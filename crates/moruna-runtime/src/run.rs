@@ -403,10 +403,13 @@ fn drive(
         }
         .into());
     }
+    // Stream C (data OS): on the Moruna kernel the arena is granted memory objects and the
+    // data disks are the engine's own. Elsewhere nothing is granted and nothing changes.
+    let granted = data_os::take()?;
     let (alloc, arena): (Arc<dyn Allocator>, Option<Arc<Arena>>) = match components.alloc {
         Some(alloc) => (alloc, None),
         None => {
-            let arena = Arena::new(ArenaConfig {
+            let config = ArenaConfig {
                 host_bytes: arena_bytes,
                 host_tier: discovered.host_tier,
                 device_bytes: limits
@@ -424,8 +427,9 @@ fn drive(
                 memlock: discovered.profile.memlock,
                 register_rdma: false,
                 pretouch: false,
-            })?;
-            (arena.clone() as Arc<dyn Allocator>, Some(arena))
+            };
+            let arena = data_os::arena(config, granted.as_ref())?;
+            (data_os::allocator(&arena, granted.as_ref()), Some(arena))
         }
     };
 
@@ -446,7 +450,7 @@ fn drive(
                     },
                     alloc.clone(),
                 )?;
-                (built.clone(), Some(built))
+                data_os::reactor(granted.as_ref(), built.clone(), Some(built))?
             }
         };
     started.reactor = Some(reactor.clone());
@@ -1056,6 +1060,14 @@ fn drive(
     let (view, shutdown_notes) = started.unwind();
 
     notes.extend(shutdown_notes);
+    // Stream C (data OS, C3): a completed run's outputs are one layer on `disk.out`.
+    let layer_failure = data_os::finish(
+        granted.as_ref(),
+        matches!(exit, moruna_trace::ExitReason::Completed),
+        alloc.as_ref(),
+        run_id,
+        &mut notes,
+    );
     let manifest = outcome_manifest.or_else(|| match (checkpoint_keep, &engine) {
         (true, Some(engine)) => engine.manifest_path(),
         _ => None,
@@ -1126,7 +1138,7 @@ fn drive(
             .map(|s| digest_of(topology.sink_input(s)))
             .collect(),
     };
-    if let Some(cause) = final_failure {
+    if let Some(cause) = final_failure.or(layer_failure) {
         return Err(RunError::bare(cause)
             .with_report(Some(computed))
             .with_manifest(manifest));
@@ -2291,5 +2303,180 @@ mod staging_segment_tests {
         assert_eq!(staging_segment_bytes(64 * MIB), 128 * MIB);
         assert_eq!(staging_segment_bytes(256 * MIB), 512 * MIB);
         assert_eq!(staging_segment_bytes(300 * MIB), 640 * MIB);
+    }
+}
+
+/// Stream C (data OS, `architecture/data-os.md` §3): on the Moruna kernel the arena is granted
+/// memory objects, each scheduler worker is placed on a core, the data disks are the engine's
+/// own and a completed run's outputs are one layer on `disk.out`. Elsewhere each of these is
+/// today's path, unchanged.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod data_os {
+    use std::sync::Arc;
+
+    use moruna_arena::{Arena, ArenaConfig};
+    use moruna_kernel::{Allocator, MorunaError, ObjectMetadata, Reactor, RunId, Tier};
+    use moruna_micro::arena::{Placed, pin_calling_thread};
+    pub(crate) use moruna_micro::blk::Granted;
+
+    use crate::error::Result;
+
+    /// Where the sinks' files are inside the VM: the layer's root. Only `/tmp` is writable
+    /// there.
+    pub(crate) const OUTPUT_ROOT: &str = "/tmp/out";
+
+    pub(crate) fn take() -> Result<Option<Granted>> {
+        Granted::take().map_err(|msg| {
+            MorunaError::Config {
+                name: "data_os",
+                msg,
+            }
+            .into()
+        })
+    }
+
+    pub(crate) fn arena(config: ArenaConfig, granted: Option<&Granted>) -> Result<Arc<Arena>> {
+        Ok(match granted {
+            Some(g) => Arena::with_backing(config, g.backing())?,
+            None => Arena::new(config)?,
+        })
+    }
+
+    pub(crate) fn allocator(arena: &Arc<Arena>, granted: Option<&Granted>) -> Arc<dyn Allocator> {
+        match (granted, moruna_micro::start::kernel()) {
+            (Some(_), Some(kernel)) => Arc::new(Placed::new(
+                Arc::clone(arena) as Arc<dyn Allocator>,
+                kernel.cpus,
+                pin_calling_thread,
+            )),
+            _ => Arc::clone(arena) as Arc<dyn Allocator>,
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn reactor(
+        granted: Option<&Granted>,
+        reactor: Arc<dyn Reactor>,
+        metadata: Option<Arc<dyn ObjectMetadata>>,
+    ) -> Result<(Arc<dyn Reactor>, Option<Arc<dyn ObjectMetadata>>)> {
+        match granted {
+            Some(g) => g.reactor(reactor, metadata).map_err(|e| {
+                MorunaError::Io {
+                    op: "data_os",
+                    target: "the input disks".into(),
+                    msg: e.to_string(),
+                }
+                .into()
+            }),
+            None => Ok((reactor, metadata)),
+        }
+    }
+
+    /// Writes the output layer when the run completed and has an output disk, and says what
+    /// the arena and the disks did; the failure, if the layer could not be written.
+    pub(crate) fn finish(
+        granted: Option<&Granted>,
+        completed: bool,
+        alloc: &dyn Allocator,
+        run_id: RunId,
+        notes: &mut Vec<String>,
+    ) -> Option<MorunaError> {
+        let granted = granted?;
+        let mut failure = None;
+        if let (true, Some(disk)) = (completed, granted.output()) {
+            let root = std::env::var("MORUNA_OUTPUT_ROOT").unwrap_or_else(|_| OUTPUT_ROOT.into());
+            let file = std::env::temp_dir().join(format!("moruna-{}.layer", run_id.to_hex()));
+            match write_layer(disk, std::path::Path::new(&root), &file, alloc) {
+                Ok(w) => notes.push(format!(
+                    "data OS: the output layer of {root} is {} bytes on {} in {} pieces",
+                    w.bytes,
+                    disk.name(),
+                    w.pieces
+                )),
+                Err(msg) => {
+                    failure = Some(MorunaError::Io {
+                        op: "output layer",
+                        target: disk.name().to_string(),
+                        msg,
+                    })
+                }
+            }
+            let _ = std::fs::remove_file(&file);
+        }
+        notes.extend(granted.notes());
+        failure
+    }
+
+    fn write_layer(
+        disk: &moruna_micro::blk::disk::Disk,
+        root: &std::path::Path,
+        file: &std::path::Path,
+        alloc: &dyn Allocator,
+    ) -> std::result::Result<moruna_micro::blk::layer::Written, String> {
+        use moruna_image::layerfile;
+        let tree = if root.exists() {
+            layerfile::tree(root)
+                .map_err(|e| format!("the outputs under {}: {e}", root.display()))?
+        } else {
+            layerfile::Entry::directory(0o755)
+        };
+        layerfile::write(&tree, file).map_err(|e| format!("laying the outputs out: {e}"))?;
+        let tier = if alloc.is_pinned() {
+            Tier::PinnedHost
+        } else {
+            Tier::Host
+        };
+        moruna_micro::blk::layer::write_file(
+            disk,
+            file,
+            alloc,
+            tier,
+            moruna_micro::blk::layer::PIECE,
+        )
+    }
+}
+
+/// Off the Moruna kernel nothing is granted: today's arena, allocator and reactor.
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+mod data_os {
+    use std::sync::Arc;
+
+    use moruna_arena::{Arena, ArenaConfig};
+    use moruna_kernel::{Allocator, MorunaError, ObjectMetadata, Reactor, RunId};
+
+    use crate::error::Result;
+
+    /// Nothing granted.
+    pub(crate) enum Granted {}
+
+    pub(crate) fn take() -> Result<Option<Granted>> {
+        Ok(None)
+    }
+
+    pub(crate) fn arena(config: ArenaConfig, _: Option<&Granted>) -> Result<Arc<Arena>> {
+        Ok(Arena::new(config)?)
+    }
+
+    pub(crate) fn allocator(arena: &Arc<Arena>, _: Option<&Granted>) -> Arc<dyn Allocator> {
+        Arc::clone(arena) as Arc<dyn Allocator>
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn reactor(
+        _: Option<&Granted>,
+        reactor: Arc<dyn Reactor>,
+        metadata: Option<Arc<dyn ObjectMetadata>>,
+    ) -> Result<(Arc<dyn Reactor>, Option<Arc<dyn ObjectMetadata>>)> {
+        Ok((reactor, metadata))
+    }
+
+    pub(crate) fn finish(
+        _: Option<&Granted>,
+        _: bool,
+        _: &dyn Allocator,
+        _: RunId,
+        _: &mut Vec<String>,
+    ) -> Option<MorunaError> {
+        None
     }
 }

@@ -67,6 +67,16 @@ pub struct Config {
     pub runs: u32,
 }
 
+/// The names a data disk's hand-over message gives its handles, in order (`disk-grant`):
+/// the configuration window, the MSI slots, the DMA resource, then each memory BAR.
+pub fn disk_names(bars: &[usize]) -> String {
+    let mut names = String::from("config msi dma");
+    for b in bars {
+        names.push_str(&format!(" bar{b}"));
+    }
+    names
+}
+
 /// The most runs one boot asks for.
 pub const RUNS_MAX: u32 = 64;
 
@@ -245,6 +255,12 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_disks_hand_over_names_its_handles_in_order() {
+        assert_eq!(disk_names(&[]), "config msi dma");
+        assert_eq!(disk_names(&[4, 1]), "config msi dma bar4 bar1");
+    }
 
     const GOOD: &str = "# the engine\n\
         program /moruna/bin/moruna\n\

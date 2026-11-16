@@ -5,7 +5,9 @@
 //! The supervisor grants a disk as one channel under the disk's start-page name, whose one
 //! message carries the function's handles and, as its bytes, their names in order: `config`
 //! (its configuration window), `msi` (its MSI slots), `dma` (its DMA resource) and one `barN`
-//! for each memory BAR. The disk's file length is its virtio-blk serial, in decimal, when the
+//! for each memory BAR. The channel is a connection to the disk's hand-over program
+//! (`kernel/engine`'s `disk-grant`, which the device manager starts for the disk), made by the
+//! supervisor's `grant disk.in.NAME lookup SERVICEn`. The disk's file length is its virtio-blk serial, in decimal, when the
 //! launcher set one; otherwise its capacity.
 
 use std::sync::Arc;
@@ -233,11 +235,18 @@ impl Port for Device {
     }
 }
 
-/// Takes the grant under `slot`: the one message on its channel.
+/// How long the engine waits for a disk's hand-over message.
+pub const GRANT_WAIT_NS: u64 = 30_000_000_000;
+
+/// Takes the grant under `slot`: the one message on its channel, which the disk's hand-over
+/// program (`kernel/engine`'s `disk-grant`) writes when the supervisor's lookup connects to it.
 pub fn take(slot: &str) -> Result<Grant<Handle>, String> {
     let channel = Channel(
         crate::start::take(slot).ok_or_else(|| format!("the engine was granted no `{slot}`"))?,
     );
+    let deadline = moruna_sys::now().saturating_add(GRANT_WAIT_NS);
+    moruna_sys::wait_one(&channel.0, Signals::READABLE, deadline)
+        .map_err(|e| format!("`{slot}`: waiting for its grant: {}", e.name()))?;
     let mut bytes = vec![0u8; 256];
     let mut handles: Vec<Option<Handle>> = (0..16).map(|_| None).collect();
     let (n, h) = channel

@@ -973,4 +973,38 @@ mod reactor_and_layer {
         out.close();
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn what_was_granted_wraps_the_reactor_and_says_what_it_moved() {
+        assert!(
+            crate::blk::Granted::take().unwrap().is_none(),
+            "off the kernel"
+        );
+        let (input, _) = disk("disk.in.g", 64, false);
+        let (output, _) = disk("disk.out", 64, true);
+        let objects = crate::arena::Objects::with_max(1 << 20);
+        let none = crate::blk::Granted::new(objects.clone(), Vec::new(), None);
+        let inner = Arc::new(Inner::default());
+        let (r, m) = none.reactor(inner.clone(), None).unwrap();
+        assert!(m.is_none());
+        r.shutdown();
+        assert_eq!(inner.calls.lock().unwrap().as_slice(), &["shutdown"]);
+        assert_eq!(none.backing().region_max(), 1 << 20);
+        assert!(none.output().is_none());
+
+        let granted = crate::blk::Granted::new(objects, vec![input.clone()], Some(output.clone()));
+        assert_eq!(granted.inputs().len(), 1);
+        assert_eq!(granted.output().unwrap().name(), "disk.out");
+        let (r, m) = granted.reactor(inner, None).unwrap();
+        assert_eq!(
+            m.unwrap().head_object("disk://g").wait().unwrap().size,
+            64 * 512
+        );
+        let notes = granted.notes();
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        assert!(notes[0].contains("0 granted memory objects"));
+        assert!(notes[1].contains("disk.in.g") && notes[2].contains("disk.out"));
+        r.shutdown();
+        output.close();
+    }
 }

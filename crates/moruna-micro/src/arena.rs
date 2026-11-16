@@ -13,13 +13,18 @@
 //! each region is pinned through the device's DMA resource once, the first time an operation
 //! names it, and its pages' device addresses kept as runs, so a read lands by DMA in the
 //! arena buffer the reactor was handed (contract C2) and no call is made per request.
+//!
+//! [`Placed`] is the engine's `Allocator`: the arena, with each of the scheduler's workers
+//! placed on a core the first time it allocates (contract C5). A place is never a function:
+//! any worker still runs any function's batch, as the scheduler decides.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use moruna_arena::{Granted, HostBacking};
-use moruna_kernel::MorunaError;
-use moruna_sys::{Error, Handle, Mapping, Memory, PAGE_SIZE, Pin, limits, map};
+use moruna_kernel::{AllocStats, Allocator, Buffer, MorunaError, Tier};
+use moruna_sys::{Error, Handle, Mapping, Memory, PAGE_SIZE, Pin, Thread, limits, map};
 
 use crate::blk::engine::Translate;
 
@@ -319,6 +324,122 @@ impl Translate for Pins {
     }
 }
 
+/// The name the scheduler gives worker `n`'s thread.
+pub const WORKER_PREFIX: &str = "moruna-worker-";
+
+/// The worker a thread named `name` is, if it is one.
+pub fn worker_index(name: &str) -> Option<u32> {
+    name.strip_prefix(WORKER_PREFIX)?.parse().ok()
+}
+
+/// Places the calling thread on CPU `cpu` (`thread_set_cpu`, stream A). The engine's threads
+/// are Linux threads with no handle of their own, so the call names the calling thread with
+/// the raw handle 0.
+pub fn pin_calling_thread(cpu: u32) -> Result<(), Error> {
+    let me = std::mem::ManuallyDrop::new(Thread(Handle::from_raw(0)));
+    moruna_sys::datapath::thread_set_cpu(&me, Some(cpu))
+}
+
+thread_local! {
+    /// Whether this thread has been considered for a place.
+    static CONSIDERED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The engine's `Allocator`: `arena`, placing each scheduler worker on CPU `worker % cpus` at
+/// its first allocation, once, and never again. A refused placement stops every later attempt.
+pub struct Placed {
+    arena: Arc<dyn Allocator>,
+    cpus: u32,
+    pin: fn(u32) -> Result<(), Error>,
+    placed: AtomicU64,
+    refused: AtomicBool,
+}
+
+impl Placed {
+    /// `arena` with workers placed over `cpus` CPUs by `pin`.
+    pub fn new(
+        arena: Arc<dyn Allocator>,
+        cpus: usize,
+        pin: fn(u32) -> Result<(), Error>,
+    ) -> Placed {
+        Placed {
+            arena,
+            cpus: cpus.max(1) as u32,
+            pin,
+            placed: AtomicU64::new(0),
+            refused: AtomicBool::new(false),
+        }
+    }
+
+    /// Workers placed.
+    pub fn placed(&self) -> u64 {
+        self.placed.load(Ordering::Relaxed)
+    }
+
+    /// Whether the kernel refused a placement.
+    pub fn refused(&self) -> bool {
+        self.refused.load(Ordering::Relaxed)
+    }
+
+    fn place(&self) {
+        if CONSIDERED.with(|c| c.replace(true)) || self.refused.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(worker) = std::thread::current().name().and_then(worker_index) else {
+            return;
+        };
+        match (self.pin)(worker % self.cpus) {
+            Ok(()) => {
+                self.placed.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                if !self.refused.swap(true, Ordering::Relaxed) {
+                    tracing::info!(target: "arena.place", why = e.name(), "workers are not placed");
+                }
+            }
+        }
+    }
+}
+
+impl Allocator for Placed {
+    fn alloc(&self, bytes: usize, tier: Tier) -> moruna_kernel::Result<Buffer> {
+        self.place();
+        self.arena.alloc(bytes, tier)
+    }
+
+    fn page_bytes(&self) -> usize {
+        self.arena.page_bytes()
+    }
+
+    fn stats(&self) -> AllocStats {
+        self.arena.stats()
+    }
+
+    fn available(&self, tier: Tier) -> Option<u64> {
+        self.arena.available(tier)
+    }
+
+    fn contains(&self, ptr: *const u8) -> bool {
+        self.arena.contains(ptr)
+    }
+
+    fn tier_of(&self, ptr: *const u8) -> Option<Tier> {
+        self.arena.tier_of(ptr)
+    }
+
+    fn note_payload_copy(&self, bytes: u64) {
+        self.arena.note_payload_copy(bytes)
+    }
+
+    fn note_boundary_copy(&self, bytes: u64) {
+        self.arena.note_boundary_copy(bytes)
+    }
+
+    fn is_pinned(&self) -> bool {
+        self.arena.is_pinned()
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -328,6 +449,89 @@ mod tests {
     use super::*;
 
     const P: u64 = PAGE_SIZE;
+
+    static PLACED_ON: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+    fn record(cpu: u32) -> Result<(), Error> {
+        PLACED_ON.lock().unwrap().push(cpu);
+        Ok(())
+    }
+
+    fn refuse(_: u32) -> Result<(), Error> {
+        Err(Error::BadSyscall)
+    }
+
+    fn arena() -> Arc<dyn Allocator> {
+        moruna_arena::Arena::new(moruna_arena::ArenaConfig {
+            host_bytes: 4 << 20,
+            huge_pages: moruna_kernel::Guarantee::Absent,
+            memlock: moruna_kernel::Guarantee::Absent,
+            ..moruna_arena::ArenaConfig::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_worker_is_placed_once_at_its_first_allocation_and_no_other_thread_is() {
+        assert_eq!(worker_index("moruna-worker-12"), Some(12));
+        assert_eq!(worker_index("moruna-worker-"), None);
+        assert_eq!(worker_index("moruna-blk-disk.in.a"), None);
+        let placed = Arc::new(Placed::new(arena(), 4, record));
+        let threads: Vec<_> = (0..6)
+            .map(|i| {
+                let placed = Arc::clone(&placed);
+                std::thread::Builder::new()
+                    .name(format!("moruna-worker-{i}"))
+                    .spawn(move || {
+                        for _ in 0..3 {
+                            drop(placed.alloc(64 * 1024, Tier::Host).unwrap());
+                        }
+                    })
+                    .unwrap()
+            })
+            .chain(std::iter::once({
+                let placed = Arc::clone(&placed);
+                std::thread::Builder::new()
+                    .name("moruna-reactor".into())
+                    .spawn(move || drop(placed.alloc(10, Tier::Host).unwrap()))
+                    .unwrap()
+            }))
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(placed.placed(), 6);
+        assert!(!placed.refused());
+        let mut on = PLACED_ON.lock().unwrap().clone();
+        on.sort();
+        assert_eq!(on, vec![0, 0, 1, 1, 2, 3], "worker n on CPU n % 4");
+        // The rest is the arena's.
+        assert_eq!(placed.page_bytes(), 4096);
+        assert!(placed.available(Tier::Host).unwrap() > 0);
+        let b = placed.alloc(100, Tier::Host).unwrap();
+        assert!(placed.contains(b.as_ptr()));
+        assert_eq!(placed.tier_of(b.as_ptr()), Some(Tier::Host));
+        placed.note_payload_copy(1);
+        placed.note_boundary_copy(2);
+        assert!(placed.stats().host_in_use > 0);
+        assert!(!placed.is_pinned());
+    }
+
+    #[test]
+    fn a_refused_placement_is_not_tried_again() {
+        let placed = Arc::new(Placed::new(arena(), 0, refuse));
+        for i in 0..3 {
+            let placed = Arc::clone(&placed);
+            std::thread::Builder::new()
+                .name(format!("moruna-worker-{i}"))
+                .spawn(move || drop(placed.alloc(10, Tier::Host).unwrap()))
+                .unwrap()
+                .join()
+                .unwrap();
+        }
+        assert!(placed.refused());
+        assert_eq!(placed.placed(), 0);
+    }
 
     #[test]
     fn contiguous_pages_are_one_run() {

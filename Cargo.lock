@@ -2256,6 +2256,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "moruna-abi",
  "moruna-adapters",
  "moruna-arena",
  "moruna-controller",
