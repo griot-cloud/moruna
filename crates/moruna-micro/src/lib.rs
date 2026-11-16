@@ -30,7 +30,19 @@
 // (contracts 01 d.13), as in the other crates of the workspace.
 #![allow(clippy::result_large_err)]
 
+pub mod devices;
 pub mod layout;
+
+// The data OS's engine-side modules (`architecture/data-os-streams.md`): each is written by
+// one stream only. Stream C: `arena`, `blk`, `accounts`. Stream P: `rings`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod accounts;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod arena;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod blk;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod rings;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod image;

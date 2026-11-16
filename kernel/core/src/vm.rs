@@ -982,6 +982,14 @@ impl Space {
     }
 }
 
+// ---- stream A (data path, `architecture/data-os-streams.md`): stream A's additions to
+// ---- `Space` go in this block; it also owns `map`, `populate` and `protect` above.
+impl Space {}
+
+// ---- stream B1 (personality, `architecture/data-os-streams.md`): stream B1's additions to
+// ---- `Space` go in this block; it also owns `fault` above.
+impl Space {}
+
 impl Drop for Space {
     fn drop(&mut self) {
         // A process may lose its last handle before launch or after a failed setup.

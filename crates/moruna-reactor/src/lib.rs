@@ -26,6 +26,8 @@ mod file_lifecycle;
 mod file_uring;
 pub mod files;
 mod gds;
+// The data OS: the engine's own block queues on the Moruna kernel (stream C).
+mod kernel_blk;
 mod object;
 mod paths;
 mod runtime;

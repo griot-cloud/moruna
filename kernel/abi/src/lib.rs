@@ -28,9 +28,12 @@ pub mod manifest;
 /// `account_info`, the account `process_create` and `memory_create` charge (an argument
 /// whose zero is the call ABI 2.2 made), and the error `QuotaExceeded` (SDD 20 f.18).
 /// ABI 2.4 adds KE1 contiguous DMA flags; ABI 2.5 adds exact Account/Memory charged-origin comparison.
+/// ABI 2.6 (0.7, `architecture/data-os.md`) reserves the data OS's calls, flags and layouts:
+/// the data path's mechanisms (stream A) and the user-space personality's (stream B1), each
+/// answered `BadSyscall` until its stream implements it (`architecture/data-os-streams.md`).
 pub const ABI_MAJOR: u16 = 2;
 /// See [`ABI_MAJOR`].
-pub const ABI_MINOR: u16 = 5;
+pub const ABI_MINOR: u16 = 6;
 /// The packed version `abi_version` returns.
 pub const ABI_VERSION: u64 = ((ABI_MAJOR as u64) << 16) | ABI_MINOR as u64;
 
@@ -158,8 +161,42 @@ pub mod nr {
     /// `(account, object)`, object only Account or Memory. Returns 0 or 1; no
     /// numeric account identity, authority minting, names or ancestor matching.
     pub const ACCOUNT_MATCHES: u64 = BASE + 52;
+    // ABI 2.6, reserved for the data OS (`architecture/data-os.md` §2). Each is
+    // `BadSyscall` until its stream implements it (`architecture/data-os-streams.md`).
+    // Stream A, the data path's mechanisms:
+    /// `thread_set_cpu(thread, cpu)`: runs the thread on CPU `cpu` only, or anywhere with
+    /// `cpu::ANY`. A place to run, never a function to run (data-os §2).
+    pub const THREAD_SET_CPU: u64 = BASE + 53;
+    /// `clock_page() -> address`: maps the read-only `clock_page::Page` into the caller
+    /// once, so time is read with no call (data-os §2).
+    pub const CLOCK_PAGE: u64 = BASE + 54;
+    /// `windows_protect(process, ranges, count, flags)`: sets `flags` (`map::READ`, or
+    /// `map::READ | map::WRITE`) on each of `count` `windows::Range`s of `process`'s
+    /// mappings, with one flush: the grouped revoke before the record check, and the
+    /// grant back when a window is used again (data-os §5).
+    pub const WINDOWS_PROTECT: u64 = BASE + 55;
+    // Stream B1, the user-space personality's mechanisms (kernel-is-the-machine §4.1).
+    // Their arguments are stream B1's to fix in `moruna-sys`'s `personality` module.
+    /// Registers a process's personality region and its entry (§4.1 a).
+    pub const PERSONALITY_SET: u64 = BASE + 56;
+    /// Returns from the personality's entry to the program, with the frame's registers.
+    pub const PERSONALITY_RETURN: u64 = BASE + 57;
+    /// A copy-on-write snapshot of a memory object (§4.1 b).
+    pub const MEMORY_SNAPSHOT: u64 = BASE + 58;
+    /// A copy-on-write clone of a process's address space, for `fork` (§4.1 b).
+    pub const PROCESS_CLONE: u64 = BASE + 59;
+    /// A memory object whose pages a pager supplies (§4.1 c).
+    pub const PAGER_CREATE: u64 = BASE + 60;
+    /// A pager's answer to a fault: pages supplied, or the fault refused (§4.1 c).
+    pub const PAGER_SUPPLY: u64 = BASE + 61;
+    /// Reads a thread's saved registers and FS and GS bases (§4.1 d).
+    pub const THREAD_STATE_READ: u64 = BASE + 62;
+    /// Writes them (§4.1 d).
+    pub const THREAD_STATE_WRITE: u64 = BASE + 63;
+    /// Interrupts a thread asleep in the core: its wait returns `Interrupted` (§4.1 d).
+    pub const THREAD_INTERRUPT: u64 = BASE + 64;
     /// One past the highest call of the table.
-    pub const COUNT: u64 = 53;
+    pub const COUNT: u64 = 65;
     /// The data plane's calls (SDD 29): native numbers a task makes on its own plane,
     /// or a personality server on a task's. The rest of the range is reserved.
     pub const DATA_PLANE: core::ops::Range<u64> = BASE + 0x100..BASE + 0x110;
@@ -663,6 +700,88 @@ pub mod map {
     pub const ALL: u64 = READ | WRITE | EXECUTE;
     /// Every flag `process_map` takes.
     pub const PROCESS_ALL: u64 = PROTECTION | FIXED;
+    /// Reserved (ABI 2.6, stream A): map with large pages where the range allows. Refused
+    /// until stream A adds it to `ALL` (data-os §2).
+    pub const HUGE: u64 = 1 << 4;
+    /// Reserved (ABI 2.6, stream A): fault every page in at the call, so none faults
+    /// later. Refused until stream A adds it to `ALL` (data-os §2).
+    pub const POPULATE: u64 = 1 << 5;
+}
+
+/// `thread_set_cpu`'s CPU argument (ABI 2.6, stream A).
+pub mod cpu {
+    /// Any CPU: the thread is not pinned.
+    pub const ANY: u64 = u64::MAX;
+}
+
+/// The page `clock_page` maps (ABI 2.6, stream A): a seqlock. A reader reads `SEQUENCE`,
+/// then the fields, then `SEQUENCE` again, and retries if it changed or was odd. Time in
+/// nanoseconds is `BASE_NS + ((tsc - BASE_TSC) * MULTIPLIER) >> SHIFT`.
+pub mod clock_page {
+    /// Byte offset of the `u64` sequence, odd while the kernel writes the page.
+    pub const SEQUENCE: usize = 0;
+    /// Byte offset of the `u64` monotonic nanoseconds at `BASE_TSC`.
+    pub const BASE_NS: usize = 8;
+    /// Byte offset of the `u64` time-stamp counter the page was written at.
+    pub const BASE_TSC: usize = 16;
+    /// Byte offset of the `u64` multiplier from counter ticks to nanoseconds.
+    pub const MULTIPLIER: usize = 24;
+    /// Byte offset of the `u32` shift applied after the multiplier.
+    pub const SHIFT: usize = 32;
+    /// The page's length.
+    pub const LEN: usize = 4096;
+}
+
+/// `windows_protect`'s entries (ABI 2.6, stream A).
+pub mod windows {
+    /// One window: a page-aligned range of the target process's mappings. 16 bytes, as two
+    /// little-endian `u64`s: the address, then the length.
+    pub const RANGE_SIZE: usize = 16;
+    /// The most ranges one call takes.
+    pub const MAX: usize = 256;
+}
+
+/// The frame the personality's entry receives (ABI 2.6, stream B1; kernel-is-the-machine
+/// §4.1 a, d): the program's registers when it made a system call or faulted, as little-
+/// endian `u64`s at these byte offsets, read and written in place by the personality.
+pub mod personality {
+    /// Why the program entered the personality: one of `reason`.
+    pub const REASON: usize = 0;
+    /// The general registers, in this order, from `REGISTERS`, 8 bytes each.
+    pub const REGISTERS: usize = 8;
+    /// The names of the general registers, in frame order.
+    pub const REGISTER_NAMES: [&str; 16] = [
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12",
+        "r13", "r14", "r15",
+    ];
+    /// The instruction pointer.
+    pub const RIP: usize = REGISTERS + 16 * 8;
+    /// The flags register.
+    pub const RFLAGS: usize = RIP + 8;
+    /// The FS base.
+    pub const FS_BASE: usize = RFLAGS + 8;
+    /// The GS base.
+    pub const GS_BASE: usize = FS_BASE + 8;
+    /// The exception vector, for `reason::EXCEPTION` and `reason::PAGE_FAULT`.
+    pub const VECTOR: usize = GS_BASE + 8;
+    /// The exception's error code.
+    pub const ERROR_CODE: usize = VECTOR + 8;
+    /// The faulting address, for `reason::PAGE_FAULT`.
+    pub const FAULT_ADDRESS: usize = ERROR_CODE + 8;
+    /// The frame's length.
+    pub const LEN: usize = FAULT_ADDRESS + 8;
+
+    /// Why the personality was entered.
+    pub mod reason {
+        /// A system call: its number in `rax`, its arguments in Linux's registers.
+        pub const SYSCALL: u64 = 1;
+        /// A page fault the core did not serve.
+        pub const PAGE_FAULT: u64 = 2;
+        /// Any other exception.
+        pub const EXCEPTION: u64 = 3;
+        /// The thread was interrupted (`thread_interrupt`) while it ran the program.
+        pub const INTERRUPTED: u64 = 4;
+    }
 }
 
 /// The page size every length and offset in this ABI is a multiple of.
@@ -1129,8 +1248,18 @@ mod tests {
         assert!(!valid_name(b""));
         assert!(!valid_name(b"Upper"));
         assert!(!valid_name(&[b'a'; 33]));
-        assert_eq!(ABI_VERSION, 0x2_0005);
-        assert_eq!(nr::ACCOUNT_MATCHES + 1, nr::BASE + nr::COUNT);
+        assert_eq!(ABI_VERSION, 0x2_0006);
+        assert_eq!(nr::THREAD_INTERRUPT + 1, nr::BASE + nr::COUNT);
+        assert_eq!(nr::THREAD_SET_CPU, nr::ACCOUNT_MATCHES + 1);
+        assert_eq!(nr::PERSONALITY_SET, nr::WINDOWS_PROTECT + 1);
+        assert!(nr::is_native(nr::THREAD_SET_CPU) && nr::is_native(nr::THREAD_INTERRUPT));
+        assert_eq!(
+            map::ALL & (map::HUGE | map::POPULATE),
+            0,
+            "reserved until stream A"
+        );
+        assert_eq!(personality::LEN, 8 + 16 * 8 + 7 * 8);
+        assert!(clock_page::SHIFT + 4 <= clock_page::LEN);
         assert_eq!(nr::ACCOUNT_MATCHES, nr::ACCOUNT_INFO + 1);
         assert_eq!(nr::ACCOUNT_CREATE, nr::PROCESS_GRANT + 1);
         assert!(nr::is_native(nr::BATCH_GET) && nr::is_native(nr::PLANE_PROBE));

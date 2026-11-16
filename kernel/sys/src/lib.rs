@@ -26,8 +26,10 @@
 #[cfg(feature = "heap")]
 extern crate alloc;
 
+pub mod datapath;
 #[cfg(feature = "heap")]
 mod heap;
+pub mod personality;
 pub mod plane;
 mod private_memory;
 pub use private_memory::PrivateMemory;

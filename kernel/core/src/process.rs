@@ -1039,6 +1039,15 @@ fn clear_child_tid(thread: &Thread) {
     }
 }
 
+// ---- stream A (data path, `architecture/data-os-streams.md`): stream A's additions to
+// ---- `Thread` (its CPU) go in this block.
+impl Thread {}
+
+// ---- stream B1 (personality, `architecture/data-os-streams.md`): stream B1's additions to
+// ---- `Thread` and `Process` go in this block; it also owns the user-mode loop's syscall
+// ---- branch (the forward) above.
+impl Thread {}
+
 impl Process {
     pub fn vm(&self) -> &Arc<ostd::mm::VmSpace> {
         &self.space.vm

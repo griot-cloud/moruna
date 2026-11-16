@@ -407,6 +407,53 @@ pub fn random_read(buf: &mut [u8]) -> u64 {
     unsafe { syscall(nr::RANDOM_READ, a) }.0
 }
 
+// ABI 2.6 (`architecture/data-os-streams.md`): the data OS's calls that pass memory, frozen
+// here so that streams A and B1 never write this file.
+
+/// `windows_protect` (ABI 2.6, stream A): `flags` on each range of `process`, given as
+/// `[address, length]` pairs (`windows::RANGE_SIZE` bytes each).
+pub fn windows_protect(process: RawHandle, ranges: &[[u64; 2]], flags: u64) -> u64 {
+    let a = [
+        process as u64,
+        ranges.as_ptr() as u64,
+        ranges.len() as u64,
+        flags,
+        0,
+        0,
+    ];
+    // SAFETY: the kernel reads `ranges.len()` entries of 16 bytes from `ranges`.
+    unsafe { syscall(nr::WINDOWS_PROTECT, a) }.0
+}
+
+/// `thread_state_read` (ABI 2.6, stream B1): `thread`'s frame (`personality::LEN` bytes,
+/// in `personality`'s layout) into `frame`.
+pub fn thread_state_read(thread: RawHandle, frame: &mut [u8]) -> u64 {
+    let a = [
+        thread as u64,
+        frame.as_mut_ptr() as u64,
+        frame.len() as u64,
+        0,
+        0,
+        0,
+    ];
+    // SAFETY: the kernel writes at most `frame.len()` bytes into `frame`.
+    unsafe { syscall(nr::THREAD_STATE_READ, a) }.0
+}
+
+/// `thread_state_write` (ABI 2.6, stream B1): `thread`'s registers from `frame`.
+pub fn thread_state_write(thread: RawHandle, frame: &[u8]) -> u64 {
+    let a = [
+        thread as u64,
+        frame.as_ptr() as u64,
+        frame.len() as u64,
+        0,
+        0,
+        0,
+    ];
+    // SAFETY: the kernel reads `frame.len()` bytes from `frame`.
+    unsafe { syscall(nr::THREAD_STATE_WRITE, a) }.0
+}
+
 /// `batch_get` (ABI 2.1): an address and a length, or an error in `rax`. Safe: it adds a
 /// mapping where the kernel chooses, and unmaps only the slot's previous batch, which
 /// the plane's `Batch` borrows keep out of reach.

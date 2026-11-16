@@ -1,8 +1,10 @@
 # The data OS: Asterinas and Moruna under the microkernel rule
 
-Status: design for Brackly's review, rewritten 2026-11-16 on his correction. Nothing in it is
-built. Until he approves it, the only work is step 1's measurements
-(`architecture/arrow-core-0.7.md`).
+Status: approved by Brackly on 2026-11-16, "as recommended", through the PM session. His
+direction for building it: "What I would make is one step. Please look at that engine,
+parallelize this work so that we can finish it." The parallel streams, their ownership and
+their frozen interfaces are in `architecture/data-os-streams.md`. Nothing in this design is
+built yet.
 
 > We should first identify performance critical processes and let them run in the kernel. And
 > then anything else runs on top. [...] The goal is to be able to have a data operating system
@@ -259,14 +261,13 @@ Wiring keeps Moruna (`arrow-core-0.7.md`).
 **Attack-surface check at each step.** Kernel-mode lines and the call list are counted at each
 step against §0's table, and they grow only by the mechanisms named in §2.
 
-## 8. Decisions for Brackly
+## 8. Decisions (Brackly, 2026-11-16, as recommended)
 
 1. **The kernel-mode set.** OSTD and Moruna's core, plus the mechanisms of §2 and nothing else.
-2. **The engine drives the data disk itself,** with DMA into its arena (recommended), rather than
-   through a separate driver process, which would need a call or a message per I/O.
+2. **The engine drives the data disk itself,** with DMA into its arena, not through a separate
+   driver process.
 3. **The record check's one remaining crossing:** write access taken back in one call per group of
    batches, kept for DP1's safety (§5).
-4. **The engine's `std`:** a native port to Moruna's core, or a Linux program on the user-space
-   personality. The hot path makes no calls either way (§3).
-5. **Still open from before:** "no C" against "no regression" for the codecs (`arrow-core-0.7.md`,
-   decision 8).
+4. **The engine's `std`:** the engine stays a Linux program on the user-space personality. There is
+   no native `std` port, because the hot path makes no calls (§3).
+5. **Codecs:** C zstd stays until a pure-Rust zstd matches it on the gate.

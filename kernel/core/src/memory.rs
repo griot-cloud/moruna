@@ -185,6 +185,14 @@ impl MemoryObject {
     }
 }
 
+// ---- stream A (data path, `architecture/data-os-streams.md`): stream A's additions to
+// ---- `MemoryObject` (large frames) go in this block.
+impl MemoryObject {}
+
+// ---- stream B1 (personality, `architecture/data-os-streams.md`): stream B1's additions to
+// ---- `MemoryObject` (snapshots, pager-backed objects) go in this block.
+impl MemoryObject {}
+
 /// The largest device memory region one call creates.
 pub const DEVICE_MEMORY_MAX: u64 = 1 << 30;
 
