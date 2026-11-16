@@ -19,10 +19,12 @@ decisions are folded in below.
   - **0.7.0 is the one big release.** In his words: "We don't need 0.7 and then 0.8."
   - **The kernel as the node itself** (Goal B, `architecture/kernel-is-the-machine.md` on
     `design/kernel-is-the-machine`) is parked and unscheduled. He is not asking for it.
-  - **Whatever of Goal B 0.7.0 needs comes into 0.7.0.** That means the Linux-program support
-    the gate's CPython, NumPy and pyarrow images need, through today's personality or Asterinas's
-    Linux layer carried into a user-space personality (`kernel-is-the-machine.md` §4.2). Step 1
-    shows which.
+  - **Whatever of Goal B 0.7.0 needs comes into 0.7.0.**
+  - **Asterinas's Linux layer is a firm 0.7.0 step** (§7a). In his words: "Where is Asterinas?"
+    and "Once Asterinas becomes involved, Linux is gone." It replaces Moruna's own Linux
+    personality (`kernel/linux`). Every Linux program in an image runs on it, the gate's CPython,
+    NumPy and pyarrow included. With the engine native (§1), no Linux code is left inside the VM.
+    The only Linux is the node that hosts it.
 - **Every step is this branch's.**
   - It builds on the work still on `feat/kd2-engine-process`, `feat/kd1-data-plane`,
     `feat/ka2-plane-linux` (its conformance suite is KD3's base) and `feat/kb5-memory-quota` (the
@@ -149,8 +151,8 @@ port gains little, they go to Brackly before anything is dropped.
   - I/O goes to the block driver (§4).
 
   tokio and mio leave the engine.
-- **Tasks stay Linux programs under the personality.** That is what lets user code be in any
-  language.
+- **Tasks stay Linux programs,** on Asterinas's Linux layer (§7a). That is what lets user code be
+  in any language.
 - **Until the port runs,** the engine keeps running as today's Linux program, so every other step
   can proceed and be measured.
 
@@ -258,6 +260,34 @@ step that replaces it.
 **Set aside, not landing:** the local branch `wip/engine-heap-reuse`, which holds glibc tuning
 and a partial removal of the NumPy hook.
 
+### 7a. Linux programs on Asterinas's Linux layer
+
+This follows `architecture/kernel-is-the-machine.md` §4.1 and §4.2, on `design/kernel-is-the-machine`,
+cut to what a VM with no network needs. That design's steps 2 and 3 are in 0.7.0; its sockets,
+cloud platform and boot-time job (steps 4 and 5) are not.
+
+- **The core's four mechanisms.** None of them knows Linux, and each is tested in the core's own
+  suite with no personality present:
+  - a personality entry on the calling thread, in the shape of Zircon's restricted mode, in place
+    of today's message per call (`foreign.rs`);
+  - copy-on-write clones of a memory object and of an address space, which `fork` needs;
+  - a user pager, which carries file-backed `mmap` and the page cache;
+  - thread state and interruption, which signals and `EINTR` need.
+- **The port.** Asterinas's Linux layer runs in user space, one instance per image task.
+  - About 137,000 lines, of which about 82% carry with mechanical swaps (OSTD's locks and wait
+    queues onto the core's futex).
+  - About 25,000 lines are rewritten against the four mechanisms.
+  - What 0.7.0 needs: processes, files, pipes, signals, epoll and the synthetic filesystems.
+  - It is pinned to one Asterinas commit, and the carried files stay MPL-2.0, as DECISIONS MK1
+    accepted for OSTD.
+- **The data plane carries over.** A task's `batch_get`, `batch_put` and `port_call`, and its
+  descriptors 0 and 1, work on the new personality as they do on today's (SDD 29).
+- **Done when:**
+  - static musl, dynamic glibc and CPython with NumPy and pyarrow run on it;
+  - the gate's images run as image tasks;
+  - `kernel/linux` is retired.
+- **The figure to beat.** Step 1's measurement of today's personality.
+
 ### 8. Python, afterwards
 
 Python comes back in three parts, designed once the runtime runs at full speed:
@@ -339,9 +369,8 @@ items to commit to then:
    - Run a real job end to end with the engine as today's Linux program (KD2-T9).
    - Run the NYC jobs as image tasks. Measure the forwarded syscalls, the boundary copies and the
      VM's boot.
-   - Find out whether today's personality runs the gate's CPython, NumPy and pyarrow images, and
-     how fast. If it falls short, carrying Asterinas's Linux layer into a user-space personality
-     (`kernel-is-the-machine.md` §4.2) comes into 0.7.0.
+   - Measure how today's personality runs the gate's CPython, NumPy and pyarrow images. That is
+     the "before" figure for §7a, not a test that decides it.
    - This is the baseline for every step after it, and for the per-job targets.
 2. **Batches as memory objects end to end** (§3).
    - `slot_push` of ranges; `offer` and `land` stop copying.
@@ -358,11 +387,18 @@ items to commit to then:
    It starts once step 1 shows what the forwarding costs. Steps 2 and 3 make their kernel calls
    through `moruna-sys`, which works in either form of the engine. If step 1 shows the port gains
    little, the numbers go to Brackly before the step is dropped.
-5. **Dependencies** (§5): wasm out, the HTTP stack out, C kept only where measurement says so,
+5. **Asterinas's Linux layer** (§7a):
+   - the core's four mechanisms, first;
+   - then the port of processes, files, pipes, signals, epoll and the synthetic filesystems;
+   - then the gate's images on it, and `kernel/linux` retired.
+
+   It starts after step 1, beside steps 2 to 4. It changes the kernel and the personality while
+   they change the engine, so the two lines of work do not collide.
+6. **Dependencies** (§5): wasm out, the HTTP stack out, C kept only where measurement says so,
    and the build check.
-6. **The host side** (§6): `moruna run` and logs on the job updates.
-7. **KD3 conformance on the kernel, then the gate** (§9), rerun on the benchmark VM.
-8. **Python** (§8).
+7. **The host side** (§6): `moruna run` and logs on the job updates.
+8. **KD3 conformance on the kernel, then the gate** (§9), rerun on the benchmark VM.
+9. **Python** (§8).
 
 The order puts measuring first, then the copies, because they cost on every batch.
 
