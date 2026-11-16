@@ -34,10 +34,13 @@ pub const REGION_LEN: u64 = 0x6000_0000_0000;
 /// mappings, which it places upwards from `REGION_BASE`.
 pub const IMAGE_BASE: u64 = 0x5000_0000_0000;
 
+/// The task's heap: addresses the personality's heap takes, mapped in every process of
+/// its task (`ostd::backend::start_task_memory`), above the core's own mappings.
+pub const HEAP: core::ops::Range<u64> = 0x2000_0000_0000..0x3000_0000_0000;
+
 /// The task's shared memory: addresses the personality picks for objects it maps in every
-/// process of its task (`ostd::backend::shared_map`), between the core's own mappings and
-/// the image.
-pub const SHARED: core::ops::Range<u64> = 0x2000_0000_0000..IMAGE_BASE;
+/// process of its task (`ostd::backend::shared_map`), between the heap and the image.
+pub const SHARED: core::ops::Range<u64> = HEAP.end..IMAGE_BASE;
 
 /// A personality thread's stack: its size and alignment. The thread's block sits at its
 /// base (`ostd::backend`).

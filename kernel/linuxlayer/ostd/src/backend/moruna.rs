@@ -588,15 +588,84 @@ impl shared::Core for CoreCalls {
     }
 }
 
+/// The most processes a task has.
+const TASK_PROCESSES: usize = 64;
+
+/// The task's processes and its heap's addresses: nothing allocates under this lock, which
+/// the heap's source takes with the heap's own held.
+struct Task {
+    processes: shared::Processes<RawHandle, TASK_PROCESSES>,
+    heap: shared::Bump,
+}
+
+static TASK: RawLock<Task> = RawLock::new(Task {
+    processes: shared::Processes::new(0),
+    heap: shared::Bump::new(
+        linuxlayer_launch::HEAP.start as usize..linuxlayer_launch::HEAP.end as usize,
+    ),
+});
+
+/// The frames' chunks. Lock order: this, then the heap's, then [`TASK`].
 static TASK_MEMORY: RawLock<Option<shared::TaskMemory<CoreCalls>>> = RawLock::new(None);
 
-/// Runs `f` on the task's shared memory, its first process the personality's own.
+/// Why the task's memory cannot start.
+#[derive(Debug)]
+pub enum TaskMemoryError {
+    /// The heap allocated before its source was set.
+    HeapStarted(moruna_sys::heap::SourceError),
+}
+
+/// Starts the task's shared memory in its first process, `own`: the heap's memory from now
+/// on is mapped in every process of the task. Before anything is allocated.
+pub fn start_task_memory(own: RawHandle) -> Result<(), TaskMemoryError> {
+    TASK.lock()
+        .processes
+        .add(own)
+        .expect("an empty table has room");
+    moruna_sys::heap::set_source(heap_map, heap_unmap).map_err(TaskMemoryError::HeapStarted)
+}
+
+/// The heap's source: `len` bytes at the next heap address, in every process of the task.
+fn heap_map(len: usize) -> Option<usize> {
+    let mut task = TASK.lock();
+    let addr = task.heap.take(len)?;
+    let object = moruna_sys::Memory::create(len as u64).ok()?;
+    shared::map_everywhere(
+        &mut CoreCalls,
+        task.processes.as_slice(),
+        &object,
+        addr,
+        len,
+    )
+    .ok()?;
+    // The mappings keep the pages; the handle closes.
+    drop(object);
+    Some(addr)
+}
+
+/// Gives back what [`heap_map`] mapped, in every process of the task.
+fn heap_unmap(addr: usize, len: usize) {
+    let task = TASK.lock();
+    for &process in task.processes.as_slice() {
+        shared::Core::unmap(&mut CoreCalls, process, addr, len);
+    }
+}
+
+/// The task's processes now, copied out so the caller may allocate.
+fn processes() -> ([RawHandle; TASK_PROCESSES], usize) {
+    let task = TASK.lock();
+    let mut list = [0; TASK_PROCESSES];
+    let now = task.processes.as_slice();
+    list[..now.len()].copy_from_slice(now);
+    (list, now.len())
+}
+
+/// Runs `f` on the frames' chunks.
 fn with_task<R>(f: impl FnOnce(&mut shared::TaskMemory<CoreCalls>) -> R) -> R {
     let mut task = TASK_MEMORY.lock();
     let task = task.get_or_insert_with(|| {
-        let own = self_process().expect("the launcher grants the process its own handle");
         let range = linuxlayer_launch::SHARED;
-        shared::TaskMemory::new(CoreCalls, range.start as usize..range.end as usize, own)
+        shared::TaskMemory::new(CoreCalls, range.start as usize..range.end as usize)
     });
     f(task)
 }
@@ -604,12 +673,18 @@ fn with_task<R>(f: impl FnOnce(&mut shared::TaskMemory<CoreCalls>) -> R) -> R {
 /// A new object of at least `len` bytes (at most `limits::MEMORY_MAX_BYTES`), mapped
 /// readable and writable at one address in every process of the task; that address.
 pub fn shared_map(len: usize) -> crate::Result<usize> {
-    with_task(|task| task.map(len))
+    with_task(|task| {
+        let (list, n) = processes();
+        task.map(len, &list[..n])
+    })
 }
 
 /// Unmaps the object [`shared_map`] mapped at `addr` from every process of the task.
 pub fn shared_unmap(addr: usize) -> crate::Result<()> {
-    with_task(|task| task.unmap(addr))
+    with_task(|task| {
+        let (list, n) = processes();
+        task.unmap(addr, &list[..n])
+    })
 }
 
 /// The shared object holding `addr`: its start, its handle (the same in every process of
@@ -622,22 +697,20 @@ pub fn shared_chunk(addr: usize) -> Option<(usize, RawHandle, usize)> {
 }
 
 /// Runs `clone`, a `process_clone` of a process of the task sharing its handle table, with
-/// the task's shared memory held still, and adds the clone it makes: the clone keeps every
-/// object mapping, so no chunk is missing from it.
+/// the task's memory held still, and adds the clone it makes: the clone keeps every object
+/// mapping, so no chunk is missing from it. `clone` must not allocate.
 pub fn clone_process<E>(clone: impl FnOnce() -> Result<RawHandle, E>) -> Result<RawHandle, E> {
-    with_task(|task| {
-        let child = task.locked(|_| clone())?;
-        task.join_cloned(child);
+    with_task(|_| {
+        let mut task = TASK.lock();
+        let child = clone()?;
+        if task.processes.add(child).is_err() {
+            panic!("a task has more than {TASK_PROCESSES} processes");
+        }
         Ok(child)
     })
 }
 
-/// Adds `process`, made empty for the task, mapping every shared object into it.
-pub fn task_join_empty(process: RawHandle) -> crate::Result<()> {
-    with_task(|task| task.join_empty(process))
-}
-
 /// Takes `process` out of the task: it has ended.
 pub fn task_leave(process: RawHandle) {
-    with_task(|task| task.leave(process));
+    with_task(|_| TASK.lock().processes.remove(process));
 }

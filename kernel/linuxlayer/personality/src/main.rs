@@ -39,7 +39,13 @@ mod image {
         // SAFETY: once, on the only thread, before anything reads a registry.
         unsafe { run_constructors() };
         if let Some(own) = start::take(slot::SELF) {
-            ostd::backend::set_self_process(own.into_raw());
+            let own = own.into_raw();
+            ostd::backend::set_self_process(own);
+            // The heap's memory comes from the task's shared memory, before anything is
+            // allocated: one address in every process of the task.
+            if let Err(e) = ostd::backend::start_task_memory(own) {
+                ostd::early_println!("linux: the heap stays the process's own: {:?}", e);
+            }
         }
         // Frames' objects come from the task's shared memory: one address in every process
         // of the task (`ostd::backend::shared_map`).

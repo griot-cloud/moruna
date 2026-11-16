@@ -13,15 +13,15 @@ mod shared;
 pub(crate) use moruna::*;
 #[cfg(target_os = "none")]
 pub use moruna::{
-    clone_process, copy_through_core, personality_set, self_process, set_self_process,
-    shared_chunk, shared_map, shared_unmap, start_thread_block, task_join_empty, task_leave,
-    user_copy_range,
+    TaskMemoryError, clone_process, copy_through_core, personality_set, self_process,
+    set_self_process, shared_chunk, shared_map, shared_unmap, start_task_memory,
+    start_thread_block, task_leave, user_copy_range,
 };
 #[cfg_attr(
     not(test),
     expect(unused_imports, reason = "the target's binding uses it")
 )]
-pub(crate) use shared::{Core, TaskMemory};
+pub(crate) use shared::{Bump, Core, Processes, TaskMemory, map_everywhere};
 
 #[cfg(not(target_os = "none"))]
 mod host;
