@@ -71,6 +71,10 @@ pub(crate) struct ThreadBlock {
     /// The thread's own handle, for interrupting it; zero for a launched first thread,
     /// which runs no program. Its spawner writes it before the thread runs anything.
     pub(crate) thread: AtomicU32,
+    /// The process the thread is in, zero until its start says: a thread in the
+    /// personality's statics would be every process's, since the task's processes share
+    /// the image's data.
+    pub(crate) process: AtomicU32,
 }
 
 /// The calling thread's block.
@@ -265,6 +269,15 @@ extern "C" fn thread_start(arg: u64) -> ! {
 
 pub(crate) fn spawn(f: Box<dyn FnOnce() + Send>) -> Result<(), ()> {
     let (base, top) = new_stack().ok_or(())?;
+    // The new thread is in the spawner's process.
+    // SAFETY: `base` is the new thread's block, which nothing reads yet; the calling
+    // thread's block is its own.
+    unsafe {
+        let process = (*block()).process.load(Ordering::Acquire);
+        (*(base as *const ThreadBlock))
+            .process
+            .store(process, Ordering::Release);
+    }
     let arg = Box::into_raw(Box::new(f)) as u64;
     match Thread::spawn(thread_start, top as u64, arg) {
         Ok(thread) => {
@@ -304,19 +317,20 @@ pub(crate) fn exit(code: u32) -> ! {
 /// Whether copies run in place: the process was given the copy routines.
 static IN_PLACE: AtomicBool = AtomicBool::new(true);
 /// The personality's own process: the program's.
-static SELF: AtomicUsize = AtomicUsize::new(0);
-
-/// Records the personality's own process, a handle with `READ` and `WRITE` (the launcher
-/// grants it as the slot `self`): the process the program runs in.
+/// Records the calling thread's process, a handle with `READ` and `WRITE` (the launcher
+/// grants the first process its own as the slot `self`): the process its program runs in.
+/// The threads it spawns are in the same process.
 pub fn set_self_process(process: RawHandle) {
-    SELF.store(process as usize, Ordering::Release);
+    // SAFETY: the calling thread's block is its own.
+    unsafe { (*block()).process.store(process, Ordering::Release) };
 }
 
-/// The personality's own process, once recorded.
+/// The calling thread's process, once recorded.
 pub fn self_process() -> Option<RawHandle> {
-    match SELF.load(Ordering::Acquire) {
+    // SAFETY: the calling thread's block is its own.
+    match unsafe { (*block()).process.load(Ordering::Acquire) } {
         0 => None,
-        v => Some(v as RawHandle),
+        v => Some(v),
     }
 }
 
