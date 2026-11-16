@@ -5,8 +5,6 @@ use core::{
     time::Duration,
 };
 
-use ostd::timer::Jiffies;
-
 use self::timer_manager::PosixTimerManager;
 use super::{
     pid_table::{self, PidTable},
@@ -37,22 +35,18 @@ use crate::{
 };
 
 mod init_proc;
-mod job_control;
 mod process_group;
 mod session;
-mod terminal;
 mod timer_manager;
 
 use atomic_integer_wrapper::define_atomic_version_of_integer_like_type;
 pub(crate) use init_proc::spawn_init_process;
-pub(crate) use job_control::JobControl;
 use ostd::{
     sync::{RcuOption, RcuOptionReadGuard, WaitQueue},
     task::Task,
 };
 pub(crate) use process_group::ProcessGroup;
 pub(crate) use session::Session;
-pub(crate) use terminal::Terminal;
 
 /// Process ID.
 pub(crate) type Pid = u32;
@@ -148,8 +142,6 @@ pub struct Process {
     prof_clock: Arc<ProfClock>,
     /// A manager that manages timer resources and utilities of the process.
     timer_manager: PosixTimerManager,
-    /// Process start time since boot.
-    start_time: Jiffies,
 
     // Namespaces
     /// The user namespace
@@ -266,7 +258,6 @@ impl Process {
                 exit_signal: AtomicSigNum::new_empty(),
                 prof_clock,
                 timer_manager,
-                start_time: Jiffies::elapsed(),
                 user_ns: Mutex::new(user_ns),
             }
         })
@@ -299,11 +290,6 @@ impl Process {
     /// Gets the timer resources and utilities of the process.
     pub(crate) fn timer_manager(&self) -> &PosixTimerManager {
         &self.timer_manager
-    }
-
-    /// Returns the process start time since boot.
-    pub(crate) fn start_time(&self) -> Jiffies {
-        self.start_time
     }
 
     pub(crate) fn tasks(&self) -> &Mutex<TaskSet> {
@@ -370,14 +356,6 @@ impl Process {
             .lock()
             .as_ref()
             .map_or(0, |group| group.session().sid())
-    }
-
-    /// Returns the controlling terminal of the process, if any.
-    pub(crate) fn terminal(&self) -> Option<Arc<dyn Terminal>> {
-        self.process_group
-            .lock()
-            .as_ref()
-            .and_then(|group| group.session().lock().terminal().cloned())
     }
 
     /// Moves the process to the new session.
@@ -821,25 +799,6 @@ pub(crate) fn enqueue_signal_async(process: Weak<Process>, signum: SigNum) {
         move || {
             if let Some(process) = process.upgrade() {
                 process.enqueue_signal(Box::new(KernelSignal::new(signum)));
-            }
-        },
-        work_queue::WorkPriority::High,
-    );
-}
-
-/// Broadcasts a process-directed kernel signal asynchronously.
-///
-/// This is the asynchronous version of [`ProcessGroup::broadcast_signal`]. By asynchronous, this
-/// method submits a work item and returns, so this method doesn't sleep and can be used in atomic
-/// mode.
-pub(crate) fn broadcast_signal_async(process_group: Weak<ProcessGroup>, signum: SigNum) {
-    use super::signal::signals::kernel::KernelSignal;
-    use crate::thread::work_queue;
-
-    work_queue::submit_work_func(
-        move || {
-            if let Some(process_group) = process_group.upgrade() {
-                process_group.broadcast_signal(KernelSignal::new(signum));
             }
         },
         work_queue::WorkPriority::High,

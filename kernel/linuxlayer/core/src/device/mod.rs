@@ -4,11 +4,7 @@ mod mem;
 pub(crate) mod misc;
 mod model;
 pub mod registry;
-// Moruna: no terminal is registered (data-os.md section 3a), so no program reaches one.
-// The console's code stays until the job control it serves goes from `process/` (stream
-// B2's), so that neither leaves the other unused.
-#[expect(dead_code, reason = "no terminal is registered")]
-mod tty;
+// Moruna: no terminals (data-os.md section 3a): the tty layer went with job control.
 
 use device_id::DeviceId;
 pub(crate) use mem::{getrandom, geturandom};

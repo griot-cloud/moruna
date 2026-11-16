@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use super::{BOOTSTRAP_SID, Pgid, Process, ProcessGroup, Sid, Terminal};
+use super::{BOOTSTRAP_SID, Pgid, Process, ProcessGroup, Sid};
 use crate::prelude::*;
 
 /// A session.
@@ -12,8 +12,8 @@ use crate::prelude::*;
 /// **Leader**: A *session leader* is the process that creates the session and whose process ID is
 /// equal to the session ID.
 ///
-/// **Controlling terminal**: A terminal can be used to manage all processes in the session. The
-/// controlling terminal is established when the session leader first opens a terminal.
+/// User space: a session has no controlling terminal (data-os.md section 3a has no
+/// terminals).
 pub(crate) struct Session {
     sid: Sid,
     inner: Mutex<Inner>,
@@ -21,7 +21,6 @@ pub(crate) struct Session {
 
 struct Inner {
     process_groups: BTreeMap<Pgid, Weak<ProcessGroup>>,
-    terminal: Option<Arc<dyn Terminal>>,
 }
 
 impl Session {
@@ -59,7 +58,6 @@ impl Session {
             sid,
             inner: Mutex::new(Inner {
                 process_groups: BTreeMap::new(),
-                terminal: None,
             }),
         })
     }
@@ -67,11 +65,6 @@ impl Session {
     /// Returns the session identifier.
     pub(crate) fn sid(&self) -> Sid {
         self.sid
-    }
-
-    /// Returns whether the process is the session leader.
-    pub(super) fn is_leader(&self, process: &Process) -> bool {
-        self.sid == process.pid()
     }
 
     /// Acquires a lock on the session.
@@ -92,19 +85,6 @@ pub(crate) struct SessionGuard<'a> {
 }
 
 impl SessionGuard<'_> {
-    /// Sets the controlling terminal of the session.
-    ///
-    /// The caller needs to ensure that the job control of the old and new controlling terminals
-    /// are properly updated and synchronized.
-    pub(super) fn set_terminal(&mut self, terminal: Option<Arc<dyn Terminal>>) {
-        self.inner.terminal = terminal;
-    }
-
-    /// Returns the controlling terminal of the session.
-    pub(crate) fn terminal(&self) -> Option<&Arc<dyn Terminal>> {
-        self.inner.terminal.as_ref()
-    }
-
     /// Inserts a process group into the session.
     ///
     /// The caller needs to ensure that the process group didn't previously belong to the session,

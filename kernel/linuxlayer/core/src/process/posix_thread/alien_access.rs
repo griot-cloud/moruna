@@ -57,9 +57,6 @@ impl AlienAccessMode {
     /// Read-only alien access check using filesystem credentials.
     pub(crate) const READ_WITH_FS_CREDS: Self =
         Self::new(AlienAccessKind::Read, CredsSource::FsCreds);
-    /// Attach-level alien access check using filesystem credentials.
-    pub(crate) const ATTACH_WITH_FS_CREDS: Self =
-        Self::new(AlienAccessKind::Attach, CredsSource::FsCreds);
 
     pub(crate) const fn new(kind: AlienAccessKind, creds: CredsSource) -> Self {
         Self { kind, creds }

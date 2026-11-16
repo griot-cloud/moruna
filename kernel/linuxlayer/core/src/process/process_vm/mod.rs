@@ -21,7 +21,7 @@ use ostd::task::disable_preempt;
 pub(crate) use self::{
     heap::{Heap, LockedHeap},
     init_stack::{
-        INIT_STACK_SIZE, InitStack, InitStackReader, MAX_LEN_STRING_ARG, MAX_NR_STRING_ARGS,
+        INIT_STACK_SIZE, InitStack, MAX_LEN_STRING_ARG, MAX_NR_STRING_ARGS,
         aux_vec::{AuxKey, AuxVec},
     },
 };
@@ -117,16 +117,6 @@ impl ProcessVm {
     /// Returns the user heap.
     pub(crate) fn heap(&self) -> &Heap {
         &self.heap
-    }
-
-    /// Returns the code range from the executable file.
-    pub(crate) fn code_range(&self) -> Range<Vaddr> {
-        self.code_range.lock().clone()
-    }
-
-    /// Returns the data range from the executable file.
-    pub(crate) fn data_range(&self) -> Range<Vaddr> {
-        self.data_range.lock().clone()
     }
 
     /// Returns a reference to the executable `Path`.
@@ -260,15 +250,6 @@ impl<'a> ProcessVmarGuard<'a> {
     /// current VMAR.
     pub(super) fn set_vmar(&mut self, new_vmar: Option<Arc<Vmar>>) -> Option<Arc<Vmar>> {
         core::mem::replace(&mut *self.inner, new_vmar)
-    }
-
-    /// Returns a reader for reading contents from
-    /// the initial portion of the main stack of a process.
-    ///
-    /// Returns `None` if the process has exited and its VMAR has been dropped.
-    pub(crate) fn init_stack_reader(&self) -> Option<InitStackReader<'_>> {
-        self.as_ref()
-            .map(|vmar| vmar.process_vm().init_stack.reader(vmar))
     }
 }
 

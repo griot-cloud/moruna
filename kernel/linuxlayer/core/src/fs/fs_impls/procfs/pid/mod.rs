@@ -40,10 +40,6 @@ impl PidDirOps {
         self.0.pid_entry()
     }
 
-    pub(super) fn tid_dir_ops(&self) -> &TidDirOps {
-        &self.0
-    }
-
     const STATIC_ENTRIES: &[StaticEntryWithOps<PidDirOps>] =
         &[("task", InodeType::Dir, TaskDirOps::new_inode)];
 }

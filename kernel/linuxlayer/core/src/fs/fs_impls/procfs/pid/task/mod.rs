@@ -25,23 +25,11 @@ use crate::{
     thread::{Thread, Tid},
 };
 
-// Moruna: cut from `/proc` (`procfs/mod.rs`). These stay until the
-// process code only they read is cut from `process/` (stream B2's).
-#[expect(dead_code, reason = "cut from /proc")]
-mod auxv;
-#[expect(dead_code, reason = "cut from /proc")]
-mod cmdline;
-#[expect(dead_code, reason = "cut from /proc")]
-mod environ;
 mod exe;
 mod fd;
 mod maps;
-#[expect(dead_code, reason = "cut from /proc")]
-mod mem;
 mod mountinfo;
 mod mounts;
-#[expect(dead_code, reason = "cut from /proc")]
-mod stat;
 mod status;
 
 /// Represents the inode at `/proc/[pid]/task`.

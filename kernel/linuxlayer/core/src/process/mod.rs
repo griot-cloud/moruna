@@ -35,8 +35,8 @@ pub(crate) use namespace::{
 pub(crate) use pid_file::PidFile;
 pub use process::Process;
 pub(crate) use process::{
-    ExitCode, INIT_PROCESS_PID, JobControl, Pgid, Pid, ProcessGroup, ReapedChildrenStats, Session,
-    Sid, Terminal, broadcast_signal_async, enqueue_signal_async, spawn_init_process,
+    ExitCode, INIT_PROCESS_PID, Pgid, Pid, ProcessGroup, ReapedChildrenStats, Session, Sid,
+    enqueue_signal_async, spawn_init_process,
 };
 pub(crate) use process_filter::ProcessFilter;
 pub(crate) use process_vm::{INIT_STACK_SIZE, LockedHeap, ProcessVm, VmarSnapshot};

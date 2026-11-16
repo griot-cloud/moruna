@@ -19,14 +19,6 @@ use crate::{
     security::lsm::is_yama_enabled,
 };
 
-// Moruna: cut from `/proc` (`procfs/mod.rs`). These stay until the
-// credentials and names only they read are cut from `process/` and `net/`.
-#[expect(dead_code, reason = "cut from /proc")]
-mod overflow_gid;
-#[expect(dead_code, reason = "cut from /proc")]
-mod overflow_uid;
-#[expect(dead_code, reason = "cut from /proc")]
-mod uts;
 mod yama;
 
 /// Represents the inode at `/proc/sys/kernel`.

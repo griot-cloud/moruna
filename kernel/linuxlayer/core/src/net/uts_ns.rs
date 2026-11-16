@@ -176,16 +176,6 @@ impl UtsName {
         target_arch = "aarch64" => "aarch64",
         _ => compile_error!("unsupported target"),
     };
-
-    /// Returns the hostname.
-    pub(crate) fn nodename(&self) -> &UtsField {
-        &self.nodename
-    }
-
-    /// Returns the NIS domain name.
-    pub(crate) fn domainname(&self) -> &UtsField {
-        &self.domainname
-    }
 }
 
 /// The storage byte length of a UTS field, including the trailing nul.

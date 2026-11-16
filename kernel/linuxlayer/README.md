@@ -45,11 +45,16 @@ run as user code in the upper region of each task's own process. Stream B2 of
   - a shell, and the default search for a first program: the personality runs the one
     program a task's command names on its image, or a booted test's `/init`;
   - administrative calls (see "Refused calls");
-  - terminals, `devpts` and ptys, overlayfs, configfs and the systree's `/sys` (stream
-    B2-fs); `/proc` and `/sys` are cut to what a task's programs read;
+  - terminals and job control (`device/tty`, a session's controlling terminal), `devpts`
+    and ptys, overlayfs, configfs and the systree's `/sys`; `/proc` and `/sys` are cut to
+    what a task's programs read, and the process code only the cut files read went with
+    them (overflow uid and gid, the UTS names' readers, start time, the init stack's
+    reader);
+  - mounting: the mount family's handlers and the fs code only they reached (the
+    filesystem types' mount-by-name path, mount propagation's slave and unbindable
+    states), since `refused.rs` answers those calls;
   - block filesystems as a root: ext2 and exfat stay compiled but unreachable until the
-    page cache's write-back leaves `vm/`, and the tty layer until job control leaves
-    `process/`.
+    page cache's write-back leaves `vm/`.
 - **`libs/short-vis-path/tests`,** which run the external `cargo expand`.
 
 ## The mechanical swaps

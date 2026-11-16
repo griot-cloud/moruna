@@ -3,7 +3,7 @@
 use alloc::collections::btree_map::Values;
 
 use super::{BOOTSTRAP_PGID, BOOTSTRAP_SID, Pgid, Pid, Process, Session};
-use crate::{prelude::*, process::signal::signals::Signal};
+use crate::prelude::*;
 
 /// A process group.
 ///
@@ -70,23 +70,6 @@ impl ProcessGroup {
     pub(crate) fn lock(&self) -> ProcessGroupGuard<'_> {
         ProcessGroupGuard {
             inner: self.inner.lock(),
-        }
-    }
-
-    /// Broadcasts the signal to all processes in the process group.
-    ///
-    /// This method should only be used to broadcast fault signals and kernel signals.
-    //
-    // TODO: Do some checks to forbid user signals.
-    pub(crate) fn broadcast_signal(&self, signal: impl Signal + Clone + 'static) {
-        for process in self
-            .inner
-            .lock()
-            .processes
-            .values()
-            .filter_map(Weak::upgrade)
-        {
-            process.enqueue_signal(Box::new(signal.clone()));
         }
     }
 }

@@ -165,11 +165,6 @@ impl Heap {
 }
 
 impl LockedHeap<'_> {
-    /// Returns the lowest address of the heap.
-    pub(crate) fn heap_low(&self) -> Vaddr {
-        self.heap_range().start
-    }
-
     /// Returns the current heap range.
     pub(crate) fn heap_range(&self) -> &Range<Vaddr> {
         let inner = self.inner.as_ref().expect("Heap is not initialized");
