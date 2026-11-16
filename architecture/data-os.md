@@ -417,6 +417,22 @@ This is `kernel-is-the-machine.md` §4.1 and §4.2, cut to a VM with no network.
   on the core's futex). About 25,000 lines are rewritten against the four mechanisms of §2.
 - **0.7.0 needs** processes, files, pipes, signals, epoll and the synthetic filesystems. Sockets
   and the cloud platform stay out: the VM has no network and runs on a Linux node.
+- **`fork` (integrator, 2026-11-16, on stream B2's question).** One instance per task means
+  every Linux process of the task must see the personality's handles and memory the same way.
+  - **The core shares a handle table on request:** `process_clone` with `SHARE_HANDLES` gives
+    the clone the cloned process's own table, as Linux's `CLONE_FILES` does.
+    - Only a caller that has a personality, and holds that same table, may ask. The engine has
+      no personality, so its table is never shared.
+    - Ending a task frees the table and every process in it, even when processes hold each
+      other's handles.
+    - This grants nothing new: the task's processes already share the personality's memory,
+      which holds every value in the table.
+  - **The personality's region needs no core change:** its allocator maps each object, up to
+    256 MiB, at an address it picks in every process of the task, under one lock, before
+    handing out any memory from it. A clone inherits those mappings. Shared page tables for
+    the region were declined: they are new code in OSTD's page tables, and these maps are
+    rare. A measurement that shows they cost reopens it.
+  - The engine never forks (C6), so none of this is on the engine's path.
 - **Today's personality** (`kernel/linux`, 7,386 lines, a message per call) is retired when this
   runs the gate's images.
 - **A Linux bug stays in user space.** It reaches the task it serves, never kernel mode and never
