@@ -1,0 +1,25 @@
+# The gate's native tasks: each job's function as a program of the Moruna kernel's user target,
+# on the data plane (`moruna_sys::plane`). Built by build.sh as kernel/tools/build.sh builds the
+# kernel's own programs: the kernel's nightly, core and alloc from source, the user linker
+# script. Its own workspace, since it builds for that target only.
+[workspace]
+resolver = "3"
+
+[package]
+name = "moruna-gate-tasks"
+description = "The gate's seven functions as native Moruna tasks on the data plane"
+version = "0.7.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+moruna-sys = { path = "../../../kernel/sys", features = ["heap"] }
+moruna-gate-record = { path = "../record" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+debug = 1

@@ -1,0 +1,19 @@
+[package]
+name = "moruna-gate-record"
+description = "A gate function on the data plane: a page-aligned Arrow record in, a record written into a window out, no_std"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-gate-functions.workspace = true
+moruna-ipc-check.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+moruna-gate-functions = { workspace = true, features = ["arrow"] }
+arrow = { workspace = true, features = ["ipc"] }
+serde_json = { version = "=1.0.151" }
+bytemuck = { workspace = true }

@@ -1,13 +1,28 @@
 """Runs the plan: each run in its own cgroup (cpuset, cpu.max, memory.max/high), sampled every 0.5 s.
-Run as root. Results: /data/results/<id>.json. Usage: driver.py PLAN.json [ONLY_PREFIX]"""
+Run as root. Results: /data/results/<id>.json. Usage: driver.py PLAN.json [ONLY_PREFIX]
+
+Every run's output is reduced to the gate's canonical form (gate-canon, canon.py) before it is
+deleted: `canon` holds its canonical row count and hashes, and a workload with a tolerant column
+keeps its tolerant rows in /data/results/canon/<id>.dump for report.py to compare. `check`, the
+row count and column sums of 0.6.5's harness, stays beside it.
+
+The engines with no Python (rust-baseline, the gate's Rust functions in a rayon pool, and
+moruna-vm, 0.7 through `moruna run` on the data OS) run as their own commands in the cgroup."""
 import json, os, subprocess, sys, time, threading, shutil, glob
 import pyarrow.parquet as pq, pyarrow.compute as pc
 CG = "/sys/fs/cgroup/bench"; RES = "/data/results"
-PY = {"moruna": "/data/venv-t/bin/python", "loop": "/data/venv-t/bin/python", "loophooked": "/data/venv-t/bin/python", "moruna065": "/data/venv-065/bin/python",
+PY = {"moruna066-rust": "/data/venv-t/bin/python", "duckdb-sql": "/data/venv-g/bin/python", "polars-expr": "/data/venv-g/bin/python",
+      "moruna": "/data/venv-t/bin/python", "loop": "/data/venv-t/bin/python", "loophooked": "/data/venv-t/bin/python", "moruna065": "/data/venv-065/bin/python",
       "polars": "/data/venv-g/bin/python", "duckdb": "/data/venv-g/bin/python",
       "morunang": "/data/venv-t/bin/python", "spark": "/data/venv-rt/bin/python", "ray": "/data/venv-rt/bin/python",
       "dask": "/data/venv-rt/bin/python", "duckdbudf": "/data/venv-rt/bin/python"}
 GiB = 1 << 30
+# The gate's binaries (images/gate): gate-baseline and gate-canon, built on the VM with
+# `cargo build --release` in images/gate; 0.7's `moruna` CLI (stream D) for moruna-vm.
+GATE = os.environ.get("GATE_BIN", "/home/bench/gate/bin")
+MORUNA07 = os.environ.get("MORUNA07_BIN", "/home/bench/moruna07/bin/moruna")
+NATIVE = ("rust-baseline", "moruna-vm")
+DUMPED = ("score",)
 
 def wr(path, value):
     with open(path, "w") as f: f.write(str(value))
@@ -44,13 +59,76 @@ def checksum(workload, out):
     if workload == "occupancy": rows = None   # per-batch partial counts: only the total is invariant
     return {"rows_out": rows, "sum": round(s, 1), "files": len(files)}
 
-def run(spec):
-    rid = spec["id"]; cg = f"{CG}/{rid}"
-    if os.path.isdir(cg): os.rmdir(cg)
-    os.makedirs(cg)
-    limits(cg, spec["cpus"], spec["mem_gib"])
-    out = f"/data/out/{rid}"; shutil.rmtree(out, ignore_errors=True); os.makedirs(out); os.chown(out, 1000, 1000)
-    flist = f"/data/results/{rid}.files"; open(flist, "w").write("\n".join(spec["files"]))
+def canon(spec, out):
+    """The output's canonical form: gate-canon's digest, and its tolerant rows kept for a later
+    comparison when the workload has a tolerant column (canon.py's SPECS)."""
+    import canon as reference
+    wl = spec["workload"]
+    os.makedirs(f"{RES}/canon", exist_ok=True)
+    # Tolerant rows are kept for the NYC jobs only: Overture's 1.19 billion rows would make a dump
+    # of tens of GB an engine. There, hash_exact is the check, and hash_all says whether the
+    # tolerant columns matched bit for bit; a bucketed comparison of them is not built yet.
+    dump = f"{RES}/canon/{spec['id']}.dump" if reference.SPECS[wl].get("tolerant") and wl in DUMPED else None
+    tool = f"{GATE}/gate-canon"
+    if os.path.exists(tool):
+        cmd = [tool, "digest", wl] + (["--dump", dump] if dump else []) + [out]
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if p.returncode != 0:
+            return {"error": p.stderr.strip()[-300:]}
+        d = json.loads(p.stdout)
+    else:  # the reference implementation: fine for small outputs, slow for large ones
+        d = reference.canonical(wl, reference.read_output([out]))
+        d.pop("tolerant_rows")
+        d["note"] = "canon.py: gate-canon was not built"
+    d["dump"] = dump
+    return d
+
+
+def moruna_vm(spec, out, flist):
+    """moruna-vm's command and where its report goes: the gate's job (gate_jobs.py) through 0.7's
+    `moruna run` (stream D). PENDING D: the CLI's options are its contract's, as
+    architecture/data-os-streams.md section D describes it (the job, the output directory, the
+    report); they change here if D's land differently."""
+    import gate_jobs
+    job = f"{RES}/{spec['id']}.job.json"
+    gate_jobs.write(job, spec["workload"], spec["files"], out, spec.get("image", {}),
+                    cpus=spec["cpus"], mem_gib=spec["mem_gib"])
+    report = f"{RES}/{spec['id']}.report.json"
+    return [MORUNA07, "run", job, "--output", out, "--report", report], report
+
+
+def vm_result(spec, report_path, wall):
+    """moruna-vm's result from 0.7's report: the VM's boot apart, and the time split as far as the
+    report has it (control 5)."""
+    import runner_split
+    try:
+        d = json.load(open(report_path))
+    except (OSError, ValueError) as e:
+        return {"engine": "moruna-vm", "function": "rust", "wall_s": wall, "error": f"no report: {e}"}
+    vm = d.get("vm") or d.get("host") or {}
+    boot = vm.get("boot_s", (vm.get("boot_ms") or 0) / 1e3 or None)
+    res = {"engine": "moruna-vm", "function": "rust", "wall_s": wall, "boot_s": boot,
+           "version": d.get("version")}
+    res["moruna"] = runner_split.split(d)
+    if d.get("exit") not in (None, "completed", "ok", 0):
+        res["error"] = f"exit {d.get('exit')}"
+    return res
+
+
+def command(spec, out, flist):
+    """The run's command: runner.py for every Python engine, the binary for the Rust ones."""
+    as_bench = ["setpriv", "--reuid=bench", "--regid=bench", "--init-groups", "--"]
+    if spec["engine"] == "rust-baseline":
+        return as_bench + [f"{GATE}/gate-baseline", "--job", spec["workload"], "--files", flist, "--out", out,
+                           "--threads", str(spec.get("threads", 0)), "--batch", str(spec.get("batch", 0))], None
+    if spec["engine"] == "moruna-vm":
+        cmd, report = moruna_vm(spec, out, flist)
+        return as_bench + cmd, report
+    return None, None
+
+
+def runner_command(spec, rid, out, flist):
+    """runner.py's command for a Python engine, with the plan's options."""
     cmd = ["setpriv", "--reuid=bench", "--regid=bench", "--init-groups", "--", PY[spec["engine"]], "-I",
            "/home/bench/bench/runner.py", "--engine", spec["engine"], "--workload", spec["workload"],
            "--files", flist, "--out", out, "--report", f"{RES}/{rid}.report.json",
@@ -71,6 +149,18 @@ def run(spec):
         if spec.get("fresh_cost"): shutil.rmtree(spec["cost"], ignore_errors=True)
         os.makedirs(spec["cost"], exist_ok=True); os.chown(spec["cost"], 1000, 1000)
         cmd += ["--cost", spec["cost"]]
+    return cmd
+
+
+def run(spec):
+    rid = spec["id"]; cg = f"{CG}/{rid}"
+    if os.path.isdir(cg): os.rmdir(cg)
+    os.makedirs(cg)
+    limits(cg, spec["cpus"], spec["mem_gib"])
+    out = f"/data/out/{rid}"; shutil.rmtree(out, ignore_errors=True); os.makedirs(out); os.chown(out, 1000, 1000)
+    flist = f"/data/results/{rid}.files"; open(flist, "w").write("\n".join(spec["files"]))
+    native, vm_report = command(spec, out, flist)
+    cmd = native or runner_command(spec, rid, out, flist)
     if spec.get("perf"): cmd = ["perf", "record", "-F", "199", "-g", "-o", f"{RES}/{rid}.perf.data", "--"] + cmd
     env = {"PATH": "/usr/bin:/bin", "HOME": "/home/bench", "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1",
            "MKL_NUM_THREADS": "1", "PYTHONPATH": "/home/bench/bench", "JAVA_HOME": "/usr/lib/jvm/java-17-openjdk-amd64", "TMPDIR": "/data/tmp"}
@@ -114,12 +204,22 @@ def run(spec):
     peak = int(rd(f"{cg}/memory.peak").strip() or 0)
     cpu_s = next((int(l.split()[1]) for l in rd(f"{cg}/cpu.stat").splitlines() if l.startswith("usage_usec")), 0) / 1e6
     result = next((json.loads(l[7:]) for l in stdout.splitlines() if l.startswith("RESULT ")), None)
+    if spec["engine"] == "moruna-vm":
+        result = vm_result(spec, vm_report, wall)
     rec = {"spec": {k: v for k, v in spec.items() if k != "files"}, "files": len(spec["files"]), "exit_code": proc.returncode,
            "oom_kills": int(events.get("oom_kill", 0)), "wall_s": round(wall, 2), "cpu_s": round(cpu_s, 1),
            "cpu_util": round(cpu_s / (wall * spec["cpus"]), 3) if not spec.get("schedule") else None,
            "cg_peak_bytes": peak, "result": result, "applied": applied, "samples": samples}
     rec["ok"] = proc.returncode == 0 and result is not None and not (result or {}).get("error")
-    if rec["ok"]: rec["check"] = checksum(spec["workload"], out)
+    if rec["ok"]:
+        rec["check"] = checksum(spec["workload"], out)
+        rec["canon"] = canon(spec, out)
+    # The PM's controls 4 and 5 beside wall time: CPU-seconds and peak memory are above; the
+    # split and the VM's boot are the engine's own figures.
+    r = result or {}
+    rec["boot_s"] = r.get("boot_s")
+    rec["split"] = r.get("split") or (r.get("moruna") or {}).get("split")
+    rec["function"] = r.get("function")
     shutil.rmtree(out, ignore_errors=True)
     for p in glob.glob(f"{cg}/*"): pass
     try: os.rmdir(cg)
