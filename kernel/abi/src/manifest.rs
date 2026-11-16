@@ -34,8 +34,9 @@ pub const VERSION: u32 = 1;
 pub const MAX_BYTES: usize = 64 * 1024;
 /// The longest line, in bytes.
 pub const MAX_LINE: usize = 512;
-/// The most processes a manifest starts.
-pub const MAX_PROCESSES: usize = 32;
+/// The most processes a manifest starts. 64 since 2026-11-16: the data OS's booted tests
+/// filled 32.
+pub const MAX_PROCESSES: usize = 64;
 /// The most channels a manifest declares.
 pub const MAX_CHANNELS: usize = 64;
 /// The longest path, in bytes.
