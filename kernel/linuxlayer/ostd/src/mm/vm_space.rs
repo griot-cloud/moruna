@@ -392,27 +392,13 @@ impl VmSpace {
         Ok(true)
     }
 
-    /// The personality's address of the byte at `va`, if a frame is mapped there with the
-    /// access asked for: through the process the space is shown in, as its program would
-    /// reach it, or through the record when it is shown nowhere. `None` too when the space
-    /// is locked by a cursor. Host tests only.
+    /// The personality's address of the byte at `va`, if the process the space is shown in
+    /// maps a page there with the access asked for, as its program would reach it; `None`
+    /// too when the space is shown nowhere or locked by a cursor. Host tests only.
     #[cfg(not(target_os = "none"))]
     pub(crate) fn translate(&self, va: Vaddr, write: bool) -> Option<usize> {
-        let state = self.state.try_lock()?;
-        if let Some(process) = state.process {
-            drop(state);
-            return emulated::translate(process, va, write);
-        }
-        let e = state.pages.get(&(va & !(PAGE_SIZE - 1)))?;
-        let allowed = if write {
-            e.prop.flags.contains(PageFlags::W)
-        } else {
-            e.prop.flags.contains(PageFlags::R)
-        };
-        match &e.item {
-            Item::Frame(f) if allowed => Some(f.paddr() + va % PAGE_SIZE),
-            _ => None,
-        }
+        let process = self.state.try_lock()?.process?;
+        emulated::translate(process, va, write)
     }
 
     /// A reader over the program's memory at `vaddr`.
