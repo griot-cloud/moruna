@@ -75,6 +75,9 @@ pub(crate) struct ThreadBlock {
     /// personality's statics would be every process's, since the task's processes share
     /// the image's data.
     pub(crate) process: AtomicU32,
+    /// The interrupt level the thread runs at (`irq::InterruptLevel`): zero but while the
+    /// ticker runs a tick.
+    pub(crate) irq_level: core::sync::atomic::AtomicU8,
 }
 
 /// The calling thread's block.
@@ -94,6 +97,17 @@ pub(crate) fn current_slot() -> usize {
 pub(crate) fn set_current_slot(value: usize) {
     // SAFETY: as above.
     unsafe { (*block()).task = value };
+}
+
+/// The calling thread's interrupt level.
+pub(crate) fn irq_level() -> u8 {
+    // SAFETY: the calling thread's block is its own.
+    unsafe { (*block()).irq_level.load(Ordering::Relaxed) }
+}
+
+pub(crate) fn set_irq_level(level: u8) {
+    // SAFETY: as above.
+    unsafe { (*block()).irq_level.store(level, Ordering::Relaxed) };
 }
 
 /// What names the calling thread for [`interrupt`]: its block's address.

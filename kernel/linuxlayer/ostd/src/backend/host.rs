@@ -108,6 +108,7 @@ thread_local! {
     static CURRENT: Cell<usize> = const { Cell::new(0) };
     static FAULTS: RefCell<Vec<Range<usize>>> = const { RefCell::new(Vec::new()) };
     static FS_BASE: Cell<usize> = const { Cell::new(0) };
+    static IRQ_LEVEL: Cell<u8> = const { Cell::new(0) };
     static GS_BASE: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -146,6 +147,15 @@ pub(crate) fn interrupt(_token: usize) {
 #[cfg(all(test, ktest))]
 pub(crate) fn interrupts() -> usize {
     INTERRUPTS.load(Ordering::SeqCst)
+}
+
+/// The calling thread's interrupt level.
+pub(crate) fn irq_level() -> u8 {
+    IRQ_LEVEL.with(Cell::get)
+}
+
+pub(crate) fn set_irq_level(level: u8) {
+    IRQ_LEVEL.with(|c| c.set(level));
 }
 
 /// The calling thread's task slot.

@@ -46,13 +46,16 @@ pub(crate) fn start_ticker() {
 
 /// Runs every callback once, then the bottom half: what a tick does.
 pub fn tick() {
-    {
-        let callbacks = CALLBACKS.lock();
-        for callback in callbacks.iter() {
-            callback();
+    // OSTD runs these in the timer interrupt: they see an interrupt level.
+    crate::irq::as_interrupt(|| {
+        {
+            let callbacks = CALLBACKS.lock();
+            for callback in callbacks.iter() {
+                callback();
+            }
         }
-    }
-    crate::irq::process_bottom_half(crate::irq::TIMER_IRQ);
+        crate::irq::process_bottom_half(crate::irq::TIMER_IRQ);
+    });
 }
 
 fn ticker() {

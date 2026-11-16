@@ -906,6 +906,22 @@ fn panic_power_io_and_scheduler_stand_ins() {
     crate::irq::register_bottom_half_handler_l1(half);
     crate::timer::tick();
     assert!(HALVES.load(Ordering::Relaxed) >= 1);
+    // A tick's callbacks run at an interrupt level, and task context comes back after.
+    static LEVELS: AtomicUsize = AtomicUsize::new(0);
+    crate::timer::register_callback_on_cpu(|| {
+        if crate::irq::InterruptLevel::current()
+            == crate::irq::InterruptLevel::L1(crate::cpu::PrivilegeLevel::Kernel)
+        {
+            LEVELS.fetch_add(1, Ordering::Relaxed);
+        }
+        assert_eq!(
+            crate::irq::as_interrupt(crate::irq::InterruptLevel::current),
+            crate::irq::InterruptLevel::L2
+        );
+    });
+    crate::timer::tick();
+    assert!(LEVELS.load(Ordering::Relaxed) >= 1);
+    assert!(crate::irq::InterruptLevel::current().is_task_context());
     crate::task::halt_cpu();
     let _ = CpuException::new(14, 2, 0x1000);
 }

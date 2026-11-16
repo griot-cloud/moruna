@@ -54,9 +54,15 @@ pub enum InterruptLevel {
 }
 
 impl InterruptLevel {
-    /// The current level: always task context in user space.
+    /// The calling thread's level: task context, but for the ticker's thread while it runs
+    /// the tick's callbacks and bottom halves, which OSTD runs in a timer interrupt
+    /// (`timer::tick`).
     pub fn current() -> Self {
-        Self::L0
+        match crate::backend::irq_level() {
+            0 => Self::L0,
+            1 => Self::L1(crate::cpu::PrivilegeLevel::Kernel),
+            _ => Self::L2,
+        }
     }
 
     /// Whether this is task context.
@@ -68,6 +74,15 @@ impl InterruptLevel {
     pub fn is_interrupt_context(&self) -> bool {
         !self.is_task_context()
     }
+}
+
+/// Runs `f` as an interrupt handler would: one level deeper, back when it returns.
+pub(crate) fn as_interrupt<R>(f: impl FnOnce() -> R) -> R {
+    let level = crate::backend::irq_level();
+    crate::backend::set_irq_level(level.saturating_add(1));
+    let result = f();
+    crate::backend::set_irq_level(level);
+    result
 }
 
 /// The interrupt number bottom halves see for the ticker's tick.
