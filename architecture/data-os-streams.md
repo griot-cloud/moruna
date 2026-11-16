@@ -324,7 +324,21 @@ and switches to the new one when the call answers.
     producing 0.6.6's output rows (count and content hash) from 0.6.6's input. A float column
     that cannot match bit for bit is named with its tolerance before it is measured;
   - the harness's data OS mode: each job through `moruna run` on `moruna-bench`, timed against
-    0.6.6 on the same data (`arrow-core-0.7.md` §9).
+    0.6.6 on the same data (`arrow-core-0.7.md` §9);
+  - the PM's controls (2026-11-16), so the result says something about the engine and the OS,
+    not only about leaving Python:
+    1. **The same function on 0.6.6.** If 0.6.6 can run the Rust port (the `rust` entry from
+       strict-guest-kernels, a kernel compiled into the binary), 0.6.6 is timed with it too. The
+       report gives both: 0.6.6 with the Python functions (the published table) and 0.6.6 with
+       the Rust functions. If 0.6.6 cannot run them, the report says so.
+    2. **A plain Rust baseline** for the "better than other options" runs: the same Rust function
+       in a plain Rust thread pool (arrow-rs and parquet reading the same row groups, rayon,
+       writing the same zstd level). Ray and Spark keep the Python functions, labelled as such.
+    3. **The same output settings for every run:** zstd level, row group size, files and splits.
+    4. **CPU-seconds and peak memory beside wall time.**
+    5. **A time split per job:** read and decode, the function, encode and write, and waits.
+    6. **A record of each port's equivalence:** the Python function it replaces, its output rows
+       matched by count and content hash, and any float tolerance named before measuring.
 - **Tests:** the harness's own unit tests, and the fixtures under KVM.
 - **Done when:** the gate runs end to end on `moruna-bench` for the NYC set, then the large
   jobs, with identical rows, boot reported, and both machine types ready, and hands its numbers

@@ -340,6 +340,15 @@ data; we're supposed to measure that, simple."
 - **Measure the noise.** Two NYC pairs of 0.6.6 against itself give the same-session noise.
 - **Pass.** On every benchmark, 0.7's median `wall_s` and median peak memory are no worse than
   0.6.6's beyond that noise, with no OOM kills.
+- **The PM's controls for ported functions** (2026-11-16):
+  - 0.6.6 is also timed with the same Rust function where it can run one, and the report says
+    so where it cannot;
+  - a plain Rust thread pool (arrow-rs, parquet, rayon) runs the same function as the "other
+    options" baseline, beside Ray and Spark running the Python functions, labelled;
+  - every run uses the same zstd level, row group size, files and splits;
+  - CPU-seconds and peak memory are reported beside wall time;
+  - each job's time is split into read and decode, the function, encode and write, and waits;
+  - each port records the Python function it replaces and its matched rows.
 
 The harness is `bench/vm/`. It gains a mode that runs the job through `moruna run` on the VM.
 
