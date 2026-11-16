@@ -4,6 +4,22 @@
   "crate": "ostd",
   "license": "MPL-2.0",
   "modified_upstream_files": {
+    "src/arch/x86/cpu/context/mod.rs": {
+      "patched_sha256": "0feeef19b89ebcfc0939976908b3d2c6bd86f8c398ff90e3524b17da7e3ad53e",
+      "upstream_sha256": "e179934a23e419c956b28c1c3b1f067f1f6e89f79cb466f39b22e407dfcdd99f"
+    },
+    "src/arch/x86/mod.rs": {
+      "patched_sha256": "43f92f372728cb565cc18e8cf90ce6aec765d72abdf72f4d8684386ce54ce1a1",
+      "upstream_sha256": "660b5a76184cb63f9e92b170104e6b77bbea79a3bfc428cac47e6845c1d26af3"
+    },
+    "src/arch/x86/timer/apic.rs": {
+      "patched_sha256": "f6791ed892d47cb967c5359f8513cdb72bd68ec6c2e3610c142b67203e048f21",
+      "upstream_sha256": "42f44b7e1ac4ec158aa9d575a80980bfdcb3f34381db92be0e612e7ecb644b31"
+    },
+    "src/arch/x86/timer/mod.rs": {
+      "patched_sha256": "e58fe2e0617f04189b3f43e4afc393e598356d6277eb2667f53c20f7b5414a27",
+      "upstream_sha256": "3fdff1d350877c451d5357770594a44e10a4c2a8ebaa03a918e080e5d5ffc8c9"
+    },
     "src/cpu/mod.rs": {
       "patched_sha256": "55ba526132b93ee564be469852087d9ec6475a2bf022a2282ba0802d8f1598a1",
       "upstream_sha256": "823031821bc36c5f9fccc46c496b634b3e965be3b25ccb0d1516f1a5f74e29a7"
@@ -28,9 +44,21 @@
       "patched_sha256": "c7a4d60001e637a0bcc527839d2661871daede33d8dbe5eaeb3ccaba7e8c2eaf",
       "upstream_sha256": "6baec94428aa053d3cfb32f402f021db0b3d28e8cc4dce4b01ab8d3dfef64a84"
     },
+    "src/sync/mod.rs": {
+      "patched_sha256": "edc97bc10c82caa98749089a6123d3965c7e4d4fa3b334bd5d3b9174520e8583",
+      "upstream_sha256": "054ba0261ff6274de8078a16ca5d2f3842f9b6e12daade9b5f64c22e63a5aee2"
+    },
+    "src/sync/rcu/mod.rs": {
+      "patched_sha256": "0e354b58f650dc02444b9386e6d23b1eb21251b0ed8f976c215362e4826eddf9",
+      "upstream_sha256": "7d1b87a14d98cbebd1068869155043d3882a01256bbc885ff2b8029cc6d08278"
+    },
     "src/task/scheduler/mod.rs": {
       "patched_sha256": "3c7a2a8de94e0f1acf08a7aa2167cfb77cc4cf84d3c8311995855649def89f25",
       "upstream_sha256": "adbe8fbb06789c6a9cce19a53987e3355d2c8c50bc0449c6db23066acbd3f979"
+    },
+    "src/timer/mod.rs": {
+      "patched_sha256": "6d7f60c8986bc340d8d3bceb536876c6681b14d2334ed78114723fce66f3e520",
+      "upstream_sha256": "76b227f1e87b417f9de6f2148da748064538284a129ae6fc7c4c7f0b8a9854ce"
     }
   },
   "official_archive": "https://static.crates.io/crates/ostd/ostd-0.19.0.crate",

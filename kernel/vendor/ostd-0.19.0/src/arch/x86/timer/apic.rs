@@ -39,12 +39,18 @@ pub(super) fn init_on_ap(timer_irq: &IrqLine) {
 
 /// A callback that needs to be called on timer interrupt.
 pub(super) fn timer_callback() {
+    rearm(crate::timer::tick_stretch());
+}
+
+/// Arms the TSC deadline `periods` timer periods from now (a periodic timer keeps its
+/// period).
+pub(super) fn rearm(periods: u64) {
     use x86::msr::{IA32_TSC_DEADLINE, wrmsr};
 
     match CONFIG.get().expect("ACPI timer config is not initialized") {
         Config::DeadlineMode { tsc_interval } => {
             let tsc_value = crate::arch::read_tsc();
-            let next_tsc_value = tsc_interval + tsc_value;
+            let next_tsc_value = tsc_interval.saturating_mul(periods) + tsc_value;
             unsafe { wrmsr(IA32_TSC_DEADLINE, next_tsc_value) };
         }
         Config::PeriodicMode { .. } => {}

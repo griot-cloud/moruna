@@ -16,6 +16,19 @@
 //!   keeps it; a partial unmap leaves the rest mapped. The page table is read with
 //!   `plane_probe` (the CI boot's kernel).
 //!
+//! - `map::POPULATE` zero pages through `process_map`: every page charged at the call, and
+//!   none charged again when it is written (no page is touched for the first time);
+//! - `windows_protect`'s slot form: an engine revokes a task's window through the output
+//!   slot alone. A revoked page keeps its bytes, a put of a window part of which is revoked
+//!   gives the record back, refusals change nothing, and `dp-task`'s write to a page
+//!   revoked this way faults.
+//!
+//! - C5's stretched tick: a thread queued on a CPU whose tick is stretched (it ran one
+//!   thread) runs there within 20 ms, and then two threads share the CPU; and grace
+//!   periods complete while a CPU runs one thread in user mode, switching no task: CPU 0
+//!   makes and frees more memory than the machine has, each freed frame waiting for a
+//!   grace period.
+//!
 //! It also measures what C4, C5 and C8 are judged by: a touch a page through large pages
 //! and through 4 KiB ones, the time a pinned CPU loses to the kernel, and a read of the
 //! page against a `clock_get`. `dp-revoke` shows a write to a revoked window faults.
@@ -27,15 +40,18 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use moruna_kb1_programs::{console, ms};
+use moruna_kb1_programs::{console, ms, slot};
 use moruna_sys::{
-    Error, Mapping, Memory, Rights, Signals, Thread,
+    Account, Channel, Error, Handle, Mapping, Memory, Process, Rights, Signals, Thread, charge,
     datapath::{
         ClockPage, clock_page, current_cpu, mapping_size, pin_current_thread, thread_set_cpu,
+        windows_protect_slot,
     },
-    futex_wait, futex_wake, map, now, println, raw, thread_exit, wait_one,
+    futex_wait, futex_wake, map, now,
+    plane::{Slot, SlotEvent, attach},
+    println, raw, thread_exit, wait_one,
 };
 
 moruna_sys::main!(run);
@@ -78,6 +94,12 @@ fn run() -> i64 {
     if let Err(code) = ticks(&out, cpus) {
         return code;
     }
+    if let Err(code) = share(&out, cpus) {
+        return code;
+    }
+    if let Err(code) = rcu(&out, cpus) {
+        return code;
+    }
     if let Err(code) = clock(&out) {
         return code;
     }
@@ -85,6 +107,16 @@ fn run() -> i64 {
         return code;
     }
     if let Err(code) = huge(&out) {
+        return code;
+    }
+    let resource = match process_resource(&out) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    if let Err(code) = populate(&out, &resource) {
+        return code;
+    }
+    if let Err(code) = slot_form(&out, &resource, &slot("task-image")) {
         return code;
     }
     0
@@ -637,6 +669,467 @@ fn huge(out: &Out) -> Result<(), i64> {
         OBJECT / MIB,
         large_ns,
         plain_ns
+    );
+    Ok(())
+}
+
+/// The process resource the supervisor sends, as it sends the accounts test its own.
+fn process_resource(out: &Out) -> Result<Handle, i64> {
+    let supervisor = Channel(slot("supervisor"));
+    wait_one(&supervisor.0, Signals::READABLE, now() + ms(60_000))
+        .map_err(|e| fail(out, "populate", "the supervisor's process resource", e))?;
+    let mut buf = [0u8; 16];
+    let mut handles = [None];
+    supervisor
+        .read(&mut buf, &mut handles)
+        .map_err(|e| fail(out, "populate", "reading the process resource", e))?;
+    handles[0]
+        .take()
+        .ok_or_else(|| fail(out, "populate", "no process resource", Error::BadState))
+}
+
+/// `map::POPULATE` zero pages through `process_map`, into a process made for it.
+fn populate(out: &Out, resource: &Handle) -> Result<(), i64> {
+    const SIZE: u64 = 4 << 20;
+    const PAGE: u64 = 4096;
+    let f = |what: &str, e: Error| fail(out, "populate", what, e);
+    let account = Account::carve(16 << 20, "dp-populate").map_err(|e| f("account_create", e))?;
+    let p = Process::create_in(resource, "dp-populate", &account.0)
+        .map_err(|e| f("process_create", e))?;
+    let used = || {
+        account
+            .usage()
+            .map(|u| u.used)
+            .map_err(|e| f("account_info", e))
+    };
+    let before = used()?;
+    let va = p
+        .map(
+            None,
+            0,
+            SIZE,
+            0,
+            map::READ | map::WRITE | map::POPULATE | map::HUGE,
+        )
+        .map_err(|e| f("process_map POPULATE", e))?;
+    let mapped = used()?;
+    let pages = SIZE / PAGE;
+    if mapped - before < pages * charge::ZERO_PAGE {
+        println!(
+            out,
+            "DS-A populate: FAIL: {} zero pages charged {} bytes at the call, less than {}",
+            pages,
+            mapped - before,
+            pages * charge::ZERO_PAGE
+        );
+        return Err(1);
+    }
+    for page in 0..pages {
+        p.write(va + page * PAGE + 7, &[page as u8])
+            .map_err(|e| f("process_write", e))?;
+    }
+    let written = used()?;
+    let mut back = [0xffu8; 2];
+    p.read(va + 5 * PAGE + 7, &mut back)
+        .map_err(|e| f("process_read", e))?;
+    if written != mapped || back != [5, 0] {
+        println!(
+            out,
+            "DS-A populate: FAIL: writing every page charged {} bytes more, and read {:?}",
+            written - mapped,
+            back
+        );
+        return Err(1);
+    }
+    // Without POPULATE a page is charged at its first touch.
+    let lazy = p
+        .map(None, 0, 64 * PAGE, 0, map::READ | map::WRITE)
+        .map_err(|e| f("process_map", e))?;
+    let quiet = used()?;
+    p.write(lazy, &[1]).map_err(|e| f("process_write", e))?;
+    let first = used()? - quiet;
+    if first != charge::ZERO_PAGE {
+        println!(
+            out,
+            "DS-A populate: FAIL: a lazy page's first write charged {} bytes", first
+        );
+        return Err(1);
+    }
+    println!(
+        out,
+        "DS-A populate: ok: {} zero pages charged {} bytes at process_map with POPULATE, and nothing more when every page was written; without it a first write charged {}",
+        pages,
+        mapped - before,
+        first
+    );
+    Ok(())
+}
+
+const TASK_PAGE: usize = 4096;
+const TASK_WINDOW: u64 = 4 * TASK_PAGE as u64;
+
+/// Waits for `word` from the task.
+fn heard(out: &Out, peer: &Channel, word: &[u8]) -> Result<(), i64> {
+    wait_one(&peer.0, Signals::READABLE, now() + ms(30_000))
+        .map_err(|e| fail(out, "slot", "waiting for dp-task", e))?;
+    let mut buf = [0u8; 16];
+    match peer.read(&mut buf, &mut []) {
+        Ok((n, 0)) if &buf[..n] == word => Ok(()),
+        other => {
+            println!(
+                out,
+                "DS-A slot: FAIL: dp-task said {:?} ({:?}), not {:?}",
+                &buf[..16],
+                other,
+                word
+            );
+            Err(1)
+        }
+    }
+}
+
+/// The next event of `output`.
+fn event(out: &Out, output: &Slot) -> Result<SlotEvent, i64> {
+    wait_one(&output.0, Signals::READABLE, now() + ms(30_000))
+        .map_err(|e| fail(out, "slot", "waiting for the slot", e))?;
+    output.take().map_err(|e| fail(out, "slot", "slot_take", e))
+}
+
+/// The first byte of each page of a window that came back.
+fn pages_of(out: &Out, memory: &Memory) -> Result<[u8; 4], i64> {
+    let m = memory
+        .map(0, TASK_WINDOW, 0)
+        .map_err(|e| fail(out, "slot", "mapping a window back", e))?;
+    let mut firsts = [0u8; 4];
+    for (page, b) in firsts.iter_mut().enumerate() {
+        let mut one = [0u8; 1];
+        m.read(page * TASK_PAGE, &mut one)
+            .map_err(|e| fail(out, "slot", "reading a window back", e))?;
+        *b = one[0];
+    }
+    Ok(firsts)
+}
+
+fn slot_refused(
+    out: &Out,
+    what: &str,
+    want: Error,
+    result: moruna_sys::Result<()>,
+) -> Result<(), i64> {
+    match result {
+        Err(e) if e == want => Ok(()),
+        other => {
+            println!(
+                out,
+                "DS-A slot: FAIL: {} gave {:?}, not {}",
+                what,
+                other,
+                want.name()
+            );
+            Err(1)
+        }
+    }
+}
+
+/// `windows_protect`'s slot form, against `dp-task`.
+fn slot_form(out: &Out, resource: &Handle, image: &Handle) -> Result<(), i64> {
+    let f = |what: &str, e: Error| fail(out, "slot", what, e);
+    let account = Account::carve(16 << 20, "dp-task").map_err(|e| f("account_create", e))?;
+    let task =
+        Process::create_in(resource, "dp-task", &account.0).map_err(|e| f("process_create", e))?;
+    let entry = task
+        .map_image(image)
+        .map_err(|e| f("process_map_image", e))?;
+    let output = Slot::create(true).map_err(|e| f("slot_create", e))?;
+    let (ours, theirs) = Channel::create().map_err(|e| f("channel_create", e))?;
+    attach(&task, &[&output], None).map_err(|(e, _)| f("process_plane", e))?;
+    slot_refused(
+        out,
+        "a slot with nothing mapped",
+        Error::BadState,
+        windows_protect_slot(&output, &[[0, 4096]], map::READ),
+    )?;
+    let first = Memory::create(TASK_WINDOW).map_err(|e| f("memory_create", e))?;
+    output
+        .push(first, 0, TASK_WINDOW, 1)
+        .map_err(|(e, _)| f("slot_push", e))?;
+    task.start_with(entry, &mut [(Some(theirs.0), "peer")])
+        .map_err(|e| f("process_start", e))?;
+    heard(out, &ours, b"mapped")?;
+    // Refusals first, each changing nothing.
+    slot_refused(
+        out,
+        "a window past the slot's area",
+        Error::OutOfRange,
+        windows_protect_slot(&output, &[[3 * 4096, 2 * 4096]], map::READ),
+    )?;
+    slot_refused(
+        out,
+        "execute",
+        Error::InvalidArgs,
+        windows_protect_slot(&output, &[[0, 4096]], map::READ | map::EXECUTE),
+    )?;
+    let looking = Slot(
+        output
+            .0
+            .duplicate(Rights::READ)
+            .map_err(|e| f("handle_duplicate", e))?,
+    );
+    slot_refused(
+        out,
+        "a slot handle without WRITE",
+        Error::AccessDenied,
+        windows_protect_slot(&looking, &[[0, 4096]], map::READ),
+    )?;
+    // Page 1 revoked, granted back, then pages 1 and 2 revoked.
+    windows_protect_slot(&output, &[[4096, 4096]], map::READ)
+        .map_err(|e| f("revoking a page", e))?;
+    windows_protect_slot(&output, &[[4096, 4096]], map::READ | map::WRITE)
+        .map_err(|e| f("granting it back", e))?;
+    windows_protect_slot(&output, &[[4096, 2 * 4096]], map::READ)
+        .map_err(|e| f("revoking two pages", e))?;
+    ours.write(b"go", [])
+        .map_err(|(e, _)| f("channel_write", e))?;
+    heard(out, &ours, b"put")?;
+    // The record put while two pages were revoked comes back whole, with their bytes kept.
+    let SlotEvent::Put { memory, .. } = event(out, &output)? else {
+        println!(out, "DS-A slot: FAIL: the put gave another event");
+        return Err(1);
+    };
+    let firsts = pages_of(out, &memory)?;
+    if firsts != [0xb0, 0xa1, 0xa2, 0xb3] {
+        println!(
+            out,
+            "DS-A slot: FAIL: the first window came back as {:x?}", firsts
+        );
+        return Err(1);
+    }
+    // The second window: page 1 revoked through the slot, then written by the task.
+    let second = Memory::create(TASK_WINDOW).map_err(|e| f("memory_create", e))?;
+    output
+        .push(second, 0, TASK_WINDOW, 2)
+        .map_err(|(e, _)| f("slot_push", e))?;
+    heard(out, &ours, b"mapped")?;
+    windows_protect_slot(&output, &[[4096, 4096]], map::READ)
+        .map_err(|e| f("revoking the second window's page", e))?;
+    println!(
+        out,
+        "DS-A slot: dp-task writes a page revoked through its slot"
+    );
+    ours.write(b"go", [])
+        .map_err(|(e, _)| f("channel_write", e))?;
+    let ended = wait_one(&task.0, Signals::TERMINATED, now() + ms(30_000));
+    if !matches!(ended, Ok(s) if s.contains(Signals::TERMINATED)) {
+        println!(out, "DS-A slot: FAIL: dp-task did not end: {:?}", ended);
+        return Err(1);
+    }
+    let mut word = [0u8; 16];
+    if let Ok((n, _)) = ours.read(&mut word, &mut []) {
+        println!(
+            out,
+            "DS-A slot: FAIL: dp-task wrote a revoked page and said {:?}",
+            &word[..n]
+        );
+        return Err(1);
+    }
+    let SlotEvent::Returned { memory, .. } = event(out, &output)? else {
+        println!(out, "DS-A slot: FAIL: the task's end gave another event");
+        return Err(1);
+    };
+    let firsts = pages_of(out, &memory)?;
+    if firsts != [0xc0, 0xc1, 0xc2, 0xc3] {
+        println!(
+            out,
+            "DS-A slot: FAIL: the second window came back as {:x?}", firsts
+        );
+        return Err(1);
+    }
+    println!(
+        out,
+        "DS-A slot: ok: windows revoked and granted back through an output slot alone, their bytes kept; a window put while two of its pages were revoked came back whole; every refusal changed nothing; and the task's write to a page revoked so faulted"
+    );
+    Ok(())
+}
+
+/// Set to stop the spinning threads of `share` and `rcu`.
+static STOP: AtomicU32 = AtomicU32::new(0);
+/// Set once the first spinner runs on its CPU.
+static SPINNING: AtomicU32 = AtomicU32::new(0);
+/// Set once the second thread runs on the spinner's CPU.
+static JOINED: AtomicU32 = AtomicU32::new(0);
+static COUNT_A: AtomicU64 = AtomicU64::new(0);
+static COUNT_B: AtomicU64 = AtomicU64::new(0);
+/// How long the second thread's placement on the spinner's CPU took, in nanoseconds.
+static JOIN_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Spins on CPU `cpu`, counting, until `STOP`.
+extern "C" fn spinner(cpu: u64) -> ! {
+    if pin_current_thread(Some(cpu as u32)).is_ok() {
+        SPINNING.store(1, Ordering::Release);
+        while STOP.load(Ordering::Relaxed) == 0 {
+            COUNT_A.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    thread_exit()
+}
+
+/// Places itself on CPU `cpu`, beside the spinner, timing it; then spins there too.
+extern "C" fn joiner(cpu: u64) -> ! {
+    let start = now();
+    if pin_current_thread(Some(cpu as u32)).is_ok() {
+        JOIN_NS.store(now() - start, Ordering::Relaxed);
+        JOINED.store(1, Ordering::Release);
+        while STOP.load(Ordering::Relaxed) == 0 {
+            COUNT_B.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    thread_exit()
+}
+
+/// A thread started at `entry(arg)` on a stack of its own, which it keeps.
+fn start(out: &Out, test: &str, entry: extern "C" fn(u64) -> !, arg: u64) -> Result<Thread, i64> {
+    let stack = Memory::create(64 * 1024).map_err(|e| fail(out, test, "a stack", e))?;
+    let mapping = stack
+        .map_detached(0, 64 * 1024, map::WRITE)
+        .map_err(|e| fail(out, test, "mapping a stack", e))?;
+    let top = mapping.end();
+    // The stack stays mapped for good: the thread exits on it.
+    core::mem::forget(mapping);
+    core::mem::forget(stack);
+    Thread::spawn(entry, top, arg).map_err(|e| fail(out, test, "thread_create", e))
+}
+
+/// Waits until `flag` is set, for at most `ms` milliseconds.
+fn until(flag: &AtomicU32, limit: u64) -> bool {
+    let end = now() + ms(limit);
+    while flag.load(Ordering::Acquire) == 0 {
+        if now() > end {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
+}
+
+fn join(out: &Out, test: &str, thread: &Thread) -> Result<(), i64> {
+    match wait_one(&thread.0, Signals::TERMINATED, now() + ms(10_000)) {
+        Ok(s) if s.contains(Signals::TERMINATED) => Ok(()),
+        other => {
+            println!(
+                out,
+                "DS-A {}: FAIL: a thread did not end: {:?}", test, other
+            );
+            Err(1)
+        }
+    }
+}
+
+/// A thread queued on the spinner's CPU, whose tick is stretched, runs there within
+/// 20 ms, and then the two share the CPU.
+fn share(out: &Out, cpus: u32) -> Result<(), i64> {
+    let last = u64::from(cpus - 1);
+    STOP.store(0, Ordering::Relaxed);
+    pin_current_thread(Some(0)).map_err(|e| fail(out, "share", "pinning", e))?;
+    let a = start(out, "share", spinner, last)?;
+    if !until(&SPINNING, 10_000) {
+        println!(out, "DS-A share: FAIL: the spinner never ran");
+        return Err(1);
+    }
+    // Long enough for its CPU to stretch its tick.
+    let _ = futex_wait(&READY, 1, now() + ms(20));
+    let b = start(out, "share", joiner, last)?;
+    if !until(&JOINED, 10_000) {
+        println!(
+            out,
+            "DS-A share: FAIL: the second thread never ran beside the spinner"
+        );
+        return Err(1);
+    }
+    let joined = JOIN_NS.load(Ordering::Relaxed);
+    let (a0, b0) = (
+        COUNT_A.load(Ordering::Relaxed),
+        COUNT_B.load(Ordering::Relaxed),
+    );
+    let _ = futex_wait(&READY, 1, now() + ms(300));
+    let (a1, b1) = (
+        COUNT_A.load(Ordering::Relaxed),
+        COUNT_B.load(Ordering::Relaxed),
+    );
+    STOP.store(1, Ordering::Relaxed);
+    join(out, "share", &a)?;
+    join(out, "share", &b)?;
+    pin_current_thread(None).map_err(|e| fail(out, "share", "unpinning", e))?;
+    let (da, db) = (a1 - a0, b1 - b0);
+    let total = (da + db).max(1);
+    if joined > ms(20) || da * 4 < total || db * 4 < total {
+        println!(
+            out,
+            "DS-A share: FAIL: the second thread took {} ns to run beside the spinner, and they counted {} and {}",
+            joined,
+            da,
+            db
+        );
+        return Err(1);
+    }
+    println!(
+        out,
+        "DS-A share: ok: a thread queued on CPU {}, its tick stretched, ran there after {} ns, and the two then shared it {}% and {}%",
+        last,
+        joined,
+        da * 100 / total,
+        db * 100 / total
+    );
+    Ok(())
+}
+
+/// Grace periods complete while a CPU runs one thread in user mode: CPU 0 makes, maps and
+/// frees more memory than the machine has (3 GiB in 128 MiB objects) while the spinner
+/// runs on the last CPU. OSTD frees an unmapped frame only after a grace period, so had
+/// grace periods stalled, memory would run out.
+fn rcu(out: &Out, cpus: u32) -> Result<(), i64> {
+    const CHUNK: u64 = 128 << 20;
+    const ROUNDS: u64 = 24;
+    let last = u64::from(cpus - 1);
+    STOP.store(0, Ordering::Relaxed);
+    SPINNING.store(0, Ordering::Relaxed);
+    pin_current_thread(Some(0)).map_err(|e| fail(out, "rcu", "pinning", e))?;
+    let spin = start(out, "rcu", spinner, last)?;
+    if !until(&SPINNING, 10_000) {
+        println!(out, "DS-A rcu: FAIL: the spinner never ran");
+        return Err(1);
+    }
+    let started = now();
+    for round in 0..ROUNDS {
+        let made = Memory::create(CHUNK).and_then(|object| {
+            let m = object.map(0, CHUNK, map::WRITE | map::HUGE)?;
+            for at in (0..CHUNK as usize).step_by(2 << 20) {
+                m.write(at, &[round as u8])?;
+            }
+            Ok(())
+        });
+        if let Err(e) = made {
+            STOP.store(1, Ordering::Relaxed);
+            println!(
+                out,
+                "DS-A rcu: FAIL: round {} of {} ({} MiB made and freed): {}",
+                round,
+                ROUNDS,
+                round * (CHUNK >> 20),
+                e.name()
+            );
+            return Err(1);
+        }
+    }
+    let took = now() - started;
+    STOP.store(1, Ordering::Relaxed);
+    join(out, "rcu", &spin)?;
+    pin_current_thread(None).map_err(|e| fail(out, "rcu", "unpinning", e))?;
+    println!(
+        out,
+        "DS-A rcu: ok: {} MiB made, mapped and freed on CPU 0 in {} ms while CPU {} ran one thread in user mode",
+        ROUNDS * (CHUNK >> 20),
+        took / 1_000_000,
+        last
     );
     Ok(())
 }

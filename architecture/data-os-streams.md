@@ -10,6 +10,14 @@ first, and iterates until Moruna is significantly better than the other engines.
 
 ## Rules for every stream
 
+- **Talos's security posture binds every stream** (`data-os.md` §3a; Brackly, 2026-11-16).
+  - No shell in anything Moruna ships or runs, and none in booted tests: no `sh` in any done
+    criterion.
+  - Tasks start by exec, never `sh -c`.
+  - No console login, no SSH, no terminals or `devpts`.
+  - The root is read-only.
+  - The carried Linux layer refuses administrative calls.
+
 - **Branch and merge.**
   - Work in your own worktree, on a branch `data-os/<stream>`, cut from `feature/arrow-core-0.7`
     when the stream starts (at or after `fa0a02bf`, which added the contracts).
@@ -185,7 +193,7 @@ and switches to the new one when the call answers.
   Sockets and the cloud platform stay out.
 - **Tests:**
   - host tests of the carried logic;
-  - then booted: static musl, dynamic glibc, `sh`, CPython 3.14 importing NumPy and pyarrow, and
+  - then booted: static musl, dynamic glibc, CPython 3.14 importing NumPy and pyarrow (no shell), and
     the gVisor system-call tests that apply.
 - **Done when:**
   - the gate's Python image runs as an image task on it under KVM;
@@ -372,3 +380,15 @@ and switches to the new one when the call answers.
       supplied.
   - **Later:** the GS base is not kept per thread, and a program thread is interrupted only
     within one tick.
+- **2026-11-16: stream A's second round merged** (`5b17702c`, from `7a74b44f`). CI's boot
+  passed 197 of 197 checks under KVM on 1, 2 and 4 CPUs, and `deadline-boot.sh` passed.
+  - `windows_protect`'s slot form landed, so stream P switches its grouped revoke on.
+  - `POPULATE` through `process_map` is booted.
+  - C5's stage (b) cut a pinned worker CPU's loss on a quiet VM from 3.8%-4.5% to 1.5%-1.6%.
+    Of a tick's ~23 us, about 0.5 us was OSTD's own work; the rest was VM exits.
+  - OSTD's RCU now counts user mode and idle as quiescent, so unmapped frames are freed.
+  - **Left for stream D:** the remaining 1.5% is the host's own 1 kHz tick on the vCPU threads.
+    The launcher should pin QEMU's vCPU threads to host cores isolated from the host's tick
+    (`nohz_full`, `isolcpus` or a cgroup cpuset, `rcu_nocbs`), and report the loss measured
+    again. It is a host setting for Griot's node, so D documents it and measures it on
+    `moruna-bench`.

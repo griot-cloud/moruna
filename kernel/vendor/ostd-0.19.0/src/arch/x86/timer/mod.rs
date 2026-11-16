@@ -37,6 +37,11 @@ pub(super) fn init_on_ap() {
     apic::init_on_ap(TIMER_IRQ.get().unwrap());
 }
 
+/// Re-arms this CPU's timer `periods` timer periods from now.
+pub(crate) fn rearm(periods: u64) {
+    apic::rearm(periods);
+}
+
 fn timer_callback(trapframe: &TrapFrame) {
     crate::timer::call_timer_callback_functions(trapframe);
 

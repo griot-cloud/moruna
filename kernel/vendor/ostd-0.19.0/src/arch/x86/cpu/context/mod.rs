@@ -365,6 +365,14 @@ impl UserContextApiInternal for UserContext {
 
         // Return when it is syscall or cpu exception type is Fault or Trap.
         loop {
+            // Going back to user mode passes a quiescent state: no RCU read-side critical
+            // section spans user mode. A CPU running one thread in user mode, switching no
+            // task, would otherwise hold every grace period open (Moruna).
+            //
+            // SAFETY: Preemption and local IRQs are enabled here (`UserMode::execute`
+            // checks it, and each pass below enables local IRQs again), so this CPU is in
+            // no RCU read-side critical section.
+            unsafe { crate::sync::finish_grace_period() };
             crate::task::scheduler::might_preempt();
 
             let guard = crate::irq::disable_local();

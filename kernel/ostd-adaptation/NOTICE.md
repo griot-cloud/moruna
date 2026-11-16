@@ -17,6 +17,15 @@ kernel mode and so counted against §0:
   release them. `Segment::from_raw_unsized` restores such a run for an untyped frame.
 - **Each CPU's number in `IA32_TSC_AUX`,** written as the CPU starts, so a thread reads
   the CPU it runs on with `rdtscp` and no call.
+- **A stretched tick** (C5): `timer::set_tick_stretch` makes a CPU tick once every so many
+  timer periods. The TSC deadline is armed that far ahead, and a smaller stretch re-arms
+  it at once. The core stretches the tick of a CPU, other than the boot processor, that
+  runs one thread or none.
+- **Quiescent states without a task switch.** OSTD ends a grace period only when every CPU
+  has switched tasks, so a CPU idling or running one thread held every grace period open,
+  and every frame unmapped meanwhile stayed allocated. Returning to user mode now passes a
+  quiescent state (`UserMode::execute`), as it does in Linux, and
+  `sync::report_quiescent_state` lets the core's idle task pass one each time it wakes.
 
 Three of its comments lose their em dashes (`src/log/logger.rs`, `src/log/macros.rs`,
 `src/task/scheduler/mod.rs`), which the repository's quality check refuses in every
