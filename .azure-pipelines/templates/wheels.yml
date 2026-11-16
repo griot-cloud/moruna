@@ -1,0 +1,178 @@
+# The six wheels: the wheels stage's jobs (ci.yml). This file is part of every wheel's inputs
+# (tools/release/azure_reuse.py), so a change to how a wheel is built builds it again.
+#
+# A wheel an earlier run built and checked from the same inputs is not built again: its build
+# job is skipped, and `wheels_reused` downloads it from that run and publishes it as this run's.
+# A build job that passes tags the run with the wheel's inputs for a later run to find.
+parameters:
+  - name: smallJobsPool
+    type: string
+  # The macOS wheels, one job each (PY-I7: both builds of CPython 3.14).
+  - name: macBuilds
+    type: object
+    default:
+      - name: cp314
+        python: "3.14"
+        tag: cp314-cp314
+      - name: cp314t
+        python: "3.14t"
+        tag: cp314-cp314t
+  - name: artifacts
+    type: object
+    default:
+      - name: wheels-linux-x86_64
+        var: wheels_linux_x86_64
+      - name: wheels-linux-aarch64
+        var: wheels_linux_aarch64
+      - name: wheels-macos-cp314
+        var: wheels_macos_cp314
+      - name: wheels-macos-cp314t
+        var: wheels_macos_cp314t
+
+jobs:
+  - job: wheels_linux_x86_64
+    displayName: build the wheels (linux x86_64)
+    timeoutInMinutes: 120
+    condition: and(succeeded(), ne(stageDependencies.version.version.outputs['reuse.reused_wheels_linux_x86_64'], 'true'))
+    variables:
+      wheelTag: $[ stageDependencies.version.version.outputs['reuse.fp_wheels_linux_x86_64'] ]
+    pool:
+      name: griot-ci
+    steps:
+      - template: checkout-kept.yml
+      - template: pythons.yml
+      - bash: |
+          set -euo pipefail
+          rm -rf dist
+          tools/release/linux-wheels.sh docker dist
+          ls -la dist
+        displayName: Build the Linux wheels in the manylinux_2_28 image
+      - bash: |
+          set -euo pipefail
+          for py in "$STANDARD" "$FREETHREADED"; do
+            env="$(Agent.TempDirectory)/try-$(basename "$py")"
+            rm -rf "$env" && uv venv -q -p "$py" "$env"
+            uv pip install -q -p "$env/bin/python" --only-binary=:all: pyarrow
+            uv pip install -q -p "$env/bin/python" --no-index --find-links dist moruna
+            "$env/bin/python" -c "import moruna; print(moruna.__version__); print(moruna.inspect_host()['limits'])"
+          done
+        displayName: The wheel installs and runs before it is published
+      - publish: dist
+        artifact: wheels-linux-x86_64
+      - bash: echo "##vso[build.addbuildtag]$(wheelTag)"
+        displayName: Record the inputs this wheel was built from, for a later run to reuse
+        continueOnError: true
+
+  - job: wheels_linux_aarch64
+    displayName: build the wheels (linux aarch64, cross-built)
+    timeoutInMinutes: 150
+    condition: and(succeeded(), ne(stageDependencies.version.version.outputs['reuse.reused_wheels_linux_aarch64'], 'true'))
+    variables:
+      wheelTag: $[ stageDependencies.version.version.outputs['reuse.fp_wheels_linux_aarch64'] ]
+    pool:
+      name: griot-ci
+    steps:
+      - template: checkout-kept.yml
+      - bash: |
+          set -euo pipefail
+          rm -rf dist
+          MORUNA_WHEEL_TARGET=aarch64 tools/release/linux-wheels.sh docker dist
+          ls -la dist
+        displayName: Cross-build the aarch64 wheels in the manylinux_2_28 cross image
+      - bash: |
+          set -euo pipefail
+          # An aarch64 container under QEMU's user-mode emulation, registered with the
+          # fix-binary flag, so the wheel is installed and imported on its own architecture.
+          sudo apt-get install -y -q --no-install-recommends qemu-user-static binfmt-support
+          docker run --rm --platform linux/arm64 -v "$PWD/dist:/dist:ro" quay.io/pypa/manylinux_2_28_aarch64 bash -euo pipefail -c '
+            uname -m
+            for py in /opt/python/cp314-cp314/bin/python /opt/python/cp314-cp314t/bin/python; do
+              "$py" -m pip install --quiet --only-binary=:all: pyarrow
+              "$py" -m pip install --quiet --no-index --find-links /dist moruna
+              "$py" -c "import moruna; print(moruna.__version__); print(moruna.inspect_host()[\"limits\"])"
+            done'
+        displayName: The wheel installs and runs on aarch64 (emulated) before it is published
+      - publish: dist
+        artifact: wheels-linux-aarch64
+      - bash: echo "##vso[build.addbuildtag]$(wheelTag)"
+        displayName: Record the inputs this wheel was built from, for a later run to reuse
+        continueOnError: true
+
+  # macOS arm64, cross-built on the hosted Intel Mac, one interpreter build a job so each
+  # stays inside the free tier's 60 minutes. Neither can be imported on an Intel Mac, so the
+  # check is the wheel's tag and its library's architecture.
+  - ${{ each build in parameters.macBuilds }}:
+    - job: wheels_macos_${{ build.name }}
+      displayName: build the wheel (macOS arm64, ${{ build.python }}, cross-built)
+      timeoutInMinutes: 60
+      condition: and(succeeded(), ne(stageDependencies.version.version.outputs['reuse.reused_wheels_macos_${{ build.name }}'], 'true'))
+      variables:
+        wheelTag: $[ stageDependencies.version.version.outputs['reuse.fp_wheels_macos_${{ build.name }}'] ]
+      pool:
+        vmImage: macOS-15
+      steps:
+        - checkout: self
+          fetchDepth: 1
+        - bash: |
+            set -euo pipefail
+            rustup toolchain install
+            rustup target add aarch64-apple-darwin
+            command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+            export PATH="$HOME/.local/bin:$PATH"
+            uv python install ${{ build.python }}
+            python="$(uv python find ${{ build.python }})"
+            maturin="$(sed -n 's/^requires = \["\(maturin[^"]*\)"\].*/\1/p' pyproject.toml)"
+            uv tool run --from "$maturin" maturin build --release --target aarch64-apple-darwin --out dist -i "$python"
+            ls -la dist
+            whl="$(ls dist/*-${{ build.tag }}-macosx_11_0_arm64.whl)"
+            mkdir -p "$(Agent.TempDirectory)/whl" && cd "$(Agent.TempDirectory)/whl" && unzip -q -o "$OLDPWD/$whl"
+            lipo -archs moruna/_core*.so | tee /dev/stderr | grep -qx arm64
+          displayName: Cross-build the macOS arm64 wheel, and check its tag and architecture
+          env:
+            # The macOS wheels keep 0.6.2's platform tag on the newer SDK.
+            MACOSX_DEPLOYMENT_TARGET: "11.0"
+        - publish: dist
+          artifact: wheels-macos-${{ build.name }}
+        - bash: echo "##vso[build.addbuildtag]$(wheelTag)"
+          displayName: Record the inputs this wheel was built from, for a later run to reuse
+          continueOnError: true
+
+  # The wheels an earlier run built and checked from these inputs, published as this run's.
+  - job: wheels_reused
+    displayName: the wheels an earlier run built from the same inputs
+    timeoutInMinutes: 15
+    variables:
+      - ${{ each artifact in parameters.artifacts }}:
+        - name: reused_${{ artifact.var }}
+          value: $[ stageDependencies.version.version.outputs['reuse.reused_${{ artifact.var }}'] ]
+        - name: from_${{ artifact.var }}
+          value: $[ stageDependencies.version.version.outputs['reuse.from_${{ artifact.var }}'] ]
+        - name: fp_${{ artifact.var }}
+          value: $[ stageDependencies.version.version.outputs['reuse.fp_${{ artifact.var }}'] ]
+    pool:
+      ${{ if eq(parameters.smallJobsPool, 'hosted') }}:
+        vmImage: ubuntu-24.04
+      ${{ else }}:
+        name: griot-ci
+    steps:
+      - checkout: none
+      - ${{ each artifact in parameters.artifacts }}:
+        - task: DownloadPipelineArtifact@2
+          displayName: ${{ artifact.name }}, from the run that built it
+          condition: eq(variables['reused_${{ artifact.var }}'], 'true')
+          inputs:
+            buildType: specific
+            project: $(System.TeamProjectId)
+            definition: $(System.DefinitionId)
+            buildVersionToDownload: specific
+            pipelineId: $(from_${{ artifact.var }})
+            artifactName: ${{ artifact.name }}
+            targetPath: $(Pipeline.Workspace)/reused/${{ artifact.name }}
+        - publish: $(Pipeline.Workspace)/reused/${{ artifact.name }}
+          artifact: ${{ artifact.name }}
+          displayName: ${{ artifact.name }}, published as this run's
+          condition: eq(variables['reused_${{ artifact.var }}'], 'true')
+        - bash: echo "##vso[build.addbuildtag]$(fp_${{ artifact.var }})"
+          displayName: ${{ artifact.name }}, recorded on this run too
+          condition: eq(variables['reused_${{ artifact.var }}'], 'true')
+          continueOnError: true

@@ -23,6 +23,11 @@
 # `smallJobsPool: managed` (or change its default) when the month's free minutes are spent.
 # Neither has an arm64 machine, so both arm64 wheels are cross-built from x86_64.
 #
+# Work is paid for once per set of inputs (tools/release/azure_reuse.py, the port of GitHub's
+# reuse.py). The gate's Rust, Python and kernel jobs, and each wheel, are skipped when an earlier
+# run passed them on the inputs this run has: a fix to one wheel builds that wheel, a changelog
+# edit runs only lint, and the merge to main publishes the wheels its pull request built.
+#
 # Nobody creates a tag. A version bump merged to main is the release; the tag is pushed here
 # once PyPI has accepted the upload, so a tag always marks something that shipped.
 
@@ -41,16 +46,14 @@ parameters:
     type: string
     default: hosted
     values: [hosted, managed]
-  # The macOS wheels, one job each (PY-I7: both builds of CPython 3.14).
-  - name: macBuilds
-    type: object
-    default:
-      - name: cp314
-        python: "3.14"
-        tag: cp314-cp314
-      - name: cp314t
-        python: "3.14t"
-        tag: cp314-cp314t
+  # `always` runs the gate even when an earlier run passed it on the same inputs: after a
+  # change to what the gate runs, which lives in this pipeline's files and so is not one of
+  # its inputs (tools/release/azure_reuse.py).
+  - name: gate
+    displayName: Run the gate when an earlier run passed it on the same inputs
+    type: string
+    default: auto
+    values: [auto, always]
 
 variables:
   CARGO_PROFILE_DEV_DEBUG: "0"
@@ -99,6 +102,11 @@ stages:
               fi
             name: check
             displayName: Is the version in Cargo.toml already released?
+          - bash: python3 tools/release/azure_reuse.py --gate "${{ parameters.gate }}"
+            name: reuse
+            displayName: What an earlier run already did from these inputs (the gate, each wheel)
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
   # ------------------------------------------------------------------------------------------
   - stage: gate
@@ -144,6 +152,7 @@ stages:
       - job: rust
         displayName: "rust: lints, tests and coverage"
         timeoutInMinutes: 180
+        condition: and(succeeded(), ne(stageDependencies.version.version.outputs['reuse.reused_gate'], 'true'))
         pool:
           name: griot-ci
         steps:
@@ -206,6 +215,7 @@ stages:
       - job: python
         displayName: "python: the package's tests on a wheel built from this commit"
         timeoutInMinutes: 90
+        condition: and(succeeded(), ne(stageDependencies.version.version.outputs['reuse.reused_gate'], 'true'))
         pool:
           name: griot-ci
         steps:
@@ -236,6 +246,7 @@ stages:
       - job: kernel
         displayName: the microkernel builds and boots (KB1)
         timeoutInMinutes: 180
+        condition: and(succeeded(), ne(stageDependencies.version.version.outputs['reuse.reused_gate'], 'true'))
         pool:
           name: griot-ci
         steps:
@@ -407,6 +418,30 @@ stages:
             displayName: Retain the kernel's serial and node logs
             condition: and(always(), eq(variables.KERNEL, 'true'))
 
+      # The gate's verdict, recorded on the run as the inputs it passed on, so a later run with
+      # the same inputs (a fix to a wheel, a changelog edit) reuses it instead of running it again.
+      - job: gate_passed
+        displayName: the gate passed on these inputs
+        dependsOn: [rust, python, kernel]
+        condition: >-
+          and(
+            eq(dependencies.rust.result, 'Succeeded'),
+            eq(dependencies.python.result, 'Succeeded'),
+            eq(dependencies.kernel.result, 'Succeeded')
+          )
+        timeoutInMinutes: 10
+        variables:
+          gateTag: $[ stageDependencies.version.version.outputs['reuse.fp_gate'] ]
+        pool:
+          ${{ if eq(parameters.smallJobsPool, 'hosted') }}:
+            vmImage: ubuntu-24.04
+          ${{ else }}:
+            name: griot-ci
+        steps:
+          - checkout: none
+          - bash: echo "##vso[build.addbuildtag]$(gateTag)"
+            displayName: Record the inputs the gate passed on, for a later run to reuse
+
   # ------------------------------------------------------------------------------------------
   - stage: wheels
     displayName: wheels
@@ -418,94 +453,9 @@ stages:
         eq(dependencies.version.outputs['version.check.release'], 'true')
       )
     jobs:
-      - job: wheels_linux_x86_64
-        displayName: build the wheels (linux x86_64)
-        timeoutInMinutes: 120
-        pool:
-          name: griot-ci
-        steps:
-          - template: templates/checkout-kept.yml
-          - template: templates/pythons.yml
-          - bash: |
-              set -euo pipefail
-              rm -rf dist
-              tools/release/linux-wheels.sh docker dist
-              ls -la dist
-            displayName: Build the Linux wheels in the manylinux_2_28 image
-          - bash: |
-              set -euo pipefail
-              for py in "$STANDARD" "$FREETHREADED"; do
-                env="$(Agent.TempDirectory)/try-$(basename "$py")"
-                rm -rf "$env" && uv venv -q -p "$py" "$env"
-                uv pip install -q -p "$env/bin/python" --only-binary=:all: pyarrow
-                uv pip install -q -p "$env/bin/python" --no-index --find-links dist moruna
-                "$env/bin/python" -c "import moruna; print(moruna.__version__); print(moruna.inspect_host()['limits'])"
-              done
-            displayName: The wheel installs and runs before it is published
-          - publish: dist
-            artifact: wheels-linux-x86_64
-
-      - job: wheels_linux_aarch64
-        displayName: build the wheels (linux aarch64, cross-built)
-        timeoutInMinutes: 150
-        pool:
-          name: griot-ci
-        steps:
-          - template: templates/checkout-kept.yml
-          - bash: |
-              set -euo pipefail
-              rm -rf dist
-              MORUNA_WHEEL_TARGET=aarch64 tools/release/linux-wheels.sh docker dist
-              ls -la dist
-            displayName: Cross-build the aarch64 wheels in the manylinux_2_28 cross image
-          - bash: |
-              set -euo pipefail
-              # An aarch64 container under QEMU's user-mode emulation, registered with the
-              # fix-binary flag, so the wheel is installed and imported on its own architecture.
-              sudo apt-get install -y -q --no-install-recommends qemu-user-static binfmt-support
-              docker run --rm --platform linux/arm64 -v "$PWD/dist:/dist:ro" quay.io/pypa/manylinux_2_28_aarch64 bash -euo pipefail -c '
-                uname -m
-                for py in /opt/python/cp314-cp314/bin/python /opt/python/cp314-cp314t/bin/python; do
-                  "$py" -m pip install --quiet --only-binary=:all: pyarrow
-                  "$py" -m pip install --quiet --no-index --find-links /dist moruna
-                  "$py" -c "import moruna; print(moruna.__version__); print(moruna.inspect_host()[\"limits\"])"
-                done'
-            displayName: The wheel installs and runs on aarch64 (emulated) before it is published
-          - publish: dist
-            artifact: wheels-linux-aarch64
-
-      # macOS arm64, cross-built on the hosted Intel Mac, one interpreter build a job so each
-      # stays inside the free tier's 60 minutes. Neither can be imported on an Intel Mac, so the
-      # check is the wheel's tag and its library's architecture.
-      - ${{ each build in parameters.macBuilds }}:
-        - job: wheels_macos_${{ build.name }}
-          displayName: build the wheel (macOS arm64, ${{ build.python }}, cross-built)
-          timeoutInMinutes: 60
-          pool:
-            vmImage: macOS-15
-          steps:
-            - checkout: self
-              fetchDepth: 1
-            - bash: |
-                set -euo pipefail
-                rustup toolchain install
-                rustup target add aarch64-apple-darwin
-                command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-                export PATH="$HOME/.local/bin:$PATH"
-                uv python install ${{ build.python }}
-                python="$(uv python find ${{ build.python }})"
-                maturin="$(sed -n 's/^requires = \["\(maturin[^"]*\)"\].*/\1/p' pyproject.toml)"
-                uv tool run --from "$maturin" maturin build --release --target aarch64-apple-darwin --out dist -i "$python"
-                ls -la dist
-                whl="$(ls dist/*-${{ build.tag }}-macosx_11_0_arm64.whl)"
-                mkdir -p "$(Agent.TempDirectory)/whl" && cd "$(Agent.TempDirectory)/whl" && unzip -q -o "$OLDPWD/$whl"
-                lipo -archs moruna/_core*.so | tee /dev/stderr | grep -qx arm64
-              displayName: Cross-build the macOS arm64 wheel, and check its tag and architecture
-              env:
-                # The macOS wheels keep 0.6.2's platform tag on the newer SDK.
-                MACOSX_DEPLOYMENT_TARGET: "11.0"
-            - publish: dist
-              artifact: wheels-macos-${{ build.name }}
+      - template: templates/wheels.yml
+        parameters:
+          smallJobsPool: ${{ parameters.smallJobsPool }}
 
   # ------------------------------------------------------------------------------------------
   - stage: release
