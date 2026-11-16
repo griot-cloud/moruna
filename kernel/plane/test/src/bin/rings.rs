@@ -239,7 +239,13 @@ struct Layout {
 }
 
 impl Layout {
-    fn of(framing: Vec<u8>) -> Result<Layout, String> {
+    fn of(mut framing: Vec<u8>) -> Result<Layout, String> {
+        // The fixture holds the framing padded to a page; the record check takes its two
+        // messages alone.
+        match record::framing_need(&framing)? {
+            record::Need::Framing(end) if end <= framing.len() => framing.truncate(end),
+            _ => return Err(String::from("the fixture holds no whole framing")),
+        }
         let batch = 8 + frame::message_len(&framing)?;
         let body = frame::body_length(framing.get(batch..).ok_or("no batch message")?)?;
         let len = framing.len() as u64 + u64::try_from(body).map_err(|_| "a negative body")?;
