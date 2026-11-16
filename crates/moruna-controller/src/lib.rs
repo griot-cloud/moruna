@@ -311,12 +311,6 @@ pub struct ControllerConfig {
     /// The process's anonymous memory sampled *before* the arena was created (f.1). Reported
     /// in `Budgets` and never subtracted from `arena_bytes`.
     pub baseline_bytes: u64,
-    /// The bytes an engine source's own operators may hold outside the arena (MH 4.5: a
-    /// DataFusion plan's sorts, aggregations and joins, bounded by its memory pool); zero for
-    /// every other source. The facade sized the arena over what this leaves, and the model
-    /// counts it as resident, beside the baseline and the arena, so no morsel is planned into
-    /// it.
-    pub engine_bytes: u64,
     /// Actual retained native child Account limits already present in every sampler reading.
     /// Funded once outside the arena, before probing; never inferred from process growth.
     /// Zero for ordinary Linux process-memory accounting.
@@ -365,7 +359,6 @@ impl Default for ControllerConfig {
             disk_budget: 0,
             arena_bytes: 0,
             baseline_bytes: 0,
-            engine_bytes: 0,
             fixed_native_bytes: 0,
             sink_buffer_bytes: 0,
             checkpoint_enabled: false,
@@ -734,7 +727,7 @@ pub(crate) struct ControllerState {
     /// reported: a morsel that started before it ran beside one of them (`settled`).
     pub stale_end_ns: u64,
     /// How many times the facade's watcher has handed the controller limits of its own
-    /// (`follow_limits`, `set_arena`, `set_engine`). The tick reads it before it samples and
+    /// (`follow_limits`, `set_arena`). The tick reads it before it samples and
     /// takes the sample's limits only if it has not moved since: a sample taken before the
     /// watcher's calls carries the limits those calls replaced (f.15, amended 2026-09-30).
     pub facade_limits: u64,
@@ -1264,22 +1257,6 @@ impl Controller {
             state.drain_pending = 0;
             if !state.terminated {
                 elastic::set_host_budget(&mut state, budget_bytes, &mut actions);
-            }
-            actions
-        };
-        self.inner.perform(actions);
-    }
-
-    /// An engine source's operator memory moved with the machine's limits: `bytes` is what its
-    /// pool may hold from now on, counted as resident beside the arena, and the plan is
-    /// re-solved inside what is left. Called by the facade's watcher only.
-    pub fn set_engine(&self, bytes: u64) {
-        let actions = {
-            let mut state = self.inner.held();
-            state.facade_limits = state.facade_limits.wrapping_add(1);
-            let mut actions = Actions::default();
-            if !state.terminated {
-                elastic::set_engine(&mut state, bytes, &mut actions);
             }
             actions
         };

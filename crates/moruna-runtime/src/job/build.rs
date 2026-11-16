@@ -19,7 +19,7 @@ use super::translate::{self, ResumeArg};
 use crate::kinds::{Context, Entry, Registry, Stage};
 use crate::spec::RunSpec;
 use moruna_job::{
-    Declaration, ErrorPolicyDoc, Fact, Flow, GuaranteeDoc, HostProfileDoc, Isolation, Job, KindDoc,
+    Declaration, ErrorPolicyDoc, Flow, GuaranteeDoc, HostProfileDoc, Isolation, Job, KindDoc,
     ObjectStoreDoc, Role, SizerDoc, SpecError,
 };
 use moruna_plan::Plan;
@@ -262,18 +262,9 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
         }
     }
 
-    // KD-I8: contracts carried for no kind that reads or writes under them are refused.
-    if !job.contracts.is_empty() && !declared.iter().any(|d| d.needs.contracts == Fact::Yes) {
-        return Err(refusal(SpecError::new(
-            "contracts",
-            "carried, and no kind of this document reads or writes under contracts",
-        )));
-    }
-
     let mut cx = Context::new(kinds.embedding())
         .packages(opts.packages)
         .host_ports(opts.host_ports)
-        .contracts(job.contracts.clone())
         .pulled(opts.pulled_images)
         .run_args(args);
 
@@ -494,23 +485,11 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
         profile_override: host_profile.clone(),
     };
 
-    let mut engine_memory = Vec::new();
-    let mut source_specs = Vec::with_capacity(sources.len());
-    for built in sources {
-        engine_memory.extend(built.memory);
-        source_specs.push(built.spec);
-    }
-    let mut sink_memory = Vec::new();
-    let mut sink_specs = Vec::with_capacity(sinks.len());
-    for built in sinks {
-        sink_memory.extend(built.memory);
-        sink_specs.push(built.spec);
-    }
+    let source_specs = sources.into_iter().map(|built| built.spec).collect();
+    let sink_specs = sinks.into_iter().map(|built| built.spec).collect();
     let mut spec = RunSpec::graph(source_specs, kernels, sink_specs, topology);
-    spec.engine_memory = engine_memory;
     spec.packaged = packaged;
     spec.ports = stage_ports;
-    spec.sink_memory = sink_memory;
     #[cfg(feature = "python")]
     {
         spec.py_kernels = py_kernels;

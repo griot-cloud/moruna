@@ -25,7 +25,7 @@ pub struct SourceSettings {
     /// `file://`, `s3://`, `gs://`, `az://` or a bare local path: files or prefixes.
     pub url: Urls,
     /// Projection and row-group pruning.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::object")]
     pub options: SourceOptions,
 }
 
@@ -51,7 +51,7 @@ pub struct SinkSettings {
     /// `file://`, `s3://`, `gs://`, `az://` or a bare local directory.
     pub url: String,
     /// Sizes and compression.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::object")]
     pub options: SinkOptions,
 }
 
@@ -130,7 +130,6 @@ impl SourceKind for Parquet {
                 )?) as Arc<dyn Source>)
             })),
             targets: settings.url.0,
-            memory: None,
         })
     }
 }
@@ -243,7 +242,6 @@ impl SinkKind for Parquet {
                 Ok(Box::new(sink) as Box<dyn moruna_kernel::Sink>)
             })),
             target,
-            memory: None,
         })
     }
 }

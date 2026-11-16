@@ -143,8 +143,6 @@ pub fn meta(exit: ExitReason) -> RunMeta {
         process_peak: moruna_kernel::ProcessPeak::default(),
         memory_basis: moruna_kernel::MemoryBasis::ProcessAnon,
         process_usage: moruna_kernel::ProcessUsage::default(),
-        write: None,
-        read: None,
         buffers: None,
         policy: None,
     }

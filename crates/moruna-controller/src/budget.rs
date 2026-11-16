@@ -59,7 +59,6 @@ pub(crate) fn prepare(ctl: &Inner) -> Result<Budgets> {
         if state.cfg.fixed_native_bytes > 0
             && baseline
                 .saturating_add(state.cfg.arena_bytes)
-                .saturating_add(state.cfg.engine_bytes)
                 .saturating_add(state.cfg.fixed_native_bytes)
                 >= ceiling
         {

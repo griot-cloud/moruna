@@ -346,7 +346,7 @@ def main():
                 '--config', 'profile.dev.package.vortex-fastlanes.opt-level=1',
                 '--config', 'profile.dev.package.vortex-array.opt-level=1',
                 '--config', 'profile.dev.package.moruna-py.opt-level=1', '-j1',
-                '-p', 'moruna-py', '--features', 'python,peql', '--lib', '--bin', 'moruna-kd3-fixture']
+                '-p', 'moruna-py', '--features', 'python', '--lib', '--bin', 'moruna-kd3-fixture']
         call(base, 'cargo-build')
         artifacts = [('debug/moruna-kd3-fixture', 'moruna-kd3-fixture', True), ('debug/lib_core.so', '_core.so', False)]
         if arch == 'aarch64':

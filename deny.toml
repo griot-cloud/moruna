@@ -9,7 +9,7 @@
 #               across the workspace. A second version of any of them is how the
 #               S7 portability claim and the S13 zero-copy claim break: two
 #               incompatible `RecordBatch` types cannot be handed between the
-#               kernel crate, the Polars and DataFusion bridges and the Python
+#               kernel crate, the Polars bridge and the Python
 #               surface without a copy, and the compiler reports it as a type
 #               mismatch nobody can read. Decided by the PM on 2026-09-22
 #               (preamble 6.2, the paragraph under the pinned version table).
@@ -23,10 +23,10 @@
 # an E2 escalation for the human (preamble section 7).
 
 [graph]
-# Every optional feature is resolved, so the `cuda`, `uring`, `python`, `polars`
-# and `datafusion` graphs are policed too. The two bridge crates are the reason:
-# `polars` and `datafusion` each pull their own `arrow`, and an unfeatured scan
-# would never see the duplicate the bans section below exists to catch.
+# Every optional feature is resolved, so the `cuda`, `uring`, `python` and `polars`
+# graphs are policed too. The Polars bridge is the reason: `polars` pulls its own
+# `arrow`, and an unfeatured scan would never see the duplicate the bans section
+# below exists to catch.
 all-features = true
 # The platforms Moruna ships, and the only ones the graph is resolved for.
 # Decided by the PM on 2026-09-22 and written into preamble 6.2 as the
@@ -108,14 +108,6 @@ confidence-threshold = 0.93
 crate = "xxhash-rust"
 allow = ["BSL-1.0"]
 
-# libbz2-rs-sys is bzip2-1.0.6 only: the bzip2 and libbzip2 licence, a BSD-style
-# permissive licence with a no-endorsement clause and no reciprocal obligation.
-# It arrives through datafusion's `compression` feature, so it is in the
-# `datafusion` bridge only.
-[[licenses.exceptions]]
-crate = "libbz2-rs-sys"
-allow = ["bzip2-1.0.6"]
-
 # enum-iterator and enum-iterator-derive are 0BSD only (BSD Zero Clause: public
 # domain equivalent, no attribution requirement, more permissive than MIT). They
 # came in with Vortex 0.86.1 on 2026-09-30, approved by Brackly, through
@@ -140,8 +132,8 @@ allow = ["0BSD"]
 # was added, and the licence question comes back with it (PM, 2026-09-22).
 
 [bans]
-# The workspace is allowed to carry duplicate versions in general: the Polars and
-# DataFusion bridges are separate crates a user opts into, and forbidding every
+# The workspace is allowed to carry duplicate versions in general: the Polars
+# bridge is a separate crate a user opts into, and forbidding every
 # duplicate would turn an unrelated transitive bump into a stop-the-world event.
 multiple-versions = "allow"
 # A `*` version requirement defeats the exact pins of preamble 6.2.
@@ -171,14 +163,5 @@ deny-multiple-versions = true
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# peQL, the contract-native engine of MH 4.5, and parcel, its contract compiler, are the
-# project's own and are consumed at a pinned commit (F8.5).
-allow-git = [
-  "https://github.com/griot-cloud/peQL",
-  "https://github.com/griot-cloud/parcel",
-  # Apache Iceberg's Rust crates, at the commits peQL 0.4.1 (`44c111f`) pins for its
-  # `iceberg` feature. They enter the graph only through `moruna-datafusion`'s
-  # `peql-iceberg`, which no Moruna build turns on; a host that embeds peQL with Iceberg does.
-  "https://github.com/apache/iceberg-rust",
-  "https://github.com/apache/datafusion-iceberg",
-]
+# No git dependency is allowed: 0.7 removed the last ones, peQL and parcel.
+allow-git = []

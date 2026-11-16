@@ -696,7 +696,6 @@ impl moruna_runtime::kinds::SourceKind for Handed<moruna_runtime::SourceSpec> {
         Ok(moruna_runtime::kinds::BuiltSource {
             spec: (self.make)(),
             targets: Vec::new(),
-            memory: None,
         })
     }
 }
@@ -714,7 +713,6 @@ impl moruna_runtime::kinds::SinkKind for Handed<moruna_runtime::SinkSpec> {
         Ok(moruna_runtime::kinds::BuiltSink {
             spec: (self.make)(),
             target: String::new(),
-            memory: None,
         })
     }
 }

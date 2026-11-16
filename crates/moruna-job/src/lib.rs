@@ -59,9 +59,9 @@ pub use catalogue::{Catalogue, CatalogueError};
 pub use check::{IMAGE_KIND, Refusal, RefusalCode, check, check_graph, drafts, settings_refusals};
 pub use doc::{
     AzureDoc, BudgetDoc, CHECKPOINT_INTERVAL_BOUNDS_MS, CHECKPOINT_INTERVAL_MS, CheckpointDoc,
-    ContractEntry, ElasticDoc, ErrorPolicyDoc, GcsDoc, GuaranteeDoc, HostProfileDoc, JobSpec,
-    KindDoc, ObjectStoreDoc, ReportDoc, S3Doc, SPEC_VERSION, SizerDoc, SpecError, StagingDoc,
-    TaskIdsDoc, TaskRefDoc, checkpoint_interval_ms, is_task_id,
+    ElasticDoc, ErrorPolicyDoc, GcsDoc, GuaranteeDoc, HostProfileDoc, JobSpec, KindDoc,
+    ObjectStoreDoc, ReportDoc, S3Doc, SPEC_VERSION, SizerDoc, SpecError, StagingDoc, TaskIdsDoc,
+    TaskRefDoc, checkpoint_interval_ms, is_task_id,
 };
 pub use flatbuffer::{JOB_IDENTIFIER, JobError, is_job_flatbuffer};
 pub use job::{Edge, IN, JOB_VERSION, Job, OUT, PortRef, Reporting, Task, V1_SINK, V1_SOURCE};

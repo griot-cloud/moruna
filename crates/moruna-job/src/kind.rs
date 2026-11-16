@@ -8,7 +8,7 @@ use crate::port::PortDoc;
 use crate::rules::{RulesFault, SchemaRules};
 
 /// The format version of `moruna kinds` (the [`Listing`]).
-pub const LISTING_VERSION: u32 = 2;
+pub const LISTING_VERSION: u32 = 3;
 
 /// The JSON Schema dialect every settings schema is written in (decision KD1).
 pub const SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -136,8 +136,6 @@ pub struct Needs {
     pub gpu: Fact,
     /// A named port it calls (`call(port, bytes)`, MH 4.10), a model's say.
     pub model_port: Fact,
-    /// The contracts the job carries (`contracts`, MH 4.5).
-    pub contracts: Fact,
 }
 
 impl Needs {
@@ -148,7 +146,6 @@ impl Needs {
             egress: Vec::new(),
             gpu: Fact::No,
             model_port: Fact::No,
-            contracts: Fact::No,
         }
     }
 

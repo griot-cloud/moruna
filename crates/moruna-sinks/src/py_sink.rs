@@ -255,7 +255,6 @@ impl Sink for PySink {
             rows: inner.stats.rows,
             bytes: inner.stats.bytes,
             files: Vec::new(),
-            write: None,
             commit,
         })
     }

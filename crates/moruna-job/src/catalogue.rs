@@ -1,20 +1,16 @@
 //! The catalogue: every declaration an embedder can name (SDD 22 e.2).
 //!
-//! Moruna's own are the two files `moruna kinds` printed, embedded: `catalogue/standard.json`,
-//! what a build with default features lists, and `catalogue/peql.json`, the two kinds a build with
-//! the `peql` feature adds. An embedder adds its own declarations to them, or starts from a
-//! listing it read from a `moruna kinds` of its own.
+//! Moruna's own is the file `moruna kinds` printed, embedded: `catalogue/standard.json`. An
+//! embedder adds its own declarations to it, or starts from a listing it read from a
+//! `moruna kinds` of its own.
 
 use std::collections::BTreeMap;
 
 use crate::kind::{Declaration, LISTING_VERSION, Listing, Role};
 use crate::schema;
 
-/// The standard kinds, as `moruna kinds` printed them for a build with default features.
+/// The standard kinds, as `moruna kinds` printed them.
 const STANDARD: &str = include_str!("../catalogue/standard.json");
-
-/// The kinds the `peql` feature adds, as `moruna kinds` printed them.
-const PEQL: &str = include_str!("../catalogue/peql.json");
 
 /// Why a declaration, or a listing of them, was not taken into a catalogue.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -75,16 +71,9 @@ impl Catalogue {
         Catalogue::default()
     }
 
-    /// Moruna's standard kinds: what a build of `moruna-runtime` with default features lists
-    /// (`moruna kinds`), without the governed ends the `peql` feature adds.
+    /// Moruna's standard kinds: what a build of `moruna-runtime` lists (`moruna kinds`).
     pub fn standard() -> Result<Catalogue, CatalogueError> {
         Catalogue::embedded(&[("standard.json", STANDARD)])
-    }
-
-    /// The standard kinds and the two the `peql` feature adds, the `datafusion` source and the
-    /// `peql` sink: what a build with that feature lists.
-    pub fn standard_with_peql() -> Result<Catalogue, CatalogueError> {
-        Catalogue::embedded(&[("standard.json", STANDARD), ("peql.json", PEQL)])
     }
 
     /// The catalogue of the kinds a listing declares: what an embedder that ran `moruna kinds`

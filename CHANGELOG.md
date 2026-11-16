@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.0 (unreleased)
+
+Moruna holds no engine or library code: anything that follows the Arrow contract runs, and the
+plan is in `architecture/arrow-core-0.7.md`.
+
+- **peQL and DataFusion are gone.** The `datafusion` source and `peql` sink kinds, the
+  `moruna-datafusion` crate, the wheel's `peql` feature, and the job document's `contracts` are
+  removed. A 0.6 document naming them is refused, by name. Read or write through peQL in your
+  own `moruna.Source` or `moruna.Sink`, or an `image` task.
+- **The report's schema is 3.0.** A sink's `excluded_rows`, and the `write` and `read` an engine
+  reported, are gone with the peQL kinds.
+- **The kinds listing is version 3.** A declaration's `needs` no longer has `contracts`.
+
 ## 0.6.6
 
 Moruna adapts to the job and the machine it runs on. On one fixed node (8 CPUs, 24 GiB) it is

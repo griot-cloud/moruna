@@ -381,31 +381,6 @@ fn run_fixture(fixture: Value, adapter: &str) -> Result<Value> {
         return Err("fixture staging must match actual run scratch".into());
     }
     fs::create_dir_all(&writable)?;
-    if let Some(input) = fixture["governed_input"].as_str() {
-        let root = writable.join("governed");
-        for task in &job.tasks {
-            if matches!(task.kind.as_str(), "datafusion" | "peql")
-                && task.settings.get("root").and_then(Value::as_str) != root.to_str()
-            {
-                return Err("governed fixture root differs from actual run scratch".into());
-            }
-        }
-        let mut source = fs::File::open(input)?;
-        let bytes = source.metadata()?.len();
-        if bytes > 16 * 1024 * 1024 {
-            return Err("actual governed fixture input exceeds 16MiB".into());
-        }
-        // peQL's Parquet binding is a dataset directory, not one file.
-        let input_dir = root.join("input");
-        fs::create_dir_all(&input_dir)?;
-        let mut target = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(input_dir.join("part-00000.parquet"))?;
-        if std::io::copy(&mut source, &mut target)? != bytes {
-            return Err("actual governed input copy length differs".into());
-        }
-    }
     let role = if phase == "readback" {
         if case["role"] != "sink" || mode != "rows" {
             return Err("readback applies to successful sink cases".into());
@@ -414,11 +389,7 @@ fn run_fixture(fixture: Value, adapter: &str) -> Result<Value> {
     } else {
         case["role"].as_str().ok_or("case role")?
     };
-    let kind = if phase == "readback" && case["kind"] == "peql" {
-        "parquet"
-    } else {
-        case["kind"].as_str().ok_or("case kind")?
-    };
+    let kind = case["kind"].as_str().ok_or("case kind")?;
     if !job
         .tasks
         .iter()
@@ -577,16 +548,12 @@ fn run_fixture(fixture: Value, adapter: &str) -> Result<Value> {
             kind: task.kind.clone(),
             settings: task.settings.clone(),
         };
-        let mut context = Context::new(Arc::new(Standalone)).contracts(job.contracts.clone());
+        let mut context = Context::new(Arc::new(Standalone));
         let (_, adapter) = kinds.sink(&job.field(index), &task.kind)?;
         let described = adapter.sink(&Entry::new(job.field(index), Some(0), &doc), &mut context)?;
         let prefix = job::translate::normalise_target(&described.target);
         Some((
-            if case["kind"] == "peql" {
-                "parquet".to_owned()
-            } else {
-                case["kind"].as_str().unwrap_or("").to_owned()
-            },
+            case["kind"].as_str().unwrap_or("").to_owned(),
             format!(
                 "{}/receipt-readback",
                 fixture["job"]["staging"]["dir"]
@@ -663,28 +630,6 @@ fn run_fixture(fixture: Value, adapter: &str) -> Result<Value> {
         return Ok(json!({"run_id":report.run_id.to_string(),"receipts":[execute,readback]}));
     }
     Ok(execute)
-}
-#[cfg(feature = "peql")]
-fn seed_contract(path: &Path) -> Result<()> {
-    use moruna_datafusion::engine::Engine;
-    let schema = Schema::new(vec![Field::new("x", DataType::Int64, false)]);
-    let engine = Engine::in_memory(path.parent().ok_or("contract path has no parent")?);
-    let mut entries = Vec::new();
-    for (name, binding) in [("input", "input/"), ("output", "output/")] {
-        let source = format!(
-            "contract: kd3/{name}\nversion: 1\nowner: kd3\nbinding: {{parquet: {binding}}}\nexpose:\n  - {{name: x, type: int64}}\nrules:\n  - {{id: fixture, op: decide, expr: \"ctx.purpose == 'conformance'\"}}\n"
-        );
-        let registered = engine.register_contract(&source, &schema)?;
-        entries.push(moruna_runtime::kinds::governed::entry_of(&registered)?);
-    }
-    let mut out = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)?;
-    serde_json::to_writer_pretty(&mut out, &entries)?;
-    out.write_all(b"\n")?;
-    out.sync_all()?;
-    Ok(())
 }
 fn emit(value: &Value, case: &str, adapter: &str) -> Result<()> {
     let Some(nonce) = std::env::var_os("MORUNA_KD3_PROOF_NONCE") else {
@@ -804,10 +749,6 @@ fn read_case_grant(_slot: &str) -> Result<Value> {
 }
 fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    #[cfg(feature = "peql")]
-    if args.len() == 2 && args[0] == "seed-contract" {
-        return seed_contract(Path::new(&args[1]));
-    }
     if args.len() == 2 && args[0] == "seed" {
         return seed(Path::new(&args[1]));
     }

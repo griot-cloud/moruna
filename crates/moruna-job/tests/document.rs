@@ -120,10 +120,11 @@ fn jb_t22_document_refusals_name_the_field() {
     );
     assert_eq!(field(&base(r#","kernels":[{"kind":5}]"#)), "kernels[0]");
     assert_eq!(field(&base(r#","kernels":[{"kind":""}]"#)), "kernels[0]");
+    // `contracts` went with the peQL kinds in 0.7: refused by name, whatever it holds.
     assert_eq!(field(&base(r#","contracts":{}"#)), "contracts");
     assert_eq!(
         field(&base(r#","contracts":[{"document":{}}]"#)),
-        "contracts[0]"
+        "contracts"
     );
     assert_eq!(field(&base(r#","ordered":"yes""#)), "ordered");
     assert_eq!(field(&base(r#","trace":5"#)), "trace");

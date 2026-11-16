@@ -157,7 +157,6 @@ pub(crate) fn resting_anon(state: &ControllerState) -> u64 {
         .saturating_add(state.budgets.host)
         .saturating_add(state.cfg.sink_buffer_bytes)
         .saturating_add(state.arena_draining)
-        .saturating_add(state.cfg.engine_bytes)
         .saturating_add(state.cfg.fixed_native_bytes)
 }
 

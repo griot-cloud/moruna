@@ -282,7 +282,6 @@ impl Sink for ArrowStreamSink {
             rows: inner.rows,
             bytes: inner.bytes,
             files: Vec::new(),
-            write: None,
             commit,
         })
     }

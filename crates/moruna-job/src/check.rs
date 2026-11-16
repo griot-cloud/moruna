@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use crate::catalogue::Catalogue;
 use crate::doc::is_task_id;
 use crate::job::{Job, Task};
-use crate::kind::{Declaration, Fact, Flow, Role};
+use crate::kind::{Declaration, Flow, Role};
 use crate::rules::Known;
 use crate::schema::{self, Step, Violation, Wrong};
 
@@ -67,8 +67,6 @@ pub enum RefusalCode {
         /// The column at fault.
         column: String,
     },
-    /// The kind needs a contract (`needs.contracts` is `yes`) and the job carries none.
-    Contract,
     /// A task's inline definition is not one (SDD 18 e.1), differs from its kind's declaration,
     /// or does not describe the task: its params against its schema, its needs, the schema one
     /// task gives against the schema the next takes.
@@ -79,7 +77,7 @@ pub enum RefusalCode {
 /// the document is read: each task (its id, its kind, its kind's flows, its settings, its ports),
 /// then each edge (its ends, its flow), then each task's ports (fed by exactly one edge, read by
 /// at least one), then the graph (a cycle, a barrier), then the columns along the edges into
-/// served kinds (SDD 22 e.6), then the contracts. Nothing is built or run.
+/// served kinds (SDD 22 e.6). Nothing is built or run.
 pub fn check(job: &Job, catalogue: &Catalogue) -> Result<(), Vec<Refusal>> {
     walk(job, Some(catalogue))
 }
@@ -92,15 +90,14 @@ pub fn check_graph(job: &Job) -> Result<(), Vec<Refusal>> {
 
 fn walk(job: &Job, catalogue: Option<&Catalogue>) -> Result<(), Vec<Refusal>> {
     let mut refusals = Vec::new();
-    let mut needing = Vec::new();
     let mut declared: Vec<Option<&Declaration>> = Vec::with_capacity(job.tasks.len());
     let mut ids: BTreeMap<&str, usize> = BTreeMap::new();
     for (i, task) in job.tasks.iter().enumerate() {
         let field = job.field(i);
         task_id(&field, task, i, &mut ids, &mut refusals);
-        declared.push(catalogue.and_then(|catalogue| {
-            task_entry(&field, task, catalogue, &mut refusals, &mut needing)
-        }));
+        declared.push(
+            catalogue.and_then(|catalogue| task_entry(&field, task, catalogue, &mut refusals)),
+        );
         ports_fit(&field, task, &mut refusals);
     }
     for (i, edge) in job.edges.iter().enumerate() {
@@ -206,18 +203,6 @@ fn walk(job: &Job, catalogue: Option<&Catalogue>) -> Result<(), Vec<Refusal>> {
         barriers(job, &mut refusals);
         columns(job, &declared, &mut refusals);
     }
-    if job.contracts.is_empty() {
-        for (field, kind) in needing {
-            refusals.push(Refusal {
-                field: "contracts".to_string(),
-                code: RefusalCode::Contract,
-                message: format!(
-                    "`{kind}` at `{field}` reads or writes under a contract, and the job carries \
-                     none: put it in `contracts`"
-                ),
-            });
-        }
-    }
     if refusals.is_empty() {
         Ok(())
     } else {
@@ -268,7 +253,6 @@ fn task_entry<'c>(
     task: &Task,
     catalogue: &'c Catalogue,
     refusals: &mut Vec<Refusal>,
-    needing: &mut Vec<(String, String)>,
 ) -> Option<&'c Declaration> {
     let role = task.role;
     let Some(declared) = catalogue.get(role, &task.kind) else {
@@ -297,9 +281,6 @@ fn task_entry<'c>(
     ));
     if let Some(definition) = &task.definition {
         definition_refusals(field, task, declared, definition, refusals);
-    }
-    if declared.needs.contracts == Fact::Yes {
-        needing.push((field.to_string(), task.kind.clone()));
     }
     Some(declared)
 }
@@ -833,7 +814,7 @@ pub fn drafts(job: &Job, held: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::doc::{JobSpec, KindDoc};
-    use crate::kind::{Isolation, Needs};
+    use crate::kind::{Fact, Isolation, Needs};
     use serde_json::json;
 
     /// JB-T11 flows_are_read_from_the_declaration: a declaration whose flows do not fit its role

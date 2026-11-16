@@ -24,7 +24,7 @@ pub struct SourceSettings {
     /// Local paths or `file://` URLs of safetensors or aligned binary tensor files.
     pub url: Urls,
     /// Which tensors.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::object")]
     pub options: SourceOptions,
 }
 
@@ -44,7 +44,7 @@ pub struct SinkSettings {
     /// A local directory.
     pub url: String,
     /// Format and naming.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::object")]
     pub options: SinkOptions,
 }
 
@@ -112,7 +112,6 @@ impl SourceKind for Tensor {
                 Ok(Arc::new(TensorSource::new(cfg, ctx.reactor.clone())?) as Arc<dyn Source>)
             })),
             targets: settings.url.0,
-            memory: None,
         })
     }
 }
@@ -170,7 +169,6 @@ impl SinkKind for Tensor {
                 )?) as Box<dyn moruna_kernel::Sink>)
             })),
             target: settings.url,
-            memory: None,
         })
     }
 }

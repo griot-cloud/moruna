@@ -298,7 +298,6 @@ impl Sink for FakeSink {
             rows: state.rows,
             bytes: state.bytes,
             files: vec!["fake-sink-0".to_string()],
-            write: None,
             commit: None,
         })
     }

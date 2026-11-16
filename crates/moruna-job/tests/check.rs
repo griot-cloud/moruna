@@ -1,8 +1,6 @@
 //! SDD 22 k: checking a document without running it (JB-T6 to JB-T10).
 
-use moruna_job::{
-    Catalogue, ContractEntry, Job, JobSpec, KindDoc, Refusal, RefusalCode, Role, check,
-};
+use moruna_job::{Catalogue, Job, JobSpec, KindDoc, Refusal, RefusalCode, Role, check};
 use serde_json::{Value, json};
 
 fn entry(value: Value) -> KindDoc {
@@ -39,20 +37,11 @@ fn text(refusals: &[Refusal]) -> Vec<String> {
     refusals.iter().map(Refusal::to_string).collect()
 }
 
-fn contract() -> ContractEntry {
-    ContractEntry {
-        document: json!({}),
-        compiled: String::new(),
-        functions: Vec::new(),
-        audiences: Vec::new(),
-    }
-}
-
 /// JB-T6 examples_pass: every example of every declared kind is settings its kind accepts, so a
 /// document made of them passes, whatever the roles around it.
 #[test]
 fn jb_t6_every_example_passes() {
-    let governed = Catalogue::standard_with_peql().expect("the governed catalogue");
+    let governed = Catalogue::standard().expect("the standard catalogue");
     let mut cases = 0;
     for role in [Role::Source, Role::Kernel, Role::Sink] {
         for declared in governed.declarations(role) {
@@ -65,7 +54,6 @@ fn jb_t6_every_example_passes() {
                     Role::Kernel => doc.kernels = vec![entry(mine)],
                     Role::Sink => doc.sink = entry(mine),
                 }
-                doc.contracts = vec![contract()];
                 assert_eq!(v1(&doc, &governed), Ok(()), "{} {example}", declared.name);
                 cases += 1;
             }
@@ -284,7 +272,7 @@ fn jb_t8_settings_refusals() {
 }
 
 /// JB-T9 every_refusal_is_collected: all of a document's refusals come back, in the order the
-/// document is read: each task, then the edges, the ports, the graph and the contracts.
+/// document is read: each task, then the edges, the ports and the graph.
 #[test]
 fn jb_t9_every_refusal_is_collected() {
     let doc = job(
@@ -308,54 +296,4 @@ fn jb_t9_every_refusal_is_collected() {
             "sink.settings.url",
         ]
     );
-}
-
-/// JB-T10 contracts_are_needed: a kind whose `needs.contracts` is `yes` is refused when the job
-/// carries none, once for each such entry, at `contracts` and naming the entry; carried, it
-/// passes. A kind that needs none is not refused for carrying none.
-#[test]
-fn jb_t10_contracts_are_needed() {
-    let governed = Catalogue::standard_with_peql().expect("the governed catalogue");
-    let example = |role: Role, name: &str| {
-        let mut settings = governed
-            .get(role, name)
-            .expect("declared")
-            .examples()
-            .remove(0);
-        settings["kind"] = json!(name);
-        settings
-    };
-    let mut doc = job(
-        example(Role::Source, "datafusion"),
-        Vec::new(),
-        example(Role::Sink, "peql"),
-    );
-    let found = v1(&doc, &governed).expect_err("no contract is carried");
-    assert_eq!(found.len(), 2, "{found:?}");
-    assert!(
-        found
-            .iter()
-            .all(|r| r.code == RefusalCode::Contract && r.field == "contracts")
-    );
-    assert_eq!(
-        found[0].message,
-        "`datafusion` at `source` reads or writes under a contract, and the job carries none: \
-         put it in `contracts`"
-    );
-    assert!(
-        found[1].message.starts_with("`peql` at `sink` "),
-        "{}",
-        found[1]
-    );
-    doc.contracts = vec![contract()];
-    assert_eq!(v1(&doc, &governed), Ok(()));
-    // The standard catalogue does not have them at all.
-    assert!(
-        v1(
-            &doc,
-            &Catalogue::standard().expect("the standard catalogue")
-        )
-        .is_err()
-    );
-    assert_eq!(v1(&good(), &governed), Ok(()));
 }

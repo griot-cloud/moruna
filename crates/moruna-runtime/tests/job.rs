@@ -14,21 +14,16 @@ use moruna_kernel::MorunaError;
 use moruna_runtime::kinds::{Context, Entry, Registry, Standalone};
 use serde_json::{Map, Value, json};
 
-/// The catalogue a build of this test has: the standard kinds, and the governed ones with the
-/// `peql` feature, which is what `Registry::standard()` registers.
+/// The catalogue a build of this test has: the standard kinds, which is what
+/// `Registry::standard()` registers.
 fn catalogue() -> Catalogue {
-    if cfg!(feature = "peql") {
-        Catalogue::standard_with_peql().expect("the governed catalogue")
-    } else {
-        Catalogue::standard().expect("the standard catalogue")
-    }
+    Catalogue::standard().expect("the standard catalogue")
 }
 
 /// JB-T25 catalogue_is_the_registry: the files `moruna-job` embeds are what `moruna kinds` lists
 /// for this build, declaration for declaration, so a kind added, removed or changed in the
-/// runtime without the files is a failure here. When it is one, regenerate them: `moruna kinds`
-/// of a build with default features is `catalogue/standard.json`, and the kinds a build with
-/// `--features peql` lists beyond it are `catalogue/peql.json`.
+/// runtime without the files is a failure here. When it is one, regenerate it: `moruna kinds` is
+/// `catalogue/standard.json`.
 #[test]
 fn jb_t25_catalogue_is_the_registry() {
     let listing = Registry::standard().listing();
@@ -50,15 +45,9 @@ fn jb_t25_catalogue_is_the_registry() {
             "a served kind in the published catalogue"
         );
     }
-    // Without the feature the governed kinds are not the registry's, and the standard catalogue
-    // is what it is.
-    if !cfg!(feature = "peql") {
-        assert!(from_registry.get(Role::Sink, "peql").is_none());
-        assert_eq!(
-            from_registry,
-            Catalogue::standard().expect("the standard catalogue")
-        );
-    }
+    // No peQL kind is in the registry since 0.7.
+    assert!(from_registry.get(Role::Sink, "peql").is_none());
+    assert!(from_registry.get(Role::Source, "datafusion").is_none());
 }
 
 /// SplitMix64, so the mutations are the same on every machine and no crate draws them.
@@ -436,7 +425,6 @@ fn jb_t27_the_types_have_one_home() {
         "JobSpec",
         "KindDoc",
         "SpecError",
-        "ContractEntry",
         "BudgetDoc",
         "ElasticDoc",
         "StagingDoc",

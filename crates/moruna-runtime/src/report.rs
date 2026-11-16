@@ -80,10 +80,6 @@ pub struct MetaInput {
     pub memory_basis: moruna_kernel::MemoryBasis,
     /// What the whole process consumed over the run (`Sampler::process_usage`).
     pub process_usage: moruna_kernel::ProcessUsage,
-    /// What the sink's engine said about the write it committed, when the run completed.
-    pub write: Option<moruna_kernel::SinkWrite>,
-    /// What the source's engine said about the read it planned, when the source was built.
-    pub read: Option<moruna_kernel::SourceRead>,
     /// What each sink reported when it finished, when the run completed.
     pub sinks: Vec<moruna_kernel::SinkSummary>,
     /// The placement engine's buffer catalog at the end of the run, when the facade built the
@@ -126,8 +122,6 @@ pub fn meta(input: MetaInput) -> RunMeta {
         process_peak: input.process_peak,
         memory_basis: input.memory_basis,
         process_usage: input.process_usage,
-        write: input.write,
-        read: input.read,
         sinks: input.sinks,
         buffers: input.buffers,
         policy: input.policy,
@@ -209,8 +203,6 @@ mod tests {
                 since_ns: 2,
             },
             process_usage: moruna_kernel::ProcessUsage::default(),
-            write: None,
-            read: None,
             sinks: Vec::new(),
             policy: None,
             buffers: Some(moruna_trace::BufferReport::of(
@@ -254,8 +246,6 @@ mod tests {
             memory_basis: moruna_kernel::MemoryBasis::ProcessAnon,
             process_peak: moruna_kernel::ProcessPeak::default(),
             process_usage: moruna_kernel::ProcessUsage::default(),
-            write: None,
-            read: None,
             sinks: Vec::new(),
             buffers: None,
             policy: None,

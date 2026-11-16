@@ -41,7 +41,6 @@ moruna-job = { path = "crates/moruna-job", version = "0.6.6" }
 moruna-cost = { path = "crates/moruna-cost", version = "0.6.6" }
 moruna-plan = { path = "crates/moruna-plan", version = "0.6.6" }
 moruna-event = { path = "crates/moruna-event", version = "0.6.6" }
-moruna-datafusion = { path = "crates/moruna-datafusion", version = "0.6.6" }
 moruna-testkit = { path = "crates/moruna-testkit", version = "0.6.6" }
 moruna-vmm = { path = "crates/moruna-vmm", version = "0.6.6" }
 moruna-kernels = { path = "crates/moruna-kernels", version = "0.6.6" }
@@ -55,7 +54,10 @@ moruna-record = { path = "crates/moruna-record", version = "0.6.6", default-feat
 # External crates, the preamble 6.2 table, pinned to the latest stable on
 # 2026-09-22. Feature lists are the table's "Notes" column; a backend or
 # engine feature a component needs beyond these is set in that crate.
-arrow = { version = "=59.3.0", default-features = false, features = ["ffi", "ipc", "ipc_compression"] }
+# `chrono-tz`: a timestamp column named by its zone (`"UTC"`, `"Europe/Berlin"`), as Parquet writes
+# them, resolves. DataFusion turned it on until 0.7; it is named here so every build has it, the
+# engine on the Moruna kernel included.
+arrow = { version = "=59.3.0", default-features = false, features = ["ffi", "ipc", "ipc_compression", "chrono-tz"] }
 # Arrow IPC LZ4_FRAME and ZSTD buffers (07 e.9, 08 e.3, contracts e.8): `moruna-kernel` inflates them
 # itself, after checking every declared size; the sink writes them through arrow-ipc.
 lz4_flex = { version = "=0.14.0", default-features = false, features = ["std", "frame", "safe-encode", "safe-decode"] }
@@ -85,12 +87,7 @@ bytes = { version = "=1.12.1" }
 getrandom = { version = "=0.4.3" }
 hostname = { version = "=0.4.2" }
 polars = { version = "=0.55.2" }
-datafusion = { version = "=55.1.0" }
-# The contract-native engine on both ends of a run (MH 4.5): a governed plan as a source, a
-# contract write as a sink. `moruna-datafusion`'s `peql` feature; peQL never depends on Moruna.
-peql = { git = "https://github.com/griot-cloud/peQL", rev = "ff69290", version = "=0.4.2" }
-# Streams of record batches out of a DataFusion plan; already in the graph through datafusion
-# at this version.
+# The sources' asynchronous reads.
 futures = { version = "=0.3.34" }
 # Each job document task's settings as a FlexBuffers map (SDD 22 e.4, KA5), the version of
 # flatbuffers above.
@@ -125,17 +122,15 @@ socket2 = { version = "=0.6.5" }
 # 2026-09-29 by the PM on Brackly's approval; `arrow` ^59.2 and `object_store` ^0.13.2 inside it
 # resolve to the pins above, so the graph keeps one arrow.
 vortex = { version = "=0.86.1", default-features = false, features = ["files"] }
-# The job document's content address (MH 4.1, 13 d.2): `sha256` of the canonical JSON. Already
-# in the graph through the engine bridges at this version, so the pin adds no second copy.
+# The job document's content address (MH 4.1, 13 d.2): `sha256` of the canonical JSON.
 sha2 = { version = "=0.11.0" }
 # The settings schema each kind declares (SDD 18, decision KD1): JSON Schema 2020-12, derived from
-# the type the kind reads its settings with. Already in the graph through `parcel-core` at this
-# version (an E2 table addition, preamble 6.2, named in SDD 18 d.5).
+# the type the kind reads its settings with (an E2 table addition, preamble 6.2, named in SDD 18 d.5).
 schemars = { version = "=1.2.2" }
 
 # Function packages (architecture/function-packages.md, SDD 16 and 17; preamble 6.2 table
 # additions, 2026-10-15). wasmtime runs a `.wasm` package with the component model and nothing
-# else, at the version parcel's runtime already brings so the graph has one wasmtime; wat
+# else; wat
 # writes the test components in the text format, at the wasmparser that wasmtime uses; zip is the `.pex`
 # archive; landlock and seccompiler confine a `.pex` stage's child on Linux.
 wasmtime = { version = "=47.0.4", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }

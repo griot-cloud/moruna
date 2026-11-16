@@ -25,7 +25,7 @@ pub struct SourceSettings {
     /// `file://`, `s3://`, `gs://`, `az://` or a bare local path: files or prefixes.
     pub url: Urls,
     /// Projection and split size.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::object")]
     pub options: SourceOptions,
 }
 
@@ -48,7 +48,7 @@ pub struct SinkSettings {
     /// `file://`, `s3://`, `gs://`, `az://` or a bare local directory.
     pub url: String,
     /// Sizes.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::object")]
     pub options: SinkOptions,
 }
 
@@ -119,7 +119,6 @@ impl SourceKind for Vortex {
                 )?) as Arc<dyn Source>)
             })),
             targets: settings.url.0,
-            memory: None,
         })
     }
 }
@@ -180,7 +179,6 @@ impl SinkKind for Vortex {
                 Ok(Box::new(sink) as Box<dyn moruna_kernel::Sink>)
             })),
             target,
-            memory: None,
         })
     }
 }

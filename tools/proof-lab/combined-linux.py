@@ -466,7 +466,7 @@ class CombinedRun(module.Ke2Run):
             gnu=options.phase.endswith('-gnu');target='x86_64-unknown-linux-gnu' if gnu else 'aarch64-unknown-linux-gnu'
             require(cache['target']==target and cache['profile']=='native-debug0','KD3 fixture target/cache must agree exactly')
             self.memory=6
-            self.measurement_scope='Actual '+target+' Python/peQL fixture and library dev-debug0 build only; no matrix execution or performance claim'
+            self.measurement_scope='Actual '+target+' Python fixture and library dev-debug0 build only; no matrix execution or performance claim'
             python_bundle,component,self.kd3_fingerprints=load_kd3_bundles(options,gnu)
             self.attachments.append({'path':str(Path(options.kd3_python_bundle).parent),'destination':'/inputs/kd3-python','readonly':True})
             payload={'kd3-fixture-producer.py':(ROOT/'kd3-fixture-producer.py').read_text(),'kd3-python-bundle.json':json.dumps(python_bundle)}

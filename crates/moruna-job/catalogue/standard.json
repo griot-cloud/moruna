@@ -1,5 +1,5 @@
 {
-  "moruna_kinds": 2,
+  "moruna_kinds": 3,
   "moruna": "0.5.9",
   "sources": [
     {
@@ -92,8 +92,7 @@
         "network": "no",
         "egress": [],
         "gpu": "no",
-        "model_port": "no",
-        "contracts": "no"
+        "model_port": "no"
       },
       "deterministic": "yes",
       "preserves_columns": "by_settings",
@@ -265,8 +264,7 @@
         "network": "no",
         "egress": [],
         "gpu": "no",
-        "model_port": "no",
-        "contracts": "no"
+        "model_port": "no"
       },
       "deterministic": "no",
       "preserves_columns": "no",
@@ -384,8 +382,7 @@
         "network": "by_settings",
         "egress": [],
         "gpu": "no",
-        "model_port": "no",
-        "contracts": "no"
+        "model_port": "no"
       },
       "deterministic": "yes",
       "preserves_columns": "by_settings",
@@ -471,8 +468,7 @@
         "network": "no",
         "egress": [],
         "gpu": "no",
-        "model_port": "no",
-        "contracts": "no"
+        "model_port": "no"
       },
       "deterministic": "yes",
       "preserves_columns": "by_settings",
@@ -568,8 +564,7 @@
         "network": "by_settings",
         "egress": [],
         "gpu": "no",
-        "model_port": "no",
-        "contracts": "no"
+        "model_port": "no"
       },
       "deterministic": "yes",
       "preserves_columns": "by_settings",
@@ -743,8 +738,7 @@
         "network": "no",
         "egress": [],
         "gpu": "no",
-        "model_port": "no",
-        "contracts": "no"
+        "model_port": "no"
       },
       "deterministic": "no",
       "preserves_columns": "no",
@@ -847,8 +841,7 @@
         "network": "no",
         "egress": [],
         "gpu": "no",
-        "model_port": "by_settings",
-        "contracts": "no"
+        "model_port": "by_settings"
       },
       "deterministic": "by_settings",
       "preserves_columns": "by_settings",
@@ -925,8 +918,7 @@
         "network": "no",
         "egress": [],
         "gpu": "no",
-        "model_port": "no",
-        "contracts": "no"
+        "model_port": "no"
       },
       "deterministic": "yes",
       "preserves_columns": "by_settings",
@@ -1016,8 +1008,7 @@
         "network": "no",
         "egress": [],
         "gpu": "no",
-        "model_port": "no",
-        "contracts": "no"
+        "model_port": "no"
       },
       "deterministic": "yes",
       "preserves_columns": "yes",
@@ -1189,8 +1180,7 @@
         "network": "no",
         "egress": [],
         "gpu": "no",
-        "model_port": "no",
-        "contracts": "no"
+        "model_port": "no"
       },
       "deterministic": "no",
       "preserves_columns": "no",
@@ -1273,8 +1263,7 @@
         "network": "by_settings",
         "egress": [],
         "gpu": "no",
-        "model_port": "no",
-        "contracts": "no"
+        "model_port": "no"
       },
       "deterministic": "yes",
       "preserves_columns": "yes",
@@ -1354,8 +1343,7 @@
         "network": "no",
         "egress": [],
         "gpu": "no",
-        "model_port": "no",
-        "contracts": "no"
+        "model_port": "no"
       },
       "deterministic": "yes",
       "preserves_columns": "yes",
@@ -1421,8 +1409,7 @@
         "network": "by_settings",
         "egress": [],
         "gpu": "no",
-        "model_port": "no",
-        "contracts": "no"
+        "model_port": "no"
       },
       "deterministic": "yes",
       "preserves_columns": "yes",

@@ -1,8 +1,7 @@
 """Author real KD3 inputs and all canonical document/library fixture cells.
 
 Run in the prepared Linux Python environment with Moruna/PyArrow already installed.
-Packages must come from the canonical packager; contracts are actual compiled
-ContractEntry JSON from the existing peQL compiler. No assets are downloaded or
+Packages must come from the canonical packager. No assets are downloaded or
 installed. Preserve this exact absolute root in the native image: paths and refusal
 sentences must agree across adapters. Sink readback runs in the original admitted process over its actual ACK files.
 """
@@ -31,25 +30,16 @@ def write(path, value):
         out.write("\n")
 
 
-def job(source, kernels, sink, root, name, contracts):
+def job(source, kernels, sink, root, name):
     run = uuid.uuid4().hex
     writable = Path("/tmp/kd3") / run
     source, sink = dict(source), dict(sink)
-    if source["kind"] == "datafusion":
-        source["root"] = str(writable / "governed")
-    if sink["kind"] == "peql":
-        sink["root"] = str(writable / "governed")
-    else:
-        sink["url"] = str(writable / "output")
+    sink["url"] = str(writable / "output")
     document = {"moruna_spec": 1, "run_id": run, "source": source,
                 "kernels": kernels, "sink": sink,
                 "budget": {"memory_bytes": 768 << 20}, "ordered": True,
                 "staging": {"dir": str(writable / "staging")},
                 "report": {"file": str(writable / "report.json")}}
-    # Only these actual matrix kinds consume governed contracts (KD-I8).
-    # Image/package/std and ordinary file/tensor IO must not carry unused authority.
-    if source["kind"] == "datafusion" or sink["kind"] == "peql":
-        document["contracts"] = contracts
     return document
 
 
@@ -58,9 +48,6 @@ def assets(args):
     import pyarrow as pa
     import pyarrow.parquet as pq
     matrix = json.loads(args.matrix.read_text())
-    contracts = json.loads(args.contracts.read_text())
-    if not isinstance(contracts, list) or len(contracts) != 2:
-        raise ValueError("supply actual compiled kd3/input and kd3/output ContractEntry objects")
     packages = {}
     for name, path in (("wasm", args.wasm), ("pex", args.pex), ("pex.assets", args.pex_assets)):
         if not path.is_absolute() or not path.is_file():
@@ -71,7 +58,7 @@ def assets(args):
     if not root.is_absolute() or root.exists():
         raise ValueError("explicit new absolute root required")
     root.mkdir(mode=0o700)
-    for name in ("data", "governed", "cases", "outputs", "reports", "staging", "asset-source", "packages"):
+    for name in ("data", "cases", "outputs", "reports", "staging", "asset-source", "packages"):
         (root / name).mkdir()
     shutil.copyfile(args.matrix, root / "matrix.json")
     shutil.copyfile(HERE / "kd3_library.py", root / "kd3_library.py")
@@ -101,7 +88,6 @@ def assets(args):
         with pa.ipc.new_file(out, echo_schema) as writer:
             writer.write_batch(echo_batch)
     pq.write_table(pa.Table.from_batches([batch]), root / "data/input.parquet")
-    shutil.copyfile(root / "data/input.parquet", root / "governed/input.parquet")
     # Same tiny standards-compliant writer used by test_tensor, with actual int64
     # row bytes. Runtime's canonical tensor source is the only decoder.
     raw = struct.pack("<" + "q" * len(matrix["rows"]), *matrix["rows"])
@@ -120,7 +106,6 @@ def assets(args):
                         staging_limit=128 << 20, checkpoint=False)
     if result.exit["status"] != "completed":
         raise RuntimeError("actual Vortex preparation did not complete")
-    write(root / "contracts.json", contracts)
     write(root / "packages.json", packages)
     print(json.dumps({"prepared_assets": str(root), "executed_matrix_cells": 0}))
 
@@ -128,7 +113,6 @@ def assets(args):
 def cases(args):
     root = args.root
     matrix = json.loads((root / "matrix.json").read_text())
-    contracts = json.loads((root / "contracts.json").read_text())
     packages = json.loads((root / "packages.json").read_text())
     for digest, layout in ((args.image, args.image_layout),
                            (args.linux_image, args.linux_image_layout)):
@@ -146,8 +130,6 @@ def cases(args):
     sources = {kind: {"kind": kind, "url": str(root / "data" / file)}
                for kind, file in (("arrow_ipc", "input.arrow"), ("parquet", "input.parquet"),
                                   ("vortex", "vortex"), ("tensor", "input.safetensors"))}
-    sources["datafusion"] = {"kind": "datafusion", "root": str(root / "governed"),
-                             "contract": "kd3/input", "caller": caller}
     kernels = {"std": {"kind": "std", "name": "select", "args": {"columns": ["x"]}},
                "image": {"kind": "image",
                          "image": {"build_key": None, "digest": args.image,
@@ -195,9 +177,6 @@ def cases(args):
                     sink["kind"] = case["kind"]
                     if case["kind"] == "tensor":
                         source = dict(sources["tensor"])
-                    if case["kind"] == "peql":
-                        sink = {"kind": "peql", "root": str(root / "governed"), "contract": "kd3/output",
-                                "caller": caller, "mode": "overwrite"}
                 if case["role"] == "function":
                     if case["kind"] == "package":
                         stage = dict(packages[case["id"].removeprefix("kernel.package.")])
@@ -217,10 +196,8 @@ def cases(args):
                     if case["id"] == "kernel.image":
                         # The canonical arrow_echo program adds its real n column.
                         stages.append({"kind": "std", "name": "select", "args": {"columns": ["x"]}})
-                document = job(source, stages, sink, root, name, contracts)
+                document = job(source, stages, sink, root, name)
                 fixture = {"case": case["id"], "phase": "execute", "mode": mode, "job": document}
-                if case["kind"] in ("datafusion", "peql"):
-                    fixture["governed_input"] = str(root / "governed/input.parquet")
                 if adapter == "linux":
                     fixture.update(sandbox_python=args.sandbox_python, sandbox_cgroup=args.sandbox_cgroup)
                 elif case["id"].startswith("kernel.package.pex"):
@@ -311,7 +288,7 @@ def main():
     a.add_argument("--root", type=Path, required=True)
     a = commands.add_parser("assets")
     a.add_argument("--matrix", type=Path, default=MATRIX)
-    for name in ("root", "wasm", "pex", "pex-assets", "contracts"):
+    for name in ("root", "wasm", "pex", "pex-assets"):
         a.add_argument("--" + name, type=Path, required=True)
     a = commands.add_parser("cases")
     for name in ("root", "output", "image-layout", "linux-image-layout"):

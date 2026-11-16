@@ -17,7 +17,7 @@ use moruna_kernel::arrow::datatypes::Schema;
 use moruna_kernel::{
     Allocator, BoxFuture, Declared, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind,
     KernelState, LogicalRows, LogicalTaskRows, MorunaError, Payload, PayloadSpec, Result, RowRange,
-    Source, SourceRead, SourceSchema, Split, Tier,
+    Source, SourceSchema, Split, Tier,
 };
 
 /// Which of a task's outputs is being checked.
@@ -295,9 +295,6 @@ impl Source for GuardedSource {
     }
     fn repeatable(&self) -> bool {
         self.inner.repeatable()
-    }
-    fn read_report(&self) -> Option<SourceRead> {
-        self.inner.read_report()
     }
 }
 
@@ -642,7 +639,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(s.streaming() && s.repeatable() && s.read_report().is_none());
+        assert!(s.streaming() && s.repeatable());
         assert!(s.plan().unwrap().is_empty());
         let _ = s.schema();
     }

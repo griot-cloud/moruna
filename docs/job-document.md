@@ -35,7 +35,6 @@ A version 1 document is a JSON object describing one job. Only `moruna_spec`, `s
 | `profiles_dir` | string | `~/.moruna/profiles` | Where function profiles are stored. |
 | `allow_gil` | boolean | `false` | Run Python functions on the standard build of Python. |
 | `report` | object | report file only | Where the report goes. |
-| `contracts` | list | `[]` | The contracts a `datafusion` source reads and a `peql` sink writes under, compiled. |
 
 ## source
 
@@ -60,13 +59,6 @@ A version 1 document is a JSON object describing one job. Only `moruna_spec`, `s
 ```
 
 **`tensor`**: `url` is a path or a list of paths to safetensors or aligned binary tensor files; `options.tensors` lists the tensors to read.
-
-**`datafusion`**: a query planned by peQL for a caller. `root` is the peQL workspace, where peQL keeps its manifests, privacy ledger and audit log; the contracts are the ones listed in [`contracts`](#contracts); exactly one of `contract`, to read one contract, or `sql`, a query over contracts; and `caller`, the caller as peQL reads it, with `id`, `tenant` and `purpose` and optionally `tier`, `clearance`, `classification`, `roles`, `now` and `other`. `on_violation` says what the read does with rows that break a contract's row rules: `exclude` (default) leaves them out, and the run report's `read` counts them per rule for each contract; `refuse` refuses the read when the data holds any, naming each rule and how many rows broke it. See the [peQL documentation](https://griot-cloud.github.io/peQL/).
-
-```json
-{"kind": "datafusion", "root": "/data/workspace", "contract": "purchasing/orders",
- "caller": {"id": "svc-scoring", "tenant": "acme", "purpose": "reporting"}}
-```
 
 **`image`**: an OCI image's command as a source: `image` (`build_key`, `digest`, `location`), `entry`, `params` and `needs`, as for an [`image` function](#kernels).
 
@@ -96,27 +88,7 @@ A `package` entry can set `fingerprint`, as printed by `moruna check`. Moruna th
 
 **`arrow_ipc`**: `url` is a directory; `options.file_bytes` (default 1 GiB); `options.compression` is `none` (default), `zstd` or `lz4`, and `options.level` the zstd level (default 3). A compressed file is smaller and is opened by any Arrow reader, `pyarrow.ipc.open_file` included.
 
-**`peql`**: writes under a peQL contract listed in [`contracts`](#contracts). `root` is the peQL workspace, `contract` the contract, `caller` the writer, who must own the contract, and `mode` either `append` (default) or `overwrite`. peQL writes the data in the contract's layout and updates the contract's manifest when the job finishes.
-
-`on_violation` says what the write does with rows that break the contract's row rules:
-
-- `refuse` (default): nothing is committed when any row breaks a rule, and the job fails naming each rule and how many rows broke it.
-- `exclude`: the rows that pass are committed, and the others are written as Parquet under `excluded_url`, one file per morsel that had any, each row with a `_violations` column listing the rules it broke. `excluded_url` is a local directory, given only with `exclude`, that is empty or absent when the job starts and is apart from the contract's files and from the source.
-- `warn`: every row is committed, and peQL's verdict on the write marks it invalid.
-
-The run report's `write` says what was done: `report.violations` (rows by rule), `report.rows_excluded` and, for `exclude`, `excluded` with the directory, the files and their rows.
-
-```json
-{"kind": "peql", "root": "/data/workspace", "contract": "purchasing/orders",
- "caller": {"id": "svc-ingest", "tenant": "acme", "purpose": "ingest"},
- "on_violation": "exclude", "excluded_url": "/staging/excluded"}
-```
-
 **`image`**: an OCI image's command as a sink: `image`, `entry`, `params` and `needs`, as for an [`image` function](#kernels). What it writes back at its end as a commit (`snapshot_id`, `version`) is in the report's `sinks`.
-
-## contracts
-
-Each entry is one contract, as peQL registers a compiled one: `document`, the contract's document; `compiled`, its compiled form exactly as parcel wrote it; `functions`, the function modules the compiled form pins; and `audiences`, the tenants it is published to for this job besides its owner (`public` is everyone). The job's peQL engine holds these contracts in memory and nothing else: it reads no contract from `root` and writes none there, and a contract the job names that is not listed here is refused by name. A document that lists contracts and has no `datafusion` source or `peql` sink is refused.
 
 ## budget
 

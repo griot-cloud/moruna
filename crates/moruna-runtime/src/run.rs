@@ -22,7 +22,7 @@ use moruna_trace::{RunReport, TraceConfig, TraceWriter};
 
 use crate::cancel::{CancelOnDrop, Started};
 use crate::config;
-use crate::elastic::{Shares, WatchCtx, WatchState, Watcher};
+use crate::elastic::{WatchCtx, WatchState, Watcher};
 use crate::error::{Result, RunError};
 use crate::report::{self, MetaInput};
 use crate::spec::{BuildCtx, Components, RunSpec};
@@ -111,8 +111,6 @@ fn drive(
         packaged,
         ports: stage_ports,
         sinks: sink_specs,
-        engine_memory,
-        sink_memory,
         budget,
         cpu,
         elastic: elastic_budget,
@@ -375,38 +373,14 @@ fn drive(
     // arena and subtracting it later would charge the arena twice.
     let baseline_bytes = sampler.sample()?.anon_bytes;
     let kernel_state = expected_kernel_state(&kernels);
-    // The engines at the ends of the run get their shares before the arena is sized, and the
-    // arena is sized over what is left: together they stay inside the ceiling (MH 4.5).
     let sizing = Sizing {
         baseline: baseline_bytes,
         kernel_state,
-        out_of_arena: expected_out_of_arena_amplification(&kernels, !engine_memory.is_empty()),
+        out_of_arena: expected_out_of_arena_amplification(&kernels),
         page_bytes: limits.page_bytes,
-        engine: !engine_memory.is_empty(),
-        sink: !sink_memory.is_empty(),
         queues: u64::from(topology.queue_count()),
     };
-    let shares = sizing.divide(limits.memory_ceiling, &mut notes);
-    // Several engines at one end of a run share that end's share equally (contracts d.16).
-    for engine in &engine_memory {
-        let share = shares.engine / engine_memory.len() as u64;
-        engine.set_limit(share);
-        notes.push(format!(
-            "the source's plan may hold {share} bytes outside the arena: its operators reserve \
-             a tenth of it and spill to the staging directory past that, four tenths are held \
-             back for what they hold beyond their reservations, and half is its batches in \
-             flight"
-        ));
-    }
-    for sink in &sink_memory {
-        let share = shares.sink / sink_memory.len() as u64;
-        sink.set_limit(share);
-        notes.push(format!(
-            "the sink's writes may hold {share} bytes outside the arena"
-        ));
-    }
-    let engine_bytes = shares.engine.saturating_add(shares.sink);
-    let arena_bytes = shares.arena;
+    let arena_bytes = sizing.divide(limits.memory_ceiling, &mut notes);
     // N-7: a budget under the run's floor cannot be honoured, and is refused here, before
     // anything exists, with the floor named. A refusal is honest; an overshoot is not. An
     // injected allocator is the caller's arena and not the facade's to size.
@@ -529,7 +503,6 @@ fn drive(
     }
     // What an engine source's engine decided when it planned the read: true of the run whatever
     // becomes of it, since the plan was made (and its budgets charged) when the source was built.
-    let source_read = sources.iter().find_map(|source| source.read_report());
     let mut built_sinks: Vec<Box<dyn Sink>> = Vec::with_capacity(sink_specs.len());
     for spec in sink_specs {
         built_sinks.push(spec.build(&ctx)?);
@@ -549,7 +522,7 @@ fn drive(
     } else {
         2
     };
-    let mut morsel_max = match claim {
+    let morsel_max = match claim {
         0 => config::MORSEL_MAX_BYTES,
         claim => (claim / (2 * buffers)).clamp(config::MORSEL_MIN_BYTES, config::MORSEL_MAX_BYTES),
     };
@@ -559,22 +532,6 @@ fn drive(
              file buffers",
             claim / buffers
         ));
-    }
-    // An engine sink holds working memory in proportion to the morsel it writes, so its share
-    // bounds the morsel as well.
-    if let Some(bytes) = sink_memory
-        .iter()
-        .filter_map(|sink| sink.morsel_max())
-        .min()
-    {
-        let bytes = bytes.clamp(config::MORSEL_MIN_BYTES, config::MORSEL_MAX_BYTES);
-        if bytes < morsel_max {
-            morsel_max = bytes;
-            notes.push(format!(
-                "morsels are at most {morsel_max} bytes, what one of the sink's writes in flight \
-                 may hold"
-            ));
-        }
     }
     let mut plans = Vec::with_capacity(sources.len());
     for source in &sources {
@@ -694,7 +651,6 @@ fn drive(
                     ceiling_bytes: limits.memory_ceiling,
                     baseline_bytes,
                     arena_bytes,
-                    engine_bytes,
                     morsel_min: config::MORSEL_MIN_BYTES,
                     safety_initial: config::SAFETY_INITIAL,
                 },
@@ -702,8 +658,7 @@ fn drive(
             )?;
             let physical = sizing
                 .allowance(limits.memory_ceiling)
-                .saturating_sub(arena_bytes)
-                .saturating_sub(engine_bytes);
+                .saturating_sub(arena_bytes);
             let share = crate::native_account::child_share(
                 physical.min(planning),
                 0,
@@ -975,7 +930,6 @@ fn drive(
             disk_budget,
             arena_bytes,
             baseline_bytes,
-            engine_bytes,
             fixed_native_bytes,
             sink_buffer_bytes,
             checkpoint_enabled,
@@ -1031,8 +985,6 @@ fn drive(
     // The limits watcher, from the moment the controller is running until the scheduler
     // returns. The arena arithmetic is the same function that sized the first region, with
     // everything but the ceiling fixed at what the run started with.
-    let engine_after = engine_memory.clone();
-    let sink_after = sink_memory.clone();
     let watcher = watch.map(|watch| {
         Watcher::start(
             WatchCtx {
@@ -1041,14 +993,12 @@ fn drive(
                 arena,
                 controller: controller.clone(),
                 scheduler: scheduler.clone(),
-                engine: engine_memory,
-                sink: sink_memory,
                 sizing: Box::new(move |ceiling| sizing.divide(ceiling, &mut Vec::new())),
                 start_ns,
                 workers_max,
                 tick: std::time::Duration::from_millis(config::TICK_MS),
             },
-            WatchState::new(arena_bytes, shares),
+            WatchState::new(arena_bytes),
         )
     });
     let outcome = if resume.is_some() {
@@ -1074,12 +1024,6 @@ fn drive(
         history.finish(matches!(outcome, RunOutcome::Completed { .. }) && !lost)?;
     }
     notes.extend(watch_notes);
-    for engine in engine_after {
-        notes.push(engine.note());
-    }
-    for sink in sink_after {
-        notes.push(sink.note());
-    }
 
     // 12. stop, finish, report. One last sample, so a rise of the process's high-water mark
     // since the last tick is in the peak the report states.
@@ -1149,11 +1093,6 @@ fn drive(
         memory_basis,
         process_peak,
         process_usage,
-        write: match &outcome {
-            RunOutcome::Completed { sinks } => sinks.iter().find_map(|sink| sink.write.clone()),
-            RunOutcome::Terminated { .. } | RunOutcome::Cancelled { .. } => None,
-        },
-        read: source_read,
         sinks: match &outcome {
             RunOutcome::Completed { sinks } => sinks.clone(),
             RunOutcome::Terminated { .. } | RunOutcome::Cancelled { .. } => Vec::new(),
@@ -1346,17 +1285,6 @@ fn gil_states(
     }
 }
 
-/// The share of the allowance an engine source's plan is given (MH 4.5). A DataFusion plan's
-/// sorts, aggregations and joins hold their state outside the arena, and its scans decode there
-/// too; what they need is not known before they run. The rest of the allowance is the arena's,
-/// whose queues hold the batches the plan emits. An operator that finds its pool full spills to
-/// the staging directory, so the share bounds the plan's memory and not the data it can process.
-const ENGINE_SHARE: f64 = 0.4;
-
-/// The share of the allowance an engine sink's writes are given (MH 4.5): a peQL contract write
-/// encodes each part in row groups, file buffers and filters on the heap, bounded by this.
-const SINK_SHARE: f64 = 0.2;
-
 /// Everything the arena arithmetic needs but the ceiling, so the limits watcher can re-run it
 /// for each new ceiling (12 f.1, MH 4.4).
 #[derive(Clone, Copy, Debug)]
@@ -1365,34 +1293,18 @@ struct Sizing {
     kernel_state: u64,
     out_of_arena: f64,
     page_bytes: usize,
-    engine: bool,
-    sink: bool,
     /// The run's queues: the buffer catalog's floor holds every one's promotion window.
     queues: u64,
 }
 
-/// The least an engine source's share may be: a pool of 4 MiB, a tenth of it, holds sixteen
-/// batches of 256 KiB, which is what an aggregation needs to spill and merge (F8.9).
-const ENGINE_FLOOR_BYTES: u64 = 40 << 20;
-
-/// The least an engine sink's share may be: two parts in flight of 8 MiB each, which is what
-/// peQL's write needs for a row group of 2 MiB (`Writing::with_memory`).
-const SINK_FLOOR_BYTES: u64 = 16 << 20;
-
 impl Sizing {
     /// The smallest ceiling at which this run can be honoured (N-7): the arena at least
-    /// `ARENA_FLOOR_BYTES` and each engine at least its floor, over what the process already
-    /// held, the reserve and the declared kernel state. Below it no arrangement of the knobs
+    /// `ARENA_FLOOR_BYTES`, over what the process already held, the reserve and the declared
+    /// kernel state. Below it no arrangement of the knobs
     /// fits, so a budget below it is refused before the run starts.
     fn floor(&self) -> u64 {
         let fits = |ceiling: u64| {
-            let shares = self.divide(ceiling, &mut Vec::new());
-            let allowance = self.allowance(ceiling);
-            allowance >= ARENA_FLOOR_BYTES
-                && allowance.saturating_sub(shares.engine + shares.sink) >= ARENA_FLOOR_BYTES
-                && (!self.engine || shares.engine >= ENGINE_FLOOR_BYTES)
-                && (!self.sink || shares.sink >= SINK_FLOOR_BYTES)
-                && self.catalog_floor(ceiling).holds()
+            self.allowance(ceiling) >= ARENA_FLOOR_BYTES && self.catalog_floor(ceiling).holds()
         };
         // Every term grows with the ceiling, so the floor is found by bisection, to a page.
         let (mut low, mut high) = (0u64, 1u64 << 50);
@@ -1427,17 +1339,6 @@ impl Sizing {
             "a buffer catalog of {}",
             self.catalog_floor(0).terms()
         ));
-        if self.engine {
-            terms.push(format!(
-                "{ENGINE_FLOOR_BYTES} bytes for the source's plan, {ENGINE_SHARE} of what the \
-                 arena and the engines share"
-            ));
-        }
-        if self.sink {
-            terms.push(format!(
-                "{SINK_FLOOR_BYTES} bytes for the sink's writes, {SINK_SHARE} of it"
-            ));
-        }
         if self.kernel_state > 0 {
             terms.push(format!(
                 "{} bytes of declared kernel state",
@@ -1460,37 +1361,18 @@ impl Sizing {
             .saturating_sub(self.kernel_state)
     }
 
-    /// The *allowance* is `ceiling - baseline - reserve - expected kernel state`: the bytes the
-    /// run may hold at all. An engine source takes `ENGINE_SHARE` of it and an engine sink
-    /// `SINK_SHARE`, and the arena is sized over what they leave, so the arena and the engines
-    /// never add up past the ceiling.
-    fn divide(&self, ceiling: u64, notes: &mut Vec<String>) -> Shares {
-        let allowance = self.allowance(ceiling);
-        let share = |on: bool, fraction: f64| {
-            if on {
-                (allowance as f64 * fraction) as u64
-            } else {
-                0
-            }
-        };
-        let engine = share(self.engine, ENGINE_SHARE);
-        let sink = share(self.sink, SINK_SHARE);
-        let arena = arena_host_bytes(
+    /// The arena's host bytes for `ceiling`: sized over the allowance, `ceiling - baseline -
+    /// reserve - expected kernel state`, the bytes the run may hold at all.
+    fn divide(&self, ceiling: u64, notes: &mut Vec<String>) -> u64 {
+        arena_host_bytes(
             ceiling,
             self.baseline,
             config::RESERVE_FRACTION,
-            self.kernel_state
-                .saturating_add(engine)
-                .saturating_add(sink),
+            self.kernel_state,
             self.out_of_arena,
             self.page_bytes,
             notes,
-        );
-        Shares {
-            engine,
-            sink,
-            arena,
-        }
+        )
     }
 }
 
@@ -1615,19 +1497,11 @@ const ARENA_FLOOR_BYTES: u64 =
 /// the allocator holds what it freed until it is asked for again. It is charged
 /// `COPY_OUT_OF_ARENA_AMPLIFICATION`. Until 2026-09-27 it was charged nothing and given the whole
 /// allowance as arena, which left the reserve as all the room there was for those bytes: a
-/// Parquet file copied into a peQL contract at 256 MiB peaked at 0.99 of its ceiling with a
-/// 177 MB arena it used a fraction of, measured by the operating system (F8.9). An engine
-/// source decodes inside its own share, so a copy from one is charged nothing here.
-fn expected_out_of_arena_amplification(
-    kernels: &[Arc<dyn moruna_kernel::Kernel>],
-    engine_source: bool,
-) -> f64 {
+/// Parquet file copied at 256 MiB peaked at 0.99 of its ceiling with a 177 MB arena it used a
+/// fraction of, measured by the operating system (F8.9).
+fn expected_out_of_arena_amplification(kernels: &[Arc<dyn moruna_kernel::Kernel>]) -> f64 {
     if kernels.is_empty() {
-        return if engine_source {
-            0.0
-        } else {
-            COPY_OUT_OF_ARENA_AMPLIFICATION
-        };
+        return COPY_OUT_OF_ARENA_AMPLIFICATION;
     }
     kernels
         .iter()
@@ -2043,10 +1917,9 @@ mod tests {
         use moruna_testkit::FakeKernel;
 
         assert_eq!(
-            expected_out_of_arena_amplification(&[], false),
+            expected_out_of_arena_amplification(&[]),
             COPY_OUT_OF_ARENA_AMPLIFICATION
         );
-        assert_eq!(expected_out_of_arena_amplification(&[], true), 0.0);
 
         // A kernel that overrides nothing declares nothing, which is the common case: the
         // `examples/append_column.rs` kernel a first program is written around is one.
@@ -2087,7 +1960,7 @@ mod tests {
         assert_eq!(Silent.hints().expected_amplification, None);
         let undeclared: Vec<Arc<dyn Kernel>> = vec![Arc::new(Silent)];
         assert_eq!(
-            expected_out_of_arena_amplification(&undeclared, false),
+            expected_out_of_arena_amplification(&undeclared),
             DEFAULT_OUT_OF_ARENA_AMPLIFICATION
         );
 
@@ -2095,64 +1968,44 @@ mod tests {
             Arc::new(FakeKernel::new().amplification(0.5)),
             Arc::new(FakeKernel::new().amplification(6.0)),
         ];
-        assert_eq!(expected_out_of_arena_amplification(&mixed, true), 6.0);
+        assert_eq!(expected_out_of_arena_amplification(&mixed), 6.0);
     }
 
-    fn sizing(engine: bool, sink: bool) -> Sizing {
+    fn sizing() -> Sizing {
         Sizing {
             baseline: 16 << 20,
             kernel_state: 0,
             out_of_arena: 0.0,
             page_bytes: 4096,
-            engine,
-            sink,
             queues: 2,
         }
     }
 
-    /// MH 4.5, F8.9: an engine source and an engine sink each take their share of the
-    /// allowance, and the arena is sized over what they leave, so the three never add up past
-    /// what the run may hold.
+    /// The arena is sized over the whole allowance, and says so.
     #[test]
-    fn the_engines_take_their_shares_before_the_arena() {
+    fn the_arena_is_sized_over_the_allowance() {
         let ceiling = 1u64 << 30;
-        let allowance = sizing(true, true).allowance(ceiling);
+        let allowance = sizing().allowance(ceiling);
         let mut notes = Vec::new();
-        let both = sizing(true, true).divide(ceiling, &mut notes);
-        assert_eq!(both.engine, (allowance as f64 * ENGINE_SHARE) as u64);
-        assert_eq!(both.sink, (allowance as f64 * SINK_SHARE) as u64);
-        assert!(both.engine + both.sink + both.arena <= allowance);
+        let arena = sizing().divide(ceiling, &mut notes);
+        assert!(arena <= allowance);
+        assert!(arena > 0);
         assert!(notes[0].contains("arena sized at"));
-        let neither = sizing(false, false).divide(ceiling, &mut Vec::new());
-        assert_eq!((neither.engine, neither.sink), (0, 0));
-        assert!(neither.arena > both.arena);
-        let source = sizing(true, false).divide(ceiling, &mut Vec::new());
-        assert_eq!((source.engine, source.sink), (both.engine, 0));
     }
 
-    /// N-7: the floor is the least ceiling whose shares are each at their least, it rises with
-    /// every engine the run has, and a ceiling at it divides into shares that are.
+    /// N-7: the floor is the least ceiling at which the arena and the buffer catalog each get
+    /// their least, and just below it they do not.
     #[test]
     fn a_run_has_a_floor() {
-        let plain = sizing(false, false);
-        let governed = sizing(true, true);
+        let plain = sizing();
         let floor = plain.floor();
-        assert!(floor < governed.floor());
-        assert!(sizing(true, false).floor() < governed.floor());
-        let at = governed.divide(governed.floor(), &mut Vec::new());
-        assert!(at.engine >= ENGINE_FLOOR_BYTES && at.sink >= SINK_FLOOR_BYTES);
-        assert!(at.arena >= ARENA_FLOOR_BYTES);
-        let below = governed.divide(governed.floor() - (8 << 20), &mut Vec::new());
-        assert!(
-            governed.allowance(governed.floor() - (8 << 20)) - below.engine - below.sink
-                < ARENA_FLOOR_BYTES
-        );
         assert!(plain.allowance(floor) >= ARENA_FLOOR_BYTES);
-        let terms = governed.floor_terms();
         assert!(
-            terms.contains("source's plan") && terms.contains("sink's writes"),
-            "{terms}"
+            plain.allowance(floor - (8 << 20)) < ARENA_FLOOR_BYTES
+                || !plain.catalog_floor(floor - (8 << 20)).holds()
         );
+        let terms = plain.floor_terms();
+        assert!(terms.contains("an arena of"), "{terms}");
         let stateful = Sizing {
             kernel_state: 64 << 20,
             ..plain

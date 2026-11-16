@@ -33,7 +33,6 @@ fn error_of(result: Result<impl Sized>) -> MorunaError {
 struct Probe {
     name: &'static str,
     isolation: Isolation,
-    contracts: Fact,
     fuses: bool,
 }
 
@@ -50,7 +49,6 @@ impl Probe {
         Probe {
             name,
             isolation: Isolation::Builtin,
-            contracts: Fact::No,
             fuses: false,
         }
     }
@@ -80,10 +78,7 @@ impl RunnableKind for Probe {
             settings: settings_schema::<ProbeSettings>(self.name, vec![json!({"tag": "a"})]),
             inputs: Flow::Batches,
             outputs: Flow::Batches,
-            needs: Needs {
-                contracts: self.contracts,
-                ..Needs::nothing()
-            },
+            needs: Needs { ..Needs::nothing() },
             deterministic: Fact::Yes,
             preserves_columns: Fact::Yes,
             isolation: self.isolation,
@@ -125,11 +120,7 @@ fn kd_t1_resolve_or_refuse() {
     assert_eq!(declared.role, Role::Kernel);
     // A name is resolved within its role: no source is called `std`, no sink `std`.
     let e = error_of(kinds.source("source", "std"));
-    let sources = if cfg!(feature = "peql") {
-        "arrow_ipc, datafusion, image, parquet, tensor, vortex"
-    } else {
-        "arrow_ipc, image, parquet, tensor, vortex"
-    };
+    let sources = "arrow_ipc, image, parquet, tensor, vortex";
     assert_eq!(
         e.to_string(),
         refusal(SpecError::new(
@@ -408,12 +399,8 @@ fn kd_t6_listing() {
     let names =
         |list: &[Declaration]| -> Vec<String> { list.iter().map(|d| d.name.clone()).collect() };
     assert_eq!(names(&listing.kernels), ["image", "package", "std"]);
-    let mut sinks = vec!["arrow_ipc", "image", "parquet", "tensor", "vortex"];
-    let mut sources = vec!["arrow_ipc", "image", "parquet", "tensor", "vortex"];
-    if cfg!(feature = "peql") {
-        sinks.insert(3, "peql");
-        sources.insert(1, "datafusion");
-    }
+    let sinks = ["arrow_ipc", "image", "parquet", "tensor", "vortex"];
+    let sources = ["arrow_ipc", "image", "parquet", "tensor", "vortex"];
     assert_eq!(names(&listing.sinks), sinks);
     assert_eq!(names(&listing.sources), sources);
     for (role, list) in [
@@ -636,17 +623,9 @@ fn a_context_shares_one_value_per_type() {
     cx.notes().push("a".into());
     assert_eq!(cx.take_notes(), ["a"]);
     assert!(cx.take_notes().is_empty());
-    assert!(cx.carried_contracts().is_empty());
     assert!(cx.host_port_hub().is_none());
     assert_eq!(cx.package_host(), &crate::packaged::PackageHost::default());
     assert!(cx.embedding().guest_port("anything").is_none());
-    let contract = moruna_job::ContractEntry {
-        document: json!({}),
-        compiled: String::new(),
-        functions: Vec::new(),
-        audiences: Vec::new(),
-    };
-    assert!(cx.embedding().admit(0, &contract).is_ok());
     // A url is one string or several, and is written back as it came.
     let one: Urls = serde_json::from_value(json!("/a")).expect("one");
     let many: Urls = serde_json::from_value(json!(["/a", "/b"])).expect("many");

@@ -132,7 +132,6 @@ fn user_source(object: Py<PyAny>) -> BuiltSource {
             )?))
         })),
         targets: Vec::new(),
-        memory: None,
     }
 }
 
@@ -152,7 +151,6 @@ fn user_sink(object: Py<PyAny>) -> BuiltSink {
             Ok(Box::new(moruna_sinks::PySink::new(object)?) as Box<dyn moruna_kernel::Sink>)
         })),
         target,
-        memory: None,
     }
 }
 
@@ -228,7 +226,6 @@ impl SourceKind for Iterable {
                 )?))
             })),
             targets: Vec::new(),
-            memory: None,
         })
     }
 }

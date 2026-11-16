@@ -314,12 +314,11 @@ if [ -f Cargo.toml ]; then
   fi
   measure_workspace
   lean coverage
-  # The feature-gated crates are invisible to a default-feature run: moruna-adapters,
-  # moruna-polars and moruna-datafusion compile to nothing without `python`, `polars`
-  # and `datafusion`, so the gate reported them as stubs and their coverage as "not
-  # measured" while they held thousands of lines (found by the component 5 agent,
-  # 2026-09-22). The engine bridges need no interpreter and are always built; the
-  # Python adapter needs an interpreter with pyarrow, so it runs when one is
+  # The feature-gated crates are invisible to a default-feature run: moruna-adapters and
+  # moruna-polars compile to nothing without `python` and `polars`, so the gate reported them
+  # as stubs and their coverage as "not measured" while they held thousands of lines (found by
+  # the component 5 agent, 2026-09-22). The Polars bridge needs no interpreter and is always
+  # built; the Python adapter needs an interpreter with pyarrow, so it runs when one is
   # configured and says so plainly when it is not.
   # The first program a user writes, run for real: a Parquet file in, a kernel that appends a
   # column, a Parquet file out, at a 512 MiB budget and otherwise nothing but defaults. Four
@@ -327,22 +326,8 @@ if [ -f Cargo.toml ]; then
   # failed this (PM, 2026-09-22).
   step "cargo run --example append_column (examples/append_column.rs)"
   quiet example cargo run -p moruna-runtime --example append_column
-  step "cargo test --features polars,datafusion,peql (the engine bridges)"
-  quiet test_bridges cargo test -p moruna-polars -p moruna-datafusion --features moruna-polars/polars,moruna-datafusion/datafusion,moruna-datafusion/peql
-  lean
-  # The peQL ends of a run (MH 4.5, H6): the bridge and the job document's datafusion and peql
-  # kinds, which a default-feature build refuses by kind and never compiles.
-  step "cargo clippy -D warnings --features peql (the governed ends of a run)"
-  quiet clippy_peql cargo clippy -p moruna-datafusion -p moruna-runtime --all-targets --features moruna-datafusion/peql,moruna-runtime/peql -- -D warnings
-  step "cargo test --features peql (H6: a governed plan is a source, a contract write a sink)"
-  quiet test_peql cargo test -p moruna-runtime --features peql
-  lean
-  # A host that embeds peQL with `iceberg` unifies that feature into this build, so the governed
-  # ends must compile and pass with it on (0.4.1).
-  step "cargo clippy and test --features peql-iceberg (peQL's Iceberg binding compiled in)"
-  quiet clippy_peql_iceberg cargo clippy -p moruna-datafusion -p moruna-runtime --all-targets \
-    --features moruna-datafusion/peql-iceberg,moruna-runtime/peql -- -D warnings
-  quiet test_peql_iceberg cargo test -p moruna-datafusion --features moruna-datafusion/peql-iceberg
+  step "cargo test --features polars (the Polars bridge)"
+  quiet test_bridges cargo test -p moruna-polars --features moruna-polars/polars
   lean
   if [ -n "${MORUNA_PYTHON:-}" ]; then
     # Rust's embedded-interpreter tests start without Python's executable having loaded

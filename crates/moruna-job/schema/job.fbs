@@ -147,16 +147,6 @@ table Report {
   logs: string;
 }
 
-table Contract {
-  // The contract's document, a FlexBuffers value.
-  document: [ubyte] (flexbuffer, required);
-  // The compiled contract, exactly as the compiler wrote it.
-  compiled: string (required);
-  // The function modules the compiled contract pins, a FlexBuffers list.
-  functions: [ubyte] (flexbuffer);
-  audiences: [string];
-}
-
 // A run argument the job declares (SDD 22 e.4): its name and its type. The document holds the
 // declaration and never a value: each run supplies its own (`moruna run JOB --arg NAME=VALUE`).
 table Arg {
@@ -186,7 +176,9 @@ table Job {
   host_profile: HostProfile;
   allow_gil: bool;
   report: Report;
-  contracts: [Contract];
+  // Was `contracts` (peQL's contracts), removed in 0.7. The slot stays deprecated so `name`
+  // and `args` keep theirs and a 0.6 document still reads.
+  retired_contracts: [ubyte] (deprecated);
   // The job's name, as its author gave it; absent: unnamed. Events and the report do not use it.
   name: string;
   // The arguments every run of the job supplies, in name order.

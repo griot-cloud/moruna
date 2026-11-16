@@ -167,7 +167,6 @@ def kind(
                 "egress": [],
                 "gpu": "no",
                 "model_port": "yes",
-                "contracts": "no",
             },
             "deterministic": _fact(deterministic, "deterministic"),
             "preserves_columns": _fact(preserves_columns, "preserves_columns"),

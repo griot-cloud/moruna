@@ -15,16 +15,14 @@ use std::sync::Arc;
 
 use crate::job::refusal;
 use crate::packaged::{PackageHost, Packaged};
-use crate::spec::{EngineMemory, SinkSpec, SourceSpec};
-use moruna_job::{ContractEntry, Declaration, KindDoc, LISTING_VERSION, Listing, Role, SpecError};
+use crate::spec::{SinkSpec, SourceSpec};
+use moruna_job::{Declaration, KindDoc, LISTING_VERSION, Listing, Role, SpecError};
 use moruna_kernel::{Kernel, MorunaError, Result};
 use serde::de::DeserializeOwned;
 
 pub mod arrow_ipc;
 pub mod conformance;
 pub mod gives;
-#[cfg(feature = "peql")]
-pub mod governed;
 pub mod image;
 pub mod package;
 pub mod parquet;
@@ -90,6 +88,32 @@ impl<'d> Entry<'d> {
     }
 }
 
+/// A settings field that is an object, as its kind's schema says (`options`): `serde` would also
+/// read a struct from an array, which the validator refuses, so the kind refuses it too (JB-T26).
+pub(crate) fn object<'de, D, T>(deserializer: D) -> core::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    use serde::Deserialize;
+    use serde::de::Error;
+    match serde_json::Value::deserialize(deserializer)? {
+        value @ serde_json::Value::Object(_) => {
+            serde_json::from_value(value).map_err(D::Error::custom)
+        }
+        other => Err(D::Error::custom(format!(
+            "an object, not {}",
+            match other {
+                serde_json::Value::Array(_) => "an array",
+                serde_json::Value::String(_) => "a string",
+                serde_json::Value::Number(_) => "a number",
+                serde_json::Value::Bool(_) => "a boolean",
+                _ => "null",
+            }
+        ))),
+    }
+}
+
 /// What the program running a document supplies besides its kinds (d.1): the hooks a kind may
 /// ask of it. Every method has the answer of a program that supplies nothing.
 pub trait Embedding: Send + Sync {
@@ -121,25 +145,6 @@ pub trait Embedding: Send + Sync {
         Ok(None)
     }
 
-    /// Where the contracts of the governed engine opened at `root` keep their files, when the
-    /// program knows more than the engine does: an authorized read-only root another party's
-    /// contract is bound to, say. `None` is the engine's own resolution.
-    #[cfg(feature = "peql")]
-    fn bindings(
-        &self,
-        root: &std::path::Path,
-    ) -> Result<Option<Arc<dyn moruna_datafusion::engine::BindingResolver>>> {
-        let _ = root;
-        Ok(None)
-    }
-
-    /// Whether the run may register entry `index` of the document's `contracts` (MH 4.5). A
-    /// program that knows where the contracts it trusts come from refuses the others here.
-    fn admit(&self, index: usize, contract: &ContractEntry) -> Result<()> {
-        let _ = (index, contract);
-        Ok(())
-    }
-
     /// The handler of the guest port `name` (`{"guest": "<name>"}`, MH 4.10): what the program
     /// answers inside the machine. `None` refuses a document that names one, by name.
     fn guest_port(&self, name: &str) -> Option<Arc<dyn moruna_kernel::GuestPort>> {
@@ -153,13 +158,11 @@ pub struct Standalone;
 
 impl Embedding for Standalone {}
 
-/// What a kind builds its part with (d.1): the run's contracts and hosts, the notes the build
-/// reports, and state the kinds of one build share (one engine per root for both ends of a run,
-/// say).
+/// What a kind builds its part with (d.1): the run's hosts, the notes the build reports, and
+/// state the kinds of one build share.
 pub struct Context {
     packages: PackageHost,
     host_ports: Option<Arc<crate::host::ports::HostPorts>>,
-    contracts: Vec<ContractEntry>,
     embedding: Arc<dyn Embedding>,
     notes: Vec<String>,
     source_targets: Vec<String>,
@@ -170,13 +173,12 @@ pub struct Context {
 }
 
 impl Context {
-    /// A context for a build in a program that supplies `embedding`, with no contracts, no host
-    /// ports, the default package host and no notes.
+    /// A context for a build in a program that supplies `embedding`, with no host ports, the
+    /// default package host and no notes.
     pub fn new(embedding: Arc<dyn Embedding>) -> Context {
         Context {
             packages: PackageHost::default(),
             host_ports: None,
-            contracts: Vec::new(),
             embedding,
             notes: Vec::new(),
             source_targets: Vec::new(),
@@ -238,12 +240,6 @@ impl Context {
         self
     }
 
-    /// The contracts the job carries (MH 4.5).
-    pub fn contracts(mut self, contracts: Vec<ContractEntry>) -> Context {
-        self.contracts = contracts;
-        self
-    }
-
     /// The package host.
     pub fn package_host(&self) -> &PackageHost {
         &self.packages
@@ -252,11 +248,6 @@ impl Context {
     /// The host ports, when there is a peer.
     pub fn host_port_hub(&self) -> Option<&Arc<crate::host::ports::HostPorts>> {
         self.host_ports.as_ref()
-    }
-
-    /// The contracts the job carries.
-    pub fn carried_contracts(&self) -> &[ContractEntry] {
-        &self.contracts
     }
 
     /// The program's hooks.
@@ -300,27 +291,22 @@ impl Context {
     }
 }
 
-/// A source kind's part (d.2): its builder, the locations it reads for the sink equals source
-/// rule (12 f.3), and the memory its engine holds outside the arena when it runs operators of its
-/// own (MH 4.5).
+/// A source kind's part (d.2): its builder, and the locations it reads for the sink equals source
+/// rule (12 f.3).
 pub struct BuiltSource {
     /// The builder.
     pub spec: SourceSpec,
     /// Where it reads.
     pub targets: Vec<String>,
-    /// Its engine's memory.
-    pub memory: Option<Arc<dyn EngineMemory>>,
 }
 
-/// A sink kind's part (d.2): its builder, where it writes (empty for a sink that names no
-/// location of its own), and its engine's memory.
+/// A sink kind's part (d.2): its builder, and where it writes (empty for a sink that names no
+/// location of its own).
 pub struct BuiltSink {
     /// The builder.
     pub spec: SinkSpec,
     /// Where it writes.
     pub target: String,
-    /// Its engine's memory.
-    pub memory: Option<Arc<dyn EngineMemory>>,
 }
 
 /// A runnable kind's stage (d.2): the kernel, and what the facade binds to the run for it.
@@ -445,8 +431,7 @@ impl Registry {
 
     /// Every kind this build of the runtime has (f.1): the Arrow IPC, Parquet, Vortex and tensor sources;
     /// the Parquet, Vortex, tensor and Arrow IPC sinks; the standard kernels and function
-    /// packages; and, with the `peql` feature, the `datafusion` source and the `peql` sink. No
-    /// `rust` kind is among them (KD-I7). A program adds its own with the `register_` calls.
+    /// packages. No `rust` kind is among them (KD-I7). A program adds its own with the `register_` calls.
     pub fn standard() -> Registry {
         let mut kinds = Registry::empty();
         kinds.put_source(Arc::new(arrow_ipc::ArrowIpc));
@@ -462,11 +447,6 @@ impl Registry {
         kinds.put_sink(Arc::new(tensor::Tensor));
         kinds.put_sink(Arc::new(arrow_ipc::ArrowIpc));
         kinds.put_sink(Arc::new(image::Image));
-        #[cfg(feature = "peql")]
-        {
-            kinds.put_source(Arc::new(governed::Datafusion));
-            kinds.put_sink(Arc::new(governed::Peql));
-        }
         kinds
     }
 

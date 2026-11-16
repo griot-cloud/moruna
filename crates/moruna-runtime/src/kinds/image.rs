@@ -607,7 +607,6 @@ fn process_task(
                 )?) as Arc<dyn moruna_kernel::Source>)
             })),
             targets: Vec::new(),
-            memory: None,
         })),
         Role::Sink => Ok(Built::Sink(BuiltSink {
             spec: crate::SinkSpec::Build(Box::new(move |ctx| {
@@ -635,7 +634,6 @@ fn process_task(
                 )) as Box<dyn moruna_kernel::Sink>)
             })),
             target: String::new(),
-            memory: None,
         })),
         Role::Kernel => Err(entry.refuse("image", "a function is a stage, not a process task")),
     }

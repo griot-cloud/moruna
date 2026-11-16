@@ -1,10 +1,10 @@
 //! SDD 22 k: the job document version 2, a DAG of tasks (JB-T29 to JB-T37, JB-T39).
 
 use moruna_job::{
-    BudgetDoc, Catalogue, CheckpointDoc, ContractEntry, Edge, ElasticDoc, ErrorPolicyDoc,
-    GuaranteeDoc, HostProfileDoc, JOB_VERSION, Job, JobError, JobSpec, KindDoc, ObjectStoreDoc,
-    Refusal, RefusalCode, Reporting, S3Doc, SizerDoc, StagingDoc, Task, TaskIdsDoc, TaskRefDoc,
-    check, is_job_flatbuffer,
+    BudgetDoc, Catalogue, CheckpointDoc, Edge, ElasticDoc, ErrorPolicyDoc, GuaranteeDoc,
+    HostProfileDoc, JOB_VERSION, Job, JobError, JobSpec, KindDoc, ObjectStoreDoc, Refusal,
+    RefusalCode, Reporting, S3Doc, SizerDoc, StagingDoc, Task, TaskIdsDoc, TaskRefDoc, check,
+    is_job_flatbuffer,
 };
 use serde_json::{Value, json};
 
@@ -118,12 +118,6 @@ fn every_section() -> Job {
         attempt: Some(2),
         logs: Some("/logs".into()),
     };
-    job.contracts = vec![ContractEntry {
-        document: json!({"name": "c", "rules": [1, 2.5, null, true, {"x": "y"}]}),
-        compiled: "parcel-compiled/1".into(),
-        functions: vec![json!({"module": "m"})],
-        audiences: vec!["public".into()],
-    }];
     job
 }
 
@@ -650,21 +644,6 @@ fn jb_t39_every_table_at_its_defaults() {
     let error_policy = fb::ErrorPolicy::create(&mut b, &fb::ErrorPolicyArgs::default());
     let host_profile = fb::HostProfile::create(&mut b, &fb::HostProfileArgs::default());
     let report = fb::Report::create(&mut b, &fb::ReportArgs::default());
-    let compiled = b.create_string("c");
-    let document = {
-        let mut map = flexbuffers::Builder::default();
-        map.start_map().end_map();
-        b.create_vector(map.view())
-    };
-    let contract = fb::Contract::create(
-        &mut b,
-        &fb::ContractArgs {
-            document: Some(document),
-            compiled: Some(compiled),
-            ..Default::default()
-        },
-    );
-    let contracts = b.create_vector(&[contract]);
     let root = fb::Job::create(
         &mut b,
         &fb::JobArgs {
@@ -678,7 +657,6 @@ fn jb_t39_every_table_at_its_defaults() {
             error_policy: Some(error_policy),
             host_profile: Some(host_profile),
             report: Some(report),
-            contracts: Some(contracts),
             ..Default::default()
         },
     );
@@ -714,7 +692,6 @@ fn jb_t39_every_table_at_its_defaults() {
         "ErrorPolicy {",
         "HostProfile {",
         "Report {",
-        "Contract {",
     ] {
         assert!(rendered.contains(table), "{table} in {rendered}");
     }

@@ -32,7 +32,7 @@ from typing import Any
 __all__ = ["RunReport"]
 
 #: The report document's schema, ``MAJOR.MINOR``: a reader refuses a major it does not know.
-SCHEMA_VERSION = "2.1"
+SCHEMA_VERSION = "3.0"
 
 _REQUIRED = ("schema_version", "run_id", "job_digest", "exit", "tasks", "resources", "sinks")
 

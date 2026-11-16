@@ -4,8 +4,8 @@
 use serde_json::Value;
 
 use crate::doc::{
-    AzureDoc, BudgetDoc, CheckpointDoc, ContractEntry, ElasticDoc, ErrorPolicyDoc, GcsDoc,
-    GuaranteeDoc, HostProfileDoc, ObjectStoreDoc, S3Doc, SizerDoc, StagingDoc,
+    AzureDoc, BudgetDoc, CheckpointDoc, ElasticDoc, ErrorPolicyDoc, GcsDoc, GuaranteeDoc,
+    HostProfileDoc, ObjectStoreDoc, S3Doc, SizerDoc, StagingDoc,
 };
 use crate::flex;
 use crate::generated::moruna::job::fb;
@@ -91,10 +91,6 @@ impl Job {
                 barrier: edge.barrier(),
             });
         }
-        let mut contracts = Vec::new();
-        for (i, contract) in root.contracts().iter().flatten().enumerate() {
-            contracts.push(read_contract(i, contract)?);
-        }
         let mut args = Vec::new();
         for (i, arg) in root.args().iter().flatten().enumerate() {
             let ty = crate::ArgType::parse(arg.type_()).ok_or_else(|| {
@@ -175,7 +171,6 @@ impl Job {
                     logs: r.logs().map(str::to_string),
                 })
                 .unwrap_or_default(),
-            contracts,
         })
     }
 
@@ -190,11 +185,6 @@ impl Job {
         let tasks = b.create_vector(&tasks);
         let edges: Vec<_> = self.edges.iter().map(|e| write_edge(&mut b, e)).collect();
         let edges = b.create_vector(&edges);
-        let mut contracts = Vec::with_capacity(self.contracts.len());
-        for (i, contract) in self.contracts.iter().enumerate() {
-            contracts.push(write_contract(&mut b, i, contract)?);
-        }
-        let contracts = b.create_vector(&contracts);
         let budget = write_budget(&mut b, &self.budget);
         let staging = write_staging(&mut b, &self.staging);
         let object_store = write_object_store(&mut b, &self.object_store);
@@ -284,7 +274,6 @@ impl Job {
                 host_profile,
                 allow_gil: self.allow_gil,
                 report: Some(report),
-                contracts: Some(contracts),
                 name,
                 args,
             },
@@ -433,56 +422,6 @@ fn write_endpoint<'b>(
             port: Some(port),
         },
     )
-}
-
-fn read_contract(i: usize, c: fb::Contract<'_>) -> Result<ContractEntry, JobError> {
-    let document = flex::decode(c.document().bytes())
-        .map_err(|reason| JobError::field(format!("contracts[{i}].document"), reason))?;
-    let functions = match c.functions() {
-        None => Vec::new(),
-        Some(bytes) => match flex::decode(bytes.bytes()) {
-            Ok(Value::Array(items)) => items,
-            Ok(_) => {
-                return Err(JobError::field(
-                    format!("contracts[{i}].functions"),
-                    "a list of function modules",
-                ));
-            }
-            Err(reason) => {
-                return Err(JobError::field(format!("contracts[{i}].functions"), reason));
-            }
-        },
-    };
-    Ok(ContractEntry {
-        document,
-        compiled: c.compiled().to_string(),
-        functions,
-        audiences: strings(c.audiences()),
-    })
-}
-
-fn write_contract<'b>(
-    b: &mut flatbuffers::FlatBufferBuilder<'b>,
-    i: usize,
-    c: &ContractEntry,
-) -> Result<flatbuffers::WIPOffset<fb::Contract<'b>>, JobError> {
-    let document = flex::encode(&c.document)
-        .map_err(|reason| JobError::field(format!("contracts[{i}].document"), reason))?;
-    let functions = flex::encode(&Value::Array(c.functions.clone()))
-        .map_err(|reason| JobError::field(format!("contracts[{i}].functions"), reason))?;
-    let document = b.create_vector(&document);
-    let compiled = b.create_string(&c.compiled);
-    let functions = b.create_vector(&functions);
-    let audiences = string_vector(b, &c.audiences);
-    Ok(fb::Contract::create(
-        b,
-        &fb::ContractArgs {
-            document: Some(document),
-            compiled: Some(compiled),
-            functions: Some(functions),
-            audiences: Some(audiences),
-        },
-    ))
 }
 
 fn read_budget(b: fb::Budget<'_>) -> BudgetDoc {

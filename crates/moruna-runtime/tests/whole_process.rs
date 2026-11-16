@@ -123,7 +123,6 @@ impl Sink for Hoarder {
             rows: self.rows.load(Ordering::SeqCst),
             bytes: 0,
             files: Vec::new(),
-            write: None,
             commit: None,
         })
     }

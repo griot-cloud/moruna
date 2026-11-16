@@ -548,7 +548,6 @@ impl Sink for TensorSink {
             rows,
             bytes,
             files: inner.ledger.names(),
-            write: None,
             commit: None,
         })
     }

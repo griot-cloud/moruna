@@ -16,7 +16,7 @@ A report is one JSON document with one canonical form. `report.bytes()` is that 
 | `exit` | `dict` | `code` (0 completed, 130 cancelled, otherwise the command's exit code for the failure), `status` (`"completed"`, `"terminated"`, `"cancelled"`) and `diagnostic`. |
 | `tasks` | list of dicts | Per task, in job order, keyed by its name in the spec: its status, times, CPU, memory, rows, bytes and morsels, waits, needs, what the plan predicted, its observation and a recommendation (see [The run report](run-report.md#task-fields)). A measurement not made is absent. |
 | `resources` | `dict` | `cpu_core_s`, `peak_memory_bytes`, `mem_byte_seconds`, `usage_measured` and `memory_basis`. |
-| `sinks` | list of dicts | Per sink: `task`, `target` (as its settings name it), `rows`, `bytes`, `files`, `excluded_rows`, and `snapshot_id` and `version` when it committed a version. |
+| `sinks` | list of dicts | Per sink: `task`, `target` (as its settings name it), `rows`, `bytes`, `files`, and `snapshot_id` and `version` when it committed a version. |
 | `plan`, `plan_steps` | `dict \| None`, list \| None | The plan the run started from, when `moruna.run(..., explain=True)` asked for it, and each step's actual start and end. |
 | `trace_path` | `str \| None` | Written trace file, if requested. |
 | `resumed`, `manifest`, `wall_ms` | `bool`, `str \| None`, `float` | Resume state, latest checkpoint path, elapsed milliseconds. |

@@ -17,8 +17,8 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::doc::{
-    BudgetDoc, CheckpointDoc, ContractEntry, ErrorPolicyDoc, HostProfileDoc, JobSpec, KindDoc,
-    ObjectStoreDoc, SizerDoc, StagingDoc, TaskRefDoc,
+    BudgetDoc, CheckpointDoc, ErrorPolicyDoc, HostProfileDoc, JobSpec, KindDoc, ObjectStoreDoc,
+    SizerDoc, StagingDoc, TaskRefDoc,
 };
 use crate::kind::{Flow, Role};
 
@@ -72,9 +72,6 @@ pub struct Job {
     pub allow_gil: bool,
     /// Where the report goes.
     pub report: Reporting,
-    /// The contracts the job's kinds read and write under (MH 4.5).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub contracts: Vec<ContractEntry>,
     /// The job's name, as its author gave it; absent: unnamed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -303,7 +300,6 @@ impl Job {
             host_profile: None,
             allow_gil: false,
             report: Reporting::default(),
-            contracts: Vec::new(),
             name: None,
             args: Vec::new(),
         }
@@ -383,7 +379,6 @@ impl Job {
                 attempt: spec.report.attempt,
                 logs: spec.report.logs.clone(),
             },
-            contracts: spec.contracts.clone(),
             name: None,
             args: Vec::new(),
         }

@@ -28,7 +28,7 @@ Functions you run often have a **profile**: Moruna saves what it measured about 
 
 ## Engines inside a job
 
-A function can hand its batch to another engine without copying it: Polars functions receive their batch as a Polars frame. A job can also read from a peQL query, so that the rows and columns it reads are the ones peQL's policies allow for the caller, and it can write its output under a peQL contract. Moruna streams the query's results through its queues rather than waiting for the whole result, so the query can be larger than the budget. See the [job document reference](job-document.md) for how to name them, and the [peQL documentation](https://griot-cloud.github.io/peQL/) for contracts and callers.
+A function can hand its batch to another engine without copying it: Polars functions receive their batch as a Polars frame. See the [job document reference](job-document.md) for the kinds a job can name.
 
 ```{toctree}
 :hidden:

@@ -26,8 +26,8 @@ use serde_json::{Map, Value, json};
 /// The report document's schema: `MAJOR.MINOR`. 2: `tasks` holds every figure of a task, and
 /// `stages` is gone.
 /// 2.1 adds `execution_fingerprint`, and `job_digest` is the public document digest from every
-/// interface.
-pub const SCHEMA_VERSION: &str = "2.1";
+/// interface. 3 (0.7): a sink's `excluded_rows` is gone, with the peQL sink that set it.
+pub const SCHEMA_VERSION: &str = "3.0";
 
 /// The public digest of a job document (0.6.6): `sha256:` and the hex of SHA-256 over its exact
 /// bytes, as Python's `JobSpec.digest()` computes it. The normalized execution fingerprint,
@@ -750,7 +750,6 @@ fn tasks(
                 if let Some(s) = sink_outcome(i) {
                     put(&mut entry, "rows_in", s.rows);
                     put(&mut entry, "bytes_in", s.bytes);
-                    put(&mut entry, "excluded_rows", s.excluded_rows);
                     ran = true;
                 }
             }
@@ -865,7 +864,6 @@ fn sinks(report: &RunReport, context: &ReportContext) -> Vec<Value> {
                 "rows": s.rows,
                 "bytes": s.bytes,
                 "files": s.files,
-                "excluded_rows": s.excluded_rows,
                 "snapshot_id": s.snapshot_id,
                 "version": s.version,
             })
@@ -957,8 +955,6 @@ mod tests {
             notes: (0..notes).map(|i| format!("note {i}")).collect(),
             overflow_failed: false,
             late_records: 0,
-            write: None,
-            read: None,
             sinks: Vec::new(),
             buffers: None,
             policy: None,
@@ -1027,7 +1023,6 @@ mod tests {
                 rows: 1_000,
                 bytes: 10,
                 files: Vec::new(),
-                excluded_rows: 3,
                 snapshot_id: Some("42".into()),
                 version: Some("v7".into()),
             },
@@ -1036,7 +1031,6 @@ mod tests {
                 rows: 1_000,
                 bytes: 20,
                 files: vec!["part-0.parquet".into()],
-                excluded_rows: 0,
                 snapshot_id: None,
                 version: None,
             },
@@ -1124,7 +1118,6 @@ mod tests {
             assert!(tasks[2].get(absent).is_none(), "{absent}");
         }
         assert!(tasks[0].get("wall_ms").is_none() && tasks[0].get("rows_in").is_none());
-        assert_eq!(tasks[3]["excluded_rows"], 3);
         assert_eq!(tasks[3]["status"], "ok");
         let sinks = value["sinks"].as_array().expect("sinks");
         assert_eq!(sinks[0]["task"], "out");

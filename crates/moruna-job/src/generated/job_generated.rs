@@ -2445,155 +2445,6 @@ impl ::core::fmt::Debug for Report<'_> {
       ds.finish()
   }
 }
-pub enum ContractOffset {}
-#[derive(Copy, Clone, PartialEq)]
-
-pub struct Contract<'a> {
-  pub _tab: ::flatbuffers::Table<'a>,
-}
-
-impl<'a> ::flatbuffers::Follow<'a> for Contract<'a> {
-  type Inner = Contract<'a>;
-  #[inline]
-  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-    Self { _tab: unsafe { ::flatbuffers::Table::new(buf, loc) } }
-  }
-}
-
-impl<'a> Contract<'a> {
-  pub const VT_DOCUMENT: ::flatbuffers::VOffsetT = 4;
-  pub const VT_COMPILED: ::flatbuffers::VOffsetT = 6;
-  pub const VT_FUNCTIONS: ::flatbuffers::VOffsetT = 8;
-  pub const VT_AUDIENCES: ::flatbuffers::VOffsetT = 10;
-
-  #[inline]
-  pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
-    Contract { _tab: table }
-  }
-  #[allow(unused_mut)]
-  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: ::flatbuffers::Allocator + 'bldr>(
-    _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
-    args: &'args ContractArgs<'args>
-  ) -> ::flatbuffers::WIPOffset<Contract<'bldr>> {
-    let mut builder = ContractBuilder::new(_fbb);
-    if let Some(x) = args.audiences { builder.add_audiences(x); }
-    if let Some(x) = args.functions { builder.add_functions(x); }
-    if let Some(x) = args.compiled { builder.add_compiled(x); }
-    if let Some(x) = args.document { builder.add_document(x); }
-    builder.finish()
-  }
-
-
-  #[inline]
-  pub fn document(&self) -> ::flatbuffers::Vector<'a, u8> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u8>>>(Contract::VT_DOCUMENT, None).unwrap()}
-  }
-  #[inline]
-  pub fn compiled(&self) -> &'a str {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(Contract::VT_COMPILED, None).unwrap()}
-  }
-  #[inline]
-  pub fn functions(&self) -> Option<::flatbuffers::Vector<'a, u8>> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u8>>>(Contract::VT_FUNCTIONS, None)}
-  }
-  #[inline]
-  pub fn audiences(&self) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<&'a str>>> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<&'a str>>>>(Contract::VT_AUDIENCES, None)}
-  }
-}
-
-impl ::flatbuffers::Verifiable for Contract<'_> {
-  #[inline]
-  fn run_verifier(
-    v: &mut ::flatbuffers::Verifier, pos: usize
-  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
-    v.visit_table(pos)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("document", Self::VT_DOCUMENT, true)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("compiled", Self::VT_COMPILED, true)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("functions", Self::VT_FUNCTIONS, false)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<&'_ str>>>>("audiences", Self::VT_AUDIENCES, false)?
-     .finish();
-    Ok(())
-  }
-}
-pub struct ContractArgs<'a> {
-    pub document: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
-    pub compiled: Option<::flatbuffers::WIPOffset<&'a str>>,
-    pub functions: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
-    pub audiences: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<&'a str>>>>,
-}
-impl<'a> Default for ContractArgs<'a> {
-  #[inline]
-  fn default() -> Self {
-    ContractArgs {
-      document: None, // required field
-      compiled: None, // required field
-      functions: None,
-      audiences: None,
-    }
-  }
-}
-
-pub struct ContractBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
-  fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
-  start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
-}
-impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> ContractBuilder<'a, 'b, A> {
-  #[inline]
-  pub fn add_document(&mut self, document: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , u8>>) {
-    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Contract::VT_DOCUMENT, document);
-  }
-  #[inline]
-  pub fn add_compiled(&mut self, compiled: ::flatbuffers::WIPOffset<&'b  str>) {
-    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Contract::VT_COMPILED, compiled);
-  }
-  #[inline]
-  pub fn add_functions(&mut self, functions: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , u8>>) {
-    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Contract::VT_FUNCTIONS, functions);
-  }
-  #[inline]
-  pub fn add_audiences(&mut self, audiences: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , ::flatbuffers::ForwardsUOffset<&'b  str>>>) {
-    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Contract::VT_AUDIENCES, audiences);
-  }
-  #[inline]
-  pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> ContractBuilder<'a, 'b, A> {
-    let start = _fbb.start_table();
-    ContractBuilder {
-      fbb_: _fbb,
-      start_: start,
-    }
-  }
-  #[inline]
-  pub fn finish(self) -> ::flatbuffers::WIPOffset<Contract<'a>> {
-    let o = self.fbb_.end_table(self.start_);
-    self.fbb_.required(o, Contract::VT_DOCUMENT,"document");
-    self.fbb_.required(o, Contract::VT_COMPILED,"compiled");
-    ::flatbuffers::WIPOffset::new(o.value())
-  }
-}
-
-impl ::core::fmt::Debug for Contract<'_> {
-  fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-    let mut ds = f.debug_struct("Contract");
-      ds.field("document", &self.document());
-      ds.field("compiled", &self.compiled());
-      ds.field("functions", &self.functions());
-      ds.field("audiences", &self.audiences());
-      ds.finish()
-  }
-}
 pub enum ArgOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -2742,7 +2593,6 @@ impl<'a> Job<'a> {
   pub const VT_HOST_PROFILE: ::flatbuffers::VOffsetT = 32;
   pub const VT_ALLOW_GIL: ::flatbuffers::VOffsetT = 34;
   pub const VT_REPORT: ::flatbuffers::VOffsetT = 36;
-  pub const VT_CONTRACTS: ::flatbuffers::VOffsetT = 38;
   pub const VT_NAME: ::flatbuffers::VOffsetT = 40;
   pub const VT_ARGS: ::flatbuffers::VOffsetT = 42;
 
@@ -2758,7 +2608,6 @@ impl<'a> Job<'a> {
     let mut builder = JobBuilder::new(_fbb);
     if let Some(x) = args.args { builder.add_args(x); }
     if let Some(x) = args.name { builder.add_name(x); }
-    if let Some(x) = args.contracts { builder.add_contracts(x); }
     if let Some(x) = args.report { builder.add_report(x); }
     if let Some(x) = args.host_profile { builder.add_host_profile(x); }
     if let Some(x) = args.profiles_dir { builder.add_profiles_dir(x); }
@@ -2900,13 +2749,6 @@ impl<'a> Job<'a> {
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<Report>>(Job::VT_REPORT, None)}
   }
   #[inline]
-  pub fn contracts(&self) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<Contract<'a>>>> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<Contract>>>>(Job::VT_CONTRACTS, None)}
-  }
-  #[inline]
   pub fn name(&self) -> Option<&'a str> {
     // Safety:
     // Created from valid Table for this object
@@ -2945,7 +2787,6 @@ impl ::flatbuffers::Verifiable for Job<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<HostProfile>>("host_profile", Self::VT_HOST_PROFILE, false)?
      .visit_field::<bool>("allow_gil", Self::VT_ALLOW_GIL, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<Report>>("report", Self::VT_REPORT, false)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<Contract>>>>("contracts", Self::VT_CONTRACTS, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("name", Self::VT_NAME, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<Arg>>>>("args", Self::VT_ARGS, false)?
      .finish();
@@ -2970,7 +2811,6 @@ pub struct JobArgs<'a> {
     pub host_profile: Option<::flatbuffers::WIPOffset<HostProfile<'a>>>,
     pub allow_gil: bool,
     pub report: Option<::flatbuffers::WIPOffset<Report<'a>>>,
-    pub contracts: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<Contract<'a>>>>>,
     pub name: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub args: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<Arg<'a>>>>>,
 }
@@ -2995,7 +2835,6 @@ impl<'a> Default for JobArgs<'a> {
       host_profile: None,
       allow_gil: false,
       report: None,
-      contracts: None,
       name: None,
       args: None,
     }
@@ -3076,10 +2915,6 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> JobBuilder<'a, 'b, A> {
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<Report>>(Job::VT_REPORT, report);
   }
   #[inline]
-  pub fn add_contracts(&mut self, contracts: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , ::flatbuffers::ForwardsUOffset<Contract<'b >>>>) {
-    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Job::VT_CONTRACTS, contracts);
-  }
-  #[inline]
   pub fn add_name(&mut self, name: ::flatbuffers::WIPOffset<&'b  str>) {
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Job::VT_NAME, name);
   }
@@ -3122,7 +2957,6 @@ impl ::core::fmt::Debug for Job<'_> {
       ds.field("host_profile", &self.host_profile());
       ds.field("allow_gil", &self.allow_gil());
       ds.field("report", &self.report());
-      ds.field("contracts", &self.contracts());
       ds.field("name", &self.name());
       ds.field("args", &self.args());
       ds.finish()

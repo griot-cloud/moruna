@@ -21,7 +21,7 @@ Every number names its unit, in its field's name or in this table.
 | `_per_s` | Per second of the task's wall time. |
 | `_ratio` | A dimensionless ratio. |
 | `mem_byte_seconds` | Bytes held, multiplied by seconds. |
-| `rows`, `rows_in`, `rows_out`, `excluded_rows` | Rows. |
+| `rows`, `rows_in`, `rows_out` | Rows. |
 | `morsels_in`, `morsels_out`, `failed_morsels`, `skipped_morsels`, `observations` | Morsels. |
 | `calls`, `instances`, `cpus`, `runs` | Counts. |
 | `percentile` | A percentile, 0 to 100. |
@@ -42,7 +42,7 @@ The trace's own fields follow the same rule: a field it measures in seconds, nan
 | `exit` | `code`, `status` (`"completed"`, `"terminated"`, `"cancelled"`, or `"refused"` when the document, its budget or its resume was refused before the run started) and `diagnostic`, the reason the job stopped. A run refused before it started has no trace: its document has its identity, `exit`, `notes`, `args`, `plan` and each task `skipped`. |
 | `tasks` | One entry per task, in the spec's order; see below. |
 | `resources` | `cpu_core_s`, `peak_memory_bytes` (the whole process's) and `memory_basis`, how it was measured. |
-| `sinks` | Per sink: its `task`, its `target`, `rows`, `bytes`, `files`, `excluded_rows`, and the `snapshot_id` and `version` it committed (every committing sink names its snapshot). |
+| `sinks` | Per sink: its `task`, its `target`, `rows`, `bytes`, `files`, and the `snapshot_id` and `version` it committed (every committing sink names its snapshot). |
 | `plan` | The plan the run started from: `moruna run` always reports it, `moruna.run` when asked for (`explain=True`); `null` otherwise. |
 | `plan_steps` | With a plan, each step's actual start and end: `step`, `tasks`, `started_at_ms`, `ended_at_ms`, so the parallelism the run achieved shows beside the plan's groups. |
 | `resumed`, `manifest` | Whether the job continued from a checkpoint, and the latest checkpoint kept. |
@@ -54,7 +54,6 @@ The trace's own fields follow the same rule: a field it measures in seconds, nan
 | `bottleneck_timeline` | What the pipeline was waiting for, and for how long. |
 | `notes` | Decisions Moruna made and facts it found, in sentences. |
 | `trace_path` | The trace file, if `trace` was set. |
-| `write`, `read` | What peQL said of a `peql` sink's write and a `datafusion` source's read; `null` otherwise. |
 | `buffers`, `policy` | What the buffer catalog and the scheduling policy did. |
 
 ## Task fields
@@ -76,7 +75,7 @@ Each task's `key` is exactly its name in the spec: a host joins a report to the 
 | `amplification_p50_ratio`, `amplification_p95_ratio` | Its memory use as a multiple of its input, typical and near the highest. |
 | `state_bytes_max`, `state_growth_bytes` | For a stateful function, its largest state and how much one instance's state grew. |
 | `alloc` | For a Python function, the memory it asked for itself, by source; see below. |
-| `failed_morsels`, `skipped_morsels`, `excluded_rows` | Morsels that failed, morsels skipped under the error policy, and rows a sink set aside. |
+| `failed_morsels`, `skipped_morsels` | Morsels that failed, and morsels skipped under the error policy. |
 | `input_wait_ms`, `output_wait_ms` | Between two of its morsels, the time its instances waited for the next input to be ready, and the time they waited with it ready (held back by memory admission or a full queue downstream), summed over instances. |
 | `needs` | Per need: `calls`, `bytes_in`, `bytes_out` and `time_ms`. A task this process ran is measured through the object the resolver supplied; an image task at its port. |
 | `planned` | With a plan: its `step`, the plan's prediction per morsel (`duration_ms` and `memory_bytes`, each `p50`, `p95`, `basis` and `observations`), and what was observed per morsel beside it. |

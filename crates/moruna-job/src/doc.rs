@@ -114,31 +114,6 @@ pub struct JobSpec {
     /// Where the report goes.
     #[serde(default)]
     pub report: ReportDoc,
-    /// The contracts the document's kinds read and write under (MH 4.5; a `datafusion` source, a
-    /// `peql` sink), each as its compiler wrote it. They are the job's whole contract store: the engine holds them
-    /// in memory for this run alone and reads no contract from its root, so a contract the job
-    /// names and does not carry is refused by name.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub contracts: Vec<ContractEntry>,
-}
-
-/// One contract a job carries (`contracts[i]`, MH 4.5): its document, its compiled form exactly
-/// as the compiler wrote it, and the function modules that form pins. Registered as given, never
-/// compiled; whoever writes the document vouches that `compiled` is what `document` compiles to,
-/// and the program running it may refuse any entry (the runtime's `Embedding::admit`).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ContractEntry {
-    /// The contract's document, as the engine reads one.
-    pub document: serde_json::Value,
-    /// The compiled contract: the compiler's bytes, which are UTF-8.
-    pub compiled: String,
-    /// The function modules the compiled contract pins, as the engine reads a bundled function.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub functions: Vec<serde_json::Value>,
-    /// The tenants it is published to for this run besides its owner; `public` is everyone.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub audiences: Vec<String>,
 }
 
 /// One part of a run as the document names it (MH 4.1, SDD 18 d.1): its `kind`, a string the
@@ -493,7 +468,7 @@ impl ReportDoc {
 }
 
 /// The top-level keys of version 1, in the order MH 4.1 lists them.
-const TOP_LEVEL: [&str; 19] = [
+const TOP_LEVEL: [&str; 18] = [
     "moruna_spec",
     "run_id",
     "source",
@@ -512,7 +487,6 @@ const TOP_LEVEL: [&str; 19] = [
     "host_profile",
     "allow_gil",
     "report",
-    "contracts",
 ];
 
 impl JobSpec {
@@ -538,7 +512,6 @@ impl JobSpec {
             host_profile: None,
             allow_gil: false,
             report: ReportDoc::default(),
-            contracts: Vec::new(),
         }
     }
 
@@ -573,6 +546,13 @@ impl JobSpec {
             }
         }
         for (key, section) in map {
+            if key == "contracts" {
+                return Err(SpecError::new(
+                    key.clone(),
+                    "a job carries no contracts since 0.7: they were the peQL kinds', and those \
+                     kinds are gone",
+                ));
+            }
             if !TOP_LEVEL.contains(&key.as_str()) {
                 return Err(SpecError::new(
                     key.clone(),
@@ -705,15 +685,6 @@ fn check_section(key: &str, section: &serde_json::Value) -> Result<(), SpecError
             };
             for (i, item) in items.iter().enumerate() {
                 read::<KindDoc>(&format!("kernels[{i}]"), item)?;
-            }
-            Ok(())
-        }
-        "contracts" => {
-            let serde_json::Value::Array(items) = section else {
-                return Err(SpecError::new(key, "a list of contracts"));
-            };
-            for (i, item) in items.iter().enumerate() {
-                read::<ContractEntry>(&format!("contracts[{i}]"), item)?;
             }
             Ok(())
         }

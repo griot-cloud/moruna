@@ -88,7 +88,7 @@ fn jb_t1_dependencies_are_the_seven() {
 }
 
 /// JB-T2 embedded_catalogues: the standard kinds, by role in name order, every one a declaration
-/// the registry accepts with an example; the `peql` kinds are two more and nothing else changes.
+/// the registry accepts with an example.
 #[test]
 fn jb_t2_embedded_catalogues() {
     let standard = Catalogue::standard().expect("the standard catalogue");
@@ -101,45 +101,22 @@ fn jb_t2_embedded_catalogues() {
         names(&standard, Role::Sink),
         ["arrow_ipc", "image", "parquet", "tensor", "vortex"]
     );
-    let governed = Catalogue::standard_with_peql().expect("the governed catalogue");
-    assert_eq!(
-        names(&governed, Role::Source),
-        [
-            "arrow_ipc",
-            "datafusion",
-            "image",
-            "parquet",
-            "tensor",
-            "vortex"
-        ]
-    );
-    assert_eq!(names(&governed, Role::Kernel), ["image", "package", "std"]);
-    assert_eq!(
-        names(&governed, Role::Sink),
-        ["arrow_ipc", "image", "parquet", "peql", "tensor", "vortex"]
-    );
-    for catalogue in [&standard, &governed] {
-        for role in [Role::Source, Role::Kernel, Role::Sink] {
-            for declared in catalogue.declarations(role) {
-                assert_eq!(declared.check(role), Ok(()), "{}", declared.name);
-                assert!(!declared.examples().is_empty(), "{}", declared.name);
-                assert!(std::ptr::eq(
-                    declared,
-                    catalogue.get(role, &declared.name).expect("by name")
-                ));
-            }
+    for role in [Role::Source, Role::Kernel, Role::Sink] {
+        for declared in standard.declarations(role) {
+            assert_eq!(declared.check(role), Ok(()), "{}", declared.name);
+            assert!(!declared.examples().is_empty(), "{}", declared.name);
+            assert!(std::ptr::eq(
+                declared,
+                standard.get(role, &declared.name).expect("by name")
+            ));
         }
     }
     // A name is a kind of a role: no source is called `std`, no sink `std`.
     assert!(standard.get(Role::Source, "std").is_none());
     assert!(standard.get(Role::Sink, "std").is_none());
     assert!(standard.get(Role::Source, "datafusion").is_none());
+    assert!(standard.get(Role::Sink, "peql").is_none());
     assert_eq!(Catalogue::empty().names(Role::Kernel).count(), 0);
-    // The governed kinds need contracts; the others do not (SDD 18 KD-I8).
-    for (role, name) in [(Role::Source, "datafusion"), (Role::Sink, "peql")] {
-        let needs = governed.get(role, name).expect("declared").needs.contracts;
-        assert_eq!(needs, Fact::Yes, "{name}");
-    }
 }
 
 /// JB-T3 add_refusals: a declaration is taken in when it passes `Declaration::check` for its role

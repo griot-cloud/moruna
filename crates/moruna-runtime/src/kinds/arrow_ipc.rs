@@ -27,7 +27,7 @@ pub struct SourceSettings {
     /// `file://`.
     pub url: Urls,
     /// Projection and split size.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::object")]
     pub options: SourceOptions,
 }
 
@@ -51,7 +51,7 @@ pub struct SinkSettings {
     /// A local directory.
     pub url: String,
     /// Sizes.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::object")]
     pub options: SinkOptions,
 }
 
@@ -121,7 +121,6 @@ impl SourceKind for ArrowIpc {
                 Ok(Arc::new(ArrowIpcSource::new(cfg, ctx.reactor.clone())?) as Arc<dyn Source>)
             })),
             targets: settings.url.0,
-            memory: None,
         })
     }
 }
@@ -184,7 +183,6 @@ impl SinkKind for ArrowIpc {
                 )?) as Box<dyn moruna_kernel::Sink>)
             })),
             target: settings.url,
-            memory: None,
         })
     }
 }

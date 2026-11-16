@@ -276,7 +276,6 @@ fn python_source_and_sink_are_kinds_the_caller_registers() {
                     1 << 10,
                 ))),
                 targets: Vec::new(),
-                memory: None,
             })
         }
     }
@@ -293,7 +292,6 @@ fn python_source_and_sink_are_kinds_the_caller_registers() {
             Ok(crate::kinds::BuiltSink {
                 spec: crate::SinkSpec::Built(Box::new(moruna_testkit::FakeSink::new())),
                 target: String::new(),
-                memory: None,
             })
         }
     }
@@ -953,27 +951,6 @@ fn kd_t7_strict_refuses_imported() {
         "{text}"
     );
     v1::build(&job, &kinds(), opts(false, &no_env)).expect("not strict: built");
-}
-
-/// KD-T8 contracts_need_a_kind (KD-I8): contracts carried by a document none of whose kinds
-/// reads or writes under contracts are refused, at `contracts`.
-#[test]
-fn kd_t8_contracts_need_a_kind() {
-    let mut job = minimal("/out");
-    job.contracts.push(ContractEntry {
-        document: json!({}),
-        compiled: String::new(),
-        functions: Vec::new(),
-        audiences: Vec::new(),
-    });
-    let e = v1::build(&job, &Registry::standard(), opts(false, &no_env))
-        .err()
-        .expect("refused");
-    assert!(
-        e.to_string()
-            .contains("contracts: carried, and no kind of this document reads or writes"),
-        "{e}"
-    );
 }
 
 /// KD-T9 v1_documents_resolve (KD-I9): `moruna_spec: 1` documents as 0.5.7 read them read

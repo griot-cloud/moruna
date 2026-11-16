@@ -10,8 +10,6 @@ pub struct FixedCommitmentInput {
     pub baseline_bytes: u64,
     /// Full resident arena, including any sink buffer.
     pub arena_bytes: u64,
-    /// Source and sink operator shares outside the arena.
-    pub engine_bytes: u64,
     /// The controller's minimum morsel size.
     pub morsel_min: u64,
     /// The controller's initial safety multiplier.
@@ -34,8 +32,7 @@ pub fn fixed_commitment_budget(
     let headroom = input
         .ceiling_bytes
         .saturating_sub(input.baseline_bytes)
-        .saturating_sub(input.arena_bytes)
-        .saturating_sub(input.engine_bytes);
+        .saturating_sub(input.arena_bytes);
     let state = kernels.iter().fold(0u64, |sum, kernel| {
         let instances = match &kernel.kind {
             KernelKind::Stateful { max_instances } => {
@@ -70,7 +67,6 @@ mod tests {
             ceiling_bytes: 402653184,
             baseline_bytes: 10026192,
             arena_bytes: 117440512,
-            engine_bytes: 0,
             morsel_min: 4 << 20,
             safety_initial: 1.5,
         }
@@ -98,7 +94,7 @@ mod tests {
             INITIAL_ANON_AMPLIFICATION,
             cfg.safety_initial,
         );
-        let headroom = cfg.ceiling_bytes - cfg.baseline_bytes - cfg.arena_bytes - cfg.engine_bytes;
+        let headroom = cfg.ceiling_bytes - cfg.baseline_bytes - cfg.arena_bytes;
         let envelope = model::kernel_envelope(headroom, 0);
         assert_eq!(pool, 114780240);
         assert_eq!(pool + work, envelope);
@@ -113,12 +109,8 @@ mod tests {
         assert_eq!(baseline - two, 25165824);
     }
     #[test]
-    fn mixed_stages_fund_all_instances_and_source_sink_shares() {
-        let mut cfg = input();
-        // engine_bytes is the runtime's combined source and sink operator funding.
-        let source = 8 << 20;
-        let sink = 4 << 20;
-        cfg.engine_bytes = source + sink;
+    fn mixed_stages_fund_all_instances() {
+        let cfg = input();
         let mut stateless = kernel(2, 2 << 20, 1);
         stateless.kind = KernelKind::Stateless;
         let kernels = [kernel(1, 3 << 20, 2), stateless, kernel(3, 1 << 20, 3)];
@@ -128,13 +120,11 @@ mod tests {
             INITIAL_ANON_AMPLIFICATION,
             cfg.safety_initial,
         );
-        let headroom = cfg.ceiling_bytes - cfg.baseline_bytes - cfg.arena_bytes - source - sink;
+        let headroom = cfg.ceiling_bytes - cfg.baseline_bytes - cfg.arena_bytes;
         let envelope = model::kernel_envelope(headroom, state);
         let pool = fixed_commitment_budget(&cfg, &kernels).unwrap();
         assert_eq!(pool + work, envelope);
         assert!(pool + work + state <= headroom);
-        cfg.engine_bytes = 0;
-        assert!(fixed_commitment_budget(&cfg, &kernels).unwrap() > pool);
     }
 
     #[test]

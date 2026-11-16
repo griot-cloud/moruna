@@ -289,13 +289,6 @@
       "expect": "rows"
     },
     {
-      "id": "source.datafusion",
-      "role": "source",
-      "kind": "datafusion",
-      "runner": "document",
-      "expect": "rows"
-    },
-    {
       "id": "sink.arrow_ipc",
       "role": "sink",
       "kind": "arrow_ipc",
@@ -320,13 +313,6 @@
       "id": "sink.tensor",
       "role": "sink",
       "kind": "tensor",
-      "runner": "document",
-      "expect": "rows"
-    },
-    {
-      "id": "sink.peql",
-      "role": "sink",
-      "kind": "peql",
       "runner": "document",
       "expect": "rows"
     },

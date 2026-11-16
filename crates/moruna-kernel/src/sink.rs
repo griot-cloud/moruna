@@ -14,10 +14,6 @@ pub struct SinkSummary {
     pub bytes: u64,
     /// The files or objects produced.
     pub files: Vec<String>,
-    /// What the engine behind the sink said about the write it committed, for a sink that
-    /// writes through an engine which judges its writes (a peQL contract); `None` for every
-    /// other write.
-    pub write: Option<SinkWrite>,
     /// The version the write committed, for a sink that commits one (a table snapshot); `None`
     /// for a sink that commits none.
     pub commit: Option<SinkCommit>,
@@ -31,32 +27,6 @@ pub struct SinkCommit {
     pub snapshot_id: String,
     /// The version the sink gives the snapshot, when it gives one.
     pub version: Option<String>,
-}
-
-/// A write as the engine that committed it reports it, in that engine's own words: Moruna
-/// carries the report to the run's report and neither reads nor judges it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SinkWrite {
-    /// The engine, by the sink kind that names it in a job document: `peql`.
-    pub engine: String,
-    /// The engine's report of the write, as the engine serialises it.
-    pub report: serde_json::Value,
-    /// The rows the engine handed back rather than commit, and where the sink kept them: for
-    /// a write that excludes the rows breaking its contract's rules, whether or not any did;
-    /// `None` for every other write.
-    pub excluded: Option<ExcludedRows>,
-}
-
-/// Rows a write handed back rather than commit, as the sink kept them: Parquet files under a
-/// local directory the job document names, each row with the rules it broke.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ExcludedRows {
-    /// The directory the files are in.
-    pub url: String,
-    /// The files, by path, in the order their morsels were written.
-    pub files: Vec<String>,
-    /// The rows in them.
-    pub rows: u64,
 }
 
 /// A morsel a sink has encoded on a worker and not yet put (RB1, `architecture/worker-io.md`).
