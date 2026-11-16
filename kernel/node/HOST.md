@@ -10,7 +10,10 @@ CPUs are kept for the VM's workers (contract C5's host half).
   QEMU stays the hypervisor in 0.7.0.
 - **Unprivileged user namespaces:** the launcher starts QEMU and the vsock back end each in its own
   jail (`crates/moruna-vmm/src/jail`): user, mount, PID, network, IPC, UTS and cgroup namespaces,
-  a tmpfs root holding only the run's files, no capabilities, a system-call filter.
+  a tmpfs root holding only the run's files, no capabilities, a system-call filter. Ubuntu 24.04
+  and later restrict unprivileged user namespaces through AppArmor: give the launcher an
+  AppArmor profile that allows `userns`, or set `kernel.apparmor_restrict_unprivileged_userns=0`
+  (the jail then fails at `deny setgroups` with `Permission denied` until one is done).
 - **`moruna-vhost-vsock`** beside the `moruna` executable.
 - **Disk:** the run's host directory (`$TMPDIR/moruna-data-*`) holds remote inputs fetched before
   the boot and the output disk (sparse, the size the image declares). It is removed when the
