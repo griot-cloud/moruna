@@ -314,7 +314,8 @@ data; we're supposed to measure that, simple."
   runs as a native Moruna task in the VM, through the plane (`moruna_sys::plane`, stream P).
   There is no Python, no libc and no Linux layer on the gate's path.
 - The port must produce 0.6.6's output rows from 0.6.6's input: the same row count and the same
-  content hash. A float column that cannot match bit for bit is named, with its tolerance, before
+  content hash, both taken on a canonical form (sorted rows; a per-batch aggregate re-aggregated
+  by its group keys first), since batch boundaries may differ between the builds. A float column that cannot match bit for bit is named, with its tolerance, before
   it is measured.
 - It is timed against 0.6.6 running the same job on the same data: wall time and peak memory, on
   the method below.

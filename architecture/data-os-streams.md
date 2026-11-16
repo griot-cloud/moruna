@@ -339,6 +339,13 @@ and switches to the new one when the call answers.
     5. **A time split per job:** read and decode, the function, encode and write, and waits.
     6. **A record of each port's equivalence:** the Python function it replaces, its output rows
        matched by count and content hash, and any float tolerance named before measuring.
+  - **The content hash is taken on a canonical form** (integrator, 2026-11-16), the same for
+    0.6.6 and 0.7, because `driver.py`'s `checksum` is only a row count and column sums:
+    - a row-wise function's output is sorted by all its columns, then hashed;
+    - a per-batch aggregate, whose rows depend on where batches split (Occupancy's partial
+      counts), is first re-aggregated by its group keys (`zone`, `minute_of_day`, summing
+      `car_minutes`), then sorted and hashed;
+    - the row count compared is the canonical form's.
 - **Tests:** the harness's own unit tests, and the fixtures under KVM.
 - **Done when:** the gate runs end to end on `moruna-bench` for the NYC set, then the large
   jobs, with identical rows, boot reported, and both machine types ready, and hands its numbers
