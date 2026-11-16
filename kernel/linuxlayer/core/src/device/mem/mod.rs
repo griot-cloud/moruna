@@ -51,9 +51,10 @@ pub(super) fn init_in_first_kthread() {
     MEM_MAJOR.call_once(|| char::acquire_major(MajorId::new(1)).unwrap());
     MEM_CLASS.call_once(|| class::register(MemClass).unwrap());
 
-    add_device(MemFile::Full).unwrap();
+    // Moruna: a task's `/dev` holds these three and nothing else (data-os.md section 3a).
+    // CPython's `os.urandom` and Rust's `getrandom` make the call, and `/dev/urandom` is
+    // its fallback.
     add_device(MemFile::Null).unwrap();
-    add_device(MemFile::Random).unwrap();
     add_device(MemFile::Urandom).unwrap();
     add_device(MemFile::Zero).unwrap();
 }

@@ -153,6 +153,14 @@ impl PathResolver {
         Self { root, cwd }
     }
 
+    /// Creates a resolver whose root and working directory are `root`'s root
+    /// (Moruna: a task's root before it is switched to, in host tests).
+    #[cfg(ktest)]
+    pub(in crate::fs) fn new_at(root: Arc<Mount>) -> Self {
+        let root = Path::new_root(root);
+        Self::new(root.clone(), root)
+    }
+
     /// Gets the path of the root directory.
     pub(crate) fn root(&self) -> &Path {
         &self.root

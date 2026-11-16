@@ -2,7 +2,6 @@
 
 #![short_vis_path::add(procfs)]
 
-use self::{fs::FsDirOps, kernel::KernelDirOps};
 use super::{
     StaticEntry,
     template::{ReaddirEntry, listed_entries_from_table, visit_listed_entries},
@@ -19,7 +18,6 @@ use crate::{
     prelude::*,
 };
 
-mod fs;
 mod kernel;
 mod vm;
 
@@ -35,8 +33,7 @@ impl SysDirOps {
     }
 
     const STATIC_ENTRIES: &'static [StaticEntry] = &[
-        ("fs", InodeType::Dir, FsDirOps::new_inode),
-        ("kernel", InodeType::Dir, KernelDirOps::new_inode),
+        ("kernel", InodeType::Dir, kernel::KernelDirOps::new_inode),
         ("vm", InodeType::Dir, VmDirOps::new_inode),
     ];
 }

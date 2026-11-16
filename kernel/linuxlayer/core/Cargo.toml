@@ -62,6 +62,15 @@ xarray.workspace = true
 xmas-elf.workspace = true
 zerocopy.workspace = true
 x86_64.workspace = true
+# A task's start (src/start): the record framing and the log ring, here for the host tests
+# too; the image filesystem's client and the core's calls on the target only.
+moruna-ipc-check.workspace = true
+moruna-record.workspace = true
+
+[target.'cfg(target_os = "none")'.dependencies]
+imagefs-protocol.workspace = true
+moruna-svc.workspace = true
+moruna-sys.workspace = true
 
 [lints]
 workspace = true

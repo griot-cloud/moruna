@@ -29,7 +29,6 @@ mod line_discipline;
 mod serial;
 pub(super) mod termio;
 
-pub(crate) use device::CONSOLE_DEVICE_ID;
 pub(super) use driver::TtyDriver;
 pub(super) use flags::TtyFlags;
 

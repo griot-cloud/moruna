@@ -138,6 +138,7 @@ pub(crate) fn interrupt(_token: usize) {
 }
 
 /// How many interrupts were asked for.
+#[cfg_attr(not(test), expect(dead_code, reason = "only ostd's own tests read it"))]
 pub(crate) fn interrupts() -> usize {
     INTERRUPTS.load(Ordering::SeqCst)
 }

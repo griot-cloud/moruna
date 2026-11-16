@@ -2,7 +2,7 @@
 
 //! Temporary file system (tmpfs) based on ramfs.
 
-pub(super) use fs::TmpFs;
+pub(crate) use fs::TmpFs;
 use fs::TmpFsType;
 
 mod fs;
@@ -10,3 +10,6 @@ mod fs;
 pub(super) fn init() {
     crate::fs::vfs::registry::register(&TmpFsType).unwrap();
 }
+
+#[cfg(ktest)]
+mod test;

@@ -54,6 +54,29 @@ pub mod info {
 /// What the first thread's stack pointer points at: the start page's address, then zero.
 pub const STACK_ARGS: u64 = 16;
 
+/// The slots the personality reads from its start page.
+pub mod slot {
+    /// The process's own handle, with `READ` and `WRITE`; the launcher adds it.
+    pub const SELF: &str = "self";
+    /// The core's console: the personality's log, and a task's text with no log ring.
+    pub const CONSOLE: &str = "console";
+    /// A booted test's initramfs, a memory object.
+    pub const INITRAMFS: &str = "initramfs";
+    /// The command line, a memory object: `init=PROGRAM`, then `--` and its arguments.
+    pub const CMDLINE: &str = "cmdline";
+    /// A task's own connection to the image filesystem (`moruna.imagefs` 3.0), its hello
+    /// not yet said: the task's root.
+    pub const FILESYSTEM: &str = "filesystem";
+    /// A task's scratch account: its limit is what `/tmp` holds.
+    pub const SCRATCH: &str = "scratch";
+    /// A task's input slot, to wait on: attached as the plane's slot 0.
+    pub const INPUT: &str = "input";
+    /// A task's output slot, to wait on: attached after the input.
+    pub const OUTPUT: &str = "output";
+    /// The engine's log ring, a memory object.
+    pub const LOG: &str = "log";
+}
+
 /// Why an image cannot be launched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanError {

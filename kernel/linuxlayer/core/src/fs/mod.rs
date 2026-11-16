@@ -5,18 +5,21 @@ mod fs_impls;
 pub(crate) mod initramfs;
 pub(crate) mod pipe;
 pub(crate) mod rootfs;
+pub(crate) mod task_streams;
 pub(crate) mod thread_info;
 pub mod utils;
 pub mod vfs;
 
 pub use fs_impls::devtmpfs;
-pub(crate) use fs_impls::{
-    cgroupfs, configfs, devpts, exfat, ext2, procfs, pseudofs, ramfs, sysfs, tmpfs,
-};
+// The image root's port, for the target's adapter (`start/image.rs`).
+#[cfg(target_os = "none")]
+pub(crate) use fs_impls::imagefs;
+pub(crate) use fs_impls::{cgroupfs, exfat, ext2, procfs, pseudofs, ramfs, tmpfs};
 
 use crate::{
     fs::{
-        file::{AccessMode, InodeType, OpenArgs, file_table::FdFlags, mkmod},
+        file::{InodeType, file_table::FdFlags, mkmod},
+        task_streams::{ConsoleText, TaskStreams},
         vfs::{
             path::{FsPath, Path, PathResolver, PerMountFlags},
             registry::FsAndRoot,
@@ -44,7 +47,8 @@ pub(crate) fn init_in_first_process(ctx: &Context) {
     let fs = ctx.thread_local.borrow_fs();
     let path_resolver = fs.resolver().read();
 
-    if init::booted_from_rootfs() {
+    // The image's root has its `/dev` (`rootfs::mount_task_root`); an initramfs gets one.
+    if !init::booted_from_rootfs() {
         let dev_path = lookup_or_create_dev(&path_resolver).unwrap();
         dev_path
             .mount(
@@ -56,48 +60,21 @@ pub(crate) fn init_in_first_process(ctx: &Context) {
             .unwrap();
     }
 
-    // Initialize the file table for the first process.
-    let tty_path = FsPath::try_from("/dev/console").unwrap();
-    let stdin = {
-        let open_args = OpenArgs::from_modes(AccessMode::O_RDONLY, mkmod!(u+r));
-        path_resolver
-            .lookup(&tty_path)
-            .unwrap()
-            .open(open_args)
-            .unwrap()
-    };
-    let stdout = {
-        let open_args = OpenArgs::from_modes(AccessMode::O_WRONLY, mkmod!(u+w));
-        path_resolver
-            .lookup(&tty_path)
-            .unwrap()
-            .open(open_args)
-            .unwrap()
-    };
-    let stderr = {
-        let open_args = OpenArgs::from_modes(AccessMode::O_WRONLY, mkmod!(u+w));
-        path_resolver
-            .lookup(&tty_path)
-            .unwrap()
-            .open(open_args)
-            .unwrap()
+    // Descriptors 0, 1 and 2 are the task's streams (SDD 29 f.7, f.8); there is no
+    // terminal (data-os.md section 3a).
+    let streams = match rootfs::task_fs() {
+        Some(task_fs) => task_fs.streams.clone(),
+        None => TaskStreams::text_only(Arc::new(ConsoleText)),
     };
 
     let mut file_table_ref = ctx.thread_local.borrow_file_table_mut();
     let mut file_table = file_table_ref.unwrap().write();
-
-    file_table
-        .insert(Arc::new(stdin), FdFlags::empty())
-        .map_err(|(err, _)| err)
-        .unwrap();
-    file_table
-        .insert(Arc::new(stdout), FdFlags::empty())
-        .map_err(|(err, _)| err)
-        .unwrap();
-    file_table
-        .insert(Arc::new(stderr), FdFlags::empty())
-        .map_err(|(err, _)| err)
-        .unwrap();
+    for file in streams.files() {
+        file_table
+            .insert(file, FdFlags::empty())
+            .map_err(|(err, _)| err)
+            .unwrap();
+    }
 }
 
 fn lookup_or_create_dev(path_resolver: &PathResolver) -> Result<Path> {

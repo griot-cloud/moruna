@@ -8,6 +8,7 @@ pub(super) use fs::RamInode;
 
 mod fs;
 pub(crate) mod memfd;
+pub(crate) mod quota;
 mod xattr;
 
 const RAMFS_MAGIC: u64 = 0x8584_58f6;

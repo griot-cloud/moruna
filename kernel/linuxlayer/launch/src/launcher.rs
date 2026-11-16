@@ -4,7 +4,9 @@
 
 use alloc::vec::Vec;
 
-use moruna_sys::{Error, Handle, Memory, Process, Result, Rights, map, personality};
+use moruna_sys::{
+    Channel, Error, Handle, Memory, Process, Result, Rights, map, personality, plane,
+};
 
 use crate::{PAGE, Plan, REGION_BASE, REGION_LEN, STACK_SIZE, segment_flags};
 
@@ -31,8 +33,33 @@ pub fn launch(
     image: &[u8],
     grants: &mut [(Option<Handle>, &str)],
 ) -> core::result::Result<Process, LaunchError> {
+    launch_task(resource, name, image, grants, None)
+}
+
+/// A task's data plane: its slots, numbered in order (input first), and its port.
+pub struct Plane<'a> {
+    pub slots: &'a [&'a plane::Slot],
+    pub port: Option<Channel>,
+}
+
+/// As [`launch`], and gives the process `plane` first (`process_plane`). The caller grants
+/// the personality its own handles to the slots too, as `slot::INPUT` and `slot::OUTPUT`,
+/// to wait on them.
+pub fn launch_task(
+    resource: &Handle,
+    name: &str,
+    image: &[u8],
+    grants: &mut [(Option<Handle>, &str)],
+    plane: Option<Plane<'_>>,
+) -> core::result::Result<Process, LaunchError> {
     let plan = Plan::new(image).map_err(LaunchError::Plan)?;
     let process = call(Process::create(resource, name), "process_create")?;
+    if let Some(p) = plane {
+        call(
+            plane::attach(&process, p.slots, p.port).map_err(|(e, _)| e),
+            "process_plane",
+        )?;
+    }
 
     // The image's segments, each an object of its own that every process of the container
     // shares: the personality's state is the container's.
@@ -69,7 +96,7 @@ pub fn launch(
             all.push((Some(handle), *name));
         }
     }
-    all.push((Some(own), "self"));
+    all.push((Some(own), crate::slot::SELF));
     let start_page = call(process.grant(&mut all), "process_grant")?;
 
     let mut args = [0u8; crate::STACK_ARGS as usize];

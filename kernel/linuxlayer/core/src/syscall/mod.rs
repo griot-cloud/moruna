@@ -117,6 +117,7 @@ mod pwritev;
 mod read;
 mod readlink;
 mod reboot;
+pub(crate) mod refused;
 mod removexattr;
 mod rename;
 mod rmdir;
@@ -317,6 +318,8 @@ macro_rules! impl_syscall_nums_and_dispatch_fn {
             ctx: &crate::context::Context,
             user_ctx: &mut ostd::arch::cpu::context::UserContext,
         ) -> $crate::prelude::Result<$crate::syscall::SyscallReturn> {
+            // User space: the data OS refuses administrative calls (`refused.rs`).
+            $crate::syscall::refused::screen(ctx.process.pid(), syscall_number)?;
             match syscall_number {
                 $(
                     $num => {
@@ -326,6 +329,7 @@ macro_rules! impl_syscall_nums_and_dispatch_fn {
                 )*
                 _ => {
                     ostd::warn!("Unimplemented syscall number: {}", syscall_number);
+                    $crate::syscall::refused::unknown(ctx.process.pid(), syscall_number);
                     $crate::return_errno_with_message!(
                         $crate::error::Errno::ENOSYS,
                         "Syscall was unimplemented"

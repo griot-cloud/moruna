@@ -3,13 +3,15 @@
 mod mem;
 pub(crate) mod misc;
 mod model;
-mod pty;
 pub mod registry;
-pub(crate) mod tty;
+// Moruna: no terminal is registered (data-os.md section 3a), so no program reaches one.
+// The console's code stays until the job control it serves goes from `process/` (stream
+// B2's), so that neither leaves the other unused.
+#[expect(dead_code, reason = "no terminal is registered")]
+mod tty;
 
 use device_id::DeviceId;
 pub(crate) use mem::{getrandom, geturandom};
-pub(crate) use pty::{PtyMaster, PtySlave, new_pty_pair};
 pub(crate) use registry::lookup;
 
 use crate::{
@@ -59,7 +61,6 @@ pub(crate) fn init_in_first_kthread() {
 
 /// Initializes device state after mounting rootfs.
 pub(crate) fn init_in_first_process() -> Result<()> {
-    tty::init_in_first_process()?;
     registry::init_in_first_process()?;
 
     Ok(())

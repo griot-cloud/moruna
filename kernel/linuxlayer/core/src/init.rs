@@ -12,7 +12,7 @@ use spin::once::Once;
 use crate::{
     fs::{
         initramfs, rootfs,
-        vfs::path::{FsPath, MountNamespace, Path, PathResolver},
+        vfs::path::{MountNamespace, Path, PathResolver},
     },
     prelude::*,
     process::{Process, spawn_init_process},
@@ -105,6 +105,7 @@ fn bsp_idle_loop() {
     }
 
     // User space: the personality's work ends with its init process.
+    crate::syscall::refused::report_task();
     let code = init_process.status().exit_code();
     ostd::info!("The init process terminates with code {:?}", code);
     ostd::power::poweroff(if code == 0 {
@@ -125,7 +126,7 @@ fn first_kthread() {
     let init_mnt_ns = MountNamespace::get_init_singleton();
     let fs_resolver = init_mnt_ns.new_path_resolver();
     init_in_first_kthread(&fs_resolver);
-    let boot_init = prepare_boot_init(fs_resolver);
+    let boot_init = prepare_boot_init(fs_resolver).unwrap_or_else(|e| no_program(e));
 
     print_banner();
 
@@ -135,13 +136,13 @@ fn first_kthread() {
         let envp = karg.envp().to_vec();
         boot_init
             .spawn(argv, envp)
-            .expect("failed to run the init process")
+            .unwrap_or_else(|e| no_program(e))
     });
 }
 
 struct BootInit {
     path_resolver: PathResolver,
-    init_path: Option<(Path, &'static str)>,
+    init_path: (Path, &'static str),
 }
 
 #[repr(u8)]
@@ -158,13 +159,8 @@ impl BootInit {
     fn spawn(self, argv: Vec<CString>, envp: Vec<CString>) -> Result<Arc<Process>> {
         let Self {
             path_resolver,
-            init_path,
+            init_path: (init_path, init_name),
         } = self;
-
-        // Only rootfs boot may have no init path; initramfs boot always provides one.
-        let Some((init_path, init_name)) = init_path else {
-            return spawn_default_rootfs_init(path_resolver, argv, envp);
-        };
 
         println!("[kernel] running {} as the init process", init_name);
         spawn_init_process(
@@ -176,61 +172,34 @@ impl BootInit {
     }
 }
 
-fn prepare_boot_init(mut path_resolver: PathResolver) -> BootInit {
-    if let Ok(init_path) = initramfs::find_init(&path_resolver) {
-        BOOT_SOURCE.store(BootSource::Initramfs as u8, Ordering::Relaxed);
-        return BootInit {
+/// The program the personality runs first (data-os.md section 3a): a task's is the one its
+/// command names on its image (`init=`), a booted test's is the initramfs's (`rdinit=`,
+/// `/init` when not given). There is no default search and no shell to fall back on, so a
+/// program that is not there is an error.
+fn prepare_boot_init(mut path_resolver: PathResolver) -> Result<BootInit> {
+    if rootfs::task_fs().is_some() {
+        rootfs::switch_to_rootfs(&mut path_resolver)?;
+        BOOT_SOURCE.store(BootSource::Rootfs as u8, Ordering::Relaxed);
+        let init_path = rootfs::find_init(&path_resolver)?.ok_or_else(|| {
+            Error::with_message(Errno::ENOENT, "the task's command names no program")
+        })?;
+        return Ok(BootInit {
             path_resolver,
-            init_path: Some(init_path),
-        };
+            init_path,
+        });
     }
-
-    rootfs::switch_to_rootfs(&mut path_resolver)
-        .expect("neither an initramfs init nor a usable root filesystem was available");
-    let init_path = rootfs::find_init(&path_resolver).expect("failed to resolve rootfs init path");
-    BOOT_SOURCE.store(BootSource::Rootfs as u8, Ordering::Relaxed);
-    BootInit {
+    let init_path = initramfs::find_init(&path_resolver)?;
+    Ok(BootInit {
         path_resolver,
         init_path,
-    }
+    })
 }
 
-fn spawn_default_rootfs_init(
-    path_resolver: PathResolver,
-    argv: Vec<CString>,
-    envp: Vec<CString>,
-) -> Result<Arc<Process>> {
-    // Linux probes the fallback init executables in this order:
-    // Reference: <https://elixir.bootlin.com/linux/v6.19/source/init/main.c#L1634>.
-    const DEFAULT_INIT_EXEC_PATHS: &[&str] = &["/sbin/init", "/etc/init", "/bin/init", "/bin/sh"];
-
-    let mut last_error = None;
-
-    for &init_name in DEFAULT_INIT_EXEC_PATHS {
-        // FIXME: Avoid cloning `argv` and `envp` for each fallback candidate.
-        let init_path = match path_resolver.lookup(&FsPath::try_from(init_name).unwrap()) {
-            Ok(path) => path,
-            Err(error) => {
-                last_error = Some(error);
-                continue;
-            }
-        };
-
-        match spawn_init_process(
-            path_resolver.clone(),
-            init_path,
-            with_init_argv0(init_name, argv.clone()),
-            envp.clone(),
-        ) {
-            Ok(process) => {
-                println!("[kernel] running {} as the rootfs init", init_name);
-                return Ok(process);
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-
-    Err(last_error.unwrap())
+/// Ends the personality when its first program cannot run.
+fn no_program(error: Error) -> ! {
+    ostd::early_println!("linux: FAIL: the task's program cannot run: {:?}", error);
+    crate::syscall::refused::report_task();
+    ostd::power::poweroff(ostd::power::ExitCode::Failure)
 }
 
 fn with_init_argv0(init_name: &str, mut argv: Vec<CString>) -> Vec<CString> {

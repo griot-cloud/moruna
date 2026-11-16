@@ -1,5 +1,33 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! `/proc`.
+//!
+//! Moruna cuts it to what a task's programs read: CPython 3.14, NumPy (with OpenBLAS),
+//! pyarrow (with jemalloc and mimalloc) and the engine (static musl Rust). The paths come
+//! from their sources and from the path strings in pyarrow 25's Linux libraries. Kept:
+//!
+//! - `self`, and in `[pid]` and `[pid]/task/[tid]`:
+//!   - `exe`: Rust's `current_exe`, glibc's `$ORIGIN` for the program;
+//!   - `maps`: glibc's `pthread_getattr_np` for the main thread, which CPython 3.14's
+//!     stack limits call;
+//!   - `fd/`, `fdinfo/`: CPython's `subprocess` closing descriptors, Rust's `File` debug
+//!     output;
+//!   - `status`: the engine's memory figures (`VmHWM`, `RssAnon`, `RssFile`), Arrow;
+//!   - `mounts`, `mountinfo`: glibc's `statvfs` and `getmntent`, Rust's cgroup lookup;
+//!   - `task/`: the thread directories these live in;
+//! - `meminfo`: the engine's budget (SDD 30 f.3);
+//! - `cpuinfo`: Arrow's CPU description;
+//! - `stat`: glibc's `get_nprocs` when `/sys/devices/system/cpu/online` cannot be read;
+//! - `loadavg`: glibc's `getloadavg` (CPython's `os.getloadavg`);
+//! - `mounts`: the link to `self/mounts`;
+//! - `sys/vm/overcommit_memory`: jemalloc and mimalloc;
+//! - `sys/kernel/yama`: the security module's own setting.
+//!
+//! Cut: `cmdline`, `filesystems`, `thread-self`, `uptime`, `version`, `sys/fs`, the rest of
+//! `sys/kernel` and `sys/vm`, and `[pid]/{auxv,cgroup,cmdline,comm,environ,gid_map,mem,
+//! mountstats,ns,oom_score_adj,stat,uid_map}`. A program that reads one finds it missing
+//! (`ENOENT`), which glibc, CPython and Rust each handle.
+
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use template::{
@@ -9,22 +37,18 @@ use template::{
 };
 
 use self::{
-    cmdline::CmdLineFileOps,
     cpuinfo::CpuInfoFileOps,
     loadavg::LoadAvgFileOps,
     meminfo::MemInfoFileOps,
     mounts::MountsSymOps,
     pid::{PidDirOps, TidDirOps},
     self_::SelfSymOps,
+    stat::StatFileOps,
     sys::SysDirOps,
-    thread_self::ThreadSelfSymOps,
-    uptime::UptimeFileOps,
-    version::VersionFileOps,
 };
 use crate::{
     fs::{
         file::{InodeType, mkmod},
-        procfs::{filesystems::FileSystemsFileOps, stat::StatFileOps},
         pseudofs::AnonDeviceId,
         utils::NAME_MAX,
         vfs::{
@@ -40,9 +64,7 @@ use crate::{
     },
 };
 
-mod cmdline;
 mod cpuinfo;
-mod filesystems;
 mod loadavg;
 mod meminfo;
 mod mounts;
@@ -51,12 +73,14 @@ mod self_;
 mod stat;
 mod sys;
 mod template;
-mod thread_self;
-mod uptime;
-mod version;
 
 pub(super) fn init() {
     crate::fs::vfs::registry::register(&ProcFsType).unwrap();
+}
+
+/// A new `/proc` for a task's root (Moruna: the start mounts it; no program does).
+pub(crate) fn new_procfs() -> Arc<dyn FileSystem> {
+    ProcFs::new()
 }
 
 pub(super) fn init_on_each_cpu() {
@@ -150,27 +174,15 @@ impl RootDirOps {
         ProcDir::new_root(Self, fs, PROC_ROOT_INO, sb, mkmod!(a+rx))
     }
 
+    // Moruna keeps what CPython, NumPy, pyarrow and the engine read (the module's note).
     const STATIC_ENTRIES: &'static [StaticEntry] = &[
-        ("cmdline", InodeType::File, CmdLineFileOps::new_inode),
         ("cpuinfo", InodeType::File, CpuInfoFileOps::new_inode),
-        (
-            "filesystems",
-            InodeType::File,
-            FileSystemsFileOps::new_inode,
-        ),
         ("loadavg", InodeType::File, LoadAvgFileOps::new_inode),
         ("meminfo", InodeType::File, MemInfoFileOps::new_inode),
         ("mounts", InodeType::SymLink, MountsSymOps::new_inode),
         ("self", InodeType::SymLink, SelfSymOps::new_inode),
         ("stat", InodeType::File, StatFileOps::new_inode),
         ("sys", InodeType::Dir, SysDirOps::new_inode),
-        (
-            "thread-self",
-            InodeType::SymLink,
-            ThreadSelfSymOps::new_inode,
-        ),
-        ("uptime", InodeType::File, UptimeFileOps::new_inode),
-        ("version", InodeType::File, VersionFileOps::new_inode),
     ];
 }
 

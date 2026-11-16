@@ -10,11 +10,15 @@
 mod image {
     extern crate alloc;
 
-    use alloc::boxed::Box;
+    use alloc::{boxed::Box, string::String};
     use core::arch::global_asm;
 
-    use linuxlayer_launch::launcher::object_len;
-    use moruna_sys::{Memory, start};
+    use linuxlayer_launch::{launcher::object_len, slot};
+    use moruna_linuxlayer::start::{TaskStart, start_task};
+    use moruna_sys::{Account, Channel, Memory, start};
+
+    /// The scratch's limit when the launcher grants no scratch account.
+    const SCRATCH_DEFAULT: usize = 64 << 20;
 
     // The first thread: the start page's address is at the stack pointer.
     global_asm!(
@@ -34,13 +38,36 @@ mod image {
         unsafe { ostd::backend::start_thread_block() };
         // SAFETY: once, on the only thread, before anything reads a registry.
         unsafe { run_constructors() };
-        if let Some(own) = start::take("self") {
+        if let Some(own) = start::take(slot::SELF) {
             ostd::backend::set_self_process(own.into_raw());
         }
-        let cmdline = start::take("cmdline")
+        let cmdline = start::take(slot::CMDLINE)
             .map(|m| linuxlayer_personality::cmdline(mapped(Memory(m))))
             .unwrap_or_default();
-        let initramfs = start::take("initramfs").map(|m| mapped(Memory(m)));
+        let initramfs = start::take(slot::INITRAMFS).map(|m| mapped(Memory(m)));
+        // A task: its image, its scratch, its plane and its log; the layer runs the program
+        // its command names on that image.
+        if let Some(filesystem) = start::take(slot::FILESYSTEM) {
+            let scratch_quota = start::take(slot::SCRATCH)
+                .and_then(|account| Account(account).usage().ok())
+                .map_or(SCRATCH_DEFAULT, |usage| usage.limit as usize);
+            let task = TaskStart {
+                filesystem: Channel(filesystem),
+                scratch_quota,
+                input: start::take(slot::INPUT),
+                output: start::take(slot::OUTPUT),
+                log: start::take(slot::LOG).map(|log| {
+                    let log = Memory(log);
+                    let len = object_len(&log);
+                    (log, len)
+                }),
+                name: String::from(start::process_name()),
+            };
+            if let Err(e) = start_task(task) {
+                ostd::early_println!("linux: FAIL: the task cannot start: {:?}", e);
+                moruna_sys::exit(1);
+            }
+        }
         let info = linuxlayer_personality::boot_info(cmdline, initramfs);
         linuxlayer_personality::start(info, moruna_linuxlayer::boot);
         // The layer runs on the threads its boot started; the idle thread ends the process

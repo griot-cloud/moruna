@@ -5,7 +5,7 @@ use crate::{
         file::{InodeType, mkmod},
         procfs::{
             ProcDir, StaticEntry,
-            sys::vm::mmap_min_addr::MmapMinAddrFileOps,
+            sys::vm::overcommit_memory::OvercommitMemoryFileOps,
             template::{
                 ProcDirOps, ReaddirEntry, listed_entries_from_table, lookup_child_from_table,
                 visit_listed_entries,
@@ -16,7 +16,7 @@ use crate::{
     prelude::*,
 };
 
-mod mmap_min_addr;
+mod overcommit_memory;
 
 /// Represents the inode at `/proc/sys/vm`.
 pub(super) struct VmDirOps;
@@ -24,15 +24,14 @@ pub(super) struct VmDirOps;
 impl VmDirOps {
     pub(super) fn new_inode(parent: Weak<dyn Inode>) -> Arc<dyn Inode> {
         // Reference:
-        // <https://elixir.bootlin.com/linux/v6.16.5/source/security/min_addr.c#L59>
         // <https://elixir.bootlin.com/linux/v6.16.5/source/fs/proc/proc_sysctl.c#L978>
         ProcDir::new(Self, parent, mkmod!(a+rx))
     }
 
     const STATIC_ENTRIES: &'static [StaticEntry] = &[(
-        "mmap_min_addr",
+        "overcommit_memory",
         InodeType::File,
-        MmapMinAddrFileOps::new_inode,
+        OvercommitMemoryFileOps::new_inode,
     )];
 }
 

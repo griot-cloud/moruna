@@ -35,6 +35,9 @@ pub(super) fn exit_process(current_process: &Process) {
     // `find_reaper_process` for details.
     current_process.status().set_zombie();
 
+    // User space: the calls the process was refused (`syscall/refused.rs`).
+    crate::syscall::refused::report_process(current_process.pid());
+
     current_process.pidfile_pollee.notify(IoEvents::IN);
 
     send_child_death_signal(current_process);

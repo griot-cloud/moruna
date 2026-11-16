@@ -225,6 +225,7 @@ impl Metadata {
         }
     }
 
+    #[expect(dead_code, reason = "only devpts, cut, used it")]
     pub(crate) fn new_device(
         ino: u64,
         mode: InodeMode,
@@ -417,18 +418,21 @@ pub(crate) trait Inode: Any + FileOps + Send + Sync {
     fn set_group(&self, self_dentry: &Dentry, gid: Gid) -> Result<()>;
 
     /// Returns the inode's access time.
+    #[expect(dead_code, reason = "only overlayfs, cut, used it")]
     fn atime(&self) -> Duration;
 
     /// Sets the inode's access time.
     fn set_atime(&self, self_dentry: &Dentry, time: Duration);
 
     /// Returns the inode's modification time.
+    #[expect(dead_code, reason = "only overlayfs, cut, used it")]
     fn mtime(&self) -> Duration;
 
     /// Sets the inode's modification time.
     fn set_mtime(&self, self_dentry: &Dentry, time: Duration);
 
     /// Returns the inode's metadata-change time.
+    #[expect(dead_code, reason = "only overlayfs, cut, used it")]
     fn ctime(&self) -> Duration;
 
     /// Sets the inode's metadata-change time.
@@ -750,6 +754,7 @@ impl Debug for dyn Inode {
 pub(crate) struct Extension {
     group1: Once<ThinBox<dyn Any + Send + Sync>>,
     group2: Once<ThinBox<dyn Any + Send + Sync>>,
+    #[expect(dead_code, reason = "only overlayfs, cut, used it")]
     group3: Once<ThinBox<dyn Any + Send + Sync>>,
 }
 
@@ -774,6 +779,7 @@ impl Extension {
     }
 
     /// Gets the third extension group.
+    #[expect(dead_code, reason = "only overlayfs, cut, used it")]
     pub(crate) fn group3(&self) -> &Once<ThinBox<dyn Any + Send + Sync>> {
         &self.group3
     }

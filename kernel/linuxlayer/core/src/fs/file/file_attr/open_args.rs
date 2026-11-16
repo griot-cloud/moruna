@@ -57,6 +57,7 @@ impl OpenArgs {
     }
 
     /// Creates `OpenArgs` from the given access mode and inode mode.
+    #[expect(dead_code, reason = "only the console's opening used it")]
     pub(crate) fn from_modes(access_mode: AccessMode, inode_mode: InodeMode) -> Self {
         Self {
             creation_flags: CreationFlags::empty(),

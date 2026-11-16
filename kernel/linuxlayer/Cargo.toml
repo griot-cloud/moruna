@@ -59,6 +59,12 @@ osdk-frame-allocator = { path = "libs/osdk-frame-allocator", version = "=0.19.0"
 osdk-heap-allocator = { path = "libs/osdk-heap-allocator", version = "=0.19.0", package = "linuxlayer-osdk-heap-allocator" }
 moruna-sys = { path = "../sys", version = "=0.1.0", features = ["heap"] }
 moruna-abi = { path = "../abi", version = "=0.1.0" }
+# A task's start (core/src/start): the image filesystem's protocol on Moruna's SDK, the
+# data plane's record framing, and the engine's log ring.
+imagefs-protocol = { path = "../imagefs/protocol", version = "=0.1.0" }
+moruna-svc = { path = "../svc", version = "=0.1.0" }
+moruna-ipc-check = { path = "../plane/check", version = "=0.1.0" }
+moruna-record = { path = "../../crates/moruna-record", version = "=0.6.6", default-features = false }
 
 # OSTD's published crates (MPL-2.0, as the kernel uses them).
 align_ext = "=0.1.0"
