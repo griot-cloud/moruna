@@ -37,7 +37,8 @@ def serve(fn, plane=None):
     copied = plane.calls.copied()
     print(
         f"moruna_shim: {n} batches, {plane.calls.made} native calls, "
-        f"{plane.waits} waits, {plane.handed} hand-backs, kernel copied {copied}",
+        f"{plane.waits} waits, {plane.wakes} wakes, {plane.handed} hand-backs, "
+        f"kernel copied {copied}",
         file=sys.stderr,
     )
     return n

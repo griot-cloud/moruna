@@ -13,7 +13,11 @@ it is not part of Moruna's runtime.
   (`pyarrow.foreign_buffer` over the region).
 - The batch the function returns is laid out as a data-plane record (contracts e.7) in a
   window of the rings object and posted on the output ring.
-- The shim waits on port 0 only when its input ring is empty, after reading it a while.
+- The shim sleeps only when its input ring is empty (after reading it a while) or no window
+  is free, on its bell: a futex word of the rings object the engine raises after each post
+  and wakes only when the shim said it waits. After each record it raises the engine's bell,
+  and wakes the engine only when the engine sleeps on it. The kernel keys a futex on a shared
+  memory object by the object and the offset, so each wake reaches the other process.
 - While the kernel cannot take write access back from a window itself, the shim hands the
   rings object back with `batch_put` once it has posted a group, and maps the next.
 

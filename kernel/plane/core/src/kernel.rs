@@ -160,6 +160,12 @@ impl ring::Shared for Mapped {
     fn fence(&self) {
         moruna_sys::plane::ring::Shared::fence(&self.0)
     }
+    fn wait(&self, at: usize, expected: u32, deadline: u64) -> bool {
+        moruna_sys::plane::ring::Shared::wait(&self.0, at, expected, deadline)
+    }
+    fn wake(&self, at: usize) {
+        moruna_sys::plane::ring::Shared::wake(&self.0, at)
+    }
 }
 
 impl View for Mapped {
@@ -207,5 +213,9 @@ impl RingCalls for Kernel {
             flags,
         ))
         .map(|_| ())
+    }
+
+    fn now(&mut self) -> u64 {
+        moruna_sys::now()
     }
 }

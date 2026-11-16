@@ -79,7 +79,7 @@ class Engine:
         g = geometry
         for at in (ring.IN_HEAD, ring.IN_TAIL, ring.OUT_HEAD, ring.OUT_TAIL, ring.FREE_HEAD,
                    ring.FREE_TAIL, ring.ENGINE_WAITS, ring.TASK_WAITS, ring.CLOSED,
-                   ring.ATTACHED):
+                   ring.ATTACHED, ring.TASK_BELL, ring.ENGINE_BELL):
             words.store(at, 0)
         for at, v in ((ring.VERSION, ring.VERSION_VALUE), (ring.REGION_BYTES, g.region_bytes),
                       (ring.IN_CAP, g.in_cap), (ring.OUT_CAP, g.out_cap),
@@ -89,18 +89,30 @@ class Engine:
                       (ring.MAGIC, ring.MAGIC_VALUE)):
             words.store(at, v)
         self.in_head = self.out_tail = self.free_head = 0
+        self.bell = 0
+
+    def ring(self):
+        """Raises the task's bell; whether the task said it waits (the engine wakes it)."""
+        self.bell = (self.bell + 1) & 0xFFFFFFFF
+        self.w.store(ring.TASK_BELL, self.bell)
+        if self.w.load(ring.TASK_WAITS) == 0:
+            return False
+        self.w.store(ring.TASK_WAITS, 0)
+        return True
 
     def post(self, offset, length, cookie, rows=0):
         at = ring.ENTRIES_AT + (self.in_head % self.g.in_cap) * ring.IN_ENTRY
         struct.pack_into("<QQQQ", self.w.view, at, offset, length, cookie, rows)
         self.in_head += 1
         self.w.store(ring.IN_HEAD, self.in_head)
+        self.ring()
 
     def give(self, n):
         at = self.g.free_entries() + (self.free_head % self.g.free_cap) * ring.FREE_ENTRY
         self.w.store(at, n)
         self.free_head += 1
         self.w.store(ring.FREE_HEAD, self.free_head)
+        self.ring()
 
     def take(self):
         if self.w.load(ring.OUT_HEAD) == self.out_tail:
@@ -112,6 +124,7 @@ class Engine:
 
     def close(self):
         self.w.store(ring.CLOSED, 1)
+        self.ring()
 
 
 def geometry(windows=2, window=1 << 20, region=4 << 20):
@@ -202,6 +215,8 @@ class FakeCalls:
         self.generations = []
         self.outputs = []
         self.made = 0
+        self.wakes = 0
+        self.sleeps = 0
         self.pending = list(batches_in)
         self.cookie = 0
         self.at = 0
@@ -269,13 +284,23 @@ class FakeCalls:
         self._collect(rings, engine)
         self._new_rings()
 
-    def port_call(self, port, body):
+    def futex_wait(self, addr, expected, deadline):
+        """The task sleeps on its bell: the engine runs meanwhile, taking its records and
+        posting the next batch (or the end) when the task has read every one."""
         self.made += 1
-        rings, _, engine = self.generations[-1]
+        self.sleeps += 1
+        rings, words, engine = self.generations[-1]
+        assert addr == ctypes.addressof(rings) + ring.TASK_BELL
+        assert deadline == (1 << 64) - 1
         self._collect(rings, engine)
-        if body[0] == ring.WAIT_INPUT:
+        if words.load(ring.IN_HEAD) == words.load(ring.IN_TAIL) and not words.load(ring.CLOSED):
             self._feed()
-        return 0
+
+    def futex_wake(self, addr):
+        self.made += 1
+        self.wakes += 1
+        rings, _, _ = self.generations[-1]
+        assert addr == ctypes.addressof(rings) + ring.ENGINE_BELL
 
 
 class Serve(unittest.TestCase):
@@ -298,6 +323,8 @@ class Serve(unittest.TestCase):
 
     def test_protect_mode_serves_every_batch_in_place(self):
         calls, plane = self.run_mode(ring.PROTECT)
+        self.assertGreater(calls.sleeps, 0)
+        self.assertEqual(plane.wakes, calls.wakes)
         self.assertEqual(plane.handed, 0)
 
     def test_unmap_mode_hands_the_rings_back_a_group_at_a_time(self):
@@ -340,3 +367,37 @@ class Example(unittest.TestCase):
         out = transform(pa.record_batch({"x": x, "y": y}))
         self.assertEqual(out["x"].to_pylist(), [0, 1, 2])
         self.assertEqual(out["y"].to_pylist(), [3 * v + (v * 7919) % 10007 for v in range(3)])
+
+
+class Bells(unittest.TestCase):
+    def test_a_post_wakes_a_sleeping_engine_once(self):
+        g = geometry()
+        w = ring.Words(bytearray(g.object_bytes()))
+        e = Engine(w, g, ring.PROTECT)
+        e.give(0)
+        t = ring.Task(w)
+        woken = []
+        self.assertTrue(t.post(0, 0, 8, 1))
+        self.assertFalse(t.ring(woken.append), "the engine is awake")
+        w.store(ring.ENGINE_WAITS, 1)
+        self.assertTrue(t.post(0, 0, 8, 2))
+        self.assertTrue(t.ring(woken.append))
+        self.assertEqual(woken, [ring.ENGINE_BELL])
+        self.assertEqual(w.load(ring.ENGINE_WAITS), 0, "one wake a sleep")
+        self.assertEqual(w.load(ring.ENGINE_BELL), 2)
+
+    def test_the_task_sleeps_only_when_nothing_came(self):
+        g = geometry()
+        w = ring.Words(bytearray(g.object_bytes()))
+        e = Engine(w, g, ring.PROTECT)
+        t = ring.Task(w)
+        slept = []
+        t.sleep(t.has_input, lambda at, v: slept.append((at, v)))
+        self.assertEqual(slept, [(ring.TASK_BELL, 0)])
+        self.assertEqual(w.load(ring.TASK_WAITS), 0)
+        e.post(0, 8, 1)
+        t.sleep(t.has_input, lambda at, v: slept.append((at, v)))
+        self.assertEqual(len(slept), 1, "an input was there: no sleep")
+        self.assertFalse(t.has_window())
+        e.give(0)
+        self.assertTrue(t.has_window())

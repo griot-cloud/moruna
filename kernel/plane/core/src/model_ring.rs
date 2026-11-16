@@ -28,6 +28,8 @@ use crate::ringed::{RingCalls, View};
 pub struct ModelMap {
     pub bytes: Rc<RefCell<Vec<u8>>>,
     len: u64,
+    /// The model's count of futex calls.
+    futex: Rc<core::cell::Cell<u64>>,
 }
 
 impl ModelMap {
@@ -36,6 +38,7 @@ impl ModelMap {
         ModelMap {
             bytes: mem.bytes.clone(),
             len: mem.bytes.borrow().len() as u64,
+            futex: Rc::new(core::cell::Cell::new(0)),
         }
     }
 }
@@ -59,6 +62,14 @@ impl Shared for ModelMap {
         store(&self.bytes, at, value)
     }
     fn fence(&self) {}
+    /// The model cannot sleep: the word has changed, or the deadline is taken as passed.
+    fn wait(&self, at: usize, expected: u32, _deadline: u64) -> bool {
+        self.futex.set(self.futex.get() + 1);
+        load(&self.bytes, at) as u32 != expected
+    }
+    fn wake(&self, _at: usize) {
+        self.futex.set(self.futex.get() + 1);
+    }
 }
 
 impl View for ModelMap {
@@ -95,6 +106,7 @@ impl RingCalls for Model {
         Ok(ModelMap {
             bytes: memory.bytes.clone(),
             len,
+            futex: self.futex.clone(),
         })
     }
 
@@ -183,6 +195,12 @@ pub struct RingTaskModel {
     pub ended: Option<Ending>,
     /// Waits it called.
     pub waits: u64,
+    /// It sleeps on its bell (the futex); otherwise it waits on port 0, as version 1 did.
+    bells: bool,
+    /// The bell's value it sleeps on.
+    bell: Option<u32>,
+    /// Wakes it called on the engine's bell.
+    pub engine_wakes: u64,
 }
 
 impl RingTaskModel {
@@ -205,7 +223,16 @@ impl RingTaskModel {
             read: Vec::new(),
             ended: None,
             waits: 0,
+            bells: true,
+            bell: None,
+            engine_wakes: 0,
         }
+    }
+
+    /// The task waits on port 0 instead of its bell, which the engine still answers.
+    pub fn with_port_waits(mut self) -> RingTaskModel {
+        self.bells = false;
+        self
     }
 
     /// The region object it maps, for a test to compare with the engine's.
@@ -234,6 +261,15 @@ impl RingTaskModel {
     }
 
     fn wait(&mut self, want: u8, seen: u64) {
+        if self.bells && want != layout::WAKE {
+            if let Some(r) = &self.rings {
+                let view = TaskMap(r.clone());
+                view.store(layout::TASK_WAITS, 1);
+                self.bell = Some(view.load(layout::TASK_BELL) as u32);
+                self.waits += 1;
+            }
+            return;
+        }
         if let Some(r) = &self.rings {
             TaskMap(r.clone()).store(layout::TASK_WAITS, 1);
         }
@@ -254,6 +290,21 @@ impl RingTaskModel {
 
     /// Whether the engine answered the wait it called.
     fn answered(&mut self) -> bool {
+        if let Some(seq) = self.bell {
+            // The futex: woken once the engine raised the bell, or the rings object it slept
+            // on was replaced (unmap mode).
+            let Some(r) = &self.rings else {
+                self.bell = None;
+                return true;
+            };
+            let view = TaskMap(r.clone());
+            if view.load(layout::TASK_BELL) as u32 == seq {
+                return false;
+            }
+            view.store(layout::TASK_WAITS, 0);
+            self.bell = None;
+            return true;
+        }
         let Some(token) = self.waiting else {
             return true;
         };
@@ -442,10 +493,10 @@ impl RingTaskModel {
                 return true;
             }
             ring.release(&view);
-            if ring.mode == Mode::Protect && ring.engine_waits(&view) {
-                // The engine sleeps on its port: one call wakes it, answered at once.
-                self.wait(layout::WAKE, 0);
-                return true;
+            // The engine's bell: a wake only when it sleeps on it. A task that waits on port
+            // 0 rings it too; the engine answers its waits there.
+            if ring.ring(&view) {
+                self.engine_wakes += 1;
             }
         }
     }

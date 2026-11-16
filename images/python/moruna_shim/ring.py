@@ -2,12 +2,14 @@
 
 The layout and the protocol are the engine's (kernel/plane/core/src/ring.rs); this is the same
 task half, in Python. Words are little-endian u64s at fixed byte offsets of the rings object.
+Each side sleeps on its bell, a 32-bit futex word the other side raises after each post and
+wakes only when the sleeper said it waits.
 """
 
 import struct
 
 MAGIC_VALUE = int.from_bytes(b"MORUNARG", "little")
-VERSION_VALUE = 1
+VERSION_VALUE = 2
 
 MAGIC = 0
 VERSION = 8
@@ -30,6 +32,8 @@ ENGINE_WAITS = 512
 TASK_WAITS = 576
 CLOSED = 640
 ATTACHED = 704
+TASK_BELL = 768
+ENGINE_BELL = 832
 
 ENTRIES_AT = 4096
 IN_ENTRY = 32
@@ -39,10 +43,6 @@ PAGE = 4096
 CAP_MAX = 1 << 16
 WINDOWS_MAX = 1 << 12
 
-WAIT_PORT = 0
-WAIT_INPUT = ord("I")
-WAIT_WINDOW = ord("W")
-WAKE = ord("N")
 
 PROTECT = 1
 UNMAP = 2
@@ -135,6 +135,7 @@ class Task:
         self.in_next = self.in_tail
         self.out_head = w.load(OUT_HEAD)
         self.free_tail = w.load(FREE_TAIL)
+        self.engine_bell = w.load(ENGINE_BELL) & 0xFFFFFFFF
         self.words = w
         w.store(ATTACHED, VERSION_VALUE)
 
@@ -200,8 +201,33 @@ class Task:
         w.store(OUT_HEAD, self.out_head)
         return True
 
-    def engine_waits(self):
-        return self.words.load(ENGINE_WAITS) != 0
+    def ring(self, wake):
+        """Raises the engine's bell after a post, and calls `wake` on it (clearing the word:
+        one wake a sleep) if the engine said it sleeps. Whether it woke the engine."""
+        w = self.words
+        self.engine_bell = (self.engine_bell + 1) & 0xFFFFFFFF
+        w.store(ENGINE_BELL, self.engine_bell)
+        if w.load(ENGINE_WAITS) == 0:
+            return False
+        w.store(ENGINE_WAITS, 0)
+        wake(ENGINE_BELL)
+        return True
 
-    def set_waiting(self, waiting):
-        self.words.store(TASK_WAITS, 1 if waiting else 0)
+    def has_input(self):
+        w = self.words
+        return w.load(IN_HEAD) != self.in_next or w.load(CLOSED) != 0
+
+    def has_window(self):
+        return self.words.load(FREE_HEAD) != self.free_tail
+
+    def sleep(self, ready, wait):
+        """Says it waits, reads its bell, and calls `wait(at, value)` on it only if `ready()`
+        still says no; the engine raises the bell and wakes it when it posts."""
+        w = self.words
+        w.store(TASK_WAITS, 1)
+        seq = w.load(TASK_BELL) & 0xFFFFFFFF
+        try:
+            if not ready():
+                wait(TASK_BELL, seq)
+        finally:
+            w.store(TASK_WAITS, 0)

@@ -10,9 +10,14 @@
 //! - slot 1 holds the task's **rings object** ([`crate::ring`]), which it maps writable once:
 //!   the rings, and the windows it writes its records into. It posts a record on the output
 //!   ring, with no call;
-//! - the port carries the task's waits: a task whose ring is empty calls port 0, and the
-//!   engine answers when it posts. The kernel's futex is keyed by process, so a shared page
-//!   cannot carry the wake.
+//! - each side sleeps only when it has nothing to do, on its **bell** in the rings object: a
+//!   futex word the other side raises after each post and wakes only when the sleeper said
+//!   it waits. The kernel keys a futex on a shared memory object by the object and the offset
+//!   (stream B1), so the wake reaches the other process. The engine sleeps on its bell when it
+//!   serves one ring task in protect mode, as an image stage does; otherwise it waits on the
+//!   tasks' slots and ports, looking at the rings every [`SLICE_NS`] while a record is owed. A
+//!   task's waits on port 0, as the first version of the protocol made them, are still
+//!   answered.
 //!
 //! **The record check stays safe (DP1).** The engine checks a record only on bytes the task
 //! can no longer write. In [`Mode::Protect`] the engine takes write access to every window
@@ -83,6 +88,10 @@ pub trait RingCalls: Calls {
         ranges: &[[u64; 2]],
         writable: bool,
     ) -> Result<(), Error>;
+    /// The kernel's clock, in nanoseconds: what a wait's deadline is on.
+    fn now(&mut self) -> u64 {
+        0
+    }
 }
 
 /// The cookie slot 0's push of a region carries; a batch's cookie is its id, from 1.
@@ -91,6 +100,10 @@ const REGION_COOKIE: u64 = u64::MAX;
 pub const SPINS: u32 = 4096;
 /// A wait request: the byte saying what for, padding, the head the task saw.
 const WAIT_LEN: usize = 16;
+/// How long the engine waits on its tasks' slots and ports at a time while a task of several
+/// in protect mode owes it a record: that task rings the engine's bell, which only a sleep on
+/// one bell hears.
+pub const SLICE_NS: u64 = 1_000_000;
 
 /// Where a ring task's input region comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +144,8 @@ pub struct Counters {
     pub waits: u64,
     /// Times the engine slept on its tasks.
     pub sleeps: u64,
+    /// Wakes the engine called on a task's bell (only when the task said it waits).
+    pub bells: u64,
 }
 
 /// A window of the current rings object.
@@ -655,6 +670,9 @@ impl<C: RingCalls> RingPlane<C> {
             return Err(PlaneError::Full);
         }
         t.inflight.push_back((batch.0, entry));
+        if t.engine.ring(&*view) {
+            self.counters.bells += 1;
+        }
         if let Some(b) = self.plane.batches.get_mut(&batch.0) {
             b.shares += 1;
         }
@@ -729,15 +747,22 @@ impl<C: RingCalls> RingPlane<C> {
             t.windows[*w as usize] = Win::Fresh;
         }
         let mut broke = None;
+        let mut gave = false;
         for w in ready {
             match t.engine.give(&*view, w) {
-                Ok(true) => t.windows[w as usize] = Win::Given,
+                Ok(true) => {
+                    t.windows[w as usize] = Win::Given;
+                    gave = true;
+                }
                 Ok(false) => break,
                 Err(b) => {
                     broke = Some(b);
                     break;
                 }
             }
+        }
+        if gave && t.engine.ring(&*view) {
+            self.counters.bells += 1;
         }
         if let Some(b) = broke {
             return self.refuse(id, bad(b));
@@ -1214,6 +1239,22 @@ impl<C: RingCalls> RingPlane<C> {
         Ok(())
     }
 
+    /// The one ring task the engine can sleep on the bell of: the plane's only task, in
+    /// protect mode, with its rings object mapped.
+    fn bell_sleeper(&self) -> Option<(u32, u64)> {
+        if !self.plane.tasks.is_empty() || self.tasks.len() != 1 {
+            return None;
+        }
+        let (id, t) = self.tasks.iter().next()?;
+        let able = t.mode == Mode::Protect
+            && !t.handed
+            && !t.refused
+            && !t.input_done
+            && !t.output_done
+            && !t.port_done;
+        able.then_some((*id, t.rings))
+    }
+
     /// Whether any ring task has something for the engine, read from the rings alone.
     fn ready(&self) -> bool {
         self.tasks.values().any(|t| {
@@ -1227,26 +1268,6 @@ impl<C: RingCalls> RingPlane<C> {
             let mut e = t.engine.clone();
             matches!(e.posted(v), Ok(n) if n > 0) || matches!(e.released(v), Ok(n) if n > 0)
         })
-    }
-
-    fn set_waiting(&mut self, waiting: bool) -> bool {
-        let mut any = false;
-        let keys: Vec<(u32, u64)> = self.tasks.iter().map(|(i, t)| (*i, t.rings)).collect();
-        for (id, key) in keys {
-            let Some(view) = self.rings_view(key) else {
-                continue;
-            };
-            if let Some(t) = self.tasks.get_mut(&id)
-                && !t.handed
-                && !t.refused
-            {
-                let mut e = t.engine.clone();
-                if let Ok(n) = e.set_waiting(&*view, waiting) {
-                    any |= n > 0;
-                }
-            }
-        }
-        any
     }
 }
 
@@ -1306,6 +1327,9 @@ impl<C: RingCalls> DataPlane for RingPlane<C> {
             .get_mut(&task.0)
             .ok_or(PlaneError::Unknown("task"))?;
         t.engine.close(&*view);
+        if t.engine.ring(&*view) {
+            self.counters.bells += 1;
+        }
         match self.plane.calls.close(&t.input) {
             Ok(()) | Err(Error::BadState) => {}
             Err(e) => return Err(kernel(e)),
@@ -1353,9 +1377,40 @@ impl<C: RingCalls> DataPlane for RingPlane<C> {
             if ready {
                 continue;
             }
-            if self.set_waiting(true) {
-                self.set_waiting(false);
-                continue;
+            // One ring task in protect mode and nothing else, as an image stage has: the
+            // engine sleeps on its bell, which the task raises after each record it posts.
+            // Its slots and its port are read at the deadline. A poll (a deadline of zero)
+            // never sleeps, so it looks at the slots as below.
+            if let Some((id, key)) = self.bell_sleeper().filter(|_| deadline != 0) {
+                let Some(view) = self.rings_view(key) else {
+                    return Ok(None);
+                };
+                let slept = match self.tasks.get_mut(&id) {
+                    Some(t) => t.engine.sleep(&*view),
+                    None => continue,
+                };
+                let seq = match slept {
+                    Ok(Some(seq)) => seq,
+                    Ok(None) => continue,
+                    Err(b) => {
+                        self.refuse(id, bad(b))?;
+                        continue;
+                    }
+                };
+                self.counters.sleeps += 1;
+                let woke = view.wait(layout::ENGINE_BELL, seq, deadline);
+                if let Some(t) = self.tasks.get(&id) {
+                    t.engine.awake(&*view);
+                }
+                if woke {
+                    continue;
+                }
+                // The deadline: a last look at everything, the slots and the port too.
+                self.signaled = true;
+                self.settle_ring();
+                self.pump(id)?;
+                self.signaled = false;
+                return Ok(self.plane.events.pop_front());
             }
             let mut slots = Vec::new();
             let mut channels = Vec::new();
@@ -1379,14 +1434,24 @@ impl<C: RingCalls> DataPlane for RingPlane<C> {
             if slots.is_empty() && channels.is_empty() {
                 return Ok(None);
             }
+            // A ring task in protect mode that owes a record wakes the engine on its bell,
+            // which this wait cannot hear: the engine looks at the rings every slice.
+            let owed = self
+                .tasks
+                .values()
+                .any(|t| t.mode == Mode::Protect && !t.refused && !t.inflight.is_empty());
+            let until = if owed && deadline != 0 {
+                deadline.min(self.plane.calls.now().saturating_add(SLICE_NS))
+            } else {
+                deadline
+            };
             self.counters.sleeps += 1;
-            let woke = self.plane.calls.wait(&slots, &channels, deadline);
-            self.set_waiting(false);
+            let woke = self.plane.calls.wait(&slots, &channels, until);
             let woke = woke.map_err(kernel)?;
             self.signaled = woke == Ready::Some;
             if woke == Ready::TimedOut {
                 // A last look: a post the task made as the engine went to sleep.
-                if self.ready() {
+                if self.ready() || until < deadline {
                     continue;
                 }
                 return Ok(None);

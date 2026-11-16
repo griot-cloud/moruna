@@ -1240,6 +1240,7 @@ impl Kernel for ImageTask {
                             generations = c.generations,
                             waits = c.waits,
                             sleeps = c.sleeps,
+                            bells = c.bells,
                             zeroed = st.plane.plane.zeroed(),
                             "image task exited 0"
                         );

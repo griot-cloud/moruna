@@ -32,6 +32,11 @@ pub struct Measure {
 
 const MIB: u64 = 1 << 20;
 
+/// Calls the engine made into the model's kernel: the plane's calls and its futex calls.
+fn calls(p: &Plane) -> u64 {
+    p.plane.calls.calls + p.plane.calls.futex.get()
+}
+
 fn plane(protect: bool) -> Plane {
     let mut p = RingPlane::new(model(protect), 64 * MIB);
     p.spins = 1;
@@ -186,6 +191,7 @@ pub fn run_all(f: &Fixtures) -> Results {
     r.push(("c4_zeroed_before_seen", zeroed(f)));
     r.push(("c6_restart_fresh", restart(f)));
     r.push(("dp_i1_unmap_one_window", one_window(f)));
+    r.push(("bells_wake_both_sides", bells(f)));
     r
 }
 
@@ -216,7 +222,7 @@ pub fn lockstep(f: &Fixtures, protect: bool, n: u64) -> Result<Measure, String> 
     )?;
     let region = p.region_of(task).ok_or("no region")?;
     drive(&mut p, &mut [&mut t])?;
-    let calls0 = p.plane.calls.calls;
+    let calls0 = calls(&p);
     let waits0 = t.waits;
     for i in 0..n {
         let b = load(&mut p, region, f)?;
@@ -257,7 +263,7 @@ pub fn lockstep(f: &Fixtures, protect: bool, n: u64) -> Result<Measure, String> 
     let c = p.counters();
     let m = Measure {
         batches: n,
-        calls: p.plane.calls.calls - calls0,
+        calls: calls(&p) - calls0,
         waits: t.waits - waits0,
         revokes: c.revokes + c.regrants,
         generations: c.generations,
@@ -297,7 +303,7 @@ pub fn pipelined(f: &Fixtures, protect: bool, n: u64) -> Result<Measure, String>
     let (task, mut t) = open(&mut p, shape(n), Behave::Echo)?;
     let region = p.region_of(task).ok_or("no region")?;
     drive(&mut p, &mut [&mut t])?;
-    let calls0 = p.plane.calls.calls;
+    let calls0 = calls(&p);
     let waits0 = t.waits;
     for _ in 0..n {
         let b = load(&mut p, region, f)?;
@@ -307,7 +313,7 @@ pub fn pipelined(f: &Fixtures, protect: bool, n: u64) -> Result<Measure, String>
     let events = drive(&mut p, &mut [&mut t])?;
     let put = puts(&events);
     same(put.len() as u64, n, "every record")?;
-    let calls = p.plane.calls.calls - calls0;
+    let calls = calls(&p) - calls0;
     for (_, b, _) in &put {
         same(bytes_of(&p, *b)?, f.good.clone(), "the record")?;
         p.drop_batch(*b).map_err(|e| format!("drop: {e:?}"))?;
@@ -592,7 +598,8 @@ fn refusals(f: &Fixtures, protect: bool) -> Result<(), String> {
 /// task with nothing to do waits on port 0 and is answered by the next post or the end.
 fn ports_and_waits(f: &Fixtures) -> Result<(), String> {
     let mut p = plane(true);
-    let (task, mut t) = open(&mut p, shape(2), Behave::Echo)?;
+    let (task, t) = open(&mut p, shape(2), Behave::Echo)?;
+    let mut t = t.with_port_waits();
     let region = p.region_of(task).ok_or("no region")?;
     drive(&mut p, &mut [&mut t])?;
     same(t.waits, 1, "an empty ring: one wait")?;
@@ -634,6 +641,69 @@ fn ports_and_waits(f: &Fixtures) -> Result<(), String> {
     p.finish(task, 0).map_err(|e| format!("{e:?}"))?;
     drive(&mut p, &mut [&mut t])?;
     same(t.ended, Some(Ending::Exited), "the end answered its wait")?;
+    Ok(())
+}
+
+/// The futex bells: a task with nothing to do sleeps on its bell, the engine's post raises it
+/// and wakes the task once (only because it said it waits), and the task's record raises the
+/// engine's bell and wakes the engine, which slept on it. No port call carries a wait.
+fn bells(f: &Fixtures) -> Result<(), String> {
+    let mut p = plane(true);
+    let (task, mut t) = open(&mut p, shape(2), Behave::Echo)?;
+    let region = p.region_of(task).ok_or("no region")?;
+    drive(&mut p, &mut [&mut t])?;
+    same(t.waits, 1, "an empty ring: the task sleeps on its bell")?;
+    let b = load(&mut p, region, f)?;
+    p.offer(task, 0, b).map_err(|e| format!("{e:?}"))?;
+    same(p.counters().bells, 1, "the post woke the sleeping task")?;
+    // The engine sleeps on its bell before the task runs (a deadline it reaches, in the
+    // model, which cannot sleep); asleep, its waits word is up, and the task's record wakes
+    // it with one call.
+    let slept = p.counters().sleeps;
+    same(
+        p.next(1).map_err(|e| format!("{e:?}"))?,
+        None,
+        "nothing yet",
+    )?;
+    same(
+        p.counters().sleeps,
+        slept + 1,
+        "the engine slept on its bell",
+    )?;
+    let rings = t
+        .output
+        .borrow()
+        .current
+        .as_ref()
+        .map(|(m, ..)| m.clone())
+        .ok_or("rings")?;
+    crate::model_ring::ModelMap::from_mem(&rings).store(layout::ENGINE_WAITS, 1);
+    t.step();
+    same(t.engine_wakes, 1, "the record woke the sleeping engine")?;
+    same(
+        crate::model_ring::ModelMap::from_mem(&rings).load(layout::ENGINE_WAITS),
+        0,
+        "one wake a sleep: the task cleared the word",
+    )?;
+    let events = drive(&mut p, &mut [&mut t])?;
+    same(puts(&events).len(), 1, "the record")?;
+    same(p.counters().waits, 0, "no wait went on port 0")?;
+    // A post while the task runs rings without a wake.
+    let before = p.counters().bells;
+    t.step();
+    let b2 = load(&mut p, region, f)?;
+    p.offer(task, 0, b2).map_err(|e| format!("{e:?}"))?;
+    let woke = p.counters().bells - before;
+    if woke > 1 {
+        return Err(format!("{woke} wakes for one post"));
+    }
+    p.finish(task, 0).map_err(|e| format!("{e:?}"))?;
+    drive(&mut p, &mut [&mut t])?;
+    same(
+        t.ended,
+        Some(Ending::Exited),
+        "the close rang the bell and the task ended",
+    )?;
     Ok(())
 }
 

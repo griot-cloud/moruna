@@ -1,10 +1,11 @@
 """The task's plane in ring mode, through the Moruna kernel's own calls.
 
 A task holds no handle: its slots are numbers. Slot 0 maps its input region read only and
-slot 1 its rings object writable, once each (`batch_get`). It waits on port 0 only when it
-has nothing to do (`port_call`), and in unmap mode hands the rings object back once a group
-is posted (`batch_put`). The native calls go through libc's `syscall`, which the personality
-never sees: the kernel answers a native number itself.
+slot 1 its rings object writable, once each (`batch_get`). It sleeps on its bell only when it
+has nothing to do (`futex_wait`, which the kernel keys by the shared object, so the engine's
+wake reaches it), wakes the engine the same way when the engine sleeps, and in unmap mode
+hands the rings object back once a group is posted (`batch_put`). The native calls go through
+libc's `syscall`, which the personality never sees: the kernel answers a native number itself.
 """
 
 import ctypes
@@ -15,11 +16,19 @@ import pyarrow as pa
 from . import record, ring
 
 BASE = 0x1_0000
+FUTEX_WAIT = BASE + 38
+FUTEX_WAKE = BASE + 39
 BATCH_GET = BASE + 0x100
 BATCH_PUT = BASE + 0x101
-PORT_CALL = BASE + 0x102
 PLANE_PROBE = BASE + 0x10F
 PROBE_COPIED = 1
+SHOULD_WAIT = 6
+TIMED_OUT = 8
+
+# A sleep on the bell has no deadline: the kernel keys the bell by the shared object, so the
+# engine's wake reaches it, and takes the futex queue's lock before it reads the bell, which
+# orders this task's "I wait" before the read.
+FOREVER = (1 << 64) - 1
 
 # Reads of the input ring before a wait: a batch the engine posts within them costs no call.
 SPINS = int(os.environ.get("MORUNA_SHIM_SPINS", "20000"))
@@ -52,9 +61,16 @@ class Calls:
     def batch_put(self, slot, addr, length):
         return self._call(BATCH_PUT, slot, addr, length)
 
-    def port_call(self, port, body):
-        buf = ctypes.create_string_buffer(body, len(body))
-        return self._call(PORT_CALL, port, ctypes.addressof(buf), len(body))
+    def futex_wait(self, addr, expected, deadline):
+        """Sleeps while the u32 at `addr` holds `expected`, until a wake or the deadline."""
+        try:
+            self._call(FUTEX_WAIT, addr, expected, deadline)
+        except KernelError as e:
+            if e.errno not in (SHOULD_WAIT, TIMED_OUT):
+                raise
+
+    def futex_wake(self, addr):
+        return self._call(FUTEX_WAKE, addr, 1)
 
     def copied(self):
         """The bytes the kernel copied into or out of this process (a kernel built with
@@ -75,6 +91,7 @@ class Plane:
     def __init__(self, calls=None):
         self.calls = calls or Calls()
         self.waits = 0
+        self.wakes = 0
         self.handed = 0
         region_addr = self.calls.batch_get(0)
         self._attach()
@@ -118,19 +135,18 @@ class Plane:
                 if self.half.mode == ring.UNMAP and self._posted_since_hand_back():
                     self.hand_back()
                     continue
-                self._wait(ring.WAIT_INPUT, self.words.load(ring.IN_HEAD))
+                self._sleep(self.half.has_input)
 
     def _posted_since_hand_back(self):
         return self.half.out_head > 0
 
-    def _wait(self, want, seen):
+    def _sleep(self, ready):
         self.waits += 1
-        self.half.set_waiting(want != ring.WAKE)
-        body = bytes([want]) + bytes(7) + seen.to_bytes(8, "little")
-        try:
-            self.calls.port_call(ring.WAIT_PORT, body)
-        finally:
-            self.half.set_waiting(False)
+
+        def wait(at, value):
+            self.calls.futex_wait(self.rings_addr + at, value, FOREVER)
+
+        self.half.sleep(ready, wait)
 
     def window(self):
         """A window's number and its memory, waiting for one when none is free."""
@@ -142,13 +158,15 @@ class Plane:
             if self.half.mode == ring.UNMAP and self._posted_since_hand_back():
                 self.hand_back()
                 continue
-            self._wait(ring.WAIT_WINDOW, self.words.load(ring.FREE_HEAD))
+            self._sleep(self.half.has_window)
 
     def post(self, w, length, cookie):
-        while not self.half.post(w, 0, length, cookie):
-            self._wait(ring.WAKE, 0)
-        if self.half.mode == ring.PROTECT and self.half.engine_waits():
-            self._wait(ring.WAKE, 0)
+        # A window is posted once, and the output ring holds every window, so it is never
+        # full for a task that keeps the protocol.
+        if not self.half.post(w, 0, length, cookie):
+            raise ring.Bad("the output ring is full")
+        if self.half.ring(lambda at: self.calls.futex_wake(self.rings_addr + at)):
+            self.wakes += 1
 
     def release(self):
         self.half.release()

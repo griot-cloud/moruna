@@ -538,6 +538,37 @@ impl ring::Shared for Shared {
     fn fence(&self) {
         core::sync::atomic::fence(Ordering::SeqCst);
     }
+
+    /// `futex_wait` on the low half of the word: the kernel keys a word of a shared memory
+    /// object by the object and its offset, so the other side's wake meets it.
+    fn wait(&self, at: usize, expected: u32, deadline: u64) -> bool {
+        let Some(word) = self.bell(at) else {
+            return false;
+        };
+        match check(raw::futex_wait(word, expected, deadline)) {
+            Ok(_) | Err(Error::ShouldWait) => true,
+            Err(_) => false,
+        }
+    }
+
+    fn wake(&self, at: usize) {
+        if let Some(word) = self.bell(at) {
+            raw::futex_wake(word, 1);
+        }
+    }
+}
+
+impl Shared {
+    /// The low half of the word at `at`, the futex word of a bell (little endian).
+    fn bell(&self, at: usize) -> Option<&core::sync::atomic::AtomicU32> {
+        if !at.is_multiple_of(8) {
+            return None;
+        }
+        let addr = self.range(at as u64, 4).ok()?;
+        // SAFETY: an aligned word inside the mapping, which outlives the borrow; both sides
+        // touch it only atomically.
+        Some(unsafe { core::sync::atomic::AtomicU32::from_ptr(addr as *mut u32) })
+    }
 }
 
 /// A task's side of ring mode: its region and its rings object, each mapped once, from
@@ -630,35 +661,26 @@ impl Rings {
                 cookie,
             },
         );
-        if posted && self.half.mode == ring::Mode::Protect && self.half.engine_waits(&self.rings) {
-            let _ = self.call(ring::layout::WAKE, 0);
+        if posted {
+            // The engine's bell: a wake only when it sleeps.
+            self.half.ring(&self.rings);
         }
         posted
     }
 
-    fn call(&mut self, want: u8, seen: u64) -> Result<()> {
-        let mut body = [0u8; 16];
-        body[0] = want;
-        body[8..].copy_from_slice(&seen.to_le_bytes());
-        self.half
-            .set_waiting(&self.rings, want != ring::layout::WAKE);
-        let (rax, _) = raw::port_call(ring::layout::WAIT_PORT, &body);
-        self.half.set_waiting(&self.rings, false);
-        check(rax).map(|_| ())
+    /// Sleeps on the task's bell until the next batch or the end (the input ring is empty).
+    /// No deadline: the engine's wake reaches the bell of the shared object.
+    pub fn wait_input(&mut self) {
+        self.half.sleep(&self.rings, crate::DEADLINE_INFINITE, |t| {
+            t.has_input(&self.rings)
+        });
     }
 
-    /// Waits for the next batch or the end (the input ring is empty).
-    pub fn wait_input(&mut self) -> Result<()> {
-        use ring::Shared as _;
-        let seen = self.rings.load(ring::layout::IN_HEAD);
-        self.call(ring::layout::WAIT_INPUT, seen)
-    }
-
-    /// Waits for a window (none is free).
-    pub fn wait_window(&mut self) -> Result<()> {
-        use ring::Shared as _;
-        let seen = self.rings.load(ring::layout::FREE_HEAD);
-        self.call(ring::layout::WAIT_WINDOW, seen)
+    /// Sleeps on the task's bell until the engine gives a window (none is free).
+    pub fn wait_window(&mut self) {
+        self.half.sleep(&self.rings, crate::DEADLINE_INFINITE, |t| {
+            t.has_window(&self.rings)
+        });
     }
 
     /// Unmap mode: hands the rings object back with the records posted on it, which leaves

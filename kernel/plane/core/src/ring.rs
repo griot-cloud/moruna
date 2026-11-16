@@ -8,6 +8,11 @@
 //! - its **rings object**, writable, on slot 1: a control page, the entries of three rings,
 //!   and the output windows the task writes its records into.
 //!
+//! Each side sleeps only when it has nothing to do, on a futex word of the rings object: its
+//! **bell**, which the other side raises after each post and wakes only when the sleeper has
+//! said it waits. The kernel keys a futex on a shared memory object by the object and the
+//! offset, so the wake meets the waiter in the other process.
+//!
 //! The three rings are single producer, single consumer, with indices that only grow:
 //!
 //! - **input** (the engine posts a batch, the task releases it);
@@ -27,7 +32,7 @@ pub mod layout {
     /// "MORUNARG" as a little-endian `u64`.
     pub const MAGIC_VALUE: u64 = u64::from_le_bytes(*b"MORUNARG");
     /// The protocol's version.
-    pub const VERSION_VALUE: u64 = 1;
+    pub const VERSION_VALUE: u64 = 2;
 
     pub const MAGIC: usize = 0;
     pub const VERSION: usize = 8;
@@ -66,6 +71,11 @@ pub mod layout {
     pub const CLOSED: usize = 640;
     /// The protocol version the task attached with.
     pub const ATTACHED: usize = 704;
+    /// The task's bell: a 32-bit futex word (the low half of this word) the engine raises
+    /// after it posts, gives a window or closes, and wakes when the task waits on it.
+    pub const TASK_BELL: usize = 768;
+    /// The engine's bell: raised by the task after each record it posts.
+    pub const ENGINE_BELL: usize = 832;
 
     /// The entries start on the second page.
     pub const ENTRIES_AT: usize = 4096;
@@ -128,6 +138,18 @@ pub trait Shared {
     fn store(&self, at: usize, value: u64);
     /// A full fence: stores before it are seen before loads after it.
     fn fence(&self);
+    /// Sleeps while the 32-bit word at `at` holds `expected`, until a wake on it or
+    /// `deadline` (the kernel's clock; `u64::MAX` for none): a futex on the shared object,
+    /// which the other side's wake meets from its own process. Whether it returned before
+    /// the deadline. Without a futex it returns `false` at once.
+    fn wait(&self, at: usize, expected: u32, deadline: u64) -> bool {
+        let _ = (at, expected, deadline);
+        false
+    }
+    /// Wakes the other side's waiter on the word at `at`.
+    fn wake(&self, at: usize) {
+        let _ = at;
+    }
 }
 
 /// The sizes of a task's rings and windows.
@@ -289,6 +311,8 @@ pub struct Engine {
     free_head: u64,
     free_tail: u64,
     closed: bool,
+    /// The task's bell as the engine last raised it.
+    task_bell: u32,
 }
 
 impl Engine {
@@ -305,6 +329,8 @@ impl Engine {
             TASK_WAITS,
             CLOSED,
             ATTACHED,
+            TASK_BELL,
+            ENGINE_BELL,
         ] {
             s.store(at, 0);
         }
@@ -318,6 +344,7 @@ impl Engine {
             free_head: 0,
             free_tail: 0,
             closed: false,
+            task_bell: 0,
         }
     }
 
@@ -344,6 +371,8 @@ impl Engine {
         next.in_head = self.in_head;
         next.in_tail = self.in_tail;
         next.closed = self.closed;
+        next.task_bell = self.task_bell;
+        to.store(TASK_BELL, u64::from(self.task_bell));
         to.store(IN_TAIL, self.in_tail);
         to.store(CLOSED, u64::from(self.closed));
         to.store(IN_HEAD, self.in_head);
@@ -461,16 +490,43 @@ impl Engine {
         Ok(Some(e))
     }
 
-    /// Says whether the engine is about to sleep; going to sleep, it reads the ring again
-    /// after the fence, so a post the task made before seeing the word is not missed.
-    pub fn set_waiting(&mut self, s: &impl Shared, waiting: bool) -> Result<u64, Bad> {
-        s.store(ENGINE_WAITS, u64::from(waiting));
-        s.fence();
-        self.posted(s)
-    }
-
     pub fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// Raises the task's bell after a post, a window given or the close, and wakes the task
+    /// if it said it waits: whether it called the wake. One wake a sleep: the engine clears
+    /// the word, which the task sets again the next time it sleeps. The engine never reads
+    /// the bell back, which the task could have written.
+    pub fn ring(&mut self, s: &impl Shared) -> bool {
+        self.task_bell = self.task_bell.wrapping_add(1);
+        s.store(TASK_BELL, u64::from(self.task_bell));
+        s.fence();
+        if s.load(TASK_WAITS) == 0 {
+            return false;
+        }
+        s.store(TASK_WAITS, 0);
+        s.wake(TASK_BELL);
+        true
+    }
+
+    /// Going to sleep on the engine's bell: says so, then reads the bell and the output ring
+    /// again after the fence. The bell's value to wait on, or `None` when an output came
+    /// meanwhile.
+    pub fn sleep(&mut self, s: &impl Shared) -> Result<Option<u32>, Bad> {
+        s.store(ENGINE_WAITS, 1);
+        s.fence();
+        let seq = s.load(ENGINE_BELL) as u32;
+        if self.posted(s)? > 0 {
+            s.store(ENGINE_WAITS, 0);
+            return Ok(None);
+        }
+        Ok(Some(seq))
+    }
+
+    /// Awake again.
+    pub fn awake(&self, s: &impl Shared) {
+        s.store(ENGINE_WAITS, 0);
     }
 
     /// The input entries not yet released, oldest first, as (index, entry).
@@ -489,6 +545,8 @@ pub struct Task {
     in_next: u64,
     out_head: u64,
     free_tail: u64,
+    /// The engine's bell as the task last raised it.
+    engine_bell: u32,
 }
 
 impl Task {
@@ -503,6 +561,7 @@ impl Task {
             in_next: s.load(IN_TAIL),
             out_head: s.load(OUT_HEAD),
             free_tail: s.load(FREE_TAIL),
+            engine_bell: s.load(ENGINE_BELL) as u32,
         };
         s.store(ATTACHED, VERSION_VALUE);
         Ok(t)
@@ -598,21 +657,44 @@ impl Task {
         true
     }
 
-    /// Whether the engine sleeps waiting for an output, read after a fence so the post just
-    /// made is ordered before it.
-    pub fn engine_waits(&self, s: &impl Shared) -> bool {
-        s.fence();
-        s.load(ENGINE_WAITS) != 0
-    }
-
-    /// Says whether the task is about to sleep.
-    pub fn set_waiting(&self, s: &impl Shared, waiting: bool) {
-        s.store(TASK_WAITS, u64::from(waiting));
-        s.fence();
-    }
-
     /// Records posted on this rings object.
     pub fn posted(&self) -> u64 {
         self.out_head
+    }
+
+    /// Raises the engine's bell after a post, and wakes the engine if it said it waits:
+    /// whether it called the wake.
+    pub fn ring(&mut self, s: &impl Shared) -> bool {
+        self.engine_bell = self.engine_bell.wrapping_add(1);
+        s.store(ENGINE_BELL, u64::from(self.engine_bell));
+        s.fence();
+        if s.load(ENGINE_WAITS) == 0 {
+            return false;
+        }
+        s.store(ENGINE_WAITS, 0);
+        s.wake(ENGINE_BELL);
+        true
+    }
+
+    /// Whether an input, or the end, is there for the task.
+    pub fn has_input(&self, s: &impl Shared) -> bool {
+        s.load(IN_HEAD) != self.in_next || s.load(CLOSED) != 0
+    }
+
+    /// Whether a window is there for the task.
+    pub fn has_window(&self, s: &impl Shared) -> bool {
+        s.load(FREE_HEAD) != self.free_tail
+    }
+
+    /// Sleeps on the task's bell until the engine posts, gives a window or closes, or the
+    /// deadline: says it waits, reads the bell, and sleeps only if `ready` still says no.
+    /// Whether it returned before the deadline.
+    pub fn sleep(&self, s: &impl Shared, deadline: u64, ready: impl Fn(&Task) -> bool) -> bool {
+        s.store(TASK_WAITS, 1);
+        s.fence();
+        let seq = s.load(TASK_BELL) as u32;
+        let woke = ready(self) || s.wait(TASK_BELL, seq, deadline);
+        s.store(TASK_WAITS, 0);
+        woke
     }
 }
