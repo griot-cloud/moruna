@@ -146,6 +146,10 @@ impl Calls for Kernel {
     }
 }
 
+/// Whether the kernel takes write access back through a slot (`windows_protect`'s slot form),
+/// so ring tasks run in protect mode.
+pub const SLOT_REVOKE: bool = false;
+
 /// The engine's mapping of a region or a rings object.
 #[derive(Debug)]
 pub struct Mapped(moruna_sys::plane::Shared);
@@ -197,22 +201,22 @@ impl RingCalls for Kernel {
             .map(Memory)
     }
 
-    /// `windows_protect` on the task that maps the slot's object, its ranges offsets in
-    /// that object: stream P's proposal to the integrator, since the engine holds no handle
-    /// to a task's process. Until the kernel takes it, the call is refused and ring mode
-    /// uses the unmap path.
+    /// `windows_protect` through the task's output slot (ABI 2.6, the slot form): the ranges
+    /// are offsets within the area the slot is mapped at in the task, which for a rings object
+    /// pushed from its start are its offsets in the object.
     fn protect(&mut self, slot: &Slot, ranges: &[[u64; 2]], writable: bool) -> Result<(), Error> {
         let flags = if writable {
             map::READ | map::WRITE
         } else {
             map::READ
         };
-        Error::from_raw(moruna_sys::raw::windows_protect(
-            slot.0.raw(),
-            ranges,
-            flags,
-        ))
-        .map(|_| ())
+        moruna_sys::datapath::windows_protect_slot(slot, ranges, flags)
+    }
+
+    /// Off until stream A's kernel takes the slot form: the integrator says when. Until then
+    /// a task hands its rings object back with `batch_put`, today's unmap path.
+    fn revokes(&mut self, _slot: &Slot) -> bool {
+        SLOT_REVOKE
     }
 
     fn now(&mut self) -> u64 {

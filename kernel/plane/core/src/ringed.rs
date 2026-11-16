@@ -92,6 +92,12 @@ pub trait RingCalls: Calls {
     fn now(&mut self) -> u64 {
         0
     }
+    /// Whether the kernel takes write access back through `slot`, so the engine revokes a
+    /// task's posted windows itself (protect mode). By default, whether an empty call is
+    /// taken.
+    fn revokes(&mut self, slot: &Self::Slot) -> bool {
+        self.protect(slot, &[], false).is_ok()
+    }
 }
 
 /// The cookie slot 0's push of a region carries; a batch's cookie is its id, from 1.
@@ -474,9 +480,10 @@ impl<C: RingCalls> RingPlane<C> {
         };
         // Write access is taken back by the engine where the kernel can, and by the task's
         // own put where it cannot yet.
-        let mode = match self.plane.calls.protect(&output, &[], false) {
-            Ok(()) => Mode::Protect,
-            Err(_) => Mode::Unmap,
+        let mode = if self.plane.calls.revokes(&output) {
+            Mode::Protect
+        } else {
+            Mode::Unmap
         };
         let (rings_object, view, _) = self.object_for(id, object_bytes)?;
         let engine = Engine::format(&view, probe, mode, 0);
