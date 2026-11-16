@@ -95,14 +95,41 @@ changed with them. Beyond that, and the pruning above:
 | `core/src/device/registry/block.rs` | No virtio or NVMe request threads. |
 | `core/src/device/tty/device.rs` | No virtual terminals or hypervisor console; the console is `ttyS0`. |
 | `core/src/process/signal/poll.rs` | A polling task is marked by its address's complement: user addresses are positive. |
+| `core/src/syscall/mod.rs`, `syscall/clone.rs` | Every call passes `syscall/refused.rs` first; a call the table lacks is counted; `clone` with a new namespace is refused. |
+| `core/src/process/exit.rs`, `core/src/init.rs` | A process's refused calls are reported when it ends, the task's when the personality ends. |
 | `core/src/process/posix_thread/mod.rs` | Waking a thread for a signal also interrupts its task (`Task::interrupt`): a thread running the program comes back only when the core interrupts it. |
 | `core/src/fs/file/file_handle.rs`, `syscall/{mod.rs,arch/x86.rs}` | No socket hooks; the socket calls answer from `syscall/no_socket.rs`. |
 | `core/src/vm/vmar/vmar_impls/fork.rs` | Its device-memory test is ignored: there is no device memory. |
 | `core/src/lib.rs` | The module list, three unused features and `getset`, and the clocks every host test needs (`ostd::ktest_setup!`). |
 | 9 files | Items only the left-out parts used are marked `expect(dead_code)` with that reason. |
 
-New in `core/`: `net/mod.rs` (the UTS namespace only), `vdso.rs` (none mapped) and
-`syscall/no_socket.rs`.
+New in `core/`: `net/mod.rs` (the UTS namespace only), `vdso.rs` (none mapped),
+`syscall/no_socket.rs` and `syscall/refused.rs`.
+
+## Refused calls
+
+The data OS takes Talos's posture (`architecture/data-os.md` §3a): no shell, and the layer
+keeps what a job's programs need (processes, threads, files, pipes, signals, epoll, `fork`
+and `execve`) and refuses administrative calls. `syscall/refused.rs` holds the list:
+
+- **`EPERM`, before the handler runs**, as Linux answers a process without the privilege:
+  - mounts: `mount`, `umount2`, and the new mount API (`open_tree`, `move_mount`, `fsopen`,
+    `fsconfig`, `fsmount`, `fspick`, `mount_setattr`);
+  - `pivot_root`, `chroot`;
+  - namespaces: `unshare`, `setns`, and `clone` or `clone3` with a `CLONE_NEW*` flag;
+  - `ptrace`, and the calls that need its permission: `process_vm_readv`,
+    `process_vm_writev`, `pidfd_getfd`;
+  - modules: `init_module`, `finit_module`, `delete_module`;
+  - `kexec_load`, `kexec_file_load`, `reboot`, `swapon`, `swapoff`;
+  - time: `settimeofday`, `clock_settime`, `adjtimex`, `clock_adjtime`.
+- **`ENOSYS`:** every number the table does not have.
+- **The socket calls** answer from `syscall/no_socket.rs`.
+
+Each refusal is counted by number for the process that made it, as `kernel/linux` counts
+its refusals: `linux: process PID refused: mount(165) x1, ...` when the process ends (if it
+had any), and `linux: the task refused: ...` when the personality ends. The refused
+handlers' carried code stays in the tree, unreachable: removing it would leave parts of
+`fs/` unused.
 
 ## Launching the personality
 

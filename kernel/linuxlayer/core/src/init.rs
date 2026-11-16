@@ -105,6 +105,7 @@ fn bsp_idle_loop() {
     }
 
     // User space: the personality's work ends with its init process.
+    crate::syscall::refused::report_task();
     let code = init_process.status().exit_code();
     ostd::info!("The init process terminates with code {:?}", code);
     ostd::power::poweroff(if code == 0 {

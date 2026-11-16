@@ -24,6 +24,12 @@ pub(super) fn sys_clone(
 ) -> Result<SyscallReturn> {
     let args = CloneArgs::for_clone(clone_flags, parent_tidptr, child_tidptr, tls, new_sp)?;
     debug!("clone args = {:x?}", args);
+    // User space: no new namespace (`refused.rs`).
+    super::refused::screen_clone(
+        ctx.process.pid(),
+        super::refused::CLONE,
+        args.flags.intersects(CloneFlags::CLONE_NS_FLAGS),
+    )?;
 
     let child_pid = clone_child(ctx, parent_context, args)?;
     Ok(SyscallReturn::Return(child_pid as _))
@@ -49,6 +55,12 @@ pub(super) fn sys_clone3(
         CloneArgs::try_from(args)?
     };
     debug!("clone args = {:x?}", clone_args);
+    // User space: no new namespace (`refused.rs`).
+    super::refused::screen_clone(
+        ctx.process.pid(),
+        super::refused::CLONE3,
+        clone_args.flags.intersects(CloneFlags::CLONE_NS_FLAGS),
+    )?;
 
     let child_pid = clone_child(ctx, parent_context, clone_args)?;
     debug!("child pid = {}", child_pid);
