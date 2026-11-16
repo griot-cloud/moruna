@@ -53,6 +53,8 @@ fn run() -> i64 {
     let linux = Channel(slot("linux"));
     let plane = Channel(slot("plane"));
     let quota = Channel(slot("quota"));
+    // stream A hook: the data path's test starts tasks too (DS-A).
+    let datapath = Channel(slot("datapath"));
     // stream B1 hook
     let personality = Channel(slot("personality"));
     if abi_version() != moruna_sys::ABI_VERSION {
@@ -237,6 +239,16 @@ fn run() -> i64 {
     };
     if let Err((e, _)) = quota.write(b"process", [for_quota]) {
         return fail(&out, "handing the accounts test its process resource", e);
+    }
+    // stream A hook: the data path's test (DS-A) maps POPULATE zero pages into a process it
+    // makes, and revokes a task's windows through its slot, with a process resource of its
+    // own.
+    let for_datapath = match root_process.duplicate(Rights::WRITE | Rights::TRANSFER) {
+        Ok(h) => h,
+        Err(e) => return fail(&out, "duplicating the process resource", e),
+    };
+    if let Err((e, _)) = datapath.write(b"process", [for_datapath]) {
+        return fail(&out, "handing the data path's test its process resource", e);
     }
     // stream B1 hook (data-os-streams.md): the personality's mechanisms' test starts its
     // children, and clones one, with a process resource of its own.

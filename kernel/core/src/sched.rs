@@ -23,6 +23,14 @@
 //! that one move is the whole mechanism: the thread runs there until it is placed again.
 //! Unpinned, a thread is free to run anywhere: the next time it is queued the scheduler
 //! places it as it places a new thread.
+//!
+//! A CPU other than the boot processor that runs one thread, or none, stretches its tick
+//! to [`STRETCH`] timer periods (C5, measured: each tick costs a pinned CPU about 19 us
+//! under KVM): nothing on it needs the tick then, since only the boot processor's tick
+//! serves the deadline queue. A thread queued on a stretched CPU asks it to reschedule
+//! at once, which brings its tick back to every period. Grace periods do not wait for
+//! the tick: a CPU passes a quiescent state each time it goes back to user mode and each
+//! time its idle task wakes (OSTD, `ostd-adaptation/NOTICE.md`).
 
 use alloc::{
     collections::{BTreeMap, VecDeque},
@@ -50,6 +58,11 @@ use crate::process::Thread;
 /// Timer ticks (1 ms each) a task runs before another task waiting on its CPU may
 /// take the CPU from it.
 const SLICE_TICKS: u32 = 10;
+
+/// The timer periods (1 ms each) a CPU waits between ticks while it runs one thread or
+/// none: what bounds a grace period, and a thread's wait for a stretched CPU that is in
+/// user mode with no other way into the kernel.
+const STRETCH: u32 = 100;
 
 /// The most CPUs whose use [`ran_process_thread`] records.
 pub const CPUS_MAX: usize = 64;
@@ -81,6 +94,10 @@ struct RunQueue {
     /// Runnable tasks on this CPU other than its idle task, read without the lock by
     /// [`Cpus::select`].
     load: Arc<AtomicUsize>,
+    /// The boot processor, which never stretches its tick: it serves the deadline queue.
+    boot: bool,
+    /// Whether this CPU's tick is stretched now.
+    stretched: bool,
 }
 
 impl RunQueue {
@@ -99,6 +116,16 @@ impl RunQueue {
         self.load
             .store(self.queue.len() + usize::from(busy), Ordering::Relaxed);
     }
+
+    /// Stretches this CPU's tick while nothing waits on it, and brings it back when
+    /// something does. Called on the CPU itself, with its queue's lock held.
+    fn retick(&mut self) {
+        let stretch = !self.boot && self.current.is_some() && self.queue.is_empty();
+        if stretch != self.stretched {
+            self.stretched = stretch;
+            ostd::timer::set_tick_stretch(if stretch { STRETCH } else { 1 });
+        }
+    }
 }
 
 impl LocalRunQueue for RunQueue {
@@ -113,6 +140,7 @@ impl LocalRunQueue for RunQueue {
             // task only when it yields, once the boot is done.
             UpdateFlags::Tick => {
                 self.ticks = self.ticks.saturating_add(1);
+                self.retick();
                 match &self.current {
                     None => false,
                     Some(c) => waiting && (self.is_idle(c) || self.ticks >= SLICE_TICKS),
@@ -139,6 +167,7 @@ impl LocalRunQueue for RunQueue {
             self.queue.push_back(previous);
         }
         self.publish();
+        self.retick();
         self.current.as_ref()
     }
 
@@ -238,12 +267,13 @@ impl Scheduler for Cpus {
         if rq.holds(&runnable) {
             return None;
         }
-        // Only a CPU running its idle task is asked to reschedule; one still in its
-        // boot context takes the task when it yields.
+        // A CPU running its idle task, or one with its tick stretched, is asked to
+        // reschedule; one still in its boot context takes the task when it yields.
         let idle = rq.current.as_ref().is_some_and(|c| rq.is_idle(c));
+        let kick = idle || rq.stretched;
         rq.queue.push_back(runnable);
         rq.publish();
-        idle.then_some(target)
+        kick.then_some(target)
     }
 
     fn local_rq_with(&self, f: &mut dyn FnMut(&dyn LocalRunQueue)) {
@@ -266,6 +296,8 @@ impl Scheduler for Cpus {
 fn idle() {
     loop {
         halt_cpu();
+        // An idle CPU switches no task, so it reports its quiescent state here.
+        ostd::sync::report_quiescent_state();
     }
 }
 
@@ -279,7 +311,7 @@ pub fn init() -> Result<(), &'static str> {
     }
     let mut queues = Vec::new();
     let mut loads = Vec::new();
-    for _ in 0..count {
+    for cpu in 0..count {
         let task = TaskOptions::new(idle)
             .build()
             .map_err(|_| "an idle task could not be built")?;
@@ -291,6 +323,8 @@ pub fn init() -> Result<(), &'static str> {
             idle: Arc::new(task),
             ticks: 0,
             load,
+            boot: cpu == 0,
+            stretched: false,
         }));
     }
     let cpus: &'static Cpus =

@@ -539,6 +539,21 @@ pub(crate) unsafe fn finish_grace_period() {
     }
 }
 
+/// Reports that this CPU passes a quiescent state: it is in no RCU read-side critical
+/// section. A CPU that switches no task for a long time, idling or running one pinned
+/// thread, calls this so that grace periods still complete (Moruna).
+///
+/// # Panics
+///
+/// Panics in atomic mode (preemption or local IRQs disabled), where this CPU may be in a
+/// read-side critical section.
+pub fn report_quiescent_state() {
+    crate::task::atomic_mode::might_sleep();
+    // SAFETY: Preemption and local IRQs are enabled (checked above), and every RCU
+    // read-side critical section disables preemption, so this CPU is in none.
+    unsafe { finish_grace_period() };
+}
+
 static RCU_MONITOR: Once<RcuMonitor> = Once::new();
 
 pub(super) fn init() {
