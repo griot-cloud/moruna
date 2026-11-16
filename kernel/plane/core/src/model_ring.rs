@@ -244,6 +244,13 @@ impl RingTaskModel {
         self.region.as_ref().map(|m| Rc::as_ptr(&m.bytes) as usize)
     }
 
+    /// Raises its note and rings the engine's bell, as before a port call.
+    pub fn note(&mut self) {
+        if let (Some(r), Some(ring)) = (self.rings.clone(), self.ring.as_mut()) {
+            ring.note(&TaskMap(r));
+        }
+    }
+
     /// Ends the task as the kernel ends a process.
     pub fn end(&mut self, how: Ending) {
         if self.ended.is_some() {

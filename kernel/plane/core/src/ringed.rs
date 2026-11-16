@@ -245,6 +245,10 @@ struct RingTask<C: RingCalls> {
     wait: Option<(u64, u8, u64)>,
     /// Unmap mode: the rings object is handed back and the next not pushed yet.
     handed: bool,
+    /// The task raised its note and no port call has come since: the engine reads its port
+    /// and slots on every look, and waits on them rather than on its bell, until one does
+    /// or the task ends (the note comes before the call's message reaches the channel).
+    noted: bool,
     refused: bool,
 }
 
@@ -516,6 +520,7 @@ impl<C: RingCalls> RingPlane<C> {
                 inflight: VecDeque::new(),
                 wait: None,
                 handed: false,
+                noted: false,
                 refused: false,
             },
         );
@@ -957,9 +962,13 @@ impl<C: RingCalls> RingPlane<C> {
                     Some(Owner::Rings(o)) => Some(o.view.clone()),
                     _ => None,
                 };
-                let noted = words
+                if words
                     .as_ref()
-                    .is_some_and(|v| !t.handed && t.engine.noted(&**v));
+                    .is_some_and(|v| !t.handed && t.engine.noted(&**v))
+                {
+                    t.noted = true;
+                }
+                let noted = t.noted;
                 let waits = words
                     .as_ref()
                     .is_some_and(|v| !t.handed && v.load(layout::TASK_WAITS) != 0);
@@ -1203,6 +1212,10 @@ impl<C: RingCalls> RingPlane<C> {
                 return Err(PlaneError::Unknown("a port message that is no request"));
             }
             let body = &message[request::SIZE..];
+            // The call the note announced has come.
+            if let Some(t) = self.tasks.get_mut(&id) {
+                t.noted = false;
+            }
             if port != layout::WAIT_PORT {
                 self.plane.events.push_back(Event::Call {
                     call: CallId {
@@ -1270,12 +1283,13 @@ impl<C: RingCalls> RingPlane<C> {
 
     /// The one ring task the engine can sleep on the bell of: the plane's only task, in
     /// protect mode, with its rings object mapped.
-    fn bell_sleeper(&self) -> Option<(u32, u64)> {
+    pub(crate) fn bell_sleeper(&self) -> Option<(u32, u64)> {
         if !self.plane.tasks.is_empty() || self.tasks.len() != 1 {
             return None;
         }
         let (id, t) = self.tasks.iter().next()?;
         let able = t.mode == Mode::Protect
+            && !t.noted
             && !t.handed
             && !t.refused
             && !t.input_done

@@ -192,6 +192,7 @@ pub fn run_all(f: &Fixtures) -> Results {
     r.push(("c6_restart_fresh", restart(f)));
     r.push(("dp_i1_unmap_one_window", one_window(f)));
     r.push(("bells_wake_both_sides", bells(f)));
+    r.push(("a_note_before_its_call", note_before_call(f)));
     r
 }
 
@@ -704,6 +705,51 @@ fn bells(f: &Fixtures) -> Result<(), String> {
         Some(Ending::Exited),
         "the close rang the bell and the task ended",
     )?;
+    Ok(())
+}
+
+/// A task's note reaches the engine before its port call's message reaches the channel: the
+/// engine that reads the note first must not then sleep on its bell, which the message does
+/// not ring, but on the port, until the call comes.
+fn note_before_call(_f: &Fixtures) -> Result<(), String> {
+    let mut p = plane(true);
+    let (task, mut t) = open(&mut p, shape(2), Behave::Echo)?;
+    drive(&mut p, &mut [&mut t])?;
+    same(
+        p.bell_sleeper().is_some(),
+        true,
+        "an idle task: the engine sleeps on its bell",
+    )?;
+    t.note();
+    same(
+        p.next(0).map_err(|e| format!("{e:?}"))?,
+        None,
+        "the note, and no call yet",
+    )?;
+    same(
+        p.bell_sleeper(),
+        None,
+        "a note pending: the engine waits on the port",
+    )?;
+    let mut message = vec![0u8; moruna_abi::plane::request::SIZE];
+    moruna_abi::write_u32(
+        &mut message,
+        moruna_abi::plane::request::KIND,
+        moruna_abi::plane::request::CALL,
+    );
+    moruna_abi::write_u64(&mut message, moruna_abi::plane::request::TOKEN, 7);
+    moruna_abi::write_u64(&mut message, moruna_abi::plane::request::PORT, 1);
+    t.port.state.borrow_mut().queues[0].push_back((message, None));
+    match p.next(0).map_err(|e| format!("{e:?}"))? {
+        Some(Event::Call { port: 1, .. }) => {}
+        other => return Err(format!("the call: {other:?}")),
+    }
+    same(
+        p.bell_sleeper().is_some(),
+        true,
+        "the call came: the bell again",
+    )?;
+    same(p.is_ring(task), true, "the task lives")?;
     Ok(())
 }
 
