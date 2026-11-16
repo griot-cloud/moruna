@@ -307,6 +307,12 @@ macro_rules! impl_syscall_nums_and_dispatch_fn {
             ctx: &crate::context::Context,
             user_ctx: &mut ostd::arch::cpu::context::UserContext,
         ) -> $crate::prelude::Result<$crate::syscall::SyscallReturn> {
+            // A native call the core refused from program mode: counted and answered.
+            if let Some(answer) =
+                $crate::syscall::refused::native(ctx.process.pid(), syscall_number)
+            {
+                return Ok($crate::syscall::SyscallReturn::Return(answer));
+            }
             // User space: the data OS refuses administrative calls (`refused.rs`).
             $crate::syscall::refused::screen(ctx.process.pid(), syscall_number)?;
             match syscall_number {

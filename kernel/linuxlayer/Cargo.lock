@@ -729,6 +729,7 @@ dependencies = [
  "linuxlayer-ostd",
  "lru",
  "miniz_oxide",
+ "moruna-abi",
  "moruna-ipc-check",
  "moruna-record",
  "moruna-svc",

@@ -67,6 +67,7 @@ x86_64.workspace = true
 moruna-ipc-check.workspace = true
 moruna-record.workspace = true
 linuxlayer-launch.workspace = true
+moruna-abi.workspace = true
 
 [target.'cfg(target_os = "none")'.dependencies]
 imagefs-protocol.workspace = true

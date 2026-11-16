@@ -152,6 +152,20 @@ pub(crate) fn unknown(pid: Pid, number: u64) {
     count(pid, number);
 }
 
+/// The first native number (`moruna_abi::nr::BASE`); every Linux number is below it.
+const NATIVE_BASE: u64 = moruna_abi::nr::BASE;
+
+/// The answer to native call `number`, if it is one: the core sends program mode's native
+/// calls that are not on its allowlist here (`architecture/data-os.md` §4), where they are
+/// counted and answered with the core's `BadSyscall`, as a native call returns an error.
+pub(crate) fn native(pid: Pid, number: u64) -> Option<isize> {
+    if number < NATIVE_BASE {
+        return None;
+    }
+    count(pid, number);
+    Some(-(moruna_abi::Error::BadSyscall as isize))
+}
+
 /// `name(number) xcount`, joined by commas, in number order; `none` for none.
 pub(crate) fn render(counts: &[(u64, u64)]) -> String {
     if counts.is_empty() {
@@ -161,6 +175,7 @@ pub(crate) fn render(counts: &[(u64, u64)]) -> String {
         .iter()
         .map(|(n, c)| match name(*n) {
             Some(name) => format!("{name}({n}) x{c}"),
+            None if *n >= NATIVE_BASE => format!("native {}({n}) x{c}", n - NATIVE_BASE),
             None => format!("{n} x{c}"),
         })
         .collect::<Vec<_>>()
@@ -236,6 +251,22 @@ mod test {
         assert_eq!(name(41), Some("socket"));
         assert_eq!(name(CLONE), Some("clone"));
         assert_eq!(name(9_999), None);
+    }
+
+    #[ktest]
+    fn native_calls_off_the_core_s_list_are_refused_and_counted() {
+        let pid = 9_003;
+        assert_eq!(native(pid, 0), None);
+        assert_eq!(native(pid, NATIVE_BASE - 1), None);
+        let process_map = NATIVE_BASE + 33;
+        assert_eq!(
+            native(pid, process_map),
+            Some(-(moruna_abi::Error::BadSyscall as isize))
+        );
+        native(pid, process_map);
+        let counts = take_process(pid);
+        assert_eq!(counts, [(process_map, 2)]);
+        assert_eq!(render(&counts), "native 33(65569) x2");
     }
 
     #[ktest]
