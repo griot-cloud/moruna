@@ -22,7 +22,8 @@
 //!   spinning in the program is interrupted into its personality. The personality's
 //!   fault-tolerant copy resumes at its recovery address on a fault, with the address.
 //!   A page protected and one unmapped inside a 2 MiB region the program's table holds,
-//!   off its start, and two pages across its end, each answer; the program runs on.
+//!   off its start, and two pages across its end, each answer; a call given the unmapped
+//!   page answers fault; the program runs on.
 //! - **Shared futexes.** A thread of another process wakes a waiter on a word of a shared
 //!   object, mapped at another address.
 //! - **A shared handle table.** A personality process's clone with `SHARE_HANDLES` uses its
@@ -159,7 +160,7 @@ fn run() -> i64 {
                 &out,
                 "protect",
                 protect_inside(),
-                "a page protected and one unmapped inside the 2 MiB region the program's table holds, off its start, and two pages across its end, each answered, and the program ran on",
+                "a page protected and one unmapped inside the 2 MiB region the program's table holds, off its start, and two pages across its end, each answered, a call given the unmapped page answered fault, and the program ran on",
             )
         }
         "b1-cow" => {
@@ -898,6 +899,28 @@ fn entry_child() -> Outcome {
     )
 }
 
+/// A native call with raw arguments, for a pointer no wrapper passes.
+fn raw_call(n: u64, a: [u64; 5]) -> u64 {
+    let rax: u64;
+    // SAFETY: the kernel reads through the pointers it is given, answering `Fault` for a
+    // page that is not mapped, and changes only rax, rdx, rcx and r11.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") n => rax,
+            in("rdi") a[0],
+            in("rsi") a[1],
+            inlateout("rdx") a[2] => _,
+            in("r10") a[3],
+            in("r8") a[4],
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    rax
+}
+
 /// Two pages across the end of the 2 MiB region the program's code and stack lie in.
 const ACROSS: u64 = CODE + (2 << 20) - PAGE;
 
@@ -914,6 +937,17 @@ fn protect_inside() -> Outcome {
     call(
         me.unmap(STACK + 2 * PAGE, PAGE),
         "unmapping a page inside the program's region",
+    )?;
+    // A call given the unmapped page answers fault: the kernel's copy faults, and resumes
+    // at its recovery rather than panic.
+    let (a, _b) = call(Channel::create(), "channel_create")?;
+    let r = raw_call(
+        moruna_abi::nr::CHANNEL_WRITE,
+        [a.0.raw() as u64, STACK + 2 * PAGE, 8, 0, 0],
+    );
+    want(
+        matches!(Error::from_raw(r), Err(Error::Fault)),
+        "a call given an unmapped page did not answer fault",
     )?;
     call(
         me.map(None, 0, 2 * PAGE, ACROSS, map::READ | map::WRITE),
