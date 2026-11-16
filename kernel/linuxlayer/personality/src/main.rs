@@ -41,6 +41,14 @@ mod image {
         if let Some(own) = start::take(slot::SELF) {
             ostd::backend::set_self_process(own.into_raw());
         }
+        // Frames' objects come from the task's shared memory: one address in every process
+        // of the task (`ostd::backend::shared_map`).
+        ostd::mm::vm_space::inject_object_source(ostd::mm::vm_space::ObjectSource {
+            create: shared_object,
+            release: |_, addr, _| {
+                let _ = ostd::backend::shared_unmap(addr);
+            },
+        });
         let cmdline = start::take(slot::CMDLINE)
             .map(|m| linuxlayer_personality::cmdline(mapped(Memory(m))))
             .unwrap_or_default();
@@ -73,6 +81,13 @@ mod image {
         // The layer runs on the threads its boot started; the idle thread ends the process
         // when the init process ends.
         moruna_sys::thread_exit()
+    }
+
+    /// An object for frames from the task's shared memory: its handle and address.
+    fn shared_object(len: usize) -> ostd::Result<(u32, usize)> {
+        let addr = ostd::backend::shared_map(len)?;
+        let (_, object, _) = ostd::backend::shared_chunk(addr).ok_or(ostd::Error::NoMemory)?;
+        Ok((object, addr))
     }
 
     /// The whole memory object `object`, mapped read-only for as long as the process runs.
