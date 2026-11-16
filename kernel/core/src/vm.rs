@@ -1560,8 +1560,6 @@ pub struct Program {
     pub copy: Option<(Range<u64>, u64)>,
     /// Where the core places the mappings of the program's native calls.
     pub reserved: Range<u64>,
-    /// The native calls the program made that were not on its list.
-    pub refused: AtomicU64,
     pub vm: Arc<VmSpace>,
     /// The regions it holds a table page for, at each level.
     tables: SpinLock<[BTreeSet<u64>; 3]>,
@@ -1682,7 +1680,6 @@ impl Space {
             region: base..end,
             copy,
             reserved,
-            refused: AtomicU64::new(0),
             vm: Arc::new(VmSpace::new()),
             tables: SpinLock::new([BTreeSet::new(), BTreeSet::new(), BTreeSet::new()]),
             account: self.account.clone(),

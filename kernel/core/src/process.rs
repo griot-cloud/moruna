@@ -788,7 +788,6 @@ impl Process {
         let program = self.handles.program.lock().drain();
         drop(handles);
         drop(program);
-        crate::personality::report_refused(self);
         // The forward goes with the process: its server sees the channel close.
         let forward = self.forward.lock().take();
         drop(forward);

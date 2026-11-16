@@ -456,7 +456,6 @@ process personality
   expect B1 places: ok:
   expect B1 room: ok:
   expect B1 native: ok:
-  expect kk: process b1-native: native calls its program made that were not on its list: 1
   expect kk: process b1-native exited with code 0 (
   expect B1 native run: ok:
   expect B1 shared handles: ok:

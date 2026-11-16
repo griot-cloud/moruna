@@ -18,8 +18,8 @@
 //!   stops), and the wait returns `Interrupted`; a thread running its program enters its
 //!   personality instead.
 //! - **A program's native calls** (`data-os.md` §4). A native call its program makes goes
-//!   to the core when it is on [`program_calls`], and is refused (`BadSyscall`) and counted
-//!   otherwise; a Linux number enters the personality. Such a call resolves handles in the
+//!   to the core when it is on [`program_calls`]; any other enters the personality, as a
+//!   Linux number does, which refuses it and counts it. A call on the list resolves handles in the
 //!   program's table only, into which the personality moves them (`program_handle`), copies
 //!   through the program's page table, places mappings in the range `personality_set`
 //!   reserved, and touches nothing of the region. Handle 0 for the caller's process is
@@ -37,7 +37,6 @@ use moruna_abi::{
 };
 use ostd::{
     arch::cpu::context::{CpuException, FsBase, UserContext},
-    early_println,
     sync::SpinLock,
     task::Task,
 };
@@ -131,9 +130,10 @@ pub(crate) fn program_call(of: impl FnOnce(&Process) -> bool) -> bool {
         .is_some_and(|t| t.mode.native.load(Ordering::Acquire) && of(&t.process))
 }
 
-/// The native calls a program may make (`data-os.md` §4): `run_granted`'s, on the memory,
-/// slots, channels, windows, disks and clock page its personality granted it. Provisional
-/// until stream B2's survey of `kernel/linux`'s `run_granted` fixes it.
+/// The native calls a program may make (`data-os.md` §4): exactly those `run_granted`'s and
+/// `run_plane`'s programs make (stream B2's survey: the engine and the boot's C programs),
+/// on the memory, slots, channels, disks and clock page its personality granted it. None
+/// takes a process.
 pub fn program_calls(number: u64) -> bool {
     matches!(
         number,
@@ -147,11 +147,14 @@ pub fn program_calls(number: u64) -> bool {
             | nr::MEMORY_CREATE
             | nr::MEMORY_MAP
             | nr::MEMORY_UNMAP
-            | nr::MEMORY_PROTECT
             | nr::WAIT
             | nr::CLOCK_GET
-            | nr::TIMER_CREATE
-            | nr::TIMER_SET
+            | nr::INTERRUPT_ACK
+            | nr::DEVICE_MEMORY_CREATE
+            | nr::INTERRUPT_CREATE_MSI
+            | nr::MEMORY_PIN
+            | nr::DMA_RELEASE
+            | nr::RESOURCE_INFO
             | nr::FUTEX_WAIT
             | nr::FUTEX_WAKE
             | nr::SLOT_CREATE
@@ -159,20 +162,20 @@ pub fn program_calls(number: u64) -> bool {
             | nr::SLOT_TAKE
             | nr::SLOT_CLOSE
             | nr::SLOT_REFUSE
+            | nr::ACCOUNT_CREATE
             | nr::ACCOUNT_INFO
+            | nr::ACCOUNT_MATCHES
             | nr::THREAD_SET_CPU
             | nr::CLOCK_PAGE
-            | nr::WINDOWS_PROTECT
             | nr::BATCH_GET
             | nr::BATCH_PUT
             | nr::PORT_CALL
-            | nr::PLANE_GET
-            | nr::PLANE_PUT
     )
 }
 
-/// The argument of a call on [`program_calls`] that names a process, where zero means the
-/// caller's own, which a program may not name.
+/// The argument of a call that names a process, where zero means the caller's own, which a
+/// program may not name, should the list ever take such a call. An account of zero (the
+/// caller's own) is not a process, and stays.
 fn names_caller(number: u64) -> Option<usize> {
     match number {
         nr::WINDOWS_PROTECT => Some(0),
@@ -182,8 +185,9 @@ fn names_caller(number: u64) -> Option<usize> {
 }
 
 /// A native call the thread's program made: served by the core, on the program's table,
-/// when it is on the list; refused and counted otherwise. An interrupt raised meanwhile
-/// enters the personality once it returns.
+/// when it is on the list; otherwise it enters the personality, which refuses it and counts
+/// it with the Linux calls it refuses. An interrupt raised meanwhile enters the personality
+/// once the call returns.
 fn program_native(thread: &Arc<Thread>, ctx: &mut UserContext, number: u64) -> Flow {
     let args = [
         ctx.rdi(),
@@ -194,11 +198,7 @@ fn program_native(thread: &Arc<Thread>, ctx: &mut UserContext, number: u64) -> F
         ctx.r9(),
     ];
     if !program_calls(number) {
-        if let Some(program) = thread.process.space.program() {
-            program.refused.fetch_add(1, Ordering::Relaxed);
-        }
-        ctx.set_rax(Error::BadSyscall.to_raw() as usize);
-        return Flow::Continue;
+        return enter(thread, ctx, reason::SYSCALL, None);
     }
     if names_caller(number).is_some_and(|i| args[i] == 0) {
         ctx.set_rax(Error::BadHandle.to_raw() as usize);
@@ -218,21 +218,6 @@ fn program_native(thread: &Arc<Thread>, ctx: &mut UserContext, number: u64) -> F
         return enter(thread, ctx, reason::INTERRUPTED, None);
     }
     flow
-}
-
-/// The native calls a process's program made that were not on the list, on its end line.
-pub(crate) fn report_refused(process: &Process) {
-    let refused = process
-        .space
-        .program()
-        .map_or(0, |p| p.refused.load(Ordering::Relaxed));
-    if refused != 0 {
-        early_println!(
-            "kk: process {}: native calls its program made that were not on its list: {}",
-            process.name,
-            refused
-        );
-    }
 }
 
 /// The user-mode loop's syscall branch: a program's call enters its personality, but for a

@@ -25,8 +25,8 @@
 //!   A page protected and one unmapped inside a 2 MiB region the program's table holds,
 //!   off its start, and two pages across its end, each answer; a call given the unmapped
 //!   page answers fault; the program runs on.
-//! - **A program's native calls.** A program's native call not on the core's list is
-//!   refused and counted; a value of the personality's table names nothing for it; an object
+//! - **A program's native calls.** A program's native call not on the core's list enters its
+//!   personality, which refuses it; a value of the personality's table names nothing for it; an object
 //!   its personality moved into its table maps, and a batch of its plane arrives, in the range
 //!   its personality reserved; a slot it makes is in its table, not the personality's; handle
 //!   0 for its process is refused; it can neither unmap the region nor have a call write
@@ -217,7 +217,7 @@ fn run() -> i64 {
                 &out,
                 "native",
                 r,
-                "a program's native call not on the list was refused, a guessed handle of the personality's named nothing, the granted object mapped and a batch came in the reserved range, a slot it made was its own, handle 0 for its process was refused, the region was out of its reach, and a fork's program had no handles",
+                "a program's native calls not on the list entered its personality, a guessed handle of the personality's named nothing, the granted object mapped and a batch came in the reserved range, a slot it made was its own, handle 0 for its process was refused, the region was out of its reach, and a fork's program had no handles",
             )
         }
         "b1-victim" => {
@@ -1097,17 +1097,35 @@ fn native_child(out: &Console) -> Outcome {
         native_program as *const () as u64,
         NATIVE_STACK + NATIVE_STACK_LEN - 8,
     );
-    let r = call(personality_return(&mut f), "running the program")?;
+    // A native call not on the list enters, as a Linux call does: refused here.
+    let mut entered = [0u64; 4];
+    let mut count = 0;
+    let r = loop {
+        let r = call(personality_return(&mut f), "running the program")?;
+        let number = f.register(Register::Rax);
+        if r != reason::SYSCALL || !nr::is_native(number) {
+            break r;
+        }
+        if let Some(slot) = entered.get_mut(count) {
+            *slot = number;
+        }
+        count += 1;
+        f.set_register(Register::Rax, Error::BadSyscall.to_raw());
+    };
     want(
         r == reason::SYSCALL && f.register(Register::Rax) == 60,
         "the program did not end with its exit call",
+    )?;
+    want(
+        count == 2 && entered[..2] == [nr::TIMER_CREATE, nr::WINDOWS_PROTECT],
+        "a native call not on the list did not enter the personality",
     )?;
     let found = |i: usize| N_FOUND[i].load(Ordering::Acquire);
     let error = |i: usize| Error::from_raw(found(i)).err();
     let reserved = tester_reserved();
     want(
         error(0) == Some(Error::BadSyscall),
-        "a native call not on the list was not refused",
+        "the personality's refusal did not reach the program",
     )?;
     want(
         error(1) == Some(Error::BadHandle),
@@ -1130,8 +1148,8 @@ fn native_child(out: &Console) -> Outcome {
         "the batch was not mapped in the reserved range",
     )?;
     want(
-        error(8) == Some(Error::BadHandle),
-        "handle 0 named the program's own process",
+        error(8) == Some(Error::BadSyscall),
+        "windows_protect on handle 0, the program's own process, was not refused",
     )?;
     want(
         error(9) == Some(Error::AccessDenied),
@@ -1149,7 +1167,7 @@ fn native_child(out: &Console) -> Outcome {
 extern "C" fn native_program() -> ! {
     let found = |i: usize, v: u64| N_FOUND[i].store(v, Ordering::Release);
     let reserved = tester_reserved();
-    found(0, raw_call(nr::DEVICE_MEMORY_CREATE, [0; 5]));
+    found(0, raw_call(nr::TIMER_CREATE, [0; 5]));
     found(
         1,
         raw_call(
