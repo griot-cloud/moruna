@@ -178,13 +178,23 @@ fn cost_child(out: &Console) -> Outcome {
     call(cm.write(0, &TOUCH), "writing the touch program")?;
     drop(cm);
     call(
-        me.map(Some(&code.0), 0, PAGE, CODE, map::READ | map::EXECUTE | map::FIXED),
+        me.map(
+            Some(&code.0),
+            0,
+            PAGE,
+            CODE,
+            map::READ | map::EXECUTE | map::FIXED,
+        ),
         "mapping the touch program in",
     )?;
     let chunk = call(Memory::create(COST_LEN), "a chunk")?;
 
     // The calls alone, no fault: a page a call, a run of 16 a call, all in one call.
-    for (what, run) in [("map 1 page a call", 1), ("map 16 pages a call", AROUND), ("map 4096 pages in one call", COST_PAGES)] {
+    for (what, run) in [
+        ("map 1 page a call", 1),
+        ("map 16 pages a call", AROUND),
+        ("map 4096 pages in one call", COST_PAGES),
+    ] {
         let t = timed(|| {
             let mut at = 0;
             while at < COST_LEN {
@@ -201,13 +211,22 @@ fn cost_child(out: &Console) -> Outcome {
         if run == 1 {
             let t = timed(|| {
                 for i in 0..COST_PAGES {
-                    call(me.protect(COST_DATA + i * PAGE, PAGE, map::READ), "process_protect")?;
+                    call(
+                        me.protect(COST_DATA + i * PAGE, PAGE, map::READ),
+                        "process_protect",
+                    )?;
                 }
                 Ok(())
             })?;
             print_cost(out, "protect 1 page a call", t, COST_PAGES, "call");
             let t = timed(|| call(me.protect(COST_DATA, COST_LEN, RW), "process_protect"))?;
-            print_cost(out, "protect 4096 one-page areas in one call", t, COST_PAGES, "page");
+            print_cost(
+                out,
+                "protect 4096 one-page areas in one call",
+                t,
+                COST_PAGES,
+                "page",
+            );
             let t = timed(|| {
                 for i in 0..COST_PAGES {
                     call(me.unmap(COST_DATA + i * PAGE, PAGE), "process_unmap")?;
@@ -222,10 +241,17 @@ fn cost_child(out: &Console) -> Outcome {
     }
 
     // The fault path: the program touches each page; the personality maps on each entry.
-    for (what, around) in [("fault, map 1 page an entry", 1), ("fault-around, map 16 pages an entry", AROUND), ("premapped, the core's own faults only", 0)] {
+    for (what, around) in [
+        ("fault, map 1 page an entry", 1),
+        ("fault-around, map 16 pages an entry", AROUND),
+        ("premapped, the core's own faults only", 0),
+    ] {
         call(me.unmap(COST_DATA, COST_LEN), "clearing the data")?;
         if around == 0 {
-            call(me.map(Some(&chunk.0), 0, COST_LEN, COST_DATA, RWF), "premapping")?;
+            call(
+                me.map(Some(&chunk.0), 0, COST_LEN, COST_DATA, RWF),
+                "premapping",
+            )?;
         }
         let mut f = program_frame(CODE, STACK + STACK_LEN);
         f.set_register(Register::Rdi, COST_DATA);
@@ -300,7 +326,10 @@ fn pager_cost(out: &Console, around: u64) -> Outcome {
         )?;
         Ok(())
     })?;
-    want(TOUCHED.load(Ordering::Acquire) == 1, "the toucher did not read every page")?;
+    want(
+        TOUCHED.load(Ordering::Acquire) == 1,
+        "the toucher did not read every page",
+    )?;
     let what = if around == 1 {
         "pager, supply 1 page a request"
     } else {
@@ -336,7 +365,9 @@ fn fork_cost(out: &Console, resource: &Handle) -> Outcome {
         println!(
             out,
             "B2VM cost: process_clone of 4096 pages in {}: {} ns ({} cycles) in all",
-            what, t.0, t.1
+            what,
+            t.0,
+            t.1
         );
         let t = timed(|| {
             let fresh = call(Process::create(resource, "b2vm-copy"), "process_create")?;
@@ -353,7 +384,9 @@ fn fork_cost(out: &Console, resource: &Handle) -> Outcome {
         println!(
             out,
             "B2VM cost: process_create and replay of 4096 pages in {}: {} ns ({} cycles) in all",
-            what, t.0, t.1
+            what,
+            t.0,
+            t.1
         );
     }
     Ok(())
@@ -369,7 +402,10 @@ fn b2vm_cost(out: &Console, resource: &Handle, image: &Handle) -> Outcome {
         child.map(None, 0, STACK_LEN, STACK, map::READ | map::WRITE),
         "mapping the program's stack",
     )?;
-    call(personality_set(&child, MAP_BASE, REGION_LEN), "personality_set")?;
+    call(
+        personality_set(&child, MAP_BASE, REGION_LEN, 0..0),
+        "personality_set",
+    )?;
     let console = call(console_for(out), "duplicating the console")?;
     let me = call(
         child

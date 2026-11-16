@@ -250,9 +250,16 @@ impl InitStackWriter<'_> {
         };
         self.auxvec.set(AuxKey::AT_RANDOM, random_value_pointer);
 
-        self.adjust_stack_alignment(&envp_pointers, &argv_pointers)?;
+        // Moruna: the task's first program gets its start page, on a page of its own, under
+        // `AT_MORUNA_START` (`crate::start::take_program_page`).
+        let start_page = match crate::start::take_program_page() {
+            Some(page) => Some(self.write_page(&page)?),
+            None => None,
+        };
+
+        self.adjust_stack_alignment(&envp_pointers, &argv_pointers, start_page.is_some())?;
         let auxv_end = self.pos();
-        self.write_aux_vec()?;
+        self.write_aux_vec(start_page)?;
         let auxv_start = self.pos();
         self.write_envp_pointers(envp_pointers)?;
         self.write_argv_pointers(argv_pointers)?;
@@ -295,10 +302,16 @@ impl InitStackWriter<'_> {
     ///
     /// The 16-byte alignment is required by x86-64 System V ABI.
     /// To meet that requirement, this method may write some extra 8-byte `u64`s.
-    fn adjust_stack_alignment(&self, envp_pointers: &[u64], argv_pointers: &[u64]) -> Result<()> {
+    fn adjust_stack_alignment(
+        &self,
+        envp_pointers: &[u64],
+        argv_pointers: &[u64],
+        start_page: bool,
+    ) -> Result<()> {
         // Ensure 8-byte alignment.
         self.write_u64(0)?;
-        let auxvec_size = (self.auxvec.table().len() + 1) * (size_of::<u64>() * 2);
+        let entries = self.auxvec.table().len() + 1 + usize::from(start_page);
+        let auxvec_size = entries * (size_of::<u64>() * 2);
         let envp_pointers_size = (envp_pointers.len() + 1) * size_of::<u64>();
         let argv_pointers_size = (argv_pointers.len() + 1) * size_of::<u64>();
         let argc_size = size_of::<u64>();
@@ -309,10 +322,15 @@ impl InitStackWriter<'_> {
         Ok(())
     }
 
-    fn write_aux_vec(&self) -> Result<()> {
+    fn write_aux_vec(&self, start_page: Option<u64>) -> Result<()> {
         // Write a NULL auxiliary entry.
         self.write_u64(0)?;
         self.write_u64(AuxKey::AT_NULL as u64)?;
+        // Moruna: the program's start page, whose key no `AuxKey` holds.
+        if let Some(page) = start_page {
+            self.write_u64(page)?;
+            self.write_u64(linuxlayer_launch::program_page::AT_MORUNA_START)?;
+        }
         // Write the auxiliary vector.
         let aux_vec: Vec<_> = self
             .auxvec
@@ -368,6 +386,14 @@ impl InitStackWriter<'_> {
 
     /// Writes bytes to the stack.
     /// Returns the writing address.
+    /// Writes `page`, at most a page, at a page boundary of its own.
+    fn write_page(&self, page: &[u8]) -> Result<u64> {
+        let new_pos = self.reserve_pos(PAGE_SIZE, PAGE_SIZE)?;
+        let mut reader = VmReader::from(page).to_fallible();
+        self.vmo.write(new_pos - self.map_addr, &mut reader)?;
+        Ok(new_pos as u64)
+    }
+
     fn write_bytes(&self, bytes: &[u8]) -> Result<u64> {
         let new_pos = self.reserve_pos(bytes.len(), align_of::<u8>())?;
         let mut reader = VmReader::from(bytes).to_fallible();

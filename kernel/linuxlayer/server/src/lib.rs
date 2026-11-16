@@ -18,6 +18,10 @@ use linux_protocol::{Ended, OUTPUT_MAX, REQUEST_MAX, how, linux, log};
 use linuxlayer_launch::report::{self, Report};
 use moruna_record::{record, ring::Ring};
 
+// The personality puts the program's start page under the protocol's auxiliary vector entry.
+const _: () =
+    assert!(linuxlayer_launch::program_page::AT_MORUNA_START == linux_protocol::AT_MORUNA_START);
+
 /// A program's process name: `lx-` and its file name, lower case, `[a-z0-9._-]` (as
 /// `kernel/linux/server` named them, so the boot's lines about them hold).
 pub fn process_name(path: &[u8]) -> String {

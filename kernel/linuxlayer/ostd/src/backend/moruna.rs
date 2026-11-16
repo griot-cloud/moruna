@@ -392,8 +392,8 @@ pub unsafe fn start_thread_block() {
     unsafe { init_block(block()) };
 }
 
-/// Gives the created process `process` its personality region, `len` bytes from `base`,
-/// with this image's copy routines (`moruna_sys::personality::personality_set_with_copy`):
+/// Gives the created process `process` its personality region, `len` bytes from `base`, and
+/// its program's native range (`linuxlayer_launch::NATIVE`), with this image's copy routines (`moruna_sys::personality::personality_set_with_copy`):
 /// a fault in them resumes at their recovery point with the fault's address in `rdx` and
 /// every other register as it was. The process must map this personality's image at the
 /// addresses it has here.
@@ -407,6 +407,7 @@ pub fn personality_set(
         process,
         base,
         len,
+        linuxlayer_launch::NATIVE,
         start as u64..end as u64,
         recovery as u64,
     )

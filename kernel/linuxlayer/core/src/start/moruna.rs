@@ -7,6 +7,7 @@
 use core::{mem::ManuallyDrop, sync::atomic::AtomicU64};
 
 use imagefs_protocol::imagefs;
+use linuxlayer_launch::program_page::Entry;
 use moruna_sys::{
     Channel, DEADLINE_INFINITE, Error as CoreError, Handle, Mapping, Memory, Process, Signals,
     WaitItem, map,
@@ -59,10 +60,44 @@ pub struct ProgramGrant {
     pub rights: moruna_sys::Rights,
 }
 
-/// The program's handles, held until they are moved into the program's own handle table
-/// (`architecture/data-os.md` §4, a program's native calls); the program cannot reach them
-/// here.
-static PROGRAM: SpinLock<Vec<ProgramGrant>> = SpinLock::new(Vec::new());
+/// The program's start page, naming its handles in its own table, until its first program
+/// takes it (`super::take_program_page`).
+static PROGRAM_PAGE: SpinLock<Option<Vec<u8>>> = SpinLock::new(None);
+
+/// Moves the program's handles into its own handle table (`architecture/data-os.md` §4,
+/// a program's native calls), where only its native calls reach them, and makes the start
+/// page that names them there. A handle the core will not move is left out, with a line.
+fn give_program(name: &str, grants: Vec<ProgramGrant>) {
+    if grants.is_empty() {
+        return;
+    }
+    let mut moved = Vec::with_capacity(grants.len());
+    for grant in grants {
+        match moruna_sys::personality::program_handle(grant.handle) {
+            Ok(value) => moved.push((value, grant.rights.bits(), grant.name)),
+            Err((e, _)) => ostd::early_println!(
+                "linux: FAIL: the program's `{}` stays out of its table: {:?}",
+                grant.name,
+                e
+            ),
+        }
+    }
+    let entries: Vec<Entry<'_>> = moved
+        .iter()
+        .map(|(handle, rights, name)| Entry {
+            handle: *handle,
+            rights: *rights,
+            name: name.as_str(),
+        })
+        .collect();
+    let cpus = moruna_sys::start::cpus() as u32;
+    *PROGRAM_PAGE.lock() = linuxlayer_launch::program_page::encode(name, cpus, &entries);
+}
+
+/// The program's start page, once.
+pub(super) fn take_program_page() -> Option<Vec<u8>> {
+    PROGRAM_PAGE.lock().take()
+}
 
 /// The report's mapping, kept until the task ends.
 static REPORT: SpinLock<Option<Mapping<'static>>> = SpinLock::new(None);
@@ -91,7 +126,7 @@ pub fn start_task(start: TaskStart) -> core::result::Result<(), StartError> {
     if let Some(command) = start.command {
         super::set_command(command);
     }
-    *PROGRAM.lock() = start.program;
+    give_program(&start.name, start.program);
     if let Some(memory) = start.report {
         let memory: &'static Memory = Box::leak(Box::new(memory));
         let len = linuxlayer_launch::report::LEN as u64;

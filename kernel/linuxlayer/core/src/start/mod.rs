@@ -32,6 +32,19 @@ mod text;
 pub use self::moruna::{ProgramGrant, StartError, TaskStart, start_task};
 use crate::prelude::*;
 
+/// The start page of the task's program (`linuxlayer_launch::program_page`), for the first
+/// program the task loads, once: `None` for a task whose program was granted no handle.
+pub(crate) fn take_program_page() -> Option<Vec<u8>> {
+    #[cfg(target_os = "none")]
+    {
+        moruna::take_program_page()
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        None
+    }
+}
+
 /// A task's program: its path on the image, its arguments (`argv[0]` included) and its
 /// environment, exactly as its launcher gave them (`linuxlayer_launch::command`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

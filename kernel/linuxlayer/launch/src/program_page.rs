@@ -10,6 +10,10 @@ use alloc::{vec, vec::Vec};
 
 use moruna_abi::{ABI_VERSION, PAGE_SIZE, limits, start_page as page, write_u32};
 
+/// The auxiliary vector entry whose value is the page's address, as
+/// `linux_protocol::AT_MORUNA_START`: outside every type Linux defines.
+pub const AT_MORUNA_START: u64 = 0x4d4f_5255;
+
 /// A handle on the page: its value in the program's table, its rights and its name.
 #[derive(Clone, Copy, Debug)]
 pub struct Entry<'a> {
