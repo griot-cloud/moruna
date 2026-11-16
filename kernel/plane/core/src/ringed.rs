@@ -250,6 +250,9 @@ struct RingTask<C: RingCalls> {
     /// or the task ends (the note comes before the call's message reaches the channel).
     noted: bool,
     refused: bool,
+    /// Inputs the task released that the engine has read and not yet given as `Released`:
+    /// each is given only after the records the task posted before it.
+    releases: u64,
 }
 
 enum Owner<V> {
@@ -271,6 +274,8 @@ pub struct RingPlane<C: RingCalls> {
     /// A wait returned with something signalled: the slots and ports are read on the next
     /// pass. Otherwise only the rings are, which costs no call.
     signaled: bool,
+    /// The exit codes ended tasks said, read before their rings objects went.
+    exits: BTreeMap<u32, i64>,
 }
 
 fn kernel(e: Error) -> PlaneError {
@@ -293,12 +298,26 @@ impl<C: RingCalls> RingPlane<C> {
             spins: SPINS,
             counters: Counters::default(),
             signaled: true,
+            exits: BTreeMap::new(),
         }
     }
 
     /// What ring mode has done.
     pub fn counters(&self) -> Counters {
         self.counters
+    }
+
+    /// The exit code `task` said before it ended (`ring::Task::exit`), if it said one: the
+    /// task's own word, which a task the engine started itself has no other way to give.
+    pub fn exit_code(&self, task: TaskId) -> Option<i64> {
+        if let Some(code) = self.exits.get(&task.0) {
+            return Some(*code);
+        }
+        let t = self.tasks.get(&task.0)?;
+        let Some(Owner::Rings(o)) = self.owners.get(&t.rings) else {
+            return None;
+        };
+        t.engine.exit(&*o.view)
     }
 
     /// Whether `task` is a ring task.
@@ -521,6 +540,7 @@ impl<C: RingCalls> RingPlane<C> {
                 wait: None,
                 handed: false,
                 noted: false,
+                releases: 0,
                 refused: false,
             },
         );
@@ -952,7 +972,9 @@ impl<C: RingCalls> RingPlane<C> {
         {
             t.engine.look(&*o.view);
         }
-        self.pump_released(id)?;
+        // The releases are read before the records, and given after them: every record a
+        // task posted before it released a batch reaches the engine before the release.
+        self.count_released(id)?;
         // A task's slots and port are read only when a wait said something came, when the
         // task says it waits, or when it posted in unmap mode (its hand-back follows): in
         // steady state the rings carry everything and the engine makes no call to look.
@@ -1020,6 +1042,11 @@ impl<C: RingCalls> RingPlane<C> {
                 Ok(_) => {}
                 Err(reason) => self.refuse(id, reason)?,
             }
+            self.emit_released(id)?;
+        } else if self.records_taken(id) {
+            // Unmap mode: the records come with the rings object's hand-back, so a release
+            // waits for it unless nothing is posted on the current object.
+            self.emit_released(id)?;
         }
         self.settle_ring();
         let low = self.tasks.get(&id).is_some_and(|t| {
@@ -1038,7 +1065,9 @@ impl<C: RingCalls> RingPlane<C> {
         self.end_if_drained(id)
     }
 
-    fn pump_released(&mut self, id: u32) -> Result<(), PlaneError> {
+    /// Reads the inputs the task released since the engine last read; they are given as
+    /// events by [`Self::emit_released`].
+    fn count_released(&mut self, id: u32) -> Result<(), PlaneError> {
         let Some(t) = self.tasks.get(&id) else {
             return Ok(());
         };
@@ -1049,14 +1078,41 @@ impl<C: RingCalls> RingPlane<C> {
             .rings_view(t.rings)
             .ok_or(PlaneError::Unknown("rings"))?;
         let t = self.tasks.get_mut(&id).ok_or(PlaneError::Unknown("task"))?;
-        let n = match t.engine.released(&*view) {
-            Ok(n) => n,
-            Err(b) => return self.refuse(id, bad(b)),
-        };
+        match t.engine.released(&*view) {
+            Ok(n) => {
+                t.releases += n;
+                Ok(())
+            }
+            Err(b) => self.refuse(id, bad(b)),
+        }
+    }
+
+    /// Gives the releases read so far as `Released` events, oldest first.
+    fn emit_released(&mut self, id: u32) -> Result<(), PlaneError> {
+        let n = self
+            .tasks
+            .get_mut(&id)
+            .map_or(0, |t| core::mem::take(&mut t.releases));
         for _ in 0..n {
             self.release_one(id)?;
         }
         Ok(())
+    }
+
+    /// Unmap mode: whether every record the task posted is taken, so no release read can
+    /// overtake one (nothing is posted on the current rings object).
+    fn records_taken(&self, id: u32) -> bool {
+        let Some(t) = self.tasks.get(&id) else {
+            return false;
+        };
+        if t.handed {
+            return false;
+        }
+        let Some(Owner::Rings(o)) = self.owners.get(&t.rings) else {
+            return false;
+        };
+        let mut e = t.engine.clone();
+        matches!(e.posted(&*o.view), Ok(0))
     }
 
     fn release_one(&mut self, id: u32) -> Result<(), PlaneError> {
@@ -1128,12 +1184,21 @@ impl<C: RingCalls> RingPlane<C> {
         if t.rings != key || t.mode != Mode::Unmap {
             return Ok(());
         }
-        t.handed = true;
+        self.count_released(id)?;
+        if let Some(t) = self.tasks.get_mut(&id) {
+            t.handed = true;
+        }
         self.counters.generations += 1;
-        self.pump_released(id)?;
         match self.posted_group(id) {
             Ok(group) => self.take_records(id, key, &group)?,
             Err(reason) => self.refuse(id, reason)?,
+        }
+        // Every release read so far, after the records: the input ring is carried over below
+        // from what is still in flight.
+        self.emit_released(id)?;
+        // A task ending in unmap mode hands its last object back with its exit code on it.
+        if let Some(code) = self.exit_code(TaskId(id)) {
+            self.exits.insert(id, code);
         }
         let Some(t) = self.tasks.get(&id) else {
             return Ok(());
@@ -1258,6 +1323,9 @@ impl<C: RingCalls> RingPlane<C> {
         }
         while self.tasks.get(&id).is_some_and(|t| !t.inflight.is_empty()) {
             self.release_one(id)?;
+        }
+        if let Some(code) = self.exit_code(TaskId(id)) {
+            self.exits.insert(id, code);
         }
         let Some(t) = self.tasks.remove(&id) else {
             return Ok(());

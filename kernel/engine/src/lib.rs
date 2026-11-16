@@ -16,6 +16,9 @@
 //!                                      # own data handle `image`, the attached image's record
 //! grant disk.in.nyc disk data0          # slot `disk.in.nyc`: data disk `data0`, which the device
 //!                                      # manager hands over once through the `handover` slot
+//! grant process process process         # slot `process`: the supervisor's process resource
+//!                                      # `process`, from which the engine starts an image's
+//!                                      # native program (stream P)
 //! runs 3                              # how many times it is started, one after another
 //! ```
 //!
@@ -53,6 +56,10 @@ pub enum Source {
     /// (`data0`): a channel whose one message carries the disk's function, which the engine
     /// drives itself (`architecture/data-os.md` §3). Only `disk.*` slots take one.
     Disk(String),
+    // stream P (architecture/data-os.md section 5)
+    /// A duplicate of a process resource the supervisor starts with, under this slot name:
+    /// the engine makes the process of an image's native program (`abi: moruna`) from it.
+    Process(String),
 }
 
 /// One handle the engine starts with.
@@ -105,6 +112,8 @@ fn source_roles(source: &Source) -> Vec<(&str, u8)> {
         Source::Admission { authority, control } => {
             alloc::vec![(authority.as_str(), 2), (control.as_str(), 0)]
         }
+        // stream P
+        Source::Process(name) => alloc::vec![(name.as_str(), 3)],
         _ => Vec::new(),
     }
 }
@@ -224,6 +233,12 @@ impl Config {
                         {
                             Source::Service(String::from(from))
                         }
+                        // stream P
+                        (Some("process"), Some(from), None)
+                            if slot_ok(from) && from != "account" =>
+                        {
+                            Source::Process(String::from(from))
+                        }
                         (Some("disk"), Some(device), None)
                             if slot.starts_with("disk.") && slot_ok(device) =>
                         {
@@ -239,7 +254,7 @@ impl Config {
                             return Err(refuse(
                                 "a grant is `grant SLOT lookup SERVICE`, `grant SLOT personality` \
                                  or `grant SLOT data SLOT` or `grant SLOT service SLOT` or \
-                                 `grant disk.SLOT disk DEVICE`",
+                                 `grant SLOT process SLOT` or `grant disk.SLOT disk DEVICE`",
                             ));
                         }
                     };
@@ -413,6 +428,28 @@ mod tests {
                 ),
                 "{error}"
             );
+        }
+    }
+
+    // stream P
+    #[test]
+    fn p_a_process_resource_is_granted_by_name_in_a_role_of_its_own() {
+        let c =
+            Config::parse("program /e\nmemory 4096\nscratch 4096\ngrant process process root\n")
+                .expect("parses");
+        assert_eq!(c.grants[0].source, Source::Process("root".into()));
+        for (grants, why) in [
+            ("grant process process\n", "line 3: a grant is"),
+            ("grant process process Root\n", "line 3: a grant is"),
+            ("grant process process root extra\n", "line 3: a grant is"),
+            ("grant process process account\n", "line 3: a grant is"),
+            (
+                "grant a data root\ngrant process process root\n",
+                "line 4: a start slot cannot have different",
+            ),
+        ] {
+            let error = Config::parse(&format!("program /e\nmemory 4096\n{grants}")).unwrap_err();
+            assert!(error.starts_with(why), "{grants:?}: {error}");
         }
     }
 

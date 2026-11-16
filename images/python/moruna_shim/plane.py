@@ -169,7 +169,12 @@ class Plane:
             self.wakes += 1
 
     def release(self):
-        self.half.release()
+        """The batch is done: every record posted before answers it. Rings the engine, which
+        waits for the release."""
+        if self.half.release() and self.half.ring(
+            lambda at: self.calls.futex_wake(self.rings_addr + at)
+        ):
+            self.wakes += 1
 
     def hand_back(self):
         """Unmap mode: the rings object goes back with the records on it, and the next is
@@ -178,9 +183,10 @@ class Plane:
         self.calls.batch_put(1, self.rings_addr, self.rings_len)
         self._attach(self.half)
 
-    def finish(self):
-        """The task ends: the engine is told, and in unmap mode the last group goes back."""
-        if self.half.note(lambda at: self.calls.futex_wake(self.rings_addr + at)):
+    def finish(self, code=0):
+        """The task ends: the engine is told its exit code, and in unmap mode the last group
+        goes back."""
+        if self.half.exit(code, lambda at: self.calls.futex_wake(self.rings_addr + at)):
             self.wakes += 1
         if self.half.mode == ring.UNMAP and self._posted_since_hand_back():
             self.calls.batch_put(1, self.rings_addr, self.rings_len)

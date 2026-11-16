@@ -120,6 +120,10 @@ def main():
         node += ["link devices directory-storage storage storage.block-directory"]
     extra_initial = []
     extra_engine = []
+    # stream P (architecture/data-os.md section 5): the engine's process resource, a duplicate
+    # of admission's, from which it starts an image's native program (abi: moruna) itself.
+    extra_initial += ["grant process root.process"]
+    extra_engine += ["grant process process process"]
     if unified:
         node += ["grant storage storage.key cache.key", "grant admission initial.checkpoint-binding checkpoint.admission", "grant admission initial.cache-binding cache.admission"]
         extra_initial += ["grant checkpoint.binding initial.checkpoint-binding", "grant cache.binding initial.cache-binding"]

@@ -383,7 +383,18 @@ fn initial_job(
     let mut grants = Vec::new();
     let mut services = Vec::new();
     for grant in initial.grants {
-        let handle = start::take(&grant.source).ok_or(admission::Error::Unavailable)?;
+        // stream P (architecture/data-os.md section 5): `root.process` is a duplicate of
+        // admission's own process resource, from which the job's engine starts an image's
+        // native program; the node gives each boot capability one owner.
+        let handle = if grant.source == "root.process" {
+            shared
+                .borrow()
+                .root
+                .duplicate(Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER)
+                .map_err(|_| admission::Error::Unavailable)?
+        } else {
+            start::take(&grant.source).ok_or(admission::Error::Unavailable)?
+        };
         authority
             .register(&grant.slot, &handle)
             .map_err(|_| admission::Error::Invalid)?;

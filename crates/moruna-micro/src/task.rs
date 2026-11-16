@@ -3,13 +3,18 @@
 //!
 //! The stage's task is a process the Linux personality starts with `run_plane` (SDD 28 d.3)
 //! on its own connection to the personality, whose closing ends it: one input slot, one
-//! output slot, its port, and a log ring for its text. Its batches cross in one of two ways:
+//! output slot, its port, and a log ring for its text. An image entry that declares
+//! `abi: moruna` names a program of the kernel's own user target instead: the engine checks
+//! its ELF against the declaration and starts it itself, a process of the kernel with its plane
+//! attached, never through the personality, and the task says its exit code on its rings.
+//! Its batches cross in one of two ways:
 //!
 //! - **ring mode** (`architecture/data-os.md` §5), for an image that declares
 //!   `MORUNA_PLANE=rings` (the Python shim's layer does): the task maps its input region and
 //!   its rings object once, the engine lays each batch out in the region and posts it on the
-//!   input ring, and the task posts its record on the output ring. No call per batch moves a
-//!   batch, and the kernel and the personality copy nothing ([`crate::rings`]);
+//!   input ring, and the task posts its record on the output ring (several when its answer is
+//!   bigger than a window), then releases the batch to say it is done. No call per batch moves
+//!   a batch, and the kernel and the personality copy nothing ([`crate::rings`]);
 //! - **descriptors 0 and 1**, for an unmodified image: the personality turns the slots'
 //!   records into an Arrow IPC stream and back, which copies, as any `read` and `write` do.
 //!
@@ -49,7 +54,7 @@ use moruna_plane::kernel::Kernel as Calls;
 use moruna_plane::ringed::{Region, RingShape};
 use moruna_plane::{BatchId, CallId, DataPlane, Event, PlaneError, RingPlane, Shape, TaskId};
 use moruna_svc::{
-    Account, Channel, ClientCore, Encoder, Error as KernelError, Rights, Usage, Wire, map,
+    Account, Channel, ClientCore, Encoder, Error as KernelError, Rights, Signals, Usage, Wire, map,
 };
 
 use crate::layout::{self, PAGE};
@@ -107,6 +112,85 @@ pub(crate) fn personality() -> std::result::Result<&'static Channel, String> {
         })
         .as_ref()
         .map_err(Clone::clone)
+}
+
+/// The most bytes of a program the kernel loads (`process_map_image`).
+const NATIVE_MAX: u64 = 64 << 20;
+/// The bytes of a program's head read to tell a native program from a Linux one: its ELF
+/// header and its program headers.
+const ELF_HEAD: usize = 64 + 64 * 56;
+
+/// The process resource the engine is granted under `process`: a stage whose image declares
+/// `abi: moruna` makes its task's process from it.
+fn process_resource() -> std::result::Result<&'static moruna_svc::Handle, String> {
+    static RESOURCE: OnceLock<std::result::Result<moruna_svc::Handle, String>> = OnceLock::new();
+    RESOURCE
+        .get_or_init(|| {
+            crate::start::take("process").ok_or_else(|| {
+                format!(
+                    "the engine was granted no `process` resource, which starts an image's \
+                     native program (it holds {:?})",
+                    crate::start::slots()
+                )
+            })
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+/// The program at `path` in the image (the engine's own view of it, the image filesystem its
+/// tasks run on), checked against the ABI its entry declares: its bytes for a native program
+/// (`abi: moruna`), which must be of the kernel's user target ([`layout::native_elf`]); for a
+/// Linux one (the default), a refusal only when it is such a native program.
+pub fn program(path: &str, native: bool) -> std::result::Result<Option<Vec<u8>>, String> {
+    use std::io::Read;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("reading the program `{path}`: {e}"))?;
+    if !native {
+        let mut head = Vec::new();
+        file.take(ELF_HEAD as u64)
+            .read_to_end(&mut head)
+            .map_err(|e| format!("reading the program `{path}`: {e}"))?;
+        return match layout::native_elf(&head) {
+            Ok(()) => Err(format!(
+                "`{path}` is a program of the Moruna kernel's user target, and the entry \
+                 declares a Linux program (the default): declare `abi: moruna`"
+            )),
+            Err(_) => Ok(None),
+        };
+    }
+    let len = file
+        .metadata()
+        .map_err(|e| format!("reading the program `{path}`: {e}"))?
+        .len();
+    if len > NATIVE_MAX {
+        return Err(format!(
+            "`{path}` is {len} bytes, and the kernel loads a program of at most {}",
+            NATIVE_MAX
+        ));
+    }
+    let mut elf = Vec::new();
+    file.read_to_end(&mut elf)
+        .map_err(|e| format!("reading the program `{path}`: {e}"))?;
+    layout::native_elf(&elf).map_err(|why| {
+        format!(
+            "the entry declares `abi: moruna`, and `{path}` is not a program of the Moruna \
+             kernel's user target: {why}"
+        )
+    })?;
+    Ok(Some(elf))
+}
+
+/// Loads `elf` into `process`: a memory object of its bytes, which the kernel parses and maps
+/// (`process_map_image`). Its entry point.
+fn load_native(process: &moruna_svc::Process, elf: &[u8]) -> std::result::Result<u64, KernelError> {
+    let bytes = layout::pages(elf.len() as u64).ok_or(KernelError::OutOfRange)?;
+    let memory = moruna_svc::Memory::create(bytes)?;
+    {
+        let mut mapping = memory.map(0, bytes, map::READ | map::WRITE)?;
+        mapping.shared_region()?[..elf.len()].copy_from_slice(elf);
+    }
+    process.map_image(&memory.0)
 }
 
 /// The account a stage's task is charged to, while the task lives: what the stage holds
@@ -191,6 +275,8 @@ pub struct ImageTask {
     assets_path: Option<std::path::PathBuf>,
     /// The image declares the ring protocol (`MORUNA_PLANE=rings`).
     rings: bool,
+    /// The native program the stage starts itself (`abi: moruna`): its ELF.
+    native: Option<Arc<[u8]>>,
 }
 
 impl std::fmt::Debug for ImageTask {
@@ -253,6 +339,7 @@ impl ImageTask {
             managed_windows: false,
             assets_path: None,
             rings,
+            native: None,
         })
     }
 
@@ -273,6 +360,14 @@ impl ImageTask {
     /// `MORUNA_PLANE=rings`.
     pub fn with_plane(mut self, plane: bool) -> Self {
         self.rings |= plane;
+        self
+    }
+
+    /// The entry declares `abi: moruna`: the command is a native program of the kernel's user
+    /// target, `elf` ([`program`] checked it), which the stage starts itself on the rings.
+    pub fn with_native(mut self, elf: Vec<u8>) -> Self {
+        self.native = Some(Arc::from(elf));
+        self.rings = true;
         self
     }
 
@@ -336,12 +431,15 @@ impl ImageTask {
             st.window = Some(bytes);
         }
         // Explicit output admission is complete BEFORE the child can read this request.
-        let len = st.offer(&batch, self.ports.get(), &self.port_names)?;
+        let (len, offered) = st.offer(&batch, self.ports.get(), &self.port_names)?;
         drop(batch);
         if reply_bytes == 0 && !st.rings {
             st.grant(len)?;
         }
         st.sent += 1;
+        if st.rings {
+            return st.answers(offered, self.ports.get(), &self.port_names);
+        }
         match st.wait(self.ports.get(), &self.port_names)? {
             Seen::Put(out) => {
                 st.received += 1;
@@ -359,6 +457,10 @@ impl ImageTask {
                 );
                 Err(st.failed(&cause))
             }
+            Seen::Released(_) => Err(kernel_error(format!(
+                "image `{}`: a release where a record was waited for",
+                self.name
+            ))),
         }
     }
 
@@ -439,6 +541,10 @@ impl ImageTask {
         })?;
         let ring = LogRing::new(RING_BYTES)
             .map_err(|e| kernel_error(format!("image `{name}`: its log ring: {e}")))?;
+        if let Some(elf) = &self.native {
+            drop((input, output));
+            return self.start_native(ctx, memory, plane, task, port, ring, ceiling, elf);
+        }
         let listener = personality().map_err(|e| kernel_error(format!("image `{name}`: {e}")))?;
         let channel = moruna_svc::connect(listener).map_err(|e| {
             kernel_error(format!(
@@ -453,36 +559,7 @@ impl ImageTask {
         .map_err(|e| kernel_error(format!("image `{name}`: hello to the personality: {e:?}")))?;
         // The 2.0 handshake rejects the old unaccounted 1.x wire layouts before
         // any run_plane request is sent. Every 2.0 method is available at minor 0.
-        // The task's account, carved out of the engine's (SDD 30 f.11).
-        let room = Usage::own()
-            .map_err(|e| {
-                kernel_error(format!(
-                    "image `{name}`: the engine's account: {}",
-                    e.name()
-                ))
-            })?
-            .room();
-        let limit = layout::task_limit(ceiling, room).ok_or_else(|| {
-            kernel_error(format!(
-                "image `{name}`: the engine's account has {room} bytes left, too few for a task's \
-                 account of at least {} bytes beside the engine's own half",
-                layout::TASK_MIN
-            ))
-        })?;
-        let account_name = layout::account_name(name);
-        let account = Account::carve(limit, &account_name).map_err(|e| {
-            kernel_error(format!(
-                "image `{name}`: an account of {limit} bytes for its task: {}",
-                e.name()
-            ))
-        })?;
-        let kept = account
-            .0
-            .duplicate(Rights::READ)
-            .map(Account)
-            .map_err(|e| {
-                kernel_error(format!("image `{name}`: its task's account: {}", e.name()))
-            })?;
+        let (account, kept, limit) = self.carve(ceiling)?;
         let mut body = Encoder::new();
         let plane_arg = LinuxPlane {
             assets: self
@@ -523,13 +600,113 @@ impl ImageTask {
         // succeeded. Failed startup drops every local handle and returns its limit.
         *lock(&memory.account) = Some((kept, limit));
         tracing::info!(target: "micro", image = %name, command = ?self.command, rings = self.rings, "image task asked of the personality");
-        Ok(TaskState {
+        Ok(self.state(ctx, memory, plane, task, ring, Some((client, run)), None))
+    }
+
+    /// The task's account, carved out of the engine's (SDD 30 f.11): the account, a read-only
+    /// handle to it the stage keeps, and its limit.
+    fn carve(&self, ceiling: u64) -> Result<(Account, Account, u64)> {
+        let name = &self.name;
+        let room = Usage::own()
+            .map_err(|e| {
+                kernel_error(format!(
+                    "image `{name}`: the engine's account: {}",
+                    e.name()
+                ))
+            })?
+            .room();
+        let limit = layout::task_limit(ceiling, room).ok_or_else(|| {
+            kernel_error(format!(
+                "image `{name}`: the engine's account has {room} bytes left, too few for a task's \
+                 account of at least {} bytes beside the engine's own half",
+                layout::TASK_MIN
+            ))
+        })?;
+        let account_name = layout::account_name(name);
+        let account = Account::carve(limit, &account_name).map_err(|e| {
+            kernel_error(format!(
+                "image `{name}`: an account of {limit} bytes for its task: {}",
+                e.name()
+            ))
+        })?;
+        let kept = account
+            .0
+            .duplicate(Rights::READ)
+            .map(Account)
+            .map_err(|e| {
+                kernel_error(format!("image `{name}`: its task's account: {}", e.name()))
+            })?;
+        Ok((account, kept, limit))
+    }
+
+    /// Starts the image's native program itself (`abi: moruna`): a process of the kernel made
+    /// from the engine's process resource and charged to the task's account, the ELF loaded
+    /// by the kernel, the plane attached (its region, its rings object and its port) and the
+    /// log ring given under `log`. The personality has no part in it.
+    #[allow(clippy::too_many_arguments)]
+    fn start_native(
+        &self,
+        ctx: &InitCtx,
+        memory: &Arc<TaskMemory>,
+        plane: RingPlane<Calls>,
+        task: TaskId,
+        port: Option<Channel>,
+        ring: LogRing,
+        ceiling: u64,
+        elf: &[u8],
+    ) -> Result<TaskState> {
+        let name = &self.name;
+        let fail = |what: &str, e: KernelError| {
+            kernel_error(format!("image `{name}`: {what}: {}", e.name()))
+        };
+        let resource =
+            process_resource().map_err(|e| kernel_error(format!("image `{name}`: {e}")))?;
+        let (account, kept, limit) = self.carve(ceiling)?;
+        let process =
+            moruna_svc::Process::create_in(resource, &layout::account_name(name), &account.0)
+                .map_err(|e| fail("making its process", e))?;
+        let entry = load_native(&process, elf).map_err(|e| fail("loading its program", e))?;
+        let slots = plane
+            .ring_slots(task)
+            .map_err(|e| plane_error(name, "its slots", e))?;
+        moruna_sys::plane::attach(&process, &slots, port)
+            .map_err(|(e, _)| fail("attaching its plane", e))?;
+        let log = ring
+            .give()
+            .map_err(|e| kernel_error(format!("image `{name}`: {e}")))?;
+        process
+            .start_with(entry, &mut [(Some(log), "log")])
+            .map_err(|e| fail("starting its process", e))?;
+        drop(account);
+        *lock(&memory.account) = Some((kept, limit));
+        tracing::info!(target: "micro", image = %name, command = ?self.command, bytes = elf.len(), "native task started");
+        Ok(self.state(ctx, memory, plane, task, ring, None, Some(process)))
+    }
+
+    /// A started task's state.
+    #[allow(clippy::too_many_arguments)]
+    fn state(
+        &self,
+        ctx: &InitCtx,
+        memory: &Arc<TaskMemory>,
+        plane: RingPlane<Calls>,
+        task: TaskId,
+        ring: LogRing,
+        personality: Option<(ClientCore, u32)>,
+        process: Option<moruna_svc::Process>,
+    ) -> TaskState {
+        let (client, run) = match personality {
+            Some((client, run)) => (Some(client), run),
+            None => (None, 0),
+        };
+        TaskState {
             memory: Arc::clone(memory),
-            name: name.clone(),
+            name: self.name.clone(),
             plane,
             task,
-            client: Some(client),
+            client,
             run,
+            process,
             ended: None,
             terminal_confirmed: false,
             ring,
@@ -538,6 +715,8 @@ impl ImageTask {
             alloc: Arc::clone(&ctx.alloc),
             sent: 0,
             received: 0,
+            answered: 0,
+            joined: 0,
             window: None,
             rings: self.rings,
             released: Released::default(),
@@ -547,7 +726,7 @@ impl ImageTask {
             landed: 0,
             stage: self.ports.get().map_or(UNKNOWN_STAGE, |p| p.stage()),
             cancel: self.cancel.get().cloned(),
-        })
+        }
     }
 }
 
@@ -562,6 +741,9 @@ pub struct TaskState {
     client: Option<ClientCore>,
     /// The `run_plane` request, answered when the task has ended.
     run: u32,
+    /// The task's process, for a native program the stage started itself: the engine waits
+    /// for its end, and ends it when the stage does.
+    process: Option<moruna_svc::Process>,
     ended: Option<std::result::Result<Ended, String>>,
     terminal_confirmed: bool,
     ring: LogRing,
@@ -569,7 +751,11 @@ pub struct TaskState {
     tail: VecDeque<String>,
     alloc: Arc<dyn Allocator>,
     sent: u64,
+    /// Records the task put, and batches it said it was done with.
     received: u64,
+    answered: u64,
+    /// Batches answered with several records, joined into one batch.
+    joined: u64,
     /// The bytes of the window the task holds for its next record.
     window: Option<u64>,
     /// The task speaks the ring protocol.
@@ -592,6 +778,16 @@ impl Drop for TaskState {
         // Read an already-available ORIGINAL terminal reply, never manufacture one
         // from a close or a transient zero while a start request may still be queued.
         let _ = self.answer(0);
+        // A native task ends with its stage: killed if it has not ended, and waited for.
+        if let Some(process) = self.process.as_ref()
+            && !self.terminal_confirmed
+        {
+            let _ = process.kill();
+            let deadline = moruna_svc::now().saturating_add(END_SECONDS * SECONDS);
+            self.terminal_confirmed =
+                moruna_svc::wait_one(&process.0, Signals::TERMINATED, deadline)
+                    .is_ok_and(|s| s.intersects(Signals::TERMINATED));
+        }
         drop(self.client.take());
         // Release our original plane/record owners before asking whether physical
         // child charges retired. No alias, fake reset or fabricated completion.
@@ -644,6 +840,8 @@ impl KernelState for TaskState {
 /// What a task's wait saw.
 enum Seen {
     Put(BatchId),
+    /// The task released this batch: it is done with it (ring mode).
+    Released(BatchId),
     Ended,
 }
 
@@ -687,6 +885,28 @@ impl TaskState {
     /// The personality's answer for the task, waiting up to `wait` nanoseconds (zero: only
     /// if it has come).
     fn answer(&mut self, wait: u64) -> Option<&std::result::Result<Ended, String>> {
+        if let Some(process) = self.process.as_ref() {
+            // A native task: its process's end, and the exit code it said on its rings.
+            if self.ended.is_none() {
+                let deadline = moruna_svc::now().saturating_add(wait.max(1));
+                let ended = moruna_svc::wait_one(&process.0, Signals::TERMINATED, deadline)
+                    .is_ok_and(|s| s.intersects(Signals::TERMINATED));
+                if ended {
+                    self.terminal_confirmed = true;
+                    let said = self.plane.exit_code(self.task);
+                    self.ended = Some(Ok(Ended {
+                        how: if said.is_some() {
+                            how::EXITED
+                        } else {
+                            how::FAULTED
+                        },
+                        code: said.unwrap_or(0),
+                        ..Ended::default()
+                    }));
+                }
+            }
+            return self.ended.as_ref();
+        }
         if self.ended.is_none() {
             let deadline = moruna_svc::now().saturating_add(wait.max(1));
             let Some(client) = self.client.as_mut() else {
@@ -742,10 +962,16 @@ impl TaskState {
         self.drain_log();
         let name = self.name.clone();
         let footprint = self.footprint();
+        let native = self.process.is_some();
         let head = match self.answer(END_SECONDS * SECONDS) {
             Some(Ok(e)) => match e.how {
                 how::EXITED => format!("image `{name}`: {cause}; exited with status {}", e.code),
                 how::SIGNALED => format!("image `{name}`: {cause}; was ended by signal {}", e.code),
+                _ if native => format!(
+                    "image `{name}`: {cause}; it ended without saying its exit code on its rings \
+                     (`Rings::exit`): it faulted or was killed, which the kernel's console line \
+                     says, or returned without saying ({footprint})"
+                ),
                 _ => format!(
                     "image `{name}` was ended by the kernel ({cause}; {footprint}; the kernel's \
                      console line says why)"
@@ -784,13 +1010,13 @@ impl TaskState {
 
     /// Lays `batch` out as a record where the task reads it and offers it: in ring mode, in
     /// the task's region, posted on its input ring; otherwise in an arena object pushed on
-    /// its input slot. The record's length.
+    /// its input slot. The record's length, and the batch it is.
     fn offer(
         &mut self,
         batch: &moruna_kernel::arrow::record_batch::RecordBatch,
         ports: Option<&Arc<StagePorts>>,
         names: &[String],
-    ) -> Result<u64> {
+    ) -> Result<(u64, BatchId)> {
         let (framing, placed) =
             moruna_kernel::ipc::encode_framing(batch, PAGE as usize, 0, self.alloc.as_ref())?;
         let pieces: Vec<(u64, u64)> = placed
@@ -860,7 +1086,7 @@ impl TaskState {
         self.plane
             .drop_batch(id)
             .map_err(|e| plane_error(&self.name, "the engine's hold", e))?;
-        Ok(len)
+        Ok((len, id))
     }
 
     /// One step of the plane while the engine waits for room: whether anything came.
@@ -1053,9 +1279,96 @@ impl TaskState {
         }
     }
 
-    /// Steps the plane until the task puts a record or ends, serving its port calls,
-    /// looking at the run's cancel and the personality's answer meanwhile.
+    /// [`Self::wait_any`] past the task's releases: a record, or the end.
     fn wait(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<Seen> {
+        loop {
+            match self.wait_any(ports, names)? {
+                Seen::Released(_) => {}
+                seen => return Ok(seen),
+            }
+        }
+    }
+
+    /// The task's answer to batch `offered` in ring mode: every record it puts until it
+    /// releases the batch, which says it is done. One record is handed on as it lies; several
+    /// (an answer bigger than a window) are joined into one batch. The first is kept in place
+    /// when it may be, and each after it lands at once, so its window goes back for the next.
+    fn answers(
+        &mut self,
+        offered: BatchId,
+        ports: Option<&Arc<StagePorts>>,
+        names: &[String],
+    ) -> Result<Payload> {
+        let mut parts = Vec::new();
+        loop {
+            match self.wait_any(ports, names)? {
+                Seen::Put(out) => {
+                    self.received += 1;
+                    let part = if parts.is_empty() {
+                        self.output(out)
+                    } else {
+                        self.land(out)
+                    };
+                    parts.push(part?);
+                }
+                Seen::Released(b) if b == offered => break,
+                Seen::Released(_) => {}
+                Seen::Ended => {
+                    let cause = format!(
+                        "it ended after answering {} of the {} batches it was sent",
+                        self.answered, self.sent
+                    );
+                    return Err(self.failed(&cause));
+                }
+            }
+        }
+        self.answered += 1;
+        match parts.len() {
+            0 => Err(self.failed(
+                "it said a batch was done without a record for it: a task answers every batch, \
+                 with a record of no rows when it keeps none",
+            )),
+            1 => Ok(parts.remove(0)),
+            _ => self.join(parts),
+        }
+    }
+
+    /// Several records answering one batch, joined into one batch in the run's arena: the one
+    /// answer copied twice, once to join and once to land, each copy counted.
+    fn join(&mut self, parts: Vec<Payload>) -> Result<Payload> {
+        let mut batches = Vec::with_capacity(parts.len());
+        for p in parts {
+            match p {
+                Payload::Table(b, _) => batches.push(b),
+                Payload::Tensor(..) => {
+                    return Err(kernel_error(format!(
+                        "image `{}`: a record that is not a table",
+                        self.name
+                    )));
+                }
+            }
+        }
+        let schema = batches[0].schema();
+        let joined =
+            moruna_kernel::arrow::compute::concat_batches(&schema, &batches).map_err(|e| {
+                kernel_error(format!(
+                    "image `{}`: joining the {} records of one batch: {e}",
+                    self.name,
+                    batches.len()
+                ))
+            })?;
+        // The first record's window goes back with it.
+        drop(batches);
+        self.reap();
+        self.alloc
+            .note_boundary_copy(joined.get_array_memory_size() as u64);
+        self.joined += 1;
+        Ok(moruna_adapters::land::land_table(joined, &self.alloc)?.0)
+    }
+
+    /// Steps the plane until the task puts a record, releases a batch or ends, serving its
+    /// port calls, looking at the run's cancel and at how the task ended meanwhile.
+    fn wait_any(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<Seen> {
         loop {
             self.reap();
             let deadline = moruna_svc::now().saturating_add(LOOK_NS);
@@ -1080,7 +1393,8 @@ impl TaskState {
                     request,
                 }) => self.call(ports, names, call, port, request)?,
                 Some(Event::Ended { .. }) => return Ok(Seen::Ended),
-                Some(Event::Released { .. } | Event::Freed { .. }) => {}
+                Some(Event::Released { batch, .. }) => return Ok(Seen::Released(batch)),
+                Some(Event::Freed { .. }) => {}
                 None => {
                     if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
                         return Err(MorunaError::Cancelled);
@@ -1212,12 +1526,20 @@ impl Kernel for ImageTask {
             match st.wait(self.ports.get(), &self.port_names)? {
                 Seen::Put(out) => {
                     let _ = st.plane.drop_batch(out);
-                    let cause = format!(
-                        "its output holds more record batches than the {} sent",
-                        st.sent
-                    );
+                    let cause = if st.rings {
+                        format!(
+                            "it put a record after it said the last of its {} batches was done",
+                            st.sent
+                        )
+                    } else {
+                        format!(
+                            "its output holds more record batches than the {} sent",
+                            st.sent
+                        )
+                    };
                     Err(st.failed(&cause))
                 }
+                Seen::Released(_) => Err(st.failed("it released a batch it was not sent")),
                 Seen::Ended => match st.answer(END_SECONDS * SECONDS) {
                     Some(Ok(e)) if e.how == how::EXITED && e.code == 0 => {
                         let (served, refused) = (e.served, e.refused.clone());
@@ -1232,7 +1554,10 @@ impl Kernel for ImageTask {
                             stage = st.stage,
                             %footprint,
                             rings = st.rings,
+                            native = st.process.is_some(),
                             batches = st.sent,
+                            records = st.received,
+                            joined = st.joined,
                             copied = st.copied,
                             kept = st.kept,
                             landed = st.landed,

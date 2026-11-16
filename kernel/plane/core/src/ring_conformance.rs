@@ -184,6 +184,14 @@ pub fn run_all(f: &Fixtures) -> Results {
             },
             refusals(f, protect),
         ));
+        r.push((
+            if protect {
+                "several_records_a_batch_protect"
+            } else {
+                "several_records_a_batch_unmap"
+            },
+            several_records(f, protect),
+        ));
     }
     r.push(("dp_i4_region_read_only", region_read_only(f)));
     r.push(("dp_i7_bounded", bounded(f)));
@@ -294,6 +302,59 @@ pub fn lockstep(f: &Fixtures, protect: bool, n: u64) -> Result<Measure, String> 
     )?;
     empty(&p, "nothing left")?;
     Ok(m)
+}
+
+/// A task answers each batch with three records through two windows, then releases it: the
+/// engine is given every record of the batch before its release, each record as the task wrote
+/// it, and the window of each it drops goes back to the task for the next. At the end the task
+/// says its exit code.
+pub fn several_records(f: &Fixtures, protect: bool) -> Result<(), String> {
+    let mut p = plane(protect);
+    let (task, mut t) = open(&mut p, shape(2), Behave::Split(3))?;
+    let region = p.region_of(task).ok_or("no region")?;
+    drive(&mut p, &mut [&mut t])?;
+    for i in 0..4 {
+        let b = load(&mut p, region, f)?;
+        p.offer(task, 0, b)
+            .map_err(|e| format!("offer {i}: {e:?}"))?;
+        p.drop_batch(b).map_err(|e| format!("drop {i}: {e:?}"))?;
+        let mut seen: Vec<Event> = Vec::new();
+        for _ in 0..8 {
+            let events = drive(&mut p, &mut [&mut t])?;
+            for e in events {
+                if let Event::Put { batch, .. } = &e {
+                    same(bytes_of(&p, *batch)?, f.good.clone(), "each record")?;
+                    // Its window goes back for the batch's next record.
+                    p.drop_batch(*batch)
+                        .map_err(|e| format!("drop out {i}: {e:?}"))?;
+                }
+                seen.push(e);
+            }
+            if seen.iter().any(|e| matches!(e, Event::Released { .. })) {
+                break;
+            }
+        }
+        let released = seen
+            .iter()
+            .position(|e| matches!(e, Event::Released { batch, .. } if *batch == b))
+            .ok_or_else(|| format!("batch {i} never released: {seen:?}, task {:?}", t.ended))?;
+        same(
+            puts(&seen[..released]).len(),
+            3,
+            "three records before the release",
+        )
+        .map_err(|e| format!("batch {i}: {e}: {seen:?}"))?;
+        same(puts(&seen).len(), 3, "no record after it")?;
+    }
+    p.finish(task, 0).map_err(|e| format!("finish: {e:?}"))?;
+    let events = drive(&mut p, &mut [&mut t])?;
+    same(
+        count(&events, |e| matches!(e, Event::Ended { .. })),
+        1,
+        "ended once",
+    )?;
+    same(p.exit_code(task), Some(0), "the exit code the task said")?;
+    empty(&p, "nothing left")
 }
 
 /// DP-I1 with batches in flight: the engine posts `n` before the task runs. A group is every

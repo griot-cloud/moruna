@@ -585,8 +585,18 @@ pub struct Rings {
     wakes: u64,
     /// Sleeps it took on its own bell.
     sleeps: u64,
-    /// A batch taken while no window was free.
-    pending: Option<ring::InEntry>,
+    /// A batch taken while no window was free, and the part of its answer to write next.
+    pending: Option<(ring::InEntry, u32)>,
+}
+
+/// What a function given to [`Rings::step_parts`] wrote into a window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// A record of this many bytes, the batch's last: the batch is done.
+    Last(usize),
+    /// A record of this many bytes, and more of the batch's answer to come in the next
+    /// window: the answer is bigger than a window.
+    More(usize),
 }
 
 /// What [`Rings::step`] did.
@@ -655,9 +665,14 @@ impl Rings {
         Ok(Some((e, bytes)))
     }
 
-    /// Releases the oldest batch taken.
+    /// Releases the oldest batch taken: the task is done with it, and every record posted
+    /// before answers it. Rings the engine's bell, which waits for the release.
     pub fn release(&mut self) -> bool {
-        self.half.release(&self.rings)
+        let released = self.half.release(&self.rings);
+        if released && self.half.ring(&self.rings) {
+            self.wakes += 1;
+        }
+        released
     }
 
     /// Whether every batch was taken and the engine posts no more.
@@ -679,9 +694,19 @@ impl Rings {
         Ok(Some((w, bytes)))
     }
 
-    /// Posts the record of `len` bytes at the start of window `w`, answering `cookie`.
+    /// Posts the record of `len` bytes at the start of window `w`, answering `cookie`. A batch
+    /// may be answered with several records; [`Rings::release`] says it is done.
     pub fn post(&mut self, w: u64, len: u64, cookie: u64) -> bool {
-        let posted = self.half.post(
+        let posted = self.post_quietly(w, len, cookie);
+        // The engine's bell: a wake only when it sleeps.
+        if posted && self.half.ring(&self.rings) {
+            self.wakes += 1;
+        }
+        posted
+    }
+
+    fn post_quietly(&mut self, w: u64, len: u64, cookie: u64) -> bool {
+        self.half.post(
             &self.rings,
             ring::OutEntry {
                 window: w,
@@ -689,12 +714,16 @@ impl Rings {
                 len,
                 cookie,
             },
-        );
-        // The engine's bell: a wake only when it sleeps.
-        if posted && self.half.ring(&self.rings) {
+        )
+    }
+
+    /// Says the task's exit code to the engine, which started it and has no other way to know
+    /// it, and returns it for `main` to return: the last call a task makes.
+    pub fn exit(&mut self, code: i64) -> i64 {
+        if self.half.exit(&self.rings, code) {
             self.wakes += 1;
         }
-        posted
+        code
     }
 
     /// Sleeps on the task's bell until the next batch or the end (the input ring is empty).
@@ -730,40 +759,80 @@ impl Rings {
     /// returning the record's length (`None` refuses the batch, an error), and the record is
     /// posted and the batch released. No byte moves but what `f` writes.
     pub fn step(&mut self, f: impl FnOnce(&[u8], &mut [u8]) -> Option<usize>) -> Result<Step> {
-        let entry = match self.pending.take() {
-            Some(e) => e,
+        let mut f = Some(f);
+        self.step_parts(|input, window, _| f.take()?(input, window).map(Part::Last))
+    }
+
+    /// [`Rings::step`] for an answer that may be bigger than a window: `f` reads the batch in
+    /// place and writes part `part` of its answer (from 0) into a free window, saying whether
+    /// more follows. Each part is posted as a record of its own, in a window of its own, and
+    /// the batch is released after the last. A step answers one batch, waiting for no window:
+    /// on [`Step::NoWindow`] the next step goes on with the same part.
+    pub fn step_parts(
+        &mut self,
+        mut f: impl FnMut(&[u8], &mut [u8], u32) -> Option<Part>,
+    ) -> Result<Step> {
+        let (entry, mut part) = match self.pending.take() {
+            Some(p) => p,
             None => match self.half.next(&self.rings).map_err(broken)? {
-                Some(e) => e,
+                Some(e) => (e, 0),
                 None if self.half.ended(&self.rings) => return Ok(Step::Ended),
                 None => return Ok(Step::NoInput),
             },
         };
-        let Some(w) = self.half.window(&self.rings).map_err(broken)? else {
-            self.pending = Some(entry);
-            return Ok(Step::NoWindow);
-        };
+        loop {
+            let Some(w) = self.half.window(&self.rings).map_err(broken)? else {
+                self.pending = Some((entry, part));
+                return Ok(Step::NoWindow);
+            };
+            let (len, last) = match self.write_part(entry, w, part, &mut f)? {
+                Part::Last(len) => (len, true),
+                Part::More(len) => (len, false),
+            };
+            if !last {
+                // The engine takes it now, so its window can come back for a later part.
+                if !self.post(w, len as u64, entry.cookie) {
+                    return Err(Error::ShouldWait);
+                }
+                part += 1;
+                continue;
+            }
+            if !self.post_quietly(w, len as u64, entry.cookie) {
+                return Err(Error::ShouldWait);
+            }
+            // One ring for the record and the release, which the engine waits for.
+            self.release();
+            return Ok(Step::Answered(w));
+        }
+    }
+
+    /// Lets `f` write part `part` of `entry`'s answer into window `w`.
+    fn write_part(
+        &mut self,
+        entry: ring::InEntry,
+        w: u64,
+        part: u32,
+        f: &mut impl FnMut(&[u8], &mut [u8], u32) -> Option<Part>,
+    ) -> Result<Part> {
         let g = self.half.geometry;
         let input = self.region.range(entry.offset, entry.len as usize)?;
         let out = self.rings.range(g.window_at(w), g.window_bytes as usize)?;
         // SAFETY: the batch is mapped read only and the engine writes no span it posted until
         // the task releases it (DP-I4); the window is the task's from the free ring until it
         // posts it, in another mapping, so the two slices never overlap; both borrows end
-        // before the post and the release below.
+        // when this returns, before the caller posts and releases.
         let (input, window) = unsafe {
             (
                 core::slice::from_raw_parts(input as *const u8, entry.len as usize),
                 core::slice::from_raw_parts_mut(out as *mut u8, g.window_bytes as usize),
             )
         };
-        let len = f(input, window).ok_or(Error::InvalidArgs)?;
+        let wrote = f(input, window, part).ok_or(Error::InvalidArgs)?;
+        let (Part::Last(len) | Part::More(len)) = wrote;
         if len == 0 || len as u64 > g.window_bytes {
             return Err(Error::OutOfRange);
         }
-        if !self.post(w, len as u64, entry.cookie) {
-            return Err(Error::ShouldWait);
-        }
-        self.release();
-        Ok(Step::Answered(w))
+        Ok(wrote)
     }
 
     /// Raises the task's note and rings the engine's bell: call it before a port call and

@@ -176,9 +176,165 @@ pub fn processes(env: &[String]) -> Result<usize, String> {
     }
 }
 
+/// Where the user target's linker script (`kernel/sys/user.ld`) puts a native program's first
+/// segment, its text.
+pub const NATIVE_BASE: u64 = 0x40_0000;
+
+const PT_LOAD: u32 = 1;
+const PF_X: u32 = 1;
+const PF_W: u32 = 2;
+const PF_R: u32 = 4;
+
+fn u16_at(b: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?))
+}
+
+fn u32_at(b: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
+}
+
+fn u64_at(b: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?))
+}
+
+/// Whether `elf` (the whole program, or at least its ELF header and program headers) is a program of
+/// the Moruna kernel's user target (`x86_64-moruna-user`), as an image entry declaring
+/// `abi: moruna` says its command is: a static x86-64 executable laid out by the user linker
+/// script, whose program headers are its loaded segments and nothing else, read and execute
+/// first at 0x400000, then read only, then read and write. A Linux program has a stack header
+/// (and a static musl one its notes and its thread-local storage), so none passes. `Err` says
+/// what does not match.
+pub fn native_elf(elf: &[u8]) -> Result<(), String> {
+    if elf.get(..4) != Some(b"\x7fELF".as_slice()) {
+        return Err("it is not an ELF program".into());
+    }
+    if elf.get(4) != Some(&2) || elf.get(5) != Some(&1) {
+        return Err("it is not a 64-bit little-endian ELF program".into());
+    }
+    let short = || String::from("its ELF header ends early");
+    let (kind, machine) = (
+        u16_at(elf, 16).ok_or_else(short)?,
+        u16_at(elf, 18).ok_or_else(short)?,
+    );
+    if kind != 2 {
+        return Err(format!(
+            "it is not a static executable (ELF type {kind}, where the user target links type 2)"
+        ));
+    }
+    if machine != 62 {
+        return Err(format!(
+            "it is not an x86-64 program (ELF machine {machine})"
+        ));
+    }
+    let phoff = u64_at(elf, 32).ok_or_else(short)?;
+    let (size, count) = (
+        u16_at(elf, 54).ok_or_else(short)?,
+        u16_at(elf, 56).ok_or_else(short)?,
+    );
+    if size != 56 || !(1..=3).contains(&count) {
+        return Err(format!(
+            "it has {count} program headers of {size} bytes, where the user target's linker \
+             script writes one to three of 56 (its loaded segments)"
+        ));
+    }
+    let mut flags = Vec::new();
+    for i in 0..u64::from(count) {
+        let at = usize::try_from(phoff + i * 56)
+            .map_err(|_| String::from("its program headers lie past its bytes"))?;
+        let ty = u32_at(elf, at)
+            .ok_or_else(|| String::from("its program headers lie past its bytes"))?;
+        if ty != PT_LOAD {
+            return Err(format!(
+                "its program header {i} is of type {ty:#x}, not a loaded segment: the user \
+                 target's linker script writes none other (a Linux program has a stack header)"
+            ));
+        }
+        let f = u32_at(elf, at + 4).unwrap_or(0);
+        let vaddr = u64_at(elf, at + 16).unwrap_or(0);
+        if i == 0 && vaddr != NATIVE_BASE {
+            return Err(format!(
+                "its first segment is at {vaddr:#x}, where the user target's linker script puts \
+                 its text at {NATIVE_BASE:#x}"
+            ));
+        }
+        flags.push(f & (PF_R | PF_W | PF_X));
+    }
+    let order = [PF_R | PF_X, PF_R, PF_R | PF_W];
+    let mut next = order.iter();
+    if flags.first() != Some(&(PF_R | PF_X)) || !flags.iter().all(|f| next.any(|o| o == f)) {
+        return Err(format!(
+            "its segments' permissions are {flags:?}, where the user target's linker script \
+             writes read and execute, then read, then read and write"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An ELF header and its program headers: (type, flags, vaddr) each.
+    fn elf(kind: u16, machine: u16, headers: &[(u32, u32, u64)]) -> Vec<u8> {
+        let mut b = vec![0u8; 64];
+        b[..4].copy_from_slice(b"\x7fELF");
+        b[4] = 2;
+        b[5] = 1;
+        b[16..18].copy_from_slice(&kind.to_le_bytes());
+        b[18..20].copy_from_slice(&machine.to_le_bytes());
+        b[32..40].copy_from_slice(&64u64.to_le_bytes());
+        b[54..56].copy_from_slice(&56u16.to_le_bytes());
+        b[56..58].copy_from_slice(&(headers.len() as u16).to_le_bytes());
+        for (ty, flags, vaddr) in headers {
+            let mut h = [0u8; 56];
+            h[..4].copy_from_slice(&ty.to_le_bytes());
+            h[4..8].copy_from_slice(&flags.to_le_bytes());
+            h[16..24].copy_from_slice(&vaddr.to_le_bytes());
+            b.extend_from_slice(&h);
+        }
+        b
+    }
+
+    #[test]
+    fn p_a_native_program_is_the_user_target_s_layout_and_nothing_else() {
+        let user = [
+            (1, 5, NATIVE_BASE),
+            (1, 4, NATIVE_BASE + 0x10000),
+            (1, 6, NATIVE_BASE + 0x20000),
+        ];
+        assert_eq!(native_elf(&elf(2, 62, &user)), Ok(()));
+        // An empty segment the linker leaves out.
+        assert_eq!(native_elf(&elf(2, 62, &[user[0], user[2]])), Ok(()));
+        assert_eq!(native_elf(&elf(2, 62, &user[..1])), Ok(()));
+        let refused = |b: Vec<u8>, says: &str| {
+            let why = native_elf(&b).unwrap_err();
+            assert!(why.contains(says), "{why}");
+        };
+        refused(b"#!/bin/sh\n".to_vec(), "not an ELF");
+        let mut class32 = elf(2, 62, &user);
+        class32[4] = 1;
+        refused(class32, "64-bit");
+        refused(elf(2, 62, &user)[..17].to_vec(), "ends early");
+        refused(elf(3, 62, &user), "ELF type 3");
+        refused(elf(2, 183, &user), "machine 183");
+        refused(elf(2, 62, &[]), "0 program headers");
+        // A static musl program: its stack header.
+        refused(
+            elf(2, 62, &[user[0], (0x6474_e551, 6, 0)]),
+            "type 0x6474e551",
+        );
+        // A Linux program's read-only segment first, at the same base.
+        refused(elf(2, 62, &[(1, 4, NATIVE_BASE), user[0]]), "permissions");
+        refused(elf(2, 62, &[(1, 5, 0x20_0000)]), "at 0x200000");
+        refused(elf(2, 62, &[user[0], user[2], user[1]]), "permissions");
+        refused(
+            elf(2, 62, &[user[0], (1, 7, NATIVE_BASE + 0x10000)]),
+            "permissions",
+        );
+        let mut cut = elf(2, 62, &user);
+        cut.truncate(64 + 56);
+        refused(cut, "past its bytes");
+    }
 
     #[test]
     fn p_a_record_is_its_framing_its_buffers_and_zeros() {

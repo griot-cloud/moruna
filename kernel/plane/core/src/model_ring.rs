@@ -171,6 +171,9 @@ pub enum Behave {
     WriteAfterPost,
     /// Ends after its first batch, without releasing it.
     Crash,
+    /// Answers each batch with this many records, each the record it was given in a window of
+    /// its own, then releases the batch.
+    Split(u8),
 }
 
 /// A task of the model that speaks the ring protocol.
@@ -187,6 +190,8 @@ pub struct RingTaskModel {
     waiting: Option<u64>,
     token: u64,
     pending: Option<(InEntry, Vec<u8>)>,
+    /// Records posted for the batch it holds.
+    parts: u8,
     posted_since_put: u64,
     /// The object and the offset of the record it posted last.
     last_posted: Option<(Mem, u64)>,
@@ -221,6 +226,7 @@ impl RingTaskModel {
             waiting: None,
             token: 0,
             pending: None,
+            parts: 0,
             posted_since_put: 0,
             last_posted: None,
             outputs: 0,
@@ -422,8 +428,8 @@ impl RingTaskModel {
                     }
                     Ok(None) => {
                         if ring.ended(&view) {
-                            // A task that ends on its own says so first.
-                            ring.note(&view);
+                            // A task that ends on its own says its exit code first.
+                            ring.exit(&view, 0);
                             if ring.mode == Mode::Unmap && self.posted_since_put > 0 {
                                 self.hand_back();
                             }
@@ -504,6 +510,15 @@ impl RingTaskModel {
             if self.behave == Behave::Crash {
                 self.end(Ending::Killed);
                 return true;
+            }
+            if let Behave::Split(n) = self.behave {
+                self.parts += 1;
+                if self.parts < n {
+                    // The next record of the same batch, in the next window.
+                    self.pending = Some((entry, out));
+                    continue;
+                }
+                self.parts = 0;
             }
             ring.release(&view);
             // The engine's bell: a wake only when it sleeps on it. A task that waits on port

@@ -170,6 +170,10 @@
               "$ref": "#/$defs/PortDoc"
             },
             "description": "Ports the command may call besides its needs, each routed as the document says (MH\n4.10): to the host protocol's peer or to a handler the program registered."
+          },
+          "abi": {
+            "$ref": "#/$defs/Abi",
+            "description": "The ABI the command's program is built for: `linux` (the default), run by the Linux\npersonality, or `moruna`, a native program of the Moruna kernel's user target, which\nthe engine checks and starts itself on the data plane (with `plane: true`). Only the\nMoruna kernel runs a native program."
           }
         },
         "required": [
@@ -239,6 +243,21 @@
               }
             },
             "description": "One port a stage may call (`ports.<name>`, MH 4.10): exactly one of `host` and `guest`."
+          },
+          "Abi": {
+            "oneOf": [
+              {
+                "type": "string",
+                "const": "linux",
+                "description": "A Linux program, run by the Linux personality on the Moruna kernel."
+              },
+              {
+                "type": "string",
+                "const": "moruna",
+                "description": "A native program of the Moruna kernel's user target (`x86_64-moruna-user`)."
+              }
+            ],
+            "description": "The ABI an image's command is built for."
           }
         },
         "examples": [
@@ -548,6 +567,10 @@
               "$ref": "#/$defs/PortDoc"
             },
             "description": "Ports the command may call besides its needs, each routed as the document says (MH\n4.10): to the host protocol's peer or to a handler the program registered."
+          },
+          "abi": {
+            "$ref": "#/$defs/Abi",
+            "description": "The ABI the command's program is built for: `linux` (the default), run by the Linux\npersonality, or `moruna`, a native program of the Moruna kernel's user target, which\nthe engine checks and starts itself on the data plane (with `plane: true`). Only the\nMoruna kernel runs a native program."
           }
         },
         "required": [
@@ -617,6 +640,21 @@
               }
             },
             "description": "One port a stage may call (`ports.<name>`, MH 4.10): exactly one of `host` and `guest`."
+          },
+          "Abi": {
+            "oneOf": [
+              {
+                "type": "string",
+                "const": "linux",
+                "description": "A Linux program, run by the Linux personality on the Moruna kernel."
+              },
+              {
+                "type": "string",
+                "const": "moruna",
+                "description": "A native program of the Moruna kernel's user target (`x86_64-moruna-user`)."
+              }
+            ],
+            "description": "The ABI an image's command is built for."
           }
         },
         "examples": [
@@ -990,6 +1028,10 @@
               "$ref": "#/$defs/PortDoc"
             },
             "description": "Ports the command may call besides its needs, each routed as the document says (MH\n4.10): to the host protocol's peer or to a handler the program registered."
+          },
+          "abi": {
+            "$ref": "#/$defs/Abi",
+            "description": "The ABI the command's program is built for: `linux` (the default), run by the Linux\npersonality, or `moruna`, a native program of the Moruna kernel's user target, which\nthe engine checks and starts itself on the data plane (with `plane: true`). Only the\nMoruna kernel runs a native program."
           }
         },
         "required": [
@@ -1059,6 +1101,21 @@
               }
             },
             "description": "One port a stage may call (`ports.<name>`, MH 4.10): exactly one of `host` and `guest`."
+          },
+          "Abi": {
+            "oneOf": [
+              {
+                "type": "string",
+                "const": "linux",
+                "description": "A Linux program, run by the Linux personality on the Moruna kernel."
+              },
+              {
+                "type": "string",
+                "const": "moruna",
+                "description": "A native program of the Moruna kernel's user target (`x86_64-moruna-user`)."
+              }
+            ],
+            "description": "The ABI an image's command is built for."
           }
         },
         "examples": [

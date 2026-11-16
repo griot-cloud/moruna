@@ -153,6 +153,28 @@ class Protocol(unittest.TestCase):
         e.close()
         self.assertTrue(t.ended())
 
+    def test_several_records_for_one_batch_then_the_release_and_the_exit_code(self):
+        g = geometry()
+        w = ring.Words(bytearray(g.object_bytes()))
+        e = Engine(w, g, ring.PROTECT)
+        e.give(0)
+        e.give(1)
+        t = ring.Task(w)
+        e.post(4096, 100, 7, 4)
+        t.next()
+        for n in (0, 1):
+            self.assertEqual(t.window(), n)
+            self.assertTrue(t.post(n, 0, 50, 7))
+        self.assertEqual(w.load(ring.IN_TAIL), 0)
+        self.assertTrue(t.release())
+        self.assertEqual((e.take(), e.take()), ((0, 0, 50, 7), (1, 0, 50, 7)))
+        woke = []
+        w.store(ring.ENGINE_WAITS, 1)
+        self.assertTrue(t.exit(-3, woke.append))
+        self.assertEqual(woke, [ring.ENGINE_BELL])
+        self.assertEqual(w.load(ring.TASK_EXIT), 1)
+        self.assertEqual(w.load(ring.TASK_EXIT_CODE), (1 << 64) - 3)
+
     def test_words_that_could_not_be_true_are_refused(self):
         g = geometry()
         w = ring.Words(bytearray(g.object_bytes()))

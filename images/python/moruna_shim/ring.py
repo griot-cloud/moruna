@@ -3,13 +3,14 @@
 The layout and the protocol are the engine's (kernel/plane/core/src/ring.rs); this is the same
 task half, in Python. Words are little-endian u64s at fixed byte offsets of the rings object.
 Each side sleeps on its bell, a 32-bit futex word the other side raises after each post and
-wakes only when the sleeper said it waits.
+wakes only when the sleeper said it waits. A task may answer a batch with several records; its
+release of the batch says it is done. It says its exit code before it ends.
 """
 
 import struct
 
 MAGIC_VALUE = int.from_bytes(b"MORUNARG", "little")
-VERSION_VALUE = 3
+VERSION_VALUE = 4
 
 MAGIC = 0
 VERSION = 8
@@ -35,6 +36,8 @@ ATTACHED = 704
 TASK_BELL = 768
 ENGINE_BELL = 832
 TASK_NOTE = 896
+TASK_EXIT = 960
+TASK_EXIT_CODE = 968
 
 ENTRIES_AT = 4096
 IN_ENTRY = 32
@@ -221,6 +224,12 @@ class Task:
         self.note_value += 1
         self.words.store(TASK_NOTE, self.note_value)
         return self.ring(wake)
+
+    def exit(self, code, wake):
+        """Says the task's exit code, then raises its note: the last thing a task does."""
+        self.words.store(TASK_EXIT_CODE, code & 0xFFFFFFFFFFFFFFFF)
+        self.words.store(TASK_EXIT, 1)
+        return self.note(wake)
 
     def has_input(self):
         w = self.words

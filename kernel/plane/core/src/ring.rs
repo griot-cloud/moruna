@@ -15,9 +15,17 @@
 //!
 //! The three rings are single producer, single consumer, with indices that only grow:
 //!
-//! - **input** (the engine posts a batch, the task releases it);
+//! - **input** (the engine posts a batch, the task releases it once it is done with it);
 //! - **output** (the task posts a record it wrote in a window, the engine takes it);
 //! - **free** (the engine gives a window, the task takes it).
+//!
+//! A task answers a batch with one record or several, each in a window of its own, and then
+//! releases the batch: its release says the batch is done, and the engine takes every record
+//! posted before it as the batch's answer. A window is sized from the plane's budget, never
+//! from a guess of how much bigger a stage's output is than its input.
+//!
+//! The task says its exit code in the control page before it ends ([`Task::exit`]): a task the
+//! engine starts itself has no other way to tell it.
 //!
 //! The task can write every byte of the rings object, so the engine never reads back a word
 //! it wrote: it keeps its own copies, and checks every word the task writes against them
@@ -31,8 +39,9 @@
 pub mod layout {
     /// "MORUNARG" as a little-endian `u64`.
     pub const MAGIC_VALUE: u64 = u64::from_le_bytes(*b"MORUNARG");
-    /// The protocol's version.
-    pub const VERSION_VALUE: u64 = 3;
+    /// The protocol's version: 4 since a task answers a batch with several records and says
+    /// its exit code.
+    pub const VERSION_VALUE: u64 = 4;
 
     pub const MAGIC: usize = 0;
     pub const VERSION: usize = 8;
@@ -79,6 +88,10 @@ pub mod layout {
     /// Raised by the task before a port call and before it ends: the engine reads the task's
     /// port and slots, which a sleep on its bell does not watch.
     pub const TASK_NOTE: usize = 896;
+    /// One once the task said its exit code, in [`TASK_EXIT_CODE`], just before it ends.
+    pub const TASK_EXIT: usize = 960;
+    /// The exit code the task said, an `i64`.
+    pub const TASK_EXIT_CODE: usize = 968;
 
     /// The entries start on the second page.
     pub const ENTRIES_AT: usize = 4096;
@@ -339,6 +352,8 @@ impl Engine {
             TASK_BELL,
             ENGINE_BELL,
             TASK_NOTE,
+            TASK_EXIT,
+            TASK_EXIT_CODE,
         ] {
             s.store(at, 0);
         }
@@ -549,6 +564,12 @@ impl Engine {
         changed
     }
 
+    /// The exit code the task said, if it said one ([`Task::exit`]). The task wrote it, so
+    /// it is only the task's word: the engine judges the task by what it put.
+    pub fn exit(&self, s: &impl Shared) -> Option<i64> {
+        (s.load(TASK_EXIT) == 1).then(|| s.load(TASK_EXIT_CODE) as i64)
+    }
+
     /// Awake again.
     pub fn awake(&self, s: &impl Shared) {
         s.store(ENGINE_WAITS, 0);
@@ -634,7 +655,8 @@ impl Task {
         Ok(Some(e))
     }
 
-    /// Releases the oldest input taken.
+    /// Releases the oldest input taken: the task is done with it, and every record it posted
+    /// before answers it.
     pub fn release(&mut self, s: &impl Shared) -> bool {
         if self.in_tail == self.in_next {
             return false;
@@ -710,6 +732,14 @@ impl Task {
         self.note = self.note.wrapping_add(1);
         s.store(TASK_NOTE, self.note);
         self.ring(s)
+    }
+
+    /// Says the task's exit code, then raises its note: the last thing a task does before it
+    /// ends.
+    pub fn exit(&mut self, s: &impl Shared, code: i64) -> bool {
+        s.store(TASK_EXIT_CODE, code as u64);
+        s.store(TASK_EXIT, 1);
+        self.note(s)
     }
 
     /// Whether an input, or the end, is there for the task.
