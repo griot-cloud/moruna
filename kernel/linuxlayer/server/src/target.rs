@@ -22,7 +22,9 @@
 //!
 //! Start slots, as `kernel/linux/server` took them: `console`; `supervisor` (the process
 //! resource, `moruna_node::Bootstrap::Linux`); `fs`, a listener of the image filesystem;
-//! `listen*`, listeners of `moruna.linux`; and `personality`, the personality's image.
+//! `listen*`, listeners of `moruna.linux`. The personality's image is in the server
+//! (`LINUXLAYER_PERSONALITY` at its build), so a boot or node image starts it as it
+//! started the old one.
 
 use alloc::{
     boxed::Box,
@@ -64,6 +66,13 @@ const RING_LEN: u64 = 256 * 1024;
 /// How often a running program's ring is read, in nanoseconds.
 const READ_EVERY: u64 = 20_000_000;
 
+/// Bytes aligned as an ELF image's headers want them.
+#[repr(C, align(4096))]
+struct Aligned<T: ?Sized>(T);
+
+/// The personality's image.
+static PERSONALITY: &Aligned<[u8]> = &Aligned(*include_bytes!(env!("LINUXLAYER_PERSONALITY")));
+
 /// A request to run a program, waiting for the main loop to start it.
 struct Job {
     pending: Pending,
@@ -79,8 +88,6 @@ struct Shared {
     out: Console,
     fs: Channel,
     resource: Handle,
-    /// The personality's image, mapped.
-    image: Mapping<'static>,
     cpus: usize,
     jobs: VecDeque<Job>,
     running: usize,
@@ -303,7 +310,6 @@ fn launch_job(
         out,
         fs,
         resource,
-        image,
         guardian,
         ..
     } = s;
@@ -388,7 +394,7 @@ fn launch_job(
         plane: launch_plane,
         before_start: Some(&mut publish),
     };
-    let launched = launcher::launch_with(resource, &name, image.bytes(), &mut grants, options);
+    let launched = launcher::launch_with(resource, &name, &PERSONALITY.0, &mut grants, options);
     let (process, _) = launched.map_err(|e| {
         if let Some(id) = escrow.get() {
             let _ = guardian.retract(id);
@@ -528,29 +534,6 @@ fn take_root(out: &Console) -> Option<(Handle, Channel)> {
     }
 }
 
-/// The personality's image, mapped from the slot `personality`.
-fn personality_image(out: &Console) -> Option<Mapping<'static>> {
-    let Some(image) = start::take("personality").map(Memory) else {
-        println!(
-            out,
-            "linux: FAIL: no personality image (the slot `personality`)"
-        );
-        return None;
-    };
-    let len = launcher::object_len(&image);
-    match image.map_detached(0, len, 0) {
-        Ok(mapping) => Some(mapping),
-        Err(e) => {
-            println!(
-                out,
-                "linux: FAIL: mapping the personality image: {}",
-                e.name()
-            );
-            None
-        }
-    }
-}
-
 fn run() -> i64 {
     let Some(out) = start::take("console").map(Console) else {
         return 90;
@@ -566,14 +549,10 @@ fn run() -> i64 {
         println!(out, "linux: FAIL: no image filesystem (the slot `fs`)");
         return 1;
     };
-    let Some(image) = personality_image(&out) else {
-        return 1;
-    };
     let shared = Rc::new(RefCell::new(Shared {
         out,
         fs,
         resource,
-        image,
         cpus: start::cpus().max(1),
         jobs: VecDeque::new(),
         running: 0,
@@ -619,7 +598,7 @@ fn run() -> i64 {
             "linux: up: {} listeners, {} CPUs, each program on its own Linux personality ({} bytes)",
             listeners,
             s.cpus,
-            s.image.bytes().len()
+            PERSONALITY.0.len()
         );
     }
     let mut served = 0u64;
