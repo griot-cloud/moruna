@@ -16,13 +16,23 @@
 //!
 //! It also records which CPUs ran process threads (the post-schedule hook calls
 //! [`ran_process_thread`]), so a boot can show the processes ran across every CPU.
+//!
+//! A thread can be placed on one CPU (`thread_set_cpu`, data-os §2 and C5): a place to
+//! run, never a function to run. The pin waits in [`PINS`] until the thread is next
+//! queued, and it moves then, when it is on no CPU's queue. Since a task keeps its CPU,
+//! that one move is the whole mechanism: the thread runs there until it is placed again.
 
-use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, VecDeque},
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use moruna_abi::Error;
 use ostd::{
     cpu::{CpuId, PinCurrentCpu, num_cpus},
-    sync::SpinLock,
+    sync::{LocalIrqDisabled, SpinLock, Waiter},
     task::{
         Task, TaskOptions, disable_preempt, halt_cpu,
         scheduler::{
@@ -33,6 +43,8 @@ use ostd::{
     util::id_set::Id,
 };
 
+use crate::process::Thread;
+
 /// Timer ticks (1 ms each) a task runs before another task waiting on its CPU may
 /// take the CPU from it.
 const SLICE_TICKS: u32 = 10;
@@ -42,6 +54,13 @@ pub const CPUS_MAX: usize = 64;
 
 /// Bit `i` is set once CPU `i` has run a process thread.
 static RAN: AtomicU64 = AtomicU64::new(0);
+
+/// The pins not yet applied, by thread id: the thread, held weakly so a thread that ends
+/// first leaves nothing behind, and the CPU it is to run on.
+static PINS: SpinLock<BTreeMap<u64, (Weak<Thread>, CpuId)>, LocalIrqDisabled> =
+    SpinLock::new(BTreeMap::new());
+/// How many pins wait, read without the lock by every enqueue.
+static PENDING: AtomicUsize = AtomicUsize::new(0);
 
 struct RunQueue {
     current: Option<Arc<Task>>,
@@ -56,6 +75,12 @@ struct RunQueue {
 impl RunQueue {
     fn is_idle(&self, task: &Arc<Task>) -> bool {
         Arc::ptr_eq(task, &self.idle)
+    }
+
+    /// Whether `task` is this CPU's current task or waits in its queue.
+    fn holds(&self, task: &Arc<Task>) -> bool {
+        self.current.as_ref().is_some_and(|c| Arc::ptr_eq(c, task))
+            || self.queue.iter().any(|queued| Arc::ptr_eq(queued, task))
     }
 
     fn publish(&self) {
@@ -148,23 +173,51 @@ impl Cpus {
     }
 }
 
+impl Cpus {
+    /// Moves `task`, which is being queued, to `cpu` if no queue holds it: `false` when
+    /// its CPU's queue still has it (a wake while it runs), and the pin must wait.
+    fn place(&self, task: &Arc<Task>, cpu: CpuId) -> bool {
+        let Some(old) = task.cpu().get() else {
+            return task.cpu().set_if_is_none(cpu).is_ok();
+        };
+        if old == cpu {
+            return true;
+        }
+        // Under its old queue's lock, so no enqueue queues it there meanwhile: one that
+        // read the old CPU finds it changed once it has the lock, and retries.
+        let rq = self.queues[old.as_usize()].disable_irq().lock();
+        if rq.holds(task) {
+            return false;
+        }
+        task.cpu().set_anyway(cpu);
+        true
+    }
+}
+
 impl Scheduler for Cpus {
     fn enqueue(&self, runnable: Arc<Task>, flags: EnqueueFlags) -> Option<CpuId> {
+        if PENDING.load(Ordering::Acquire) != 0
+            && let Some((thread, cpu)) = take_pin(&runnable)
+            && !self.place(&runnable, cpu)
+        {
+            put_pin(&thread, cpu);
+        }
         // Only the first enqueue chooses a CPU. An assigned CPU is affinity,
         // not evidence that this task is still runnable: a waiter can already
         // be dequeued while its old context is completing the switch-out.
         let selected = self.select(flags);
-        let target = match runnable.cpu().set_if_is_none(selected) {
-            Ok(()) => selected,
-            Err(cpu) => cpu,
+        let (target, mut rq) = loop {
+            let target = match runnable.cpu().set_if_is_none(selected) {
+                Ok(()) => selected,
+                Err(cpu) => cpu,
+            };
+            let rq = self.queues[target.as_usize()].disable_irq().lock();
+            // A pin may have moved it while this waited for the lock.
+            if runnable.cpu().get() == Some(target) {
+                break (target, rq);
+            }
         };
-        let mut rq = self.queues[target.as_usize()].disable_irq().lock();
-        if rq
-            .current
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &runnable))
-            || rq.queue.iter().any(|queued| Arc::ptr_eq(queued, &runnable))
-        {
+        if rq.holds(&runnable) {
             return None;
         }
         // Only a CPU running its idle task is asked to reschedule; one still in its
@@ -241,4 +294,74 @@ pub fn ran_process_thread() -> u64 {
 /// How many CPUs have run a process thread so far.
 pub fn cpus_that_ran() -> u32 {
     RAN.load(Ordering::Relaxed).count_ones()
+}
+
+/// The thread a task runs, if it is a process thread.
+fn thread_of(task: &Task) -> Option<&Arc<Thread>> {
+    task.data().downcast_ref::<Arc<Thread>>()
+}
+
+/// Takes the pin waiting for `task`'s thread, if one does.
+fn take_pin(task: &Task) -> Option<(Arc<Thread>, CpuId)> {
+    let thread = thread_of(task)?;
+    let mut pins = PINS.lock();
+    let (_, cpu) = pins.remove(&thread.tid)?;
+    PENDING.store(pins.len(), Ordering::Release);
+    Some((thread.clone(), cpu))
+}
+
+/// Records that `thread` is to run on `cpu`, replacing any pin it had; pins of threads
+/// that have ended go.
+fn put_pin(thread: &Arc<Thread>, cpu: CpuId) {
+    let mut pins = PINS.lock();
+    pins.retain(|_, (t, _)| t.strong_count() > 0);
+    pins.insert(thread.tid, (Arc::downgrade(thread), cpu));
+    PENDING.store(pins.len(), Ordering::Release);
+}
+
+/// Drops `thread`'s pin, if one waits.
+fn drop_pin(thread: &Thread) {
+    let mut pins = PINS.lock();
+    pins.remove(&thread.tid);
+    PENDING.store(pins.len(), Ordering::Release);
+}
+
+/// The CPU running the caller now.
+pub fn current_cpu() -> u32 {
+    disable_preempt().current_cpu().as_usize() as u32
+}
+
+/// `thread_set_cpu`: runs `thread` on CPU `cpu` only, or, with `None`, wherever it is now
+/// (the scheduler moves no thread on its own). `caller` is the calling thread. The
+/// caller placing itself is on that CPU when this returns: it sleeps until the next timer
+/// tick wakes it, and is queued there. Another thread moves the next time it is queued:
+/// at once when it is asleep, when it next sleeps when it runs.
+pub fn set_cpu(caller: &Arc<Thread>, thread: &Arc<Thread>, cpu: Option<u32>) -> Result<(), Error> {
+    let Some(cpu) = cpu else {
+        drop_pin(thread);
+        return Ok(());
+    };
+    let cpu = usize::try_from(cpu)
+        .ok()
+        .and_then(|c| CpuId::try_from(c).ok())
+        .ok_or(Error::InvalidArgs)?;
+    put_pin(thread, cpu);
+    if !Arc::ptr_eq(caller, thread) {
+        return Ok(());
+    }
+    while current_cpu() as usize != cpu.as_usize() {
+        if caller.killed() {
+            drop_pin(caller);
+            return Err(Error::BadState);
+        }
+        // Leave this CPU: asleep, it is on no queue, and the tick's wake queues it on
+        // its new CPU. A tick before it sleeps finds it still running, keeps the pin,
+        // and the loop sleeps again.
+        let (waiter, waker) = Waiter::new_pair();
+        let key = crate::clock::arm_wake(crate::clock::now(), waker);
+        waiter.wait();
+        crate::clock::disarm(key);
+    }
+    drop_pin(caller);
+    Ok(())
 }

@@ -187,7 +187,42 @@ impl MemoryObject {
 
 // ---- stream A (data path, `architecture/data-os-streams.md`): stream A's additions to
 // ---- `MemoryObject` (large frames) go in this block.
-impl MemoryObject {}
+
+/// The pages of a large page (2 MiB).
+#[allow(
+    dead_code,
+    reason = "with_dma allocates with it once the integrator's patch lands"
+)]
+const RUN_PAGES: usize = ostd::mm::HUGE_PAGE_SIZE / PAGE;
+
+impl MemoryObject {
+    /// `pages` zeroed frames for an object, in aligned 2 MiB runs while a whole run
+    /// remains, so that `map::HUGE` maps them as large pages (data-os §2, C4); single
+    /// frames for the rest, and for a run the allocator has no aligned space for. The
+    /// same pages as single frames, charged the same.
+    #[allow(
+        dead_code,
+        reason = "with_dma allocates with it once the integrator's patch lands"
+    )]
+    pub fn large_frames(pages: usize) -> Result<Vec<UFrame>, Error> {
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(pages)
+            .map_err(|_| Error::NoMemory)?;
+        let mut options = FrameAllocOptions::new();
+        options.zeroed(true);
+        while frames.len() < pages {
+            let run = (pages - frames.len() >= RUN_PAGES)
+                .then(|| options.alloc_segment(RUN_PAGES).ok())
+                .flatten();
+            match run {
+                Some(run) => frames.extend(USegment::from(run)),
+                None => frames.push(options.alloc_frame().map_err(|_| Error::NoMemory)?.into()),
+            }
+        }
+        Ok(frames)
+    }
+}
 
 // ---- stream B1 (personality, `architecture/data-os-streams.md`): stream B1's additions to
 // ---- `MemoryObject` (snapshots, pager-backed objects) go in this block.
