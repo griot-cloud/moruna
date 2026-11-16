@@ -88,8 +88,8 @@ impl<T> RawLock<T> {
         RawGuard { lock: self }
     }
 
-    /// Host tests only: `VmSpace::translate`.
-    #[cfg(not(target_os = "none"))]
+    /// The value, if no one holds it: host tests' `VmSpace::translate`, and the target's
+    /// end of a task (`backend::exit`), which a panic may reach with the lock held.
     pub(crate) fn try_lock(&self) -> Option<RawGuard<'_, T>> {
         self.word.try_lock().then_some(RawGuard { lock: self })
     }

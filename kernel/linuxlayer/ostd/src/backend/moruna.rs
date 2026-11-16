@@ -325,7 +325,34 @@ pub(crate) fn num_cpus() -> usize {
 }
 
 pub(crate) fn exit(code: u32) -> ! {
+    end_task();
     moruna_sys::exit(code as i64)
+}
+
+/// Kills every other process of the task: a task ends with its personality (a power-off or
+/// a panic), whatever its other processes are doing.
+fn end_task() {
+    let me = self_process();
+    let mut others = [0 as RawHandle; TASK_PROCESSES];
+    let mut n = 0;
+    // A panic may come while this thread holds the table's lock: then no process is killed
+    // rather than none ending.
+    let task = (0..100_000).find_map(|_| {
+        core::hint::spin_loop();
+        TASK.try_lock()
+    });
+    for &process in task.as_ref().map_or(&[][..], |t| t.processes.as_slice()) {
+        if Some(process) != me {
+            others[n] = process;
+            n += 1;
+        }
+    }
+    drop(task);
+    for &process in &others[..n] {
+        let process = core::mem::ManuallyDrop::new(moruna_sys::Process(Handle::from_raw(process)));
+        // One already ended answers an error, which changes nothing.
+        let _ = process.kill();
+    }
 }
 
 /// Whether copies run in place: the process was given the copy routines.
