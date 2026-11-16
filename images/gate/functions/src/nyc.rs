@@ -369,11 +369,10 @@ fn layer<const K: usize>(x: &[[f64; K]], w: &[f64], b: &[f64; HIDDEN], h: &mut [
             let mut acc = [[0.0f64; TILE_COLS]; TILE_ROWS];
             for k in 0..K {
                 let at = k * HIDDEN + j0;
-                let wk: &[f64; TILE_COLS] =
-                    match w.get(at..at + TILE_COLS).and_then(|s| s.try_into().ok()) {
-                        Some(wk) => wk,
-                        None => &[0.0; TILE_COLS],
-                    };
+                let wk: &[f64; TILE_COLS] = w
+                    .get(at..at + TILE_COLS)
+                    .and_then(|s| s.try_into().ok())
+                    .unwrap_or(&[0.0; TILE_COLS]);
                 for (a, xr) in acc.iter_mut().zip(&xs) {
                     let xv = xr[k];
                     for jj in 0..TILE_COLS {
