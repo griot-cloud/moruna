@@ -30,9 +30,10 @@ use moruna_plane::{
     ring::Mode,
     ringed::{Region, RingCalls, RingShape, View},
 };
+use moruna_record::{record::Decoded, ring::Ring};
 use moruna_svc::{Channel, Console, Handle, deadline_in, println, start};
 use moruna_sys::{
-    Account, Error, Memory, Process, map,
+    Account, Error, Memory, Process, Rights, map,
     plane::{Slot, attach},
 };
 
@@ -57,6 +58,8 @@ const CHUNK: usize = 8192;
 /// The port the task reports on, and the one it waits for every record taken on.
 const REPORT: u64 = 2;
 const TAKEN: u64 = 1;
+/// The task's log ring, as the engine's stage gives one.
+const LOG_BYTES: u64 = 64 << 10;
 
 /// The kernel's calls, counted; the plane's memory is charged to its own account.
 struct Counted {
@@ -288,6 +291,8 @@ struct Run {
     batches: u64,
     /// The task's process and account, kept while it lives.
     held: Option<(Process, Account)>,
+    /// The log ring the task was given, which the engine reads.
+    log: Option<Memory>,
 }
 
 impl Run {
@@ -312,9 +317,15 @@ impl Run {
         let slots = self.plane.ring_slots(task).map_err(plane_error)?;
         attach(&process, &slots, Some(port))
             .map_err(|(e, _)| format!("process_plane: {}", e.name()))?;
+        let log = log_ring()?;
+        let given = log
+            .0
+            .duplicate(Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER)
+            .map_err(kernel_error("handle_duplicate"))?;
         process
-            .start_with(entry, &mut [])
+            .start_with(entry, &mut [(Some(given), "log")])
             .map_err(kernel_error("process_start"))?;
+        self.log = Some(log);
         self.task = task;
         self.report = None;
         self.ended = false;
@@ -501,6 +512,55 @@ impl Run {
     }
 }
 
+/// A formatted log ring, as the engine's stage makes one for a task.
+fn log_ring() -> Result<Memory, String> {
+    let memory = Memory::create(LOG_BYTES).map_err(kernel_error("memory_create"))?;
+    {
+        let mut mapping = memory
+            .map(0, LOG_BYTES, map::READ | map::WRITE)
+            .map_err(kernel_error("memory_map"))?;
+        let region = mapping
+            .shared_region()
+            .map_err(kernel_error("the log ring's region"))?;
+        Ring::init(region).map_err(|e| format!("formatting the log ring: {e:?}"))?;
+    }
+    Ok(memory)
+}
+
+/// The lines in a task's log ring: each record's `stream` header, its subject and its text.
+fn log_lines(memory: &Memory) -> Result<Vec<(String, u32, String)>, String> {
+    let mut mapping = memory
+        .map(0, LOG_BYTES, map::READ | map::WRITE)
+        .map_err(kernel_error("memory_map"))?;
+    let region = mapping
+        .shared_region()
+        .map_err(kernel_error("the log ring's region"))?;
+    let ring = Ring::attach(region).map_err(|e| format!("attaching the log ring: {e:?}"))?;
+    let mut consumer = ring
+        .consumer()
+        .map_err(|e| format!("the log ring's consumer: {e:?}"))?;
+    let mut out = Vec::new();
+    while let Some(bytes) = consumer.pop() {
+        match moruna_record::record::decode(bytes) {
+            Decoded::Record(r, _) => {
+                let stream = r
+                    .headers
+                    .iter()
+                    .find(|(k, _)| *k == "stream")
+                    .map(|(_, v)| String::from(*v))
+                    .unwrap_or_default();
+                out.push((
+                    stream,
+                    r.subject,
+                    String::from_utf8_lossy(r.body).into_owned(),
+                ));
+            }
+            other => return Err(format!("a log record that does not decode: {other:?}")),
+        }
+    }
+    Ok(out)
+}
+
 /// `a / b` with two decimals.
 fn ratio(a: u64, b: u64) -> String {
     format!("{}.{:02}", a / b, a * 100 / b % 100)
@@ -529,9 +589,20 @@ fn lockstep(r: &mut Run) -> Result<(), String> {
             ));
         }
     }
+    // Its log line came on the ring it was given, as a Linux task's standard error does.
+    let lines = log_lines(r.log.as_ref().ok_or("no log ring")?)?;
+    let want = format!("ring-task: answered {LOCKSTEP} batches");
+    match lines.as_slice() {
+        [(stream, 2, text)] if stream == "stderr" && *text == want => {}
+        other => {
+            return Err(format!(
+                "the task's log ring held {other:?}, not the one line {want:?} on stderr"
+            ));
+        }
+    }
     println!(
         r.out,
-        "DS-P lockstep: ok: {} batches of {} rows, one at a time, each made in the task's region and read in place, y = 3x + 7 judged on every row, and the task said exit code 0 on its rings: engine {} calls a batch ({} revokes, {} regrants, {} sleeps on its bell, {} wakes of the task); task {} calls a batch ({} sleeps, {} wakes); the kernel copied {} bytes for the task, its bells' words",
+        "DS-P lockstep: ok: {} batches of {} rows, one at a time, each made in the task's region and read in place, y = 3x + 7 judged on every row, and the task said exit code 0 on its rings and its one log line on its log ring: engine {} calls a batch ({} revokes, {} regrants, {} sleeps on its bell, {} wakes of the task); task {} calls a batch ({} sleeps, {} wakes); the kernel copied {} bytes for the task, its bells' words",
         LOCKSTEP,
         ROWS,
         ratio(spent, LOCKSTEP),
@@ -671,6 +742,7 @@ fn run() -> i64 {
         ended: false,
         batches: 0,
         held: None,
+        log: None,
     };
     if let Err(why) = lockstep(&mut r) {
         println!(r.out, "DS-P lockstep: FAIL: {}", why);

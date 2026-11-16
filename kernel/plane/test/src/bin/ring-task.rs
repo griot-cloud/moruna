@@ -7,14 +7,18 @@
 //! its calls on the bells, then asks (port 1) whether to write the window of its last record.
 //! Told to, it writes it: the engine took write access to it back before it checked the
 //! record, so the write faults and the kernel ends this task. Told not to, it exits 0.
+//!
+//! It writes one line to its log (`moruna_sys::plane::Log`), which the engine reads back.
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+use core::fmt::Write;
 use moruna_ipc_check::record::{Need, check_record, framing_need};
-use moruna_sys::plane::{Plane, Rings, Step, copied};
+
+use moruna_sys::plane::{Log, Plane, Rings, Step, copied};
 
 moruna_sys::main!(run);
 
@@ -62,9 +66,13 @@ fn run() -> i64 {
     };
     let before = copied().unwrap_or(0);
     let mut last = None;
+    let mut answered = 0u64;
     loop {
         match rings.step(apply) {
-            Ok(Step::Answered(w)) => last = Some(w),
+            Ok(Step::Answered(w)) => {
+                last = Some(w);
+                answered += 1;
+            }
             Ok(Step::NoInput) => rings.wait_input(),
             Ok(Step::NoWindow) => rings.wait_window(),
             Ok(Step::Ended) => break,
@@ -73,6 +81,10 @@ fn run() -> i64 {
     }
     // The kernel's copies for this task, and its calls on the bells.
     let copies = copied().unwrap_or(u64::MAX).wrapping_sub(before);
+    // Its log line, which the engine reads back from the ring it gave the task as `log`.
+    if let Some(mut log) = Log::take() {
+        let _ = writeln!(log, "ring-task: answered {answered} batches");
+    }
     // Two notes follow: the report and the question are port calls.
     let (sleeps, wakes) = rings.bell_calls();
     let mut report = [0u8; 24];
