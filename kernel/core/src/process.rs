@@ -46,7 +46,7 @@ use crate::{
     object::Handle,
     plane::Plane,
     signal::Signaller,
-    syscall::{self, Flow},
+    syscall::Flow,
     usercopy,
     vm::{Access, Backing, Kind, Space},
 };
@@ -777,6 +777,8 @@ pub struct Thread {
     /// CPU time the thread has used, in nanoseconds, and when it last took a CPU.
     pub cpu_ns: AtomicU64,
     on_cpu_since: AtomicU64,
+    /// Stream B1: its side of the personality, and its interrupt.
+    pub(crate) mode: crate::personality::Mode,
 }
 
 struct Hooks<'a>(&'a Thread);
@@ -820,6 +822,8 @@ impl Thread {
             port_reply: SpinLock::new(None),
             cpu_ns: AtomicU64::new(0),
             on_cpu_since: AtomicU64::new(0),
+            // stream B1 hook
+            mode: crate::personality::Mode::new(),
         });
         if set_tid != 0 {
             process
@@ -835,8 +839,10 @@ impl Thread {
         Ok(thread)
     }
 
+    /// Whether the thread is ending, or (stream B1) an interrupt is pending: either stops
+    /// a wait in the core. [`Thread::dying`] is the end alone.
     pub fn killed(&self) -> bool {
-        self.killed.load(Ordering::Acquire)
+        self.killed.load(Ordering::Acquire) || self.mode.interrupt_pending()
     }
 
     fn kill(&self) {
@@ -892,69 +898,17 @@ fn describe(exception: Option<CpuException>, ip: usize) -> String {
     }
 }
 
-/// What a fault was.
-enum Touch {
-    /// A zero page's first touch, now mapped (SDD 20, f.12).
-    Served,
-    /// The process's own fault.
-    Fault,
-    /// A first touch whose page could not be had: why, for the process's end.
-    Refused(String),
-}
-
-/// A page fault on a page with no entry that the area allows is a zero page's first
-/// touch, served when its page can be charged and allocated. Anything else is the
-/// process's fault.
-fn first_touch(space: &Space, exception: &Option<CpuException>) -> Touch {
-    let Some(CpuException::PageFault(info)) = exception else {
-        return Touch::Fault;
-    };
-    let code = info.error_code.bits();
-    // Bit 0: the page was present (a protection fault, never a first touch).
-    if code & 0b1 != 0 {
-        return Touch::Fault;
-    }
-    let (access, word) = if code & 0b1_0000 != 0 {
-        (Access::Execute, "execute")
-    } else if code & 0b10 != 0 {
-        (Access::Write, "write")
-    } else {
-        (Access::Read, "read")
-    };
-    match space.fault(info.addr as u64, access) {
-        Ok(true) => Touch::Served,
-        Ok(false) => Touch::Fault,
-        Err(Error::QuotaExceeded) => Touch::Refused(format!(
-            "a page fault at {:#x} on {word} could not be charged: {}",
-            info.addr,
-            space.account().refusal(charge::ZERO_PAGE)
-        )),
-        Err(e) => Touch::Refused(format!(
-            "a page fault at {:#x} on {word} could not be served: {}",
-            info.addr,
-            e.name()
-        )),
-    }
-}
-
 fn run(thread: Arc<Thread>, context: UserContext) {
     thread.process.vm().activate();
     FsBase::new(thread.fs() as usize).load();
     let mut user = UserMode::new(context);
     let hooks = Hooks(&thread);
-    while !thread.killed() {
+    // stream B1 hook: the loop ends with the thread, not with an interrupt.
+    while !thread.dying() {
         match user.execute(&hooks) {
             ReturnReason::UserSyscall => {
-                let number = user.context_mut().rax() as u64;
-                let flow = if moruna_abi::nr::is_native(number) {
-                    syscall::dispatch(&thread, user.context_mut())
-                } else if let Some(forward) = thread.process.forward() {
-                    foreign::call(&thread, &forward, user.context_mut())
-                } else {
-                    user.context_mut()
-                        .set_rax(Error::BadSyscall.to_raw() as usize);
-                    Flow::Continue
-                };
+                // Stream B1: the branch is the personality's (`personality::syscall`).
+                let flow = crate::personality::syscall(&thread, user.context_mut());
                 match flow {
                     Flow::Continue => {}
                     Flow::ThreadExit => break,
@@ -969,18 +923,20 @@ fn run(thread: Arc<Thread>, context: UserContext) {
                 }
             }
             ReturnReason::UserException => {
-                let context = user.context_mut();
-                let ip = context.instruction_pointer();
-                let exception = context.take_exception();
-                let why = match first_touch(&thread.process.space, &exception) {
-                    Touch::Served => continue,
-                    Touch::Fault => describe(exception, ip),
-                    Touch::Refused(why) => why,
-                };
-                thread.process.end(Exit::Fault(why));
-                break;
+                // Stream B1: served, entered into the personality, or the process's fault.
+                match exception(&thread, user.context_mut()) {
+                    Flow::Continue => {}
+                    _ => break,
+                }
             }
-            ReturnReason::KernelEvent => {}
+            ReturnReason::KernelEvent => {
+                // Stream B1: an interrupt of a thread running its program.
+                if let Flow::ThreadExit =
+                    crate::personality::kernel_event(&thread, user.context_mut())
+                {
+                    break;
+                }
+            }
         }
     }
     clear_child_tid(&thread);
@@ -1019,7 +975,128 @@ impl Thread {}
 // ---- stream B1 (personality, `architecture/data-os-streams.md`): stream B1's additions to
 // ---- `Thread` and `Process` go in this block; it also owns the user-mode loop's syscall
 // ---- branch (the forward) above.
-impl Thread {}
+impl Thread {
+    /// Whether the thread is ending: killed, or its process ending.
+    pub fn dying(&self) -> bool {
+        self.killed.load(Ordering::Acquire)
+    }
+
+    /// `thread_interrupt`: stops its wait in the core, or brings it from its program into
+    /// its personality.
+    pub fn interrupt(&self) {
+        self.mode.raise();
+        if let Some(waker) = self.waker.lock().as_ref() {
+            waker.wake_up();
+        }
+    }
+
+    /// Activates the table the thread runs on: its program's while it runs its program.
+    pub fn activate(&self) {
+        if self.mode.in_program()
+            && let Some(program) = self.process.space.program()
+        {
+            program.vm.activate();
+            return;
+        }
+        self.process.vm().activate();
+    }
+}
+
+/// The thread on this CPU, if a process's.
+pub fn current() -> Option<Arc<Thread>> {
+    current_thread()
+}
+
+/// An exception of user code: a page fault the space serves (a first touch, a page a
+/// pager supplies, a page shared copy-on-write written, a page the program's table lacks),
+/// or else the program's, which enters its personality, or the process's own, which ends
+/// it (SDD 20, f.12).
+fn exception(thread: &Arc<Thread>, context: &mut UserContext) -> Flow {
+    let ip = context.instruction_pointer();
+    let exception = context.take_exception();
+    let program = thread.mode.in_program();
+    let mut refused = None;
+    if let Some(CpuException::PageFault(info)) = &exception {
+        let code = info.error_code.bits();
+        let (access, word) = if code & 0b1_0000 != 0 {
+            (Access::Execute, "execute")
+        } else if code & 0b10 != 0 {
+            (Access::Write, "write")
+        } else {
+            (Access::Read, "read")
+        };
+        let space = &thread.process.space;
+        loop {
+            match space.fault(info.addr as u64, access, program) {
+                Ok(true) => return Flow::Continue,
+                Ok(false) => break,
+                Err(Error::ShouldWait) => match space.want(info.addr as u64, thread) {
+                    Ok(()) => continue,
+                    // The thread is ending.
+                    Err(Error::BadState) => return Flow::Continue,
+                    Err(_) => {
+                        refused = Some(format!(
+                            "its pager refused the page at {:#x} on {word}",
+                            info.addr
+                        ));
+                        break;
+                    }
+                },
+                Err(Error::QuotaExceeded) => {
+                    refused = Some(format!(
+                        "a page fault at {:#x} on {word} could not be charged: {}",
+                        info.addr,
+                        space.account().refusal(charge::ZERO_PAGE)
+                    ));
+                    break;
+                }
+                Err(e) => {
+                    refused = Some(format!(
+                        "a page fault at {:#x} on {word} could not be served: {}",
+                        info.addr,
+                        e.name()
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+    if program {
+        let why = match &exception {
+            Some(CpuException::PageFault(_)) => moruna_abi::personality::reason::PAGE_FAULT,
+            _ => moruna_abi::personality::reason::EXCEPTION,
+        };
+        let detail = exception.as_ref().map(|e| {
+            let (vector, code) = crate::personality::vector(e);
+            let address = match e {
+                CpuException::PageFault(info) => info.addr as u64,
+                _ => 0,
+            };
+            (vector, code, address)
+        });
+        return crate::personality::enter(thread, context, why, detail);
+    }
+    // The personality's copy routine faulted on memory it may not reach: it resumes at its
+    // recovery address with the faulting address in `rdx`.
+    if let Some(program) = thread.process.space.program()
+        && let Some((routine, recovery)) = &program.copy
+        && routine.contains(&(ip as u64))
+    {
+        let address = match &exception {
+            Some(CpuException::PageFault(info)) => Some(info.addr as u64),
+            Some(CpuException::GeneralProtectionFault(_)) => Some(0),
+            _ => None,
+        };
+        if let Some(address) = address {
+            context.set_rip(*recovery as usize);
+            context.set_rdx(address as usize);
+            return Flow::Continue;
+        }
+    }
+    let why = refused.unwrap_or_else(|| describe(exception, ip));
+    thread.process.end(Exit::Fault(why));
+    Flow::ThreadExit
+}
 
 impl Process {
     pub fn vm(&self) -> &Arc<ostd::mm::VmSpace> {
@@ -1052,7 +1129,8 @@ pub fn deactivate_current(_guard: &DisabledLocalIrqGuard) {
 /// its FPU registers and FS base are back.
 pub fn activate_current() {
     if let Some(thread) = current_thread() {
-        thread.process.vm().activate();
+        // Stream B1: the thread's own table, the program's while it runs its program.
+        thread.activate();
         thread.fpu.lock().load();
         FsBase::new(thread.fs() as usize).load();
         thread.on_cpu_since.store(clock::now(), Ordering::Relaxed);

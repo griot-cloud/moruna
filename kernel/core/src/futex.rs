@@ -3,8 +3,11 @@
 //! A wait reads the word and queues the thread under one lock, so a wake that follows
 //! a change of the word can never fall between the read and the sleep. A queue is
 //! keyed by the process and the word's address: no word of one process names a queue
-//! of another (KK-I1). A waiter carries a bitset; a wake wakes only waiters whose set
-//! meets its own, which is what the bitset forms of Linux's futex need.
+//! of another (KK-I1), except a word of a shared memory object, which is keyed by the
+//! object and its offset in every process that maps it (stream B1: a personality's state
+//! shared by a container's processes, rings shared by the engine and its tasks). A
+//! waiter carries a bitset; a wake wakes only waiters whose set meets its own, which is
+//! what the bitset forms of Linux's futex need.
 
 use alloc::{
     collections::{BTreeMap, VecDeque},
@@ -15,7 +18,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use moruna_abi::{DEADLINE_INFINITE, Error};
 use ostd::sync::{SpinLock, Waiter, Waker};
 
-use crate::{clock, process::Thread, usercopy};
+use crate::{
+    clock,
+    process::{self, Process, Thread},
+    usercopy,
+};
 
 /// Every bit: a waiter or a wake without a bitset.
 pub const ALL: u32 = u32::MAX;
@@ -24,11 +31,34 @@ struct Sleeper {
     waker: Arc<Waker>,
     bitset: u32,
     woken: AtomicBool,
-    /// The word whose queue holds it; a requeue moves it, under the queues' lock.
-    addr: AtomicU64,
+    /// The queue that holds it; a requeue moves it, under the queues' lock.
+    key: [AtomicU64; 2],
 }
 
-type Key = (u64, u64);
+pub type Key = (u64, u64);
+
+impl Sleeper {
+    fn key(&self) -> Key {
+        (
+            self.key[0].load(Ordering::Relaxed),
+            self.key[1].load(Ordering::Relaxed),
+        )
+    }
+
+    fn set_key(&self, key: Key) {
+        self.key[0].store(key.0, Ordering::Relaxed);
+        self.key[1].store(key.1, Ordering::Relaxed);
+    }
+}
+
+/// The queue of the word at `addr` of `process`: its shared object's and offset, or the
+/// process's and address.
+fn key(process: &Process, addr: u64) -> Key {
+    process
+        .space
+        .shared_word(addr)
+        .unwrap_or((process.koid, addr))
+}
 
 static QUEUES: SpinLock<BTreeMap<Key, VecDeque<Arc<Sleeper>>>> = SpinLock::new(BTreeMap::new());
 
@@ -46,18 +76,20 @@ pub fn wait(
         return Err(Error::InvalidArgs);
     }
     let process = &thread.process;
-    let key = (process.koid, addr);
     let (waiter, waker) = Waiter::new_pair();
-    let sleeper = Arc::new(Sleeper {
-        waker: waker.clone(),
-        bitset,
-        woken: AtomicBool::new(false),
-        addr: AtomicU64::new(addr),
-    });
     {
         // The word is read with the queue's lock held; it is populated first, so the
         // read under the lock never needs the space's lock.
         process.space.populate(addr, 4, false)?;
+    }
+    let key = key(process, addr);
+    let sleeper = Arc::new(Sleeper {
+        waker: waker.clone(),
+        bitset,
+        woken: AtomicBool::new(false),
+        key: [AtomicU64::new(key.0), AtomicU64::new(key.1)],
+    });
+    {
         let mut queues = QUEUES.lock();
         let value = usercopy::read_u32(&process.space, addr)?;
         if value != expected {
@@ -90,7 +122,7 @@ pub fn wait(
         // Leave the queue, unless a wake took this sleeper first: then the wake
         // counted it, and the wait succeeded.
         let mut queues = QUEUES.lock();
-        let now_at = (key.0, sleeper.addr.load(Ordering::Relaxed));
+        let now_at = sleeper.key();
         let removed = remove(&mut queues, now_at, &sleeper);
         if !removed && sleeper.woken.load(Ordering::Acquire) {
             return Ok(());
@@ -122,8 +154,13 @@ pub fn wake(koid: u64, addr: u64, count: u32, bitset: u32) -> Result<u32, Error>
     if !addr.is_multiple_of(4) || bitset == 0 {
         return Err(Error::InvalidArgs);
     }
+    // Every caller wakes on its own process's words.
+    let key = match process::current() {
+        Some(t) if t.process.koid == koid => key(&t.process, addr),
+        _ => (koid, addr),
+    };
     let mut queues = QUEUES.lock();
-    Ok(wake_locked(&mut queues, (koid, addr), count, bitset))
+    Ok(wake_locked(&mut queues, key, count, bitset))
 }
 
 fn wake_locked(
@@ -172,17 +209,18 @@ pub fn requeue(
     if expected.is_some() {
         process.space.populate(from, 4, false)?;
     }
+    let (from_key, to_key) = (key(process, from), key(process, to));
     let mut queues = QUEUES.lock();
     if let Some(expected) = expected
         && usercopy::read_u32(&process.space, from)? != expected
     {
         return Err(Error::ShouldWait);
     }
-    let woken = wake_locked(&mut queues, (process.koid, from), wake, ALL);
+    let woken = wake_locked(&mut queues, from_key, wake, ALL);
     let mut moved = 0u32;
-    if from != to && requeue > 0 {
+    if from_key != to_key && requeue > 0 {
         let mut taken = VecDeque::new();
-        if let Some(queue) = queues.get_mut(&(process.koid, from)) {
+        if let Some(queue) = queues.get_mut(&from_key) {
             while moved < requeue {
                 match queue.pop_front() {
                     Some(s) => {
@@ -193,11 +231,11 @@ pub fn requeue(
                 }
             }
             if queue.is_empty() {
-                queues.remove(&(process.koid, from));
+                queues.remove(&from_key);
             }
         }
         if !taken.is_empty() {
-            let target = queues.entry((process.koid, to)).or_default();
+            let target = queues.entry(to_key).or_default();
             if target.try_reserve(taken.len()).is_err() {
                 // No room to move them: wake them instead, which a waiter tolerates.
                 for s in taken {
@@ -206,7 +244,7 @@ pub fn requeue(
                 }
             } else {
                 for s in &taken {
-                    s.addr.store(to, Ordering::Relaxed);
+                    s.set_key(to_key);
                 }
                 target.extend(taken);
             }
