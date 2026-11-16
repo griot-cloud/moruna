@@ -1,0 +1,10 @@
+https://huggingface.co/datasets/HuggingFaceFW/fineweb/resolve/main/sample/100BT/001_00000.parquet
+https://huggingface.co/datasets/HuggingFaceFW/fineweb/resolve/main/sample/100BT/001_00001.parquet
+https://huggingface.co/datasets/HuggingFaceFW/fineweb/resolve/main/sample/100BT/001_00002.parquet
+https://huggingface.co/datasets/HuggingFaceFW/fineweb/resolve/main/sample/100BT/001_00003.parquet
+https://huggingface.co/datasets/HuggingFaceFW/fineweb/resolve/main/sample/100BT/001_00004.parquet
+https://huggingface.co/datasets/HuggingFaceFW/fineweb/resolve/main/sample/100BT/001_00005.parquet
+https://huggingface.co/datasets/HuggingFaceFW/fineweb/resolve/main/sample/100BT/001_00006.parquet
+https://huggingface.co/datasets/HuggingFaceFW/fineweb/resolve/main/sample/100BT/001_00007.parquet
+https://huggingface.co/datasets/HuggingFaceFW/fineweb/resolve/main/sample/100BT/001_00008.parquet
+https://huggingface.co/datasets/HuggingFaceFW/fineweb/resolve/main/sample/100BT/001_00009.parquet
