@@ -325,7 +325,7 @@ pub fn qemu_args(disks: &[Opened]) -> Result<Vec<String>> {
         };
         args.push("-device".to_string());
         args.push(format!(
-            "virtio-blk-pci,drive=data{i},addr=0x{:x},disable-legacy=off,disable-modern=off{serial}",
+            "virtio-blk-pci,drive=data{i},id=data-disk{i},addr=0x{:x},disable-legacy=off,disable-modern=off{serial}",
             FIRST_SLOT + i as u32
         ));
     }
@@ -487,12 +487,12 @@ mod tests {
                     file.display()
                 ),
                 "-device".to_string(),
-                "virtio-blk-pci,drive=data0,addr=0x10,disable-legacy=off,disable-modern=off,serial=1000"
+                "virtio-blk-pci,drive=data0,id=data-disk0,addr=0x10,disable-legacy=off,disable-modern=off,serial=1000"
                     .to_string(),
                 "-drive".to_string(),
                 format!("file={},format=raw,if=none,id=data1", out.display()),
                 "-device".to_string(),
-                "virtio-blk-pci,drive=data1,addr=0x11,disable-legacy=off,disable-modern=off"
+                "virtio-blk-pci,drive=data1,id=data-disk1,addr=0x11,disable-legacy=off,disable-modern=off"
                     .to_string(),
             ]
         );

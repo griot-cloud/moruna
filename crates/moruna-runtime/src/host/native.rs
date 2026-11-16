@@ -414,6 +414,7 @@ pub struct NativeRun {
     guest_exit: Option<i32>,
     transport_uncertain: bool,
     timing: Timing,
+    launched_at: Instant,
     node: RunningNode,
     reader: BufReader<UnixStream>,
     control: Control,
@@ -622,6 +623,7 @@ impl NativeRun {
             launch: launched - began,
             connect: launched.elapsed(),
         };
+        let launched_at = launched;
         reader
             .get_ref()
             .set_read_timeout(Some(Duration::from_millis(100)))
@@ -645,6 +647,7 @@ impl NativeRun {
             guest_exit: None,
             transport_uncertain: false,
             timing,
+            launched_at,
             node,
             reader,
             control,
@@ -687,6 +690,10 @@ impl NativeRun {
     /// How long the VM took to launch and to boot to its runtime's connection.
     pub fn timing(&self) -> Timing {
         self.timing
+    }
+    /// When QEMU was running: where the boot's time starts.
+    pub fn launched_at(&self) -> Instant {
+        self.launched_at
     }
     /// Where the vCPUs were placed, when the run asked for a placement.
     pub fn placed(&self) -> Option<&Placed> {

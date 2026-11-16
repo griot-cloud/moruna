@@ -1029,7 +1029,7 @@ fn run_vm(
                 placed.others
             );
         }
-        let spawned = std::time::Instant::now() - launched.connect;
+        let spawned = run.launched_at();
         let control = run.control();
         let done = std::sync::atomic::AtomicBool::new(false);
         let result = std::thread::scope(|scope| {
