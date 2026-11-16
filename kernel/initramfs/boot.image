@@ -444,6 +444,7 @@ process personality
   expect B1 pager: ok:
   expect kk: process b1-victim faulted: its pager refused the page at
   expect B1 entry: ok:
+  expect B1 protect: ok:
   expect kk: process b1-entry exited with code 0 (
   expect B1 entry run: ok:
   expect B1 copy: ok:

@@ -21,6 +21,8 @@
 //!   a read of the region faults into the personality, as does an invalid opcode; a thread
 //!   spinning in the program is interrupted into its personality. The personality's
 //!   fault-tolerant copy resumes at its recovery address on a fault, with the address.
+//!   A page protected and one unmapped inside a 2 MiB region the program's table holds,
+//!   off its start, and two pages across its end, each answer; the program runs on.
 //! - **Shared futexes.** A thread of another process wakes a waiter on a word of a shared
 //!   object, mapped at another address.
 //! - **A shared handle table.** A personality process's clone with `SHARE_HANDLES` uses its
@@ -147,11 +149,17 @@ fn run() -> i64 {
     match start::process_name() {
         "b1-entry" => {
             let r = entry_child();
-            report(
+            let code = report(
                 &out,
                 "entry",
                 r,
                 "a call entered the personality and returned through the entry, a native number entered too, the FS base was the program's, a read of the region and an invalid opcode faulted into it, and a spinning program was interrupted into it",
+            );
+            code | report(
+                &out,
+                "protect",
+                protect_inside(),
+                "a page protected and one unmapped inside the 2 MiB region the program's table holds, off its start, and two pages across its end, each answered, and the program ran on",
             )
         }
         "b1-cow" => {
@@ -784,8 +792,12 @@ fn entry(out: &Console, resource: &Handle, image: &Handle) -> Outcome {
         _ => return Err(("a second personality_set was taken", None)),
     }
     let console = call(console_for(out), "duplicating the console")?;
+    let me = call(
+        child.0.duplicate(Rights::WRITE | Rights::TRANSFER),
+        "duplicating the entry child's handle",
+    )?;
     call(
-        child.start_with(entry, &mut [(Some(console), "console")]),
+        child.start_with(entry, &mut [(Some(console), "console"), (Some(me), "self")]),
         "process_start",
     )?;
     call(
@@ -883,6 +895,45 @@ fn entry_child() -> Outcome {
     want(
         SPUN.load(Ordering::Acquire) == 1,
         "the spinning program was not interrupted into its personality",
+    )
+}
+
+/// Two pages across the end of the 2 MiB region the program's code and stack lie in.
+const ACROSS: u64 = CODE + (2 << 20) - PAGE;
+
+/// A protect and an unmap inside a region the program's table holds a table for, off
+/// the region's start, and across its end. Each once made a range that ran backwards,
+/// which panicked the kernel.
+fn protect_inside() -> Outcome {
+    use moruna_abi::personality::reason;
+    let me = Process(slot("self"));
+    call(
+        me.protect(STACK + PAGE, PAGE, map::READ),
+        "protecting a page inside the program's region",
+    )?;
+    call(
+        me.unmap(STACK + 2 * PAGE, PAGE),
+        "unmapping a page inside the program's region",
+    )?;
+    call(
+        me.map(None, 0, 2 * PAGE, ACROSS, map::READ | map::WRITE),
+        "mapping two pages across the region's end",
+    )?;
+    call(
+        me.protect(ACROSS, 2 * PAGE, map::READ),
+        "protecting two pages across the region's end",
+    )?;
+    call(
+        me.unmap(ACROSS, 2 * PAGE),
+        "unmapping two pages across the region's end",
+    )?;
+    // The program's table still serves the region.
+    let mut f = program_frame(CODE, STACK + STACK_LEN);
+    f.set_register(Register::Rax, 7);
+    let r = call(personality_return(&mut f), "running the program again")?;
+    want(
+        r == reason::SYSCALL && f.register(Register::Rax) == 7 && f.rip() == AFTER_FIRST,
+        "the program did not run after the protect and the unmap",
     )
 }
 
