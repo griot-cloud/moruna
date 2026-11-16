@@ -180,10 +180,6 @@ impl MemoryObject {
 // ---- `MemoryObject` (large frames) go in this block.
 
 /// The pages of a large page (2 MiB).
-#[allow(
-    dead_code,
-    reason = "with_dma allocates with it once the integrator's patch lands"
-)]
 const RUN_PAGES: usize = ostd::mm::HUGE_PAGE_SIZE / PAGE;
 
 impl MemoryObject {
@@ -191,10 +187,6 @@ impl MemoryObject {
     /// remains, so that `map::HUGE` maps them as large pages (data-os §2, C4); single
     /// frames for the rest, and for a run the allocator has no aligned space for. The
     /// same pages as single frames, charged the same.
-    #[allow(
-        dead_code,
-        reason = "with_dma allocates with it once the integrator's patch lands"
-    )]
     pub fn large_frames(pages: usize) -> Result<Vec<UFrame>, Error> {
         let mut frames = Vec::new();
         frames

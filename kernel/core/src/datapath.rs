@@ -101,10 +101,6 @@ pub(crate) fn windows_protect(process: &Process, args: [u64; 6]) -> Answer {
 /// `memory_map`'s mapping of `len` bytes of `object` from `offset`, where the kernel
 /// chooses, with `flags`' protection, `map::HUGE` and `map::POPULATE`; the dispatch has
 /// checked the flags, the handle's rights and the range. Returns where.
-#[allow(
-    dead_code,
-    reason = "memory_map calls it once the integrator's patch lands"
-)]
 pub(crate) fn map_memory(
     process: &Process,
     object: &Arc<MemoryObject>,

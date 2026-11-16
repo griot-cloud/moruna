@@ -159,6 +159,13 @@ pub fn windows_protect(process: &Process, windows: &[[u64; 2]], flags: u64) -> R
     check(raw::windows_protect(process.0.raw(), windows, flags)).map(|_| ())
 }
 
+/// `plane_probe` (the kernel's `probe` feature, ABI 2.6): the bytes the page table entry
+/// mapping `addr`, an address of this process, covers: 4096, 2 MiB for a large page, or
+/// zero when none does.
+pub fn mapping_size(addr: u64) -> Result<u64> {
+    check(raw::call2(nr::PLANE_PROBE, moruna_abi::plane::probe::MAPPING, addr).0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,9 +8,17 @@
 //! - `windows_protect`: a group of windows made read only and writable again in one call,
 //!   with their bytes kept, and every refusal leaving every window as it was.
 //!
-//! It also measures what C5 and C8 are judged by: the time a pinned CPU loses to the
-//! kernel, and a read of the page against a `clock_get`. `dp-revoke` shows a write to a
-//! revoked window faults.
+//! - `map::HUGE` and `map::POPULATE`: an object mapped with both is in 2 MiB entries
+//!   before a byte is touched, at an aligned address, and keeps them through every touch
+//!   (no page faults: every page has its entry); with `map::POPULATE` alone every page has
+//!   a 4 KiB entry before it is touched; an object too small for a large page maps in
+//!   4 KiB entries; a revoke of one page splits its large page and a revoke of a whole one
+//!   keeps it; a partial unmap leaves the rest mapped. The page table is read with
+//!   `plane_probe` (the CI boot's kernel).
+//!
+//! It also measures what C4, C5 and C8 are judged by: a touch a page through large pages
+//! and through 4 KiB ones, the time a pinned CPU loses to the kernel, and a read of the
+//! page against a `clock_get`. `dp-revoke` shows a write to a revoked window faults.
 
 #![no_std]
 #![no_main]
@@ -24,7 +32,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use moruna_kb1_programs::{console, ms};
 use moruna_sys::{
     Error, Mapping, Memory, Rights, Signals, Thread,
-    datapath::{ClockPage, clock_page, current_cpu, pin_current_thread, thread_set_cpu},
+    datapath::{
+        ClockPage, clock_page, current_cpu, mapping_size, pin_current_thread, thread_set_cpu,
+    },
     futex_wait, futex_wake, map, now, println, raw, thread_exit, wait_one,
 };
 
@@ -72,6 +82,9 @@ fn run() -> i64 {
         return code;
     }
     if let Err(code) = revoke(&out) {
+        return code;
+    }
+    if let Err(code) = huge(&out) {
         return code;
     }
     0
@@ -165,34 +178,44 @@ fn pin(out: &Out) -> Result<u32, i64> {
     Ok(cpus)
 }
 
-/// C5's figure: on the last CPU, pinned, the time 200 ms of spinning loses in gaps of
-/// more than 2 microseconds between two clock reads (ticks, interrupts, other threads).
+/// C5's figure: on the last CPU, pinned, what 300 ms of spinning loses between two
+/// clock reads more than 500 ns apart. A gap under 100 us is a tick or a device
+/// interrupt, what tickless worker cores would take away; a longer one is another thread
+/// the CPU ran meanwhile (the boot runs every test at once).
 fn ticks(out: &Out, cpus: u32) -> Result<(), i64> {
     let page = ClockPage::map().map_err(|e| fail(out, "ticks", "clock_page", e))?;
     pin_current_thread(Some(cpus - 1)).map_err(|e| fail(out, "ticks", "pinning", e))?;
     let start = page.now();
     let mut last = start;
-    let (mut gaps, mut lost, mut longest) = (0u64, 0u64, 0u64);
-    while last - start < ms(200) {
+    let (mut short, mut short_ns, mut longest_short) = (0u64, 0u64, 0u64);
+    let (mut long, mut long_ns) = (0u64, 0u64);
+    while last - start < ms(300) {
         let t = page.now();
         let gap = t - last;
-        if gap > 2_000 {
-            gaps += 1;
-            lost += gap;
-            longest = longest.max(gap);
+        if gap >= 100_000 {
+            long += 1;
+            long_ns += gap;
+        } else if gap > 500 {
+            short += 1;
+            short_ns += gap;
+            longest_short = longest_short.max(gap);
         }
         last = t;
     }
     pin_current_thread(None).map_err(|e| fail(out, "ticks", "unpinning", e))?;
+    let ran = last - start - long_ns;
     println!(
         out,
-        "DS-A ticks: ok: pinned to CPU {} for {} ns: {} gaps over 2 us, {} ns lost ({} per 100,000), the longest {} ns",
+        "DS-A ticks: ok: pinned to CPU {} for {} ns: {} interruptions under 100 us took {} ns, {} per 100,000 of the {} ns it ran (the longest {} ns); {} longer gaps were other threads ({} ns)",
         cpus - 1,
         last - start,
-        gaps,
-        lost,
-        lost * 100_000 / (last - start),
-        longest
+        short,
+        short_ns,
+        short_ns * 100_000 / ran.max(1),
+        ran,
+        longest_short,
+        long,
+        long_ns
     );
     Ok(())
 }
@@ -446,4 +469,174 @@ fn refused_ok(out: &Out, what: &str, raw_result: u64) -> Result<(), i64> {
     Error::from_raw(raw_result)
         .map(|_| ())
         .map_err(|e| fail(out, "revoke", what, e))
+}
+
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * KIB;
+const LARGE: u64 = 2 * MIB;
+const OBJECT: u64 = 32 * MIB;
+
+fn huge_fail(out: &Out, what: &str, e: Error) -> i64 {
+    println!(out, "DS-A huge: FAIL: {}: {}", what, e.name());
+    1
+}
+
+/// Every page of `m`'s `range` has an entry of `size` bytes.
+fn entries(
+    out: &Out,
+    m: &Mapping<'_>,
+    from: u64,
+    to: u64,
+    size: u64,
+    when: &str,
+) -> Result<(), i64> {
+    let mut at = from;
+    while at < to {
+        let got = mapping_size(m.addr() + at).map_err(|e| huge_fail(out, "plane_probe", e))?;
+        if got != size {
+            println!(
+                out,
+                "DS-A huge: FAIL: {}: the page at offset {:#x} has an entry of {} bytes, not {}",
+                when,
+                at,
+                got,
+                size
+            );
+            return Err(1);
+        }
+        at += 4 * KIB;
+    }
+    Ok(())
+}
+
+/// Writes then reads one byte a page, `passes` times; the nanoseconds a touch.
+fn touch(out: &Out, m: &Mapping<'_>, passes: u64, mark: u8) -> Result<u64, i64> {
+    let pages = m.len() / (4 * KIB);
+    let start = now();
+    for pass in 0..passes {
+        for page in 0..pages {
+            let at = (page * 4 * KIB + (pass % 64) * 8) as usize;
+            m.write(at, &[mark])
+                .map_err(|e| huge_fail(out, "a touch", e))?;
+        }
+    }
+    let ns = (now() - start) / (passes * pages);
+    let mut b = [0u8; 1];
+    for page in 0..pages {
+        m.read((page * 4 * KIB) as usize, &mut b)
+            .map_err(|e| huge_fail(out, "reading back", e))?;
+        if b[0] != mark {
+            println!(out, "DS-A huge: FAIL: page {} lost its byte", page);
+            return Err(1);
+        }
+    }
+    Ok(ns)
+}
+
+fn huge(out: &Out) -> Result<(), i64> {
+    let object = Memory::create(OBJECT).map_err(|e| huge_fail(out, "memory_create", e))?;
+    let large = object
+        .map(0, OBJECT, map::WRITE | map::HUGE | map::POPULATE)
+        .map_err(|e| huge_fail(out, "memory_map HUGE | POPULATE", e))?;
+    if large.addr() % LARGE != 0 {
+        println!(
+            out,
+            "DS-A huge: FAIL: a large mapping at {:#x}, not on a 2 MiB boundary",
+            large.addr()
+        );
+        return Err(1);
+    }
+    entries(out, &large, 0, OBJECT, LARGE, "before any touch")?;
+    let large_ns = touch(out, &large, 16, 0xa5)?;
+    entries(
+        out,
+        &large,
+        0,
+        OBJECT,
+        LARGE,
+        "after every page was touched",
+    )?;
+
+    // POPULATE alone: every page present, in 4 KiB entries, before a touch.
+    let plain = object
+        .map(0, OBJECT, map::WRITE | map::POPULATE)
+        .map_err(|e| huge_fail(out, "memory_map POPULATE", e))?;
+    entries(
+        out,
+        &plain,
+        0,
+        OBJECT,
+        4 * KIB,
+        "POPULATE alone, before any touch",
+    )?;
+    let plain_ns = touch(out, &plain, 16, 0x5a)?;
+
+    // Too small for a large page: 4 KiB entries.
+    let small = Memory::create(64 * KIB).map_err(|e| huge_fail(out, "a small object", e))?;
+    let small_map = small
+        .map(0, 64 * KIB, map::WRITE | map::HUGE)
+        .map_err(|e| huge_fail(out, "memory_map HUGE of a small object", e))?;
+    entries(out, &small_map, 0, 64 * KIB, 4 * KIB, "a small object")?;
+
+    // A revoke of one page splits its large page; the others stay large.
+    let one = [[large.addr() + 4 * KIB, 4 * KIB]];
+    Error::from_raw(raw::windows_protect(0, &one, map::READ))
+        .map_err(|e| huge_fail(out, "revoking one page", e))?;
+    entries(
+        out,
+        &large,
+        0,
+        LARGE,
+        4 * KIB,
+        "the large page one revoke split",
+    )?;
+    entries(
+        out,
+        &large,
+        LARGE,
+        OBJECT,
+        LARGE,
+        "the large pages beside the split",
+    )?;
+    Error::from_raw(raw::windows_protect(0, &one, map::READ | map::WRITE))
+        .map_err(|e| huge_fail(out, "granting the page back", e))?;
+    // A revoke of a whole large page changes it in place.
+    let whole = [[large.addr() + 2 * LARGE, LARGE]];
+    Error::from_raw(raw::windows_protect(0, &whole, map::READ))
+        .map_err(|e| huge_fail(out, "revoking a large page", e))?;
+    entries(
+        out,
+        &large,
+        2 * LARGE,
+        3 * LARGE,
+        LARGE,
+        "a revoked large page",
+    )?;
+    Error::from_raw(raw::windows_protect(0, &whole, map::READ | map::WRITE))
+        .map_err(|e| huge_fail(out, "granting a large page back", e))?;
+    touch(out, &large, 1, 0x3c)?;
+
+    // A partial unmap keeps the rest.
+    let mut large = large;
+    large
+        .shrink(LARGE / (4 * KIB) + 1)
+        .map_err(|e| huge_fail(out, "a partial unmap", e))?;
+    entries(
+        out,
+        &large,
+        4 * KIB,
+        2 * KIB * 4,
+        4 * KIB,
+        "after a partial unmap",
+    )?;
+    touch(out, &large, 1, 0xc3)?;
+
+    println!(
+        out,
+        "DS-A huge: ok: {} MiB in 2 MiB entries at an aligned address before any touch, kept through every touch, split by a one-page revoke and kept by a whole one; POPULATE alone gave every page its entry; a touch a page took {} ns through large pages against {} ns through 4 KiB ones",
+        OBJECT / MIB,
+        large_ns,
+        plain_ns
+    );
+    Ok(())
 }

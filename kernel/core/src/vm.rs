@@ -1307,10 +1307,6 @@ impl Space {
     /// The size of the page table entry that maps `addr`: 4 KiB, 2 MiB for a large page,
     /// or zero when none does (probe ABI only).
     #[cfg(feature = "probe")]
-    #[allow(
-        dead_code,
-        reason = "plane_probe answers with it once the integrator's patch lands"
-    )]
     pub fn mapping_at(&self, addr: u64) -> u64 {
         let page = addr & !(PAGE_SIZE - 1);
         let inner = self.inner.lock();
