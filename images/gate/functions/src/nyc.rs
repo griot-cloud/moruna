@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 
 use crate::cols::{BitsBuf, Col};
 use crate::error::{Error, Result};
+use crate::gemm;
 use crate::pyfloat::{np_clip, np_divmod, np_f64_to_i64, np_maximum, np_round6, py_max, py_round2};
 use crate::score_weights::{
     B1, B2, COS_HOUR, EMB, EMBED, FEATURES, HIDDEN, SIN_HOUR, W1, W2, W3, ZONES,
@@ -313,80 +314,55 @@ pub struct Trips<'a> {
     pub do_location_id: Col<'a, i64>,
 }
 
-/// Rows scored at once: each weight row is read once a block.
-const BLOCK: usize = 8;
+/// Rows scored at once: the GEMM's `m`, large enough that packing the weights is a small share.
+const BLOCK: usize = 512;
 
 /// W4, `score`: 23 features a trip, a 23-128-128-1 network, `np.round(y, 6)`.
 ///
 /// NumPy holds a timestamp column with a null as doubles (NaN for the null), so the arithmetic
 /// on it is float arithmetic; within +/- 2**53 microseconds that gives the integer path's values.
-/// The network's sums run in order over `k`, unfused; BLAS orders them its own way, so
+/// The three products run on a GEMM ([`crate::gemm`]), then the bias and `maximum(.., 0)` as
+/// NumPy applies them after `@`. A GEMM orders and fuses its sums its own way, as BLAS does, so
 /// `predicted_tip` is matched within one step of its sixth decimal (images/gate/README.md).
 pub fn score(t: &Trips) -> Vec<f64> {
     let n = t.pickup.len();
     let float_a = t.pickup.null_count() > 0;
     let float_b = t.dropoff.null_count() > 0;
     let mut out = Vec::with_capacity(n);
-    let mut x = [[0.0f64; FEATURES]; BLOCK];
-    let mut h1 = [[0.0f64; HIDDEN]; BLOCK];
-    let mut h2 = [[0.0f64; HIDDEN]; BLOCK];
+    let rows = BLOCK.min(n.max(1));
+    let mut x = vec![0.0f64; rows * FEATURES];
+    let mut h1 = vec![0.0f64; rows * HIDDEN];
+    let mut h2 = vec![0.0f64; rows * HIDDEN];
+    let mut y = vec![0.0f64; rows];
     let mut start = 0;
     while start < n {
-        let m = BLOCK.min(n - start);
-        for (r, row) in x[..m].iter_mut().enumerate() {
+        let m = rows.min(n - start);
+        for (r, row) in x
+            .as_chunks_mut::<FEATURES>()
+            .0
+            .iter_mut()
+            .take(m)
+            .enumerate()
+        {
             features(t, start + r, float_a, float_b, row);
         }
-        layer(&x[..m], &W1, &B1, &mut h1[..m]);
-        layer(&h1[..m], &W2, &B2, &mut h2[..m]);
-        for h in &h2[..m] {
-            let mut acc = 0.0;
-            for k in 0..HIDDEN {
-                acc += h[k] * W3[k];
-            }
-            out.push(np_round6(acc));
-        }
+        gemm::matmul(m, FEATURES, HIDDEN, &x, &W1, &mut h1);
+        bias_relu(&mut h1[..m * HIDDEN], &B1);
+        gemm::matmul(m, HIDDEN, HIDDEN, &h1, &W2, &mut h2);
+        bias_relu(&mut h2[..m * HIDDEN], &B2);
+        gemm::matmul(m, HIDDEN, 1, &h2, &W3, &mut y);
+        out.extend(y[..m].iter().map(|v| np_round6(*v)));
         start += m;
     }
     out
 }
 
-/// Rows and columns of the register tile `layer` accumulates in.
-const TILE_ROWS: usize = 4;
-const TILE_COLS: usize = 8;
-
-/// `h = maximum(x @ w + b, 0)` for a block of rows, each sum in order over `k` from 0, unfused:
-/// the order fixes every bit, whatever width the vectors are. The sums are kept in a tile of
-/// registers across `k`, so each weight is loaded once for four rows.
-fn layer<const K: usize>(x: &[[f64; K]], w: &[f64], b: &[f64; HIDDEN], h: &mut [[f64; HIDDEN]]) {
-    let m = x.len().min(h.len());
-    let mut r0 = 0;
-    while r0 < m {
-        // A partial tile reads zero rows and drops their sums.
-        let mut xs = [[0.0f64; K]; TILE_ROWS];
-        let rows = TILE_ROWS.min(m - r0);
-        xs[..rows].copy_from_slice(&x[r0..r0 + rows]);
-        for j0 in (0..HIDDEN).step_by(TILE_COLS) {
-            let mut acc = [[0.0f64; TILE_COLS]; TILE_ROWS];
-            for k in 0..K {
-                let at = k * HIDDEN + j0;
-                let wk: &[f64; TILE_COLS] = w
-                    .get(at..at + TILE_COLS)
-                    .and_then(|s| s.try_into().ok())
-                    .unwrap_or(&[0.0; TILE_COLS]);
-                for (a, xr) in acc.iter_mut().zip(&xs) {
-                    let xv = xr[k];
-                    for jj in 0..TILE_COLS {
-                        a[jj] += xv * wk[jj];
-                    }
-                }
-            }
-            for (r, a) in acc.iter().enumerate().take(rows) {
-                for jj in 0..TILE_COLS {
-                    h[r0 + r][j0 + jj] = np_maximum(a[jj] + b[j0 + jj], 0.0);
-                }
-            }
+/// `np.maximum(h + b, 0.0)` on each row of `h`.
+fn bias_relu(h: &mut [f64], b: &[f64; HIDDEN]) {
+    for row in h.as_chunks_mut::<HIDDEN>().0 {
+        for (v, bj) in row.iter_mut().zip(b) {
+            *v = np_maximum(*v + bj, 0.0);
         }
-        r0 += rows;
     }
 }
 

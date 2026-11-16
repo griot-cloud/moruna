@@ -433,6 +433,26 @@ This is `kernel-is-the-machine.md` §4.1 and §4.2, cut to a VM with no network.
     the region were declined: they are new code in OSTD's page tables, and these maps are
     rare. A measurement that shows they cost reopens it.
   - The engine never forks (C6), so none of this is on the engine's path.
+- **A program's native calls** (integrator, 2026-11-16, on stream B2's survey of `run_granted`).
+  The engine is a Linux program on the personality that also calls the core directly on its
+  granted memory, slots, channels, windows, disks and clock page. Today it does so as a process
+  of its own.
+  - **Program mode has a handle table of its own.** A native call from program mode resolves
+    only there, so the personality's handles are unreachable by construction.
+    - The personality moves a handle into it with one new call, made from personality mode.
+    - Handles a program-mode call receives land in the program's table.
+    - A clone starts with the program's table empty; `SHARE_HANDLES` covers only the
+      personality's table.
+  - **An allowlist of call numbers** is accepted from program mode: the `run_granted` set. Any
+    other native call from program mode is refused and counted.
+  - **Handle 0, meaning the caller's process, is refused** from program mode for every call
+    that takes a process, so a program cannot map over the personality's region. Handle 0 for
+    the calling thread (`thread_set_cpu`) stays.
+  - **Addresses the core picks** for program-mode calls come from a range the personality
+    reserves at `personality_set`, apart from its region, and Linux `mmap` keeps out of it.
+  - The calls stay direct: no crossing and no message, so the batch path costs what it does
+    today. A checked entry in the personality was rejected: it would follow every handle in
+    and out per call, and still need core changes for the windows and `batch_get`.
 - **Today's personality** (`kernel/linux`, 7,386 lines, a message per call) is retired when this
   runs the gate's images.
 - **A Linux bug stays in user space.** It reaches the task it serves, never kernel mode and never
