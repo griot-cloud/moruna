@@ -24,7 +24,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use moruna_kb1_programs::{console, ms};
 use moruna_sys::{
     Error, Mapping, Memory, Rights, Signals, Thread,
-    datapath::{ClockPage, clock_page, current_cpu, set_current_cpu, thread_set_cpu},
+    datapath::{ClockPage, clock_page, current_cpu, pin_current_thread, thread_set_cpu},
     futex_wait, futex_wake, map, now, println, raw, thread_exit, wait_one,
 };
 
@@ -82,7 +82,7 @@ fn run() -> i64 {
 fn pin(out: &Out) -> Result<u32, i64> {
     let mut cpus = 0;
     loop {
-        match set_current_cpu(Some(cpus)) {
+        match pin_current_thread(Some(cpus)) {
             Ok(()) => {}
             Err(Error::InvalidArgs) if cpus > 0 => break,
             Err(e) => return Err(fail(out, "pin", "thread_set_cpu on the caller", e)),
@@ -108,7 +108,7 @@ fn pin(out: &Out) -> Result<u32, i64> {
         .map(0, 64 * 1024, map::WRITE)
         .map_err(|e| fail(out, "pin", "mapping the stack", e))?;
     // From another CPU than the one it will be placed on, when there is one.
-    set_current_cpu(Some(0)).map_err(|e| fail(out, "pin", "back to CPU 0", e))?;
+    pin_current_thread(Some(0)).map_err(|e| fail(out, "pin", "back to CPU 0", e))?;
     let thread =
         Thread::spawn(sleeper, stack.end(), 0).map_err(|e| fail(out, "pin", "thread_create", e))?;
     let deadline = now() + ms(10_000);
@@ -134,7 +134,7 @@ fn pin(out: &Out) -> Result<u32, i64> {
         return Err(1);
     }
     // A CPU past the last is refused; any CPU unpins.
-    match set_current_cpu(Some(cpus)) {
+    match pin_current_thread(Some(cpus)) {
         Err(Error::InvalidArgs) => {}
         other => {
             println!(
@@ -155,7 +155,7 @@ fn pin(out: &Out) -> Result<u32, i64> {
             return Err(1);
         }
     }
-    set_current_cpu(None).map_err(|e| fail(out, "pin", "unpinning", e))?;
+    pin_current_thread(None).map_err(|e| fail(out, "pin", "unpinning", e))?;
     println!(
         out,
         "DS-A pin: ok: the caller placed on each of {} CPUs ran only there (rdtscp), a sleeping thread placed on CPU {} woke there, and a CPU past the last was refused",
@@ -169,7 +169,7 @@ fn pin(out: &Out) -> Result<u32, i64> {
 /// more than 2 microseconds between two clock reads (ticks, interrupts, other threads).
 fn ticks(out: &Out, cpus: u32) -> Result<(), i64> {
     let page = ClockPage::map().map_err(|e| fail(out, "ticks", "clock_page", e))?;
-    set_current_cpu(Some(cpus - 1)).map_err(|e| fail(out, "ticks", "pinning", e))?;
+    pin_current_thread(Some(cpus - 1)).map_err(|e| fail(out, "ticks", "pinning", e))?;
     let start = page.now();
     let mut last = start;
     let (mut gaps, mut lost, mut longest) = (0u64, 0u64, 0u64);
@@ -183,7 +183,7 @@ fn ticks(out: &Out, cpus: u32) -> Result<(), i64> {
         }
         last = t;
     }
-    set_current_cpu(None).map_err(|e| fail(out, "ticks", "unpinning", e))?;
+    pin_current_thread(None).map_err(|e| fail(out, "ticks", "unpinning", e))?;
     println!(
         out,
         "DS-A ticks: ok: pinned to CPU {} for {} ns: {} gaps over 2 us, {} ns lost ({} per 100,000), the longest {} ns",
@@ -211,7 +211,7 @@ fn clock(out: &Out) -> Result<(), i64> {
         return Err(1);
     }
     // Pinned, so every read is one CPU's counter.
-    set_current_cpu(Some(0)).map_err(|e| fail(out, "clock page", "pinning", e))?;
+    pin_current_thread(Some(0)).map_err(|e| fail(out, "clock page", "pinning", e))?;
     for _ in 0..10_000 {
         let before = page.now();
         let call = now();
@@ -270,7 +270,7 @@ fn clock(out: &Out) -> Result<(), i64> {
         sum = sum.wrapping_add(now());
     }
     let call_ns = now() - start;
-    set_current_cpu(None).map_err(|e| fail(out, "clock page", "unpinning", e))?;
+    pin_current_thread(None).map_err(|e| fail(out, "clock page", "unpinning", e))?;
     println!(
         out,
         "DS-A clock page: ok: mapped once, read only, clock_get between every two readings; a reading {} ns against {} ns for clock_get ({})",

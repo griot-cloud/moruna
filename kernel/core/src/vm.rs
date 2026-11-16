@@ -22,6 +22,7 @@ use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use moruna_abi::{Error, PAGE_SIZE, charge, map};
+use moruna_datapath::place;
 use ostd::{
     mm::{
         CachePolicy, FrameAllocOptions, HUGE_PAGE_SIZE, HasPaddr, MAX_USERSPACE_VADDR, PageFlags,
@@ -978,11 +979,11 @@ const HUGE_PAGES: usize = HUGE_PAGE_SIZE / PAGE_SIZE as usize;
 
 /// Whether `frames` are one large page: whole, physically contiguous, and aligned.
 fn one_run(frames: &[UFrame]) -> bool {
-    frames.len() == HUGE_PAGES
-        && (frames[0].paddr() as u64).is_multiple_of(HUGE)
-        && frames
-            .windows(2)
-            .all(|pair| pair[1].paddr() == pair[0].paddr() + PAGE_SIZE as usize)
+    moruna_datapath::frames::one_run(
+        frames.iter().map(|f| f.paddr() as u64),
+        HUGE_PAGES,
+        PAGE_SIZE,
+    )
 }
 
 /// One large page of zeroed frames, or `None` when the allocator has no aligned run.
@@ -1150,15 +1151,7 @@ impl Space {
 
     /// As `find_free`, at an address `phase` past a multiple of 2 MiB.
     fn find_free_aligned(inner: &Inner, len: u64, phase: u64) -> Result<u64, Error> {
-        // The first address at or above `at` that is `phase` past a multiple of 2 MiB.
-        let align = |at: u64| -> Result<u64, Error> {
-            let here = at - at % HUGE + phase;
-            if here >= at {
-                Ok(here)
-            } else {
-                here.checked_add(HUGE).ok_or(Error::Limit)
-            }
-        };
+        let align = |at: u64| place::aligned(at, phase, HUGE).ok_or(Error::Limit);
         let mut candidate = align(MAP_BASE + PAGE_SIZE)?;
         for (&start, area) in inner.areas.range(MAP_BASE..) {
             let fits = candidate

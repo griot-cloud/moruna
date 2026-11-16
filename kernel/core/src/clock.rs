@@ -1,7 +1,7 @@
 //! The clock, its page and the deadline queue (SDD 20, f.6; data-os §2, C8).
 //!
 //! The clock is the TSC scaled to nanoseconds since boot: `(tsc - origin) * MULTIPLIER >>
-//! SHIFT`. The clock page publishes that same scale (`moruna_abi::clock_page`), written
+//! SHIFT` (`moruna_datapath::clock`). The clock page publishes that same scale (`moruna_abi::clock_page`), written
 //! once at boot, so a process that maps it reads the time with no call and agrees with
 //! `clock_get` to the nanosecond. The TSC is the one counter and the scale never changes,
 //! so the page is never written again; its sequence lets a later kernel recalibrate.
@@ -14,7 +14,8 @@
 use alloc::{collections::BTreeMap, sync::Arc, sync::Weak};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use moruna_abi::{DEADLINE_INFINITE, Error, PAGE_SIZE, Signals, charge, clock_page};
+use moruna_abi::{DEADLINE_INFINITE, Error, PAGE_SIZE, Signals, charge};
+use moruna_datapath::clock as scale;
 use ostd::{
     arch::{read_tsc, tsc_freq},
     sync::{LocalIrqDisabled, SpinLock, Waker},
@@ -27,8 +28,6 @@ use crate::{
     signal::Signaller,
 };
 
-/// Counter ticks to nanoseconds: multiply by `MULTIPLIER`, then shift right by this.
-const SHIFT: u32 = 40;
 static MULTIPLIER: AtomicU64 = AtomicU64::new(0);
 /// The realtime clock at boot, in nanoseconds since 1970, read from the CMOS clock.
 static REALTIME_AT_BOOT: AtomicU64 = AtomicU64::new(0);
@@ -37,38 +36,12 @@ static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// The clock page, made at boot.
 static PAGE: SpinLock<Option<Arc<MemoryObject>>> = SpinLock::new(None);
 
-/// The multiplier for a counter of `hz`: nanoseconds per tick, scaled by `2^SHIFT`,
-/// rounded to the nearest.
-fn multiplier(hz: u64) -> u64 {
-    let scaled = (1_000_000_000u128 << SHIFT) + u128::from(hz) / 2;
-    u64::try_from(scaled / u128::from(hz)).unwrap_or(u64::MAX)
-}
-
-/// Nanoseconds for `ticks` at `multiplier`: the clock page's formula.
-fn scale(ticks: u64, multiplier: u64) -> u64 {
-    let ns = (u128::from(ticks) * u128::from(multiplier)) >> SHIFT;
-    u64::try_from(ns).unwrap_or(u64::MAX - 1)
-}
-
-/// The clock page's bytes for the scale: zero nanoseconds at `origin`, and an even
-/// sequence, so it reads as written.
-fn page_bytes(origin: u64, multiplier: u64) -> [u8; clock_page::SHIFT + 4] {
-    let mut bytes = [0u8; clock_page::SHIFT + 4];
-    let mut put = |at: usize, value: &[u8]| bytes[at..at + value.len()].copy_from_slice(value);
-    put(clock_page::SEQUENCE, &2u64.to_le_bytes());
-    put(clock_page::BASE_NS, &0u64.to_le_bytes());
-    put(clock_page::BASE_TSC, &origin.to_le_bytes());
-    put(clock_page::MULTIPLIER, &multiplier.to_le_bytes());
-    put(clock_page::SHIFT, &SHIFT.to_le_bytes());
-    bytes
-}
-
 /// Makes the clock page: one page, charged to an account of its own, since it is the
 /// kernel's and no process's.
 fn make_page(origin: u64, multiplier: u64) -> Result<(), &'static str> {
     let account = Account::machine(charge::memory(1));
     let page = MemoryObject::new(PAGE_SIZE, &account).map_err(|_| "no page for the clock page")?;
-    page.write(0, &page_bytes(origin, multiplier))
+    page.write(0, &scale::page(origin, multiplier))
         .map_err(|_| "the clock page could not be written")?;
     *PAGE.lock() = Some(Arc::new(page));
     Ok(())
@@ -96,7 +69,7 @@ pub fn init() -> Result<(), &'static str> {
         return Err("the TSC frequency is unknown, so the clock cannot run");
     }
     let origin = read_tsc();
-    let multiplier = multiplier(hz);
+    let multiplier = scale::multiplier(hz).ok_or("the TSC frequency is unknown")?;
     TSC_ORIGIN.store(origin, Ordering::Release);
     MULTIPLIER.store(multiplier, Ordering::Release);
     make_page(origin, multiplier)?;
@@ -111,7 +84,7 @@ pub fn now() -> u64 {
     if multiplier == 0 {
         return 0;
     }
-    scale(
+    scale::scale(
         read_tsc().wrapping_sub(TSC_ORIGIN.load(Ordering::Acquire)),
         multiplier,
     )

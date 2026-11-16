@@ -298,22 +298,6 @@ process vm
   expect KC1 kernel calls: ok:
   exits 0
 
-# DS-A (architecture/data-os-streams.md, stream A): the data path's mechanisms. The
-# caller placed on each CPU and a sleeping thread placed on one, a pinned CPU's lost
-# time, the clock page against clock_get, and a group of windows revoked and granted
-# back in one call; then a write to a revoked window faults.
-process datapath
-  handle console console
-  expect DS-A pin: ok:
-  expect DS-A ticks: ok:
-  expect DS-A clock page: ok:
-  expect DS-A revoke: ok:
-  exits 0
-process dp-revoke
-  handle console console
-  expect DS-A revoke: about to write a revoked window at
-  faults page fault at
-
 # KB5-T2 to KB5-T4 (SDD 20 f.18): memory accounts. The process has an account of its own
 # of 64 MiB carved out of the machine's; it checks an account's figures, its peak and the
 # sum of its children, then starts three children in accounts carved out of its own: one
@@ -415,3 +399,20 @@ process fpu-b
   expect NATIVE FPU: ok: seed 610795520 eight live workers preserved SIMD FP control and x87 state;
   exits 0
 link fpu-a.peer fpu-b.peer
+
+# stream A
+# DS-A (architecture/data-os-streams.md, stream A): the data path's mechanisms. The
+# caller placed on each CPU and a sleeping thread placed on one, a pinned CPU's lost
+# time, the clock page against clock_get, and a group of windows revoked and granted
+# back in one call; then a write to a revoked window faults.
+process datapath
+  handle console console
+  expect DS-A pin: ok:
+  expect DS-A ticks: ok:
+  expect DS-A clock page: ok:
+  expect DS-A revoke: ok:
+  exits 0
+process dp-revoke
+  handle console console
+  expect DS-A revoke: about to write a revoked window at
+  faults page fault at

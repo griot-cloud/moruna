@@ -14,7 +14,8 @@
 
 use alloc::{sync::Arc, vec::Vec};
 
-use moruna_abi::{Error, PAGE_SIZE, RawHandle, Rights, cpu, map, read_u64, windows};
+use moruna_abi::{Error, PAGE_SIZE, RawHandle, Rights, cpu, map, windows::RANGE_SIZE};
+use moruna_datapath::windows;
 
 use crate::{
     clock,
@@ -39,8 +40,9 @@ fn object(process: &Process, value: u64, rights: Rights) -> Result<Object, Error
 }
 
 /// `thread_set_cpu(thread, cpu)`: runs `thread` (zero: the caller) on CPU `cpu` only, or
-/// wherever it runs now with `cpu::ANY`. The caller placing itself returns on that CPU;
-/// another thread moves the next time it is queued. Needs `WRITE` on the thread.
+/// with `cpu::ANY` unpins it: free to run on any CPU, as a new thread is. The caller
+/// placing itself on a CPU returns on it; any other change takes effect the next time the
+/// thread is queued. Needs `WRITE` on the thread.
 pub(crate) fn thread_set_cpu(caller: &Arc<Thread>, args: [u64; 6]) -> Answer {
     let [thread, target, ..] = args;
     let thread = if thread == 0 {
@@ -77,20 +79,12 @@ pub(crate) fn clock_page(process: &Process, _args: [u64; 6]) -> Answer {
 /// finished on every CPU when the call returns. Needs `WRITE` on the process.
 pub(crate) fn windows_protect(process: &Process, args: [u64; 6]) -> Answer {
     let [target, ranges, count, flags, ..] = args;
-    if flags != map::READ && flags != map::READ | map::WRITE {
-        return Err(Error::InvalidArgs);
-    }
-    let count = usize::try_from(count).map_err(|_| Error::InvalidArgs)?;
-    if count > windows::MAX {
-        return Err(Error::InvalidArgs);
-    }
-    let bytes = usercopy::read(&process.space, ranges, count * windows::RANGE_SIZE)?;
+    windows::flags(flags)?;
+    let bytes = usercopy::read(&process.space, ranges, windows::bytes(count)?)?;
     let mut list = Vec::new();
-    list.try_reserve_exact(count).map_err(|_| Error::NoMemory)?;
-    for entry in bytes.as_chunks::<{ windows::RANGE_SIZE }>().0 {
-        let word = |at: usize| read_u64(entry, at).ok_or(Error::InvalidArgs);
-        list.push((word(0)?, word(8)?));
-    }
+    list.try_reserve_exact(bytes.len() / RANGE_SIZE)
+        .map_err(|_| Error::NoMemory)?;
+    windows::parse(&bytes, &mut list)?;
     if target == 0 {
         process
             .space

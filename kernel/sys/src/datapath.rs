@@ -72,14 +72,6 @@ impl ClockReading {
     }
 }
 
-/// Runs the calling thread on CPU `cpu` only, or where it runs now with `None`: with a
-/// CPU, the call returns on it. A thread holds no handle to itself, so this is
-/// [`thread_set_cpu`] for the thread making the call.
-pub fn set_current_cpu(cpu: Option<u32>) -> Result<()> {
-    let target = cpu.map_or(cpu::ANY, u64::from);
-    check(raw::call2(nr::THREAD_SET_CPU, 0, target).0).map(|_| ())
-}
-
 /// The CPU running the calling thread, read with no call: the kernel writes each CPU's
 /// number to its `IA32_TSC_AUX`, which `rdtscp` returns. A thread on no pinned CPU may
 /// be elsewhere by the time this returns.

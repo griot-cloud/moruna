@@ -211,15 +211,18 @@ impl MemoryObject {
             .map_err(|_| Error::NoMemory)?;
         let mut options = FrameAllocOptions::new();
         options.zeroed(true);
-        while frames.len() < pages {
-            let run = (pages - frames.len() >= RUN_PAGES)
-                .then(|| options.alloc_segment(RUN_PAGES).ok())
-                .flatten();
-            match run {
-                Some(run) => frames.extend(USegment::from(run)),
-                None => frames.push(options.alloc_frame().map_err(|_| Error::NoMemory)?.into()),
-            }
-        }
+        moruna_datapath::frames::fill(
+            &mut frames,
+            pages,
+            RUN_PAGES,
+            || options.alloc_segment(RUN_PAGES).ok().map(USegment::from),
+            || {
+                options
+                    .alloc_frame()
+                    .map(Into::into)
+                    .map_err(|_| Error::NoMemory)
+            },
+        )?;
         Ok(frames)
     }
 }
