@@ -179,5 +179,8 @@ class Plane:
         self._attach(self.half)
 
     def finish(self):
+        """The task ends: the engine is told, and in unmap mode the last group goes back."""
+        if self.half.note(lambda at: self.calls.futex_wake(self.rings_addr + at)):
+            self.wakes += 1
         if self.half.mode == ring.UNMAP and self._posted_since_hand_back():
             self.calls.batch_put(1, self.rings_addr, self.rings_len)

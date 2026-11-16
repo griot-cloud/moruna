@@ -944,9 +944,15 @@ impl<C: RingCalls> RingPlane<C> {
         // A task's slots and port are read only when a wait said something came, when the
         // task says it waits, or when it posted in unmap mode (its hand-back follows): in
         // steady state the rings carry everything and the engine makes no call to look.
-        let (slots, port) = match self.tasks.get(&id) {
+        let (slots, port) = match self.tasks.get_mut(&id) {
             Some(t) => {
-                let words = self.rings_view(t.rings);
+                let words = match self.owners.get(&t.rings) {
+                    Some(Owner::Rings(o)) => Some(o.view.clone()),
+                    _ => None,
+                };
+                let noted = words
+                    .as_ref()
+                    .is_some_and(|v| !t.handed && t.engine.noted(&**v));
                 let waits = words
                     .as_ref()
                     .is_some_and(|v| !t.handed && v.load(layout::TASK_WAITS) != 0);
@@ -955,7 +961,10 @@ impl<C: RingCalls> RingPlane<C> {
                         let mut e = t.engine.clone();
                         matches!(e.posted(&**v), Ok(n) if n > 0)
                     });
-                (self.signaled || posted || t.handed, self.signaled || waits)
+                (
+                    self.signaled || posted || t.handed || noted,
+                    self.signaled || waits || noted,
+                )
             }
             None => (false, false),
         };

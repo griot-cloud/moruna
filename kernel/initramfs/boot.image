@@ -430,21 +430,22 @@ link supervisor.datapath datapath.supervisor
 
 # stream P
 # DS-P (architecture/data-os.md section 5, stream P): ring mode. An engine on RingPlane runs
-# ring-task, which maps its region and its rings object once and sleeps on its bell only when
-# it has nothing to do: 200 batches in lockstep and a group of 32 in flight, each read in
-# place, each record checked after the grouped revoke through the task's output slot. Then
-# the task writes the window of its last record: the write faults, and the record the engine
-# checked is unchanged (DP1).
+# ring-task, a native task that maps its region and its rings object once and applies
+# y = 3x + 7 to batches of 128 Ki Int64 values, each made in its region and read in place,
+# each record checked after the grouped revoke through the task's output slot and judged on
+# every row: 100 in lockstep, then 256 in groups of 32 in flight, with the calls a batch of
+# the engine and the task counted. Then the second task writes the window of its last record:
+# the write faults, and the record the engine checked is unchanged (DP1).
 process rings
   handle console console
   handle program:ring-task task-image
-  handle data:plane/good.fixture good
-  expect DS-P ring: ok:
-  expect DS-P pipelined: ok:
-  expect DS-P copies: ok:
-  expect DS-P revoke: ring-task writes a posted window
-  expect kk: process ring-task faulted: page fault at
+  handle data:plane/mib.fixture mib
+  expect DS-P lockstep: ok:
+  expect DS-P steady: ok:
+  expect DS-P revoke: ring-steady writes a posted window
+  expect kk: process ring-steady faulted: page fault at
   expect DS-P revoke: ok:
+  expect DS-P ring: ok:
   exits 0
 link supervisor.rings rings.supervisor
 

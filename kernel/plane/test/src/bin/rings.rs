@@ -1,17 +1,18 @@
 //! DS-P (`architecture/data-os.md` §5, stream P): ring mode on the kernel. An engine on
-//! `RingPlane` opens a ring task (`ring-task`) and runs:
+//! `RingPlane` runs a native task (`ring-task`) that applies a batch function, `y = 3 * x + 7`,
+//! to batches of one `Int64` column of 128 Ki values (1 MiB):
 //!
-//! - lockstep: one batch at a time, as an image stage's `apply` is, each laid out in the
-//!   task's region and posted with no call, each record taken back after the grouped revoke
-//!   through the task's output slot (`windows_protect`'s slot form) and checked, its bytes
-//!   the batch's;
-//! - pipelined: a group of batches posted before any record is taken, one revoke for the
-//!   group;
-//! - DP1: once every record is taken, the task writes the window of its last one. The write
-//!   faults, the kernel ends the task, and the record the engine checked is unchanged.
+//! - each batch is made in the task's region, where the task reads it in place: no copy and no
+//!   call to hand it over;
+//! - each record the task writes is taken back after the grouped revoke through the task's
+//!   output slot (`windows_protect`'s slot form), checked, and every one of its values judged;
+//! - lockstep, one batch at a time as an image stage's `apply` is, in one task; then a steady
+//!   state of groups of 32 in flight, in another;
+//! - DP1: once every record is taken, the second task writes the window of its last one. The
+//!   write faults, the kernel ends the task, and the record the engine checked is unchanged.
 //!
-//! Every kernel call the engine makes is counted, so calls per batch are measured, and the
-//! task reports the bytes the kernel copied for it, which are only its bells' words.
+//! Every kernel call the engine makes is counted, and each task reports its own calls on the
+//! bells and the bytes the kernel copied for it, which are only its bells' words.
 
 #![no_std]
 #![no_main]
@@ -39,21 +40,27 @@ moruna_svc::main!(run);
 const PAGE: u64 = 4096;
 const MIB: u64 = 1 << 20;
 const SECONDS: u64 = 1_000_000_000;
-/// The engine's plane: the task's region and its rings object.
-const BUDGET: u64 = 64 * MIB;
+/// The engine's plane: each task's region and its rings object.
+const BUDGET: u64 = 96 * MIB;
 /// The task's account: its process, its thread, its image and its tables.
 const TASK_LIMIT: u64 = 16 * MIB;
 /// Lockstep batches.
-const LOCKSTEP: u64 = 200;
-/// Batches of the pipelined group.
+const LOCKSTEP: u64 = 100;
+/// Batches in flight at once in the steady state, and how many groups of them.
 const GROUP: u64 = 32;
+const GROUPS: u64 = 8;
+/// Values of a batch.
+const ROWS: u64 = 128 << 10;
+/// Values the engine writes or judges at a time.
+const CHUNK: usize = 8192;
 /// The port the task reports on, and the one it waits for every record taken on.
 const REPORT: u64 = 2;
 const TAKEN: u64 = 1;
 
-/// The kernel's calls, counted.
+/// The kernel's calls, counted; the plane's memory is charged to its own account.
 struct Counted {
     calls: u64,
+    account: Account,
 }
 
 impl Calls for Counted {
@@ -63,7 +70,7 @@ impl Calls for Counted {
 
     fn memory(&mut self, bytes: u64) -> Result<Memory, Error> {
         self.calls += 1;
-        Kernel.memory(bytes)
+        Memory::create_in(bytes, &self.account.0)
     }
     fn share(&mut self, memory: &Memory) -> Result<Memory, Error> {
         self.calls += 1;
@@ -211,42 +218,160 @@ fn take_resource(out: &Console) -> Option<Handle> {
     handles[0].take()
 }
 
-/// The record `batch` holds, read through the engine's mapping.
-fn bytes_of(p: &Plane, batch: BatchId) -> Result<Vec<u8>, String> {
-    let (view, at, len) = p
-        .batch_view(batch)
-        .ok_or_else(|| format!("{batch:?} is not a ring batch"))?;
-    let mut out = vec![0u8; len as usize];
-    view.read(at, &mut out)
-        .map_err(kernel_error("reading a record"))?;
-    Ok(out)
+/// The value `x` of row `j` of batch `n`.
+fn x_of(n: u64, j: u64) -> i64 {
+    (n * 1_000_000 + j) as i64
+}
+
+/// The batch function the task applies.
+fn f(x: i64) -> i64 {
+    x.wrapping_mul(3).wrapping_add(7)
+}
+
+/// A batch's layout: the framing, and where its values start.
+struct Layout {
+    framing: Vec<u8>,
+    values: u64,
+    len: u64,
+}
+
+impl Layout {
+    fn of(framing: Vec<u8>) -> Layout {
+        let values = (framing.len() as u64).div_ceil(PAGE) * PAGE;
+        Layout {
+            framing,
+            values,
+            len: values + ROWS * 8,
+        }
+    }
 }
 
 struct Run {
     out: Console,
     plane: Plane,
+    resource: Handle,
+    image: Handle,
+    layout: Layout,
     task: TaskId,
     /// The task's port calls that wait until every record is taken.
     waiting: Vec<moruna_plane::CallId>,
-    report: Option<(u64, u64)>,
+    /// What the task reported: the kernel's copies for it, its sleeps and its wakes.
+    report: Option<(u64, u64, u64)>,
     ended: bool,
+    batches: u64,
+    /// The task's process and account, kept while it lives.
+    held: Option<(Process, Account)>,
 }
 
 impl Run {
+    fn start(&mut self, name: &str, region: u64, windows: u64) -> Result<(), String> {
+        let account = Account::carve(TASK_LIMIT, name).map_err(kernel_error("account_create"))?;
+        let process = Process::create_in(&self.resource, name, &account.0)
+            .map_err(kernel_error("process_create"))?;
+        let entry = process
+            .map_image(&self.image)
+            .map_err(kernel_error("process_map_image"))?;
+        let (task, port) = self
+            .plane
+            .open_ring(RingShape {
+                region: Region::New(region),
+                windows,
+                window_bytes: self.layout.len.div_ceil(PAGE) * PAGE,
+            })
+            .map_err(plane_error)?;
+        if self.plane.mode(task) != Some(Mode::Protect) {
+            return Err(String::from("the plane did not choose protect mode"));
+        }
+        let slots = self.plane.ring_slots(task).map_err(plane_error)?;
+        attach(&process, &slots, Some(port))
+            .map_err(|(e, _)| format!("process_plane: {}", e.name()))?;
+        process
+            .start_with(entry, &mut [])
+            .map_err(kernel_error("process_start"))?;
+        self.task = task;
+        self.report = None;
+        self.ended = false;
+        self.held = Some((process, account));
+        Ok(())
+    }
+
+    /// Makes batch `n` in the task's region and posts it: no copy, no call.
+    fn post(&mut self, n: u64) -> Result<(), String> {
+        let region = self.plane.region_of(self.task).ok_or("no region")?;
+        let layout = &self.layout;
+        let mut chunk = vec![0u8; CHUNK * 8];
+        let (b, rows) = self
+            .plane
+            .load_into(region, layout.len, |v, at| {
+                v.write(at, &layout.framing)?;
+                let mut j = 0;
+                while j < ROWS {
+                    let k = (ROWS - j).min(CHUNK as u64);
+                    let (words, _) = chunk.as_chunks_mut::<8>();
+                    for (i, w) in words.iter_mut().take(k as usize).enumerate() {
+                        *w = x_of(n, j + i as u64).to_le_bytes();
+                    }
+                    v.write(at + layout.values + j * 8, &chunk[..k as usize * 8])?;
+                    j += k;
+                }
+                Ok(())
+            })
+            .map_err(plane_error)?;
+        if rows != ROWS {
+            return Err(format!("batch {n} holds {rows} rows"));
+        }
+        self.plane.offer(self.task, 0, b).map_err(plane_error)?;
+        self.plane.drop_batch(b).map_err(plane_error)
+    }
+
     /// The next record the task puts, answering its port calls meanwhile.
-    fn record(&mut self) -> Result<(BatchId, u64), String> {
+    fn record(&mut self) -> Result<BatchId, String> {
         loop {
             match self
                 .plane
                 .next(deadline_in(30 * SECONDS))
                 .map_err(plane_error)?
             {
-                Some(Event::Put { batch, rows, .. }) => return Ok((batch, rows)),
+                Some(Event::Put { batch, rows, .. }) => {
+                    if rows != ROWS {
+                        return Err(format!("a record of {rows} rows"));
+                    }
+                    return Ok(batch);
+                }
                 Some(Event::Released { .. } | Event::Freed { .. }) => {}
                 Some(e) => self.event(e)?,
                 None => return Err(String::from("no record within 30 s")),
             }
         }
+    }
+
+    /// Judges every value of the record answering batch `n`.
+    fn judge(&mut self, record: BatchId, n: u64) -> Result<(), String> {
+        let (view, at, len) = self
+            .plane
+            .batch_view(record)
+            .ok_or("the record is not a ring batch")?;
+        if len != self.layout.len {
+            return Err(format!("a record of {len} bytes"));
+        }
+        let mut chunk = vec![0u8; CHUNK * 8];
+        let mut j = 0;
+        while j < ROWS {
+            let k = (ROWS - j).min(CHUNK as u64);
+            let bytes = &mut chunk[..k as usize * 8];
+            view.read(at + self.layout.values + j * 8, bytes)
+                .map_err(kernel_error("reading a record"))?;
+            let (words, _) = bytes.as_chunks::<8>();
+            for (i, w) in words.iter().enumerate() {
+                let row = j + i as u64;
+                if i64::from_le_bytes(*w) != f(x_of(n, row)) {
+                    return Err(format!("batch {n} row {row} is not f(x)"));
+                }
+            }
+            j += k;
+        }
+        self.batches += 1;
+        Ok(())
     }
 
     fn event(&mut self, e: Event) -> Result<(), String> {
@@ -256,13 +381,13 @@ impl Run {
                 port,
                 request,
             } => match port {
-                REPORT if request.len() == 16 => {
+                REPORT if request.len() == 24 => {
                     let word = |at: usize| {
                         let mut w = [0u8; 8];
                         w.copy_from_slice(&request[at..at + 8]);
                         u64::from_le_bytes(w)
                     };
-                    self.report = Some((word(0), word(8)));
+                    self.report = Some((word(0), word(8), word(16)));
                     self.plane.answer(call, Ok(&[])).map_err(plane_error)
                 }
                 TAKEN => {
@@ -287,123 +412,158 @@ impl Run {
         }
     }
 
-    fn post(&mut self, region: moruna_plane::ringed::RegionId, good: &[u8]) -> Result<(), String> {
-        let (b, _) = self
-            .plane
-            .load_into(region, good.len() as u64, |v, at| v.write(at, good))
-            .map_err(plane_error)?;
-        self.plane.offer(self.task, 0, b).map_err(plane_error)?;
-        self.plane.drop_batch(b).map_err(plane_error)
+    /// Ends the task's input and waits for its report and its question.
+    fn wind_up(&mut self) -> Result<(u64, u64, u64), String> {
+        self.plane.finish(self.task, 0).map_err(plane_error)?;
+        let deadline = deadline_in(60 * SECONDS);
+        while self.waiting.is_empty() {
+            match self.plane.next(deadline).map_err(plane_error)? {
+                Some(e) => self.event(e)?,
+                None => return Err(String::from("the task never asked to write")),
+            }
+        }
+        let (copies, sleeps, wakes) = self.report.ok_or("the task reported nothing")?;
+        if copies != 4 * sleeps {
+            return Err(format!(
+                "the kernel copied {copies} bytes for the task, which slept {sleeps} times: \
+                 more than its bells' words"
+            ));
+        }
+        Ok((copies, sleeps, wakes))
+    }
+
+    /// Answers the task's question, and waits for its end.
+    fn end(&mut self, write: bool) -> Result<(), String> {
+        for call in core::mem::take(&mut self.waiting) {
+            let answer: Result<&[u8], Error> = if write {
+                Ok(b"write")
+            } else {
+                Err(Error::AccessDenied)
+            };
+            self.plane.answer(call, answer).map_err(plane_error)?;
+        }
+        // A task that faults rings nothing: its end is read at each look, every 250 ms.
+        let deadline = deadline_in(60 * SECONDS);
+        while !self.ended {
+            if moruna_svc::now() >= deadline {
+                return Err(String::from("the task did not end"));
+            }
+            if let Some(e) = self
+                .plane
+                .next(deadline_in(SECONDS / 4))
+                .map_err(plane_error)?
+            {
+                self.event(e)?;
+            }
+        }
+        self.held = None;
+        Ok(())
     }
 }
 
-fn lockstep(
-    r: &mut Run,
-    region: moruna_plane::ringed::RegionId,
-    good: &[u8],
-) -> Result<(), String> {
+/// `a / b` with two decimals.
+fn ratio(a: u64, b: u64) -> String {
+    format!("{}.{:02}", a / b, a * 100 / b % 100)
+}
+
+fn lockstep(r: &mut Run) -> Result<(), String> {
+    r.start("ring-lockstep", 4 * MIB, 4)?;
     let calls0 = calls(&mut r.plane);
     let c0 = r.plane.counters();
-    for i in 0..LOCKSTEP {
-        r.post(region, good)?;
-        let (out, rows) = r.record()?;
-        if rows != 4 || bytes_of(&r.plane, out)? != good {
-            return Err(format!("record {i} is not the batch it answers"));
-        }
+    for n in 0..LOCKSTEP {
+        r.post(n)?;
+        let out = r.record()?;
+        r.judge(out, n)?;
         r.plane.drop_batch(out).map_err(plane_error)?;
     }
-    let c = r.plane.counters();
     let spent = calls(&mut r.plane) - calls0;
+    let c = r.plane.counters();
+    let (copies, sleeps, wakes) = r.wind_up()?;
+    r.end(false)?;
     println!(
         r.out,
-        "DS-P ring: ok: {} batches in lockstep in protect mode, each read in place and its record checked after the revoke: {} engine calls ({}.{:02} a batch), {} revokes, {} regrants, {} sleeps on the bell, {} wakes of the task",
+        "DS-P lockstep: ok: {} batches of {} rows, one at a time, each made in the task's region and read in place, y = 3x + 7 judged on every row: engine {} calls a batch ({} revokes, {} regrants, {} sleeps on its bell, {} wakes of the task); task {} calls a batch ({} sleeps, {} wakes); the kernel copied {} bytes for the task, its bells' words",
         LOCKSTEP,
-        spent,
-        spent / LOCKSTEP,
-        spent * 100 / LOCKSTEP % 100,
+        ROWS,
+        ratio(spent, LOCKSTEP),
         c.revokes - c0.revokes,
         c.regrants - c0.regrants,
         c.bell_sleeps - c0.bell_sleeps,
-        c.bells - c0.bells
+        c.bells - c0.bells,
+        ratio(sleeps + wakes, LOCKSTEP),
+        sleeps,
+        wakes,
+        copies
     );
     Ok(())
 }
 
-fn pipelined(
-    r: &mut Run,
-    region: moruna_plane::ringed::RegionId,
-    good: &[u8],
-) -> Result<BatchId, String> {
-    let calls0 = calls(&mut r.plane);
+fn steady(r: &mut Run) -> Result<BatchId, String> {
+    r.start(
+        "ring-steady",
+        (GROUP + 2) * (r.layout.len.div_ceil(PAGE) * PAGE),
+        GROUP,
+    )?;
+    let mut last = None;
+    let mut first_group = 0;
     let c0 = r.plane.counters();
-    for _ in 0..GROUP {
-        r.post(region, good)?;
-    }
-    let mut held = Vec::new();
-    for _ in 0..GROUP {
-        let (out, _) = r.record()?;
-        if bytes_of(&r.plane, out)? != good {
-            return Err(String::from("a record is not its batch"));
+    let calls0 = calls(&mut r.plane);
+    for g in 0..GROUPS {
+        if g == 1 {
+            first_group = calls(&mut r.plane) - calls0;
         }
-        held.push(out);
+        for i in 0..GROUP {
+            r.post(g * GROUP + i)?;
+        }
+        for i in 0..GROUP {
+            let out = r.record()?;
+            r.judge(out, g * GROUP + i)?;
+            if g + 1 == GROUPS && i + 1 == GROUP {
+                // The last record stays held, its window revoked, for DP1.
+                last = Some(out);
+            } else {
+                r.plane.drop_batch(out).map_err(plane_error)?;
+            }
+        }
     }
     let spent = calls(&mut r.plane) - calls0;
     let c = r.plane.counters();
-    // The last record stays held, its window revoked, for DP1.
-    let last = held.pop().ok_or("no record")?;
-    for b in held {
-        r.plane.drop_batch(b).map_err(plane_error)?;
-    }
+    let steady_calls = spent - first_group;
+    let steady_batches = (GROUPS - 1) * GROUP;
+    let (copies, sleeps, wakes) = r.wind_up()?;
     println!(
         r.out,
-        "DS-P pipelined: ok: {} batches posted before any record was taken: {} engine calls ({}.{:02} a batch), {} revokes",
+        "DS-P steady: ok: {} batches of {} rows in groups of {} in flight, y = 3x + 7 judged on every row: engine {} calls a batch in the steady state ({} calls for {} batches after the first group; {} revokes and {} regrants in all); task {} calls a batch ({} sleeps, {} wakes); the kernel copied {} bytes for the task, its bells' words",
+        GROUPS * GROUP,
+        ROWS,
         GROUP,
-        spent,
-        spent / GROUP,
-        spent * 100 / GROUP % 100,
-        c.revokes - c0.revokes
+        ratio(steady_calls, steady_batches),
+        steady_calls,
+        steady_batches,
+        c.revokes - c0.revokes,
+        c.regrants - c0.regrants,
+        ratio(sleeps + wakes, GROUPS * GROUP),
+        sleeps,
+        wakes,
+        copies
     );
-    if spent >= GROUP {
-        return Err(format!("{spent} calls for {GROUP} batches in flight"));
+    if steady_calls >= steady_batches || sleeps + wakes >= GROUPS * GROUP {
+        return Err(String::from("a call a batch or more in the steady state"));
     }
-    Ok(last)
+    last.ok_or_else(|| String::from("no record"))
 }
 
-fn revoked(r: &mut Run, last: BatchId, good: &[u8]) -> Result<(), String> {
-    r.plane.finish(r.task, 0).map_err(plane_error)?;
-    // The task reports its copies, then waits until every record is taken: they are.
-    let deadline = deadline_in(60 * SECONDS);
-    while r.waiting.is_empty() {
-        match r.plane.next(deadline).map_err(plane_error)? {
-            Some(e) => r.event(e)?,
-            None => return Err(String::from("the task never asked to write")),
-        }
-    }
-    let (copies, waits) = r.report.ok_or("the task reported nothing")?;
-    if copies != 4 * waits {
-        return Err(format!(
-            "the kernel copied {copies} bytes for the task, which slept {waits} times: \
-             more than its bells' words"
-        ));
-    }
-    println!(
-        r.out,
-        "DS-P copies: ok: the kernel copied {} bytes for ring-task, the {} words of its {} sleeps on its bell, and none of a batch or a record",
-        copies,
-        waits,
-        waits
-    );
-    println!(r.out, "DS-P revoke: ring-task writes a posted window");
-    for call in core::mem::take(&mut r.waiting) {
-        r.plane.answer(call, Ok(b"go")).map_err(plane_error)?;
-    }
-    while !r.ended {
-        match r.plane.next(deadline).map_err(plane_error)? {
-            Some(e) => r.event(e)?,
-            None => return Err(String::from("the task did not end")),
-        }
-    }
-    if bytes_of(&r.plane, last)? != good {
+fn revoked(r: &mut Run, last: BatchId) -> Result<(), String> {
+    let (view, at, len) = r.plane.batch_view(last).ok_or("no view")?;
+    let mut checked = vec![0u8; len as usize];
+    view.read(at, &mut checked)
+        .map_err(kernel_error("reading a record"))?;
+    println!(r.out, "DS-P revoke: ring-steady writes a posted window");
+    r.end(true)?;
+    let mut now = vec![0u8; len as usize];
+    view.read(at, &mut now)
+        .map_err(kernel_error("reading a record"))?;
+    if now != checked {
         return Err(String::from("the checked record changed after the revoke"));
     }
     r.plane.drop_batch(last).map_err(plane_error)?;
@@ -425,73 +585,53 @@ fn run() -> i64 {
         println!(out, "DS-P ring: FAIL: no task image");
         return 90;
     };
-    let good = match fixture("good") {
+    let framing = match fixture("mib") {
         Ok(g) => g,
         Err(why) => {
             println!(out, "DS-P ring: FAIL: {}", why);
             return 1;
         }
     };
-    let started = (|| -> Result<(Plane, TaskId, Process, Account), String> {
-        let mut plane = RingPlane::new(Counted { calls: 0 }, BUDGET);
-        let account =
-            Account::carve(TASK_LIMIT, "ring-task").map_err(kernel_error("account_create"))?;
-        let process = Process::create_in(&resource, "ring-task", &account.0)
-            .map_err(kernel_error("process_create"))?;
-        let entry = process
-            .map_image(&image)
-            .map_err(kernel_error("process_map_image"))?;
-        let (task, port) = plane
-            .open_ring(RingShape {
-                region: Region::New(MIB),
-                windows: GROUP,
-                window_bytes: 2 * PAGE,
-            })
-            .map_err(plane_error)?;
-        if plane.mode(task) != Some(Mode::Protect) {
-            return Err(String::from("the plane did not choose protect mode"));
-        }
-        let slots = plane.ring_slots(task).map_err(plane_error)?;
-        attach(&process, &slots, Some(port))
-            .map_err(|(e, _)| format!("process_plane: {}", e.name()))?;
-        process
-            .start_with(entry, &mut [])
-            .map_err(kernel_error("process_start"))?;
-        Ok((plane, task, process, account))
-    })();
-    let (plane, task, _process, _account) = match started {
-        Ok(s) => s,
-        Err(why) => {
-            println!(out, "DS-P ring: FAIL: {}", why);
+    let account = match Account::carve(BUDGET, "rings.arena") {
+        Ok(a) => a,
+        Err(e) => {
+            println!(out, "DS-P ring: FAIL: arena account: {}", e.name());
             return 1;
         }
-    };
-    let Some(region) = plane.region_of(task) else {
-        println!(out, "DS-P ring: FAIL: no region");
-        return 1;
     };
     let mut r = Run {
         out,
-        plane,
-        task,
+        plane: RingPlane::new(Counted { calls: 0, account }, BUDGET),
+        resource,
+        image,
+        layout: Layout::of(framing),
+        task: TaskId(0),
         waiting: Vec::new(),
         report: None,
         ended: false,
+        batches: 0,
+        held: None,
     };
-    if let Err(why) = lockstep(&mut r, region, &good) {
-        println!(r.out, "DS-P ring: FAIL: {}", why);
+    if let Err(why) = lockstep(&mut r) {
+        println!(r.out, "DS-P lockstep: FAIL: {}", why);
         return 1;
     }
-    let last = match pipelined(&mut r, region, &good) {
+    let last = match steady(&mut r) {
         Ok(last) => last,
         Err(why) => {
-            println!(r.out, "DS-P pipelined: FAIL: {}", why);
+            println!(r.out, "DS-P steady: FAIL: {}", why);
             return 1;
         }
     };
-    if let Err(why) = revoked(&mut r, last, &good) {
+    if let Err(why) = revoked(&mut r, last) {
         println!(r.out, "DS-P revoke: FAIL: {}", why);
         return 1;
     }
+    println!(
+        r.out,
+        "DS-P ring: ok: {} batches answered and judged, the plane zeroed {} bytes another task had seen",
+        r.batches,
+        r.plane.plane.zeroed()
+    );
     0
 }

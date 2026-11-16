@@ -415,6 +415,8 @@ impl RingTaskModel {
                     }
                     Ok(None) => {
                         if ring.ended(&view) {
+                            // A task that ends on its own says so first.
+                            ring.note(&view);
                             if ring.mode == Mode::Unmap && self.posted_since_put > 0 {
                                 self.hand_back();
                             }

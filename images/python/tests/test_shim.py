@@ -79,7 +79,7 @@ class Engine:
         g = geometry
         for at in (ring.IN_HEAD, ring.IN_TAIL, ring.OUT_HEAD, ring.OUT_TAIL, ring.FREE_HEAD,
                    ring.FREE_TAIL, ring.ENGINE_WAITS, ring.TASK_WAITS, ring.CLOSED,
-                   ring.ATTACHED, ring.TASK_BELL, ring.ENGINE_BELL):
+                   ring.ATTACHED, ring.TASK_BELL, ring.ENGINE_BELL, ring.TASK_NOTE):
             words.store(at, 0)
         for at, v in ((ring.VERSION, ring.VERSION_VALUE), (ring.REGION_BYTES, g.region_bytes),
                       (ring.IN_CAP, g.in_cap), (ring.OUT_CAP, g.out_cap),

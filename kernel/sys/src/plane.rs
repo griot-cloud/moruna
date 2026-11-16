@@ -578,7 +578,32 @@ pub struct Rings {
     region: Shared,
     rings: Shared,
     half: ring::Task,
+    /// How many times the task reads its ring before it sleeps: a batch the engine posts
+    /// within them costs no call.
+    pub spins: u32,
+    /// Wakes the task called on the engine's bell.
+    wakes: u64,
+    /// Sleeps it took on its own bell.
+    sleeps: u64,
+    /// A batch taken while no window was free.
+    pending: Option<ring::InEntry>,
 }
+
+/// What [`Rings::step`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// It answered a batch with a record in this window.
+    Answered(u64),
+    /// No batch is there yet: [`Rings::wait_input`].
+    NoInput,
+    /// No window is free: [`Rings::wait_window`].
+    NoWindow,
+    /// Every batch is answered and the engine posts no more.
+    Ended,
+}
+
+/// How many times a task reads its ring before it sleeps, by default.
+pub const SPINS: u32 = 1 << 14;
 
 fn broken(_: ring::Bad) -> Error {
     Error::BadState
@@ -604,6 +629,10 @@ impl Rings {
             region,
             rings,
             half,
+            spins: SPINS,
+            wakes: 0,
+            sleeps: 0,
+            pending: None,
         })
     }
 
@@ -661,9 +690,9 @@ impl Rings {
                 cookie,
             },
         );
-        if posted {
-            // The engine's bell: a wake only when it sleeps.
-            self.half.ring(&self.rings);
+        // The engine's bell: a wake only when it sleeps.
+        if posted && self.half.ring(&self.rings) {
+            self.wakes += 1;
         }
         posted
     }
@@ -671,6 +700,13 @@ impl Rings {
     /// Sleeps on the task's bell until the next batch or the end (the input ring is empty).
     /// No deadline: the engine's wake reaches the bell of the shared object.
     pub fn wait_input(&mut self) {
+        for _ in 0..self.spins {
+            if self.half.has_input(&self.rings) {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        self.sleeps += 1;
         self.half.sleep(&self.rings, crate::DEADLINE_INFINITE, |t| {
             t.has_input(&self.rings)
         });
@@ -678,9 +714,70 @@ impl Rings {
 
     /// Sleeps on the task's bell until the engine gives a window (none is free).
     pub fn wait_window(&mut self) {
+        for _ in 0..self.spins {
+            if self.half.has_window(&self.rings) {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        self.sleeps += 1;
         self.half.sleep(&self.rings, crate::DEADLINE_INFINITE, |t| {
             t.has_window(&self.rings)
         });
+    }
+
+    /// Answers the next batch: `f` reads it in place and writes a record into a free window,
+    /// returning the record's length (`None` refuses the batch, an error), and the record is
+    /// posted and the batch released. No byte moves but what `f` writes.
+    pub fn step(&mut self, f: impl FnOnce(&[u8], &mut [u8]) -> Option<usize>) -> Result<Step> {
+        let entry = match self.pending.take() {
+            Some(e) => e,
+            None => match self.half.next(&self.rings).map_err(broken)? {
+                Some(e) => e,
+                None if self.half.ended(&self.rings) => return Ok(Step::Ended),
+                None => return Ok(Step::NoInput),
+            },
+        };
+        let Some(w) = self.half.window(&self.rings).map_err(broken)? else {
+            self.pending = Some(entry);
+            return Ok(Step::NoWindow);
+        };
+        let g = self.half.geometry;
+        let input = self.region.range(entry.offset, entry.len as usize)?;
+        let out = self.rings.range(g.window_at(w), g.window_bytes as usize)?;
+        // SAFETY: the batch is mapped read only and the engine writes no span it posted until
+        // the task releases it (DP-I4); the window is the task's from the free ring until it
+        // posts it, in another mapping, so the two slices never overlap; both borrows end
+        // before the post and the release below.
+        let (input, window) = unsafe {
+            (
+                core::slice::from_raw_parts(input as *const u8, entry.len as usize),
+                core::slice::from_raw_parts_mut(out as *mut u8, g.window_bytes as usize),
+            )
+        };
+        let len = f(input, window).ok_or(Error::InvalidArgs)?;
+        if len == 0 || len as u64 > g.window_bytes {
+            return Err(Error::OutOfRange);
+        }
+        if !self.post(w, len as u64, entry.cookie) {
+            return Err(Error::ShouldWait);
+        }
+        self.release();
+        Ok(Step::Answered(w))
+    }
+
+    /// Raises the task's note and rings the engine's bell: call it before a port call and
+    /// before the task ends, so an engine asleep on its bell reads the task's port and slots.
+    pub fn note(&mut self) {
+        if self.half.note(&self.rings) {
+            self.wakes += 1;
+        }
+    }
+
+    /// The task's calls on the bells so far: its sleeps, and its wakes of the engine. Each
+    /// is one futex call; nothing else of the rings makes one.
+    pub fn bell_calls(&self) -> (u64, u64) {
+        (self.sleeps, self.wakes)
     }
 
     /// Where window `w` starts in this task: for a test that writes a window it posted, which

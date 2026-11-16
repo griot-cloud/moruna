@@ -9,7 +9,7 @@ wakes only when the sleeper said it waits.
 import struct
 
 MAGIC_VALUE = int.from_bytes(b"MORUNARG", "little")
-VERSION_VALUE = 2
+VERSION_VALUE = 3
 
 MAGIC = 0
 VERSION = 8
@@ -34,6 +34,7 @@ CLOSED = 640
 ATTACHED = 704
 TASK_BELL = 768
 ENGINE_BELL = 832
+TASK_NOTE = 896
 
 ENTRIES_AT = 4096
 IN_ENTRY = 32
@@ -136,6 +137,7 @@ class Task:
         self.out_head = w.load(OUT_HEAD)
         self.free_tail = w.load(FREE_TAIL)
         self.engine_bell = w.load(ENGINE_BELL) & 0xFFFFFFFF
+        self.note_value = w.load(TASK_NOTE)
         self.words = w
         w.store(ATTACHED, VERSION_VALUE)
 
@@ -212,6 +214,13 @@ class Task:
         w.store(ENGINE_WAITS, 0)
         wake(ENGINE_BELL)
         return True
+
+    def note(self, wake):
+        """Raises the task's note and rings the engine's bell: before the task ends, so an
+        engine asleep on its bell reads the task's slots."""
+        self.note_value += 1
+        self.words.store(TASK_NOTE, self.note_value)
+        return self.ring(wake)
 
     def has_input(self):
         w = self.words

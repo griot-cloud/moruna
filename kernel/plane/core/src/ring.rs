@@ -32,7 +32,7 @@ pub mod layout {
     /// "MORUNARG" as a little-endian `u64`.
     pub const MAGIC_VALUE: u64 = u64::from_le_bytes(*b"MORUNARG");
     /// The protocol's version.
-    pub const VERSION_VALUE: u64 = 2;
+    pub const VERSION_VALUE: u64 = 3;
 
     pub const MAGIC: usize = 0;
     pub const VERSION: usize = 8;
@@ -76,6 +76,9 @@ pub mod layout {
     pub const TASK_BELL: usize = 768;
     /// The engine's bell: raised by the task after each record it posts.
     pub const ENGINE_BELL: usize = 832;
+    /// Raised by the task before a port call and before it ends: the engine reads the task's
+    /// port and slots, which a sleep on its bell does not watch.
+    pub const TASK_NOTE: usize = 896;
 
     /// The entries start on the second page.
     pub const ENTRIES_AT: usize = 4096;
@@ -313,6 +316,8 @@ pub struct Engine {
     closed: bool,
     /// The task's bell as the engine last raised it.
     task_bell: u32,
+    /// The task's note as the engine last read it.
+    note: u64,
 }
 
 impl Engine {
@@ -331,6 +336,7 @@ impl Engine {
             ATTACHED,
             TASK_BELL,
             ENGINE_BELL,
+            TASK_NOTE,
         ] {
             s.store(at, 0);
         }
@@ -345,6 +351,7 @@ impl Engine {
             free_tail: 0,
             closed: false,
             task_bell: 0,
+            note: 0,
         }
     }
 
@@ -524,6 +531,15 @@ impl Engine {
         Ok(Some(seq))
     }
 
+    /// Whether the task raised its note since the engine last looked: it is about to call a
+    /// port, or to end.
+    pub fn noted(&mut self, s: &impl Shared) -> bool {
+        let note = s.load(TASK_NOTE);
+        let changed = note != self.note;
+        self.note = note;
+        changed
+    }
+
     /// Awake again.
     pub fn awake(&self, s: &impl Shared) {
         s.store(ENGINE_WAITS, 0);
@@ -547,6 +563,8 @@ pub struct Task {
     free_tail: u64,
     /// The engine's bell as the task last raised it.
     engine_bell: u32,
+    /// The task's note as it last raised it.
+    note: u64,
 }
 
 impl Task {
@@ -562,6 +580,7 @@ impl Task {
             out_head: s.load(OUT_HEAD),
             free_tail: s.load(FREE_TAIL),
             engine_bell: s.load(ENGINE_BELL) as u32,
+            note: s.load(TASK_NOTE),
         };
         s.store(ATTACHED, VERSION_VALUE);
         Ok(t)
@@ -674,6 +693,14 @@ impl Task {
         s.store(ENGINE_WAITS, 0);
         s.wake(ENGINE_BELL);
         true
+    }
+
+    /// Raises the task's note and rings the engine's bell: before a port call, and before the
+    /// task ends, so an engine asleep on its bell reads the task's port and slots.
+    pub fn note(&mut self, s: &impl Shared) -> bool {
+        self.note = self.note.wrapping_add(1);
+        s.store(TASK_NOTE, self.note);
+        self.ring(s)
     }
 
     /// Whether an input, or the end, is there for the task.
