@@ -24,9 +24,12 @@
 //! reach, how many bytes they hold, and how many were cut or dropped (`logs`), and, since stream D
 //! of the data OS (2026-11-16), carries each record the store keeps as the same `log` event,
 //! held to its producer's rate (`logs::RATE_RECORDS`, `logs::RATE_BYTES`): the job updates carry
-//! the logs (`architecture/arrow-core-0.7.md` §6). A `log` event's `seq` is its producer's, so a
-//! peer orders them by the run's start, the attempt and the producer, apart from the run's other
-//! events.
+//! the logs (`architecture/arrow-core-0.7.md` §6). On the socket a `log` event is numbered with
+//! the run's other events, from 1 with no gap, and stamped when it was kept; in the store it keeps
+//! its producer's own numbering. It is a record of output, not a fact of a task's lifecycle, so
+//! it may follow its task's end (output written before the end is drained after it). The socket
+//! is held to a lower rate than the store (`logs::SENT_RATE_RECORDS`, `logs::SENT_RATE_BYTES`
+//! a producer a second), and a `platform` line says how much was kept and not sent.
 //!
 //! The port messages (MH 4.10) are versioned on their own (`v`, [`PORTS_VERSION`]): a stage's
 //! call to a host port is a `port_call`, answered by the peer's `port_reply` for the same `call`;

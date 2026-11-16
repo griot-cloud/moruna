@@ -249,6 +249,38 @@ pub fn stage(
 mod tests {
     use super::*;
 
+    /// The launcher's copy of the data devices' contract is the frozen one (`devices.rs`).
+    #[test]
+    fn the_launcher_attaches_disks_as_the_engine_reads_them() {
+        use moruna_vmm::data;
+        assert_eq!(data::DATA_DISK_DEVICE_ID, devices::DATA_DISK_DEVICE_ID);
+        assert_eq!(data::NAME_MAX, devices::NAME_MAX);
+        assert_eq!(data::SERIAL_MAX, devices::SERIAL_MAX);
+        for len in [0, 1, 511, 512, 123_456_789, u64::MAX] {
+            assert_eq!(data::serial_of(len), devices::serial_of(len));
+            assert_eq!(
+                devices::length_of(data::serial_of(len).as_bytes()),
+                Some(len)
+            );
+        }
+        let (longest, longer) = ("x".repeat(24), "x".repeat(25));
+        for name in [
+            "nyc",
+            "a.b_c-d",
+            "",
+            "Upper",
+            "a/b",
+            longest.as_str(),
+            longer.as_str(),
+        ] {
+            assert_eq!(
+                data::valid_name(name),
+                devices::input_slot(&format!("{}{name}", devices::SCHEME)).is_some(),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn a_binding_names_an_input_and_where_it_is() {
         assert_eq!(

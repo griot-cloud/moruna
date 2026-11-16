@@ -167,31 +167,42 @@ fn what_waits_too_long_goes_out() {
 struct Told {
     events: Arc<Mutex<Vec<Event>>>,
     notes: Arc<Mutex<Vec<String>>>,
-    /// The `log` records sent to the peer, as sent.
-    records: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl Told {
+    /// The `log` events told, as a peer would hear them.
+    fn logs(&self) -> Vec<Event> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, Event::Log { .. }))
+            .cloned()
+            .collect()
+    }
+
+    /// The events told other than `log`.
+    fn others(&self) -> Vec<Event> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| !matches!(e, Event::Log { .. }))
+            .cloned()
+            .collect()
+    }
 }
 
 fn told() -> (Told, Tell) {
     let events = Arc::new(Mutex::new(Vec::new()));
     let notes = Arc::new(Mutex::new(Vec::new()));
-    let records = Arc::new(Mutex::new(Vec::new()));
-    let (e, n, r) = (
-        Arc::clone(&events),
-        Arc::clone(&notes),
-        Arc::clone(&records),
-    );
+    let (e, n) = (Arc::clone(&events), Arc::clone(&notes));
     (
-        Told {
-            events,
-            notes,
-            records,
-        },
+        Told { events, notes },
         Tell {
             event: Box::new(move |_, event| e.lock().unwrap().push(event)),
             note: Box::new(move |note| n.lock().unwrap().push(note)),
-            record: Some(Box::new(move |record| {
-                r.lock().unwrap().push(record.to_vec())
-            })),
+            logs: true,
         },
     )
 }
@@ -336,6 +347,7 @@ fn a_flood_is_bounded_and_counted() {
         peak = peak.max(capture.shared.queued.load(Ordering::Acquire));
     }
     assert!(peak <= QUEUE_BYTES, "{peak} bytes queued");
+    let elapsed = started.elapsed().as_secs_f64();
     let during = told.events.lock().unwrap().len();
     assert!(during >= 1, "the reach was not told during the flood");
     assert!(capture.finish(FINISH_WAIT));
@@ -359,6 +371,23 @@ fn a_flood_is_bounded_and_counted() {
             .unwrap()
             .contains("of this output were dropped here")
     );
+    // The connection carries less than the store keeps, and says so.
+    let sent = told
+        .logs()
+        .into_iter()
+        .filter(|e| matches!(e, Event::Log { task: Some(t), stream, .. } if t == "k1" && *stream != LogStream::Platform))
+        .count() as f64;
+    let most = SENT_BURST_RECORDS as f64 + SENT_RATE_RECORDS as f64 * (elapsed + 2.0);
+    assert!(sent <= most, "{sent} records sent, at most {most}");
+    assert!(
+        (sent as u64) < k1.records,
+        "the store keeps more than is sent"
+    );
+    assert!(told.logs().iter().any(|e| matches!(
+        e,
+        Event::Log { stream: LogStream::Platform, text, .. }
+            if text.contains("not sent on the connection")
+    )));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -396,12 +425,12 @@ fn output_after_its_task_ended_is_drained() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The job updates carry the logs (stream D): every record the store keeps goes to the peer as
-/// the same `log` event, with its producer, its level and its line, numbered by its producer.
+/// The job updates carry the logs (stream D): every record the store keeps is told as the same
+/// `log` event, with its producer, its level and its line.
 #[test]
 fn every_kept_record_goes_to_the_peer_as_it_is_kept() {
     let dir = scratch("peer");
-    let (told, tell) = told();
+    let (heard, tell) = told();
     let capture = Capture::start(
         attempt_dir(&dir, 1, START),
         meta(1),
@@ -414,32 +443,57 @@ fn every_kept_record_goes_to_the_peer_as_it_is_kept() {
     sink.record(Some(1), Some(moruna_kernel::Level::Warning), "careful");
     sink.bytes(None, Stream::Stderr, b"the engine's\n");
     assert!(capture.finish(FINISH_WAIT));
-    let sent: Vec<serde_json::Value> = told
-        .records
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|r| moruna_event::decode(r).unwrap().to_value())
-        .collect();
     let kept = read_producer(&attempt_dir(&dir, 1, START).join("k1")).unwrap();
-    let k1: Vec<&serde_json::Value> = sent.iter().filter(|r| r["task"] == "k1").collect();
-    assert_eq!(k1.len(), 3);
-    assert_eq!(k1.iter().map(|r| (*r).clone()).collect::<Vec<_>>(), kept);
-    assert_eq!(k1[0]["text"], "one");
-    assert_eq!(k1[2]["level"], "warning");
-    assert_eq!(
-        k1.iter()
-            .map(|r| r["seq"].as_u64().unwrap())
-            .collect::<Vec<_>>(),
-        [1, 2, 3],
-        "numbered by the producer"
-    );
-    let engine: Vec<&serde_json::Value> = sent
-        .iter()
-        .filter(|r| r.get("task").is_none_or(|t| t.is_null()))
+    let told_k1: Vec<Event> = heard
+        .logs()
+        .into_iter()
+        .filter(|e| matches!(e, Event::Log { task: Some(t), .. } if t == "k1"))
         .collect();
-    assert_eq!(engine.len(), 1);
-    assert_eq!(engine[0]["text"], "the engine's");
+    assert_eq!(told_k1.len(), 3);
+    for (event, record) in told_k1.iter().zip(&kept) {
+        let Event::Log {
+            task,
+            stream,
+            level,
+            text,
+            ..
+        } = event
+        else {
+            unreachable!()
+        };
+        assert_eq!(record["task"], task.as_deref().unwrap());
+        assert_eq!(record["text"], text.as_str());
+        assert_eq!(record["level"], serde_json::json!(level));
+        assert_eq!(record["stream"], serde_json::json!(stream));
+    }
+    let engine: Vec<Event> = heard
+        .logs()
+        .into_iter()
+        .filter(|e| matches!(e, Event::Log { task: None, .. }))
+        .collect();
+    assert!(matches!(&engine[..], [Event::Log { text, .. }] if text == "the engine's"));
+    assert!(matches!(heard.others().last(), Some(Event::Logs { .. })));
+    // Without a peer the records stay in the store alone.
+    let (quiet, mut tell) = told();
+    tell.logs = false;
+    let capture = Capture::start(
+        attempt_dir(&dir, 2, START),
+        meta(2),
+        vec!["src".into()],
+        Instant::now(),
+        tell,
+    );
+    capture
+        .sink()
+        .bytes(Some(0), Stream::Stdout, b"kept, not told\n");
+    assert!(capture.finish(FINISH_WAIT));
+    assert!(quiet.logs().is_empty());
+    assert_eq!(
+        read_producer(&attempt_dir(&dir, 2, START).join("src"))
+            .unwrap()
+            .len(),
+        1
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -465,10 +519,7 @@ fn a_store_that_cannot_be_written_is_told() {
         .find(|r| r.task.as_deref() == Some("src"))
         .unwrap();
     assert_eq!((src.records, src.dropped, src.drained), (0, 1, true));
-    assert!(
-        told.records.lock().unwrap().is_empty(),
-        "the peer gets what is kept"
-    );
+    assert!(told.logs().is_empty(), "the peer hears what is kept");
     let _ = std::fs::remove_file(&file);
 }
 
