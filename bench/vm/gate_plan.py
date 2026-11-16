@@ -84,3 +84,32 @@ def nyc(files, machine: str = "d8", with_066_rust: bool = True):
             for side in ("a", "b"):
                 add(f"g-{machine}-{wl}-noise-p{p}{side}", "moruna", wl, repeat=None, noise=f"p{p}")
     return plan
+
+
+# The large jobs: once per build, the order changing from job to job (arrow-core-0.7.md section 9).
+OOC = {"ov_shape": "overture", "ov_attrs": "overture", "fw_minhash": "fineweb"}
+OOC_LOOP = {"ov_shape": {"threads": 16, "batch": 250000}, "ov_attrs": {"threads": 16, "batch": 250000},
+            "fw_minhash": {"threads": 16, "batch": 20000}}
+OOC_ENGINES = ("moruna-vm", "moruna", "moruna066-rust", "rust-baseline", "loop", "ray")
+
+
+def ooc(files: dict, machine: str = "d8", with_066_rust: bool = True):
+    """`files` maps a dataset (overture, fineweb) to its files."""
+    m = MACHINES[machine]
+    engines = [e for e in OOC_ENGINES if with_066_rust or e != "moruna066-rust"]
+    plan = []
+    for k, (wl, dataset) in enumerate(OOC.items()):
+        order = engines if k % 2 == 0 else list(reversed(engines))
+        for e in order:
+            extra = dict(OOC_LOOP[wl]) if e == "loop" else {}
+            if e == "ray":
+                extra = {"batch": OOC_LOOP[wl]["batch"]}
+            if e in ("moruna", "moruna066-rust"):
+                extra = {"profiles": f"/data/profiles/gate-{machine}-{e}-{wl}", "fresh_profiles": True,
+                         "staging": "/data/staging"}
+            if e == "rust-baseline":
+                extra = {"threads": m["cpus"], "batch": OOC_LOOP[wl]["batch"]}
+            plan.append({"id": f"g-{machine}-{wl}-{e}-r1", "engine": e, "workload": wl, "files": files[dataset],
+                         "cpus": m["cpus"], "mem_gib": m["mem"], "group": group_of(e), "machine": machine,
+                         "repeat": 1, "timeout_s": 5400, **extra})
+    return plan

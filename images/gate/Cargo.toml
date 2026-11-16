@@ -2,11 +2,12 @@
 # benchmark jobs' functions ported to Rust, their record codec for the data plane, the plain Rust
 # baseline and the canonical-hash tool. It is not Moruna's runtime, so it is its own workspace,
 # as images/python is P's. The native tasks build for the kernel's user target on the kernel's
-# toolchain, so they are a workspace of their own too (tasks/).
+# toolchain, so they are a workspace of their own too (tasks/), as is 0.6.6's extension (py066/),
+# which builds against a Python.
 [workspace]
 resolver = "3"
 members = ["functions", "record", "baseline"]
-exclude = ["tasks"]
+exclude = ["tasks", "py066"]
 
 [workspace.package]
 version = "0.7.0"

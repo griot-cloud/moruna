@@ -34,7 +34,8 @@ output by its canonical form, not by `checksum`'s column sums:
   `images/gate` (`cargo build --release` there, then `GATE_BIN`); `moruna-vm` is 0.7's
   `moruna run` (stream D, `MORUNA07_BIN`) on the job `gate_jobs.py` writes.
 - `moruna066-rust` is 0.6.6 running the Rust port through the `moruna_gate` extension
-  (`images/gate/py066`); `duckdb-sql` and `polars-expr` are the native-expression rows.
+  (`images/gate/py066`, installed with `/data/venv-t/bin/pip install images/gate/py066`);
+  `duckdb-sql` and `polars-expr` are the native-expression rows.
 - Every engine writes zstd level 1, row groups of at most 1 Mi rows, files of at most 1 GiB
   (control 3); `runner.py`'s `OUTPUT` and `gate-baseline`'s `Output`.
 - `driver.py` records `canon` (rows, `hash_exact`, `hash_all`) for every run, keeps Score's

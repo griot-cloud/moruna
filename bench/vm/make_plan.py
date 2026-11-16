@@ -1,4 +1,4 @@
-"""Writes the run plans. make_plan.py preflight|grid|main|...|gate-nyc MACHINE [--no-066-rust]"""
+"""Writes the run plans. make_plan.py preflight|grid|main|...|gate-nyc|gate-ooc MACHINE [--no-066-rust]"""
 import json, sys, glob
 D = "/data/nyc/norm/yellow_tripdata_"
 ALL = sorted(glob.glob(D + "*.parquet"))
@@ -279,5 +279,12 @@ elif mode == "gate-nyc":
     machine = sys.argv[2] if len(sys.argv) > 2 else "d8"
     plan = gate_plan.nyc(Y2024, machine, with_066_rust="--no-066-rust" not in sys.argv)
     mode = f"gate-nyc-{machine}"
+elif mode == "gate-ooc":
+    # The large jobs, once per build: Overture and FineWeb as rerun7 downloaded them.
+    import gate_plan
+    machine = sys.argv[2] if len(sys.argv) > 2 else "d8"
+    files = {"overture": sorted(glob.glob("/data/overture/*.parquet")), "fineweb": sorted(glob.glob("/data/fineweb/*.parquet"))}
+    plan = gate_plan.ooc(files, machine, with_066_rust="--no-066-rust" not in sys.argv)
+    mode = f"gate-ooc-{machine}"
 json.dump(plan, open(f"/data/results/plan-{mode}.json", "w"), indent=1)
 print(mode, len(plan), "runs")

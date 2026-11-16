@@ -22,6 +22,7 @@ GiB = 1 << 30
 GATE = os.environ.get("GATE_BIN", "/home/bench/gate/bin")
 MORUNA07 = os.environ.get("MORUNA07_BIN", "/home/bench/moruna07/bin/moruna")
 NATIVE = ("rust-baseline", "moruna-vm")
+DUMPED = ("score",)
 
 def wr(path, value):
     with open(path, "w") as f: f.write(str(value))
@@ -64,7 +65,10 @@ def canon(spec, out):
     import canon as reference
     wl = spec["workload"]
     os.makedirs(f"{RES}/canon", exist_ok=True)
-    dump = f"{RES}/canon/{spec['id']}.dump" if reference.SPECS[wl].get("tolerant") else None
+    # Tolerant rows are kept for the NYC jobs only: Overture's 1.19 billion rows would make a dump
+    # of tens of GB an engine. There, hash_exact is the check, and hash_all says whether the
+    # tolerant columns matched bit for bit; a bucketed comparison of them is not built yet.
+    dump = f"{RES}/canon/{spec['id']}.dump" if reference.SPECS[wl].get("tolerant") and wl in DUMPED else None
     tool = f"{GATE}/gate-canon"
     if os.path.exists(tool):
         cmd = [tool, "digest", wl] + (["--dump", dump] if dump else []) + [out]

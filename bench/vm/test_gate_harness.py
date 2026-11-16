@@ -272,3 +272,12 @@ def test_node_fixtures_arguments(tmp_path):
     assert p.returncode == 2 and "SDK proof launches its own TCG VM" in p.stderr
     p = run("--bogus")
     assert p.returncode == 2 and "unknown argument" in p.stderr
+
+
+def test_the_large_jobs_plan():
+    plan = gate_plan.ooc({"overture": ["o"], "fineweb": ["f"]}, "d8")
+    shape = [p["engine"] for p in plan if p["workload"] == "ov_shape"]
+    attrs = [p["engine"] for p in plan if p["workload"] == "ov_attrs"]
+    assert shape == attrs[::-1] and len(plan) == 18
+    assert next(p for p in plan if p["workload"] == "fw_minhash" and p["engine"] == "loop")["batch"] == 20000
+    assert all(p["files"] == ["f"] for p in plan if p["workload"] == "fw_minhash")
