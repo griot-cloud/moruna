@@ -448,6 +448,27 @@ impl Slot {
     }
 }
 
+// ---- stream A hook (`windows_protect`'s slot form, data-os §5).
+impl Slot {
+    /// Runs `f` on the area this slot's batch or window is mapped at, with the slot's
+    /// state held so that it neither moves nor goes meanwhile: the process that mapped it,
+    /// the area's address and length, and its memory object. `BadState` when nothing is
+    /// mapped. The lock order is the plane's: the slot's state, then the address space.
+    pub fn with_mapped<R>(
+        &self,
+        f: impl FnOnce(&Arc<Process>, u64, u64, &Arc<MemoryObject>) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let s = self.state.lock();
+        let m = s.current.as_ref().ok_or(Error::BadState)?;
+        let mapper = m.mapper.upgrade().ok_or(Error::BadState)?;
+        let result = f(&mapper, m.addr, m.span, &m.entry.memory);
+        // The process is dropped after the slot's lock, in case this was its last holder.
+        drop(s);
+        drop(mapper);
+        result
+    }
+}
+
 /// What `slot_take` hands back: the 32 bytes of `slot_event` and the memory object
 /// with the rights it was pushed through, for a record or a window.
 pub struct Taken {

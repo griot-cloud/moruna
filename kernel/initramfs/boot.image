@@ -404,21 +404,29 @@ link fpu-a.peer fpu-b.peer
 # DS-A (architecture/data-os-streams.md, stream A): the data path's mechanisms. The
 # caller placed on each CPU and a sleeping thread placed on one, a pinned CPU's lost
 # time, the clock page against clock_get, a group of windows revoked and granted back in
-# one call, and objects in 2 MiB entries before any touch with map::HUGE and
-# map::POPULATE; then a write to a revoked window faults. (One process for all but the
-# fault: the manifest holds at most 32.)
+# one call, objects in 2 MiB entries before any touch with map::HUGE and map::POPULATE,
+# POPULATE zero pages through process_map, and windows revoked through an output slot
+# alone, against dp-task; then a write to a revoked window faults.
 process datapath
   handle console console
+  handle program:dp-task task-image
   expect DS-A pin: ok:
   expect DS-A ticks: ok:
+  expect DS-A share: ok:
+  expect DS-A rcu: ok:
   expect DS-A clock page: ok:
   expect DS-A revoke: ok:
   expect DS-A huge: ok:
+  expect DS-A populate: ok:
+  expect DS-A slot: dp-task writes a page revoked through its slot
+  expect kk: process dp-task faulted: page fault at
+  expect DS-A slot: ok:
   exits 0
 process dp-revoke
   handle console console
   expect DS-A revoke: about to write a revoked window at
   faults page fault at
+link supervisor.datapath datapath.supervisor
 
 # stream B1 (data-os-streams.md, kernel-is-the-machine.md 4.1): the personality's four
 # mechanisms in the core, with no personality present. A sleeping thread is interrupted;
@@ -444,6 +452,11 @@ process personality
   expect B1 futex waker: ok:
   expect kk: process b1-futex exited with code 0 (
   expect B1 futex: ok:
+  expect B1 places: ok:
+  expect B1 room: ok:
+  expect B1 shared handles: ok:
+  expect kk: process b1-task was killed through a handle to it
+  expect B1 task: ok:
   expect B1 tables: ok:
   expect kk: process b1-tables exited with code 0 (
   expect B1 tables run: ok:

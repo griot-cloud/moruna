@@ -5,7 +5,10 @@
 mod jiffies;
 
 use alloc::{boxed::Box, vec::Vec};
-use core::{cell::RefCell, sync::atomic::Ordering};
+use core::{
+    cell::RefCell,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 pub use jiffies::Jiffies;
 
@@ -28,6 +31,29 @@ type InterruptCallback = Box<dyn Fn() + Sync + Send>;
 
 cpu_local! {
     static INTERRUPT_CALLBACKS: RefCell<Vec<InterruptCallback>> = RefCell::new(Vec::new());
+    /// How many timer periods (`1 / TIMER_FREQ`) this CPU waits between two ticks.
+    static TICK_STRETCH: AtomicU32 = AtomicU32::new(1);
+}
+
+/// Makes this CPU tick once every `periods` timer periods (`1 / TIMER_FREQ` each), at least
+/// one: a CPU that runs one thread, or none, needs no tick a millisecond (Moruna). A smaller
+/// stretch than before re-arms the timer at once, so the CPU ticks within the new stretch;
+/// a larger one takes effect from the next tick.
+pub fn set_tick_stretch(periods: u32) {
+    let periods = periods.max(1);
+    let irq_guard = irq::disable_local();
+    let old = TICK_STRETCH
+        .get_with(&irq_guard)
+        .swap(periods, Ordering::Relaxed);
+    if periods < old {
+        crate::arch::timer::rearm(u64::from(periods));
+    }
+}
+
+/// This CPU's tick stretch (see [`set_tick_stretch`]).
+pub(crate) fn tick_stretch() -> u64 {
+    let irq_guard = irq::disable_local();
+    u64::from(TICK_STRETCH.get_with(&irq_guard).load(Ordering::Relaxed))
 }
 
 /// Registers a function that will be executed during the timer interrupt on the current CPU.

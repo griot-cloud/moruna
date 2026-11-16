@@ -8,10 +8,13 @@
 //!   then keeps its own. A process cloned from another shares its zero pages and its image
 //!   until either writes them: writes on each side, by the kernel's copies and by the source
 //!   in user mode, stay on that side, each copy charged to the writer's account; a shared
-//!   object stays shared.
+//!   object stays shared. A snapshot mapped in two places of one process is one object in
+//!   its clone too, and no later write through either place reaches the clone; a second
+//!   process cannot map it. A clone needs no room for the zero pages it shares.
 //! - **The pager (§4.1 c).** A thread touching a pager's page waits while the pager is asked;
 //!   the pager supplies it and the thread reads it. A second process touches another page,
-//!   which the pager refuses, and faults.
+//!   which the pager refuses, and faults. `process_read` and `process_write` wait for the
+//!   pager too, and answer `Fault` on a refusal.
 //! - **The entry (§4.1 a).** A process with a personality region runs a program of a few
 //!   instructions: its system call enters the personality, which answers it and returns
 //!   through the entry; a native call number enters too; the program's FS base is its own;
@@ -20,6 +23,11 @@
 //!   fault-tolerant copy resumes at its recovery address on a fault, with the address.
 //! - **Shared futexes.** A thread of another process wakes a waiter on a word of a shared
 //!   object, mapped at another address.
+//! - **A shared handle table.** A personality process's clone with `SHARE_HANDLES` uses its
+//!   table: a handle made in either works in the other, and a handle closed in one is closed
+//!   for both; a clone without it starts with no handles; a caller with no personality, or
+//!   not holding the table, is refused. Killing a task of four processes holding each
+//!   other's handles frees them all, and its account returns to its starting charge.
 //! - **Page tables go.** When exactly one 2 MiB region empties, its 4 KiB table goes; when a
 //!   whole 512 GiB region empties, its tables go to the root.
 //!
@@ -184,6 +192,7 @@ fn run() -> i64 {
                 "the table of an emptied 2 MiB region went, and those of an emptied 512 GiB region",
             )
         }
+        "b1-task" => task_child(&out),
         "b1-victim" => {
             let pager = Memory(slot("pager"));
             let m = match pager.map(0, 2 * PAGE, 0) {
@@ -232,7 +241,7 @@ fn tester(out: &Console) -> i64 {
         out,
         "pager",
         pager(out, &resource, &image),
-        "a thread waited for a page the pager supplied and read it; a page the pager refused faulted another process",
+        "a thread waited for a page the pager supplied and read it; a page the pager refused faulted another process; process_read and process_write waited for the pager, and a refused page answered fault",
     );
     code |= report(
         out,
@@ -248,6 +257,18 @@ fn tester(out: &Console) -> i64 {
     );
     code |= report(
         out,
+        "places",
+        places(&resource),
+        "a snapshot mapped twice in one process was one object in its clone too, no later write through either place reached the clone, and a second process could not map it",
+    );
+    code |= report(
+        out,
+        "room",
+        room(&resource),
+        "a clone of a process whose account had no room for its zero pages again was made, and its account's peak rose by less than a quarter of them",
+    );
+    code |= report(
+        out,
         "tables run",
         tables(out, &resource, &image),
         "the tables child ended",
@@ -257,6 +278,13 @@ fn tester(out: &Console) -> i64 {
         "futex",
         futex(out, &resource, &image),
         "a waiter on a shared object's word was woken by another process",
+    );
+    // Last: the task takes the process resource with it.
+    code |= report(
+        out,
+        "task",
+        task(out, resource, &image),
+        "a clone sharing a table was refused to a caller with no personality, and a task of four processes holding each other's handles, killed, freed them all and gave its account back its starting charge",
     );
     if code == 0 {
         println!(out, "B1 personality: ok: the four mechanisms answered");
@@ -451,7 +479,7 @@ fn clone(out: &Console, resource: &Handle, image: &Handle) -> Outcome {
 
     let account = call(Account::carve(16 << 20, "b1-clone"), "account_create")?;
     let child = call(
-        personality::process_clone(resource, &source, Some(&account.0)),
+        personality::process_clone(resource, Some(&source), Some(&account.0), 0),
         "process_clone",
     )?;
     let after_clone = call(account.usage(), "account_info")?.used;
@@ -562,7 +590,7 @@ fn request(port: &Channel) -> Result<(u64, u64), (&'static str, Option<Error>)> 
 
 fn pager(out: &Console, resource: &Handle, image: &Handle) -> Outcome {
     let (kernel_end, port) = call(Channel::create(), "channel_create")?;
-    let object = match personality::pager_create(kernel_end, 4 * PAGE, 0x51, None) {
+    let object = match personality::pager_create(kernel_end, 8 * PAGE, 0x51, None) {
         Ok(m) => m,
         Err((e, _)) => return Err(("pager_create", Some(e))),
     };
@@ -616,7 +644,118 @@ fn pager(out: &Console, resource: &Handle, image: &Handle) -> Outcome {
         wait_one(&victim.0, Signals::TERMINATED, now() + ms(10_000)),
         "the victim did not end",
     )?;
-    Ok(())
+    pager_copies(resource, &object, &port)
+}
+
+/// Where a third process maps the pager's object, for the kernel's copies.
+const PAGER_AT: u64 = 0x0c00_0000_0000;
+
+static COPY_OP: AtomicU64 = AtomicU64::new(0);
+static COPY_DONE: AtomicU64 = AtomicU64::new(0);
+static COPY_READ: AtomicU64 = AtomicU64::new(0);
+
+/// `process_read` (op 1) or `process_write` (op 2) of the page `arg >> 32` of the process
+/// whose handle is `arg`'s low half: 1 when it succeeded, 2 on `Fault`, 3 otherwise.
+extern "C" fn copier(arg: u64) -> ! {
+    let process = Process(Handle::from_raw(arg as u32));
+    let at = PAGER_AT + (arg >> 32) * PAGE;
+    let r = match COPY_OP.load(Ordering::Acquire) {
+        1 => {
+            let mut b = [0u8; 8];
+            let r = process.read(at, &mut b);
+            COPY_READ.store(u64::from_le_bytes(b), Ordering::Release);
+            r
+        }
+        _ => process.write(at, b"WRITTEN!"),
+    };
+    core::mem::forget(process);
+    let done = match r {
+        Ok(()) => 1,
+        Err(Error::Fault) => 2,
+        Err(_) => 3,
+    };
+    COPY_DONE.store(done, Ordering::Release);
+    thread_exit()
+}
+
+/// One kernel copy of page `page` through `process`, on a thread of its own: the pager is
+/// asked for the page, which `answer` supplies or refuses. What the copy answered.
+fn copy_through_pager(
+    process: &Process,
+    page: u64,
+    op: u64,
+    port: &Channel,
+    answer: impl FnOnce(u64) -> Outcome,
+) -> Result<u64, (&'static str, Option<Error>)> {
+    COPY_OP.store(op, Ordering::Release);
+    COPY_DONE.store(0, Ordering::Release);
+    let raw = process.0.raw() as u64 | page << 32;
+    let t = spawn(copier, raw)?;
+    let (key, offset) = request(port)?;
+    want(
+        key == 0x51 && offset == page * PAGE,
+        "the copy's request named another page",
+    )?;
+    want(
+        COPY_DONE.load(Ordering::Acquire) == 0,
+        "the copy did not wait for the pager",
+    )?;
+    answer(offset)?;
+    call(
+        wait_one(&t.0, Signals::TERMINATED, now() + ms(10_000)),
+        "the copy did not end",
+    )?;
+    Ok(COPY_DONE.load(Ordering::Acquire))
+}
+
+/// A page the pager supplies, holding `text`.
+fn supply(object: &Memory, offset: u64, text: &[u8; 8]) -> Outcome {
+    let page = call(Memory::create(PAGE), "a supplied page")?;
+    let m = call(page.map(0, PAGE, map::WRITE), "mapping a supplied page")?;
+    call(m.write(0, text), "writing a supplied page")?;
+    drop(m);
+    call(
+        personality::pager_supply(object, offset, PAGE, &page, 0),
+        "pager_supply",
+    )
+}
+
+fn pager_copies(resource: &Handle, object: &Memory, port: &Channel) -> Outcome {
+    let z = call(Process::create(resource, "b1-copies"), "process_create")?;
+    let theirs = call(
+        object
+            .0
+            .duplicate(Rights::READ | Rights::WRITE | Rights::MAP),
+        "duplicate",
+    )?;
+    call(
+        z.map(Some(&theirs), 0, 8 * PAGE, PAGER_AT, map::READ | map::WRITE),
+        "mapping the pager's object",
+    )?;
+    let read = copy_through_pager(&z, 2, 1, port, |o| supply(object, o, b"SUPPLIED"))?;
+    want(
+        read == 1 && COPY_READ.load(Ordering::Acquire) == u64::from_le_bytes(*b"SUPPLIED"),
+        "process_read did not read the page the pager supplied",
+    )?;
+    let wrote = copy_through_pager(&z, 3, 2, port, |o| supply(object, o, &[0; 8]))?;
+    want(
+        wrote == 1,
+        "process_write did not write the page the pager supplied",
+    )?;
+    let mine = call(object.map(3 * PAGE, PAGE, 0), "mapping the written page")?;
+    let mut b = [0u8; 8];
+    call(mine.read(0, &mut b), "reading the written page")?;
+    want(
+        &b == b"WRITTEN!",
+        "process_write's bytes did not land in the pager's page",
+    )?;
+    let refused = copy_through_pager(&z, 4, 1, port, |o| {
+        call(personality::pager_refuse(object, o, PAGE), "pager_refuse")
+    })?;
+    want(
+        refused == 2,
+        "a refused page did not answer process_read with fault",
+    )
 }
 
 // ---- The entry.
@@ -948,4 +1087,374 @@ fn tables_child() -> Outcome {
         whole == 1 << 39,
         "an emptied 512 GiB region's tables stayed",
     )
+}
+
+// ---- A snapshot in two places.
+
+const PLACES: u64 = 0x0d00_0000_0000;
+
+fn places(resource: &Handle) -> Outcome {
+    let word = |text: &[u8; 8]| u64::from_le_bytes(*text);
+    let source = call(Memory::create(PAGE), "memory_create")?;
+    let snap = call(
+        personality::memory_snapshot(&source, 0, PAGE, None),
+        "memory_snapshot",
+    )?;
+    let x = call(Process::create(resource, "b1-places"), "process_create")?;
+    let (a, b) = (PLACES, PLACES + 2 * PAGE);
+    for at in [a, b] {
+        call(
+            x.map(Some(&snap.0), 0, PAGE, at, map::READ | map::WRITE),
+            "mapping the snapshot twice",
+        )?;
+    }
+    // One process maps it: another, and this one, are refused.
+    let y = call(Process::create(resource, "b1-places-y"), "process_create")?;
+    match y.map(Some(&snap.0), 0, PAGE, a, map::READ | map::WRITE) {
+        Err(Error::BadState) => {}
+        _ => return Err(("a second process mapped the snapshot", None)),
+    }
+    match snap.map(0, PAGE, 0) {
+        Err(Error::BadState) => {}
+        _ => return Err(("a third process mapped the snapshot", None)),
+    }
+    call(x.write(a, b"11111111"), "writing one place")?;
+    want(
+        read_u64(&x, b)? == word(b"11111111"),
+        "the two places are not one object",
+    )?;
+    let c = call(
+        personality::process_clone(resource, Some(&x), None, 0),
+        "process_clone",
+    )?;
+    call(
+        x.write(b, b"22222222"),
+        "writing the other place after the clone",
+    )?;
+    want(
+        read_u64(&c, a)? == word(b"11111111") && read_u64(&c, b)? == word(b"11111111"),
+        "a write through the second place reached the clone",
+    )?;
+    want(
+        read_u64(&x, a)? == word(b"22222222"),
+        "the source's two places stopped being one object",
+    )?;
+    call(c.write(a, b"33333333"), "writing the clone")?;
+    want(
+        read_u64(&c, b)? == word(b"33333333"),
+        "the clone's two places are not one object",
+    )?;
+    want(
+        read_u64(&x, a)? == word(b"22222222"),
+        "the clone's write reached the source",
+    )
+}
+
+// ---- A clone's room.
+
+const ROOM: u64 = 0x0e00_0000_0000;
+const ROOM_PAGES: u64 = 128;
+
+fn room(resource: &Handle) -> Outcome {
+    let budget = call(Account::carve(2 << 20, "b1-room"), "account_create")?;
+    let source = call(
+        Process::create_in(resource, "b1-room", &budget.0),
+        "process_create",
+    )?;
+    call(
+        source.map(None, 0, ROOM_PAGES * PAGE, ROOM, map::READ | map::WRITE),
+        "mapping zero pages",
+    )?;
+    for i in 0..ROOM_PAGES {
+        call(
+            source.write(ROOM + i * PAGE, &i.to_le_bytes()),
+            "touching a zero page",
+        )?;
+    }
+    // The account fills to within 16 pages of its limit.
+    let u = call(budget.usage(), "account_info")?;
+    let room = u.limit - u.used - u.reserved;
+    let filler = (room - 16 * PAGE - 256) / (PAGE + 16);
+    let _filler = call(
+        Memory::create_in(filler * PAGE, &budget.0),
+        "filling the account",
+    )?;
+    let before = call(budget.usage(), "account_info")?;
+    want(
+        before.limit - before.used - before.reserved < ROOM_PAGES * PAGE / 2,
+        "the account still had room for its zero pages",
+    )?;
+    let theirs = call(Account::carve(4 << 20, "b1-room-clone"), "account_create")?;
+    let child = call(
+        personality::process_clone(resource, Some(&source), Some(&theirs.0), 0),
+        "process_clone with no room for the zero pages twice",
+    )?;
+    let after = call(budget.usage(), "account_info")?;
+    want(
+        after.peak - before.peak < ROOM_PAGES * PAGE / 4,
+        "the clone charged the source's account its zero pages again",
+    )?;
+    want(
+        read_u64(&child, ROOM + 5 * PAGE)? == 5,
+        "the clone lost a zero page",
+    )?;
+    call(
+        source.write(ROOM + 5 * PAGE, &9u64.to_le_bytes()),
+        "the source's write",
+    )?;
+    want(
+        read_u64(&child, ROOM + 5 * PAGE)? == 5 && read_u64(&source, ROOM + 5 * PAGE)? == 9,
+        "a shared zero page did not copy on write",
+    )
+}
+
+// ---- A shared handle table.
+
+/// The task's processes run below the region, each on a stack of its own.
+const TASK_STACKS: u64 = 0x0f00_0000_0000;
+const TASK_STACK: u64 = 16 * PAGE;
+/// The object the task's processes share, mapped where the kernel chose, before any clone.
+static TASK_SHARED: AtomicU64 = AtomicU64::new(0);
+
+/// The task's shared words: a step, and values its processes hand each other.
+fn task_word(i: usize) -> &'static AtomicU64 {
+    // SAFETY: the shared object is a page, mapped before the clones and never unmapped
+    // while the task lives; its words are only accessed as atomics.
+    unsafe { &*((TASK_SHARED.load(Ordering::Acquire) + 8 * i as u64) as *const AtomicU64) }
+}
+
+fn task_step() -> &'static AtomicU32 {
+    // SAFETY: as in `task_word`; word 0's low half is the step.
+    unsafe { &*(TASK_SHARED.load(Ordering::Acquire) as *const AtomicU32) }
+}
+
+fn set_step(step: u32) {
+    task_step().store(step, Ordering::Release);
+    let _ = futex_wake(task_step(), u32::MAX);
+}
+
+fn await_step(step: u32) -> bool {
+    let end = now() + ms(10_000);
+    loop {
+        let seen = task_step().load(Ordering::Acquire);
+        if seen >= step {
+            return true;
+        }
+        if now() >= end {
+            return false;
+        }
+        let _ = futex_wait(task_step(), seen, now() + ms(100));
+    }
+}
+
+/// A clone without `SHARE_HANDLES`: the console's value names nothing in it.
+extern "C" fn task_probe(_: u64) -> ! {
+    let value = task_word(2).load(Ordering::Acquire) as u32;
+    let empty = matches!(moruna_sys::info(value), Err(Error::BadHandle));
+    task_word(1).store(if empty { 1 } else { 2 }, Ordering::Release);
+    thread_exit()
+}
+
+/// A clone sharing the table: a channel it makes is the parent's, and the parent's is its.
+extern "C" fn task_share(_: u64) -> ! {
+    if let Ok((a, b)) = Channel::create() {
+        task_word(3).store(a.0.into_raw() as u64, Ordering::Release);
+        task_word(4).store(b.0.into_raw() as u64, Ordering::Release);
+    }
+    set_step(1);
+    if await_step(2) {
+        let k1 = Channel(Handle::from_raw(task_word(5).load(Ordering::Acquire) as u32));
+        let k2 = Channel(Handle::from_raw(task_word(6).load(Ordering::Acquire) as u32));
+        let mut b = [0u8; 1];
+        let mut none: [Option<Handle>; 0] = [];
+        let ok = k1.write(b"k", []).is_ok() && k2.read(&mut b, &mut none).is_ok() && &b == b"k";
+        task_word(7).store(if ok { 1 } else { 2 }, Ordering::Release);
+        // Closed here, for the parent too.
+        let _ = k1.0.close();
+        core::mem::forget(k2);
+        set_step(3);
+    }
+    task_rest()
+}
+
+/// One of the task's four, asleep until the task is killed.
+extern "C" fn task_sleeper(_: u64) -> ! {
+    task_rest()
+}
+
+fn task_rest() -> ! {
+    let word = AtomicU32::new(0);
+    loop {
+        let _ = futex_wait(&word, 0, now() + ms(60_000));
+    }
+}
+
+/// Clones this process, maps the clone a stack, and starts it at `entry`.
+fn task_clone(
+    resource: &Handle,
+    index: u64,
+    flags: u64,
+    entry: extern "C" fn(u64) -> !,
+) -> Result<Process, (&'static str, Option<Error>)> {
+    let child = call(
+        personality::process_clone(resource, None, None, flags),
+        "process_clone of itself",
+    )?;
+    let stack = TASK_STACKS + index * 2 * TASK_STACK;
+    call(
+        child.map(None, 0, TASK_STACK, stack, map::READ | map::WRITE),
+        "mapping a clone's stack",
+    )?;
+    call(
+        child.launch(entry as *const () as u64, stack + TASK_STACK - 8, 0),
+        "process_launch of a clone",
+    )?;
+    Ok(child)
+}
+
+/// The task's first process: its checks, its report, then a rest until the tester kills
+/// the task, so a failed check never leaves a clone running.
+fn task_child(out: &Console) -> ! {
+    let resource = slot("resource");
+    let report_to = Channel(slot("report"));
+    let outcome = Memory::create(PAGE)
+        .and_then(|shared| shared.map_detached(0, PAGE, map::WRITE))
+        .map_err(|e| ("the task's shared object", Some(e)))
+        .and_then(|m| {
+            TASK_SHARED.store(m.addr(), Ordering::Release);
+            core::mem::forget(m);
+            task_steps(out, &resource)
+        });
+    let text: &[u8] = if outcome.is_ok() { b"ok" } else { b"fail" };
+    report(
+        out,
+        "shared handles",
+        outcome,
+        "a handle made in a clone worked in its parent and one made in the parent in the clone, one closed in the clone was closed in the parent, a clone without the flag had no handles, and a clone of another table or with an unknown flag was refused",
+    );
+    let _ = report_to.write(text, []);
+    task_rest()
+}
+
+fn task_steps(out: &Console, resource: &Handle) -> Outcome {
+    use moruna_abi::process::SHARE_HANDLES;
+    // Refused: another process's table, and a flag no ABI has.
+    let other = call(Process::create(resource, "b1-other"), "process_create")?;
+    match personality::process_clone(resource, Some(&other), None, SHARE_HANDLES) {
+        Err(Error::AccessDenied) => {}
+        _ => return Err(("a clone shared a table the caller does not hold", None)),
+    }
+    match personality::process_clone(resource, None, None, 1 << 7) {
+        Err(Error::InvalidArgs) => {}
+        _ => return Err(("a clone took an unknown flag", None)),
+    }
+    // Without the flag: no handles.
+    task_word(2).store(out.0.raw() as u64, Ordering::Release);
+    let probe = task_clone(resource, 0, 0, task_probe)?;
+    call(
+        wait_one(&probe.0, Signals::TERMINATED, now() + ms(10_000)),
+        "the clone without the flag did not end",
+    )?;
+    want(
+        task_word(1).load(Ordering::Acquire) == 1,
+        "a clone without the flag held the parent's handles",
+    )?;
+    // With it: one table.
+    let _share = task_clone(resource, 1, SHARE_HANDLES, task_share)?;
+    want(await_step(1), "the sharing clone did not make its channel")?;
+    let h1 = Channel(Handle::from_raw(task_word(3).load(Ordering::Acquire) as u32));
+    let h2 = Channel(Handle::from_raw(task_word(4).load(Ordering::Acquire) as u32));
+    let mut b = [0u8; 1];
+    let mut none: [Option<Handle>; 0] = [];
+    let theirs_work = h1.write(b"h", []).is_ok() && h2.read(&mut b, &mut none).is_ok();
+    core::mem::forget((h1, h2));
+    want(
+        theirs_work && &b == b"h",
+        "a handle made in the clone did not work in the parent",
+    )?;
+    let (k1, k2) = call(Channel::create(), "channel_create")?;
+    let k1_raw = k1.0.into_raw();
+    task_word(5).store(k1_raw as u64, Ordering::Release);
+    task_word(6).store(k2.0.into_raw() as u64, Ordering::Release);
+    set_step(2);
+    want(
+        await_step(3),
+        "the sharing clone did not use the parent's channel",
+    )?;
+    want(
+        task_word(7).load(Ordering::Acquire) == 1,
+        "a handle made in the parent did not work in the clone",
+    )?;
+    match moruna_sys::info(k1_raw) {
+        Err(Error::BadHandle) => {}
+        _ => {
+            return Err((
+                "a handle closed in the clone stayed open in the parent",
+                None,
+            ));
+        }
+    }
+    // Two more: a task of four, each holding the others' handles in the one table.
+    task_clone(resource, 2, SHARE_HANDLES, task_sleeper)?;
+    task_clone(resource, 3, SHARE_HANDLES, task_sleeper)?;
+    Ok(())
+}
+
+fn task(out: &Console, resource: Handle, image: &Handle) -> Outcome {
+    use moruna_abi::process::SHARE_HANDLES;
+    // This process has no personality: it may not share its table.
+    match personality::process_clone(&resource, None, None, SHARE_HANDLES) {
+        Err(Error::AccessDenied) => {}
+        _ => return Err(("a process with no personality shared its table", None)),
+    }
+    let account = call(Account::carve(64 << 20, "b1-task"), "account_create")?;
+    let start = call(account.usage(), "account_info")?.used;
+    let t = call(
+        Process::create_in(&resource, "b1-task", &account.0),
+        "process_create",
+    )?;
+    let entry = call(t.map_image(image), "process_map_image")?;
+    call(personality_set(&t, MAP_BASE, REGION_LEN), "personality_set")?;
+    let (mine, theirs) = call(Channel::create(), "channel_create")?;
+    let console = call(console_for(out), "duplicating the console")?;
+    call(
+        t.start_with(
+            entry,
+            &mut [
+                (Some(console), "console"),
+                (Some(resource), "resource"),
+                (Some(theirs.0), "report"),
+            ],
+        ),
+        "process_start",
+    )?;
+    let reported = wait_one(&mine.0, Signals::READABLE, now() + ms(30_000));
+    let mut b = [0u8; 4];
+    let mut none: [Option<Handle>; 0] = [];
+    let read = mine.read(&mut b, &mut none);
+    let running = call(account.usage(), "account_info")?.used;
+    // Killed whatever it reported, so none of its processes outlives the test.
+    call(t.kill(), "process_kill of the task")?;
+    call(reported, "the task did not report")?;
+    want(
+        matches!(read, Ok((2, _))) && &b[..2] == b"ok",
+        "the task's own checks failed",
+    )?;
+    want(running > start, "the task charged nothing")?;
+    call(
+        wait_one(&t.0, Signals::TERMINATED, now() + ms(10_000)),
+        "the task did not end",
+    )?;
+    drop(t);
+    // Its processes end on their own CPUs: the charge goes back as the last of them goes.
+    let end = now() + ms(10_000);
+    loop {
+        if call(account.usage(), "account_info")?.used == start {
+            return Ok(());
+        }
+        if now() >= end {
+            return Err(("the killed task's account kept a charge", None));
+        }
+        sleep(ms(10));
+    }
 }

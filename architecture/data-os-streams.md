@@ -10,6 +10,14 @@ first, and iterates until Moruna is significantly better than the other engines.
 
 ## Rules for every stream
 
+- **Talos's security posture binds every stream** (`data-os.md` §3a; Brackly, 2026-11-16).
+  - No shell in anything Moruna ships or runs, and none in booted tests: no `sh` in any done
+    criterion.
+  - Tasks start by exec, never `sh -c`.
+  - No console login, no SSH, no terminals or `devpts`.
+  - The root is read-only.
+  - The carried Linux layer refuses administrative calls.
+
 - **Branch and merge.**
   - Work in your own worktree, on a branch `data-os/<stream>`, cut from `feature/arrow-core-0.7`
     when the stream starts (at or after `fa0a02bf`, which added the contracts).
@@ -47,6 +55,13 @@ first, and iterates until Moruna is significantly better than the other engines.
   - `cargo llvm-cov` for root crates;
   - the host tests CI's kernel job runs for kernel crates;
   - booted tests in the kernel's boot image for mechanisms only a running kernel can show.
+- **Code carried from Asterinas is judged by test suites, not line coverage** (Brackly,
+  2026-11-16: "Yes, test suites").
+  - Moruna's own code keeps the 80% per-crate floor.
+  - The files carried from Asterinas's Linux layer are judged by Asterinas's own tests and the
+    gVisor system-call suite: report which pass and which fail.
+  - Code we write or rewrite around the carried code is Moruna's own, so it gets the 80% floor.
+    That covers the user-space OSTD, the glue and the rewritten files.
 - **The Mac's disk.**
   - Set `CARGO_INCREMENTAL=0` and a `CARGO_TARGET_DIR` of your own.
   - Delete it when your stream is done.
@@ -178,7 +193,7 @@ and switches to the new one when the call answers.
   Sockets and the cloud platform stay out.
 - **Tests:**
   - host tests of the carried logic;
-  - then booted: static musl, dynamic glibc, `sh`, CPython 3.14 importing NumPy and pyarrow, and
+  - then booted: static musl, dynamic glibc, CPython 3.14 importing NumPy and pyarrow (no shell), and
     the gVisor system-call tests that apply.
 - **Done when:**
   - the gate's Python image runs as an image task on it under KVM;
@@ -349,3 +364,31 @@ and switches to the new one when the call answers.
   - **CI's kernel job host-tests `moruna-datapath` and `moruna-sys`.**
   - **B2's proposed four-way split** (core and processes, vm, fs, images) is accepted. The new
     streams start when B2's core compiles and a session slot is free.
+- **2026-11-16: stream B1 merged** (`e7a1fb88`, from `f855154e`). CI's boot passed 191 of 191
+  checks under KVM on 1, 2 and 4 CPUs.
+  - Every booted B1 test reports ok: the interrupt, snapshot, clone, pager, entry, copy,
+    tables, futex and personality tests.
+  - Kernel mode grows by 1,372 code lines net, through the nine reserved calls and the
+    probe-only `TABLE`.
+  - The KB1 ping-pong shows no regression against step 1: 6.09 s, 5.42 s and 0.72 s, against
+    6.46 s, 6.19 s and 0.85 s.
+  - **Open, and B1's next:**
+    - a snapshot mapped in two places shares later writes with a clone, which `fork` cannot
+      allow;
+    - a clone briefly needs room for its zero pages twice;
+    - `process_read` and `process_write` answer `ShouldWait` on a page the pager has not
+      supplied.
+  - **Later:** the GS base is not kept per thread, and a program thread is interrupted only
+    within one tick.
+- **2026-11-16: stream A's second round merged** (`5b17702c`, from `7a74b44f`). CI's boot
+  passed 197 of 197 checks under KVM on 1, 2 and 4 CPUs, and `deadline-boot.sh` passed.
+  - `windows_protect`'s slot form landed, so stream P switches its grouped revoke on.
+  - `POPULATE` through `process_map` is booted.
+  - C5's stage (b) cut a pinned worker CPU's loss on a quiet VM from 3.8%-4.5% to 1.5%-1.6%.
+    Of a tick's ~23 us, about 0.5 us was OSTD's own work; the rest was VM exits.
+  - OSTD's RCU now counts user mode and idle as quiescent, so unmapped frames are freed.
+  - **Left for stream D:** the remaining 1.5% is the host's own 1 kHz tick on the vCPU threads.
+    The launcher should pin QEMU's vCPU threads to host cores isolated from the host's tick
+    (`nohz_full`, `isolcpus` or a cgroup cpuset, `rcu_nocbs`), and report the loss measured
+    again. It is a host setting for Griot's node, so D documents it and measures it on
+    `moruna-bench`.
