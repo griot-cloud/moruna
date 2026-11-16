@@ -9,6 +9,10 @@ Status: plan, rewritten 2026-11-16 on Brackly's direction:
 This replaces the earlier revision of this file, which designed 0.7 around a Python host (it is
 in git history at `65acdc8f`). The decisions in "What stays" carry over from it.
 
+**Under review:** `architecture/data-os.md` (2026-11-16) proposes a data OS, Asterinas's kernel
+with Moruna's data path fused in, which would reshape steps 1 to 5 below. Until Brackly approves
+it, this plan stands, and only step 1's measurements proceed.
+
 Brackly approved this plan on 2026-11-16, and the PM session agreed it the same day. The PM's
 decisions are folded in below.
 
