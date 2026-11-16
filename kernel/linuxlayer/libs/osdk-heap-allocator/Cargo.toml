@@ -1,0 +1,13 @@
+[package]
+name = "linuxlayer-osdk-heap-allocator"
+description = "OSDK's heap allocator's per-CPU boxes, for aster-util in user space"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "osdk_heap_allocator"
+
+[dependencies]
+ostd.workspace = true

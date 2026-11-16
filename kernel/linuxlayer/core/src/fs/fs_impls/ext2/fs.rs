@@ -14,7 +14,7 @@
 //! and sync. The `block_groups` vector itself is immutable after mount;
 //! each `BlockGroup` carries its own internal locks (see `block_group`
 //! module documentation). The `group_descriptors_segment` has no dedicated
-//! lock — it is loaded once at mount and updated during `sync` under each
+//! lock, it is loaded once at mount and updated during `sync` under each
 //! group's metadata write guard, with disjoint descriptor offsets ensuring
 //! no two writers touch the same bytes. `next_generation` is an `AtomicU32`
 //! incremented once per newly allocated inode.

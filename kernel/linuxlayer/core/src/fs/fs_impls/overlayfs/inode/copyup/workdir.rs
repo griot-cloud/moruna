@@ -4,9 +4,9 @@
 //!
 //! [`WorkdirTemp`] is the guard of one staged object: it holds the name the object was created
 //! under, its dentry, an owned handle of the workspace it lives in, and whether an outlet has
-//! already consumed it. Two consuming outlets discharge the guard — [`WorkdirTemp::publish`]
+//! already consumed it. Two consuming outlets discharge the guard, [`WorkdirTemp::publish`]
 //! renames the object into the upper, and [`WorkdirTemp::into_whiteout`] detaches it into a
-//! whiteout handle the workspace never cleans up — and [`Drop`](WorkdirTemp) is the backstop for
+//! whiteout handle the workspace never cleans up, and [`Drop`](WorkdirTemp) is the backstop for
 //! an early `?` that took neither, removing the temp. Because the workspace handle is owned and
 //! has no accessor, those outlets are the only paths that move a guarded name.
 //!
@@ -65,7 +65,7 @@ impl WorkdirTemp {
     /// Publishes this staged temp into `upper_parent` under `name`, consuming the guard.
     ///
     /// A successful rename moves the entry out of the workspace, and a failed one leaves the
-    /// guard unconsumed so `Drop` removes the temp — the same best-effort cleanup the callers
+    /// guard unconsumed so `Drop` removes the temp, the same best-effort cleanup the callers
     /// used to write by hand.
     pub(in super::super) fn publish(
         mut self,

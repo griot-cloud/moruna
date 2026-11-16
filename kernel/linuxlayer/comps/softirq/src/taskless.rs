@@ -2,13 +2,19 @@
 
 use alloc::{boxed::Box, sync::Arc};
 use core::{
-    cell::RefCell,
     ops::DerefMut,
     sync::atomic::{AtomicBool, Ordering},
 };
 
 use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter};
-use ostd::{cpu::local::StaticCpuLocal, cpu_local, irq};
+use ostd::{
+    cpu::local::StaticCpuLocal,
+    cpu_local, irq,
+    sync::{LocalIrqDisabled, SpinLock},
+};
+
+// User space: the threads on a CPU share its lists, so each is a lock, not a `RefCell`.
+type TasklessList = SpinLock<LinkedList<TasklessAdapter>, LocalIrqDisabled>;
 
 use super::{
     SoftIrqLine,
@@ -67,10 +73,9 @@ pub struct Taskless {
 intrusive_adapter!(TasklessAdapter = Arc<Taskless>: Taskless { link: LinkedListAtomicLink });
 
 cpu_local! {
-    static TASKLESS_LIST: RefCell<LinkedList<TasklessAdapter>> =
-        RefCell::new(LinkedList::new(TasklessAdapter::NEW));
-    static TASKLESS_URGENT_LIST: RefCell<LinkedList<TasklessAdapter>> =
-        RefCell::new(LinkedList::new(TasklessAdapter::NEW));
+    static TASKLESS_LIST: TasklessList = SpinLock::new(LinkedList::new(TasklessAdapter::NEW));
+    static TASKLESS_URGENT_LIST: TasklessList =
+        SpinLock::new(LinkedList::new(TasklessAdapter::NEW));
 }
 
 impl Taskless {
@@ -119,10 +124,7 @@ impl Taskless {
     }
 }
 
-fn do_schedule(
-    taskless: &Arc<Taskless>,
-    taskless_list: &'static StaticCpuLocal<RefCell<LinkedList<TasklessAdapter>>>,
-) {
+fn do_schedule(taskless: &Arc<Taskless>, taskless_list: &'static StaticCpuLocal<TasklessList>) {
     if taskless.is_disabled.load(Ordering::Acquire) {
         return;
     }
@@ -136,7 +138,7 @@ fn do_schedule(
     let irq_guard = irq::disable_local();
     taskless_list
         .get_with(&irq_guard)
-        .borrow_mut()
+        .lock()
         .push_front(taskless.clone());
 }
 
@@ -155,14 +157,11 @@ pub(super) fn init() {
 ///
 /// If the `Taskless` is ready to be executed, it will be set to not scheduled
 /// and can be scheduled again.
-fn taskless_softirq_handler(
-    taskless_list: &'static StaticCpuLocal<RefCell<LinkedList<TasklessAdapter>>>,
-    softirq_id: u8,
-) {
+fn taskless_softirq_handler(taskless_list: &'static StaticCpuLocal<TasklessList>, softirq_id: u8) {
     let mut processing_list = {
         let irq_guard = irq::disable_local();
         let guard = taskless_list.get_with(&irq_guard);
-        let mut list_mut = guard.borrow_mut();
+        let mut list_mut = guard.lock();
         LinkedList::take(list_mut.deref_mut())
     };
 
@@ -175,7 +174,7 @@ fn taskless_softirq_handler(
             let irq_guard = irq::disable_local();
             taskless_list
                 .get_with(&irq_guard)
-                .borrow_mut()
+                .lock()
                 .push_front(taskless);
             SoftIrqLine::get(softirq_id).raise();
             continue;

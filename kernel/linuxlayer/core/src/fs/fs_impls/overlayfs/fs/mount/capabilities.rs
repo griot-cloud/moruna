@@ -3,8 +3,8 @@
 //! Upper-filesystem capability probes.
 //!
 //! After the upper/workdir pair is claimed, this module measures the upper
-//! filesystem's capabilities — on the upper itself and on the workdir
-//! workspace — used to decide whiteout and UUID support for a writable
+//! filesystem's capabilities, on the upper itself and on the workdir
+//! workspace, used to decide whiteout and UUID support for a writable
 //! overlay mount.
 
 #![short_vis_path::add(overlayfs)]

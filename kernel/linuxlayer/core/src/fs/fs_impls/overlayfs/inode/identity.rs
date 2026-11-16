@@ -19,12 +19,12 @@
 //!
 //! Overlayfs has two ways to project an identity, resolved once at mount time into the mount's
 //! [`IdentityPolicy`]:
-//! - `SameFs` — every layer really lives on one underlying filesystem, so that filesystem already
+//! - `SameFs`: every layer really lives on one underlying filesystem, so that filesystem already
 //!   provides the identity guarantees and overlayfs may pass its identities through.
 //!   - To decide whether the layers share one filesystem, the mount checks the filesystem instance
 //!   each real layer belongs to and assigns one `fsid` per instance, topmost layer first; when all
 //!   layers belong to one filesystem, only `fsid = 0` is assigned.
-//! - `Xino` — overlayfs provides the identity guarantees itself, in particular when the layers live
+//! - `Xino`: overlayfs provides the identity guarantees itself, in particular when the layers live
 //!   on several filesystem instances (a single-instance mount can force it too).
 //!   - Overlayfs takes an anonymous device ID of its own, distinct from every existing
 //!     filesystem, so that device numbers cannot collide.
@@ -107,7 +107,7 @@ pub(in overlayfs) struct IdentityPolicy {
     /// The numbers this mount allocates; absent when the resolved form allocates none.
     fallback_ino: Option<AtomicU64>,
     upper_numbers: Option<LayerNumbers>,
-    /// The numbers of every lower, topmost first — the layers an origin record can name.
+    /// The numbers of every lower, topmost first, the layers an origin record can name.
     lower_numbers: Vec<LayerNumbers>,
 }
 
@@ -158,7 +158,7 @@ pub(super) struct ObjectVisibleId {
     pub(super) ino: u64,
 }
 
-/// The numbers the ID system keeps for one layer — what a durable layer name resolves to.
+/// The numbers the ID system keeps for one layer, what a durable layer name resolves to.
 #[derive(Clone, Copy, Debug)]
 struct LayerNumbers {
     fsid: u64,
@@ -355,7 +355,7 @@ impl IdentityPolicy {
     /// Returns the next number this mount allocates.
     ///
     /// A self-allocated number has to stay distinguishable from an encoded one, so
-    /// `xino_fallback_ino` sets the lowest encoding bit on it — the bit `encode_xino` keeps clear.
+    /// `xino_fallback_ino` sets the lowest encoding bit on it, the bit `encode_xino` keeps clear.
     /// Linux marks a self-allocated number the same way with `ovl_map_dev_ino` and `ovl_map_ino`.
     ///
     /// Reference:
@@ -431,7 +431,7 @@ impl OverlayFs {
     /// Returns the real ID recorded in the upper's durable origin record, resolved onto a lower of this
     /// mount.
     ///
-    /// `None` covers an absent, undecodable, or unreadable record — the unreadable one warns once — and
+    /// `None` covers an absent, undecodable, or unreadable record, the unreadable one warns once, and
     /// a record that matches no single lower.
     pub(super) fn origin_of(&self, upper: &Dentry) -> Option<ObjectRealId> {
         let mut value = [0u8; size_of::<ObjectOriginRecord>()];
@@ -470,7 +470,7 @@ impl OverlayFs {
     /// Returns the real ID one projected stack resolves to: the ID of its visible source.
     ///
     /// Two kinds of object answer differently: a directory takes its topmost retained lower's number
-    /// — the one its identity must survive a copy-up as — and a non-directory upper takes the durable
+    ///, the one its identity must survive a copy-up as, and a non-directory upper takes the durable
     /// record it carries.
     pub(super) fn real_id_of_stack(&self, facts: &RealObjectStack) -> ObjectRealId {
         let visible = facts.visible_source();

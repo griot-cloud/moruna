@@ -29,19 +29,19 @@ use crate::{
 ///
 /// Conceptually, there are four variants of dentries:
 ///
-/// - **Root** — the root of a mounted filesystem;
+/// - **Root**: the root of a mounted filesystem;
 ///   its name derives from the mountpoint.
 ///   It has no in-tree parent.
-/// - **Named** — an ordinary entry under a parent directory
+/// - **Named**: an ordinary entry under a parent directory
 ///   with a real, mutable name.
-/// - **Anonymous** — a real filesystem inode that has no name yet:
+/// - **Anonymous**: a real filesystem inode that has no name yet:
 ///   it keeps a real parent directory,
 ///   but is deliberately kept out of the parent's children cache,
 ///   so path lookup cannot reach it.
 ///   This variant is reserved for temporary files created via `O_TMPFILE`;
 ///   such a file can be promoted to a `Named` dentry
 ///   by a later `linkat(2)` (future work).
-/// - **Pseudo** — an object with no position in any real filesystem tree
+/// - **Pseudo**: an object with no position in any real filesystem tree
 ///   (pipes, sockets, anon-inode fds, namespace/pidfd files, memfd).
 ///   It has no parent,
 ///   and its name is a synthesized display string

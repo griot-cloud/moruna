@@ -8,8 +8,8 @@
 //!
 //! # Types
 //!
-//! - `RawSuperBlock` — the `#[repr(C)]` on-disk layout.
-//! - `SuperBlock` — a validated, in-memory representation.
+//! - `RawSuperBlock`: the `#[repr(C)]` on-disk layout.
+//! - `SuperBlock`: a validated, in-memory representation.
 //!
 //! # Mount validation
 //!

@@ -24,7 +24,7 @@ pub(crate) trait FsType: Send + Sync + 'static {
     /// Key used to deduplicate mounts of the same logical FS instance.
     ///
     /// Set to `()` (with the default `obtain_key_and_cache` returning `None`) to opt out
-    /// of any caching — every mount is fresh.
+    /// of any caching, every mount is fresh.
     type Key: Eq + Ord + Clone + Send + Sync + 'static;
 
     /// Gets the name of this FS type such as `"ext4"` or `"sysfs"`.

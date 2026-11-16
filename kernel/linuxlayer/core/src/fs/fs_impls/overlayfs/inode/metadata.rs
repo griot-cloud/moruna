@@ -7,8 +7,8 @@
 //! (utimes). Every entry ends in the writable take point
 //! ([`OverlayInode::writable_real_object`]): the read-only gate, the copy-up
 //! promotion sourced from the entry's own dentry, and the upper real object
-//! the change is handed to. The overlay evaluates no DAC of its own — that
-//! stays the VFS's — so the take point is the one place a metadata write is
+//! the change is handed to. The overlay evaluates no DAC of its own, that
+//! stays the VFS's, so the take point is the one place a metadata write is
 //! admitted.
 //!
 //! # Ownership

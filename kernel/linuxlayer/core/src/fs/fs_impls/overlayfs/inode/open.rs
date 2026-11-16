@@ -3,8 +3,8 @@
 //! Open admission for overlay inodes and the per-open directory handle.
 //!
 //! A directory open answers with a per-open handle that owns this open file's frozen snapshot and
-//! the `..` identity captured here; a writable open of a file runs the writable take point — the
-//! read-only gate plus the copy-up promotion — instead. This module is a sibling of
+//! the `..` identity captured here; a writable open of a file runs the writable take point, the
+//! read-only gate plus the copy-up promotion, instead. This module is a sibling of
 //! [`super::readdir`], so a snapshot's fields stay invisible to the handle: it can read them only
 //! through their accessors.
 

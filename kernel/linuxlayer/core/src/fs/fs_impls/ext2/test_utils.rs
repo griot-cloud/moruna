@@ -32,7 +32,7 @@ const DOT_BYTE: &[u8] = b".";
 const DOT_DOT_BYTE: &[u8] = b"..";
 
 // ===========================================================================
-// Layer 0: Primitives — assertions, bit manipulation
+// Layer 0: Primitives, assertions, bit manipulation
 // ===========================================================================
 
 macro_rules! assert_errno {
@@ -444,7 +444,7 @@ pub(super) fn write_simple_root_dir_block(disk: &Ext2MemoryDisk, root_bid: u32) 
 }
 
 // ===========================================================================
-// Layer 4: Fixture — strategy enums, Ext2Fixture, Ext2FixtureBuilder
+// Layer 4: Fixture, strategy enums, Ext2Fixture, Ext2FixtureBuilder
 // ===========================================================================
 
 #[derive(Clone)]
@@ -640,7 +640,7 @@ impl Ext2FixtureBuilder {
             }
         });
 
-        // Block bitmaps — one pass per group.
+        // Block bitmaps, one pass per group.
         for (group_idx, desc) in descs.iter().enumerate() {
             let first = sb.group_first_block_no(group_idx);
             let last = sb.group_last_block_no(group_idx);
@@ -675,7 +675,7 @@ impl Ext2FixtureBuilder {
                 .unwrap();
         }
 
-        // Inode bitmap — group 0 only.
+        // Inode bitmap, group 0 only.
         {
             let mut bitmap = [0u8; BLOCK_SIZE];
             match &inode_init {

@@ -2,12 +2,12 @@
 
 //! Small helpers shared across the ext2 module.
 //!
-//! - `Dirty` — a wrapper that tracks whether its inner value has been
+//! - `Dirty`: a wrapper that tracks whether its inner value has been
 //!   mutated, for writeback scheduling.
-//! - `IsPowerOf` — a trait for testing whether a number is a power of
+//! - `IsPowerOf`: a trait for testing whether a number is a power of
 //!   another (used by sparse-superblock backup-group selection).
-//! - `now` — a convenience function that reads the real-time coarse clock.
-//! - `duration_to_ext2_secs` — converts kernel durations to clamped ext2
+//! - `now`: a convenience function that reads the real-time coarse clock.
+//! - `duration_to_ext2_secs`: converts kernel durations to clamped ext2
 //!   timestamp seconds.
 
 use core::ops::MulAssign;

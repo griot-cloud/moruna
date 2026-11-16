@@ -22,9 +22,9 @@
 //!
 //! `BlockGroup` uses two independent locks:
 //!
-//! - `metadata` — protects the group descriptor and both allocation
+//! - `metadata`: protects the group descriptor and both allocation
 //!   bitmaps. Held briefly during alloc/free operations.
-//! - `inode_cache` — protects the per-group live inode map. Uses
+//! - `inode_cache`: protects the per-group live inode map. Uses
 //!   double-checked locking (read then promote to write on miss).
 
 use core::fmt;

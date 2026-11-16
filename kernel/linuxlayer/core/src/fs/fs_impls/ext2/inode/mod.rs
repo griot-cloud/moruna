@@ -7,9 +7,9 @@
 //!
 //! # Type aliases
 //!
-//! - `Iblock` — logical block index within a file (0-based).
-//! - `Ext2Bid` — physical block address on the backing device.
-//! - `Ext2Ino` — on-disk inode number (ext2 format is 32-bit; the VFS widens
+//! - `Iblock`: logical block index within a file (0-based).
+//! - `Ext2Bid`: physical block address on the backing device.
+//! - `Ext2Ino`: on-disk inode number (ext2 format is 32-bit; the VFS widens
 //!   to `u64`).
 //!
 //! # Data model
@@ -20,13 +20,13 @@
 //! Inode  →  InodeInner  →  InodeDesc  →  RawInode
 //! ```
 //!
-//! - `Inode` — the ref-counted, shareable handle; holds the inode number,
+//! - `Inode`: the ref-counted, shareable handle; holds the inode number,
 //!   file type, block-group index, a weak filesystem reference, and an optional
 //!   xattr sidecar.
-//! - `InodeInner` — the `RwMutex`-guarded interior: the dirty descriptor
+//! - `InodeInner`: the `RwMutex`-guarded interior: the dirty descriptor
 //!   and the type-specific inode payload.
-//! - `InodeDesc` — a decoded, Rust-typed mirror of all on-disk inode fields.
-//! - `RawInode` — the 128-byte on-disk layout (`#[repr(C)]`); converted
+//! - `InodeDesc`: a decoded, Rust-typed mirror of all on-disk inode fields.
+//! - `RawInode`: the 128-byte on-disk layout (`#[repr(C)]`); converted
 //!   to/from `InodeDesc` at I/O boundaries.
 //!
 //! # Submodules

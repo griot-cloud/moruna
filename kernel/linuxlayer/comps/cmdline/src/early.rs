@@ -35,10 +35,10 @@ pub(super) fn is_early_param(key: &str) -> bool {
 ///
 /// # Recognized tokens
 ///
-/// - `earlycon` — enables the early UART console (exact token match).
-/// - `loglevel=N` — sets the OSTD log filter (`N` in `0..=8`, see [`LevelFilter`]).
-/// - `loglevel=LEVEL` — also accepts textual levels such as `error` or `debug`.
-/// - `--` — stops parsing; all following tokens are for the init process.
+/// - `earlycon`: enables the early UART console (exact token match).
+/// - `loglevel=N`: sets the OSTD log filter (`N` in `0..=8`, see [`LevelFilter`]).
+/// - `loglevel=LEVEL`: also accepts textual levels such as `error` or `debug`.
+/// - `--`: stops parsing; all following tokens are for the init process.
 ///
 /// Double quotes (`"`) protect spaces inside one token (Linux-compatible).
 /// Other tokens are ignored. When `loglevel` is absent, the default is `8`

@@ -4,11 +4,11 @@
 //!
 //! Ext2 distinguishes two storage strategies for symbolic link targets:
 //!
-//! - **Fast symlink** — targets up to 59 bytes are stored inline in the
+//! - **Fast symlink**: targets up to 59 bytes are stored inline in the
 //!   60-byte raw block-pointer area of the inode (`i_block[0..15]`) without
 //!   allocating any data blocks. One byte is reserved for the
 //!   Linux-compatible trailing NUL.
-//! - **Slow symlink** — longer targets are written to an allocated data block
+//! - **Slow symlink**: longer targets are written to an allocated data block
 //!   through the normal page-cache path.
 
 #![short_vis_path::add(ext2)]

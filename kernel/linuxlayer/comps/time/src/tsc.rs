@@ -5,10 +5,7 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use ostd::{
-    arch::{read_tsc, tsc_freq},
-    timer::{self, TIMER_FREQ},
-};
+use ostd::timer::{self, TIMER_FREQ, monotonic_nanos};
 use spin::Once;
 
 use crate::{
@@ -30,10 +27,12 @@ pub(super) fn init() {
 
 fn init_clock() {
     CLOCK.call_once(|| {
+        // User space: the core's monotonic clock in nanoseconds, not the TSC, whose
+        // frequency a guest may not be told.
         Arc::new(ClockSource::new(
-            tsc_freq(),
+            1_000_000_000,
             MAX_DELAY_SECS,
-            Arc::new(read_tsc),
+            Arc::new(monotonic_nanos),
         ))
     });
 }

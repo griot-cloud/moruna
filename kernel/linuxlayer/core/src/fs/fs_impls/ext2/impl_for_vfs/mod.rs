@@ -6,8 +6,8 @@
 //! generic VFS layer.  The two child modules each contain `impl` blocks for
 //! the corresponding VFS traits:
 //!
-//! * `fs` — `FileSystem` for `Ext2` (mount, sync, stat, root).
-//! * `inode` — `InodeIo` and `Inode` for `Inode` (I/O, metadata,
+//! * `fs`: `FileSystem` for `Ext2` (mount, sync, stat, root).
+//! * `inode`: `InodeIo` and `Inode` for `Inode` (I/O, metadata,
 //!   lookup, link, rename, symlink, extension slot, xattr).
 
 mod fs;

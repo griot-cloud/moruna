@@ -12,18 +12,7 @@ component.workspace = true
 ostd.workspace = true
 spin.workspace = true
 
-[target.x86_64-unknown-none.dependencies]
-chrono.workspace = true
-
-[target.riscv64imac-unknown-none-elf.dependencies]
-fdt-util.workspace = true
-
-[target.loongarch64-unknown-none-softfloat.dependencies]
-chrono.workspace = true
-fdt-util.workspace = true
-
-[target.aarch64-unknown-none-softfloat.dependencies]
-fdt-util.workspace = true
+# User space: no RTC device, so none of the RTC drivers' dependencies.
 
 [lints]
 workspace = true

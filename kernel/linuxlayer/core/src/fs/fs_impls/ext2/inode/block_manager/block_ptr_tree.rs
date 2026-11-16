@@ -415,7 +415,7 @@ impl BlockPtrTree {
     /// the on-disk chain to resolve physical block addresses.
     ///
     /// After skipping the 12 direct blocks, the remaining block number is
-    /// converted to base-1024 digits — each digit becomes a slot at one
+    /// converted to base-1024 digits, each digit becomes a slot at one
     /// level of the indirect block tree.
     fn walk_at(&self, iblock: Iblock) -> Result<BlockPointerWalk> {
         let path = BlockPointerPath::new(iblock)?;

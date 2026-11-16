@@ -99,7 +99,7 @@ struct MeasurementAttr {
     ///
     /// Static registers (`MRCONFIGID`, `MROWNER`, `MROWNERCONFIG`, `MRTD`) are
     /// written by the TDX module at TD creation time and can never change at
-    /// runtime, so `false` is correct for them — the cached `TDREPORT_STRUCT`
+    /// runtime, so `false` is correct for them, the cached `TDREPORT_STRUCT`
     /// is always authoritative.
     ///
     /// RTMRs can be extended at any time via [`tdxguest::extend_tdx_mr`], which

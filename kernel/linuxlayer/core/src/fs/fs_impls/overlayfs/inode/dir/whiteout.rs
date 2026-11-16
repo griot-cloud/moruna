@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! This module owns the whiteout concept in both directions: what a whiteout is
-//! ([`OverlayFs::is_whiteout`] as the confirmed read over the two physical forms — a char device
+//! ([`OverlayFs::is_whiteout`] as the confirmed read over the two physical forms, a char device
 //! `0:0` or a zero-size regular file carrying the record), and how one is published, removed, and
 //! swept ([`WhiteoutCache`] and its [`WhiteoutHandle`], `OverlayFs::publish_whiteout`,
 //! `OverlayFs::remove_whiteout`, `OverlayFs::sweep_whiteouts`).
 //!
 //! The two directions are deliberately asymmetric: the write side picks a form from this mount's
-//! capability, while the read side answers the union of both forms at every layer — a lower
+//! capability, while the read side answers the union of both forms at every layer, a lower
 //! layer's whiteout was published by another mount, so reading never consults this one's
 //! capability.
 //!

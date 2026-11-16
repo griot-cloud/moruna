@@ -40,12 +40,12 @@
 //! additional gaps between them.
 //!
 //! Each entry descriptor stores:
-//! - `name_index` — a `XattrNameIndex` byte that encodes the namespace
+//! - `name_index`: a `XattrNameIndex` byte that encodes the namespace
 //!   prefix (e.g., `user.`, `security.`).
-//! - `name_len` — byte length of the suffix that follows the header.
-//! - `value_offset` — byte offset of the value from the start of the block.
-//! - `value_len` — byte length of the value.
-//! - `hash` — per-entry hash covering name and value (currently always 0;
+//! - `name_len`: byte length of the suffix that follows the header.
+//! - `value_offset`: byte offset of the value from the start of the block.
+//! - `value_len`: byte length of the value.
+//! - `hash`: per-entry hash covering name and value (currently always 0;
 //!   block sharing via mb_cache is not implemented).
 //!
 //! The entry list is terminated by an `XattrEntry` with `name_len == 0`
@@ -316,7 +316,7 @@ impl XattrCache {
 
     // TODO: The VFS `Inode::list_xattr` trait passes a single namespace,
     // but `sys_listxattr` only queries one namespace (Trusted for root,
-    // User otherwise), which is wrong — Linux returns all visible
+    // User otherwise), which is wrong, Linux returns all visible
     // namespaces.  As a workaround we replicate the old ext2 behavior:
     // when the caller passes User, list only user.* entries; otherwise
     // list all entries (matching root visibility in Linux).  The proper

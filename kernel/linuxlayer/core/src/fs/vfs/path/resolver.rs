@@ -40,10 +40,10 @@ pub(crate) const AT_EMPTY_PATH: u32 = 0x1000;
 /// One call per variant, showing the three patterns side by side:
 ///
 /// ```ignore
-/// // mkdirat — dentry op, a name is mandatory.
+/// // mkdirat, dentry op, a name is mandatory.
 /// let fs_path = FsPath::from_fd_at(dirfd, &path_str, EmptyPathStr::Reject)?;
 ///
-/// // faccessat2 — inode op with a `flags` argument; `""` accepted
+/// // faccessat2, inode op with a `flags` argument; `""` accepted
 /// // only if the caller passed AT_EMPTY_PATH.
 /// let fs_path = FsPath::from_fd_at(
 ///     dirfd,
@@ -51,7 +51,7 @@ pub(crate) const AT_EMPTY_PATH: u32 = 0x1000;
 ///     EmptyPathStr::AllowIfFlag(flags.bits()),
 /// )?;
 ///
-/// // readlinkat — inode op with no `flags` argument; `""` accepted
+/// // readlinkat, inode op with no `flags` argument; `""` accepted
 /// // only when `dirfd` is a real fd rather than `AT_FDCWD`.
 /// let fs_path = FsPath::from_fd_at(dirfd, &path_str, EmptyPathStr::Allow)?;
 /// ```
@@ -63,7 +63,7 @@ pub(crate) const AT_EMPTY_PATH: u32 = 0x1000;
 /// 1. **Target.** Does the syscall operate on an *inode*
 ///    (the data or metadata behind `dirfd`)
 ///    or on a *directory entry* (a name inside a parent directory)?
-///    An empty `path_str` means "operate on `dirfd` directly" —
+///    An empty `path_str` means "operate on `dirfd` directly", 
 ///    meaningful only for inode ops,
 ///    since there is no such thing as a nameless dentry
 ///    to create, remove, rename, or open.
@@ -72,7 +72,7 @@ pub(crate) const AT_EMPTY_PATH: u32 = 0x1000;
 ///    that can hold the [`AT_EMPTY_PATH`] opt-in bit?
 ///    `AT_EMPTY_PATH` post-dates most `*at` syscalls,
 ///    and callers historically passed `""` by accident (and received `ENOENT`),
-///    so the accept-empty behaviour is opt-in —
+///    so the accept-empty behaviour is opt-in, 
 ///    and the opt-in must live in a `flags` word.
 ///
 /// Quick chooser:
@@ -85,7 +85,7 @@ pub(crate) const AT_EMPTY_PATH: u32 = 0x1000;
 pub(crate) enum EmptyPathStr {
     /// Always reject an empty `path_str` with `ENOENT`; a name is mandatory.
     ///
-    /// Use for syscalls whose target is a **directory entry** —
+    /// Use for syscalls whose target is a **directory entry**, 
     /// create, remove, rename, or open a named file.
     /// Examples: `openat`, `mkdirat`, `mknodat`, `symlinkat`, `unlinkat`,
     /// `renameat[2]`, and `linkat`'s *newname*.
@@ -103,11 +103,11 @@ pub(crate) enum EmptyPathStr {
     /// iff [`AT_EMPTY_PATH`] is set in the enclosed raw flag bits;
     /// otherwise behave like [`Reject`](Self::Reject).
     ///
-    /// Callers pass their syscall's raw flag bits —
+    /// Callers pass their syscall's raw flag bits, 
     /// typically `flags.bits()` after parsing the flag word into a typed `BitFlags`.
     /// Only the [`AT_EMPTY_PATH`] bit is inspected; the rest are ignored.
     ///
-    /// Use for **inode-target** syscalls that carry a `flags` argument —
+    /// Use for **inode-target** syscalls that carry a `flags` argument, 
     /// the common case for attribute queries and modifications on the inode behind `dirfd`.
     /// Examples: `faccessat2`, `fchmodat2`, `fchownat`, `fstatat` / `newfstatat`,
     /// `statx`, `utimensat`, `name_to_handle_at`, `execveat`, and `linkat`'s *oldname*.

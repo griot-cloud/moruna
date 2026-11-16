@@ -4,11 +4,11 @@
 //!
 //! This module provides two things:
 //!
-//! 1. **`/dev/tdx_guest` character device** — exposes the `TDX_CMD_GET_REPORT0`
+//! 1. **`/dev/tdx_guest` character device**: exposes the `TDX_CMD_GET_REPORT0`
 //!    ioctl, which lets userspace request a `TDREPORT_STRUCT` from the TDX module
 //!    (see [`TdxGuest`]).
 //!
-//! 2. **Measurement register API** — a set of public functions used by other
+//! 2. **Measurement register API**: a set of public functions used by other
 //!    kernel subsystems (e.g. the TSM-MR sysfs layer) to interact with TDX
 //!    measurement registers.
 //!
@@ -31,7 +31,7 @@
 //! | Function | TDCALL? | Use when… |
 //! |---|---|---|
 //! | [`get_tdx_mr`] | No | Reading a register whose value is not expected to have changed since the last refresh (cheap). |
-//! | [`get_tdx_mr_refresh`] | Yes | Reading a register whose current hardware value is needed — e.g. immediately after [`extend_tdx_mr`]. The refresh and the register read are performed atomically under the write lock. |
+//! | [`get_tdx_mr_refresh`] | Yes | Reading a register whose current hardware value is needed, e.g. immediately after [`extend_tdx_mr`]. The refresh and the register read are performed atomically under the write lock. |
 //! | [`refresh_tdx_report`] | Yes | Regenerating the report with a custom `report_data` blob (used by the `TDX_CMD_GET_REPORT0` ioctl and the quote path) without reading a specific register. |
 //! | [`extend_tdx_mr`] | Yes | Extending an RTMR. After extending, the cached report is stale; use [`get_tdx_mr_refresh`] (or [`refresh_tdx_report`] followed by [`get_tdx_mr`]) to observe the updated value. |
 //!
@@ -303,7 +303,7 @@ pub(crate) const SHA384_DIGEST_SIZE: usize = 48;
 
 /// Gets the measurement register value from the cached TDX report.
 ///
-/// This is a cheap read — no TDCALL is issued. The value reflects the state of
+/// This is a cheap read, no TDCALL is issued. The value reflects the state of
 /// the report at the time of the last [`refresh_tdx_report`] or
 /// [`get_tdx_mr_refresh`] call. If the register may have been updated by a
 /// recent [`extend_tdx_mr`], use [`get_tdx_mr_refresh`] instead to obtain the

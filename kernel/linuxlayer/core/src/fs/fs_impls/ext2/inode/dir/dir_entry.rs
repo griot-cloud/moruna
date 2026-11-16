@@ -20,25 +20,25 @@
 //! └──────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! - `rec_len` — byte length of this entire record (header + name + padding),
+//! - `rec_len`: byte length of this entire record (header + name + padding),
 //!   always a multiple of 4. The last record in a block is padded to fill the
 //!   block, so its `rec_len` may be much larger than its `name_len` requires.
-//! - `ino == 0` — marks a free (deleted) slot. The iterator yields it with
+//! - `ino == 0`: marks a free (deleted) slot. The iterator yields it with
 //!   an empty name, and higher-level directory operations decide whether to
 //!   skip or reuse it.
-//! - `file_type` — the `DirEntryFileType` byte encodes the inode type,
+//! - `file_type`: the `DirEntryFileType` byte encodes the inode type,
 //!   avoiding an extra inode lookup during readdir.
 //!
 //! # Types
 //!
-//! - `DirEntryHeader` — the 8-byte on-disk header (`#[repr(C)]`, `Pod`).
-//! - `DirEntry` — a parsed header plus a borrowed name slice from the
+//! - `DirEntryHeader`: the 8-byte on-disk header (`#[repr(C)]`, `Pod`).
+//! - `DirEntry`: a parsed header plus a borrowed name slice from the
 //!   iterator's reusable name buffer.
-//! - `DirEntryFileType` — the `file_type` field enum, with conversions
+//! - `DirEntryFileType`: the `file_type` field enum, with conversions
 //!   to/from `InodeType`.
-//! - `DirBlockView` — a bounded view into one directory block,
+//! - `DirBlockView`: a bounded view into one directory block,
 //!   providing entry iteration, entry writing, deletion, and field updates.
-//! - `DirBlockViewIter` — the iterator returned by `DirBlockView::iter_entries`;
+//! - `DirBlockViewIter`: the iterator returned by `DirBlockView::iter_entries`;
 //!   reads entry headers from the page cache, copies live-entry names into a
 //!   reusable buffer, and validates each header before yielding it.
 

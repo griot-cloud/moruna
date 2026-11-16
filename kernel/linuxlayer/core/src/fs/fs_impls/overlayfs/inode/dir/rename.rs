@@ -112,8 +112,8 @@ impl OverlayInode {
 }
 
 impl<'x> RenameFacts<'x> {
-    /// Builds the facts of one rename — the target name classified once and the two answers the
-    /// lower layers give — together with the plan they decide.
+    /// Builds the facts of one rename, the target name classified once and the two answers the
+    /// lower layers give, together with the plan they decide.
     fn classify(
         old_parent: Arc<OverlayInode>,
         old_child_dentry: &'x Dentry,
@@ -305,7 +305,7 @@ impl<'x> RenameFacts<'x> {
         ))
     }
 
-    /// Promotes the objects this move will touch — both parents, the source, and an exchange's
+    /// Promotes the objects this move will touch, both parents, the source, and an exchange's
     /// target without an upper.
     ///
     /// The real rename can be expressed on the upper alone.
@@ -358,7 +358,7 @@ impl<'x> RenameFacts<'x> {
         OverlayXattrType::Opaque.set_value_on(source_upper.dentry(), namespace, None)
     }
 
-    /// Writes the impure record on the new parent from either origin direction — the source's own
+    /// Writes the impure record on the new parent from either origin direction, the source's own
     /// or, for an exchange, the target's.
     ///
     /// A failure here still stops the move before it commits.
@@ -395,8 +395,8 @@ impl<'x> RenameFacts<'x> {
 
     /// Commits the move: the real rename in the upper, then the old name's whiteout action.
     ///
-    /// The consequences the rename already fixed — the displaced target's latch and each parent's
-    /// snapshot drop — hold whether or not the whiteout step succeeded; its error is reported, not
+    /// The consequences the rename already fixed, the displaced target's latch and each parent's
+    /// snapshot drop, hold whether or not the whiteout step succeeded; its error is reported, not
     /// rolled back.
     fn commit(&self, locks: &mut RenameLocks<'_>) -> Result<()> {
         let old_name = self.source_dentry.name();

@@ -11,7 +11,7 @@
 //!   object becomes the next round's publication parent. Every collected
 //!   element carries the name it publishes under its publication parent.
 //! - **winner/waiter**: the tasks racing on one object's per-inode transaction
-//!   lock — for a non-directory that lock is a plain serialization token,
+//!   lock, for a non-directory that lock is a plain serialization token,
 //!   because the sole published-state fact is `upper: Once` being set. The
 //!   winner performs the promotion; the waiters re-observe `upper` under that
 //!   lock and skip.
@@ -28,10 +28,10 @@
 //!
 //! # Locking
 //!
-//! A copy-up collects its chain from the VFS dcache alone — reading the dentry's
+//! A copy-up collects its chain from the VFS dcache alone, reading the dentry's
 //! parent and name are NameAndParent leaf reads. Each promotion round then nests in
-//! this order — the publication parent's transaction lock, then the promoted
-//! object's transaction lock — and releases both at the round's end, so every lock
+//! this order, the publication parent's transaction lock, then the promoted
+//! object's transaction lock, and releases both at the round's end, so every lock
 //! edge runs ancestor-to-descendant.
 //!
 //! Both name-taken latches of the round are read under those two locks and before

@@ -26,15 +26,15 @@
 //!
 //! [`OverlayInode::lock`] is the per-inode transaction lock that serializes one
 //! object's mutations. For a directory its payload is that directory's readdir
-//! snapshot — a [`readdir::ReaddirCache`], the merged entry table one merge
+//! snapshot, a [`readdir::ReaddirCache`], the merged entry table one merge
 //! produced; a non-directory uses the lock as a plain serialization token. The
 //! lock also serializes an object's promotion against the removal or
 //! displacement of its name.
 //! [`OverlayInode::append_write`] holds this lock across the underlying `size()` +
 //! `write_at` so concurrent appends serialize on the post-write size.
 //!
-//! The name-taken latch is written — by a removal, or by a rename that displaces
-//! the name — and read only inside that object's transaction lock; that lock is
+//! The name-taken latch is written, by a removal, or by a rename that displaces
+//! the name, and read only inside that object's transaction lock; that lock is
 //! what orders a name removal against a promotion round, so the latch needs no
 //! ordering of its own.
 //!
@@ -129,7 +129,7 @@ impl OverlayInode {
     /// Returns the real object a write may land on.
     ///
     /// Refuses an effectively read-only mount, returns the receiver's own upper when it has one, and
-    /// otherwise promotes the receiver into `copyup_dentry` first — so the answer is always an upper.
+    /// otherwise promotes the receiver into `copyup_dentry` first, so the answer is always an upper.
     fn writable_real_object(&self, copyup_dentry: &Dentry) -> Result<&RealObject> {
         let fs = self.fs_arc();
         if fs.policy().is_effective_read_only() {
