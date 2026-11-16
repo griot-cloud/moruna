@@ -16,8 +16,13 @@ decisions are folded in below.
 - **Where the kernel runs (Brackly, 2026-11-16, through the PM).**
   - His words: "We have a Linux node, and then we run a VM on top of it, which is [Moruna]."
   - **The host is a Linux node** (Griot's D4ls_v5), and the Moruna VM runs on top of it under KVM.
+  - **0.7.0 is the one big release.** In his words: "We don't need 0.7 and then 0.8."
   - **The kernel as the node itself** (Goal B, `architecture/kernel-is-the-machine.md` on
-    `design/kernel-is-the-machine`) moves to 0.8.0.
+    `design/kernel-is-the-machine`) is parked and unscheduled. He is not asking for it.
+  - **Whatever of Goal B 0.7.0 needs comes into 0.7.0.** That means the Linux-program support
+    the gate's CPython, NumPy and pyarrow images need, through today's personality or Asterinas's
+    Linux layer carried into a user-space personality (`kernel-is-the-machine.md` §4.2). Step 1
+    shows which.
 - **Every step is this branch's.**
   - It builds on the work still on `feat/kd2-engine-process`, `feat/kd1-data-plane`,
     `feat/ka2-plane-linux` (its conformance suite is KD3's base) and `feat/kb5-memory-quota` (the
@@ -334,6 +339,9 @@ items to commit to then:
    - Run a real job end to end with the engine as today's Linux program (KD2-T9).
    - Run the NYC jobs as image tasks. Measure the forwarded syscalls, the boundary copies and the
      VM's boot.
+   - Find out whether today's personality runs the gate's CPython, NumPy and pyarrow images, and
+     how fast. If it falls short, carrying Asterinas's Linux layer into a user-space personality
+     (`kernel-is-the-machine.md` §4.2) comes into 0.7.0.
    - This is the baseline for every step after it, and for the per-job targets.
 2. **Batches as memory objects end to end** (§3).
    - `slot_push` of ranges; `offer` and `land` stop copying.
