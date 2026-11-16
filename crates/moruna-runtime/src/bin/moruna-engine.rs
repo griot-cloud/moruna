@@ -50,8 +50,8 @@ mod clock {
         {
             // SAFETY: the caller passes a `timespec` to write, as `clock_gettime` requires.
             unsafe {
-                (*ts).tv_sec = (ns / 1_000_000_000) as libc::time_t;
-                (*ts).tv_nsec = (ns % 1_000_000_000) as libc::c_long;
+                (*ts).tv_sec = (ns / 1_000_000_000) as _;
+                (*ts).tv_nsec = (ns % 1_000_000_000) as _;
             }
             return 0;
         }

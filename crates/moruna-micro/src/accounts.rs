@@ -66,4 +66,12 @@ mod tests {
         let over = Reading { used: 90, ..r };
         assert_eq!(over.room(), 0);
     }
+
+    /// Off the Moruna kernel a native call is refused, and the reading says so.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn off_the_kernel_the_account_is_not_read() {
+        let e = run().unwrap_err();
+        assert!(e.starts_with("account_info"), "{e}");
+    }
 }

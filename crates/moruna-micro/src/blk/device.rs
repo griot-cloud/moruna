@@ -432,6 +432,16 @@ mod tests {
         }
     }
 
+    /// Off the Moruna kernel nothing is granted, and opening a disk says so.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn off_the_kernel_no_disk_is_granted() {
+        let objects = Objects::new();
+        assert!(take("disk.in.x").unwrap_err().contains("granted no"));
+        let e = open("disk.out", &objects, true).unwrap_err();
+        assert!(e.contains("granted no `disk.out`"), "{e}");
+    }
+
     #[test]
     fn a_serial_names_the_files_length() {
         assert_eq!(serial_length(b"123456\0\0\0", 1 << 20), Some(123_456));

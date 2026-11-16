@@ -346,6 +346,39 @@ mod tests {
 
     const P: u64 = PAGE_SIZE;
 
+    /// Off the Moruna kernel a native call is refused: no region is granted, and a region the
+    /// arena holds is refused its pin, each with why.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn off_the_kernel_no_region_is_granted_and_none_pinned() {
+        let objects = Objects::with_max(1 << 20);
+        assert_eq!(objects.region_max(), 1 << 20);
+        let refused = objects.region(4096).err().expect("refused");
+        assert!(matches!(refused, MorunaError::Config { name, .. } if name == "budget.host"));
+        assert_eq!(objects.mapped(), Mapped::default());
+        lock(&objects.regions).push(Region {
+            id: 7,
+            base: 0x1000_0000,
+            bytes: 1 << 20,
+            memory: Arc::new(Memory(Handle::from_raw(0))),
+        });
+        assert!(objects.holds(7) && !objects.holds(8));
+        assert_eq!(objects.find(0x1000_0010), Some((7, 0x1000_0000, 1 << 20)));
+        assert!(objects.memory(8).is_none());
+        let pins = Pins::new(Arc::clone(&objects), Arc::new(Handle::from_raw(0)));
+        let mut out = Vec::new();
+        let e = pins.runs(0x9000, 10, &mut out).unwrap_err();
+        assert!(e.contains("not in the arena"), "{e}");
+        let e = pins
+            .runs(0x1000_0000 + (1 << 20) - 5, 10, &mut out)
+            .unwrap_err();
+        assert!(e.contains("not in one arena region"), "{e}");
+        let e = pins.runs(0x1000_0000, 4096, &mut out).unwrap_err();
+        assert!(e.contains("pinning"), "{e}");
+        assert_eq!(pins.calls(), 1);
+        assert!(out.is_empty());
+    }
+
     #[test]
     fn contiguous_pages_are_one_run() {
         let runs = runs_of(&[10 * P, 11 * P, 12 * P, 40 * P, 41 * P, 7 * P]);
