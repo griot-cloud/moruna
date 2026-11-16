@@ -414,6 +414,7 @@ process datapath
   expect DS-A ticks: ok:
   expect DS-A share: ok:
   expect DS-A rcu: ok:
+  expect DS-A placement: ok:
   expect DS-A clock page: ok:
   expect DS-A revoke: ok:
   expect DS-A huge: ok:

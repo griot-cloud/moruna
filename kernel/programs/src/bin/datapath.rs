@@ -29,6 +29,10 @@
 //!   makes and frees more memory than the machine has, each freed frame waiting for a
 //!   grace period.
 //!
+//! - C5's placement: unpinned threads that first ran on a core keep off it once a worker
+//!   is pinned there, while another core has no pinned thread, so they no longer take the
+//!   worker's turns.
+//!
 //! It also measures what C4, C5 and C8 are judged by: a touch a page through large pages
 //! and through 4 KiB ones, the time a pinned CPU loses to the kernel, and a read of the
 //! page against a `clock_get`. `dp-revoke` shows a write to a revoked window faults.
@@ -98,6 +102,9 @@ fn run() -> i64 {
         return code;
     }
     if let Err(code) = rcu(&out, cpus) {
+        return code;
+    }
+    if let Err(code) = placement(&out, cpus) {
         return code;
     }
     if let Err(code) = clock(&out) {
@@ -1130,6 +1137,129 @@ fn rcu(out: &Out, cpus: u32) -> Result<(), i64> {
         ROUNDS * (CHUNK >> 20),
         took / 1_000_000,
         last
+    );
+    Ok(())
+}
+
+/// Set to stop the wakers of `placement`.
+static WAKERS_STOP: AtomicU32 = AtomicU32::new(0);
+/// Never changes: the wakers sleep on it with a deadline.
+static WAKER_WORD: AtomicU32 = AtomicU32::new(0);
+/// Each waker's CPU at its last wake, plus one.
+static WAKER_CPU: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+/// The worker's CPU, plus one, once it is pinned there (zero before).
+static WORKER_ON: AtomicU32 = AtomicU32::new(0);
+/// Wakes of a waker on the worker's CPU once the worker is pinned there.
+static WAKES_ON_WORKER: AtomicU64 = AtomicU64::new(0);
+/// The worker's turns lost to other threads (gaps of 150 us or more), and their time.
+static LOST_TURNS: AtomicU64 = AtomicU64::new(0);
+static LOST_NS: AtomicU64 = AtomicU64::new(0);
+/// Set once the worker has measured.
+static MEASURED: AtomicU32 = AtomicU32::new(0);
+
+/// Wakes every 2 ms and works 200 us, as a reactor or a ticker does, unpinned.
+extern "C" fn waker(i: u64) -> ! {
+    while WAKERS_STOP.load(Ordering::Relaxed) == 0 {
+        let cpu = current_cpu();
+        WAKER_CPU[i as usize].store(cpu + 1, Ordering::Relaxed);
+        if WORKER_ON.load(Ordering::Acquire) == cpu + 1 {
+            WAKES_ON_WORKER.fetch_add(1, Ordering::Relaxed);
+        }
+        let end = now() + 200_000;
+        while now() < end {
+            core::hint::spin_loop();
+        }
+        let _ = futex_wait(&WAKER_WORD, 0, now() + ms(2));
+    }
+    thread_exit()
+}
+
+/// Pins itself to CPU `cpu` and spins there 300 ms, counting the turns it loses.
+extern "C" fn worker(cpu: u64) -> ! {
+    let Ok(page) = ClockPage::map() else {
+        thread_exit()
+    };
+    if pin_current_thread(Some(cpu as u32)).is_ok() {
+        WORKER_ON.store(cpu as u32 + 1, Ordering::Release);
+        let start = page.now();
+        let mut last = start;
+        let (mut turns, mut lost) = (0, 0);
+        while last - start < ms(300) {
+            let t = page.now();
+            if t - last >= 150_000 {
+                turns += 1;
+                lost += t - last;
+            }
+            last = t;
+        }
+        LOST_TURNS.store(turns, Ordering::Relaxed);
+        LOST_NS.store(lost, Ordering::Relaxed);
+        WORKER_ON.store(0, Ordering::Release);
+        let _ = pin_current_thread(None);
+    }
+    MEASURED.store(1, Ordering::Release);
+    thread_exit()
+}
+
+/// A worker pinned to a core where an unpinned waker first ran: with a core free of
+/// pinned threads, the wakers move there and the worker keeps its core.
+fn placement(out: &Out, cpus: u32) -> Result<(), i64> {
+    if cpus == 1 {
+        println!(
+            out,
+            "DS-A placement: ok: one CPU, which a worker shares with every thread"
+        );
+        return Ok(());
+    }
+    // This thread stays unpinned, so a core is free of pinned threads.
+    pin_current_thread(None).map_err(|e| fail(out, "placement", "unpinning", e))?;
+    let mut wakers = Vec::new();
+    for i in 0..3 {
+        wakers.push(start(out, "placement", waker, i)?);
+    }
+    let _ = futex_wait(&READY, 1, now() + ms(20));
+    // The worker's core: one a waker first ran on, other than the boot processor's.
+    let core = WAKER_CPU
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .find(|c| *c > 1)
+        .map_or(cpus - 1, |c| c - 1);
+    let first = WAKER_CPU
+        .iter()
+        .filter(|c| c.load(Ordering::Relaxed) == core + 1)
+        .count();
+    let w = start(out, "placement", worker, u64::from(core))?;
+    let measured = until(&MEASURED, 10_000);
+    WAKERS_STOP.store(1, Ordering::Relaxed);
+    join(out, "placement", &w)?;
+    for t in &wakers {
+        join(out, "placement", t)?;
+    }
+    let (turns, lost) = (
+        LOST_TURNS.load(Ordering::Relaxed),
+        LOST_NS.load(Ordering::Relaxed),
+    );
+    let on = WAKES_ON_WORKER.load(Ordering::Relaxed);
+    if !measured || turns > 10 || on > 3 {
+        println!(
+            out,
+            "DS-A placement: FAIL: a worker pinned to CPU {} lost {} turns ({} ns) in 300 ms, and the wakers woke on its core {} times ({} had first run there)",
+            core,
+            turns,
+            lost,
+            on,
+            first
+        );
+        return Err(1);
+    }
+    println!(
+        out,
+        "DS-A placement: ok: a worker pinned to CPU {}, where {} of 3 unpinned wakers first ran, lost {} turns ({} ns) in 300 ms to other threads, and the wakers woke on its core {} times",
+        core,
+        first,
+        turns,
+        lost,
+        on
     );
     Ok(())
 }
