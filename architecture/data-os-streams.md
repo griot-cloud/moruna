@@ -392,3 +392,37 @@ and switches to the new one when the call answers.
     (`nohz_full`, `isolcpus` or a cgroup cpuset, `rcu_nocbs`), and report the loss measured
     again. It is a host setting for Griot's node, so D documents it and measures it on
     `moruna-bench`.
+- **2026-11-16: B1's three follow-ups merged** (`586d7bc4`, from `089a7e48`). CI's boot passed
+  193 of 193 checks under KVM on 1, 2 and 4 CPUs.
+  - A snapshot binds to the one space that maps it; a clone makes one pair of sides per object,
+    so two mappings of one snapshot stay one object in the child, with no later write shared.
+  - A clone moves each shared zero page with the bytes already charged for it, so the source's
+    account needs room only for 64-byte records.
+  - `process_read` and `process_write` wait for a pager's page as a fault does, and answer
+    `Fault` on a refusal.
+  - Kernel mode: net +90 code lines, no new calls. Ping-pong 6.15 s, 5.30 s and 0.74 s.
+  - **For B2-vm:** a `MAP_PRIVATE` file mapping needs its own `memory_snapshot` per process.
+- **2026-11-16: `fork` decided** (`data-os.md` §4), on B2's question that a forked child has no
+  handles. B1 adds `process_clone`'s `SHARE_HANDLES` (personality processes only, the engine's
+  table never shared, no cycle leaks). The personality maps its region's objects into every
+  process itself; shared page tables were declined.
+- **2026-11-16: B2-fs final** at `1dfe096f` (`feature/data-os-b2-fs`), for B2 to merge.
+  - The root is an imagefs client over Moruna's verified layers, not overlayfs.
+  - `/tmp` is a tmpfs under the scratch quota. `/proc` and `/sys` are cut to the paths glibc,
+    CPython, OpenBLAS and the allocators read. `/dev` is `null`, `zero` and `urandom`. There
+    are no terminals.
+  - Descriptors 0, 1 and 2 are the input slot, the output slot and the log.
+  - New code is at 94.6% line coverage.
+  - File times read as zero, as `kernel/linux` reports them today.
+  - The mount-family handlers (836 lines) and the fs items only they use go in one pass by B2,
+    since `refused.rs` answers first.
+- **2026-11-16: stream C merged** (`e42a083c`, from `3141b3d6`). All 15 production-node cases
+  pass under KVM on C's head, with A and B1's first round merged.
+  - It adds:
+    - the engine's arena on granted large-page memory, never given back (C4);
+    - the engine driving its data disks' virtio-blk queues (C2, C3, C7);
+    - workers placed at start through the scheduler's worker-start hook, which decides
+      nothing;
+    - no shell as the engine's program, and outputs laid out in the scratch.
+  - Coverage: arena 93.1%, runtime 87.0%.
+  - **Waits on D:** the `disk://` job under KVM.
