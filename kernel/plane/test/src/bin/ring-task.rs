@@ -87,10 +87,8 @@ fn run() -> i64 {
     rings.note();
     match port.call(1, b"posted") {
         Ok(Some(reply)) if reply.bytes() == b"write" => {}
-        _ => {
-            rings.note();
-            return 0;
-        }
+        // The task says its exit code on its rings as it ends (protocol 4).
+        _ => return rings.exit(0),
     }
     let Some(w) = last else {
         return 7;

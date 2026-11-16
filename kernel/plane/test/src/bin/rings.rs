@@ -520,9 +520,18 @@ fn lockstep(r: &mut Run) -> Result<(), String> {
     let c = r.plane.counters();
     let (copies, sleeps, wakes) = r.wind_up()?;
     r.end(false)?;
+    // Protocol 4: the task said its exit code on its rings before it ended.
+    match r.plane.exit_code(r.task) {
+        Some(0) => {}
+        said => {
+            return Err(format!(
+                "the task said exit code {said:?} on its rings, not 0"
+            ));
+        }
+    }
     println!(
         r.out,
-        "DS-P lockstep: ok: {} batches of {} rows, one at a time, each made in the task's region and read in place, y = 3x + 7 judged on every row: engine {} calls a batch ({} revokes, {} regrants, {} sleeps on its bell, {} wakes of the task); task {} calls a batch ({} sleeps, {} wakes); the kernel copied {} bytes for the task, its bells' words",
+        "DS-P lockstep: ok: {} batches of {} rows, one at a time, each made in the task's region and read in place, y = 3x + 7 judged on every row, and the task said exit code 0 on its rings: engine {} calls a batch ({} revokes, {} regrants, {} sleeps on its bell, {} wakes of the task); task {} calls a batch ({} sleeps, {} wakes); the kernel copied {} bytes for the task, its bells' words",
         LOCKSTEP,
         ROWS,
         ratio(spent, LOCKSTEP),
@@ -605,6 +614,10 @@ fn revoked(r: &mut Run, last: BatchId) -> Result<(), String> {
         .map_err(kernel_error("reading a record"))?;
     if now != checked {
         return Err(String::from("the checked record changed after the revoke"));
+    }
+    // A task that faulted said no exit code.
+    if let Some(code) = r.plane.exit_code(r.task) {
+        return Err(format!("the task faulted and said exit code {code}"));
     }
     r.plane.drop_batch(last).map_err(plane_error)?;
     println!(
