@@ -78,6 +78,34 @@ def digest(path):
     return h.hexdigest()
 
 
+DATA_LINE = "  driver 1af4:1001 - data\n"
+
+
+def data_disk_description(description, programs, out):
+    """The node's description with the data disks' driver-table line (transitional virtio-blk,
+    no driver started: the device manager hands each to the engine's supervisor), and the
+    programs it is built from.
+
+    The image tool asks every driver line for a program, the `-` of a line that starts none
+    included (kernel/tools/image `Description::programs`; requested of the integrator). Until it
+    does not, the programs are linked into OUT/bins with `-` a link to `virtio-blk`, which the
+    device manager never starts for this line."""
+    text = description.read_text()
+    anchor = "  driver 1af4:1042 virtio-blk block\n"
+    if DATA_LINE not in text:
+        if anchor not in text:
+            raise SystemExit("the node's description has no virtio-blk driver line to follow")
+        text = text.replace(anchor, anchor + DATA_LINE, 1)
+    rendered = out / "node.image"
+    rendered.write_text(text)
+    bins = out / "bins"
+    for program in programs.iterdir():
+        if program.is_file():
+            place(program, bins / program.name)
+    place(programs / "virtio-blk", bins / "-")
+    return rendered, bins
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--build", type=Path, required=True)
@@ -99,6 +127,9 @@ def main():
     out.mkdir(mode=0o700)
     tools = Path(__file__).resolve().parent
     description = tools.parent / "standalone.image"
+    programs = build / "node-user-bins"
+    if args.input or args.output_bytes:
+        description, programs = data_disk_description(description, programs, out)
 
     def command(argv):
         with (out / "prepare.log").open("ab") as log:
@@ -139,7 +170,7 @@ def main():
              "--storage-admission", out / "canonical/storage.admission"])
     command([build / "moruna-node-image", description, out / "assets", node_memory, args.cpus, PORT])
     resources = json.loads((out / "assets/node-resources.json").read_text())
-    command([build / "moruna-image-host", description, build / "node-user-bins", out / "assets"])
+    command([build / "moruna-image-host", description, programs, out / "assets"])
     home = out / "home.img"
     with home.open("xb") as file:
         file.truncate(64 * MIB)
