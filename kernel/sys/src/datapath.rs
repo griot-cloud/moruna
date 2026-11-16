@@ -89,7 +89,7 @@ mod tests {
         bytes[page::MULTIPLIER..page::MULTIPLIER + 8].copy_from_slice(&3u64.to_le_bytes());
         bytes[page::SHIFT..page::SHIFT + 4].copy_from_slice(&1u32.to_le_bytes());
         let r = ClockReading::from_bytes(2, &bytes, 2).expect("steady");
-        assert_eq!(r.nanos_at(600), 1_000 + (100 * 3 >> 1));
+        assert_eq!(r.nanos_at(600), 1_000 + ((100 * 3) >> 1));
         assert_eq!(
             ClockReading::from_bytes(3, &bytes, 3),
             None,

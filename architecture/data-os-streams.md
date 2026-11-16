@@ -119,7 +119,21 @@ and switches to the new one when the call answers.
     process. B2's personality locks need that, and so do P's engine-to-task rings;
   - in `vm.rs`: `Space::fault` and the stream B1 block;
   - the stream B1 blocks in `memory.rs` and `process.rs`;
-  - the user-mode loop's syscall branch in `process.rs` (lines around 976).
+  - the user-mode loop's syscall branch in `process.rs` (lines around 976);
+  - granted on 2026-11-16, each marked as a B1 hook:
+    - in `process.rs`: one field on `Thread` and one on `Process`; `run()`'s exception and
+      kernel-event branches and its loop condition; `Thread::killed()`; `activate_current`'s
+      activation line;
+    - in `vm.rs`: one field on `Space`; `unmap_ptes`; `Backing` and its `impl`; `frame`;
+      `touch`; `fill_ptes`'s object and zero arms; `each_page`; `discard`;
+    - in `memory.rs`: `MemoryObject`'s storage, its constructors, `frames`, `read` and `write`;
+    - a boot test program, `kernel/programs/src/bin/personality.rs`, with its block at the end
+      of `kernel/initramfs/boot.image` under a `# stream B1` comment.
+
+  **Where A and B1 meet:** `fill_ptes` is B1's. Stream A reaches huge pages through its own
+  functions, called from `Space::map` and `populate`. If A needs a hook inside `fill_ptes`, it
+  adds one call line marked `// stream A hook`, and the integrator settles any conflict at
+  merge. Each stream adds its boot test block at the end of `boot.image` under its own comment.
 - **Contracts:** none of the data path's. Its measure is the kernel-mode cost in `data-os.md` §0,
   and C6's restart of a task as a fresh process.
 - **Builds:** `kernel-is-the-machine.md` §4.1:

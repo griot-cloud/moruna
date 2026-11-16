@@ -262,11 +262,13 @@ pub enum Error {
     /// (2.3) The account the call charges has no room for it: its use, what it holds for
     /// the accounts carved from it, and the call's charge would pass its limit.
     QuotaExceeded = 15,
+    /// (2.6, stream B1) The thread was interrupted (`thread_interrupt`) while it waited.
+    Interrupted = 16,
 }
 
 impl Error {
     /// All errors, in code order.
-    pub const ALL: [Error; 15] = [
+    pub const ALL: [Error; 16] = [
         Error::BadHandle,
         Error::WrongType,
         Error::AccessDenied,
@@ -282,6 +284,7 @@ impl Error {
         Error::BadState,
         Error::Fault,
         Error::QuotaExceeded,
+        Error::Interrupted,
     ];
 
     /// The positive code; `rax` carries its negation.
@@ -327,6 +330,7 @@ impl Error {
             Error::BadState => "bad state",
             Error::Fault => "fault",
             Error::QuotaExceeded => "quota exceeded",
+            Error::Interrupted => "interrupted",
         }
     }
 }
@@ -1261,7 +1265,7 @@ mod tests {
             "reserved until stream A"
         );
         assert_eq!(personality::LEN, 8 + 16 * 8 + 7 * 8);
-        assert!(clock_page::SHIFT + 4 <= clock_page::LEN);
+        const { assert!(clock_page::SHIFT + 4 <= clock_page::LEN) };
         assert_eq!(nr::ACCOUNT_MATCHES, nr::ACCOUNT_INFO + 1);
         assert_eq!(nr::ACCOUNT_CREATE, nr::PROCESS_GRANT + 1);
         assert!(nr::is_native(nr::BATCH_GET) && nr::is_native(nr::PLANE_PROBE));
@@ -1313,6 +1317,9 @@ mod tests {
         assert_eq!(Error::QuotaExceeded.code(), 15);
         assert_eq!(Error::from_code(15), Some(Error::QuotaExceeded));
         assert_eq!(Error::QuotaExceeded.name(), "quota exceeded");
+        assert_eq!(Error::Interrupted.code(), 16);
+        assert_eq!(Error::from_code(16), Some(Error::Interrupted));
+        assert_eq!(Error::Interrupted.name(), "interrupted");
         assert_eq!(charge::memory(0), charge::OBJECT);
         assert_eq!(
             charge::memory(3),
