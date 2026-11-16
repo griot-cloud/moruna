@@ -540,3 +540,8 @@ and switches to the new one when the call answers.
   - **Done when, under KVM:** linux-test, KD1 and LX-T16 pass on the new server; C's 15 node
     cases pass with the engine on the personality; B2-fs's booted checks pass through a real
     task start; `kernel/linux/{core,server}` are deleted.
+- **2026-11-16: a program's native calls** (`data-os.md` §4): program mode gets a handle table of
+  its own, an allowlist of native calls, no handle 0 for a process, and a reserved address range
+  for core-placed mappings. B1 builds it after its current slot (ABI 2.6, unreleased: one new
+  call, and a new `personality_set` argument). B2 uses it for `run_granted`. It is not on the
+  gate's path: the engine runs on today's server until B2 lands.
