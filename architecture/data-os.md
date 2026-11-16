@@ -83,8 +83,10 @@ Every figure below comes from the 0.6.6 runs on the benchmark VM (Linux, 8 CPUs,
   and 4 CPUs.
 - **The engine runs real jobs on it as today's Linux program (EN1).** All 15 production-node job
   cases passed (five cases on 1, 2 and 4 CPUs).
-- **Each fixture case takes 2.3 s to 3.1 s end to end under KVM,** boot, job and shutdown
-  included. The comparison with the emulator follows.
+- **Each fixture case takes 2.3 s to 3.1 s end to end under KVM.** That covers the host
+  driver's setup, the VM's boot, the job and the shutdown. The medians are 2.58 s, 2.74 s and
+  2.79 s on 1, 2 and 4 CPUs, against 5.91 s, 5.65 s and 5.66 s under QEMU's emulator (TCG). All
+  30 runs passed, and this is the upper bound on boot plus a small job.
 
 **Codecs (`arrow-core-0.7.md` §5; decision 5 here),** single-threaded, best of three, on the
 gate's own pages. `ruzstd` 0.8.3 implements only its Fastest level; its Default and Better
