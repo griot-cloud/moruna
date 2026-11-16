@@ -27,6 +27,13 @@ pub(super) fn init() {
 ///
 /// [`ConfigFs`]: fs::ConfigFs
 #[cfg_attr(not(any(ktest, target_arch = "x86_64")), expect(dead_code))]
+#[cfg_attr(
+    not(ktest),
+    expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )
+)]
 pub(crate) fn register_subsystem(subsystem: Arc<dyn SysBranchNode>) -> Result<()> {
     ConfigRootNode::singleton().add_child(subsystem)?;
 

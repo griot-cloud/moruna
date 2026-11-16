@@ -115,12 +115,9 @@ impl Pollee {
         }
 
         // We will store `task_ptr` in `state` to indicate that we're checking the events. But we
-        // need to make sure it's a negative value.
-        const {
-            use ostd::mm::KERNEL_VADDR_RANGE;
-            assert!((KERNEL_VADDR_RANGE.start as isize) < 0);
-        }
-        let task_ptr = Task::current().unwrap().as_ref() as *const _ as isize;
+        // need to make sure it's a negative value. User space: a task's address is a positive
+        // one, so the state holds its complement, which is negative and never `INV_STATE`.
+        let task_ptr = !(Task::current().unwrap().as_ref() as *const _ as isize);
 
         // Store `task_ptr` in `state` to indicate we're checking the events.
         //

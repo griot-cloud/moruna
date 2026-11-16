@@ -24,6 +24,9 @@
 #![warn(missing_docs)]
 
 extern crate alloc;
+// The `ktest` attribute names `::ostd`, which is this crate in its own tests.
+#[cfg(ktest)]
+extern crate self as ostd;
 #[macro_use]
 extern crate ostd_pod;
 
@@ -40,6 +43,7 @@ pub mod boot;
 pub mod console;
 pub mod cpu;
 mod error;
+pub mod io;
 pub mod irq;
 pub mod log;
 pub mod mm;
@@ -55,7 +59,12 @@ pub mod util;
 #[cfg(ktest)]
 mod test;
 
-pub use ostd_macros::early_cmdline_parser;
+#[doc(hidden)]
+pub use inventory as __inventory;
+pub use ostd_macros::{
+    early_cmdline_parser, global_frame_allocator, global_heap_allocator,
+    global_heap_allocator_slot_map, panic_handler,
+};
 pub use ostd_pod::Pod;
 
 // OSDK's heap allocator's per-CPU boxes (`osdk_heap_allocator`), for aster-util.

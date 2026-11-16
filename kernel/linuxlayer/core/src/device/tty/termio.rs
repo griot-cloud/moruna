@@ -488,16 +488,48 @@ pub(crate) struct CFontOp {
 
 impl CFontOp {
     // https://elixir.bootlin.com/linux/v6.15/source/include/uapi/linux/kd.h#L177
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     pub(super) const OP_SET: u32 = 0;
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     pub(super) const OP_GET: u32 = 1;
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     pub(super) const OP_SET_DEFAULT: u32 = 2;
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     pub(super) const OP_SET_TALL: u32 = 4;
 
     // https://elixir.bootlin.com/linux/v6.15/source/drivers/tty/vt/vt.c#L4711
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     pub(super) const MAX_WIDTH: u32 = 64;
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     pub(super) const MAX_HEIGHT: u32 = 128;
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     pub(super) const MAX_CHARCOUNT: u32 = 512;
 
     // https://elixir.bootlin.com/linux/v6.15/source/drivers/tty/vt/vt.c#L4721
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     pub(super) const NONTALL_VPITCH: u32 = 32;
 }

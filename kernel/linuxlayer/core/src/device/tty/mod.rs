@@ -3,7 +3,7 @@
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::sync::LocalIrqDisabled;
 
-use self::{line_discipline::LineDiscipline, termio::CFontOp};
+use self::line_discipline::LineDiscipline;
 use crate::{
     device::{Device, DeviceType},
     dispatch_ioctl,

@@ -6,9 +6,13 @@
 //! one that is not open and `ENOTSOCK` for one that is.
 
 use super::SyscallReturn;
-use crate::{fs::file::file_table::FileDesc, prelude::*};
+use crate::{
+    fs::file::file_table::{FileDesc, RawFileDesc},
+    prelude::*,
+};
 
-fn not_a_socket(fd: FileDesc, ctx: &Context) -> Result<SyscallReturn> {
+fn not_a_socket(raw_fd: RawFileDesc, ctx: &Context) -> Result<SyscallReturn> {
+    let fd: FileDesc = raw_fd.try_into()?;
     let file_table = ctx.thread_local.borrow_file_table();
     let _file = file_table.unwrap().read().get_file(fd)?.clone();
     return_errno_with_message!(Errno::ENOTSOCK, "the file is not a socket")
@@ -18,7 +22,12 @@ fn no_family() -> Result<SyscallReturn> {
     return_errno_with_message!(Errno::EAFNOSUPPORT, "the personality has no sockets")
 }
 
-pub(super) fn sys_socket(_domain: i32, _type: i32, _protocol: i32, _ctx: &Context) -> Result<SyscallReturn> {
+pub(super) fn sys_socket(
+    _domain: i32,
+    _type: i32,
+    _protocol: i32,
+    _ctx: &Context,
+) -> Result<SyscallReturn> {
     no_family()
 }
 
@@ -34,7 +43,7 @@ pub(super) fn sys_socketpair(
 
 macro_rules! on_a_descriptor {
     ($($name:ident($($arg:ident),*);)*) => {$(
-        pub(super) fn $name(fd: FileDesc, $($arg: u64,)* ctx: &Context) -> Result<SyscallReturn> {
+        pub(super) fn $name(fd: RawFileDesc, $($arg: u64,)* ctx: &Context) -> Result<SyscallReturn> {
             $(let _ = $arg;)*
             not_a_socket(fd, ctx)
         }

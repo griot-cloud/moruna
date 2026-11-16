@@ -537,6 +537,13 @@ macro_rules! dispatch_ioctl {
 ///
 /// The enum variant of the ioctl can be obtained by calling [`IoctlEnum::discriminant`],
 /// whose value is equal to `nr & ENUM_MASK`.
+#[cfg_attr(
+    not(ktest),
+    expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )
+)]
 pub(crate) struct IoctlEnum<const MAGIC: u8, const BASE_NR: u8, const ENUM_MASK: u8, D> {
     base_ioctl: Ioctl<MAGIC, BASE_NR, /* IS_MODERN = */ true, D>,
     discriminant: u8,
@@ -549,6 +556,13 @@ impl<const MAGIC: u8, const BASE_NR: u8, const ENUM_MASK: u8, D: DataSpec>
     ///
     /// This method succeeds only if the ioctl command belongs to the ioctl enum. Otherwise, this
     /// method returns `None`.
+    #[cfg_attr(
+        not(ktest),
+        expect(
+            dead_code,
+            reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+        )
+    )]
     pub(crate) fn try_from_raw(raw_ioctl: RawIoctl) -> Option<Self> {
         const {
             assert!(
@@ -581,6 +595,13 @@ impl<const MAGIC: u8, const BASE_NR: u8, const ENUM_MASK: u8, D>
     /// Returns a reference to the base ioctl.
     ///
     /// See the type-level documentations for the definition of the base ioctl.
+    #[cfg_attr(
+        not(ktest),
+        expect(
+            dead_code,
+            reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+        )
+    )]
     pub(crate) const fn base_ioctl(&self) -> &Ioctl<MAGIC, BASE_NR, /* IS_MODERN = */ true, D> {
         &self.base_ioctl
     }
@@ -588,6 +609,13 @@ impl<const MAGIC: u8, const BASE_NR: u8, const ENUM_MASK: u8, D>
     /// Returns the discriminant of the ioctl enum variant.
     ///
     /// See the type-level documentations for the definition of the enum discriminant.
+    #[cfg_attr(
+        not(ktest),
+        expect(
+            dead_code,
+            reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+        )
+    )]
     pub(crate) const fn discriminant(&self) -> u8 {
         self.discriminant
     }

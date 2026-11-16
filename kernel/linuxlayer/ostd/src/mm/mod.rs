@@ -7,19 +7,28 @@
 //! over the program's memory are fallible: they go through the fault-tolerant copy.
 
 pub mod dma;
+pub mod fault;
 pub mod frame;
+pub mod heap;
 pub mod io;
 pub(crate) mod kspace;
 mod mem_obj;
+pub mod page_prop;
+pub mod tlb;
+pub mod vm_space;
 
 pub use self::{
-    frame::{AnyFrameMeta, AnyUFrameMeta, Frame, FrameAllocOptions, Segment, UFrame, USegment},
+    frame::{
+        AnyFrameMeta, AnyUFrameMeta, Frame, FrameAllocOptions, FrameRef, Segment, UFrame, USegment,
+    },
     io::{
         Fallible, FallibleVmRead, FallibleVmWrite, Infallible, PodAtomic, PodOnce, VmIo, VmIoFill,
         VmIoOnce, VmReader, VmWriter,
     },
     kspace::{KERNEL_VADDR_RANGE, MAX_USERSPACE_VADDR},
     mem_obj::{HasDaddr, HasPaddr, HasPaddrRange, HasSize, Split},
+    page_prop::{CachePolicy, PageFlags, PageProperty},
+    vm_space::VmSpace,
 };
 
 /// A virtual address.

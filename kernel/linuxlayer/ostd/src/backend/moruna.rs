@@ -63,6 +63,10 @@ pub(crate) struct ThreadBlock {
     pub(crate) frame: moruna_sys::personality::Frame,
     /// The thread's task (`Task::current`), zero for none.
     pub(crate) task: usize,
+    /// The program's FS base, handed to the program in the frame and taken back.
+    pub(crate) fs_base: usize,
+    /// The program's GS base: kept, but the core loads none per thread.
+    pub(crate) gs_base: usize,
 }
 
 /// The calling thread's block.
@@ -111,6 +115,28 @@ pub(crate) unsafe fn init_block(block: *mut ThreadBlock) {
     }
 }
 
+/// The program's FS base.
+pub(crate) fn program_fs_base() -> usize {
+    // SAFETY: the calling thread's block is its own.
+    unsafe { (*block()).fs_base }
+}
+
+pub(crate) fn set_program_fs_base(value: usize) {
+    // SAFETY: as above.
+    unsafe { (*block()).fs_base = value };
+}
+
+/// The program's GS base.
+pub(crate) fn program_gs_base() -> usize {
+    // SAFETY: as above.
+    unsafe { (*block()).gs_base }
+}
+
+pub(crate) fn set_program_gs_base(value: usize) {
+    // SAFETY: as above.
+    unsafe { (*block()).gs_base = value };
+}
+
 /// Copies the program's saved vector state into `area`.
 pub(crate) fn program_fpu_save(area: &mut [u8]) {
     // SAFETY: the calling thread's block is its own.
@@ -153,6 +179,11 @@ pub(crate) fn run_program(
     // SAFETY: the block is the calling thread's own and lies in the personality's region.
     let (frame, fpu) = unsafe { (&mut (*block).frame, (*block).fpu.as_mut_ptr()) };
     ctx.to_frame(&mut frame.0);
+    // The FS base the program runs with is the block's (`FsBase::load` set it).
+    let fs = crate::arch::cpu::context::frame::FS_BASE;
+    // SAFETY: as above.
+    let fs_base = unsafe { (*block).fs_base } as u64;
+    frame.0[fs..fs + 8].copy_from_slice(&fs_base.to_le_bytes());
     let mut control = [0u32; 2];
     let rax: u64;
     // SAFETY: XRSTOR loads the program's state just before the call, and XSAVE stores it
@@ -190,6 +221,10 @@ pub(crate) fn run_program(
     };
     let at = crate::arch::cpu::context::frame::REASON;
     frame.0[at..at + 8].copy_from_slice(&reason.to_le_bytes());
+    // SAFETY: as above.
+    unsafe {
+        (*block).fs_base = u64::from_le_bytes(frame.0[fs..fs + 8].try_into().unwrap()) as usize
+    };
     ctx.from_frame(&frame.0)
 }
 

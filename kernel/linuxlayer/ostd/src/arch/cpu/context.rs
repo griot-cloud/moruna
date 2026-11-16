@@ -71,7 +71,7 @@ pub struct GeneralRegs {
     pub rip: usize,
 }
 
-/// A thread's FS base. The frame carries it, so saving and loading it touch no register.
+/// A thread's FS base.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FsBase(usize);
 
@@ -85,9 +85,21 @@ impl FsBase {
     pub fn addr(&self) -> usize {
         self.0
     }
+
+    /// Reads the program's FS base: in user space it lives in the thread's block, which the
+    /// entry hands to the program and takes back.
+    pub fn save(&mut self) {
+        self.0 = crate::backend::program_fs_base();
+    }
+
+    /// Sets the program's FS base, for its next run.
+    pub fn load(&self) {
+        crate::backend::set_program_fs_base(self.0);
+    }
 }
 
-/// A thread's GS base, carried in the frame as the FS base is.
+/// A thread's GS base. The core keeps no GS base per thread, so the program's is kept in
+/// the thread's block and reported, but not loaded into the CPU.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GsBase(usize);
 
@@ -100,6 +112,16 @@ impl GsBase {
     /// The address.
     pub fn addr(&self) -> usize {
         self.0
+    }
+
+    /// Reads the program's GS base.
+    pub fn save(&mut self, _guard: &crate::irq::DisabledLocalIrqGuard) {
+        self.0 = crate::backend::program_gs_base();
+    }
+
+    /// Sets the program's GS base.
+    pub fn load(&self, _guard: &crate::irq::DisabledLocalIrqGuard) {
+        crate::backend::set_program_gs_base(self.0);
     }
 }
 

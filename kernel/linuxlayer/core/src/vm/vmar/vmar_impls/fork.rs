@@ -267,6 +267,7 @@ mod test {
     }
 
     #[ktest]
+    #[ignore = "user space has no device memory to map"]
     fn cow_copy_pt_iomem() {
         /// A very large address (1TiB) beyond typical physical memory for testing.
         const IOMEM_PADDR: usize = 0x100_000_000_000;

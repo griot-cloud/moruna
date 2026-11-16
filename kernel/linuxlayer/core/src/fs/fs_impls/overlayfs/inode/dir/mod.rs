@@ -2,7 +2,7 @@
 
 //! The overlayfs namespace-mutation and whiteout subsystem.
 //!
-//! This module hosts the four namespace-mutation recipes as its submodules, 
+//! This module hosts the four namespace-mutation recipes as its submodules,
 //! create, link, remove, and rename, with the whiteout mechanics their
 //! publications go through. Each recipe file owns its VFS entry.
 //!

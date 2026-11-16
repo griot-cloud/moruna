@@ -10,11 +10,7 @@ use device_id::{DeviceId, MajorId, MinorId};
 use spin::Once;
 
 use crate::{
-    device::{
-        Device, DeviceType,
-        registry::char,
-        tty::{hvc::hvc0_device, serial::serial0_device, vt::active_vt},
-    },
+    device::{Device, DeviceType, registry::char, tty::serial::serial0_device},
     fs::{
         devtmpfs::DevtmpfsNodeMeta,
         file::{PerOpenFileOps, mkmod},
@@ -40,7 +36,8 @@ impl Device for Tty0Device {
     }
 
     fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
-        active_vt().open()
+        // User space: there are no virtual terminals.
+        return_errno_with_message!(Errno::ENODEV, "there are no virtual terminals")
     }
 }
 
@@ -93,12 +90,11 @@ impl SystemConsole {
             let console_name = CONSOLES
                 .get()
                 .and_then(|consoles| consoles.first().map(|s| s.as_str()))
-                .unwrap_or("tty0");
+                .unwrap_or("ttyS0");
 
             let device = match console_name {
                 "tty0" => Some(Arc::new(Tty0Device) as _),
                 "ttyS0" => serial0_device().cloned().map(|device| device as _),
-                "hvc0" => hvc0_device().cloned().map(|device| device as _),
                 _ => None,
             };
             let inner = device.unwrap_or_else(|| {

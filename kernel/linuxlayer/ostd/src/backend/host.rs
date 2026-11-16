@@ -84,16 +84,44 @@ pub(crate) fn yield_now() {
 }
 
 /// Runs `f` on a new thread.
+/// Runs `f` on a new thread. A panic there ends the process, as it would the personality,
+/// so a test fails rather than waits for a thread that is gone.
 pub(crate) fn spawn(f: Box<dyn FnOnce() + Send>) -> Result<(), ()> {
     std::thread::Builder::new()
-        .spawn(f)
+        .spawn(move || {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+                std::process::abort();
+            }
+        })
         .map(|_| ())
         .map_err(|_| ())
 }
 
 thread_local! {
+    static ACTIVE_SPACE: RefCell<Option<alloc::sync::Arc<crate::mm::VmSpace>>> =
+        const { RefCell::new(None) };
     static CURRENT: Cell<usize> = const { Cell::new(0) };
     static FAULTS: RefCell<Vec<Range<usize>>> = const { RefCell::new(Vec::new()) };
+    static FS_BASE: Cell<usize> = const { Cell::new(0) };
+    static GS_BASE: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The program's FS base, as the thread keeps it.
+pub(crate) fn program_fs_base() -> usize {
+    FS_BASE.with(Cell::get)
+}
+
+pub(crate) fn set_program_fs_base(value: usize) {
+    FS_BASE.with(|c| c.set(value));
+}
+
+/// The program's GS base, as the thread keeps it.
+pub(crate) fn program_gs_base() -> usize {
+    GS_BASE.with(Cell::get)
+}
+
+pub(crate) fn set_program_gs_base(value: usize) {
+    GS_BASE.with(|c| c.set(value));
 }
 
 /// The calling thread's task slot.
@@ -145,28 +173,67 @@ fn reachable(addr: usize, len: usize) -> usize {
     })
 }
 
+/// Program addresses in host tests: below this, an address is the activated space's
+/// (`VmSpace::activate`), reached through its pages; above, it is the host's own memory,
+/// as a test's buffers are.
+const PROGRAM_LIMIT: usize = 1 << 32;
+
+pub(crate) fn set_active_space(space: alloc::sync::Arc<crate::mm::VmSpace>) {
+    ACTIVE_SPACE.with(|a| *a.borrow_mut() = Some(space));
+}
+
+/// Where the byte at `addr` of the program's memory is, for an access of up to `len` bytes
+/// within its page: `None` on a fault.
+fn locate(addr: usize, len: usize, write: bool) -> Option<(usize, usize)> {
+    let in_page = 4096 - addr % 4096;
+    let n = len.min(in_page);
+    if addr < PROGRAM_LIMIT {
+        let host = ACTIVE_SPACE.with(|a| a.borrow().as_ref()?.translate(addr, write))?;
+        return Some((host, n));
+    }
+    let n = reachable(addr, n);
+    (n > 0).then_some((addr, n))
+}
+
 /// Copies `len` bytes; returns how many were not copied.
 ///
 /// # Safety
 ///
-/// Both ranges must be valid outside the marked ranges.
+/// Both ranges must be valid outside the marked ranges and the program's addresses.
 pub(crate) unsafe fn copy_fallible(dst: *mut u8, src: *const u8, len: usize, _dir: Dir) -> usize {
-    let n = reachable(dst as usize, len).min(reachable(src as usize, len));
-    // SAFETY: the caller keeps both ranges valid up to the first marked byte.
-    unsafe { core::ptr::copy(src, dst, n) };
-    len - n
+    let (dst, src) = (dst as usize, src as usize);
+    let mut done = 0;
+    while done < len {
+        let Some((d, dn)) = locate(dst + done, len - done, true) else {
+            break;
+        };
+        let Some((s, sn)) = locate(src + done, dn, false) else {
+            break;
+        };
+        // SAFETY: both pieces were found valid for `sn` bytes.
+        unsafe { core::ptr::copy(s as *const u8, d as *mut u8, sn) };
+        done += sn;
+    }
+    len - done
 }
 
 /// Fills `len` bytes with `value`; returns how many were not filled.
 ///
 /// # Safety
 ///
-/// The range must be valid outside the marked ranges.
+/// As for `copy_fallible`.
 pub(crate) unsafe fn set_fallible(dst: *mut u8, value: u8, len: usize) -> usize {
-    let n = reachable(dst as usize, len);
-    // SAFETY: as for `copy_fallible`.
-    unsafe { core::ptr::write_bytes(dst, value, n) };
-    len - n
+    let dst = dst as usize;
+    let mut done = 0;
+    while done < len {
+        let Some((d, n)) = locate(dst + done, len - done, true) else {
+            break;
+        };
+        // SAFETY: the piece was found valid for `n` bytes.
+        unsafe { core::ptr::write_bytes(d as *mut u8, value, n) };
+        done += n;
+    }
+    len - done
 }
 
 /// Loads a `u32` from the program's memory; `None` on a fault.
@@ -175,11 +242,12 @@ pub(crate) unsafe fn set_fallible(dst: *mut u8, value: u8, len: usize) -> usize 
 ///
 /// `ptr` must be valid and aligned outside the marked ranges.
 pub(crate) unsafe fn load_u32_fallible(ptr: *const u32) -> Option<u32> {
-    if reachable(ptr as usize, 4) < 4 {
+    let (at, n) = locate(ptr as usize, 4, false)?;
+    if n < 4 {
         return None;
     }
     // SAFETY: as above; the word is aligned, so the access is atomic.
-    Some(unsafe { AtomicU32::from_ptr(ptr as *mut u32) }.load(Ordering::Acquire))
+    Some(unsafe { AtomicU32::from_ptr(at as *mut u32) }.load(Ordering::Acquire))
 }
 
 /// Compares and exchanges a `u32` of the program's memory; returns the old value, `None`
@@ -189,11 +257,12 @@ pub(crate) unsafe fn load_u32_fallible(ptr: *const u32) -> Option<u32> {
 ///
 /// As for `load_u32_fallible`.
 pub(crate) unsafe fn cmpxchg_u32_fallible(ptr: *mut u32, old: u32, new: u32) -> Option<u32> {
-    if reachable(ptr as usize, 4) < 4 {
+    let (at, n) = locate(ptr as usize, 4, true)?;
+    if n < 4 {
         return None;
     }
     // SAFETY: as above.
-    let word = unsafe { AtomicU32::from_ptr(ptr) };
+    let word = unsafe { AtomicU32::from_ptr(at as *mut u32) };
     Some(
         match word.compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire) {
             Ok(v) | Err(v) => v,

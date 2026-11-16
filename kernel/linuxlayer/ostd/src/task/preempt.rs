@@ -50,8 +50,10 @@ pub fn disable_preempt() -> DisabledPreemptGuard {
     DisabledPreemptGuard::new()
 }
 
-/// Halts the CPU: in user space, sleeps for good.
+/// Halts the CPU until something happens: in user space, sleeps for a tick, as an idle
+/// CPU wakes at the next interrupt.
 pub fn halt_cpu() {
     let word = core::sync::atomic::AtomicU32::new(0);
-    crate::backend::futex_wait(&word, 0, crate::backend::FOREVER);
+    let tick = 1_000_000_000 / crate::timer::TIMER_FREQ;
+    crate::backend::futex_wait(&word, 0, crate::backend::now() + tick);
 }

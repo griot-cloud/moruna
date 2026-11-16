@@ -104,6 +104,10 @@ impl EndpointState {
     ///
     /// [`read_with`]: Endpoint::read_with
     /// [`write_with`]: Endpoint::read_with
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     pub(crate) fn cloned_pollee(&self) -> Pollee {
         self.pollee.clone()
     }

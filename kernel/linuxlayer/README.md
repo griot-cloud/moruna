@@ -84,15 +84,24 @@ their `use ostd::...` lines. The swaps of `kernel-is-the-machine.md` §4.2 are i
 
 Moruna's text rule (no em dashes) covers carried files too: the 108 em dashes in
 Asterinas's comments became colons after a list item's term and commas elsewhere. No code
-changed with them.
+changed with them. Beyond that, and the pruning above:
 
 | File | Why |
 | --- | --- |
 | `comps/softirq/src/taskless.rs` | Its per-CPU `RefCell` lists become locks: threads share CPU 0's state. |
-| `comps/time/src/tsc.rs` | The clock source is the core's monotonic clock, not the TSC. |
-| `comps/time/src/rtc/mod.rs` | One "driver" reading the wall time the start gives. |
-| `comps/time/Cargo.toml` | No RTC drivers' dependencies. |
+| `comps/time/src/tsc.rs`, `rtc/mod.rs`, `Cargo.toml` | The clock source is the core's monotonic clock; one "RTC" reads the wall time the start gives. |
+| `core/src/init.rs` | No other CPU, driver listing, network or vDSO to start; the personality ends with its init process. |
+| `core/src/arch/x86/power.rs` | No ACPI reset port: powering off ends the process. |
+| `core/src/device/registry/block.rs` | No virtio or NVMe request threads. |
+| `core/src/device/tty/device.rs` | No virtual terminals or hypervisor console; the console is `ttyS0`. |
+| `core/src/process/signal/poll.rs` | A polling task is marked by its address's complement: user addresses are positive. |
+| `core/src/fs/file/file_handle.rs`, `syscall/{mod.rs,arch/x86.rs}` | No socket hooks; the socket calls answer from `syscall/no_socket.rs`. |
+| `core/src/vm/vmar/vmar_impls/fork.rs` | Its device-memory test is ignored: there is no device memory. |
+| `core/src/lib.rs` | The module list, three unused features and `getset`, and the clocks every host test needs (`ostd::ktest_setup!`). |
+| 9 files | Items only the left-out parts used are marked `expect(dead_code)` with that reason. |
 
+New in `core/`: `net/mod.rs` (the UTS namespace only), `vdso.rs` (none mapped) and
+`syscall/no_socket.rs`.
 ## Running the program: B1's entry
 
 The program's own entry, clones, the pager and thread state are stream B1's mechanisms
@@ -108,16 +117,25 @@ The program's own entry, clones, the pager and thread state are stream B1's mech
 - A driver installed with `ostd::user::set_program_driver` takes the entry's place: a
   scripted program in host tests.
 
-What builds on these is the rewrite of `core/src/{thread,vm,process}` and the start.
+## The program's address space
 
-`core/` is carried but not yet a workspace member: making it build against `ostd` comes
-next, subsystem by subsystem.
+`vm/` drives OSTD's `VmSpace` through its cursors. Here `ostd`'s `VmSpace` is the
+personality's record of the program's pages, with OSTD's cursor API, so `vm/` carries
+unchanged, Asterinas's own copy-on-write `fork` included. Making the program see those pages
+(the core's `process_map`, `process_unmap` and `process_protect` of the frames' memory
+objects, with B1's clone and pager where they measure better) is stream B2-vm's. In host
+tests a thread's activated space backs program addresses below 4 GiB, so `vm/`'s faults,
+mappings and copies run on the host.
+
+A copy of program memory the personality has not mapped yet asks the layer's fault handler
+(`ostd::mm::fault`) to map it and goes on, as OSTD's fault path does.
 
 ## Building and testing
 
 The tree is its own Cargo workspace on the kernel's toolchain, so its carried files keep
 Asterinas's lints and formatting. Asterinas's kernel tests (`#[ktest]`) run as host tests
-with `--cfg ktest`, one at a time as the kernel runs them (some share global registries):
+with `--cfg ktest`, one at a time as the kernel runs them (some share global registries),
+each in a task of its own, after the setups registered with `ostd::ktest_setup!`:
 
 ```sh
 cd kernel/linuxlayer

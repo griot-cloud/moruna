@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use aster_cmdline::INIT_PROC_ARGS;
 use component::InitStage;
-use ostd::{cpu::CpuId, util::id_set::Id};
+use ostd::cpu::CpuId;
 use spin::once::Once;
 
 use crate::{
@@ -29,8 +29,8 @@ pub(super) fn main() {
     // Initialize the per-CPU states for BSP.
     init_on_each_cpu();
 
-    // Enable APs.
-    ostd::boot::smp::register_ap_entry(ap_init);
+    // User space: no other CPU boots here; the core runs the personality's threads on all
+    // of them.
 
     // Give the control of the BSP to the idle thread.
     ThreadOptions::new(bsp_idle_loop)
@@ -50,9 +50,7 @@ fn init() {
     crate::arch::init();
     crate::thread::init();
     crate::util::random::init();
-    crate::driver::init();
     crate::time::init();
-    crate::net::init();
     crate::sched::init();
     crate::process::init();
     crate::fs::init();
@@ -64,17 +62,6 @@ fn init_on_each_cpu() {
     crate::process::init_on_each_cpu();
     crate::fs::init_on_each_cpu();
     crate::time::init_on_each_cpu();
-}
-
-fn ap_init() {
-    // Initialize the per-CPU states for AP.
-    init_on_each_cpu();
-
-    ThreadOptions::new(ap_idle_loop)
-        // No races because `ap_init` runs on a certain AP.
-        .cpu_affinity(CpuId::current_racy().into())
-        .sched_policy(SchedPolicy::Idle)
-        .spawn();
 }
 
 //--------------------------------------------------------------------------
@@ -117,22 +104,14 @@ fn bsp_idle_loop() {
         ostd::task::halt_cpu();
     }
 
-    panic!(
-        "The init process terminates with code {:?}",
-        init_process.status().exit_code()
-    );
-}
-
-fn ap_idle_loop() {
-    ostd::info!(
-        "Idle thread for CPU #{} started",
-        // No races because this function runs on a certain AP.
-        CpuId::current_racy().as_usize(),
-    );
-
-    loop {
-        ostd::task::halt_cpu();
-    }
+    // User space: the personality's work ends with its init process.
+    let code = init_process.status().exit_code();
+    ostd::info!("The init process terminates with code {:?}", code);
+    ostd::power::poweroff(if code == 0 {
+        ostd::power::ExitCode::Success
+    } else {
+        ostd::power::ExitCode::Failure
+    });
 }
 
 //--------------------------------------------------------------------------
@@ -268,14 +247,11 @@ fn init_in_first_kthread(path_resolver: &PathResolver) {
     crate::thread::init_in_first_kthread();
     crate::fs::init_in_first_kthread(path_resolver);
     crate::device::init_in_first_kthread();
-    crate::net::init_in_first_kthread();
-    #[cfg(not(target_arch = "loongarch64"))]
-    crate::vdso::init_in_first_kthread();
 }
 
 fn print_banner() {
     println!("");
-    println!("{}", logo_ascii_art::get_gradient_color_version());
+    println!("Asterinas's Linux layer, as Moruna's personality");
 }
 
 static BOOT_SOURCE: AtomicU8 = AtomicU8::new(BootSource::Initramfs as u8);

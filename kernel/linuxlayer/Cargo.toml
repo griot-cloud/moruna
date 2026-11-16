@@ -7,6 +7,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "core",
     "comps/block",
     "comps/cmdline",
     "comps/console",
@@ -29,6 +30,7 @@ members = [
     "libs/io-util",
     "libs/jhash",
     "libs/keyable-arc",
+    "libs/osdk-frame-allocator",
     "libs/osdk-heap-allocator",
     "libs/ring-buffer",
     "libs/short-vis-path",
@@ -49,6 +51,7 @@ edition = "2024"
 # through a fault-tolerant copy (ostd/README.md).
 ostd = { path = "ostd", version = "=0.19.0", package = "linuxlayer-ostd" }
 ostd-macros = { path = "ostd/macros", version = "=0.19.0", package = "linuxlayer-ostd-macros" }
+osdk-frame-allocator = { path = "libs/osdk-frame-allocator", version = "=0.19.0", package = "linuxlayer-osdk-frame-allocator" }
 osdk-heap-allocator = { path = "libs/osdk-heap-allocator", version = "=0.19.0", package = "linuxlayer-osdk-heap-allocator" }
 moruna-sys = { path = "../sys", version = "=0.1.0", features = ["heap"] }
 moruna-abi = { path = "../abi", version = "=0.1.0" }

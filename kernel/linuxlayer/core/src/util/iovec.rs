@@ -199,15 +199,27 @@ pub(crate) trait MultiRead: ReadCString {
     fn read(&mut self, writer: &mut VmWriter<'_, Infallible>) -> Result<usize, (OstdError, usize)>;
 
     /// Calculates the total length of data remaining to read.
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     fn sum_lens(&self) -> usize;
 
     /// Checks if the data remaining to read is empty.
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     fn is_empty(&self) -> bool {
         self.sum_lens() == 0
     }
 
     /// Skips the first `nbytes` bytes of data, or skips to the end if the readers have
     /// insufficient bytes.
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     fn skip_some(&mut self, nbytes: usize);
 }
 
@@ -228,15 +240,27 @@ pub(crate) trait MultiWrite {
     -> Result<usize, (OstdError, usize)>;
 
     /// Calculates the length of space available to write.
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     fn sum_lens(&self) -> usize;
 
     /// Checks if the space available to write is empty.
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     fn is_empty(&self) -> bool {
         self.sum_lens() == 0
     }
 
     /// Skips the first `nbytes` bytes of data, or skips to the end if the writers have
     /// insufficient bytes.
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     fn skip_some(&mut self, nbytes: usize);
 }
 
@@ -289,6 +313,10 @@ impl MultiRead for VmReader<'_> {
 
 impl dyn MultiRead + '_ {
     /// Reads a `T` value, returning a `None` if the readers have insufficient bytes.
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     pub(crate) fn read_val_opt<T: Pod>(&mut self) -> Result<Option<T>> {
         let mut val = T::new_zeroed();
         let nbytes = self.read(&mut VmWriter::from(val.as_mut_bytes()))?;
@@ -356,6 +384,10 @@ impl MultiWrite for VmWriter<'_> {
 
 impl dyn MultiWrite + '_ {
     /// Writes a `T` value, truncating the value if the writers have insufficient bytes.
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     pub(crate) fn write_val_trunc<T: Pod>(&mut self, val: &T) -> Result<()> {
         let _nbytes = self.write(&mut VmReader::from(val.as_bytes()))?;
         // `_nbytes` may be smaller than the value size. We ignore it to truncate the value.

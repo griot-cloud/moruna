@@ -7,12 +7,9 @@
 #![no_std]
 #![deny(unsafe_code)]
 #![feature(alloc_io)]
-#![feature(array_try_from_fn)]
-#![feature(associated_type_defaults)]
 #![feature(btree_cursors)]
 #![feature(debug_closure_helpers)]
 #![feature(format_args_nl)]
-#![feature(ip_as_octets)]
 #![feature(linked_list_cursors)]
 #![feature(linked_list_retain)]
 #![feature(panic_can_unwind)]
@@ -23,8 +20,6 @@
 
 extern crate alloc;
 extern crate lru;
-#[macro_use]
-extern crate getset;
 #[macro_use]
 extern crate ostd_pod;
 
@@ -59,7 +54,13 @@ mod syscall;
 mod thread;
 mod time;
 pub mod util;
+// User space: no vDSO is mapped (vdso.rs).
+mod vdso;
 pub mod vm;
+
+// Host tests: the clocks a kernel's boot starts before its tests run.
+#[cfg(ktest)]
+ostd::ktest_setup!(crate::time::clocks::init_for_ktest);
 
 /// Boots the Asterinas core kernel.
 pub fn boot() {

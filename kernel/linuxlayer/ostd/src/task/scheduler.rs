@@ -1,6 +1,80 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Scheduling: the core's. What is left is the task's CPU record.
+//! Scheduling: the core's. What is left is the task's CPU record, and OSTD's scheduler
+//! interface, so the layer's scheduler classes carry: a scheduler injected here is kept and
+//! never driven, since the core decides what runs. Policies and nice values the program
+//! sets are recorded by the layer as Linux reports them.
+
+use alloc::sync::Arc;
+
+use spin::Once;
+
+use crate::{cpu::CpuId, task::Task};
+
+/// Why a task is enqueued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnqueueFlags {
+    /// Spawn a new task.
+    Spawn,
+    /// Wake a sleeping task.
+    Wake,
+}
+
+/// Why the current task is updated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateFlags {
+    /// Timer interrupt.
+    Tick,
+    /// Task waiting.
+    Wait,
+    /// Task yielding.
+    Yield,
+    /// Task exiting.
+    Exit,
+}
+
+/// A scheduler, as OSTD defines one.
+pub trait Scheduler<T = Task>: Sync + Send {
+    /// Enqueues a runnable task.
+    fn enqueue(&self, runnable: Arc<T>, flags: EnqueueFlags) -> Option<CpuId>;
+
+    /// Runs `f` on the local run queue.
+    fn local_rq_with(&self, f: &mut dyn FnMut(&dyn LocalRunQueue<T>));
+
+    /// Runs `f` on the local run queue, mutably.
+    fn mut_local_rq_with(&self, f: &mut dyn FnMut(&mut dyn LocalRunQueue<T>));
+}
+
+/// A CPU's run queue, as OSTD defines one.
+pub trait LocalRunQueue<T = Task> {
+    /// The running task.
+    fn current(&self) -> Option<&Arc<T>>;
+
+    /// Updates the running task; whether another should run.
+    #[must_use]
+    fn update_current(&mut self, flags: UpdateFlags) -> bool;
+
+    /// The next task to run.
+    fn pick_next(&mut self) -> &Arc<T> {
+        self.try_pick_next().unwrap()
+    }
+
+    /// The next task to run, if any.
+    fn try_pick_next(&mut self) -> Option<&Arc<T>>;
+
+    /// Removes the running task.
+    fn dequeue_current(&mut self) -> Option<Arc<T>>;
+}
+
+static SCHEDULER: Once<&'static dyn Scheduler<Task>> = Once::new();
+
+/// Keeps the layer's scheduler; the core schedules, so it is never driven.
+pub fn inject_scheduler(scheduler: &'static dyn Scheduler<Task>) {
+    SCHEDULER.call_once(|| scheduler);
+}
+
+/// Enables preemption ticks on this CPU: the core preempts, so there is nothing to do.
+pub fn enable_preemption_on_cpu() {}
 
 pub mod info {
     //! The scheduling information a task keeps.

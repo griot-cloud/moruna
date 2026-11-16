@@ -22,7 +22,7 @@ use super::{
     HasPaddr, HasSize, Infallible, PAGE_SIZE, Paddr, Split, VmReader, VmWriter,
     io::util::{HasVmReaderWriter, VmReaderWriterIdentity},
 };
-use crate::{Error, Result};
+use crate::{Error, Result, sync::non_null::NonNullPtr};
 
 /// A frame's metadata.
 ///
@@ -75,6 +75,22 @@ struct Block {
     pages: usize,
 }
 
+/// Bytes held in frames.
+static HELD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The bytes the personality may still allocate as frames: the usable memory its start
+/// gave it (`boot::BootInfo::memory_regions`) less what frames hold.
+pub fn free_bytes() -> usize {
+    let total: usize = crate::boot::try_boot_info().map_or(0, |info| {
+        info.memory_regions
+            .iter()
+            .filter(|r| r.typ() == crate::boot::memory_region::MemoryRegionType::Usable)
+            .map(|r| r.len())
+            .sum()
+    });
+    total.saturating_sub(HELD.load(core::sync::atomic::Ordering::Relaxed))
+}
+
 impl Block {
     fn alloc(pages: usize, zeroed: bool) -> Result<Arc<Block>> {
         let layout = Layout::from_size_align(
@@ -96,6 +112,7 @@ impl Block {
         if ptr.is_null() {
             return Err(Error::NoMemory);
         }
+        HELD.fetch_add(layout.size(), core::sync::atomic::Ordering::Relaxed);
         Ok(Arc::new(Block {
             addr: ptr as usize,
             pages,
@@ -106,6 +123,7 @@ impl Block {
 impl Drop for Block {
     fn drop(&mut self) {
         let layout = Layout::from_size_align(self.pages * PAGE_SIZE, PAGE_SIZE).unwrap();
+        HELD.fetch_sub(layout.size(), core::sync::atomic::Ordering::Relaxed);
         // SAFETY: `alloc` allocated the block with this layout, and no page refers to it.
         unsafe { alloc::alloc::dealloc(self.addr as *mut u8, layout) };
     }
@@ -251,6 +269,79 @@ impl<M: AnyUFrameMeta + ?Sized> HasVmReaderWriter for Frame<M> {
     fn writer(&self) -> VmWriter<'_, Infallible> {
         // SAFETY: as for `reader`; untyped memory may be written through shared frames.
         unsafe { VmWriter::from_kernel_space(self.page.addr as *mut u8, PAGE_SIZE) }
+    }
+}
+
+/// A borrowed frame: the frame, without a reference of its own.
+pub struct FrameRef<'a, M: AnyFrameMeta + ?Sized> {
+    inner: core::mem::ManuallyDrop<Frame<M>>,
+    _marker: core::marker::PhantomData<&'a Frame<M>>,
+}
+
+impl<'a, M: AnyFrameMeta + ?Sized> FrameRef<'a, M> {
+    pub(crate) fn new(frame: &'a Frame<M>) -> Self {
+        Self {
+            // SAFETY: a bitwise copy that is never dropped holds no count of its own, and
+            // `'a` keeps the frame it copies alive.
+            inner: core::mem::ManuallyDrop::new(unsafe { core::ptr::read(frame) }),
+            _marker: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<M: AnyFrameMeta + ?Sized> core::ops::Deref for FrameRef<'_, M> {
+    type Target = Frame<M>;
+
+    fn deref(&self) -> &Frame<M> {
+        &self.inner
+    }
+}
+
+impl<M: AnyFrameMeta + ?Sized> Debug for FrameRef<'_, M> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        Debug::fmt(&*self.inner, f)
+    }
+}
+
+// SAFETY: a frame is an `Arc`, whose pointer is never null and points at its page, which
+// is aligned to at least eight bytes (the `Arc`'s counts precede it).
+unsafe impl<M: AnyFrameMeta> NonNullPtr for Frame<M> {
+    type Target = core::marker::PhantomData<Self>;
+
+    type Ref<'a>
+        = FrameRef<'a, M>
+    where
+        Self: 'a;
+
+    const ALIGN_BITS: u32 = 3;
+
+    fn into_raw(self) -> core::ptr::NonNull<Self::Target> {
+        let ptr = Arc::into_raw(self.page).cast_mut();
+        // SAFETY: an `Arc`'s pointer is never null.
+        unsafe { core::ptr::NonNull::new_unchecked(ptr) }.cast()
+    }
+
+    unsafe fn from_raw(raw: core::ptr::NonNull<Self::Target>) -> Self {
+        // SAFETY: the caller gives a pointer from `into_raw`, whose count it owns.
+        Self {
+            page: unsafe { Arc::from_raw(raw.as_ptr().cast_const().cast::<Page<M>>()) },
+        }
+    }
+
+    unsafe fn raw_as_ref<'a>(raw: core::ptr::NonNull<Self::Target>) -> Self::Ref<'a> {
+        FrameRef {
+            // SAFETY: as for `from_raw`; the copy is never dropped, so it takes no count.
+            inner: core::mem::ManuallyDrop::new(Self {
+                page: unsafe { Arc::from_raw(raw.as_ptr().cast_const().cast::<Page<M>>()) },
+            }),
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    fn ref_as_raw(ptr_ref: Self::Ref<'_>) -> core::ptr::NonNull<Self::Target> {
+        let ptr = Arc::as_ptr(&ptr_ref.inner.page).cast_mut();
+        // SAFETY: as for `into_raw`.
+        unsafe { core::ptr::NonNull::new_unchecked(ptr) }.cast()
     }
 }
 

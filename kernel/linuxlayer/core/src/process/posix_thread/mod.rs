@@ -305,6 +305,10 @@ impl PosixThread {
     }
 
     /// Gets the duplicatable read-only credentials of the thread.
+    #[expect(
+        dead_code,
+        reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+    )]
     pub(crate) fn credentials_dup(&self) -> Credentials<ReadDupOp> {
         self.credentials.dup().restrict()
     }

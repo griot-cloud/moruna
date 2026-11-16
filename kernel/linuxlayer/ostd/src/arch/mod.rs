@@ -3,22 +3,18 @@
 //! x86-64, from a user process.
 
 pub mod cpu;
+pub mod power;
 pub mod trap;
 
-/// Reads the time-stamp counter.
+/// Reads the "time-stamp counter": in user space the core's monotonic clock in nanoseconds,
+/// which a VM's CPUID may not give a frequency for when the real TSC is used.
 pub fn read_tsc() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: RDTSC reads a counter and touches no memory.
-    unsafe {
-        core::arch::x86_64::_rdtsc()
-    }
-    #[cfg(not(target_arch = "x86_64"))]
     crate::backend::now()
 }
 
-/// The time-stamp counter's frequency, from CPUID; zero when the CPU does not say.
+/// The counter's frequency: a nanosecond clock's.
 pub fn tsc_freq() -> u64 {
-    cpu::cpuid::query_tsc_freq().unwrap_or(0)
+    1_000_000_000
 }
 
 /// A random 64-bit value from the core's random source.

@@ -38,6 +38,13 @@ impl IoctlCmd {
         Self(cmd)
     }
 
+    #[cfg_attr(
+        not(ktest),
+        expect(
+            dead_code,
+            reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+        )
+    )]
     pub(super) const fn as_u32(self) -> u32 {
         self.0
     }
@@ -47,6 +54,13 @@ impl IoctlCmd {
         self.0 as u8
     }
 
+    #[cfg_attr(
+        not(ktest),
+        expect(
+            dead_code,
+            reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+        )
+    )]
     pub(super) const fn set_nr(&mut self, nr: u8) {
         // Bits 0..=7
         self.0 = (self.0 & !0xFF) | (nr as u32);

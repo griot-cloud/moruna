@@ -87,6 +87,12 @@ impl<T> RawLock<T> {
         self.word.lock();
         RawGuard { lock: self }
     }
+
+    /// Host tests only: `VmSpace::translate`.
+    #[cfg(not(target_os = "none"))]
+    pub(crate) fn try_lock(&self) -> Option<RawGuard<'_, T>> {
+        self.word.try_lock().then_some(RawGuard { lock: self })
+    }
 }
 
 pub(crate) struct RawGuard<'a, T> {

@@ -478,14 +478,13 @@ fn tasks_are_threads() {
 
 #[ktest]
 fn boot_info_and_power_types() {
-    use crate::boot::{BootInfo, boot_info, memory_region::*};
+    use crate::boot::{BootInfo, boot_info, memory_region::*, try_boot_info};
+    // The test runner gave the start's information first; a second one is ignored.
+    crate::boot::init(BootInfo::default());
+    assert!(try_boot_info().is_some());
+    assert_eq!(boot_info().memory_regions[0].len(), 1 << 30);
+    assert!(crate::mm::frame::free_bytes() > 0);
     let region = MemoryRegion::new(0x1000, 0x2000, MemoryRegionType::Usable);
-    crate::boot::init(BootInfo {
-        kernel_cmdline: "init=/bin/sh".into(),
-        memory_regions: vec![region],
-        ..Default::default()
-    });
-    assert_eq!(boot_info().memory_regions[0].len(), 0x2000);
     assert_eq!(region.base(), 0x1000);
     assert!(!region.is_empty());
     assert_eq!(region.typ(), MemoryRegionType::Usable);

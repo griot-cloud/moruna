@@ -137,7 +137,7 @@ impl<R: UserReg> CpuSync<R> {
     /// The `set` method itself only writes the in-memory copy and marks `InMemory`.
     /// This avoids a CPU write when:
     ///
-    /// 1. `set` is followed by more `set`s before user-entry: 
+    /// 1. `set` is followed by more `set`s before user-entry:
     ///    they collapse into a single load.
     /// 2. The task never re-enters user mode
     ///    after this `set` (e.g. exits in the kernel), no CPU write happens at all.

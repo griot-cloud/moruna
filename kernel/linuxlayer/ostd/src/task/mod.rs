@@ -45,7 +45,8 @@ impl Task {
         NonNull::new(ptr).map(|p| unsafe { CurrentTask::new(p) })
     }
 
-    /// Makes `task` the calling thread's task until [`Task::leave`].
+    /// Makes `task` the calling thread's task until [`Task::leave`], and runs the
+    /// post-schedule handler, as a switch to it would.
     pub fn enter(task: Arc<Task>) {
         let old = backend::current_slot();
         backend::set_current_slot(Arc::into_raw(task) as usize);
@@ -53,10 +54,19 @@ impl Task {
             // SAFETY: the slot held a strong reference from an earlier `enter`.
             drop(unsafe { Arc::from_raw(old as *const Task) });
         }
+        if let Some(handler) = POST_SCHEDULE_HANDLER.get() {
+            handler();
+        }
     }
 
-    /// Ends the calling thread's task.
+    /// Ends the calling thread's task, running the pre-schedule handler first, as a switch
+    /// away from it would.
     pub fn leave() {
+        if backend::current_slot() != 0
+            && let Some(handler) = PRE_SCHEDULE_HANDLER.get()
+        {
+            handler(&crate::irq::disable_local());
+        }
         let old = backend::current_slot();
         backend::set_current_slot(0);
         if old != 0 {
@@ -227,11 +237,53 @@ impl Borrow<Task> for CurrentTask {
     }
 }
 
-/// Injects a handler run before a context switch: unused, since the core switches.
-pub fn inject_pre_schedule_handler(_handler: fn(&crate::irq::DisabledLocalIrqGuard)) {}
+/// A setup every test needs, which a kernel's boot would have done: registered with
+/// [`crate::ktest_setup!`] and run once, before the first test.
+#[doc(hidden)]
+pub struct KtestSetup(pub fn());
 
-/// Injects a handler run after a context switch: unused, since the core switches.
-pub fn inject_post_schedule_handler(_handler: fn()) {}
+inventory::collect!(KtestSetup);
+
+/// Runs a test's body in a task of its own, as OSTD's test runner does.
+#[doc(hidden)]
+pub fn __run_ktest<R>(body: impl FnOnce() -> R) -> R {
+    // Tests run after boot, as OSTD's do: a start with one gibibyte of usable memory.
+    crate::boot::init(crate::boot::BootInfo {
+        memory_regions: alloc::vec![crate::boot::memory_region::MemoryRegion::new(
+            0,
+            1 << 30,
+            crate::boot::memory_region::MemoryRegionType::Usable,
+        )],
+        ..Default::default()
+    });
+    let task = Arc::new(TaskOptions::new(|| {}).data(()).build().unwrap());
+    Task::enter(task);
+    static SETUP: spin::Once<()> = spin::Once::new();
+    SETUP.call_once(|| {
+        for setup in inventory::iter::<KtestSetup> {
+            (setup.0)();
+        }
+    });
+    let result = body();
+    Task::leave();
+    result
+}
+
+static PRE_SCHEDULE_HANDLER: spin::Once<fn(&crate::irq::DisabledLocalIrqGuard)> = spin::Once::new();
+static POST_SCHEDULE_HANDLER: spin::Once<fn()> = spin::Once::new();
+
+/// Injects a handler run when a task leaves its thread, as OSTD runs it before a context
+/// switch.
+pub fn inject_pre_schedule_handler(handler: fn(&crate::irq::DisabledLocalIrqGuard)) {
+    PRE_SCHEDULE_HANDLER.call_once(|| handler);
+}
+
+/// Injects a handler run when a task enters a thread, as OSTD runs it after a context
+/// switch: the core runs each task's thread with no switch between tasks, so entering is
+/// when a task is switched in.
+pub fn inject_post_schedule_handler(handler: fn()) {
+    POST_SCHEDULE_HANDLER.call_once(|| handler);
+}
 
 #[cfg(ktest)]
 mod test {
@@ -264,6 +316,9 @@ mod test {
 
     #[ktest]
     fn enter_and_leave() {
+        // A test runs in a task of its own.
+        assert!(Task::current().is_some());
+        Task::leave();
         assert!(Task::current().is_none());
         let task = Arc::new(TaskOptions::new(|| {}).data(()).build().unwrap());
         Task::enter(task.clone());

@@ -34,6 +34,8 @@ pub(in crate::fs) use nullfs::NullFs;
 pub(crate) use pidfdfs::PidfdFs;
 pub(in crate::fs) use pipefs::PipeFs;
 use pipefs::PipeFsType;
+// User space: only tests make socket inodes, as sockets are out of 0.7.0.
+#[cfg_attr(not(ktest), expect(unused_imports))]
 pub(crate) use sockfs::SockFs;
 use sockfs::SockFsType;
 use spin::Once;
@@ -172,6 +174,13 @@ const ROOT_INO: u64 = 1;
 pub(crate) enum PseudoInodeType {
     Root,
     Pipe,
+    #[cfg_attr(
+        not(ktest),
+        expect(
+            dead_code,
+            reason = "used only by what 0.7.0 leaves out: sockets, virtual terminals, the vDSO"
+        )
+    )]
     Socket,
     AnonInode,
     Pidfd,

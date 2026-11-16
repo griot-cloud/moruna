@@ -42,6 +42,11 @@ pub fn boot_info() -> &'static BootInfo {
         .expect("the personality's start has not set its boot information")
 }
 
+/// What the personality started with, if its start has said.
+pub fn try_boot_info() -> Option<&'static BootInfo> {
+    INFO.get()
+}
+
 /// What the early command line says.
 #[derive(Clone, Copy, Debug)]
 pub struct EarlyCmdline {

@@ -8,7 +8,48 @@
 //! a crash of the personality. There is no device memory (`Io`) in user space.
 
 use super::{Fallible, Infallible};
-use crate::backend::{self, Dir};
+use crate::{
+    backend::{self, Dir},
+    mm::fault,
+};
+
+/// Copies `len` bytes through the fault-tolerant copy; returns how many were copied. A copy
+/// that stops at a page the personality has not mapped yet asks the layer's fault handler to
+/// map it and goes on from there, as OSTD's fault path does; it stops for good where the
+/// handler cannot, or where it makes no progress.
+///
+/// # Safety
+///
+/// As for [`memcpy`].
+unsafe fn copy_resolving(dst: *mut u8, src: *const u8, len: usize, dir: Dir) -> usize {
+    let mut done = 0;
+    let mut last_fault = None;
+    while done < len {
+        // SAFETY: the caller upholds it for the whole range, so for its tail.
+        let left = unsafe { backend::copy_fallible(dst.add(done), src.add(done), len - done, dir) };
+        done = len - left;
+        if left == 0 {
+            break;
+        }
+        // The fault is at the first byte not copied, on the program's side.
+        let at = done;
+        if last_fault == Some(at) {
+            break;
+        }
+        last_fault = Some(at);
+        let resolved = match dir {
+            Dir::ToProgram => fault::resolve(dst as usize + at, true),
+            Dir::FromProgram => fault::resolve(src as usize + at, false),
+            Dir::Both => {
+                fault::resolve(src as usize + at, false) | fault::resolve(dst as usize + at, true)
+            }
+        };
+        if !resolved {
+            break;
+        }
+    }
+    done
+}
 
 /// Copies `len` bytes from `src` to `dst`.
 ///
@@ -81,7 +122,7 @@ unsafe impl Memcpy<Fallible> for Infallible {
 
     unsafe fn memcpy(dst: *mut u8, src: *const u8, len: usize) -> usize {
         // SAFETY: as above.
-        len - unsafe { backend::copy_fallible(dst, src, len, Dir::FromProgram) }
+        unsafe { copy_resolving(dst, src, len, Dir::FromProgram) }
     }
 }
 
@@ -91,7 +132,7 @@ unsafe impl Memcpy<Infallible> for Fallible {
 
     unsafe fn memcpy(dst: *mut u8, src: *const u8, len: usize) -> usize {
         // SAFETY: as above.
-        len - unsafe { backend::copy_fallible(dst, src, len, Dir::ToProgram) }
+        unsafe { copy_resolving(dst, src, len, Dir::ToProgram) }
     }
 }
 
@@ -101,7 +142,7 @@ unsafe impl Memcpy<Fallible> for Fallible {
 
     unsafe fn memcpy(dst: *mut u8, src: *const u8, len: usize) -> usize {
         // SAFETY: as above.
-        len - unsafe { backend::copy_fallible(dst, src, len, Dir::Both) }
+        unsafe { copy_resolving(dst, src, len, Dir::Both) }
     }
 }
 
@@ -120,8 +161,20 @@ unsafe impl Memset for Fallible {
     type Result = usize;
 
     unsafe fn memset(dst: *mut u8, value: u8, len: usize) -> usize {
-        // SAFETY: as above.
-        len - unsafe { backend::set_fallible(dst, value, len) }
+        let mut done = 0;
+        let mut last_fault = None;
+        while done < len {
+            // SAFETY: as above, for the tail.
+            done = len - unsafe { backend::set_fallible(dst.add(done), value, len - done) };
+            if done == len || last_fault == Some(done) {
+                break;
+            }
+            last_fault = Some(done);
+            if !fault::resolve(dst as usize + done, true) {
+                break;
+            }
+        }
+        done
     }
 }
 
@@ -132,7 +185,15 @@ unsafe impl Memset for Fallible {
 /// `ptr` is aligned.
 pub(crate) unsafe fn __atomic_load_fallible(ptr: *const u32) -> u64 {
     // SAFETY: the caller upholds it.
-    unsafe { backend::load_u32_fallible(ptr) }.map_or(!0, u64::from)
+    let first = unsafe { backend::load_u32_fallible(ptr) };
+    let value = match first {
+        None if fault::resolve(ptr as usize, false) => {
+            // SAFETY: as above.
+            unsafe { backend::load_u32_fallible(ptr) }
+        }
+        other => other,
+    };
+    value.map_or(!0, u64::from)
 }
 
 /// Compares and exchanges a `u32` of the program's memory; returns the old value, `!0`
@@ -143,5 +204,13 @@ pub(crate) unsafe fn __atomic_load_fallible(ptr: *const u32) -> u64 {
 /// `ptr` is aligned.
 pub(crate) unsafe fn __atomic_cmpxchg_fallible(ptr: *mut u32, old: u32, new: u32) -> u64 {
     // SAFETY: the caller upholds it.
-    unsafe { backend::cmpxchg_u32_fallible(ptr, old, new) }.map_or(!0, u64::from)
+    let first = unsafe { backend::cmpxchg_u32_fallible(ptr, old, new) };
+    let value = match first {
+        None if fault::resolve(ptr as usize, true) => {
+            // SAFETY: as above.
+            unsafe { backend::cmpxchg_u32_fallible(ptr, old, new) }
+        }
+        other => other,
+    };
+    value.map_or(!0, u64::from)
 }

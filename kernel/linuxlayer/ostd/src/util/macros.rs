@@ -46,3 +46,22 @@ macro_rules! ptr_null_of {
         }
     };
 }
+
+/// Runs its first block in a TDX guest and its `else` block otherwise: a personality is
+/// never one, so only the `else` block is kept.
+#[macro_export]
+macro_rules! if_tdx_enabled {
+    ({ $($if_tdx:tt)* }) => {};
+    ({ $($if_tdx:tt)* } else { $($not_tdx:tt)* }) => { $($not_tdx)* };
+}
+
+/// Registers a setup every test needs, run once before the first: what Asterinas's
+/// `ktest` TODO asks for, since a host test has no kernel boot before it.
+#[macro_export]
+macro_rules! ktest_setup {
+    ($setup:path) => {
+        $crate::__inventory::submit! {
+            $crate::task::KtestSetup($setup)
+        }
+    };
+}
