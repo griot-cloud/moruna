@@ -272,6 +272,14 @@ impl ImageTask {
         Ok(self)
     }
 
+    /// The job's entry says its command makes the data plane's calls itself (`plane: true`):
+    /// on the kernel that is the ring protocol, as an image whose own environment declares
+    /// `MORUNA_PLANE=rings`.
+    pub fn with_plane(mut self, plane: bool) -> Self {
+        self.rings |= plane;
+        self
+    }
+
     /// Use per-command actual reply windows, without pregranting the next window.
     /// This changes no syscall or plane protocol; ordinary image tasks keep their flow.
     pub fn managed_windows(mut self) -> Self {

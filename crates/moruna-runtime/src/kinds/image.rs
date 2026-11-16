@@ -425,7 +425,9 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
     .map_err(|why| moruna_kernel::MorunaError::Config {
         name: "image",
         msg: format!("{reference}: {why}"),
-    })?;
+    })?
+    // A command that makes the data plane's calls itself runs on the rings (stream P).
+    .with_plane(settings.plane);
     cx.notes().push(format!(
         "image {}: verified on the Moruna kernel against the {} layers it attached",
         verified.digest,
