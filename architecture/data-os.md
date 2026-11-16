@@ -182,6 +182,34 @@ This is `kernel-is-the-machine.md` §4.1 and §4.2, cut to a VM with no network.
 - **An unmodified image** still works through descriptors 0 and 1 as an Arrow IPC stream. That path
   copies, and the report says so.
 
+## 5a. Risks, and the first evidence for each
+
+1. **The cost of carrying the Linux layer to user space.** This is the largest risk.
+   - It needs the four core mechanisms and about 25,000 rewritten lines.
+   - A Linux call becomes a crossing (a switch into the personality's region in the same process)
+     instead of a trap answered in kernel mode.
+   - The switch is cheaper than today's message per call to the personality process, and dearer
+     than a trap.
+   - **First evidence:** step 1 measures today's forwarding on the gate's Python image under KVM:
+     calls per second, time per call, and its share of wall time. That is the cost the new entry
+     has to beat, and the call rate says how much a dearer-than-trap crossing can cost at most.
+2. **Huge pages for a process in OSTD's page tables.** These are not shown yet (SDD 29 m.1). The
+   first evidence is a mapping test in the core's suite, and the fault and TLB counts on the
+   arena.
+3. **The engine driving the data disk itself.** Moruna's driver processes do this today, but the
+   engine has not. The first evidence is a virtio-blk read into arena pages under KVM, timed
+   against today's path.
+4. **The grouped revoke.** Taking write access back costs a TLB flush on every CPU the task runs
+   on. The first evidence is its cost per group, measured against the batches a group carries.
+
+## Rejected: Asterinas's whole kernel
+
+Asterinas's kernel, with its Linux layer in kernel mode and Moruna fused into it, was the first
+draft's recommendation (`992a5662`). Brackly rejected it: "there is no difference ... between
+using Linux and using the whole of Asterinas ... the whole goal of this was to be able to reduce
+the attack surface ... the rule is to have a micro kernel, not a kernel." It would put about
+228,000 lines and 245 Linux calls in kernel mode (§0).
+
 ## 6. What stays Moruna
 
 Wiring keeps Moruna (`arrow-core-0.7.md`).
