@@ -7,9 +7,24 @@ use crate::{prelude::*, vm::perms::VmPerms};
 
 impl Vmar {
     pub(crate) fn handle_page_fault(&self, page_fault_info: &PageFaultInfo) -> Result<()> {
+        let address = page_fault_info.address;
+
+        // Moruna: a page the record allows but the core does not show (a refused call, or
+        // the other side of a writable and executable page) is shown, and the program goes
+        // on. Forced faults (`ptrace`) take vm/'s path.
+        if !page_fault_info.is_forced() {
+            let perms = page_fault_info.required_perms;
+            if self.vm_space.serve_lagging(
+                address,
+                perms.contains(VmPerms::WRITE),
+                perms.contains(VmPerms::EXEC),
+            )? {
+                return Ok(());
+            }
+        }
+
         let inner = self.inner.read();
 
-        let address = page_fault_info.address;
         if let Some(vm_mapping) = inner.vm_mappings.find_one(&address) {
             debug_assert!(vm_mapping.range().contains(&address));
 

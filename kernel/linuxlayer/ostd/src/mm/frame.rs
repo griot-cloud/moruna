@@ -3,21 +3,23 @@
 //! Frames in user space.
 //!
 //! In OSTD a frame is a physical page with a reference count and typed metadata. Here a
-//! frame is a page of the personality's own memory, allocated in blocks of contiguous
-//! pages; each page keeps its own count and metadata, and a block is freed when its last
-//! page is. Its "physical address" is its address in the personality.
-//!
-//! Mapping a frame into the program is the vm module's rewrite against the core's
-//! mappings and pager (stream B1), not this module's.
+//! frame is a page of a chunk: a memory object the core holds, mapped in the personality's
+//! region (`chunk`). Each page keeps its own count and metadata, and goes back to its chunk
+//! when its last reference goes. Its "physical address" is its address in the personality,
+//! and its chunk and offset are what the core maps into the program
+//! (`super::vm_space`).
+
+mod chunk;
 
 use alloc::{sync::Arc, vec::Vec};
 use core::{
-    alloc::Layout,
     any::{Any, TypeId},
     fmt::Debug,
     ops::Range,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
+use self::chunk::Chunk;
 use super::{
     HasPaddr, HasSize, Infallible, PAGE_SIZE, Paddr, Split, VmReader, VmWriter,
     io::util::{HasVmReaderWriter, VmReaderWriterIdentity},
@@ -68,15 +70,8 @@ macro_rules! impl_untyped_frame_meta_for {
 
 impl_untyped_frame_meta_for!(());
 
-/// Contiguous pages of the personality's memory, freed when the last page goes.
-#[derive(Debug)]
-struct Block {
-    addr: usize,
-    pages: usize,
-}
-
 /// Bytes held in frames.
-static HELD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static HELD: AtomicUsize = AtomicUsize::new(0);
 
 /// The bytes the personality may still allocate as frames: the usable memory its start
 /// gave it (`boot::BootInfo::memory_regions`) less what frames hold.
@@ -88,52 +83,26 @@ pub fn free_bytes() -> usize {
             .map(|r| r.len())
             .sum()
     });
-    total.saturating_sub(HELD.load(core::sync::atomic::Ordering::Relaxed))
+    total.saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
-impl Block {
-    fn alloc(pages: usize, zeroed: bool) -> Result<Arc<Block>> {
-        let layout = Layout::from_size_align(
-            pages.checked_mul(PAGE_SIZE).ok_or(Error::Overflow)?,
-            PAGE_SIZE,
-        )
-        .map_err(|_| Error::InvalidArgs)?;
-        if layout.size() == 0 {
-            return Err(Error::InvalidArgs);
-        }
-        // SAFETY: the layout has a non-zero size.
-        let ptr = unsafe {
-            if zeroed {
-                alloc::alloc::alloc_zeroed(layout)
-            } else {
-                alloc::alloc::alloc(layout)
-            }
-        };
-        if ptr.is_null() {
-            return Err(Error::NoMemory);
-        }
-        HELD.fetch_add(layout.size(), core::sync::atomic::Ordering::Relaxed);
-        Ok(Arc::new(Block {
-            addr: ptr as usize,
-            pages,
-        }))
-    }
+/// The chunks frames come from now, and the bytes they hold.
+pub fn chunks_held() -> (usize, usize) {
+    chunk::held()
 }
 
-impl Drop for Block {
-    fn drop(&mut self) {
-        let layout = Layout::from_size_align(self.pages * PAGE_SIZE, PAGE_SIZE).unwrap();
-        HELD.fetch_sub(layout.size(), core::sync::atomic::Ordering::Relaxed);
-        // SAFETY: `alloc` allocated the block with this layout, and no page refers to it.
-        unsafe { alloc::alloc::dealloc(self.addr as *mut u8, layout) };
-    }
-}
-
-/// A page: its block, kept alive while the page is, its address and its metadata.
+/// A page: its chunk, kept while the page is, its address and its metadata.
 struct Page<M: ?Sized> {
-    _block: Arc<Block>,
+    chunk: Arc<Chunk>,
     addr: usize,
     meta: M,
+}
+
+impl<M: ?Sized> Drop for Page<M> {
+    fn drop(&mut self) {
+        HELD.fetch_sub(PAGE_SIZE, Ordering::Relaxed);
+        chunk::free(&self.chunk, (self.addr - self.chunk.base()) / PAGE_SIZE);
+    }
 }
 
 /// A page of memory with metadata `M`, counted by reference.
@@ -184,6 +153,12 @@ impl<M: AnyFrameMeta + ?Sized> Frame<M> {
     /// How many references the frame has.
     pub fn reference_count(&self) -> u64 {
         Arc::strong_count(&self.page) as u64
+    }
+
+    /// The object holding the frame, and the frame's offset in it: what the core maps.
+    pub(crate) fn object_offset(&self) -> (u32, usize) {
+        let chunk = &self.page.chunk;
+        (chunk.raw(), self.page.addr - chunk.base())
     }
 }
 
@@ -509,16 +484,23 @@ impl FrameAllocOptions {
     where
         F: FnMut(Paddr) -> M,
     {
-        let block = Block::alloc(nframes, self.zeroed)?;
         let mut frames = Vec::new();
         frames
             .try_reserve_exact(nframes)
             .map_err(|_| Error::NoMemory)?;
+        let (chunk, first, stale) = chunk::alloc(nframes)?;
+        let base = chunk.base() + first * PAGE_SIZE;
+        if self.zeroed && stale != 0 {
+            // SAFETY: the pages were just taken from the chunk, which is mapped in the
+            // personality, and nothing else refers to them.
+            unsafe { core::ptr::write_bytes(base as *mut u8, 0, stale * PAGE_SIZE) };
+        }
+        HELD.fetch_add(nframes * PAGE_SIZE, Ordering::Relaxed);
         for i in 0..nframes {
-            let addr = block.addr + i * PAGE_SIZE;
+            let addr = base + i * PAGE_SIZE;
             frames.push(Frame {
                 page: Arc::new(Page {
-                    _block: block.clone(),
+                    chunk: chunk.clone(),
                     addr,
                     meta: metadata_fn(addr),
                 }),

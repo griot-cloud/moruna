@@ -401,4 +401,83 @@ mod test {
             (_, None)
         ));
     }
+
+    // Moruna (stream B2-vm): a fork shown through the core's process clone.
+    use ostd::mm::vm_space::emulated;
+
+    use crate::vm::shown_tests::{
+        R, RW, counted, fault, map_anon, new_vmar, peek, poke, shown_vmar,
+    };
+
+    #[ktest]
+    fn a_fork_clones_the_process_and_copies_on_write_on_both_sides() {
+        let (parent, pp) = shown_vmar();
+        let addr = map_anon(&parent, 0x300_0000, 4);
+        for i in 0..4 {
+            fault(&parent, addr + i * PAGE_SIZE, true).unwrap();
+            assert!(poke(pp, addr + i * PAGE_SIZE, 100 + i as u64));
+        }
+
+        // As `Vmar::fork_from` does, whose heap a host test has not set up: the child's
+        // mapping, and the page table copied with write access taken on both sides.
+        let child = new_vmar();
+        map_anon(&child, addr, 4);
+        {
+            let guard = disable_preempt();
+            let range = addr..addr + 4 * PAGE_SIZE;
+            let mut to = child.vm_space().cursor_mut(&guard, &range).unwrap();
+            let mut from = parent.vm_space().cursor_mut(&guard, &range).unwrap();
+            assert_eq!(cow_copy_pt(&mut from, &mut to, range.len()), 4);
+        }
+        // The parent's pages lose write access, in one call for the run.
+        for (_, page) in emulated::pages(pp) {
+            assert_eq!(page.prot, R);
+        }
+        assert!(!poke(pp, addr, 1));
+        let mut cp = None;
+        let made = counted(|| {
+            cp = Some(
+                child
+                    .vm_space()
+                    .show_cloned(parent.vm_space(), |p| {
+                        emulated::process_clone(p).map_err(|_| ostd::Error::NoMemory)
+                    })
+                    .unwrap(),
+            );
+        });
+        let cp = cp.unwrap();
+        // The clone shows what the child's record holds: no call.
+        assert_eq!(made.calls(), 0);
+        assert_eq!(emulated::pages(cp), emulated::pages(pp));
+        assert_eq!(peek(cp, addr + 3 * PAGE_SIZE), Some(103));
+
+        // The child writes page 0: its own copy, writable; the parent keeps its page.
+        let before = emulated::pages(pp)[&addr];
+        fault(&child, addr, true).unwrap();
+        let now = emulated::pages(cp)[&addr];
+        assert_eq!(now.prot, RW);
+        assert_ne!((now.object, now.offset), (before.object, before.offset));
+        assert!(poke(cp, addr, 999));
+        assert_eq!(peek(pp, addr), Some(100));
+        assert_eq!(emulated::pages(pp)[&addr], before);
+
+        // The parent writes page 1: the frame is shared, so the parent copies.
+        fault(&parent, addr + PAGE_SIZE, true).unwrap();
+        assert!(poke(pp, addr + PAGE_SIZE, 555));
+        assert_eq!(peek(cp, addr + PAGE_SIZE), Some(101));
+        assert_eq!(emulated::pages(cp)[&(addr + PAGE_SIZE)].prot, R);
+
+        // The child ends: its pages go from its process, and the parent's page 2 is its alone,
+        // so a write takes it back writable with no copy.
+        drop(child);
+        assert!(emulated::pages(cp).is_empty());
+        let shared = emulated::pages(pp)[&(addr + 2 * PAGE_SIZE)];
+        fault(&parent, addr + 2 * PAGE_SIZE, true).unwrap();
+        let taken = emulated::pages(pp)[&(addr + 2 * PAGE_SIZE)];
+        assert_eq!((taken.object, taken.offset), (shared.object, shared.offset));
+        assert_eq!(taken.prot, RW);
+        assert_eq!(peek(pp, addr + 2 * PAGE_SIZE), Some(102));
+        emulated::process_end(cp);
+        emulated::process_end(pp);
+    }
 }
