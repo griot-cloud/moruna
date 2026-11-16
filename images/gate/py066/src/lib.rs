@@ -36,4 +36,6 @@ macro_rules! functions {
     };
 }
 
-functions!(score, occupancy, enrich, audit, ov_shape, ov_attrs, fw_minhash);
+functions!(
+    score, occupancy, enrich, audit, ov_shape, ov_attrs, fw_minhash
+);

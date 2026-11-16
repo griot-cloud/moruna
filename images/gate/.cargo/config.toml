@@ -1,0 +1,9 @@
+# The CPU features every Rust row of the gate builds with, in one place: the native tasks
+# (tasks/build.sh), gate-baseline and 0.6.6's extension (py066) all build under this directory, so
+# all three get these flags and the same GEMM kernel (matrixmultiply picks its kernel from them at
+# compile time). Approved by the integrator, 2026-11-16: AVX2 and FMA, which both benchmark
+# machines (D8ds_v6, D4ls_v5) have and OSTD saves for user processes (XCR0, xsave).
+#
+# A RUSTFLAGS in the environment would replace these: leave it unset when building the gate.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-feature=+avx,+avx2,+fma"]
