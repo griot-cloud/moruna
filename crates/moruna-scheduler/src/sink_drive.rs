@@ -191,30 +191,54 @@ fn write_loop(
                     if !ends.started.swap(true, Ordering::SeqCst) {
                         shared.tell(moruna_kernel::StageEvent::SinkWriting { sink: end.index });
                     }
+                    let times = Arc::clone(&end.input.times);
                     let future: BoxFuture<'_, Result<()>> = if sink.encodes_on_workers() {
-                        // RB1: any worker encodes; this drive puts what it made.
+                        // RB1: any worker encodes; this drive puts what it made. Each half is
+                        // timed.
                         let owner = Arc::clone(shared);
                         let index = usize::from(end.index);
                         let (seq, payload) = (morsel.seq, morsel.payload);
                         let offload = &shared.offload;
                         let inline = Arc::clone(shared);
+                        let encoding = Arc::clone(&times);
                         Box::pin(async move {
                             let encoded = crate::offload::on_worker(
                                 offload,
                                 move || inline.offload_inline(),
                                 move || {
+                                    let start = Instant::now();
                                     let end = owner.sinks.get(index).ok_or_else(|| {
                                         MorunaError::Sink(format!("no sink {index}"))
                                     })?;
                                     let guard = end.sink.read().unwrap_or_else(|e| e.into_inner());
-                                    guard.encode(seq, payload)
+                                    let encoded = guard.encode(seq, payload);
+                                    encoding.codec(start);
+                                    encoded
                                 },
                             )
-                            .await?;
-                            sink.put(encoded).await
+                            .await;
+                            let encoded = match encoded {
+                                Ok(e) => e,
+                                Err(e) => {
+                                    times.done();
+                                    return Err(e);
+                                }
+                            };
+                            let put = Instant::now();
+                            let written = sink.put(encoded).await;
+                            times.io(put);
+                            times.done();
+                            written
                         })
                     } else {
-                        sink.write(morsel.seq, morsel.payload)
+                        let issued = Instant::now();
+                        let written = sink.write(morsel.seq, morsel.payload);
+                        Box::pin(async move {
+                            let written = written.await;
+                            times.io(issued);
+                            times.done();
+                            written
+                        })
                     };
                     shared.writes_in_flight.fetch_add(1, Ordering::SeqCst);
                     inflight.push((morsel.seq, future));

@@ -72,6 +72,57 @@ pub struct RunMeta {
     /// What the scheduling policy decided and left unused (10 f.3, adaptive-runtime 9.7);
     /// `None` when the run never started its scheduler.
     pub policy: Option<PolicyReport>,
+    /// Where the sources' and the sinks' time went: reads apart from decodes, encodes apart
+    /// from writes. Empty when the run never started its scheduler.
+    pub io: IoReport,
+}
+
+/// Where a run's sources' and sinks' time went (the gate's split, `arrow-core-0.7.md` §9):
+/// each source's reads apart from its decodes, each sink's encodes apart from its writes. With
+/// each stage's `kernel_busy_s` (the function) and its waits it is the job's time split into
+/// read and decode, the function, encode and write, and waits.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct IoReport {
+    /// Each source's, source 0 first.
+    pub sources: Vec<SourceIo>,
+    /// Each sink's, sink 0 first.
+    pub sinks: Vec<SinkIo>,
+}
+
+impl IoReport {
+    /// Whether it times no source and no sink.
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty() && self.sinks.is_empty()
+    }
+}
+
+/// One source's reads and decodes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct SourceIo {
+    /// Reads finished, failed ones included.
+    pub reads: u64,
+    /// Seconds fetching bytes, each read from its issue until its bytes were in, summed over
+    /// the reads in flight together. A source that decodes in its read counts its decodes here.
+    pub read_s: f64,
+    /// Seconds decoding on workers, summed; `None` (absent) for a source that decodes in its
+    /// read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_s: Option<f64>,
+}
+
+/// One sink's encodes and writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct SinkIo {
+    /// Writes finished, failed ones included.
+    pub writes: u64,
+    /// Seconds encoding on workers, summed; `None` (absent) for a sink that encodes in its
+    /// write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encode_s: Option<f64>,
+    /// Seconds writing, each write from its put until it was done, summed over the writes in
+    /// flight together. A sink that encodes in its write counts its encodes here, and an ordered
+    /// sink's write its wait for the morsels before it.
+    pub write_s: f64,
 }
 
 /// What the scheduling policy did over a run (adaptive-runtime 9.7, 10), for the benchmark
@@ -583,6 +634,11 @@ pub struct RunReport {
     /// the run never started its scheduler.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyReport>,
+    /// Where the sources' and the sinks' time went: reads apart from decodes, encodes apart
+    /// from writes (the gate's split, `arrow-core-0.7.md` §9). Absent from the JSON when the run
+    /// had no scheduler to time them.
+    #[serde(skip_serializing_if = "IoReport::is_empty")]
+    pub io: IoReport,
     /// What identifies each part of the run, as the run resolved it: a source's schema is the
     /// one it gives, a stage's its first input's, a sink's the one it is given; a stage's
     /// fingerprint is its kernel's. Filled by the facade that knows them; empty when none did.
@@ -1060,6 +1116,7 @@ impl RunReport {
                 .collect(),
             buffers: meta.buffers.clone(),
             policy: meta.policy.clone(),
+            io: meta.io.clone(),
             part_digests: PartDigests::default(),
         }
     }

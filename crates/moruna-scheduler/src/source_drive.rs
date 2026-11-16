@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam::channel::{Receiver, Sender};
 use crossbeam::sync::{Parker, Unparker};
@@ -564,8 +564,10 @@ fn submit<'a>(
     let range = if whole { None } else { Some(rows) };
     shared.source_reading(source);
     let tier = tier0(shared);
+    let times = Arc::clone(&source.out.times);
+    let issued = Instant::now();
     let future: BoxFuture<'a, Result<Payload>> = if source.source.decodes_on_workers() {
-        // RB1: the drive fetches the bytes and any worker decodes them.
+        // RB1: the drive fetches the bytes and any worker decodes them; each half is timed.
         let decoder = Arc::clone(&source.source);
         let alloc = Arc::clone(&shared.alloc);
         let owned = split.clone();
@@ -573,18 +575,40 @@ fn submit<'a>(
             let fetched = source
                 .source
                 .fetch(split, range, shared.alloc.as_ref(), tier)
-                .await?;
-            crate::offload::on_worker(
+                .await;
+            times.io(issued);
+            let fetched = match fetched {
+                Ok(f) => f,
+                Err(e) => {
+                    times.done();
+                    return Err(e);
+                }
+            };
+            let decoding = Arc::clone(&times);
+            let decoded = crate::offload::on_worker(
                 &shared.offload,
                 || shared.offload_inline(),
-                move || decoder.decode(&owned, fetched, alloc.as_ref(), tier),
+                move || {
+                    let start = Instant::now();
+                    let decoded = decoder.decode(&owned, fetched, alloc.as_ref(), tier);
+                    decoding.codec(start);
+                    decoded
+                },
             )
-            .await
+            .await;
+            times.done();
+            decoded
         })
     } else {
-        source
+        let read = source
             .source
-            .read(split, range, shared.alloc.as_ref(), tier)
+            .read(split, range, shared.alloc.as_ref(), tier);
+        Box::pin(async move {
+            let read = read.await;
+            times.io(issued);
+            times.done();
+            read
+        })
     };
     shared.reads_in_flight.fetch_add(1, Ordering::SeqCst);
     inflight.push(InFlight {
@@ -983,12 +1007,15 @@ fn service_helper(
     };
     let range = if whole { None } else { Some(rows) };
     shared.source_reading(source);
+    let issued = Instant::now();
     let mut future = source
         .source
         .read(split, range, shared.alloc.as_ref(), tier0(shared));
     shared.reads_in_flight.fetch_add(1, Ordering::SeqCst);
     let result = block_on(&mut future, parker, cx);
     shared.reads_in_flight.fetch_sub(1, Ordering::SeqCst);
+    source.out.times.io(issued);
+    source.out.times.done();
     let answer = match result {
         Ok(payload) => {
             // The probe's read is the run's first: what it decoded to sizes every read after it
@@ -1069,12 +1096,15 @@ fn recompute(shared: &Shared, source: &SourceEnd, parker: &Parker, cx: &mut Cont
             None
         };
         shared.source_reading(source);
+        let issued = Instant::now();
         let mut future = source
             .source
             .read(split, range, shared.alloc.as_ref(), tier0(shared));
         shared.reads_in_flight.fetch_add(1, Ordering::SeqCst);
         let result = block_on(&mut future, parker, cx);
         shared.reads_in_flight.fetch_sub(1, Ordering::SeqCst);
+        source.out.times.io(issued);
+        source.out.times.done();
         match result {
             Ok(payload) => {
                 let (rows, bytes) = (payload.rows(), payload.bytes());

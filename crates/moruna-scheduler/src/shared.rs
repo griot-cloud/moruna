@@ -149,6 +149,8 @@ pub(crate) struct EndCounters {
     pub(crate) morsels: AtomicU64,
     pub(crate) rows: AtomicU64,
     pub(crate) bytes: AtomicU64,
+    /// Its reads or writes, apart from its decodes or encodes (the gate's split).
+    pub(crate) times: Arc<crate::io_times::Times>,
 }
 
 /// A job the scheduler asks one named worker to run, because the SDD says the call must happen
