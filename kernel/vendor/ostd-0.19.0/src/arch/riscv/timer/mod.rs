@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! The timer support.
+
+use core::{
+    arch::asm,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use spin::Once;
+
+use crate::{
+    arch::{self, boot::DEVICE_TREE, cpu::extension::IsaExtensions, trap::TrapFrame},
+    irq::IrqLine,
+    timer::TIMER_FREQ,
+};
+
+pub(super) static TIMER_IRQ: Once<IrqLine> = Once::new();
+
+static TIMEBASE_FREQ: AtomicU64 = AtomicU64::new(0);
+static TIMER_INTERVAL: AtomicU64 = AtomicU64::new(0);
+
+/// Initializes the timer module on the BSP.
+///
+/// # Safety
+///
+/// This function is safe to call on the following conditions:
+///  1. It is called once and at most once at a proper timing in the boot context
+///     of the BSP.
+///  2. It is called before any other public functions of this module is called.
+pub(super) unsafe fn init_on_bsp() {
+    TIMEBASE_FREQ.store(
+        DEVICE_TREE
+            .get()
+            .unwrap()
+            .cpus()
+            .next()
+            .unwrap()
+            .timebase_frequency() as u64,
+        Ordering::Relaxed,
+    );
+    TIMER_INTERVAL.store(
+        TIMEBASE_FREQ.load(Ordering::Relaxed) / TIMER_FREQ,
+        Ordering::Relaxed,
+    );
+    if is_sstc_enabled() {
+        // SAFETY: Mutating the static variable `SET_NEXT_TIMER_FN` is safe here
+        // because we ensure that it is only modified during the initialization
+        // phase of the timer.
+        unsafe {
+            SET_NEXT_TIMER_FN = set_next_timer_sstc;
+        }
+    }
+
+    TIMER_IRQ.call_once(|| {
+        let mut timer_irq = IrqLine::alloc().unwrap();
+        timer_irq.on_active(timer_callback);
+
+        timer_irq
+    });
+
+    // SAFETY: The caller ensures that this is only called once on the
+    // bootstrapping hart.
+    unsafe { init_current_hart() };
+}
+
+/// Initializes the timer on this AP.
+///
+/// # Safety
+///
+/// This function must be called on an AP that hasn't called this function.
+pub(super) unsafe fn init_on_ap() {
+    // SAFETY: The caller ensures that this is only called once on the
+    // current application hart.
+    unsafe { init_current_hart() };
+}
+
+/// Initializes the timer on the current hart.
+///
+/// # Safety
+///
+/// This function must be called on a hart that hasn't called this function.
+unsafe fn init_current_hart() {
+    set_next_timer();
+    // SAFETY: Accessing the `sie` CSR to enable the timer interrupt is safe
+    // here because this function is only called during timer initialization,
+    // and we ensure that only the timer interrupt bit is set without affecting
+    // other interrupt sources.
+    unsafe {
+        riscv::register::sie::set_stimer();
+    }
+}
+
+fn timer_callback(trapframe: &TrapFrame) {
+    crate::timer::call_timer_callback_functions(trapframe);
+
+    set_next_timer();
+}
+
+fn set_next_timer() {
+    // SAFETY: Calling the `SET_NEXT_TIMER_FN` function pointer is safe here
+    // because we ensure that it is set to a valid function during the timer
+    // initialization, and we never modify it after that.
+    unsafe {
+        SET_NEXT_TIMER_FN();
+    }
+}
+
+static mut SET_NEXT_TIMER_FN: fn() = set_next_timer_sbi;
+
+fn set_next_timer_sbi() {
+    sbi_rt::set_timer(get_next_when());
+}
+
+fn set_next_timer_sstc() {
+    // SAFETY: Setting the next timer using the `stimecmp` CSR is safe here
+    // because we are using the `stimecmp` CSR to set the next timer interrupt
+    // only when we're handling a timer interrupt, which is a standard operation
+    // specified by RISC-V SSTC extension.
+    unsafe {
+        asm!("csrrw {}, stimecmp, {}", out(reg) _, in(reg) get_next_when());
+    }
+}
+
+fn is_sstc_enabled() -> bool {
+    arch::cpu::extension::has_extensions(IsaExtensions::SSTC)
+}
+
+fn get_next_when() -> u64 {
+    let current = riscv::register::time::read64();
+    let interval = TIMER_INTERVAL.load(Ordering::Relaxed);
+    current + interval
+}
+
+pub(crate) fn get_timebase_freq() -> u64 {
+    TIMEBASE_FREQ.load(Ordering::Relaxed)
+}

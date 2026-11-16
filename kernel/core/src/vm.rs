@@ -22,10 +22,11 @@ use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use moruna_abi::{Error, PAGE_SIZE, charge, map};
+use moruna_datapath::place;
 use ostd::{
     mm::{
-        CachePolicy, FrameAllocOptions, MAX_USERSPACE_VADDR, PageFlags, PageProperty, UFrame, VmIo,
-        VmSpace,
+        CachePolicy, FrameAllocOptions, HUGE_PAGE_SIZE, HasPaddr, MAX_USERSPACE_VADDR, PageFlags,
+        PageProperty, UFrame, USegment, VmIo, VmSpace, tlb::TlbFlushOp,
     },
     sync::SpinLock,
     task::disable_preempt,
@@ -538,6 +539,13 @@ impl Space {
     /// Maps `len` bytes (whole pages) of `backing` with `prot`: at `at` when it is
     /// given, replacing what is there when `fixed` and refusing (`BadState`) when not;
     /// anywhere free in the mapping area otherwise. Returns where.
+    ///
+    /// `prot` may also carry the data path's options (data-os §2, C4). `map::POPULATE`
+    /// gives every zero page its frame at once, charged at once, so no page of the
+    /// mapping faults later; an object's or a device's pages are always mapped at once.
+    /// `map::HUGE` maps each aligned 2 MiB of the range whose frames are one aligned
+    /// physical run as one large page, and places a mapping the kernel chooses where its
+    /// runs line up; zero pages are in runs only when `map::POPULATE` allocates them.
     pub fn map(
         &self,
         at: Option<u64>,
@@ -547,6 +555,8 @@ impl Space {
         backing: Backing,
         fixed: bool,
     ) -> Result<u64, Error> {
+        let options = prot & (map::HUGE | map::POPULATE);
+        let prot = prot & !options;
         Space::check_prot(prot, &backing)?;
         let len = pages(len)?;
         if len == 0 {
@@ -569,6 +579,9 @@ impl Space {
                 }
                 va
             }
+            None if options & map::HUGE != 0 => {
+                Space::find_free_aligned(&inner, len, Space::huge_phase(&backing))?
+            }
             None => Space::find_free(&inner, len)?,
         };
         let area = Area {
@@ -577,19 +590,10 @@ impl Space {
             prot,
             backing,
         };
-        // The area's record and the tables of the regions only it touches, charged
-        // before anything is mapped.
-        let (before, after) = inner.neighbours(va, va + len);
-        let added = moruna_quota::tables(&[(va, va + len)], before, after, map_end());
-        self.charge(&mut inner, charge::AREA + added.bytes())?;
-        inner.tables += added.pages;
-        if let Err(e) = self.fill_ptes(&inner, va, &area, va, va + len) {
-            inner.tables -= added.pages;
-            self.settle(&mut inner);
-            return Err(e);
-        }
-        inner.areas.insert(va, area);
-        Ok(va)
+        let result = self.insert_area(&mut inner, va, area, options);
+        drop(inner);
+        // What a failed mapping allocated goes once the lock is released.
+        result.map(|()| va).map_err(|(e, _frames)| e)
     }
 
     /// Unmaps whole pages `va .. va + len`; pages nothing maps are skipped. With
@@ -660,24 +664,7 @@ impl Space {
     pub fn protect(&self, va: u64, len: u64, prot: u64, only: Option<Kind>) -> Result<(), Error> {
         let end = Space::check_range(va, len)?;
         let mut inner = self.inner.lock();
-        // Every page covered, of the allowed kind, and the protection allowed.
-        let mut cursor = va;
-        for (&start, area) in inner.areas.range(..end) {
-            if area.end <= va {
-                continue;
-            }
-            if start > cursor {
-                return Err(Error::OutOfRange);
-            }
-            if only.is_some_and(|k| k != area.kind) || area.kind == Kind::Plane {
-                return Err(Error::InvalidArgs);
-            }
-            Space::check_prot(prot, &area.backing)?;
-            cursor = area.end;
-        }
-        if cursor < end {
-            return Err(Error::OutOfRange);
-        }
+        Space::check_cover(&inner, va, end, prot, only)?;
         // Splitting at both ends makes at most two areas more.
         let split_bytes = Space::split_bytes(&inner, va, end);
         self.charge(&mut inner, split_bytes)?;
@@ -1011,7 +998,363 @@ impl Space {
 
 // ---- stream A (data path, `architecture/data-os-streams.md`): stream A's additions to
 // ---- `Space` go in this block; it also owns `map`, `populate` and `protect` above.
-impl Space {}
+
+/// A large page's size: 2 MiB.
+const HUGE: u64 = HUGE_PAGE_SIZE as u64;
+/// The pages of a large page.
+const HUGE_PAGES: usize = HUGE_PAGE_SIZE / PAGE_SIZE as usize;
+
+/// Whether `frames` are one large page: whole, physically contiguous, and aligned.
+fn one_run(frames: &[UFrame]) -> bool {
+    moruna_datapath::frames::one_run(
+        frames.iter().map(|f| f.paddr() as u64),
+        HUGE_PAGES,
+        PAGE_SIZE,
+    )
+}
+
+/// One large page of zeroed frames, or `None` when the allocator has no aligned run.
+fn zeroed_run() -> Option<USegment> {
+    let mut options = FrameAllocOptions::new();
+    options.zeroed(true);
+    options.alloc_segment(HUGE_PAGES).ok().map(Into::into)
+}
+
+impl Space {
+    /// Records `area`, new at `va` where nothing is mapped, with its charge, its zero
+    /// pages if `options` has `map::POPULATE`, and its page table's entries, large ones
+    /// where `options` has `map::HUGE`. On failure nothing is left, and the error comes
+    /// with the frames it allocated, to be dropped once the lock is released.
+    fn insert_area(
+        &self,
+        inner: &mut Inner,
+        va: u64,
+        area: Area,
+        options: u64,
+    ) -> Result<(), (Error, Vec<UFrame>)> {
+        let end = area.end;
+        // The area's record and the tables of the regions only it touches, charged
+        // before anything is mapped.
+        let (before, after) = inner.neighbours(va, end);
+        let added = moruna_quota::tables(&[(va, end)], before, after, map_end());
+        if let Err(e) = self.charge(inner, charge::AREA + added.bytes()) {
+            return Err(self.failed(inner, va, end, e));
+        }
+        inner.tables += added.pages;
+        let huge = options & map::HUGE != 0;
+        let filled = if options & map::POPULATE != 0 {
+            self.populate_zero(inner, va, &area, huge)
+        } else {
+            Ok(())
+        }
+        .and_then(|()| {
+            if huge {
+                self.fill_huge(inner, va, &area)
+            } else {
+                self.fill_ptes(inner, va, &area, va, end)
+            }
+        });
+        if let Err(e) = filled {
+            inner.tables -= added.pages;
+            return Err(self.failed(inner, va, end, e));
+        }
+        inner.areas.insert(va, area);
+        Ok(())
+    }
+
+    /// Undoes a mapping of `va .. end` that failed with `error`: no entry and no zero
+    /// page of it stays, and the charge goes back. Returns the error and the frames.
+    fn failed(&self, inner: &mut Inner, va: u64, end: u64, error: Error) -> (Error, Vec<UFrame>) {
+        let pages: Vec<u64> = inner.zero.range(va..end).map(|(p, _)| *p).collect();
+        let frames = pages.iter().filter_map(|p| inner.zero.remove(p)).collect();
+        self.unmap_ptes(va, end - va);
+        self.settle(inner);
+        (error, frames)
+    }
+
+    /// `map::POPULATE` for zero pages: every page of the new area at `va` gets its frame
+    /// now, charged now, in aligned 2 MiB runs where `huge` and the range allow. An area
+    /// of any other backing has its pages already.
+    fn populate_zero(
+        &self,
+        inner: &mut Inner,
+        va: u64,
+        area: &Area,
+        huge: bool,
+    ) -> Result<(), Error> {
+        if !matches!(area.backing, Backing::Zero) {
+            return Ok(());
+        }
+        self.charge(inner, (area.end - va) / PAGE_SIZE * charge::ZERO_PAGE)?;
+        let mut page = va;
+        while page < area.end {
+            let run = (huge && page.is_multiple_of(HUGE) && area.end - page >= HUGE)
+                .then(zeroed_run)
+                .flatten();
+            if let Some(run) = run {
+                for frame in run {
+                    inner.zero.insert(page, frame);
+                    page += PAGE_SIZE;
+                }
+            } else {
+                inner.zero.insert(page, zeroed_frame()?);
+                page += PAGE_SIZE;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fills a new area's page table as `fill_ptes` does, with one large page for each
+    /// aligned 2 MiB whose frames are one run.
+    fn fill_huge(&self, inner: &Inner, start: u64, area: &Area) -> Result<(), Error> {
+        if area.prot & map::PROTECTION == 0 || matches!(area.backing, Backing::Device { .. }) {
+            return self.fill_ptes(inner, start, area, start, area.end);
+        }
+        let mut va = start;
+        while va < area.end {
+            if va.is_multiple_of(HUGE)
+                && area.end - va >= HUGE
+                && self.map_large(inner, start, area, va)?
+            {
+                va += HUGE;
+                continue;
+            }
+            let next = (va / HUGE + 1) * HUGE;
+            let end = next.min(area.end);
+            self.fill_ptes(inner, start, area, va, end)?;
+            va = end;
+        }
+        Ok(())
+    }
+
+    /// Maps `va .. va + 2 MiB` of `area` (which starts at `start`) as one large page if
+    /// its frames are one run; whether it did.
+    fn map_large(&self, inner: &Inner, start: u64, area: &Area, va: u64) -> Result<bool, Error> {
+        let zero: Vec<UFrame>;
+        let frames: &[UFrame] = match &area.backing {
+            Backing::Object { memory, first, .. } => {
+                let skip = first + ((va - start) / PAGE_SIZE) as usize;
+                memory
+                    .frames()
+                    .get(skip..skip + HUGE_PAGES)
+                    .ok_or(Error::OutOfRange)?
+            }
+            Backing::Zero => {
+                zero = inner
+                    .zero
+                    .range(va..va + HUGE)
+                    .map(|(_, f)| f.clone())
+                    .collect();
+                &zero
+            }
+            Backing::Device { .. } => return Ok(false),
+        };
+        if !one_run(frames) {
+            return Ok(false);
+        }
+        let guard = disable_preempt();
+        let range = va as usize..(va + HUGE) as usize;
+        let mut cursor = self
+            .vm
+            .cursor_mut_huge(&guard, &range)
+            .map_err(|_| Error::InvalidArgs)?;
+        // A 4 KiB table an earlier mapping left empty may hold the large page's place.
+        // OSTD drops no table on its own, and an unmap of the range through a cursor that
+        // locks only that table cannot take it out; this cursor holds the level above, so
+        // its unmap does. Nothing is mapped in the range: the new area alone covers it.
+        cursor.unmap(HUGE_PAGE_SIZE);
+        cursor.jump(va as usize).map_err(|_| Error::InvalidArgs)?;
+        let property = PageProperty::new_user(page_flags(area.prot), CachePolicy::Writeback);
+        Ok(cursor.map_huge(frames, property).is_ok())
+    }
+
+    /// Where an object's first page sits within its large page: a mapping the kernel
+    /// places for `map::HUGE` starts at the same offset, so the runs line up.
+    fn huge_phase(backing: &Backing) -> u64 {
+        match backing {
+            Backing::Object { memory, first, .. } => memory
+                .frames()
+                .get(*first)
+                .map_or(0, |f| f.paddr() as u64 % HUGE),
+            _ => 0,
+        }
+    }
+
+    /// As `find_free`, at an address `phase` past a multiple of 2 MiB.
+    fn find_free_aligned(inner: &Inner, len: u64, phase: u64) -> Result<u64, Error> {
+        let align = |at: u64| place::aligned(at, phase, HUGE).ok_or(Error::Limit);
+        let mut candidate = align(MAP_BASE + PAGE_SIZE)?;
+        for (&start, area) in inner.areas.range(MAP_BASE..) {
+            let fits = candidate
+                .checked_add(len)
+                .and_then(|e| e.checked_add(PAGE_SIZE))
+                .is_some_and(|e| e <= start);
+            if fits {
+                break;
+            }
+            candidate = candidate.max(align(area.end + PAGE_SIZE)?);
+        }
+        let end = candidate.checked_add(len).ok_or(Error::Limit)?;
+        if end > map_end() {
+            return Err(Error::Limit);
+        }
+        Ok(candidate)
+    }
+
+    /// Checks that areas cover `va .. end` with no hole, each of them `only`'s kind if
+    /// given and none the data plane's, and that each allows `prot`.
+    fn check_cover(
+        inner: &Inner,
+        va: u64,
+        end: u64,
+        prot: u64,
+        only: Option<Kind>,
+    ) -> Result<(), Error> {
+        let first = Space::area_at(inner, va).map_or(va, |(start, _)| start);
+        let mut cursor = va;
+        for (&start, area) in inner.areas.range(first..end) {
+            if start > cursor {
+                return Err(Error::OutOfRange);
+            }
+            if only.is_some_and(|k| k != area.kind) || area.kind == Kind::Plane {
+                return Err(Error::InvalidArgs);
+            }
+            Space::check_prot(prot, &area.backing)?;
+            cursor = area.end;
+        }
+        if cursor < end {
+            return Err(Error::OutOfRange);
+        }
+        Ok(())
+    }
+
+    /// `windows_protect`: sets `prot` on the whole pages of each window, `(address,
+    /// length)`. Every window is checked first, as `protect` checks one range, so all
+    /// change or none does. The entries change in place, and one TLB flush covers every
+    /// window; it has finished on every CPU when this returns, so no write through an old
+    /// entry follows a revoke (data-os §5, the grouped revoke before the record check).
+    pub fn protect_windows(
+        &self,
+        windows: &[(u64, u64)],
+        prot: u64,
+        only: Option<Kind>,
+    ) -> Result<(), Error> {
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(windows.len())
+            .map_err(|_| Error::NoMemory)?;
+        for &(va, len) in windows {
+            ranges.push((va, Space::check_range(va, len)?));
+        }
+        ranges.sort_unstable();
+        let (Some(&(low, _)), Some(high)) = (ranges.first(), ranges.iter().map(|r| r.1).max())
+        else {
+            return Ok(());
+        };
+        let mut inner = self.inner.lock();
+        for &(va, end) in &ranges {
+            Space::check_cover(&inner, va, end, prot, only)?;
+        }
+        // Splitting at both ends of each window makes at most two areas more a window.
+        let split_bytes = ranges
+            .iter()
+            .map(|&(va, end)| Space::split_bytes(&inner, va, end))
+            .sum();
+        self.charge(&mut inner, split_bytes)?;
+        for &(va, end) in &ranges {
+            Space::split(&mut inner, va);
+            Space::split(&mut inner, end);
+        }
+        self.settle(&mut inner);
+        // The areas that had no entries (no access) get them once the rest are changed.
+        let mut fill = Vec::new();
+        for &(va, end) in &ranges {
+            for (&start, area) in inner.areas.range_mut(va..end) {
+                if area.prot & map::PROTECTION == 0 {
+                    fill.push(start);
+                }
+                area.prot = prot;
+            }
+        }
+        {
+            let guard = disable_preempt();
+            let span = low as usize..high as usize;
+            let mut cursor = self
+                .vm
+                .cursor_mut(&guard, &span)
+                .map_err(|_| Error::InvalidArgs)?;
+            let flags = page_flags(prot);
+            for &(va, end) in &ranges {
+                cursor.jump(va as usize).map_err(|_| Error::InvalidArgs)?;
+                let end = end as usize;
+                while let Some(done) = cursor.protect_next(
+                    end.saturating_sub(cursor.virt_addr()),
+                    |f: &mut PageFlags, _: &mut CachePolicy| *f = (*f - PageFlags::RWX) | flags,
+                ) {
+                    cursor
+                        .flusher()
+                        .issue_tlb_flush(TlbFlushOp::for_range(done));
+                }
+            }
+            cursor.flusher().dispatch_tlb_flush();
+            cursor.flusher().sync_tlb_flush();
+        }
+        for start in fill {
+            if let Some(area) = inner.areas.get(&start).cloned() {
+                self.fill_ptes(&inner, start, &area, start, area.end)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Maps `memory`'s first page read only where the kernel chooses, unless an area
+    /// already maps just that page so: the clock page, once a process. Returns where.
+    pub fn map_page_once(&self, memory: &Arc<MemoryObject>) -> Result<u64, Error> {
+        let mut inner = self.inner.lock();
+        let found = inner.areas.iter().find(|(start, a)| {
+            a.end - **start == PAGE_SIZE
+                && a.prot == map::READ
+                && matches!(&a.backing, Backing::Object { memory: m, first: 0, .. } if Arc::ptr_eq(m, memory))
+        });
+        if let Some((start, _)) = found {
+            return Ok(*start);
+        }
+        let va = Space::find_free(&inner, PAGE_SIZE)?;
+        let area = Area {
+            end: va + PAGE_SIZE,
+            kind: Kind::Mapping,
+            prot: map::READ,
+            backing: Backing::Object {
+                memory: memory.clone(),
+                first: 0,
+                writable: false,
+            },
+        };
+        let result = self.insert_area(&mut inner, va, area, 0);
+        drop(inner);
+        result.map(|()| va).map_err(|(e, _frames)| e)
+    }
+
+    /// The size of the page table entry that maps `addr`: 4 KiB, 2 MiB for a large page,
+    /// or zero when none does (probe ABI only).
+    #[cfg(feature = "probe")]
+    pub fn mapping_at(&self, addr: u64) -> u64 {
+        let page = addr & !(PAGE_SIZE - 1);
+        let inner = self.inner.lock();
+        if Space::area_at(&inner, page).is_none() {
+            return 0;
+        }
+        let guard = disable_preempt();
+        let range = page as usize..(page + PAGE_SIZE) as usize;
+        let Ok(mut cursor) = self.vm.cursor(&guard, &range) else {
+            return 0;
+        };
+        match cursor.query() {
+            Ok((mapped, Some(_))) => (mapped.end - mapped.start) as u64,
+            _ => 0,
+        }
+    }
+}
 
 // ---- stream B1 (personality, `architecture/data-os-streams.md`): stream B1's additions to
 // ---- `Space` go in this block; it also owns `fault` above.

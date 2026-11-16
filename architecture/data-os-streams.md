@@ -114,10 +114,26 @@ and switches to the new one when the call answers.
 
 - **Owns:**
   - `kernel/core/src/personality.rs` and `kernel/sys/src/personality.rs`;
-  - `kernel/core/src/{foreign,usercopy}.rs`;
+  - `kernel/core/src/{foreign,usercopy,futex}.rs`. `futex.rs` was added on 2026-11-16: words in a
+    memory object mapped into several processes are keyed by the object and offset, not by
+    process. B2's personality locks need that, and so do P's engine-to-task rings;
   - in `vm.rs`: `Space::fault` and the stream B1 block;
   - the stream B1 blocks in `memory.rs` and `process.rs`;
-  - the user-mode loop's syscall branch in `process.rs` (lines around 976).
+  - the user-mode loop's syscall branch in `process.rs` (lines around 976);
+  - granted on 2026-11-16, each marked as a B1 hook:
+    - in `process.rs`: one field on `Thread` and one on `Process`; `run()`'s exception and
+      kernel-event branches and its loop condition; `Thread::killed()`; `activate_current`'s
+      activation line;
+    - in `vm.rs`: one field on `Space`; `unmap_ptes`; `Backing` and its `impl`; `frame`;
+      `touch`; `fill_ptes`'s object and zero arms; `each_page`; `discard`;
+    - in `memory.rs`: `MemoryObject`'s storage, its constructors, `frames`, `read` and `write`;
+    - a boot test program, `kernel/programs/src/bin/personality.rs`, with its block at the end
+      of `kernel/initramfs/boot.image` under a `# stream B1` comment.
+
+  **Where A and B1 meet:** `fill_ptes` is B1's. Stream A reaches huge pages through its own
+  functions, called from `Space::map` and `populate`. If A needs a hook inside `fill_ptes`, it
+  adds one call line marked `// stream A hook`, and the integrator settles any conflict at
+  merge. Each stream adds its boot test block at the end of `boot.image` under its own comment.
 - **Contracts:** none of the data path's. Its measure is the kernel-mode cost in `data-os.md` §0,
   and C6's restart of a task as a fresh process.
 - **Builds:** `kernel-is-the-machine.md` §4.1:
@@ -126,6 +142,11 @@ and switches to the new one when the call answers.
   - copy-on-write snapshots and address-space clones;
   - a user pager;
   - thread state and interruption.
+
+  - shared futexes, keyed by memory object and offset for shared mappings;
+  - a fault-tolerant copy: `personality_set` registers a copy routine's range and a recovery
+    address, and a fault in that range resumes at the recovery address with the fault address in
+    `rdx`. B2 asked for this on 2026-11-16.
 
   Its first commit fixes the wrappers' arguments in `moruna_sys::personality`, so B2 can build
   against them.
@@ -175,6 +196,11 @@ and switches to the new one when the call answers.
   - `crates/moruna-runtime/src/bin/moruna-engine.rs` and the engine's adapter wiring in
     `crates/moruna-runtime/src/run.rs`;
   - `kernel/engine` (the supervisor's grants of memory and devices to the engine).
+  - the device manager's `hand_over(name)` request in `kernel/devices` (2026-11-16): for a table
+    line that starts no driver, it hands the function's resources (config, BARs, MSI, DMA) to the
+    supervisor once;
+  - a worker-start hook in `moruna-scheduler`'s worker spawn, for pinning. It is wiring, and
+    changes nothing the scheduler decides.
 - **Contracts:**
   - C2: planned reads, readahead from the scheduler's next splits, DMA into the arena, no page
     cache;
@@ -248,7 +274,8 @@ and switches to the new one when the call answers.
 - **Builds:** `moruna run JOB` on a Linux x86-64 node with KVM, which:
   - stages remote inputs on the host;
   - attaches each input as a read-only virtio-blk device and an output disk (`devices.rs`), the
-    launcher's devices of KD4;
+    launcher's devices of KD4. They are transitional virtio-blk (1af4:1001), with an input's
+    serial giving its file's length, and device-table lines that start no driver;
   - boots the VM;
   - sends the job over the vsock;
   - streams events, logs (as records on the job updates, with producer, level and line,
@@ -299,3 +326,26 @@ and switches to the new one when the call answers.
   - settles `Cargo.lock`;
   - runs the touched crates' tests and CI's boot under KVM;
   - updates `data-os.md` §0's attack-surface figures.
+
+## Integration log
+
+- **2026-11-16: stream A merged** (fast-forward to `eb4b0b07`). Its CI boot passed 170 of 170
+  checks under KVM on 1, 2 and 4 CPUs.
+  - It added three calls, two mapping flags, one probe operation, a vendored OSTD 0.19.0
+    (about 115 code lines changed) and `moruna-datapath`.
+  - It added about 670 code lines to kernel mode.
+- **Decided at that merge:**
+  - **A builds C5's tickless worker cores next.** The measurement shows the gain the design
+    asked for: a pinned core loses 3.8% to 4.5% of its time to about two interruptions a
+    millisecond, about 19 us each, even on a quiet VM.
+  - **A adds `windows_protect`'s slot form,** the ABI's doc being amended: the engine revokes a
+    task's output windows through the output slot, since it holds no handle to the task's
+    process (stream P).
+  - **A adds a booted test of `POPULATE` zero pages through `process_map`.**
+  - **B1 fixes the reclaim of empty 4 KiB tables when a 2 MiB region is unmapped** (`unmap_ptes`
+    is B1's), through a cursor locked one level up, as A's `eb4b0b07` does for large pages.
+  - **The boot manifest's `MAX_PROCESSES` rises from 32 to 64,** because the booted tests filled
+    32.
+  - **CI's kernel job host-tests `moruna-datapath` and `moruna-sys`.**
+  - **B2's proposed four-way split** (core and processes, vm, fs, images) is accepted. The new
+    streams start when B2's core compiles and a session slot is free.

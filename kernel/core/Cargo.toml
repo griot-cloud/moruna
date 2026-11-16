@@ -12,6 +12,7 @@ moruna-abi = { workspace = true, features = ["manifest"] }
 moruna-loader.workspace = true
 moruna-handles.workspace = true
 moruna-quota.workspace = true
+moruna-datapath.workspace = true
 # The free memory the frame allocator holds at boot: the machine's account is sized from
 # it (SDD 20 f.18).
 osdk-frame-allocator.workspace = true

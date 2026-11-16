@@ -1,14 +1,21 @@
-//! The clock and the deadline queue (SDD 20, f.6).
+//! The clock, its page and the deadline queue (SDD 20, f.6; data-os §2, C8).
 //!
-//! The clock is the TSC scaled to nanoseconds since boot. Deadlines live in one queue
-//! ordered by time; OSTD's 1 kHz timer interrupt pops every entry that is due, firing a
-//! timer object or waking a waiting thread. Every mutation of the queue, and of a
-//! timer's armed state, happens under the queue's lock, which disables interrupts.
+//! The clock is the TSC scaled to nanoseconds since boot: `(tsc - origin) * MULTIPLIER >>
+//! SHIFT` (`moruna_datapath::clock`). The clock page publishes that same scale (`moruna_abi::clock_page`), written
+//! once at boot, so a process that maps it reads the time with no call and agrees with
+//! `clock_get` to the nanosecond. The TSC is the one counter and the scale never changes,
+//! so the page is never written again; its sequence lets a later kernel recalibrate.
+//!
+//! Deadlines live in one queue ordered by time; OSTD's 1 kHz timer interrupt pops every
+//! entry that is due, firing a timer object or waking a waiting thread. Every mutation of
+//! the queue, and of a timer's armed state, happens under the queue's lock, which
+//! disables interrupts.
 
 use alloc::{collections::BTreeMap, sync::Arc, sync::Weak};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use moruna_abi::{DEADLINE_INFINITE, Error, Signals, charge};
+use moruna_abi::{DEADLINE_INFINITE, Error, PAGE_SIZE, Signals, charge};
+use moruna_datapath::clock as scale;
 use ostd::{
     arch::{read_tsc, tsc_freq},
     sync::{LocalIrqDisabled, SpinLock, Waker},
@@ -17,14 +24,33 @@ use ostd::{
 
 use crate::{
     account::{Account, Charge},
+    memory::MemoryObject,
     signal::Signaller,
 };
 
-static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+static MULTIPLIER: AtomicU64 = AtomicU64::new(0);
 /// The realtime clock at boot, in nanoseconds since 1970, read from the CMOS clock.
 static REALTIME_AT_BOOT: AtomicU64 = AtomicU64::new(0);
 static TSC_ORIGIN: AtomicU64 = AtomicU64::new(0);
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+/// The clock page, made at boot.
+static PAGE: SpinLock<Option<Arc<MemoryObject>>> = SpinLock::new(None);
+
+/// Makes the clock page: one page, charged to an account of its own, since it is the
+/// kernel's and no process's.
+fn make_page(origin: u64, multiplier: u64) -> Result<(), &'static str> {
+    let account = Account::machine(charge::memory(1));
+    let page = MemoryObject::new(PAGE_SIZE, &account).map_err(|_| "no page for the clock page")?;
+    page.write(0, &scale::page(origin, multiplier))
+        .map_err(|_| "the clock page could not be written")?;
+    *PAGE.lock() = Some(Arc::new(page));
+    Ok(())
+}
+
+/// The clock page, read only for every process that maps it (`clock_page`).
+pub fn page() -> Option<Arc<MemoryObject>> {
+    PAGE.lock().clone()
+}
 
 /// A queue key: the deadline and a sequence number that makes it unique.
 pub type Key = (u64, u64);
@@ -42,8 +68,11 @@ pub fn init() -> Result<(), &'static str> {
     if hz == 0 {
         return Err("the TSC frequency is unknown, so the clock cannot run");
     }
-    TSC_HZ.store(hz, Ordering::Release);
-    TSC_ORIGIN.store(read_tsc(), Ordering::Release);
+    let origin = read_tsc();
+    let multiplier = scale::multiplier(hz).ok_or("the TSC frequency is unknown")?;
+    TSC_ORIGIN.store(origin, Ordering::Release);
+    MULTIPLIER.store(multiplier, Ordering::Release);
+    make_page(origin, multiplier)?;
     REALTIME_AT_BOOT.store(rtc::read()?, Ordering::Release);
     timer::register_callback_on_cpu(tick);
     Ok(())
@@ -51,13 +80,14 @@ pub fn init() -> Result<(), &'static str> {
 
 /// Nanoseconds since the clock started.
 pub fn now() -> u64 {
-    let hz = TSC_HZ.load(Ordering::Acquire);
-    if hz == 0 {
+    let multiplier = MULTIPLIER.load(Ordering::Acquire);
+    if multiplier == 0 {
         return 0;
     }
-    let ticks = read_tsc().wrapping_sub(TSC_ORIGIN.load(Ordering::Acquire));
-    let ns = (ticks as u128 * 1_000_000_000) / hz as u128;
-    u64::try_from(ns).unwrap_or(u64::MAX - 1)
+    scale::scale(
+        read_tsc().wrapping_sub(TSC_ORIGIN.load(Ordering::Acquire)),
+        multiplier,
+    )
 }
 
 /// The realtime clock at boot, in nanoseconds since 1970.
