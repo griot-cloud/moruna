@@ -1000,11 +1000,12 @@ fn protect_inside() -> Outcome {
 // ---- A program's native calls.
 
 /// The native child's program stack, below the region; the range its personality reserves
-/// for what the core maps for its program; the first word of the batch on its slot 0.
+/// for what the core maps for its program, above the region, as stream B2's does
+/// (`linuxlayer_launch::NATIVE`); the first word of the batch on its slot 0.
 const NATIVE_STACK: u64 = CODE + 0x40_0000;
 const NATIVE_STACK_LEN: u64 = 16 * PAGE;
-const RESERVED: u64 = 0x0b00_0000_0000;
-const RESERVED_LEN: u64 = 1 << 30;
+const RESERVED: u64 = 0x7000_0000_0000;
+const RESERVED_LEN: u64 = 0x0f00_0000_0000;
 const BATCH_WORD: u64 = 0x3130_2068_6374_6162;
 
 /// What the personality hands its program: the granted object's value in the program's
