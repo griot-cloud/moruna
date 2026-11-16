@@ -264,33 +264,6 @@ impl Process {
         self.forward.lock().clone()
     }
 
-    /// Maps `len` bytes of `object` from `offset` into this process where the kernel
-    /// chooses (`memory_map`); returns where.
-    pub fn map_memory(
-        &self,
-        object: &Arc<MemoryObject>,
-        offset: u64,
-        len: u64,
-        write: bool,
-        execute: bool,
-        writable: bool,
-    ) -> Result<u64, Error> {
-        let first = (offset / PAGE_SIZE) as usize;
-        let backing = Backing::Object {
-            memory: object.clone(),
-            first,
-            writable,
-        };
-        self.space.map(
-            None,
-            len,
-            Kind::Mapping,
-            prot(write, execute),
-            backing,
-            false,
-        )
-    }
-
     /// Maps `len` bytes of a device memory region from `offset`, uncached.
     pub fn map_device(
         &self,

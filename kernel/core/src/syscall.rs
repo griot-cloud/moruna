@@ -532,9 +532,10 @@ fn memory_map(p: &Process, value: u64, offset: u64, len: u64, flags: u64) -> Ret
     }
     let writable = handle.rights.contains(Rights::WRITE);
     let va = match &handle.object {
-        Object::Memory(m) => p.map_memory(m, offset, len, write, execute, writable)?,
+        Object::Memory(m) => datapath::map_memory(p, m, offset, len, flags, writable)?,
         Object::DeviceMemory(d) => {
-            if execute {
+            // Device memory is uncached I/O: no large pages, and always present.
+            if execute || flags & (map::HUGE | map::POPULATE) != 0 {
                 return Err(Error::InvalidArgs.into());
             }
             p.map_device(d, offset, len, write, writable)?
@@ -1019,14 +1020,9 @@ fn process_map(p: &Process, a: [u64; 6]) -> Ret {
     if fixed && at.is_none() {
         return Err(Error::InvalidArgs.into());
     }
-    let va = target.space.map(
-        at,
-        len,
-        Kind::Mapping,
-        flags & map::PROTECTION,
-        backing,
-        fixed,
-    )?;
+    let va = target
+        .space
+        .map(at, len, Kind::Mapping, flags & !map::FIXED, backing, fixed)?;
     one(va)
 }
 
@@ -1309,6 +1305,8 @@ fn plane_probe(p: &Process, op: u64, arg: u64) -> Ret {
     match op {
         probe::FRAME => one(p.space.frame_at(arg)?),
         probe::COPIED => one(p.space.copied()),
+        probe::MAPPING => one(p.space.mapping_at(arg)),
+        probe::TABLE => one(p.space.table_gap(arg)),
         probe::OBJECT_FRAME => {
             let memory = typed(p, arg & 0xffff_ffff, Rights::READ, as_memory)?;
             let page = (arg >> 32) as usize;

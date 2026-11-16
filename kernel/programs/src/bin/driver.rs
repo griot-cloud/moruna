@@ -35,10 +35,22 @@ fn run() -> i64 {
     let gsi = u64::from_le_bytes(word) as u32;
 
     match DeviceMemory::create(&device, window, 4096) {
-        Ok(region) => match region.map(0, 4096, map::WRITE) {
-            Ok(mapping) => drop(mapping),
-            Err(e) => return fail(&out, "mapping its page", e),
-        },
+        Ok(region) => {
+            // DS-A: device memory takes neither large pages nor POPULATE.
+            for flag in [map::HUGE, map::POPULATE] {
+                if !matches!(region.map(0, 4096, flag), Err(Error::InvalidArgs)) {
+                    return fail(
+                        &out,
+                        "device memory mapped HUGE or POPULATE",
+                        Error::BadState,
+                    );
+                }
+            }
+            match region.map(0, 4096, map::WRITE) {
+                Ok(mapping) => drop(mapping),
+                Err(e) => return fail(&out, "mapping its page", e),
+            }
+        }
         Err(e) => return fail(&out, "claiming its page", e),
     }
     for (what, page) in [

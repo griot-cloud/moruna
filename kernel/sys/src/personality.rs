@@ -336,6 +336,13 @@ pub fn thread_interrupt(thread: &Thread) -> Result<()> {
     check(raw::call1(nr::THREAD_INTERRUPT, thread.0.raw() as u64).0).map(|_| ())
 }
 
+/// The bytes of the hole holding `addr` at the deepest page table this process has there
+/// (`plane_probe`'s `TABLE`; a kernel built with its `probe` feature): 4096 where a 4 KiB table
+/// holds it, 2 MiB where only the table above does, and so on; zero where a page is mapped.
+pub fn table_gap(addr: u64) -> Result<u64> {
+    check(raw::call2(nr::PLANE_PROBE, moruna_abi::plane::probe::TABLE, addr).0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

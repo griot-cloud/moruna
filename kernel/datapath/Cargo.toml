@@ -1,0 +1,10 @@
+[package]
+name = "moruna-datapath"
+description = "The Moruna microkernel's data-path mechanisms, the part that is arithmetic and so is tested on the host: the clock page's scale, large-page runs, window lists and placement"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-abi.workspace = true

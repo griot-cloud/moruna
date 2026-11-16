@@ -68,16 +68,7 @@ impl MemoryObject {
         let pages = size.div_ceil(PAGE_SIZE) as usize;
         // Charged before anything is allocated, so a refusal allocates nothing.
         let charge = Charge::new(account, charge::memory(pages as u64))?;
-        let mut frames = Vec::new();
-        frames
-            .try_reserve_exact(pages)
-            .map_err(|_| Error::NoMemory)?;
-        let mut options = FrameAllocOptions::new();
-        options.zeroed(true);
-        for _ in 0..pages {
-            let frame = options.alloc_frame().map_err(|_| Error::NoMemory)?;
-            frames.push(frame.into());
-        }
+        let frames = MemoryObject::large_frames(pages)?;
         Ok(MemoryObject {
             frames,
             size: pages as u64 * PAGE_SIZE,
@@ -196,7 +187,37 @@ impl MemoryObject {
 
 // ---- stream A (data path, `architecture/data-os-streams.md`): stream A's additions to
 // ---- `MemoryObject` (large frames) go in this block.
-impl MemoryObject {}
+
+/// The pages of a large page (2 MiB).
+const RUN_PAGES: usize = ostd::mm::HUGE_PAGE_SIZE / PAGE;
+
+impl MemoryObject {
+    /// `pages` zeroed frames for an object, in aligned 2 MiB runs while a whole run
+    /// remains, so that `map::HUGE` maps them as large pages (data-os §2, C4); single
+    /// frames for the rest, and for a run the allocator has no aligned space for. The
+    /// same pages as single frames, charged the same.
+    pub fn large_frames(pages: usize) -> Result<Vec<UFrame>, Error> {
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(pages)
+            .map_err(|_| Error::NoMemory)?;
+        let mut options = FrameAllocOptions::new();
+        options.zeroed(true);
+        moruna_datapath::frames::fill(
+            &mut frames,
+            pages,
+            RUN_PAGES,
+            || options.alloc_segment(RUN_PAGES).ok().map(USegment::from),
+            || {
+                options
+                    .alloc_frame()
+                    .map(Into::into)
+                    .map_err(|_| Error::NoMemory)
+            },
+        )?;
+        Ok(frames)
+    }
+}
 
 // ---- stream B1 (personality, `architecture/data-os-streams.md`): stream B1's additions to
 // ---- `MemoryObject` (snapshots, pager-backed objects) go in this block.
