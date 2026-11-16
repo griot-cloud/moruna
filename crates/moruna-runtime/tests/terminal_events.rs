@@ -327,7 +327,9 @@ fn events_in(text: &Arc<Mutex<Vec<u8>>>) -> Vec<Value> {
 /// The property, on one run's events: each task is told its states in order (PY-I12,
 /// [`told_in_order`]); every registered task ends exactly once (PY-I11); a task that
 /// started ends completed or failed, never skipped; nothing is told of a task after its end;
-/// and a failed task carries its cause.
+/// and a failed task carries its cause. A `log` event is a record of what the task printed, not
+/// a fact of its lifecycle, and may come after its end (stream D: the job updates carry the
+/// logs, and output written before the end is drained after it).
 fn one_end_each(events: &[Value], what: &str) {
     told_in_order(events, what);
     let registered: Vec<String> = events
@@ -340,7 +342,7 @@ fn one_end_each(events: &[Value], what: &str) {
         let told: Vec<(usize, &Value)> = events
             .iter()
             .enumerate()
-            .filter(|(_, e)| e["task"] == task.as_str())
+            .filter(|(_, e)| e["task"] == task.as_str() && e["kind"] != "log")
             .collect();
         let ends: Vec<&(usize, &Value)> = told
             .iter()
@@ -801,7 +803,10 @@ fn told_in_order(events: &[Value], what: &str) {
         .filter_map(|e| e["task"].as_str())
         .collect();
     for task in registered {
-        let told: Vec<&Value> = events.iter().filter(|e| e["task"] == task).collect();
+        let told: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["task"] == task && e["kind"] != "log")
+            .collect();
         let kinds: Vec<&str> = told.iter().filter_map(|e| e["kind"].as_str()).collect();
         let count = |kind: &str| kinds.iter().filter(|k| **k == kind).count();
         let at = |kind: &str| kinds.iter().position(|k| *k == kind);

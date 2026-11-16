@@ -3,7 +3,15 @@
 
 The profile is operator input. Canonical Rust parsers validate the generated files
 again during package.py. No boot or hardware success is asserted by rendering.
+
+An optional profile field `data_disks` ({"inputs": [NAME, ...], "output_bytes": N}) declares
+the engine's data disks (stream D, `crates/moruna-micro/src/devices.rs`): input i is the
+device manager's `datai` (a transitional virtio-blk the device table starts no driver for),
+granted to the engine as `disk.in.NAME`, and the output disk, when `output_bytes` is not zero,
+is the next one, granted as `disk.out`. The device manager's `control.engine` listener is
+linked to the engine's supervisor (`handover`) and to nothing else.
 """
+import re
 import argparse
 import json
 from pathlib import Path
@@ -34,8 +42,12 @@ def main():
     except (OSError, ValueError) as error:
         parser.error(f"cannot read profile: {error}")
     expected = {"version", "node_memory_bytes", "cpus", "agent_port", "job_memory_bytes", "job_account_bytes", "scratch_bytes", "engine_program", "service_accounts", "storage_provider"}
-    if not isinstance(profile, dict) or set(profile) != expected or type(profile["version"]) is not int or profile["version"] != 1:
+    if not isinstance(profile, dict) or set(profile) - {"data_disks"} != expected or type(profile["version"]) is not int or profile["version"] != 1:
         parser.error("unknown or missing profile fields/version")
+    data_disks = profile.get("data_disks", {"inputs": [], "output_bytes": 0})
+    data_error = check_data_disks(data_disks)
+    if data_error:
+        parser.error(f"data_disks: {data_error}")
     unified = profile["storage_provider"] == "local-single-node-home"
     local_inputs=(args.local_config,args.checkpoint_admission,args.cache_admission,args.cache_key)
     if unified:
@@ -114,12 +126,21 @@ def main():
         "link linux listen-engine admission initial.linux", "link network listen-engine admission initial.network",
     ]
     node += [f"link storage storage.authority admission {'local-home.authority' if unified else 'storage.authority'}"]
+    data_inputs = data_disks["inputs"]
+    data_output = data_disks["output_bytes"] > 0
+    if data_inputs or data_output:
+        node += ["link devices control.engine admission initial.handover"]
     if provider == "bucket":
         node += ["grant storage storage.credential storage.credential", "link network listen-storage storage storage.network-listener"]
     else:
         node += ["link devices directory-storage storage storage.block-directory"]
     extra_initial = []
     extra_engine = []
+    if data_inputs or data_output:
+        extra_initial.append("grant handover initial.handover")
+        extra_engine += [f"grant disk.in.{name} disk data{index}" for index, name in enumerate(data_inputs)]
+        if data_output:
+            extra_engine.append(f"grant disk.out disk data{len(data_inputs)}")
     if unified:
         node += ["grant storage storage.key cache.key", "grant admission initial.checkpoint-binding checkpoint.admission", "grant admission initial.cache-binding cache.admission"]
         extra_initial += ["grant checkpoint.binding initial.checkpoint-binding", "grant cache.binding initial.cache-binding"]
@@ -171,6 +192,28 @@ def main():
     with (args.out / "initial.job").open("a") as output: output.write("\n".join(extra_initial) + ("\n" if extra_initial else ""))
     with (args.out / "engine.conf").open("a") as output: output.write("\n".join(extra_engine) + ("\n" if extra_engine else ""))
     (args.out / "profile.json").write_text(json.dumps(profile, indent=2) + "\n")
+
+
+DATA_NAME = re.compile(r"[a-z0-9._-]{1,24}")
+# The most data disks a run attaches (moruna-vmm's `data::DISKS_MAX`): each is a handle on the
+# engine's start page and a grant line of its one-page configuration.
+DATA_DISKS_MAX = 40
+
+
+def check_data_disks(data):
+    """Why a `data_disks` profile field cannot be built, or None."""
+    if not isinstance(data, dict) or set(data) != {"inputs", "output_bytes"}:
+        return "an object of exactly inputs and output_bytes"
+    inputs, output = data["inputs"], data["output_bytes"]
+    if not isinstance(inputs, list) or any(not isinstance(n, str) or not DATA_NAME.fullmatch(n) for n in inputs):
+        return "inputs are names of 1 to 24 of [a-z0-9._-]"
+    if len(set(inputs)) != len(inputs):
+        return "an input is named twice"
+    if type(output) is not int or output < 0 or output % 4096 or output > 1 << 40:
+        return "output_bytes is whole pages, at most 1 TiB, or 0 for none"
+    if len(inputs) + (output > 0) > DATA_DISKS_MAX:
+        return f"at most {DATA_DISKS_MAX} data disks"
+    return None
 
 
 if __name__ == "__main__":

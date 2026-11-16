@@ -4,8 +4,10 @@
 //! QEMU supplies the existing q35 PCI and Multiboot boot boundary.
 use crate::{
     Budget,
+    data::{self, DataDisks, RunDevices},
     error::{Result, VmmError},
     jail::{self, Cgroup},
+    placement::{Placed, Placement},
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -212,7 +214,13 @@ pub struct MicrokernelArtifacts {
     pub agent_port: u32,
     /// Checked fixed initial-job/node resources; no dynamic run-config mutation.
     pub resources: Resources,
+    /// The data disks the image's engine is granted (`crate::data`): its inputs by name, in
+    /// device order, and its output disk's size. Absent: none.
+    #[serde(default)]
+    pub data_disks: DataDisks,
 }
+/// The PCI slots on the root bus a node's devices share: 0x01 to 0x1e, less the vsock's 0x06.
+const PCI_SLOTS: usize = 29;
 fn bad(message: impl Into<String>) -> VmmError {
     VmmError::config("microkernel", message)
 }
@@ -257,6 +265,16 @@ pub fn inspect(descriptor: &Path) -> Result<MicrokernelArtifacts> {
         return Err(bad(
             "unsupported or inconsistent node resource/artifact contract",
         ));
+    }
+    artifacts.data_disks.check()?;
+    let devices = artifacts.layers.len()
+        + artifacts.writable_disks.len()
+        + usize::from(artifacts.user_network)
+        + data::slots_for(artifacts.data_disks.count());
+    if devices > PCI_SLOTS {
+        return Err(bad(format!(
+            "{devices} PCI devices; a node has {PCI_SLOTS} slots for its layers, disks and network"
+        )));
     }
     Ok(artifacts)
 }
@@ -378,10 +396,16 @@ pub struct RunningNode {
     uds: PathBuf,
     agent_port: u32,
     _disk_leases: Vec<File>,
+    _data_leases: Vec<File>,
     qmp: PathBuf,
     run: RunDir,
+    placed: Option<Placed>,
 }
 impl RunningNode {
+    /// Where the vCPUs were placed, when the run asked for a placement (`crate::placement`).
+    pub fn placed(&self) -> Option<&Placed> {
+        self.placed.as_ref()
+    }
     /// Declared runtime service port; readiness still requires a real connection.
     pub fn agent_port(&self) -> u32 {
         self.agent_port
@@ -641,6 +665,7 @@ pub fn launch(
         cgroup,
         Acceleration::Kvm,
         None,
+        &RunDevices::default(),
     )
 }
 
@@ -655,6 +680,31 @@ pub fn launch_for_run(
     cgroup: &Cgroup,
     run: &RunAuthority,
 ) -> Result<RunningNode> {
+    launch_with(
+        descriptor,
+        budget,
+        runtime_dir,
+        qemu,
+        vhost_backend,
+        cgroup,
+        run,
+        &RunDevices::default(),
+    )
+}
+
+/// [`launch_for_run`] with the run's own devices: the data disks the image declares, bound to
+/// the run's files, and where its vCPUs run (`crate::data`, `crate::placement`).
+#[allow(clippy::too_many_arguments)]
+pub fn launch_with(
+    descriptor: &Path,
+    budget: Budget,
+    runtime_dir: &Path,
+    qemu: &Path,
+    vhost_backend: &Path,
+    cgroup: &Cgroup,
+    run: &RunAuthority,
+    devices: &RunDevices,
+) -> Result<RunningNode> {
     launch_owned(
         descriptor,
         budget,
@@ -664,6 +714,7 @@ pub fn launch_for_run(
         cgroup,
         Acceleration::Kvm,
         Some(run),
+        devices,
     )
 }
 
@@ -689,6 +740,7 @@ pub fn launch_tcg_proof(
         cgroup,
         Acceleration::TcgProof,
         None,
+        &RunDevices::default(),
     )
 }
 
@@ -704,6 +756,31 @@ pub fn launch_tcg_proof_for_run(
     cgroup: &Cgroup,
     run: &RunAuthority,
 ) -> Result<RunningNode> {
+    launch_tcg_proof_with(
+        descriptor,
+        budget,
+        runtime_dir,
+        qemu,
+        vhost_backend,
+        cgroup,
+        run,
+        &RunDevices::default(),
+    )
+}
+
+/// [`launch_tcg_proof_for_run`] with the run's own devices, as [`launch_with`] attaches them.
+#[cfg(feature = "native-tcg-proof")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_tcg_proof_with(
+    descriptor: &Path,
+    budget: Budget,
+    runtime_dir: &Path,
+    qemu: &Path,
+    vhost_backend: &Path,
+    cgroup: &Cgroup,
+    run: &RunAuthority,
+    devices: &RunDevices,
+) -> Result<RunningNode> {
     launch_owned(
         descriptor,
         budget,
@@ -713,6 +790,7 @@ pub fn launch_tcg_proof_for_run(
         cgroup,
         Acceleration::TcgProof,
         Some(run),
+        devices,
     )
 }
 
@@ -818,6 +896,7 @@ fn launch_owned(
     cgroup: &Cgroup,
     acceleration: Acceleration,
     run: Option<&RunAuthority>,
+    devices: &RunDevices,
 ) -> Result<RunningNode> {
     acceleration.check_host()?;
     let qemu = jail::resolve_program(qemu)?;
@@ -828,6 +907,7 @@ fn launch_owned(
     let artifacts = inspect(&descriptor)?;
     authorize_disks(&artifacts.writable_disks, run)?;
     let budget = artifacts.resources.admit(budget)?;
+    let placement = placement_for(devices, budget.cpus)?;
     if artifacts.kernel.bytes > 256 * 1024 * 1024
         || artifacts.initramfs.bytes >= budget.memory_bytes / 2
     {
@@ -979,6 +1059,8 @@ fn launch_owned(
         writable.push((path, disk.serial.clone(), disk.access));
         disk_leases.push(file);
     }
+    let data_disks = data::open(&artifacts.data_disks, devices)?;
+    let data_args = data::qemu_args(&data_disks)?;
     // Each socket lives in a directory of its own, so each jail is shown only the sockets it
     // uses: QEMU its QMP socket and the back end's vhost-user socket, the back end that socket
     // and the host side of the guest's vsock.
@@ -1069,6 +1151,12 @@ fn launch_owned(
         "-no-reboot",
         "-nodefaults",
     ]);
+    // Named threads (`CPU N/KVM`) are how a placement finds the vCPUs; a placed run starts
+    // paused until they are placed.
+    push(&["-name", "moruna,debug-threads=on"]);
+    if placement.is_some() {
+        push(&["-S"]);
+    }
     push(&[
         "-m",
         &format!("{}M", budget.memory_bytes / (1024 * 1024)),
@@ -1090,6 +1178,9 @@ fn launch_owned(
         "-device",
         "vhost-user-vsock-pci,chardev=vsock0,addr=0x6",
     ]);
+    // The data disks take their fixed slots before any device is given the next free one.
+    args.extend(data_args.iter().map(std::ffi::OsString::from));
+    let mut push = |items: &[&str]| args.extend(items.iter().map(|a| std::ffi::OsString::from(*a)));
     push(&["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     push(&["-kernel", &kernel.display().to_string()]);
     push(&["-initrd", &initramfs.display().to_string()]);
@@ -1112,6 +1203,14 @@ fn launch_owned(
         path: vsock_dir,
         access: jail::Access::Read,
     });
+    for disk in &data_disks {
+        let access = if disk.writable {
+            jail::Access::Write
+        } else {
+            jail::Access::Read
+        };
+        qemu_entries.push(file_entry(&disk.path, access));
+    }
     for (index, disk) in disks.iter().enumerate() {
         push(&[
             "-drive",
@@ -1162,15 +1261,92 @@ fn launch_owned(
             .map_err(|e| VmmError::io("create", "QEMU log", &e))?,
         cgroup: leaf,
     })?;
-    Ok(RunningNode {
+    let mut node = RunningNode {
         qemu: Mutex::new(qemu),
         backend: Mutex::new(backend),
         uds,
         agent_port: artifacts.agent_port,
         _disk_leases: disk_leases,
+        _data_leases: data_disks.into_iter().map(|d| d.lease).collect(),
         qmp,
         run,
-    })
+        placed: None,
+    };
+    if let Some(placement) = placement {
+        // Dropping the node on an error kills and reaps both processes.
+        node.placed = Some(place_and_start(&node, &placement)?);
+    }
+    Ok(node)
+}
+
+/// The run's placement checked against the node's `cpus` and this process's own CPUs; `None`
+/// when the run names none.
+fn placement_for(devices: &RunDevices, cpus: u32) -> Result<Option<Placement>> {
+    if devices.vcpu_cpus.is_empty() {
+        return Ok(None);
+    }
+    #[cfg(target_os = "linux")]
+    let (online, allowed) = (
+        crate::placement::online_cpus()?,
+        crate::placement::allowed_cpus()?,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let (online, allowed): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    Placement::check(&devices.vcpu_cpus, cpus, &online, &allowed).map(Some)
+}
+
+/// Place the paused node's vCPUs and its other threads, then let the guest run.
+#[cfg(target_os = "linux")]
+fn place_and_start(node: &RunningNode, placement: &Placement) -> Result<Placed> {
+    let [qemu, backend] = node.processes();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let placed = crate::placement::place(placement, qemu, &[backend], deadline, &|| node.alive())?;
+    qmp_execute(&node.qmp, "cont", deadline)?;
+    Ok(placed)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn place_and_start(_node: &RunningNode, _placement: &Placement) -> Result<Placed> {
+    Err(bad("a vCPU placement needs Linux"))
+}
+
+/// Run one QMP command on the node's QMP socket and wait for its answer.
+#[cfg(target_os = "linux")]
+fn qmp_execute(path: &Path, command: &str, deadline: Instant) -> Result<()> {
+    let stream = loop {
+        match UnixStream::connect(path) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Err(e) => return Err(VmmError::io("connect", "owned QMP", &e)),
+        }
+    };
+    let wait = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(100));
+    stream
+        .set_read_timeout(Some(wait))
+        .map_err(|e| VmmError::io("timeout", "QMP", &e))?;
+    stream
+        .set_write_timeout(Some(wait))
+        .map_err(|e| VmmError::io("timeout", "QMP", &e))?;
+    let mut reader = BufReader::new(stream);
+    if qmp_reply(&mut reader)?.get("QMP").is_none() {
+        return Err(bad("owned QMP omitted greeting"));
+    }
+    for line in [
+        "{\"execute\":\"qmp_capabilities\"}\r\n".to_string(),
+        format!("{{\"execute\":\"{command}\"}}\r\n"),
+    ] {
+        reader
+            .get_mut()
+            .write_all(line.as_bytes())
+            .map_err(|e| VmmError::io("write", "QMP", &e))?;
+        let reply = qmp_reply(&mut reader)?;
+        if reply.get("return").is_none() {
+            return Err(bad(format!("QMP refused {command}: {reply}")));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1465,6 +1641,73 @@ mod tests {
                 .is_err()
         );
     }
+    /// Stream D: a descriptor may declare the engine's data disks; one without them still
+    /// reads, and one whose devices do not fit the root bus is refused.
+    #[test]
+    fn a_descriptor_declares_its_data_disks_within_the_pci_slots() {
+        let dir = std::env::temp_dir().join(format!(
+            "moruna-descriptor-data-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let artifact = serde_json::json!({"path": "k", "bytes": 1, "sha256": "0".repeat(64)});
+        let descriptor = |extra: serde_json::Value, layers: usize| {
+            let mut d = serde_json::json!({
+                "version": 1, "architecture": "x86_64", "boot_mode": "multiboot2",
+                "kernel": artifact, "initramfs": artifact,
+                "layers": vec![serde_json::json!({"artifact": artifact}); layers],
+                "writable_disks": [], "user_network": false, "cid": 3, "agent_port": 5100,
+                "resources": {"node_memory_bytes": 3u64 << 30, "job_memory_bytes": 1u64 << 30,
+                    "job_account_bytes": 1408u64 << 20, "scratch_bytes": 256u64 << 20, "cpus": 2}
+            });
+            if !extra.is_null() {
+                d["data_disks"] = extra;
+            }
+            let path = dir.join("node-image.json");
+            fs::write(&path, serde_json::to_vec(&d).unwrap()).unwrap();
+            inspect(&path)
+        };
+        assert_eq!(
+            descriptor(serde_json::Value::Null, 2).unwrap().data_disks,
+            DataDisks::default()
+        );
+        let declared = descriptor(
+            serde_json::json!({"inputs": ["nyc"], "output_bytes": 1u64 << 30}),
+            2,
+        )
+        .unwrap()
+        .data_disks;
+        assert_eq!(declared.inputs, ["nyc"]);
+        assert_eq!(declared.count(), 2);
+        assert!(descriptor(serde_json::json!({"inputs": ["Bad"], "output_bytes": 0}), 2).is_err());
+        let full: Vec<String> = (0..39).map(|i| format!("i{i}")).collect();
+        descriptor(
+            serde_json::json!({"inputs": full, "output_bytes": 4096}),
+            16,
+        )
+        .unwrap();
+        let over: Vec<String> = (0..40).map(|i| format!("i{i}")).collect();
+        let e = descriptor(serde_json::json!({"inputs": over, "output_bytes": 4096}), 2)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("at most 40"), "{e}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_placement_is_refused_before_anything_starts_where_it_cannot_hold() {
+        assert_eq!(placement_for(&RunDevices::default(), 2).unwrap(), None);
+        let devices = RunDevices {
+            vcpu_cpus: vec![0],
+            ..RunDevices::default()
+        };
+        assert!(placement_for(&devices, 2).is_err(), "one host CPU per vCPU");
+    }
+
     #[test]
     fn legacy_linux_image_config_is_not_a_native_descriptor() {
         assert!(

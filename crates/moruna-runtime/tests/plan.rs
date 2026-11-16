@@ -604,7 +604,8 @@ fn pn_t25_explain_and_run_from_the_plan_it_wrote() {
         &["explain", "a", "--planner"][..],
         &["explain", "a", "--out"][..],
         &["run", "a", "--plan"][..],
-        &["run", "--vm", "a", "--image", "/i", "--plan", "p"][..],
+        // Stream D: a VM run's launch witness has a default now; its plan still needs a path.
+        &["run", "--vm", "a", "--image", "/i", "--plan"][..],
     ] {
         assert!(
             moruna_runtime::host::cli::parse(&args(bad)).is_err(),

@@ -168,7 +168,12 @@ impl Events {
                 };
                 let mut encoder = Encoder::new();
                 let mut seq = 0u64;
+                // Facts are told from several threads; a fact told after another is never
+                // stamped before it, so a peer's time runs forward.
+                let mut last_t = 0u64;
                 while let Ok(Some((t_us, body))) = rx.recv() {
+                    let t_us = t_us.max(last_t);
+                    last_t = t_us;
                     match encoder.encode(&meta.stamp(), seq + 1, meta.ts_ns(t_us), t_us, &body) {
                         Ok(record) => {
                             seq += 1;

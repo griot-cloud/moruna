@@ -8,10 +8,12 @@
 
 pub mod cli;
 pub mod events;
+pub mod inputs;
 pub mod launch_witness;
 pub mod lifecycle;
 pub mod logs;
 pub mod native;
+pub mod outputs;
 pub mod ports;
 pub mod protocol;
 pub mod session;

@@ -575,6 +575,30 @@ mod ownership_tests {
         .unwrap();
         assert!(!data.grants[0].listener);
     }
+    /// Stream D: the data disks' hand-over, as configure.py renders it. The device manager's
+    /// `control.engine` listener is linked to admission's `initial.handover`, which the initial
+    /// job grants to the engine's supervisor as `handover`, a plain grant, not a retained
+    /// service.
+    #[test]
+    fn the_data_disks_handover_is_linked_to_the_engine_alone() {
+        let node = Config::parse(
+            b"moruna-node 1\nservice devices image.devices 4096\nservice admission image.admission 8192\n\
+              bootstrap devices devices\nbootstrap admission admission\n\
+              link devices control.engine admission initial.handover\n",
+            1 << 20,
+        )
+        .unwrap();
+        assert_eq!(node.links.len(), 1);
+        assert_eq!(node.links[0].left_slot, "control.engine");
+        assert_eq!(node.links[0].right_slot, "initial.handover");
+        let job = InitialJob::parse(
+            b"moruna-node-job 1\nbudget 8192\ngrant directory initial.directory\n\
+              grant handover initial.handover\n",
+        )
+        .unwrap();
+        assert_eq!(job.grants[1].slot, "handover");
+        assert!(!job.grants[1].listener);
+    }
     #[test]
     fn initial_job_has_explicit_budget_and_unique_capability_sources() {
         assert!(

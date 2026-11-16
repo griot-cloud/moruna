@@ -14,6 +14,7 @@ pub mod cli;
 mod config;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod control;
+pub mod data;
 #[cfg(any(target_os = "linux", all(test, target_arch = "x86_64")))]
 pub mod devices;
 pub mod error;
@@ -30,6 +31,7 @@ mod loader;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod machine;
 pub mod microkernel;
+pub mod placement;
 pub mod session;
 pub mod sys;
 #[cfg(all(test, target_arch = "x86_64"))]
