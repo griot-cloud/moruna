@@ -193,10 +193,10 @@ and switches to the new one when the call answers.
   Sockets and the cloud platform stay out.
 - **Tests:**
   - host tests of the carried logic;
-  - then booted: static musl, dynamic glibc, CPython 3.14 importing NumPy and pyarrow (no shell), and
-    the gVisor system-call tests that apply.
+  - then booted: static musl and dynamic glibc (no shell), and the gVisor system-call tests that
+    apply. CPython is not a 0.7.0 target (Brackly, 2026-11-16).
 - **Done when:**
-  - the gate's Python image runs as an image task on it under KVM;
+  - static musl and dynamic glibc programs, and a forking one, run on it under KVM;
   - the engine runs on it;
   - `kernel/linux` can be retired. The integrator retires it at merge.
 - **Size:** the largest stream. About 137,000 lines, about 82% mechanical. If it needs to split
@@ -274,8 +274,9 @@ and switches to the new one when the call answers.
   - the `COPIED` counter and an engine boundary-copy counter stay at zero through N image
     stages;
   - no call per batch, counted.
-- **Done when:** a Python image task runs a batch function under KVM with no boundary copy and
-  no call per batch in steady state, and its rows match.
+- **Done when:** a native Rust task (`moruna_sys::plane`) runs a batch function under KVM with
+  no boundary copy and no call per batch in steady state, and its rows match. The Python shim
+  stays in `images/python/` for later (`arrow-core-0.7.md` §8) and is not part of the proof.
 
 ### D. The host side
 
@@ -312,20 +313,22 @@ and switches to the new one when the call answers.
     `crates/moruna-py/tests/fixtures/kd3-matrix.json`);
   - `kernel/node/tools/proof.py`;
   - `kernel/tools/node-fixtures.sh`;
-  - a new `images/gate/` for the gate's images.
+  - a new `images/gate/` for the gate's tasks.
 - **Contracts:** measures every contract's gain as `data-os.md` §1a names it (copies, faults,
   calls per batch, interrupts on worker cores, bytes through a page cache), against 0.6.6 and
   against today's microkernel figures from step 1.
 - **Builds:**
   - a KVM mode for the node fixtures (`proof.py` forces TCG today, line 356);
   - KD3's conformance on the data OS (same rows, refusals and decisions as on a Linux host);
-  - the gate's Python image (CPython 3.14 with NumPy and pyarrow, 0.6.6's kernels unchanged,
-    P's shim);
-  - the harness's data OS mode: 0.6.6's jobs through `moruna run` on `moruna-bench`, against
-    0.6.6, on the PM's terms (`arrow-core-0.7.md` §9).
+  - the seven jobs' functions ported to Rust as native tasks on `moruna_sys::plane`, each
+    producing 0.6.6's output rows (count and content hash) from 0.6.6's input. A float column
+    that cannot match bit for bit is named with its tolerance before it is measured;
+  - the harness's data OS mode: each job through `moruna run` on `moruna-bench`, timed against
+    0.6.6 on the same data (`arrow-core-0.7.md` §9).
 - **Tests:** the harness's own unit tests, and the fixtures under KVM.
-- **Done when:** the gate runs end to end on `moruna-bench` for the NYC set, with identical rows,
-  boot reported, and both machine types ready, and hands its numbers to the PM.
+- **Done when:** the gate runs end to end on `moruna-bench` for the NYC set, then the large
+  jobs, with identical rows, boot reported, and both machine types ready, and hands its numbers
+  to the PM.
 
 ## Order and dependencies
 
@@ -334,7 +337,7 @@ and switches to the new one when the call answers.
 - **Hard dependencies:**
   - B2's entry loop needs B1's wrappers (B1's first commit);
   - the gate needs C, P and D;
-  - the gate's Python image runs on B2's personality, or on today's personality until B2 lands.
+  - the gate's tasks are native Rust, so the gate does not wait on B2.
 - **Merge order** into `feature/arrow-core-0.7`: A and B1 first (the kernel), then C and P, then
   D, then B2 (with `kernel/linux` retired), and E throughout.
 - **The integrator,** at each merge:
@@ -426,3 +429,10 @@ and switches to the new one when the call answers.
     - no shell as the engine's program, and outputs laid out in the scratch.
   - Coverage: arena 93.1%, runtime 87.0%.
   - **Waits on D:** the `disk://` job under KVM.
+- **2026-11-16: the gate is the jobs' functions in Rust** (Brackly: "we have data, then a
+  function, then producing some other data; we're supposed to measure that, simple").
+  - E ports the seven functions to Rust as native tasks; same input, 0.6.6's output rows, timed
+    against 0.6.6.
+  - No Python on the gate's path: P's proof is a native Rust task, and B2's 0.7.0 targets are
+    musl and glibc. CPython waits for `arrow-core-0.7.md` §8.
+  - The gate needs C, P, D and E, and no longer waits on B2.
