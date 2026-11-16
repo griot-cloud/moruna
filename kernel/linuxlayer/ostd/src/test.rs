@@ -96,7 +96,10 @@ fn rwlock_readers_writers_and_upgrade() {
     drop(reader);
     let mut w = up.upgrade();
     *w += 1;
-    drop(w);
+    let up = w.downgrade();
+    assert_eq!(*up, 15_001);
+    let reader = lock.read();
+    drop((up, reader));
     t.join().unwrap();
     assert_eq!(*lock.read(), 15_002);
 }

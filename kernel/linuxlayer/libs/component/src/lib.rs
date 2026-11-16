@@ -10,6 +10,9 @@
 #![no_std]
 
 extern crate alloc;
+// The attribute names `::component`, which is this crate in its own tests.
+#[cfg(test)]
+extern crate self as component;
 
 use alloc::vec::Vec;
 
@@ -108,4 +111,49 @@ pub fn registered(stage: InitStage) -> impl Iterator<Item = &'static str> {
         .into_iter()
         .filter(move |c| c.stage == stage)
         .map(|c| c.path)
+}
+
+#[cfg(test)]
+mod test {
+    extern crate std;
+
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    static ORDER_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    #[init_component]
+    fn first() -> Result<(), ComponentInitError> {
+        ORDER_SEEN.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[init_component(process)]
+    fn in_process() -> Result<(), ComponentInitError> {
+        ORDER_SEEN.fetch_add(10, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[init_component(kthread)]
+    fn failing() -> Result<(), ComponentInitError> {
+        Err(ComponentInitError::Unknown)
+    }
+
+    #[test]
+    fn stages_run_their_own() {
+        assert_eq!(registered(InitStage::Bootstrap).count(), 1);
+        assert!(registered(InitStage::Process).all(|p| p.starts_with("component")));
+        init_all(InitStage::Bootstrap, parse_metadata!()).unwrap();
+        assert_eq!(ORDER_SEEN.load(Ordering::SeqCst), 1);
+        init_all(InitStage::Process, ()).unwrap();
+        assert_eq!(ORDER_SEEN.load(Ordering::SeqCst), 11);
+        assert!(matches!(
+            init_all(InitStage::Kthread, ()),
+            Err(ComponentInitError::Unknown)
+        ));
+        let c = ComponentInit::new(InitStage::Bootstrap, "aster_time::x", first);
+        assert_eq!(c.crate_name(), "aster_time");
+        let _ = ComponentInitError::UninitializedComponent("x");
+    }
 }

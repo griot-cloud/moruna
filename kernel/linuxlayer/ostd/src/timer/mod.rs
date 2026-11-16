@@ -34,6 +34,11 @@ where
     F: Fn() + Sync + Send + 'static,
 {
     CALLBACKS.lock().push(Box::new(func));
+    start_ticker();
+}
+
+/// Starts the ticker thread, once: tick callbacks and bottom halves run on it.
+pub(crate) fn start_ticker() {
     if !STARTED.swap(true, Ordering::AcqRel) && backend::spawn(Box::new(ticker)).is_err() {
         STARTED.store(false, Ordering::Release);
     }

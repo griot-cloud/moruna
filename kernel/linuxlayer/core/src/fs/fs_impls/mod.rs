@@ -16,7 +16,6 @@ pub(crate) mod pseudofs;
 pub(crate) mod ramfs;
 pub(crate) mod sysfs;
 pub(crate) mod tmpfs;
-pub(crate) mod virtiofs;
 
 pub(super) fn init() {
     sysfs::init();
@@ -32,7 +31,6 @@ pub(super) fn init() {
     ext2::init();
     exfat::init();
     overlayfs::init();
-    virtiofs::init();
 }
 
 pub(super) fn init_on_each_cpu() {

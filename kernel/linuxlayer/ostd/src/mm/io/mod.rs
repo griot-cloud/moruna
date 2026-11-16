@@ -48,11 +48,7 @@ use core::{marker::PhantomData, mem::MaybeUninit};
 use ostd_pod::Pod;
 
 use self::copy::{__atomic_cmpxchg_fallible, __atomic_load_fallible, memcpy, memset};
-use crate::{
-    Error,
-    mm::kspace::{KERNEL_BASE_VADDR, KERNEL_END_VADDR},
-    prelude::*,
-};
+use crate::{Error, prelude::*};
 
 /// A trait that enables reading/writing data from/to a VM object,
 /// e.g., [`USegment`], [`Vec<UFrame>`] and [`UFrame`].
@@ -377,8 +373,8 @@ impl<'a> VmReader<'a, Infallible> {
         // Rust is allowed to give the reference to a zero-sized object a very small address,
         // falling out of the kernel virtual address space range.
         // So when `len` is zero, we should not and need not to check `ptr`.
-        debug_assert!(len == 0 || KERNEL_BASE_VADDR <= ptr.addr());
-        debug_assert!(len == 0 || ptr.addr().checked_add(len).unwrap() <= KERNEL_END_VADDR);
+        // User space: the personality's memory is not one range, so there is no bound
+        // to check here; a program's pointer is checked against `MAX_USERSPACE_VADDR`.
 
         Self {
             cursor: ptr,
@@ -647,8 +643,8 @@ impl<'a> VmWriter<'a, Infallible> {
     pub unsafe fn from_kernel_space(ptr: *mut u8, len: usize) -> Self {
         // If casting a zero sized slice to a pointer, the pointer may be null
         // and does not reside in our kernel space range.
-        debug_assert!(len == 0 || KERNEL_BASE_VADDR <= ptr.addr());
-        debug_assert!(len == 0 || ptr.addr().checked_add(len).unwrap() <= KERNEL_END_VADDR);
+        // User space: the personality's memory is not one range, so there is no bound
+        // to check here; a program's pointer is checked against `MAX_USERSPACE_VADDR`.
 
         Self {
             cursor: ptr,

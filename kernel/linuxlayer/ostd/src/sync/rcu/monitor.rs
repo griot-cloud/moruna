@@ -31,6 +31,9 @@ struct Queue {
 static QUEUE: RawLock<Queue> = RawLock::new(Queue {
     callbacks: VecDeque::new(),
 });
+/// Held by a pass of `reclaim`, so a pass on a yielding thread waits for the callbacks
+/// another pass is running, as OSTD's grace periods end before a yield returns.
+static RUNNING: RawLock<()> = RawLock::new(());
 
 /// Enters a read-side section; returns the parity to leave it with.
 pub(crate) fn reader_enter() -> usize {
@@ -75,6 +78,7 @@ pub(super) fn after_grace_period(f: Callback) {
 /// parity as `cur + 1`) are gone, so when that parity is empty every reader of an epoch
 /// before `cur` has ended, and the callbacks queued before `cur` may run.
 pub(crate) fn reclaim() -> bool {
+    let _running = RUNNING.lock();
     loop {
         let cur = EPOCH.load(SeqCst);
         if READERS[(cur + 1) & 1].load(SeqCst) != 0 {

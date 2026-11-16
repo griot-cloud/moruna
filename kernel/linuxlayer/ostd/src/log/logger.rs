@@ -82,7 +82,7 @@ pub trait Log: Sync + Send {
 ///
 /// Records are created by the logging macros
 /// and passed to the [`Log`] backend.
-/// They are transient, 
+/// They are transient,
 /// the backend must consume all data during the `log()` call.
 pub struct Record<'a> {
     level: Level,

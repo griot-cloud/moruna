@@ -81,6 +81,7 @@ static BOTTOM_HALF_HANDLER_L2: spin::Once<fn(u8)> = spin::Once::new();
 /// Registers the bottom half run after each tick, as after an interrupt.
 pub fn register_bottom_half_handler_l1(func: BottomHalfL1) {
     BOTTOM_HALF_HANDLER_L1.call_once(|| func);
+    crate::timer::start_ticker();
 }
 
 /// Registers the bottom half of a nested interrupt: never run in user space.

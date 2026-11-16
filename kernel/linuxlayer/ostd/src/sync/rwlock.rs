@@ -326,6 +326,24 @@ impl<T: ?Sized, G: SpinGuardian> DerefMut for RwLockWriteGuard<'_, T, G> {
     }
 }
 
+impl<'a, T: ?Sized, G: SpinGuardian> RwLockWriteGuard<'a, T, G> {
+    /// Downgrades the write guard to an upgradeable read guard, atomically.
+    ///
+    /// User space: OSTD's `RwMutex` has this, and Asterinas's softirq test uses it on an
+    /// `RwLock`.
+    pub fn downgrade(self) -> RwLockUpgradeableGuard<'a, T, G> {
+        let this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is neither used nor dropped again, so its guard moves out once,
+        // and the atomic mode it holds carries on unbroken into the new guard.
+        let guard = unsafe { core::ptr::read(&this.guard) };
+        let inner = this.inner;
+        inner.lock.fetch_add(UPGRADEABLE_READER, Acquire);
+        inner.lock.fetch_and(!WRITER, Release);
+        inner.parking.notify();
+        RwLockUpgradeableGuard { guard, inner }
+    }
+}
+
 impl<T: ?Sized, G: SpinGuardian> Drop for RwLockWriteGuard<'_, T, G> {
     fn drop(&mut self) {
         self.inner.lock.fetch_and(!WRITER, Release);

@@ -44,7 +44,6 @@ mod arch;
 pub mod context;
 mod cpu;
 pub mod device;
-mod driver;
 pub mod error;
 pub mod events;
 pub mod fs;
@@ -60,9 +59,6 @@ mod syscall;
 mod thread;
 mod time;
 pub mod util;
-// TODO: Add vDSO support for LoongArch.
-#[cfg(not(target_arch = "loongarch64"))]
-mod vdso;
 pub mod vm;
 
 /// Boots the Asterinas core kernel.

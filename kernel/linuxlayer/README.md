@@ -26,8 +26,15 @@ run as user code in the upper region of each task's own process. Stream B2 of
 ## What is left out, for 0.7.0
 
 - **Sockets and the network:** `core/src/net/` and `core/src/util/net/` (15,967 lines and
-  their helpers). The VM has no network, and `kernel-is-the-machine.md` §4.3 makes the
-  socket layer a client of `moruna.net` when it comes.
+  their helpers), but for `net/uts_ns.rs` (the host and domain names, which `uname`
+  needs). The VM has no network, and `kernel-is-the-machine.md` §4.3 makes the socket
+  layer a client of `moruna.net` when it comes. The 16 socket calls answer from
+  `core/src/syscall/no_socket.rs`: `EAFNOSUPPORT` to make a socket, `EBADF` or `ENOTSOCK`
+  on a descriptor.
+- **Hardware the personality never sees:** TDX (`security/tsm*`,
+  `device/misc/tdxguest.rs`), the virtio RNG, the hypervisor console, virtual terminals,
+  input events, the framebuffer, virtiofs, the input-driver listing, and the vDSO (a
+  program without `AT_SYSINFO_EHDR` makes the calls instead).
 - **Other architectures:** `core/src/arch/{arm,riscv,loongarch}`. Moruna runs on x86-64.
 - **Drivers and the cloud platform:** Asterinas's components that drive hardware
   (`virtio`, `nvme`, `pci`, `network`, `input`, `framebuffer`, `mlsdisk`) and the libraries
@@ -105,12 +112,12 @@ next, subsystem by subsystem.
 
 The tree is its own Cargo workspace on the kernel's toolchain, so its carried files keep
 Asterinas's lints and formatting. Asterinas's kernel tests (`#[ktest]`) run as host tests
-with `--cfg ktest`:
+with `--cfg ktest`, one at a time as the kernel runs them (some share global registries):
 
 ```sh
 cd kernel/linuxlayer
-RUSTFLAGS="--cfg ktest" cargo test --target x86_64-apple-darwin --workspace   # a Mac, under Rosetta
-RUSTFLAGS="--cfg ktest" cargo test --target x86_64-unknown-linux-gnu --workspace
+RUSTFLAGS="--cfg ktest" cargo test --target x86_64-apple-darwin --workspace -- --test-threads=1   # a Mac, under Rosetta
+RUSTFLAGS="--cfg ktest" cargo test --target x86_64-unknown-linux-gnu --workspace -- --test-threads=1
 ```
 
 For the Moruna user target, as `kernel/tools/build.sh` builds programs:

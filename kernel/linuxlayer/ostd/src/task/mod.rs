@@ -71,9 +71,13 @@ impl Task {
     }
 
     /// Gives up the CPU for a moment.
+    ///
+    /// As in OSTD, where a context switch ends this CPU's part of a grace period, the
+    /// RCU callbacks that are due run here: a task never yields in atomic mode.
     #[track_caller]
     pub fn yield_now() {
         backend::yield_now();
+        let _ = crate::sync::reclaim();
     }
 
     /// Starts the task on a new thread.

@@ -17,6 +17,3 @@ pub const MAX_USERSPACE_VADDR: Vaddr = 0x0000_8000_0000_0000 - super::PAGE_SIZE;
 
 /// The personality's own addresses, as the carried code names "kernel space".
 pub const KERNEL_VADDR_RANGE: Range<Vaddr> = 0..usize::MAX;
-
-pub(crate) const KERNEL_BASE_VADDR: Vaddr = KERNEL_VADDR_RANGE.start;
-pub(crate) const KERNEL_END_VADDR: Vaddr = KERNEL_VADDR_RANGE.end;

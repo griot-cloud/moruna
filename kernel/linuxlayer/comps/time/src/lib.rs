@@ -63,3 +63,38 @@ pub fn read_system_time() -> SystemTime {
 pub fn default_clocksource() -> Arc<ClockSource> {
     tsc::CLOCK.get().unwrap().clone()
 }
+
+#[cfg(ktest)]
+mod test {
+    use core::time::Duration;
+
+    use ostd::{
+        boot::{BootInfo, init},
+        prelude::*,
+        timer::monotonic_nanos,
+    };
+
+    use super::*;
+
+    // User space: the clock is the core's monotonic clock, and the wall time is the one
+    // the start gives plus the monotonic time since.
+    #[ktest]
+    fn clocks_from_the_core_and_the_start() {
+        let at_start = Duration::from_secs(1_700_000_000);
+        init(BootInfo {
+            wall_clock_at_start: at_start,
+            monotonic_at_start: monotonic_nanos(),
+            ..Default::default()
+        });
+        time_init().unwrap();
+        let a = read_monotonic_time();
+        let b = read_monotonic_time();
+        assert!(b >= a);
+        let start = read_start_time().since_epoch();
+        assert!(start >= at_start && start < at_start + Duration::from_secs(60));
+        assert!(read_system_time().since_epoch() >= start);
+        let clock = default_clocksource();
+        assert_eq!(clock.freq(), 1_000_000_000);
+        assert!(clock.read_cycles() > 0);
+    }
+}
