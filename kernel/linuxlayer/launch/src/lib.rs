@@ -16,6 +16,7 @@ extern crate alloc;
 
 #[cfg(all(feature = "launcher", target_os = "none"))]
 pub mod launcher;
+pub mod program_page;
 
 use alloc::vec::Vec;
 
@@ -128,7 +129,7 @@ pub mod report {
     pub const REFUSED_MAX: usize = (LEN - 32) / 16;
 
     /// What the personality reports.
-    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    #[derive(Clone, Debug, Default, PartialEq)]
     pub struct Report {
         pub how: u8,
         pub code: i64,
@@ -182,7 +183,7 @@ pub mod command {
     use alloc::vec::Vec;
 
     /// A program to run: its path, arguments and environment.
-    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    #[derive(Clone, Debug, Default, PartialEq)]
     pub struct Command {
         pub path: Vec<u8>,
         pub argv: Vec<Vec<u8>>,
@@ -191,7 +192,7 @@ pub mod command {
 
     /// Why a command cannot be encoded: a string holds a zero byte, or an argument is
     /// empty (which would end the arguments).
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq)]
     pub struct BadCommand;
 
     /// The command's encoding.
@@ -238,7 +239,7 @@ pub mod command {
 }
 
 /// Why an image cannot be launched.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PlanError {
     /// The ELF is not one the loader takes, or a segment lies outside the region.
     Elf(elf::ElfError),
@@ -251,7 +252,7 @@ pub enum PlanError {
 }
 
 /// Where the launcher puts each part of the personality.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
     /// The first thread's entry.
     pub entry: u64,

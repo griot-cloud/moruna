@@ -172,3 +172,96 @@ fn the_personality_s_slots_are_apart_from_the_program_s() {
     assert!(!program_name_ok(""));
     assert!(!program_name_ok("lx.anything"));
 }
+
+#[test]
+fn a_program_s_start_page_lays_out_as_the_core_s() {
+    use moruna_abi::{ABI_VERSION, PAGE_SIZE, limits, read_u32, start_page as page};
+
+    use crate::program_page::{Entry, encode};
+    let entries = [
+        Entry {
+            handle: 7,
+            rights: 0x13,
+            name: "vsock",
+        },
+        Entry {
+            handle: 9,
+            rights: 0x01,
+            name: "filesystem",
+        },
+    ];
+    let p = encode("lx-moruna-engine", 4, &entries).unwrap();
+    assert_eq!(p.len(), PAGE_SIZE as usize);
+    assert_eq!(read_u32(&p, page::MAGIC_OFFSET), Some(page::MAGIC));
+    assert_eq!(read_u32(&p, page::VERSION_OFFSET), Some(ABI_VERSION as u32));
+    assert_eq!(read_u32(&p, page::COUNT_OFFSET), Some(2));
+    assert_eq!(read_u32(&p, page::CPUS_OFFSET), Some(4));
+    assert_eq!(&p[page::NAME_OFFSET..][..16], b"lx-moruna-engine");
+    assert_eq!(p[page::NAME_OFFSET + 16], 0);
+    let second = page::HEADER_SIZE + page::ENTRY_SIZE;
+    assert_eq!(read_u32(&p, second + page::ENTRY_HANDLE), Some(9));
+    assert_eq!(read_u32(&p, second + page::ENTRY_RIGHTS), Some(1));
+    assert_eq!(&p[second + page::ENTRY_NAME..][..11], b"filesystem\0");
+    // A long process name is cut; too many entries or a long name refuse.
+    let long = "p".repeat(40);
+    let p = encode(&long, 1, &[]).unwrap();
+    assert_eq!(
+        &p[page::NAME_OFFSET..][..limits::NAME_MAX],
+        &long.as_bytes()[..32]
+    );
+    let name = "n".repeat(33);
+    let bad = Entry {
+        handle: 1,
+        rights: 0,
+        name: &name,
+    };
+    assert!(encode("x", 1, &[bad]).is_none());
+    let one = Entry {
+        handle: 1,
+        rights: 0,
+        name: "a",
+    };
+    assert!(encode("x", 1, &[one; limits::START_HANDLES_MAX]).is_some());
+    assert!(encode("x", 1, &[one; limits::START_HANDLES_MAX + 1]).is_none());
+}
+
+#[test]
+fn the_contract_s_values_copy_compare_and_print() {
+    use alloc::format;
+
+    let bytes = elf([CODE, CODE + 0x40, CODE + 0x40], CODE, CODE + 0x100);
+    let plan = Plan::new(&bytes).unwrap();
+    assert_eq!(plan.clone(), plan);
+    assert!(format!("{plan:?}").contains("recovery"));
+    let error = PlanError::TooLarge;
+    assert_eq!(error, error.clone());
+    assert!(format!("{error:?} {:?}", PlanError::NoInfo).contains("TooLarge"));
+    // A writable segment maps writable.
+    let mut writable = plan.segments[0];
+    writable.write = true;
+    assert_eq!(
+        segment_flags(&writable),
+        moruna_abi::map::READ | moruna_abi::map::WRITE
+    );
+    let report = report::Report {
+        how: report::SIGNALED,
+        code: 9,
+        served: 1,
+        refused: vec![(41, 2)],
+    };
+    assert_eq!(report.clone(), report);
+    assert!(format!("{report:?}").contains("refused"));
+    let command = command::Command::default();
+    assert_eq!(command.clone(), command);
+    assert!(format!("{command:?}").contains("argv"));
+    let bad = command::BadCommand;
+    assert_eq!(bad, bad.clone());
+    assert_eq!(format!("{bad:?}"), "BadCommand");
+    let entry = program_page::Entry {
+        handle: 1,
+        rights: 2,
+        name: "n",
+    };
+    let copied = entry;
+    assert!(format!("{copied:?}").contains("rights"));
+}
