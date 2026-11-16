@@ -17,9 +17,18 @@
 //!   stops its wait (`killed` is true while one is pending, so every wait of the core
 //!   stops), and the wait returns `Interrupted`; a thread running its program enters its
 //!   personality instead.
+//! - **A program's native calls** (`data-os.md` §4). A native call its program makes goes
+//!   to the core when it is on [`program_calls`], and is refused (`BadSyscall`) and counted
+//!   otherwise; a Linux number enters the personality. Such a call resolves handles in the
+//!   program's table only, into which the personality moves them (`program_handle`), copies
+//!   through the program's page table, places mappings in the range `personality_set`
+//!   reserved, and touches nothing of the region. Handle 0 for the caller's process is
+//!   refused.
 
 use alloc::{format, string::String, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
+
+use moruna_abi::personality::copy;
 
 use moruna_abi::{
     Error, PAGE_SIZE, RawHandle, ResourceKind, Rights, nr,
@@ -28,7 +37,9 @@ use moruna_abi::{
 };
 use ostd::{
     arch::cpu::context::{CpuException, FsBase, UserContext},
+    early_println,
     sync::SpinLock,
+    task::Task,
 };
 
 use crate::{
@@ -67,6 +78,8 @@ struct State {
 pub(crate) struct Mode {
     /// Whether the thread runs its program, on the program's table.
     program: AtomicBool,
+    /// Whether the core is serving a native call its program made.
+    native: AtomicBool,
     /// An interrupt not yet delivered.
     interrupt: AtomicBool,
     state: SpinLock<State>,
@@ -76,6 +89,7 @@ impl Mode {
     pub(crate) fn new() -> Mode {
         Mode {
             program: AtomicBool::new(false),
+            native: AtomicBool::new(false),
             interrupt: AtomicBool::new(false),
             state: SpinLock::new(State::default()),
         }
@@ -106,10 +120,129 @@ fn sleeps(number: u64) -> bool {
     )
 }
 
-/// The user-mode loop's syscall branch: a program's call enters its personality; a native
-/// call is dispatched, a foreign one forwarded.
+/// Whether the thread on this CPU is serving a native call its program made, in a process
+/// `of` picks out.
+pub(crate) fn program_call(of: impl FnOnce(&Process) -> bool) -> bool {
+    let Some(task) = Task::current() else {
+        return false;
+    };
+    task.data()
+        .downcast_ref::<Arc<Thread>>()
+        .is_some_and(|t| t.mode.native.load(Ordering::Acquire) && of(&t.process))
+}
+
+/// The native calls a program may make (`data-os.md` §4): `run_granted`'s, on the memory,
+/// slots, channels, windows, disks and clock page its personality granted it. Provisional
+/// until stream B2's survey of `kernel/linux`'s `run_granted` fixes it.
+pub fn program_calls(number: u64) -> bool {
+    matches!(
+        number,
+        nr::ABI_VERSION
+            | nr::HANDLE_CLOSE
+            | nr::HANDLE_DUPLICATE
+            | nr::HANDLE_INFO
+            | nr::CHANNEL_CREATE
+            | nr::CHANNEL_WRITE
+            | nr::CHANNEL_READ
+            | nr::MEMORY_CREATE
+            | nr::MEMORY_MAP
+            | nr::MEMORY_UNMAP
+            | nr::MEMORY_PROTECT
+            | nr::WAIT
+            | nr::CLOCK_GET
+            | nr::TIMER_CREATE
+            | nr::TIMER_SET
+            | nr::FUTEX_WAIT
+            | nr::FUTEX_WAKE
+            | nr::SLOT_CREATE
+            | nr::SLOT_PUSH
+            | nr::SLOT_TAKE
+            | nr::SLOT_CLOSE
+            | nr::SLOT_REFUSE
+            | nr::ACCOUNT_INFO
+            | nr::THREAD_SET_CPU
+            | nr::CLOCK_PAGE
+            | nr::WINDOWS_PROTECT
+            | nr::BATCH_GET
+            | nr::BATCH_PUT
+            | nr::PORT_CALL
+            | nr::PLANE_GET
+            | nr::PLANE_PUT
+    )
+}
+
+/// The argument of a call on [`program_calls`] that names a process, where zero means the
+/// caller's own, which a program may not name.
+fn names_caller(number: u64) -> Option<usize> {
+    match number {
+        nr::WINDOWS_PROTECT => Some(0),
+        nr::PROCESS_CLONE => Some(1),
+        _ => None,
+    }
+}
+
+/// A native call the thread's program made: served by the core, on the program's table,
+/// when it is on the list; refused and counted otherwise. An interrupt raised meanwhile
+/// enters the personality once it returns.
+fn program_native(thread: &Arc<Thread>, ctx: &mut UserContext, number: u64) -> Flow {
+    let args = [
+        ctx.rdi(),
+        ctx.rsi(),
+        ctx.rdx(),
+        ctx.r10(),
+        ctx.r8(),
+        ctx.r9(),
+    ];
+    if !program_calls(number) {
+        if let Some(program) = thread.process.space.program() {
+            program.refused.fetch_add(1, Ordering::Relaxed);
+        }
+        ctx.set_rax(Error::BadSyscall.to_raw() as usize);
+        return Flow::Continue;
+    }
+    if names_caller(number).is_some_and(|i| args[i] == 0) {
+        ctx.set_rax(Error::BadHandle.to_raw() as usize);
+        return Flow::Continue;
+    }
+    thread.mode.native.store(true, Ordering::Release);
+    let flow = syscall::dispatch(thread, ctx);
+    thread.mode.native.store(false, Ordering::Release);
+    if !matches!(flow, Flow::Continue) || thread.dying() {
+        return flow;
+    }
+    if thread.mode.take_interrupt() {
+        // A wait the interrupt stopped answers so.
+        if sleeps(number) && ctx.rax() as u64 == Error::BadState.to_raw() {
+            ctx.set_rax(Error::Interrupted.to_raw() as usize);
+        }
+        return enter(thread, ctx, reason::INTERRUPTED, None);
+    }
+    flow
+}
+
+/// The native calls a process's program made that were not on the list, on its end line.
+pub(crate) fn report_refused(process: &Process) {
+    let refused = process
+        .space
+        .program()
+        .map_or(0, |p| p.refused.load(Ordering::Relaxed));
+    if refused != 0 {
+        early_println!(
+            "kk: process {}: native calls its program made that were not on its list: {}",
+            process.name,
+            refused
+        );
+    }
+}
+
+/// The user-mode loop's syscall branch: a program's call enters its personality, but for a
+/// native one; a native call is dispatched, a foreign one forwarded.
 pub(crate) fn syscall(thread: &Arc<Thread>, ctx: &mut UserContext) -> Flow {
     if thread.mode.in_program() {
+        let number = ctx.rax() as u64;
+        if nr::is_native(number) {
+            return program_native(thread, ctx, number);
+        }
         return enter(thread, ctx, reason::SYSCALL, None);
     }
     let number = ctx.rax() as u64;
@@ -393,17 +526,47 @@ fn pages(offset: u64, len: u64) -> Result<(usize, usize), Error> {
     Ok(((offset / PAGE_SIZE) as usize, (len / PAGE_SIZE) as usize))
 }
 
-/// `personality_set(process, base, len, copy_start, copy_end, recovery)`: a created
-/// process's personality region, and its fault-tolerant copy routine (none when all three
-/// are zero).
+/// `personality_set(process, base, len, reserved_base, reserved_len, copy)`: a created
+/// process's personality region, the range for its program's mappings, and its
+/// fault-tolerant copy routine (a `personality::copy` record at `copy`, none when zero).
 pub(crate) fn personality_set(p: &Process, a: [u64; 6]) -> Answer {
     let target = typed(p, a[0], Rights::WRITE, process)?;
     if !target.is_created() || target.forward().is_some() {
         return Err(Error::BadState);
     }
-    let copy = (a[3..] != [0, 0, 0]).then_some((a[3]..a[4], a[5]));
-    target.space.set_program(a[1], a[2], copy)?;
+    let routine = if a[5] == 0 {
+        None
+    } else {
+        let bytes = usercopy::read(&p.space, a[5], copy::LEN)?;
+        let word = |at| read_u64(&bytes, at).ok_or(Error::InvalidArgs);
+        Some((word(copy::START)?..word(copy::END)?, word(copy::RECOVERY)?))
+    };
+    let reserved = a[3]..a[3].checked_add(a[4]).ok_or(Error::OutOfRange)?;
+    target.space.set_program(a[1], a[2], reserved, routine)?;
     Ok((0, 0))
+}
+
+/// `program_handle(handle) -> value`: moves a handle of the caller's table into its
+/// program's, made from the personality.
+pub(crate) fn program_handle(caller: &Arc<Thread>, a: [u64; 6]) -> Answer {
+    let p = &caller.process;
+    if p.space.program().is_none() {
+        return Err(Error::BadState);
+    }
+    let value = RawHandle::try_from(a[0]).map_err(|_| Error::BadHandle)?;
+    let moved = p.handles.shared.lock().remove(value)?;
+    let result = {
+        let mut table = p.handles.program.lock();
+        p.insert_into_program(&mut table, moved)
+    };
+    match result {
+        Ok(v) => Ok((v as u64, 0)),
+        Err((e, back)) => {
+            // Put back: nothing changed.
+            let _ = p.insert(back);
+            Err(e)
+        }
+    }
 }
 
 /// `personality_return(frame) -> reason`: checks the frame and the program's registers,
@@ -460,10 +623,10 @@ pub(crate) fn process_clone(p: &Process, a: [u64; 6]) -> Answer {
     }
     let table = if a[3] & moruna_abi::process::SHARE_HANDLES != 0 {
         // The engine has no personality, so its table is never shared.
-        if p.space.program().is_none() || !Arc::ptr_eq(&p.handles, &source.handles) {
+        if p.space.program().is_none() || !Arc::ptr_eq(&p.handles.shared, &source.handles.shared) {
             return Err(Error::AccessDenied);
         }
-        Some(source.handles.clone())
+        Some(source.handles.shared.clone())
     } else {
         None
     };

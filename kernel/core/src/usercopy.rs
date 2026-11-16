@@ -25,7 +25,10 @@ fn prepare(space: &Space, ptr: u64, len: u64, write: bool) -> Result<(), Error> 
 
 fn read_into(space: &Space, ptr: u64, buf: &mut [u8]) -> Result<(), Error> {
     let addr = usize::try_from(ptr).map_err(|_| Error::Fault)?;
-    let mut reader = space.vm.reader(addr, buf.len()).map_err(|_| Error::Fault)?;
+    // stream B1 hook: a program's call copies through the program's table.
+    let program = space.program_call();
+    let vm = program.as_ref().map_or(&space.vm, |p| &p.vm);
+    let mut reader = vm.reader(addr, buf.len()).map_err(|_| Error::Fault)?;
     let len = buf.len();
     let mut writer = VmWriter::from(&mut buf[..]);
     let read = reader.read_fallible(&mut writer);
@@ -41,10 +44,10 @@ fn read_into(space: &Space, ptr: u64, buf: &mut [u8]) -> Result<(), Error> {
 
 fn write_from(space: &Space, ptr: u64, data: &[u8]) -> Result<(), Error> {
     let addr = usize::try_from(ptr).map_err(|_| Error::Fault)?;
-    let mut writer = space
-        .vm
-        .writer(addr, data.len())
-        .map_err(|_| Error::Fault)?;
+    // stream B1 hook: a program's call copies through the program's table.
+    let program = space.program_call();
+    let vm = program.as_ref().map_or(&space.vm, |p| &p.vm);
+    let mut writer = vm.writer(addr, data.len()).map_err(|_| Error::Fault)?;
     let mut reader = VmReader::from(data);
     let written = writer.write_fallible(&mut reader);
     space.count_copy(match &written {
