@@ -800,6 +800,12 @@ fn run_planned(
                     let wire = wire.clone();
                     Box::new(move |note| wire.note(note))
                 },
+                // Stream D: the job updates carry the logs, each record as the store keeps it.
+                record: wire.has_peer().then(|| {
+                    let wire = wire.clone();
+                    Box::new(move |record: &[u8]| wire.send_event(record))
+                        as super::logs::SendRecord
+                }),
             },
         ));
         #[cfg(unix)]

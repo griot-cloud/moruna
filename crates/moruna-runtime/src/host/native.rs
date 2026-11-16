@@ -5,8 +5,10 @@ use super::launch_witness::{Admission, Key, Phase, Witness, checked_directory};
 use super::protocol::{self, Inbound, Outbound};
 use moruna_vmm::{
     Budget,
+    data::RunDevices,
     error::{Result, VmmError},
     microkernel::RunningNode,
+    placement::Placed,
 };
 use std::{
     fs::File,
@@ -252,10 +254,24 @@ type NodeLauncher = fn(
     &Path,
     &moruna_vmm::jail::Cgroup,
     &moruna_vmm::microkernel::RunAuthority,
+    &RunDevices,
 ) -> Result<RunningNode>;
 struct NodeBackend<'a> {
     tools: Tools<'a>,
     launch: NodeLauncher,
+    /// The run's data disks and vCPU placement (stream D).
+    devices: &'a RunDevices,
+}
+
+/// How long a native run took to come up, apart from the job (`arrow-core-0.7.md` §9: VM boot
+/// reported on its own).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Timing {
+    /// From the start call to QEMU running: artifacts checked and copied, disks opened, the
+    /// jails and QEMU spawned, the vCPUs placed.
+    pub launch: Duration,
+    /// From QEMU running to the guest's runtime accepting its connection: the boot.
+    pub connect: Duration,
 }
 /// Original-call dispatch certainty; later disk probes never return NotDispatched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,6 +413,7 @@ pub struct NativeRun {
     witness: Witness,
     guest_exit: Option<i32>,
     transport_uncertain: bool,
+    timing: Timing,
     node: RunningNode,
     reader: BufReader<UnixStream>,
     control: Control,
@@ -417,6 +434,30 @@ impl NativeRun {
         spec: Inbound,
         deadline: Instant,
     ) -> core::result::Result<Self, StartError> {
+        Self::start_with(
+            admission,
+            descriptor,
+            budget,
+            runtime_dir,
+            tools,
+            spec,
+            deadline,
+            &RunDevices::default(),
+        )
+    }
+    /// [`Self::start`] with the run's own devices: its data disks, bound to the image's
+    /// declared inputs, its output disk, and where its vCPUs run (`moruna_vmm::data`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with(
+        admission: Admission<'_>,
+        descriptor: &Path,
+        budget: Budget,
+        runtime_dir: &Path,
+        tools: Tools<'_>,
+        spec: Inbound,
+        deadline: Instant,
+        devices: &RunDevices,
+    ) -> core::result::Result<Self, StartError> {
         if Instant::now() >= deadline {
             return Err(StartError {
                 disposition: StartDisposition::NotDispatched,
@@ -427,12 +468,16 @@ impl NativeRun {
             disposition: StartDisposition::NotDispatched,
             source,
         })?;
-        Self::start_prepared(
+        Self::start_prepared_owned(
             admission,
             descriptor,
             budget,
             runtime_dir,
-            tools,
+            NodeBackend {
+                tools,
+                launch: moruna_vmm::microkernel::launch_with,
+                devices,
+            },
             prepared,
             deadline,
         )
@@ -457,7 +502,8 @@ impl NativeRun {
             runtime_dir,
             NodeBackend {
                 tools,
-                launch: moruna_vmm::microkernel::launch_for_run,
+                launch: moruna_vmm::microkernel::launch_with,
+                devices: &RunDevices::default(),
             },
             prepared,
             deadline,
@@ -484,7 +530,8 @@ impl NativeRun {
             runtime_dir,
             NodeBackend {
                 tools,
-                launch: moruna_vmm::microkernel::launch_tcg_proof_for_run,
+                launch: moruna_vmm::microkernel::launch_tcg_proof_with,
+                devices: &RunDevices::default(),
             },
             prepared,
             deadline,
@@ -554,6 +601,7 @@ impl NativeRun {
             return Err(refused("launch deadline expired after dispatch intent"));
         }
         let authority = run_authority(witness.key(), &spec);
+        let began = Instant::now();
         let node = (backend.launch)(
             descriptor,
             budget,
@@ -562,12 +610,18 @@ impl NativeRun {
             backend.tools.vsock,
             backend.tools.cgroup,
             &authority,
+            backend.devices,
         )?;
+        let launched = Instant::now();
         witness.advance(Phase::Launched)?;
         let reader = node.connect(
             node.agent_port(),
             deadline.min(Instant::now() + moruna_vmm::session::CONNECT_TIMEOUT),
         )?;
+        let timing = Timing {
+            launch: launched - began,
+            connect: launched.elapsed(),
+        };
         reader
             .get_ref()
             .set_read_timeout(Some(Duration::from_millis(100)))
@@ -590,6 +644,7 @@ impl NativeRun {
             witness,
             guest_exit: None,
             transport_uncertain: false,
+            timing,
             node,
             reader,
             control,
@@ -628,6 +683,14 @@ impl NativeRun {
             Ok(()) if self.guest_exit.is_some() => CancelOutcome::Exited(self.witness.record()),
             Ok(()) => CancelOutcome::Cancelled(self.witness.record()),
         }
+    }
+    /// How long the VM took to launch and to boot to its runtime's connection.
+    pub fn timing(&self) -> Timing {
+        self.timing
+    }
+    /// Where the vCPUs were placed, when the run asked for a placement.
+    pub fn placed(&self) -> Option<&Placed> {
+        self.node.placed()
     }
     /// Disk evidence is useful after owner loss, but never permission to respawn.
     pub fn launch_key(&self) -> &super::launch_witness::Key {

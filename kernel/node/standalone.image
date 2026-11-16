@@ -29,6 +29,7 @@ process node-supervisor
   handle data:network.conf network.config
   handle data:tls.roots tls.roots
   driver 1af4:1042 virtio-blk block
+  driver 1af4:1001 - data
   driver 1af4:1053 virtio-vsock vsock
   driver 1af4:1041 virtio-net net
   driver 1b36:0010 nvme nvme

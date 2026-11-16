@@ -167,17 +167,31 @@ fn what_waits_too_long_goes_out() {
 struct Told {
     events: Arc<Mutex<Vec<Event>>>,
     notes: Arc<Mutex<Vec<String>>>,
+    /// The `log` records sent to the peer, as sent.
+    records: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 fn told() -> (Told, Tell) {
     let events = Arc::new(Mutex::new(Vec::new()));
     let notes = Arc::new(Mutex::new(Vec::new()));
-    let (e, n) = (Arc::clone(&events), Arc::clone(&notes));
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let (e, n, r) = (
+        Arc::clone(&events),
+        Arc::clone(&notes),
+        Arc::clone(&records),
+    );
     (
-        Told { events, notes },
+        Told {
+            events,
+            notes,
+            records,
+        },
         Tell {
             event: Box::new(move |_, event| e.lock().unwrap().push(event)),
             note: Box::new(move |note| n.lock().unwrap().push(note)),
+            record: Some(Box::new(move |record| {
+                r.lock().unwrap().push(record.to_vec())
+            })),
         },
     )
 }
@@ -382,6 +396,53 @@ fn output_after_its_task_ended_is_drained() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The job updates carry the logs (stream D): every record the store keeps goes to the peer as
+/// the same `log` event, with its producer, its level and its line, numbered by its producer.
+#[test]
+fn every_kept_record_goes_to_the_peer_as_it_is_kept() {
+    let dir = scratch("peer");
+    let (told, tell) = told();
+    let capture = Capture::start(
+        attempt_dir(&dir, 1, START),
+        meta(1),
+        vec!["src".into(), "k1".into(), "snk".into()],
+        Instant::now(),
+        tell,
+    );
+    let sink = capture.sink();
+    sink.bytes(Some(1), Stream::Stdout, b"one\ntwo\n");
+    sink.record(Some(1), Some(moruna_kernel::Level::Warning), "careful");
+    sink.bytes(None, Stream::Stderr, b"the engine's\n");
+    assert!(capture.finish(FINISH_WAIT));
+    let sent: Vec<serde_json::Value> = told
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| moruna_event::decode(r).unwrap().to_value())
+        .collect();
+    let kept = read_producer(&attempt_dir(&dir, 1, START).join("k1")).unwrap();
+    let k1: Vec<&serde_json::Value> = sent.iter().filter(|r| r["task"] == "k1").collect();
+    assert_eq!(k1.len(), 3);
+    assert_eq!(k1.iter().map(|r| (*r).clone()).collect::<Vec<_>>(), kept);
+    assert_eq!(k1[0]["text"], "one");
+    assert_eq!(k1[2]["level"], "warning");
+    assert_eq!(
+        k1.iter()
+            .map(|r| r["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [1, 2, 3],
+        "numbered by the producer"
+    );
+    let engine: Vec<&serde_json::Value> = sent
+        .iter()
+        .filter(|r| r.get("task").is_none_or(|t| t.is_null()))
+        .collect();
+    assert_eq!(engine.len(), 1);
+    assert_eq!(engine[0]["text"], "the engine's");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A store that cannot be made is a note, and what was written is dropped and counted.
 #[test]
 fn a_store_that_cannot_be_written_is_told() {
@@ -404,6 +465,10 @@ fn a_store_that_cannot_be_written_is_told() {
         .find(|r| r.task.as_deref() == Some("src"))
         .unwrap();
     assert_eq!((src.records, src.dropped, src.drained), (0, 1, true));
+    assert!(
+        told.records.lock().unwrap().is_empty(),
+        "the peer gets what is kept"
+    );
     let _ = std::fs::remove_file(&file);
 }
 

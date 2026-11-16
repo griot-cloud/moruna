@@ -18,7 +18,7 @@ use crate::packaged::PackageHost;
 
 /// What `moruna` prints for a command line it does not understand.
 pub const USAGE: &str = "usage: moruna run <spec.json> [--arg NAME=VALUE]... [--resolver MODULE:ATTRIBUTE] [--plan <plan.mplan>] [--strict] [--events-json] [--cost-store <dir>] [--cost-model <name>] [--sandbox-python <path>] [--sandbox-cgroup <dir>] [--kinds <kinds.json>]...
-       moruna run --vm <spec.json> --image <node-image.json> --launch-witness <durable-directory>
+       moruna run --vm <spec.json> --image <node-image.json> --launch-witness <durable-directory> [--input NAME=URL]... [--output <dir>] [--vcpu-cpus <list>]
        moruna serve --listen <unix:///path | vsock://CID:PORT> [--no-strict] [--cost-store <dir>] [--cost-model <name>] [--sandbox-python <path>] [--sandbox-cgroup <dir>] [--kinds <kinds.json>]...
        moruna kinds [--kinds <kinds.json>]...
        moruna check-job <spec.json> [--kinds <kinds.json>]...
@@ -86,6 +86,17 @@ pub fn with_declared(kinds: &Registry, files: &[PathBuf]) -> Result<Registry, St
     Ok(extended)
 }
 
+/// What `moruna run --vm` attaches beside its image (stream D, `moruna_vmm::data`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VmData {
+    /// `--input NAME=URL`: the host file or remote object behind a job's `disk://NAME`.
+    pub inputs: Vec<(String, String)>,
+    /// `--output DIR`: where the run's output layer is unpacked, a new or empty directory.
+    pub output: Option<PathBuf>,
+    /// `--vcpu-cpus LIST`: the host CPU of each vCPU, vCPU 0 first (`moruna_vmm::placement`).
+    pub vcpu_cpus: Vec<u32>,
+}
+
 /// A parsed command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -118,6 +129,8 @@ pub enum Command {
         witness: PathBuf,
         /// Optional exact plan delivered through the canonical Spec message.
         plan: Option<PathBuf>,
+        /// The run's data disks and vCPU placement.
+        data: VmData,
     },
     /// `moruna serve --listen <address> [--no-strict]`; strict unless told otherwise, because
     /// serve is the hosted path (MH 4.1).
@@ -184,6 +197,8 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             let mut witness = None;
             let mut packages = PackageHost::default();
             let mut args: Vec<(String, String)> = Vec::new();
+            let mut data = VmData::default();
+            let mut vcpus = false;
             while let Some(arg) = rest.next() {
                 if sandbox_option(arg, &mut rest, &mut packages, "moruna run")? {
                     continue;
@@ -222,6 +237,36 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                             return Err("duplicate --launch-witness".into());
                         }
                     }
+                    "--input" => {
+                        let given = rest
+                            .next()
+                            .ok_or("moruna run --vm: --input needs NAME=URL")?;
+                        let (name, url) = super::inputs::parse_binding(given)
+                            .map_err(|e| format!("moruna run --vm: {e}"))?;
+                        if data.inputs.iter().any(|(n, _)| *n == name) {
+                            return Err(format!("moruna run --vm: input {name} is bound twice"));
+                        }
+                        data.inputs.push((name, url));
+                    }
+                    "--output" => {
+                        let path = rest
+                            .next()
+                            .ok_or("moruna run --vm: --output needs a directory")?;
+                        if data.output.replace(PathBuf::from(path)).is_some() {
+                            return Err("moruna run --vm: --output is given twice".into());
+                        }
+                    }
+                    "--vcpu-cpus" => {
+                        let list = rest
+                            .next()
+                            .ok_or("moruna run --vm: --vcpu-cpus needs a CPU list")?;
+                        if vcpus {
+                            return Err("moruna run --vm: --vcpu-cpus is given twice".into());
+                        }
+                        vcpus = true;
+                        data.vcpu_cpus = moruna_vmm::placement::parse_cpu_list(list)
+                            .map_err(|e| format!("moruna run --vm: --vcpu-cpus: {e}"))?;
+                    }
                     "--disk" => return Err(
                         "moruna run --vm: --disk is retired; node-image.json defines exact devices"
                             .into(),
@@ -239,9 +284,10 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             }
             let spec = spec.ok_or_else(|| "moruna run: which document?".to_string())?;
             if !vm {
-                if image.is_some() || witness.is_some() {
+                if image.is_some() || witness.is_some() || data != VmData::default() || vcpus {
                     return Err(
-                        "moruna run: --image and --disk describe a guest, and need --vm"
+                        "moruna run: --image, --launch-witness, --input, --output and \
+                         --vcpu-cpus describe a guest, and need --vm"
                             .to_string(),
                     );
                 }
@@ -281,6 +327,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                 image,
                 plan,
                 witness,
+                data,
             })
         }
         Some("serve") => {
@@ -601,8 +648,16 @@ fn main_as(
             image,
             plan,
             witness,
+            data,
         } => {
-            return run_vm(Path::new(&spec), &image, plan.as_deref(), &witness, cancel);
+            return run_vm(
+                Path::new(&spec),
+                &image,
+                plan.as_deref(),
+                &witness,
+                &data,
+                cancel,
+            );
         }
         Command::Run {
             spec,
@@ -784,61 +839,134 @@ impl Drop for StopWatcher<'_> {
     }
 }
 
-/// Moruna 1.0 boots only the checked native microkernel artifact descriptor.
+/// The run's private host directory for its staged inputs and its output disk, removed with
+/// everything in it when the run ends, whatever the end (contract C7: nothing kept between runs).
+#[cfg(target_os = "linux")]
+struct Staging(PathBuf);
+#[cfg(target_os = "linux")]
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// How long a VM run took, part by part, in milliseconds: the line `moruna run --vm` prints on
+/// standard error (`arrow-core-0.7.md` §9: VM boot reported on its own).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VmTiming {
+    /// Inputs fetched to the host.
+    pub stage_ms: u64,
+    /// Artifacts checked and copied, disks opened, QEMU spawned and placed.
+    pub launch_ms: u64,
+    /// QEMU spawned to the guest's runtime saying hello: the boot.
+    pub boot_ms: u64,
+    /// Hello to the job's exit.
+    pub job_ms: u64,
+    /// The VM stopped and its outputs unpacked.
+    pub outputs_ms: u64,
+}
+
+impl VmTiming {
+    /// The line printed: `moruna run --vm: timing {...}`.
+    pub fn line(&self) -> String {
+        format!(
+            "moruna run --vm: timing {{\"stage_ms\":{},\"launch_ms\":{},\"boot_ms\":{},\
+             \"job_ms\":{},\"outputs_ms\":{}}}",
+            self.stage_ms, self.launch_ms, self.boot_ms, self.job_ms, self.outputs_ms
+        )
+    }
+}
+
+/// The run's output directory, refused before anything boots when it cannot take the outputs:
+/// named exactly when the image has an output disk, and new or empty.
+pub fn check_output(declared: u64, output: Option<&Path>) -> Result<(), String> {
+    match (declared > 0, output) {
+        (true, None) => Err(
+            "the image writes the job's outputs to an output disk; name the directory they go \
+             to with --output DIR"
+                .into(),
+        ),
+        (false, Some(_)) => Err("--output: the image has no output disk".into()),
+        (false, None) => Ok(()),
+        (true, Some(dir)) => match std::fs::symlink_metadata(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(m) if m.is_dir() => match std::fs::read_dir(dir).map(|mut d| d.next().is_none()) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(format!("--output {}: not empty", dir.display())),
+                Err(e) => Err(format!("--output {}: {e}", dir.display())),
+            },
+            Ok(_) => Err(format!("--output {}: not a directory", dir.display())),
+            Err(e) => Err(format!("--output {}: {e}", dir.display())),
+        },
+    }
+}
+
+/// Moruna 1.0 boots only the checked native microkernel artifact descriptor. The run's inputs
+/// are attached as read-only data disks and its outputs read back from its output disk
+/// (stream D, `moruna_vmm::data`).
 #[cfg(target_os = "linux")]
 fn run_vm(
     spec: &Path,
     image: &Path,
     plan: Option<&Path>,
     witness: &Path,
+    data: &VmData,
     cancel: CancelToken,
 ) -> i32 {
+    use moruna_vmm::error::VmmError;
+    let mut timing = VmTiming::default();
+    let mut output_disk: Option<PathBuf> = None;
+    let mut staging: Option<Staging> = None;
     let result = (|| -> moruna_vmm::error::Result<moruna_vmm::ExitStatus> {
         use std::io::Read as _;
         let mut bytes = Vec::new();
         std::fs::File::open(spec)
-            .map_err(|e| moruna_vmm::error::VmmError::io("open", spec.display().to_string(), &e))?
+            .map_err(|e| VmmError::io("open", spec.display().to_string(), &e))?
             .take(super::protocol::MAX_SPEC_LINE as u64 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|e| moruna_vmm::error::VmmError::io("read", spec.display().to_string(), &e))?;
+            .map_err(|e| VmmError::io("read", spec.display().to_string(), &e))?;
         if bytes.len() > super::protocol::MAX_SPEC_LINE {
-            return Err(moruna_vmm::error::VmmError::config(
+            return Err(VmmError::config(
                 "spec",
                 "exceeds canonical protocol ceiling",
             ));
         }
         let document = super::session::read_document(&bytes)
-            .map_err(|(_, e)| moruna_vmm::error::VmmError::config("spec", e.to_string()))?;
-        let budget = vm_budget(&document)
-            .map_err(|e| moruna_vmm::error::VmmError::config("budget", e.to_string()))?;
+            .map_err(|(_, e)| VmmError::config("spec", e.to_string()))?;
+        let budget = vm_budget(&document).map_err(|e| VmmError::config("budget", e.to_string()))?;
+        // What the image declares for data disks, checked against the job and the command line
+        // before anything is fetched or booted.
+        let declared = moruna_vmm::microkernel::inspect(image)?.data_disks;
+        let used = super::inputs::names_used(&document).map_err(|e| VmmError::config("spec", e))?;
+        super::inputs::check_used(&used, &declared.inputs)
+            .map_err(|e| VmmError::config("spec", e))?;
+        check_output(declared.output_bytes, data.output.as_deref())
+            .map_err(|e| VmmError::config("output", e))?;
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce)
-            .map_err(|e| moruna_vmm::error::VmmError::config("run directory", e.to_string()))?;
+            .map_err(|e| VmmError::config("run directory", e.to_string()))?;
         let name: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
         let directory = std::env::temp_dir().join(format!("moruna-node-{name}"));
         let executable = std::env::current_exe()
-            .map_err(|e| moruna_vmm::error::VmmError::io("resolve", "runtime executable", &e))?;
+            .map_err(|e| VmmError::io("resolve", "runtime executable", &e))?;
         let backend = executable
             .parent()
-            .ok_or_else(|| {
-                moruna_vmm::error::VmmError::config("backend", "executable parent unavailable")
-            })?
+            .ok_or_else(|| VmmError::config("backend", "executable parent unavailable"))?
             .join("moruna-vhost-vsock");
         let plan = plan
             .map(|path| {
                 use base64::Engine as _;
-                let metadata = std::fs::metadata(path)
-                    .map_err(|e| moruna_vmm::error::VmmError::io("metadata", "plan", &e))?;
+                let metadata =
+                    std::fs::metadata(path).map_err(|e| VmmError::io("metadata", "plan", &e))?;
                 if metadata.len() > super::protocol::MAX_SPEC_LINE as u64 {
-                    return Err(moruna_vmm::error::VmmError::config(
+                    return Err(VmmError::config(
                         "plan",
                         "exceeds canonical control ceiling",
                     ));
                 }
-                let bytes = std::fs::read(path)
-                    .map_err(|e| moruna_vmm::error::VmmError::io("read", "plan", &e))?;
+                let bytes = std::fs::read(path).map_err(|e| VmmError::io("read", "plan", &e))?;
                 super::session::read_plan(&bytes)
-                    .map_err(|e| moruna_vmm::error::VmmError::config("plan", e.to_string()))?;
+                    .map_err(|e| VmmError::config("plan", e.to_string()))?;
                 Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
             })
             .transpose()?;
@@ -849,12 +977,25 @@ fn run_vm(
             .as_deref()
             .and_then(moruna_kernel::RunId::from_hex)
             .ok_or_else(|| {
-                moruna_vmm::error::VmmError::config(
-                    "run",
-                    "native admission requires canonical document id",
-                )
+                VmmError::config("run", "native admission requires canonical document id")
             })?;
-        let mut run = super::native::NativeRun::start(
+        // The run's own host directory: its fetched inputs and its output disk.
+        let stage_dir = std::env::temp_dir().join(format!("moruna-data-{name}"));
+        std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+            .create(&stage_dir)
+            .map_err(|e| VmmError::io("create", stage_dir.display().to_string(), &e))?;
+        let stage_dir = staging.insert(Staging(stage_dir)).0.clone();
+        let fetching = std::time::Instant::now();
+        let inputs = super::inputs::stage(&data.inputs, &stage_dir, &document.object_store)
+            .map_err(|e| VmmError::config("input", e))?;
+        timing.stage_ms = fetching.elapsed().as_millis() as u64;
+        let devices = moruna_vmm::data::RunDevices {
+            inputs,
+            output: (declared.output_bytes > 0).then(|| stage_dir.join("output.disk")),
+            vcpu_cpus: data.vcpu_cpus.clone(),
+        };
+        output_disk = devices.output.clone();
+        let mut run = super::native::NativeRun::start_with(
             super::launch_witness::Admission {
                 run_id: assigned,
                 node_boot: moruna_kernel::RunId(nonce),
@@ -873,7 +1014,22 @@ fn run_vm(
             },
             super::protocol::Inbound::Spec { spec, plan },
             deadline,
+            &devices,
         )?;
+        let launched = run.timing();
+        timing.launch_ms = launched.launch.as_millis() as u64;
+        if let Some(placed) = run.placed() {
+            for (vcpu, tid, cpu) in &placed.vcpus {
+                eprintln!(
+                    "moruna run --vm: vCPU {vcpu} (host thread {tid}) runs on host CPU {cpu}"
+                );
+            }
+            eprintln!(
+                "moruna run --vm: {} other threads of the run kept off those CPUs",
+                placed.others
+            );
+        }
+        let spawned = std::time::Instant::now() - launched.connect;
         let control = run.control();
         let done = std::sync::atomic::AtomicBool::new(false);
         let result = std::thread::scope(|scope| {
@@ -889,6 +1045,7 @@ fn run_vm(
             });
             let outcome = (|| {
                 let mut messages = 0usize;
+                let mut hello: Option<std::time::Instant> = None;
                 loop {
                     let message = run.next(deadline)?;
                     let message = match message {
@@ -896,27 +1053,24 @@ fn run_vm(
                         super::native::Message::Event(event) => {
                             std::io::stdout()
                                 .write_all(event.json_line().as_bytes())
-                                .map_err(|e| {
-                                    moruna_vmm::error::VmmError::io(
-                                        "write",
-                                        "guest event output",
-                                        &e,
-                                    )
-                                })?;
+                                .map_err(|e| VmmError::io("write", "guest event output", &e))?;
                             messages += 1;
                             continue;
                         }
                     };
+                    if hello.is_none() {
+                        let now = std::time::Instant::now();
+                        timing.boot_ms = now.saturating_duration_since(spawned).as_millis() as u64;
+                        hello = Some(now);
+                    }
                     std::io::stdout()
                         .write_all(message.line().as_bytes())
-                        .map_err(|e| {
-                            moruna_vmm::error::VmmError::io("write", "guest output", &e)
-                        })?;
+                        .map_err(|e| VmmError::io("write", "guest output", &e))?;
                     messages += 1;
                     match message {
                         super::protocol::Outbound::PortCall { v, call, port, .. } => {
                             if v != super::protocol::PORTS_VERSION {
-                                return Err(moruna_vmm::error::VmmError::config(
+                                return Err(VmmError::config(
                                     "port",
                                     "unsupported guest port version",
                                 ));
@@ -931,6 +1085,7 @@ fn run_vm(
                             })?;
                         }
                         super::protocol::Outbound::Exit { code, .. } => {
+                            timing.job_ms = hello.map_or(0, |h| h.elapsed().as_millis() as u64);
                             return Ok(moruna_vmm::ExitStatus { code, messages });
                         }
                         _ => {}
@@ -941,7 +1096,9 @@ fn run_vm(
             let _ = watcher.join();
             outcome
         });
+        let stopping = std::time::Instant::now();
         let cleanup = run.shutdown();
+        timing.outputs_ms = stopping.elapsed().as_millis() as u64;
         let result = result.and_then(|status| cleanup.map(|()| status));
         // Preserve actual serial/backend diagnostics for a failed run.
         if result.is_ok() {
@@ -954,13 +1111,48 @@ fn run_vm(
         }
         result
     })();
-    match result {
+    let code = match result {
         Ok(status) => status.code,
         Err(error) => {
             eprintln!("moruna run --vm: {error}");
             error.exit_code()
         }
+    };
+    // C3: a completed run's outputs, from its output disk into the job's output directory.
+    let code = match (code, &output_disk, &data.output) {
+        (exit::COMPLETED, Some(disk), Some(out)) => {
+            let unpacking = std::time::Instant::now();
+            let unpacked = super::outputs::unpack(disk, out);
+            timing.outputs_ms += unpacking.elapsed().as_millis() as u64;
+            match unpacked {
+                Ok(done) => {
+                    eprintln!(
+                        "moruna run --vm: outputs in {}: {} files, {} directories, {} bytes{}",
+                        out.display(),
+                        done.files,
+                        done.directories,
+                        done.bytes,
+                        if done.links_skipped > 0 {
+                            format!(", {} symbolic links left out", done.links_skipped)
+                        } else {
+                            String::new()
+                        }
+                    );
+                    code
+                }
+                Err(why) => {
+                    eprintln!("moruna run --vm: the outputs were not read back: {why}");
+                    exit::FAILED
+                }
+            }
+        }
+        _ => code,
+    };
+    drop(staging);
+    if timing != VmTiming::default() {
+        eprintln!("{}", timing.line());
     }
+    code
 }
 
 /// Native historical read adapter used by the CLI. SDK/MCP embedders call `ReadPort` directly;
@@ -1029,6 +1221,7 @@ fn run_vm(
     _image: &Path,
     _plan: Option<&Path>,
     _witness: &Path,
+    _data: &VmData,
     _cancel: CancelToken,
 ) -> i32 {
     eprintln!(
@@ -1233,7 +1426,8 @@ mod tests {
                 spec: "job.json".into(),
                 image: "/node-image.json".into(),
                 plan: Some("/job.mplan".into()),
-                witness: "/launches".into()
+                witness: "/launches".into(),
+                data: VmData::default(),
             })
         );
         assert!(
@@ -1344,6 +1538,123 @@ mod tests {
             HEARTBEAT,
         );
         assert_eq!(code, exit::FAILED);
+    }
+
+    /// Stream D: a VM run binds the image's inputs, names its output directory and may place
+    /// its vCPUs; none of these is a host run's.
+    #[test]
+    fn a_vm_run_names_its_data_disks_and_placement() {
+        let base = [
+            "run",
+            "--vm",
+            "job.json",
+            "--image",
+            "/i.json",
+            "--launch-witness",
+            "/w",
+        ];
+        let with = |extra: &[&str]| {
+            let mut all: Vec<&str> = base.to_vec();
+            all.extend_from_slice(extra);
+            parse(&args(&all))
+        };
+        let parsed = with(&[
+            "--input",
+            "nyc=/data/nyc.parquet",
+            "--input",
+            "zones=s3://b/zones.parquet",
+            "--output",
+            "/out",
+            "--vcpu-cpus",
+            "2-3",
+        ])
+        .unwrap();
+        let Command::RunVm { data, .. } = parsed else {
+            panic!("{parsed:?}")
+        };
+        assert_eq!(
+            data,
+            VmData {
+                inputs: vec![
+                    ("nyc".into(), "/data/nyc.parquet".into()),
+                    ("zones".into(), "s3://b/zones.parquet".into())
+                ],
+                output: Some("/out".into()),
+                vcpu_cpus: vec![2, 3],
+            }
+        );
+        for (extra, why) in [
+            (
+                &["--input", "nyc=/a", "--input", "nyc=/b"][..],
+                "bound twice",
+            ),
+            (&["--input", "Bad=/a"][..], "is not one"),
+            (&["--input"][..], "needs NAME=URL"),
+            (&["--output", "/a", "--output", "/b"][..], "given twice"),
+            (&["--output"][..], "needs a directory"),
+            (&["--vcpu-cpus", "3-1"][..], "runs backwards"),
+            (&["--vcpu-cpus", "1", "--vcpu-cpus", "2"][..], "given twice"),
+            (&["--vcpu-cpus"][..], "needs a CPU list"),
+        ] {
+            let e = with(extra).unwrap_err();
+            assert!(e.contains(why), "{extra:?}: {e}");
+        }
+        for host in [
+            &["run", "job.json", "--input", "a=/a"][..],
+            &["run", "job.json", "--output", "/o"][..],
+            &["run", "job.json", "--vcpu-cpus", "1"][..],
+        ] {
+            assert!(
+                parse(&args(host)).unwrap_err().contains("need --vm"),
+                "{host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vm_run_reports_its_timing_and_checks_its_output_directory() {
+        let t = VmTiming {
+            stage_ms: 1,
+            launch_ms: 2,
+            boot_ms: 3,
+            job_ms: 4,
+            outputs_ms: 5,
+        };
+        assert_eq!(
+            t.line(),
+            "moruna run --vm: timing {\"stage_ms\":1,\"launch_ms\":2,\"boot_ms\":3,\"job_ms\":4,\"outputs_ms\":5}"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(t.line().split_once("timing ").unwrap().1).unwrap();
+        assert_eq!(json["boot_ms"], 3);
+        let dir = std::env::temp_dir().join(format!("m-check-output-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        check_output(0, None).unwrap();
+        assert!(
+            check_output(4096, None)
+                .unwrap_err()
+                .contains("--output DIR")
+        );
+        assert!(
+            check_output(0, Some(&dir))
+                .unwrap_err()
+                .contains("no output disk")
+        );
+        check_output(4096, Some(&dir)).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        check_output(4096, Some(&dir)).unwrap();
+        std::fs::write(dir.join("x"), b"x").unwrap();
+        assert!(
+            check_output(4096, Some(&dir))
+                .unwrap_err()
+                .contains("not empty")
+        );
+        assert!(
+            check_output(4096, Some(&dir.join("x")))
+                .unwrap_err()
+                .contains("not a directory")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1604,6 +1915,7 @@ mod run_vm_refusals {
             &dir.join("no-image.json"),
             plan,
             &dir.join("witness"),
+            &VmData::default(),
             CancelToken::new(),
         )
     }

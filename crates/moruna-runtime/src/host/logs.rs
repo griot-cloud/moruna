@@ -26,9 +26,14 @@
 //!   <task>/<first seq>.mrec`, the engine's under `_engine`), each written whole and renamed
 //!   into place, so a reader never sees half a segment;
 //! - at most every [`LOGS_EVERY`] the thread tells the peer how far each producer's records
-//!   reach now (`logs`), and once more when the run is over, with `drained`.
+//!   reach now (`logs`), and once more when the run is over, with `drained`;
+//! - each record the store keeps also goes to the peer on the connection, when there is one, as
+//!   the `log` event it is (its producer, its level, its line), held to the same per-producer
+//!   rate: the job updates carry the logs (`architecture/arrow-core-0.7.md` §6). A run in a VM
+//!   keeps its store in the VM's scratch, which goes with the VM (contract C7), so the peer is
+//!   where its logs live on.
 //!
-//! The peer hears counts. What the tasks printed stays in the store.
+//! The peer hears counts, and every record kept.
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -216,12 +221,18 @@ impl OutputSink for Sink {
     }
 }
 
+/// Where a kept `log` record goes beside the store: the peer on the connection.
+pub type SendRecord = Box<dyn Fn(&[u8]) + Send>;
+
 /// Where the writer tells its facts: the run's events, and the report's notes.
 pub struct Tell {
     /// One event, at the microsecond it became true.
     pub event: Box<dyn Fn(u64, Event) + Send>,
     /// A note for the report: why output was not kept.
     pub note: Box<dyn Fn(String) + Send>,
+    /// Each `log` record as it is kept, encoded, numbered by its producer: to the peer on the
+    /// connection. `None` keeps the records in the store alone.
+    pub record: Option<SendRecord>,
 }
 
 /// One attempt's output capture: the sink the run writes to, and the thread that keeps it.
@@ -967,6 +978,9 @@ impl Writer {
             }
         };
         producer.seq = seq;
+        if let Some(send) = &self.tell.record {
+            send(record);
+        }
         if producer.pending.is_empty() {
             producer.pending_first = seq;
             producer.pending_since = Some(Instant::now());

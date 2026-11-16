@@ -170,12 +170,17 @@ def main():
         shutil.copyfile(source, destination)
         writable_disks.append({"path": str(destination.relative_to(out)), "bytes": destination.stat().st_size, "serial": f"moruna-home-{index}"})
     (out / "mutable-inputs.json").write_text(json.dumps({str(p): artifact(p) for p in (out / "homes").glob("*.raw")}, indent=2) + "\n")
-    (out / "node-image.json").write_text(json.dumps({
+    descriptor = {
         "version": 1, "architecture": "x86_64", "boot_mode": "multiboot2",
         "kernel": artifact(payload / "moruna-kernel.elf"),
         "initramfs": artifact(payload / "initramfs.cpio"),
         "layers": layers, "writable_disks": writable_disks, "user_network": args.user_network, "cid": args.cid, "agent_port": args.agent_port, "resources": resources,
-    }, indent=2) + "\n")
+    }
+    # The engine's data disks, as configure.py granted them (stream D): the launcher binds a
+    # run's files to these names and attaches them in this order.
+    if "data_disks" in profile:
+        descriptor["data_disks"] = profile["data_disks"]
+    (out / "node-image.json").write_text(json.dumps(descriptor, indent=2) + "\n")
     (out / "inputs-and-artifacts.json").write_text(json.dumps(evidence, indent=2) + "\n")
     print(f"Packaged {disk}; boot and hardware validation remain required.")
 
