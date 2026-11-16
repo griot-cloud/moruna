@@ -66,7 +66,7 @@ pub(super) fn counted(f: impl FnOnce()) -> CallCounts {
 }
 
 #[ktest]
-pub(super) fn faults_map_through_the_core_and_unmaps_take_them_away() {
+fn faults_map_through_the_core_and_unmaps_take_them_away() {
     let (vmar, p) = shown_vmar();
     let addr = map_anon(&vmar, 0x100_0000, 8);
     // Before a fault the program sees nothing.
@@ -90,7 +90,7 @@ pub(super) fn faults_map_through_the_core_and_unmaps_take_them_away() {
 }
 
 #[ktest]
-pub(super) fn fault_around_maps_its_window_in_few_calls() {
+fn fault_around_maps_its_window_in_few_calls() {
     let (vmar, p) = shown_vmar();
     let vmo = VmoOptions::new(32 * PAGE_SIZE).alloc().unwrap();
     let bytes = vec![7u8; 32 * PAGE_SIZE];
@@ -183,4 +183,36 @@ fn a_thread_shows_its_space_in_its_own_process() {
         seen.lock().take().unwrap(),
         (Some(2 * PAGE_SIZE), true, 2, [9u8; 8])
     );
+}
+
+#[ktest]
+fn a_page_the_core_lags_on_shows_on_the_next_fault() {
+    let (vmar, p) = shown_vmar();
+    let addr = map_anon(&vmar, 0x700_0000, 2);
+    // The core refuses the map: the record has the page, the program does not.
+    emulated::refuse_next(emulated::Call::Map, emulated::CoreError::QuotaExceeded);
+    fault(&vmar, addr, true).unwrap();
+    assert!(emulated::pages(p).is_empty());
+    // The program faults again: the page shows, with no new frame.
+    let made = counted(|| fault(&vmar, addr, true).unwrap());
+    assert_eq!((made.maps, made.mapped_pages), (1, 1));
+    assert_eq!(emulated::pages(p)[&addr].prot, RW);
+    // Refused at the fault too: the program gets the error.
+    emulated::refuse_next(emulated::Call::Map, emulated::CoreError::QuotaExceeded);
+    fault(&vmar, addr + PAGE_SIZE, true).unwrap();
+    emulated::refuse_next(emulated::Call::Map, emulated::CoreError::NoMemory);
+    assert!(fault(&vmar, addr + PAGE_SIZE, true).is_err());
+
+    // Writable and executable: the core shows one side, and an instruction fetch turns it.
+    let code = vmar
+        .new_map(PAGE_SIZE, VmPerms::READ | VmPerms::WRITE | VmPerms::EXEC)
+        .offset(VmarMapOffset::FixedNoReplace(0x710_0000))
+        .build()
+        .unwrap();
+    fault(&vmar, code, true).unwrap();
+    assert_eq!(emulated::pages(p)[&code].prot, RW);
+    vmar.handle_page_fault(&PageFaultInfo::new(code, VmPerms::EXEC))
+        .unwrap();
+    assert_eq!(emulated::pages(p)[&code].prot, R | 4);
+    emulated::process_end(p);
 }

@@ -11,11 +11,13 @@ use alloc::{collections::BTreeMap, vec::Vec};
 use core::{alloc::Layout, cell::Cell};
 use std::{sync::Mutex, thread_local};
 
+/// The core's errors, for a refusal.
+pub use moruna_abi::Error as CoreError;
 use moruna_abi::{IMAGE_RANGE, map};
 
 use super::{
     PAGE_SIZE,
-    calls::{CoreError, Made, ProgramProcess},
+    calls::{Made, ProgramProcess},
 };
 use crate::mm::MAX_USERSPACE_VADDR;
 
