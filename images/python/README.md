@@ -34,6 +34,11 @@ ENV PYTHONPATH=/usr/lib/moruna MORUNA_PLANE=rings
 CMD ["python3", "-m", "moruna_shim", "mypackage.kernels:score"]
 ```
 
+The command is exec form, a JSON array: the engine resolves its first word against the
+image's `PATH` and the personality execs it. Never the shell form (`CMD python3 -m ...`),
+which is `sh -c`: the data OS never runs a shell (`architecture/data-os.md` §3a). The shim
+itself starts no process and no shell; a test checks its sources for it.
+
 `MODULE:FUNCTION` names a function that takes a `pyarrow.RecordBatch` and returns one. An
 image that does not declare `MORUNA_PLANE=rings` is served on its descriptors 0 and 1 as an
 Arrow IPC stream, which copies, as before.
@@ -42,6 +47,8 @@ Arrow IPC stream, which copies, as before.
 (20,000 by default).
 
 ## Tests
+
+On a workstation:
 
 ```bash
 cd images/python && python3 -m unittest discover -s tests

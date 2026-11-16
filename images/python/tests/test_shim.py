@@ -401,3 +401,46 @@ class Bells(unittest.TestCase):
         self.assertFalse(t.has_window())
         e.give(0)
         self.assertTrue(t.has_window())
+
+
+class NoShell(unittest.TestCase):
+    """The data OS never runs a shell, and a task starts by exec (data-os.md section 3a): the
+    shim starts no process at all."""
+
+    IMPORTS = ("subprocess", "pty", "multiprocessing", "shlex", "pexpect")
+    OS_CALLS = ("system", "popen", "fork", "forkpty", "posix_spawn", "posix_spawnp")
+
+    def test_the_shim_starts_no_process_and_no_shell(self):
+        import ast
+
+        here = os.path.join(os.path.dirname(__file__), "..", "moruna_shim")
+        for name in sorted(os.listdir(here)):
+            if not name.endswith(".py"):
+                continue
+            with open(os.path.join(here, name)) as f:
+                tree = ast.parse(f.read())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for a in node.names:
+                        self.assertNotIn(a.name.split(".")[0], self.IMPORTS, name)
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    self.assertNotIn(node.module.split(".")[0], self.IMPORTS, name)
+                elif (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "os"
+                ):
+                    attr = node.attr
+                    spawns = attr in self.OS_CALLS or attr.startswith(("exec", "spawn"))
+                    self.assertFalse(spawns, f"{name} calls os.{attr}")
+                elif isinstance(node, ast.keyword) and node.arg == "shell":
+                    self.fail(f"{name} passes shell=")
+                elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    for word in ("/bin/sh", "sh -c", "/bin/bash"):
+                        self.assertNotIn(word, node.value, name)
+
+    def test_the_readme_s_command_is_exec_form(self):
+        with open(os.path.join(os.path.dirname(__file__), "..", "README.md")) as f:
+            for line in f:
+                if line.startswith(("CMD", "ENTRYPOINT")):
+                    self.assertTrue(line.split(None, 1)[1].startswith("["), line)

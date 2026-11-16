@@ -3,7 +3,9 @@
 `serve(fn)` runs a batch function as a stage's task: each batch the engine posts is read in
 place from the task's input region as a `pyarrow.RecordBatch` (`pyarrow.foreign_buffer` over
 the mapping), and the batch `fn` returns is written as a record into a window and posted.
-One interpreter per process; a stage runs as many processes as it asks for. An image whose
+One interpreter per process; a stage runs as many processes as it asks for. The image's
+command is exec form (`python3 -m moruna_shim MODULE:FUNCTION`), and the shim starts no
+process and no shell (`architecture/data-os.md` section 3a). An image whose
 layer sets `MORUNA_PLANE=rings` is served this way; any other is served on its descriptors
 0 and 1.
 """
