@@ -428,6 +428,26 @@ process dp-revoke
   faults page fault at
 link supervisor.datapath datapath.supervisor
 
+# stream P
+# DS-P (architecture/data-os.md section 5, stream P): ring mode. An engine on RingPlane runs
+# ring-task, which maps its region and its rings object once and sleeps on its bell only when
+# it has nothing to do: 200 batches in lockstep and a group of 32 in flight, each read in
+# place, each record checked after the grouped revoke through the task's output slot. Then
+# the task writes the window of its last record: the write faults, and the record the engine
+# checked is unchanged (DP1).
+process rings
+  handle console console
+  handle program:ring-task task-image
+  handle data:plane/good.fixture good
+  expect DS-P ring: ok:
+  expect DS-P pipelined: ok:
+  expect DS-P copies: ok:
+  expect DS-P revoke: ring-task writes a posted window
+  expect kk: process ring-task faulted: page fault at
+  expect DS-P revoke: ok:
+  exits 0
+link supervisor.rings rings.supervisor
+
 # stream B1 (data-os-streams.md, kernel-is-the-machine.md 4.1): the personality's four
 # mechanisms in the core, with no personality present. A sleeping thread is interrupted;
 # a snapshot and a clone copy on write; a pager serves one fault and refuses another,

@@ -683,6 +683,12 @@ impl Rings {
         });
     }
 
+    /// Where window `w` starts in this task: for a test that writes a window it posted, which
+    /// must fault once the engine has taken it.
+    pub fn window_addr(&self, w: u64) -> u64 {
+        self.rings.addr + self.half.geometry.window_at(w)
+    }
+
     /// Unmap mode: hands the rings object back with the records posted on it, which leaves
     /// the task, and maps the next one the engine gives (waiting for it).
     pub fn hand_back(&mut self) -> Result<()> {

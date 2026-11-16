@@ -152,6 +152,8 @@ pub struct Counters {
     pub sleeps: u64,
     /// Wakes the engine called on a task's bell (only when the task said it waits).
     pub bells: u64,
+    /// Sleeps the engine took on its own bell: each one futex wait.
+    pub bell_sleeps: u64,
 }
 
 /// A window of the current rings object.
@@ -739,10 +741,12 @@ impl<C: RingCalls> RingPlane<C> {
             .map(|w| [g.window_at(*w), g.window_bytes])
             .collect();
         if t.mode == Mode::Protect && !revoked.is_empty() {
-            self.plane
-                .calls
-                .protect(&t.output, &revoked, true)
-                .map_err(kernel)?;
+            match self.plane.calls.protect(&t.output, &revoked, true) {
+                Ok(()) => {}
+                // The task no longer maps its rings object: nothing to give it.
+                Err(Error::BadState) => return Ok(()),
+                Err(e) => return Err(kernel(e)),
+            }
             self.counters.regrants += 1;
         }
         let view = self
@@ -977,11 +981,13 @@ impl<C: RingCalls> RingPlane<C> {
                             [at, pages(e.len).unwrap_or(e.len)]
                         })
                         .collect();
-                    // DP1: no record is read before the task can no longer write it.
-                    self.plane
-                        .calls
-                        .protect(&t.output, &ranges, false)
-                        .map_err(kernel)?;
+                    // DP1: no record is read before the task can no longer write it. The
+                    // slot form refuses with `BadState` when no process maps the rings
+                    // object any more (the task ended): then none can write it either.
+                    match self.plane.calls.protect(&t.output, &ranges, false) {
+                        Ok(()) | Err(Error::BadState) => {}
+                        Err(e) => return Err(kernel(e)),
+                    }
                     self.counters.revokes += 1;
                     let key = t.rings;
                     self.take_records(id, key, &group)?;
@@ -1405,6 +1411,7 @@ impl<C: RingCalls> DataPlane for RingPlane<C> {
                     }
                 };
                 self.counters.sleeps += 1;
+                self.counters.bell_sleeps += 1;
                 let woke = view.wait(layout::ENGINE_BELL, seq, deadline);
                 if let Some(t) = self.tasks.get(&id) {
                     t.engine.awake(&*view);

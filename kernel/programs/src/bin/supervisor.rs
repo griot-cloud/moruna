@@ -57,6 +57,8 @@ fn run() -> i64 {
     let datapath = Channel(slot("datapath"));
     // stream B1 hook
     let personality = Channel(slot("personality"));
+    // stream P hook: the rings' test (DS-P) starts its ring task.
+    let rings = Channel(slot("rings"));
     if abi_version() != moruna_sys::ABI_VERSION {
         println!(
             out,
@@ -258,6 +260,15 @@ fn run() -> i64 {
     };
     if let Err((e, _)) = personality.write(b"process", [for_personality]) {
         return fail(&out, "handing the personality test its process resource", e);
+    }
+    // stream P hook (data-os.md section 5): the rings' test starts its ring task with a
+    // process resource of its own.
+    let for_rings = match root_process.duplicate(Rights::WRITE | Rights::TRANSFER) {
+        Ok(h) => h,
+        Err(e) => return fail(&out, "duplicating the process resource", e),
+    };
+    if let Err((e, _)) = rings.write(b"process", [for_rings]) {
+        return fail(&out, "handing the rings' test its process resource", e);
     }
     // SDD 25: the device manager does the device work with the device roots.
     if let Err((e, _)) = devices.write(

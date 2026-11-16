@@ -147,8 +147,8 @@ impl Calls for Kernel {
 }
 
 /// Whether the kernel takes write access back through a slot (`windows_protect`'s slot form),
-/// so ring tasks run in protect mode.
-pub const SLOT_REVOKE: bool = false;
+/// so ring tasks run in protect mode: stream A's 28ed2f43, booted.
+pub const SLOT_REVOKE: bool = true;
 
 /// The engine's mapping of a region or a rings object.
 #[derive(Debug)]
@@ -213,8 +213,8 @@ impl RingCalls for Kernel {
         moruna_sys::datapath::windows_protect_slot(slot, ranges, flags)
     }
 
-    /// Off until stream A's kernel takes the slot form: the integrator says when. Until then
-    /// a task hands its rings object back with `batch_put`, today's unmap path.
+    /// On since stream A's kernel takes the slot form. Off, a task hands its rings object
+    /// back with `batch_put`, the unmap path.
     fn revokes(&mut self, _slot: &Slot) -> bool {
         SLOT_REVOKE
     }

@@ -121,6 +121,10 @@ impl RingCalls for Model {
             return Err(Error::BadSyscall);
         }
         let mut s = slot.borrow_mut();
+        // As the kernel's slot form: no process maps the slot's object any more.
+        if s.current.is_none() && !ranges.is_empty() {
+            return Err(Error::BadState);
+        }
         for [at, len] in ranges {
             if at % PAGE != 0 || len % PAGE != 0 {
                 return Err(Error::InvalidArgs);
