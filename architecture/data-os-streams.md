@@ -114,7 +114,9 @@ and switches to the new one when the call answers.
 
 - **Owns:**
   - `kernel/core/src/personality.rs` and `kernel/sys/src/personality.rs`;
-  - `kernel/core/src/{foreign,usercopy}.rs`;
+  - `kernel/core/src/{foreign,usercopy,futex}.rs`. `futex.rs` was added on 2026-11-16: words in a
+    memory object mapped into several processes are keyed by the object and offset, not by
+    process. B2's personality locks need that, and so do P's engine-to-task rings;
   - in `vm.rs`: `Space::fault` and the stream B1 block;
   - the stream B1 blocks in `memory.rs` and `process.rs`;
   - the user-mode loop's syscall branch in `process.rs` (lines around 976).
@@ -126,6 +128,11 @@ and switches to the new one when the call answers.
   - copy-on-write snapshots and address-space clones;
   - a user pager;
   - thread state and interruption.
+
+  - shared futexes, keyed by memory object and offset for shared mappings;
+  - a fault-tolerant copy: `personality_set` registers a copy routine's range and a recovery
+    address, and a fault in that range resumes at the recovery address with the fault address in
+    `rdx`. B2 asked for this on 2026-11-16.
 
   Its first commit fixes the wrappers' arguments in `moruna_sys::personality`, so B2 can build
   against them.
