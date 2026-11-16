@@ -562,3 +562,28 @@ and switches to the new one when the call answers.
   - **Open:** ping-pong on 1 and 2 CPUs read 7.69 s and 6.74 s against 6.15 s and 5.30 s
     before, with the boot now carrying A's, P's and E's tests on the same CPUs. B1 measures it
     alone in its next slot before and after `SHARE_HANDLES`, to rule a regression out.
+- **2026-11-16: stream D merged** (`e39b8f0e`, from `e8c18316`). `moruna run JOB --output DIR
+  --report FILE` is a VM run: the job's local inputs become `disk://` data disks, the output
+  disk is unpacked into DIR, and the report carries `vm` (`boot_s`, `launch_s`, `stage_s`,
+  `node_s`, `job_s`, `outputs_s`, `total_s`). Log records ride the run's events at the
+  connection's own rate. Coverage on moruna-bench: `moruna-vmm` 84.6%, `moruna-runtime` 83.3%.
+  - **Tick isolation measured:** with `nohz_full`, `isolcpus=domain,managed_irq` and
+    `rcu_nocbs` on the vCPUs' cores and the launcher's placement, a quiet boot loses
+    0.058-0.073% of a 300 ms spin, against 1.45% with the host tick on. Host settings for
+    Griot's node are in `kernel/node/HOST.md`.
+  - **The KVM end to end did not run.** moruna-bench has no QEMU with both KVM and seccomp
+    (`/opt/qemu` lacks seccomp, `/opt/qemu-proof` lacks KVM), and the launcher always jails
+    QEMU with `-sandbox`. Under TCG the run reached the engine's first touch of its data disks,
+    where the guest panicked on OSTD's missing user page fault handler. That is the panic B1
+    fixed in `fdece684`; D's branch predated it, and the merged head has it.
+  - **Integrator's call:** the launcher keeps `-sandbox`. moruna-bench gets one QEMU built
+    from the repo's pinned 10.2.1 source with KVM, seccomp, vhost-user and slirp, then D's
+    harness (`/home/bench/d/d-e2e.sh`) runs at the merged head before E's NYC gate.
+  - **For E:** a 24 GiB-budget document gets a 27 GiB VM by default; the gate passes
+    `--memory-gib 24` with a budget of 20.6 GiB or less. A run takes at most 40 data disks,
+    so Overture's 240 files need C's multi-file input on one disk; NYC (12) and FineWeb (20)
+    fit.
+  - **Open, for Brackly:** the image tool's `Description::programs()` fails every image build
+    on a `-` driver line (D's one-line fix, in `kernel/tools/image/src/lib.rs`, was blocked
+    by the permission classifier, so it waits for you). `node-for-job.py` works around it per
+    node. `node-for-job.py` runs under `python3` on the host and is to be ported to Rust.
