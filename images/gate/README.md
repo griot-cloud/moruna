@@ -11,6 +11,7 @@ runtime, so it is its own Cargo workspace, as `images/python` is stream P's.
 | `record/` | A function on the data plane: a page-aligned input record read in place, the output record written into a window (`apply`), `no_std`, safe |
 | `tasks/` | The seven native tasks, `gate-JOB`, static programs of `x86_64-moruna-user` on `moruna_sys::plane` (`tasks/build.sh`) |
 | `baseline/` | `gate-baseline`, the PM's control 2 (a rayon pool over arrow-rs and parquet), and `gate-canon`, the canonical hash of any engine's output |
+| `py066/` | `moruna_gate`, the PM's control 1: the seven ports as a Python extension 0.6.6's `moruna.run` runs (`check.py` checks a build against the fixtures) |
 | `fixtures/` | The oracle's inputs and Python's outputs (`bench/vm/gate_oracle.py`), and `manifest.json` |
 | `functions/data/` | NumPy's draws, exported bit for bit: Score's weights and the hour tables, FineWeb's permutations |
 
@@ -78,6 +79,23 @@ engine's record check, and finds it bit for bit the arrow-rs port's.
 The oracle ran on macOS arm64: Python 3.14.3, NumPy 2.4.2 (Accelerate's BLAS), pyarrow 24.0.0,
 shapely 2.1.2 on GEOS 3.13.1. 0.6.6's benchmark ran on x86-64 Linux; the gate's first VM run
 compares the ports with 0.6.6's own outputs there, on the real data, by the same hash.
+
+## The same function on 0.6.6 (the PM's control 1)
+
+0.6.6 cannot name a Rust function in a job. The `rust` entry of strict-guest-kernels
+(`0796bb1a`, PR #44, shipped in 0.5.1) looked a kernel up in a table the embedding binary
+compiled in; MC1 (`dab9f3ed`, 0.5.8) replaced it with the registry of kinds, and
+`architecture/sdd/18-kinds.md` (KD-I7) records that `rust` is not registered. On 0.6.6
+(`fix/adaptive-runtime`) a job naming it is refused ("no function kind `rust` is registered;
+this build runs image, package, std"), and the wheel's `moruna.run` and `moruna run` start from
+`Registry::standard()` with no hook for a Rust kind.
+
+What 0.6.6 does run is any Python callable, so `py066/` builds the ports as an extension module,
+`moruna_gate`, whose functions take a pyarrow `RecordBatch` and return one over the Arrow C data
+interface, with the GIL released and free-threading declared. `runner.py`'s `moruna066-rust`
+engine runs `moruna.run(ParquetSource, [moruna.function(moruna_gate.JOB)], ParquetSink)`, the
+same as its `moruna` engine with the Python function: 0.6.6 timed with the Rust function, and the
+report says how. `py066/check.py` finds every fixture case matching through it.
 
 ## gate-canon/1
 

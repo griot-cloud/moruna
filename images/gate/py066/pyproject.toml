@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "moruna-gate"
+version = "0.7.0"
+description = "The 0.7 gate's Rust functions for Moruna 0.6.6"
+requires-python = ">=3.14"
+dependencies = ["pyarrow>=14"]
+
+[tool.maturin]
+module-name = "moruna_gate._native"
+python-source = "python"
