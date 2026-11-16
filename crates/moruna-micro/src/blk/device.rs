@@ -2,13 +2,12 @@
 //! process brings its device up (`kernel/drivers/virtio-blk`), with `moruna-pci`'s
 //! configuration space and MSI-X code and `moruna-virtio`'s transport and split queue.
 //!
-//! The supervisor grants a disk as one channel under the disk's start-page name, whose one
-//! message carries the function's handles and, as its bytes, their names in order: `config`
-//! (its configuration window), `msi` (its MSI slots), `dma` (its DMA resource) and one `barN`
-//! for each memory BAR. The channel is a connection to the disk's hand-over program
-//! (`kernel/engine`'s `disk-grant`, which the device manager starts for the disk), made by the
-//! supervisor's `grant disk.in.NAME lookup SERVICEn`. The disk's file length is its virtio-blk serial, in decimal, when the
-//! launcher set one; otherwise its capacity.
+//! The device manager hands a data disk's function to the engine's supervisor once
+//! (`hand_over`), and the supervisor grants it to the engine as one channel under the disk's
+//! start-page name, whose one message carries the function's handles and, as its bytes, their
+//! names in order: `config` (its configuration window), `msi` (its MSI slots), `dma` (its DMA
+//! resource) and one `barN` for each memory BAR. The disk's file length is its virtio-blk
+//! serial ([`devices::length_of`]); with none, its capacity.
 
 use std::sync::Arc;
 
@@ -25,6 +24,7 @@ use super::disk::{Disk, Futex, Port};
 use super::engine::{Engine, ID_BYTES, Kind, Op, SLOT, Slots};
 use super::plan;
 use crate::arena::{Objects, Pins};
+use crate::devices;
 
 /// virtio-blk feature bits (virtio 1.2, 5.2.3).
 pub const F_SEG_MAX: u64 = 1 << 2;
@@ -34,8 +34,11 @@ pub const F_RO: u64 = 1 << 5;
 pub const F_BLK_SIZE: u64 = 1 << 6;
 /// The device has a write cache to flush.
 pub const F_FLUSH: u64 = 1 << 9;
-/// A modern virtio-blk function's device id, and a transitional one's.
-pub const DEVICE_IDS: [u16; 2] = [moruna_virtio::MODERN_BASE + kind::BLOCK, 0x1001];
+/// A data disk's device id (transitional virtio-blk), and a modern virtio-blk function's.
+pub const DEVICE_IDS: [u16; 2] = [
+    devices::DATA_DISK_DEVICE_ID,
+    moruna_virtio::MODERN_BASE + kind::BLOCK,
+];
 /// The MSI-X entry the queue interrupts through.
 pub const VECTOR: u16 = 0;
 /// Requests one disk keeps in flight at most: a slot each.
@@ -100,17 +103,9 @@ impl<T> Grant<T> {
     }
 }
 
-/// The length a serial names, when it is a decimal number of at most `capacity`.
+/// The length a serial states ([`devices::length_of`]), when it is at most `capacity`.
 pub fn serial_length(serial: &[u8], capacity: u64) -> Option<u64> {
-    let text = serial.split(|b| *b == 0).next()?;
-    if text.is_empty() || !text.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    std::str::from_utf8(text)
-        .ok()?
-        .parse::<u64>()
-        .ok()
-        .filter(|n| *n <= capacity)
+    devices::length_of(serial).filter(|n| *n <= capacity)
 }
 
 /// A mapped window, read and written as `moruna-mmio` reads and writes a mapping on the
@@ -238,8 +233,8 @@ impl Port for Device {
 /// How long the engine waits for a disk's hand-over message.
 pub const GRANT_WAIT_NS: u64 = 30_000_000_000;
 
-/// Takes the grant under `slot`: the one message on its channel, which the disk's hand-over
-/// program (`kernel/engine`'s `disk-grant`) writes when the supervisor's lookup connects to it.
+/// Takes the grant under `slot`: the one message on its channel, which the supervisor writes
+/// from the device manager's `hand_over` before it starts the engine.
 pub fn take(slot: &str) -> Result<Grant<Handle>, String> {
     let channel = Channel(
         crate::start::take(slot).ok_or_else(|| format!("the engine was granted no `{slot}`"))?,

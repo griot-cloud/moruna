@@ -429,7 +429,7 @@ fn drive(
                 pretouch: false,
             };
             let arena = data_os::arena(config, granted.as_ref())?;
-            (data_os::allocator(&arena, granted.as_ref()), Some(arena))
+            (arena.clone() as Arc<dyn Allocator>, Some(arena))
         }
     };
 
@@ -814,6 +814,8 @@ fn drive(
             // Discovery measures no disk bandwidth: the scheduler's declared figure, what a
             // lookahead plays a spill and a read-back at.
             disk_bytes_per_second: moruna_scheduler::DISK_BYTES_PER_SECOND,
+            // Stream C (data OS, C5): each worker placed on a core as it starts.
+            on_worker_start: data_os::worker_start(granted.as_ref()),
         },
         pipeline,
         placement.clone(),
@@ -2314,16 +2316,18 @@ mod staging_segment_tests {
 mod data_os {
     use std::sync::Arc;
 
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use moruna_arena::{Arena, ArenaConfig};
     use moruna_kernel::{Allocator, MorunaError, ObjectMetadata, Reactor, RunId, Tier};
-    use moruna_micro::arena::{Placed, pin_calling_thread};
     pub(crate) use moruna_micro::blk::Granted;
+    use moruna_scheduler::WorkerStart;
 
     use crate::error::Result;
 
-    /// Where the sinks' files are inside the VM: the layer's root. Only `/tmp` is writable
-    /// there.
-    pub(crate) const OUTPUT_ROOT: &str = "/tmp/out";
+    /// Where the sinks' files are inside the VM: the layer's root (`MORUNA_OUTPUT_ROOT`
+    /// overrides it).
+    pub(crate) const OUTPUT_ROOT: &str = "/out";
 
     pub(crate) fn take() -> Result<Option<Granted>> {
         Granted::take().map_err(|msg| {
@@ -2342,15 +2346,20 @@ mod data_os {
         })
     }
 
-    pub(crate) fn allocator(arena: &Arc<Arena>, granted: Option<&Granted>) -> Arc<dyn Allocator> {
-        match (granted, moruna_micro::start::kernel()) {
-            (Some(_), Some(kernel)) => Arc::new(Placed::new(
-                Arc::clone(arena) as Arc<dyn Allocator>,
-                kernel.cpus,
-                pin_calling_thread,
-            )),
-            _ => Arc::clone(arena) as Arc<dyn Allocator>,
-        }
+    /// Workers placed on a core, and placements the kernel refused.
+    static PLACED: AtomicU64 = AtomicU64::new(0);
+    static REFUSED: AtomicU64 = AtomicU64::new(0);
+
+    /// Places worker `n` on CPU `n % cpus` as it starts, once: a place, never a function.
+    pub(crate) fn worker_start(granted: Option<&Granted>) -> Option<WorkerStart> {
+        granted?;
+        let cpus = moruna_micro::start::kernel()?.cpus.max(1) as u32;
+        Some(WorkerStart(Arc::new(move |worker| {
+            match moruna_sys::datapath::pin_current_thread(Some(u32::from(worker) % cpus)) {
+                Ok(()) => PLACED.fetch_add(1, Ordering::Relaxed),
+                Err(_) => REFUSED.fetch_add(1, Ordering::Relaxed),
+            };
+        })))
     }
 
     #[allow(clippy::type_complexity)]
@@ -2404,6 +2413,11 @@ mod data_os {
             let _ = std::fs::remove_file(&file);
         }
         notes.extend(granted.notes());
+        notes.push(format!(
+            "data OS: {} workers placed on cores, {} placements refused",
+            PLACED.load(Ordering::Relaxed),
+            REFUSED.load(Ordering::Relaxed)
+        ));
         failure
     }
 
@@ -2457,8 +2471,8 @@ mod data_os {
         Ok(Arena::new(config)?)
     }
 
-    pub(crate) fn allocator(arena: &Arc<Arena>, _: Option<&Granted>) -> Arc<dyn Allocator> {
-        Arc::clone(arena) as Arc<dyn Allocator>
+    pub(crate) fn worker_start(_: Option<&Granted>) -> Option<moruna_scheduler::WorkerStart> {
+        None
     }
 
     #[allow(clippy::type_complexity)]

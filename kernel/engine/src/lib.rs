@@ -14,6 +14,8 @@
 //! grant network service network      # fresh connection from explicitly granted listener
 //! grant image data image               # slot `image`: a read-only duplicate of the supervisor's
 //!                                      # own data handle `image`, the attached image's record
+//! grant disk.in.nyc disk data0          # slot `disk.in.nyc`: data disk `data0`, which the device
+//!                                      # manager hands over once through the `handover` slot
 //! runs 3                              # how many times it is started, one after another
 //! ```
 //!
@@ -44,6 +46,10 @@ pub enum Source {
     Service(String),
     /// Already-connected private storage authority and canonical Admission data.
     Admission { authority: String, control: String },
+    /// A data disk the device manager hands over (`hand_over`), by its device name
+    /// (`data0`): a channel whose one message carries the disk's function, which the engine
+    /// drives itself (`architecture/data-os.md` §3). Only `disk.*` slots take one.
+    Disk(String),
 }
 
 /// One handle the engine starts with.
@@ -65,16 +71,6 @@ pub struct Config {
     pub scratch: u64,
     pub grants: Vec<Grant>,
     pub runs: u32,
-}
-
-/// The names a data disk's hand-over message gives its handles, in order (`disk-grant`):
-/// the configuration window, the MSI slots, the DMA resource, then each memory BAR.
-pub fn disk_names(bars: &[usize]) -> String {
-    let mut names = String::from("config msi dma");
-    for b in bars {
-        names.push_str(&format!(" bar{b}"));
-    }
-    names
 }
 
 /// The most runs one boot asks for.
@@ -209,10 +205,22 @@ impl Config {
                         {
                             Source::Service(String::from(from))
                         }
+                        (Some("disk"), Some(device), None)
+                            if slot.starts_with("disk.") && slot_ok(device) =>
+                        {
+                            if grants
+                                .iter()
+                                .any(|g| g.source == Source::Disk(device.into()))
+                            {
+                                return Err(refuse("a data disk is granted to one slot"));
+                            }
+                            Source::Disk(String::from(device))
+                        }
                         _ => {
                             return Err(refuse(
                                 "a grant is `grant SLOT lookup SERVICE`, `grant SLOT personality` \
-                                 or `grant SLOT data SLOT` or `grant SLOT service SLOT`",
+                                 or `grant SLOT data SLOT` or `grant SLOT service SLOT` or \
+                                 `grant disk.SLOT disk DEVICE`",
                             ));
                         }
                     };
@@ -257,9 +265,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_disks_hand_over_names_its_handles_in_order() {
-        assert_eq!(disk_names(&[]), "config msi dma");
-        assert_eq!(disk_names(&[4, 1]), "config msi dma bar4 bar1");
+    fn a_data_disk_is_granted_to_a_disk_slot_once() {
+        let base = "program /e\nmemory 4096\nscratch 4096\n";
+        let c = Config::parse(&format!(
+            "{base}grant disk.in.nyc disk data0\ngrant disk.out disk data1\n"
+        ))
+        .expect("parses");
+        assert_eq!(c.grants[0].source, Source::Disk("data0".into()));
+        assert_eq!(c.grants[1].slot, "disk.out");
+        for (grants, why) in [
+            ("grant vsock disk data0\n", "line 4: a grant is"),
+            ("grant disk.in.a disk\n", "line 4: a grant is"),
+            ("grant disk.in.a disk Data0\n", "line 4: a grant is"),
+            (
+                "grant disk.in.a disk data0\ngrant disk.in.b disk data0\n",
+                "line 5: a data disk is granted to one slot",
+            ),
+        ] {
+            let e = Config::parse(&format!("{base}{grants}")).unwrap_err();
+            assert!(e.starts_with(why), "{grants}: {e}");
+        }
     }
 
     const GOOD: &str = "# the engine\n\
