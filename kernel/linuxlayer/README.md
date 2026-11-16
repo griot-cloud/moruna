@@ -158,27 +158,65 @@ handlers' carried code stays in the tree, unreachable: removing it would leave p
 - **The launcher** (`launch/src/launcher.rs`) creates the process, maps each segment as an
   object of its own, maps the first stack, grants the handles it is given plus the
   process's own as `self`, gives the process its region with the copy routines
-  (`personality_set_with_copy`) and launches it. `launch_task` gives a task's process its
-  data plane first. `linuxlayer-boot` launches it with the slots `console`, `initramfs`
-  and, if given, `cmdline`.
+  (`personality_set_with_copy`) and launches it. `launch_with` also charges the process to
+  an account, attaches a task's plane (and grants its slots as `input` and `output`), and
+  runs a hook just before the start. `linuxlayer-boot` launches it with the slots
+  `console`, `initramfs`, `processes` and, if given, `cmdline`.
 - **A task's slots** (`linuxlayer_launch::slot`): `filesystem`, its own connection to the
   image filesystem, which becomes the root; `scratch`, the account whose limit `/tmp`
-  holds; `input` and `output`, the plane's slots to wait on; `log`, the engine's log ring;
-  and `cmdline`, `init=PROGRAM -- ARGS`. Without `filesystem` the personality boots on its
-  initramfs.
+  holds; `input` and `output`, the plane's slots to wait on; `log`, the log ring its
+  descriptors 1 and 2 write records to; `processes`, the process resource `fork` clones
+  from; `command`, the program, its arguments and environment (`launch::command`); and
+  `report`, a page the personality writes how the task ended on (`launch::report`: exited
+  or signaled, the code, the calls served and refused, or the errno of a program that could
+  not start). Without `filesystem` the personality boots on its initramfs, running
+  `cmdline`'s `init=PROGRAM -- ARGS`.
 - **The image** (`personality/`) is built from position-independent code
   (`-C relocation-model=pie`, so it reaches its addresses) and linked at its address
   (`personality.ld`). Its start records the start page and the first thread's block, runs
   the constructors `inventory` registers with, reads its slots, gives the layer its boot
-  information (the command line, the initramfs, a 1 GiB memory budget, the clocks) and runs
-  the layer's boot in a task, with the core's console as the layer's serial console. The
-  layer ends the process when its init process ends.
+  information (the command line, the initramfs, its account's limit as its memory, which
+  `/proc/meminfo` and `sysinfo` report, the clocks) and runs the layer's boot in a task,
+  with the core's console as the layer's serial console. The layer ends the process when
+  its init process ends, killing the task's other processes first.
 - **The booted test** (`boot/boot.sh MODE`) builds the kernel, the image and
   `linuxlayer-boot`, an initramfs with the mode's program, renders `boot/MODE.image` and
   boots it under QEMU, then checks the lines it expects: `musl` runs a static musl program
   as `/init` (kernel/linux's LX-T10), `glibc` a dynamic glibc one with its interpreter and
   libraries (LX-T12), `fork` a static program that forks two generations. There is no
   shell in the image.
+
+## The `linux` server
+
+`server/` is the drop-in `linux` server: it speaks `linux-protocol` 3.0 as
+`kernel/linux/server` did, so `linux-test`, KD1, the engine's supervisor and
+`moruna-micro` are unchanged, and `kernel/linux/{core,server}` are gone. Each request's
+program runs on a personality of its own:
+
+- The server makes the program's process with the launcher and grants it its own image
+  filesystem connection, the console, the process resource, the command, a report page and
+  a log ring; `run_plane` adds the plane's slots and the engine's ring, `run_plane` and
+  `run_granted` the account the process is charged to, and `run_granted` its scratch
+  account. The supervisor's guardian holds the process from just before it starts.
+- For `run` and `run_granted` the ring is the server's: it reads it every 20 ms, echoes each
+  line to the console (`linux lx-NAME: ...`) and keeps the first `OUTPUT_MAX` bytes for the
+  answer. At the process's end the answer is made from the report: exited or signaled with
+  the code, the calls served and refused; a process that ended without a report (killed, or
+  out of its account) answers `FAULTED`; a program that never started answers `NotFound` or
+  `NotExecutable`.
+- At most 24 programs run at once (`Busy` past it), and a closed connection ends the
+  programs it started, as before.
+- The personality's image is in the server (`LINUXLAYER_PERSONALITY` names it at the
+  build), so a boot or node image starts `linux` as it started the old one;
+  `kernel/tools/build.sh` builds the personality, then the server, and puts it in place.
+- Not yet: `run_granted`'s handles are held for the task's life and are not the program's
+  until the native-call entry exists; `run_plane`'s `assets` is not mounted.
+
+`check/` is B2-fs's booted check through a real task start (`B2 task` in
+`kernel/initramfs/boot.image`): `linuxlayer-check` runs `boot/programs/taskcheck.c` with
+`run_granted`, an account and a scratch account, and the program checks the image's root,
+the `/proc` and `/sys` paths programs read, `/tmp`'s quota, epoll control from a POSIX
+thread and descriptor 2. Descriptors 0 and 1 as Arrow are KD1's `shimless` case.
 
 ## A task's processes: shared memory and `fork`
 
@@ -309,7 +347,8 @@ The booted test, on Linux x86-64 with QEMU and musl (KVM when usable):
 kernel/linuxlayer/boot/boot.sh [OUT] [TIMEOUT_SECONDS] [musl|glibc|fork|gvisor]
 ```
 
-For the Moruna user target, as `kernel/tools/build.sh` builds programs:
+For the Moruna user target, as `kernel/tools/build.sh` builds programs (the server needs
+`LINUXLAYER_PERSONALITY`, the built personality's path):
 
 ```sh
 RUSTFLAGS="-C relocation-model=static -C relro-level=off -C force-unwind-tables=yes --check-cfg cfg(ktest) -C no-redzone=y" \

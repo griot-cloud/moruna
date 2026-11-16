@@ -352,8 +352,21 @@ fn ended_text(e: &Ended) -> String {
     format!(
         "{how_}; {} calls served; refused: {}",
         e.served,
-        moruna_linux::refused::Refused::render(&e.refused)
+        refused(&e.refused)
     )
+}
+
+/// `number xcount`, joined by commas; `none` when nothing was refused. (The personality
+/// names each refused call on the console when its process ends.)
+fn refused(counts: &[(u64, u64)]) -> String {
+    if counts.is_empty() {
+        return String::from("none");
+    }
+    counts
+        .iter()
+        .map(|(n, c)| format!("{n} x{c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A reply is not permission to reset an account while original objects/loans
