@@ -53,6 +53,8 @@ fn run() -> i64 {
     let linux = Channel(slot("linux"));
     let plane = Channel(slot("plane"));
     let quota = Channel(slot("quota"));
+    // stream B1 hook
+    let personality = Channel(slot("personality"));
     if abi_version() != moruna_sys::ABI_VERSION {
         println!(
             out,
@@ -235,6 +237,15 @@ fn run() -> i64 {
     };
     if let Err((e, _)) = quota.write(b"process", [for_quota]) {
         return fail(&out, "handing the accounts test its process resource", e);
+    }
+    // stream B1 hook (data-os-streams.md): the personality's mechanisms' test starts its
+    // children, and clones one, with a process resource of its own.
+    let for_personality = match root_process.duplicate(Rights::WRITE | Rights::TRANSFER) {
+        Ok(h) => h,
+        Err(e) => return fail(&out, "duplicating the process resource", e),
+    };
+    if let Err((e, _)) = personality.write(b"process", [for_personality]) {
+        return fail(&out, "handing the personality test its process resource", e);
     }
     // SDD 25: the device manager does the device work with the device roots.
     if let Err((e, _)) = devices.write(

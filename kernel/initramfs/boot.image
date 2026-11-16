@@ -399,3 +399,55 @@ process fpu-b
   expect NATIVE FPU: ok: seed 610795520 eight live workers preserved SIMD FP control and x87 state;
   exits 0
 link fpu-a.peer fpu-b.peer
+
+# stream A
+# DS-A (architecture/data-os-streams.md, stream A): the data path's mechanisms. The
+# caller placed on each CPU and a sleeping thread placed on one, a pinned CPU's lost
+# time, the clock page against clock_get, a group of windows revoked and granted back in
+# one call, and objects in 2 MiB entries before any touch with map::HUGE and
+# map::POPULATE; then a write to a revoked window faults. (One process for all but the
+# fault: the manifest holds at most 32.)
+process datapath
+  handle console console
+  expect DS-A pin: ok:
+  expect DS-A ticks: ok:
+  expect DS-A clock page: ok:
+  expect DS-A revoke: ok:
+  expect DS-A huge: ok:
+  exits 0
+process dp-revoke
+  handle console console
+  expect DS-A revoke: about to write a revoked window at
+  faults page fault at
+
+# stream B1 (data-os-streams.md, kernel-is-the-machine.md 4.1): the personality's four
+# mechanisms in the core, with no personality present. A sleeping thread is interrupted;
+# a snapshot and a clone copy on write; a pager serves one fault and refuses another,
+# which ends b1-victim; a program enters its personality and returns through the entry.
+# The supervisor sends the process resource its children are made with.
+process personality
+  handle console console
+  handle program:personality self-image
+  expect B1 interrupt: ok:
+  expect B1 snapshot: ok:
+  expect B1 clone: ok:
+  expect B1 clone source: ok:
+  expect kk: process b1-cow exited with code 0 (
+  expect B1 pager: ok:
+  expect kk: process b1-victim faulted: its pager refused the page at
+  expect B1 entry: ok:
+  expect kk: process b1-entry exited with code 0 (
+  expect B1 entry run: ok:
+  expect B1 copy: ok:
+  expect kk: process b1-copy exited with code 0 (
+  expect B1 copy run: ok:
+  expect B1 futex waker: ok:
+  expect kk: process b1-futex exited with code 0 (
+  expect B1 futex: ok:
+  expect B1 tables: ok:
+  expect kk: process b1-tables exited with code 0 (
+  expect B1 tables run: ok:
+  expect B1 personality: ok:
+  exits 0
+# stream B1 hook: the supervisor sends the test its process resource.
+link supervisor.personality personality.supervisor

@@ -164,17 +164,24 @@ pub mod nr {
     // ABI 2.6, reserved for the data OS (`architecture/data-os.md` §2). Each is
     // `BadSyscall` until its stream implements it (`architecture/data-os-streams.md`).
     // Stream A, the data path's mechanisms:
-    /// `thread_set_cpu(thread, cpu)`: runs the thread on CPU `cpu` only, or anywhere with
-    /// `cpu::ANY`; thread handle 0 is the calling thread. A place to run, never a function to
-    /// run (data-os §2).
+    /// `thread_set_cpu(thread, cpu)`: runs the thread on CPU `cpu` only, or, with
+    /// `cpu::ANY`, unpins it: free to run on any CPU; thread handle 0 is the calling thread.
+    /// A place to run, never a function to run (data-os §2). The caller placing itself on
+    /// a CPU returns on it; any other change takes effect the next time the thread is
+    /// queued.
     pub const THREAD_SET_CPU: u64 = BASE + 53;
     /// `clock_page() -> address`: maps the read-only `clock_page::Page` into the caller
     /// once, so time is read with no call (data-os §2).
     pub const CLOCK_PAGE: u64 = BASE + 54;
     /// `windows_protect(process, ranges, count, flags)`: sets `flags` (`map::READ`, or
     /// `map::READ | map::WRITE`) on each of `count` `windows::Range`s of `process`'s
-    /// mappings, with one flush: the grouped revoke before the record check, and the
-    /// grant back when a window is used again (data-os §5).
+    /// mappings (zero: the caller's own, as `memory_protect`), all or none, with one
+    /// flush finished on every CPU when it returns: the grouped revoke before the record
+    /// check, and the grant back when a window is used again (data-os §5). The first
+    /// argument may instead be a slot handle the caller holds: the ranges are then
+    /// offsets within the area that slot is mapped at in the process that mapped it, and
+    /// nothing outside that area changes. That is how the engine revokes a task's output
+    /// windows, since it holds no handle to the task's process (stream P, 2026-11-16).
     pub const WINDOWS_PROTECT: u64 = BASE + 55;
     // Stream B1, the user-space personality's mechanisms (kernel-is-the-machine §4.1).
     // Their arguments are stream B1's to fix in `moruna-sys`'s `personality` module.
@@ -701,21 +708,22 @@ pub mod map {
     pub const FIXED: u64 = 1 << 3;
     /// The protection bits, of which none is no access.
     pub const PROTECTION: u64 = READ | WRITE | EXECUTE;
-    /// Every flag `memory_map` takes.
-    pub const ALL: u64 = READ | WRITE | EXECUTE;
+    /// Every flag `memory_map` takes; device memory takes neither `HUGE` nor `POPULATE`.
+    pub const ALL: u64 = READ | WRITE | EXECUTE | HUGE | POPULATE;
     /// Every flag `process_map` takes.
-    pub const PROCESS_ALL: u64 = PROTECTION | FIXED;
-    /// Reserved (ABI 2.6, stream A): map with large pages where the range allows. Refused
-    /// until stream A adds it to `ALL` (data-os §2).
+    pub const PROCESS_ALL: u64 = PROTECTION | FIXED | HUGE | POPULATE;
+    /// ABI 2.6: map each aligned 2 MiB whose pages are one aligned physical run as one
+    /// large page, and place a mapping the kernel chooses where its runs line up. A memory
+    /// object's pages are in such runs; zero pages are only with `POPULATE` (data-os §2).
     pub const HUGE: u64 = 1 << 4;
-    /// Reserved (ABI 2.6, stream A): fault every page in at the call, so none faults
-    /// later. Refused until stream A adds it to `ALL` (data-os §2).
+    /// ABI 2.6: every page present at the call, so none faults later: zero pages get
+    /// their frames and are charged at once. An object's pages always are (data-os §2).
     pub const POPULATE: u64 = 1 << 5;
 }
 
 /// `thread_set_cpu`'s CPU argument (ABI 2.6, stream A).
 pub mod cpu {
-    /// Any CPU: the thread is not pinned.
+    /// Any CPU: the thread is not pinned, and is free to run anywhere.
     pub const ANY: u64 = u64::MAX;
 }
 
@@ -1041,6 +1049,14 @@ pub mod plane {
         /// The physical address of page 0 of a memory object the caller holds a handle
         /// to, the argument being `handle | page << 32`.
         pub const OBJECT_FRAME: u64 = 2;
+        /// ABI 2.6: the bytes the page table entry mapping the argument, an address of
+        /// the caller's, covers: 4096, 2 MiB for a large page, or zero for none.
+        pub const MAPPING: u64 = 3;
+        /// ABI 2.6 (stream B1): the bytes of the hole holding the argument, an address of
+        /// the caller's, at the deepest page table the caller has there: 4096 where a 4 KiB
+        /// table holds it, 2 MiB where only the table above does, and so on; zero where a
+        /// page is mapped. A table no area needs any more is gone.
+        pub const TABLE: u64 = 4;
     }
 }
 
@@ -1261,8 +1277,7 @@ mod tests {
         assert!(nr::is_native(nr::THREAD_SET_CPU) && nr::is_native(nr::THREAD_INTERRUPT));
         assert_eq!(
             map::ALL & (map::HUGE | map::POPULATE),
-            0,
-            "reserved until stream A"
+            map::HUGE | map::POPULATE
         );
         assert_eq!(personality::LEN, 8 + 16 * 8 + 7 * 8);
         const { assert!(clock_page::SHIFT + 4 <= clock_page::LEN) };
@@ -1279,8 +1294,8 @@ mod tests {
         assert!(!nr::is_native(nr::BASE - 1) && !nr::is_native(nr::BASE + nr::COUNT));
         assert!(nr::is_native(nr::DATA_PLANE.start) && !nr::is_native(nr::DATA_PLANE.end));
         assert!(!nr::is_native(0) && !nr::is_native(511));
-        assert_eq!(map::ALL, 7);
-        assert_eq!(map::PROCESS_ALL, 15);
+        assert_eq!(map::ALL, 0x37);
+        assert_eq!(map::PROCESS_ALL, 0x3f);
         assert_eq!(forward::table::SIZE, 8 + limits::FORWARD_FAST);
         assert_eq!(forward::request::SIZE, forward::request::IP + 8);
         assert_eq!(forward::reply::SIZE, forward::reply::BRK + 8);

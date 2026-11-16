@@ -1,0 +1,41 @@
+{
+  "added_files": [],
+  "archive_sha256": "a8f8fdb1551f65080f45f135a80ac838112cd53a5d384fc8331e9fe9e233b7cc",
+  "crate": "ostd",
+  "license": "MPL-2.0",
+  "modified_upstream_files": {
+    "src/cpu/mod.rs": {
+      "patched_sha256": "55ba526132b93ee564be469852087d9ec6475a2bf022a2282ba0802d8f1598a1",
+      "upstream_sha256": "823031821bc36c5f9fccc46c496b634b3e965be3b25ccb0d1516f1a5f74e29a7"
+    },
+    "src/log/logger.rs": {
+      "patched_sha256": "6a9bf66ea007a2a34abe90f6b1fe90db31c2c450e2dda625d399e9b1272a5437",
+      "upstream_sha256": "93a4a18caa4c37a69b54767c7a4072e60c4f742c60bef1e65f527e97f974d4f6"
+    },
+    "src/log/macros.rs": {
+      "patched_sha256": "44350d7cf722b2ada3ab50cd48b1cd9dd10d74918eeb42ed6da001228bd6dfb8",
+      "upstream_sha256": "8a4a9f44bf04466cc31972bfd6fd17324a49b82cc92d16670ec9791c1f506dc2"
+    },
+    "src/mm/frame/segment.rs": {
+      "patched_sha256": "393c7c35875fae08cf94743f1ed8ad1d3c647e7c2d5e7136451b5eaffbfc0c25",
+      "upstream_sha256": "0659b0525e493e9612e89aa80730bcf9b1c68d175019b5346e73f67b7c40f5c6"
+    },
+    "src/mm/mod.rs": {
+      "patched_sha256": "8edea8fdd99623f3ed61338595c1c6f94f5e0c44a2b3b33d959ff463fe7cd164",
+      "upstream_sha256": "18a6aa2313d01bc4c798346f456d7052b80be2b0ea6c9c770a93f541e48d4aec"
+    },
+    "src/mm/vm_space.rs": {
+      "patched_sha256": "c7a4d60001e637a0bcc527839d2661871daede33d8dbe5eaeb3ccaba7e8c2eaf",
+      "upstream_sha256": "6baec94428aa053d3cfb32f402f021db0b3d28e8cc4dce4b01ab8d3dfef64a84"
+    },
+    "src/task/scheduler/mod.rs": {
+      "patched_sha256": "3c7a2a8de94e0f1acf08a7aa2167cfb77cc4cf84d3c8311995855649def89f25",
+      "upstream_sha256": "adbe8fbb06789c6a9cce19a53987e3355d2c8c50bc0449c6db23066acbd3f979"
+    }
+  },
+  "official_archive": "https://static.crates.io/crates/ostd/ostd-0.19.0.crate",
+  "scope": "Large pages in a process's page table (a VmSpace cursor that locks at a large page's level, CursorMut::map_huge, the user page table's items restoring and unmapping a 2 MiB run, Segment::from_raw_unsized) and each CPU's number written to IA32_TSC_AUX at its start. Existing items, kernel mappings, allocation and metadata unchanged.",
+  "upstream_files": "upstream-files.json",
+  "vendor_path": "../vendor/ostd-0.19.0",
+  "version": "0.19.0"
+}

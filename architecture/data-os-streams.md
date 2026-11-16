@@ -47,6 +47,13 @@ first, and iterates until Moruna is significantly better than the other engines.
   - `cargo llvm-cov` for root crates;
   - the host tests CI's kernel job runs for kernel crates;
   - booted tests in the kernel's boot image for mechanisms only a running kernel can show.
+- **Code carried from Asterinas is judged by test suites, not line coverage** (Brackly,
+  2026-11-16: "Yes, test suites").
+  - Moruna's own code keeps the 80% per-crate floor.
+  - The files carried from Asterinas's Linux layer are judged by Asterinas's own tests and the
+    gVisor system-call suite: report which pass and which fail.
+  - Code we write or rewrite around the carried code is Moruna's own, so it gets the 80% floor.
+    That covers the user-space OSTD, the glue and the rewritten files.
 - **The Mac's disk.**
   - Set `CARGO_INCREMENTAL=0` and a `CARGO_TARGET_DIR` of your own.
   - Delete it when your stream is done.
@@ -326,3 +333,42 @@ and switches to the new one when the call answers.
   - settles `Cargo.lock`;
   - runs the touched crates' tests and CI's boot under KVM;
   - updates `data-os.md` §0's attack-surface figures.
+
+## Integration log
+
+- **2026-11-16: stream A merged** (fast-forward to `eb4b0b07`). Its CI boot passed 170 of 170
+  checks under KVM on 1, 2 and 4 CPUs.
+  - It added three calls, two mapping flags, one probe operation, a vendored OSTD 0.19.0
+    (about 115 code lines changed) and `moruna-datapath`.
+  - It added about 670 code lines to kernel mode.
+- **Decided at that merge:**
+  - **A builds C5's tickless worker cores next.** The measurement shows the gain the design
+    asked for: a pinned core loses 3.8% to 4.5% of its time to about two interruptions a
+    millisecond, about 19 us each, even on a quiet VM.
+  - **A adds `windows_protect`'s slot form,** the ABI's doc being amended: the engine revokes a
+    task's output windows through the output slot, since it holds no handle to the task's
+    process (stream P).
+  - **A adds a booted test of `POPULATE` zero pages through `process_map`.**
+  - **B1 fixes the reclaim of empty 4 KiB tables when a 2 MiB region is unmapped** (`unmap_ptes`
+    is B1's), through a cursor locked one level up, as A's `eb4b0b07` does for large pages.
+  - **The boot manifest's `MAX_PROCESSES` rises from 32 to 64,** because the booted tests filled
+    32.
+  - **CI's kernel job host-tests `moruna-datapath` and `moruna-sys`.**
+  - **B2's proposed four-way split** (core and processes, vm, fs, images) is accepted. The new
+    streams start when B2's core compiles and a session slot is free.
+- **2026-11-16: stream B1 merged** (`e7a1fb88`, from `f855154e`). CI's boot passed 191 of 191
+  checks under KVM on 1, 2 and 4 CPUs.
+  - Every booted B1 test reports ok: the interrupt, snapshot, clone, pager, entry, copy,
+    tables, futex and personality tests.
+  - Kernel mode grows by 1,372 code lines net, through the nine reserved calls and the
+    probe-only `TABLE`.
+  - The KB1 ping-pong shows no regression against step 1: 6.09 s, 5.42 s and 0.72 s, against
+    6.46 s, 6.19 s and 0.85 s.
+  - **Open, and B1's next:**
+    - a snapshot mapped in two places shares later writes with a clone, which `fork` cannot
+      allow;
+    - a clone briefly needs room for its zero pages twice;
+    - `process_read` and `process_write` answer `ShouldWait` on a page the pager has not
+      supplied.
+  - **Later:** the GS base is not kept per thread, and a program thread is interrupted only
+    within one tick.
