@@ -41,6 +41,15 @@ run as user code in the upper region of each task's own process. Stream B2 of
   only they use (`aster-bigtcp`, `aster-fuse`, `fdt-util`, `logo-ascii-art`). Moruna's
   drivers stay processes.
 - **The RTC drivers** of `comps/time` (`rtc/{cmos,goldfish,kvmclock,loongson,pl031}.rs`).
+- **What Talos's posture leaves out** (`architecture/data-os.md` §3a):
+  - a shell, and the default search for a first program: the personality runs the one
+    program a task's command names on its image, or a booted test's `/init`;
+  - administrative calls (see "Refused calls");
+  - terminals, `devpts` and ptys, overlayfs, configfs and the systree's `/sys` (stream
+    B2-fs); `/proc` and `/sys` are cut to what a task's programs read;
+  - block filesystems as a root: ext2 and exfat stay compiled but unreachable until the
+    page cache's write-back leaves `vm/`, and the tty layer until job control leaves
+    `process/`.
 - **`libs/short-vis-path/tests`,** which run the external `cargo expand`.
 
 ## The mechanical swaps
@@ -90,7 +99,7 @@ changed with them. Beyond that, and the pruning above:
 | --- | --- |
 | `comps/softirq/src/taskless.rs` | Its per-CPU `RefCell` lists become locks: threads share CPU 0's state. |
 | `comps/time/src/tsc.rs`, `rtc/mod.rs`, `Cargo.toml` | The clock source is the core's monotonic clock; one "RTC" reads the wall time the start gives. |
-| `core/src/init.rs` | No other CPU, driver listing, network or vDSO to start; the personality ends with its init process. |
+| `core/src/init.rs` | No other CPU, driver listing, network or vDSO to start; the first program is the task's named one on its image (or a booted test's `/init`), with no default search and no shell, and a missing one ends the personality; the personality ends with its init process. |
 | `core/src/arch/x86/power.rs` | No ACPI reset port: powering off ends the process. |
 | `core/src/device/registry/block.rs` | No virtio or NVMe request threads. |
 | `core/src/device/tty/device.rs` | No virtual terminals or hypervisor console; the console is `ttyS0`. |
@@ -100,11 +109,14 @@ changed with them. Beyond that, and the pruning above:
 | `core/src/process/posix_thread/mod.rs` | Waking a thread for a signal also interrupts its task (`Task::interrupt`): a thread running the program comes back only when the core interrupts it. |
 | `core/src/fs/file/file_handle.rs`, `syscall/{mod.rs,arch/x86.rs}` | No socket hooks; the socket calls answer from `syscall/no_socket.rs`. |
 | `core/src/vm/vmar/vmar_impls/fork.rs` | Its device-memory test is ignored: there is no device memory. |
-| `core/src/lib.rs` | The module list, three unused features and `getset`, and the clocks every host test needs (`ostd::ktest_setup!`). |
+| `core/src/fs/` | Stream B2-fs: the root is the image through the image filesystem (`fs_impls/imagefs`, `rootfs.rs`), with the task's scratch (a tmpfs under a quota), the cut `/proc` and `/sys`, and `/dev` over it; descriptors 0 to 2 are the task's streams (`task_streams.rs`). Their ports reach the start on the target (`fs/mod.rs`, `imagefs/mod.rs`). |
+| `core/src/lib.rs` | The module list (with `start`), three unused features and `getset`, and the clocks every host test needs (`ostd::ktest_setup!`). |
 | 9 files | Items only the left-out parts used are marked `expect(dead_code)` with that reason. |
 
 New in `core/`: `net/mod.rs` (the UTS namespace only), `vdso.rs` (none mapped),
-`syscall/no_socket.rs` and `syscall/refused.rs`.
+`syscall/no_socket.rs`, `syscall/refused.rs`, and `start/`, a task's start: the image
+filesystem's client, the plane's slots (ported from `kernel/linux/server/src/plane.rs`) and
+the log ring, as the ports `fs/` is built on (`start::start_task`).
 
 ## Refused calls
 
@@ -142,8 +154,14 @@ handlers' carried code stays in the tree, unreachable: removing it would leave p
 - **The launcher** (`launch/src/launcher.rs`) creates the process, maps each segment as an
   object of its own, maps the first stack, grants the handles it is given plus the
   process's own as `self`, gives the process its region with the copy routines
-  (`personality_set_with_copy`) and launches it. `linuxlayer-boot` launches it with the
-  slots `console`, `initramfs` and, if given, `cmdline`.
+  (`personality_set_with_copy`) and launches it. `launch_task` gives a task's process its
+  data plane first. `linuxlayer-boot` launches it with the slots `console`, `initramfs`
+  and, if given, `cmdline`.
+- **A task's slots** (`linuxlayer_launch::slot`): `filesystem`, its own connection to the
+  image filesystem, which becomes the root; `scratch`, the account whose limit `/tmp`
+  holds; `input` and `output`, the plane's slots to wait on; `log`, the engine's log ring;
+  and `cmdline`, `init=PROGRAM -- ARGS`. Without `filesystem` the personality boots on its
+  initramfs.
 - **The image** (`personality/`) is built from position-independent code
   (`-C relocation-model=pie`, so it reaches its addresses) and linked at its address
   (`personality.ld`). Its start records the start page and the first thread's block, runs
