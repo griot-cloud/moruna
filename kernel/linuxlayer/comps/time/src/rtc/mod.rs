@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: MPL-2.0
+
+use alloc::sync::Arc;
+
+use crate::SystemTime;
+
+/// Generic interface for RTC drivers.
+pub(crate) trait Driver {
+    /// Creates a RTC driver.
+    /// Returns [`Some<Self>`] on success, [`None`] otherwise (e.g. platform unsupported).
+    fn try_new() -> Option<Self>
+    where
+        Self: Sized;
+
+    /// Reads RTC.
+    fn read_rtc(&self) -> SystemTime;
+}
+
+macro_rules! declare_rtc_drivers {
+    ( $( #[cfg $cfg:tt ] $module:ident :: $name:ident),* $(,)? ) => {
+        pub(super) fn init_rtc_driver() -> Arc<dyn Driver + Send + Sync> {
+            // Iterate all possible drivers and pick one that can be initialized.
+            $(
+                #[cfg $cfg]
+                if let Some(driver) = $module::$name::try_new() {
+                    return Arc::new(driver);
+                }
+            )*
+
+            ostd::warn!("No RTC device found, falling back to a dummy RTC");
+
+            Arc::new(RtcDummy)
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod cmos;
+#[cfg(target_arch = "riscv64")]
+mod goldfish;
+#[cfg(target_arch = "x86_64")]
+mod kvmclock;
+#[cfg(target_arch = "loongarch64")]
+mod loongson;
+#[cfg(target_arch = "aarch64")]
+mod pl031;
+
+declare_rtc_drivers! {
+    // Prefers the KVM wall clock over CMOS on x86_64. This matches Linux.
+    // Reference: <https://elixir.bootlin.com/linux/v7.0/source/arch/x86/kernel/kvmclock.c#L326>.
+    #[cfg(target_arch = "x86_64")] kvmclock::RtcKvmClock,
+    #[cfg(target_arch = "x86_64")] cmos::RtcCmos,
+    #[cfg(target_arch = "riscv64")] goldfish::RtcGoldfish,
+    #[cfg(target_arch = "loongarch64")] loongson::RtcLoongson,
+    #[cfg(target_arch = "aarch64")] pl031::RtcPl031,
+}
+
+struct RtcDummy;
+
+impl Driver for RtcDummy {
+    fn try_new() -> Option<Self> {
+        Some(Self)
+    }
+
+    fn read_rtc(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH
+    }
+}
