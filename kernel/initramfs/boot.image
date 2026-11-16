@@ -454,6 +454,9 @@ process personality
   expect B1 futex: ok:
   expect B1 places: ok:
   expect B1 room: ok:
+  expect B1 shared handles: ok:
+  expect kk: process b1-task was killed through a handle to it
+  expect B1 task: ok:
   expect B1 tables: ok:
   expect kk: process b1-tables exited with code 0 (
   expect B1 tables run: ok:

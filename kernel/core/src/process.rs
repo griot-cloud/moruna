@@ -88,7 +88,9 @@ pub struct Process {
     /// by it.
     pub koid: u64,
     pub space: Space,
-    pub handles: SpinLock<HandleTable<Handle>>,
+    /// Its handle table, shared with the processes `process_clone` gave it to (stream B1
+    /// hook): `handles.lock()` is the table.
+    pub handles: Arc<Table>,
     state: SpinLock<State>,
     pub signaller: Signaller,
     supervisor: bool,
@@ -105,8 +107,6 @@ pub struct Process {
     /// The code the last thread to end by a fast `exit` gave: a process whose last
     /// thread ends that way ends with it.
     last_code: AtomicI64,
-    /// What its handle table's slots cost, charged as the table grows (SDD 20 f.18).
-    table_charge: SpinLock<Charge>,
     /// Its record, charged to its own account.
     _record: Charge,
 }
@@ -189,6 +189,17 @@ impl Process {
         supervisor: bool,
         account: &Arc<Account>,
     ) -> Result<Arc<Process>, Error> {
+        Process::new_in(name, supervisor, account, None)
+    }
+
+    /// A created process as [`Process::new`] makes one, using `table` when given (stream B1
+    /// hook: `process_clone`'s `SHARE_HANDLES`), else a table of its own.
+    pub fn new_in(
+        name: &[u8],
+        supervisor: bool,
+        account: &Arc<Account>,
+        table: Option<Arc<Table>>,
+    ) -> Result<Arc<Process>, Error> {
         if !valid_name(name) {
             return Err(Error::InvalidArgs);
         }
@@ -196,11 +207,15 @@ impl Process {
         let record = Charge::new(account, charge::PROCESS)?;
         let space = Space::new(account)?;
         let koid = NEXT_KOID.fetch_add(1, Ordering::Relaxed);
-        Ok(Arc::new(Process {
+        let handles = match table {
+            Some(table) => table,
+            None => Arc::new(Table::new(salt(koid), account)?),
+        };
+        let process = Arc::new(Process {
             name: String::from(name),
             koid,
             space,
-            handles: SpinLock::new(HandleTable::new(salt(koid))),
+            handles,
             state: SpinLock::new(State {
                 life: Life::Created { entry: None },
                 exit: None,
@@ -214,9 +229,10 @@ impl Process {
             granted: AtomicBool::new(false),
             cpu_ns: AtomicU64::new(0),
             last_code: AtomicI64::new(0),
-            table_charge: SpinLock::new(Charge::new(account, 0)?),
             _record: record,
-        }))
+        });
+        process.handles.join(&process);
+        Ok(process)
     }
 
     /// The account everything it causes to exist is charged to.
@@ -235,7 +251,8 @@ impl Process {
         if table.grows() {
             let step = charge::HANDLE_SLOTS * charge::HANDLE_SLOT;
             let need = moruna_quota::table_steps(table.slots() + 1) * step;
-            let mut charged = self.table_charge.lock();
+            // Stream B1 hook: the table's own charge, however many processes share it.
+            let mut charged = self.handles.charge.lock();
             let have = charged.bytes();
             if need > have
                 && let Err(e) = charged.grow(need - have)
@@ -375,6 +392,8 @@ impl Process {
         match state.life {
             Life::Created { .. } => {
                 state.life = Life::Running { live: 1 };
+                // stream B1 hook
+                self.handles.running.fetch_add(1, Ordering::AcqRel);
                 Ok(())
             }
             _ => Err(Error::BadState),
@@ -657,6 +676,12 @@ impl Process {
             }
         }
         self.end(Exit::Killed);
+        // Stream B1 hook: a task sharing one table ends whole.
+        for other in self.handles.others(self) {
+            if other.is_running() {
+                other.end(Exit::Killed);
+            }
+        }
         Ok(())
     }
 
@@ -733,7 +758,13 @@ impl Process {
                 true
             }
         };
-        let handles = self.handles.lock().drain();
+        // Stream B1 hook: a shared table empties with the last of its running processes,
+        // which frees the processes its handles held.
+        let handles = if self.handles.running.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.handles.lock().drain()
+        } else {
+            Vec::new()
+        };
         drop(handles);
         // The forward goes with the process: its server sees the channel close.
         let forward = self.forward.lock().take();
@@ -1101,6 +1132,69 @@ fn exception(thread: &Arc<Thread>, context: &mut UserContext) -> Flow {
 impl Process {
     pub fn vm(&self) -> &Arc<ostd::mm::VmSpace> {
         &self.space.vm
+    }
+
+    fn is_running(&self) -> bool {
+        let state = self.state.lock();
+        matches!(state.life, Life::Running { .. }) && state.exit.is_none()
+    }
+}
+
+/// A handle table (SDD 20, e.2), which `process_clone`'s `SHARE_HANDLES` shares between the
+/// processes of a task, as Linux's `CLONE_FILES` does. Its slots are charged once, to the
+/// account of the process it was made for, and its limit is its own. It holds handles to
+/// the processes that share it, which hold it: when the last of them that ran ends, it is
+/// emptied, which frees every process its handles held, so no cycle outlives the task.
+pub struct Table {
+    table: SpinLock<HandleTable<Handle>>,
+    /// What its slots cost, charged as it grows (SDD 20 f.18).
+    charge: SpinLock<Charge>,
+    /// The processes that use it.
+    members: SpinLock<Vec<Weak<Process>>>,
+    /// How many of them run.
+    running: AtomicUsize,
+}
+
+// A process's record covers its own table's.
+const _: () = assert!(
+    (core::mem::size_of::<Process>() + core::mem::size_of::<Table>()) as u64 <= charge::PROCESS
+);
+
+impl Table {
+    fn new(salt: u32, account: &Arc<Account>) -> Result<Table, Error> {
+        Ok(Table {
+            table: SpinLock::new(HandleTable::new(salt)),
+            charge: SpinLock::new(Charge::new(account, 0)?),
+            members: SpinLock::new(Vec::new()),
+            running: AtomicUsize::new(0),
+        })
+    }
+
+    fn join(&self, process: &Arc<Process>) {
+        let mut members = self.members.lock();
+        members.retain(|m| m.strong_count() > 0);
+        // With no room to count it, a kill of another member leaves it to end on its own.
+        if members.try_reserve(1).is_ok() {
+            members.push(Arc::downgrade(process));
+        }
+    }
+
+    /// The live processes that share it with `process`.
+    fn others(&self, process: &Process) -> Vec<Arc<Process>> {
+        self.members
+            .lock()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|m| !core::ptr::eq(&**m, process))
+            .collect()
+    }
+}
+
+impl core::ops::Deref for Table {
+    type Target = SpinLock<HandleTable<Handle>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.table
     }
 }
 
