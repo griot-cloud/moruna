@@ -426,4 +426,5 @@ process personality
   expect B1 futex: ok:
   expect B1 personality: ok:
   exits 0
+# stream B1 hook: the supervisor sends the test its process resource.
 link supervisor.personality personality.supervisor
