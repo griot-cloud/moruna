@@ -14,15 +14,10 @@ decisions are folded in below.
 
 - **0.7.0 is this plan, plus finishing Goal A.** That means KD2 booted, KD3 and KD4.
 - **Where the kernel runs (Brackly, 2026-11-16, through the PM).**
-  - His words: "Maruna VM runs on top of Linux, yes. But I don't expect that we run the VM as a
-    process in Linux. It's supposed to run the VM on Linux."
-  - **The host stays Linux** and runs the Moruna VM under KVM on Griot's D4ls_v5.
-  - **The kernel as the Azure machine** (Goal B, `architecture/kernel-is-the-machine.md` on
+  - His words: "We have a Linux node, and then we run a VM on top of it, which is [Moruna]."
+  - **The host is a Linux node** (Griot's D4ls_v5), and the Moruna VM runs on top of it under KVM.
+  - **The kernel as the node itself** (Goal B, `architecture/kernel-is-the-machine.md` on
     `design/kernel-is-the-machine`) moves to 0.8.0.
-  - **Inside the VM, Moruna does not run as a Linux process.** The native engine is required
-    (§1).
-  - **Being confirmed with him:** whether "not as a process" also covers the host's monitor, QEMU
-    today against `moruna-vmm`'s own KVM monitor.
 - **Every step is this branch's.**
   - It builds on the work still on `feat/kd2-engine-process`, `feat/kd1-data-plane`,
     `feat/ka2-plane-linux` (its conformance suite is KD3's base) and `feat/kb5-memory-quota` (the
@@ -127,11 +122,11 @@ does not change what they decide or how.
 
 That shape adapts the engine to an interface that is not its own.
 
-**In 0.7** the engine is the kernel's own process, reversing DECISIONS EN1. Brackly ruled on
-2026-11-16 that inside the VM, Moruna does not run as a Linux process. It calls the kernel
+**In 0.7** the engine is the kernel's own process, reversing DECISIONS EN1. It calls the kernel
 directly through `moruna-sys`: memory objects, slots, channels, threads, futexes and the clock.
 
-Step 1 measures today's forwarding and copies, as the "before" figure.
+Step 1 measures today's forwarding and copies, as the "before" figure. If those numbers show the
+port gains little, they go to Brackly before anything is dropped.
 
 - **How.** Rust's standard library is ported to the kernel as a target (`x86_64-unknown-moruna`),
   as `x86_64-unknown-hermit` is in Rust today. Arrow and Parquet need `std`, so this keeps them
@@ -352,8 +347,9 @@ items to commit to then:
    - kernel adapters for the reactor and discovery;
    - EN1 retired.
 
-   It is the longest piece, so it starts right after step 1, beside steps 2 and 3. Their kernel
-   calls go through `moruna-sys` in either form of the engine.
+   It starts once step 1 shows what the forwarding costs. Steps 2 and 3 make their kernel calls
+   through `moruna-sys`, which works in either form of the engine. If step 1 shows the port gains
+   little, the numbers go to Brackly before the step is dropped.
 5. **Dependencies** (§5): wasm out, the HTTP stack out, C kept only where measurement says so,
    and the build check.
 6. **The host side** (§6): `moruna run` and logs on the job updates.
@@ -370,12 +366,11 @@ Settled on 2026-11-16, by Brackly's approval of this plan and by the PM:
    package returns afterwards as a client (§8).
 2. **The gate.** The 0.6.6 jobs, with the same kernels, run as image tasks in the VM against 0.6.6,
    on the PM's terms (§9).
-3. **How the engine reaches its kernel.** As the kernel's own process, through a `std` port. This
-   is required (Brackly, 2026-11-16) (§1).
+3. **How the engine reaches its kernel.** As the kernel's own process, through a `std` port (§1,
+   step 4), as approved. If step 1's numbers show the port gains little, they go to Brackly.
 4. **wasm tasks leave 0.7.0** (§5).
 5. **Outputs on the data disk as layers** (§4, SDD 30 m.3).
-6. **The launcher's monitor** stays QEMU in 0.7.0 (§6) unless Brackly's answer on "not as a
-   process" covers the host's monitor too. The PM is confirming it with him.
+6. **QEMU stays the launcher's hypervisor** in 0.7.0 (§6).
 7. **Where it runs.** On `moruna-bench` (D8ds_v6, `/dev/kvm`, griot-stg), pre-approved for this
    work, under `~/.vm-lock`, and before its 02:00 UTC shutdown wipes `/data`.
 
