@@ -1,0 +1,399 @@
+{
+ "constants": {
+  "minhash_ab.bin": "4cd382362e8e3c03b4b59878c479a8c71d5c4612753f1dd10c572c580f144381",
+  "score_trig.bin": "17534e10190be5289605dc4fe1ff5a573de7c33458a2dd2b13d31c8466cbc99f",
+  "score_weights.bin": "2e4cbfbb97944ad61c8d414cdffdadd6be37b0120eb91bd0769789261c7c63d4"
+ },
+ "jobs": {
+  "audit": {
+   "empty": {
+    "hash_all": "12c614561a7d5de4a6e7b5772d68ef5b3e9f7f03a485392fef3b19deb2c8fc99",
+    "hash_exact": "12c614561a7d5de4a6e7b5772d68ef5b3e9f7f03a485392fef3b19deb2c8fc99",
+    "input": "inputs/nyc/empty.arrow",
+    "rows": 0,
+    "rows_in": 0,
+    "rows_out": 0,
+    "schema": [
+     "vendor_id:int64",
+     "pu_location_id:int64",
+     "fare_amount:double",
+     "expected_fare:double",
+     "flagged:bool"
+    ]
+   },
+   "main": {
+    "hash_all": "7ff5844dd3c8008cf7e8b4398010fe699fdb021b542ada8f65664ec954e155bc",
+    "hash_exact": "7ff5844dd3c8008cf7e8b4398010fe699fdb021b542ada8f65664ec954e155bc",
+    "input": "inputs/nyc/main.arrow",
+    "rows": 4000,
+    "rows_in": 4000,
+    "rows_out": 4000,
+    "schema": [
+     "vendor_id:int64",
+     "pu_location_id:int64",
+     "fare_amount:double",
+     "expected_fare:double",
+     "flagged:bool"
+    ]
+   },
+   "null_times": {
+    "error": "TypeError: unsupported operand type(s) for -: 'int' and 'NoneType'",
+    "input": "inputs/nyc/null_times.arrow",
+    "rows_in": 600
+   },
+   "offset": {
+    "hash_all": "8096b8e516b1b46e968143b9f231972f67146b0558d0fcc28493566df34434ec",
+    "hash_exact": "8096b8e516b1b46e968143b9f231972f67146b0558d0fcc28493566df34434ec",
+    "input": "inputs/nyc/offset.arrow",
+    "rows": 517,
+    "rows_in": 517,
+    "rows_out": 517,
+    "schema": [
+     "vendor_id:int64",
+     "pu_location_id:int64",
+     "fare_amount:double",
+     "expected_fare:double",
+     "flagged:bool"
+    ]
+   },
+   "one": {
+    "hash_all": "521c1dcba5fe75cf9f57de1bf3a00bc85356d0a1efa1cab42629a0a146c19a7a",
+    "hash_exact": "521c1dcba5fe75cf9f57de1bf3a00bc85356d0a1efa1cab42629a0a146c19a7a",
+    "input": "inputs/nyc/one.arrow",
+    "rows": 1,
+    "rows_in": 1,
+    "rows_out": 1,
+    "schema": [
+     "vendor_id:int64",
+     "pu_location_id:int64",
+     "fare_amount:double",
+     "expected_fare:double",
+     "flagged:bool"
+    ]
+   }
+  },
+  "enrich": {
+   "empty": {
+    "hash_all": "5bf8d94ce057575117d047df2140db38803b20b8346ffe5f9c49c196288aa9c2",
+    "hash_exact": "5bf8d94ce057575117d047df2140db38803b20b8346ffe5f9c49c196288aa9c2",
+    "input": "inputs/nyc/empty.arrow",
+    "rows": 0,
+    "rows_in": 0,
+    "rows_out": 0,
+    "schema": [
+     "vendor_id:int64",
+     "pickup_at:timestamp[us]",
+     "dropoff_at:timestamp[us]",
+     "passenger_count:double",
+     "trip_distance:double",
+     "ratecode_id:double",
+     "store_and_fwd_flag:string",
+     "pu_location_id:int64",
+     "do_location_id:int64",
+     "payment_type:int64",
+     "fare_amount:double",
+     "extra:double",
+     "mta_tax:double",
+     "tip_amount:double",
+     "tolls_amount:double",
+     "improvement_surcharge:double",
+     "total_amount:double",
+     "congestion_surcharge:double",
+     "airport_fee:double",
+     "duration_s:double",
+     "mph:double",
+     "fare_per_mile:double",
+     "tip_share:double"
+    ]
+   },
+   "huge_duration": {
+    "error": "ArrowInvalid: Integer value 9007199254740993 not in range: -9007199254740992 to 9007199254740992",
+    "input": "inputs/nyc/huge_duration.arrow",
+    "rows_in": 100
+   },
+   "main": {
+    "hash_all": "55920f3cf574bc92d867da5aac6bf887b40d4ae09832e78e6d513d467bb5e61e",
+    "hash_exact": "55920f3cf574bc92d867da5aac6bf887b40d4ae09832e78e6d513d467bb5e61e",
+    "input": "inputs/nyc/main.arrow",
+    "rows": 2625,
+    "rows_in": 4000,
+    "rows_out": 2625,
+    "schema": [
+     "vendor_id:int64",
+     "pickup_at:timestamp[us]",
+     "dropoff_at:timestamp[us]",
+     "passenger_count:double",
+     "trip_distance:double",
+     "ratecode_id:double",
+     "store_and_fwd_flag:string",
+     "pu_location_id:int64",
+     "do_location_id:int64",
+     "payment_type:int64",
+     "fare_amount:double",
+     "extra:double",
+     "mta_tax:double",
+     "tip_amount:double",
+     "tolls_amount:double",
+     "improvement_surcharge:double",
+     "total_amount:double",
+     "congestion_surcharge:double",
+     "airport_fee:double",
+     "duration_s:double",
+     "mph:double",
+     "fare_per_mile:double",
+     "tip_share:double"
+    ]
+   },
+   "null_times": {
+    "hash_all": "232026307033106818d09bd1b69157698f7d6a8eda63cf8054d28033fa83f681",
+    "hash_exact": "232026307033106818d09bd1b69157698f7d6a8eda63cf8054d28033fa83f681",
+    "input": "inputs/nyc/null_times.arrow",
+    "rows": 392,
+    "rows_in": 600,
+    "rows_out": 392,
+    "schema": [
+     "vendor_id:int64",
+     "pickup_at:timestamp[us]",
+     "dropoff_at:timestamp[us]",
+     "passenger_count:double",
+     "trip_distance:double",
+     "ratecode_id:double",
+     "store_and_fwd_flag:string",
+     "pu_location_id:int64",
+     "do_location_id:int64",
+     "payment_type:int64",
+     "fare_amount:double",
+     "extra:double",
+     "mta_tax:double",
+     "tip_amount:double",
+     "tolls_amount:double",
+     "improvement_surcharge:double",
+     "total_amount:double",
+     "congestion_surcharge:double",
+     "airport_fee:double",
+     "duration_s:double",
+     "mph:double",
+     "fare_per_mile:double",
+     "tip_share:double"
+    ]
+   },
+   "offset": {
+    "hash_all": "64f4e7e2efe6e465f5efbbc73494e6ad05b5884ddb7307ae237849414ec5284d",
+    "hash_exact": "64f4e7e2efe6e465f5efbbc73494e6ad05b5884ddb7307ae237849414ec5284d",
+    "input": "inputs/nyc/offset.arrow",
+    "rows": 326,
+    "rows_in": 517,
+    "rows_out": 326,
+    "schema": [
+     "vendor_id:int64",
+     "pickup_at:timestamp[us]",
+     "dropoff_at:timestamp[us]",
+     "passenger_count:double",
+     "trip_distance:double",
+     "ratecode_id:double",
+     "store_and_fwd_flag:string",
+     "pu_location_id:int64",
+     "do_location_id:int64",
+     "payment_type:int64",
+     "fare_amount:double",
+     "extra:double",
+     "mta_tax:double",
+     "tip_amount:double",
+     "tolls_amount:double",
+     "improvement_surcharge:double",
+     "total_amount:double",
+     "congestion_surcharge:double",
+     "airport_fee:double",
+     "duration_s:double",
+     "mph:double",
+     "fare_per_mile:double",
+     "tip_share:double"
+    ]
+   },
+   "one": {
+    "hash_all": "5bf8d94ce057575117d047df2140db38803b20b8346ffe5f9c49c196288aa9c2",
+    "hash_exact": "5bf8d94ce057575117d047df2140db38803b20b8346ffe5f9c49c196288aa9c2",
+    "input": "inputs/nyc/one.arrow",
+    "rows": 0,
+    "rows_in": 1,
+    "rows_out": 0,
+    "schema": [
+     "vendor_id:int64",
+     "pickup_at:timestamp[us]",
+     "dropoff_at:timestamp[us]",
+     "passenger_count:double",
+     "trip_distance:double",
+     "ratecode_id:double",
+     "store_and_fwd_flag:string",
+     "pu_location_id:int64",
+     "do_location_id:int64",
+     "payment_type:int64",
+     "fare_amount:double",
+     "extra:double",
+     "mta_tax:double",
+     "tip_amount:double",
+     "tolls_amount:double",
+     "improvement_surcharge:double",
+     "total_amount:double",
+     "congestion_surcharge:double",
+     "airport_fee:double",
+     "duration_s:double",
+     "mph:double",
+     "fare_per_mile:double",
+     "tip_share:double"
+    ]
+   }
+  },
+  "occupancy": {
+   "empty": {
+    "hash_all": "26410093dfedeb7d44af73fbac4324961eaccbb23a796f91cbf05c8ab9134ce2",
+    "hash_exact": "26410093dfedeb7d44af73fbac4324961eaccbb23a796f91cbf05c8ab9134ce2",
+    "input": "inputs/nyc/empty.arrow",
+    "rows": 0,
+    "rows_in": 0,
+    "rows_out": 0,
+    "schema": [
+     "zone:int64",
+     "minute_of_day:int64",
+     "car_minutes:int64"
+    ]
+   },
+   "main": {
+    "hash_all": "1dd27b5549307d05360af6fdde1095f85ebdcc7864bae17fcb8676fbb010a6eb",
+    "hash_exact": "1dd27b5549307d05360af6fdde1095f85ebdcc7864bae17fcb8676fbb010a6eb",
+    "input": "inputs/nyc/main.arrow",
+    "rows": 147230,
+    "rows_in": 4000,
+    "rows_out": 147230,
+    "schema": [
+     "zone:int64",
+     "minute_of_day:int64",
+     "car_minutes:int64"
+    ]
+   },
+   "null_times": {
+    "error": "TypeError: Cannot cast array data from dtype('float64') to dtype('int64') according to the rule 'safe'",
+    "input": "inputs/nyc/null_times.arrow",
+    "rows_in": 600
+   },
+   "null_zone": {
+    "hash_all": "548baca999f40e5ec40b6c4f635ca6c85950093796f6573aae33b67abb9f0b64",
+    "hash_exact": "548baca999f40e5ec40b6c4f635ca6c85950093796f6573aae33b67abb9f0b64",
+    "input": "inputs/nyc/null_zone.arrow",
+    "rows": 24735,
+    "rows_in": 600,
+    "rows_out": 24735,
+    "schema": [
+     "zone:double",
+     "minute_of_day:double",
+     "car_minutes:int64"
+    ]
+   },
+   "offset": {
+    "hash_all": "e84c75ece5368ea885c9946b0b2a9f4d04ae53d98f0b546620d42bee49410c6b",
+    "hash_exact": "e84c75ece5368ea885c9946b0b2a9f4d04ae53d98f0b546620d42bee49410c6b",
+    "input": "inputs/nyc/offset.arrow",
+    "rows": 22810,
+    "rows_in": 517,
+    "rows_out": 22810,
+    "schema": [
+     "zone:int64",
+     "minute_of_day:int64",
+     "car_minutes:int64"
+    ]
+   },
+   "one": {
+    "hash_all": "ac0245c82108091f84f607d5778d6192c1bb54b63fd9597555844dd3f78bc72a",
+    "hash_exact": "ac0245c82108091f84f607d5778d6192c1bb54b63fd9597555844dd3f78bc72a",
+    "input": "inputs/nyc/one.arrow",
+    "rows": 1,
+    "rows_in": 1,
+    "rows_out": 1,
+    "schema": [
+     "zone:int64",
+     "minute_of_day:int64",
+     "car_minutes:int64"
+    ]
+   }
+  },
+  "score": {
+   "empty": {
+    "hash_all": "2f904cdc82d1c3780466bff67c88ae6a9f74331f080f347a6093803a52008252",
+    "hash_exact": "b11162d98d9b4d2910b49c28b8ffd9776fb0371bf6608d01d52dd2cdcc9bc65d",
+    "input": "inputs/nyc/empty.arrow",
+    "rows": 0,
+    "rows_in": 0,
+    "rows_out": 0,
+    "schema": [
+     "vendor_id:int64",
+     "pu_location_id:int64",
+     "fare_amount:double",
+     "predicted_tip:double"
+    ]
+   },
+   "main": {
+    "hash_all": "9a19565f7403fff207d637675c481dc8da71f56ba0d4a48ef23bf38ca6c059ee",
+    "hash_exact": "05d965e8df7f69e8bc1dc29f638302943da82ef0012b9c242cfa68e3bd6537df",
+    "input": "inputs/nyc/main.arrow",
+    "rows": 4000,
+    "rows_in": 4000,
+    "rows_out": 4000,
+    "schema": [
+     "vendor_id:int64",
+     "pu_location_id:int64",
+     "fare_amount:double",
+     "predicted_tip:double"
+    ]
+   },
+   "null_times": {
+    "hash_all": "2b6137987617045f482ab3825dbf992366b94142980db90f09bb046048aee7c0",
+    "hash_exact": "2d97ef97a7fd6dfd18c7818f87333afb1059c19211f64e9f57cfe2cd2ef3454b",
+    "input": "inputs/nyc/null_times.arrow",
+    "rows": 600,
+    "rows_in": 600,
+    "rows_out": 600,
+    "schema": [
+     "vendor_id:int64",
+     "pu_location_id:int64",
+     "fare_amount:double",
+     "predicted_tip:double"
+    ]
+   },
+   "offset": {
+    "hash_all": "98dcd9f2ccd9ceae05998151948e0fa12cc505ac7a947209d3487d0a9734dbcc",
+    "hash_exact": "105d190d798464f30638fcfdfa45b525d3ee3b56e3c789a2ef2408a2da89f7af",
+    "input": "inputs/nyc/offset.arrow",
+    "rows": 517,
+    "rows_in": 517,
+    "rows_out": 517,
+    "schema": [
+     "vendor_id:int64",
+     "pu_location_id:int64",
+     "fare_amount:double",
+     "predicted_tip:double"
+    ]
+   },
+   "one": {
+    "hash_all": "dc1c6fab71234a2cb12c9bb938d6c2a84b6a77161734dc8daec38fcf6c5db00b",
+    "hash_exact": "60d0835c33f1c0b9d71b986c280e1f7e8b8b19a9d6788f3713bd1a49934b9b19",
+    "input": "inputs/nyc/one.arrow",
+    "rows": 1,
+    "rows_in": 1,
+    "rows_out": 1,
+    "schema": [
+     "vendor_id:int64",
+     "pu_location_id:int64",
+     "fare_amount:double",
+     "predicted_tip:double"
+    ]
+   }
+  }
+ },
+ "oracle": {
+  "machine": "arm64",
+  "numpy": "2.4.2",
+  "pyarrow": "24.0.0",
+  "python": "3.14.3",
+  "system": "Darwin"
+ }
+}
