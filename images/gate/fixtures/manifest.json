@@ -244,6 +244,50 @@
     ]
    }
   },
+  "fw_minhash": {
+   "empty": {
+    "hash_all": "0e05c91600830abb6383e483960df360cc26ff6bb56fd03253428e44bb84e3c6",
+    "hash_exact": "0e05c91600830abb6383e483960df360cc26ff6bb56fd03253428e44bb84e3c6",
+    "input": "inputs/fineweb/empty.arrow",
+    "rows": 0,
+    "rows_in": 0,
+    "rows_out": 0,
+    "schema": [
+     "id:string",
+     "url:string",
+     "minhash:fixed_size_list<item: uint32>[64]",
+     "bands:fixed_size_list<item: uint64>[8]"
+    ]
+   },
+   "main": {
+    "hash_all": "833cebb81138ef9ee59263c792a569d46b99e2a582638e3aacd9edd305c597de",
+    "hash_exact": "833cebb81138ef9ee59263c792a569d46b99e2a582638e3aacd9edd305c597de",
+    "input": "inputs/fineweb/main.arrow",
+    "rows": 400,
+    "rows_in": 400,
+    "rows_out": 400,
+    "schema": [
+     "id:string",
+     "url:string",
+     "minhash:fixed_size_list<item: uint32>[64]",
+     "bands:fixed_size_list<item: uint64>[8]"
+    ]
+   },
+   "offset": {
+    "hash_all": "7027424db29eba59ff383c2f725144e46b486faee1f0e640e8c91186835220e4",
+    "hash_exact": "7027424db29eba59ff383c2f725144e46b486faee1f0e640e8c91186835220e4",
+    "input": "inputs/fineweb/offset.arrow",
+    "rows": 101,
+    "rows_in": 101,
+    "rows_out": 101,
+    "schema": [
+     "id:string",
+     "url:string",
+     "minhash:fixed_size_list<item: uint32>[64]",
+     "bands:fixed_size_list<item: uint64>[8]"
+    ]
+   }
+  },
   "occupancy": {
    "empty": {
     "hash_all": "26410093dfedeb7d44af73fbac4324961eaccbb23a796f91cbf05c8ab9134ce2",
@@ -313,6 +357,164 @@
      "zone:int64",
      "minute_of_day:int64",
      "car_minutes:int64"
+    ]
+   }
+  },
+  "ov_attrs": {
+   "empty": {
+    "hash_all": "09166e89accf52bd6fdd016c708062405666ef9ae3f8e996c795883480b496d5",
+    "hash_exact": "0675e4455c528bfb1ec5c27b62d4b3000c916e8c05e6ea11c9f8789a3efa9d42",
+    "input": "inputs/overture/empty.arrow",
+    "rows": 0,
+    "rows_in": 0,
+    "rows_out": 0,
+    "schema": [
+     "id:string",
+     "name:string",
+     "sources:int32",
+     "best_source:string",
+     "height_m:double",
+     "usage:string",
+     "volume_m3:double"
+    ]
+   },
+   "main": {
+    "hash_all": "e3811cf310d3ad796ee688b2f2b69b0f7c09928abd4b10272aa3e740a9f859b5",
+    "hash_exact": "d51a0942af8361e7e682b20e165d564f6b937d185648782071f2d8c0376c3b98",
+    "input": "inputs/overture/main.arrow",
+    "rows": 600,
+    "rows_in": 600,
+    "rows_out": 600,
+    "schema": [
+     "id:string",
+     "name:string",
+     "sources:int32",
+     "best_source:string",
+     "height_m:double",
+     "usage:string",
+     "volume_m3:double"
+    ]
+   },
+   "null_bound": {
+    "error": "TypeError: unsupported operand type(s) for -: 'float' and 'NoneType'",
+    "input": "inputs/overture/null_bound.arrow",
+    "rows_in": 20
+   },
+   "offset": {
+    "hash_all": "1109075e4010276191e559318dd6b3c72845ce7def51f31a5a9c1f28b53a54c8",
+    "hash_exact": "5bf51a599ad8f6132986f332b723612c2fdab5229239007698bd4b8e52a278ed",
+    "input": "inputs/overture/offset.arrow",
+    "rows": 211,
+    "rows_in": 211,
+    "rows_out": 211,
+    "schema": [
+     "id:string",
+     "name:string",
+     "sources:int32",
+     "best_source:string",
+     "height_m:double",
+     "usage:string",
+     "volume_m3:double"
+    ]
+   }
+  },
+  "ov_shape": {
+   "bad_wkb": {
+    "error": "GEOSException: ParseException: Input buffer is smaller than requested object size",
+    "input": "inputs/overture/bad_wkb.arrow",
+    "rows_in": 20
+   },
+   "empty": {
+    "hash_all": "67fd9cc79696235d54c2adeb00b86b14e0b79c188e275094278b81b171630f5e",
+    "hash_exact": "893126643c654b2fa76c05d704081af6b55caf3a30acbca21728ceaf40cf968c",
+    "input": "inputs/overture/empty.arrow",
+    "rows": 0,
+    "rows_in": 0,
+    "rows_out": 0,
+    "schema": [
+     "id:string",
+     "class:string",
+     "subtype:string",
+     "height:double",
+     "area_m2:double",
+     "perimeter_m:int64",
+     "lon:double",
+     "lat:double",
+     "vertices:int32",
+     "compactness:double",
+     "tile_x:int32",
+     "tile_y:int32"
+    ]
+   },
+   "empty_geom": {
+    "error": "GEOSException: UnsupportedOperationException: getX called on empty Point\n",
+    "input": "inputs/overture/empty_geom.arrow",
+    "rows_in": 20
+   },
+   "main": {
+    "hash_all": "969124d8b3a551e0a7fa79b8c49c48cf7c5ac20fffa73399ec198acc681a4fa9",
+    "hash_exact": "8a302ace6c16e9a2dda39ee29eb3ac26e8e30a2c34133af3cb7a9a81136a1644",
+    "input": "inputs/overture/main.arrow",
+    "rows": 600,
+    "rows_in": 600,
+    "rows_out": 600,
+    "schema": [
+     "id:string",
+     "class:string",
+     "subtype:string",
+     "height:double",
+     "area_m2:double",
+     "perimeter_m:double",
+     "lon:double",
+     "lat:double",
+     "vertices:int32",
+     "compactness:double",
+     "tile_x:int32",
+     "tile_y:int32"
+    ]
+   },
+   "offset": {
+    "hash_all": "7c2b3d6ca26784919f370c1b1a699584b69cb6d361f9449b98d68c5876023a30",
+    "hash_exact": "5b92beb613f4da573804aea88640597475271f896995cbc23eceb0f85ebe231d",
+    "input": "inputs/overture/offset.arrow",
+    "rows": 211,
+    "rows_in": 211,
+    "rows_out": 211,
+    "schema": [
+     "id:string",
+     "class:string",
+     "subtype:string",
+     "height:double",
+     "area_m2:double",
+     "perimeter_m:double",
+     "lon:double",
+     "lat:double",
+     "vertices:int32",
+     "compactness:double",
+     "tile_x:int32",
+     "tile_y:int32"
+    ]
+   },
+   "other_types": {
+    "hash_all": "b74e82019bd067d8954c77a7306c65436a2eefc287c12bc6b3e15c443db097ee",
+    "hash_exact": "9bc2cfa6ce047b6054c7999fcc0060431d89a92c891547e3c695c94f81ad7ab4",
+    "input": "inputs/overture/other_types.arrow",
+    "rows": 60,
+    "rows_in": 60,
+    "rows_out": 60,
+    "schema": [
+     "id:string",
+     "class:string",
+     "subtype:string",
+     "height:double",
+     "area_m2:double",
+     "perimeter_m:double",
+     "lon:double",
+     "lat:double",
+     "vertices:int32",
+     "compactness:double",
+     "tile_x:int32",
+     "tile_y:int32"
     ]
    }
   },
@@ -390,10 +592,12 @@
   }
  },
  "oracle": {
+  "geos": "3.13.1",
   "machine": "arm64",
   "numpy": "2.4.2",
   "pyarrow": "24.0.0",
   "python": "3.14.3",
+  "shapely": "2.1.2",
   "system": "Darwin"
  }
 }

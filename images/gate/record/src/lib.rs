@@ -19,6 +19,7 @@ extern crate alloc;
 pub mod decode;
 pub mod encode;
 pub mod fb;
+pub mod large;
 pub mod nyc;
 pub mod types;
 
@@ -73,6 +74,9 @@ pub enum Job {
     Audit,
     Occupancy,
     Score,
+    FwMinhash,
+    OvShape,
+    OvAttrs,
 }
 
 impl Job {
@@ -82,6 +86,9 @@ impl Job {
             "audit" => Job::Audit,
             "occupancy" => Job::Occupancy,
             "score" => Job::Score,
+            "fw_minhash" => Job::FwMinhash,
+            "ov_shape" => Job::OvShape,
+            "ov_attrs" => Job::OvAttrs,
             _ => return None,
         })
     }
@@ -92,6 +99,9 @@ impl Job {
             Job::Audit => "audit",
             Job::Occupancy => "occupancy",
             Job::Score => "score",
+            Job::FwMinhash => "fw_minhash",
+            Job::OvShape => "ov_shape",
+            Job::OvAttrs => "ov_attrs",
         }
     }
 }
@@ -106,6 +116,9 @@ pub fn apply(job: Job, input: &[u8], window: &mut [u8]) -> Result<usize, Error> 
         Job::Audit => nyc::audit(&batch)?,
         Job::Occupancy => nyc::occupancy(&batch)?,
         Job::Score => nyc::score(&batch)?,
+        Job::FwMinhash => large::fw_minhash(&batch)?,
+        Job::OvShape => large::ov_shape(&batch)?,
+        Job::OvAttrs => large::ov_attrs(&batch)?,
     };
     encode::write(&out.fields, &out.columns, out.rows, window)
 }

@@ -28,3 +28,16 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub type Result<T> = core::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::ToString;
+
+    #[test]
+    fn says_what() {
+        assert_eq!(Error::Schema("x".into()).to_string(), "schema: x");
+        assert_eq!(Error::Value("x".into()).to_string(), "value: x");
+        assert_eq!(Error::Layout("x".into()).to_string(), "layout: x");
+    }
+}

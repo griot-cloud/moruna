@@ -116,7 +116,9 @@ fn check_job(name: &str) {
         }
         let n = got.unwrap_or_else(|e| panic!("{name}/{case}: {e}"));
         let out = read_record(&w[..n]);
-        let want = read_ipc(&fixtures().join(name).join(format!("{case}.expected.arrow")));
+        // Bit for bit against the arrow-rs port (the same core); against Python by the canonical
+        // hash, exact columns, and the tolerant ones by the functions crate's own test.
+        let want = moruna_gate_functions::batch::by_name(name).unwrap()(&input).unwrap();
         assert_eq!(out.num_rows(), want.num_rows(), "{name}/{case}");
         assert_eq!(out.schema().fields().len(), want.schema().fields().len());
         for (i, (g, w)) in out
@@ -135,13 +137,14 @@ fn check_job(name: &str) {
         }
         let ours = canon::canonical(name, &[out], false).unwrap();
         assert_eq!(
-            ours.hash_all,
-            rec["hash_all"].as_str().unwrap(),
+            ours.hash_exact,
+            rec["hash_exact"].as_str().unwrap(),
             "{name}/{case}"
         );
         assert_eq!(ours.rows, rec["rows"].as_u64().unwrap(), "{name}/{case}");
+        let exact = ours.hash_all == rec["hash_all"].as_str().unwrap();
         eprintln!(
-            "{name}/{case}: {} rows, the record {n} bytes, hash_all matches",
+            "{name}/{case}: {} rows, the record {n} bytes, hash_exact matches, hash_all {exact}",
             ours.rows
         );
     }
@@ -165,6 +168,21 @@ fn occupancy_on_the_plane() {
 #[test]
 fn score_on_the_plane() {
     check_job("score");
+}
+
+#[test]
+fn fw_minhash_on_the_plane() {
+    check_job("fw_minhash");
+}
+
+#[test]
+fn ov_attrs_on_the_plane() {
+    check_job("ov_attrs");
+}
+
+#[test]
+fn ov_shape_on_the_plane() {
+    check_job("ov_shape");
 }
 
 #[test]

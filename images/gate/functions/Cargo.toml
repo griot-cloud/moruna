@@ -16,6 +16,8 @@ std = []
 
 [dependencies]
 libm.workspace = true
+# `_norm_name`'s NFKC (Unicode 17; Python 3.14's tables are 16.0).
+unicode-normalization = { version = "=0.1.25", default-features = false }
 arrow = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 

@@ -69,3 +69,26 @@ pub static W3: [f64; HIDDEN] = table(WEIGHTS, AT_W3);
 pub static SIN_HOUR: [f64; 24] = table(TRIG, 0);
 /// `np.cos(hour * (np.pi / 12))` for hours 0 to 23.
 pub static COS_HOUR: [f64; 24] = table(TRIG, 24);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_tables_read_at_run_time_as_at_compile_time() {
+        let w1: [f64; N_W1] = table(WEIGHTS, AT_W1);
+        assert_eq!(w1, W1);
+        assert_eq!(at(TRIG, 24), COS_HOUR[0]);
+        assert_eq!(SIN_HOUR[0], 0.0);
+        assert_eq!(COS_HOUR[0], 1.0);
+        assert_eq!(TOTAL * 8, WEIGHTS.len());
+        assert!(
+            EMB.iter()
+                .chain(&B1)
+                .chain(&W2)
+                .chain(&B2)
+                .chain(&W3)
+                .all(|v| v.is_finite())
+        );
+    }
+}

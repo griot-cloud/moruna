@@ -12,19 +12,20 @@ use std::vec;
 use std::vec::Vec;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, PrimitiveArray, RecordBatch,
-    UInt32Array,
+    Array, ArrayRef, AsArray, BooleanArray, FixedSizeListArray, Float64Array, Int32Array,
+    Int64Array, PrimitiveArray, RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array,
 };
 use arrow::buffer::{BooleanBuffer, NullBuffer};
 use arrow::datatypes::{
-    ArrowPrimitiveType, DataType, Field, Float64Type, Int64Type, Schema, TimeUnit,
-    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    ArrowPrimitiveType, DataType, Field, Float32Type, Float64Type, Int32Type, Int64Type, Schema,
+    TimeUnit, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
     TimestampSecondType,
 };
 
-use crate::cols::{Bits, BitsBuf, Col};
+use crate::cols::{Bits, BitsBuf, Col, Offsets, Strs};
 use crate::error::{Error, Result};
-use crate::nyc;
+use crate::overture::{AttrsIn, BBox, Floats, Sources};
+use crate::{fineweb, nyc, overture};
 
 fn column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a ArrayRef> {
     batch
@@ -217,6 +218,198 @@ pub fn score(batch: &RecordBatch) -> Result<RecordBatch> {
     ])
 }
 
+/// A string or binary column of either offset width.
+pub fn strs<'a>(a: &'a ArrayRef, what: &str) -> Result<Strs<'a>> {
+    let valid = bits(a.as_ref())?;
+    let (offsets, data) = match a.data_type() {
+        DataType::Utf8 => {
+            let s = a.as_string::<i32>();
+            (Offsets::Small(s.value_offsets()), s.value_data())
+        }
+        DataType::LargeUtf8 => {
+            let s = a.as_string::<i64>();
+            (Offsets::Large(s.value_offsets()), s.value_data())
+        }
+        DataType::Binary => {
+            let s = a.as_binary::<i32>();
+            (Offsets::Small(s.value_offsets()), s.value_data())
+        }
+        DataType::LargeBinary => {
+            let s = a.as_binary::<i64>();
+            (Offsets::Large(s.value_offsets()), s.value_data())
+        }
+        other => {
+            return Err(Error::Schema(format!(
+                "{what} is {other}, not a string or binary column"
+            )));
+        }
+    };
+    Ok(Strs {
+        offsets,
+        data,
+        valid,
+    })
+}
+
+fn child<'a>(s: &'a StructArray, name: &str, what: &str) -> Result<&'a ArrayRef> {
+    s.column_by_name(name)
+        .ok_or_else(|| Error::Schema(format!("{what} has no field {name:?}")))
+}
+
+fn floats_of<'a>(a: &'a ArrayRef, what: &str) -> Result<Floats<'a>> {
+    let v = bits(a.as_ref())?;
+    match a.data_type() {
+        DataType::Float32 => Ok(Floats::F32(Col::new(
+            &a.as_primitive::<Float32Type>().values()[..],
+            v,
+        ))),
+        DataType::Float64 => Ok(Floats::F64(Col::new(
+            &a.as_primitive::<Float64Type>().values()[..],
+            v,
+        ))),
+        other => Err(Error::Schema(format!(
+            "{what} is {other}, not floating point"
+        ))),
+    }
+}
+
+fn struct_col<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StructArray> {
+    let a = column(batch, name)?;
+    a.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+        Error::Schema(format!(
+            "column {name:?} is {}, not a struct",
+            a.data_type()
+        ))
+    })
+}
+
+fn strings(values: Vec<Option<String>>) -> ArrayRef {
+    Arc::new(StringArray::from(values))
+}
+
+/// `fw_minhash`: `id`, `url`, `minhash` (64 `uint32`), `bands` (8 `uint64`).
+pub fn fw_minhash(batch: &RecordBatch) -> Result<RecordBatch> {
+    let texts = column(batch, "text")?;
+    let (sigs, keys) = fineweb::minhash(&strs(texts, "column \"text\"")?)?;
+    let item = |t: DataType| Arc::new(Field::new("item", t, true));
+    let minhash = FixedSizeListArray::try_new(
+        item(DataType::UInt32),
+        fineweb::PERMS as i32,
+        Arc::new(UInt32Array::from(sigs)),
+        None,
+    )
+    .map_err(|e| Error::Schema(e.to_string()))?;
+    let bands = FixedSizeListArray::try_new(
+        item(DataType::UInt64),
+        fineweb::BANDS as i32,
+        Arc::new(UInt64Array::from(keys)),
+        None,
+    )
+    .map_err(|e| Error::Schema(e.to_string()))?;
+    record(vec![
+        ("id", column(batch, "id")?.clone()),
+        ("url", column(batch, "url")?.clone()),
+        ("minhash", Arc::new(minhash)),
+        ("bands", Arc::new(bands)),
+    ])
+}
+
+/// `ov_attrs`: `id`, `name`, `sources`, `best_source`, `height_m`, `usage`, `volume_m3`.
+pub fn ov_attrs(batch: &RecordBatch) -> Result<RecordBatch> {
+    let names = struct_col(batch, "names")?;
+    let src = column(batch, "sources")?;
+    let (offsets, items) = match src.data_type() {
+        DataType::List(_) => {
+            let l = src.as_list::<i32>();
+            (Offsets::Small(l.value_offsets()), l.values())
+        }
+        DataType::LargeList(_) => {
+            let l = src.as_list::<i64>();
+            (Offsets::Large(l.value_offsets()), l.values())
+        }
+        other => {
+            return Err(Error::Schema(format!(
+                "column \"sources\" is {other}, not a list"
+            )));
+        }
+    };
+    let items = items
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| Error::Schema("sources' items are not structs".into()))?;
+    let bbox = struct_col(batch, "bbox")?;
+    let floors = column(batch, "num_floors")?;
+    if floors.data_type() != &DataType::Int32 {
+        return Err(Error::Schema(format!(
+            "column \"num_floors\" is {}, not int32",
+            floors.data_type()
+        )));
+    }
+    let a = AttrsIn {
+        rows: batch.num_rows(),
+        names_valid: bits(names)?,
+        primary: strs(child(names, "primary", "names")?, "names.primary")?,
+        sources: Sources {
+            offsets,
+            valid: bits(src.as_ref())?,
+            item_valid: bits(items)?,
+            dataset: strs(child(items, "dataset", "sources")?, "sources.dataset")?,
+            confidence: floats_of(child(items, "confidence", "sources")?, "sources.confidence")?,
+        },
+        height: floats(batch, "height")?,
+        num_floors: Col::new(
+            &floors.as_primitive::<Int32Type>().values()[..],
+            bits(floors.as_ref())?,
+        ),
+        class: strs(column(batch, "class")?, "column \"class\"")?,
+        subtype: strs(column(batch, "subtype")?, "column \"subtype\"")?,
+        bbox: BBox {
+            valid: bits(bbox)?,
+            xmin: floats_of(child(bbox, "xmin", "bbox")?, "bbox.xmin")?,
+            xmax: floats_of(child(bbox, "xmax", "bbox")?, "bbox.xmax")?,
+            ymin: floats_of(child(bbox, "ymin", "bbox")?, "bbox.ymin")?,
+            ymax: floats_of(child(bbox, "ymax", "bbox")?, "bbox.ymax")?,
+        },
+    };
+    let o = overture::attrs(&a)?;
+    let usage: Vec<Option<String>> = o.usage.iter().map(|u| Some(String::from(*u))).collect();
+    record(vec![
+        ("id", column(batch, "id")?.clone()),
+        ("name", strings(o.name)),
+        ("sources", Arc::new(Int32Array::from(o.sources))),
+        ("best_source", strings(o.best_source)),
+        ("height_m", Arc::new(Float64Array::from(o.height_m))),
+        ("usage", strings(usage)),
+        ("volume_m3", Arc::new(Float64Array::from(o.volume_m3))),
+    ])
+}
+
+/// `ov_shape`: `id`, `class`, `subtype`, `height`, then the shape's columns.
+pub fn ov_shape(batch: &RecordBatch) -> Result<RecordBatch> {
+    let s = overture::shapes(&strs(column(batch, "geometry")?, "column \"geometry\"")?)?;
+    let f = |v: Vec<f64>| -> ArrayRef { Arc::new(Float64Array::from(v)) };
+    let i = |v: Vec<i32>| -> ArrayRef { Arc::new(Int32Array::from(v)) };
+    let perimeter = if s.pairs == 0 {
+        i64_array(vec![0; s.perimeter_m.len()])
+    } else {
+        f(s.perimeter_m)
+    };
+    record(vec![
+        ("id", column(batch, "id")?.clone()),
+        ("class", column(batch, "class")?.clone()),
+        ("subtype", column(batch, "subtype")?.clone()),
+        ("height", column(batch, "height")?.clone()),
+        ("area_m2", f(s.area_m2)),
+        ("perimeter_m", perimeter),
+        ("lon", f(s.lon)),
+        ("lat", f(s.lat)),
+        ("vertices", i(s.vertices)),
+        ("compactness", f(s.compactness)),
+        ("tile_x", i(s.tile_x)),
+        ("tile_y", i(s.tile_y)),
+    ])
+}
+
 /// The function a job runs, by its harness name.
 pub fn by_name(job: &str) -> Option<fn(&RecordBatch) -> Result<RecordBatch>> {
     Some(match job {
@@ -224,11 +417,14 @@ pub fn by_name(job: &str) -> Option<fn(&RecordBatch) -> Result<RecordBatch>> {
         "audit" => audit,
         "occupancy" => occupancy,
         "score" => score,
+        "fw_minhash" => fw_minhash,
+        "ov_attrs" => ov_attrs,
+        "ov_shape" => ov_shape,
         _ => return None,
     })
 }
 
 /// The jobs [`by_name`] knows, for messages.
 pub fn known() -> String {
-    String::from("enrich, audit, occupancy, score")
+    String::from("enrich, audit, occupancy, score, fw_minhash, ov_attrs, ov_shape")
 }

@@ -110,13 +110,19 @@ fn check_case(job: &str, case: &str, rec: &Value) -> Option<Outcome> {
     let mut max_abs = 0.0f64;
     for (i, field) in ws.fields().iter().enumerate() {
         let (g, w) = (got.column(i), want.column(i));
-        match spec.tolerant.iter().find(|(n, _, _)| n == field.name()) {
+        let tolerant = spec
+            .tolerant
+            .iter()
+            .find(|(n, _, _)| n == field.name())
+            .filter(|_| w.data_type() == &arrow::datatypes::DataType::Float64);
+        match tolerant {
             None => same_column(
                 g.as_ref(),
                 w.as_ref(),
                 &format!("{job}/{case}: column {}", field.name()),
             ),
             Some((_, abs, rel)) => {
+                let (mut col_diff, mut col_rel) = (0usize, 0.0f64);
                 let (g, w) = (
                     g.as_primitive::<Float64Type>(),
                     w.as_primitive::<Float64Type>(),
@@ -133,11 +139,20 @@ fn check_case(job: &str, case: &str, rec: &Value) -> Option<Outcome> {
                     );
                     if x.map(f64::to_bits) != y.map(f64::to_bits) {
                         differing += 1;
+                        col_diff += 1;
                         if let (Some(x), Some(y)) = (x, y) {
                             max_abs = max_abs.max((x - y).abs());
+                            if y != 0.0 && x.is_finite() && y.is_finite() {
+                                col_rel = col_rel.max(((x - y) / y).abs());
+                            }
                         }
                     }
                 }
+                eprintln!(
+                    "{job}/{case}: {}: {col_diff} of {} values differ, max relative {col_rel:e}",
+                    field.name(),
+                    w.len()
+                );
             }
         }
     }
@@ -205,6 +220,21 @@ fn occupancy_matches_python() {
 #[test]
 fn score_matches_python() {
     check_job("score");
+}
+
+#[test]
+fn fw_minhash_matches_python() {
+    check_job("fw_minhash");
+}
+
+#[test]
+fn ov_attrs_matches_python() {
+    check_job("ov_attrs");
+}
+
+#[test]
+fn ov_shape_matches_python() {
+    check_job("ov_shape");
 }
 
 #[test]

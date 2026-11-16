@@ -1,0 +1,109 @@
+# The gate's functions in Rust
+
+The 0.7 no-regression gate (`architecture/arrow-core-0.7.md` section 9) runs each of 0.6.6's seven
+benchmark jobs with its function ported to Rust: the same input, the function, 0.6.6's output
+rows, timed against 0.6.6. This directory is the image-side code for it. It is not Moruna's
+runtime, so it is its own Cargo workspace, as `images/python` is stream P's.
+
+| Path | What it is |
+| --- | --- |
+| `functions/` | The seven functions: a `no_std` core over column slices, and Arrow `RecordBatch` in, `RecordBatch` out on arrow-rs 59.3.0 (`batch.rs`), and gate-canon/1 (`canon.rs`) |
+| `record/` | A function on the data plane: a page-aligned input record read in place, the output record written into a window (`apply`), `no_std`, safe |
+| `tasks/` | The seven native tasks, `gate-JOB`, static programs of `x86_64-moruna-user` on `moruna_sys::plane` (`tasks/build.sh`) |
+| `baseline/` | `gate-baseline`, the PM's control 2 (a rayon pool over arrow-rs and parquet), and `gate-canon`, the canonical hash of any engine's output |
+| `fixtures/` | The oracle's inputs and Python's outputs (`bench/vm/gate_oracle.py`), and `manifest.json` |
+| `functions/data/` | NumPy's draws, exported bit for bit: Score's weights and the hour tables, FineWeb's permutations |
+
+`cargo test` here runs every port against the fixtures with no Python. `bench/vm/gate_oracle.py`
+writes them again; `--check-constants` on another machine checks its NumPy draws the same
+constants.
+
+## The equivalence records (the PM's control 6)
+
+Each port against the Python function it replaces, on the oracle's synthetic inputs in the job's
+real input schema (nulls, edge values, unicode, offsets into shared buffers, empty batches, and
+the cases Python raises on). Rows are counted on the canonical form (gate-canon/1, below).
+`hash_all` equal means every column matched bit for bit; `hash_exact` equal means every column
+but the named tolerant ones did, and those are within their tolerance row by row.
+
+| Job | Python function (0.6.6) | Port | Fixture rows matched | Content hash | Tolerance, named before measuring |
+| --- | --- | --- | --- | --- | --- |
+| NYC Score | `workloads.py` `score` | `functions/src/nyc.rs` `score` | 5,118 of 5,118 (5 cases) | `hash_all` equal on every case | `predicted_tip`: absolute 1.1e-6, one step of its sixth decimal. BLAS orders the network's sums its own way and may fuse them; the port sums in order, unfused, and uses musl's `log1p`. No value differed on the fixtures. |
+| NYC Occupancy | `workloads.py` `occupancy` | `nyc.rs` `occupancy` | 194,776 of 194,776 (5 cases), regrouped | `hash_all` equal | none |
+| NYC Enrich | `workloads.py` `enrich` | `nyc.rs` `enrich` | 3,343 of 3,343 (5 cases) | `hash_all` equal | none |
+| NYC Audit | `workloads.py` `audit` | `nyc.rs` `audit` | 4,518 of 4,518 (4 cases) | `hash_all` equal | none |
+| Overture shapes | `ooc_workloads.py` `ov_shape` | `functions/src/overture.rs` `shapes`, `geom.rs` | 871 of 871 (4 cases) | `hash_exact` equal | `area_m2`, `perimeter_m`, `compactness`: relative 1e-9; `lon`, `lat`: absolute 1e-9 degrees. The scaling's `cos` is NumPy's in Python and musl's here, and `perimeter_m` subtracts nearby scaled coordinates, which magnifies its last bit. Observed: `area_m2` 29 of 871 values differ, at most 3.3e-16 relative; `perimeter_m` 73, at most 2.3e-11; `compactness` 81, at most 4.6e-11; `lon` and `lat` none. |
+| Overture attributes | `ooc_workloads.py` `ov_attrs`, `_norm_name` | `overture.rs` `attrs` | 811 of 811 (3 cases) | `hash_exact` equal | `volume_m3`: relative 1e-12, for `math.cos` (the platform's libm against musl's). Observed: 17 of 811 differ, at most 3.1e-16. |
+| FineWeb MinHash | `ooc_workloads.py` `fw_minhash`, `_signature` | `functions/src/fineweb.rs` | 501 of 501 (3 cases) | `hash_all` equal | none |
+
+Each job runs one function: `runner.py` takes `getattr(workloads or ooc_workloads, WORKLOAD)`, so
+FineWeb MinHash is `fw_minhash` alone. `fw_clean` is a job of its own, not on 0.6.6's table, and is
+not ported.
+
+The cases Python raises on, each port refuses with the same error: Audit and Occupancy with a null
+timestamp, Enrich with a duration past 2**53 microseconds (pyarrow's cast), `ov_shape` with a WKB
+GEOS refuses or an empty geometry (`get_x` on its empty centroid), `ov_attrs` with a null bound
+of a box it uses. A task refuses such a batch and ends, as the stage of a raising Python function
+did. Untrusted input never panics a port: the record reader goes through the engine's own record
+check, every offset is checked, and a WKB count is checked against its bytes before anything is
+allocated.
+
+The same records hold for the native path: `record/tests/plane.rs` makes each fixture's input a
+record as the engine lays one out, applies the job as a task does, passes the output through the
+engine's record check, and finds it bit for bit the arrow-rs port's.
+
+### What the ports take from Python and NumPy
+
+- Python's `round(x, 2)` is the double nearest the exact value's decimal rounding, ties to even
+  (`pyfloat::py_round2`, checked against 38,088 values); NumPy's `np.round(x, 6)` is
+  `rint(x * 1e6) / 1e6`.
+- Python's `max(a, b)` keeps a NaN `a`; NumPy's `maximum` and `clip` propagate NaN; NumPy's float
+  `//` and `%` are `npy_divmod`'s.
+- NumPy holds an integer column with a null as doubles (NaN for the null). Score then works in
+  floats, which equals the integer path for timestamps within +/- 2**53 microseconds; Occupancy
+  then raises (null times), or keys its zones as doubles (a null zone), as the port does.
+- A float cast to an integer is x86-64's (`cvttsd2si`: the minimum integer for NaN and anything
+  out of range), the gate's machine. The oracle runs on arm64, where NumPy gives 0, so it writes
+  x86-64's value for `ov_shape`'s tiles of a null geometry, the one place a NaN is cast.
+- 0.6.6's `ov_shape` writes `perimeter_m` as `int64` zeros for a batch with no two coordinates in
+  one geometry (`np.bincount` of nothing is an integer array); so does the port.
+- `str.split()` and `str.isspace()` count U+001C to U+001F as whitespace, which Rust does not.
+  Case mapping and NFKC are Rust's and `unicode-normalization`'s Unicode 17 tables against Python
+  3.14's 16.0: they differ only on characters new in 17.
+- A NaN's payload is not compared: NumPy's sort writes 0x7fff_ffff_ffff_ffff on one machine and
+  another on the next, and gate-canon/1 maps every NaN to one.
+- Floating point is `libm`'s (musl's functions in Rust) everywhere: the native task, the baseline
+  and any host compute the same bits.
+
+The oracle ran on macOS arm64: Python 3.14.3, NumPy 2.4.2 (Accelerate's BLAS), pyarrow 24.0.0,
+shapely 2.1.2 on GEOS 3.13.1. 0.6.6's benchmark ran on x86-64 Linux; the gate's first VM run
+compares the ports with 0.6.6's own outputs there, on the real data, by the same hash.
+
+## gate-canon/1
+
+The content hash every engine's output is compared by: `bench/vm/canon.py` is the reference and
+documents it, `functions/src/canon.rs` implements it (and `gate-canon` runs it over Parquet
+files), and the tests check the two give the same hashes. A per-batch aggregate (Occupancy) is
+regrouped by its keys first, so the hash does not depend on where batches split; every other gate
+function is row-wise. The hash is a multiset hash (the sum of the rows' hashes), the same for the
+same rows in any order or split.
+
+## The native tasks
+
+`tasks/build.sh` builds `gate-JOB` for the seven jobs as `kernel/tools/build.sh` builds the
+kernel's programs: the kernel's nightly, core and alloc from source, the user linker script.
+Each task takes its plane, then for each batch of input slot 0 writes the job's output record into
+a window of output slot 1 and puts it (`record::apply`, which has the shape of stream P's
+`Rings::step`). A 0.7 job names the task as an `image` function with `command: ["/gate-JOB"]` and
+`plane: true` (`bench/vm/gate_jobs.py`).
+
+What the task API on this base cannot yet express, reported to the integrator:
+
+- **Starting a native program.** On the kernel an `image` entry's command starts through the Linux
+  personality (`moruna-micro`'s `ImageTask`); a native program needs the runner to start it as a
+  process of the kernel with its plane attached.
+- **An output larger than its window.** A task answers one batch with one record in one window.
+  Enrich's output is larger than its input (four more columns), so the engine must size windows
+  from the stage's amplification, or let a task put several records for one batch.
+- **The task's log.** A refusal is written to the console when the manifest gives the task one;
+  a task has no log ring of its own through `moruna_sys` yet.

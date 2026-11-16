@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the gate's native tasks for the Moruna kernel's user target, as kernel/tools/build.sh
 # builds the kernel's own programs: the kernel's pinned nightly, core and alloc from source, the
-# user linker script, static. Writes OUT/gate-{enrich,audit,occupancy,score}.
+# user linker script, static. Writes gate-JOB for each of the seven jobs.
 #
 #   images/gate/tasks/build.sh [OUT]
 #
@@ -20,7 +20,7 @@ RUSTFLAGS="$flags -Zunstable-options -C link-arg=-T$kernel/sys/user.ld -C link-a
   -Zunstable-options -Zjson-target-spec \
   -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem "$@"
 bin="${CARGO_TARGET_DIR:-$here/target}/x86_64-moruna-user/release"
-for t in enrich audit occupancy score; do
+for t in enrich audit occupancy score fw_minhash ov_shape ov_attrs; do
   test -f "$bin/gate-$t" || { echo "build.sh: gate-$t was not built" >&2; exit 1; }
 done
 echo "$bin"

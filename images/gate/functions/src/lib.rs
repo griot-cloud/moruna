@@ -29,7 +29,10 @@ extern crate std;
 
 pub mod cols;
 pub mod error;
+pub mod fineweb;
+pub mod geom;
 pub mod nyc;
+pub mod overture;
 pub mod pyfloat;
 pub mod score_weights;
 

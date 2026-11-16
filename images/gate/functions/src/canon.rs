@@ -644,3 +644,141 @@ impl core::fmt::Display for Comparison {
 pub fn describe(e: &Error) -> String {
     e.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::vec;
+
+    use arrow::array::{
+        BinaryArray, BooleanArray, Float32Array, Float64Array, Int64Array, LargeStringArray,
+        StringArray, TimestampMicrosecondArray, UInt8Array,
+    };
+    use arrow::datatypes::{Field, Fields};
+
+    fn batch(cols: Vec<(&str, ArrayRef)>) -> RecordBatch {
+        RecordBatch::try_from_iter(cols).unwrap()
+    }
+
+    #[test]
+    fn every_type_has_an_encoding() {
+        let items = Arc::new(Field::new("item", DataType::Int64, true));
+        let list = arrow::array::ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1), None]),
+            None,
+        ]);
+        let st = StructArray::new(
+            Fields::from(vec![Field::new("x", DataType::Int64, true)]),
+            vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef],
+            Some(vec![true, false].into()),
+        );
+        let b = batch(vec![
+            (
+                "b",
+                Arc::new(BooleanArray::from(vec![Some(true), None])) as ArrayRef,
+            ),
+            ("u", Arc::new(UInt8Array::from(vec![1, 2]))),
+            (
+                "f",
+                Arc::new(Float32Array::from(vec![Some(1.5), Some(f32::NAN)])),
+            ),
+            ("s", Arc::new(StringArray::from(vec![Some("x"), None]))),
+            ("ls", Arc::new(LargeStringArray::from(vec!["a", "b"]))),
+            ("bin", Arc::new(BinaryArray::from(vec![&b"\0"[..], b"z"]))),
+            ("t", Arc::new(TimestampMicrosecondArray::from(vec![1, 2]))),
+            ("l", Arc::new(list)),
+            ("st", Arc::new(st)),
+        ]);
+        let _ = items;
+        let d = canonical("enrich", core::slice::from_ref(&b), false).unwrap();
+        assert_eq!(d.rows, 2);
+        assert!(d.json().contains("\"rows\": 2"));
+        // A second part with the same rows doubles the count and keeps the types.
+        let mut c = Canon::new("enrich", b.schema_ref(), false).unwrap();
+        c.add(&b).unwrap();
+        let mut c2 = Canon::new("enrich", b.schema_ref(), false).unwrap();
+        c2.add(&b).unwrap();
+        c.merge(c2).unwrap();
+        assert_eq!(c.finish().unwrap().rows, 4);
+        assert_eq!(
+            type_class(&DataType::Timestamp(TimeUnit::Nanosecond, None)).unwrap(),
+            "ts:ns"
+        );
+        assert!(type_class(&DataType::Date32).is_err());
+    }
+
+    #[test]
+    fn refusals_and_comparisons() {
+        let i = |v: Vec<i64>| Arc::new(Int64Array::from(v)) as ArrayRef;
+        let b = batch(vec![
+            ("zone", i(vec![1, 1])),
+            ("minute_of_day", i(vec![2, 2])),
+            ("car_minutes", i(vec![3, 4])),
+        ]);
+        let d = canonical("occupancy", core::slice::from_ref(&b), false).unwrap();
+        assert_eq!(d.rows, 1);
+        assert!(canonical("nope", core::slice::from_ref(&b), false).is_err());
+        assert!(canonical("occupancy", &[], false).is_err());
+        let extra = batch(vec![
+            ("zone", i(vec![1])),
+            ("minute_of_day", i(vec![2])),
+            ("car_minutes", i(vec![3])),
+            ("x", i(vec![0])),
+        ]);
+        assert!(canonical("occupancy", &[extra], false).is_err());
+        let other = batch(vec![("zone", i(vec![1])), ("minute_of_day", i(vec![2]))]);
+        let mut c = Canon::new("occupancy", b.schema_ref(), false).unwrap();
+        assert!(c.add(&other).is_err());
+        let wrong = batch(vec![
+            ("zone", i(vec![1])),
+            ("minute_of_day", i(vec![2])),
+            (
+                "car_minutes",
+                Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
+            ),
+        ]);
+        assert!(c.check_schema(wrong.schema_ref()).is_err());
+        // Score: a tolerant column; hashes that differ with no rows kept cannot be compared.
+        let f = |v: Vec<f64>| Arc::new(Float64Array::from(v)) as ArrayRef;
+        let s1 = batch(vec![
+            ("vendor_id", i(vec![1])),
+            ("predicted_tip", f(vec![0.5])),
+        ]);
+        let s2 = batch(vec![
+            ("vendor_id", i(vec![1])),
+            ("predicted_tip", f(vec![0.5000001])),
+        ]);
+        let s3 = batch(vec![
+            ("vendor_id", i(vec![1])),
+            ("predicted_tip", f(vec![0.6])),
+        ]);
+        let (a, b2, c3) = (
+            canonical("score", core::slice::from_ref(&s1), true).unwrap(),
+            canonical("score", core::slice::from_ref(&s2), true).unwrap(),
+            canonical("score", &[s3], true).unwrap(),
+        );
+        let ok = compare("score", &a, &b2).unwrap();
+        assert!(ok.ok && ok.differing == 1 && ok.max_abs > 0.0);
+        assert!(!compare("score", &a, &c3).unwrap().ok);
+        let bare = canonical("score", &[s2], false).unwrap();
+        assert!(compare("score", &a, &bare).is_err());
+        assert!(compare("nope", &a, &a).is_err());
+        assert!(
+            compare("score", &a, &a)
+                .unwrap()
+                .json()
+                .contains("\"ok\": true")
+        );
+        assert!(within(Some(f64::INFINITY), Some(f64::INFINITY), 0.0, 0.0));
+        assert!(!within(Some(f64::NAN), Some(1.0), 1.0, 0.0));
+        assert!(within(None, None, 0.0, 0.0) && !within(None, Some(1.0), 0.0, 0.0));
+        assert_eq!(describe(&Error::Value("v".into())), "value: v");
+        // A tolerant column must be floating point.
+        let ints = batch(vec![
+            ("vendor_id", i(vec![1])),
+            ("predicted_tip", i(vec![1])),
+        ]);
+        assert!(canonical("score", &[ints], true).is_err());
+    }
+}
