@@ -18,6 +18,9 @@ moruna_sys::main!(run);
 
 const SECOND: u64 = 1_000_000_000;
 
+/// How long the personality may run, in seconds.
+const WAIT: u64 = 4 * 3600;
+
 fn slot(name: &str) -> Option<Handle> {
     start::take(name)
 }
@@ -72,12 +75,13 @@ fn boot(out: &Console) -> Result<i64, alloc::string::String> {
         LaunchError::Call(what, e) => format!("{what}: {e:?}"),
     })?;
     println!(out, "B2 boot: ok: launched the personality ({len} bytes)");
-    match wait_one(&process.0, Signals::TERMINATED, now() + 120 * SECOND) {
+    // A gVisor batch runs for long; the boot's own timeout bounds a boot that hangs.
+    match wait_one(&process.0, Signals::TERMINATED, now() + WAIT * SECOND) {
         Ok(_) => println!(out, "B2 boot: ok: the personality's process ended"),
         Err(e) => {
             println!(
                 out,
-                "B2 boot: the personality still runs after 120 s ({e:?}); ending it"
+                "B2 boot: the personality still runs after {WAIT} s ({e:?}); ending it"
             );
             let _ = process.kill();
         }

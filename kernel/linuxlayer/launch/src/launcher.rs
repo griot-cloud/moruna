@@ -87,7 +87,9 @@ pub fn launch_task(
     )?;
 
     let own = call(
-        process.0.duplicate(Rights::READ | Rights::WRITE | Rights::TRANSFER),
+        process
+            .0
+            .duplicate(Rights::READ | Rights::WRITE | Rights::TRANSFER),
         "duplicating the process's own handle",
     )?;
     let mut all: Vec<(Option<Handle>, &str)> = Vec::new();

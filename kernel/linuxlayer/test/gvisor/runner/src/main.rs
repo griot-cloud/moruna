@@ -15,7 +15,8 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    process::{Command, ExitCode, ExitStatus},
+    process::{Child, Command, ExitCode, ExitStatus},
+    time::{Duration, Instant},
 };
 
 /// Where the tests are when no root is given.
@@ -27,6 +28,9 @@ const SCRATCH: &str = "/tmp";
 /// The descriptor limit gVisor's runner gives a test: `PipeTest.PipeFdCount` needs more than
 /// 66,000 (gVisor `runsc/boot/limits.go`).
 const NOFILE: u64 = 1_048_576;
+
+/// How long one test binary may run before it is killed and failed.
+const TEST_LIMIT: Duration = Duration::from_secs(600);
 
 /// The test binaries `applies` names, one a line, `#` starting a comment.
 fn names(applies: &str) -> Vec<String> {
@@ -48,12 +52,32 @@ fn filter(blocklist: &str) -> String {
     }
 }
 
-/// How a test ended, as a line ends.
-fn verdict(name: &str, status: io::Result<ExitStatus>) -> (bool, String) {
+/// Waits for `child` until `limit` has passed; kills it then, and answers `None`.
+fn wait_for(mut child: Child, limit: Duration) -> io::Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            child.kill()?;
+            child.wait()?;
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// How a test ended, as a line ends; `None` for one killed at its time limit.
+fn verdict(name: &str, status: io::Result<Option<ExitStatus>>) -> (bool, String) {
     use std::os::unix::process::ExitStatusExt;
     match status {
-        Ok(s) if s.success() => (true, format!("gvisor: ok: {name}")),
-        Ok(s) => match (s.code(), s.signal()) {
+        Ok(None) => (
+            false,
+            format!("gvisor: FAIL: {name} ran past its time limit"),
+        ),
+        Ok(Some(s)) if s.success() => (true, format!("gvisor: ok: {name}")),
+        Ok(Some(s)) => match (s.code(), s.signal()) {
             (Some(code), _) => (false, format!("gvisor: FAIL: {name} exited with {code}")),
             (None, Some(signal)) => (
                 false,
@@ -104,8 +128,9 @@ fn raise_nofile() -> io::Result<()> {
     }
 }
 
-/// Runs every test `root/applies` names; the lines it printed and how many passed.
-fn run(root: &Path, scratch: &Path, out: &mut impl FnMut(&str)) -> (usize, usize) {
+/// Runs every test `root/applies` names, each for at most `limit`; how many passed, of how
+/// many.
+fn run(root: &Path, scratch: &Path, limit: Duration, out: &mut impl FnMut(&str)) -> (usize, usize) {
     let applies = fs::read_to_string(root.join("applies")).unwrap_or_default();
     let tests = root.join("tests");
     let (mut passed, mut ran) = (0, 0);
@@ -116,7 +141,8 @@ fn run(root: &Path, scratch: &Path, out: &mut impl FnMut(&str)) -> (usize, usize
             .arg(format!("--gtest_filter={}", filter(&blocklist)))
             .current_dir(&tests)
             .env("TEST_TMPDIR", scratch)
-            .status();
+            .spawn()
+            .and_then(|child| wait_for(child, limit));
         reap();
         empty(scratch);
         let (ok, line) = verdict(&name, status);
@@ -134,7 +160,7 @@ fn start(root: Option<String>, scratch: &Path, out: &mut impl FnMut(&str)) -> bo
     if let Err(e) = raise_nofile() {
         out(&format!("gvisor: the descriptor limit stays: {e}"));
     }
-    let (passed, ran) = run(&root, scratch, out);
+    let (passed, ran) = run(&root, scratch, TEST_LIMIT, out);
     ran > 0 && passed == ran
 }
 

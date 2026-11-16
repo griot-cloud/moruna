@@ -9,8 +9,11 @@
 #
 # MODE is `musl` (default: linux/programs/hello.c, static, as /init), `glibc`
 # (linux/programs/dynamic.c, dynamic, at /kc1/bin/dynamic with its interpreter and
-# libraries from this machine, run with rdinit=), or `fork` (boot/programs/fork.c, static,
-# as /init).
+# libraries from this machine, run with rdinit=), `fork` (boot/programs/fork.c, static,
+# as /init), or `gvisor`: test/gvisor's runner as the first program, with the gVisor test
+# binaries GVISOR_TESTS names (default all `applies` names) from GVISOR_BINS
+# (test/gvisor/build.sh's), their libraries and blocklists. BOOT_MEMORY is the guest's
+# memory (default 2G).
 #
 # Needs what kernel/tools/build.sh needs for the kernel and the Linux programs (the
 # pinned nightly, musl for x86_64, QEMU). CARGO_TARGET_DIR, when set, is where the three
@@ -23,7 +26,8 @@ kernel="$(dirname "$layer")"
 out="${1:-$kernel/target/linuxlayer-boot}"
 seconds="${2:-120}"
 mode="${3:-musl}"
-case "$mode" in musl|glibc|fork) ;; *) echo "boot.sh: unknown mode $mode" >&2; exit 2 ;; esac
+case "$mode" in musl|glibc|fork|gvisor) ;; *) echo "boot.sh: unknown mode $mode" >&2; exit 2 ;; esac
+memory="${BOOT_MEMORY:-2G}"
 targets="${CARGO_TARGET_DIR:-$kernel/target}"
 target=x86_64-unknown-none
 user_target="$kernel/targets/x86_64-moruna-user.json"
@@ -55,32 +59,63 @@ cp "$targets/linuxlayer-boot/x86_64-moruna-user/release/linuxlayer-boot" "$out/b
 cp "$targets/linuxlayer-image/x86_64-moruna-user/release/linuxlayer-personality" \
   "$out/linuxlayer/personality"
 
-# The initramfs: the mode's program, and the file both programs read.
-cp "$kernel/linux/programs/greeting.txt" "$out/root/kc1/greeting.txt"
-if [ "$mode" != glibc ]; then
+# Copies the libraries `ldd` names for the program at $1 into the initramfs, at their
+# paths, links followed.
+with_libraries() {
+  for lib in $(ldd "$1" | awk '/=>/ { print $3 } /^\t\// { print $1 }'); do
+    mkdir -p "$out/root$(dirname "$lib")"
+    cp -L "$lib" "$out/root$lib"
+  done
+}
+
+muslcc() {
   specs=/usr/lib/x86_64-linux-musl/musl-gcc.specs
   if [ "$(uname -m)" = x86_64 ] && command -v musl-gcc >/dev/null; then
-    muslcc=(musl-gcc)
+    musl-gcc "$@"
   elif [ -r "$specs" ]; then
-    muslcc=("${CC:-x86_64-linux-gnu-gcc}" -specs="$specs")
+    "${CC:-x86_64-linux-gnu-gcc}" -specs="$specs" "$@"
   else
     echo "boot.sh: no musl for x86_64 (musl-tools)" >&2
     exit 1
   fi
-  program="$kernel/linux/programs/hello.c"
-  [ "$mode" = fork ] && program="$here/programs/fork.c"
-  "${muslcc[@]}" -static -O2 -Wall -Werror -s -o "$out/root/init" "$program"
-  cmdline=""
-else
-  "${CC:-gcc}" -O2 -Wall -Werror -s -o "$out/root/kc1/bin/dynamic" \
-    "$kernel/linux/programs/dynamic.c"
-  # Its interpreter and libraries, at their paths, links followed.
-  for lib in $(ldd "$out/root/kc1/bin/dynamic" | awk '/=>/ { print $3 } /^\t\// { print $1 }'); do
-    mkdir -p "$out/root$(dirname "$lib")"
-    cp -L "$lib" "$out/root$lib"
-  done
-  cmdline="rdinit=/kc1/bin/dynamic"
-fi
+}
+
+# The initramfs: the mode's program, and the file the test programs read.
+cp "$kernel/linux/programs/greeting.txt" "$out/root/kc1/greeting.txt"
+case "$mode" in
+  musl | fork)
+    program="$kernel/linux/programs/hello.c"
+    [ "$mode" = fork ] && program="$here/programs/fork.c"
+    muslcc -static -O2 -Wall -Werror -s -o "$out/root/init" "$program"
+    cmdline=""
+    ;;
+  glibc)
+    "${CC:-gcc}" -O2 -Wall -Werror -s -o "$out/root/kc1/bin/dynamic" \
+      "$kernel/linux/programs/dynamic.c"
+    with_libraries "$out/root/kc1/bin/dynamic"
+    cmdline="rdinit=/kc1/bin/dynamic"
+    ;;
+  gvisor)
+    bins="${GVISOR_BINS:-$HOME/b2/gvisor-bins}"
+    tests="${GVISOR_TESTS:-$(grep -v '^#' "$layer/test/gvisor/applies" | sed 's/#.*//' | tr '\n' ' ')}"
+    musl=x86_64-unknown-linux-musl
+    rustup target list --installed | grep -qx "$musl" || rustup target add "$musl"
+    (cd "$layer/test/gvisor/runner" && CARGO_TARGET_DIR="$targets/gvisor-runner" \
+      cargo build --release --locked --target "$musl")
+    mkdir -p "$out/root/gvisor/tests" "$out/root/gvisor/blocklists"
+    install -m 0755 "$targets/gvisor-runner/$musl/release/linuxlayer-gvisor-runner" \
+      "$out/root/gvisor/runner"
+    : > "$out/root/gvisor/applies"
+    for name in $tests; do
+      install -m 0755 "$bins/$name" "$out/root/gvisor/tests/$name"
+      with_libraries "$bins/$name"
+      echo "$name" >> "$out/root/gvisor/applies"
+      [ -f "$layer/test/gvisor/blocklists/$name" ] &&
+        cp "$layer/test/gvisor/blocklists/$name" "$out/root/gvisor/blocklists/"
+    done
+    cmdline="rdinit=/gvisor/runner -- /gvisor"
+    ;;
+esac
 python3 "$here/cpio.py" "$out/root" "$out/linuxlayer/initramfs.cpio"
 printf '%s\0' "$cmdline" > "$out/linuxlayer/cmdline"
 
@@ -104,7 +139,7 @@ else
   accel=(-accel tcg -cpu max -machine q35)
 fi
 set +e
-timeout --kill-after=5 "$seconds" qemu-system-x86_64 "${accel[@]}" -m 2G -smp 2 \
+timeout --kill-after=5 "$seconds" qemu-system-x86_64 "${accel[@]}" -m "$memory" -smp 2 \
   -nographic -display none -monitor none -serial stdio -no-reboot \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
   -kernel "$out/moruna-microkernel.qemu.elf" -initrd "$out/initramfs.cpio" \

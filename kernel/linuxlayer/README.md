@@ -262,15 +262,20 @@ a0de2258 runs) in a booted personality:
 - `blocklists/` is Asterinas's (`test/initramfs/src/conformance/gvisor/blocklists`,
   MPL-2.0), one file a test, for the tests that apply;
 - `runner/` takes the place of Asterinas's `run_gvisor_test.sh`, since there is no shell.
-  It is the first program (`init=/gvisor/runner -- /gvisor`): it runs each test with its
-  blocklist as the gtest filter in an empty `/tmp`, reaps what the test leaves behind, and
-  prints `gvisor: ok: NAME` or `gvisor: FAIL: NAME ...`, then a count. It is a Linux
-  program (static musl), outside the workspace; its host tests use stand-in test
-  binaries.
+  It is the first program (`rdinit=/gvisor/runner -- /gvisor`): it runs each test with
+  its blocklist as the gtest filter in an empty `/tmp`, kills one that runs past ten
+  minutes, reaps what the test leaves behind, and prints `gvisor: ok: NAME` or
+  `gvisor: FAIL: NAME ...`, then a count. It is a Linux program (static musl), outside the
+  workspace; its host tests use stand-in test binaries.
+- `build.sh` builds the binaries that apply from gVisor's source at that tag with Bazel
+  (through bazelisk, checked by digest), stripped, keeping the checkout and Bazel's cache
+  under `~/b2` so they survive `/data`'s wipe; on Linux x86-64 (moruna-bench).
+- `run.sh BINS OUT` boots them in batches (`boot/boot.sh gvisor`, eight binaries a boot,
+  4 GiB), so a test that ends the personality loses only its batch, and writes a verdict
+  per test binary to `OUT/results`. They run on dynamic glibc, their libraries copied in.
 
-The binaries are built from gVisor's source at that tag (`bazel build
---test_tag_filters=native //test/syscalls/...`) and run on dynamic glibc. Which cases
-fail here, beyond Asterinas's blocklists, is the judgement Brackly's rule asks for.
+Which cases fail here, beyond Asterinas's blocklists, is the judgement Brackly's rule asks
+for.
 
 ## How the tree is judged
 
@@ -301,7 +306,7 @@ RUSTFLAGS="--cfg ktest" cargo test --target x86_64-unknown-linux-gnu --workspace
 The booted test, on Linux x86-64 with QEMU and musl (KVM when usable):
 
 ```sh
-kernel/linuxlayer/boot/boot.sh [OUT] [TIMEOUT_SECONDS] [musl|glibc|fork]
+kernel/linuxlayer/boot/boot.sh [OUT] [TIMEOUT_SECONDS] [musl|glibc|fork|gvisor]
 ```
 
 For the Moruna user target, as `kernel/tools/build.sh` builds programs:

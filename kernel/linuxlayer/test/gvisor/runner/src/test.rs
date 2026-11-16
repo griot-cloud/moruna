@@ -42,7 +42,13 @@ fn the_filter_leaves_out_every_blocked_case() {
 
 #[test]
 fn verdicts_say_how_a_test_ended() {
-    let status = |cmd: &str| Command::new("/bin/sh").arg("-c").arg(cmd).status();
+    let status = |cmd: &str| {
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg(cmd)
+            .status()
+            .map(Some)
+    };
     assert_eq!(
         verdict("a_test", status("exit 0")),
         (true, "gvisor: ok: a_test".into())
@@ -55,7 +61,11 @@ fn verdicts_say_how_a_test_ended() {
         verdict("a_test", status("kill -9 $$")),
         (false, "gvisor: FAIL: a_test was killed by signal 9".into())
     );
-    let missing = Command::new("/nonexistent/a_test").status();
+    assert_eq!(
+        verdict("a_test", Ok(None)),
+        (false, "gvisor: FAIL: a_test ran past its time limit".into())
+    );
+    let missing = Command::new("/nonexistent/a_test").status().map(Some);
     assert!(
         verdict("a_test", missing)
             .1
@@ -94,7 +104,9 @@ fn run_runs_each_named_test_with_its_filter_in_an_empty_scratch() {
         "test -e \"$TEST_TMPDIR/left\" && exit 9; exit 1",
     );
     let mut lines = Vec::new();
-    let (passed, ran) = run(&root, &scratch, &mut |line| lines.push(line.to_string()));
+    let (passed, ran) = run(&root, &scratch, Duration::from_secs(30), &mut |line| {
+        lines.push(line.to_string())
+    });
     assert_eq!((passed, ran), (1, 3));
     assert_eq!(
         fs::read_to_string(&seen).unwrap().trim(),
@@ -117,8 +129,9 @@ fn run_runs_each_named_test_with_its_filter_in_an_empty_scratch() {
 fn nothing_named_runs_nothing() {
     let root = dir("none");
     let mut lines = Vec::new();
+    let limit = Duration::from_secs(30);
     assert_eq!(
-        run(&root, &root, &mut |l| lines.push(l.to_string())),
+        run(&root, &root, limit, &mut |l| lines.push(l.to_string())),
         (0, 0)
     );
     assert_eq!(lines, ["gvisor: 0 of 0 test binaries passed"]);
@@ -149,5 +162,25 @@ fn start_passes_only_when_every_test_passed() {
     // No root given: the image's, absent on the host, so nothing ran.
     assert!(!start(None, &scratch, &mut |l| lines.push(l.to_string())));
     assert_eq!(lines.last().unwrap(), "gvisor: 0 of 0 test binaries passed");
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_test_past_its_limit_is_killed_and_failed() {
+    let root = dir("limit");
+    let scratch = root.join("scratch");
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::create_dir_all(&scratch).unwrap();
+    fs::write(root.join("applies"), "slow_test\n").unwrap();
+    script(&root.join("tests/slow_test"), "exec sleep 30");
+    let started = Instant::now();
+    let mut lines = Vec::new();
+    let limit = Duration::from_millis(300);
+    assert_eq!(
+        run(&root, &scratch, limit, &mut |l| lines.push(l.to_string())),
+        (0, 1)
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(lines.contains(&"gvisor: FAIL: slow_test ran past its time limit".to_string()));
     fs::remove_dir_all(&root).unwrap();
 }
