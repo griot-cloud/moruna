@@ -666,7 +666,7 @@ impl Rings {
     pub fn hand_back(&mut self) -> Result<()> {
         check(raw::batch_put(1, self.rings.addr, self.rings.len))?;
         self.rings = Rings::map(1)?;
-        self.half = ring::Task::attach(&self.rings).map_err(broken)?;
+        self.half = ring::Task::reattach(&self.rings, &self.half).map_err(broken)?;
         Ok(())
     }
 }

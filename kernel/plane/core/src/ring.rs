@@ -508,6 +508,17 @@ impl Task {
         Ok(t)
     }
 
+    /// The task's half of the next rings object the engine gave (unmap mode), the inputs it
+    /// took and has not released kept as they were: the engine carried the input ring over.
+    pub fn reattach(s: &impl Shared, previous: &Task) -> Result<Task, Bad> {
+        let mut t = Task::attach(s)?;
+        if t.in_tail != previous.in_tail || t.geometry != previous.geometry {
+            return Err(Bad("the next rings object does not carry the input ring"));
+        }
+        t.in_next = previous.in_next;
+        Ok(t)
+    }
+
     /// The next input, which stays the task's until it releases it; `None` while there is
     /// none.
     pub fn next(&mut self, s: &impl Shared) -> Result<Option<InEntry>, Bad> {

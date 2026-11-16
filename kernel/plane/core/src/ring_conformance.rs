@@ -185,6 +185,7 @@ pub fn run_all(f: &Fixtures) -> Results {
     r.push(("dp_i2_ports_and_waits", ports_and_waits(f)));
     r.push(("c4_zeroed_before_seen", zeroed(f)));
     r.push(("c6_restart_fresh", restart(f)));
+    r.push(("dp_i1_unmap_one_window", one_window(f)));
     r
 }
 
@@ -327,6 +328,30 @@ pub fn pipelined(f: &Fixtures, protect: bool, n: u64) -> Result<Measure, String>
         revokes: c.revokes + c.regrants,
         generations: c.generations,
     })
+}
+
+/// DP-I1 in unmap mode with one window: a batch taken while no window is free waits through
+/// the hand-back and is answered once, not read again from the next rings object.
+fn one_window(f: &Fixtures) -> Result<(), String> {
+    let mut p = plane(false);
+    let (task, mut t) = open(&mut p, shape(1), Behave::Echo)?;
+    let region = p.region_of(task).ok_or("no region")?;
+    let mut sent = Vec::new();
+    for _ in 0..4 {
+        let b = load(&mut p, region, f)?;
+        p.offer(task, 0, b).map_err(|e| format!("{e:?}"))?;
+        p.drop_batch(b).map_err(|e| format!("{e:?}"))?;
+        sent.push(b);
+    }
+    let events = drive(&mut p, &mut [&mut t])?;
+    same(puts(&events).len(), 4, "one record a batch, none twice")?;
+    same(t.read.len(), 4, "each batch read once")?;
+    same(
+        p.counters().generations,
+        4,
+        "a hand-back a record, with one window",
+    )?;
+    Ok(())
 }
 
 /// DP-I3: when the engine checks a record the task can no longer write it, and a write after

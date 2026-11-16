@@ -159,6 +159,23 @@ pub fn declares_rings(env: &[String]) -> bool {
     env.iter().any(|e| e == "MORUNA_PLANE=rings")
 }
 
+/// The most processes one image stage runs.
+pub const PROCESSES_MAX: usize = 64;
+
+/// How many processes an image's stage runs, one interpreter each: the `MORUNA_PROCESSES` its
+/// environment declares, or one.
+pub fn processes(env: &[String]) -> Result<usize, String> {
+    match env.iter().find_map(|e| e.strip_prefix("MORUNA_PROCESSES=")) {
+        None => Ok(1),
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if (1..=PROCESSES_MAX).contains(&n) => Ok(n),
+            _ => Err(format!(
+                "MORUNA_PROCESSES={v}: a stage runs 1 to {PROCESSES_MAX} processes"
+            )),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +241,16 @@ mod tests {
         assert!(keep_in_place(2, 4));
         assert!(!keep_in_place(3, 4));
         assert!(!keep_in_place(0, 1));
+    }
+
+    #[test]
+    fn p_an_image_declares_its_processes_in_its_environment() {
+        let env = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(processes(&env(&[])), Ok(1));
+        assert_eq!(processes(&env(&["MORUNA_PROCESSES=8"])), Ok(8));
+        assert!(processes(&env(&["MORUNA_PROCESSES=0"])).is_err());
+        assert!(processes(&env(&["MORUNA_PROCESSES=65"])).is_err());
+        assert!(processes(&env(&["MORUNA_PROCESSES=x"])).is_err());
     }
 
     #[test]

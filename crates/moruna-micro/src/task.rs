@@ -147,6 +147,19 @@ impl moruna_kernel::OutsideMemory for TaskMemory {
     }
 }
 
+/// The memory every process of a stage holds outside the engine's process.
+pub struct TaskMemories(Vec<Arc<TaskMemory>>);
+
+impl moruna_kernel::OutsideMemory for TaskMemories {
+    fn in_use(&self) -> moruna_kernel::Result<u64> {
+        let mut sum = 0u64;
+        for m in &self.0 {
+            sum = sum.saturating_add(m.in_use()?);
+        }
+        Ok(sum)
+    }
+}
+
 impl Drop for TaskMemory {
     fn drop(&mut self) {
         // Uncertified original ownership cannot be released by a Rust receiver drop.
@@ -172,8 +185,10 @@ pub struct ImageTask {
     cancel: OnceLock<CancelToken>,
     /// The stage's ceiling, which bounds its plane's arena and its task's account.
     ceiling: Mutex<Option<u64>>,
-    /// The task's account, once it has started.
-    memory: Arc<TaskMemory>,
+    /// Each process's account, once it has started: one a process of the stage.
+    memory: Vec<Arc<TaskMemory>>,
+    /// The memory all of them hold outside the engine's process.
+    outside: Arc<TaskMemories>,
     /// Native PEX controls reserve each reply explicitly; ordinary image behavior is unchanged.
     managed_windows: bool,
     /// Source path is only resolved through the actual filesystem capability at start.
@@ -221,6 +236,10 @@ impl ImageTask {
         }
         personality()?;
         let rings = layout::declares_rings(&env);
+        let processes = layout::processes(&env)?;
+        let memory: Vec<Arc<TaskMemory>> = (0..processes)
+            .map(|_| Arc::new(TaskMemory::default()))
+            .collect();
         port_names.sort();
         port_names.dedup();
         Ok(ImageTask {
@@ -233,7 +252,8 @@ impl ImageTask {
             ports: OnceLock::new(),
             cancel: OnceLock::new(),
             ceiling: Mutex::new(None),
-            memory: Arc::new(TaskMemory::default()),
+            outside: Arc::new(TaskMemories(memory.clone())),
+            memory,
             managed_windows: false,
             assets_path: None,
             rings,
@@ -276,7 +296,7 @@ impl ImageTask {
             .as_any_mut()
             .downcast_mut::<TaskState>()
             .ok_or_else(|| kernel_error("image: a state this kernel did not make".into()))?;
-        if !Arc::ptr_eq(&st.memory, &self.memory) {
+        if !self.memory.iter().any(|m| Arc::ptr_eq(&st.memory, m)) {
             return Err(kernel_error(
                 "image: state belongs to another actual task owner".into(),
             ));
@@ -340,7 +360,7 @@ impl ImageTask {
 
     /// The memory the stage holds outside the engine's process: its task's account.
     pub fn outside(&self) -> Arc<dyn moruna_kernel::OutsideMemory> {
-        Arc::clone(&self.memory) as Arc<dyn moruna_kernel::OutsideMemory>
+        Arc::clone(&self.outside) as Arc<dyn moruna_kernel::OutsideMemory>
     }
 
     /// The stage's ports, once it is placed (MH 4.10).
@@ -363,7 +383,14 @@ impl ImageTask {
 
     fn start(&self, ctx: &InitCtx) -> Result<TaskState> {
         let name = &self.name;
-        if lock(&self.memory.account).is_some() || lock(&self.memory.failure).is_some() {
+        let memory = self.memory.get(ctx.instance).ok_or_else(|| {
+            kernel_error(format!(
+                "image `{name}`: instance {} of a stage of {} processes",
+                ctx.instance,
+                self.memory.len()
+            ))
+        })?;
+        if lock(&memory.account).is_some() || lock(&memory.failure).is_some() {
             return Err(kernel_error(format!(
                 "image `{name}`: previous task account has no certified retirement"
             )));
@@ -490,13 +517,13 @@ impl ImageTask {
             .map_err(|e| kernel_error(format!("image `{name}`: run_plane: {e:?}")))?;
         // Publish the retained account only after request construction and transfer
         // succeeded. Failed startup drops every local handle and returns its limit.
-        *lock(&self.memory.account) = Some((kept, limit));
-        self.memory
+        *lock(&memory.account) = Some((kept, limit));
+        memory
             .plane
             .store(budget, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(target: "micro", image = %name, command = ?self.command, rings = self.rings, "image task asked of the personality");
         Ok(TaskState {
-            memory: Arc::clone(&self.memory),
+            memory: Arc::clone(memory),
             name: name.clone(),
             plane,
             task,
@@ -1126,10 +1153,11 @@ impl Kernel for ImageTask {
         self.fingerprint
     }
 
-    /// One task per stage.
+    /// One task process per instance: one, or the `MORUNA_PROCESSES` the image declares.
     fn kind(&self) -> KernelKind {
         KernelKind::Stateful {
-            max_instances: core::num::NonZeroUsize::MIN,
+            max_instances: core::num::NonZeroUsize::new(self.memory.len())
+                .unwrap_or(core::num::NonZeroUsize::MIN),
         }
     }
 
@@ -1172,7 +1200,7 @@ impl Kernel for ImageTask {
                 .as_any_mut()
                 .downcast_mut::<TaskState>()
                 .ok_or_else(|| kernel_error("image: a state this kernel did not make".into()))?;
-            if !Arc::ptr_eq(&st.memory, &self.memory) {
+            if !self.memory.iter().any(|m| Arc::ptr_eq(&st.memory, m)) {
                 return Err(kernel_error(
                     "image: state belongs to another actual task owner".into(),
                 ));

@@ -166,6 +166,8 @@ pub struct RingTaskModel {
     region: Option<Mem>,
     rings: Option<Mem>,
     ring: Option<ring::Task>,
+    /// The half it had before it handed its rings object back.
+    previous: Option<ring::Task>,
     waiting: Option<u64>,
     token: u64,
     pending: Option<(InEntry, Vec<u8>)>,
@@ -193,6 +195,7 @@ impl RingTaskModel {
             region: None,
             rings: None,
             ring: None,
+            previous: None,
             waiting: None,
             token: 0,
             pending: None,
@@ -282,7 +285,7 @@ impl RingTaskModel {
         }
         drop(s);
         self.rings = None;
-        self.ring = None;
+        self.previous = self.ring.take();
         self.posted_since_put = 0;
     }
 
@@ -326,7 +329,11 @@ impl RingTaskModel {
             let Some(m) = Self::map(&self.output) else {
                 return false;
             };
-            match ring::Task::attach(&TaskMap(m.clone())) {
+            let attached = match &self.previous {
+                Some(p) => ring::Task::reattach(&TaskMap(m.clone()), p),
+                None => ring::Task::attach(&TaskMap(m.clone())),
+            };
+            match attached {
                 Ok(t) => self.ring = Some(t),
                 Err(_) => {
                     self.end(Ending::Faulted);

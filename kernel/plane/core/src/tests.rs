@@ -691,3 +691,41 @@ fn dp_ring_measures_calls_per_batch() {
         assert!(pipe.calls < pipe.batches);
     }
 }
+
+/// The fixtures the Python shim's tests share with the engine (images/python/tests/fixtures):
+/// a record the shim wrote passes the engine's check, and the ring layout the shim speaks is
+/// the engine's. `MORUNA_WRITE_GOLDEN=1` writes the layout's file again.
+#[test]
+fn p_the_python_shim_speaks_the_engine_s_records_and_rings() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../images/python/tests/fixtures");
+    let rec = std::fs::read(dir.join("record.bin")).expect("the shim's record");
+    let checked = verify(rec.len() as u64, |at, buf| {
+        let at = at as usize;
+        buf.copy_from_slice(&rec[at..at + buf.len()]);
+        Ok(())
+    })
+    .expect("the shim's record passes the check");
+    assert_eq!(checked.rows, 3);
+
+    let words = crate::ring_conformance::golden();
+    assert!(!words.is_empty());
+    let g = crate::ring::Geometry::new(1 << 20, 2, 64 * 1024).expect("geometry");
+    let body: Vec<String> = words
+        .iter()
+        .map(|(at, v)| format!("    \"{at}\": {v}"))
+        .collect();
+    let json = format!(
+        "{{\n  \"windows_at\": {},\n  \"words\": {{\n{}\n  }}\n}}\n",
+        g.windows_at(),
+        body.join(",\n")
+    );
+    let file = dir.join("ring-golden.json");
+    if std::env::var("MORUNA_WRITE_GOLDEN").is_ok() {
+        std::fs::write(&file, &json).expect("writing the golden layout");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("the golden layout"),
+        json
+    );
+}
