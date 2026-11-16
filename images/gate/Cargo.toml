@@ -5,7 +5,7 @@
 # toolchain, so they are a workspace of their own too (tasks/).
 [workspace]
 resolver = "3"
-members = ["functions"]
+members = ["functions", "record"]
 exclude = ["tasks"]
 
 [workspace.package]

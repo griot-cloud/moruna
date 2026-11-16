@@ -1,0 +1,212 @@
+//! The native path on the host: each fixture's input made into a data-plane record as the engine
+//! makes one (an Arrow IPC stream laid out by `moruna_ipc_check::record::reframe`), the job
+//! applied to it as a task applies it, and the record it wrote checked by the engine's own
+//! record check, read back by arrow-ipc and compared with the Python function's output.
+
+use std::fs::File;
+use std::path::PathBuf;
+
+use arrow::array::{Array, AsArray, RecordBatch};
+use arrow::datatypes::{DataType, Float64Type};
+use arrow::ipc::reader::{FileReader, StreamReader};
+use arrow::ipc::writer::StreamWriter;
+use moruna_gate_functions::canon;
+use moruna_gate_record::{Error, Job, apply};
+use moruna_ipc_check::frame::{END_OF_STREAM, body_length, message_len};
+use moruna_ipc_check::record::{Need, check_record, framing_need, reframe};
+use serde_json::Value;
+
+fn fixtures() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures")
+}
+
+fn read_ipc(path: &PathBuf) -> RecordBatch {
+    let reader = FileReader::try_new(File::open(path).unwrap(), None).unwrap();
+    let schema = reader.schema();
+    let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
+    arrow::compute::concat_batches(&schema, &batches).unwrap()
+}
+
+/// An 8-aligned buffer of `n` bytes, as a mapped region is.
+fn aligned(n: usize) -> Vec<u64> {
+    vec![0u64; n.div_ceil(8)]
+}
+
+/// `batch` as a data-plane record, in an 8-aligned buffer.
+fn record_of(batch: &RecordBatch) -> (Vec<u64>, usize) {
+    let mut stream = Vec::new();
+    {
+        let mut w = StreamWriter::try_new(&mut stream, &batch.schema()).unwrap();
+        w.write(batch).unwrap();
+        w.finish().unwrap();
+    }
+    let l1 = message_len(&stream).unwrap();
+    let schema = &stream[..8 + l1];
+    let l2 = message_len(&stream[8 + l1..]).unwrap();
+    let rb = &stream[8 + l1..8 + l1 + 8 + l2];
+    let body_at = 8 + l1 + 8 + l2;
+    let body_len = body_length(rb).unwrap() as usize;
+    let body = &stream[body_at..body_at + body_len];
+    let r = reframe(schema, rb).unwrap();
+    let mut buf = aligned(r.record_len as usize);
+    let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut buf);
+    bytes[..r.framing.len()].copy_from_slice(&r.framing);
+    for (from, to, len) in r.moves {
+        bytes[to as usize..(to + len) as usize]
+            .copy_from_slice(&body[from as usize..(from + len) as usize]);
+    }
+    (buf, r.record_len as usize)
+}
+
+/// A record read back as arrow-ipc reads a stream, after the engine's check passed it.
+fn read_record(record: &[u8]) -> RecordBatch {
+    let Ok(Need::Framing(end)) = framing_need(record) else {
+        panic!("no framing")
+    };
+    check_record(&record[..end], record.len() as u64).expect("the engine's record check");
+    let mut stream = record.to_vec();
+    stream.extend_from_slice(&END_OF_STREAM);
+    let reader = StreamReader::try_new(&stream[..], None).unwrap();
+    let schema = reader.schema();
+    let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
+    arrow::compute::concat_batches(&schema, &batches).unwrap()
+}
+
+fn same(g: &dyn Array, w: &dyn Array, what: &str) {
+    if w.data_type() == &DataType::Float64 {
+        let (g, w) = (
+            g.as_primitive::<Float64Type>(),
+            w.as_primitive::<Float64Type>(),
+        );
+        assert_eq!(g.null_count(), w.null_count(), "{what}");
+        for r in 0..w.len() {
+            assert_eq!(g.is_valid(r), w.is_valid(r), "{what} row {r}");
+            if w.is_valid(r) {
+                let (x, y) = (g.value(r), w.value(r));
+                assert!(
+                    x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()),
+                    "{what} row {r}"
+                );
+            }
+        }
+    } else {
+        assert_eq!(g.to_data(), w.to_data(), "{what}");
+    }
+}
+
+fn check_job(name: &str) {
+    let job = Job::by_name(name).unwrap();
+    assert_eq!(job.name(), name);
+    let m: Value =
+        serde_json::from_reader(File::open(fixtures().join("manifest.json")).unwrap()).unwrap();
+    for (case, rec) in m["jobs"][name].as_object().unwrap() {
+        let input = read_ipc(&fixtures().join(rec["input"].as_str().unwrap()));
+        let (buf, len) = record_of(&input);
+        let record = &bytemuck::cast_slice::<u64, u8>(&buf)[..len];
+        let mut window = aligned(len * 8 + (1 << 22));
+        let w: &mut [u8] = bytemuck::cast_slice_mut(&mut window);
+        let got = apply(job, record, w);
+        if rec.get("error").is_some() {
+            assert!(
+                matches!(got, Err(Error::Function(_))),
+                "{name}/{case}: {got:?}"
+            );
+            eprintln!("{name}/{case}: refused, as Python raised");
+            continue;
+        }
+        let n = got.unwrap_or_else(|e| panic!("{name}/{case}: {e}"));
+        let out = read_record(&w[..n]);
+        let want = read_ipc(&fixtures().join(name).join(format!("{case}.expected.arrow")));
+        assert_eq!(out.num_rows(), want.num_rows(), "{name}/{case}");
+        assert_eq!(out.schema().fields().len(), want.schema().fields().len());
+        for (i, (g, w)) in out
+            .schema()
+            .fields()
+            .iter()
+            .zip(want.schema().fields())
+            .enumerate()
+        {
+            assert_eq!(g, w, "{name}/{case}: field {i}");
+            same(
+                out.column(i).as_ref(),
+                want.column(i).as_ref(),
+                &format!("{name}/{case}: {}", g.name()),
+            );
+        }
+        let ours = canon::canonical(name, &[out], false).unwrap();
+        assert_eq!(
+            ours.hash_all,
+            rec["hash_all"].as_str().unwrap(),
+            "{name}/{case}"
+        );
+        assert_eq!(ours.rows, rec["rows"].as_u64().unwrap(), "{name}/{case}");
+        eprintln!(
+            "{name}/{case}: {} rows, the record {n} bytes, hash_all matches",
+            ours.rows
+        );
+    }
+}
+
+#[test]
+fn enrich_on_the_plane() {
+    check_job("enrich");
+}
+
+#[test]
+fn audit_on_the_plane() {
+    check_job("audit");
+}
+
+#[test]
+fn occupancy_on_the_plane() {
+    check_job("occupancy");
+}
+
+#[test]
+fn score_on_the_plane() {
+    check_job("score");
+}
+
+#[test]
+fn a_small_window_is_refused() {
+    let input = read_ipc(&fixtures().join("inputs/nyc/main.arrow"));
+    let (buf, len) = record_of(&input);
+    let record = &bytemuck::cast_slice::<u64, u8>(&buf)[..len];
+    let mut window = aligned(4096 * 4);
+    let w: &mut [u8] = bytemuck::cast_slice_mut(&mut window);
+    match apply(Job::Audit, record, w) {
+        Err(Error::WindowTooSmall { need, have }) => assert!(need > have),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn damaged_records_are_errors_not_panics() {
+    let input = read_ipc(&fixtures().join("inputs/nyc/one.arrow"));
+    let (buf, len) = record_of(&input);
+    let good = bytemuck::cast_slice::<u64, u8>(&buf)[..len].to_vec();
+    let mut window = aligned(1 << 20);
+    let w: &mut [u8] = bytemuck::cast_slice_mut(&mut window);
+    // Truncated anywhere, and every framing byte flipped: never a panic.
+    for cut in [0, 4, 8, 64, 512, len / 2, len - 1] {
+        let mut b = aligned(cut);
+        let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut b);
+        bytes[..cut].copy_from_slice(&good[..cut]);
+        let _ = apply(Job::Score, &bytes[..cut], w);
+    }
+    let Ok(Need::Framing(end)) = framing_need(&good) else {
+        panic!()
+    };
+    for i in 0..end {
+        for flip in [0x01u8, 0x80, 0xff] {
+            let mut b = aligned(len);
+            let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut b);
+            bytes[..len].copy_from_slice(&good);
+            bytes[i] ^= flip;
+            for job in [Job::Enrich, Job::Audit, Job::Occupancy, Job::Score] {
+                let _ = apply(job, &bytes[..len], w);
+            }
+        }
+    }
+    assert!(Job::by_name("nope").is_none());
+}
