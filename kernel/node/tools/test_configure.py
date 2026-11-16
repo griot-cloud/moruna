@@ -70,7 +70,7 @@ class DataDisks(unittest.TestCase):
                     {"inputs": ["a" * 25], "output_bytes": 0},
                     {"inputs": ["a", "a"], "output_bytes": 0},
                     {"inputs": [], "output_bytes": 4095},
-                    {"inputs": [f"i{n}" for n in range(15)], "output_bytes": 4096},
+                    {"inputs": [f"i{n}" for n in range(40)], "output_bytes": 4096},
                     {"inputs": []},
                     ["nyc"]):
             with tempfile.TemporaryDirectory() as tmp:

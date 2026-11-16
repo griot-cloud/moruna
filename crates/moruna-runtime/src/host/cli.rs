@@ -18,7 +18,8 @@ use crate::packaged::PackageHost;
 
 /// What `moruna` prints for a command line it does not understand.
 pub const USAGE: &str = "usage: moruna run <spec.json> [--arg NAME=VALUE]... [--resolver MODULE:ATTRIBUTE] [--plan <plan.mplan>] [--strict] [--events-json] [--cost-store <dir>] [--cost-model <name>] [--sandbox-python <path>] [--sandbox-cgroup <dir>] [--kinds <kinds.json>]...
-       moruna run --vm <spec.json> --image <node-image.json> --launch-witness <durable-directory> [--input NAME=URL]... [--output <dir>] [--vcpu-cpus <list>]
+       moruna run <spec.json> --output <dir> [--report <file>] [--input NAME=URL]... [--memory-gib N | --memory BYTES] [--scratch-gib N] [--node-kit <dir>] [--image-stack <dir>] [--launch-witness <dir>] [--vcpu-cpus <list>]
+       moruna run --vm <spec.json> [--image <node-image.json>] [the options above]
        moruna serve --listen <unix:///path | vsock://CID:PORT> [--no-strict] [--cost-store <dir>] [--cost-model <name>] [--sandbox-python <path>] [--sandbox-cgroup <dir>] [--kinds <kinds.json>]...
        moruna kinds [--kinds <kinds.json>]...
        moruna check-job <spec.json> [--kinds <kinds.json>]...
@@ -86,7 +87,7 @@ pub fn with_declared(kinds: &Registry, files: &[PathBuf]) -> Result<Registry, St
     Ok(extended)
 }
 
-/// What `moruna run --vm` attaches beside its image (stream D, `moruna_vmm::data`).
+/// What a run in a VM is given beside its document (stream D, `moruna_vmm::data`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VmData {
     /// `--input NAME=URL`: the host file or remote object behind a job's `disk://NAME`.
@@ -95,6 +96,16 @@ pub struct VmData {
     pub output: Option<PathBuf>,
     /// `--vcpu-cpus LIST`: the host CPU of each vCPU, vCPU 0 first (`moruna_vmm::placement`).
     pub vcpu_cpus: Vec<u32>,
+    /// `--report FILE`: the run's report as JSON, the VM's figures beside the engine's report.
+    pub report: Option<PathBuf>,
+    /// `--memory BYTES` or `--memory-gib N`: the VM's memory, for a node built from the kit.
+    pub memory_bytes: Option<u64>,
+    /// `--scratch-gib N`: the engine's scratch, where its outputs wait for the output disk.
+    pub scratch_bytes: Option<u64>,
+    /// `--node-kit DIR`: what a node is built from (`kernel/node/HOST.md`).
+    pub node_kit: Option<PathBuf>,
+    /// `--image-stack DIR`: the image layers the node attaches, in place of the kit's own.
+    pub image_stack: Option<PathBuf>,
 }
 
 /// A parsed command line.
@@ -123,10 +134,12 @@ pub enum Command {
         /// The document.
         spec: String,
         /// Exact checked native node-image.json descriptor; directories and OCI
-        /// layouts are not interpreted as microkernel images.
-        image: PathBuf,
-        /// Existing durable run-claim directory; never a temporary default.
-        witness: PathBuf,
+        /// layouts are not interpreted as microkernel images. Absent: a node is built for the
+        /// run from the node kit.
+        image: Option<PathBuf>,
+        /// Existing durable run-claim directory; never a temporary default. Absent: the
+        /// user's state directory's `moruna/launches`.
+        witness: Option<PathBuf>,
         /// Optional exact plan delivered through the canonical Spec message.
         plan: Option<PathBuf>,
         /// The run's data disks and vCPU placement.
@@ -256,6 +269,49 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                             return Err("moruna run --vm: --output is given twice".into());
                         }
                     }
+                    "--report" => {
+                        let path = rest.next().ok_or("moruna run: --report needs a file")?;
+                        if data.report.replace(PathBuf::from(path)).is_some() {
+                            return Err("moruna run: --report is given twice".into());
+                        }
+                    }
+                    "--memory" | "--memory-gib" | "--scratch-gib" => {
+                        let value = rest
+                            .next()
+                            .ok_or_else(|| format!("moruna run: {arg} needs a number"))?;
+                        let bytes = if arg == "--memory" {
+                            value.parse::<u64>().ok()
+                        } else {
+                            value
+                                .parse::<f64>()
+                                .ok()
+                                .filter(|g| g.is_finite() && *g > 0.0 && *g < 1024.0)
+                                .map(|g| (g * f64::from(1u32 << 30)) as u64)
+                        }
+                        .filter(|b| *b > 0)
+                        .ok_or_else(|| format!("moruna run: {arg} {value} is not a size"))?;
+                        let slot = if arg == "--scratch-gib" {
+                            &mut data.scratch_bytes
+                        } else {
+                            &mut data.memory_bytes
+                        };
+                        if slot.replace(bytes).is_some() {
+                            return Err(format!("moruna run: {arg} is given twice"));
+                        }
+                    }
+                    "--node-kit" | "--image-stack" => {
+                        let path = rest
+                            .next()
+                            .ok_or_else(|| format!("moruna run: {arg} needs a directory"))?;
+                        let slot = if arg == "--node-kit" {
+                            &mut data.node_kit
+                        } else {
+                            &mut data.image_stack
+                        };
+                        if slot.replace(PathBuf::from(path)).is_some() {
+                            return Err(format!("moruna run: {arg} is given twice"));
+                        }
+                    }
                     "--vcpu-cpus" => {
                         let list = rest
                             .next()
@@ -283,11 +339,14 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                 }
             }
             let spec = spec.ok_or_else(|| "moruna run: which document?".to_string())?;
+            // A run that names its output directory runs in a VM (stream D): a run on this host
+            // writes where its sink says.
+            let vm = vm || data.output.is_some();
             if !vm {
                 if image.is_some() || witness.is_some() || data != VmData::default() || vcpus {
                     return Err(
-                        "moruna run: --image, --launch-witness, --input, --output and \
-                         --vcpu-cpus describe a guest, and need --vm"
+                        "moruna run: --image, --launch-witness, --input, --report, --memory, \
+                         --node-kit and --vcpu-cpus describe a guest, and need --vm or --output"
                             .to_string(),
                     );
                 }
@@ -320,8 +379,18 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                         .to_string(),
                 );
             }
-            let image = image.ok_or_else(|| "moruna run --vm: --image is required".to_string())?;
-            let witness = witness.ok_or("moruna run --vm: --launch-witness is required")?;
+            if image.is_some()
+                && (data.memory_bytes.is_some()
+                    || data.scratch_bytes.is_some()
+                    || data.node_kit.is_some()
+                    || data.image_stack.is_some())
+            {
+                return Err(
+                    "moruna run --vm: --memory, --scratch-gib, --node-kit and --image-stack size \
+                     and build a node from the kit; --image names one already built"
+                        .to_string(),
+                );
+            }
             Ok(Command::RunVm {
                 spec,
                 image,
@@ -652,9 +721,9 @@ fn main_as(
         } => {
             return run_vm(
                 Path::new(&spec),
-                &image,
+                image.as_deref(),
                 plan.as_deref(),
-                &witness,
+                witness.as_deref(),
                 &data,
                 cancel,
             );
@@ -901,51 +970,352 @@ pub fn check_output(declared: u64, output: Option<&Path>) -> Result<(), String> 
     }
 }
 
-/// Moruna 1.0 boots only the checked native microkernel artifact descriptor. The run's inputs
-/// are attached as read-only data disks and its outputs read back from its output disk
-/// (stream D, `moruna_vmm::data`).
+/// The engine's scratch a node built from the kit gets when the run names none: where the sinks'
+/// files wait until the run's end writes them to the output disk.
+pub const SCRATCH_DEFAULT: u64 = 1 << 30;
+
+/// The output disk of a node built from the kit: the scratch, as one layer, with room for the
+/// layer's own tables and hash tree.
+pub fn output_disk_for(scratch: u64) -> u64 {
+    (scratch + scratch / 32 + (64 << 20)).div_ceil(4096) * 4096
+}
+
+/// The node kit a run builds its node from: `--node-kit`, else `MORUNA_NODE_KIT`, else
+/// `share/moruna/node-kit` beside the executable's `bin` (`kernel/node/HOST.md`).
+pub fn node_kit(
+    given: Option<&Path>,
+    env: Option<std::ffi::OsString>,
+    exe: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if let Some(kit) = given {
+        return Ok(kit.to_path_buf());
+    }
+    if let Some(kit) = env.filter(|k| !k.is_empty()) {
+        return Ok(PathBuf::from(kit));
+    }
+    if let Some(kit) = exe
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(|prefix| prefix.join("share/moruna/node-kit"))
+        .filter(|kit| kit.is_dir())
+    {
+        return Ok(kit);
+    }
+    Err(
+        "no node to boot: name one with --image, or a node kit with --node-kit, \
+         MORUNA_NODE_KIT or share/moruna/node-kit beside the executable's bin"
+            .into(),
+    )
+}
+
+/// Where a run's launch claims are kept when `--launch-witness` names nowhere: the user's state
+/// directory's `moruna/launches` (`$XDG_STATE_HOME`, else `~/.local/state`), made private.
+pub fn default_witness(
+    state: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    let base = match (
+        state.filter(|s| !s.is_empty()),
+        home.filter(|h| !h.is_empty()),
+    ) {
+        (Some(state), _) => PathBuf::from(state),
+        (None, Some(home)) => PathBuf::from(home).join(".local/state"),
+        (None, None) => return Err("no --launch-witness, and no HOME for its default".into()),
+    };
+    let dir = base.join("moruna/launches");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// What a node built from a kit is: its CPUs, its memory (exact when asked), the engine's
+/// scratch, its data disks and the image layers it attaches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeOrder {
+    /// vCPUs, the job's.
+    pub cpus: u32,
+    /// The VM's memory; absent: the job's, its scratch and the node's services.
+    pub memory_bytes: Option<u64>,
+    /// The engine's scratch.
+    pub scratch_bytes: u64,
+    /// The inputs' names, in device order.
+    pub inputs: Vec<String>,
+    /// The image layers in place of the kit's own.
+    pub image_stack: Option<PathBuf>,
+}
+
+impl NodeOrder {
+    /// The arguments of `node-for-job.py` for this order.
+    pub fn args(&self, kit: &Path, job: &Path, out: &Path) -> Vec<std::ffi::OsString> {
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "-I".into(),
+            kit.join("node/tools/node-for-job.py").into(),
+            "--build".into(),
+            kit.into(),
+            "--job".into(),
+            job.into(),
+            "--out".into(),
+            out.into(),
+            "--cpus".into(),
+            self.cpus.to_string().into(),
+            "--scratch".into(),
+            self.scratch_bytes.to_string().into(),
+            "--output-bytes".into(),
+            output_disk_for(self.scratch_bytes).to_string().into(),
+        ];
+        for name in &self.inputs {
+            args.push("--input".into());
+            args.push(name.into());
+        }
+        if let Some(memory) = self.memory_bytes {
+            args.push("--node-memory".into());
+            args.push(
+                memory
+                    .div_ceil(2 << 20)
+                    .saturating_mul(2 << 20)
+                    .to_string()
+                    .into(),
+            );
+        }
+        if let Some(stack) = &self.image_stack {
+            args.push("--image-stack".into());
+            args.push(stack.into());
+        }
+        args
+    }
+}
+
+/// Build the node one run boots from the kit (`kernel/node/tools/node-for-job.py`, started by
+/// exec, no shell) in `out`: the path of its `node-image.json`.
+pub fn build_node(
+    kit: &Path,
+    job: &Path,
+    out: &Path,
+    order: &NodeOrder,
+) -> Result<PathBuf, String> {
+    if !kit.join("node/tools/node-for-job.py").is_file() {
+        return Err(format!(
+            "{} is not a node kit: it has no node/tools/node-for-job.py",
+            kit.display()
+        ));
+    }
+    let done = std::process::Command::new("python3")
+        .args(order.args(kit, job, out))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("python3, to build the node: {e}"))?;
+    if !done.status.success() {
+        let log = std::fs::read(out.join("prepare.log")).unwrap_or_default();
+        let tail =
+            |b: &[u8]| String::from_utf8_lossy(&b[b.len().saturating_sub(2048)..]).into_owned();
+        return Err(format!(
+            "building the node failed ({}): {}{}",
+            done.status,
+            tail(&done.stderr).trim(),
+            tail(&log).trim()
+        ));
+    }
+    let printed = String::from_utf8_lossy(&done.stdout);
+    let path = printed
+        .lines()
+        .last()
+        .map(|l| PathBuf::from(l.trim()))
+        .filter(|p| p.is_file())
+        .ok_or_else(|| format!("the node builder named no descriptor: {printed}"))?;
+    Ok(path)
+}
+
+/// The status a run's exit code says, as the engine's report words it.
+pub fn status_of(code: i32) -> &'static str {
+    match code {
+        exit::COMPLETED => "completed",
+        exit::CANCELLED => "cancelled",
+        exit::SPEC_REFUSED | exit::BUDGET_REFUSED | exit::RESUME_REFUSED => "refused",
+        _ => "failed",
+    }
+}
+
+/// What a VM run's report file holds: the engine's own report, every field as it wrote it, its
+/// `exit` (an object) kept as `engine_exit`; then `exit` (the run's status, `completed` when it
+/// completed), `code`, `diagnostic`, `version`, and `vm`, the VM's figures in seconds, its boot
+/// apart (`arrow-core-0.7.md` §9), its memory and CPUs, its inputs and its outputs.
+pub fn vm_report(
+    engine: Option<serde_json::Value>,
+    code: i32,
+    diagnostic: Option<String>,
+    vm: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut report = match engine {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    let engine_exit = report.remove("exit");
+    let status = match engine_exit
+        .as_ref()
+        .and_then(|e| e.get("status"))
+        .and_then(serde_json::Value::as_str)
+    {
+        _ if code == exit::COMPLETED => "completed".to_string(),
+        Some(said) => said.to_string(),
+        None => status_of(code).to_string(),
+    };
+    if let Some(e) = engine_exit {
+        report.insert("engine_exit".into(), e);
+    }
+    report.insert("exit".into(), status.into());
+    report.insert("code".into(), code.into());
+    report.insert("diagnostic".into(), diagnostic.into());
+    report
+        .entry("version")
+        .or_insert_with(|| serde_json::Value::String(super::VERSION.to_string()));
+    report.insert("vm".into(), serde_json::Value::Object(vm));
+    serde_json::Value::Object(report)
+}
+
+/// Write `report` to `path` whole: a sibling written, then renamed over it.
+pub fn write_report(path: &Path, report: &serde_json::Value) -> Result<(), String> {
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(report).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Moruna 1.0 boots only the checked native microkernel artifact descriptor: `--image`, or a
+/// node built for the run from the node kit. The document is adapted to the VM (a `run_id`, its
+/// local inputs as data disks, its local sink as the VM's output root; `inputs::adapt`), its
+/// inputs are attached as read-only data disks, its outputs read back from its output disk into
+/// the output directory, and its report written with the VM's figures (stream D).
 #[cfg(target_os = "linux")]
 fn run_vm(
     spec: &Path,
-    image: &Path,
+    image: Option<&Path>,
     plan: Option<&Path>,
-    witness: &Path,
+    witness: Option<&Path>,
     data: &VmData,
     cancel: CancelToken,
 ) -> i32 {
     use moruna_vmm::error::VmmError;
+    let begun = std::time::Instant::now();
     let mut timing = VmTiming::default();
     let mut output_disk: Option<PathBuf> = None;
+    let mut output_dir: Option<PathBuf> = data.output.clone();
     let mut staging: Option<Staging> = None;
+    let mut engine_report: Option<serde_json::Value> = None;
+    let mut diagnostic: Option<String> = None;
+    let mut facts = serde_json::Map::new();
     let result = (|| -> moruna_vmm::error::Result<moruna_vmm::ExitStatus> {
         use std::io::Read as _;
-        let mut bytes = Vec::new();
-        std::fs::File::open(spec)
-            .map_err(|e| VmmError::io("open", spec.display().to_string(), &e))?
-            .take(super::protocol::MAX_SPEC_LINE as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| VmmError::io("read", spec.display().to_string(), &e))?;
+        let read_bounded = |path: &Path, limit: usize| -> moruna_vmm::error::Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)
+                .map_err(|e| VmmError::io("open", path.display().to_string(), &e))?
+                .take(limit as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| VmmError::io("read", path.display().to_string(), &e))?;
+            if bytes.len() > limit {
+                return Err(VmmError::config(
+                    "spec",
+                    format!("{} exceeds its {limit} bytes", path.display()),
+                ));
+            }
+            Ok(bytes)
+        };
+        let raw = read_bounded(spec, super::protocol::MAX_SPEC_LINE)?;
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce)
+            .map_err(|e| VmmError::config("run directory", e.to_string()))?;
+        let name: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        // The run's own host directory: its document as sent, its node, its fetched inputs and
+        // its output disk, gone with the run.
+        let stage_dir = std::env::temp_dir().join(format!("moruna-data-{name}"));
+        std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+            .create(&stage_dir)
+            .map_err(|e| VmmError::io("create", stage_dir.display().to_string(), &e))?;
+        let stage_dir = staging.insert(Staging(stage_dir)).0.clone();
+        let sidecar_path = super::inputs::sidecar_of(spec);
+        let sidecar = match sidecar_path.is_file() {
+            true => Some(read_bounded(&sidecar_path, 1 << 20)?),
+            false => None,
+        };
+        let adapted = super::inputs::adapt(&raw, sidecar.as_deref(), || {
+            crate::run::mint_run_id()
+                .map(|id| id.to_hex())
+                .unwrap_or_else(|_| name.clone())
+        })
+        .map_err(|e| VmmError::config("spec", e))?;
+        if output_dir.is_none() {
+            output_dir = adapted.output.clone();
+        }
+        let bytes = adapted.bytes;
         if bytes.len() > super::protocol::MAX_SPEC_LINE {
             return Err(VmmError::config(
                 "spec",
                 "exceeds canonical protocol ceiling",
             ));
         }
+        let job_path = stage_dir.join("job.json");
+        std::fs::write(&job_path, &bytes)
+            .map_err(|e| VmmError::io("write", job_path.display().to_string(), &e))?;
         let document = super::session::read_document(&bytes)
             .map_err(|(_, e)| VmmError::config("spec", e.to_string()))?;
         let budget = vm_budget(&document).map_err(|e| VmmError::config("budget", e.to_string()))?;
-        // What the image declares for data disks, checked against the job and the command line
+        let mut bindings = adapted.bindings;
+        for (name, url) in &data.inputs {
+            if bindings.iter().any(|(n, _)| n == name) {
+                return Err(VmmError::config(
+                    "input",
+                    format!("input {name} is bound twice"),
+                ));
+            }
+            bindings.push((name.clone(), url.clone()));
+        }
+        facts.insert(
+            "inputs".into(),
+            bindings
+                .iter()
+                .map(|(n, u)| (n.clone(), serde_json::Value::String(u.clone())))
+                .collect::<serde_json::Map<_, _>>()
+                .into(),
+        );
+        // The node: the one named, or one built for this run from the kit.
+        let building = std::time::Instant::now();
+        let descriptor = match image {
+            Some(image) => image.to_path_buf(),
+            None => {
+                let kit = node_kit(
+                    data.node_kit.as_deref(),
+                    std::env::var_os("MORUNA_NODE_KIT"),
+                    std::env::current_exe().ok().as_deref(),
+                )
+                .map_err(|e| VmmError::config("node", e))?;
+                let order = NodeOrder {
+                    cpus: budget.cpus,
+                    memory_bytes: data.memory_bytes,
+                    scratch_bytes: data.scratch_bytes.unwrap_or(SCRATCH_DEFAULT),
+                    inputs: bindings.iter().map(|(n, _)| n.clone()).collect(),
+                    image_stack: data.image_stack.clone(),
+                };
+                build_node(&kit, &job_path, &stage_dir.join("node"), &order)
+                    .map_err(|e| VmmError::config("node", e))?
+            }
+        };
+        facts.insert("node_s".into(), building.elapsed().as_secs_f64().into());
+        // What the node declares for data disks, checked against the job and the command line
         // before anything is fetched or booted.
-        let declared = moruna_vmm::microkernel::inspect(image)?.data_disks;
+        let artifacts = moruna_vmm::microkernel::inspect(&descriptor)?;
+        facts.insert(
+            "memory_bytes".into(),
+            artifacts.resources.node_memory_bytes.into(),
+        );
+        facts.insert("cpus".into(), artifacts.resources.cpus.into());
+        let declared = artifacts.data_disks;
         let used = super::inputs::names_used(&document).map_err(|e| VmmError::config("spec", e))?;
         super::inputs::check_used(&used, &declared.inputs)
             .map_err(|e| VmmError::config("spec", e))?;
-        check_output(declared.output_bytes, data.output.as_deref())
+        check_output(declared.output_bytes, output_dir.as_deref())
             .map_err(|e| VmmError::config("output", e))?;
-        let mut nonce = [0u8; 16];
-        getrandom::fill(&mut nonce)
-            .map_err(|e| VmmError::config("run directory", e.to_string()))?;
-        let name: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
         let directory = std::env::temp_dir().join(format!("moruna-node-{name}"));
         let executable = std::env::current_exe()
             .map_err(|e| VmmError::io("resolve", "runtime executable", &e))?;
@@ -979,14 +1349,13 @@ fn run_vm(
             .ok_or_else(|| {
                 VmmError::config("run", "native admission requires canonical document id")
             })?;
-        // The run's own host directory: its fetched inputs and its output disk.
-        let stage_dir = std::env::temp_dir().join(format!("moruna-data-{name}"));
-        std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
-            .create(&stage_dir)
-            .map_err(|e| VmmError::io("create", stage_dir.display().to_string(), &e))?;
-        let stage_dir = staging.insert(Staging(stage_dir)).0.clone();
+        let witness = match witness {
+            Some(w) => w.to_path_buf(),
+            None => default_witness(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+                .map_err(|e| VmmError::config("launch witness", e))?,
+        };
         let fetching = std::time::Instant::now();
-        let inputs = super::inputs::stage(&data.inputs, &stage_dir, &document.object_store)
+        let inputs = super::inputs::stage(&bindings, &stage_dir, &document.object_store)
             .map_err(|e| VmmError::config("input", e))?;
         timing.stage_ms = fetching.elapsed().as_millis() as u64;
         let devices = moruna_vmm::data::RunDevices {
@@ -1000,9 +1369,9 @@ fn run_vm(
                 run_id: assigned,
                 node_boot: moruna_kernel::RunId(nonce),
                 attempt: 0,
-                directory: witness,
+                directory: &witness,
             },
-            image,
+            &descriptor,
             budget,
             &directory,
             super::native::Tools {
@@ -1019,6 +1388,15 @@ fn run_vm(
         let launched = run.timing();
         timing.launch_ms = launched.launch.as_millis() as u64;
         if let Some(placed) = run.placed() {
+            facts.insert(
+                "vcpu_cpus".into(),
+                placed
+                    .vcpus
+                    .iter()
+                    .map(|(_, _, cpu)| serde_json::Value::from(*cpu))
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
             for (vcpu, tid, cpu) in &placed.vcpus {
                 eprintln!(
                     "moruna run --vm: vCPU {vcpu} (host thread {tid}) runs on host CPU {cpu}"
@@ -1067,6 +1445,9 @@ fn run_vm(
                         .write_all(message.line().as_bytes())
                         .map_err(|e| VmmError::io("write", "guest output", &e))?;
                     messages += 1;
+                    if let super::protocol::Outbound::Report { report, .. } = &message {
+                        engine_report = Some(report.clone());
+                    }
                     match message {
                         super::protocol::Outbound::PortCall { v, call, port, .. } => {
                             if v != super::protocol::PORTS_VERSION {
@@ -1084,7 +1465,11 @@ fn run_vm(
                                 )),
                             })?;
                         }
-                        super::protocol::Outbound::Exit { code, .. } => {
+                        super::protocol::Outbound::Exit {
+                            code,
+                            diagnostic: said,
+                        } => {
+                            diagnostic = said;
                             timing.job_ms = hello.map_or(0, |h| h.elapsed().as_millis() as u64);
                             return Ok(moruna_vmm::ExitStatus { code, messages });
                         }
@@ -1115,17 +1500,24 @@ fn run_vm(
         Ok(status) => status.code,
         Err(error) => {
             eprintln!("moruna run --vm: {error}");
+            diagnostic.get_or_insert_with(|| error.to_string());
             error.exit_code()
         }
     };
     // C3: a completed run's outputs, from its output disk into the job's output directory.
-    let code = match (code, &output_disk, &data.output) {
+    let code = match (code, &output_disk, &output_dir) {
         (exit::COMPLETED, Some(disk), Some(out)) => {
             let unpacking = std::time::Instant::now();
             let unpacked = super::outputs::unpack(disk, out);
             timing.outputs_ms += unpacking.elapsed().as_millis() as u64;
             match unpacked {
                 Ok(done) => {
+                    facts.insert(
+                        "outputs".into(),
+                        serde_json::json!({"directory": out, "files": done.files,
+                            "directories": done.directories, "bytes": done.bytes,
+                            "links_skipped": done.links_skipped}),
+                    );
                     eprintln!(
                         "moruna run --vm: outputs in {}: {} files, {} directories, {} bytes{}",
                         out.display(),
@@ -1142,6 +1534,7 @@ fn run_vm(
                 }
                 Err(why) => {
                     eprintln!("moruna run --vm: the outputs were not read back: {why}");
+                    diagnostic = Some(format!("the outputs were not read back: {why}"));
                     exit::FAILED
                 }
             }
@@ -1151,6 +1544,28 @@ fn run_vm(
     drop(staging);
     if timing != VmTiming::default() {
         eprintln!("{}", timing.line());
+    }
+    if let Some(path) = &data.report {
+        let seconds = |ms: u64| serde_json::Value::from(ms as f64 / 1000.0);
+        for (key, ms) in [
+            ("stage_s", timing.stage_ms),
+            ("launch_s", timing.launch_ms),
+            ("boot_s", timing.boot_ms),
+            ("job_s", timing.job_ms),
+            ("outputs_s", timing.outputs_ms),
+        ] {
+            facts.insert(key.into(), seconds(ms));
+        }
+        facts.insert("total_s".into(), begun.elapsed().as_secs_f64().into());
+        let report = vm_report(engine_report, code, diagnostic, facts);
+        if let Err(why) = write_report(path, &report) {
+            eprintln!("moruna run --vm: the report was not written: {why}");
+            return if code == exit::COMPLETED {
+                exit::FAILED
+            } else {
+                code
+            };
+        }
     }
     code
 }
@@ -1218,9 +1633,9 @@ pub fn task_output(
 #[cfg(not(target_os = "linux"))]
 fn run_vm(
     _spec: &Path,
-    _image: &Path,
+    _image: Option<&Path>,
     _plan: Option<&Path>,
-    _witness: &Path,
+    _witness: Option<&Path>,
     _data: &VmData,
     _cancel: CancelToken,
 ) -> i32 {
@@ -1424,9 +1839,9 @@ mod tests {
             ])),
             Ok(Command::RunVm {
                 spec: "job.json".into(),
-                image: "/node-image.json".into(),
+                image: Some("/node-image.json".into()),
                 plan: Some("/job.mplan".into()),
-                witness: "/launches".into(),
+                witness: Some("/launches".into()),
                 data: VmData::default(),
             })
         );
@@ -1457,7 +1872,8 @@ mod tests {
             &["check", "k.py"][..],
             &["run", "a", "--image", "/img"][..],
             &["run", "a", "--disk", "/d"][..],
-            &["run", "--vm", "a"][..],
+            &["run", "a", "--report", "/r.json"][..],
+            &["run", "--vm", "a", "--image", "/i", "--memory-gib", "8"][..],
             &["run", "--vm", "--strict", "a", "--image", "/i"][..],
             &["run", "--vm", "a", "--image"][..],
             &["run", "--vm", "a", "--image", "/i", "--disk"][..],
@@ -1581,6 +1997,7 @@ mod tests {
                 ],
                 output: Some("/out".into()),
                 vcpu_cpus: vec![2, 3],
+                ..VmData::default()
             }
         );
         for (extra, why) in [
@@ -1601,14 +2018,184 @@ mod tests {
         }
         for host in [
             &["run", "job.json", "--input", "a=/a"][..],
-            &["run", "job.json", "--output", "/o"][..],
             &["run", "job.json", "--vcpu-cpus", "1"][..],
+            &["run", "job.json", "--report", "/r"][..],
         ] {
             assert!(
-                parse(&args(host)).unwrap_err().contains("need --vm"),
+                parse(&args(host))
+                    .unwrap_err()
+                    .contains("need --vm or --output"),
                 "{host:?}"
             );
         }
+        // The gate's command line: the output directory makes it a VM run, its node built from
+        // the kit, its witness the default.
+        let gate = parse(&args(&[
+            "run",
+            "job.json",
+            "--output",
+            "/out",
+            "--report",
+            "/r.json",
+            "--memory-gib",
+            "24",
+            "--scratch-gib",
+            "2.5",
+            "--node-kit",
+            "/kit",
+            "--image-stack",
+            "/stack",
+        ]))
+        .unwrap();
+        assert_eq!(
+            gate,
+            Command::RunVm {
+                spec: "job.json".into(),
+                image: None,
+                plan: None,
+                witness: None,
+                data: VmData {
+                    output: Some("/out".into()),
+                    report: Some("/r.json".into()),
+                    memory_bytes: Some(24 << 30),
+                    scratch_bytes: Some(5 << 29),
+                    node_kit: Some("/kit".into()),
+                    image_stack: Some("/stack".into()),
+                    ..VmData::default()
+                },
+            }
+        );
+        let kit = |extra: &[&str]| {
+            let mut all = vec!["run", "job.json", "--output", "/out"];
+            all.extend_from_slice(extra);
+            parse(&args(&all))
+        };
+        assert_eq!(
+            kit(&["--memory", "1048576"]).map(|c| match c {
+                Command::RunVm { data, .. } => data.memory_bytes,
+                _ => None,
+            }),
+            Ok(Some(1 << 20))
+        );
+        for (extra, why) in [
+            (&["--memory-gib", "0"][..], "not a size"),
+            (&["--memory-gib", "x"][..], "not a size"),
+            (&["--memory", "-1"][..], "not a size"),
+            (&["--memory"][..], "needs a number"),
+            (&["--memory-gib", "1", "--memory", "2"][..], "given twice"),
+            (&["--report", "/a", "--report", "/b"][..], "given twice"),
+            (&["--report"][..], "needs a file"),
+            (&["--node-kit"][..], "needs a directory"),
+            (&["--node-kit", "/a", "--node-kit", "/b"][..], "given twice"),
+            (&["--image", "/i", "--memory-gib", "8"][..], "already built"),
+        ] {
+            let e = kit(extra).unwrap_err();
+            assert!(e.contains(why), "{extra:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_vm_run_finds_its_node_kit_and_its_witness() {
+        let dir = std::env::temp_dir().join(format!("m-kit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            node_kit(Some(Path::new("/k")), Some("/e".into()), None).unwrap(),
+            Path::new("/k")
+        );
+        assert_eq!(
+            node_kit(None, Some("/e".into()), None).unwrap(),
+            Path::new("/e")
+        );
+        assert!(node_kit(None, Some("".into()), None).is_err());
+        let installed = dir.join("share/moruna/node-kit");
+        std::fs::create_dir_all(&installed).unwrap();
+        assert_eq!(
+            node_kit(None, None, Some(&dir.join("bin/moruna"))).unwrap(),
+            installed
+        );
+        assert!(node_kit(None, None, Some(Path::new("/nowhere/bin/moruna"))).is_err());
+        let state = default_witness(Some(dir.join("state").into()), None).unwrap();
+        assert_eq!(state, dir.join("state/moruna/launches"));
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            default_witness(None, Some(dir.join("home").into())).unwrap(),
+            dir.join("home/.local/state/moruna/launches")
+        );
+        assert!(default_witness(None, None).is_err());
+        // The node builder's arguments, and a kit that is not one.
+        let order = NodeOrder {
+            cpus: 8,
+            memory_bytes: Some((24 << 30) + 1),
+            scratch_bytes: 1 << 30,
+            inputs: vec!["a".into(), "b".into()],
+            image_stack: Some("/stack".into()),
+        };
+        let args: Vec<String> = order
+            .args(Path::new("/kit"), Path::new("/j.json"), Path::new("/o"))
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let at = |flag: &str| args[args.iter().position(|a| a == flag).unwrap() + 1].clone();
+        assert_eq!(args[1], "/kit/node/tools/node-for-job.py");
+        assert_eq!(at("--cpus"), "8");
+        assert_eq!(
+            at("--node-memory"),
+            ((24u64 << 30) + (2 << 20)).to_string(),
+            "whole 2 MiB pages"
+        );
+        assert_eq!(at("--output-bytes"), output_disk_for(1 << 30).to_string());
+        assert_eq!(at("--image-stack"), "/stack");
+        assert_eq!(args.iter().filter(|a| *a == "--input").count(), 2);
+        assert!(output_disk_for(1 << 30) > (1 << 30));
+        assert_eq!(output_disk_for(1 << 30) % 4096, 0);
+        let e = build_node(&dir, Path::new("/j"), &dir.join("o"), &order).unwrap_err();
+        assert!(e.contains("not a node kit"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_vm_runs_report_is_the_engines_with_the_vms_figures() {
+        let engine = serde_json::json!({"tasks": [{"role": "function", "busy_ms": 5}],
+            "exit": {"status": "completed", "code": 0}, "peak_anon_bytes": 7});
+        let mut vm = serde_json::Map::new();
+        vm.insert("boot_s".into(), 1.5.into());
+        let report = vm_report(Some(engine.clone()), 0, None, vm.clone());
+        assert_eq!(report["exit"], "completed");
+        assert_eq!(report["engine_exit"]["status"], "completed");
+        assert_eq!(report["vm"]["boot_s"], 1.5);
+        assert_eq!(report["tasks"], engine["tasks"]);
+        assert_eq!(report["peak_anon_bytes"], 7);
+        assert_eq!(report["version"], VERSION);
+        let failed = serde_json::json!({"exit": {"status": "terminated", "code": 4}});
+        let report = vm_report(Some(failed), 4, Some("why".into()), vm.clone());
+        assert_eq!(report["exit"], "terminated");
+        assert_eq!(report["diagnostic"], "why");
+        let none = vm_report(None, 8, None, vm);
+        assert_eq!(none["exit"], "failed");
+        assert_eq!(none["code"], 8);
+        for (code, status) in [
+            (0, "completed"),
+            (130, "cancelled"),
+            (2, "refused"),
+            (3, "refused"),
+            (5, "refused"),
+            (4, "failed"),
+        ] {
+            assert_eq!(status_of(code), status);
+        }
+        let dir = std::env::temp_dir().join(format!("m-report-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.json");
+        write_report(&path, &none).unwrap();
+        let read: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(read, none);
+        assert!(write_report(&dir.join("no/such/r.json"), &none).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1912,9 +2499,9 @@ mod run_vm_refusals {
         let dir = spec.parent().unwrap();
         run_vm(
             spec,
-            &dir.join("no-image.json"),
+            Some(&dir.join("no-image.json")),
             plan,
-            &dir.join("witness"),
+            Some(&dir.join("witness")),
             &VmData::default(),
             CancelToken::new(),
         )

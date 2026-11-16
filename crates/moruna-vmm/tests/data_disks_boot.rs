@@ -200,32 +200,33 @@ fn data_disks_attach_in_order_and_vcpus_run_where_placed() {
         node.logs()
     );
     let socket = node.runtime_dir().join("qmp/qmp.sock");
-    // The PCI functions: three transitional virtio-blk (1af4:1001) at 0x10, 0x11 and 0x12, the
+    // The PCI functions: three transitional virtio-blk (1af4:1001) at 0x10.0 to 0x10.2, the
     // image's layer a modern one (1af4:1042) elsewhere.
     let pci = qmp(&socket, serde_json::json!({"execute": "query-pci"}));
-    let functions: Vec<(u64, u64, u64)> = pci[0]["devices"]
+    let functions: Vec<(u64, u64, u64, u64)> = pci[0]["devices"]
         .as_array()
         .unwrap()
         .iter()
         .map(|d| {
             (
                 d["slot"].as_u64().unwrap(),
+                d["function"].as_u64().unwrap(),
                 d["id"]["vendor"].as_u64().unwrap(),
                 d["id"]["device"].as_u64().unwrap(),
             )
         })
         .collect();
     println!("PCI: {functions:x?}");
-    for slot in [0x10, 0x11, 0x12] {
+    for function in 0..3 {
         assert!(
-            functions.contains(&(slot, 0x1af4, 0x1001)),
-            "no data disk at slot {slot:#x}"
+            functions.contains(&(0x10, function, 0x1af4, 0x1001)),
+            "no data disk at 0x10.{function}"
         );
     }
     assert!(
         functions
             .iter()
-            .any(|f| f.1 == 0x1af4 && f.2 == 0x1042 && !(0x10..=0x12).contains(&f.0))
+            .any(|f| f.2 == 0x1af4 && f.3 == 0x1042 && f.0 != 0x10)
     );
     // The drives: the inputs read-only in the image's order, the output writable.
     let block = qmp(&socket, serde_json::json!({"execute": "query-block"}));

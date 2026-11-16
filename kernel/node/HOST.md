@@ -22,23 +22,47 @@ is driven only by the job protocol over the vsock.
 ## A run
 
 ```
-moruna run --vm JOB.json --image node-image.json --launch-witness DIR \
-    --input NAME=PATH|file://PATH|s3://B/K|gs://B/K|az://C/K ... \
-    --output OUT_DIR [--vcpu-cpus LIST]
+moruna run JOB.json --output OUT_DIR [--report REPORT.json] [--input NAME=URL]...
+    [--memory-gib N | --memory BYTES] [--scratch-gib N] [--node-kit DIR] [--image-stack DIR]
+    [--launch-witness DIR] [--vcpu-cpus LIST]
+moruna run --vm JOB.json [--image node-image.json] [the options above]
 ```
 
-- `node-image.json` declares the engine's data disks (`data_disks`): its inputs by name, in
-  device order, and its output disk's size (`kernel/node/tools/configure.py`, `package.py`,
-  `node-for-job.py`).
-- Each `--input` binds one declared name to a host file, used in place, or to a remote object,
-  fetched to the run's host directory first (the VM has no network). The job reads it as
-  `disk://NAME`.
-- `--output` is a new or empty directory. When the job completes, the output layer on the output
-  disk is unpacked there (C3).
-- Standard output carries the job updates as lines of JSON: the protocol's messages and every
+- **A run that names its output directory runs in a VM.** One job per VM, nothing kept between
+  runs (C7).
+- **The document is adapted to the VM** before it is sent (a version 1 document; the one sent
+  is what the run's identity and report name):
+  - a `run_id` is minted when it has none, as a host run mints one at its start;
+  - each input of its source that is a local file, a local directory (its `*.parquet` files) or
+    an `s3://`, `gs://` or `az://` object becomes a data disk, `disk://NAME`, its name made from
+    the file's. Remote objects are fetched to the run's host directory first (the VM has no
+    network);
+  - a sink on this host is written to the VM's output root (`/tmp/out`), and its directory is
+    the run's output directory unless `--output` names another.
+
+  A document may name its devices itself (`disk://NAME`) and bind them in `JOB.inputs.json`
+  beside it (`{"NAME": "PATH or URL"}`), or with `--input NAME=URL`.
+- **The node** is `--image`, or one built for the run from the node kit
+  (`kernel/node/tools/node-for-job.py`): its CPUs the job's, its memory the job's budget, the
+  engine's scratch (`--scratch-gib`, 1 GiB by default; the outputs wait there for the output
+  disk) and the node's services, or exactly `--memory-gib` when given (a job that does not fit is
+  refused, naming the least it needs).
+- **The node kit** is `--node-kit`, else `MORUNA_NODE_KIT`, else `share/moruna/node-kit` beside
+  the executable's `bin`: `kernel/tools/build.sh`'s output, with `kernel/node/tools/node-for-job.py`
+  and `configure.py` in its `node/tools/` and `kernel/node/standalone.image` in its `node/`.
+  `--image-stack` attaches other image layers (a `moruna-layer stack` directory) than the kit's.
+- **The launch witness** is `--launch-witness`, else `$XDG_STATE_HOME/moruna/launches` (or
+  `~/.local/state/moruna/launches`).
+- **The output directory** is new or empty; when the job completes, the output layer on the
+  output disk is unpacked there (C3).
+- **Standard output** carries the job updates as lines of JSON: the protocol's messages and every
   event, the task logs among them (`"kind":"log"`, with the task, the level and the line).
-- Standard error ends with the run's timing, the VM's boot apart from the job:
+- **Standard error** ends with the run's timing:
   `moruna run --vm: timing {"stage_ms":..,"launch_ms":..,"boot_ms":..,"job_ms":..,"outputs_ms":..}`.
+- **`--report`** writes the engine's own report with the VM's figures: `exit` (`completed` when
+  it completed), `code`, `diagnostic`, the engine's `exit` as `engine_exit`, and `vm`:
+  `boot_s` (QEMU running to the guest's hello), `launch_s`, `stage_s`, `node_s`, `job_s`,
+  `outputs_s`, `total_s`, `memory_bytes`, `cpus`, `vcpu_cpus`, `inputs` and `outputs`.
 
 ## Tick isolation
 

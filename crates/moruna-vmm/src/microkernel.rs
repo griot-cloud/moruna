@@ -270,7 +270,7 @@ pub fn inspect(descriptor: &Path) -> Result<MicrokernelArtifacts> {
     let devices = artifacts.layers.len()
         + artifacts.writable_disks.len()
         + usize::from(artifacts.user_network)
-        + artifacts.data_disks.count();
+        + data::slots_for(artifacts.data_disks.count());
     if devices > PCI_SLOTS {
         return Err(bad(format!(
             "{devices} PCI devices; a node has {PCI_SLOTS} slots for its layers, disks and network"
@@ -1681,19 +1681,17 @@ mod tests {
         assert_eq!(declared.inputs, ["nyc"]);
         assert_eq!(declared.count(), 2);
         assert!(descriptor(serde_json::json!({"inputs": ["Bad"], "output_bytes": 0}), 2).is_err());
-        let thirteen: Vec<String> = (0..13).map(|i| format!("i{i}")).collect();
+        let full: Vec<String> = (0..39).map(|i| format!("i{i}")).collect();
         descriptor(
-            serde_json::json!({"inputs": thirteen, "output_bytes": 4096}),
-            15,
-        )
-        .unwrap();
-        let e = descriptor(
-            serde_json::json!({"inputs": thirteen, "output_bytes": 4096}),
+            serde_json::json!({"inputs": full, "output_bytes": 4096}),
             16,
         )
-        .unwrap_err()
-        .to_string();
-        assert!(e.contains("30 PCI devices"), "{e}");
+        .unwrap();
+        let over: Vec<String> = (0..40).map(|i| format!("i{i}")).collect();
+        let e = descriptor(serde_json::json!({"inputs": over, "output_bytes": 4096}), 2)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("at most 40"), "{e}");
         fs::remove_dir_all(&dir).unwrap();
     }
 

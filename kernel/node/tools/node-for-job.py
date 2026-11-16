@@ -1,29 +1,73 @@
 #!/usr/bin/env python3
-"""The node image one job boots with `moruna run --vm` (stream D): a descriptor beside a build.
+"""The node image one job boots with `moruna run` (stream D): a descriptor in OUT.
 
-From a build output (kernel/tools/build.sh), a canonical job, and the job's data disks, it renders
-the node's assets with configure.py (the data disks granted to the engine), checks them with the
-node image validator, builds the initramfs, provisions the node's home disk, and writes
-`node-image.json` naming the kernel, the initramfs, the layers, the home and the data disks.
+From a node kit (kernel/tools/build.sh's output, with this directory as `node/tools` and
+`standalone.image` as `node/standalone.image`), a canonical job, and the job's data disks, it
+renders the node's assets with configure.py (the data disks granted to the engine), checks them
+with the node image validator, builds the initramfs, provisions the node's home disk, and writes
+OUT/node-image.json naming the kernel, the initramfs, the layers, the home and the data disks.
+`moruna run` calls it for a run that names no prebuilt node (`--image`).
 
-Every artifact path in a descriptor is relative to its directory, so the descriptor is written in
-the closest directory holding the build and OUT (`DESCRIPTOR` printed last), as proof.py does.
+The artifacts are linked into OUT (copied where a link cannot be made), since a descriptor's
+paths are relative to its own directory. The node's memory is the job's, its scratch (where the
+engine's outputs are kept until they are written to the output disk) and the node's services;
+`--node-memory` asks for an exact size and is refused when the job does not fit it.
 
-    node-for-job.py --build BUILD --job JOB --out NEW_DIR --cpus N --tls-roots ROOTS
-                    [--input NAME]... [--output-bytes N] [--node-memory BYTES]
+    node-for-job.py --build KIT --job JOB --out NEW_DIR --cpus N [--tls-roots ROOTS]
+                    [--input NAME]... [--output-bytes N] [--scratch BYTES]
+                    [--node-memory BYTES] [--image-stack DIR]
 
-No shell runs, nothing is downloaded, nothing boots here.
+No shell runs, nothing is downloaded, nothing boots here. The descriptor's path is printed last.
 """
 import argparse
 import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import time
 
 MIB = 1024 * 1024
 PORT = 5100
+# The node's services' accounts, as proof.py sizes them; admission's is the engine's and more.
+SERVICES = {"devices": 128 * MIB, "imagefs": 768 * MIB, "linux": 256 * MIB, "network": 64 * MIB, "storage": 128 * MIB}
+# What the engine's account holds beyond its memory and scratch, and admission beyond that.
+ENGINE_OVERHEAD = 128 * MIB
+ADMISSION_OVERHEAD = 128 * MIB
+# Room for the kernel and the boot beside the carved accounts.
+BOOT_SLACK = 256 * MIB
+
+
+def round_up(value, unit):
+    return (value + unit - 1) // unit * unit
+
+
+def sizes(job_memory, scratch, node_memory=None):
+    """The node's fixed resources for a job of `job_memory` bytes: (node, job, account, scratch,
+    admission), or a ValueError naming what does not fit."""
+    job_memory, scratch = round_up(job_memory, 4096), round_up(scratch, 4096)
+    account = job_memory + scratch + ENGINE_OVERHEAD
+    admission = account + ADMISSION_OVERHEAD
+    least = round_up(sum(SERVICES.values()) + admission + BOOT_SLACK, 2 * MIB)
+    if node_memory is None:
+        node_memory = least
+    elif node_memory < least:
+        raise ValueError(f"a node of {node_memory} bytes cannot hold the job's {job_memory} bytes, "
+                         f"its {scratch} bytes of scratch and the node's services: it needs at least {least}")
+    if node_memory % (2 * MIB):
+        raise ValueError("the node's memory is whole 2 MiB pages")
+    return node_memory, job_memory, account, scratch, admission
+
+
+def place(source, destination):
+    """`source` at `destination`: a hard link where the file system allows one, else a copy."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copyfile(source, destination)
+    return destination
 
 
 def digest(path):
@@ -40,10 +84,12 @@ def main():
     parser.add_argument("--job", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--cpus", type=int, required=True)
-    parser.add_argument("--tls-roots", type=Path, required=True)
+    parser.add_argument("--tls-roots", type=Path)
     parser.add_argument("--input", action="append", default=[])
     parser.add_argument("--output-bytes", type=int, default=0)
-    parser.add_argument("--node-memory", type=int, default=3072 * MIB)
+    parser.add_argument("--scratch", type=int, default=256 * MIB)
+    parser.add_argument("--node-memory", type=int)
+    parser.add_argument("--image-stack", type=Path)
     args = parser.parse_args()
     build, out = args.build.resolve(strict=True), args.out.absolute()
     if out.exists():
@@ -62,13 +108,23 @@ def main():
     run = job.get("run_id")
     if not isinstance(run, str) or len(run) != 32:
         parser.error("the job needs its canonical run_id")
+    budget = job.get("budget") or {}
+    elastic = budget.get("elastic") or {}
+    job_memory = max(int(budget.get("memory_bytes") or 0), int(elastic.get("memory_max_bytes") or 0))
+    if job_memory <= 0:
+        parser.error("the job's budget names no memory")
+    try:
+        node_memory, job_memory, account, scratch, admission = sizes(job_memory, args.scratch, args.node_memory)
+    except ValueError as error:
+        parser.error(str(error))
+    tls_roots = args.tls_roots or build / "ke2/roots"
+    linux = (args.image_stack or build / "node-linux").resolve(strict=True)
     (out / "job.json").write_bytes(args.job.read_bytes())
     command([build / "moruna-node-ci-assets", out / "job.json", out / "canonical"])
-    profile = {"version": 1, "node_memory_bytes": args.node_memory, "cpus": args.cpus, "agent_port": PORT,
-               "job_memory_bytes": 1024 * MIB, "job_account_bytes": 1408 * MIB, "scratch_bytes": 256 * MIB,
+    profile = {"version": 1, "node_memory_bytes": node_memory, "cpus": args.cpus, "agent_port": PORT,
+               "job_memory_bytes": job_memory, "job_account_bytes": account, "scratch_bytes": scratch,
                "engine_program": "/moruna/bin/moruna-engine", "storage_provider": "single-node-home",
-               "service_accounts": {"devices": 128 * MIB, "imagefs": 768 * MIB, "linux": 256 * MIB,
-                                    "network": 64 * MIB, "admission": 1536 * MIB, "storage": 128 * MIB},
+               "service_accounts": {**SERVICES, "admission": admission},
                "data_disks": {"inputs": args.input, "output_bytes": args.output_bytes}}
     (out / "profile.json").write_text(json.dumps(profile) + "\n")
     (out / "storage.conf").write_text("moruna-storage 1\ntimeout-ns 5000000000\nbody-limit 1048576\nsession-limit 4\n"
@@ -76,13 +132,12 @@ def main():
     (out / "network.conf").write_text(f"moruna-netstack 1\nsetting tls-unix-seconds {int(time.time())}\n"
                                       "setting tls-time-valid-ms 3600000\n"
                                       "grant listen-engine rights=connect remote=127.0.0.0/8 local=127.0.0.0/8 sockets=8\n")
-    linux = build / "node-linux"
     command(["python3", "-I", tools / "configure.py", "--profile", out / "profile.json", "--out", out / "assets",
              "--image-record", linux / "image.record", "--layers", linux / "stack.layers", "--network", out / "network.conf",
-             "--tls-roots", args.tls_roots, "--engine-bindings", out / "canonical/engine.bindings",
+             "--tls-roots", tls_roots, "--engine-bindings", out / "canonical/engine.bindings",
              "--storage-config", out / "storage.conf", "--storage-grants", out / "canonical/storage.grants",
              "--storage-admission", out / "canonical/storage.admission"])
-    command([build / "moruna-node-image", description, out / "assets", args.node_memory, args.cpus, PORT])
+    command([build / "moruna-node-image", description, out / "assets", node_memory, args.cpus, PORT])
     resources = json.loads((out / "assets/node-resources.json").read_text())
     command([build / "moruna-image-host", description, build / "node-user-bins", out / "assets"])
     home = out / "home.img"
@@ -96,27 +151,25 @@ def main():
     while (linux / f"stack-{index}.img").is_file():
         layers.append(linux / f"stack-{index}.img")
         index += 1
-    kernel = build / "moruna-microkernel.elf"
+    artifacts = out / "artifacts"
+    kernel = place(build / "moruna-microkernel.elf", artifacts / "kernel.elf")
+    linked = [place(path, artifacts / f"layer-{n}.img") for n, path in enumerate(layers)]
     initramfs = out / "assets/initramfs.cpio"
-    parent = Path(os.path.commonpath([str(p.parent) for p in [kernel, initramfs, home, *layers]]))
-    if parent == Path(parent.anchor):
-        parser.error("the build and OUT need a common directory below the root")
 
     def artifact(path):
-        return {"path": path.relative_to(parent).as_posix(), "bytes": path.stat().st_size, "sha256": digest(path)}
+        return {"path": path.relative_to(out).as_posix(), "bytes": path.stat().st_size, "sha256": digest(path)}
 
     descriptor = {"version": 1, "architecture": "x86_64", "boot_mode": "multiboot2",
                   "kernel": artifact(kernel), "initramfs": artifact(initramfs),
-                  "layers": [{"artifact": artifact(p)} for p in layers],
-                  "writable_disks": [{"path": home.relative_to(parent).as_posix(), "bytes": home.stat().st_size,
+                  "layers": [{"artifact": artifact(p)} for p in linked],
+                  "writable_disks": [{"path": home.relative_to(out).as_posix(), "bytes": home.stat().st_size,
                                       "serial": "node-ci-home"}],
                   "user_network": False, "cid": 3, "agent_port": PORT, "resources": resources,
                   "data_disks": profile["data_disks"]}
-    path = parent / f".moruna-node-{run}.json"
+    path = out / "node-image.json"
     with path.open("x") as file:
         json.dump(descriptor, file, indent=2)
         file.write("\n")
-    (out / "node-image.json").write_bytes(path.read_bytes())
     print(path)
 
 

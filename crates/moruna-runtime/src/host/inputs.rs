@@ -62,6 +62,208 @@ pub fn locate(url: &str) -> Result<Location, String> {
     }
 }
 
+/// Where the engine in the VM writes its outputs: the root of the output layer (stream C's
+/// `OUTPUT_ROOT`, in the engine's scratch).
+pub const OUTPUT_ROOT: &str = "/tmp/out";
+
+/// A job document as a VM runs it, and what the host binds for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Adapted {
+    /// The document's bytes as sent.
+    pub bytes: Vec<u8>,
+    /// Whether they differ from the bytes read.
+    pub changed: bool,
+    /// Each input name the document reads as `disk://NAME`, and where its bytes are.
+    pub bindings: Vec<(String, String)>,
+    /// The host directory the document's sink named, where the outputs go.
+    pub output: Option<PathBuf>,
+}
+
+/// A `disk://` name for `location` (a path or an object's key): its file name, lowercase, the
+/// `.parquet` or `.arrow` cut, every other character than `[a-z0-9._-]` a `-`, at most 24 bytes,
+/// and unique among `taken`.
+pub fn disk_name(location: &str, taken: &mut Vec<String>) -> String {
+    let file = location
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let file = file
+        .strip_suffix(".parquet")
+        .or_else(|| file.strip_suffix(".arrow"))
+        .unwrap_or(&file);
+    let cleaned: String = file
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let base = match cleaned.trim_matches('-') {
+        "" => "input".to_string(),
+        b => b.chars().take(devices::NAME_MAX).collect(),
+    };
+    let mut name = base.clone();
+    let mut n = 1;
+    while taken.contains(&name) {
+        let suffix = format!("-{n}");
+        name = format!(
+            "{}{suffix}",
+            &base[..base.len().min(devices::NAME_MAX - suffix.len())]
+        );
+        n += 1;
+    }
+    taken.push(name.clone());
+    name
+}
+
+/// The files a local input names: a file, or a directory's `*.parquet` files in name order.
+fn local_files(path: &Path) -> Result<Vec<PathBuf>, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !meta.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "parquet") && p.is_file())
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return Err(format!("{}: holds no *.parquet file", path.display()));
+    }
+    Ok(files)
+}
+
+/// A version 1 document (`moruna_spec: 1`) as a VM runs it: given a `run_id` (`mint`) when it
+/// has none, as a host run mints one at its start; each input of its source that is not a
+/// `disk://` device bound to a data disk of a name made from its file's; a sink on this host
+/// written to the VM's output root instead, its directory the run's output directory. `sidecar`
+/// (`JOB.inputs.json`, `{"NAME": "PATH or URL"}`) binds names the document already reads as
+/// `disk://NAME`. A version 2 document is taken as it is; its inputs are bound by the sidecar.
+pub fn adapt(
+    bytes: &[u8],
+    sidecar: Option<&[u8]>,
+    mint: impl FnOnce() -> String,
+) -> Result<Adapted, String> {
+    let mut bindings: Vec<(String, String)> = Vec::new();
+    if let Some(sidecar) = sidecar {
+        let map: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(sidecar)
+            .map_err(|e| format!("the inputs file is not a JSON object of NAME: PATH: {e}"))?;
+        for (name, value) in map {
+            let url = value
+                .as_str()
+                .ok_or_else(|| format!("the inputs file's {name} is not a path"))?;
+            let (name, url) = parse_binding(&format!("{name}={url}"))?;
+            bindings.push((name, url));
+        }
+    }
+    let unchanged = |bindings| Adapted {
+        bytes: bytes.to_vec(),
+        changed: false,
+        bindings,
+        output: None,
+    };
+    if bytes.get(4..8) == Some(b"MJB2".as_slice()) {
+        return Ok(unchanged(bindings));
+    }
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("the document is not JSON: {e}"))?;
+    if doc.get("moruna_spec") != Some(&serde_json::json!(1)) {
+        return Ok(unchanged(bindings));
+    }
+    let mut changed = false;
+    if doc.get("run_id").is_none_or(serde_json::Value::is_null) {
+        doc["run_id"] = serde_json::Value::String(mint());
+        changed = true;
+    }
+    let mut taken: Vec<String> = bindings.iter().map(|(n, _)| n.clone()).collect();
+    if let Some(url) = doc.pointer_mut("/source/url") {
+        let urls: Vec<String> = match &*url {
+            serde_json::Value::String(one) => vec![one.clone()],
+            serde_json::Value::Array(many) => many
+                .iter()
+                .map(|u| u.as_str().map(str::to_string))
+                .collect::<Option<_>>()
+                .ok_or("the source's urls are not strings")?,
+            _ => return Err("the source's url is not a string or a list".into()),
+        };
+        let mut devices_urls = Vec::new();
+        for given in urls {
+            if given.starts_with(devices::SCHEME) {
+                devices_urls.push(given);
+                continue;
+            }
+            let found: Vec<String> = match locate(&given)? {
+                Location::Local(path) => local_files(&path)?
+                    .into_iter()
+                    .map(|p| p.display().to_string())
+                    .collect(),
+                Location::Remote(url) => vec![url],
+            };
+            for location in found {
+                let name = disk_name(&location, &mut taken);
+                devices_urls.push(format!("{}{name}", devices::SCHEME));
+                bindings.push((name, location));
+            }
+            changed = true;
+        }
+        *url = match devices_urls.as_slice() {
+            [one] => serde_json::Value::String(one.clone()),
+            _ => serde_json::Value::Array(
+                devices_urls
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        };
+    }
+    let mut output = None;
+    if let Some(url) = doc.pointer_mut("/sink/url")
+        && let Some(given) = url.as_str().map(str::to_string)
+    {
+        let inside = |p: &Path| p.starts_with(OUTPUT_ROOT);
+        match locate(&given) {
+            Ok(Location::Local(path)) if !inside(&path) => {
+                output = Some(path);
+                *url = serde_json::Value::String(format!("file://{OUTPUT_ROOT}/"));
+                changed = true;
+            }
+            Ok(Location::Local(_)) => {}
+            _ => {
+                return Err(format!(
+                    "the sink writes to {given}; a run in a VM writes its outputs to its output \
+                     disk, so its sink names a directory on this host"
+                ));
+            }
+        }
+    }
+    if !changed {
+        return Ok(unchanged(bindings));
+    }
+    let bytes = serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?;
+    Ok(Adapted {
+        bytes,
+        changed,
+        bindings,
+        output,
+    })
+}
+
+/// The inputs file beside a job document: `JOB.inputs.json` for `JOB.json`.
+pub fn sidecar_of(spec: &Path) -> PathBuf {
+    let name = spec
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = name.strip_suffix(".json").unwrap_or(&name);
+    spec.with_file_name(format!("{stem}.inputs.json"))
+}
+
 /// The input names the job's tasks use, each once, in the order they first appear: every
 /// string in a task's settings that is a `disk://` URL.
 pub fn names_used(job: &moruna_job::Job) -> Result<Vec<String>, String> {
@@ -279,6 +481,147 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn a_disk_name_is_made_from_the_file_name() {
+        let mut taken = Vec::new();
+        assert_eq!(
+            disk_name("/d/yellow_tripdata_2024-01.parquet", &mut taken),
+            "yellow_tripdata_2024-01"
+        );
+        assert_eq!(disk_name("/d/x/Part 0.ARROW", &mut taken), "part-0");
+        assert_eq!(disk_name("s3://b/k/data.parquet", &mut taken), "data");
+        assert_eq!(disk_name("/d/data.parquet", &mut taken), "data-1");
+        assert_eq!(disk_name("/d/???.parquet", &mut taken), "input");
+        let long = format!("/d/{}.parquet", "a".repeat(40));
+        assert_eq!(disk_name(&long, &mut taken), "a".repeat(24));
+        assert_eq!(
+            disk_name(&long, &mut taken),
+            format!("{}-1", "a".repeat(22))
+        );
+        for name in &taken {
+            assert!(parse_binding(&format!("{name}=/x")).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_document_is_adapted_to_the_vm() {
+        let dir = std::env::temp_dir().join(format!(
+            "moruna-adapt-{}-{}",
+            std::process::id(),
+            crate::run::mint_run_id().unwrap().to_hex()
+        ));
+        std::fs::create_dir_all(dir.join("in")).unwrap();
+        for f in ["b.parquet", "a.parquet", "notes.txt"] {
+            std::fs::write(dir.join("in").join(f), b"x").unwrap();
+        }
+        std::fs::write(dir.join("one.parquet"), b"x").unwrap();
+        let doc = serde_json::json!({
+            "moruna_spec": 1,
+            "source": {"kind": "parquet", "url": [
+                dir.join("in").display().to_string(),
+                format!("file://{}", dir.join("one.parquet").display()),
+                "disk://kept",
+            ]},
+            "kernels": [],
+            "sink": {"kind": "parquet", "url": dir.join("out").display().to_string()},
+            "budget": {"memory_bytes": 1u64 << 30, "cpu": 2},
+        });
+        let adapted = adapt(
+            &serde_json::to_vec(&doc).unwrap(),
+            Some(br#"{"kept": "/data/kept.parquet"}"#),
+            || "ab".repeat(16),
+        )
+        .unwrap();
+        assert!(adapted.changed);
+        let sent: serde_json::Value = serde_json::from_slice(&adapted.bytes).unwrap();
+        assert_eq!(sent["run_id"], "ab".repeat(16));
+        assert_eq!(
+            sent["source"]["url"],
+            serde_json::json!(["disk://a", "disk://b", "disk://one", "disk://kept"])
+        );
+        assert_eq!(sent["sink"]["url"], "file:///tmp/out/");
+        assert_eq!(adapted.output.as_deref(), Some(dir.join("out").as_path()));
+        let names: Vec<&str> = adapted.bindings.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["kept", "a", "b", "one"]);
+        assert_eq!(
+            adapted.bindings[1].1,
+            dir.join("in/a.parquet").display().to_string()
+        );
+        // What the engine reads is what is bound.
+        let job = crate::host::session::read_document(&adapted.bytes).unwrap();
+        assert_eq!(names_used(&job).unwrap(), ["a", "b", "one", "kept"]);
+        // A document a VM can run as it is stays as it is, byte for byte.
+        let ready = serde_json::json!({"moruna_spec": 1, "run_id": "cd".repeat(16),
+            "source": {"kind": "parquet", "url": "disk://x"}, "kernels": [],
+            "sink": {"kind": "parquet", "url": "file:///tmp/out/r/"},
+            "budget": {"memory_bytes": 1u64 << 30, "cpu": 1}});
+        let bytes = serde_json::to_vec(&ready).unwrap();
+        let same = adapt(&bytes, None, || unreachable!()).unwrap();
+        assert!(!same.changed);
+        assert_eq!(same.bytes, bytes);
+        assert_eq!(same.output, None);
+        // A version 2 document, or one in binary, is the sidecar's to bind.
+        let v2 = adapt(
+            br#"{"moruna_spec": 2}"#,
+            Some(br#"{"x": "/x"}"#),
+            || unreachable!(),
+        )
+        .unwrap();
+        assert_eq!(v2.bindings, [("x".to_string(), "/x".to_string())]);
+        assert!(!v2.changed);
+        let mut binary = vec![0u8; 16];
+        binary[4..8].copy_from_slice(b"MJB2");
+        assert!(!adapt(&binary, None, || unreachable!()).unwrap().changed);
+        // Refusals: a sink the VM cannot reach, a missing input, a bad inputs file.
+        let mut remote = ready.clone();
+        remote["sink"]["url"] = serde_json::json!("s3://b/out/");
+        assert!(
+            adapt(
+                &serde_json::to_vec(&remote).unwrap(),
+                None,
+                || unreachable!()
+            )
+            .unwrap_err()
+            .contains("output disk")
+        );
+        let mut missing = ready.clone();
+        missing["source"]["url"] =
+            serde_json::json!(dir.join("absent.parquet").display().to_string());
+        assert!(
+            adapt(
+                &serde_json::to_vec(&missing).unwrap(),
+                None,
+                || unreachable!()
+            )
+            .is_err()
+        );
+        let mut empty = ready.clone();
+        empty["source"]["url"] = serde_json::json!(dir.display().to_string());
+        std::fs::remove_file(dir.join("one.parquet")).unwrap();
+        assert!(
+            adapt(
+                &serde_json::to_vec(&empty).unwrap(),
+                None,
+                || unreachable!()
+            )
+            .unwrap_err()
+            .contains("no *.parquet")
+        );
+        for bad in [&b"[1]"[..], br#"{"Bad": "/x"}"#, br#"{"x": 1}"#] {
+            assert!(adapt(&bytes, Some(bad), || unreachable!()).is_err());
+        }
+        assert!(adapt(b"not json", None, || unreachable!()).is_err());
+        assert_eq!(
+            sidecar_of(Path::new("/r/job.json")),
+            Path::new("/r/job.inputs.json")
+        );
+        assert_eq!(
+            sidecar_of(Path::new("/r/job")),
+            Path::new("/r/job.inputs.json")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

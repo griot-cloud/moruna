@@ -195,8 +195,9 @@ def main():
 
 
 DATA_NAME = re.compile(r"[a-z0-9._-]{1,24}")
-# Data disks take fixed PCI slots 0x10 to 0x1e (moruna-vmm's `data::DISKS_MAX`).
-DATA_DISKS_MAX = 15
+# The most data disks a run attaches (moruna-vmm's `data::DISKS_MAX`): each is a handle on the
+# engine's start page and a grant line of its one-page configuration.
+DATA_DISKS_MAX = 40
 
 
 def check_data_disks(data):

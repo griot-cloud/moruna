@@ -17,8 +17,11 @@
 //! - the output disk holds, when the run completes, one layer file from its first byte, which the
 //!   host reads back into the job's output directory.
 //!
-//! Every data disk sits at a fixed PCI slot from [`FIRST_SLOT`], so PCI order is the declared
-//! order whatever else the machine has. Inputs are opened by the launcher, held under a shared
+//! Every data disk sits at a fixed PCI address from [`FIRST_SLOT`], eight functions to a slot
+//! ([`address_of`]), so PCI order is the declared order whatever else the machine has; the device
+//! manager scans every function. At most [`DISKS_MAX`] are attached: each is a handle on the
+//! engine's start page (at most 64) and a grant line of its one-page configuration. Inputs are
+//! opened by the launcher, held under a shared
 //! lock for the VM's life and shown to QEMU's jail read-only; the output disk is created new by
 //! the launcher, sparse, held under an exclusive lock, and is the only file of the run QEMU may
 //! write besides its own logs and sockets.
@@ -31,12 +34,29 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// The first PCI slot of a data disk on the root bus; disk `i` is at `FIRST_SLOT + i`.
+/// The first PCI slot of a data disk on the root bus.
 pub const FIRST_SLOT: u32 = 0x10;
 /// The last slot a data disk may take (0x1f is the chipset's).
 pub const LAST_SLOT: u32 = 0x1e;
-/// The most data disks a run attaches, inputs and output together.
-pub const DISKS_MAX: usize = (LAST_SLOT - FIRST_SLOT + 1) as usize;
+/// The functions of one slot.
+pub const FUNCTIONS: usize = 8;
+/// The most data disks a run attaches, inputs and output together: room on the engine's start
+/// page (64 handles, about a dozen of them the engine's own) and in its one-page configuration.
+pub const DISKS_MAX: usize = 40;
+/// The root bus's slots the data disks take: whole slots of [`FUNCTIONS`].
+pub fn slots_for(disks: usize) -> usize {
+    disks.div_ceil(FUNCTIONS)
+}
+
+/// The PCI address of data disk `i`: its slot, its function, and whether it is function 0 of a
+/// slot that holds more than one (`multifunction=on`).
+pub fn address_of(i: usize, disks: usize) -> (u32, u32, bool) {
+    let slot = FIRST_SLOT + (i / FUNCTIONS) as u32;
+    let function = (i % FUNCTIONS) as u32;
+    let shared = disks > i - i % FUNCTIONS + 1;
+    (slot, function, function == 0 && shared)
+}
+
 /// The longest input name (`moruna_micro::devices::NAME_MAX`): a start-page name is at most 32
 /// bytes and `disk.in.` takes 8.
 pub const NAME_MAX: usize = 24;
@@ -323,10 +343,11 @@ pub fn qemu_args(disks: &[Opened]) -> Result<Vec<String>> {
             Some(serial) => return Err(bad(format!("`{serial}` is not a length serial"))),
             None => String::new(),
         };
+        let (slot, function, multifunction) = address_of(i, disks.len());
         args.push("-device".to_string());
         args.push(format!(
-            "virtio-blk-pci,drive=data{i},id=data-disk{i},addr=0x{:x},disable-legacy=off,disable-modern=off{serial}",
-            FIRST_SLOT + i as u32
+            "virtio-blk-pci,drive=data{i},id=data-disk{i},addr=0x{slot:x}.0x{function:x}{},disable-legacy=off,disable-modern=off{serial}",
+            if multifunction { ",multifunction=on" } else { "" }
         ));
     }
     Ok(args)
@@ -404,9 +425,24 @@ mod tests {
             inputs: names,
             output_bytes: 4096,
         };
-        assert!(over.check().unwrap_err().to_string().contains("at most 15"));
+        assert!(over.check().unwrap_err().to_string().contains("at most 40"));
         assert!(valid_name(&"a".repeat(NAME_MAX)));
         assert!(valid_name("nyc-2024.v1_a"));
+    }
+
+    #[test]
+    fn disks_take_eight_functions_to_a_slot_in_order() {
+        assert_eq!(address_of(0, 1), (0x10, 0, false));
+        assert_eq!(address_of(0, 2), (0x10, 0, true));
+        assert_eq!(address_of(7, 9), (0x10, 7, false));
+        assert_eq!(address_of(8, 9), (0x11, 0, false), "alone in its slot");
+        assert_eq!(address_of(8, 10), (0x11, 0, true));
+        assert_eq!(address_of(DISKS_MAX - 1, DISKS_MAX), (0x14, 7, false));
+        assert_eq!(slots_for(0), 0);
+        assert_eq!(slots_for(1), 1);
+        assert_eq!(slots_for(8), 1);
+        assert_eq!(slots_for(9), 2);
+        assert!(FIRST_SLOT as usize + slots_for(DISKS_MAX) - 1 <= LAST_SLOT as usize);
     }
 
     #[test]
@@ -487,12 +523,12 @@ mod tests {
                     file.display()
                 ),
                 "-device".to_string(),
-                "virtio-blk-pci,drive=data0,id=data-disk0,addr=0x10,disable-legacy=off,disable-modern=off,serial=1000"
+                "virtio-blk-pci,drive=data0,id=data-disk0,addr=0x10.0x0,multifunction=on,disable-legacy=off,disable-modern=off,serial=1000"
                     .to_string(),
                 "-drive".to_string(),
                 format!("file={},format=raw,if=none,id=data1", out.display()),
                 "-device".to_string(),
-                "virtio-blk-pci,drive=data1,id=data-disk1,addr=0x11,disable-legacy=off,disable-modern=off"
+                "virtio-blk-pci,drive=data1,id=data-disk1,addr=0x10.0x1,disable-legacy=off,disable-modern=off"
                     .to_string(),
             ]
         );
@@ -546,7 +582,9 @@ mod tests {
         let many: Vec<Opened> = (0..=DISKS_MAX).map(|_| disk(Some("1"))).collect();
         assert!(qemu_args(&many).is_err());
         let last = qemu_args(&many[..DISKS_MAX]).unwrap();
-        assert!(last.last().unwrap().contains("addr=0x1e"), "{last:?}");
+        assert!(last.last().unwrap().contains("addr=0x14.0x7,"), "{last:?}");
+        let one = qemu_args(&many[..1]).unwrap();
+        assert!(one[3].contains("addr=0x10.0x0,disable"), "one disk alone: {one:?}");
         assert!(qemu_args(&[]).unwrap().is_empty());
         let relative = Opened {
             path: PathBuf::from("f"),
