@@ -177,7 +177,8 @@ handlers' carried code stays in the tree, unreachable: removing it would leave p
   `linuxlayer-boot`, an initramfs with the mode's program, renders `boot/MODE.image` and
   boots it under QEMU, then checks the lines it expects: `musl` runs a static musl program
   as `/init` (kernel/linux's LX-T10), `glibc` a dynamic glibc one with its interpreter and
-  libraries (LX-T12). There is no shell in the image.
+  libraries (LX-T12), `fork` a static program that forks two generations. There is no
+  shell in the image.
 
 ## A task's processes: shared memory and `fork`
 
@@ -193,8 +194,15 @@ integrator's decision of 2026-11-16):
   objects and the processes, and `clone_process` holds it across a `process_clone`;
 - which process a thread is in goes in its block.
 
-`fork` itself waits for B1's `SHARE_HANDLES`; the personality's heap moves onto the shared
-memory once `moruna-sys`'s heap takes its chunks from it.
+- the personality's heap takes its memory from `linuxlayer_launch::HEAP` in every process
+  (`moruna_sys::heap::set_source`, set by `start_task_memory` before anything allocates);
+  B2-vm's frames take theirs from `shared_map`;
+- `fork` (`process/core_process.rs`): the child's address space is shown in a
+  `process_clone` of the parent's process with `SHARE_HANDLES` (`ostd::backend::fork_process`,
+  under the shared memory's lock); the child's main task starts there (`Task::set_home`), on
+  a first thread that spawns its real one so it has a handle to be interrupted by; reaping
+  the child closes its process. The personality gets the process resource as the slot
+  `processes`. `boot/boot.sh fork` checks a child and a grandchild.
 
 ## Running the program: B1's entry
 
@@ -272,7 +280,7 @@ RUSTFLAGS="--cfg ktest" cargo test --target x86_64-unknown-linux-gnu --workspace
 The booted test, on Linux x86-64 with QEMU and musl (KVM when usable):
 
 ```sh
-kernel/linuxlayer/boot/boot.sh [OUT] [TIMEOUT_SECONDS] [musl|glibc]
+kernel/linuxlayer/boot/boot.sh [OUT] [TIMEOUT_SECONDS] [musl|glibc|fork]
 ```
 
 For the Moruna user target, as `kernel/tools/build.sh` builds programs:

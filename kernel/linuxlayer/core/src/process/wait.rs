@@ -363,6 +363,10 @@ fn reap_zombie_child(
     // Remove the process from the global table
     pid_table.remove_process(child_process.pid());
 
+    // User space: the child's Moruna process goes back (`core_process.rs`).
+    #[cfg(target_os = "none")]
+    super::core_process::reaped(child_process.pid());
+
     // Remove the process group and the session from global table, if necessary
     let mut child_group_mut = child_process.process_group.lock();
     child_process.clear_old_group_and_session(&mut child_group_mut, &mut pid_table);

@@ -7,9 +7,10 @@
 #
 #   kernel/linuxlayer/boot/boot.sh [OUT] [TIMEOUT_SECONDS] [MODE]
 #
-# MODE is `musl` (default: linux/programs/hello.c, static, as /init) or `glibc`
+# MODE is `musl` (default: linux/programs/hello.c, static, as /init), `glibc`
 # (linux/programs/dynamic.c, dynamic, at /kc1/bin/dynamic with its interpreter and
-# libraries from this machine, run with rdinit=).
+# libraries from this machine, run with rdinit=), or `fork` (boot/programs/fork.c, static,
+# as /init).
 #
 # Needs what kernel/tools/build.sh needs for the kernel and the Linux programs (the
 # pinned nightly, musl for x86_64, QEMU). CARGO_TARGET_DIR, when set, is where the three
@@ -22,7 +23,7 @@ kernel="$(dirname "$layer")"
 out="${1:-$kernel/target/linuxlayer-boot}"
 seconds="${2:-120}"
 mode="${3:-musl}"
-case "$mode" in musl|glibc) ;; *) echo "boot.sh: unknown mode $mode" >&2; exit 2 ;; esac
+case "$mode" in musl|glibc|fork) ;; *) echo "boot.sh: unknown mode $mode" >&2; exit 2 ;; esac
 targets="${CARGO_TARGET_DIR:-$kernel/target}"
 target=x86_64-unknown-none
 user_target="$kernel/targets/x86_64-moruna-user.json"
@@ -56,7 +57,7 @@ cp "$targets/linuxlayer-image/x86_64-moruna-user/release/linuxlayer-personality"
 
 # The initramfs: the mode's program, and the file both programs read.
 cp "$kernel/linux/programs/greeting.txt" "$out/root/kc1/greeting.txt"
-if [ "$mode" = musl ]; then
+if [ "$mode" != glibc ]; then
   specs=/usr/lib/x86_64-linux-musl/musl-gcc.specs
   if [ "$(uname -m)" = x86_64 ] && command -v musl-gcc >/dev/null; then
     muslcc=(musl-gcc)
@@ -66,8 +67,9 @@ if [ "$mode" = musl ]; then
     echo "boot.sh: no musl for x86_64 (musl-tools)" >&2
     exit 1
   fi
-  "${muslcc[@]}" -static -O2 -Wall -Werror -s -o "$out/root/init" \
-    "$kernel/linux/programs/hello.c"
+  program="$kernel/linux/programs/hello.c"
+  [ "$mode" = fork ] && program="$here/programs/fork.c"
+  "${muslcc[@]}" -static -O2 -Wall -Werror -s -o "$out/root/init" "$program"
   cmdline=""
 else
   "${CC:-gcc}" -O2 -Wall -Werror -s -o "$out/root/kc1/bin/dynamic" \

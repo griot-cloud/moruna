@@ -18,7 +18,7 @@ use core::{
     cell::Cell,
     ops::Deref,
     ptr::NonNull,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
 use self::utils::ForceSync;
@@ -37,6 +37,9 @@ pub struct Task {
     schedule_info: TaskScheduleInfo,
     /// The thread running the task (`backend::thread_token`), zero when none does.
     thread: AtomicUsize,
+    /// The process of the task its thread starts in (`Task::set_home`); zero for the
+    /// starter's own.
+    home: AtomicU32,
 }
 
 impl core::fmt::Debug for Task {
@@ -120,16 +123,26 @@ impl Task {
     #[track_caller]
     pub fn run(self: &Arc<Self>) {
         let task = self.clone();
-        let started = backend::spawn(Box::new(move || {
-            // SAFETY: only the task's own thread takes its function, once.
-            let func = unsafe { task.func.get() }.take();
-            Task::enter(task);
-            if let Some(func) = func {
-                func();
-            }
-            Task::leave();
-        }));
+        let home = self.home.load(Ordering::Acquire);
+        let started = backend::spawn_in(
+            home,
+            Box::new(move || {
+                // SAFETY: only the task's own thread takes its function, once.
+                let func = unsafe { task.func.get() }.take();
+                Task::enter(task);
+                if let Some(func) = func {
+                    func();
+                }
+                Task::leave();
+            }),
+        );
         assert!(started.is_ok(), "no thread for a new task");
+    }
+
+    /// Makes the task's thread start in `process`, a process of the task created and not
+    /// started (a fork's child, `ostd::backend::fork_process`), rather than the starter's.
+    pub fn set_home(&self, process: u32) {
+        self.home.store(process, Ordering::Release);
     }
 
     /// The task's shared data.
@@ -200,6 +213,7 @@ impl TaskOptions {
                 cpu: AtomicCpuId::default(),
             },
             thread: AtomicUsize::new(0),
+            home: AtomicU32::new(0),
         })
     }
 

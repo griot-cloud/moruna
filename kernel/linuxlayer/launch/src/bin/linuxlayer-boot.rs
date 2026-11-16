@@ -49,6 +49,9 @@ fn boot(out: &Console) -> Result<i64, alloc::string::String> {
         .map(0, len, 0)
         .map_err(|e| format!("mapping the personality image: {e:?}"))?;
     let initramfs = slot("initramfs").ok_or("no initramfs")?;
+    let processes = resource
+        .duplicate(Rights::WRITE | Rights::TRANSFER)
+        .map_err(|e| format!("duplicating the process resource: {e:?}"))?;
     let console = out
         .0
         .duplicate(Rights::WRITE | Rights::TRANSFER)
@@ -61,6 +64,7 @@ fn boot(out: &Console) -> Result<i64, alloc::string::String> {
             (Some(console), "console"),
             (Some(initramfs), "initramfs"),
             (slot("cmdline"), "cmdline"),
+            (Some(processes), linuxlayer_launch::slot::PROCESSES),
         ],
     )
     .map_err(|e| match e {

@@ -97,6 +97,11 @@ pub(crate) fn spawn(f: Box<dyn FnOnce() + Send>) -> Result<(), ()> {
         .map_err(|_| ())
 }
 
+/// Runs `f` on a new thread: the host has one process, so `process` is it.
+pub(crate) fn spawn_in(_process: u32, f: Box<dyn FnOnce() + Send>) -> Result<(), ()> {
+    spawn(f)
+}
+
 thread_local! {
     static ACTIVE_SPACE: RefCell<Option<alloc::sync::Arc<crate::mm::VmSpace>>> =
         const { RefCell::new(None) };

@@ -55,6 +55,9 @@ mod image {
                 let _ = ostd::backend::shared_unmap(addr);
             },
         });
+        if let Some(processes) = start::take(slot::PROCESSES) {
+            ostd::backend::set_process_resource(processes.into_raw());
+        }
         let cmdline = start::take(slot::CMDLINE)
             .map(|m| linuxlayer_personality::cmdline(mapped(Memory(m))))
             .unwrap_or_default();

@@ -505,6 +505,19 @@ fn clone_child_process(
     // Clone the virtual memory space
     let child_vmar = clone_vmar(thread_local.vmar().borrow().as_ref().unwrap(), clone_flags);
 
+    // User space: a forked child is a Moruna process of its own, a clone of this one that
+    // shares the task's handle table and shows the child's space (`core_process.rs`).
+    #[cfg(target_os = "none")]
+    let child_core = if clone_flags.contains(CloneFlags::CLONE_VM) {
+        None
+    } else {
+        let parent_vmar = thread_local.vmar().borrow();
+        Some(super::core_process::clone_for(
+            parent_vmar.as_ref().unwrap(),
+            &child_vmar,
+        )?)
+    };
+
     // Clone the user context
     #[cfg_attr(target_arch = "x86_64", expect(unused_mut))]
     let mut child_user_ctx = Box::new(clone_user_ctx(
@@ -619,6 +632,12 @@ fn clone_child_process(
             child_thread_builder,
         )
     };
+
+    // User space: the child's main thread starts in its own Moruna process.
+    #[cfg(target_os = "none")]
+    if let Some(core) = child_core {
+        super::core_process::adopt(&child, core);
+    }
 
     clone_pidfd(ctx, &child, clone_flags, clone_args.pidfd)?;
 

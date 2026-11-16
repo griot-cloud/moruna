@@ -83,6 +83,8 @@ pub mod slot {
     pub const OUTPUT: &str = "output";
     /// The engine's log ring, a memory object.
     pub const LOG: &str = "log";
+    /// A process resource with `WRITE`: what `fork` clones the task's processes from.
+    pub const PROCESSES: &str = "processes";
 }
 
 /// Why an image cannot be launched.

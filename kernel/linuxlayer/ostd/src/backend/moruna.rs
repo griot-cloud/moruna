@@ -714,3 +714,93 @@ pub fn clone_process<E>(clone: impl FnOnce() -> Result<RawHandle, E>) -> Result<
 pub fn task_leave(process: RawHandle) {
     with_task(|_| TASK.lock().processes.remove(process));
 }
+
+/// The process resource `fork` clones the task's processes from: one value in every process
+/// of the task, whose processes share one handle table.
+static PROCESS_RESOURCE: AtomicU32 = AtomicU32::new(0);
+
+/// Records the process resource the launcher granted (`linuxlayer_launch::slot::PROCESSES`).
+pub fn set_process_resource(resource: RawHandle) {
+    PROCESS_RESOURCE.store(resource, Ordering::Release);
+}
+
+/// A `process_clone` of the task's process `parent` sharing its handle table, added to the
+/// task with every shared object mapped (`clone_process`); not started.
+pub fn fork_process(parent: RawHandle) -> crate::Result<RawHandle> {
+    let resource = PROCESS_RESOURCE.load(Ordering::Acquire);
+    if resource == 0 {
+        return Err(crate::Error::AccessDenied);
+    }
+    let resource = core::mem::ManuallyDrop::new(Handle::from_raw(resource));
+    let parent = core::mem::ManuallyDrop::new(moruna_sys::Process(Handle::from_raw(parent)));
+    clone_process(|| {
+        moruna_sys::personality::process_clone(
+            &resource,
+            Some(&parent),
+            None,
+            moruna_abi::process::SHARE_HANDLES,
+        )
+        .map(|child| child.0.into_raw())
+    })
+    .map_err(|_| crate::Error::NoMemory)
+}
+
+/// Takes `process` out of the task and closes its handle: it has ended and been reaped.
+pub fn task_release(process: RawHandle) {
+    task_leave(process);
+    drop(moruna_sys::Process(Handle::from_raw(process)));
+}
+
+// A first thread in another process of the task: its block is on a stack in the task's
+// heap, which every process maps, and its argument at the stack pointer.
+global_asm!(
+    ".globl linuxlayer_first_thread",
+    "linuxlayer_first_thread:",
+    "mov rdi, [rsp]",
+    "and rsp, -16",
+    "call {entry}",
+    "ud2",
+    entry = sym first_thread_entry,
+);
+
+extern "C" fn first_thread_entry(arg: u64) -> ! {
+    // SAFETY: `spawn_in` leaked this box for the thread, which takes it once.
+    let f = unsafe { Box::from_raw(arg as *mut Box<dyn FnOnce() + Send>) };
+    // A thread of its own runs `f`, so it has a handle to be interrupted by; this one,
+    // launched with none, ends.
+    if spawn(*f).is_err() {
+        exit(1);
+    }
+    moruna_sys::thread_exit()
+}
+
+/// Runs `f` on a new thread in `process`, a process of the task: the caller's own (or `0`)
+/// spawns it there; another's, created and not started, is started with it.
+pub(crate) fn spawn_in(process: RawHandle, f: Box<dyn FnOnce() + Send>) -> Result<(), ()> {
+    if process == 0 || self_process() == Some(process) {
+        return spawn(f);
+    }
+    let (base, top) = new_stack().ok_or(())?;
+    // SAFETY: `base` is the new thread's block, which nothing reads yet.
+    unsafe {
+        (*(base as *const ThreadBlock))
+            .process
+            .store(process, Ordering::Release)
+    };
+    let arg = Box::into_raw(Box::new(f));
+    let sp = top - linuxlayer_launch::STACK_ARGS as usize;
+    // SAFETY: `sp` is inside the new stack, which nothing uses yet.
+    unsafe { (sp as *mut u64).write(arg as u64) };
+    unsafe extern "C" {
+        fn linuxlayer_first_thread();
+    }
+    let target = core::mem::ManuallyDrop::new(moruna_sys::Process(Handle::from_raw(process)));
+    match target.launch(linuxlayer_first_thread as *const () as u64, sp as u64, 0) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            // SAFETY: the thread did not start, so the box is still ours.
+            drop(unsafe { Box::from_raw(arg) });
+            Err(())
+        }
+    }
+}

@@ -13,9 +13,9 @@ mod shared;
 pub(crate) use moruna::*;
 #[cfg(target_os = "none")]
 pub use moruna::{
-    TaskMemoryError, clone_process, copy_through_core, personality_set, self_process,
-    set_self_process, shared_chunk, shared_map, shared_unmap, start_task_memory,
-    start_thread_block, task_leave, user_copy_range,
+    TaskMemoryError, clone_process, copy_through_core, fork_process, personality_set, self_process,
+    set_process_resource, set_self_process, shared_chunk, shared_map, shared_unmap,
+    start_task_memory, start_thread_block, task_leave, task_release, user_copy_range,
 };
 #[cfg_attr(
     not(test),

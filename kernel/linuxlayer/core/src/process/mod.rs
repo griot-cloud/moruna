@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 mod clone;
+#[cfg(target_os = "none")]
+mod core_process;
 pub mod credentials;
 mod execve;
 mod exit;
