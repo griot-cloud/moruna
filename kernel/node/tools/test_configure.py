@@ -85,5 +85,39 @@ class DataDisks(unittest.TestCase):
             self.assertNotEqual(done.returncode, 0)
 
 
+class NodeSizes(unittest.TestCase):
+    """node-for-job.py's node: the job's memory, its scratch and the node's services."""
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("node_for_job", TOOL.parent / "node-for-job.py")
+        self.tool = importlib.util.module_from_spec(spec)
+        sys.dont_write_bytecode = True
+        spec.loader.exec_module(self.tool)
+
+    def test_a_node_holds_its_job_and_passes_configure(self):
+        node, job, account, scratch, admission = self.tool.sizes(384 * MIB, 1024 * MIB)
+        self.assertEqual((job, scratch), (384 * MIB, 1024 * MIB))
+        self.assertGreater(account, job + scratch)
+        self.assertGreater(admission, account)
+        self.assertEqual(node % (2 * MIB), 0)
+        self.assertLessEqual(node, 6 * 1024 * MIB, "a booted test's node stays within 6 GiB")
+        accounts = dict(self.tool.SERVICES, admission=admission)
+        value = profile(node_memory_bytes=node, job_memory_bytes=job, job_account_bytes=account,
+                        scratch_bytes=scratch, service_accounts=accounts)
+        with tempfile.TemporaryDirectory() as tmp:
+            done, _ = render(Path(tmp), value)
+            self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_an_exact_node_is_refused_when_the_job_does_not_fit(self):
+        gib = 1024 * MIB
+        node, *_ = self.tool.sizes(20 * gib, gib, 24 * gib)
+        self.assertEqual(node, 24 * gib)
+        with self.assertRaisesRegex(ValueError, "needs at least"):
+            self.tool.sizes(24 * gib, gib, 24 * gib)
+        with self.assertRaisesRegex(ValueError, "2 MiB"):
+            self.tool.sizes(gib, gib, 24 * gib + 4096)
+
+
 if __name__ == "__main__":
     unittest.main()
