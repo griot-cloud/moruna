@@ -2,15 +2,23 @@
 //! of the data plane, with SDD 19's contract, the same as on a Linux node.
 //!
 //! The stage's task is a process the Linux personality starts with `run_plane` (SDD 28 d.3)
-//! on its own connection to the personality, whose closing ends it: one input slot, which its
-//! descriptor 0 reads as an Arrow IPC stream, one output slot, which its descriptor 1 writes
-//! as one, its port, and a log ring for its text. Each `apply` lays the batch out as a
-//! page-aligned record in an arena object of the stage's [`KernelPlane`] (one copy of each
-//! buffer), offers it to the task (its pages mapped into the task read only, no copy), and
-//! waits for the one record the task puts back, which the plane checks before the engine sees
-//! it (DP1); the engine decodes it in place and lands it in the run's arena (the one copy
-//! every image's output has, as on Linux). `finish` ends the input and requires the task to
-//! end its stream and exit 0.
+//! on its own connection to the personality, whose closing ends it: one input slot, one
+//! output slot, its port, and a log ring for its text. Its batches cross in one of two ways:
+//!
+//! - **ring mode** (`architecture/data-os.md` §5), for an image that declares
+//!   `MORUNA_PLANE=rings` (the Python shim's layer does): the task maps its input region and
+//!   its rings object once, the engine lays each batch out in the region and posts it on the
+//!   input ring, and the task posts its record on the output ring. No call per batch moves a
+//!   batch, and the kernel and the personality copy nothing ([`crate::rings`]);
+//! - **descriptors 0 and 1**, for an unmodified image: the personality turns the slots'
+//!   records into an Arrow IPC stream and back, which copies, as any `read` and `write` do.
+//!
+//! Each `apply` lays the batch out as a page-aligned record (the one copy of each buffer the
+//! engine makes, counted as the stage's boundary copy, until the batch is decoded straight
+//! into the task's region), and waits for the one record the task puts back, which the plane
+//! checks before the engine sees it (DP1). The engine decodes that record in place and hands
+//! it on as it lies, with no landing copy, while the task has a window left to write its next
+//! record in. `finish` ends the input and requires the task to end its stream and exit 0.
 //!
 //! What ends the stage, each with its cause, as on Linux: the task exiting or faulting before
 //! it answered (with the last lines of its standard error), a record the check refused (the
@@ -38,13 +46,15 @@ use moruna_kernel::{
     StageId, StagePorts, Stream as OutStream, TierPref,
 };
 use moruna_plane::kernel::Kernel as Calls;
-use moruna_plane::{BatchId, CallId, DataPlane, Event, KernelPlane, PlaneError, Shape, TaskId};
+use moruna_plane::ringed::{Region, RingShape};
+use moruna_plane::{BatchId, CallId, DataPlane, Event, PlaneError, RingPlane, Shape, TaskId};
 use moruna_svc::{
     Account, Channel, ClientCore, Encoder, Error as KernelError, Rights, Usage, Wire, map,
 };
 
 use crate::layout::{self, PAGE};
 use crate::ring::{LogRing, Stream};
+use crate::rings::{self, Released};
 
 const SECONDS: u64 = 1_000_000_000;
 /// How long the personality may take to say hello on a task's connection.
@@ -105,6 +115,9 @@ pub(crate) fn personality() -> std::result::Result<&'static Channel, String> {
 #[derive(Default)]
 pub struct TaskMemory {
     account: Mutex<Option<(Account, u64)>>,
+    /// The stage's plane budget while its task lives: the records it hands on as they lie
+    /// are held there, outside the run's arena.
+    plane: std::sync::atomic::AtomicU64,
     /// Sticky uncertainty is a typed accounting failure, never a zero reservation.
     failure: Mutex<Option<String>>,
 }
@@ -127,7 +140,10 @@ impl moruna_kernel::OutsideMemory for TaskMemory {
                 "task account cleanup uncertain: {why}"
             )));
         }
-        Ok(lock(&self.account).as_ref().map_or(0, |(_, limit)| *limit))
+        let plane = self.plane.load(std::sync::atomic::Ordering::Relaxed);
+        Ok(lock(&self.account)
+            .as_ref()
+            .map_or(0, |(_, limit)| *limit + plane))
     }
 }
 
@@ -162,6 +178,8 @@ pub struct ImageTask {
     managed_windows: bool,
     /// Source path is only resolved through the actual filesystem capability at start.
     assets_path: Option<std::path::PathBuf>,
+    /// The image declares the ring protocol (`MORUNA_PLANE=rings`).
+    rings: bool,
 }
 
 impl std::fmt::Debug for ImageTask {
@@ -202,6 +220,7 @@ impl ImageTask {
             return Err("the command or the environment holds a NUL byte".to_string());
         }
         personality()?;
+        let rings = layout::declares_rings(&env);
         port_names.sort();
         port_names.dedup();
         Ok(ImageTask {
@@ -217,6 +236,7 @@ impl ImageTask {
             memory: Arc::new(TaskMemory::default()),
             managed_windows: false,
             assets_path: None,
+            rings,
         })
     }
 
@@ -266,6 +286,13 @@ impl ImageTask {
                 "an image takes a table; its batches cross the data plane as records".into(),
             ));
         };
+        st.reap();
+        if reply_bytes != 0 && st.rings {
+            return Err(kernel_error(
+                "explicit reply windows are a task of the slots; a ring task's windows are its plane's"
+                    .into(),
+            ));
+        }
         if reply_bytes != 0 {
             if st.window.is_some() {
                 return Err(kernel_error("explicit reply window already held".into()));
@@ -285,21 +312,21 @@ impl ImageTask {
             st.window = Some(bytes);
         }
         // Explicit output admission is complete BEFORE the child can read this request.
-        let len = st.offer(&batch)?;
+        let len = st.offer(&batch, self.ports.get(), &self.port_names)?;
         drop(batch);
-        if reply_bytes == 0 {
+        if reply_bytes == 0 && !st.rings {
             st.grant(len)?;
         }
         st.sent += 1;
         match st.wait(self.ports.get(), &self.port_names)? {
             Seen::Put(out) => {
                 st.received += 1;
-                let landed = st.land(out)?;
+                let out = st.output(out)?;
                 // The next record's room, before the task asks for it.
-                if !self.managed_windows {
+                if !self.managed_windows && !st.rings {
                     st.grant(len)?;
                 }
-                Ok(landed)
+                Ok(out)
             }
             Seen::Ended => {
                 let cause = format!(
@@ -347,14 +374,24 @@ impl ImageTask {
             ))
         })?;
         let budget = ceiling.min(PLANE_BUDGET_MAX);
-        let mut plane = KernelPlane::new(Calls, budget);
-        let (task, port) = plane
-            .open(Shape {
+        let mut plane = RingPlane::new(Calls, budget);
+        let (task, port) = if self.rings {
+            let sizes = layout::ring_sizes(budget);
+            plane
+                .open_ring(RingShape {
+                    region: Region::New(sizes.region),
+                    windows: sizes.windows,
+                    window_bytes: sizes.window,
+                })
+                .map(|(task, port)| (task, Some(port)))
+        } else {
+            plane.open(Shape {
                 inputs: 1,
                 outputs: 1,
                 port: !self.port_names.is_empty(),
             })
-            .map_err(|e| plane_error(name, "opening the task's plane", e))?;
+        }
+        .map_err(|e| plane_error(name, "opening the task's plane", e))?;
         let slots: Vec<moruna_svc::Handle> = plane
             .slots(task)
             .map_err(|e| plane_error(name, "its slots", e))?
@@ -454,7 +491,10 @@ impl ImageTask {
         // Publish the retained account only after request construction and transfer
         // succeeded. Failed startup drops every local handle and returns its limit.
         *lock(&self.memory.account) = Some((kept, limit));
-        tracing::info!(target: "micro", image = %name, command = ?self.command, "image task asked of the personality");
+        self.memory
+            .plane
+            .store(budget, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(target: "micro", image = %name, command = ?self.command, rings = self.rings, "image task asked of the personality");
         Ok(TaskState {
             memory: Arc::clone(&self.memory),
             name: name.clone(),
@@ -471,6 +511,12 @@ impl ImageTask {
             sent: 0,
             received: 0,
             window: None,
+            rings: self.rings,
+            released: Released::default(),
+            held: 0,
+            copied: 0,
+            kept: 0,
+            landed: 0,
             stage: self.ports.get().map_or(UNKNOWN_STAGE, |p| p.stage()),
             cancel: self.cancel.get().cloned(),
         })
@@ -482,7 +528,7 @@ pub struct TaskState {
     /// Its account, which the stage reads its peak from.
     memory: Arc<TaskMemory>,
     name: String,
-    plane: KernelPlane<Calls>,
+    plane: RingPlane<Calls>,
     task: TaskId,
     /// The task's own connection to the personality: closing it ends the task.
     client: Option<ClientCore>,
@@ -498,6 +544,17 @@ pub struct TaskState {
     received: u64,
     /// The bytes of the window the task holds for its next record.
     window: Option<u64>,
+    /// The task speaks the ring protocol.
+    rings: bool,
+    /// Records handed on as they lie whose payloads downstream has dropped.
+    released: Released,
+    /// Records handed on as they lie and not yet given back.
+    held: u64,
+    /// Body bytes the engine copied laying batches out for the task.
+    copied: u64,
+    /// Records handed on as they lie, and records copied into the run's arena instead.
+    kept: u64,
+    landed: u64,
     stage: StageId,
     cancel: Option<CancelToken>,
 }
@@ -510,7 +567,7 @@ impl Drop for TaskState {
         drop(self.client.take());
         // Release our original plane/record owners before asking whether physical
         // child charges retired. No alias, fake reset or fabricated completion.
-        let original = core::mem::replace(&mut self.plane, KernelPlane::new(Calls, 0));
+        let original = core::mem::replace(&mut self.plane, RingPlane::new(Calls, 0));
         drop(original);
         let result = (|| -> std::result::Result<(), String> {
             if !self.terminal_confirmed {
@@ -687,8 +744,25 @@ impl TaskState {
         Ok(())
     }
 
-    /// Lays `batch` out as a record in an arena object and offers it to the task.
-    fn offer(&mut self, batch: &moruna_kernel::arrow::record_batch::RecordBatch) -> Result<u64> {
+    /// Gives the plane back every record whose payload downstream has dropped.
+    fn reap(&mut self) {
+        for batch in self.released.take() {
+            self.held = self.held.saturating_sub(1);
+            if let Err(e) = self.plane.drop_batch(batch) {
+                tracing::error!(target: "micro", image = %self.name, ?e, "giving a record back to the plane");
+            }
+        }
+    }
+
+    /// Lays `batch` out as a record where the task reads it and offers it: in ring mode, in
+    /// the task's region, posted on its input ring; otherwise in an arena object pushed on
+    /// its input slot. The record's length.
+    fn offer(
+        &mut self,
+        batch: &moruna_kernel::arrow::record_batch::RecordBatch,
+        ports: Option<&Arc<StagePorts>>,
+        names: &[String],
+    ) -> Result<u64> {
         let (framing, placed) =
             moruna_kernel::ipc::encode_framing(batch, PAGE as usize, 0, self.alloc.as_ref())?;
         let pieces: Vec<(u64, u64)> = placed
@@ -697,25 +771,179 @@ impl TaskState {
             .collect();
         let len = layout::record_len(framing.len() as u64, &pieces)
             .ok_or_else(|| kernel_error(format!("image `{}`: a record past u64", self.name)))?;
-        let (id, _) = self
-            .plane
-            .load_with(len, |_, memory| {
-                write_record(memory, len, &framing, &placed)
-            })
-            .map_err(|e| plane_error(&self.name, "laying the batch out", e))?;
-        self.plane
-            .offer(self.task, 0, id)
-            .map_err(|e| plane_error(&self.name, "offering the batch", e))?;
-        // The task's share keeps it until the task takes its next or ends.
+        let body: u64 = pieces.iter().map(|(_, n)| n).sum();
+        let id = if self.rings {
+            let region = self
+                .plane
+                .region_of(self.task)
+                .ok_or_else(|| kernel_error(format!("image `{}`: no input region", self.name)))?;
+            let id = loop {
+                let laid = self.plane.load_into(region, len, |view, at| {
+                    rings::write_record(view, at, len, &framing, &placed).map(|_| ())
+                });
+                match laid {
+                    Ok((id, _)) => break id,
+                    // The region holds the task's unreleased batches: wait for a release.
+                    Err(PlaneError::Budget { asked, free }) => {
+                        if !self.step(ports, names)? {
+                            return Err(kernel_error(format!(
+                                "image `{}`: a record of {asked} bytes does not fit its input \
+                                 region, which has {free} bytes free and nothing to release",
+                                self.name
+                            )));
+                        }
+                    }
+                    Err(e) => return Err(plane_error(&self.name, "laying the batch out", e)),
+                }
+            };
+            loop {
+                match self.plane.offer(self.task, 0, id) {
+                    Ok(()) => break,
+                    Err(PlaneError::Full) => {
+                        if !self.step(ports, names)? {
+                            return Err(kernel_error(format!(
+                                "image `{}`: its input ring stays full",
+                                self.name
+                            )));
+                        }
+                    }
+                    Err(e) => return Err(plane_error(&self.name, "posting the batch", e)),
+                }
+            }
+            id
+        } else {
+            let (id, _) = self
+                .plane
+                .plane
+                .load_with(len, |_, memory| {
+                    write_record(memory, len, &framing, &placed)
+                })
+                .map_err(|e| plane_error(&self.name, "laying the batch out", e))?;
+            self.plane
+                .offer(self.task, 0, id)
+                .map_err(|e| plane_error(&self.name, "offering the batch", e))?;
+            id
+        };
+        // The engine's one copy at the boundary, until the batch is decoded straight into
+        // the task's region.
+        self.copied += body;
+        self.alloc.note_boundary_copy(body);
+        // The task's share keeps it until the task releases it or ends.
         self.plane
             .drop_batch(id)
             .map_err(|e| plane_error(&self.name, "the engine's hold", e))?;
         Ok(len)
     }
 
-    /// The batch the task put, decoded in place and landed in the run's arena.
+    /// One step of the plane while the engine waits for room: whether anything came.
+    fn step(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<bool> {
+        let deadline = moruna_svc::now().saturating_add(LOOK_NS);
+        let event = self
+            .plane
+            .next(deadline)
+            .map_err(|e| plane_error(&self.name, "waiting on the task", e))?;
+        self.drain_log();
+        match event {
+            None => {
+                if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                    return Err(MorunaError::Cancelled);
+                }
+                Ok(false)
+            }
+            Some(Event::Call {
+                call,
+                port,
+                request,
+            }) => {
+                self.call(ports, names, call, port, request)?;
+                Ok(true)
+            }
+            Some(Event::Refused { reason, .. }) => Err(self.failed(&format!(
+                "its record on its output was refused by the engine's check: {reason}"
+            ))),
+            Some(Event::Ended { .. }) => {
+                Err(self.failed("it ended while the engine offered a batch"))
+            }
+            Some(Event::Put { batch, .. }) => {
+                let _ = self.plane.drop_batch(batch);
+                Err(self.failed("it put a record before it was offered a batch"))
+            }
+            Some(Event::Released { .. } | Event::Freed { .. }) => Ok(true),
+        }
+    }
+
+    /// The record the task put, decoded in place and handed on as it lies; or copied into
+    /// the run's arena when the task would otherwise run out of windows to write in.
+    fn output(&mut self, out: BatchId) -> Result<Payload> {
+        let tier = if self.alloc.is_pinned() {
+            moruna_kernel::Tier::PinnedHost
+        } else {
+            moruna_kernel::Tier::Host
+        };
+        let windows = if self.rings {
+            layout::ring_sizes(self.plane.residency().budget).windows
+        } else {
+            // A task of the slots is granted a fresh window each time: a few held downstream
+            // cost only the budget.
+            4
+        };
+        if !layout::keep_in_place(self.held, windows) {
+            return self.land(out);
+        }
+        let payload = if let Some((view, offset, len)) = self.plane.batch_view(out) {
+            let ptr = moruna_plane::ringed::View::base(&*view) + offset as usize;
+            // SAFETY: the record lies at `offset` of the engine's mapping `view`, which the
+            // payload keeps; it was checked after the task's write access was taken back,
+            // and the plane gives its window to the task again only when the payload is
+            // dropped (`reap`), so nothing writes it meanwhile (DP-I4).
+            #[allow(unsafe_code)]
+            unsafe {
+                rings::payload_over(view, ptr, len, out, &self.released, tier)
+            }
+        } else {
+            let (memory, offset, len) = self
+                .plane
+                .plane
+                .batch(out)
+                .map_err(|e| plane_error(&self.name, "the record put", e))?;
+            let first = offset & !(PAGE - 1);
+            let within = (offset - first) as usize;
+            let span = layout::pages(offset + len).unwrap_or(u64::MAX) - first;
+            let mapping = memory.map_detached(first, span, map::READ).map_err(|e| {
+                kernel_error(format!(
+                    "image `{}`: mapping its record: {}",
+                    self.name,
+                    e.name()
+                ))
+            })?;
+            let ptr = mapping.addr() as usize + within;
+            // SAFETY: the record lies inside `mapping`, which the payload keeps; nothing
+            // writes a batch the engine holds (DP-I4), and its hold is dropped only when the
+            // payload is (`reap`).
+            #[allow(unsafe_code)]
+            unsafe {
+                rings::payload_over(Mapped(mapping), ptr, len, out, &self.released, tier)
+            }
+        };
+        match payload {
+            Ok(p) => {
+                self.held += 1;
+                self.kept += 1;
+                Ok(p)
+            }
+            Err(e) => {
+                // The hold went back with the failed buffer.
+                self.reap();
+                Err(e)
+            }
+        }
+    }
+
+    /// The record the task put, decoded in place and copied into the run's arena, its
+    /// window given back at once.
     fn land(&mut self, out: BatchId) -> Result<Payload> {
         let (memory, offset, len) = self
+            .plane
             .plane
             .batch(out)
             .map_err(|e| plane_error(&self.name, "the record put", e))?;
@@ -744,6 +972,7 @@ impl TaskState {
         self.plane
             .drop_batch(out)
             .map_err(|e| plane_error(&self.name, "dropping the record put", e))?;
+        self.landed += 1;
         Ok(landed?.0)
     }
 
@@ -800,6 +1029,7 @@ impl TaskState {
     /// looking at the run's cancel and the personality's answer meanwhile.
     fn wait(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<Seen> {
         loop {
+            self.reap();
             let deadline = moruna_svc::now().saturating_add(LOOK_NS);
             let event = self
                 .plane
@@ -964,6 +1194,7 @@ impl Kernel for ImageTask {
                         let (served, refused) = (e.served, e.refused.clone());
                         st.drain_log();
                         let footprint = st.footprint();
+                        let c = st.plane.counters();
                         tracing::info!(
                             target: "micro",
                             image = %st.name,
@@ -971,6 +1202,17 @@ impl Kernel for ImageTask {
                             refused = ?refused,
                             stage = st.stage,
                             %footprint,
+                            rings = st.rings,
+                            batches = st.sent,
+                            copied = st.copied,
+                            kept = st.kept,
+                            landed = st.landed,
+                            revokes = c.revokes,
+                            regrants = c.regrants,
+                            generations = c.generations,
+                            waits = c.waits,
+                            sleeps = c.sleeps,
+                            zeroed = st.plane.plane.zeroed(),
                             "image task exited 0"
                         );
                         Ok(())

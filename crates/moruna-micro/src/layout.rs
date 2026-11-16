@@ -83,9 +83,156 @@ pub fn line(body: &[u8]) -> Vec<u8> {
     l
 }
 
+/// What one of a record's bytes ranges is written with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Piece<'a> {
+    /// These bytes at this offset of the record.
+    Bytes(u64, &'a [u8]),
+    /// So many zeros at this offset.
+    Zeros(u64, u64),
+}
+
+/// How a record of `len` bytes is written: its framing at 0, each body buffer at its offset
+/// (in order, none overlapping, all within `len`), and every gap zero, so the task sees no
+/// byte the engine did not mean it to. `None` when the buffers do not fit.
+pub fn pieces<'a>(len: u64, framing: &'a [u8], body: &[(u64, &'a [u8])]) -> Option<Vec<Piece<'a>>> {
+    let mut out = vec![Piece::Bytes(0, framing)];
+    let mut end = framing.len() as u64;
+    if end > len {
+        return None;
+    }
+    for (offset, bytes) in body {
+        let stop = offset.checked_add(bytes.len() as u64)?;
+        if *offset < end || stop > len {
+            return None;
+        }
+        if *offset > end {
+            out.push(Piece::Zeros(end, offset - end));
+        }
+        out.push(Piece::Bytes(*offset, bytes));
+        end = stop;
+    }
+    if len > end {
+        out.push(Piece::Zeros(end, len - end));
+    }
+    Some(out)
+}
+
+/// The sizes of a ring task's plane, from the stage's plane budget (SDD 30 f.6): its input
+/// region a quarter of it, and two windows each an eighth, so the region, the rings object in
+/// use and one handed back with its records still held fit the budget together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RingSizes {
+    /// The input region's bytes.
+    pub region: u64,
+    /// The windows of a rings object.
+    pub windows: u64,
+    /// Each window's bytes.
+    pub window: u64,
+}
+
+/// The least region and window: a record of a small batch and its framing.
+pub const RING_MIN: u64 = 1 << 20;
+
+/// [`RingSizes`] for a plane of `budget` bytes, in whole pages.
+pub fn ring_sizes(budget: u64) -> RingSizes {
+    let quarter = (budget / 4) & !(PAGE - 1);
+    let eighth = (budget / 8) & !(PAGE - 1);
+    RingSizes {
+        region: quarter.clamp(RING_MIN, WINDOW_MAX),
+        windows: 2,
+        window: eighth.clamp(RING_MIN, WINDOW_MAX),
+    }
+}
+
+/// Whether the record a task put is kept where it is and handed on as it lies (no copy),
+/// or copied into the run's arena so its window goes back at once: kept while fewer than
+/// `windows - 1` records of the task's are still held downstream, so the task always has a
+/// window to write its next record in, whatever downstream holds.
+pub fn keep_in_place(held: u64, windows: u64) -> bool {
+    held + 1 < windows
+}
+
+/// Whether an image declares the ring protocol in its environment (`MORUNA_PLANE=rings`):
+/// the Python shim's layer sets it. Any other image is served on its descriptors 0 and 1.
+pub fn declares_rings(env: &[String]) -> bool {
+    env.iter().any(|e| e == "MORUNA_PLANE=rings")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p_a_record_is_its_framing_its_buffers_and_zeros() {
+        let framing = [1u8; 10];
+        let a = [2u8; 8];
+        let b = [3u8; 4];
+        let p = pieces(4096 + 64, &framing, &[(4096, &a), (4096 + 16, &b)]).unwrap();
+        assert_eq!(
+            p,
+            vec![
+                Piece::Bytes(0, &framing),
+                Piece::Zeros(10, 4086),
+                Piece::Bytes(4096, &a),
+                Piece::Zeros(4104, 8),
+                Piece::Bytes(4112, &b),
+                Piece::Zeros(4116, 44),
+            ]
+        );
+        assert_eq!(
+            pieces(10, &framing, &[]).unwrap(),
+            vec![Piece::Bytes(0, &framing)]
+        );
+        assert_eq!(pieces(4, &framing, &[]), None, "framing past the record");
+        assert_eq!(
+            pieces(4100, &framing, &[(4096, &a)]),
+            None,
+            "a buffer past it"
+        );
+        assert_eq!(
+            pieces(8192, &framing, &[(4, &a)]),
+            None,
+            "a buffer over the framing"
+        );
+        assert_eq!(pieces(8192, &framing, &[(u64::MAX, &a)]), None, "past u64");
+    }
+
+    #[test]
+    fn p_ring_sizes_fit_the_budget() {
+        const MIB: u64 = 1 << 20;
+        let s = ring_sizes(1 << 30);
+        assert_eq!(
+            s,
+            RingSizes {
+                region: 256 * MIB,
+                windows: 2,
+                window: 128 * MIB
+            }
+        );
+        assert!(s.region + 2 * s.windows * s.window <= 1 << 30);
+        let small = ring_sizes(MIB);
+        assert_eq!((small.region, small.window), (RING_MIN, RING_MIN));
+        assert_eq!(ring_sizes(16 * MIB + 5).region % PAGE, 0);
+        assert_eq!(ring_sizes(u64::MAX).region, WINDOW_MAX);
+    }
+
+    #[test]
+    fn p_a_record_is_kept_in_place_while_a_window_stays_free() {
+        assert!(keep_in_place(0, 2));
+        assert!(!keep_in_place(1, 2));
+        assert!(keep_in_place(2, 4));
+        assert!(!keep_in_place(3, 4));
+        assert!(!keep_in_place(0, 1));
+    }
+
+    #[test]
+    fn p_an_image_declares_the_rings_in_its_environment() {
+        let env = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(declares_rings(&env(&["PATH=/bin", "MORUNA_PLANE=rings"])));
+        assert!(!declares_rings(&env(&["MORUNA_PLANE=stdio"])));
+        assert!(!declares_rings(&env(&[])));
+    }
 
     #[test]
     fn kd2_t7_windows_are_whole_pages_within_their_bounds() {
