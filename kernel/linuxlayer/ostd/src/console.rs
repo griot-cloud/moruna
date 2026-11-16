@@ -13,6 +13,11 @@ impl Write for Console {
     }
 }
 
+/// Writes bytes to the console as they are.
+pub fn send(bytes: &[u8]) {
+    crate::backend::debug_write(bytes);
+}
+
 /// Prints to the console.
 pub fn early_print(args: fmt::Arguments) {
     let _ = Console.write_fmt(args);

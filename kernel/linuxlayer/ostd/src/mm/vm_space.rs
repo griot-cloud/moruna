@@ -118,8 +118,9 @@ static SHOWN: RawLock<BTreeMap<ProgramProcess, Weak<VmSpace>>> = RawLock::new(BT
 static OWN: spin::Once<fn() -> Option<ProgramProcess>> = spin::Once::new();
 
 /// Injects how a thread finds the process its program runs in, which
-/// [`VmSpace::activate`] shows the space in; once. In host tests without one, each thread
-/// is an emulated process of its own.
+/// [`VmSpace::activate`] shows the space in; once. Without one it is the personality's own
+/// process (`backend::self_process`), and in host tests each thread is an emulated process
+/// of its own.
 pub fn inject_own_process(own: fn() -> Option<ProgramProcess>) {
     OWN.call_once(|| own);
 }
@@ -131,7 +132,7 @@ fn own_process() -> Option<ProgramProcess> {
     #[cfg(not(target_os = "none"))]
     return Some(emulated::own_process());
     #[cfg(target_os = "none")]
-    None
+    crate::backend::self_process().map(ProgramProcess::from_raw)
 }
 
 /// The program's whole lower range, for an unmap of all of it.

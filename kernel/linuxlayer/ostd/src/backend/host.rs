@@ -9,7 +9,7 @@ use alloc::{boxed::Box, vec::Vec};
 use core::{
     cell::{Cell, RefCell},
     ops::Range,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
     time::Duration,
 };
 use std::{
@@ -122,6 +122,24 @@ pub(crate) fn program_gs_base() -> usize {
 
 pub(crate) fn set_program_gs_base(value: usize) {
     GS_BASE.with(|c| c.set(value));
+}
+
+/// What names the calling thread for [`interrupt`]: its slot's address.
+pub(crate) fn thread_token() -> usize {
+    CURRENT.with(|c| c as *const Cell<usize> as usize)
+}
+
+static INTERRUPTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Interrupts the thread `token` names: on the host no thread runs a program, so this
+/// only counts.
+pub(crate) fn interrupt(_token: usize) {
+    INTERRUPTS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// How many interrupts were asked for.
+pub(crate) fn interrupts() -> usize {
+    INTERRUPTS.load(Ordering::SeqCst)
 }
 
 /// The calling thread's task slot.

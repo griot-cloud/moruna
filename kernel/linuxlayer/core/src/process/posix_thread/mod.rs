@@ -253,6 +253,11 @@ impl PosixThread {
         if let Some((waker, _)) = &*self.signalled_waker.lock() {
             waker.wake_up();
         }
+        // User space: a thread running the program comes back to the personality only when
+        // the core interrupts it, where a kernel's timer interrupt would bring it back.
+        if let Some(task) = self.task.upgrade() {
+            task.interrupt();
+        }
     }
 
     /// Enqueues a thread-directed signal.

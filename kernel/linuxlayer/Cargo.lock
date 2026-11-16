@@ -526,6 +526,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "linuxlayer-launch"
+version = "0.19.0"
+dependencies = [
+ "moruna-abi",
+ "moruna-loader",
+ "moruna-sys",
+]
+
+[[package]]
 name = "linuxlayer-osdk-frame-allocator"
 version = "0.19.0"
 dependencies = [
@@ -547,6 +556,7 @@ dependencies = [
  "bitvec",
  "inherit-methods-macro",
  "inventory",
+ "linuxlayer-launch",
  "linuxlayer-ostd-macros",
  "log",
  "moruna-abi",
@@ -564,6 +574,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "linuxlayer-personality"
+version = "0.19.0"
+dependencies = [
+ "aster-console",
+ "component",
+ "linuxlayer-launch",
+ "linuxlayer-ostd",
+ "moruna-linuxlayer",
+ "moruna-sys",
 ]
 
 [[package]]
@@ -683,6 +705,10 @@ dependencies = [
  "xmas-elf",
  "zerocopy",
 ]
+
+[[package]]
+name = "moruna-loader"
+version = "0.1.0"
 
 [[package]]
 name = "moruna-sys"

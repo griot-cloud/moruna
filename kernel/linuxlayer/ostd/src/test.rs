@@ -3,7 +3,7 @@
 //! Host tests of the user-space swaps: the futex locks, the wait queues' sleep, RCU's
 //! epochs, the fault-tolerant copy, frames, the entry frame and the clocks.
 
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::vec;
 use core::{
     sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     time::Duration,
@@ -15,8 +15,8 @@ use crate::{
     backend,
     cpu::{CpuId, PinCurrentCpu, all_cpus, num_cpus},
     mm::{
-        FallibleVmRead, FallibleVmWrite, Frame, FrameAllocOptions, HasPaddr, HasSize, PAGE_SIZE,
-        Segment, Split, UFrame, USegment, VmIo, VmReader, VmWriter,
+        FallibleVmRead, FallibleVmWrite, Frame, FrameAllocOptions, PAGE_SIZE, Segment, Split,
+        UFrame, USegment, VmIo, VmReader, VmWriter,
         dma::{DmaCoherent, DmaStream, FromDevice, ToDevice},
         frame::AnyFrameMeta,
         io::util::HasVmReaderWriter,
@@ -25,7 +25,6 @@ use crate::{
     sync::{Mutex, RcuOption, RwLock, SpinLock, WaitQueue, Waiter, raw::RawLock},
     task::{Task, TaskOptions, disable_preempt},
     user::{ReturnReason, UserContextApi, UserMode},
-    util::id_set::Id,
 };
 
 extern crate std;
@@ -493,6 +492,7 @@ fn boot_info_and_power_types() {
     assert!(crate::arch::read_random().is_some());
     let _ = crate::arch::tsc_freq();
     crate::early_println!("early console: {}", 1);
+    crate::console::send(b"raw bytes\n");
     crate::log::init(crate::log::LevelFilter::Info);
     crate::info!("logged");
     let irq = crate::irq::disable_local();
@@ -654,13 +654,11 @@ fn atomic_cpu_ids_and_either() {
 }
 
 mod vm {
-    use alloc::sync::Arc;
-
     use crate::{
         Error,
         mm::{
-            CachePolicy, FallibleVmRead, FallibleVmWrite, FrameAllocOptions, HasPaddr, PAGE_SIZE,
-            PageFlags, PageProperty, UFrame, VmIo, VmReader, VmSpace, VmWriter,
+            CachePolicy, FallibleVmRead, FallibleVmWrite, FrameAllocOptions, PAGE_SIZE, PageFlags,
+            PageProperty, UFrame, VmIo, VmReader, VmSpace, VmWriter,
             tlb::{TlbFlushOp, TlbFlusher},
             vm_space::VmQueriedItem,
         },
@@ -909,5 +907,5 @@ fn panic_power_io_and_scheduler_stand_ins() {
     crate::timer::tick();
     assert!(HALVES.load(Ordering::Relaxed) >= 1);
     crate::task::halt_cpu();
-    let _ = crate::arch::cpu::context::CpuException::new(14, 2, 0x1000);
+    let _ = CpuException::new(14, 2, 0x1000);
 }

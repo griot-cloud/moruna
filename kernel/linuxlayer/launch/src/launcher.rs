@@ -1,0 +1,120 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! The launcher, on Moruna's core: a created process given the personality.
+
+use alloc::vec::Vec;
+
+use moruna_sys::{Error, Handle, Memory, Process, Result, Rights, map, personality};
+
+use crate::{PAGE, Plan, REGION_BASE, REGION_LEN, STACK_SIZE, segment_flags};
+
+/// Why a launch failed.
+#[derive(Debug)]
+pub enum LaunchError {
+    /// The image cannot be planned.
+    Plan(crate::PlanError),
+    /// A call failed: what it was doing, and the error.
+    Call(&'static str, Error),
+}
+
+fn call<T>(r: Result<T>, what: &'static str) -> core::result::Result<T, LaunchError> {
+    r.map_err(|e| LaunchError::Call(what, e))
+}
+
+/// Creates a process named `name` from the process resource `resource`, gives it the
+/// personality image `image` (its ELF bytes) and the handles `grants` (each moved in under
+/// its slot name, a slot with no handle left out; the process's own handle is added as
+/// `self`), and starts its first thread in the personality.
+pub fn launch(
+    resource: &Handle,
+    name: &str,
+    image: &[u8],
+    grants: &mut [(Option<Handle>, &str)],
+) -> core::result::Result<Process, LaunchError> {
+    let plan = Plan::new(image).map_err(LaunchError::Plan)?;
+    let process = call(Process::create(resource, name), "process_create")?;
+
+    // The image's segments, each an object of its own that every process of the container
+    // shares: the personality's state is the container's.
+    for s in &plan.segments {
+        let len = s.page_end() - s.page_start();
+        let object = call(Memory::create(len), "a segment's object")?;
+        {
+            let m = call(object.map(0, len, map::WRITE), "mapping a segment's object")?;
+            let file = &image[s.offset as usize..(s.offset + s.filesz) as usize];
+            call(
+                m.write((s.vaddr - s.page_start()) as usize, file),
+                "writing a segment",
+            )?;
+        }
+        call(
+            process.map(Some(&object.0), 0, len, s.page_start(), segment_flags(s)),
+            "mapping a segment",
+        )?;
+    }
+
+    // The first thread's stack: zero pages, whose block the thread writes itself.
+    call(
+        process.map(None, 0, STACK_SIZE, plan.stack, map::READ | map::WRITE),
+        "mapping the first stack",
+    )?;
+
+    let own = call(
+        process.0.duplicate(Rights::READ | Rights::WRITE),
+        "duplicating the process's own handle",
+    )?;
+    let mut all: Vec<(Option<Handle>, &str)> = Vec::new();
+    for (handle, name) in grants.iter_mut() {
+        if let Some(handle) = handle.take() {
+            all.push((Some(handle), *name));
+        }
+    }
+    all.push((Some(own), "self"));
+    let start_page = call(process.grant(&mut all), "process_grant")?;
+
+    let mut args = [0u8; crate::STACK_ARGS as usize];
+    args[..8].copy_from_slice(&start_page.to_le_bytes());
+    call(
+        process.write(plan.stack_pointer(), &args),
+        "writing the first thread's arguments",
+    )?;
+    call(
+        personality::personality_set_with_copy(
+            &process,
+            REGION_BASE,
+            REGION_LEN,
+            plan.copy.clone(),
+            plan.recovery,
+        ),
+        "personality_set",
+    )?;
+    call(
+        process.launch(plan.entry, plan.stack_pointer(), 0),
+        "process_launch",
+    )?;
+    Ok(process)
+}
+
+/// The length of `object` in bytes, whole pages: the longest mapping from its start the core
+/// accepts (a mapping past the end is `OutOfRange`), found by doubling, then halving.
+pub fn object_len(object: &Memory) -> u64 {
+    let fits = |pages: u64| object.map(0, pages * PAGE, 0).is_ok();
+    if !fits(1) {
+        return 0;
+    }
+    let mut lo = 1;
+    let mut hi = 2;
+    while fits(hi) {
+        lo = hi;
+        hi *= 2;
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo * PAGE
+}
