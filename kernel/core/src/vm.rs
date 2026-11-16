@@ -379,11 +379,8 @@ impl Space {
         if len == 0 {
             return;
         }
-        let guard = disable_preempt();
-        let range = va as usize..(va + len) as usize;
-        if let Ok(mut cursor) = self.vm.cursor_mut(&guard, &range) {
-            cursor.unmap(len as usize);
-        }
+        // stream B1 hook: the tables of the regions the range covers whole go too.
+        unmap_in(&self.vm, va, len);
         // Stream B1: the program's table holds no entry the space's does not.
         self.program.unmap(va, len, &self.account);
     }
@@ -1371,8 +1368,6 @@ impl Space {
 use alloc::collections::BTreeSet;
 use core::ops::Range;
 
-use ostd::mm::tlb::TlbFlushOp;
-
 use crate::process::Thread;
 
 /// The program's table of a process with a personality.
@@ -1398,11 +1393,7 @@ impl ProgramTable {
         let Some(program) = self.0.lock().clone() else {
             return;
         };
-        let guard = disable_preempt();
-        let range = va as usize..(va + len) as usize;
-        if let Ok(mut cursor) = program.vm.cursor_mut(&guard, &range) {
-            cursor.unmap(len as usize);
-        }
+        unmap_in(&program.vm, va, len);
         let end = va + len;
         let mut tables = program.tables.lock();
         for (level, size) in charge::TABLE_REGIONS.iter().copied().enumerate() {
@@ -1414,6 +1405,32 @@ impl ProgramTable {
             }
         }
     }
+}
+
+/// Unmaps `va .. va + len` of `vm`, and the tables of the regions it covers whole. OSTD's
+/// cursor locks the lowest table that covers its range, and its unmap can take out the
+/// tables under that one but not that one: a cursor over exactly one 2 MiB region (or
+/// 1 GiB, or 512 GiB) would leave the region's own table, empty, until the region above
+/// empties. A range of whole 2 MiB regions is therefore unmapped through a cursor that
+/// reaches one page past it (or one before it, at the top of user space), which locks a
+/// table above them.
+fn unmap_in(vm: &VmSpace, va: u64, len: u64) {
+    const REGION: u64 = charge::TABLE_REGIONS[0];
+    let end = va + len;
+    let whole = va.is_multiple_of(REGION) && end.is_multiple_of(REGION);
+    let (from, to) = match (whole, va.checked_sub(PAGE_SIZE)) {
+        (true, _) if end + PAGE_SIZE <= map_end() => (va, end + PAGE_SIZE),
+        (true, Some(before)) => (before, end),
+        _ => (va, end),
+    };
+    let guard = disable_preempt();
+    let Ok(mut cursor) = vm.cursor_mut(&guard, &(from as usize..to as usize)) else {
+        return;
+    };
+    if from != va && cursor.jump(va as usize).is_err() {
+        return;
+    }
+    cursor.unmap(len as usize);
 }
 
 impl Drop for Program {
@@ -1561,6 +1578,23 @@ impl Space {
                 Some((object, offset))
             }
             _ => None,
+        }
+    }
+
+    /// The bytes of the hole holding `addr` at the deepest table the space has there: 4096
+    /// where a 4 KiB table holds it, 2 MiB where only the table above does, and so on;
+    /// zero where a page is mapped (probe ABI only).
+    #[cfg(feature = "probe")]
+    pub fn table_gap(&self, addr: u64) -> u64 {
+        let page = addr & !(PAGE_SIZE - 1);
+        let guard = disable_preempt();
+        let range = page as usize..(page + PAGE_SIZE) as usize;
+        let Ok(mut cursor) = self.vm.cursor(&guard, &range) else {
+            return 0;
+        };
+        match cursor.query() {
+            Ok((hole, None)) => (hole.end - hole.start) as u64,
+            _ => 0,
         }
     }
 
