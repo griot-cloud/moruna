@@ -64,33 +64,47 @@ pub const STACK_ARGS: u64 = 16;
 
 /// The slots the personality reads from its start page.
 pub mod slot {
+    /// What starts the name of every slot the personality takes for itself. Every other name
+    /// on its start page is a handle granted to its program (`run_granted`, `run_plane`), which
+    /// the program's own start page names; a program's names never start with it.
+    pub const PREFIX: &str = "lx.";
     /// The process's own handle, with `READ` and `WRITE`; the launcher adds it.
-    pub const SELF: &str = "self";
+    pub const SELF: &str = "lx.self";
     /// The core's console: the personality's log, and a task's text with no log ring.
-    pub const CONSOLE: &str = "console";
+    pub const CONSOLE: &str = "lx.console";
     /// A booted test's initramfs, a memory object.
-    pub const INITRAMFS: &str = "initramfs";
+    pub const INITRAMFS: &str = "lx.initramfs";
     /// The command line, a memory object: `init=PROGRAM`, then `--` and its arguments.
-    pub const CMDLINE: &str = "cmdline";
+    pub const CMDLINE: &str = "lx.cmdline";
     /// A task's own connection to the image filesystem (`moruna.imagefs` 3.0), its hello
     /// not yet said: the task's root.
-    pub const FILESYSTEM: &str = "filesystem";
+    pub const FILESYSTEM: &str = "lx.filesystem";
     /// A task's scratch account: its limit is what `/tmp` holds.
-    pub const SCRATCH: &str = "scratch";
+    pub const SCRATCH: &str = "lx.scratch";
     /// A task's input slot, to wait on: attached as the plane's slot 0.
-    pub const INPUT: &str = "input";
+    pub const INPUT: &str = "lx.input";
     /// A task's output slot, to wait on: attached after the input.
-    pub const OUTPUT: &str = "output";
+    pub const OUTPUT: &str = "lx.output";
     /// The engine's log ring, a memory object.
-    pub const LOG: &str = "log";
+    pub const LOG: &str = "lx.log";
     /// A process resource with `WRITE`: what `fork` clones the task's processes from.
-    pub const PROCESSES: &str = "processes";
+    pub const PROCESSES: &str = "lx.processes";
     /// The task's command, a memory object in [`command`]'s encoding: the program's path,
     /// its arguments and its environment, exactly as given.
-    pub const COMMAND: &str = "command";
+    pub const COMMAND: &str = "lx.command";
     /// A memory object of [`report::LEN`] bytes, writable, where the personality says how
     /// the task ended ([`report`]).
-    pub const REPORT: &str = "report";
+    pub const REPORT: &str = "lx.report";
+    /// Whether `name` names a handle granted to the program, not one of the personality's.
+    pub fn is_program(name: &str) -> bool {
+        !name.starts_with(PREFIX)
+    }
+
+    /// Whether `name` may name a handle granted to a program: not empty, at most
+    /// `limits::NAME_MAX` bytes, and not the personality's.
+    pub fn program_name_ok(name: &str) -> bool {
+        !name.is_empty() && name.len() <= moruna_abi::limits::NAME_MAX && is_program(name)
+    }
 }
 
 /// How a task ended, as the personality writes it for its launcher when its first program

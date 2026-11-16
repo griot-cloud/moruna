@@ -42,7 +42,7 @@ use linuxlayer_launch::{
     launcher::{self, LaunchError, Options},
     report, slot,
 };
-use linuxlayer_server::{Output, echo, ended, process_name, request_ok, ring_lines};
+use linuxlayer_server::{Output, echo, ended, process_name, program_names, request_ok, ring_lines};
 use moruna_record::ring::Ring;
 use moruna_svc::{
     Channel, Completions, ConnectionId, Console, Context, DEADLINE_INFINITE, Decoder, Dispatcher,
@@ -244,8 +244,6 @@ struct End {
     _process: Process,
     report: Memory,
     ring: Option<Rc<RefCell<TaskRing>>>,
-    /// `run_granted`'s handles, held for the task's life.
-    _held: Vec<Handle>,
     shared: Rc<RefCell<Shared>>,
     pending: Option<Pending>,
 }
@@ -293,7 +291,6 @@ struct Started {
     process: Process,
     report: Memory,
     ring: Option<Rc<RefCell<TaskRing>>>,
-    held: Vec<Handle>,
 }
 
 /// Makes `job`'s process with the personality in it and starts it.
@@ -341,7 +338,10 @@ fn launch_job(
         linux::Error::NoProcess
     })?;
 
-    let (account, scratch, log, launch_plane, held) = match (plane, grant) {
+    // The program's own handles, as the old server gave them: `run_granted`'s, and for
+    // `run_plane` an observer of its account; with either, a read-only export of the image's
+    // root as `filesystem`.
+    let (account, scratch, log, launch_plane, mut program) = match (plane, grant) {
         (Some(p), _) => {
             if p.assets.is_some() {
                 println!(
@@ -349,19 +349,33 @@ fn launch_job(
                     "linux: {}: its assets are not mounted on the personality yet", name
                 );
             }
+            let observer = p
+                .account
+                .duplicate(Rights::READ | Rights::TRANSFER)
+                .map_err(|_| linux::Error::BadGrant)?;
             let plane = launcher::Plane {
                 input: p.input.map(Slot),
                 output: p.output.map(Slot),
                 port: p.port,
             };
-            (Some(p.account), None, Some(p.log), Some(plane), Vec::new())
+            let program = vec![(String::from("account"), Some(observer))];
+            (Some(p.account), None, Some(p.log), Some(plane), program)
         }
         (None, Some(g)) => {
-            let held = g.handles.into_iter().map(|(_, h)| h).collect();
-            (Some(g.account), g.scratch, None, None, held)
+            let (names, handles): (Vec<Vec<u8>>, Vec<Handle>) =
+                g.handles.into_iter().map(|(n, h)| (n.0, h)).unzip();
+            let names = program_names(&names).ok_or(linux::Error::BadGrant)?;
+            let program = names
+                .into_iter()
+                .zip(handles.into_iter().map(Some))
+                .collect();
+            (Some(g.account), g.scratch, None, None, program)
         }
         (None, None) => (None, None, None, None, Vec::new()),
     };
+    if account.is_some() {
+        program.push((String::from("filesystem"), Some(export_root(fs, out)?)));
+    }
     let (log, ring) = match log {
         Some(log) => (log, None),
         None => {
@@ -384,6 +398,7 @@ fn launch_job(
         (Some(command.0), slot::COMMAND),
         (Some(report_grant), slot::REPORT),
     ];
+    grants.extend(program.iter_mut().map(|(n, h)| (h.take(), n.as_str())));
     let escrow = Cell::new(None);
     let mut publish = |process: &Process| {
         escrow.set(Some(guardian.publish(process)?));
@@ -417,8 +432,25 @@ fn launch_job(
         process,
         report,
         ring,
-        held,
     })
+}
+
+/// A read-only export of the image's root, on a connection of its own to the image
+/// filesystem: a program's `filesystem`.
+fn export_root(fs: &Channel, out: &Console) -> Result<Handle, linux::Error> {
+    let fail = |what: &str, e: &dyn core::fmt::Debug| {
+        println!(out, "linux: FAIL: {} the image filesystem: {:?}", what, e);
+        linux::Error::NoProcess
+    };
+    let channel = moruna_svc::connect(fs).map_err(|e| fail("connecting to", &e))?;
+    let mut client =
+        imagefs_protocol::imagefs::Client::connect(channel, moruna_svc::deadline_in(LAYERS_WAIT))
+            .map_err(|e| fail("hello to", &e))?;
+    client.core().set_timeout(LAYERS_WAIT);
+    let root = client
+        .export_directory(imagefs_protocol::Bytes(b"/".to_vec()))
+        .map_err(|e| fail("exporting the root of", &e))?;
+    Ok(root.0)
 }
 
 /// A memory object holding `bytes`, whole pages.
@@ -490,7 +522,6 @@ fn start_job(
         _process: started.process,
         report: started.report,
         ring: started.ring,
-        _held: started.held,
         shared: shared.clone(),
         pending: Some(pending),
     };

@@ -64,9 +64,9 @@ fn boot(out: &Console) -> Result<i64, alloc::string::String> {
         "linux",
         mapping.bytes(),
         &mut [
-            (Some(console), "console"),
-            (Some(initramfs), "initramfs"),
-            (slot("cmdline"), "cmdline"),
+            (Some(console), linuxlayer_launch::slot::CONSOLE),
+            (Some(initramfs), linuxlayer_launch::slot::INITRAMFS),
+            (slot("cmdline"), linuxlayer_launch::slot::CMDLINE),
             (Some(processes), linuxlayer_launch::slot::PROCESSES),
         ],
     )

@@ -10,11 +10,11 @@
 mod image {
     extern crate alloc;
 
-    use alloc::{boxed::Box, string::String};
+    use alloc::{boxed::Box, string::String, vec::Vec};
     use core::arch::global_asm;
 
     use linuxlayer_launch::{launcher::object_len, slot};
-    use moruna_linuxlayer::start::{TaskStart, start_task};
+    use moruna_linuxlayer::start::{ProgramGrant, TaskStart, start_task};
     use moruna_sys::{Account, Channel, Memory, Usage, start};
 
     /// The scratch's limit when the launcher grants no scratch account.
@@ -30,6 +30,26 @@ mod image {
         "ud2",
         entry = sym entry,
     );
+
+    /// The handles granted to the task's program: every entry of the start page whose name is
+    /// not one of the personality's own slots.
+    fn program_grants() -> Vec<ProgramGrant> {
+        let names: Vec<(&'static str, moruna_sys::Rights)> = (0..start::count())
+            .filter_map(start::entry)
+            .filter(|(_, _, name)| slot::is_program(name))
+            .map(|(_, rights, name)| (name, rights))
+            .collect();
+        names
+            .into_iter()
+            .filter_map(|(name, rights)| {
+                Some(ProgramGrant {
+                    name: String::from(name),
+                    handle: start::take(name)?,
+                    rights,
+                })
+            })
+            .collect()
+    }
 
     extern "C" fn entry(start_page: u64) -> ! {
         start::init(start_page);
@@ -79,6 +99,7 @@ mod image {
                     (log, len)
                 }),
                 name: String::from(start::process_name()),
+                program: program_grants(),
                 report: start::take(slot::REPORT).map(Memory),
                 command: start::take(slot::COMMAND).and_then(|c| {
                     let c = linuxlayer_launch::command::decode(mapped(Memory(c)))?;

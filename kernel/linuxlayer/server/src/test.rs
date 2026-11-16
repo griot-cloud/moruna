@@ -125,3 +125,24 @@ fn echoed_lines_name_their_program() {
     assert_eq!(echo("lx-hello", b"hi there"), "linux lx-hello: hi there");
     assert_eq!(echo("lx-x", &[0xff]).to_string(), "linux lx-x: \u{fffd}");
 }
+
+#[test]
+fn a_program_s_handles_need_names_of_its_own() {
+    let names =
+        |list: &[&str]| -> Vec<Vec<u8>> { list.iter().map(|n| n.as_bytes().to_vec()).collect() };
+    assert_eq!(
+        program_names(&names(&["vsock", "linux", "image"])).unwrap(),
+        ["vsock", "linux", "image"]
+    );
+    assert_eq!(program_names(&[]).unwrap().len(), 0);
+    for bad in [
+        &["lx.console"][..],
+        &["filesystem"],
+        &[""],
+        &["a", "a"],
+        &["x23456789012345678901234567890123"],
+    ] {
+        assert!(program_names(&names(bad)).is_none(), "{bad:?}");
+    }
+    assert!(program_names(&[vec![0xff]]).is_none());
+}

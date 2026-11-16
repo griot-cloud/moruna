@@ -47,7 +47,22 @@ pub struct TaskStart {
     pub command: Option<super::TaskCommand>,
     /// Where to write how the task ended (`linuxlayer_launch::report`), if anywhere.
     pub report: Option<Memory>,
+    /// The handles granted to the task's program (`run_granted`, `run_plane`): every entry of
+    /// the start page whose name is not the personality's (`linuxlayer_launch::slot`).
+    pub program: Vec<ProgramGrant>,
 }
+
+/// A handle granted to the task's program, under its name on the program's start page.
+pub struct ProgramGrant {
+    pub name: String,
+    pub handle: Handle,
+    pub rights: moruna_sys::Rights,
+}
+
+/// The program's handles, held until they are moved into the program's own handle table
+/// (`architecture/data-os.md` §4, a program's native calls); the program cannot reach them
+/// here.
+static PROGRAM: SpinLock<Vec<ProgramGrant>> = SpinLock::new(Vec::new());
 
 /// The report's mapping, kept until the task ends.
 static REPORT: SpinLock<Option<Mapping<'static>>> = SpinLock::new(None);
@@ -76,6 +91,7 @@ pub fn start_task(start: TaskStart) -> core::result::Result<(), StartError> {
     if let Some(command) = start.command {
         super::set_command(command);
     }
+    *PROGRAM.lock() = start.program;
     if let Some(memory) = start.report {
         let memory: &'static Memory = Box::leak(Box::new(memory));
         let len = linuxlayer_launch::report::LEN as u64;

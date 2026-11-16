@@ -49,6 +49,25 @@ pub fn request_ok(path: &[u8], argv: &[Vec<u8>], env: &[Vec<u8>]) -> bool {
         && argv.iter().chain(env).all(|b| !b.contains(&0))
 }
 
+/// The names of `run_granted`'s handles, as they go on the program's start page: each UTF-8,
+/// at most `limits::NAME_MAX` bytes, none the personality's (`linuxlayer_launch::slot`), none
+/// `filesystem` (the server adds the image's root under it), none repeated. `None` refuses
+/// the grant.
+pub fn program_names(names: &[Vec<u8>]) -> Option<Vec<String>> {
+    let mut out: Vec<String> = Vec::with_capacity(names.len());
+    for name in names {
+        let name = core::str::from_utf8(name).ok()?;
+        let ok = linuxlayer_launch::slot::program_name_ok(name)
+            && name != "filesystem"
+            && !out.iter().any(|n| n == name);
+        if !ok {
+            return None;
+        }
+        out.push(String::from(name));
+    }
+    Some(out)
+}
+
 /// A program's standard output and error, as `Ended::output` holds them: the first
 /// `OUTPUT_MAX` bytes, and a count of the rest.
 #[derive(Debug, Default, PartialEq, Eq)]

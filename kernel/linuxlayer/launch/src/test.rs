@@ -155,3 +155,20 @@ fn a_report_round_trips_and_a_missing_one_reads_as_none() {
     lying[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(decode(&lying), None);
 }
+
+#[test]
+fn the_personality_s_slots_are_apart_from_the_program_s() {
+    use crate::slot::*;
+    let own = [
+        SELF, CONSOLE, INITRAMFS, CMDLINE, FILESYSTEM, SCRATCH, INPUT, OUTPUT, LOG, PROCESSES,
+        COMMAND, REPORT,
+    ];
+    for name in own {
+        assert!(name.starts_with(PREFIX) && !is_program(name) && !program_name_ok(name));
+    }
+    assert!(program_name_ok("vsock") && program_name_ok("filesystem"));
+    assert!(program_name_ok(&"x".repeat(32)));
+    assert!(!program_name_ok(&"x".repeat(33)));
+    assert!(!program_name_ok(""));
+    assert!(!program_name_ok("lx.anything"));
+}

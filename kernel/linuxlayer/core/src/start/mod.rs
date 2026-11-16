@@ -29,7 +29,7 @@ mod test;
 mod text;
 
 #[cfg(target_os = "none")]
-pub use self::moruna::{StartError, TaskStart, start_task};
+pub use self::moruna::{ProgramGrant, StartError, TaskStart, start_task};
 use crate::prelude::*;
 
 /// A task's program: its path on the image, its arguments (`argv[0]` included) and its

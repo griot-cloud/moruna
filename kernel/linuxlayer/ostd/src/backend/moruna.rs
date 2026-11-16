@@ -311,7 +311,7 @@ pub(crate) fn spawn(f: Box<dyn FnOnce() + Send>) -> Result<(), ()> {
 }
 
 pub(crate) fn debug_write(bytes: &[u8]) {
-    if let Some(console) = moruna_sys::start::peek("console") {
+    if let Some(console) = moruna_sys::start::peek(linuxlayer_launch::slot::CONSOLE) {
         let _ = raw::debug_write(console, bytes);
     }
 }
