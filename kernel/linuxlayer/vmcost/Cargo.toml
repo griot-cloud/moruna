@@ -1,0 +1,26 @@
+# Stream B2-vm's measurement: what a page costs the personality under KVM (one boot, not a
+# test). Its own workspace, so the Linux layer's workspace and its host tests never build it;
+# `cost.sh` builds it for the Moruna user target.
+[workspace]
+
+[package]
+name = "linuxlayer-vmcost"
+description = "What a page costs the Linux personality: process_map a page against fault-around, protection, unmapping, the entry's round trip, the pager, and process_clone against a replay"
+version = "0.19.0"
+edition = "2024"
+license = "MPL-2.0"
+publish = false
+
+[dependencies]
+moruna-abi = { path = "../../abi", version = "=0.1.0" }
+moruna-sys = { path = "../../sys", version = "=0.1.0" }
+
+[[bin]]
+name = "b2vm-cost"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
