@@ -584,7 +584,10 @@ mod tests {
         let last = qemu_args(&many[..DISKS_MAX]).unwrap();
         assert!(last.last().unwrap().contains("addr=0x14.0x7,"), "{last:?}");
         let one = qemu_args(&many[..1]).unwrap();
-        assert!(one[3].contains("addr=0x10.0x0,disable"), "one disk alone: {one:?}");
+        assert!(
+            one[3].contains("addr=0x10.0x0,disable"),
+            "one disk alone: {one:?}"
+        );
         assert!(qemu_args(&[]).unwrap().is_empty());
         let relative = Opened {
             path: PathBuf::from("f"),

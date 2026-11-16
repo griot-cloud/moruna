@@ -446,6 +446,32 @@ impl NativeRun {
             &RunDevices::default(),
         )
     }
+    /// [`Self::start_with`] through the explicit TEST-ONLY TCG proof launch, as
+    /// [`Self::start_prepared_tcg_proof`] is: never a KVM fallback, and no KVM figure follows.
+    #[cfg(feature = "native-tcg-proof")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_tcg_proof_with(
+        admission: Admission<'_>,
+        descriptor: &Path,
+        budget: Budget,
+        runtime_dir: &Path,
+        tools: Tools<'_>,
+        spec: Inbound,
+        deadline: Instant,
+        devices: &RunDevices,
+    ) -> core::result::Result<Self, StartError> {
+        Self::start_launched(
+            admission,
+            descriptor,
+            budget,
+            runtime_dir,
+            tools,
+            spec,
+            deadline,
+            devices,
+            moruna_vmm::microkernel::launch_tcg_proof_with,
+        )
+    }
     /// [`Self::start`] with the run's own devices: its data disks, bound to the image's
     /// declared inputs, its output disk, and where its vCPUs run (`moruna_vmm::data`).
     #[allow(clippy::too_many_arguments)]
@@ -458,6 +484,30 @@ impl NativeRun {
         spec: Inbound,
         deadline: Instant,
         devices: &RunDevices,
+    ) -> core::result::Result<Self, StartError> {
+        Self::start_launched(
+            admission,
+            descriptor,
+            budget,
+            runtime_dir,
+            tools,
+            spec,
+            deadline,
+            devices,
+            moruna_vmm::microkernel::launch_with,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn start_launched(
+        admission: Admission<'_>,
+        descriptor: &Path,
+        budget: Budget,
+        runtime_dir: &Path,
+        tools: Tools<'_>,
+        spec: Inbound,
+        deadline: Instant,
+        devices: &RunDevices,
+        launch: NodeLauncher,
     ) -> core::result::Result<Self, StartError> {
         if Instant::now() >= deadline {
             return Err(StartError {
@@ -476,7 +526,7 @@ impl NativeRun {
             runtime_dir,
             NodeBackend {
                 tools,
-                launch: moruna_vmm::microkernel::launch_with,
+                launch,
                 devices,
             },
             prepared,

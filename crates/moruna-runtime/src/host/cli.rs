@@ -1364,7 +1364,22 @@ fn run_vm(
             vcpu_cpus: data.vcpu_cpus.clone(),
         };
         output_disk = devices.output.clone();
-        let mut run = super::native::NativeRun::start_with(
+        // A build with the explicit TCG proof (tests only) boots without KVM when asked; a
+        // production build has no such start.
+        #[cfg(feature = "native-tcg-proof")]
+        let tcg = std::env::var_os("MORUNA_TCG_PROOF").is_some_and(|v| v == "1");
+        #[cfg(not(feature = "native-tcg-proof"))]
+        let tcg = false;
+        if tcg {
+            eprintln!("moruna run --vm: the explicit TCG proof boot (tests only): no KVM figure");
+            facts.insert("accel".into(), "tcg-proof".into());
+        }
+        let start = match tcg {
+            #[cfg(feature = "native-tcg-proof")]
+            true => super::native::NativeRun::start_tcg_proof_with,
+            _ => super::native::NativeRun::start_with,
+        };
+        let mut run = start(
             super::launch_witness::Admission {
                 run_id: assigned,
                 node_boot: moruna_kernel::RunId(nonce),

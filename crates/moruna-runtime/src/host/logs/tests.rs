@@ -347,7 +347,6 @@ fn a_flood_is_bounded_and_counted() {
         peak = peak.max(capture.shared.queued.load(Ordering::Acquire));
     }
     assert!(peak <= QUEUE_BYTES, "{peak} bytes queued");
-    let elapsed = started.elapsed().as_secs_f64();
     let during = told.events.lock().unwrap().len();
     assert!(during >= 1, "the reach was not told during the flood");
     assert!(capture.finish(FINISH_WAIT));
@@ -377,7 +376,9 @@ fn a_flood_is_bounded_and_counted() {
         .into_iter()
         .filter(|e| matches!(e, Event::Log { task: Some(t), stream, .. } if t == "k1" && *stream != LogStream::Platform))
         .count() as f64;
-    let most = SENT_BURST_RECORDS as f64 + SENT_RATE_RECORDS as f64 * (elapsed + 2.0);
+    // The writer drains what was queued until `finish` returns: the rate runs that long.
+    let elapsed = started.elapsed().as_secs_f64();
+    let most = SENT_BURST_RECORDS as f64 + SENT_RATE_RECORDS as f64 * (elapsed + 1.0);
     assert!(sent <= most, "{sent} records sent, at most {most}");
     assert!(
         (sent as u64) < k1.records,
