@@ -356,3 +356,19 @@ and switches to the new one when the call answers.
   - **CI's kernel job host-tests `moruna-datapath` and `moruna-sys`.**
   - **B2's proposed four-way split** (core and processes, vm, fs, images) is accepted. The new
     streams start when B2's core compiles and a session slot is free.
+- **2026-11-16: stream B1 merged** (`e7a1fb88`, from `f855154e`). CI's boot passed 191 of 191
+  checks under KVM on 1, 2 and 4 CPUs.
+  - Every booted B1 test reports ok: the interrupt, snapshot, clone, pager, entry, copy,
+    tables, futex and personality tests.
+  - Kernel mode grows by 1,372 code lines net, through the nine reserved calls and the
+    probe-only `TABLE`.
+  - The KB1 ping-pong shows no regression against step 1: 6.09 s, 5.42 s and 0.72 s, against
+    6.46 s, 6.19 s and 0.85 s.
+  - **Open, and B1's next:**
+    - a snapshot mapped in two places shares later writes with a clone, which `fork` cannot
+      allow;
+    - a clone briefly needs room for its zero pages twice;
+    - `process_read` and `process_write` answer `ShouldWait` on a page the pager has not
+      supplied.
+  - **Later:** the GS base is not kept per thread, and a program thread is interrupted only
+    within one tick.
