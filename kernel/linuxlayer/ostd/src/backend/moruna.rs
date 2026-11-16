@@ -19,12 +19,12 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
 };
 
-use moruna_sys::{DEADLINE_INFINITE, Error, RawHandle, Thread, raw};
+use moruna_sys::{DEADLINE_INFINITE, Error, Handle, RawHandle, Thread, raw};
 
 use super::{Dir, FOREVER};
 
 /// A personality thread's stack: its size, and its alignment.
-pub(crate) const STACK_SIZE: usize = 256 * 1024;
+pub(crate) const STACK_SIZE: usize = linuxlayer_launch::STACK_SIZE as usize;
 
 pub(crate) fn futex_wait(word: &AtomicU32, expected: u32, deadline: u64) -> bool {
     let deadline = if deadline == FOREVER {
@@ -67,6 +67,9 @@ pub(crate) struct ThreadBlock {
     pub(crate) fs_base: usize,
     /// The program's GS base: kept, but the core loads none per thread.
     pub(crate) gs_base: usize,
+    /// The thread's own handle, for interrupting it; zero for a launched first thread,
+    /// which runs no program. Its spawner writes it before the thread runs anything.
+    pub(crate) thread: AtomicU32,
 }
 
 /// The calling thread's block.
@@ -86,6 +89,24 @@ pub(crate) fn current_slot() -> usize {
 pub(crate) fn set_current_slot(value: usize) {
     // SAFETY: as above.
     unsafe { (*block()).task = value };
+}
+
+/// What names the calling thread for [`interrupt`]: its block's address.
+pub(crate) fn thread_token() -> usize {
+    block() as usize
+}
+
+/// Interrupts the thread whose block is at `token` (`moruna_sys::personality`'s
+/// `thread_interrupt`). A thread that has ended answers an error, which is ignored: its
+/// block and handle stay while the personality runs.
+pub(crate) fn interrupt(token: usize) {
+    let block = token as *const ThreadBlock;
+    // SAFETY: a token is a block's address, and blocks are never freed.
+    let raw = unsafe { (*block).thread.load(Ordering::Acquire) };
+    if raw != 0 {
+        let thread = core::mem::ManuallyDrop::new(Thread(Handle::from_raw(raw)));
+        let _ = moruna_sys::personality::thread_interrupt(&thread);
+    }
 }
 
 /// A stack for a personality thread: its aligned base, with the thread's block written, and
@@ -229,6 +250,12 @@ pub(crate) fn run_program(
 }
 
 extern "C" fn thread_start(arg: u64) -> ! {
+    // Its spawner writes the thread's handle into its block before anything may interrupt it.
+    // SAFETY: the block is the thread's own, written by `new_stack`.
+    let handle = unsafe { &(*block()).thread };
+    while handle.load(Ordering::Acquire) == 0 {
+        futex_wait(handle, 0, FOREVER);
+    }
     // SAFETY: `spawn` leaked this box for the new thread, which takes it once.
     let f = unsafe { Box::from_raw(arg as *mut Box<dyn FnOnce() + Send>) };
     f();
@@ -236,11 +263,15 @@ extern "C" fn thread_start(arg: u64) -> ! {
 }
 
 pub(crate) fn spawn(f: Box<dyn FnOnce() + Send>) -> Result<(), ()> {
-    let (_, top) = new_stack().ok_or(())?;
+    let (base, top) = new_stack().ok_or(())?;
     let arg = Box::into_raw(Box::new(f)) as u64;
     match Thread::spawn(thread_start, top as u64, arg) {
         Ok(thread) => {
-            core::mem::forget(thread);
+            // SAFETY: the block at `base` is the new thread's, which only reads this word
+            // until it is set.
+            let handle = unsafe { &(*(base as *const ThreadBlock)).thread };
+            handle.store(thread.0.into_raw(), Ordering::Release);
+            futex_wake(handle, 1);
             Ok(())
         }
         Err(_) => {
@@ -271,14 +302,38 @@ pub(crate) fn exit(code: u32) -> ! {
 
 /// Whether copies run in place: the process was given the copy routines.
 static IN_PLACE: AtomicBool = AtomicBool::new(true);
-/// The personality's own process, for copies through the core.
+/// The personality's own process: the program's.
 static SELF: AtomicUsize = AtomicUsize::new(0);
 
-/// Copies go through `process_read` and `process_write` on `process`, the personality's own:
-/// for a process given no copy routines.
-pub fn copy_through_core(process: RawHandle) {
+/// Records the personality's own process, a handle with `READ` and `WRITE` (the launcher
+/// grants it as the slot `self`): the process the program runs in.
+pub fn set_self_process(process: RawHandle) {
     SELF.store(process as usize, Ordering::Release);
+}
+
+/// The personality's own process, once recorded.
+pub fn self_process() -> Option<RawHandle> {
+    match SELF.load(Ordering::Acquire) {
+        0 => None,
+        v => Some(v as RawHandle),
+    }
+}
+
+/// Copies go through `process_read` and `process_write` on the personality's own process:
+/// for a process given no copy routines.
+pub fn copy_through_core() {
     IN_PLACE.store(false, Ordering::Release);
+}
+
+/// Writes the calling thread's block, for a first thread its launcher gave a stack of
+/// `STACK_SIZE` bytes aligned to its size (`linuxlayer_launch`).
+///
+/// # Safety
+///
+/// The calling thread runs on such a stack, and nothing else uses its block.
+pub unsafe fn start_thread_block() {
+    // SAFETY: the caller upholds it.
+    unsafe { init_block(block()) };
 }
 
 /// Gives the created process `process` its personality region, `len` bytes from `base`,
@@ -364,13 +419,6 @@ unsafe extern "C" {
     fn linuxlayer_set(dst: *mut u8, value: u32, len: usize) -> usize;
     fn linuxlayer_load32(ptr: *const u32, out: *mut u32) -> usize;
     fn linuxlayer_cmpxchg32(ptr: *mut u32, old: u32, new: u32, out: *mut u32) -> usize;
-}
-
-fn self_process() -> Option<RawHandle> {
-    match SELF.load(Ordering::Acquire) {
-        0 => None,
-        v => Some(v as RawHandle),
-    }
 }
 
 /// A copy through the core, the largest prefix that succeeds, a page at a time once one

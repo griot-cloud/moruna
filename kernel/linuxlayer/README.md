@@ -95,13 +95,65 @@ changed with them. Beyond that, and the pruning above:
 | `core/src/device/registry/block.rs` | No virtio or NVMe request threads. |
 | `core/src/device/tty/device.rs` | No virtual terminals or hypervisor console; the console is `ttyS0`. |
 | `core/src/process/signal/poll.rs` | A polling task is marked by its address's complement: user addresses are positive. |
+| `core/src/syscall/mod.rs`, `syscall/clone.rs` | Every call passes `syscall/refused.rs` first; a call the table lacks is counted; `clone` with a new namespace is refused. |
+| `core/src/process/exit.rs`, `core/src/init.rs` | A process's refused calls are reported when it ends, the task's when the personality ends. |
+| `core/src/process/posix_thread/mod.rs` | Waking a thread for a signal also interrupts its task (`Task::interrupt`): a thread running the program comes back only when the core interrupts it. |
 | `core/src/fs/file/file_handle.rs`, `syscall/{mod.rs,arch/x86.rs}` | No socket hooks; the socket calls answer from `syscall/no_socket.rs`. |
 | `core/src/vm/vmar/vmar_impls/fork.rs` | Its device-memory test is ignored: there is no device memory. |
 | `core/src/lib.rs` | The module list, three unused features and `getset`, and the clocks every host test needs (`ostd::ktest_setup!`). |
 | 9 files | Items only the left-out parts used are marked `expect(dead_code)` with that reason. |
 
-New in `core/`: `net/mod.rs` (the UTS namespace only), `vdso.rs` (none mapped) and
-`syscall/no_socket.rs`.
+New in `core/`: `net/mod.rs` (the UTS namespace only), `vdso.rs` (none mapped),
+`syscall/no_socket.rs` and `syscall/refused.rs`.
+
+## Refused calls
+
+The data OS takes Talos's posture (`architecture/data-os.md` §3a): no shell, and the layer
+keeps what a job's programs need (processes, threads, files, pipes, signals, epoll, `fork`
+and `execve`) and refuses administrative calls. `syscall/refused.rs` holds the list:
+
+- **`EPERM`, before the handler runs**, as Linux answers a process without the privilege:
+  - mounts: `mount`, `umount2`, and the new mount API (`open_tree`, `move_mount`, `fsopen`,
+    `fsconfig`, `fsmount`, `fspick`, `mount_setattr`);
+  - `pivot_root`, `chroot`;
+  - namespaces: `unshare`, `setns`, and `clone` or `clone3` with a `CLONE_NEW*` flag;
+  - `ptrace`, and the calls that need its permission: `process_vm_readv`,
+    `process_vm_writev`, `pidfd_getfd`;
+  - modules: `init_module`, `finit_module`, `delete_module`;
+  - `kexec_load`, `kexec_file_load`, `reboot`, `swapon`, `swapoff`;
+  - time: `settimeofday`, `clock_settime`, `adjtimex`, `clock_adjtime`.
+- **`ENOSYS`:** every number the table does not have.
+- **The socket calls** answer from `syscall/no_socket.rs`.
+
+Each refusal is counted by number for the process that made it, as `kernel/linux` counts
+its refusals: `linux: process PID refused: mount(165) x1, ...` when the process ends (if it
+had any), and `linux: the task refused: ...` when the personality ends. The refused
+handlers' carried code stays in the tree, unreachable: removing it would leave parts of
+`fs/` unused.
+
+## Launching the personality
+
+- **The contract** (`launch/`): the personality's region is `[IMAGE_RANGE.end,
+  + 0x6000_0000_0000)`, above every address a Linux program links at. Its image is linked at
+  `0x5000_0000_0000` inside the region and opens with a table of three `u64`s: the copy
+  routines' start and end, and their recovery point. The first thread's stack is 256 KiB,
+  aligned to its size, past the image; the start page's address is at its stack pointer.
+- **The launcher** (`launch/src/launcher.rs`) creates the process, maps each segment as an
+  object of its own, maps the first stack, grants the handles it is given plus the
+  process's own as `self`, gives the process its region with the copy routines
+  (`personality_set_with_copy`) and launches it. `linuxlayer-boot` launches it with the
+  slots `console`, `initramfs` and, if given, `cmdline`.
+- **The image** (`personality/`) is built from position-independent code
+  (`-C relocation-model=pie`, so it reaches its addresses) and linked at its address
+  (`personality.ld`). Its start records the start page and the first thread's block, runs
+  the constructors `inventory` registers with, reads its slots, gives the layer its boot
+  information (the command line, the initramfs, a 1 GiB memory budget, the clocks) and runs
+  the layer's boot in a task, with the core's console as the layer's serial console. The
+  layer ends the process when its init process ends.
+- **The booted test** (`boot/boot.sh`) builds the kernel, the image and `linuxlayer-boot`, an
+  initramfs whose `/init` is a static musl program, renders `boot/linuxlayer.image` and
+  boots it under QEMU, then checks the lines it expects.
+
 ## Running the program: B1's entry
 
 The program's own entry, clones, the pager and thread state are stream B1's mechanisms
@@ -114,6 +166,10 @@ The program's own entry, clones, the pager and thread state are stream B1's mech
   OSTD's `FpuContext::save` and `load` read and write that saved state.
 - **Each thread's block** sits at the base of its aligned stack: its task, the program's
   frame (inside the region, as the core requires) and the program's vector state.
+- **Interruption:** a signal for a thread that runs the program interrupts it
+  (`Task::interrupt`, B1's `thread_interrupt`), so it enters the personality and takes the
+  signal, as a kernel's timer interrupt would bring it back. Each thread's block holds its
+  own handle for that, written by its spawner before the thread runs anything.
 - A driver installed with `ostd::user::set_program_driver` takes the entry's place: a
   scripted program in host tests.
 
@@ -149,6 +205,12 @@ each in a task of its own, after the setups registered with `ostd::ktest_setup!`
 cd kernel/linuxlayer
 RUSTFLAGS="--cfg ktest" cargo test --target x86_64-apple-darwin --workspace -- --test-threads=1   # a Mac, under Rosetta
 RUSTFLAGS="--cfg ktest" cargo test --target x86_64-unknown-linux-gnu --workspace -- --test-threads=1
+```
+
+The booted test, on Linux x86-64 with QEMU and musl (KVM when usable):
+
+```sh
+kernel/linuxlayer/boot/boot.sh [OUT] [TIMEOUT_SECONDS] [INIT_C] [CMDLINE]
 ```
 
 For the Moruna user target, as `kernel/tools/build.sh` builds programs:

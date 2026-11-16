@@ -60,7 +60,7 @@ pub mod vm;
 
 // Host tests: the clocks a kernel's boot starts before its tests run.
 #[cfg(ktest)]
-ostd::ktest_setup!(crate::time::clocks::init_for_ktest);
+ostd::ktest_setup!(time::clocks::init_for_ktest);
 
 /// Boots the Asterinas core kernel.
 pub fn boot() {

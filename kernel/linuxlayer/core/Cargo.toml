@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[lib]
+# Asterinas's doc examples illustrate kernel use and are not run on the host, as OSDK runs
+# none in the kernel.
+doctest = false
+
 [dependencies]
 align_ext.workspace = true
 aster-block.workspace = true
