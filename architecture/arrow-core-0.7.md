@@ -9,12 +9,27 @@ Status: plan, rewritten 2026-11-16 on Brackly's direction:
 This replaces the earlier revision of this file, which designed 0.7 around a Python host (it is
 in git history at `65acdc8f`). The decisions in "What stays" carry over from it.
 
+Brackly approved this plan on 2026-11-16, and the PM session agreed it the same day. The PM's
+decisions are folded in below.
+
+- **0.7.0 is this plan, plus finishing Goal A.** That means KD2 booted, KD3 and KD4.
+- **Goal B moves to 0.8.0.** The kernel as the node, the network server and Linux server programs
+  (KE1 to KE3, KS1, KC3 to KC5) do not serve the analytical gain. Production is Moruna in a VM
+  under KVM on the D4ls_v5.
+- **Every step is this branch's.**
+  - It builds on the work still on `feat/kd2-engine-process`, `feat/kd1-data-plane`,
+    `feat/ka2-plane-linux` (its conformance suite is KD3's base) and `feat/kb5-memory-quota` (the
+    account counting step 2 needs).
+  - `feat/kd7c-policies` stays out: it changes scheduler decisions, which is core work, not wiring.
+
 ## What 0.7.0 is
 
 - **One VM per run** on a Linux x86_64 node with KVM. Inside it: Moruna's kernel, the engine as its
   first process, and the job's tasks as processes. Batches move between them as memory pages.
 - **Everything of Moruna's inside the VM is Rust.** That covers the kernel, its servers and the
-  engine. The engine links no C library and calls no `malloc`.
+  engine.
+  - The engine links no library it does not need, and its memory is the arena, not `malloc`.
+  - C code stays only where a measurement shows that removing it costs speed (§5, decision 8).
 - **User code runs as tasks, in images, in any language.** A Python function is one of them: its
   CPython is in the image, not in Moruna.
 - **The host side is small.** It launches the VM, hands it the job and its data, and streams back
@@ -105,8 +120,18 @@ does not change what they decide or how.
 
 That shape adapts the engine to an interface that is not its own.
 
-**In 0.7** the engine is the kernel's own process, reversing DECISIONS EN1. It calls the kernel
-directly through `moruna-sys`: memory objects, slots, channels, threads, futexes and the clock.
+**In 0.7** the engine reaches its kernel directly for everything on the hot path, and becomes
+the kernel's own process if measurement says the rest still costs. It calls the kernel through
+`moruna-sys`: memory objects, slots, channels, threads, futexes and the clock.
+
+- **First, from inside today's program.** Steps 2 and 3 move batches and the arena onto memory
+  objects through the kernel's own calls, which a granted Linux program already makes (SDD 30
+  f.1). After that the hot path has few Linux syscalls left.
+- **Then measure the forwarding.** Measure the personality's share of wall time on the gate's
+  jobs.
+- **A native engine only if it costs.** Reversing DECISIONS EN1 with the `std` port below happens
+  only if forwarding still costs more than about 5% of some job. A `std` port is a large, lasting
+  maintenance cost, so it has to pay for itself (the PM's decision, 2026-11-16).
 
 - **How.** Rust's standard library is ported to the kernel as a target (`x86_64-unknown-moruna`),
   as `x86_64-unknown-hermit` is in Rust today. Arrow and Parquet need `std`, so this keeps them
@@ -182,17 +207,21 @@ The VM has no network.
   host reads with `moruna-layer`.
 - **Spill** goes to the same data disk.
 
-### 5. No C in the engine
+### 5. No library dependencies in the engine, and no C where it costs nothing
 
-- **zstd:** a pure-Rust zstd (`ruzstd`) for Arrow IPC and Parquet, with Parquet's codec patched to
-  use it. The cost to measure is decode speed against C zstd on Overture.
-- **blake3:** its pure-Rust implementation.
-- **`ring` and the HTTP stack:** gone with §4.
-- **musl:** gone with §1.
+The no-regression rule outranks "no C" (the PM's decision, 2026-11-16). Every 0.6.6 benchmark
+writes zstd Parquet, and Rust's `snap` already loses about 1.5x to the C++ codec.
+
+- **zstd.** C zstd (`zstd-sys`) stays unless a pure-Rust zstd (`ruzstd`) matches it on the gate's
+  jobs. `ruzstd` decodes slower and compresses far worse today. Brackly's call is open: see
+  "Decisions".
+- **blake3:** its pure-Rust implementation, if it measures the same.
+- **`ring` and the HTTP stack:** gone with §4. They are library dependencies the VM cannot use.
+- **musl:** goes only with a native engine (§1).
 - **wasm tasks leave 0.7.0.** wasmtime is an engine, with C parts and a memory model of its own,
   and image tasks already cover every language.
-- **The check.** The engine target's dependency tree has no `cc` build and no `-sys` crate, and
-  the build enforces it.
+- **The check.** Each `cc` build and `-sys` crate left in the engine target's dependency tree is
+  listed with the measurement that keeps it, and the build refuses any other.
 
 ### 6. The host side
 
@@ -271,6 +300,30 @@ Python-specific in Moruna.
 
 The harness is `bench/vm/`. It gains a mode that runs the job through `moruna run` on the VM.
 
+**The PM's requirements (2026-11-16):**
+
+- **Same inputs and the same output rows,** checked by row count and a content hash.
+- **VM boot reported separately,** and included in the wall time.
+- **Parallel Python without free threading.**
+  - 0.6.6's pure-Python jobs (Audit, Overture attributes) got their parallelism from
+    free-threaded threads in one process.
+  - An image of `python:3.14-slim` is the GIL build, so the image task runs either N interpreter
+    processes per stage or a 3.14t image. Otherwise those two jobs regress.
+  - One process per interpreter may also win back Overture attributes from free-threaded GC
+    pauses.
+- **Rust ports of the kernels are a separate "much better" track,** never the gate. Changing the
+  kernels' language proves nothing about regression.
+
+**"Much better" is written as per-job targets after step 1's KVM measurement, not before.** The
+items to commit to then:
+
+- boundary copies from two to zero;
+- huge pages for the arena;
+- block reads straight into arena pages;
+- decode on the worker that consumes the batch, which is the cache-locality loss behind Audit's
+  last 1 to 3%;
+- one process per interpreter.
+
 **What the image path pays today,** and the step that removes each cost:
 
 | Cost | Removed in |
@@ -282,37 +335,47 @@ The harness is `bench/vm/`. It gains a mode that runs the job through `moruna ru
 ## Order of work
 
 1. **Boot what exists (KD2) on KVM**, on the benchmark VM.
+   - First, take what the KD1, KD2, KA2 and KB5 branches have that this branch lacks.
    - Run a real job end to end with the engine as today's Linux program (KD2-T9).
-   - Run the NYC jobs as image tasks. Measure the forwarded syscalls and the boundary copies.
-   - This is the baseline for every step after it.
-2. **Batches as memory objects end to end** (§3): `slot_push` of ranges; `offer` and `land` stop
-   copying.
-3. **Data devices** (§4): inputs read from block devices into the arena; outputs on the data disk;
-   `object_store` out of the engine.
-4. **The engine native** (§1, §2):
-   - the `std` port;
-   - the arena as the global allocator;
-   - kernel adapters for the reactor and discovery;
-   - EN1 retired.
-5. **No C** (§5): `ruzstd`, blake3 in pure Rust, wasm out, and the build check.
+   - Run the NYC jobs as image tasks. Measure the forwarded syscalls, the boundary copies and the
+     VM's boot.
+   - This is the baseline for every step after it, and for the per-job targets.
+2. **Batches as memory objects end to end** (§3).
+   - `slot_push` of ranges; `offer` and `land` stop copying.
+   - KB5's account counting.
+   - The arena on memory objects, with huge pages.
+3. **Data devices** (§4): KD4's launcher devices; inputs read from block devices into the arena;
+   outputs on the data disk; `object_store` out of the engine.
+4. **Measure the forwarding, then decide on the native engine** (§1, §2). The `std` port, the arena
+   as the global allocator, kernel adapters for the reactor and discovery, and EN1 retired, all
+   only if forwarding costs more than about 5%.
+5. **Dependencies** (§5): wasm out, the HTTP stack out, C kept only where measurement says so,
+   and the build check.
 6. **The host side** (§6): `moruna run` and logs on the job updates.
-7. **KD3 conformance on the kernel, then the gate** (§9).
+7. **KD3 conformance on the kernel, then the gate** (§9), rerun on the benchmark VM.
 8. **Python** (§8).
 
-The order puts measuring first, then the copies, because they cost on every batch. The native
-engine is the largest piece; it starts once step 1 shows what the forwarding costs.
+The order puts measuring first, then the copies, because they cost on every batch.
 
-## Decisions for Brackly
+## Decisions
+
+Settled on 2026-11-16, by Brackly's approval of this plan and by the PM:
 
 1. **Python in 0.7.0.** The runtime has none. Python functions run as image tasks, and the `moruna`
-   package returns afterwards as a client (§8). Recommended.
-2. **The gate.** The 0.6.6 jobs, with the same kernels, run as image tasks in the VM against 0.6.6
-   (§9). Recommended.
-3. **How the engine reaches its kernel.** Recommended: natively, through a Rust `std` port (§1).
-   The alternative keeps it a Linux program on a pure-Rust C library (c-ward). That removes the C,
-   but keeps the personality and its IPC between the engine and its kernel.
-4. **wasm tasks leave 0.7.0** (§5). Recommended.
-5. **Outputs on the data disk as layers** (§4, SDD 30 m.3). Recommended.
-6. **QEMU stays the launcher's hypervisor** in 0.7.0 (§6). Recommended.
-7. **Where it runs while CI is paused.** Step 1 onwards needs an x86_64 machine with KVM. This Mac
-   can only emulate one. The benchmark VM on griot-stg is the candidate.
+   package returns afterwards as a client (§8).
+2. **The gate.** The 0.6.6 jobs, with the same kernels, run as image tasks in the VM against 0.6.6,
+   on the PM's terms (§9).
+3. **How the engine reaches its kernel.** Directly, for the hot path, from inside today's program.
+   It becomes a native process through a `std` port only if forwarding still costs more than about
+   5% (§1).
+4. **wasm tasks leave 0.7.0** (§5).
+5. **Outputs on the data disk as layers** (§4, SDD 30 m.3).
+6. **QEMU stays the launcher's hypervisor** in 0.7.0 (§6).
+7. **Where it runs.** On `moruna-bench` (D8ds_v6, `/dev/kvm`, griot-stg), pre-approved for this
+   work, under `~/.vm-lock`, and before its 02:00 UTC shutdown wipes `/data`.
+
+Open, Brackly's:
+
+8. **"No C" or "no regression" when they conflict.** Brackly asked for a runtime "in pure Rust"
+   and said C libraries are not needed in Rust. The PM ranks the no-regression rule higher: C zstd
+   stays unless `ruzstd` matches it (§5), and musl stays unless the native engine pays (§1).
