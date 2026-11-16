@@ -1052,6 +1052,11 @@ pub mod plane {
         /// ABI 2.6: the bytes the page table entry mapping the argument, an address of
         /// the caller's, covers: 4096, 2 MiB for a large page, or zero for none.
         pub const MAPPING: u64 = 3;
+        /// ABI 2.6 (stream B1): the bytes of the hole holding the argument, an address of
+        /// the caller's, at the deepest page table the caller has there: 4096 where a 4 KiB
+        /// table holds it, 2 MiB where only the table above does, and so on; zero where a
+        /// page is mapped. A table no area needs any more is gone.
+        pub const TABLE: u64 = 4;
     }
 }
 

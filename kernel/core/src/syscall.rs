@@ -1306,6 +1306,7 @@ fn plane_probe(p: &Process, op: u64, arg: u64) -> Ret {
         probe::FRAME => one(p.space.frame_at(arg)?),
         probe::COPIED => one(p.space.copied()),
         probe::MAPPING => one(p.space.mapping_at(arg)),
+        probe::TABLE => one(p.space.table_gap(arg)),
         probe::OBJECT_FRAME => {
             let memory = typed(p, arg & 0xffff_ffff, Rights::READ, as_memory)?;
             let page = (arg >> 32) as usize;

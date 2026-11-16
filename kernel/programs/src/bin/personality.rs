@@ -20,6 +20,8 @@
 //!   fault-tolerant copy resumes at its recovery address on a fault, with the address.
 //! - **Shared futexes.** A thread of another process wakes a waiter on a word of a shared
 //!   object, mapped at another address.
+//! - **Page tables go.** When exactly one 2 MiB region empties, its 4 KiB table goes; when a
+//!   whole 512 GiB region empties, its tables go to the root.
 //!
 //! Slots: `console`, `self-image` (this program, for its children), and `supervisor`, on
 //! which the supervisor sends a process resource. The children are this program too, each
@@ -173,6 +175,15 @@ fn run() -> i64 {
             let r = futex_child();
             report(&out, "futex waker", r, "woke a word of the shared object")
         }
+        "b1-tables" => {
+            let r = tables_child();
+            report(
+                &out,
+                "tables",
+                r,
+                "the table of an emptied 2 MiB region went, and those of an emptied 512 GiB region",
+            )
+        }
         "b1-victim" => {
             let pager = Memory(slot("pager"));
             let m = match pager.map(0, 2 * PAGE, 0) {
@@ -234,6 +245,12 @@ fn tester(out: &Console) -> i64 {
         "copy run",
         copy_run(out, &resource, &image),
         "the copy child ended",
+    );
+    code |= report(
+        out,
+        "tables run",
+        tables(out, &resource, &image),
+        "the tables child ended",
     );
     code |= report(
         out,
@@ -848,4 +865,87 @@ fn futex(out: &Console, resource: &Handle, image: &Handle) -> Outcome {
     let mut b = [0u8; 4];
     call(m.read(8, &mut b), "reading the waker's count")?;
     want(u32::from_le_bytes(b) == 1, "the waker woke no one")
+}
+
+// ---- Page tables.
+
+/// Two 2 MiB regions alone in their 512 GiB region.
+const TABLES: u64 = 0x0a00_0000_0000;
+const REGION: u64 = 2 << 20;
+
+fn tables(out: &Console, resource: &Handle, image: &Handle) -> Outcome {
+    let child = call(Process::create(resource, "b1-tables"), "process_create")?;
+    let entry = call(child.map_image(image), "process_map_image")?;
+    call(
+        child.map(None, 0, 2 * REGION, TABLES, map::READ | map::WRITE),
+        "mapping two regions",
+    )?;
+    // A page in each region, so each has a 4 KiB table.
+    call(child.write(TABLES, b"x"), "touching the first region")?;
+    call(
+        child.write(TABLES + REGION, b"y"),
+        "touching the second region",
+    )?;
+    call(
+        child.unmap(TABLES + REGION, REGION),
+        "emptying the second region",
+    )?;
+    let (mine, theirs) = call(Channel::create(), "channel_create")?;
+    let console = call(console_for(out), "duplicating the console")?;
+    call(
+        child.start_with(
+            entry,
+            &mut [(Some(console), "console"), (Some(theirs.0), "peer")],
+        ),
+        "process_start",
+    )?;
+    // Once it has looked, the first region empties too, and with it the 512 GiB region.
+    call(
+        wait_one(&mine.0, Signals::READABLE, now() + ms(10_000)),
+        "the tables child did not look",
+    )?;
+    let mut b = [0u8; 1];
+    let mut none: [Option<Handle>; 0] = [];
+    call(mine.read(&mut b, &mut none), "reading the tables child")?;
+    call(child.unmap(TABLES, REGION), "emptying the first region")?;
+    if let Err((e, _)) = mine.write(b"2", []) {
+        return Err(("telling the tables child", Some(e)));
+    }
+    call(
+        wait_one(&child.0, Signals::TERMINATED, now() + ms(10_000)),
+        "the tables child did not end",
+    )?;
+    Ok(())
+}
+
+fn tables_child() -> Outcome {
+    let peer = Channel(slot("peer"));
+    let emptied = call(
+        personality::table_gap(TABLES + REGION),
+        "probing the emptied region",
+    )?;
+    want(
+        emptied == REGION,
+        "an emptied 2 MiB region's 4 KiB table stayed",
+    )?;
+    let kept = call(
+        personality::table_gap(TABLES + PAGE),
+        "probing the kept region",
+    )?;
+    want(kept == PAGE, "a kept region's 4 KiB table went")?;
+    if let Err((e, _)) = peer.write(b"1", []) {
+        return Err(("telling the tester", Some(e)));
+    }
+    call(
+        wait_one(&peer.0, Signals::READABLE, now() + ms(10_000)),
+        "the tester did not empty the first region",
+    )?;
+    let whole = call(
+        personality::table_gap(TABLES),
+        "probing the emptied 512 GiB region",
+    )?;
+    want(
+        whole == 1 << 39,
+        "an emptied 512 GiB region's tables stayed",
+    )
 }
