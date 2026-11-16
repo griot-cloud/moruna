@@ -1030,6 +1030,35 @@ fn one_run(frames: &[UFrame]) -> bool {
     )
 }
 
+/// Sets `prot` on the entries `vm` holds in each of `ranges` (sorted, whole pages), in
+/// place, with one TLB flush that has finished on every CPU when this returns.
+fn protect_in(vm: &VmSpace, ranges: &[(u64, u64)], prot: u64) -> Result<(), Error> {
+    let (Some(&(low, _)), Some(high)) = (ranges.first(), ranges.iter().map(|r| r.1).max()) else {
+        return Ok(());
+    };
+    let guard = disable_preempt();
+    let span = low as usize..high as usize;
+    let mut cursor = vm
+        .cursor_mut(&guard, &span)
+        .map_err(|_| Error::InvalidArgs)?;
+    let flags = page_flags(prot);
+    for &(va, end) in ranges {
+        cursor.jump(va as usize).map_err(|_| Error::InvalidArgs)?;
+        let end = end as usize;
+        while let Some(done) = cursor.protect_next(
+            end.saturating_sub(cursor.virt_addr()),
+            |f: &mut PageFlags, _: &mut CachePolicy| *f = (*f - PageFlags::RWX) | flags,
+        ) {
+            cursor
+                .flusher()
+                .issue_tlb_flush(TlbFlushOp::for_range(done));
+        }
+    }
+    cursor.flusher().dispatch_tlb_flush();
+    cursor.flusher().sync_tlb_flush();
+    Ok(())
+}
+
 /// One large page of zeroed frames, or `None` when the allocator has no aligned run.
 fn zeroed_run() -> Option<USegment> {
     let mut options = FrameAllocOptions::new();
@@ -1124,7 +1153,13 @@ impl Space {
     /// Fills a new area's page table as `fill_ptes` does, with one large page for each
     /// aligned 2 MiB whose frames are one run.
     fn fill_huge(&self, inner: &Inner, start: u64, area: &Area) -> Result<(), Error> {
-        if area.prot & map::PROTECTION == 0 || matches!(area.backing, Backing::Device { .. }) {
+        let whole = match &area.backing {
+            Backing::Object { memory, .. } => !memory.is_lazy(),
+            Backing::Zero => true,
+            Backing::Device { .. } => false,
+        };
+        // A lazy object's pages are mapped as they are touched, a device's in small ones.
+        if area.prot & map::PROTECTION == 0 || !whole {
             return self.fill_ptes(inner, start, area, start, area.end);
         }
         let mut va = start;
@@ -1284,37 +1319,46 @@ impl Space {
         }
         self.settle(&mut inner);
         // The areas that had no entries (no access) get them once the rest are changed.
+        // A grant drops the entries of a lazy object's pages rather than make them
+        // writable: one may be a page it shares copy-on-write, which only the fault that
+        // copies it may make writable. Every other entry changes in place.
+        let grant = prot & map::WRITE != 0;
         let mut fill = Vec::new();
+        let mut in_place = Vec::new();
+        let mut dropped = Vec::new();
         for &(va, end) in &ranges {
             for (&start, area) in inner.areas.range_mut(va..end) {
+                let piece = (start.max(va), area.end.min(end));
                 if area.prot & map::PROTECTION == 0 {
                     fill.push(start);
+                } else if grant
+                    && matches!(&area.backing, Backing::Object { memory, .. } if memory.is_lazy())
+                {
+                    dropped.push(piece);
+                } else {
+                    in_place.push(piece);
                 }
                 area.prot = prot;
             }
         }
-        {
-            let guard = disable_preempt();
-            let span = low as usize..high as usize;
-            let mut cursor = self
-                .vm
-                .cursor_mut(&guard, &span)
-                .map_err(|_| Error::InvalidArgs)?;
-            let flags = page_flags(prot);
-            for &(va, end) in &ranges {
-                cursor.jump(va as usize).map_err(|_| Error::InvalidArgs)?;
-                let end = end as usize;
-                while let Some(done) = cursor.protect_next(
-                    end.saturating_sub(cursor.virt_addr()),
-                    |f: &mut PageFlags, _: &mut CachePolicy| *f = (*f - PageFlags::RWX) | flags,
-                ) {
-                    cursor
-                        .flusher()
-                        .issue_tlb_flush(TlbFlushOp::for_range(done));
+        if !in_place.is_empty() {
+            protect_in(&self.vm, &in_place, prot)?;
+            // The program's table of a process with a personality holds entries only in the
+            // regions it has a table for; a cursor reaching one of them makes no table.
+            if let Some(program) = self.program() {
+                let tables = program.tables.lock();
+                let region = charge::TABLE_REGIONS[0];
+                let holds = tables[0]
+                    .range(low / region..high.div_ceil(region))
+                    .next()
+                    .is_some();
+                if holds {
+                    protect_in(&program.vm, &in_place, prot)?;
                 }
             }
-            cursor.flusher().dispatch_tlb_flush();
-            cursor.flusher().sync_tlb_flush();
+        }
+        for (va, end) in dropped {
+            self.unmap_ptes(va, end - va);
         }
         for start in fill {
             if let Some(area) = inner.areas.get(&start).cloned() {
@@ -1442,10 +1486,14 @@ impl Space {
             return 0;
         }
         let guard = disable_preempt();
-        let range = page as usize..(page + PAGE_SIZE) as usize;
-        let Ok(mut cursor) = self.vm.cursor(&guard, &range) else {
+        // A cursor over the whole space starts at the root: one over the page would make
+        // the tables down to it, which a probe must not (as B1's `table_gap`).
+        let Ok(mut cursor) = self.vm.cursor(&guard, &(0..map_end() as usize)) else {
             return 0;
         };
+        if cursor.jump(page as usize).is_err() {
+            return 0;
+        }
         match cursor.query() {
             Ok((mapped, Some(_))) => (mapped.end - mapped.start) as u64,
             _ => 0,
