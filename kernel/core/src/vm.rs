@@ -33,7 +33,7 @@ use ostd::{
 
 use crate::{
     account::{Account, Charge},
-    memory::{DeviceMemory, MemoryObject},
+    memory::{DeviceMemory, MemoryObject, Resolved},
 };
 
 pub use moruna_abi::IMAGE_RANGE;
@@ -212,6 +212,8 @@ pub struct Space {
     account: Arc<Account>,
     /// The root table and the three over the top of user space (`charge::SPACE`).
     _fixed: Charge,
+    /// Stream B1: the program's table, for a process with a personality.
+    program: ProgramTable,
 }
 
 fn zeroed_frame() -> Result<UFrame, Error> {
@@ -239,6 +241,8 @@ impl Space {
             copied: AtomicU64::new(0),
             account: account.clone(),
             _fixed: fixed,
+            // stream B1 hook
+            program: ProgramTable(SpinLock::new(None)),
         })
     }
 
@@ -364,8 +368,8 @@ impl Space {
         let mut inner = self.inner.lock();
         let (start, area) = Space::area_at(&inner, page).ok_or(Error::BadState)?;
         let area = area.clone();
-        let frame = self
-            .frame(&mut inner, start, &area, page)
+        let (frame, _) = self
+            .frame(&mut inner, start, &area, page, false)
             .map_err(|_| Error::BadState)?;
         Ok(frame.paddr() as u64)
     }
@@ -379,6 +383,8 @@ impl Space {
         if let Ok(mut cursor) = self.vm.cursor_mut(&guard, &range) {
             cursor.unmap(len as usize);
         }
+        // Stream B1: the program's table holds no entry the space's does not.
+        self.program.unmap(va, len, &self.account);
     }
 
     /// Fills the page table for `va .. end` of `area` (which starts at `start`), whose
@@ -402,6 +408,8 @@ impl Space {
             .cursor_mut(&guard, &range)
             .map_err(|_| Error::InvalidArgs)?;
         match &area.backing {
+            // Stream B1: a lazy object's pages are mapped as they are touched.
+            Backing::Object { memory, .. } if memory.is_lazy() => {}
             Backing::Object { memory, first, .. } => {
                 let property =
                     PageProperty::new_user(page_flags(area.prot), CachePolicy::Writeback);
@@ -703,22 +711,30 @@ impl Space {
     }
 
     /// The frame of page `page` of `area`, allocating a zero page the first time, which
-    /// is charged to the space's account then (`QuotaExceeded` when it has no room).
+    /// is charged to the space's account then (`QuotaExceeded` when it has no room), and
+    /// whether it may be mapped as the area allows: a lazy object's shared page is mapped
+    /// read only, and is the object's own after a `write` (stream B1). `ShouldWait` for a
+    /// pager's page not supplied yet.
     fn frame(
         &self,
         inner: &mut Inner,
         start: u64,
         area: &Area,
         page: u64,
-    ) -> Result<UFrame, Error> {
+        write: bool,
+    ) -> Result<(UFrame, bool), Error> {
         match &area.backing {
             Backing::Object { memory, first, .. } => {
                 let index = first + ((page - start) / PAGE_SIZE) as usize;
-                memory.frames().get(index).cloned().ok_or(Error::OutOfRange)
+                match memory.resolve(index, write)? {
+                    Some(Resolved::Own(f)) => Ok((f, true)),
+                    Some(Resolved::Shared(f)) => Ok((f, false)),
+                    None => Err(Error::ShouldWait),
+                }
             }
             Backing::Zero => {
                 if let Some(f) = inner.zero.get(&page) {
-                    return Ok(f.clone());
+                    return Ok((f.clone(), true));
                 }
                 self.charge(inner, charge::ZERO_PAGE)?;
                 let frame = match zeroed_frame() {
@@ -729,27 +745,10 @@ impl Space {
                     }
                 };
                 inner.zero.insert(page, frame.clone());
-                Ok(frame)
+                Ok((frame, true))
             }
             Backing::Device { .. } => Err(Error::Fault),
         }
-    }
-
-    /// Maps the frame of the page holding `addr` if `access` is allowed there and the
-    /// page has no entry: a first touch of a zero page. `Ok(true)` when it did,
-    /// `Ok(false)` when the fault is not a first touch, and the error when the page
-    /// could not be had: `QuotaExceeded` when the account has no room for it.
-    pub fn fault(&self, addr: u64, access: Access) -> Result<bool, Error> {
-        let page = addr & !(PAGE_SIZE - 1);
-        let mut inner = self.inner.lock();
-        let Some((start, area)) = Space::area_at(&inner, page) else {
-            return Ok(false);
-        };
-        if !allows(area.prot, access) {
-            return Ok(false);
-        }
-        let area = area.clone();
-        self.touch(&mut inner, start, &area, page).map(|()| true)
     }
 
     /// Gives page `page` of `area` its entry if it has none.
@@ -763,11 +762,17 @@ impl Space {
         if matches!(cursor.query(), Ok((_, Some(_)))) {
             return Ok(());
         }
-        let frame = self.frame(inner, start, area, page)?;
+        // stream B1 hook: a lazy object's shared page is mapped read only.
+        let (frame, own) = self.frame(inner, start, area, page, false)?;
+        let prot = if own {
+            area.prot
+        } else {
+            area.prot & !map::WRITE
+        };
         cursor.jump(page as usize).map_err(|_| Error::InvalidArgs)?;
         cursor.map(
             frame,
-            PageProperty::new_user(page_flags(area.prot), CachePolicy::Writeback),
+            PageProperty::new_user(page_flags(prot), CachePolicy::Writeback),
         );
         Ok(())
     }
@@ -837,7 +842,15 @@ impl Space {
                     return Err(Error::Fault);
                 }
                 let area = area.clone();
-                let frame = self.frame(&mut inner, start, &area, page)?;
+                // Stream B1: a write makes a lazy object's page its own; no table keeps an
+                // entry for the page it may stop sharing.
+                if write
+                    && let Backing::Object { memory, .. } = &area.backing
+                    && memory.is_lazy()
+                {
+                    self.unmap_ptes(page, PAGE_SIZE);
+                }
+                let (frame, _) = self.frame(&mut inner, start, &area, page, write)?;
                 if matches!(area.backing, Backing::Zero) {
                     // A page first touched by a copy is touched for the process too.
                     self.touch(&mut inner, start, &area, page)?;
@@ -935,6 +948,7 @@ impl Space {
         let frames: Vec<UFrame> = {
             let mut inner = self.inner.lock();
             let mut cursor = va;
+            let mut forget = Vec::new();
             for (&start, area) in inner.areas.range(..end) {
                 if area.end <= va {
                     continue;
@@ -945,10 +959,25 @@ impl Space {
                 if area.kind == Kind::Plane {
                     return Err(Error::InvalidArgs);
                 }
+                // Stream B1: a snapshot's written pages go too.
+                if let Backing::Object { memory, first, .. } = &area.backing
+                    && memory.is_snapshot()
+                {
+                    let (lo, hi) = (va.max(start), end.min(area.end));
+                    let index = first + ((lo - start) / PAGE_SIZE) as usize;
+                    forget.push((memory.clone(), index, ((hi - lo) / PAGE_SIZE) as usize));
+                }
                 cursor = area.end;
             }
             if cursor < end {
                 return Err(Error::OutOfRange);
+            }
+            if !forget.is_empty() {
+                // No table keeps an entry for a page a snapshot lets go.
+                self.unmap_ptes(va, end - va);
+                for (memory, index, count) in &forget {
+                    memory.forget(*index, *count);
+                }
             }
             let pages: Vec<u64> = inner.zero.range(va..end).map(|(p, _)| *p).collect();
             let frames = pages.iter().filter_map(|p| inner.zero.remove(p)).collect();
@@ -988,7 +1017,363 @@ impl Space {}
 
 // ---- stream B1 (personality, `architecture/data-os-streams.md`): stream B1's additions to
 // ---- `Space` go in this block; it also owns `fault` above.
-impl Space {}
+//
+// A process with a personality (kernel-is-the-machine §4.1 a) has a second page table,
+// the program's: the space's pages outside the personality's region, each entered as the
+// program touches it, so the program never reaches the region. Every entry the space's
+// table loses, the program's loses too (`unmap_ptes`). Its table pages are charged as the
+// space's are: one for each region of `charge::TABLE_REGIONS` it touches, given back when
+// an unmap covers the region whole and OSTD drops the table.
+
+use alloc::collections::BTreeSet;
+use core::ops::Range;
+
+use ostd::mm::tlb::TlbFlushOp;
+
+use crate::process::Thread;
+
+/// The program's table of a process with a personality.
+pub struct Program {
+    /// The personality's region, which the table never maps.
+    pub region: Range<u64>,
+    /// The personality's fault-tolerant copy routine, and where a fault in it resumes.
+    pub copy: Option<(Range<u64>, u64)>,
+    pub vm: Arc<VmSpace>,
+    /// The regions it holds a table page for, at each level.
+    tables: SpinLock<[BTreeSet<u64>; 3]>,
+    account: Arc<Account>,
+    /// Its root and the three tables over the top of user space.
+    _fixed: Charge,
+}
+
+pub struct ProgramTable(SpinLock<Option<Arc<Program>>>);
+
+impl ProgramTable {
+    /// Unmaps `va .. va + len` from the program's table, and gives back the table pages
+    /// of the regions the range covers whole.
+    fn unmap(&self, va: u64, len: u64, account: &Account) {
+        let Some(program) = self.0.lock().clone() else {
+            return;
+        };
+        let guard = disable_preempt();
+        let range = va as usize..(va + len) as usize;
+        if let Ok(mut cursor) = program.vm.cursor_mut(&guard, &range) {
+            cursor.unmap(len as usize);
+        }
+        let end = va + len;
+        let mut tables = program.tables.lock();
+        for (level, size) in charge::TABLE_REGIONS.iter().copied().enumerate() {
+            let whole = va.div_ceil(size)..end / size;
+            let gone: Vec<u64> = tables[level].range(whole).copied().collect();
+            for region in gone {
+                tables[level].remove(&region);
+                account.uncharge(charge::PAGE);
+            }
+        }
+    }
+}
+
+impl Drop for Program {
+    fn drop(&mut self) {
+        // The tables still held: a space ends with `clear`, which unmapped them first.
+        let held: u64 = self.tables.lock().iter().map(|t| t.len() as u64).sum();
+        if held != 0 {
+            self.account.uncharge(held * charge::PAGE);
+        }
+    }
+}
+
+impl Space {
+    /// Gives the space the personality's region `base .. base + len` (whole pages, in
+    /// user space) and a program's table, once; and the region's copy routine, if any:
+    /// its range and where a fault in it resumes, all inside the region.
+    pub fn set_program(
+        &self,
+        base: u64,
+        len: u64,
+        copy: Option<(Range<u64>, u64)>,
+    ) -> Result<(), Error> {
+        let end = Space::check_range(base, len)?;
+        if let Some((range, recovery)) = &copy {
+            let inside = |a: u64| (base..end).contains(&a);
+            if range.is_empty() || !inside(range.start) || range.end > end || !inside(*recovery) {
+                return Err(Error::InvalidArgs);
+            }
+        }
+        let mut slot = self.program.0.lock();
+        if slot.is_some() {
+            return Err(Error::BadState);
+        }
+        *slot = Some(Arc::new(Program {
+            region: base..end,
+            copy,
+            vm: Arc::new(VmSpace::new()),
+            tables: SpinLock::new([BTreeSet::new(), BTreeSet::new(), BTreeSet::new()]),
+            account: self.account.clone(),
+            _fixed: Charge::new(&self.account, charge::SPACE)?,
+        }));
+        Ok(())
+    }
+
+    /// The program's table, for a process with a personality.
+    pub fn program(&self) -> Option<Arc<Program>> {
+        self.program.0.lock().clone()
+    }
+
+    /// Charges the table pages the program's table needs to map `page`.
+    fn charge_program_tables(&self, program: &Program, page: u64) -> Result<(), Error> {
+        let mut tables = program.tables.lock();
+        for (level, size) in charge::TABLE_REGIONS.iter().copied().enumerate() {
+            let region = page / size;
+            // The topmost region's table is the fixed charge's.
+            if region == (map_end() - 1) / size || tables[level].contains(&region) {
+                continue;
+            }
+            self.account.charge(charge::PAGE)?;
+            tables[level].insert(region);
+        }
+        Ok(())
+    }
+
+    /// Serves a page fault at `addr` on the table the thread runs on, the program's when
+    /// `program`: a first touch, a pager's page supplied, a page the program's table does
+    /// not hold yet, or a write to a page shared copy-on-write, which copies it. `Ok(true)`
+    /// when served, `Ok(false)` when the fault is the process's own (outside its areas,
+    /// against their protection, or the program's in the personality's region),
+    /// `ShouldWait` for a pager's page not supplied yet (the caller waits with
+    /// [`Space::want`] and faults again), and the error when the page could not be had:
+    /// `QuotaExceeded` when the account has no room for it.
+    pub fn fault(&self, addr: u64, access: Access, program: bool) -> Result<bool, Error> {
+        let page = addr & !(PAGE_SIZE - 1);
+        let table = match program {
+            false => None,
+            true => match self.program() {
+                Some(p) if !p.region.contains(&page) => Some(p),
+                _ => return Ok(false),
+            },
+        };
+        let vm = table.as_ref().map_or(&self.vm, |p| &p.vm);
+        let mut inner = self.inner.lock();
+        let Some((start, area)) = Space::area_at(&inner, page) else {
+            return Ok(false);
+        };
+        if !allows(area.prot, access) || matches!(area.backing, Backing::Device { .. }) {
+            return Ok(false);
+        }
+        let area = area.clone();
+        let write = access == Access::Write;
+        let range = page as usize..(page + PAGE_SIZE) as usize;
+        let present = {
+            let guard = disable_preempt();
+            let mut cursor = vm.cursor(&guard, &range).map_err(|_| Error::InvalidArgs)?;
+            match cursor.query() {
+                Ok((_, Some(item))) => Some(item.prop().flags.contains(PageFlags::W)),
+                _ => None,
+            }
+        };
+        match present {
+            // Served by another thread meanwhile.
+            Some(writable) if !write || writable => return Ok(true),
+            // Copy-on-write: the page leaves both tables before the object stops sharing it.
+            Some(_) => self.unmap_ptes(page, PAGE_SIZE),
+            None => {}
+        }
+        let (frame, own) = self.frame(&mut inner, start, &area, page, write)?;
+        if let Some(p) = &table {
+            self.charge_program_tables(p, page)?;
+        }
+        let prot = if own {
+            area.prot
+        } else {
+            area.prot & !map::WRITE
+        };
+        let guard = disable_preempt();
+        let mut cursor = vm
+            .cursor_mut(&guard, &range)
+            .map_err(|_| Error::InvalidArgs)?;
+        if matches!(cursor.query(), Ok((_, Some(_)))) {
+            return Ok(true);
+        }
+        cursor.jump(page as usize).map_err(|_| Error::InvalidArgs)?;
+        cursor.map(
+            frame,
+            PageProperty::new_user(page_flags(prot), CachePolicy::Writeback),
+        );
+        Ok(true)
+    }
+
+    /// The futex queue of a word of a shared memory object (one not private to this space:
+    /// not a snapshot, an image segment or the first stack): the object and the word's
+    /// offset in it, the same in every space that maps it. `None` for any other word.
+    pub fn shared_word(&self, addr: u64) -> Option<(u64, u64)> {
+        let inner = self.inner.lock();
+        let (start, area) = Space::area_at(&inner, addr)?;
+        match &area.backing {
+            Backing::Object { memory, first, .. }
+                if !memory.is_snapshot() && !matches!(area.kind, Kind::Image | Kind::Stack) =>
+            {
+                // Kernel addresses: the top bit is set, which no process's number has.
+                let object = Arc::as_ptr(memory) as usize as u64 | 1 << 63;
+                let offset = *first as u64 * PAGE_SIZE + (addr - start);
+                Some((object, offset))
+            }
+            _ => None,
+        }
+    }
+
+    /// Waits until the pager's page under `addr` is supplied: `Fault` when it is refused,
+    /// `BadState` when the thread ends meanwhile.
+    pub fn want(&self, addr: u64, thread: &Thread) -> Result<(), Error> {
+        let page = addr & !(PAGE_SIZE - 1);
+        let (memory, index) = {
+            let inner = self.inner.lock();
+            let (start, area) = Space::area_at(&inner, page).ok_or(Error::Fault)?;
+            match &area.backing {
+                Backing::Object { memory, first, .. } => (
+                    memory.clone(),
+                    first + ((page - start) / PAGE_SIZE) as usize,
+                ),
+                _ => return Ok(()),
+            }
+        };
+        memory.want(index, thread)
+    }
+
+    /// Makes the pages of `va .. va + len` ready for one of the kernel's copies through
+    /// the space's table, as a fault on each would, waiting for a pager's pages.
+    pub fn prepare(&self, va: u64, len: u64, write: bool, thread: &Thread) -> Result<(), Error> {
+        let end = va.checked_add(len).ok_or(Error::Fault)?;
+        let access = if write { Access::Write } else { Access::Read };
+        let mut page = va & !(PAGE_SIZE - 1);
+        while page < end {
+            match self.fault(page, access, false) {
+                Ok(true) => page += PAGE_SIZE,
+                Ok(false) => return Err(Error::Fault),
+                Err(Error::ShouldWait) => self.want(page, thread)?,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes write access away from every entry of `va .. end` in `vm`.
+    fn write_protect(vm: &VmSpace, va: u64, end: u64) {
+        let guard = disable_preempt();
+        let range = va as usize..end as usize;
+        let Ok(mut cursor) = vm.cursor_mut(&guard, &range) else {
+            return;
+        };
+        let mut changed = false;
+        while cursor.virt_addr() < end as usize {
+            let left = end as usize - cursor.virt_addr();
+            if cursor
+                .protect_next(left, |flags, _| *flags -= PageFlags::W)
+                .is_none()
+            {
+                break;
+            }
+            changed = true;
+        }
+        if changed {
+            cursor.flusher().issue_tlb_flush(TlbFlushOp::for_all());
+            cursor.flusher().dispatch_tlb_flush();
+            cursor.flusher().sync_tlb_flush();
+        }
+    }
+
+    /// Makes `child`, a new and empty space, a copy-on-write clone of this one, for
+    /// `process_clone` (kernel-is-the-machine §4.1 b). A private area (zero pages, an
+    /// image segment, the first stack, a snapshot) is backed on each side by an object
+    /// sharing its pages, which either side copies when it writes; this side's entries
+    /// for it lose write access. Any other mapping of an object is shared. The data
+    /// plane's and device areas are left out. The personality's region carries over.
+    pub fn clone_into(&self, child: &Space) -> Result<(), Error> {
+        let mut inner = self.inner.lock();
+        let mut theirs: BTreeMap<u64, Area> = BTreeMap::new();
+        let mut mine: Vec<(u64, Area)> = Vec::new();
+        let mut taken: Vec<u64> = Vec::new();
+        for (&start, area) in inner.areas.iter() {
+            let pages = ((area.end - start) / PAGE_SIZE) as usize;
+            let backed = |memory: Arc<MemoryObject>, first: usize, writable: bool| Area {
+                backing: Backing::Object {
+                    memory,
+                    first,
+                    writable,
+                },
+                ..area.clone()
+            };
+            match &area.backing {
+                _ if area.kind == Kind::Plane => {}
+                Backing::Device { .. } => {}
+                Backing::Object {
+                    memory,
+                    first,
+                    writable,
+                } if memory.is_snapshot() || matches!(area.kind, Kind::Image | Kind::Stack) => {
+                    let (m, m_first, t) =
+                        memory.fork(*first, pages, &self.account, &child.account)?;
+                    mine.push((start, backed(m, m_first, *writable)));
+                    theirs.insert(start, backed(t, 0, *writable));
+                }
+                Backing::Object { .. } => {
+                    theirs.insert(start, area.clone());
+                }
+                Backing::Zero => {
+                    let held: Vec<(usize, UFrame)> = inner
+                        .zero
+                        .range(start..area.end)
+                        .map(|(p, f)| (((p - start) / PAGE_SIZE) as usize, f.clone()))
+                        .collect();
+                    taken.extend(held.iter().map(|(i, _)| start + *i as u64 * PAGE_SIZE));
+                    let (m, t) =
+                        MemoryObject::fork_zero(pages, held, &self.account, &child.account)?;
+                    mine.push((start, backed(m, 0, true)));
+                    theirs.insert(start, backed(t, 0, true));
+                }
+            }
+        }
+        child.adopt(theirs, inner.brk)?;
+        if let Some(p) = self.program() {
+            let len = p.region.end - p.region.start;
+            child.set_program(p.region.start, len, p.copy.clone())?;
+        }
+        let program = self.program();
+        for (start, area) in mine {
+            let end = area.end;
+            inner.areas.insert(start, area);
+            Space::write_protect(&self.vm, start, end);
+            if let Some(p) = &program {
+                Space::write_protect(&p.vm, start, end);
+            }
+        }
+        let gone: Vec<UFrame> = taken.iter().filter_map(|p| inner.zero.remove(p)).collect();
+        self.settle(&mut inner);
+        drop(inner);
+        drop(gone);
+        Ok(())
+    }
+
+    /// Takes `areas` into this new and empty space, charged as `map` charges them.
+    fn adopt(&self, areas: BTreeMap<u64, Area>, brk: Option<Brk>) -> Result<(), Error> {
+        let pieces: Vec<(u64, u64)> = areas.iter().map(|(s, a)| (*s, a.end)).collect();
+        let tables = moruna_quota::tables(&pieces, None, None, map_end());
+        let mut inner = self.inner.lock();
+        if !inner.areas.is_empty() {
+            return Err(Error::BadState);
+        }
+        self.charge(
+            &mut inner,
+            areas.len() as u64 * charge::AREA + tables.bytes(),
+        )?;
+        inner.tables = tables.pages;
+        inner.brk = brk;
+        for (start, area) in &areas {
+            self.fill_ptes(&inner, *start, area, *start, area.end)?;
+        }
+        inner.areas = areas;
+        Ok(())
+    }
+}
 
 impl Drop for Space {
     fn drop(&mut self) {

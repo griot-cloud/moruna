@@ -15,6 +15,13 @@ pub fn thread_set_cpu(thread: &Thread, cpu: Option<u32>) -> Result<()> {
     check(raw::call2(nr::THREAD_SET_CPU, u64::from(thread.0.raw()), target).0).map(|_| ())
 }
 
+/// Runs the calling thread on CPU `cpu` only, or anywhere with `None` (thread handle 0 means the
+/// caller). For a thread that holds no handle to itself, such as a Linux program's thread.
+pub fn pin_current_thread(cpu: Option<u32>) -> Result<()> {
+    let target = cpu.map_or(cpu::ANY, u64::from);
+    check(raw::call2(nr::THREAD_SET_CPU, 0, target).0).map(|_| ())
+}
+
 /// Maps the read-only clock page into this process (once) and returns its address.
 pub fn clock_page() -> Result<u64> {
     check(raw::call0(nr::CLOCK_PAGE).0)
@@ -82,7 +89,7 @@ mod tests {
         bytes[page::MULTIPLIER..page::MULTIPLIER + 8].copy_from_slice(&3u64.to_le_bytes());
         bytes[page::SHIFT..page::SHIFT + 4].copy_from_slice(&1u32.to_le_bytes());
         let r = ClockReading::from_bytes(2, &bytes, 2).expect("steady");
-        assert_eq!(r.nanos_at(600), 1_000 + (100 * 3 >> 1));
+        assert_eq!(r.nanos_at(600), 1_000 + ((100 * 3) >> 1));
         assert_eq!(
             ClockReading::from_bytes(3, &bytes, 3),
             None,

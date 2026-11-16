@@ -165,7 +165,8 @@ pub mod nr {
     // `BadSyscall` until its stream implements it (`architecture/data-os-streams.md`).
     // Stream A, the data path's mechanisms:
     /// `thread_set_cpu(thread, cpu)`: runs the thread on CPU `cpu` only, or anywhere with
-    /// `cpu::ANY`. A place to run, never a function to run (data-os §2).
+    /// `cpu::ANY`; thread handle 0 is the calling thread. A place to run, never a function to
+    /// run (data-os §2).
     pub const THREAD_SET_CPU: u64 = BASE + 53;
     /// `clock_page() -> address`: maps the read-only `clock_page::Page` into the caller
     /// once, so time is read with no call (data-os §2).
@@ -261,11 +262,13 @@ pub enum Error {
     /// (2.3) The account the call charges has no room for it: its use, what it holds for
     /// the accounts carved from it, and the call's charge would pass its limit.
     QuotaExceeded = 15,
+    /// (2.6, stream B1) The thread was interrupted (`thread_interrupt`) while it waited.
+    Interrupted = 16,
 }
 
 impl Error {
     /// All errors, in code order.
-    pub const ALL: [Error; 15] = [
+    pub const ALL: [Error; 16] = [
         Error::BadHandle,
         Error::WrongType,
         Error::AccessDenied,
@@ -281,6 +284,7 @@ impl Error {
         Error::BadState,
         Error::Fault,
         Error::QuotaExceeded,
+        Error::Interrupted,
     ];
 
     /// The positive code; `rax` carries its negation.
@@ -326,6 +330,7 @@ impl Error {
             Error::BadState => "bad state",
             Error::Fault => "fault",
             Error::QuotaExceeded => "quota exceeded",
+            Error::Interrupted => "interrupted",
         }
     }
 }
@@ -714,7 +719,8 @@ pub mod cpu {
     pub const ANY: u64 = u64::MAX;
 }
 
-/// The page `clock_page` maps (ABI 2.6, stream A): a seqlock. A reader reads `SEQUENCE`,
+/// The page `clock_page` maps (ABI 2.6, stream A): a seqlock. Its time is `clock_get`'s
+/// monotonic nanoseconds, the clock every deadline in this ABI is measured on. A reader reads `SEQUENCE`,
 /// then the fields, then `SEQUENCE` again, and retries if it changed or was odd. Time in
 /// nanoseconds is `BASE_NS + ((tsc - BASE_TSC) * MULTIPLIER) >> SHIFT`.
 pub mod clock_page {
@@ -1259,7 +1265,7 @@ mod tests {
             "reserved until stream A"
         );
         assert_eq!(personality::LEN, 8 + 16 * 8 + 7 * 8);
-        assert!(clock_page::SHIFT + 4 <= clock_page::LEN);
+        const { assert!(clock_page::SHIFT + 4 <= clock_page::LEN) };
         assert_eq!(nr::ACCOUNT_MATCHES, nr::ACCOUNT_INFO + 1);
         assert_eq!(nr::ACCOUNT_CREATE, nr::PROCESS_GRANT + 1);
         assert!(nr::is_native(nr::BATCH_GET) && nr::is_native(nr::PLANE_PROBE));
@@ -1311,6 +1317,9 @@ mod tests {
         assert_eq!(Error::QuotaExceeded.code(), 15);
         assert_eq!(Error::from_code(15), Some(Error::QuotaExceeded));
         assert_eq!(Error::QuotaExceeded.name(), "quota exceeded");
+        assert_eq!(Error::Interrupted.code(), 16);
+        assert_eq!(Error::from_code(16), Some(Error::Interrupted));
+        assert_eq!(Error::Interrupted.name(), "interrupted");
         assert_eq!(charge::memory(0), charge::OBJECT);
         assert_eq!(
             charge::memory(3),
