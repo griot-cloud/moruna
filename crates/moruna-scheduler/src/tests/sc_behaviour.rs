@@ -428,6 +428,60 @@ fn sc_d1_ordered_sink_handle() {
     assert_eq!(written, (0..8).collect::<Vec<u64>>());
 }
 
+/// `on_worker_start` is called once on each worker's own thread before it takes work, and the
+/// run is the same run.
+#[test]
+fn every_worker_start_is_told_on_its_own_thread() {
+    let seen: Arc<std::sync::Mutex<Vec<(u16, String)>>> = Arc::default();
+    let record = Arc::clone(&seen);
+    let sink = FakeSink::new();
+    let scheduler = Scheduler::new(
+        SchedulerConfig {
+            workers_max: 3,
+            workers_active: 3,
+            initial_morsel_target: 8,
+            morsel_min: 8,
+            morsel_max: 1 << 20,
+            on_worker_start: Some(crate::WorkerStart(Arc::new(move |worker| {
+                let name = std::thread::current().name().unwrap_or("").to_string();
+                record.lock().unwrap().push((worker, name));
+            }))),
+            ..cfg()
+        },
+        Pipeline::chain(
+            Arc::new(FakeSource::new().splits(1, 8, 64)),
+            vec![Arc::new(FakeKernel::new())],
+            SinkHandle::wrap(Box::new(sink.clone()), false, 1 << 20),
+        ),
+        Arc::new(FakePlacement::new()),
+        Arc::new(moruna_testkit::FakeAllocator::new()),
+        Arc::new(moruna_testkit::FakeTrace::new()),
+        Arc::new(moruna_testkit::FakeSampler::new()),
+    )
+    .expect("new");
+    assert!(format!("{:?}", cfg_with_hook()).contains("WorkerStart"));
+    match scheduler.run(CancelToken::new()) {
+        Ok(RunOutcome::Completed { .. }) => {}
+        other => panic!("expected Completed, got {other:?}"),
+    }
+    let mut seen = seen.lock().unwrap().clone();
+    seen.sort();
+    assert_eq!(
+        seen,
+        (0..3u16)
+            .map(|w| (w, format!("moruna-worker-{w}")))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(sink.written().len(), 8);
+}
+
+fn cfg_with_hook() -> SchedulerConfig {
+    SchedulerConfig {
+        on_worker_start: Some(crate::WorkerStart(Arc::new(|_| {}))),
+        ..cfg()
+    }
+}
+
 /// f.4, f.13: a `Forbid` kernel cannot be resumed, and a manifest that holds no state for an
 /// instance of a `Checkpoint` stage is a resume error.
 #[test]

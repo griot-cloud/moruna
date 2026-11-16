@@ -3,7 +3,12 @@
 
 Uses prebuilt production services/codecs and explicit existing immutable inputs.
 TCG is intentional test harness ONLY, never the production KVM launcher fallback.
+`--accel kvm` runs the same direct-QEMU case under KVM (`-accel kvm -cpu host`) and records
+mode `explicit-kvm`; it needs /dev/kvm and never falls back to TCG. The SDK and fixture proofs
+launch their own VMs and stay TCG.
 No compilation/download, fake service, permission parser or successful boot claim.
+`proof.py check ROOT --accel tcg|kvm` checks a KVM evidence root as check-node-fixtures.py
+checks a TCG one.
 """
 import argparse
 import hashlib
@@ -28,6 +33,67 @@ def digest(path):
         for block in iter(lambda: stream.read(MIB), b""):
             h.update(block)
     return h.hexdigest()
+
+
+MODES = {"tcg": "explicit-test-tcg", "kvm": "explicit-kvm"}
+NAMES = ("rows", "a task that fails", "a refused record", "cancel", "an image nobody named")
+
+
+def accel_args(accel):
+    """QEMU's accelerator and CPU for a mode: TCG's `max`, or KVM with the host's CPU."""
+    if accel == "kvm":
+        return ["-accel", "kvm", "-cpu", "host"]
+    if accel == "tcg":
+        return ["-accel", "tcg", "-cpu", "max"]
+    raise ValueError(f"unknown accelerator {accel!r}")
+
+
+def kvm_ready(path="/dev/kvm"):
+    """Whether this host can run the case under KVM: the device exists and this user may open it."""
+    return os.path.exists(path) and os.access(path, os.R_OK | os.W_OK)
+
+
+def check(root, accel):
+    """The direct-QEMU evidence of all 15 cases under `accel`, as check-node-fixtures.py checks
+    TCG's: every case passed and cleaned up in its mode, QEMU ended as the guest asked, one
+    immutable input census, the CPUs online, one verdict per case, case 3's record-check fault."""
+    mode = MODES[accel]
+    if not root.is_absolute():
+        raise ValueError("explicit absolute node evidence root required")
+    baseline = None
+    for cpus in (1, 2, 4):
+        for case, name in enumerate(NAMES, 1):
+            out = root / f"cpu{cpus}" / f"case{case}"
+            result = json.loads((out / "result.json").read_text())
+            if (result.get("version"), result.get("cpus"), result.get("case"), result.get("passed"),
+                    result.get("cleanup"), result.get("mode")) != (1, cpus, case, True, True, mode):
+                raise ValueError(f"incomplete/failed actual node case: {out}")
+            if result.get("transport") == "native-sdk":
+                raise ValueError(f"the SDK proof is TCG only: {out}")
+            status = (result.get("qemu_exit"), result.get("cleanup_method"))
+            if status not in ((33, "guest-normal33"), (0, "qmp-quit")):
+                raise ValueError(f"uncertain/failed actual QEMU lifecycle: {out}: {status}")
+            inputs = result.get("inputs")
+            if not isinstance(inputs, dict) or not inputs or any(
+                    not isinstance(v, str) or len(v) != 64 or any(c not in "0123456789abcdef" for c in v)
+                    for v in inputs.values()):
+                raise ValueError(f"immutable input hashes absent/invalid: {out}")
+            actual = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+            if result.get("inputs_sha256") != actual:
+                raise ValueError(f"actual input census mismatch: {out}")
+            baseline = baseline or actual
+            if baseline != actual:
+                raise ValueError(f"native profiles were tested with different immutable inputs: {out}")
+            serial = (out / "serial.log").read_text(errors="replace")
+            peer = (out / "peer.log").read_text(errors="replace")
+            if f"kk: {cpus} CPUs online" not in serial or "panic" in serial.lower() or "FAIL:" in serial or "FAIL:" in peer:
+                raise ValueError(f"actual CPU boot or peer failed: {out}")
+            prefix = f"embedder: ok: run {case} ({name}):"
+            if sum(line.startswith(prefix) for line in peer.splitlines()) != 1:
+                raise ValueError(f"original strict case verdict missing/duplicated: {out}")
+            if case == 3 and "faulted: its record on slot 1 was refused by the engine's check:" not in serial:
+                raise ValueError(f"original record-check fault witness missing: {out}")
+    return f"native node fixtures ({accel}): all15 real case/profile results passed with one immutable input census and confirmed cleanup"
 
 
 def print_failure(out, record, stream=None):
@@ -57,6 +123,13 @@ def print_failure(out, record, stream=None):
 
 
 def main():
+    if sys.argv[1:2] == ["check"]:
+        checker = argparse.ArgumentParser(prog="proof.py check")
+        checker.add_argument("root", type=Path)
+        checker.add_argument("--accel", choices=tuple(MODES), required=True)
+        a = checker.parse_args(sys.argv[2:])
+        print(check(a.root, a.accel))
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--cpus", type=int, choices=(1, 2, 4), required=True)
@@ -73,6 +146,8 @@ def main():
     parser.add_argument("--io-phase", choices=("created", "existing"))
     parser.add_argument("--io-home", type=Path)
     parser.add_argument("--io-net", type=Path)
+    parser.add_argument("--accel", choices=tuple(MODES), default="tcg",
+                        help="tcg (the default, CI's) or kvm: the direct-QEMU case under KVM, no fallback")
     args = parser.parse_args()
     if any((args.io_phase is not None, args.io_home is not None, args.io_net is not None)) != all((args.io_phase is not None, args.io_home is not None, args.io_net is not None)):
         parser.error("IO fixture requires phase, same provisioned home, and existing net-proof inputs together")
@@ -81,6 +156,10 @@ def main():
         parser.error("fixture command/job/boot/cell required together, separate from SDK server and IO proofs")
     if args.sdk_proof and args.io_phase:
         parser.error("SDK engine-case proof cannot stand in for the separate native storage/network IO actor")
+    if args.accel == "kvm" and (args.sdk_proof or fixture_mode):
+        parser.error("--accel kvm runs QEMU directly; the SDK and fixture proofs launch their own TCG VMs")
+    if args.accel == "kvm" and not kvm_ready():
+        parser.error("--accel kvm needs /dev/kvm readable and writable by this user; there is no fallback to TCG")
     if not 10 <= args.seconds <= 600:
         parser.error("explicit per-case bound must be 10..600 seconds")
     out = args.out.absolute()
@@ -342,7 +421,7 @@ def main():
                                   "canonical/identity.json", "assets/node.conf", "assets/engine.conf", "assets/initial.job",
                                   "assets/node-resources.json", "job.json", "assets/initramfs.cpio", "kernel.qemu.elf")}
         record.update({"engine_spec_digest": engine_spec_digest, "run_id": run, "kernel_sha256": digest(args.kernel_elf), "job_sha256": digest(out / "job.json"),
-                       "initramfs_sha256": digest(out / "assets/initramfs.cpio"), "mode": "explicit-test-tcg", "acceptance": "native-storage-network" if args.io_phase else "canonical-engine-task"})
+                       "initramfs_sha256": digest(out / "assets/initramfs.cpio"), "mode": MODES[args.accel], "acceptance": "native-storage-network" if args.io_phase else "canonical-engine-task"})
         if args.io_phase:
             record["case_inputs"]["io.image"] = digest(description)
         else:
@@ -353,7 +432,7 @@ def main():
             if backend.poll() is not None:
                 raise RuntimeError("actual vsock backend exited before binding")
             time.sleep(0.01)
-        qemu_args = [args.qemu, "-accel", "tcg", "-cpu", "max", "-machine", "q35", "-m", f"{RAM // MIB}M",
+        qemu_args = [args.qemu, *accel_args(args.accel), "-machine", "q35", "-m", f"{RAM // MIB}M",
                      "-smp", args.cpus, "-display", "none", "-monitor", "none", "-no-reboot", "-nodefaults",
                      "-serial", f"file:{out / 'serial.log'}", "-qmp", f"unix:{out / 'qmp.sock'},server=on,wait=off",
                      "-object", f"memory-backend-memfd,id=ram0,size={RAM},share=on", "-numa", "node,memdev=ram0",

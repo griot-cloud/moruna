@@ -70,7 +70,8 @@ first, and iterates until Moruna is significantly better than the other engines.
   - `moruna-bench` (griot-stg) is the only x86-64 KVM machine, and this Mac is arm64.
   - Every heavy stage takes `~/.vm-lock` (`mkdir`, write `owner`), respects `~/.vm-lock-next`,
     runs one VM at a time at no more than 6 GiB, never steals the lock, and releases only its
-    own.
+    own. The 6 GiB cap is the Mac's rule, kept for booted tests; the gate's VM on
+    `moruna-bench` runs at the benchmark's budget (24 GiB on the D8ds_v6, as 0.6.6's table did).
   - The machine shuts down at 02:00 UTC, and that wipes `/data`. Keep results on
     `/home/bench`.
 - **Style.** No em-dashes in text. Plain, short comments, as the files already have.
@@ -193,10 +194,10 @@ and switches to the new one when the call answers.
   Sockets and the cloud platform stay out.
 - **Tests:**
   - host tests of the carried logic;
-  - then booted: static musl, dynamic glibc, CPython 3.14 importing NumPy and pyarrow (no shell), and
-    the gVisor system-call tests that apply.
+  - then booted: static musl and dynamic glibc (no shell), and the gVisor system-call tests that
+    apply. CPython is not a 0.7.0 target (Brackly, 2026-11-16).
 - **Done when:**
-  - the gate's Python image runs as an image task on it under KVM;
+  - static musl and dynamic glibc programs, and a forking one, run on it under KVM;
   - the engine runs on it;
   - `kernel/linux` can be retired. The integrator retires it at merge.
 - **Size:** the largest stream. About 137,000 lines, about 82% mechanical. If it needs to split
@@ -274,8 +275,9 @@ and switches to the new one when the call answers.
   - the `COPIED` counter and an engine boundary-copy counter stay at zero through N image
     stages;
   - no call per batch, counted.
-- **Done when:** a Python image task runs a batch function under KVM with no boundary copy and
-  no call per batch in steady state, and its rows match.
+- **Done when:** a native Rust task (`moruna_sys::plane`) runs a batch function under KVM with
+  no boundary copy and no call per batch in steady state, and its rows match. The Python shim
+  stays in `images/python/` for later (`arrow-core-0.7.md` §8) and is not part of the proof.
 
 ### D. The host side
 
@@ -312,20 +314,46 @@ and switches to the new one when the call answers.
     `crates/moruna-py/tests/fixtures/kd3-matrix.json`);
   - `kernel/node/tools/proof.py`;
   - `kernel/tools/node-fixtures.sh`;
-  - a new `images/gate/` for the gate's images.
+  - a new `images/gate/` for the gate's tasks.
 - **Contracts:** measures every contract's gain as `data-os.md` §1a names it (copies, faults,
   calls per batch, interrupts on worker cores, bytes through a page cache), against 0.6.6 and
   against today's microkernel figures from step 1.
 - **Builds:**
   - a KVM mode for the node fixtures (`proof.py` forces TCG today, line 356);
   - KD3's conformance on the data OS (same rows, refusals and decisions as on a Linux host);
-  - the gate's Python image (CPython 3.14 with NumPy and pyarrow, 0.6.6's kernels unchanged,
-    P's shim);
-  - the harness's data OS mode: 0.6.6's jobs through `moruna run` on `moruna-bench`, against
-    0.6.6, on the PM's terms (`arrow-core-0.7.md` §9).
+  - the seven jobs' functions ported to Rust as native tasks on `moruna_sys::plane`, each
+    producing 0.6.6's output rows (count and content hash) from 0.6.6's input. A float column
+    that cannot match bit for bit is named with its tolerance before it is measured;
+  - the harness's data OS mode: each job through `moruna run` on `moruna-bench`, timed against
+    0.6.6 on the same data (`arrow-core-0.7.md` §9);
+  - the PM's controls (2026-11-16), so the result says something about the engine and the OS,
+    not only about leaving Python:
+    1. **The same function on 0.6.6.** If 0.6.6 can run the Rust port (the `rust` entry from
+       strict-guest-kernels, a kernel compiled into the binary), 0.6.6 is timed with it too. The
+       report gives both: 0.6.6 with the Python functions (the published table) and 0.6.6 with
+       the Rust functions. If 0.6.6 cannot run them, the report says so.
+    2. **A plain Rust baseline** for the "better than other options" runs: the same Rust function
+       in a plain Rust thread pool (arrow-rs and parquet reading the same row groups, rayon,
+       writing the same zstd level). Ray and Spark keep the Python functions, labelled as such.
+    3. **The same output settings for every run:** zstd level, row group size, files and splits.
+    4. **CPU-seconds and peak memory beside wall time.**
+    5. **A time split per job:** read and decode, the function, encode and write, and waits.
+    6. **A record of each port's equivalence:** the Python function it replaces, its output rows
+       matched by count and content hash, and any float tolerance named before measuring.
+  - **The content hash is taken on a canonical form** (integrator, 2026-11-16), the same for
+    0.6.6 and 0.7, because `driver.py`'s `checksum` is only a row count and column sums:
+    - a row-wise function's output is sorted by all its columns, then hashed;
+    - a per-batch aggregate, whose rows depend on where batches split (Occupancy's partial
+      counts), is first re-aggregated by its group keys (`zone`, `minute_of_day`, summing
+      `car_minutes`), then sorted and hashed;
+    - the row count compared is the canonical form's.
+  - **The PM's NYC matrix** in the harness's report (`arrow-core-0.7.md` §9): the five labelled
+    row groups (native expressions included), the columns, and 0.7's speedup against the best
+    Rust row and the best native-expression row.
 - **Tests:** the harness's own unit tests, and the fixtures under KVM.
-- **Done when:** the gate runs end to end on `moruna-bench` for the NYC set, with identical rows,
-  boot reported, and both machine types ready, and hands its numbers to the PM.
+- **Done when:** the gate runs end to end on `moruna-bench` for the NYC set, then the large
+  jobs, with identical rows, boot reported, and both machine types ready, and hands its numbers
+  to the PM.
 
 ## Order and dependencies
 
@@ -334,7 +362,7 @@ and switches to the new one when the call answers.
 - **Hard dependencies:**
   - B2's entry loop needs B1's wrappers (B1's first commit);
   - the gate needs C, P and D;
-  - the gate's Python image runs on B2's personality, or on today's personality until B2 lands.
+  - the gate's tasks are native Rust, so the gate does not wait on B2.
 - **Merge order** into `feature/arrow-core-0.7`: A and B1 first (the kernel), then C and P, then
   D, then B2 (with `kernel/linux` retired), and E throughout.
 - **The integrator,** at each merge:
@@ -392,3 +420,110 @@ and switches to the new one when the call answers.
     (`nohz_full`, `isolcpus` or a cgroup cpuset, `rcu_nocbs`), and report the loss measured
     again. It is a host setting for Griot's node, so D documents it and measures it on
     `moruna-bench`.
+- **2026-11-16: B1's three follow-ups merged** (`586d7bc4`, from `089a7e48`). CI's boot passed
+  193 of 193 checks under KVM on 1, 2 and 4 CPUs.
+  - A snapshot binds to the one space that maps it; a clone makes one pair of sides per object,
+    so two mappings of one snapshot stay one object in the child, with no later write shared.
+  - A clone moves each shared zero page with the bytes already charged for it, so the source's
+    account needs room only for 64-byte records.
+  - `process_read` and `process_write` wait for a pager's page as a fault does, and answer
+    `Fault` on a refusal.
+  - Kernel mode: net +90 code lines, no new calls. Ping-pong 6.15 s, 5.30 s and 0.74 s.
+  - **For B2-vm:** a `MAP_PRIVATE` file mapping needs its own `memory_snapshot` per process.
+- **2026-11-16: `fork` decided** (`data-os.md` §4), on B2's question that a forked child has no
+  handles. B1 adds `process_clone`'s `SHARE_HANDLES` (personality processes only, the engine's
+  table never shared, no cycle leaks). The personality maps its region's objects into every
+  process itself; shared page tables were declined.
+- **2026-11-16: B2-fs final** at `1dfe096f` (`feature/data-os-b2-fs`), for B2 to merge.
+  - The root is an imagefs client over Moruna's verified layers, not overlayfs.
+  - `/tmp` is a tmpfs under the scratch quota. `/proc` and `/sys` are cut to the paths glibc,
+    CPython, OpenBLAS and the allocators read. `/dev` is `null`, `zero` and `urandom`. There
+    are no terminals.
+  - Descriptors 0, 1 and 2 are the input slot, the output slot and the log.
+  - New code is at 94.6% line coverage.
+  - File times read as zero, as `kernel/linux` reports them today.
+  - The mount-family handlers (836 lines) and the fs items only they use go in one pass by B2,
+    since `refused.rs` answers first.
+- **2026-11-16: stream C merged** (`e42a083c`, from `3141b3d6`). All 15 production-node cases
+  pass under KVM on C's head, with A and B1's first round merged.
+  - It adds:
+    - the engine's arena on granted large-page memory, never given back (C4);
+    - the engine driving its data disks' virtio-blk queues (C2, C3, C7);
+    - workers placed at start through the scheduler's worker-start hook, which decides
+      nothing;
+    - no shell as the engine's program, and outputs laid out in the scratch.
+  - Coverage: arena 93.1%, runtime 87.0%.
+  - **Waits on D:** the `disk://` job under KVM.
+- **2026-11-16: the gate is the jobs' functions in Rust** (Brackly: "we have data, then a
+  function, then producing some other data; we're supposed to measure that, simple").
+  - E ports the seven functions to Rust as native tasks; same input, 0.6.6's output rows, timed
+    against 0.6.6.
+  - No Python on the gate's path: P's proof is a native Rust task, and B2's 0.7.0 targets are
+    musl and glibc. CPython waits for `arrow-core-0.7.md` §8.
+  - The gate needs C, P, D and E, and no longer waits on B2.
+- **2026-11-16: B2-vm final** at `94a30bfd` (`feature/data-os-b2-vm`), merged into B2's branch
+  (`bf6f8db4`).
+  - Frames are pages of memory-object chunks (2 to 64 MiB) from an injected source (B2's region
+    allocator), kept as (object, offset) plus address.
+  - `process_map`, `process_unmap` and `process_protect` are batched per cursor: fault-around's
+    16 pages are 1 call, and fork through `process_clone` is 0 calls a page.
+  - Private-file copy-on-write is done on frames, not `memory_snapshot`.
+  - Host tests: ostd 91, core 147. Coverage 85.7% to 100% per file, ostd 92.3%.
+  - Timings wait for B2's slot (`kernel/linuxlayer/vmcost`).
+  - **Open for the core, decided after those timings:** each `process_map` creates one area
+    (96 bytes charged), and adjacent areas of one object are never merged, so anonymous memory
+    faulted a page at a time costs an area a page.
+- **2026-11-16: stream E's host work merged** (`a52dc581`, from `bf5c1115`).
+  - All seven functions are ported (`images/gate/functions`) and match 0.6.6's Python outputs on
+    the fixtures, five bit for bit. Score's `predicted_tip` is within abs 1.1e-6 (BLAS order),
+    and Overture's areas and volumes within rel 1e-9 and 1e-12, the observed differences near
+    machine precision. The tolerances are confirmed again on x86.
+  - The canonical hash is an order-independent multiset hash (the sum of row SHA-256s mod
+    2^128), with Occupancy regrouped first.
+  - **Control 1:** 0.6.6 cannot run a `rust` kind (removed in 0.5.8, KD-I7). Its row is
+    "0.6.6, Rust function via pyo3" (`images/gate/py066`, GIL released), labelled so.
+  - The baseline (`gate-baseline`, rayon, arrow-rs, parquet, Moruna's sink settings) is built,
+    as are the harness's engines, plan, report and the KVM mode for the node fixtures.
+  - Coverage: functions 94.2%, record 86.1%, baseline 90.8%.
+- **2026-11-16: decisions on E's gaps** (integrator; Brackly away, technical calls):
+  - **A native program in an image** is declared by its kernel (`abi: moruna`; the default
+    stays Linux). The runner starts it with `process_create` and its plane attached, never
+    through the personality, after checking the ELF matches the declaration. Owner: P.
+  - **Output size:** a task may put several output records for one input batch, so no window
+    is sized from a guess of the stage's amplification. Owner: P.
+  - **A native task's log** goes through `moruna_sys::plane` onto the job updates, as a Linux
+    task's descriptor 2 does. Owner: P, after the gate.
+  - **`moruna run`'s form** follows E's harness: `moruna run JOB --output DIR --report FILE`,
+    with local inputs staged as `disk://` names and `vm.boot_s` in the report. Owner: D.
+  - **The time split:** the engine's report times decode apart from read, and encode apart from
+    write. Owner: C.
+  - **AVX:** the gate's tasks build with `+avx,+avx2` (no FMA, so the bits are unchanged). Both
+    gate machines have AVX2, 0.6.6's NumPy used the hardware, and OSTD saves AVX state with
+    `xsave`. A booted test of AVX state across preemption goes into A's next run. The
+    `x86_64-moruna-user` default stays SSE2 for other programs.
+  - **The gate's VM time:** about 15 h in all. The NYC D8ds_v6 groups 1, 2, 3 and 5 (about
+    1.5 h) go first, once P and D are merged; the Python engines, the D4ls_v5 and the large jobs
+    follow on later days.
+- **2026-11-16: B2's first boots under KVM** (18:42 to 18:54 UTC, head `d0383bc5` with
+  `9e8ab3e1`'s line patched in): the Linux layer in user space runs real programs, with no shell.
+  - Static musl: "hello from musl", reading the image and writing `/tmp`, exit 0.
+  - Dynamic glibc 2.39 through `ld-linux`: LX-T12's two regression checks pass, exit 0. One
+    refused call, `rseq` (334), which glibc tolerates.
+  - Fork: a child and a grandchild in their own processes, a pipe between them, exit 7 as
+    expected, each process exiting 0.
+  - **A kernel panic reachable from user space**, found there and fixed by the integrator in
+    `9e8ab3e1`: `ProgramTable::unmap` built a backwards range for a protect or unmap inside one
+    table region, and `BTreeSet::range` panicked in kernel mode. B1 adds the booted regression
+    test and audits the same class of range.
+  - The gVisor suite (it needs a Bazel build of gVisor) and B2-fs's booted checks are next.
+- **2026-11-16: B2-vm's costs under KVM** (`kernel/linuxlayer/vmcost`, all 25 lines in the
+  shared notes, `b2-first-boots.md`):
+  - `process_map`: 842 ns for 1 page a call; 70 ns a page at 16; 21 ns a page at 4,096.
+  - A fault that maps 1 page costs 3,142 ns a page; fault-around of 16 costs 1,046 ns; an
+    already-mapped page 869 ns.
+  - The pager: 61.8 us a page at 1 page a request; 5.6 us at 16.
+  - `process_clone` of 4,096 pages: 0.86 ms against 2.26 ms for create plus replay.
+  - **Decided:** fault-around of 16 stays the default. File-backed faults always ask the pager
+    for 16 pages or more. The core does not merge adjacent areas: with fault-around, an area is
+    about 6 bytes a page, and merging would be new kernel-mode code for little. None of this is
+    on the engine's path, which uses populated granted memory.

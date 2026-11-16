@@ -288,9 +288,10 @@ cloud platform and boot-time job (steps 4 and 5) are not.
 - **The data plane carries over.** A task's `batch_get`, `batch_put` and `port_call`, and its
   descriptors 0 and 1, work on the new personality as they do on today's (SDD 29).
 - **Done when:**
-  - static musl, dynamic glibc and CPython with NumPy and pyarrow run on it;
-  - the gate's images run as image tasks;
+  - static musl and dynamic glibc programs run on it, with no shell;
   - `kernel/linux` is retired.
+
+  CPython on it waits for §8. The gate's tasks are native and do not wait on this step.
 - **The figure to beat.** Step 1's measurement of today's personality.
 
 ### 8. Python, afterwards
@@ -306,10 +307,18 @@ Python comes back in three parts, designed once the runtime runs at full speed:
 
 0.7.0 is not versioned until every 0.6.6 benchmark holds.
 
-**What runs.** The 0.6.6 jobs, with their kernels unchanged, run as image tasks inside the VM,
-with CPython in the image. They are compared with 0.6.6 running them in process. Kept as image
-tasks, the Python kernels are just programs in images, so the comparison needs nothing
-Python-specific in Moruna.
+**What runs (Brackly, 2026-11-16).** "We have data, then a function, then producing some other
+data; we're supposed to measure that, simple."
+
+- Each of the seven jobs keeps its input data and its output. Its function is ported to Rust and
+  runs as a native Moruna task in the VM, through the plane (`moruna_sys::plane`, stream P).
+  There is no Python, no libc and no Linux layer on the gate's path.
+- The port must produce 0.6.6's output rows from 0.6.6's input: the same row count and the same
+  content hash, both taken on a canonical form (sorted rows; a per-batch aggregate re-aggregated
+  by its group keys first), since batch boundaries may differ between the builds. A float column that cannot match bit for bit is named, with its tolerance, before
+  it is measured.
+- It is timed against 0.6.6 running the same job on the same data: wall time and peak memory, on
+  the method below.
 
 | Benchmark (8 CPUs, 24 GiB) | 0.6.6 | Loop | Ray Data |
 | --- | --- | --- | --- |
@@ -332,6 +341,31 @@ Python-specific in Moruna.
 - **Measure the noise.** Two NYC pairs of 0.6.6 against itself give the same-session noise.
 - **Pass.** On every benchmark, 0.7's median `wall_s` and median peak memory are no worse than
   0.6.6's beyond that noise, with no OOM kills.
+- **The PM's controls for ported functions** (2026-11-16):
+  - 0.6.6 is also timed with the same Rust function where it can run one, and the report says
+    so where it cannot;
+  - a plain Rust thread pool (arrow-rs, parquet, rayon) runs the same function as the "other
+    options" baseline, beside Ray and Spark running the Python functions, labelled;
+  - every run uses the same zstd level, row group size, files and splits;
+  - CPU-seconds and peak memory are reported beside wall time;
+  - each job's time is split into read and decode, the function, encode and write, and waits;
+  - each port records the Python function it replaces and its matched rows.
+- **The PM's NYC matrix** (2026-11-16), each row labelled by its function's language:
+  - **Machines:** D8ds_v6 first, then D4ls_v5. griot-stg's 10-vCPU quota holds one at a time.
+  - **Rows:**
+    1. 0.7 on the data OS, with the Rust function;
+    2. the plain Rust thread pool, with the Rust function;
+    3. 0.6.6 with the Python function, and with the Rust function where it can run one;
+    4. the loop, Polars, DuckDB, Ray, Spark and Dask with the Python function, as `runner.py`
+       runs them;
+    5. native expressions where a job needs no UDF: Enrich as DuckDB SQL and as Polars
+       expressions, and Occupancy as DuckDB SQL. Score and Audit have none.
+  - **Columns:** median wall, CPU-seconds, peak memory, OOM kills, and the time split. 0.7's
+    speedup is shown against the best of row 2 and the best of row 5, not only against the
+    Python rows.
+  - **"Significantly better":** at least 1.5x the median wall of the best like-for-like row on
+    every NYC job, with CPU-seconds no worse. The native-expression rows are reported beside it,
+    and any gap is named.
 
 The harness is `bench/vm/`. It gains a mode that runs the job through `moruna run` on the VM.
 
@@ -339,15 +373,9 @@ The harness is `bench/vm/`. It gains a mode that runs the job through `moruna ru
 
 - **Same inputs and the same output rows,** checked by row count and a content hash.
 - **VM boot reported separately,** and included in the wall time.
-- **Parallel Python without free threading.**
-  - 0.6.6's pure-Python jobs (Audit, Overture attributes) got their parallelism from
-    free-threaded threads in one process.
-  - An image of `python:3.14-slim` is the GIL build, so the image task runs either N interpreter
-    processes per stage or a 3.14t image. Otherwise those two jobs regress.
-  - One process per interpreter may also win back Overture attributes from free-threaded GC
-    pauses.
-- **Rust ports of the kernels are a separate "much better" track,** never the gate. Changing the
-  kernels' language proves nothing about regression.
+- **Superseded by Brackly (2026-11-16):** the PM's requirements for parallel Python, and its
+  rule that Rust ports are never the gate. The gate measures data in, the function, data out,
+  with the function in Rust.
 
 **"Much better" is written as per-job targets after step 1's KVM measurement, not before.** The
 items to commit to then:
@@ -356,15 +384,13 @@ items to commit to then:
 - huge pages for the arena;
 - block reads straight into arena pages;
 - decode on the worker that consumes the batch, which is the cache-locality loss behind Audit's
-  last 1 to 3%;
-- one process per interpreter.
+  last 1 to 3%.
 
 **What the image path pays today,** and the step that removes each cost:
 
 | Cost | Removed in |
 | --- | --- |
 | Two boundary copies per batch | Step 2 |
-| The personality forwarding CPython's syscalls | Hot calls answered in the kernel, if step 1's measurements show it matters |
 | The engine's own forwarded syscalls | Step 4 |
 
 ## Order of work
@@ -413,8 +439,9 @@ Settled on 2026-11-16, by Brackly's approval of this plan and by the PM:
 
 1. **Python in 0.7.0.** The runtime has none. Python functions run as image tasks, and the `moruna`
    package returns afterwards as a client (§8).
-2. **The gate.** The 0.6.6 jobs, with the same kernels, run as image tasks in the VM against 0.6.6,
-   on the PM's terms (§9).
+2. **The gate.** The seven jobs' functions, ported to Rust, run as native tasks in the VM on 0.6.6's
+   input and must produce 0.6.6's output rows. They are timed against 0.6.6 on the PM's method
+   (§9). Brackly, 2026-11-16.
 3. **How the engine reaches its kernel.** As the kernel's own process, through a `std` port (§1,
    step 4), as approved. If step 1's numbers show the port gains little, they go to Brackly.
 4. **wasm tasks leave 0.7.0** (§5).

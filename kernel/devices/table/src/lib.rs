@@ -13,6 +13,9 @@
 //! `SERVICEn` (`block0`, `block1`). Several lines may name one service, so devices of
 //! one kind with different drivers share its names: a node image that names both
 //! network cards a cloud offers as `net` publishes whichever the machine has as `net0`.
+//! A line whose program is `-` ([`NO_DRIVER`]) starts no driver: its devices are the data
+//! disks the engine drives itself, which the device manager hands to the engine's supervisor
+//! once (`hand_over`, `architecture/data-os.md` decision 2).
 //! `#` begins a comment line. The boot image tool
 //! renders the table from its description's `driver` lines; the device manager parses
 //! it with this code.
@@ -37,6 +40,8 @@ pub const PROGRAM_MAX: usize = moruna_abi::limits::NAME_MAX - IMAGE_SLOT.len();
 pub const SERVICE_MAX: usize = moruna_abi::limits::NAME_MAX - 2;
 /// The most lines one table holds.
 pub const MAX_DRIVERS: usize = 32;
+/// The program of a line that starts no driver.
+pub const NO_DRIVER: &str = "-";
 
 /// One line: devices with this vendor and device id are driven by `program` and
 /// published as `service` and an index.
@@ -52,6 +57,11 @@ impl Driver {
     /// The slot of the device manager that holds this driver's image.
     pub fn image_slot(&self) -> String {
         format!("{IMAGE_SLOT}{}", self.program)
+    }
+
+    /// Whether the line starts a driver: every line but a [`NO_DRIVER`] one.
+    pub fn starts_driver(&self) -> bool {
+        self.program != NO_DRIVER
     }
 }
 
@@ -160,10 +170,11 @@ impl Table {
             .find(|d| d.vendor == vendor && d.device == device)
     }
 
-    /// The distinct programs the table names, in first-use order.
+    /// The distinct programs the table names, in first-use order; a [`NO_DRIVER`] line names
+    /// none.
     pub fn programs(&self) -> Vec<&str> {
         let mut programs: Vec<&str> = Vec::new();
-        for d in &self.drivers {
+        for d in self.drivers.iter().filter(|d| d.starts_driver()) {
             if !programs.contains(&d.program.as_str()) {
                 programs.push(&d.program);
             }
@@ -276,6 +287,19 @@ driver 1af4:1044 virtio-blk entropy
             refused("moruna-drivers 9\n").to_string(),
             "driver table line 1: the first line must be `moruna-drivers 1`"
         );
+    }
+
+    #[test]
+    fn a_line_with_no_driver_names_no_program() {
+        let t = Table::parse(
+            "moruna-drivers 1\ndriver 1af4:1042 virtio-blk block\ndriver 1af4:1001 - data\n",
+        )
+        .expect("parses");
+        assert_eq!(t.programs(), ["virtio-blk"]);
+        let data = t.find(0x1af4, 0x1001).expect("the data line");
+        assert!(!data.starts_driver());
+        assert!(t.find(0x1af4, 0x1042).unwrap().starts_driver());
+        assert_eq!(Table::parse(&t.to_string()).unwrap(), t, "round trip");
     }
 
     #[test]

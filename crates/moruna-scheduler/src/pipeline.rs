@@ -83,6 +83,21 @@ pub struct SchedulerConfig {
     /// 3.3): what a lookahead plays a spill and a read-back at. `DISK_BYTES_PER_SECOND` unless
     /// the embedder knows its machine's.
     pub disk_bytes_per_second: u64,
+    /// Called on each worker's own thread as it starts, with the worker's index, before it
+    /// takes any work: the embedder's wiring for the thread (on the data OS it places the thread
+    /// on a core, `architecture/data-os.md` C5). It decides nothing the scheduler decides: any
+    /// worker still runs any stage's morsel.
+    pub on_worker_start: Option<WorkerStart>,
+}
+
+/// What [`SchedulerConfig::on_worker_start`] calls.
+#[derive(Clone)]
+pub struct WorkerStart(pub std::sync::Arc<dyn Fn(u16) + Send + Sync>);
+
+impl std::fmt::Debug for WorkerStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WorkerStart")
+    }
 }
 
 impl Default for SchedulerConfig {
@@ -106,6 +121,7 @@ impl Default for SchedulerConfig {
             policies: crate::policies::standard(),
             clock: std::sync::Arc::new(crate::decide::SystemClock::default()),
             disk_bytes_per_second: crate::decide::DISK_BYTES_PER_SECOND,
+            on_worker_start: None,
         }
     }
 }

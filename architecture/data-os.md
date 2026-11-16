@@ -458,11 +458,10 @@ This is `kernel-is-the-machine.md` §4.1 and §4.2, cut to a VM with no network.
   own batches.
 - **Fan-out** maps the same pages read-only into each consumer, and frees them after the last one
   (DP-I6).
-- **Python.**
-  - A shim in the image's layer reads the ring and turns a batch into a `pyarrow.RecordBatch` in
-    place (`pyarrow.foreign_buffer`).
-  - One interpreter per process, N processes per stage. That removes GC stops and heap contention,
-    and keeps 0.6.6's kernels unchanged.
+- **A native task** reads the ring through `moruna_sys::plane` and sees each batch in place. The
+  gate's functions, ported to Rust, are native tasks.
+- **Python, afterwards** (`arrow-core-0.7.md` §8): a shim in an image's layer turns a batch into a
+  `pyarrow.RecordBatch` in place. Stream P built it, but it is not on 0.7.0's gate.
 - **An unmodified image** still works through descriptors 0 and 1 as an Arrow IPC stream. That path
   copies, and the report says so.
 
@@ -515,13 +514,13 @@ Wiring keeps Moruna (`arrow-core-0.7.md`).
 
 ## 7. The gate, and what this does to the 0.7 steps
 
-**The gate is unchanged** (`arrow-core-0.7.md` §9, the PM's terms):
+**The gate** (`arrow-core-0.7.md` §9; Brackly, 2026-11-16: data in, the function, data out):
 
-- 0.6.6's jobs, with their kernels unchanged, run as image tasks against 0.6.6;
-- identical rows by count and content hash;
+- the seven jobs' functions, ported to Rust, run as native tasks on 0.6.6's input;
+- 0.6.6's output rows, by count and content hash;
+- timed against 0.6.6 on the same data: wall time and peak memory;
 - VM boot reported separately and included in the wall time;
-- both machine types, alternating order;
-- one interpreter per process for Audit and Overture attributes.
+- both machine types, alternating order.
 
 "Much better" becomes per-job targets after step 1.
 
@@ -532,12 +531,12 @@ Wiring keeps Moruna (`arrow-core-0.7.md`).
 | 1 | Today's measurements on Moruna's microkernel under KVM: forwarding, copies, boot, how the gate's Python image runs on today's personality, and `ruzstd` against C zstd | Unchanged |
 | 2 | The arena on granted memory objects, pre-faulted, with huge pages; CPU pinning; the clock page | Step 2, plus three mechanisms |
 | 3 | The engine drives the data disk's queues itself, with DMA into arena pages | Step 3 (data devices) |
-| 4 | Input regions, output windows, rings, the grouped revoke; the Python shim; a process per interpreter | Step 2's zero copies, with no call per batch |
+| 4 | Input regions, output windows, rings, the grouped revoke; native tasks on the plane | Step 2's zero copies, with no call per batch |
 | 5 | The four mechanisms, then Asterinas's Linux layer in user space; `kernel/linux` retired | §7a, unchanged |
 | 6 | The engine's `std`: the native port, or a Linux program on the new personality | Step 4, now Brackly's choice (§3) |
 | 7 | Dependencies: wasm out, the HTTP stack out, C as Brackly decides | Step 5 |
 | 8 | The host side: `moruna run`, logs on the job updates | Step 6 |
-| 9 | KD3 on the data OS, then the gate on the benchmark VM | Step 7 |
+| 9 | KD3 on the data OS, then the gate (the jobs' functions in Rust) on the benchmark VM | Step 7 |
 | 10 | The Python client | Step 8 |
 
 **Attack-surface check at each step.** Kernel-mode lines and the call list are counted at each
