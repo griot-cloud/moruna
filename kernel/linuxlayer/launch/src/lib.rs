@@ -34,6 +34,11 @@ pub const REGION_LEN: u64 = 0x6000_0000_0000;
 /// mappings, which it places upwards from `REGION_BASE`.
 pub const IMAGE_BASE: u64 = 0x5000_0000_0000;
 
+/// The task's shared memory: addresses the personality picks for objects it maps in every
+/// process of its task (`ostd::backend::shared_map`), between the core's own mappings and
+/// the image.
+pub const SHARED: core::ops::Range<u64> = 0x2000_0000_0000..IMAGE_BASE;
+
 /// A personality thread's stack: its size and alignment. The thread's block sits at its
 /// base (`ostd::backend`).
 pub const STACK_SIZE: u64 = 256 * 1024;

@@ -107,7 +107,6 @@ changed with them. Beyond that, and the pruning above:
 | `core/src/init.rs` | No other CPU, driver listing, network or vDSO to start; the first program is the task's named one on its image (or a booted test's `/init`), with no default search and no shell, and a missing one ends the personality; the personality ends with its init process. |
 | `core/src/arch/x86/power.rs` | No ACPI reset port: powering off ends the process. |
 | `core/src/device/registry/block.rs` | No virtio or NVMe request threads. |
-| `core/src/device/tty/device.rs` | No virtual terminals or hypervisor console; the console is `ttyS0`. |
 | `core/src/process/signal/poll.rs` | A polling task is marked by its address's complement: user addresses are positive. |
 | `core/src/syscall/mod.rs`, `syscall/clone.rs` | Every call passes `syscall/refused.rs` first; a call the table lacks is counted; `clone` with a new namespace is refused. |
 | `core/src/process/exit.rs`, `core/src/init.rs` | A process's refused calls are reported when it ends, the task's when the personality ends. |
@@ -177,6 +176,23 @@ handlers' carried code stays in the tree, unreachable: removing it would leave p
 - **The booted test** (`boot/boot.sh`) builds the kernel, the image and `linuxlayer-boot`, an
   initramfs whose `/init` is a static musl program, renders `boot/linuxlayer.image` and
   boots it under QEMU, then checks the lines it expects.
+
+## A task's processes: shared memory and `fork`
+
+One Linux process is one Moruna process, and the task's personality is one instance whose
+state every process reaches at the same addresses (`architecture/data-os.md` §4, the
+integrator's decision of 2026-11-16):
+
+- the task's processes share one handle table (B1's `process_clone` with
+  `process::SHARE_HANDLES`), so every handle value means the same in each;
+- memory the personality hands out comes from objects mapped at an address it picks in
+  `linuxlayer_launch::SHARED`, in every process of the task, before any of it is used
+  (`ostd::backend::shared_map`, `backend/shared.rs`); one lock covers the addresses, the
+  objects and the processes, and `clone_process` holds it across a `process_clone`;
+- which process a thread is in goes in its block.
+
+`fork` itself waits for B1's `SHARE_HANDLES`; the personality's heap moves onto the shared
+memory once `moruna-sys`'s heap takes its chunks from it.
 
 ## Running the program: B1's entry
 

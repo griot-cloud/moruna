@@ -21,7 +21,8 @@ use core::{
 
 use moruna_sys::{DEADLINE_INFINITE, Error, Handle, RawHandle, Thread, raw};
 
-use super::{Dir, FOREVER};
+use super::{Dir, FOREVER, shared};
+use crate::sync::raw::RawLock;
 
 /// A personality thread's stack: its size, and its alignment.
 pub(crate) const STACK_SIZE: usize = linuxlayer_launch::STACK_SIZE as usize;
@@ -535,4 +536,94 @@ pub(crate) unsafe fn cmpxchg_u32_fallible(ptr: *mut u32, old: u32, new: u32) -> 
     let mut out = 0u32;
     // SAFETY: as for `copy_fallible`.
     (unsafe { linuxlayer_cmpxchg32(ptr, old, new, &mut out) } == 0).then_some(out)
+}
+
+/// The core's calls for the task's shared memory (`shared.rs`).
+struct CoreCalls;
+
+impl shared::Core for CoreCalls {
+    type Process = RawHandle;
+    type Object = moruna_sys::Memory;
+
+    fn create(&mut self, len: usize) -> crate::Result<moruna_sys::Memory> {
+        moruna_sys::Memory::create(len as u64).map_err(|_| crate::Error::NoMemory)
+    }
+
+    fn map(
+        &mut self,
+        process: RawHandle,
+        object: &moruna_sys::Memory,
+        addr: usize,
+        len: usize,
+    ) -> crate::Result<()> {
+        let flags = moruna_sys::map::READ | moruna_sys::map::WRITE;
+        Error::from_raw(raw::process_map(
+            process,
+            object.0.raw(),
+            0,
+            len as u64,
+            addr as u64,
+            flags,
+        ))
+        .map(|_| ())
+        .map_err(|_| crate::Error::NoMemory)
+    }
+
+    fn unmap(&mut self, process: RawHandle, addr: usize, len: usize) {
+        let _ = raw::process_unmap(process, addr as u64, len as u64);
+    }
+}
+
+static TASK_MEMORY: RawLock<Option<shared::TaskMemory<CoreCalls>>> = RawLock::new(None);
+
+/// Runs `f` on the task's shared memory, its first process the personality's own.
+fn with_task<R>(f: impl FnOnce(&mut shared::TaskMemory<CoreCalls>) -> R) -> R {
+    let mut task = TASK_MEMORY.lock();
+    let task = task.get_or_insert_with(|| {
+        let own = self_process().expect("the launcher grants the process its own handle");
+        let range = linuxlayer_launch::SHARED;
+        shared::TaskMemory::new(CoreCalls, range.start as usize..range.end as usize, own)
+    });
+    f(task)
+}
+
+/// A new object of at least `len` bytes (at most `limits::MEMORY_MAX_BYTES`), mapped
+/// readable and writable at one address in every process of the task; that address.
+pub fn shared_map(len: usize) -> crate::Result<usize> {
+    with_task(|task| task.map(len))
+}
+
+/// Unmaps the object [`shared_map`] mapped at `addr` from every process of the task.
+pub fn shared_unmap(addr: usize) -> crate::Result<()> {
+    with_task(|task| task.unmap(addr))
+}
+
+/// The shared object holding `addr`: its start, its handle (the same in every process of
+/// the task) and its length.
+pub fn shared_chunk(addr: usize) -> Option<(usize, RawHandle, usize)> {
+    with_task(|task| {
+        task.chunk(addr)
+            .map(|(start, object, len)| (start, object.0.raw(), len))
+    })
+}
+
+/// Runs `clone`, a `process_clone` of a process of the task sharing its handle table, with
+/// the task's shared memory held still, and adds the clone it makes: the clone keeps every
+/// object mapping, so no chunk is missing from it.
+pub fn clone_process<E>(clone: impl FnOnce() -> Result<RawHandle, E>) -> Result<RawHandle, E> {
+    with_task(|task| {
+        let child = task.locked(|_| clone())?;
+        task.join_cloned(child);
+        Ok(child)
+    })
+}
+
+/// Adds `process`, made empty for the task, mapping every shared object into it.
+pub fn task_join_empty(process: RawHandle) -> crate::Result<()> {
+    with_task(|task| task.join_empty(process))
+}
+
+/// Takes `process` out of the task: it has ended.
+pub fn task_leave(process: RawHandle) {
+    with_task(|task| task.leave(process));
 }

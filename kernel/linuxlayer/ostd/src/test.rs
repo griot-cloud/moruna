@@ -909,3 +909,165 @@ fn panic_power_io_and_scheduler_stand_ins() {
     crate::task::halt_cpu();
     let _ = CpuException::new(14, 2, 0x1000);
 }
+
+mod shared_memory {
+    //! The task's shared memory (`backend/shared.rs`) on a core that records each
+    //! process's mappings.
+
+    use alloc::{collections::BTreeMap, vec};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::{
+        Error,
+        backend::{Core, TaskMemory},
+        mm::PAGE_SIZE,
+        prelude::*,
+    };
+
+    /// A core whose processes are numbers, each with its mappings by address.
+    #[derive(Default)]
+    struct Recorder {
+        mapped: BTreeMap<u32, BTreeMap<usize, (u32, usize)>>,
+        next_object: u32,
+        objects_alive: Arc<AtomicUsize>,
+        refuse_map_in: Option<u32>,
+        refuse_create: bool,
+    }
+
+    /// An object: its number, counted alive until dropped.
+    struct Object(u32, Arc<AtomicUsize>);
+
+    impl Drop for Object {
+        fn drop(&mut self) {
+            self.1.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    impl Core for Box<Recorder> {
+        type Process = u32;
+        type Object = Object;
+
+        fn create(&mut self, _len: usize) -> Result<Object> {
+            if self.refuse_create {
+                return Err(Error::NoMemory);
+            }
+            self.next_object += 1;
+            self.objects_alive.fetch_add(1, Ordering::Relaxed);
+            Ok(Object(self.next_object, self.objects_alive.clone()))
+        }
+
+        fn map(&mut self, process: u32, object: &Object, addr: usize, len: usize) -> Result<()> {
+            if self.refuse_map_in == Some(process) {
+                return Err(Error::NoMemory);
+            }
+            let mappings = self.mapped.entry(process).or_default();
+            assert!(mappings.insert(addr, (object.0, len)).is_none());
+            Ok(())
+        }
+
+        fn unmap(&mut self, process: u32, addr: usize, len: usize) {
+            let (_, mapped) = self
+                .mapped
+                .get_mut(&process)
+                .unwrap()
+                .remove(&addr)
+                .unwrap();
+            assert_eq!(mapped, len);
+        }
+    }
+
+    const BASE: usize = 0x2000_0000_0000;
+    const RANGE: core::ops::Range<usize> = BASE..BASE + 64 * PAGE_SIZE;
+
+    fn task() -> TaskMemory<Box<Recorder>> {
+        TaskMemory::new(Box::default(), RANGE, 1)
+    }
+
+    fn mapped(task: &mut TaskMemory<Box<Recorder>>, process: u32) -> Vec<usize> {
+        task.locked(|core| {
+            core.mapped
+                .get(&process)
+                .map(|m| m.keys().copied().collect())
+                .unwrap_or_default()
+        })
+    }
+
+    #[ktest]
+    fn a_chunk_is_mapped_in_every_process_at_one_address() {
+        let mut task = task();
+        task.join_cloned(2);
+        task.join_cloned(2);
+        let a = task.map(1).unwrap();
+        let b = task.map(3 * PAGE_SIZE).unwrap();
+        assert_eq!((a, b), (BASE, BASE + PAGE_SIZE));
+        assert_eq!(mapped(&mut task, 1), vec![a, b]);
+        assert_eq!(mapped(&mut task, 2), vec![a, b]);
+        let (start, _, len) = task.chunk(b + 2 * PAGE_SIZE).unwrap();
+        assert_eq!((start, len), (b, 3 * PAGE_SIZE));
+        assert!(task.chunk(b + 3 * PAGE_SIZE).is_none());
+        assert!(task.chunk(BASE - 1).is_none());
+    }
+
+    #[ktest]
+    fn a_freed_chunk_leaves_every_process_and_its_addresses_return() {
+        let mut task = task();
+        task.join_cloned(2);
+        let a = task.map(PAGE_SIZE).unwrap();
+        let b = task.map(PAGE_SIZE).unwrap();
+        let c = task.map(PAGE_SIZE).unwrap();
+        task.unmap(b).unwrap();
+        task.unmap(a).unwrap();
+        assert_eq!(task.unmap(a), Err(Error::InvalidArgs));
+        assert_eq!(mapped(&mut task, 2), vec![c]);
+        assert_eq!(
+            task.locked(|core| core.objects_alive.load(Ordering::Relaxed)),
+            1
+        );
+        // The two freed pages merged: a two-page chunk fits where they were.
+        assert_eq!(task.map(2 * PAGE_SIZE).unwrap(), a);
+        task.unmap(c).unwrap();
+        // Everything after `a`'s two pages is one free range again.
+        assert_eq!(task.map(62 * PAGE_SIZE).unwrap(), a + 2 * PAGE_SIZE);
+        assert_eq!(task.map(PAGE_SIZE), Err(Error::NoMemory));
+    }
+
+    #[ktest]
+    fn an_empty_process_gets_every_chunk_and_a_leaving_one_none() {
+        let mut task = task();
+        let a = task.map(PAGE_SIZE).unwrap();
+        let b = task.map(2 * PAGE_SIZE).unwrap();
+        task.join_empty(3).unwrap();
+        assert_eq!(mapped(&mut task, 3), vec![a, b]);
+        task.leave(3);
+        let c = task.map(PAGE_SIZE).unwrap();
+        assert_eq!(mapped(&mut task, 3), vec![a, b]);
+        assert_eq!(mapped(&mut task, 1), vec![a, b, c]);
+        // A process that cannot take them all takes none.
+        task.locked(|core| core.refuse_map_in = Some(4));
+        assert_eq!(task.join_empty(4), Err(Error::NoMemory));
+        assert!(mapped(&mut task, 4).is_empty());
+    }
+
+    #[ktest]
+    fn a_refused_map_or_object_maps_nothing() {
+        let mut task = task();
+        task.join_cloned(2);
+        task.join_cloned(3);
+        task.locked(|core| core.refuse_map_in = Some(3));
+        assert_eq!(task.map(PAGE_SIZE), Err(Error::NoMemory));
+        assert!(mapped(&mut task, 1).is_empty());
+        assert!(mapped(&mut task, 2).is_empty());
+        assert_eq!(
+            task.locked(|core| core.objects_alive.load(Ordering::Relaxed)),
+            0
+        );
+        task.locked(|core| {
+            core.refuse_map_in = None;
+            core.refuse_create = true;
+        });
+        assert_eq!(task.map(PAGE_SIZE), Err(Error::NoMemory));
+        task.locked(|core| core.refuse_create = false);
+        // The addresses the refusals reserved are free again.
+        assert_eq!(task.map(PAGE_SIZE).unwrap(), BASE);
+    }
+}

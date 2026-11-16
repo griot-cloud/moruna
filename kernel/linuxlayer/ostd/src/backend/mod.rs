@@ -8,13 +8,20 @@
 
 #[cfg(target_os = "none")]
 mod moruna;
+mod shared;
 #[cfg(target_os = "none")]
 pub(crate) use moruna::*;
 #[cfg(target_os = "none")]
 pub use moruna::{
-    copy_through_core, personality_set, self_process, set_self_process, start_thread_block,
+    clone_process, copy_through_core, personality_set, self_process, set_self_process,
+    shared_chunk, shared_map, shared_unmap, start_thread_block, task_join_empty, task_leave,
     user_copy_range,
 };
+#[cfg_attr(
+    not(test),
+    expect(unused_imports, reason = "the target's binding uses it")
+)]
+pub(crate) use shared::{Core, TaskMemory};
 
 #[cfg(not(target_os = "none"))]
 mod host;
