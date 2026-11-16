@@ -346,6 +346,9 @@ and switches to the new one when the call answers.
       counts), is first re-aggregated by its group keys (`zone`, `minute_of_day`, summing
       `car_minutes`), then sorted and hashed;
     - the row count compared is the canonical form's.
+  - **The PM's NYC matrix** in the harness's report (`arrow-core-0.7.md` §9): the five labelled
+    row groups (native expressions included), the columns, and 0.7's speedup against the best
+    Rust row and the best native-expression row.
 - **Tests:** the harness's own unit tests, and the fixtures under KVM.
 - **Done when:** the gate runs end to end on `moruna-bench` for the NYC set, then the large
   jobs, with identical rows, boot reported, and both machine types ready, and hands its numbers

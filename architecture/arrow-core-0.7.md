@@ -350,6 +350,22 @@ data; we're supposed to measure that, simple."
   - CPU-seconds and peak memory are reported beside wall time;
   - each job's time is split into read and decode, the function, encode and write, and waits;
   - each port records the Python function it replaces and its matched rows.
+- **The PM's NYC matrix** (2026-11-16), each row labelled by its function's language:
+  - **Machines:** D8ds_v6 first, then D4ls_v5. griot-stg's 10-vCPU quota holds one at a time.
+  - **Rows:**
+    1. 0.7 on the data OS, with the Rust function;
+    2. the plain Rust thread pool, with the Rust function;
+    3. 0.6.6 with the Python function, and with the Rust function where it can run one;
+    4. the loop, Polars, DuckDB, Ray, Spark and Dask with the Python function, as `runner.py`
+       runs them;
+    5. native expressions where a job needs no UDF: Enrich as DuckDB SQL and as Polars
+       expressions, and Occupancy as DuckDB SQL. Score and Audit have none.
+  - **Columns:** median wall, CPU-seconds, peak memory, OOM kills, and the time split. 0.7's
+    speedup is shown against the best of row 2 and the best of row 5, not only against the
+    Python rows.
+  - **"Significantly better":** at least 1.5x the median wall of the best like-for-like row on
+    every NYC job, with CPU-seconds no worse. The native-expression rows are reported beside it,
+    and any gap is named.
 
 The harness is `bench/vm/`. It gains a mode that runs the job through `moruna run` on the VM.
 
