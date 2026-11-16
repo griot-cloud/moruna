@@ -142,8 +142,8 @@ pub(crate) fn interrupt(_token: usize) {
     INTERRUPTS.fetch_add(1, Ordering::SeqCst);
 }
 
-/// How many interrupts were asked for.
-#[cfg_attr(not(test), expect(dead_code, reason = "only ostd's own tests read it"))]
+/// How many interrupts were asked for: ostd's own tests read it.
+#[cfg(all(test, ktest))]
 pub(crate) fn interrupts() -> usize {
     INTERRUPTS.load(Ordering::SeqCst)
 }

@@ -17,10 +17,7 @@ pub use moruna::{
     set_process_resource, set_self_process, shared_chunk, shared_map, shared_unmap,
     start_task_memory, start_thread_block, task_leave, task_release, user_copy_range,
 };
-#[cfg_attr(
-    not(test),
-    expect(unused_imports, reason = "the target's binding uses it")
-)]
+#[cfg(all(test, ktest))]
 pub(crate) use shared::{Bump, Core, Processes, TaskMemory, map_everywhere};
 
 #[cfg(not(target_os = "none"))]

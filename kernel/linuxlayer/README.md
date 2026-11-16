@@ -225,16 +225,32 @@ The program's own entry, clones, the pager and thread state are stream B1's mech
 
 ## The program's address space
 
-`vm/` drives OSTD's `VmSpace` through its cursors. Here `ostd`'s `VmSpace` is the
-personality's record of the program's pages, with OSTD's cursor API, so `vm/` carries
-unchanged, Asterinas's own copy-on-write `fork` included. Making the program see those pages
-(the core's `process_map`, `process_unmap` and `process_protect` of the frames' memory
-objects, with B1's clone and pager where they measure better) is stream B2-vm's. In host
-tests a thread's activated space backs program addresses below 4 GiB, so `vm/`'s faults,
-mappings and copies run on the host.
+`vm/` drives OSTD's `VmSpace` through its cursors, so it carries unchanged, Asterinas's own
+copy-on-write `fork` included. Here `ostd`'s `VmSpace` (stream B2-vm) is the personality's
+record of the program's pages, mirrored into a Moruna process:
 
-A copy of program memory the personality has not mapped yet asks the layer's fault handler
-(`ostd::mm::fault`) to map it and goes on, as OSTD's fault path does.
+- **Frames** are pages of chunks, memory objects of 2 MiB to 64 MiB grown with use; a frame
+  is its object and offset, and its address in the region. The chunks come from the task's
+  shared memory (`ostd::backend::shared_map`, injected at the start as the object source),
+  so each is at one address in every process of the task.
+- **Showing:** a space is shown in at most one process, and a process shows at most one
+  space. A cursor gathers its changes and makes the core's calls when it drops, a run of
+  neighbouring pages of one chunk in one `process_map`, and likewise for `process_unmap`
+  and `process_protect`. `VmSpace::activate` shows a thread's space in its own process
+  (`ostd::backend::self_process`, from the thread's block), hiding the one shown there
+  before; `execve` needs nothing more.
+- **fork:** the child's space is shown in a `process_clone` of the parent's process
+  (`VmSpace::show_cloned`), which already maps the child's pages, so only where the child's
+  record differs takes a call; see "A task's processes".
+- **Faults:** a program's page fault enters the personality and reaches `vm/`'s handler as
+  Asterinas's does. A page the core refused to map or protect stays out of the program until
+  its next fault, which serves it again.
+- **Copies:** a copy of program memory the personality has not shown yet asks the layer's
+  fault handler (`ostd::mm::fault`) to show it and goes on, as OSTD's fault path does.
+
+In host tests an emulated core (`ostd/src/mm/vm_space/emulated.rs`) holds what each process
+maps, with the core's checks, so `vm/`'s faults, fault-around, `fork` with copy-on-write on
+both sides, `mprotect`, `munmap` and a new program's space are checked against it.
 
 ## The gVisor system-call tests
 
@@ -263,6 +279,11 @@ Asterinas's own tests and the gVisor system-call suite, which pass and which fai
 Moruna writes or rewrites around them (`ostd/`, `libs/component`, the OSDK stand-ins, and
 rewritten files such as the start, the entry loop and the `vm/` adapters) keeps the 80%
 per-crate line floor by host tests.
+
+Carried tests known to be unreliable on the host, reported rather than changed:
+
+- `fs::pipe::common::test::write_closed` depends on timing: it aborted once under
+  `cargo llvm-cov` and passes on a plain run.
 
 ## Building and testing
 

@@ -12,7 +12,7 @@
 //! The core's calls are in `moruna.rs`, on the target only; the rest runs in host tests.
 
 #![cfg_attr(
-    all(not(target_os = "none"), not(test)),
+    all(not(target_os = "none"), not(all(test, ktest))),
     expect(
         dead_code,
         reason = "the target's start uses them, and the host's tests"
