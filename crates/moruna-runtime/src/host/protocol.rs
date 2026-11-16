@@ -18,9 +18,18 @@
 //! --events-json`, [`read_json_message`]). A peer refuses a version it does not read rather than
 //! guess at it.
 //!
-//! What a task prints is never on the socket. Each record of it is an `event` of kind `log` in
-//! the run's output store (`report.logs`), numbered by its own producer; the socket says only how
-//! far each producer's records reach, how many bytes they hold, and how many were cut or dropped.
+//! What a task prints is kept as records: each is an `event` of kind `log` in the run's output
+//! store (`report.logs`), numbered by its own producer, with its producer (`task`, absent for the
+//! engine), its `level` and its line (`text`). The socket says how far each producer's records
+//! reach, how many bytes they hold, and how many were cut or dropped (`logs`), and, since stream D
+//! of the data OS (2026-11-16), carries each record the store keeps as the same `log` event,
+//! held to its producer's rate (`logs::RATE_RECORDS`, `logs::RATE_BYTES`): the job updates carry
+//! the logs (`architecture/arrow-core-0.7.md` §6). On the socket a `log` event is numbered with
+//! the run's other events, from 1 with no gap, and stamped when it was kept; in the store it keeps
+//! its producer's own numbering. It is a record of output, not a fact of a task's lifecycle, so
+//! it may follow its task's end (output written before the end is drained after it). The socket
+//! is held to a lower rate than the store (`logs::SENT_RATE_RECORDS`, `logs::SENT_RATE_BYTES`
+//! a producer a second), and a `platform` line says how much was kept and not sent.
 //!
 //! The port messages (MH 4.10) are versioned on their own (`v`, [`PORTS_VERSION`]): a stage's
 //! call to a host port is a `port_call`, answered by the peer's `port_reply` for the same `call`;

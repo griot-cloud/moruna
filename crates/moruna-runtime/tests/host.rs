@@ -1163,11 +1163,12 @@ fn stored(logs: &Path, events: &[Value], producer: &str) -> Vec<Value> {
 
 /// HO-T21 a task's output (MH 4.3 `log`, `logs`): what a kernel prints is kept in the output
 /// store under its task, each line whole, a traceback as one record, a character never split
-/// and a logging record with its level; the socket carries only the store's reach, whose last
-/// word counts every record, drained; nothing the kernel printed (a row's value, a secret) is on
-/// the socket.
+/// and a logging record with its level; the socket carries the store's reach, whose last word
+/// counts every record, drained, and (stream D of the data OS, `arrow-core-0.7.md` §6: the job
+/// updates carry the logs) each record kept as its `log` event, and what the kernel printed (a
+/// row's value, a secret) is in those events and in no other message.
 #[test]
-fn ho_t21_a_tasks_output_is_kept_in_the_store_and_only_counted_on_the_socket() {
+fn ho_t21_a_tasks_output_is_kept_in_the_store_and_carried_on_the_socket_as_logs() {
     let _serial = one_run_at_a_time();
     let scratch = Scratch::new("ho_t21");
     let mut doc = document(scratch.path(), 4_000, 2, Some("print"));
@@ -1182,6 +1183,9 @@ fn ho_t21_a_tasks_output_is_kept_in_the_store_and_only_counted_on_the_socket() {
     assert_eq!(code, exit::COMPLETED);
     let events = well_formed(&messages, 1);
     for (_, message) in &messages {
+        if message["type"] == "event" && message["kind"] == "log" {
+            continue;
+        }
         let text = message.to_string();
         for forbidden in [
             SEEDED_SECRET,
@@ -1191,7 +1195,7 @@ fn ho_t21_a_tasks_output_is_kept_in_the_store_and_only_counted_on_the_socket() {
         ] {
             assert!(
                 !text.contains(forbidden),
-                "{forbidden} is on the socket: {text}"
+                "{forbidden} is on the socket outside a log: {text}"
             );
         }
     }
@@ -1238,6 +1242,28 @@ fn ho_t21_a_tasks_output_is_kept_in_the_store_and_only_counted_on_the_socket() {
         secret.iter().all(|r| r["level"].is_null()),
         "stderr says no level"
     );
+    // The socket's `log` events are the store's records, in order: task, stream, level, line.
+    let carried: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "log" && e["task"] == "shout")
+        .collect();
+    assert_eq!(carried.len(), records.len());
+    for (event, record) in carried.iter().zip(&records) {
+        for field in [
+            "task",
+            "stream",
+            "level",
+            "text",
+            "bytes",
+            "partial",
+            "truncated",
+        ] {
+            assert_eq!(
+                event[field], record[field],
+                "{field}: {event} against {record}"
+            );
+        }
+    }
     let tracebacks = of("stderr", "Traceback");
     assert_eq!(tracebacks.len(), morsels);
     assert_eq!(
@@ -1275,14 +1301,21 @@ fn ho_t22_a_kernels_failure_is_its_output() {
             .contains("the test asked this apply to fail")
     );
     // The report and the exit carry the failure's words as they always have, for the host to
-    // scrub; no event does.
-    for event in &events {
+    // scrub; of the events, only the task's own `log` record does (stream D: the job updates
+    // carry the logs).
+    for event in events.iter().filter(|e| e["kind"] != "log") {
         assert!(
             !event
                 .to_string()
                 .contains("the test asked this apply to fail")
         );
     }
+    let carried: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "log" && e["task"] == "kernel-1" && e["level"] == "error")
+        .collect();
+    assert_eq!(carried.len(), 1);
+    assert_eq!(carried[0]["text"], errors[0]["text"]);
     assert_eq!(reach_of(&last_reach(&events), "kernel-1")["records"], 1);
 }
 

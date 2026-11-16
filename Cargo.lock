@@ -2264,6 +2264,7 @@ dependencies = [
  "moruna-discovery",
  "moruna-event",
  "moruna-image",
+ "moruna-imagefs",
  "moruna-job",
  "moruna-kernel",
  "moruna-kernels",

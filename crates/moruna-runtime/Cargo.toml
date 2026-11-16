@@ -45,6 +45,9 @@ moruna-wasm = { workspace = true }
 moruna-sandbox = { workspace = true }
 # An image kernel's root (SDD 19).
 moruna-image = { workspace = true }
+# A VM run's output layer, read back on the host with the image filesystem's own verified reader
+# (stream D, contract C3).
+moruna-imagefs = { workspace = true }
 # The engine on the Moruna kernel (SDD 30): its vsock, and an image's task on the data plane.
 moruna-micro = { workspace = true }
 # `moruna run --vm` (MH 4.8.4): the monitor's library seam, `boot_and_run`.

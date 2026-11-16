@@ -26,9 +26,18 @@
 //!   <task>/<first seq>.mrec`, the engine's under `_engine`), each written whole and renamed
 //!   into place, so a reader never sees half a segment;
 //! - at most every [`LOGS_EVERY`] the thread tells the peer how far each producer's records
-//!   reach now (`logs`), and once more when the run is over, with `drained`.
+//!   reach now (`logs`), and once more when the run is over, with `drained`;
+//! - each record the store keeps is also told as the run's event, when a peer is on the
+//!   connection: the same `log` (its producer, its level, its line), numbered with the run's
+//!   other events and stamped when it was kept. The job updates carry the logs
+//!   (`architecture/arrow-core-0.7.md` §6). A run in a VM keeps its store in the VM's scratch,
+//!   which goes with the VM (contract C7), so the peer is where its logs live on. The
+//!   connection is held to a lower rate than the store ([`SENT_RATE_RECORDS`],
+//!   [`SENT_RATE_BYTES`] a second for each producer, with bursts), so a flood never holds back
+//!   the run's other updates or a cancel's answer; what is past it is counted, and a `platform`
+//!   line on the connection says how much was not sent.
 //!
-//! The peer hears counts. What the tasks printed stays in the store.
+//! The peer hears counts, and every record kept.
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -70,6 +79,14 @@ pub const BURST_RECORDS: u64 = 10_000;
 pub const RATE_BYTES: u64 = 1 << 20;
 /// Bytes a producer may write at once, its second's worth included.
 pub const BURST_BYTES: u64 = 4 << 20;
+/// Records of a producer the connection carries a second.
+pub const SENT_RATE_RECORDS: u64 = 200;
+/// Records of a producer the connection carries at once, its second's worth included.
+pub const SENT_BURST_RECORDS: u64 = 2_000;
+/// Bytes of a producer the connection carries a second.
+pub const SENT_RATE_BYTES: u64 = 64 << 10;
+/// Bytes of a producer the connection carries at once, its second's worth included.
+pub const SENT_BURST_BYTES: u64 = 512 << 10;
 /// The most of one producer's output the store keeps in one process.
 pub const PRODUCER_BYTES_MAX: u64 = 256 << 20;
 /// How long the end of a run waits for its output to be written.
@@ -222,6 +239,9 @@ pub struct Tell {
     pub event: Box<dyn Fn(u64, Event) + Send>,
     /// A note for the report: why output was not kept.
     pub note: Box<dyn Fn(String) + Send>,
+    /// Tell each record kept as an event too (through `event`): when a peer is on the
+    /// connection, which then hears every line the store keeps.
+    pub logs: bool,
 }
 
 /// One attempt's output capture: the sink the run writes to, and the thread that keeps it.
@@ -645,6 +665,11 @@ struct Producer {
     pending_since: Option<Instant>,
     records: Bucket,
     byte_rate: Bucket,
+    /// The connection's own rate for this producer's records.
+    sent_records: Bucket,
+    sent_bytes: Bucket,
+    /// Records kept and not sent on the connection since the last word about them.
+    unsent: (u64, u64),
     dirty: bool,
 }
 
@@ -672,6 +697,9 @@ impl Producer {
             pending_since: None,
             records: Bucket::new(RATE_RECORDS, BURST_RECORDS),
             byte_rate: Bucket::new(RATE_BYTES, BURST_BYTES),
+            sent_records: Bucket::new(SENT_RATE_RECORDS, SENT_BURST_RECORDS),
+            sent_bytes: Bucket::new(SENT_RATE_BYTES, SENT_BURST_BYTES),
+            unsent: (0, 0),
             dirty: false,
         }
     }
@@ -784,6 +812,7 @@ impl Writer {
         for p in 0..self.producers.len() {
             self.mark_drops(p);
             self.flush(p);
+            self.mark_unsent(p);
         }
         let reach = self.producers.iter().map(|p| p.reach(true)).collect();
         self.event(Event::Logs { producers: reach });
@@ -860,6 +889,7 @@ impl Writer {
             self.overflow();
             for p in 0..self.producers.len() {
                 self.mark_drops(p);
+                self.mark_unsent(p);
             }
             let reach: Vec<LogReach> = self
                 .producers
@@ -976,9 +1006,50 @@ impl Writer {
         producer.pending_bytes += text_bytes;
         producer.pending_truncated += u64::from(truncated > 0);
         producer.kept_bytes += record.len() as u64;
-        if producer.pending.len() >= SEGMENT_BYTES {
+        let full = producer.pending.len() >= SEGMENT_BYTES;
+        if self.tell.logs {
+            let now = Instant::now();
+            producer.sent_records.refill(now);
+            producer.sent_bytes.refill(now);
+            if producer.sent_records.tokens >= 1.0
+                && producer.sent_bytes.tokens >= text_bytes as f64
+            {
+                producer.sent_records.tokens -= 1.0;
+                producer.sent_bytes.tokens -= text_bytes as f64;
+                (self.tell.event)(self.shared.t_us(), event);
+            } else {
+                producer.unsent.0 += 1;
+                producer.unsent.1 += text_bytes;
+            }
+        }
+        if full {
             self.flush(p);
         }
+    }
+
+    /// Where records of producer `p` were kept and not sent, a `platform` line on the
+    /// connection says how many (it is not kept: the store holds them all).
+    fn mark_unsent(&mut self, p: usize) {
+        let (records, bytes) = std::mem::take(&mut self.producers[p].unsent);
+        if records == 0 {
+            return;
+        }
+        let text = format!(
+            "{records} records ({bytes} bytes) of this output were kept and not sent on the \
+             connection, which carries at most {SENT_RATE_RECORDS} records or {SENT_RATE_BYTES} \
+             bytes a second of one producer's output"
+        );
+        let event = Event::Log {
+            task: self.producers[p].task.clone(),
+            stream: LogStream::Platform,
+            level: None,
+            bytes: text.len() as u64,
+            text,
+            partial: false,
+            continued: false,
+            truncated: 0,
+        };
+        (self.tell.event)(self.shared.t_us(), event);
     }
 
     /// The producer's pending records, written as one segment.

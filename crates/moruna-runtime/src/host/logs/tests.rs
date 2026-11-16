@@ -169,6 +169,30 @@ struct Told {
     notes: Arc<Mutex<Vec<String>>>,
 }
 
+impl Told {
+    /// The `log` events told, as a peer would hear them.
+    fn logs(&self) -> Vec<Event> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, Event::Log { .. }))
+            .cloned()
+            .collect()
+    }
+
+    /// The events told other than `log`.
+    fn others(&self) -> Vec<Event> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| !matches!(e, Event::Log { .. }))
+            .cloned()
+            .collect()
+    }
+}
+
 fn told() -> (Told, Tell) {
     let events = Arc::new(Mutex::new(Vec::new()));
     let notes = Arc::new(Mutex::new(Vec::new()));
@@ -178,6 +202,7 @@ fn told() -> (Told, Tell) {
         Tell {
             event: Box::new(move |_, event| e.lock().unwrap().push(event)),
             note: Box::new(move |note| n.lock().unwrap().push(note)),
+            logs: true,
         },
     )
 }
@@ -345,6 +370,25 @@ fn a_flood_is_bounded_and_counted() {
             .unwrap()
             .contains("of this output were dropped here")
     );
+    // The connection carries less than the store keeps, and says so.
+    let sent = told
+        .logs()
+        .into_iter()
+        .filter(|e| matches!(e, Event::Log { task: Some(t), stream, .. } if t == "k1" && *stream != LogStream::Platform))
+        .count() as f64;
+    // The writer drains what was queued until `finish` returns: the rate runs that long.
+    let elapsed = started.elapsed().as_secs_f64();
+    let most = SENT_BURST_RECORDS as f64 + SENT_RATE_RECORDS as f64 * (elapsed + 1.0);
+    assert!(sent <= most, "{sent} records sent, at most {most}");
+    assert!(
+        (sent as u64) < k1.records,
+        "the store keeps more than is sent"
+    );
+    assert!(told.logs().iter().any(|e| matches!(
+        e,
+        Event::Log { stream: LogStream::Platform, text, .. }
+            if text.contains("not sent on the connection")
+    )));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -382,6 +426,78 @@ fn output_after_its_task_ended_is_drained() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The job updates carry the logs (stream D): every record the store keeps is told as the same
+/// `log` event, with its producer, its level and its line.
+#[test]
+fn every_kept_record_goes_to_the_peer_as_it_is_kept() {
+    let dir = scratch("peer");
+    let (heard, tell) = told();
+    let capture = Capture::start(
+        attempt_dir(&dir, 1, START),
+        meta(1),
+        vec!["src".into(), "k1".into(), "snk".into()],
+        Instant::now(),
+        tell,
+    );
+    let sink = capture.sink();
+    sink.bytes(Some(1), Stream::Stdout, b"one\ntwo\n");
+    sink.record(Some(1), Some(moruna_kernel::Level::Warning), "careful");
+    sink.bytes(None, Stream::Stderr, b"the engine's\n");
+    assert!(capture.finish(FINISH_WAIT));
+    let kept = read_producer(&attempt_dir(&dir, 1, START).join("k1")).unwrap();
+    let told_k1: Vec<Event> = heard
+        .logs()
+        .into_iter()
+        .filter(|e| matches!(e, Event::Log { task: Some(t), .. } if t == "k1"))
+        .collect();
+    assert_eq!(told_k1.len(), 3);
+    for (event, record) in told_k1.iter().zip(&kept) {
+        let Event::Log {
+            task,
+            stream,
+            level,
+            text,
+            ..
+        } = event
+        else {
+            unreachable!()
+        };
+        assert_eq!(record["task"], task.as_deref().unwrap());
+        assert_eq!(record["text"], text.as_str());
+        assert_eq!(record["level"], serde_json::json!(level));
+        assert_eq!(record["stream"], serde_json::json!(stream));
+    }
+    let engine: Vec<Event> = heard
+        .logs()
+        .into_iter()
+        .filter(|e| matches!(e, Event::Log { task: None, .. }))
+        .collect();
+    assert!(matches!(&engine[..], [Event::Log { text, .. }] if text == "the engine's"));
+    assert!(matches!(heard.others().last(), Some(Event::Logs { .. })));
+    // Without a peer the records stay in the store alone.
+    let (quiet, mut tell) = told();
+    tell.logs = false;
+    let capture = Capture::start(
+        attempt_dir(&dir, 2, START),
+        meta(2),
+        vec!["src".into()],
+        Instant::now(),
+        tell,
+    );
+    capture
+        .sink()
+        .bytes(Some(0), Stream::Stdout, b"kept, not told\n");
+    assert!(capture.finish(FINISH_WAIT));
+    assert!(quiet.logs().is_empty());
+    assert_eq!(
+        read_producer(&attempt_dir(&dir, 2, START).join("src"))
+            .unwrap()
+            .len(),
+        1
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A store that cannot be made is a note, and what was written is dropped and counted.
 #[test]
 fn a_store_that_cannot_be_written_is_told() {
@@ -404,6 +520,7 @@ fn a_store_that_cannot_be_written_is_told() {
         .find(|r| r.task.as_deref() == Some("src"))
         .unwrap();
     assert_eq!((src.records, src.dropped, src.drained), (0, 1, true));
+    assert!(told.logs().is_empty(), "the peer hears what is kept");
     let _ = std::fs::remove_file(&file);
 }
 
