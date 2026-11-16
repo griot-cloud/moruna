@@ -43,6 +43,20 @@ pub const HEAP: core::ops::Range<u64> = 0x2000_0000_0000..0x3000_0000_0000;
 /// process of its task (`ostd::backend::shared_map`), between the heap and the image.
 pub const SHARED: core::ops::Range<u64> = HEAP.end..IMAGE_BASE;
 
+/// Where the core places what a program's native calls map without an address
+/// (`memory_map`, `batch_get`'s batches and windows): the range the personality gives at
+/// `personality_set` (`architecture/data-os.md` section 4). It lies above the region, so it
+/// never meets the personality's addresses, and above the program's Linux memory, which ends
+/// at the region's base, so Linux `mmap` never reaches it.
+pub const NATIVE: core::ops::Range<u64> = 0x7000_0000_0000..0x7f00_0000_0000;
+
+const _: () = assert!(
+    REGION_BASE + REGION_LEN <= NATIVE.start
+        && NATIVE.end <= 0x0000_8000_0000_0000
+        && NATIVE.start.is_multiple_of(PAGE)
+        && NATIVE.end.is_multiple_of(PAGE)
+);
+
 /// A personality thread's stack: its size and alignment. The thread's block sits at its
 /// base (`ostd::backend`).
 pub const STACK_SIZE: u64 = 256 * 1024;

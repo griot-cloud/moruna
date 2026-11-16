@@ -209,8 +209,14 @@ program runs on a personality of its own:
 - The personality's image is in the server (`LINUXLAYER_PERSONALITY` names it at the
   build), so a boot or node image starts `linux` as it started the old one;
   `kernel/tools/build.sh` builds the personality, then the server, and puts it in place.
-- Not yet: `run_granted`'s handles are held for the task's life and are not the program's
-  until the native-call entry exists; `run_plane`'s `assets` is not mounted.
+- The program's own handles (`run_granted`'s, an observer of `run_plane`'s account, and with
+  either the image's root as `filesystem`) go on the personality's start page beside its own
+  slots, which are named `lx.*`; the personality holds them apart.
+- Not yet: the program's native calls (`architecture/data-os.md` section 4). The core gives
+  program mode a handle table of its own (stream B1); the personality will move the
+  program's handles into it, give the program its start page (`launch::program_page`) under
+  `AT_MORUNA_START`, and reserve `launch::NATIVE`, above the region and the program's Linux
+  memory, for what the core maps for it. `run_plane`'s `assets` is not mounted yet.
 
 `check/` is B2-fs's booted check through a real task start (`B2 task` in
 `kernel/initramfs/boot.image`): `linuxlayer-check` runs `boot/programs/taskcheck.c` with
