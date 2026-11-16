@@ -70,7 +70,8 @@ first, and iterates until Moruna is significantly better than the other engines.
   - `moruna-bench` (griot-stg) is the only x86-64 KVM machine, and this Mac is arm64.
   - Every heavy stage takes `~/.vm-lock` (`mkdir`, write `owner`), respects `~/.vm-lock-next`,
     runs one VM at a time at no more than 6 GiB, never steals the lock, and releases only its
-    own.
+    own. The 6 GiB cap is the Mac's rule, kept for booted tests; the gate's VM on
+    `moruna-bench` runs at the benchmark's budget (24 GiB on the D8ds_v6, as 0.6.6's table did).
   - The machine shuts down at 02:00 UTC, and that wipes `/data`. Keep results on
     `/home/bench`.
 - **Style.** No em-dashes in text. Plain, short comments, as the files already have.
@@ -472,3 +473,34 @@ and switches to the new one when the call answers.
   - **Open for the core, decided after those timings:** each `process_map` creates one area
     (96 bytes charged), and adjacent areas of one object are never merged, so anonymous memory
     faulted a page at a time costs an area a page.
+- **2026-11-16: stream E's host work merged** (`a52dc581`, from `bf5c1115`).
+  - All seven functions are ported (`images/gate/functions`) and match 0.6.6's Python outputs on
+    the fixtures, five bit for bit. Score's `predicted_tip` is within abs 1.1e-6 (BLAS order),
+    and Overture's areas and volumes within rel 1e-9 and 1e-12, the observed differences near
+    machine precision. The tolerances are confirmed again on x86.
+  - The canonical hash is an order-independent multiset hash (the sum of row SHA-256s mod
+    2^128), with Occupancy regrouped first.
+  - **Control 1:** 0.6.6 cannot run a `rust` kind (removed in 0.5.8, KD-I7). Its row is
+    "0.6.6, Rust function via pyo3" (`images/gate/py066`, GIL released), labelled so.
+  - The baseline (`gate-baseline`, rayon, arrow-rs, parquet, Moruna's sink settings) is built,
+    as are the harness's engines, plan, report and the KVM mode for the node fixtures.
+  - Coverage: functions 94.2%, record 86.1%, baseline 90.8%.
+- **2026-11-16: decisions on E's gaps** (integrator; Brackly away, technical calls):
+  - **A native program in an image** is declared by its kernel (`abi: moruna`; the default
+    stays Linux). The runner starts it with `process_create` and its plane attached, never
+    through the personality, after checking the ELF matches the declaration. Owner: P.
+  - **Output size:** a task may put several output records for one input batch, so no window
+    is sized from a guess of the stage's amplification. Owner: P.
+  - **A native task's log** goes through `moruna_sys::plane` onto the job updates, as a Linux
+    task's descriptor 2 does. Owner: P, after the gate.
+  - **`moruna run`'s form** follows E's harness: `moruna run JOB --output DIR --report FILE`,
+    with local inputs staged as `disk://` names and `vm.boot_s` in the report. Owner: D.
+  - **The time split:** the engine's report times decode apart from read, and encode apart from
+    write. Owner: C.
+  - **AVX:** the gate's tasks build with `+avx,+avx2` (no FMA, so the bits are unchanged). Both
+    gate machines have AVX2, 0.6.6's NumPy used the hardware, and OSTD saves AVX state with
+    `xsave`. A booted test of AVX state across preemption goes into A's next run. The
+    `x86_64-moruna-user` default stays SSE2 for other programs.
+  - **The gate's VM time:** about 15 h in all. The NYC D8ds_v6 groups 1, 2, 3 and 5 (about
+    1.5 h) go first, once P and D are merged; the Python engines, the D4ls_v5 and the large jobs
+    follow on later days.
