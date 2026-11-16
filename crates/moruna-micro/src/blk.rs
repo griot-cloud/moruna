@@ -27,7 +27,7 @@ pub mod reactor;
 #[cfg(test)]
 mod tests;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use moruna_arena::HostBacking;
 use moruna_kernel::{ObjectMetadata, Reactor};
@@ -37,6 +37,7 @@ use crate::devices;
 
 /// What the engine was granted on the Moruna kernel: the arena's memory objects and every data
 /// disk, brought up.
+#[derive(Clone)]
 pub struct Granted {
     objects: Arc<Objects>,
     inputs: Vec<disk::Disk>,
@@ -45,22 +46,28 @@ pub struct Granted {
 
 impl Granted {
     /// The arena's memory, and each `disk.in.*` and `disk.out` slot this process was granted
-    /// brought up; `None` off the Moruna kernel.
+    /// brought up; `None` off the Moruna kernel. The disks are brought up by the first run and
+    /// are the process's: a later run of the same engine (`moruna serve`) is given them again.
     pub fn take() -> Result<Option<Granted>, String> {
-        if !crate::on_kernel() {
-            return Ok(None);
-        }
-        let objects = Objects::new();
-        let mut inputs = Vec::new();
-        let mut output = None;
-        for slot in crate::start::slots() {
-            if slot.starts_with(devices::INPUT_PREFIX) {
-                inputs.push(device::open(&slot, &objects, false)?);
-            } else if slot == devices::OUTPUT {
-                output = Some(device::open(&slot, &objects, true)?);
-            }
-        }
-        Ok(Some(Granted::new(objects, inputs, output)))
+        static GRANTED: OnceLock<Result<Option<Granted>, String>> = OnceLock::new();
+        GRANTED
+            .get_or_init(|| {
+                if !crate::on_kernel() {
+                    return Ok(None);
+                }
+                let objects = Objects::new();
+                let mut inputs = Vec::new();
+                let mut output = None;
+                for slot in crate::start::slots() {
+                    if slot.starts_with(devices::INPUT_PREFIX) {
+                        inputs.push(device::open(&slot, &objects, false)?);
+                    } else if slot == devices::OUTPUT {
+                        output = Some(device::open(&slot, &objects, true)?);
+                    }
+                }
+                Ok(Some(Granted::new(objects, inputs, output)))
+            })
+            .clone()
     }
 
     /// What was granted, brought up already.

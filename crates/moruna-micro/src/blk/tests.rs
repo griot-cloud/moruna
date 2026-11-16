@@ -891,7 +891,13 @@ mod reactor_and_layer {
         reactor.unregister_segment(1);
         let _ = reactor.paths();
         reactor.shutdown();
-        assert_eq!(model.lock().unwrap().resets, 1, "the input disk closed");
+        assert_eq!(
+            model.lock().unwrap().resets,
+            0,
+            "the disk is the process's, not the run's"
+        );
+        input.close();
+        assert_eq!(model.lock().unwrap().resets, 1);
         assert_eq!(
             inner.calls.lock().unwrap().clone(),
             vec![

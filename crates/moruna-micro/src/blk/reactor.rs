@@ -202,11 +202,10 @@ impl Reactor for DiskReactor {
         self.inner.paths()
     }
 
+    /// The wrapped reactor's shutdown. The disks are the process's, not the run's, and stay
+    /// open for the next run.
     fn shutdown(&self) {
         self.inner.shutdown();
-        for disk in self.disks.values() {
-            disk.close();
-        }
     }
 }
 

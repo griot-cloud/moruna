@@ -30,6 +30,7 @@ use crate::blk::engine::Translate;
 
 /// One region the arena was given.
 struct Region {
+    id: u64,
     base: u64,
     bytes: u64,
     memory: Arc<Memory>,
@@ -102,12 +103,26 @@ impl Objects {
         }
     }
 
-    /// The region holding `addr`: its base, length and memory object.
-    fn find(&self, addr: u64) -> Option<(u64, u64, Arc<Memory>)> {
+    /// The region holding `addr`: its id, base and length. A region's id is never another's,
+    /// though a later region may be mapped where a released one was.
+    fn find(&self, addr: u64) -> Option<(u64, u64, u64)> {
         let regions = lock(&self.regions);
         let i = regions.partition_point(|r| r.base <= addr).checked_sub(1)?;
         let r = &regions[i];
-        (addr < r.base + r.bytes).then(|| (r.base, r.bytes, Arc::clone(&r.memory)))
+        (addr < r.base + r.bytes).then_some((r.id, r.base, r.bytes))
+    }
+
+    /// The memory object of region `id` and its bytes, while the arena holds it.
+    fn memory(&self, id: u64) -> Option<(Arc<Memory>, u64)> {
+        lock(&self.regions)
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| (Arc::clone(&r.memory), r.bytes))
+    }
+
+    /// Whether the arena still holds region `id`.
+    fn holds(&self, id: u64) -> bool {
+        lock(&self.regions).iter().any(|r| r.id == id)
     }
 }
 
@@ -139,19 +154,20 @@ impl HostBacking for Objects {
                 Err(e) => return Err(refused("mapping", e)),
             };
         let base = mapping.addr();
+        let id = self.made.fetch_add(1, Ordering::Relaxed);
         {
             let mut regions = lock(&self.regions);
             let at = regions.partition_point(|r| r.base < base);
             regions.insert(
                 at,
                 Region {
+                    id,
                     base,
                     bytes,
                     memory: Arc::new(memory),
                 },
             );
         }
-        self.made.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
         if huge {
             self.huge.fetch_add(1, Ordering::Relaxed);
@@ -230,18 +246,18 @@ pub fn emit(runs: &[Run], offset: u64, len: u64, out: &mut Vec<(u64, u32)>) -> b
 }
 
 struct Pinned {
-    base: u64,
-    bytes: u64,
     runs: Vec<Run>,
     _pin: Pin,
     _memory: Arc<Memory>,
 }
 
-/// The arena's pages as one device reaches them.
+/// The arena's pages as one device reaches them. A region is pinned when an operation first
+/// names it; the pins of regions the arena has let go are dropped at the next pin, and their
+/// pages released from the device's quarantine (no operation can name a released region).
 pub struct Pins {
     objects: Arc<Objects>,
     dma: Arc<Handle>,
-    pinned: RwLock<Vec<Pinned>>,
+    pinned: RwLock<std::collections::HashMap<u64, Pinned>>,
     calls: AtomicU64,
 }
 
@@ -262,14 +278,19 @@ impl Pins {
         self.calls.load(Ordering::Relaxed)
     }
 
-    /// Pins the region holding `addr`.
-    fn pin(&self, addr: u64) -> Result<(), String> {
-        let (base, bytes, memory) = self
+    /// Pins region `id`, and drops the pins of regions the arena no longer holds.
+    fn pin(&self, id: u64) -> Result<(), String> {
+        let (memory, bytes) = self
             .objects
-            .find(addr)
-            .ok_or_else(|| format!("{addr:#x} is not in the arena, which alone a disk reaches"))?;
+            .memory(id)
+            .ok_or("an arena region let go while an operation named it")?;
         let mut pinned = self.pinned.write().unwrap_or_else(|e| e.into_inner());
-        if pinned.iter().any(|p| p.base == base) {
+        let before = pinned.len();
+        pinned.retain(|held, _| self.objects.holds(*held));
+        if pinned.len() < before {
+            let _ = moruna_sys::dma_release(&self.dma);
+        }
+        if pinned.contains_key(&id) {
             return Ok(());
         }
         let mut pages = vec![0u64; (bytes / PAGE_SIZE) as usize];
@@ -277,12 +298,9 @@ impl Pins {
         let (pin, n) = Pin::create(&self.dma, &memory.0, true, &mut pages)
             .map_err(|e| format!("pinning an arena region for a disk: {}", e.name()))?;
         pages.truncate(n);
-        let at = pinned.partition_point(|p| p.base < base);
         pinned.insert(
-            at,
+            id,
             Pinned {
-                base,
-                bytes,
                 runs: runs_of(&pages),
                 _pin: pin,
                 _memory: memory,
@@ -291,35 +309,34 @@ impl Pins {
         Ok(())
     }
 
-    fn lookup(&self, addr: u64, len: u64, out: &mut Vec<(u64, u32)>) -> Option<bool> {
+    fn lookup(&self, id: u64, offset: u64, len: u64, out: &mut Vec<(u64, u32)>) -> Option<bool> {
         let pinned = self.pinned.read().unwrap_or_else(|e| e.into_inner());
-        let i = pinned.partition_point(|p| p.base <= addr).checked_sub(1)?;
-        let p = &pinned[i];
-        if addr >= p.base + p.bytes {
-            return None;
-        }
-        if addr + len > p.base + p.bytes {
-            return Some(false);
-        }
-        Some(emit(&p.runs, addr - p.base, len, out))
+        pinned.get(&id).map(|p| emit(&p.runs, offset, len, out))
     }
 }
 
 impl Translate for Pins {
     fn runs(&self, addr: u64, len: u64, out: &mut Vec<(u64, u32)>) -> Result<(), String> {
-        let found = match self.lookup(addr, len, out) {
+        let (id, base, bytes) = self
+            .objects
+            .find(addr)
+            .ok_or_else(|| format!("{addr:#x} is not in the arena, which alone a disk reaches"))?;
+        if addr + len > base + bytes {
+            return Err(format!(
+                "{len} bytes at {addr:#x} are not in one arena region"
+            ));
+        }
+        let found = match self.lookup(id, addr - base, len, out) {
             Some(found) => found,
             None => {
-                self.pin(addr)?;
-                self.lookup(addr, len, out).unwrap_or(false)
+                self.pin(id)?;
+                self.lookup(id, addr - base, len, out).unwrap_or(false)
             }
         };
         if found {
             Ok(())
         } else {
-            Err(format!(
-                "{len} bytes at {addr:#x} are not in one pinned arena region"
-            ))
+            Err(format!("{len} bytes at {addr:#x} are not all pinned"))
         }
     }
 }
