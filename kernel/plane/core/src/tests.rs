@@ -729,3 +729,39 @@ fn p_the_python_shim_speaks_the_engine_s_records_and_rings() {
         json
     );
 }
+
+/// The engine never sleeps through a ring it may not have seen: the task notes (or posts)
+/// between the engine's look at the rings and its sleep, and the sleep is refused; after a
+/// fresh look it sleeps on the bell as it now stands.
+#[test]
+fn p_the_engine_does_not_sleep_through_a_ring_after_its_look() {
+    use crate::ring::{Engine, Geometry, Mode, Task, layout};
+    let mem = crate::model::Mem {
+        bytes: Rc::new(core::cell::RefCell::new(vec![0u8; 64 * 1024])),
+        writable: true,
+    };
+    let s = crate::model_ring::ModelMap::from_mem(&mem);
+    let g = Geometry::new(4096, 1, 4096).expect("geometry");
+    let mut e = Engine::format(&s, g, Mode::Protect, 0);
+    let mut t = Task::attach(&s).expect("attach");
+    e.look(&s);
+    t.note(&s);
+    assert_eq!(e.sleep(&s), Ok(None), "the note rang after the look");
+    assert_eq!(
+        crate::ring::Shared::load(&s, layout::ENGINE_WAITS),
+        0,
+        "not asleep"
+    );
+    e.look(&s);
+    let seq = e
+        .sleep(&s)
+        .expect("sleep")
+        .expect("nothing rang since the look");
+    assert_eq!(
+        seq,
+        crate::ring::Shared::load(&s, layout::ENGINE_BELL) as u32
+    );
+    e.awake(&s);
+    assert!(e.noted(&s), "the note is read");
+    assert!(!e.noted(&s), "once");
+}

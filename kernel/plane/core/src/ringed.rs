@@ -940,6 +940,13 @@ impl<C: RingCalls> RingPlane<C> {
 
     /// Everything a ring task has for the engine now.
     fn pump(&mut self, id: u32) -> Result<(), PlaneError> {
+        // Every ring from here on is one this look may miss: the engine will not sleep
+        // through it.
+        if let Some(t) = self.tasks.get_mut(&id)
+            && let Some(Owner::Rings(o)) = self.owners.get(&t.rings)
+        {
+            t.engine.look(&*o.view);
+        }
         self.pump_released(id)?;
         // A task's slots and port are read only when a wait said something came, when the
         // task says it waits, or when it posted in unmap mode (its hand-back follows): in

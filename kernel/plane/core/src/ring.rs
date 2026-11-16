@@ -318,6 +318,8 @@ pub struct Engine {
     task_bell: u32,
     /// The task's note as the engine last read it.
     note: u64,
+    /// The engine's bell as it stood when the engine last looked at the rings.
+    bell_seen: u32,
 }
 
 impl Engine {
@@ -352,6 +354,7 @@ impl Engine {
             closed: false,
             task_bell: 0,
             note: 0,
+            bell_seen: 0,
         }
     }
 
@@ -517,14 +520,20 @@ impl Engine {
         true
     }
 
+    /// The engine starts a look at the rings: the bell as it stands now. A ring after this
+    /// is one the look may not have seen, so the engine will not sleep through it.
+    pub fn look(&mut self, s: &impl Shared) {
+        self.bell_seen = s.load(ENGINE_BELL) as u32;
+    }
+
     /// Going to sleep on the engine's bell: says so, then reads the bell and the output ring
-    /// again after the fence. The bell's value to wait on, or `None` when an output came
-    /// meanwhile.
+    /// again after the fence. The bell's value to wait on, or `None` when the task rang it
+    /// since the engine's last look (a record, its note) or an output came meanwhile.
     pub fn sleep(&mut self, s: &impl Shared) -> Result<Option<u32>, Bad> {
         s.store(ENGINE_WAITS, 1);
         s.fence();
         let seq = s.load(ENGINE_BELL) as u32;
-        if self.posted(s)? > 0 {
+        if seq != self.bell_seen || self.posted(s)? > 0 {
             s.store(ENGINE_WAITS, 0);
             return Ok(None);
         }
