@@ -1568,7 +1568,10 @@ impl ProgramTable {
         }
         unmap_in(&program.vm, va, len);
         for (level, size) in charge::TABLE_REGIONS.iter().copied().enumerate() {
-            let whole = va.div_ceil(size)..end / size;
+            // A range inside one region covers none whole. Clamped, so it never runs
+            // backwards: `BTreeSet::range` panics on that, in kernel mode.
+            let first = va.div_ceil(size);
+            let whole = first..(end / size).max(first);
             let gone: Vec<u64> = tables[level].range(whole).copied().collect();
             for region in gone {
                 tables[level].remove(&region);
