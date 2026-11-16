@@ -98,4 +98,19 @@ of 2 vCPUs with `--vcpu-cpus 2,3`.
 
 ### Measured on moruna-bench
 
-See the table below (stream D, 2026-11-16).
+Stream D, 2026-11-16, Standard_D8ds_v6 (8 CPUs, cores 4-5 and 6-7 isolated): stream A's quiet
+boot (only the `datapath` test), whose pinned guest CPU spins 300 ms and counts what interrupts
+it for less than 100 us. QEMU 10.2.1 under KVM, its vCPUs placed by the launcher's own placement
+code (`crates/moruna-vmm/examples/pin-vcpus.rs`); 3 runs each, on 2 and 4 vCPUs.
+
+| Host | vCPUs | Interruptions in 300 ms | Time lost |
+| --- | --- | --- | --- |
+| Host tick on, vCPUs where the scheduler puts them | unplaced | 342 to 799 | 1.44% to 2.73% |
+| Host tick on, vCPUs placed | 4,6 and 4-7 | 335 to 360 | 1.45% to 1.47% |
+| `nohz_full`, `isolcpus`, `rcu_nocbs` on 4-7, vCPUs placed there | 4,6 and 4-7 | 62 to 72 | 0.058% to 0.073% |
+| The same host, vCPUs unplaced | unplaced | 360 to 431 | 1.62% to 2.48% |
+
+Placing the vCPUs alone takes out the spread (other host work landing on the vCPU's core);
+the isolated cores take out the host's tick: about 25 times less time lost. What is left (about
+0.23 interruptions a millisecond) is the guest's own stretched tick and the Azure hypervisor
+under this VM.
