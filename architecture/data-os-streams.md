@@ -193,7 +193,7 @@ and switches to the new one when the call answers.
   Sockets and the cloud platform stay out.
 - **Tests:**
   - host tests of the carried logic;
-  - then booted: static musl, dynamic glibc, `sh`, CPython 3.14 importing NumPy and pyarrow, and
+  - then booted: static musl, dynamic glibc, CPython 3.14 importing NumPy and pyarrow (no shell), and
     the gVisor system-call tests that apply.
 - **Done when:**
   - the gate's Python image runs as an image task on it under KVM;
