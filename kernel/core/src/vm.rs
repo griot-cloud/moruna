@@ -335,15 +335,12 @@ impl Space {
         let end = Space::check_range(va, len)?;
         let removed = {
             let mut inner = self.inner.lock();
-            let same = inner.areas.get(&va).is_some_and(|a| {
-                a.kind == Kind::Plane
-                    && a.end == end
-                    && matches!(&a.backing, Backing::Object { memory: m, .. } if Arc::ptr_eq(m, memory))
-            });
-            if !same {
-                return Err(Error::BadState);
-            }
-            let removed = inner.areas.remove(&va);
+            // stream A hook: `windows_protect`'s slot form may have split the area.
+            let starts = Space::plane_run(&inner, va, end, memory).ok_or(Error::BadState)?;
+            let removed: Vec<Area> = starts
+                .iter()
+                .filter_map(|s| inner.areas.remove(s))
+                .collect();
             let (before, after) = inner.neighbours(va, end);
             let freed = moruna_quota::tables(&[(va, end)], before, after, map_end());
             inner.tables -= freed.pages;
@@ -657,7 +654,7 @@ impl Space {
     pub fn protect(&self, va: u64, len: u64, prot: u64, only: Option<Kind>) -> Result<(), Error> {
         let end = Space::check_range(va, len)?;
         let mut inner = self.inner.lock();
-        Space::check_cover(&inner, va, end, prot, only)?;
+        Space::check_cover(&inner, va, end, prot, Scope::Kind(only))?;
         // Splitting at both ends makes at most two areas more.
         let split_bytes = Space::split_bytes(&inner, va, end);
         self.charge(&mut inner, split_bytes)?;
@@ -972,6 +969,27 @@ impl Space {
 // ---- stream A (data path, `architecture/data-os-streams.md`): stream A's additions to
 // ---- `Space` go in this block; it also owns `map`, `populate` and `protect` above.
 
+/// Which areas `protect_windows` may change.
+#[derive(Clone, Copy)]
+pub enum Scope<'a> {
+    /// Areas of this kind (`None`: any kind), never the data plane's.
+    Kind(Option<Kind>),
+    /// The data plane's areas of this object only: `windows_protect`'s slot form.
+    Plane(&'a Arc<MemoryObject>),
+}
+
+impl Scope<'_> {
+    fn takes(&self, area: &Area) -> bool {
+        match self {
+            Scope::Kind(only) => area.kind != Kind::Plane && only.is_none_or(|k| k == area.kind),
+            Scope::Plane(memory) => {
+                area.kind == Kind::Plane
+                    && matches!(&area.backing, Backing::Object { memory: m, .. } if Arc::ptr_eq(m, memory))
+            }
+        }
+    }
+}
+
 /// A large page's size: 2 MiB.
 const HUGE: u64 = HUGE_PAGE_SIZE as u64;
 /// The pages of a large page.
@@ -1174,14 +1192,14 @@ impl Space {
         Ok(candidate)
     }
 
-    /// Checks that areas cover `va .. end` with no hole, each of them `only`'s kind if
-    /// given and none the data plane's, and that each allows `prot`.
+    /// Checks that areas cover `va .. end` with no hole, each of them in `scope`, and
+    /// that each allows `prot`.
     fn check_cover(
         inner: &Inner,
         va: u64,
         end: u64,
         prot: u64,
-        only: Option<Kind>,
+        scope: Scope<'_>,
     ) -> Result<(), Error> {
         let first = Space::area_at(inner, va).map_or(va, |(start, _)| start);
         let mut cursor = va;
@@ -1189,7 +1207,7 @@ impl Space {
             if start > cursor {
                 return Err(Error::OutOfRange);
             }
-            if only.is_some_and(|k| k != area.kind) || area.kind == Kind::Plane {
+            if !scope.takes(area) {
                 return Err(Error::InvalidArgs);
             }
             Space::check_prot(prot, &area.backing)?;
@@ -1210,7 +1228,7 @@ impl Space {
         &self,
         windows: &[(u64, u64)],
         prot: u64,
-        only: Option<Kind>,
+        scope: Scope<'_>,
     ) -> Result<(), Error> {
         let mut ranges = Vec::new();
         ranges
@@ -1226,7 +1244,7 @@ impl Space {
         };
         let mut inner = self.inner.lock();
         for &(va, end) in &ranges {
-            Space::check_cover(&inner, va, end, prot, only)?;
+            Space::check_cover(&inner, va, end, prot, scope)?;
         }
         // Splitting at both ends of each window makes at most two areas more a window.
         let split_bytes = ranges
@@ -1277,7 +1295,87 @@ impl Space {
                 self.fill_ptes(&inner, start, &area, start, area.end)?;
             }
         }
+        // The data plane unmaps its area whole: pieces that agree again join again.
+        for &(va, end) in &ranges {
+            Space::join_plane(&mut inner, va);
+            Space::join_plane(&mut inner, end);
+        }
+        self.settle(&mut inner);
         Ok(())
+    }
+
+    /// Joins the data plane's area that ends at `at` with the one that starts there, when
+    /// both are pieces of one mapping of one object with one protection.
+    fn join_plane(inner: &mut Inner, at: u64) {
+        let Some((start, head)) = inner.areas.range(..at).next_back() else {
+            return;
+        };
+        let (start, head) = (*start, head.clone());
+        let joins = head.end == at
+            && inner
+                .areas
+                .get(&at)
+                .is_some_and(|tail| Space::continues(&head, start, tail, at));
+        if joins
+            && let Some(tail) = inner.areas.remove(&at)
+            && let Some(h) = inner.areas.get_mut(&start)
+        {
+            h.end = tail.end;
+        }
+    }
+
+    /// Whether `tail`, at `at`, continues the data plane's area `head`, at `start`: the
+    /// next pages of the same object, with the same protection and rights.
+    fn continues(head: &Area, start: u64, tail: &Area, at: u64) -> bool {
+        head.kind == Kind::Plane
+            && tail.kind == Kind::Plane
+            && head.prot == tail.prot
+            && head.backing.writable() == tail.backing.writable()
+            && Space::continues_object(head, start, tail, at)
+    }
+
+    /// The starts of the data plane's areas that cover exactly `va .. end`, one mapping of
+    /// `memory` from `va`, though a revoke may have split it; `None` when they do not.
+    fn plane_run(inner: &Inner, va: u64, end: u64, memory: &Arc<MemoryObject>) -> Option<Vec<u64>> {
+        let head = inner.areas.get(&va)?;
+        let ours = |a: &Area| {
+            a.kind == Kind::Plane
+                && matches!(&a.backing, Backing::Object { memory: m, .. } if Arc::ptr_eq(m, memory))
+        };
+        if !ours(head) {
+            return None;
+        }
+        let mut starts = Vec::new();
+        let (mut last_start, mut last) = (va, head);
+        starts.push(va);
+        while last.end < end {
+            let next = inner.areas.get(&last.end)?;
+            if !ours(next) || !Space::continues_object(last, last_start, next, last.end) {
+                return None;
+            }
+            starts.push(last.end);
+            (last_start, last) = (last.end, next);
+        }
+        (last.end == end).then_some(starts)
+    }
+
+    /// Whether `tail`, at `at`, maps the next pages of `head`'s object, at `start`.
+    fn continues_object(head: &Area, start: u64, tail: &Area, at: u64) -> bool {
+        match (&head.backing, &tail.backing) {
+            (
+                Backing::Object {
+                    memory: m,
+                    first: f,
+                    ..
+                },
+                Backing::Object {
+                    memory: n,
+                    first: g,
+                    ..
+                },
+            ) => Arc::ptr_eq(m, n) && *f as u64 + (at - start) / PAGE_SIZE == *g as u64,
+            _ => false,
+        }
     }
 
     /// Maps `memory`'s first page read only where the kernel chooses, unless an area

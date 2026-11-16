@@ -23,7 +23,7 @@ use crate::{
     object::Object,
     process::{Process, Thread},
     sched, usercopy,
-    vm::{Backing, Kind},
+    vm::{Backing, Kind, Scope},
 };
 
 /// What a call returns: `rax` and `rdx`, or the error.
@@ -76,7 +76,9 @@ pub(crate) fn clock_page(process: &Process, _args: [u64; 6]) -> Answer {
 /// `windows_protect(process, ranges, count, flags)`: sets `flags`, `map::READ` or
 /// `map::READ | map::WRITE`, on each of `count` (at most `windows::MAX`) windows of
 /// `process` (zero: the caller's own mappings), all or none, with one flush that has
-/// finished on every CPU when the call returns. Needs `WRITE` on the process.
+/// finished on every CPU when the call returns. Needs `WRITE` on the process. With a
+/// slot in place of the process, the ranges are offsets within the area the slot's
+/// window is mapped at, and nothing else changes; needs `WRITE` on the slot.
 pub(crate) fn windows_protect(process: &Process, args: [u64; 6]) -> Answer {
     let [target, ranges, count, flags, ..] = args;
     windows::flags(flags)?;
@@ -88,12 +90,29 @@ pub(crate) fn windows_protect(process: &Process, args: [u64; 6]) -> Answer {
     if target == 0 {
         process
             .space
-            .protect_windows(&list, flags, Some(Kind::Mapping))?;
-    } else {
-        let Object::Process(other) = object(process, target, Rights::WRITE)? else {
-            return Err(Error::WrongType);
-        };
-        other.space.protect_windows(&list, flags, None)?;
+            .protect_windows(&list, flags, Scope::Kind(Some(Kind::Mapping)))?;
+        return Ok((0, 0));
+    }
+    match object(process, target, Rights::WRITE)? {
+        Object::Process(other) => other
+            .space
+            .protect_windows(&list, flags, Scope::Kind(None))?,
+        // The slot form: offsets within the area the slot's window is mapped at, in the
+        // process that mapped it, and nothing outside that area (DP-I5: only a slot the
+        // caller holds, and only its own area).
+        Object::Slot(end) => end.0.with_mapped(|mapper, addr, span, memory| {
+            for window in list.iter_mut() {
+                let (offset, len) = *window;
+                if offset.checked_add(len).is_none_or(|e| e > span) {
+                    return Err(Error::OutOfRange);
+                }
+                *window = (addr + offset, len);
+            }
+            mapper
+                .space
+                .protect_windows(&list, flags, Scope::Plane(memory))
+        })?,
+        _ => return Err(Error::WrongType),
     }
     Ok((0, 0))
 }

@@ -16,6 +16,13 @@
 //!   keeps it; a partial unmap leaves the rest mapped. The page table is read with
 //!   `plane_probe` (the CI boot's kernel).
 //!
+//! - `map::POPULATE` zero pages through `process_map`: every page charged at the call, and
+//!   none charged again when it is written (no page is touched for the first time);
+//! - `windows_protect`'s slot form: an engine revokes a task's window through the output
+//!   slot alone. A revoked page keeps its bytes, a put of a window part of which is revoked
+//!   gives the record back, refusals change nothing, and `dp-task`'s write to a page
+//!   revoked this way faults.
+//!
 //! It also measures what C4, C5 and C8 are judged by: a touch a page through large pages
 //! and through 4 KiB ones, the time a pinned CPU loses to the kernel, and a read of the
 //! page against a `clock_get`. `dp-revoke` shows a write to a revoked window faults.
@@ -29,13 +36,16 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use moruna_kb1_programs::{console, ms};
+use moruna_kb1_programs::{console, ms, slot};
 use moruna_sys::{
-    Error, Mapping, Memory, Rights, Signals, Thread,
+    Account, Channel, Error, Handle, Mapping, Memory, Process, Rights, Signals, Thread, charge,
     datapath::{
         ClockPage, clock_page, current_cpu, mapping_size, pin_current_thread, thread_set_cpu,
+        windows_protect_slot,
     },
-    futex_wait, futex_wake, map, now, println, raw, thread_exit, wait_one,
+    futex_wait, futex_wake, map, now,
+    plane::{Slot, SlotEvent, attach},
+    println, raw, thread_exit, wait_one,
 };
 
 moruna_sys::main!(run);
@@ -85,6 +95,16 @@ fn run() -> i64 {
         return code;
     }
     if let Err(code) = huge(&out) {
+        return code;
+    }
+    let resource = match process_resource(&out) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    if let Err(code) = populate(&out, &resource) {
+        return code;
+    }
+    if let Err(code) = slot_form(&out, &resource, &slot("task-image")) {
         return code;
     }
     0
@@ -637,6 +657,284 @@ fn huge(out: &Out) -> Result<(), i64> {
         OBJECT / MIB,
         large_ns,
         plain_ns
+    );
+    Ok(())
+}
+
+/// The process resource the supervisor sends, as it sends the accounts test its own.
+fn process_resource(out: &Out) -> Result<Handle, i64> {
+    let supervisor = Channel(slot("supervisor"));
+    wait_one(&supervisor.0, Signals::READABLE, now() + ms(60_000))
+        .map_err(|e| fail(out, "populate", "the supervisor's process resource", e))?;
+    let mut buf = [0u8; 16];
+    let mut handles = [None];
+    supervisor
+        .read(&mut buf, &mut handles)
+        .map_err(|e| fail(out, "populate", "reading the process resource", e))?;
+    handles[0]
+        .take()
+        .ok_or_else(|| fail(out, "populate", "no process resource", Error::BadState))
+}
+
+/// `map::POPULATE` zero pages through `process_map`, into a process made for it.
+fn populate(out: &Out, resource: &Handle) -> Result<(), i64> {
+    const SIZE: u64 = 4 << 20;
+    const PAGE: u64 = 4096;
+    let f = |what: &str, e: Error| fail(out, "populate", what, e);
+    let account = Account::carve(16 << 20, "dp-populate").map_err(|e| f("account_create", e))?;
+    let p = Process::create_in(resource, "dp-populate", &account.0)
+        .map_err(|e| f("process_create", e))?;
+    let used = || {
+        account
+            .usage()
+            .map(|u| u.used)
+            .map_err(|e| f("account_info", e))
+    };
+    let before = used()?;
+    let va = p
+        .map(
+            None,
+            0,
+            SIZE,
+            0,
+            map::READ | map::WRITE | map::POPULATE | map::HUGE,
+        )
+        .map_err(|e| f("process_map POPULATE", e))?;
+    let mapped = used()?;
+    let pages = SIZE / PAGE;
+    if mapped - before < pages * charge::ZERO_PAGE {
+        println!(
+            out,
+            "DS-A populate: FAIL: {} zero pages charged {} bytes at the call, less than {}",
+            pages,
+            mapped - before,
+            pages * charge::ZERO_PAGE
+        );
+        return Err(1);
+    }
+    for page in 0..pages {
+        p.write(va + page * PAGE + 7, &[page as u8])
+            .map_err(|e| f("process_write", e))?;
+    }
+    let written = used()?;
+    let mut back = [0xffu8; 2];
+    p.read(va + 5 * PAGE + 7, &mut back)
+        .map_err(|e| f("process_read", e))?;
+    if written != mapped || back != [5, 0] {
+        println!(
+            out,
+            "DS-A populate: FAIL: writing every page charged {} bytes more, and read {:?}",
+            written - mapped,
+            back
+        );
+        return Err(1);
+    }
+    // Without POPULATE a page is charged at its first touch.
+    let lazy = p
+        .map(None, 0, 64 * PAGE, 0, map::READ | map::WRITE)
+        .map_err(|e| f("process_map", e))?;
+    let quiet = used()?;
+    p.write(lazy, &[1]).map_err(|e| f("process_write", e))?;
+    let first = used()? - quiet;
+    if first != charge::ZERO_PAGE {
+        println!(
+            out,
+            "DS-A populate: FAIL: a lazy page's first write charged {} bytes", first
+        );
+        return Err(1);
+    }
+    println!(
+        out,
+        "DS-A populate: ok: {} zero pages charged {} bytes at process_map with POPULATE, and nothing more when every page was written; without it a first write charged {}",
+        pages,
+        mapped - before,
+        first
+    );
+    Ok(())
+}
+
+const TASK_PAGE: usize = 4096;
+const TASK_WINDOW: u64 = 4 * TASK_PAGE as u64;
+
+/// Waits for `word` from the task.
+fn heard(out: &Out, peer: &Channel, word: &[u8]) -> Result<(), i64> {
+    wait_one(&peer.0, Signals::READABLE, now() + ms(30_000))
+        .map_err(|e| fail(out, "slot", "waiting for dp-task", e))?;
+    let mut buf = [0u8; 16];
+    match peer.read(&mut buf, &mut []) {
+        Ok((n, 0)) if &buf[..n] == word => Ok(()),
+        other => {
+            println!(
+                out,
+                "DS-A slot: FAIL: dp-task said {:?} ({:?}), not {:?}",
+                &buf[..16],
+                other,
+                word
+            );
+            Err(1)
+        }
+    }
+}
+
+/// The next event of `output`.
+fn event(out: &Out, output: &Slot) -> Result<SlotEvent, i64> {
+    wait_one(&output.0, Signals::READABLE, now() + ms(30_000))
+        .map_err(|e| fail(out, "slot", "waiting for the slot", e))?;
+    output.take().map_err(|e| fail(out, "slot", "slot_take", e))
+}
+
+/// The first byte of each page of a window that came back.
+fn pages_of(out: &Out, memory: &Memory) -> Result<[u8; 4], i64> {
+    let m = memory
+        .map(0, TASK_WINDOW, 0)
+        .map_err(|e| fail(out, "slot", "mapping a window back", e))?;
+    let mut firsts = [0u8; 4];
+    for (page, b) in firsts.iter_mut().enumerate() {
+        let mut one = [0u8; 1];
+        m.read(page * TASK_PAGE, &mut one)
+            .map_err(|e| fail(out, "slot", "reading a window back", e))?;
+        *b = one[0];
+    }
+    Ok(firsts)
+}
+
+fn slot_refused(
+    out: &Out,
+    what: &str,
+    want: Error,
+    result: moruna_sys::Result<()>,
+) -> Result<(), i64> {
+    match result {
+        Err(e) if e == want => Ok(()),
+        other => {
+            println!(
+                out,
+                "DS-A slot: FAIL: {} gave {:?}, not {}",
+                what,
+                other,
+                want.name()
+            );
+            Err(1)
+        }
+    }
+}
+
+/// `windows_protect`'s slot form, against `dp-task`.
+fn slot_form(out: &Out, resource: &Handle, image: &Handle) -> Result<(), i64> {
+    let f = |what: &str, e: Error| fail(out, "slot", what, e);
+    let account = Account::carve(16 << 20, "dp-task").map_err(|e| f("account_create", e))?;
+    let task =
+        Process::create_in(resource, "dp-task", &account.0).map_err(|e| f("process_create", e))?;
+    let entry = task
+        .map_image(image)
+        .map_err(|e| f("process_map_image", e))?;
+    let output = Slot::create(true).map_err(|e| f("slot_create", e))?;
+    let (ours, theirs) = Channel::create().map_err(|e| f("channel_create", e))?;
+    attach(&task, &[&output], None).map_err(|(e, _)| f("process_plane", e))?;
+    slot_refused(
+        out,
+        "a slot with nothing mapped",
+        Error::BadState,
+        windows_protect_slot(&output, &[[0, 4096]], map::READ),
+    )?;
+    let first = Memory::create(TASK_WINDOW).map_err(|e| f("memory_create", e))?;
+    output
+        .push(first, 0, TASK_WINDOW, 1)
+        .map_err(|(e, _)| f("slot_push", e))?;
+    task.start_with(entry, &mut [(Some(theirs.0), "peer")])
+        .map_err(|e| f("process_start", e))?;
+    heard(out, &ours, b"mapped")?;
+    // Refusals first, each changing nothing.
+    slot_refused(
+        out,
+        "a window past the slot's area",
+        Error::OutOfRange,
+        windows_protect_slot(&output, &[[3 * 4096, 2 * 4096]], map::READ),
+    )?;
+    slot_refused(
+        out,
+        "execute",
+        Error::InvalidArgs,
+        windows_protect_slot(&output, &[[0, 4096]], map::READ | map::EXECUTE),
+    )?;
+    let looking = Slot(
+        output
+            .0
+            .duplicate(Rights::READ)
+            .map_err(|e| f("handle_duplicate", e))?,
+    );
+    slot_refused(
+        out,
+        "a slot handle without WRITE",
+        Error::AccessDenied,
+        windows_protect_slot(&looking, &[[0, 4096]], map::READ),
+    )?;
+    // Page 1 revoked, granted back, then pages 1 and 2 revoked.
+    windows_protect_slot(&output, &[[4096, 4096]], map::READ)
+        .map_err(|e| f("revoking a page", e))?;
+    windows_protect_slot(&output, &[[4096, 4096]], map::READ | map::WRITE)
+        .map_err(|e| f("granting it back", e))?;
+    windows_protect_slot(&output, &[[4096, 2 * 4096]], map::READ)
+        .map_err(|e| f("revoking two pages", e))?;
+    ours.write(b"go", [])
+        .map_err(|(e, _)| f("channel_write", e))?;
+    heard(out, &ours, b"put")?;
+    // The record put while two pages were revoked comes back whole, with their bytes kept.
+    let SlotEvent::Put { memory, .. } = event(out, &output)? else {
+        println!(out, "DS-A slot: FAIL: the put gave another event");
+        return Err(1);
+    };
+    let firsts = pages_of(out, &memory)?;
+    if firsts != [0xb0, 0xa1, 0xa2, 0xb3] {
+        println!(
+            out,
+            "DS-A slot: FAIL: the first window came back as {:x?}", firsts
+        );
+        return Err(1);
+    }
+    // The second window: page 1 revoked through the slot, then written by the task.
+    let second = Memory::create(TASK_WINDOW).map_err(|e| f("memory_create", e))?;
+    output
+        .push(second, 0, TASK_WINDOW, 2)
+        .map_err(|(e, _)| f("slot_push", e))?;
+    heard(out, &ours, b"mapped")?;
+    windows_protect_slot(&output, &[[4096, 4096]], map::READ)
+        .map_err(|e| f("revoking the second window's page", e))?;
+    println!(
+        out,
+        "DS-A slot: dp-task writes a page revoked through its slot"
+    );
+    ours.write(b"go", [])
+        .map_err(|(e, _)| f("channel_write", e))?;
+    let ended = wait_one(&task.0, Signals::TERMINATED, now() + ms(30_000));
+    if !matches!(ended, Ok(s) if s.contains(Signals::TERMINATED)) {
+        println!(out, "DS-A slot: FAIL: dp-task did not end: {:?}", ended);
+        return Err(1);
+    }
+    let mut word = [0u8; 16];
+    if let Ok((n, _)) = ours.read(&mut word, &mut []) {
+        println!(
+            out,
+            "DS-A slot: FAIL: dp-task wrote a revoked page and said {:?}",
+            &word[..n]
+        );
+        return Err(1);
+    }
+    let SlotEvent::Returned { memory, .. } = event(out, &output)? else {
+        println!(out, "DS-A slot: FAIL: the task's end gave another event");
+        return Err(1);
+    };
+    let firsts = pages_of(out, &memory)?;
+    if firsts != [0xc0, 0xc1, 0xc2, 0xc3] {
+        println!(
+            out,
+            "DS-A slot: FAIL: the second window came back as {:x?}", firsts
+        );
+        return Err(1);
+    }
+    println!(
+        out,
+        "DS-A slot: ok: windows revoked and granted back through an output slot alone, their bytes kept; a window put while two of its pages were revoked came back whole; every refusal changed nothing; and the task's write to a page revoked so faulted"
     );
     Ok(())
 }
