@@ -358,6 +358,38 @@ can come from either of two places at no hot-path cost:
 
 The second removes the `std` port. It is Brackly's call (§8).
 
+## 3a. Security posture: Talos's (Brackly, 2026-11-16)
+
+> some security design decisions still stand which would or would not affect the ported over
+> code, borrowing from talos, there should not be a shell, and everything about what we need
+> from asterinas should coincide with talos
+
+Talos Linux has no shell, no SSH and no console login. It is managed only through its API, and
+its root is immutable, so its workloads run without the OS ever needing a shell. The data OS
+takes the same posture.
+
+- **No shell anywhere Moruna ships or runs.**
+  - None in the kernel's boot image, the engine's layer, the node image or any layer Moruna
+    builds.
+  - No interactive console, no login and no SSH.
+  - No booted test uses one.
+- **Tasks start by exec of their command, never through `sh -c`.** A user's image may contain a
+  shell binary, as a container image on Talos may, but Moruna never invokes it, and nothing in
+  the personality depends on one.
+- **Managed only through the API.** The VM is driven only by the job protocol over the vsock,
+  through the engine. The host side has no other way in.
+- **An immutable root.** The root filesystem is the verified, read-only layers (SDD 27). The only
+  writable places are a task's scratch and the engine's output disk.
+- **The carried Linux layer is cut to match.**
+  - It keeps what a job's programs need to run (processes, threads, files, pipes, signals,
+    epoll, `fork` and `execve`).
+  - It refuses administrative calls: `mount` and `umount`, `pivot_root` and `chroot`, `unshare`
+    and `setns`, `ptrace`, module loading, `kexec`, `reboot`, `swapon` and `swapoff`, and
+    changes of time.
+  - It provides no terminals, `devpts` or login records.
+  - A refused call answers `EPERM` or `ENOSYS` and is counted, as `kernel/linux` counts them
+    today.
+
 ## 4. User space: Asterinas's Linux layer as the personality
 
 This is `kernel-is-the-machine.md` §4.1 and §4.2, cut to a VM with no network.

@@ -10,6 +10,14 @@ first, and iterates until Moruna is significantly better than the other engines.
 
 ## Rules for every stream
 
+- **Talos's security posture binds every stream** (`data-os.md` §3a; Brackly, 2026-11-16).
+  - No shell in anything Moruna ships or runs, and none in booted tests: no `sh` in any done
+    criterion.
+  - Tasks start by exec, never `sh -c`.
+  - No console login, no SSH, no terminals or `devpts`.
+  - The root is read-only.
+  - The carried Linux layer refuses administrative calls.
+
 - **Branch and merge.**
   - Work in your own worktree, on a branch `data-os/<stream>`, cut from `feature/arrow-core-0.7`
     when the stream starts (at or after `fa0a02bf`, which added the contracts).
@@ -185,7 +193,7 @@ and switches to the new one when the call answers.
   Sockets and the cloud platform stay out.
 - **Tests:**
   - host tests of the carried logic;
-  - then booted: static musl, dynamic glibc, `sh`, CPython 3.14 importing NumPy and pyarrow, and
+  - then booted: static musl, dynamic glibc, CPython 3.14 importing NumPy and pyarrow (no shell), and
     the gVisor system-call tests that apply.
 - **Done when:**
   - the gate's Python image runs as an image task on it under KVM;
