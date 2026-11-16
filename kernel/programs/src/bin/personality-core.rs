@@ -16,7 +16,10 @@
 //!   instructions: its system call enters the personality, which answers it and returns
 //!   through the entry; a native call number enters too; the program's FS base is its own;
 //!   a read of the region faults into the personality, as does an invalid opcode; a thread
-//!   spinning in the program is interrupted into its personality.
+//!   spinning in the program is interrupted into its personality. The personality's
+//!   fault-tolerant copy resumes at its recovery address on a fault, with the address.
+//! - **Shared futexes.** A thread of another process wakes a waiter on a word of a shared
+//!   object, mapped at another address.
 //!
 //! Slots: `console`, `self-image` (this program, for its children), and `supervisor`, on
 //! which the supervisor sends a process resource. The children are this program too, each
@@ -24,14 +27,13 @@
 
 #![no_std]
 #![no_main]
-#![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use moruna_kb1_programs::{console, ms, slot};
 use moruna_sys::{
     Account, Channel, Console, Error, Handle, Memory, PAGE_SIZE, Process, Rights, Signals, Thread,
-    futex_wait, map, now,
+    futex_wait, futex_wake, map, now,
     personality::{
         self, Frame, Register, pager_request, personality_return, personality_set, thread_interrupt,
     },
@@ -74,6 +76,35 @@ const PROGRAM_FS: u64 = 0x1234_5000;
 
 /// The image page the clone test writes on each side.
 static MARK: AtomicU64 = AtomicU64::new(0x1111);
+
+// The personality's fault-tolerant copy, as B2 builds it: one byte from `rdi` into `rax`,
+// `rdx` zero; a fault at the load resumes at `b1_copy_fault` with the address in `rdx`.
+core::arch::global_asm!(
+    ".global b1_copy_byte",
+    ".global b1_copy_end",
+    ".global b1_copy_fault",
+    "b1_copy_byte:",
+    "    xor edx, edx",
+    "    movzx eax, byte ptr [rdi]",
+    "b1_copy_end:",
+    "    ret",
+    "b1_copy_fault:",
+    "    mov rax, -1",
+    "    ret",
+);
+
+/// What the copy returns, in `rax` and `rdx`.
+#[repr(C)]
+struct Copied {
+    value: u64,
+    fault: u64,
+}
+
+unsafe extern "C" {
+    fn b1_copy_byte(address: u64) -> Copied;
+    fn b1_copy_end();
+    fn b1_copy_fault();
+}
 
 type Outcome = Result<(), (&'static str, Option<Error>)>;
 
@@ -128,6 +159,19 @@ fn run() -> i64 {
                 r,
                 "wrote its image page after the clone (copy on write in user mode)",
             )
+        }
+        "b1-copy" => {
+            let r = copy_child();
+            report(
+                &out,
+                "copy",
+                r,
+                "the copy routine read a byte, and resumed at its recovery address with the address after a page fault and a general protection fault",
+            )
+        }
+        "b1-futex" => {
+            let r = futex_child();
+            report(&out, "futex waker", r, "woke a word of the shared object")
         }
         "b1-victim" => {
             let pager = Memory(slot("pager"));
@@ -184,6 +228,18 @@ fn tester(out: &Console) -> i64 {
         "entry run",
         entry(out, &resource, &image),
         "the entry child ended",
+    );
+    code |= report(
+        out,
+        "copy run",
+        copy_run(out, &resource, &image),
+        "the copy child ended",
+    );
+    code |= report(
+        out,
+        "futex",
+        futex(out, &resource, &image),
+        "a waiter on a shared object's word was woken by another process",
     );
     if code == 0 {
         println!(out, "B1 personality: ok: the four mechanisms answered");
@@ -672,4 +728,124 @@ fn entry_child() -> Outcome {
         SPUN.load(Ordering::Acquire) == 1,
         "the spinning program was not interrupted into its personality",
     )
+}
+
+// ---- The fault-tolerant copy.
+
+fn copy_run(out: &Console, resource: &Handle, image: &Handle) -> Outcome {
+    let child = call(Process::create(resource, "b1-copy"), "process_create")?;
+    let entry = call(child.map_image(image), "process_map_image")?;
+    // The region covers the image too, so the copy routine, in the image, lies inside it.
+    let routine = b1_copy_byte as *const () as u64..b1_copy_end as *const () as u64;
+    let recovery = b1_copy_fault as *const () as u64;
+    call(
+        personality::personality_set_with_copy(
+            &child,
+            PAGE,
+            MAP_BASE + REGION_LEN - PAGE,
+            routine,
+            recovery,
+        ),
+        "personality_set with a copy routine",
+    )?;
+    let console = call(console_for(out), "duplicating the console")?;
+    call(
+        child.start_with(entry, &mut [(Some(console), "console")]),
+        "process_start",
+    )?;
+    call(
+        wait_one(&child.0, Signals::TERMINATED, now() + ms(10_000)),
+        "the copy child did not end",
+    )?;
+    Ok(())
+}
+
+fn copy(address: u64) -> Copied {
+    // SAFETY: the routine reads one byte; a fault there resumes at its recovery address,
+    // which this process's personality names, and returns the address in `fault`.
+    unsafe { b1_copy_byte(address) }
+}
+
+fn copy_child() -> Outcome {
+    let c = copy(&MARK as *const AtomicU64 as u64);
+    want(
+        c.value == 0x11 && c.fault == 0,
+        "the copy did not read a byte",
+    )?;
+    let c = copy(0x10);
+    want(
+        c.value == u64::MAX && c.fault == 0x10,
+        "a page fault in the copy did not resume at its recovery address",
+    )?;
+    let c = copy(0x8000_0000_0000_0000);
+    want(
+        c.value == u64::MAX && c.fault == 0,
+        "a general protection fault in the copy did not resume at its recovery address",
+    )
+}
+
+// ---- Shared futexes.
+
+/// The word at the start of a mapping, for a futex.
+fn word<'a>(m: &'a moruna_sys::Mapping<'_>) -> &'a AtomicU32 {
+    // SAFETY: the mapping is at least a page, aligned, mapped for as long as it is
+    // borrowed, and only ever accessed as atomics.
+    unsafe { &*(m.addr() as *const AtomicU32) }
+}
+
+fn futex_child() -> Outcome {
+    let shared = Memory(slot("shared"));
+    let m = call(shared.map(0, PAGE, map::WRITE), "mapping the shared object")?;
+    let woken = call(futex_wake(word(&m), u32::MAX), "futex_wake")?;
+    call(m.write(8, &woken.to_le_bytes()), "writing the count")
+}
+
+static FUTEX_ASLEEP: AtomicU32 = AtomicU32::new(0);
+static FUTEX_WOKEN: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn futex_waiter(address: u64) -> ! {
+    // SAFETY: as in `word`: the tester keeps the page mapped until this thread ends.
+    let w = unsafe { &*(address as *const AtomicU32) };
+    FUTEX_ASLEEP.store(1, Ordering::Release);
+    let r = futex_wait(w, 0, now() + ms(10_000));
+    FUTEX_WOKEN.store(if r.is_ok() { 1 } else { 2 }, Ordering::Release);
+    thread_exit()
+}
+
+fn futex(out: &Console, resource: &Handle, image: &Handle) -> Outcome {
+    let shared = call(Memory::create(PAGE), "the shared object")?;
+    let m = call(shared.map(0, PAGE, map::WRITE), "mapping the shared object")?;
+    let child = call(Process::create(resource, "b1-futex"), "process_create")?;
+    let entry = call(child.map_image(image), "process_map_image")?;
+    let console = call(console_for(out), "duplicating the console")?;
+    let theirs = call(
+        shared
+            .0
+            .duplicate(Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER),
+        "duplicate",
+    )?;
+    // The child starts once this process's thread sleeps on word 0, which holds zero.
+    let waiter = spawn(futex_waiter, m.addr())?;
+    while FUTEX_ASLEEP.load(Ordering::Acquire) == 0 {
+        sleep(ms(1));
+    }
+    sleep(ms(20));
+    call(
+        child.start_with(
+            entry,
+            &mut [(Some(console), "console"), (Some(theirs), "shared")],
+        ),
+        "process_start",
+    )?;
+    call(
+        wait_one(&waiter.0, Signals::TERMINATED, now() + ms(10_000)),
+        "the shared word's waiter was not woken",
+    )?;
+    want(
+        FUTEX_WOKEN.load(Ordering::Acquire) == 1,
+        "the shared word's waiter ended without a wake",
+    )?;
+    let mut b = [0u8; 4];
+    call(m.read(8, &mut b), "reading the waker's count")?;
+    want(u32::from_le_bytes(b) == 1, "the waker woke no one")
 }

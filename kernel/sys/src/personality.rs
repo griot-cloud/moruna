@@ -170,6 +170,29 @@ pub fn personality_set(process: &Process, base: u64, len: u64) -> Result<()> {
     check(raw::call3(nr::PERSONALITY_SET, process.0.raw() as u64, base, len).0).map(|_| ())
 }
 
+/// [`personality_set`], with the personality's fault-tolerant copy routine (B2's `VmReader`
+/// and `VmWriter`): a page fault or general protection fault at an instruction of `routine`,
+/// while the thread is in the personality, resumes it at `recovery` with the faulting address
+/// in `rdx` (zero for a general protection fault) and every other register as it was, where it
+/// would otherwise end the process. `routine` and `recovery` lie inside the region.
+pub fn personality_set_with_copy(
+    process: &Process,
+    base: u64,
+    len: u64,
+    routine: core::ops::Range<u64>,
+    recovery: u64,
+) -> Result<()> {
+    let a = [
+        process.0.raw() as u64,
+        base,
+        len,
+        routine.start,
+        routine.end,
+        recovery,
+    ];
+    check(raw::call6(nr::PERSONALITY_SET, a).0).map(|_| ())
+}
+
 /// Runs the program with the registers in `frame`, which must lie inside the calling
 /// process's personality region, from the calling thread, which must be in the personality.
 /// Returns when the program next enters the personality: the reason (`personality::reason`),

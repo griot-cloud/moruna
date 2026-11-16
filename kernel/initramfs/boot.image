@@ -336,6 +336,12 @@ process personality-core
   expect B1 entry: ok:
   expect kk: process b1-entry exited with code 0 (
   expect B1 entry run: ok:
+  expect B1 copy: ok:
+  expect kk: process b1-copy exited with code 0 (
+  expect B1 copy run: ok:
+  expect B1 futex waker: ok:
+  expect kk: process b1-futex exited with code 0 (
+  expect B1 futex: ok:
   expect B1 personality: ok:
   exits 0
 link supervisor.personality personality-core.supervisor

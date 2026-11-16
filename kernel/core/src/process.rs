@@ -1101,6 +1101,23 @@ fn exception(thread: &Arc<Thread>, context: &mut UserContext) -> Flow {
         });
         return crate::personality::enter(thread, context, why, detail);
     }
+    // The personality's copy routine faulted on memory it may not reach: it resumes at its
+    // recovery address with the faulting address in `rdx`.
+    if let Some(program) = thread.process.space.program()
+        && let Some((routine, recovery)) = &program.copy
+        && routine.contains(&(ip as u64))
+    {
+        let address = match &exception {
+            Some(CpuException::PageFault(info)) => Some(info.addr as u64),
+            Some(CpuException::GeneralProtectionFault(_)) => Some(0),
+            _ => None,
+        };
+        if let Some(address) = address {
+            context.set_rip(*recovery as usize);
+            context.set_rdx(address as usize);
+            return Flow::Continue;
+        }
+    }
     let why = refused.unwrap_or_else(|| describe(exception, ip));
     thread.process.end(Exit::Fault(why));
     Flow::ThreadExit

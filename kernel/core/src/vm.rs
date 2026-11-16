@@ -1034,6 +1034,8 @@ use crate::process::Thread;
 pub struct Program {
     /// The personality's region, which the table never maps.
     pub region: Range<u64>,
+    /// The personality's fault-tolerant copy routine, and where a fault in it resumes.
+    pub copy: Option<(Range<u64>, u64)>,
     pub vm: Arc<VmSpace>,
     /// The regions it holds a table page for, at each level.
     tables: SpinLock<[BTreeSet<u64>; 3]>,
@@ -1081,15 +1083,28 @@ impl Drop for Program {
 
 impl Space {
     /// Gives the space the personality's region `base .. base + len` (whole pages, in
-    /// user space) and a program's table, once.
-    pub fn set_program(&self, base: u64, len: u64) -> Result<(), Error> {
+    /// user space) and a program's table, once; and the region's copy routine, if any:
+    /// its range and where a fault in it resumes, all inside the region.
+    pub fn set_program(
+        &self,
+        base: u64,
+        len: u64,
+        copy: Option<(Range<u64>, u64)>,
+    ) -> Result<(), Error> {
         let end = Space::check_range(base, len)?;
+        if let Some((range, recovery)) = &copy {
+            let inside = |a: u64| (base..end).contains(&a);
+            if range.is_empty() || !inside(range.start) || range.end > end || !inside(*recovery) {
+                return Err(Error::InvalidArgs);
+            }
+        }
         let mut slot = self.program.0.lock();
         if slot.is_some() {
             return Err(Error::BadState);
         }
         *slot = Some(Arc::new(Program {
             region: base..end,
+            copy,
             vm: Arc::new(VmSpace::new()),
             tables: SpinLock::new([BTreeSet::new(), BTreeSet::new(), BTreeSet::new()]),
             account: self.account.clone(),
@@ -1183,6 +1198,25 @@ impl Space {
             PageProperty::new_user(page_flags(prot), CachePolicy::Writeback),
         );
         Ok(true)
+    }
+
+    /// The futex queue of a word of a shared memory object (one not private to this space:
+    /// not a snapshot, an image segment or the first stack): the object and the word's
+    /// offset in it, the same in every space that maps it. `None` for any other word.
+    pub fn shared_word(&self, addr: u64) -> Option<(u64, u64)> {
+        let inner = self.inner.lock();
+        let (start, area) = Space::area_at(&inner, addr)?;
+        match &area.backing {
+            Backing::Object { memory, first, .. }
+                if !memory.is_snapshot() && !matches!(area.kind, Kind::Image | Kind::Stack) =>
+            {
+                // Kernel addresses: the top bit is set, which no process's number has.
+                let object = Arc::as_ptr(memory) as usize as u64 | 1 << 63;
+                let offset = *first as u64 * PAGE_SIZE + (addr - start);
+                Some((object, offset))
+            }
+            _ => None,
+        }
     }
 
     /// Waits until the pager's page under `addr` is supplied: `Fault` when it is refused,
@@ -1298,7 +1332,8 @@ impl Space {
         }
         child.adopt(theirs, inner.brk)?;
         if let Some(p) = self.program() {
-            child.set_program(p.region.start, p.region.end - p.region.start)?;
+            let len = p.region.end - p.region.start;
+            child.set_program(p.region.start, len, p.copy.clone())?;
         }
         let program = self.program();
         for (start, area) in mine {

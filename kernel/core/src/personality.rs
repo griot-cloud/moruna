@@ -393,13 +393,16 @@ fn pages(offset: u64, len: u64) -> Result<(usize, usize), Error> {
     Ok(((offset / PAGE_SIZE) as usize, (len / PAGE_SIZE) as usize))
 }
 
-/// `personality_set(process, base, len)`: a created process's personality region.
+/// `personality_set(process, base, len, copy_start, copy_end, recovery)`: a created
+/// process's personality region, and its fault-tolerant copy routine (none when all three
+/// are zero).
 pub(crate) fn personality_set(p: &Process, a: [u64; 6]) -> Answer {
     let target = typed(p, a[0], Rights::WRITE, process)?;
     if !target.is_created() || target.forward().is_some() {
         return Err(Error::BadState);
     }
-    target.space.set_program(a[1], a[2])?;
+    let copy = (a[3..] != [0, 0, 0]).then_some((a[3]..a[4], a[5]));
+    target.space.set_program(a[1], a[2], copy)?;
     Ok((0, 0))
 }
 
