@@ -327,7 +327,7 @@ fn fork_cost(out: &Console, resource: &Handle) -> Outcome {
         let mut child = None;
         let t = timed(|| {
             child = Some(call(
-                personality::process_clone(resource, &source, None),
+                personality::process_clone(resource, Some(&source), None, 0),
                 "process_clone",
             )?);
             Ok(())
