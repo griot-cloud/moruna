@@ -36,6 +36,31 @@ in git history at `65acdc8f`). The decisions in "What stays" carry over from it.
 `architecture/optimized-runtime.md` describes this target. This plan says what 0.7.0 builds of
 it, in what order, and what leaves.
 
+## What Moruna is, and stays (Brackly, 2026-11-16)
+
+> make sure we maintain what moruna is, there is a risk of changing things just because were
+> wiring in
+
+Moruna is memory-aware, adaptive execution:
+
+- the arena;
+- the scheduler and its sizing;
+- the controller and its models;
+- placement and spill;
+- the reactor;
+- checkpoint and resume;
+- the run report and the events.
+
+The VM work wires these onto the kernel through their ports, as new adapters beneath them. It
+does not change what they decide or how.
+
+- **No change to core logic as a side effect of wiring.** A change to how the scheduler, the
+  controller or placement decides needs its own reason. It is measured on its own, and it is
+  never folded into a wiring step.
+- **Same rows, same refusals, same decisions.** KD3's conformance runs every kind on a Linux host
+  and on the kernel, and the two must agree.
+- **Same speed or better.** The gate (§9) reruns on the benchmark VM when the work is complete.
+
 ## What stays (settled 2026-11-16)
 
 - **No engine or library code in Moruna.** Data formats may be exceptions, engines may not. Kept
@@ -111,13 +136,13 @@ directly through `moruna-sys`: memory objects, slots, channels, threads, futexes
   measurement. Regions above 2 MiB use huge pages.
 - **What goes:**
   - `malloc` and allocator tuning (`allocator.rs`, which only acts under glibc);
-  - the counting allocator;
-  - sampled RSS;
-  - the engine's out-of-arena model.
-
-  The controller reads the account.
+  - the counting allocator.
 - **A task's memory is its own process's,** charged to its own account. Which C library or
   allocator it uses is its business, bounded by that account. Moruna hooks nothing in it.
+- **The controller is unchanged.** Its models stay, the out-of-arena model included: a task's
+  memory per batch is still what that model predicts. Only where its measurements come from
+  changes. Its `Sampler` port gets a kernel adapter that reads the run's account and each task's,
+  exact figures in place of sampled RSS.
 
 ### 3. Batches are memory objects, end to end
 
