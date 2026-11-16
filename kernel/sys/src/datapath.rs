@@ -248,7 +248,9 @@ mod tests {
         let a = tsc();
         let b = tsc();
         assert!(b >= a, "one CPU's counter does not go back");
-        // Linux numbers CPUs in the low twelve bits of IA32_TSC_AUX, Moruna in all of it.
-        assert!(current_cpu() & 0xfff < 4096);
+        // Linux numbers CPUs in the low twelve bits of IA32_TSC_AUX, Moruna in all of it. Read
+        // twice in a row on one thread, the number names a CPU each time; the point is that
+        // `rdtscp` answers with no call, which reaching here shows.
+        core::hint::black_box((current_cpu(), current_cpu()));
     }
 }
