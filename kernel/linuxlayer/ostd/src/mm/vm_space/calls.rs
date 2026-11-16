@@ -43,29 +43,77 @@ impl ProgramProcess {
     }
 }
 
-/// A memory object holding frames, mapped in the personality's region. Dropping it unmaps
-/// it there and closes it; nothing may show its pages by then.
+/// Where frames' objects come from: an object of `len` bytes (whole pages, zeroed), mapped
+/// writable in the personality's region at one address in every process of the task, as
+/// its handle value and that address; and how to give one back. The personality's region
+/// allocator (`ostd::backend`, stream B2) is the source; without one, an object is mapped
+/// with `memory_map` where the core picks, which serves a task of one process.
+#[derive(Clone, Copy, Debug)]
+pub struct ObjectSource {
+    /// Makes an object.
+    pub create: fn(len: usize) -> crate::Result<(u32, usize)>,
+    /// Unmaps an object everywhere and closes it.
+    pub release: fn(raw: u32, addr: usize, len: usize),
+}
+
+static SOURCE: crate::sync::raw::RawLock<Option<ObjectSource>> =
+    crate::sync::raw::RawLock::new(None);
+
+/// Sets where frames' objects come from, before the first frame is taken. An object goes
+/// back to the source it came from.
+pub fn inject_object_source(source: ObjectSource) {
+    set_object_source(Some(source));
+}
+
+pub(crate) fn set_object_source(source: Option<ObjectSource>) {
+    *SOURCE.lock() = source;
+}
+
+/// A memory object holding frames, mapped in the personality's region: its handle value
+/// (one handle table serves the task) and its address there. Dropping it gives it back;
+/// nothing may show its pages by then.
 #[derive(Debug)]
 pub(crate) struct Object {
     raw: u32,
     addr: usize,
     len: usize,
+    /// The source it came from; `None` for the default.
+    source: Option<ObjectSource>,
+    /// What the default source holds for it, unmapped and closed when dropped.
     #[cfg(target_os = "none")]
-    _held: super::moruna::Held,
+    _held: Option<super::moruna::Held>,
 }
 
 impl Object {
     /// A zeroed object of `len` bytes, whole pages, mapped writable in the region.
     pub(crate) fn create(len: usize) -> crate::Result<Object> {
-        let made = sys::object_create(len).map_err(to_error)?;
+        let source = *SOURCE.lock();
+        let object = match source {
+            Some(s) => {
+                let (raw, addr) = (s.create)(len)?;
+                Object {
+                    raw,
+                    addr,
+                    len,
+                    source,
+                    #[cfg(target_os = "none")]
+                    _held: None,
+                }
+            }
+            None => {
+                let made = sys::object_create(len).map_err(to_error)?;
+                Object {
+                    raw: made.raw,
+                    addr: made.addr,
+                    len,
+                    source: None,
+                    #[cfg(target_os = "none")]
+                    _held: Some(made.held),
+                }
+            }
+        };
         OBJECTS.fetch_add(1, Ordering::Relaxed);
-        Ok(Object {
-            raw: made.raw,
-            addr: made.addr,
-            len,
-            #[cfg(target_os = "none")]
-            _held: made.held,
-        })
+        Ok(object)
     }
 
     /// Its handle value.
@@ -87,12 +135,17 @@ impl Object {
 impl Drop for Object {
     fn drop(&mut self) {
         OBJECTS.fetch_sub(1, Ordering::Relaxed);
-        #[cfg(not(target_os = "none"))]
-        sys::object_release(self.raw, self.addr, self.len);
+        match self.source {
+            Some(source) => (source.release)(self.raw, self.addr, self.len),
+            #[cfg(not(target_os = "none"))]
+            None => sys::object_release(self.raw, self.addr, self.len),
+            #[cfg(target_os = "none")]
+            None => {}
+        }
     }
 }
 
-/// What an object comes back as from the core.
+/// What an object comes back as from the default source.
 pub(crate) struct Made {
     pub(crate) raw: u32,
     pub(crate) addr: usize,

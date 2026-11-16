@@ -714,3 +714,50 @@ fn the_emulated_core_catches_an_object_freed_while_mapped() {
     emulated::map(p, 0x1000, made.raw, 0, PAGE_SIZE, R).unwrap();
     emulated::object_release(made.raw, made.addr, PAGE_SIZE);
 }
+
+static SOURCED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn sourced_create(len: usize) -> crate::Result<(u32, usize)> {
+    SOURCED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let made = emulated::object_create(len).map_err(calls::to_error)?;
+    Ok((made.raw, made.addr))
+}
+
+fn sourced_release(raw: u32, addr: usize, len: usize) {
+    SOURCED.fetch_add(1 << 16, core::sync::atomic::Ordering::Relaxed);
+    emulated::object_release(raw, addr, len);
+}
+
+#[ktest]
+fn frames_take_their_objects_from_the_region_source() {
+    use core::sync::atomic::Ordering;
+    super::inject_object_source(calls::ObjectSource {
+        create: sourced_create,
+        release: sourced_release,
+    });
+    // Larger than any chunk held: a new object, from the source.
+    let a = FrameAllocOptions::new().alloc_segment(20_000).unwrap();
+    let b = FrameAllocOptions::new().alloc_segment(20_000).unwrap();
+    calls::set_object_source(None);
+    assert_eq!(SOURCED.load(Ordering::Relaxed) & 0xffff, 2);
+    let first = a.into_iter().next().unwrap();
+    assert_eq!(
+        emulated::object_at(first.paddr()).map(|(o, _)| o),
+        Some(first.object_offset().0)
+    );
+    drop(first);
+    drop(b);
+    // Of the two emptied, one went back to the source it came from.
+    assert!(SOURCED.load(Ordering::Relaxed) >> 16 >= 1);
+    // A source that fails: no frame.
+    fn refuse(_: usize) -> crate::Result<(u32, usize)> {
+        Err(Error::NoMemory)
+    }
+    calls::set_object_source(Some(calls::ObjectSource {
+        create: refuse,
+        release: sourced_release,
+    }));
+    let refused = FrameAllocOptions::new().alloc_segment(30_000);
+    calls::set_object_source(None);
+    assert_eq!(refused.unwrap_err(), Error::NoMemory);
+}

@@ -39,7 +39,9 @@ use alloc::{
 };
 use core::ops::Range;
 
-pub use self::calls::{CallCounts, ProgramProcess, call_counts};
+pub use self::calls::{
+    CallCounts, ObjectSource, ProgramProcess, call_counts, inject_object_source,
+};
 use super::{
     AnyUFrameMeta, Fallible, FrameRef, HasPaddr, HasSize, PAGE_SIZE, Paddr, UFrame, Vaddr,
     VmReader, VmWriter, is_in_user_space,
