@@ -840,16 +840,18 @@ impl Space {
                     return Err(Error::Fault);
                 }
                 let area = area.clone();
+                // Stream B1: a write makes a lazy object's page its own; no table keeps an
+                // entry for the page it may stop sharing.
+                if write
+                    && let Backing::Object { memory, .. } = &area.backing
+                    && memory.is_lazy()
+                {
+                    self.unmap_ptes(page, PAGE_SIZE);
+                }
                 let (frame, _) = self.frame(&mut inner, start, &area, page, write)?;
-                match &area.backing {
+                if matches!(area.backing, Backing::Zero) {
                     // A page first touched by a copy is touched for the process too.
-                    Backing::Zero => self.touch(&mut inner, start, &area, page)?,
-                    // Stream B1: a write made a lazy page the object's own; an entry
-                    // for the page it shared goes.
-                    Backing::Object { memory, .. } if write && memory.is_lazy() => {
-                        self.unmap_ptes(page, PAGE_SIZE)
-                    }
-                    _ => {}
+                    self.touch(&mut inner, start, &area, page)?;
                 }
                 frame
             };
@@ -968,8 +970,12 @@ impl Space {
             if cursor < end {
                 return Err(Error::OutOfRange);
             }
-            for (memory, index, count) in &forget {
-                memory.forget(*index, *count);
+            if !forget.is_empty() {
+                // No table keeps an entry for a page a snapshot lets go.
+                self.unmap_ptes(va, end - va);
+                for (memory, index, count) in &forget {
+                    memory.forget(*index, *count);
+                }
             }
             let pages: Vec<u64> = inner.zero.range(va..end).map(|(p, _)| *p).collect();
             let frames = pages.iter().filter_map(|p| inner.zero.remove(p)).collect();
@@ -1139,7 +1145,6 @@ impl Space {
         }
         let area = area.clone();
         let write = access == Access::Write;
-        let (frame, own) = self.frame(&mut inner, start, &area, page, write)?;
         let range = page as usize..(page + PAGE_SIZE) as usize;
         let present = {
             let guard = disable_preempt();
@@ -1152,10 +1157,11 @@ impl Space {
         match present {
             // Served by another thread meanwhile.
             Some(writable) if !write || writable => return Ok(true),
-            // Copy-on-write: the page shared leaves both tables.
+            // Copy-on-write: the page leaves both tables before the object stops sharing it.
             Some(_) => self.unmap_ptes(page, PAGE_SIZE),
             None => {}
         }
+        let (frame, own) = self.frame(&mut inner, start, &area, page, write)?;
         if let Some(p) = &table {
             self.charge_program_tables(p, page)?;
         }

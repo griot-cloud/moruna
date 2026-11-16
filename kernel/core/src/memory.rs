@@ -629,13 +629,39 @@ impl MemoryObject {
 
 impl Lazy {
     fn resolve(&self, index: usize, write: bool) -> Result<Option<Resolved>, Error> {
-        let shared = match self.pages.lock().get(&index) {
-            Some(Held::Own(f, _)) => return Ok(Some(Resolved::Own(f.clone()))),
-            Some(Held::Shared(k, _)) if !write => {
-                return Ok(Some(Resolved::Shared(k.frame.clone())));
+        let shared = {
+            let mut pages = self.pages.lock();
+            match pages.get(&index) {
+                Some(Held::Own(f, _)) => return Ok(Some(Resolved::Own(f.clone()))),
+                Some(Held::Shared(k, _)) if !write => {
+                    return Ok(Some(Resolved::Shared(k.frame.clone())));
+                }
+                Some(Held::Shared(k, _)) if Arc::strong_count(k) == 1 => {
+                    // The last of the clone's sides to hold it takes it as its own, with
+                    // no copy, charged to its account instead. Its callers have taken the
+                    // page out of every table first.
+                    let charge = Charge::new(&self.account, LAZY_PAGE)?;
+                    let Some(Held::Shared(k, record)) = pages.remove(&index) else {
+                        return Err(Error::BadState);
+                    };
+                    match Arc::try_unwrap(k) {
+                        Ok(kept) => {
+                            let frame = kept.frame.clone();
+                            pages.insert(index, Held::Own(kept.frame, charge));
+                            drop(pages);
+                            drop(record);
+                            return Ok(Some(Resolved::Own(frame)));
+                        }
+                        Err(k) => {
+                            let frame = k.frame.clone();
+                            pages.insert(index, Held::Shared(k, record));
+                            Some(frame)
+                        }
+                    }
+                }
+                Some(Held::Shared(k, _)) => Some(k.frame.clone()),
+                None => None,
             }
-            Some(Held::Shared(k, _)) => Some(k.frame.clone()),
-            None => None,
         };
         let below = match (shared, &self.source) {
             (Some(f), _) => Some(f),
