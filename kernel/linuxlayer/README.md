@@ -121,6 +121,7 @@ and `execve`) and refuses administrative calls. `syscall/refused.rs` holds the l
     `process_vm_writev`, `pidfd_getfd`;
   - modules: `init_module`, `finit_module`, `delete_module`;
   - `kexec_load`, `kexec_file_load`, `reboot`, `swapon`, `swapoff`;
+  - names: `sethostname`, `setdomainname`;
   - time: `settimeofday`, `clock_settime`, `adjtimex`, `clock_adjtime`.
 - **`ENOSYS`:** every number the table does not have.
 - **The socket calls** answer from `syscall/no_socket.rs`.

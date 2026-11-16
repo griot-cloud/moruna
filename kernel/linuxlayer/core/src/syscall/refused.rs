@@ -8,7 +8,7 @@
 //!   privilege, before its handler runs: mounts (the old call and the new mount API),
 //!   `pivot_root` and `chroot`, namespaces (`unshare`, `setns`, and `clone` with a
 //!   `CLONE_NEW*` flag), `ptrace` and the calls that need its permission, modules, `kexec`,
-//!   `reboot`, swap, and every change of time.
+//!   `reboot`, swap, every change of time, and the host and domain names.
 //! - A call the table does not have answers `ENOSYS`.
 //! - The socket calls answer from `no_socket.rs` (data-os.md §4: no network).
 //!
@@ -32,6 +32,8 @@ pub(crate) const ADMINISTRATIVE: &[(u64, &str)] = &[
     (167, "swapon"),
     (168, "swapoff"),
     (169, "reboot"),
+    (170, "sethostname"),
+    (171, "setdomainname"),
     (175, "init_module"),
     (176, "delete_module"),
     (227, "clock_settime"),
