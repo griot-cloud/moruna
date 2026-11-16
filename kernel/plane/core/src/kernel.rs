@@ -8,6 +8,8 @@ use moruna_sys::{
 };
 
 use crate::calls::{Calls, Ready, Taken};
+use crate::ring;
+use crate::ringed::{RingCalls, View};
 
 /// The calls of the process the engine runs in.
 #[derive(Debug, Default)]
@@ -141,5 +143,69 @@ impl Calls for Kernel {
             Err(Error::TimedOut) => Ok(Ready::TimedOut),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// The engine's mapping of a region or a rings object.
+#[derive(Debug)]
+pub struct Mapped(moruna_sys::plane::Shared);
+
+impl ring::Shared for Mapped {
+    fn load(&self, at: usize) -> u64 {
+        moruna_sys::plane::ring::Shared::load(&self.0, at)
+    }
+    fn store(&self, at: usize, value: u64) {
+        moruna_sys::plane::ring::Shared::store(&self.0, at, value)
+    }
+    fn fence(&self) {
+        moruna_sys::plane::ring::Shared::fence(&self.0)
+    }
+}
+
+impl View for Mapped {
+    fn read(&self, at: u64, buf: &mut [u8]) -> Result<(), Error> {
+        self.0.read(at, buf)
+    }
+    fn write(&self, at: u64, data: &[u8]) -> Result<(), Error> {
+        self.0.write(at, data)
+    }
+    fn base(&self) -> usize {
+        self.0.addr() as usize
+    }
+    fn len(&self) -> u64 {
+        self.0.len()
+    }
+}
+
+impl RingCalls for Kernel {
+    type Mapping = Mapped;
+
+    fn map(&mut self, memory: &Memory, len: u64) -> Result<Mapped, Error> {
+        moruna_sys::plane::Shared::map(memory, len).map(Mapped)
+    }
+
+    fn keep(&mut self, memory: &Memory) -> Result<Memory, Error> {
+        memory
+            .0
+            .duplicate(Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER)
+            .map(Memory)
+    }
+
+    /// `windows_protect` on the task that maps the slot's object, its ranges offsets in
+    /// that object: stream P's proposal to the integrator, since the engine holds no handle
+    /// to a task's process. Until the kernel takes it, the call is refused and ring mode
+    /// uses the unmap path.
+    fn protect(&mut self, slot: &Slot, ranges: &[[u64; 2]], writable: bool) -> Result<(), Error> {
+        let flags = if writable {
+            map::READ | map::WRITE
+        } else {
+            map::READ
+        };
+        Error::from_raw(moruna_sys::raw::windows_protect(
+            slot.0.raw(),
+            ranges,
+            flags,
+        ))
+        .map(|_| ())
     }
 }

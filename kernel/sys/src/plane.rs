@@ -431,3 +431,242 @@ pub fn object_frame(memory: &Memory, page: u32) -> Result<u64> {
     let arg = memory.0.raw() as u64 | (page as u64) << 32;
     check(raw::call2(nr::PLANE_PROBE, probe::OBJECT_FRAME, arg).0)
 }
+
+/// The rings between the engine and a task in ring mode (`architecture/data-os.md` §5): the
+/// layout and each side's half of the protocol, the same source the engine's
+/// `moruna-plane` builds (and tests) from.
+#[path = "../../plane/core/src/ring.rs"]
+pub mod ring;
+
+/// Memory shared with another process, read and written by its words and in bulk: the
+/// engine's mapping of a region or a rings object, or a task's mapping of what its slots
+/// hold. Whole byte ranges are handed from one side to the other by the ring protocol, so
+/// neither side touches a range the other may be writing.
+#[derive(Debug)]
+pub struct Shared {
+    addr: u64,
+    len: u64,
+    _mapping: Option<crate::Mapping<'static>>,
+}
+
+impl Shared {
+    /// A writable mapping of `len` bytes of `memory`, the engine's own, until dropped.
+    pub fn map(memory: &Memory, len: u64) -> Result<Shared> {
+        let m = memory.map_detached(0, len, moruna_abi::map::READ | moruna_abi::map::WRITE)?;
+        Ok(Shared {
+            addr: m.addr(),
+            len: m.len(),
+            _mapping: Some(m),
+        })
+    }
+
+    /// What a slot mapped at `addr` for `len` bytes: the slot keeps the mapping, until its
+    /// next `batch_get` or `batch_put` or the task's end.
+    fn slot(addr: u64, len: u64) -> Shared {
+        Shared {
+            addr,
+            len,
+            _mapping: None,
+        }
+    }
+
+    pub fn addr(&self) -> u64 {
+        self.addr
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn range(&self, at: u64, n: usize) -> Result<u64> {
+        let end = at.checked_add(n as u64).ok_or(Error::OutOfRange)?;
+        if end > self.len {
+            return Err(Error::OutOfRange);
+        }
+        Ok(self.addr + at)
+    }
+
+    /// Copies `buf.len()` bytes at `at` out.
+    pub fn read(&self, at: u64, buf: &mut [u8]) -> Result<()> {
+        let from = self.range(at, buf.len())?;
+        // SAFETY: `from .. from + buf.len()` lies inside the mapping, which lives as long as
+        // `self` (or the slot's call that unmaps it, which the caller's borrow precedes); the
+        // protocol gives this side the range, so no other process writes it meanwhile.
+        unsafe {
+            core::ptr::copy_nonoverlapping(from as *const u8, buf.as_mut_ptr(), buf.len());
+        }
+        Ok(())
+    }
+
+    /// Copies `data` in at `at`.
+    pub fn write(&self, at: u64, data: &[u8]) -> Result<()> {
+        let to = self.range(at, data.len())?;
+        // SAFETY: as in `read`; the mapping is writable (a read-only one faults, ending the
+        // process, which is the kernel's refusal and never a write elsewhere).
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), to as *mut u8, data.len());
+        }
+        Ok(())
+    }
+
+    fn word(&self, at: usize) -> Option<&core::sync::atomic::AtomicU64> {
+        if !at.is_multiple_of(8) {
+            return None;
+        }
+        let addr = self.range(at as u64, 8).ok()?;
+        // SAFETY: an aligned word inside the mapping, which outlives the borrow; every
+        // access to a shared word, on either side, is atomic.
+        Some(unsafe { core::sync::atomic::AtomicU64::from_ptr(addr as *mut u64) })
+    }
+}
+
+impl ring::Shared for Shared {
+    fn load(&self, at: usize) -> u64 {
+        self.word(at).map_or(0, |w| w.load(Ordering::Acquire))
+    }
+
+    fn store(&self, at: usize, value: u64) {
+        if let Some(w) = self.word(at) {
+            w.store(value, Ordering::Release);
+        }
+    }
+
+    fn fence(&self) {
+        core::sync::atomic::fence(Ordering::SeqCst);
+    }
+}
+
+/// A task's side of ring mode: its region and its rings object, each mapped once, from
+/// slots 0 and 1 of its plane.
+#[derive(Debug)]
+pub struct Rings {
+    region: Shared,
+    rings: Shared,
+    half: ring::Task,
+}
+
+fn broken(_: ring::Bad) -> Error {
+    Error::BadState
+}
+
+impl Rings {
+    fn map(slot: u64) -> Result<Shared> {
+        let (rax, rdx) = raw::batch_get(slot);
+        let (addr, len) = region(rax, rdx)?.ok_or(Error::PeerClosed)?;
+        Ok(Shared::slot(addr, len))
+    }
+
+    /// Maps the region (slot 0) and the rings object (slot 1) once and attaches. Takes both
+    /// slots of `plane`, so nothing else of the task can unmap them.
+    pub fn attach(plane: &Plane) -> Result<Rings> {
+        if !(plane.slot(0) && plane.slot(1)) {
+            return Err(Error::BadState);
+        }
+        let region = Rings::map(0)?;
+        let rings = Rings::map(1)?;
+        let half = ring::Task::attach(&rings).map_err(broken)?;
+        Ok(Rings {
+            region,
+            rings,
+            half,
+        })
+    }
+
+    /// The geometry and the mode the engine chose.
+    pub fn half(&self) -> &ring::Task {
+        &self.half
+    }
+
+    /// The next batch, in place in the region; `None` while there is none. It stays the
+    /// task's until [`Rings::release`].
+    pub fn batch(&mut self) -> Result<Option<(ring::InEntry, &[u8])>> {
+        let Some(e) = self.half.next(&self.rings).map_err(broken)? else {
+            return Ok(None);
+        };
+        let at = self.region.range(e.offset, e.len as usize)?;
+        // SAFETY: the region is mapped read only for as long as the task lives (slot 0 is
+        // never asked again), the engine writes no span it has posted until the task
+        // releases it (DP-I4), and the borrow of `self` ends before `release`.
+        let bytes = unsafe { core::slice::from_raw_parts(at as *const u8, e.len as usize) };
+        Ok(Some((e, bytes)))
+    }
+
+    /// Releases the oldest batch taken.
+    pub fn release(&mut self) -> bool {
+        self.half.release(&self.rings)
+    }
+
+    /// Whether every batch was taken and the engine posts no more.
+    pub fn ended(&self) -> bool {
+        self.half.ended(&self.rings)
+    }
+
+    /// A window to write a record in, and its bytes; `None` while the engine has given none.
+    pub fn window(&mut self) -> Result<Option<(u64, &mut [u8])>> {
+        let Some(w) = self.half.window(&self.rings).map_err(broken)? else {
+            return Ok(None);
+        };
+        let g = self.half.geometry;
+        let at = self.rings.range(g.window_at(w), g.window_bytes as usize)?;
+        // SAFETY: the window is the task's from the free ring until it posts it, mapped
+        // writable in the rings object, and the borrow ends before `post`.
+        let bytes =
+            unsafe { core::slice::from_raw_parts_mut(at as *mut u8, g.window_bytes as usize) };
+        Ok(Some((w, bytes)))
+    }
+
+    /// Posts the record of `len` bytes at the start of window `w`, answering `cookie`.
+    pub fn post(&mut self, w: u64, len: u64, cookie: u64) -> bool {
+        let posted = self.half.post(
+            &self.rings,
+            ring::OutEntry {
+                window: w,
+                offset: 0,
+                len,
+                cookie,
+            },
+        );
+        if posted && self.half.mode == ring::Mode::Protect && self.half.engine_waits(&self.rings) {
+            let _ = self.call(ring::layout::WAKE, 0);
+        }
+        posted
+    }
+
+    fn call(&mut self, want: u8, seen: u64) -> Result<()> {
+        let mut body = [0u8; 16];
+        body[0] = want;
+        body[8..].copy_from_slice(&seen.to_le_bytes());
+        self.half
+            .set_waiting(&self.rings, want != ring::layout::WAKE);
+        let (rax, _) = raw::port_call(ring::layout::WAIT_PORT, &body);
+        self.half.set_waiting(&self.rings, false);
+        check(rax).map(|_| ())
+    }
+
+    /// Waits for the next batch or the end (the input ring is empty).
+    pub fn wait_input(&mut self) -> Result<()> {
+        use ring::Shared as _;
+        let seen = self.rings.load(ring::layout::IN_HEAD);
+        self.call(ring::layout::WAIT_INPUT, seen)
+    }
+
+    /// Waits for a window (none is free).
+    pub fn wait_window(&mut self) -> Result<()> {
+        use ring::Shared as _;
+        let seen = self.rings.load(ring::layout::FREE_HEAD);
+        self.call(ring::layout::WAIT_WINDOW, seen)
+    }
+
+    /// Unmap mode: hands the rings object back with the records posted on it, which leaves
+    /// the task, and maps the next one the engine gives (waiting for it).
+    pub fn hand_back(&mut self) -> Result<()> {
+        check(raw::batch_put(1, self.rings.addr, self.rings.len))?;
+        self.rings = Rings::map(1)?;
+        self.half = ring::Task::attach(&self.rings).map_err(broken)?;
+        Ok(())
+    }
+}

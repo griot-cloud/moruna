@@ -661,3 +661,33 @@ fn ka2_scripts_and_outcomes_cross_as_bytes() {
     assert!(decode_seen(&[7, 99, 0, 0, 0]).is_err());
     assert!(decode_seen(&[0]).is_err());
 }
+
+#[test]
+fn dp_ring_conformance_passes_on_the_kernel_model() {
+    let f = fixtures();
+    match crate::ring_conformance::check(&f) {
+        Ok(n) => assert!(n >= 17, "{n} cases"),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+#[test]
+fn dp_ring_measures_calls_per_batch() {
+    let f = fixtures();
+    for protect in [true, false] {
+        let lock = crate::ring_conformance::lockstep(&f, protect, 32).expect("lockstep");
+        let pipe = crate::ring_conformance::pipelined(&f, protect, 32).expect("pipelined");
+        std::println!(
+            "ring mode, {}: lockstep {} calls for {} batches ({} waits, {} revokes, {} generations); pipelined {} calls for {} batches",
+            if protect { "protect" } else { "unmap" },
+            lock.calls,
+            lock.batches,
+            lock.waits,
+            lock.revokes,
+            lock.generations,
+            pipe.calls,
+            pipe.batches
+        );
+        assert!(pipe.calls < pipe.batches);
+    }
+}

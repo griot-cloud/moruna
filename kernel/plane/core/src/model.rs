@@ -9,7 +9,7 @@
 //! the previous one released, a window unmapped at its put, everything given back at the end.
 
 use alloc::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     rc::Rc,
     string::String,
     vec,
@@ -50,6 +50,8 @@ pub struct SlotState {
     pub ended: bool,
     /// The reason `slot_refuse` gave, once it was called.
     pub refused: Option<String>,
+    /// Pages of the mapped object the task may not write (`windows_protect`), by offset.
+    pub read_only: BTreeSet<u64>,
 }
 
 pub type Slot = Rc<RefCell<SlotState>>;
@@ -79,6 +81,10 @@ pub struct Model {
     pub fail_push: Option<Error>,
     /// The most objects one slot holds, as the kernel's `SLOT_DEPTH`.
     pub depth: usize,
+    /// Whether `windows_protect` answers (stream A), or `BadSyscall` as today.
+    pub protect: bool,
+    /// Calls made into the model's kernel.
+    pub calls: u64,
 }
 
 impl Default for Model {
@@ -90,6 +96,8 @@ impl Default for Model {
             fail_read: false,
             fail_push: None,
             depth: limits::SLOT_DEPTH,
+            protect: false,
+            calls: 0,
         }
     }
 }
@@ -100,6 +108,7 @@ impl Calls for Model {
     type Channel = Chan;
 
     fn memory(&mut self, bytes: u64) -> Result<Mem, Error> {
+        self.calls += 1;
         if self.fail_memory {
             return Err(Error::NoMemory);
         }
@@ -111,6 +120,7 @@ impl Calls for Model {
     }
 
     fn share(&mut self, memory: &Mem) -> Result<Mem, Error> {
+        self.calls += 1;
         Ok(Mem {
             bytes: memory.bytes.clone(),
             writable: false,
@@ -118,6 +128,7 @@ impl Calls for Model {
     }
 
     fn read(&mut self, memory: &Mem, offset: u64, buf: &mut [u8]) -> Result<(), Error> {
+        self.calls += 1;
         if self.fail_read {
             return Err(Error::Fault);
         }
@@ -129,6 +140,7 @@ impl Calls for Model {
     }
 
     fn write(&mut self, memory: &Mem, offset: u64, data: &[u8]) -> Result<(), Error> {
+        self.calls += 1;
         let mut b = memory.bytes.borrow_mut();
         let at = offset as usize;
         b.get_mut(at..at + data.len())
@@ -138,6 +150,7 @@ impl Calls for Model {
     }
 
     fn slot(&mut self, output: bool) -> Result<Slot, Error> {
+        self.calls += 1;
         let s = Rc::new(RefCell::new(SlotState {
             output,
             ready: VecDeque::new(),
@@ -146,6 +159,7 @@ impl Calls for Model {
             closed: false,
             ended: false,
             refused: None,
+            read_only: BTreeSet::new(),
         }));
         self.slots.push(s.clone());
         Ok(s)
@@ -159,6 +173,7 @@ impl Calls for Model {
         len: u64,
         cookie: u64,
     ) -> Result<(), (Error, Mem)> {
+        self.calls += 1;
         if let Some(e) = self.fail_push.take() {
             return Err((e, memory));
         }
@@ -174,6 +189,7 @@ impl Calls for Model {
     }
 
     fn take(&mut self, slot: &Slot) -> Result<Taken<Mem>, Error> {
+        self.calls += 1;
         let mut s = slot.borrow_mut();
         match s.events.pop_front() {
             Some(t) => Ok(t),
@@ -183,11 +199,13 @@ impl Calls for Model {
     }
 
     fn close(&mut self, slot: &Slot) -> Result<(), Error> {
+        self.calls += 1;
         slot.borrow_mut().closed = true;
         Ok(())
     }
 
     fn refuse(&mut self, slot: &Slot, reason: &str) -> Result<(), Error> {
+        self.calls += 1;
         let mut s = slot.borrow_mut();
         if s.ended {
             return Err(Error::BadState);
@@ -197,6 +215,7 @@ impl Calls for Model {
     }
 
     fn channel(&mut self) -> Result<(Chan, Chan), Error> {
+        self.calls += 1;
         let state = Rc::new(RefCell::new(ChannelState {
             queues: [VecDeque::new(), VecDeque::new()],
             open: [true, true],
@@ -211,6 +230,7 @@ impl Calls for Model {
     }
 
     fn receive(&mut self, channel: &Chan, buf: &mut [u8]) -> Result<usize, Error> {
+        self.calls += 1;
         let mut c = channel.state.borrow_mut();
         let peer = 1 - channel.side;
         match c.queues[channel.side].pop_front() {
@@ -224,6 +244,7 @@ impl Calls for Model {
     }
 
     fn send(&mut self, channel: &Chan, bytes: &[u8], memory: Option<Mem>) -> Result<(), Error> {
+        self.calls += 1;
         let mut c = channel.state.borrow_mut();
         let peer = 1 - channel.side;
         if !c.open[peer] {
@@ -239,6 +260,7 @@ impl Calls for Model {
         channels: &[&Chan],
         _deadline: u64,
     ) -> Result<Ready, Error> {
+        self.calls += 1;
         let ready = slots
             .iter()
             .any(|s| !s.borrow().events.is_empty() || s.borrow().ended)

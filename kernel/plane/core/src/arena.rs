@@ -26,11 +26,39 @@ pub fn pages(bytes: u64) -> Option<u64> {
     bytes.checked_add(PAGE - 1).map(|b| b & !(PAGE - 1))
 }
 
+/// Which tasks have seen an object's pages: a task is never shown pages another task saw
+/// until they are zeroed (C4's trust boundary).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seen {
+    /// No task: the kernel zeroed the pages when it made the object.
+    Nobody,
+    /// One task.
+    One(u32),
+    /// More than one.
+    Many,
+}
+
+impl Seen {
+    /// Whether `task` may be shown the pages as they are.
+    pub fn clean_for(self, task: u32) -> bool {
+        matches!(self, Seen::Nobody) || self == Seen::One(task)
+    }
+
+    fn and(self, task: u32) -> Seen {
+        match self {
+            Seen::Nobody => Seen::One(task),
+            Seen::One(t) if t == task => self,
+            _ => Seen::Many,
+        }
+    }
+}
+
 /// An object of the arena: its handle while the engine holds it (none while a slot does),
-/// and its size.
+/// its size, and who has seen it.
 struct Object<M> {
     handle: Option<M>,
     bytes: u64,
+    seen: Seen,
 }
 
 pub struct Arena<M> {
@@ -111,6 +139,7 @@ impl<M> Arena<M> {
             Object {
                 handle: None,
                 bytes: size,
+                seen: Seen::Nobody,
             },
         );
         Ok((id, handle, size))
@@ -132,6 +161,25 @@ impl<M> Arena<M> {
     /// The handle of object `id`, which the engine holds.
     pub fn handle(&self, id: u64) -> Option<&M> {
         self.objects.get(&id).and_then(|o| o.handle.as_ref())
+    }
+
+    /// Who has seen object `id`.
+    pub fn seen(&self, id: u64) -> Seen {
+        self.objects.get(&id).map_or(Seen::Nobody, |o| o.seen)
+    }
+
+    /// `task` is shown object `id`'s pages.
+    pub fn show(&mut self, id: u64, task: u32) {
+        if let Some(o) = self.objects.get_mut(&id) {
+            o.seen = o.seen.and(task);
+        }
+    }
+
+    /// Object `id`'s pages were zeroed: no task has seen them.
+    pub fn zeroed(&mut self, id: u64) {
+        if let Some(o) = self.objects.get_mut(&id) {
+            o.seen = Seen::Nobody;
+        }
     }
 
     /// The size of object `id`.
