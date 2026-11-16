@@ -1125,14 +1125,18 @@ impl Space {
         if !one_run(frames) {
             return Ok(false);
         }
-        // A table an earlier mapping left empty may hold the place of the large page.
-        self.unmap_ptes(va, HUGE);
         let guard = disable_preempt();
         let range = va as usize..(va + HUGE) as usize;
         let mut cursor = self
             .vm
             .cursor_mut_huge(&guard, &range)
             .map_err(|_| Error::InvalidArgs)?;
+        // A 4 KiB table an earlier mapping left empty may hold the large page's place.
+        // OSTD drops no table on its own, and an unmap of the range through a cursor that
+        // locks only that table cannot take it out; this cursor holds the level above, so
+        // its unmap does. Nothing is mapped in the range: the new area alone covers it.
+        cursor.unmap(HUGE_PAGE_SIZE);
+        cursor.jump(va as usize).map_err(|_| Error::InvalidArgs)?;
         let property = PageProperty::new_user(page_flags(area.prot), CachePolicy::Writeback);
         Ok(cursor.map_huge(frames, property).is_ok())
     }
