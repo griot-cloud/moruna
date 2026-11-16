@@ -10,6 +10,10 @@ Status: plan, revised 2026-11-16 on Brackly's direction.
 - **Analytical workloads, with tensors in scope as data.** That is where the speed-up comes from.
   Fewer translations and less deserialization, adaptiveness and CPU memory use all stay.
 - **No regressions.** Every benchmark 0.6.6 ran has to hold, and §7 is the gate that proves it.
+- **One platform: Linux on x86_64** (Brackly, 2026-11-16), Griot's Azure Standard_D4ls_v5
+  (4 vCPU, 8 GiB), for staging and production. Releases build only the Linux x86_64 wheels, for
+  CPython 3.14 and 3.14t; macOS arm64 and Linux aarch64 stop at 0.6.5 (`8018c96a` on
+  `fix/adaptive-runtime`). 0.7 does no macOS or aarch64 work; a Mac stays a development machine.
 
 Read from `main` at `d4165127` (0.6.5). Aligned with the 0.6.6 release session on 2026-11-16: its
 hot paths, its sink rule and its CI changes are folded in below. Every 0.6.6 commit cited is on
@@ -429,6 +433,35 @@ embedders register their own kinds (`kinds/mod.rs:504-575`). A removed kind is r
 list of kinds the build has (`kinds/mod.rs:693-709`). Add one line that names the replacement: "use
 a `moruna.Source` or an `image`".
 
+### Logs ride the job updates (Brackly, 2026-11-16)
+
+**Today.** Everything a task prints is captured, an image task's output included, and kept as
+`log` records in the run's output store (`crates/moruna-runtime/src/host/logs.rs:1-30`). The job
+updates Moruna posts to its host carry only how far each producer's records reach, never the lines
+themselves (`crates/moruna-runtime/src/host/protocol.rs:21-23`). No user-facing API reads them:
+the run report does not expose them, there is no `moruna logs`, and `moruna.read_events(path)`
+needs a segment file the user has to find.
+
+**0.7.** Log records go out on the same update stream as the run's other events.
+
+- Each record carries its producer (task or engine), its level and its line.
+- They stay rate-limited per producer, as the capture already is (`RATE_RECORDS`, `RATE_BYTES`).
+- A host such as Griot forwards them with the other updates (to Kora, on Griot's side). Moruna
+  carries no Kora code.
+- In Python, the run report gains `logs(task=None)`, which reads the run's records, and
+  `moruna.run(..., on_log=...)`, which gets each record as it arrives.
+
+### Containers: `moruna.image` is the interface
+
+`moruna.image(reference, role=..., entry=..., params=..., needs=..., takes=..., gives=...)` runs
+any OCI image, by digest, as a source, a function or a sink (`python/moruna/_job.py:1923-1939`).
+
+- **What a task can set:** `command` and `env` (`crates/moruna-runtime/src/kinds/image.rs:73-94`).
+- **How it runs:** confined, with no network (`docs/images.md`). Its batches cross as Arrow IPC.
+- **So any function in any language that reads and writes Arrow runs today.**
+- **The gaps:** image sources plan no splits (item 3), and image sources and sinks are refused on
+  the microkernel (item 5). Both are already in this plan.
+
 ## 4. What a 0.6.x user changes
 
 | 0.6.x | In 0.7 |
@@ -476,7 +509,7 @@ local crates.
 
 | Build | 0.6.5 | 0.7 | Platforms |
 |---|---|---|---|
-| Wheel | 556 (+4 git pins) | **330** (0 git pins) | linux x86_64; macOS arm64 is 551 → 326 |
+| Wheel | 556 (+4 git pins) | **330** (0 git pins) | linux x86_64, the one platform released |
 | Microkernel engine (musl) | 439 | **305** | linux only |
 
 0.7 keeps `dlpark` and moves `safetensors` to dev-dependencies ("Tensors"). Dropping NumPy removes no
@@ -514,7 +547,7 @@ Each step ships with its tests and meets the coverage gate (`tools/quality/cover
 
 Steps 1 to 5, 7 and 8 touch the run path or the `@moruna.function` path. Each of them runs the four
 NYC jobs against 0.6.6 by the §7 method before it merges; each job takes 7 to 25 s. The full gate
-runs once, at step 10.
+runs once, at step 11.
 
 **Before step 1.** Branch from `main` only after 0.6.6 (`fix/adaptive-runtime`, Azure PR 2) has
 merged. It touches files this plan also changes:
@@ -571,14 +604,17 @@ until the 0.6.6 session says the release is out.
      - The Python shim on the three calls.
      - The engine pushing arena runs.
    - Tests as in "Memory: How it is proved". The NYC check after 8a and after 8b.
-9. **Docs:** `docs/sources-and-sinks.md`, `docs/python-sources.md`, `docs/python-sinks.md`,
+9. **Logs on the job updates.** Records on the update stream, and `logs()` and `on_log` in
+   Python. Tests: a task's lines reach the peer in order with their producer and level, the rate
+   limit holds, and `report.logs(task=...)` returns that task's lines.
+10. **Docs:** `docs/sources-and-sinks.md`, `docs/python-sources.md`, `docs/python-sinks.md`,
    `docs/job-document.md`, `docs/python-functions.md`, the README and the CHANGELOG, with §4 as
    the migration.
    - `docs/python-sources.md` replaces its `moruna.VortexSource` section with a worked
      `moruna.Source` over Vortex's own Python package: one split per file with its row count, and
      `read` returning that row range as Arrow.
    - The same example is the step 5 test, so reading Vortex stays proven after the built-in goes.
-10. **The no-regression gate (§7), then the version bump.** A benchmark that does not hold blocks
+11. **The no-regression gate (§7), then the version bump.** A benchmark that does not hold blocks
    the release.
 
 ## 7. The no-regression gate
@@ -600,7 +636,10 @@ measured on one fixed node with 8 CPUs and 24 GiB.
 
 **Method.**
 
-- **One VM, both builds, side by side.** VMs of one type differ by about 15%. A number from another
+- **Two machine types, each with both builds side by side.** The D8ds_v6 the 0.6.6 numbers came
+  from, and the D4ls_v5 that staging and production run on (4 vCPU, 8 GiB). On the D4ls_v5 there
+  is no published baseline, so 0.6.6 is measured there in the same session. Within a type, VMs
+  differ by about 15%. A number from another
   VM or another day proves nothing.
 - **Alternate the order.** Whichever build reads a set of files first looks slower, because of the
   page cache.
@@ -622,8 +661,14 @@ measured on one fixed node with 8 CPUs and 24 GiB.
   holds them. If it does not, the fix goes into that model, which serves every library, never back
   into a NumPy hook.
 
-**Where.** The VM is `moruna-bench`, in resource group `moruna-bench-20261114g` on the griot-stg
-subscription. It is deallocated, and kept for this run by the 0.6.6 session.
+**Where.** The D8ds_v6 is `moruna-bench`, in resource group `moruna-bench-20261114g` on the
+griot-stg subscription. It is deallocated, and kept for this run by the 0.6.6 session. A
+D4ls_v5 is made beside it for the run, from the same setup script.
+
+- **On the D4ls_v5,** the harness's defaults of 8 CPUs and 24 GiB (`bench/vm/make_plan.py:11`)
+  scale to the machine. It has no local temporary disk, so `/data` is a managed data disk, and
+  its I/O figures are not comparable with the D8ds_v6's NVMe; only 0.6.6 against 0.7 on that
+  machine is.
 
 - `/home/bench/setup8.sh` on its OS disk recreates `/data`, downloads the datasets and mirrors the
   results.
