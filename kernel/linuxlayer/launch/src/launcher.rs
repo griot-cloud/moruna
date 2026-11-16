@@ -46,33 +46,19 @@ pub struct Options<'a> {
     /// `None`.
     pub account: Option<&'a Handle>,
     /// The task's data plane.
-    pub plane: Option<Plane<'a>>,
+    pub plane: Option<Plane>,
     /// Called with the process made and given everything, just before it starts: a
     /// refusal stops the launch.
     pub before_start: Option<BeforeStart<'a>>,
 }
 
-/// A task's data plane: its slots, numbered in order (input first), and its port.
-pub struct Plane<'a> {
-    pub slots: &'a [&'a plane::Slot],
+/// A task's data plane: its input and output slots (numbered in that order) and its port.
+/// The launcher attaches them to the process, then grants the personality the slots
+/// themselves, as `slot::INPUT` and `slot::OUTPUT`, to wait on them.
+pub struct Plane {
+    pub input: Option<plane::Slot>,
+    pub output: Option<plane::Slot>,
     pub port: Option<Channel>,
-}
-
-/// As [`launch`], and gives the process `plane` first (`process_plane`). The caller grants
-/// the personality its own handles to the slots too, as `slot::INPUT` and `slot::OUTPUT`,
-/// to wait on them.
-pub fn launch_task(
-    resource: &Handle,
-    name: &str,
-    image: &[u8],
-    grants: &mut [(Option<Handle>, &str)],
-    plane: Option<Plane<'_>>,
-) -> core::result::Result<Process, LaunchError> {
-    let options = Options {
-        plane,
-        ..Options::default()
-    };
-    launch_with(resource, name, image, grants, options).map(|(p, _)| p)
 }
 
 /// As [`launch`], with `options`; the process and its first thread's id.
@@ -96,11 +82,16 @@ pub fn launch_with(
         )?,
         None => call(Process::create(resource, name), "process_create")?,
     };
+    let mut slots: [(Option<Handle>, &str); 2] =
+        [(None, crate::slot::INPUT), (None, crate::slot::OUTPUT)];
     if let Some(p) = plane {
+        let attached: Vec<&plane::Slot> = p.input.iter().chain(&p.output).collect();
         call(
-            plane::attach(&process, p.slots, p.port).map_err(|(e, _)| e),
+            plane::attach(&process, &attached, p.port).map_err(|(e, _)| e),
             "process_plane",
         )?;
+        slots[0].0 = p.input.map(|s| s.0);
+        slots[1].0 = p.output.map(|s| s.0);
     }
 
     // The image's segments, each an object of its own that every process of the container
@@ -135,7 +126,7 @@ pub fn launch_with(
         "duplicating the process's own handle",
     )?;
     let mut all: Vec<(Option<Handle>, &str)> = Vec::new();
-    for (handle, name) in grants.iter_mut() {
+    for (handle, name) in grants.iter_mut().chain(slots.iter_mut()) {
         if let Some(handle) = handle.take() {
             all.push((Some(handle), *name));
         }

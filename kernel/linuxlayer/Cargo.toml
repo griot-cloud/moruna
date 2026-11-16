@@ -20,6 +20,7 @@ members = [
     "ostd",
     "ostd/macros",
     "personality",
+    "server",
     "libs/aster-rights",
     "libs/aster-rights-proc",
     "libs/aster-util",
@@ -65,6 +66,10 @@ imagefs-protocol = { path = "../imagefs/protocol", version = "=0.1.0" }
 moruna-svc = { path = "../svc", version = "=0.1.0" }
 moruna-ipc-check = { path = "../plane/check", version = "=0.1.0" }
 moruna-record = { path = "../../crates/moruna-record", version = "=0.6.6", default-features = false }
+# The drop-in `linux` server (server/): the protocol its clients speak, and the node's
+# guardian and bootstrap it keeps.
+linux-protocol = { path = "../linux/protocol", version = "=0.1.0" }
+moruna-node = { path = "../node/core", version = "=0.1.0" }
 
 # OSTD's published crates (MPL-2.0, as the kernel uses them).
 align_ext = "=0.1.0"

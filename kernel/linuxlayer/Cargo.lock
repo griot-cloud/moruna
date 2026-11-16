@@ -524,6 +524,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "linux-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+]
+
+[[package]]
 name = "linuxlayer-component-macro"
 version = "0.19.0"
 dependencies = [
@@ -592,6 +599,19 @@ dependencies = [
  "linuxlayer-launch",
  "linuxlayer-ostd",
  "moruna-linuxlayer",
+ "moruna-sys",
+]
+
+[[package]]
+name = "linuxlayer-server"
+version = "0.19.0"
+dependencies = [
+ "imagefs-protocol",
+ "linux-protocol",
+ "linuxlayer-launch",
+ "moruna-node",
+ "moruna-record",
+ "moruna-svc",
  "moruna-sys",
 ]
 
@@ -726,6 +746,13 @@ dependencies = [
 [[package]]
 name = "moruna-loader"
 version = "0.1.0"
+
+[[package]]
+name = "moruna-node"
+version = "0.1.0"
+dependencies = [
+ "moruna-sys",
+]
 
 [[package]]
 name = "moruna-record"
