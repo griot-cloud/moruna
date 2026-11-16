@@ -225,6 +225,27 @@ impl Mount {
         Ok(child_mount)
     }
 
+    /// Mounts `fs_and_root` on directory `name` at this mount's root.
+    ///
+    /// Moruna: the start assembles a task's root with this before its first process (no
+    /// program mounts anything), as [`PathResolver::switch_root_for_boot`] switches to it.
+    ///
+    /// [`PathResolver::switch_root_for_boot`]: super::PathResolver::switch_root_for_boot
+    pub(in crate::fs) fn mount_child_for_boot(
+        self: &Arc<Self>,
+        name: &str,
+        fs_and_root: FsAndRoot,
+        flags: PerMountFlags,
+        source: Option<String>,
+    ) -> Result<Arc<Self>> {
+        let mountpoint = self
+            .root_dentry()
+            .as_dir_dentry_or_err()?
+            .lookup_child(name)?;
+        let mut topology = MountTopology::write_lock();
+        self.do_mount(fs_and_root, flags, &mountpoint, source, &mut topology)
+    }
+
     /// Unmounts the child at `mountpoint` and returns the requested child mount.
     ///
     /// If this mount is shared,

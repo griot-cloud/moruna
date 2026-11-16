@@ -15,7 +15,12 @@ use ostd::{
     sync::{PreemptDisabled, RwLockWriteGuard},
 };
 
-use super::{memfd::MemfdInode, xattr::RamXattr, *};
+use super::{
+    memfd::MemfdInode,
+    quota::{ENTRY_COST, Quota},
+    xattr::RamXattr,
+    *,
+};
 use crate::{
     device::{self, DeviceType},
     fs::{
@@ -53,6 +58,8 @@ pub(crate) struct RamFs {
     inode_allocator: AtomicU64,
     /// FS event subscriber stats for this file system
     fs_event_subscriber_stats: FsEventSubscriberStats,
+    /// The bytes a scratch tmpfs may hold, if it is one.
+    quota: Option<Quota>,
 }
 
 impl RamFs {
@@ -69,6 +76,16 @@ impl RamFs {
         anon_device_id: AnonDeviceId,
         sb: SuperBlock,
         revalidation_policy: RevalidationPolicy,
+    ) -> Arc<Self> {
+        Self::new_with_quota_and_sb(name, anon_device_id, sb, revalidation_policy, None)
+    }
+
+    fn new_with_quota_and_sb(
+        name: &'static str,
+        anon_device_id: AnonDeviceId,
+        sb: SuperBlock,
+        revalidation_policy: RevalidationPolicy,
+        quota: Option<Quota>,
     ) -> Arc<Self> {
         let root_dev_id = anon_device_id.id();
         Arc::new_cyclic(move |weak_fs| Self {
@@ -96,7 +113,43 @@ impl RamFs {
             }),
             inode_allocator: AtomicU64::new(ROOT_INO + 1),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+            quota,
         })
+    }
+
+    /// The same filesystem, holding at most `quota`'s bytes.
+    pub(in crate::fs) fn new_with_quota(
+        name: &'static str,
+        anon_device_id: AnonDeviceId,
+        sb: SuperBlock,
+        quota: Quota,
+    ) -> Arc<Self> {
+        Self::new_with_quota_and_sb(
+            name,
+            anon_device_id,
+            sb,
+            RevalidationPolicy::empty(),
+            Some(quota),
+        )
+    }
+
+    /// The scratch quota, if this filesystem has one.
+    #[cfg(ktest)]
+    pub(in crate::fs) fn quota(&self) -> Option<&Quota> {
+        self.quota.as_ref()
+    }
+
+    fn charge(&self, bytes: usize) -> Result<()> {
+        match &self.quota {
+            Some(quota) => quota.charge(bytes),
+            None => Ok(()),
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        if let Some(quota) = &self.quota {
+            quota.release(bytes);
+        }
     }
 
     fn new_internal(name: &'static str) -> Arc<Self> {
@@ -125,7 +178,14 @@ impl FileSystem for RamFs {
     }
 
     fn sb(&self) -> SuperBlock {
-        self.sb.clone()
+        let mut sb = self.sb.clone();
+        if let Some(quota) = &self.quota {
+            let free = quota.limit().saturating_sub(quota.used()) / BLOCK_SIZE;
+            sb.blocks = quota.limit() / BLOCK_SIZE;
+            sb.bfree = free;
+            sb.bavail = free;
+        }
+        sb
     }
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
@@ -910,6 +970,7 @@ impl RamInode {
         }
 
         let fs = self.fs.upgrade().unwrap();
+        fs.charge(ENTRY_COST + symlink_target.map_or(0, str::len))?;
         let (uid, gid) = utils::current_fs_ids();
         let new_inode = match type_ {
             InodeType::File => RamInode::new_file(&fs, mode, uid, gid, to_be_revalidated),
@@ -961,6 +1022,7 @@ impl RamInode {
             return_errno_with_message!(Errno::EEXIST, "entry exists");
         }
 
+        self.fs.upgrade().unwrap().charge(ENTRY_COST)?;
         let (uid, gid) = utils::current_fs_ids();
         let new_inode = match type_ {
             MknodType::CharDevice(dev_id) | MknodType::BlockDevice(dev_id) => {
@@ -1006,6 +1068,11 @@ impl RamInode {
         if file_size == new_size {
             return Ok(());
         }
+        let old_pages = file_size.align_up(BLOCK_SIZE);
+        let new_pages = new_size.align_up(BLOCK_SIZE);
+        if new_pages > old_pages {
+            self.charge(new_pages - old_pages)?;
+        }
         let now = now();
         inode_meta.set_mtime(now);
         inode_meta.set_ctime(now);
@@ -1013,14 +1080,55 @@ impl RamInode {
         if new_size > file_size {
             inode_meta.resize(new_size);
             drop(inode_meta);
-            page_cache.resize(new_size, file_size)?;
+            if let Err(error) = page_cache.resize(new_size, file_size) {
+                self.metadata.lock().resize(file_size);
+                self.release(new_pages - old_pages);
+                return Err(error);
+            }
         } else {
             drop(inode_meta);
             page_cache.resize(new_size, file_size)?;
             self.metadata.lock().resize(new_size);
+            self.release(old_pages - new_pages);
         }
 
         Ok(())
+    }
+}
+
+impl RamInode {
+    /// Charges `bytes` to the filesystem's quota, if it has one.
+    fn charge(&self, bytes: usize) -> Result<()> {
+        match self.fs.upgrade() {
+            Some(fs) => fs.charge(bytes),
+            None => Ok(()),
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        if let Some(fs) = self.fs.upgrade() {
+            fs.release(bytes);
+        }
+    }
+}
+
+impl Drop for RamInode {
+    fn drop(&mut self) {
+        // The root is not charged, nor is an inode outlived by its filesystem.
+        if self.ino == ROOT_INO {
+            return;
+        }
+        let Some(fs) = self.fs.upgrade() else {
+            return;
+        };
+        let mut bytes = ENTRY_COST;
+        if let Some(target) = self.inner.as_symlink() {
+            bytes += target.lock().len();
+        }
+        if self.typ == InodeType::File {
+            bytes += self.metadata.lock().size.align_up(BLOCK_SIZE);
+        }
+        fs.release(bytes);
     }
 }
 
@@ -1074,6 +1182,12 @@ impl FileOps for RamInode {
                 let new_size = offset + write_len;
                 let should_expand_size = new_size > file_size;
                 let new_size_aligned = new_size.align_up(BLOCK_SIZE);
+                if should_expand_size {
+                    let old_size_aligned = file_size.align_up(BLOCK_SIZE);
+                    if new_size_aligned > old_size_aligned {
+                        self.charge(new_size_aligned - old_size_aligned)?;
+                    }
+                }
                 inode_meta.set_mtime(now);
                 inode_meta.set_ctime(now);
                 if should_expand_size {
@@ -1248,6 +1362,7 @@ impl Inode for RamInode {
         }
 
         let fs = self.fs.upgrade().unwrap();
+        fs.charge(ENTRY_COST)?;
         let (uid, gid) = utils::current_fs_ids();
         Ok(RamInode::new_tmpfile(
             &fs,

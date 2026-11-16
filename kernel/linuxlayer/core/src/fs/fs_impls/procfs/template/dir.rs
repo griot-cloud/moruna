@@ -395,6 +395,7 @@ mod readdir {
         }
 
         /// Returns the filename of the listed entry.
+        #[expect(dead_code, reason = "only the entries cut from /proc used it")]
         pub(in procfs) fn name(&self) -> &str {
             self.name.as_ref()
         }

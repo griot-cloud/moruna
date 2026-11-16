@@ -68,6 +68,7 @@ impl CgroupNamespace {
     /// Linux reports `/proc/[pid]/cgroup` relative to the namespace root.
     /// When the target lies outside that subtree, the path climbs up with
     /// `..` components instead of failing.
+    #[expect(dead_code, reason = "only /proc/<pid>/cgroup, cut, used it")]
     pub(crate) fn virtualize_path(&self, cgroup: Arc<dyn CgroupSysNode>) -> String {
         let root_path = self.root.path();
         let cgroup_path = cgroup.path();
@@ -75,6 +76,10 @@ impl CgroupNamespace {
     }
 }
 
+#[cfg_attr(
+    not(ktest),
+    expect(dead_code, reason = "only /proc/<pid>/cgroup, cut, used it")
+)]
 fn virtualize_path_from(root_path: &str, target_path: &str) -> String {
     fn path_components(path: &str) -> impl Iterator<Item = &str> + Clone + '_ {
         path.split('/').filter(|component| !component.is_empty())
