@@ -13,13 +13,16 @@ Brackly approved this plan on 2026-11-16, and the PM session agreed it the same 
 decisions are folded in below.
 
 - **0.7.0 is this plan, plus finishing Goal A.** That means KD2 booted, KD3 and KD4.
-- **Open (Brackly's, raised by the PM on 2026-11-16): where the kernel runs in 0.7.0.**
-  - Either the kernel boots as the Azure machine itself, with the platform drivers of
-    `architecture/kernel-is-the-machine.md` §4.5 (on `design/kernel-is-the-machine`): VMBus, NVMe
-    over VMBus vPCI, MANA or netvsc, the Hyper-V clock and the wireserver's ready report.
-  - Or it runs inside a VM on a Linux host first, as this plan assumes.
-  - BOARD's goals stay as they are until he decides. Steps 1 and 2 measure the engine on the
-    kernel and serve either answer; §4 and §6 depend on it.
+- **Where the kernel runs (Brackly, 2026-11-16, through the PM).**
+  - His words: "Maruna VM runs on top of Linux, yes. But I don't expect that we run the VM as a
+    process in Linux. It's supposed to run the VM on Linux."
+  - **The host stays Linux** and runs the Moruna VM under KVM on Griot's D4ls_v5.
+  - **The kernel as the Azure machine** (Goal B, `architecture/kernel-is-the-machine.md` on
+    `design/kernel-is-the-machine`) moves to 0.8.0.
+  - **Inside the VM, Moruna does not run as a Linux process.** The native engine is required
+    (§1).
+  - **Being confirmed with him:** whether "not as a process" also covers the host's monitor, QEMU
+    today against `moruna-vmm`'s own KVM monitor.
 - **Every step is this branch's.**
   - It builds on the work still on `feat/kd2-engine-process`, `feat/kd1-data-plane`,
     `feat/ka2-plane-linux` (its conformance suite is KD3's base) and `feat/kb5-memory-quota` (the
@@ -124,18 +127,11 @@ does not change what they decide or how.
 
 That shape adapts the engine to an interface that is not its own.
 
-**In 0.7** the engine reaches its kernel directly for everything on the hot path, and becomes
-the kernel's own process if measurement says the rest still costs. It calls the kernel through
-`moruna-sys`: memory objects, slots, channels, threads, futexes and the clock.
+**In 0.7** the engine is the kernel's own process, reversing DECISIONS EN1. Brackly ruled on
+2026-11-16 that inside the VM, Moruna does not run as a Linux process. It calls the kernel
+directly through `moruna-sys`: memory objects, slots, channels, threads, futexes and the clock.
 
-- **First, from inside today's program.** Steps 2 and 3 move batches and the arena onto memory
-  objects through the kernel's own calls, which a granted Linux program already makes (SDD 30
-  f.1). After that the hot path has few Linux syscalls left.
-- **Then measure the forwarding.** Measure the personality's share of wall time on the gate's
-  jobs.
-- **A native engine only if it costs.** Reversing DECISIONS EN1 with the `std` port below happens
-  only if forwarding still costs more than about 5% of some job. A `std` port is a large, lasting
-  maintenance cost, so it has to pay for itself (the PM's decision, 2026-11-16).
+Step 1 measures today's forwarding and copies, as the "before" figure.
 
 - **How.** Rust's standard library is ported to the kernel as a target (`x86_64-unknown-moruna`),
   as `x86_64-unknown-hermit` is in Rust today. Arrow and Parquet need `std`, so this keeps them
@@ -221,7 +217,7 @@ writes zstd Parquet, and Rust's `snap` already loses about 1.5x to the C++ codec
   "Decisions".
 - **blake3:** its pure-Rust implementation, if it measures the same.
 - **`ring` and the HTTP stack:** gone with §4. They are library dependencies the VM cannot use.
-- **musl:** goes only with a native engine (§1).
+- **musl:** goes with the native engine (§1).
 - **wasm tasks leave 0.7.0.** wasmtime is an engine, with C parts and a memory model of its own,
   and image tasks already cover every language.
 - **The check.** Each `cc` build and `-sys` crate left in the engine target's dependency tree is
@@ -350,9 +346,14 @@ items to commit to then:
    - The arena on memory objects, with huge pages.
 3. **Data devices** (§4): KD4's launcher devices; inputs read from block devices into the arena;
    outputs on the data disk; `object_store` out of the engine.
-4. **Measure the forwarding, then decide on the native engine** (§1, §2). The `std` port, the arena
-   as the global allocator, kernel adapters for the reactor and discovery, and EN1 retired, all
-   only if forwarding costs more than about 5%.
+4. **The native engine** (§1, §2):
+   - the `std` port;
+   - the arena as the global allocator;
+   - kernel adapters for the reactor and discovery;
+   - EN1 retired.
+
+   It is the longest piece, so it starts right after step 1, beside steps 2 and 3. Their kernel
+   calls go through `moruna-sys` in either form of the engine.
 5. **Dependencies** (§5): wasm out, the HTTP stack out, C kept only where measurement says so,
    and the build check.
 6. **The host side** (§6): `moruna run` and logs on the job updates.
@@ -369,12 +370,12 @@ Settled on 2026-11-16, by Brackly's approval of this plan and by the PM:
    package returns afterwards as a client (§8).
 2. **The gate.** The 0.6.6 jobs, with the same kernels, run as image tasks in the VM against 0.6.6,
    on the PM's terms (§9).
-3. **How the engine reaches its kernel.** Directly, for the hot path, from inside today's program.
-   It becomes a native process through a `std` port only if forwarding still costs more than about
-   5% (§1).
+3. **How the engine reaches its kernel.** As the kernel's own process, through a `std` port. This
+   is required (Brackly, 2026-11-16) (§1).
 4. **wasm tasks leave 0.7.0** (§5).
 5. **Outputs on the data disk as layers** (§4, SDD 30 m.3).
-6. **QEMU stays the launcher's hypervisor** in 0.7.0 (§6).
+6. **The launcher's monitor** stays QEMU in 0.7.0 (§6) unless Brackly's answer on "not as a
+   process" covers the host's monitor too. The PM is confirming it with him.
 7. **Where it runs.** On `moruna-bench` (D8ds_v6, `/dev/kvm`, griot-stg), pre-approved for this
    work, under `~/.vm-lock`, and before its 02:00 UTC shutdown wipes `/data`.
 
