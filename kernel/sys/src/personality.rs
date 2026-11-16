@@ -336,6 +336,54 @@ mod tests {
     }
 
     #[test]
+    fn every_frame_field_reads_back() {
+        let mut f = Frame::default();
+        let all = [
+            Register::Rax,
+            Register::Rbx,
+            Register::Rcx,
+            Register::Rdx,
+            Register::Rsi,
+            Register::Rdi,
+            Register::Rbp,
+            Register::Rsp,
+            Register::R8,
+            Register::R9,
+            Register::R10,
+            Register::R11,
+            Register::R12,
+            Register::R13,
+            Register::R14,
+            Register::R15,
+        ];
+        for (i, r) in all.iter().enumerate() {
+            f.set_register(*r, 0x100 + i as u64);
+            assert!(personality::REGISTER_NAMES[*r as usize].len() >= 2);
+        }
+        for (i, r) in all.iter().enumerate() {
+            assert_eq!(f.register(*r), 0x100 + i as u64);
+        }
+        f.set_rflags(0x246);
+        assert_eq!(f.rflags(), 0x246);
+        let fields = [
+            (personality::REASON, 4),
+            (personality::GS_BASE, 5),
+            (personality::VECTOR, 14),
+            (personality::ERROR_CODE, 6),
+            (personality::FAULT_ADDRESS, 0xdead_0000),
+        ];
+        for (at, v) in fields {
+            assert!(write_u64(&mut f.0, at, v));
+        }
+        assert_eq!(f.reason(), personality::reason::INTERRUPTED);
+        assert_eq!(f.gs_base(), 5);
+        assert_eq!(f.vector(), 14);
+        assert_eq!(f.error_code(), 6);
+        assert_eq!(f.fault_address(), 0xdead_0000);
+        assert_eq!(f.clone(), f);
+    }
+
+    #[test]
     fn pager_request_layout() {
         let mut m = [0u8; pager_request::SIZE];
         assert!(moruna_abi::write_u32(
