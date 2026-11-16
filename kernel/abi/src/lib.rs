@@ -177,7 +177,11 @@ pub mod nr {
     /// `map::READ | map::WRITE`) on each of `count` `windows::Range`s of `process`'s
     /// mappings (zero: the caller's own, as `memory_protect`), all or none, with one
     /// flush finished on every CPU when it returns: the grouped revoke before the record
-    /// check, and the grant back when a window is used again (data-os §5).
+    /// check, and the grant back when a window is used again (data-os §5). The first
+    /// argument may instead be a slot handle the caller holds: the ranges are then
+    /// offsets within the area that slot is mapped at in the process that mapped it, and
+    /// nothing outside that area changes. That is how the engine revokes a task's output
+    /// windows, since it holds no handle to the task's process (stream P, 2026-11-16).
     pub const WINDOWS_PROTECT: u64 = BASE + 55;
     // Stream B1, the user-space personality's mechanisms (kernel-is-the-machine §4.1).
     // Their arguments are stream B1's to fix in `moruna-sys`'s `personality` module.

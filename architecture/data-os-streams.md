@@ -326,3 +326,26 @@ and switches to the new one when the call answers.
   - settles `Cargo.lock`;
   - runs the touched crates' tests and CI's boot under KVM;
   - updates `data-os.md` §0's attack-surface figures.
+
+## Integration log
+
+- **2026-11-16: stream A merged** (fast-forward to `eb4b0b07`). Its CI boot passed 170 of 170
+  checks under KVM on 1, 2 and 4 CPUs.
+  - It added three calls, two mapping flags, one probe operation, a vendored OSTD 0.19.0
+    (about 115 code lines changed) and `moruna-datapath`.
+  - It added about 670 code lines to kernel mode.
+- **Decided at that merge:**
+  - **A builds C5's tickless worker cores next.** The measurement shows the gain the design
+    asked for: a pinned core loses 3.8% to 4.5% of its time to about two interruptions a
+    millisecond, about 19 us each, even on a quiet VM.
+  - **A adds `windows_protect`'s slot form,** the ABI's doc being amended: the engine revokes a
+    task's output windows through the output slot, since it holds no handle to the task's
+    process (stream P).
+  - **A adds a booted test of `POPULATE` zero pages through `process_map`.**
+  - **B1 fixes the reclaim of empty 4 KiB tables when a 2 MiB region is unmapped** (`unmap_ptes`
+    is B1's), through a cursor locked one level up, as A's `eb4b0b07` does for large pages.
+  - **The boot manifest's `MAX_PROCESSES` rises from 32 to 64,** because the booted tests filled
+    32.
+  - **CI's kernel job host-tests `moruna-datapath` and `moruna-sys`.**
+  - **B2's proposed four-way split** (core and processes, vm, fs, images) is accepted. The new
+    streams start when B2's core compiles and a session slot is free.

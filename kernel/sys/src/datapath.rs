@@ -159,6 +159,17 @@ pub fn windows_protect(process: &Process, windows: &[[u64; 2]], flags: u64) -> R
     check(raw::windows_protect(process.0.raw(), windows, flags)).map(|_| ())
 }
 
+/// `windows_protect` through a slot: `windows` are `[offset, length]` pairs within the area
+/// `slot` is mapped at in the task that mapped it, and nothing outside that area changes. The
+/// engine holds no handle to a task's process, so it revokes the task's output windows this way.
+pub fn windows_protect_slot(
+    slot: &crate::plane::Slot,
+    windows: &[[u64; 2]],
+    flags: u64,
+) -> Result<()> {
+    check(raw::windows_protect(slot.0.raw(), windows, flags)).map(|_| ())
+}
+
 /// `plane_probe` (the kernel's `probe` feature, ABI 2.6): the bytes the page table entry
 /// mapping `addr`, an address of this process, covers: 4096, 2 MiB for a large page, or
 /// zero when none does.
