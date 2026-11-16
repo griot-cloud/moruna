@@ -11,8 +11,8 @@ first, and iterates until Moruna is significantly better than the other engines.
 ## Rules for every stream
 
 - **Branch and merge.**
-  - Work in your own worktree, on a branch `data-os/<stream>`, cut from the commit that added
-    this file.
+  - Work in your own worktree, on a branch `data-os/<stream>`, cut from `feature/arrow-core-0.7`
+    when the stream starts (at or after `fa0a02bf`, which added the contracts).
   - Commit there. Push nothing: the CI pause holds, so queue no runs.
   - The integrator merges each stream into `feature/arrow-core-0.7` locally.
 - **Write only the files your stream owns** (below). Each shared file has a marked block per
@@ -62,7 +62,7 @@ first, and iterates until Moruna is significantly better than the other engines.
 - **Report** to the integrator when done: your branch and its commits, test results with
   per-crate coverage, measurements, and anything left open.
 
-## The frozen interfaces (at the commit that added this file)
+## The frozen interfaces (frozen at `add53e75`)
 
 | Interface | Where | Producer | Consumers |
 | --- | --- | --- | --- |
