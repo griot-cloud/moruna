@@ -1,7 +1,6 @@
-# B2's booted test (kernel/linuxlayer/boot/boot.sh): the Linux personality launched into a
-# process of its own by linuxlayer-boot, with an initramfs whose /init is a static musl
-# program (linux/programs/hello.c), and the command line boot.sh writes. The program runs
-# once the personality's address space is the core's mappings (stream B2-vm).
+# B2's booted test, mode musl (kernel/linuxlayer/boot/boot.sh): the Linux personality
+# launched into a process of its own by linuxlayer-boot, with an initramfs whose /init is
+# a static musl program (linux/programs/hello.c, kernel/linux's LX-T10), and no shell.
 moruna-image 1
 process linuxlayer-boot
   handle console console

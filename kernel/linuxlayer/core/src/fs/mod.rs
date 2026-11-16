@@ -21,6 +21,7 @@ use crate::{
         file::{InodeType, file_table::FdFlags, mkmod},
         task_streams::{ConsoleText, TaskStreams},
         vfs::{
+            file_system::FileSystem,
             path::{FsPath, Path, PathResolver, PerMountFlags},
             registry::FsAndRoot,
         },
@@ -47,17 +48,28 @@ pub(crate) fn init_in_first_process(ctx: &Context) {
     let fs = ctx.thread_local.borrow_fs();
     let path_resolver = fs.resolver().read();
 
-    // The image's root has its `/dev` (`rootfs::mount_task_root`); an initramfs gets one.
+    // The image's root has its `/dev` and `/proc` (`rootfs::mount_task_root`); a booted
+    // test's initramfs gets them too.
     if !init::booted_from_rootfs() {
-        let dev_path = lookup_or_create_dev(&path_resolver).unwrap();
-        dev_path
-            .mount(
-                FsAndRoot::new(devtmpfs::singleton().clone()),
-                PerMountFlags::default(),
-                Some("devtmpfs".to_string()),
-                ctx,
-            )
-            .unwrap();
+        let mounts = [
+            (
+                "dev",
+                devtmpfs::singleton().clone() as Arc<dyn FileSystem>,
+                "devtmpfs",
+            ),
+            ("proc", procfs::new_procfs(), "proc"),
+        ];
+        for (dir, fs, name) in mounts {
+            lookup_or_create_dir(&path_resolver, dir)
+                .unwrap()
+                .mount(
+                    FsAndRoot::new(fs),
+                    PerMountFlags::default(),
+                    Some(name.to_string()),
+                    ctx,
+                )
+                .unwrap();
+        }
     }
 
     // Descriptors 0, 1 and 2 are the task's streams (SDD 29 f.7, f.8); there is no
@@ -77,12 +89,12 @@ pub(crate) fn init_in_first_process(ctx: &Context) {
     }
 }
 
-fn lookup_or_create_dev(path_resolver: &PathResolver) -> Result<Path> {
-    match path_resolver.lookup(&FsPath::try_from("/dev")?) {
+fn lookup_or_create_dir(path_resolver: &PathResolver, dir: &str) -> Result<Path> {
+    match path_resolver.lookup(&FsPath::try_from(alloc::format!("/{dir}").as_str())?) {
         Err(error) if error.error() == Errno::ENOENT => {
             path_resolver
                 .root()
-                .new_child("dev", InodeType::Dir, mkmod!(a+rx, u+w))
+                .new_child(dir, InodeType::Dir, mkmod!(a+rx, u+w))
         }
         result => result,
     }

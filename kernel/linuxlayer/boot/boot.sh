@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MPL-2.0
 # B2's booted test: builds the microkernel, the Linux personality and linuxlayer-boot, an
-# initramfs whose /init is a static musl program, renders linuxlayer.image with
-# moruna-image, and boots it under QEMU (KVM when usable). Prints the serial log, then
-# judges it: every line the description expects, no failure, no panic.
+# initramfs with the mode's program, renders MODE.image with moruna-image, and boots it
+# under QEMU (KVM when usable). Prints the serial log, then judges it: every line the
+# description expects, no failure, no panic. There is no shell in the image.
 #
-#   kernel/linuxlayer/boot/boot.sh [OUT] [TIMEOUT_SECONDS] [INIT_C] [CMDLINE]
+#   kernel/linuxlayer/boot/boot.sh [OUT] [TIMEOUT_SECONDS] [MODE]
+#
+# MODE is `musl` (default: linux/programs/hello.c, static, as /init) or `glibc`
+# (linux/programs/dynamic.c, dynamic, at /kc1/bin/dynamic with its interpreter and
+# libraries from this machine, run with rdinit=).
 #
 # Needs what kernel/tools/build.sh needs for the kernel and the Linux programs (the
 # pinned nightly, musl for x86_64, QEMU). CARGO_TARGET_DIR, when set, is where the three
@@ -17,8 +21,8 @@ layer="$(dirname "$here")"
 kernel="$(dirname "$layer")"
 out="${1:-$kernel/target/linuxlayer-boot}"
 seconds="${2:-120}"
-init_c="${3:-$kernel/linux/programs/hello.c}"
-cmdline="${4:-}"
+mode="${3:-musl}"
+case "$mode" in musl|glibc) ;; *) echo "boot.sh: unknown mode $mode" >&2; exit 2 ;; esac
 targets="${CARGO_TARGET_DIR:-$kernel/target}"
 target=x86_64-unknown-none
 user_target="$kernel/targets/x86_64-moruna-user.json"
@@ -45,29 +49,42 @@ export CARGO_INCREMENTAL=0
   "${build_std[@]}" -p linuxlayer-launch --features launcher --bin linuxlayer-boot)
 
 rm -rf "$out"
-mkdir -p "$out/bins" "$out/linuxlayer" "$out/root/kc1" "$out/root/tmp"
+mkdir -p "$out/bins" "$out/linuxlayer" "$out/root/kc1/bin" "$out/root/tmp"
 cp "$targets/linuxlayer-boot/x86_64-moruna-user/release/linuxlayer-boot" "$out/bins/"
 cp "$targets/linuxlayer-image/x86_64-moruna-user/release/linuxlayer-personality" \
   "$out/linuxlayer/personality"
 
-# The initramfs: /init, and the file hello.c reads.
-specs=/usr/lib/x86_64-linux-musl/musl-gcc.specs
-if [ "$(uname -m)" = x86_64 ] && command -v musl-gcc >/dev/null; then
-  muslcc=(musl-gcc)
-elif [ -r "$specs" ]; then
-  muslcc=("${CC:-x86_64-linux-gnu-gcc}" -specs="$specs")
-else
-  echo "boot.sh: no musl for x86_64 (musl-tools)" >&2
-  exit 1
-fi
-"${muslcc[@]}" -static -O2 -Wall -Werror -s -o "$out/root/init" "$init_c"
+# The initramfs: the mode's program, and the file both programs read.
 cp "$kernel/linux/programs/greeting.txt" "$out/root/kc1/greeting.txt"
+if [ "$mode" = musl ]; then
+  specs=/usr/lib/x86_64-linux-musl/musl-gcc.specs
+  if [ "$(uname -m)" = x86_64 ] && command -v musl-gcc >/dev/null; then
+    muslcc=(musl-gcc)
+  elif [ -r "$specs" ]; then
+    muslcc=("${CC:-x86_64-linux-gnu-gcc}" -specs="$specs")
+  else
+    echo "boot.sh: no musl for x86_64 (musl-tools)" >&2
+    exit 1
+  fi
+  "${muslcc[@]}" -static -O2 -Wall -Werror -s -o "$out/root/init" \
+    "$kernel/linux/programs/hello.c"
+  cmdline=""
+else
+  "${CC:-gcc}" -O2 -Wall -Werror -s -o "$out/root/kc1/bin/dynamic" \
+    "$kernel/linux/programs/dynamic.c"
+  # Its interpreter and libraries, at their paths, links followed.
+  for lib in $(ldd "$out/root/kc1/bin/dynamic" | awk '/=>/ { print $3 } /^\t\// { print $1 }'); do
+    mkdir -p "$out/root$(dirname "$lib")"
+    cp -L "$lib" "$out/root$lib"
+  done
+  cmdline="rdinit=/kc1/bin/dynamic"
+fi
 python3 "$here/cpio.py" "$out/root" "$out/linuxlayer/initramfs.cpio"
 printf '%s\0' "$cmdline" > "$out/linuxlayer/cmdline"
 
 (cd "$kernel" && RUSTFLAGS="--cfg polyval_force_soft" CARGO_TARGET_DIR="$targets" \
   cargo run --quiet --release --locked --target "$host" -p moruna-image -- \
-  "$here/linuxlayer.image" "$out/bins" "$out")
+  "$here/$mode.image" "$out/bins" "$out")
 # QEMU boots a Multiboot kernel only as an EM_386 ELF: the same private copy build.sh
 # makes.
 python3 - "$targets/$target/release/moruna-microkernel" "$out/moruna-microkernel.qemu.elf" <<'PY'

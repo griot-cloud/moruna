@@ -173,9 +173,11 @@ handlers' carried code stays in the tree, unreachable: removing it would leave p
   information (the command line, the initramfs, a 1 GiB memory budget, the clocks) and runs
   the layer's boot in a task, with the core's console as the layer's serial console. The
   layer ends the process when its init process ends.
-- **The booted test** (`boot/boot.sh`) builds the kernel, the image and `linuxlayer-boot`, an
-  initramfs whose `/init` is a static musl program, renders `boot/linuxlayer.image` and
-  boots it under QEMU, then checks the lines it expects.
+- **The booted test** (`boot/boot.sh MODE`) builds the kernel, the image and
+  `linuxlayer-boot`, an initramfs with the mode's program, renders `boot/MODE.image` and
+  boots it under QEMU, then checks the lines it expects: `musl` runs a static musl program
+  as `/init` (kernel/linux's LX-T10), `glibc` a dynamic glibc one with its interpreter and
+  libraries (LX-T12). There is no shell in the image.
 
 ## A task's processes: shared memory and `fork`
 
@@ -270,7 +272,7 @@ RUSTFLAGS="--cfg ktest" cargo test --target x86_64-unknown-linux-gnu --workspace
 The booted test, on Linux x86-64 with QEMU and musl (KVM when usable):
 
 ```sh
-kernel/linuxlayer/boot/boot.sh [OUT] [TIMEOUT_SECONDS] [INIT_C] [CMDLINE]
+kernel/linuxlayer/boot/boot.sh [OUT] [TIMEOUT_SECONDS] [musl|glibc]
 ```
 
 For the Moruna user target, as `kernel/tools/build.sh` builds programs:
