@@ -86,7 +86,7 @@ Every figure below comes from the 0.6.6 runs on the benchmark VM (Linux, 8 CPUs,
 - **Each fixture case takes 2.3 s to 3.1 s end to end under KVM,** boot, job and shutdown
   included. The comparison with the emulator follows.
 
-**Codecs (C5 in `arrow-core-0.7.md` §5, decision 5),** single-threaded, best of three, on the
+**Codecs (`arrow-core-0.7.md` §5; decision 5 here),** single-threaded, best of three, on the
 gate's own pages. `ruzstd` 0.8.3 implements only its Fastest level; its Default and Better
 levels panic "not implemented". C zstd and `ruzstd` decoded every page to the same bytes.
 
