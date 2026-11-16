@@ -326,3 +326,17 @@ class Main(unittest.TestCase):
         finally:
             entry.serve = real
         self.assertEqual(served, [json.dumps])
+
+
+class Example(unittest.TestCase):
+    def test_kd2s_transform_gives_kd2s_rows(self):
+        import sys
+
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "examples"))
+        from kd2_task import transform
+
+        x = pa.array([0, 1, 2], pa.int64())
+        y = pa.array([(v * 7919) % 10007 for v in range(3)], pa.int64())
+        out = transform(pa.record_batch({"x": x, "y": y}))
+        self.assertEqual(out["x"].to_pylist(), [0, 1, 2])
+        self.assertEqual(out["y"].to_pylist(), [3 * v + (v * 7919) % 10007 for v in range(3)])
