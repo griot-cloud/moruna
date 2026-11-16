@@ -1393,15 +1393,27 @@ impl ProgramTable {
         let Some(program) = self.0.lock().clone() else {
             return;
         };
-        unmap_in(&program.vm, va, len);
         let end = va + len;
         let mut tables = program.tables.lock();
+        // Entries lie only in the 2 MiB regions it holds a table for. A cursor elsewhere
+        // would make the tables down to its range, uncharged.
+        let size = charge::TABLE_REGIONS[0];
+        if tables[0]
+            .range(va / size..end.div_ceil(size))
+            .next()
+            .is_none()
+        {
+            return;
+        }
+        unmap_in(&program.vm, va, len);
         for (level, size) in charge::TABLE_REGIONS.iter().copied().enumerate() {
             let whole = va.div_ceil(size)..end / size;
             let gone: Vec<u64> = tables[level].range(whole).copied().collect();
             for region in gone {
                 tables[level].remove(&region);
-                account.uncharge(charge::PAGE);
+                if region != (map_end() - 1) / size {
+                    account.uncharge(charge::PAGE);
+                }
             }
         }
     }
@@ -1436,7 +1448,12 @@ fn unmap_in(vm: &VmSpace, va: u64, len: u64) {
 impl Drop for Program {
     fn drop(&mut self) {
         // The tables still held: a space ends with `clear`, which unmapped them first.
-        let held: u64 = self.tables.lock().iter().map(|t| t.len() as u64).sum();
+        let tables = self.tables.lock();
+        let held: u64 = charge::TABLE_REGIONS
+            .iter()
+            .zip(tables.iter())
+            .map(|(size, t)| t.iter().filter(|r| **r != (map_end() - 1) / size).count() as u64)
+            .sum();
         if held != 0 {
             self.account.uncharge(held * charge::PAGE);
         }
@@ -1481,15 +1498,18 @@ impl Space {
     }
 
     /// Charges the table pages the program's table needs to map `page`.
+    /// Every region it holds a table for is kept, the topmost too, which the fixed charge
+    /// pays for.
     fn charge_program_tables(&self, program: &Program, page: u64) -> Result<(), Error> {
         let mut tables = program.tables.lock();
         for (level, size) in charge::TABLE_REGIONS.iter().copied().enumerate() {
             let region = page / size;
-            // The topmost region's table is the fixed charge's.
-            if region == (map_end() - 1) / size || tables[level].contains(&region) {
+            if tables[level].contains(&region) {
                 continue;
             }
-            self.account.charge(charge::PAGE)?;
+            if region != (map_end() - 1) / size {
+                self.account.charge(charge::PAGE)?;
+            }
             tables[level].insert(region);
         }
         Ok(())
@@ -1522,6 +1542,10 @@ impl Space {
         }
         let area = area.clone();
         let write = access == Access::Write;
+        // The program's tables are charged before a cursor makes them.
+        if let Some(p) = &table {
+            self.charge_program_tables(p, page)?;
+        }
         let range = page as usize..(page + PAGE_SIZE) as usize;
         let present = {
             let guard = disable_preempt();
@@ -1539,9 +1563,6 @@ impl Space {
             None => {}
         }
         let (frame, own) = self.frame(&mut inner, start, &area, page, write)?;
-        if let Some(p) = &table {
-            self.charge_program_tables(p, page)?;
-        }
         let prot = if own {
             area.prot
         } else {
@@ -1588,10 +1609,14 @@ impl Space {
     pub fn table_gap(&self, addr: u64) -> u64 {
         let page = addr & !(PAGE_SIZE - 1);
         let guard = disable_preempt();
-        let range = page as usize..(page + PAGE_SIZE) as usize;
-        let Ok(mut cursor) = self.vm.cursor(&guard, &range) else {
+        // A cursor over the whole space starts at the root: one over the page would make the
+        // tables down to it, the very ones asked about.
+        let Ok(mut cursor) = self.vm.cursor(&guard, &(0..map_end() as usize)) else {
             return 0;
         };
+        if cursor.jump(page as usize).is_err() {
+            return 0;
+        }
         match cursor.query() {
             Ok((hole, None)) => (hole.end - hole.start) as u64,
             _ => 0,
@@ -1719,8 +1744,10 @@ impl Space {
             let end = area.end;
             inner.areas.insert(start, area);
             Space::write_protect(&self.vm, start, end);
-            if let Some(p) = &program {
-                Space::write_protect(&p.vm, start, end);
+            // The program's table drops them, and takes them back read only as it touches
+            // them: walking it would make tables where it has none.
+            if program.is_some() {
+                self.program.unmap(start, end - start, &self.account);
             }
         }
         let gone: Vec<UFrame> = taken.iter().filter_map(|p| inner.zero.remove(p)).collect();
