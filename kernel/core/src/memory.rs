@@ -228,11 +228,18 @@ impl MemoryObject {
 // copies a shared page when it writes it, and the page stays charged to the account that
 // held it until neither shares it.
 
-use alloc::{boxed::Box, collections::BTreeMap};
+use alloc::{
+    boxed::Box,
+    collections::BTreeMap,
+    sync::{Arc as Shared, Weak},
+};
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use moruna_abi::{write_u32, write_u64};
-use ostd::sync::{Waiter, Waker};
+use ostd::{
+    mm::VmSpace,
+    sync::{Waiter, Waker},
+};
 
 use crate::{
     channel::{Endpoint, Message},
@@ -282,7 +289,26 @@ impl Resolved {
 /// A page the two sides of a clone share, charged to the account that held it.
 struct Kept {
     frame: UFrame,
-    _charge: Charge,
+    _paid: Paid,
+}
+
+/// What pays for a shared page: a charge, or the bytes a space had charged for it as a zero
+/// page, which moved here with it so the clone charges nothing twice.
+enum Paid {
+    Charge(#[expect(dead_code, reason = "held for its drop")] Charge),
+    Owed(#[expect(dead_code, reason = "held for its drop")] Owed),
+}
+
+/// Bytes already charged to an account, given back when it goes.
+struct Owed {
+    account: Arc<Account>,
+    bytes: u64,
+}
+
+impl Drop for Owed {
+    fn drop(&mut self) {
+        self.account.uncharge(self.bytes);
+    }
 }
 
 enum Held {
@@ -295,6 +321,9 @@ struct Lazy {
     source: Source,
     account: Arc<Account>,
     depth: u32,
+    /// A snapshot's space: the one whose tables may map its pages, so a clone of that space
+    /// reaches every entry that could write a page it shares.
+    bound: SpinLock<Weak<VmSpace>>,
 }
 
 enum Source {
@@ -355,6 +384,7 @@ impl MemoryObject {
                 source,
                 account: account.clone(),
                 depth,
+                bound: SpinLock::new(Weak::new()),
             })),
         })
     }
@@ -545,111 +575,145 @@ impl MemoryObject {
         }
     }
 
-    /// The two sides of a clone of a private mapping of `pages` pages from `first`: the
-    /// object the clone's source maps from now on, and the one the clone maps, both from
-    /// their page 0 when new. A plain object becomes the parent of two new snapshots; a
-    /// snapshot shares what it holds there with a new twin, so either side's write copies.
-    pub fn fork(
-        self: &Arc<Self>,
-        first: usize,
-        pages: usize,
-        mine: &Arc<Account>,
-        theirs: &Arc<Account>,
-    ) -> Result<(Arc<MemoryObject>, usize, Arc<MemoryObject>), Error> {
-        let Some(lazy) = &self.lazy else {
-            let a = MemoryObject::snapshot(self, first, pages, mine)?;
-            let b = MemoryObject::snapshot(self, first, pages, theirs)?;
-            return Ok((Arc::new(a), 0, Arc::new(b)));
+    /// Binds a snapshot to the space whose table `vm` is, or refuses (`BadState`) a second
+    /// space while the first lives: a clone write-protects only its own space's entries, so
+    /// no other space may hold one that could write a page the clone shares. Any other
+    /// object maps anywhere.
+    pub fn bind(&self, vm: &Shared<VmSpace>) -> Result<(), Error> {
+        let Some(lazy) = self.lazy.as_deref() else {
+            return Ok(());
         };
-        let Source::Snapshot {
-            parent,
-            first: parent_first,
-        } = &lazy.source
+        if !matches!(lazy.source, Source::Snapshot { .. }) {
+            return Ok(());
+        }
+        let mut bound = lazy.bound.lock();
+        match bound.upgrade() {
+            Some(other) if !Shared::ptr_eq(&other, vm) => Err(Error::BadState),
+            Some(_) => Ok(()),
+            None => {
+                *bound = Shared::downgrade(vm);
+                Ok(())
+            }
+        }
+    }
+
+    /// An anonymous snapshot of `pages` pages: zero until written.
+    pub fn anonymous(pages: usize, account: &Arc<Account>) -> Result<MemoryObject, Error> {
+        let source = Source::Snapshot {
+            parent: None,
+            first: 0,
+        };
+        MemoryObject::lazy(pages as u64 * PAGE_SIZE, source, 0, account)
+    }
+
+    /// The clone's twin of this snapshot, empty: its size, parent and depth, charged to
+    /// `theirs`. [`Self::share_with`] gives it the pages.
+    pub fn twin(&self, theirs: &Arc<Account>) -> Result<MemoryObject, Error> {
+        let Some(Lazy {
+            source: Source::Snapshot { parent, first },
+            depth,
+            ..
+        }) = self.lazy.as_deref()
         else {
             return Err(Error::InvalidArgs);
         };
         let source = Source::Snapshot {
             parent: parent.clone(),
-            first: parent_first + first,
+            first: *first,
         };
-        let twin = MemoryObject::lazy(pages as u64 * PAGE_SIZE, source, lazy.depth, theirs)?;
-        let twin_lazy = twin.lazy.as_ref().ok_or(Error::BadState)?;
-        let mut pages_mine = lazy.pages.lock();
-        let keys: Vec<usize> = pages_mine
-            .range(first..first + pages)
-            .map(|(k, _)| *k)
-            .collect();
-        // Every record charged before anything changes, so a refusal changes nothing.
-        let mut records = Vec::new();
-        records
-            .try_reserve_exact(2 * keys.len())
-            .map_err(|_| Error::NoMemory)?;
-        for _ in &keys {
-            records.push(Charge::new(mine, LAZY_RECORD)?);
-            records.push(Charge::new(theirs, LAZY_RECORD)?);
-        }
-        let mut pages_twin = twin_lazy.pages.lock();
+        MemoryObject::lazy(self.size, source, *depth, theirs)
+    }
+
+    /// Shares every page this snapshot holds with its empty `twin`: each side copies a
+    /// shared page when it writes it. The records are charged first, to `mine` and
+    /// `theirs`, so a refusal changes nothing.
+    pub fn share_with(
+        &self,
+        twin: &MemoryObject,
+        mine: &Arc<Account>,
+        theirs: &Arc<Account>,
+    ) -> Result<(), Error> {
+        let (Some(lazy), Some(twin)) = (self.lazy.as_deref(), twin.lazy.as_deref()) else {
+            return Err(Error::InvalidArgs);
+        };
+        let mut pages = lazy.pages.lock();
+        let mut records = records(pages.len(), mine, theirs)?;
+        let mut theirs_pages = twin.pages.lock();
+        let keys: Vec<usize> = pages.keys().copied().collect();
         for k in keys {
             let (Some(record_twin), Some(record_mine)) = (records.pop(), records.pop()) else {
                 break;
             };
-            let kept = match pages_mine.remove(&k) {
-                Some(Held::Own(frame, charge)) => Arc::new(Kept {
-                    frame,
-                    _charge: charge,
-                }),
+            let kept = match pages.remove(&k) {
+                Some(Held::Own(frame, charge)) => {
+                    let kept = Arc::new(Kept {
+                        frame,
+                        _paid: Paid::Charge(charge),
+                    });
+                    pages.insert(k, Held::Shared(kept.clone(), record_mine));
+                    kept
+                }
                 Some(Held::Shared(kept, charge)) => {
-                    pages_mine.insert(k, Held::Shared(kept.clone(), charge));
+                    pages.insert(k, Held::Shared(kept.clone(), charge));
                     kept
                 }
                 None => continue,
             };
-            if !matches!(pages_mine.get(&k), Some(Held::Shared(..))) {
-                pages_mine.insert(k, Held::Shared(kept.clone(), record_mine));
-            }
-            pages_twin.insert(k - first, Held::Shared(kept, record_twin));
+            theirs_pages.insert(k, Held::Shared(kept, record_twin));
         }
-        drop(pages_twin);
-        drop(pages_mine);
-        Ok((self.clone(), first, Arc::new(twin)))
+        Ok(())
     }
 
-    /// The two sides of a clone of an area of zero pages `pages` long, which holds
-    /// `held` (by page, charged to `mine` as zero pages): anonymous snapshots sharing
-    /// them, copy-on-write.
-    pub fn fork_zero(
-        pages: usize,
+    /// Two anonymous snapshots, `a` the clone's source's and `b` the clone's, share `held`,
+    /// the zero pages of an area by page. Each page's charge, `bytes` an `owner`'s space
+    /// had made for it, moves with it, so nothing is charged twice; `records` (from
+    /// [`records`], two a page) were charged before. Nothing here can fail.
+    pub fn share_zero(
+        a: &MemoryObject,
+        b: &MemoryObject,
         held: Vec<(usize, UFrame)>,
-        mine: &Arc<Account>,
-        theirs: &Arc<Account>,
-    ) -> Result<(Arc<MemoryObject>, Arc<MemoryObject>), Error> {
-        let anonymous = || Source::Snapshot {
-            parent: None,
-            first: 0,
+        owner: &Arc<Account>,
+        bytes: u64,
+        records: Vec<Charge>,
+    ) {
+        let (Some(la), Some(lb)) = (a.lazy.as_deref(), b.lazy.as_deref()) else {
+            return;
         };
-        let size = pages as u64 * PAGE_SIZE;
-        let a = MemoryObject::lazy(size, anonymous(), 0, mine)?;
-        let b = MemoryObject::lazy(size, anonymous(), 0, theirs)?;
-        {
-            let (la, lb) = (
-                a.lazy.as_ref().ok_or(Error::BadState)?,
-                b.lazy.as_ref().ok_or(Error::BadState)?,
-            );
-            let (mut pa, mut pb) = (la.pages.lock(), lb.pages.lock());
-            for (index, frame) in held {
-                let kept = Arc::new(Kept {
-                    frame,
-                    _charge: Charge::new(mine, LAZY_PAGE)?,
-                });
-                pa.insert(
-                    index,
-                    Held::Shared(kept.clone(), Charge::new(mine, LAZY_RECORD)?),
-                );
-                pb.insert(index, Held::Shared(kept, Charge::new(theirs, LAZY_RECORD)?));
-            }
+        let (mut pa, mut pb) = (la.pages.lock(), lb.pages.lock());
+        let mut records = records.into_iter();
+        for (index, frame) in held {
+            let kept = Arc::new(Kept {
+                frame,
+                _paid: Paid::Owed(Owed {
+                    account: owner.clone(),
+                    bytes,
+                }),
+            });
+            // The caller charged two records a page.
+            let (Some(record_a), Some(record_b)) = (records.next(), records.next()) else {
+                break;
+            };
+            pa.insert(index, Held::Shared(kept.clone(), record_a));
+            pb.insert(index, Held::Shared(kept, record_b));
         }
-        Ok((Arc::new(a), Arc::new(b)))
     }
+}
+
+/// The records of a clone's share of `count` pages: two a page, `mine`'s then `theirs`'s.
+pub fn records(
+    count: usize,
+    mine: &Arc<Account>,
+    theirs: &Arc<Account>,
+) -> Result<Vec<Charge>, Error> {
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(2 * count)
+        .map_err(|_| Error::NoMemory)?;
+    for _ in 0..count {
+        records.push(Charge::new(mine, LAZY_RECORD)?);
+        records.push(Charge::new(theirs, LAZY_RECORD)?);
+    }
+    Ok(records)
 }
 
 impl Lazy {
