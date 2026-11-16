@@ -5,9 +5,9 @@ use crate::{
         fs_impls::ramfs::{self, RamFs, quota::Quota},
         pseudofs::AnonDeviceId,
         vfs::{
-            file_system::{FileSystem, SuperBlock},
+            file_system::SuperBlock,
             inode::RevalidationPolicy,
-            registry::{FsCreationCtx, FsProperties, FsType},
+            registry::{FsProperties, FsType},
         },
     },
     prelude::*,
@@ -91,18 +91,12 @@ fn default_max_inodes() -> usize {
 pub(super) struct TmpFsType;
 
 impl FsType for TmpFsType {
-    type Key = ();
-
     fn name(&self) -> &'static str {
         "tmpfs"
     }
 
     fn properties(&self) -> FsProperties {
         FsProperties::empty()
-    }
-
-    fn create(&self, _fs_creation_ctx: &mut FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
-        Ok(TmpFs::new_tmpfs())
     }
 
     fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {

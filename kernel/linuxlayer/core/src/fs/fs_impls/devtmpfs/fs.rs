@@ -8,9 +8,8 @@ use crate::{
     fs::{
         tmpfs::TmpFs,
         vfs::{
-            file_system::FileSystem,
             inode::RevalidationPolicy,
-            registry::{FsCreationCtx, FsProperties, FsType},
+            registry::{FsProperties, FsType},
         },
     },
     prelude::*,
@@ -38,18 +37,12 @@ pub(super) fn init() {
 struct DevTmpFsType;
 
 impl FsType for DevTmpFsType {
-    type Key = ();
-
     fn name(&self) -> &'static str {
         "devtmpfs"
     }
 
     fn properties(&self) -> FsProperties {
         FsProperties::empty()
-    }
-
-    fn create(&self, _fs_creation_ctx: &mut FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
-        Ok(singleton().clone())
     }
 
     fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {

@@ -16,7 +16,7 @@ use crate::{
             file_system::{FileSystem, FsEventSubscriberStats, FsFlags, SuperBlock},
             inode::{Extension, FileOps, Inode, Metadata},
             path::Dentry,
-            registry::{FsCreationCtx, FsProperties, FsType},
+            registry::{FsProperties, FsType},
         },
     },
     prelude::*,
@@ -137,18 +137,12 @@ impl FileSystem for SysFs {
 pub(super) struct SysFsType;
 
 impl FsType for SysFsType {
-    type Key = ();
-
     fn name(&self) -> &'static str {
         "sysfs"
     }
 
     fn properties(&self) -> FsProperties {
         FsProperties::empty()
-    }
-
-    fn create(&self, _fs_creation_ctx: &mut FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
-        Ok(SysFs::new()?)
     }
 
     fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {

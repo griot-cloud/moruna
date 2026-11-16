@@ -54,7 +54,7 @@ use crate::{
         vfs::{
             file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
             inode::{Inode, RevalidationPolicy},
-            registry::{FsCreationCtx, FsProperties, FsType},
+            registry::{FsProperties, FsType},
         },
     },
     prelude::*,
@@ -145,18 +145,12 @@ impl FileSystem for ProcFs {
 struct ProcFsType;
 
 impl FsType for ProcFsType {
-    type Key = ();
-
     fn name(&self) -> &'static str {
         "proc"
     }
 
     fn properties(&self) -> FsProperties {
         FsProperties::empty()
-    }
-
-    fn create(&self, _fs_creation_ctx: &mut FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
-        Ok(ProcFs::new())
     }
 
     fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {

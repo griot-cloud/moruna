@@ -17,10 +17,7 @@ pub(crate) use timer_create::create_timer_for_clock;
 
 use crate::{cpu::LinuxAbi, prelude::*};
 
-#[cfg_attr(target_arch = "x86_64", path = "arch/x86.rs")]
-#[cfg_attr(target_arch = "riscv64", path = "arch/riscv.rs")]
-#[cfg_attr(target_arch = "loongarch64", path = "arch/loongarch.rs")]
-#[cfg_attr(target_arch = "aarch64", path = "arch/arm.rs")]
+#[path = "arch/x86.rs"]
 mod arch;
 
 mod access;
@@ -33,7 +30,6 @@ mod capset;
 mod chdir;
 mod chmod;
 mod chown;
-mod chroot;
 mod clock_gettime;
 mod clone;
 mod close;
@@ -49,9 +45,6 @@ mod fallocate;
 mod fcntl;
 mod flock;
 mod fork;
-mod fsconfig;
-mod fsmount;
-mod fsopen;
 mod fsync;
 mod futex;
 mod get_ioprio;
@@ -88,8 +81,6 @@ mod memfd_create;
 mod mkdir;
 mod mknod;
 mod mmap;
-mod mount;
-mod move_mount;
 mod mprotect;
 mod mremap;
 mod msync;
@@ -103,7 +94,6 @@ mod pidfd_getfd;
 mod pidfd_open;
 mod pidfd_send_signal;
 mod pipe;
-mod pivot_root;
 mod poll;
 mod ppoll;
 mod prctl;
@@ -179,7 +169,6 @@ mod timerfd_gettime;
 mod timerfd_settime;
 mod truncate;
 mod umask;
-mod umount;
 mod uname;
 mod unlink;
 mod unshare;

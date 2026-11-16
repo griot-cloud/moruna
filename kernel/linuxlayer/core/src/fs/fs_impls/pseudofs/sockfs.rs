@@ -10,9 +10,8 @@ use crate::{
         pseudofs::{NaivePseudoFs, PseudoInodeType},
         utils,
         vfs::{
-            file_system::FileSystem,
             path::{Mount, Path},
-            registry::{FsCreationCtx, FsProperties, FsType},
+            registry::{FsProperties, FsType},
         },
     },
     prelude::*,
@@ -68,18 +67,12 @@ impl SockFs {
 pub(super) struct SockFsType;
 
 impl FsType for SockFsType {
-    type Key = ();
-
     fn name(&self) -> &'static str {
         "sockfs"
     }
 
     fn properties(&self) -> FsProperties {
         FsProperties::empty()
-    }
-
-    fn create(&self, _fs_creation_ctx: &mut FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
-        return_errno_with_message!(Errno::EINVAL, "sockfs cannot be mounted");
     }
 
     fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {

@@ -34,7 +34,7 @@ use crate::{
         vfs::{
             file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
             inode::Inode,
-            registry::{FsCache, FsCreationCtx, FsProperties, FsType},
+            registry::{FsProperties, FsType},
         },
     },
     prelude::*,
@@ -473,40 +473,17 @@ pub(crate) struct ExfatMountOptions {
     pub(super) zero_size_dir: bool,
 }
 
-pub(super) struct ExfatType {
-    cache: FsCache<DeviceId>,
-}
+pub(super) struct ExfatType;
 
-pub(super) static EXFAT_TYPE: ExfatType = ExfatType {
-    cache: FsCache::new(),
-};
+pub(super) static EXFAT_TYPE: ExfatType = ExfatType;
 
 impl FsType for ExfatType {
-    type Key = DeviceId;
-
     fn name(&self) -> &'static str {
         "exfat"
     }
 
     fn properties(&self) -> FsProperties {
         FsProperties::NEED_DISK
-    }
-
-    fn create(&self, fs_creation_ctx: &mut FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
-        let disk = fs_creation_ctx.resolve_block_device()?.clone();
-        Ok(ExfatFs::open(disk, ExfatMountOptions::default())?)
-    }
-
-    fn obtain_key_and_cache(
-        &self,
-        fs_creation_ctx: &mut FsCreationCtx,
-    ) -> Option<(DeviceId, &FsCache<DeviceId>)> {
-        let key = fs_creation_ctx
-            .resolve_block_device()
-            .ok()
-            .map(|disk| disk.id())?;
-
-        Some((key, &self.cache))
     }
 
     fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {

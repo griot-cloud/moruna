@@ -120,13 +120,6 @@ impl PidTable {
             .and_then(|entry| entry.lock().thread())
     }
 
-    /// Returns an iterator over threads that have a live thread reference.
-    pub(crate) fn iter_threads(&self) -> impl Iterator<Item = Arc<Thread>> + '_ {
-        self.entries
-            .values()
-            .filter_map(|entry| entry.lock().thread())
-    }
-
     // ---- Process operations ----
 
     /// Inserts a process and its main thread into the table.

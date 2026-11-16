@@ -96,10 +96,6 @@ impl<T: NsCommonOps> NsInode<T> {
     fn name(&self) -> &str {
         &self.name
     }
-
-    pub(in crate::fs) fn ns(&self) -> &Arc<T> {
-        &self.ns
-    }
 }
 
 #[inherit_methods(from = "self.common")]

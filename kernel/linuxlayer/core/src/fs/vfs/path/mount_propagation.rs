@@ -8,11 +8,10 @@
 //! [`MountTopology`] serializes mount-tree changes and indexes the peer and
 //! master relationships used to route propagation events.
 
-use hashbrown::HashSet;
 use ostd::sync::{RwMutexReadGuard, RwMutexWriteGuard};
 use sparse_id_alloc::SparseIdAlloc;
 
-use super::{UniqueMountId, dentry::Dentry, mount::Mount};
+use super::{UniqueMountId, mount::Mount};
 use crate::prelude::*;
 
 /// The internal mount event propagation state of one mount.
@@ -193,14 +192,6 @@ impl MountPropagation {
         }
     }
 
-    pub(super) fn unbindable() -> Self {
-        Self {
-            peer_group_id: None,
-            master_id: None,
-            bindability: MountBindability::Unbindable,
-        }
-    }
-
     pub(super) fn peer_group_id(&self) -> Option<PeerGroupId> {
         self.peer_group_id
     }
@@ -233,21 +224,6 @@ impl MountPropagation {
 
         Self::shared(peer_group_id, self.master_id())
     }
-
-    /// Converts this propagation state from shared to slave.
-    ///
-    /// A non-shared state is unchanged.
-    /// A shared mount initially names its old peer group as its master.
-    /// If removing the mount empties that group,
-    /// [`MountTopology::remove_peer`] replaces this temporary relationship with
-    /// the removed group's upstream master.
-    pub(super) fn make_slave(self) -> Self {
-        let Some(peer_group_id) = self.peer_group_id() else {
-            return self;
-        };
-
-        Self::slave(peer_group_id)
-    }
 }
 
 /// Whether a mount can be bind-mounted.
@@ -264,18 +240,11 @@ pub(crate) enum MountPropType {
     /// A mount that neither sends nor receives propagation events.
     #[default]
     Private,
-    /// A mount that receives events from a master peer group without sending
-    /// local events back to that group.
-    ///
-    /// Making a slave shared forms the internal shared-and-slave state.
-    Slave,
     /// A mount that sends events to its peers and downstream slaves.
     ///
     /// Events received from another peer or an upstream master are forwarded
     /// through the same relationships.
     Shared,
-    /// A private mount that cannot be used as the root of a bind clone.
-    Unbindable,
 }
 
 /// The synchronized index of mount peer groups and propagation relationships.
@@ -299,37 +268,6 @@ impl MountTopology {
     /// Acquires the read side of the mount topology lock.
     pub(super) fn read_lock() -> RwMutexReadGuard<'static, Self> {
         MOUNT_TOPOLOGY.read()
-    }
-
-    /// Collects every propagation receiver that can address `mountpoint`.
-    ///
-    /// A receiver participates only if `mountpoint` is at or below its root dentry;
-    /// a bind mount rooted elsewhere cannot address the event location.
-    pub(super) fn propagation_receivers(
-        &self,
-        source_parent: &Arc<Mount>,
-        mountpoint: &Arc<Dentry>,
-    ) -> Vec<Arc<Mount>> {
-        let mut visited = HashSet::new();
-        visited.insert(source_parent.unique_id());
-        let mut try_visit_receiver = |receiver: &Arc<Mount>| {
-            visited.insert(receiver.unique_id())
-                && mountpoint.is_equal_or_descendant_of(receiver.root_dentry())
-        };
-
-        let mut receivers = self
-            .direct_propagation_receivers(source_parent)
-            .filter(&mut try_visit_receiver)
-            .collect::<Vec<_>>();
-
-        let mut work_idx = 0;
-        while work_idx < receivers.len() {
-            let direct_receivers = self.direct_propagation_receivers(&receivers[work_idx]);
-            receivers.extend(direct_receivers.filter(&mut try_visit_receiver));
-            work_idx += 1;
-        }
-
-        receivers
     }
 
     /// Iterates over the live peers in `peer_group_id`.
@@ -514,24 +452,6 @@ impl MountTopology {
             self.remove_peer(mount.unique_id(), &old);
         }
     }
-
-    /// Iterates over the other peers and direct slaves of `source_parent`.
-    fn direct_propagation_receivers<'a>(
-        &'a self,
-        source_parent: &Mount,
-    ) -> impl Iterator<Item = Arc<Mount>> + 'a {
-        let source_parent_id = source_parent.unique_id();
-        let peer_group_id = source_parent.propagation().peer_group_id();
-        let peers = peer_group_id
-            .into_iter()
-            .flat_map(|peer_group_id| self.group_peers_of(peer_group_id))
-            .filter(move |peer| peer.unique_id() != source_parent_id);
-        let slaves = peer_group_id
-            .into_iter()
-            .flat_map(|peer_group_id| self.slave_mounts_of(peer_group_id));
-
-        peers.chain(slaves)
-    }
 }
 
 /// A batch of mount-propagation changes awaiting publication.
@@ -566,11 +486,6 @@ impl PendingPropagationChanges {
         self.add_peer_group(source_mount.unique_id(), peer_group);
         self.add_set_op(source_mount, new_propagation);
         Ok(new_propagation)
-    }
-
-    pub(super) fn add_make_slave_op(&mut self, mount: Arc<Mount>) {
-        self.propagation_ops
-            .push(MountPropagationOp::MakeSlave { mount });
     }
 
     pub(super) fn add_set_op(&mut self, mount: Arc<Mount>, new_propagation: MountPropagation) {
@@ -617,9 +532,6 @@ enum MountPropagationOp {
         mount: Arc<Mount>,
         propagation: MountPropagation,
     },
-    MakeSlave {
-        mount: Arc<Mount>,
-    },
     Register(Arc<Mount>),
 }
 
@@ -628,10 +540,6 @@ impl MountPropagationOp {
         match self {
             Self::Set { mount, propagation } => {
                 mount.publish_propagation(propagation, topology);
-            }
-            Self::MakeSlave { mount } => {
-                let current_propagation = mount.propagation();
-                mount.publish_propagation(current_propagation.make_slave(), topology);
             }
             Self::Register(mount) => topology.register_mount_propagation(&mount),
         }

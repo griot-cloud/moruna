@@ -17,7 +17,7 @@ use crate::{
     fs::{
         file::InodeType,
         vfs::{
-            file_system::{FileSystem, FsFlags},
+            file_system::FileSystem,
             path::{
                 Path,
                 dentry::{Dentry, DentryKey},
@@ -246,49 +246,6 @@ impl Mount {
         self.do_mount(fs_and_root, flags, &mountpoint, source, &mut topology)
     }
 
-    /// Unmounts the child at `mountpoint` and returns the requested child mount.
-    ///
-    /// If this mount is shared,
-    /// corresponding children below its propagation receivers are also unmounted.
-    ///
-    /// The operation is atomic: an error leaves the mount tree and propagation topology
-    /// unchanged.
-    /// The caller must hold the mount-topology write lock in `topology`.
-    pub(super) fn do_unmount(
-        self: &Arc<Self>,
-        mountpoint: &Arc<Dentry>,
-        topology: &mut MountTopology,
-    ) -> Result<Arc<Self>> {
-        let child_mount = self
-            .get(mountpoint)
-            .ok_or_else(|| Error::with_message(Errno::ENOENT, "can not find child mount"))?;
-        let parent = child_mount
-            .parent()
-            .and_then(|parent| parent.upgrade())
-            .ok_or_else(|| {
-                Error::with_message(Errno::EINVAL, "the root mount cannot be unmounted")
-            })?;
-
-        let mut unmounted_mounts = vec![child_mount];
-        for receiver in topology.propagation_receivers(&parent, mountpoint) {
-            if let Some(child) = receiver.get(mountpoint) {
-                unmounted_mounts.push(child);
-            }
-        }
-
-        for target in &unmounted_mounts {
-            target
-                .try_walk_tree(|mount| {
-                    mount.clear_propagation(topology);
-                    Ok(())
-                })
-                .unwrap();
-            target.detach_from_parent(topology);
-        }
-
-        Ok(unmounted_mounts.into_iter().next().unwrap())
-    }
-
     /// Clones this mount as an unpublished mount rooted at `root_dentry`.
     ///
     /// The clone belongs to `new_ns` and shares this mount's file system,
@@ -465,12 +422,7 @@ impl Mount {
                         new_propagation
                     }
                 }
-                MountPropType::Slave => {
-                    pending_changes.add_make_slave_op(mount);
-                    return Ok(());
-                }
                 MountPropType::Private => MountPropagation::private(),
-                MountPropType::Unbindable => MountPropagation::unbindable(),
             };
             pending_changes.add_set_op(mount, new_propagation);
             Ok(())
@@ -502,11 +454,6 @@ impl Mount {
     /// Returns whether this mount cannot be bind-cloned.
     pub(super) fn is_unbindable(&self) -> bool {
         self.propagation.read().is_unbindable()
-    }
-
-    /// Returns whether this mount belongs to a peer group.
-    pub(super) fn is_shared(&self) -> bool {
-        self.propagation.read().is_shared()
     }
 
     /// Returns a snapshot of this mount's propagation state.
@@ -736,40 +683,6 @@ impl Mount {
     /// Flushes all pending filesystem metadata and cached file data to the device.
     pub(super) fn sync(&self) -> Result<()> {
         self.fs.sync()?;
-        Ok(())
-    }
-
-    pub(super) fn remount(
-        &self,
-        mount_flags: PerMountFlags,
-        fs_flags: Option<FsFlags>,
-        data: Option<&str>,
-        ctx: &Context,
-        _topology: &mut MountTopology,
-    ) -> Result<()> {
-        if let Some(flags) = fs_flags {
-            self.fs.set_fs_flags(flags, data, ctx)?;
-        }
-
-        // The logics here are consistent with Linux.
-        // In Linux, `NOATIME`, `RELATIME`, and `STRICTATIME` are mutually exclusive.
-        // If none of them nor `NODIRATIME` are set, the atime policy will be inherited
-        // from the old flags.
-        // Reference: https://elixir.bootlin.com/linux/v6.17/source/fs/namespace.c#L4097
-        const ATIME_MASK: PerMountFlags = PerMountFlags::NOATIME
-            .union(PerMountFlags::RELATIME)
-            .union(PerMountFlags::STRICTATIME);
-
-        let need_inherit_atime = !mount_flags.intersects(ATIME_MASK | PerMountFlags::NODIRATIME);
-
-        if need_inherit_atime {
-            let old_flags = self.flags.load(Ordering::Relaxed);
-            let new_flags = mount_flags | (old_flags & ATIME_MASK);
-            self.flags.store(new_flags, Ordering::Relaxed);
-        } else {
-            self.flags.store(mount_flags, Ordering::Relaxed);
-        }
-
         Ok(())
     }
 

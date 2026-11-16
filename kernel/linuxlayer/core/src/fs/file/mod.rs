@@ -7,7 +7,6 @@ mod file_common;
 mod file_handle;
 pub(crate) mod file_table;
 pub(crate) mod flock;
-mod fs_config_file;
 mod inode_attr;
 mod inode_handle;
 
@@ -19,7 +18,6 @@ pub(crate) use file_attr::{
 pub(crate) use file_common::FileCommon;
 pub(crate) use file_handle::{FileLike, StatusFlagsUpdate};
 pub use file_handle::{Mappable, MappableObject, MappedObject, SyncMode};
-pub(crate) use fs_config_file::{DetachedMountFile, FsConfigFile};
 pub use inode_attr::r#type::InodeType;
 pub(crate) use inode_attr::{
     mode::{InodeMode, chmod, mkmod, perms_to_mask, who_and_perms_to_mask, who_to_mask},

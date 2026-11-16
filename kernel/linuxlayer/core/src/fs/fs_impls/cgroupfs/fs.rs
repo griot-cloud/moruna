@@ -15,7 +15,7 @@ use crate::{
         vfs::{
             file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
             inode::Inode,
-            registry::{FsCreationCtx, FsProperties, FsType},
+            registry::{FsProperties, FsType},
         },
     },
     process::posix_thread::AsThreadLocal,
@@ -85,18 +85,12 @@ impl FileSystem for CgroupFs {
 pub(super) struct CgroupFsType;
 
 impl FsType for CgroupFsType {
-    type Key = ();
-
     fn name(&self) -> &'static str {
         "cgroup2"
     }
 
     fn properties(&self) -> FsProperties {
         FsProperties::empty()
-    }
-
-    fn create(&self, _fs_creation_ctx: &mut FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
-        Ok(CgroupFs::singleton().clone())
     }
 
     fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {

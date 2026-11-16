@@ -35,7 +35,7 @@ use crate::{
                 RenameMode, RevalidationPolicy, SymbolicLink,
             },
             path::{Dentry, is_dot, is_dot_or_dotdot, is_dotdot},
-            registry::{FsCreationCtx, FsProperties, FsType},
+            registry::{FsProperties, FsType},
             xattr::{XattrName, XattrNamespace, XattrSetFlags},
         },
     },
@@ -63,10 +63,6 @@ pub(crate) struct RamFs {
 }
 
 impl RamFs {
-    pub(crate) fn new() -> Arc<Self> {
-        Self::new_internal("ramfs")
-    }
-
     pub(in crate::fs) fn new_rootfs() -> Arc<Self> {
         Self::new_internal("rootfs")
     }
@@ -1785,18 +1781,12 @@ fn now() -> Duration {
 pub(super) struct RamFsType;
 
 impl FsType for RamFsType {
-    type Key = ();
-
     fn name(&self) -> &'static str {
         "ramfs"
     }
 
     fn properties(&self) -> FsProperties {
         FsProperties::empty()
-    }
-
-    fn create(&self, _fs_creation_ctx: &mut FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
-        Ok(RamFs::new())
     }
 
     fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {

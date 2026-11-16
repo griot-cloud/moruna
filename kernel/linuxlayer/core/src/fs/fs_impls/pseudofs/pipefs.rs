@@ -9,9 +9,8 @@ use crate::{
         pipe::AnonPipeInode,
         pseudofs::NaivePseudoFs,
         vfs::{
-            file_system::FileSystem,
             path::{Mount, Path},
-            registry::{FsCreationCtx, FsProperties, FsType},
+            registry::{FsProperties, FsType},
         },
     },
     prelude::*,
@@ -52,18 +51,12 @@ impl PipeFs {
 pub(super) struct PipeFsType;
 
 impl FsType for PipeFsType {
-    type Key = ();
-
     fn name(&self) -> &'static str {
         "pipefs"
     }
 
     fn properties(&self) -> FsProperties {
         FsProperties::empty()
-    }
-
-    fn create(&self, _fs_creation_ctx: &mut FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
-        return_errno_with_message!(Errno::EINVAL, "pipefs cannot be mounted");
     }
 
     fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {

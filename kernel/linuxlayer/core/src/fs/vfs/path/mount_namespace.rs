@@ -8,14 +8,13 @@ use super::{
     UniqueMountId,
     mount::MountTreeCloneMode,
     mount_propagation::{MountTopology, PendingPropagationChanges},
-    try_get_mnt_ns_inode,
 };
 use crate::{
     fs::{
         fs_impls::ramfs::RamFs,
         pseudofs::{NsCommonOps, NsType, NullFs, StashedDentry},
         vfs::{
-            path::{Dentry, Mount, Path, PathResolver, PerMountFlags},
+            path::{Mount, Path, PathResolver, PerMountFlags},
             registry::FsAndRoot,
         },
     },
@@ -269,41 +268,6 @@ impl MountNamespace {
     /// Checks whether a given mount belongs to this mount namespace.
     pub(crate) fn owns(self: &Arc<Self>, mount: &Mount) -> bool {
         mount.mnt_ns().as_ptr() == Arc::as_ptr(self)
-    }
-
-    /// Returns whether bind-mounting or moving `dentry` into this mount namespace
-    /// would create a mount-namespace loop.
-    pub(super) fn would_form_mnt_ns_loop(&self, dentry: &Dentry) -> bool {
-        let Some(mnt_ns_inode) = try_get_mnt_ns_inode(dentry) else {
-            return false;
-        };
-
-        self >= mnt_ns_inode.ns().as_ref()
-    }
-
-    /// Ensures that importing the mount subtree rooted at `root_mount` into this
-    /// mount namespace would not form a mount-namespace loop.
-    pub(super) fn check_no_mnt_ns_loop_in_tree(
-        &self,
-        root_mount: &Arc<Mount>,
-        _topology: &MountTopology,
-    ) -> Result<()> {
-        let mut checked_root_dentries = BTreeSet::new();
-
-        root_mount.try_walk_tree(|mount| {
-            let root_dentry = mount.root_dentry();
-            if checked_root_dentries.insert(root_dentry.key())
-                && self.would_form_mnt_ns_loop(root_dentry)
-            {
-                return_errno_with_message!(
-                    Errno::ELOOP,
-                    "the mount tree contains a mount namespace file that would create a namespace loop"
-                );
-            }
-            Ok(())
-        })?;
-
-        Ok(())
     }
 }
 

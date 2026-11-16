@@ -12,7 +12,6 @@ use super::{
     chdir::{sys_chdir, sys_fchdir},
     chmod::{sys_chmod, sys_fchmod, sys_fchmodat, sys_fchmodat2},
     chown::{sys_chown, sys_fchown, sys_fchownat, sys_lchown},
-    chroot::sys_chroot,
     clock_gettime::sys_clock_gettime,
     clone::{sys_clone, sys_clone3},
     close::{sys_close, sys_close_range},
@@ -30,9 +29,6 @@ use super::{
     fcntl::sys_fcntl,
     flock::sys_flock,
     fork::{sys_fork, sys_vfork},
-    fsconfig::sys_fsconfig,
-    fsmount::sys_fsmount,
-    fsopen::sys_fsopen,
     fsync::{sys_fdatasync, sys_fsync},
     futex::sys_futex,
     get_ioprio::sys_ioprio_get,
@@ -70,8 +66,6 @@ use super::{
     mkdir::{sys_mkdir, sys_mkdirat},
     mknod::{sys_mknod, sys_mknodat},
     mmap::sys_mmap,
-    mount::sys_mount,
-    move_mount::sys_move_mount,
     mprotect::sys_mprotect,
     mremap::sys_mremap,
     msync::sys_msync,
@@ -89,7 +83,6 @@ use super::{
     pidfd_open::sys_pidfd_open,
     pidfd_send_signal::sys_pidfd_send_signal,
     pipe::{sys_pipe, sys_pipe2},
-    pivot_root::sys_pivot_root,
     poll::sys_poll,
     ppoll::sys_ppoll,
     prctl::sys_prctl,
@@ -164,7 +157,6 @@ use super::{
     timerfd_settime::sys_timerfd_settime,
     truncate::{sys_ftruncate, sys_truncate},
     umask::sys_umask,
-    umount::sys_umount,
     uname::sys_uname,
     unlink::{sys_unlink, sys_unlinkat},
     unshare::sys_unshare,
@@ -308,14 +300,10 @@ impl_syscall_nums_and_dispatch_fn! {
     SYS_SCHED_GETSCHEDULER = 145 => sys_sched_getscheduler(args[..1]);
     SYS_SCHED_GET_PRIORITY_MAX = 146 => sys_sched_get_priority_max(args[..1]);
     SYS_SCHED_GET_PRIORITY_MIN = 147 => sys_sched_get_priority_min(args[..1]);
-    SYS_PIVOT_ROOT = 155       => sys_pivot_root(args[..2]);
     SYS_PRCTL = 157            => sys_prctl(args[..5]);
     SYS_ARCH_PRCTL = 158       => sys_arch_prctl(args[..2]);
     SYS_SETRLIMIT = 160        => sys_setrlimit(args[..2]);
-    SYS_CHROOT = 161           => sys_chroot(args[..1]);
     SYS_SYNC = 162             => sys_sync(args[..0]);
-    SYS_MOUNT = 165            => sys_mount(args[..5]);
-    SYS_UMOUNT2 = 166          => sys_umount(args[..2]);
     SYS_REBOOT = 169           => sys_reboot(args[..4]);
     SYS_SETHOSTNAME = 170      => sys_sethostname(args[..2]);
     SYS_SETDOMAINNAME = 171    => sys_setdomainname(args[..2]);
@@ -408,10 +396,6 @@ impl_syscall_nums_and_dispatch_fn! {
     SYS_PWRITEV2 = 328         => sys_pwritev2(args[..6]);
     SYS_STATX = 332            => sys_statx(args[..5]);
     SYS_PIDFD_SEND_SIGNAL = 424 => sys_pidfd_send_signal(args[..4]);
-    SYS_MOVE_MOUNT = 429        => sys_move_mount(args[..5]);
-    SYS_FSOPEN = 430           => sys_fsopen(args[..2]);
-    SYS_FSCONFIG = 431         => sys_fsconfig(args[..5]);
-    SYS_FSMOUNT = 432          => sys_fsmount(args[..3]);
     SYS_PIDFD_OPEN = 434       => sys_pidfd_open(args[..2]);
     SYS_CLONE3 = 435           => sys_clone3(args[..2], &user_ctx);
     SYS_CLOSE_RANGE = 436      => sys_close_range(args[..3]);

@@ -15,10 +15,6 @@ use crate::{
         vfs::{inode::SymbolicLink, path::MountNamespace},
     },
     prelude::*,
-    process::{
-        credentials::capabilities::CapSet, pid_table::PidTable, posix_thread::AsPosixThread,
-    },
-    security::lsm::hooks as lsm_hooks,
 };
 
 /// The file descriptor of the current working directory.
@@ -179,28 +175,9 @@ impl PathResolver {
         Ok(())
     }
 
-    /// Changes the root directory to `path`.
-    pub(crate) fn chroot(&mut self, path: Path, ctx: &Context) -> Result<()> {
-        path.check_dir_search_permission()?;
-
-        lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
-            ctx.thread_local.borrow_user_ns().as_ref(),
-            ctx.posix_thread,
-            CapSet::SYS_CHROOT,
-        ))?;
-
-        self.set_root(path);
-        Ok(())
-    }
-
     /// Sets the current working directory to the given `path`.
     fn set_cwd(&mut self, path: Path) {
         self.cwd = path;
-    }
-
-    /// Sets the root directory to the given `path`.
-    fn set_root(&mut self, path: Path) {
-        self.root = path;
     }
 
     /// Constructs the absolute path name of a [`Path`].
@@ -421,141 +398,6 @@ impl PathResolver {
         let new_root = Path::new_root(new_root_mount);
         self.root = new_root.clone();
         self.cwd = new_root;
-    }
-
-    /// Changes the root mount in the mount namespace of the calling thread.
-    ///
-    /// This function moves the original root mount of the calling thread to `put_old_path` and makes
-    /// `new_root_path` the new root mount. For other threads in the current mount namespace, if their
-    /// root directory and current working directory are the same as the current thread's root directory,
-    /// they will also be changed to `new_root_path`.
-    pub(crate) fn pivot_root(
-        &mut self,
-        new_root_path: FsPath,
-        put_old_path: FsPath,
-        pid_table: &PidTable,
-        ctx: &Context,
-    ) -> Result<()> {
-        let new_root_path = self.lookup(&new_root_path)?;
-        let put_old_path = self.lookup(&put_old_path)?;
-
-        if new_root_path.type_() != InodeType::Dir || put_old_path.type_() != InodeType::Dir {
-            return_errno_with_message!(
-                Errno::ENOTDIR,
-                "`new_root` or `put_old` is not a directory"
-            );
-        }
-
-        let current_ns_proxy = ctx.thread_local.borrow_ns_proxy();
-        let current_mnt_ns = current_ns_proxy.unwrap().mnt_ns();
-        if !current_mnt_ns.owns(&new_root_path.mount) || !current_mnt_ns.owns(&put_old_path.mount) {
-            return_errno_with_message!(
-                Errno::EINVAL,
-                "`new_root` or `put_old` is not in the current mount namespace"
-            );
-        }
-
-        if self.root.mount.id() == new_root_path.mount.id()
-            || self.root.mount.id() == put_old_path.mount.id()
-        {
-            return_errno_with_message!(
-                Errno::EBUSY,
-                "`new_root` or `put_old` is on the current root mount"
-            );
-        }
-        if !new_root_path.is_mount_root() || !self.root.is_mount_root() {
-            return_errno_with_message!(
-                Errno::EINVAL,
-                "`new_root` or the current root is not a mount point"
-            );
-        }
-
-        let mut topology_guard = MountTopology::write_lock();
-
-        let Some(new_root_parent) = new_root_path
-            .mount
-            .parent()
-            .and_then(|parent| parent.upgrade())
-        else {
-            return_errno_with_message!(Errno::EINVAL, "`new_root` is on the rootfs mount");
-        };
-        let Some(current_root_parent) =
-            self.root.mount.parent().and_then(|parent| parent.upgrade())
-        else {
-            return_errno_with_message!(Errno::EINVAL, "the current root is on the rootfs mount");
-        };
-
-        if new_root_parent.is_shared()
-            || current_root_parent.is_shared()
-            || put_old_path.mount.is_shared()
-        {
-            return_errno_with_message!(
-                Errno::EINVAL,
-                "`new_root` parent, current root parent, or `put_old` mount is shared"
-            );
-        }
-
-        if !put_old_path.is_reachable_from(&new_root_path, &topology_guard) {
-            return_errno_with_message!(
-                Errno::EINVAL,
-                "`put_old` is not at or underneath `new_root`"
-            );
-        }
-        if !new_root_path.is_reachable_from(&self.root, &topology_guard) {
-            return_errno_with_message!(
-                Errno::EINVAL,
-                "`new_root` is not at or underneath the current root"
-            );
-        }
-
-        let parent_path = {
-            let mountpoint = self.root.mount.mountpoint().unwrap();
-            Path::new(current_root_parent, mountpoint)
-        };
-
-        self.root
-            .mount
-            .graft_mount_tree(put_old_path, &mut topology_guard);
-        new_root_path
-            .mount
-            .graft_mount_tree(parent_path, &mut topology_guard);
-
-        // Release the mount topology lock before taking other threads' resolver locks.
-        drop(topology_guard);
-
-        // TODO: This method should only iterate threads in the current PID namespace instead of
-        // the whole PID table.
-        for thread in pid_table.iter_threads() {
-            let posix_thread = thread.as_posix_thread().unwrap();
-            let ns_proxy = posix_thread.ns_proxy().lock();
-            let Some(ns_proxy) = ns_proxy.as_ref() else {
-                // The thread has exited.
-                continue;
-            };
-            let mnt_ns = ns_proxy.mnt_ns();
-            if !Arc::ptr_eq(mnt_ns, current_mnt_ns) {
-                continue;
-            }
-            let fs = posix_thread.read_fs();
-            if Arc::ptr_eq(&fs, &ctx.thread_local.borrow_fs()) {
-                continue;
-            }
-
-            let mut fs_resolver = fs.resolver().write();
-            if fs_resolver.root() == &self.root {
-                fs_resolver.set_root(new_root_path.clone());
-            }
-            if fs_resolver.cwd() == &self.root {
-                fs_resolver.set_cwd(new_root_path.clone());
-            }
-        }
-
-        if self.cwd == self.root {
-            self.cwd = new_root_path.clone();
-        }
-        self.root = new_root_path;
-
-        Ok(())
     }
 }
 

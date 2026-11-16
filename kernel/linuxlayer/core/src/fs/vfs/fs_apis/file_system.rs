@@ -39,13 +39,6 @@ pub(crate) trait FileSystem: Any + Sync + Send {
         FsFlags::empty()
     }
 
-    /// Sets the flags of this file system.
-    fn set_fs_flags(&self, _flags: FsFlags, _data: Option<&str>, _ctx: &Context) -> Result<()> {
-        // TODO: Remove the default empty implementation in the future.
-        warn!("setting file system flags is not implemented");
-        Ok(())
-    }
-
     /// Returns the FS event subscriber stats of this file system.
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats;
 }
