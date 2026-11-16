@@ -130,6 +130,14 @@ mappings and copies run on the host.
 A copy of program memory the personality has not mapped yet asks the layer's fault handler
 (`ostd::mm::fault`) to map it and goes on, as OSTD's fault path does.
 
+## How the tree is judged
+
+Brackly's rule (data-os-streams.md, 2026-11-16): files carried from Asterinas are judged by
+Asterinas's own tests and the gVisor system-call suite, which pass and which fail. Code
+Moruna writes or rewrites around them (`ostd/`, `libs/component`, the OSDK stand-ins, and
+rewritten files such as the start, the entry loop and the `vm/` adapters) keeps the 80%
+per-crate line floor by host tests.
+
 ## Building and testing
 
 The tree is its own Cargo workspace on the kernel's toolchain, so its carried files keep
