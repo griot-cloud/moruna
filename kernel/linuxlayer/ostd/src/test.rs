@@ -493,6 +493,7 @@ fn boot_info_and_power_types() {
     assert!(crate::arch::read_random().is_some());
     let _ = crate::arch::tsc_freq();
     crate::early_println!("early console: {}", 1);
+    crate::console::send(b"raw bytes\n");
     crate::log::init(crate::log::LevelFilter::Info);
     crate::info!("logged");
     let irq = crate::irq::disable_local();

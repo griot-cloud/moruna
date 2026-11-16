@@ -16,6 +16,7 @@ bitflags.workspace = true
 bitvec.workspace = true
 inherit-methods-macro.workspace = true
 inventory.workspace = true
+linuxlayer-launch.workspace = true
 log.workspace = true
 moruna-abi.workspace = true
 ostd-macros.workspace = true
