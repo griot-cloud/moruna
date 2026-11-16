@@ -68,8 +68,9 @@ pub fn vcpu_of(comm: &str) -> Option<u32> {
     index.parse().ok()
 }
 
-/// A placement checked against the node: one host CPU per vCPU, each one this process may run
-/// on, and the CPUs left for everything else (empty when the vCPUs take them all).
+/// A placement checked against the node: one host CPU per vCPU, each one the host has online
+/// (an isolated core is in no process's affinity until it is placed there: `isolcpus`), and the
+/// CPUs this process may run on less the vCPUs' for everything else (empty when none is left).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Placement {
     /// The host CPU of vCPU `i`.
@@ -79,9 +80,14 @@ pub struct Placement {
 }
 
 impl Placement {
-    /// Check `vcpu_cpus` for a node of `cpus` vCPUs, against `allowed`, the CPUs this process
-    /// may run on.
-    pub fn check(vcpu_cpus: &[u32], cpus: u32, allowed: &[u32]) -> Result<Placement> {
+    /// Check `vcpu_cpus` for a node of `cpus` vCPUs, against `online`, the host's online CPUs;
+    /// the rest of the run is kept on `allowed`, the CPUs this process may run on, less them.
+    pub fn check(
+        vcpu_cpus: &[u32],
+        cpus: u32,
+        online: &[u32],
+        allowed: &[u32],
+    ) -> Result<Placement> {
         if vcpu_cpus.len() != cpus as usize {
             return Err(bad(format!(
                 "{} host CPUs for a node of {cpus} vCPUs; name one per vCPU",
@@ -92,10 +98,8 @@ impl Placement {
             if vcpu_cpus[..i].contains(cpu) {
                 return Err(bad(format!("host CPU {cpu} is given to two vCPUs")));
             }
-            if !allowed.contains(cpu) {
-                return Err(bad(format!(
-                    "host CPU {cpu} is not one this launcher may run on ({allowed:?})"
-                )));
+            if !online.contains(cpu) {
+                return Err(bad(format!("host CPU {cpu} is not online ({online:?})")));
             }
         }
         Ok(Placement {
@@ -119,7 +123,7 @@ pub struct Placed {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{allowed_cpus, place};
+pub use linux::{allowed_cpus, online_cpus, place};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -146,6 +150,13 @@ mod linux {
         } else {
             Err(std::io::Error::last_os_error())
         }
+    }
+
+    /// The host's online CPUs.
+    pub fn online_cpus() -> Result<Vec<u32>> {
+        let path = "/sys/devices/system/cpu/online";
+        let text = std::fs::read_to_string(path).map_err(|e| VmmError::io("read", path, &e))?;
+        super::parse_cpu_list(text.trim())
     }
 
     /// The CPUs this process may run on.
@@ -266,7 +277,7 @@ mod linux {
                 .name("CPU 0/KVM".into())
                 .spawn(|| std::thread::sleep(Duration::from_millis(300)))
                 .unwrap();
-            let placement = Placement::check(&[cpu], 1, &allowed).unwrap();
+            let placement = Placement::check(&[cpu], 1, &online_cpus().unwrap(), &allowed).unwrap();
             let placed = place(
                 &placement,
                 me,
@@ -282,7 +293,8 @@ mod linux {
             for (tid, _) in threads(me).unwrap() {
                 let _ = affinity(tid, &allowed);
             }
-            let none = Placement::check(&[cpu, cpu + 1], 2, &[cpu, cpu + 1]).unwrap();
+            let none = Placement::check(&[cpu, cpu + 1], 2, &[cpu, cpu + 1], &[cpu]).unwrap();
+            assert!(none.housekeeping.is_empty());
             let e = place(&none, me, &[], Instant::now(), &|| true).unwrap_err();
             assert!(e.to_string().contains("of its 2 vCPU threads"), "{e}");
         }
@@ -321,18 +333,23 @@ mod tests {
 
     #[test]
     fn a_placement_names_one_allowed_cpu_per_vcpu() {
-        let allowed = [0, 1, 2, 3, 4, 5, 6, 7];
-        let p = Placement::check(&[6, 7], 2, &allowed).unwrap();
+        let online = [0, 1, 2, 3, 4, 5, 6, 7];
+        let p = Placement::check(&[6, 7], 2, &online, &online).unwrap();
         assert_eq!(p.vcpus, [6, 7]);
         assert_eq!(p.housekeeping, [0, 1, 2, 3, 4, 5]);
-        let all = Placement::check(&[0, 1], 2, &[0, 1]).unwrap();
+        // Isolated cores are in no process's affinity: the vCPUs go there, the rest stays.
+        let isolated = Placement::check(&[4, 6], 2, &online, &[0, 1, 2, 3]).unwrap();
+        assert_eq!(isolated.housekeeping, [0, 1, 2, 3]);
+        let all = Placement::check(&[0, 1], 2, &[0, 1], &[0, 1]).unwrap();
         assert!(all.housekeeping.is_empty());
         for (cpus, n, why) in [
             (&[6][..], 2, "one per vCPU"),
             (&[6, 6][..], 2, "two vCPUs"),
-            (&[6, 9][..], 2, "may run on"),
+            (&[6, 9][..], 2, "not online"),
         ] {
-            let e = Placement::check(cpus, n, &allowed).unwrap_err().to_string();
+            let e = Placement::check(cpus, n, &online, &online)
+                .unwrap_err()
+                .to_string();
             assert!(e.contains(why), "{e}");
         }
     }

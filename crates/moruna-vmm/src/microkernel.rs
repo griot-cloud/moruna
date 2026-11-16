@@ -1286,10 +1286,13 @@ fn placement_for(devices: &RunDevices, cpus: u32) -> Result<Option<Placement>> {
         return Ok(None);
     }
     #[cfg(target_os = "linux")]
-    let allowed = crate::placement::allowed_cpus()?;
+    let (online, allowed) = (
+        crate::placement::online_cpus()?,
+        crate::placement::allowed_cpus()?,
+    );
     #[cfg(not(target_os = "linux"))]
-    let allowed: Vec<u32> = Vec::new();
-    Placement::check(&devices.vcpu_cpus, cpus, &allowed).map(Some)
+    let (online, allowed): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    Placement::check(&devices.vcpu_cpus, cpus, &online, &allowed).map(Some)
 }
 
 /// Place the paused node's vCPUs and its other threads, then let the guest run.

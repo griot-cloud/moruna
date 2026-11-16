@@ -24,9 +24,10 @@ fn main() -> std::process::ExitCode {
         let deadline = Instant::now() + Duration::from_secs(10);
         if let Some(list) = rest.first() {
             let cpus = placement::parse_cpu_list(list).map_err(|e| e.to_string())?;
+            let online = placement::online_cpus().map_err(|e| e.to_string())?;
             let allowed = placement::allowed_cpus().map_err(|e| e.to_string())?;
-            let wanted =
-                Placement::check(&cpus, cpus.len() as u32, &allowed).map_err(|e| e.to_string())?;
+            let wanted = Placement::check(&cpus, cpus.len() as u32, &online, &allowed)
+                .map_err(|e| e.to_string())?;
             let alive = || std::path::Path::new(&format!("/proc/{qemu}")).exists();
             let placed = placement::place(&wanted, qemu, &[backend], deadline, &alive)
                 .map_err(|e| e.to_string())?;
