@@ -2326,8 +2326,9 @@ mod data_os {
     use crate::error::Result;
 
     /// Where the sinks' files are inside the VM: the layer's root (`MORUNA_OUTPUT_ROOT`
-    /// overrides it).
-    pub(crate) const OUTPUT_ROOT: &str = "/out";
+    /// overrides it). It is in the engine's scratch, because the root is read only and the only
+    /// writable places are a task's scratch and the engine's output disk (data-os §3a).
+    pub(crate) const OUTPUT_ROOT: &str = "/tmp/out";
 
     pub(crate) fn take() -> Result<Option<Granted>> {
         Granted::take().map_err(|msg| {

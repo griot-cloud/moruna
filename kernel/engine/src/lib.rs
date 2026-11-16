@@ -19,6 +19,9 @@
 //! runs 3                              # how many times it is started, one after another
 //! ```
 //!
+//! The program is started by exec, never through a shell, and may not be one: the data OS has
+//! no shell (`architecture/data-os.md` §3a).
+//!
 //! Every line is checked; an unknown key, a repeated one that may appear once, a number
 //! that is not one, a slot name the kernel would refuse and a configuration with no
 //! program or no budget are refused with the line.
@@ -71,6 +74,17 @@ pub struct Config {
     pub scratch: u64,
     pub grants: Vec<Grant>,
     pub runs: u32,
+}
+
+/// The programs that are shells, by file name: none may be the engine's program (data-os §3a).
+pub const SHELLS: [&str; 12] = [
+    "sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "busybox", "toybox",
+];
+
+/// Whether the program at absolute path `path` is a shell.
+pub fn is_shell(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    SHELLS.contains(&name)
 }
 
 /// The most runs one boot asks for.
@@ -127,6 +141,11 @@ impl Config {
                     once(program.is_some())?;
                     if !rest.starts_with('/') || rest.contains(' ') {
                         return Err(refuse("the program is one absolute path"));
+                    }
+                    if is_shell(rest) {
+                        return Err(refuse(
+                            "the program is a shell, and the data OS starts nothing through one",
+                        ));
                     }
                     program = Some(String::from(rest));
                 }
@@ -443,6 +462,14 @@ mod tests {
             (
                 "program /e\nprogram /f\nmemory 4096\n",
                 "line 2: given twice",
+            ),
+            (
+                "program /bin/sh\nmemory 4096\n",
+                "line 1: the program is a shell",
+            ),
+            (
+                "program /usr/bin/busybox\nmemory 4096\n",
+                "line 1: the program is a shell",
             ),
             ("program /e\nmemory lots\n", "line 2: not a number"),
             ("program /e\nmemory 0\n", "line 2: a budget of no memory"),
