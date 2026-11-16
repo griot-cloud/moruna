@@ -65,16 +65,7 @@ impl MemoryObject {
         let pages = size.div_ceil(PAGE_SIZE) as usize;
         // Charged before anything is allocated, so a refusal allocates nothing.
         let charge = Charge::new(account, charge::memory(pages as u64))?;
-        let mut frames = Vec::new();
-        frames
-            .try_reserve_exact(pages)
-            .map_err(|_| Error::NoMemory)?;
-        let mut options = FrameAllocOptions::new();
-        options.zeroed(true);
-        for _ in 0..pages {
-            let frame = options.alloc_frame().map_err(|_| Error::NoMemory)?;
-            frames.push(frame.into());
-        }
+        let frames = MemoryObject::large_frames(pages)?;
         Ok(MemoryObject {
             frames,
             size: pages as u64 * PAGE_SIZE,
