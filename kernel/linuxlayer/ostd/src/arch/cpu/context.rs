@@ -429,7 +429,18 @@ impl FpuContext {
     }
 
     /// Saves the calling thread's state.
+    ///
+    /// On the target the program's state is not in the registers while the personality runs:
+    /// the entry saved it in the thread's block, which this copies.
     pub fn save(&mut self) {
+        #[cfg(target_os = "none")]
+        crate::backend::program_fpu_save(self.as_bytes_mut());
+        #[cfg(not(target_os = "none"))]
+        self.save_registers();
+    }
+
+    #[cfg(not(target_os = "none"))]
+    fn save_registers(&mut self) {
         let mem_addr = self.as_bytes_mut().as_mut_ptr();
         #[cfg(target_arch = "x86_64")]
         // SAFETY: the area is 64-byte aligned and as large as the CPU's XSAVE area.
@@ -442,7 +453,17 @@ impl FpuContext {
     }
 
     /// Loads the state into the calling thread.
+    ///
+    /// On the target this sets the state the entry loads when the program next runs.
     pub fn load(&self) {
+        #[cfg(target_os = "none")]
+        crate::backend::program_fpu_load(self.as_bytes());
+        #[cfg(not(target_os = "none"))]
+        self.load_registers();
+    }
+
+    #[cfg(not(target_os = "none"))]
+    fn load_registers(&self) {
         let mem_addr = self.as_bytes().as_ptr();
         #[cfg(target_arch = "x86_64")]
         // SAFETY: as for `save`; the area holds a state XSAVE or FXSAVE wrote, or the
@@ -528,7 +549,8 @@ struct FxSaveArea {
     reserved3: [u32; 12],
 }
 
-const XFEATURE_MASK_USER_RESTORE: u64 = 0b1110_0111;
+/// The XSAVE components a program's state holds: x87, SSE, AVX and AVX-512.
+pub(crate) const XFEATURE_MASK_USER_RESTORE: u64 = 0b1110_0111;
 const MAX_XSAVE_AREA_SIZE: usize = 4096;
 
 fn xstate_max_features() -> Option<u64> {

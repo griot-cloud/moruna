@@ -4,9 +4,9 @@
 //!
 //! In OSTD this enters user mode on the kernel's CPU. Here the thread is already the
 //! program's own: `execute` hands its registers back through the personality entry and
-//! returns with the next entry's (`kernel-is-the-machine.md` §4.1 a). The entry is
-//! stream B1's mechanism, so it is reached through a driver installed at start:
-//! the core's entry on the target, a scripted program in host tests.
+//! returns with the next entry's (`kernel-is-the-machine.md` §4.1 a), through B1's
+//! `personality_return` on the target (`backend::run_program`). A driver installed with
+//! `set_program_driver` takes its place: a scripted program in host tests.
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -103,10 +103,12 @@ pub fn set_program_driver(driver: ProgramDriver) {
 
 pub(crate) fn run_program(context: &mut UserContext) -> ReturnReason {
     let ptr = DRIVER.load(Ordering::Acquire);
-    assert!(
-        !ptr.is_null(),
-        "no program driver: the personality entry is not set"
-    );
+    // On the target the core's entry runs the program unless a driver is installed.
+    #[cfg(target_os = "none")]
+    if ptr.is_null() {
+        return crate::backend::run_program(context);
+    }
+    assert!(!ptr.is_null(), "no program driver installed");
     // SAFETY: only `set_program_driver` stores here, and it stores a `ProgramDriver`.
     let driver: ProgramDriver = unsafe { core::mem::transmute(ptr) };
     driver(context)

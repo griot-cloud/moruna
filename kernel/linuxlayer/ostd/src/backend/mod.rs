@@ -11,7 +11,7 @@ mod moruna;
 #[cfg(target_os = "none")]
 pub(crate) use moruna::*;
 #[cfg(target_os = "none")]
-pub use moruna::{set_self_process, set_user_copy, user_copy_range};
+pub use moruna::{copy_through_core, personality_set, user_copy_range};
 
 #[cfg(not(target_os = "none"))]
 mod host;

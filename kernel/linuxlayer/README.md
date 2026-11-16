@@ -60,12 +60,13 @@ their `use ostd::...` lines. The swaps of `kernel-is-the-machine.md` §4.2 are i
 - **The program's memory through a fault-tolerant copy** (`ostd/src/mm/io/copy.rs`,
   `ostd/src/backend/moruna.rs`):
   - `VmReader` and `VmWriter` keep OSTD's code; their fallible side is the program's memory;
-  - once the core resumes a fault in the copy routines at their recovery point
-    (B1's `personality_set`), copies run in place; until then each goes through
-    `process_read` or `process_write` on the personality's own process, which answer
-    `Fault` safely;
-  - a program's pointer is accepted only below `MAX_USERSPACE_VADDR`, so a program can never
-    make the personality copy into its own region.
+  - copies run in place: the process is given the copy routines with B1's
+    `personality_set_with_copy` (`ostd::backend::personality_set`), and the core resumes a
+    fault in them at their recovery point; a process given none copies through
+    `process_read` and `process_write` on itself (`copy_through_core`);
+  - a program's pointer is accepted only below `MAX_USERSPACE_VADDR`, the base of the
+    personality's region (`IMAGE_RANGE.end`), so a program can never make the personality
+    copy into its own region.
 - **Tasks are threads** (`ostd/src/task`): the core schedules, so `Task::run` starts a thread,
   and `Task::current` reads a slot at the base of the thread's aligned stack (the program
   owns FS). Atomic-mode guards are RCU read sections.
@@ -92,18 +93,22 @@ changed with them.
 | `comps/time/src/rtc/mod.rs` | One "driver" reading the wall time the start gives. |
 | `comps/time/Cargo.toml` | No RTC drivers' dependencies. |
 
-## What is next: the parts that need B1
+## Running the program: B1's entry
 
 The program's own entry, clones, the pager and thread state are stream B1's mechanisms
-(`kernel-is-the-machine.md` §4.1). In `ostd` they sit behind one seam each:
+(`kernel-is-the-machine.md` §4.1, `moruna_sys::personality`):
 
-- **Running the program** (`ostd::user::set_program_driver`): `UserMode::execute` hands the
-  context to the program and returns with the next entry's frame, in ABI 2.6's layout
-  (`ostd::arch::cpu::context::frame`, `moruna_abi::personality`).
-- **The fault-tolerant copy's recovery point** (`ostd::backend::set_user_copy`,
-  `user_copy_range`).
+- **Running the program:** `UserMode::execute` hands the context to the program with
+  `personality_return` and returns with the next entry's frame (`backend::run_program`).
+  The core switches general registers, RIP, RFLAGS and FS base only, so the entry loads the
+  program's vector state (XRSTOR) just before the call and saves it (XSAVE) just after, and
+  OSTD's `FpuContext::save` and `load` read and write that saved state.
+- **Each thread's block** sits at the base of its aligned stack: its task, the program's
+  frame (inside the region, as the core requires) and the program's vector state.
+- A driver installed with `ostd::user::set_program_driver` takes the entry's place: a
+  scripted program in host tests.
 
-What builds on them is the rewrite of `core/src/{thread,vm,process}` and the start.
+What builds on these is the rewrite of `core/src/{thread,vm,process}` and the start.
 
 `core/` is carried but not yet a workspace member: making it build against `ostd` comes
 next, subsystem by subsystem.

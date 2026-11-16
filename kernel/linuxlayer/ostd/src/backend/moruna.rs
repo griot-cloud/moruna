@@ -3,13 +3,15 @@
 //! Moruna's core under the personality, through `moruna-sys`.
 //!
 //! Every thread the personality runs on has a stack of `STACK_SIZE` bytes aligned to its
-//! size; the word at its base names the thread's task, so finding the current task takes
-//! no call and no TLS (the program owns FS).
+//! size; at its base is the thread's block: its task, the program's frame, and the
+//! program's vector state. Finding them takes no call and no TLS (the program owns FS,
+//! and the core keeps no GS base per thread).
 //!
-//! The program's memory is reached through a fault-tolerant copy. Once the core resumes
-//! a fault in the copy routines at their recovery point (`set_user_copy`), copies run in
-//! place; until then each one is a `process_read` or `process_write` on the personality's
-//! own process, which answers `Fault` safely.
+//! The program's memory is reached through a fault-tolerant copy that runs in place: the
+//! process is given the copy routines with `personality_set_with_copy` (`personality_set`
+//! here), and the core resumes a fault in them at their recovery point. A personality whose
+//! process has no routines copies through `process_read` and `process_write` on itself
+//! instead (`copy_through_core`), which answer `Fault` safely.
 
 use alloc::{boxed::Box, vec::Vec};
 use core::{
@@ -48,36 +50,147 @@ pub(crate) fn yield_now() {
     core::hint::spin_loop();
 }
 
-/// The stack base of the calling thread.
-fn stack_base() -> usize {
+/// The size of a program's XSAVE area here; `query_xsave_area_size` is at most this.
+pub(crate) const FPU_AREA: usize = 4096;
+
+/// What a personality thread keeps at the base of its stack.
+#[repr(C, align(64))]
+pub(crate) struct ThreadBlock {
+    /// The program's vector and x87 state, in the XSAVE layout, while the thread runs the
+    /// personality: the core switches general registers and FS base only.
+    pub(crate) fpu: [u8; FPU_AREA],
+    /// The program's registers between entries; inside the region, as the core requires.
+    pub(crate) frame: moruna_sys::personality::Frame,
+    /// The thread's task (`Task::current`), zero for none.
+    pub(crate) task: usize,
+}
+
+/// The calling thread's block.
+fn block() -> *mut ThreadBlock {
     let sp: usize;
     // SAFETY: reads the stack pointer and touches nothing.
     unsafe { core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack)) };
-    sp & !(STACK_SIZE - 1)
+    (sp & !(STACK_SIZE - 1)) as *mut ThreadBlock
 }
 
 pub(crate) fn current_slot() -> usize {
-    // SAFETY: every personality thread runs on a stack made by `new_stack`, whose first
-    // word is the slot, written before the thread runs.
-    unsafe { *(stack_base() as *const usize) }
+    // SAFETY: every personality thread runs on a stack made by `new_stack`, whose block is
+    // written before the thread runs; only the thread itself reaches it.
+    unsafe { (*block()).task }
 }
 
 pub(crate) fn set_current_slot(value: usize) {
-    // SAFETY: as above; only the thread itself writes its slot.
-    unsafe { *(stack_base() as *mut usize) = value };
+    // SAFETY: as above.
+    unsafe { (*block()).task = value };
 }
 
-/// A stack for a personality thread: its aligned base and its top. It is never freed
-/// while the personality runs.
+/// A stack for a personality thread: its aligned base, with the thread's block written, and
+/// its top. It is never freed while the personality runs.
 pub(crate) fn new_stack() -> Option<(usize, usize)> {
     let mut v: Vec<u8> = Vec::new();
     v.try_reserve_exact(2 * STACK_SIZE).ok()?;
     let start = v.as_mut_ptr() as usize;
     core::mem::forget(v);
     let base = (start + STACK_SIZE - 1) & !(STACK_SIZE - 1);
-    // SAFETY: the slot lies inside the reservation just leaked.
-    unsafe { *(base as *mut usize) = 0 };
+    // SAFETY: the block lies inside the reservation just leaked, at its aligned base.
+    unsafe { init_block(base as *mut ThreadBlock) };
     Some((base, base + STACK_SIZE))
+}
+
+/// Writes a fresh block: no task, a zero frame, and the program's initial vector state (the
+/// XSAVE header's components all at their initial state, MXCSR 0x1F80).
+///
+/// # Safety
+///
+/// `block` is valid for writes and 64-byte aligned.
+pub(crate) unsafe fn init_block(block: *mut ThreadBlock) {
+    // SAFETY: the caller upholds it; every field is plain bytes.
+    unsafe {
+        core::ptr::write_bytes(block, 0, 1);
+        (&mut (*block).fpu)[24..28].copy_from_slice(&0x1F80u32.to_le_bytes());
+    }
+}
+
+/// Copies the program's saved vector state into `area`.
+pub(crate) fn program_fpu_save(area: &mut [u8]) {
+    // SAFETY: the calling thread's block is its own.
+    let fpu = unsafe { &(*block()).fpu };
+    let n = area.len().min(FPU_AREA);
+    area[..n].copy_from_slice(&fpu[..n]);
+}
+
+/// Sets the program's vector state from `area`, loaded when the program next runs.
+pub(crate) fn program_fpu_load(area: &[u8]) {
+    // SAFETY: as above.
+    let fpu = unsafe { &mut (*block()).fpu };
+    let n = area.len().min(FPU_AREA);
+    fpu[..n].copy_from_slice(&area[..n]);
+}
+
+/// The XSAVE components a program's state holds: what the CPU enables, of the x87, SSE,
+/// AVX and AVX-512 states.
+fn xsave_mask() -> u64 {
+    static MASK: AtomicUsize = AtomicUsize::new(0);
+    let m = MASK.load(Ordering::Relaxed);
+    if m != 0 {
+        return m as u64;
+    }
+    // SAFETY: XGETBV with ECX 0 reads XCR0, readable in user mode on a CPU with XSAVE,
+    // which the data OS's machines have.
+    let xcr0 = unsafe { core::arch::x86_64::_xgetbv(0) };
+    let m = xcr0 & crate::arch::cpu::context::XFEATURE_MASK_USER_RESTORE;
+    MASK.store(m as usize, Ordering::Relaxed);
+    m
+}
+
+/// Runs the program with `ctx` until it enters the personality again
+/// (`moruna_sys::personality::personality_return`).
+pub(crate) fn run_program(
+    ctx: &mut crate::arch::cpu::context::UserContext,
+) -> crate::user::ReturnReason {
+    let block = block();
+    let mask = xsave_mask();
+    // SAFETY: the block is the calling thread's own and lies in the personality's region.
+    let (frame, fpu) = unsafe { (&mut (*block).frame, (*block).fpu.as_mut_ptr()) };
+    ctx.to_frame(&mut frame.0);
+    let mut control = [0u32; 2];
+    let rax: u64;
+    // SAFETY: XRSTOR loads the program's state just before the call, and XSAVE stores it
+    // just after, with no compiler code between that could use vector registers; the
+    // personality's own MXCSR and x87 control word, which the ABI keeps across calls, are
+    // put back after. The call reads and writes only the frame.
+    unsafe {
+        core::arch::asm!(
+            "stmxcsr [r12]",
+            "fnstcw [r12 + 4]",
+            "mov eax, r13d",
+            "mov edx, r14d",
+            "xrstor64 [rsi]",
+            "mov rax, {nr}",
+            "syscall",
+            "mov r8, rax",
+            "mov eax, r13d",
+            "mov edx, r14d",
+            "xsave64 [rsi]",
+            "ldmxcsr [r12]",
+            "fldcw [r12 + 4]",
+            nr = const moruna_abi::nr::PERSONALITY_RETURN,
+            in("rdi") frame as *mut moruna_sys::personality::Frame,
+            in("rsi") fpu,
+            in("r12") control.as_mut_ptr(),
+            in("r13") mask as u32,
+            in("r14") (mask >> 32) as u32,
+            out("r8") rax,
+            clobber_abi("sysv64"),
+        );
+    }
+    let reason = match Error::from_raw(rax) {
+        Ok(reason) => reason,
+        Err(e) => panic!("the personality entry refused the program's frame: {e:?}"),
+    };
+    let at = crate::arch::cpu::context::frame::REASON;
+    frame.0[at..at + 8].copy_from_slice(&reason.to_le_bytes());
+    ctx.from_frame(&frame.0)
 }
 
 extern "C" fn thread_start(arg: u64) -> ! {
@@ -121,20 +234,36 @@ pub(crate) fn exit(code: u32) -> ! {
     moruna_sys::exit(code as i64)
 }
 
-/// Whether the core resumes faults in the copy routines at their recovery point.
-static IN_PLACE: AtomicBool = AtomicBool::new(false);
-/// The personality's own process, for copies before that.
+/// Whether copies run in place: the process was given the copy routines.
+static IN_PLACE: AtomicBool = AtomicBool::new(true);
+/// The personality's own process, for copies through the core.
 static SELF: AtomicUsize = AtomicUsize::new(0);
 
-/// Copies run in place from now on: the core resumes a fault in
-/// `[user_copy_range().0, .1)` at `user_copy_range().2` with the registers as they were.
-pub fn set_user_copy() {
-    IN_PLACE.store(true, Ordering::Release);
+/// Copies go through `process_read` and `process_write` on `process`, the personality's own:
+/// for a process given no copy routines.
+pub fn copy_through_core(process: RawHandle) {
+    SELF.store(process as usize, Ordering::Release);
+    IN_PLACE.store(false, Ordering::Release);
 }
 
-/// Copies go through `process_read` and `process_write` on `process`.
-pub fn set_self_process(process: RawHandle) {
-    SELF.store(process as usize, Ordering::Release);
+/// Gives the created process `process` its personality region, `len` bytes from `base`,
+/// with this image's copy routines (`moruna_sys::personality::personality_set_with_copy`):
+/// a fault in them resumes at their recovery point with the fault's address in `rdx` and
+/// every other register as it was. The process must map this personality's image at the
+/// addresses it has here.
+pub fn personality_set(
+    process: &moruna_sys::Process,
+    base: u64,
+    len: u64,
+) -> moruna_sys::Result<()> {
+    let (start, end, recovery) = user_copy_range();
+    moruna_sys::personality::personality_set_with_copy(
+        process,
+        base,
+        len,
+        start as u64..end as u64,
+        recovery as u64,
+    )
 }
 
 /// The copy routines' range and their recovery point, for the core.
@@ -153,7 +282,9 @@ pub fn user_copy_range() -> (usize, usize, usize) {
 
 // Each routine leaves in rcx how much is left to do and ends at the shared epilogue,
 // which returns it; a fault resumes at the epilogue with rcx as the fault left it, which
-// `rep movsb` and `rep stosb` keep exact.
+// `rep movsb` and `rep stosb` keep exact. The core puts the fault's address in rdx there,
+// which no routine needs after its fault, and leaves the rest; no routine pushes, so the
+// epilogue's `ret` finds the caller's return address.
 global_asm!(
     ".pushsection .text.linuxlayer_user, \"ax\"",
     ".global linuxlayer_user_start",
@@ -209,7 +340,7 @@ fn self_process() -> Option<RawHandle> {
 
 /// A copy through the core, the largest prefix that succeeds, a page at a time once one
 /// fails; returns how many bytes were not copied.
-fn copy_through_core(dst: usize, src: usize, len: usize, to_program: bool) -> usize {
+fn copy_via_core(dst: usize, src: usize, len: usize, to_program: bool) -> usize {
     let Some(process) = self_process() else {
         return len;
     };
@@ -253,16 +384,16 @@ pub(crate) unsafe fn copy_fallible(dst: *mut u8, src: *const u8, len: usize, dir
         return unsafe { linuxlayer_copy(dst, src, len) };
     }
     match dir {
-        Dir::ToProgram => copy_through_core(dst as usize, src as usize, len, true),
-        Dir::FromProgram => copy_through_core(dst as usize, src as usize, len, false),
+        Dir::ToProgram => copy_via_core(dst as usize, src as usize, len, true),
+        Dir::FromProgram => copy_via_core(dst as usize, src as usize, len, false),
         Dir::Both => {
             let mut page = [0u8; 4096];
             let mut done = 0;
             while done < len {
                 let n = (len - done).min(4096);
                 let p = page.as_mut_ptr() as usize;
-                let got = n - copy_through_core(p, src as usize + done, n, false);
-                let put = got - copy_through_core(dst as usize + done, p, got, true);
+                let got = n - copy_via_core(p, src as usize + done, n, false);
+                let put = got - copy_via_core(dst as usize + done, p, got, true);
                 done += put;
                 if put != n {
                     break;
@@ -288,7 +419,7 @@ pub(crate) unsafe fn set_fallible(dst: *mut u8, value: u8, len: usize) -> usize 
     let mut done = 0;
     while done < len {
         let n = (len - done).min(4096);
-        let left = copy_through_core(dst as usize + done, page.as_ptr() as usize, n, true);
+        let left = copy_via_core(dst as usize + done, page.as_ptr() as usize, n, true);
         done += n - left;
         if left != 0 {
             break;
@@ -306,7 +437,7 @@ pub(crate) unsafe fn load_u32_fallible(ptr: *const u32) -> Option<u32> {
         // SAFETY: as for `copy_fallible`.
         return (unsafe { linuxlayer_load32(ptr, &mut out) } == 0).then_some(out);
     }
-    let left = copy_through_core((&raw mut out) as usize, ptr as usize, 4, false);
+    let left = copy_via_core((&raw mut out) as usize, ptr as usize, 4, false);
     (left == 0).then_some(out)
 }
 
