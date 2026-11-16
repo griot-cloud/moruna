@@ -1127,6 +1127,33 @@ pub fn build_node(
     Ok(path)
 }
 
+/// The most of each node log a run that did not complete keeps.
+pub const DIAGNOSTIC_BYTES: u64 = 1 << 20;
+
+/// Copy the last [`DIAGNOSTIC_BYTES`] of the node's logs in `from` (`serial.log`, `qemu.log`,
+/// `backend.log`) into `to`, a new private directory.
+pub fn keep_diagnostics(from: &Path, to: &Path) -> Result<(), String> {
+    use std::io::{Read as _, Seek as _};
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+        .create(to)
+        .map_err(|e| format!("{}: {e}", to.display()))?;
+    for name in ["serial.log", "qemu.log", "backend.log"] {
+        let Ok(mut file) = std::fs::File::open(from.join(name)) else {
+            continue;
+        };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let _ = file.seek(std::io::SeekFrom::Start(
+            len.saturating_sub(DIAGNOSTIC_BYTES),
+        ));
+        let mut tail = Vec::new();
+        file.take(DIAGNOSTIC_BYTES)
+            .read_to_end(&mut tail)
+            .map_err(|e| format!("{name}: {e}"))?;
+        std::fs::write(to.join(name), tail).map_err(|e| format!("{name}: {e}"))?;
+    }
+    Ok(())
+}
+
 /// The status a run's exit code says, as the engine's report words it.
 pub fn status_of(code: i32) -> &'static str {
     match code {
@@ -1496,20 +1523,23 @@ fn run_vm(
             let _ = watcher.join();
             outcome
         });
+        // A run that did not complete keeps its node's logs (the guest's serial console, QEMU's
+        // and the vsock back end's), since the run's directory goes with the node.
+        if !matches!(result, Ok(ref s) if s.code == exit::COMPLETED) {
+            let kept = std::env::temp_dir().join(format!("moruna-diagnostics-{name}"));
+            match keep_diagnostics(run.runtime_dir(), &kept) {
+                Ok(()) => eprintln!(
+                    "moruna run --vm: the node's logs are kept in {}",
+                    kept.display()
+                ),
+                Err(why) => eprintln!("moruna run --vm: the node's logs were not kept: {why}"),
+            }
+        }
         let stopping = std::time::Instant::now();
         let cleanup = run.shutdown();
         timing.outputs_ms = stopping.elapsed().as_millis() as u64;
-        let result = result.and_then(|status| cleanup.map(|()| status));
-        // Preserve actual serial/backend diagnostics for a failed run.
-        if result.is_ok() {
-            let _ = std::fs::remove_dir_all(&directory);
-        } else {
-            eprintln!(
-                "moruna run --vm: diagnostics retained at {}",
-                directory.display()
-            );
-        }
-        result
+        let _ = std::fs::remove_dir_all(&directory);
+        result.and_then(|status| cleanup.map(|()| status))
     })();
     let code = match result {
         Ok(status) => status.code,
@@ -2169,6 +2199,31 @@ mod tests {
         assert_eq!(output_disk_for(1 << 30) % 4096, 0);
         let e = build_node(&dir, Path::new("/j"), &dir.join("o"), &order).unwrap_err();
         assert!(e.contains("not a node kit"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_run_that_did_not_complete_keeps_the_tail_of_its_node_logs() {
+        let dir = std::env::temp_dir().join(format!("m-diag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        let mut serial = vec![b'a'; DIAGNOSTIC_BYTES as usize];
+        serial.extend_from_slice(b"panic: the end");
+        std::fs::write(dir.join("run/serial.log"), &serial).unwrap();
+        std::fs::write(dir.join("run/qemu.log"), b"qemu says").unwrap();
+        keep_diagnostics(&dir.join("run"), &dir.join("kept")).unwrap();
+        let kept = std::fs::read(dir.join("kept/serial.log")).unwrap();
+        assert_eq!(kept.len() as u64, DIAGNOSTIC_BYTES);
+        assert!(kept.ends_with(b"panic: the end"));
+        assert_eq!(
+            std::fs::read(dir.join("kept/qemu.log")).unwrap(),
+            b"qemu says"
+        );
+        assert!(!dir.join("kept/backend.log").exists());
+        assert!(
+            keep_diagnostics(&dir.join("run"), &dir.join("kept")).is_err(),
+            "never over"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

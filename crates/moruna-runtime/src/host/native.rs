@@ -741,6 +741,10 @@ impl NativeRun {
     pub fn timing(&self) -> Timing {
         self.timing
     }
+    /// The node's own directory, its logs in it, removed when the node is shut down.
+    pub fn runtime_dir(&self) -> &Path {
+        self.node.runtime_dir()
+    }
     /// When QEMU was running: where the boot's time starts.
     pub fn launched_at(&self) -> Instant {
         self.launched_at
