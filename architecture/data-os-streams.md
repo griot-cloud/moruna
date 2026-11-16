@@ -182,6 +182,11 @@ and switches to the new one when the call answers.
   - `crates/moruna-runtime/src/bin/moruna-engine.rs` and the engine's adapter wiring in
     `crates/moruna-runtime/src/run.rs`;
   - `kernel/engine` (the supervisor's grants of memory and devices to the engine).
+  - the device manager's `hand_over(name)` request in `kernel/devices` (2026-11-16): for a table
+    line that starts no driver, it hands the function's resources (config, BARs, MSI, DMA) to the
+    supervisor once;
+  - a worker-start hook in `moruna-scheduler`'s worker spawn, for pinning. It is wiring, and
+    changes nothing the scheduler decides.
 - **Contracts:**
   - C2: planned reads, readahead from the scheduler's next splits, DMA into the arena, no page
     cache;
@@ -255,7 +260,8 @@ and switches to the new one when the call answers.
 - **Builds:** `moruna run JOB` on a Linux x86-64 node with KVM, which:
   - stages remote inputs on the host;
   - attaches each input as a read-only virtio-blk device and an output disk (`devices.rs`), the
-    launcher's devices of KD4;
+    launcher's devices of KD4. They are transitional virtio-blk (1af4:1001), with an input's
+    serial giving its file's length, and device-table lines that start no driver;
   - boots the VM;
   - sends the job over the vsock;
   - streams events, logs (as records on the job updates, with producer, level and line,

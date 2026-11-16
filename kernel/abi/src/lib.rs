@@ -165,7 +165,8 @@ pub mod nr {
     // `BadSyscall` until its stream implements it (`architecture/data-os-streams.md`).
     // Stream A, the data path's mechanisms:
     /// `thread_set_cpu(thread, cpu)`: runs the thread on CPU `cpu` only, or anywhere with
-    /// `cpu::ANY`. A place to run, never a function to run (data-os §2).
+    /// `cpu::ANY`; thread handle 0 is the calling thread. A place to run, never a function to
+    /// run (data-os §2).
     pub const THREAD_SET_CPU: u64 = BASE + 53;
     /// `clock_page() -> address`: maps the read-only `clock_page::Page` into the caller
     /// once, so time is read with no call (data-os §2).
@@ -714,7 +715,8 @@ pub mod cpu {
     pub const ANY: u64 = u64::MAX;
 }
 
-/// The page `clock_page` maps (ABI 2.6, stream A): a seqlock. A reader reads `SEQUENCE`,
+/// The page `clock_page` maps (ABI 2.6, stream A): a seqlock. Its time is `clock_get`'s
+/// monotonic nanoseconds, the clock every deadline in this ABI is measured on. A reader reads `SEQUENCE`,
 /// then the fields, then `SEQUENCE` again, and retries if it changed or was odd. Time in
 /// nanoseconds is `BASE_NS + ((tsc - BASE_TSC) * MULTIPLIER) >> SHIFT`.
 pub mod clock_page {
