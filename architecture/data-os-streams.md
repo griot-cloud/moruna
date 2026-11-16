@@ -527,3 +527,16 @@ and switches to the new one when the call answers.
     for 16 pages or more. The core does not merge adjacent areas: with fault-around, an area is
     about 6 bytes a page, and merging would be new kernel-mode code for little. None of this is
     on the engine's path, which uses populated granted memory.
+- **2026-11-16: how `kernel/linux` is retired** (integrator, on B2's question): a drop-in `linux`
+  server on the personality, speaking linux-protocol, so its clients (linux-test, KD1, the
+  engine, moruna-micro) do not change.
+  - `run_granted` stays: the engine is a Linux program on the personality that makes native
+    calls on its granted memory, disks, cores and clock page.
+  - A program's native calls pass through the personality's entry, which makes them only on
+    handles granted to the program. Routing them straight to the core was rejected: the
+    program would reach the personality's own handles.
+  - LX-T16's "forward" is measured again as the entry crossing. The engine's batch path still
+    makes no calls.
+  - **Done when, under KVM:** linux-test, KD1 and LX-T16 pass on the new server; C's 15 node
+    cases pass with the engine on the personality; B2-fs's booted checks pass through a real
+    task start; `kernel/linux/{core,server}` are deleted.
