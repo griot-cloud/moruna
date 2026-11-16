@@ -350,26 +350,44 @@ pub fn score(t: &Trips) -> Vec<f64> {
     out
 }
 
-/// `h = maximum(x @ w + b, 0)` for a block of rows, each sum in order over `k`.
+/// Rows and columns of the register tile `layer` accumulates in.
+const TILE_ROWS: usize = 4;
+const TILE_COLS: usize = 8;
+
+/// `h = maximum(x @ w + b, 0)` for a block of rows, each sum in order over `k` from 0, unfused:
+/// the order fixes every bit, whatever width the vectors are. The sums are kept in a tile of
+/// registers across `k`, so each weight is loaded once for four rows.
 fn layer<const K: usize>(x: &[[f64; K]], w: &[f64], b: &[f64; HIDDEN], h: &mut [[f64; HIDDEN]]) {
-    for hr in h.iter_mut() {
-        *hr = [0.0; HIDDEN];
-    }
-    for k in 0..K {
-        let wr: &[f64; HIDDEN] = w[k * HIDDEN..(k + 1) * HIDDEN]
-            .try_into()
-            .unwrap_or(&[0.0; HIDDEN]);
-        for (xr, hr) in x.iter().zip(h.iter_mut()) {
-            let xv = xr[k];
-            for j in 0..HIDDEN {
-                hr[j] += xv * wr[j];
+    let m = x.len().min(h.len());
+    let mut r0 = 0;
+    while r0 < m {
+        // A partial tile reads zero rows and drops their sums.
+        let mut xs = [[0.0f64; K]; TILE_ROWS];
+        let rows = TILE_ROWS.min(m - r0);
+        xs[..rows].copy_from_slice(&x[r0..r0 + rows]);
+        for j0 in (0..HIDDEN).step_by(TILE_COLS) {
+            let mut acc = [[0.0f64; TILE_COLS]; TILE_ROWS];
+            for k in 0..K {
+                let at = k * HIDDEN + j0;
+                let wk: &[f64; TILE_COLS] =
+                    match w.get(at..at + TILE_COLS).and_then(|s| s.try_into().ok()) {
+                        Some(wk) => wk,
+                        None => &[0.0; TILE_COLS],
+                    };
+                for (a, xr) in acc.iter_mut().zip(&xs) {
+                    let xv = xr[k];
+                    for jj in 0..TILE_COLS {
+                        a[jj] += xv * wk[jj];
+                    }
+                }
+            }
+            for (r, a) in acc.iter().enumerate().take(rows) {
+                for jj in 0..TILE_COLS {
+                    h[r0 + r][j0 + jj] = np_maximum(a[jj] + b[j0 + jj], 0.0);
+                }
             }
         }
-    }
-    for hr in h.iter_mut() {
-        for j in 0..HIDDEN {
-            hr[j] = np_maximum(hr[j] + b[j], 0.0);
-        }
+        r0 += rows;
     }
 }
 
