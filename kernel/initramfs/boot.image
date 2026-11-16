@@ -318,34 +318,6 @@ process quota
   exits 0
 link supervisor.quota quota.supervisor
 
-# Stream B1 (data-os-streams.md, kernel-is-the-machine.md 4.1): the personality's four
-# mechanisms in the core, with no personality present. A sleeping thread is interrupted;
-# a snapshot and a clone copy on write; a pager serves one fault and refuses another,
-# which ends b1-victim; a program enters its personality and returns through the entry.
-# The supervisor sends the process resource its children are made with.
-process personality-core
-  handle console console
-  handle program:personality-core self-image
-  expect B1 interrupt: ok:
-  expect B1 snapshot: ok:
-  expect B1 clone: ok:
-  expect B1 clone source: ok:
-  expect kk: process b1-cow exited with code 0 (
-  expect B1 pager: ok:
-  expect kk: process b1-victim faulted: its pager refused the page at
-  expect B1 entry: ok:
-  expect kk: process b1-entry exited with code 0 (
-  expect B1 entry run: ok:
-  expect B1 copy: ok:
-  expect kk: process b1-copy exited with code 0 (
-  expect B1 copy run: ok:
-  expect B1 futex waker: ok:
-  expect kk: process b1-futex exited with code 0 (
-  expect B1 futex: ok:
-  expect B1 personality: ok:
-  exits 0
-link supervisor.personality personality-core.supervisor
-
 # SDD 28: the Linux personality. Every program it runs with run_granted or run_plane is
 # charged to the account its starter carved (SDD 20 f.18); KB5-T1 runs one past its
 # account. A second image filesystem serves the Linux image:
@@ -427,3 +399,31 @@ process fpu-b
   expect NATIVE FPU: ok: seed 610795520 eight live workers preserved SIMD FP control and x87 state;
   exits 0
 link fpu-a.peer fpu-b.peer
+
+# stream B1 (data-os-streams.md, kernel-is-the-machine.md 4.1): the personality's four
+# mechanisms in the core, with no personality present. A sleeping thread is interrupted;
+# a snapshot and a clone copy on write; a pager serves one fault and refuses another,
+# which ends b1-victim; a program enters its personality and returns through the entry.
+# The supervisor sends the process resource its children are made with.
+process personality
+  handle console console
+  handle program:personality self-image
+  expect B1 interrupt: ok:
+  expect B1 snapshot: ok:
+  expect B1 clone: ok:
+  expect B1 clone source: ok:
+  expect kk: process b1-cow exited with code 0 (
+  expect B1 pager: ok:
+  expect kk: process b1-victim faulted: its pager refused the page at
+  expect B1 entry: ok:
+  expect kk: process b1-entry exited with code 0 (
+  expect B1 entry run: ok:
+  expect B1 copy: ok:
+  expect kk: process b1-copy exited with code 0 (
+  expect B1 copy run: ok:
+  expect B1 futex waker: ok:
+  expect kk: process b1-futex exited with code 0 (
+  expect B1 futex: ok:
+  expect B1 personality: ok:
+  exits 0
+link supervisor.personality personality.supervisor

@@ -241,6 +241,7 @@ impl Space {
             copied: AtomicU64::new(0),
             account: account.clone(),
             _fixed: fixed,
+            // stream B1 hook
             program: ProgramTable(SpinLock::new(None)),
         })
     }
@@ -761,6 +762,7 @@ impl Space {
         if matches!(cursor.query(), Ok((_, Some(_)))) {
             return Ok(());
         }
+        // stream B1 hook: a lazy object's shared page is mapped read only.
         let (frame, own) = self.frame(inner, start, area, page, false)?;
         let prot = if own {
             area.prot

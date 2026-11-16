@@ -849,6 +849,7 @@ impl Thread {
             port_reply: SpinLock::new(None),
             cpu_ns: AtomicU64::new(0),
             on_cpu_since: AtomicU64::new(0),
+            // stream B1 hook
             mode: crate::personality::Mode::new(),
         });
         if set_tid != 0 {
@@ -929,6 +930,7 @@ fn run(thread: Arc<Thread>, context: UserContext) {
     FsBase::new(thread.fs() as usize).load();
     let mut user = UserMode::new(context);
     let hooks = Hooks(&thread);
+    // stream B1 hook: the loop ends with the thread, not with an interrupt.
     while !thread.dying() {
         match user.execute(&hooks) {
             ReturnReason::UserSyscall => {

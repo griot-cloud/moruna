@@ -84,6 +84,7 @@ impl MemoryObject {
             dma,
             run: None,
             _charge: charge,
+            // stream B1 hook
             lazy: None,
         })
     }
@@ -117,6 +118,7 @@ impl MemoryObject {
             dma: true,
             run: Some(run),
             _charge: charge,
+            // stream B1 hook
             lazy: None,
         })
     }
@@ -160,6 +162,7 @@ impl MemoryObject {
             let at = offset as usize + done;
             let (page, within) = (at / PAGE, at % PAGE);
             let n = (PAGE - within).min(buf.len() - done);
+            // stream B1 hook: a lazy object's page.
             self.page(page, false)?
                 .read_bytes(within, &mut buf[done..done + n])
                 .map_err(|_| Error::Fault)?;
@@ -181,6 +184,7 @@ impl MemoryObject {
             let at = offset as usize + done;
             let (page, within) = (at / PAGE, at % PAGE);
             let n = (PAGE - within).min(buf.len() - done);
+            // stream B1 hook: a lazy object's page, its own once written.
             self.page(page, true)?
                 .write_bytes(within, &buf[done..done + n])
                 .map_err(|_| Error::Fault)?;
