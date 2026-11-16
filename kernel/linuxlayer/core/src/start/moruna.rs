@@ -43,6 +43,8 @@ pub struct TaskStart {
     pub log: Option<(Memory, u64)>,
     /// The task's name in its log records.
     pub name: String,
+    /// The task's program, as given; the command line's `init=` without one.
+    pub command: Option<super::TaskCommand>,
 }
 
 /// Why a task cannot start.
@@ -59,6 +61,9 @@ pub enum StartError {
 /// Gives the layer the task's filesystems and descriptors from `start`; then the layer's
 /// boot runs the task's program on its image.
 pub fn start_task(start: TaskStart) -> core::result::Result<(), StartError> {
+    if let Some(command) = start.command {
+        super::set_command(command);
+    }
     let client = imagefs::Client::connect(start.filesystem, moruna_svc::deadline_in(HELLO_WAIT_NS))
         .map_err(|_| StartError::Image)?;
     let text: Arc<dyn TextSink> = match start.log {

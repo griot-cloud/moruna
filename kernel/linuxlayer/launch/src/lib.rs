@@ -85,6 +85,71 @@ pub mod slot {
     pub const LOG: &str = "log";
     /// A process resource with `WRITE`: what `fork` clones the task's processes from.
     pub const PROCESSES: &str = "processes";
+    /// The task's command, a memory object in [`command`]'s encoding: the program's path,
+    /// its arguments and its environment, exactly as given.
+    pub const COMMAND: &str = "command";
+}
+
+/// A task's command as the launcher hands it over: each string ends with a zero byte, the
+/// path first, then the arguments (`argv[0]` included), an empty string, then the
+/// environment. Bytes after the environment's end are zero.
+pub mod command {
+    use alloc::vec::Vec;
+
+    /// A program to run: its path, arguments and environment.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Command {
+        pub path: Vec<u8>,
+        pub argv: Vec<Vec<u8>>,
+        pub env: Vec<Vec<u8>>,
+    }
+
+    /// Why a command cannot be encoded: a string holds a zero byte, or an argument is
+    /// empty (which would end the arguments).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct BadCommand;
+
+    /// The command's encoding.
+    pub fn encode(command: &Command) -> Result<Vec<u8>, BadCommand> {
+        let mut out = Vec::new();
+        let mut put = |s: &[u8], may_be_empty: bool| {
+            if s.contains(&0) || (s.is_empty() && !may_be_empty) {
+                return Err(BadCommand);
+            }
+            out.extend_from_slice(s);
+            out.push(0);
+            Ok(())
+        };
+        put(&command.path, false)?;
+        for arg in &command.argv {
+            put(arg, false)?;
+        }
+        put(b"", true)?;
+        for var in &command.env {
+            put(var, false)?;
+        }
+        put(b"", true)?;
+        Ok(out)
+    }
+
+    /// The command `bytes` encode; `None` for bytes that are not an encoding.
+    pub fn decode(bytes: &[u8]) -> Option<Command> {
+        let mut strings = bytes.split(|&b| b == 0);
+        let path = strings.next().filter(|p| !p.is_empty())?.to_vec();
+        let take = |strings: &mut core::slice::Split<'_, u8, _>| {
+            let mut list = Vec::new();
+            loop {
+                match strings.next() {
+                    None => return None,
+                    Some([]) => return Some(list),
+                    Some(s) => list.push(s.to_vec()),
+                }
+            }
+        };
+        let argv = take(&mut strings)?;
+        let env = take(&mut strings)?;
+        Some(Command { path, argv, env })
+    }
 }
 
 /// Why an image cannot be launched.

@@ -83,3 +83,50 @@ fn refuses_what_it_cannot_launch() {
     let bytes = elf([end, end + 8, end], end, end);
     assert_eq!(Plan::new(&bytes), Err(PlanError::TooLarge));
 }
+
+#[test]
+fn a_command_round_trips() {
+    use crate::command::{BadCommand, Command, decode, encode};
+    let command = Command {
+        path: b"/kc1/bin/hello".to_vec(),
+        argv: vec![b"hello".to_vec(), b"a b \"c\"".to_vec()],
+        env: vec![b"PATH=/bin".to_vec(), b"X=1=2".to_vec()],
+    };
+    let mut bytes = encode(&command).unwrap();
+    assert_eq!(decode(&bytes), Some(command.clone()));
+    // A memory object's trailing zeros change nothing.
+    bytes.extend_from_slice(&[0; 64]);
+    assert_eq!(decode(&bytes), Some(command.clone()));
+    let bare = Command {
+        path: b"/init".to_vec(),
+        ..Command::default()
+    };
+    assert_eq!(decode(&encode(&bare).unwrap()), Some(bare));
+    assert_eq!(
+        encode(&Command {
+            path: b"/a\0b".to_vec(),
+            ..Command::default()
+        }),
+        Err(BadCommand)
+    );
+    assert_eq!(
+        encode(&Command {
+            path: b"/a".to_vec(),
+            argv: vec![Vec::new()],
+            env: Vec::new()
+        }),
+        Err(BadCommand)
+    );
+    assert_eq!(decode(b""), None);
+    assert_eq!(decode(b"\0"), None);
+    assert_eq!(decode(b"/a\0x\0"), None);
+    // Zero padding ends both lists.
+    assert_eq!(
+        decode(b"/a\0x\0\0"),
+        Some(Command {
+            path: b"/a".to_vec(),
+            argv: vec![b"x".to_vec()],
+            env: Vec::new()
+        })
+    );
+}

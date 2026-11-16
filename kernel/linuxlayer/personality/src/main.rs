@@ -79,6 +79,14 @@ mod image {
                     (log, len)
                 }),
                 name: String::from(start::process_name()),
+                command: start::take(slot::COMMAND).and_then(|c| {
+                    let c = linuxlayer_launch::command::decode(mapped(Memory(c)))?;
+                    Some(moruna_linuxlayer::start::TaskCommand {
+                        path: c.path,
+                        argv: c.argv,
+                        env: c.env,
+                    })
+                }),
             };
             if let Err(e) = start_task(task) {
                 ostd::early_println!("linux: FAIL: the task cannot start: {:?}", e);

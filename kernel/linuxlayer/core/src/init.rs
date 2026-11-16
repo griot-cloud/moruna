@@ -12,7 +12,7 @@ use spin::once::Once;
 use crate::{
     fs::{
         initramfs, rootfs,
-        vfs::path::{MountNamespace, Path, PathResolver},
+        vfs::path::{FsPath, MountNamespace, Path, PathResolver},
     },
     prelude::*,
     process::{Process, spawn_init_process},
@@ -131,9 +131,17 @@ fn first_kthread() {
     print_banner();
 
     INIT_PROCESS.call_once(|| {
-        let karg = INIT_PROC_ARGS.get().unwrap();
-        let argv = karg.argv().to_vec();
-        let envp = karg.envp().to_vec();
+        let (argv, envp) = match crate::start::command() {
+            // A task's command, exactly as its launcher gave it.
+            Some(command) => (
+                c_strings(&command.argv).unwrap_or_else(|e| no_program(e)),
+                c_strings(&command.env).unwrap_or_else(|e| no_program(e)),
+            ),
+            None => {
+                let karg = INIT_PROC_ARGS.get().unwrap();
+                (karg.argv().to_vec(), karg.envp().to_vec())
+            }
+        };
         boot_init
             .spawn(argv, envp)
             .unwrap_or_else(|e| no_program(e))
@@ -163,12 +171,13 @@ impl BootInit {
         } = self;
 
         println!("[kernel] running {} as the init process", init_name);
-        spawn_init_process(
-            path_resolver,
-            init_path,
-            with_init_argv0(init_name, argv),
-            envp,
-        )
+        // A task's command carries its own `argv[0]`.
+        let argv = if crate::start::command().is_some() {
+            argv
+        } else {
+            with_init_argv0(init_name, argv)
+        };
+        spawn_init_process(path_resolver, init_path, argv, envp)
     }
 }
 
@@ -180,9 +189,15 @@ fn prepare_boot_init(mut path_resolver: PathResolver) -> Result<BootInit> {
     if rootfs::task_fs().is_some() {
         rootfs::switch_to_rootfs(&mut path_resolver)?;
         BOOT_SOURCE.store(BootSource::Rootfs as u8, Ordering::Relaxed);
-        let init_path = rootfs::find_init(&path_resolver)?.ok_or_else(|| {
-            Error::with_message(Errno::ENOENT, "the task's command names no program")
-        })?;
+        let init_path = match crate::start::command() {
+            Some(command) => {
+                let name: &'static str = String::from_utf8_lossy(&command.path).into_owned().leak();
+                (path_resolver.lookup(&FsPath::try_from(name)?)?, name)
+            }
+            None => rootfs::find_init(&path_resolver)?.ok_or_else(|| {
+                Error::with_message(Errno::ENOENT, "the task's command names no program")
+            })?,
+        };
         return Ok(BootInit {
             path_resolver,
             init_path,
@@ -193,6 +208,17 @@ fn prepare_boot_init(mut path_resolver: PathResolver) -> Result<BootInit> {
         path_resolver,
         init_path,
     })
+}
+
+/// `strings` as C strings: none may hold a zero byte.
+fn c_strings(strings: &[Vec<u8>]) -> Result<Vec<CString>> {
+    strings
+        .iter()
+        .map(|s| {
+            CString::new(s.clone())
+                .map_err(|_| Error::with_message(Errno::EINVAL, "a zero byte in the command"))
+        })
+        .collect()
 }
 
 /// Ends the personality when its first program cannot run.

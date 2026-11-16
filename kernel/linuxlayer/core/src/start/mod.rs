@@ -30,3 +30,25 @@ mod text;
 
 #[cfg(target_os = "none")]
 pub use self::moruna::{StartError, TaskStart, start_task};
+use crate::prelude::*;
+
+/// A task's program: its path on the image, its arguments (`argv[0]` included) and its
+/// environment, exactly as its launcher gave them (`linuxlayer_launch::command`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskCommand {
+    pub path: Vec<u8>,
+    pub argv: Vec<Vec<u8>>,
+    pub env: Vec<Vec<u8>>,
+}
+
+static COMMAND: spin::Once<TaskCommand> = spin::Once::new();
+
+/// The task's command, if its launcher gave one.
+pub(crate) fn command() -> Option<&'static TaskCommand> {
+    COMMAND.get()
+}
+
+/// Records the task's command, once.
+pub(crate) fn set_command(command: TaskCommand) {
+    COMMAND.call_once(|| command);
+}
