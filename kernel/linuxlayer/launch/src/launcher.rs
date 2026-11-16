@@ -33,7 +33,23 @@ pub fn launch(
     image: &[u8],
     grants: &mut [(Option<Handle>, &str)],
 ) -> core::result::Result<Process, LaunchError> {
-    launch_task(resource, name, image, grants, None)
+    launch_with(resource, name, image, grants, Options::default()).map(|(p, _)| p)
+}
+
+/// What runs with a task's process made, just before it starts.
+pub type BeforeStart<'a> = &'a mut dyn FnMut(&Process) -> Result<()>;
+
+/// How a task's process is made, beyond its personality and handles.
+#[derive(Default)]
+pub struct Options<'a> {
+    /// The account the process is charged to (`process_create`'s), the caller's own when
+    /// `None`.
+    pub account: Option<&'a Handle>,
+    /// The task's data plane.
+    pub plane: Option<Plane<'a>>,
+    /// Called with the process made and given everything, just before it starts: a
+    /// refusal stops the launch.
+    pub before_start: Option<BeforeStart<'a>>,
 }
 
 /// A task's data plane: its slots, numbered in order (input first), and its port.
@@ -52,8 +68,34 @@ pub fn launch_task(
     grants: &mut [(Option<Handle>, &str)],
     plane: Option<Plane<'_>>,
 ) -> core::result::Result<Process, LaunchError> {
+    let options = Options {
+        plane,
+        ..Options::default()
+    };
+    launch_with(resource, name, image, grants, options).map(|(p, _)| p)
+}
+
+/// As [`launch`], with `options`; the process and its first thread's id.
+pub fn launch_with(
+    resource: &Handle,
+    name: &str,
+    image: &[u8],
+    grants: &mut [(Option<Handle>, &str)],
+    options: Options<'_>,
+) -> core::result::Result<(Process, u64), LaunchError> {
+    let Options {
+        account,
+        plane,
+        before_start,
+    } = options;
     let plan = Plan::new(image).map_err(LaunchError::Plan)?;
-    let process = call(Process::create(resource, name), "process_create")?;
+    let process = match account {
+        Some(account) => call(
+            Process::create_in(resource, name, account),
+            "process_create",
+        )?,
+        None => call(Process::create(resource, name), "process_create")?,
+    };
     if let Some(p) = plane {
         call(
             plane::attach(&process, p.slots, p.port).map_err(|(e, _)| e),
@@ -117,11 +159,14 @@ pub fn launch_task(
         ),
         "personality_set",
     )?;
-    call(
+    if let Some(before_start) = before_start {
+        call(before_start(&process), "before the start")?;
+    }
+    let thread = call(
         process.launch(plan.entry, plan.stack_pointer(), 0),
         "process_launch",
     )?;
-    Ok(process)
+    Ok((process, thread))
 }
 
 /// The length of `object` in bytes, whole pages: the longest mapping from its start the core

@@ -88,6 +88,77 @@ pub mod slot {
     /// The task's command, a memory object in [`command`]'s encoding: the program's path,
     /// its arguments and its environment, exactly as given.
     pub const COMMAND: &str = "command";
+    /// A memory object of [`report::LEN`] bytes, writable, where the personality says how
+    /// the task ended ([`report`]).
+    pub const REPORT: &str = "report";
+}
+
+/// How a task ended, as the personality writes it for its launcher when its first program
+/// ends: linux-protocol's `Ended` fields the launcher cannot see itself. Little endian:
+/// `0` the magic (written last), `4` how, `8` the code, `16` the calls served, `24` the
+/// number of refused calls listed, then from `32` each refused call's number and count.
+pub mod report {
+    use alloc::vec::Vec;
+
+    /// The report's object's length.
+    pub const LEN: usize = 4096;
+    /// "MLR1": a whole report.
+    pub const MAGIC: u32 = u32::from_le_bytes(*b"MLR1");
+    /// The program exited: the code is its exit status.
+    pub const EXITED: u8 = 1;
+    /// A signal ended it: the code is the signal.
+    pub const SIGNALED: u8 = 2;
+    /// The program could not start: the code is the Linux error.
+    pub const NOT_STARTED: u8 = 0x10;
+    /// The most refused calls listed.
+    pub const REFUSED_MAX: usize = (LEN - 32) / 16;
+
+    /// What the personality reports.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Report {
+        pub how: u8,
+        pub code: i64,
+        pub served: u64,
+        /// Each refused call's number and count, at most [`REFUSED_MAX`].
+        pub refused: Vec<(u64, u64)>,
+    }
+
+    /// The report's bytes, [`LEN`] of them; refused calls past [`REFUSED_MAX`] left out.
+    pub fn encode(report: &Report) -> Vec<u8> {
+        let mut out = alloc::vec![0u8; LEN];
+        out[4] = report.how;
+        out[8..16].copy_from_slice(&report.code.to_le_bytes());
+        out[16..24].copy_from_slice(&report.served.to_le_bytes());
+        let listed = &report.refused[..report.refused.len().min(REFUSED_MAX)];
+        out[24..28].copy_from_slice(&(listed.len() as u32).to_le_bytes());
+        for (i, (number, count)) in listed.iter().enumerate() {
+            let at = 32 + 16 * i;
+            out[at..at + 8].copy_from_slice(&number.to_le_bytes());
+            out[at + 8..at + 16].copy_from_slice(&count.to_le_bytes());
+        }
+        out[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        out
+    }
+
+    /// The report in `bytes`; `None` when the personality wrote none.
+    pub fn decode(bytes: &[u8]) -> Option<Report> {
+        let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        if bytes.len() < 32 || bytes[0..4] != MAGIC.to_le_bytes() {
+            return None;
+        }
+        let listed = u32::from_le_bytes(bytes[24..28].try_into().unwrap()) as usize;
+        if listed > REFUSED_MAX || bytes.len() < 32 + 16 * listed {
+            return None;
+        }
+        Some(Report {
+            how: bytes[4],
+            code: u64_at(8) as i64,
+            served: u64_at(16),
+            refused: (0..listed)
+                .map(|i| (u64_at(32 + 16 * i), u64_at(40 + 16 * i)))
+                .collect(),
+        })
+    }
 }
 
 /// A task's command as the launcher hands it over: each string ends with a zero byte, the

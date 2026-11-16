@@ -52,3 +52,37 @@ pub(crate) fn command() -> Option<&'static TaskCommand> {
 pub(crate) fn set_command(command: TaskCommand) {
     COMMAND.call_once(|| command);
 }
+
+/// How the task's first program ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ending {
+    /// It ran, and ended with this `wait(2)` status.
+    Ran(u32),
+    /// It could not start, for this reason.
+    NotStarted(Errno),
+}
+
+/// What the task's report says (`linuxlayer_launch::report`): how it ended, the calls its
+/// programs made and those refused.
+pub(crate) fn report(ending: Ending) -> linuxlayer_launch::report::Report {
+    use linuxlayer_launch::report::{EXITED, NOT_STARTED, Report, SIGNALED};
+    let (how, code) = match ending {
+        Ending::Ran(status) if status & 0x7f == 0 => (EXITED, i64::from((status >> 8) & 0xff)),
+        Ending::Ran(status) => (SIGNALED, i64::from(status & 0x7f)),
+        Ending::NotStarted(errno) => (NOT_STARTED, errno as i64),
+    };
+    Report {
+        how,
+        code,
+        served: crate::syscall::refused::calls(),
+        refused: crate::syscall::refused::task(),
+    }
+}
+
+/// Writes the task's report for its launcher, if it gave a place for one.
+pub(crate) fn finish(ending: Ending) {
+    #[cfg(target_os = "none")]
+    moruna::write_report(&report(ending));
+    #[cfg(not(target_os = "none"))]
+    let _ = ending;
+}

@@ -66,6 +66,7 @@ x86_64.workspace = true
 # too; the image filesystem's client and the core's calls on the target only.
 moruna-ipc-check.workspace = true
 moruna-record.workspace = true
+linuxlayer-launch.workspace = true
 
 [target.'cfg(target_os = "none")'.dependencies]
 imagefs-protocol.workspace = true

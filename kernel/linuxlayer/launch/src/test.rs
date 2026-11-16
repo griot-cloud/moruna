@@ -130,3 +130,28 @@ fn a_command_round_trips() {
         })
     );
 }
+
+#[test]
+fn a_report_round_trips_and_a_missing_one_reads_as_none() {
+    use crate::report::{EXITED, LEN, REFUSED_MAX, Report, SIGNALED, decode, encode};
+    let report = Report {
+        how: SIGNALED,
+        code: -9,
+        served: 1234,
+        refused: vec![(41, 2), (334, 1)],
+    };
+    let bytes = encode(&report);
+    assert_eq!(bytes.len(), LEN);
+    assert_eq!(decode(&bytes), Some(report.clone()));
+    assert_eq!(decode(&[0u8; LEN]), None);
+    assert_eq!(decode(&bytes[..16]), None);
+    let many = Report {
+        how: EXITED,
+        refused: (0..REFUSED_MAX as u64 + 5).map(|n| (n, 1)).collect(),
+        ..Report::default()
+    };
+    assert_eq!(decode(&encode(&many)).unwrap().refused.len(), REFUSED_MAX);
+    let mut lying = encode(&report);
+    lying[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(decode(&lying), None);
+}

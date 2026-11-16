@@ -695,6 +695,7 @@ dependencies = [
  "jhash",
  "keyable-arc",
  "lending-iterator",
+ "linuxlayer-launch",
  "linuxlayer-osdk-frame-allocator",
  "linuxlayer-osdk-heap-allocator",
  "linuxlayer-ostd",

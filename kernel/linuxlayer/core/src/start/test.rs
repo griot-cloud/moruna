@@ -286,3 +286,20 @@ fn text_lines_become_records_in_the_ring() {
     ring.with(|bytes| bytes.fill(0)).unwrap();
     assert!(!text.line(1, b"lost"));
 }
+
+#[ktest]
+fn a_report_says_how_the_program_ended() {
+    use linuxlayer_launch::report::{EXITED, NOT_STARTED, SIGNALED};
+
+    use super::{Ending, report};
+    let exited = report(Ending::Ran(3 << 8));
+    assert_eq!((exited.how, exited.code), (EXITED, 3));
+    let killed = report(Ending::Ran(9));
+    assert_eq!((killed.how, killed.code), (SIGNALED, 9));
+    let missing = report(Ending::NotStarted(Errno::ENOENT));
+    assert_eq!(
+        (missing.how, missing.code),
+        (NOT_STARTED, Errno::ENOENT as i64)
+    );
+    assert_eq!(missing.served, crate::syscall::refused::calls());
+}

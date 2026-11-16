@@ -113,9 +113,18 @@ pub(crate) fn count(pid: Pid, number: u64) {
     *counts.task.entry(number).or_insert(0) += 1;
 }
 
+/// Every call the task's programs made.
+static CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many calls the task's programs made (linux-protocol's `Ended::served`).
+pub(crate) fn calls() -> u64 {
+    CALLS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// What happens to call `number` before its handler runs: an administrative call is counted
 /// and refused with `EPERM`; a socket call is counted and served by `no_socket.rs`.
 pub(crate) fn screen(pid: Pid, number: u64) -> Result<()> {
+    CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if ADMINISTRATIVE.iter().any(|(n, _)| *n == number) {
         count(pid, number);
         return_errno_with_message!(

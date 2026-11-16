@@ -107,6 +107,7 @@ fn bsp_idle_loop() {
     // User space: the personality's work ends with its init process.
     crate::syscall::refused::report_task();
     let code = init_process.status().exit_code();
+    crate::start::finish(crate::start::Ending::Ran(code));
     ostd::info!("The init process terminates with code {:?}", code);
     ostd::power::poweroff(if code == 0 {
         ostd::power::ExitCode::Success
@@ -224,6 +225,7 @@ fn c_strings(strings: &[Vec<u8>]) -> Result<Vec<CString>> {
 /// Ends the personality when its first program cannot run.
 fn no_program(error: Error) -> ! {
     ostd::early_println!("linux: FAIL: the task's program cannot run: {:?}", error);
+    crate::start::finish(crate::start::Ending::NotStarted(error.error()));
     crate::syscall::refused::report_task();
     ostd::power::poweroff(ostd::power::ExitCode::Failure)
 }

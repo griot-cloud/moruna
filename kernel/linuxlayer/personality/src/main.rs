@@ -79,6 +79,7 @@ mod image {
                     (log, len)
                 }),
                 name: String::from(start::process_name()),
+                report: start::take(slot::REPORT).map(Memory),
                 command: start::take(slot::COMMAND).and_then(|c| {
                     let c = linuxlayer_launch::command::decode(mapped(Memory(c)))?;
                     Some(moruna_linuxlayer::start::TaskCommand {

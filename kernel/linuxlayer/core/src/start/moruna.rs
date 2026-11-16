@@ -45,6 +45,18 @@ pub struct TaskStart {
     pub name: String,
     /// The task's program, as given; the command line's `init=` without one.
     pub command: Option<super::TaskCommand>,
+    /// Where to write how the task ended (`linuxlayer_launch::report`), if anywhere.
+    pub report: Option<Memory>,
+}
+
+/// The report's mapping, kept until the task ends.
+static REPORT: SpinLock<Option<Mapping<'static>>> = SpinLock::new(None);
+
+/// Writes `report` where the launcher reads it.
+pub(super) fn write_report(report: &linuxlayer_launch::report::Report) {
+    if let Some(mapping) = REPORT.lock().as_ref() {
+        let _ = mapping.write(0, &linuxlayer_launch::report::encode(report));
+    }
 }
 
 /// Why a task cannot start.
@@ -63,6 +75,13 @@ pub enum StartError {
 pub fn start_task(start: TaskStart) -> core::result::Result<(), StartError> {
     if let Some(command) = start.command {
         super::set_command(command);
+    }
+    if let Some(memory) = start.report {
+        let memory: &'static Memory = Box::leak(Box::new(memory));
+        let len = linuxlayer_launch::report::LEN as u64;
+        if let Ok(mapping) = memory.map_detached(0, len, map::READ | map::WRITE) {
+            *REPORT.lock() = Some(mapping);
+        }
     }
     let client = imagefs::Client::connect(start.filesystem, moruna_svc::deadline_in(HELLO_WAIT_NS))
         .map_err(|_| StartError::Image)?;
