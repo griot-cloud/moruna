@@ -47,6 +47,13 @@ first, and iterates until Moruna is significantly better than the other engines.
   - `cargo llvm-cov` for root crates;
   - the host tests CI's kernel job runs for kernel crates;
   - booted tests in the kernel's boot image for mechanisms only a running kernel can show.
+- **Code carried from Asterinas is judged by test suites, not line coverage** (Brackly,
+  2026-11-16: "Yes, test suites").
+  - Moruna's own code keeps the 80% per-crate floor.
+  - The files carried from Asterinas's Linux layer are judged by Asterinas's own tests and the
+    gVisor system-call suite: report which pass and which fail.
+  - Code we write or rewrite around the carried code is Moruna's own, so it gets the 80% floor.
+    That covers the user-space OSTD, the glue and the rewritten files.
 - **The Mac's disk.**
   - Set `CARGO_INCREMENTAL=0` and a `CARGO_TARGET_DIR` of your own.
   - Delete it when your stream is done.
