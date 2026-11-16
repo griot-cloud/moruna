@@ -18,15 +18,18 @@ fn cmdline_stops_at_zero_and_trims() {
 }
 
 #[test]
-fn boot_info_gives_the_budget() {
+fn boot_info_gives_the_memory() {
     static RAMFS: [u8; 4] = *b"0707";
-    let info = boot_info(String::from("init=/x"), Some(&RAMFS));
+    let info = boot_info(String::from("init=/x"), Some(&RAMFS), MEMORY_BUDGET);
     assert_eq!(info.bootloader_name, "moruna");
     assert_eq!(info.kernel_cmdline, "init=/x");
     assert_eq!(info.initramfs, Some(&RAMFS[..]));
     assert_eq!(info.memory_regions.len(), 1);
     assert_eq!(info.memory_regions[0].len(), MEMORY_BUDGET);
     assert_eq!(info.wall_clock_at_start, Duration::ZERO);
+    let info = boot_info(String::new(), None, memory_of(Some(16 << 20)));
+    assert_eq!(info.memory_regions[0].len(), 16 << 20);
+    assert_eq!(memory_of(None), MEMORY_BUDGET);
 }
 
 static SENT: SpinLock<Vec<u8>> = SpinLock::new(Vec::new());
@@ -57,7 +60,7 @@ fn console_sends_and_hands_input_on() {
 #[test]
 fn start_boots_in_a_task_with_the_console_registered() {
     let mut ran = false;
-    start(boot_info(String::new(), None), || {
+    start(boot_info(String::new(), None, MEMORY_BUDGET), || {
         assert!(Task::current().is_some());
         assert_eq!(ostd::boot::boot_info().bootloader_name, "moruna");
         component::init_all(InitStage::Bootstrap, component::parse_metadata!()).unwrap();

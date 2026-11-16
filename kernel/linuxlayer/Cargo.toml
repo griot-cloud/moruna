@@ -21,6 +21,7 @@ members = [
     "ostd/macros",
     "personality",
     "server",
+    "check",
     "libs/aster-rights",
     "libs/aster-rights-proc",
     "libs/aster-util",

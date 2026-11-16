@@ -15,7 +15,7 @@ mod image {
 
     use linuxlayer_launch::{launcher::object_len, slot};
     use moruna_linuxlayer::start::{TaskStart, start_task};
-    use moruna_sys::{Account, Channel, Memory, start};
+    use moruna_sys::{Account, Channel, Memory, Usage, start};
 
     /// The scratch's limit when the launcher grants no scratch account.
     const SCRATCH_DEFAULT: usize = 64 << 20;
@@ -94,7 +94,9 @@ mod image {
                 moruna_sys::exit(1);
             }
         }
-        let info = linuxlayer_personality::boot_info(cmdline, initramfs);
+        let limit = Usage::own().ok().map(|usage| usage.limit);
+        let memory = linuxlayer_personality::memory_of(limit);
+        let info = linuxlayer_personality::boot_info(cmdline, initramfs, memory);
         linuxlayer_personality::start(info, moruna_linuxlayer::boot);
         // The layer runs on the threads its boot started; the idle thread ends the process
         // when the init process ends.

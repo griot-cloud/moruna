@@ -531,6 +531,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "linuxlayer-check"
+version = "0.19.0"
+dependencies = [
+ "linux-protocol",
+ "moruna-svc",
+]
+
+[[package]]
 name = "linuxlayer-component-macro"
 version = "0.19.0"
 dependencies = [

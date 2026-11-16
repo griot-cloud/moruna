@@ -357,6 +357,17 @@ process linux-test
   exits 0
 link linux-test.server linux.listen-test
 
+# stream B2: B2-fs's checks through a real task start on the `linux` server, each program
+# on a Linux personality of its own (kernel/linuxlayer/check): a static musl program run
+# with an account and a scratch account reads the image's root, /proc and /sys, fills
+# /tmp to its quota, has a POSIX thread add to the epoll its main thread waits on, and
+# writes to its descriptor 2.
+process linuxlayer-check
+  handle console console
+  expect B2 task: ok:
+  exits 0
+link linuxlayer-check.server linux.listen-b2
+
 # SDD 29: the data plane. An engine on moruna-plane runs DP-T10 to DP-T17 as tasks, each a
 # process with no handle and a plane of slots and a port: a 64 MiB batch moved in its
 # frames with no copy, a fan-out of one batch to three tasks, the check's refusals before
