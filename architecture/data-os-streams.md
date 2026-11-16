@@ -10,6 +10,14 @@ first, and iterates until Moruna is significantly better than the other engines.
 
 ## Rules for every stream
 
+- **Talos's security posture binds every stream** (`data-os.md` §3a; Brackly, 2026-11-16).
+  - No shell in anything Moruna ships or runs, and none in booted tests: no `sh` in any done
+    criterion.
+  - Tasks start by exec, never `sh -c`.
+  - No console login, no SSH, no terminals or `devpts`.
+  - The root is read-only.
+  - The carried Linux layer refuses administrative calls.
+
 - **Branch and merge.**
   - Work in your own worktree, on a branch `data-os/<stream>`, cut from `feature/arrow-core-0.7`
     when the stream starts (at or after `fa0a02bf`, which added the contracts).
