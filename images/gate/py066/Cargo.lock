@@ -590,6 +590,7 @@ version = "0.7.0"
 dependencies = [
  "arrow",
  "libm",
+ "matrixmultiply",
  "sha2",
  "unicode-normalization",
 ]

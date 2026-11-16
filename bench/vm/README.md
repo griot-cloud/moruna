@@ -31,7 +31,8 @@ The gate runs each job's function ported to Rust (`images/gate`) and compares ev
 output by its canonical form, not by `checksum`'s column sums:
 
 - `rust-baseline` and `moruna-vm` run without Python. `rust-baseline` is `gate-baseline` from
-  `images/gate` (`cargo build --release` there, then `GATE_BIN`); `moruna-vm` is 0.7's
+  `images/gate` (`cargo build --release` there, then `GATE_BIN`), built with the gate's one CPU
+  setting (`images/gate/.cargo/config.toml`, AVX2 and FMA) as the tasks and `py066` are; `moruna-vm` is 0.7's
   `moruna run` (stream D, `MORUNA07_BIN`) on the job `gate_jobs.py` writes.
 - `moruna066-rust` is 0.6.6 running the Rust port through the `moruna_gate` extension
   (`images/gate/py066`, installed with `/data/venv-t/bin/pip install images/gate/py066`);
