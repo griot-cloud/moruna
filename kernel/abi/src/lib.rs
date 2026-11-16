@@ -191,7 +191,9 @@ pub mod nr {
     pub const PERSONALITY_RETURN: u64 = BASE + 57;
     /// A copy-on-write snapshot of a memory object (§4.1 b).
     pub const MEMORY_SNAPSHOT: u64 = BASE + 58;
-    /// A copy-on-write clone of a process's address space, for `fork` (§4.1 b).
+    /// A copy-on-write clone of a process's address space, for `fork` (§4.1 b):
+    /// `(resource, process, account, flags)`, the process the caller's own when zero, and
+    /// `flags` from [`crate::process`].
     pub const PROCESS_CLONE: u64 = BASE + 59;
     /// A memory object whose pages a pager supplies (§4.1 c).
     pub const PAGER_CREATE: u64 = BASE + 60;
@@ -744,6 +746,16 @@ pub mod clock_page {
     pub const SHIFT: usize = 32;
     /// The page's length.
     pub const LEN: usize = 4096;
+}
+
+/// `process_clone`'s flags (ABI 2.6, stream B1).
+pub mod process {
+    /// The clone uses the cloned process's own handle table, as Linux's `CLONE_FILES`
+    /// does: a handle made, moved or closed in one is so in every process sharing it. Only
+    /// a caller with a personality that holds that same table may ask (`AccessDenied`).
+    pub const SHARE_HANDLES: u64 = 1 << 0;
+    /// Every flag `process_clone` takes; any other bit is `InvalidArgs`.
+    pub const ALL: u64 = SHARE_HANDLES;
 }
 
 /// `windows_protect`'s entries (ABI 2.6, stream A).

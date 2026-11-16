@@ -437,7 +437,9 @@ pub(crate) fn memory_snapshot(p: &Process, a: [u64; 6]) -> Answer {
     insert(p, Object::Memory(Arc::new(snapshot)))
 }
 
-/// `process_clone(resource, process, account) -> process`.
+/// `process_clone(resource, process, account, flags) -> process`: `process` the caller's own
+/// when zero. With `process::SHARE_HANDLES` the clone shares the cloned process's table,
+/// which only a caller with a personality that holds that same table may ask for.
 pub(crate) fn process_clone(p: &Process, a: [u64; 6]) -> Answer {
     typed(p, a[0], Rights::WRITE, |o| match o {
         Object::Resource(r) => Some(r.kind == ResourceKind::Process),
@@ -445,9 +447,27 @@ pub(crate) fn process_clone(p: &Process, a: [u64; 6]) -> Answer {
     })?
     .then_some(())
     .ok_or(Error::AccessDenied)?;
-    let source = typed(p, a[1], Rights::READ | Rights::WRITE, process)?;
+    let held;
+    let source: &Process = if a[1] == 0 {
+        p
+    } else {
+        held = typed(p, a[1], Rights::READ | Rights::WRITE, process)?;
+        &held
+    };
     let account = account(p, a[2])?;
-    let child = Process::new(source.name.as_bytes(), false, &account)?;
+    if a[3] & !moruna_abi::process::ALL != 0 {
+        return Err(Error::InvalidArgs);
+    }
+    let table = if a[3] & moruna_abi::process::SHARE_HANDLES != 0 {
+        // The engine has no personality, so its table is never shared.
+        if p.space.program().is_none() || !Arc::ptr_eq(&p.handles, &source.handles) {
+            return Err(Error::AccessDenied);
+        }
+        Some(source.handles.clone())
+    } else {
+        None
+    };
+    let child = Process::new_in(source.name.as_bytes(), false, &account, table)?;
     source.space.clone_into(&child.space)?;
     insert(p, Object::Process(child))
 }
