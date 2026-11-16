@@ -545,3 +545,20 @@ and switches to the new one when the call answers.
   for core-placed mappings. B1 builds it after its current slot (ABI 2.6, unreleased: one new
   call, and a new `personality_set` argument). B2 uses it for `run_granted`. It is not on the
   gate's path: the engine runs on today's server until B2 lands.
+- **2026-11-16: B1's shared handles merged** (`905258d0`, from `b4116620`). CI's boot passed 203
+  of 203 checks under KVM on 1, 2 and 4 CPUs.
+  - `process_clone` shares the cloned process's handle table on request (`SHARE_HANDLES`),
+    under the §4 guards. A task of processes holding each other's handles is killed whole.
+  - **A second kernel panic reachable from user space, fixed** (`fdece684`, a marked B1 hook
+    in `boot.rs`, approved). The kernel had never installed OSTD's handler for a kernel copy
+    that faults on a user page. Any call given a bad pointer panicked the kernel, as did a
+    copy onto a page shared copy-on-write since a clone. Such a copy now answers `Fault`, or
+    readies the page and copies again. It had been there since KB1.
+  - B1 audited every range and every sum on user values in `vm.rs` and `memory.rs`. The first
+    panic's clamp (`9e8ab3e1`) covers every path through `unmap_ptes` (unmap, protect, discard,
+    copy-on-write faults, kernel copies, `windows_protect`, clones). Nothing else can run
+    backwards or overflow.
+  - Kernel mode: net +85 code lines.
+  - **Open:** ping-pong on 1 and 2 CPUs read 7.69 s and 6.74 s against 6.15 s and 5.30 s
+    before, with the boot now carrying A's, P's and E's tests on the same CPUs. B1 measures it
+    alone in its next slot before and after `SHARE_HANDLES`, to rule a regression out.
