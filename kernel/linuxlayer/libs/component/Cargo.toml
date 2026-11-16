@@ -7,5 +7,5 @@ license.workspace = true
 publish = false
 
 [dependencies]
-component-macro = { path = "macros", package = "linuxlayer-component-macro" }
+component-macro = { path = "macros", version = "=0.19.0", package = "linuxlayer-component-macro" }
 inventory.workspace = true

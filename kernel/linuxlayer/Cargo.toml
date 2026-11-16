@@ -47,9 +47,9 @@ edition = "2024"
 [workspace.dependencies]
 # OSTD's API for user space: its locks and wait queues on the core's futex, user memory
 # through a fault-tolerant copy (ostd/README.md).
-ostd = { path = "ostd", package = "linuxlayer-ostd" }
-ostd-macros = { path = "ostd/macros", package = "linuxlayer-ostd-macros" }
-osdk-heap-allocator = { path = "libs/osdk-heap-allocator", package = "linuxlayer-osdk-heap-allocator" }
+ostd = { path = "ostd", version = "=0.19.0", package = "linuxlayer-ostd" }
+ostd-macros = { path = "ostd/macros", version = "=0.19.0", package = "linuxlayer-ostd-macros" }
+osdk-heap-allocator = { path = "libs/osdk-heap-allocator", version = "=0.19.0", package = "linuxlayer-osdk-heap-allocator" }
 moruna-sys = { path = "../sys", version = "=0.1.0", features = ["heap"] }
 moruna-abi = { path = "../abi", version = "=0.1.0" }
 
@@ -60,32 +60,32 @@ int-to-c-enum = "=0.1.0"
 ostd-pod = "=0.4.0"
 padding-struct = "=0.2.0"
 
-aster-block = { path = "comps/block" }
-dma-pool = { path = "libs/dma-pool" }
-aster-cmdline = { path = "comps/cmdline" }
-aster-console = { path = "comps/console" }
-aster-device = { path = "comps/device" }
-aster-logger = { path = "comps/logger" }
-aster-softirq = { path = "comps/softirq" }
-aster-systree = { path = "comps/systree" }
-aster-time = { path = "comps/time" }
+aster-block = { path = "comps/block", version = "=0.1.0" }
+dma-pool = { path = "libs/dma-pool", version = "=0.1.0" }
+aster-cmdline = { path = "comps/cmdline", version = "=0.1.0" }
+aster-console = { path = "comps/console", version = "=0.1.0" }
+aster-device = { path = "comps/device", version = "=0.1.0" }
+aster-logger = { path = "comps/logger", version = "=0.1.0" }
+aster-softirq = { path = "comps/softirq", version = "=0.1.0" }
+aster-systree = { path = "comps/systree", version = "=0.1.0" }
+aster-time = { path = "comps/time", version = "=0.1.0" }
 
-aster-rights = { path = "libs/aster-rights" }
-aster-rights-proc = { path = "libs/aster-rights-proc" }
-aster-util = { path = "libs/aster-util" }
-atomic-integer-wrapper = { path = "libs/atomic-integer-wrapper" }
-component = { path = "libs/component" }
-cpio-decoder = { path = "libs/cpio-decoder" }
-device-id = { path = "libs/device-id" }
-io-util = { path = "libs/io-util" }
-jhash = { path = "libs/jhash" }
-keyable-arc = { path = "libs/keyable-arc" }
-ring-buffer = { path = "libs/ring-buffer" }
-short-vis-path = { path = "libs/short-vis-path" }
-sparse-id-alloc = { path = "libs/sparse-id-alloc" }
-typeflags = { path = "libs/typeflags" }
-typeflags-util = { path = "libs/typeflags-util" }
-xarray = { path = "libs/xarray" }
+aster-rights = { path = "libs/aster-rights", version = "=0.1.0" }
+aster-rights-proc = { path = "libs/aster-rights-proc", version = "=0.1.0" }
+aster-util = { path = "libs/aster-util", version = "=0.1.0" }
+atomic-integer-wrapper = { path = "libs/atomic-integer-wrapper", version = "=0.1.0" }
+component = { path = "libs/component", version = "=0.19.0" }
+cpio-decoder = { path = "libs/cpio-decoder", version = "=0.1.0" }
+device-id = { path = "libs/device-id", version = "=0.1.0" }
+io-util = { path = "libs/io-util", version = "=0.1.0" }
+jhash = { path = "libs/jhash", version = "=0.1.0" }
+keyable-arc = { path = "libs/keyable-arc", version = "=0.1.0" }
+ring-buffer = { path = "libs/ring-buffer", version = "=0.1.0" }
+short-vis-path = { path = "libs/short-vis-path", version = "=0.1.0" }
+sparse-id-alloc = { path = "libs/sparse-id-alloc", version = "=0.1.0" }
+typeflags = { path = "libs/typeflags", version = "=0.1.0" }
+typeflags-util = { path = "libs/typeflags-util", version = "=0.1.0" }
+xarray = { path = "libs/xarray", version = "=0.1.0" }
 
 # The external crates, at Asterinas's versions.
 bitflags = "2.13"
