@@ -504,3 +504,61 @@ and switches to the new one when the call answers.
   - **The gate's VM time:** about 15 h in all. The NYC D8ds_v6 groups 1, 2, 3 and 5 (about
     1.5 h) go first, once P and D are merged; the Python engines, the D4ls_v5 and the large jobs
     follow on later days.
+- **2026-11-16: B2's first boots under KVM** (18:42 to 18:54 UTC, head `d0383bc5` with
+  `9e8ab3e1`'s line patched in): the Linux layer in user space runs real programs, with no shell.
+  - Static musl: "hello from musl", reading the image and writing `/tmp`, exit 0.
+  - Dynamic glibc 2.39 through `ld-linux`: LX-T12's two regression checks pass, exit 0. One
+    refused call, `rseq` (334), which glibc tolerates.
+  - Fork: a child and a grandchild in their own processes, a pipe between them, exit 7 as
+    expected, each process exiting 0.
+  - **A kernel panic reachable from user space**, found there and fixed by the integrator in
+    `9e8ab3e1`: `ProgramTable::unmap` built a backwards range for a protect or unmap inside one
+    table region, and `BTreeSet::range` panicked in kernel mode. B1 adds the booted regression
+    test and audits the same class of range.
+  - The gVisor suite (it needs a Bazel build of gVisor) and B2-fs's booted checks are next.
+- **2026-11-16: B2-vm's costs under KVM** (`kernel/linuxlayer/vmcost`, all 25 lines in the
+  shared notes, `b2-first-boots.md`):
+  - `process_map`: 842 ns for 1 page a call; 70 ns a page at 16; 21 ns a page at 4,096.
+  - A fault that maps 1 page costs 3,142 ns a page; fault-around of 16 costs 1,046 ns; an
+    already-mapped page 869 ns.
+  - The pager: 61.8 us a page at 1 page a request; 5.6 us at 16.
+  - `process_clone` of 4,096 pages: 0.86 ms against 2.26 ms for create plus replay.
+  - **Decided:** fault-around of 16 stays the default. File-backed faults always ask the pager
+    for 16 pages or more. The core does not merge adjacent areas: with fault-around, an area is
+    about 6 bytes a page, and merging would be new kernel-mode code for little. None of this is
+    on the engine's path, which uses populated granted memory.
+- **2026-11-16: how `kernel/linux` is retired** (integrator, on B2's question): a drop-in `linux`
+  server on the personality, speaking linux-protocol, so its clients (linux-test, KD1, the
+  engine, moruna-micro) do not change.
+  - `run_granted` stays: the engine is a Linux program on the personality that makes native
+    calls on its granted memory, disks, cores and clock page.
+  - A program's native calls pass through the personality's entry, which makes them only on
+    handles granted to the program. Routing them straight to the core was rejected: the
+    program would reach the personality's own handles.
+  - LX-T16's "forward" is measured again as the entry crossing. The engine's batch path still
+    makes no calls.
+  - **Done when, under KVM:** linux-test, KD1 and LX-T16 pass on the new server; C's 15 node
+    cases pass with the engine on the personality; B2-fs's booted checks pass through a real
+    task start; `kernel/linux/{core,server}` are deleted.
+- **2026-11-16: a program's native calls** (`data-os.md` §4): program mode gets a handle table of
+  its own, an allowlist of native calls, no handle 0 for a process, and a reserved address range
+  for core-placed mappings. B1 builds it after its current slot (ABI 2.6, unreleased: one new
+  call, and a new `personality_set` argument). B2 uses it for `run_granted`. It is not on the
+  gate's path: the engine runs on today's server until B2 lands.
+- **2026-11-16: B1's shared handles merged** (`905258d0`, from `b4116620`). CI's boot passed 203
+  of 203 checks under KVM on 1, 2 and 4 CPUs.
+  - `process_clone` shares the cloned process's handle table on request (`SHARE_HANDLES`),
+    under the §4 guards. A task of processes holding each other's handles is killed whole.
+  - **A second kernel panic reachable from user space, fixed** (`fdece684`, a marked B1 hook
+    in `boot.rs`, approved). The kernel had never installed OSTD's handler for a kernel copy
+    that faults on a user page. Any call given a bad pointer panicked the kernel, as did a
+    copy onto a page shared copy-on-write since a clone. Such a copy now answers `Fault`, or
+    readies the page and copies again. It had been there since KB1.
+  - B1 audited every range and every sum on user values in `vm.rs` and `memory.rs`. The first
+    panic's clamp (`9e8ab3e1`) covers every path through `unmap_ptes` (unmap, protect, discard,
+    copy-on-write faults, kernel copies, `windows_protect`, clones). Nothing else can run
+    backwards or overflow.
+  - Kernel mode: net +85 code lines.
+  - **Open:** ping-pong on 1 and 2 CPUs read 7.69 s and 6.74 s against 6.15 s and 5.30 s
+    before, with the boot now carrying A's, P's and E's tests on the same CPUs. B1 measures it
+    alone in its next slot before and after `SHARE_HANDLES`, to rule a regression out.

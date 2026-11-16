@@ -21,6 +21,11 @@ constants.
 
 ## The equivalence records (the PM's control 6)
 
+The records hold for the gate's final build: x86-64 with AVX, AVX2 and FMA (`.cargo/config.toml`,
+below), checked by running the tests as `x86_64-apple-darwin` code under Rosetta 2, which
+executes AVX2 and FMA, and again as native arm64 code. Both gave the same counts and the same
+largest differences.
+
 Each port against the Python function it replaces, on the oracle's synthetic inputs in the job's
 real input schema (nulls, edge values, unicode, offsets into shared buffers, empty batches, and
 the cases Python raises on). Rows are counted on the canonical form (gate-canon/1, below).
@@ -29,7 +34,7 @@ but the named tolerant ones did, and those are within their tolerance row by row
 
 | Job | Python function (0.6.6) | Port | Fixture rows matched | Content hash | Tolerance, named before measuring |
 | --- | --- | --- | --- | --- | --- |
-| NYC Score | `workloads.py` `score` | `functions/src/nyc.rs` `score` | 5,118 of 5,118 (5 cases) | `hash_all` equal on every case | `predicted_tip`: absolute 1.1e-6, one step of its sixth decimal. BLAS orders the network's sums its own way and may fuse them; the port sums in order, unfused, and uses musl's `log1p`. No value differed on the fixtures. |
+| NYC Score | `workloads.py` `score` | `functions/src/nyc.rs` `score`, its products on `gemm.rs` | 5,118 of 5,118 (5 cases) | `hash_all` equal on every case | `predicted_tip`: absolute 1.1e-6, one step of its sixth decimal. The three products run on `matrixmultiply`'s GEMM, which orders and fuses its sums its own way, as BLAS does, and the features use musl's `log1p`. No value differed on the fixtures, on the AVX2 and FMA kernel or on NEON's. |
 | NYC Occupancy | `workloads.py` `occupancy` | `nyc.rs` `occupancy` | 194,776 of 194,776 (5 cases), regrouped | `hash_all` equal | none |
 | NYC Enrich | `workloads.py` `enrich` | `nyc.rs` `enrich` | 3,343 of 3,343 (5 cases) | `hash_all` equal | none |
 | NYC Audit | `workloads.py` `audit` | `nyc.rs` `audit` | 4,518 of 4,518 (4 cases) | `hash_all` equal | none |
@@ -73,8 +78,11 @@ engine's record check, and finds it bit for bit the arrow-rs port's.
   3.14's 16.0: they differ only on characters new in 17.
 - A NaN's payload is not compared: NumPy's sort writes 0x7fff_ffff_ffff_ffff on one machine and
   another on the next, and gate-canon/1 maps every NaN to one.
-- Floating point is `libm`'s (musl's functions in Rust) everywhere: the native task, the baseline
-  and any host compute the same bits.
+- Floating point is `libm`'s (musl's functions in Rust) everywhere, and Score's products are
+  `matrixmultiply`'s: the native task, the baseline and 0.6.6's extension build with the same
+  flags and compute the same bits. Rust never fuses a multiply and an add on its own, so FMA
+  changes only the GEMM's kernel, not `libm` or the geometry: the Overture figures above are the
+  same with it and without it.
 
 The oracle ran on macOS arm64: Python 3.14.3, NumPy 2.4.2 (Accelerate's BLAS), pyarrow 24.0.0,
 shapely 2.1.2 on GEOS 3.13.1. 0.6.6's benchmark ran on x86-64 Linux; the gate's first VM run
@@ -105,6 +113,32 @@ files), and the tests check the two give the same hashes. A per-batch aggregate 
 regrouped by its keys first, so the hash does not depend on where batches split; every other gate
 function is row-wise. The hash is a multiset hash (the sum of the rows' hashes), the same for the
 same rows in any order or split.
+
+## One build for every Rust row
+
+`.cargo/config.toml` is the gate's one setting for the CPU: `+avx,+avx2,+fma` on x86-64. The
+native tasks (`tasks/build.sh` puts its own flags in the target's rustflags, which cargo joins
+with the file's), `gate-baseline` and `py066` all build under this directory, so they get the
+same flags and the same GEMM kernel. `matrixmultiply` is built without its `std` feature, so it
+picks the kernel at compile time from those features (its `src/x86/macros.rs`), with no CPU
+detection inside the task; with them it is the AVX2 and FMA kernel. `py066` links
+`matrixmultiply`'s `std` through pyo3-arrow's numpy, so it detects at run time, and finds the
+same kernel on a machine with the features. A `RUSTFLAGS` in the environment would replace the
+file's flags: leave it unset when building the gate.
+
+Score's function time on one core, 500,000 rows in two batches (this Mac, an Apple M5):
+
+| Score's function | Time on one core |
+| --- | --- |
+| NumPy 2.4.2, Accelerate's BLAS on one thread (`VECLIB_MAXIMUM_THREADS=1`) | 0.20 s |
+| The port on `matrixmultiply` (NEON, fused) | 0.41 s |
+| The port before, its own 4 x 8 register tile, unfused | 0.72 s |
+| The port first, sums in order row by row | 1.33 s |
+
+Accelerate runs `dgemm` on Apple's matrix coprocessor, so this Mac flatters NumPy; on the gate's
+x86-64 machines it is OpenBLAS against the AVX2 and FMA kernel, measured by the VM's first run
+(`rust-baseline` against `moruna`, the function's share in each one's split). The network's
+products are most of Score's time: 9.7 billion multiply-adds for these rows.
 
 ## The native tasks
 

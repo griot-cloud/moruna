@@ -21,7 +21,8 @@
 //! a port computes the same bits in the VM, in the baseline and on any host.
 
 #![no_std]
-#![forbid(unsafe_code)]
+// One `unsafe` block, the call into the GEMM (`gemm::matmul`), behind its own checks.
+#![deny(unsafe_code)]
 
 extern crate alloc;
 #[cfg(feature = "std")]
@@ -30,6 +31,7 @@ extern crate std;
 pub mod cols;
 pub mod error;
 pub mod fineweb;
+pub mod gemm;
 pub mod geom;
 pub mod nyc;
 pub mod overture;

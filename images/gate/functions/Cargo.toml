@@ -16,6 +16,8 @@ std = []
 
 [dependencies]
 libm.workspace = true
+# Score's products. Without `std` it picks its kernel from the target's features at compile time.
+matrixmultiply = { version = "=0.3.11", default-features = false }
 # `_norm_name`'s NFKC (Unicode 17; Python 3.14's tables are 16.0).
 unicode-normalization = { version = "=0.1.25", default-features = false }
 arrow = { workspace = true, optional = true }

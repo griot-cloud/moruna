@@ -71,6 +71,11 @@ fn start() -> Result<usize, String> {
     crate::clock::init()?;
     ostd::task::inject_pre_schedule_handler(process::deactivate_current);
     ostd::task::inject_post_schedule_handler(process::activate_current);
+    // stream B1 hook: a kernel copy that faults on a user page (a bad pointer, a page not
+    // touched yet, or one shared copy-on-write since a clone) resumes at its exception
+    // table's recovery, so `usercopy` answers `Fault`, or makes the page ready and copies
+    // once more. With no handler OSTD panics.
+    ostd::mm::fault::inject_user_page_fault_handler(|_| Err(()));
     early_println!("kk: {} CPUs online", ostd::cpu::num_cpus());
     #[cfg(feature = "probe")]
     osdk_frame_allocator::probe_shared_pool();
