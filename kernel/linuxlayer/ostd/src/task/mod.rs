@@ -12,7 +12,14 @@ mod preempt;
 pub mod scheduler;
 mod utils;
 
-use core::{any::Any, borrow::Borrow, cell::Cell, ops::Deref, ptr::NonNull};
+use core::{
+    any::Any,
+    borrow::Borrow,
+    cell::Cell,
+    ops::Deref,
+    ptr::NonNull,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use self::utils::ForceSync;
 pub use self::{
@@ -28,6 +35,8 @@ pub struct Task {
     data: Box<dyn Any + Send + Sync>,
     local_data: ForceSync<Box<dyn Any + Send>>,
     schedule_info: TaskScheduleInfo,
+    /// The thread running the task (`backend::thread_token`), zero when none does.
+    thread: AtomicUsize,
 }
 
 impl core::fmt::Debug for Task {
@@ -48,12 +57,18 @@ impl Task {
     /// Makes `task` the calling thread's task until [`Task::leave`], and runs the
     /// post-schedule handler, as a switch to it would.
     pub fn enter(task: Arc<Task>) {
-        let old = backend::current_slot();
-        backend::set_current_slot(Arc::into_raw(task) as usize);
-        if old != 0 {
+        let old = match backend::current_slot() {
+            0 => None,
             // SAFETY: the slot held a strong reference from an earlier `enter`.
-            drop(unsafe { Arc::from_raw(old as *const Task) });
+            old => Some(unsafe { Arc::from_raw(old as *const Task) }),
+        };
+        if let Some(old) = &old {
+            old.thread.store(0, Ordering::Release);
         }
+        task.thread
+            .store(backend::thread_token(), Ordering::Release);
+        backend::set_current_slot(Arc::into_raw(task) as usize);
+        drop(old);
         if let Some(handler) = POST_SCHEDULE_HANDLER.get() {
             handler();
         }
@@ -71,7 +86,18 @@ impl Task {
         backend::set_current_slot(0);
         if old != 0 {
             // SAFETY: as in `enter`.
-            drop(unsafe { Arc::from_raw(old as *const Task) });
+            let task = unsafe { Arc::from_raw(old as *const Task) };
+            task.thread.store(0, Ordering::Release);
+        }
+    }
+
+    /// Brings the task's thread back to the personality if it runs the program, as a
+    /// kernel's interrupt would bring a CPU back to the kernel; a thread in the personality
+    /// has its next wait return early instead (`moruna_sys::personality::thread_interrupt`).
+    pub fn interrupt(&self) {
+        let thread = self.thread.load(Ordering::Acquire);
+        if thread != 0 {
+            backend::interrupt(thread);
         }
     }
 
@@ -173,6 +199,7 @@ impl TaskOptions {
             schedule_info: TaskScheduleInfo {
                 cpu: AtomicCpuId::default(),
             },
+            thread: AtomicUsize::new(0),
         })
     }
 
@@ -326,5 +353,27 @@ mod test {
         Task::leave();
         assert!(Task::current().is_none());
         assert_eq!(Arc::strong_count(&task), 1);
+    }
+
+    #[ktest]
+    fn interrupt_reaches_a_running_task_only() {
+        let interrupts = crate::backend::interrupts;
+        let outer = Task::current().unwrap().cloned();
+        let task = Arc::new(TaskOptions::new(|| {}).data(()).build().unwrap());
+        let before = interrupts();
+        task.interrupt();
+        assert_eq!(interrupts(), before);
+        Task::enter(task.clone());
+        outer.interrupt();
+        assert_eq!(interrupts(), before);
+        task.interrupt();
+        assert_eq!(interrupts(), before + 1);
+        Task::enter(task.clone());
+        task.interrupt();
+        assert_eq!(interrupts(), before + 2);
+        Task::leave();
+        task.interrupt();
+        assert_eq!(interrupts(), before + 2);
+        Task::enter(outer);
     }
 }

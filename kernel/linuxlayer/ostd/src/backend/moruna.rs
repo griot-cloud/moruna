@@ -19,7 +19,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
 };
 
-use moruna_sys::{DEADLINE_INFINITE, Error, RawHandle, Thread, raw};
+use moruna_sys::{DEADLINE_INFINITE, Error, Handle, RawHandle, Thread, raw};
 
 use super::{Dir, FOREVER};
 
@@ -67,6 +67,9 @@ pub(crate) struct ThreadBlock {
     pub(crate) fs_base: usize,
     /// The program's GS base: kept, but the core loads none per thread.
     pub(crate) gs_base: usize,
+    /// The thread's own handle, for interrupting it; zero for a launched first thread,
+    /// which runs no program. Its spawner writes it before the thread runs anything.
+    pub(crate) thread: AtomicU32,
 }
 
 /// The calling thread's block.
@@ -86,6 +89,24 @@ pub(crate) fn current_slot() -> usize {
 pub(crate) fn set_current_slot(value: usize) {
     // SAFETY: as above.
     unsafe { (*block()).task = value };
+}
+
+/// What names the calling thread for [`interrupt`]: its block's address.
+pub(crate) fn thread_token() -> usize {
+    block() as usize
+}
+
+/// Interrupts the thread whose block is at `token` (`moruna_sys::personality`'s
+/// `thread_interrupt`). A thread that has ended answers an error, which is ignored: its
+/// block and handle stay while the personality runs.
+pub(crate) fn interrupt(token: usize) {
+    let block = token as *const ThreadBlock;
+    // SAFETY: a token is a block's address, and blocks are never freed.
+    let raw = unsafe { (*block).thread.load(Ordering::Acquire) };
+    if raw != 0 {
+        let thread = core::mem::ManuallyDrop::new(Thread(Handle::from_raw(raw)));
+        let _ = moruna_sys::personality::thread_interrupt(&thread);
+    }
 }
 
 /// A stack for a personality thread: its aligned base, with the thread's block written, and
@@ -229,6 +250,12 @@ pub(crate) fn run_program(
 }
 
 extern "C" fn thread_start(arg: u64) -> ! {
+    // Its spawner writes the thread's handle into its block before anything may interrupt it.
+    // SAFETY: the block is the thread's own, written by `new_stack`.
+    let handle = unsafe { &(*block()).thread };
+    while handle.load(Ordering::Acquire) == 0 {
+        futex_wait(handle, 0, FOREVER);
+    }
     // SAFETY: `spawn` leaked this box for the new thread, which takes it once.
     let f = unsafe { Box::from_raw(arg as *mut Box<dyn FnOnce() + Send>) };
     f();
@@ -236,11 +263,15 @@ extern "C" fn thread_start(arg: u64) -> ! {
 }
 
 pub(crate) fn spawn(f: Box<dyn FnOnce() + Send>) -> Result<(), ()> {
-    let (_, top) = new_stack().ok_or(())?;
+    let (base, top) = new_stack().ok_or(())?;
     let arg = Box::into_raw(Box::new(f)) as u64;
     match Thread::spawn(thread_start, top as u64, arg) {
         Ok(thread) => {
-            core::mem::forget(thread);
+            // SAFETY: the block at `base` is the new thread's, which only reads this word
+            // until it is set.
+            let handle = unsafe { &(*(base as *const ThreadBlock)).thread };
+            handle.store(thread.0.into_raw(), Ordering::Release);
+            futex_wake(handle, 1);
             Ok(())
         }
         Err(_) => {
