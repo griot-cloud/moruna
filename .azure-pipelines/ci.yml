@@ -169,6 +169,9 @@ stages:
             env:
               CARGO_BUILD_JOBS: "3"
               RUST_TEST_THREADS: "1"
+              # The job disk holds the pool's other checkouts too: 44 GB were free on a cold
+              # start, and the whole gate's builds take more (check.sh's lean()).
+              MORUNA_GATE_LEAN: "1"
           - bash: |
               set -euo pipefail
               mkdir -p "$(Build.ArtifactStagingDirectory)/gate"
