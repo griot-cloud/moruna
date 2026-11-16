@@ -2,7 +2,8 @@
 //! and the check of what a run left in its output directory.
 //!
 //!   data-disks parquet OUT_FILE          writes ROWS rows, `x` 0..ROWS and `y = (x * 7919) % 10007`
-//!   data-disks check DIR same|kd2        reads every Parquet or Arrow IPC file under DIR and
+//!   data-disks check DIR same|kd2        reads every Parquet or Arrow IPC file under DIR (known
+//!                                        by its first bytes) and
 //!                                        checks each `x` once and `y` as the input's (`same`) or
 //!                                        as KD2's transform makes it (`kd2`, `3 * x + y`); prints
 //!                                        the rows and a SHA-256 over them in `x` order
@@ -49,34 +50,52 @@ fn write_parquet(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+/// What a file under the output directory holds, by its first bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Parquet,
+    IpcFile,
+    IpcStream,
+}
+
+fn kind_of(path: &Path) -> Result<Option<Kind>> {
+    use std::io::Read as _;
+    let mut head = [0u8; 8];
+    let n = std::fs::File::open(path)?.read(&mut head)?;
+    Ok(match &head[..n] {
+        [b'P', b'A', b'R', b'1', ..] => Some(Kind::Parquet),
+        [b'A', b'R', b'R', b'O', b'W', b'1', ..] => Some(Kind::IpcFile),
+        [0xff, 0xff, 0xff, 0xff, ..] => Some(Kind::IpcStream),
+        _ => None,
+    })
+}
+
+fn files(dir: &Path, out: &mut Vec<(PathBuf, Kind)>) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if entry.file_type()?.is_dir() {
             files(&path, out)?;
-        } else if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("parquet" | "arrow" | "arrows" | "ipc")
-        ) {
-            out.push(path);
+        } else if let Some(kind) = kind_of(&path)? {
+            out.push((path, kind));
         }
     }
     Ok(())
 }
 
-fn batches(path: &Path) -> Result<Vec<RecordBatch>> {
+fn batches(path: &Path, kind: Kind) -> Result<Vec<RecordBatch>> {
     let file = std::fs::File::open(path)?;
-    if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
-        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?
-            .build()?;
-        return Ok(reader.collect::<std::result::Result<_, _>>()?);
-    }
-    match arrow::ipc::reader::FileReader::try_new(std::fs::File::open(path)?, None) {
-        Ok(reader) => Ok(reader.collect::<std::result::Result<_, _>>()?),
-        Err(_) => Ok(arrow::ipc::reader::StreamReader::try_new(file, None)?
-            .collect::<std::result::Result<_, _>>()?),
-    }
+    Ok(match kind {
+        Kind::Parquet => {
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?
+                .build()?
+                .collect::<std::result::Result<_, _>>()?
+        }
+        Kind::IpcFile => arrow::ipc::reader::FileReader::try_new(file, None)?
+            .collect::<std::result::Result<_, _>>()?,
+        Kind::IpcStream => arrow::ipc::reader::StreamReader::try_new(file, None)?
+            .collect::<std::result::Result<_, _>>()?,
+    })
 }
 
 fn check(dir: &Path, kd2: bool) -> Result<String> {
@@ -86,8 +105,8 @@ fn check(dir: &Path, kd2: bool) -> Result<String> {
         return Err(format!("no Parquet or Arrow file under {}", dir.display()).into());
     }
     let mut rows = BTreeMap::new();
-    for path in &found {
-        for batch in batches(path)? {
+    for (path, kind) in &found {
+        for batch in batches(path, *kind)? {
             let column = |name: &str| -> Result<Int64Array> {
                 let array = batch
                     .column_by_name(name)
