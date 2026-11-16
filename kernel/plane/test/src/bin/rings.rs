@@ -22,6 +22,7 @@ extern crate alloc;
 
 use alloc::{format, string::String, vec, vec::Vec};
 
+use moruna_ipc_check::{frame, record};
 use moruna_plane::{
     BatchId, DataPlane, Event, PlaneError, RingPlane, TaskId,
     calls::{Calls, Ready, Taken},
@@ -228,21 +229,41 @@ fn f(x: i64) -> i64 {
     x.wrapping_mul(3).wrapping_add(7)
 }
 
-/// A batch's layout: the framing, and where its values start.
+/// A batch's layout, as its framing declares it: the record's length, where its values start,
+/// and its validity bitmap, if the column has one.
 struct Layout {
     framing: Vec<u8>,
     values: u64,
+    validity: Option<(u64, u64)>,
     len: u64,
 }
 
 impl Layout {
-    fn of(framing: Vec<u8>) -> Layout {
-        let values = (framing.len() as u64).div_ceil(PAGE) * PAGE;
-        Layout {
+    fn of(framing: Vec<u8>) -> Result<Layout, String> {
+        let batch = 8 + frame::message_len(&framing)?;
+        let body = frame::body_length(framing.get(batch..).ok_or("no batch message")?)?;
+        let len = framing.len() as u64 + u64::try_from(body).map_err(|_| "a negative body")?;
+        let record = record::check_record(&framing, len)?;
+        if record.rows != ROWS {
+            return Err(format!("the framing declares {} rows", record.rows));
+        }
+        let values = record
+            .buffers
+            .iter()
+            .find(|(_, l)| *l == ROWS * 8)
+            .map(|(at, _)| *at)
+            .ok_or("no buffer of the values")?;
+        let validity = record
+            .buffers
+            .iter()
+            .copied()
+            .find(|(_, l)| *l > 0 && *l != ROWS * 8);
+        Ok(Layout {
             framing,
             values,
-            len: values + ROWS * 8,
-        }
+            validity,
+            len,
+        })
     }
 }
 
@@ -304,6 +325,11 @@ impl Run {
             .plane
             .load_into(region, layout.len, |v, at| {
                 v.write(at, &layout.framing)?;
+                // Every value is valid.
+                if let Some((bitmap, bytes)) = layout.validity {
+                    let ones = vec![0xffu8; bytes as usize];
+                    v.write(at + bitmap, &ones)?;
+                }
                 let mut j = 0;
                 while j < ROWS {
                     let k = (ROWS - j).min(CHUNK as u64);
@@ -430,6 +456,14 @@ impl Run {
             ));
         }
         Ok((copies, sleeps, wakes))
+    }
+
+    /// A failed test ends its task, which would otherwise sleep on its bell for good.
+    fn fail(&mut self) -> i64 {
+        if let Some((process, _)) = self.held.take() {
+            let _ = process.kill();
+        }
+        1
     }
 
     /// Answers the task's question, and waits for its end.
@@ -599,12 +633,19 @@ fn run() -> i64 {
             return 1;
         }
     };
+    let layout = match Layout::of(framing) {
+        Ok(l) => l,
+        Err(why) => {
+            println!(out, "DS-P ring: FAIL: the batch's framing: {}", why);
+            return 1;
+        }
+    };
     let mut r = Run {
         out,
         plane: RingPlane::new(Counted { calls: 0, account }, BUDGET),
         resource,
         image,
-        layout: Layout::of(framing),
+        layout,
         task: TaskId(0),
         waiting: Vec::new(),
         report: None,
@@ -614,18 +655,18 @@ fn run() -> i64 {
     };
     if let Err(why) = lockstep(&mut r) {
         println!(r.out, "DS-P lockstep: FAIL: {}", why);
-        return 1;
+        return r.fail();
     }
     let last = match steady(&mut r) {
         Ok(last) => last,
         Err(why) => {
             println!(r.out, "DS-P steady: FAIL: {}", why);
-            return 1;
+            return r.fail();
         }
     };
     if let Err(why) = revoked(&mut r, last) {
         println!(r.out, "DS-P revoke: FAIL: {}", why);
-        return 1;
+        return r.fail();
     }
     println!(
         r.out,
