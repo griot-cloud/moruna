@@ -443,11 +443,13 @@ This is `kernel-is-the-machine.md` §4.1 and §4.2, cut to a VM with no network.
     - Handles a program-mode call receives land in the program's table.
     - A clone starts with the program's table empty; `SHARE_HANDLES` covers only the
       personality's table.
-  - **An allowlist of call numbers** is accepted from program mode: the `run_granted` set. Any
-    other native call from program mode is refused and counted.
+  - **An allowlist of call numbers** (34, the `run_granted` set) goes from program mode
+    straight to the core. Every other call, Linux or native, enters the personality, which
+    answers an off-list native call with `BadSyscall` and counts it in the task's report.
   - **Handle 0, meaning the caller's process, is refused** from program mode for every call
     that takes a process, so a program cannot map over the personality's region. Handle 0 for
-    the calling thread (`thread_set_cpu`) stays.
+    the calling thread (`thread_set_cpu`) and for the caller's own account (`memory_create`,
+    `account_create`, `account_info`) stays.
   - **Addresses the core picks** for program-mode calls come from a range the personality
     reserves at `personality_set`, apart from its region, and Linux `mmap` keeps out of it.
   - The calls stay direct: no crossing and no message, so the batch path costs what it does
