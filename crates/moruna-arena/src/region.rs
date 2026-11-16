@@ -15,6 +15,14 @@ use moruna_kernel::{Guarantee, MorunaError, Result};
 static MMAP_CALLS: AtomicU64 = AtomicU64::new(0);
 /// `mlock` (or `cuMemHostRegister`) calls made through this module since the process started.
 static MLOCK_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Regions asked of a [`HostBacking`] since the process started.
+static GRANTS: AtomicU64 = AtomicU64::new(0);
+
+/// Regions asked of a [`HostBacking`] since the process started: one per region, at start
+/// and when the arena grows, and none per buffer.
+pub fn granted_regions() -> u64 {
+    GRANTS.load(Ordering::Relaxed)
+}
 
 /// Counting shim for AR-T3: the reservation syscalls this module has made.
 ///
@@ -39,11 +47,39 @@ pub fn syscall_counts() -> SyscallCounts {
     }
 }
 
+/// Memory granted to the process at start, which the host regions are carved from in place
+/// of mappings of the arena's own (`architecture/data-os.md` §3, contract C4): every page is
+/// present when it is given, so no buffer faults on it, and none is given back while the run
+/// lasts, so none is zeroed again when it is reused.
+pub trait HostBacking: Send + Sync {
+    /// The most bytes one region may have.
+    fn region_max(&self) -> u64;
+    /// A region of at least `bytes`, readable and writable, every page present.
+    fn region(&self, bytes: u64) -> Result<Granted>;
+}
+
+/// One region a [`HostBacking`] gave.
+pub struct Granted {
+    /// Its first byte.
+    pub base: *mut u8,
+    /// Its length.
+    pub bytes: u64,
+    /// Whether large pages map it.
+    pub huge_pages: bool,
+    /// What keeps it mapped: dropped when the arena releases the region.
+    pub keep: Box<dyn std::any::Any + Send + Sync>,
+}
+
+// SAFETY: a `Granted` is the sole owner of its region, as a `Mapping` is (see below).
+unsafe impl Send for Granted {}
+
 /// What backs a region, and what has to be undone when it is released.
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum Backing {
     /// An anonymous private mapping; `pinned` when the whole region is page-locked.
     Host { pinned: bool },
+    /// Memory a [`HostBacking`] granted: released by dropping what keeps it.
+    Granted,
     /// A device allocation (feature `cuda`); the base is a device address.
     #[cfg(feature = "cuda")]
     Device,
@@ -57,6 +93,8 @@ pub(crate) struct Mapping {
     base: *mut u8,
     bytes: u64,
     backing: Backing,
+    /// What keeps a granted region mapped.
+    _keep: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 // SAFETY: a `Mapping` owns its region exclusively (AR-I3: it is created once and released
@@ -103,6 +141,8 @@ impl Drop for Mapping {
                     libc::munmap(self.raw.cast(), self.raw_len);
                 }
             }
+            // The region goes with what keeps it, which drops after this.
+            Backing::Granted => {}
             #[cfg(feature = "cuda")]
             Backing::Device => {
                 // SAFETY: `base` is the device address `cuMemAlloc_v2` returned in
@@ -180,6 +220,7 @@ pub(crate) fn new_host(
         base,
         bytes,
         backing: Backing::Host { pinned: false },
+        _keep: None,
     };
 
     let huge_pages_active = apply_huge_pages(&mapping, huge_pages)?;
@@ -199,6 +240,51 @@ pub(crate) fn new_host(
         huge_pages_active,
         pinned,
     })
+}
+
+/// Prepare a host region of `bytes` (a multiple of `align`) on memory `backing` grants: the
+/// region is asked for `bytes + align` and used from its first aligned byte. Nothing is
+/// touched, advised or locked: the backing's pages are present already and stay resident.
+pub(crate) fn new_granted(backing: &dyn HostBacking, bytes: u64, align: u64) -> Result<HostRegion> {
+    let want = bytes
+        .checked_add(align)
+        .ok_or_else(|| MorunaError::Config {
+            name: "budget.host",
+            msg: format!("a granted region of {bytes} bytes does not fit this address space"),
+        })?;
+    GRANTS.fetch_add(1, Ordering::Relaxed);
+    let granted = backing.region(want)?;
+    let start = granted.base as usize as u64;
+    let skip = align_up(start, align) - start;
+    if granted.bytes < skip.saturating_add(bytes) {
+        return Err(MorunaError::Config {
+            name: "budget.host",
+            msg: format!(
+                "the backing gave {} bytes for a region of {bytes} bytes aligned to {align}",
+                granted.bytes
+            ),
+        });
+    }
+    // SAFETY: `skip + bytes <= granted.bytes`, so the aligned base and the `bytes` after it lie
+    // inside the granted region, which stays mapped while `keep` lives in the mapping.
+    let base = unsafe { granted.base.add(skip as usize) };
+    Ok(HostRegion {
+        mapping: Mapping {
+            raw: granted.base,
+            raw_len: granted.bytes as usize,
+            base,
+            bytes,
+            backing: Backing::Granted,
+            _keep: Some(granted.keep),
+        },
+        huge_pages_active: granted.huge_pages,
+        pinned: false,
+    })
+}
+
+/// The usable bytes of the largest region `backing` gives at `align`.
+pub(crate) fn granted_chunk(backing: &dyn HostBacking, align: u64) -> u64 {
+    align_down(backing.region_max().saturating_sub(align), align)
 }
 
 /// `madvise(MADV_HUGEPAGE)` under the guarantee rules of f.1: a `Present` guarantee that
@@ -395,6 +481,7 @@ pub(crate) fn new_device(id: moruna_kernel::DeviceId, bytes: u64) -> Result<(Map
                 base: dptr as usize as *mut u8,
                 bytes: want,
                 backing: Backing::Device,
+                _keep: None,
             };
             return Ok((mapping, want));
         }

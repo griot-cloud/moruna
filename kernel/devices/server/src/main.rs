@@ -18,6 +18,12 @@
 //!    answered once it runs.
 //! 5. When the last directory and control client has gone, it closes the drivers'
 //!    listeners, waits for each driver to end, and exits.
+//!
+//! A table line whose program is `-` starts no driver: its devices are data disks the engine
+//! drives itself. Each is handed, DMA right included, to the one connection that asks through
+//! the listener the boot description links to the engine's supervisor
+//! (`devices_protocol::HAND_OVER_SLOT`), once (`architecture/data-os.md` §3, decision 2).
+//! Nothing else may reach such a device: it has no service to look up, and `sandbox` refuses it.
 
 #![no_std]
 #![no_main]
@@ -34,7 +40,7 @@ use alloc::{
 };
 use core::cell::RefCell;
 
-use devices_protocol::{Entry, Windows, control, directory};
+use devices_protocol::{Entry, HAND_OVER_SLOT, Windows, control, directory, hand_over_names};
 use moruna_driver_table::Table;
 use moruna_mmio::Sub;
 use moruna_pci::{Address, Bar, CONFIG_SIZE, Config, DEVICES, FUNCTIONS};
@@ -80,6 +86,15 @@ struct Device {
     starts: u32,
     lookups: Vec<Pending>,
     restarts: Vec<Pending>,
+    /// A data disk with no driver: whether it has been handed to the supervisor.
+    handed: bool,
+}
+
+impl Device {
+    /// Whether the table line starts a driver for it.
+    fn driven(&self) -> bool {
+        self.program != moruna_driver_table::NO_DRIVER
+    }
 }
 
 struct Roots {
@@ -266,6 +281,10 @@ impl Handler for Directory {
                     return Outcome::Failure(directory::Error::Unavailable.code());
                 }
                 let device = &mut s.devices[index];
+                if !device.driven() {
+                    // A data disk is the engine's, and has no service.
+                    return Outcome::Failure(directory::Error::NotFound.code());
+                }
                 match connection(device) {
                     Some(c) => Outcome::reply(c),
                     None => {
@@ -298,7 +317,11 @@ impl Handler for Directory {
     }
 }
 
-struct Control(Rc<RefCell<State>>);
+/// Control, through one listener: `hand_over` only when it is the supervisor's.
+struct Control {
+    state: Rc<RefCell<State>>,
+    supervisor: bool,
+}
 
 impl Handler for Control {
     fn protocol(&self) -> moruna_svc::ProtocolId {
@@ -320,13 +343,35 @@ impl Handler for Control {
         if d.finish().is_err() {
             return Outcome::Status(moruna_svc::Status::BadMessage);
         }
-        let mut s = self.0.borrow_mut();
+        let mut s = self.state.borrow_mut();
         let Some(index) = s.find(&name) else {
             return Outcome::Failure(control::Error::NotFound.code());
         };
         let failed = Outcome::Failure(control::Error::Failed.code());
+        let refused = Outcome::Failure(control::Error::Refused.code());
         let device = &mut s.devices[index];
         match ordinal {
+            4 => {
+                if !self.supervisor || device.driven() || device.handed {
+                    return refused;
+                }
+                let mut handles = Vec::new();
+                let all = [&device.config, &device.msi, &device.dma]
+                    .into_iter()
+                    .chain(device.bars.iter().map(|(_, h)| h));
+                for h in all {
+                    match dup(h, "a resource") {
+                        Ok(h) => handles.push(h),
+                        Err(_) => return failed,
+                    }
+                }
+                device.handed = true;
+                let bars: Vec<usize> = device.bars.iter().map(|(i, _)| *i).collect();
+                let name = device.name.clone();
+                println!(s.out, "KB3 devices: {} handed to the supervisor", name);
+                Outcome::reply((hand_over_names(&bars), handles))
+            }
+            2 if !device.driven() => refused,
             1 => {
                 let Some(process) = device.process.as_ref() else {
                     return failed;
@@ -615,6 +660,7 @@ fn serve(out: &Console) -> Result<String, String> {
             starts: 0,
             lookups: Vec::new(),
             restarts: Vec::new(),
+            handed: false,
         });
     }
     let console = Console(
@@ -634,7 +680,14 @@ fn serve(out: &Console) -> Result<String, String> {
     let mut dispatcher = Dispatcher::new();
     let count = state.borrow().devices.len();
     let mut started = Vec::new();
+    let mut handed = Vec::new();
     for index in 0..count {
+        if !state.borrow().devices[index].driven() {
+            let s = state.borrow();
+            let d = &s.devices[index];
+            handed.push(format!("{} at {}", d.name, d.function.address));
+            continue;
+        }
         let process = state.borrow_mut().start(index);
         let s = state.borrow();
         let d = &s.devices[index];
@@ -662,6 +715,14 @@ fn serve(out: &Console) -> Result<String, String> {
             unclaimed.join(", ")
         }
     );
+    if !handed.is_empty() {
+        println!(
+            out,
+            "KB3 devices: {} data disks for the supervisor: {}",
+            handed.len(),
+            handed.join(", ")
+        );
+    }
     let mut listeners = 0;
     for i in 0..start::count() {
         let Some((_, _, slot)) = start::entry(i) else {
@@ -672,7 +733,13 @@ fn serve(out: &Console) -> Result<String, String> {
             Box::new(move || Box::new(Directory(s.clone())) as Box<dyn Handler>)
         } else if slot.starts_with("control") {
             let s = state.clone();
-            Box::new(move || Box::new(Control(s.clone())) as Box<dyn Handler>)
+            let supervisor = slot == HAND_OVER_SLOT;
+            Box::new(move || {
+                Box::new(Control {
+                    state: s.clone(),
+                    supervisor,
+                }) as Box<dyn Handler>
+            })
         } else {
             continue;
         };

@@ -24,5 +24,12 @@ moruna-plane = { workspace = true, features = ["native"] }
 vsock-protocol = { workspace = true }
 linux-protocol = { workspace = true }
 moruna-record = { workspace = true }
+# Stream C: the arena on granted memory objects and the engine's own virtio-blk queues, with
+# the virtio, PCI and register code Moruna's driver processes use.
+moruna-arena = { workspace = true }
+moruna-abi = { workspace = true }
+moruna-mmio = { path = "../../kernel/drivers/mmio", version = "=0.1.0" }
+moruna-pci = { path = "../../kernel/drivers/pci", version = "=0.1.0" }
+moruna-virtio = { path = "../../kernel/drivers/virtio", version = "=0.1.0" }
 
 imagefs-protocol = { workspace = true }

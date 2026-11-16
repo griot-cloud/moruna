@@ -39,6 +39,7 @@ use moruna_kernel::{
 use crate::classes::{GRANULE, SMALL_BUDGET_BYTES, Space, Watermark};
 use crate::region::Mapping;
 
+pub use crate::region::{Granted, HostBacking};
 pub use crate::stats::ArenaStats;
 
 /// How the facade builds the arena (d.1). Every value comes from discovery or the
@@ -162,6 +163,9 @@ struct Inner {
     side_made: AtomicU64,
     /// Double releases counted by regions that have since been retired.
     retired_double_release: AtomicU64,
+    /// Where host regions come from when the process does not map them itself (the data OS's
+    /// granted memory objects); `None` maps them with `mmap`.
+    backing: Option<Arc<dyn HostBacking>>,
 }
 
 /// The memory arena (d.1).
@@ -174,6 +178,19 @@ impl Arena {
     /// at the requested size and does not partially succeed: a failure after the host
     /// region exists releases it before returning (AR-I3).
     pub fn new(cfg: ArenaConfig) -> Result<Arc<Arena>> {
+        Arena::build(cfg, None)
+    }
+
+    /// Reserve the host budget on memory `backing` grants, in regions of at most its largest,
+    /// and every device region as [`Arena::new`] does. The regions are the run's fixed budget:
+    /// none drains, and no page of them is given back, so a reused page is never zeroed again
+    /// (`architecture/data-os.md` C4). `pretouch` and `memlock` do not apply: the backing's
+    /// pages are present and resident when it gives them.
+    pub fn with_backing(cfg: ArenaConfig, backing: Arc<dyn HostBacking>) -> Result<Arc<Arena>> {
+        Arena::build(cfg, Some(backing))
+    }
+
+    fn build(cfg: ArenaConfig, backing: Option<Arc<dyn HostBacking>>) -> Result<Arc<Arena>> {
         if cfg.register_rdma {
             return Err(MorunaError::Unsupported("rdma"));
         }
@@ -225,48 +242,66 @@ impl Arena {
                 ),
             });
         }
-        let host = region::new_host(
-            host_bytes,
-            align,
-            host_tier == Tier::PinnedHost,
-            cfg.huge_pages,
-            cfg.memlock,
-            cfg.pretouch,
-        )?;
-        let pinned = host.pinned;
+        let (hosts, pinned) = match &backing {
+            None => {
+                let host = region::new_host(
+                    host_bytes,
+                    align,
+                    host_tier == Tier::PinnedHost,
+                    cfg.huge_pages,
+                    cfg.memlock,
+                    cfg.pretouch,
+                )?;
+                let pinned = host.pinned;
+                (vec![host], pinned)
+            }
+            // Granted memory is resident: a run whose tier is page-locked has it so.
+            Some(backing) => (
+                granted(backing.as_ref(), host_bytes, align)?,
+                host_tier == Tier::PinnedHost,
+            ),
+        };
+        let huge_pages_active = hosts.iter().all(|h| h.huge_pages_active);
         let host_tier = if pinned { Tier::PinnedHost } else { Tier::Host };
         let host_watermark = Arc::new(Watermark::default());
-        let host_alloc = Arc::new(HostRegion {
-            space: Space::new(
-                host.mapping.base(),
-                host.mapping.bytes(),
-                host_tier,
-                host_bytes < SMALL_BUDGET_BYTES,
-                Arc::clone(&host_watermark),
-            ),
-            _mapping: host.mapping,
-            draining: AtomicBool::new(false),
-            base: true,
-            side: false,
-        });
+        let host_allocs: Vec<Arc<HostRegion>> = hosts
+            .into_iter()
+            .map(|host| {
+                Arc::new(HostRegion {
+                    space: Space::new(
+                        host.mapping.base(),
+                        host.mapping.bytes(),
+                        host_tier,
+                        host.mapping.bytes() < SMALL_BUDGET_BYTES,
+                        Arc::clone(&host_watermark),
+                    ),
+                    _mapping: host.mapping,
+                    draining: AtomicBool::new(false),
+                    base: true,
+                    side: false,
+                })
+            })
+            .collect();
         let devices = Self::devices(&cfg, align)?;
         tracing::info!(
             target: "arena.reserved",
             host_bytes,
             pinned,
-            huge_pages = host.huge_pages_active,
+            huge_pages = huge_pages_active,
+            regions = host_allocs.len(),
+            granted = backing.is_some(),
             devices = devices.len(),
             "arena reserved"
         );
         Ok(Arc::new(Arena {
             inner: Arc::new(Inner {
-                host: RwLock::new(vec![host_alloc]),
+                host: RwLock::new(host_allocs),
                 host_watermark,
                 devices,
                 host_tier,
                 page_bytes: cfg.page_bytes,
                 pinned,
-                huge_pages_active: host.huge_pages_active,
+                huge_pages_active,
                 allocations: AtomicU64::new(0),
                 foreign: AtomicU64::new(0),
                 payload_copies: AtomicU64::new(0),
@@ -281,6 +316,7 @@ impl Arena {
                 side_live: AtomicU64::new(0),
                 side_made: AtomicU64::new(0),
                 retired_double_release: AtomicU64::new(0),
+                backing,
             }),
         }))
     }
@@ -299,6 +335,27 @@ impl Arena {
         let bytes = region::align_up(bytes, REGION_ROUNDING.max(inner.align));
         if bytes < GRANULE {
             return Ok(0);
+        }
+        if let Some(backing) = &inner.backing {
+            let mut added = 0;
+            for host in granted(backing.as_ref(), bytes, inner.align)? {
+                added += host.mapping.bytes();
+                inner.write_host().push(Arc::new(HostRegion {
+                    space: Space::new(
+                        host.mapping.base(),
+                        host.mapping.bytes(),
+                        inner.host_tier,
+                        host.mapping.bytes() < SMALL_BUDGET_BYTES,
+                        Arc::clone(&inner.host_watermark),
+                    ),
+                    _mapping: host.mapping,
+                    draining: AtomicBool::new(false),
+                    base: false,
+                    side: false,
+                }));
+            }
+            tracing::info!(target: "arena.grow", bytes = added, "arena grew by granted regions");
+            return Ok(added);
         }
         let host = region::new_host(
             bytes,
@@ -423,7 +480,8 @@ impl Arena {
     /// system, keeping the mappings (RB4). The next use of a page faults it in and charges it
     /// then. Nothing is given back from a page-locked region. Returns the bytes given back.
     pub fn release_free(&self) -> u64 {
-        if self.inner.pinned {
+        // Granted memory is the run's for the whole run (C4): nothing goes back.
+        if self.inner.pinned || self.inner.backing.is_some() {
             return 0;
         }
         let page = self.inner.page_bytes as u64;
@@ -487,6 +545,11 @@ impl Arena {
                   unconstructible (preamble 6.2)"
                 .into(),
         })
+    }
+
+    /// True when the host regions are memory a [`HostBacking`] granted.
+    pub fn granted(&self) -> bool {
+        self.inner.backing.is_some()
     }
 
     /// True when the host region is backed by transparent huge pages (d.1, f.1).
@@ -553,6 +616,30 @@ impl std::fmt::Debug for Arena {
             .field("huge_pages_active", &self.inner.huge_pages_active)
             .finish()
     }
+}
+
+/// Host regions of `bytes` (a multiple of `align`) on memory `backing` grants, each at most its
+/// largest region.
+fn granted(backing: &dyn HostBacking, bytes: u64, align: u64) -> Result<Vec<region::HostRegion>> {
+    let chunk = region::granted_chunk(backing, align);
+    if chunk < GRANULE {
+        return Err(MorunaError::Config {
+            name: "budget.host",
+            msg: format!(
+                "the granted memory's largest region of {} bytes holds no size class once \
+                 aligned to {align} bytes",
+                backing.region_max()
+            ),
+        });
+    }
+    let mut out = Vec::new();
+    let mut left = bytes;
+    while left >= GRANULE {
+        let take = left.min(chunk);
+        out.push(region::new_granted(backing, take, align)?);
+        left -= take;
+    }
+    Ok(out)
 }
 
 impl Inner {
@@ -684,7 +771,7 @@ impl Inner {
     /// (a side region would have to be prepared the same way), the request is small, or the
     /// budget has no room for it.
     fn alloc_side(&self, bytes: u64) -> Option<(*mut u8, Tier)> {
-        if self.pinned || self.pretouch || bytes < SIDE_MIN {
+        if self.pinned || bytes < SIDE_MIN || (self.pretouch && self.backing.is_none()) {
             return None;
         }
         let charge = crate::classes::charge_of(bytes);
@@ -701,12 +788,23 @@ impl Inner {
         // top of those would put the process past what the controller counts the arena as
         // (11 f.3: the regions' bytes). After this the arena is resident in what is in use.
         let page = self.page_bytes as u64;
-        for region in host.iter().filter(|r| !r.draining.load(Ordering::SeqCst)) {
-            region.space.release_free(page);
+        if self.backing.is_none() {
+            for region in host.iter().filter(|r| !r.draining.load(Ordering::SeqCst)) {
+                region.space.release_free(page);
+            }
         }
         let len = region::align_up(charge, self.align.max(GRANULE));
-        let mapped =
-            region::new_host(len, self.align, false, self.huge_pages, self.memlock, false).ok()?;
+        let mapped = match &self.backing {
+            // A granted side region is one more grant, made only if one region holds it.
+            Some(backing) => {
+                if len > region::granted_chunk(backing.as_ref(), self.align) {
+                    return None;
+                }
+                region::new_granted(backing.as_ref(), len, self.align).ok()?
+            }
+            None => region::new_host(len, self.align, false, self.huge_pages, self.memlock, false)
+                .ok()?,
+        };
         let side = Arc::new(HostRegion {
             space: Space::new(
                 mapped.mapping.base(),

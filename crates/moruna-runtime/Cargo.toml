@@ -113,4 +113,6 @@ python = ["moruna-adapters/python", "moruna-sources/python", "moruna-sandbox/pyt
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 moruna-micro = { workspace = true }
 moruna-sys = { workspace = true }
+# Stream C: the clock page's layout, which the engine's own `clock_gettime` reads (C8).
+moruna-abi = { workspace = true }
 moruna-storage = { workspace = true, features = ["native"] }

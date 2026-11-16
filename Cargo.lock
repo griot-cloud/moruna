@@ -2081,14 +2081,27 @@ dependencies = [
  "imagefs-protocol",
  "libc",
  "linux-protocol",
+ "moruna-abi",
  "moruna-adapters",
+ "moruna-arena",
  "moruna-kernel",
+ "moruna-mmio",
+ "moruna-pci",
  "moruna-plane",
  "moruna-record",
  "moruna-svc",
  "moruna-sys",
+ "moruna-virtio",
  "tracing",
  "vsock-protocol",
+]
+
+[[package]]
+name = "moruna-mmio"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+ "moruna-svc",
 ]
 
 [[package]]
@@ -2102,6 +2115,15 @@ dependencies = [
  "sha2 0.11.0",
  "wat",
  "zip",
+]
+
+[[package]]
+name = "moruna-pci"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+ "moruna-mmio",
+ "moruna-svc",
 ]
 
 [[package]]
@@ -2234,6 +2256,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "moruna-abi",
  "moruna-adapters",
  "moruna-arena",
  "moruna-controller",
@@ -2446,6 +2469,16 @@ dependencies = [
 [[package]]
 name = "moruna-types"
 version = "0.6.6"
+
+[[package]]
+name = "moruna-virtio"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+ "moruna-mmio",
+ "moruna-pci",
+ "moruna-svc",
+]
 
 [[package]]
 name = "moruna-vmm"

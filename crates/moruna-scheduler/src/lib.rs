@@ -56,7 +56,7 @@ mod wall;
 mod worker;
 
 pub use decide::{Clock, DISK_BYTES_PER_SECOND, SystemClock};
-pub use pipeline::{Pipeline, SchedulerConfig, validate_graph};
+pub use pipeline::{Pipeline, SchedulerConfig, WorkerStart, validate_graph};
 
 use shared::Shared;
 

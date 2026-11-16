@@ -9,7 +9,10 @@
 //! Start slots: `console`; `config`, the configuration (`engine::Config`); `linux`, a
 //! listener of `moruna.linux`; `directory`, the device manager's directory, when a grant
 //! looks a service up; each data handle a `grant SLOT data FROM` names as `FROM`;
-//! and each listener a `grant SLOT service FROM` explicitly names as `FROM`.
+//! each listener a `grant SLOT service FROM` explicitly names as `FROM`; and `handover`, a
+//! listener of the device manager's control linked to its `control.engine` slot, when a
+//! `grant disk.NAME disk DEVICE` asks for a data disk (`architecture/data-os.md` §3). Each data
+//! disk is handed over once, and each run is given duplicates of its handles.
 
 #![no_std]
 #![no_main]
@@ -19,7 +22,7 @@ extern crate alloc;
 
 use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
 
-use devices_protocol::directory;
+use devices_protocol::{control, directory};
 use engine::{Config, Source};
 use linux_protocol::{Bytes, Ended, Grant, how, linux};
 use moruna_svc::{
@@ -178,11 +181,68 @@ fn admission_control(
     Ok((Memory(readonly), length as u32))
 }
 
+/// The data disks the device manager has handed over: each device's handle names and handles,
+/// kept for every run.
+struct Disks {
+    listener: Option<Channel>,
+    control: Option<control::Client>,
+    handed: BTreeMap<String, (String, Vec<Handle>)>,
+}
+
+impl Disks {
+    fn new() -> Disks {
+        Disks {
+            listener: start::take("handover").map(Channel),
+            control: None,
+            handed: BTreeMap::new(),
+        }
+    }
+
+    /// A channel whose one message carries duplicates of data disk `device`'s handles, named;
+    /// the disk is handed over the first time a run asks for it.
+    fn grant(&mut self, slot: &str, device: &str) -> Result<Handle, String> {
+        if !self.handed.contains_key(device) {
+            if self.control.is_none() {
+                let listener = self.listener.take().ok_or_else(|| {
+                    format!("`grant {slot} disk {device}` needs the `handover` slot")
+                })?;
+                self.control = Some(
+                    devices_protocol::open_control(listener, deadline_in(120 * SECONDS))
+                        .map_err(|e| format!("the device manager's control: {e:?}"))?,
+                );
+            }
+            let control = self.control.as_mut().ok_or("no control connection")?;
+            let handed = control
+                .hand_over(String::from(device))
+                .map_err(|e| format!("the device manager refused to hand {device} over: {e:?}"))?;
+            self.handed.insert(String::from(device), handed);
+        }
+        let (names, handles) = self
+            .handed
+            .get(device)
+            .ok_or_else(|| format!("no data disk {device}"))?;
+        let mut copies = Vec::with_capacity(handles.len());
+        for h in handles {
+            copies.push(Some(
+                h.duplicate(Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER)
+                    .map_err(|e| format!("duplicating {device}'s handles: {}", e.name()))?,
+            ));
+        }
+        let (ours, theirs) =
+            Channel::create().map_err(|e| format!("channel_create: {}", e.name()))?;
+        ours.write_with(names.as_bytes(), &mut copies)
+            .map_err(|e| format!("granting {device}: {}", e.name()))?;
+        Ok(theirs.0)
+    }
+}
+
 /// The handles one run starts with, made fresh for it.
+#[allow(clippy::too_many_arguments)]
 fn grants(
     config: &Config,
     personality: &Channel,
     directory: &mut Option<directory::Client>,
+    disks: &mut Disks,
     data: &BTreeMap<String, Handle>,
     services: &BTreeMap<String, Channel>,
     admissions: &mut BTreeMap<String, moruna_storage_service::protocol::admission::Client>,
@@ -276,6 +336,7 @@ fn grants(
                 .ok_or_else(|| format!("no data handle `{from}`"))?
                 .duplicate(Rights::READ | Rights::MAP | Rights::TRANSFER)
                 .map_err(|e| format!("duplicating the data handle `{from}`: {}", e.name()))?,
+            Source::Disk(device) => disks.grant(&g.slot, device)?,
         };
         out.push((b(&g.slot), handle));
     }
@@ -387,6 +448,7 @@ fn run() -> i64 {
             return 1;
         }
     };
+    let mut disks = Disks::new();
     let mut argv = Vec::with_capacity(config.args.len() + 1);
     argv.push(b(&config.program));
     argv.extend(config.args.iter().map(|a| b(a)));
@@ -413,6 +475,7 @@ fn run() -> i64 {
             &config,
             &personality,
             &mut directory,
+            &mut disks,
             &data,
             &services,
             &mut admissions,
