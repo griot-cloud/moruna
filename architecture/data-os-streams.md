@@ -504,3 +504,26 @@ and switches to the new one when the call answers.
   - **The gate's VM time:** about 15 h in all. The NYC D8ds_v6 groups 1, 2, 3 and 5 (about
     1.5 h) go first, once P and D are merged; the Python engines, the D4ls_v5 and the large jobs
     follow on later days.
+- **2026-11-16: B2's first boots under KVM** (18:42 to 18:54 UTC, head `d0383bc5` with
+  `9e8ab3e1`'s line patched in): the Linux layer in user space runs real programs, with no shell.
+  - Static musl: "hello from musl", reading the image and writing `/tmp`, exit 0.
+  - Dynamic glibc 2.39 through `ld-linux`: LX-T12's two regression checks pass, exit 0. One
+    refused call, `rseq` (334), which glibc tolerates.
+  - Fork: a child and a grandchild in their own processes, a pipe between them, exit 7 as
+    expected, each process exiting 0.
+  - **A kernel panic reachable from user space**, found there and fixed by the integrator in
+    `9e8ab3e1`: `ProgramTable::unmap` built a backwards range for a protect or unmap inside one
+    table region, and `BTreeSet::range` panicked in kernel mode. B1 adds the booted regression
+    test and audits the same class of range.
+  - The gVisor suite (it needs a Bazel build of gVisor) and B2-fs's booted checks are next.
+- **2026-11-16: B2-vm's costs under KVM** (`kernel/linuxlayer/vmcost`, all 25 lines in the
+  shared notes, `b2-first-boots.md`):
+  - `process_map`: 842 ns for 1 page a call; 70 ns a page at 16; 21 ns a page at 4,096.
+  - A fault that maps 1 page costs 3,142 ns a page; fault-around of 16 costs 1,046 ns; an
+    already-mapped page 869 ns.
+  - The pager: 61.8 us a page at 1 page a request; 5.6 us at 16.
+  - `process_clone` of 4,096 pages: 0.86 ms against 2.26 ms for create plus replay.
+  - **Decided:** fault-around of 16 stays the default. File-backed faults always ask the pager
+    for 16 pages or more. The core does not merge adjacent areas: with fault-around, an area is
+    about 6 bytes a page, and merging would be new kernel-mode code for little. None of this is
+    on the engine's path, which uses populated granted memory.
