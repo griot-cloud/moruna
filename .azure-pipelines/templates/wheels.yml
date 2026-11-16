@@ -57,6 +57,11 @@ jobs:
             "$env/bin/python" -c "import moruna; print(moruna.__version__); print(moruna.inspect_host()['limits'])"
           done
         displayName: The wheel installs and runs before it is published
+        env:
+          # The pool's agent reached pypi.org only after a minute at times: uv's defaults gave
+          # up after 46 s with the wheels built (2026-11-16).
+          UV_HTTP_TIMEOUT: "120"
+          UV_HTTP_RETRIES: "6"
       - publish: dist
         artifact: wheels-linux-x86_64
       - bash: echo "##vso[build.addbuildtag]$(wheelTag)"
