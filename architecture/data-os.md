@@ -24,7 +24,7 @@ built. Until he approves it, the only work is step 1's measurements
   - memory objects and huge pages;
   - mapping one memory object into several processes;
   - device DMA into a process's own pages;
-  - a thread pinned to a CPU;
+  - a worker thread pinned to a CPU core (a place to run, never a function to run);
   - futex notification;
   - a clock read without a call.
 
@@ -99,7 +99,7 @@ processes run their hot paths without calling the kernel.
 | Map a memory object into several processes, read-only to some | Exists (`MEMORY_MAP`, `PROCESS_MAP`, slots) | Copies between processes | None new |
 | Map pre-faulted, with huge pages | New. The kernel maps 4 KiB pages today (SDD 29 m.1). | Faults, zeroing and TLB misses on the arena | A mapping flag, and large-page support in OSTD's page tables. To be measured. |
 | Device DMA into a process's own pages | Exists for driver processes (`MEMORY_PIN`, `DEVICE_MEMORY_CREATE`, `INTERRUPT_CREATE_MSI`, `DMA_RELEASE`) | A copy from a driver's buffer into the arena | None new. The engine is granted the data disk as a driver process is (§3). |
-| A thread pinned to a CPU | New | Losing cache locality between decode and the function | One call. Small. |
+| A thread pinned to a CPU core | New | Losing cache locality between decode and the function | One call. Small. It places a thread on a core and nothing else: it never binds a worker to a function or a stage. |
 | Futex wait and wake | Exists (`FUTEX_WAIT`, `FUTEX_WAKE`) | A call per batch: waits happen only when a ring is empty | None new |
 | A clock readable without a call | New: a read-only page the kernel updates | `clock_gettime` calls on every timed batch | One page and its update. Small. |
 | Revoke a task's write access to a set of windows | Partly exists (`PROCESS_PROTECT`, `batch_put`'s unmap) | The record check's need for bytes no task can write (DP1), paid once per group of batches, not per batch (§5) | A call that takes a list. Small. |
@@ -122,7 +122,7 @@ The engine is one user process. It is granted, at start, everything its hot path
 | Reading the data disk | The engine is granted the data disk's virtio-blk queues and drives them itself, as Moruna's driver processes do today. Requests go on the device's ring, and data lands by DMA in arena pages. Completion is polled while busy, with an interrupt woken through a futex only when idle. |
 | Writing outputs and spill | The same device ring, from arena pages. |
 | Handing a batch to user code | Pre-shared regions and rings (§5). |
-| Placing work | Workers are pinned once. The engine's scheduler hands batches to pinned workers through its own queues, as it does today, with no call. |
+| Placing work | Each worker thread is pinned once, to a core. The engine's scheduler hands any worker a batch of any function through its own queues, as it does today, with no call. A worker is never bound to a function or a stage. |
 | Timing a batch | The clock page. |
 | Logs and events | A task's text goes to the log ring (SDD 29 f.7). Events go out on the vsock, which is not on the hot path. |
 
@@ -221,8 +221,12 @@ Wiring keeps Moruna (`arrow-core-0.7.md`).
   - the reactor drives the data disk's ring;
   - the controller's `Sampler` reads the accounts;
   - the transport is the vsock.
-- **Changes to decisions are separate.** "Decode on the worker that consumes the batch" changes a
-  scheduler decision, so it gets its own reason and measurement. KD3's conformance (same rows,
+- **Any worker runs any function's batch, as today.** Pinning places worker threads on cores. It
+  never dedicates a worker to a function or a stage (Brackly, 2026-11-16), so the scheduler keeps
+  its freedom to hand any morsel to any worker.
+- **Changes to decisions are separate.** "Decode on the worker that consumes the batch" chooses
+  the core a batch's decode runs on; it does not dedicate workers to functions. It is still a
+  scheduler change, so it gets its own reason and measurement. KD3's conformance (same rows,
   refusals and decisions on a Linux host and on the data OS) proves the rest.
 
 ## 7. The gate, and what this does to the 0.7 steps
