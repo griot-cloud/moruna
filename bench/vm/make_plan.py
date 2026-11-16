@@ -1,4 +1,4 @@
-"""Writes the run plans. make_plan.py preflight|grid|main"""
+"""Writes the run plans. make_plan.py preflight|grid|main|...|gate-nyc MACHINE [--no-066-rust]"""
 import json, sys, glob
 D = "/data/nyc/norm/yellow_tripdata_"
 ALL = sorted(glob.glob(D + "*.parquet"))
@@ -270,5 +270,14 @@ elif mode == "rerun7":
         add(f"c7-ooc-{wl}-moruna-m8", "moruna", wl, files, mem=8, profiles=f"/data/profiles/{wl}", **T, **S)
         add(f"c7-ooc-{wl}-loop-m8", "loop", wl, files, mem=8, **LO[wl], **T)
         add(f"c7-ooc-{wl}-ray-m8", "ray", wl, files, mem=8, batch=LO[wl]["batch"], **T)
+elif mode == "gate-nyc":
+    # The PM's NYC matrix for the 0.7 gate (arrow-core-0.7.md section 9): the 2024 set, one
+    # learning run (r0) and five measured repeats (r1-r5) of every row, the order reversed on every
+    # other repeat; then two pairs of 0.6.6 against itself for the session's noise. The machine is
+    # the second argument: d8 (D8ds_v6) first, then d4 (D4ls_v5).
+    import gate_plan
+    machine = sys.argv[2] if len(sys.argv) > 2 else "d8"
+    plan = gate_plan.nyc(Y2024, machine, with_066_rust="--no-066-rust" not in sys.argv)
+    mode = f"gate-nyc-{machine}"
 json.dump(plan, open(f"/data/results/plan-{mode}.json", "w"), indent=1)
 print(mode, len(plan), "runs")
