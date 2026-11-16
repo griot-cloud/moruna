@@ -77,7 +77,30 @@ Every figure below comes from the 0.6.6 runs on the benchmark VM (Linux, 8 CPUs,
 | Parquet decode and encode | Enrich spent about 40 of 46 CPU-seconds reading and writing outside the function, against about 27 for pyarrow. Rust's `snap` decodes about 1.5x slower than C++. | Compute |
 | Parallel encode and write lanes | Overture shapes: Moruna 723 s, the loop 870 s, Ray Data 941 s. | Compute and I/O |
 
-Step 1's KVM figures (forwarding, boundary copies, VM boot) are added here when they exist.
+**Step 1, on `moruna-bench` (D8ds_v6, KVM), 2026-11-16:**
+
+- **The microkernel builds and boots under KVM.** CI's boot passed all 162 of its checks on 1, 2
+  and 4 CPUs.
+- **The engine runs real jobs on it as today's Linux program (EN1).** All 15 production-node job
+  cases passed (five cases on 1, 2 and 4 CPUs).
+- **Each fixture case takes 2.3 s to 3.1 s end to end under KVM,** boot, job and shutdown
+  included. The comparison with the emulator follows.
+
+**Codecs (C5 in `arrow-core-0.7.md` §5, decision 5),** single-threaded, best of three, on the
+gate's own pages. `ruzstd` 0.8.3 implements only its Fastest level; its Default and Better
+levels panic "not implemented". C zstd and `ruzstd` decoded every page to the same bytes.
+
+| Dataset | Decode: C zstd / `ruzstd` | Encode, level 1: C zstd / `ruzstd` Fastest | `ruzstd`'s bytes |
+| --- | --- | --- | --- |
+| Overture (2 files, zstd pages, 1.9 GB raw) | 939 / 201 MB/s (4.7x the time) | 380 / 56 MB/s (6.7x) | 1.17x |
+| NYC 2024, as the benchmark reads it (3 months, 249 MB raw) | 683 / 161 MB/s (4.3x) | 302 / 52 MB/s (5.8x) | 1.11x |
+| FineWeb (1 file, 3.4 GB raw) | 1,082 / 189 MB/s (5.7x) | 289 / 50 MB/s (5.8x) | 1.16x |
+
+C zstd stays (decision 5): a pure-Rust zstd today would slow every zstd job's decode four- to
+six-fold and every write about six-fold.
+
+The forwarding and boundary-copy figures on the gate's own jobs need stream E's harness and are
+added when it runs.
 
 **What the evidence says:**
 
