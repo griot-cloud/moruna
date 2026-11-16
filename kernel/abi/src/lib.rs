@@ -261,11 +261,13 @@ pub enum Error {
     /// (2.3) The account the call charges has no room for it: its use, what it holds for
     /// the accounts carved from it, and the call's charge would pass its limit.
     QuotaExceeded = 15,
+    /// (2.6) A `thread_interrupt` stopped the wait, as a Linux call returns `EINTR`.
+    Interrupted = 16,
 }
 
 impl Error {
     /// All errors, in code order.
-    pub const ALL: [Error; 15] = [
+    pub const ALL: [Error; 16] = [
         Error::BadHandle,
         Error::WrongType,
         Error::AccessDenied,
@@ -281,6 +283,7 @@ impl Error {
         Error::BadState,
         Error::Fault,
         Error::QuotaExceeded,
+        Error::Interrupted,
     ];
 
     /// The positive code; `rax` carries its negation.
@@ -326,6 +329,7 @@ impl Error {
             Error::BadState => "bad state",
             Error::Fault => "fault",
             Error::QuotaExceeded => "quota exceeded",
+            Error::Interrupted => "interrupted",
         }
     }
 }

@@ -156,6 +156,8 @@ fn send(
     }
     write_u64(&mut bytes, request::IP, ctx.instruction_pointer() as u64);
     *thread.parked.lock() = Some(ctx.clone());
+    // Asleep in the core until the reply: its registers can be read and changed.
+    crate::personality::fall_asleep(thread, ctx);
     // A thread has one forwarded call in flight at a time: its request is paid for in
     // the thread's own charge (`charge::THREAD`).
     let request = Message {
@@ -173,6 +175,8 @@ fn send(
         "its personality server",
     );
     *thread.parked.lock() = None;
+    // A forwarded call is not interrupted: only a holder's changes apply.
+    crate::personality::wake(thread, ctx, u64::MAX, u64::MAX);
     let message = match answer {
         Ok(Some(m)) => m.bytes,
         Ok(None) => return Flow::ThreadExit,
@@ -260,7 +264,8 @@ fn rendezvous(
         return Err(alloc::format!("no memory to wait for {who}"));
     }
     let result = loop {
-        if thread.killed() {
+        // A call in flight is not interrupted: only the thread's end stops the wait.
+        if thread.dying() {
             break Ok(None);
         }
         {
