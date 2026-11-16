@@ -14,8 +14,13 @@
 //! grant network service network      # fresh connection from explicitly granted listener
 //! grant image data image               # slot `image`: a read-only duplicate of the supervisor's
 //!                                      # own data handle `image`, the attached image's record
+//! grant disk.in.nyc disk data0          # slot `disk.in.nyc`: data disk `data0`, which the device
+//!                                      # manager hands over once through the `handover` slot
 //! runs 3                              # how many times it is started, one after another
 //! ```
+//!
+//! The program is started by exec, never through a shell, and may not be one: the data OS has
+//! no shell (`architecture/data-os.md` §3a).
 //!
 //! Every line is checked; an unknown key, a repeated one that may appear once, a number
 //! that is not one, a slot name the kernel would refuse and a configuration with no
@@ -44,6 +49,10 @@ pub enum Source {
     Service(String),
     /// Already-connected private storage authority and canonical Admission data.
     Admission { authority: String, control: String },
+    /// A data disk the device manager hands over (`hand_over`), by its device name
+    /// (`data0`): a channel whose one message carries the disk's function, which the engine
+    /// drives itself (`architecture/data-os.md` §3). Only `disk.*` slots take one.
+    Disk(String),
 }
 
 /// One handle the engine starts with.
@@ -65,6 +74,17 @@ pub struct Config {
     pub scratch: u64,
     pub grants: Vec<Grant>,
     pub runs: u32,
+}
+
+/// The programs that are shells, by file name: none may be the engine's program (data-os §3a).
+pub const SHELLS: [&str; 12] = [
+    "sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "busybox", "toybox",
+];
+
+/// Whether the program at absolute path `path` is a shell.
+pub fn is_shell(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    SHELLS.contains(&name)
 }
 
 /// The most runs one boot asks for.
@@ -121,6 +141,11 @@ impl Config {
                     once(program.is_some())?;
                     if !rest.starts_with('/') || rest.contains(' ') {
                         return Err(refuse("the program is one absolute path"));
+                    }
+                    if is_shell(rest) {
+                        return Err(refuse(
+                            "the program is a shell, and the data OS starts nothing through one",
+                        ));
                     }
                     program = Some(String::from(rest));
                 }
@@ -199,10 +224,22 @@ impl Config {
                         {
                             Source::Service(String::from(from))
                         }
+                        (Some("disk"), Some(device), None)
+                            if slot.starts_with("disk.") && slot_ok(device) =>
+                        {
+                            if grants
+                                .iter()
+                                .any(|g| g.source == Source::Disk(device.into()))
+                            {
+                                return Err(refuse("a data disk is granted to one slot"));
+                            }
+                            Source::Disk(String::from(device))
+                        }
                         _ => {
                             return Err(refuse(
                                 "a grant is `grant SLOT lookup SERVICE`, `grant SLOT personality` \
-                                 or `grant SLOT data SLOT` or `grant SLOT service SLOT`",
+                                 or `grant SLOT data SLOT` or `grant SLOT service SLOT` or \
+                                 `grant disk.SLOT disk DEVICE`",
                             ));
                         }
                     };
@@ -245,6 +282,29 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_data_disk_is_granted_to_a_disk_slot_once() {
+        let base = "program /e\nmemory 4096\nscratch 4096\n";
+        let c = Config::parse(&format!(
+            "{base}grant disk.in.nyc disk data0\ngrant disk.out disk data1\n"
+        ))
+        .expect("parses");
+        assert_eq!(c.grants[0].source, Source::Disk("data0".into()));
+        assert_eq!(c.grants[1].slot, "disk.out");
+        for (grants, why) in [
+            ("grant vsock disk data0\n", "line 4: a grant is"),
+            ("grant disk.in.a disk\n", "line 4: a grant is"),
+            ("grant disk.in.a disk Data0\n", "line 4: a grant is"),
+            (
+                "grant disk.in.a disk data0\ngrant disk.in.b disk data0\n",
+                "line 5: a data disk is granted to one slot",
+            ),
+        ] {
+            let e = Config::parse(&format!("{base}{grants}")).unwrap_err();
+            assert!(e.starts_with(why), "{grants}: {e}");
+        }
+    }
 
     const GOOD: &str = "# the engine\n\
         program /moruna/bin/moruna\n\
@@ -402,6 +462,14 @@ mod tests {
             (
                 "program /e\nprogram /f\nmemory 4096\n",
                 "line 2: given twice",
+            ),
+            (
+                "program /bin/sh\nmemory 4096\n",
+                "line 1: the program is a shell",
+            ),
+            (
+                "program /usr/bin/busybox\nmemory 4096\n",
+                "line 1: the program is a shell",
             ),
             ("program /e\nmemory lots\n", "line 2: not a number"),
             ("program /e\nmemory 0\n", "line 2: a budget of no memory"),

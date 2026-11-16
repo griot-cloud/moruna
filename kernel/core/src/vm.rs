@@ -403,8 +403,9 @@ impl Space {
             .cursor_mut(&guard, &range)
             .map_err(|_| Error::InvalidArgs)?;
         match &area.backing {
-            // Stream B1: a lazy object's pages are mapped as they are touched.
-            Backing::Object { memory, .. } if memory.is_lazy() => {}
+            // Stream B1: a lazy object's pages are mapped as they are touched, and a
+            // snapshot maps in one space only.
+            Backing::Object { memory, .. } if memory.is_lazy() => memory.bind(&self.vm)?,
             Backing::Object { memory, first, .. } => {
                 let property =
                     PageProperty::new_user(page_flags(area.prot), CachePolicy::Writeback);
@@ -815,7 +816,7 @@ impl Space {
             let page = at & !(PAGE_SIZE - 1);
             let within = (at - page) as usize;
             let n = (PAGE_SIZE as usize - within).min(len - done);
-            let frame = {
+            let copied = {
                 let mut inner = self.inner.lock();
                 let (start, area) = Space::area_at(&inner, page).ok_or(Error::Fault)?;
                 let access = if write { Access::Write } else { Access::Read };
@@ -831,14 +832,28 @@ impl Space {
                 {
                     self.unmap_ptes(page, PAGE_SIZE);
                 }
-                let (frame, _) = self.frame(&mut inner, start, &area, page, write)?;
-                if matches!(area.backing, Backing::Zero) {
-                    // A page first touched by a copy is touched for the process too.
-                    self.touch(&mut inner, start, &area, page)?;
+                // stream B1 hook: a pager's page not supplied yet is waited for below.
+                match self.frame(&mut inner, start, &area, page, write) {
+                    Ok((frame, _)) => {
+                        if matches!(area.backing, Backing::Zero) {
+                            // A page first touched by a copy is touched for the process too.
+                            self.touch(&mut inner, start, &area, page)?;
+                        }
+                        // Stream B1: copied under the space's lock, so no clone shares the
+                        // page between its choice and the copy.
+                        f(&frame, within, done, n)?;
+                        true
+                    }
+                    Err(Error::ShouldWait) => false,
+                    Err(e) => return Err(e),
                 }
-                frame
             };
-            f(&frame, within, done, n)?;
+            if !copied {
+                // Stream B1: the copy waits for the pager, as a fault does.
+                let thread = crate::process::current().ok_or(Error::ShouldWait)?;
+                self.want(page, &thread)?;
+                continue;
+            }
             self.count_copy(n);
             done += n;
         }
@@ -1511,7 +1526,7 @@ impl Space {
 // space's are: one for each region of `charge::TABLE_REGIONS` it touches, given back when
 // an unmap covers the region whole and OSTD drops the table.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeSet, btree_map::Entry};
 use core::ops::Range;
 
 use crate::process::Thread;
@@ -1836,12 +1851,15 @@ impl Space {
     /// for it lose write access. Any other mapping of an object is shared. The data
     /// plane's and device areas are left out. The personality's region carries over.
     pub fn clone_into(&self, child: &Space) -> Result<(), Error> {
+        let (mine, theirs_account) = (&self.account, &child.account);
         let mut inner = self.inner.lock();
+        // First everything that can be refused, while this space is as it was. A private
+        // object gets one pair of sides however many areas map it, so two areas sharing it
+        // here share it in the clone too: this side's and the clone's, by the object.
+        let mut forks: BTreeMap<usize, (Arc<MemoryObject>, Arc<MemoryObject>)> = BTreeMap::new();
+        let mut zeros = Vec::new();
         let mut theirs: BTreeMap<u64, Area> = BTreeMap::new();
-        let mut mine: Vec<(u64, Area)> = Vec::new();
-        let mut taken: Vec<u64> = Vec::new();
         for (&start, area) in inner.areas.iter() {
-            let pages = ((area.end - start) / PAGE_SIZE) as usize;
             let backed = |memory: Arc<MemoryObject>, first: usize, writable: bool| Area {
                 backing: Backing::Object {
                     memory,
@@ -1858,25 +1876,37 @@ impl Space {
                     first,
                     writable,
                 } if memory.is_snapshot() || matches!(area.kind, Kind::Image | Kind::Stack) => {
-                    let (m, m_first, t) =
-                        memory.fork(*first, pages, &self.account, &child.account)?;
-                    mine.push((start, backed(m, m_first, *writable)));
-                    theirs.insert(start, backed(t, 0, *writable));
+                    let sides = match forks.entry(Arc::as_ptr(memory) as usize) {
+                        Entry::Occupied(sides) => sides.into_mut(),
+                        Entry::Vacant(place) if memory.is_snapshot() => {
+                            let twin = Arc::new(memory.twin(theirs_account)?);
+                            memory.share_with(&twin, mine, theirs_account)?;
+                            place.insert((memory.clone(), twin))
+                        }
+                        Entry::Vacant(place) => {
+                            let n = (memory.size() / PAGE_SIZE) as usize;
+                            let a = MemoryObject::snapshot(memory, 0, n, mine)?;
+                            let b = MemoryObject::snapshot(memory, 0, n, theirs_account)?;
+                            place.insert((Arc::new(a), Arc::new(b)))
+                        }
+                    };
+                    theirs.insert(start, backed(sides.1.clone(), *first, *writable));
                 }
                 Backing::Object { .. } => {
                     theirs.insert(start, area.clone());
                 }
                 Backing::Zero => {
+                    let pages = ((area.end - start) / PAGE_SIZE) as usize;
                     let held: Vec<(usize, UFrame)> = inner
                         .zero
                         .range(start..area.end)
                         .map(|(p, f)| (((p - start) / PAGE_SIZE) as usize, f.clone()))
                         .collect();
-                    taken.extend(held.iter().map(|(i, _)| start + *i as u64 * PAGE_SIZE));
-                    let (m, t) =
-                        MemoryObject::fork_zero(pages, held, &self.account, &child.account)?;
-                    mine.push((start, backed(m, 0, true)));
-                    theirs.insert(start, backed(t, 0, true));
+                    let records = crate::memory::records(held.len(), mine, theirs_account)?;
+                    let a = Arc::new(MemoryObject::anonymous(pages, mine)?);
+                    let b = Arc::new(MemoryObject::anonymous(pages, theirs_account)?);
+                    theirs.insert(start, backed(b.clone(), 0, true));
+                    zeros.push((start, area.end, a, b, held, records));
                 }
             }
         }
@@ -1885,10 +1915,39 @@ impl Space {
             let len = p.region.end - p.region.start;
             child.set_program(p.region.start, len, p.copy.clone())?;
         }
+        // Then what cannot fail. This side's private areas map their new objects.
+        let mut changed = Vec::new();
+        for (start, area) in inner.areas.iter_mut() {
+            if let Backing::Object { memory, .. } = &mut area.backing
+                && let Some((mine, _)) = forks.get(&(Arc::as_ptr(memory) as usize))
+            {
+                let _ = mine.bind(&self.vm);
+                *memory = mine.clone();
+                changed.push((*start, area.end));
+            }
+        }
+        // A zero area's pages move into the two objects with what was charged for them,
+        // so the clone needs room for its records alone.
+        let mut gone = Vec::new();
+        for (start, end, a, b, held, records) in zeros {
+            for (index, _) in &held {
+                gone.extend(inner.zero.remove(&(start + *index as u64 * PAGE_SIZE)));
+            }
+            inner.charged -= held.len() as u64 * charge::ZERO_PAGE;
+            MemoryObject::share_zero(&a, &b, held, mine, charge::ZERO_PAGE, records);
+            let _ = a.bind(&self.vm);
+            if let Some(area) = inner.areas.get_mut(&start) {
+                area.backing = Backing::Object {
+                    memory: a,
+                    first: 0,
+                    writable: true,
+                };
+            }
+            changed.push((start, end));
+        }
+        // Every page they share loses write access in this space's tables.
         let program = self.program();
-        for (start, area) in mine {
-            let end = area.end;
-            inner.areas.insert(start, area);
+        for (start, end) in changed {
             Space::write_protect(&self.vm, start, end);
             // The program's table drops them, and takes them back read only as it touches
             // them: walking it would make tables where it has none.
@@ -1896,7 +1955,6 @@ impl Space {
                 self.program.unmap(start, end - start, &self.account);
             }
         }
-        let gone: Vec<UFrame> = taken.iter().filter_map(|p| inner.zero.remove(p)).collect();
         self.settle(&mut inner);
         drop(inner);
         drop(gone);

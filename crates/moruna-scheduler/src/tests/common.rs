@@ -61,6 +61,7 @@ pub fn cfg() -> SchedulerConfig {
         policies: crate::policies::standard(),
         clock: std::sync::Arc::new(crate::decide::SystemClock::default()),
         disk_bytes_per_second: crate::decide::DISK_BYTES_PER_SECOND,
+        on_worker_start: None,
     }
 }
 

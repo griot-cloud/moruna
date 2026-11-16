@@ -1266,7 +1266,12 @@ pub(crate) fn spawn_all(shared: &Arc<Shared>) -> Result<()> {
             let shared = Arc::clone(shared);
             let handle = std::thread::Builder::new()
                 .name(format!("moruna-worker-{worker}"))
-                .spawn(move || crate::worker::worker_loop(shared, worker as u16, rx, parker))
+                .spawn(move || {
+                    if let Some(start) = &shared.cfg.on_worker_start {
+                        (start.0)(worker as u16);
+                    }
+                    crate::worker::worker_loop(shared, worker as u16, rx, parker)
+                })
                 .map_err(|e| MorunaError::Plan(format!("a worker thread could not start: {e}")))?;
             handles.push(Some(handle));
         }
