@@ -25,7 +25,8 @@
 //! **The pager (§4.1 c).** [`pager_create`] makes an object whose pages a server supplies:
 //! a touch of a page it does not hold sends a [`pager_request`] on the server's channel,
 //! and the thread waits until [`pager_supply`] gives the page or [`pager_refuse`] refuses
-//! it; a refusal is a fault of the touching thread.
+//! it; a refusal is a fault of the touching thread. `process_read` and `process_write` wait
+//! for the pager the same way, and answer `Fault` on a refusal.
 //!
 //! **Thread state and interruption (§4.1 d).** [`thread_state_read`] and
 //! [`thread_state_write`] reach the registers of a thread asleep in the core, and
@@ -213,7 +214,9 @@ pub fn personality_return(frame: &mut Frame) -> Result<u64> {
 /// source's pages until it writes them, each write copying the page and charging the copy
 /// to the snapshot's account. Writes to the source may show in pages the snapshot has not
 /// written, as a Linux `MAP_PRIVATE` mapping of a file allows; [`process_clone`] gives a
-/// process's private mappings a full copy-on-write snapshot.
+/// process's private mappings a full copy-on-write snapshot. A snapshot maps into one
+/// process: mapping it into a second, while the first lives, is refused with `BadState`, so a
+/// clone reaches every mapping that could write a page it shares.
 pub fn memory_snapshot(
     memory: &Memory,
     offset: u64,
@@ -241,7 +244,9 @@ pub fn memory_snapshot(
 /// snapshot) is shared until either side writes it, which copies it; every other mapping
 /// of a memory object is shared; the data plane's and device mappings are left out. It has
 /// no threads and no handles, and keeps `process`'s personality region: the caller starts
-/// it with [`Process::launch`], its first thread in the personality.
+/// it with [`Process::launch`], its first thread in the personality. Two mappings of one
+/// private object stay one object in the clone. The pages it shares stay charged where they
+/// were, so it needs room only for its records (64 bytes a page) and its own tables.
 pub fn process_clone(
     resource: &Handle,
     process: &Process,

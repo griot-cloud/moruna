@@ -444,6 +444,8 @@ process personality
   expect B1 futex waker: ok:
   expect kk: process b1-futex exited with code 0 (
   expect B1 futex: ok:
+  expect B1 places: ok:
+  expect B1 room: ok:
   expect B1 tables: ok:
   expect kk: process b1-tables exited with code 0 (
   expect B1 tables run: ok:

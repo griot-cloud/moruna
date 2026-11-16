@@ -8,10 +8,13 @@
 //!   then keeps its own. A process cloned from another shares its zero pages and its image
 //!   until either writes them: writes on each side, by the kernel's copies and by the source
 //!   in user mode, stay on that side, each copy charged to the writer's account; a shared
-//!   object stays shared.
+//!   object stays shared. A snapshot mapped in two places of one process is one object in
+//!   its clone too, and no later write through either place reaches the clone; a second
+//!   process cannot map it. A clone needs no room for the zero pages it shares.
 //! - **The pager (§4.1 c).** A thread touching a pager's page waits while the pager is asked;
 //!   the pager supplies it and the thread reads it. A second process touches another page,
-//!   which the pager refuses, and faults.
+//!   which the pager refuses, and faults. `process_read` and `process_write` wait for the
+//!   pager too, and answer `Fault` on a refusal.
 //! - **The entry (§4.1 a).** A process with a personality region runs a program of a few
 //!   instructions: its system call enters the personality, which answers it and returns
 //!   through the entry; a native call number enters too; the program's FS base is its own;
@@ -232,7 +235,7 @@ fn tester(out: &Console) -> i64 {
         out,
         "pager",
         pager(out, &resource, &image),
-        "a thread waited for a page the pager supplied and read it; a page the pager refused faulted another process",
+        "a thread waited for a page the pager supplied and read it; a page the pager refused faulted another process; process_read and process_write waited for the pager, and a refused page answered fault",
     );
     code |= report(
         out,
@@ -245,6 +248,18 @@ fn tester(out: &Console) -> i64 {
         "copy run",
         copy_run(out, &resource, &image),
         "the copy child ended",
+    );
+    code |= report(
+        out,
+        "places",
+        places(&resource),
+        "a snapshot mapped twice in one process was one object in its clone too, no later write through either place reached the clone, and a second process could not map it",
+    );
+    code |= report(
+        out,
+        "room",
+        room(&resource),
+        "a clone of a process whose account had no room for its zero pages again was made, and its account's peak rose by less than a quarter of them",
     );
     code |= report(
         out,
@@ -562,7 +577,7 @@ fn request(port: &Channel) -> Result<(u64, u64), (&'static str, Option<Error>)> 
 
 fn pager(out: &Console, resource: &Handle, image: &Handle) -> Outcome {
     let (kernel_end, port) = call(Channel::create(), "channel_create")?;
-    let object = match personality::pager_create(kernel_end, 4 * PAGE, 0x51, None) {
+    let object = match personality::pager_create(kernel_end, 8 * PAGE, 0x51, None) {
         Ok(m) => m,
         Err((e, _)) => return Err(("pager_create", Some(e))),
     };
@@ -616,7 +631,118 @@ fn pager(out: &Console, resource: &Handle, image: &Handle) -> Outcome {
         wait_one(&victim.0, Signals::TERMINATED, now() + ms(10_000)),
         "the victim did not end",
     )?;
-    Ok(())
+    pager_copies(resource, &object, &port)
+}
+
+/// Where a third process maps the pager's object, for the kernel's copies.
+const PAGER_AT: u64 = 0x0c00_0000_0000;
+
+static COPY_OP: AtomicU64 = AtomicU64::new(0);
+static COPY_DONE: AtomicU64 = AtomicU64::new(0);
+static COPY_READ: AtomicU64 = AtomicU64::new(0);
+
+/// `process_read` (op 1) or `process_write` (op 2) of the page `arg >> 32` of the process
+/// whose handle is `arg`'s low half: 1 when it succeeded, 2 on `Fault`, 3 otherwise.
+extern "C" fn copier(arg: u64) -> ! {
+    let process = Process(Handle::from_raw(arg as u32));
+    let at = PAGER_AT + (arg >> 32) * PAGE;
+    let r = match COPY_OP.load(Ordering::Acquire) {
+        1 => {
+            let mut b = [0u8; 8];
+            let r = process.read(at, &mut b);
+            COPY_READ.store(u64::from_le_bytes(b), Ordering::Release);
+            r
+        }
+        _ => process.write(at, b"WRITTEN!"),
+    };
+    core::mem::forget(process);
+    let done = match r {
+        Ok(()) => 1,
+        Err(Error::Fault) => 2,
+        Err(_) => 3,
+    };
+    COPY_DONE.store(done, Ordering::Release);
+    thread_exit()
+}
+
+/// One kernel copy of page `page` through `process`, on a thread of its own: the pager is
+/// asked for the page, which `answer` supplies or refuses. What the copy answered.
+fn copy_through_pager(
+    process: &Process,
+    page: u64,
+    op: u64,
+    port: &Channel,
+    answer: impl FnOnce(u64) -> Outcome,
+) -> Result<u64, (&'static str, Option<Error>)> {
+    COPY_OP.store(op, Ordering::Release);
+    COPY_DONE.store(0, Ordering::Release);
+    let raw = process.0.raw() as u64 | page << 32;
+    let t = spawn(copier, raw)?;
+    let (key, offset) = request(port)?;
+    want(
+        key == 0x51 && offset == page * PAGE,
+        "the copy's request named another page",
+    )?;
+    want(
+        COPY_DONE.load(Ordering::Acquire) == 0,
+        "the copy did not wait for the pager",
+    )?;
+    answer(offset)?;
+    call(
+        wait_one(&t.0, Signals::TERMINATED, now() + ms(10_000)),
+        "the copy did not end",
+    )?;
+    Ok(COPY_DONE.load(Ordering::Acquire))
+}
+
+/// A page the pager supplies, holding `text`.
+fn supply(object: &Memory, offset: u64, text: &[u8; 8]) -> Outcome {
+    let page = call(Memory::create(PAGE), "a supplied page")?;
+    let m = call(page.map(0, PAGE, map::WRITE), "mapping a supplied page")?;
+    call(m.write(0, text), "writing a supplied page")?;
+    drop(m);
+    call(
+        personality::pager_supply(object, offset, PAGE, &page, 0),
+        "pager_supply",
+    )
+}
+
+fn pager_copies(resource: &Handle, object: &Memory, port: &Channel) -> Outcome {
+    let z = call(Process::create(resource, "b1-copies"), "process_create")?;
+    let theirs = call(
+        object
+            .0
+            .duplicate(Rights::READ | Rights::WRITE | Rights::MAP),
+        "duplicate",
+    )?;
+    call(
+        z.map(Some(&theirs), 0, 8 * PAGE, PAGER_AT, map::READ | map::WRITE),
+        "mapping the pager's object",
+    )?;
+    let read = copy_through_pager(&z, 2, 1, port, |o| supply(object, o, b"SUPPLIED"))?;
+    want(
+        read == 1 && COPY_READ.load(Ordering::Acquire) == u64::from_le_bytes(*b"SUPPLIED"),
+        "process_read did not read the page the pager supplied",
+    )?;
+    let wrote = copy_through_pager(&z, 3, 2, port, |o| supply(object, o, &[0; 8]))?;
+    want(
+        wrote == 1,
+        "process_write did not write the page the pager supplied",
+    )?;
+    let mine = call(object.map(3 * PAGE, PAGE, 0), "mapping the written page")?;
+    let mut b = [0u8; 8];
+    call(mine.read(0, &mut b), "reading the written page")?;
+    want(
+        &b == b"WRITTEN!",
+        "process_write's bytes did not land in the pager's page",
+    )?;
+    let refused = copy_through_pager(&z, 4, 1, port, |o| {
+        call(personality::pager_refuse(object, o, PAGE), "pager_refuse")
+    })?;
+    want(
+        refused == 2,
+        "a refused page did not answer process_read with fault",
+    )
 }
 
 // ---- The entry.
@@ -947,5 +1073,124 @@ fn tables_child() -> Outcome {
     want(
         whole == 1 << 39,
         "an emptied 512 GiB region's tables stayed",
+    )
+}
+
+// ---- A snapshot in two places.
+
+const PLACES: u64 = 0x0d00_0000_0000;
+
+fn places(resource: &Handle) -> Outcome {
+    let word = |text: &[u8; 8]| u64::from_le_bytes(*text);
+    let source = call(Memory::create(PAGE), "memory_create")?;
+    let snap = call(
+        personality::memory_snapshot(&source, 0, PAGE, None),
+        "memory_snapshot",
+    )?;
+    let x = call(Process::create(resource, "b1-places"), "process_create")?;
+    let (a, b) = (PLACES, PLACES + 2 * PAGE);
+    for at in [a, b] {
+        call(
+            x.map(Some(&snap.0), 0, PAGE, at, map::READ | map::WRITE),
+            "mapping the snapshot twice",
+        )?;
+    }
+    // One process maps it: another, and this one, are refused.
+    let y = call(Process::create(resource, "b1-places-y"), "process_create")?;
+    match y.map(Some(&snap.0), 0, PAGE, a, map::READ | map::WRITE) {
+        Err(Error::BadState) => {}
+        _ => return Err(("a second process mapped the snapshot", None)),
+    }
+    match snap.map(0, PAGE, 0) {
+        Err(Error::BadState) => {}
+        _ => return Err(("a third process mapped the snapshot", None)),
+    }
+    call(x.write(a, b"11111111"), "writing one place")?;
+    want(
+        read_u64(&x, b)? == word(b"11111111"),
+        "the two places are not one object",
+    )?;
+    let c = call(
+        personality::process_clone(resource, &x, None),
+        "process_clone",
+    )?;
+    call(
+        x.write(b, b"22222222"),
+        "writing the other place after the clone",
+    )?;
+    want(
+        read_u64(&c, a)? == word(b"11111111") && read_u64(&c, b)? == word(b"11111111"),
+        "a write through the second place reached the clone",
+    )?;
+    want(
+        read_u64(&x, a)? == word(b"22222222"),
+        "the source's two places stopped being one object",
+    )?;
+    call(c.write(a, b"33333333"), "writing the clone")?;
+    want(
+        read_u64(&c, b)? == word(b"33333333"),
+        "the clone's two places are not one object",
+    )?;
+    want(
+        read_u64(&x, a)? == word(b"22222222"),
+        "the clone's write reached the source",
+    )
+}
+
+// ---- A clone's room.
+
+const ROOM: u64 = 0x0e00_0000_0000;
+const ROOM_PAGES: u64 = 128;
+
+fn room(resource: &Handle) -> Outcome {
+    let budget = call(Account::carve(2 << 20, "b1-room"), "account_create")?;
+    let source = call(
+        Process::create_in(resource, "b1-room", &budget.0),
+        "process_create",
+    )?;
+    call(
+        source.map(None, 0, ROOM_PAGES * PAGE, ROOM, map::READ | map::WRITE),
+        "mapping zero pages",
+    )?;
+    for i in 0..ROOM_PAGES {
+        call(
+            source.write(ROOM + i * PAGE, &i.to_le_bytes()),
+            "touching a zero page",
+        )?;
+    }
+    // The account fills to within 16 pages of its limit.
+    let u = call(budget.usage(), "account_info")?;
+    let room = u.limit - u.used - u.reserved;
+    let filler = (room - 16 * PAGE - 256) / (PAGE + 16);
+    let _filler = call(
+        Memory::create_in(filler * PAGE, &budget.0),
+        "filling the account",
+    )?;
+    let before = call(budget.usage(), "account_info")?;
+    want(
+        before.limit - before.used - before.reserved < ROOM_PAGES * PAGE / 2,
+        "the account still had room for its zero pages",
+    )?;
+    let theirs = call(Account::carve(4 << 20, "b1-room-clone"), "account_create")?;
+    let child = call(
+        personality::process_clone(resource, &source, Some(&theirs.0)),
+        "process_clone with no room for the zero pages twice",
+    )?;
+    let after = call(budget.usage(), "account_info")?;
+    want(
+        after.peak - before.peak < ROOM_PAGES * PAGE / 4,
+        "the clone charged the source's account its zero pages again",
+    )?;
+    want(
+        read_u64(&child, ROOM + 5 * PAGE)? == 5,
+        "the clone lost a zero page",
+    )?;
+    call(
+        source.write(ROOM + 5 * PAGE, &9u64.to_le_bytes()),
+        "the source's write",
+    )?;
+    want(
+        read_u64(&child, ROOM + 5 * PAGE)? == 5 && read_u64(&source, ROOM + 5 * PAGE)? == 9,
+        "a shared zero page did not copy on write",
     )
 }
