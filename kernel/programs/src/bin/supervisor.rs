@@ -55,6 +55,8 @@ fn run() -> i64 {
     let quota = Channel(slot("quota"));
     // stream A hook: the data path's test starts tasks too (DS-A).
     let datapath = Channel(slot("datapath"));
+    // stream B1 hook
+    let personality = Channel(slot("personality"));
     if abi_version() != moruna_sys::ABI_VERSION {
         println!(
             out,
@@ -247,6 +249,15 @@ fn run() -> i64 {
     };
     if let Err((e, _)) = datapath.write(b"process", [for_datapath]) {
         return fail(&out, "handing the data path's test its process resource", e);
+    }
+    // stream B1 hook (data-os-streams.md): the personality's mechanisms' test starts its
+    // children, and clones one, with a process resource of its own.
+    let for_personality = match root_process.duplicate(Rights::WRITE | Rights::TRANSFER) {
+        Ok(h) => h,
+        Err(e) => return fail(&out, "duplicating the process resource", e),
+    };
+    if let Err((e, _)) = personality.write(b"process", [for_personality]) {
+        return fail(&out, "handing the personality test its process resource", e);
     }
     // SDD 25: the device manager does the device work with the device roots.
     if let Err((e, _)) = devices.write(

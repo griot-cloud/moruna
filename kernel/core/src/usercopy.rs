@@ -2,16 +2,26 @@
 //!
 //! Every copy goes through OSTD's fallible user readers and writers, which check the
 //! range is user space and turn a fault into an error, so a bad pointer from a process
-//! is `Fault`, never a kernel crash. A copy that faults on zero pages the process has
-//! not touched yet populates them (SDD 20, f.12) and is tried once more. Every length
-//! is bounded by the caller before it gets here, and buffers are reserved fallibly.
+//! is `Fault`, never a kernel crash. A copy that faults on pages the process has not
+//! touched yet makes them ready as the process's own faults would (SDD 20, f.12): a zero
+//! page, a page shared copy-on-write written, or a pager's page waited for; and it is
+//! tried once more. Every length is bounded by the caller before it gets here, and
+//! buffers are reserved fallibly.
 
 use alloc::vec::Vec;
 
 use moruna_abi::Error;
 use ostd::mm::{FallibleVmRead, FallibleVmWrite, VmReader, VmWriter};
 
-use crate::vm::Space;
+use crate::{process, vm::Space};
+
+/// Makes `ptr .. ptr + len` ready for a copy, as the calling thread's faults would.
+fn prepare(space: &Space, ptr: u64, len: u64, write: bool) -> Result<(), Error> {
+    match process::current() {
+        Some(thread) => space.prepare(ptr, len, write, &thread),
+        None => space.populate(ptr, len, write),
+    }
+}
 
 fn read_into(space: &Space, ptr: u64, buf: &mut [u8]) -> Result<(), Error> {
     let addr = usize::try_from(ptr).map_err(|_| Error::Fault)?;
@@ -55,7 +65,7 @@ pub fn read_exact(space: &Space, ptr: u64, buf: &mut [u8]) -> Result<(), Error> 
     if read_into(space, ptr, buf).is_ok() {
         return Ok(());
     }
-    space.populate(ptr, buf.len() as u64, false)?;
+    prepare(space, ptr, buf.len() as u64, false)?;
     read_into(space, ptr, buf)
 }
 
@@ -77,7 +87,7 @@ pub fn write(space: &Space, ptr: u64, data: &[u8]) -> Result<(), Error> {
     if write_from(space, ptr, data).is_ok() {
         return Ok(());
     }
-    space.populate(ptr, data.len() as u64, true)?;
+    prepare(space, ptr, data.len() as u64, true)?;
     write_from(space, ptr, data)
 }
 
