@@ -15,3 +15,6 @@ pub(in crate::fs) mod test;
 
 pub(crate) use fs::ImageFs;
 pub(crate) use port::ImageSource;
+// The port's types, for the target's adapter (`start/image.rs`).
+#[cfg(target_os = "none")]
+pub(crate) use port::{ImageDirent, ImageError, ImageResult, ImageStat};

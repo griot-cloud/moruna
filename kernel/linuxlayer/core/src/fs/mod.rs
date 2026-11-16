@@ -11,6 +11,9 @@ pub mod utils;
 pub mod vfs;
 
 pub use fs_impls::devtmpfs;
+// The image root's port, for the target's adapter (`start/image.rs`).
+#[cfg(target_os = "none")]
+pub(crate) use fs_impls::imagefs;
 pub(crate) use fs_impls::{cgroupfs, exfat, ext2, procfs, pseudofs, ramfs, tmpfs};
 
 use crate::{

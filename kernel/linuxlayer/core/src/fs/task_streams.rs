@@ -60,8 +60,8 @@ pub(crate) trait PlaneInput: Send + Sync {
 /// What an Arrow IPC message is, by its flatbuffer's header type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
-    not(ktest),
-    expect(dead_code, reason = "the start's adapter makes them")
+    all(not(ktest), not(target_os = "none")),
+    expect(dead_code, reason = "the target's start makes them (`start/plane.rs`)")
 )]
 pub(crate) enum MessageKind {
     Schema,

@@ -50,6 +50,8 @@ pub mod prelude;
 pub mod process;
 mod sched;
 pub mod security;
+// User space: a task's start, which its launcher gives the personality.
+pub mod start;
 mod syscall;
 mod thread;
 mod time;

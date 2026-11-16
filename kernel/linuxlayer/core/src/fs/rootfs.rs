@@ -46,8 +46,8 @@ static TASK_FS: Once<TaskFs> = Once::new();
 
 /// Gives the task's filesystems, once, before the first process starts.
 #[cfg_attr(
-    not(ktest),
-    expect(dead_code, reason = "the launcher (stream B2) calls it")
+    all(not(ktest), not(target_os = "none")),
+    expect(dead_code, reason = "the target's start calls it (`start/moruna.rs`)")
 )]
 pub(crate) fn set_task_fs(task_fs: TaskFs) -> Result<()> {
     let mut given = Some(task_fs);

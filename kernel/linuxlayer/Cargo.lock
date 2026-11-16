@@ -403,6 +403,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
+name = "imagefs-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+]
+
+[[package]]
 name = "inherit-methods-macro"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -651,6 +658,10 @@ name = "moruna-abi"
 version = "0.1.0"
 
 [[package]]
+name = "moruna-ipc-check"
+version = "0.1.0"
+
+[[package]]
 name = "moruna-linuxlayer"
 version = "0.19.0"
 dependencies = [
@@ -675,6 +686,7 @@ dependencies = [
  "device-id",
  "hashbrown 0.14.5",
  "id-alloc",
+ "imagefs-protocol",
  "inherit-methods-macro",
  "int-to-c-enum",
  "intrusive-collections",
@@ -688,6 +700,10 @@ dependencies = [
  "linuxlayer-ostd",
  "lru",
  "miniz_oxide",
+ "moruna-ipc-check",
+ "moruna-record",
+ "moruna-svc",
+ "moruna-sys",
  "ostd-pod",
  "paste",
  "rand",
@@ -709,6 +725,18 @@ dependencies = [
 [[package]]
 name = "moruna-loader"
 version = "0.1.0"
+
+[[package]]
+name = "moruna-record"
+version = "0.6.6"
+
+[[package]]
+name = "moruna-svc"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+ "moruna-sys",
+]
 
 [[package]]
 name = "moruna-sys"
