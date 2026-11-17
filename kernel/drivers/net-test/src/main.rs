@@ -55,7 +55,7 @@ fn open(directory: &RefDirectory, name: &str) -> Result<net::Client, String> {
         .borrow_mut()
         .lookup(String::from(name))
         .map_err(|e| format!("looking up {name}: {e:?}"))?;
-    let mut client = net::Client::connect(channel, deadline_in(60 * SECONDS))
+    let mut client = net::Client::connect(channel, deadline_in(moruna_svc::READY_TIMEOUT))
         .map_err(|e| format!("hello to {name}: {e:?}"))?;
     client.core().set_timeout(60 * SECONDS);
     Ok(client)
