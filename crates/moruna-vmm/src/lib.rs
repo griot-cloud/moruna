@@ -71,3 +71,30 @@ mod tests {
         assert!(matches!(boot(&c), Err(error::VmmError::Config { .. })));
     }
 }
+
+// stream U hooks, at the end of the file so that no line above moves: the usage build's
+// collection (feature `usage`), and the hook `RunningNode::shutdown` calls through
+// `usage_hook!`, which in every other build is its first argument and nothing else.
+#[cfg(feature = "usage")]
+pub mod usage;
+
+/// stream U hook: the usage build collects the node's coverage evidence before it is stopped.
+#[cfg(feature = "usage")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! usage_hook {
+    ($value:expr, $runtime_dir:expr) => {{
+        $crate::usage::at_shutdown($runtime_dir);
+        $value
+    }};
+}
+
+/// stream U hook: nothing in every build but the usage build.
+#[cfg(not(feature = "usage"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! usage_hook {
+    ($value:expr, $runtime_dir:expr) => {
+        $value
+    };
+}

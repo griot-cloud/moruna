@@ -52,3 +52,15 @@ mod heap_allocator {
         type_from_layout(layout)
     }
 }
+
+// stream U hook: the usage build's kernel is compiled with `-C instrument-coverage`, whose
+// code names the profiling runtime through this symbol. There is no runtime: the counters
+// stay in the kernel image, and the host reads them out of the guest's memory at the end of
+// a job (kernel/usage). Only the usage build has it.
+#[cfg(feature = "usage")]
+mod usage {
+    // SAFETY: LLVM's instrumented code refers to this symbol by name, and no other crate in
+    // the image defines it.
+    #[unsafe(no_mangle)]
+    static __llvm_profile_runtime: u8 = 0;
+}

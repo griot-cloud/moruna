@@ -2475,6 +2475,10 @@ name = "moruna-types"
 version = "0.6.6"
 
 [[package]]
+name = "moruna-usage"
+version = "0.1.0"
+
+[[package]]
 name = "moruna-virtio"
 version = "0.1.0"
 dependencies = [
@@ -2495,6 +2499,7 @@ dependencies = [
  "libc",
  "linux-loader",
  "moruna-kernel",
+ "moruna-usage",
  "serde",
  "serde_json",
  "sha2 0.11.0",

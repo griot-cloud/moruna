@@ -17,3 +17,6 @@ moruna-microkernel.workspace = true
 
 [features]
 probe = ["moruna-microkernel/probe"]
+# stream U: the usage build (kernel/tools/build.sh with MORUNA_USAGE=1), which also compiles
+# every crate with `-C instrument-coverage`. Off in every other build.
+usage = []

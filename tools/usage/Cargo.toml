@@ -1,0 +1,27 @@
+# stream U: the usage build's report (architecture/data-os-streams.md). A host tool, not part of
+# Moruna's runtime, so it is a workspace of its own, as images/gate is.
+[workspace]
+resolver = "3"
+
+[package]
+name = "moruna-usage-report"
+description = "Turns the usage build's evidence from the gate's jobs into what each job used and what nothing used: native and Linux calls, programs, coverage, and the candidates for removal"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "moruna-usage"
+path = "src/main.rs"
+
+[dependencies]
+moruna-usage = { path = "../../kernel/usage", features = ["alloc"] }
+# The root workspace's pins (Cargo.lock).
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.151" }
+rustc-demangle = { version = "=0.1.28" }
+
+[dev-dependencies]
+moruna-usage = { path = "../../kernel/usage", features = ["alloc", "testing"] }

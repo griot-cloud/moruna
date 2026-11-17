@@ -27,6 +27,8 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 libc = { workspace = true }
 sha2 = { workspace = true }
+# stream U: the usage build's kernel ELF reading (feature `usage`).
+moruna-usage = { path = "../../kernel/usage", version = "=0.1.0", features = ["alloc"], optional = true }
 
 # The actual vhost-user server is portable Linux userspace, independent of KVM.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -55,3 +57,6 @@ native-tcg-proof = []
 
 # Explicit fixture command/console proof only; production launcher stays strict KVM.
 kd3-conformance-proof = ["native-tcg-proof"]
+# stream U: the usage build's evidence, read from the node before it stops (src/usage.rs). Never
+# in a production or timed build.
+usage = ["dep:moruna-usage"]

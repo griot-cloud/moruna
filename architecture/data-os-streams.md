@@ -822,3 +822,69 @@ and switches to the new one when the call answers.
     being cut by C's arena by use and fixed sink cap, and P's queue.
   - **Correction to an earlier figure:** the arena committed 1.5 to 3.4 times its peak use, not
     3 to 11. Its note gives the total of the objects made, not each object's size.
+- **2026-11-17: stream U, the usage build** (Brackly: "once we have tested stuff we'll see what
+  part of moruna os is useless or not being used and we can remove it"). An untimed build that
+  runs the gate's jobs once and records what they used. Stream U's technical calls:
+  - **One switch, off by default.** `MORUNA_USAGE=1 kernel/tools/build.sh OUT` adds
+    `-C instrument-coverage -Zno-profiler-runtime -Cllvm-args=-instrprof-atomic-counter-update-all`
+    and the features `usage` (kernel boot) and `moruna-sys/usage` (every user program). The host
+    side is `moruna` (`-p moruna-runtime --bin moruna-engine`) built with `--features usage`,
+    which keeps the evidence in `MORUNA_USAGE_DIR`. Unset, every command is what it was.
+    Checked on the Mac against
+    `9a34ba31`: the kernel ELF, 55 of the 57 user programs and `moruna-vmm`'s binaries are the
+    same files byte for byte; `storage` and `storage-maintenance` load the same bytes (every
+    loadable segment) and differ only in the `.llvm.<hash>` suffixes of 89 local symbol names,
+    which LLVM hashes from the module and which any edit to `kernel/sys/src/raw.rs` changes, a
+    comment at its end included. So no behaviour changes. The timed gate never sets it.
+  - **Hooks move no line.** A panic's location is compiled into the program, so a hook goes at
+    the end of a file or on an existing line: `raw.rs` declares `usage.rs` and holds the `wait`
+    and `process_exit` hooks; `lib.rs` is untouched; `RunningNode::shutdown` calls
+    `usage_hook!`, which outside the usage build is its first argument.
+  - **Coverage, not counters.** Per-call counts are the region counts of the dispatchers' match
+    arms: `syscall.rs` `dispatch` (native calls), `foreign.rs` `fast_call` (Linux calls answered
+    in kernel mode) and `kernel/linux/server` `call`. Counters update atomically, so counts are
+    exact on several CPUs.
+  - **Kernel mode carries no runtime and no dump code.** The node never powers off (the host
+    quits QEMU after the job), so OSTD's `coverage` exit hook would never run, and it would add
+    minicov's C runtime to kernel mode. Instead, after the job's exit, the host waits for the
+    console to settle, pauses the guest over the node's own QMP socket and has QEMU `pmemsave`
+    the kernel's `__llvm_prf_cnts` (its physical address from the kernel ELF's segments). The
+    raw profile (format 10) is rebuilt on the host from the ELF's data and names sections and
+    those counters (`kernel/usage`). Kernel mode gains one static symbol, in the usage build only.
+  - **User programs print their own counters.** `moruna_sys::raw::usage` prints them, sparse
+    and checked by a hash, on the console the program already holds: one second after it goes
+    idle having handled something, when busy and its last dump is five seconds old, and at exit.
+    Its waits answer as before. A dump goes out only in the usage build, through the serial log
+    the host already keeps: no new path from a task to the host, no shell, nothing the host
+    sends in. Tasks (the gate's native tasks, Linux programs) are not instrumented.
+  - **Per process.** The kernel's counts are global. Each program's native calls come from the
+    coverage of moruna-sys's wrappers in its own profile. A dump names its process, and its
+    build by a fingerprint (the size and first record of its `__llvm_prf_data`), which the
+    report matches to the kit's program. Linux refusals per process come from the server's
+    end-of-process line, which B2's personality keeps.
+  - **The engine** (`moruna-engine`, a musl Linux program the gate's image carries) is built for
+    the usage run with `-C instrument-coverage` (LLVM's runtime comes with it on that target) and
+    `--features moruna-sys/usage`: at its exit it prints its counters on standard error from
+    `.fini_array`, in lines the Linux server keeps whole (under 400 bytes). The report takes it
+    with `--program`. The host CLI is the same binary built with `--features usage` and no
+    instrumentation. The gate's native tasks are not instrumented; their native calls are in
+    the kernel's counts.
+  - **B2 carries over** by adding its dispatcher to the report's `DISPATCHES` table
+    (`tools/usage/src/report.rs`); as a program on moruna-sys it dumps as the server does.
+  - **The report** (`tools/usage`, `moruna-usage report`, Rust, its own workspace) merges each
+    job's profiles and all jobs' with the kernel toolchain's `llvm-profdata` and reads them back
+    with `llvm-cov export`. Its candidates for removal are sorted by what user space can reach
+    (the coordinator's order): native calls never made; kernel-mode code on a direct call path
+    from the user-mode loop, never run; Linux calls never answered; services never started or
+    idle; kernel-mode code reachable only from the kernel. Reachability follows direct calls in
+    the kernel's disassembly, so it is a lower bound. Sizes are lines and bytes (from a
+    production kit's symbols with `--prod-kit`). Only functions compiled into the image count.
+  - **Kept for the accelerator path** (Brackly, 2026-11-17), listed apart with their sizes:
+    `MEMORY_PIN`, `DEVICE_MEMORY_CREATE`, `INTERRUPT_CREATE_MSI`, `DMA_RELEASE`, the drivers
+    and the device manager, OSTD's IOMMU and DMA code, and the core's device, DMA and MSI code.
+  - **Kept for mode 1** (Brackly's definition of done, 2026-11-17: Moruna boots as the node itself
+    on Servercore and on Azure), listed in a section of its own with their sizes, though mode 2's
+    job VMs never use them: the net server (`netstack`, with DHCP and TLS), `virtio-net`, `nvme`,
+    `gve`, the node's job API (`node-admission`), and `storage` and `storage-maintenance`,
+    since a mode-1 node boots from its own disk and keeps its home there. A part kept for both
+    says so.
