@@ -49,7 +49,17 @@ built yet.
 | --- | --- | --- |
 | Linux | Tens of millions of lines, with every driver | Over 350 system calls, plus every driver's `ioctl` |
 | Asterinas, whole | OSTD (about 49,000 lines) plus its Linux layer (about 137,000) plus its components (about 42,000) | 245 Linux calls |
-| The data OS | OSTD (about 49,000) plus Moruna's core (6,952 today) plus the mechanisms of §2 (to be measured) | Moruna's 55 native calls, plus §2's few |
+| The data OS | OSTD (about 49,000) plus Moruna's core (9,821 lines on 2026-11-17, with §2's mechanisms of A, B1 and P merged) | Moruna's 71 native calls |
+
+How the figures are measured, so each merge updates them the same way: kernel-mode lines are
+`wc -l` over `kernel/core/src` (tests included); native calls are the call numbers the
+dispatcher in `kernel/core/src/syscall.rs` answers. Measured so, the table's first version
+(`b3d51a64`) had 6,952 lines and 59 calls, where it said 55. Since then: 2026-11-17, at
+`d3201370` (A, B1, C, D, E and P merged, A's wake queue reverted), 9,821 lines and 71 calls. The growth is A's data
+path (slots, windows, clock page), B1's personality mechanisms
+(personality entry, snapshots and clones, the pager, thread state) and P's plane calls. Every
+call that is reachable but no gate job uses is a removal candidate on stream U's list. The
+exceptions are the device and DMA calls, which are kept for the accelerator path.
 
 **Rules this design keeps:**
 
