@@ -243,33 +243,63 @@ pub(crate) fn new_host(
     })
 }
 
-/// Prepare a host region of `bytes` (a multiple of `align`) on memory `backing` grants: the
-/// region is asked for `bytes + align` and used from its first aligned byte. Nothing is
-/// touched, advised or locked: the backing's pages are present already and stay resident.
+/// Prepare a host region of `bytes` (a multiple of `align`) on memory `backing` grants. The
+/// backing is asked for `bytes` exactly: the Moruna kernel maps a large-page object on a 2 MiB
+/// boundary, so a region of the backing's largest size is usable whole, and two 128 MiB
+/// buffers share a 256 MiB region. Only a grant that comes back misaligned loses anything: it
+/// is asked for again one alignment larger when that still fits one grant, and otherwise used
+/// from its first aligned byte, at most one alignment short. The region's usable bytes are
+/// `mapping.bytes()`, which callers count, never the bytes they asked for. Nothing is touched,
+/// advised or locked: the backing's pages are present already and stay resident.
 pub(crate) fn new_granted(backing: &dyn HostBacking, bytes: u64, align: u64) -> Result<HostRegion> {
-    let want = bytes
-        .checked_add(align)
-        .ok_or_else(|| MorunaError::Config {
-            name: "budget.host",
-            msg: format!("a granted region of {bytes} bytes does not fit this address space"),
-        })?;
     GRANTS.fetch_add(1, Ordering::Relaxed);
-    let granted = backing.region(want)?;
+    let granted = backing.region(bytes)?;
     let start = granted.base as usize as u64;
+    if start.is_multiple_of(align) && granted.bytes >= bytes {
+        return Ok(granted_region(granted, 0, bytes));
+    }
+    if let Some(want) = bytes
+        .checked_add(align)
+        .filter(|want| *want <= backing.region_max())
+    {
+        // Given back before the next is asked for, so the two are never held together.
+        drop(granted);
+        GRANTS.fetch_add(1, Ordering::Relaxed);
+        let again = backing.region(want)?;
+        let start = again.base as usize as u64;
+        let skip = align_up(start, align) - start;
+        if again.bytes < skip.saturating_add(bytes) {
+            return Err(MorunaError::Config {
+                name: "budget.host",
+                msg: format!(
+                    "the backing gave {} bytes for a region of {bytes} bytes aligned to {align}",
+                    again.bytes
+                ),
+            });
+        }
+        return Ok(granted_region(again, skip, bytes));
+    }
     let skip = align_up(start, align) - start;
-    if granted.bytes < skip.saturating_add(bytes) {
+    let usable = align_down(granted.bytes.saturating_sub(skip), align).min(bytes);
+    if usable == 0 {
         return Err(MorunaError::Config {
             name: "budget.host",
             msg: format!(
-                "the backing gave {} bytes for a region of {bytes} bytes aligned to {align}",
+                "the backing gave {} bytes at {start:#x}, which hold nothing aligned to {align}",
                 granted.bytes
             ),
         });
     }
-    // SAFETY: `skip + bytes <= granted.bytes`, so the aligned base and the `bytes` after it lie
-    // inside the granted region, which stays mapped while `keep` lives in the mapping.
+    Ok(granted_region(granted, skip, usable))
+}
+
+/// The region of `bytes` from `skip` bytes into `granted`.
+fn granted_region(granted: Granted, skip: u64, bytes: u64) -> HostRegion {
+    // SAFETY: every caller has checked `skip + bytes <= granted.bytes`, so the aligned base and
+    // the `bytes` after it lie inside the granted region, which stays mapped while `keep` lives
+    // in the mapping.
     let base = unsafe { granted.base.add(skip as usize) };
-    Ok(HostRegion {
+    HostRegion {
         mapping: Mapping {
             raw: granted.base,
             raw_len: granted.bytes as usize,
@@ -280,12 +310,13 @@ pub(crate) fn new_granted(backing: &dyn HostBacking, bytes: u64, align: u64) -> 
         },
         huge_pages_active: granted.huge_pages,
         pinned: false,
-    })
+    }
 }
 
-/// The usable bytes of the largest region `backing` gives at `align`.
+/// The usable bytes of the largest region `backing` gives at `align`: all of it, as an aligned
+/// grant is used whole.
 pub(crate) fn granted_chunk(backing: &dyn HostBacking, align: u64) -> u64 {
-    align_down(backing.region_max().saturating_sub(align), align)
+    align_down(backing.region_max(), align)
 }
 
 /// `madvise(MADV_HUGEPAGE)` under the guarantee rules of f.1: a `Present` guarantee that

@@ -10,24 +10,37 @@ use moruna_kernel::{Allocator, Guarantee, MorunaError, Tier, TierKind};
 
 const MIB: u64 = 1024 * 1024;
 
+/// The arena's alignment: its 64 KiB granule.
+const ALIGN: usize = 64 * 1024;
+
 /// What a fake grant keeps: a heap block, freed (and counted) when the arena lets it go.
 struct Block {
-    bytes: Vec<u8>,
+    ptr: *mut u8,
+    layout: std::alloc::Layout,
     released: Arc<AtomicU64>,
 }
+
+// SAFETY: the block is the grant's alone; the arena reaches its bytes through the region it
+// made of them, never through this.
+unsafe impl Send for Block {}
+// SAFETY: as above; nothing reads or writes through a shared `Block`.
+unsafe impl Sync for Block {}
 
 impl Drop for Block {
     fn drop(&mut self) {
         self.released.fetch_add(1, Ordering::SeqCst);
-        let _ = self.bytes.len();
+        // SAFETY: `ptr` came from `alloc_zeroed` with this layout and is freed once, here.
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
     }
 }
 
 /// A backing over the heap, as the data OS's memory objects are: at most `max` bytes a
-/// region, every byte present when it is given.
+/// region, every byte present when it is given. Its grants start on the arena's alignment, as
+/// the kernel maps a large-page object on a 2 MiB boundary, or a page past it when `skewed`.
 struct Heap {
     max: u64,
     huge: bool,
+    skewed: bool,
     given: Mutex<Vec<u64>>,
     released: Arc<AtomicU64>,
     refuse: AtomicBool,
@@ -38,6 +51,19 @@ impl Heap {
         Arc::new(Heap {
             max,
             huge: true,
+            skewed: false,
+            given: Mutex::new(Vec::new()),
+            released: Arc::new(AtomicU64::new(0)),
+            refuse: AtomicBool::new(false),
+        })
+    }
+
+    /// A backing whose grants start a page past the arena's alignment.
+    fn skewed(max: u64) -> Arc<Heap> {
+        Arc::new(Heap {
+            max,
+            huge: true,
+            skewed: true,
             given: Mutex::new(Vec::new()),
             released: Arc::new(AtomicU64::new(0)),
             refuse: AtomicBool::new(false),
@@ -62,15 +88,19 @@ impl HostBacking for Heap {
             });
         }
         self.given.lock().unwrap().push(bytes);
-        let mut bytes = vec![0u8; bytes as usize];
-        let base = bytes.as_mut_ptr();
-        let len = bytes.len() as u64;
+        let skew = if self.skewed { 4096 } else { 0 };
+        let layout = std::alloc::Layout::from_size_align(bytes as usize + skew, ALIGN).unwrap();
+        // SAFETY: the layout is not zero-sized: a grant is at least a page.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null());
         Ok(Granted {
-            base,
-            bytes: len,
+            // SAFETY: `skew` is inside the allocation, which is `bytes + skew` long.
+            base: unsafe { ptr.add(skew) },
+            bytes,
             huge_pages: self.huge,
             keep: Box::new(Block {
-                bytes,
+                ptr,
+                layout,
                 released: Arc::clone(&self.released),
             }),
         })
@@ -98,9 +128,8 @@ fn the_budget_is_made_into_regions_of_at_most_one_grant_as_the_run_needs_them() 
     let arena = Arena::with_backing(config(10 * MIB), heap.clone()).expect("a granted arena");
     assert!(arena.granted());
     assert!(arena.huge_pages_active(), "every grant was huge");
-    // One region now, of the most one grant holds less one alignment; the rest is the arena's
-    // but not yet made.
-    let chunk = 4 * MIB - 64 * 1024;
+    // One region now, of the most one grant holds; the rest is the arena's but not yet made.
+    let chunk = 4 * MIB;
     assert_eq!(heap.given(), vec![4 * MIB]);
     assert!(moruna_arena::region::granted_regions() > before);
     assert_eq!(arena.uncommitted_bytes(), 10 * MIB - chunk);
@@ -187,8 +216,8 @@ fn what_is_made_follows_what_the_run_uses_not_its_budget() {
     let first = moruna_arena::FIRST_GRANTED_REGION;
     let heap = Heap::new(256 * MIB);
     let arena = Arena::with_backing(config(GIB), heap.clone()).expect("a granted arena");
-    // A small region at start, whatever the budget; each grant is a region and one alignment.
-    assert_eq!(heap.given(), vec![first + 64 * 1024]);
+    // A small region at start, whatever the budget; an aligned grant is the region, whole.
+    assert_eq!(heap.given(), vec![first]);
     assert_eq!(arena.host_capacity(), GIB);
     let made = |arena: &Arena| GIB - arena.uncommitted_bytes();
     let mut held = Vec::new();
@@ -202,10 +231,10 @@ fn what_is_made_follows_what_the_run_uses_not_its_budget() {
         );
     }
     // Each region as large as all before it, up to one grant.
-    let regions: Vec<u64> = heap.given().iter().map(|b| b - 64 * 1024).collect();
+    let regions = heap.given();
     assert_eq!(
         regions,
-        vec![first, first, 2 * first, 4 * first, 256 * MIB - 64 * 1024],
+        vec![first, first, 2 * first, 4 * first, 256 * MIB],
         "{regions:?}"
     );
     drop(held);
@@ -220,7 +249,7 @@ fn a_large_first_allocation_makes_a_region_that_holds_it() {
         .alloc(128 * MIB as usize, Tier::Host)
         .expect("a region for it");
     assert_eq!(heap.given().len(), 2);
-    assert_eq!(heap.given()[1], 128 * MIB + 64 * 1024);
+    assert_eq!(heap.given()[1], 128 * MIB);
     assert_eq!(arena.side_regions(), 0);
     drop(big);
 }
@@ -230,7 +259,7 @@ fn allocations_that_find_the_regions_full_together_make_each_region_once() {
     let heap = Heap::new(4 * MIB);
     let budget = 64 * MIB;
     let arena = Arena::with_backing(config(budget), heap.clone()).expect("a granted arena");
-    let chunk = 4 * MIB - 64 * 1024;
+    let chunk = 4 * MIB;
     let regions = budget.div_ceil(chunk) as usize;
     let threads: Vec<_> = (0..8)
         .map(|_| {
@@ -267,8 +296,8 @@ fn a_ceiling_below_the_budget_makes_nothing_past_it() {
     assert_eq!(held.len() as u64, 4 * MIB / GRANULE as u64);
     assert_eq!(
         heap.given().len(),
-        2,
-        "the cap's last granule needed a second region"
+        1,
+        "the cap fills the first region exactly, and nothing past it is made"
     );
     assert_eq!(arena.host_capacity(), 4 * MIB);
     arena.cap_host(None);
@@ -279,7 +308,7 @@ fn a_ceiling_below_the_budget_makes_nothing_past_it() {
 fn a_grant_refused_during_the_run_refuses_the_allocation_and_the_arena_goes_on() {
     let heap = Heap::new(4 * MIB);
     let arena = Arena::with_backing(config(8 * MIB), heap.clone()).expect("a granted arena");
-    let chunk = 4 * MIB - 64 * 1024;
+    let chunk = 4 * MIB;
     let first: Vec<_> = (0..chunk / GRANULE as u64)
         .map(|_| arena.alloc(GRANULE, Tier::Host).expect("room"))
         .collect();
@@ -308,7 +337,7 @@ fn a_grant_refused_during_the_run_refuses_the_allocation_and_the_arena_goes_on()
 fn the_largest_free_counts_the_next_region_to_be_made() {
     let heap = Heap::new(4 * MIB);
     let arena = Arena::with_backing(config(10 * MIB), heap.clone()).expect("a granted arena");
-    let chunk = 4 * MIB - 64 * 1024;
+    let chunk = 4 * MIB;
     let held: Vec<_> = (0..chunk / GRANULE as u64)
         .map(|_| arena.alloc(GRANULE, Tier::Host).expect("room"))
         .collect();
@@ -331,13 +360,13 @@ fn the_largest_free_counts_the_next_region_to_be_made() {
 #[test]
 fn a_large_buffer_past_what_is_left_to_make_gets_a_side_region() {
     let heap = Heap::new(4 * MIB);
-    // A region of 4032 KiB, then 1088 KiB left to make.
+    // A region of 4 MiB, then 1 MiB left to make.
     let arena = Arena::with_backing(config(5 * MIB), heap.clone()).expect("a granted arena");
     let small = arena.alloc(GRANULE, Tier::Host).expect("room");
     let big = arena
         .alloc(2 * MIB as usize, Tier::Host)
         .expect("first region");
-    // Room by charge, but neither the first region nor the 1088 KiB left holds 2 MiB in one
+    // Room by charge, but neither the first region nor the 1 MiB left holds 2 MiB in one
     // piece: a side grant.
     let side = arena.alloc(2 * MIB as usize, Tier::Host);
     assert!(side.is_ok(), "{side:?}");
@@ -348,7 +377,7 @@ fn a_large_buffer_past_what_is_left_to_make_gets_a_side_region() {
 
 #[test]
 fn a_backing_whose_region_holds_no_class_is_refused() {
-    let heap = Heap::new(64 * 1024);
+    let heap = Heap::new(32 * 1024);
     let refused = Arena::with_backing(config(MIB), heap).unwrap_err();
     assert!(matches!(refused, MorunaError::Config { name, .. } if name == "budget.host"));
 }
@@ -358,6 +387,7 @@ fn a_refused_grant_is_the_arenas_refusal() {
     let heap = Arc::new(Heap {
         max: 4 * MIB,
         huge: false,
+        skewed: false,
         given: Mutex::new(Vec::new()),
         released: Arc::new(AtomicU64::new(0)),
         refuse: AtomicBool::new(true),
@@ -393,8 +423,9 @@ fn growing_adds_granted_regions_that_shrink_may_drain() {
 
 #[test]
 fn a_large_buffer_the_regions_cannot_hold_in_one_piece_gets_a_granted_side_region() {
-    let heap = Heap::new(8 * MIB);
-    // Two regions of about 8 MiB; 6 MiB taken from each leaves 4 MiB free, 2 in each.
+    // Grants a page off the alignment: regions of 8 MiB less 64 KiB and of 6 MiB and 64 KiB,
+    // whose free bytes after these three are about 4 MiB, in pieces.
+    let heap = Heap::skewed(8 * MIB);
     let arena = Arena::with_backing(config(14 * MIB), heap.clone()).expect("a granted arena");
     let a = arena.alloc(4 * MIB as usize, Tier::Host).expect("first");
     let b = arena.alloc(4 * MIB as usize, Tier::Host).expect("second");
@@ -407,7 +438,7 @@ fn a_large_buffer_the_regions_cannot_hold_in_one_piece_gets_a_granted_side_regio
     match side {
         Ok(side) => {
             assert_eq!(arena.side_regions(), 1);
-            assert_eq!(heap.given().len(), grants + 1);
+            assert!(heap.given().len() > grants);
             drop(side);
             assert_eq!(arena.side_in_use(), 0);
         }
@@ -435,4 +466,58 @@ fn a_page_locked_run_takes_granted_memory_as_locked() {
         .alloc(64 * 1024, Tier::PinnedHost)
         .expect("pinned room");
     assert_eq!(arena.tier_of(b.as_ptr()), Some(Tier::PinnedHost));
+}
+
+#[test]
+fn an_aligned_grant_is_used_whole_so_two_halves_share_one_region() {
+    let heap = Heap::new(4 * MIB);
+    let arena = Arena::with_backing(config(16 * MIB), heap.clone()).expect("a granted arena");
+    let a = arena
+        .alloc(2 * MIB as usize, Tier::Host)
+        .expect("first half");
+    let b = arena
+        .alloc(2 * MIB as usize, Tier::Host)
+        .expect("second half");
+    assert_eq!(heap.given(), vec![4 * MIB], "one grant holds both");
+    assert_eq!(arena.uncommitted_bytes(), 12 * MIB);
+    assert_eq!(heap.released.load(Ordering::SeqCst), 0);
+    drop((a, b));
+}
+
+#[test]
+fn a_skewed_grant_is_asked_again_or_used_an_alignment_short() {
+    // A grant of the backing's largest size cannot be asked for one alignment larger: it is
+    // used from its first aligned byte, 64 KiB short.
+    let heap = Heap::skewed(4 * MIB);
+    let arena = Arena::with_backing(config(16 * MIB), heap.clone()).expect("a granted arena");
+    assert_eq!(heap.given(), vec![4 * MIB]);
+    assert_eq!(
+        arena.uncommitted_bytes(),
+        16 * MIB - (4 * MIB - ALIGN as u64)
+    );
+    assert_eq!(
+        arena.host_capacity(),
+        16 * MIB,
+        "the budget is whole all the same"
+    );
+    assert_eq!(heap.released.load(Ordering::SeqCst), 0);
+    // A smaller one is given back and asked for again one alignment larger, and is usable whole.
+    let heap = Heap::skewed(4 * MIB);
+    let arena = Arena::with_backing(config(MIB), heap.clone()).expect("a granted arena");
+    assert_eq!(heap.given(), vec![MIB, MIB + ALIGN as u64]);
+    assert_eq!(
+        heap.released.load(Ordering::SeqCst),
+        1,
+        "the first went back"
+    );
+    assert_eq!(arena.uncommitted_bytes(), 0);
+    let whole = arena
+        .alloc(MIB as usize, Tier::Host)
+        .expect("the whole region");
+    assert!(arena.alloc(GRANULE, Tier::Host).is_err());
+    drop(whole);
+    // A backing whose largest grant holds nothing once aligned is refused.
+    let tiny = Heap::skewed(ALIGN as u64);
+    let refused = Arena::with_backing(config(ALIGN as u64), tiny).unwrap_err();
+    assert!(matches!(refused, MorunaError::Config { name, .. } if name == "budget.host"));
 }

@@ -108,8 +108,11 @@ fn si_t3_no_partial_final() {
         panic!("finish must return the original error, got {outcome:?}");
     };
     assert!(msg.contains("committed files:"), "{msg}");
+    // Stream C (2026-11-17): the lanes' buffers are made as files need them, so what the sink
+    // may still hold is its pair of spares (two buffers of the 64 KiB class here), which `open`
+    // used to take up front: the refused file's buffer is not among them.
     assert!(
-        alloc.fake().in_use(Tier::Host) <= before,
+        alloc.fake().in_use(Tier::Host) <= before + 2 * (64 << 10),
         "the rolled file's arena buffer was not released"
     );
     let resolved: Vec<_> = reactor
@@ -249,9 +252,9 @@ fn si_t16_parquet_encodes_into_arena() {
     sink.open(&table_source_schema()).expect("open");
     assert_eq!(
         alloc.fake().allocations_total(),
-        before + 2,
-        "f.1: `open` takes the two file buffers while the arena is empty, and nothing else; \
-         the writer waits for the first payload's schema"
+        before,
+        "f.1, stream C (2026-11-17): `open` takes nothing; a lane's file buffer comes with its \
+         first file, and the writer waits for the first payload's schema"
     );
 
     for seq in 0..24 {
@@ -317,10 +320,14 @@ fn si_t16_parquet_encodes_into_arena() {
         Arc::new(starved),
     )
     .expect("parquet sink");
-    let outcome = sink.open(&table_source_schema());
+    // Stream C (2026-11-17): `open` takes nothing, so the refusal comes with the first file.
+    sink.open(&table_source_schema())
+        .expect("open takes nothing");
+    let payload = arena_payload(&FakeAllocator::new(), 8, 0);
+    let outcome = block_on(sink.write(0, payload));
     assert!(
         matches!(outcome, Err(MorunaError::Alloc { .. })),
-        "below the format's own floor the error stands, at open, got {outcome:?}"
+        "below the format's own floor the error stands, at the first file, got {outcome:?}"
     );
     assert_eq!(starved_fake.in_use(Tier::Host), 0, "nothing is held");
 }
@@ -535,10 +542,11 @@ fn a_roll_for_a_morsel_that_fits_opens_an_ordinary_file() {
     for (seq, payload) in payloads.into_iter().enumerate() {
         block_on(sink.write(seq as u64, payload)).expect("written into an ordinary file");
     }
-    assert_eq!(
-        alloc.allocations_total(),
-        before,
-        "every roll reused a buffer the sink already held"
+    // Stream C (2026-11-17): the pair is made as the first two files need it, and every later
+    // roll reuses one of the two.
+    assert!(
+        alloc.allocations_total() - before <= 2,
+        "every roll after the first two reused a buffer the sink already held"
     );
     let summary = sink.finish().expect("finish");
     assert!(summary.files.len() >= 3, "{:?}", summary.files);
@@ -563,8 +571,12 @@ fn a_slice_of_a_large_buffer_is_measured_by_its_rows() {
     let moruna_kernel::Payload::Table(batch, tier) = whole else {
         panic!("a table");
     };
+    // The lane's own buffer comes with its first file (stream C, 2026-11-17); after that, no
+    // slice asks for a buffer of its own.
+    let first = moruna_kernel::Payload::Table(batch.slice(0, 100), tier);
+    block_on(sink.write(0, first)).expect("a few rows");
     let before = alloc.allocations_total();
-    for seq in 0..4 {
+    for seq in 1..4 {
         let slice = batch.slice(seq as usize * 100, 100);
         let payload = moruna_kernel::Payload::Table(slice, tier);
         block_on(sink.write(seq, payload)).expect("a few rows");
