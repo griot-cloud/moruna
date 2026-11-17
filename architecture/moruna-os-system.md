@@ -1,0 +1,363 @@
+# Moruna OS: system design
+
+The detailed design under `moruna-os.md` (the OS design). It follows the critical path, component by
+component, and fixes every decision an agent would otherwise make. Written by the PM, 2026-11-17.
+
+- **Final** sections are ready to build. **Draft** sections state the decisions so far and what is
+  still open; no work is issued from them.
+- The last section shows how each part traces to the OS design.
+
+## How work is issued
+
+- An agent gets two documents: this one, and its work item (`architecture/work/<id>-<name>.md`).
+- The work item names the sections it implements, exactly what to build, the checks that prove it,
+  and what is out of scope.
+- Where the two documents leave a choice open, the agent stops and asks the PM. It does not choose.
+- An item is done when its checks pass and the PM has run them again. The PM merges.
+- Every item: a branch from `feature/arrow-core-0.7`, local commits, nothing pushed, tests with the
+  code, no speed work.
+
+## 0. A base that boots (Final)
+
+The branch head carries a new Linux layer that was merged without being booted. Nothing is built on
+a tree that has not booted.
+
+| Item | Build | Success |
+|---|---|---|
+| 0.1 | Boot the branch head as CI does. If the Linux-layer swap breaks it, move the swap to its own branch. | CI's boot checks pass at the head on 1, 2 and 4 CPUs. |
+
+## 1. The node on OpenStack (Final)
+
+Implements the OS design, section 1, OpenStack column.
+
+### 1A. The image
+
+- **One disk image for every cloud,** built by `kernel/node/tools/package.py` from a profile. The
+  `cloud` profile grows by step:
+
+  | Step | Processes in the image |
+  |---|---|
+  | 1 | `node-supervisor`, `devices`, `netstack`, `platform`, `api`; drivers `virtio-blk`, `virtio-net`, `nvme`, `gve` |
+  | 2 | The same; `api` gains TLS and its operations |
+  | 3 | Adds `storage`, `imagefs`, `linux`, `node-admission`, `engine` |
+
+- **Layout:** a GPT disk with one partition, the EFI system partition (FAT32). It holds
+  `EFI/BOOT/BOOTX64.EFI` (GRUB), `boot/moruna-kernel.elf` and `boot/initramfs.cpio`. A second
+  partition, `moruna-system`, is reserved for step 3's function images.
+- **Boot chain:** UEFI firmware, GRUB with no menu and no wait, the core by multiboot2 with the
+  initramfs as its module, then `node-supervisor`. This is what `package.py` builds today.
+- **UEFI only.** Secure Boot comes later. A BIOS boot is added only if a cloud cannot do UEFI.
+- **The disk is never written while the node runs.**
+- **Formats** are made from the one raw image: raw and qcow2 for OpenStack, a fixed-size VHD
+  rounded up to a whole MiB for Azure.
+- **No vsock, no host socket, no direct kernel load.** Those belong to the Linux-node launcher.
+
+### 1B. Boot and console
+
+- **Console:** the first serial port (COM1, 115200 8N1). Clouds show it as the machine's console
+  log. The node reads nothing from it: there is no login and no prompt.
+- **Boot lines,** one per stage, exactly:
+
+  ```
+  moruna: core <version> cpus=<n> memory=<bytes>
+  moruna: services started
+  moruna: network wan <address>/<prefix> gateway <address>
+  moruna: cloud <openstack|azure|none> instance <id>
+  moruna: tls sha256=<fingerprint>
+  moruna: ready api=<address>:443 boot_ms=<n>
+  ```
+
+- **`boot_ms`** counts from the core's first instruction to ready. Firmware and GRUB time is
+  measured from outside, at bring-up, as create-to-ready.
+- **Limits:** services started within 5 s; an address within 30 s; instance data within 60 s.
+- **Failure:** one line, `moruna: fatal <stage>: <reason>`, then the machine powers off. A node
+  never hangs silently, never restarts itself in a loop, and never offers a prompt. A service that
+  dies stops the node (SDD 33).
+
+### 1C. Network
+
+- **One interface, `wan`,** on the first network card, set by DHCP: address, mask, gateway, DNS.
+  IPv4 only for now. The network server's config is:
+
+  ```
+  moruna-netstack 1
+  interface wan card=net0 dhcp
+  ```
+
+- **One port listens: TCP 443,** owned by `api`. Nothing else accepts connections.
+- **Outbound is denied unless granted.** In steps 1 and 2 only `platform` has a grant: the instance
+  data address on port 80.
+- **In step 1, `api` accepts a connection on 443 and closes it.** That proves the address, the
+  route and the cloud's firewall rule. Step 2 gives it TLS and operations.
+
+### 1D. `platform` and node config
+
+One process, `platform`. In order, it:
+
+1. **Finds the cloud** by asking for instance data over HTTP at `169.254.169.254`:
+   - OpenStack: `/openstack/latest/meta_data.json` and `/openstack/latest/user_data`;
+   - Azure: `/metadata/instance` and its `userData`, with the `Metadata: true` header.
+
+   The first that answers names the cloud. No config drive: it would need a filesystem reader.
+2. **Sets the wall clock** from the `Date` header of that answer. The node has no other clock
+   source that works the same on every cloud. The monotonic clock carries it forward.
+3. **Validates node config,** which is the instance's user-data, version 1:
+
+   ```json
+   {
+     "moruna": 1,
+     "api": {
+       "token_keys": ["<Ed25519 public key, base64>"],
+       "tls": { "certificate": "<PEM chain>", "key": "<PEM>" }
+     }
+   }
+   ```
+
+   - `token_keys` is required, 1 to 8 keys. `tls` is optional.
+   - Unknown fields are refused. A missing or invalid config is fatal.
+4. **Hands `api` its config** (token keys, TLS identity, wall clock, instance ID) over a channel
+   the supervisor links.
+5. **Prints** the `cloud` and `ready` lines.
+
+- **By default node config holds no secrets.** Without `tls`, `api` makes an ECDSA P-256 key and a
+  self-signed certificate at each boot, and the console shows its fingerprint for clients to pin.
+  An operator who wants a certificate from their own authority supplies `tls`, and accepts that the
+  key then sits in instance data.
+- **Cloud `none`** is for development only: when no instance data answers and the image was built
+  with a development config file, that file is the node config. A release image has no such file,
+  so there it is fatal.
+- **Tests** serve fake instance data to QEMU at the same address.
+
+### 1E. Bring-up on Servercore
+
+- Upload the image with `hw_firmware_type=uefi`; create one machine with node config as user-data
+  and a firewall rule for 443 only; check; delete.
+- **Success is the OS design's:** the machine gets an address, answers on 443, and shows as
+  running, with nobody logging in. Create-to-ready time and `boot_ms` are recorded.
+- Creating cloud resources needs the PM's go-ahead each time.
+
+### Work items
+
+| Item | Build | Success | Needs |
+|---|---|---|---|
+| 1.1 | The `cloud` profile for step 1; boot its image in QEMU under UEFI firmware with one virtio disk and one virtio network card (1A) | A script boots it to `services started` on 1 and 2 CPUs | 0.1 |
+| 1.2 | The boot lines, the limits, and power-off on a fatal error (1B) | Each line appears in order; each limit, when forced, gives its `fatal` line and a power-off | 1.1 |
+| 1.3 | DHCP on `wan`; `api` owning 443 and closing each connection; the outbound grant (1C) | A connection from the host reaches 443; one to any other port is refused; `api` cannot connect out | 1.1 |
+| 1.4 | `platform`: instance data, wall clock, node config v1, the hand-over to `api` (1D) | Booted against fake OpenStack data: the `cloud` and `ready` lines appear; each invalid config is refused with its reason | 1.2, 1.3 |
+| 1.5 | The qcow2 and VHD formats and the upload recipe, `kernel/node/OPENSTACK.md` (1A, 1E) | Each format boots in QEMU; the recipe's commands are complete | 1.1 |
+| 1.6 | Bring-up on Servercore (1E) | 1E's success, on Servercore | 1.4, 1.5, credentials |
+
+## 1F. The node on Azure (Draft)
+
+Implements the OS design, section 1, Azure column. It becomes Final after item 1.7's findings.
+
+Decisions so far:
+
+- **Machine:** `Standard_D4ls_v5`, Generation 2, accelerated networking off, so the one network
+  card is netvsc.
+- **The core on Hyper-V:** it finds the hypervisor, takes its clock rate from Hyper-V, and uses the
+  local APIC timer. It assumes none of the old PC devices that Generation 2 leaves out.
+- **VMBus, split by the microkernel rule:**
+  - The core gains one mechanism: the two hypercalls that post a message and signal an event, the
+    message and event pages mapped to the bus driver, and the VMBus interrupt delivered to it.
+  - Offers, channels and ring buffers live in a `vmbus` process. A channel's rings are shared
+    memory mapped to its driver.
+- **`storvsc` and `netvsc`** are driver processes that serve today's block and network driver
+  protocols, so nothing above them changes.
+- **`platform`** reads Azure's instance data (1D) and, once config is valid, reports "ready" to
+  Azure's wireserver. Without that report Azure reboots the machine.
+- **Image:** the fixed-size VHD of 1A.
+
+Item 1.7 must answer: how far today's core boots on Azure and what stops it; which old PC devices
+OSTD touches; what Microsoft's OpenVMM offers for guest-side VMBus, storvsc and netvsc, and under
+what licence; and the size of items 1.8 to 1.12.
+
+| Item | Build | Success | Needs |
+|---|---|---|---|
+| 1.7 | Findings: read OSTD and OpenVMM; boot the image on Azure and read its serial console | A note answering the four questions above | 1.1 (the reading can start now) |
+| 1.8 | The core on Hyper-V | The core reaches `services started` on Azure's console | 1.7 |
+| 1.9 | VMBus: the core mechanism and the `vmbus` process | A booted test lists the devices Azure offers; added kernel-mode lines are counted | 1.8 |
+| 1.10 | `storvsc` | The node reads its Azure disk; the block driver suite passes | 1.9 |
+| 1.11 | `netvsc` | DHCP and a connection to 443 on Azure; the network driver suite passes | 1.9 |
+| 1.12 | `platform` for Azure, with the "ready" report | Azure shows provisioning succeeded | 1.4, 1.11 |
+| 1.13 | Bring-up on Azure | 1E's success, on Azure | 1.10, 1.12 |
+
+## 2. The API (Final)
+
+Implements the OS design, section 2.
+
+### 2A. Operations and types
+
+- **One crate, `moruna-api`,** holds every request, response and error as Rust types. The OpenAPI
+  document and the MCP tool list are generated from it and checked in; a test fails if they drift.
+- **Paths start `/v1`.** Bodies are JSON. Unknown request fields are refused.
+- **Step 2's operations:**
+
+  | Operation | Scope | Answer |
+  |---|---|---|
+  | `GET /v1/health` | none | `{"status":"ok"}`. The only call without a token. |
+  | `GET /v1/node` | observe | The node document below |
+  | `GET /v1/node/audit` | admin | The most recent calls, newest first |
+
+  ```json
+  {
+    "version": "0.7.0", "instance": "<id>", "cloud": "openstack",
+    "cores": 4, "memory_bytes": 8589934592,
+    "executors": [{ "kind": "cpu", "slots": 4 }],
+    "boot_ms": 2140, "time": 1794931200, "health": "ok"
+  }
+  ```
+
+- **Errors** are `{"error":{"code":"<code>","message":"<text>"}}` with these codes: `invalid` (400),
+  `unauthorized` (401), `forbidden` (403), `not_found` (404), `conflict` (409), `busy` (503),
+  `internal` (500).
+- Step 3 adds the `functions` and `jobs` operations of the OS design to the same crate.
+
+### 2B. The `api` server
+
+- **A process on `moruna-svc`,** with a 64 MiB account, on no worker's core. If it dies, the node
+  stops (1B).
+- **TLS ends inside `api`** (rustls), so the node's key stays in the one process that uses it. TLS
+  1.3 only.
+- **HTTP/1.1 only,** with keep-alive and Server-Sent Events. No HTTP/2, compression, cookies or
+  cross-origin headers.
+- **Limits:** 16 KiB of headers, 1 MiB of body, 64 open connections, 60 s idle. Over a limit, the
+  answer is `invalid` or `busy`, never a crash.
+- **New dependencies:** `httparse` and `serde_json`, both without std. Signatures use `ring`,
+  already in the tree.
+
+### 2C. Tokens and the audit record
+
+- **A token is a JWT signed with Ed25519,** sent as `Authorization: Bearer <token>`. Its claims:
+
+  ```json
+  { "aud": "<instance id>", "exp": 1794934800, "scope": ["observe"] }
+  ```
+
+- **A call is allowed when** the signature verifies under one of the node's `token_keys`, `aud` is
+  this node's instance ID, `exp` is in the future and at most one hour ahead, and `scope` covers
+  the operation. `admin` covers `submit`, and `submit` covers `observe`.
+- **Every call leaves an audit record:** time, key, scope, operation, status. `api` keeps the last
+  10,000 in memory. Nothing is written to disk or to the console.
+
+### 2D. MCP
+
+- **`POST /mcp`** on the same port, with the same tokens: MCP's Streamable HTTP, stateless.
+- **One tool per operation,** generated from `moruna-api`: `moruna_health`, `moruna_node`,
+  `moruna_node_audit`. A tool's input and output are the operation's request and response.
+
+### 2E. Clients
+
+- **The CLI:** `moruna node --url <https://…> --token <token> [--pin <fingerprint>]`.
+- **Generated clients** for Rust and Python, from the OpenAPI document.
+
+### Work items
+
+| Item | Build | Success | Needs |
+|---|---|---|---|
+| 2.1 | `moruna-api`: step 2's types, the generated OpenAPI document and MCP tool list (2A) | Host tests pass; the drift test fails when a type changes without regenerating | none |
+| 2.2 | The `api` server: TLS, HTTP/1.1, the three operations, the limits (2B) | Booted in QEMU: `health` and `node` answer over HTTPS; each limit holds | 1.4, 2.1 |
+| 2.3 | Tokens and audit (2C) | A bad signature, a wrong `aud`, an expired or over-long `exp`, and a missing scope are each refused; each call appears in `audit` | 2.2 |
+| 2.4 | MCP (2D) | An MCP client lists the three tools and calls `moruna_node` on a booted node | 2.2 |
+| 2.5 | The CLI and the generated clients (2E) | All three read `node` from a booted node | 2.1, 2.2 |
+| 2.6 | Proof on both clouds | From outside the cloud, `node` answers over HTTPS and over MCP on Servercore and on Azure; a bad token is refused | 1.6, 1.13, 2.3, 2.4 |
+
+## 3. Wiring (Draft)
+
+Implements the OS design, section 3. It becomes Final before any item but 3.1 is issued.
+
+Decisions so far:
+
+- **One job at a time** in the first release. `submit` while a job runs answers `busy`. Jobs side by
+  side, kept apart by the core's accounts, come later.
+- **A fresh engine process per job,** started through `node-admission` as today, so nothing is kept
+  between jobs.
+- **`api` and the engine** exchange today's job messages (submit, events, logs, report, cancel)
+  over a channel the supervisor links.
+- **Data on attached volumes first.** A job names a volume by its serial; the client attaches it
+  through the cloud.
+- **Then object storage:** the S3 API, then Azure Blob. Credentials arrive in the job document over
+  TLS, live in the engine's memory for that job, and are never logged or kept in node config.
+- **Functions** are registered by address, SHA-256 and signature. The public keys that may sign
+  them are added to node config.
+- **Events** are Server-Sent Events: progress, logs, and each stage's time split.
+
+Still open, and mine to settle:
+
+- How the engine reaches the network: through the Linux layer's sockets, or a native client.
+- Where registered function images are kept, since the boot disk is never written and
+  `Standard_D4ls_v5` has no local disk.
+- The cause of the full-year hang.
+
+| Item | Build | Success | Needs |
+|---|---|---|---|
+| 3.1 | The full-year hang: reproduce it, find the cause, and bring the PM a fix to approve before building it | A test reproduces it and passes after the fix; all four taxi jobs complete on the full year | 0.1 |
+| 3.2 | Jobs through the API | A job submitted over HTTPS runs and reports on a booted node | 2.3, 3.1 |
+| 3.3 | Data on attached volumes | A taxi job reads one volume and writes another on Servercore | 3.2, 1.6 |
+| 3.4 | The engine on the network | The engine opens a TLS connection out; its throughput is recorded | 3.2 |
+| 3.5 | Object storage sources and sinks | A taxi job reads from and writes to object storage on each cloud | 3.4 |
+| 3.6 | Functions through the API | An unsigned image is refused; a registered function runs in a job | 3.2 |
+| 3.7 | Events and the report | An MCP client follows a running job to its report | 3.2, 2.4 |
+| 3.8 | Proof | The four taxi jobs through the API give 0.6.6's rows on a Servercore node and an Azure node | 3.3 or 3.5, 3.6 |
+| 3.9 | The benchmark returns | Operational time for all four jobs against the other engines: first faster than 0.6.6, then the 1.5x bar | 3.8 |
+
+## 5. Languages (Draft)
+
+Implements the OS design, section 5.
+
+- **The Rust SDK** is `moruna_sys::plane`, documented, with an example function.
+- **The C header** wraps it in six calls: open the task, take the next batch, emit a batch, write a
+  log line, report an error, finish. Batches cross by the Arrow C Data Interface.
+- **The Python SDK** binds the header with pyarrow: `@moruna.source`, `@moruna.function`,
+  `@moruna.sink`. It builds the function's image and registers it. It needs the Linux layer booted
+  with CPython.
+
+| Item | Build | Success | Needs |
+|---|---|---|---|
+| 5.1 | The Rust function SDK | The example builds from the docs alone and runs in a job | 3.6 |
+| 5.2 | The C header, with a conformance test | A C function runs in a job and passes the row check | 5.1 |
+| 5.3 | The Linux layer boots CPython with pyarrow | A booted test | 0.1 |
+| 5.4 | The Python function SDK | A Python function runs in a job on a node and passes the row check | 5.2, 5.3, 3.6 |
+
+## 4. Kernels and accelerators (not started)
+
+The OS design's section 4 stands as written. Its system design is written after 3.8 holds on both
+clouds, as Brackly decided. It will cover the kernel contract and registry, the plane's five verbs,
+Rust GPU libraries measured per kernel, the first engine adapter (DataFusion, and so peQL), and the
+first accelerator.
+
+## Traceability to the OS design
+
+| OS design | Here | State |
+|---|---|---|
+| 1. Boot as a node, OpenStack | 1A to 1E | Final |
+| 1. Boot as a node, Azure | 1F | Draft, until item 1.7's findings |
+| 2. The API | 2A to 2E | Final |
+| 3. Wiring | 3 | Draft |
+| 4. The two interfaces and the unit of work | 4 | Not started, by decision |
+| 5. Rust first, every language after | 5 | Draft |
+| One image for every cloud | 1A | Final |
+| No shell, no arbitrary command | 1B (no console input), 2A (fixed operations) | Final |
+| The microkernel rule | 1F (VMBus split), 2B (`api` is a process) | Held |
+
+This document adds detail to the OS design and no behaviour it does not call for. Five details
+that go beyond its words:
+
+1. **The node makes its own TLS key by default** (1D). The OS design said node config carries the
+   node's TLS identity. Its sentence is changed in the same commit, since this is safer: by default
+   no secret sits in instance data.
+2. **`api` exists from step 1** and owns port 443 (1C), so "answers on its API port" is true
+   before the API has operations.
+3. **`GET /v1/health` needs no token** (2A). It says only that the node is up.
+4. **The audit record is read at `node/audit`** (2A, 2C).
+5. **One job at a time in the first release** (3).
+
+If a later detail would contradict the OS design, the OS design is changed first, with Brackly's
+approval.
+
+## Order
+
+- **Can start now, on separate files:** 0.1 then 1.1 to 1.5 (one owner, in order); 2.1; the reading
+  half of 1.7; 3.1.
+- **Then:** 1.6 and 2.2 to 2.5; 1.8 to 1.13 once 1F is Final.
+- **Then:** 2.6, section 3 once Final, and section 5.

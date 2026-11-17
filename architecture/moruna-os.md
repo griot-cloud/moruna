@@ -1,7 +1,7 @@
 # Moruna OS: design
 
-Approved by Brackly on 2026-11-17 as the plan. The three decisions at the end are still open. It
-replaces the benchmark-first plan in `data-os-streams.md`; the microkernel rule and the contracts
+Approved by Brackly on 2026-11-17 as the plan. The system design under it, with the work items, is
+`moruna-os-system.md`. It replaces the benchmark-first plan in `data-os-streams.md`; the microkernel rule and the contracts
 in `data-os.md` stand.
 
 **Moruna OS is a machine you boot from one image and drive only through an API. It runs jobs made of
@@ -52,7 +52,7 @@ image's layout.
 | Network | virtio-net: have | netvsc over VMBus: build |
 | Clock | kvmclock: have | Hyper-V's clock: build |
 | Handshake | none | report "ready" after DHCP, or Azure reboots the machine: build |
-| Node config | metadata service or config drive: build | instance metadata: build |
+| Node config | metadata service: build | instance metadata: build |
 
 - **Have:** the image builder (`kernel/node/tools/package.py`: a UEFI GPT disk, GRUB loading the
   core), the node's manifest (`standalone.image`), DHCP and TLS in the network server. The image has
@@ -79,8 +79,10 @@ Linux layer.
 
 - **Transport:** HTTPS (TLS 1.3, HTTP/1.1, JSON), with Server-Sent Events for live streams. MCP's
   Streamable HTTP maps onto the same operations one to one. One listening port.
-- **Node config** arrives as instance data: the key that signs API tokens, and the node's TLS
-  identity. Tokens are short-lived and scoped: observe, submit, admin.
+- **Node config** arrives as instance data: the public keys that verify API tokens. By default it
+  holds no secrets: the node makes its own TLS key at boot and shows the certificate's fingerprint
+  on its console. An operator can supply a certificate and key instead. Tokens are short-lived and
+  scoped: observe, submit, admin.
 - **No shell and no arbitrary command.** Every call is logged.
 
 | Operation | What it does |
@@ -149,8 +151,18 @@ The user writes sources, functions and sinks. A function carries one or more ker
   CPU kernel's rows. The benchmark's row check enforces that.
 - **The job does not name hardware.** The engine places each stage from measured cost; the user can
   pin a stage.
-- **Moruna stays a runtime.** It defines the kernel contract and ships a small library. Engines and
-  vendor libraries (cuDF, cuBLAS) arrive as packages that provide kernels.
+- **Moruna stays a runtime.** It defines the kernel contract and ships a library of its own
+  kernels. Engines and vendor libraries can add kernels as packages.
+- **Kernels are also for other engines** (Brackly, 2026-11-17). A library kernel has a plain
+  contract: Arrow columns in, Arrow columns out, a name, a version and a signature. So an engine
+  that passes Arrow can call one without being a Moruna job. Adapters map an engine's own hooks
+  onto kernels: DataFusion first, because peQL is built on it, then Polars and DuckDB. Success is an
+  existing database or DSL getting faster by handing its heavy steps to Moruna kernels, with no
+  rewrite.
+- **Device kernels are ours, written in Rust** (Brackly, 2026-11-17). We start on existing Rust
+  libraries for accelerated computing; the candidates to measure are CubeCL, wgpu, rust-gpu and
+  cudarc. Every kernel has a CPU kernel and the row check, so each library is judged per kernel
+  and kept or replaced.
 
 ### The plane: the hardware-facing interface
 
@@ -205,10 +217,13 @@ it.
 - **Carried debts:** the full-year hang; 0.7 slower than 0.6.6 because tasks wait for batches; the
   branch head unbooted.
 
-## Decisions needed
+## Decisions
 
-1. **Scope of 0.7.0:** steps 1 to 3 on both clouds with the Rust and Python function SDKs, and
-   accelerators after it? The interfaces in section 4 are fixed now either way.
-2. **Azure's first size:** `Standard_D4ls_v5`, which means VMBus disk and network drivers?
-3. **First accelerator:** an FPGA or a card of ours on a Moruna node, or an NVIDIA GPU on a Linux
-   node?
+1. **Order (Brackly, 2026-11-17):** the full OS on OpenStack and on Azure comes first. Accelerators
+   come after it. The interfaces in section 4 are fixed now, so nothing built before then closes
+   them off.
+2. **Azure's first size:** `Standard_D4ls_v5` is the working choice, which means VMBus disk and
+   network drivers. Work item 1.7's findings confirm it or change it.
+3. **The first accelerator** is chosen when the OS works on both clouds.
+
+The system design and the work items are in `moruna-os-system.md`.
