@@ -79,8 +79,13 @@ for sig in TERM INT; do
       wait $PID; code=$?; took=$((SECONDS - t0))
       sleep 1
       left=$(run_procs "$JOB" | tr '\n' ' ')
-      if [ $code -eq 130 ] && [ -z "$left" ]; then check $name PASS "exit $code in ${took} s, no QEMU left"
-      else check $name FAIL "exit $code in ${took} s, left: ${left:-none}"; fi
+      # The cancel must end the run through the guest (its report written), not on the
+      # signal's interrupted read.
+      report="$(dirname "$JOB")/report.json"
+      said=$(python3 -I -c "import json,sys; r=json.load(open(sys.argv[1])); print(str(r.get('diagnostic'))[:120], '| engine report:', 'yes' if r.get('notes') else 'no')" "$report" 2> /dev/null)
+      if [ $code -eq 130 ] && [ -z "$left" ] && ! echo "$said" | grep -q "Interrupted system call"; then
+        check $name PASS "exit $code in ${took} s, no QEMU left; $said"
+      else check $name FAIL "exit $code in ${took} s, left: ${left:-none}; $said"; fi
       for p in $left; do kill -KILL $p; done
     else
       check $name FAIL "still running ${GRACE_S} s after SIG$sig"

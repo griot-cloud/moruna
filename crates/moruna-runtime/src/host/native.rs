@@ -832,10 +832,16 @@ impl NativeRun {
             let raw = match self.framing.read(&mut self.reader) {
                 Ok(Some(message)) => message,
                 Ok(None) => return Err(refused("guest closed without an explicit job exit")),
+                // stream E hook (D's file): a signal (the CLI's SIGINT or SIGTERM handler) ends
+                // a read of a socket with a receive timeout with EINTR, never restarted: it is
+                // a wait like a timeout, so the run waits for the guest's report after a cancel
+                // instead of ending on "Interrupted system call".
                 Err(e)
                     if matches!(
                         e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
                     ) =>
                 {
                     if self.node.try_wait()?.is_some() {
