@@ -1,0 +1,25 @@
+[package]
+name = "moruna-api-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A blocking client of a Moruna node's API, on the API's own types and operations table, and the `moruna node` command"
+
+# System design 2E, item 2.5. Blocking, over the root workspace's `reqwest` with rustls; a pinned
+# certificate is checked by a rustls verifier of this crate.
+[dependencies]
+moruna-api = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "rustls-tls-native-roots"] }
+rustls = { workspace = true, features = ["ring", "std"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+# The tests' stand-in node: its TLS identity and the tokens it verifies (tests/support).
+[dev-dependencies]
+base64 = { workspace = true }
+ring = { workspace = true, features = ["alloc"] }

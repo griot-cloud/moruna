@@ -53,6 +53,9 @@ schemars = { workspace = true }
 parquet = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-arrow = { workspace = true, optional = true }
+# `moruna node` (system design 2E): the binary answers it with the API client, before it starts
+# its interpreter.
+moruna-api-client = { workspace = true }
 
 [features]
 default = []
