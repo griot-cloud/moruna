@@ -1154,6 +1154,77 @@ pub fn keep_diagnostics(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// stream E hook (D's file): the lines of a node's console that say why it never answered, the
+/// last four of them: a critical service that ended or panicked, an account or quota refused, a
+/// process that failed. `None` when the console names nothing.
+pub fn console_cause(serial: &str) -> Option<String> {
+    const SIGNS: [&str; 8] = [
+        "critical service",
+        "panicked",
+        "account",
+        "Quota",
+        "quota",
+        "refused",
+        "failed",
+        "exited with code",
+    ];
+    let lines: Vec<&str> = serial
+        .lines()
+        .map(str::trim)
+        .filter(|l| SIGNS.iter().any(|s| l.contains(s)) && !l.contains("exited with code 0"))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(lines[lines.len().saturating_sub(4)..].join("; "))
+}
+
+/// stream E hook (D's file): a node that never answered its runtime keeps its logs, as a run
+/// that did not complete keeps them (in `keep`, the run's `MORUNA_KEEP_NODE_LOGS`, when given), and
+/// its error says what its console says. Before this a job too big for its node ended with
+/// "native service connect deadline" and nothing kept.
+pub fn connect_failure(
+    error: moruna_vmm::error::VmmError,
+    runtime_dir: &Path,
+    keep: Option<std::ffi::OsString>,
+) -> moruna_vmm::error::VmmError {
+    use moruna_vmm::error::VmmError;
+    let kept = match keep {
+        Some(keep) => PathBuf::from(keep),
+        None => {
+            let name = runtime_dir
+                .file_name()
+                .map(|n| {
+                    n.to_string_lossy()
+                        .trim_start_matches("moruna-node-")
+                        .to_string()
+                })
+                .unwrap_or_default();
+            std::env::temp_dir().join(format!("moruna-diagnostics-{name}"))
+        }
+    };
+    match keep_diagnostics(runtime_dir, &kept) {
+        Ok(()) => eprintln!(
+            "moruna run --vm: the node's logs are kept in {}",
+            kept.display()
+        ),
+        Err(why) => eprintln!("moruna run --vm: the node's logs were not kept: {why}"),
+    }
+    let serial = std::fs::read(kept.join("serial.log")).unwrap_or_default();
+    let Some(cause) = console_cause(&String::from_utf8_lossy(&serial)) else {
+        return error;
+    };
+    match error {
+        VmmError::Control(msg) => VmmError::Control(format!("{msg}; the node's console: {cause}")),
+        VmmError::Io { op, target, msg } => VmmError::Io {
+            op,
+            target,
+            msg: format!("{msg}; the node's console: {cause}"),
+        },
+        other => other,
+    }
+}
+
 /// The status a run's exit code says, as the engine's report words it.
 pub fn status_of(code: i32) -> &'static str {
     match code {
@@ -2205,6 +2276,46 @@ mod tests {
         assert_eq!(output_disk_for(1 << 30) % 4096, 0);
         let e = build_node(&dir, Path::new("/j"), &dir.join("o"), &order).unwrap_err();
         assert!(e.contains("not a node kit"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// stream E hook (D's file): a node that never answered says why, from its console, and
+    /// keeps its logs.
+    #[test]
+    fn a_node_that_never_answered_names_its_console_cause() {
+        let console = "kk: 8 CPUs online\n\
+            KD2 engine: run 1 of 1: starting /moruna/bin/moruna-engine\n\
+            kk: process task.a exited with code 0 (it ran on cpus 1)\n\
+            admission: an account of 23353884672 bytes: QuotaExceeded\n\
+            kk: process admission exited with code 1 (it ran on cpus 2)\n\
+            node: critical service 5 terminated; stopping node\n";
+        let cause = console_cause(console).unwrap();
+        assert!(cause.starts_with("admission: an account"), "{cause}");
+        assert!(cause.ends_with("node: critical service 5 terminated; stopping node"));
+        assert!(!cause.contains("code 0"));
+        assert_eq!(console_cause("kk: 8 CPUs online\nlinux: up\n"), None);
+        let many = "x failed\n".repeat(9);
+        assert_eq!(console_cause(&many).unwrap().matches("failed").count(), 4);
+
+        let dir = std::env::temp_dir().join(format!("m-never-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let run = dir.join("moruna-node-abc");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("serial.log"), console).unwrap();
+        let error = connect_failure(
+            moruna_vmm::error::VmmError::Control(
+                "native service connect deadline/owner expired".into(),
+            ),
+            &run,
+            Some(dir.join("kept").into_os_string()),
+        );
+        let said = error.to_string();
+        assert!(said.contains("connect deadline"), "{said}");
+        assert!(
+            said.contains("the node's console: admission: an account"),
+            "{said}"
+        );
+        assert!(dir.join("kept/serial.log").is_file());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

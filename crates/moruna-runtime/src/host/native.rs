@@ -665,10 +665,22 @@ impl NativeRun {
         )?;
         let launched = Instant::now();
         witness.advance(Phase::Launched)?;
-        let reader = node.connect(
+        let reader = match node.connect(
             node.agent_port(),
             deadline.min(Instant::now() + moruna_vmm::session::CONNECT_TIMEOUT),
-        )?;
+        ) {
+            Ok(reader) => reader,
+            // stream E hook (D's file): a node that never answered keeps its logs, and its
+            // error says what its console says (a job too big for its node, a service that
+            // panicked), before the node and its directory go.
+            Err(error) => {
+                return Err(super::cli::connect_failure(
+                    error,
+                    node.runtime_dir(),
+                    std::env::var_os("MORUNA_KEEP_NODE_LOGS"),
+                ));
+            }
+        };
         let timing = Timing {
             launch: launched - began,
             connect: launched.elapsed(),
