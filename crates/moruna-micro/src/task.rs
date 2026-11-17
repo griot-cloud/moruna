@@ -71,6 +71,9 @@ const LOOK_NS: u64 = 250_000_000;
 const END_SECONDS: u64 = 60;
 /// A task's log ring.
 const RING_BYTES: u64 = 64 * 1024;
+/// Batches each of a ring stage's tasks holds at once: one it works on while the engine lays
+/// out the next, so one engine worker keeps every task of the stage busy.
+const IN_FLIGHT: usize = 2;
 /// The last lines of standard error a failure quotes, as on Linux.
 pub const TAIL_LINES: usize = 20;
 /// A stage's plane holds a record of its input and a window for its output; its arena is
@@ -277,6 +280,27 @@ pub struct ImageTask {
     rings: bool,
     /// The native program the stage starts itself (`abi: moruna`): its ELF.
     native: Option<Arc<[u8]>>,
+    /// How many of the stage's tasks hold a batch now, and the most that ever did.
+    busy: Arc<Busy>,
+}
+
+/// A ring stage's tasks holding batches: now, and the most at once.
+#[derive(Debug, Default)]
+struct Busy {
+    now: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+impl Busy {
+    fn start(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = self.now.fetch_add(1, Relaxed) + 1;
+        self.peak.fetch_max(now, Relaxed);
+    }
+
+    fn stop(&self) {
+        self.now.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Debug for ImageTask {
@@ -340,6 +364,7 @@ impl ImageTask {
             assets_path: None,
             rings,
             native: None,
+            busy: Arc::default(),
         })
     }
 
@@ -438,7 +463,7 @@ impl ImageTask {
         }
         st.sent += 1;
         if st.rings {
-            return st.answers(offered, self.ports.get(), &self.port_names);
+            return st.pipelined(offered, self.ports.get(), &self.port_names);
         }
         match st.wait(self.ports.get(), &self.port_names)? {
             Seen::Put(out) => {
@@ -726,6 +751,11 @@ impl ImageTask {
             landed: 0,
             stage: self.ports.get().map_or(UNKNOWN_STAGE, |p| p.stage()),
             cancel: self.cancel.get().cloned(),
+            in_flight: VecDeque::new(),
+            early: VecDeque::new(),
+            schema: None,
+            busy: Arc::clone(&self.busy),
+            deferred: 0,
         }
     }
 }
@@ -771,6 +801,17 @@ pub struct TaskState {
     landed: u64,
     stage: StageId,
     cancel: Option<CancelToken>,
+    /// Ring mode: the batches offered and not yet answered, oldest first.
+    in_flight: VecDeque<BatchId>,
+    /// What the task put or released while the engine laid out its next batch.
+    early: VecDeque<Seen>,
+    /// The schema of the task's answers, from its first: a batch of no rows stands for an
+    /// answer still to come.
+    schema: Option<moruna_kernel::arrow::datatypes::SchemaRef>,
+    /// The stage's gauge of busy tasks.
+    busy: Arc<Busy>,
+    /// Answers the stage gave as batches of no rows, the answers coming later.
+    deferred: u64,
 }
 
 impl Drop for TaskState {
@@ -1118,9 +1159,19 @@ impl TaskState {
             Some(Event::Ended { .. }) => {
                 Err(self.failed("it ended while the engine offered a batch"))
             }
+            // An answer to a batch in flight, taken in its turn.
+            Some(Event::Put { batch, .. }) if !self.in_flight.is_empty() => {
+                self.window = None;
+                self.early.push_back(Seen::Put(batch));
+                Ok(true)
+            }
             Some(Event::Put { batch, .. }) => {
                 let _ = self.plane.drop_batch(batch);
                 Err(self.failed("it put a record before it was offered a batch"))
+            }
+            Some(Event::Released { batch, .. }) if !self.in_flight.is_empty() => {
+                self.early.push_back(Seen::Released(batch));
+                Ok(true)
             }
             Some(Event::Released { .. } | Event::Freed { .. }) => Ok(true),
         }
@@ -1329,7 +1380,88 @@ impl TaskState {
                  with a record of no rows when it keeps none",
             )),
             1 => Ok(parts.remove(0)),
-            _ => self.join(parts),
+            _ => {
+                self.joined += 1;
+                self.join(parts)
+            }
+        }
+    }
+
+    /// Ring mode: batch `offered` joins the task's batches in flight, and the stage answers
+    /// with the oldest one's answer. It waits for that answer only for the task's first (whose
+    /// schema stands for the rest) and when the task holds [`IN_FLIGHT`] batches; otherwise,
+    /// with the answer not come yet, it answers with a batch of no rows and the answer comes
+    /// with a later one, or at the stage's end. The task works while the engine lays out its
+    /// next batch, and one engine worker keeps every task of the stage busy.
+    fn pipelined(
+        &mut self,
+        offered: BatchId,
+        ports: Option<&Arc<StagePorts>>,
+        names: &[String],
+    ) -> Result<Payload> {
+        if self.in_flight.is_empty() {
+            self.busy.start();
+        }
+        self.in_flight.push_back(offered);
+        self.gather(ports, names)?;
+        let oldest = self.in_flight[0];
+        let come = self
+            .early
+            .iter()
+            .any(|seen| matches!(seen, Seen::Released(b) if *b == oldest));
+        let schema = match &self.schema {
+            Some(schema) if !come && self.in_flight.len() < IN_FLIGHT => Arc::clone(schema),
+            _ => {
+                self.in_flight.pop_front();
+                let answer = self.answers(oldest, ports, names);
+                if self.in_flight.is_empty() {
+                    self.busy.stop();
+                }
+                let answer = answer?;
+                if let (None, Payload::Table(batch, _)) = (&self.schema, &answer) {
+                    self.schema = Some(batch.schema());
+                }
+                return Ok(answer);
+            }
+        };
+        self.deferred += 1;
+        Ok(Payload::Table(
+            moruna_kernel::arrow::record_batch::RecordBatch::new_empty(schema),
+            moruna_kernel::Tier::Host,
+        ))
+    }
+
+    /// Takes what the task has done by now, without waiting: its records and releases go to
+    /// [`Self::early`], in order, and its port calls are served.
+    fn gather(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<()> {
+        loop {
+            let event = self
+                .plane
+                .next(moruna_svc::now())
+                .map_err(|e| plane_error(&self.name, "looking at the task", e))?;
+            match event {
+                None => return Ok(()),
+                Some(Event::Put { batch, .. }) => {
+                    self.window = None;
+                    self.early.push_back(Seen::Put(batch));
+                }
+                Some(Event::Released { batch, .. }) => self.early.push_back(Seen::Released(batch)),
+                Some(Event::Ended { .. }) => {
+                    self.early.push_back(Seen::Ended);
+                    return Ok(());
+                }
+                Some(Event::Call {
+                    call,
+                    port,
+                    request,
+                }) => self.call(ports, names, call, port, request)?,
+                Some(Event::Refused { reason, .. }) => {
+                    return Err(self.failed(&format!(
+                        "its record on its output was refused by the engine's check: {reason}"
+                    )));
+                }
+                Some(Event::Freed { .. }) => {}
+            }
         }
     }
 
@@ -1362,13 +1494,15 @@ impl TaskState {
         self.reap();
         self.alloc
             .note_boundary_copy(joined.get_array_memory_size() as u64);
-        self.joined += 1;
         Ok(moruna_adapters::land::land_table(joined, &self.alloc)?.0)
     }
 
     /// Steps the plane until the task puts a record, releases a batch or ends, serving its
     /// port calls, looking at the run's cancel and at how the task ended meanwhile.
     fn wait_any(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<Seen> {
+        if let Some(seen) = self.early.pop_front() {
+            return Ok(seen);
+        }
         loop {
             self.reap();
             let deadline = moruna_svc::now().saturating_add(LOOK_NS);
@@ -1484,6 +1618,12 @@ impl Kernel for ImageTask {
         false
     }
 
+    /// A ring stage's tasks keep batches in flight of their own, so its instances take its
+    /// batches in turn and one worker keeps every task busy.
+    fn deals_instances(&self) -> bool {
+        self.rings
+    }
+
     fn accepts(&self) -> PayloadSpec {
         PayloadSpec {
             kind: PayloadKind::Table,
@@ -1501,16 +1641,17 @@ impl Kernel for ImageTask {
         Ok(Box::new(self.start(ctx)?))
     }
 
-    /// SDD 19 f.6 on the kernel: one record to the task and one back, in lockstep.
+    /// SDD 19 f.6 on the kernel: one record to the task and one back, in lockstep; in ring
+    /// mode with [`IN_FLIGHT`] batches in flight, each answer coming with a later batch.
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
         self.exchange(state, input, 0)
     }
 
     /// SDD 19 f.6, f.7 on the kernel: the input ends; the task puts nothing more, ends its
-    /// stream and exits 0. It gives nothing at its end: every batch an
-    /// image writes answers one it was sent.
+    /// stream and exits 0. It gives the answers still in flight (ring mode), joined into one
+    /// batch, and nothing else: every batch an image writes answers one it was sent.
     fn finish(&self, state: &mut dyn KernelState) -> Result<Option<Payload>> {
-        let ended = (|| -> Result<()> {
+        (|| -> Result<Option<Payload>> {
             let st = state
                 .as_any_mut()
                 .downcast_mut::<TaskState>()
@@ -1520,6 +1661,19 @@ impl Kernel for ImageTask {
                     "image: state belongs to another actual task owner".into(),
                 ));
             }
+            let mut rest = Vec::new();
+            let had = !st.in_flight.is_empty();
+            while let Some(oldest) = st.in_flight.pop_front() {
+                rest.push(st.answers(oldest, self.ports.get(), &self.port_names)?);
+            }
+            if had {
+                st.busy.stop();
+            }
+            let rest = match rest.len() {
+                0 => None,
+                1 => rest.pop(),
+                _ => Some(st.join(rest)?),
+            };
             st.plane
                 .finish(st.task, 0)
                 .map_err(|e| plane_error(&st.name, "ending the task's input", e))?;
@@ -1568,14 +1722,15 @@ impl Kernel for ImageTask {
                             sleeps = c.sleeps,
                             bells = c.bells,
                             zeroed = st.plane.plane.zeroed(),
+                            deferred = st.deferred,
+                            busy_peak = self.busy.peak.load(std::sync::atomic::Ordering::Relaxed),
                             "image task exited 0"
                         );
-                        Ok(())
+                        Ok(rest)
                     }
                     _ => Err(st.failed("it ended")),
                 },
             }
-        })();
-        ended.map(|()| None)
+        })()
     }
 }

@@ -396,6 +396,10 @@ impl Kernel for FinalRows {
     fn waiting_state(&self, instance: usize) -> Option<Vec<u8>> {
         self.kernel.waiting_state(instance)
     }
+    // stream P: a native stage's instances fed in turn.
+    fn deals_instances(&self) -> bool {
+        self.kernel.deals_instances()
+    }
 }
 
 impl Historical {
