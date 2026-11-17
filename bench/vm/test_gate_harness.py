@@ -179,14 +179,17 @@ def test_the_report(tmp_path):
     recs = []
     for r in range(1, 6):
         recs += [fake("moruna", r, 7.0, 40.0, good), fake("moruna-vm", r, 2.0, 12.0, good),
+                 fake("moruna066-rust", r, 5.0, 30.0, good),
                  fake("rust-baseline", r, 4.0, 14.0, good), fake("duckdb-sql", r, 3.0, 20.0, bad)]
     recs += [fake("moruna", None, 7.1, 40.0, good, noise="p1"), fake("moruna", None, 6.9, 40.0, good, noise="p2")]
     for i, rec in enumerate(recs):
         json.dump(rec, open(tmp_path / f"g-{i}.json", "w"))
     text = report.render(report.load(str(tmp_path)), ["d8"])
     # 2.0 s in all: 0.7 s of the VM's start-up, 0.3 s of the engine's, 1.0 s operational.
-    assert "| 1 | moruna-vm | rust | 1.0 | 2.0 | 0.70 | 0.30 | 12.0 |" in text, text
-    assert "| 2 | rust-baseline | rust | 4.0 | 4.0 |  |  | 14.0 |" in text
+    assert "| 1 | moruna-vm | rust | 1.0 | 2.0 | PASS | 0.70 | 0.30 | 12.0 |" in text, text
+    assert "| 2 | rust-baseline | rust | 4.0 | 4.0 |  |  |  | 14.0 |" in text
+    assert ("**PASS** no regression (the first gate: faster than both 0.6.6 rows): 0.7's operational 1.0 s "
+            "against 0.6.6 with the Rust function 5.0 s (5.00x), 0.6.6 with the Python function 7.0 s (7.00x)") in text
     assert ("against the plain Rust pool (best: rust-baseline, 4.0 s): 4.00x on operational time; 2.00x with "
             "start-up") in text
     assert "**PASS** on operational time (the bar)" in text and "**PASS** with start-up (the total)" in text
@@ -196,6 +199,10 @@ def test_the_report(tmp_path):
     slow = [fake("moruna-vm", 1, 3.9, 15.0, good), fake("rust-baseline", 1, 4.0, 14.0, good)]
     table, _ = report.rows_for(slow, "d8", "enrich")
     lines = report.speedups(table)
+    assert any("no regression: unchecked, no row for 0.6.6 with the Rust function" in line for line in lines)
+    six = slow + [fake("moruna066-rust", 1, 2.5, 14.0, good), fake("moruna", 1, 9.0, 40.0, good)]
+    table6, _ = report.rows_for(six, "d8", "enrich")
+    assert report.no_regression(table6)[0] == "MISS"  # 2.9 s operational against 0.6.6's 2.5 s
     # 3.9 s in all misses; operational, 2.9 s, misses too (4.0 / 2.9 = 1.38x).
     assert any("**MISS** with start-up" in line for line in lines)
     assert any("**MISS** on operational time" in line for line in lines)
