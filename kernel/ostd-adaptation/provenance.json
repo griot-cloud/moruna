@@ -52,6 +52,10 @@
       "patched_sha256": "0e354b58f650dc02444b9386e6d23b1eb21251b0ed8f976c215362e4826eddf9",
       "upstream_sha256": "7d1b87a14d98cbebd1068869155043d3882a01256bbc885ff2b8029cc6d08278"
     },
+    "src/task/mod.rs": {
+      "patched_sha256": "77a1b5b52000a461f18f347ac220f2a5121d49d692ea4d824a76a5285e8ed3f4",
+      "upstream_sha256": "7458cb746d2a769313b4e12b525db56df1eba9aff09429cf535f53a7eed86b4f"
+    },
     "src/task/scheduler/mod.rs": {
       "patched_sha256": "3c7a2a8de94e0f1acf08a7aa2167cfb77cc4cf84d3c8311995855649def89f25",
       "upstream_sha256": "adbe8fbb06789c6a9cce19a53987e3355d2c8c50bc0449c6db23066acbd3f979"

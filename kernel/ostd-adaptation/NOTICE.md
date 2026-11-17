@@ -26,6 +26,11 @@ kernel mode and so counted against §0:
   and every frame unmapped meanwhile stayed allocated. Returning to user mode now passes a
   quiescent state (`UserMode::execute`), as it does in Linux, and
   `sync::report_quiescent_state` lets the core's idle task pass one each time it wakes.
+- **Whether a task is still in a CPU's foreground** (`Task::is_in_foreground`). OSTD
+  dequeues a parking task before its old context has finished switching out, and a CPU
+  that switches to such a task spins until it is let go. The core's scheduler moves a
+  woken thread to another CPU only when it is not in the foreground, so no CPU waits on
+  another.
 
 Three of its comments lose their em dashes (`src/log/logger.rs`, `src/log/macros.rs`,
 `src/task/scheduler/mod.rs`), which the repository's quality check refuses in every

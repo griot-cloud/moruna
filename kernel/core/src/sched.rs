@@ -3,10 +3,14 @@
 //!
 //! OSTD's default scheduler queues every task on the boot processor, so a kernel that
 //! wants its other CPUs must bring its own. This one places a new task on the CPU with
-//! the fewest runnable tasks, preferring the current one on a tie; retains that CPU
-//! across waits and wakes. OSTD dequeues a parking task before its old context has
-//! finished switching out, so migrating it at that point could select a task still
-//! in the foreground on another CPU. New tasks still spread across all CPUs. It runs each
+//! the fewest runnable tasks, preferring the current one on a tie, and retains that CPU
+//! across waits and wakes, with one exception: a woken thread whose CPU is busy moves to
+//! a CPU with nothing to run, or to its waker's when only the waker runs there, so
+//! threads first placed together (each started while the others slept) spread as they
+//! run. A task moves only once it has left its old CPU's foreground: OSTD dequeues a
+//! parking task before its old context has finished switching out, and a CPU that
+//! switches to a task still in another's foreground spins until it leaves
+//! (`Task::is_in_foreground`, `ostd-adaptation/NOTICE.md`). It runs each
 //! CPU's queue first in, first out; preempts a task that has run for a
 //! slice while another waits on its CPU; and gives each CPU an idle task that halts
 //! until an interrupt, so a CPU with nothing to run sleeps instead of spinning. A wake
@@ -23,6 +27,18 @@
 //! that one move is the whole mechanism: the thread runs there until it is placed again.
 //! Unpinned, a thread is free to run anywhere: the next time it is queued the scheduler
 //! places it as it places a new thread.
+//!
+//! A woken task runs before the tasks a slice preempted: it waits in its CPU's wake queue,
+//! which is taken first, at most [`WOKEN_FIRST`] in a row while a preempted task waits.
+//! So a wake waits at most for what is left of the running task's slice, not for every
+//! task queued on its CPU; and a task that never sleeps still runs at least once every
+//! `WOKEN_FIRST + 1` turns.
+//!
+//! A worker's core runs its pinned worker (C5). While some core has no pinned thread, the
+//! scheduler places an unpinned thread on such a core, and an unpinned thread queued on a
+//! core with a pinned thread moves to one: a reactor, a ticker or a helper that first ran
+//! there before the worker was pinned stops preempting it. When every core has a pinned
+//! thread, an unpinned one shares a core with a worker.
 //!
 //! A CPU other than the boot processor that runs one thread, or none, stretches its tick
 //! to [`STRETCH`] timer periods (C5, measured: each tick costs a pinned CPU about 19 us
@@ -42,6 +58,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use moruna_abi::Error;
 use ostd::{
     cpu::{CpuId, PinCurrentCpu, num_cpus},
+    irq::InterruptLevel,
     sync::{LocalIrqDisabled, SpinLock, Waiter},
     task::{
         Task, TaskOptions, disable_preempt, halt_cpu,
@@ -86,9 +103,46 @@ static PINS: SpinLock<BTreeMap<u64, (Weak<Thread>, Place)>, LocalIrqDisabled> =
 /// How many pins wait, read without the lock by every enqueue.
 static PENDING: AtomicUsize = AtomicUsize::new(0);
 
+/// Whether unpinned threads keep off the cores of pinned ones while a core is free of them.
+const PLACE_AWAY: bool = true;
+
+/// Whether a woken unpinned thread whose CPU is busy moves to a CPU with nothing to run.
+const WAKE_AWAY: bool = true;
+
+/// How many woken tasks may run in a row before a preempted task that waits; zero runs
+/// every queue first in, first out, as before woken tasks went first.
+const WOKEN_FIRST: u32 = 4;
+
+/// Bit `i` is set while CPU `i` has a pinned thread.
+static PINNED_CPUS: AtomicU64 = AtomicU64::new(0);
+/// Bit `i` is set for every CPU there is.
+static ALL_CPUS: AtomicU64 = AtomicU64::new(0);
+
+/// The scheduler, for a pin that needs no move.
+static SCHEDULER: SpinLock<Option<&'static Cpus>> = SpinLock::new(None);
+
+/// Whether a CPU without a pinned thread is there to place an unpinned one on.
+fn free_core() -> bool {
+    PINNED_CPUS.load(Ordering::Relaxed) != ALL_CPUS.load(Ordering::Relaxed)
+}
+
+/// Whether an unpinned thread may be placed on `cpu`.
+fn may_place(cpu: usize) -> bool {
+    !PLACE_AWAY || !free_core() || PINNED_CPUS.load(Ordering::Relaxed) & bit(cpu) == 0
+}
+
+fn bit(cpu: usize) -> u64 {
+    if cpu < CPUS_MAX { 1 << cpu } else { 0 }
+}
+
 struct RunQueue {
     current: Option<Arc<Task>>,
+    /// The tasks a slice preempted, and new ones, first in, first out.
     queue: VecDeque<Arc<Task>>,
+    /// The tasks woken from a wait, first in, first out, taken before `queue`.
+    woken: VecDeque<Arc<Task>>,
+    /// The woken tasks run in a row while `queue` waited.
+    woken_run: u32,
     idle: Arc<Task>,
     ticks: u32,
     /// Runnable tasks on this CPU other than its idle task, read without the lock by
@@ -98,6 +152,10 @@ struct RunQueue {
     boot: bool,
     /// Whether this CPU's tick is stretched now.
     stretched: bool,
+    /// Its number.
+    cpu: usize,
+    /// The threads pinned to it, by thread id, held weakly: one that ends goes at a tick.
+    pinned: BTreeMap<u64, Weak<Thread>>,
 }
 
 impl RunQueue {
@@ -105,22 +163,76 @@ impl RunQueue {
         Arc::ptr_eq(task, &self.idle)
     }
 
-    /// Whether `task` is this CPU's current task or waits in its queue.
+    /// Records that `thread` is pinned to this CPU, or no longer is, and publishes
+    /// whether any thread is; pins of threads that have ended go.
+    fn pin(&mut self, thread: &Arc<Thread>, pinned: bool) {
+        if pinned {
+            self.pinned.insert(thread.tid, Arc::downgrade(thread));
+        } else {
+            self.pinned.remove(&thread.tid);
+        }
+        self.publish_pins();
+    }
+
+    fn publish_pins(&mut self) {
+        self.pinned.retain(|_, t| t.strong_count() > 0);
+        if self.pinned.is_empty() {
+            PINNED_CPUS.fetch_and(!bit(self.cpu), Ordering::Relaxed);
+        } else {
+            PINNED_CPUS.fetch_or(bit(self.cpu), Ordering::Relaxed);
+        }
+    }
+
+    /// Whether `task` is this CPU's current task or waits in one of its queues.
     fn holds(&self, task: &Arc<Task>) -> bool {
         self.current.as_ref().is_some_and(|c| Arc::ptr_eq(c, task))
             || self.queue.iter().any(|queued| Arc::ptr_eq(queued, task))
+            || self.woken.iter().any(|queued| Arc::ptr_eq(queued, task))
+    }
+
+    /// Whether a task waits to run.
+    fn waiting(&self) -> bool {
+        !self.queue.is_empty() || !self.woken.is_empty()
+    }
+
+    /// Whether a task woken by a thread running on CPU `waker` (none for an interrupt)
+    /// would wait for another on this CPU: one runs or waits here, other than that waker
+    /// on its own CPU.
+    fn busy_for(&self, waker: Option<usize>) -> bool {
+        let running = self.current.as_ref().is_some_and(|c| !self.is_idle(c));
+        self.waiting() || (running && waker != Some(self.cpu))
+    }
+
+    /// The next task to run: a woken one, unless `WOKEN_FIRST` of them have run in a row
+    /// while a preempted one waited.
+    fn take_next(&mut self) -> Option<Arc<Task>> {
+        let woken_turn =
+            !self.woken.is_empty() && (self.queue.is_empty() || self.woken_run < WOKEN_FIRST);
+        if woken_turn {
+            self.woken_run = if self.queue.is_empty() {
+                0
+            } else {
+                self.woken_run + 1
+            };
+            self.woken.pop_front()
+        } else {
+            self.woken_run = 0;
+            self.queue.pop_front()
+        }
     }
 
     fn publish(&self) {
         let busy = self.current.as_ref().is_some_and(|c| !self.is_idle(c));
-        self.load
-            .store(self.queue.len() + usize::from(busy), Ordering::Relaxed);
+        self.load.store(
+            self.queue.len() + self.woken.len() + usize::from(busy),
+            Ordering::Relaxed,
+        );
     }
 
     /// Stretches this CPU's tick while nothing waits on it, and brings it back when
     /// something does. Called on the CPU itself, with its queue's lock held.
     fn retick(&mut self) {
-        let stretch = !self.boot && self.current.is_some() && self.queue.is_empty();
+        let stretch = !self.boot && self.current.is_some() && !self.waiting();
         if stretch != self.stretched {
             self.stretched = stretch;
             ostd::timer::set_tick_stretch(if stretch { STRETCH } else { 1 });
@@ -134,13 +246,16 @@ impl LocalRunQueue for RunQueue {
     }
 
     fn update_current(&mut self, flags: UpdateFlags) -> bool {
-        let waiting = !self.queue.is_empty();
+        let waiting = self.waiting();
         match flags {
             // The boot context (no current task) is never preempted: it leaves for a
             // task only when it yields, once the boot is done.
             UpdateFlags::Tick => {
                 self.ticks = self.ticks.saturating_add(1);
                 self.retick();
+                if !self.pinned.is_empty() {
+                    self.publish_pins();
+                }
                 match &self.current {
                     None => false,
                     Some(c) => waiting && (self.is_idle(c) || self.ticks >= SLICE_TICKS),
@@ -155,7 +270,7 @@ impl LocalRunQueue for RunQueue {
     }
 
     fn try_pick_next(&mut self) -> Option<&Arc<Task>> {
-        let next = match self.queue.pop_front() {
+        let next = match self.take_next() {
             Some(task) => task,
             None if self.current.is_none() => self.idle.clone(),
             None => return None,
@@ -192,32 +307,61 @@ impl Cpus {
     /// Where a task that names no CPU goes: a woken one to this CPU if at most its
     /// waker is runnable here, else (and a new one always) the CPU with the fewest
     /// runnable tasks, this one on a tie.
+    ///
+    /// While some CPU has no pinned thread, only such CPUs are chosen.
     fn select(&self, flags: EnqueueFlags) -> CpuId {
         let here = disable_preempt().current_cpu();
         let count = self.loads.len();
         let start = here.as_usize();
-        if flags == EnqueueFlags::Wake && self.loads[start].load(Ordering::Relaxed) <= 1 {
+        if flags == EnqueueFlags::Wake
+            && may_place(start)
+            && self.loads[start].load(Ordering::Relaxed) <= 1
+        {
             return here;
         }
-        let mut best = start;
-        let mut best_load = self.loads[start].load(Ordering::Relaxed);
-        for step in 1..count {
+        let mut best = None;
+        for step in 0..count {
             let cpu = (start + step) % count;
+            if !may_place(cpu) {
+                continue;
+            }
             let load = self.loads[cpu].load(Ordering::Relaxed);
-            if load < best_load {
-                best = cpu;
-                best_load = load;
+            if best.is_none_or(|(_, least)| load < least) {
+                best = Some((cpu, load));
             }
         }
-        CpuId::try_from(best).unwrap_or(here)
+        best.and_then(|(cpu, _)| CpuId::try_from(cpu).ok())
+            .unwrap_or(here)
     }
 }
 
 impl Cpus {
+    /// Where a woken thread goes when its CPU `home` is busy: the first CPU after `home`
+    /// with nothing to run, else the waking thread's CPU `waker` when only that thread
+    /// runs there and no thread is pinned to it; never a CPU an unpinned thread may not
+    /// be placed on. `None` leaves it home.
+    fn wake_target(&self, home: usize, waker: Option<usize>) -> Option<CpuId> {
+        let count = self.loads.len();
+        let unpinned = |cpu| PINNED_CPUS.load(Ordering::Relaxed) & bit(cpu) == 0;
+        let mut fallback = None;
+        for step in 1..count {
+            let cpu = (home + step) % count;
+            if !may_place(cpu) {
+                continue;
+            }
+            match self.loads[cpu].load(Ordering::Relaxed) {
+                0 => return CpuId::try_from(cpu).ok(),
+                1 if Some(cpu) == waker && unpinned(cpu) => fallback = CpuId::try_from(cpu).ok(),
+                _ => {}
+            }
+        }
+        fallback
+    }
+
     /// Moves `task`, which is being queued, to `place` if no queue holds it: `false` when
     /// its CPU's queue still has it (a wake while it runs), and the pin must wait.
     /// `Anywhere` leaves it with no CPU, so this enqueue chooses one.
-    fn place(&self, task: &Arc<Task>, place: Place) -> bool {
+    fn place(&self, task: &Arc<Task>, thread: &Arc<Thread>, place: Place) -> bool {
         let Some(old) = task.cpu().get() else {
             return match place {
                 Place::Cpu(cpu) => task.cpu().set_if_is_none(cpu).is_ok(),
@@ -229,10 +373,11 @@ impl Cpus {
         }
         // Under its old queue's lock, so no enqueue queues it there meanwhile: one that
         // read the old CPU finds it changed once it has the lock, and retries.
-        let rq = self.queues[old.as_usize()].disable_irq().lock();
-        if rq.holds(task) {
+        let mut rq = self.queues[old.as_usize()].disable_irq().lock();
+        if rq.holds(task) || task.is_in_foreground() {
             return false;
         }
+        rq.pin(thread, false);
         match place {
             Place::Cpu(cpu) => task.cpu().set_anyway(cpu),
             Place::Anywhere => task.cpu().set_to_none(),
@@ -243,26 +388,73 @@ impl Cpus {
 
 impl Scheduler for Cpus {
     fn enqueue(&self, runnable: Arc<Task>, flags: EnqueueFlags) -> Option<CpuId> {
+        let mut applied = None;
         if PENDING.load(Ordering::Acquire) != 0
             && let Some((thread, place)) = take_pin(&runnable)
-            && !self.place(&runnable, place)
         {
-            put_pin(&thread, place);
+            if self.place(&runnable, &thread, place) {
+                applied = Some((thread, place));
+            } else {
+                put_pin(&thread, place);
+            }
         }
         // Only the first enqueue chooses a CPU. An assigned CPU is affinity,
         // not evidence that this task is still runnable: a waiter can already
         // be dequeued while its old context is completing the switch-out.
-        let selected = self.select(flags);
+        let mut selected = self.select(flags);
+        // The CPU of the thread waking it; none when an interrupt wakes it.
+        let waker = InterruptLevel::current()
+            .is_task_context()
+            .then(|| disable_preempt().current_cpu().as_usize());
+        let mut moved = false;
         let (target, mut rq) = loop {
             let target = match runnable.cpu().set_if_is_none(selected) {
                 Ok(()) => selected,
                 Err(cpu) => cpu,
             };
-            let rq = self.queues[target.as_usize()].disable_irq().lock();
+            let mut rq = self.queues[target.as_usize()].disable_irq().lock();
             // A pin may have moved it while this waited for the lock.
-            if runnable.cpu().get() == Some(target) {
-                break (target, rq);
+            if runnable.cpu().get() != Some(target) {
+                continue;
             }
+            if let Some((thread, Place::Cpu(cpu))) = &applied
+                && *cpu == target
+            {
+                rq.pin(thread, true);
+            }
+            // An unpinned thread on a pinned thread's core moves to a core with none,
+            // while there is one; one this queue still holds stays for now.
+            let unpinned = thread_of(&runnable).is_some_and(|t| !rq.pinned.contains_key(&t.tid));
+            if PLACE_AWAY
+                && unpinned
+                && !rq.pinned.is_empty()
+                && free_core()
+                && !rq.holds(&runnable)
+                && !runnable.is_in_foreground()
+            {
+                runnable.cpu().set_to_none();
+                drop(rq);
+                selected = self.select(flags);
+                continue;
+            }
+            // A woken thread whose CPU is busy moves, once, to one with nothing to run,
+            // so threads first placed together do not stay together for good.
+            if WAKE_AWAY
+                && flags == EnqueueFlags::Wake
+                && !moved
+                && applied.is_none()
+                && unpinned
+                && rq.busy_for(waker)
+                && !rq.holds(&runnable)
+                && !runnable.is_in_foreground()
+                && let Some(cpu) = self.wake_target(target.as_usize(), waker)
+            {
+                runnable.cpu().set_anyway(cpu);
+                moved = true;
+                drop(rq);
+                continue;
+            }
+            break (target, rq);
         };
         if rq.holds(&runnable) {
             return None;
@@ -271,7 +463,12 @@ impl Scheduler for Cpus {
         // reschedule; one still in its boot context takes the task when it yields.
         let idle = rq.current.as_ref().is_some_and(|c| rq.is_idle(c));
         let kick = idle || rq.stretched;
-        rq.queue.push_back(runnable);
+        // A task woken from a wait runs before the ones a slice preempted.
+        if flags == EnqueueFlags::Wake && WOKEN_FIRST > 0 {
+            rq.woken.push_back(runnable);
+        } else {
+            rq.queue.push_back(runnable);
+        }
         rq.publish();
         kick.then_some(target)
     }
@@ -320,15 +517,21 @@ pub fn init() -> Result<(), &'static str> {
         queues.push(SpinLock::new(RunQueue {
             current: None,
             queue: VecDeque::new(),
+            woken: VecDeque::new(),
+            woken_run: 0,
             idle: Arc::new(task),
             ticks: 0,
             load,
             boot: cpu == 0,
             stretched: false,
+            cpu,
+            pinned: BTreeMap::new(),
         }));
+        ALL_CPUS.fetch_or(bit(cpu), Ordering::Relaxed);
     }
     let cpus: &'static Cpus =
         alloc::boxed::Box::leak(alloc::boxed::Box::new(Cpus { queues, loads }));
+    *SCHEDULER.lock() = Some(cpus);
     inject_scheduler(cpus);
     enable_preemption_on_cpu();
     ostd::boot::smp::register_ap_entry(enable_preemption_on_cpu);
@@ -400,6 +603,17 @@ pub fn set_cpu(caller: &Arc<Thread>, thread: &Arc<Thread>, cpu: Option<u32>) -> 
         .ok_or(Error::InvalidArgs)?;
     put_pin(thread, Place::Cpu(cpu));
     if !Arc::ptr_eq(caller, thread) {
+        return Ok(());
+    }
+    if current_cpu() as usize == cpu.as_usize() {
+        // Already there: no move records the pin, so it is recorded here.
+        drop_pin(caller);
+        if let Some(cpus) = *SCHEDULER.lock() {
+            cpus.queues[cpu.as_usize()]
+                .disable_irq()
+                .lock()
+                .pin(caller, true);
+        }
         return Ok(());
     }
     while current_cpu() as usize != cpu.as_usize() {

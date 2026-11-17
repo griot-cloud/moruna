@@ -124,6 +124,14 @@ impl Task {
     pub fn schedule_info(&self) -> &TaskScheduleInfo {
         &self.schedule_info
     }
+
+    /// Whether the task is in a CPU's foreground: running there, or parked and not yet
+    /// switched out. A scheduler moves a woken task to another CPU only when it is not,
+    /// so that CPU never waits for this one to let it go (Moruna).
+    pub fn is_in_foreground(&self) -> bool {
+        self.switched_to_cpu
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
 }
 
 /// Options to create or spawn a new task.

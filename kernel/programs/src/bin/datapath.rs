@@ -23,11 +23,22 @@
 //!   gives the record back, refusals change nothing, and `dp-task`'s write to a page
 //!   revoked this way faults.
 //!
-//! - C5's stretched tick: a thread queued on a CPU whose tick is stretched (it ran one
-//!   thread) runs there within 20 ms, and then two threads share the CPU; and grace
-//!   periods complete while a CPU runs one thread in user mode, switching no task: CPU 0
-//!   makes and frees more memory than the machine has, each freed frame waiting for a
-//!   grace period.
+//! - C5's stretched tick: a thread moved onto a CPU whose tick is stretched (it ran one
+//!   thread) runs there within 20 ms (the median of five moves), and then two threads
+//!   share the CPU; and grace periods complete while a CPU runs one thread in user mode,
+//!   switching no task: CPU 0 makes and frees more memory than the machine has, each
+//!   freed frame waiting for a grace period.
+//!
+//! - a wake behind busy threads: a thread woken on a CPU where three threads spin runs
+//!   before any other of them takes the CPU (judged by the order they ran in);
+//! - spreading: twice as many unpinned sleepers as CPUs, each started while the others
+//!   sleep, so they start on one CPU, run on every CPU once woken together;
+//! - AVX state (`avx_fixture.rs`): one more thread than there are CPUs keeps its own
+//!   values in all 16 `ymm` registers through preemption, and one moves between CPUs with
+//!   `thread_set_cpu`, every lane checked at the end;
+//! - C5's placement: unpinned threads that first ran on a core keep off it once a worker
+//!   is pinned there, while another core has no pinned thread, so they no longer take the
+//!   worker's turns.
 //!
 //! It also measures what C4, C5 and C8 are judged by: a touch a page through large pages
 //! and through 4 KiB ones, the time a pinned CPU loses to the kernel, and a read of the
@@ -35,7 +46,9 @@
 
 #![no_std]
 #![no_main]
-#![forbid(unsafe_code)]
+// The AVX check's assembly region (`avx_fixture.rs`) is the one place unsafe code is
+// allowed.
+#![deny(unsafe_code)]
 
 extern crate alloc;
 
@@ -53,6 +66,9 @@ use moruna_sys::{
     plane::{Slot, SlotEvent, attach},
     println, raw, thread_exit, wait_one,
 };
+
+#[path = "../avx_fixture.rs"]
+mod avx;
 
 moruna_sys::main!(run);
 
@@ -97,7 +113,19 @@ fn run() -> i64 {
     if let Err(code) = share(&out, cpus) {
         return code;
     }
+    if let Err(code) = wake(&out, cpus) {
+        return code;
+    }
     if let Err(code) = rcu(&out, cpus) {
+        return code;
+    }
+    if let Err(code) = placement(&out, cpus) {
+        return code;
+    }
+    if let Err(code) = spread(&out, cpus) {
+        return code;
+    }
+    if let Err(code) = avx::check(&out, cpus) {
         return code;
     }
     if let Err(code) = clock(&out) {
@@ -959,8 +987,9 @@ static SPINNING: AtomicU32 = AtomicU32::new(0);
 static JOINED: AtomicU32 = AtomicU32::new(0);
 static COUNT_A: AtomicU64 = AtomicU64::new(0);
 static COUNT_B: AtomicU64 = AtomicU64::new(0);
-/// How long the second thread's placement on the spinner's CPU took, in nanoseconds.
-static JOIN_NS: AtomicU64 = AtomicU64::new(0);
+/// How long each of the second thread's five moves onto the spinner's CPU took, in
+/// nanoseconds.
+static JOINS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// Spins on CPU `cpu`, counting, until `STOP`.
 extern "C" fn spinner(cpu: u64) -> ! {
@@ -975,13 +1004,23 @@ extern "C" fn spinner(cpu: u64) -> ! {
 
 /// Places itself on CPU `cpu`, beside the spinner, timing it; then spins there too.
 extern "C" fn joiner(cpu: u64) -> ! {
-    let start = now();
-    if pin_current_thread(Some(cpu as u32)).is_ok() {
-        JOIN_NS.store(now() - start, Ordering::Relaxed);
-        JOINED.store(1, Ordering::Release);
-        while STOP.load(Ordering::Relaxed) == 0 {
-            COUNT_B.fetch_add(1, Ordering::Relaxed);
+    // Five times: away to CPU 0 (on one CPU it never leaves), long enough for the
+    // spinner's CPU to stretch its tick again, then back beside the spinner, timed.
+    let home = 0u32;
+    for join in &JOINS {
+        if pin_current_thread(Some(home)).is_err() {
+            thread_exit()
         }
+        let _ = futex_wait(&READY, 1, now() + ms(30));
+        let start = now();
+        if pin_current_thread(Some(cpu as u32)).is_err() {
+            thread_exit()
+        }
+        join.store(now() - start, Ordering::Relaxed);
+    }
+    JOINED.store(1, Ordering::Release);
+    while STOP.load(Ordering::Relaxed) == 0 {
+        COUNT_B.fetch_add(1, Ordering::Relaxed);
     }
     thread_exit()
 }
@@ -1024,8 +1063,9 @@ fn join(out: &Out, test: &str, thread: &Thread) -> Result<(), i64> {
     }
 }
 
-/// A thread queued on the spinner's CPU, whose tick is stretched, runs there within
-/// 20 ms, and then the two share the CPU.
+/// A thread moved onto the spinner's CPU, whose tick is stretched, runs there within
+/// 20 ms (the median of five moves: a stall of the host under the VM is not the
+/// scheduler's), and then the two share the CPU.
 fn share(out: &Out, cpus: u32) -> Result<(), i64> {
     let last = u64::from(cpus - 1);
     STOP.store(0, Ordering::Relaxed);
@@ -1038,14 +1078,22 @@ fn share(out: &Out, cpus: u32) -> Result<(), i64> {
     // Long enough for its CPU to stretch its tick.
     let _ = futex_wait(&READY, 1, now() + ms(20));
     let b = start(out, "share", joiner, last)?;
-    if !until(&JOINED, 10_000) {
+    // Sleeping, not spinning: CPU 0 is where the second thread goes between moves.
+    let end = now() + ms(30_000);
+    while JOINED.load(Ordering::Acquire) == 0 && now() < end {
+        let _ = futex_wait(&READY, 1, now() + ms(5));
+    }
+    if JOINED.load(Ordering::Acquire) == 0 {
         println!(
             out,
             "DS-A share: FAIL: the second thread never ran beside the spinner"
         );
         return Err(1);
     }
-    let joined = JOIN_NS.load(Ordering::Relaxed);
+    let mut joins: [u64; 5] = core::array::from_fn(|i| JOINS[i].load(Ordering::Relaxed));
+    joins.sort_unstable();
+    // The median: one stall of the host under the VM does not judge the scheduler.
+    let joined = joins[2];
     let (a0, b0) = (
         COUNT_A.load(Ordering::Relaxed),
         COUNT_B.load(Ordering::Relaxed),
@@ -1064,7 +1112,8 @@ fn share(out: &Out, cpus: u32) -> Result<(), i64> {
     if joined > ms(20) || da * 4 < total || db * 4 < total {
         println!(
             out,
-            "DS-A share: FAIL: the second thread took {} ns to run beside the spinner, and they counted {} and {}",
+            "DS-A share: FAIL: moving beside the spinner took {:?} ns (median {} ns), and they counted {} and {}",
+            joins,
             joined,
             da,
             db
@@ -1073,9 +1122,10 @@ fn share(out: &Out, cpus: u32) -> Result<(), i64> {
     }
     println!(
         out,
-        "DS-A share: ok: a thread queued on CPU {}, its tick stretched, ran there after {} ns, and the two then shared it {}% and {}%",
+        "DS-A share: ok: a thread moved onto CPU {}, its tick stretched, ran there after {} ns (median of {:?} ns), and the two then shared it {}% and {}%",
         last,
         joined,
+        joins,
         da * 100 / total,
         db * 100 / total
     );
@@ -1130,6 +1180,388 @@ fn rcu(out: &Out, cpus: u32) -> Result<(), i64> {
         ROUNDS * (CHUNK >> 20),
         took / 1_000_000,
         last
+    );
+    Ok(())
+}
+
+/// Set to stop the wakers of `placement`.
+static WAKERS_STOP: AtomicU32 = AtomicU32::new(0);
+/// Never changes: the wakers sleep on it with a deadline.
+static WAKER_WORD: AtomicU32 = AtomicU32::new(0);
+/// Each waker's CPU at its last wake, plus one.
+static WAKER_CPU: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+/// The worker's CPU, plus one, once it is pinned there (zero before).
+static WORKER_ON: AtomicU32 = AtomicU32::new(0);
+/// Wakes of a waker on the worker's CPU once the worker is pinned there.
+static WAKES_ON_WORKER: AtomicU64 = AtomicU64::new(0);
+/// The worker's turns lost to other threads (gaps of 150 us or more), and their time.
+static LOST_TURNS: AtomicU64 = AtomicU64::new(0);
+static LOST_NS: AtomicU64 = AtomicU64::new(0);
+/// Set once the worker has measured.
+static MEASURED: AtomicU32 = AtomicU32::new(0);
+
+/// Wakes every 2 ms and works 200 us, as a reactor or a ticker does, unpinned.
+extern "C" fn waker(i: u64) -> ! {
+    while WAKERS_STOP.load(Ordering::Relaxed) == 0 {
+        let cpu = current_cpu();
+        WAKER_CPU[i as usize].store(cpu + 1, Ordering::Relaxed);
+        if WORKER_ON.load(Ordering::Acquire) == cpu + 1 {
+            WAKES_ON_WORKER.fetch_add(1, Ordering::Relaxed);
+        }
+        let end = now() + 200_000;
+        while now() < end {
+            core::hint::spin_loop();
+        }
+        let _ = futex_wait(&WAKER_WORD, 0, now() + ms(2));
+    }
+    thread_exit()
+}
+
+/// Pins itself to CPU `cpu` and spins there 300 ms, counting the turns it loses.
+extern "C" fn worker(cpu: u64) -> ! {
+    let Ok(page) = ClockPage::map() else {
+        thread_exit()
+    };
+    if pin_current_thread(Some(cpu as u32)).is_ok() {
+        WORKER_ON.store(cpu as u32 + 1, Ordering::Release);
+        let start = page.now();
+        let mut last = start;
+        let (mut turns, mut lost) = (0, 0);
+        while last - start < ms(300) {
+            let t = page.now();
+            if t - last >= 150_000 {
+                turns += 1;
+                lost += t - last;
+            }
+            last = t;
+        }
+        LOST_TURNS.store(turns, Ordering::Relaxed);
+        LOST_NS.store(lost, Ordering::Relaxed);
+        WORKER_ON.store(0, Ordering::Release);
+        let _ = pin_current_thread(None);
+    }
+    MEASURED.store(1, Ordering::Release);
+    thread_exit()
+}
+
+/// A worker pinned to a core where an unpinned waker first ran: with a core free of
+/// pinned threads, the wakers move there and the worker keeps its core.
+fn placement(out: &Out, cpus: u32) -> Result<(), i64> {
+    if cpus == 1 {
+        println!(
+            out,
+            "DS-A placement: ok: one CPU, which a worker shares with every thread"
+        );
+        return Ok(());
+    }
+    // This thread stays unpinned, so a core is free of pinned threads.
+    pin_current_thread(None).map_err(|e| fail(out, "placement", "unpinning", e))?;
+    let mut wakers = Vec::new();
+    for i in 0..3 {
+        wakers.push(start(out, "placement", waker, i)?);
+    }
+    let _ = futex_wait(&READY, 1, now() + ms(20));
+    // The worker's core: one a waker first ran on, other than the boot processor's.
+    let core = WAKER_CPU
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .find(|c| *c > 1)
+        .map_or(cpus - 1, |c| c - 1);
+    let first = WAKER_CPU
+        .iter()
+        .filter(|c| c.load(Ordering::Relaxed) == core + 1)
+        .count();
+    let w = start(out, "placement", worker, u64::from(core))?;
+    let measured = until(&MEASURED, 10_000);
+    WAKERS_STOP.store(1, Ordering::Relaxed);
+    join(out, "placement", &w)?;
+    for t in &wakers {
+        join(out, "placement", t)?;
+    }
+    let (turns, lost) = (
+        LOST_TURNS.load(Ordering::Relaxed),
+        LOST_NS.load(Ordering::Relaxed),
+    );
+    let on = WAKES_ON_WORKER.load(Ordering::Relaxed);
+    if !measured || turns > 10 || on > 3 {
+        println!(
+            out,
+            "DS-A placement: FAIL: a worker pinned to CPU {} lost {} turns ({} ns) in 300 ms, and the wakers woke on its core {} times ({} had first run there)",
+            core,
+            turns,
+            lost,
+            on,
+            first
+        );
+        return Err(1);
+    }
+    println!(
+        out,
+        "DS-A placement: ok: a worker pinned to CPU {}, where {} of 3 unpinned wakers first ran, lost {} turns ({} ns) in 300 ms to other threads, and the wakers woke on its core {} times",
+        core,
+        first,
+        turns,
+        lost,
+        on
+    );
+    Ok(())
+}
+
+/// The round `spread`'s sleepers are woken for; past the last, they end.
+static BELL: AtomicU32 = AtomicU32::new(0);
+/// The last round `spread` has ended.
+static BELL_END: AtomicU32 = AtomicU32::new(0);
+/// How many times a sleeper of `spread` has gone to the bell, over all rounds.
+static AT_BELL: AtomicU32 = AtomicU32::new(0);
+/// The CPUs `spread`'s sleepers first ran on, and those each round ran them on, by bit.
+static SPREAD_START: AtomicU64 = AtomicU64::new(0);
+static SPREAD_ROUNDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn cpu_bit(cpu: u32) -> u64 {
+    if cpu < 64 { 1 << cpu } else { 0 }
+}
+
+/// Goes to the bell at once, then, each round, spins until the round ends and records
+/// the CPU it ran on.
+extern "C" fn bell_sleeper(_: u64) -> ! {
+    SPREAD_START.fetch_or(cpu_bit(current_cpu()), Ordering::Relaxed);
+    let mut round = 0;
+    loop {
+        AT_BELL.fetch_add(1, Ordering::Release);
+        while BELL.load(Ordering::Acquire) == round {
+            let _ = futex_wait(&BELL, round, now() + ms(1_000));
+        }
+        round = BELL.load(Ordering::Acquire);
+        let Some(seen) = SPREAD_ROUNDS.get(round as usize - 1) else {
+            break;
+        };
+        while BELL_END.load(Ordering::Acquire) < round {
+            core::hint::spin_loop();
+        }
+        seen.fetch_or(cpu_bit(current_cpu()), Ordering::Relaxed);
+    }
+    thread_exit()
+}
+
+/// Sleeps until `AT_BELL` reaches `count`, for at most 10 s.
+fn until_at_bell(count: u32) -> bool {
+    let end = now() + ms(10_000);
+    while AT_BELL.load(Ordering::Acquire) < count {
+        if now() > end {
+            return false;
+        }
+        let _ = futex_wait(&READY, 1, now() + ms(1));
+    }
+    true
+}
+
+/// Unpinned threads first placed together spread over the CPUs once woken: twice as
+/// many sleepers as CPUs, each started while the others sleep (so every CPU looks the
+/// same to the scheduler and they start on one), are woken together three times, and
+/// in the last round they run on every CPU. A thread that stayed where it was first
+/// placed would leave every CPU but that one idle.
+fn spread(out: &Out, cpus: u32) -> Result<(), i64> {
+    let n = 2 * cpus;
+    let rounds = SPREAD_ROUNDS.len() as u32;
+    pin_current_thread(None).map_err(|e| fail(out, "spread", "unpinning", e))?;
+    let mut threads = Vec::new();
+    for i in 0..n {
+        threads.push(start(out, "spread", bell_sleeper, u64::from(i))?);
+        if !until_at_bell(i + 1) {
+            println!(out, "DS-A spread: FAIL: sleeper {} never ran", i);
+            return Err(1);
+        }
+        // Asleep before the next starts.
+        let _ = futex_wait(&READY, 1, now() + ms(2));
+    }
+    for round in 1..=rounds {
+        BELL.store(round, Ordering::Release);
+        futex_wake(&BELL, n).map_err(|e| fail(out, "spread", "futex_wake", e))?;
+        let _ = futex_wait(&READY, 1, now() + ms(50));
+        BELL_END.store(round, Ordering::Release);
+        if !until_at_bell(n * (round + 1)) {
+            println!(out, "DS-A spread: FAIL: round {} never ended", round);
+            return Err(1);
+        }
+    }
+    BELL.store(rounds + 1, Ordering::Release);
+    let _ = futex_wake(&BELL, n);
+    for t in &threads {
+        join(out, "spread", t)?;
+    }
+    let start = SPREAD_START.load(Ordering::Relaxed);
+    let seen: [u64; 3] = core::array::from_fn(|i| SPREAD_ROUNDS[i].load(Ordering::Relaxed));
+    let last = seen[seen.len() - 1].count_ones();
+    if last < cpus {
+        println!(
+            out,
+            "DS-A spread: FAIL: {} sleepers started on CPUs {:#x} ran on {:#x}, {:#x} and {:#x}: {} of {} CPUs in the last round",
+            n,
+            start,
+            seen[0],
+            seen[1],
+            seen[2],
+            last,
+            cpus
+        );
+        return Err(1);
+    }
+    println!(
+        out,
+        "DS-A spread: ok: {} sleepers started on CPUs {:#x}, woken together, ran on {:#x}, {:#x} and {:#x}: every CPU",
+        n,
+        start,
+        seen[0],
+        seen[1],
+        seen[2]
+    );
+    Ok(())
+}
+
+/// `wake`'s request: the sleeper waits while this holds the last one it served.
+static WAKE_WORD: AtomicU32 = AtomicU32::new(0);
+/// The last request the sleeper served.
+static SERVED: AtomicU32 = AtomicU32::new(0);
+/// When the last request was made, on `now`'s clock, and `TURNS` then.
+static WAKE_AT: AtomicU64 = AtomicU64::new(0);
+static TURNS_AT: AtomicU64 = AtomicU64::new(0);
+/// The thread that ran last on the sleeper's CPU, by number: each spinner, on finding
+/// another there before it, counts a turn.
+static LAST: AtomicU64 = AtomicU64::new(0);
+static TURNS: AtomicU64 = AtomicU64::new(0);
+/// The most turns other spinners took between a request and the sleeper's run, and the
+/// requests' total and longest latency, in nanoseconds.
+static WAKE_TURNS: AtomicU64 = AtomicU64::new(0);
+static WAKE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WAKE_MAX: AtomicU64 = AtomicU64::new(0);
+/// Set to end the sleeper.
+static WAKE_STOP: AtomicU32 = AtomicU32::new(0);
+
+/// Spins on CPU `arg & 0xffff_ffff` as thread `arg >> 32` (one and up), counting a turn
+/// each time it finds another thread ran there last.
+extern "C" fn turner(arg: u64) -> ! {
+    let (cpu, me) = (arg & 0xffff_ffff, arg >> 32);
+    if pin_current_thread(Some(cpu as u32)).is_ok() {
+        while STOP.load(Ordering::Relaxed) == 0 {
+            if LAST.load(Ordering::Relaxed) != me {
+                LAST.store(me, Ordering::Relaxed);
+                TURNS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    thread_exit()
+}
+
+/// Pinned to CPU `cpu`, sleeps until asked and records, for each request, how many turns
+/// the spinners took before it ran, and how long it took.
+extern "C" fn sleeper_timed(cpu: u64) -> ! {
+    if pin_current_thread(Some(cpu as u32)).is_ok() {
+        JOINED.store(1, Ordering::Release);
+        let mut served = 0;
+        loop {
+            let _ = futex_wait(&WAKE_WORD, served, now() + ms(1_000));
+            if WAKE_STOP.load(Ordering::Acquire) != 0 {
+                break;
+            }
+            let asked = WAKE_WORD.load(Ordering::Acquire);
+            if asked == served {
+                continue;
+            }
+            let turns = TURNS.load(Ordering::Relaxed) - TURNS_AT.load(Ordering::Acquire);
+            let latency = now().saturating_sub(WAKE_AT.load(Ordering::Acquire));
+            LAST.store(0, Ordering::Relaxed);
+            WAKE_TURNS.fetch_max(turns, Ordering::Relaxed);
+            WAKE_TOTAL.fetch_add(latency, Ordering::Relaxed);
+            WAKE_MAX.fetch_max(latency, Ordering::Relaxed);
+            served = asked;
+            SERVED.store(asked, Ordering::Release);
+        }
+    }
+    thread_exit()
+}
+
+/// A thread woken on a CPU where three others spin runs before any other of them takes
+/// the CPU: at the end of the running one's slice, not after each one queued there.
+/// Judged by the order the threads ran in, which a stall of the host under the VM does
+/// not change; the time each wake took is reported.
+fn wake(out: &Out, cpus: u32) -> Result<(), i64> {
+    const ROUNDS: u32 = 20;
+    let last = u64::from(cpus - 1);
+    STOP.store(0, Ordering::Relaxed);
+    JOINED.store(0, Ordering::Relaxed);
+    pin_current_thread(None).map_err(|e| fail(out, "wake", "unpinning", e))?;
+    let mut spinners = Vec::new();
+    for me in 1..=3 {
+        spinners.push(start(out, "wake", turner, last | me << 32)?);
+    }
+    let sleeper = start(out, "wake", sleeper_timed, last)?;
+    if !until(&JOINED, 10_000) {
+        println!(
+            out,
+            "DS-A wake: FAIL: the sleeper never ran on CPU {}", last
+        );
+        return Err(1);
+    }
+    for round in 1..=ROUNDS {
+        // About 15 ms apart, so a request falls anywhere in a spinner's slice.
+        let _ = futex_wait(&READY, 1, now() + ms(15));
+        TURNS_AT.store(TURNS.load(Ordering::Relaxed), Ordering::Release);
+        WAKE_AT.store(now(), Ordering::Release);
+        WAKE_WORD.store(round, Ordering::Release);
+        futex_wake(&WAKE_WORD, 1).map_err(|e| fail(out, "wake", "futex_wake", e))?;
+        // Each request is served before the next is made.
+        let end = now() + ms(5_000);
+        while SERVED.load(Ordering::Acquire) != round && now() < end {
+            let _ = futex_wait(&READY, 1, now() + ms(1));
+        }
+        if SERVED.load(Ordering::Acquire) != round {
+            STOP.store(1, Ordering::Relaxed);
+            WAKE_STOP.store(1, Ordering::Release);
+            let _ = futex_wake(&WAKE_WORD, 1);
+            println!(
+                out,
+                "DS-A wake: FAIL: request {} of {} was not served in 5 s on CPU {}",
+                round,
+                ROUNDS,
+                last
+            );
+            return Err(1);
+        }
+    }
+    WAKE_STOP.store(1, Ordering::Release);
+    WAKE_WORD.store(ROUNDS + 1, Ordering::Release);
+    let _ = futex_wake(&WAKE_WORD, 1);
+    STOP.store(1, Ordering::Relaxed);
+    join(out, "wake", &sleeper)?;
+    for t in &spinners {
+        join(out, "wake", t)?;
+    }
+    let (turns, total, max) = (
+        WAKE_TURNS.load(Ordering::Relaxed),
+        WAKE_TOTAL.load(Ordering::Relaxed),
+        WAKE_MAX.load(Ordering::Relaxed),
+    );
+    // One turn at most: a request may land as one spinner hands the CPU to the next.
+    if turns > 1 {
+        println!(
+            out,
+            "DS-A wake: FAIL: behind 3 spinning threads on CPU {}, other spinners took up to {} turns before a woken thread ran; its {} wakes took {} ns on average, the longest {} ns",
+            last,
+            turns,
+            ROUNDS,
+            total / u64::from(ROUNDS),
+            max
+        );
+        return Err(1);
+    }
+    println!(
+        out,
+        "DS-A wake: ok: {} wakes behind 3 spinning threads on CPU {}, each run before another spinner took the CPU (at most {} turns), after {} ns on average, the longest {} ns",
+        ROUNDS,
+        last,
+        turns,
+        total / u64::from(ROUNDS),
+        max
     );
     Ok(())
 }
