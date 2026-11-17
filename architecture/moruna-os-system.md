@@ -106,6 +106,18 @@ Implements the OS design, section 1, OpenStack column.
   interface wan card=net0 dhcp
   ```
 
+- **The network server faces the internet, so its limits hold against anyone** (item 1.3b):
+  - smoltcp 0.13.1, which fixes a window-underflow panic (upstream issue 1048);
+  - a grant's `sockets=` counts every socket, closing ones included, and refuses at accept;
+  - `rx=` and `tx=` set its buffers, carried on the wire so a minted grant gets no more than its
+    parent's;
+  - `per-peer=` caps what one remote address holds;
+  - `linger=` shortens abandoned closes;
+  - `handshake-timeout-ms` (10 s) frees half-open connections;
+  - a line is printed, at most once a minute per grant, when a bound is hit.
+
+  The cloud grant is `grant listen-api rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536
+  tx=65536 per-peer=8 linger=5000`.
 - **One port listens: TCP 443,** owned by `api`. Nothing else accepts connections. `api` listens on
   `wan`'s leased address, and moves its listener when the lease's address changes.
 - **`devices` lives as long as the node.** Started by the node's supervisor, it serves until the
