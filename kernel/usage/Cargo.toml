@@ -1,0 +1,16 @@
+[package]
+name = "moruna-usage"
+description = "The usage build's evidence format: a program's coverage counters as console lines, the ELF sections they belong to, and the LLVM raw profile rebuilt from both. Off in every production build."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# The host's side: decoding dumps, reading ELF files and building raw profiles. A program
+# in the guest needs only the encoder, which allocates nothing.
+alloc = []
+# ELF files built for tests (`elf::build`), for the report's tests.
+testing = ["alloc"]
+
+[dependencies]

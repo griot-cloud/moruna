@@ -58,6 +58,19 @@ build_std=(-Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compile
 # osdk/src/commands/build/mod.rs), less `+ermsb`, which is a speed workaround that
 # current toolchains warn is unstable.
 flags="--cfg polyval_force_soft -C relocation-model=static -C relro-level=off -C force-unwind-tables=yes --check-cfg cfg(ktest) -C no-redzone=y"
+# stream U: MORUNA_USAGE=1 makes the untimed usage build (kernel/usage): the kernel and every
+# userland program compiled with LLVM's coverage counters (exact under SMP), the kernel's read by
+# the host at the end of a job and each program's printed on its console when idle. Never set
+# for a production, CI or timed build; unset, every command below is what it was.
+usage_flags=""
+kernel_features=probe
+user_features=moruna-storage-service/service
+if [ "${MORUNA_USAGE:-0}" = 1 ]; then
+  usage_flags=" -C instrument-coverage -Zno-profiler-runtime -Cllvm-args=-instrprof-atomic-counter-update-all"
+  kernel_features=probe,usage
+  user_features=moruna-storage-service/service,moruna-sys/usage
+  echo "build.sh: the usage build (MORUNA_USAGE=1): not for production or timed runs" >&2
+fi
 
 # This canonical entry owns dependency-wide flags. An inherited encoded override
 # must not silently supersede the approved backend or inject kernel flags into host tools.
@@ -66,8 +79,8 @@ export RUSTFLAGS="--cfg polyval_force_soft"
 cd "$kernel"
 # The CI boot's kernel answers `plane_probe` (SDD 29 k): the frames and copies the data
 # plane's tests measure.
-RUSTFLAGS="$flags" cargo build --release --locked --target "$target" "${build_std[@]}" \
-  -p moruna-microkernel-boot --features probe
+RUSTFLAGS="$flags$usage_flags" cargo build --release --locked --target "$target" "${build_std[@]}" \
+  -p moruna-microkernel-boot --features "$kernel_features"
 # Every userland crate (the test programs, the SDK, the examples) in a second
 # invocation, so the kernel's features (the manifest parser, which allocates) are not
 # unified into them; each program is linked static with the user linker script, whose
@@ -84,10 +97,10 @@ user_cc="${CC_x86_64_moruna_user:-clang}"
 set -x
 CC_x86_64_moruna_user="$user_cc" \
 CFLAGS_x86_64_moruna_user="--target=x86_64-unknown-none -ffreestanding -mno-red-zone -fno-stack-protector ${CFLAGS_x86_64_moruna_user:-}" \
-RUSTFLAGS="$flags -Zunstable-options -C link-arg=-T$kernel/sys/user.ld -C link-arg=-static" \
+RUSTFLAGS="$flags$usage_flags -Zunstable-options -C link-arg=-T$kernel/sys/user.ld -C link-arg=-static" \
   rustup run nightly-2026-07-21 cargo build --release --locked --target "$user_target" \
   -Zunstable-options -Zjson-target-spec "${build_std[@]}" --workspace \
-  --features moruna-storage-service/service \
+  --features "$user_features" \
   --exclude moruna-microkernel --exclude moruna-microkernel-boot --exclude moruna-image --exclude moruna-node-image
 set +x
 

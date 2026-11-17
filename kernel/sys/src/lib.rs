@@ -35,6 +35,10 @@ mod private_memory;
 pub use private_memory::PrivateMemory;
 pub mod raw;
 pub mod start;
+// stream U hook: the usage build's counters dump (feature `usage`).
+#[cfg(all(feature = "usage", target_os = "none"))]
+#[doc(hidden)]
+pub mod usage;
 
 #[cfg(target_os = "none")]
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -65,6 +69,9 @@ pub fn abi_version() -> u64 {
 
 /// Ends the calling process with `code`.
 pub fn exit(code: i64) -> ! {
+    // stream U hook: the usage build's last dump.
+    #[cfg(all(feature = "usage", target_os = "none"))]
+    usage::at_exit();
     raw::call1(nr::PROCESS_EXIT, code as u64);
     // The kernel never returns from `process_exit`.
     loop {
@@ -322,6 +329,10 @@ impl WaitItem {
 /// Waits until one of `items` raises a signal it awaits, or `deadline` (on [`now`]'s
 /// clock) passes. Returns how many items are satisfied; every item's `observed` is set.
 pub fn wait(items: &mut [WaitItem], deadline: u64) -> Result<usize> {
+    // stream U hook: the usage build dumps when the program goes idle.
+    #[cfg(all(feature = "usage", target_os = "none"))]
+    return check(usage::wait(items, deadline)).map(|n| n as usize);
+    #[cfg(not(all(feature = "usage", target_os = "none")))]
     check(raw::wait(items, deadline)).map(|n| n as usize)
 }
 
@@ -1113,7 +1124,7 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 
 /// Declares a process's entry: `main!(run)` runs `fn run() -> i64` and exits with
 /// what it returns.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", not(feature = "usage")))]
 #[macro_export]
 #[allow_internal_unsafe]
 macro_rules! main {
@@ -1123,6 +1134,27 @@ macro_rules! main {
         #[unsafe(no_mangle)]
         pub extern "C" fn _start(start_page: u64) -> ! {
             $crate::start::init(start_page);
+            $crate::exit($run())
+        }
+    };
+}
+
+// stream U hook: `main!` in the usage build, which also names the program for its dumps
+// (`usage::start`). The macro above is the one every other build has.
+#[cfg(all(target_os = "none", feature = "usage"))]
+#[macro_export]
+#[allow_internal_unsafe]
+macro_rules! main {
+    ($run:path) => {
+        // SAFETY: `_start` is the symbol the image's entry point names, and nothing
+        // else in the image defines it.
+        #[unsafe(no_mangle)]
+        pub extern "C" fn _start(start_page: u64) -> ! {
+            $crate::start::init(start_page);
+            $crate::usage::start(match option_env!("CARGO_BIN_NAME") {
+                Some(name) => name,
+                None => env!("CARGO_CRATE_NAME"),
+            });
             $crate::exit($run())
         }
     };

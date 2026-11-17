@@ -36,6 +36,9 @@ pub mod session;
 pub mod sys;
 #[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) mod testing;
+// stream U hook: the usage build's collection (feature `usage`).
+#[cfg(feature = "usage")]
+pub mod usage;
 pub mod vhost_user;
 pub use session::{Budget, ExitStatus};
 

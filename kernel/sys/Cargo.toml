@@ -13,8 +13,14 @@ heap = []
 # stream P: `plane::Log`, a native task's lines into the log ring the engine gives it. Its
 # records are `moruna-record`'s, which links alloc, so a program with it also has `heap`.
 log = ["dep:moruna-record"]
+# stream U: the usage build (kernel/tools/build.sh with MORUNA_USAGE=1, which also compiles with
+# `-C instrument-coverage`): a program prints its coverage counters on its console when idle
+# and at exit (src/usage.rs). Off in every other build.
+usage = ["dep:moruna-usage"]
 
 [dependencies]
 moruna-abi.workspace = true
+# stream U: the dump's encoder (feature `usage`).
+moruna-usage = { path = "../usage", version = "=0.1.0", optional = true }
 # stream P: `plane::Log`'s records (feature `log`).
 moruna-record = { path = "../../crates/moruna-record", version = "=0.6.6", default-features = false, optional = true }

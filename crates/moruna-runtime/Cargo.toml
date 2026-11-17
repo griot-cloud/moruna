@@ -111,6 +111,9 @@ uring = ["moruna-reactor/uring"]
 gds = ["cuda", "moruna-reactor/gds"]
 rdma = ["moruna-arena/rdma", "moruna-reactor/rdma", "moruna-placement/rdma"]
 python = ["moruna-adapters/python", "moruna-sources/python", "moruna-sandbox/python"]
+# stream U: `moruna run` keeps the usage build's coverage evidence in MORUNA_USAGE_DIR before the
+# node stops (moruna_vmm::usage). Only for the untimed usage build; never in a timed or release one.
+usage = ["moruna-vmm/usage"]
 
 # The actual granted microkernel start page exists only in this guest profile.
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]

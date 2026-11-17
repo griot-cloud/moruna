@@ -930,7 +930,12 @@ version = "0.1.0"
 dependencies = [
  "moruna-abi",
  "moruna-record",
+ "moruna-usage",
 ]
+
+[[package]]
+name = "moruna-usage"
+version = "0.1.0"
 
 [[package]]
 name = "moruna-virtio"
