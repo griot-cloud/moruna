@@ -637,17 +637,13 @@ fn drive(
         // Each live instance of a stage is a child of its own (an image's MORUNA_PROCESSES, one
         // task process each): the share is a child's, and each instance carves its account
         // within it (stream E, for the gate's native tasks on every core).
-        let instances = |stage: &crate::packaged::Packaged| match stage.kernel().kind() {
-            moruna_kernel::KernelKind::Stateful { max_instances } => Some(max_instances.get()),
-            _ => None,
-        };
-        let mut count = 0usize;
-        for stage in packaged.iter().filter(|stage| stage.native_singleton()) {
-            count += instances(stage).ok_or_else(|| MorunaError::Config {
-                name: "budget.native_children",
-                msg: "a native child's stage must be stateful, its instances its children".into(),
-            })?;
-        }
+        let count = crate::native_account::native_children(
+            packaged
+                .iter()
+                .filter(|stage| stage.native_singleton())
+                .map(|stage| stage.kernel().kind()),
+        )
+        .map_err(|error| *error)?;
         if count > 0 {
             let planning = moruna_controller::fixed_commitment_budget(
                 &moruna_controller::FixedCommitmentInput {
