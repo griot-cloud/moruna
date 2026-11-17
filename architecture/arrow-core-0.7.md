@@ -371,6 +371,10 @@ data; we're supposed to measure that, simple."
     only when its median wall is at least 1.5x faster than the best of **every** row, the
     native-expression rows included, and its CPU-seconds are no more than any row's. A job that
     misses gets another round on the stage its time split names; it is not done.
+  - **First gate, no regressions** (Brackly, 2026-11-17): 0.7 must be faster than both 0.6.6
+    rows (the Rust function and Python) on every job, before the 1.5x bar applies. Every
+    table shows both 0.6.6 rows beside 0.7. The full-year baseline (`be78ad45`) fails it on
+    every job.
   - **Judged on operational time** (Brackly, 2026-11-17): "disambiguate the startup times and
     the operational time". Mode 2 (the Moruna VM on Azure's Linux) keeps being benchmarked.
     Every table has two columns. Operational time runs from the first rows to the output

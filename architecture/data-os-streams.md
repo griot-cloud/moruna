@@ -802,3 +802,23 @@ and switches to the new one when the call answers.
   launch ("needs at least 24.50 GiB"). One-month job_s: Enrich 15.6 s at 8, Score 10.2 s at 8
   and 7.4 s at 2 (about 950k rows/s), with first rows at 2.0 to 4.2 s. The steady state, at
   0.5 to 0.95M rows/s, is the next limit, and a larger budget runs slower (P).
+- **2026-11-17: the 0.7 baseline, full year** (`be78ad45`, "known bugs: setup before first
+  rows, coarse batches"; NYC 2024, 41.2M rows, 8 processes, medians of r1-r5). All 24 runs
+  passed, and every output is equal to 0.6.6's.
+
+  | Job | Operational | VM start-up | Engine start-up | CPU-s (function / waits) | Best control | Verdict |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | Score | 58.4 s | 4.2 s | 4.3 s | 239.5 (113.6 / 64.1) | 14.2 s, 99.5 | MISS, 0.24x |
+  | Occupancy | 25.2 s | 4.2 s | 4.2 s | 144.6 (30.9 / 81.2) | 2.4 s, 8.7 | MISS, 0.10x |
+  | Enrich | 139.6 s | 4.3 s | 4.3 s | 476.8 (35.9 / 270.4) | 6.6 s, 39.6 | MISS, 0.05x |
+  | Audit | 36.0 s | 4.2 s | 4.2 s | 181.5 (31.5 / 99.9) | 3.0 s, 12.7 | MISS, 0.08x |
+
+  - **Where it loses:** the tasks' waits, which burn CPU (they spin rather than sleep). Except
+    in Score they outweigh the function several times. One engine worker per native stage
+    feeds all 8 tasks. Next: tasks sleep while waiting, and more than one worker feeds a stage
+    (P).
+  - **Start-up:** the VM's 4.2 s is launch 0.14, boot 2.7 and about 1.4 s of host-side node
+    preparation (node-for-job.py and its tools). The engine's 4.2-4.3 s before first rows is
+    being cut by C's arena by use and fixed sink cap, and P's queue.
+  - **Correction to an earlier figure:** the arena committed 1.5 to 3.4 times its peak use, not
+    3 to 11. Its note gives the total of the objects made, not each object's size.
