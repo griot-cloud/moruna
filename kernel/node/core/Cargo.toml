@@ -6,5 +6,15 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[dependencies]
+# The policy a `restart` record mints its service's listener with (item 2.2c).
+netstack-protocol = { path = "../../net/protocol", version = "=0.1.0" }
+
 [target.'cfg(target_os = "none")'.dependencies]
 moruna-sys.workspace = true
+
+# The network server's own configuration parser and stack, on a host, to show that a
+# `restart` record's policy is network.conf's and that the supervisor's grant mints it.
+[dev-dependencies]
+moruna-netstack = { path = "../../net/stack", version = "=0.1.0" }
+moruna-svc.workspace = true

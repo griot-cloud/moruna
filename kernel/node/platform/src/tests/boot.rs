@@ -19,8 +19,8 @@ use super::{
     wire_server,
 };
 use crate::{
-    boot::{Fatal, Inputs, READY_LIMIT_NS, Stage, cloud_line, ready_line, run},
-    machine::{Clock, Link, LinkError, StreamError},
+    boot::{Fatal, Inputs, READY_LIMIT_NS, Stage, cloud_line, ready_line, run, serve},
+    machine::{Clock, Control, FOREVER, Link, LinkError, StreamError},
     wireserver,
 };
 
@@ -44,6 +44,59 @@ struct FakeApi {
     sent: Vec<Vec<u8>>,
     /// The deadline of every call.
     deadlines: Vec<u64>,
+    /// How many starts of `api` the supervisor's channel brings, and what it meets after.
+    starts: usize,
+    then: LinkError,
+    /// The deadline of every wait for a start's channel.
+    channels: Vec<u64>,
+}
+
+impl FakeApi {
+    fn new(clock: &FakeClock, events: &Events) -> FakeApi {
+        FakeApi {
+            clock: clock.clone(),
+            events: events.clone(),
+            send: Ok(()),
+            answer: Ok(b"ready".to_vec()),
+            takes: 40 * MS,
+            sent: Vec::new(),
+            deadlines: Vec::new(),
+            starts: usize::MAX,
+            then: LinkError::Closed,
+            channels: Vec::new(),
+        }
+    }
+}
+
+/// The supervisor's channel to `platform`, played by the test: each start of `api` it sends is
+/// the one fake `api`.
+struct FakeControl(Rc<RefCell<FakeApi>>);
+
+/// One start's channel to the fake `api`.
+struct ApiEnd(Rc<RefCell<FakeApi>>);
+
+impl Link for ApiEnd {
+    fn send(&mut self, message: &[u8], deadline: u64) -> Result<(), LinkError> {
+        self.0.borrow_mut().send(message, deadline)
+    }
+
+    fn receive(&mut self, deadline: u64) -> Result<Vec<u8>, LinkError> {
+        self.0.borrow_mut().receive(deadline)
+    }
+}
+
+impl Control for FakeControl {
+    type Api = ApiEnd;
+
+    fn next_api(&mut self, deadline: u64) -> Result<ApiEnd, LinkError> {
+        let mut api = self.0.borrow_mut();
+        api.channels.push(deadline);
+        if api.starts == 0 {
+            return Err(api.then.clone());
+        }
+        api.starts -= 1;
+        Ok(ApiEnd(self.0.clone()))
+    }
 }
 
 impl Link for FakeApi {
@@ -102,25 +155,22 @@ fn boot_with(
 ) -> Booted {
     let mut clock = network.clock.clone();
     let events = Events::default();
-    let mut api = FakeApi {
-        clock: clock.clone(),
-        events: events.clone(),
-        send: Ok(()),
-        answer: Ok(b"ready".to_vec()),
-        takes: 40 * MS,
-        sent: Vec::new(),
-        deadlines: Vec::new(),
-    };
+    let mut api = FakeApi::new(&clock, &events);
     prepare(&mut api);
+    let api = Rc::new(RefCell::new(api));
     let console = events.clone();
     let result = run(
         &mut network,
         &mut clock,
-        &mut api,
+        &mut FakeControl(api.clone()),
         &mut |line: &str| console.borrow_mut().push(line.to_string()),
         inputs,
     );
     let events = events.borrow().clone();
+    let api = Rc::try_unwrap(api)
+        .ok()
+        .expect("no channel to api outlives the boot")
+        .into_inner();
     Booted {
         result,
         events,
@@ -657,4 +707,118 @@ fn the_lines_are_the_design_s() {
     assert!(line.starts_with("moruna: fatal config: line?break, caf?, bell?, xxx"));
     assert_eq!(line.len(), "moruna: fatal config: ".len() + 300);
     assert!(line.chars().all(|c| c == ' ' || c.is_ascii_graphic()));
+}
+
+#[test]
+fn the_hand_over_waits_for_the_supervisor_s_channel_to_api() {
+    // Each start of api, the first included, comes as a channel on the supervisor's channel
+    // (PM, item 2.2c). Asked with api's 10 s, after the cloud's line.
+    let network = || FakeNetwork::serving(&FakeClock::default(), |_, sent| openstack(sent));
+    let cloud = format!("moruna: cloud openstack instance {RECORDED_OPENSTACK_ID}");
+    let booted = boot_with(network(), INPUTS, |_| {});
+    assert!(booted.result.is_ok());
+    assert_eq!(booted.api.channels, [10 * SECOND]);
+    for (error, said) in [
+        (LinkError::TimedOut, "the deadline passed"),
+        (LinkError::Closed, "the supervisor closed its channel"),
+        (
+            LinkError::Other("the supervisor sent something other than api-started".into()),
+            "the supervisor sent something other than api-started",
+        ),
+    ] {
+        let booted = boot_with(network(), INPUTS, |api| {
+            api.starts = 0;
+            api.then = error.clone();
+        });
+        assert_eq!(
+            booted.line(),
+            format!("moruna: fatal platform: the supervisor sent no channel to api: {said}")
+        );
+        assert_eq!(booted.result.unwrap_err().stage, Stage::Platform);
+        assert_eq!(booted.events, std::slice::from_ref(&cloud));
+        assert!(booted.api.sent.is_empty());
+        assert_eq!(booted.api.channels, [10 * SECOND]);
+    }
+}
+
+/// `serve` after a boot on OpenStack: the boot's hand-over, and `api`'s later starts as `prepare`
+/// makes them, from a clock at 1000 s.
+fn served(prepare: impl FnOnce(&mut FakeApi)) -> (Fatal, Handover, FakeApi) {
+    let handover = boot(|_, sent| openstack(sent)).result.unwrap();
+    let mut clock = FakeClock::default();
+    clock.advance(1000 * SECOND);
+    let events = Events::default();
+    let mut api = FakeApi::new(&clock, &events);
+    prepare(&mut api);
+    let api = Rc::new(RefCell::new(api));
+    let fatal = serve(&mut clock, &mut FakeControl(api.clone()), &handover);
+    let api = Rc::try_unwrap(api).ok().unwrap().into_inner();
+    (fatal, handover, api)
+}
+
+#[test]
+fn each_later_start_of_api_gets_the_same_hand_over() {
+    let (fatal, handover, api) = served(|api| api.starts = 3);
+    // Three later starts, each handed what the first had, each with 1D's 10 s from when its
+    // channel arrived: 40 ms apart, api's answers.
+    assert_eq!(api.sent, vec![handover.encode().unwrap(); 3]);
+    let t = 1000 * SECOND;
+    assert_eq!(
+        api.deadlines,
+        [
+            t + 10 * SECOND,
+            t + 10 * SECOND,
+            t + 40 * MS + 10 * SECOND,
+            t + 40 * MS + 10 * SECOND,
+            t + 80 * MS + 10 * SECOND,
+            t + 80 * MS + 10 * SECOND,
+        ]
+    );
+    // A start is waited for with no deadline: api may never die.
+    assert_eq!(api.channels, [FOREVER; 4]);
+    // When the supervisor's channel ends, so does platform, with the reason.
+    assert_eq!(
+        fatal.to_string(),
+        "moruna: fatal platform: the supervisor's channel: the supervisor closed its channel"
+    );
+    assert_eq!(fatal.stage, Stage::Platform);
+    // Nothing reaches the console: the supervisor's and api's own lines say what happened.
+    assert_eq!(api.events.borrow().len(), 3);
+    assert!(
+        api.events
+            .borrow()
+            .iter()
+            .all(|event| event == "the hand-over")
+    );
+}
+
+#[test]
+fn a_later_start_of_api_has_1d_s_10_s_too() {
+    let (fatal, _, api) = served(|api| api.answer = Err(LinkError::TimedOut));
+    assert_eq!(
+        fatal.to_string(),
+        "moruna: fatal platform: api did not answer ready within 10 s"
+    );
+    assert_eq!(api.deadlines, [1010 * SECOND; 2]);
+    let (fatal, _, _) = served(|api| api.answer = Ok(b"READY".to_vec()));
+    assert_eq!(
+        fatal.to_string(),
+        "moruna: fatal platform: api answered the hand-over with something else"
+    );
+    let (fatal, _, _) = served(|api| api.send = Err(LinkError::Closed));
+    assert_eq!(
+        fatal.to_string(),
+        "moruna: fatal platform: the hand-over was not sent to api: api closed its end of the \
+         link"
+    );
+    let (fatal, _, api) = served(|api| {
+        api.starts = 1;
+        api.then = LinkError::Other("the supervisor sent something other than api-started".into());
+    });
+    assert_eq!(
+        fatal.to_string(),
+        "moruna: fatal platform: the supervisor's channel: the supervisor sent something other \
+         than api-started"
+    );
+    assert_eq!(api.sent.len(), 1);
 }

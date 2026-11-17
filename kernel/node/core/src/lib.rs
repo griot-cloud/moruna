@@ -5,6 +5,9 @@
 extern crate alloc;
 use alloc::{string::String, vec::Vec};
 
+pub mod restart;
+pub use restart::Restart;
+
 pub const MAX_CONFIG: usize = 4096;
 pub const MAX_SERVICES: usize = 16;
 pub const MAX_JOB_GRANTS: usize = 24;
@@ -38,6 +41,8 @@ pub struct Config {
     pub links: Vec<Link>,
     pub bootstraps: Vec<(Bootstrap, String)>,
     pub admission: Option<String>,
+    /// The one service the supervisor starts again when it dies (`restart`, item 2.2c).
+    pub restart: Option<Restart>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,9 +54,12 @@ pub enum ConfigError {
     Duplicate,
     Budget,
     Empty,
+    /// An option this node does not support yet: a `restart` policy's `rx=` or `tx=`, which
+    /// the network protocol's `Policy` has no field for.
+    Unsupported,
 }
 
-fn identifier(s: &str) -> bool {
+pub(crate) fn identifier(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 32
         && s.bytes().all(|b| {
@@ -80,9 +88,16 @@ impl Config {
         let mut links = Vec::new();
         let mut bootstraps: Vec<(Bootstrap, String)> = Vec::new();
         let mut admission: Option<String> = None;
+        let mut restart: Option<Restart> = None;
         for line in lines {
             let words: Vec<_> = line.split_ascii_whitespace().collect();
             match words.as_slice() {
+                ["restart", record @ ..] => {
+                    if restart.replace(Restart::parse(record)?).is_some() {
+                        return Err(ConfigError::Duplicate);
+                    }
+                    continue;
+                }
                 ["bootstrap", "admission", service] if identifier(service) => {
                     if admission.replace((*service).into()).is_some() {
                         return Err(ConfigError::Duplicate);
@@ -190,6 +205,24 @@ impl Config {
             destinations.push((&link.left, &link.left_slot));
             destinations.push((&link.right, &link.right_slot));
         }
+        if let Some(record) = &restart {
+            // A service started again has only what a start makes afresh: no grant, link
+            // or bootstrap of node.conf's could be given to it a second time.
+            if destinations
+                .iter()
+                .any(|(service, _)| *service == record.service)
+            {
+                return Err(ConfigError::Syntax);
+            }
+            destinations.push((&record.service, &record.slot));
+            destinations.push((&record.server, &record.granting));
+            if bootstraps
+                .iter()
+                .any(|(kind, _)| *kind == Bootstrap::Platform)
+            {
+                destinations.push((&record.service, restart::PLATFORM_SLOT));
+            }
+        }
         for (index, (service, slot)) in destinations.iter().enumerate() {
             if !services.iter().any(|s| s.name == *service)
                 || *slot == "account"
@@ -210,6 +243,7 @@ impl Config {
             links,
             bootstraps,
             admission,
+            restart,
         })
     }
 }
@@ -240,6 +274,15 @@ impl Lifecycle {
             return false;
         }
         self.states[index] = State::Running;
+        true
+    }
+    /// The service at `index`, which has died, is to be started again: back to pending, and
+    /// the node not failed. Only a running service is.
+    pub fn restarting(&mut self, index: usize) -> bool {
+        if self.failed || self.states.get(index) != Some(&State::Running) {
+            return false;
+        }
+        self.states[index] = State::Pending;
         true
     }
     pub fn terminated(&mut self, index: usize) -> bool {
