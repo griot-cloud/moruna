@@ -277,8 +277,9 @@ const NETWORK_CONF: &str = "moruna-netstack 1
 interface wan card=net0 dhcp
 grant listen-api rights=listen local=0.0.0.0/0@443 sockets=64
 ";
+/// `platform`'s grant, with the local rule a connection needs to leave at all (PM, 2026-11-18).
 const PLATFORM_GRANT: &str = "grant listen-platform rights=connect \
-     remote=169.254.169.254/32@80,168.63.129.16/32@80 sockets=4\n";
+     remote=169.254.169.254/32@80,168.63.129.16/32@80 local=0.0.0.0/0 sockets=4\n";
 
 /// The cloud profile's `node.conf` as items 1.1 and 1.3 write it, and the lines item 1.4 adds.
 const NODE_CONF: &str = "moruna-node 1
@@ -327,7 +328,8 @@ fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
     assert!(link("platform", "api", "api", "platform"));
 
     // network.conf: the grant is taken as written, with connect as its only right, to the two
-    // addresses on port 80 and nowhere else, and four sockets.
+    // addresses on port 80 and nowhere else, from any of the node's addresses, and four
+    // sockets.
     let config = parse(&format!("{NETWORK_CONF}{PLATFORM_GRANT}")).expect("network.conf");
     let (_, policy) = config
         .grants
@@ -343,6 +345,9 @@ fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
     assert!(!policy.may_connect(&to(169, 254, 169, 253, 80)));
     assert!(!policy.may_connect(&to(10, 0, 2, 2, 80)));
     assert!(!policy.may_listen(&to(0, 0, 0, 0, 443)));
+    assert!(!policy.may_listen(&to(10, 0, 2, 15, 443)));
+    assert!(!policy.may_bind(&to(10, 0, 2, 15, 68)));
+    assert!(policy.may_use_source(&Addr::v4(10, 0, 2, 15)));
     assert!(policy.names.is_empty());
 }
 
@@ -384,11 +389,7 @@ fn the_node_s_address_is_its_wan_interface_s_ipv4_address() {
 #[test]
 fn a_node_that_dhcp_has_not_yet_answered_has_no_route_and_no_address() {
     // The cloud profile's interface, on a card where no DHCP server answers.
-    let config = format!(
-        "{NETWORK_CONF}{}",
-        PLATFORM_GRANT.replace(" sockets=4", " local=0.0.0.0/0 sockets=4")
-    );
-    let (slots, server) = serve(&config, &[CARD]);
+    let (slots, server) = serve(&format!("{NETWORK_CONF}{PLATFORM_GRANT}"), &[CARD]);
     let mut wan = Wan::new(client(&slots["listen-platform"])).unwrap();
     let soon = deadline_in(5 * SECOND);
     assert_eq!(
@@ -407,7 +408,7 @@ fn a_node_that_dhcp_has_not_yet_answered_has_no_route_and_no_address() {
 }
 
 #[test]
-fn platform_s_grant_needs_a_local_rule_before_it_can_connect_out() {
+fn platform_s_grant_reaches_instance_data_and_only_with_its_local_rule() {
     let instance_data = |grant: &str| {
         let (slots, server) = serve(&node(grant), &[CARD]);
         let mut wan = Wan::new(client(&slots["listen-platform"])).unwrap();
@@ -419,20 +420,20 @@ fn platform_s_grant_needs_a_local_rule_before_it_can_connect_out() {
         server.join().unwrap();
         met
     };
-    // As the work item writes the grant, it names no local address a connection may leave
-    // from, and the network server refuses every connection for that.
+    // The grant is routed to the gateway. Nothing answers on this card, so the network server
+    // gives up at its connect timeout: the connection was made, not refused.
+    assert_eq!(instance_data(PLATFORM_GRANT), Some(StreamError::TimedOut));
+    // Without its local rule, as the work item first wrote it, the grant names no address a
+    // connection may leave from, and the network server refuses every connection for that.
+    let without_local = PLATFORM_GRANT.replace(" local=0.0.0.0/0", "");
     assert_eq!(
-        instance_data(PLATFORM_GRANT),
+        instance_data(&without_local),
         Some(StreamError::Other(
             "the network server answered Remote(NotPermitted)".to_string()
         ))
     );
-    // With a local rule the connection is routed to the gateway. Nothing answers on this
-    // card, so the network server gives up at its connect timeout.
-    let with_local = PLATFORM_GRANT.replace(" sockets=4", " local=0.0.0.0/0 sockets=4");
-    assert_eq!(instance_data(&with_local), Some(StreamError::TimedOut));
     // And the local rule opens nothing else: the policy still cannot listen.
-    let config = parse(&node(&with_local)).unwrap();
+    let config = parse(&node(PLATFORM_GRANT)).unwrap();
     let policy = &config.grants[0].1;
     assert_eq!(policy.rights, rights::CONNECT);
     assert!(!policy.may_listen(&Endpoint::new(Addr::v4(10, 0, 2, 15), 443)));
@@ -562,7 +563,6 @@ fn the_hand_over_crosses_a_channel_to_api_s_half() {
         Inputs {
             started_ns: 0,
             memory_bytes: None,
-            ready_limit_ns: None,
         },
     )
     .unwrap();

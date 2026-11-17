@@ -11,14 +11,13 @@ use std::{
 };
 
 use moruna_node_config::{Cloud, Handover, HandoverError, NodeConfig, base64};
-use moruna_svc::DEADLINE_INFINITE;
 
 use super::{
     FakeClock, FakeNetwork, RECORDED_AZURE_ID, RECORDED_CONFIG, RECORDED_OPENSTACK_ID,
     RECORDED_OPENSTACK_TIME, Reply, SECOND, Sent, answer, azure, openstack,
 };
 use crate::{
-    boot::{Fatal, Inputs, Stage, cloud_line, ready_line, run},
+    boot::{Fatal, Inputs, READY_LIMIT_NS, Stage, cloud_line, ready_line, run},
     machine::{Clock, Link, LinkError, StreamError},
 };
 
@@ -85,7 +84,6 @@ impl Booted {
 const INPUTS: Inputs = Inputs {
     started_ns: 0,
     memory_bytes: Some(8 << 30),
-    ready_limit_ns: None,
 };
 
 /// Boots against `network`, with `api` changed by `prepare` from one that answers `ready`.
@@ -183,8 +181,8 @@ fn a_node_on_openstack_hands_over_and_says_it_is_ready() {
     // What api got is the hand-over, as its half of the crate reads it.
     assert_eq!(booted.api.sent, [handover.encode().unwrap()]);
     assert_eq!(Handover::decode(&booted.api.sent[0]), Ok(handover));
-    // No limit was given for api's answer, so none was set.
-    assert_eq!(booted.api.deadlines, [DEADLINE_INFINITE, DEADLINE_INFINITE]);
+    // api had 10 s from the cloud's line, after the three requests' 6 ms.
+    assert_eq!(booted.api.deadlines, [6 * MS + 10 * SECOND; 2]);
 }
 
 #[test]
@@ -448,24 +446,25 @@ fn an_api_that_does_not_answer_ready_is_fatal() {
         let booted = boot_with(network(), INPUTS, |api| api.answer = Ok(other.to_vec()));
         assert_eq!(
             booted.line(),
-            "moruna: fatal ready: api answered the hand-over with something else"
+            "moruna: fatal platform: api answered the hand-over with something else"
         );
         // The cloud was named and the hand-over sent; the node never said it was ready.
         assert_eq!(booted.events, [cloud.clone(), "the hand-over".to_string()]);
-        assert_eq!(booted.result.unwrap_err().stage, Stage::Ready);
+        assert_eq!(booted.result.unwrap_err().stage, Stage::Platform);
     }
 
     // It closes its end, before the hand-over or after it.
     let booted = boot_with(network(), INPUTS, |api| api.send = Err(LinkError::Closed));
     assert_eq!(
         booted.line(),
-        "moruna: fatal ready: the hand-over was not sent to api: api closed its end of the link"
+        "moruna: fatal platform: the hand-over was not sent to api: api closed its end of the \
+         link"
     );
     assert_eq!(booted.events, [cloud.as_str()]);
     let booted = boot_with(network(), INPUTS, |api| api.answer = Err(LinkError::Closed));
     assert_eq!(
         booted.line(),
-        "moruna: fatal ready: api did not answer: api closed its end of the link"
+        "moruna: fatal platform: api did not answer: api closed its end of the link"
     );
     let booted = boot_with(network(), INPUTS, |api| {
         api.answer = Err(LinkError::Other(
@@ -474,26 +473,27 @@ fn an_api_that_does_not_answer_ready_is_fatal() {
     });
     assert_eq!(
         booted.line(),
-        "moruna: fatal ready: api did not answer: the kernel refused: bad handle"
+        "moruna: fatal platform: api did not answer: the kernel refused: bad handle"
     );
 
-    // With a limit, an api that says nothing is fatal when the limit passes.
-    let limited = Inputs {
-        ready_limit_ns: Some(30 * SECOND),
-        ..INPUTS
-    };
-    let booted = boot_with(network(), limited, |api| {
+    // An api that says nothing is fatal when its 10 s have passed (PM, 2026-11-18).
+    let booted = boot_with(network(), INPUTS, |api| {
         api.answer = Err(LinkError::TimedOut);
     });
     assert_eq!(
         booted.line(),
-        "moruna: fatal ready: api did not answer within 30 s"
+        "moruna: fatal platform: api did not answer ready within 10 s"
     );
-    assert_eq!(booted.clock.now(), 30 * SECOND);
-    assert_eq!(booted.api.deadlines, [30 * SECOND, 30 * SECOND]);
-    // And one that answers within it is ready.
-    let booted = boot_with(network(), limited, |_| {});
+    assert_eq!(booted.clock.now(), 10 * SECOND);
+    assert_eq!(booted.api.deadlines, [10 * SECOND, 10 * SECOND]);
+    assert_eq!(READY_LIMIT_NS, 10 * SECOND);
+    // And one that answers within them is ready.
+    let booted = boot_with(network(), INPUTS, |api| api.takes = 10 * SECOND - 1);
     assert_eq!(booted.events.len(), 3);
+    assert_eq!(
+        booted.events[2],
+        format!("moruna: ready api=10.0.2.15:443 boot_ms={}", 10_000 - 1)
+    );
     assert!(booted.result.is_ok());
 }
 
@@ -506,10 +506,12 @@ fn a_node_whose_address_is_not_known_does_not_say_it_is_ready() {
     let booted = boot_with(network, INPUTS, |_| {});
     assert_eq!(
         booted.line(),
-        "moruna: fatal ready: the node's address is not known: the interface wan has no IPv4 \
-         address"
+        "moruna: fatal platform: the node's address is not known: the interface wan has no \
+         IPv4 address"
     );
-    assert_eq!(booted.events.len(), 2);
+    // The address is asked before the hand-over, so api was never handed it.
+    assert_eq!(booted.events.len(), 1);
+    assert!(booted.api.sent.is_empty());
 }
 
 #[test]
@@ -539,8 +541,8 @@ fn the_lines_are_the_design_s() {
         "moruna: fatal config: a reason"
     );
     assert_eq!(
-        Fatal::new(Stage::Ready, "a reason").to_string(),
-        "moruna: fatal ready: a reason"
+        Fatal::new(Stage::Platform, "a reason").to_string(),
+        "moruna: fatal platform: a reason"
     );
     // A reason is one printable line that fits the console's buffer, whatever it quotes.
     let quoted = format!("line\nbreak, caf\u{e9}, bell\u{7}, {}", "x".repeat(600));

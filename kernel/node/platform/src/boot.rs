@@ -13,7 +13,6 @@ use core::{
 };
 
 use moruna_node_config::{Cloud, Handover, NodeConfig, READY, cloud_name};
-use moruna_svc::DEADLINE_INFINITE;
 
 use crate::{
     date, instance,
@@ -23,6 +22,10 @@ use crate::{
 /// The port `api` listens on.
 pub const API_PORT: u16 = 443;
 
+/// How long `api` has to answer the hand-over `ready`, from when `platform` begins to hand it
+/// over (PM, 2026-11-18).
+pub const READY_LIMIT_NS: u64 = 10 * instance::SECOND;
+
 /// The stage a boot stopped in, as the fatal line names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
@@ -30,8 +33,8 @@ pub enum Stage {
     InstanceData,
     /// Validating node config.
     Config,
-    /// Handing `api` its config and hearing that it is ready.
-    Ready,
+    /// Handing `api` its config and hearing that it is ready: `platform`'s own stage.
+    Platform,
 }
 
 impl Stage {
@@ -40,7 +43,7 @@ impl Stage {
         match self {
             Stage::InstanceData => "instance-data",
             Stage::Config => "config",
-            Stage::Ready => "ready",
+            Stage::Platform => "platform",
         }
     }
 }
@@ -97,8 +100,6 @@ pub struct Inputs {
     pub started_ns: u64,
     /// The node's memory, which bounds `functions.cache_bytes`; `None` when it is not known.
     pub memory_bytes: Option<u64>,
-    /// How long `api` may take to answer the hand-over; `None` for no limit.
-    pub ready_limit_ns: Option<u64>,
 }
 
 /// Boots: returns the hand-over `api` took, having printed the `cloud` and `ready` lines through
@@ -140,32 +141,33 @@ pub fn run<N: Network, C: Clock, L: Link>(
     // `api` prints once it has its config.
     console(&cloud_line(handover.cloud, &handover.instance));
 
-    // 4. The hand-over, and `api`'s answer.
-    let ready = |reason: String| Fatal::new(Stage::Ready, reason);
-    let deadline = match inputs.ready_limit_ns {
-        None => DEADLINE_INFINITE,
-        Some(limit) => clock.now().saturating_add(limit),
-    };
+    // 4. The hand-over, and `api`'s answer, within the limit. The address the ready line
+    // names is asked first: the network server answers it at once, and asking it after `api`
+    // has answered could find the limit all but spent.
+    let fatal = |reason: String| Fatal::new(Stage::Platform, reason);
+    let deadline = clock.now().saturating_add(READY_LIMIT_NS);
+    let address = network
+        .address(deadline)
+        .map_err(|error| fatal(format!("the node's address is not known: {error}")))?;
     link.send(&message, deadline)
-        .map_err(|error| ready(format!("the hand-over was not sent to api: {error}")))?;
+        .map_err(|error| fatal(format!("the hand-over was not sent to api: {error}")))?;
     match link.receive(deadline) {
         Ok(answer) if answer == READY => {}
         Ok(_) => {
-            return Err(ready(
+            return Err(fatal(
                 "api answered the hand-over with something else".into(),
             ));
         }
         Err(LinkError::TimedOut) => {
-            let seconds = inputs.ready_limit_ns.unwrap_or_default() / instance::SECOND;
-            return Err(ready(format!("api did not answer within {seconds} s")));
+            let seconds = READY_LIMIT_NS / instance::SECOND;
+            return Err(fatal(format!(
+                "api did not answer ready within {seconds} s"
+            )));
         }
-        Err(error) => return Err(ready(format!("api did not answer: {error}"))),
+        Err(error) => return Err(fatal(format!("api did not answer: {error}"))),
     }
 
     // 5. Ready.
-    let address = network
-        .address(deadline)
-        .map_err(|error| ready(format!("the node's address is not known: {error}")))?;
     console(&ready_line(address, clock.now() / 1_000_000));
     Ok(handover)
 }

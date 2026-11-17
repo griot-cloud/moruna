@@ -615,10 +615,25 @@ fn the_function_cache_is_whole_mib_from_64_mib_to_half_the_node_s_memory() {
     );
     // Without the node's memory the bound cannot be checked, so a given size is refused.
     assert_eq!(cache(64 << 20, None), Err(Refusal::CacheUnchecked));
-    // The default is taken as it is, on a small node and on one whose memory is not known.
-    for memory in [Some(1 << 30), Some(100 << 20), None] {
-        let config = NodeConfig::validate(with("").as_bytes(), memory).unwrap();
-        assert_eq!(config.functions.cache_bytes, CACHE_BYTES_DEFAULT);
+}
+
+#[test]
+fn the_default_function_cache_is_1_gib_or_half_the_node_s_memory_and_never_refused() {
+    let default = |text: &str, memory: Option<u64>| {
+        NodeConfig::validate(text.as_bytes(), memory).map(|c| c.functions.cache_bytes)
+    };
+    // With no `functions`, and with `functions` that leaves `cache_bytes` out.
+    for text in [with(""), with(r#","functions":{"keys":[]}"#)] {
+        // 1 GiB on a node with at least 2 GiB.
+        assert_eq!(default(&text, Some(MEMORY)), Ok(1 << 30));
+        assert_eq!(default(&text, Some(2 << 30)), Ok(1 << 30));
+        // Half the node's memory on a smaller one, not rounded and not held to 64 MiB.
+        assert_eq!(default(&text, Some((2 << 30) - 4096)), Ok((1 << 30) - 2048));
+        assert_eq!(default(&text, Some(1 << 30)), Ok(512 << 20));
+        assert_eq!(default(&text, Some(100 << 20)), Ok(50 << 20));
+        assert_eq!(default(&text, Some(0)), Ok(0));
+        // 1 GiB when the node's memory is not known.
+        assert_eq!(default(&text, None), Ok(CACHE_BYTES_DEFAULT));
     }
 }
 

@@ -42,7 +42,7 @@ fn boot(console: &Console, started_ns: u64) -> Result<Handover, Fatal> {
         .ok_or_else(|| instance_data("platform was started without its network channel".into()))?;
     let api = start::take("api").map(Channel).ok_or_else(|| {
         Fatal::new(
-            Stage::Ready,
+            Stage::Platform,
             "platform was started without its channel to api",
         )
     })?;
@@ -71,13 +71,10 @@ fn boot(console: &Console, started_ns: u64) -> Result<Handover, Fatal> {
         &mut |line: &str| println!(console, "{}", line),
         Inputs {
             started_ns,
-            // Open, asked of the PM in item 1.4's report: no call gives a service the node's
-            // memory. Until one does, a node config that sets `functions.cache_bytes` is refused,
+            // Open, asked of the PM in item 1.4's report: which figure is the node's memory.
+            // Until it is given, a node config that sets `functions.cache_bytes` is refused,
             // because its upper bound (half the node's memory) cannot be checked.
             memory_bytes: None,
-            // Open, asked of the PM in item 1.4's report: the design gives `api` no limit for
-            // its `ready`, so none is set here.
-            ready_limit_ns: None,
         },
     )
 }
