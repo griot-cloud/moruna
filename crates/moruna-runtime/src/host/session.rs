@@ -1217,12 +1217,33 @@ fn limits_for(job: &Job) -> Option<LimitsMsg> {
 
 /// Where a document's output store is (MH 4.3 `log`).
 pub fn logs_path(job: &Job, run_id: &str) -> PathBuf {
-    match &job.report.logs {
+    logs_path_from(
+        job.report.logs.as_deref(),
+        job.staging.dir.as_deref(),
+        run_id,
+        moruna_micro::on_kernel(),
+    )
+}
+
+/// stream E hook (D's file): the output store's place from the document's `report.logs`
+/// template, its staging directory and whether the engine runs on the Moruna kernel. A document
+/// naming neither keeps its store beside the process, as on a host; on the Moruna kernel that is
+/// the image's root, which is read only, so the store could not be made and every task's lines
+/// were dropped ("Read-only file system", 2026-11-17). There it goes in the engine's scratch
+/// (the temporary directory, `/tmp`), the guest's one writable place beside the output disk.
+fn logs_path_from(
+    template: Option<&str>,
+    staging_dir: Option<&str>,
+    run_id: &str,
+    on_kernel: bool,
+) -> PathBuf {
+    match template {
         Some(template) => PathBuf::from(template.replace("<run_id>", run_id)),
         None => {
             let name = format!("moruna-{run_id}.logs");
-            match job.staging.dir.as_deref() {
+            match staging_dir {
                 Some(dir) => Path::new(dir).join(name),
+                None if on_kernel => std::env::temp_dir().join(name),
                 None => PathBuf::from(name),
             }
         }
@@ -1268,6 +1289,35 @@ pub fn read_report_file(path: &Path) -> std::io::Result<serde_json::Value> {
     let mut text = String::new();
     std::fs::File::open(path)?.read_to_string(&mut text)?;
     serde_json::from_str(&text).map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+mod logs_path_tests {
+    use super::*;
+
+    /// stream E hook (D's file): on the Moruna kernel a document naming no place keeps its
+    /// output store in the engine's scratch, not the read-only root; a template or a staging
+    /// directory wins wherever the engine runs, and a host keeps the store beside the process.
+    #[test]
+    fn the_output_store_is_writable_on_the_moruna_kernel() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let name = format!("moruna-{id}.logs");
+        assert_eq!(
+            logs_path_from(None, None, id, true),
+            std::env::temp_dir().join(&name)
+        );
+        assert_eq!(logs_path_from(None, None, id, false), PathBuf::from(&name));
+        for on_kernel in [true, false] {
+            assert_eq!(
+                logs_path_from(None, Some("/stage"), id, on_kernel),
+                Path::new("/stage").join(&name)
+            );
+            assert_eq!(
+                logs_path_from(Some("/out/<run_id>.logs"), Some("/stage"), id, on_kernel),
+                PathBuf::from(format!("/out/{id}.logs"))
+            );
+        }
+    }
 }
 
 #[cfg(test)]
