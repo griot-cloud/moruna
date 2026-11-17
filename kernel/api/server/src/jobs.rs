@@ -62,6 +62,8 @@ struct Entry {
     /// Where its first record stands in the buffer, and how many records it has.
     first: u64,
     records: u64,
+    /// The engine's lines passed over for being longer than [`ENGINE_LINE_LIMIT`].
+    skipped: u64,
 }
 
 impl Entry {
@@ -99,9 +101,10 @@ struct Flight {
     submitted: u64,
     /// Whether the engine has told the run's ID, so that the job is in the list.
     listed: bool,
-    /// A heartbeat and a report that came before the run's ID.
+    /// A heartbeat and a report that came before the run's ID, and the lines passed over.
     heartbeat: Option<Box<str>>,
     report: Option<(Box<str>, Option<Box<str>>)>,
+    skipped: u64,
 }
 
 /// A document waiting for the engine's check.
@@ -109,6 +112,8 @@ struct Flight {
 struct Check {
     ticket: u64,
     document: Vec<u8>,
+    /// The names of the job's secrets, which its document may refer to.
+    names: Vec<String>,
     secrets: Secrets,
 }
 
@@ -117,6 +122,10 @@ struct Parsed {
     /// The `spec` member of the host protocol's `spec` message: the version 1 document as one
     /// line of JSON, or the version 2 document's base64 as a JSON string.
     spec: String,
+    /// The `secrets` member: the job's secrets by name, as JSON, when it has any.
+    named: Option<String>,
+    /// Their names.
+    names: Vec<String>,
     secrets: Secrets,
 }
 
@@ -125,7 +134,12 @@ impl Parsed {
     fn of(body: &[u8]) -> Result<Self, &'static str> {
         let job: Job<&RawValue> =
             serde_json::from_slice(body).map_err(|_| "the body is not a job: v1 or v2")?;
-        let secrets = Secrets::new(&job.secrets)?;
+        let secrets = Secrets::new(job.secrets.iter())?;
+        let names = job.secrets.keys().cloned().collect();
+        let named = (!job.secrets.is_empty())
+            .then(|| serde_json::to_string(&job.secrets))
+            .transpose()
+            .map_err(|_| "the secrets cannot be written")?;
         let spec = match (job.v1, job.v2) {
             (Some(document), None) if is_object(document.get()) => compact(document.get()),
             (Some(_), None) => return Err("v1 is a job document, a JSON object"),
@@ -137,7 +151,23 @@ impl Parsed {
             }
             _ => return Err("a job is exactly one of v1 and v2"),
         };
-        Ok(Self { spec, secrets })
+        Ok(Self {
+            spec,
+            named,
+            names,
+            secrets,
+        })
+    }
+
+    /// The host protocol's `spec` message: the document, and the secrets beside it.
+    fn message(&self) -> String {
+        match &self.named {
+            Some(named) => format!(
+                "{{\"type\":\"spec\",\"spec\":{},\"secrets\":{named}}}\n",
+                self.spec
+            ),
+            None => format!("{{\"type\":\"spec\",\"spec\":{}}}\n", self.spec),
+        }
     }
 
     /// The document as the engine's check reads it: version 1's JSON, or version 2's bytes.
@@ -181,6 +211,8 @@ pub(crate) struct Stream {
     next: u64,
     /// How many of the job's heartbeats had been sent or passed when last looked.
     heartbeats: u64,
+    /// How many of the engine's skipped lines the stream has been told of.
+    skipped: u64,
 }
 
 /// The jobs' state.
@@ -266,6 +298,7 @@ impl Jobs {
         self.checks.push_back(Check {
             ticket,
             document: parsed.document(),
+            names: parsed.names,
             secrets: parsed.secrets,
         });
         Ok(ticket)
@@ -283,9 +316,11 @@ impl Jobs {
             return Err(Answer::error(ErrorCode::Busy, "a job is running"));
         }
         let parsed = Parsed::of(body).map_err(|why| Answer::error(ErrorCode::Invalid, why))?;
-        let spec = format!("{{\"type\":\"spec\",\"spec\":{}}}\n", parsed.spec);
-        host.start(spec.as_bytes())
-            .map_err(|error| failed(error, &parsed.secrets))?;
+        let mut spec = parsed.message();
+        let started = host.start(spec.as_bytes());
+        // The message held the secrets in the clear: overwrite it before it is let go.
+        spec.replace_range(.., &"\0".repeat(spec.len()));
+        started.map_err(|error| failed(error, &parsed.secrets))?;
         let ticket = self.ticket();
         self.ordinals += 1;
         self.wire.clear();
@@ -297,6 +332,7 @@ impl Jobs {
             listed: false,
             heartbeat: None,
             report: None,
+            skipped: 0,
         });
         Ok(ticket)
     }
@@ -372,6 +408,7 @@ impl Jobs {
                 .first
                 .saturating_add(from.unwrap_or(1).saturating_sub(1)),
             heartbeats: entry.heartbeats,
+            skipped: 0,
         })
     }
 
@@ -401,6 +438,18 @@ impl Jobs {
         }
         if stream.next < end {
             return false;
+        }
+        if entry.skipped > stream.skipped {
+            stream.skipped = entry.skipped;
+            event(
+                out,
+                "note",
+                &format!(
+                    "{{\"type\":\"note\",\"skipped_lines\":{0},\"message\":\"{0} of the engine's \
+                     lines were longer than {ENGINE_LINE_LIMIT} bytes and were skipped\"}}",
+                    entry.skipped
+                ),
+            );
         }
         if entry.heartbeats > stream.heartbeats {
             stream.heartbeats = entry.heartbeats;
@@ -440,7 +489,9 @@ impl Jobs {
                     read += count;
                     self.wire.push(&scratch[..count]);
                     while self.flight.is_some() {
-                        match self.wire.next() {
+                        let message = self.wire.next();
+                        self.count_skipped();
+                        match message {
                             Some(Message::Line(line)) => self.line(line, now),
                             Some(Message::Record(record)) => self.record(&record, now),
                             Some(Message::Garbled) => self.end(None, None, now),
@@ -475,7 +526,7 @@ impl Jobs {
             let Some(check) = self.checks.front() else {
                 break;
             };
-            match host.check(&check.document) {
+            match host.check(&check.document, &check.names) {
                 Ok(()) => self.checking = true,
                 Err(HostError::WouldBlock) => break,
                 Err(error) => {
@@ -485,6 +536,19 @@ impl Jobs {
                     }
                 }
             }
+        }
+    }
+
+    /// Counts the lines the wire has passed over for their length, for the job in flight.
+    fn count_skipped(&mut self) {
+        let skipped = self.wire.take_skipped();
+        if skipped == 0 {
+            return;
+        }
+        if let Some(entry) = self.current() {
+            entry.skipped += skipped;
+        } else if let Some(flight) = &mut self.flight {
+            flight.skipped += skipped;
         }
     }
 
@@ -592,7 +656,7 @@ impl Jobs {
         if !flight.listed {
             flight.listed = true;
             let id = event.run.unwrap_or(event.start);
-            let (ordinal, submitted) = (flight.ordinal, flight.submitted);
+            let (ordinal, submitted, skipped) = (flight.ordinal, flight.submitted, flight.skipped);
             let (heartbeat, report) = (flight.heartbeat.take(), flight.report.take());
             if let Some(ticket) = flight.ticket.take() {
                 let submitted = Submitted { id: id.clone() };
@@ -615,6 +679,7 @@ impl Jobs {
                 plan: None,
                 first: self.front + self.lines.len() as u64,
                 records: 0,
+                skipped,
             });
             while self.list.len() > JOBS_KEPT {
                 if let Some(old) = self.list.pop_back() {

@@ -49,22 +49,36 @@ pub(crate) fn is_object(text: &str) -> bool {
     text.bytes().find(|b| !is_space(*b)) == Some(b'{')
 }
 
-/// The strings a job says are secret, each as JSON writes it inside a string. Their bytes are
-/// wiped when the job has ended and this is dropped.
+/// Whether `name` is a secret's name: 1 to 64 of ASCII letters, digits, `_`, `-`, `.` and `:`,
+/// as a port's name is.
+pub(crate) fn is_secret_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+}
+
+/// The values of a job's secrets, each as JSON writes it inside a string. Their bytes are wiped
+/// when the job has ended and this is dropped.
 #[derive(Default)]
 pub(crate) struct Secrets {
     forms: Vec<Vec<u8>>,
 }
 
 impl Secrets {
-    /// The secrets `named`, or why they are refused: an empty one, or more than
-    /// [`SECRETS_LIMIT`].
-    pub(crate) fn new(named: &[String]) -> Result<Self, &'static str> {
+    /// The secrets `named`, by name, or why they are refused: more than [`SECRETS_LIMIT`], a
+    /// name that is not one ([`is_secret_name`]), or an empty value.
+    pub(crate) fn new<'a>(
+        named: impl ExactSizeIterator<Item = (&'a String, &'a String)>,
+    ) -> Result<Self, &'static str> {
         if named.len() > SECRETS_LIMIT {
             return Err("a job names at most 32 secrets");
         }
         let mut forms = Vec::with_capacity(named.len());
-        for secret in named {
+        for (name, secret) in named {
+            if !is_secret_name(name) {
+                return Err("a secret's name is 1 to 64 of letters, digits, _ - . and :");
+            }
             if secret.is_empty() {
                 return Err("a secret is not empty");
             }

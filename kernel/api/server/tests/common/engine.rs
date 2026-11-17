@@ -25,8 +25,9 @@ const START: &str = "fedcba9876543210fedcba9876543210";
 /// What the engine has been asked, and what it has said that the server has not yet read.
 #[derive(Default)]
 pub struct State {
-    /// The documents handed to the check, in order.
+    /// The documents handed to the check, in order, and the secrets' names with each.
     pub checked: Vec<Vec<u8>>,
+    pub checked_names: Vec<Vec<String>>,
     /// The verdicts the next checks give, in order; a check with none finds the document sound.
     pub verdicts: VecDeque<Result<Vec<Refusal>, HostError>>,
     /// While set, a check under way gives no verdict.
@@ -158,10 +159,11 @@ impl Engine {
 }
 
 impl EngineHost for Engine {
-    fn check(&mut self, document: &[u8]) -> Result<(), HostError> {
+    fn check(&mut self, document: &[u8], secrets: &[String]) -> Result<(), HostError> {
         let mut state = self.0.borrow_mut();
         assert!(!state.checking, "one check at a time");
         state.checked.push(document.to_vec());
+        state.checked_names.push(secrets.to_vec());
         state.checking = true;
         Ok(())
     }

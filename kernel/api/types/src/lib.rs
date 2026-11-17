@@ -21,7 +21,7 @@
 
 extern crate alloc;
 
-use alloc::{format, string::String, vec::Vec};
+use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
 #[cfg(any(test, feature = "schema"))]
@@ -249,7 +249,8 @@ pub struct Claims {
 }
 
 /// A job as a client hands it to the node: the job document, as version 1 JSON (`v1`) or as
-/// version 2's FlatBuffers in base64 (`v2`), exactly one of the two.
+/// version 2's FlatBuffers in base64 (`v2`), exactly one of the two, and the secrets its
+/// object-store settings refer to by name (`{"secret": "<name>"}`).
 // `D` is the version 1 document's type: any JSON object, in whatever form the program holds JSON
 // (system design, section 3B).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,10 +264,11 @@ pub struct Job<D> {
     /// The job document, version 2: its `MJB2` FlatBuffer in standard base64.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v2: Option<String>,
-    /// Strings in the document that are secret (object-store credentials): the node shows none
-    /// of them in any answer, event, log or report of this job.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub secrets: Vec<String>,
+    /// The job's secrets (object-store credentials), by name: at most 32. They reach the engine
+    /// beside the document, never in it, and the node shows none of them in any answer, event,
+    /// log or report of this job.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, String>,
 }
 
 impl<D> Job<D> {
@@ -275,7 +277,7 @@ impl<D> Job<D> {
         Self {
             v1: Some(document),
             v2: None,
-            secrets: Vec::new(),
+            secrets: BTreeMap::new(),
         }
     }
 
@@ -284,8 +286,14 @@ impl<D> Job<D> {
         Self {
             v1: None,
             v2: Some(base64.into()),
-            secrets: Vec::new(),
+            secrets: BTreeMap::new(),
         }
+    }
+
+    /// The job with the secret `value` under `name`.
+    pub fn with_secret(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.secrets.insert(name.into(), value.into());
+        self
     }
 }
 

@@ -238,14 +238,14 @@
       "description": "Whether the engine takes a job document, and its refusals when it does not. Nothing runs.",
       "inputSchema": {
         "additionalProperties": false,
-        "description": "A job as a client hands it to the node: the job document, as version 1 JSON (`v1`) or as\nversion 2's FlatBuffers in base64 (`v2`), exactly one of the two.",
+        "description": "A job as a client hands it to the node: the job document, as version 1 JSON (`v1`) or as\nversion 2's FlatBuffers in base64 (`v2`), exactly one of the two, and the secrets its\nobject-store settings refer to by name (`{\"secret\": \"<name>\"}`).",
         "properties": {
           "secrets": {
-            "description": "Strings in the document that are secret (object-store credentials): the node shows none\nof them in any answer, event, log or report of this job.",
-            "items": {
+            "additionalProperties": {
               "type": "string"
             },
-            "type": "array"
+            "description": "The job's secrets (object-store credentials), by name: at most 32. They reach the engine\nbeside the document, never in it, and the node shows none of them in any answer, event,\nlog or report of this job.",
+            "type": "object"
           },
           "v1": {
             "additionalProperties": true,
@@ -308,14 +308,14 @@
       "description": "Run a job in a fresh engine and answer its run ID. Busy while a job runs; invalid with the engine's refusals.",
       "inputSchema": {
         "additionalProperties": false,
-        "description": "A job as a client hands it to the node: the job document, as version 1 JSON (`v1`) or as\nversion 2's FlatBuffers in base64 (`v2`), exactly one of the two.",
+        "description": "A job as a client hands it to the node: the job document, as version 1 JSON (`v1`) or as\nversion 2's FlatBuffers in base64 (`v2`), exactly one of the two, and the secrets its\nobject-store settings refer to by name (`{\"secret\": \"<name>\"}`).",
         "properties": {
           "secrets": {
-            "description": "Strings in the document that are secret (object-store credentials): the node shows none\nof them in any answer, event, log or report of this job.",
-            "items": {
+            "additionalProperties": {
               "type": "string"
             },
-            "type": "array"
+            "description": "The job's secrets (object-store credentials), by name: at most 32. They reach the engine\nbeside the document, never in it, and the node shows none of them in any answer, event,\nlog or report of this job.",
+            "type": "object"
           },
           "v1": {
             "additionalProperties": true,

@@ -71,6 +71,10 @@ def _int(value: Any, where: str, low: int | None, high: int | None) -> int:
     return value
 
 
+def _strings(value: Any, where: str) -> dict[str, str]:
+    return {key: _str(item, f"{where}.{key}") for key, item in _object(value, where).items()}
+
+
 def _bool(value: Any, where: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{where}: expected a boolean, found {type(value).__name__}")
@@ -391,12 +395,14 @@ class Heartbeat:
 @dataclass(frozen=True, slots=True)
 class Job:
     """A job as a client hands it to the node: the job document, as version 1 JSON (`v1`) or as
-    version 2's FlatBuffers in base64 (`v2`), exactly one of the two.
+    version 2's FlatBuffers in base64 (`v2`), exactly one of the two, and the secrets its
+    object-store settings refer to by name (`{"secret": "<name>"}`).
     """
 
-    secrets: list[str] | None = None
-    """Strings in the document that are secret (object-store credentials): the node shows none of
-    them in any answer, event, log or report of this job.
+    secrets: dict[str, str] | None = None
+    """The job's secrets (object-store credentials), by name: at most 32. They reach the engine
+    beside the document, never in it, and the node shows none of them in any answer, event, log
+    or report of this job.
     """
 
     v1: dict[str, Any] | None = None
@@ -410,12 +416,7 @@ class Job:
         """Read an answer's JSON value; a ``ValueError`` says where it is wrong."""
         data = _object(value, where)
         return cls(
-            secrets=_maybe(
-                data,
-                "secrets",
-                where,
-                lambda at: [_str(*item) for item in _items(*at)],
-            ),
+            secrets=_maybe(data, "secrets", where, lambda at: _strings(*at)),
             v1=_maybe(data, "v1", where, lambda at: _object(*at)),
             v2=_maybe(data, "v2", where, lambda at: _str(*at)),
         )
@@ -424,7 +425,7 @@ class Job:
         """The JSON value, as the node writes it."""
         data: dict[str, Any] = {}
         if self.secrets is not None:
-            data["secrets"] = [item for item in self.secrets]
+            data["secrets"] = self.secrets
         if self.v1 is not None:
             data["v1"] = self.v1
         if self.v2 is not None:

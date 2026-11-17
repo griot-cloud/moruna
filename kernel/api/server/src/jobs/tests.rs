@@ -139,6 +139,9 @@ fn what_is_not_a_job_is_invalid_and_starts_nothing() {
         r#"{"v1":{},"budget":1}"#,
         r#"{"v1":{},"secrets":[""]}"#,
         r#"{"v1":{},"secrets":"s"}"#,
+        r#"{"v1":{},"secrets":{"key":""}}"#,
+        r#"{"v1":{},"secrets":{"a key":"v"}}"#,
+        r#"{"v1":{},"secrets":{"k":7}}"#,
     ] {
         let answer = jobs.submit(&mut engine, bad.as_bytes(), NOW).unwrap_err();
         assert_eq!(answer.status, 400, "{bad}");
@@ -544,7 +547,7 @@ fn the_last_100_jobs_are_kept_and_their_reports_within_their_bytes() {
     engine.run_as(RUN);
     running(&mut jobs, &mut engine, V1);
     // The engine's line limit is under the reports' bytes, so such a report is a line passed
-    // over: the job ends with none.
+    // over: the job ends with none, and a stream of its events says one line was skipped.
     engine.finish(
         &format!("{{\"pad\":\"{}\"}}", "r".repeat(ENGINE_LINE_LIMIT)),
         0,
@@ -553,18 +556,60 @@ fn the_last_100_jobs_are_kept_and_their_reports_within_their_bytes() {
     jobs.pump(&mut engine, NOW);
     assert_eq!(jobs.status(RUN).unwrap().state, JobState::Completed);
     assert_eq!(jobs.report(RUN).status, 404);
+    let (text, ended) = sent(&jobs, &mut jobs.stream(RUN, None).unwrap());
+    assert!(ended);
+    let note = text
+        .split("\n\n")
+        .find(|event| event.starts_with("event: note\n"))
+        .expect("a note");
+    let data: Value =
+        serde_json::from_str(note.strip_prefix("event: note\ndata: ").unwrap()).unwrap();
+    assert_eq!(
+        (&data["type"], &data["skipped_lines"]),
+        (&json!("note"), &json!(1))
+    );
+    assert!(data["message"].as_str().unwrap().contains("skipped"));
+}
+
+#[test]
+fn a_line_skipped_before_the_run_id_is_counted_for_the_job() {
+    let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
+    let ticket = jobs.submit(&mut engine, V1.as_bytes(), NOW).unwrap();
+    engine.say(&"x".repeat(ENGINE_LINE_LIMIT + 1));
+    engine.say(&"y".repeat(ENGINE_LINE_LIMIT + 1));
+    jobs.pump(&mut engine, NOW);
+    engine.attempt_started();
+    jobs.pump(&mut engine, NOW);
+    assert_eq!(resolved(&mut jobs, ticket).status, 201);
+    let mut stream = jobs.stream(RUN, None).unwrap();
+    let (text, _) = sent(&jobs, &mut stream);
+    assert!(text.contains("\"skipped_lines\":2"), "{text}");
+    // Told once; told again when more are skipped.
+    assert_eq!(sent(&jobs, &mut stream).0, "");
+    engine.say(&"z".repeat(ENGINE_LINE_LIMIT + 1));
+    jobs.pump(&mut engine, NOW);
+    assert!(sent(&jobs, &mut stream).0.contains("\"skipped_lines\":3"));
 }
 
 #[test]
 fn a_secret_appears_in_nothing_the_node_keeps_or_answers() {
     const SECRET: &str = "AKIA/very+secret=key";
     let job = format!(
-        r#"{{"v1":{{"moruna_spec":1,"source":{{"kind":"s3","key":"{SECRET}"}}}},"secrets":["{SECRET}"]}}"#
+        r#"{{"v1":{{"moruna_spec":1,"object_store":{{"s3":{{"secret_access_key":{{"secret":"s3.key"}}}}}}}},"secrets":{{"s3.key":"{SECRET}","other":"unused"}}}}"#
     );
     let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
-    // The engine has it: the document goes to it whole.
+    // The engine has it, beside the document and never in it.
     running(&mut jobs, &mut engine, &job);
-    assert!(engine.0.borrow().started[0].contains(SECRET));
+    let spec = engine.spec();
+    assert_eq!(
+        spec["secrets"],
+        json!({ "s3.key": SECRET, "other": "unused" })
+    );
+    assert_eq!(
+        spec["spec"]["object_store"]["s3"]["secret_access_key"],
+        json!({ "secret": "s3.key" })
+    );
+    assert!(!spec["spec"].to_string().contains(SECRET));
     // And it leaks it every way it can.
     engine.log("source", &format!("opening with key {SECRET}"));
     engine.say(&format!(
@@ -610,6 +655,9 @@ fn a_secret_appears_in_nothing_the_node_keeps_or_answers() {
     let ticket = jobs.validate(job.as_bytes()).unwrap();
     jobs.pump(&mut engine, NOW);
     jobs.pump(&mut engine, NOW);
+    // The check is told the secrets' names, and never their values.
+    let names = engine.0.borrow().checked_names.last().unwrap().clone();
+    assert_eq!(names, ["other", "s3.key"]);
     let refused = String::from_utf8(resolved(&mut jobs, ticket).body).unwrap();
     assert!(
         !refused.contains(SECRET) && refused.contains("[redacted] is not a key"),

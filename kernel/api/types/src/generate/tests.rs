@@ -299,6 +299,10 @@ fn openapi_schemas_carry_the_design_names_and_no_others() {
         false
     );
     assert_eq!(
+        document["components"]["schemas"]["Job"]["properties"]["secrets"]["additionalProperties"],
+        json!({ "type": "string" })
+    );
+    assert_eq!(
         properties(&document, "Validation"),
         strings(&["ok", "refusals"])
     );

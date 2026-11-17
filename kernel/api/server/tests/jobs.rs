@@ -415,7 +415,7 @@ fn from_replays_from_that_record_and_nothing_else_is_a_query() {
 fn a_credential_put_in_a_job_appears_in_no_answer_event_log_or_report() {
     const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
     let job = format!(
-        r#"{{"v1":{{"moruna_spec":1,"source":{{"kind":"s3","secret_access_key":"{SECRET}"}},"sink":{{"kind":"count"}}}},"secrets":["{SECRET}"]}}"#
+        r#"{{"v1":{{"moruna_spec":1,"source":{{"kind":"s3"}},"sink":{{"kind":"count"}},"object_store":{{"s3":{{"secret_access_key":{{"secret":"aws"}}}}}}}},"secrets":{{"aws":"{SECRET}"}}}}"#
     );
     let mut harness = Harness::new();
     let token = harness.token(&["admin"]);

@@ -66,6 +66,14 @@ fn a_line_past_the_limit_is_passed_over_and_the_next_is_read() {
         all(&mut wire),
         [Message::Line(b"{\"type\":\"exit\"}".to_vec())]
     );
+    assert_eq!(wire.take_skipped(), 1);
+    assert_eq!(wire.take_skipped(), 0);
+    // A long line that arrives whole is passed over and counted too.
+    let mut long = vec![b'z'; ENGINE_LINE_LIMIT + 1];
+    long.extend_from_slice(b"\n{}\n");
+    wire.push(&long);
+    assert_eq!(all(&mut wire), [Message::Line(b"{}".to_vec())]);
+    assert_eq!(wire.take_skipped(), 1);
     // A line at the limit is read.
     let mut line = vec![b'y'; ENGINE_LINE_LIMIT];
     line.push(b'\n');
@@ -94,7 +102,7 @@ fn a_frame_no_record_has_garbles_the_stream() {
 #[test]
 fn a_node_with_no_engine_runs_no_jobs() {
     let mut none = NoEngine;
-    assert_eq!(none.check(b"{}"), Err(HostError::Unavailable));
+    assert_eq!(none.check(b"{}", &[]), Err(HostError::Unavailable));
     assert_eq!(none.checked(), None);
     assert_eq!(none.start(b"{}\n"), Err(HostError::Unavailable));
     assert_eq!(none.send(b"{}\n"), Err(HostError::Unavailable));

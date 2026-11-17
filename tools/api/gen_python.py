@@ -115,6 +115,10 @@ def _int(value: Any, where: str, low: int | None, high: int | None) -> int:
     return value
 
 
+def _strings(value: Any, where: str) -> dict[str, str]:
+    return {key: _str(item, f"{where}.{key}") for key, item in _object(value, where).items()}
+
+
 def _bool(value: Any, where: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{where}: expected a boolean, found {type(value).__name__}")
@@ -212,7 +216,7 @@ class Generator:
             raise Unsupported(f"{where}: a reference outside the document's schemas: {target}")
         return target[len(REF) :]
 
-    def annotation(self, schema: dict[str, Any], where: str) -> str:
+    def annotation(self, schema: dict[str, Any], where: str) -> str:  # noqa: PLR0911
         """The Python type of a field's schema."""
         schema = plain(schema)
         if "$ref" in schema:
@@ -224,6 +228,8 @@ class Generator:
             return "int"
         if kind == "boolean":
             return "bool"
+        if kind == "object" and schema.get("additionalProperties") == {"type": "string"}:
+            return "dict[str, str]"
         if kind == "object" and "properties" not in schema:
             return "dict[str, Any]"
         if kind == "array":
@@ -244,6 +250,8 @@ class Generator:
             return f"_str(*{value})"
         if kind == "boolean":
             return f"_bool(*{value})"
+        if kind == "object" and schema.get("additionalProperties") == {"type": "string"}:
+            return f"_strings(*{value})"
         if kind == "object":
             return f"_object(*{value})"
         if kind == "array":

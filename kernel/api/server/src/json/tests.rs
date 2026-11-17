@@ -1,7 +1,7 @@
 //! JSON text made one line, and its secrets taken out.
 
 use super::*;
-use alloc::{format, string::ToString, vec};
+use alloc::{format, string::ToString};
 use serde_json::Value;
 
 #[test]
@@ -24,7 +24,12 @@ fn compact_takes_out_the_space_between_tokens_only() {
 }
 
 fn secrets(named: &[&str]) -> Secrets {
-    Secrets::new(&named.iter().map(|s| s.to_string()).collect::<vec::Vec<_>>()).unwrap()
+    let map: alloc::collections::BTreeMap<String, String> = named
+        .iter()
+        .enumerate()
+        .map(|(n, s)| (format!("s{n}"), s.to_string()))
+        .collect();
+    Secrets::new(map.iter()).unwrap()
 }
 
 #[test]
@@ -59,10 +64,22 @@ fn secrets_of_one(secret: &str) -> Secrets {
 }
 
 #[test]
-fn an_empty_secret_and_too_many_are_refused() {
-    assert!(Secrets::new(&["".to_string()]).is_err());
-    let many = vec!["secret".to_string(); SECRETS_LIMIT + 1];
-    assert!(Secrets::new(&many).is_err());
-    assert!(Secrets::new(&many[..SECRETS_LIMIT]).is_ok());
+fn an_empty_secret_a_bad_name_and_too_many_are_refused() {
+    let one = |name: &str, value: &str| {
+        let map = alloc::collections::BTreeMap::from([(name.to_string(), value.to_string())]);
+        Secrets::new(map.iter()).map(|_| ())
+    };
+    assert!(one("key", "").is_err());
+    for name in ["", "a b", "k/1", &"x".repeat(65)] {
+        assert!(one(name, "v").is_err(), "{name}");
+    }
+    for name in ["s3.secret_access_key", "A-1:b", &"x".repeat(64)] {
+        assert!(one(name, "v").is_ok(), "{name}");
+    }
+    let many: alloc::collections::BTreeMap<String, String> = (0..=SECRETS_LIMIT)
+        .map(|n| (format!("k{n}"), "v".to_string()))
+        .collect();
+    assert!(Secrets::new(many.iter()).is_err());
+    assert!(Secrets::new(many.iter().take(SECRETS_LIMIT)).is_ok());
     assert_eq!(format!("{:?}", secrets(&["a", "b"])), "Secrets(2)");
 }

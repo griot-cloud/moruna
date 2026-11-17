@@ -362,12 +362,14 @@ fn a_job_is_its_document_in_one_version() {
         v1,
         Job::v1(serde_json::json!({"moruna_spec":1,"source":{"kind":"rows"}}))
     );
-    let v2: Job<Value> = round_trip(r#"{"v2":"TUpCMg==","secrets":["s3cr3t"]}"#);
+    let v2: Job<Value> = round_trip(r#"{"v2":"TUpCMg==","secrets":{"s3-key":"s3cr3t"}}"#);
     assert_eq!(v2.v2.as_deref(), Some("TUpCMg=="));
-    assert_eq!(v2.secrets, ["s3cr3t"]);
-    assert_eq!(Job::<Value>::v2("TUpCMg==").secrets, Vec::<String>::new());
+    assert_eq!(v2, Job::v2("TUpCMg==").with_secret("s3-key", "s3cr3t"));
+    assert!(Job::<Value>::v2("TUpCMg==").secrets.is_empty());
     assert!(refused::<Job<Value>>(r#"{"v1":{},"v3":{}}"#).contains("v3"));
     assert!(refused::<Job<Value>>(r#"{"v2":7}"#).contains("string"));
+    refused::<Job<Value>>(r#"{"v2":"TUpCMg==","secrets":["s3cr3t"]}"#);
+    refused::<Job<Value>>(r#"{"v2":"TUpCMg==","secrets":{"k":7}}"#);
 }
 
 #[test]

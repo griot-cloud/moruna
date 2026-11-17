@@ -32,16 +32,18 @@ pub enum HostError {
 /// its next poll.
 pub trait EngineHost {
     /// Starts the engine's check of `document` (a version 1 document's JSON, or a version 2
-    /// document's bytes) in a short-lived process. One check runs at a time: the server starts
-    /// the next when [`checked`](EngineHost::checked) has answered.
-    fn check(&mut self, document: &[u8]) -> Result<(), HostError>;
+    /// document's bytes) in a short-lived process, with the names of the job's secrets, so that
+    /// a reference to one not given is refused. One check runs at a time: the server starts the
+    /// next when [`checked`](EngineHost::checked) has answered.
+    fn check(&mut self, document: &[u8], secrets: &[String]) -> Result<(), HostError>;
 
     /// The verdict of the check under way, once it has one: the engine's refusals, none when
     /// the document is sound.
     fn checked(&mut self) -> Option<Result<Vec<Refusal>, HostError>>;
 
     /// Starts a fresh engine for one job and sends it `spec`, the host protocol's `spec`
-    /// message: one line, its line break included.
+    /// message: one line, its line break included, with the job's secrets in its `secrets`
+    /// member.
     fn start(&mut self, spec: &[u8]) -> Result<(), HostError>;
 
     /// Sends the engine one line of the host protocol, its line break included: `cancel`.
@@ -57,7 +59,7 @@ pub trait EngineHost {
 pub struct NoEngine;
 
 impl EngineHost for NoEngine {
-    fn check(&mut self, _document: &[u8]) -> Result<(), HostError> {
+    fn check(&mut self, _document: &[u8], _secrets: &[String]) -> Result<(), HostError> {
         Err(HostError::Unavailable)
     }
 
@@ -99,6 +101,8 @@ pub(crate) struct Wire {
     /// A line longer than the limit is being passed over, up to its line break.
     passing: bool,
     garbled: bool,
+    /// Lines passed over for their length since last asked.
+    skipped: u64,
 }
 
 impl Wire {
@@ -117,6 +121,11 @@ impl Wire {
     /// Forgets everything: a new engine begins.
     pub(crate) fn clear(&mut self) {
         *self = Self::default();
+    }
+
+    /// How many lines have been passed over for their length since last asked.
+    pub(crate) fn take_skipped(&mut self) -> u64 {
+        core::mem::take(&mut self.skipped)
     }
 
     /// Lets go of the bytes already read, once every whole message has been taken.
@@ -164,13 +173,16 @@ impl Wire {
                 Some(at) => {
                     let line = rest[..at].trim_ascii().to_vec();
                     self.read += at + 1;
-                    if !line.is_empty() && at <= ENGINE_LINE_LIMIT {
+                    if at > ENGINE_LINE_LIMIT {
+                        self.skipped += 1;
+                    } else if !line.is_empty() {
                         return Some(Message::Line(line));
                     }
                 }
                 None => {
                     if rest.len() > ENGINE_LINE_LIMIT {
                         self.passing = true;
+                        self.skipped += 1;
                         continue;
                     }
                     return None;
