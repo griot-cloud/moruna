@@ -28,9 +28,13 @@ NATIVE_EXPR = {"duckdb-sql": ("enrich", "occupancy"), "polars-expr": ("enrich",)
 # 0.7 with one vCPU left to the engine (tasks = vCPUs - 1), against all vCPUs: whether anything
 # of the `share` stall (fixed in bdf24e1f) is left. Occupancy and Enrich.
 FREE1 = ("occupancy", "enrich")
-# 0.7's VM (stream D): a 24 GiB VM takes a job budget of 20.6 GiB or less; its cgroup holds the
-# guest's memory and QEMU's.
-VM = {"vm_memory_gib": 24, "budget_gib": 20.5, "mem": 27}
+# 0.7's VM (stream D): its cgroup holds the guest's memory and QEMU's. A 24 GiB node gives its
+# processes 22.84 GiB (the kernel keeps 0.74 GiB: "kk: memory: 24526286848 bytes for processes,
+# 791171072 kept by the kernel"); node-for-job.py carves the services' 1.31 GiB and the job's
+# budget and scratch with 0.25 GiB beside them, so budget and scratch together may be at most
+# 21.28 GiB. 21.5 does not boot (no service connects, 20.5 + 1 and 17.5 + 4 on both VMs); 21.0
+# runs (20.5 + 0.5). Each job's budget is what its scratch leaves of 21.0.
+VM = {"vm_memory_gib": 24, "job_and_scratch_gib": 21.0, "mem": 27}
 # The engine's scratch holds a run's outputs until the output disk takes them, inside the VM's
 # memory, so a job with a large output gives up budget for it (2024's outputs, measured on
 # moruna-bench: Enrich's is the largest).
@@ -77,7 +81,7 @@ def options(engine: str, workload: str, machine: str, cpus: int):
     if engine in STACKS:
         scratch = SCRATCH_GIB.get(workload, 1)
         return {"image_stack": STACKS[engine], "vm_memory_gib": VM["vm_memory_gib"],
-                "budget_gib": VM["budget_gib"] + 1 - scratch, "scratch_gib": scratch, "timeout_s": 900}
+                "budget_gib": VM["job_and_scratch_gib"] - scratch, "scratch_gib": scratch, "timeout_s": 900}
     return {}
 
 
