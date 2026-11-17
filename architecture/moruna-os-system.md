@@ -24,7 +24,21 @@ a tree that has not booted.
 
 | Item | Build | Success |
 |---|---|---|
-| 0.1 | Boot the branch head as CI does. If the Linux-layer swap breaks it, move the swap to its own branch. | CI's boot checks pass at the head on 1, 2 and 4 CPUs. |
+| 0.1 | Boot the branch head as CI does. If the Linux-layer swap breaks it, move the swap to its own branch. | Done, 2026-11-17: see below. |
+
+**The base, from item 0.1:**
+- The head failed every Linux-layer check: the new `linux` server duplicates a process resource
+  handed to it without the duplicate right.
+- Stream B2's merge (`803e984c`) and stream A's wake queue (`16cf745c`) are reverted
+  (`a095f5d3`, `078e8087`). With them out, the kernel is the tag's, which booted under KVM.
+- Each returns as its own work item, proven under KVM: the Linux layer before section 5 needs
+  it, stream A's wake queue with the speed work of item 3.9.
+- Until then the engine and Linux programs run on `kernel/linux`, as at the tag.
+
+**Judging boots under the emulator.** QEMU's emulator on this Mac can't hold the timing checks.
+At the tag they fail on 2 CPUs (DS-A share) and 4 CPUs (DS-P steady), and they pass under KVM.
+Under the emulator, an item's boot check is `check-boot.sh` with those timing lines removed from
+`expect`, and the report says so. Under KVM, every line counts.
 
 ## 1. The node on OpenStack (Final)
 
