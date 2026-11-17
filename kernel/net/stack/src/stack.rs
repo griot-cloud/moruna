@@ -41,6 +41,7 @@ use smoltcp::{
 };
 
 use crate::{
+    boot::{LEASE_WITHIN_NS, network_line},
     config::{Config, Congestion, Settings},
     device::Port,
 };
@@ -331,6 +332,11 @@ pub struct Stack {
     pub grants: Vec<(Pending, Policy)>,
     /// What changed that the server's log should say: a lease taken or lost.
     pub notes: Vec<String>,
+    /// The boot's lines (system design 1B), for the server's console exactly as they
+    /// are: the network line, when the first DHCP lease is taken.
+    pub boot: Vec<String>,
+    /// Whether an interface has taken a DHCP lease since the stack was made.
+    leased: bool,
     now: u64,
     next_port: u16,
     next_seq: u16,
@@ -468,6 +474,8 @@ impl Stack {
             ready: Vec::new(),
             grants: Vec::new(),
             notes: Vec::new(),
+            boot: Vec::new(),
+            leased: false,
             now,
             next_port: EPHEMERAL_FIRST + (seed % 16384) as u16,
             next_seq: 1,
@@ -503,6 +511,20 @@ impl Stack {
         // absent. A new DHCP lease is requested when it comes back.
         self.dhcp(card + 1);
         self.update_resolvers();
+    }
+
+    /// When a server that started at `started` stops waiting for its first DHCP lease
+    /// (system design 1B: an address within 30 s). `None` when it waits for none: no
+    /// interface is set by DHCP, or one has taken a lease.
+    pub fn lease_due(&self, started: u64) -> Option<u64> {
+        (!self.leased && self.ifaces.iter().any(|x| x.dhcp.is_some()))
+            .then(|| started.saturating_add(LEASE_WITHIN_NS))
+    }
+
+    /// Whether that time has come at `now` with no lease taken: the server prints
+    /// [`crate::boot::NO_LEASE`] and exits with failure.
+    pub fn lease_overdue(&self, started: u64, now: u64) -> bool {
+        self.lease_due(started).is_some_and(|due| now >= due)
     }
 
     /// Whether nothing is left to finish: no socket closing on its own.
@@ -646,6 +668,18 @@ impl Stack {
                     x.gateway4 = Some(Addr(IpAddr::V4(r)));
                 }
                 x.dhcp_dns = servers.into_iter().map(|s| Addr(IpAddr::V4(s))).collect();
+                // The boot's network line, once: at the first lease the server takes.
+                // It names the gateway, so a lease that gives none has no line.
+                if !self.leased
+                    && let Some(gateway) = x.gateway4
+                {
+                    self.boot.push(network_line(
+                        &x.name,
+                        Cidr::new(addr(IpAddress::Ipv4(cidr.address())), cidr.prefix_len()),
+                        gateway,
+                    ));
+                }
+                self.leased = true;
                 let dns: Vec<String> = x.dhcp_dns.iter().map(|d| format!("{d}")).collect();
                 format!(
                     "{}: DHCP bound {}/{}, router {}, dns {}",

@@ -13,14 +13,10 @@ use std::{
     thread,
 };
 
-use common::{Flaws, MAC_A, MAC_B, PAIR, Rng, Wire, link, serve};
+use common::{Flaws, MAC_A, MAC_B, PAIR, Rng, Wire, dhcp_server, link, serve};
 use moruna_netstack::Stack;
 use moruna_svc::{CallError, Channel, deadline_in};
 use netstack_protocol::{Addr, Cidr, Endpoint, Target, net};
-use smoltcp::wire::{
-    DhcpMessageType, DhcpPacket, DhcpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
-    EthernetRepr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr,
-};
 
 fn client(listener: Channel) -> net::Client {
     let channel = moruna_svc::connect(&listener).expect("connect");
@@ -222,118 +218,9 @@ interface wan card=net4 dhcp
 grant listen rights=connect remote=any local=any
 ";
 
-/// A DHCP server for card 0: offers 10.0.2.15/24, router 10.0.2.2, DNS 10.0.2.3, and
-/// acknowledges the request for it.
-fn dhcp_server() -> Wire {
-    let server_mac = EthernetAddress([0x52, 0x55, 0x0a, 0x00, 0x02, 0x02]);
-    let server_ip = Ipv4Address::new(10, 0, 2, 2);
-    Box::new(move |st: &mut Stack, _: &mut Rng| {
-        for f in std::mem::take(&mut st.card_mut(0).port.tx) {
-            let Some((client, xid, kind)) = dhcp_request(&f) else {
-                continue;
-            };
-            let reply_type = match kind {
-                DhcpMessageType::Discover => DhcpMessageType::Offer,
-                DhcpMessageType::Request => DhcpMessageType::Ack,
-                _ => continue,
-            };
-            let mut dns = heapless::Vec::new();
-            let _ = dns.push(Ipv4Address::new(10, 0, 2, 3));
-            let repr = DhcpRepr {
-                message_type: reply_type,
-                transaction_id: xid,
-                secs: 0,
-                client_hardware_address: client,
-                client_ip: Ipv4Address::UNSPECIFIED,
-                your_ip: Ipv4Address::new(10, 0, 2, 15),
-                server_ip,
-                router: Some(server_ip),
-                subnet_mask: Some(Ipv4Address::new(255, 255, 255, 0)),
-                relay_agent_ip: Ipv4Address::UNSPECIFIED,
-                broadcast: false,
-                requested_ip: None,
-                client_identifier: None,
-                server_identifier: Some(server_ip),
-                parameter_request_list: None,
-                dns_servers: Some(dns),
-                max_size: None,
-                lease_duration: Some(3600),
-                renew_duration: None,
-                rebind_duration: None,
-                additional_options: &[],
-            };
-            st.card_mut(0)
-                .port
-                .deliver(dhcp_frame(server_mac, server_ip, &repr));
-        }
-    })
-}
-
-/// The client's address, transaction and message type, if `f` is a DHCP request.
-fn dhcp_request(f: &[u8]) -> Option<(EthernetAddress, u32, DhcpMessageType)> {
-    let eth = EthernetFrame::new_checked(f).ok()?;
-    if eth.ethertype() != EthernetProtocol::Ipv4 {
-        return None;
-    }
-    let ip = Ipv4Packet::new_checked(eth.payload()).ok()?;
-    if ip.next_header() != IpProtocol::Udp {
-        return None;
-    }
-    let udp = UdpPacket::new_checked(ip.payload()).ok()?;
-    if udp.dst_port() != 67 {
-        return None;
-    }
-    let dhcp = DhcpPacket::new_checked(udp.payload()).ok()?;
-    let repr = DhcpRepr::parse(&dhcp).ok()?;
-    Some((
-        repr.client_hardware_address,
-        repr.transaction_id,
-        repr.message_type,
-    ))
-}
-
-fn dhcp_frame(src_mac: EthernetAddress, src: Ipv4Address, repr: &DhcpRepr<'_>) -> Vec<u8> {
-    let caps = smoltcp::phy::ChecksumCapabilities::default();
-    let dst = Ipv4Address::BROADCAST;
-    let udp = UdpRepr {
-        src_port: 67,
-        dst_port: 68,
-    };
-    let udp_len = 8 + repr.buffer_len();
-    let ip = Ipv4Repr {
-        src_addr: src,
-        dst_addr: dst,
-        next_header: IpProtocol::Udp,
-        payload_len: udp_len,
-        hop_limit: 64,
-    };
-    let eth = EthernetRepr {
-        src_addr: src_mac,
-        dst_addr: EthernetAddress::BROADCAST,
-        ethertype: EthernetProtocol::Ipv4,
-    };
-    let mut buf = vec![0u8; 14 + ip.buffer_len() + udp_len];
-    let mut frame = EthernetFrame::new_unchecked(&mut buf[..]);
-    eth.emit(&mut frame);
-    let mut packet = Ipv4Packet::new_unchecked(frame.payload_mut());
-    ip.emit(&mut packet, &caps);
-    let mut datagram = UdpPacket::new_unchecked(packet.payload_mut());
-    udp.emit(
-        &mut datagram,
-        &src.into(),
-        &dst.into(),
-        repr.buffer_len(),
-        |payload| {
-            let _ = repr.emit(&mut DhcpPacket::new_unchecked(payload));
-        },
-        &caps,
-    );
-    buf
-}
-
 #[test]
 fn kn_t10_a_dhcp_lease_becomes_the_interface_s_address_gateway_and_resolver() {
-    let (mut slots, join) = serve(WAN, &[MAC_A], dhcp_server());
+    let (mut slots, join) = serve(WAN, &[MAC_A], dhcp_server(true));
     let mut c = client(slots.remove("listen").expect("slot"));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let wan = loop {
