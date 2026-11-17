@@ -35,8 +35,15 @@ SERVICES = {"devices": 128 * MIB, "imagefs": 768 * MIB, "linux": 256 * MIB, "net
 # What the engine's account holds beyond its memory and scratch, and admission beyond that.
 ENGINE_OVERHEAD = 128 * MIB
 ADMISSION_OVERHEAD = 128 * MIB
-# Room for the kernel and the boot beside the carved accounts.
+# Room for the node's own processes (init, the drivers) beside the carved accounts.
 BOOT_SLACK = 256 * MIB
+# stream E hook (D's file): what the node's processes get of its memory, the rest the kernel's
+# (its frames' records and tables, about 3.1%) and what the firmware and the boot image hold. A
+# 24 GiB node's console says "kk: memory: 24526286848 bytes for processes, 791171072 kept by the
+# kernel": 95.17%. The carved accounts and BOOT_SLACK fit in that share or the node is refused
+# here; with BOOT_SLACK alone a job of 21.5 GiB with its scratch passed this check on 24 GiB,
+# then no service connected (2026-11-17).
+PROCESS_SHARE = (24526286848, 24 * 1024 * MIB)
 
 
 def round_up(value, unit):
@@ -49,12 +56,15 @@ def sizes(job_memory, scratch, node_memory=None):
     job_memory, scratch = round_up(job_memory, 4096), round_up(scratch, 4096)
     account = job_memory + scratch + ENGINE_OVERHEAD
     admission = account + ADMISSION_OVERHEAD
-    least = round_up(sum(SERVICES.values()) + admission + BOOT_SLACK, 2 * MIB)
+    need = sum(SERVICES.values()) + admission + BOOT_SLACK
+    processes, node = PROCESS_SHARE
+    least = round_up(-(-need * node // processes), 2 * MIB)
     if node_memory is None:
         node_memory = least
     elif node_memory < least:
         raise ValueError(f"a node of {node_memory} bytes cannot hold the job's {job_memory} bytes, "
-                         f"its {scratch} bytes of scratch and the node's services: it needs at least {least}")
+                         f"its {scratch} bytes of scratch and the node's services beside what its "
+                         f"kernel keeps: it needs at least {least} ({least / (1024 * MIB):.2f} GiB)")
     if node_memory % (2 * MIB):
         raise ValueError("the node's memory is whole 2 MiB pages")
     return node_memory, job_memory, account, scratch, admission

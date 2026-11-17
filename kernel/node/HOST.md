@@ -49,7 +49,8 @@ moruna run --vm JOB.json [--image node-image.json] [the options above]
   (`kernel/node/tools/node-for-job.py`): its CPUs the job's, its memory the job's budget, the
   engine's scratch (`--scratch-gib`, 1 GiB by default; the outputs wait there for the output
   disk) and the node's services, or exactly `--memory-gib` when given (a job that does not fit is
-  refused, naming the least it needs).
+  refused, naming the least it needs). The node's processes get about 95% of its memory, the rest
+  being the kernel's: on 24 GiB a job's budget and scratch together may be about 21 GiB.
 - **The node kit** is `--node-kit`, else `MORUNA_NODE_KIT`, else `share/moruna/node-kit` beside
   the executable's `bin`: `kernel/tools/build.sh`'s output, with `kernel/node/tools/node-for-job.py`
   and `configure.py` in its `node/tools/` and `kernel/node/standalone.image` in its `node/`.
