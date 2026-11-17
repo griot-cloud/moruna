@@ -1,0 +1,11 @@
+[package]
+name = "double"
+description = "moruna-function's example: a native function that doubles every Int64 column"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-function.workspace = true
+arrow-array.workspace = true
