@@ -26,7 +26,10 @@ use serde_json::{Map, Value, json};
 /// The report document's schema: `MAJOR.MINOR`. 2: `tasks` holds every figure of a task, and
 /// `stages` is gone.
 /// 2.1 adds `execution_fingerprint`, and `job_digest` is the public document digest from every
-/// interface. 3 (0.7): a sink's `excluded_rows` is gone, with the peQL sink that set it.
+/// interface. 3 (0.7): a sink's `excluded_rows` is gone, with the peQL sink that set it; `io`
+/// gives each source's reads apart from its decodes and each sink's encodes apart from its
+/// writes, and a source's or a sink's task carries its own (`read_ms`, `decode_ms`, `encode_ms`,
+/// `write_ms`; a half done in the same call is absent).
 pub const SCHEMA_VERSION: &str = "3.0";
 
 /// The public digest of a job document (0.6.6): `sha256:` and the hex of SHA-256 over its exact
@@ -727,6 +730,14 @@ fn tasks(
                     put(&mut entry, "bytes_out", bytes);
                     ran = true;
                 }
+                let io = context.parts.sources.iter().position(|&t| t == i);
+                if let Some(io) = io.and_then(|n| report.io.sources.get(n)) {
+                    put(&mut entry, "reads", io.reads);
+                    put(&mut entry, "read_ms", io.read_s * 1e3);
+                    if let Some(decode) = io.decode_s {
+                        put(&mut entry, "decode_ms", decode * 1e3);
+                    }
+                }
             }
             Role::Kernel => {
                 if let Some((stage, members, found)) = stage_of(report, context, i) {
@@ -751,6 +762,14 @@ fn tasks(
                     put(&mut entry, "rows_in", s.rows);
                     put(&mut entry, "bytes_in", s.bytes);
                     ran = true;
+                }
+                let io = context.parts.sinks.iter().position(|&t| t == i);
+                if let Some(io) = io.and_then(|n| report.io.sinks.get(n)) {
+                    put(&mut entry, "writes", io.writes);
+                    if let Some(encode) = io.encode_s {
+                        put(&mut entry, "encode_ms", encode * 1e3);
+                    }
+                    put(&mut entry, "write_ms", io.write_s * 1e3);
                 }
             }
         }
@@ -958,6 +977,7 @@ mod tests {
             sinks: Vec::new(),
             buffers: None,
             policy: None,
+            io: Default::default(),
             part_digests: moruna_trace::PartDigests {
                 source_schemas: vec![Some([1; 32])],
                 stage_schemas: (0..stages).map(|_| Some([2; 32])).collect(),
@@ -1146,6 +1166,60 @@ mod tests {
     /// An image task's key names its build key, so two runs of the same code are one key
     /// whatever image digest each built; with a store configured its recommendation draws on
     /// every run the store holds of the key, and says how many.
+    /// The gate's split: a source's task carries its reads apart from its decodes and a sink's its
+    /// encodes apart from its writes, in milliseconds, a half done in the same call absent; the
+    /// run's `io` carries them all.
+    #[test]
+    fn a_source_and_a_sink_carry_their_reads_decodes_encodes_and_writes() {
+        let mut r = report(1, 0);
+        r.io = moruna_trace::IoReport {
+            sources: vec![moruna_trace::SourceIo {
+                reads: 8,
+                read_s: 1.5,
+                decode_s: Some(2.5),
+            }],
+            sinks: vec![
+                moruna_trace::SinkIo {
+                    writes: 8,
+                    encode_s: Some(0.25),
+                    write_s: 0.5,
+                },
+                moruna_trace::SinkIo {
+                    writes: 3,
+                    encode_s: None,
+                    write_s: 0.125,
+                },
+            ],
+        };
+        let value = doc(&r, None, &context());
+        let task = |key: &str| {
+            value["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["key"] == key)
+                .unwrap()
+                .clone()
+        };
+        let rows = task("rows");
+        assert_eq!(
+            (rows["reads"].clone(), rows["read_ms"].clone()),
+            (json!(8), json!(1500.0))
+        );
+        assert_eq!(rows["decode_ms"], json!(2500.0));
+        let out = task("out");
+        assert_eq!(out["encode_ms"], json!(250.0));
+        assert_eq!(out["write_ms"], json!(500.0));
+        let copy = task("copy");
+        assert_eq!(copy["writes"], json!(3));
+        assert!(copy.get("encode_ms").is_none(), "{copy}");
+        assert_eq!(copy["write_ms"], json!(125.0));
+        assert!(task("shout").get("read_ms").is_none());
+        assert_eq!(value["io"]["sources"][0]["decode_ms"], json!(2500.0));
+        assert!(value["io"]["sinks"][1].get("encode_s").is_none());
+        assert!(value["io"]["sinks"][1].get("encode_ms").is_none());
+    }
+
     #[test]
     fn an_image_task_is_keyed_by_its_build_key_and_learns_across_runs() {
         use moruna_cost::{Inputs, Observation, ObservationSource, ObservationStore, Origin};

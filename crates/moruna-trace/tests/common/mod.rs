@@ -145,6 +145,7 @@ pub fn meta(exit: ExitReason) -> RunMeta {
         process_usage: moruna_kernel::ProcessUsage::default(),
         buffers: None,
         policy: None,
+        io: Default::default(),
     }
 }
 

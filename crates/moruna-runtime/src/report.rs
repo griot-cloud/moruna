@@ -87,6 +87,8 @@ pub struct MetaInput {
     pub buffers: Option<moruna_trace::BufferReport>,
     /// What the scheduling policy decided, when the scheduler started (10 f.3).
     pub policy: Option<moruna_trace::PolicyReport>,
+    /// Where the sources' and the sinks' time went (the gate's split).
+    pub io: moruna_trace::IoReport,
 }
 
 /// Build the `RunMeta` of 04 d.1 from what the run gathered (12 f.2).
@@ -125,6 +127,32 @@ pub fn meta(input: MetaInput) -> RunMeta {
         sinks: input.sinks,
         buffers: input.buffers,
         policy: input.policy,
+        io: input.io,
+    }
+}
+
+/// The scheduler's times of each source and sink, in seconds, as the report gives them.
+pub fn io_report(times: &moruna_scheduler::IoTimes) -> moruna_trace::IoReport {
+    let s = |ns: u64| ns as f64 / 1e9;
+    moruna_trace::IoReport {
+        sources: times
+            .sources
+            .iter()
+            .map(|t| moruna_trace::SourceIo {
+                reads: t.operations,
+                read_s: s(t.io_ns),
+                decode_s: t.codec_ns.map(s),
+            })
+            .collect(),
+        sinks: times
+            .sinks
+            .iter()
+            .map(|t| moruna_trace::SinkIo {
+                writes: t.operations,
+                encode_s: t.codec_ns.map(s),
+                write_s: s(t.io_ns),
+            })
+            .collect(),
     }
 }
 
@@ -205,6 +233,7 @@ mod tests {
             process_usage: moruna_kernel::ProcessUsage::default(),
             sinks: Vec::new(),
             policy: None,
+            io: Default::default(),
             buffers: Some(moruna_trace::BufferReport::of(
                 "known_future",
                 &moruna_kernel::CatalogStats {
@@ -249,10 +278,48 @@ mod tests {
             sinks: Vec::new(),
             buffers: None,
             policy: None,
+            io: Default::default(),
         });
         assert_eq!(meta.sizer, "rule");
         assert!(meta.bottleneck_timeline.is_empty());
         assert!(meta.resumed);
         assert!(now_ns() > 0);
+    }
+
+    #[test]
+    fn the_schedulers_times_are_the_reports_seconds() {
+        let times = moruna_scheduler::IoTimes {
+            sources: vec![moruna_scheduler::EndTimes {
+                operations: 4,
+                io_ns: 1_500_000_000,
+                codec_ns: Some(500_000_000),
+            }],
+            sinks: vec![moruna_scheduler::EndTimes {
+                operations: 2,
+                io_ns: 250_000_000,
+                codec_ns: None,
+            }],
+        };
+        let io = io_report(&times);
+        assert_eq!(
+            io.sources,
+            vec![moruna_trace::SourceIo {
+                reads: 4,
+                read_s: 1.5,
+                decode_s: Some(0.5)
+            }]
+        );
+        assert_eq!(
+            io.sinks,
+            vec![moruna_trace::SinkIo {
+                writes: 2,
+                encode_s: None,
+                write_s: 0.25
+            }]
+        );
+        assert_eq!(
+            io_report(&Default::default()),
+            moruna_trace::IoReport::default()
+        );
     }
 }

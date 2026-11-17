@@ -39,6 +39,7 @@ mod decide;
 mod decode_ratio;
 mod heartbeat;
 mod instances;
+mod io_times;
 mod knobs;
 mod learning;
 mod lifecycle;
@@ -58,6 +59,7 @@ mod wall;
 mod worker;
 
 pub use decide::{Clock, DISK_BYTES_PER_SECOND, SystemClock};
+pub use io_times::{EndTimes, IoTimes};
 pub use pipeline::{Pipeline, SchedulerConfig, WorkerStart, validate_graph};
 
 use shared::Shared;
@@ -263,6 +265,25 @@ impl Scheduler {
     /// The node this run reads on; `LOCAL_NODE` in v1 (d.1).
     pub fn node(&self) -> NodeId {
         self.shared.cfg.node
+    }
+
+    /// Where each source's and each sink's time went so far: reads apart from decodes, encodes
+    /// apart from writes (the gate's split, `arrow-core-0.7.md` §9).
+    pub fn io_times(&self) -> IoTimes {
+        IoTimes {
+            sources: self
+                .shared
+                .sources
+                .iter()
+                .map(|end| end.out.times.snapshot())
+                .collect(),
+            sinks: self
+                .shared
+                .sinks
+                .iter()
+                .map(|end| end.input.times.snapshot())
+                .collect(),
+        }
     }
 
     /// True when the run may write manifests: `checkpoint.enabled` and neither a non-resumable

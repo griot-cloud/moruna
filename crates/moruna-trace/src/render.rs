@@ -145,6 +145,40 @@ impl fmt::Display for RunReport {
             self.io_paths.pinned,
             self.io_paths.rdma
         )?;
+        for (i, s) in self.io.sources.iter().enumerate() {
+            match s.decode_s {
+                Some(decode) => writeln!(
+                    f,
+                    "source {i}: {} reads, read {} s, decode {} s",
+                    s.reads,
+                    sig3(s.read_s),
+                    sig3(decode)
+                )?,
+                None => writeln!(
+                    f,
+                    "source {i}: {} reads, read and decode {} s in one call",
+                    s.reads,
+                    sig3(s.read_s)
+                )?,
+            }
+        }
+        for (i, s) in self.io.sinks.iter().enumerate() {
+            match s.encode_s {
+                Some(encode) => writeln!(
+                    f,
+                    "sink {i}: {} writes, encode {} s, write {} s",
+                    s.writes,
+                    sig3(encode),
+                    sig3(s.write_s)
+                )?,
+                None => writeln!(
+                    f,
+                    "sink {i}: {} writes, encode and write {} s in one call",
+                    s.writes,
+                    sig3(s.write_s)
+                )?,
+            }
+        }
         writeln!(
             f,
             "staging: {}, written {}, staging bandwidth {} beside source bandwidth {}",

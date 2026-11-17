@@ -1050,6 +1050,13 @@ fn drive(
             &moruna_kernel::StatsSource::scheduler_stats(scheduler.as_ref()).policy,
         )
     });
+    // The gate's split: each source's reads apart from its decodes, each sink's encodes apart
+    // from its writes, read before the scheduler is unwound.
+    let io = started
+        .scheduler
+        .as_ref()
+        .map(|scheduler| report::io_report(&scheduler.io_times()))
+        .unwrap_or_default();
     let summary = started
         .controller
         .take()
@@ -1118,6 +1125,7 @@ fn drive(
         buffers: engine.as_ref().map(|engine| {
             moruna_trace::BufferReport::of(engine.eviction_order(), &engine.catalog_stats())
         }),
+        io,
     });
     let view = view.ok_or_else(|| {
         RunError::bare(MorunaError::Io {

@@ -9,6 +9,7 @@ pub(crate) mod common;
 mod sc_behaviour;
 
 mod sc_cpu_limit;
+mod sc_io_times;
 mod sc_t10_probe_protocol;
 mod sc_t11_cancel;
 mod sc_t12_utilisation;
