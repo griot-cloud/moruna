@@ -17,21 +17,13 @@
 //!   pager too, and answer `Fault` on a refusal.
 //! - **The entry (§4.1 a).** A process with a personality region runs a program of a few
 //!   instructions: its system call enters the personality, which answers it and returns
-//!   through the entry; a native call on the core's list is the core's; the program's FS
-//!   base is its own;
+//!   through the entry; a native call number enters too; the program's FS base is its own;
 //!   a read of the region faults into the personality, as does an invalid opcode; a thread
 //!   spinning in the program is interrupted into its personality. The personality's
 //!   fault-tolerant copy resumes at its recovery address on a fault, with the address.
 //!   A page protected and one unmapped inside a 2 MiB region the program's table holds,
 //!   off its start, and two pages across its end, each answer; a call given the unmapped
 //!   page answers fault; the program runs on.
-//! - **A program's native calls.** A program's native call not on the core's list enters its
-//!   personality, which refuses it; a value of the personality's table names nothing for it; an object
-//!   its personality moved into its table maps, and a batch of its plane arrives, in the range
-//!   its personality reserved; a slot it makes is in its table, not the personality's; handle
-//!   0 for its process is refused; it can neither unmap the region nor have a call write
-//!   there; a fork's program starts with no handles. A reserved range inside the region is
-//!   refused.
 //! - **Shared futexes.** A thread of another process wakes a waiter on a word of a shared
 //!   object, mapped at another address.
 //! - **A shared handle table.** A personality process's clone with `SHARE_HANDLES` uses its
@@ -51,7 +43,6 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use moruna_abi::nr;
 use moruna_kb1_programs::{console, ms, slot};
 use moruna_sys::{
     Account, Channel, Console, Error, Handle, Memory, PAGE_SIZE, Process, Rights, Signals, Thread,
@@ -59,7 +50,6 @@ use moruna_sys::{
     personality::{
         self, Frame, Register, pager_request, personality_return, personality_set, thread_interrupt,
     },
-    plane::{self, Slot},
     println, start, thread_exit, wait_one,
 };
 
@@ -78,8 +68,8 @@ const ZERO: u64 = 0x0900_0000_0000;
 /// A shared object's mapping in the clone test's source.
 const SHARED: u64 = 0x0900_0010_0000;
 
-/// The program: a call (`rax` 1), a native call on the list (`abi_version`), its FS base
-/// read, a read of `rbx` (in the region), an invalid opcode, and a loop.
+/// The program: a call (`rax` 1), a native number (`abi_version`), its FS base read, a read
+/// of `rbx` (in the region), an invalid opcode, and a loop.
 const PROGRAM: [u8; 24] = [
     0x0f, 0x05, // 0: syscall
     0x48, 0x89, 0xc7, // 2: mov rdi, rax
@@ -91,6 +81,7 @@ const PROGRAM: [u8; 24] = [
     0xeb, 0xfe, // 22: jmp 22
 ];
 const AFTER_FIRST: u64 = CODE + 2;
+const AFTER_SECOND: u64 = CODE + 12;
 const READ_REGION: u64 = CODE + 17;
 const UD2: u64 = CODE + 20;
 const LOOP: u64 = CODE + 22;
@@ -163,7 +154,7 @@ fn run() -> i64 {
                 &out,
                 "entry",
                 r,
-                "a call entered the personality and returned through the entry, a native call on the list was the core's, the FS base was the program's, a read of the region and an invalid opcode faulted into it, and a spinning program was interrupted into it",
+                "a call entered the personality and returned through the entry, a native number entered too, the FS base was the program's, a read of the region and an invalid opcode faulted into it, and a spinning program was interrupted into it",
             );
             code | report(
                 &out,
@@ -211,15 +202,6 @@ fn run() -> i64 {
             )
         }
         "b1-task" => task_child(&out),
-        "b1-native" => {
-            let r = native_child(&out);
-            report(
-                &out,
-                "native",
-                r,
-                "a program's native calls not on the list entered its personality, a guessed handle of the personality's named nothing, the granted object mapped and a batch came in the reserved range, a slot it made was its own, handle 0 for its process was refused, the region was out of its reach, and a fork's program had no handles",
-            )
-        }
         "b1-victim" => {
             let pager = Memory(slot("pager"));
             let m = match pager.map(0, 2 * PAGE, 0) {
@@ -305,12 +287,6 @@ fn tester(out: &Console) -> i64 {
         "futex",
         futex(out, &resource, &image),
         "a waiter on a shared object's word was woken by another process",
-    );
-    code |= report(
-        out,
-        "native run",
-        native(out, &resource, &image),
-        "the native child ended",
     );
     // Last: the task takes the process resource with it.
     code |= report(
@@ -809,10 +785,10 @@ fn entry(out: &Console, resource: &Handle, image: &Handle) -> Outcome {
         "mapping the program's stack",
     )?;
     call(
-        personality_set(&child, MAP_BASE, REGION_LEN, 0..0),
+        personality_set(&child, MAP_BASE, REGION_LEN),
         "personality_set",
     )?;
-    match personality_set(&child, MAP_BASE, REGION_LEN, 0..0) {
+    match personality_set(&child, MAP_BASE, REGION_LEN) {
         Err(Error::BadState) => {}
         _ => return Err(("a second personality_set was taken", None)),
     }
@@ -876,16 +852,19 @@ fn entry_child() -> Outcome {
     )?;
     f.set_register(Register::Rax, 42);
 
-    // The native call on the list (`abi_version`) is the core's: the program goes on to
-    // read the region.
     let r = call(personality_return(&mut f), "the second personality_return")?;
+    want(r == reason::SYSCALL, "the native number did not enter")?;
+    want(
+        f.register(Register::Rax) == 0x1_0000 && f.register(Register::Rdi) == 42,
+        "the answer did not reach the program, or the native number reached the kernel",
+    )?;
+    want(f.rip() == AFTER_SECOND, "the second call's frame is wrong")?;
+    f.set_register(Register::Rax, 0);
+
+    let r = call(personality_return(&mut f), "the third personality_return")?;
     want(
         r == reason::PAGE_FAULT,
         "a read of the region did not fault into the personality",
-    )?;
-    want(
-        f.register(Register::Rax) == moruna_abi::ABI_VERSION && f.register(Register::Rdi) == 42,
-        "the answer did not reach the program, or the core did not answer its native call",
     )?;
     want(
         f.fault_address() == inside && f.vector() == 14 && f.rip() == READ_REGION,
@@ -897,7 +876,7 @@ fn entry_child() -> Outcome {
     )?;
     f.set_rip(UD2);
 
-    let r = call(personality_return(&mut f), "the third personality_return")?;
+    let r = call(personality_return(&mut f), "the fourth personality_return")?;
     want(
         r == reason::EXCEPTION && f.vector() == 6 && f.rip() == UD2,
         "an invalid opcode did not enter as an exception",
@@ -922,12 +901,7 @@ fn entry_child() -> Outcome {
 
 /// A native call with raw arguments, for a pointer no wrapper passes.
 fn raw_call(n: u64, a: [u64; 5]) -> u64 {
-    raw_call2(n, a).0
-}
-
-/// As [`raw_call`], with `rdx` too.
-fn raw_call2(n: u64, a: [u64; 5]) -> (u64, u64) {
-    let (rax, rdx): (u64, u64);
+    let rax: u64;
     // SAFETY: the kernel reads through the pointers it is given, answering `Fault` for a
     // page that is not mapped, and changes only rax, rdx, rcx and r11.
     unsafe {
@@ -936,7 +910,7 @@ fn raw_call2(n: u64, a: [u64; 5]) -> (u64, u64) {
             inlateout("rax") n => rax,
             in("rdi") a[0],
             in("rsi") a[1],
-            inlateout("rdx") a[2] => rdx,
+            inlateout("rdx") a[2] => _,
             in("r10") a[3],
             in("r8") a[4],
             lateout("rcx") _,
@@ -944,7 +918,7 @@ fn raw_call2(n: u64, a: [u64; 5]) -> (u64, u64) {
             options(nostack),
         );
     }
-    (rax, rdx)
+    rax
 }
 
 /// Two pages across the end of the 2 MiB region the program's code and stack lie in.
@@ -997,284 +971,6 @@ fn protect_inside() -> Outcome {
     )
 }
 
-// ---- A program's native calls.
-
-/// The native child's program stack, below the region; the range its personality reserves
-/// for what the core maps for its program, above the region, as stream B2's does
-/// (`linuxlayer_launch::NATIVE`); the first word of the batch on its slot 0.
-const NATIVE_STACK: u64 = CODE + 0x40_0000;
-const NATIVE_STACK_LEN: u64 = 16 * PAGE;
-const RESERVED: u64 = 0x7000_0000_0000;
-const RESERVED_LEN: u64 = 0x0f00_0000_0000;
-const BATCH_WORD: u64 = 0x3130_2068_6374_6162;
-
-/// What the personality hands its program: the granted object's value in the program's
-/// table, and a value of its own table for the program to guess.
-static N_GRANTED: AtomicU64 = AtomicU64::new(0);
-static N_GUESS: AtomicU64 = AtomicU64::new(0);
-/// What the program found, by step.
-static N_FOUND: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
-/// The word the fork reports on, in an object the fork shares.
-static FORK_REPORT: AtomicU64 = AtomicU64::new(0);
-
-fn tester_reserved() -> core::ops::Range<u64> {
-    RESERVED..RESERVED + RESERVED_LEN
-}
-
-/// The native child, made with a reserved range, a program stack, one batch on its plane's
-/// slot 0, a memory object to grant its program, and a process resource to fork with.
-fn native(out: &Console, resource: &Handle, image: &Handle) -> Outcome {
-    let child = call(Process::create(resource, "b1-native"), "process_create")?;
-    let entry = call(child.map_image(image), "process_map_image")?;
-    call(
-        child.map(
-            None,
-            0,
-            NATIVE_STACK_LEN,
-            NATIVE_STACK,
-            map::READ | map::WRITE,
-        ),
-        "mapping the program's stack",
-    )?;
-    match personality_set(
-        &child,
-        MAP_BASE,
-        REGION_LEN,
-        MAP_BASE + PAGE..MAP_BASE + 2 * PAGE,
-    ) {
-        Err(Error::InvalidArgs) => {}
-        _ => return Err(("a reserved range inside the region was taken", None)),
-    }
-    call(
-        personality_set(&child, MAP_BASE, REGION_LEN, tester_reserved()),
-        "personality_set",
-    )?;
-    let input = call(Slot::create(false), "slot_create")?;
-    let batch = call(Memory::create(PAGE), "the batch")?;
-    {
-        let m = call(batch.map(0, PAGE, map::WRITE), "mapping the batch")?;
-        call(m.write(0, &BATCH_WORD.to_le_bytes()), "writing the batch")?;
-    }
-    if let Err((e, _)) = input.push(batch, 0, PAGE, 1) {
-        return Err(("slot_push", Some(e)));
-    }
-    if let Err((e, _)) = plane::attach(&child, &[&input], None) {
-        return Err(("process_plane", Some(e)));
-    }
-    let granted = call(Memory::create(PAGE), "the granted object")?;
-    let forks = call(
-        resource.duplicate(Rights::WRITE | Rights::TRANSFER),
-        "duplicating the process resource",
-    )?;
-    let console = call(console_for(out), "duplicating the console")?;
-    call(
-        child.start_with(
-            entry,
-            &mut [
-                (Some(console), "console"),
-                (Some(granted.0), "granted"),
-                (Some(forks), "resource"),
-            ],
-        ),
-        "process_start",
-    )?;
-    call(
-        wait_one(&child.0, Signals::TERMINATED, now() + ms(20_000)),
-        "the native child did not end",
-    )?;
-    drop(input);
-    Ok(())
-}
-
-/// The native child's personality: grants its program one object, runs it, and judges what
-/// it found; then forks.
-fn native_child(out: &Console) -> Outcome {
-    use moruna_abi::personality::reason;
-    let granted = slot("granted");
-    let g = personality::program_handle(granted).map_err(|(e, _)| ("program_handle", Some(e)))?;
-    N_GRANTED.store(g as u64, Ordering::Release);
-    N_GUESS.store(out.0.raw() as u64, Ordering::Release);
-    let mut f = program_frame(
-        native_program as *const () as u64,
-        NATIVE_STACK + NATIVE_STACK_LEN - 8,
-    );
-    // A native call not on the list enters, as a Linux call does: refused here.
-    let mut entered = [0u64; 4];
-    let mut count = 0;
-    let r = loop {
-        let r = call(personality_return(&mut f), "running the program")?;
-        let number = f.register(Register::Rax);
-        if r != reason::SYSCALL || !nr::is_native(number) {
-            break r;
-        }
-        if let Some(slot) = entered.get_mut(count) {
-            *slot = number;
-        }
-        count += 1;
-        f.set_register(Register::Rax, Error::BadSyscall.to_raw());
-    };
-    want(
-        r == reason::SYSCALL && f.register(Register::Rax) == 60,
-        "the program did not end with its exit call",
-    )?;
-    want(
-        count == 2 && entered[..2] == [nr::TIMER_CREATE, nr::WINDOWS_PROTECT],
-        "a native call not on the list did not enter the personality",
-    )?;
-    let found = |i: usize| N_FOUND[i].load(Ordering::Acquire);
-    let error = |i: usize| Error::from_raw(found(i)).err();
-    let reserved = tester_reserved();
-    want(
-        error(0) == Some(Error::BadSyscall),
-        "the personality's refusal did not reach the program",
-    )?;
-    want(
-        error(1) == Some(Error::BadHandle),
-        "a guessed value of the personality's table named a handle for the program",
-    )?;
-    want(
-        reserved.contains(&found(2)) && found(3) == 0x5a,
-        "the granted object was not mapped in the reserved range",
-    )?;
-    want(
-        error(4).is_none() && error(5).is_none(),
-        "a slot the program made did not land in its table",
-    )?;
-    want(
-        matches!(moruna_sys::info(found(4) as u32), Err(Error::BadHandle)),
-        "a slot the program made landed in the personality's table",
-    )?;
-    want(
-        reserved.contains(&found(6)) && found(7) == BATCH_WORD,
-        "the batch was not mapped in the reserved range",
-    )?;
-    want(
-        error(8) == Some(Error::BadSyscall),
-        "windows_protect on handle 0, the program's own process, was not refused",
-    )?;
-    want(
-        error(9) == Some(Error::AccessDenied),
-        "the program unmapped the personality's region",
-    )?;
-    want(
-        error(10) == Some(Error::Fault),
-        "a call wrote the personality's region for the program",
-    )?;
-    native_fork()
-}
-
-/// The native child's program: Rust in the image, on its stack below the region. It ends
-/// with Linux's `exit`, which enters the personality.
-extern "C" fn native_program() -> ! {
-    let found = |i: usize, v: u64| N_FOUND[i].store(v, Ordering::Release);
-    let reserved = tester_reserved();
-    found(0, raw_call(nr::TIMER_CREATE, [0; 5]));
-    found(
-        1,
-        raw_call(
-            nr::HANDLE_INFO,
-            [N_GUESS.load(Ordering::Acquire), 0, 0, 0, 0],
-        ),
-    );
-    let granted = N_GRANTED.load(Ordering::Acquire);
-    let at = raw_call(
-        nr::MEMORY_MAP,
-        [granted, 0, PAGE, map::READ | map::WRITE, 0],
-    );
-    found(2, at);
-    if reserved.contains(&at) {
-        // SAFETY: the core has just mapped this page writable for the program.
-        unsafe {
-            (at as *mut u8).write_volatile(0x5a);
-            found(3, (at as *const u8).read_volatile() as u64);
-        }
-    }
-    let input = moruna_abi::plane::slot_flags::INPUT;
-    let slot = raw_call(nr::SLOT_CREATE, [input, 0, 0, 0, 0]);
-    found(4, slot);
-    found(5, raw_call(nr::HANDLE_INFO, [slot, 0, 0, 0, 0]));
-    let (batch, _) = raw_call2(nr::BATCH_GET, [0; 5]);
-    found(6, batch);
-    if reserved.contains(&batch) {
-        // SAFETY: the core has just mapped the batch read only for the program.
-        found(7, unsafe { (batch as *const u64).read_volatile() });
-    }
-    let ranges = [[batch, PAGE]];
-    let windows = [0, ranges.as_ptr() as u64, 1, map::READ, 0];
-    found(8, raw_call(nr::WINDOWS_PROTECT, windows));
-    found(9, raw_call(nr::MEMORY_UNMAP, [MAP_BASE, PAGE, 0, 0, 0]));
-    found(10, raw_call(nr::ACCOUNT_INFO, [0, MAP_BASE, 0, 0, 0]));
-    linux_exit(0)
-}
-
-/// Linux's `exit`, from a program: it enters the personality, which does not return to it.
-fn linux_exit(code: u64) -> ! {
-    // SAFETY: the call enters the personality and never comes back here.
-    unsafe {
-        core::arch::asm!("syscall", in("rax") 60u64, in("rdi") code, options(noreturn));
-    }
-}
-
-fn fork_word() -> &'static AtomicU64 {
-    // SAFETY: the report object is a page mapped before the fork and never unmapped while
-    // either process lives; its first word is only accessed as an atomic.
-    unsafe { &*(FORK_REPORT.load(Ordering::Acquire) as *const AtomicU64) }
-}
-
-/// A fork's program table starts empty: the parent's granted value names nothing there.
-fn native_fork() -> Outcome {
-    let resource = slot("resource");
-    let report = call(Memory::create(PAGE), "the fork's report")?;
-    let m = call(
-        report.map_detached(0, PAGE, map::WRITE),
-        "mapping the fork's report",
-    )?;
-    FORK_REPORT.store(m.addr(), Ordering::Release);
-    core::mem::forget(m);
-    fork_word().store(u64::MAX, Ordering::Release);
-    let fork = call(
-        personality::process_clone(&resource, None, None, 0),
-        "process_clone",
-    )?;
-    let stack = call(
-        fork.map(None, 0, 16 * PAGE, 0, map::READ | map::WRITE),
-        "mapping the fork's stack",
-    )?;
-    call(
-        fork.launch(fork_entry as *const () as u64, stack + 16 * PAGE - 8, 0),
-        "process_launch of the fork",
-    )?;
-    call(
-        wait_one(&fork.0, Signals::TERMINATED, now() + ms(10_000)),
-        "the fork did not end",
-    )?;
-    want(
-        Error::from_raw(fork_word().load(Ordering::Acquire)).err() == Some(Error::BadHandle),
-        "a fork's program held its parent's program handles",
-    )
-}
-
-/// The fork's first thread, in its personality: runs its program and reports its answer.
-extern "C" fn fork_entry(_: u64) -> ! {
-    let mut f = program_frame(
-        fork_program as *const () as u64,
-        NATIVE_STACK + NATIVE_STACK_LEN - 8,
-    );
-    let syscall = moruna_abi::personality::reason::SYSCALL;
-    if personality_return(&mut f) == Ok(syscall) {
-        fork_word().store(f.register(Register::Rdi), Ordering::Release);
-    }
-    moruna_sys::exit(0)
-}
-
-/// The fork's program: asks for the value its parent's program was granted.
-extern "C" fn fork_program() -> ! {
-    linux_exit(raw_call(
-        nr::HANDLE_INFO,
-        [N_GRANTED.load(Ordering::Acquire), 0, 0, 0, 0],
-    ))
-}
-
 // ---- The fault-tolerant copy.
 
 fn copy_run(out: &Console, resource: &Handle, image: &Handle) -> Outcome {
@@ -1288,7 +984,6 @@ fn copy_run(out: &Console, resource: &Handle, image: &Handle) -> Outcome {
             &child,
             PAGE,
             MAP_BASE + REGION_LEN - PAGE,
-            0..0,
             routine,
             recovery,
         ),
@@ -1804,10 +1499,7 @@ fn task(out: &Console, resource: Handle, image: &Handle) -> Outcome {
         "process_create",
     )?;
     let entry = call(t.map_image(image), "process_map_image")?;
-    call(
-        personality_set(&t, MAP_BASE, REGION_LEN, 0..0),
-        "personality_set",
-    )?;
+    call(personality_set(&t, MAP_BASE, REGION_LEN), "personality_set")?;
     let (mine, theirs) = call(Channel::create(), "channel_create")?;
     let console = call(console_for(out), "duplicating the console")?;
     call(

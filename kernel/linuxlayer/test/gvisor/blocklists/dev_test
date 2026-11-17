@@ -1,3 +1,0 @@
-# TODO: Support `/dev/fuse`
-DevTest.OpenDevFuse
-DevTest.ReadDevFuseWithoutMount

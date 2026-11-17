@@ -185,11 +185,7 @@ pub mod nr {
     pub const WINDOWS_PROTECT: u64 = BASE + 55;
     // Stream B1, the user-space personality's mechanisms (kernel-is-the-machine §4.1).
     // Their arguments are stream B1's to fix in `moruna-sys`'s `personality` module.
-    /// Registers a process's personality region and its entry (§4.1 a):
-    /// `(process, base, len, reserved_base, reserved_len, copy)`: the region; the range
-    /// the core places the mappings of its program's native calls in (none when its
-    /// length is zero), apart from the region; and the fault-tolerant copy routine, a
-    /// [`crate::personality::copy`] record at `copy` (none when zero).
+    /// Registers a process's personality region and its entry (§4.1 a).
     pub const PERSONALITY_SET: u64 = BASE + 56;
     /// Returns from the personality's entry to the program, with the frame's registers.
     pub const PERSONALITY_RETURN: u64 = BASE + 57;
@@ -209,11 +205,8 @@ pub mod nr {
     pub const THREAD_STATE_WRITE: u64 = BASE + 63;
     /// Interrupts a thread asleep in the core: its wait returns `Interrupted` (§4.1 d).
     pub const THREAD_INTERRUPT: u64 = BASE + 64;
-    /// Moves a handle from the personality's table into its program's, where the
-    /// program's native calls resolve: `(handle) -> value`, from the personality.
-    pub const PROGRAM_HANDLE: u64 = BASE + 65;
     /// One past the highest call of the table.
-    pub const COUNT: u64 = 66;
+    pub const COUNT: u64 = 65;
     /// The data plane's calls (SDD 29): native numbers a task makes on its own plane,
     /// or a personality server on a task's. The rest of the range is reserved.
     pub const DATA_PLANE: core::ops::Range<u64> = BASE + 0x100..BASE + 0x110;
@@ -804,15 +797,6 @@ pub mod personality {
     /// The frame's length.
     pub const LEN: usize = FAULT_ADDRESS + 8;
 
-    /// The fault-tolerant copy routine `personality_set` takes: a fault at an instruction
-    /// in `START .. END` resumes at `RECOVERY`.
-    pub mod copy {
-        pub const START: usize = 0;
-        pub const END: usize = 8;
-        pub const RECOVERY: usize = 16;
-        pub const LEN: usize = 24;
-    }
-
     /// Why the personality was entered.
     pub mod reason {
         /// A system call: its number in `rax`, its arguments in Linux's registers.
@@ -1299,9 +1283,7 @@ mod tests {
         assert!(!valid_name(b"Upper"));
         assert!(!valid_name(&[b'a'; 33]));
         assert_eq!(ABI_VERSION, 0x2_0006);
-        assert_eq!(nr::PROGRAM_HANDLE, nr::THREAD_INTERRUPT + 1);
-        assert_eq!(nr::PROGRAM_HANDLE + 1, nr::BASE + nr::COUNT);
-        assert_eq!(personality::copy::LEN, 3 * 8);
+        assert_eq!(nr::THREAD_INTERRUPT + 1, nr::BASE + nr::COUNT);
         assert_eq!(nr::THREAD_SET_CPU, nr::ACCOUNT_MATCHES + 1);
         assert_eq!(nr::PERSONALITY_SET, nr::WINDOWS_PROTECT + 1);
         assert!(nr::is_native(nr::THREAD_SET_CPU) && nr::is_native(nr::THREAD_INTERRUPT));

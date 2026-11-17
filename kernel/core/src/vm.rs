@@ -337,7 +337,6 @@ impl Space {
     /// by `memory`; `BadState` when no such area is there.
     pub fn unmap_plane(&self, va: u64, len: u64, memory: &Arc<MemoryObject>) -> Result<(), Error> {
         let end = Space::check_range(va, len)?;
-        self.outside_region(va, end)?;
         let removed = {
             let mut inner = self.inner.lock();
             // stream A hook: `windows_protect`'s slot form may have split the area.
@@ -488,11 +487,11 @@ impl Space {
             .is_some_and(|(_, a)| a.end > va)
     }
 
-    /// A free range of `len` bytes in `place` (the kernel's mapping area, or a program's
-    /// reserved range), with an unmapped guard page on each side, first fit.
-    fn find_free(inner: &Inner, len: u64, place: &Range<u64>) -> Result<u64, Error> {
-        let mut candidate = place.start + PAGE_SIZE;
-        for (&start, area) in inner.areas.range(Space::first_in(inner, place.start)..) {
+    /// A free range of `len` bytes in the kernel's mapping area, with an unmapped
+    /// guard page on each side, first fit.
+    fn find_free(inner: &Inner, len: u64) -> Result<u64, Error> {
+        let mut candidate = MAP_BASE + PAGE_SIZE;
+        for (&start, area) in inner.areas.range(MAP_BASE..) {
             let fits = candidate
                 .checked_add(len)
                 .and_then(|e| e.checked_add(PAGE_SIZE))
@@ -503,15 +502,10 @@ impl Space {
             candidate = candidate.max(area.end + PAGE_SIZE);
         }
         let end = candidate.checked_add(len).ok_or(Error::Limit)?;
-        if end > place.end {
+        if end > map_end() {
             return Err(Error::Limit);
         }
         Ok(candidate)
-    }
-
-    /// Where a search from `at` begins: the start of the area holding `at`, if one does.
-    fn first_in(inner: &Inner, at: u64) -> u64 {
-        Space::area_at(inner, at).map_or(at, |(start, _)| start)
     }
 
     fn check_range(va: u64, len: u64) -> Result<u64, Error> {
@@ -564,14 +558,10 @@ impl Space {
         if len == 0 {
             return Err(Error::InvalidArgs);
         }
-        // Stream B1 hook: a program's call places in its reserved range, and never in the
-        // personality's region.
-        let place = self.place();
         let mut inner = self.inner.lock();
         let va = match at {
             Some(va) => {
                 let end = Space::check_range(va, len)?;
-                self.outside_region(va, end)?;
                 if Space::overlaps(&inner, va, end) {
                     if !fixed {
                         return Err(Error::BadState);
@@ -586,9 +576,9 @@ impl Space {
                 va
             }
             None if options & map::HUGE != 0 => {
-                Space::find_free_aligned(&inner, len, Space::huge_phase(&backing), &place)?
+                Space::find_free_aligned(&inner, len, Space::huge_phase(&backing))?
             }
-            None => Space::find_free(&inner, len, &place)?,
+            None => Space::find_free(&inner, len)?,
         };
         let area = Area {
             end: va + len,
@@ -607,7 +597,6 @@ impl Space {
     /// (`InvalidArgs`).
     pub fn unmap(&self, va: u64, len: u64, only: Option<Kind>) -> Result<(), Error> {
         let end = Space::check_range(va, len)?;
-        self.outside_region(va, end)?;
         let (removed, frames) = {
             let mut inner = self.inner.lock();
             if let Some(kind) = only {
@@ -670,7 +659,6 @@ impl Space {
     /// mapped (`OutOfRange` otherwise). With `only`, every area must be of that kind.
     pub fn protect(&self, va: u64, len: u64, prot: u64, only: Option<Kind>) -> Result<(), Error> {
         let end = Space::check_range(va, len)?;
-        self.outside_region(va, end)?;
         let mut inner = self.inner.lock();
         Space::check_cover(&inner, va, end, prot, Scope::Kind(only))?;
         // Splitting at both ends makes at most two areas more.
@@ -953,7 +941,6 @@ impl Space {
     /// pages of a memory object are its own and stay.
     pub fn discard(&self, va: u64, len: u64) -> Result<(), Error> {
         let end = Space::check_range(va, len)?;
-        self.outside_region(va, end)?;
         let frames: Vec<UFrame> = {
             let mut inner = self.inner.lock();
             let mut cursor = va;
@@ -1261,15 +1248,10 @@ impl Space {
     }
 
     /// As `find_free`, at an address `phase` past a multiple of 2 MiB.
-    fn find_free_aligned(
-        inner: &Inner,
-        len: u64,
-        phase: u64,
-        within: &Range<u64>,
-    ) -> Result<u64, Error> {
+    fn find_free_aligned(inner: &Inner, len: u64, phase: u64) -> Result<u64, Error> {
         let align = |at: u64| place::aligned(at, phase, HUGE).ok_or(Error::Limit);
-        let mut candidate = align(within.start + PAGE_SIZE)?;
-        for (&start, area) in inner.areas.range(Space::first_in(inner, within.start)..) {
+        let mut candidate = align(MAP_BASE + PAGE_SIZE)?;
+        for (&start, area) in inner.areas.range(MAP_BASE..) {
             let fits = candidate
                 .checked_add(len)
                 .and_then(|e| e.checked_add(PAGE_SIZE))
@@ -1280,7 +1262,7 @@ impl Space {
             candidate = candidate.max(align(area.end + PAGE_SIZE)?);
         }
         let end = candidate.checked_add(len).ok_or(Error::Limit)?;
-        if end > within.end {
+        if end > map_end() {
             return Err(Error::Limit);
         }
         Ok(candidate)
@@ -1329,9 +1311,7 @@ impl Space {
             .try_reserve_exact(windows.len())
             .map_err(|_| Error::NoMemory)?;
         for &(va, len) in windows {
-            let end = Space::check_range(va, len)?;
-            self.outside_region(va, end)?;
-            ranges.push((va, end));
+            ranges.push((va, Space::check_range(va, len)?));
         }
         ranges.sort_unstable();
         let (Some(&(low, _)), Some(high)) = (ranges.first(), ranges.iter().map(|r| r.1).max())
@@ -1486,7 +1466,6 @@ impl Space {
     /// Maps `memory`'s first page read only where the kernel chooses, unless an area
     /// already maps just that page so: the clock page, once a process. Returns where.
     pub fn map_page_once(&self, memory: &Arc<MemoryObject>) -> Result<u64, Error> {
-        let place = self.place();
         let mut inner = self.inner.lock();
         let found = inner.areas.iter().find(|(start, a)| {
             a.end - **start == PAGE_SIZE
@@ -1496,7 +1475,7 @@ impl Space {
         if let Some((start, _)) = found {
             return Ok(*start);
         }
-        let va = Space::find_free(&inner, PAGE_SIZE, &place)?;
+        let va = Space::find_free(&inner, PAGE_SIZE)?;
         let area = Area {
             end: va + PAGE_SIZE,
             kind: Kind::Mapping,
@@ -1558,8 +1537,6 @@ pub struct Program {
     pub region: Range<u64>,
     /// The personality's fault-tolerant copy routine, and where a fault in it resumes.
     pub copy: Option<(Range<u64>, u64)>,
-    /// Where the core places the mappings of the program's native calls.
-    pub reserved: Range<u64>,
     pub vm: Arc<VmSpace>,
     /// The regions it holds a table page for, at each level.
     tables: SpinLock<[BTreeSet<u64>; 3]>,
@@ -1655,20 +1632,12 @@ impl Space {
         &self,
         base: u64,
         len: u64,
-        reserved: Range<u64>,
         copy: Option<(Range<u64>, u64)>,
     ) -> Result<(), Error> {
         let end = Space::check_range(base, len)?;
         if let Some((range, recovery)) = &copy {
             let inside = |a: u64| (base..end).contains(&a);
             if range.is_empty() || !inside(range.start) || range.end > end || !inside(*recovery) {
-                return Err(Error::InvalidArgs);
-            }
-        }
-        // The reserved range, if any, is whole pages of user space apart from the region.
-        if !reserved.is_empty() {
-            Space::check_range(reserved.start, reserved.end - reserved.start)?;
-            if reserved.start < end && base < reserved.end {
                 return Err(Error::InvalidArgs);
             }
         }
@@ -1679,7 +1648,6 @@ impl Space {
         *slot = Some(Arc::new(Program {
             region: base..end,
             copy,
-            reserved,
             vm: Arc::new(VmSpace::new()),
             tables: SpinLock::new([BTreeSet::new(), BTreeSet::new(), BTreeSet::new()]),
             account: self.account.clone(),
@@ -1691,32 +1659,6 @@ impl Space {
     /// The program's table, for a process with a personality.
     pub fn program(&self) -> Option<Arc<Program>> {
         self.program.0.lock().clone()
-    }
-
-    /// The program's table while the thread on this CPU serves a native call this space's
-    /// program made: the call copies through it.
-    pub fn program_call(&self) -> Option<Arc<Program>> {
-        if !crate::personality::program_call(|p| core::ptr::eq(&p.space, self)) {
-            return None;
-        }
-        self.program()
-    }
-
-    /// Where the core places a mapping whose address it picks: in a program's call, the
-    /// range its personality reserved; else the mapping area.
-    fn place(&self) -> Range<u64> {
-        match self.program_call() {
-            Some(p) => p.reserved.clone(),
-            None => MAP_BASE..map_end(),
-        }
-    }
-
-    /// `AccessDenied` for a range touching the personality's region, in a program's call.
-    fn outside_region(&self, va: u64, end: u64) -> Result<(), Error> {
-        match self.program_call() {
-            Some(p) if va < p.region.end && p.region.start < end => Err(Error::AccessDenied),
-            _ => Ok(()),
-        }
     }
 
     /// Charges the table pages the program's table needs to map `page`.
@@ -1868,11 +1810,9 @@ impl Space {
     pub fn prepare(&self, va: u64, len: u64, write: bool, thread: &Thread) -> Result<(), Error> {
         let end = va.checked_add(len).ok_or(Error::Fault)?;
         let access = if write { Access::Write } else { Access::Read };
-        // A program's call copies through the program's table, which the region is not in.
-        let program = self.program_call().is_some();
         let mut page = va & !(PAGE_SIZE - 1);
         while page < end {
-            match self.fault(page, access, program) {
+            match self.fault(page, access, false) {
                 Ok(true) => page += PAGE_SIZE,
                 Ok(false) => return Err(Error::Fault),
                 Err(Error::ShouldWait) => self.want(page, thread)?,
@@ -1976,7 +1916,7 @@ impl Space {
         child.adopt(theirs, inner.brk)?;
         if let Some(p) = self.program() {
             let len = p.region.end - p.region.start;
-            child.set_program(p.region.start, len, p.reserved.clone(), p.copy.clone())?;
+            child.set_program(p.region.start, len, p.copy.clone())?;
         }
         // Then what cannot fail. This side's private areas map their new objects.
         let mut changed = Vec::new();

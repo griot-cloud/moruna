@@ -27,9 +27,8 @@
 extern crate alloc;
 
 pub mod datapath;
-// stream B2 (data-os-streams.md): public for `heap::set_source`, the integrator's call.
 #[cfg(feature = "heap")]
-pub mod heap;
+mod heap;
 pub mod personality;
 pub mod plane;
 mod private_memory;

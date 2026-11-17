@@ -141,7 +141,6 @@ pub fn dispatch(thread: &Arc<Thread>, ctx: &mut UserContext) -> Flow {
         nr::THREAD_STATE_READ => personality::thread_state_read(p, a).map_err(Into::into),
         nr::THREAD_STATE_WRITE => personality::thread_state_write(p, a).map_err(Into::into),
         nr::THREAD_INTERRUPT => personality::thread_interrupt(p, a).map_err(Into::into),
-        nr::PROGRAM_HANDLE => personality::program_handle(thread, a).map_err(Into::into),
         nr::BATCH_GET => batch_get(thread, a[0]),
         nr::BATCH_PUT => batch_put(p, a[0], a[1], a[2]),
         nr::PORT_CALL => port_call(thread, a[0], a[1], a[2]),
