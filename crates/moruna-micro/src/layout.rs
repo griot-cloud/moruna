@@ -182,11 +182,15 @@ pub fn pieces<'a>(len: u64, framing: &'a [u8], body: &[(u64, &'a [u8])]) -> Opti
     Some(out)
 }
 
-/// The sizes of a ring task's plane, from the stage's plane budget (SDD 30 f.6): its input
-/// region a quarter of it, and two windows each an eighth, so the region, the rings object in
-/// use and one handed back with its records still held fit the budget together.
+/// The sizes of a ring task's plane (SDD 30 f.6), from what it holds in flight: the largest
+/// record the engine lays out for it (a piece: a bigger batch goes to the task cut into
+/// pieces), [`IN_FLIGHT`] of them and one more in its input region, and two windows of two
+/// pieces each, for an answer up to twice its batch. The region, the rings object in use and
+/// one handed back with its records still held fit the stage's plane budget together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RingSizes {
+    /// The largest record the engine lays out for the task.
+    pub piece: u64,
     /// The input region's bytes.
     pub region: u64,
     /// The windows of a rings object.
@@ -194,6 +198,15 @@ pub struct RingSizes {
     /// Each window's bytes.
     pub window: u64,
 }
+
+/// Batches each of a ring stage's tasks holds at once: one it works on while the engine lays
+/// out the next, so one engine worker keeps every task of the stage busy.
+pub const IN_FLIGHT: u64 = 2;
+
+/// The largest piece: the region and windows it makes are what a task holds in flight, never a
+/// share of the budget. Budget shares made each task's plane up to 512 MiB, all of it zeroed
+/// when it was made and charged to the engine (the NYC gate, 2026-11-17).
+pub const PIECE_MAX: u64 = 16 << 20;
 
 /// The least region and window: a record of a small batch and its framing.
 pub const RING_MIN: u64 = 1 << 20;
@@ -213,14 +226,44 @@ pub const RINGS_HEAD_MAX: u64 = 1 << 20;
 /// (`Kernel(Limit)` opening the task's plane, the NYC gate at 8 GiB and more, 2026-11-17).
 pub fn ring_sizes(budget: u64) -> RingSizes {
     const WINDOWS: u64 = 2;
-    let quarter = (budget / 4) & !(PAGE - 1);
-    let eighth = (budget / 8) & !(PAGE - 1);
-    let window_max = ((OBJECT_MAX - RINGS_HEAD_MAX) / WINDOWS) & !(PAGE - 1);
+    // The region (IN_FLIGHT + 1 pieces) and two rings objects (two windows of two pieces each).
+    const PIECES: u64 = (IN_FLIGHT + 1) + 2 * WINDOWS * 2;
+    let piece = ((budget / PIECES) & !(PAGE - 1)).clamp(RING_MIN, PIECE_MAX);
     RingSizes {
-        region: quarter.clamp(RING_MIN, WINDOW_MAX.min(OBJECT_MAX)),
+        piece,
+        region: (IN_FLIGHT + 1) * piece,
         windows: WINDOWS,
-        window: eighth.clamp(RING_MIN, window_max),
+        window: 2 * piece,
     }
+}
+
+// The largest plane is well within the kernel's largest object.
+const _: () = assert!((IN_FLIGHT + 1) * PIECE_MAX <= OBJECT_MAX);
+const _: () = assert!(2 * 2 * PIECE_MAX + RINGS_HEAD_MAX <= OBJECT_MAX);
+
+/// The most of a stage's budget one native task stands for (the run's `child_share`): its
+/// account, and its plane at its largest.
+pub const NATIVE_CHILD_MAX: u64 = NATIVE_TASK_MAX + ((IN_FLIGHT + 1) + 2 * 2 * 2) * PIECE_MAX;
+
+// A native task stands for less than a gibibyte of its stage's budget.
+const _: () = assert!(NATIVE_CHILD_MAX < 1 << 30);
+
+/// Rows of a batch of `rows` rows whose record is `len` bytes cut into pieces of at most
+/// `piece` bytes, by its bytes a row, a tenth spare for the framing and the pages: each piece's
+/// first row and row count, in order. One piece when it fits, or when it has one row.
+pub fn cut(rows: usize, len: u64, piece: u64) -> Vec<(usize, usize)> {
+    if len <= piece || rows <= 1 || piece == 0 {
+        return vec![(0, rows)];
+    }
+    let target = piece - piece / 10;
+    let count = usize::try_from(len.div_ceil(target.max(1)))
+        .unwrap_or(rows)
+        .clamp(1, rows);
+    let each = rows.div_ceil(count);
+    (0..rows)
+        .step_by(each)
+        .map(|at| (at, each.min(rows - at)))
+        .collect()
 }
 
 /// A stage's cleanup of its task's account (SB-I9): the task's `process` handle, for a native
@@ -476,22 +519,60 @@ mod tests {
     }
 
     #[test]
-    fn p_ring_sizes_fit_the_budget() {
+    fn p_ring_sizes_are_what_a_task_holds_in_flight() {
         const MIB: u64 = 1 << 20;
+        // A big budget: the largest piece, three of them in the region, windows of two.
         let s = ring_sizes(1 << 30);
         assert_eq!(
             s,
             RingSizes {
-                region: 256 * MIB,
+                piece: PIECE_MAX,
+                region: 3 * PIECE_MAX,
                 windows: 2,
-                window: (255 * MIB / 2) & !(PAGE - 1),
+                window: 2 * PIECE_MAX,
             }
         );
-        assert!(s.region + 2 * s.windows * s.window <= 1 << 30);
+        assert_eq!(ring_sizes(u64::MAX), s, "never more, whatever the budget");
+        // In use: the region and one rings object, 112 MiB at most, where 512 MiB were.
+        assert_eq!(s.region + s.windows * s.window, 112 * MIB);
+        // A small budget: the region, the rings object and one handed back fit it.
+        for budget in [16 * MIB, 64 * MIB, 100 * MIB + 5, 150 * MIB] {
+            let s = ring_sizes(budget);
+            assert!(
+                s.region + 2 * s.windows * s.window <= budget,
+                "{budget}: {s:?}"
+            );
+            assert_eq!(
+                (s.piece % PAGE, s.region, s.window),
+                (0, 3 * s.piece, 2 * s.piece)
+            );
+        }
         let small = ring_sizes(MIB);
-        assert_eq!((small.region, small.window), (RING_MIN, RING_MIN));
-        assert_eq!(ring_sizes(16 * MIB + 5).region % PAGE, 0);
-        assert_eq!(ring_sizes(u64::MAX).region, WINDOW_MAX);
+        assert_eq!((small.piece, small.region), (RING_MIN, 3 * RING_MIN));
+    }
+
+    #[test]
+    fn p_a_batch_past_a_piece_is_cut_into_pieces_in_order() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(cut(1000, 10 * MIB, 16 * MIB), [(0, 1000)], "fits");
+        assert_eq!(
+            cut(1, 100 * MIB, 16 * MIB),
+            [(0, 1)],
+            "one row is one piece"
+        );
+        let pieces = cut(1_000_000, 100 * MIB, 16 * MIB);
+        assert!(pieces.len() >= 7, "{}", pieces.len());
+        // Every row once, in order, and each piece's share of the bytes under a piece.
+        let mut next = 0;
+        for &(at, rows) in &pieces {
+            assert_eq!(at, next);
+            assert!(rows > 0);
+            assert!((100 * MIB) * rows as u64 / 1_000_000 <= 16 * MIB - 16 * MIB / 10 + MIB);
+            next = at + rows;
+        }
+        assert_eq!(next, 1_000_000);
+        // Fewer rows than pieces: one row each at most.
+        assert_eq!(cut(3, 100 * MIB, 16 * MIB), [(0, 1), (1, 1), (2, 1)]);
     }
 
     #[test]

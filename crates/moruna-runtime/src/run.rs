@@ -672,6 +672,9 @@ fn drive(
                     name: "budget.native_children",
                     msg: "native singleton has no admitted child share".into(),
                 })?;
+                // stream P: a native task stands for what it holds (its account and its plane
+                // at their largest), not for its whole share: the rest stays the run's.
+                let share = share.min(moruna_micro::layout::NATIVE_CHILD_MAX);
                 stage.bind(gate, &sampler, share);
             }
         }
