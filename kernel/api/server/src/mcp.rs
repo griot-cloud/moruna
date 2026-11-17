@@ -5,7 +5,7 @@
 //! `kernel/api/mcp-tools.json` (generated from `moruna-api`) lists them.
 
 use crate::{
-    api::{Answer, Api},
+    api::{Admission, Answer, Api, Call},
     http::Request,
     token::Grant,
 };
@@ -73,35 +73,45 @@ fn tool_result(answer: &Answer) -> Value {
 }
 
 impl Api {
-    /// The answer to a request for `/mcp` at `now`, Unix seconds.
-    pub(crate) fn mcp(&mut self, request: &Request, now: u64) -> Answer {
+    /// What the head of a request for `/mcp` decides at `now`, Unix seconds, before its body is
+    /// read: only `POST`, and every MCP request needs a token covering `observe` at least.
+    pub(crate) fn admit_mcp(&mut self, request: &Request, now: u64) -> Admission {
         match request.method.as_str() {
             "POST" => {}
             "GET" => {
-                return Answer {
+                return Admission::Answer(Answer {
                     status: 405,
                     body: Vec::new(),
                     close: false,
                     allow: Some("POST"),
-                };
+                });
             }
-            _ => return Answer::error(ErrorCode::Invalid, "this path takes another method"),
+            _ => {
+                return Admission::Answer(Answer::error(
+                    ErrorCode::Invalid,
+                    "this path takes another method",
+                ));
+            }
         }
-        // Every MCP request needs a token, `observe` at least.
         let grant = match self.verify(&request.authorization, now) {
             Ok(grant) => grant,
-            Err(why) => return Answer::error(ErrorCode::Unauthorized, why),
+            Err(why) => return Admission::Answer(Answer::error(ErrorCode::Unauthorized, why)),
         };
         if !grant.covers(Scope::Observe) {
-            return Answer::error(
+            return Admission::Answer(Answer::error(
                 ErrorCode::Forbidden,
                 "the token's scope does not cover observe",
-            );
+            ));
         }
         if request.query {
-            return Answer::error(ErrorCode::Invalid, "MCP takes no query");
+            return Admission::Answer(Answer::error(ErrorCode::Invalid, "MCP takes no query"));
         }
-        let Ok(message) = serde_json::from_slice::<Value>(&request.body) else {
+        Admission::Body(Call::Mcp(grant))
+    }
+
+    /// The answer to one MCP message, `body`, from a caller whose token granted `grant`.
+    pub(crate) fn mcp_message(&mut self, grant: &Grant, body: &[u8], now: u64) -> Answer {
+        let Ok(message) = serde_json::from_slice::<Value>(body) else {
             return reply(&Value::Null, Err((PARSE_ERROR, "Parse error")));
         };
         let Some(message) = message.as_object() else {
@@ -137,7 +147,7 @@ impl Api {
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(tools()),
-            "tools/call" => self.call_tool(message.get("params"), &grant, now),
+            "tools/call" => self.call_tool(message.get("params"), grant, now),
             _ => Err((METHOD_NOT_FOUND, "Method not found")),
         };
         reply(id, outcome)

@@ -3,7 +3,7 @@
 //! body every refusal carries.
 
 use crate::{
-    audit::AuditLog,
+    audit::{AUDIT_ANSWER_LIMIT, AuditLog},
     http::{Authorization, Request},
     mcp::MCP_PATH,
     token::{Grant, TokenKey, Verifier},
@@ -94,6 +94,22 @@ pub(crate) fn error_body(code: ErrorCode, message: &str) -> Vec<u8> {
     serde_json::to_vec(&ErrorBody::new(code, message)).unwrap_or_default()
 }
 
+/// What the head of a request decides.
+#[derive(Debug)]
+pub(crate) enum Admission {
+    /// The answer, from the head alone: no body is read.
+    Answer(Answer),
+    /// The call is allowed and takes a body: read it, then [complete](Api::complete) the call.
+    Body(Call),
+}
+
+/// A call admitted on its head, waiting for its body.
+#[derive(Debug)]
+pub(crate) enum Call {
+    /// One MCP message, from a caller whose token granted this.
+    Mcp(Grant),
+}
+
 /// The operations' state: what the node says about itself, the keys its tokens are checked
 /// against, and the audit record.
 #[derive(Debug)]
@@ -112,38 +128,64 @@ impl Api {
         }
     }
 
-    /// The answer to `request` at `now`, Unix seconds. `/mcp` is MCP's (2D); every other route
-    /// comes from the operations table only: a path in no operation is `not_found`, and a known
-    /// path with another method is `invalid`. An operation that needs a scope needs a valid
-    /// token (2C); `health` never reads the header. Each call of an operation is recorded.
-    pub(crate) fn answer(&mut self, request: &Request, now: u64) -> Answer {
+    /// What the head of `request`, whose body is `body` bytes, decides at `now`, Unix seconds,
+    /// before any of the body is read. `/mcp` is MCP's (2D); every other route comes from the
+    /// operations table only: a path in no operation is `not_found`, and a known path with
+    /// another method is `invalid`. An operation that needs a scope needs a valid token (2C),
+    /// checked first; `health` never reads the header. Step 2's operations take no query and no
+    /// body. Each call of an operation but `health` is recorded.
+    pub(crate) fn admit(&mut self, request: &Request, body: usize, now: u64) -> Admission {
         if request.path == MCP_PATH {
-            return self.mcp(request, now);
+            return self.admit_mcp(request, now);
         }
         let Some(operation) = OPERATIONS.iter().find(|o| o.path == request.path) else {
-            return Answer::error(ErrorCode::NotFound, "no operation has this path");
+            return Admission::Answer(Answer::error(
+                ErrorCode::NotFound,
+                "no operation has this path",
+            ));
         };
         if request.method != operation.method.as_str() {
-            return Answer::error(ErrorCode::Invalid, "this path takes another method");
+            return Admission::Answer(Answer::error(
+                ErrorCode::Invalid,
+                "this path takes another method",
+            ));
         }
         let grant = match operation.scope {
             None => None,
             Some(_) => match self.verify(&request.authorization, now) {
                 Ok(grant) => Some(grant),
                 Err(why) => {
-                    return self.refuse(operation, None, ErrorCode::Unauthorized, why, now);
+                    let answer = self.refuse(operation, None, ErrorCode::Unauthorized, why, now);
+                    return Admission::Answer(answer);
                 }
             },
         };
-        if request.query {
+        let answer = if request.query {
             let why = "this operation takes no query";
-            return self.refuse(operation, grant.as_ref(), ErrorCode::Invalid, why, now);
-        }
-        if !request.body.is_empty() {
+            self.refuse(operation, grant.as_ref(), ErrorCode::Invalid, why, now)
+        } else if body > 0 {
             let why = "this operation takes no body";
-            return self.refuse(operation, grant.as_ref(), ErrorCode::Invalid, why, now);
+            self.refuse(operation, grant.as_ref(), ErrorCode::Invalid, why, now)
+        } else {
+            self.call(operation, grant.as_ref(), now)
+        };
+        Admission::Answer(answer)
+    }
+
+    /// Completes `call`, admitted on its head, with its `body`.
+    pub(crate) fn complete(&mut self, call: Call, body: &[u8], now: u64) -> Answer {
+        match call {
+            Call::Mcp(grant) => self.mcp_message(&grant, body, now),
         }
-        self.call(operation, grant.as_ref(), now)
+    }
+
+    /// The answer to `request` with `body`: admitted, then completed when it takes a body.
+    #[cfg(test)]
+    pub(crate) fn answer(&mut self, request: &Request, body: &[u8], now: u64) -> Answer {
+        match self.admit(request, body.len(), now) {
+            Admission::Answer(answer) => answer,
+            Admission::Body(call) => self.complete(call, body, now),
+        }
     }
 
     /// What the token in `authorization` grants at `now`, or why it is refused.
@@ -178,7 +220,7 @@ impl Api {
             }
         }
         let answer = self.run(operation, now);
-        self.audit.record(now, grant, operation.id, answer.status);
+        self.record(now, grant, operation, answer.status);
         answer
     }
 
@@ -192,8 +234,21 @@ impl Api {
         now: u64,
     ) -> Answer {
         let answer = Answer::error(code, why);
-        self.audit.record(now, grant, operation.id, answer.status);
+        self.record(now, grant, operation, answer.status);
         answer
+    }
+
+    /// Records a call of `operation`; `health` leaves no record.
+    fn record(
+        &mut self,
+        now: u64,
+        grant: Option<&Grant>,
+        operation: &'static Operation,
+        status: u16,
+    ) {
+        if operation.response != Response::Health {
+            self.audit.record(now, grant, operation.id, status);
+        }
     }
 
     /// Runs `operation`, whose call is allowed.
@@ -203,7 +258,9 @@ impl Api {
                 status: HealthStatus::Ok,
             })),
             Response::Node => Answer::ok(serde_json::to_vec(&self.facts.document(now))),
-            Response::Audit => Answer::ok(serde_json::to_vec(&self.audit.audit())),
+            Response::Audit => {
+                Answer::ok(serde_json::to_vec(&self.audit.audit(AUDIT_ANSWER_LIMIT)))
+            }
         }
     }
 
@@ -216,7 +273,7 @@ impl Api {
     /// The audit record's records, newest first.
     #[cfg(test)]
     pub(crate) fn records(&self) -> Vec<moruna_api::AuditRecord> {
-        self.audit.audit().records
+        self.audit.audit(usize::MAX).records
     }
 }
 

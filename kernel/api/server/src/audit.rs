@@ -7,6 +7,8 @@ use moruna_api::{Audit, AuditRecord, Scope};
 
 /// How many records are kept: the last 10,000 calls.
 pub const AUDIT_LIMIT: usize = 10_000;
+/// How many records `node/audit` answers: the newest 1,000.
+pub const AUDIT_ANSWER_LIMIT: usize = 1_000;
 
 /// The scopes in the order a record lists them.
 const SCOPES: [Scope; 3] = [Scope::Observe, Scope::Submit, Scope::Admin];
@@ -59,12 +61,13 @@ impl AuditLog {
         });
     }
 
-    /// The records, newest first, as `node/audit` answers them.
-    pub(crate) fn audit(&self) -> Audit {
+    /// The newest `count` records, newest first, as `node/audit` answers them.
+    pub(crate) fn audit(&self, count: usize) -> Audit {
         Audit {
             records: self
                 .entries
                 .iter()
+                .take(count)
                 .map(|entry| AuditRecord {
                     time: entry.time,
                     key: entry

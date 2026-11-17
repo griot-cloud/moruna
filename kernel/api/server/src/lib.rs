@@ -12,12 +12,17 @@
 //!   [deadline](Server::deadline) passes, and supplies the time through a [`Clock`]. No threads,
 //!   no async runtime.
 //! - The limits: [`HEADER_LIMIT`] and [`BODY_LIMIT`] (over them, `invalid`),
-//!   [`CONNECTION_LIMIT`] (over it, `busy`) and [`IDLE_LIMIT_MS`]; each answer over a limit
-//!   closes its connection.
+//!   [`CONNECTION_LIMIT`] (over it, `busy`), [`OPEN_LIMIT`] (over it, closed with no answer),
+//!   [`IDLE_LIMIT_MS`] and [`HANDSHAKE_LIMIT_MS`]; each answer over a limit closes its
+//!   connection.
+//! - Memory: a request's head is read and its token checked before any of its body, so a body
+//!   is read only for a call that takes one and is allowed; bodies share [`BODY_BUDGET`], and a
+//!   body that does not fit is answered `busy`.
 //! - Tokens (2C): every operation but `health` needs a JWT signed with Ed25519 under one of the
 //!   node's [`TokenKey`]s, for this node, expiring within [`MOST_AHEAD_SECONDS`], whose scope
-//!   covers the operation. Each call of an operation leaves an audit record; the last
-//!   [`AUDIT_LIMIT`] are kept in memory, and `node/audit` answers them newest first.
+//!   covers the operation. Each call of an operation but `health` leaves an audit record; the
+//!   last [`AUDIT_LIMIT`] are kept in memory, and `node/audit` answers the newest
+//!   [`AUDIT_ANSWER_LIMIT`], newest first.
 //! - MCP (2D): `POST /mcp` on the same port with the same tokens, MCP's Streamable HTTP,
 //!   stateless, at [`PROTOCOL_VERSION`]: one tool per operation, `moruna_<id>`.
 //!
@@ -48,10 +53,10 @@ mod token;
 mod transport;
 
 pub use api::NodeFacts;
-pub use audit::AUDIT_LIMIT;
-pub use http::{BODY_LIMIT, HEADER_LIMIT};
+pub use audit::{AUDIT_ANSWER_LIMIT, AUDIT_LIMIT};
+pub use http::{BODY_BUDGET, BODY_LIMIT, HEADER_LIMIT};
 pub use identity::{Identity, IdentityError, VALID_AFTER_SECONDS, VALID_BEFORE_SECONDS};
 pub use mcp::PROTOCOL_VERSION;
-pub use server::{CONNECTION_LIMIT, Config, IDLE_LIMIT_MS, Server};
+pub use server::{CONNECTION_LIMIT, Config, HANDSHAKE_LIMIT_MS, IDLE_LIMIT_MS, OPEN_LIMIT, Server};
 pub use token::{MOST_AHEAD_SECONDS, TokenKey};
 pub use transport::{Clock, Transport, TransportError};

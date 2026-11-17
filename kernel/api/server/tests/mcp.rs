@@ -133,12 +133,12 @@ fn a_client_initializes_lists_and_calls_each_tool() {
         .as_array()
         .unwrap();
     let key = TokenKey::new(harness.signer.public()).id().to_string();
-    // Each tools/call is one record with its operation's ID; nothing else MCP does is.
+    // Each tools/call is one record with its operation's ID, health's excepted; nothing else
+    // MCP does is.
     assert_eq!(
         records,
         &[
-            json!({ "time": WALL + 2, "key": key, "scope": ["admin"], "operation": "node", "status": 200 }),
-            json!({ "time": WALL, "key": key, "scope": ["admin"], "operation": "health", "status": 200 }),
+            json!({ "time": WALL + 2, "key": key, "scope": ["admin"], "operation": "node", "status": 200 })
         ]
     );
     assert_eq!(text(&audit["result"]), audit["result"]["structuredContent"]);
@@ -200,17 +200,23 @@ fn an_unknown_method_gets_32601_and_malformed_json_32700() {
 #[test]
 fn mcp_needs_the_same_tokens_and_only_post() {
     let mut harness = Harness::new();
-    let client = harness.connect();
     let ping = request(6, "ping", json!({}));
-    let refused = post(&mut harness, client, "not.a.token", &ping);
-    assert_eq!(refused.status, 401);
-    assert_eq!(refused.error_code(), "unauthorized");
+    // Refused on its head, a message is never read, so its connection closes.
     let expired = harness.signer.token(INSTANCE, WALL - 1, &["observe"]);
-    assert_eq!(post(&mut harness, client, &expired, &ping).status, 401);
     let nothing = harness.token(&[]);
-    let forbidden = post(&mut harness, client, &nothing, &ping);
-    assert_eq!(forbidden.status, 403);
-    assert_eq!(forbidden.error_code(), "forbidden");
+    for (token, status, code) in [
+        ("not.a.token", 401, "unauthorized"),
+        (expired.as_str(), 401, "unauthorized"),
+        (nothing.as_str(), 403, "forbidden"),
+    ] {
+        let client = harness.connect();
+        let refused = post(&mut harness, client, token, &ping);
+        assert_eq!(refused.status, status);
+        assert_eq!(refused.error_code(), code);
+        assert_eq!(refused.header("connection"), Some("close"));
+        assert!(harness.clients[client].server_closed());
+    }
+    let client = harness.connect();
     let observe = harness.token(&["observe"]);
     assert_eq!(
         answer(&post(&mut harness, client, &observe, &ping), 6)["result"],
@@ -220,4 +226,5 @@ fn mcp_needs_the_same_tokens_and_only_post() {
     assert_eq!(get.status, 405);
     assert_eq!(get.header("allow"), Some("POST"));
     assert!(get.body.is_empty());
+    assert!(!harness.clients[client].server_closed());
 }

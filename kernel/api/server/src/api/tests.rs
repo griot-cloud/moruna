@@ -2,6 +2,7 @@
 //! and the record each call leaves.
 
 use super::*;
+use crate::audit::AUDIT_LIMIT;
 use crate::{http::Request, signer::Signer};
 use alloc::{format, string::ToString, vec};
 use moruna_api::{ExecutorKind, Node, Scope};
@@ -34,7 +35,6 @@ fn get(path: &str, token: Option<&str>) -> Request {
             Authorization::One(format!("Bearer {token}").into_bytes())
         }),
         close: false,
-        body: Vec::new(),
     }
 }
 
@@ -52,10 +52,10 @@ fn each_operation_answers_a_token_whose_scope_covers_it() {
     let signer = Signer::new();
     let mut api = api(&signer);
     let admin = signer.token("i-1", NOW + 60, &["admin"]);
-    let health = api.answer(&get("/v1/health", None), NOW);
+    let health = api.answer(&get("/v1/health", None), &[], NOW);
     assert_eq!(health.status, 200);
     assert_eq!(health.body, br#"{"status":"ok"}"#);
-    let node = api.answer(&get("/v1/node", Some(&admin)), NOW);
+    let node = api.answer(&get("/v1/node", Some(&admin)), &[], NOW);
     assert_eq!(node.status, 200);
     assert_eq!(
         body(&node),
@@ -68,9 +68,13 @@ fn each_operation_answers_a_token_whose_scope_covers_it() {
     );
     let node: Node = serde_json::from_slice(&node.body).unwrap();
     assert_eq!(node, facts().document(NOW));
-    let audit = api.answer(&get("/v1/node/audit", Some(&admin)), NOW);
+    let audit = api.answer(&get("/v1/node/audit", Some(&admin)), &[], NOW);
     assert_eq!(audit.status, 200);
-    assert_eq!(body(&audit)["records"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        body(&audit)["records"].as_array().unwrap().len(),
+        1,
+        "the node call; health leaves no record"
+    );
 }
 
 #[test]
@@ -78,14 +82,14 @@ fn health_never_reads_the_header() {
     let signer = Signer::new();
     let mut api = api(&signer);
     for token in [None, Some("garbage")] {
-        assert_eq!(api.answer(&get("/v1/health", token), NOW).status, 200);
+        assert_eq!(api.answer(&get("/v1/health", token), &[], NOW).status, 200);
     }
-    let records = api.audit.audit().records;
-    assert!(
-        records
-            .iter()
-            .all(|r| r.key.is_empty() && r.scope.is_empty())
-    );
+    assert_eq!(api.recorded(), 0, "health leaves no record");
+    // Not even refused.
+    let mut query = get("/v1/health", None);
+    query.query = true;
+    assert_eq!(api.answer(&query, &[], NOW).status, 400);
+    assert_eq!(api.recorded(), 0);
 }
 
 #[test]
@@ -98,26 +102,33 @@ fn what_no_operation_takes_is_refused() {
         assert_eq!(body(&answer)["error"]["code"], code);
         assert!(!answer.close);
     };
-    refused(api.answer(&get("/v1/nodes", None), NOW), 404, "not_found");
-    refused(api.answer(&get("/v1/node/", None), NOW), 404, "not_found");
-    refused(api.answer(&get("/", None), NOW), 404, "not_found");
+    refused(
+        api.answer(&get("/v1/nodes", None), &[], NOW),
+        404,
+        "not_found",
+    );
+    refused(
+        api.answer(&get("/v1/node/", None), &[], NOW),
+        404,
+        "not_found",
+    );
+    refused(api.answer(&get("/", None), &[], NOW), 404, "not_found");
     let mut post = get("/v1/node", Some(&admin));
     post.method = "POST".to_string();
-    refused(api.answer(&post, NOW), 400, "invalid");
+    refused(api.answer(&post, &[], NOW), 400, "invalid");
     let mut head = get("/v1/health", None);
     head.method = "HEAD".to_string();
-    refused(api.answer(&head, NOW), 400, "invalid");
+    refused(api.answer(&head, &[], NOW), 400, "invalid");
     assert_eq!(api.recorded(), 0, "no operation was called");
     let mut query = get("/v1/node", Some(&admin));
     query.query = true;
-    refused(api.answer(&query, NOW), 400, "invalid");
-    let mut with_body = get("/v1/node", Some(&admin));
-    with_body.body = b"{}".to_vec();
-    refused(api.answer(&with_body, NOW), 400, "invalid");
+    refused(api.answer(&query, &[], NOW), 400, "invalid");
+    let with_body = get("/v1/node", Some(&admin));
+    refused(api.answer(&with_body, b"{}", NOW), 400, "invalid");
     // A token is checked before the request is.
     let mut no_token = get("/v1/node", None);
     no_token.query = true;
-    refused(api.answer(&no_token, NOW), 401, "unauthorized");
+    refused(api.answer(&no_token, &[], NOW), 401, "unauthorized");
     assert_eq!(api.recorded(), 3);
 }
 
@@ -129,7 +140,7 @@ fn a_token_is_needed_and_its_scope_must_cover_the_operation() {
     let submit = signer.token("i-1", NOW + 60, &["submit"]);
     let none = signer.token("i-1", NOW + 60, &[]);
     let status = |api: &mut Api, path: &str, token: Option<&str>| {
-        let answer = api.answer(&get(path, token), NOW);
+        let answer = api.answer(&get(path, token), &[], NOW);
         if answer.status != 200 {
             let code = body(&answer)["error"]["code"].as_str().unwrap().to_string();
             assert_eq!(
@@ -152,7 +163,7 @@ fn a_token_is_needed_and_its_scope_must_cover_the_operation() {
     // An operation called without a grant at all is unauthorized.
     let node = &OPERATIONS[1];
     assert_eq!(api.call(node, None, NOW).status, 401);
-    let audit = api.audit.audit().records;
+    let audit = api.records();
     assert_eq!(audit[0].operation, "node");
     assert_eq!(audit[0].status, 401);
     assert_eq!(audit[1].scope, [Scope::Submit]);
@@ -177,4 +188,32 @@ fn errors_carry_their_code_and_status() {
     }
     let failed = Answer::ok(Err(serde_json::from_slice::<Value>(b"{").unwrap_err()));
     assert_eq!(failed.status, 500);
+}
+
+#[test]
+fn audit_answers_the_newest_1000_of_the_10000_it_keeps() {
+    let signer = Signer::new();
+    let mut api = api(&signer);
+    let grant = crate::token::Grant {
+        key: TokenKey::new(signer.public()).id().to_string(),
+        scope: vec![Scope::Admin],
+    };
+    let node = &OPERATIONS[1];
+    for second in 0..=AUDIT_LIMIT as u64 {
+        assert_eq!(api.call(node, Some(&grant), NOW + second).status, 200);
+    }
+    assert_eq!(
+        api.recorded(),
+        AUDIT_LIMIT,
+        "after 10,001 calls, exactly 10,000"
+    );
+    let admin = signer.token("i-1", NOW + 10_600, &["admin"]);
+    let audit = api.answer(&get("/v1/node/audit", Some(&admin)), &[], NOW + 10_001);
+    let records = body(&audit)["records"].as_array().unwrap().clone();
+    assert_eq!(records.len(), AUDIT_ANSWER_LIMIT);
+    assert_eq!(records[0]["time"], NOW + AUDIT_LIMIT as u64, "newest first");
+    assert_eq!(
+        records[AUDIT_ANSWER_LIMIT - 1]["time"],
+        NOW + (AUDIT_LIMIT - AUDIT_ANSWER_LIMIT + 1) as u64
+    );
 }

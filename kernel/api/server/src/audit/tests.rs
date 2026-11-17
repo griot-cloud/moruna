@@ -25,7 +25,7 @@ fn records_come_back_newest_first_as_2_1_writes_them() {
     );
     log.record(12, None, "node", 401);
     assert_eq!(
-        log.audit().records,
+        log.audit(usize::MAX).records,
         vec![
             AuditRecord {
                 time: 12,
@@ -59,8 +59,12 @@ fn the_ring_holds_the_last_10_000() {
         log.record(time, None, "health", 200);
     }
     assert_eq!(log.len(), AUDIT_LIMIT);
-    let records = log.audit().records;
+    let records = log.audit(usize::MAX).records;
     assert_eq!(records.len(), AUDIT_LIMIT);
+    assert_eq!(
+        log.audit(AUDIT_ANSWER_LIMIT).records[..],
+        records[..AUDIT_ANSWER_LIMIT]
+    );
     assert_eq!(records[0].time, AUDIT_LIMIT as u64);
     assert_eq!(records[AUDIT_LIMIT - 1].time, 1, "the oldest went first");
 }

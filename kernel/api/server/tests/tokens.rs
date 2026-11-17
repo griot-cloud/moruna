@@ -3,7 +3,7 @@
 mod common;
 
 use common::{Harness, INSTANCE, Response, WALL, signer::Signer};
-use moruna_api_server::{AUDIT_LIMIT, Identity, TokenKey};
+use moruna_api_server::{AUDIT_ANSWER_LIMIT, Identity, TokenKey};
 use serde_json::{Value, json};
 
 /// A GET of `path` on a new connection carrying `token` (none when `None`).
@@ -166,12 +166,12 @@ fn each_call_appears_in_audit_newest_first() {
             json!({ "time": WALL + 4, "key": key, "scope": ["observe"], "operation": "node_audit", "status": 403 }),
             json!({ "time": WALL + 3, "key": "", "scope": [], "operation": "node", "status": 401 }),
             json!({ "time": WALL + 2, "key": key, "scope": ["observe"], "operation": "node", "status": 200 }),
-            json!({ "time": WALL + 1, "key": "", "scope": [], "operation": "health", "status": 200 }),
-        ]
+        ],
+        "health leaves no record"
     );
     // The audit call itself is recorded once it has answered.
     let records = audit(&mut harness);
-    assert_eq!(records.len(), 5);
+    assert_eq!(records.len(), 4);
     assert_eq!(
         records[0],
         json!({ "time": WALL + 5, "key": key, "scope": ["admin"], "operation": "node_audit", "status": 200 })
@@ -179,16 +179,19 @@ fn each_call_appears_in_audit_newest_first() {
 }
 
 #[test]
-fn after_10_001_calls_audit_holds_exactly_10_000() {
+fn audit_answers_the_newest_1_000_calls() {
     let mut harness = Harness::new();
     let client = harness.connect();
-    let calls = AUDIT_LIMIT + 1;
+    let calls = AUDIT_ANSWER_LIMIT + 1;
     // Pipelined in batches, so that the test stays quick.
-    let request = b"GET /v1/health HTTP/1.1\r\nHost: node\r\n\r\n";
+    let request = format!(
+        "GET /v1/node HTTP/1.1\r\nHost: node\r\n{}\r\n",
+        Harness::bearer(&harness.token(&["observe"]))
+    );
     let mut sent = 0;
     while sent < calls {
-        let batch = (calls - sent).min(500);
-        harness.clients[client].send(&request.repeat(batch));
+        let batch = (calls - sent).min(250);
+        harness.clients[client].send(request.repeat(batch).as_bytes());
         harness.settle();
         for _ in 0..batch {
             assert_eq!(harness.clients[client].response().unwrap().status, 200);
@@ -196,6 +199,6 @@ fn after_10_001_calls_audit_holds_exactly_10_000() {
         sent += batch;
     }
     let records = audit(&mut harness);
-    assert_eq!(records.len(), AUDIT_LIMIT);
-    assert!(records.iter().all(|r| r["operation"] == "health"));
+    assert_eq!(records.len(), AUDIT_ANSWER_LIMIT);
+    assert!(records.iter().all(|r| r["operation"] == "node"));
 }

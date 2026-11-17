@@ -3,7 +3,7 @@
 //! and the limits on headers and bodies. No HTTP/2, compression, cookies or cross-origin
 //! headers.
 
-use crate::api::{Answer, Api};
+use crate::api::{Admission, Answer, Api, Call};
 use alloc::{format, string::String, vec, vec::Vec};
 use moruna_api::ErrorCode;
 
@@ -11,9 +11,11 @@ use moruna_api::ErrorCode;
 pub const HEADER_LIMIT: usize = 16 * 1024;
 /// The most bytes a request's body may take.
 pub const BODY_LIMIT: usize = 1024 * 1024;
-/// The decrypted bytes a session reads ahead to before it stops asking for more: one request at
-/// its limits.
-const INPUT_LIMIT: usize = HEADER_LIMIT + BODY_LIMIT;
+/// The most bytes of request bodies held at once, across every connection. A request whose body
+/// does not fit is answered `busy`, and its connection closes.
+pub const BODY_BUDGET: usize = 8 * 1024 * 1024;
+/// What a session's input may hold beyond what it asked for: the rest of the last TLS record.
+const RECORD_SLACK: usize = 17 * 1024;
 
 /// What a request's `Authorization` headers held.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,7 +28,7 @@ pub(crate) enum Authorization {
     Many,
 }
 
-/// One request, read whole.
+/// One request's head: everything but its body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Request {
     /// The method, as sent.
@@ -39,8 +41,6 @@ pub(crate) struct Request {
     pub authorization: Authorization,
     /// Whether the client asked for the connection to close after this answer.
     pub close: bool,
-    /// The body.
-    pub body: Vec<u8>,
 }
 
 /// What reading the front of the stream gave.
@@ -48,29 +48,23 @@ pub(crate) struct Request {
 pub(crate) enum Read {
     /// More bytes are needed.
     Incomplete,
-    /// A whole request, which took this many bytes.
-    Request(Request, usize),
+    /// A request's head, which took `length` bytes; a body of `body` bytes follows it.
+    Head {
+        request: Request,
+        length: usize,
+        body: usize,
+    },
     /// The stream is not HTTP/1.1 as this server reads it, or a request is over a limit. The
     /// answer is `invalid` with this message, then the connection closes.
     Refused(&'static str),
 }
 
-/// A request head read whole whose body has not all arrived.
-#[derive(Debug)]
-struct Head {
-    request: Request,
-    length: usize,
-    body: usize,
-}
-
-/// Reads requests from the front of a stream, one at a time.
+/// Reads request heads from the front of a stream, one at a time.
 #[derive(Debug, Default)]
 pub(crate) struct Reader {
     /// How far the search for the end of the head has looked, so that bytes arriving one at a
     /// time are not searched again and again.
     searched: usize,
-    /// The head of the request whose body is still arriving.
-    head: Option<Head>,
 }
 
 /// Whether `bytes` holds an empty line: a line feed followed by another, or by a carriage return
@@ -90,40 +84,24 @@ fn trim(value: &[u8]) -> &[u8] {
 }
 
 impl Reader {
-    /// Reads the request at the front of `input`.
+    /// Reads the request head at the front of `input`. Once a head is read, the caller takes its
+    /// bytes off the front before reading again.
     pub(crate) fn read(&mut self, input: &[u8]) -> Read {
-        if self.head.is_none() {
-            match self.read_head(input) {
-                Ok(Some(head)) => self.head = Some(head),
-                Ok(None) => return Read::Incomplete,
-                Err(message) => return Read::Refused(message),
+        match self.read_head(input) {
+            Ok(Some(read)) => {
+                self.searched = 0;
+                read
             }
+            Ok(None) => Read::Incomplete,
+            Err(message) => Read::Refused(message),
         }
-        let Some(head) = self.head.as_ref() else {
-            return Read::Incomplete;
-        };
-        let end = head.length + head.body;
-        if input.len() < end {
-            return Read::Incomplete;
-        }
-        let Some(Head {
-            mut request,
-            length,
-            ..
-        }) = self.head.take()
-        else {
-            return Read::Incomplete;
-        };
-        request.body = input[length..end].to_vec();
-        self.searched = 0;
-        Read::Request(request, end)
     }
 
     /// The head at the front of `input`, `None` while it has not all arrived, or why it is
     /// refused.
-    fn read_head(&mut self, input: &[u8]) -> Result<Option<Head>, &'static str> {
+    fn read_head(&mut self, input: &[u8]) -> Result<Option<Read>, &'static str> {
         let window = &input[..input.len().min(HEADER_LIMIT)];
-        let from = self.searched.saturating_sub(2);
+        let from = self.searched.min(window.len()).saturating_sub(2);
         if !has_empty_line(&window[from..]) {
             self.searched = window.len();
             return if window.len() == HEADER_LIMIT {
@@ -189,14 +167,13 @@ impl Reader {
             Some((path, _)) => (path, true),
             None => (target, false),
         };
-        Ok(Some(Head {
+        Ok(Some(Read::Head {
             request: Request {
                 method: String::from(method),
                 path: String::from(path),
                 query,
                 authorization,
                 close,
-                body: Vec::new(),
             },
             length,
             body: content_length.unwrap_or(0),
@@ -259,11 +236,61 @@ pub(crate) fn write(answer: &Answer, close: bool, out: &mut Vec<u8>) {
     out.extend_from_slice(&answer.body);
 }
 
-/// One connection's HTTP: the decrypted bytes in, the answers out.
+/// The bytes of request bodies the server may still hold, shared by every connection.
+#[derive(Debug)]
+pub(crate) struct Budget {
+    free: usize,
+}
+
+impl Budget {
+    pub(crate) fn new(size: usize) -> Self {
+        Self { free: size }
+    }
+
+    /// Takes `size` bytes, when they are free.
+    fn take(&mut self, size: usize) -> bool {
+        match self.free.checked_sub(size) {
+            Some(free) => {
+                self.free = free;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Gives back `size` bytes.
+    fn give(&mut self, size: usize) {
+        self.free += size;
+    }
+
+    /// The bytes free.
+    #[cfg(test)]
+    pub(crate) fn free(&self) -> usize {
+        self.free
+    }
+}
+
+/// A call whose head was admitted and whose body is arriving.
+#[derive(Debug)]
+struct Pending {
+    call: Call,
+    /// The body's length, which the session holds from the budget.
+    length: usize,
+    /// The client asked for the connection to close after this answer.
+    close: bool,
+}
+
+/// One connection's HTTP: the decrypted bytes in, the answers out. A request's head is read and
+/// its token checked before any of its body: a body is read only for a call that takes one and
+/// is allowed, and only when the body budget holds it.
 #[derive(Debug, Default)]
 pub(crate) struct Session {
     input: Vec<u8>,
     reader: Reader,
+    /// The call whose body is arriving.
+    pending: Option<Pending>,
+    /// The bytes this session holds from the body budget.
+    reserved: usize,
     /// Answers not yet taken by TLS; `taken` of them have been.
     output: Vec<u8>,
     taken: usize,
@@ -289,10 +316,14 @@ impl Session {
         self.refusing
     }
 
-    /// Whether the session reads more: it is not closing and its input is under one request at
-    /// its limits.
-    pub(crate) fn wants_input(&self) -> bool {
-        !self.closing && self.input.len() < INPUT_LIMIT
+    /// How many more decrypted bytes the session wants now: the rest of a head, up to its limit,
+    /// or the rest of an admitted body. None once it is closing.
+    pub(crate) fn wanted(&self) -> usize {
+        if self.closing {
+            return 0;
+        }
+        let target = self.pending.as_ref().map_or(HEADER_LIMIT, |p| p.length);
+        target.saturating_sub(self.input.len())
     }
 
     /// Decrypted bytes from the client.
@@ -311,7 +342,7 @@ impl Session {
     pub(crate) fn take(&mut self, count: usize) {
         self.taken = (self.taken + count).min(self.output.len());
         if self.taken == self.output.len() {
-            self.output.clear();
+            self.output = Vec::new();
             self.taken = 0;
         }
     }
@@ -326,42 +357,102 @@ impl Session {
         self.finished = true;
     }
 
+    /// Gives back what the session holds from the body budget: when a body has been answered,
+    /// or the connection is gone.
+    pub(crate) fn release(&mut self, budget: &mut Budget) {
+        budget.give(self.reserved);
+        self.reserved = 0;
+    }
+
+    /// Queues `answer`, closing after it when `close`.
+    fn reply(&mut self, answer: &Answer, close: bool) {
+        write(answer, close, &mut self.output);
+        if close {
+            self.close();
+        }
+    }
+
+    /// Reads no more: the input goes, and the connection closes once its output has gone.
+    fn close(&mut self) {
+        self.closing = true;
+        self.pending = None;
+        self.input = Vec::new();
+    }
+
     /// Answers the requests that have arrived, one at a time: the next is read only when the
     /// last answer has all been taken. Says whether anything was answered.
-    pub(crate) fn serve(&mut self, api: &mut Api, now: u64) -> bool {
+    pub(crate) fn serve(&mut self, api: &mut Api, budget: &mut Budget, now: u64) -> bool {
         let mut answered = false;
         while !self.closing && self.output.is_empty() {
-            let (answer, close) = match self.reader.read(&self.input) {
-                Read::Incomplete => {
+            if let Some(length) = self.pending.as_ref().map(|p| p.length) {
+                if self.input.len() < length {
                     if self.finished {
-                        self.closing = true;
-                        self.input = Vec::new();
+                        self.release(budget);
+                        self.close();
                         answered = true;
                     }
                     break;
                 }
-                Read::Request(request, length) => {
-                    self.input.drain(..length);
-                    if self.refusing {
-                        (busy(), true)
-                    } else {
-                        let answer = api.answer(&request, now);
-                        let close = request.close || answer.close;
-                        (answer, close)
+                let Some(pending) = self.pending.take() else {
+                    break;
+                };
+                let answer = api.complete(pending.call, &self.input[..length], now);
+                self.input.drain(..length);
+                self.release(budget);
+                // Keep no room a body needed once it is answered.
+                self.input.shrink_to(2 * HEADER_LIMIT);
+                let close = pending.close || answer.close;
+                self.reply(&answer, close);
+                answered = true;
+                continue;
+            }
+            match self.reader.read(&self.input) {
+                Read::Incomplete => {
+                    if self.finished {
+                        self.close();
+                        answered = true;
                     }
+                    break;
                 }
                 Read::Refused(message) => {
-                    if self.refusing {
-                        (busy(), true)
+                    let answer = if self.refusing {
+                        busy()
                     } else {
-                        (Answer::error(ErrorCode::Invalid, message), true)
+                        Answer::error(ErrorCode::Invalid, message)
+                    };
+                    self.reply(&answer, true);
+                }
+                Read::Head {
+                    request,
+                    length,
+                    body,
+                } => {
+                    self.input.drain(..length);
+                    if self.refusing {
+                        self.reply(&busy(), true);
+                    } else {
+                        match api.admit(&request, body, now) {
+                            // Answered from the head: a body that follows is never read, so
+                            // the stream cannot go on past it.
+                            Admission::Answer(answer) => {
+                                let close = request.close || answer.close || body > 0;
+                                self.reply(&answer, close);
+                            }
+                            Admission::Body(call) if budget.take(body) => {
+                                self.reserved = body;
+                                self.input.reserve_exact(
+                                    (body + RECORD_SLACK).saturating_sub(self.input.len()),
+                                );
+                                self.pending = Some(Pending {
+                                    call,
+                                    length: body,
+                                    close: request.close,
+                                });
+                            }
+                            Admission::Body(_) => self.reply(&budget_spent(), true),
+                        }
                     }
                 }
-            };
-            write(&answer, close, &mut self.output);
-            if close {
-                self.closing = true;
-                self.input = Vec::new();
             }
             answered = true;
         }
@@ -374,6 +465,14 @@ fn busy() -> Answer {
     Answer::error(
         ErrorCode::Busy,
         "the node has 64 open connections; try again later",
+    )
+}
+
+/// The answer to a request whose body the body budget cannot hold now.
+fn budget_spent() -> Answer {
+    Answer::error(
+        ErrorCode::Busy,
+        "the node holds as many request bodies as it can; try again later",
     )
 }
 

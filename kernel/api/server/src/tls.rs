@@ -129,9 +129,14 @@ impl Tls {
         }
     }
 
-    /// Whether the handshake is done.
+    /// Whether this side may send application data: its part of the handshake is done.
     pub(crate) fn ready(&self) -> bool {
         self.ready
+    }
+
+    /// Whether the handshake is still going: until the client's Finished has been read.
+    pub(crate) fn handshaking(&self) -> bool {
+        self.conn.is_handshaking()
     }
 
     /// Whether the client has said it sends nothing more (its close_notify).

@@ -1,10 +1,12 @@
 //! The server end to end, through real rustls clients over an in-memory transport (item 2.2):
-//! the handshake, each operation's answer field for field as 2A, and each limit.
+//! the handshake, each operation's answer field for field as 2A, each limit, and the order of
+//! head, token and body that bounds memory.
 mod common;
 
 use common::{Harness, INSTANCE, WALL, pinned};
 use moruna_api_server::{
-    BODY_LIMIT, CONNECTION_LIMIT, HEADER_LIMIT, IDLE_LIMIT_MS, Identity, NodeFacts,
+    BODY_BUDGET, BODY_LIMIT, CONNECTION_LIMIT, HANDSHAKE_LIMIT_MS, HEADER_LIMIT, IDLE_LIMIT_MS,
+    Identity, NodeFacts, OPEN_LIMIT,
 };
 use rustls::ClientConfig;
 use serde_json::json;
@@ -194,24 +196,43 @@ fn headers_over_16_kib_are_invalid_then_close() {
     assert!(harness.clients[client].server_closed());
 }
 
+/// A POST to `/mcp` of `body`, carrying `token` when one is given.
+fn mcp_post(token: Option<&str>, body: &[u8]) -> Vec<u8> {
+    let bearer = token.map(Harness::bearer).unwrap_or_default();
+    let mut request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: node\r\n{bearer}Content-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    request
+}
+
+/// An MCP ping padded to exactly `size` bytes.
+fn ping_of(size: usize) -> Vec<u8> {
+    let start = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"pad":""#;
+    let end = r#""}}"#;
+    let mut body = start.as_bytes().to_vec();
+    body.resize(size - end.len(), b'x');
+    body.extend_from_slice(end.as_bytes());
+    body
+}
+
 #[test]
 fn a_body_over_1_mib_is_invalid_then_close() {
     let mut harness = Harness::new();
     let client = harness.connect();
-    // At the limit the body is read whole and the request answered (GET takes no body).
-    let bearer = Harness::bearer(&harness.token(&["observe"]));
-    let mut at_limit = format!(
-        "GET /v1/node HTTP/1.1\r\nHost: node\r\n{bearer}Content-Length: {BODY_LIMIT}\r\n\r\n"
-    )
-    .into_bytes();
-    at_limit.resize(at_limit.len() + BODY_LIMIT, b'x');
-    let response = harness.exchange(client, &at_limit);
-    assert_eq!(response.status, 400);
+    // At the limit the body is read whole and the message answered.
+    let observe = harness.token(&["observe"]);
+    let response = harness.exchange(client, &mcp_post(Some(&observe), &ping_of(BODY_LIMIT)));
+    assert_eq!(response.status, 200);
+    assert_eq!(response.json()["result"], json!({}));
     assert_eq!(response.header("connection"), None, "kept alive");
     assert_eq!(harness.get(client, "/v1/health", "").status, 200);
     // One byte over: refused on its head, before any of the body.
     let over = format!(
-        "GET /v1/node HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\n\r\n",
+        "POST /mcp HTTP/1.1\r\nHost: node\r\n{}Content-Length: {}\r\n\r\n",
+        Harness::bearer(&observe),
         BODY_LIMIT + 1
     );
     let response = harness.exchange(client, over.as_bytes());
@@ -219,6 +240,93 @@ fn a_body_over_1_mib_is_invalid_then_close() {
     assert_eq!(response.error_code(), "invalid");
     assert_eq!(response.header("connection"), Some("close"));
     assert!(harness.clients[client].server_closed());
+}
+
+#[test]
+fn a_body_is_never_read_for_a_call_its_token_does_not_allow() {
+    let mut harness = Harness::new();
+    let observe = harness.token(&["observe"]);
+    let nothing = harness.token(&[]);
+    let mut audit = format!(
+        "GET /v1/node/audit HTTP/1.1\r\nHost: node\r\n{}Content-Length: {BODY_LIMIT}\r\n\r\n",
+        Harness::bearer(&observe)
+    )
+    .into_bytes();
+    audit.resize(audit.len() + BODY_LIMIT, b'x');
+    for (request, status) in [
+        (mcp_post(None, &ping_of(BODY_LIMIT)), 401),
+        (mcp_post(Some("not.a.token"), &ping_of(BODY_LIMIT)), 401),
+        (mcp_post(Some(&nothing), &ping_of(BODY_LIMIT)), 403),
+        (audit, 400),
+    ] {
+        let client = harness.connect();
+        let response = harness.exchange(client, &request);
+        assert_eq!(response.status, status);
+        assert_eq!(response.header("connection"), Some("close"));
+        assert!(harness.clients[client].server_closed());
+        let unread = harness.clients[client].pipe.borrow().to_server.len();
+        assert!(
+            unread > BODY_LIMIT - 64 * 1024,
+            "the body stayed in the transport: {unread} bytes unread"
+        );
+    }
+}
+
+#[test]
+fn bodies_share_8_mib_and_one_that_does_not_fit_is_busy_then_closed() {
+    let mut harness = Harness::new();
+    let observe = harness.token(&["observe"]);
+    let head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: node\r\n{}Content-Length: {BODY_LIMIT}\r\n\r\n",
+        Harness::bearer(&observe)
+    );
+    // Eight requests whose 1 MiB bodies have not arrived hold the whole budget.
+    let holders: Vec<usize> = (0..BODY_BUDGET / BODY_LIMIT)
+        .map(|_| {
+            let client = harness.connect();
+            harness.clients[client].send(head.as_bytes());
+            client
+        })
+        .collect();
+    harness.settle();
+    assert!(
+        holders
+            .iter()
+            .all(|&c| harness.clients[c].response().is_none())
+    );
+    let over = harness.connect();
+    let response = harness.exchange(over, head.as_bytes());
+    assert_eq!(response.status, 503);
+    assert_eq!(response.error_code(), "busy");
+    assert_eq!(response.header("connection"), Some("close"));
+    assert!(harness.clients[over].server_closed());
+    // One body arrives and is answered; its share is free again.
+    let body = ping_of(BODY_LIMIT);
+    harness.clients[holders[0]].send(&body);
+    harness.settle();
+    assert_eq!(harness.clients[holders[0]].response().unwrap().status, 200);
+    let again = harness.connect();
+    let response = harness.exchange(again, &mcp_post(Some(&observe), &body));
+    assert_eq!(response.status, 200);
+    // A head alone takes the last free share again.
+    harness.clients[again].send(head.as_bytes());
+    harness.settle();
+    let spent = harness.connect();
+    assert_eq!(harness.exchange(spent, head.as_bytes()).status, 503);
+    // A holder that goes gives its share back.
+    harness.clients[holders[1]].hang_up();
+    harness.settle();
+    assert!(harness.clients[holders[1]].server_closed());
+    let fits = harness.connect();
+    harness.clients[fits].send(head.as_bytes());
+    harness.settle();
+    assert!(
+        harness.clients[fits].response().is_none(),
+        "held, waiting for its body"
+    );
+    harness.clients[fits].send(&body);
+    harness.settle();
+    assert_eq!(harness.clients[fits].response().unwrap().status, 200);
 }
 
 #[test]
@@ -272,14 +380,60 @@ fn a_connection_idle_for_60_s_is_closed() {
 }
 
 #[test]
-fn a_client_that_never_finishes_its_handshake_is_closed_when_idle() {
+fn a_handshake_not_finished_within_10_s_is_closed() {
     let mut harness = Harness::new();
     let client = harness.connect();
-    // The client's hello never leaves it.
     harness.server.poll();
-    harness.clock.advance(IDLE_LIMIT_MS);
+    assert_eq!(harness.server.deadline(), Some(1_000 + HANDSHAKE_LIMIT_MS));
+    // A client that keeps sending a byte of a record's header now and then, and never finishes
+    // its handshake.
+    for (at, byte) in [0x16, 0x03, 0x01].into_iter().enumerate() {
+        harness.clock.advance(3_000);
+        harness.clients[client]
+            .pipe
+            .borrow_mut()
+            .to_server
+            .push_back(byte);
+        harness.server.poll();
+        assert!(!harness.clients[client].server_closed(), "byte {at}");
+    }
+    harness.clock.advance(1_000);
     harness.server.poll();
-    assert!(harness.clients[client].server_closed());
+    assert!(harness.clients[client].server_closed(), "closed at 10 s");
+    // A handshake that finished is not held to the limit.
+    let done = harness.connect();
+    harness.settle();
+    harness.clock.advance(HANDSHAKE_LIMIT_MS + 1);
+    assert_eq!(harness.get(done, "/v1/health", "").status, 200);
+    assert_eq!(
+        harness.server.deadline(),
+        Some(harness.clock.ms.get() + IDLE_LIMIT_MS)
+    );
+}
+
+#[test]
+fn the_81st_connection_is_closed_at_once_with_no_answer() {
+    let mut harness = Harness::new();
+    let clients: Vec<usize> = (0..OPEN_LIMIT).map(|_| harness.connect()).collect();
+    assert_eq!(harness.server.connections(), OPEN_LIMIT);
+    let extra = harness.connect();
+    assert!(harness.clients[extra].server_closed(), "closed at once");
+    assert_eq!(harness.server.connections(), OPEN_LIMIT);
+    harness.settle();
+    assert!(harness.clients[extra].tls.is_handshaking());
+    assert!(harness.clients[extra].received.is_empty());
+    // The first 64 are served; the rest, up to 80, are busy.
+    assert_eq!(harness.get(clients[0], "/v1/health", "").status, 200);
+    assert_eq!(
+        harness
+            .get(clients[OPEN_LIMIT - 1], "/v1/health", "")
+            .status,
+        503
+    );
+    // With one gone, a new connection is taken again.
+    let next = harness.connect();
+    assert!(!harness.clients[next].server_closed());
+    assert_eq!(harness.server.connections(), OPEN_LIMIT);
 }
 
 #[test]
