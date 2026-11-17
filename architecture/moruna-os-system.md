@@ -152,8 +152,10 @@ One process, `platform`. In order, it:
    - `functions` is optional: `keys` holds 0 to 8 keys that may sign function images (3E), and
      `cache_bytes` defaults to 1 GiB.
    - Unknown fields are refused. A missing or invalid config is fatal.
-4. **Hands `api` its config** (token keys, TLS identity, wall clock, instance ID) over a channel
-   the supervisor links.
+4. **Hands `api` its config** (token keys, TLS identity, wall clock, instance ID, the machine's
+   memory) over a channel the supervisor links. The memory is the root account's total, which
+   the supervisor reads and passes to `platform` at start. `api` answers `ready` within 10 s, or
+   it is fatal.
 5. **Prints** the `cloud` and `ready` lines.
 
 - **By default node config holds no secrets.** Without `tls`, `api` makes an ECDSA P-256 key and a
