@@ -75,7 +75,7 @@ Implements the OS design, section 1, OpenStack column.
   ```
   moruna: core <version> cpus=<n> memory=<bytes>
   moruna: services started
-  moruna: network wan <address>/<prefix> gateway <address>
+  moruna: network wan <address>/<prefix> gateway <address|none>
   moruna: cloud <openstack|azure|none> instance <id>
   moruna: tls sha256=<fingerprint>
   moruna: ready api=<address>:443 boot_ms=<n>
@@ -106,7 +106,11 @@ Implements the OS design, section 1, OpenStack column.
   interface wan card=net0 dhcp
   ```
 
-- **One port listens: TCP 443,** owned by `api`. Nothing else accepts connections.
+- **One port listens: TCP 443,** owned by `api`. Nothing else accepts connections. `api` listens on
+  `wan`'s leased address, and moves its listener when the lease's address changes.
+- **`devices` lives as long as the node.** Started by the node's supervisor, it serves until the
+  supervisor stops it, not until its last client leaves. Clients come and go: the network server
+  at start, `node-admission` for each job's volumes (3C).
 - **Outbound is denied unless granted.** In steps 1 and 2 only `platform` has grants:
   `169.254.169.254` port 80 (instance data), and on Azure `168.63.129.16` port 80 (the "ready"
   report).
@@ -180,6 +184,7 @@ One process, `platform`. In order, it:
 | 1.1 | The `cloud` profile for step 1; boot its image in QEMU under UEFI firmware with one virtio disk and one virtio network card (1A) | A script boots it to `services started` on 1 and 2 CPUs | 0.1 |
 | 1.2 | The boot lines, the limits, deadlines on boot waits, and ACPI S5 power-off on a fatal error (1B) | Each line appears in order; each limit, when forced, gives its `fatal` line and the machine powers off by S5 | 1.1 |
 | 1.3 | DHCP on `wan`; `api` owning 443 and closing each connection; the outbound grant (1C) | A connection from the host reaches 443; one to any other port is refused; `api` cannot connect out | 1.1 |
+| 1.3b | The network server hardened for a public port: the smoltcp underflow, socket memory bounded per grant | 10,000 abandoned connections never exceed the grant; the suite passes | 1.3 |
 | 1.4 | `platform`: instance data, wall clock, node config v1, the hand-over to `api` (1D) | Booted against fake OpenStack data: the `cloud` and `ready` lines appear; each invalid config is refused with its reason | 1.2, 1.3 |
 | 1.5 | The qcow2 and VHD formats and the upload recipe, `kernel/node/OPENSTACK.md` (1A, 1E) | Each format boots in QEMU; the recipe's commands are complete | 1.1 |
 | 1.6 | Bring-up on Servercore (1E) | 1E's success, on Servercore | 1.4, 1.5, credentials |
