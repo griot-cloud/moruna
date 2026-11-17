@@ -154,6 +154,14 @@ pub fn run_all(f: &Fixtures) -> Results {
         ));
         r.push((
             if protect {
+                "p_answers_of_batches_in_flight_in_order_protect"
+            } else {
+                "p_answers_of_batches_in_flight_in_order_unmap"
+            },
+            answers_in_order(f, protect),
+        ));
+        r.push((
+            if protect {
                 "dp_i3_checked_unwritable_protect"
             } else {
                 "dp_i3_checked_unwritable_unmap"
@@ -355,6 +363,62 @@ pub fn several_records(f: &Fixtures, protect: bool) -> Result<(), String> {
     )?;
     same(p.exit_code(task), Some(0), "the exit code the task said")?;
     empty(&p, "nothing left")
+}
+
+/// Stream P: with batches in flight, the task answers each in turn, its records then its
+/// release, and the engine is given them in that order, whatever one look of its rings finds:
+/// every record of a batch before the batch's release, and no record of a later batch before
+/// it. Its looks used to give every record found before every release found, so a later
+/// batch's record came before an earlier batch's release, and a stage that takes a batch's
+/// records up to its release took the later one's (the NYC gate, "it said a batch was done
+/// without a record for it", 2026-11-17). One record a batch, and three.
+pub fn answers_in_order(f: &Fixtures, protect: bool) -> Result<(), String> {
+    for (behave, parts) in [(Behave::Echo, 1usize), (Behave::Split(3), 3)] {
+        let mut p = plane(protect);
+        let (task, mut t) = open(&mut p, shape(8), behave)?;
+        let region = p.region_of(task).ok_or("no region")?;
+        drive(&mut p, &mut [&mut t])?;
+        let mut offered = Vec::new();
+        for i in 0..2 {
+            let b = load(&mut p, region, f)?;
+            p.offer(task, 0, b)
+                .map_err(|e| format!("offer {i}: {e:?}"))?;
+            p.drop_batch(b).map_err(|e| format!("drop {i}: {e:?}"))?;
+            offered.push(b);
+        }
+        // The task answers both before the engine looks once.
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            for e in drive(&mut p, &mut [&mut t])? {
+                if let Event::Put { batch, .. } = &e {
+                    p.drop_batch(*batch)
+                        .map_err(|e| format!("drop out: {e:?}"))?;
+                }
+                seen.push(e);
+            }
+            if count(&seen, |e| matches!(e, Event::Released { .. })) == 2 {
+                break;
+            }
+        }
+        let order: Vec<String> = seen
+            .iter()
+            .filter_map(|e| match e {
+                Event::Put { .. } => Some(String::from("put")),
+                Event::Released { batch, .. } => Some(format!(
+                    "released {}",
+                    offered.iter().position(|b| b == batch).unwrap_or(9)
+                )),
+                _ => None,
+            })
+            .collect();
+        let mut want = Vec::new();
+        for i in 0..2 {
+            want.extend((0..parts).map(|_| String::from("put")));
+            want.push(format!("released {i}"));
+        }
+        same(order, want, &format!("{parts} records a batch, in order"))?;
+    }
+    Ok(())
 }
 
 /// DP-I1 with batches in flight: the engine posts `n` before the task runs. A group is every
