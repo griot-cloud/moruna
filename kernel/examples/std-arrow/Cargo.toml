@@ -19,6 +19,9 @@ arrow-ipc = { version = "=59.3.0", default-features = false }
 arrow-ord = { version = "=59.3.0", default-features = false }
 arrow-schema = { version = "=59.3.0", default-features = false }
 arrow-select = { version = "=59.3.0", default-features = false }
+# getrandom, as arrow-rs's hasher reaches it, with its backend on Moruna: the core's random_read.
+getrandom = { version = "0.3.4", default-features = false }
+moruna-getrandom = { path = "../../getrandom", version = "=0.1.0" }
 
 [profile.dev]
 panic = "abort"
