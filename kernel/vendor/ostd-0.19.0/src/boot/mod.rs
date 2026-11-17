@@ -23,6 +23,8 @@ use alloc::{
     vec::Vec,
 };
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use memory_region::{MemoryRegion, MemoryRegionArray};
 use spin::Once;
 
@@ -40,6 +42,23 @@ pub struct BootInfo {
     pub framebuffer_arg: Option<BootloaderFramebufferArg>,
     /// The memory regions provided by the bootloader.
     pub memory_regions: Vec<MemoryRegion>,
+}
+
+// moruna: the time-stamp counter as the boot processor ran its first Rust instruction, so the
+// core's clock counts from there and not from where OSTD's start-up ends (Moruna's system design,
+// section 1B: `boot_ms` counts from the core's first instruction).
+static ENTRY_TSC: AtomicU64 = AtomicU64::new(0);
+
+/// moruna: records the time-stamp counter as the boot processor's first Rust instruction. Each
+/// boot protocol's entry calls it first, once.
+pub(crate) fn record_entry_tsc() {
+    ENTRY_TSC.store(crate::arch::read_tsc(), Ordering::Relaxed);
+}
+
+/// moruna: the time-stamp counter as the boot processor ran its first Rust instruction, or zero
+/// if the entry that booted did not record it.
+pub fn entry_tsc() -> u64 {
+    ENTRY_TSC.load(Ordering::Relaxed)
 }
 
 /// Gets the boot information.

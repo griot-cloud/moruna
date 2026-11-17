@@ -35,6 +35,19 @@ LAUNCHER_FLAGS = (("agent_port", "--agent-port"), ("cpus", "--cpus"), ("layer", 
 # The disk's formats. `raw` is the disk itself; each other one is a file beside it.
 FORMATS = ("raw", "qcow2", "vhd")
 MIB = 1024 * 1024
+# The C of a user program (`ring`, which the network server brings in) is compiled as
+# kernel/tools/build.sh compiles it: by clang, freestanding, for the bare x86_64 ELF target.
+USER_CC = "CC_x86_64_moruna_user"
+USER_CFLAGS = "CFLAGS_x86_64_moruna_user"
+USER_C_FLAGS = "--target=x86_64-unknown-none -ffreestanding -mno-red-zone -fno-stack-protector"
+
+
+def user_c(environment):
+    """The two C compiler variables of the user build, as kernel/tools/build.sh sets them:
+    the caller's compiler, or clang; build.sh's flags, then the caller's. They name the user
+    target, so no host tool and no kernel build reads them."""
+    flags = " ".join(part for part in (USER_C_FLAGS, environment.get(USER_CFLAGS, "").strip()) if part)
+    return {USER_CC: environment.get(USER_CC) or "clang", USER_CFLAGS: flags}
 
 
 def command(args, cwd, env=None):
@@ -181,7 +194,8 @@ def main():
     env["RUSTFLAGS"] = flags
     command([*cargo, "build", *common, "-p", "moruna-microkernel-boot"], kernel, env)
     env["RUSTFLAGS"] = f"{flags} -Zunstable-options -C link-arg=-T{kernel / 'sys/user.ld'} -C link-arg=-static"
-    packages = list(dict.fromkeys([*PROGRAMS[args.profile], *args.package]))
+    env.update(user_c(os.environ))
+    packages =list(dict.fromkeys([*PROGRAMS[args.profile], *args.package]))
     package_args = [word for package in packages for word in ("-p", package)]
     user_common = ["--locked", "--offline", "--release", "--target", user_target, *std]
     # The storage service's feature names a package only the standalone node builds.

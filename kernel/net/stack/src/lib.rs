@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+pub mod boot;
 pub mod config;
 pub mod device;
 mod session;

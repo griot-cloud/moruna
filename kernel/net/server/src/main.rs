@@ -11,6 +11,13 @@
 //! most a setting's sends in flight a card. When every client and listener has gone
 //! the server lets the sockets still closing finish, for at most a second, and ends,
 //! closing its cards' connections so their drivers end too.
+//!
+//! In a node's boot (system design 1B and 1C) its first DHCP lease prints the network
+//! line, `moruna: network wan <address>/<prefix> gateway <address|none>`. With an
+//! interface set by DHCP and no lease 30 s after its start, it prints
+//! `moruna: fatal network: no DHCP lease within 30 s` and exits with failure. Whatever
+//! else ends it with failure, at its start or later, prints its `KE2 netstack: FAIL:`
+//! line and then `moruna: fatal network: <reason>`.
 
 #![no_std]
 #![no_main]
@@ -28,7 +35,11 @@ use alloc::{
 use core::cell::RefCell;
 
 use devices_protocol::directory;
-use moruna_netstack::{Card, Config, Shared, Stack, after_turn, factory, parse};
+use moruna_netstack::{
+    Card, Config, Shared, Stack, after_turn,
+    boot::{NO_LEASE, fatal},
+    factory, parse,
+};
 use moruna_svc::{
     CallError, Channel, ClientCore, Completions, Console, DEADLINE_INFINITE, Decoder, Encoder,
     Handle, Memory, Rights, Signals, Timer, Watch, Wire, deadline_in, limits, now, println, random,
@@ -338,13 +349,17 @@ fn open_cards(
 }
 
 fn run() -> i64 {
+    // The server's start, which its wait for a first DHCP lease is counted from.
+    let started = now();
     let Some(out) = start::take("console").map(Console) else {
         return 90;
     };
-    match serve(&out) {
-        Ok(()) => 0,
+    match serve(&out, started) {
+        Ok(code) => code,
         Err(e) => {
             println!(out, "KE2 netstack: FAIL: {}", e);
+            // The node's failure line, last (system design 1B).
+            println!(out, "{}", fatal(&e));
             1
         }
     }
@@ -358,7 +373,9 @@ fn mac_text(mac: u64) -> String {
     )
 }
 
-fn serve(out: &Console) -> Result<(), String> {
+/// Serves until every client has left (0), or until the first DHCP lease is overdue
+/// (1, its fatal line printed).
+fn serve(out: &Console, started: u64) -> Result<i64, String> {
     let text = read_config()?;
     let config = parse(&text).map_err(|e| format!("the configuration: {e}"))?;
     let mut seed = [0u8; 8];
@@ -479,6 +496,14 @@ fn serve(out: &Console) -> Result<(), String> {
         for note in core::mem::take(&mut shared.stack.borrow_mut().notes) {
             println!(out, "KE2 netstack: {}", note);
         }
+        // The boot's lines, exactly as the stack wrote them.
+        for line in core::mem::take(&mut shared.stack.borrow_mut().boot) {
+            println!(out, "{}", line);
+        }
+        if shared.stack.borrow().lease_overdue(started, now()) {
+            println!(out, "{}", NO_LEASE);
+            return Ok(1);
+        }
         {
             let mut links = cards.borrow_mut();
             for (index, l) in links.iter_mut().enumerate() {
@@ -502,12 +527,14 @@ fn serve(out: &Console) -> Result<(), String> {
             }
         }
         let next = shared.stack.borrow_mut().poll_at();
-        // At the stack's next deadline (now, when frames wait), or the linger's end;
-        // disarmed (zero) when neither is due.
-        let deadline = match (next, linger) {
-            (Some(n), Some(l)) => n.min(l),
-            (n, l) => n.or(l).unwrap_or(0),
-        };
+        let lease = shared.stack.borrow().lease_due(started);
+        // At the stack's next deadline (now, when frames wait), the linger's end, or
+        // when the first lease is due; disarmed (zero) when none is.
+        let deadline = [next, linger, lease]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(0);
         timer
             .set(if deadline == 0 { 0 } else { deadline.max(1) })
             .map_err(|e| format!("timer_set: {}", e.name()))?;
@@ -529,5 +556,5 @@ fn serve(out: &Console) -> Result<(), String> {
     // the connections ends them and the drivers see their last client leave.
     drop(d);
     drop(cards);
-    Ok(())
+    Ok(0)
 }
