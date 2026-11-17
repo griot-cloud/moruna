@@ -18,14 +18,22 @@ measures it as bench/vm/driver.py does:
 - **Elsewhere (the Mac's check):** CPU-seconds are the children's rusage, user and system; peak
   memory is the largest one process reached (`ru_maxrss`), not the run's total, and is marked so.
 
-Start-up is from the process's start to the engine's `ready` mark (engine.py); operational time
-from `ready` to `done`, the output written. For the Rust pool, operational time is its own
-`wall_s` and start-up the rest of the process's life before it.
+Operational time runs from the job's being handed to the ready engine (engine.py's `start`) to
+the output durably written (`done`); start-up is everything before `start`: the process, the
+imports, the session or cluster. Every mark is kept. For the Rust pool, operational time is its
+own `wall_s` and start-up the rest of the process's life before it.
+
+**Data.** With a store in the environment (store.py), the spec's `inputs` are blob names and its
+`output` a blob prefix, and the engine reads and writes them itself. An engine with no Blob
+reader (`LOCAL_COPY`: the Rust pool) gets a local copy, timed apart: its inputs are downloaded
+before it starts (`copy_in_s`) and its output uploaded after it ends (`copy_out_s`), and its
+record says `data: local copy`. Without a store, everything is local.
 
 The output is reduced to its canonical form (gate-canon/1: `gate-canon` when it is built, else
-bench/vm/canon.py) and compared with the reference's: a dump `gate-canon` wrote, or a canon.py
-JSON with its tolerant rows. `check` does the same for an output another machine wrote (the
-Moruna node's), fetched from Blob first with `--blob-prefix`. Each writes RESULTS/ID.json and prints it on one line after `MEASURED `.
+bench/vm/canon.py), after it is fetched from Blob outside every timing, and compared with the
+reference's: a dump `gate-canon` wrote, or a canon.py JSON with its tolerant rows. `check` does
+the same for an output another machine wrote (the Moruna node's) under `--blob-prefix`. Each
+writes RESULTS/ID.json and prints it on one line after `MEASURED `.
 """
 import argparse
 import json
@@ -40,11 +48,15 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 VM = os.environ.get("BENCH_VM", os.path.abspath(os.path.join(HERE, "..", "..", "vm")))
 sys.path.insert(0, VM)
+import store as stores  # noqa: E402, store.py beside this file
+
 CG = "/sys/fs/cgroup/bench"
 GiB = 1 << 30
-PYTHON_ENGINES = ("moruna066", "moruna066-rust", "duckdb", "polars", "ray", "spark", "dask")
 VENV = {"moruna066": "moruna066", "moruna066-rust": "moruna066", "ray": "ray", "spark": "spark",
-        "dask": "dask", "duckdb": "duckdb", "polars": "polars"}
+        "dask": "dask", "duckdb": "duckdb", "duckdb-sql": "duckdb", "polars": "polars", "polars-expr": "polars"}
+PYTHON_ENGINES = tuple(VENV)
+# Engines with no Blob reader of their own: a local copy, timed apart (the PM, 2026-11-18).
+LOCAL_COPY = ("rust-pool",)
 
 
 def wr(path, value):
@@ -60,7 +72,8 @@ def rd(path):
 
 
 def command(spec, root, out, flist, tmp, report):
-    """The run's command line: engine.py in the engine's environment, or the Rust pool's binary."""
+    """The run's command line: engine.py in the engine's environment, or the Rust pool's binary.
+    `out` is a local directory, or a blob prefix when the engine writes Blob itself."""
     e = spec["engine"]
     if e == "rust-pool":
         return [os.path.join(root, "bin", "gate-baseline"), "--job", spec["workload"], "--files", flist,
@@ -68,8 +81,8 @@ def command(spec, root, out, flist, tmp, report):
     if e not in PYTHON_ENGINES:
         raise ValueError(f"measure.py: no engine {e!r}")
     cmd = [os.path.join(root, f"venv-{VENV[e]}", "bin", "python"), "-I", os.path.join(HERE, "engine.py"),
-           "--engine", e, "--workload", spec["workload"], "--files", flist, "--out", out,
-           "--cpus", str(spec["cpus"]), "--mem-gib", str(spec["mem_gib"]), "--tmp", tmp,
+           "--engine", e, "--workload", spec["workload"], "--inputs", flist, "--out", out,
+           "--cpus", str(spec["cpus"]), "--mem-gib", str(spec["mem_gib"]), "--tmp", tmp, "--root", root,
            "--batch", str(spec.get("batch", 0)), "--report", report]
     if spec.get("staging"):
         cmd += ["--staging", spec["staging"]]
@@ -85,8 +98,9 @@ def environment(spec, tmp):
            "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
            "VECLIB_MAXIMUM_THREADS": "1", "POLARS_MAX_THREADS": str(spec["cpus"]),
            "PYTHONPATH": VM, "TMPDIR": tmp}
-    if os.environ.get("JAVA_HOME"):
-        env["JAVA_HOME"] = os.environ["JAVA_HOME"]
+    for k in ("JAVA_HOME", "BENCH_ACCOUNT", "BENCH_KEY", "BENCH_CONTAINER", "BENCH_ENDPOINT"):
+        if os.environ.get(k):
+            env[k] = os.environ[k]
     env.update(spec.get("env", {}))
     return env
 
@@ -173,15 +187,18 @@ def execute(spec, cmd, env, timeout):
 
 
 def phases(result, t_spawn, t_end):
-    """Start-up and operational time from the engine's marks (engine.py), or from the Rust pool's
-    own wall time."""
+    """Start-up and operational time from the engine's marks (engine.py): the job handed to the
+    ready engine (`start`) to the output durably written (`done`), and everything before `start`;
+    or the Rust pool's own wall time."""
     marks = (result or {}).get("marks") or {}
-    if marks.get("ready") and marks.get("done"):
-        return {"startup_s": round(marks["ready"] - t_spawn, 3), "operational_s": round(marks["done"] - marks["ready"], 3),
-                "interpreter_s": round(marks["main"] - t_spawn, 3) if marks.get("main") else None,
-                "imports_s": round(marks["imported"] - marks["main"], 3) if marks.get("imported") and marks.get("main") else None,
-                "session_s": round(marks["ready"] - marks["imported"], 3) if marks.get("imported") else None,
-                "shutdown_s": round(t_end - marks["done"], 3)}
+    start = marks.get("start") or marks.get("ready")
+    if start and marks.get("done"):
+        r = lambda x: round(x, 3) if x is not None else None  # noqa: E731
+        gap = lambda a, b: r(marks[b] - marks[a]) if marks.get(a) and marks.get(b) else None  # noqa: E731
+        return {"startup_s": r(start - t_spawn), "operational_s": r(marks["done"] - start),
+                "interpreter_s": r(marks["main"] - t_spawn) if marks.get("main") else None,
+                "imports_s": gap("main", "imported"), "session_s": gap("imported", "ready"),
+                "handover_s": gap("ready", "start"), "shutdown_s": r(t_end - marks["done"])}
     if (result or {}).get("engine") in ("rust-pool", "rust-baseline") and result.get("wall_s") is not None:
         # gate-baseline's own RESULT names its engine `rust-baseline`, as bench/vm's runs did.
         return {"startup_s": round(max(t_end - t_spawn - result["wall_s"], 0.0), 3),
@@ -296,18 +313,43 @@ def run(a):
         os.makedirs(spec["profiles"], exist_ok=True)
     if spec.get("staging"):
         os.makedirs(spec["staging"], exist_ok=True)
+    store = stores.Store.from_env()
+    data = {"data": "local"}
+    inputs, target = spec.get("files", []), out
+    if store and spec["engine"] in LOCAL_COPY:
+        # No Blob reader: the inputs come to the local disk before the engine starts, timed apart.
+        local_in = os.path.join(work, "in", rid)
+        shutil.rmtree(local_in, ignore_errors=True)
+        t = time.time()
+        copied = sum(store.download(n, local_in) for n in spec["inputs"])
+        inputs = [os.path.join(local_in, os.path.basename(n)) for n in spec["inputs"]]
+        data = {"data": "local copy", "copy_in_s": round(time.time() - t, 3), "copy_in_bytes": copied}
+    elif store:
+        inputs, target = spec["inputs"], spec["output"]
+        data = {"data": "blob"}
     flist = os.path.join(tmp, "files")
-    open(flist, "w").write("\n".join(spec["files"]))
+    open(flist, "w").write("\n".join(inputs))
     os.makedirs(a.results, exist_ok=True)
     report = os.path.join(os.path.abspath(a.results), f"{rid}.report.json")
-    cmd = command(spec, a.root, out, flist, tmp, report)
+    cmd = command(spec, a.root, target, flist, tmp, report)
     code, stdout, stderr, t0, t1, totals = execute(spec, cmd, environment(spec, tmp), spec.get("timeout_s", 1800))
     result = next((json.loads(line[7:]) for line in stdout.splitlines() if line.startswith("RESULT ")), None)
     rec = {"spec": spec, "command": cmd, "exit_code": code, "wall_s": round(t1 - t0, 3), "result": result,
-           **totals, **phases(result, t0, t1)}
+           "memory_gib": spec.get("mem_gib"), **data, **totals, **phases(result, t0, t1)}
     rec["ok"] = code == 0 and result is not None and not result.get("error")
     if not rec["ok"]:
         rec["stderr"] = stderr
+    if rec["ok"] and store and data["data"] == "local copy":
+        t = time.time()
+        for d, _, fs in os.walk(out):
+            for f in fs:
+                store.upload(os.path.join(d, f), f"{spec['output']}/{os.path.relpath(os.path.join(d, f), out)}")
+        rec["copy_out_s"] = round(time.time() - t, 3)
+    elif rec["ok"] and store:
+        # The engine wrote Blob: its output comes back for the check, outside every timing.
+        t = time.time()
+        store.download(spec["output"], out)
+        rec["fetch_s"] = round(time.time() - t, 3)
     rec["out_bytes"] = sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(out) for f in fs)
     if rec["ok"]:
         mine = canonical(spec["workload"], out, a.root, dump_path(a, tmp))
@@ -319,32 +361,12 @@ def run(a):
     return record(spec, rid, a.results, rec)
 
 
-def fetch(base, container, prefix, sas, dest):
-    """Every blob under `prefix` in `container`, into `dest`: the node's output, from Blob."""
-    import urllib.request
-    import xml.etree.ElementTree as ET
-    names, marker = [], ""
-    while True:
-        url = f"{base}/{container}?restype=container&comp=list&prefix={prefix}&{sas}" + (f"&marker={marker}" if marker else "")
-        root = ET.fromstring(urllib.request.urlopen(url, timeout=60).read())
-        names += [b.findtext("Name") for b in root.iter("Blob")]
-        marker = root.findtext("NextMarker") or ""
-        if not marker:
-            break
-    for name in names:
-        path = os.path.join(dest, name[len(prefix):].lstrip("/"))
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with urllib.request.urlopen(f"{base}/{container}/{name}?{sas}", timeout=600) as r, open(path, "wb") as f:
-            shutil.copyfileobj(r, f)
-    return names
-
-
 def check(a):
     """The canonical form of an output written elsewhere (the node's), against the reference."""
     if a.blob_prefix:
         shutil.rmtree(a.out, ignore_errors=True)
         os.makedirs(a.out)
-        fetch(os.environ["BASE"], "results", a.blob_prefix, os.environ["SAS_RESULTS"], a.out)
+        stores.Store.from_env().download(a.blob_prefix, a.out)
     tmp = os.path.join(os.path.abspath(a.results), f".{a.id}.tmp")
     os.makedirs(tmp, exist_ok=True)
     mine = canonical(a.workload, a.out, a.root, dump_path(a, tmp))
@@ -374,8 +396,8 @@ def main(argv=None):
     c.add_argument("--workload", required=True)
     c.add_argument("--out", required=True)
     c.add_argument("--id", required=True)
-    c.add_argument("--blob-prefix", default="", help="fetch the output from container `results` first "
-                   "(BASE and SAS_RESULTS in the environment)")
+    c.add_argument("--blob-prefix", default="", help="fetch the output from the store's container first "
+                   "(store.py: BENCH_ACCOUNT and the rest in the environment)")
     a = p.parse_args(argv)
     rec = run(a) if a.cmd == "run" else check(a)
     return 0 if rec.get("ok") and (rec.get("output_check") or {}).get("ok") is not False else 1

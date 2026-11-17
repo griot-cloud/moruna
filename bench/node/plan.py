@@ -10,21 +10,32 @@ A plan is a JSON file (`plans/nyc-2024.json`). `load` checks it and refuses an u
 - then `noise_pairs` pairs of 0.6.6 against itself, for the session's noise.
 
 0.6.6 keeps a profile store across a job's runs, emptied before its learning run, and stages to
-disk, as gate_plan.py's runs did. Every engine has the machine's CPUs; the Linux engines' memory
-is the plan's `machine.mem_gib`.
+disk, as gate_plan.py's runs did. Every engine has the machine's CPUs. Memory is what each
+platform leaves on the same machine (the PM, 2026-11-18): the plan's `machine.mem_gib` on Linux,
+the node's memory less 768 MiB on Moruna (run.py reads it from the node).
+
+**Data** (`linux_data`): `blob`, every engine reads its inputs (`inputs`, blob names under
+`nyc/`) from and writes its output (`output`, under `out/<run id>`) to the run's one container,
+with its own Blob reader (store.py); `local` (the Mac's check with no emulator) reads local files.
+
+The native-expression rows run only the jobs that have a native form (bench/vm/native_exprs.py):
+DuckDB SQL for Enrich and Occupancy, Polars expressions for Enrich.
 """
 import json
 import os
 
 JOBS = ("score", "occupancy", "enrich", "audit")
-# Every engine of 6A: where it runs, the language of its function, and its row's name.
+# Every engine of 6A and the native-expression rows: where it runs, the language of its
+# function, its row's name, and the jobs it has a form of (every job when not named).
 ENGINES = {
     "moruna-node": {"where": "node", "function": "rust", "label": "Moruna 0.7, the node"},
     "moruna066": {"where": "linux", "function": "python", "label": "0.6.6, Python function"},
     "moruna066-rust": {"where": "linux", "function": "rust", "label": "0.6.6, Rust function"},
     "rust-pool": {"where": "linux", "function": "rust", "label": "the plain Rust pool"},
     "duckdb": {"where": "linux", "function": "python", "label": "DuckDB"},
+    "duckdb-sql": {"where": "linux", "function": "sql", "label": "DuckDB SQL", "jobs": ("enrich", "occupancy")},
     "polars": {"where": "linux", "function": "python", "label": "Polars"},
+    "polars-expr": {"where": "linux", "function": "expressions", "label": "Polars expressions", "jobs": ("enrich",)},
     "ray": {"where": "linux", "function": "python", "label": "Ray"},
     "spark": {"where": "linux", "function": "python", "label": "Spark"},
     "dask": {"where": "linux", "function": "python", "label": "Dask"},
@@ -34,7 +45,12 @@ FIELDS = {"plan", "name", "dataset", "jobs", "engines", "repeats", "learning_run
           "linux_data", "timeout_s", "notes"}
 DATASET = {"name", "source_dir", "files", "rows"}
 MACHINE = {"size", "zone", "cpus", "mem_gib", "image", "os_disk_gib"}
-LINUX_DATA = ("local-copy",)
+LINUX_DATA = ("blob", "local")
+
+
+def engines_for(plan: dict, job: str) -> list:
+    """The plan's engines that have a form of `job`, in the plan's order."""
+    return [e for e in plan["engines"] if job in ENGINES[e].get("jobs", JOBS)]
 
 
 class PlanError(ValueError):
@@ -102,15 +118,18 @@ def _order(engines):
 
 
 def runs(plan: dict, root: str = "/data") -> list:
-    """Every run of `plan`, in the order they are made. Linux paths are under `root`."""
+    """Every run of `plan`, in the order they are made. Linux paths are under `root`; blob names
+    are under the run's container (store.py)."""
     m = plan["machine"]
     files = [f"{root}/nyc/{f}" for f in plan["dataset"]["files"]]
+    inputs = [f"nyc/{f}" for f in plan["dataset"]["files"]]
     out = []
 
     def add(job, engine, repeat, noise=None):
         rid = f"{job}-{engine}-r{repeat}" if noise is None else f"{job}-noise-{noise}"
         spec = {"id": rid, "job": job, "workload": job, "engine": engine, "where": ENGINES[engine]["where"],
                 "repeat": repeat, "cpus": m["cpus"], "mem_gib": m["mem_gib"], "files": files,
+                "inputs": inputs, "output": f"out/{rid}", "data": plan["linux_data"],
                 "timeout_s": plan.get("timeout_s", 1800)}
         if noise is not None:
             spec["noise"] = noise
@@ -122,7 +141,7 @@ def runs(plan: dict, root: str = "/data") -> list:
         out.append(spec)
 
     for job in plan["jobs"]:
-        engines = list(plan["engines"])
+        engines = engines_for(plan, job)
         if plan.get("learning_run", True):
             for e in _order(engines):
                 add(job, e, 0)
