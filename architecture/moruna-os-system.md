@@ -600,7 +600,18 @@ There are two kinds:
   - arguments and environment from the start page.
   - Files, sockets and processes answer "unsupported" until a function needs them. A function's
     data comes through the plane, not through files.
-- **Proof:** arrow-rs's arrays, compute and IPC run in a booted native task.
+- **Decisions from item 5.0:**
+  - the layer is modelled on Motor OS's: each `std::sys` file calls `moruna_sys::rt`;
+  - `SystemTime` reads the clock page's `realtime_base_ns`, which `platform` sets through a new
+    call, `clock_set_realtime`, on `root.clock` (granted to `platform` only). Unset, it reads as
+    1970 plus the monotonic clock;
+  - `yield_now` is a new core call, `thread_yield`;
+  - randomness comes from the core's `random_read` (getrandom's custom backend);
+  - builds are offline, from `library/vendor`;
+  - output with no log slot goes to the console;
+  - `std::os::moruna` re-exports std's own `moruna_sys`;
+  - threads default to a 2 MiB stack.
+- **Proof:** arrow-rs's arrays, compute and IPC run in a booted native task in CI's own boot image.
 
 ### 5A. Rust: `moruna-function`
 
