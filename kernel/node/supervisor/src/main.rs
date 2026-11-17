@@ -1,10 +1,19 @@
 //! Owns service process handles and their carved accounts; no spare channel ends.
+//!
+//! A node that fails says why and stops (`architecture/moruna-os-system.md`, section 1B):
+//! - the supervisor that cannot go on writes `moruna: fatal services: <reason>`;
+//! - a service not started within 5 s of the supervisor's own start is
+//!   `moruna: fatal services: <name> did not start within 5 s`;
+//! - a service that ends is `moruna: fatal service <name>: ended`.
+//!
+//! After any of them it kills every child and exits with failure, and the core, with no
+//! process left, powers the machine off.
 #![no_std]
 #![no_main]
 #![forbid(unsafe_code)]
 extern crate alloc;
 use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
-use moruna_node::{Bootstrap, Config, Lifecycle};
+use moruna_node::{Bootstrap, Config, Lifecycle, StartError, line};
 use moruna_sys::{
     Account, Channel, Console, Handle, Memory, Process, Rights, Signals, Usage, WaitItem, map, now,
     println, start, wait,
@@ -13,6 +22,7 @@ use moruna_sys::{
 moruna_sys::main!(run);
 
 struct Child {
+    name: String,
     process: Process,
     _account: Account,
     entry: u64,
@@ -102,6 +112,7 @@ fn prepare(console: &Console) -> Result<Prepared, String> {
             ),
         ];
         children.push(Child {
+            name: service.name.clone(),
             process,
             _account: account,
             entry,
@@ -204,7 +215,36 @@ fn prepare(console: &Console) -> Result<Prepared, String> {
     Ok((children, lifecycle, guardians, control))
 }
 type Descendants = Vec<(usize, u64, Process)>;
-fn collect(guardians: &[Channel], children: &mut Descendants, closing: bool) -> Result<(), String> {
+/// Why the services' children could not be collected.
+enum Uncollected {
+    /// A guardian channel's other end closed: the service that held it has ended, or is
+    /// ending.
+    Closed,
+    Failed(String),
+}
+impl From<String> for Uncollected {
+    fn from(reason: String) -> Self {
+        Self::Failed(reason)
+    }
+}
+impl From<&str> for Uncollected {
+    fn from(reason: &str) -> Self {
+        Self::Failed(reason.into())
+    }
+}
+impl core::fmt::Display for Uncollected {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Closed => f.write_str("guardian read: peer closed"),
+            Self::Failed(reason) => f.write_str(reason),
+        }
+    }
+}
+fn collect(
+    guardians: &[Channel],
+    children: &mut Descendants,
+    closing: bool,
+) -> Result<(), Uncollected> {
     for (index, guardian) in guardians.iter().enumerate() {
         loop {
             let mut bytes = [0; 16];
@@ -213,7 +253,8 @@ fn collect(guardians: &[Channel], children: &mut Descendants, closing: bool) -> 
                 Ok(message) => message,
                 Err(moruna_sys::Error::ShouldWait) => break,
                 Err(moruna_sys::Error::PeerClosed) if closing => break,
-                Err(e) => return Err(format!("guardian read: {}", e.name())),
+                Err(moruna_sys::Error::PeerClosed) => return Err(Uncollected::Closed),
+                Err(e) => return Err(format!("guardian read: {}", e.name()).into()),
             };
             let record = moruna_node::ChildRecord::decode(&bytes[..count], carried)
                 .ok_or("invalid child escrow record")?;
@@ -242,6 +283,23 @@ fn collect(guardians: &[Channel], children: &mut Descendants, closing: bool) -> 
     }
     children.retain(|(_, _, child)| !matches!(moruna_sys::wait_one(&child.0, Signals::TERMINATED, now()), Ok(seen) if seen.contains(Signals::TERMINATED)));
     Ok(())
+}
+/// The first started service whose process has ended, waiting up to a second for one. A
+/// service that ends closes its channels a moment before its process is seen to have
+/// ended, so its closed guardian channel can reach the supervisor first.
+fn ended_service(children: &[Child], lifecycle: &Lifecycle) -> Option<usize> {
+    let started: Vec<usize> = (0..children.len())
+        .filter(|index| lifecycle.state(*index) != Some(moruna_node::State::Pending))
+        .collect();
+    let mut items: Vec<_> = started
+        .iter()
+        .map(|index| WaitItem::new(&children[*index].process.0, Signals::TERMINATED))
+        .collect();
+    wait(&mut items, now().saturating_add(1_000_000_000)).ok()?;
+    items
+        .iter()
+        .position(|item| item.observed().contains(Signals::TERMINATED))
+        .map(|at| started[at])
 }
 fn shutdown(
     children: &[Child],
@@ -276,7 +334,9 @@ fn shutdown(
             complete = false;
         }
     }
-    let collect_error = collect(guardians, descendants, true).err();
+    let collect_error = collect(guardians, descendants, true)
+        .err()
+        .map(|e| format!("{e}"));
     if collect_error.is_some() {
         complete = false;
     }
@@ -317,6 +377,8 @@ fn stop_node(
 }
 
 fn run() -> i64 {
+    // The services limit counts from here, the supervisor's own start.
+    let began = now();
     let console = match take("console") {
         Ok(h) => Console(h),
         Err(_) => return 1,
@@ -325,41 +387,82 @@ fn run() -> i64 {
         Ok(c) => c,
         Err(e) => {
             println!(console, "node: startup refused: {}", e);
+            println!(console, "{}", line::fatal(&e));
             return 1;
         }
     };
     let mut descendants = Vec::new();
-    for index in 0..children.len() {
-        let child = &mut children[index];
+    let started = moruna_node::start_services(&mut lifecycle, began, now, |index| {
+        let child: &mut Child = &mut children[index];
         let mut handles: Vec<_> = child
             .handles
             .iter_mut()
             .map(|(h, name)| (h.take(), name.as_str()))
             .collect();
-        if let Err(e) = child.process.start_with(child.entry, &mut handles) {
-            println!(
-                console,
-                "node: service {} start failed: {}",
-                index,
-                e.name()
-            );
-            return stop_node(
-                &console,
-                &children,
-                &mut lifecycle,
-                &guardians,
-                &mut descendants,
-                &mut control,
-            );
-        }
-        lifecycle.started(index);
+        child.process.start_with(child.entry, &mut handles)?;
         println!(console, "node: service {} started", index);
+        Ok::<(), moruna_sys::Error>(())
+    });
+    if let Err(failure) = started {
+        match failure {
+            StartError::Refused { index, error } => {
+                println!(
+                    console,
+                    "node: service {} start failed: {}",
+                    index,
+                    error.name()
+                );
+                println!(
+                    console,
+                    "{}",
+                    line::fatal(format_args!(
+                        "{} could not start: {}",
+                        children[index].name,
+                        error.name()
+                    ))
+                );
+            }
+            StartError::Late { index } => {
+                println!(console, "{}", line::Late(&children[index].name));
+            }
+        }
+        return stop_node(
+            &console,
+            &children,
+            &mut lifecycle,
+            &guardians,
+            &mut descendants,
+            &mut control,
+        );
     }
     // System design 1B: the boot line once every service in node.conf has started.
     println!(console, "moruna: services started");
     loop {
         if let Err(e) = collect(&guardians, &mut descendants, false) {
-            println!(console, "node: child supervision failed: {}", e);
+            // A closed guardian channel is a service ending, seen before its process's end
+            // (as it is on 2 CPUs): then the line is the one for a service that ended.
+            let ended = match e {
+                Uncollected::Closed => ended_service(&children, &lifecycle),
+                Uncollected::Failed(_) => None,
+            };
+            match ended {
+                Some(index) => {
+                    lifecycle.terminated(index);
+                    println!(
+                        console,
+                        "node: critical service {} terminated; stopping node", index
+                    );
+                    println!(console, "{}", line::Ended(&children[index].name));
+                }
+                None => {
+                    println!(console, "node: child supervision failed: {}", e);
+                    println!(
+                        console,
+                        "{}",
+                        line::fatal(format_args!("child supervision failed: {e}"))
+                    );
+                }
+            }
             return stop_node(
                 &console,
                 &children,
@@ -385,6 +488,11 @@ fn run() -> i64 {
         );
         if let Err(e) = wait(&mut items, moruna_sys::DEADLINE_INFINITE) {
             println!(console, "node: service wait failed: {}", e.name());
+            println!(
+                console,
+                "{}",
+                line::fatal(format_args!("service wait failed: {}", e.name()))
+            );
             return stop_node(
                 &console,
                 &children,
@@ -401,6 +509,7 @@ fn run() -> i64 {
                     console,
                     "node: critical service {} terminated; stopping node", index
                 );
+                println!(console, "{}", line::Ended(&children[index].name));
                 return stop_node(
                     &console,
                     &children,
