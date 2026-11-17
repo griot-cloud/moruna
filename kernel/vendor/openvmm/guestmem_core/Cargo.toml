@@ -1,0 +1,61 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# moruna: this manifest is rewritten for the kernel workspace. Upstream's takes its
+# edition, rust-version, dependency versions and lints from OpenVMM's workspace
+# manifest, which is not vendored; the values here are that manifest's at e7e7df77,
+# with each dependency pinned to one version. Every difference is in ../README.md.
+[package]
+name = "guestmem_core"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+[dependencies]
+thiserror = { version = "=2.0.21", default-features = false }
+zerocopy = { version = "=0.8.63", features = ["derive"] }
+
+# moruna: OpenVMM's `[workspace.lints]`, which upstream's `[lints] workspace = true`
+# names. The sources' `#![expect(...)]` attributes are written against these levels.
+[lints.rust]
+future_incompatible = { level = "deny", priority = -2 }
+rust_2018_idioms = { level = "warn", priority = -2 }
+unused_qualifications = "warn"
+missing_docs = "warn"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(trick_rust_analyzer_into_highlighting_interpolated_bits)'] }
+
+[lints.clippy]
+allow_attributes = "warn"
+dbg_macro = "warn"
+debug_assert_with_mut_call = "warn"
+filter_map_next = "warn"
+fn_params_excessive_bools = "warn"
+implicit_clone = "warn"
+imprecise_flops = "warn"
+inefficient_to_string = "warn"
+linkedlist = "warn"
+lossy_float_literal = "warn"
+macro_use_imports = "warn"
+option_option = "warn"
+ptr_as_ptr = "warn"
+ptr_cast_constness = "warn"
+ref_as_ptr = "warn"
+ref_option_ref = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+suboptimal_flops = "warn"
+undocumented_unsafe_blocks = "warn"
+unnecessary_box_returns = "warn"
+collapsible_else_if = "allow"
+collapsible_if = "allow"
+collapsible_match = "allow"
+len_without_is_empty = "allow"
+new_without_default = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+manual_flatten = "allow"
+bool_assert_comparison = "allow"
+box_default = "allow"
+single_range_in_vec_init = "allow"
+uninlined_format_args = "allow"

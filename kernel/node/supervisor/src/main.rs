@@ -386,6 +386,8 @@ fn run() -> i64 {
             &mut control,
         );
     }
+    // System design 1B: the boot line once every service in node.conf has started.
+    println!(console, "moruna: services started");
     loop {
         if let Err(e) = collect(&guardians, &mut descendants, false) {
             println!(console, "node: child supervision failed: {}", e);

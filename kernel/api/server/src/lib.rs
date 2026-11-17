@@ -1,0 +1,62 @@
+//! The node's API server as a library (system design, section 2B): TLS 1.3, HTTP/1.1, the
+//! operations of `moruna-api` (2A) and the limits, over a byte-stream transport the caller
+//! drives.
+//!
+//! The program `moruna-node-api` wires it to the network server's sockets and to `platform`'s
+//! hand-over. Everything else is here, and tested on the host:
+//!
+//! - [`Identity`]: the operator's certificate and key, or the node's own, made at boot, and the
+//!   fingerprint the console shows.
+//! - [`Server`]: a state machine. The caller [accepts](Server::accept) each connection as a
+//!   [`Transport`], [polls](Server::poll) when a stream changes or the
+//!   [deadline](Server::deadline) passes, and supplies the time through a [`Clock`]. No threads,
+//!   no async runtime.
+//! - The limits: [`HEADER_LIMIT`] and [`BODY_LIMIT`] (over them, `invalid`),
+//!   [`CONNECTION_LIMIT`] (over it, `busy`), [`OPEN_LIMIT`] (over it, closed with no answer),
+//!   [`IDLE_LIMIT_MS`] and [`HANDSHAKE_LIMIT_MS`]; each answer over a limit closes its
+//!   connection.
+//! - Memory: a request's head is read and its token checked before any of its body, so a body
+//!   is read only for a call that takes one and is allowed; bodies share [`BODY_BUDGET`], and a
+//!   body that does not fit is answered `busy`.
+//! - Tokens (2C): every operation but `health` needs a JWT signed with Ed25519 under one of the
+//!   node's [`TokenKey`]s, for this node, expiring within [`MOST_AHEAD_SECONDS`], whose scope
+//!   covers the operation. Each call of an operation but `health` leaves an audit record; the
+//!   last [`AUDIT_LIMIT`] are kept in memory, and `node/audit` answers the newest
+//!   [`AUDIT_ANSWER_LIMIT`], newest first.
+//! - MCP (2D): `POST /mcp` on the same port with the same tokens, MCP's Streamable HTTP,
+//!   stateless, at [`PROTOCOL_VERSION`]: one tool per operation, `moruna_<id>`.
+//!
+//! The crate is `no_std` with `alloc`. On the kernel, ring's randomness comes from
+//! `moruna_svc::random`, as the network server's does.
+#![no_std]
+#![deny(unsafe_code)]
+#![warn(missing_docs)]
+
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
+
+mod api;
+mod audit;
+mod der;
+mod http;
+mod identity;
+mod mcp;
+#[cfg(target_os = "none")]
+mod random;
+mod server;
+#[cfg(test)]
+#[path = "../tests/common/signer.rs"]
+mod signer;
+mod tls;
+mod token;
+mod transport;
+
+pub use api::NodeFacts;
+pub use audit::{AUDIT_ANSWER_LIMIT, AUDIT_LIMIT};
+pub use http::{BODY_BUDGET, BODY_LIMIT, HEADER_LIMIT};
+pub use identity::{Identity, IdentityError, VALID_AFTER_SECONDS, VALID_BEFORE_SECONDS};
+pub use mcp::PROTOCOL_VERSION;
+pub use server::{CONNECTION_LIMIT, Config, HANDSHAKE_LIMIT_MS, IDLE_LIMIT_MS, OPEN_LIMIT, Server};
+pub use token::{MOST_AHEAD_SECONDS, TokenKey};
+pub use transport::{Clock, Transport, TransportError};

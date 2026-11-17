@@ -48,6 +48,70 @@ allow = ["0BSD"]
 crate = "managed"
 allow = ["0BSD"]
 
+# The crates vendored from Microsoft's OpenVMM (kernel/vendor/openvmm, item 1.9a) are MIT:
+# every file says so and the repository's LICENSE is the MIT text, but their manifests
+# name no licence. Each clarification holds only while kernel/vendor/openvmm/LICENSE,
+# which is that text as fetched, keeps this hash.
+[[licenses.clarify]]
+crate = "guestmem_core"
+expression = "MIT"
+license-files = [{ path = "../LICENSE", hash = 0x45c4defe }]
+
+[[licenses.clarify]]
+crate = "guid"
+expression = "MIT"
+license-files = [{ path = "../LICENSE", hash = 0x45c4defe }]
+
+[[licenses.clarify]]
+crate = "hvdef"
+expression = "MIT"
+license-files = [{ path = "../LICENSE", hash = 0x45c4defe }]
+
+[[licenses.clarify]]
+crate = "net_backend_core"
+expression = "MIT"
+license-files = [{ path = "../LICENSE", hash = 0x45c4defe }]
+
+[[licenses.clarify]]
+crate = "netvsp_protocol"
+expression = "MIT"
+license-files = [{ path = "../LICENSE", hash = 0x45c4defe }]
+
+[[licenses.clarify]]
+crate = "open_enum"
+expression = "MIT"
+license-files = [{ path = "../LICENSE", hash = 0x45c4defe }]
+
+[[licenses.clarify]]
+crate = "safeatomic"
+expression = "MIT"
+license-files = [{ path = "../LICENSE", hash = 0x45c4defe }]
+
+[[licenses.clarify]]
+crate = "scsi_defs"
+expression = "MIT"
+license-files = [{ path = "../LICENSE", hash = 0x45c4defe }]
+
+[[licenses.clarify]]
+crate = "storvsp_protocol"
+expression = "MIT"
+license-files = [{ path = "../LICENSE", hash = 0x45c4defe }]
+
+[[licenses.clarify]]
+crate = "vmbus_core"
+expression = "MIT"
+license-files = [{ path = "../LICENSE", hash = 0x45c4defe }]
+
+[[licenses.clarify]]
+crate = "vmbus_ring"
+expression = "MIT"
+license-files = [{ path = "../LICENSE", hash = 0x45c4defe }]
+
+[[licenses.clarify]]
+crate = "x86defs"
+expression = "MIT"
+license-files = [{ path = "../LICENSE", hash = 0x45c4defe }]
+
 [bans]
 multiple-versions = "allow"
 wildcards = "deny"
