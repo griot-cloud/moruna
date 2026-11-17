@@ -618,8 +618,9 @@ and switches to the new one when the call answers.
   - **One switch, off by default.** `MORUNA_USAGE=1 kernel/tools/build.sh OUT` adds
     `-C instrument-coverage -Zno-profiler-runtime -Cllvm-args=-instrprof-atomic-counter-update-all`
     and the features `usage` (kernel boot) and `moruna-sys/usage` (every user program). The host
-    side is `moruna` built with `moruna-runtime/usage`, which keeps the evidence in
-    `MORUNA_USAGE_DIR`. Unset, every command is what it was. Checked on the Mac against
+    side is `moruna` (`-p moruna-runtime --bin moruna-engine`) built with `--features usage`,
+    which keeps the evidence in `MORUNA_USAGE_DIR`. Unset, every command is what it was.
+    Checked on the Mac against
     `9a34ba31`: the kernel ELF, 55 of the 57 user programs and `moruna-vmm`'s binaries are the
     same files byte for byte; `storage` and `storage-maintenance` load the same bytes (every
     loadable segment) and differ only in the `.llvm.<hash>` suffixes of 89 local symbol names,
@@ -651,8 +652,13 @@ and switches to the new one when the call answers.
     build by a fingerprint (the size and first record of its `__llvm_prf_data`), which the
     report matches to the kit's program. Linux refusals per process come from the server's
     end-of-process line, which B2's personality keeps.
-  - **Not instrumented:** `moruna-engine` (the job's runtime, a musl Linux program, not an OS
-    service) and the gate's native tasks. Their native calls are in the kernel's counts.
+  - **The engine** (`moruna-engine`, a musl Linux program the gate's image carries) is built for
+    the usage run with `-C instrument-coverage` (LLVM's runtime comes with it on that target) and
+    `--features moruna-sys/usage`: at its exit it prints its counters on standard error from
+    `.fini_array`, in lines the Linux server keeps whole (under 400 bytes). The report takes it
+    with `--program`. The host CLI is the same binary built with `--features usage` and no
+    instrumentation. The gate's native tasks are not instrumented; their native calls are in
+    the kernel's counts.
   - **B2 carries over** by adding its dispatcher to the report's `DISPATCHES` table
     (`tools/usage/src/report.rs`); as a program on moruna-sys it dumps as the server does.
   - **The report** (`tools/usage`, `moruna-usage report`, Rust, its own workspace) merges each
