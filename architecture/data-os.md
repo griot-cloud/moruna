@@ -300,6 +300,8 @@ budget.
 - **Status:** new as a stated commitment of the data OS. Today's host runs more than one job per
   process.
 - **Streams:** D (the launcher), C (the engine's own driver).
+- **In mode 1** (Moruna as the node, §8 decision 6): one client per node, its jobs side by side as
+  processes kept apart by the kernel's accounts. A reading, not built.
 
 ### C8. Time is monotonic and read from the clock page
 
@@ -584,3 +586,22 @@ step against §0's table, and they grow only by the mechanisms named in §2.
 4. **The engine's `std`:** the engine stays a Linux program on the user-space personality. There is
    no native `std` port, because the hot path makes no calls (§3).
 5. **Codecs:** C zstd stays until a pure-Rust zstd matches it on the gate.
+6. **How Moruna OS is deployed: two modes, and no VMs on a Moruna node** (Brackly, 2026-11-17).
+   "If we put up Moruna as a node, it's only for one client, not multiple clients. For multiple
+   clients, we would have the second case, which we have already booted up a node as Linux, and
+   we are running a VM on top of it, which would give isolation, which is only justifiable if
+   we have multiple clients wanting to run on one node."
+   - **Mode 1, Moruna is the node:** one client per node, and no VMs run on it.
+   - **Mode 2, several clients on one node:** the node boots Linux, and each client gets a
+     Moruna VM. This is what 0.7.0 delivers.
+   - **What follows:**
+     - No virtualization mechanism goes into Moruna's kernel. Nothing in this design or on
+       stream U's keep-list assumes Moruna hosting VMs. The device and DMA calls kept for
+       accelerators serve devices, not guests.
+     - One OS image serves both modes, so the VM path must not grow assumptions that hold only
+       under a monitor. Mode 1 later needs drivers for the machine it boots on; that is not
+       0.7.0 work.
+     - The monitor (QEMU today, with the launcher's jail) belongs to mode 2 only.
+     - C7 in mode 1 reads "one client per node". A client's jobs there run side by side as
+       processes, kept apart by the kernel's accounts. This is the reading only; it is not
+       built.
