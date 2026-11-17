@@ -612,3 +612,13 @@ and switches to the new one when the call answers.
     against 20 ms; 1 CPU passes), and the 9 DS-A lines after it are then missing. A finds the
     cause; E checks whether the NYC numbers move with one vCPU left free. B1's `futex` ("the
     waker woke no one") failed once on 4 CPUs in r6 and passed in r7.
+- **2026-11-17: the bar is every benchmark, then pruning** (Brackly, through the PM;
+  `arrow-core-0.7.md` section 9). A NYC job passes only at 1.5x the best of every row, on wall
+  and with CPU-seconds no worse than any row; a miss gets another round on the stage its time
+  split names. **Stream U** (integrator's agent, its own branch) builds the untimed usage
+  build. Kernel-mode coverage comes from OSTD's existing `coverage` feature (minicov, dumped at
+  system exit, read by the host), and the services' from minicov too. Region counts on the
+  dispatchers' arms are the per-call counts, so no hand-written counters go in. It is off by
+  default, and the timed builds never carry it. U runs it on the gate's jobs after E's timed
+  matrix and lists every zero-use call, OSTD part, server subsystem and driver as a removal
+  candidate. Removal waits for the large datasets.

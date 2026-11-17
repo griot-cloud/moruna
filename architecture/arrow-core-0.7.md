@@ -366,6 +366,21 @@ data; we're supposed to measure that, simple."
   - **"Significantly better":** at least 1.5x the median wall of the best like-for-like row on
     every NYC job, with CPU-seconds no worse. The native-expression rows are reported beside it,
     and any gap is named.
+  - **Raised by Brackly (2026-11-17): win every benchmark.** "You have a whole OS to optimize for
+    data workloads. I expect nothing less than dominance in every benchmark." 0.7 passes a job
+    only when its median wall is at least 1.5x faster than the best of **every** row, the
+    native-expression rows included, and its CPU-seconds are no more than any row's. A job that
+    misses gets another round on the stage its time split names; it is not done.
+  - **Then prune what the OS does not use** (Brackly, same day). The timed runs carry no
+    counters. They keep what already exists: the Linux calls the server refused, the processes
+    the boot started, and the report's `vm` object. A separate, untimed usage build (stream U:
+    OSTD's `coverage` feature and minicov, off by default, the production build unchanged)
+    runs the same jobs. It records the native calls and their counts, the Linux calls answered
+    and refused, the drivers and servers started, and the coverage of kernel mode, OSTD and each
+    service. Everything with zero use across all jobs becomes a removal candidate: kernel calls,
+    OSTD parts, personality subsystems, servers and drivers. Each one removed also shrinks the
+    attack surface. Removal waits for FineWeb and Overture too, so nothing the large jobs need
+    is cut.
 
 The harness is `bench/vm/`. It gains a mode that runs the job through `moruna run` on the VM.
 
