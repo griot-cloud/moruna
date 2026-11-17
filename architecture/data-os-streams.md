@@ -672,3 +672,7 @@ and switches to the new one when the call answers.
   - **Kept for the accelerator path** (Brackly, 2026-11-17), listed apart with their sizes:
     `MEMORY_PIN`, `DEVICE_MEMORY_CREATE`, `INTERRUPT_CREATE_MSI`, `DMA_RELEASE`, the drivers
     and the device manager, OSTD's IOMMU and DMA code, and the core's device, DMA and MSI code.
+  - **Kept for mode 1** (Brackly's definition of done, 2026-11-17: Moruna boots as the node itself
+    on Servercore and on Azure), listed in a section of its own with their sizes, though mode 2's
+    job VMs never use them: the net server (`netstack`, with DHCP and TLS), `virtio-net`, `nvme`,
+    `gve` and the node's job API (`node-admission`). A part kept for both says so.

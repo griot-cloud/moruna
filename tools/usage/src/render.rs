@@ -234,26 +234,45 @@ pub fn markdown(report: &Report, names: &BTreeMap<u64, String>) -> String {
         }
         let _ = writeln!(out);
     }
-    let lines: u64 = report.keep.iter().map(|i| i.lines).sum();
-    let bytes: u64 = report.keep.iter().map(|i| i.bytes).sum();
+    keep_section(
+        &mut out,
+        "accelerator path",
+        "Kept whatever their use, for accelerators behind the same task interface (Brackly, \
+         2026-11-17): the device and DMA calls, the drivers and the device manager, and the \
+         kernel-mode code they need.",
+        &report.keep,
+    );
+    keep_section(
+        &mut out,
+        "mode 1",
+        "Kept whatever their use, for Moruna booted as the node itself on Servercore and on Azure \
+         (Brackly's definition of done, 2026-11-17), though mode 2's job VMs never use it: the net \
+         server with DHCP and TLS, virtio-net, NVMe and gve, and the node's job API.",
+        &report.keep_mode1,
+    );
+    out
+}
+
+/// A "Keep" section: what is kept, why, and what keeping it costs.
+fn keep_section(out: &mut String, title: &str, why: &str, items: &[crate::report::Item]) {
+    let lines: u64 = items.iter().map(|i| i.lines).sum();
+    let bytes: u64 = items.iter().map(|i| i.bytes).sum();
     let _ = writeln!(
         out,
-        "### Keep: accelerator path ({lines} lines, {bytes} bytes)\n\nKept whatever their use, for \
-         accelerators behind the same task interface (Brackly, 2026-11-17): the device and DMA \
-         calls, the drivers and the device manager, and the kernel-mode code they need.\n"
+        "### Keep: {title} ({lines} lines, {bytes} bytes)\n\n{why}\n"
     );
     let _ = writeln!(
         out,
         "| part | kind | lines | bytes | use |\n| --- | --- | --- | --- | --- |"
     );
-    for i in &report.keep {
+    for i in items {
         let _ = writeln!(
             out,
             "| {} | {} | {} | {} | {} |",
             i.name, i.group, i.lines, i.bytes, i.detail
         );
     }
-    out
+    let _ = writeln!(out);
 }
 
 #[cfg(test)]
@@ -309,6 +328,7 @@ mod tests {
             all,
             unused: vec![item("A", "SLOT_REFUSE"), item("E", "ostd/src/boot")],
             keep: vec![item("native call", "MEMORY_PIN")],
+            keep_mode1: vec![item("program", "netstack")],
             notes: vec!["a note".into()],
         };
         let md = markdown(&report, &BTreeMap::from([(334, "rseq".to_string())]));
@@ -326,6 +346,8 @@ mod tests {
             "| SLOT_REFUSE | 2 | 64 | d |",
             "### Keep: accelerator path (2 lines, 64 bytes)",
             "| MEMORY_PIN | native call | 2 | 64 | d |",
+            "### Keep: mode 1 (2 lines, 64 bytes)",
+            "| netstack | program | 2 | 64 | d |",
         ] {
             assert!(md.contains(expect), "missing {expect:?} in\n{md}");
         }

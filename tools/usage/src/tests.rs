@@ -358,6 +358,11 @@ fn fixture(name: &str) -> (PathBuf, report::Config) {
         &binary(0x60_0000, 2, &[]),
     );
     put(
+        &kit.join("node-user-bins/storage"),
+        &binary(0x62_0000, 2, &[]),
+    );
+    put(&kit.join("node-user-bins/gve"), &binary(0x63_0000, 2, &[]));
+    put(
         &kit.join("node-user-bins/virtio-blk"),
         &binary(0x61_0000, 2, &[]),
     );
@@ -483,7 +488,7 @@ fn the_report_counts_calls_and_sorts_what_nothing_used() {
             ("B", "ostd-0.19.0/src/mm/vm_space.rs"),
             ("C", "RSEQ"),
             ("C", "EXIT"),
-            ("D", "netstack"),
+            ("D", "storage"),
             ("E", "ostd-0.19.0/src/boot/mod.rs"),
         ]
     );
@@ -521,6 +526,24 @@ fn the_report_counts_calls_and_sorts_what_nothing_used() {
     assert!(cfg.out.join("jobs/nyc-score/linux.profraw").is_file());
     assert!(cfg.out.join("all/kernel.profdata").is_file());
     assert!(cfg.out.join("zero/netstack.profraw").is_file());
+    // Mode 1 keeps the net server whatever the job VMs use, apart from the removals.
+    let mode1: Vec<_> = r
+        .keep_mode1
+        .iter()
+        .map(|i| (i.name.as_str(), i.detail.as_str(), i.lines))
+        .collect();
+    assert_eq!(
+        mode1,
+        [
+            (
+                "gve",
+                "never started; kept for the accelerator path too",
+                77
+            ),
+            ("netstack", "never started", 77)
+        ]
+    );
+    assert!(r.keep.iter().any(|i| i.name == "gve"));
 
     // And the command writes both files.
     let said = run(

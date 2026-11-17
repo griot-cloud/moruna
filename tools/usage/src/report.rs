@@ -39,6 +39,11 @@ pub const KEEP_PROGRAMS: [&str; 6] = [
     "nvme",
     "gve",
 ];
+/// Kept for mode 1, Moruna booted as the node itself on Servercore and on Azure, whatever the
+/// job VMs of mode 2 use (Brackly's definition of done, 2026-11-17): the net server (with DHCP
+/// and TLS), the network and disk drivers it needs, and the node's job API.
+pub const KEEP_MODE1_PROGRAMS: [&str; 5] =
+    ["netstack", "virtio-net", "nvme", "gve", "node-admission"];
 /// Kernel-mode code whose file path holds one of these.
 const KEEP_PATHS: [&str; 2] = [
     "/ostd-0.19.0/src/arch/x86/iommu/",
@@ -187,6 +192,8 @@ pub struct Report {
     pub unused: Vec<Item>,
     /// Kept for the accelerator path, used or not.
     pub keep: Vec<Item>,
+    /// Kept for mode 1, the node itself, used or not.
+    pub keep_mode1: Vec<Item>,
     pub notes: Vec<String>,
 }
 
@@ -715,7 +722,11 @@ pub const GROUPS: [(&str, &str); 5] = [
     ),
 ];
 
-/// The candidates for removal and the accelerator path's parts, from the merged profiles.
+/// Never used, kept for the accelerator path, kept for mode 1.
+type Candidates = (Vec<Item>, Vec<Item>, Vec<Item>);
+
+/// The candidates for removal, and the parts kept for the accelerator path and for mode 1, from
+/// the merged profiles.
 #[allow(clippy::too_many_arguments)]
 fn candidates(
     cfg: &Config,
@@ -726,9 +737,10 @@ fn candidates(
     tools: &dyn Tools,
     started: &BTreeSet<String>,
     notes: &mut Vec<String>,
-) -> Result<(Vec<Item>, Vec<Item>), String> {
+) -> Result<Candidates, String> {
     let mut unused = Vec::new();
     let mut keep_items = Vec::new();
+    let mut keep_mode1 = Vec::new();
     let prod_kernel = cfg
         .prod_kit
         .as_ref()
@@ -913,21 +925,26 @@ fn candidates(
                 u.lines.1
             ),
         };
-        let item = Item {
-            group: if KEEP_PROGRAMS.contains(&name.as_str()) {
-                "program".into()
-            } else {
-                "D".into()
-            },
+        let accelerator = KEEP_PROGRAMS.contains(&name.as_str());
+        let mode1 = KEEP_MODE1_PROGRAMS.contains(&name.as_str());
+        let item = |group: &str, detail: String| Item {
+            group: group.into(),
             name: name.clone(),
-            detail: status,
+            detail,
             lines,
             bytes,
         };
-        if KEEP_PROGRAMS.contains(&name.as_str()) {
-            keep_items.push(item);
-        } else if use_.is_none_or(|u| u.wakes == 0) {
-            unused.push(item);
+        if mode1 {
+            let detail = match accelerator {
+                true => format!("{status}; kept for the accelerator path too"),
+                false => status.clone(),
+            };
+            keep_mode1.push(item("program", detail));
+        }
+        if accelerator {
+            keep_items.push(item("program", status));
+        } else if !mode1 && use_.is_none_or(|u| u.wakes == 0) {
+            unused.push(item("D", status));
         }
     }
 
@@ -950,7 +967,8 @@ fn candidates(
         sort(&mut unused[start..end]);
     }
     sort(&mut keep_items);
-    Ok((unused, keep_items))
+    sort(&mut keep_mode1);
+    Ok((unused, keep_items, keep_mode1))
 }
 
 /// The lines of a program no job ran, from an export under a profile of zero counters.
@@ -1051,7 +1069,7 @@ pub fn build(cfg: &Config, tools: &dyn Tools) -> Result<Report, String> {
         "all jobs", &exports, &image, &programs, &all_linux, &sources,
     );
     (report.all.dumps, report.all.broken_dumps) = dumps;
-    let (unused, keep) = candidates(
+    let (unused, keep, keep_mode1) = candidates(
         cfg,
         &exports,
         &image,
@@ -1063,6 +1081,7 @@ pub fn build(cfg: &Config, tools: &dyn Tools) -> Result<Report, String> {
     )?;
     report.unused = unused;
     report.keep = keep;
+    report.keep_mode1 = keep_mode1;
     report.notes.push(
         "Reachability follows direct calls from the user-mode loop; code reached only through a \
          pointer is listed under E though user space may reach it."
