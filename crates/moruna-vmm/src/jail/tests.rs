@@ -93,16 +93,6 @@ fn probe() {
             "nnp",
             libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0).to_string(),
         );
-        // stream E hook (D's file): the signal it gets when its launcher dies.
-        let mut pdeathsig: libc::c_int = -1;
-        libc::prctl(
-            libc::PR_GET_PDEATHSIG,
-            &mut pdeathsig as *mut libc::c_int,
-            0,
-            0,
-            0,
-        );
-        say("pdeathsig", pdeathsig.to_string());
         let mut bounding = 0;
         for cap in 0..64 {
             if libc::prctl(libc::PR_CAPBSET_READ, cap, 0, 0, 0) == 1 {
@@ -424,8 +414,6 @@ fn jail_shows_only_its_entries_and_no_node() {
     assert_eq!(one("uid"), format!("{JAIL_ID} {JAIL_ID}"));
     assert_eq!(one("gid"), format!("{JAIL_ID} {JAIL_ID}"));
     assert_eq!(one("nnp"), "1");
-    // stream E hook (D's file): it dies with its launcher.
-    assert_eq!(one("pdeathsig"), libc::SIGKILL.to_string());
     assert_eq!(one("bounding"), "0");
     assert_eq!(one("caps"), "[0, 0, 0, 0, 0, 0]");
     assert_eq!(one("setuid0"), format!("errno{}", libc::EINVAL));
@@ -479,6 +467,67 @@ fn jail_shows_only_its_entries_and_no_node() {
     assert_eq!(one("inet-outside"), format!("errno{}", libc::ENETUNREACH));
     assert_eq!(one("abstract"), format!("errno{}", libc::ECONNREFUSED));
     assert_eq!(one("shm"), enoent);
+}
+
+/// Run only as the jailed program (`a_jailed_program_dies_with_the_thread_that_launched_it`):
+/// waits, to be killed.
+#[test]
+#[ignore = "the jailed half of a_jailed_program_dies_with_the_thread_that_launched_it"]
+fn sleeper() {
+    // SAFETY: a plain getter. Outside a jail this does nothing.
+    if unsafe { libc::getpid() } != 1 {
+        return;
+    }
+    std::thread::sleep(Duration::from_secs(60));
+}
+
+/// stream E hook (D's file): a jailed program dies with its launcher (its parent-death
+/// signal, SIGKILL, set before anything else). The signal follows the thread that spawned it,
+/// so a thread that spawns and ends stands for a launcher that dies: the program, which would
+/// sleep a minute, is killed by SIGKILL at once. (The flag itself is a thread's and cannot be
+/// read from the probe, whose test runs on a thread of its own.)
+#[test]
+fn a_jailed_program_dies_with_the_thread_that_launched_it() {
+    use std::os::unix::process::ExitStatusExt;
+    let scratch = Scratch::new("orphan");
+    let root = scratch.0.join("root");
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let entries = settle(program_entries(&exe).unwrap()).unwrap();
+    let out = scratch.0.join("out");
+    let err = scratch.0.join("err");
+    let launcher = std::thread::spawn(move || {
+        spawn(Spec {
+            program: &exe,
+            args: [
+                "--exact",
+                "jail::tests::sleeper",
+                "--ignored",
+                "--test-threads=1",
+            ]
+            .map(Into::into)
+            .to_vec(),
+            entries,
+            root: &root,
+            stdout: File::create(out).unwrap(),
+            stderr: File::create(err).unwrap(),
+            cgroup: None,
+        })
+        .unwrap()
+    });
+    let mut jailed = launcher.join().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = jailed.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the jailed program outlived the thread that launched it"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
 }
 
 #[test]
