@@ -622,3 +622,20 @@ and switches to the new one when the call answers.
   default, and the timed builds never carry it. U runs it on the gate's jobs after E's timed
   matrix and lists every zero-use call, OSTD part, server subsystem and driver as a removal
   candidate. Removal waits for the large datasets.
+- **2026-11-17: stream A's wake queue merged** (`bdf24e1f`, from `12f1ce40`, with `da345685`
+  and `fae6a8cc`), before the NYC gate's timed runs, since the stall it fixes is on the gate's
+  path. DS-A `share` failed in P's boots on 2 and 4 CPUs (25 and 47 ms against 20). The cause
+  is the queue order, not the stretched tick: an enqueue onto a stretched CPU already kicks it.
+  A woken task joined the back of one first-in, first-out queue and waited out every slice
+  ahead of it, up to 10 ms each, behind threads that had first run on that core and stayed.
+  - **The fix:** a woken task waits in its CPU's wake queue, taken before the preempted and new
+    tasks, at most four in a row while a preempted one waits. A wake waits at most the rest of
+    the current slice plus a tick, and a thread that never sleeps still runs one turn in five.
+    New test `DS-A wake`: a sleeper shares a core with three pinned spinners, is woken 20 times,
+    and fails if a wake takes over 15 ms.
+  - **Placement:** while some core has no pinned thread, unpinned threads (a reactor, a ticker,
+    a helper) are placed on such cores, and one queued on a pinned worker's core moves.
+  - Checked on the Mac: kernel clippy, the user programs' clippy and the host tests. Booted by
+    the integrator under KVM on 1, 2 and 4 CPUs in its moruna-bench slot before the gate. A's
+    own slot (after B2) boots it with the old order and placement off, for the with-and-without
+    figures.
