@@ -634,22 +634,21 @@ fn drive(
     // minimum-morsel work funded, before any child is started.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if let Some(gate) = &gate {
-        let count = packaged
-            .iter()
-            .filter(|stage| stage.native_singleton())
-            .count();
+        // Each live instance of a stage is a child of its own (an image's MORUNA_PROCESSES, one
+        // task process each): the share is a child's, and each instance carves its account
+        // within it (stream E, for the gate's native tasks on every core).
+        let instances = |stage: &crate::packaged::Packaged| match stage.kernel().kind() {
+            moruna_kernel::KernelKind::Stateful { max_instances } => Some(max_instances.get()),
+            _ => None,
+        };
+        let mut count = 0usize;
+        for stage in packaged.iter().filter(|stage| stage.native_singleton()) {
+            count += instances(stage).ok_or_else(|| MorunaError::Config {
+                name: "budget.native_children",
+                msg: "a native child's stage must be stateful, its instances its children".into(),
+            })?;
+        }
         if count > 0 {
-            for stage in packaged.iter().filter(|stage| stage.native_singleton()) {
-                if !matches!(stage.kernel().kind(), moruna_kernel::KernelKind::Stateful { max_instances } if max_instances.get() == 1)
-                {
-                    return Err(MorunaError::Config {
-                        name: "budget.native_children",
-                        msg: "native child share requires exactly one live instance per stage"
-                            .into(),
-                    }
-                    .into());
-                }
-            }
             let planning = moruna_controller::fixed_commitment_budget(
                 &moruna_controller::FixedCommitmentInput {
                     ceiling_bytes: limits.memory_ceiling,
