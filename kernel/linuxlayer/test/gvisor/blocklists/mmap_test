@@ -1,0 +1,12 @@
+MMapDeathTest.TruncateAfterCOWBreak
+MMapFileTest.InternalSigBus
+MMapFileTest.MapOffsetBeyondEnd
+MMapFileTest.ReadSharedTruncateSIGBUS
+MMapFileTest.WriteSharedTruncateSIGBUS
+MMapTest.ExceedLimitAS
+MMapTest.MapCharDevice
+MMapTest.MapDevZero*
+MMapTest.MapPipe
+MMapTest.MprotectProtNone
+MMapTest.NoExceedLimitAS
+ReadWriteSharedPrivate/MMapFileParamTest.SigBusDeath/*

@@ -1,0 +1,32 @@
+[package]
+name = "linuxlayer-ostd"
+description = "OSTD's API in user space for Asterinas's Linux layer: OSTD's locks and wait queues on Moruna's futex, the program's memory through a fault-tolerant copy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "ostd"
+# OSTD's doc examples illustrate kernel use and are not run on the host.
+doctest = false
+
+[dependencies]
+bitflags.workspace = true
+bitvec.workspace = true
+inherit-methods-macro.workspace = true
+inventory.workspace = true
+linuxlayer-launch.workspace = true
+log.workspace = true
+moruna-abi.workspace = true
+ostd-macros.workspace = true
+ostd-pod.workspace = true
+smallvec.workspace = true
+spin.workspace = true
+zerocopy.workspace = true
+
+[target.'cfg(target_os = "none")'.dependencies]
+moruna-sys.workspace = true
+
+[lints]
+workspace = true

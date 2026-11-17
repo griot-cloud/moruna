@@ -1,0 +1,154 @@
+# Asterinas's Linux layer, carried into user space as the personality
+# (architecture/data-os.md §4, kernel-is-the-machine.md §4.2). Carried from
+# asterinas/asterinas a0de2258 (0.19.0); see README.md.
+#
+# It is its own workspace, on the kernel's pinned nightly, so the carried files keep
+# Asterinas's lints and formatting (rustfmt.toml, clippy.toml) unchanged.
+[workspace]
+resolver = "3"
+members = [
+    "core",
+    "launch",
+    "comps/block",
+    "comps/cmdline",
+    "comps/console",
+    "comps/device",
+    "comps/logger",
+    "comps/softirq",
+    "comps/systree",
+    "comps/time",
+    "ostd",
+    "ostd/macros",
+    "personality",
+    "server",
+    "check",
+    "libs/aster-rights",
+    "libs/aster-rights-proc",
+    "libs/aster-util",
+    "libs/atomic-integer-wrapper",
+    "libs/component",
+    "libs/component/macros",
+    "libs/cpio-decoder",
+    "libs/device-id",
+    "libs/dma-pool",
+    "libs/io-util",
+    "libs/jhash",
+    "libs/keyable-arc",
+    "libs/osdk-frame-allocator",
+    "libs/osdk-heap-allocator",
+    "libs/ring-buffer",
+    "libs/short-vis-path",
+    "libs/sparse-id-alloc",
+    "libs/typeflags",
+    "libs/typeflags-util",
+    "libs/xarray",
+]
+
+[workspace.package]
+version = "0.19.0"
+repository = "https://github.com/asterinas/asterinas"
+license = "MPL-2.0"
+edition = "2024"
+
+[workspace.dependencies]
+# OSTD's API for user space: its locks and wait queues on the core's futex, user memory
+# through a fault-tolerant copy (ostd/README.md).
+ostd = { path = "ostd", version = "=0.19.0", package = "linuxlayer-ostd" }
+ostd-macros = { path = "ostd/macros", version = "=0.19.0", package = "linuxlayer-ostd-macros" }
+linuxlayer-launch = { path = "launch", version = "=0.19.0", default-features = false }
+moruna-linuxlayer = { path = "core", version = "=0.19.0" }
+osdk-frame-allocator = { path = "libs/osdk-frame-allocator", version = "=0.19.0", package = "linuxlayer-osdk-frame-allocator" }
+osdk-heap-allocator = { path = "libs/osdk-heap-allocator", version = "=0.19.0", package = "linuxlayer-osdk-heap-allocator" }
+moruna-sys = { path = "../sys", version = "=0.1.0", features = ["heap"] }
+moruna-abi = { path = "../abi", version = "=0.1.0" }
+# A task's start (core/src/start): the image filesystem's protocol on Moruna's SDK, the
+# data plane's record framing, and the engine's log ring.
+imagefs-protocol = { path = "../imagefs/protocol", version = "=0.1.0" }
+moruna-svc = { path = "../svc", version = "=0.1.0" }
+moruna-ipc-check = { path = "../plane/check", version = "=0.1.0" }
+moruna-record = { path = "../../crates/moruna-record", version = "=0.6.6", default-features = false }
+# The drop-in `linux` server (server/): the protocol its clients speak, and the node's
+# guardian and bootstrap it keeps.
+linux-protocol = { path = "../linux/protocol", version = "=0.1.0" }
+moruna-node = { path = "../node/core", version = "=0.1.0" }
+
+# OSTD's published crates (MPL-2.0, as the kernel uses them).
+align_ext = "=0.1.0"
+id-alloc = "=0.1.0"
+int-to-c-enum = "=0.1.0"
+ostd-pod = "=0.4.0"
+padding-struct = "=0.2.0"
+
+aster-block = { path = "comps/block", version = "=0.1.0" }
+dma-pool = { path = "libs/dma-pool", version = "=0.1.0" }
+aster-cmdline = { path = "comps/cmdline", version = "=0.1.0" }
+aster-console = { path = "comps/console", version = "=0.1.0" }
+aster-device = { path = "comps/device", version = "=0.1.0" }
+aster-logger = { path = "comps/logger", version = "=0.1.0" }
+aster-softirq = { path = "comps/softirq", version = "=0.1.0" }
+aster-systree = { path = "comps/systree", version = "=0.1.0" }
+aster-time = { path = "comps/time", version = "=0.1.0" }
+
+aster-rights = { path = "libs/aster-rights", version = "=0.1.0" }
+aster-rights-proc = { path = "libs/aster-rights-proc", version = "=0.1.0" }
+aster-util = { path = "libs/aster-util", version = "=0.1.0" }
+atomic-integer-wrapper = { path = "libs/atomic-integer-wrapper", version = "=0.1.0" }
+component = { path = "libs/component", version = "=0.19.0" }
+cpio-decoder = { path = "libs/cpio-decoder", version = "=0.1.0" }
+device-id = { path = "libs/device-id", version = "=0.1.0" }
+io-util = { path = "libs/io-util", version = "=0.1.0" }
+jhash = { path = "libs/jhash", version = "=0.1.0" }
+keyable-arc = { path = "libs/keyable-arc", version = "=0.1.0" }
+ring-buffer = { path = "libs/ring-buffer", version = "=0.1.0" }
+short-vis-path = { path = "libs/short-vis-path", version = "=0.1.0" }
+sparse-id-alloc = { path = "libs/sparse-id-alloc", version = "=0.1.0" }
+typeflags = { path = "libs/typeflags", version = "=0.1.0" }
+typeflags-util = { path = "libs/typeflags-util", version = "=0.1.0" }
+xarray = { path = "libs/xarray", version = "=0.1.0" }
+
+# The external crates, at Asterinas's versions.
+bitflags = "2.13"
+bitvec = { version = "1.0.1", default-features = false, features = ["alloc"] }
+chrono = { version = "0.4.38", default-features = false }
+const_format = "0.2.35"
+getset = "0.1.2"
+hashbrown = { version = "0.14.3", features = ["serde"] }
+inherit-methods-macro = "=0.1.0"
+intrusive-collections = { version = "0.9.6", features = ["nightly"] }
+inventory = "0.3.24"
+itertools = "0.10.5"
+lending-iterator = "0.1.7"
+log = "0.4"
+lru = "0.16.3"
+owo-colors = "4.2.2"
+miniz_oxide = { version = "0.8.9", default-features = false, features = ["with-alloc"] }
+paste = "1.0.15"
+rand = { version = "0.9.2", default-features = false }
+smallvec = "1.13.2"
+spin = "0.9.4"
+takeable = "0.2.2"
+time = { version = "0.3", default-features = false, features = ["alloc"] }
+x86_64 = "0.15.5"
+xmas-elf = "0.10.0"
+zerocopy = { version = "0.8.34", features = ["derive"] }
+
+proc-macro2 = { version = "1.0.95", features = ["span-locations"] }
+quote = "1.0.35"
+syn = { version = "2.0.77", features = ["full", "parsing", "fold", "visit-mut"] }
+
+[workspace.lints.rust]
+redundant_imports = "warn"
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(ktest)'] }
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+allow_attributes = "warn"
+inconsistent_struct_constructor = "warn"
+redundant_test_prefix = "warn"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

@@ -9,4 +9,3 @@ publish.workspace = true
 [dependencies]
 moruna-svc.workspace = true
 linux-protocol = { path = "../protocol", version = "=0.1.0" }
-moruna-linux = { path = "../core", version = "=0.1.0" }

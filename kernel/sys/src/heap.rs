@@ -8,6 +8,9 @@
 //! unmapped on free, so a server that handles one large message gives its pages back.
 //! Alignment up to a page is honoured; a larger alignment is refused (a null pointer,
 //! which `alloc` reports as an allocation failure).
+//!
+//! A program may give the heap another source of memory, once, before its first
+//! allocation ([`set_source`], stream B2).
 
 use core::{
     alloc::{GlobalAlloc, Layout},
@@ -33,7 +36,61 @@ struct State {
     /// The unused part of the current chunk.
     next: usize,
     end: usize,
+    // stream B2 (data-os-streams.md): where the memory comes from, and whether that is
+    // settled.
+    source: Source,
+    /// A program gave the source.
+    given: bool,
+    /// Something was allocated: the source stays.
+    sealed: bool,
+    // stream B2 end
 }
+
+// stream B2 (data-os-streams.md): the heap's source of memory. The Linux personality's
+// heap must be at one address in every process of its task, so it maps its own
+// (`ostd::backend::shared_map`); every other program keeps memory objects mapped into
+// its process.
+
+/// Where the heap's memory comes from.
+#[derive(Clone, Copy)]
+struct Source {
+    /// Maps `len` fresh zeroed bytes (whole pages), readable and writable; their address.
+    map: fn(usize) -> Option<usize>,
+    /// Gives back `len` bytes at `addr` that `map` mapped.
+    unmap: fn(usize, usize),
+}
+
+/// The core's: memory objects mapped into the process.
+const CORE: Source = Source {
+    map: map_pages,
+    unmap: unmap_pages,
+};
+
+/// Why [`set_source`] refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceError {
+    /// A source was given already.
+    AlreadySet,
+    /// The heap has allocated already, from its first source.
+    AlreadyAllocated,
+}
+
+/// Gives the heap its memory from `map` (`len` fresh zeroed bytes, whole pages, readable
+/// and writable; their address) and back to `unmap` (`addr`, `len`), in place of memory
+/// objects mapped into the process. Once only, and only before anything is allocated: a
+/// second call, or one after an allocation, changes nothing, so a block never goes back
+/// through a source that did not map it.
+pub fn set_source(
+    map: fn(usize) -> Option<usize>,
+    unmap: fn(usize, usize),
+) -> Result<(), SourceError> {
+    HEAP.set_source(Source { map, unmap })
+}
+
+fn unmap_pages(addr: usize, len: usize) {
+    raw::memory_unmap(addr as u64, len as u64);
+}
+// stream B2 end
 
 struct Heap {
     locked: AtomicBool,
@@ -44,15 +101,9 @@ struct Heap {
 // release (`Heap::with`), so one thread at a time touches it.
 unsafe impl Sync for Heap {}
 
-#[global_allocator]
-static HEAP: Heap = Heap {
-    locked: AtomicBool::new(false),
-    state: UnsafeCell::new(State {
-        free: [0; CLASSES.len()],
-        next: 0,
-        end: 0,
-    }),
-};
+// The crate's own host tests make heaps of their own, whose sources make no kernel call.
+#[cfg_attr(not(test), global_allocator)]
+static HEAP: Heap = Heap::new(CORE);
 
 fn class_of(layout: Layout) -> Option<usize> {
     let need = layout.size().max(layout.align());
@@ -74,6 +125,44 @@ fn map_pages(len: usize) -> Option<usize> {
 }
 
 impl Heap {
+    const fn new(source: Source) -> Heap {
+        Heap {
+            locked: AtomicBool::new(false),
+            state: UnsafeCell::new(State {
+                free: [0; CLASSES.len()],
+                next: 0,
+                end: 0,
+                source,
+                given: false,
+                sealed: false,
+            }),
+        }
+    }
+
+    // stream B2 (data-os-streams.md)
+    fn set_source(&self, source: Source) -> Result<(), SourceError> {
+        self.with(|state| {
+            if state.given {
+                Err(SourceError::AlreadySet)
+            } else if state.sealed {
+                Err(SourceError::AlreadyAllocated)
+            } else {
+                state.source = source;
+                state.given = true;
+                Ok(())
+            }
+        })
+    }
+
+    /// The source, sealed: whatever is allocated now comes from it.
+    fn sealed_source(&self) -> Source {
+        self.with(|state| {
+            state.sealed = true;
+            state.source
+        })
+    }
+    // stream B2 end
+
     fn with<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         while self
             .locked
@@ -101,7 +190,7 @@ fn take_small(state: &mut State, class: usize) -> *mut u8 {
     }
     let mut at = state.next.next_multiple_of(size);
     if state.next == 0 || at + size > state.end {
-        let Some(chunk) = map_pages(CHUNK) else {
+        let Some(chunk) = (state.source.map)(CHUNK) else {
             return null_mut();
         };
         state.next = chunk;
@@ -125,9 +214,13 @@ fn give_small(state: &mut State, class: usize, ptr: *mut u8) {
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         match class_of(layout) {
-            Some(class) => self.with(|state| take_small(state, class)),
+            Some(class) => self.with(|state| {
+                state.sealed = true;
+                take_small(state, class)
+            }),
             None if layout.align() <= PAGE => {
-                map_pages(layout.size().next_multiple_of(PAGE)).map_or(null_mut(), |a| a as *mut u8)
+                (self.sealed_source().map)(layout.size().next_multiple_of(PAGE))
+                    .map_or(null_mut(), |a| a as *mut u8)
             }
             None => null_mut(),
         }
@@ -137,8 +230,126 @@ unsafe impl GlobalAlloc for Heap {
         match class_of(layout) {
             Some(class) => self.with(|state| give_small(state, class, ptr)),
             None => {
-                raw::memory_unmap(ptr as u64, layout.size().next_multiple_of(PAGE) as u64);
+                let source = self.with(|state| state.source);
+                (source.unmap)(ptr as usize, layout.size().next_multiple_of(PAGE));
             }
         }
     }
 }
+
+// stream B2 (data-os-streams.md): the source's refusals and a given source, on heaps whose
+// sources make no kernel call.
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use core::sync::atomic::AtomicUsize;
+    use std::{alloc::Layout as StdLayout, sync::Mutex, vec::Vec};
+
+    use super::*;
+
+    /// What a test source mapped and unmapped: address and length.
+    static MAPPED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+    static UNMAPPED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+    /// Maps from the other test source, which stands for the core's; only the refusal
+    /// test uses it.
+    static FIRST_MAPS: AtomicUsize = AtomicUsize::new(0);
+
+    fn host_map(len: usize) -> Option<usize> {
+        let layout = StdLayout::from_size_align(len, PAGE).ok()?;
+        // SAFETY: the layout is not zero sized: every request is whole pages.
+        let addr = unsafe { std::alloc::alloc_zeroed(layout) } as usize;
+        (addr != 0).then_some(addr)
+    }
+
+    fn host_unmap(addr: usize, len: usize) {
+        let layout = StdLayout::from_size_align(len, PAGE).unwrap();
+        // SAFETY: `addr` came from `host_map` with this length.
+        unsafe { std::alloc::dealloc(addr as *mut u8, layout) };
+    }
+
+    fn given_map(len: usize) -> Option<usize> {
+        let addr = host_map(len)?;
+        MAPPED.lock().unwrap().push((addr, len));
+        Some(addr)
+    }
+
+    fn given_unmap(addr: usize, len: usize) {
+        UNMAPPED.lock().unwrap().push((addr, len));
+        host_unmap(addr, len);
+    }
+
+    fn first_map(len: usize) -> Option<usize> {
+        FIRST_MAPS.fetch_add(1, Ordering::Relaxed);
+        host_map(len)
+    }
+
+    const FIRST: Source = Source {
+        map: first_map,
+        unmap: host_unmap,
+    };
+
+    #[test]
+    fn a_given_source_maps_chunks_and_large_blocks_and_takes_them_back() {
+        let heap = Heap::new(FIRST);
+        let given = Source {
+            map: given_map,
+            unmap: given_unmap,
+        };
+        assert_eq!(heap.set_source(given), Ok(()));
+        assert_eq!(heap.set_source(given), Err(SourceError::AlreadySet));
+        let small = Layout::from_size_align(24, 8).unwrap();
+        let large = Layout::from_size_align(3 * PAGE + 1, 8).unwrap();
+        // SAFETY: the layouts are not zero sized, and each block goes back with its own.
+        unsafe {
+            let a = heap.alloc(small);
+            let b = heap.alloc(small);
+            assert!(!a.is_null() && b as usize == a as usize + 32);
+            let big = heap.alloc(large);
+            assert!(!big.is_null());
+            assert_eq!(
+                *MAPPED.lock().unwrap(),
+                [(a as usize, CHUNK), (big as usize, 4 * PAGE)]
+            );
+            heap.dealloc(big, large);
+            assert_eq!(*UNMAPPED.lock().unwrap(), [(big as usize, 4 * PAGE)]);
+            heap.dealloc(b, small);
+            assert_eq!(heap.alloc(small), b);
+            assert!(
+                heap.alloc(Layout::from_size_align(8, 2 * PAGE).unwrap())
+                    .is_null()
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_after_an_allocation_is_refused_and_changes_nothing() {
+        let heap = Heap::new(FIRST);
+        let before = FIRST_MAPS.load(Ordering::Relaxed);
+        let large = Layout::from_size_align(2 * PAGE, 8).unwrap();
+        // SAFETY: as above.
+        let block = unsafe { heap.alloc(large) };
+        assert!(!block.is_null());
+        let other = Source {
+            map: |_| None,
+            unmap: |_, _| panic!("a block went back through a source that did not map it"),
+        };
+        assert_eq!(heap.set_source(other), Err(SourceError::AlreadyAllocated));
+        // SAFETY: as above.
+        unsafe {
+            heap.dealloc(block, large);
+            assert!(
+                !heap
+                    .alloc(Layout::from_size_align(16, 16).unwrap())
+                    .is_null()
+            );
+        }
+        assert_eq!(FIRST_MAPS.load(Ordering::Relaxed), before + 2);
+        // A small block seals the source as well.
+        let fresh = Heap::new(FIRST);
+        // SAFETY: as above.
+        assert!(!unsafe { fresh.alloc(Layout::from_size_align(16, 16).unwrap()) }.is_null());
+        assert_eq!(fresh.set_source(other), Err(SourceError::AlreadyAllocated));
+    }
+}
+// stream B2 end

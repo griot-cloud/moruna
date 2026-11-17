@@ -1,0 +1,22 @@
+IoctlTest.BadFileDescriptor
+IoctlTest.InvalidControlNumber
+IoctlTest.IoctlWithOpath
+IoctlTest.FIONBIOSucceeds
+IoctlTest.FIONBIOFails
+IoctlTest.FIOASYNCFails
+IoctlTest.FIOASYNCHandlesFuseFD
+IoctlTest.FIOASYNCSucceeds
+IoctlTest.FIOASYNCNoTarget
+IoctlTest.FIOASYNCSelfTarget
+IoctlTest.FIOASYNCSelfTarget2
+IoctlTest.FIOASYNCSelfTargetClose
+IoctlTest.FIOASYNCInvalidPID
+IoctlTest.FIOASYNCUnsetTarget
+IoctlTest.FIOGETOWNSucceeds
+IoctlTest.SIOCGPGRPSucceeds
+
+# TODO: Support IPv6 UDP sockets.
+IoctlTest/IoctlTestSIOCGIFCONF.ValidateNoArrayGetsLength/5
+IoctlTest/IoctlTestSIOCGIFCONF.ValidateNoPartialIfrsReturned/5
+IoctlTest/IoctlTestSIOCGIFCONF.ValidateNestedPointerCheck/5
+IoctlTest/IoctlTestSIOCGIFCONF.ValidateLoopbackIsPresent/5

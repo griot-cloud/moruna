@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! Misc devices.
+//!
+//! Character device with major number 10.
+
+use device_id::MajorId;
+use spin::Once;
+
+use super::registry::char::{MajorIdOwner, acquire_major};
+
+static MISC_MAJOR: Once<MajorIdOwner> = Once::new();
+
+pub(super) fn init_in_first_kthread() {
+    MISC_MAJOR.call_once(|| acquire_major(MajorId::new(10)).unwrap());
+}

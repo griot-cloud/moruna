@@ -74,8 +74,18 @@ fn exited_zero(r: &Run, what: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `number xcount`, joined by commas; `none` when nothing was refused. (The personality
+/// names each refused call on the console when its process ends.)
 fn refused(r: &Run) -> String {
-    moruna_linux::refused::Refused::render(&r.ended.refused)
+    if r.ended.refused.is_empty() {
+        return String::from("none");
+    }
+    r.ended
+        .refused
+        .iter()
+        .map(|(n, c)| format!("{n} x{c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn check(out: &Console, name: &str, result: Result<String, String>) -> bool {

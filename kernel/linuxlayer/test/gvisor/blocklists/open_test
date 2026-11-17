@@ -1,0 +1,10 @@
+OpenTest.AppendConcurrentWrite
+OpenTest.CanTruncateWithStrangePermissions
+OpenTest.DirectoryDirectFails
+OpenTest.OpenNoFollowStillFollowsLinksInPath
+OpenTest.OpenWithStrangeFlags
+OpenTest.OTrunc
+OpenTest.OTruncAndReadOnlyDir
+OpenTest.SymlinkRecurse
+OpenTest.Truncate
+OpenTest.TruncateNoSizeChangeUpdatesTimestamps
