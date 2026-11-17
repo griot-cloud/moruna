@@ -2,11 +2,11 @@
   "added_files": [
     {
       "path": "src/arch/x86/cpu/hypervisor.rs",
-      "sha256": "c3945554706dead0a602ebac60009e5497251ebf623c43fa84ddc05e5ad507bd"
+      "sha256": "42d6ebd0e92c891bb40e0571ce40518aa52794c2f304180f53435f11eee4c457"
     },
     {
       "path": "src/arch/x86/kernel/hyperv.rs",
-      "sha256": "8a41e94bef45ae58e85c21497136895552faed1ea178cbd494fa6da22d538d04"
+      "sha256": "a75f6e26b1df499c7227859df9403a56682e0433f01a42ec9fc102f90d9c5456"
     },
     {
       "path": "src/arch/x86/kernel/tsc/boot_wait.rs",

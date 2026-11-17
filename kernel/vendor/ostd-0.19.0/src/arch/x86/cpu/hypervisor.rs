@@ -16,8 +16,8 @@ use hvdef::{
     HV_CPUID_FUNCTION_MS_HV_FEATURES, HV_CPUID_FUNCTION_MS_HV_IMPLEMENTATION_LIMITS,
     HV_CPUID_FUNCTION_VERSION_AND_FEATURES, HV_MESSAGE_PAYLOAD_SIZE, HV_MESSAGE_SIZE,
     HV_PAGE_SHIFT, HV_PAGE_SIZE, HV_X64_MSR_APIC_FREQUENCY, HV_X64_MSR_SINT0,
-    HV_X64_MSR_TSC_FREQUENCY, HvFeatures, HvMessageFlags, HvMessageHeader, HvMessageType,
-    HvSynicScontrol, HvSynicSimpSiefp, HvSynicSint, HypercallCode, NUM_SINTS,
+    HV_X64_MSR_TSC_FREQUENCY, HV_X64_MSR_VP_INDEX, HvFeatures, HvMessageFlags, HvMessageHeader,
+    HvMessageType, HvSynicScontrol, HvSynicSimpSiefp, HvSynicSint, HypercallCode, NUM_SINTS,
     hypercall::{
         Control, HvGuestOsOpenSource, HvGuestOsOpenSourceType, HypercallOutput,
         MsrHypercallContents, PostMessage, SignalEvent,
@@ -272,6 +272,20 @@ pub(crate) fn synic_msrs(cpu: &impl Cpu) -> bool {
             && privileges.post_messages()
             && privileges.signal_events()
     })
+}
+
+/// The VP index of the CPU `cpu` reads, as Hyper-V numbers its virtual processors: the
+/// target VMBus names for its messages and channels, so the VP of CPU 0, whose SynIC alone
+/// is enabled. Read from `HV_X64_MSR_VP_INDEX` (TLFS, "Virtual Processor Index") when the
+/// partition holds `AccessVpIndex` (leaf `0x40000003` EAX bit 6), as Linux reads it
+/// (`hv_common_cpu_init`); never assumed to be the CPU's own number. `None` off Hyper-V,
+/// without the privilege, or for a value that is no 32-bit index.
+pub(crate) fn vp_index(cpu: &impl Cpu) -> Option<u32> {
+    let features = hyperv_features(cpu)?;
+    if !features.privileges().access_vp_index() {
+        return None;
+    }
+    u32::try_from(cpu.rdmsr(HV_X64_MSR_VP_INDEX)).ok()
 }
 
 /// The value to write to `HV_X64_MSR_SIMP` or `HV_X64_MSR_SIEFP` to place the message

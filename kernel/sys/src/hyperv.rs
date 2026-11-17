@@ -41,8 +41,18 @@ impl Hyperv {
     /// An interrupt object for SINT 2, raised for each message and event flag Hyper-V
     /// gives it; waited on and acknowledged as a device's is.
     pub fn interrupt(&self) -> Result<Interrupt> {
-        let v = check(raw::call1(nr::HYPERV_INTERRUPT, u64::from(self.0.raw())).0)?;
-        Ok(Interrupt(Handle::from_raw(v as RawHandle)))
+        self.sint().map(|sint| sint.interrupt)
+    }
+
+    /// SINT 2's interrupt, as [`interrupt`](Self::interrupt) gives it, and the VP it
+    /// arrives on.
+    pub fn sint(&self) -> Result<Sint> {
+        let (v, vp_index) = raw::call1(nr::HYPERV_INTERRUPT, u64::from(self.0.raw()));
+        let v = check(v)?;
+        Ok(Sint {
+            interrupt: Interrupt(Handle::from_raw(v as RawHandle)),
+            vp_index: vp_index as u32,
+        })
     }
 
     /// A handle that signals `connection` and nothing else, to give to the driver of the
@@ -58,6 +68,16 @@ impl Hyperv {
         )?;
         Ok(HvSignal(Handle::from_raw(v as RawHandle)))
     }
+}
+
+/// SINT 2 of CPU 0's SynIC: its interrupt, and CPU 0's VP index.
+#[derive(Debug)]
+pub struct Sint {
+    /// Raised for each message and event flag Hyper-V gives SINT 2.
+    pub interrupt: Interrupt,
+    /// CPU 0's VP index, as Hyper-V numbers its virtual processors: the target a VMBus
+    /// client names for its contact and every channel. It is not always 0.
+    pub vp_index: u32,
 }
 
 /// The right to signal one connection ID: a VMBus channel's driver signals the host with

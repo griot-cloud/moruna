@@ -14,7 +14,7 @@ use super::hypervisor::{
     POST_MESSAGE_SIZE, SIGNAL_EVENT, TscSource, VMBUS_SINT, VMBUS_SINT_MSR, apic_timer_count,
     hypercall_msr, hypercall_msrs, hypercall_status, hypervisor, message_pending, message_present,
     post_message_input, scontrol_msr, signal_event_input, sint_msr, synic_msrs, synic_page_msr,
-    tsc_rate,
+    tsc_rate, vp_index,
 };
 use super::pit_presence::{NO_PIT_FOR_APIC_TIMER, NO_PIT_FOR_TSC, READS, counts};
 
@@ -405,6 +405,31 @@ fn the_synic_needs_hyper_v_and_its_four_privileges() {
         assert!(!synic_msrs(&azure(features)), "{register} {bit}");
     }
     assert!(!synic_msrs(&kvm()));
+}
+
+/// `HV_X64_MSR_VP_INDEX`.
+const VP_INDEX: u32 = 0x4000_0002;
+
+#[test]
+fn cpu_0s_vp_index_is_read_from_its_msr_and_never_assumed() {
+    // Hyper-V numbers its VPs as it chooses: CPU 0 may be VP 0, or any other.
+    for vp in [0u32, 1, 5, 63, u32::MAX] {
+        let cpu = azure(hyperv_features(true, true, true)).msr(VP_INDEX, u64::from(vp));
+        assert_eq!(vp_index(&cpu), Some(vp));
+        assert_eq!(*cpu.read.borrow(), [VP_INDEX]);
+    }
+    // Without AccessVpIndex (leaf 0x40000003 EAX bit 6) the MSR is not read, and there is
+    // no index, so no SynIC.
+    let mut features = hyperv_features(true, true, true);
+    features[0] &= !(1 << 6);
+    let cpu = azure(features).msr(VP_INDEX, 3);
+    assert_eq!(vp_index(&cpu), None);
+    assert!(cpu.read.borrow().is_empty());
+    // A value no 32-bit index holds is no index.
+    let cpu = azure(hyperv_features(true, true, true)).msr(VP_INDEX, 1 << 32);
+    assert_eq!(vp_index(&cpu), None);
+    // Off Hyper-V there is none, and no MSR is read.
+    assert_eq!(vp_index(&kvm()), None);
 }
 
 #[test]

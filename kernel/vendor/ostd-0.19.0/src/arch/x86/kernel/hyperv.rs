@@ -206,6 +206,8 @@ pub struct Synic {
     input: SpinLock<Frame<()>>,
     /// Held while a message is taken, so two takers never empty the slot twice.
     taking: SpinLock<()>,
+    /// CPU 0's VP index, read when the SynIC was enabled.
+    vp_index: u32,
 }
 
 static SYNIC: Once<Synic> = Once::new();
@@ -229,6 +231,11 @@ fn set_up_synic() {
         crate::warn!("Hyper-V: this partition may not use the SynIC, post or signal");
         return;
     }
+    // The VP VMBus is to target is CPU 0's, whose number Hyper-V gives, not CPU 0's own.
+    let Some(vp_index) = hypervisor::vp_index(&ThisCpu) else {
+        crate::warn!("Hyper-V: this partition may not read CPU 0's VP index");
+        return;
+    };
     let frame = || FrameAllocOptions::new().zeroed(true).alloc_frame();
     let (Ok(messages), Ok(events), Ok(input)) = (frame(), frame(), frame()) else {
         crate::warn!("Hyper-V: no frames for the SynIC");
@@ -267,7 +274,8 @@ fn set_up_synic() {
         wrmsr(HV_X64_MSR_SCONTROL, hypervisor::scontrol_msr(scontrol));
     }
     crate::info!(
-        "Hyper-V: SynIC on CPU 0, SINT {} at vector {}",
+        "Hyper-V: SynIC on CPU 0 (VP {}), SINT {} at vector {}",
+        vp_index,
         hypervisor::VMBUS_SINT,
         line.num()
     );
@@ -277,6 +285,7 @@ fn set_up_synic() {
         line,
         input: SpinLock::new(input),
         taking: SpinLock::new(()),
+        vp_index,
     });
 }
 
@@ -362,6 +371,13 @@ impl Synic {
 
     /// Where SINT 2's event flags lie in [`event_flags`](Self::event_flags)'s page.
     pub const EVENT_FLAGS_OFFSET: usize = hypervisor::EVENT_FLAGS;
+
+    /// CPU 0's VP index (`HV_X64_MSR_VP_INDEX`, read when the SynIC was enabled): the VP
+    /// that SINT 2's messages and interrupts arrive on, and so the target VMBus names for
+    /// its contact and for every channel.
+    pub fn vp_index(&self) -> u32 {
+        self.vp_index
+    }
 
     /// The IRQ line SINT 2 is delivered at: a callback registered on it runs on CPU 0
     /// for each message or event flag Hyper-V gives the SINT.

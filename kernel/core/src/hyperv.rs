@@ -7,7 +7,8 @@
 //! - `hyperv_post`: `HvCallPostMessage`, at most 240 bytes, answered with Hyper-V's status;
 //! - `hyperv_take`: SINT 2's message copied out and its slot emptied, never waiting;
 //! - `hyperv_map_events`: CPU 0's event-flags page mapped into the caller, once;
-//! - `hyperv_interrupt`: an interrupt object for SINT 2, which is how the caller waits;
+//! - `hyperv_interrupt`: an interrupt object for SINT 2, which is how the caller waits,
+//!   and CPU 0's VP index, which VMBus targets;
 //! - `hyperv_signal_create`: an `HvSignal` for one connection ID, to give to a driver;
 //! - `hyperv_signal`: `HvCallSignalEvent` through an `HvSignal`, and nothing else.
 //!
@@ -127,11 +128,12 @@ pub(crate) fn hyperv_map_events(p: &Process, a: [u64; 6]) -> Answer {
     Ok((p.space.map_page_once_writable(&page)?, 0))
 }
 
-/// `hyperv_interrupt(root)`.
+/// `hyperv_interrupt(root)`: the interrupt, and in `rdx` CPU 0's VP index.
 pub(crate) fn hyperv_interrupt(p: &Process, a: [u64; 6]) -> Answer {
     let synic = root(p, a[0])?;
     let interrupt = Interrupt::sint(synic.interrupt(), p.account())?;
-    insert(p, Object::Interrupt(Arc::new(interrupt)))
+    let (handle, _) = insert(p, Object::Interrupt(Arc::new(interrupt)))?;
+    Ok((handle, u64::from(synic.vp_index())))
 }
 
 /// `hyperv_signal_create(root, connection)`.
