@@ -253,12 +253,11 @@ fn run() -> i64 {
         return fail(&out, "handing the data path's test its process resource", e);
     }
     // stream B1 hook (data-os-streams.md): the personality's mechanisms' test starts its
-    // children, and clones one, with a process resource of its own, which it shares out.
-    let for_personality =
-        match root_process.duplicate(Rights::WRITE | Rights::TRANSFER | Rights::DUPLICATE) {
-            Ok(h) => h,
-            Err(e) => return fail(&out, "duplicating the process resource", e),
-        };
+    // children, and clones one, with a process resource of its own.
+    let for_personality = match root_process.duplicate(Rights::WRITE | Rights::TRANSFER) {
+        Ok(h) => h,
+        Err(e) => return fail(&out, "duplicating the process resource", e),
+    };
     if let Err((e, _)) = personality.write(b"process", [for_personality]) {
         return fail(&out, "handing the personality test its process resource", e);
     }

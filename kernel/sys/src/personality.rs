@@ -13,11 +13,8 @@
 //! with the region out of reach. A system call, an exception the core does not serve, or
 //! a [`thread_interrupt`] in the program brings the same thread back: `personality_return`
 //! returns the reason, with the frame holding the program's registers as they were. Every
-//! Linux call of the program comes back. A native call of the program goes to the core when
-//! it is on the core's list (`run_granted`'s calls) and is refused otherwise; it resolves
-//! only the program's own handles, which [`program_handle`] moves there, places what the
-//! core maps in the range `personality_set` reserved, and cannot touch the region, so the
-//! program never holds the personality's handles. The kernel switches the general registers and the FS base;
+//! system call of the program comes back, native numbers too, so the program never holds
+//! the personality's handles. The kernel switches the general registers and the FS base;
 //! the vector and x87 registers stay live across the switch, and the personality saves the
 //! program's before it uses its own (as Zircon's restricted mode asks of Starnix).
 //!
@@ -168,37 +165,10 @@ impl Frame {
 
 /// Gives the created process `process` (a handle with `WRITE`) its personality region:
 /// `len` bytes from `base`, whole pages inside user space. Its program can never reach the
-/// region. `reserved` (whole pages apart from the region, or empty) is where the core
-/// places what its program's native calls map: `memory_map`, `batch_get`, the plane's
-/// windows; with it empty those calls find no room (`Limit`). Once per process, before it
-/// starts; a process with a forward is refused (`BadState`). Its threads start in the
-/// personality.
-pub fn personality_set(
-    process: &Process,
-    base: u64,
-    len: u64,
-    reserved: core::ops::Range<u64>,
-) -> Result<()> {
-    set(process, base, len, reserved, 0)
-}
-
-fn set(
-    process: &Process,
-    base: u64,
-    len: u64,
-    reserved: core::ops::Range<u64>,
-    copy: u64,
-) -> Result<()> {
-    let reserved_len = reserved.end.saturating_sub(reserved.start);
-    let a = [
-        process.0.raw() as u64,
-        base,
-        len,
-        reserved.start,
-        reserved_len,
-        copy,
-    ];
-    check(raw::call6(nr::PERSONALITY_SET, a).0).map(|_| ())
+/// region. Once per process, before it starts; a process with a forward is refused
+/// (`BadState`). Its threads start in the personality.
+pub fn personality_set(process: &Process, base: u64, len: u64) -> Result<()> {
+    check(raw::call3(nr::PERSONALITY_SET, process.0.raw() as u64, base, len).0).map(|_| ())
 }
 
 /// [`personality_set`], with the personality's fault-tolerant copy routine (B2's `VmReader`
@@ -210,30 +180,18 @@ pub fn personality_set_with_copy(
     process: &Process,
     base: u64,
     len: u64,
-    reserved: core::ops::Range<u64>,
     routine: core::ops::Range<u64>,
     recovery: u64,
 ) -> Result<()> {
-    let mut record = [0u8; personality::copy::LEN];
-    write_u64(&mut record, personality::copy::START, routine.start);
-    write_u64(&mut record, personality::copy::END, routine.end);
-    write_u64(&mut record, personality::copy::RECOVERY, recovery);
-    // The kernel reads the record's `copy::LEN` bytes during the call.
-    set(process, base, len, reserved, record.as_ptr() as u64)
-}
-
-/// Moves `handle` from the calling process's table into its program's, where the native
-/// calls its program makes resolve; returns its value there, which the personality hands
-/// the program. From the personality only. On failure the handle stays in the caller's
-/// table and comes back with the error.
-pub fn program_handle(handle: Handle) -> core::result::Result<RawHandle, (Error, Handle)> {
-    match check(raw::call1(nr::PROGRAM_HANDLE, handle.raw() as u64).0) {
-        Ok(v) => {
-            core::mem::forget(handle);
-            Ok(v as RawHandle)
-        }
-        Err(e) => Err((e, handle)),
-    }
+    let a = [
+        process.0.raw() as u64,
+        base,
+        len,
+        routine.start,
+        routine.end,
+        recovery,
+    ];
+    check(raw::call6(nr::PERSONALITY_SET, a).0).map(|_| ())
 }
 
 /// Runs the program with the registers in `frame`, which must lie inside the calling

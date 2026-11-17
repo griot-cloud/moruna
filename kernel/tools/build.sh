@@ -105,22 +105,6 @@ RUSTFLAGS="$flags$usage_flags -Zunstable-options -C link-arg=-T$kernel/sys/user.
 set +x
 
 bin="${CARGO_TARGET_DIR:-$kernel/target}/$user_target_name/release"
-# stream B2: the `linux` server is kernel/linuxlayer's, a workspace of its own: the Linux
-# personality first (position-independent, linked in its region), then the server with
-# the personality's image in it, in place of kernel/linux/server's.
-layer_targets="${CARGO_TARGET_DIR:-$kernel/target}/linuxlayer"
-layer_flags="-C relro-level=off -C force-unwind-tables=yes --check-cfg cfg(ktest) -C no-redzone=y"
-(cd "$kernel/linuxlayer" && CARGO_TARGET_DIR="$layer_targets/image" \
-  RUSTFLAGS="-C relocation-model=pie -C code-model=small $layer_flags" \
-  rustup run nightly-2026-07-21 cargo build --release --locked --target "$user_target" \
-  -Zunstable-options -Zjson-target-spec "${build_std[@]}" -p linuxlayer-personality)
-(cd "$kernel/linuxlayer" && CARGO_TARGET_DIR="$layer_targets/server" \
-  LINUXLAYER_PERSONALITY="$layer_targets/image/$user_target_name/release/linuxlayer-personality" \
-  RUSTFLAGS="-C relocation-model=static $layer_flags" \
-  rustup run nightly-2026-07-21 cargo build --release --locked --target "$user_target" \
-  -Zunstable-options -Zjson-target-spec "${build_std[@]}" -p linuxlayer-server -p linuxlayer-check)
-cp "$layer_targets/server/$user_target_name/release/linux" "$bin/linux"
-cp "$layer_targets/server/$user_target_name/release/linuxlayer-check" "$bin/linuxlayer-check"
 kernel_bin="${CARGO_TARGET_DIR:-$kernel/target}/$target/release"
 rm -rf "$out"
 mkdir -p "$out"
@@ -157,9 +141,6 @@ mkdir -p "$programs/kc1/bin"
 for p in hello threads refuse isolate bench granted hog tap badrecord; do
   "${muslcc[@]}" -static -O2 -Wall -Werror -s -o "$programs/kc1/bin/$p" "$kernel/linux/programs/$p.c"
 done
-# stream B2: B2-fs's checks through a task start (kernel/linuxlayer/check runs it).
-"${muslcc[@]}" -static -O2 -Wall -Werror -s -pthread -o "$programs/kc1/bin/taskcheck" \
-  "$kernel/linuxlayer/boot/programs/taskcheck.c"
 "$gnucc" -O2 -Wall -Werror -s -o "$programs/kc1/bin/dynamic" "$kernel/linux/programs/dynamic.c"
 # SDD 29 k (DP-T16): KA1's arrow_echo, unmodified, as a static musl program: a Rust program
 # that speaks Arrow IPC on its standard streams and knows no Moruna library.

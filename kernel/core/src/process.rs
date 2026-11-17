@@ -88,9 +88,9 @@ pub struct Process {
     /// by it.
     pub koid: u64,
     pub space: Space,
-    /// Its handle tables (stream B1 hook): its own, which `process_clone` may share, and
-    /// its program's. `handles.lock()` is the one the calling thread's calls resolve in.
-    pub handles: Handles,
+    /// Its handle table, shared with the processes `process_clone` gave it to (stream B1
+    /// hook): `handles.lock()` is the table.
+    pub handles: Arc<Table>,
     state: SpinLock<State>,
     pub signaller: Signaller,
     supervisor: bool,
@@ -207,12 +207,9 @@ impl Process {
         let record = Charge::new(account, charge::PROCESS)?;
         let space = Space::new(account)?;
         let koid = NEXT_KOID.fetch_add(1, Ordering::Relaxed);
-        let handles = Handles {
-            shared: match table {
-                Some(table) => table,
-                None => Arc::new(Table::new(salt(koid), account)?),
-            },
-            program: Slots::new(salt(koid), account)?,
+        let handles = match table {
+            Some(table) => table,
+            None => Arc::new(Table::new(salt(koid), account)?),
         };
         let process = Arc::new(Process {
             name: String::from(name),
@@ -234,7 +231,7 @@ impl Process {
             last_code: AtomicI64::new(0),
             _record: record,
         });
-        process.handles.shared.join(&process);
+        process.handles.join(&process);
         Ok(process)
     }
 
@@ -251,28 +248,11 @@ impl Process {
         table: &mut HandleTable<Handle>,
         handle: Handle,
     ) -> Result<RawHandle, (Error, Handle)> {
-        // Stream B1 hook: the table's own charge, however many processes share it.
-        Process::insert_charged(&self.handles, table, handle)
-    }
-
-    /// As [`Process::insert_into`], into the program's table (stream B1).
-    pub fn insert_into_program(
-        &self,
-        table: &mut HandleTable<Handle>,
-        handle: Handle,
-    ) -> Result<RawHandle, (Error, Handle)> {
-        Process::insert_charged(&self.handles.program, table, handle)
-    }
-
-    fn insert_charged(
-        slots: &Slots,
-        table: &mut HandleTable<Handle>,
-        handle: Handle,
-    ) -> Result<RawHandle, (Error, Handle)> {
         if table.grows() {
             let step = charge::HANDLE_SLOTS * charge::HANDLE_SLOT;
             let need = moruna_quota::table_steps(table.slots() + 1) * step;
-            let mut charged = slots.charge.lock();
+            // Stream B1 hook: the table's own charge, however many processes share it.
+            let mut charged = self.handles.charge.lock();
             let have = charged.bytes();
             if need > have
                 && let Err(e) = charged.grow(need - have)
@@ -413,7 +393,7 @@ impl Process {
             Life::Created { .. } => {
                 state.life = Life::Running { live: 1 };
                 // stream B1 hook
-                self.handles.shared.running.fetch_add(1, Ordering::AcqRel);
+                self.handles.running.fetch_add(1, Ordering::AcqRel);
                 Ok(())
             }
             _ => Err(Error::BadState),
@@ -697,7 +677,7 @@ impl Process {
         }
         self.end(Exit::Killed);
         // Stream B1 hook: a task sharing one table ends whole.
-        for other in self.handles.shared.others(self) {
+        for other in self.handles.others(self) {
             if other.is_running() {
                 other.end(Exit::Killed);
             }
@@ -779,15 +759,13 @@ impl Process {
             }
         };
         // Stream B1 hook: a shared table empties with the last of its running processes,
-        // which frees the processes its handles held; the program's goes with this one.
-        let handles = if self.handles.shared.running.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.handles.shared.lock().drain()
+        // which frees the processes its handles held.
+        let handles = if self.handles.running.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.handles.lock().drain()
         } else {
             Vec::new()
         };
-        let program = self.handles.program.lock().drain();
         drop(handles);
-        drop(program);
         // The forward goes with the process: its server sees the channel close.
         let forward = self.forward.lock().take();
         drop(forward);
@@ -1162,58 +1140,15 @@ impl Process {
     }
 }
 
-/// A process's handle tables: its own, and its program's, where the native calls its
-/// program makes resolve (`data-os.md` §4, a program's native calls). The program's starts
-/// empty in a clone, is charged as the other is, and empties when the process ends.
-pub struct Handles {
-    pub shared: Arc<Table>,
-    pub program: Slots,
-}
-
-impl core::ops::Deref for Handles {
-    type Target = Slots;
-
-    /// The table the calling thread's calls resolve in: the program's during a native
-    /// call this process's program made, else its own.
-    fn deref(&self) -> &Slots {
-        if crate::personality::program_call(|p| core::ptr::eq(&p.handles, self)) {
-            &self.program
-        } else {
-            &self.shared.slots
-        }
-    }
-}
-
-/// A handle table (SDD 20, e.2) and what its slots cost, charged as it grows (SDD 20
-/// f.18), to the account of the process it was made for; its limit is its own.
-pub struct Slots {
-    table: SpinLock<HandleTable<Handle>>,
-    charge: SpinLock<Charge>,
-}
-
-impl Slots {
-    fn new(salt: u32, account: &Arc<Account>) -> Result<Slots, Error> {
-        Ok(Slots {
-            table: SpinLock::new(HandleTable::new(salt)),
-            charge: SpinLock::new(Charge::new(account, 0)?),
-        })
-    }
-}
-
-impl core::ops::Deref for Slots {
-    type Target = SpinLock<HandleTable<Handle>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.table
-    }
-}
-
-/// A process's own handle table, which `process_clone`'s `SHARE_HANDLES` shares between
-/// the processes of a task, as Linux's `CLONE_FILES` does. It holds handles to the
-/// processes that share it, which hold it: when the last of them that ran ends, it is
+/// A handle table (SDD 20, e.2), which `process_clone`'s `SHARE_HANDLES` shares between the
+/// processes of a task, as Linux's `CLONE_FILES` does. Its slots are charged once, to the
+/// account of the process it was made for, and its limit is its own. It holds handles to
+/// the processes that share it, which hold it: when the last of them that ran ends, it is
 /// emptied, which frees every process its handles held, so no cycle outlives the task.
 pub struct Table {
-    slots: Slots,
+    table: SpinLock<HandleTable<Handle>>,
+    /// What its slots cost, charged as it grows (SDD 20 f.18).
+    charge: SpinLock<Charge>,
     /// The processes that use it.
     members: SpinLock<Vec<Weak<Process>>>,
     /// How many of them run.
@@ -1228,7 +1163,8 @@ const _: () = assert!(
 impl Table {
     fn new(salt: u32, account: &Arc<Account>) -> Result<Table, Error> {
         Ok(Table {
-            slots: Slots::new(salt, account)?,
+            table: SpinLock::new(HandleTable::new(salt)),
+            charge: SpinLock::new(Charge::new(account, 0)?),
             members: SpinLock::new(Vec::new()),
             running: AtomicUsize::new(0),
         })
@@ -1255,10 +1191,10 @@ impl Table {
 }
 
 impl core::ops::Deref for Table {
-    type Target = Slots;
+    type Target = SpinLock<HandleTable<Handle>>;
 
-    fn deref(&self) -> &Slots {
-        &self.slots
+    fn deref(&self) -> &Self::Target {
+        &self.table
     }
 }
 

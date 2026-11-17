@@ -1,3 +1,0 @@
-RlimitTest.ParseProcPidLimits
-RlimitTest.SetRlimitHigher
-RlimitTest.UnprivilegedSetRlimit
