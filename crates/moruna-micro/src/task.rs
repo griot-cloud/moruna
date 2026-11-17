@@ -1629,9 +1629,10 @@ impl TaskState {
     /// [`Self::early`], in order, and its port calls are served.
     fn gather(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<()> {
         loop {
+            // A poll: it looks, and never spins or sleeps.
             let event = self
                 .plane
-                .next(moruna_svc::now())
+                .next(0)
                 .map_err(|e| plane_error(&self.name, "looking at the task", e))?;
             match event {
                 None => return Ok(()),

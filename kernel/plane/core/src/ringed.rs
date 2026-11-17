@@ -1512,9 +1512,11 @@ impl<C: RingCalls> DataPlane for RingPlane<C> {
                 continue;
             }
             // Read the rings a while before sleeping: a task that answers within it costs
-            // the engine no call.
+            // the engine no call. A poll (a deadline of zero) only looks: a stage that polls
+            // each batch for answers already come spun every time (the NYC gate, 2026-11-17).
             let mut ready = false;
-            for _ in 0..self.spins {
+            let spins = if deadline == 0 { 0 } else { self.spins };
+            for _ in 0..spins {
                 if self.ready() {
                     ready = true;
                     break;

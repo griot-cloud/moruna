@@ -114,3 +114,34 @@ fn sc_p_several_workers_deal_every_instance_some_of_few_batches() {
         assert_eq!(per.values().sum::<usize>(), 34);
     }
 }
+
+#[test]
+fn sc_p_workers_apply_a_dealt_stage_s_instances_at_once() {
+    // Nothing in the scheduler holds a dealt stage to one worker: eight workers over eight
+    // instances overlap their applies, each 20 ms, on 32 batches.
+    let kernel = Arc::new(StatefulKernel::new(8).latency(Duration::from_millis(20)));
+    let rig = RigBuilder::new()
+        .cfg(|cfg| {
+            cfg.workers_max = 8;
+            cfg.workers_active = 8;
+            cfg.initial_morsel_target = 8;
+            cfg.read_ahead = 8;
+        })
+        .source(FakeSource::new().splits(1, 32, 32 * 8))
+        .kernel(Arc::new(Dealt(kernel.clone(), true)))
+        .go();
+    rig.scheduler
+        .init_instances()
+        .expect("the instances are made");
+    let started = std::time::Instant::now();
+    match rig.scheduler.run(CancelToken::new()) {
+        Ok(crate::RunOutcome::Completed { .. }) => {}
+        other => panic!("expected Completed, got {other:?}"),
+    }
+    let took = started.elapsed();
+    // One worker at a time would take 32 x 20 ms = 640 ms.
+    assert!(
+        took < Duration::from_millis(400),
+        "32 applies of 20 ms on 8 workers took {took:?}"
+    );
+}

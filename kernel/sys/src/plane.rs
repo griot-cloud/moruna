@@ -612,8 +612,11 @@ pub enum Step {
     Ended,
 }
 
-/// How many times a task reads its ring before it sleeps, by default.
-pub const SPINS: u32 = 1 << 14;
+/// How many times a task reads its ring before it sleeps on its bell, by default: a few
+/// microseconds, then the futex. Under KVM a long run of `pause` traps the vCPU to the host,
+/// so 16,384 reads before each sleep cost the gate's waiting tasks more CPU than their
+/// functions (Enrich: 270 CPU-s of waits beside 36 of its function, a full year, 2026-11-17).
+pub const SPINS: u32 = 1 << 8;
 
 fn broken(_: ring::Bad) -> Error {
     Error::BadState
