@@ -92,7 +92,8 @@ impl fmt::Display for HandoverError {
 }
 
 impl Handover {
-    /// The message `platform` sends: the hand-over as JSON.
+    /// The message `platform` sends: the hand-over as JSON, its node config only what the
+    /// operator set (PM, 2026-11-18).
     pub fn encode(&self) -> Result<Vec<u8>, HandoverError> {
         let message = serde_json::json!({
             "cloud": cloud_name(self.cloud),
@@ -110,8 +111,10 @@ impl Handover {
         Ok(message)
     }
 
-    /// The hand-over a message holds, for `api`. The node config in it is validated again, on a
-    /// node of the hand-over's own `memory_bytes`.
+    /// The hand-over a message holds, for `api`. The node config in it is validated again, and
+    /// its defaults derived, by the function that read it in `platform`, on a node of the
+    /// hand-over's own `memory_bytes`: what the operator set is judged as theirs, and a default
+    /// comes out as it did there.
     pub fn decode(message: &[u8]) -> Result<Handover, HandoverError> {
         if message.len() > MESSAGE_MAX {
             return Err(HandoverError::TooLarge(message.len()));
