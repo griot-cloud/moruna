@@ -11,6 +11,13 @@
 //! most a setting's sends in flight a card. When every client and listener has gone
 //! the server lets the sockets still closing finish, for at most a second, and ends,
 //! closing its cards' connections so their drivers end too.
+//!
+//! In a node's boot (system design 1B and 1C) its first DHCP lease prints the network
+//! line, `moruna: network wan <address>/<prefix> gateway <address|none>`. With an
+//! interface set by DHCP and no lease 30 s after its start, it prints
+//! `moruna: fatal network: no DHCP lease within 30 s` and exits with failure. Whatever
+//! else ends it with failure, at its start or later, prints its `KE2 netstack: FAIL:`
+//! line and then `moruna: fatal network: <reason>`.
 
 #![no_std]
 #![no_main]
@@ -28,7 +35,11 @@ use alloc::{
 use core::cell::RefCell;
 
 use devices_protocol::directory;
-use moruna_netstack::{Card, ClockSession, Config, Shared, Stack, after_turn, factory, parse};
+use moruna_netstack::{
+    Card, ClockSession, Config, Shared, Stack, after_turn,
+    boot::{NO_LEASE, fatal},
+    factory, parse,
+};
 use moruna_svc::{
     CallError, Channel, ClientCore, Completions, Console, DEADLINE_INFINITE, Decoder, Encoder,
     Handle, Memory, Rights, Signals, Timer, Watch, Wire, deadline_in, limits, now, println, random,
@@ -55,7 +66,8 @@ struct CardLink {
     receive: Option<u32>,
     link: Option<u32>,
     generation: u32,
-    sends: Vec<u32>,
+    /// The sends outstanding: each request's id, and the frames it carries.
+    sends: Vec<(u32, u32)>,
     batch: u32,
     failed: Option<String>,
 }
@@ -98,13 +110,20 @@ impl CardLink {
         }
         let mut k = 0;
         while k < self.sends.len() {
-            match self.core.reply(self.sends[k], 0) {
+            let (id, frames) = self.sends[k];
+            match self.core.reply(id, 0) {
                 Ok(mut f) => {
+                    // moruna.driver.net's `send` answers the frames' count once every one is
+                    // on the device's ring, and refuses a batch whole.
                     let mut decoder = f.decoder();
-                    <()>::decode(&mut decoder).map_err(|e| format!("send answer: {e:?}"))?;
+                    let taken =
+                        u32::decode(&mut decoder).map_err(|e| format!("send answer: {e:?}"))?;
                     decoder
                         .finish()
                         .map_err(|e| format!("send answer trailer: {e:?}"))?;
+                    if taken != frames {
+                        return Err(format!("a send of {frames} frames was answered {taken}"));
+                    }
                     self.sends.swap_remove(k);
                 }
                 Err(CallError::TimedOut) => k += 1,
@@ -162,10 +181,11 @@ impl CardLink {
             if batch.is_empty() {
                 return Ok(());
             }
+            let frames = batch.len() as u32;
             let mut e = Encoder::new();
             batch.encode(&mut e).map_err(|e| format!("{e:?}"))?;
-            self.sends
-                .push(self.core.send(4, e).map_err(|e| format!("send: {e:?}"))?);
+            let id = self.core.send(4, e).map_err(|e| format!("send: {e:?}"))?;
+            self.sends.push((id, frames));
         }
     }
 }
@@ -338,13 +358,17 @@ fn open_cards(
 }
 
 fn run() -> i64 {
+    // The server's start, which its wait for a first DHCP lease is counted from.
+    let started = now();
     let Some(out) = start::take("console").map(Console) else {
         return 90;
     };
-    match serve(&out) {
-        Ok(()) => 0,
+    match serve(&out, started) {
+        Ok(code) => code,
         Err(e) => {
             println!(out, "KE2 netstack: FAIL: {}", e);
+            // The node's failure line, last (system design 1B).
+            println!(out, "{}", fatal(&e));
             1
         }
     }
@@ -358,7 +382,9 @@ fn mac_text(mac: u64) -> String {
     )
 }
 
-fn serve(out: &Console) -> Result<(), String> {
+/// Serves until every client has left (0), or until the first DHCP lease is overdue
+/// (1, its fatal line printed).
+fn serve(out: &Console, started: u64) -> Result<i64, String> {
     let text = read_config()?;
     let config = parse(&text).map_err(|e| format!("the configuration: {e}"))?;
     let mut seed = [0u8; 8];
@@ -375,15 +401,12 @@ fn serve(out: &Console) -> Result<(), String> {
             return Err(format!("grant {slot} names a slot the boot did not give"));
         }
     }
-    let mut listeners = Vec::new();
+    let mut granted = Vec::new();
     for slot in slots {
         let Some((_, policy)) = config.grants.iter().find(|(s, _)| *s == slot) else {
             return Err(format!("slot {slot} has no grant"));
         };
-        let channel = start::take(&slot)
-            .map(Channel)
-            .ok_or_else(|| format!("slot {slot} was taken"))?;
-        listeners.push((channel, policy.clone()));
+        granted.push((slot, policy.clone()));
     }
     let (mut links, cards) = if config.interfaces.is_empty() {
         (Vec::new(), Vec::new())
@@ -456,6 +479,16 @@ fn serve(out: &Console) -> Result<(), String> {
         ));
     }
     println!(out, "{}", up);
+    // The listeners are taken only now, once the server has started: one that cannot start
+    // ends holding none, so its clients see it go when its process ends, after its fatal
+    // line, and the console names the cause first (system design 1B).
+    let mut listeners = Vec::new();
+    for (slot, policy) in granted {
+        let channel = start::take(&slot)
+            .map(Channel)
+            .ok_or_else(|| format!("slot {slot} was taken"))?;
+        listeners.push((channel, policy));
+    }
     let shared = Shared::new(stack);
     let mut d = moruna_svc::Dispatcher::new();
     for (channel, policy) in listeners {
@@ -496,6 +529,14 @@ fn serve(out: &Console) -> Result<(), String> {
         for note in core::mem::take(&mut shared.stack.borrow_mut().notes) {
             println!(out, "KE2 netstack: {}", note);
         }
+        // The boot's lines, exactly as the stack wrote them.
+        for line in core::mem::take(&mut shared.stack.borrow_mut().boot) {
+            println!(out, "{}", line);
+        }
+        if shared.stack.borrow().lease_overdue(started, now()) {
+            println!(out, "{}", NO_LEASE);
+            return Ok(1);
+        }
         {
             let mut links = cards.borrow_mut();
             for (index, l) in links.iter_mut().enumerate() {
@@ -519,12 +560,14 @@ fn serve(out: &Console) -> Result<(), String> {
             }
         }
         let next = shared.stack.borrow_mut().poll_at();
-        // At the stack's next deadline (now, when frames wait), or the linger's end;
-        // disarmed (zero) when neither is due.
-        let deadline = match (next, linger) {
-            (Some(n), Some(l)) => n.min(l),
-            (n, l) => n.or(l).unwrap_or(0),
-        };
+        let lease = shared.stack.borrow().lease_due(started);
+        // At the stack's next deadline (now, when frames wait), the linger's end, or
+        // when the first lease is due; disarmed (zero) when none is.
+        let deadline = [next, linger, lease]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(0);
         timer
             .set(if deadline == 0 { 0 } else { deadline.max(1) })
             .map_err(|e| format!("timer_set: {}", e.name()))?;
@@ -546,5 +589,5 @@ fn serve(out: &Console) -> Result<(), String> {
     // the connections ends them and the drivers see their last client leave.
     drop(d);
     drop(cards);
-    Ok(())
+    Ok(0)
 }

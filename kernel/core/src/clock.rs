@@ -1,8 +1,11 @@
 //! The clock, its page and the deadline queue (SDD 20, f.6; data-os §2, C8).
 //!
-//! The clock is the TSC scaled to nanoseconds since boot: `(tsc - origin) * MULTIPLIER >>
-//! SHIFT` (`moruna_datapath::clock`). The clock page publishes that same scale (`moruna_abi::clock_page`), written
-//! once at boot, so a process that maps it reads the time with no call and agrees with
+//! The clock is the TSC scaled to nanoseconds since the core's first instruction:
+//! `(tsc - origin) * MULTIPLIER >> SHIFT` (`moruna_datapath::clock`), where `origin` is the
+//! counter OSTD read as the boot processor ran its first Rust code (`ostd::boot::entry_tsc`, a
+//! `moruna:` patch), so the clock counts OSTD's start-up too (system design, section 1B:
+//! `boot_ms`). The clock page publishes that same scale and origin (`moruna_abi::clock_page`),
+//! written once at boot, so a process that maps it reads the time with no call and agrees with
 //! `clock_get` to the nanosecond. The TSC is the one counter and the scale never changes.
 //! The page is also the node's one wall clock (ABI 2.8): its realtime base and where the base
 //! came from, the CMOS clock's reading at boot, then each `clock_set_realtime`'s, both written
@@ -20,6 +23,7 @@ use moruna_abi::{DEADLINE_INFINITE, Error, PAGE_SIZE, Signals, charge, clock_pag
 use moruna_datapath::clock as scale;
 use ostd::{
     arch::{read_tsc, tsc_freq},
+    early_println,
     sync::{LocalIrqDisabled, SpinLock, Waker},
     timer,
 };
@@ -69,17 +73,33 @@ enum Entry {
 static QUEUE: SpinLock<BTreeMap<Key, Entry>, LocalIrqDisabled> = SpinLock::new(BTreeMap::new());
 
 /// Starts the clock and the deadline queue. Fails if OSTD could not measure the TSC.
+///
+/// The clock's zero is the core's first instruction: the counter OSTD recorded on entry. An entry
+/// that recorded none, or a counter ahead of this one, starts the clock here instead.
 pub fn init() -> Result<(), &'static str> {
     let hz = tsc_freq();
     if hz == 0 {
         return Err("the TSC frequency is unknown, so the clock cannot run");
     }
-    let origin = read_tsc();
+    let here = read_tsc();
+    let entry = ostd::boot::entry_tsc();
+    let origin = if entry != 0 && entry <= here {
+        entry
+    } else {
+        here
+    };
     let multiplier = scale::multiplier(hz).ok_or("the TSC frequency is unknown")?;
     TSC_ORIGIN.store(origin, Ordering::Release);
     MULTIPLIER.store(multiplier, Ordering::Release);
     make_page(origin, multiplier)?;
-    set_base(rtc::read()?, clock_page::realtime::MACHINE);
+    // The CMOS clock is read now, after the clock's zero: the realtime at the zero is that
+    // reading less the time since, so `realtime` and a realtime deadline agree with it.
+    let cmos = rtc::read()?;
+    set_base(cmos.saturating_sub(now()), clock_page::realtime::MACHINE);
+    early_println!(
+        "kk: clock: started {} ms after the core's first instruction",
+        scale::scale(here - origin, multiplier) / 1_000_000
+    );
     timer::register_callback_on_cpu(tick);
     Ok(())
 }

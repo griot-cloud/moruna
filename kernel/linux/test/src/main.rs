@@ -286,22 +286,15 @@ fn hog(c: &mut linux::Client) -> Result<String, String> {
     ))
 }
 
-/// KB5-T9: the account protocol cannot decode old unchecked-budget requests.
+/// How long the test waits for the personality to come up: it serves only once its image (five
+/// layers, through its own image filesystem) is attached.
+const READY: u64 = 600 * SECONDS;
+
+/// KB5-T9: the account protocol cannot decode old unchecked-budget requests. The server is
+/// waited for first, and the refusal is given 5 s.
 fn old_major_refused(listener: &Channel) -> Result<(), String> {
-    let channel = moruna_svc::connect(listener).map_err(|e| format!("connecting: {e:?}"))?;
     let old = moruna_svc::protocol::ProtocolId::new(linux::ID.name, 1, 2);
-    match moruna_svc::ClientCore::connect(channel, old, deadline_in(5 * SECONDS)) {
-        Err(moruna_svc::CallError::Refused(refusal))
-            if refusal.reason == moruna_svc::protocol::Refusal::MajorMismatch
-                && refusal.server == linux::ID.hello() =>
-        {
-            Ok(())
-        }
-        other => Err(format!(
-            "the old major was not refused before requests: {:?}",
-            other.map(|_| ())
-        )),
-    }
+    moruna_svc::conformance::old_major_refused(listener, linux::ID, old, READY, 5 * SECONDS)
 }
 
 fn run() -> i64 {
@@ -328,7 +321,7 @@ fn run() -> i64 {
             return 1;
         }
     };
-    let mut c = match linux::Client::connect(channel, deadline_in(600 * SECONDS)) {
+    let mut c = match linux::Client::connect(channel, deadline_in(READY)) {
         Ok(c) => c,
         Err(e) => {
             println!(out, "KC1 linux-test: FAIL: hello: {e:?}");

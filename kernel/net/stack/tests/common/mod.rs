@@ -4,10 +4,22 @@
 
 #![allow(dead_code)]
 
-use std::{collections::BTreeMap, rc::Rc, thread};
+use std::{
+    collections::BTreeMap,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+};
 
-use moruna_netstack::{Card, ClockSession, Shared, Stack, after_turn, factory, parse};
+use moruna_netstack::{Card, Shared, Stack, after_turn, factory, parse};
 use moruna_svc::{Channel, Dispatcher, Turn, now};
+use smoltcp::wire::{
+    DhcpMessageType, DhcpPacket, DhcpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
+    EthernetRepr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr,
+};
 
 pub const MAC_A: u64 = 0x5254_004b_4502;
 pub const MAC_B: u64 = 0x5254_004b_4503;
@@ -112,26 +124,17 @@ pub fn serve_with_tls(
     wire: Wire,
     trust: Option<moruna_netstack::tls::Trust>,
 ) -> (BTreeMap<String, Channel>, thread::JoinHandle<()>) {
-    serve_linked(config, macs, wire, trust, None)
+    serve_until(config, macs, wire, trust, Arc::new(AtomicBool::new(false)))
 }
 
-/// As [`serve_with_tls`], with no cards, and the server also serving the clock link
-/// (`moruna.net.clock`): returns the link's other end, the end `platform` holds.
-pub fn serve_with_clock(
-    config: &str,
-    trust: Option<moruna_netstack::tls::Trust>,
-) -> (BTreeMap<String, Channel>, Channel, thread::JoinHandle<()>) {
-    let (ours, theirs) = Channel::create().expect("a channel");
-    let (slots, join) = serve_linked(config, &[], no_external_cards(), trust, Some(theirs));
-    (slots, ours, join)
-}
-
-fn serve_linked(
+/// The same server, which also ends as soon as `stop` is set, whoever is still
+/// connected: every channel to it closes, as when the server's process exits.
+pub fn serve_until(
     config: &str,
     macs: &[u64],
     wire: Wire,
     trust: Option<moruna_netstack::tls::Trust>,
-    clock: Option<Channel>,
+    stop: Arc<AtomicBool>,
 ) -> (BTreeMap<String, Channel>, thread::JoinHandle<()>) {
     let config = parse(config).expect("the configuration");
     let mut ours = BTreeMap::new();
@@ -162,10 +165,6 @@ fn serve_linked(
             d.listen(listener, factory(Rc::clone(&shared), policy))
                 .expect("listen");
         }
-        if let Some(clock) = clock {
-            d.serve(clock, Box::new(ClockSession::new(Rc::clone(&shared), now)))
-                .expect("serve the clock link");
-        }
         loop {
             after_turn(&shared, &mut d, now());
             let deadline = {
@@ -176,7 +175,7 @@ fn serve_linked(
                     .unwrap_or(t + 50_000_000)
                     .clamp(t, t + 50_000_000)
             };
-            if d.channels() == 0 {
+            if d.channels() == 0 || stop.load(Ordering::SeqCst) {
                 break;
             }
             if d.turn(deadline).expect("a turn") == Turn::Empty {
@@ -236,4 +235,122 @@ pub fn send(
             .map_err(CallError::Kernel)?,
     );
     client.send_from(socket, loan, 0, bytes.len() as u32)
+}
+
+/// A DHCP server for card 0: offers 10.0.2.15/24, DNS 10.0.2.3 and, with `router`, the
+/// router 10.0.2.2, and acknowledges the request for it.
+pub fn dhcp_server(router: bool) -> Wire {
+    Box::new(move |st: &mut Stack, _: &mut Rng| {
+        for f in std::mem::take(&mut st.card_mut(0).port.tx) {
+            if let Some(answer) = dhcp_answer(&f, router) {
+                st.card_mut(0).port.deliver(answer);
+            }
+        }
+    })
+}
+
+/// That server's answer to the frame `f`: an offer for a discover and an acknowledgement
+/// for a request, and nothing for any other frame.
+pub fn dhcp_answer(f: &[u8], router: bool) -> Option<Vec<u8>> {
+    dhcp_answer_offering(f, [10, 0, 2, 15], router)
+}
+
+/// The same server offering `address` in 10.0.2.0/24 instead.
+pub fn dhcp_answer_offering(f: &[u8], address: [u8; 4], router: bool) -> Option<Vec<u8>> {
+    let server_mac = EthernetAddress([0x52, 0x55, 0x0a, 0x00, 0x02, 0x02]);
+    let server_ip = Ipv4Address::new(10, 0, 2, 2);
+    let (client, xid, kind) = dhcp_request(f)?;
+    let reply_type = match kind {
+        DhcpMessageType::Discover => DhcpMessageType::Offer,
+        DhcpMessageType::Request => DhcpMessageType::Ack,
+        _ => return None,
+    };
+    let mut dns = heapless::Vec::new();
+    let _ = dns.push(Ipv4Address::new(10, 0, 2, 3));
+    let repr = DhcpRepr {
+        message_type: reply_type,
+        transaction_id: xid,
+        secs: 0,
+        client_hardware_address: client,
+        client_ip: Ipv4Address::UNSPECIFIED,
+        your_ip: Ipv4Address::from(address),
+        server_ip,
+        router: router.then_some(server_ip),
+        subnet_mask: Some(Ipv4Address::new(255, 255, 255, 0)),
+        relay_agent_ip: Ipv4Address::UNSPECIFIED,
+        broadcast: false,
+        requested_ip: None,
+        client_identifier: None,
+        server_identifier: Some(server_ip),
+        parameter_request_list: None,
+        dns_servers: Some(dns),
+        max_size: None,
+        lease_duration: Some(3600),
+        renew_duration: None,
+        rebind_duration: None,
+        additional_options: &[],
+    };
+    Some(dhcp_frame(server_mac, server_ip, &repr))
+}
+
+/// The client's address, transaction and message type, if `f` is a DHCP request.
+pub fn dhcp_request(f: &[u8]) -> Option<(EthernetAddress, u32, DhcpMessageType)> {
+    let eth = EthernetFrame::new_checked(f).ok()?;
+    if eth.ethertype() != EthernetProtocol::Ipv4 {
+        return None;
+    }
+    let ip = Ipv4Packet::new_checked(eth.payload()).ok()?;
+    if ip.next_header() != IpProtocol::Udp {
+        return None;
+    }
+    let udp = UdpPacket::new_checked(ip.payload()).ok()?;
+    if udp.dst_port() != 67 {
+        return None;
+    }
+    let dhcp = DhcpPacket::new_checked(udp.payload()).ok()?;
+    let repr = DhcpRepr::parse(&dhcp).ok()?;
+    Some((
+        repr.client_hardware_address,
+        repr.transaction_id,
+        repr.message_type,
+    ))
+}
+
+fn dhcp_frame(src_mac: EthernetAddress, src: Ipv4Address, repr: &DhcpRepr<'_>) -> Vec<u8> {
+    let caps = smoltcp::phy::ChecksumCapabilities::default();
+    let dst = Ipv4Address::BROADCAST;
+    let udp = UdpRepr {
+        src_port: 67,
+        dst_port: 68,
+    };
+    let udp_len = 8 + repr.buffer_len();
+    let ip = Ipv4Repr {
+        src_addr: src,
+        dst_addr: dst,
+        next_header: IpProtocol::Udp,
+        payload_len: udp_len,
+        hop_limit: 64,
+    };
+    let eth = EthernetRepr {
+        src_addr: src_mac,
+        dst_addr: EthernetAddress::BROADCAST,
+        ethertype: EthernetProtocol::Ipv4,
+    };
+    let mut buf = vec![0u8; 14 + ip.buffer_len() + udp_len];
+    let mut frame = EthernetFrame::new_unchecked(&mut buf[..]);
+    eth.emit(&mut frame);
+    let mut packet = Ipv4Packet::new_unchecked(frame.payload_mut());
+    ip.emit(&mut packet, &caps);
+    let mut datagram = UdpPacket::new_unchecked(packet.payload_mut());
+    udp.emit(
+        &mut datagram,
+        &src.into(),
+        &dst.into(),
+        repr.buffer_len(),
+        |payload| {
+            let _ = repr.emit(&mut DhcpPacket::new_unchecked(payload));
+        },
+        &caps,
+    );
+    buf
 }

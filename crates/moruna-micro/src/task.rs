@@ -340,6 +340,9 @@ struct Busy {
     schema: Mutex<Option<moruna_kernel::arrow::datatypes::SchemaRef>>,
     /// Where the stage's workers' time inside the stage went, summed over its tasks.
     feeder: Feeder,
+    /// The run's cancel, which a task's waits look at: shared, so a task started before its
+    /// stage was bound to the run (`init_instances`) still sees it.
+    cancel: OnceLock<CancelToken>,
     /// What each task did, by instance, summed over the tasks an instance had.
     figures: Mutex<Vec<Option<layout::TaskFigures>>>,
 }
@@ -597,6 +600,7 @@ impl ImageTask {
             ports.bind_run(run.clone());
         }
         let _ = self.cancel.set(run.cancel.clone());
+        let _ = self.busy.cancel.set(run.cancel.clone());
     }
 
     /// The run's ceiling, which bounds the stage's plane (SDD 30 f.6).
@@ -863,6 +867,10 @@ impl ImageTask {
             cancel: self.cancel.get().cloned(),
             in_flight: VecDeque::new(),
             queued: VecDeque::new(),
+            applying: false,
+            ready: VecDeque::new(),
+            taking: None,
+            counted: false,
             early: VecDeque::new(),
             schema: None,
             busy: Arc::clone(&self.busy),
@@ -921,6 +929,19 @@ pub struct TaskState {
     /// Ring mode: pieces given to the stage and not yet posted to the task, oldest first: a
     /// morsel's pieces past what the task holds in flight wait here, not the worker.
     queued: VecDeque<moruna_kernel::arrow::record_batch::RecordBatch>,
+    /// Ring mode: a unit's batch is cut and queued, and the unit has not returned. A unit the
+    /// run's arena refused (`MorunaError::Alloc`) is applied again with the same batch (RB5,
+    /// the scheduler's `run_task`), and every other failure retires the state, so a unit that
+    /// finds this set goes on from where the refusal stopped it: its batch is not cut and
+    /// posted twice (item 3.1: rows came out twice, or not at all).
+    applying: bool,
+    /// Ring mode: answers the unit under way has taken and not yet given, oldest first: kept
+    /// across a refused unit, given with the unit that completes.
+    ready: VecDeque<Payload>,
+    /// Ring mode: the answer being taken when the run's arena refused one of its records.
+    taking: Option<Taking>,
+    /// Whether this task counts in the stage's busy tasks now.
+    counted: bool,
     /// What the task put or released while the engine laid out its next batch.
     early: VecDeque<Seen>,
     /// The schema of the task's answers, from its first: a batch of no rows stands for an
@@ -1003,10 +1024,40 @@ enum Seen {
     Ended,
 }
 
+/// An answer being taken: the batch it answers, its records taken so far (each decoded as it
+/// came, so its window cycles for the next part), the record the run's arena refused, to take
+/// first when the unit is applied again, and whether the task has released the batch.
+struct Taking {
+    offered: BatchId,
+    parts: Vec<Payload>,
+    refused: Option<BatchId>,
+    released: bool,
+}
+
 /// A mapping of a batch the engine holds, owning the pages an Arrow buffer points into.
 struct Mapped(#[allow(dead_code)] moruna_svc::Mapping<'static>);
 
 impl TaskState {
+    /// Whether the run is cancelled: as the task started, or as its stage was bound since.
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .or_else(|| self.busy.cancel.get())
+            .is_some_and(CancelToken::is_cancelled)
+    }
+
+    /// This task in the stage's busy tasks, or out of them, once each way.
+    fn count_busy(&mut self, busy: bool) {
+        if busy != self.counted {
+            if busy {
+                self.busy.start();
+            } else {
+                self.busy.stop();
+            }
+            self.counted = busy;
+        }
+    }
+
     /// Adds what this task did to its instance's figures in the stage's, once.
     fn record(&mut self) {
         if std::mem::replace(&mut self.recorded, true) {
@@ -1312,7 +1363,7 @@ impl TaskState {
         self.drain_log();
         match event {
             None => {
-                if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                if self.cancelled() {
                     return Err(MorunaError::Cancelled);
                 }
                 Ok(false)
@@ -1444,13 +1495,15 @@ impl TaskState {
         // and every array over it are gone.
         #[allow(unsafe_code)]
         let buffer = unsafe { ArrowBuffer::from_custom_allocation(ptr, len as usize, owner) };
+        // Only once it has landed is the record given back: one the run's arena refused stays
+        // the engine's, taken first when the unit is applied again (`Taking::refused`).
         let landed = moruna_kernel::ipc::decode(buffer, PAGE as usize)
-            .and_then(|b| moruna_adapters::land::land_table(b, &self.alloc));
+            .and_then(|b| moruna_adapters::land::land_table(b, &self.alloc))?;
         self.plane
             .drop_batch(out)
             .map_err(|e| plane_error(&self.name, "dropping the record put", e))?;
         self.landed += 1;
-        Ok(landed?.0)
+        Ok(landed.0)
     }
 
     /// Answers a port call through the stage's ports.
@@ -1512,18 +1565,20 @@ impl TaskState {
         }
     }
 
-    /// The task's answer to batch `offered` in ring mode: every record it puts until it
+    /// The task's answer to the batch `t` names in ring mode: every record it puts until it
     /// releases the batch, which says it is done. One record is handed on as it lies; several
     /// (an answer bigger than a window) are joined into one batch. The first is kept in place
     /// when it may be, and each after it lands at once, so its window goes back for the next.
+    /// A record the run's arena refused stays in `t`, which the caller keeps for the unit
+    /// applied again: nothing taken is lost and nothing is taken twice.
     fn answers(
         &mut self,
-        offered: BatchId,
+        t: &mut Taking,
         ports: Option<&Arc<StagePorts>>,
         names: &[String],
     ) -> Result<Payload> {
         let (started, waited) = (moruna_svc::now(), self.timed[WAIT]);
-        let answer = self.answers_timed(offered, ports, names);
+        let answer = self.answers_timed(t, ports, names);
         let spent = moruna_svc::now().saturating_sub(started);
         self.timed[TAKE] += spent.saturating_sub(self.timed[WAIT] - waited);
         answer
@@ -1531,23 +1586,20 @@ impl TaskState {
 
     fn answers_timed(
         &mut self,
-        offered: BatchId,
+        t: &mut Taking,
         ports: Option<&Arc<StagePorts>>,
         names: &[String],
     ) -> Result<Payload> {
-        let mut parts = Vec::new();
-        loop {
+        if let Some(out) = t.refused.take() {
+            self.part(t, out)?;
+        }
+        while !t.released {
             match self.wait_any(ports, names)? {
                 Seen::Put(out) => {
                     self.received += 1;
-                    let part = if parts.is_empty() {
-                        self.output(out)
-                    } else {
-                        self.land(out)
-                    };
-                    parts.push(part?);
+                    self.part(t, out)?;
                 }
-                Seen::Released(b) if b == offered => break,
+                Seen::Released(b) if b == t.offered => t.released = true,
                 Seen::Released(_) => {}
                 Seen::Ended => {
                     let cause = format!(
@@ -1558,16 +1610,46 @@ impl TaskState {
                 }
             }
         }
-        self.answered += 1;
-        match parts.len() {
-            0 => Err(self.failed(
-                "it said a batch was done without a record for it: a task answers every batch, \
-                 with a record of no rows when it keeps none",
-            )),
-            1 => Ok(parts.remove(0)),
+        let answer = match t.parts.len() {
+            0 => {
+                return Err(self.failed(
+                    "it said a batch was done without a record for it: a task answers every \
+                     batch, with a record of no rows when it keeps none",
+                ));
+            }
+            1 => t
+                .parts
+                .pop()
+                .ok_or_else(|| kernel_error(format!("image `{}`: no part", self.name)))?,
             _ => {
+                let joined = self.join(&t.parts)?;
+                // The parts' windows go back once the joined batch has landed.
+                t.parts.clear();
+                self.reap();
                 self.joined += 1;
-                self.join(parts)
+                joined
+            }
+        };
+        self.answered += 1;
+        Ok(answer)
+    }
+
+    /// Takes record `out` as the next part of the answer `t`: the first decoded in place when
+    /// it may be, each after it landed. A record the run's arena refused is kept in `t`.
+    fn part(&mut self, t: &mut Taking, out: BatchId) -> Result<()> {
+        let part = if t.parts.is_empty() {
+            self.output(out)
+        } else {
+            self.land(out)
+        };
+        match part {
+            Ok(part) => {
+                t.parts.push(part);
+                Ok(())
+            }
+            Err(e) => {
+                t.refused = Some(out);
+                Err(e)
             }
         }
     }
@@ -1580,6 +1662,10 @@ impl TaskState {
     /// no answer come it answers with a batch of no rows, and the answers come with a later
     /// batch, or at the stage's end. A morsel of [`layout::IN_FLIGHT`] pieces is posted at
     /// once, so one engine worker keeps every task of the stage busy.
+    ///
+    /// A unit the run's arena refused is applied again with the same batch (RB5): it goes on
+    /// from where it stopped ([`TaskState::applying`]), with the answers it had taken
+    /// ([`TaskState::ready`]) and the one it was taking ([`TaskState::taking`]).
     fn pipelined(
         &mut self,
         batch: &moruna_kernel::arrow::record_batch::RecordBatch,
@@ -1590,14 +1676,21 @@ impl TaskState {
         if self.schema.is_none() {
             self.schema = lock(&self.busy.schema).clone();
         }
-        let mut taken = Vec::new();
-        let started = moruna_svc::now();
-        let pieces = self.pieces(batch, piece)?;
-        self.timed[CUT] += moruna_svc::now().saturating_sub(started);
-        self.queued.extend(pieces);
+        if !self.applying {
+            let started = moruna_svc::now();
+            let pieces = self.pieces(batch, piece)?;
+            self.timed[CUT] += moruna_svc::now().saturating_sub(started);
+            self.queued.extend(pieces);
+            self.applying = true;
+        }
+        if self.taking.is_some() {
+            let answer = self.take_oldest(ports, names)?;
+            self.ready.push_back(answer);
+        }
         self.feed(ports, names)?;
-        if self.schema.is_none() && taken.is_empty() {
-            taken.push(self.take_oldest(ports, names)?);
+        if self.schema.is_none() && self.ready.is_empty() {
+            let answer = self.take_oldest(ports, names)?;
+            self.ready.push_back(answer);
             self.feed(ports, names)?;
         }
         loop {
@@ -1611,68 +1704,108 @@ impl TaskState {
                     .iter()
                     .any(|seen| matches!(seen, Seen::Released(b) if *b == oldest))
             {
-                taken.push(self.take_oldest(ports, names)?);
+                let answer = self.take_oldest(ports, names)?;
+                self.ready.push_back(answer);
                 came = true;
             }
             self.feed(ports, names)?;
             // Nothing stays queued past this unit: a queued piece holds its morsel's memory,
             // and under memory pressure no unit may come to post it ([`layout::QUEUED_MAX`]).
             if layout::holds_worker(self.queued.len()) {
-                taken.push(self.take_oldest(ports, names)?);
+                let answer = self.take_oldest(ports, names)?;
+                self.ready.push_back(answer);
                 self.feed(ports, names)?;
             } else if !came {
                 break;
             }
         }
         debug_assert!(self.queued.is_empty(), "a unit left pieces queued");
-        match taken.len() {
+        let answer = match self.ready.len() {
             0 => {
                 let schema = self.schema.clone().ok_or_else(|| {
                     kernel_error(format!("image `{}`: no answer's schema yet", self.name))
                 })?;
                 self.deferred += 1;
-                Ok(Payload::Table(
+                Payload::Table(
                     moruna_kernel::arrow::record_batch::RecordBatch::new_empty(schema),
                     moruna_kernel::Tier::Host,
-                ))
+                )
             }
-            1 => Ok(taken.remove(0)),
-            _ => self.join(taken),
+            1 => self
+                .ready
+                .pop_front()
+                .ok_or_else(|| kernel_error(format!("image `{}`: no answer", self.name)))?,
+            _ => self.join_ready()?,
+        };
+        self.applying = false;
+        Ok(answer)
+    }
+
+    /// The answers taken and not given, joined; kept when the run's arena refuses the join.
+    fn join_ready(&mut self) -> Result<Payload> {
+        let ready: Vec<Payload> = std::mem::take(&mut self.ready).into();
+        match self.join(&ready) {
+            Ok(joined) => {
+                // Their windows go back once the joined batch has landed.
+                drop(ready);
+                self.reap();
+                Ok(joined)
+            }
+            Err(e) => {
+                self.ready = ready.into();
+                Err(e)
+            }
         }
     }
 
     /// Posts the task as many of its queued pieces, oldest first, as it has room for
-    /// ([`layout::to_post`]).
+    /// ([`layout::to_post`]). A piece whose layout failed (the run's arena refused its
+    /// framing) goes back to the front of the queue, for the unit applied again.
     fn feed(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<()> {
         for _ in 0..layout::to_post(self.in_flight.len(), self.queued.len()) {
             let Some(part) = self.queued.pop_front() else {
                 break;
             };
-            let (_, offered) = self.offer(&part, ports, names)?;
+            let offered = match self.offer(&part, ports, names) {
+                Ok((_, offered)) => offered,
+                Err(e) => {
+                    self.queued.push_front(part);
+                    return Err(e);
+                }
+            };
             self.sent += 1;
-            if self.in_flight.is_empty() {
-                self.busy.start();
-            }
+            self.count_busy(true);
             self.in_flight.push_back(offered);
         }
         Ok(())
     }
 
-    /// The answer to the oldest batch in flight, waited for.
+    /// The answer to the oldest batch in flight, waited for; or the one a refusal interrupted.
     fn take_oldest(
         &mut self,
         ports: Option<&Arc<StagePorts>>,
         names: &[String],
     ) -> Result<Payload> {
-        let oldest = self
-            .in_flight
-            .pop_front()
-            .ok_or_else(|| kernel_error(format!("image `{}`: no batch in flight", self.name)))?;
-        let answer = self.answers(oldest, ports, names);
-        if self.in_flight.is_empty() {
-            self.busy.stop();
-        }
-        let answer = answer?;
+        let mut taking = match self.taking.take() {
+            Some(taking) => taking,
+            None => Taking {
+                offered: self.in_flight.pop_front().ok_or_else(|| {
+                    kernel_error(format!("image `{}`: no batch in flight", self.name))
+                })?,
+                parts: Vec::new(),
+                refused: None,
+                released: false,
+            },
+        };
+        let answer = match self.answers(&mut taking, ports, names) {
+            Ok(answer) => answer,
+            Err(e) => {
+                // Taken on from here when the unit is applied again.
+                self.taking = Some(taking);
+                return Err(e);
+            }
+        };
+        self.count_busy(!self.in_flight.is_empty());
         if let (None, Payload::Table(batch, _)) = (&self.schema, &answer) {
             let schema = batch.schema();
             lock(&self.busy.schema).get_or_insert_with(|| Arc::clone(&schema));
@@ -1761,12 +1894,14 @@ impl TaskState {
     }
 
     /// Several records answering one batch, joined into one batch in the run's arena: the one
-    /// answer copied twice, once to join and once to land, each copy counted.
-    fn join(&mut self, parts: Vec<Payload>) -> Result<Payload> {
+    /// answer copied twice, once to join and once to land, each copy counted. The parts stay
+    /// the caller's, who drops them (their windows going back) once this has landed, and keeps
+    /// them when the run's arena refused it.
+    fn join(&mut self, parts: &[Payload]) -> Result<Payload> {
         let mut batches = Vec::with_capacity(parts.len());
         for p in parts {
             match p {
-                Payload::Table(b, _) => batches.push(b),
+                Payload::Table(b, _) => batches.push(b.clone()),
                 Payload::Tensor(..) => {
                     return Err(kernel_error(format!(
                         "image `{}`: a record that is not a table",
@@ -1784,9 +1919,7 @@ impl TaskState {
                     batches.len()
                 ))
             })?;
-        // The first record's window goes back with it.
         drop(batches);
-        self.reap();
         self.alloc
             .note_boundary_copy(joined.get_array_memory_size() as u64);
         Ok(moruna_adapters::land::land_table(joined, &self.alloc)?.0)
@@ -1809,6 +1942,7 @@ impl TaskState {
         if let Some(seen) = self.early.pop_front() {
             return Ok(seen);
         }
+        let mut notes = layout::WaitNotes::begin(moruna_svc::now());
         loop {
             self.reap();
             let deadline = moruna_svc::now().saturating_add(LOOK_NS);
@@ -1836,7 +1970,7 @@ impl TaskState {
                 Some(Event::Released { batch, .. }) => return Ok(Seen::Released(batch)),
                 Some(Event::Freed { .. }) => {}
                 None => {
-                    if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                    if self.cancelled() {
                         return Err(MorunaError::Cancelled);
                     }
                     match self.answer(0) {
@@ -1855,8 +1989,33 @@ impl TaskState {
                         }
                         _ => {}
                     }
+                    if let Some(waited) = notes.due(moruna_svc::now()) {
+                        self.say_waiting(waited);
+                    }
                 }
             }
+        }
+    }
+
+    /// One line, every [`layout::WAIT_NOTE_NS`] of a wait with no answer come: the stage, the
+    /// task, what the stage holds of it, and each of its windows as the plane has it. To the
+    /// engine's log and the stage's output, which the run's events carry.
+    fn say_waiting(&mut self, waited: u64) {
+        let windows = self.plane.window_states(self.task);
+        let line = layout::wait_note(
+            &self.name,
+            self.instance,
+            waited,
+            (self.in_flight.len(), self.queued.len(), self.held),
+            windows.as_deref(),
+        );
+        tracing::warn!(target: "micro", stage = self.stage, "{line}");
+        if let Some((sink, stage)) = &self.out {
+            sink.bytes(
+                Some(*stage),
+                OutStream::Stderr,
+                &layout::line(line.as_bytes()),
+            );
         }
     }
 }
@@ -1968,19 +2127,20 @@ impl Kernel for ImageTask {
                     "image: state belongs to another actual task owner".into(),
                 ));
             }
-            let mut rest = Vec::new();
-            // Every piece the task has queued goes to it, as it has room, and every answer back.
+            // The answers a unit took and did not give first, then every piece the task has
+            // queued, as it has room, and every answer back.
             loop {
                 st.feed(self.ports.get(), &self.port_names)?;
-                if st.in_flight.is_empty() {
+                if st.in_flight.is_empty() && st.taking.is_none() {
                     break;
                 }
-                rest.push(st.take_oldest(self.ports.get(), &self.port_names)?);
+                let answer = st.take_oldest(self.ports.get(), &self.port_names)?;
+                st.ready.push_back(answer);
             }
-            let rest = match rest.len() {
+            let rest = match st.ready.len() {
                 0 => None,
-                1 => rest.pop(),
-                _ => Some(st.join(rest)?),
+                1 => st.ready.pop_front(),
+                _ => Some(st.join_ready()?),
             };
             st.plane
                 .finish(st.task, 0)

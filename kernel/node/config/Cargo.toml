@@ -1,0 +1,13 @@
+[package]
+name = "moruna-node-config"
+description = "Node config version 1 with its validation, and the hand-over message `platform` sends `api`"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The cloud's names, as the node document writes them.
+moruna-api = { path = "../../api/types", version = "=0.1.0" }
+serde = { version = "=1.0.229", default-features = false, features = ["alloc"] }
+serde_json = { version = "=1.0.154", default-features = false, features = ["alloc"] }

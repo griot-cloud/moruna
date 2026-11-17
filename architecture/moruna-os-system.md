@@ -84,7 +84,8 @@ Implements the OS design, section 1, OpenStack column.
 - **`boot_ms`** counts from the core's first instruction to ready. Firmware and GRUB time is
   measured from outside, at bring-up, as create-to-ready.
 - **Limits:** services started within 5 s; an address within 30 s; instance data within 90 s.
-- **Failure:** one line, `moruna: fatal <stage>: <reason>`, then the machine powers off. The stage
+- **Failure:** the line `moruna: fatal <stage>: <reason>`, then the machine powers off. The first
+  fatal line is the cause, and tools read only it; consequence lines may follow. The stage
   is `core`, or the name of the service that can't go on, unless this document names another. A node
   never hangs silently, never restarts itself in a loop, and never offers a prompt. A service that
   dies stops the node (SDD 33), except `api`, which is restarted (2B).
@@ -275,13 +276,29 @@ if it does, this section changes first.
   protocol, `moruna.driver.vmbus`: list the offers of an interface, open a channel, share memory
   with the host, close.
   - Opening a channel gives the driver the ring memory, the channel's signal handle, and a wake
-    word.
+    channel: `vmbus` writes an empty message to it when the host has data (a full channel means one
+    is already pending) and closes it when the channel is gone, so a driver waits only on handles,
+    in its dispatcher, beside its clients.
   - **Out:** a driver writes its ring and signals the host itself, through its signal handle.
   - **In:** the host's interrupt reaches `vmbus`, which reads the event flags and wakes the
-    drivers whose channels have data. That is one hop on the way in, accepted for the first
+    drivers whose channels have data, through their wake channels. That is one hop on the way in, accepted for the first
     bring-up.
 - **`storvsc` and `netvsc`** are driver processes that serve today's block and network driver
   protocols, so nothing above them changes. netvsc speaks NVSP and RNDIS.
+  - **Disks are found in one place:** storvsc registers each disk in `devices`' directory (a
+    `register` request, a right only driver links carry), with its serial, size and read-only flag,
+    so 3C's `disk://<serial>` works the same on every cloud. Serials follow Microsoft's Azure udev
+    rules (WALinuxAgent's `66-azure-storage.rules`, azure-vm-utils' `80-azure-disk.rules`): on the
+    root controller `{f8b3781a-1e82-4818-a1c3-63d806ec15bb}` (or a Gen 1 `00000000-0000-` one), LUN 0
+    is the OS disk (registered as `boot`, read-only, never a volume) and LUN 1 the resource disk
+    (`resource`); on `{f8b3781b/c/d-…}`, LUN n is `lun-<n>`. A disk no rule names is printed and not
+    registered; if no disk matches the OS-disk rule, every disk is registered read-only. Disks are
+    found at start by REPORT LUNS; disks attached later are a known limit.
+  - **vmbus serves one listener slot per interface class,** `scsi` and `net`; a connection lists
+    and opens only that class's offers.
+  - **A client of a service that isn't on this machine isn't on it either** (the supervisor drops
+    it, transitively, along client links only; a server never goes for losing a client), so storvsc
+    and netvsc never start, with their DMA grants, off Hyper-V.
 - **Libraries first, as with the API server.** The VMBus client, storvsc and netvsc are each a
   library without std (`moruna-vmbus`, `moruna-storvsc`, `moruna-netvsc`), tested on the host
   against a fake of the host's side. The processes only wire them to the core and to each other.
@@ -508,7 +525,7 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
 | `GET /v1/jobs` | observe | The last 100 jobs, newest first: id, state, times |
 | `GET /v1/jobs/{id}` | observe | State (`starting`, `running`, `completed`, `failed`, `cancelled`), times, the latest heartbeat's fields, exit code |
 | `POST /v1/jobs/{id}/cancel` | submit | Sends `cancel`; `conflict` if the job has ended |
-| `GET /v1/jobs/{id}/events` | observe | Server-Sent Events: each event record as its JSON line (`moruna_event`'s rendering), heartbeats, log records, then `report` and `exit`. `?from=<seq>` replays from the node's buffer of the last 100,000 records |
+| `GET /v1/jobs/{id}/events` | observe | Server-Sent Events: each event record as its JSON line (`moruna_event`'s rendering), heartbeats, log records, then `report` and `exit`. `?from=<seq>` replays the records after `<seq>` (as SSE's `Last-Event-ID`) from the node's buffer of the last 100,000 records. MCP's `moruna_jobs_events` (`id`, `from`) answers the same records as pages of at most 1,000 records or 1 MiB, with `next` |
 | `GET /v1/jobs/{id}/report` | observe | The `RunReport` JSON, once the job has ended |
 
 - **A job is** `{"v1": <job document version 1 as JSON>}` or `{"v2": "<base64 of the MJB2 FlatBuffer>"}`,
@@ -531,11 +548,22 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
 ### 3C. Volumes
 
 - **A job reads and writes attached volumes,** named by the serial the cloud gives the disk: the
-  Cinder volume ID on OpenStack, `lun-<n>` on Azure. In the job: `disk://<serial>/<path>`.
-- `devices` reports every block device with its serial. `node-admission` grants the engine exactly
-  the volumes its job names, read-only for sources and read-write for sinks. Today's `disk://`
-  support (stream D) does the rest.
-- **The boot disk is never a volume.**
+  Cinder volume ID on OpenStack (virtio-blk's `GET_ID`), `lun-<n>` on Azure. In the job:
+  `disk://<serial>/<path>`, where a volume holds one moruna-image layer (the output disk's format)
+  and `<path>` names a file in it; `moruna volume pack <dir> <out>` makes a source volume.
+- **A volume is served by its driver** (virtio-blk or storvsc) through `moruna.driver.block`, and
+  the engine reads and writes it as that protocol's client. Data moves by the client's page numbers
+  with no copy, in large pipelined requests. One path on every cloud, and read-only is enforced
+  below the engine: a source's connection gets no write lease. (Changed 2026-11-17 night from
+  stream D's engine-driven virtio-blk, because Azure's disks are storvsc's and two paths are one too
+  many; 3.3 measures the driver path against the direct one, and a loss is fixed in the protocol.)
+- Every driver registers its disks in `devices`' directory with serial, size and read-only flag.
+  The engine's check answers the job's `needs.volumes` (`[{"serial", "write"}]`); api passes them to
+  `node-admission`'s `launch`, which grants exactly those connections. An unknown serial or the boot
+  disk is refused at `validate`.
+- **The boot disk is never a volume.** The image carries its own GPT disk GUID, derived from its
+  content hash at packaging; the driver marks the disk with that GUID as `boot` (storvsc also by
+  Microsoft's rule, 1F).
 
 ### 3D. The network for jobs
 
@@ -548,9 +576,12 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
   refuses TLS while that clock is unset. `platform` sets it through `clock_set_realtime` on
   `root.clock` from instance data's `Date` before `ready`, and again every hour, which keeps S3 and
   Blob request signing inside their 15-minute skew on a node that runs for months. No second clock,
-  no link for it, never a build-time clock: the cloud profile refuses `tls-unix-seconds`.
-- **Trusted roots:** the cloud profile's `tls.roots` is Mozilla's set, generated from a pinned
-  `webpki-roots` into `kernel/node/cloud/tls-roots.pem`, with its version and SHA-256 beside it.
+  no link for it, never a build-time clock. TLS accepts the clock once it is set by the machine's
+  CMOS at boot or by `platform`; test machines set it with QEMU's `-rtc`, so `tls-unix-seconds` is
+  gone everywhere.
+- **Trusted roots:** the cloud profile's `tls.roots` is Mozilla's set as curl publishes it
+  (`cacert.pem`, MPL-2.0), a pinned dated release checked against curl's SHA-256, converted to the
+  server's DER list in `kernel/node/cloud/`.
 - **Egress per job:** the engine's check (3B) answers with the job's needs: its object-store host
   names, its volumes (3C) and its functions (3E). `node-admission` grants exactly those. For the
   network it holds a client with `grant,connect` on the name rule `*` at port 443 (every name, held

@@ -337,6 +337,37 @@ fn filled(len: usize) -> Encoder {
     body
 }
 
+/// KB5-T9 for any protocol: the server listening on `listener` refuses a `Hello` for `old`, an
+/// older major of the protocol `current` names, with `MajorMismatch` and its own hello, before
+/// any request, within `exchange` nanoseconds. The server is waited for first, up to `ready`
+/// nanoseconds ([`client::ready`]): its start is not the exchange's time. Timing the refusal
+/// from the test's own start failed under load, with the server not yet up (`TimedOut`).
+pub fn old_major_refused(
+    listener: &Channel,
+    current: ProtocolId,
+    old: ProtocolId,
+    ready: u64,
+    exchange: u64,
+) -> Result<(), Fail> {
+    let up = client::ready(listener, current, deadline_in(ready))
+        .map_err(|e| format!("the server did not come up: {e:?}"))?;
+    let channel =
+        client::connect(listener).map_err(|e| format!("connecting through the listener: {e:?}"))?;
+    let answer = client::ClientCore::connect(channel, old, deadline_in(exchange));
+    drop(up);
+    match answer {
+        Err(CallError::Refused(refused))
+            if refused.reason == Refusal::MajorMismatch && refused.server == current.hello() =>
+        {
+            Ok(())
+        }
+        other => Err(format!(
+            "the old major was not refused before requests: {:?}",
+            other.map(|_| ())
+        )),
+    }
+}
+
 /// Runs `suite` against the server `connector` reaches, reporting each check as it
 /// finishes.
 pub fn run(
