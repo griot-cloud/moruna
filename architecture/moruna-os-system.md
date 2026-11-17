@@ -322,6 +322,15 @@ Implements the OS design, section 2.
   cross-origin headers.
 - **Limits:** 16 KiB of headers, 1 MiB of body, 64 open connections, 60 s idle. Over a limit, the
   answer is `invalid` or `busy`, never a crash.
+- **Memory is bounded before any token is checked:**
+  - at most 80 connections open, handshakes included; past that, a connection is closed with no
+    answer;
+  - a TLS handshake must finish within 10 s;
+  - the token is checked before any body is read;
+  - all bodies share one 8 MiB budget, and a request that doesn't fit gets `busy`;
+  - `node/audit` answers the newest 1,000 records.
+
+  Peak use stays under 32 MiB of the 64 MiB account.
 - **New dependencies:** `httparse` and `serde_json`, both without std. Signatures use `ring`,
   already in the tree.
 
@@ -336,8 +345,9 @@ Implements the OS design, section 2.
 - **A call is allowed when** the signature verifies under one of the node's `token_keys`, `aud` is
   this node's instance ID, `exp` is in the future and at most one hour ahead, and `scope` covers
   the operation. `admin` covers `submit`, and `submit` covers `observe`.
-- **Every call leaves an audit record:** time, key, scope, operation, status. `api` keeps the last
-  10,000 in memory. Nothing is written to disk or to the console.
+- **Every call of an operation leaves an audit record,** refused ones included, except `health`:
+  time, key, scope, operation, status. `api` keeps the last 10,000 in memory. Nothing is written to
+  disk or to the console.
 
 ### 2D. MCP
 
