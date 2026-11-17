@@ -30,16 +30,34 @@ pub fn task_limit(ceiling: u64, room: u64) -> Option<u64> {
 /// in its account. A stage's whole share (the run's `child_share`) was carved for each task,
 /// and the stage's outside memory counts every carved limit as held: eight Score tasks at
 /// 20.5 GiB put 14.8 GiB on the engine's samples at stage start, near the controller's
-/// memory trip (the NYC gate, 2026-11-17).
-pub const NATIVE_TASK_MAX: u64 = 512 << 20;
+/// memory trip; their accounts then peaked under 4 MB (the NYC gate, 2026-11-17).
+pub const NATIVE_TASK_MAX: u64 = 128 << 20;
 
-// Eight native tasks are counted at no more than 4 GiB together.
-const _: () = assert!(8 * NATIVE_TASK_MAX <= 4 << 30);
+// Eight native tasks are counted at no more than 1 GiB together.
+const _: () = assert!(8 * NATIVE_TASK_MAX <= 1 << 30);
 
-/// [`task_limit`] for a native task: also at most [`NATIVE_TASK_MAX`].
-pub fn native_task_limit(ceiling: u64, room: u64) -> Option<u64> {
-    task_limit(ceiling.min(NATIVE_TASK_MAX), room)
+/// A native task's plane budget and account ceiling, both out of its `share` of the stage's
+/// budget: a quarter for its plane ([`ring_sizes`], at most what it holds in flight), and what
+/// is left past the plane's real size for its account, at most [`NATIVE_TASK_MAX`]. The two
+/// together never pass the share, so a native stage costs the run what the run set aside for
+/// it: a plane of half the share beside an account of the whole one was refused at a 2 GiB
+/// budget (the NYC gate, 2026-11-17).
+pub fn native_split(share: u64) -> (u64, u64) {
+    let budget = share / 4;
+    let s = ring_sizes(budget);
+    let plane = s.region + 2 * s.windows * s.window;
+    let account = share.saturating_sub(plane).min(NATIVE_TASK_MAX) & !(PAGE - 1);
+    (budget, account)
 }
+
+/// [`task_limit`] for a native task, out of its `share` ([`native_split`]).
+pub fn native_task_limit(share: u64, room: u64) -> Option<u64> {
+    task_limit(native_split(share).1, room)
+}
+
+/// The least share a native task runs in: its account at [`TASK_MIN`] beside its plane at its
+/// least (pieces of [`RING_MIN`]: the region, and two rings objects of two windows of two).
+pub const NATIVE_CHILD_MIN: u64 = TASK_MIN + ((IN_FLIGHT + 1) + 2 * 2 * 2) * RING_MIN;
 
 /// The CPU a stage's task `instance` is placed on, of `cpus`: one after the instance, so the
 /// first CPU, where the engine's first worker deals the stage's batches, takes a task last.
@@ -47,9 +65,12 @@ pub fn task_cpu(instance: usize, cpus: usize) -> u32 {
     u32::try_from((instance + 1) % cpus.max(1)).unwrap_or(0)
 }
 
-/// What one task of a stage did, for the run's report.
+/// What one task of a stage did, for the run's report: summed over every task the instance
+/// had (one, unless the scheduler retired it and started another).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TaskFigures {
+    /// Tasks the instance had.
+    pub states: u64,
     /// Batches it was given.
     pub batches: u64,
     /// Records it put.
@@ -75,13 +96,18 @@ pub fn stage_note(stage: &str, tasks: &[Option<TaskFigures>], busy_peak: usize) 
     for (i, t) in tasks.iter().enumerate() {
         match t {
             Some(t) => note.push_str(&format!(
-                "; task {i}: {} batches, {} records, {} deferred, cpu {}, account peak {} of {} bytes",
+                "; task {i}: {} batches, {} records, {} deferred, cpu {}, account peak {} of {} bytes{}",
                 t.batches,
                 t.records,
                 t.deferred,
                 t.cpu.map_or_else(|| "any".to_string(), |c| c.to_string()),
                 t.peak,
-                t.limit
+                t.limit,
+                if t.states > 1 {
+                    format!(", {} tasks in turn", t.states)
+                } else {
+                    String::new()
+                }
             )),
             None => note.push_str(&format!("; task {i}: no figures")),
         }
@@ -241,9 +267,10 @@ pub fn ring_sizes(budget: u64) -> RingSizes {
 const _: () = assert!((IN_FLIGHT + 1) * PIECE_MAX <= OBJECT_MAX);
 const _: () = assert!(2 * 2 * PIECE_MAX + RINGS_HEAD_MAX <= OBJECT_MAX);
 
-/// The most of a stage's budget one native task stands for (the run's `child_share`): its
-/// account, and its plane at its largest.
-pub const NATIVE_CHILD_MAX: u64 = NATIVE_TASK_MAX + ((IN_FLIGHT + 1) + 2 * 2 * 2) * PIECE_MAX;
+/// The most of a stage's budget one native task stands for (the run's `child_share`): the share
+/// whose quarter makes its plane at its largest ([`native_split`]); its account takes at most
+/// [`NATIVE_TASK_MAX`] of the rest.
+pub const NATIVE_CHILD_MAX: u64 = 4 * ((IN_FLIGHT + 1) + 2 * 2 * 2) * PIECE_MAX;
 
 // A native task stands for less than a gibibyte of its stage's budget.
 const _: () = assert!(NATIVE_CHILD_MAX < 1 << 30);
@@ -600,18 +627,36 @@ mod tests {
     }
 
     #[test]
-    fn p_a_native_task_s_account_is_its_process_s_not_the_stage_s_share() {
+    fn p_a_native_task_s_plane_and_account_fit_its_share() {
         const MIB: u64 = 1 << 20;
-        // A share of 1.85 GiB and plenty of room: the native task is carved at its most.
+        let mut share = NATIVE_CHILD_MIN;
+        while share <= 64 << 30 {
+            let (budget, account) = native_split(share);
+            let s = ring_sizes(budget);
+            let plane = s.region + 2 * s.windows * s.window;
+            assert!(
+                plane + account <= share,
+                "{share}: plane {plane}, account {account}"
+            );
+            assert!(account >= TASK_MIN, "{share}: account {account}");
+            assert!(account <= NATIVE_TASK_MAX);
+            assert_eq!(native_task_limit(share, 64 << 30), Some(account));
+            share = share * 5 / 4 + PAGE;
+        }
+        // At the most a native task stands for, its plane is at its largest.
+        let (budget, account) = native_split(NATIVE_CHILD_MAX);
+        assert_eq!(ring_sizes(budget).piece, PIECE_MAX);
+        assert_eq!(account, NATIVE_TASK_MAX);
+        // Under the least, the account does not fit.
         assert_eq!(
-            native_task_limit(1894 * MIB, 32 << 30),
-            Some(NATIVE_TASK_MAX)
+            native_task_limit(NATIVE_CHILD_MIN - 2 * MIB, 64 << 30),
+            None
         );
-        assert_eq!(task_limit(1894 * MIB, 32 << 30), Some(1894 * MIB));
-        // A smaller share, or less room, is what it is.
-        assert_eq!(native_task_limit(100 * MIB, 32 << 30), Some(100 * MIB));
-        assert_eq!(native_task_limit(1 << 30, 300 * MIB), Some(150 * MIB));
-        assert_eq!(native_task_limit(1 << 30, 20 * MIB), None, "under TASK_MIN");
+        // Less room in the engine's account is what it is.
+        assert_eq!(
+            native_task_limit(NATIVE_CHILD_MAX, 100 * MIB),
+            Some(50 * MIB)
+        );
     }
 
     #[test]
@@ -626,12 +671,13 @@ mod tests {
     #[test]
     fn p_the_report_says_each_task_s_batches_cpu_and_account() {
         let t = TaskFigures {
+            states: 1,
             batches: 12,
             records: 13,
             deferred: 2,
             cpu: Some(3),
             peak: 40 << 20,
-            limit: NATIVE_TASK_MAX,
+            limit: 128 << 20,
         };
         let note = stage_note("score", &[Some(t), None, Some(TaskFigures::default())], 2);
         assert!(
@@ -640,11 +686,16 @@ mod tests {
         );
         assert!(
             note.contains(
-                "task 0: 12 batches, 13 records, 2 deferred, cpu 3, account peak 41943040 of 536870912 bytes"
+                "task 0: 12 batches, 13 records, 2 deferred, cpu 3, account peak 41943040 of 134217728 bytes;"
             ),
             "{note}"
         );
         assert!(note.contains("task 1: no figures"), "{note}");
+        let again = TaskFigures { states: 2, ..t };
+        assert!(
+            stage_note("score", &[Some(again)], 1).ends_with(", 2 tasks in turn"),
+            "a retired instance's task and the next are both said"
+        );
         assert!(
             note.contains("task 2: 0 batches, 0 records, 0 deferred, cpu any"),
             "{note}"

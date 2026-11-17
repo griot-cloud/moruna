@@ -664,7 +664,8 @@ fn drive(
                 0,
                 count,
                 moruna_micro::layout::PAGE,
-                moruna_micro::layout::TASK_MIN,
+                // stream P: a native task's account at its least beside its plane at its least.
+                moruna_micro::layout::NATIVE_CHILD_MIN,
             )
             .map_err(|error| *error)?;
             for stage in packaged.iter().filter(|stage| stage.native_singleton()) {
