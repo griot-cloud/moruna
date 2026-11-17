@@ -162,7 +162,7 @@ fn prepare(console: &Console) -> Result<Prepared, String> {
             .map_err(|e| format!("process root: {}", e.name()))?;
         let roots = match kind {
             Bootstrap::Linux => alloc::vec![root],
-            Bootstrap::Devices => alloc::vec![
+            Bootstrap::Devices { .. } => alloc::vec![
                 root,
                 take("root.device")?,
                 take("root.ecam")?,
