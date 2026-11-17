@@ -69,10 +69,16 @@ Implements the OS design, section 1, OpenStack column.
 
 - **`boot_ms`** counts from the core's first instruction to ready. Firmware and GRUB time is
   measured from outside, at bring-up, as create-to-ready.
-- **Limits:** services started within 5 s; an address within 30 s; instance data within 60 s.
+- **Limits:** services started within 5 s; an address within 30 s; instance data within 90 s.
 - **Failure:** one line, `moruna: fatal <stage>: <reason>`, then the machine powers off. A node
   never hangs silently, never restarts itself in a loop, and never offers a prompt. A service that
   dies stops the node (SDD 33).
+- **Power-off is ACPI S5 on every machine:** SLP_TYPa from the DSDT's `\_S5` object (found by
+  scanning the DSDT for `_S5_` and reading the package that follows, as small kernels do),
+  written with SLP_EN to the FADT's PM1a control register. OSTD today powers off only through
+  QEMU's test exit device, which no cloud has. That device stays for CI's exit codes alone.
+- **No wait without a deadline in boot code.** OSTD's PIT calibration waits forever on a machine
+  with no PIT. Every such wait gets a deadline and, when it passes, a `fatal` line.
 
 ### 1C. Network
 
@@ -85,8 +91,9 @@ Implements the OS design, section 1, OpenStack column.
   ```
 
 - **One port listens: TCP 443,** owned by `api`. Nothing else accepts connections.
-- **Outbound is denied unless granted.** In steps 1 and 2 only `platform` has a grant: the instance
-  data address on port 80.
+- **Outbound is denied unless granted.** In steps 1 and 2 only `platform` has grants:
+  `169.254.169.254` port 80 (instance data), and on Azure `168.63.129.16` port 80 (the "ready"
+  report).
 - **In step 1, `api` accepts a connection on 443 and closes it.** That proves the address, the
   route and the cloud's firewall rule. Step 2 gives it TLS and operations.
 
@@ -94,11 +101,15 @@ Implements the OS design, section 1, OpenStack column.
 
 One process, `platform`. In order, it:
 
-1. **Finds the cloud** by asking for instance data over HTTP at `169.254.169.254`:
-   - OpenStack: `/openstack/latest/meta_data.json` and `/openstack/latest/user_data`;
-   - Azure: `/metadata/instance` and its `userData`, with the `Metadata: true` header.
+1. **Finds the cloud** by asking for instance data over HTTP at `169.254.169.254`, in this order:
+   - Azure: `GET /metadata/instance?api-version=2021-02-01` with the header `Metadata: true`;
+     user-data is its `compute.userData`, base64-encoded.
+   - OpenStack: `GET /openstack/latest/meta_data.json`, then `/openstack/latest/user_data`.
 
-   The first that answers names the cloud. No config drive: it would need a filesystem reader.
+   A cloud is named only by a `200` whose body parses as that cloud's document; any other answer
+   (Azure answers `400` or `404` to OpenStack's paths) moves to the next. A refused or timed-out
+   connection is retried every second, at most 5 requests a second; a `410` is retried. Nothing by
+   90 s is fatal. No config drive: it would need a filesystem reader.
 2. **Sets the wall clock** from the `Date` header of that answer. The node has no other clock
    source that works the same on every cloud. The monotonic clock carries it forward.
 3. **Validates node config,** which is the instance's user-data, version 1:
@@ -130,8 +141,12 @@ One process, `platform`. In order, it:
 
 ### 1E. Bring-up on Servercore
 
-- Upload the image with `hw_firmware_type=uefi`; create one machine with node config as user-data
-  and a firewall rule for 443 only; check; delete.
+- Upload the image with the properties `hw_firmware_type=uefi`, `hw_machine_type=q35`,
+  `hw_disk_bus=virtio` and `hw_vif_model=virtio`; create one machine with node config as
+  user-data and a firewall rule for 443 only; check; delete.
+- **q35 matters:** the core finds PCI through ACPI's MCFG table, which only q35 has. If Servercore
+  ignores `hw_machine_type`, item 1.6 reports it, and PCI configuration through I/O ports is added
+  as its own item.
 - **Success is the OS design's:** the machine gets an address, answers on 443, and shows as
   running, with nobody logging in. Create-to-ready time and `boot_ms` are recorded.
 - Creating cloud resources needs the PM's go-ahead each time.
@@ -141,46 +156,87 @@ One process, `platform`. In order, it:
 | Item | Build | Success | Needs |
 |---|---|---|---|
 | 1.1 | The `cloud` profile for step 1; boot its image in QEMU under UEFI firmware with one virtio disk and one virtio network card (1A) | A script boots it to `services started` on 1 and 2 CPUs | 0.1 |
-| 1.2 | The boot lines, the limits, and power-off on a fatal error (1B) | Each line appears in order; each limit, when forced, gives its `fatal` line and a power-off | 1.1 |
+| 1.2 | The boot lines, the limits, deadlines on boot waits, and ACPI S5 power-off on a fatal error (1B) | Each line appears in order; each limit, when forced, gives its `fatal` line and the machine powers off by S5 | 1.1 |
 | 1.3 | DHCP on `wan`; `api` owning 443 and closing each connection; the outbound grant (1C) | A connection from the host reaches 443; one to any other port is refused; `api` cannot connect out | 1.1 |
 | 1.4 | `platform`: instance data, wall clock, node config v1, the hand-over to `api` (1D) | Booted against fake OpenStack data: the `cloud` and `ready` lines appear; each invalid config is refused with its reason | 1.2, 1.3 |
 | 1.5 | The qcow2 and VHD formats and the upload recipe, `kernel/node/OPENSTACK.md` (1A, 1E) | Each format boots in QEMU; the recipe's commands are complete | 1.1 |
 | 1.6 | Bring-up on Servercore (1E) | 1E's success, on Servercore | 1.4, 1.5, credentials |
 
-## 1F. The node on Azure (Draft)
+## 1F. The node on Azure (Final)
 
-Implements the OS design, section 1, Azure column. It becomes Final after item 1.7's findings.
+Implements the OS design, section 1, Azure column. Made final from item 1.7a's findings
+(`architecture/work/1.7-azure-findings.md`). The booted half, 1.7b, may still change details here;
+if it does, this section changes first.
 
-Decisions so far:
+### The machine
 
-- **Machine:** `Standard_D4ls_v5`, Generation 2, accelerated networking off, so the one network
-  card is netvsc.
-- **The core on Hyper-V:** it finds the hypervisor, takes its clock rate from Hyper-V, and uses the
-  local APIC timer. It assumes none of the old PC devices that Generation 2 leaves out.
-- **VMBus, split by the microkernel rule:**
-  - The core gains one mechanism: the two hypercalls that post a message and signal an event, the
-    message and event pages mapped to the bus driver, and the VMBus interrupt delivered to it.
-  - Offers, channels and ring buffers live in a `vmbus` process. A channel's rings are shared
-    memory mapped to its driver.
+- **`Standard_D4ls_v5`, Generation 2, security type `Standard`.** Azure defaults to Trusted Launch,
+  whose Secure Boot refuses our unsigned GRUB. Signing comes later.
+- **Accelerated networking cannot be turned off on this size,** so Azure offers a virtual function
+  (ConnectX or MANA) beside the synthetic NIC. The node uses the synthetic NIC (netvsc) only. It
+  ignores the virtual-PCI offer and never asks Azure to move traffic to the virtual function.
+  Networking still works, at the synthetic NIC's speed. MANA comes later.
+- **The image** is 1A's fixed-size VHD.
+
+### The core on Hyper-V
+
+- **Finding Hyper-V:** CPUID leaf `0x40000000` returns `Hv#1`.
+- **Clock rates:** OSTD tries, in order, kvmclock, CPUID leaf `0x15`, then Hyper-V's MSRs
+  `0x40000022` (TSC) and `0x40000023` (local APIC), and the PIT last, with a deadline (1B).
+- **Timer:** the local APIC timer at the rate Hyper-V gives. Nothing from the old PC (PIT, PIC,
+  HPET, CMOS clock) is assumed.
+- **No PCI bus:** Generation 2 has no ACPI MCFG. The core boots without `root.ecam`, and `devices`
+  runs with no PCI functions. Today the core refuses to boot without MCFG (`kernel/core/src/boot.rs`).
+- **Guest OS ID:** written before the hypercall page, in the TLFS's open-source encoding. Item 1.8
+  proposes the exact value with its TLFS citation; the PM approves it.
+- **Power-off:** ACPI S5 (1B).
+
+### VMBus, split by the microkernel rule
+
+- **In the core, one mechanism,** granted to the `vmbus` process only:
+  - the hypercall page, and the hypercalls `HvPostMessage` and `HvSignalEvent`;
+  - each CPU's SynIC message and event pages, mapped read-only to `vmbus`;
+  - SINT 2's interrupt delivered to `vmbus`, and its end-of-message write.
+
+  Added kernel-mode lines are counted in `data-os.md` section 0.
+- **In the `vmbus` process:** the version handshake, offers, opening and closing channels, GPADLs
+  (guest memory shared with the host), and each channel's ring pair mapped to its driver. Every
+  channel targets CPU 0 at first.
 - **`storvsc` and `netvsc`** are driver processes that serve today's block and network driver
-  protocols, so nothing above them changes.
-- **`platform`** reads Azure's instance data (1D) and, once config is valid, reports "ready" to
-  Azure's wireserver. Without that report Azure reboots the machine.
-- **Image:** the fixed-size VHD of 1A.
+  protocols, so nothing above them changes. netvsc speaks NVSP and RNDIS.
+- **Reused from Microsoft's OpenVMM** (MIT, `no_std`, at e7e7df77): `hvdef`, `x86defs`,
+  `vmbus_core`, `vmbus_ring` and `netvsp_protocol` as written, and `storvsp_protocol` with a small
+  fork. They are vendored under `kernel/vendor/openvmm` with the licence, the commit and file hashes,
+  as OSTD is. OpenVMM's std and async drivers are read as references only.
 
-Item 1.7 must answer: how far today's core boots on Azure and what stops it; which old PC devices
-OSTD touches; what Microsoft's OpenVMM offers for guest-side VMBus, storvsc and netvsc, and under
-what licence; and the size of items 1.8 to 1.12.
+### `platform` on Azure
 
-| Item | Build | Success | Needs |
-|---|---|---|---|
-| 1.7 | Findings: read OSTD and OpenVMM; boot the image on Azure and read its serial console | A note answering the four questions above | 1.1 (the reading can start now) |
-| 1.8 | The core on Hyper-V | The core reaches `services started` on Azure's console | 1.7 |
-| 1.9 | VMBus: the core mechanism and the `vmbus` process | A booted test lists the devices Azure offers; added kernel-mode lines are counted | 1.8 |
-| 1.10 | `storvsc` | The node reads its Azure disk; the block driver suite passes | 1.9 |
-| 1.11 | `netvsc` | DHCP and a connection to 443 on Azure; the network driver suite passes | 1.9 |
-| 1.12 | `platform` for Azure, with the "ready" report | Azure shows provisioning succeeded | 1.4, 1.11 |
-| 1.13 | Bring-up on Azure | 1E's success, on Azure | 1.10, 1.12 |
+- Instance data as 1D says.
+- **The "ready" report,** once node config is valid: `GET http://168.63.129.16/machine?comp=goalstate`,
+  then `POST /machine?comp=health` with the `Health` XML document, both with the header
+  `x-ms-version: 2012-11-30`. Without it, Azure reboots the machine.
+
+### Testing
+
+- **Azure is the proof,** at each item's end.
+- **Between proofs, OpenVMM on a Linux machine with KVM** stands in for Hyper-V: it boots UEFI
+  guests and has storvsp and netvsp. The Linux machine is an Azure VM with nested virtualization.
+  Creating it, and every Azure resource, needs Brackly's go-ahead.
+
+### Work items
+
+Sizes are 1.7a's estimates.
+
+| Item | Build | Success | Size | Needs |
+|---|---|---|---|---|
+| 1.7a | Findings from reading | Done: `architecture/work/1.7-azure-findings.md` | | |
+| 1.7b | Findings from booting: today's image on Azure, its serial console read | Where the boot stops, and why | small | 1.1, Azure go-ahead |
+| 1.8 | The core on Hyper-V: finding it, clock rates, deadlines, no MCFG, guest OS ID | The core reaches `services started` on Azure's console | medium | 1.7b |
+| 1.9 | VMBus: the core mechanism, the vendored crates, the `vmbus` process | A booted test lists the devices Azure offers; added kernel-mode lines are counted | large | 1.8 |
+| 1.10 | `storvsc` | The node reads its Azure disk; the block driver suite passes | medium | 1.9 |
+| 1.11 | `netvsc` | DHCP and a connection to 443 on Azure; the network driver suite passes | large | 1.9 |
+| 1.12 | `platform` for Azure, with the "ready" report | Azure shows provisioning succeeded | small | 1.4, 1.11 |
+| 1.13 | Bring-up on Azure | 1E's success, on Azure | small | 1.10, 1.12 |
 
 ## 2. The API (Final)
 
@@ -331,7 +387,7 @@ first accelerator.
 | OS design | Here | State |
 |---|---|---|
 | 1. Boot as a node, OpenStack | 1A to 1E | Final |
-| 1. Boot as a node, Azure | 1F | Draft, until item 1.7's findings |
+| 1. Boot as a node, Azure | 1F | Final; 1.7b may adjust details |
 | 2. The API | 2A to 2E | Final |
 | 3. Wiring | 3 | Draft |
 | 4. The two interfaces and the unit of work | 4 | Not started, by decision |
@@ -340,7 +396,7 @@ first accelerator.
 | No shell, no arbitrary command | 1B (no console input), 2A (fixed operations) | Final |
 | The microkernel rule | 1F (VMBus split), 2B (`api` is a process) | Held |
 
-This document adds detail to the OS design and no behaviour it does not call for. Five details
+This document adds detail to the OS design and no behaviour it does not call for. Six details
 that go beyond its words:
 
 1. **The node makes its own TLS key by default** (1D). The OS design said node config carries the
@@ -351,13 +407,16 @@ that go beyond its words:
 3. **`GET /v1/health` needs no token** (2A). It says only that the node is up.
 4. **The audit record is read at `node/audit`** (2A, 2C).
 5. **One job at a time in the first release** (3).
+6. **Azure machines boot without Secure Boot** (1F, security type `Standard`) until the boot chain
+   is signed. The OS design asks for security as a priority, so signing GRUB and the core is owed
+   before production.
 
 If a later detail would contradict the OS design, the OS design is changed first, with Brackly's
 approval.
 
 ## Order
 
-- **Can start now, on separate files:** 0.1 then 1.1 to 1.5 (one owner, in order); 2.1; the reading
-  half of 1.7; 3.1.
-- **Then:** 1.6 and 2.2 to 2.5; 1.8 to 1.13 once 1F is Final.
+- **Can start now, on separate files:** 0.1 then 1.1 to 1.5 (one owner, in order); 2.1 (done); the
+  reading half of 1.7 (done); 3.1.
+- **Then:** 1.6 and 2.2 to 2.5; 1.7b and then 1.8 to 1.13, once Azure resources are approved.
 - **Then:** 2.6, section 3 once Final, and section 5.
