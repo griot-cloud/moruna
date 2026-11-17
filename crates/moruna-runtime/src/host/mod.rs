@@ -13,6 +13,7 @@ pub mod launch_witness;
 pub mod lifecycle;
 pub mod logs;
 pub mod native;
+pub mod node;
 pub mod outputs;
 pub mod ports;
 pub mod protocol;

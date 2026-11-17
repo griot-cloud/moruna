@@ -820,6 +820,75 @@ fn every_sink_kind_builds() {
     let built = v1::build(&job, &kinds, opts(false, &no_env)).expect("tensor source");
     assert!(built.spec.object_store.gcs.is_some() && built.spec.object_store.azure.is_some());
 
+    // The references to secrets resolve into the stores built: each from the secrets given,
+    // a place the document leaves empty as it was, and a name not given refused by its field.
+    let doc = ObjectStoreDoc {
+        s3: Some(S3Doc {
+            secret_access_key: Some(moruna_job::SecretRef::new("aws.key")),
+            session_token: Some(moruna_job::SecretRef::new("aws.token")),
+            ..S3Doc::default()
+        }),
+        gcs: Some(GcsDoc {
+            service_account_json: Some(moruna_job::SecretRef::new("gcs")),
+            ..GcsDoc::default()
+        }),
+        azure: Some(AzureDoc {
+            access_key: Some(moruna_job::SecretRef::new("azure")),
+            ..AzureDoc::default()
+        }),
+        ..ObjectStoreDoc::default()
+    };
+    let given: std::collections::BTreeMap<String, String> = [
+        ("aws.key", "S3-SECRET"),
+        ("aws.token", "S3-TOKEN"),
+        ("gcs", "{}"),
+        ("azure", "a2V5"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let mut store = moruna_reactor::ObjectStoreConfig {
+        s3: Some(moruna_reactor::S3Config {
+            access_key_id: Some("from the runner".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    crate::job::build::with_secrets(&mut store, &doc, &given).expect("every name is given");
+    let s3 = store.s3.as_ref().expect("s3");
+    assert_eq!(s3.access_key_id.as_deref(), Some("from the runner"));
+    assert_eq!(s3.secret_access_key.as_deref(), Some("S3-SECRET"));
+    assert_eq!(s3.session_token.as_deref(), Some("S3-TOKEN"));
+    assert_eq!(
+        store
+            .gcs
+            .as_ref()
+            .and_then(|g| g.service_account_json.as_deref()),
+        Some("{}")
+    );
+    assert_eq!(
+        store.azure.as_ref().and_then(|a| a.access_key.as_deref()),
+        Some("a2V5")
+    );
+    let mut fewer = given.clone();
+    fewer.remove("gcs");
+    let refused = crate::job::build::with_secrets(
+        &mut moruna_reactor::ObjectStoreConfig::default(),
+        &doc,
+        &fewer,
+    )
+    .expect_err("gcs is not given");
+    assert_eq!(refused.field, "object_store.gcs.service_account_json");
+    assert!(
+        refused.reason.contains("no secret named `gcs`"),
+        "{}",
+        refused.reason
+    );
+    let mut none = moruna_reactor::ObjectStoreConfig::default();
+    crate::job::build::with_secrets(&mut none, &ObjectStoreDoc::default(), &Default::default())
+        .expect("no reference needs no secret");
+    assert!(none.s3.is_none() && none.gcs.is_none() && none.azure.is_none());
+
     use crate::kinds::{parquet, tensor};
     for (name, back) in [
         ("zstd", "zstd"),
