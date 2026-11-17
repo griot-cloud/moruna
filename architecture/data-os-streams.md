@@ -702,3 +702,24 @@ and switches to the new one when the call answers.
     scratch account (plus up to an eighth for growth), so 1 GiB holds outputs to about
     300 MB. Streaming the layer onto `disk.out` without the spill and the layer file is
     the engine's change.
+- **2026-11-17: stream E's gate harness merged** (from `f444b0d6`). Its native tasks run on
+  P's rings, with answers in parts. The gate image is FROM scratch with the engine in it
+  (55 MB; the engine is 49.8 MB stripped). It also brings the setup-time and clean-install
+  benchmarks, and a block0 stack attached without the kit's fixture disks (launch 0.26 s to
+  0.14 s).
+  - **Integrator's call, for the gate:** a native stage may run several instances, each a
+    child carving its own account inside the stage's share (`native_account::native_children`,
+    with a host test). C reviews it.
+  - **Checks:** `moruna-runtime` clippy is clean and its tests pass, apart from one.
+    `test_configure.py` and the gate harness's tests pass. The one failure is
+    `registration_and_live_keys_preserve_distinct_actual_package_arguments`
+    (`tests/package.rs:548`, its warm-up observed nothing in 250 ms). It is not E's: it failed 3
+    of 3 on `764bfe7a`, before the merge, and 2 of 3 after, on a Mac short of disk with the uv
+    cache just emptied. It is left open, to be run again on a quiet machine.
+- **2026-11-17: the benchmark moves to Central India** (Brackly). The rows must come from one
+  machine. The German moruna-bench's 51 control runs are discarded, and its THP A/B never ran.
+  The new machine is the same: Standard_D8ds_v6, Ubuntu 24.04.202610250, host kernel
+  7.0.0-1017-azure, nested KVM on Azure, in resource group moruna-bench-20261117in, zone 2.
+  Its tree is public main (`d4165127`) plus the integrator's patch, sent through run-command
+  in pieces checked by SHA-256 (no SSH). 0.6.6's tree is `8018c96a`. QEMU is rebuilt there from
+  the pinned 10.2.1 source.
