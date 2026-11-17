@@ -3,9 +3,10 @@
 //! `Instant` is nanoseconds on the kernel's monotonic clock, the clock every deadline is
 //! measured on, read from the clock page with no call (`moruna_abi::clock_page`).
 //!
-//! `SystemTime` has no source on Moruna: the node's wall clock is `platform`'s (system design
-//! 1D), and a native task is given no realtime base. Its arithmetic works; `SystemTime::now`
-//! is unsupported, and panics, as on every platform of std without a wall clock.
+//! `SystemTime` is the realtime base the clock page carries (ABI 2.8) plus that monotonic
+//! clock: the wall clock the core keeps, from the machine's CMOS clock at boot and from
+//! `platform`'s `clock_set_realtime` (system design 1D). While the base is unset the wall
+//! clock reads 1970 plus the monotonic clock, as the Linux layer's does; it never panics.
 
 use core::time::Duration;
 
@@ -56,15 +57,22 @@ pub struct SystemTime(Duration);
 /// 1970-01-01T00:00:00Z.
 pub const UNIX_EPOCH: SystemTime = SystemTime(Duration::ZERO);
 
+/// The wall clock when the realtime base is `base` (zero while unset) and the monotonic clock
+/// reads `monotonic`.
+fn wall(base: u64, monotonic: u64) -> SystemTime {
+    SystemTime(Duration::from_nanos(base.saturating_add(monotonic)))
+}
+
 impl SystemTime {
     /// The latest moment a `SystemTime` holds.
     pub const MAX: SystemTime = SystemTime(Duration::MAX);
     /// The earliest: [`UNIX_EPOCH`].
     pub const MIN: SystemTime = SystemTime(Duration::ZERO);
 
-    /// Unsupported: a native task has no realtime base to read.
+    /// Now, on the wall clock.
     pub fn now() -> SystemTime {
-        panic!("SystemTime::now is not supported on Moruna: a native task has no realtime base")
+        let (base, monotonic) = os::realtime();
+        wall(base, monotonic)
     }
 
     /// The time from `other` to `self`, or, when `other` is later, the time back to it.
@@ -156,8 +164,35 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "no realtime base")]
-    fn the_wall_clock_is_unsupported() {
-        let _ = SystemTime::now();
+    fn the_wall_clock_is_the_realtime_base_plus_the_monotonic_clock() {
+        // 2023-11-14T22:13:20Z at the monotonic zero.
+        let base = 1_700_000_000_000_000_000;
+        let at = wall(base, 5_000);
+        assert_eq!(
+            at.sub_time(&UNIX_EPOCH),
+            Ok(Duration::from_nanos(base + 5_000))
+        );
+        assert_eq!(
+            wall(base, 7_000).sub_time(&at),
+            Ok(Duration::from_nanos(2_000)),
+            "it moves with the monotonic clock"
+        );
+        // A base past the clock's end stays there rather than wrapping to 1970.
+        assert_eq!(wall(u64::MAX, 1), wall(u64::MAX, 0));
+    }
+
+    #[test]
+    fn an_unset_wall_clock_reads_as_1970_plus_the_monotonic_clock() {
+        assert_eq!(
+            wall(0, 3_000_000_000).sub_time(&UNIX_EPOCH),
+            Ok(Duration::from_secs(3))
+        );
+        // The host stands in an unset base: now is 1970 plus its clock, and never panics.
+        let since = SystemTime::now().sub_time(&UNIX_EPOCH).unwrap();
+        assert!(since > Duration::ZERO, "the monotonic clock has started");
+        assert!(
+            since < Duration::from_secs(24 * 3600),
+            "not a date in this century"
+        );
     }
 }

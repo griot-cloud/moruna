@@ -7,12 +7,13 @@
 //!   exit code after; [`abort`] ends it after a panic.
 //! - [`futex`]: the futex calls with a timeout, which std's `Mutex`, `Condvar`, `RwLock`, `Once` and
 //!   thread parking are built on.
-//! - [`time`]: `Instant` from the clock page. `SystemTime` has no source: a native task is given no
-//!   realtime base, so `SystemTime::now` is unsupported.
+//! - [`time`]: `Instant` from the clock page, and `SystemTime` from the realtime base it carries
+//!   (ABI 2.8); 1970 plus the monotonic clock while that is unset.
 //! - [`tls`]: thread-local keys, in a table each thread's FS base points at.
-//! - [`thread`]: spawn, join, sleep and yield.
+//! - [`thread`]: spawn, join, sleep and yield (`thread_yield`, ABI 2.8).
 //! - `stdio` and `memory` (feature `rt`): stdout and stderr as lines of the task's log
-//!   ([`crate::plane::Log`]), and std's allocator over the process's heap.
+//!   ([`crate::plane::Log`]), or of its console when it has no log, and std's allocator over
+//!   the process's heap.
 //!
 //! Every call the kernel answers goes through `os`, the one module a host test replaces.
 

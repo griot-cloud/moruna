@@ -32,15 +32,25 @@ mod moruna {
 
     /// Nanoseconds on the kernel's monotonic clock, read from the clock page with no call.
     pub(in crate::rt) fn clock() -> u64 {
+        page().map_or_else(crate::now, |page| page.now())
+    }
+
+    /// The clock page, mapped at the first call; `None` when the kernel maps none.
+    fn page() -> Option<ClockPage> {
         let mut page = CLOCK.load(Ordering::Relaxed);
         if page == 0 {
             page = ClockPage::map().map_or(1, |p| p.address());
             CLOCK.store(page, Ordering::Relaxed);
         }
-        if page == 1 {
-            crate::now()
-        } else {
-            ClockPage::at(page).now()
+        (page != 1).then(|| ClockPage::at(page))
+    }
+
+    /// The realtime base (zero while unset) and the monotonic clock, read together from the
+    /// clock page; with no page, no base and `clock_get`.
+    pub(in crate::rt) fn realtime() -> (u64, u64) {
+        match page() {
+            Some(page) => page.realtime_parts(),
+            None => (0, crate::now()),
         }
     }
 
@@ -70,6 +80,17 @@ mod moruna {
     /// The CPUs online, from the start page; one when it says none.
     pub(in crate::rt) fn cpus() -> usize {
         crate::start::cpus().max(1)
+    }
+
+    /// `thread_yield`: another ready thread runs first.
+    pub(in crate::rt) fn yield_now() {
+        crate::thread_yield();
+    }
+
+    /// Writes `line` on the console `console`, in one call.
+    #[cfg(feature = "rt")]
+    pub(in crate::rt) fn console_write(console: moruna_abi::RawHandle, line: &[u8]) {
+        raw::debug_write(console, line);
     }
 
     /// A thread's stack: a memory object of its own, mapped, with its lowest page made
@@ -211,6 +232,11 @@ mod host {
             + 1
     }
 
+    /// The host stands in a wall clock never set.
+    pub(in crate::rt) fn realtime() -> (u64, u64) {
+        (0, clock())
+    }
+
     std::thread_local! {
         static TABLE: Cell<usize> = const { Cell::new(0) };
     }
@@ -226,6 +252,14 @@ mod host {
     pub(in crate::rt) fn cpus() -> usize {
         4
     }
+
+    pub(in crate::rt) fn yield_now() {
+        std::thread::yield_now();
+    }
+
+    /// A host process has no console slot, so nothing reaches here.
+    #[cfg(feature = "rt")]
+    pub(in crate::rt) fn console_write(_: moruna_abi::RawHandle, _: &[u8]) {}
 
     /// The host's stack is its thread's own.
     pub(in crate::rt) struct Stack;

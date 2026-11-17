@@ -12,15 +12,15 @@ use alloc::vec::Vec;
 use core::sync::atomic::AtomicU32;
 use core::time::Duration;
 
-use moruna_abi::{Error, PAGE_SIZE, limits};
+use moruna_abi::{Error, PAGE_SIZE};
 
 use super::lock::Lock;
 use super::{futex, os, tls};
 use crate::Result;
 
-/// The stack of a thread std is asked for no size for: the first thread's (`limits`), as
-/// Motor's std gives its threads.
-pub const DEFAULT_MIN_STACK_SIZE: usize = limits::MAIN_STACK_BYTES as usize;
+/// The stack of a thread std is asked for no size for: 2 MiB, as Linux's std gives, since
+/// arrow-rs and query engines recurse deeply (PM, 2026-11-18). A guard page lies below it.
+pub const DEFAULT_MIN_STACK_SIZE: usize = 2 << 20;
 
 /// What a started thread runs, boxed by [`spawn`] and freed by the thread.
 struct Start {
@@ -144,10 +144,10 @@ pub fn sleep_until(deadline: u64) {
     }
 }
 
-/// Lets another thread run. The core has no call that gives the CPU away, so this is a hint to
-/// the CPU only; the scheduler's tick still moves threads that do not block.
+/// Gives the CPU to another ready thread, if there is one (`thread_yield`, ABI 2.8): what a
+/// library's spin-then-yield loop needs to give way.
 pub fn yield_now() {
-    core::hint::spin_loop();
+    os::yield_now();
 }
 
 /// The CPUs a program's threads can run on, from the start page.
