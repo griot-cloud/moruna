@@ -31,7 +31,8 @@ TIMED_OUT = 8
 FOREVER = (1 << 64) - 1
 
 # Reads of the input ring before a wait: a batch the engine posts within them costs no call.
-SPINS = int(os.environ.get("MORUNA_SHIM_SPINS", "20000"))
+# A few, then the futex: a long spin under KVM burns the task's CPU while it waits.
+SPINS = int(os.environ.get("MORUNA_SHIM_SPINS", "256"))
 
 
 class KernelError(OSError):

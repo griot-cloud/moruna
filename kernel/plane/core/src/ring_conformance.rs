@@ -154,6 +154,14 @@ pub fn run_all(f: &Fixtures) -> Results {
         ));
         r.push((
             if protect {
+                "p_a_poll_never_spins_protect"
+            } else {
+                "p_a_poll_never_spins_unmap"
+            },
+            poll_never_spins(f, protect),
+        ));
+        r.push((
+            if protect {
                 "p_answers_of_batches_in_flight_in_order_protect"
             } else {
                 "p_answers_of_batches_in_flight_in_order_unmap"
@@ -363,6 +371,30 @@ pub fn several_records(f: &Fixtures, protect: bool) -> Result<(), String> {
     )?;
     same(p.exit_code(task), Some(0), "the exit code the task said")?;
     empty(&p, "nothing left")
+}
+
+/// Stream P: a poll (a deadline of zero) only looks: however many times a wait reads the rings
+/// before it sleeps, a poll returns at once, with a batch in flight and nothing come. The
+/// stage polls each batch for answers already come, and every poll spun (the NYC gate,
+/// 2026-11-17).
+pub fn poll_never_spins(f: &Fixtures, protect: bool) -> Result<(), String> {
+    let mut p = plane(protect);
+    let (task, mut t) = open(&mut p, shape(2), Behave::Echo)?;
+    let region = p.region_of(task).ok_or("no region")?;
+    drive(&mut p, &mut [&mut t])?;
+    let b = load(&mut p, region, f)?;
+    p.offer(task, 0, b).map_err(|e| format!("offer: {e:?}"))?;
+    p.drop_batch(b).map_err(|e| format!("drop: {e:?}"))?;
+    // The task has not run: nothing has come, and a wait would spin for good.
+    p.spins = u32::MAX;
+    for i in 0..1000 {
+        if let Some(e) = p.next(0).map_err(|e| format!("poll {i}: {e:?}"))? {
+            return Err(format!("poll {i} gave {e:?} with nothing come"));
+        }
+    }
+    p.spins = 1;
+    drive(&mut p, &mut [&mut t])?;
+    Ok(())
 }
 
 /// Stream P: with batches in flight, the task answers each in turn, its records then its
