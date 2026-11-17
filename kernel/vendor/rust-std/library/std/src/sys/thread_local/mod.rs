@@ -187,6 +187,15 @@ pub(crate) mod key {
             pub(super) use xous::{Key, get, set};
             use xous::{create, destroy};
         }
+        // moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
+        target_os = "moruna" => {
+            mod racy;
+            #[cfg(test)]
+            mod tests;
+            pub(super) use racy::LazyKey;
+            pub(super) use moruna_sys::rt::tls::{Key, get, set};
+            use moruna_sys::rt::tls::{create, destroy};
+        }
         target_os = "motor" => {
             mod racy;
             #[cfg(test)]

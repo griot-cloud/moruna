@@ -9,6 +9,8 @@ cfg_select! {
         target_os = "dragonfly",
         target_os = "fuchsia",
         target_os = "motor",
+        // moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
+        target_os = "moruna",
         target_os = "hermit",
     ) => {
         mod futex;

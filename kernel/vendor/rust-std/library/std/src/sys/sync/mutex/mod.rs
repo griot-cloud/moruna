@@ -6,6 +6,8 @@ cfg_select! {
         target_os = "freebsd",
         target_os = "openbsd",
         target_os = "motor",
+        // moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
+        target_os = "moruna",
         target_os = "dragonfly",
         all(target_family = "wasm", target_feature = "atomics"),
         target_os = "hermit",

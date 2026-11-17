@@ -6,6 +6,14 @@ cfg_select! {
         mod unsupported;
         pub use unsupported::{current_os_id, set_name};
     }
+    // moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
+    target_os = "moruna" => {
+        mod moruna;
+        pub use moruna::{Thread, available_parallelism, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};
+        #[expect(dead_code)]
+        mod unsupported;
+        pub use unsupported::{current_os_id, set_name};
+    }
     target_os = "motor" => {
         mod motor;
         pub use motor::*;

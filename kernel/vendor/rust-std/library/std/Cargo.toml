@@ -73,6 +73,11 @@ fortanix-sgx-abi = { version = "0.6.1", features = [
 [target.'cfg(target_os = "motor")'.dependencies]
 moto-rt = { version = "0.16", features = ['rustc-dep-of-std'], public = true }
 
+# moruna: Moruna's runtime, which std's `target_os = "moruna"` layer calls (kernel/sys, `rt`;
+# kernel/vendor/rust-std/README.md).
+[target.'cfg(target_os = "moruna")'.dependencies]
+moruna-sys = { path = "../../../../sys", features = ['rustc-dep-of-std'], public = true }
+
 [target.'cfg(target_os = "hermit")'.dependencies]
 hermit-abi = { version = "0.5.0", features = [
     'rustc-dep-of-std',

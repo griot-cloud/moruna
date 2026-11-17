@@ -81,6 +81,11 @@ cfg_select! {
         mod hermit;
         use hermit as imp;
     }
+    // moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
+    target_os = "moruna" => {
+        mod moruna;
+        use moruna as imp;
+    }
     target_os = "motor" => {
         mod motor;
         use motor as imp;

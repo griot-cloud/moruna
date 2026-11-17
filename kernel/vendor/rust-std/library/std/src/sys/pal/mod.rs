@@ -20,6 +20,11 @@ cfg_select! {
         mod hermit;
         pub use self::hermit::*;
     }
+    // moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
+    target_os = "moruna" => {
+        mod moruna;
+        pub use self::moruna::*;
+    }
     target_os = "motor" => {
         mod motor;
         pub use self::motor::*;

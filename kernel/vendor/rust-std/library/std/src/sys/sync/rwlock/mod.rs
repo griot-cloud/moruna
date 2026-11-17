@@ -10,6 +10,8 @@ cfg_select! {
         all(target_family = "wasm", target_feature = "atomics"),
         target_os = "hermit",
        target_os = "motor",
+       // moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
+       target_os = "moruna",
     ) => {
         mod futex;
         pub use futex::RwLock;

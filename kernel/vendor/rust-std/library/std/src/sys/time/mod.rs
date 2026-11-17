@@ -3,6 +3,10 @@ cfg_select! {
         mod hermit;
         use hermit as imp;
     }
+    // moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
+    target_os = "moruna" => {
+        use moruna_sys::rt::time as imp;
+    }
     target_os = "motor" => {
         use moto_rt::time as imp;
     }

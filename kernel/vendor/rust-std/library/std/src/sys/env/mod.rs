@@ -6,6 +6,8 @@
     target_family = "unix",
     target_os = "hermit",
     target_os = "motor",
+    // moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
+    target_os = "moruna",
     all(target_vendor = "fortanix", target_env = "sgx"),
     target_os = "solid_asp3",
     target_os = "uefi",
@@ -26,6 +28,11 @@ cfg_select! {
     target_os = "hermit" => {
         mod hermit;
         pub use hermit::*;
+    }
+    // moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
+    target_os = "moruna" => {
+        mod moruna;
+        pub use moruna::*;
     }
     target_os = "motor" => {
         mod motor;

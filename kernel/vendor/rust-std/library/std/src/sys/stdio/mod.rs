@@ -13,6 +13,11 @@ cfg_select! {
         mod sgx;
         pub use sgx::*;
     }
+    // moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
+    target_os = "moruna" => {
+        mod moruna;
+        pub use moruna::*;
+    }
     target_os = "motor" => {
         mod motor;
         pub use motor::*;

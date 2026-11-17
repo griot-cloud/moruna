@@ -34,6 +34,8 @@ fn main() {
         || target_os == "fuchsia"
         || (target_vendor == "fortanix" && target_env == "sgx")
         || target_os == "motor"
+        // moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
+        || target_os == "moruna"
         || target_os == "hermit"
         || target_os == "trusty"
         || target_os == "l4re"

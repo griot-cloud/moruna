@@ -63,6 +63,11 @@ cfg_select! {
         mod redox;
         pub use redox::fill_bytes;
     }
+    // moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
+    target_os = "moruna" => {
+        mod moruna;
+        pub use moruna::fill_bytes;
+    }
     target_os = "motor" => {
         mod motor;
         pub use motor::fill_bytes;

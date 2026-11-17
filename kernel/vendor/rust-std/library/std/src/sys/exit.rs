@@ -98,6 +98,10 @@ pub fn exit(code: i32) -> ! {
                 libc::exit(code)
             }
         }
+        // moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
+        target_os = "moruna" => {
+            moruna_sys::rt::exit(code)
+        }
         target_os = "motor" => {
             moto_rt::process::exit(code)
         }
