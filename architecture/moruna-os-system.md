@@ -120,11 +120,17 @@ One process, `platform`. In order, it:
      "api": {
        "token_keys": ["<Ed25519 public key, base64>"],
        "tls": { "certificate": "<PEM chain>", "key": "<PEM>" }
+     },
+     "functions": {
+       "keys": ["<Ed25519 public key, base64>"],
+       "cache_bytes": 1073741824
      }
    }
    ```
 
    - `token_keys` is required, 1 to 8 keys. `tls` is optional.
+   - `functions` is optional: `keys` holds 0 to 8 keys that may sign function images (3E), and
+     `cache_bytes` defaults to 1 GiB.
    - Unknown fields are refused. A missing or invalid config is fatal.
 4. **Hands `api` its config** (token keys, TLS identity, wall clock, instance ID) over a channel
    the supervisor links.
@@ -350,44 +356,113 @@ Implements the OS design, section 2.
 | 2.5 | The CLI and the generated clients (2E) | All three read `node` from a booted node | 2.1, 2.2 |
 | 2.6 | Proof on both clouds | From outside the cloud, `node` answers over HTTPS and over MCP on Servercore and on Azure; a bad token is refused; killing `api` leaves the node answering | 1.6, 1.13, 2.2c, 2.4 |
 
-## 3. Wiring (Draft)
+## 3. Wiring (Final)
 
-Implements the OS design, section 3. It becomes Final before any item but 3.1 is issued.
+Implements the OS design, section 3. It reuses what exists and adds the node's side:
+- the job document (SDD 22: version 1 JSON, version 2 FlatBuffers `MJB2`, `moruna-job`'s `check`);
+- the host protocol (`moruna-hosted-engine.md` 4.3: `spec`, `cancel`, `hello`, `heartbeat`, event
+  records, `report`, `exit`);
+- `node-admission`, which starts one engine process per job;
+- the engine's object-store connector seam (`moruna-hosted-engine.md` 4.6).
 
-Decisions so far:
+The engine's own design (sources, sinks, scheduler, memory) stands as SDDs 2 to 11 and 30 say.
 
-- **One job at a time** in the first release. `submit` while a job runs answers `busy`. Jobs side by
-  side, kept apart by the core's accounts, come later.
-- **A fresh engine process per job,** started through `node-admission` as today, so nothing is kept
-  between jobs.
-- **`api` and the engine** exchange today's job messages (submit, events, logs, report, cancel)
-  over a channel the supervisor links.
-- **Data on attached volumes first.** A job names a volume by its serial; the client attaches it
-  through the cloud.
-- **Then object storage:** the S3 API, then Azure Blob. Credentials arrive in the job document over
-  TLS, live in the engine's memory for that job, and are never logged or kept in node config.
-- **Functions** are registered by address, SHA-256 and signature. The public keys that may sign
-  them are added to node config.
-- **Events** are Server-Sent Events: progress, logs, and each stage's time split.
+### 3A. A job's path
 
-Still open, and mine to settle:
+```
+client ─HTTPS─► api ──(job, cancel)──► node-admission ──starts──► engine ─┬─ volumes (disk://)
+           ◄─────── events, report ◄── the host protocol, on a channel ───┘ └─ network (object storage)
+```
 
-- How the engine reaches the network: through the Linux layer's sockets, or a native client.
-- Where registered function images are kept, since the boot disk is never written and
-  `Standard_D4ls_v5` has no local disk.
-- The cause of the full-year hang.
+- **One job at a time.** `submit` while a job runs answers `busy`. Jobs side by side, kept apart by
+  the core's accounts, come later.
+- **A fresh engine per job,** started by `node-admission` with the job's budget as its account,
+  then ended. Nothing is kept between jobs except the function cache (3E).
+- **`api` is the engine's host.** The host protocol runs unchanged over a channel between `api` and
+  the engine, instead of a socket: `api` sends `spec` and `cancel`, and reads `hello`, `heartbeat`,
+  event records, `report` and `exit`.
+- **The budget** is the job document's `budget.memory_bytes`, at most the node's memory less 512 MiB
+  kept for the node's services. A larger one is refused at `validate`.
+
+### 3B. The job operations
+
+Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clients grow with them:
+
+| Operation | Scope | Body or answer |
+|---|---|---|
+| `POST /v1/jobs/validate` | submit | Body: a job (below). Answer: `{"ok":true}` or `{"ok":false,"refusals":[…]}`, `moruna-job`'s refusals with their fields |
+| `POST /v1/jobs` | submit | Body: a job. Answer `201` with `{"id":"<run id>"}`; `busy` while a job runs; `invalid` with the refusals |
+| `GET /v1/jobs` | observe | The last 100 jobs, newest first: id, state, times |
+| `GET /v1/jobs/{id}` | observe | State (`starting`, `running`, `completed`, `failed`, `cancelled`), times, the latest heartbeat's fields, exit code |
+| `POST /v1/jobs/{id}/cancel` | submit | Sends `cancel`; `conflict` if the job has ended |
+| `GET /v1/jobs/{id}/events` | observe | Server-Sent Events: each event record as its JSON line (`moruna_event`'s rendering), heartbeats, log records, then `report` and `exit`. `?from=<seq>` replays from the node's buffer of the last 100,000 records |
+| `GET /v1/jobs/{id}/report` | observe | The `RunReport` JSON, once the job has ended |
+
+- **A job is** `{"v1": <job document version 1 as JSON>}` or `{"v2": "<base64 of the MJB2 FlatBuffer>"}`.
+  Either is checked by `moruna-job`'s `check` before it is accepted.
+- **The node fills in** `report.socket` (the channel), `staging` (none) and the run id when absent.
+  A document that names a host socket, a `file://` path outside its volumes, or `resume` is refused
+  in this release.
+- **Secrets** (object-store credentials) are redacted in every answer, event, log and report. They
+  live in the engine's memory for the job and in `api`'s memory until the engine has them.
+
+### 3C. Volumes
+
+- **A job reads and writes attached volumes,** named by the serial the cloud gives the disk: the
+  Cinder volume ID on OpenStack, `lun-<n>` on Azure. In the job: `disk://<serial>/<path>`.
+- `devices` reports every block device with its serial. `node-admission` grants the engine exactly
+  the volumes its job names, read-only for sources and read-write for sinks. Today's `disk://`
+  support (stream D) does the rest.
+- **The boot disk is never a volume.**
+
+### 3D. The network for jobs
+
+- **The engine reaches object storage through the network server's own client,** not through the
+  Linux layer's sockets. It is a new object-store connector, `moruna-net`, beside the `unix://` and
+  `vsock://` ones of `moruna-hosted-engine.md` 4.6: it opens a connection, and the network server
+  runs TLS on it (`start_tls`, with the node's `tls.roots`).
+- **Egress per job:** `node-admission` holds a network client with only the `grant` right. For each
+  job it mints the engine's channel with `connect` and `resolve` limited to the host names in the
+  job's object-store settings, on port 443. Nothing else is reachable from a job.
+- **Object stores, in order:** the S3 API (any endpoint), then Azure Blob.
+- **Throughput is measured** in item 3.4: one large object read through the connector, MB/s,
+  against the same read with `curl` on the same cloud's Linux.
+
+### 3E. Functions
+
+- **Registration:** `POST /v1/functions` (admin) with `{"name", "address", "sha256", "signature"}`.
+  - `address` is an `https://` URL or an object-store URL; `sha256` is the image file's.
+  - `signature` is an Ed25519 signature over the 32 bytes of that SHA-256, by one of node config's
+    `function_keys` (added to 1D's schema, 0 to 8 keys).
+  - The node checks the signature and stores the entry. `GET /v1/functions` (observe) lists them.
+    Nothing is fetched at registration.
+- **At job start,** `node-admission` has the engine fetch each function the job names, through its
+  job network (3D). The node refuses the job if a SHA-256 differs. Images are cached in memory, up
+  to node config's `function_cache_bytes` (default 1 GiB), until the node stops.
+- **A job names a function** by its registered name. An unregistered name is refused at `validate`.
+
+### 3F. The full-year hang
+
+Item 3.1 reproduces it, finds the cause, and proposes a fix for the PM's approval. Nothing in 3A to
+3E waits on it except the proof, 3.8.
+
+### Work items
 
 | Item | Build | Success | Needs |
 |---|---|---|---|
-| 3.1 | The full-year hang: reproduce it, find the cause, and bring the PM a fix to approve before building it | A test reproduces it and passes after the fix; all four taxi jobs complete on the full year | 0.1 |
-| 3.2 | Jobs through the API | A job submitted over HTTPS runs and reports on a booted node | 2.3, 3.1 |
-| 3.3 | Data on attached volumes | A taxi job reads one volume and writes another on Servercore | 3.2, 1.6 |
-| 3.4 | The engine on the network | The engine opens a TLS connection out; its throughput is recorded | 3.2 |
-| 3.5 | Object storage sources and sinks | A taxi job reads from and writes to object storage on each cloud | 3.4 |
-| 3.6 | Functions through the API | An unsigned image is refused; a registered function runs in a job | 3.2 |
-| 3.7 | Events and the report | An MCP client follows a running job to its report | 3.2, 2.4 |
-| 3.8 | Proof | The four taxi jobs through the API give 0.6.6's rows on a Servercore node and an Azure node | 3.3 or 3.5, 3.6 |
-| 3.9 | The benchmark returns | Operational time for all four jobs against the other engines: first faster than 0.6.6, then the 1.5x bar | 3.8 |
+| 3.1 | The full-year hang (3F) | A host test reproduces it and passes after the fix; one month at 2 GiB and 19 GiB completes | none |
+| 3.2 | The job operations, `api` as the engine's host over a channel, one job at a time (3A, 3B) | On a booted node: a `disk://`-free test job (a source that makes rows, a sink that counts) validates, runs, streams events, reports, and can be cancelled | 2.2b |
+| 3.3 | Volumes by serial (3C) | On a booted node with two extra virtio disks: a taxi month read from one and written to the other, rows as 0.6.6 | 3.2 |
+| 3.4 | The `moruna-net` connector and egress per job (3D) | A job reads an object over HTTPS through the network server; a host not in the job is refused; throughput recorded | 3.2 |
+| 3.5 | S3, then Azure Blob, sources and sinks over 3.4 | A taxi month read from and written to S3-compatible storage, and to Blob | 3.4 |
+| 3.6 | Functions: registration, fetch, verification, cache (3E) | An unsigned or altered image is refused; a registered native function runs in a job | 3.4 |
+| 3.7 | Events and reports over SSE and MCP | An MCP client follows a job to its report; `?from` replays | 3.2, 2.4 |
+| 3.8 | Proof | The four taxi jobs through the API give 0.6.6's rows, on a Servercore node and an Azure node | 3.1, 3.3 or 3.5, 3.6, 1.13 |
+| 3.9 | The benchmark returns | Operational time on all four jobs against the other engines: first faster than 0.6.6, then the 1.5x bar | 3.8 |
+
+**One open risk:** the engine runs as a Linux program on the Linux layer. Item 0.1 shows whether
+the branch head's new Linux layer boots. If it doesn't, the node uses the tag's `kernel/linux`
+until it does, and that choice is written here.
 
 ## 5. Languages (Draft)
 
@@ -421,7 +496,7 @@ first accelerator.
 | 1. Boot as a node, OpenStack | 1A to 1E | Final |
 | 1. Boot as a node, Azure | 1F | Final; 1.7b may adjust details |
 | 2. The API | 2A to 2E | Final |
-| 3. Wiring | 3 | Draft |
+| 3. Wiring | 3A to 3F | Final; one open risk (0.1's result) |
 | 4. The two interfaces and the unit of work | 4 | Not started, by decision |
 | 5. Rust first, every language after | 5 | Draft |
 | One image for every cloud | 1A | Final |
@@ -450,5 +525,5 @@ approval.
 
 - **Can start now, on separate files:** 0.1 then 1.1 to 1.5 (one owner, in order); 2.1 (done); the
   reading half of 1.7 (done); 3.1.
-- **Then:** 1.6 and 2.2 to 2.5; 1.7b and then 1.8 to 1.13, once Azure resources are approved.
-- **Then:** 2.6, section 3 once Final, and section 5.
+- **Then:** 1.6 and 2.2b, 2.2c; 1.7b and then 1.8 to 1.13.
+- **Then:** 2.6; 3.2 to 3.7; 3.8; section 5.
