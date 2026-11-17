@@ -51,7 +51,7 @@ Implements the OS design, section 1, OpenStack column.
 
   | Step | Processes in the image |
   |---|---|
-  | 1 | `node-supervisor`, `devices`, `netstack`, `platform`, `api`; drivers `virtio-blk`, `virtio-net`, `nvme`, `gve` |
+  | 1 | `node-supervisor`, `devices`, `netstack`, `platform`, `api`; drivers `virtio-blk`, `virtio-net`, `nvme`, `gve`. Item 1.1 boots the supervisor, `devices` and the drivers alone; `netstack` joins with `api` in 1.3, because the network server refuses a config with no listener grant |
   | 2 | The same; `api` gains TLS and its operations |
   | 3 | Adds `storage`, `imagefs`, `linux`, `node-admission`, `engine` |
 
