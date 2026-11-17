@@ -4,9 +4,11 @@
 System design 2E, item 2.5. The generated module holds one class per schema of
 ``kernel/api/openapi.json`` (a dataclass for each object, a ``StrEnum`` for each set of string
 constants), one function per operation, which calls it through a client and reads its answer,
-and the class ``Operations``, one method per operation, each a call of its function. The client
-itself is hand-written beside it, in ``python/moruna/api/__init__.py``, and inherits
-``Operations``.
+and the class ``Operations``, one method per operation, each a call of its function. An
+operation's function takes the run's ID when its path carries one, its body when it has one, and
+its query parameters as keywords; one that answers with Server-Sent Events returns an iterator
+of them. The client itself is hand-written beside it, in ``python/moruna/api/__init__.py``, and
+inherits ``Operations``.
 
 Usage::
 
@@ -52,16 +54,32 @@ method of ``Operations``, which ``Client`` inherits: ``client.node()`` is ``node
 
 from __future__ import annotations
 
+import urllib.parse
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
 
 
+@dataclass(frozen=True, slots=True)
+class ServerSentEvent:
+    """One event of a stream: its ID when it has one, its name, and its data, read as JSON."""
+
+    id: int | None
+    event: str
+    data: Any
+
+
 class Caller(Protocol):
     """What an operation is called through: ``moruna.api.Client``."""
 
-    def call(self, operation: str, method: str, path: str, *, token: bool) -> Any:
-        """Call ``method path`` (with the token when ``token``) and return the JSON answer."""
+    def call(self, operation: str, method: str, path: str, *, token: bool, body: Any = None) -> Any:
+        """Call ``method path`` (with the token when ``token``, and ``body`` as its JSON body
+        when it has one) and return the JSON answer."""
+        ...
+
+    def stream(self, operation: str, path: str, *, token: bool) -> Iterator[ServerSentEvent]:
+        """Call ``GET path`` and return its answer's Server-Sent Events as they arrive."""
         ...
 
 
@@ -97,12 +115,38 @@ def _int(value: Any, where: str, low: int | None, high: int | None) -> int:
     return value
 
 
+def _bool(value: Any, where: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{where}: expected a boolean, found {type(value).__name__}")
+    return value
+
+
 def _enum[E: StrEnum](kind: type[E], value: Any, where: str) -> E:
     text = _str(value, where)
     try:
         return kind(text)
     except ValueError:
         raise ValueError(f"{where}: {text!r} is not a {kind.__name__}") from None
+
+
+def _maybe[T](
+    data: dict[str, Any], key: str, where: str, read: Callable[[tuple[Any, str]], T]
+) -> T | None:
+    """A field that may be absent or null: read when it is there."""
+    if data.get(key) is None:
+        return None
+    return read((data[key], f"{where}.{key}"))
+
+
+def _segment(value: str) -> str:
+    """A value as one segment of a path."""
+    return urllib.parse.quote(value, safe="")
+
+
+def _query(**parameters: int | None) -> str:
+    """The query of the parameters that are given; nothing when none is."""
+    given = {name.rstrip("_"): value for name, value in parameters.items() if value is not None}
+    return "?" + urllib.parse.urlencode(given) if given else ""
 '''
 
 
@@ -136,6 +180,24 @@ def member(value: str) -> str:
     return "_" + name if not name or name[0].isdigit() else name
 
 
+#: What an optional field's schema has two of: its type, and null.
+NULLABLE = 2
+
+
+def plain(schema: dict[str, Any]) -> dict[str, Any]:
+    """A field's schema without the null an optional field may also be."""
+    kinds = schema.get("type")
+    if isinstance(kinds, list) and "null" in kinds and len(kinds) == NULLABLE:
+        (kind,) = (k for k in kinds if k != "null")
+        return {**schema, "type": kind}
+    any_of = schema.get("anyOf")
+    if isinstance(any_of, list) and len(any_of) == NULLABLE and {"type": "null"} in any_of:
+        (other,) = (alternative for alternative in any_of if alternative != {"type": "null"})
+        if isinstance(other, dict):
+            return other
+    return schema
+
+
 class Generator:
     """Writes the module for one OpenAPI document."""
 
@@ -152,6 +214,7 @@ class Generator:
 
     def annotation(self, schema: dict[str, Any], where: str) -> str:
         """The Python type of a field's schema."""
+        schema = plain(schema)
         if "$ref" in schema:
             return self.ref(schema, where)
         kind = schema.get("type")
@@ -159,21 +222,30 @@ class Generator:
             return "str"
         if kind == "integer":
             return "int"
+        if kind == "boolean":
+            return "bool"
+        if kind == "object" and "properties" not in schema:
+            return "dict[str, Any]"
         if kind == "array":
             return f"list[{self.annotation(schema['items'], where + '[]')}]"
         raise Unsupported(f"{where}: a field schema of type {kind!r}")
 
-    def read(self, schema: dict[str, Any], value: str, where: str) -> str:
+    def read(self, schema: dict[str, Any], value: str, where: str) -> str:  # noqa: PLR0911
         """An expression that reads ``value``, a ``(value, location)`` pair, as ``schema``."""
+        schema = plain(schema)
         if "$ref" in schema:
             name = self.ref(schema, where)
             if is_enum(self.schemas[name]):
                 return f"_enum({name}, *{value})"
             return f"{name}.from_json(*{value})"
-        # The field's annotation was made first, so its type is one of these three.
+        # The field's annotation was made first, so its type is one of these.
         kind = schema.get("type")
         if kind == "string":
             return f"_str(*{value})"
+        if kind == "boolean":
+            return f"_bool(*{value})"
+        if kind == "object":
+            return f"_object(*{value})"
         if kind == "array":
             item = self.read(schema["items"], "item", where + "[]")
             return f"[{item} for item in _items(*{value})]"
@@ -181,6 +253,7 @@ class Generator:
 
     def write(self, schema: dict[str, Any], value: str, where: str) -> str:
         """An expression that writes ``value`` back to JSON."""
+        schema = plain(schema)
         if "$ref" in schema:
             if is_enum(self.schemas[self.ref(schema, where)]):
                 return f"{value}.value"
@@ -198,23 +271,28 @@ class Generator:
                 lines.extend(docstring(constant["description"], "    "))
         return lines
 
-    def dataclass(self, name: str, schema: dict[str, Any]) -> list[str]:
+    def dataclass(self, name: str, schema: dict[str, Any]) -> list[str]:  # noqa: PLR0912
         if schema.get("type") != "object" or not isinstance(schema.get("properties"), dict):
             raise Unsupported(f"{name}: neither an object nor a set of string constants")
         properties: dict[str, dict[str, Any]] = schema["properties"]
         required = [key for key in schema.get("required", []) if key in properties]
-        if len(required) != len(properties):
-            raise Unsupported(f"{name}: an optional field")
+        # A field the node may leave out, or write as null: `None` here, and left out of the
+        # JSON written back. They follow the required fields, as a dataclass's defaults must.
+        optional = [key for key in properties if key not in required]
         lines = [
             "@dataclass(frozen=True, slots=True)",
             f"class {name}:",
             *docstring(schema.get("description", name), "    "),
         ]
-        for key in required:
+        for key in [*required, *optional]:
             if not key.isidentifier() or keyword.iskeyword(key):
                 raise Unsupported(f"{name}.{key}: not a Python name")
+            annotation = self.annotation(properties[key], f"{name}.{key}")
             lines.append("")
-            lines.append(f"    {key}: {self.annotation(properties[key], f'{name}.{key}')}")
+            if key in required:
+                lines.append(f"    {key}: {annotation}")
+            else:
+                lines.append(f"    {key}: {annotation} | None = None")
             if "description" in properties[key]:
                 lines.extend(docstring(properties[key]["description"], "    "))
         lines += [
@@ -233,17 +311,143 @@ class Generator:
                 lines += [f"            {key}=[", f"                {read[1:-1]}", "            ],"]
             else:
                 lines.append(line)
+        for key in optional:
+            read = self.read(properties[key], "at", f"{name}.{key}")
+            line = f'            {key}=_maybe(data, "{key}", where, lambda at: {read}),'
+            if len(line) > WIDTH:
+                # As ruff formats it: each argument on its own line.
+                lines += [
+                    f"            {key}=_maybe(",
+                    "                data,",
+                    f'                "{key}",',
+                    "                where,",
+                    f"                lambda at: {read},",
+                    "            ),",
+                ]
+            else:
+                lines.append(line)
         lines += [
             "        )",
             "",
             "    def to_json(self) -> dict[str, Any]:",
             '        """The JSON value, as the node writes it."""',
-            "        return {",
         ]
-        for key in required:
-            lines.append(f'            "{key}": {self.write(properties[key], f"self.{key}", key)},')
-        lines.append("        }")
+        if not optional:
+            lines.append("        return {")
+            for key in required:
+                write = self.write(properties[key], f"self.{key}", key)
+                lines.append(f'            "{key}": {write},')
+            lines.append("        }")
+            return lines
+        if required:
+            lines.append("        data: dict[str, Any] = {")
+            for key in required:
+                write = self.write(properties[key], f"self.{key}", key)
+                lines.append(f'            "{key}": {write},')
+            lines.append("        }")
+        else:
+            lines.append("        data: dict[str, Any] = {}")
+        for key in optional:
+            write = self.write(properties[key], f"self.{key}", key)
+            lines.append(f"        if self.{key} is not None:")
+            lines.append(f'            data["{key}"] = {write}')
+        lines.append("        return data")
         return lines
+
+    def operation(  # noqa: PLR0912, PLR0915, one operation's shape, read top to bottom
+        self, path: str, method: str, op: dict[str, Any]
+    ) -> tuple[list[str], list[str]]:
+        """One operation's function, and its method of ``Operations``."""
+        name = op["operationId"]
+        (status,) = (key for key in op["responses"] if key != "default")
+        (content, answer) = next(iter(op["responses"][status]["content"].items()))
+        answer = answer["schema"]
+        # What the function takes after the client: the run's ID in the path, the body, then
+        # the query parameters, as keywords.
+        arguments: list[str] = []
+        passed: list[str] = []
+        query: list[str] = []
+        for parameter in op.get("parameters", []):
+            if parameter["in"] == "path" and parameter["schema"] == {"type": "string"}:
+                arguments.append(f"{parameter['name']}: str")
+                passed.append(parameter["name"])
+            elif parameter["in"] == "query" and parameter["schema"].get("type") == "integer":
+                given = parameter["name"]
+                given += "_" if keyword.iskeyword(given) else ""
+                query.append(given)
+            else:
+                raise Unsupported(f"{name}: the parameter {parameter['name']!r}")
+        body = None
+        if "requestBody" in op:
+            schema = op["requestBody"]["content"]["application/json"]["schema"]
+            body = self.ref(schema, f"{name}'s body")
+            arguments.append(f"{body.lower()}: {body}")
+            passed.append(body.lower())
+        if query:
+            arguments.append("*")
+            arguments += [f"{given}: int | None = None" for given in query]
+            passed += [f"{given}={given}" for given in query]
+        # The path, with the run's ID as one of its segments.
+        if "{" in path:
+            place = path
+            for parameter in op.get("parameters", []):
+                if parameter["in"] == "path":
+                    place = place.replace(
+                        "{" + parameter["name"] + "}", "{_segment(" + parameter["name"] + ")}"
+                    )
+            place = f'f"{place}"'
+        else:
+            place = f'"{path}"'
+        if query:
+            place += " + _query(" + ", ".join(f"{given}={given}" for given in query) + ")"
+        security = op.get("security", [])
+        scopes = [scope for entry in security for scopes in entry.values() for scope in scopes]
+        needs = f"a token with scope ``{scopes[0]}``" if scopes else "no token"
+        token = "True" if security else "False"
+        text = f"{op['summary']}\n\n``{method.upper()} {path}``, {needs}."
+        if content == "text/event-stream":
+            result = "Iterator[ServerSentEvent]"
+            call = [f'    return client.stream("{name}", {place}, token={token})']
+            if len(call[0]) > WIDTH:
+                # As ruff formats it: the arguments on their own line.
+                call = [
+                    "    return client.stream(",
+                    f'        "{name}", {place}, token={token}',
+                    "    )",
+                ]
+        else:
+            sent = f', "{method.upper()}", {place}, token={token}'
+            sent += f", body={body.lower()}.to_json()" if body else ""
+            call = [f'    answer = client.call("{name}"{sent})']
+            if len(call[0]) > WIDTH:
+                # As ruff formats it: the arguments on their own line.
+                call = [
+                    "    answer = client.call(",
+                    f'        "{name}"{sent}',
+                    "    )",
+                ]
+            if "$ref" in answer:
+                result = self.ref(answer, f"{name}'s answer")
+                call.append(f"    return {result}.from_json(answer)")
+            elif answer == {"type": "object"}:
+                result = "dict[str, Any]"
+                call.append(f'    return _object(answer, "{name}\'s answer")')
+            else:
+                raise Unsupported(f"{name}: its answer's schema")
+        takes = "".join(f", {argument}" for argument in arguments)
+        function = [
+            f"def {name}(client: Caller{takes}) -> {result}:",
+            *docstring(text, "    "),
+            *call,
+        ]
+        given = ", ".join(["self", *passed])
+        method_lines = [
+            "",
+            f"    def {name}(self{takes}) -> {result}:",
+            *docstring(f"{text} The function ``{name}({given})``.", "        "),
+            f"        return {name}({given})",
+        ]
+        return function, method_lines
 
     def operations(self) -> list[list[str]]:
         """One function per operation, then the ``Operations`` class: one method per operation,
@@ -259,32 +463,9 @@ class Generator:
         ]
         for path in sorted(self.paths):
             for method in sorted(self.paths[path]):
-                op = self.paths[path][method]
-                name = op["operationId"]
-                answer = op["responses"]["200"]["content"]["application/json"]["schema"]
-                result = self.ref(answer, f"{name}'s answer")
-                security = op.get("security", [])
-                scopes = [
-                    scope for entry in security for scopes in entry.values() for scope in scopes
-                ]
-                needs = f"a token with scope ``{scopes[0]}``" if scopes else "no token"
-                token = "True" if security else "False"
-                text = f"{op['summary']}\n\n``{method.upper()} {path}``, {needs}."
-                functions.append(
-                    [
-                        f"def {name}(client: Caller) -> {result}:",
-                        *docstring(text, "    "),
-                        f'    answer = client.call("{name}", "{method.upper()}", "{path}", '
-                        f"token={token})",
-                        f"    return {result}.from_json(answer)",
-                    ]
-                )
-                methods += [
-                    "",
-                    f"    def {name}(self) -> {result}:",
-                    *docstring(f"{text} The function ``{name}(self)``.", "        "),
-                    f"        return {name}(self)",
-                ]
+                function, method_lines = self.operation(path, method, self.paths[path][method])
+                functions.append(function)
+                methods += method_lines
         return [*functions, methods]
 
     def module(self) -> str:
