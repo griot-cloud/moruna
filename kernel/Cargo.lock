@@ -852,6 +852,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-node-config"
+version = "0.1.0"
+dependencies = [
+ "moruna-api",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "moruna-node-image"
 version = "0.1.0"
 dependencies = [
