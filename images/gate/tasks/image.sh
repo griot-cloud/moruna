@@ -5,9 +5,11 @@
 #
 #   images/gate/tasks/image.sh BIN_DIR BASE_LAYOUT PROCESSES OUT MORUNA_LAYER
 #
-# BIN_DIR holds gate-* (tasks/build.sh's output); BASE_LAYOUT is an OCI layout to derive from
-# (kernel/tools/python-layout.sh's, as kernel/tools/build.sh derives the node's image);
-# MORUNA_LAYER is crates/moruna-image's moruna-layer. Run from the repository's root.
+# BIN_DIR holds gate-* (tasks/build.sh's output), stripped of their debug information here;
+# BASE_LAYOUT is an OCI layout to derive from (kernel/tools/python-layout.sh's, as
+# kernel/tools/build.sh derives the node's image), or `scratch` for none: the tasks need no file
+# but their own; MORUNA_LAYER is crates/moruna-image's moruna-layer. Run from the repository's
+# root.
 set -euo pipefail
 bin="$1"; base="$2"; n="$3"; out="$4"; layer="$5"
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -16,7 +18,12 @@ trap 'rm -rf "$work"' EXIT
 mkdir "$work/root"
 for job in enrich audit occupancy score fw_minhash ov_shape ov_attrs; do
   install -m 0755 "$bin/gate-$job" "$work/root/gate-$job"
+  strip --strip-debug "$work/root/gate-$job"
 done
+if [ "$base" = scratch ]; then
+  base="$work/base"
+  python3 -I "$here/image_env.py" --empty "$base"
+fi
 manifest="$(python3 kernel/tools/oci-manifest.py "$base" linux amd64)"
 "$layer" derive "$base" "$manifest" "$work/root" gate "$work/image" /gate-score
 python3 -I "$here/image_env.py" "$work/image" "MORUNA_PROCESSES=$n"

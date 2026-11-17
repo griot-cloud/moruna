@@ -282,6 +282,13 @@ elif mode == "gate-nyc":
     plan = gate_plan.nyc(Y2024, machine, with_066_rust="--no-066-rust" not in sys.argv, groups=groups,
                          noise="--rest" not in sys.argv)
     mode = f"gate-nyc-{machine}" + ("-core" if "--core" in sys.argv else "-rest" if "--rest" in sys.argv else "")
+    # --no-vm: the rows that boot no Moruna VM (they may run while 0.7's kernel is held); --vm: 0.7's.
+    if "--no-vm" in sys.argv:
+        plan = [p for p in plan if not p["engine"].startswith("moruna-vm")]
+        mode += "-controls"
+    elif "--vm" in sys.argv:
+        plan = [p for p in plan if p["engine"].startswith("moruna-vm")]
+        mode += "-vm"
 elif mode == "gate-ooc":
     # The large jobs, once per build: Overture and FineWeb as rerun7 downloaded them.
     import gate_plan

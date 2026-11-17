@@ -87,7 +87,7 @@ def rows_for(recs, machine, workload):
             "oom": sum(r.get("oom_kills", 0) for r in runs),
             "boot_s": med([r.get("boot_s") for r in ok]),
             "vm": {k: med([(r.get("vm") or {}).get(k) for r in ok])
-                   for k in ("boot_s", "stage_s", "job_s", "outputs_s", "total_s")},
+                   for k in ("launch_s", "boot_s", "stage_s", "node_s", "job_s", "outputs_s", "total_s")},
             "split": {k: med([s.get(k) for s in splits]) for k in
                       ("read_decode_s", "function_s", "encode_write_s", "wait_s")},
             "output": match(ok[0], ref, workload) if ok else "no run passed",
@@ -140,8 +140,23 @@ def speedups(table):
     return lines
 
 
+def sizes_line(path=os.environ.get("GATE_SIZES", "/home/bench/gate/sizes.json")):
+    """The images a 0.7 run boots and attaches, from the setup's sizes.json, in MB."""
+    try:
+        z = json.load(open(path))
+    except (OSError, ValueError):
+        return None
+    mb = lambda b: f"{b / 1e6:.1f} MB"
+    parts = ", ".join(f"{k} {mb(v)}" for k, v in z.get("booted", {}).items())
+    return (f"Images: the node 0.7 boots {mb(sum(z.get('booted', {}).values()))} ({parts}); the gate task "
+            f"image {mb(z.get('gate_image', 0))} (its tasks {mb(z.get('gate_tasks', 0))})")
+
+
 def render(recs, machines):
     out = []
+    line = sizes_line()
+    if line:
+        out.append(line + "\n")
     for m in machines:
         out.append(f"## {m}: {gate_plan.MACHINES[m]['cpus']} CPUs, {gate_plan.MACHINES[m]['mem']} GiB\n")
         for wl in gate_plan.NYC:
@@ -149,13 +164,15 @@ def render(recs, machines):
             if not table:
                 continue
             out.append(f"### {wl}\n")
-            out.append("| Group | Engine | Function | Wall s | CPU s | Peak GiB | OOM | Boot s | Read+decode s | "
-                       "Function s | Encode+write s | Waits s | Output | Runs ok |")
-            out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+            out.append("| Group | Engine | Function | Wall s | CPU s | Peak GiB | OOM | Launch s | Boot s | Stage s | "
+                       "Read+decode s | Function s | Encode+write s | Waits s | Output | Runs ok |")
+            out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
             for e, r in sorted(table.items(), key=lambda kv: (kv[1]["group"], kv[0])):
                 s = r["split"]
+                v = r.get("vm") or {}
                 out.append(f"| {r['group']} | {e} | {r['function']} | {fmt(r['wall_s'])} | {fmt(r['cpu_s'])} | "
-                           f"{fmt(r['peak_gib'], 2)} | {r['oom']} | {fmt(r['boot_s'], 2)} | "
+                           f"{fmt(r['peak_gib'], 2)} | {r['oom']} | {fmt(v.get('launch_s'), 2)} | "
+                           f"{fmt(v.get('boot_s'), 2)} | {fmt(v.get('stage_s'), 2)} | "
                            f"{fmt(s['read_decode_s'])} | {fmt(s['function_s'])} | {fmt(s['encode_write_s'])} | "
                            f"{fmt(s['wait_s'])} | {r['output']} | {r['ok']}/{r['runs']} |")
             out.append("")

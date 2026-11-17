@@ -35,8 +35,8 @@ VM = {"vm_memory_gib": 24, "budget_gib": 20.5, "mem": 27}
 # memory, so a job with a large output gives up budget for it (2024's outputs, measured on
 # moruna-bench: Enrich's is the largest).
 SCRATCH_GIB = {"enrich": 4, "score": 2, "audit": 2, "occupancy": 1}
-# The gate image's layer stacks (setup on moruna-bench): MORUNA_PROCESSES=8 and =7.
-STACKS = {"moruna-vm": "/data/gate/stack8", "moruna-vm-free1": "/data/gate/stack7"}
+# The gate image's layer stacks (setup on moruna-bench), FROM scratch: MORUNA_PROCESSES=8 and =7.
+STACKS = {"moruna-vm": "/data/gate/stack8s", "moruna-vm-free1": "/data/gate/stack7s"}
 # The loop's best settings from 0.6.5's grid (make_plan.py rerun): 16 threads over 250,000-row
 # batches, 8 threads for Occupancy.
 LOOP = {"enrich": {"threads": 16, "batch": 250000}, "audit": {"threads": 16, "batch": 250000},

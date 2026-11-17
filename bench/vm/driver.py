@@ -23,6 +23,8 @@ GATE = os.environ.get("GATE_BIN", "/home/bench/gate/bin")
 MORUNA07 = os.environ.get("MORUNA07_BIN", "/home/bench/moruna07/bin/moruna")
 NATIVE = ("rust-baseline", "moruna-vm", "moruna-vm-free1")
 DUMPED = ("score",)
+# The node kit 0.7's runs boot: the gate's kernel, 5ffded0f's code (the integrator, 2026-11-17).
+NODE_KIT = os.environ.get("GATE_NODE_KIT", "/data/boot-gate")
 
 def wr(path, value):
     with open(path, "w") as f: f.write(str(value))
@@ -179,7 +181,7 @@ def run(spec):
         # QEMU with KVM and seccomp first in PATH, the node kit, a scratch for the run's directory,
         # and where the node's logs go.
         node_logs = f"/data/tmp/{rid}.node"; shutil.rmtree(node_logs, ignore_errors=True)
-        env.update({"PATH": "/opt/qemu-kvm/bin:/usr/bin:/bin", "MORUNA_NODE_KIT": "/data/boot",
+        env.update({"PATH": "/opt/qemu-kvm/bin:/usr/bin:/bin", "MORUNA_NODE_KIT": NODE_KIT,
                     "TMPDIR": "/data/tmp", "MORUNA_KEEP_NODE_LOGS": node_logs})
     env.update(spec.get("env", {}))
     log = open(f"{RES}/{rid}.log", "w")
