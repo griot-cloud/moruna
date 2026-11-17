@@ -1,18 +1,17 @@
-//! The node's `api` process (system design 1C and 2B, work item 1.3).
+//! The node's `api` process (system design 1C, 2B and 2C; work items 1.3 and 2.2b).
 //!
 //! Its start handles are the supervisor's: `console`, its own `account`, `network`, the
 //! listener of the network server's grant `listen-api`, which permits listening on port
 //! 443 and nothing else, and `platform`, its link to `platform`. It connects to the
-//! network server, takes `platform`'s hand-over, and runs the service: a listener on
-//! `wan`'s leased address at 443, which follows the lease, closing each connection it
-//! accepts. Once the listener first opens it answers `platform` `ready`. It says when it
-//! starts and stops listening.
+//! network server and runs the library: `platform`'s hand-over, the API server made from
+//! it and its `moruna: tls sha256=` line, and the loop that serves the API on `wan`'s
+//! leased address at 443, answering `platform` `ready` once the listener first opens.
 //!
 //! It never ends by itself. When it cannot go on (a start handle is missing, the
-//! hand-over is refused, or a request to the network server or `platform` fails) it
-//! prints `moruna: fatal api: <reason>` and
-//! exits with failure (system design 1B). What a dead `api` then means for the node is
-//! the supervisor's to decide (1B and 2B).
+//! hand-over or the operator's TLS identity is refused, or a request to the network
+//! server or `platform` fails) it prints `moruna: fatal api: <reason>` and exits with
+//! failure (system design 1B). What a dead `api` then means for the node is the
+//! supervisor's to decide (1B and 2B).
 
 #![no_std]
 #![no_main]
@@ -44,7 +43,9 @@ fn serve(out: &Console) -> Result<Infallible, Error> {
     let platform = start::take("platform")
         .map(Channel)
         .ok_or(Error::NoSlot("platform"))?;
-    moruna_node_api::run(connect(&network, account)?, &platform, &mut |line| {
+    // The node document's cores: the CPUs the core brought online.
+    let cores = u32::try_from(start::cpus()).unwrap_or(u32::MAX);
+    moruna_node_api::run(connect(&network, account)?, &platform, cores, &mut |line| {
         println!(out, "{}", line)
     })
 }

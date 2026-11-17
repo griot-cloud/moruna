@@ -912,11 +912,18 @@ name = "moruna-node-api"
 version = "0.1.0"
 dependencies = [
  "heapless",
+ "httparse",
+ "moruna-api",
+ "moruna-api-server",
  "moruna-netstack",
  "moruna-node-config",
  "moruna-node-platform",
  "moruna-svc",
  "netstack-protocol",
+ "rcgen",
+ "ring",
+ "rustls",
+ "serde_json",
  "smoltcp",
 ]
 
