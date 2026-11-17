@@ -47,11 +47,16 @@ section 1B; work item 1.2). Each patch is marked with a `moruna:` comment:
   rate the wait is there to measure). It then prints
   `moruna: fatal core: PIT calibration timed out` or
   `moruna: fatal core: APIC timer calibration timed out` and powers the machine off.
+- **The same deadline on the wait for the other CPUs to start** (`src/boot/smp.rs`, on
+  x86). The boot processor waited without end for every other CPU to report in. It now
+  gives up at the same count, prints `moruna: fatal core: CPU start timed out` and powers
+  the machine off. `src/arch/x86/mod.rs` gives the deadline's module the name
+  `arch::boot_wait`, by which code outside `arch` reaches it.
 
-The arithmetic of both is in two added files that name nothing of OSTD:
+Their arithmetic is in two added files that name nothing of OSTD:
 `src/arch/x86/power/acpi_s5.rs` (the scan of a DSDT for `_S5_`, the package's first
-element, the PM1a value) and `src/arch/x86/kernel/tsc/boot_wait.rs` (the wait and its
-deadline). This directory is also the crate `moruna-ostd-adaptation`, which compiles
+element, the PM1a value) and `src/arch/x86/kernel/tsc/boot_wait.rs` (the wait, its
+deadline and the three waits' lines). This directory is also the crate `moruna-ostd-adaptation`, which compiles
 those same two files for the host and tests them (`cargo test -p moruna-ostd-adaptation`).
 They carry `SPDX-License-Identifier: MPL-2.0`, as the files beside them do.
 

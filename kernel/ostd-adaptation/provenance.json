@@ -2,7 +2,7 @@
   "added_files": [
     {
       "path": "src/arch/x86/kernel/tsc/boot_wait.rs",
-      "sha256": "81fb4b1f2a3960dbb2b83e8452a735b53115a7024c128c219c700f3dddaaa83a"
+      "sha256": "463331e066e00db1cc4541cccd36497ef0d0826ca19e343f522a3ee33561e7a8"
     },
     {
       "path": "src/arch/x86/power/acpi_s5.rs",
@@ -18,11 +18,11 @@
       "upstream_sha256": "e179934a23e419c956b28c1c3b1f067f1f6e89f79cb466f39b22e407dfcdd99f"
     },
     "src/arch/x86/kernel/tsc.rs": {
-      "patched_sha256": "a2a0f4f10e77a5f4f4b8e6253d1977b4ba479b957ac462272df81a161f939503",
+      "patched_sha256": "8da36a640478b9a64925c1acd407fddff665055a74abdaeaa292352a57d08e29",
       "upstream_sha256": "b8232083c633be0fec1ac54216e2cb5d54595d10876847741a6331c265783550"
     },
     "src/arch/x86/mod.rs": {
-      "patched_sha256": "43f92f372728cb565cc18e8cf90ce6aec765d72abdf72f4d8684386ce54ce1a1",
+      "patched_sha256": "29052934543d3022a53385393326d5c6de9042d5d432bab1f5339b410ebff85d",
       "upstream_sha256": "660b5a76184cb63f9e92b170104e6b77bbea79a3bfc428cac47e6845c1d26af3"
     },
     "src/arch/x86/power.rs": {
@@ -36,6 +36,10 @@
     "src/arch/x86/timer/mod.rs": {
       "patched_sha256": "e58fe2e0617f04189b3f43e4afc393e598356d6277eb2667f53c20f7b5414a27",
       "upstream_sha256": "3fdff1d350877c451d5357770594a44e10a4c2a8ebaa03a918e080e5d5ffc8c9"
+    },
+    "src/boot/smp.rs": {
+      "patched_sha256": "8d3e7a9c0194920b0dbbd2623662c7946df9006407322fbc2e63cfa55400300f",
+      "upstream_sha256": "d634cada696093587477385c29cc5db2395bc59c502ce8cc5affffeb8363a191"
     },
     "src/cpu/mod.rs": {
       "patched_sha256": "55ba526132b93ee564be469852087d9ec6475a2bf022a2282ba0802d8f1598a1",
@@ -79,7 +83,7 @@
     }
   },
   "official_archive": "https://static.crates.io/crates/ostd/ostd-0.19.0.crate",
-  "scope": "Large pages in a process's page table (a VmSpace cursor that locks at a large page's level, CursorMut::map_huge, the user page table's items restoring and unmapping a 2 MiB run, Segment::from_raw_unsized) and each CPU's number written to IA32_TSC_AUX at its start. Existing items, kernel mappings, allocation and metadata unchanged. Work item 1.2 (architecture/moruna-os-system.md, section 1B): ACPI S5 after QEMU's test exit device in arch::power::try_poweroff, and a deadline of 2^33 TSC counts on the PIT calibration waits of the TSC and of the APIC timer, each with its fatal line and a power-off; their arithmetic in the two added files, which Moruna's host tests compile.",
+  "scope": "Large pages in a process's page table (a VmSpace cursor that locks at a large page's level, CursorMut::map_huge, the user page table's items restoring and unmapping a 2 MiB run, Segment::from_raw_unsized) and each CPU's number written to IA32_TSC_AUX at its start. Existing items, kernel mappings, allocation and metadata unchanged. Work item 1.2 (architecture/moruna-os-system.md, section 1B): ACPI S5 after QEMU's test exit device in arch::power::try_poweroff, and a deadline of 2^33 TSC counts on the PIT calibration waits of the TSC and of the APIC timer, each with its fatal line and a power-off; their arithmetic in the two added files, which Moruna's host tests compile. The same deadline on the boot processor's wait for the other CPUs to start (boot/smp.rs, reached through arch::boot_wait), with its fatal line and a power-off.",
   "upstream_files": "upstream-files.json",
   "vendor_path": "../vendor/ostd-0.19.0",
   "version": "0.19.0"

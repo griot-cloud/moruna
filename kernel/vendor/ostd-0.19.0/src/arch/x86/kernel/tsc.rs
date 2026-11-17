@@ -12,9 +12,10 @@ use crate::{
     timer::TIMER_FREQ,
 };
 
-// moruna: the deadline of the boot waits (Moruna's system design, section 1B); this wait
-// and the APIC timer's (`timer/apic.rs`) use it, and the power-off after it.
-pub(in crate::arch) mod boot_wait;
+// moruna: the deadline of the boot waits (Moruna's system design, section 1B); this wait,
+// the APIC timer's (`timer/apic.rs`) and the wait for the other CPUs to start
+// (`boot/smp.rs`) use it, and the power-off after it.
+pub(crate) mod boot_wait;
 
 /// The frequency in Hz of the Time Stamp Counter (TSC).
 pub(in crate::arch) static TSC_FREQ: AtomicU64 = AtomicU64::new(0);

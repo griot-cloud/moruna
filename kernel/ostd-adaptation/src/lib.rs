@@ -279,7 +279,7 @@ mod boot_wait_tests {
 
     use moruna_abi::boot_line::{CORE, Fatal};
 
-    use super::boot_wait::{APIC_TIMER_TIMED_OUT, LIMIT, PIT_TIMED_OUT, wait};
+    use super::boot_wait::{APIC_TIMER_TIMED_OUT, CPU_START_TIMED_OUT, LIMIT, PIT_TIMED_OUT, wait};
 
     /// A counter that reads `start` first and `step` more at each reading after.
     fn counter(start: u64, step: u64) -> impl Fn() -> u64 {
@@ -419,5 +419,42 @@ mod boot_wait_tests {
                 }
             )
         );
+        assert_eq!(
+            CPU_START_TIMED_OUT,
+            format!(
+                "{}",
+                Fatal {
+                    stage: CORE,
+                    reason: "CPU start timed out"
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn the_wait_for_the_other_cpus_ends_when_the_last_has_started_or_at_the_deadline() {
+        // The boot processor's wait as `boot/smp.rs` runs it: a pause, then a look at how
+        // many CPUs have started. Three of four start, a look apart, and the fourth after
+        // seven looks.
+        let started = Cell::new(1usize);
+        let looks = Cell::new(0);
+        assert!(wait(
+            counter(5_000, 40_000_000),
+            || {
+                looks.set(looks.get() + 1);
+                if looks.get() <= 2 || looks.get() == 7 {
+                    started.set(started.get() + 1);
+                }
+            },
+            || started.get() == 4
+        ));
+        assert_eq!(looks.get(), 7);
+        // A CPU that never starts: the wait gives up once the count is above the limit.
+        let started = Cell::new(1usize);
+        assert!(!wait(
+            counter(5_000, LIMIT / 2),
+            || started.set(started.get().max(3)),
+            || started.get() == 4
+        ));
     }
 }

@@ -5,8 +5,9 @@
 //! compile this same file (`kernel/ostd-adaptation`).
 //!
 //! The PIT calibration of the TSC and the PIT calibration of the APIC timer each waited
-//! for PIT interrupts without end, which on a machine with no PIT is for ever. Each now
-//! waits through [`wait`], and says its line and powers the machine off when it gives up.
+//! for PIT interrupts without end, which on a machine with no PIT is for ever, and the
+//! boot processor waited without end for the other CPUs to start. Each now waits through
+//! [`wait`], and says its line and powers the machine off when it gives up.
 
 /// The deadline, as a count of the TSC: above 2^33, about 2 s at any rate a cloud CPU
 /// runs. It is counted without the TSC's rate, which the first of these waits is there to
@@ -18,6 +19,8 @@ pub(crate) const PIT_TIMED_OUT: &str = "moruna: fatal core: PIT calibration time
 /// What the APIC timer's calibration says when its deadline passes.
 pub(crate) const APIC_TIMER_TIMED_OUT: &str =
     "moruna: fatal core: APIC timer calibration timed out";
+/// What the boot processor says when the other CPUs have not all started by the deadline.
+pub(crate) const CPU_START_TIMED_OUT: &str = "moruna: fatal core: CPU start timed out";
 
 /// Waits for `done`, calling `pause` before each look at it, until the counter `now` has
 /// moved more than [`LIMIT`] from where the wait began. Returns whether `done` came true.
