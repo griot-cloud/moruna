@@ -83,7 +83,8 @@ class Profiles(unittest.TestCase):
 
     def test_cloud_builds_only_its_programs(self):
         cloud = package.PROGRAMS["cloud"]
-        self.assertEqual(cloud, ["moruna-node-supervisor", "devices", "virtio-blk", "virtio-net", "nvme", "gve"])
+        self.assertEqual(cloud, ["moruna-node-supervisor", "devices", "virtio-blk", "virtio-net", "nvme", "gve",
+                                 "moruna-vmbus-server"])
         for absent in ("virtio-vsock", "imagefs", "linux", "node-admission", "moruna-storage-service", "engine", "netstack"):
             self.assertNotIn(absent, cloud)
 

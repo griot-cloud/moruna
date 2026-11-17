@@ -48,8 +48,12 @@ fn prepare(console: &Console) -> Result<Prepared, String> {
         .position(|b| *b == 0)
         .ok_or("unterminated config")?;
     let usage = Usage::own().map_err(|e| format!("node usage: {}", e.name()))?;
-    let config =
-        Config::parse(&bytes[..end], usage.room()).map_err(|e| format!("config: {e:?}"))?;
+    // The core makes `root.hyperv` only on Hyper-V (ABI 2.7): elsewhere a service granted
+    // it, `vmbus`, is not started (system design 1F).
+    let hyperv = start::peek(moruna_node::HYPERV).is_some();
+    let config = Config::parse(&bytes[..end], usage.room())
+        .map_err(|e| format!("config: {e:?}"))?
+        .on_machine(hyperv);
     let process_root = take("root.process")?;
     let mut guardians = Vec::new();
     let mut control = None;

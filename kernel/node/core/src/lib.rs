@@ -9,6 +9,11 @@ pub const MAX_CONFIG: usize = 4096;
 pub const MAX_SERVICES: usize = 16;
 pub const MAX_JOB_GRANTS: usize = 24;
 
+/// The boot capability the core makes only on Hyper-V (ABI 2.7; system design 1F): a
+/// service granted it runs only on a machine where the supervisor holds it
+/// ([`Config::on_machine`]), which is how `vmbus` is started on Azure and nowhere else.
+pub const HYPERV: &str = "root.hyperv";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Service {
     pub name: String,
@@ -182,6 +187,17 @@ impl Config {
             destinations.push((&link.left, &link.left_slot));
             destinations.push((&link.right, &link.right_slot));
         }
+        // A service that runs only on Hyper-V is never one the node cannot run without.
+        let hyperv_only = |name: &str| {
+            grants
+                .iter()
+                .any(|grant| grant.service == name && grant.source == HYPERV)
+        };
+        if admission.as_deref().is_some_and(hyperv_only)
+            || bootstraps.iter().any(|(_, service)| hyperv_only(service))
+        {
+            return Err(ConfigError::Syntax);
+        }
         for (index, (service, slot)) in destinations.iter().enumerate() {
             if !services.iter().any(|s| s.name == *service)
                 || *slot == "account"
@@ -203,6 +219,28 @@ impl Config {
             bootstraps,
             admission,
         })
+    }
+
+    /// The node as this machine runs it. With `hyperv` (the supervisor holds [`HYPERV`]),
+    /// all of it; without, every service granted [`HYPERV`] is left out, with its grants
+    /// and the links to it, and the boot capabilities it would have taken are not taken.
+    /// No such service is the admission service or a bootstrap's (`parse` refuses it).
+    pub fn on_machine(mut self, hyperv: bool) -> Config {
+        if hyperv {
+            return self;
+        }
+        let left_out: Vec<String> = self
+            .grants
+            .iter()
+            .filter(|grant| grant.source == HYPERV)
+            .map(|grant| grant.service.clone())
+            .collect();
+        let kept = |name: &String| !left_out.contains(name);
+        self.services.retain(|service| kept(&service.name));
+        self.grants.retain(|grant| kept(&grant.service));
+        self.links
+            .retain(|link| kept(&link.left) && kept(&link.right));
+        self
     }
 }
 
@@ -522,6 +560,38 @@ mod tests {
             Err(ConfigError::Budget)
         );
     }
+    const CLOUD: &[u8] = b"moruna-node 1\nservice devices image.devices 4096\nservice vmbus image.vmbus 4096\nservice probe image.probe 4096\nbootstrap devices devices\ngrant devices drivers drivers\ngrant vmbus root.hyperv root.hyperv\ngrant vmbus dma dma.vmbus\nlink vmbus listener probe vmbus\n";
+
+    #[test]
+    fn a_service_granted_root_hyperv_runs_only_where_the_core_made_it() {
+        let config = Config::parse(CLOUD, 16384).unwrap();
+        // On Hyper-V the node is as written.
+        assert_eq!(config.clone().on_machine(true), config);
+        // Elsewhere `vmbus` is left out, with its two grants and its link; the rest stays.
+        let elsewhere = config.on_machine(false);
+        let names: Vec<_> = elsewhere.services.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["devices", "probe"]);
+        assert_eq!(elsewhere.grants.len(), 1);
+        assert_eq!(elsewhere.grants[0].source, "drivers");
+        assert!(elsewhere.links.is_empty());
+        assert_eq!(elsewhere.bootstraps.len(), 1);
+        // A node with no Hyper-V service is the same on every machine.
+        let plain = Config::parse(b"moruna-node 1\nservice a b 4096\n", 8192).unwrap();
+        assert_eq!(plain.clone().on_machine(false), plain);
+        assert_eq!(HYPERV, "root.hyperv");
+    }
+
+    #[test]
+    fn a_service_the_node_cannot_run_without_is_never_hyper_v_only() {
+        let bootstrap = b"moruna-node 1\nservice devices image.devices 4096\nbootstrap devices devices\ngrant devices root.hyperv root.hyperv\n";
+        assert_eq!(Config::parse(bootstrap, 8192), Err(ConfigError::Syntax));
+        let admission = b"moruna-node 1\nservice gate image.admission 4096\nbootstrap admission gate\ngrant gate root.hyperv root.hyperv\n";
+        assert_eq!(Config::parse(admission, 8192), Err(ConfigError::Syntax));
+        // root.hyperv has one owner, as every boot capability does.
+        let twice = b"moruna-node 1\nservice a b 4096\nservice c d 4096\ngrant a root.hyperv root.hyperv\ngrant c root.hyperv root.hyperv\n";
+        assert_eq!(Config::parse(twice, 8192), Err(ConfigError::Duplicate));
+    }
+
     #[test]
     fn unexpected_death_prevents_later_launch() {
         let mut l = Lifecycle::new(2);

@@ -1053,6 +1053,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-vmbus-server"
+version = "0.1.0"
+dependencies = [
+ "guid",
+ "hvdef",
+ "moruna-svc",
+ "moruna-sys",
+ "moruna-vmbus",
+ "vmbus-protocol",
+ "vmbus_core",
+ "vmbus_ring",
+]
+
+[[package]]
 name = "multiboot2"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1948,6 +1962,14 @@ dependencies = [
  "moruna-svc",
  "moruna-virtio",
  "vsock-protocol",
+]
+
+[[package]]
+name = "vmbus-protocol"
+version = "0.1.0"
+dependencies = [
+ "guid",
+ "moruna-svc",
 ]
 
 [[package]]
