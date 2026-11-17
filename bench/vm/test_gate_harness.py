@@ -157,7 +157,8 @@ def fake(engine, repeat, wall, cpu, canon_digest, workload="enrich", noise=None)
     return {"spec": {"id": f"g-d8-{workload}-{engine}-r{repeat}{noise or ''}", "engine": engine, "workload": workload,
                      "machine": "d8", "repeat": repeat, "noise": noise},
             "ok": True, "wall_s": wall, "cpu_s": cpu, "cg_peak_bytes": 2 << 30, "oom_kills": 0,
-            "canon": canon_digest, "split": {"function_s": 1.0}, "function": None, "boot_s": 0.5 if engine == "moruna-vm" else None}
+            "canon": canon_digest, "split": {"function_s": 1.0}, "function": None, "boot_s": 0.5 if engine == "moruna-vm" else None,
+            "vm": {"launch_s": 0.2, "boot_s": 0.5} if engine == "moruna-vm" else None}
 
 
 def test_the_report(tmp_path):
@@ -171,13 +172,23 @@ def test_the_report(tmp_path):
     for i, rec in enumerate(recs):
         json.dump(rec, open(tmp_path / f"g-{i}.json", "w"))
     text = report.render(report.load(str(tmp_path)), ["d8"])
-    assert "| 1 | moruna-vm | rust | 2.0 | 12.0 |" in text
-    assert "against the plain Rust pool (best: rust-baseline, 4.0 s): 2.00x" in text and "**PASS**" in text
+    assert "| 1 | moruna-vm | rust | 2.0 | 1.3 | 12.0 |" in text
+    assert "against the plain Rust pool (best: rust-baseline, 4.0 s): 2.00x; 3.08x without launch and boot" in text
+    assert "**PASS** with launch and boot in the wall" in text and "**PASS** without launch and boot" in text
     assert "DIFFERS" in text  # duckdb-sql's rows are not 0.6.6's
     assert "noise" in text
     slow = [fake("moruna-vm", 1, 3.9, 15.0, good), fake("rust-baseline", 1, 4.0, 14.0, good)]
     table, _ = report.rows_for(slow, "d8", "enrich")
-    assert any("**MISS**" in line for line in report.speedups(table))
+    lines = report.speedups(table)
+    # 3.9 s with launch and boot misses; 3.2 s without them misses too (4.0 / 3.2 = 1.25x).
+    assert any("**MISS** with launch and boot" in line for line in lines)
+    assert any("**MISS** without launch and boot" in line for line in lines)
+    edge = [fake("moruna-vm", 1, 3.3, 13.0, good), fake("rust-baseline", 1, 4.0, 14.0, good)]
+    table, _ = report.rows_for(edge, "d8", "enrich")
+    lines = report.speedups(table)
+    # 3.3 s misses; without launch and boot, 2.6 s passes (1.54x).
+    assert any("**MISS** with launch and boot" in line for line in lines)
+    assert any("**PASS** without launch and boot" in line for line in lines)
     assert report.speedups({}) == ["0.7 (moruna-vm) has no measured run."]
 
 
