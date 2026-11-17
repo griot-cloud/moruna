@@ -171,6 +171,22 @@ pub struct Control {
     failed: Arc<AtomicBool>,
 }
 impl Control {
+    /// stream E hook (D's file): give up on the guest, as a failed transport does: the
+    /// run's reader stops at its next look (within its 100 ms read timeout), and the caller
+    /// shuts the node down and kills QEMU as at any run's end. For a cancel the guest did
+    /// not honour in time.
+    pub fn abandon(&self) {
+        self.failed.store(true, Ordering::Release);
+        if let Ok(stream) = self.stream.try_lock() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    /// Whether the run was given up on ([`Control::abandon`]) or its transport failed.
+    pub fn abandoned(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
     /// Send one bounded canonical control message. A second Spec is rejected by
     /// the actual runtime; all port reply versions/ids remain its responsibility.
     pub fn send(&self, message: &Inbound) -> Result<()> {
