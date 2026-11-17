@@ -10,8 +10,8 @@ use moruna_svc::{
     Channel, Completions, Context, Decoder, Dispatcher, Handle, Handler, Outcome, Pending,
     ProtocolId, Signals, Status, Watch, Wire,
 };
-use moruna_sys::{Account, Console, ObjectType, Process, Rights, start};
-use node_protocol::{CANCELLED, MAX_JOBS, RUNNING, TERMINATED, admission};
+use moruna_sys::{Account, Console, ObjectType, Process, Rights, println, start};
+use node_protocol::{CANCELLED, CHECK_BYTES, MAX_JOBS, RUNNING, TERMINATED, admission};
 moruna_sys::main!(run);
 
 struct Job {
@@ -36,6 +36,14 @@ struct Shared {
     shutdown_done: bool,
     shutdown: Option<Pending>,
     backends: BTreeMap<String, Channel>,
+    /// The node's memory, the machine account's limit, which the supervisor sends at start
+    /// (item 1.4): a job's budget is at most this less 768 MiB (system design 3A).
+    node_memory: u64,
+    /// Where each check's account is carved from: `CHECK_BYTES` of the server's own account,
+    /// set aside at start when it serves `api`. `None`: checks are unavailable.
+    check_account: Option<Account>,
+    /// The check that holds the check account, until it is released.
+    check: Option<u64>,
 }
 struct End {
     shared: Rc<RefCell<Shared>>,
@@ -224,8 +232,19 @@ impl Handler for Session {
     fn handle(&mut self, cx: &mut Context<'_>, ordinal: u16, d: &mut Decoder<'_>) -> Outcome {
         let owner = cx.connection();
         self.owner = Some(owner);
-        if !(1..=5).contains(&ordinal) {
+        if !(1..=6).contains(&ordinal) {
             return Outcome::Status(Status::UnknownMethod);
+        }
+        if ordinal == 6 {
+            let Some((config, names, grants, services)) =
+                args::<(Handle, Vec<String>, Vec<Handle>, Vec<String>)>(d)
+            else {
+                return Outcome::Status(Status::BadMessage);
+            };
+            return match check_job(&self.shared, owner, config, names, grants, services) {
+                Ok(id) => Outcome::reply(id),
+                Err(e) => failure(e),
+            };
         }
         if ordinal == 1 {
             let Some((account, budget, config, names, grants, services)) =
@@ -233,6 +252,11 @@ impl Handler for Session {
             else {
                 return Outcome::Status(Status::BadMessage);
             };
+            // A job's budget is at most the node's memory less 768 MiB (system design 3A).
+            let node_memory = self.shared.borrow().node_memory;
+            if let Err(e) = node_protocol::admits(budget, node_memory) {
+                return failure(e);
+            }
             return match launch_job(
                 &self.shared,
                 owner,
@@ -302,6 +326,55 @@ impl Handler for Session {
         }
     }
 }
+/// Starts a check (method 6): the engine in a `CHECK_BYTES` account carved from the check
+/// account, one at a time.
+fn check_job(
+    shared: &Rc<RefCell<Shared>>,
+    owner: u64,
+    config: Handle,
+    names: Vec<String>,
+    grants: Vec<Handle>,
+    services: Vec<String>,
+) -> Result<u64, admission::Error> {
+    let account = {
+        let state = shared.borrow();
+        if state.check.is_some_and(|id| state.jobs.contains_key(&id)) {
+            return Err(admission::Error::Limit);
+        }
+        let check = state
+            .check_account
+            .as_ref()
+            .ok_or(admission::Error::Unavailable)?;
+        let rights = check.0.info().map_err(|_| admission::Error::Unavailable)?.1;
+        check
+            .0
+            .duplicate(rights)
+            .map_err(|_| admission::Error::Unavailable)?
+    };
+    let id = launch_job(
+        shared,
+        owner,
+        Launch {
+            account,
+            budget: CHECK_BYTES,
+            config,
+            names,
+            grants,
+            services,
+        },
+    )?;
+    shared.borrow_mut().check = Some(id);
+    Ok(id)
+}
+
+/// The node's memory, as the supervisor's message on `supervisor` carries it.
+fn read_node_memory(supervisor: Handle) -> Option<u64> {
+    let mut bytes = [0u8; 16];
+    let mut handles = [None];
+    let (count, carried) = Channel(supervisor).read(&mut bytes, &mut handles).ok()?;
+    moruna_node::Bootstrap::platform_memory(&bytes[..count], carried)
+}
+
 struct ControlSession(Rc<RefCell<Shared>>, Rc<authority::Authority>);
 impl Handler for ControlSession {
     fn protocol(&self) -> ProtocolId {
@@ -449,6 +522,34 @@ fn run() -> i64 {
     let Some(control) = start::take("control").map(Channel) else {
         return 1;
     };
+    let Some(node_memory) = start::take("supervisor").and_then(read_node_memory) else {
+        println!(
+            console,
+            "moruna: fatal node-admission: the node's memory is not known: the supervisor sent \
+             none on `supervisor`"
+        );
+        return 1;
+    };
+    // The check account, set aside when the server serves `api` and runs no initial job: a
+    // check runs beside a job (system design 3A).
+    let check_account = if listener.is_some() && initial.is_none() {
+        match start::take("account").map(|own| Account(own).carve_from(CHECK_BYTES, "check")) {
+            Some(Ok(account)) => Some(account),
+            Some(Err(e)) => {
+                println!(
+                    console,
+                    "node-admission: no check account: {} bytes could not be carved from its \
+                     own: {}",
+                    CHECK_BYTES,
+                    e.name()
+                );
+                None
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     let shared = Rc::new(RefCell::new(Shared {
         root,
         image,
@@ -463,6 +564,9 @@ fn run() -> i64 {
         shutdown_done: false,
         shutdown: None,
         backends: BTreeMap::new(),
+        node_memory,
+        check_account,
+        check: None,
     }));
     let Some(policy) = start::take("storage.grants") else {
         return 1;
