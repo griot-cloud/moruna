@@ -668,15 +668,13 @@ impl Stack {
                     x.gateway4 = Some(Addr(IpAddr::V4(r)));
                 }
                 x.dhcp_dns = servers.into_iter().map(|s| Addr(IpAddr::V4(s))).collect();
-                // The boot's network line, once: at the first lease the server takes.
-                // It names the gateway, so a lease that gives none has no line.
-                if !self.leased
-                    && let Some(gateway) = x.gateway4
-                {
+                // The boot's network line, once: at the first lease the server takes,
+                // with `gateway none` when the lease names no router.
+                if !self.leased {
                     self.boot.push(network_line(
                         &x.name,
                         Cidr::new(addr(IpAddress::Ipv4(cidr.address())), cidr.prefix_len()),
-                        gateway,
+                        x.gateway4,
                     ));
                 }
                 self.leased = true;

@@ -13,9 +13,11 @@
 //! closing its cards' connections so their drivers end too.
 //!
 //! In a node's boot (system design 1B and 1C) its first DHCP lease prints the network
-//! line, `moruna: network wan <address>/<prefix> gateway <address>`. With an interface
-//! set by DHCP and no lease 30 s after its start, it prints
-//! `moruna: fatal network: no DHCP lease within 30 s` and exits with failure.
+//! line, `moruna: network wan <address>/<prefix> gateway <address|none>`. With an
+//! interface set by DHCP and no lease 30 s after its start, it prints
+//! `moruna: fatal network: no DHCP lease within 30 s` and exits with failure. Whatever
+//! else ends it with failure, at its start or later, prints its `KE2 netstack: FAIL:`
+//! line and then `moruna: fatal network: <reason>`.
 
 #![no_std]
 #![no_main]
@@ -33,7 +35,11 @@ use alloc::{
 use core::cell::RefCell;
 
 use devices_protocol::directory;
-use moruna_netstack::{Card, Config, Shared, Stack, after_turn, boot::NO_LEASE, factory, parse};
+use moruna_netstack::{
+    Card, Config, Shared, Stack, after_turn,
+    boot::{NO_LEASE, fatal},
+    factory, parse,
+};
 use moruna_svc::{
     CallError, Channel, ClientCore, Completions, Console, DEADLINE_INFINITE, Decoder, Encoder,
     Handle, Memory, Rights, Signals, Timer, Watch, Wire, deadline_in, limits, now, println, random,
@@ -352,6 +358,8 @@ fn run() -> i64 {
         Ok(code) => code,
         Err(e) => {
             println!(out, "KE2 netstack: FAIL: {}", e);
+            // The node's failure line, last (system design 1B).
+            println!(out, "{}", fatal(&e));
             1
         }
     }

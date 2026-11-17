@@ -1,7 +1,8 @@
 //! The cloud node's network (system design 1B and 1C, work item 1.3), on a host: its
 //! configuration is read as written; its first DHCP lease gives the boot's network
-//! line, once; no lease is due 30 s after the server's start; and its one grant, which
-//! only listens on port 443, refuses every way out.
+//! line, once, `gateway none` when the lease names no router; no lease is due 30 s
+//! after the server's start; and its one grant, which only listens on port 443,
+//! refuses every way out.
 
 mod common;
 
@@ -164,7 +165,7 @@ fn no_lease_is_due_thirty_seconds_after_the_server_s_start() {
 }
 
 #[test]
-fn a_lease_with_no_router_has_no_network_line_and_is_still_a_lease() {
+fn a_lease_with_no_router_says_gateway_none() {
     let mut stack = cloud_stack(0);
     let mut wire = dhcp_server(false);
     let mut t = 0;
@@ -180,7 +181,10 @@ fn a_lease_with_no_router_has_no_network_line_and_is_still_a_lease() {
         "{:?}",
         stack.notes
     );
-    assert!(stack.boot.is_empty(), "{:?}", stack.boot);
+    assert_eq!(
+        stack.boot,
+        ["moruna: network wan 10.0.2.15/24 gateway none"]
+    );
     assert_eq!(stack.lease_due(0), None);
 }
 
