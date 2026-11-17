@@ -7,6 +7,8 @@
 
 pub(super) mod acpi;
 pub(super) mod apic;
+// moruna: the hypervisor at boot, and the hypercall page on Hyper-V (work item 1.8).
+pub(super) mod hyperv;
 pub(super) mod kvm_clock;
 pub(super) mod tsc;
 

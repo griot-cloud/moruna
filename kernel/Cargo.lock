@@ -951,6 +951,7 @@ dependencies = [
 name = "moruna-ostd-adaptation"
 version = "0.1.0"
 dependencies = [
+ "hvdef",
  "moruna-abi",
 ]
 
@@ -1224,6 +1225,7 @@ dependencies = [
  "bitvec",
  "fdt",
  "gimli 0.28.1",
+ "hvdef",
  "id-alloc",
  "inherit-methods-macro",
  "int-to-c-enum",

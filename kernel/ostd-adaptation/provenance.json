@@ -1,28 +1,60 @@
 {
   "added_files": [
     {
+      "path": "src/arch/x86/cpu/hypervisor.rs",
+      "sha256": "0c05df7d52462a2a66a8d7e9db05f8c2942eaf8fa1c1999c77af631f732d2387"
+    },
+    {
+      "path": "src/arch/x86/kernel/hyperv.rs",
+      "sha256": "efe76cc2f0c06a53a927b1bf07cf74d52a95e8b719c641b90876174482156c0b"
+    },
+    {
       "path": "src/arch/x86/kernel/tsc/boot_wait.rs",
       "sha256": "463331e066e00db1cc4541cccd36497ef0d0826ca19e343f522a3ee33561e7a8"
     },
     {
       "path": "src/arch/x86/power/acpi_s5.rs",
       "sha256": "8907433b12deb9d2cb5a6800d41e7ce6b6c2eb35568d5df1272256b9cc2c02b5"
+    },
+    {
+      "path": "src/arch/x86/timer/pit/presence.rs",
+      "sha256": "e932eac544c80f4697eb96762db1f7923068968429c816a0bc81a559238f8a92"
     }
   ],
   "archive_sha256": "a8f8fdb1551f65080f45f135a80ac838112cd53a5d384fc8331e9fe9e233b7cc",
   "crate": "ostd",
   "license": "MPL-2.0",
   "modified_upstream_files": {
+    "Cargo.toml": {
+      "patched_sha256": "3a2885ecc72045aae8c53cf85b9a74173b8a1be952a67b9ff6698e485eb82c34",
+      "upstream_sha256": "17e70d9dc0848d2ff5908f462d25364db713cadd479679130980bcb6c2758781"
+    },
     "src/arch/x86/cpu/context/mod.rs": {
       "patched_sha256": "0feeef19b89ebcfc0939976908b3d2c6bd86f8c398ff90e3524b17da7e3ad53e",
       "upstream_sha256": "e179934a23e419c956b28c1c3b1f067f1f6e89f79cb466f39b22e407dfcdd99f"
     },
+    "src/arch/x86/cpu/cpuid.rs": {
+      "patched_sha256": "b23782abd16d59cbdad8f85578aff01f6c501c0dc2a8f57e26bcf5281ae98fea",
+      "upstream_sha256": "250dadd9e2d1efc9bd85f64d2abeef6b080ba15c609a3ced8c1a06d12c82e8de"
+    },
+    "src/arch/x86/cpu/mod.rs": {
+      "patched_sha256": "efd181338cbdb226cd7ec9e8a9b8987a782ad93dd718eeea9ef6674653e9e585",
+      "upstream_sha256": "a6fc5ad41a81dea5212440ef8be835f0507aa0e80737b85af1bc21b6a1b22610"
+    },
+    "src/arch/x86/irq/chip/mod.rs": {
+      "patched_sha256": "a7a6964f32f6906fd541d153e7750b4ac0c9ddb959440146e1405992a147cdcc",
+      "upstream_sha256": "dc0fa48d1d848e0ee26e6e561af82dd40ca74e8c0f976f5e70c69cd01e805e45"
+    },
+    "src/arch/x86/kernel/mod.rs": {
+      "patched_sha256": "b45f9b427b06864fc17c133c71caef4e4a9ae4e4087057b3cc4201a399127a1c",
+      "upstream_sha256": "e01579a3256bbb7a3a620fdcdc63a45c80e1349b4579e10a025726c9d4d570fa"
+    },
     "src/arch/x86/kernel/tsc.rs": {
-      "patched_sha256": "8da36a640478b9a64925c1acd407fddff665055a74abdaeaa292352a57d08e29",
+      "patched_sha256": "9e698ba44cc933af169af769dc0a5906215cbeb067afef1502b71a1aa49e7eba",
       "upstream_sha256": "b8232083c633be0fec1ac54216e2cb5d54595d10876847741a6331c265783550"
     },
     "src/arch/x86/mod.rs": {
-      "patched_sha256": "29052934543d3022a53385393326d5c6de9042d5d432bab1f5339b410ebff85d",
+      "patched_sha256": "4714777f20587779e2f104ba6c3f46cf1c73a68553560ebad5584743305c2f87",
       "upstream_sha256": "660b5a76184cb63f9e92b170104e6b77bbea79a3bfc428cac47e6845c1d26af3"
     },
     "src/arch/x86/power.rs": {
@@ -30,12 +62,16 @@
       "upstream_sha256": "4af3057c7a0115ad3599299754f7142d47721b57e183ab949343f53ac71f05cb"
     },
     "src/arch/x86/timer/apic.rs": {
-      "patched_sha256": "d66b68813dcd88ca5075d4e0af3159b3cb8bfcf192939d3fbc5e1a2ec40b2af9",
+      "patched_sha256": "8f741d327c501207df0dc3bdcb3bbe4772adf50fead4a18b5993b2eefbccf7a1",
       "upstream_sha256": "42f44b7e1ac4ec158aa9d575a80980bfdcb3f34381db92be0e612e7ecb644b31"
     },
     "src/arch/x86/timer/mod.rs": {
       "patched_sha256": "e58fe2e0617f04189b3f43e4afc393e598356d6277eb2667f53c20f7b5414a27",
       "upstream_sha256": "3fdff1d350877c451d5357770594a44e10a4c2a8ebaa03a918e080e5d5ffc8c9"
+    },
+    "src/arch/x86/timer/pit.rs": {
+      "patched_sha256": "008ae0ae699d263fe65b42a959db5e80823efa24e9c471c1742982622d63635b",
+      "upstream_sha256": "bf177b86fc07116a8ff2aee47bb706493a36a0f79f66404cd42df2d462d892f5"
     },
     "src/boot/smp.rs": {
       "patched_sha256": "8d3e7a9c0194920b0dbbd2623662c7946df9006407322fbc2e63cfa55400300f",
@@ -83,7 +119,7 @@
     }
   },
   "official_archive": "https://static.crates.io/crates/ostd/ostd-0.19.0.crate",
-  "scope": "Large pages in a process's page table (a VmSpace cursor that locks at a large page's level, CursorMut::map_huge, the user page table's items restoring and unmapping a 2 MiB run, Segment::from_raw_unsized) and each CPU's number written to IA32_TSC_AUX at its start. Existing items, kernel mappings, allocation and metadata unchanged. Work item 1.2 (architecture/moruna-os-system.md, section 1B): ACPI S5 after QEMU's test exit device in arch::power::try_poweroff, and a deadline of 2^33 TSC counts on the PIT calibration waits of the TSC and of the APIC timer, each with its fatal line and a power-off; their arithmetic in the two added files, which Moruna's host tests compile. The same deadline on the boot processor's wait for the other CPUs to start (boot/smp.rs, reached through arch::boot_wait), with its fatal line and a power-off.",
+  "scope": "Large pages in a process's page table (a VmSpace cursor that locks at a large page's level, CursorMut::map_huge, the user page table's items restoring and unmapping a 2 MiB run, Segment::from_raw_unsized) and each CPU's number written to IA32_TSC_AUX at its start. Existing items, kernel mappings, allocation and metadata unchanged. Work item 1.2 (architecture/moruna-os-system.md, section 1B): ACPI S5 after QEMU's test exit device in arch::power::try_poweroff, and a deadline of 2^33 TSC counts on the PIT calibration waits of the TSC and of the APIC timer, each with its fatal line and a power-off; their arithmetic in the two added files, which Moruna's host tests compile. The same deadline on the boot processor's wait for the other CPUs to start (boot/smp.rs, reached through arch::boot_wait), with its fatal line and a power-off. Work item 1.8 (section 1F): Hyper-V or KVM found and named on the console, the TSC's rate from Hyper-V's MSR after kvmclock and CPUID leaf 0x15 and the APIC timer's from Hyper-V's, the PIT looked for before use, the PIC set up only where it answers its probe, and on Hyper-V the guest OS ID and the hypercall page (one frame, mapped read and execute in kernel mode only); hvdef added as a dependency for the x86 kernel target; the decisions in two added files, which Moruna's host tests compile.",
   "upstream_files": "upstream-files.json",
   "vendor_path": "../vendor/ostd-0.19.0",
   "version": "0.19.0"

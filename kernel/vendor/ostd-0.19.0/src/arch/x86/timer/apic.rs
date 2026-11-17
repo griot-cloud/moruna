@@ -112,6 +112,28 @@ fn init_deadline_mode_config() {
 fn init_periodic_mode_config() {
     info!("Enable APIC periodic mode");
 
+    // moruna: on Hyper-V the timer's rate is `HV_X64_MSR_APIC_FREQUENCY`'s, and nothing is
+    // calibrated (Moruna's system design, section 1F, "Clock rates"; work item 1.8).
+    // Elsewhere it is calibrated against the PIT as before, once the PIT is found to be
+    // there: a machine with none says so and powers off at once.
+    if let Some(init_count) = crate::arch::cpu::hypervisor::apic_timer_count(
+        &crate::arch::kernel::hyperv::ThisCpu,
+        TIMER_FREQ,
+    ) {
+        info!(
+            "APIC timer: init {:#x} from Hyper-V's frequency",
+            init_count
+        );
+        CONFIG.call_once(|| Config::PeriodicMode {
+            init_count: u64::from(init_count),
+        });
+        return;
+    }
+    if !super::pit::is_present() {
+        crate::early_println!("{}", super::pit::presence::NO_PIT_FOR_APIC_TIMER);
+        crate::power::poweroff(crate::power::ExitCode::Failure);
+    }
+
     // Allocate IRQ
     let mut irq = IrqLine::alloc().unwrap();
     irq.on_active(pit_callback);

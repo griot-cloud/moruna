@@ -461,10 +461,17 @@ fn table() -> Result<Table, String> {
 }
 
 /// Walks the ECAM window: every function, with BARs sized for those the table names.
-fn enumerate(ecam: &Handle, table: &Table) -> Result<Vec<Function>, String> {
+/// An empty window, which the core gives when the firmware describes no PCI
+/// configuration space (`architecture/moruna-os-system.md`, section 1F), holds none: the
+/// device manager says so in one line and serves with no driver.
+fn enumerate(out: &Console, ecam: &Handle, table: &Table) -> Result<Vec<Function>, String> {
     let info = ecam
         .resource_info()
         .map_err(|e| format!("resource_info of the ECAM: {}", e.name()))?;
+    if info.len == 0 {
+        println!(out, "{}", moruna_abi::boot_line::NO_PCI_BUS);
+        return Ok(Vec::new());
+    }
     let window = DeviceMemory::create(ecam, info.base, info.len)
         .map_err(|e| format!("claiming the ECAM window: {}", e.name()))?;
     let mapping = window
@@ -614,7 +621,7 @@ fn serve(out: &Console) -> Result<String, String> {
         images.push((program.to_string(), image));
     }
     let roots = roots(&supervisor)?;
-    let functions = enumerate(&roots.ecam, &table)?;
+    let functions = enumerate(out, &roots.ecam, &table)?;
     let mut devices: Vec<Device> = Vec::new();
     let mut counts: Vec<(String, u32)> = Vec::new();
     let mut msi_next = 0;

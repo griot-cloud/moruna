@@ -575,6 +575,30 @@ pub mod resource_range {
     pub const MSI_END: u64 = 224;
     /// PCI requester ids (`bus << 8 | device << 3 | function`) a DMA resource may cover.
     pub const DMA_END: u64 = 1 << 16;
+
+    /// The bytes of one bus's configuration space in an ECAM window (PCI Express Base
+    /// Specification, "Enhanced Configuration Access Mechanism"): 32 devices of 8 functions
+    /// of 4 KiB.
+    pub const ECAM_BUS_BYTES: u64 = 1 << 20;
+
+    /// What `root.ecam` covers on a machine whose firmware describes no PCI configuration
+    /// space (no ACPI MCFG), as a Hyper-V Generation 2 machine has none
+    /// (`architecture/moruna-os-system.md`, section 1F, "No PCI bus"): nothing. A device
+    /// manager given it finds no PCI function.
+    pub const NO_ECAM: core::ops::Range<u64> = 0..0;
+
+    /// What `root.ecam` covers on a machine whose firmware describes PCI configuration
+    /// space at `base` for buses `bus_start` to `bus_end` (the MCFG's first segment): from
+    /// its first bus to the end of its last. `None` when the buses run backwards, or the
+    /// window would wrap past the end of a 64-bit address.
+    pub fn ecam(base: u64, bus_start: u8, bus_end: u8) -> Option<core::ops::Range<u64>> {
+        if bus_end < bus_start {
+            return None;
+        }
+        let start = base.checked_add(u64::from(bus_start) * ECAM_BUS_BYTES)?;
+        let end = base.checked_add((u64::from(bus_end) + 1) * ECAM_BUS_BYTES)?;
+        Some(start..end)
+    }
 }
 
 /// The flags of `memory_create` (ABI 1.2; zero is the call of ABI 1.0).
@@ -1338,6 +1362,31 @@ mod tests {
         assert_eq!(limits::PIN_MAX_PAGES, 65536);
         assert_eq!(resource_range::MSI_END, 224);
         assert_eq!(resource_range::DMA_END, 65536);
+    }
+
+    #[test]
+    fn root_ecam_covers_the_mcfgs_buses_or_nothing() {
+        use resource_range::{ECAM_BUS_BYTES, NO_ECAM, ecam};
+        // QEMU's q35: one segment at 0xb000_0000, buses 0 to 255, 256 MiB.
+        assert_eq!(ecam(0xb000_0000, 0, 255), Some(0xb000_0000..0xc000_0000));
+        // A segment whose first bus is not 0: the window starts at that bus's space.
+        assert_eq!(
+            ecam(0xe000_0000, 2, 3),
+            Some(0xe000_0000 + 2 * ECAM_BUS_BYTES..0xe000_0000 + 4 * ECAM_BUS_BYTES)
+        );
+        assert_eq!(ecam(0, 7, 7), Some(7 << 20..8 << 20));
+        // Buses that run backwards describe nothing to cover.
+        assert_eq!(ecam(0xb000_0000, 1, 0), None);
+        // A window that would wrap past the end of a 64-bit address.
+        assert_eq!(ecam(u64::MAX - ECAM_BUS_BYTES, 0, 1), None);
+        assert_eq!(ecam(u64::MAX - ECAM_BUS_BYTES + 1, 0, 0), None);
+        assert_eq!(
+            ecam(u64::MAX - ECAM_BUS_BYTES, 0, 0),
+            Some(u64::MAX - ECAM_BUS_BYTES..u64::MAX)
+        );
+        // No MCFG: the empty range, which a device manager can claim no window of.
+        assert!(NO_ECAM.is_empty());
+        assert_eq!(NO_ECAM.end - NO_ECAM.start, 0);
     }
 
     #[test]

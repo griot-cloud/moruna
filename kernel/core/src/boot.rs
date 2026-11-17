@@ -29,6 +29,7 @@ use moruna_abi::{
     ABI_MAJOR, ABI_MINOR, ResourceKind,
     boot_line::{self, Core, Fatal, Panic},
     manifest::{Manifest, Source, source_rights},
+    resource_range,
 };
 use moruna_loader::cpio;
 use ostd::{
@@ -157,18 +158,18 @@ fn machine_account() -> Result<Arc<Account>, String> {
 }
 
 /// The PCI configuration space the firmware describes (ACPI MCFG, its first segment),
-/// from its first bus to the end of its last: the range `root.ecam` covers.
+/// from its first bus to the end of its last: the range `root.ecam` covers. A machine
+/// whose firmware describes none, as a Hyper-V Generation 2 machine (the system design,
+/// section 1F), has no PCI bus: `root.ecam` covers nothing, and the boot goes on.
 fn ecam() -> Result<core::ops::Range<u64>, String> {
-    let region = ostd::arch::kernel::ACPI_INFO
+    let Some(region) = ostd::arch::kernel::ACPI_INFO
         .get()
         .and_then(|info| info.pci_ecam_region.as_ref())
-        .ok_or("root.ecam: the firmware describes no PCI configuration space (ACPI MCFG)")?;
-    let start = region.base_address + ((region.bus_start as u64) << 20);
-    let end = region.base_address + ((region.bus_end as u64 + 1) << 20);
-    if end <= start {
-        return Err(String::from("root.ecam: the MCFG's bus range is empty"));
-    }
-    Ok(start..end)
+    else {
+        return Ok(resource_range::NO_ECAM);
+    };
+    resource_range::ecam(region.base_address, region.bus_start, region.bus_end)
+        .ok_or_else(|| String::from("root.ecam: the MCFG's bus range is empty"))
 }
 
 fn start_manifest(machine: &Arc<Account>) -> Result<usize, String> {

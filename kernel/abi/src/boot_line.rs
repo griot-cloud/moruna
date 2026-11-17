@@ -32,6 +32,27 @@ impl Display for Core<'_> {
     }
 }
 
+/// The hypervisor the core found (`architecture/moruna-os-system.md`, section 1F; work item
+/// 1.8): `moruna: hypervisor <name>`, [`HYPERV`] or [`KVM`]. The core says nothing on a
+/// machine with no hypervisor.
+pub struct Hypervisor<'a>(pub &'a str);
+
+/// Microsoft's hypervisor, found by its interface signature `Hv#1`.
+pub const HYPERV: &str = "hyperv";
+/// KVM, found by its signature `KVMKVMKVM`.
+pub const KVM: &str = "kvm";
+
+impl Display for Hypervisor<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "moruna: hypervisor {}", self.0)
+    }
+}
+
+/// What `devices` says when `root.ecam` covers nothing, as on a machine whose firmware
+/// describes no PCI configuration space (section 1F, "No PCI bus"). It then serves with no
+/// driver.
+pub const NO_PCI_BUS: &str = "devices: no PCI bus on this machine";
+
 /// A failure's line: `moruna: fatal <stage>: <reason>`.
 ///
 /// It is always one line: a line break in the reason is written as a space.
@@ -104,6 +125,21 @@ mod tests {
             memory: 0,
         };
         assert_eq!(format!("{line}"), "moruna: core 0.7.0 cpus=1 memory=0");
+    }
+
+    #[test]
+    fn the_hypervisor_line_names_the_hypervisor_found() {
+        assert_eq!(
+            format!("{}", Hypervisor(HYPERV)),
+            "moruna: hypervisor hyperv"
+        );
+        assert_eq!(format!("{}", Hypervisor(KVM)), "moruna: hypervisor kvm");
+    }
+
+    #[test]
+    fn devices_says_so_when_there_is_no_pci_bus() {
+        assert_eq!(NO_PCI_BUS, "devices: no PCI bus on this machine");
+        assert!(!NO_PCI_BUS.contains('\n'));
     }
 
     #[test]
