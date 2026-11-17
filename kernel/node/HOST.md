@@ -154,11 +154,12 @@ worktree is `/src/.claude/worktrees/<name>`. Run commands with
 `container exec moruna-arm bash -lc 'cd /src/.claude/worktrees/<name> && ...'`. `git` does not
 work inside it (a worktree's `.git` names a Mac path): commit on the Mac.
 
-What it holds (set up for items 0.1 and 1.1, 2026-11-17):
+What it holds (set up for items 0.1, 1.1 and 1.5, 2026-11-17):
 
 | What | Where | For |
 | --- | --- | --- |
-| QEMU 10.2.1 (CI's pin), vhost-user | `/opt/qemu/bin`, **not on `PATH`**: `export PATH=/opt/qemu/bin:$PATH` | every boot |
+| QEMU 10.2.1 (CI's pin), vhost-user | `/opt/qemu/bin`, **not on `PATH`**: `export PATH=/opt/qemu/bin:$PATH`. Built as CI builds it, `--without-default-features`, so it has no `vpc` (VHD) driver: `qemu-system-x86_64 -drive format=help` lists what it reads | every boot |
+| `qemu-img` 8.2.2 | package `qemu-utils` (Ubuntu's `1:8.2.2+ds-0ubuntu1.18`), `/usr/bin/qemu-img`, on `PATH` | `package.py --formats` |
 | QEMU's UEFI firmware (edk2) | `/opt/qemu/share/qemu/edk2-x86_64-code.fd`, vars template `edk2-i386-vars.fd` | `uefi-boot.sh` finds them beside `qemu-system-x86_64` |
 | GRUB for x86_64 EFI | package `grub-efi-amd64-bin:amd64`, modules in `/usr/lib/grub/x86_64-efi`; `grub-mkstandalone` from `grub-common` | `package.py` |
 | `sgdisk`, mtools | packages `gdisk`, `mtools` | `package.py` |
@@ -174,7 +175,7 @@ container the same way:
 ```
 apt-get update
 apt-get install -y --no-install-recommends gcc-x86-64-linux-gnu libc6-dev-amd64-cross \
-  musl-dev:amd64 grub-efi-amd64-bin:amd64 gdisk mtools
+  musl-dev:amd64 grub-efi-amd64-bin:amd64 gdisk mtools qemu-utils
 ```
 
 CI's boot image (`kernel/tools/build.sh`) also needs python:3.14-slim's OCI layout:
@@ -222,12 +223,8 @@ Each cloud takes its own format, and every one is made from the one raw disk (sy
 | `vhd` | `moruna-node.vhd` | `qemu-img convert -f raw -O vpc -o subformat=fixed,force_size` | Azure |
 
 - **`qemu-img` must be on `PATH`** for `qcow2` or `vhd`: the build refuses to start without it.
-  **`moruna-arm` has none** (verified 2026-11-17 with `command -v qemu-img` and a search of its
-  whole filesystem): `/opt/qemu/bin` holds `qemu-system-x86_64` alone, QEMU's tools not having
-  been installed with it. Until one is put there, `--formats qcow2 vhd` cannot run in it.
-  Ubuntu's `qemu-utils` package (QEMU 8.2.2's `qemu-img`, 2.1 MB with three small libraries) is
-  one source; QEMU 10.2.1's own tools, built from its source, are the other. Which is the PM's
-  to say.
+  In `moruna-arm` it is Ubuntu's, 8.2.2 (the table above): the image formats are stable across
+  QEMU's versions, so the distribution's tool is the one used (PM, 2026-11-17).
 - **The VHD is fixed-size:** the raw disk rounded up to a whole MiB, then the VHD's 512-byte
   footer, so the file is a whole number of MiB and 512 bytes. `package.py`'s raw disk is a whole
   MiB already (its size is `(esp_mib + 4) * MIB`), so the VHD holds exactly the raw disk.
@@ -235,6 +232,9 @@ Each cloud takes its own format, and every one is made from the one raw disk (sy
 - **Boot one** with `kernel/node/tools/uefi-boot.sh OUT CPUS FORMAT`, where `FORMAT` is `raw`
   (the default when it is left out), `qcow2` or `vhd`. The machine is the same; only the boot
   disk's file and the QEMU driver that reads it change (`vpc` for the VHD).
+- **`vhd` cannot boot in `moruna-arm` today:** its QEMU has no `vpc` driver (the table above),
+  so QEMU stops at once with `Unknown driver 'vpc'` and `uefi-boot.sh` exits 1 (item 1.5,
+  2026-11-17). `raw` and `qcow2` boot. How the VHD is booted here is open with the PM.
 - **The test** is `python3 -I kernel/node/tools/test_formats.py`. It converts small stand-in
   disks and runs `uefi-boot.sh` against a stand-in for QEMU, so it builds nothing, boots nothing
   and needs no lock. It needs `qemu-img` on `PATH` and a bash with `EPOCHREALTIME` (5.0 or
