@@ -697,13 +697,19 @@ There are two kinds:
   int  moruna_open(struct moruna_task **task);
   int  moruna_next(struct moruna_task *task, struct ArrowArray *out, struct ArrowSchema *schema); /* 1 batch, 0 end, <0 error */
   int  moruna_emit(struct moruna_task *task, struct ArrowArray *batch, struct ArrowSchema *schema); /* takes ownership */
-  void moruna_log(struct moruna_task *task, int level, const char *line);
+  void moruna_log(struct moruna_task *task, const char *line);
   void moruna_error(struct moruna_task *task, const char *message);
   int  moruna_finish(struct moruna_task *task);
   ```
 
-- **A batch from `moruna_next`** stays valid until its `release` is called. The window is given
-  back then.
+- **A batch from `moruna_next`** stays valid until its `release` is called; its window goes back
+  at the next `moruna_next` or `moruna_finish`, so an answer emitted after the release still answers
+  it. A failed call returns the negated exit code (`MORUNA_E_…`, as 5A's); `moruna_emit` takes
+  ownership of both structs, and may be called with no batch held (an aggregate's answer at the end;
+  5A has the same, an end hook).
+- **C needs a libc, and it is relibc** (Redox's, MIT, in Rust) with a Moruna platform layer over
+  `moruna-sys` and std, vendored at a pinned commit like OSTD. A minimal runtime breaks on the first
+  real C library; musl would need an in-process Linux syscall layer. Item 5.2b.
 - **C, C++ and Zig** link the library into a static native function. Go and others follow when
   someone needs them; nothing in the header is tied to C.
 
