@@ -197,6 +197,17 @@ impl Packaged {
             Packaged::Task(_) => {}
         }
     }
+
+    // stream P: what a native stage's tasks did, in the run's report.
+    /// The report's note of what the stage's tasks did (an image stage on the rings): each
+    /// task's batches, CPU and account, and the most that held a batch at once.
+    pub fn task_note(&self) -> Option<String> {
+        match self {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::Task(k) => k.note(),
+            _ => None,
+        }
+    }
 }
 
 /// Open the package at `path`, check `pin` against it when one is given (PK-I2), and make its

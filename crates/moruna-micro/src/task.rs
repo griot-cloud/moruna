@@ -285,6 +285,8 @@ pub struct ImageTask {
     native: Option<Arc<[u8]>>,
     /// How many of the stage's tasks hold a batch now, and the most that ever did.
     busy: Arc<Busy>,
+    /// What each task did, by instance, once it ended at the stage's end: the run's report.
+    figures: Mutex<Vec<Option<layout::TaskFigures>>>,
 }
 
 /// A ring stage's tasks holding batches: now, and the most at once.
@@ -368,6 +370,7 @@ impl ImageTask {
             rings,
             native: None,
             busy: Arc::default(),
+            figures: Mutex::new(vec![None; processes]),
         })
     }
 
@@ -492,6 +495,28 @@ impl ImageTask {
         }
     }
 
+    /// What the stage's tasks did, for the run's report (ring mode): each task's batches, CPU
+    /// and account, and the most that held a batch at once. `None` for a stage on descriptors.
+    pub fn note(&self) -> Option<String> {
+        self.rings.then(|| {
+            layout::stage_note(
+                &self.name,
+                &lock(&self.figures),
+                self.busy.peak.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+    }
+
+    /// The CPU the stage places its task `instance` on (ring mode): one task to a CPU.
+    fn cpu_of(&self, instance: usize) -> Option<u32> {
+        self.rings.then(|| {
+            layout::task_cpu(
+                instance,
+                crate::start::kernel().map_or(1, |kernel| kernel.cpus),
+            )
+        })
+    }
+
     /// The memory the stage holds outside the engine's process: its task's account.
     pub fn outside(&self) -> Arc<dyn moruna_kernel::OutsideMemory> {
         Arc::clone(&self.outside) as Arc<dyn moruna_kernel::OutsideMemory>
@@ -544,7 +569,12 @@ impl ImageTask {
                     windows: sizes.windows,
                     window_bytes: sizes.window,
                 })
-                .map(|(task, port)| (task, Some(port)))
+                .and_then(|(task, port)| {
+                    // Each task on a CPU of its own: the kernel keeps a thread where it first
+                    // ran, and tasks started while the others slept all went to one.
+                    plane.place(task, self.cpu_of(ctx.instance))?;
+                    Ok((task, Some(port)))
+                })
         } else {
             plane.open(Shape {
                 inputs: 1,
@@ -587,7 +617,7 @@ impl ImageTask {
         .map_err(|e| kernel_error(format!("image `{name}`: hello to the personality: {e:?}")))?;
         // The 2.0 handshake rejects the old unaccounted 1.x wire layouts before
         // any run_plane request is sent. Every 2.0 method is available at minor 0.
-        let (account, kept, limit) = self.carve(ceiling)?;
+        let (account, kept, limit) = self.carve(ceiling, false)?;
         let mut body = Encoder::new();
         let plane_arg = LinuxPlane {
             assets: self
@@ -633,7 +663,7 @@ impl ImageTask {
 
     /// The task's account, carved out of the engine's (SDD 30 f.11): the account, a read-only
     /// handle to it the stage keeps, and its limit.
-    fn carve(&self, ceiling: u64) -> Result<(Account, Account, u64)> {
+    fn carve(&self, ceiling: u64, native: bool) -> Result<(Account, Account, u64)> {
         let name = &self.name;
         let room = Usage::own()
             .map_err(|e| {
@@ -643,7 +673,12 @@ impl ImageTask {
                 ))
             })?
             .room();
-        let limit = layout::task_limit(ceiling, room).ok_or_else(|| {
+        let limit = if native {
+            layout::native_task_limit(ceiling, room)
+        } else {
+            layout::task_limit(ceiling, room)
+        };
+        let limit = limit.ok_or_else(|| {
             kernel_error(format!(
                 "image `{name}`: the engine's account has {room} bytes left, too few for a task's \
                  account of at least {} bytes beside the engine's own half",
@@ -689,7 +724,7 @@ impl ImageTask {
         };
         let resource =
             process_resource().map_err(|e| kernel_error(format!("image `{name}`: {e}")))?;
-        let (account, kept, limit) = self.carve(ceiling)?;
+        let (account, kept, limit) = self.carve(ceiling, true)?;
         let process =
             moruna_svc::Process::create_in(resource, &layout::account_name(name), &account.0)
                 .map_err(|e| fail("making its process", e))?;
@@ -759,6 +794,8 @@ impl ImageTask {
             schema: None,
             busy: Arc::clone(&self.busy),
             deferred: 0,
+            instance: ctx.instance,
+            cpu: self.cpu_of(ctx.instance),
         }
     }
 }
@@ -815,6 +852,9 @@ pub struct TaskState {
     busy: Arc<Busy>,
     /// Answers the stage gave as batches of no rows, the answers coming later.
     deferred: u64,
+    /// Which of the stage's tasks it is, and the CPU it was placed on.
+    instance: usize,
+    cpu: Option<u32>,
 }
 
 impl Drop for TaskState {
@@ -1716,9 +1756,24 @@ impl Kernel for ImageTask {
                             bells = c.bells,
                             zeroed = st.plane.plane.zeroed(),
                             deferred = st.deferred,
+                            cpu = ?st.cpu,
                             busy_peak = self.busy.peak.load(std::sync::atomic::Ordering::Relaxed),
                             "image task exited 0"
                         );
+                        let (peak, limit) = match st.memory.usage() {
+                            Some(Ok(u)) => (u.peak, u.limit),
+                            _ => (0, 0),
+                        };
+                        if let Some(slot) = lock(&self.figures).get_mut(st.instance) {
+                            *slot = Some(layout::TaskFigures {
+                                batches: st.sent,
+                                records: st.received,
+                                deferred: st.deferred,
+                                cpu: st.cpu,
+                                peak,
+                                limit,
+                            });
+                        }
                         Ok(rest)
                     }
                     _ => Err(st.failed("it ended")),

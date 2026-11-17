@@ -626,8 +626,9 @@ impl Rings {
         Ok(Shared::slot(addr, len))
     }
 
-    /// Maps the region (slot 0) and the rings object (slot 1) once and attaches. Takes both
-    /// slots of `plane`, so nothing else of the task can unmap them.
+    /// Maps the region (slot 0) and the rings object (slot 1) once and attaches, and pins the
+    /// thread on the CPU the engine placed the task on, if it placed it. Takes both slots of
+    /// `plane`, so nothing else of the task can unmap them.
     pub fn attach(plane: &Plane) -> Result<Rings> {
         if !(plane.slot(0) && plane.slot(1)) {
             return Err(Error::BadState);
@@ -635,6 +636,12 @@ impl Rings {
         let region = Rings::map(0)?;
         let rings = Rings::map(1)?;
         let half = ring::Task::attach(&rings).map_err(broken)?;
+        // The CPU the engine placed the task on: the kernel keeps a thread where it first
+        // ran, so the stage's tasks spread only when each is placed. A CPU the kernel does not
+        // have leaves the thread where it is.
+        if let Some(cpu) = half.place {
+            let _ = crate::datapath::pin_current_thread(Some(cpu));
+        }
         Ok(Rings {
             region,
             rings,

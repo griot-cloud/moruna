@@ -765,3 +765,45 @@ fn p_the_engine_does_not_sleep_through_a_ring_after_its_look() {
     assert!(e.noted(&s), "the note is read");
     assert!(!e.noted(&s), "once");
 }
+
+/// Stream P: the engine places a ring task on a CPU before it starts; the task reads where as it
+/// attaches, and a task the engine did not place, or a rings object formatted again, reads none.
+#[test]
+fn p_a_ring_task_reads_the_cpu_the_engine_placed_it_on() {
+    use crate::ring::{Engine, Geometry, Mode, Shared, Task};
+    use core::cell::RefCell;
+
+    struct Words(RefCell<Vec<u8>>);
+    impl Shared for Words {
+        fn load(&self, at: usize) -> u64 {
+            let b = self.0.borrow();
+            u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+        }
+        fn store(&self, at: usize, value: u64) {
+            self.0.borrow_mut()[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        fn fence(&self) {}
+    }
+
+    let g = Geometry::new(1 << 20, 2, 1 << 20).unwrap();
+    let words = Words(RefCell::new(vec![0xff; g.windows_at() as usize]));
+    let engine = Engine::format(&words, g, Mode::Protect, 0);
+    assert_eq!(Task::attach(&words).unwrap().place, None, "not placed");
+    engine.place(&words, Some(3));
+    assert_eq!(Task::attach(&words).unwrap().place, Some(3));
+    engine.place(&words, Some(0));
+    assert_eq!(
+        Task::attach(&words).unwrap().place,
+        Some(0),
+        "CPU 0 is a place too"
+    );
+    engine.place(&words, None);
+    assert_eq!(Task::attach(&words).unwrap().place, None);
+    engine.place(&words, Some(5));
+    let _ = Engine::format(&words, g, Mode::Protect, 1);
+    assert_eq!(
+        Task::attach(&words).unwrap().place,
+        None,
+        "a new object is placed anew"
+    );
+}

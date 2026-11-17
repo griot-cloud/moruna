@@ -1057,6 +1057,8 @@ fn drive(
     let (view, shutdown_notes) = started.unwind();
 
     notes.extend(shutdown_notes);
+    // stream P: each native stage's tasks, once they have ended (E's gate shows them).
+    notes.extend(packaged.iter().filter_map(|stage| stage.task_note()));
     // Stream C (data OS, C3): a completed run's outputs are one layer on `disk.out`.
     let layer_failure = data_os::finish(
         granted.as_ref(),

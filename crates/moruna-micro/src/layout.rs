@@ -25,6 +25,70 @@ pub fn task_limit(ceiling: u64, room: u64) -> Option<u64> {
     (limit >= TASK_MIN).then_some(limit)
 }
 
+/// The most a native task's account is carved at (`abi: moruna`): what such a task holds is
+/// its process, its image and its heap; its batches and records are in the engine's plane, not
+/// in its account. A stage's whole share (the run's `child_share`) was carved for each task,
+/// and the stage's outside memory counts every carved limit as held: eight Score tasks at
+/// 20.5 GiB put 14.8 GiB on the engine's samples at stage start, near the controller's
+/// memory trip (the NYC gate, 2026-11-17).
+pub const NATIVE_TASK_MAX: u64 = 512 << 20;
+
+// Eight native tasks are counted at no more than 4 GiB together.
+const _: () = assert!(8 * NATIVE_TASK_MAX <= 4 << 30);
+
+/// [`task_limit`] for a native task: also at most [`NATIVE_TASK_MAX`].
+pub fn native_task_limit(ceiling: u64, room: u64) -> Option<u64> {
+    task_limit(ceiling.min(NATIVE_TASK_MAX), room)
+}
+
+/// The CPU a stage's task `instance` is placed on, of `cpus`: one after the instance, so the
+/// first CPU, where the engine's first worker deals the stage's batches, takes a task last.
+pub fn task_cpu(instance: usize, cpus: usize) -> u32 {
+    u32::try_from((instance + 1) % cpus.max(1)).unwrap_or(0)
+}
+
+/// What one task of a stage did, for the run's report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TaskFigures {
+    /// Batches it was given.
+    pub batches: u64,
+    /// Records it put.
+    pub records: u64,
+    /// Answers the stage gave as batches of no rows, the answer coming later.
+    pub deferred: u64,
+    /// The CPU it was placed on.
+    pub cpu: Option<u32>,
+    /// Its account's peak, in bytes.
+    pub peak: u64,
+    /// Its account's limit, in bytes.
+    pub limit: u64,
+}
+
+/// The run report's note of a ring stage's tasks: each one's batches, CPU and account, and
+/// the most of them that held a batch at once (`busy_peak`). Tasks with no figures (not ended
+/// as the stage ended) are said as such.
+pub fn stage_note(stage: &str, tasks: &[Option<TaskFigures>], busy_peak: usize) -> String {
+    let mut note = format!(
+        "image `{stage}`: {} tasks, busy_peak {busy_peak} (the most holding a batch at once)",
+        tasks.len()
+    );
+    for (i, t) in tasks.iter().enumerate() {
+        match t {
+            Some(t) => note.push_str(&format!(
+                "; task {i}: {} batches, {} records, {} deferred, cpu {}, account peak {} of {} bytes",
+                t.batches,
+                t.records,
+                t.deferred,
+                t.cpu.map_or_else(|| "any".to_string(), |c| c.to_string()),
+                t.peak,
+                t.limit
+            )),
+            None => note.push_str(&format!("; task {i}: no figures")),
+        }
+    }
+    note
+}
+
 /// The name of a stage's task's account: `task.` and the stage's name, in the kernel's
 /// alphabet (`[a-z0-9._-]`, other bytes as `-`), at most 32 bytes.
 pub fn account_name(stage: &str) -> String {
@@ -452,6 +516,58 @@ mod tests {
             assert!(s.window >= RING_MIN && s.region >= RING_MIN);
             assert_eq!((s.region % PAGE, s.window % PAGE), (0, 0));
         }
+    }
+
+    #[test]
+    fn p_a_native_task_s_account_is_its_process_s_not_the_stage_s_share() {
+        const MIB: u64 = 1 << 20;
+        // A share of 1.85 GiB and plenty of room: the native task is carved at its most.
+        assert_eq!(
+            native_task_limit(1894 * MIB, 32 << 30),
+            Some(NATIVE_TASK_MAX)
+        );
+        assert_eq!(task_limit(1894 * MIB, 32 << 30), Some(1894 * MIB));
+        // A smaller share, or less room, is what it is.
+        assert_eq!(native_task_limit(100 * MIB, 32 << 30), Some(100 * MIB));
+        assert_eq!(native_task_limit(1 << 30, 300 * MIB), Some(150 * MIB));
+        assert_eq!(native_task_limit(1 << 30, 20 * MIB), None, "under TASK_MIN");
+    }
+
+    #[test]
+    fn p_a_stage_s_tasks_go_one_to_a_cpu_the_dealer_s_last() {
+        let cpus: Vec<u32> = (0..8).map(|i| task_cpu(i, 8)).collect();
+        assert_eq!(cpus, [1, 2, 3, 4, 5, 6, 7, 0]);
+        assert_eq!(task_cpu(8, 8), 1, "more tasks than CPUs go round again");
+        assert_eq!(task_cpu(0, 1), 0);
+        assert_eq!(task_cpu(3, 0), 0, "no CPU count: the first");
+    }
+
+    #[test]
+    fn p_the_report_says_each_task_s_batches_cpu_and_account() {
+        let t = TaskFigures {
+            batches: 12,
+            records: 13,
+            deferred: 2,
+            cpu: Some(3),
+            peak: 40 << 20,
+            limit: NATIVE_TASK_MAX,
+        };
+        let note = stage_note("score", &[Some(t), None, Some(TaskFigures::default())], 2);
+        assert!(
+            note.starts_with("image `score`: 3 tasks, busy_peak 2"),
+            "{note}"
+        );
+        assert!(
+            note.contains(
+                "task 0: 12 batches, 13 records, 2 deferred, cpu 3, account peak 41943040 of 536870912 bytes"
+            ),
+            "{note}"
+        );
+        assert!(note.contains("task 1: no figures"), "{note}");
+        assert!(
+            note.contains("task 2: 0 batches, 0 records, 0 deferred, cpu any"),
+            "{note}"
+        );
     }
 
     #[test]
