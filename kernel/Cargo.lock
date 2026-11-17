@@ -331,6 +331,7 @@ name = "devices"
 version = "0.1.0"
 dependencies = [
  "devices-protocol",
+ "moruna-abi",
  "moruna-driver-table",
  "moruna-mmio",
  "moruna-node",
