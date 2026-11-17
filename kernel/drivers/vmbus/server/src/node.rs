@@ -207,9 +207,9 @@ fn serve(console: &Console) -> Result<(), String> {
     let events = root
         .events()
         .map_err(|e| format!("event flags: {}", e.name()))?;
-    let interrupt = root
-        .interrupt()
-        .map_err(|e| format!("SINT 2: {}", e.name()))?;
+    // SINT 2's interrupt, and CPU 0's VP index, which the contact and every channel
+    // target.
+    let sint = root.sint().map_err(|e| format!("SINT 2: {}", e.name()))?;
     let said = console
         .0
         .duplicate(Rights::WRITE)
@@ -224,11 +224,11 @@ fn serve(console: &Console) -> Result<(), String> {
         wakes: BTreeMap::new(),
         next: 0,
     };
-    let vmbus = Rc::new(RefCell::new(Vmbus::new(node)));
+    let vmbus = Rc::new(RefCell::new(Vmbus::new(node, sint.vp_index)));
     let mut dispatcher = Dispatcher::new();
     dispatcher
         .watch(Box::new(Sint {
-            interrupt,
+            interrupt: sint.interrupt,
             vmbus: vmbus.clone(),
         }))
         .map_err(|e| format!("watch: {}", e.name()))?;

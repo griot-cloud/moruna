@@ -161,12 +161,18 @@ impl Host for Node {
 
 type Shared = Rc<RefCell<Vmbus<Node>>>;
 
+/// The process over the node `hv` is part of, targeting the VP the host expects.
+fn on(hv: FakeHost) -> Vmbus<Node> {
+    let vp = hv.target_vp;
+    Vmbus::new(Node::new(hv), vp)
+}
+
 /// The process over a host that offers a network card and a disk, as channels 1 and 2,
 /// with contact made.
 fn connected() -> Shared {
     let mut hv = FakeHost::new();
     hv.devices = vec![(NIC, instance(1)), (SCSI, instance(2))];
-    let vmbus = Rc::new(RefCell::new(Vmbus::new(Node::new(hv))));
+    let vmbus = Rc::new(RefCell::new(on(hv)));
     vmbus.borrow_mut().start();
     vmbus
 }
@@ -234,10 +240,43 @@ fn contact_is_made_at_start_and_every_offer_is_said_on_the_console() {
             instance(2)
         )
     );
-    assert_eq!(console[2], "vmbus: connected, version Copper");
+    assert_eq!(
+        console[2],
+        "vmbus: connected, version Copper, CPU 0 is VP 0"
+    );
     assert_eq!(console.len(), 3);
     assert_eq!(vmbus.fatal(), None);
     assert_eq!((vmbus.pending(), vmbus.channels()), (0, 0));
+}
+
+#[test]
+fn the_contact_and_a_channel_target_the_vp_the_core_gives() {
+    // CPU 0 as VP 5: the strict host refuses a contact or an open that names another.
+    let mut hv = FakeHost::new();
+    hv.target_vp = 5;
+    hv.devices = vec![(SCSI, instance(1))];
+    let vmbus = Rc::new(RefCell::new(on(hv)));
+    vmbus.borrow_mut().start();
+    assert!(
+        vmbus
+            .borrow()
+            .host()
+            .said("vmbus: connected, version Copper, CPU 0 is VP 5")
+    );
+    let mut d = Dispatcher::new();
+    let end = driver(&vmbus, &mut d);
+    let end = serve(
+        &vmbus,
+        &mut d,
+        thread::spawn(move || {
+            let mut c = client(end);
+            c.open(1, 8, 4).unwrap();
+            c.into_core().into_channel()
+        }),
+        |_| {},
+    );
+    assert!(vmbus.borrow().host().hv.is_open(ChannelId(1)));
+    drop(end);
 }
 
 #[test]
@@ -283,7 +322,7 @@ fn offers_asked_before_contact_wait_for_it() {
     hv.devices = vec![(SCSI, instance(2))];
     // The host is busy: the request for contact waits in the client.
     hv.busy = 1;
-    let vmbus = Rc::new(RefCell::new(Vmbus::new(Node::new(hv))));
+    let vmbus = Rc::new(RefCell::new(on(hv)));
     vmbus.borrow_mut().start();
     assert!(vmbus.borrow().has_unsent());
     let mut d = Dispatcher::new();
@@ -688,7 +727,7 @@ fn a_rescinded_channel_is_gone_for_its_driver() {
 fn a_post_hyper_v_refuses_is_fatal() {
     let mut hv = FakeHost::new();
     hv.refuse_post = Some(HvError::InvalidConnectionId);
-    let vmbus = Rc::new(RefCell::new(Vmbus::new(Node::new(hv))));
+    let vmbus = Rc::new(RefCell::new(on(hv)));
     vmbus.borrow_mut().start();
     let v = vmbus.borrow();
     let fatal = v.fatal().unwrap();
@@ -701,7 +740,7 @@ fn contact_the_host_refuses_is_fatal_and_answers_what_waited() {
     // No version the client offers.
     let mut hv = FakeHost::up_to(Version::Win8_1);
     hv.busy = 1;
-    let vmbus = Rc::new(RefCell::new(Vmbus::new(Node::new(hv))));
+    let vmbus = Rc::new(RefCell::new(on(hv)));
     vmbus.borrow_mut().start();
     let mut d = Dispatcher::new();
     let end = driver(&vmbus, &mut d);

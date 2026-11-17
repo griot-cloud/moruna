@@ -173,11 +173,12 @@ fn refusal(error: moruna_vmbus::Error) -> Error {
 }
 
 impl<H: Host> Vmbus<H> {
-    /// The process over `host`, with no contact yet.
-    pub fn new(host: H) -> Vmbus<H> {
+    /// The process over `host`, with no contact yet. Its contact and every channel target
+    /// the VP `target_vp`: CPU 0's VP index, which `hyperv_interrupt` gives.
+    pub fn new(host: H, target_vp: u32) -> Vmbus<H> {
         Vmbus {
             host,
-            client: Client::new(),
+            client: Client::new(target_vp),
             contact: Contact::Connecting,
             waiting: Vec::new(),
             channels: BTreeMap::new(),
@@ -317,8 +318,9 @@ impl<H: Host> Vmbus<H> {
             Event::Connected { version } => {
                 self.contact = Contact::Connected;
                 self.host.say(format_args!(
-                    "vmbus: connected, version {:?}",
-                    version.version
+                    "vmbus: connected, version {:?}, CPU 0 is VP {}",
+                    version.version,
+                    self.client.target_vp()
                 ));
                 for (pending, interface) in core::mem::take(&mut self.waiting) {
                     let offers = self.list(interface);

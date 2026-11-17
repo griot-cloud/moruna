@@ -243,7 +243,7 @@ fn a_device_added_later_is_offered_then() {
 #[test]
 fn connect_is_refused_unless_disconnected() {
     let mut host = FakeHost::new();
-    let mut client = Client::new();
+    let mut client = Client::new(0);
     client.connect().unwrap();
     assert_eq!(client.state(), ClientState::Connecting);
     assert_eq!(client.connect(), Err(Error::NotDisconnected));
@@ -258,7 +258,7 @@ fn a_busy_post_is_retried_until_the_host_takes_it() {
     let mut host = FakeHost::new();
     host.devices = vec![(NIC, instance(1))];
     host.busy = 3;
-    let mut client = Client::default();
+    let mut client = Client::new(0);
     client.connect().unwrap();
 
     // Three polls find the host busy: nothing is lost and nothing is sent twice.
@@ -288,7 +288,7 @@ fn a_post_hyper_v_refuses_is_an_error_and_the_message_waits_first_in_line() {
     let mut host = FakeHost::new();
     host.devices = vec![(NIC, instance(1))];
     host.refuse_post = Some(HvError::InvalidConnectionId);
-    let mut client = Client::new();
+    let mut client = Client::new(0);
     client.connect().unwrap();
 
     // Nothing was posted, and the client says why, with Hyper-V's status.
@@ -440,7 +440,7 @@ fn unload_ends_the_connection_and_forgets_everything() {
 fn unload_while_the_offers_arrive_drops_the_rest_of_them() {
     let mut host = FakeHost::new();
     host.devices = vec![(NIC, instance(1)), (SCSI, instance(2))];
-    let mut client = Client::new();
+    let mut client = Client::new(0);
     client.connect().unwrap();
 
     // The first offer has come; the second and the end of the offers are still waiting.
@@ -462,7 +462,7 @@ fn every_request_needs_a_connection() {
         outgoing_pages: 4,
     };
     let channel = ChannelId(1);
-    let mut client = Client::new();
+    let mut client = Client::new(0);
 
     let check = |client: &mut Client, host: &mut FakeHost| {
         assert_eq!(client.open(host, channel, ring), Err(Error::NotConnected));
