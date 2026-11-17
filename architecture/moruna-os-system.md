@@ -273,6 +273,19 @@ Implements the OS design, section 2.
 
 - **A process on `moruna-svc`,** with a 64 MiB account, on no worker's core. If it dies, the node
   stops (1B).
+- **Two crates.** The logic (HTTP, TLS, routing, tokens, audit, MCP) is the library
+  `moruna-api-server` (`kernel/api/server`, no std, with alloc). It talks to a byte-stream trait, so
+  every behaviour is tested on the host. The program `moruna-node-api` (`kernel/node/api`, from item
+  1.3) only wires that library to the network server's sockets and to `platform`'s hand-over.
+- **The node's own certificate** (1D's default): an ECDSA P-256 key made at boot with `ring` (whose
+  randomness comes from `moruna_svc::random`, as the network server's does), and a self-signed
+  X.509 v3 certificate written by a minimal DER writer for one fixed template:
+  - subject and issuer: `CN=<instance id>`; serial: 16 random bytes;
+  - validity: from one hour before the wall clock to 397 days after it;
+  - extensions: basicConstraints CA false, keyUsage digitalSignature, extendedKeyUsage serverAuth.
+
+  The console line `moruna: tls sha256=<fingerprint>` is the SHA-256 of the certificate's DER, in
+  lowercase hex, printed by `api` before `platform` prints `ready`.
 - **TLS ends inside `api`** (rustls), so the node's key stays in the one process that uses it. TLS
   1.3 only.
 - **HTTP/1.1 only,** with keep-alive and Server-Sent Events. No HTTP/2, compression, cookies or
@@ -304,8 +317,15 @@ Implements the OS design, section 2.
 
 ### 2E. Clients
 
-- **The CLI:** `moruna node --url <https://…> --token <token> [--pin <fingerprint>]`.
-- **Generated clients** for Rust and Python, from the OpenAPI document.
+- **The CLI:** `moruna node --url <https://…> --token <token> [--pin <fingerprint>]`, a subcommand of
+  the existing `moruna` binary (`crates/moruna-py/src/bin/moruna.rs`).
+- **The Rust client:** crate `moruna-api-client` (`crates/moruna-api-client`), blocking, over the
+  root workspace's `reqwest` with rustls. It uses `moruna-api`'s types and operations table directly,
+  so it is generated from the same source as the OpenAPI document.
+- **The Python client:** module `moruna.api`, generated from `kernel/api/openapi.json` by an in-repo
+  script (`tools/api/gen_python.py`), standard library only: dataclasses and `urllib`.
+- **Pinning, in all three:** with `--pin`, the server's certificate is accepted when its DER's
+  SHA-256 equals the pin, and nothing else is checked. Without it, normal public verification.
 
 ### Work items
 
