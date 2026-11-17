@@ -559,9 +559,10 @@ pub enum ResourceKind {
     /// `memory_pin` for the devices whose PCI requester ids lie in its range (ABI 1.2):
     /// the right to hand a device the physical pages of a memory object.
     Dma = 5,
+    // 6 is ABI 2.7's `Hyperv` (item 1.9c, on its own branch).
     /// `clock_set_realtime` (ABI 2.8): the right to set the wall clock. No range; never
     /// narrowed.
-    Clock = 6,
+    Clock = 7,
 }
 
 impl ResourceKind {
@@ -1307,9 +1308,9 @@ mod tests {
             assert_eq!(ResourceKind::from_raw(k as u32), Some(k));
         }
         assert_eq!(ResourceKind::from_raw(0), None);
-        // ABI 2.8: the clock.
-        assert_eq!(ResourceKind::from_raw(6), Some(ResourceKind::Clock));
-        assert_eq!(ResourceKind::from_raw(7), None);
+        // ABI 2.8: the clock, after ABI 2.7's `Hyperv` (6, item 1.9c's branch).
+        assert_eq!(ResourceKind::from_raw(7), Some(ResourceKind::Clock));
+        assert_eq!(ResourceKind::from_raw(8), None);
     }
 
     #[test]
