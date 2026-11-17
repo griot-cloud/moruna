@@ -908,6 +908,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-node-api"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+ "moruna-netstack",
+ "moruna-svc",
+ "netstack-protocol",
+ "smoltcp",
+]
+
+[[package]]
 name = "moruna-node-image"
 version = "0.1.0"
 dependencies = [
