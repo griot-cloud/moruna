@@ -153,8 +153,10 @@ One process, `platform`. In order, it:
      `cache_bytes` defaults to 1 GiB.
    - Unknown fields are refused. A missing or invalid config is fatal.
 4. **Hands `api` its config** (token keys, TLS identity, wall clock, instance ID, the machine's
-   memory) over a channel the supervisor links. The memory is the root account's total, which
-   the supervisor reads and passes to `platform` at start. `api` answers `ready` within 10 s, or
+   memory) over a channel the supervisor links. The node's memory is the machine account's limit,
+   which every service and job is carved from: the supervisor reads it with `account_info` and
+   passes it to `platform` at start. It is less than the RAM the core's `memory=` line counts, by
+   what the kernel keeps. `api` answers `ready` within 10 s, or
    it is fatal.
 5. **Prints** the `cloud` and `ready` lines.
 
