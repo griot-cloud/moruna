@@ -71,6 +71,9 @@ const LOOK_NS: u64 = 250_000_000;
 const END_SECONDS: u64 = 60;
 /// A task's log ring.
 const RING_BYTES: u64 = 64 * 1024;
+// The kernel's largest memory object, which a task's region and rings object are sized under.
+const _: () = assert!(layout::OBJECT_MAX == moruna_abi::limits::MEMORY_MAX_BYTES);
+
 /// Batches each of a ring stage's tasks holds at once: one it works on while the engine lays
 /// out the next, so one engine worker keeps every task of the stage busy.
 const IN_FLIGHT: usize = 2;
@@ -834,37 +837,27 @@ impl Drop for TaskState {
         // child charges retired. No alias, fake reset or fabricated completion.
         let original = core::mem::replace(&mut self.plane, RingPlane::new(Calls, 0));
         drop(original);
-        let result = (|| -> std::result::Result<(), String> {
-            if !self.terminal_confirmed {
-                return Err("owner closed without an actual terminal acknowledgement".into());
-            }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                let usage = {
-                    let held = lock(&self.memory.account);
-                    held.as_ref()
+        let result = if self.terminal_confirmed {
+            // A native task's process handle goes first: its process is charged to the account.
+            let memory = &self.memory;
+            layout::retire(
+                self.process.take(),
+                || {
+                    lock(&memory.account)
+                        .as_ref()
                         .map(|(account, _)| account.usage())
                         .transpose()
-                        .map_err(|e| format!("actual Account read: {}", e.name()))?
-                };
-                match usage {
-                    Some(usage) if usage.used == 0 && usage.reserved == 0 => {
-                        lock(&self.memory.account).take();
-                        return Ok(());
-                    }
-                    None => {
-                        return Err(
-                            "original Account observer disappeared before retirement".into()
-                        );
-                    }
-                    Some(_) => {}
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err("actual child Account did not retire within bounded cleanup".into());
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        })();
+                        .map(|usage| usage.map(|u| (u.used, u.reserved)))
+                        .map_err(|e| format!("actual Account read: {}", e.name()))
+                },
+                std::time::Duration::from_secs(5),
+            )
+        } else {
+            Err("owner closed without an actual terminal acknowledgement".into())
+        };
+        if result.is_ok() {
+            lock(&self.memory.account).take();
+        }
         if let Err(why) = result {
             *lock(&self.memory.failure) = Some(why.clone());
             tracing::error!(target:"micro",image=%self.name,cause=%why,"task cleanup uncertain; actual Account observer retained");
