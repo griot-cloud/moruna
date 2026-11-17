@@ -51,7 +51,7 @@ fn node_answers_the_node_document_field_for_field() {
     let mut harness = Harness::new();
     let client = harness.connect();
     harness.clock.advance(5_000);
-    let response = harness.get(client, "/v1/node", "");
+    let response = harness.get_as(client, "/v1/node", &["observe"]);
     assert_eq!(response.status, 200);
     assert_eq!(response.header("content-type"), Some("application/json"));
     assert_eq!(
@@ -74,7 +74,7 @@ fn the_node_document_follows_the_facts_the_caller_changes() {
         cloud: moruna_api::Cloud::None,
         ..common::facts()
     };
-    let body = harness.get(client, "/v1/node", "").json();
+    let body = harness.get_as(client, "/v1/node", &["observe"]).json();
     assert_eq!(body["health"], "degraded");
     assert_eq!(body["cloud"], "none");
 }
@@ -83,7 +83,7 @@ fn the_node_document_follows_the_facts_the_caller_changes() {
 fn audit_answers_its_list() {
     let mut harness = Harness::new();
     let client = harness.connect();
-    let response = harness.get(client, "/v1/node/audit", "");
+    let response = harness.get_as(client, "/v1/node/audit", &["admin"]);
     assert_eq!(response.status, 200);
     assert!(response.json()["records"].is_array());
 }
@@ -117,8 +117,12 @@ fn keep_alive_serves_many_requests_and_close_is_honoured() {
         assert_eq!(harness.get(client, "/v1/health", "").status, 200);
     }
     // Pipelined: three requests in one write, three answers in order.
+    let bearer = Harness::bearer(&harness.token(&["observe"]));
     harness.clients[client].send(
-        b"GET /v1/health HTTP/1.1\r\nHost: node\r\n\r\nGET /v1/node HTTP/1.1\r\nHost: node\r\n\r\nGET /nope HTTP/1.1\r\nHost: node\r\n\r\n",
+        format!(
+            "GET /v1/health HTTP/1.1\r\nHost: node\r\n\r\nGET /v1/node HTTP/1.1\r\nHost: node\r\n{bearer}\r\nGET /nope HTTP/1.1\r\nHost: node\r\n\r\n"
+        )
+        .as_bytes(),
     );
     harness.settle();
     let statuses: Vec<u16> = (0..3)
@@ -155,8 +159,12 @@ fn a_client_close_notify_after_pipelined_requests_gets_every_answer_then_a_close
     let mut harness = Harness::new();
     let client = harness.connect();
     harness.settle();
+    let bearer = Harness::bearer(&harness.token(&["observe"]));
     harness.clients[client].send(
-        b"GET /v1/health HTTP/1.1\r\nHost: node\r\n\r\nGET /v1/node HTTP/1.1\r\nHost: node\r\n\r\n",
+        format!(
+            "GET /v1/health HTTP/1.1\r\nHost: node\r\n\r\nGET /v1/node HTTP/1.1\r\nHost: node\r\n{bearer}\r\n"
+        )
+        .as_bytes(),
     );
     harness.clients[client].tls.send_close_notify();
     harness.settle();
@@ -191,9 +199,11 @@ fn a_body_over_1_mib_is_invalid_then_close() {
     let mut harness = Harness::new();
     let client = harness.connect();
     // At the limit the body is read whole and the request answered (GET takes no body).
-    let mut at_limit =
-        format!("GET /v1/node HTTP/1.1\r\nHost: node\r\nContent-Length: {BODY_LIMIT}\r\n\r\n")
-            .into_bytes();
+    let bearer = Harness::bearer(&harness.token(&["observe"]));
+    let mut at_limit = format!(
+        "GET /v1/node HTTP/1.1\r\nHost: node\r\n{bearer}Content-Length: {BODY_LIMIT}\r\n\r\n"
+    )
+    .into_bytes();
     at_limit.resize(at_limit.len() + BODY_LIMIT, b'x');
     let response = harness.exchange(client, &at_limit);
     assert_eq!(response.status, 400);
@@ -312,7 +322,7 @@ fn a_client_that_reads_slowly_gets_every_byte() {
     let client = harness.connect();
     harness.clients[client].pipe.borrow_mut().capacity = Some(100);
     harness.settle();
-    let body = harness.get(client, "/v1/node", "").json();
+    let body = harness.get_as(client, "/v1/node", &["observe"]).json();
     assert_eq!(body["instance"], INSTANCE);
 }
 

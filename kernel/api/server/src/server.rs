@@ -8,6 +8,7 @@ use crate::{
     http::Session,
     identity::Identity,
     tls::{self, Tls, WallClock},
+    token::TokenKey,
     transport::{Clock, Transport, TransportError},
 };
 use alloc::{sync::Arc, vec, vec::Vec};
@@ -28,8 +29,10 @@ const ROUNDS: usize = 16;
 pub struct Config {
     /// The TLS identity: the operator's, or the node's own.
     pub identity: Identity,
-    /// What the node document says.
+    /// What the node document says. Its `instance` is also the `aud` every token must carry.
     pub facts: NodeFacts,
+    /// The keys a token's signature is checked against: node config's `token_keys`.
+    pub token_keys: Vec<TokenKey>,
 }
 
 /// The API server over connections of type `T`, with time from `C`.
@@ -129,7 +132,7 @@ impl<T: Transport, C: Clock> Server<T, C> {
             tls: tls::config(&config.identity, wall.clone())?,
             wall,
             clock,
-            api: Api::new(config.facts),
+            api: Api::new(config.facts, config.token_keys),
             connections: Vec::new(),
             scratch: vec![0; READ_CHUNK],
         })

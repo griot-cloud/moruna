@@ -3,8 +3,12 @@
 //! 2.5 will.
 #![allow(dead_code)]
 
+pub mod signer;
+
 use moruna_api::{Cloud, Executor, ExecutorKind, NodeHealth};
-use moruna_api_server::{Clock, Config, Identity, NodeFacts, Server, Transport, TransportError};
+use moruna_api_server::{
+    Clock, Config, Identity, NodeFacts, Server, TokenKey, Transport, TransportError,
+};
 use ring::digest;
 use rustls::{
     ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme,
@@ -12,6 +16,7 @@ use rustls::{
     crypto::{CryptoProvider, ring::default_provider, verify_tls13_signature},
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
+use signer::Signer;
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -358,12 +363,14 @@ impl Response {
     }
 }
 
-/// A server and its clients over in-memory pipes, with a clock the test moves.
+/// A server and its clients over in-memory pipes, with a clock the test moves, and the token
+/// issuer whose key is the node's.
 pub struct Harness {
     pub server: Server<End, TestClock>,
     pub clock: TestClock,
     pub fingerprint: String,
     pub clients: Vec<Client>,
+    pub signer: Signer,
 }
 
 impl Harness {
@@ -373,12 +380,19 @@ impl Harness {
     }
 
     pub fn with_identity(identity: Identity) -> Self {
+        let signer = Signer::new();
+        Self::with(identity, vec![TokenKey::new(signer.public())], signer)
+    }
+
+    /// A server with `identity` and `token_keys`, whose tests sign with `signer`.
+    pub fn with(identity: Identity, token_keys: Vec<TokenKey>, signer: Signer) -> Self {
         let clock = TestClock::new();
         let fingerprint = identity.fingerprint();
         let server = Server::new(
             Config {
                 identity,
                 facts: facts(),
+                token_keys,
             },
             clock.clone(),
         )
@@ -388,7 +402,25 @@ impl Harness {
             clock,
             fingerprint,
             clients: Vec::new(),
+            signer,
         }
+    }
+
+    /// A valid token for this node with `scope`, expiring in ten minutes.
+    pub fn token(&self, scope: &[&str]) -> String {
+        self.signer
+            .token(INSTANCE, self.clock.unix_seconds() + 600, scope)
+    }
+
+    /// The header line that carries `token`.
+    pub fn bearer(token: &str) -> String {
+        format!("Authorization: Bearer {token}\r\n")
+    }
+
+    /// A GET of `path` on client `index` with a valid token for `scope`.
+    pub fn get_as(&mut self, index: usize, path: &str, scope: &[&str]) -> Response {
+        let header = Self::bearer(&self.token(scope));
+        self.get(index, path, &header)
     }
 
     /// Connects a new client with `config`, and says which it is.

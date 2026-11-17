@@ -1,11 +1,16 @@
-//! The operations (system design, section 2A): routing from `moruna-api`'s operations table, each
-//! operation's answer, and the error body every refusal carries.
+//! The operations (system design, section 2A): routing from `moruna-api`'s operations table, the
+//! token each call needs and the record it leaves (2C), each operation's answer, and the error
+//! body every refusal carries.
 
-use crate::http::Request;
+use crate::{
+    audit::AuditLog,
+    http::{Authorization, Request},
+    token::{Grant, TokenKey, Verifier},
+};
 use alloc::{string::String, vec::Vec};
 use moruna_api::{
-    Audit, Cloud, ErrorBody, ErrorCode, Executor, Health, HealthStatus, Node, NodeHealth,
-    OPERATIONS, Operation, Response,
+    Cloud, ErrorBody, ErrorCode, Executor, Health, HealthStatus, Node, NodeHealth, OPERATIONS,
+    Operation, Response,
 };
 
 /// What the node says about itself in the node document, supplied by the caller. The server
@@ -88,20 +93,28 @@ pub(crate) fn error_body(code: ErrorCode, message: &str) -> Vec<u8> {
     serde_json::to_vec(&ErrorBody::new(code, message)).unwrap_or_default()
 }
 
-/// The operations' state: what the node says about itself.
+/// The operations' state: what the node says about itself, the keys its tokens are checked
+/// against, and the audit record.
 #[derive(Debug)]
 pub(crate) struct Api {
     pub facts: NodeFacts,
+    verifier: Verifier,
+    audit: AuditLog,
 }
 
 impl Api {
-    pub(crate) fn new(facts: NodeFacts) -> Self {
-        Self { facts }
+    pub(crate) fn new(facts: NodeFacts, keys: Vec<TokenKey>) -> Self {
+        Self {
+            facts,
+            verifier: Verifier::new(keys),
+            audit: AuditLog::default(),
+        }
     }
 
     /// The answer to `request` at `now`, Unix seconds. The route comes from the operations
     /// table only: a path in no operation is `not_found`, and a known path with another method
-    /// is `invalid`.
+    /// is `invalid`. An operation that needs a scope needs a valid token (2C); `health` never
+    /// reads the header. Each call of an operation is recorded.
     pub(crate) fn answer(&mut self, request: &Request, now: u64) -> Answer {
         let Some(operation) = OPERATIONS.iter().find(|o| o.path == request.path) else {
             return Answer::error(ErrorCode::NotFound, "no operation has this path");
@@ -109,26 +122,91 @@ impl Api {
         if request.method != operation.method.as_str() {
             return Answer::error(ErrorCode::Invalid, "this path takes another method");
         }
+        let grant = match operation.scope {
+            None => None,
+            Some(_) => match self.verify(&request.authorization, now) {
+                Ok(grant) => Some(grant),
+                Err(why) => {
+                    return self.refuse(operation, None, ErrorCode::Unauthorized, why, now);
+                }
+            },
+        };
         if request.query {
-            return Answer::error(ErrorCode::Invalid, "this operation takes no query");
+            let why = "this operation takes no query";
+            return self.refuse(operation, grant.as_ref(), ErrorCode::Invalid, why, now);
         }
         if !request.body.is_empty() {
-            return Answer::error(ErrorCode::Invalid, "this operation takes no body");
+            let why = "this operation takes no body";
+            return self.refuse(operation, grant.as_ref(), ErrorCode::Invalid, why, now);
         }
-        self.run(operation, now)
+        self.call(operation, grant.as_ref(), now)
     }
 
-    /// Runs `operation`, whose request has been checked.
+    /// What the token in `authorization` grants at `now`, or why it is refused.
+    pub(crate) fn verify(
+        &self,
+        authorization: &Authorization,
+        now: u64,
+    ) -> Result<Grant, &'static str> {
+        self.verifier
+            .verify(authorization, &self.facts.instance, now)
+    }
+
+    /// Calls `operation`, whose request has been checked, for a caller whose token granted
+    /// `grant`: `forbidden` when its scope does not cover the operation. The call is recorded.
+    pub(crate) fn call(
+        &mut self,
+        operation: &'static Operation,
+        grant: Option<&Grant>,
+        now: u64,
+    ) -> Answer {
+        if let Some(needed) = operation.scope {
+            match grant {
+                None => {
+                    let why = "the call carries no token";
+                    return self.refuse(operation, grant, ErrorCode::Unauthorized, why, now);
+                }
+                Some(grant) if !grant.covers(needed) => {
+                    let why = "the token's scope does not cover this operation";
+                    return self.refuse(operation, Some(grant), ErrorCode::Forbidden, why, now);
+                }
+                Some(_) => {}
+            }
+        }
+        let answer = self.run(operation, now);
+        self.audit.record(now, grant, operation.id, answer.status);
+        answer
+    }
+
+    /// Refuses a call of `operation` with `code`, and records it.
+    fn refuse(
+        &mut self,
+        operation: &'static Operation,
+        grant: Option<&Grant>,
+        code: ErrorCode,
+        why: &str,
+        now: u64,
+    ) -> Answer {
+        let answer = Answer::error(code, why);
+        self.audit.record(now, grant, operation.id, answer.status);
+        answer
+    }
+
+    /// Runs `operation`, whose call is allowed.
     fn run(&mut self, operation: &Operation, now: u64) -> Answer {
         match operation.response {
             Response::Health => Answer::ok(serde_json::to_vec(&Health {
                 status: HealthStatus::Ok,
             })),
             Response::Node => Answer::ok(serde_json::to_vec(&self.facts.document(now))),
-            Response::Audit => Answer::ok(serde_json::to_vec(&Audit {
-                records: Vec::new(),
-            })),
+            Response::Audit => Answer::ok(serde_json::to_vec(&self.audit.audit())),
         }
+    }
+
+    /// How many calls the audit record holds.
+    #[cfg(test)]
+    pub(crate) fn recorded(&self) -> usize {
+        self.audit.len()
     }
 }
 

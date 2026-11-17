@@ -14,6 +14,10 @@
 //! - The limits: [`HEADER_LIMIT`] and [`BODY_LIMIT`] (over them, `invalid`),
 //!   [`CONNECTION_LIMIT`] (over it, `busy`) and [`IDLE_LIMIT_MS`]; each answer over a limit
 //!   closes its connection.
+//! - Tokens (2C): every operation but `health` needs a JWT signed with Ed25519 under one of the
+//!   node's [`TokenKey`]s, for this node, expiring within [`MOST_AHEAD_SECONDS`], whose scope
+//!   covers the operation. Each call of an operation leaves an audit record; the last
+//!   [`AUDIT_LIMIT`] are kept in memory, and `node/audit` answers them newest first.
 //!
 //! The crate is `no_std` with `alloc`. On the kernel, ring's randomness comes from
 //! `moruna_svc::random`, as the network server's does.
@@ -22,19 +26,28 @@
 #![warn(missing_docs)]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod api;
+mod audit;
 mod der;
 mod http;
 mod identity;
 #[cfg(target_os = "none")]
 mod random;
 mod server;
+#[cfg(test)]
+#[path = "../tests/common/signer.rs"]
+mod signer;
 mod tls;
+mod token;
 mod transport;
 
 pub use api::NodeFacts;
+pub use audit::AUDIT_LIMIT;
 pub use http::{BODY_LIMIT, HEADER_LIMIT};
 pub use identity::{Identity, IdentityError, VALID_AFTER_SECONDS, VALID_BEFORE_SECONDS};
 pub use server::{CONNECTION_LIMIT, Config, IDLE_LIMIT_MS, Server};
+pub use token::{MOST_AHEAD_SECONDS, TokenKey};
 pub use transport::{Clock, Transport, TransportError};

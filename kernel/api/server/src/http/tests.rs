@@ -205,7 +205,7 @@ fn exchange(session: &mut Session, api: &mut Api, bytes: &[u8]) -> Vec<u8> {
 
 #[test]
 fn a_session_answers_pipelined_requests_in_order_and_keeps_the_connection() {
-    let mut api = Api::new(facts());
+    let mut api = Api::new(facts(), Vec::new());
     let mut session = Session::default();
     let out = exchange(
         &mut session,
@@ -243,7 +243,7 @@ fn a_session_answers_pipelined_requests_in_order_and_keeps_the_connection() {
 
 #[test]
 fn a_refused_stream_is_answered_invalid_and_closed() {
-    let mut api = Api::new(facts());
+    let mut api = Api::new(facts(), Vec::new());
     let mut session = Session::default();
     let out = exchange(&mut session, &mut api, b"BREW /pot HTCPCP/1.0\r\n\r\n");
     let text = String::from_utf8(out).unwrap();
@@ -257,7 +257,7 @@ fn a_refused_stream_is_answered_invalid_and_closed() {
 
 #[test]
 fn a_session_over_the_connection_limit_answers_busy_and_closes() {
-    let mut api = Api::new(facts());
+    let mut api = Api::new(facts(), Vec::new());
     for bytes in [
         &b"GET /v1/health HTTP/1.1\r\nHost: n\r\n\r\n"[..],
         b"not http\r\n\r\n",
@@ -277,7 +277,7 @@ fn a_session_over_the_connection_limit_answers_busy_and_closes() {
 
 #[test]
 fn a_finished_session_answers_what_arrived_then_closes() {
-    let mut api = Api::new(facts());
+    let mut api = Api::new(facts(), Vec::new());
     let mut session = Session::default();
     session.finish();
     let text = String::from_utf8(exchange(
@@ -338,7 +338,7 @@ const PIECES: &[&[u8]] = &[
 #[test]
 fn ten_thousand_random_streams_never_panic() {
     let mut random = Random(0x6d6f_7275_6e61_2e32);
-    let mut api = Api::new(facts());
+    let mut api = Api::new(facts(), Vec::new());
     for _ in 0..10_000 {
         let mut stream = Vec::new();
         let length = random.below(600);
