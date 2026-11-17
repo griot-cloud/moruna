@@ -40,15 +40,19 @@ moruna run --vm JOB.json [--image node-image.json] [the options above]
     an `s3://`, `gs://` or `az://` object becomes a data disk, `disk://NAME`, its name made from
     the file's. Remote objects are fetched to the run's host directory first (the VM has no
     network);
-  - a sink on this host is written to the VM's output root (`/tmp/out`), and its directory is
-    the run's output directory unless `--output` names another.
+  - a sink on this host writes onto the VM's output disk, and its directory is the run's output
+    directory unless `--output` names another. A Parquet sink writes there as it commits each
+    file (`disk://out/`); another sink writes under the VM's output root (`/tmp/out`, in the
+    engine's scratch), and the run's end puts its files on the disk. Either way the outputs are
+    one layer on the output disk, which the host unpacks.
 
   A document may name its devices itself (`disk://NAME`) and bind them in `JOB.inputs.json`
   beside it (`{"NAME": "PATH or URL"}`), or with `--input NAME=URL`.
 - **The node** is `--image`, or one built for the run from the node kit
   (`kernel/node/tools/node-for-job.py`): its CPUs the job's, its memory the job's budget, the
-  engine's scratch (`--scratch-gib`, 1 GiB by default; the outputs wait there for the output
-  disk) and the node's services, or exactly `--memory-gib` when given (a job that does not fit is
+  engine's scratch (`--scratch-gib`, 1 GiB by default; the output disk has room for that much
+  output, the layer's 16 MiB of tables before it and its hash tree after it) and the node's
+  services, or exactly `--memory-gib` when given (a job that does not fit is
   refused, naming the least it needs).
 - **The node kit** is `--node-kit`, else `MORUNA_NODE_KIT`, else `share/moruna/node-kit` beside
   the executable's `bin`: `kernel/tools/build.sh`'s output, with `kernel/node/tools/node-for-job.py`

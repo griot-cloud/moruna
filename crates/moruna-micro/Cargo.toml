@@ -31,9 +31,16 @@ moruna-abi = { workspace = true }
 moruna-mmio = { path = "../../kernel/drivers/mmio", version = "=0.1.0" }
 moruna-pci = { path = "../../kernel/drivers/pci", version = "=0.1.0" }
 moruna-virtio = { path = "../../kernel/drivers/virtio", version = "=0.1.0" }
+# Stream C: the output layer's format, and its pages' hashes.
+moruna-imagefs = { workspace = true }
+sha2 = { workspace = true }
 
 imagefs-protocol = { workspace = true }
 
 # stream P: the plane's rings layout, which a test checks the ring sizes against on any host.
 [dev-dependencies]
 moruna-plane = { workspace = true }
+
+# Stream C: the output layer read back with the host's own reader.
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
+moruna-image = { workspace = true }

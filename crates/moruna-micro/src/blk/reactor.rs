@@ -9,18 +9,22 @@
 //! I/O thread: no copy of the body, no call and no message per read. Readahead is the
 //! scheduler's, as on every host: each source drive keeps its `read_ahead` planned splits in
 //! flight (contract C2), and here each of them is requests on the device's ring.
+//!
+//! A sink's `write_object` under [`out::URL`] is the output layer's: [`out::Output`] puts the
+//! file onto `disk.out` as it is written (contract C3).
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 
 use moruna_kernel::{
-    Buffer, BufferView, Completion, CopyDst, CopySrc, Dispatch, IoPaths, MorunaError, ObjectMeta,
-    ObjectMetadata, Reactor,
+    Allocator, Buffer, BufferView, Completion, CopyDst, CopySrc, Dispatch, IoPaths, MorunaError,
+    ObjectMeta, ObjectMetadata, Reactor, Tier,
 };
 
 use super::disk::Disk;
 use super::engine::{Kind, Op};
+use super::out::{self, Output};
 use crate::devices;
 
 /// The reactor with the engine's disks in front of it.
@@ -28,16 +32,19 @@ pub struct DiskReactor {
     inner: Arc<dyn Reactor>,
     metadata: Option<Arc<dyn ObjectMetadata>>,
     disks: BTreeMap<String, Disk>,
+    output: Option<Arc<Output>>,
     dispatch: Dispatch,
 }
 
 impl DiskReactor {
     /// `inner` and its metadata, with each of `disks` (by start-page name) answering the
-    /// `disk://` URL that names it.
+    /// `disk://` URL that names it, and `output` (the run's `disk.out`, with the allocator its
+    /// bounce buffers come from) taking the files written under [`out::URL`].
     pub fn new(
         inner: Arc<dyn Reactor>,
         metadata: Option<Arc<dyn ObjectMetadata>>,
         disks: impl IntoIterator<Item = Disk>,
+        output: Option<(Disk, Arc<dyn Allocator>)>,
     ) -> std::io::Result<DiskReactor> {
         let disks = disks
             .into_iter()
@@ -46,12 +53,32 @@ impl DiskReactor {
                 Some((format!("{}{name}", devices::SCHEME), d))
             })
             .collect();
+        let dispatch = dispatcher()?;
+        let output = output.map(|(disk, alloc)| {
+            let tier = if alloc.is_pinned() {
+                Tier::PinnedHost
+            } else {
+                Tier::Host
+            };
+            Output::new(disk, alloc, tier, dispatch.clone())
+        });
         Ok(DiskReactor {
             inner,
             metadata,
             disks,
-            dispatch: dispatcher()?,
+            output,
+            dispatch,
         })
+    }
+
+    /// The run's output layer, when it has an output disk.
+    pub fn output(&self) -> Option<Arc<Output>> {
+        self.output.clone()
+    }
+
+    /// The path under the output layer a URL names, if it names one.
+    fn output_path(url: &str) -> Option<&str> {
+        url.strip_prefix(out::URL)
     }
 
     /// The disk a URL names.
@@ -169,6 +196,15 @@ impl Reactor for DiskReactor {
                 self.dispatch.clone(),
             );
         }
+        if let Some(path) = DiskReactor::output_path(url) {
+            return match &self.output {
+                Some(output) => output.put(path, src),
+                None => Completion::resolved_on(
+                    Err(io("write_object", url, "the run has no output disk")),
+                    self.dispatch.clone(),
+                ),
+            };
+        }
         self.inner.write_object(url, src)
     }
 
@@ -190,6 +226,16 @@ impl Reactor for DiskReactor {
                 Err(io("delete_object", url, "an input disk is read only")),
                 self.dispatch.clone(),
             );
+        }
+        if let Some(path) = DiskReactor::output_path(url) {
+            // A file taken out of the layer; its pages stay on the disk, unnamed.
+            let removed = self.output.as_ref().is_some_and(|o| o.remove(path));
+            let result = if removed {
+                Ok(())
+            } else {
+                Err(io("delete_object", url, "no such file in the output layer"))
+            };
+            return Completion::resolved_on(result, self.dispatch.clone());
         }
         self.inner.delete_object(url)
     }

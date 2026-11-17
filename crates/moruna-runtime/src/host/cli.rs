@@ -100,7 +100,8 @@ pub struct VmData {
     pub report: Option<PathBuf>,
     /// `--memory BYTES` or `--memory-gib N`: the VM's memory, for a node built from the kit.
     pub memory_bytes: Option<u64>,
-    /// `--scratch-gib N`: the engine's scratch, where its outputs wait for the output disk.
+    /// `--scratch-gib N`: the engine's scratch, and the room for outputs on the output disk
+    /// (stream C hook, D's file: the sinks write there directly).
     pub scratch_bytes: Option<u64>,
     /// `--node-kit DIR`: what a node is built from (`kernel/node/HOST.md`).
     pub node_kit: Option<PathBuf>,
@@ -970,14 +971,20 @@ pub fn check_output(declared: u64, output: Option<&Path>) -> Result<(), String> 
     }
 }
 
-/// The engine's scratch a node built from the kit gets when the run names none: where the sinks'
-/// files wait until the run's end writes them to the output disk.
+/// The engine's scratch a node built from the kit gets when the run names none, and the room for
+/// outputs on its output disk (stream C hook, D's file: the sinks write there directly).
 pub const SCRATCH_DEFAULT: u64 = 1 << 30;
 
-/// The output disk of a node built from the kit: the scratch, as one layer, with room for the
-/// layer's own tables and hash tree.
-pub fn output_disk_for(scratch: u64) -> u64 {
-    (scratch + scratch / 32 + (64 << 20)).div_ceil(4096) * 4096
+// stream C hook (D's file): the output disk holds the layer as the sinks write it.
+/// The output disk of a node built from the kit, for `data` bytes of outputs (the scratch's
+/// size; the outputs no longer pass through it): the data, the 16 MiB the layer keeps before it
+/// for its tables (`moruna_micro::blk::out::RESERVE`), its hash tree (a page per 127 pages of
+/// what is before it) and a margin, in whole pages.
+pub fn output_disk_for(data: u64) -> u64 {
+    const RESERVE: u64 = 16 << 20;
+    const MARGIN: u64 = 64 << 20;
+    let content = data.next_multiple_of(4096) + RESERVE;
+    (content + content.div_ceil(4096 * 127) * 4096 + MARGIN).div_ceil(4096) * 4096
 }
 
 /// The node kit a run builds its node from: `--node-kit`, else `MORUNA_NODE_KIT`, else
@@ -2203,6 +2210,16 @@ mod tests {
         assert_eq!(args.iter().filter(|a| *a == "--input").count(), 2);
         assert!(output_disk_for(1 << 30) > (1 << 30));
         assert_eq!(output_disk_for(1 << 30) % 4096, 0);
+        // stream C hook (D's file): the data, the tables' 16 MiB, the tree, the margin.
+        let gib = output_disk_for(1 << 30);
+        let content = (1u64 << 30) + (16 << 20);
+        assert!(gib >= content + content / 127 + (64 << 20), "{gib}");
+        assert!(gib < content + content / 64 + (64 << 20) + 4096, "{gib}");
+        let none = output_disk_for(0);
+        assert!(
+            none > (16 << 20) + (64 << 20) && none.is_multiple_of(4096),
+            "{none}"
+        );
         let e = build_node(&dir, Path::new("/j"), &dir.join("o"), &order).unwrap_err();
         assert!(e.contains("not a node kit"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
