@@ -751,3 +751,21 @@ and switches to the new one when the call answers.
   change, and a failed run leaves no header. A 16 MiB metadata reserve holds about 150,000 files.
   C owns it, including D's two lines (the in-VM sink URL and disk.out's size), marked as hooks
   in D's files since D's agent is finished.
+- **2026-11-17: the NYC gate's core controls, India VM** (10:05-10:48 UTC; 106 runs, each
+  row 5 of 5, no OOM; every output equal to 0.6.6's under gate-canon/1). Medians:
+
+  | Job | Rust pool | 0.6.6, Rust fn | 0.6.6, Python fn | DuckDB / Polars | 0.7 must reach |
+  | --- | --- | --- | --- | --- | --- |
+  | Score | 14.2 s, 99.5 CPU-s | 14.6 s | 27.4 s | none | 9.5 s |
+  | Occupancy | 2.4 s, 8.7 | 3.0 s | 8.0 s | 7.0 s | 1.6 s |
+  | Enrich | 6.6 s, 39.6 | 7.8 s | 7.4 s | 12.8 s / 9.4 s | 4.4 s |
+  | Audit | 3.0 s, 12.7 | 3.4 s | 28.0 s | none | 2.0 s |
+
+  - **Out of reach with boot counted:** 0.7's launch plus boot is 2.65 s, so Occupancy and
+    Audit cannot pass with boot counted in the wall. Score's function alone is about 11 s on
+    8 threads, the same code in every Rust row. Only Enrich is reachable: 1.7 s for the job
+    after boot, where the pool spends 30.4 of its 39.6 CPU-s on Parquet encode and write. The
+    column the bar is judged on (with boot or without) is Brackly's call. Every Moruna row is
+    reported both ways, and cutting boot is work regardless (fast deployment).
+  - **Shmem THP `advise`** changed nothing: QEMU does not madvise its memfd, so
+    ShmemHugePages stayed 0. A `within_size` run follows.
