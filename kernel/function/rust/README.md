@@ -82,8 +82,10 @@ another version is another type.
   records, in order. One row's record must fit a window (exit code 8 otherwise). A dictionary
   column is refused: a data-plane record carries no dictionaries, so cast it to its values first.
   An error from `Emit::batch` ends the task even if the function ignores it.
-- **Every line of the log** that `serve` writes starts with the task's name. A function's own
-  lines (`moruna_function::log`) are written as given.
+- **The log is std's.** On the core std owns the task's log (5A0) and sends standard error to it,
+  so `moruna_function::log` writes its line to standard error, as `eprintln!` would, and the SDK
+  never takes the log itself. Every line `serve` writes starts with the task's name; a
+  function's own lines are written as given.
 - **Exit codes,** said on the task's rings and returned for `main` to return
   (`moruna_function::code`):
 

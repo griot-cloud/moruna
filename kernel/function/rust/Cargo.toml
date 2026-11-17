@@ -40,9 +40,10 @@ moruna-ipc-check = { path = "../../plane/check" }
 [dev-dependencies]
 arrow-select.workspace = true
 
-# On the core: the task's plane, its rings and its log.
+# On the core: the task's plane and its rings. Its log is std's: the std layer (5A0, item 5.0) owns
+# the log slot and sends standard error to it.
 [target.'cfg(any(target_os = "moruna", moruna_function_sys))'.dependencies]
-moruna-sys = { path = "../../sys", features = ["log"] }
+moruna-sys = { path = "../../sys" }
 
 # On a host: the ring protocol, for the data plane in memory (`moruna_function::host`).
 [target.'cfg(not(any(target_os = "moruna", moruna_function_sys)))'.dependencies]

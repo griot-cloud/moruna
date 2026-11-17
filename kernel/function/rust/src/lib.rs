@@ -68,9 +68,11 @@ pub mod code {
     pub const WINDOW_SMALL: i64 = 8;
 }
 
-/// Writes `line` to the task's log, a record a line (a line with newlines is several). On the
-/// core the log is the ring the engine gave the task, held to its rate; on a host it is
-/// [`host::Outcome::log`] inside [`host::Plane::run`], and standard error outside it.
+/// Writes `line` to the task's log, a record a line (a line with newlines is several), through
+/// std's standard error. On the core std owns the task's log (5A0, item 5.0): it sends standard
+/// error there, and to the console when the task has no log. On a host, inside
+/// [`host::Plane::run`], the lines are the run's [`host::Outcome::log`], as the core's std makes
+/// them the task's; anywhere else they go to standard error.
 pub fn log(line: impl std::fmt::Display) {
     platform::log_line(&line.to_string());
 }

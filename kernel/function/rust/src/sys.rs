@@ -1,41 +1,31 @@
-//! The task's lane on the core: `moruna_sys::plane`'s rings and log, as the gate's tasks used
-//! them (`images/gate/tasks` before 5.1): the plane taken once, the rings attached from its slots
-//! 0 and 1, the log from its start slot.
+//! The task's lane on the core: `moruna_sys::plane`'s rings, as the gate's tasks used them
+//! (`images/gate/tasks` before 5.1): the plane taken once, the rings attached from its slots 0
+//! and 1. The task's log is std's (5A0, item 5.0): std takes the log slot and sends standard error
+//! to it, so a line here is a line of standard error, and the SDK never takes the slot.
 
+use std::io::Write;
 use std::ptr::NonNull;
-use std::sync::{Mutex, Once, PoisonError};
 
-use moruna_sys::plane::{Log, Plane, Rings};
+use moruna_sys::plane::{Plane, Rings};
 
 use crate::code;
 use crate::lane::{Lane, Posted, Unattached, Window};
 
-/// The task's log, taken from its start slot the first time a line is written.
-static LOG: Mutex<Option<Log>> = Mutex::new(None);
-static TAKEN: Once = Once::new();
-
-fn with_log(f: impl FnOnce(&mut Log)) {
-    TAKEN.call_once(|| *LOG.lock().unwrap_or_else(PoisonError::into_inner) = Log::take());
-    if let Some(log) = LOG.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
-        f(log);
+/// A line of the task's log, written to standard error, which std sends there; a line with
+/// newlines is several. The lines go out together, under standard error's lock.
+pub(crate) fn log_line(line: &str) {
+    let mut err = std::io::stderr().lock();
+    if line.is_empty() {
+        let _ = err.write_all(b"\n");
+    }
+    for part in line.lines() {
+        let _ = writeln!(err, "{part}");
     }
 }
 
-/// A line of the task's log; a line with newlines is several.
-pub(crate) fn log_line(line: &str) {
-    with_log(|log| {
-        if line.is_empty() {
-            log.line(b"");
-        }
-        for part in line.lines() {
-            log.line(part.as_bytes());
-        }
-    });
-}
-
-/// Says how many lines were dropped, if any: before the task ends.
+/// Every line written so far handed on, before the task says its exit code.
 fn flush_log() {
-    with_log(Log::finish);
+    let _ = std::io::stderr().lock().flush();
 }
 
 /// The task's rings.
