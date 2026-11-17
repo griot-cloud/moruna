@@ -50,6 +50,10 @@ moruna-sandbox = { path = "crates/moruna-sandbox", version = "0.6.6" }
 moruna-image = { path = "crates/moruna-image", version = "0.6.6" }
 moruna-plane-linux = { path = "crates/moruna-plane-linux", version = "0.6.6" }
 moruna-record = { path = "crates/moruna-record", version = "0.6.6", default-features = false }
+# The node API's client (system design 2E, item 2.5), on the API's own types and operations table,
+# a `no_std` crate of the kernel workspace.
+moruna-api-client = { path = "crates/moruna-api-client", version = "0.6.6" }
+moruna-api = { path = "kernel/api/types", version = "=0.1.0" }
 
 # External crates, the preamble 6.2 table, pinned to the latest stable on
 # 2026-09-22. Feature lists are the table's "Notes" column; a backend or
@@ -116,6 +120,13 @@ hyper-util = { version = "=0.1.20", default-features = false }
 http = { version = "=1.5.0" }
 http-body-util = { version = "=0.1.5" }
 socket2 = { version = "=0.6.5" }
+# The node API's client (system design 2E, item 2.5): the blocking `reqwest` over rustls, with a
+# rustls verifier of its own for a pinned certificate, and `ring` for its tests' keys and
+# signatures. All three are already in the graph through `object_store` at these versions; they
+# are named here so the client can use them directly (a preamble 6.2 table addition, E2).
+reqwest = { version = "=0.12.28", default-features = false }
+rustls = { version = "=0.23.45", default-features = false }
+ring = { version = "=0.17.14", default-features = false }
 # The job document's content address (MH 4.1, 13 d.2): `sha256` of the canonical JSON.
 sha2 = { version = "=0.11.0" }
 # The settings schema each kind declares (SDD 18, decision KD1): JSON Schema 2020-12, derived from
