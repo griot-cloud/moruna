@@ -420,8 +420,15 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
 - **`api` is the engine's host.** The host protocol runs unchanged over a channel between `api` and
   the engine, instead of a socket: `api` sends `spec` and `cancel`, and reads `hello`, `heartbeat`,
   event records, `report` and `exit`.
-- **The budget** is the job document's `budget.memory_bytes`, at most the node's memory less 512 MiB
-  kept for the node's services. A larger one is refused at `validate`.
+- **The budget** is the job document's `budget.memory_bytes`, at most the node's memory less 768 MiB:
+  512 MiB kept for the node's services and 256 MiB for a check running beside a job. A larger one
+  is refused.
+- **Validation is the engine's.** `api` does not link `moruna-job`, which needs std. A document is
+  checked by the engine itself:
+  - `validate`: `node-admission` runs the engine's `check` on the document in a short-lived
+    process with a 256 MiB account, also while a job runs, and `api` returns its refusals.
+  - `submit`: the engine refuses an invalid document as it does today (exit code 2, with the
+    refusals), and `api` answers `invalid` with them.
 
 ### 3B. The job operations
 
@@ -438,7 +445,7 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
 | `GET /v1/jobs/{id}/report` | observe | The `RunReport` JSON, once the job has ended |
 
 - **A job is** `{"v1": <job document version 1 as JSON>}` or `{"v2": "<base64 of the MJB2 FlatBuffer>"}`.
-  Either is checked by `moruna-job`'s `check` before it is accepted.
+  Either is checked by the engine (3A) before it runs.
 - **The node fills in** `report.socket` (the channel), `staging` (none) and the run id when absent.
   A document that names a host socket, a `file://` path outside its volumes, or `resume` is refused
   in this release.
