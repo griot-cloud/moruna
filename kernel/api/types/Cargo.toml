@@ -1,0 +1,26 @@
+[package]
+name = "moruna-api"
+description = "The node API's requests, responses, errors and token claims, from which its OpenAPI document and MCP tool list are generated"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Host only: what generating the OpenAPI document and the MCP tool list needs, and the
+# command that writes them (`cargo run -p moruna-api --features schema`).
+schema = ["dep:schemars", "dep:serde_json"]
+
+[dependencies]
+serde = { version = "=1.0.229", default-features = false, features = ["alloc", "derive"] }
+schemars = { version = "=1.2.3", default-features = false, features = ["derive"], optional = true }
+serde_json = { version = "=1.0.154", default-features = false, features = ["alloc"], optional = true }
+
+[dev-dependencies]
+schemars = { version = "=1.2.3", default-features = false, features = ["derive"] }
+serde_json = { version = "=1.0.154", default-features = false, features = ["alloc"] }
+
+[[bin]]
+name = "moruna-api-generate"
+path = "src/bin/generate.rs"
+required-features = ["schema"]

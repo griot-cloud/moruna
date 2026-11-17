@@ -1,0 +1,421 @@
+{
+  "components": {
+    "schemas": {
+      "Audit": {
+        "description": "The answer to `GET /v1/node/audit`.",
+        "properties": {
+          "records": {
+            "description": "The most recent calls, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/AuditRecord"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "records"
+        ],
+        "type": "object"
+      },
+      "AuditRecord": {
+        "description": "The record one call leaves.",
+        "properties": {
+          "key": {
+            "description": "The first 16 hex characters of the SHA-256 of the token key's public bytes, or empty when\nthe call carried no valid token.",
+            "type": "string"
+          },
+          "operation": {
+            "description": "The operation called.",
+            "type": "string"
+          },
+          "scope": {
+            "description": "The token's scope.",
+            "items": {
+              "$ref": "#/components/schemas/Scope"
+            },
+            "type": "array"
+          },
+          "status": {
+            "description": "The HTTP status of the answer.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "time": {
+            "description": "When the call was made, in Unix seconds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "time",
+          "key",
+          "scope",
+          "operation",
+          "status"
+        ],
+        "type": "object"
+      },
+      "Cloud": {
+        "description": "The cloud a node runs on.",
+        "oneOf": [
+          {
+            "const": "openstack",
+            "description": "OpenStack, found by its instance data.",
+            "type": "string"
+          },
+          {
+            "const": "azure",
+            "description": "Azure, found by its instance data.",
+            "type": "string"
+          },
+          {
+            "const": "none",
+            "description": "No cloud: a development node, configured from a file in its image.",
+            "type": "string"
+          }
+        ]
+      },
+      "ErrorBody": {
+        "description": "The body of every error answer: `{\"error\":{\"code\":\"<code>\",\"message\":\"<text>\"}}`.",
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail",
+            "description": "What went wrong."
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      },
+      "ErrorCode": {
+        "description": "The kinds of error, each with its HTTP status.",
+        "oneOf": [
+          {
+            "const": "invalid",
+            "description": "400: the request is malformed or over a limit.",
+            "type": "string"
+          },
+          {
+            "const": "unauthorized",
+            "description": "401: the call carries no valid token.",
+            "type": "string"
+          },
+          {
+            "const": "forbidden",
+            "description": "403: the token's scope does not cover the operation.",
+            "type": "string"
+          },
+          {
+            "const": "not_found",
+            "description": "404: no such path or object.",
+            "type": "string"
+          },
+          {
+            "const": "conflict",
+            "description": "409: the request conflicts with the node's state.",
+            "type": "string"
+          },
+          {
+            "const": "busy",
+            "description": "503: the node cannot take the request now.",
+            "type": "string"
+          },
+          {
+            "const": "internal",
+            "description": "500: the node failed.",
+            "type": "string"
+          }
+        ]
+      },
+      "ErrorDetail": {
+        "description": "What went wrong, inside an error body.",
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ErrorCode",
+            "description": "The kind of error; the answer's HTTP status matches it."
+          },
+          "message": {
+            "description": "A sentence for a person to read.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "Executor": {
+        "description": "One kind of executor and how many units of work it runs at once.",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/ExecutorKind",
+            "description": "The kind of executor."
+          },
+          "slots": {
+            "description": "How many units of work it runs at once.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "slots"
+        ],
+        "type": "object"
+      },
+      "ExecutorKind": {
+        "description": "A kind of executor.",
+        "oneOf": [
+          {
+            "const": "cpu",
+            "description": "The node's CPU cores.",
+            "type": "string"
+          }
+        ]
+      },
+      "Health": {
+        "description": "The answer to `GET /v1/health`.",
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/HealthStatus",
+            "description": "Always `ok`: a node that answers is up."
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "HealthStatus": {
+        "description": "What `GET /v1/health` reports: only that the node is up.",
+        "oneOf": [
+          {
+            "const": "ok",
+            "description": "The node is up.",
+            "type": "string"
+          }
+        ]
+      },
+      "Node": {
+        "description": "The node document, the answer to `GET /v1/node`.",
+        "properties": {
+          "boot_ms": {
+            "description": "Milliseconds from the core's first instruction to ready.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cloud": {
+            "$ref": "#/components/schemas/Cloud",
+            "description": "The cloud the node found at boot."
+          },
+          "cores": {
+            "description": "The node's CPU cores.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "executors": {
+            "description": "What the node can run work on.",
+            "items": {
+              "$ref": "#/components/schemas/Executor"
+            },
+            "type": "array"
+          },
+          "health": {
+            "$ref": "#/components/schemas/NodeHealth",
+            "description": "Whether the node is healthy."
+          },
+          "instance": {
+            "description": "The cloud's ID for this machine.",
+            "type": "string"
+          },
+          "memory_bytes": {
+            "description": "The node's memory, in bytes.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "time": {
+            "description": "The node's wall clock, in Unix seconds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version": {
+            "description": "The version of Moruna the node runs.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "instance",
+          "cloud",
+          "cores",
+          "memory_bytes",
+          "executors",
+          "boot_ms",
+          "time",
+          "health"
+        ],
+        "type": "object"
+      },
+      "NodeHealth": {
+        "description": "A node's health.",
+        "oneOf": [
+          {
+            "const": "ok",
+            "description": "Healthy.",
+            "type": "string"
+          },
+          {
+            "const": "degraded",
+            "description": "Running, with a fault.",
+            "type": "string"
+          }
+        ]
+      },
+      "Scope": {
+        "description": "What a token allows. `admin` covers `submit`, and `submit` covers `observe`.",
+        "oneOf": [
+          {
+            "const": "observe",
+            "description": "Read the node.",
+            "type": "string"
+          },
+          {
+            "const": "submit",
+            "description": "Submit work, and everything `observe` allows.",
+            "type": "string"
+          },
+          {
+            "const": "admin",
+            "description": "Administer the node, and everything `submit` allows.",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "bearerFormat": "JWT",
+        "description": "A JWT signed with Ed25519 under one of the node's token keys. Its claims are aud (the node's instance ID), exp (Unix seconds, at most one hour ahead) and scope. admin covers submit, and submit covers observe.",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "A Moruna node is driven only through this API. Paths start /v1, bodies are JSON, and unknown request fields are refused.",
+    "title": "Moruna node API",
+    "version": "1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/v1/health": {
+      "get": {
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An error. Its code matches the HTTP status."
+          }
+        },
+        "security": [],
+        "summary": "Whether the node is up. The only call that needs no token."
+      }
+    },
+    "/v1/node": {
+      "get": {
+        "operationId": "node",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Node"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An error. Its code matches the HTTP status."
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "observe"
+            ]
+          }
+        ],
+        "summary": "The node document: version, instance, cloud, cores, memory, executors, boot time, clock and health."
+      }
+    },
+    "/v1/node/audit": {
+      "get": {
+        "operationId": "node_audit",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Audit"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An error. Its code matches the HTTP status."
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "admin"
+            ]
+          }
+        ],
+        "summary": "The most recent calls to the node, newest first."
+      }
+    }
+  }
+}
