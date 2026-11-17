@@ -275,10 +275,12 @@ if it does, this section changes first.
   protocol, `moruna.driver.vmbus`: list the offers of an interface, open a channel, share memory
   with the host, close.
   - Opening a channel gives the driver the ring memory, the channel's signal handle, and a wake
-    word.
+    channel: `vmbus` writes an empty message to it when the host has data (a full channel means one
+    is already pending) and closes it when the channel is gone, so a driver waits only on handles,
+    in its dispatcher, beside its clients.
   - **Out:** a driver writes its ring and signals the host itself, through its signal handle.
   - **In:** the host's interrupt reaches `vmbus`, which reads the event flags and wakes the
-    drivers whose channels have data. That is one hop on the way in, accepted for the first
+    drivers whose channels have data, through their wake channels. That is one hop on the way in, accepted for the first
     bring-up.
 - **`storvsc` and `netvsc`** are driver processes that serve today's block and network driver
   protocols, so nothing above them changes. netvsc speaks NVSP and RNDIS.
