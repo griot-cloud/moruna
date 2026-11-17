@@ -239,12 +239,16 @@ pub const WINDOWS: u64 = IN_FLIGHT;
 /// half each.
 const PLANE_HALF_PIECES: u64 = 2 * (IN_FLIGHT + 1) + 2 * WINDOWS * 3;
 
-/// Pieces a task may have queued, given to the stage and not yet posted to it, before the
-/// stage holds the worker that brings it more until it has worked some off: a morsel's pieces
-/// past what a task holds in flight wait here, not the worker. A worker that waited for a
-/// task's oldest answer before each piece past the second kept the other seven tasks waiting
-/// for it (32 MiB morsels of three pieces, the NYC gate at 20.5 GiB, 2026-11-17).
-pub const QUEUED_MAX: usize = 2 * IN_FLIGHT as usize;
+/// Pieces a task may keep queued, given to the stage and not yet posted to it, once the unit
+/// that brought them returns: none. A queued piece is a slice of its morsel and holds the
+/// morsel's memory, and a queue is fed only by the stage's next unit for that task. A run under
+/// memory pressure runs no unit until memory frees, so pieces left queued held the memory that
+/// would let the next unit run: one-month Score at a 2 GiB budget stopped with 30% of its rows
+/// in the tasks' queues, 680 s, bottleneck Memory (the NYC gate, 2026-11-17). A unit therefore
+/// posts its morsel's pieces as its task makes room, taking answers meanwhile, before it
+/// returns; a morsel of [`IN_FLIGHT`] pieces, which the sink's 64 MiB lanes keep the gate's
+/// to, posts at once and never waits.
+pub const QUEUED_MAX: usize = 0;
 
 /// How many of a task's `queued` pieces are posted to it now, with `in_flight` of its pieces
 /// posted and not answered: as many as [`IN_FLIGHT`] leaves room for.
@@ -253,7 +257,7 @@ pub fn to_post(in_flight: usize, queued: usize) -> usize {
 }
 
 /// Whether a task with `queued` pieces holds the worker that brought them, which waits for its
-/// oldest answer before it goes on: only past [`QUEUED_MAX`].
+/// oldest answer and posts another before it goes on: past [`QUEUED_MAX`].
 pub fn holds_worker(queued: usize) -> bool {
     queued > QUEUED_MAX
 }
@@ -667,9 +671,10 @@ mod tests {
         pieces: usize,
         (cost, work): (u64, u64),
         queue: bool,
-    ) -> (u64, u64) {
+    ) -> (u64, u64, usize) {
         let mut now = 0u64;
         let mut waited = 0u64;
+        let mut left = 0usize;
         // Each task: when its posted pieces end, oldest first, and its queued pieces.
         let mut posted: Vec<std::collections::VecDeque<u64>> = vec![Default::default(); tasks];
         let mut queued = vec![0usize; tasks];
@@ -706,6 +711,7 @@ mod tests {
                     waited += end - now;
                     now = end;
                 }
+                left = left.max(queued[t]);
             } else {
                 for _ in 0..pieces {
                     done(&mut posted[t], now);
@@ -727,7 +733,7 @@ mod tests {
                 queued[t] -= 1;
             }
         }
-        (free.into_iter().max().unwrap_or(0), waited)
+        (free.into_iter().max().unwrap_or(0), waited, left)
     }
 
     #[test]
@@ -737,26 +743,35 @@ mod tests {
         // and encode beside a 16 MiB piece of Score).
         // A morsel of the pieces a task holds in flight: the worker never waits.
         assert_eq!(deal(8, 64, IN_FLIGHT as usize, (10, 10), true).1, 0);
-        // More pieces than that: the extra wait in the task's queue, not the worker.
+        // More pieces than that: the worker posts them as its task makes room, and waits no
+        // longer than it did for each piece.
         let pieces = IN_FLIGHT as usize + 1;
-        let (old_end, old_waited) = deal(8, 64, pieces, (10, 10), false);
-        let (end, waited) = deal(8, 64, pieces, (10, 10), true);
-        assert!(
-            waited * 2 <= old_waited,
-            "waited {waited}, was {old_waited}"
-        );
-        assert!(end * 10 < old_end * 9, "ended at {end}, was {old_end}");
-        // Tasks slower than the worker deals: the queue's bound holds it, as it must.
-        assert!(deal(8, 64, 3, (1, 20), true).1 > 0);
-        // The queue is bounded: a task far behind holds the worker again.
-        assert!(!holds_worker(QUEUED_MAX));
-        assert!(holds_worker(QUEUED_MAX + 1));
+        let (old_end, old_waited, _) = deal(8, 64, pieces, (10, 10), false);
+        let (end, waited, _) = deal(8, 64, pieces, (10, 10), true);
+        assert!(waited <= old_waited, "waited {waited}, was {old_waited}");
+        assert!(end <= old_end, "ended at {end}, was {old_end}");
+        assert!(holds_worker(1) && !holds_worker(0));
         assert_eq!(to_post(0, 5), IN_FLIGHT as usize);
         assert_eq!(to_post(IN_FLIGHT as usize, 5), 0);
         assert_eq!(to_post(1, 0), 0);
-        // One task, all the work: the queue bounds what waits, and nothing is lost.
-        let (one, _) = deal(1, 10, 3, (1, 5), true);
+        // One task, all the work: nothing is lost.
+        let (one, _, _) = deal(1, 10, 3, (1, 5), true);
         assert_eq!(one, deal(1, 10, 3, (1, 5), false).0);
+    }
+
+    #[test]
+    fn p_a_unit_leaves_no_piece_queued_so_a_stage_the_run_stops_visiting_holds_no_input() {
+        // Whatever the morsels, the tasks and their pace, a unit returns with its task's queue
+        // empty: a run that runs no unit under memory pressure finds no stage holding morsels
+        // it cannot post (the drain that stopped one-month Score at 2 GiB for 680 s).
+        for pieces in 1..=3 * IN_FLIGHT as usize {
+            for (cost, work) in [(10, 10), (1, 20), (20, 1)] {
+                for tasks in [1, 3, 8] {
+                    let (_, _, left) = deal(tasks, 48, pieces, (cost, work), true);
+                    assert_eq!(left, 0, "{pieces} pieces, {tasks} tasks, ({cost}, {work})");
+                }
+            }
+        }
     }
 
     #[test]
