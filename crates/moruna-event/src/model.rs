@@ -6,7 +6,9 @@
 //! e.4). Every task event names the step of the run's plan that runs the task, `step`: `None`
 //! only when the document was refused before it was planned (SDD 26).
 
-use serde::Serialize;
+use alloc::{format, string::String, vec::Vec};
+
+use serde::{Serialize, Serializer};
 
 /// The version of the `event` this build writes (MH 4.3). Version 7 is the first whose event is a
 /// record (SDD 21) carrying its fact as FlatBuffers; version 6 was a line of JSON.
@@ -613,20 +615,15 @@ struct LogLine<'a> {
     truncated: u64,
 }
 
-impl EventMsg {
-    /// The event as the JSON people and `moruna run --events-json` read, one line, newline
-    /// included: `type`, who told it and when, then the fact, every field written out, nulls
-    /// included. The names are the version 6 line's, with `v` 7; a record of output carries its
-    /// `id`, `<start>/<producer>/<seq>`.
-    pub fn json_line(&self) -> String {
-        let mut text = self.json_text();
-        text.push('\n');
-        text
-    }
+/// An event as its JSON rendering, for a serializer: what [`EventMsg::rendering`] hands out and
+/// [`EventMsg::json_text`] writes.
+#[derive(Clone, Copy, Debug)]
+pub struct Rendering<'a>(&'a EventMsg);
 
-    /// [`Self::json_line`] without the newline.
-    pub fn json_text(&self) -> String {
-        let rendered = match &self.body {
+impl Serialize for Rendering<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let event = self.0;
+        match &event.body {
             Event::Log {
                 task,
                 stream,
@@ -636,19 +633,19 @@ impl EventMsg {
                 partial,
                 continued,
                 truncated,
-            } => serde_json::to_string(&LogLine {
+            } => LogLine {
                 kind_of: "event",
                 v: EVENTS_VERSION,
-                attempt: self.attempt,
-                start: &self.start,
-                seq: self.seq,
-                t_us: self.t_us,
+                attempt: event.attempt,
+                start: &event.start,
+                seq: event.seq,
+                t_us: event.t_us,
                 kind: "log",
                 id: &format!(
                     "{}/{}/{}",
-                    self.start,
+                    event.start,
                     task.as_deref().unwrap_or(ENGINE),
-                    self.seq
+                    event.seq
                 ),
                 task,
                 stream: *stream,
@@ -658,23 +655,50 @@ impl EventMsg {
                 partial: *partial,
                 continued: *continued,
                 truncated: *truncated,
-            }),
-            body => serde_json::to_string(&Line {
+            }
+            .serialize(serializer),
+            body => Line {
                 kind_of: "event",
                 v: EVENTS_VERSION,
-                attempt: self.attempt,
-                start: &self.start,
-                seq: self.seq,
-                t_us: self.t_us,
+                attempt: event.attempt,
+                start: &event.start,
+                seq: event.seq,
+                t_us: event.t_us,
                 body,
-            }),
-        };
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+impl EventMsg {
+    /// The event's JSON rendering, for a serializer of the reader's own: `type`, who told it and
+    /// when, then the fact, every field written out, nulls included. The names are the version
+    /// 6 line's, with `v` 7; a record of output carries its `id`, `<start>/<producer>/<seq>`.
+    pub fn rendering(&self) -> Rendering<'_> {
+        Rendering(self)
+    }
+
+    /// The event as the JSON people and `moruna run --events-json` read, one line, newline
+    /// included: [`Self::rendering`] as text.
+    #[cfg(feature = "std")]
+    pub fn json_line(&self) -> String {
+        let mut text = self.json_text();
+        text.push('\n');
+        text
+    }
+
+    /// [`Self::json_line`] without the newline.
+    #[cfg(feature = "std")]
+    pub fn json_text(&self) -> String {
         // Every field is a string, a number, a boolean or a list of them: serialising cannot
         // fail, and if it ever did the line says so rather than being empty.
-        rendered.unwrap_or_else(|e| format!("{{\"type\":\"event\",\"render_error\":\"{e}\"}}"))
+        serde_json::to_string(&self.rendering())
+            .unwrap_or_else(|e| format!("{{\"type\":\"event\",\"render_error\":\"{e}\"}}"))
     }
 
     /// The event as a JSON value, for a reader that wants fields and not text.
+    #[cfg(feature = "std")]
     pub fn to_value(&self) -> serde_json::Value {
         serde_json::from_str(&self.json_text()).unwrap_or(serde_json::Value::Null)
     }

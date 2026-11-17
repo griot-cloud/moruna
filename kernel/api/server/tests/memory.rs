@@ -7,7 +7,12 @@
 //! The test is alone in its own binary, so that nothing else allocates while it measures.
 mod common;
 
-use common::{Client, End, Harness, INSTANCE, Pipe, TestClock, facts, pinned, signer::Signer};
+use common::{
+    Client, End, Harness, INSTANCE, Pipe, TestClock,
+    engine::{Engine, RUN},
+    facts, pinned,
+    signer::Signer,
+};
 use moruna_api_server::{BODY_BUDGET, BODY_LIMIT, Config, Identity, OPEN_LIMIT, Server, TokenKey};
 use rustls::{ClientConnection, pki_types::ServerName};
 use std::{
@@ -116,13 +121,24 @@ fn connect(harness: &mut Harness) -> usize {
 
 /// Polls the server, counted, and pumps the clients until nothing moves.
 fn settle(harness: &mut Harness) {
-    for _ in 0..10_000 {
+    settle_but(harness, usize::MAX);
+}
+
+/// As [`settle`], with client `stalled` reading nothing: what the server sends it stays where
+/// the server put it.
+fn settle_but(harness: &mut Harness, stalled: usize) {
+    let mut quiet = 0;
+    for _ in 0..100_000 {
         as_server(|| harness.server.poll());
-        if !harness.clients.iter_mut().any(Client::pump) {
-            as_server(|| harness.server.poll());
-            if !harness.clients.iter_mut().any(Client::pump) {
-                return;
+        let mut moved = false;
+        for (index, client) in harness.clients.iter_mut().enumerate() {
+            if index != stalled {
+                moved |= client.pump();
             }
+        }
+        quiet = if moved { 0 } else { quiet + 1 };
+        if quiet == 4 {
+            return;
         }
     }
     panic!("the exchange never settled");
@@ -134,14 +150,16 @@ fn eighty_connections_with_1_mib_bodies_and_no_token_stay_under_32_mib() {
     let identity = Identity::generate(INSTANCE, common::WALL).unwrap();
     let fingerprint = identity.fingerprint();
     let clock = TestClock::new();
+    let engine = Engine::new();
     let server = as_server(|| {
-        Server::new(
+        Server::with_engine(
             Config {
                 identity,
                 facts: facts(),
                 token_keys: vec![TokenKey::new(signer.public())],
             },
             clock.clone(),
+            Box::new(engine.clone()),
         )
         .unwrap()
     });
@@ -151,6 +169,7 @@ fn eighty_connections_with_1_mib_bodies_and_no_token_stay_under_32_mib() {
         fingerprint,
         clients: Vec::new(),
         signer,
+        engine,
     };
 
     // 80 connections at once, each sending a whole 1 MiB body with no token.
@@ -231,6 +250,97 @@ fn eighty_connections_with_1_mib_bodies_and_no_token_stay_under_32_mib() {
     let peak = PEAK.load(Ordering::Relaxed);
     report("80 bodies with a token, eight held at once", peak);
     assert!(peak < 32 * 1024 * 1024, "peak {peak} bytes");
+
+    // A job runs and tells far more records than the node's buffer keeps, while a reader of
+    // its events has stopped reading, and eight documents of 1 MiB wait for the engine's check.
+    PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+    let submit = harness.token(&["submit"]);
+    let job = r#"{"v1":{"moruna_spec":1,"source":{"kind":"rows"},"sink":{"kind":"count"}}}"#;
+    let submitter = connect(&mut harness);
+    harness.clients[submitter].send(&Harness::post("/v1/jobs", &submit, job));
+    settle(&mut harness);
+    harness.engine.attempt_started();
+    settle(&mut harness);
+    assert_eq!(harness.clients[submitter].response().unwrap().status, 201);
+    let reader = connect(&mut harness);
+    harness.clients[reader].send(
+        format!(
+            "GET /v1/jobs/{RUN}/events HTTP/1.1\r\nHost: node\r\n{}\r\n",
+            Harness::bearer(&token)
+        )
+        .as_bytes(),
+    );
+    settle(&mut harness);
+    assert!(
+        harness.clients[reader]
+            .received
+            .starts_with(b"HTTP/1.1 200 OK\r\n")
+    );
+    // From here the reader takes nothing more, and the server may hold 4 KiB for it.
+    harness.clients[reader].pipe.borrow_mut().capacity = Some(4096);
+    harness.engine.0.borrow_mut().hold_checks = true;
+    let document = {
+        let start = r#"{"v1":{"pad":""#;
+        let mut document = start.as_bytes().to_vec();
+        document.resize(BODY_LIMIT - 3, b'x');
+        document.extend_from_slice(br#""}}"#);
+        String::from_utf8(document).unwrap()
+    };
+    let waiting: Vec<usize> = (0..BODY_BUDGET / BODY_LIMIT)
+        .map(|_| {
+            let client = connect(&mut harness);
+            harness.clients[client].send(&Harness::post("/v1/jobs/validate", &submit, &document));
+            client
+        })
+        .collect();
+    settle_but(&mut harness, reader);
+    let line = "a line of a task's output, as long as such lines are. ".repeat(4);
+    for batch in 0..60 {
+        for _ in 0..1_000 {
+            harness.engine.log("source", &line);
+        }
+        harness.engine.heartbeat(batch * 1_000);
+        settle_but(&mut harness, reader);
+    }
+    let held = harness.clients[reader].pipe.borrow().to_client.len();
+    assert!(held <= 4096, "the stalled reader's pipe holds {held} bytes");
+    let peak = PEAK.load(Ordering::Relaxed);
+    report(
+        "a job telling 60,000 records, a reader that stopped, eight documents waiting",
+        peak,
+    );
+    assert!(
+        peak > 8 * 1024 * 1024,
+        "the buffer and the documents were held: {peak}"
+    );
+    assert!(peak < 32 * 1024 * 1024, "peak {peak} bytes");
+
+    // The documents are checked, the job ends, and the reader, reading again, is sent the rest
+    // from the oldest record the buffer still holds, then the report and the exit.
+    harness.engine.0.borrow_mut().hold_checks = false;
+    harness.engine.finish(r#"{"rows_out":60000}"#, 0, None);
+    harness.clients[reader].pipe.borrow_mut().capacity = None;
+    settle(&mut harness);
+    for &client in &waiting {
+        assert_eq!(harness.clients[client].response().unwrap().status, 200);
+    }
+    let stream = String::from_utf8(std::mem::take(&mut harness.clients[reader].received)).unwrap();
+    assert!(
+        stream.ends_with("\"diagnostic\":null}\n\n"),
+        "it reached the exit"
+    );
+    assert!(stream.contains("event: report\n"));
+    let ids: Vec<u64> = stream
+        .lines()
+        .filter_map(|line| line.strip_prefix("id: "))
+        .map(|id| id.parse().unwrap())
+        .collect();
+    assert_eq!(ids.last(), Some(&60_001), "the last record");
+    assert!(
+        ids.windows(2).any(|pair| pair[1] > pair[0] + 1),
+        "with a gap where it fell behind"
+    );
+    assert!(harness.clients[reader].server_closed());
 }
 
 fn report(case: &str, peak: usize) {
