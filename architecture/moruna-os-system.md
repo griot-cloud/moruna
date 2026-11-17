@@ -72,7 +72,7 @@ Implements the OS design, section 1, OpenStack column.
 - **Limits:** services started within 5 s; an address within 30 s; instance data within 90 s.
 - **Failure:** one line, `moruna: fatal <stage>: <reason>`, then the machine powers off. A node
   never hangs silently, never restarts itself in a loop, and never offers a prompt. A service that
-  dies stops the node (SDD 33).
+  dies stops the node (SDD 33), except `api`, which is restarted (2B).
 - **Power-off is ACPI S5 on every machine:** SLP_TYPa from the DSDT's `\_S5` object (found by
   scanning the DSDT for `_S5_` and reading the package that follows, as small kernels do),
   written with SLP_EN to the FADT's PM1a control register. OSTD today powers off only through
@@ -271,8 +271,18 @@ Implements the OS design, section 2.
 
 ### 2B. The `api` server
 
-- **A process on `moruna-svc`,** with a 64 MiB account, on no worker's core. If it dies, the node
-  stops (1B).
+- **A process on `moruna-svc`,** with a 64 MiB account, on no worker's core.
+- **If `api` dies, the node keeps running** (the OS design's step 2) and the supervisor starts it
+  again, at most 5 times in 10 minutes; a sixth death is fatal (1B). A restarted `api` needs fresh
+  channels, so:
+  - **its listener:** the supervisor holds a network-server client whose grant has only the `grant`
+    right, limited to listening on 443. At each start it mints `api`'s listener channel from it
+    (`Client::grant`).
+  - **its hand-over:** the supervisor makes a fresh `platform`-`api` channel pair at each start and
+    sends `platform` its end over a supervisor-to-`platform` control channel. `platform` keeps the
+    validated config and sends the hand-over again.
+  - **its identity:** a restarted `api` makes a new key and certificate when node config has no
+    `tls`, and prints the new fingerprint line. The audit ring starts empty.
 - **Two crates.** The logic (HTTP, TLS, routing, tokens, audit, MCP) is the library
   `moruna-api-server` (`kernel/api/server`, no std, with alloc). It talks to a byte-stream trait, so
   every behaviour is tested on the host. The program `moruna-node-api` (`kernel/node/api`, from item
@@ -332,11 +342,13 @@ Implements the OS design, section 2.
 | Item | Build | Success | Needs |
 |---|---|---|---|
 | 2.1 | `moruna-api`: step 2's types, the generated OpenAPI document and MCP tool list (2A) | Host tests pass; the drift test fails when a type changes without regenerating | none |
-| 2.2 | The `api` server: TLS, HTTP/1.1, the three operations, the limits (2B) | Booted in QEMU: `health` and `node` answer over HTTPS; each limit holds | 1.4, 2.1 |
-| 2.3 | Tokens and audit (2C) | A bad signature, a wrong `aud`, an expired or over-long `exp`, and a missing scope are each refused; each call appears in `audit` | 2.2 |
-| 2.4 | MCP (2D) | An MCP client lists the three tools and calls `moruna_node` on a booted node | 2.2 |
+| 2.2 | The server library `moruna-api-server`: TLS, HTTP/1.1, the three operations, the limits (2B) | Host tests through a real TLS client; each limit holds | 2.1 |
+| 2.2b | `moruna-node-api` serves through the library: identity, node facts, tokens from node config | Booted in QEMU: `health`, `node` and `audit` answer over HTTPS; the `tls` line appears | 1.4, 2.3 |
+| 2.2c | Restarting `api` (2B) | Booted: `api` killed three times, the node keeps answering after each; a sixth death in 10 minutes powers off | 2.2b |
+| 2.3 | Tokens and audit (2C), in the library | A bad signature, a wrong `aud`, an expired or over-long `exp`, and a missing scope are each refused; each call appears in `audit` | 2.2 |
+| 2.4 | MCP (2D), in the library | An MCP client lists the three tools and calls `moruna_node`, on the host and then on a booted node | 2.3 |
 | 2.5 | The CLI and the generated clients (2E) | All three read `node` from a booted node | 2.1, 2.2 |
-| 2.6 | Proof on both clouds | From outside the cloud, `node` answers over HTTPS and over MCP on Servercore and on Azure; a bad token is refused | 1.6, 1.13, 2.3, 2.4 |
+| 2.6 | Proof on both clouds | From outside the cloud, `node` answers over HTTPS and over MCP on Servercore and on Azure; a bad token is refused; killing `api` leaves the node answering | 1.6, 1.13, 2.2c, 2.4 |
 
 ## 3. Wiring (Draft)
 
