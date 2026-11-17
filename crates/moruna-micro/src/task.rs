@@ -282,17 +282,22 @@ pub struct ImageTask {
     rings: bool,
     /// The native program the stage starts itself (`abi: moruna`): its ELF.
     native: Option<Arc<[u8]>>,
-    /// How many of the stage's tasks hold a batch now, and the most that ever did.
+    /// What the stage's tasks share: how many hold a batch, their answers' schema, and what
+    /// each did, for the run's report.
     busy: Arc<Busy>,
-    /// What each task did, by instance, once it ended at the stage's end: the run's report.
-    figures: Mutex<Vec<Option<layout::TaskFigures>>>,
 }
 
-/// A ring stage's tasks holding batches: now, and the most at once.
+/// What a ring stage's tasks share.
 #[derive(Debug, Default)]
 struct Busy {
+    /// Tasks holding a batch now, and the most at once.
     now: std::sync::atomic::AtomicUsize,
     peak: std::sync::atomic::AtomicUsize,
+    /// The schema of the stage's answers, from the first any task gave: the stage waits for
+    /// one answer, not one a task, before it stands batches of no rows in for answers.
+    schema: Mutex<Option<moruna_kernel::arrow::datatypes::SchemaRef>>,
+    /// What each task did, by instance, summed over the tasks an instance had.
+    figures: Mutex<Vec<Option<layout::TaskFigures>>>,
 }
 
 impl Busy {
@@ -368,8 +373,10 @@ impl ImageTask {
             assets_path: None,
             rings,
             native: None,
-            busy: Arc::default(),
-            figures: Mutex::new(vec![None; processes]),
+            busy: Arc::new(Busy {
+                figures: Mutex::new(vec![None; processes]),
+                ..Busy::default()
+            }),
         })
     }
 
@@ -500,7 +507,7 @@ impl ImageTask {
         self.rings.then(|| {
             layout::stage_note(
                 &self.name,
-                &lock(&self.figures),
+                &lock(&self.busy.figures),
                 self.busy.peak.load(std::sync::atomic::Ordering::Relaxed),
             )
         })
@@ -558,7 +565,12 @@ impl ImageTask {
                 "image `{name}`: the stage has no ceiling; the run binds it before the task starts"
             ))
         })?;
-        let budget = ceiling.min(PLANE_BUDGET_MAX);
+        // A native task's plane comes out of its share at its real size, beside its account.
+        let budget = if self.native.is_some() {
+            layout::native_split(ceiling).0
+        } else {
+            ceiling.min(PLANE_BUDGET_MAX)
+        };
         let mut plane = RingPlane::new(Calls, budget);
         let (task, port) = if self.rings {
             let sizes = layout::ring_sizes(budget);
@@ -795,6 +807,7 @@ impl ImageTask {
             deferred: 0,
             instance: ctx.instance,
             cpu: self.cpu_of(ctx.instance),
+            recorded: false,
         }
     }
 }
@@ -854,10 +867,14 @@ pub struct TaskState {
     /// Which of the stage's tasks it is, and the CPU it was placed on.
     instance: usize,
     cpu: Option<u32>,
+    /// Its figures are in the stage's ([`TaskState::record`]).
+    recorded: bool,
 }
 
 impl Drop for TaskState {
     fn drop(&mut self) {
+        // A task retired before its stage's end is still in the report.
+        self.record();
         // Read an already-available ORIGINAL terminal reply, never manufacture one
         // from a close or a transient zero while a start request may still be queued.
         let _ = self.answer(0);
@@ -922,6 +939,27 @@ enum Seen {
 struct Mapped(#[allow(dead_code)] moruna_svc::Mapping<'static>);
 
 impl TaskState {
+    /// Adds what this task did to its instance's figures in the stage's, once.
+    fn record(&mut self) {
+        if std::mem::replace(&mut self.recorded, true) {
+            return;
+        }
+        let (peak, limit) = match self.memory.usage() {
+            Some(Ok(u)) => (u.peak, u.limit),
+            _ => (0, 0),
+        };
+        if let Some(slot) = lock(&self.busy.figures).get_mut(self.instance) {
+            let f = slot.get_or_insert_with(layout::TaskFigures::default);
+            f.states += 1;
+            f.batches += self.sent;
+            f.records += self.received;
+            f.deferred += self.deferred;
+            f.cpu = self.cpu;
+            f.peak = f.peak.max(peak);
+            f.limit = limit;
+        }
+    }
+
     /// Takes the task's lines out of its ring: to the stage's output (MH 4.3 `log`), and its
     /// standard error to the tail a failure quotes.
     fn drain_log(&mut self) {
@@ -1433,6 +1471,9 @@ impl TaskState {
         names: &[String],
     ) -> Result<Payload> {
         let piece = layout::ring_sizes(self.plane.residency().budget).piece;
+        if self.schema.is_none() {
+            self.schema = lock(&self.busy.schema).clone();
+        }
         let mut taken = Vec::new();
         for part in self.pieces(batch, piece)? {
             while self.in_flight.len() >= IN_FLIGHT {
@@ -1490,7 +1531,9 @@ impl TaskState {
         }
         let answer = answer?;
         if let (None, Payload::Table(batch, _)) = (&self.schema, &answer) {
-            self.schema = Some(batch.schema());
+            let schema = batch.schema();
+            lock(&self.busy.schema).get_or_insert_with(|| Arc::clone(&schema));
+            self.schema = Some(schema);
         }
         Ok(answer)
     }
@@ -1825,20 +1868,7 @@ impl Kernel for ImageTask {
                             busy_peak = self.busy.peak.load(std::sync::atomic::Ordering::Relaxed),
                             "image task exited 0"
                         );
-                        let (peak, limit) = match st.memory.usage() {
-                            Some(Ok(u)) => (u.peak, u.limit),
-                            _ => (0, 0),
-                        };
-                        if let Some(slot) = lock(&self.figures).get_mut(st.instance) {
-                            *slot = Some(layout::TaskFigures {
-                                batches: st.sent,
-                                records: st.received,
-                                deferred: st.deferred,
-                                cpu: st.cpu,
-                                peak,
-                                limit,
-                            });
-                        }
+                        st.record();
                         Ok(rest)
                     }
                     _ => Err(st.failed("it ended")),

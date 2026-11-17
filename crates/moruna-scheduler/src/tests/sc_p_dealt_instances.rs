@@ -48,15 +48,20 @@ impl Kernel for Dealt {
 
 /// Applies per instance, on one worker.
 fn applies(deals: bool) -> BTreeMap<usize, usize> {
-    let kernel = Arc::new(StatefulKernel::new(4).latency(Duration::from_micros(100)));
+    applies_on(deals, 4, 1, 200)
+}
+
+/// Applies per instance of `instances`, on `workers` workers, over `morsels` morsels.
+fn applies_on(deals: bool, instances: usize, workers: u16, morsels: u32) -> BTreeMap<usize, usize> {
+    let kernel = Arc::new(StatefulKernel::new(instances).latency(Duration::from_micros(300)));
     let rig = RigBuilder::new()
         .cfg(|cfg| {
-            cfg.workers_max = 1;
-            cfg.workers_active = 1;
+            cfg.workers_max = workers;
+            cfg.workers_active = workers;
             cfg.initial_morsel_target = 8;
             cfg.read_ahead = 4;
         })
-        .source(FakeSource::new().splits(1, 200, 1_600))
+        .source(FakeSource::new().splits(1, u64::from(morsels), u64::from(morsels) * 8))
         .kernel(Arc::new(Dealt(kernel.clone(), deals)))
         .go();
     rig.scheduler
@@ -94,4 +99,18 @@ fn sc_p_one_worker_deals_batches_to_every_instance_in_turn() {
 fn sc_p_without_dealing_one_worker_feeds_the_one_instance_it_holds() {
     let per = applies(false);
     assert_eq!(per.len(), 1, "a worker keeps its instance (f.4): {per:?}");
+}
+
+#[test]
+fn sc_p_several_workers_deal_every_instance_some_of_few_batches() {
+    // The gate's shape: eight tasks, a few dozen batches, several workers.
+    for workers in [1, 2, 4, 8] {
+        let per = applies_on(true, 8, workers, 34);
+        assert_eq!(
+            per.len(),
+            8,
+            "{workers} workers: every instance took batches: {per:?}"
+        );
+        assert_eq!(per.values().sum::<usize>(), 34);
+    }
 }
