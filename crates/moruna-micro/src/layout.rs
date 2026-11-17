@@ -25,6 +25,70 @@ pub fn task_limit(ceiling: u64, room: u64) -> Option<u64> {
     (limit >= TASK_MIN).then_some(limit)
 }
 
+/// The most a native task's account is carved at (`abi: moruna`): what such a task holds is
+/// its process, its image and its heap; its batches and records are in the engine's plane, not
+/// in its account. A stage's whole share (the run's `child_share`) was carved for each task,
+/// and the stage's outside memory counts every carved limit as held: eight Score tasks at
+/// 20.5 GiB put 14.8 GiB on the engine's samples at stage start, near the controller's
+/// memory trip (the NYC gate, 2026-11-17).
+pub const NATIVE_TASK_MAX: u64 = 512 << 20;
+
+// Eight native tasks are counted at no more than 4 GiB together.
+const _: () = assert!(8 * NATIVE_TASK_MAX <= 4 << 30);
+
+/// [`task_limit`] for a native task: also at most [`NATIVE_TASK_MAX`].
+pub fn native_task_limit(ceiling: u64, room: u64) -> Option<u64> {
+    task_limit(ceiling.min(NATIVE_TASK_MAX), room)
+}
+
+/// The CPU a stage's task `instance` is placed on, of `cpus`: one after the instance, so the
+/// first CPU, where the engine's first worker deals the stage's batches, takes a task last.
+pub fn task_cpu(instance: usize, cpus: usize) -> u32 {
+    u32::try_from((instance + 1) % cpus.max(1)).unwrap_or(0)
+}
+
+/// What one task of a stage did, for the run's report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TaskFigures {
+    /// Batches it was given.
+    pub batches: u64,
+    /// Records it put.
+    pub records: u64,
+    /// Answers the stage gave as batches of no rows, the answer coming later.
+    pub deferred: u64,
+    /// The CPU it was placed on.
+    pub cpu: Option<u32>,
+    /// Its account's peak, in bytes.
+    pub peak: u64,
+    /// Its account's limit, in bytes.
+    pub limit: u64,
+}
+
+/// The run report's note of a ring stage's tasks: each one's batches, CPU and account, and
+/// the most of them that held a batch at once (`busy_peak`). Tasks with no figures (not ended
+/// as the stage ended) are said as such.
+pub fn stage_note(stage: &str, tasks: &[Option<TaskFigures>], busy_peak: usize) -> String {
+    let mut note = format!(
+        "image `{stage}`: {} tasks, busy_peak {busy_peak} (the most holding a batch at once)",
+        tasks.len()
+    );
+    for (i, t) in tasks.iter().enumerate() {
+        match t {
+            Some(t) => note.push_str(&format!(
+                "; task {i}: {} batches, {} records, {} deferred, cpu {}, account peak {} of {} bytes",
+                t.batches,
+                t.records,
+                t.deferred,
+                t.cpu.map_or_else(|| "any".to_string(), |c| c.to_string()),
+                t.peak,
+                t.limit
+            )),
+            None => note.push_str(&format!("; task {i}: no figures")),
+        }
+    }
+    note
+}
+
 /// The name of a stage's task's account: `task.` and the stage's name, in the kernel's
 /// alphabet (`[a-z0-9._-]`, other bytes as `-`), at most 32 bytes.
 pub fn account_name(stage: &str) -> String {
@@ -118,11 +182,15 @@ pub fn pieces<'a>(len: u64, framing: &'a [u8], body: &[(u64, &'a [u8])]) -> Opti
     Some(out)
 }
 
-/// The sizes of a ring task's plane, from the stage's plane budget (SDD 30 f.6): its input
-/// region a quarter of it, and two windows each an eighth, so the region, the rings object in
-/// use and one handed back with its records still held fit the budget together.
+/// The sizes of a ring task's plane (SDD 30 f.6), from what it holds in flight: the largest
+/// record the engine lays out for it (a piece: a bigger batch goes to the task cut into
+/// pieces), [`IN_FLIGHT`] of them and one more in its input region, and two windows of two
+/// pieces each, for an answer up to twice its batch. The region, the rings object in use and
+/// one handed back with its records still held fit the stage's plane budget together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RingSizes {
+    /// The largest record the engine lays out for the task.
+    pub piece: u64,
     /// The input region's bytes.
     pub region: u64,
     /// The windows of a rings object.
@@ -130,6 +198,15 @@ pub struct RingSizes {
     /// Each window's bytes.
     pub window: u64,
 }
+
+/// Batches each of a ring stage's tasks holds at once: one it works on while the engine lays
+/// out the next, so one engine worker keeps every task of the stage busy.
+pub const IN_FLIGHT: u64 = 2;
+
+/// The largest piece: the region and windows it makes are what a task holds in flight, never a
+/// share of the budget. Budget shares made each task's plane up to 512 MiB, all of it zeroed
+/// when it was made and charged to the engine (the NYC gate, 2026-11-17).
+pub const PIECE_MAX: u64 = 16 << 20;
 
 /// The least region and window: a record of a small batch and its framing.
 pub const RING_MIN: u64 = 1 << 20;
@@ -149,14 +226,44 @@ pub const RINGS_HEAD_MAX: u64 = 1 << 20;
 /// (`Kernel(Limit)` opening the task's plane, the NYC gate at 8 GiB and more, 2026-11-17).
 pub fn ring_sizes(budget: u64) -> RingSizes {
     const WINDOWS: u64 = 2;
-    let quarter = (budget / 4) & !(PAGE - 1);
-    let eighth = (budget / 8) & !(PAGE - 1);
-    let window_max = ((OBJECT_MAX - RINGS_HEAD_MAX) / WINDOWS) & !(PAGE - 1);
+    // The region (IN_FLIGHT + 1 pieces) and two rings objects (two windows of two pieces each).
+    const PIECES: u64 = (IN_FLIGHT + 1) + 2 * WINDOWS * 2;
+    let piece = ((budget / PIECES) & !(PAGE - 1)).clamp(RING_MIN, PIECE_MAX);
     RingSizes {
-        region: quarter.clamp(RING_MIN, WINDOW_MAX.min(OBJECT_MAX)),
+        piece,
+        region: (IN_FLIGHT + 1) * piece,
         windows: WINDOWS,
-        window: eighth.clamp(RING_MIN, window_max),
+        window: 2 * piece,
     }
+}
+
+// The largest plane is well within the kernel's largest object.
+const _: () = assert!((IN_FLIGHT + 1) * PIECE_MAX <= OBJECT_MAX);
+const _: () = assert!(2 * 2 * PIECE_MAX + RINGS_HEAD_MAX <= OBJECT_MAX);
+
+/// The most of a stage's budget one native task stands for (the run's `child_share`): its
+/// account, and its plane at its largest.
+pub const NATIVE_CHILD_MAX: u64 = NATIVE_TASK_MAX + ((IN_FLIGHT + 1) + 2 * 2 * 2) * PIECE_MAX;
+
+// A native task stands for less than a gibibyte of its stage's budget.
+const _: () = assert!(NATIVE_CHILD_MAX < 1 << 30);
+
+/// Rows of a batch of `rows` rows whose record is `len` bytes cut into pieces of at most
+/// `piece` bytes, by its bytes a row, a tenth spare for the framing and the pages: each piece's
+/// first row and row count, in order. One piece when it fits, or when it has one row.
+pub fn cut(rows: usize, len: u64, piece: u64) -> Vec<(usize, usize)> {
+    if len <= piece || rows <= 1 || piece == 0 {
+        return vec![(0, rows)];
+    }
+    let target = piece - piece / 10;
+    let count = usize::try_from(len.div_ceil(target.max(1)))
+        .unwrap_or(rows)
+        .clamp(1, rows);
+    let each = rows.div_ceil(count);
+    (0..rows)
+        .step_by(each)
+        .map(|at| (at, each.min(rows - at)))
+        .collect()
 }
 
 /// A stage's cleanup of its task's account (SB-I9): the task's `process` handle, for a native
@@ -412,22 +519,60 @@ mod tests {
     }
 
     #[test]
-    fn p_ring_sizes_fit_the_budget() {
+    fn p_ring_sizes_are_what_a_task_holds_in_flight() {
         const MIB: u64 = 1 << 20;
+        // A big budget: the largest piece, three of them in the region, windows of two.
         let s = ring_sizes(1 << 30);
         assert_eq!(
             s,
             RingSizes {
-                region: 256 * MIB,
+                piece: PIECE_MAX,
+                region: 3 * PIECE_MAX,
                 windows: 2,
-                window: (255 * MIB / 2) & !(PAGE - 1),
+                window: 2 * PIECE_MAX,
             }
         );
-        assert!(s.region + 2 * s.windows * s.window <= 1 << 30);
+        assert_eq!(ring_sizes(u64::MAX), s, "never more, whatever the budget");
+        // In use: the region and one rings object, 112 MiB at most, where 512 MiB were.
+        assert_eq!(s.region + s.windows * s.window, 112 * MIB);
+        // A small budget: the region, the rings object and one handed back fit it.
+        for budget in [16 * MIB, 64 * MIB, 100 * MIB + 5, 150 * MIB] {
+            let s = ring_sizes(budget);
+            assert!(
+                s.region + 2 * s.windows * s.window <= budget,
+                "{budget}: {s:?}"
+            );
+            assert_eq!(
+                (s.piece % PAGE, s.region, s.window),
+                (0, 3 * s.piece, 2 * s.piece)
+            );
+        }
         let small = ring_sizes(MIB);
-        assert_eq!((small.region, small.window), (RING_MIN, RING_MIN));
-        assert_eq!(ring_sizes(16 * MIB + 5).region % PAGE, 0);
-        assert_eq!(ring_sizes(u64::MAX).region, WINDOW_MAX);
+        assert_eq!((small.piece, small.region), (RING_MIN, 3 * RING_MIN));
+    }
+
+    #[test]
+    fn p_a_batch_past_a_piece_is_cut_into_pieces_in_order() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(cut(1000, 10 * MIB, 16 * MIB), [(0, 1000)], "fits");
+        assert_eq!(
+            cut(1, 100 * MIB, 16 * MIB),
+            [(0, 1)],
+            "one row is one piece"
+        );
+        let pieces = cut(1_000_000, 100 * MIB, 16 * MIB);
+        assert!(pieces.len() >= 7, "{}", pieces.len());
+        // Every row once, in order, and each piece's share of the bytes under a piece.
+        let mut next = 0;
+        for &(at, rows) in &pieces {
+            assert_eq!(at, next);
+            assert!(rows > 0);
+            assert!((100 * MIB) * rows as u64 / 1_000_000 <= 16 * MIB - 16 * MIB / 10 + MIB);
+            next = at + rows;
+        }
+        assert_eq!(next, 1_000_000);
+        // Fewer rows than pieces: one row each at most.
+        assert_eq!(cut(3, 100 * MIB, 16 * MIB), [(0, 1), (1, 1), (2, 1)]);
     }
 
     #[test]
@@ -452,6 +597,58 @@ mod tests {
             assert!(s.window >= RING_MIN && s.region >= RING_MIN);
             assert_eq!((s.region % PAGE, s.window % PAGE), (0, 0));
         }
+    }
+
+    #[test]
+    fn p_a_native_task_s_account_is_its_process_s_not_the_stage_s_share() {
+        const MIB: u64 = 1 << 20;
+        // A share of 1.85 GiB and plenty of room: the native task is carved at its most.
+        assert_eq!(
+            native_task_limit(1894 * MIB, 32 << 30),
+            Some(NATIVE_TASK_MAX)
+        );
+        assert_eq!(task_limit(1894 * MIB, 32 << 30), Some(1894 * MIB));
+        // A smaller share, or less room, is what it is.
+        assert_eq!(native_task_limit(100 * MIB, 32 << 30), Some(100 * MIB));
+        assert_eq!(native_task_limit(1 << 30, 300 * MIB), Some(150 * MIB));
+        assert_eq!(native_task_limit(1 << 30, 20 * MIB), None, "under TASK_MIN");
+    }
+
+    #[test]
+    fn p_a_stage_s_tasks_go_one_to_a_cpu_the_dealer_s_last() {
+        let cpus: Vec<u32> = (0..8).map(|i| task_cpu(i, 8)).collect();
+        assert_eq!(cpus, [1, 2, 3, 4, 5, 6, 7, 0]);
+        assert_eq!(task_cpu(8, 8), 1, "more tasks than CPUs go round again");
+        assert_eq!(task_cpu(0, 1), 0);
+        assert_eq!(task_cpu(3, 0), 0, "no CPU count: the first");
+    }
+
+    #[test]
+    fn p_the_report_says_each_task_s_batches_cpu_and_account() {
+        let t = TaskFigures {
+            batches: 12,
+            records: 13,
+            deferred: 2,
+            cpu: Some(3),
+            peak: 40 << 20,
+            limit: NATIVE_TASK_MAX,
+        };
+        let note = stage_note("score", &[Some(t), None, Some(TaskFigures::default())], 2);
+        assert!(
+            note.starts_with("image `score`: 3 tasks, busy_peak 2"),
+            "{note}"
+        );
+        assert!(
+            note.contains(
+                "task 0: 12 batches, 13 records, 2 deferred, cpu 3, account peak 41943040 of 536870912 bytes"
+            ),
+            "{note}"
+        );
+        assert!(note.contains("task 1: no figures"), "{note}");
+        assert!(
+            note.contains("task 2: 0 batches, 0 records, 0 deferred, cpu any"),
+            "{note}"
+        );
     }
 
     #[test]

@@ -723,3 +723,31 @@ and switches to the new one when the call answers.
   Its tree is public main (`d4165127`) plus the integrator's patch, sent through run-command
   in pieces checked by SHA-256 (no SSH). 0.6.6's tree is `8018c96a`. QEMU is rebuilt there from
   the pinned 10.2.1 source.
+- **2026-11-17: C's arena on growth and P's three gate fixes merged** (`c363d2ef`, from
+  `ec9d67b3` and `c2a6d0cc`). Checked on the Mac: clippy is clean and the tests of
+  moruna-arena, moruna-scheduler, moruna-micro and moruna-kernel pass. On the India VM they are
+  in the gate's tree before any Moruna row is timed.
+  - **C:** a granted arena commits as the run uses it: a 32 MiB first region, then regions as
+    large as all made so far, up to the backing's largest. The budget is still counted in full
+    for admission. Before the fix the guest committed the whole budget before the first row,
+    at 2.2 s per GiB.
+  - **P, the ~40 s tail:** it was not the log drain. Each native task's cleanup waited the full
+    5 s for its account to empty while its process handle was still held, and then marked the
+    instance "cleanup uncertain". With 8 tasks that came to about 40 s. The handle is now
+    released first.
+  - **P, Kernel(Limit):** the kernel makes no memory object over 256 MiB, and a task's rings
+    object (two output windows of 128 MiB plus the ring pages) went just over it. The windows
+    are now capped, with a compile-time check against the kernel's limit.
+  - **P, the feeding:** one worker keeps every instance of a native stage busy, two batches in
+    flight per task, dealt across the instances.
+  - **Process lesson:** both fixes sat finished for over an hour, because the streams' reports
+    stayed in their own transcripts. The integrator now checks asked-for branches itself, and
+    the streams SendMessage their results.
+- **2026-11-17: the output layer goes straight onto disk.out** (integrator, on C's plan).
+  Today a run's output is copied four times after the last row and held three times in scratch,
+  which caps it at about a third of the scratch account. Instead, sinks write
+  `disk://out/<dir>/` objects by DMA from their arena buffers, and the finish writes only the
+  metadata, the hash tree and, last, the header. The layer format and the host's unpacker do not
+  change, and a failed run leaves no header. A 16 MiB metadata reserve holds about 150,000 files.
+  C owns it, including D's two lines (the in-VM sink URL and disk.out's size), marked as hooks
+  in D's files since D's agent is finished.

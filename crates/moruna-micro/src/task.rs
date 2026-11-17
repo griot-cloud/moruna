@@ -74,9 +74,8 @@ const RING_BYTES: u64 = 64 * 1024;
 // The kernel's largest memory object, which a task's region and rings object are sized under.
 const _: () = assert!(layout::OBJECT_MAX == moruna_abi::limits::MEMORY_MAX_BYTES);
 
-/// Batches each of a ring stage's tasks holds at once: one it works on while the engine lays
-/// out the next, so one engine worker keeps every task of the stage busy.
-const IN_FLIGHT: usize = 2;
+/// Batches each of a ring stage's tasks holds at once ([`layout::IN_FLIGHT`]).
+const IN_FLIGHT: usize = layout::IN_FLIGHT as usize;
 /// The last lines of standard error a failure quotes, as on Linux.
 pub const TAIL_LINES: usize = 20;
 /// A stage's plane holds a record of its input and a window for its output; its arena is
@@ -285,6 +284,8 @@ pub struct ImageTask {
     native: Option<Arc<[u8]>>,
     /// How many of the stage's tasks hold a batch now, and the most that ever did.
     busy: Arc<Busy>,
+    /// What each task did, by instance, once it ended at the stage's end: the run's report.
+    figures: Mutex<Vec<Option<layout::TaskFigures>>>,
 }
 
 /// A ring stage's tasks holding batches: now, and the most at once.
@@ -368,6 +369,7 @@ impl ImageTask {
             rings,
             native: None,
             busy: Arc::default(),
+            figures: Mutex::new(vec![None; processes]),
         })
     }
 
@@ -458,16 +460,16 @@ impl ImageTask {
                 .map_err(|e| plane_error(&self.name, "granting explicit reply window", e))?;
             st.window = Some(bytes);
         }
+        if st.rings {
+            return st.pipelined(&batch, self.ports.get(), &self.port_names);
+        }
         // Explicit output admission is complete BEFORE the child can read this request.
-        let (len, offered) = st.offer(&batch, self.ports.get(), &self.port_names)?;
+        let (len, _) = st.offer(&batch, self.ports.get(), &self.port_names)?;
         drop(batch);
         if reply_bytes == 0 && !st.rings {
             st.grant(len)?;
         }
         st.sent += 1;
-        if st.rings {
-            return st.pipelined(offered, self.ports.get(), &self.port_names);
-        }
         match st.wait(self.ports.get(), &self.port_names)? {
             Seen::Put(out) => {
                 st.received += 1;
@@ -490,6 +492,28 @@ impl ImageTask {
                 self.name
             ))),
         }
+    }
+
+    /// What the stage's tasks did, for the run's report (ring mode): each task's batches, CPU
+    /// and account, and the most that held a batch at once. `None` for a stage on descriptors.
+    pub fn note(&self) -> Option<String> {
+        self.rings.then(|| {
+            layout::stage_note(
+                &self.name,
+                &lock(&self.figures),
+                self.busy.peak.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+    }
+
+    /// The CPU the stage places its task `instance` on (ring mode): one task to a CPU.
+    fn cpu_of(&self, instance: usize) -> Option<u32> {
+        self.rings.then(|| {
+            layout::task_cpu(
+                instance,
+                crate::start::kernel().map_or(1, |kernel| kernel.cpus),
+            )
+        })
     }
 
     /// The memory the stage holds outside the engine's process: its task's account.
@@ -544,7 +568,12 @@ impl ImageTask {
                     windows: sizes.windows,
                     window_bytes: sizes.window,
                 })
-                .map(|(task, port)| (task, Some(port)))
+                .and_then(|(task, port)| {
+                    // Each task on a CPU of its own: the kernel keeps a thread where it first
+                    // ran, and tasks started while the others slept all went to one.
+                    plane.place(task, self.cpu_of(ctx.instance))?;
+                    Ok((task, Some(port)))
+                })
         } else {
             plane.open(Shape {
                 inputs: 1,
@@ -587,7 +616,7 @@ impl ImageTask {
         .map_err(|e| kernel_error(format!("image `{name}`: hello to the personality: {e:?}")))?;
         // The 2.0 handshake rejects the old unaccounted 1.x wire layouts before
         // any run_plane request is sent. Every 2.0 method is available at minor 0.
-        let (account, kept, limit) = self.carve(ceiling)?;
+        let (account, kept, limit) = self.carve(ceiling, false)?;
         let mut body = Encoder::new();
         let plane_arg = LinuxPlane {
             assets: self
@@ -633,7 +662,7 @@ impl ImageTask {
 
     /// The task's account, carved out of the engine's (SDD 30 f.11): the account, a read-only
     /// handle to it the stage keeps, and its limit.
-    fn carve(&self, ceiling: u64) -> Result<(Account, Account, u64)> {
+    fn carve(&self, ceiling: u64, native: bool) -> Result<(Account, Account, u64)> {
         let name = &self.name;
         let room = Usage::own()
             .map_err(|e| {
@@ -643,7 +672,12 @@ impl ImageTask {
                 ))
             })?
             .room();
-        let limit = layout::task_limit(ceiling, room).ok_or_else(|| {
+        let limit = if native {
+            layout::native_task_limit(ceiling, room)
+        } else {
+            layout::task_limit(ceiling, room)
+        };
+        let limit = limit.ok_or_else(|| {
             kernel_error(format!(
                 "image `{name}`: the engine's account has {room} bytes left, too few for a task's \
                  account of at least {} bytes beside the engine's own half",
@@ -689,7 +723,7 @@ impl ImageTask {
         };
         let resource =
             process_resource().map_err(|e| kernel_error(format!("image `{name}`: {e}")))?;
-        let (account, kept, limit) = self.carve(ceiling)?;
+        let (account, kept, limit) = self.carve(ceiling, true)?;
         let process =
             moruna_svc::Process::create_in(resource, &layout::account_name(name), &account.0)
                 .map_err(|e| fail("making its process", e))?;
@@ -759,6 +793,8 @@ impl ImageTask {
             schema: None,
             busy: Arc::clone(&self.busy),
             deferred: 0,
+            instance: ctx.instance,
+            cpu: self.cpu_of(ctx.instance),
         }
     }
 }
@@ -815,6 +851,9 @@ pub struct TaskState {
     busy: Arc<Busy>,
     /// Answers the stage gave as batches of no rows, the answers coming later.
     deferred: u64,
+    /// Which of the stage's tasks it is, and the CPU it was placed on.
+    instance: usize,
+    cpu: Option<u32>,
 }
 
 impl Drop for TaskState {
@@ -1380,48 +1419,117 @@ impl TaskState {
         }
     }
 
-    /// Ring mode: batch `offered` joins the task's batches in flight, and the stage answers
-    /// with the oldest one's answer. It waits for that answer only for the task's first (whose
-    /// schema stands for the rest) and when the task holds [`IN_FLIGHT`] batches; otherwise,
-    /// with the answer not come yet, it answers with a batch of no rows and the answer comes
-    /// with a later one, or at the stage's end. The task works while the engine lays out its
-    /// next batch, and one engine worker keeps every task of the stage busy.
+    /// Ring mode: `batch` goes to the task in pieces of at most its plane's piece, each joining
+    /// the task's batches in flight, of which it holds at most [`IN_FLIGHT`]; the stage answers
+    /// with every answer it has taken meanwhile, joined, the oldest first. It waits for an
+    /// answer only to make room for a piece, and for the task's first (whose schema stands for
+    /// the rest); with no answer come yet it answers with a batch of no rows, and the answers
+    /// come with a later batch, or at the stage's end. The task works while the engine lays out
+    /// its next piece, and one engine worker keeps every task of the stage busy.
     fn pipelined(
         &mut self,
-        offered: BatchId,
+        batch: &moruna_kernel::arrow::record_batch::RecordBatch,
         ports: Option<&Arc<StagePorts>>,
         names: &[String],
     ) -> Result<Payload> {
-        if self.in_flight.is_empty() {
-            self.busy.start();
-        }
-        self.in_flight.push_back(offered);
-        self.gather(ports, names)?;
-        let oldest = self.in_flight[0];
-        let come = self
-            .early
-            .iter()
-            .any(|seen| matches!(seen, Seen::Released(b) if *b == oldest));
-        let schema = match &self.schema {
-            Some(schema) if !come && self.in_flight.len() < IN_FLIGHT => Arc::clone(schema),
-            _ => {
-                self.in_flight.pop_front();
-                let answer = self.answers(oldest, ports, names);
-                if self.in_flight.is_empty() {
-                    self.busy.stop();
-                }
-                let answer = answer?;
-                if let (None, Payload::Table(batch, _)) = (&self.schema, &answer) {
-                    self.schema = Some(batch.schema());
-                }
-                return Ok(answer);
+        let piece = layout::ring_sizes(self.plane.residency().budget).piece;
+        let mut taken = Vec::new();
+        for part in self.pieces(batch, piece)? {
+            while self.in_flight.len() >= IN_FLIGHT {
+                taken.push(self.take_oldest(ports, names)?);
             }
-        };
-        self.deferred += 1;
-        Ok(Payload::Table(
-            moruna_kernel::arrow::record_batch::RecordBatch::new_empty(schema),
-            moruna_kernel::Tier::Host,
-        ))
+            let (_, offered) = self.offer(&part, ports, names)?;
+            self.sent += 1;
+            if self.in_flight.is_empty() {
+                self.busy.start();
+            }
+            self.in_flight.push_back(offered);
+        }
+        if self.schema.is_none() && taken.is_empty() {
+            taken.push(self.take_oldest(ports, names)?);
+        }
+        // The answers that have come, without waiting for any.
+        self.gather(ports, names)?;
+        while let Some(&oldest) = self.in_flight.front()
+            && self
+                .early
+                .iter()
+                .any(|seen| matches!(seen, Seen::Released(b) if *b == oldest))
+        {
+            taken.push(self.take_oldest(ports, names)?);
+        }
+        match taken.len() {
+            0 => {
+                let schema = self.schema.clone().ok_or_else(|| {
+                    kernel_error(format!("image `{}`: no answer's schema yet", self.name))
+                })?;
+                self.deferred += 1;
+                Ok(Payload::Table(
+                    moruna_kernel::arrow::record_batch::RecordBatch::new_empty(schema),
+                    moruna_kernel::Tier::Host,
+                ))
+            }
+            1 => Ok(taken.remove(0)),
+            _ => self.join(taken),
+        }
+    }
+
+    /// The answer to the oldest batch in flight, waited for.
+    fn take_oldest(
+        &mut self,
+        ports: Option<&Arc<StagePorts>>,
+        names: &[String],
+    ) -> Result<Payload> {
+        let oldest = self
+            .in_flight
+            .pop_front()
+            .ok_or_else(|| kernel_error(format!("image `{}`: no batch in flight", self.name)))?;
+        let answer = self.answers(oldest, ports, names);
+        if self.in_flight.is_empty() {
+            self.busy.stop();
+        }
+        let answer = answer?;
+        if let (None, Payload::Table(batch, _)) = (&self.schema, &answer) {
+            self.schema = Some(batch.schema());
+        }
+        Ok(answer)
+    }
+
+    /// `batch` as the records the engine lays out for the task: itself when its record fits a
+    /// piece, else slices of its rows that each do ([`layout::cut`], cut again where a slice's
+    /// record is still past a piece). A slice is a view of the batch's buffers: nothing is
+    /// copied until the record is laid out in the region.
+    fn pieces(
+        &self,
+        batch: &moruna_kernel::arrow::record_batch::RecordBatch,
+        piece: u64,
+    ) -> Result<Vec<moruna_kernel::arrow::record_batch::RecordBatch>> {
+        let len = self.record_len(batch)?;
+        if len <= piece || batch.num_rows() <= 1 {
+            return Ok(vec![batch.clone()]);
+        }
+        let mut out = Vec::new();
+        for (at, rows) in layout::cut(batch.num_rows(), len, piece) {
+            let part = batch.slice(at, rows);
+            if rows <= 1 || self.record_len(&part)? <= piece {
+                out.push(part);
+            } else {
+                out.extend(self.pieces(&part, piece)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The bytes of `batch`'s record as the engine lays it out.
+    fn record_len(&self, batch: &moruna_kernel::arrow::record_batch::RecordBatch) -> Result<u64> {
+        let (framing, placed) =
+            moruna_kernel::ipc::encode_framing(batch, PAGE as usize, 0, self.alloc.as_ref())?;
+        let pieces: Vec<(u64, u64)> = placed
+            .iter()
+            .map(|(at, b)| (*at as u64, b.len() as u64))
+            .collect();
+        layout::record_len(framing.len() as u64, &pieces)
+            .ok_or_else(|| kernel_error(format!("image `{}`: a record past u64", self.name)))
     }
 
     /// Takes what the task has done by now, without waiting: its records and releases go to
@@ -1635,7 +1743,8 @@ impl Kernel for ImageTask {
     }
 
     /// SDD 19 f.6 on the kernel: one record to the task and one back, in lockstep; in ring
-    /// mode with [`IN_FLIGHT`] batches in flight, each answer coming with a later batch.
+    /// mode in pieces, with at most [`IN_FLIGHT`] in flight, the answers coming with later
+    /// batches ([`TaskState::pipelined`]).
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
         self.exchange(state, input, 0)
     }
@@ -1655,12 +1764,8 @@ impl Kernel for ImageTask {
                 ));
             }
             let mut rest = Vec::new();
-            let had = !st.in_flight.is_empty();
-            while let Some(oldest) = st.in_flight.pop_front() {
-                rest.push(st.answers(oldest, self.ports.get(), &self.port_names)?);
-            }
-            if had {
-                st.busy.stop();
+            while !st.in_flight.is_empty() {
+                rest.push(st.take_oldest(self.ports.get(), &self.port_names)?);
             }
             let rest = match rest.len() {
                 0 => None,
@@ -1716,9 +1821,24 @@ impl Kernel for ImageTask {
                             bells = c.bells,
                             zeroed = st.plane.plane.zeroed(),
                             deferred = st.deferred,
+                            cpu = ?st.cpu,
                             busy_peak = self.busy.peak.load(std::sync::atomic::Ordering::Relaxed),
                             "image task exited 0"
                         );
+                        let (peak, limit) = match st.memory.usage() {
+                            Some(Ok(u)) => (u.peak, u.limit),
+                            _ => (0, 0),
+                        };
+                        if let Some(slot) = lock(&self.figures).get_mut(st.instance) {
+                            *slot = Some(layout::TaskFigures {
+                                batches: st.sent,
+                                records: st.received,
+                                deferred: st.deferred,
+                                cpu: st.cpu,
+                                peak,
+                                limit,
+                            });
+                        }
                         Ok(rest)
                     }
                     _ => Err(st.failed("it ended")),
