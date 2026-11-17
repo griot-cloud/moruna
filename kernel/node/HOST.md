@@ -143,7 +143,8 @@ container start moruna-arm
 container stop moruna-arm && rm ~/.vm-lock/owner && rmdir ~/.vm-lock
 ```
 
-Host tests of single crates (`cargo test -p ...`) need no lock: run them on the Mac with `-j 4`.
+Host tests of single crates (`cargo test -p ...`) need no lock: run them on the Mac with `-j 2`
+(`architecture/work/_rules.md`: up to six agents share its 10 cores and 16 GB).
 
 ### `moruna-arm`
 
@@ -153,11 +154,12 @@ worktree is `/src/.claude/worktrees/<name>`. Run commands with
 `container exec moruna-arm bash -lc 'cd /src/.claude/worktrees/<name> && ...'`. `git` does not
 work inside it (a worktree's `.git` names a Mac path): commit on the Mac.
 
-What it holds (set up for items 0.1 and 1.1, 2026-11-17):
+What it holds (set up for items 0.1, 1.1 and 1.5, 2026-11-17):
 
 | What | Where | For |
 | --- | --- | --- |
-| QEMU 10.2.1 (CI's pin), vhost-user | `/opt/qemu/bin`, **not on `PATH`**: `export PATH=/opt/qemu/bin:$PATH` | every boot |
+| QEMU 10.2.1 (CI's pin), vhost-user | `/opt/qemu/bin`, **not on `PATH`**: `export PATH=/opt/qemu/bin:$PATH`. Built as CI builds it, `--without-default-features`, so it has no `vpc` (VHD) driver: `qemu-system-x86_64 -drive format=help` lists what it reads | every boot |
+| `qemu-img` 8.2.2 | package `qemu-utils` (Ubuntu's `1:8.2.2+ds-0ubuntu1.18`), `/usr/bin/qemu-img`, on `PATH` | `package.py --formats` |
 | QEMU's UEFI firmware (edk2) | `/opt/qemu/share/qemu/edk2-x86_64-code.fd`, vars template `edk2-i386-vars.fd` | `uefi-boot.sh` finds them beside `qemu-system-x86_64` |
 | GRUB for x86_64 EFI | package `grub-efi-amd64-bin:amd64`, modules in `/usr/lib/grub/x86_64-efi`; `grub-mkstandalone` from `grub-common` | `package.py` |
 | `sgdisk`, mtools | packages `gdisk`, `mtools` | `package.py` |
@@ -173,7 +175,7 @@ container the same way:
 ```
 apt-get update
 apt-get install -y --no-install-recommends gcc-x86-64-linux-gnu libc6-dev-amd64-cross \
-  musl-dev:amd64 grub-efi-amd64-bin:amd64 gdisk mtools
+  musl-dev:amd64 grub-efi-amd64-bin:amd64 gdisk mtools qemu-utils
 ```
 
 CI's boot image (`kernel/tools/build.sh`) also needs python:3.14-slim's OCI layout:
@@ -207,3 +209,35 @@ card on QEMU's user network, COM1 to `OUT/console.log`) and exits 0 when
 It prints the seconds from QEMU's start to the line. Exit 124 is the timeout, 1 is QEMU ending
 first. The console log holds the firmware's screen output (terminal escapes) before GRUB, then
 the kernel's lines.
+
+### The disk's other formats (item 1.5)
+
+Each cloud takes its own format, and every one is made from the one raw disk (system design
+1A). Add `--formats` and a list to the `package.py` line above, for example
+`--formats qcow2 vhd`:
+
+| Format | File in `OUT` | Made by | For |
+| --- | --- | --- | --- |
+| `raw` | `moruna-node.raw` | every build, with or without `--formats` | OpenStack |
+| `qcow2` | `moruna-node.qcow2` | `qemu-img convert -f raw -O qcow2` | OpenStack: `kernel/node/OPENSTACK.md` uploads it |
+| `vhd` | `moruna-node.vhd` | `qemu-img convert -f raw -O vpc -o subformat=fixed,force_size` | Azure |
+
+- **`qemu-img` must be on `PATH`** for `qcow2` or `vhd`: the build refuses to start without it.
+  In `moruna-arm` it is Ubuntu's, 8.2.2 (the table above): the image formats are stable across
+  QEMU's versions, so the distribution's tool is the one used (PM, 2026-11-17).
+- **The VHD is fixed-size:** the raw disk rounded up to a whole MiB, then the VHD's 512-byte
+  footer, so the file is a whole number of MiB and 512 bytes. `package.py`'s raw disk is a whole
+  MiB already (its size is `(esp_mib + 4) * MIB`), so the VHD holds exactly the raw disk.
+- **Each file's size and SHA-256** are in `OUT/inputs-and-artifacts.json`, under its path.
+- **Boot one** with `kernel/node/tools/uefi-boot.sh OUT CPUS FORMAT`, where `FORMAT` is `raw`
+  (the default when it is left out), `qcow2` or `vhd`. The machine is the same; only the boot
+  disk's file and how QEMU reads it change.
+- **The VHD is read as raw, its footer left off** (PM, 2026-11-17): `format=raw,size=` the
+  file's length less 512, computed by `uefi-boot.sh` from the file. That is exactly the disk
+  Azure presents from a fixed VHD, and it needs no `vpc` driver, which `moruna-arm`'s QEMU lacks
+  (the table above; with `format=vpc` QEMU stops at once with `Unknown driver 'vpc'`). A `.vhd`
+  whose length is not whole 512-byte sectors and a footer is refused before QEMU starts.
+- **The test** is `python3 -I kernel/node/tools/test_formats.py`. It converts small stand-in
+  disks and runs `uefi-boot.sh` against a stand-in for QEMU, so it builds nothing, boots nothing
+  and needs no lock. It needs `qemu-img` on `PATH` and a bash with `EPOCHREALTIME` (5.0 or
+  later, as `uefi-boot.sh` does), and fails rather than skips without them.

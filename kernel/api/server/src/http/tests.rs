@@ -48,7 +48,7 @@ fn a_get_is_read_whole() {
     assert_eq!(body, 0);
     assert_eq!(request.method, "GET");
     assert_eq!(request.path, "/v1/node");
-    assert!(!request.query);
+    assert_eq!(request.query, None);
     assert!(!request.close);
     assert_eq!(
         request.authorization,
@@ -61,7 +61,7 @@ fn headers_are_read_without_regard_to_case() {
     let text = b"GET /v1/node?x=1 HTTP/1.1\r\nhOsT: node\r\nconnection: keep-alive, CLOSE\r\nauthorization: a\r\nAUTHORIZATION: b\r\n\r\n";
     let (request, _, _) = whole(read_all(text));
     assert_eq!(request.path, "/v1/node");
-    assert!(request.query);
+    assert_eq!(request.query.as_deref(), Some("x=1"));
     assert!(request.close);
     assert_eq!(request.authorization, Authorization::Many);
 }
@@ -212,7 +212,11 @@ fn exchange(session: &mut Session, api: &mut Api, budget: &mut Budget, bytes: &[
 /// An API whose one token key is `signer`'s, and a full budget.
 fn api(signer: &Signer) -> (Api, Budget) {
     (
-        Api::new(facts(), vec![TokenKey::new(signer.public())]),
+        Api::new(
+            facts(),
+            vec![TokenKey::new(signer.public())],
+            alloc::boxed::Box::new(crate::NoEngine),
+        ),
         Budget::new(BODY_BUDGET),
     )
 }

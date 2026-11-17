@@ -71,6 +71,39 @@ pub enum RefusalCode {
     /// or does not describe the task: its params against its schema, its needs, the schema one
     /// task gives against the schema the next takes.
     Definition,
+    /// A reference to a secret names none of the secrets the job comes with.
+    Secret {
+        /// The name the reference gives.
+        name: String,
+    },
+}
+
+/// The references to secrets in `job`'s object-store settings that name none of `names`, the
+/// names of the secrets the job comes with: each refused by its field. The engine's check is
+/// given the names (never the values), so a reference to a secret not given is refused before
+/// the job runs.
+pub fn check_secrets(job: &Job, names: &[&str]) -> Result<(), Vec<Refusal>> {
+    let refusals: Vec<Refusal> = job
+        .object_store
+        .secret_refs()
+        .into_iter()
+        .filter(|(_, reference)| !names.contains(&reference.secret.as_str()))
+        .map(|(field, reference)| Refusal {
+            field: field.to_string(),
+            code: RefusalCode::Secret {
+                name: reference.secret.clone(),
+            },
+            message: format!(
+                "the job comes with no secret named `{}`: give it in the job's secrets",
+                reference.secret
+            ),
+        })
+        .collect();
+    if refusals.is_empty() {
+        Ok(())
+    } else {
+        Err(refusals)
+    }
 }
 
 /// Check `job` against `catalogue`. Every refusal is collected, not only the first, in the order

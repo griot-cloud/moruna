@@ -1337,6 +1337,103 @@ impl ::core::fmt::Debug for Staging<'_> {
       ds.finish()
   }
 }
+pub enum SecretRefOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct SecretRef<'a> {
+  pub _tab: ::flatbuffers::Table<'a>,
+}
+
+impl<'a> ::flatbuffers::Follow<'a> for SecretRef<'a> {
+  type Inner = SecretRef<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: unsafe { ::flatbuffers::Table::new(buf, loc) } }
+  }
+}
+
+impl<'a> SecretRef<'a> {
+  pub const VT_SECRET: ::flatbuffers::VOffsetT = 4;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+    SecretRef { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: ::flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args SecretRefArgs<'args>
+  ) -> ::flatbuffers::WIPOffset<SecretRef<'bldr>> {
+    let mut builder = SecretRefBuilder::new(_fbb);
+    if let Some(x) = args.secret { builder.add_secret(x); }
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn secret(&self) -> &'a str {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(SecretRef::VT_SECRET, None).unwrap()}
+  }
+}
+
+impl ::flatbuffers::Verifiable for SecretRef<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut ::flatbuffers::Verifier, pos: usize
+  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+    v.visit_table(pos)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("secret", Self::VT_SECRET, true)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct SecretRefArgs<'a> {
+    pub secret: Option<::flatbuffers::WIPOffset<&'a str>>,
+}
+impl<'a> Default for SecretRefArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    SecretRefArgs {
+      secret: None, // required field
+    }
+  }
+}
+
+pub struct SecretRefBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> SecretRefBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_secret(&mut self, secret: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(SecretRef::VT_SECRET, secret);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> SecretRefBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    SecretRefBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> ::flatbuffers::WIPOffset<SecretRef<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    self.fbb_.required(o, SecretRef::VT_SECRET,"secret");
+    ::flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl ::core::fmt::Debug for SecretRef<'_> {
+  fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+    let mut ds = f.debug_struct("SecretRef");
+      ds.field("secret", &self.secret());
+      ds.finish()
+  }
+}
 pub enum S3Offset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -1356,6 +1453,9 @@ impl<'a> S3<'a> {
   pub const VT_ENDPOINT: ::flatbuffers::VOffsetT = 4;
   pub const VT_REGION: ::flatbuffers::VOffsetT = 6;
   pub const VT_BUCKET: ::flatbuffers::VOffsetT = 14;
+  pub const VT_ACCESS_KEY_ID_REF: ::flatbuffers::VOffsetT = 16;
+  pub const VT_SECRET_ACCESS_KEY_REF: ::flatbuffers::VOffsetT = 18;
+  pub const VT_SESSION_TOKEN_REF: ::flatbuffers::VOffsetT = 20;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -1367,6 +1467,9 @@ impl<'a> S3<'a> {
     args: &'args S3Args<'args>
   ) -> ::flatbuffers::WIPOffset<S3<'bldr>> {
     let mut builder = S3Builder::new(_fbb);
+    if let Some(x) = args.session_token_ref { builder.add_session_token_ref(x); }
+    if let Some(x) = args.secret_access_key_ref { builder.add_secret_access_key_ref(x); }
+    if let Some(x) = args.access_key_id_ref { builder.add_access_key_id_ref(x); }
     if let Some(x) = args.bucket { builder.add_bucket(x); }
     if let Some(x) = args.region { builder.add_region(x); }
     if let Some(x) = args.endpoint { builder.add_endpoint(x); }
@@ -1395,6 +1498,27 @@ impl<'a> S3<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(S3::VT_BUCKET, None)}
   }
+  #[inline]
+  pub fn access_key_id_ref(&self) -> Option<SecretRef<'a>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<SecretRef>>(S3::VT_ACCESS_KEY_ID_REF, None)}
+  }
+  #[inline]
+  pub fn secret_access_key_ref(&self) -> Option<SecretRef<'a>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<SecretRef>>(S3::VT_SECRET_ACCESS_KEY_REF, None)}
+  }
+  #[inline]
+  pub fn session_token_ref(&self) -> Option<SecretRef<'a>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<SecretRef>>(S3::VT_SESSION_TOKEN_REF, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for S3<'_> {
@@ -1406,6 +1530,9 @@ impl ::flatbuffers::Verifiable for S3<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("endpoint", Self::VT_ENDPOINT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("region", Self::VT_REGION, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("bucket", Self::VT_BUCKET, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<SecretRef>>("access_key_id_ref", Self::VT_ACCESS_KEY_ID_REF, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<SecretRef>>("secret_access_key_ref", Self::VT_SECRET_ACCESS_KEY_REF, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<SecretRef>>("session_token_ref", Self::VT_SESSION_TOKEN_REF, false)?
      .finish();
     Ok(())
   }
@@ -1414,6 +1541,9 @@ pub struct S3Args<'a> {
     pub endpoint: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub region: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub bucket: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub access_key_id_ref: Option<::flatbuffers::WIPOffset<SecretRef<'a>>>,
+    pub secret_access_key_ref: Option<::flatbuffers::WIPOffset<SecretRef<'a>>>,
+    pub session_token_ref: Option<::flatbuffers::WIPOffset<SecretRef<'a>>>,
 }
 impl<'a> Default for S3Args<'a> {
   #[inline]
@@ -1422,6 +1552,9 @@ impl<'a> Default for S3Args<'a> {
       endpoint: None,
       region: None,
       bucket: None,
+      access_key_id_ref: None,
+      secret_access_key_ref: None,
+      session_token_ref: None,
     }
   }
 }
@@ -1444,6 +1577,18 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> S3Builder<'a, 'b, A> {
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(S3::VT_BUCKET, bucket);
   }
   #[inline]
+  pub fn add_access_key_id_ref(&mut self, access_key_id_ref: ::flatbuffers::WIPOffset<SecretRef<'b >>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<SecretRef>>(S3::VT_ACCESS_KEY_ID_REF, access_key_id_ref);
+  }
+  #[inline]
+  pub fn add_secret_access_key_ref(&mut self, secret_access_key_ref: ::flatbuffers::WIPOffset<SecretRef<'b >>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<SecretRef>>(S3::VT_SECRET_ACCESS_KEY_REF, secret_access_key_ref);
+  }
+  #[inline]
+  pub fn add_session_token_ref(&mut self, session_token_ref: ::flatbuffers::WIPOffset<SecretRef<'b >>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<SecretRef>>(S3::VT_SESSION_TOKEN_REF, session_token_ref);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> S3Builder<'a, 'b, A> {
     let start = _fbb.start_table();
     S3Builder {
@@ -1464,6 +1609,9 @@ impl ::core::fmt::Debug for S3<'_> {
       ds.field("endpoint", &self.endpoint());
       ds.field("region", &self.region());
       ds.field("bucket", &self.bucket());
+      ds.field("access_key_id_ref", &self.access_key_id_ref());
+      ds.field("secret_access_key_ref", &self.secret_access_key_ref());
+      ds.field("session_token_ref", &self.session_token_ref());
       ds.finish()
   }
 }
@@ -1484,6 +1632,7 @@ impl<'a> ::flatbuffers::Follow<'a> for Gcs<'a> {
 
 impl<'a> Gcs<'a> {
   pub const VT_BUCKET: ::flatbuffers::VOffsetT = 8;
+  pub const VT_SERVICE_ACCOUNT_JSON_REF: ::flatbuffers::VOffsetT = 10;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -1495,6 +1644,7 @@ impl<'a> Gcs<'a> {
     args: &'args GcsArgs<'args>
   ) -> ::flatbuffers::WIPOffset<Gcs<'bldr>> {
     let mut builder = GcsBuilder::new(_fbb);
+    if let Some(x) = args.service_account_json_ref { builder.add_service_account_json_ref(x); }
     if let Some(x) = args.bucket { builder.add_bucket(x); }
     builder.finish()
   }
@@ -1507,6 +1657,13 @@ impl<'a> Gcs<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(Gcs::VT_BUCKET, None)}
   }
+  #[inline]
+  pub fn service_account_json_ref(&self) -> Option<SecretRef<'a>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<SecretRef>>(Gcs::VT_SERVICE_ACCOUNT_JSON_REF, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for Gcs<'_> {
@@ -1516,18 +1673,21 @@ impl ::flatbuffers::Verifiable for Gcs<'_> {
   ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
     v.visit_table(pos)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("bucket", Self::VT_BUCKET, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<SecretRef>>("service_account_json_ref", Self::VT_SERVICE_ACCOUNT_JSON_REF, false)?
      .finish();
     Ok(())
   }
 }
 pub struct GcsArgs<'a> {
     pub bucket: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub service_account_json_ref: Option<::flatbuffers::WIPOffset<SecretRef<'a>>>,
 }
 impl<'a> Default for GcsArgs<'a> {
   #[inline]
   fn default() -> Self {
     GcsArgs {
       bucket: None,
+      service_account_json_ref: None,
     }
   }
 }
@@ -1540,6 +1700,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> GcsBuilder<'a, 'b, A> {
   #[inline]
   pub fn add_bucket(&mut self, bucket: ::flatbuffers::WIPOffset<&'b  str>) {
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Gcs::VT_BUCKET, bucket);
+  }
+  #[inline]
+  pub fn add_service_account_json_ref(&mut self, service_account_json_ref: ::flatbuffers::WIPOffset<SecretRef<'b >>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<SecretRef>>(Gcs::VT_SERVICE_ACCOUNT_JSON_REF, service_account_json_ref);
   }
   #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> GcsBuilder<'a, 'b, A> {
@@ -1560,6 +1724,7 @@ impl ::core::fmt::Debug for Gcs<'_> {
   fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
     let mut ds = f.debug_struct("Gcs");
       ds.field("bucket", &self.bucket());
+      ds.field("service_account_json_ref", &self.service_account_json_ref());
       ds.finish()
   }
 }
@@ -1581,6 +1746,7 @@ impl<'a> ::flatbuffers::Follow<'a> for Azure<'a> {
 impl<'a> Azure<'a> {
   pub const VT_ACCOUNT: ::flatbuffers::VOffsetT = 4;
   pub const VT_CONTAINER: ::flatbuffers::VOffsetT = 8;
+  pub const VT_ACCESS_KEY_REF: ::flatbuffers::VOffsetT = 10;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -1592,6 +1758,7 @@ impl<'a> Azure<'a> {
     args: &'args AzureArgs<'args>
   ) -> ::flatbuffers::WIPOffset<Azure<'bldr>> {
     let mut builder = AzureBuilder::new(_fbb);
+    if let Some(x) = args.access_key_ref { builder.add_access_key_ref(x); }
     if let Some(x) = args.container { builder.add_container(x); }
     if let Some(x) = args.account { builder.add_account(x); }
     builder.finish()
@@ -1612,6 +1779,13 @@ impl<'a> Azure<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(Azure::VT_CONTAINER, None)}
   }
+  #[inline]
+  pub fn access_key_ref(&self) -> Option<SecretRef<'a>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<SecretRef>>(Azure::VT_ACCESS_KEY_REF, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for Azure<'_> {
@@ -1622,6 +1796,7 @@ impl ::flatbuffers::Verifiable for Azure<'_> {
     v.visit_table(pos)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("account", Self::VT_ACCOUNT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("container", Self::VT_CONTAINER, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<SecretRef>>("access_key_ref", Self::VT_ACCESS_KEY_REF, false)?
      .finish();
     Ok(())
   }
@@ -1629,6 +1804,7 @@ impl ::flatbuffers::Verifiable for Azure<'_> {
 pub struct AzureArgs<'a> {
     pub account: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub container: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub access_key_ref: Option<::flatbuffers::WIPOffset<SecretRef<'a>>>,
 }
 impl<'a> Default for AzureArgs<'a> {
   #[inline]
@@ -1636,6 +1812,7 @@ impl<'a> Default for AzureArgs<'a> {
     AzureArgs {
       account: None,
       container: None,
+      access_key_ref: None,
     }
   }
 }
@@ -1652,6 +1829,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> AzureBuilder<'a, 'b, A> {
   #[inline]
   pub fn add_container(&mut self, container: ::flatbuffers::WIPOffset<&'b  str>) {
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(Azure::VT_CONTAINER, container);
+  }
+  #[inline]
+  pub fn add_access_key_ref(&mut self, access_key_ref: ::flatbuffers::WIPOffset<SecretRef<'b >>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<SecretRef>>(Azure::VT_ACCESS_KEY_REF, access_key_ref);
   }
   #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> AzureBuilder<'a, 'b, A> {
@@ -1673,6 +1854,7 @@ impl ::core::fmt::Debug for Azure<'_> {
     let mut ds = f.debug_struct("Azure");
       ds.field("account", &self.account());
       ds.field("container", &self.container());
+      ds.field("access_key_ref", &self.access_key_ref());
       ds.finish()
   }
 }

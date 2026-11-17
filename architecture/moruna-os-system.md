@@ -106,6 +106,18 @@ Implements the OS design, section 1, OpenStack column.
   interface wan card=net0 dhcp
   ```
 
+- **The network server faces the internet, so its limits hold against anyone** (item 1.3b):
+  - smoltcp 0.13.1, which fixes a window-underflow panic (upstream issue 1048);
+  - a grant's `sockets=` counts every socket, closing ones included, and refuses at accept;
+  - `rx=` and `tx=` set its buffers, carried on the wire so a minted grant gets no more than its
+    parent's;
+  - `per-peer=` caps what one remote address holds;
+  - `linger=` shortens abandoned closes;
+  - `handshake-timeout-ms` (10 s) frees half-open connections;
+  - a line is printed, at most once a minute per grant, when a bound is hit.
+
+  The cloud grant is `grant listen-api rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536
+  tx=65536 per-peer=8 linger=5000`.
 - **One port listens: TCP 443,** owned by `api`. Nothing else accepts connections. `api` listens on
   `wan`'s leased address, and moves its listener when the lease's address changes.
 - **`devices` lives as long as the node.** Started by the node's supervisor, it serves until the
@@ -285,7 +297,10 @@ if it does, this section changes first.
 - Instance data as 1D says.
 - **The "ready" report,** once node config is valid: `GET http://168.63.129.16/machine?comp=goalstate`,
   then `POST /machine?comp=health` with the `Health` XML document, both with the header
-  `x-ms-version: 2012-11-30`. Without it, Azure reboots the machine.
+  `x-ms-version: 2012-11-30`. The POST also sends `Content-Type: text/xml;charset=utf-8` and
+  `x-ms-agent-name: moruna`. Without the report, Azure reboots the machine.
+- **`platform`'s HTTP client reads chunked answers too,** within the same 1 MiB: an HTTP/1.1 server
+  may send them, and Microsoft doesn't say which the WireServer uses.
 
 ### Testing
 
@@ -350,12 +365,18 @@ Implements the OS design, section 2.
 - **If `api` dies, the node keeps running** (the OS design's step 2) and the supervisor starts it
   again, at most 5 times in 10 minutes; a sixth death is fatal (1B). A restarted `api` needs fresh
   channels, so:
-  - **its listener:** the supervisor holds a network-server client whose grant has only the `grant`
-    right, limited to listening on 443. At each start it mints `api`'s listener channel from it
-    (`Client::grant`).
-  - **its hand-over:** the supervisor makes a fresh `platform`-`api` channel pair at each start and
-    sends `platform` its end over a supervisor-to-`platform` control channel. `platform` keeps the
-    validated config and sends the hand-over again.
+  - **its listener:** the supervisor holds a network-server client whose grant is
+    `rights=grant,listen local=0.0.0.0/0@443`. A grant can hand out only what it holds, so it holds
+    `listen`, but the supervisor never listens itself. At each start it mints `api`'s listener from
+    it (`Client::grant`). `node.conf`'s one record says it all:
+    `restart api network network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=64`,
+    giving the service, its listener slot, the network server's service, its granting slot, and
+    the policy. `network.conf`
+    has no `listen-api` grant.
+  - **its hand-over, the same at every start, the first included:** the supervisor makes a fresh
+    `platform`-`api` channel pair and sends `platform` its end, as `api-started`, over `platform`'s
+    bootstrap channel, which the supervisor keeps. `platform` keeps the validated config and sends
+    the hand-over on each new end. Every start has 1D's 10 s to answer `ready`.
   - **its identity:** a restarted `api` makes a new key and certificate when node config has no
     `tls`, and prints the new fingerprint line. The audit ring starts empty.
 - **Two crates.** The logic (HTTP, TLS, routing, tokens, audit, MCP) is the library
@@ -570,6 +591,40 @@ There are two kinds:
 - **native:** a static program for the core, as the gate's tasks are today (`images/gate/tasks`);
 - **image:** a Linux program run by the Linux layer, today's `image` kind (SDD 19).
 
+### 5A0. Rust's standard library on Moruna
+
+- **arrow-rs, and most of the Rust ecosystem, need `std`,** and the core's user target has none
+  (item 5.1's finding). A native function in Rust must be an ordinary Rust program, so Moruna
+  becomes a target `std` supports, `target_os = "moruna"`, rather than each library being forked
+  to work without it.
+- **How:**
+  - `std`'s platform layer for Moruna lives in a patched copy of Rust's `library/`, pinned to the
+    kernel's nightly and vendored under `kernel/vendor/rust-std` with the patch marked.
+  - Programs build with `-Zbuild-std=std,panic_abort` against it.
+  - The target becomes `kernel/targets/x86_64-moruna.json`; the `std`-free target stays for the
+    core's own services.
+- **What the platform layer provides,** over `moruna_sys`:
+  - memory from the process's account;
+  - threads, and futex-based locks and condition variables;
+  - the monotonic clock from the clock page;
+  - randomness from the core;
+  - stdout and stderr to the task's log;
+  - arguments and environment from the start page.
+  - Files, sockets and processes answer "unsupported" until a function needs them. A function's
+    data comes through the plane, not through files.
+- **Decisions from item 5.0:**
+  - the layer is modelled on Motor OS's: each `std::sys` file calls `moruna_sys::rt`;
+  - `SystemTime` reads the clock page's `realtime_base_ns`, which `platform` sets through a new
+    call, `clock_set_realtime`, on `root.clock` (granted to `platform` only). Unset, it reads as
+    1970 plus the monotonic clock;
+  - `yield_now` is a new core call, `thread_yield`;
+  - randomness comes from the core's `random_read` (getrandom's custom backend);
+  - builds are offline, from `library/vendor`;
+  - output with no log slot goes to the console;
+  - `std::os::moruna` re-exports std's own `moruna_sys`;
+  - threads default to a 2 MiB stack.
+- **Proof:** arrow-rs's arrays, compute and IPC run in a booted native task in CI's own boot image.
+
 ### 5A. Rust: `moruna-function`
 
 - **One crate,** `kernel/function/rust`, package `moruna-function`, for the core's user target. It
@@ -623,7 +678,8 @@ There are two kinds:
 
 | Item | Build | Success | Needs |
 |---|---|---|---|
-| 5.1 | `moruna-function` (5A), its guide, and the gate's seven functions moved onto it | Each of the seven gives its rows, as today, in a booted job; an example built from the guide alone runs | 3.2 |
+| 5.0 | Rust's `std` on Moruna (5A0) | A booted native task builds and runs arrow-rs's arrays, compute and IPC | none |
+| 5.1 | `moruna-function` (5A), its guide, and the gate's seven functions moved onto it | Each of the seven gives its rows, as today, in a booted job; an example built from the guide alone runs | 5.0, 3.2 |
 | 5.2 | The header and the static library (5B), with a C conformance function | A C function passes the row check in a booted job | 5.1 |
 | 5.3 | CPython with pyarrow booted on the Linux layer, as an image function | A Python function's rows match in a booted job | 3.2 |
 | 5.4 | `moruna.register` and the end-to-end Python path (5C) | From a laptop: a decorated Python function is registered on a node and runs in a job | 5.3, 3.6 |

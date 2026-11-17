@@ -238,8 +238,64 @@ pub struct StagingDoc {
     pub durable: Option<bool>,
 }
 
-/// `object_store` (MH 4.1): endpoints and names. A document holds no credential; the runner
-/// supplies credentials when the job runs, and a field that would carry one is refused.
+/// A reference to one of the job's secrets where a credential belongs: `{"secret": "<name>"}`
+/// (system design 3B). A document never holds a credential itself: the runner gives the job's
+/// secrets beside it, by name (MH 4.3, the `spec` message's `secrets`), and the engine resolves
+/// each reference when it builds the job's object stores. A literal credential is refused.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SecretRef {
+    /// The secret's name ([`is_secret_name`]).
+    pub secret: String,
+}
+
+impl SecretRef {
+    /// A reference to the secret `name`.
+    pub fn new(name: impl Into<String>) -> SecretRef {
+        SecretRef {
+            secret: name.into(),
+        }
+    }
+}
+
+/// Whether `name` is a secret's name: 1 to 64 of ASCII letters, digits, `_`, `-`, `.` and `:`,
+/// the first a letter or a digit, as a port's name is.
+pub fn is_secret_name(name: &str) -> bool {
+    crate::is_port_name(name)
+}
+
+/// What a literal credential where a reference belongs is refused with.
+pub const LITERAL_CREDENTIAL: &str = "a credential is never written in a job document: refer to \
+                                      one of the job's secrets by name, {\"secret\": \"<name>\"}";
+
+impl<'de> Deserialize<'de> for SecretRef {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<SecretRef, D::Error> {
+        use serde::de::Error;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Named {
+            secret: String,
+        }
+        match serde_json::Value::deserialize(d)? {
+            value @ serde_json::Value::Object(_) => {
+                let named: Named = serde_json::from_value(value).map_err(D::Error::custom)?;
+                if !is_secret_name(&named.secret) {
+                    return Err(D::Error::custom(format!(
+                        "`{}` is not a secret's name: 1 to 64 of letters, digits, _ - . and :, the \
+                         first a letter or a digit",
+                        named.secret
+                    )));
+                }
+                Ok(SecretRef {
+                    secret: named.secret,
+                })
+            }
+            _ => Err(D::Error::custom(LITERAL_CREDENTIAL)),
+        }
+    }
+}
+
+/// `object_store` (MH 4.1): endpoints and names, and where a credential belongs, a reference to
+/// one of the job's secrets ([`SecretRef`]). A document holds no credential.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ObjectStoreDoc {
@@ -272,6 +328,15 @@ pub struct S3Doc {
     /// Default bucket.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
+    /// The access key id, a reference to one of the job's secrets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<SecretRef>,
+    /// The secret access key, a reference to one of the job's secrets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_access_key: Option<SecretRef>,
+    /// The session token, a reference to one of the job's secrets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<SecretRef>,
 }
 
 /// `object_store.gcs`.
@@ -281,6 +346,9 @@ pub struct GcsDoc {
     /// Default bucket.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
+    /// The service account's key as JSON, a reference to one of the job's secrets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_account_json: Option<SecretRef>,
 }
 
 /// `object_store.azure`.
@@ -293,6 +361,44 @@ pub struct AzureDoc {
     /// Default container.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
+    /// The access key, a reference to one of the job's secrets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_key: Option<SecretRef>,
+}
+
+impl ObjectStoreDoc {
+    /// Every reference to a secret, each with the field it is in
+    /// (`object_store.s3.secret_access_key`), in the order the section lists them.
+    pub fn secret_refs(&self) -> Vec<(&'static str, &SecretRef)> {
+        let s3 = self.s3.as_ref();
+        let gcs = self.gcs.as_ref();
+        let azure = self.azure.as_ref();
+        [
+            (
+                "object_store.s3.access_key_id",
+                s3.and_then(|s| s.access_key_id.as_ref()),
+            ),
+            (
+                "object_store.s3.secret_access_key",
+                s3.and_then(|s| s.secret_access_key.as_ref()),
+            ),
+            (
+                "object_store.s3.session_token",
+                s3.and_then(|s| s.session_token.as_ref()),
+            ),
+            (
+                "object_store.gcs.service_account_json",
+                gcs.and_then(|g| g.service_account_json.as_ref()),
+            ),
+            (
+                "object_store.azure.access_key",
+                azure.and_then(|a| a.access_key.as_ref()),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(field, reference)| reference.map(|r| (field, r)))
+        .collect()
+    }
 }
 
 /// `checkpoint` (MH 4.1).
@@ -660,6 +766,29 @@ impl JobSpec {
 }
 
 /// Read one top-level section into its type, so a refusal names the section.
+/// The places in `object_store` where a credential belongs, as `(store, field)`.
+const SECRET_FIELDS: [(&str, &str); 5] = [
+    ("s3", "access_key_id"),
+    ("s3", "secret_access_key"),
+    ("s3", "session_token"),
+    ("gcs", "service_account_json"),
+    ("azure", "access_key"),
+];
+
+/// Each place in an `object_store` section where a credential belongs holds a reference to one
+/// of the job's secrets, and is refused by its field otherwise: a literal credential, or a
+/// reference that is not one.
+fn check_secret_refs(section: &serde_json::Value) -> Result<(), SpecError> {
+    for (store, name) in SECRET_FIELDS {
+        let Some(value) = section.get(store).and_then(|s| s.get(name)) else {
+            continue;
+        };
+        serde_json::from_value::<SecretRef>(value.clone())
+            .map_err(|e| SpecError::new(format!("object_store.{store}.{name}"), e.to_string()))?;
+    }
+    Ok(())
+}
+
 fn check_section(key: &str, section: &serde_json::Value) -> Result<(), SpecError> {
     fn read<T: serde::de::DeserializeOwned>(
         key: &str,
@@ -673,7 +802,10 @@ fn check_section(key: &str, section: &serde_json::Value) -> Result<(), SpecError
         "source" | "sink" => read::<KindDoc>(key, section),
         "budget" => read::<BudgetDoc>(key, section),
         "staging" => read::<StagingDoc>(key, section),
-        "object_store" => read::<ObjectStoreDoc>(key, section),
+        "object_store" => {
+            check_secret_refs(section)?;
+            read::<ObjectStoreDoc>(key, section)
+        }
         "checkpoint" => read::<CheckpointDoc>(key, section),
         "error_policy" => read::<ErrorPolicyDoc>(key, section),
         "sizer" => read::<SizerDoc>(key, section),

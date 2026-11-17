@@ -331,6 +331,7 @@ name = "devices"
 version = "0.1.0"
 dependencies = [
  "devices-protocol",
+ "moruna-abi",
  "moruna-driver-table",
  "moruna-mmio",
  "moruna-node",
@@ -444,6 +445,16 @@ name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
+
+[[package]]
+name = "flatbuffers"
+version = "25.12.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
+dependencies = [
+ "bitflags 2.13.2",
+ "rustc_version",
+]
 
 [[package]]
 name = "fnv"
@@ -782,9 +793,12 @@ dependencies = [
  "getrandom 0.2.17",
  "httparse",
  "moruna-api",
+ "moruna-event",
+ "moruna-record",
  "moruna-svc",
  "ring",
  "rustls",
+ "serde",
  "serde_json",
 ]
 
@@ -800,6 +814,15 @@ name = "moruna-driver-table"
 version = "0.1.0"
 dependencies = [
  "moruna-abi",
+]
+
+[[package]]
+name = "moruna-event"
+version = "0.6.6"
+dependencies = [
+ "flatbuffers",
+ "moruna-record",
+ "serde",
 ]
 
 [[package]]
@@ -901,9 +924,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-netvsc"
+version = "0.1.0"
+dependencies = [
+ "guestmem_core",
+ "moruna-vmbus",
+ "netvsp_protocol",
+ "vmbus_ring",
+ "zerocopy",
+]
+
+[[package]]
 name = "moruna-node"
 version = "0.1.0"
 dependencies = [
+ "moruna-abi",
  "moruna-sys",
 ]
 
@@ -987,6 +1022,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-ostd-adaptation"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+]
+
+[[package]]
 name = "moruna-pci"
 version = "0.1.0"
 dependencies = [
@@ -1038,6 +1080,18 @@ dependencies = [
  "moruna-svc",
  "moruna-sys",
  "netstack-protocol",
+]
+
+[[package]]
+name = "moruna-storvsc"
+version = "0.1.0"
+dependencies = [
+ "guestmem_core",
+ "moruna-vmbus",
+ "scsi_defs",
+ "storvsp_protocol",
+ "vmbus_ring",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1552,6 +1606,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8188909339ccc0c68cfb5a04648313f09621e8b87dc03095454f1a11f6c5d436"
 
 [[package]]
+name = "rustc_version"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
+dependencies = [
+ "semver",
+]
+
+[[package]]
 name = "rustls"
 version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1652,6 +1715,12 @@ dependencies = [
  "open_enum",
  "zerocopy",
 ]
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"
