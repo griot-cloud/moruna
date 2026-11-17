@@ -781,3 +781,17 @@ and switches to the new one when the call answers.
   - **Shmem THP, `within_size` against `never`:** no huge pages (ShmemHugePages 0) and no
     change in the first row. The cost before the first row is the guest's own commit, not the
     host's page size. Host huge pages (a hugetlb memfd with reserved pages) are left aside.
+- **2026-11-17: C's output layer on disk.out under KVM** (`793e9dc7`, one-month Score at
+  budget 8, against `c06344c2`). Rows and gate-canon hashes are equal; the file split differs,
+  as between any two runs, since 8 lanes encode in parallel. Nothing is staged in /tmp: "4
+  files of 27755364 bytes, written as the sinks wrote them, 0 picked up from /tmp/out", in 27
+  DMA operations onto disk.out. The job took 0.29 s less, within noise, and unpacking 0.08 s
+  more (a 44.9 MB layer, 16 MiB of it the reserve). It merges after its 15 node cases pass.
+  - **Also found, on the plane (P):** an intermittent "kernel stage 1 morsel 25: ... it said a
+    batch was done without a record for it" after about 71 s, passing on a rerun. It is likely
+    the same failure as Enrich's morsel 44 at budget 8.
+  - **The 0.7 rows' sizing (E, `1beae084`):** a 24 GiB node gives its processes 22.84 GiB (the
+    kernel keeps 0.74 GiB), so budget plus scratch can be about 21.28 GiB at most. Every
+    planned row was 21.5 and none would have booted. Rows are now Score 19 + 2, Enrich 17 + 4,
+    Audit 19 + 2, Occupancy 20 + 1. node-for-job.py's check assumed 256 MiB for the kernel;
+    its fix, and a launch error that names the real cause, are E's (in D's files).
