@@ -363,6 +363,10 @@ fn fixture(name: &str) -> (PathBuf, report::Config) {
     );
     put(&kit.join("node-user-bins/gve"), &binary(0x63_0000, 2, &[]));
     put(
+        &kit.join("node-user-bins/node-proof"),
+        &binary(0x64_0000, 2, &[]),
+    );
+    put(
         &kit.join("node-user-bins/virtio-blk"),
         &binary(0x61_0000, 2, &[]),
     );
@@ -488,7 +492,7 @@ fn the_report_counts_calls_and_sorts_what_nothing_used() {
             ("B", "ostd-0.19.0/src/mm/vm_space.rs"),
             ("C", "RSEQ"),
             ("C", "EXIT"),
-            ("D", "storage"),
+            ("D", "node-proof"),
             ("E", "ostd-0.19.0/src/boot/mod.rs"),
         ]
     );
@@ -540,7 +544,9 @@ fn the_report_counts_calls_and_sorts_what_nothing_used() {
                 "never started; kept for the accelerator path too",
                 77
             ),
-            ("netstack", "never started", 77)
+            ("netstack", "never started", 77),
+            // A mode-1 node boots from its own disk and keeps its home there.
+            ("storage", "never started", 77)
         ]
     );
     assert!(r.keep.iter().any(|i| i.name == "gve"));

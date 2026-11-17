@@ -675,4 +675,6 @@ and switches to the new one when the call answers.
   - **Kept for mode 1** (Brackly's definition of done, 2026-11-17: Moruna boots as the node itself
     on Servercore and on Azure), listed in a section of its own with their sizes, though mode 2's
     job VMs never use them: the net server (`netstack`, with DHCP and TLS), `virtio-net`, `nvme`,
-    `gve` and the node's job API (`node-admission`). A part kept for both says so.
+    `gve`, the node's job API (`node-admission`), and `storage` and `storage-maintenance`,
+    since a mode-1 node boots from its own disk and keeps its home there. A part kept for both
+    says so.

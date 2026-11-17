@@ -41,9 +41,18 @@ pub const KEEP_PROGRAMS: [&str; 6] = [
 ];
 /// Kept for mode 1, Moruna booted as the node itself on Servercore and on Azure, whatever the
 /// job VMs of mode 2 use (Brackly's definition of done, 2026-11-17): the net server (with DHCP
-/// and TLS), the network and disk drivers it needs, and the node's job API.
-pub const KEEP_MODE1_PROGRAMS: [&str; 5] =
-    ["netstack", "virtio-net", "nvme", "gve", "node-admission"];
+/// and TLS), the network and disk drivers it needs, the node's job API, and the storage service
+/// (and its maintenance program), since a mode-1 node boots from its own disk and keeps its home
+/// there.
+pub const KEEP_MODE1_PROGRAMS: [&str; 7] = [
+    "netstack",
+    "virtio-net",
+    "nvme",
+    "gve",
+    "node-admission",
+    "storage",
+    "storage-maintenance",
+];
 /// Kernel-mode code whose file path holds one of these.
 const KEEP_PATHS: [&str; 2] = [
     "/ostd-0.19.0/src/arch/x86/iommu/",
