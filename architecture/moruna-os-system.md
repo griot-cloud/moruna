@@ -285,7 +285,10 @@ if it does, this section changes first.
 - Instance data as 1D says.
 - **The "ready" report,** once node config is valid: `GET http://168.63.129.16/machine?comp=goalstate`,
   then `POST /machine?comp=health` with the `Health` XML document, both with the header
-  `x-ms-version: 2012-11-30`. Without it, Azure reboots the machine.
+  `x-ms-version: 2012-11-30`. The POST also sends `Content-Type: text/xml;charset=utf-8` and
+  `x-ms-agent-name: moruna`. Without the report, Azure reboots the machine.
+- **`platform`'s HTTP client reads chunked answers too,** within the same 1 MiB: an HTTP/1.1 server
+  may send them, and Microsoft doesn't say which the WireServer uses.
 
 ### Testing
 
