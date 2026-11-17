@@ -450,7 +450,7 @@ fn drive(
                     },
                     alloc.clone(),
                 )?;
-                data_os::reactor(granted.as_ref(), built.clone(), Some(built))?
+                data_os::reactor(granted.as_ref(), built.clone(), Some(built), alloc.clone())?
             }
         };
     started.reactor = Some(reactor.clone());
@@ -1067,8 +1067,7 @@ fn drive(
     let layer_failure = data_os::finish(
         granted.as_ref(),
         matches!(exit, moruna_trace::ExitReason::Completed),
-        alloc.as_ref(),
-        run_id,
+        alloc.clone(),
         &mut notes,
     );
     let manifest = outcome_manifest.or_else(|| match (checkpoint_keep, &engine) {
@@ -2320,15 +2319,17 @@ mod data_os {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use moruna_arena::{Arena, ArenaConfig};
-    use moruna_kernel::{Allocator, MorunaError, ObjectMetadata, Reactor, RunId, Tier};
+    use moruna_kernel::{Allocator, MorunaError, ObjectMetadata, Reactor};
     pub(crate) use moruna_micro::blk::Granted;
     use moruna_scheduler::WorkerStart;
 
     use crate::error::Result;
 
-    /// Where the sinks' files are inside the VM: the layer's root (`MORUNA_OUTPUT_ROOT`
-    /// overrides it). It is in the engine's scratch, because the root is read only and the only
-    /// writable places are a task's scratch and the engine's output disk (data-os §3a).
+    /// Where a sink or task that writes local files puts its outputs inside the VM
+    /// (`MORUNA_OUTPUT_ROOT` overrides it): they join the layer at the run's end. A sink's
+    /// URL under `disk://out/` writes straight onto the output disk instead. The root is in the
+    /// engine's scratch, because the root filesystem is read only and the only writable places
+    /// are a task's scratch and the engine's output disk (data-os §3a).
     pub(crate) const OUTPUT_ROOT: &str = "/tmp/out";
 
     pub(crate) fn take() -> Result<Option<Granted>> {
@@ -2369,12 +2370,13 @@ mod data_os {
         granted: Option<&Granted>,
         reactor: Arc<dyn Reactor>,
         metadata: Option<Arc<dyn ObjectMetadata>>,
+        alloc: Arc<dyn Allocator>,
     ) -> Result<(Arc<dyn Reactor>, Option<Arc<dyn ObjectMetadata>>)> {
         match granted {
-            Some(g) => g.reactor(reactor, metadata).map_err(|e| {
+            Some(g) => g.reactor(reactor, metadata, alloc).map_err(|e| {
                 MorunaError::Io {
                     op: "data_os",
-                    target: "the input disks".into(),
+                    target: "the data disks".into(),
                     msg: e.to_string(),
                 }
                 .into()
@@ -2383,36 +2385,36 @@ mod data_os {
         }
     }
 
-    /// Writes the output layer when the run completed and has an output disk, and says what
-    /// the arena and the disks did; the failure, if the layer could not be written.
+    /// Finishes the output layer when the run completed and has an output disk, and says what
+    /// the arena and the disks did; the failure, if the layer could not be finished.
     pub(crate) fn finish(
         granted: Option<&Granted>,
         completed: bool,
-        alloc: &dyn Allocator,
-        run_id: RunId,
+        alloc: Arc<dyn Allocator>,
         notes: &mut Vec<String>,
     ) -> Option<MorunaError> {
         let granted = granted?;
         let mut failure = None;
-        if let (true, Some(disk)) = (completed, granted.output()) {
-            let root = std::env::var("MORUNA_OUTPUT_ROOT").unwrap_or_else(|_| OUTPUT_ROOT.into());
-            let file = std::env::temp_dir().join(format!("moruna-{}.layer", run_id.to_hex()));
-            match write_layer(disk, std::path::Path::new(&root), &file, alloc) {
-                Ok(w) => notes.push(format!(
-                    "data OS: the output layer of {root} is {} bytes on {} in {} pieces",
-                    w.bytes,
-                    disk.name(),
-                    w.pieces
-                )),
-                Err(msg) => {
-                    failure = Some(MorunaError::Io {
-                        op: "output layer",
-                        target: disk.name().to_string(),
-                        msg,
-                    })
-                }
+        let root = std::env::var("MORUNA_OUTPUT_ROOT").unwrap_or_else(|_| OUTPUT_ROOT.into());
+        match granted.finish(completed, std::path::Path::new(&root), alloc) {
+            Some(Ok(w)) => notes.push(format!(
+                "data OS: the output layer is {} bytes on {}: {} files of {} bytes in {} \
+                 directories, written as the sinks wrote them, {} picked up from {root}",
+                w.bytes,
+                moruna_micro::devices::OUTPUT,
+                w.files,
+                w.data,
+                w.directories,
+                w.picked_up
+            )),
+            Some(Err(msg)) => {
+                failure = Some(MorunaError::Io {
+                    op: "output layer",
+                    target: moruna_micro::devices::OUTPUT.to_string(),
+                    msg,
+                })
             }
-            let _ = std::fs::remove_file(&file);
+            None => {}
         }
         notes.extend(granted.notes());
         notes.push(format!(
@@ -2422,34 +2424,6 @@ mod data_os {
         ));
         failure
     }
-
-    fn write_layer(
-        disk: &moruna_micro::blk::disk::Disk,
-        root: &std::path::Path,
-        file: &std::path::Path,
-        alloc: &dyn Allocator,
-    ) -> std::result::Result<moruna_micro::blk::layer::Written, String> {
-        use moruna_image::layerfile;
-        let tree = if root.exists() {
-            layerfile::tree(root)
-                .map_err(|e| format!("the outputs under {}: {e}", root.display()))?
-        } else {
-            layerfile::Entry::directory(0o755)
-        };
-        layerfile::write(&tree, file).map_err(|e| format!("laying the outputs out: {e}"))?;
-        let tier = if alloc.is_pinned() {
-            Tier::PinnedHost
-        } else {
-            Tier::Host
-        };
-        moruna_micro::blk::layer::write_file(
-            disk,
-            file,
-            alloc,
-            tier,
-            moruna_micro::blk::layer::PIECE,
-        )
-    }
 }
 
 /// Off the Moruna kernel nothing is granted: today's arena, allocator and reactor.
@@ -2458,7 +2432,7 @@ mod data_os {
     use std::sync::Arc;
 
     use moruna_arena::{Arena, ArenaConfig};
-    use moruna_kernel::{Allocator, MorunaError, ObjectMetadata, Reactor, RunId};
+    use moruna_kernel::{Allocator, MorunaError, ObjectMetadata, Reactor};
 
     use crate::error::Result;
 
@@ -2482,6 +2456,7 @@ mod data_os {
         _: Option<&Granted>,
         reactor: Arc<dyn Reactor>,
         metadata: Option<Arc<dyn ObjectMetadata>>,
+        _: Arc<dyn Allocator>,
     ) -> Result<(Arc<dyn Reactor>, Option<Arc<dyn ObjectMetadata>>)> {
         Ok((reactor, metadata))
     }
@@ -2489,8 +2464,7 @@ mod data_os {
     pub(crate) fn finish(
         _: Option<&Granted>,
         _: bool,
-        _: &dyn Allocator,
-        _: RunId,
+        _: Arc<dyn Allocator>,
         _: &mut Vec<String>,
     ) -> Option<MorunaError> {
         None

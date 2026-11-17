@@ -718,7 +718,7 @@ mod reactor_and_layer {
     };
 
     use super::*;
-    use crate::blk::layer;
+    use crate::blk::out::{self, Output};
     use crate::blk::reactor::DiskReactor;
 
     fn arena() -> Arc<Arena> {
@@ -830,9 +830,11 @@ mod reactor_and_layer {
             inner.clone(),
             Some(inner.clone()),
             [input.clone(), output.clone()],
+            None,
         )
         .unwrap();
         assert_eq!(reactor.urls(), vec!["disk://nyc".to_string()]);
+        assert!(reactor.output().is_none());
 
         let head = reactor.head_object("disk://nyc").wait().unwrap();
         assert_eq!((head.url.as_str(), head.size), ("disk://nyc", 1_000_000));
@@ -859,6 +861,13 @@ mod reactor_and_layer {
                 .is_err()
         );
         assert!(reactor.delete_object("disk://nyc").wait().is_err());
+        // With no output disk, the output layer's URLs are refused, not passed on.
+        let e = reactor
+            .write_object("disk://out/x", held.view())
+            .wait()
+            .unwrap_err();
+        assert!(e.to_string().contains("no output disk"), "{e}");
+        assert!(reactor.delete_object("disk://out/x").wait().is_err());
 
         // Everything else is the wrapped reactor's.
         let other = arena.alloc(10, Tier::Host).unwrap();
@@ -922,62 +931,360 @@ mod reactor_and_layer {
     #[test]
     fn with_no_store_behind_it_an_object_url_is_refused() {
         let (input, _) = disk("disk.in.a", 64, false);
-        let reactor = DiskReactor::new(Arc::new(Inner::default()), None, [input.clone()]).unwrap();
+        let reactor =
+            DiskReactor::new(Arc::new(Inner::default()), None, [input.clone()], None).unwrap();
         assert!(reactor.head_object("s3://b/k").wait().is_err());
         assert!(reactor.list_prefix("s3://b/").wait().is_err());
         input.close();
     }
 
-    #[test]
-    fn the_layer_is_written_from_the_first_sector_and_flushed() {
-        let arena = arena();
-        let (out, model) = disk("disk.out", 16 * 1024, true);
-        let dir = std::env::temp_dir().join(format!("moruna-layer-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("out.layer");
-        let bytes: Vec<u8> = (0..3 * (1 << 20) + 123).map(|i| (i % 241) as u8).collect();
-        std::fs::write(&file, &bytes).unwrap();
+    use std::collections::BTreeMap;
 
-        let written = layer::write_file(&out, &file, arena.as_ref(), Tier::Host, layer::PIECE)
-            .expect("written");
-        assert_eq!(written.bytes, bytes.len() as u64);
-        assert_eq!(written.on_disk, (bytes.len() as u64).next_multiple_of(512));
-        assert_eq!(written.pieces, 4);
-        {
-            let m = model.lock().unwrap();
-            assert_eq!(m.disk[..bytes.len()], bytes[..]);
+    use moruna_image::layerfile::Item;
+    use moruna_imagefs::format::MAGIC;
+
+    /// Sectors of an output disk with room for the reserve and `data` bytes more.
+    fn out_sectors(data: usize) -> usize {
+        (out::RESERVE as usize + data + (2 << 20)) / 512
+    }
+
+    /// A view of `bytes` in `alloc`'s memory.
+    fn view(alloc: &Arena, bytes: &[u8]) -> BufferView {
+        let mut b = alloc.alloc(bytes.len(), Tier::Host).unwrap();
+        b.copy_from_slice(bytes);
+        Arc::new(b).view()
+    }
+
+    fn pattern(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    /// The layer the disk holds, read back with the host's own reader.
+    fn read_back(model: &Arc<Mutex<Model>>, written: &out::Written) -> BTreeMap<String, Item> {
+        let path = std::env::temp_dir().join(format!(
+            "moruna-out-{}-{}.layer",
+            std::process::id(),
+            written.bytes
+        ));
+        std::fs::write(&path, &model.lock().unwrap().disk[..written.bytes as usize]).unwrap();
+        let items = moruna_image::layerfile::read(std::slice::from_ref(&path)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        items
+    }
+
+    fn file(items: &BTreeMap<String, Item>, path: &str) -> Vec<u8> {
+        match items.get(path) {
+            Some(Item::File(mode, bytes)) => {
+                assert_eq!(*mode, 0o644, "{path}");
+                bytes.clone()
+            }
+            other => panic!("{path}: {other:?}"),
+        }
+    }
+
+    fn no_root() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("moruna-out-none-{}", std::process::id()))
+    }
+
+    fn reactor_with_output(arena: &Arc<Arena>, sectors: usize) -> (DiskReactor, Arc<Mutex<Model>>) {
+        let (output, model) = disk("disk.out", sectors, true);
+        let inner = Arc::new(Inner::default());
+        let reactor = DiskReactor::new(
+            inner,
+            None,
+            std::iter::empty(),
+            Some((output, arena.clone() as Arc<dyn Allocator>)),
+        )
+        .unwrap();
+        (reactor, model)
+    }
+
+    #[test]
+    fn files_written_as_the_sinks_write_are_one_layer_read_back_byte_for_byte() {
+        let arena = arena();
+        let (reactor, model) = reactor_with_output(&arena, out_sectors(1 << 20));
+        let layer = reactor.output().unwrap();
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("r/part-00000.parquet", pattern(3 * 4096 + 123, 1)),
+            ("r/part-00001.parquet", pattern(4096, 2)),
+            ("r/_SUCCESS", Vec::new()),
+            ("r/sub/one", pattern(1, 3)),
+            ("top", pattern(200 * 1024 + 7, 4)),
+            ("zeros", vec![0u8; 3 * 4096]),
+        ];
+        for (path, bytes) in &files {
+            let url = format!("{}{path}", out::URL);
+            reactor
+                .write_object(&url, view(&arena, bytes))
+                .wait()
+                .unwrap();
+        }
+        // Nothing is a layer until the end: no header yet.
+        assert_ne!(model.lock().unwrap().disk[..8], MAGIC);
+        let written = layer.finish(&no_root()).unwrap();
+        assert_eq!(written.files, files.len() as u64);
+        assert_eq!(written.directories, 3, "the root, r and r/sub");
+        assert_eq!(
+            written.data,
+            files.iter().map(|(_, b)| b.len() as u64).sum::<u64>()
+        );
+        assert_eq!(written.picked_up, 0);
+        assert_eq!(model.lock().unwrap().disk[..8], MAGIC);
+        let items = read_back(&model, &written);
+        for (path, bytes) in &files {
+            assert_eq!(&file(&items, &format!("/{path}")), bytes, "{path}");
+        }
+        assert!(matches!(items.get("/r"), Some(Item::Directory(0o755))));
+        assert!(matches!(items.get("/r/sub"), Some(Item::Directory(0o755))));
+        assert_eq!(items.len(), files.len() + 2);
+        // The sinks' buffers and the bounce pages all went back.
+        assert_eq!(arena.stats().host_in_use, 0);
+        // The layer is finished: nothing more is taken.
+        let late = reactor
+            .write_object("disk://out/late", view(&arena, b"x"))
+            .wait();
+        assert!(late.is_err());
+        layer.disk().close();
+    }
+
+    #[test]
+    fn writers_on_many_threads_interleave_on_the_disk_and_each_file_is_whole() {
+        let arena = arena();
+        let (reactor, model) = reactor_with_output(&arena, out_sectors(4 << 20));
+        let reactor = Arc::new(reactor);
+        let threads: Vec<_> = (0..8u8)
+            .map(|t| {
+                let reactor = Arc::clone(&reactor);
+                let arena = Arc::clone(&arena);
+                std::thread::spawn(move || {
+                    for i in 0..6usize {
+                        let bytes = pattern(i * 9000 + t as usize * 77 + 1, t * 16 + i as u8);
+                        let url = format!("disk://out/t{t}/f{i}");
+                        reactor
+                            .write_object(&url, view(&arena, &bytes))
+                            .wait()
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let written = reactor.output().unwrap().finish(&no_root()).unwrap();
+        assert_eq!(written.files, 48);
+        let items = read_back(&model, &written);
+        for t in 0..8u8 {
+            for i in 0..6usize {
+                let want = pattern(i * 9000 + t as usize * 77 + 1, t * 16 + i as u8);
+                assert_eq!(file(&items, &format!("/t{t}/f{i}")), want);
+            }
+        }
+    }
+
+    #[test]
+    fn a_view_the_layer_cannot_reach_by_dma_goes_through_bounce_pieces() {
+        let arena = arena();
+        let elsewhere = Arena::new(ArenaConfig {
+            host_bytes: 8 << 20,
+            huge_pages: Guarantee::Absent,
+            memlock: Guarantee::Absent,
+            ..ArenaConfig::default()
+        })
+        .unwrap();
+        let (reactor, model) = reactor_with_output(&arena, out_sectors(4 << 20));
+        let bytes = pattern(2 * out::PIECE + 5000, 9);
+        reactor
+            .write_object("disk://out/far", view(&elsewhere, &bytes))
+            .wait()
+            .unwrap();
+        let written = reactor.output().unwrap().finish(&no_root()).unwrap();
+        assert_eq!(file(&read_back(&model, &written), "/far"), bytes);
+        assert_eq!(arena.stats().host_in_use, 0, "every bounce piece went back");
+    }
+
+    #[test]
+    fn a_file_written_again_is_the_later_one_and_a_deleted_one_is_gone() {
+        let arena = arena();
+        let (reactor, model) = reactor_with_output(&arena, out_sectors(1 << 20));
+        reactor
+            .write_object("disk://out/a", view(&arena, &pattern(5000, 1)))
+            .wait()
+            .unwrap();
+        reactor
+            .write_object("disk://out/a", view(&arena, &pattern(7000, 2)))
+            .wait()
+            .unwrap();
+        reactor
+            .write_object("disk://out/b", view(&arena, b"gone"))
+            .wait()
+            .unwrap();
+        reactor.delete_object("disk://out/b").wait().unwrap();
+        assert!(reactor.delete_object("disk://out/b").wait().is_err());
+        let written = reactor.output().unwrap().finish(&no_root()).unwrap();
+        let items = read_back(&model, &written);
+        assert_eq!(file(&items, "/a"), pattern(7000, 2));
+        assert!(!items.contains_key("/b"));
+        assert_eq!(written.files, 1);
+    }
+
+    #[test]
+    fn what_a_task_left_under_the_root_joins_the_layer_once() {
+        let arena = arena();
+        let (reactor, model) = reactor_with_output(&arena, out_sectors(4 << 20));
+        let root = std::env::temp_dir().join(format!("moruna-out-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("local/deep")).unwrap();
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        let local = pattern(out::PIECE + 4097, 5);
+        std::fs::write(root.join("local/deep/x.csv"), &local).unwrap();
+        std::fs::write(root.join("nothing"), b"").unwrap();
+        reactor
+            .write_object("disk://out/sunk", view(&arena, b"sunk"))
+            .wait()
+            .unwrap();
+        let written = reactor.output().unwrap().finish(&root).unwrap();
+        assert_eq!(written.picked_up, 2);
+        assert_eq!(written.files, 3);
+        let items = read_back(&model, &written);
+        assert_eq!(file(&items, "/local/deep/x.csv"), local);
+        assert_eq!(file(&items, "/nothing"), b"");
+        assert_eq!(file(&items, "/sunk"), b"sunk");
+        assert!(matches!(items.get("/empty"), Some(Item::Directory(_))));
+
+        // A path both written and left under the root is refused, as is a link.
+        let (reactor, _) = reactor_with_output(&arena, out_sectors(4 << 20));
+        reactor
+            .write_object("disk://out/nothing", view(&arena, b"x"))
+            .wait()
+            .unwrap();
+        let e = reactor.output().unwrap().finish(&root).unwrap_err();
+        assert!(e.contains("both"), "{e}");
+        let (reactor, _) = reactor_with_output(&arena, out_sectors(4 << 20));
+        std::os::unix::fs::symlink("nothing", root.join("link")).unwrap();
+        let e = reactor.output().unwrap().finish(&root).unwrap_err();
+        assert!(e.contains("not a file or a directory"), "{e}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn paths_no_layer_holds_and_outputs_past_the_disk_are_refused() {
+        let arena = arena();
+        let (reactor, _) = reactor_with_output(&arena, out_sectors(64 * 1024));
+        for bad in ["", "a//b", "a/", "../x", "a/./b"] {
+            let url = format!("disk://out/{bad}");
             assert!(
-                m.disk[bytes.len()..written.on_disk as usize]
-                    .iter()
-                    .all(|b| *b == 0)
+                reactor
+                    .write_object(&url, view(&arena, b"x"))
+                    .wait()
+                    .is_err(),
+                "{bad}"
             );
         }
-        assert!(arena.stats().host_in_use == 0, "both buffers went back");
+        let big = pattern(3 << 20, 1);
+        let e = reactor
+            .write_object("disk://out/big", view(&arena, &big))
+            .wait()
+            .unwrap_err();
+        assert!(e.to_string().contains("do not fit"), "{e}");
+        // A file and a directory of one name.
+        reactor
+            .write_object("disk://out/a", view(&arena, b"x"))
+            .wait()
+            .unwrap();
+        reactor
+            .write_object("disk://out/a/b", view(&arena, b"y"))
+            .wait()
+            .unwrap();
+        let e = reactor.output().unwrap().finish(&no_root()).unwrap_err();
+        assert!(e.contains("both a file and a directory"), "{e}");
+    }
 
-        let big = dir.join("big.layer");
-        std::fs::write(&big, vec![1u8; 16 * 1024 * 512 + 1]).unwrap();
-        let e =
-            layer::write_file(&out, &big, arena.as_ref(), Tier::Host, layer::PIECE).unwrap_err();
-        assert!(e.contains("do not fit"), "{e}");
-        assert!(layer::write_file(&out, &file, arena.as_ref(), Tier::Host, 100).is_err());
-        assert!(
-            layer::write_file(
-                &out,
-                &dir.join("none"),
-                arena.as_ref(),
-                Tier::Host,
-                layer::PIECE
-            )
-            .is_err()
+    #[test]
+    fn more_files_than_the_reserve_holds_are_refused_with_their_count() {
+        let arena = arena();
+        let (output, model) = disk("disk.out", out_sectors(1 << 20), true);
+        let dispatch: moruna_kernel::Dispatch = Arc::new(|f| f());
+        let layer = Output::with_reserve(
+            output,
+            arena.clone() as Arc<dyn Allocator>,
+            Tier::Host,
+            dispatch,
+            3 * 4096,
         );
-        // A disk that refuses writes refuses the layer.
-        let (input, _) = disk("disk.in.ro", 16 * 1024, false);
+        // Three pages hold the header and two pages of nodes, not the names of 100 files too.
+        for i in 0..100 {
+            layer
+                .put(&format!("f{i:03}"), view(&arena, b""))
+                .wait()
+                .unwrap();
+        }
+        let e = layer.finish(&no_root()).unwrap_err();
+        assert!(e.contains("100 files"), "{e}");
+        assert_ne!(model.lock().unwrap().disk[..8], MAGIC, "no layer");
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_layer() {
+        let arena = arena();
+        let (reactor, model) = reactor_with_output(&arena, out_sectors(1 << 20));
+        model.lock().unwrap().bad_sector = Some(out::RESERVE / 512);
         assert!(
-            layer::write_file(&input, &file, arena.as_ref(), Tier::Host, layer::PIECE).is_err()
+            reactor
+                .write_object("disk://out/a", view(&arena, &pattern(5000, 1)))
+                .wait()
+                .is_err()
         );
-        input.close();
-        out.close();
-        let _ = std::fs::remove_dir_all(&dir);
+        let late = reactor
+            .write_object("disk://out/b", view(&arena, b"x"))
+            .wait()
+            .unwrap_err();
+        assert!(late.to_string().contains("earlier write"), "{late}");
+        let e = reactor.output().unwrap().finish(&no_root()).unwrap_err();
+        assert!(e.contains("failed"), "{e}");
+        assert_ne!(model.lock().unwrap().disk[..8], MAGIC);
+    }
+
+    #[test]
+    fn a_completed_run_finishes_its_layer_and_any_other_leaves_none() {
+        let arena = arena();
+        let alloc: Arc<dyn Allocator> = arena.clone();
+        let objects = crate::arena::Objects::with_max(1 << 20);
+        let (output, model) = disk("disk.out", out_sectors(1 << 20), true);
+        let granted = crate::blk::Granted::new(objects.clone(), Vec::new(), Some(output.clone()));
+        let none = crate::blk::Granted::new(objects, Vec::new(), None);
+        assert!(none.finish(true, &no_root(), alloc.clone()).is_none());
+        // A run that did not complete leaves no layer.
+        let (r, _) = granted
+            .reactor(Arc::new(Inner::default()), None, alloc.clone())
+            .unwrap();
+        r.write_object("disk://out/a", view(&arena, b"a"))
+            .wait()
+            .unwrap();
+        assert!(granted.finish(false, &no_root(), alloc.clone()).is_none());
+        assert_ne!(model.lock().unwrap().disk[..8], MAGIC);
+        // The next run's layer is its own.
+        let (r, _) = granted
+            .reactor(Arc::new(Inner::default()), None, alloc.clone())
+            .unwrap();
+        r.write_object("disk://out/b", view(&arena, b"b"))
+            .wait()
+            .unwrap();
+        let written = granted
+            .finish(true, &no_root(), alloc.clone())
+            .unwrap()
+            .unwrap();
+        let items = read_back(&model, &written);
+        assert_eq!(file(&items, "/b"), b"b");
+        assert!(!items.contains_key("/a"));
+        // A run whose reactor was given to it makes its layer at the end, of what is under
+        // the root.
+        let written = granted.finish(true, &no_root(), alloc).unwrap().unwrap();
+        assert_eq!((written.files, written.directories), (0, 1));
+        assert_eq!(read_back(&model, &written).len(), 0);
+        output.close();
     }
 
     #[test]
@@ -991,7 +1298,8 @@ mod reactor_and_layer {
         let objects = crate::arena::Objects::with_max(1 << 20);
         let none = crate::blk::Granted::new(objects.clone(), Vec::new(), None);
         let inner = Arc::new(Inner::default());
-        let (r, m) = none.reactor(inner.clone(), None).unwrap();
+        let alloc: Arc<dyn Allocator> = arena();
+        let (r, m) = none.reactor(inner.clone(), None, alloc.clone()).unwrap();
         assert!(m.is_none());
         r.shutdown();
         assert_eq!(inner.calls.lock().unwrap().as_slice(), &["shutdown"]);
@@ -1001,7 +1309,7 @@ mod reactor_and_layer {
         let granted = crate::blk::Granted::new(objects, vec![input.clone()], Some(output.clone()));
         assert_eq!(granted.inputs().len(), 1);
         assert_eq!(granted.output().unwrap().name(), "disk.out");
-        let (r, m) = granted.reactor(inner, None).unwrap();
+        let (r, m) = granted.reactor(inner, None, alloc.clone()).unwrap();
         assert_eq!(
             m.unwrap().head_object("disk://g").wait().unwrap().size,
             64 * 512

@@ -2084,6 +2084,8 @@ dependencies = [
  "moruna-abi",
  "moruna-adapters",
  "moruna-arena",
+ "moruna-image",
+ "moruna-imagefs",
  "moruna-kernel",
  "moruna-mmio",
  "moruna-pci",
@@ -2092,6 +2094,7 @@ dependencies = [
  "moruna-svc",
  "moruna-sys",
  "moruna-virtio",
+ "sha2 0.11.0",
  "tracing",
  "vsock-protocol",
 ]

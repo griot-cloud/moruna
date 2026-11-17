@@ -14,23 +14,25 @@
 //! - [`disk`]: the I/O thread, polling while busy and asleep on a futex when idle;
 //! - [`device`]: a granted device brought up, and its I/O thread started (kernel only);
 //! - [`reactor`]: the reactor's `disk://` reads on those disks, planned splits read ahead
-//!   by the scheduler as today (contract C2);
-//! - [`layer`]: the output layer written to `disk.out` at the run's end (contract C3).
+//!   by the scheduler as today (contract C2), and the sinks' writes to the output layer;
+//! - [`out`]: the output layer, written onto `disk.out` as the sinks write and finished in
+//!   place at the run's end (contract C3).
 
 pub mod device;
 pub mod disk;
 pub mod engine;
-pub mod layer;
+pub mod out;
 pub mod plan;
 pub mod reactor;
 
 #[cfg(test)]
 mod tests;
 
-use std::sync::{Arc, OnceLock};
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use moruna_arena::HostBacking;
-use moruna_kernel::{ObjectMetadata, Reactor};
+use moruna_kernel::{Allocator, ObjectMetadata, Reactor};
 
 use crate::arena::Objects;
 use crate::devices;
@@ -42,6 +44,8 @@ pub struct Granted {
     objects: Arc<Objects>,
     inputs: Vec<disk::Disk>,
     output: Option<disk::Disk>,
+    /// The current run's output layer, made with its reactor.
+    layer: Arc<Mutex<Option<Arc<out::Output>>>>,
 }
 
 impl Granted {
@@ -80,6 +84,7 @@ impl Granted {
             objects,
             inputs,
             output,
+            layer: Arc::default(),
         }
     }
 
@@ -98,22 +103,54 @@ impl Granted {
         self.output.as_ref()
     }
 
-    /// `reactor` and its metadata with the input disks in front of them; unchanged with none.
+    /// `reactor` and its metadata with the disks in front of them: the input disks' reads, and
+    /// this run's output layer on the output disk, its bounce buffers from `alloc`. Unchanged
+    /// with no disk.
     #[allow(clippy::type_complexity)]
     pub fn reactor(
         &self,
         reactor: Arc<dyn Reactor>,
         metadata: Option<Arc<dyn ObjectMetadata>>,
+        alloc: Arc<dyn Allocator>,
     ) -> std::io::Result<(Arc<dyn Reactor>, Option<Arc<dyn ObjectMetadata>>)> {
-        if self.inputs.is_empty() {
+        if self.inputs.is_empty() && self.output.is_none() {
             return Ok((reactor, metadata));
         }
         let disks = Arc::new(reactor::DiskReactor::new(
             reactor,
             metadata,
             self.inputs.iter().cloned(),
+            self.output.clone().map(|d| (d, alloc)),
         )?);
+        *self.layer.lock().unwrap_or_else(|e| e.into_inner()) = disks.output();
         Ok((disks.clone(), Some(disks)))
+    }
+
+    /// Ends the run's output layer: finished in place when the run `completed`, with what is
+    /// left under `root` in the scratch; left with no header otherwise. `None` when the run
+    /// has no output disk.
+    pub fn finish(
+        &self,
+        completed: bool,
+        root: &Path,
+        alloc: Arc<dyn Allocator>,
+    ) -> Option<Result<out::Written, String>> {
+        let disk = self.output.as_ref()?;
+        let layer = self.layer.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if !completed {
+            return None;
+        }
+        // A run whose reactor was given to it made no layer: its outputs are only what is
+        // under the root.
+        let layer = layer.unwrap_or_else(|| {
+            let tier = if alloc.is_pinned() {
+                moruna_kernel::Tier::PinnedHost
+            } else {
+                moruna_kernel::Tier::Host
+            };
+            out::Output::new(disk.clone(), alloc, tier, Arc::new(|f| f()))
+        });
+        Some(layer.finish(root))
     }
 
     /// The report's lines: how the arena's memory was mapped and what each disk moved.

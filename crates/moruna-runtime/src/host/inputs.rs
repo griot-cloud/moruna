@@ -62,9 +62,20 @@ pub fn locate(url: &str) -> Result<Location, String> {
     }
 }
 
-/// Where the engine in the VM writes its outputs: the root of the output layer (stream C's
-/// `OUTPUT_ROOT`, in the engine's scratch).
+/// Where a sink or task that writes local files in the VM puts its outputs: the root of the
+/// output layer in the engine's scratch (stream C's `OUTPUT_ROOT`), picked up at the run's end.
 pub const OUTPUT_ROOT: &str = "/tmp/out";
+
+// stream C hook (D's file): a VM's sink writes straight onto its output disk.
+/// The URL a sink in the VM writes its files under: onto the output disk as they are written,
+/// with no copy in the engine's scratch (stream C's `moruna_micro::blk::out::URL`). A path
+/// under [`OUTPUT_ROOT`] names the same place.
+pub const OUTPUT_URL: &str = "disk://out/";
+
+// stream C hook (D's file): no input may be named as the output disk is.
+/// The name no input disk may have: `disk://out` would be the output disk's URL less its
+/// slash, which the sink-equals-source rule would read as the sink.
+const OUTPUT_NAME: &str = "out";
 
 /// A job document as a VM runs it, and what the host binds for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,7 +192,14 @@ pub fn adapt(
         doc["run_id"] = serde_json::Value::String(mint());
         changed = true;
     }
+    // stream C hook (D's file): `out` is the output disk's.
+    if bindings.iter().any(|(n, _)| n == OUTPUT_NAME) {
+        return Err(format!(
+            "an input may not be named `{OUTPUT_NAME}`: {OUTPUT_URL} is the output disk"
+        ));
+    }
     let mut taken: Vec<String> = bindings.iter().map(|(n, _)| n.clone()).collect();
+    taken.push(OUTPUT_NAME.to_string());
     if let Some(url) = doc.pointer_mut("/source/url") {
         let urls: Vec<String> = match &*url {
             serde_json::Value::String(one) => vec![one.clone()],
@@ -223,17 +241,33 @@ pub fn adapt(
         };
     }
     let mut output = None;
+    // stream C hook (D's file): a Parquet sink writes onto the output disk, under
+    // `disk://out/`, as it commits each file. Other sinks write their files under
+    // `OUTPUT_ROOT` in the scratch, and the run's end puts them on the disk. Either way a
+    // directory on this host is where the host unpacks the layer, and a path under
+    // `OUTPUT_ROOT` is the same place on the disk.
+    let objects = doc.pointer("/sink/kind").and_then(|k| k.as_str()) == Some("parquet");
     if let Some(url) = doc.pointer_mut("/sink/url")
         && let Some(given) = url.as_str().map(str::to_string)
+        && !given.starts_with(OUTPUT_URL)
     {
-        let inside = |p: &Path| p.starts_with(OUTPUT_ROOT);
         match locate(&given) {
-            Ok(Location::Local(path)) if !inside(&path) => {
-                output = Some(path);
-                *url = serde_json::Value::String(format!("file://{OUTPUT_ROOT}/"));
-                changed = true;
+            Ok(Location::Local(path)) => {
+                let under = path.strip_prefix(OUTPUT_ROOT).ok().map(Path::to_path_buf);
+                if under.is_none() {
+                    output = Some(path);
+                }
+                let sent = match (objects, under) {
+                    (true, Some(under)) if !under.as_os_str().is_empty() => {
+                        format!("{OUTPUT_URL}{}/", under.display())
+                    }
+                    (true, _) => OUTPUT_URL.to_string(),
+                    (false, Some(_)) => given.clone(),
+                    (false, None) => format!("file://{OUTPUT_ROOT}/"),
+                };
+                changed |= sent != given;
+                *url = serde_json::Value::String(sent);
             }
-            Ok(Location::Local(_)) => {}
             _ => {
                 return Err(format!(
                     "the sink writes to {given}; a run in a VM writes its outputs to its output \
@@ -265,10 +299,12 @@ pub fn sidecar_of(spec: &Path) -> PathBuf {
 }
 
 /// The input names the job's tasks use, each once, in the order they first appear: every
-/// string in a task's settings that is a `disk://` URL.
+/// string in a task's settings that is a `disk://` URL, except the output disk's.
 pub fn names_used(job: &moruna_job::Job) -> Result<Vec<String>, String> {
     fn visit(value: &serde_json::Value, out: &mut Vec<String>) -> Result<(), String> {
         match value {
+            // stream C hook (D's file): `disk://out/` is the output disk, not an input.
+            serde_json::Value::String(s) if s.starts_with(OUTPUT_URL) => {}
             serde_json::Value::String(s) if s.starts_with(devices::SCHEME) => {
                 if devices::input_slot(s).is_none() {
                     return Err(format!(
@@ -494,6 +530,8 @@ mod tests {
         assert_eq!(disk_name("s3://b/k/data.parquet", &mut taken), "data");
         assert_eq!(disk_name("/d/data.parquet", &mut taken), "data-1");
         assert_eq!(disk_name("/d/???.parquet", &mut taken), "input");
+        let mut reserved = vec![OUTPUT_NAME.to_string()];
+        assert_eq!(disk_name("/d/out.parquet", &mut reserved), "out-1");
         let long = format!("/d/{}.parquet", "a".repeat(40));
         assert_eq!(disk_name(&long, &mut taken), "a".repeat(24));
         assert_eq!(
@@ -541,7 +579,7 @@ mod tests {
             sent["source"]["url"],
             serde_json::json!(["disk://a", "disk://b", "disk://one", "disk://kept"])
         );
-        assert_eq!(sent["sink"]["url"], "file:///tmp/out/");
+        assert_eq!(sent["sink"]["url"], OUTPUT_URL);
         assert_eq!(adapted.output.as_deref(), Some(dir.join("out").as_path()));
         let names: Vec<&str> = adapted.bindings.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["kept", "a", "b", "one"]);
@@ -555,13 +593,52 @@ mod tests {
         // A document a VM can run as it is stays as it is, byte for byte.
         let ready = serde_json::json!({"moruna_spec": 1, "run_id": "cd".repeat(16),
             "source": {"kind": "parquet", "url": "disk://x"}, "kernels": [],
-            "sink": {"kind": "parquet", "url": "file:///tmp/out/r/"},
+            "sink": {"kind": "parquet", "url": "disk://out/r/"},
             "budget": {"memory_bytes": 1u64 << 30, "cpu": 1}});
         let bytes = serde_json::to_vec(&ready).unwrap();
         let same = adapt(&bytes, None, || unreachable!()).unwrap();
         assert!(!same.changed);
         assert_eq!(same.bytes, bytes);
         assert_eq!(same.output, None);
+        // A sink under the VM's output root writes the same place on the output disk.
+        for (root, on_disk) in [
+            ("file:///tmp/out/r/", "disk://out/r/"),
+            ("/tmp/out/a/b", "disk://out/a/b/"),
+            ("file:///tmp/out/", "disk://out/"),
+        ] {
+            let mut inside = ready.clone();
+            inside["sink"]["url"] = serde_json::json!(root);
+            let moved = adapt(
+                &serde_json::to_vec(&inside).unwrap(),
+                None,
+                || unreachable!(),
+            )
+            .unwrap();
+            assert!(moved.changed, "{root}");
+            assert_eq!(moved.output, None, "{root}");
+            let sent: serde_json::Value = serde_json::from_slice(&moved.bytes).unwrap();
+            assert_eq!(sent["sink"]["url"], on_disk, "{root}");
+        }
+        // A sink that writes local files keeps the output root; its files join the layer at
+        // the run's end.
+        let mut ipc = ready.clone();
+        ipc["sink"] =
+            serde_json::json!({"kind": "arrow_ipc", "url": dir.join("o").display().to_string()});
+        let kept = adapt(&serde_json::to_vec(&ipc).unwrap(), None, || unreachable!()).unwrap();
+        let sent: serde_json::Value = serde_json::from_slice(&kept.bytes).unwrap();
+        assert_eq!(sent["sink"]["url"], "file:///tmp/out/");
+        assert_eq!(kept.output.as_deref(), Some(dir.join("o").as_path()));
+        ipc["sink"]["url"] = serde_json::json!("file:///tmp/out/i/");
+        let bytes_ipc = serde_json::to_vec(&ipc).unwrap();
+        let same = adapt(&bytes_ipc, None, || unreachable!()).unwrap();
+        assert!(!same.changed);
+        assert_eq!(same.bytes, bytes_ipc);
+        // `out` is the output disk's: no input has it.
+        assert!(
+            adapt(&bytes, Some(br#"{"out": "/x"}"#), || unreachable!())
+                .unwrap_err()
+                .contains("output disk")
+        );
         // A version 2 document, or one in binary, is the sidecar's to bind.
         let v2 = adapt(
             br#"{"moruna_spec": 2}"#,
