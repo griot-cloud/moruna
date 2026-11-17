@@ -827,6 +827,19 @@ pub fn with_secrets(
     Ok(())
 }
 
+/// For a run that is given no secrets (the Python surface's `moruna.run`): the first reference
+/// to a secret in `doc`, the document's object-store settings, refused by its field with
+/// `reason`.
+pub fn refuse_secret_refs(
+    doc: &ObjectStoreDoc,
+    reason: &str,
+) -> std::result::Result<(), moruna_job::SpecError> {
+    match doc.secret_refs().first() {
+        Some((field, _)) => Err(moruna_job::SpecError::new(*field, reason)),
+        None => Ok(()),
+    }
+}
+
 /// The shape of a resume argument, for a caller that must know it before building (the host
 /// session reads the manifest's run id to name the report file).
 pub fn resume_shape(job: &Job) -> Option<ResumeArg> {
