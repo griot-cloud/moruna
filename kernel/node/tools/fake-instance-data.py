@@ -8,7 +8,7 @@ Service does, from the recorded answers in `kernel/node/platform/fixtures`, with
 user-data the node config it is given, and the `Date` of each answer this machine's time:
 
     fake-instance-data.py --cloud openstack|azure --config NAME|PATH|none
-        [--bind 127.0.0.1] [--port 80]
+        [--bind 127.0.0.1] [--port 80] [--wireserver HOST:PORT [--report take|refuse]]
     fake-instance-data.py --list
 
 `--config` is a built-in config by name (`--list` names them, each with the line a boot given it
@@ -20,10 +20,26 @@ ends on), a file whose bytes are the user-data, or `none` for an instance create
   2021-02-01` with it is the recorded document, its `compute.userData` the config in base64 (empty
   for `none`); any other path is Azure's 404.
 
+With `--wireserver HOST:PORT` (Azure only, item 1.12) it is Azure's WireServer too, on that
+second address, where a boot forwards the node's connections to 168.63.129.16 port 80. It is as
+strict as the WireServer the platform library's host tests play:
+
+- `GET /machine?comp=goalstate` with `x-ms-version: 2012-11-30` is the recorded goal state;
+- `POST /machine?comp=health` with that header and the `Health` document that reports the
+  recorded goal state ready is taken, a `200`, and logged as `report ready taken`. The document
+  it wants is made as Microsoft's "Create Linux images without a provisioning agent" makes it,
+  with `ElementTree` from the goal state's `Incarnation`, `Container/ContainerId` and
+  `Container/RoleInstanceList/RoleInstance/InstanceId`;
+- anything else is a `400`, or a `404` for a path it does not have. These two are this fake's
+  answers, not documented ones.
+
+`--report refuse` answers every request to the WireServer `503`, so a boot shows the report's
+fatal line after its 2 minutes.
+
 Each answer closes its connection. Each request is logged on standard error, after a first line
-that says where the server listens (`--port 0` takes a free port). Run it inside `moruna-arm`,
-as root, so it may bind port 80 (PM, 2026-11-18): nothing then listens on the Mac. Standard
-library only.
+that says where the server listens (`--port 0` takes a free port), and a second for the
+WireServer when there is one. Run it inside `moruna-arm`, as root, so it may bind port 80 (PM,
+2026-11-18): nothing then listens on the Mac. Standard library only.
 """
 
 import argparse
@@ -32,13 +48,19 @@ import email.utils
 import json
 import socketserver
 import sys
+import threading
 from pathlib import Path
+from xml.etree import ElementTree
 
 FIXTURES = Path(__file__).resolve().parents[1] / "platform" / "fixtures"
 AZURE_PATH = "/metadata/instance?api-version=2021-02-01"
 OPENSTACK_META = "/openstack/latest/meta_data.json"
 OPENSTACK_USER = "/openstack/latest/user_data"
+GOAL_STATE = "/machine?comp=goalstate"
+HEALTH = "/machine?comp=health"
+VERSION = "2012-11-30"
 HEAD_MAX = 16 * 1024
+BODY_MAX = 64 * 1024
 # The recorded config's one token key: the standard base64 of the bytes 0 to 31.
 KEY = base64.b64encode(bytes(range(32))).decode()
 
@@ -108,12 +130,87 @@ def not_allowed(method):
     )
 
 
+def plain(status, text):
+    """An answer of this fake's own: `status` and a line of text."""
+    body = f"{text}\n".encode()
+    return (
+        f"HTTP/1.1 {status}\r\nDate: {email.utils.formatdate(usegmt=True)}\r\n"
+        f"Content-Type: text/plain\r\nContent-Length: {len(body)}\r\n\r\n"
+    ).encode() + body
+
+
+def health_for(goal_state):
+    """The `Health` document that reports `goal_state` ready, as Microsoft's example makes it."""
+    root = ElementTree.fromstring(goal_state)
+    container_id = root.findtext("Container/ContainerId")
+    instance_id = root.findtext("Container/RoleInstanceList/RoleInstance/InstanceId")
+    incarnation = root.findtext("Incarnation")
+    health = ElementTree.Element("Health")
+    ElementTree.SubElement(health, "GoalStateIncarnation").text = incarnation
+    container = ElementTree.SubElement(health, "Container")
+    ElementTree.SubElement(container, "ContainerId").text = container_id
+    role_instance_list = ElementTree.SubElement(container, "RoleInstanceList")
+    role = ElementTree.SubElement(role_instance_list, "Role")
+    ElementTree.SubElement(role, "InstanceId").text = instance_id
+    health_second = ElementTree.SubElement(role, "Health")
+    ElementTree.SubElement(health_second, "State").text = "Ready"
+    document = ElementTree.tostring(health, encoding="unicode", method="xml")
+    return document, (incarnation, container_id, instance_id)
+
+
+class WireServer:
+    """Azure's WireServer: the recorded goal state, and the report that it is ready."""
+
+    log = "wireserver "
+
+    def __init__(self, refuse):
+        self.refuse = refuse
+        self.goal_state = fixture("azure/goalstate.http")
+        self.health, self.names = health_for(self.goal_state[2])
+
+    def respond(self, method, path, headers, body):
+        refusal = self.refusal(method, path, headers, body)
+        if refusal is not None:
+            return refusal
+        if method == "GET":
+            return answer(self.goal_state)
+        incarnation, container, instance = self.names
+        print(
+            f"fake-instance-data: report ready taken: incarnation {incarnation} "
+            f"container {container} instance {instance}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return answer(fixture("azure/health.http"))
+
+    def refusal(self, method, path, headers, body):
+        """This fake's answer to a request it does not take, or None for one it takes."""
+        if self.refuse:
+            return plain("503 Service Unavailable", "the report is refused (--report refuse)")
+        if path not in (GOAL_STATE, HEALTH):
+            return plain("404 Not Found", f"{path} is not served here")
+        if headers.get("x-ms-version") != VERSION:
+            return plain("400 Bad Request", f"x-ms-version is not {VERSION}")
+        if (method, path) not in (("GET", GOAL_STATE), ("POST", HEALTH)):
+            return plain("400 Bad Request", f"{method} {path} is not served here")
+        if method == "POST" and body != self.health.encode():
+            return plain("400 Bad Request", "not the Health document of the goal state")
+        return None
+
+
 class Cloud:
     """What one cloud answers, given the instance's user-data (None for none)."""
+
+    log = ""
 
     def __init__(self, cloud, user_data):
         self.cloud = cloud
         self.user_data = user_data
+
+    def respond(self, method, path, headers, _body):
+        if method != "GET":
+            return not_allowed(method)
+        return self.answer(path, headers)
 
     def answer(self, path, headers):
         if self.cloud == "openstack":
@@ -142,34 +239,46 @@ class Cloud:
 
 class Handler(socketserver.StreamRequestHandler):
     def handle(self):
-        head = b""
-        while b"\r\n\r\n" not in head:
+        received = b""
+        while b"\r\n\r\n" not in received:
             chunk = self.request.recv(4096)
-            if not chunk or len(head) + len(chunk) > HEAD_MAX:
+            if not chunk or len(received) + len(chunk) > HEAD_MAX:
                 return
-            head += chunk
-        lines = head.split(b"\r\n\r\n", 1)[0].decode("latin-1").split("\r\n")
+            received += chunk
+        head, body = received.split(b"\r\n\r\n", 1)
+        lines = head.decode("latin-1").split("\r\n")
         method, path, _ = (lines[0].split(" ") + ["", "", ""])[:3]
         headers = {}
         for line in lines[1:]:
             name, _, value = line.partition(":")
             headers[name.strip().lower()] = value.strip()
-        if method == "GET":
-            reply = self.server.cloud.answer(path, headers)
-        else:
-            reply = not_allowed(method)
+        # A body, by its Content-Length.
+        length = headers.get("content-length", "0")
+        if not length.isdigit() or int(length) > BODY_MAX:
+            return
+        while len(body) < int(length):
+            chunk = self.request.recv(4096)
+            if not chunk:
+                return
+            body += chunk
+        service = self.server.service
+        reply = service.respond(method, path, headers, body[: int(length)])
         self.wfile.write(reply)
         status = reply.split(b"\r\n", 1)[0].decode()
-        print(f"fake-instance-data: {method} {path}: {status}", file=sys.stderr, flush=True)
+        print(
+            f"fake-instance-data: {service.log}{method} {path}: {status}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, address, cloud):
+    def __init__(self, address, service):
         super().__init__(address, Handler)
-        self.cloud = cloud
+        self.service = service
 
 
 def user_data(config):
@@ -191,6 +300,8 @@ def main(argv=None):
     parser.add_argument("--config", help="a built-in config's name, a file, or none")
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=80)
+    parser.add_argument("--wireserver", metavar="HOST:PORT", help="be Azure's WireServer there too")
+    parser.add_argument("--report", choices=["take", "refuse"], default="take")
     parser.add_argument("--list", action="store_true", help="name the built-in configs")
     args = parser.parse_args(argv)
     if args.list:
@@ -199,14 +310,32 @@ def main(argv=None):
         return 0
     if args.cloud is None or args.config is None:
         parser.error("--cloud and --config are needed")
+    wireserver = None
+    if args.wireserver is not None:
+        if args.cloud != "azure":
+            parser.error("--wireserver is Azure's: it needs --cloud azure")
+        host, _, port = args.wireserver.rpartition(":")
+        if not host or not port.isdigit():
+            parser.error(f"--wireserver is HOST:PORT: {args.wireserver}")
+        wireserver = Server((host, int(port)), WireServer(args.report == "refuse"))
+    elif args.report != "take":
+        parser.error("--report needs --wireserver")
     cloud = Cloud(args.cloud, user_data(args.config))
     with Server((args.bind, args.port), cloud) as server:
         host, port = server.server_address[:2]
         print(f"fake-instance-data: {args.cloud} on {host}:{port}", file=sys.stderr, flush=True)
+        if wireserver is not None:
+            host, port = wireserver.server_address[:2]
+            print(f"fake-instance-data: wireserver on {host}:{port}", file=sys.stderr, flush=True)
+            threading.Thread(target=wireserver.serve_forever, daemon=True).start()
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+        finally:
+            if wireserver is not None:
+                wireserver.shutdown()
+                wireserver.server_close()
     return 0
 
 
