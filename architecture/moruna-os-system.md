@@ -192,6 +192,12 @@ if it does, this section changes first.
 
 - **`Standard_D4ls_v5`, Generation 2, security type `Standard`.** Azure defaults to Trusted Launch,
   whose Secure Boot refuses our unsigned GRUB. Signing comes later.
+- **The first bring-up runs on `Standard_D4s_v4`** (or `D2s_v4`), Generation 2, in subscription
+  `griot-dev`, Central India, zone 3, with accelerated networking off. `griot-dev` has no quota for
+  any v5 family there (checked 2026-11-17). The v4 size presents the same devices: SCSI disks over
+  VMBus and the synthetic NIC, and no virtual function when accelerated networking is off. The
+  final proof on `Standard_D4ls_v5` needs DLSv5 quota in `griot-dev`, which is Brackly's to ask
+  Azure for.
 - **Accelerated networking cannot be turned off on this size,** so Azure offers a virtual function
   (ConnectX or MANA) beside the synthetic NIC. The node uses the synthetic NIC (netvsc) only. It
   ignores the virtual-PCI offer and never asks Azure to move traffic to the virtual function.
