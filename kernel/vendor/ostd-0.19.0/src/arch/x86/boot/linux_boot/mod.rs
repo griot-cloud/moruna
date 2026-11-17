@@ -216,6 +216,8 @@ impl ToEarlyBootInfo for BootParams {
 // SAFETY: The name does not collide with other symbols.
 #[unsafe(no_mangle)]
 unsafe extern "sysv64" fn __linux_boot(params_ptr: *const BootParams) -> ! {
+    // moruna: the core's clock counts from here (`crate::boot::entry_tsc`).
+    crate::boot::record_entry_tsc();
     let params = unsafe { &*params_ptr };
     assert_eq!({ params.hdr.header }, LINUX_BOOT_HEADER_MAGIC);
 

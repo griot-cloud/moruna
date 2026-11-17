@@ -4,7 +4,7 @@ resolver = "3"
 # (`drivers/vmbus/core`), so `drivers/*` must not take the directory itself for a crate: each
 # crate under it is a member by name.
 exclude = ["vendor/ring-0.17.14", "vendor/osdk-frame-allocator-0.19.0", "vendor/ostd-0.19.0", "drivers/vmbus", "drivers/storvsc", "drivers/netvsc"]
-members = ["abi", "loader", "handles", "quota", "datapath", "core", "boot", "sys", "svc", "programs", "tools/image", "examples/*", "drivers/*", "devices/*", "imagefs/*", "linux/core", "linux/protocol", "linux/server", "linux/test", "usage", "plane/check", "plane/core", "plane/test", "engine", "net/*", "storage", "node/core", "node/protocol", "node/supervisor", "node/admission", "node/image", "node/proof", "api/types", "vendor/openvmm/*", "drivers/vmbus/core", "drivers/storvsc/core", "api/server", "drivers/netvsc/core", "ostd-adaptation"]
+members = ["abi", "loader", "handles", "quota", "datapath", "core", "boot", "sys", "svc", "programs", "tools/image", "examples/*", "drivers/*", "devices/*", "imagefs/*", "linux/core", "linux/protocol", "linux/server", "linux/test", "usage", "plane/check", "plane/core", "plane/test", "engine", "net/*", "storage", "node/core", "node/protocol", "node/supervisor", "node/admission", "node/image", "node/proof", "node/api", "node/config", "node/platform", "api/types", "vendor/openvmm/*", "drivers/vmbus/core", "drivers/storvsc/core", "api/server", "drivers/netvsc/core", "ostd-adaptation"]
 
 [workspace.package]
 version = "0.1.0"

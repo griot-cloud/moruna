@@ -163,34 +163,47 @@ fn prepare(console: &Console) -> Result<Prepared, String> {
             .ok_or("unknown bootstrap service")?;
         let (sender, receiver) =
             Channel::create().map_err(|e| format!("bootstrap channel: {}", e.name()))?;
-        let root = process_root
-            .duplicate(
-                process_root
-                    .info()
-                    .map_err(|e| format!("process root rights: {}", e.name()))?
-                    .1,
-            )
-            .map_err(|e| format!("process root: {}", e.name()))?;
+        let root = || -> Result<Handle, String> {
+            process_root
+                .duplicate(
+                    process_root
+                        .info()
+                        .map_err(|e| format!("process root rights: {}", e.name()))?
+                        .1,
+                )
+                .map_err(|e| format!("process root: {}", e.name()))
+        };
         let roots = match kind {
-            Bootstrap::Linux => alloc::vec![root],
-            Bootstrap::Devices => alloc::vec![
-                root,
+            // No root for `platform`: its message is the node's memory, the machine
+            // account's limit that every service and job is carved from (item 1.4).
+            Bootstrap::Platform => Vec::new(),
+            Bootstrap::Linux => alloc::vec![root()?],
+            Bootstrap::Devices { .. } => alloc::vec![
+                root()?,
                 take("root.device")?,
                 take("root.ecam")?,
                 take("root.msi")?,
                 take("root.dma")?
             ],
         };
-        // The two bounded bootstrap kinds carry different handle counts. This
+        let message = match kind {
+            Bootstrap::Platform => Bootstrap::platform_message(usage.limit).to_vec(),
+            _ => kind.header().to_vec(),
+        };
+        // The bounded bootstrap kinds carry different handle counts. This
         // SDK seam consumes every slot only on success; refusal retains owners.
         let mut roots: Vec<Option<Handle>> = roots.into_iter().map(Some).collect();
         sender
-            .write_with(kind.header(), &mut roots)
+            .write_with(&message, &mut roots)
             .map_err(|e| format!("bootstrap transfer: {}", e.name()))?;
         children[index]
             .handles
             .push((Some(receiver.0), "supervisor".into()));
-        guardians.push(sender);
+        // `platform` makes no process, so its channel is no guardian, and this end is not
+        // kept: the message stays queued for `platform` once the end has closed.
+        if *kind != Bootstrap::Platform {
+            guardians.push(sender);
+        }
     }
     if let Some(service) = &config.admission {
         let index = config

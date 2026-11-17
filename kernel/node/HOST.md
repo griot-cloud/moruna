@@ -210,6 +210,23 @@ It prints the seconds from QEMU's start to the line. Exit 124 is the timeout, 1 
 first. The console log holds the firmware's screen output (terminal escapes) before GRUB, then
 the kernel's lines.
 
+### Bring it up and talk to it (items 1.3, 1.4 and 2.2b)
+
+```
+python3 kernel/node/tools/fake-instance-data.py --cloud openstack --config valid &   # as root
+kernel/node/tools/node-up.sh OUT CPUS
+curl -k https://localhost:8443/v1/health
+kernel/node/tools/node-down.sh OUT
+```
+
+`node-up.sh` runs the same machine with its user network set for these checks: the node's
+instance data at 169.254.169.254 port 80 is the fake server's on 127.0.0.1 port 80 (the lease is
+then 169.254.169.15/24, gateway 169.254.169.254), this machine's 8443 and 8444 reach the node's
+443 and 444, and every frame goes to `OUT/net.pcap`. It returns at `moruna: network`, within
+300 s under the emulator, and leaves QEMU running, its process ID in `OUT/qemu.pid`, until
+`node-down.sh`. A `moruna: fatal` line first is printed, with whether the machine then powered
+off. `NODE_UP_CARD=none` runs the machine with no network card.
+
 ### The disk's other formats (item 1.5)
 
 Each cloud takes its own format, and every one is made from the one raw disk (system design
