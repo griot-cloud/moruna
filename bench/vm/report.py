@@ -31,10 +31,14 @@ GATE = os.environ.get("GATE_BIN", "/home/bench/gate/bin")
 def load(results_dir):
     out = []
     for p in glob.glob(os.path.join(results_dir, "g-*.json")):
+        # A run's result; its engine's report (ID.report.json) and its job (ID.job.json) sit
+        # beside it with no spec.
         try:
-            out.append(json.load(open(p)))
+            rec = json.load(open(p))
         except ValueError:
             continue
+        if isinstance(rec, dict) and isinstance(rec.get("spec"), dict):
+            out.append(rec)
     return out
 
 
