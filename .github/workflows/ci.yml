@@ -360,7 +360,7 @@ jobs:
             -p moruna-netvsc
             -p moruna-mmio -p moruna-pci -p moruna-virtio -p moruna-driver-table -p moruna-imagefs
             -p moruna-linux -p linux-protocol -p moruna-nvme -p moruna-gve -p net-protocol
-            -p moruna-datapath -p moruna-sys -p moruna-node -p moruna-ostd-adaptation)
+            -p moruna-datapath -p moruna-sys -p moruna-node -p moruna-netstack -p moruna-ostd-adaptation)
           cargo clippy --locked --target "$host" --all-targets "${packages[@]}" --features moruna-abi/manifest -- -D warnings
           cargo test --locked --target "$host" "${packages[@]}" --features moruna-abi/manifest
       - name: Examples and drivers touch no file of the kernel (SV-T15, DR-T16)
