@@ -10,7 +10,7 @@ use netvsp_protocol::{
 };
 
 use crate::fake::{
-    Card, Got, PAGE, ROOMY, Random, SMALL, Settings, assert_clean, drain, poll, start_on,
+    Card, Got, PAGE, ROOMY, Random, SMALL, Settings, assert_clean, down, drain, poll, start_on,
     start_with, started, up,
 };
 
@@ -325,27 +325,46 @@ fn a_frame_no_card_sends_is_refused_before_it_is_sent() {
 }
 
 #[test]
-fn a_frame_that_fits_no_send_section_is_refused() {
-    // Sections of 1,024 bytes hold a frame of up to 980 behind its RNDIS fields.
-    let (card, host) = start_with(SMALL, |host| host.send_section = 1024);
-    let mut card = up(card);
-    assert!(card.send(&[1; 980]).unwrap());
-    let e = card.send(&[1; 981]).unwrap_err();
+fn a_host_whose_send_sections_cannot_hold_the_largest_frame_fails_the_start() {
+    // The largest frame of a 1,500-byte MTU is 1,514 bytes, 1,558 with its RNDIS
+    // fields. Sections of 1,557 bytes cannot hold it: the card does not start, and the
+    // packet filter was never set, so the host delivers nothing.
+    let (card, host) = start_with(SMALL, |host| host.send_section = 1557);
+    let e = down(card);
     assert!(
         matches!(
             e,
             NetvscError::Unfit {
-                message: 1025,
-                section: 1024
+                message: 1558,
+                section: 1557
             }
         ),
         "{e}"
     );
     assert_eq!(
         e.to_string(),
-        "a frame whose message of 1025 bytes fits no send section of 1024 bytes"
+        "a frame whose message of 1558 bytes fits no send section of 1557 bytes"
     );
+    assert_eq!(host.borrow().filter, 0);
+    assert_clean(&host);
+    // A smaller MTU fits smaller sections: 1,024 bytes hold the 980-byte frame of an
+    // MTU of 966.
+    let (card, host) = start_with(SMALL, |host| {
+        host.send_section = 1024;
+        host.mtu = Some(966);
+    });
+    let mut card = up(card);
+    assert!(card.send(&[1; 980]).unwrap());
+    assert!(matches!(
+        card.send(&[1; 981]),
+        Err(NetvscError::Length(981))
+    ));
     assert_eq!(host.borrow().frames, [vec![1; 980]]);
+    // Sections of 1,558 bytes hold the largest frame of a 1,500-byte MTU, exactly.
+    let (card, host) = start_with(SMALL, |host| host.send_section = 1558);
+    let mut card = up(card);
+    assert!(card.send(&[2; 1514]).unwrap());
+    assert_eq!(host.borrow().frames, [vec![2; 1514]]);
     assert_clean(&host);
 }
 

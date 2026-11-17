@@ -347,11 +347,11 @@ fn two_thousand_starts_against_random_answers_end_without_a_panic() {
         match card {
             Ok(mut card) => {
                 // Whatever the host changed, the card that started has an MTU its
-                // receive sections hold, and takes a frame or says why it cannot: the
-                // frame is longer than the MTU or the send sections the host stated.
+                // receive sections and its send sections hold, and takes a frame, or
+                // refuses it as longer than the MTU.
                 assert!((1..=1748).contains(&card.mtu()), "start {n}");
                 match card.send(&[0; 60]) {
-                    Ok(true) | Err(NetvscError::Length(60) | NetvscError::Unfit { .. }) => {}
+                    Ok(true) | Err(NetvscError::Length(60)) => {}
                     other => panic!("start {n}: {other:?}"),
                 }
                 started += 1;
