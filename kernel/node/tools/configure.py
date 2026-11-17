@@ -136,6 +136,10 @@ def main():
         node += ["link devices directory-storage storage storage.block-directory"]
     extra_initial = []
     extra_engine = []
+    # stream P (architecture/data-os.md section 5): the engine's process resource, a duplicate
+    # of admission's, from which it starts an image's native program (abi: moruna) itself.
+    extra_initial += ["grant process root.process"]
+    extra_engine += ["grant process process process"]
     if data_inputs or data_output:
         extra_initial.append("grant handover initial.handover")
         extra_engine += [f"grant disk.in.{name} disk data{index}" for index, name in enumerate(data_inputs)]

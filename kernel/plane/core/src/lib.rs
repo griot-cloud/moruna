@@ -31,8 +31,14 @@ pub mod conformance;
 pub mod kernel;
 #[cfg(any(test, feature = "model"))]
 pub mod model;
+#[cfg(any(test, feature = "model"))]
+pub mod model_ring;
 pub mod plane;
 pub mod port;
+pub mod ring;
+#[cfg(any(test, feature = "model"))]
+pub mod ring_conformance;
+pub mod ringed;
 pub mod verify;
 
 #[cfg(test)]
@@ -40,3 +46,4 @@ mod tests;
 
 pub use plane::KernelPlane;
 pub use port::{BatchId, CallId, DataPlane, Event, PlaneError, Residency, Shape, TaskId};
+pub use ringed::{RingCalls, RingPlane, RingShape, View};

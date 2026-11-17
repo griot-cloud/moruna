@@ -26,13 +26,13 @@ use crate::verify::verify;
 /// The most slots and port channels one `next` waits on: a `wait`'s items.
 pub const WAITED_MAX: usize = limits::WAIT_MAX_ITEMS;
 
-struct SlotRec<S> {
-    slot: S,
+pub(crate) struct SlotRec<S> {
+    pub(crate) slot: S,
     /// Its task has ended and every event is taken.
-    drained: bool,
+    pub(crate) drained: bool,
 }
 
-struct TaskRec<S, Ch> {
+pub(crate) struct TaskRec<S, Ch> {
     inputs: Vec<SlotRec<S>>,
     outputs: Vec<SlotRec<S>>,
     port: Option<Ch>,
@@ -41,7 +41,12 @@ struct TaskRec<S, Ch> {
 }
 
 impl<S, Ch> TaskRec<S, Ch> {
-    fn open_slots(&self) -> impl Iterator<Item = &SlotRec<S>> {
+    /// Its port channel while it is open.
+    pub(crate) fn open_port(&self) -> Option<&Ch> {
+        self.port.as_ref().filter(|_| !self.port_done)
+    }
+
+    pub(crate) fn open_slots(&self) -> impl Iterator<Item = &SlotRec<S>> {
         self.inputs
             .iter()
             .chain(self.outputs.iter())
@@ -53,30 +58,47 @@ impl<S, Ch> TaskRec<S, Ch> {
     }
 }
 
-struct BatchRec {
+/// What a batch's bytes belong to, which they go back to when it is freed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Backing {
+    /// A whole arena object, which goes back to the pool.
+    Object,
+    /// Bytes ring mode lent out of an object it keeps (a region's span, a window), which
+    /// it takes back itself ([`crate::ringed`]).
+    Ring { owner: u64, at: u64 },
+}
+
+pub(crate) struct BatchRec {
     /// The arena object holding it.
-    object: u64,
-    offset: u64,
-    len: u64,
+    pub(crate) object: u64,
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
     /// Shares held by tasks.
-    shares: u64,
+    pub(crate) shares: u64,
     /// The engine's own hold.
-    held: bool,
+    pub(crate) held: bool,
+    pub(crate) backing: Backing,
 }
 
 /// The engine's side of the data plane over the kernel's calls.
 pub struct KernelPlane<C: Calls> {
-    calls: C,
-    arena: Arena<C::Memory>,
-    tasks: BTreeMap<u32, TaskRec<C::Slot, C::Channel>>,
-    next_task: u32,
-    batches: BTreeMap<u64, BatchRec>,
-    next_batch: u64,
-    events: VecDeque<Event>,
+    pub(crate) calls: C,
+    pub(crate) arena: Arena<C::Memory>,
+    pub(crate) tasks: BTreeMap<u32, TaskRec<C::Slot, C::Channel>>,
+    pub(crate) next_task: u32,
+    pub(crate) batches: BTreeMap<u64, BatchRec>,
+    pub(crate) next_batch: u64,
+    pub(crate) events: VecDeque<Event>,
     /// Bytes of windows granted and not yet back.
-    windows: u64,
+    pub(crate) windows: u64,
     /// A port request's buffer, reused.
-    buffer: Vec<u8>,
+    pub(crate) buffer: Vec<u8>,
+    /// Ring-backed batches freed, for ring mode to take their bytes back.
+    pub(crate) ring_freed: VecDeque<(u64, u64, u64)>,
+    /// Bytes zeroed before a task first saw them (C4's trust boundary).
+    pub(crate) zeroed: u64,
+    /// Zeros to write from, made at the first use.
+    zeros: Vec<u8>,
 }
 
 fn kernel(e: Error) -> PlaneError {
@@ -96,7 +118,16 @@ impl<C: Calls> KernelPlane<C> {
             events: VecDeque::new(),
             windows: 0,
             buffer: Vec::new(),
+            ring_freed: VecDeque::new(),
+            zeroed: 0,
+            zeros: Vec::new(),
         }
+    }
+
+    /// Bytes the plane zeroed before a task first saw them: pooled memory another task
+    /// had seen (C4's trust boundary). Fresh objects come zeroed from the kernel.
+    pub fn zeroed(&self) -> u64 {
+        self.zeroed
     }
 
     /// The kernel calls, for the engine's other uses of them.
@@ -137,6 +168,22 @@ impl<C: Calls> KernelPlane<C> {
         })
     }
 
+    /// Zeroes `len` bytes of `memory` from `offset`, and counts them.
+    pub(crate) fn zero(&mut self, memory: &C::Memory, offset: u64, len: u64) -> Result<(), Error> {
+        const CHUNK: usize = 64 * 1024;
+        if self.zeros.len() < CHUNK {
+            self.zeros.resize(CHUNK, 0);
+        }
+        let mut at = 0u64;
+        while at < len {
+            let n = (len - at).min(CHUNK as u64) as usize;
+            self.calls.write(memory, offset + at, &self.zeros[..n])?;
+            at += n as u64;
+        }
+        self.zeroed += len;
+        Ok(())
+    }
+
     /// A record of `len` bytes the engine writes itself, with `write`, into an arena
     /// object of at least that size, then checked and held as a batch, as [`Self::load`]:
     /// how a source or a stage lays a batch out where its tasks will map it, with one copy
@@ -149,6 +196,16 @@ impl<C: Calls> KernelPlane<C> {
     ) -> Result<(BatchId, u64), PlaneError> {
         let calls = &mut self.calls;
         let (object, memory, _) = self.arena.take(len, |n| calls.memory(n))?;
+        // A pooled object's pages past the record were another batch's: a task that maps
+        // the record's last page must not see them.
+        let tail = pages(len).unwrap_or(len) - len;
+        if self.arena.seen(object) != crate::arena::Seen::Nobody
+            && tail > 0
+            && let Err(e) = self.zero(&memory, len, tail)
+        {
+            self.arena.untake(object, memory)?;
+            return Err(kernel(e));
+        }
         let written = write(&mut self.calls, &memory);
         let checked = match written {
             Ok(()) => {
@@ -178,12 +235,13 @@ impl<C: Calls> KernelPlane<C> {
                 len,
                 shares: 0,
                 held: true,
+                backing: Backing::Object,
             },
         );
         Ok((BatchId(id), record.rows))
     }
 
-    fn waited(&self) -> usize {
+    pub(crate) fn waited(&self) -> usize {
         self.tasks
             .values()
             .map(|t| t.open_slots().count() + usize::from(t.port.is_some() && !t.port_done))
@@ -191,16 +249,19 @@ impl<C: Calls> KernelPlane<C> {
     }
 
     /// A share or the hold of `batch` has gone: free it once nothing holds it.
-    fn settle(&mut self, batch: u64) -> Result<(), PlaneError> {
+    pub(crate) fn settle(&mut self, batch: u64) -> Result<(), PlaneError> {
         let Some(b) = self.batches.get(&batch) else {
             return Ok(());
         };
         if b.shares > 0 || b.held {
             return Ok(());
         }
-        let object = b.object;
+        let (object, backing) = (b.object, b.backing);
         self.batches.remove(&batch);
-        self.arena.free(object)?;
+        match backing {
+            Backing::Object => self.arena.free(object)?,
+            Backing::Ring { owner, at } => self.ring_freed.push_back((owner, at, batch)),
+        }
         self.events.push_back(Event::Freed {
             batch: BatchId(batch),
         });
@@ -236,6 +297,7 @@ impl<C: Calls> KernelPlane<C> {
                         len,
                         shares: 0,
                         held: true,
+                        backing: Backing::Object,
                     },
                 );
                 self.events.push_back(Event::Put {
@@ -269,7 +331,7 @@ impl<C: Calls> KernelPlane<C> {
     }
 
     /// Takes every event every open slot has, and every port request, into the queue.
-    fn poll(&mut self) -> Result<(), PlaneError> {
+    pub(crate) fn poll(&mut self) -> Result<(), PlaneError> {
         let ids: Vec<u32> = self.tasks.keys().copied().collect();
         for id in ids {
             self.poll_task(id)?;
@@ -463,6 +525,7 @@ impl<C: Calls> DataPlane for KernelPlane<C> {
             Err((Error::BadState, _)) => return Err(PlaneError::Closed),
             Err((e, _)) => return Err(kernel(e)),
         }
+        self.arena.show(object, task.0);
         if let Some(b) = self.batches.get_mut(&batch.0) {
             b.shares += 1;
         }
@@ -492,11 +555,20 @@ impl<C: Calls> DataPlane for KernelPlane<C> {
         }
         let calls = &mut self.calls;
         let (id, memory, size) = self.arena.take(len, |n| calls.memory(n))?;
+        // Pages another task has seen are zeroed before this one sees them (C4).
+        if !self.arena.seen(id).clean_for(task.0) {
+            if let Err(e) = self.zero(&memory, 0, size) {
+                self.arena.untake(id, memory)?;
+                return Err(kernel(e));
+            }
+            self.arena.zeroed(id);
+        }
         let t = self.tasks.get(&task.0).ok_or(PlaneError::Unknown("task"))?;
         let slot = &t.outputs[output as usize].slot;
         match self.calls.push(slot, memory, 0, len, id) {
             Ok(()) => {
                 self.windows += size;
+                self.arena.show(id, task.0);
                 Ok(())
             }
             Err((e, memory)) => {

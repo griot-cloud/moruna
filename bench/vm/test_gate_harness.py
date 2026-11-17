@@ -110,7 +110,7 @@ def test_job_documents():
     files = [f"/data/nyc/norm/yellow_tripdata_2024-{m:02d}.parquet" for m in range(1, 13)]
     d = gate_jobs.document("score", files, "/data/out/x", {"digest": "sha256:" + "a" * 64, "location": "/oci"})
     k = d["kernels"][0]
-    assert (k["kind"], k["command"], k["plane"]) == ("image", ["/gate-score"], True)
+    assert (k["kind"], k["command"], k["plane"], k["abi"]) == ("image", ["/gate-score"], True, "moruna")
     assert d["source"]["url"] == files and d["sink"]["options"]["compression"] == "zstd"
     disk = gate_jobs.document("score", files, "/data/out/x", {}, disk=True)
     assert disk["source"]["url"][0] == "disk://2024-01"

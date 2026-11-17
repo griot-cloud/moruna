@@ -8,6 +8,8 @@ use moruna_sys::{
 };
 
 use crate::calls::{Calls, Ready, Taken};
+use crate::ring;
+use crate::ringed::{RingCalls, View};
 
 /// The calls of the process the engine runs in.
 #[derive(Debug, Default)]
@@ -141,5 +143,83 @@ impl Calls for Kernel {
             Err(Error::TimedOut) => Ok(Ready::TimedOut),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Whether the kernel takes write access back through a slot (`windows_protect`'s slot form),
+/// so ring tasks run in protect mode: stream A's 28ed2f43, booted.
+pub const SLOT_REVOKE: bool = true;
+
+/// The engine's mapping of a region or a rings object.
+#[derive(Debug)]
+pub struct Mapped(moruna_sys::plane::Shared);
+
+impl ring::Shared for Mapped {
+    fn load(&self, at: usize) -> u64 {
+        moruna_sys::plane::ring::Shared::load(&self.0, at)
+    }
+    fn store(&self, at: usize, value: u64) {
+        moruna_sys::plane::ring::Shared::store(&self.0, at, value)
+    }
+    fn fence(&self) {
+        moruna_sys::plane::ring::Shared::fence(&self.0)
+    }
+    fn wait(&self, at: usize, expected: u32, deadline: u64) -> bool {
+        moruna_sys::plane::ring::Shared::wait(&self.0, at, expected, deadline)
+    }
+    fn wake(&self, at: usize) {
+        moruna_sys::plane::ring::Shared::wake(&self.0, at)
+    }
+}
+
+impl View for Mapped {
+    fn read(&self, at: u64, buf: &mut [u8]) -> Result<(), Error> {
+        self.0.read(at, buf)
+    }
+    fn write(&self, at: u64, data: &[u8]) -> Result<(), Error> {
+        self.0.write(at, data)
+    }
+    fn base(&self) -> usize {
+        self.0.addr() as usize
+    }
+    fn len(&self) -> u64 {
+        self.0.len()
+    }
+}
+
+impl RingCalls for Kernel {
+    type Mapping = Mapped;
+
+    fn map(&mut self, memory: &Memory, len: u64) -> Result<Mapped, Error> {
+        moruna_sys::plane::Shared::map(memory, len).map(Mapped)
+    }
+
+    fn keep(&mut self, memory: &Memory) -> Result<Memory, Error> {
+        memory
+            .0
+            .duplicate(Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER)
+            .map(Memory)
+    }
+
+    /// `windows_protect` through the task's output slot (ABI 2.6, the slot form): the ranges
+    /// are offsets within the area the slot is mapped at in the task, which for a rings object
+    /// pushed from its start are its offsets in the object.
+    fn protect(&mut self, slot: &Slot, ranges: &[[u64; 2]], writable: bool) -> Result<(), Error> {
+        let flags = if writable {
+            map::READ | map::WRITE
+        } else {
+            map::READ
+        };
+        moruna_sys::datapath::windows_protect_slot(slot, ranges, flags)
+    }
+
+    /// On since stream A's kernel takes the slot form. Off, a task hands its rings object
+    /// back with `batch_put`, the unmap path.
+    fn revokes(&mut self, _slot: &Slot) -> bool {
+        SLOT_REVOKE
+    }
+
+    fn now(&mut self) -> u64 {
+        moruna_sys::now()
     }
 }

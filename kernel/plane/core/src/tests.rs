@@ -661,3 +661,107 @@ fn ka2_scripts_and_outcomes_cross_as_bytes() {
     assert!(decode_seen(&[7, 99, 0, 0, 0]).is_err());
     assert!(decode_seen(&[0]).is_err());
 }
+
+#[test]
+fn dp_ring_conformance_passes_on_the_kernel_model() {
+    let f = fixtures();
+    match crate::ring_conformance::check(&f) {
+        Ok(n) => assert!(n >= 17, "{n} cases"),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+#[test]
+fn dp_ring_measures_calls_per_batch() {
+    let f = fixtures();
+    for protect in [true, false] {
+        let lock = crate::ring_conformance::lockstep(&f, protect, 32).expect("lockstep");
+        let pipe = crate::ring_conformance::pipelined(&f, protect, 32).expect("pipelined");
+        std::println!(
+            "ring mode, {}: lockstep {} calls for {} batches ({} waits, {} revokes, {} generations); pipelined {} calls for {} batches",
+            if protect { "protect" } else { "unmap" },
+            lock.calls,
+            lock.batches,
+            lock.waits,
+            lock.revokes,
+            lock.generations,
+            pipe.calls,
+            pipe.batches
+        );
+        assert!(pipe.calls < pipe.batches);
+    }
+}
+
+/// The fixtures the Python shim's tests share with the engine (images/python/tests/fixtures):
+/// a record the shim wrote passes the engine's check, and the ring layout the shim speaks is
+/// the engine's. `MORUNA_WRITE_GOLDEN=1` writes the layout's file again.
+#[test]
+fn p_the_python_shim_speaks_the_engine_s_records_and_rings() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../images/python/tests/fixtures");
+    let rec = std::fs::read(dir.join("record.bin")).expect("the shim's record");
+    let checked = verify(rec.len() as u64, |at, buf| {
+        let at = at as usize;
+        buf.copy_from_slice(&rec[at..at + buf.len()]);
+        Ok(())
+    })
+    .expect("the shim's record passes the check");
+    assert_eq!(checked.rows, 3);
+
+    let words = crate::ring_conformance::golden();
+    assert!(!words.is_empty());
+    let g = crate::ring::Geometry::new(1 << 20, 2, 64 * 1024).expect("geometry");
+    let body: Vec<String> = words
+        .iter()
+        .map(|(at, v)| format!("    \"{at}\": {v}"))
+        .collect();
+    let json = format!(
+        "{{\n  \"windows_at\": {},\n  \"words\": {{\n{}\n  }}\n}}\n",
+        g.windows_at(),
+        body.join(",\n")
+    );
+    let file = dir.join("ring-golden.json");
+    if std::env::var("MORUNA_WRITE_GOLDEN").is_ok() {
+        std::fs::write(&file, &json).expect("writing the golden layout");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("the golden layout"),
+        json
+    );
+}
+
+/// The engine never sleeps through a ring it may not have seen: the task notes (or posts)
+/// between the engine's look at the rings and its sleep, and the sleep is refused; after a
+/// fresh look it sleeps on the bell as it now stands.
+#[test]
+fn p_the_engine_does_not_sleep_through_a_ring_after_its_look() {
+    use crate::ring::{Engine, Geometry, Mode, Task, layout};
+    let mem = crate::model::Mem {
+        bytes: Rc::new(core::cell::RefCell::new(vec![0u8; 64 * 1024])),
+        writable: true,
+    };
+    let s = crate::model_ring::ModelMap::from_mem(&mem);
+    let g = Geometry::new(4096, 1, 4096).expect("geometry");
+    let mut e = Engine::format(&s, g, Mode::Protect, 0);
+    let mut t = Task::attach(&s).expect("attach");
+    e.look(&s);
+    t.note(&s);
+    assert_eq!(e.sleep(&s), Ok(None), "the note rang after the look");
+    assert_eq!(
+        crate::ring::Shared::load(&s, layout::ENGINE_WAITS),
+        0,
+        "not asleep"
+    );
+    e.look(&s);
+    let seq = e
+        .sleep(&s)
+        .expect("sleep")
+        .expect("nothing rang since the look");
+    assert_eq!(
+        seq,
+        crate::ring::Shared::load(&s, layout::ENGINE_BELL) as u32
+    );
+    e.awake(&s);
+    assert!(e.noted(&s), "the note is read");
+    assert!(!e.noted(&s), "once");
+}

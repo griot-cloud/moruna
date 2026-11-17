@@ -12,7 +12,8 @@
 //! each listener a `grant SLOT service FROM` explicitly names as `FROM`; and `handover`, a
 //! listener of the device manager's control linked to its `control.engine` slot, when a
 //! `grant disk.NAME disk DEVICE` asks for a data disk (`architecture/data-os.md` §3). Each data
-//! disk is handed over once, and each run is given duplicates of its handles.
+//! disk is handed over once, and each run is given duplicates of its handles. Each process
+//! resource a `grant SLOT process FROM` names as `FROM` (stream P).
 
 #![no_std]
 #![no_main]
@@ -75,6 +76,32 @@ fn data_slots(config: &Config) -> Result<BTreeMap<String, Handle>, String> {
                     g.slot
                 )
             })?;
+            out.insert(from.clone(), handle);
+        }
+    }
+    Ok(out)
+}
+
+// stream P (architecture/data-os.md section 5)
+/// The process resources the grants name, taken from the supervisor's start page once and
+/// checked to be process resources: each run is given a duplicate.
+fn process_slots(config: &Config) -> Result<BTreeMap<String, Handle>, String> {
+    let mut out = BTreeMap::new();
+    for g in &config.grants {
+        if let Source::Process(from) = &g.source
+            && !out.contains_key(from)
+        {
+            let handle = start::take(from).ok_or_else(|| {
+                format!(
+                    "`grant {} process {from}` names a process resource the supervisor was not \
+                     given",
+                    g.slot
+                )
+            })?;
+            match handle.resource_info() {
+                Ok(info) if info.kind == moruna_svc::ResourceKind::Process => {}
+                _ => return Err(format!("`{from}` is not a process resource")),
+            }
             out.insert(from.clone(), handle);
         }
     }
@@ -247,6 +274,7 @@ fn grants(
     services: &BTreeMap<String, Channel>,
     admissions: &mut BTreeMap<String, moruna_storage_service::protocol::admission::Client>,
     account: &Account,
+    processes: &BTreeMap<String, Handle>,
 ) -> Result<Vec<(Bytes, Handle)>, String> {
     let bindings = if config
         .grants
@@ -337,6 +365,12 @@ fn grants(
                 .duplicate(Rights::READ | Rights::MAP | Rights::TRANSFER)
                 .map_err(|e| format!("duplicating the data handle `{from}`: {}", e.name()))?,
             Source::Disk(device) => disks.grant(&g.slot, device)?,
+            // stream P: the engine makes processes from it, nothing more.
+            Source::Process(from) => processes
+                .get(from)
+                .ok_or_else(|| format!("no process resource `{from}`"))?
+                .duplicate(Rights::WRITE | Rights::TRANSFER)
+                .map_err(|e| format!("duplicating the process resource `{from}`: {}", e.name()))?,
         };
         out.push((b(&g.slot), handle));
     }
@@ -448,6 +482,14 @@ fn run() -> i64 {
             return 1;
         }
     };
+    // stream P
+    let processes = match process_slots(&config) {
+        Ok(p) => p,
+        Err(why) => {
+            println!(out, "KD2 engine: FAIL: {}", why);
+            return 1;
+        }
+    };
     let mut disks = Disks::new();
     let mut argv = Vec::with_capacity(config.args.len() + 1);
     argv.push(b(&config.program));
@@ -480,6 +522,7 @@ fn run() -> i64 {
             &services,
             &mut admissions,
             &runtime,
+            &processes,
         ) {
             Ok(h) => h,
             Err(why) => {

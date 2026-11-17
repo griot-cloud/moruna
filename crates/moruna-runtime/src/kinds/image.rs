@@ -104,7 +104,36 @@ pub struct Settings {
     /// 4.10): to the host protocol's peer or to a handler the program registered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ports: Option<BTreeMap<String, PortDoc>>,
+    // stream P (architecture/data-os.md section 5): the command's ABI.
+    /// The ABI the command's program is built for: `linux` (the default), run by the Linux
+    /// personality, or `moruna`, a native program of the Moruna kernel's user target, which
+    /// the engine checks and starts itself on the data plane (with `plane: true`). Only the
+    /// Moruna kernel runs a native program.
+    #[serde(default, skip_serializing_if = "Abi::is_linux")]
+    pub abi: Abi,
 }
+
+// stream P (architecture/data-os.md section 5): the ABI an image's command is built for.
+/// The ABI an image's command is built for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Abi {
+    /// A Linux program, run by the Linux personality on the Moruna kernel.
+    #[default]
+    Linux,
+    /// A native program of the Moruna kernel's user target (`x86_64-moruna-user`).
+    Moruna,
+}
+
+impl Abi {
+    fn is_linux(&self) -> bool {
+        *self == Abi::Linux
+    }
+}
+
+/// Why an entry declaring `abi: moruna` is refused off the Moruna kernel (stream P).
+const NATIVE_ONLY_ON_KERNEL: &str =
+    "a native program of the Moruna kernel's user target runs only on the Moruna kernel";
 
 fn declaration_of(role: Role) -> Declaration {
     let (summary, inputs, outputs) = match role {
@@ -261,6 +290,10 @@ impl RunnableKind for Image {
         if moruna_micro::on_kernel() {
             return on_kernel(entry, settings, cx);
         }
+        // stream P
+        if settings.abi == Abi::Moruna {
+            return Err(entry.refuse("abi", NATIVE_ONLY_ON_KERNEL));
+        }
         sandboxed(entry, settings, cx)
     }
 }
@@ -275,6 +308,10 @@ impl SourceKind for Image {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         if moruna_micro::on_kernel() {
             return Err(entry.refuse("image", ON_KERNEL));
+        }
+        // stream P
+        if settings.abi == Abi::Moruna {
+            return Err(entry.refuse("abi", NATIVE_ONLY_ON_KERNEL));
         }
         process_task(entry, settings, cx, Role::Source).map(|built| match built {
             Built::Source(source) => source,
@@ -293,6 +330,10 @@ impl SinkKind for Image {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         if moruna_micro::on_kernel() {
             return Err(entry.refuse("image", ON_KERNEL));
+        }
+        // stream P
+        if settings.abi == Abi::Moruna {
+            return Err(entry.refuse("abi", NATIVE_ONLY_ON_KERNEL));
         }
         process_task(entry, settings, cx, Role::Sink).map(|built| match built {
             Built::Sink(sink) => sink,
@@ -369,7 +410,16 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
         &env,
     )
     .map_err(|e| entry.refuse("command", e.to_string()))?;
-    if (launch.uid, launch.gid) != (0, 0) {
+    // stream P: a native program needs the data plane, and is started by the engine, not the
+    // personality, whose rules below it does not keep.
+    let native = settings.abi == Abi::Moruna;
+    if native && !settings.plane {
+        return Err(entry.refuse(
+            "abi",
+            "a native program makes the data plane's calls itself: it needs `plane: true`",
+        ));
+    }
+    if !native && (launch.uid, launch.gid) != (0, 0) {
         return Err(entry.refuse(
             "image",
             format!(
@@ -379,7 +429,7 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
             ),
         ));
     }
-    if launch.working_dir != "/" {
+    if !native && launch.working_dir != "/" {
         return Err(entry.refuse(
             "image",
             format!(
@@ -408,11 +458,16 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
                 ),
             )
         })?;
+    // stream P: the program's ELF, checked against the ABI the entry declares.
+    let elf = moruna_micro::task::program(&path, native).map_err(|why| entry.refuse("abi", why))?;
     let env = launch.env_entries();
-    let identity = json!({
+    let mut identity = json!({
         "image": verified.digest.to_string(), "path": path, "command": launch.command,
         "env": env, "ports": names,
     });
+    if native {
+        identity["abi"] = json!("moruna");
+    }
     let reference = verified.digest.to_string();
     let task = moruna_micro::task::ImageTask::new(
         &reference,
@@ -425,7 +480,14 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
     .map_err(|why| moruna_kernel::MorunaError::Config {
         name: "image",
         msg: format!("{reference}: {why}"),
-    })?;
+    })?
+    // A command that makes the data plane's calls itself runs on the rings (stream P).
+    .with_plane(settings.plane);
+    // stream P: a native program, which the stage starts itself.
+    let task = match elf {
+        Some(elf) => task.with_native(elf),
+        None => task,
+    };
     cx.notes().push(format!(
         "image {}: verified on the Moruna kernel against the {} layers it attached",
         verified.digest,

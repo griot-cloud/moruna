@@ -3,12 +3,10 @@ function as a native task, a Parquet sink.
 
 A native task is named the way a job names any program of its own: an `image` function whose
 image holds the task (images/gate/tasks, gate-JOB, a static program of the kernel's user target)
-and whose `command` runs it, with `plane: true`, the command making the data plane's calls itself.
-
-PENDING (reported to the integrator): on the Moruna kernel, an `image` entry's command starts
-through the Linux personality today (moruna-micro's ImageTask; stream P's 820d7fe0 puts it on
-the rings); a native program needs the runner to start it as a process of the kernel, with its
-plane attached, and no personality. The document names the task the same either way.
+and whose `command` runs it, with `plane: true`, the command making the data plane's calls itself,
+and `abi: "moruna"`: the engine checks the program is of the kernel's user target and starts it
+itself, a process of the kernel with its plane attached, never through the Linux personality
+(stream P).
 
 The inputs are named as `moruna run` takes them; on the data OS each becomes a `disk://NAME`
 device (crates/moruna-micro/src/devices.rs). With disk=True the document names the devices,
@@ -53,6 +51,7 @@ def document(workload: str, files, out: str, image: dict, cpus: int = 8, mem_gib
                   "location": image.get("location")},
         "command": [f"/gate-{workload}"],
         "plane": True,
+        "abi": "moruna",
     }]
     doc["sink"] = {"kind": "parquet", "url": out, "options": dict(SINK)}
     doc["budget"] = {"memory_bytes": int(mem_gib * (1 << 30)), "cpu": cpus}

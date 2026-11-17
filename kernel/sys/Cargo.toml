@@ -10,6 +10,11 @@ publish.workspace = true
 # A global allocator over memory objects, so a program has `alloc` (moruna-svc turns
 # it on).
 heap = []
+# stream P: `plane::Log`, a native task's lines into the log ring the engine gives it. Its
+# records are `moruna-record`'s, which links alloc, so a program with it also has `heap`.
+log = ["dep:moruna-record"]
 
 [dependencies]
 moruna-abi.workspace = true
+# stream P: `plane::Log`'s records (feature `log`).
+moruna-record = { path = "../../crates/moruna-record", version = "=0.6.6", default-features = false, optional = true }
