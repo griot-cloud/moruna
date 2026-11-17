@@ -29,6 +29,22 @@
       "patched_sha256": "3a2885ecc72045aae8c53cf85b9a74173b8a1be952a67b9ff6698e485eb82c34",
       "upstream_sha256": "17e70d9dc0848d2ff5908f462d25364db713cadd479679130980bcb6c2758781"
     },
+    "src/arch/x86/boot/linux_boot/mod.rs": {
+      "patched_sha256": "e48fa59aeca336440c9761cd60a44ccbc812272cea6e7ffb1f7123cbd10a9b68",
+      "upstream_sha256": "e5e3b7540c6251c35b439726953a5ffe12d965548ba37e5f0ccdd521865b8d6e"
+    },
+    "src/arch/x86/boot/multiboot/mod.rs": {
+      "patched_sha256": "14ed83aa9acd02b5ef550c1a9af0a40d2ecf27e6787a6fa9b1a03fe2bc060c18",
+      "upstream_sha256": "2c3615e5ff655c60ffc01c5ea70f93b6d3938230708b3ae2ed1940c67afac420"
+    },
+    "src/arch/x86/boot/multiboot2/mod.rs": {
+      "patched_sha256": "12bfe9e5266a7477b8d99724d02cac9a9b3b7a1c3112044c0c94c3654f706750",
+      "upstream_sha256": "5e92fa38e19cc1da44ff0d465ad9a28cb888136bcffcdb45bae272539d5cb16c"
+    },
+    "src/arch/x86/boot/pvh/mod.rs": {
+      "patched_sha256": "6f754a08a6bed301f5bf484e1b2e480cbe9033141cd7eccabdac9b24c665ea54",
+      "upstream_sha256": "36b0110c50f439bf3ba61a279ffc6b25c8f437e85afc07049843ec2cd6a1a158"
+    },
     "src/arch/x86/cpu/context/mod.rs": {
       "patched_sha256": "0feeef19b89ebcfc0939976908b3d2c6bd86f8c398ff90e3524b17da7e3ad53e",
       "upstream_sha256": "e179934a23e419c956b28c1c3b1f067f1f6e89f79cb466f39b22e407dfcdd99f"
@@ -72,6 +88,10 @@
     "src/arch/x86/timer/pit.rs": {
       "patched_sha256": "008ae0ae699d263fe65b42a959db5e80823efa24e9c471c1742982622d63635b",
       "upstream_sha256": "bf177b86fc07116a8ff2aee47bb706493a36a0f79f66404cd42df2d462d892f5"
+    },
+    "src/boot/mod.rs": {
+      "patched_sha256": "922d928a33e361dfdd56655a884fb4cc1f76ccbf1176ab0a2ce10750d3d612ef",
+      "upstream_sha256": "8d5adf5603324edf3ffbdfe22b11c9436db74246843df3927926e54d28a4b76e"
     },
     "src/boot/smp.rs": {
       "patched_sha256": "8d3e7a9c0194920b0dbbd2623662c7946df9006407322fbc2e63cfa55400300f",

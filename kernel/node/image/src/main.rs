@@ -657,7 +657,9 @@ mod profile_tests {
                     .as_nanos()
             ));
             fs::create_dir(&root).unwrap();
-            fs::copy(node_dir().join("cloud/node.conf"), root.join("node.conf")).unwrap();
+            for name in ["node.conf", "network.conf"] {
+                fs::copy(node_dir().join("cloud").join(name), root.join(name)).unwrap();
+            }
             fs::copy(node_dir().join("cloud.image"), root.join("cloud.image")).unwrap();
             for (name, text) in changes {
                 fs::write(root.join(name), text).unwrap();
@@ -794,16 +796,29 @@ mod profile_tests {
         assert!(missing.cloud(RAM).unwrap_err().starts_with("node.conf: "));
     }
 
+    /// Item 1.1's node.conf, which runs no network server.
+    const UNNETWORKED: &str = "moruna-node 1\nservice devices image.devices 67108864\nbootstrap devices devices\ngrant devices drivers drivers\n";
+
     #[test]
     fn cloud_checks_network_conf_only_when_node_conf_runs_the_network_server() {
-        // Item 1.1's profile runs no network server: network.conf is neither needed nor read.
-        let none = Assets::new("nonet", &[("network.conf", "not a network config")]);
+        // A profile that runs no network server: network.conf is neither needed nor read.
+        let none = Assets::new(
+            "nonet",
+            &[
+                ("node.conf", UNNETWORKED),
+                ("network.conf", "not a network config"),
+            ],
+        );
         none.cloud(RAM).unwrap();
         // With one, network.conf must be bound and pass the network server's parser.
         let unbound = Assets::new(
             "unbound-net",
             &[
                 ("node.conf", NETWORKED),
+                (
+                    "cloud.image",
+                    "moruna-image 1\nprocess node-supervisor\n  handle console console\n  handle data:node.conf config\n",
+                ),
                 ("network.conf", "moruna-netstack 1\n"),
             ],
         );
@@ -862,6 +877,7 @@ mod profile_tests {
             "unreadable",
             &[("node.conf", NETWORKED), ("cloud.image", BOUND)],
         );
+        fs::remove_file(unreadable.0.join("network.conf")).unwrap();
         assert!(
             unreadable
                 .cloud(RAM)

@@ -27,6 +27,13 @@ kernel mode and so counted against §0:
   quiescent state (`UserMode::execute`), as it does in Linux, and
   `sync::report_quiescent_state` lets the core's idle task pass one each time it wakes.
 
+One more, marked `moruna:` (item 1.4, the system design's section 1B):
+
+- **The counter at the core's first instruction.** Each boot protocol's entry
+  (`__multiboot2_entry`, `__multiboot_entry`, `__pvh_entry`, `__linux_boot`) records the
+  time-stamp counter first thing, and `boot::entry_tsc` gives it. The core's clock counts
+  from it, so `boot_ms` includes OSTD's own start-up.
+
 It also adds what a node needs to stop on every machine (`architecture/moruna-os-system.md`,
 section 1B; work item 1.2). Each patch is marked with a `moruna:` comment:
 

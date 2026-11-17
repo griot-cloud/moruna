@@ -41,7 +41,7 @@ fn run() -> i64 {
 
 fn exchange(server: &Channel) -> Result<(), String> {
     let channel = connect(server).map_err(|e| format!("connect: {e:?}"))?;
-    let mut c = echo::Client::connect(channel, deadline_in(10 * SECOND))
+    let mut c = echo::Client::connect(channel, deadline_in(moruna_svc::READY_TIMEOUT))
         .map_err(|e| format!("handshake: {e:?}"))?;
     c.core().set_timeout(10 * SECOND);
     if c.core().server_minor() != echo::ID.minor {

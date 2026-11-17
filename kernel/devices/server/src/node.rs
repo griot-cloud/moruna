@@ -18,7 +18,10 @@
 //!    until the new driver has reset the device). Lookups that arrive meanwhile are
 //!    answered once it runs.
 //! 5. When the last directory and control client has gone, it closes the drivers'
-//!    listeners, waits for each driver to end, and exits.
+//!    listeners, waits for each driver to end, and exits. Unless the supervisor's
+//!    message says it serves until it is stopped, as a node's supervisor does (system
+//!    design 1C: it lives as long as the node, while its clients come and go): then it
+//!    serves on, with or without clients, until the supervisor stops it.
 //!
 //! A table line whose program is `-` starts no driver: its devices are data disks the engine
 //! drives itself. Each is handed, DMA right included, to the one connection that asks through
@@ -42,8 +45,8 @@ use moruna_mmio::Sub;
 use moruna_pci::{Address, Bar, CONFIG_SIZE, Config, DEVICES, FUNCTIONS};
 use moruna_svc::{
     Channel, Completions, Console, Context, DEADLINE_INFINITE, DeviceMemory, Dispatcher, Error,
-    Handle, Handler, Memory, Outcome, Pending, Process, ProtocolError, Rights, Signals, Watch,
-    connect, deadline_in, map, now, println, start, wait_one,
+    Handle, Handler, Memory, Outcome, Pending, Process, ProtocolError, Rights, Signals, Timer,
+    Watch, connect, deadline_in, map, now, println, start, wait_one,
 };
 
 /// How long the device manager waits for the supervisor's resources, and for its
@@ -385,17 +388,20 @@ impl Handler for Control {
     }
 }
 
-/// Reads the supervisor's message: the five root resources, in order.
-fn roots(supervisor: &Channel) -> Result<Roots, String> {
+/// Reads the supervisor's message: the five root resources, in order, and whether the
+/// device manager serves until it is stopped.
+fn roots(supervisor: &Channel) -> Result<(Roots, bool), String> {
     wait_one(&supervisor.0, Signals::READABLE, deadline_in(WAIT_NS))
         .map_err(|e| format!("waiting for the supervisor's resources: {}", e.name()))?;
     let mut bytes = [0u8; 16];
     let mut handles: [Option<Handle>; 5] = Default::default();
-    match supervisor.read(&mut bytes, &mut handles) {
-        Ok((n, count)) if moruna_node::Bootstrap::Devices.accepts(&bytes[..n], count) => {}
-        Ok(_) => return Err("invalid versioned device root bootstrap".to_string()),
+    let until_stopped = match supervisor.read(&mut bytes, &mut handles) {
+        Ok((n, count)) => match moruna_node::Bootstrap::decode(&bytes[..n], count) {
+            Some(moruna_node::Bootstrap::Devices { until_stopped }) => until_stopped,
+            _ => return Err("invalid versioned device root bootstrap".to_string()),
+        },
         Err(e) => return Err(format!("reading the supervisor's resources: {}", e.name())),
-    }
+    };
     let [
         Some(process),
         Some(device),
@@ -406,13 +412,32 @@ fn roots(supervisor: &Channel) -> Result<Roots, String> {
     else {
         return Err("the supervisor's message lacks a handle".to_string());
     };
-    Ok(Roots {
-        process,
-        device,
-        ecam,
-        msi,
-        dma,
-    })
+    Ok((
+        Roots {
+            process,
+            device,
+            ecam,
+            msi,
+            dma,
+        },
+        until_stopped,
+    ))
+}
+
+/// A timer never set: a watch that never fires, so a device manager that serves until
+/// it is stopped has a wait to sleep in when it holds no client and no driver.
+struct Never(Handle);
+
+impl Watch for Never {
+    fn handle(&self) -> &Handle {
+        &self.0
+    }
+    fn signals(&self) -> Signals {
+        Signals::SIGNALED
+    }
+    fn signaled(&mut self, _: Signals, _: &mut Completions) -> bool {
+        true
+    }
 }
 
 fn table() -> Result<Table, String> {
@@ -589,7 +614,7 @@ fn serve(out: &Console) -> Result<String, String> {
         let image = start::take(&slot).ok_or_else(|| format!("no image in slot {slot}"))?;
         images.push((program.to_string(), image));
     }
-    let roots = roots(&supervisor)?;
+    let (roots, until_stopped) = roots(&supervisor)?;
     let functions = enumerate(out, &roots.ecam, &table)?;
     let mut devices: Vec<Device> = Vec::new();
     let mut counts: Vec<(String, u32)> = Vec::new();
@@ -742,6 +767,20 @@ fn serve(out: &Console) -> Result<String, String> {
             .listen(channel, factory)
             .map_err(|e| format!("listening on {slot}: {}", e.name()))?;
         listeners += 1;
+    }
+    if until_stopped {
+        // System design 1C: on a node the device manager lives as long as the node.
+        // Clients come and go, and the supervisor stops it.
+        println!(out, "KB3 devices: serving until the supervisor stops it");
+        let never = Timer::create().map_err(|e| format!("timer_create: {}", e.name()))?;
+        dispatcher
+            .watch(Box::new(Never(never.0)))
+            .map_err(|e| format!("watching the idle timer: {}", e.name()))?;
+        loop {
+            dispatcher
+                .turn(DEADLINE_INFINITE)
+                .map_err(|e| format!("wait: {}", e.name()))?;
+        }
     }
     while dispatcher.channels() > 0 {
         dispatcher
