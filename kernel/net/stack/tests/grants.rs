@@ -1,7 +1,9 @@
 //! A grant's bounds (work item 1.3b), through `moruna.net` over loopback: `sockets=N`
 //! counts every socket of the grant's listeners and connections until it is freed, its
 //! closing ones included, whichever client connection through the grant's slot holds
-//! them; and `rx=` and `tx=` are the buffers of the grant's TCP sockets.
+//! them; `rx=` and `tx=` are the buffers of the grant's TCP sockets and its UDP
+//! sockets' payload buffers; and a listener minted by `grant` has buffers within its
+//! minter's (moruna.net 3.1).
 
 mod common;
 
@@ -9,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use common::{no_external_cards, serve};
 use moruna_svc::{CallError, Channel, deadline_in};
-use netstack_protocol::{Addr, Endpoint, Target, net};
+use netstack_protocol::{Addr, Endpoint, Policy, Target, net, rights};
 
 const SECOND: u64 = 1_000_000_000;
 const HERE: Addr = Addr::v4(127, 0, 0, 1);
@@ -221,5 +223,115 @@ grant listen-y rights=connect remote=127.0.0.0/8 local=127.0.0.0/8
         "the settings, for a grant that sets no buffers"
     );
     drop((a, b, x, y, slots));
+    join.join().expect("the server");
+}
+
+#[test]
+fn a_grant_s_udp_sockets_have_its_buffers() {
+    // The UDP settings are large, so only the grant's buffers bound these sockets.
+    let config = "moruna-netstack 1
+grant listen-x rights=udp remote=127.0.0.0/8 local=127.0.0.0/8 rx=2048 tx=2048
+grant listen-y rights=udp remote=127.0.0.0/8 local=127.0.0.0/8
+";
+    let (mut slots, join) = serve(config, &[], no_external_cards());
+    let x = slots.remove("listen-x").expect("slot");
+    let y = slots.remove("listen-y").expect("slot");
+    let mut a = client(&x);
+    let mut b = client(&y);
+    let (sa, at_a) = a.bind(Endpoint::new(HERE, 0)).expect("bind");
+    let (sb, at_b) = b.bind(Endpoint::new(HERE, 0)).expect("bind");
+    // Sending: nothing larger than the grant's send buffer.
+    match a.send_to(sa, at_b, vec![1; 3000]) {
+        Err(CallError::Remote(net::Error::TooLarge)) => {}
+        other => panic!("3000 bytes past a 2048-byte send buffer: {other:?}"),
+    }
+    a.send_to(sa, at_b, vec![2; 2000]).expect("2000 bytes");
+    let (from, bytes) = b.receive_from(sb).expect("receive");
+    assert_eq!((from, bytes.len()), (at_a, 2000));
+    // Receiving: a datagram larger than the receive buffer is dropped; the next is not.
+    b.send_to(sb, at_a, vec![3; 3000])
+        .expect("3000 bytes from a grant of the settings");
+    b.send_to(sb, at_a, vec![4; 100]).expect("100 bytes");
+    let (_, bytes) = a.receive_from(sa).expect("receive");
+    assert_eq!(bytes, vec![4; 100], "the 3000 bytes did not fit 2048");
+    drop((a, b, x, y, slots));
+    join.join().expect("the server");
+}
+
+#[test]
+fn a_minted_listener_has_buffers_within_its_minter_s() {
+    let config = "moruna-netstack 1
+grant listen-x rights=listen,grant local=127.0.0.0/8 sockets=8 rx=8192 tx=8192 per-peer=4 linger=2000
+grant listen-y rights=connect remote=127.0.0.0/8 local=127.0.0.0/8
+";
+    let (mut slots, join) = serve(config, &[], no_external_cards());
+    let x = slots.remove("listen-x").expect("slot");
+    let y = slots.remove("listen-y").expect("slot");
+    let mut a = client(&x);
+    let mut b = client(&y);
+    let parent = a.info().expect("info").policy;
+    assert_eq!(
+        (parent.rx, parent.tx, parent.per_peer, parent.linger_ms),
+        (Some(8192), Some(8192), Some(4), Some(2000)),
+        "info says the grant's bounds"
+    );
+    let child = Policy {
+        rights: rights::LISTEN,
+        tx: Some(4096),
+        per_peer: Some(2),
+        linger_ms: Some(1000),
+        ..parent.clone()
+    };
+    let refused = |r: Result<Channel, CallError<net::Error>>, what: &str| {
+        assert!(
+            matches!(r, Err(CallError::Remote(net::Error::NotPermitted))),
+            "{what}: expected NotPermitted, got {r:?}"
+        );
+    };
+    for (wider, what) in [
+        (
+            Policy {
+                rx: Some(8193),
+                ..child.clone()
+            },
+            "larger buffers",
+        ),
+        (
+            Policy {
+                rx: None,
+                ..child.clone()
+            },
+            "the server's buffers, under a grant that gives its own",
+        ),
+        (
+            Policy {
+                per_peer: Some(5),
+                ..child.clone()
+            },
+            "more sockets a peer",
+        ),
+        (
+            Policy {
+                linger_ms: Some(2001),
+                ..child.clone()
+            },
+            "a longer linger",
+        ),
+    ] {
+        refused(a.grant(wider), what);
+    }
+    let minted = a.grant(child.clone()).expect("a narrower grant");
+    let mut c = client(&minted);
+    assert_eq!(c.info().expect("info").policy, child);
+    let (l, at) = c.listen(Endpoint::new(HERE, 0), 4).expect("listen");
+    b.open(Target::Endpoint(at), None).expect("open");
+    let accepted = c.accept(l).expect("accept");
+    let status = c.status(accepted.socket).expect("status");
+    assert_eq!(
+        (status.receive_capacity, status.send_capacity),
+        (8192, 4096),
+        "the minted grant's buffers"
+    );
+    drop((a, b, c, minted, x, y, slots));
     join.join().expect("the server");
 }

@@ -18,6 +18,6 @@ pub mod tls;
 
 pub use config::{Config, ConfigError, Settings, parse};
 pub use device::Port;
-pub use grant::{Buffers, Grant};
+pub use grant::Grant;
 pub use session::{Session, Shared, after_turn, factory, granted};
 pub use stack::{Card, Iface, Stack};

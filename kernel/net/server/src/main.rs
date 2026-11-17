@@ -400,7 +400,7 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
         let channel = start::take(&slot)
             .map(Channel)
             .ok_or_else(|| format!("slot {slot} was taken"))?;
-        listeners.push((channel, Grant::new(policy.clone(), config.buffers(&slot))));
+        listeners.push((channel, Grant::new(slot.clone(), policy.clone())));
     }
     let (mut links, cards) = if config.interfaces.is_empty() {
         (Vec::new(), Vec::new())
@@ -498,6 +498,10 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
         }
         // The boot's lines, exactly as the stack wrote them.
         for line in core::mem::take(&mut shared.stack.borrow_mut().boot) {
+            println!(out, "{}", line);
+        }
+        // A grant at its bound, at most once a minute a grant (work item 1.3b).
+        for line in core::mem::take(&mut shared.stack.borrow_mut().bounds) {
             println!(out, "{}", line);
         }
         if shared.stack.borrow().lease_overdue(started, now()) {

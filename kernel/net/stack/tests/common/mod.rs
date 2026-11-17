@@ -142,7 +142,7 @@ pub fn serve_until(
     for (slot, policy) in &config.grants {
         let (o, t) = Channel::create().expect("a channel");
         ours.insert(slot.clone(), o);
-        theirs.push((t, Grant::new(policy.clone(), config.buffers(slot))));
+        theirs.push((t, Grant::new(slot.clone(), policy.clone())));
     }
     let cards: Vec<Card> = macs
         .iter()

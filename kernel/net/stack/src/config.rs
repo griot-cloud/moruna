@@ -8,29 +8,30 @@
 //!                [gateway6=ADDR] [dhcp]
 //! dns ADDR...                             # the resolver's servers, before DHCP's
 //! grant SLOT rights=R,... [remote=RULE,...] [local=RULE,...] [names=PATTERN[@PORTS],...]
-//!            [sockets=N] [rx=BYTES] [tx=BYTES]
+//!            [sockets=N] [rx=BYTES] [tx=BYTES] [per-peer=N] [linger=MS]
 //! ```
 //!
 //! A rule is `ADDR/PREFIX` with an optional `@PORT` or `@FIRST-LAST` (every port
 //! without), or `any` for every IPv4 and IPv6 address. A grant's `SLOT` names a
 //! listener slot of the server's (`listen*`); every connection through it holds that
 //! policy. `sockets` bounds the sockets every connection through the slot holds
-//! between them ([`crate::grant`]); `rx` and `tx` are the receive and send buffers
-//! of each of their TCP sockets, the settings `tcp-receive-buffer` and
-//! `tcp-send-buffer` when not given (work item 1.3b). `#` begins a comment. Anything
-//! else, and every value out of range, is refused with its line.
+//! between them ([`crate::grant`]). Work item 1.3b's bounds on their memory: `rx` and
+//! `tx` are the receive and send buffers of each of their sockets (TCP's, and UDP's
+//! payload buffers), `per-peer` the most connections one remote address may hold
+//! through the slot's listeners (8 when not given), and `linger` how long, in
+//! milliseconds, a closed socket may take to finish its close; not given, the settings
+//! hold (`tcp-receive-buffer` and `udp-receive-bytes`, `tcp-send-buffer` and
+//! `udp-send-bytes`, `tcp-linger-ms`). `#` begins a comment. Anything else, and every
+//! value out of range, is refused with its line.
 
 use alloc::{
-    collections::BTreeMap,
     format,
     string::{String, ToString},
     vec::Vec,
 };
 use core::net::IpAddr;
 
-use netstack_protocol::{Addr, Cidr, NameRule, Policy, Rule, rights};
-
-use crate::grant::Buffers;
+use netstack_protocol::{Addr, Cidr, LINGER_MAX_MS, NameRule, PER_PEER_MAX, Policy, Rule, rights};
 
 /// The first line of the configuration.
 pub const HEADER: &str = "moruna-netstack 1";
@@ -42,8 +43,8 @@ pub const ADDRS_MAX: usize = 6;
 /// The most resolver servers, smoltcp's `dns-max-server-count-4`.
 pub const DNS_MAX: usize = 4;
 /// The smallest and largest socket buffer, in bytes, a setting or a grant gives.
-pub const BUFFER_MIN: usize = 1024;
-pub const BUFFER_MAX: usize = 16 << 20;
+pub const BUFFER_MIN: usize = netstack_protocol::BUFFER_MIN as usize;
+pub const BUFFER_MAX: usize = netstack_protocol::BUFFER_MAX as usize;
 
 /// The tuning of the server (SDD 31, i): every buffer and bound that is not the
 /// protocol's. The defaults are this table's; the configuration's `setting` lines
@@ -81,6 +82,9 @@ pub struct Settings {
     /// How long a socket closed by its client, or left by a connection that went, may
     /// take to finish its close before it is reset.
     pub tcp_linger_ms: u64,
+    /// How long a connection a listener took a SYN for may take to finish its
+    /// handshake; past it the socket is reset and freed (work item 1.3b).
+    pub handshake_timeout_ms: u64,
     /// Frames asked of a card at once, and the most frames received and not yet
     /// taken by the stack; more are dropped and counted.
     pub card_receive_frames: usize,
@@ -128,6 +132,7 @@ impl Default for Settings {
             tcp_nagle: true,
             tcp_congestion: Congestion::Reno,
             tcp_linger_ms: 30_000,
+            handshake_timeout_ms: 10_000,
             card_receive_frames: 256,
             card_queue_frames: 2048,
             card_sends_in_flight: 4,
@@ -162,15 +167,6 @@ pub struct Config {
     pub dns: Vec<Addr>,
     /// Each listener slot's policy.
     pub grants: Vec<(String, Policy)>,
-    /// The buffers of the slots whose grants set them (`rx=`, `tx=`).
-    pub buffers: BTreeMap<String, Buffers>,
-}
-
-impl Config {
-    /// The buffers slot `slot`'s grant gives its TCP sockets.
-    pub fn buffers(&self, slot: &str) -> Buffers {
-        self.buffers.get(slot).copied().unwrap_or_default()
-    }
 }
 
 /// A configuration refused: the line (1-based) and why.
@@ -335,6 +331,7 @@ impl Settings {
                 }
             }
             "tcp-linger-ms" => self.tcp_linger_ms = positive_ms(value)?,
+            "handshake-timeout-ms" => self.handshake_timeout_ms = positive_ms(value)?,
             "card-receive-frames" => self.card_receive_frames = count(value, 1024)?,
             "card-queue-frames" => self.card_queue_frames = count(value, 65536)?,
             "card-sends-in-flight" => self.card_sends_in_flight = count(value, 32)?,
@@ -502,7 +499,9 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
                     ..Policy::default()
                 };
                 let mut had_rights = false;
-                let mut buffers = Buffers::default();
+                let number = |value: &str, range: core::ops::RangeInclusive<u32>| {
+                    value.parse().ok().filter(|v| range.contains(v))
+                };
                 for w in words {
                     let (key, value) = w.split_once('=').unwrap_or((w, ""));
                     let parsed = match key {
@@ -518,24 +517,19 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
                             .ok()
                             .filter(|s| (1..=65536).contains(s))
                             .map(|s| p.sockets = s),
-                        "rx" | "tx" => value
-                            .parse::<usize>()
-                            .ok()
-                            .filter(|b| (BUFFER_MIN..=BUFFER_MAX).contains(b))
-                            .map(|b| {
-                                *if key == "rx" {
-                                    &mut buffers.rx
-                                } else {
-                                    &mut buffers.tx
-                                } = Some(b)
-                            }),
+                        "rx" => number(value, BUFFER_MIN as u32..=BUFFER_MAX as u32)
+                            .map(|b| p.rx = Some(b)),
+                        "tx" => number(value, BUFFER_MIN as u32..=BUFFER_MAX as u32)
+                            .map(|b| p.tx = Some(b)),
+                        "per-peer" => number(value, 1..=PER_PEER_MAX).map(|v| p.per_peer = Some(v)),
+                        "linger" => number(value, 1..=LINGER_MAX_MS).map(|v| p.linger_ms = Some(v)),
                         _ => None,
                     };
                     if parsed.is_none() {
                         return err(
                             n,
                             format!(
-                                "`{w}` is not a grant's rights, rules, names, socket bound or buffers ({BUFFER_MIN} to {BUFFER_MAX} bytes)"
+                                "`{w}` is not a grant's rights, rules, names, socket bound, buffers ({BUFFER_MIN} to {BUFFER_MAX} bytes), per-peer bound (1 to {PER_PEER_MAX}) or linger (1 to {LINGER_MAX_MS} ms)"
                             ),
                         );
                     }
@@ -543,22 +537,11 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
                 if !had_rights {
                     return err(n, "a grant says its rights (`rights=`)");
                 }
-                if buffers != Buffers::default() && p.has(rights::GRANT) {
-                    // moruna.net's policy carries no buffers, so a listener this grant
-                    // minted would not keep them.
-                    return err(
-                        n,
-                        "a grant that sets rx= or tx= cannot have the grant right: a listener it grants would not keep them",
-                    );
-                }
                 if p.validate().is_err() {
                     return err(
                         n,
                         "the grant's policy is malformed (too many rules, or a name that is not one)",
                     );
-                }
-                if buffers != Buffers::default() {
-                    c.buffers.insert(slot.to_string(), buffers);
                 }
                 c.grants.push((slot.to_string(), p));
             }
@@ -631,49 +614,38 @@ grant listen-any rights=connect,listen,udp,ping,resolve,grant remote=any local=a
     }
 
     #[test]
-    fn a_grant_sets_its_buffers_and_others_keep_the_settings() {
+    fn a_grant_sets_its_bounds_and_others_keep_the_settings() {
         let c = parse(
             "moruna-netstack 1
-grant listen-api rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536
-grant listen-rx rights=listen rx=1024
-grant listen-tx rights=connect,grant tx=16777216 rx=16777216 tx=4096
-grant listen-plain rights=connect,grant
-",
-        );
-        assert!(c.is_err(), "a buffered grant with the grant right");
-        let c = parse(
-            "moruna-netstack 1
-grant listen-api rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536
-grant listen-rx rights=listen rx=1024
-grant listen-tx rights=connect tx=16777216 rx=16777216 tx=4096
+setting handshake-timeout-ms 500
+grant listen-api rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000
+grant listen-rx rights=listen,grant rx=1024 per-peer=65536 linger=3600000
+grant listen-tx rights=connect tx=16777216 rx=16777216 tx=4096 per-peer=1 linger=1
 grant listen-plain rights=connect,grant
 ",
         )
         .expect("parses");
-        assert_eq!(c.grants[0].1.sockets, 81);
-        let both = Buffers {
-            rx: Some(65536),
-            tx: Some(65536),
+        assert_eq!(c.settings.handshake_timeout_ms, 500);
+        assert_eq!(Settings::default().handshake_timeout_ms, 10_000);
+        let bounds = |k: usize| {
+            let p = &c.grants[k].1;
+            (p.sockets, p.rx, p.tx, p.per_peer, p.linger_ms)
         };
-        assert_eq!(c.buffers("listen-api"), both);
         assert_eq!(
-            c.buffers("listen-rx"),
-            Buffers {
-                rx: Some(1024),
-                tx: None
-            }
+            bounds(0),
+            (81, Some(65536), Some(65536), Some(8), Some(5000))
+        );
+        assert_eq!(
+            bounds(1),
+            (64, Some(1024), None, Some(65536), Some(3_600_000))
         );
         // The last of a key said twice holds.
         assert_eq!(
-            c.buffers("listen-tx"),
-            Buffers {
-                rx: Some(16 << 20),
-                tx: Some(4096)
-            }
+            bounds(2),
+            (64, Some(16 << 20), Some(4096), Some(1), Some(1))
         );
-        assert_eq!(c.buffers("listen-plain"), Buffers::default());
-        assert_eq!(c.buffers("listen-none"), Buffers::default());
-        assert_eq!(c.buffers.len(), 3);
+        assert_eq!(bounds(3), (64, None, None, None, None));
+        assert_eq!(c.grants[3].1.per_peer(), 8);
     }
 
     #[test]
@@ -816,9 +788,29 @@ grant listen-plain rights=connect,grant
                 "buffers",
             ),
             (
-                "moruna-netstack 1\ngrant listen rights=listen,grant tx=65536\n",
+                "moruna-netstack 1\ngrant listen rights=listen per-peer=0\n",
                 2,
-                "cannot have the grant right",
+                "per-peer bound (1 to 65536)",
+            ),
+            (
+                "moruna-netstack 1\ngrant listen rights=listen per-peer=65537\n",
+                2,
+                "per-peer",
+            ),
+            (
+                "moruna-netstack 1\ngrant listen rights=listen linger=0\n",
+                2,
+                "linger (1 to 3600000 ms)",
+            ),
+            (
+                "moruna-netstack 1\ngrant listen rights=listen linger=3600001\n",
+                2,
+                "linger",
+            ),
+            (
+                "moruna-netstack 1\nsetting handshake-timeout-ms 0\n",
+                2,
+                "1 to 3600000",
             ),
             ("moruna-netstack 1\nroute 10.0.0.0/8\n", 2, "not setting"),
             ("moruna-netstack 1\n", 0, "no grant"),

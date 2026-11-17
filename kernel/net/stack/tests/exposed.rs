@@ -476,9 +476,11 @@ fn a_peer_that_sends_past_its_window_is_acknowledged_for_the_window_only() {
 }
 
 /// `api`'s grant in the cloud profile (work item 1.3b): 80 connections and the listener,
-/// each socket with 64 KiB to receive and 64 KiB to send.
-const API_GRANT: &str =
-    "grant listen-api rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536";
+/// each socket with 64 KiB to receive and 64 KiB to send, 8 a peer, 5 s to close.
+const API_GRANT: &str = "grant listen-api rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000";
+/// The same with a linger of a tenth of a second, for a test that needs many abandoned
+/// connections to pass in seconds.
+const API_GRANT_FAST: &str = "grant listen-api rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=100";
 const API_SOCKETS: usize = 81;
 const API_BUFFERS: usize = 65536 + 65536;
 
@@ -505,8 +507,9 @@ struct Crowd {
 /// even to the FIN `api`'s close sends. The node never holds more than the grant's 81
 /// sockets, nor more than 81 times 128 KiB of their buffers; a SYN that finds the grant
 /// full is answered with a reset; and a well-behaved connection afterwards is served.
-/// The linger is a tenth of a second here (30 s by default), so that the 10,000 pass
-/// in seconds: an abandoned connection is reset, and freed, once it has passed.
+/// The grant's linger is a tenth of a second here (5 s in the profile), so that the
+/// 10,000 pass in seconds: an abandoned connection is reset, and freed, once it has
+/// passed. Each peer has an address of its own, so none meets its bound of 8.
 #[test]
 fn ten_thousand_abandoned_connections_never_exceed_the_grant_and_the_next_is_served() {
     const TARGET: u32 = 10_000;
@@ -615,7 +618,7 @@ fn ten_thousand_abandoned_connections_never_exceed_the_grant_and_the_next_is_ser
     };
     let stop = Arc::new(AtomicBool::new(false));
     let (mut slots, server) = serve_until(
-        &node(API_GRANT, "setting tcp-linger-ms 100\n"),
+        &node(API_GRANT_FAST, ""),
         &[MAC_A],
         wire,
         None,
@@ -677,5 +680,318 @@ fn ten_thousand_abandoned_connections_never_exceed_the_grant_and_the_next_is_ser
     assert!(
         served,
         "the well-behaved connection afterwards was not served"
+    );
+}
+
+/// `api` in step 1 on `listener`'s grant: a listener on 443, and a thread that accepts
+/// each connection and closes it at once; the remote end of each it accepted.
+fn api_closing_each(listener: &Channel) -> (thread::JoinHandle<()>, Arc<Mutex<Vec<Endpoint>>>) {
+    let mut api = client(listener);
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    let (l, _) = api
+        .listen(Endpoint::new(Addr::v4(10, 0, 2, 15), PORT), 64)
+        .expect("the listener on 443");
+    let seen = accepted.clone();
+    let join = thread::spawn(move || {
+        while let Ok(c) = api.accept(l) {
+            seen.lock().unwrap().push(c.remote);
+            let _ = api.close(c.socket);
+        }
+    });
+    (join, accepted)
+}
+
+fn endpoint_of(peer: (Ipv4Address, u16)) -> Endpoint {
+    let o = peer.0.octets();
+    Endpoint::new(Addr::v4(o[0], o[1], o[2], o[3]), peer.1)
+}
+
+/// What one peer of many connections saw.
+#[derive(Default)]
+struct OnePeer {
+    /// Its first twelve SYNs: answered with a SYN|ACK, or reset.
+    opened: u32,
+    reset: u32,
+    /// SYNs sent again afterwards, one at a time, and how many were reset.
+    again: u32,
+    again_reset: u32,
+    /// How long after the first twelve were answered one was opened again.
+    freed_after: Option<Duration>,
+    /// The most sockets the node held after any poll, and its lines about bounds.
+    most_sockets: usize,
+    lines: Vec<String>,
+}
+
+/// The cloud profile's `listen-api` grant, as written: one peer opens twelve connections
+/// at once and abandons them. It gets eight, its bound, and four resets; the node says
+/// once that the grant is at its bound, however often the peer meets it in the minute;
+/// and `api`'s closes of the eight, never answered, are freed by the grant's linger of
+/// 5 s (TIME-WAIT is never reached), after which the peer is served again.
+#[test]
+fn one_peer_holds_at_most_its_eight_and_its_abandoned_closes_go_within_the_linger() {
+    const FROM: Ipv4Address = Ipv4Address::new(198, 51, 100, 7);
+    let attacking = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(Mutex::new(OnePeer::default()));
+    let wire: Wire = {
+        let (attacking, seen) = (attacking.clone(), seen.clone());
+        let mut internet = Internet::new();
+        let mut first: Option<(Vec<u16>, Option<Instant>)> = None;
+        let mut next_port = 31000u16;
+        let mut retry: Option<u16> = None;
+        let mut last_retry: Option<Instant> = None;
+        Box::new(move |st: &mut Stack, _: &mut Rng| {
+            let segments = internet.take(st);
+            let mut seen = seen.lock().unwrap();
+            seen.most_sockets = seen.most_sockets.max(st.sockets());
+            seen.lines.extend(std::mem::take(&mut st.bounds));
+            if !attacking.load(Ordering::SeqCst) {
+                return;
+            }
+            let (waiting, answered) = first.get_or_insert_with(|| {
+                let ports: Vec<u16> = (30000..30012).collect();
+                for &port in &ports {
+                    st.card_mut(0).port.deliver(to_node(
+                        (FROM, port),
+                        TcpControl::Syn,
+                        0,
+                        None,
+                        &[],
+                    ));
+                }
+                (ports, None)
+            });
+            for s in segments.iter().filter(|s| s.to.0 == FROM) {
+                let ours = waiting.iter().position(|p| *p == s.to.1);
+                let again = retry == Some(s.to.1);
+                match s.control {
+                    TcpControl::Syn if ours.is_some() || again => {
+                        // The handshake's end, and then nothing.
+                        st.card_mut(0).port.deliver(to_node(
+                            s.to,
+                            TcpControl::None,
+                            1,
+                            Some(s.seq.wrapping_add(1)),
+                            &[],
+                        ));
+                        if let Some(k) = ours {
+                            waiting.swap_remove(k);
+                            seen.opened += 1;
+                        } else if let Some(at) = answered {
+                            seen.freed_after.get_or_insert(at.elapsed());
+                            retry = None;
+                        }
+                    }
+                    TcpControl::Rst if ours.is_some() => {
+                        waiting.swap_remove(ours.unwrap());
+                        seen.reset += 1;
+                    }
+                    TcpControl::Rst if again => {
+                        seen.again_reset += 1;
+                        retry = None;
+                    }
+                    _ => {}
+                }
+            }
+            if waiting.is_empty() && answered.is_none() {
+                *answered = Some(Instant::now());
+            }
+            // Once the twelve are answered, one SYN at a time, every 250 ms, until one is
+            // taken again.
+            if let Some(at) = *answered
+                && seen.freed_after.is_none()
+                && last_retry.is_none_or(|sent| sent.elapsed() >= Duration::from_millis(250))
+                && at.elapsed() >= Duration::from_millis(250)
+            {
+                next_port += 1;
+                retry = Some(next_port);
+                last_retry = Some(Instant::now());
+                seen.again += 1;
+                st.card_mut(0).port.deliver(to_node(
+                    (FROM, next_port),
+                    TcpControl::Syn,
+                    0,
+                    None,
+                    &[],
+                ));
+            }
+        })
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let (mut slots, server) = serve_until(&node(API_GRANT, ""), &[MAC_A], wire, None, stop.clone());
+    let listener = slots.remove("listen-api").expect("slot");
+    let (api, accepted) = api_closing_each(&listener);
+    attacking.store(true, Ordering::SeqCst);
+    let done = until(Duration::from_secs(30), || {
+        seen.lock().unwrap().freed_after.is_some()
+    });
+    stop.store(true, Ordering::SeqCst);
+    server.join().expect("the server did not panic");
+    api.join().expect("the api thread");
+    let seen = seen.lock().unwrap();
+    eprintln!(
+        "one peer: {} opened, {} reset; {} more SYNs, {} reset; freed after {:?}; at most {} sockets; lines {:?}",
+        seen.opened,
+        seen.reset,
+        seen.again,
+        seen.again_reset,
+        seen.freed_after,
+        seen.most_sockets,
+        seen.lines
+    );
+    assert_eq!((seen.opened, seen.reset), (8, 4), "the peer's bound is 8");
+    // The listener's listening socket, the peer's eight, and the four reset, each held
+    // until its reset has gone.
+    assert!(seen.most_sockets <= 13, "{} sockets", seen.most_sockets);
+    assert!(done, "the peer was not served again in 30 s");
+    let freed = seen.freed_after.unwrap();
+    assert!(
+        freed >= Duration::from_millis(4500) && freed <= Duration::from_secs(15),
+        "the abandoned closes were freed after {freed:?}, not by the linger of 5 s"
+    );
+    assert!(seen.again_reset > 0, "no SYN met the bound while it held");
+    assert_eq!(
+        seen.lines.len(),
+        1,
+        "one line in the minute: {:?}",
+        seen.lines
+    );
+    assert!(
+        seen.lines[0].starts_with("netstack: grant listen-api at its bound (")
+            && seen.lines[0].ends_with(" sockets, 1 peers)"),
+        "{}",
+        seen.lines[0]
+    );
+    assert_eq!(
+        accepted.lock().unwrap().len(),
+        9,
+        "the eight, and the one after"
+    );
+    assert!(
+        accepted
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|e| e.addr == endpoint_of((FROM, 0)).addr)
+    );
+}
+
+/// What SYN-only peers, and a well-behaved one after them, saw.
+#[derive(Default)]
+struct HalfOpen {
+    /// SYN|ACKs, and resets (at once, or at the deadline), the 80 SYN-only peers got.
+    syn_acked: u32,
+    reset: u32,
+    /// The well-behaved peer: reset while the grant was full, then served.
+    valid_reset: u32,
+    valid_served: Option<Duration>,
+}
+
+/// SYNs never followed by an ACK hold a socket each until the handshake's deadline
+/// (`handshake-timeout-ms`, 500 ms here, 10 s by default): of 80 of them, 64 fill
+/// `api`'s backlog and the rest are reset at once, a well-behaved connection is reset
+/// meanwhile, and once the deadline passes each of the 64 is reset and freed, and the
+/// well-behaved one is served.
+#[test]
+fn handshakes_not_done_in_time_are_reset_and_their_sockets_freed() {
+    const VALID: (Ipv4Address, u16) = (Ipv4Address::new(192, 0, 2, 20), 50001);
+    let attacking = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(Mutex::new(HalfOpen::default()));
+    let wire: Wire = {
+        let (attacking, seen) = (attacking.clone(), seen.clone());
+        let mut internet = Internet::new();
+        let mut started: Option<Instant> = None;
+        let mut valid_syn: Option<Instant> = None;
+        let mut valid_open = false;
+        // A reset SYN is sent again 100 ms after the last.
+        Box::new(move |st: &mut Stack, _: &mut Rng| {
+            let segments = internet.take(st);
+            if !attacking.load(Ordering::SeqCst) {
+                return;
+            }
+            let began = *started.get_or_insert_with(|| {
+                for n in 0..80u32 {
+                    let from = (Ipv4Address::from(0xc612_8000u32 + n), 41000);
+                    st.card_mut(0)
+                        .port
+                        .deliver(to_node(from, TcpControl::Syn, 0, None, &[]));
+                }
+                Instant::now()
+            });
+            let mut seen = seen.lock().unwrap();
+            for s in &segments {
+                if s.to == VALID {
+                    match s.control {
+                        TcpControl::Syn if !valid_open => {
+                            valid_open = true;
+                            seen.valid_served = Some(began.elapsed());
+                            st.card_mut(0).port.deliver(to_node(
+                                VALID,
+                                TcpControl::None,
+                                1,
+                                Some(s.seq.wrapping_add(1)),
+                                &[],
+                            ));
+                        }
+                        TcpControl::Rst if !valid_open => seen.valid_reset += 1,
+                        _ => {}
+                    }
+                    continue;
+                }
+                match s.control {
+                    TcpControl::Syn => seen.syn_acked += 1,
+                    TcpControl::Rst => seen.reset += 1,
+                    _ => {}
+                }
+            }
+            // The well-behaved peer, once the 80 are answered, every 100 ms.
+            if seen.syn_acked + seen.reset >= 80
+                && !valid_open
+                && valid_syn.is_none_or(|at| at.elapsed() >= Duration::from_millis(100))
+            {
+                valid_syn = Some(Instant::now());
+                st.card_mut(0)
+                    .port
+                    .deliver(to_node(VALID, TcpControl::Syn, 0, None, &[]));
+            }
+        })
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let (mut slots, server) = serve_until(
+        &node(API_GRANT, "setting handshake-timeout-ms 500\n"),
+        &[MAC_A],
+        wire,
+        None,
+        stop.clone(),
+    );
+    let listener = slots.remove("listen-api").expect("slot");
+    let (api, accepted) = api_closing_each(&listener);
+    attacking.store(true, Ordering::SeqCst);
+    let served = until(Duration::from_secs(20), || {
+        accepted.lock().unwrap().contains(&endpoint_of(VALID))
+    });
+    stop.store(true, Ordering::SeqCst);
+    server.join().expect("the server did not panic");
+    api.join().expect("the api thread");
+    let seen = seen.lock().unwrap();
+    eprintln!(
+        "half-open: {} SYN|ACKs, {} resets; the valid peer reset {} times, served after {:?}",
+        seen.syn_acked, seen.reset, seen.valid_reset, seen.valid_served
+    );
+    assert_eq!(seen.syn_acked, 64, "api's backlog of half-open sockets");
+    assert_eq!(seen.reset, 80, "16 reset at once, and 64 at their deadline");
+    assert!(
+        seen.valid_reset > 0,
+        "the backlog was not full of half-open sockets"
+    );
+    assert!(served, "the well-behaved peer was not served");
+    assert!(
+        seen.valid_served.unwrap() >= Duration::from_millis(500),
+        "served at {:?}, before the handshakes' deadline",
+        seen.valid_served
+    );
+    assert_eq!(
+        accepted.lock().unwrap().len(),
+        1,
+        "only the well-behaved one"
     );
 }

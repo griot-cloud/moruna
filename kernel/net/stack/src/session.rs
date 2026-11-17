@@ -10,7 +10,7 @@ use moruna_svc::{
 };
 use netstack_protocol::{Addr, Endpoint, Policy, Target, net};
 
-use crate::{Buffers, Grant, Stack};
+use crate::{Grant, Stack};
 
 /// The stack, shared by every connection's handler and the server's loop, and the
 /// connections that closed while the stack was in use.
@@ -50,16 +50,15 @@ pub fn after_turn(shared: &Rc<Shared>, d: &mut Dispatcher, now: u64) {
             core::mem::take(&mut st.grants),
         )
     };
-    for (pending, policy) in grants {
+    for (pending, policy, name) in grants {
         let outcome = match Channel::create() {
-            // A listener minted by `grant` has the server's buffers: moruna.net's
-            // policy carries none (the configuration refuses buffers on a grant that
-            // may mint).
-            Ok((ours, theirs)) => match d.listen(ours, factory(shared.clone(), policy)) {
-                Ok(()) => Outcome::reply(theirs),
-                // As many handles as one wait takes: no room for another listener.
-                Err(_) => Outcome::Failure(net::Error::TooMany.code()),
-            },
+            Ok((ours, theirs)) => {
+                match d.listen(ours, granted(shared.clone(), Grant::new(name, policy))) {
+                    Ok(()) => Outcome::reply(theirs),
+                    // As many handles as one wait takes: no room for another listener.
+                    Err(_) => Outcome::Failure(net::Error::TooMany.code()),
+                }
+            }
             Err(_) => Outcome::Failure(net::Error::TooMany.code()),
         };
         // An answer whose connection has gone is dropped with it.
@@ -78,9 +77,9 @@ pub struct Session {
 }
 
 /// A listener's factory: every connection through it holds `policy`, under one grant
-/// with the server's buffers.
+/// of no slot's name.
 pub fn factory(shared: Rc<Shared>, policy: Policy) -> Factory {
-    granted(shared, Grant::new(policy, Buffers::default()))
+    granted(shared, Grant::new("(unnamed)", policy))
 }
 
 /// A listener's factory for `grant`: every connection through it holds its policy, and

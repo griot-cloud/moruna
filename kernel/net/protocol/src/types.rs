@@ -245,13 +245,31 @@ impl Wire for NameRule {
 /// What a connection may do (SDD 31, f.6): its rights, where it may reach (`remote`),
 /// which names it may resolve and reach by name (`names`), which local endpoints it
 /// may listen and bind on and send from (`local`), and how many sockets it may hold.
+///
+/// Since 3.1 (work item 1.3b) it also bounds its sockets' memory and how long they
+/// hold it: each socket's buffers, the sockets one peer may hold through its
+/// listeners, and how long a closed socket may take to finish its close. `None` is
+/// the server's setting (for `per_peer`, [`crate::PER_PEER_DEFAULT`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Policy {
     pub rights: u32,
     pub remote: Vec<Rule>,
     pub local: Vec<Rule>,
     pub names: Vec<NameRule>,
+    /// Sockets held under the grant at once, every connection through its listener
+    /// counted together, closing sockets until they are freed.
     pub sockets: u32,
+    /// Bytes of each socket's receive buffer: a TCP socket's, a UDP socket's payload
+    /// buffer (`rx=`).
+    pub rx: Option<u32>,
+    /// Bytes of each socket's send buffer, likewise (`tx=`).
+    pub tx: Option<u32>,
+    /// The most sockets one remote address may hold through the grant's listeners,
+    /// closing ones included (`per-peer=`).
+    pub per_peer: Option<u32>,
+    /// Milliseconds a socket closed by its client, or left by a connection that went,
+    /// may take to finish its close before it is reset (`linger=`).
+    pub linger_ms: Option<u32>,
 }
 
 impl Wire for Policy {
@@ -260,7 +278,11 @@ impl Wire for Policy {
         self.remote.encode(e)?;
         self.local.encode(e)?;
         self.names.encode(e)?;
-        self.sockets.encode(e)
+        self.sockets.encode(e)?;
+        self.rx.encode(e)?;
+        self.tx.encode(e)?;
+        self.per_peer.encode(e)?;
+        self.linger_ms.encode(e)
     }
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
         Ok(Policy {
@@ -269,6 +291,10 @@ impl Wire for Policy {
             local: Vec::decode(d)?,
             names: Vec::decode(d)?,
             sockets: u32::decode(d)?,
+            rx: Option::decode(d)?,
+            tx: Option::decode(d)?,
+            per_peer: Option::decode(d)?,
+            linger_ms: Option::decode(d)?,
         })
     }
 }
