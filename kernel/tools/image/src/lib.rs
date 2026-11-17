@@ -21,7 +21,7 @@
 //! ```
 //!
 //! `SOURCE` is `console`, `root.process`, `root.device`, `root.interrupt`, `root.ecam`,
-//! `root.msi`, `root.dma`, `program:PROGRAM`, a read-only memory object holding that
+//! `root.msi`, `root.dma`, `root.clock`, `program:PROGRAM`, a read-only memory object holding that
 //! program's image, for a process that starts others, or `data:PATH`, a read-only
 //! memory object holding the file PATH of the build's data directory (the files a
 //! build makes for its boot, such as the image filesystem's layer list, SDD 27), at
@@ -92,6 +92,7 @@ pub enum DescSource {
     RootEcam,
     RootMsi,
     RootDma,
+    RootClock,
     Program(String),
     /// A file of the build's data directory, by its relative path.
     Data(String),
@@ -383,6 +384,7 @@ impl Description {
                         "root.ecam" => DescSource::RootEcam,
                         "root.msi" => DescSource::RootMsi,
                         "root.dma" => DescSource::RootDma,
+                        "root.clock" => DescSource::RootClock,
                         other => {
                             match (other.strip_prefix("program:"), other.strip_prefix("data:")) {
                                 (Some(p), _) => DescSource::Program(name(p, line, "program")?),
@@ -577,6 +579,7 @@ impl Description {
                         DescSource::RootEcam => Source::RootEcam,
                         DescSource::RootMsi => Source::RootMsi,
                         DescSource::RootDma => Source::RootDma,
+                        DescSource::RootClock => Source::RootClock,
                         DescSource::Program(program) => Source::File {
                             path: format!("{BIN}/{program}"),
                         },

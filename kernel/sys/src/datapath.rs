@@ -40,6 +40,12 @@ pub struct ClockReading {
     pub multiplier: u64,
     /// See `multiplier`.
     pub shift: u32,
+    /// The wall clock at the monotonic zero, in nanoseconds since 1970 (UTC); zero while it is
+    /// unset (ABI 2.8, `clock_page::REALTIME_BASE`).
+    pub realtime_base: u64,
+    /// Where the base came from: one of `clock_page::realtime`, `UNSET` until the wall clock is
+    /// set (ABI 2.8, `clock_page::REALTIME_SOURCE`).
+    pub realtime_source: u64,
 }
 
 impl ClockReading {
@@ -61,7 +67,22 @@ impl ClockReading {
             base_tsc: word(page::BASE_TSC),
             multiplier: word(page::MULTIPLIER),
             shift: u32::from_le_bytes(s),
+            realtime_base: word(page::REALTIME_BASE),
+            realtime_source: word(page::REALTIME_SOURCE),
         })
+    }
+
+    /// Whether the wall clock has been set: from the machine's clock at boot, or by
+    /// `clock_set_realtime`.
+    pub fn realtime_is_set(&self) -> bool {
+        self.realtime_source != page::realtime::UNSET
+    }
+
+    /// The wall clock, in nanoseconds since 1970 (UTC), at counter value `tsc`; `None` while it
+    /// is unset, for a reader that must not use an unset clock (a TLS certificate check).
+    pub fn realtime_at(&self, tsc: u64) -> Option<u64> {
+        self.realtime_is_set()
+            .then(|| self.realtime_base.saturating_add(self.nanos_at(tsc)))
     }
 
     /// Nanoseconds at counter value `tsc`.
@@ -128,6 +149,22 @@ impl ClockPage {
     pub fn now(&self) -> u64 {
         self.reading().nanos_at(tsc())
     }
+
+    /// The wall clock now, in nanoseconds since 1970 (UTC), read with no call; `None` while it
+    /// is unset (ABI 2.8).
+    #[cfg(target_arch = "x86_64")]
+    pub fn realtime(&self) -> Option<u64> {
+        self.reading().realtime_at(tsc())
+    }
+
+    /// The realtime base (zero while the wall clock is unset) and the monotonic nanoseconds now,
+    /// from one reading: for std's `SystemTime`, which reads 1970 plus the monotonic clock
+    /// while the wall clock is unset rather than fail.
+    #[cfg(target_arch = "x86_64")]
+    pub fn realtime_parts(&self) -> (u64, u64) {
+        let reading = self.reading();
+        (reading.realtime_base, reading.nanos_at(tsc()))
+    }
 }
 
 /// Reads the clock page at `base`, retrying while the kernel writes it: the sequence,
@@ -149,6 +186,8 @@ unsafe fn read_page(base: *const u8) -> ClockReading {
             base_tsc: word(page::BASE_TSC).load(Ordering::Relaxed),
             multiplier: word(page::MULTIPLIER).load(Ordering::Relaxed),
             shift: shift.load(Ordering::Relaxed),
+            realtime_base: word(page::REALTIME_BASE).load(Ordering::Relaxed),
+            realtime_source: word(page::REALTIME_SOURCE).load(Ordering::Relaxed),
         };
         fence(Ordering::Acquire);
         let after = word(page::SEQUENCE).load(Ordering::Relaxed);
@@ -195,8 +234,20 @@ mod tests {
         bytes[page::BASE_TSC..page::BASE_TSC + 8].copy_from_slice(&500u64.to_le_bytes());
         bytes[page::MULTIPLIER..page::MULTIPLIER + 8].copy_from_slice(&3u64.to_le_bytes());
         bytes[page::SHIFT..page::SHIFT + 4].copy_from_slice(&1u32.to_le_bytes());
+        bytes[page::REALTIME_BASE..page::REALTIME_BASE + 8].copy_from_slice(&9u64.to_le_bytes());
         let r = ClockReading::from_bytes(2, &bytes, 2).expect("steady");
         assert_eq!(r.nanos_at(600), 1_000 + ((100 * 3) >> 1));
+        assert_eq!(r.realtime_base, 9);
+        assert!(
+            !r.realtime_is_set(),
+            "a base with no source is not a wall clock"
+        );
+        assert_eq!(r.realtime_at(600), None);
+        bytes[page::REALTIME_SOURCE..page::REALTIME_SOURCE + 8]
+            .copy_from_slice(&page::realtime::SET.to_le_bytes());
+        let r = ClockReading::from_bytes(4, &bytes, 4).expect("steady");
+        assert!(r.realtime_is_set());
+        assert_eq!(r.realtime_at(600), Some(9 + 1_000 + ((100 * 3) >> 1)));
         assert_eq!(
             ClockReading::from_bytes(3, &bytes, 3),
             None,
@@ -213,6 +264,8 @@ mod tests {
         words[page::BASE_TSC / 8] = 1_000;
         words[page::MULTIPLIER / 8] = 3 << 40;
         words[page::SHIFT / 8] = 40;
+        words[page::REALTIME_BASE / 8] = 1_700_000_000_000_000_000;
+        words[page::REALTIME_SOURCE / 8] = page::realtime::MACHINE;
         words
     }
 
@@ -228,10 +281,14 @@ mod tests {
                 base_tsc: 1_000,
                 multiplier: 3 << 40,
                 shift: 40,
+                realtime_base: 1_700_000_000_000_000_000,
+                realtime_source: page::realtime::MACHINE,
             }
         );
         // Three nanoseconds a tick, from 7 ns at tick 1000.
         assert_eq!(r.nanos_at(1_010), 37);
+        // Set from the machine's clock: the wall clock is the base plus the monotonic time.
+        assert_eq!(r.realtime_at(1_010), Some(1_700_000_000_000_000_037));
         // A counter read before the base (another CPU's, a little behind) wraps as the
         // kernel's own clock does, rather than panicking.
         let _ = r.nanos_at(999);
@@ -247,6 +304,54 @@ mod tests {
         // SAFETY: as above.
         let in_place = unsafe { read_page(words.as_ptr() as *const u8) };
         assert_eq!(ClockReading::from_bytes(4, &bytes, 4), Some(in_place));
+    }
+
+    #[test]
+    fn a_reader_sees_each_change_of_the_wall_clock_whole_while_it_is_set_again_and_again() {
+        extern crate std;
+        use std::sync::Arc;
+
+        // The page as the kernel writes it at each `clock_set_realtime` (`moruna_datapath::
+        // clock::realtime_writes`): the sequence odd, the base, the source, the sequence even.
+        // Each base says which source goes with it, so a reading that mixes two changes shows.
+        struct Page([AtomicU64; page::LEN / 8]);
+        let page = Arc::new(Page(core::array::from_fn(|_| AtomicU64::new(0))));
+        page.0[page::SEQUENCE / 8].store(2, Ordering::SeqCst);
+        let writer = {
+            let page = Arc::clone(&page);
+            std::thread::spawn(move || {
+                let mut sequence = 2;
+                for k in 1..=20_000u64 {
+                    let source = if k % 2 == 0 {
+                        page::realtime::SET
+                    } else {
+                        page::realtime::MACHINE
+                    };
+                    let word = |at: usize| &page.0[at / 8];
+                    word(page::SEQUENCE).store(sequence + 1, Ordering::SeqCst);
+                    word(page::REALTIME_BASE).store(k * 10 + source, Ordering::SeqCst);
+                    word(page::REALTIME_SOURCE).store(source, Ordering::SeqCst);
+                    word(page::SEQUENCE).store(sequence + 2, Ordering::SeqCst);
+                    sequence += 2;
+                }
+            })
+        };
+        let mut readings = 0;
+        while !writer.is_finished() || readings == 0 {
+            // SAFETY: a whole page of words, aligned to 8, alive for the call.
+            let r = unsafe { read_page(page.0.as_ptr() as *const u8) };
+            if r.realtime_is_set() {
+                assert_eq!(
+                    r.realtime_base % 10,
+                    r.realtime_source,
+                    "a torn reading: {r:?}"
+                );
+            } else {
+                assert_eq!(r.realtime_base, 0);
+            }
+            readings += 1;
+        }
+        writer.join().unwrap();
     }
 
     #[cfg(target_arch = "x86_64")]

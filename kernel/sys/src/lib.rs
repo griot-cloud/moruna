@@ -112,9 +112,22 @@ pub fn random(buf: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-/// Sets the calling thread's FS base (ABI 2.0); this crate keeps nothing there.
+/// Sets the calling thread's FS base (ABI 2.0); this crate keeps nothing there, but its
+/// `rt` (std's runtime) keeps each thread's table of thread-local keys there.
 pub fn set_fs(base: u64) -> Result<()> {
     check(raw::thread_set_fs(base)).map(|_| ())
+}
+
+/// Gives the calling thread's CPU to another ready thread, if there is one (ABI 2.8).
+pub fn thread_yield() {
+    raw::call0(nr::THREAD_YIELD);
+}
+
+/// The wall clock reads `utc_ns`, nanoseconds since 1970 (UTC), now (ABI 2.8). `clock` is
+/// `root.clock`, which the supervisor gives `platform` alone; the clock page carries the new
+/// realtime base. `InvalidArgs` for a time at or before the monotonic clock's start.
+pub fn clock_set_realtime(clock: &Handle, utc_ns: u64) -> Result<()> {
+    check(raw::call2(nr::CLOCK_SET_REALTIME, clock.raw() as u64, utc_ns).0).map(|_| ())
 }
 
 /// An owned handle. Dropping it closes it.
