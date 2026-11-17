@@ -293,7 +293,29 @@ pub enum CheckAnswer {
         /// The budget the job runs with, in bytes: the document's, or on a node, when it names
         /// none, the most the node allows. `None` when neither is known.
         memory_bytes: Option<u64>,
+        /// The hosts the job reaches, from its object-store settings: what a node's egress
+        /// grants it (item 3.4). Empty when the document could not be read.
+        #[serde(default)]
+        hosts: Vec<String>,
+        /// The volumes the job names (`disk://<serial>`), each with its access: what a node
+        /// grants its engine (item 3.3).
+        #[serde(default)]
+        volumes: Vec<VolumeNeed>,
+        /// The functions the job uses, by name: what a node fetches for it (item 3.6).
+        #[serde(default)]
+        functions: Vec<String>,
     },
+}
+
+/// A volume a job names, by the serial the cloud gives its disk, and whether the job writes it:
+/// `{"serial": "…", "write": bool}`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeNeed {
+    /// The serial, as `disk://<serial>/...` names it.
+    pub serial: String,
+    /// `true` for a sink's volume, which the job writes; `false` for one it only reads.
+    pub write: bool,
 }
 
 impl Inbound {

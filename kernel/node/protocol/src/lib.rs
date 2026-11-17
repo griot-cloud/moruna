@@ -24,6 +24,43 @@ pub const ENGINE_CHANNEL: &str = "engine";
 /// channel:check`).
 pub const CHECK_CHANNEL: &str = "check";
 
+/// What a job needs of the node beyond its budget, as the engine's check answers it (item 3.2):
+/// the hosts it reaches; each volume by its serial, `true` when the job writes it; and the
+/// functions it uses, by name. `node-admission` keeps them with the job, for items 3.3, 3.4
+/// and 3.6 to grant from.
+pub type Needs = (Vec<String>, Vec<(String, bool)>, Vec<String>);
+
+/// The most of each kind of need a job may name.
+pub const MAX_NEEDS: usize = 64;
+
+/// Whether `needs` are a job's: at most [`MAX_NEEDS`] of each, each named once, a host 1 to
+/// 253 bytes, a serial or a function 1 to 128, all printable ASCII without spaces, and no `/`
+/// in a serial.
+pub fn valid_needs(needs: &Needs) -> bool {
+    let (hosts, volumes, functions) = needs;
+    let named = |name: &str, most: usize| {
+        (1..=most).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_graphic())
+    };
+    let once = |names: &[&str]| {
+        names
+            .iter()
+            .enumerate()
+            .all(|(i, n)| !names[..i].contains(n))
+    };
+    let serials: Vec<&str> = volumes.iter().map(|(serial, _)| serial.as_str()).collect();
+    let hosts: Vec<&str> = hosts.iter().map(String::as_str).collect();
+    let functions: Vec<&str> = functions.iter().map(String::as_str).collect();
+    [hosts.len(), serials.len(), functions.len()]
+        .iter()
+        .all(|count| *count <= MAX_NEEDS)
+        && hosts.iter().all(|h| named(h, 253))
+        && serials.iter().all(|s| named(s, 128) && !s.contains('/'))
+        && functions.iter().all(|f| named(f, 128))
+        && once(&hosts)
+        && once(&serials)
+        && once(&functions)
+}
+
 /// The most a job's budget may be on a node of `node_memory` bytes (the machine account's
 /// limit): its memory less [`RESERVED_BYTES`], in whole pages. A job whose document names no
 /// budget has all of it: a node runs one job.
@@ -82,7 +119,10 @@ moruna_svc::protocol! {
             /// Launch one engine; names and grants correspond exactly. Config is
             /// the existing KD2 engine configuration; names cannot shadow reserved
             /// console/account/config slots. Linux/directory are explicit grants.
-            1 => fn launch(account: Handle, budget: u64, config: Handle, names: Vec<String>, grants: Vec<Handle>, services: Vec<String>) -> u64;
+            /// `needs` are the job's as its check answered them (`Needs`), kept with
+            /// the job for the grants of items 3.3, 3.4 and 3.6; `Invalid` when they
+            /// are not `valid_needs`.
+            1 => fn launch(account: Handle, budget: u64, config: Handle, names: Vec<String>, grants: Vec<Handle>, services: Vec<String>, needs: Needs) -> u64;
             /// Actual process state; termination does not claim a successful exit.
             2 => fn status(job: u64) -> u32;
             /// Kill the caller's job. A returned success means kill was accepted;
@@ -144,6 +184,42 @@ mod tests {
         assert_eq!(admits(0, node), Err(admission::Error::Invalid));
         assert_eq!(admits(4097, node), Err(admission::Error::Invalid));
         assert_eq!(admits(4096, RESERVED_BYTES), Err(admission::Error::Quota));
+    }
+
+    #[test]
+    fn a_jobs_needs_are_bounded_and_each_named_once() {
+        let s = |names: &[&str]| -> Vec<String> { names.iter().map(|n| (*n).into()).collect() };
+        let none: Needs = (Vec::new(), Vec::new(), Vec::new());
+        assert!(valid_needs(&none));
+        let every: Needs = (
+            s(&["s3.example.com", "acct.blob.core.windows.net"]),
+            alloc::vec![("vol-in".into(), false), ("vol-out".into(), true)],
+            s(&["std", "taxi.clean"]),
+        );
+        assert!(valid_needs(&every));
+        let with = |change: &dyn Fn(&mut Needs)| {
+            let mut needs = every.clone();
+            change(&mut needs);
+            valid_needs(&needs)
+        };
+        assert!(!with(&|n| n.0.push("s3.example.com".into())));
+        assert!(!with(&|n| n.1.push(("vol-in".into(), true))));
+        assert!(!with(&|n| n.2.push("std".into())));
+        assert!(!with(&|n| n.0.push(String::new())));
+        assert!(!with(&|n| n.0.push("a b".into())));
+        assert!(!with(&|n| n.0.push("h".repeat(254))));
+        assert!(with(&|n| n.0.push("h".repeat(253))));
+        assert!(!with(&|n| n.1.push(("a/b".into(), false))));
+        assert!(!with(&|n| n.2.push("f".repeat(129))));
+        let many = |count: usize| -> Needs {
+            (
+                (0..count).map(|i| alloc::format!("h{i}")).collect(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        assert!(valid_needs(&many(MAX_NEEDS)));
+        assert!(!valid_needs(&many(MAX_NEEDS + 1)));
     }
 
     #[test]

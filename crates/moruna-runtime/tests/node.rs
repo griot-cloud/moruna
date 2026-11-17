@@ -11,7 +11,7 @@ mod support;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use moruna_kernel::CancelToken;
@@ -29,13 +29,18 @@ use support::{Scratch, one_run_at_a_time, read_back_rows, write_parquet};
 /// What the job's secret is; it must appear in nothing the engine says.
 const SECRET: &str = "wJalrXUtnFEMI-K7MDENG-bPxRfiCY-NODE-SECRET";
 
-/// One end of a socket pair as a channel's: each message a `u32` length and its bytes.
+/// One end of a socket pair as a channel's: each message a `u32` length and its bytes, and an
+/// empty frame, which no message is, for the end: what a channel's peer sees when this end
+/// closes. (On macOS a socket pair's `shutdown` does not always wake the other end's blocked
+/// read, so the end is said in the stream, then the sockets are shut down.)
 struct Framed {
     reading: Mutex<UnixStream>,
     writing: Mutex<UnixStream>,
     closer: UnixStream,
     /// The largest message sent from this end.
     largest: AtomicUsize,
+    /// Whether this end was closed.
+    closed: AtomicBool,
 }
 
 impl Framed {
@@ -47,6 +52,7 @@ impl Framed {
                 writing: Mutex::new(stream.try_clone().expect("clone")),
                 closer: stream,
                 largest: AtomicUsize::new(0),
+                closed: AtomicBool::new(false),
             })
         };
         (end(a), end(b))
@@ -75,11 +81,18 @@ impl Messages for Framed {
             Err(e) => return Err(e),
         }
         let length = u32::from_le_bytes(length) as usize;
+        if length == 0 {
+            return Ok(0);
+        }
         reading.read_exact(&mut buf[..length])?;
         Ok(length)
     }
 
     fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        if let Ok(mut writing) = self.writing.lock() {
+            let _ = writing.write_all(&0u32.to_le_bytes());
+        }
         let _ = self.closer.shutdown(std::net::Shutdown::Both);
     }
 }
@@ -210,6 +223,18 @@ fn serve_bounded(scratch: &Scratch, spec: Value, budget_max: Option<u64>) -> Ser
             pulled_images: None,
         },
     );
+    // The engine has returned: its end is closed, and the peer reads to the end at once. A
+    // peer still reading after a while is a failure that says how the engine closed, not a hang.
+    let waited = std::time::Instant::now();
+    while !peer.is_finished() {
+        assert!(
+            waited.elapsed() < std::time::Duration::from_secs(30),
+            "the peer never read to the end: the engine closed its end: {}, the outcome {:?}",
+            engine.closed.load(Ordering::Relaxed),
+            (outcome.code, &outcome.diagnostic),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let bytes = peer.join().expect("the peer");
     let messages = protocol::json_messages(&bytes).expect("every message reads");
     Served {
@@ -525,7 +550,23 @@ fn a_check_on_a_channel_answers_its_refusals_and_the_budget() {
     assert_eq!(code, exit::COMPLETED);
     assert_eq!(
         answer,
-        json!({"type": "checked", "ok": true, "refusals": [], "memory_bytes": max})
+        json!({"type": "checked", "ok": true, "refusals": [], "memory_bytes": max,
+               "hosts": ["s3.example.com"], "volumes": [], "functions": ["std"]})
+    );
+    // A document's volumes and hosts, as the check answers them for node-admission to keep.
+    let mut disks = document(scratch.path());
+    disks["source"] = json!({"kind": "parquet", "url": "disk://vol-in/taxi/"});
+    disks["sink"] = json!({"kind": "parquet", "url": "disk://vol-out/rows/"});
+    disks["object_store"]["azure"] = json!({"account": "acct"});
+    let (code, answer) = check(request(disks, json!(["aws.id", "aws.key"])));
+    assert_eq!(code, exit::COMPLETED, "{answer}");
+    assert_eq!(
+        answer["hosts"],
+        json!(["acct.blob.core.windows.net", "s3.example.com"])
+    );
+    assert_eq!(
+        answer["volumes"],
+        json!([{"serial": "vol-in", "write": false}, {"serial": "vol-out", "write": true}])
     );
     // No budget: all the node allows.
     let mut none = document(scratch.path());
@@ -578,6 +619,10 @@ fn a_check_on_a_channel_answers_its_refusals_and_the_budget() {
         assert_eq!(code, exit::SPEC_REFUSED, "{line}");
         assert_eq!(answer["ok"], json!(false));
         assert_eq!(answer["memory_bytes"], Value::Null);
+        assert_eq!(
+            (&answer["hosts"], &answer["volumes"], &answer["functions"]),
+            (&json!([]), &json!([]), &json!([]))
+        );
     }
     let (code, answer) = check(request(document(scratch.path()), json!(["-bad"])));
     assert_eq!(

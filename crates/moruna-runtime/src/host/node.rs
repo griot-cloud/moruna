@@ -19,6 +19,8 @@
 use moruna_job::{Job, SpecError};
 use serde_json::Value;
 
+use super::protocol::VolumeNeed;
+
 /// What node mode needs to know: the channel the job is served on, and the most its budget may
 /// be.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +77,106 @@ fn file_urls(field: &str, value: &Value, found: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+/// What a job needs of a node, beyond its budget, which the node's check answers and
+/// `node-admission` keeps with the job (system design 3A, 3C, 3D, 3E).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeNeeds {
+    /// The hosts it reaches from its object-store settings: the S3 endpoint's host,
+    /// `<account>.blob.core.windows.net` for Azure, `storage.googleapis.com` for GCS. Each once,
+    /// sorted.
+    pub hosts: Vec<String>,
+    /// Each `disk://<serial>` it names, written by a sink and only read otherwise; a serial
+    /// both read and written is written. By serial.
+    pub volumes: Vec<VolumeNeed>,
+    /// The kinds of its function tasks, each once, in the order the document names them: a
+    /// function by its registered name (3E).
+    pub functions: Vec<String>,
+}
+
+/// The host of a URL's authority (`https://s3.example.com:9000/x` is `s3.example.com`),
+/// lowercase; `None` for a URL with no host or a host socket.
+fn url_host(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    let host = match host.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => host.split(':').next().unwrap_or_default(),
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// The serial of a `disk://<serial>/...` URL, in any case of the scheme.
+fn disk_serial(text: &str) -> Option<&str> {
+    let rest = text
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("disk://"))
+        .map(|_| &text[7..])?;
+    let serial = rest.split('/').next().unwrap_or_default();
+    (!serial.is_empty()).then_some(serial)
+}
+
+/// Every `disk://` serial in `value`.
+fn disk_serials<'a>(value: &'a Value, found: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) => found.extend(disk_serial(text)),
+        Value::Array(items) => items.iter().for_each(|item| disk_serials(item, found)),
+        Value::Object(map) => map.values().for_each(|item| disk_serials(item, found)),
+        _ => {}
+    }
+}
+
+/// What `job` needs of a node ([`NodeNeeds`]).
+pub fn needs(job: &Job) -> NodeNeeds {
+    let mut hosts = Vec::new();
+    let store = &job.object_store;
+    if let Some(host) = store
+        .s3
+        .as_ref()
+        .and_then(|s3| s3.endpoint.as_deref())
+        .and_then(url_host)
+    {
+        hosts.push(host);
+    }
+    if let Some(account) = store.azure.as_ref().and_then(|a| a.account.as_deref()) {
+        hosts.push(format!(
+            "{}.blob.core.windows.net",
+            account.to_ascii_lowercase()
+        ));
+    }
+    if store.gcs.is_some() {
+        hosts.push("storage.googleapis.com".to_string());
+    }
+    hosts.sort();
+    hosts.dedup();
+    let mut volumes: std::collections::BTreeMap<String, bool> = Default::default();
+    let mut functions: Vec<String> = Vec::new();
+    for task in &job.tasks {
+        let write = task.role == moruna_job::Role::Sink;
+        let mut found = Vec::new();
+        for value in task.settings.values() {
+            disk_serials(value, &mut found);
+        }
+        for serial in found {
+            *volumes.entry(serial.to_string()).or_insert(write) |= write;
+        }
+        if task.role == moruna_job::Role::Kernel && !functions.contains(&task.kind) {
+            functions.push(task.kind.clone());
+        }
+    }
+    NodeNeeds {
+        hosts,
+        volumes: volumes
+            .into_iter()
+            .map(|(serial, write)| VolumeNeed { serial, write })
+            .collect(),
+        functions,
     }
 }
 

@@ -1136,6 +1136,9 @@ pub fn check_conn(conn: Conn, kinds: &Registry, node: Option<&Node>) -> i32 {
                 ok: false,
                 refusals,
                 memory_bytes: None,
+                hosts: Vec::new(),
+                volumes: Vec::new(),
+                functions: Vec::new(),
             },
         ),
         Ok((job, secrets)) => {
@@ -1144,6 +1147,7 @@ pub fn check_conn(conn: Conn, kinds: &Registry, node: Option<&Node>) -> i32 {
                 Some(node) => super::node::budget(&job, node),
                 None => job.budget.memory_bytes,
             };
+            let needs = super::node::needs(&job);
             match check_refusals(&job, kinds, &names, node) {
                 Ok(refusals) => (
                     if refusals.is_empty() {
@@ -1155,6 +1159,9 @@ pub fn check_conn(conn: Conn, kinds: &Registry, node: Option<&Node>) -> i32 {
                         ok: refusals.is_empty(),
                         refusals,
                         memory_bytes,
+                        hosts: needs.hosts,
+                        volumes: needs.volumes,
+                        functions: needs.functions,
                     },
                 ),
                 Err(reason) => {

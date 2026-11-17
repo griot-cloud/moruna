@@ -11,13 +11,16 @@ use moruna_svc::{
     ProtocolId, Signals, Status, Watch, Wire,
 };
 use moruna_sys::{Account, Console, ObjectType, Process, Rights, println, start};
-use node_protocol::{CANCELLED, CHECK_BYTES, MAX_JOBS, RUNNING, TERMINATED, admission};
+use node_protocol::{CANCELLED, CHECK_BYTES, MAX_JOBS, Needs, RUNNING, TERMINATED, admission};
 moruna_sys::main!(run);
 
 struct Job {
     owner: u64,
     process: Process,
     _account: Account,
+    /// What the job needs of the node, as its check answered them: kept for the grants of
+    /// items 3.3, 3.4 and 3.6, which this item does not make yet.
+    _needs: Needs,
     state: u32,
     cancel_requested: bool,
     waiters: Vec<Pending>,
@@ -99,6 +102,7 @@ struct Launch {
     names: Vec<String>,
     grants: Vec<Handle>,
     services: Vec<String>,
+    needs: Needs,
 }
 fn launch_job(
     shared: &Rc<RefCell<Shared>>,
@@ -112,7 +116,11 @@ fn launch_job(
         mut names,
         mut grants,
         services,
+        needs,
     } = launch;
+    if !node_protocol::valid_needs(&needs) {
+        return Err(admission::Error::Invalid);
+    }
     if services.len() > node_protocol::MAX_GRANTS {
         return Err(admission::Error::Invalid);
     }
@@ -210,6 +218,7 @@ fn launch_job(
             owner,
             process,
             _account: account,
+            _needs: needs,
             state: RUNNING,
             cancel_requested: false,
             waiters: Vec::new(),
@@ -247,8 +256,12 @@ impl Handler for Session {
             };
         }
         if ordinal == 1 {
-            let Some((account, budget, config, names, grants, services)) =
-                args::<(Handle, u64, Handle, Vec<String>, Vec<Handle>, Vec<String>)>(d)
+            // The arguments in order: the first six, then the job's needs.
+            let Some(((account, budget, config, names, grants, services), needs)) =
+                args::<(
+                    (Handle, u64, Handle, Vec<String>, Vec<Handle>, Vec<String>),
+                    Needs,
+                )>(d)
             else {
                 return Outcome::Status(Status::BadMessage);
             };
@@ -267,6 +280,7 @@ impl Handler for Session {
                     names,
                     grants,
                     services,
+                    needs,
                 },
             ) {
                 Ok(id) => Outcome::reply(id),
@@ -361,6 +375,7 @@ fn check_job(
             names,
             grants,
             services,
+            needs: Default::default(),
         },
     )?;
     shared.borrow_mut().check = Some(id);
@@ -499,6 +514,7 @@ fn initial_job(
             names,
             grants,
             services,
+            needs: Default::default(),
         },
     )
 }
