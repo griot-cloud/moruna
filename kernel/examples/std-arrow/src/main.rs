@@ -54,13 +54,13 @@ fn main() -> Result<(), ArrowError> {
 
     let above = gt(&values, &Int64Array::new_scalar(5))?;
     let kept = filter(&values, &above)?;
-    let kept = kept.as_primitive::<Int64Type>().values();
-    assert_eq!(kept.as_ref(), [7, 9, 8, 6, 10]);
+    let kept: &[i64] = kept.as_primitive::<Int64Type>().values();
+    assert_eq!(kept, [7, 9, 8, 6, 10]);
     println!("std-arrow: filter value > 5 keeps {kept:?}");
 
     let sorted = sort(&values, None)?;
-    let sorted = sorted.as_primitive::<Int64Type>().values();
-    assert_eq!(sorted.as_ref(), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    let sorted: &[i64] = sorted.as_primitive::<Int64Type>().values();
+    assert_eq!(sorted, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     println!("std-arrow: sort gives {sorted:?}");
 
     // IPC: a batch written as a stream into memory, and read back.
