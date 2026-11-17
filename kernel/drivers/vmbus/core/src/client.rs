@@ -33,10 +33,12 @@ use vmbus_core::protocol::Version;
 use crate::gpadl;
 use crate::gpadl::MAX_PAGES;
 use crate::hv::Hv;
+use crate::hv::HvError;
 use crate::hv::HvMessage;
 use crate::hv::MAX_PAYLOAD;
 use crate::hv::MESSAGE_TYPE;
 use crate::hv::MemoryId;
+use crate::hv::PostError;
 
 /// The versions the client offers, newest first: every version `vmbus_core` defines from
 /// the newest down to Windows 10's, 4.0. Nothing older is ever offered.
@@ -183,10 +185,14 @@ pub enum Error {
     GpadlBusy(GpadlId),
 }
 
-/// Why the client refused a message from the host. The message is dropped and the client
-/// is as it was before it.
+/// What went wrong on the host's side. [`HostError::Post`] is Hyper-V refusing a post;
+/// every other kind is the client refusing a message from the host, which is dropped,
+/// leaving the client as it was before it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HostError {
+    /// Hyper-V refused to post a message, with this status. The message stays first in
+    /// line ([`Client::has_unsent`]); the `vmbus` process treats this as fatal.
+    Post(HvError),
     /// Not a VMBus message: SINT 2 carried this SynIC message type.
     NotVmbus(u32),
     /// The SynIC header claims this many bytes of payload; a slot holds 240.
@@ -244,6 +250,7 @@ impl core::error::Error for Error {}
 impl fmt::Display for HostError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            HostError::Post(status) => write!(f, "Hyper-V refused a post: {status}"),
             HostError::NotVmbus(typ) => write!(f, "SynIC message type {typ:#x} is not VMBus's"),
             HostError::Length(len) => write!(f, "a message of {len} bytes in a 240-byte slot"),
             HostError::TooSmall(Some(typ)) => write!(f, "message {} is too short", typ.0),
@@ -572,11 +579,12 @@ impl Client {
     /// caller waits for SINT 2, or pauses and polls again if
     /// [`has_unsent`](Client::has_unsent).
     ///
-    /// An error is a message from the host that the client refused. That message is
-    /// dropped, nothing else is lost, and the next call goes on with the next one.
+    /// An error is either Hyper-V refusing a post ([`HostError::Post`]), or a message from
+    /// the host that the client refused. A refused message is dropped, nothing else is
+    /// lost, and the next call goes on with the next one.
     pub fn poll(&mut self, hv: &mut impl Hv) -> Result<Option<Event>, HostError> {
         loop {
-            self.flush(hv);
+            self.flush(hv)?;
             if let Some(event) = self.events.pop_front() {
                 return Ok(Some(event));
             }
@@ -588,17 +596,18 @@ impl Client {
     }
 
     /// Posts the waiting messages, oldest first, and stops at the first the host has no
-    /// room for: it stays first in line.
-    fn flush(&mut self, hv: &mut impl Hv) {
+    /// room for or refuses: it stays first in line.
+    fn flush(&mut self, hv: &mut impl Hv) -> Result<(), HostError> {
         while let Some((connection, message)) = self.unsent.front() {
-            if hv
-                .post_message(*connection, MESSAGE_TYPE, message.data())
-                .is_err()
-            {
-                return;
+            match hv.post_message(*connection, MESSAGE_TYPE, message.data()) {
+                Ok(()) => {
+                    self.unsent.pop_front();
+                }
+                Err(PostError::Busy) => return Ok(()),
+                Err(PostError::Hv(status)) => return Err(HostError::Post(status)),
             }
-            self.unsent.pop_front();
         }
+        Ok(())
     }
 
     /// Queues a message for the connection the host named.

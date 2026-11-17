@@ -13,7 +13,6 @@ use std::collections::VecDeque;
 
 use hvdef::HvMessageType;
 use hvdef::Vtl;
-use moruna_vmbus::Busy;
 use moruna_vmbus::ChannelId;
 use moruna_vmbus::Client;
 use moruna_vmbus::ConnectionState;
@@ -21,9 +20,11 @@ use moruna_vmbus::Event;
 use moruna_vmbus::GpadlId;
 use moruna_vmbus::Guid;
 use moruna_vmbus::Hv;
+use moruna_vmbus::HvError;
 use moruna_vmbus::HvMessage;
 use moruna_vmbus::MemoryId;
 use moruna_vmbus::MessageType;
+use moruna_vmbus::PostError;
 use moruna_vmbus::Version;
 use moruna_vmbus::VersionInfo;
 use vmbus_core::OutgoingMessage;
@@ -94,6 +95,8 @@ pub struct FakeHost {
     pub busy: usize,
     /// Turn busy later: once it has taken this many posts, refuse this many.
     pub busy_at: Option<(usize, usize)>,
+    /// Refuse the next post with this status, as Hyper-V refuses a post it cannot take.
+    pub refuse_post: Option<HvError>,
     /// The status of the next GPADL, if it is to fail.
     pub fail_gpadl: Option<i32>,
     /// The status of the next open, if it is to fail.
@@ -139,6 +142,7 @@ impl FakeHost {
             devices: Vec::new(),
             busy: 0,
             busy_at: None,
+            refuse_post: None,
             fail_gpadl: None,
             fail_open: None,
             hold_gpadl: false,
@@ -622,7 +626,10 @@ impl Hv for FakeHost {
         connection_id: u32,
         message_type: u32,
         payload: &[u8],
-    ) -> Result<(), Busy> {
+    ) -> Result<(), PostError> {
+        if let Some(status) = self.refuse_post.take() {
+            return Err(PostError::Hv(status));
+        }
         if let Some((at, times)) = self.busy_at
             && self.posted.len() == at
         {
@@ -632,7 +639,7 @@ impl Hv for FakeHost {
         if self.busy > 0 {
             self.busy -= 1;
             self.refused += 1;
-            return Err(Busy);
+            return Err(PostError::Busy);
         }
         assert_eq!(message_type, 1, "VMBus messages are SynIC type 1");
         assert!(payload.len() <= 240, "a message fits a SynIC slot");

@@ -5,7 +5,6 @@
 use std::collections::VecDeque;
 
 use hvdef::HvMessageType;
-use moruna_vmbus::Busy;
 use moruna_vmbus::ChannelId;
 use moruna_vmbus::Client;
 use moruna_vmbus::ClientState;
@@ -15,6 +14,7 @@ use moruna_vmbus::Hv;
 use moruna_vmbus::HvMessage;
 use moruna_vmbus::MAX_CHANNEL_ID;
 use moruna_vmbus::MemoryId;
+use moruna_vmbus::PostError;
 use moruna_vmbus::RingPair;
 use vmbus_core::OutgoingMessage;
 use vmbus_core::protocol;
@@ -56,13 +56,13 @@ struct Chaos {
 }
 
 impl Hv for Chaos {
-    fn post_message(&mut self, _: u32, message_type: u32, payload: &[u8]) -> Result<(), Busy> {
+    fn post_message(&mut self, _: u32, message_type: u32, payload: &[u8]) -> Result<(), PostError> {
         // Whatever the host does, what the client posts is a VMBus message that fits.
         assert_eq!(message_type, 1);
         assert!((8..=240).contains(&payload.len()));
         if self.random.one_in(6) {
             self.refused += 1;
-            return Err(Busy);
+            return Err(PostError::Busy);
         }
         self.posted += 1;
         Ok(())

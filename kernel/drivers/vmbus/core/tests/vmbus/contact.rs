@@ -8,6 +8,8 @@ use moruna_vmbus::ConnectionState;
 use moruna_vmbus::Error;
 use moruna_vmbus::Event;
 use moruna_vmbus::FeatureFlags;
+use moruna_vmbus::HostError;
+use moruna_vmbus::HvError;
 use moruna_vmbus::MemoryId;
 use moruna_vmbus::MessageType;
 use moruna_vmbus::Offer;
@@ -279,6 +281,67 @@ fn a_busy_post_is_retried_until_the_host_takes_it() {
         [MessageType::INITIATE_CONTACT, MessageType::REQUEST_OFFERS]
     );
     assert!(!client.has_unsent());
+}
+
+#[test]
+fn a_post_hyper_v_refuses_is_an_error_and_the_message_waits_first_in_line() {
+    let mut host = FakeHost::new();
+    host.devices = vec![(NIC, instance(1))];
+    host.refuse_post = Some(HvError::InvalidConnectionId);
+    let mut client = Client::new();
+    client.connect().unwrap();
+
+    // Nothing was posted, and the client says why, with Hyper-V's status.
+    assert_eq!(
+        client.poll(&mut host),
+        Err(HostError::Post(HvError::InvalidConnectionId))
+    );
+    assert!(host.posted.is_empty());
+    assert!(client.has_unsent());
+    assert_eq!(client.state(), ClientState::Connecting);
+
+    // A caller that polls again posts the same message, once.
+    let events = drain(&mut client, &mut host);
+    assert!(matches!(
+        events[..],
+        [Event::Offer(_), Event::Connected { .. }]
+    ));
+    assert_eq!(
+        host.types(),
+        [MessageType::INITIATE_CONTACT, MessageType::REQUEST_OFFERS]
+    );
+}
+
+#[test]
+fn a_post_refused_later_keeps_the_messages_after_it_in_order() {
+    let (mut client, mut host) = connected();
+    let memory = host.add_memory(1, 0x1000, 100);
+    client
+        .create_gpadl(&mut host, ChannelId(1), memory)
+        .unwrap();
+    host.refuse_post = Some(HvError::InsufficientMemory);
+
+    // The header goes nowhere; the body after it is not posted ahead of it.
+    assert_eq!(
+        client.poll(&mut host),
+        Err(HostError::Post(HvError::InsufficientMemory))
+    );
+    assert_eq!(
+        host.types().len(),
+        2,
+        "only contact and the request for offers"
+    );
+    let events = drain(&mut client, &mut host);
+    assert!(matches!(events[..], [Event::GpadlCreated { .. }]));
+    assert_eq!(
+        host.types()[2..],
+        [
+            MessageType::GPADL_HEADER,
+            MessageType::GPADL_BODY,
+            MessageType::GPADL_BODY,
+            MessageType::GPADL_BODY
+        ]
+    );
 }
 
 #[test]

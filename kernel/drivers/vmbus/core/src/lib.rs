@@ -53,12 +53,13 @@ pub use client::RingPair;
 pub use client::VERSIONS;
 pub use gpadl::MAX_PAGES;
 pub use gpadl::PAGE_SIZE;
-pub use hv::Busy;
 pub use hv::Hv;
+pub use hv::HvError;
 pub use hv::HvMessage;
 pub use hv::MAX_PAYLOAD;
 pub use hv::MESSAGE_TYPE;
 pub use hv::MemoryId;
+pub use hv::PostError;
 
 pub use guid::Guid;
 pub use vmbus_core::VersionInfo;

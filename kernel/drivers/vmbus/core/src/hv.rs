@@ -6,6 +6,7 @@
 
 use alloc::vec::Vec;
 
+pub use hvdef::HvError;
 pub use hvdef::HvMessage;
 
 /// The type Hyper-V carries every VMBus message under, in both directions
@@ -21,22 +22,28 @@ pub const MAX_PAYLOAD: usize = hvdef::HV_MESSAGE_PAYLOAD_SIZE;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MemoryId(pub u64);
 
-/// Hyper-V has no room for the message now (`HV_STATUS_INSUFFICIENT_BUFFERS`): the same
-/// message is to be posted again later.
+/// Why a message was not posted. Either way nothing was posted.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Busy;
+pub enum PostError {
+    /// Hyper-V has no room for the message now (`HV_STATUS_INSUFFICIENT_BUFFERS`): the
+    /// same message is to be posted again later.
+    Busy,
+    /// Hyper-V refused the post with any other status. The client passes it up as
+    /// [`HostError::Post`](crate::HostError::Post); the `vmbus` process treats it as fatal.
+    Hv(HvError),
+}
 
 /// What the library needs from Hyper-V.
 pub trait Hv {
     /// Posts a message to a connection ID: a type and up to [`MAX_PAYLOAD`] bytes
-    /// (`HvCallPostMessage`). [`Busy`] means nothing was posted and the caller of the
-    /// library is to try again.
+    /// (`HvCallPostMessage`). `HV_STATUS_INSUFFICIENT_BUFFERS` is [`PostError::Busy`],
+    /// any other failure [`PostError::Hv`] with Hyper-V's status.
     fn post_message(
         &mut self,
         connection_id: u32,
         message_type: u32,
         payload: &[u8],
-    ) -> Result<(), Busy>;
+    ) -> Result<(), PostError>;
 
     /// Signals an event on a connection ID and flag (`HvCallSignalEvent`).
     fn signal_event(&mut self, connection_id: u32, flag: u16);

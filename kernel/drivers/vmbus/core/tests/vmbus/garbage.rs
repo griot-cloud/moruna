@@ -216,7 +216,12 @@ fn a_version_accepted_with_no_connection_to_use_is_refused() {
     // A host that answers contact itself, wrongly: 6.0 accepted, connection ID zero.
     struct NoConnection(FakeHost);
     impl moruna_vmbus::Hv for NoConnection {
-        fn post_message(&mut self, _: u32, _: u32, _: &[u8]) -> Result<(), moruna_vmbus::Busy> {
+        fn post_message(
+            &mut self,
+            _: u32,
+            _: u32,
+            _: &[u8],
+        ) -> Result<(), moruna_vmbus::PostError> {
             self.0
                 .send(OutgoingMessage::new(&protocol::VersionResponse2 {
                     version_response: protocol::VersionResponse {
@@ -569,6 +574,7 @@ fn while_unloading_the_hosts_other_answers_are_dropped_and_garbage_is_still_name
 #[test]
 fn every_refusal_says_what_was_refused() {
     let host = [
+        HostError::Post(moruna_vmbus::HvError::InvalidConnectionId),
         HostError::NotVmbus(2),
         HostError::Length(250),
         HostError::TooSmall(None),
@@ -609,7 +615,8 @@ fn every_refusal_says_what_was_refused() {
         assert!(all[..i].iter().all(|other| other != text), "{text}");
     }
     assert_eq!(caller[7], "a GPADL names 1 to 8190 pages, not 9000");
-    assert_eq!(host[1], "a message of 250 bytes in a 240-byte slot");
+    assert_eq!(host[0], "Hyper-V refused a post: Invalid connection ID");
+    assert_eq!(host[2], "a message of 250 bytes in a 240-byte slot");
     // Each is an error a caller can pass on.
     let _: &dyn core::error::Error = &HostError::OpenId(4);
     let _: &dyn core::error::Error = &Error::NotConnected;
