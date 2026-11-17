@@ -75,7 +75,7 @@ Implements the OS design, section 1, OpenStack column.
   ```
   moruna: core <version> cpus=<n> memory=<bytes>
   moruna: services started
-  moruna: network wan <address>/<prefix> gateway <address>
+  moruna: network wan <address>/<prefix> gateway <address|none>
   moruna: cloud <openstack|azure|none> instance <id>
   moruna: tls sha256=<fingerprint>
   moruna: ready api=<address>:443 boot_ms=<n>
@@ -84,7 +84,8 @@ Implements the OS design, section 1, OpenStack column.
 - **`boot_ms`** counts from the core's first instruction to ready. Firmware and GRUB time is
   measured from outside, at bring-up, as create-to-ready.
 - **Limits:** services started within 5 s; an address within 30 s; instance data within 90 s.
-- **Failure:** one line, `moruna: fatal <stage>: <reason>`, then the machine powers off. A node
+- **Failure:** one line, `moruna: fatal <stage>: <reason>`, then the machine powers off. The stage
+  is `core`, or the name of the service that can't go on, unless this document names another. A node
   never hangs silently, never restarts itself in a loop, and never offers a prompt. A service that
   dies stops the node (SDD 33), except `api`, which is restarted (2B).
 - **Power-off is ACPI S5 on every machine:** SLP_TYPa from the DSDT's `\_S5` object (found by
@@ -92,7 +93,8 @@ Implements the OS design, section 1, OpenStack column.
   written with SLP_EN to the FADT's PM1a control register. OSTD today powers off only through
   QEMU's test exit device, which no cloud has. That device stays for CI's exit codes alone.
 - **No wait without a deadline in boot code.** OSTD's PIT calibration waits forever on a machine
-  with no PIT. Every such wait gets a deadline and, when it passes, a `fatal` line.
+  with no PIT. Every such wait gets a deadline and, when it passes, a `fatal` line: the PIT and APIC
+  timer calibrations, and the wait for the other CPUs to start.
 
 ### 1C. Network
 
@@ -104,7 +106,11 @@ Implements the OS design, section 1, OpenStack column.
   interface wan card=net0 dhcp
   ```
 
-- **One port listens: TCP 443,** owned by `api`. Nothing else accepts connections.
+- **One port listens: TCP 443,** owned by `api`. Nothing else accepts connections. `api` listens on
+  `wan`'s leased address, and moves its listener when the lease's address changes.
+- **`devices` lives as long as the node.** Started by the node's supervisor, it serves until the
+  supervisor stops it, not until its last client leaves. Clients come and go: the network server
+  at start, `node-admission` for each job's volumes (3C).
 - **Outbound is denied unless granted.** In steps 1 and 2 only `platform` has grants:
   `169.254.169.254` port 80 (instance data), and on Azure `168.63.129.16` port 80 (the "ready"
   report).
@@ -146,8 +152,12 @@ One process, `platform`. In order, it:
    - `functions` is optional: `keys` holds 0 to 8 keys that may sign function images (3E), and
      `cache_bytes` defaults to 1 GiB.
    - Unknown fields are refused. A missing or invalid config is fatal.
-4. **Hands `api` its config** (token keys, TLS identity, wall clock, instance ID) over a channel
-   the supervisor links.
+4. **Hands `api` its config** (token keys, TLS identity, wall clock, instance ID, the machine's
+   memory) over a channel the supervisor links. The node's memory is the machine account's limit,
+   which every service and job is carved from: the supervisor reads it with `account_info` and
+   passes it to `platform` at start. It is less than the RAM the core's `memory=` line counts, by
+   what the kernel keeps. `api` answers `ready` within 10 s, or
+   it is fatal.
 5. **Prints** the `cloud` and `ready` lines.
 
 - **By default node config holds no secrets.** Without `tls`, `api` makes an ECDSA P-256 key and a
@@ -178,6 +188,7 @@ One process, `platform`. In order, it:
 | 1.1 | The `cloud` profile for step 1; boot its image in QEMU under UEFI firmware with one virtio disk and one virtio network card (1A) | A script boots it to `services started` on 1 and 2 CPUs | 0.1 |
 | 1.2 | The boot lines, the limits, deadlines on boot waits, and ACPI S5 power-off on a fatal error (1B) | Each line appears in order; each limit, when forced, gives its `fatal` line and the machine powers off by S5 | 1.1 |
 | 1.3 | DHCP on `wan`; `api` owning 443 and closing each connection; the outbound grant (1C) | A connection from the host reaches 443; one to any other port is refused; `api` cannot connect out | 1.1 |
+| 1.3b | The network server hardened for a public port: the smoltcp underflow, socket memory bounded per grant | 10,000 abandoned connections never exceed the grant; the suite passes | 1.3 |
 | 1.4 | `platform`: instance data, wall clock, node config v1, the hand-over to `api` (1D) | Booted against fake OpenStack data: the `cloud` and `ready` lines appear; each invalid config is refused with its reason | 1.2, 1.3 |
 | 1.5 | The qcow2 and VHD formats and the upload recipe, `kernel/node/OPENSTACK.md` (1A, 1E) | Each format boots in QEMU; the recipe's commands are complete | 1.1 |
 | 1.6 | Bring-up on Servercore (1E) | 1E's success, on Servercore | 1.4, 1.5, credentials |
@@ -216,23 +227,41 @@ if it does, this section changes first.
   `0x40000022` (TSC) and `0x40000023` (local APIC), and the PIT last, with a deadline (1B).
 - **Timer:** the local APIC timer at the rate Hyper-V gives. Nothing from the old PC (PIT, PIC,
   HPET, CMOS clock) is assumed.
-- **No PCI bus:** Generation 2 has no ACPI MCFG. The core boots without `root.ecam`, and `devices`
-  runs with no PCI functions. Today the core refuses to boot without MCFG (`kernel/core/src/boot.rs`).
+- **No PCI bus:** Generation 2 has no ACPI MCFG. Today the core refuses to boot without it
+  (`kernel/core/src/boot.rs`). Instead, `root.ecam` then covers an empty range, `devices` finds no
+  PCI function and says so in one line, and the boot goes on. The same holds on any machine
+  without MCFG.
 - **Guest OS ID:** written before the hypercall page, in the TLFS's open-source encoding. Item 1.8
   proposes the exact value with its TLFS citation; the PM approves it.
 - **Power-off:** ACPI S5 (1B).
 
 ### VMBus, split by the microkernel rule
 
-- **In the core, one mechanism,** granted to the `vmbus` process only:
-  - the hypercall page, and the hypercalls `HvPostMessage` and `HvSignalEvent`;
-  - each CPU's SynIC message and event pages, mapped read-only to `vmbus`;
-  - SINT 2's interrupt delivered to `vmbus`, and its end-of-message write.
+- **In the core, one mechanism.** When Hyper-V is found, the core sets up the hypercall page and
+  CPU 0's SynIC, and makes one boot capability, `root.hyperv`, which the supervisor grants to the
+  `vmbus` process only. The calls on it:
 
-  Added kernel-mode lines are counted in `data-os.md` section 0.
-- **In the `vmbus` process:** the version handshake, offers, opening and closing channels, GPADLs
-  (guest memory shared with the host), and each channel's ring pair mapped to its driver. Every
-  channel targets CPU 0 at first.
+  | Call | What it does |
+  |---|---|
+  | post a message | `HvPostMessage` to a connection ID: a type and up to 240 bytes. Answers ok, busy, or Hyper-V's status |
+  | take a message | Copies out the message waiting on SINT 2, marks the slot empty, and writes end-of-message when one more is pending |
+  | map the event flags | Maps CPU 0's event-flags page into the caller, once |
+  | the interrupt | Gives an interrupt object for SINT 2, waited on as a driver waits on its device's |
+  | a signal handle | Makes a handle that can signal one connection ID and nothing else, to give to that channel's driver |
+  | signal | `HvSignalEvent`, through a signal handle |
+
+  - The SynIC is enabled on CPU 0 only, and every channel targets it.
+  - A GPADL's guest page numbers come from the DMA grant a driver already uses to pin memory.
+  - Added kernel-mode lines and calls are counted in `data-os.md` section 0.
+- **In the `vmbus` process:** `moruna-vmbus` wired to those calls. It serves drivers a small
+  protocol, `moruna.driver.vmbus`: list the offers of an interface, open a channel, share memory
+  with the host, close.
+  - Opening a channel gives the driver the ring memory, the channel's signal handle, and a wake
+    word.
+  - **Out:** a driver writes its ring and signals the host itself, through its signal handle.
+  - **In:** the host's interrupt reaches `vmbus`, which reads the event flags and wakes the
+    drivers whose channels have data. That is one hop on the way in, accepted for the first
+    bring-up.
 - **`storvsc` and `netvsc`** are driver processes that serve today's block and network driver
   protocols, so nothing above them changes. netvsc speaks NVSP and RNDIS.
 - **Libraries first, as with the API server.** The VMBus client, storvsc and netvsc are each a
@@ -455,13 +484,22 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
 | `GET /v1/jobs/{id}/events` | observe | Server-Sent Events: each event record as its JSON line (`moruna_event`'s rendering), heartbeats, log records, then `report` and `exit`. `?from=<seq>` replays from the node's buffer of the last 100,000 records |
 | `GET /v1/jobs/{id}/report` | observe | The `RunReport` JSON, once the job has ended |
 
-- **A job is** `{"v1": <job document version 1 as JSON>}` or `{"v2": "<base64 of the MJB2 FlatBuffer>"}`.
+- **A job is** `{"v1": <job document version 1 as JSON>}` or `{"v2": "<base64 of the MJB2 FlatBuffer>"}`,
+  with an optional `secrets` map.
   Either is checked by the engine (3A) before it runs.
 - **The node fills in** `report.socket` (the channel), `staging` (none) and the run id when absent.
   A document that names a host socket, a `file://` path outside its volumes, or `resume` is refused
   in this release.
-- **Secrets** (object-store credentials) are redacted in every answer, event, log and report. They
-  live in the engine's memory for the job and in `api`'s memory until the engine has them.
+- **Secrets travel beside the document, by name:**
+  - the job body carries `"secrets": {"<name>": "<value>"}`, at most 32;
+  - the document refers to one where a credential belongs, as `{"secret": "<name>"}`, and never
+    holds a credential itself;
+  - `api` passes the map to the engine in the `spec` message's `secrets` member, outside the
+    document and its digest;
+  - `api` redacts the values in every answer, event, log and report, and drops them when the
+    engine exits. They live only in the engine's and `api`'s memory.
+- **Node mode:** the engine, serving on a channel, fills in the document's gaps and refuses what a
+  node doesn't allow (above). `api` and `node-admission` never read a document.
 
 ### 3C. Volumes
 
@@ -525,23 +563,116 @@ Item 3.1 reproduces it, finds the cause, and proposes a fix for the PM's approva
 the branch head's new Linux layer boots. If it doesn't, the node uses the tag's `kernel/linux`
 until it does, and that choice is written here.
 
-## 5. Languages (Draft)
+## 5. Languages (Final)
 
-Implements the OS design, section 5.
+Implements the OS design, section 5. A function is a program that the plane feeds Arrow batches.
+There are two kinds:
+- **native:** a static program for the core, as the gate's tasks are today (`images/gate/tasks`);
+- **image:** a Linux program run by the Linux layer, today's `image` kind (SDD 19).
 
-- **The Rust SDK** is `moruna_sys::plane`, documented, with an example function.
-- **The C header** wraps it in six calls: open the task, take the next batch, emit a batch, write a
-  log line, report an error, finish. Batches cross by the Arrow C Data Interface.
-- **The Python SDK** binds the header with pyarrow: `@moruna.source`, `@moruna.function`,
-  `@moruna.sink`. It builds the function's image and registers it. It needs the Linux layer booted
-  with CPython.
+### 5A. Rust: `moruna-function`
+
+- **One crate,** `kernel/function/rust`, package `moruna-function`, for the core's user target. It
+  wraps `moruna_sys::plane` (rings, windows, log) and arrow-rs:
+
+  ```rust
+  moruna_function::serve(|batch: RecordBatch, out: &mut Emit| -> Result<(), FunctionError> { … })
+  ```
+
+  - `serve` takes each input batch, read in place from its window (Arrow IPC, no copy);
+  - `Emit::batch` writes an output batch into a window, and may be called any number of times;
+  - a returned error ends the task with that message;
+  - logging goes through `moruna_function::log`.
+- **What a function is:** one static ELF, built with `cargo build --target` for the core's user
+  target. Registration (3E) takes that file. Nothing else is packaged.
+- **The gate's seven functions** move onto this crate. They are the SDK's first users and its
+  conformance suite.
+
+### 5B. C, and every language that links C
+
+- **A header,** `moruna_function.h`, and a static library, `libmoruna_function.a`, built from 5A for
+  the user target. Batches cross by the Arrow C Data Interface:
+
+  ```c
+  int  moruna_open(struct moruna_task **task);
+  int  moruna_next(struct moruna_task *task, struct ArrowArray *out, struct ArrowSchema *schema); /* 1 batch, 0 end, <0 error */
+  int  moruna_emit(struct moruna_task *task, struct ArrowArray *batch, struct ArrowSchema *schema); /* takes ownership */
+  void moruna_log(struct moruna_task *task, int level, const char *line);
+  void moruna_error(struct moruna_task *task, const char *message);
+  int  moruna_finish(struct moruna_task *task);
+  ```
+
+- **A batch from `moruna_next`** stays valid until its `release` is called. The window is given
+  back then.
+- **C, C++ and Zig** link the library into a static native function. Go and others follow when
+  someone needs them; nothing in the header is tied to C.
+
+### 5C. Python
+
+- **Python functions are the `image` kind,** on the Linux layer (`kernel/linux` until the new layer
+  returns, section 0): CPython with pyarrow in a layered image, the batch exchanged as Arrow IPC.
+  That is today's 0.6 path (`moruna.function`, the image builder of `python/moruna/_build.py`)
+  and needs no new interface.
+- **The SDK** keeps `@moruna.source`, `@moruna.function` and `@moruna.sink` (SDD 12). It gains
+  `moruna.register(fn, client)`: build the image, sign it with the operator's key, upload it to
+  object storage the node can read, and register it through `moruna.api` (2E).
+- **What registration takes for an image function:** the image as one file, the existing layer
+  archive, named by the address and SHA-256 of 3E.
+
+### Work items
 
 | Item | Build | Success | Needs |
 |---|---|---|---|
-| 5.1 | The Rust function SDK | The example builds from the docs alone and runs in a job | 3.6 |
-| 5.2 | The C header, with a conformance test | A C function runs in a job and passes the row check | 5.1 |
-| 5.3 | The Linux layer boots CPython with pyarrow | A booted test | 0.1 |
-| 5.4 | The Python function SDK | A Python function runs in a job on a node and passes the row check | 5.2, 5.3, 3.6 |
+| 5.1 | `moruna-function` (5A), its guide, and the gate's seven functions moved onto it | Each of the seven gives its rows, as today, in a booted job; an example built from the guide alone runs | 3.2 |
+| 5.2 | The header and the static library (5B), with a C conformance function | A C function passes the row check in a booted job | 5.1 |
+| 5.3 | CPython with pyarrow booted on the Linux layer, as an image function | A Python function's rows match in a booted job | 3.2 |
+| 5.4 | `moruna.register` and the end-to-end Python path (5C) | From a laptop: a decorated Python function is registered on a node and runs in a job | 5.3, 3.6 |
+
+## 6. The benchmark (Final)
+
+Implements the OS design's last line of section 3: "The benchmark returns". Brackly's rule
+(2026-11-17): a miss points at something broken or inefficient in Moruna; fix that, for every
+workload. Nothing is tuned for a benchmark.
+
+### 6A. Where
+
+- **Subscription `griot-dev`,** Central India, one resource group per run, `moruna-bench-<date>`,
+  deleted after.
+- **Moruna is the node:** our VHD on `Standard_D4s_v4`, zone 3, driven through its API.
+- **Every other engine runs on Linux** (Ubuntu 24.04) on the same size in the same zone, one machine
+  at a time: 0.6.6 (with Python and with the Rust function), the plain Rust pool, DuckDB, Polars,
+  Ray, Spark and Dask.
+- **The data** sits in one Azure Blob container in the same region. Moruna reads it through 3.5; the
+  others through their own Blob readers or a local copy timed apart.
+
+### 6B. What is measured
+
+- **Per job and per engine,** the median of 5 runs, in interleaved order:
+  - operational time: from the first rows to the output written;
+  - start-up: Moruna's boot-to-ready, the others' process start and imports;
+  - CPU-seconds and peak memory;
+  - the output's canonical hash, checked against 0.6.6's.
+- **Jobs:** the four NYC taxi jobs on 2024 (41.2M rows) first. FineWeb and Overture follow when
+  NYC holds.
+- **The bar:** first faster than 0.6.6 on every job, then at least 1.5x the best engine on
+  operational time, with CPU-seconds no worse.
+
+### 6C. When Moruna loses
+
+1. The report's time split (read, decode, function, encode, write, waits) names the stage that
+   lost.
+2. A profile of that stage names the cause in Moruna's code.
+3. The fix is written as a work item that states the general defect, why it hurts workloads beyond
+   the benchmark, and a test that shows it without the benchmark.
+4. **Refused:** constants tuned to a dataset, a path special to a job, anything that changes what
+   is measured.
+5. Every run and every fix is logged in `architecture/benchmark-log.md`.
+
+| Item | Build | Success | Needs |
+|---|---|---|---|
+| 6.1 | The harness: provision, run, collect and tear down, from one command on the Mac | A dry run creates and deletes the resource group | 1.13, 3.5 |
+| 6.2 | The first full run | The table of 6B, logged | 3.8, 6.1 |
+| 6.3 | Each miss, through 6C | One work item per root cause | 6.2 |
 
 ## 4. Kernels and accelerators (not started)
 
@@ -557,9 +688,10 @@ first accelerator.
 | 1. Boot as a node, OpenStack | 1A to 1E | Final |
 | 1. Boot as a node, Azure | 1F | Final; 1.7b may adjust details |
 | 2. The API | 2A to 2E | Final |
-| 3. Wiring | 3A to 3F | Final; one open risk (0.1's result) |
+| 3. Wiring | 3A to 3F | Final; 0.1's risk settled: `kernel/linux` until the new layer returns |
+| 3. "The benchmark returns" | 6 | Final |
 | 4. The two interfaces and the unit of work | 4 | Not started, by decision |
-| 5. Rust first, every language after | 5 | Draft |
+| 5. Rust first, every language after | 5A to 5C | Final |
 | One image for every cloud | 1A | Final |
 | No shell, no arbitrary command | 1B (no console input), 2A (fixed operations) | Final |
 | The microkernel rule | 1F (VMBus split), 2B (`api` is a process) | Held |

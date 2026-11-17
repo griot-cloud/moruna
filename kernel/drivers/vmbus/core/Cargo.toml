@@ -1,0 +1,24 @@
+[package]
+name = "moruna-vmbus"
+description = "The guest's side of Hyper-V's VMBus as a state machine the caller drives: contact and version, offers, GPADLs, opening and closing channels, rescinds and unload, over a trait for what it needs from Hyper-V; and the trait a driver sees a channel through"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# An in-memory `Channel` with a fake device on its other end, for the host tests of the
+# drivers that sit on a channel (moruna-storvsc, moruna-netvsc). Never on in a node.
+testing = ["dep:guestmem_core"]
+
+[dependencies]
+# Only `testing` needs it by name: a ring's packets are read and written through its traits.
+guestmem_core = { path = "../../../vendor/openvmm/guestmem_core", version = "=0.0.0", optional = true }
+guid ={ path = "../../../vendor/openvmm/guid", version = "=0.0.0" }
+hvdef = { path = "../../../vendor/openvmm/hvdef", version = "=0.0.0" }
+vmbus_core = { path = "../../../vendor/openvmm/vmbus_core", version = "=0.0.0" }
+vmbus_ring = { path = "../../../vendor/openvmm/vmbus_ring", version = "=0.0.0" }
+
+[dev-dependencies]
+# The crate's own tests cover `testing` too, without a flag on the command line.
+moruna-vmbus = { path = ".", version = "=0.1.0", features = ["testing"] }
