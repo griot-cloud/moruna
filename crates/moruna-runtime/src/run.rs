@@ -501,6 +501,11 @@ fn drive(
     for ports in &stage_ports {
         ports.bind_run(run_ports.clone());
     }
+    // stream P: a packaged stage's own waits answer to the run's cancel too (a native stage's
+    // waits on its tasks were never told it, so a cancel did not end a unit waiting on one).
+    for stage in &packaged {
+        stage.bind_run_ports(&run_ports);
+    }
     let mut sources: Vec<Arc<dyn moruna_kernel::Source>> = Vec::with_capacity(source_specs.len());
     for spec in source_specs {
         sources.push(spec.build(&ctx)?);
@@ -1002,11 +1007,57 @@ fn drive(
             WatchState::new(arena_bytes),
         )
     });
+    // stream P: a cancelled run says where its workers are as the cancel reaches it, into the
+    // run's output, which the store tells as events at once: a run that then hangs in its
+    // workers and is shut down still leaves its diagnosis (the NYC gate, 2026-11-17).
+    let diagnosed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let diagnosis = {
+        let token = guard.token();
+        let done = Arc::clone(&diagnosed);
+        let scheduler = scheduler.clone();
+        let controller = started.controller.clone();
+        let stages = packaged.clone();
+        let output = components.output.clone();
+        std::thread::Builder::new()
+            .name("moruna-diagnosis".to_string())
+            .spawn(move || {
+                use std::sync::atomic::Ordering::Relaxed;
+                while !done.load(Relaxed) && !token.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                // A run that ended without a cancel has nothing to say here; a cancelled one says
+                // it however soon it ended.
+                if !token.is_cancelled() {
+                    return;
+                }
+                let mut lines = Vec::new();
+                if let Some(controller) = &controller {
+                    lines.extend(controller.summary().notes);
+                }
+                lines.extend(scheduler.worker_notes());
+                lines.extend(stages.iter().filter_map(|stage| stage.task_note()));
+                for line in lines {
+                    tracing::warn!(target: "run.cancel", "{line}");
+                    if let Some(output) = &output {
+                        output.record(
+                            None,
+                            Some(moruna_kernel::output::Level::Warning),
+                            &format!("at the cancel: {line}"),
+                        );
+                    }
+                }
+            })
+            .ok()
+    };
     let outcome = if resume.is_some() {
         scheduler.run_resumed(guard.token())
     } else {
         scheduler.run(guard.token())
     };
+    diagnosed.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(diagnosis) = diagnosis {
+        let _ = diagnosis.join();
+    }
     let (drains, watch_notes) = match watcher {
         Some(watcher) => {
             let watched = watcher.stop();

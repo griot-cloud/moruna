@@ -28,6 +28,10 @@ moruna-testkit = { workspace = true }
 # The real placement engine, for the tests and the policy matrix that prove the hard rule
 # against the buffer catalog itself (SC-T28, SC-B1); a test dependency only.
 moruna-placement = { workspace = true }
+# Item 3.1: the native stage SC-P drives runs on the ring plane's own rule for giving a task
+# its windows back and on the stage's own layout (`moruna_micro::layout`, on every host).
+moruna-plane = { workspace = true }
+moruna-micro = { workspace = true }
 
 [features]
 default = []
