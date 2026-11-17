@@ -111,7 +111,7 @@ impl Handler for Session {
         let id = cx.connection();
         self.id = Some(id);
         let mut st = self.shared.stack.borrow_mut();
-        st.connection(id, &self.grant);
+        st.connection(id, &self.grant, || cx.peer_watch().ok());
         let bad = Outcome::Status(Status::BadMessage);
         let bound = st.account_bound(id);
         macro_rules! authorized {
