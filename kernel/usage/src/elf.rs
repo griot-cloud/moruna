@@ -221,7 +221,7 @@ impl<'a> Elf<'a> {
             .contents(table)
             .ok_or(Error("symbols out of the file"))?;
         let mut out = Vec::with_capacity(bytes.len() / 24);
-        for entry in bytes.chunks_exact(24) {
+        for entry in bytes.as_chunks::<24>().0 {
             out.push(Symbol {
                 name: string(names, u32_at(entry, 0)?)?,
                 kind: entry[4] & 0xf,
@@ -258,7 +258,7 @@ pub mod build {
         // Section bodies.
         let mut placed = Vec::new();
         for s in sections {
-            while out.len() % 8 != 0 {
+            while !out.len().is_multiple_of(8) {
                 out.push(0);
             }
             placed.push(out.len() as u64);
@@ -280,7 +280,7 @@ pub mod build {
         }
         let strtab_at = out.len() as u64;
         out.extend_from_slice(&strtab);
-        while out.len() % 8 != 0 {
+        while !out.len().is_multiple_of(8) {
             out.push(0);
         }
         let symtab_at = out.len() as u64;
@@ -299,7 +299,7 @@ pub mod build {
         }
         let shstr_at = out.len() as u64;
         out.extend_from_slice(&shstr);
-        while out.len() % 8 != 0 {
+        while !out.len().is_multiple_of(8) {
             out.push(0);
         }
         // Program headers.

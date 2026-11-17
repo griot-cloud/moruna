@@ -207,6 +207,16 @@ pub fn build(elf: &Elf<'_>, counters: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
+/// The program's fingerprint (`dump::fingerprint`): its data section's size and first eight
+/// bytes, as the file has them.
+pub fn fingerprint(elf: &Elf<'_>) -> Option<alloc::string::String> {
+    let data = elf.section(DATA)?;
+    let first = elf.contents(data)?.get(..8)?;
+    let mut buf = [0u8; crate::dump::FINGERPRINT_MAX];
+    let first = u64::from_le_bytes(first.try_into().ok()?);
+    Some(crate::dump::fingerprint(data.size, first, &mut buf).into())
+}
+
 /// Eight-byte counters as the bytes of their section.
 pub fn to_bytes(counters: &[u64]) -> Vec<u8> {
     counters.iter().flat_map(|c| c.to_le_bytes()).collect()
@@ -278,6 +288,7 @@ mod tests {
             (CNTS_AT, 24, false, 3)
         );
         let live = to_bytes(&[1, 0, 9]);
+        assert_eq!(fingerprint(&e).as_deref(), Some("80.0707070707070707"));
         let p = build(&e, &live).unwrap();
         let expect_header = [
             MAGIC,

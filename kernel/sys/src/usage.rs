@@ -1,9 +1,13 @@
 //! stream U: the usage build's counters, printed by the program itself (`kernel/usage`).
 //!
 //! Only a program built with the `usage` feature and `-C instrument-coverage` has this
-//! module; no production build does. Its coverage counters are in its own memory, which the
-//! host cannot read, so the program prints them on its console, which the kernel writes to
-//! the serial log the host keeps. A dump goes out:
+//! module; no production build does. It is declared at the end of `raw.rs`, the one file
+//! whose functions it hooks (`wait` and `process_exit`), so that no other source of the crate
+//! changes and the build without the feature stays what it was.
+//!
+//! The program's coverage counters are in its own memory, which the host cannot read, so the
+//! program prints them on its console, which the kernel writes to the serial log the host
+//! keeps. A dump goes out:
 //!
 //! - when the program has handled something and then waited [`IDLE`] with nothing to do;
 //! - before a wait, when it has handled something and its last dump is [`MAX_AGE`] old (a
@@ -13,15 +17,16 @@
 //! So a program's last dump holds all it did, a few seconds after it goes quiet, with no
 //! call from the host and no new path into or out of the guest: the console is one the
 //! program already holds. Its waits answer as before; only their timing differs, by the time
-//! a dump takes.
+//! a dump takes. A dump names its program by a fingerprint of its build, which the host
+//! matches against the kit's programs.
 
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 
 use moruna_abi::{Error, Rights, nr};
-use moruna_usage::dump::{self, Header, LINE_MAX};
+use moruna_usage::dump::{self, FINGERPRINT_MAX, Header, LINE_MAX};
 
 use crate::{WaitItem, raw, start};
 
@@ -34,10 +39,12 @@ pub const MAX_AGE: u64 = 5_000_000_000;
 const NONE: u64 = u64::MAX;
 
 unsafe extern "C" {
-    // The counter section's bounds, which the linker defines for a section named as a C
-    // identifier (LLVM's `__llvm_prf_cnts`).
+    // The bounds of the counter and data sections, which the linker defines for sections
+    // named as C identifiers (LLVM's `__llvm_prf_*`).
     static __start___llvm_prf_cnts: u8;
     static __stop___llvm_prf_cnts: u8;
+    static __start___llvm_prf_data: u8;
+    static __stop___llvm_prf_data: u8;
 }
 
 // SAFETY: LLVM's instrumented code refers to this symbol by name, and no other crate in the
@@ -45,8 +52,8 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 static __llvm_profile_runtime: u8 = 0;
 
-static PROGRAM: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
-static PROGRAM_LEN: AtomicUsize = AtomicUsize::new(0);
+/// 0: not started; 1: starting; 2: started.
+static STATE: AtomicU8 = AtomicU8::new(0);
 static CONSOLE: AtomicU64 = AtomicU64::new(NONE);
 static INSTANCE: AtomicU64 = AtomicU64::new(0);
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -67,12 +74,13 @@ fn now() -> u64 {
     raw::call0(nr::CLOCK_GET).0
 }
 
-/// Called by `main!` before the program's `run`: its binary name, its instance and a console
-/// of its own (a duplicate of the one it started with, so the program may close its own).
-#[doc(hidden)]
-pub fn start(program: &'static str) {
-    PROGRAM_LEN.store(program.len(), Ordering::Relaxed);
-    PROGRAM.store(program.as_ptr().cast_mut(), Ordering::Release);
+/// On the program's first wait or exit: its instance and a console of its own (a duplicate
+/// of the one it started with, so the program may close its own).
+fn started() -> bool {
+    match STATE.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {}
+        Err(state) => return state == 2,
+    }
     let mut id = [0u8; 8];
     let instance = match Error::from_raw(raw::random_read(&mut id)) {
         Ok(_) => u64::from_le_bytes(id),
@@ -88,22 +96,14 @@ pub fn start(program: &'static str) {
         CONSOLE.store(own, Ordering::Release);
     }
     LAST.store(now(), Ordering::Relaxed);
-}
-
-fn program() -> &'static str {
-    let ptr = PROGRAM.load(Ordering::Acquire);
-    if ptr.is_null() {
-        return "?";
-    }
-    // SAFETY: `start` stored the pointer and length of a `&'static str`.
-    let bytes = unsafe { core::slice::from_raw_parts(ptr, PROGRAM_LEN.load(Ordering::Relaxed)) };
-    core::str::from_utf8(bytes).unwrap_or("?")
+    STATE.store(2, Ordering::Release);
+    true
 }
 
 /// Prints the counters now; `false`, with nothing printed, when another thread is printing
-/// them.
+/// them or the program has not started its dumps.
 pub fn dump() -> bool {
-    if DUMPING.swap(true, Ordering::AcqRel) {
+    if STATE.load(Ordering::Acquire) != 2 || DUMPING.swap(true, Ordering::AcqRel) {
         return false;
     }
     // Cleared first, so a thread that handles something while this prints marks it again.
@@ -113,8 +113,18 @@ pub fn dump() -> bool {
         let first = (&raw const __start___llvm_prf_cnts).cast::<u64>();
         let end = &raw const __stop___llvm_prf_cnts as usize;
         let count = end.saturating_sub(first as usize) / 8;
+        let data = (&raw const __start___llvm_prf_data).cast::<u64>();
+        let data_size = (&raw const __stop___llvm_prf_data as usize).saturating_sub(data as usize);
+        // SAFETY: the data section holds whole 64-byte records when it is not empty; its first
+        // eight bytes are read only then, and it is never written.
+        let name = if data_size >= 8 {
+            unsafe { core::ptr::read_volatile(data) }
+        } else {
+            0
+        };
+        let mut print = [0u8; FINGERPRINT_MAX];
         let header = Header {
-            program: program(),
+            program: dump::fingerprint(data_size as u64, name, &mut print),
             process: start::process_name(),
             instance: INSTANCE.load(Ordering::Relaxed),
             seq: SEQ.fetch_add(1, Ordering::Relaxed),
@@ -140,6 +150,9 @@ pub fn dump() -> bool {
 /// `wait` as the program asked it, with the dumps above: the answer is the one the kernel
 /// gives for the program's own deadline.
 pub(crate) fn wait(items: &mut [WaitItem], deadline: u64) -> u64 {
+    if !started() {
+        return raw::wait_kernel(items, deadline);
+    }
     loop {
         let mut until = deadline;
         if ACTIVE.load(Ordering::Acquire) {
@@ -162,5 +175,7 @@ pub(crate) fn wait(items: &mut [WaitItem], deadline: u64) -> u64 {
 
 /// Called before the process ends.
 pub(crate) fn at_exit() {
-    dump();
+    if started() {
+        dump();
+    }
 }

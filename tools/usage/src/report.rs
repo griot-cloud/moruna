@@ -593,7 +593,7 @@ fn kernel_modules(
     modules
         .into_iter()
         .map(|(module, mut fs)| {
-            fs.sort_by(|a, b| (b.bytes, b.lines).cmp(&(a.bytes, a.lines)));
+            fs.sort_by_key(|f| std::cmp::Reverse((f.bytes, f.lines)));
             let names: Vec<&str> = fs.iter().take(3).map(|f| f.name.as_str()).collect();
             Item {
                 group: group.to_string(),

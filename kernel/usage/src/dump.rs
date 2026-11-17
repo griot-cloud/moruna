@@ -140,6 +140,22 @@ impl Line<'_> {
     }
 }
 
+/// The longest [`fingerprint`].
+pub const FINGERPRINT_MAX: usize = 33;
+
+/// Which build of which program a dump is from, without its name: the size of its
+/// `__llvm_prf_data` section and its first eight bytes (the first function's name hash), as
+/// `SIZE.FIRST` in hex. The host finds the program in the kit by the same two facts of each
+/// ELF, so the program needs no name compiled in.
+pub fn fingerprint(data_size: u64, first: u64, buf: &mut [u8; FINGERPRINT_MAX]) -> &str {
+    let mut line = Line { buf, len: 0 };
+    line.hex(data_size, 1);
+    line.push(b".");
+    line.hex(first, 16);
+    let len = line.len;
+    core::str::from_utf8(&buf[..len]).unwrap_or("?")
+}
+
 /// The next nonzero counter at or after `from`, each counter read once.
 fn next_nonzero(
     from: usize,
@@ -501,6 +517,20 @@ mod tests {
             Some(1)
         );
         assert!(reads.borrow().iter().all(|n| *n == 1));
+    }
+
+    #[test]
+    fn a_fingerprint_is_the_data_size_and_the_first_name_hash() {
+        let mut buf = [0u8; FINGERPRINT_MAX];
+        assert_eq!(
+            fingerprint(0x10a700, 0x11f6_b9b9, &mut buf),
+            "10a700.0000000011f6b9b9"
+        );
+        let mut buf = [0u8; FINGERPRINT_MAX];
+        assert_eq!(
+            fingerprint(u64::MAX, u64::MAX, &mut buf).len(),
+            FINGERPRINT_MAX
+        );
     }
 
     #[test]

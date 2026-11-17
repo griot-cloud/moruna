@@ -1113,7 +1113,7 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 
 /// Declares a process's entry: `main!(run)` runs `fn run() -> i64` and exits with
 /// what it returns.
-#[cfg(all(target_os = "none", not(feature = "usage")))]
+#[cfg(target_os = "none")]
 #[macro_export]
 #[allow_internal_unsafe]
 macro_rules! main {
@@ -1123,33 +1123,6 @@ macro_rules! main {
         #[unsafe(no_mangle)]
         pub extern "C" fn _start(start_page: u64) -> ! {
             $crate::start::init(start_page);
-            $crate::exit($run())
-        }
-    };
-}
-
-// stream U hooks, at the end of the file so that no line above moves: a panic's location is
-// in the program, and the build without the feature stays byte for byte what it was.
-// The usage build's counters dump (`usage.rs`), and its `main!`, which also names the
-// program for its dumps. Its waits and its exit are hooked in `raw.rs`.
-#[cfg(all(feature = "usage", target_os = "none"))]
-#[doc(hidden)]
-pub mod usage;
-
-#[cfg(all(target_os = "none", feature = "usage"))]
-#[macro_export]
-#[allow_internal_unsafe]
-macro_rules! main {
-    ($run:path) => {
-        // SAFETY: `_start` is the symbol the image's entry point names, and nothing
-        // else in the image defines it.
-        #[unsafe(no_mangle)]
-        pub extern "C" fn _start(start_page: u64) -> ! {
-            $crate::start::init(start_page);
-            $crate::usage::start(match option_env!("CARGO_BIN_NAME") {
-                Some(name) => name,
-                None => env!("CARGO_CRATE_NAME"),
-            });
             $crate::exit($run())
         }
     };

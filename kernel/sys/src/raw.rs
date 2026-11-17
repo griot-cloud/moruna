@@ -82,7 +82,7 @@ pub(crate) fn call1(n: u64, a: u64) -> (u64, u64) {
     // stream U hook: the usage build's last dump, before `process_exit`.
     #[cfg(all(feature = "usage", target_os = "none"))]
     if n == nr::PROCESS_EXIT {
-        crate::usage::at_exit();
+        usage::at_exit();
     }
     plain(n, [a, 0, 0, 0, 0, 0])
 }
@@ -602,10 +602,18 @@ sized!(load16, store16, u16);
 sized!(load32, store32, u32);
 sized!(load64, store64, u64);
 
-// stream U hook: `wait` in the usage build, the dumps' wait (`usage::wait`).
+// stream U hooks, at the end of the file. The usage build's counters dump (`usage.rs`), declared
+// here so that `lib.rs` does not change: any change to a file before this one moves the source
+// positions LLVM hashes into the names of a program's local symbols.
+#[cfg(all(feature = "usage", target_os = "none"))]
+#[path = "usage.rs"]
+#[doc(hidden)]
+pub mod usage;
+
+/// `wait` in the usage build, the dumps' wait (`usage::wait`).
 #[cfg(all(feature = "usage", target_os = "none"))]
 pub fn wait(items: &mut [WaitItem], deadline: u64) -> u64 {
-    crate::usage::wait(items, deadline)
+    usage::wait(items, deadline)
 }
 
 /// The `wait` call itself, as `wait` is in every other build.

@@ -161,6 +161,37 @@ impl Qmp {
     }
 }
 
+/// What `RunningNode::shutdown` calls in the usage build (`usage_hook!`): when
+/// `MORUNA_USAGE_DIR` names a directory, the node's evidence is collected into it before the
+/// node is stopped. Every outcome is said on standard error; none stops the shutdown.
+pub fn at_shutdown(runtime_dir: &Path) {
+    at_shutdown_with(
+        runtime_dir,
+        std::env::var_os("MORUNA_USAGE_DIR"),
+        Settle::default(),
+    );
+}
+
+fn at_shutdown_with(runtime_dir: &Path, out: Option<std::ffi::OsString>, wait: Settle) {
+    let Some(out) = out.filter(|o| !o.is_empty()) else {
+        return;
+    };
+    match collect(runtime_dir, Path::new(&out), wait) {
+        Ok(c) => eprintln!(
+            "moruna usage: {} bytes of kernel counters and the serial log in {} (console {} after {:.1} s)",
+            c.size,
+            c.dir.display(),
+            if c.settled {
+                "settled"
+            } else {
+                "still writing"
+            },
+            c.waited.as_secs_f64()
+        ),
+        Err(why) => eprintln!("moruna usage: not collected: {why}"),
+    }
+}
+
 /// Collects the node's usage evidence into a new directory `out`, from the node's runtime
 /// directory (`RunningNode::runtime_dir`): its `serial.log`, its `kernel.elf` and its QMP
 /// socket `qmp/qmp.sock`. Leaves the guest paused; the node's shutdown ends it.
@@ -233,7 +264,7 @@ mod tests {
         let names = b"\0__llvm_prf_cnts\0.shstrtab\0";
         let names_at = out.len() as u64;
         out.extend_from_slice(names);
-        while out.len() % 8 != 0 {
+        while !out.len().is_multiple_of(8) {
             out.push(0);
         }
         let phoff = out.len() as u64;
@@ -404,6 +435,25 @@ mod tests {
     }
 
     #[test]
+    fn the_shutdown_hook_collects_only_when_asked() {
+        let run = scratch("hook");
+        fs::write(run.join("kernel.elf"), kernel(64)).unwrap();
+        // Not asked: nothing is touched.
+        at_shutdown_with(&run, None, quick());
+        at_shutdown_with(&run, Some("".into()), quick());
+        assert!(!run.join("out").exists());
+        // Asked, with no QEMU: said, and the shutdown goes on.
+        at_shutdown_with(&run, Some(run.join("out").into()), quick());
+        assert!(run.join("out").is_dir());
+        // Asked, with QEMU.
+        let qemu = fake_qemu(&run.join("qmp/qmp.sock"), None, 0);
+        at_shutdown_with(&run, Some(run.join("kept").into()), quick());
+        qemu.join().unwrap();
+        assert!(run.join("kept/kernel.cnts").is_file());
+        let _ = fs::remove_dir_all(&run);
+    }
+
+    #[test]
     fn the_console_settles_when_it_stops_growing_or_gives_up() {
         let run = scratch("settle");
         let log = run.join("serial.log");
@@ -427,7 +477,7 @@ mod tests {
             quiet: Duration::from_secs(10),
             most: Duration::from_millis(60),
         };
-        assert_eq!(settle(&log, never).1, false);
+        assert!(!settle(&log, never).1);
         assert_eq!(Settle::default().least, Duration::from_secs(8));
         let _ = fs::remove_dir_all(&run);
     }

@@ -460,7 +460,7 @@ impl RunningNode {
             .qemu
             .get_mut()
             .map_err(|_| bad("QEMU child lock poisoned"))?;
-        let graceful = quit_qemu(qemu, &self.qmp);
+        let graceful = quit_qemu(crate::usage_hook!(qemu, &self.run.path), &self.qmp); // stream U hook
         let stopped = stop_checked(qemu);
         let backend = stop_checked(
             self.backend

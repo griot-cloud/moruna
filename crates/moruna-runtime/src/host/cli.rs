@@ -1535,29 +1535,6 @@ fn run_vm(
                 Err(why) => eprintln!("moruna run --vm: the node's logs were not kept: {why}"),
             }
         }
-        // stream U hook: the usage build keeps the node's coverage evidence in
-        // MORUNA_USAGE_DIR before the node goes (moruna_vmm::usage).
-        #[cfg(feature = "usage")]
-        if let Some(dir) = std::env::var_os("MORUNA_USAGE_DIR") {
-            match moruna_vmm::usage::collect(
-                run.runtime_dir(),
-                Path::new(&dir),
-                moruna_vmm::usage::Settle::default(),
-            ) {
-                Ok(c) => eprintln!(
-                    "moruna run --vm: usage in {} ({} bytes of kernel counters, console {} after {:.1} s)",
-                    c.dir.display(),
-                    c.size,
-                    if c.settled {
-                        "settled"
-                    } else {
-                        "still writing"
-                    },
-                    c.waited.as_secs_f64()
-                ),
-                Err(why) => eprintln!("moruna run --vm: usage not collected: {why}"),
-            }
-        }
         let stopping = std::time::Instant::now();
         let cleanup = run.shutdown();
         timing.outputs_ms = stopping.elapsed().as_millis() as u64;

@@ -197,7 +197,7 @@ fn constants(line: &str, prefix: &str) -> Vec<String> {
         if before_ok && !name.is_empty() {
             out.push(name.clone());
         }
-        rest = &tail[name.len().max(0)..];
+        rest = &tail[name.len()..];
     }
     out
 }
@@ -211,8 +211,7 @@ pub fn arms(text: &str, function: &str, prefix: &str) -> Vec<Arm> {
     };
     let original: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
-    for i in first..=last {
-        let line = lines[i];
+    for (i, line) in lines.iter().enumerate().take(last + 1).skip(first) {
         let Some(arrow) = line.find("=>") else {
             continue;
         };
