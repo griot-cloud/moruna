@@ -11,7 +11,8 @@
 //! - `src/arch/x86/cpu/hypervisor.rs`: which hypervisor the machine runs on, where the
 //!   TSC's and the APIC timer's rates come from, the guest OS ID and the hypercall MSR's
 //!   value (section 1F, "The core on Hyper-V"; work item 1.8), over recorded CPUID and MSR
-//!   answers;
+//!   answers; and the SynIC's MSR values and the two hypercalls of VMBus (section 1F,
+//!   "VMBus, split by the microkernel rule"; work item 1.9c);
 //! - `src/arch/x86/timer/pit/presence.rs`: whether a PIT answers at its ports (section 1F,
 //!   nothing from the old PC is assumed).
 //!

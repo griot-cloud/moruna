@@ -7,8 +7,10 @@
 
 pub(super) mod acpi;
 pub(super) mod apic;
-// moruna: the hypervisor at boot, and the hypercall page on Hyper-V (work item 1.8).
-pub(super) mod hyperv;
+// moruna: the hypervisor at boot, and the hypercall page on Hyper-V (work item 1.8); CPU 0's
+// SynIC and the two hypercalls of VMBus, which the core's `hyperv_*` calls reach as
+// `ostd::arch::kernel::hyperv::synic` (work item 1.9c).
+pub mod hyperv;
 pub(super) mod kvm_clock;
 pub(super) mod tsc;
 

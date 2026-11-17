@@ -100,7 +100,8 @@ pub(crate) unsafe fn late_init_on_bsp() {
     irq::ipi::init();
 
     // moruna: the hypervisor, said on the console before the clock rates are taken from it,
-    // and Hyper-V's hypercall page placed before the other CPUs start (work item 1.8).
+    // and Hyper-V's hypercall page placed before the other CPUs start (work item 1.8), then
+    // CPU 0's SynIC enabled, here on CPU 0 (work item 1.9c).
     kernel::hyperv::init_on_bsp();
     kernel::tsc::init_tsc_freq();
     timer::init_on_bsp();

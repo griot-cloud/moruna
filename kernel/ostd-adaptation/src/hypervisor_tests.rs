@@ -1,6 +1,7 @@
 //! Tests of `cpu/hypervisor.rs` and `timer/pit/presence.rs` (work item 1.8): the
 //! hypervisor found and the clock rates taken, over CPUID and MSR answers recorded for
-//! each kind of machine, and the PIT's presence over counts read from its ports.
+//! each kind of machine, and the PIT's presence over counts read from its ports; and the
+//! SynIC's values and the two hypercalls of VMBus (work item 1.9c).
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -8,8 +9,12 @@ use std::collections::BTreeMap;
 use moruna_abi::boot_line::{CORE, Fatal, HYPERV, Hypervisor as Line, KVM, OTHER};
 
 use super::hypervisor::{
-    APIC_TIMER_DIVIDE, Cpu, GUEST_OS_ID, HYPERV_LINE, Hypervisor, KVM_LINE, OTHER_LINE, TscSource,
-    apic_timer_count, hypercall_msr, hypercall_msrs, hypervisor, tsc_rate,
+    APIC_TIMER_DIVIDE, Cpu, EVENT_FLAGS, EVENT_FLAGS_SIZE, GUEST_OS_ID, HYPERV_LINE, Hypervisor,
+    KVM_LINE, MESSAGE_FLAGS, MESSAGE_SLOT, MESSAGE_TYPE, OTHER_LINE, POST_MESSAGE,
+    POST_MESSAGE_SIZE, SIGNAL_EVENT, TscSource, VMBUS_SINT, VMBUS_SINT_MSR, apic_timer_count,
+    hypercall_msr, hypercall_msrs, hypercall_status, hypervisor, message_pending, message_present,
+    post_message_input, scontrol_msr, signal_event_input, sint_msr, synic_msrs, synic_page_msr,
+    tsc_rate,
 };
 use super::pit_presence::{NO_PIT_FOR_APIC_TIMER, NO_PIT_FOR_TSC, READS, counts};
 
@@ -383,6 +388,115 @@ fn the_hypercall_msr_takes_the_page_and_the_enable_bit_and_keeps_its_reserved_bi
     assert_eq!(hypercall_msr(0b10, 0x0012_3000), None);
     assert_eq!(hypercall_msr(0xabcd_e003, 0x0012_3000), None);
     assert_eq!(hypercall_msr(0, 0x0012_3008), None);
+}
+
+// Work item 1.9c: the SynIC on CPU 0 and the two hypercalls of VMBus.
+
+#[test]
+fn the_synic_needs_hyper_v_and_its_four_privileges() {
+    let cpu = azure(hyperv_features(true, true, true));
+    assert!(synic_msrs(&cpu));
+    assert!(cpu.read.borrow().is_empty(), "no MSR is read to decide");
+    // Each privilege taken away in turn: AccessHypercallMsrs (EAX bit 5), AccessSynicRegs
+    // (EAX bit 2), PostMessages and SignalEvents (EBX bits 4 and 5).
+    for (register, bit) in [(0, 5), (0, 2), (1, 4), (1, 5)] {
+        let mut features = hyperv_features(true, true, true);
+        features[register] &= !(1 << bit);
+        assert!(!synic_msrs(&azure(features)), "{register} {bit}");
+    }
+    assert!(!synic_msrs(&kvm()));
+}
+
+#[test]
+fn the_synic_pages_take_their_frame_and_the_enable_bit_and_keep_reserved_bits() {
+    assert_eq!(synic_page_msr(0, 0x0012_3000), Some(0x0012_3001));
+    // Bits 11:1 are kept as read; a page firmware left enabled is moved.
+    assert_eq!(synic_page_msr(0xffe, 0x0012_3000), Some(0x0012_3fff));
+    assert_eq!(synic_page_msr(0xabcd_e001, 0x0004_5000), Some(0x0004_5001));
+    assert_eq!(
+        synic_page_msr(0, 0xffff_ffff_ffff_f000),
+        Some(0xffff_ffff_ffff_f001)
+    );
+    assert_eq!(synic_page_msr(0, 0x0012_3008), None);
+}
+
+#[test]
+fn sint_2_is_unmasked_at_its_vector_with_the_apics_eoi() {
+    assert_eq!(VMBUS_SINT, 2);
+    assert_eq!(VMBUS_SINT_MSR, 0x4000_0092);
+    // Masked, as the SINTs are at reset.
+    assert_eq!(sint_msr(1 << 16, 0x30), 0x30);
+    // Auto-EOI and polling cleared; the reserved bits 15:8 and 63:21 and the proxy bit kept.
+    let current = (1 << 63) | (1 << 20) | (1 << 18) | (1 << 17) | (1 << 16) | 0xab00 | 0x41;
+    assert_eq!(sint_msr(current, 0xfe), (1 << 63) | (1 << 20) | 0xabfe);
+}
+
+#[test]
+fn scontrol_enables_and_keeps_its_reserved_bits() {
+    assert_eq!(scontrol_msr(0), 1);
+    assert_eq!(scontrol_msr(0xf0), 0xf1);
+    assert_eq!(scontrol_msr(1), 1);
+}
+
+#[test]
+fn the_two_hypercalls_are_post_message_slow_and_signal_event_fast() {
+    // Call codes 0x5c and 0x5d (TLFS appendix A); the fast bit is bit 16.
+    assert_eq!(POST_MESSAGE, 0x5c);
+    assert_eq!(SIGNAL_EVENT, 0x1_005d);
+    // The connection ID in bits 31:0, the flag number in bits 47:32.
+    assert_eq!(signal_event_input(0x0002_0001, 7), 0x0007_0002_0001);
+    assert_eq!(signal_event_input(u32::MAX, u16::MAX), 0xffff_ffff_ffff);
+    // A status in RAX's low 16 bits; the rest is the reps completed.
+    assert_eq!(hypercall_status(0), 0);
+    assert_eq!(hypercall_status(0x0000_0fff_0000_0013), 0x13);
+    assert_eq!(u64::from(hypercall_status(0x13)), moruna_abi::hyperv::BUSY);
+}
+
+#[test]
+fn a_posted_message_is_laid_out_as_hvcallpostmessage_takes_it() {
+    let payload: Vec<u8> = (1..=240).collect();
+    let input = post_message_input(0x0002_0001, 1, &payload).unwrap();
+    assert_eq!(POST_MESSAGE_SIZE, 256);
+    assert_eq!(input[0..4], 0x0002_0001u32.to_le_bytes());
+    assert_eq!(input[4..8], [0; 4], "padding");
+    assert_eq!(input[8..12], 1u32.to_le_bytes());
+    assert_eq!(input[12..16], 240u32.to_le_bytes());
+    assert_eq!(input[16..], payload[..]);
+    let short = post_message_input(4, 1, &[9, 8, 7]).unwrap();
+    assert_eq!(short[12..20], [3, 0, 0, 0, 9, 8, 7, 0]);
+    assert!(short[20..].iter().all(|b| *b == 0));
+    assert!(post_message_input(4, 1, &[]).is_some());
+    // The rule of item 1.9c: at most 240 bytes.
+    assert_eq!(post_message_input(4, 1, &[0; 241]), None);
+    assert_eq!(
+        moruna_abi::hyperv::PAYLOAD_MAX,
+        POST_MESSAGE_SIZE - 16,
+        "the ABI's limit is the hypercall's"
+    );
+}
+
+#[test]
+fn sint_2s_slot_and_flags_are_where_the_abi_says() {
+    assert_eq!(u32::from(VMBUS_SINT), moruna_abi::hyperv::SINT);
+    assert_eq!(MESSAGE_SLOT, 512);
+    assert_eq!(MESSAGE_TYPE, 0);
+    assert_eq!(MESSAGE_FLAGS, 5);
+    assert_eq!(EVENT_FLAGS_SIZE, 256);
+    assert_eq!(EVENT_FLAGS, moruna_abi::hyperv::EVENT_FLAGS_OFFSET);
+    assert_eq!(
+        EVENT_FLAGS_SIZE * 8,
+        moruna_abi::hyperv::EVENT_FLAGS as usize
+    );
+    assert_eq!(moruna_abi::hyperv::MESSAGE_SIZE, 256);
+    // An empty slot's type is zero; VMBus's messages are type 1.
+    assert!(!message_present(0));
+    assert!(message_present(1));
+    assert!(message_present(0x8000_0000));
+    // Only bit 0 of the flags is MessagePending.
+    assert!(message_pending(1));
+    assert!(message_pending(0xff));
+    assert!(!message_pending(0));
+    assert!(!message_pending(0xfe));
 }
 
 #[test]

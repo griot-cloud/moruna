@@ -89,24 +89,43 @@ It also adds what the core needs on Hyper-V (`architecture/moruna-os-system.md`,
   `HV_X64_MSR_GUEST_OS_ID` (open source, OS type undefined: `0x8000000000000000`), then
   places the hypercall page on a zeroed frame of its own, mapped read and execute in kernel
   mode only in a kernel virtual area, by `HV_X64_MSR_HYPERCALL` with its reserved bits
-  kept. The mapping and the frame are kept for as long as the machine runs; nothing calls
-  the page yet (item 1.9c). A locked hypercall MSR, or a page that does not enable, is
-  logged and the boot goes on. As Linux does, the ID is always written and a page firmware
-  left enabled is always moved, where the TLFS would keep both: firmware's page lies in
-  memory the OS reclaims, so keeping it would be unsafe.
+  kept. The mapping and the frame are kept for as long as the machine runs. A locked
+  hypercall MSR, or a page that does not enable, is logged and the boot goes on. As Linux
+  does, the ID is always written and a page firmware left enabled is always moved, where
+  the TLFS would keep both: firmware's page lies in memory the OS reclaims, so keeping it
+  would be unsafe.
+- **CPU 0's SynIC and the two hypercalls of VMBus** (`src/arch/x86/kernel/hyperv.rs`; work
+  item 1.9c, section 1F, "VMBus, split by the microkernel rule"), on Hyper-V once the
+  hypercall page is in place and when the partition may use the SynIC MSRs, post messages
+  and signal events (leaf `0x40000003` EAX bits 5 and 2, EBX bits 4 and 5). On the boot
+  processor, CPU 0, before the other CPUs start, it places the message page (SIMP) and
+  the event-flags page (SIEFP) on two zeroed frames of its own, sets SINT 2 unmasked at
+  the vector of an IRQ line it allocates (no auto-EOI: the local APIC's EOI, as every IRQ
+  line has), and enables the SynIC, each MSR's reserved bits kept; no other SINT is
+  touched, and no other CPU's SynIC. `kernel::hyperv::synic` is then public, for the
+  core's `hyperv_*` calls (ABI 2.7): `HvCallPostMessage` from a third frame of its own,
+  `HvCallSignalEvent` as a fast call, SINT 2's message copied out of its slot with the slot
+  emptied and `HV_X64_MSR_EOM` written on CPU 0 (by an inter-processor call from any other
+  CPU) when another message waits, the event-flags frame, and a clone of the IRQ line.
+  Hypercalls go through the hypercall page in inline assembly (`call` with the control
+  value in RCX, the input in RDX and R8, the status in RAX), which `hypercall_page` no
+  longer leaves unused. Anything that stops the SynIC is logged, and the boot goes on
+  without VMBus. The module is now `pub` in `src/arch/x86/kernel/mod.rs`; its boot items
+  stay private to `arch`.
 
 Every Hyper-V constant is the vendored `hvdef`'s (`../vendor/openvmm/hvdef`, MIT), which
 OSTD now depends on for the x86 kernel target. What is decided rather than done is in two
 more added files that name nothing of OSTD: `src/arch/x86/cpu/hypervisor.rs` (the
 hypervisor, the clock rates, the guest OS ID and the hypercall MSR's value, read through a
-trait for the CPU) and `src/arch/x86/timer/pit/presence.rs` (the PIT's presence from its
+trait for the CPU; and the SynIC's MSR values, the two hypercalls' control values and
+inputs, a status, and where SINT 2's message slot, its flags and its event flags lie) and `src/arch/x86/timer/pit/presence.rs` (the PIT's presence from its
 counts, and the two lines).
 
 This directory is also the crate `moruna-ostd-adaptation`, which compiles those four
 added files for the host and tests them (`cargo test -p moruna-ostd-adaptation`): the
 hypervisor and its clock rates over CPUID and MSR answers recorded for KVM, Hyper-V with
 and without the frequency MSRs, bare metal with leaf 0x15, and a machine with nothing at
-all. They carry `SPDX-License-Identifier: MPL-2.0`, as the files beside them do.
+all; and the SynIC's values against the TLFS's layouts and the ABI's (`moruna_abi::hyperv`). They carry `SPDX-License-Identifier: MPL-2.0`, as the files beside them do.
 
 Three of its comments lose their em dashes (`src/log/logger.rs`, `src/log/macros.rs`,
 `src/task/scheduler/mod.rs`), which the repository's quality check refuses in every
@@ -114,5 +133,6 @@ tracked file; their code is unchanged.
 
 `upstream-files.json` records every file of the unmodified crate. `provenance.json`
 records the archive's checksum, the changed files' checksums and the added files'. The
-one dependency added is `hvdef`; the one frame allocation and kernel mapping added are
-the hypercall page's, on Hyper-V. No metadata changes.
+one dependency added is `hvdef`. On Hyper-V the frames allocated are the hypercall page's,
+the SynIC's two pages and the post input page, and the one kernel mapping added is the
+hypercall page's; one IRQ line is allocated for SINT 2. No metadata changes.

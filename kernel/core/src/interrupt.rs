@@ -3,7 +3,8 @@
 //!
 //! A line is either a global system interrupt routed through the I/O APIC to an OSTD
 //! IRQ line, or an OSTD IRQ line with no pin at all, which a device raises by writing
-//! a message (MSI or MSI-X) the kernel returns with the object. When it fires, the
+//! a message (MSI or MSI-X) the kernel returns with the object, or Hyper-V raises
+//! through SINT 2 of CPU 0's SynIC (ABI 2.7). When it fires, the
 //! object raises `SIGNALED`; the driver waits on it, services its device, and
 //! acknowledges with `interrupt_ack`, which clears the signal.
 
@@ -62,8 +63,18 @@ const MSI_DESTINATION: u32 = 0;
 /// What an interrupt object holds for as long as it lives; dropping it unroutes the
 /// line and frees the slot.
 enum Line {
-    Gsi { _mapped: MappedIrqLine },
-    Msi { _line: IrqLine, _slot: MsiSlot },
+    Gsi {
+        _mapped: MappedIrqLine,
+    },
+    Msi {
+        _line: IrqLine,
+        _slot: MsiSlot,
+    },
+    /// SINT 2 of CPU 0's SynIC (ABI 2.7, `hyperv_interrupt`): OSTD holds the line, and
+    /// this object holds its callback, which goes when the object does.
+    Sint {
+        _line: IrqLine,
+    },
 }
 
 pub struct Interrupt {
@@ -79,9 +90,14 @@ const _: () = assert!(
 
 fn line_raising(signaller: &Arc<Signaller>) -> Result<IrqLine, Error> {
     let mut line = IrqLine::alloc().map_err(|_| Error::Limit)?;
+    raise_on(&mut line, signaller);
+    Ok(line)
+}
+
+/// Has `line` raise `SIGNALED` on `signaller` each time it fires.
+fn raise_on(line: &mut IrqLine, signaller: &Arc<Signaller>) {
     let raised = signaller.clone();
     line.on_active(move |_| raised.update(Signals::NONE, Signals::SIGNALED));
-    Ok(line)
 }
 
 impl Interrupt {
@@ -145,6 +161,19 @@ impl Interrupt {
             address,
             data,
         ))
+    }
+
+    /// An interrupt raised by SINT 2 of CPU 0's SynIC, which OSTD delivers at `line`
+    /// (`hyperv_interrupt`, ABI 2.7): each message or event flag Hyper-V gives the SINT.
+    pub fn sint(mut line: IrqLine, account: &Arc<Account>) -> Result<Interrupt, Error> {
+        let charge = Charge::new(account, charge::OBJECT)?;
+        let signaller = Arc::new(Signaller::new(Signals::NONE));
+        raise_on(&mut line, &signaller);
+        Ok(Interrupt {
+            signaller,
+            _line: Line::Sint { _line: line },
+            _charge: charge,
+        })
     }
 
     pub fn ack(&self) {

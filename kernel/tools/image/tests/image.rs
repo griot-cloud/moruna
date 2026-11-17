@@ -4,7 +4,7 @@
 
 use std::{fs, path::PathBuf, process::Command};
 
-use moruna_abi::{Rights, manifest::Manifest};
+use moruna_abi::{ABI_MAJOR, ABI_MINOR, Rights, manifest::Manifest};
 use moruna_image::{DescSource, Description, archive, build};
 use moruna_loader::cpio;
 
@@ -104,9 +104,10 @@ fn sv_t9_a_description_renders_the_manifest_the_kernel_parses() {
     assert!(text.contains("handle channel:ping.peer.1 peer rights=read,write,wait"));
     let expect = d.expectations();
     assert_eq!(expect[0], "kk: 1 CPUs online");
-    assert!(expect.contains(
-        &"kk: moruna microkernel, abi 2.5: started 3 processes from the manifest".to_string()
-    ));
+    // The ABI's own version, which the core says at boot: a bump of the ABI moves it.
+    assert!(expect.contains(&format!(
+        "kk: moruna microkernel, abi {ABI_MAJOR}.{ABI_MINOR}: started 3 processes from the manifest"
+    )));
     assert!(expect.contains(&"kk: process supervisor exited with code 0 (".to_string()));
     assert!(expect.contains(&"kk: process pong faulted: page fault at 0x0 on read".to_string()));
     assert!(expect.contains(&"supervisor: ok".to_string()));

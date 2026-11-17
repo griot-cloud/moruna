@@ -41,6 +41,7 @@ use ostd::{
 use crate::{
     account::Account,
     channel::{self, Endpoint},
+    hyperv,
     memory::MemoryObject,
     object::{Console, Handle, Object, Resource},
     process::{self, Process},
@@ -232,6 +233,10 @@ fn start_manifest(machine: &Arc<Account>) -> Result<usize, String> {
                 Source::RootInterrupt => root(ResourceKind::Interrupt)?,
                 Source::RootMsi => root(ResourceKind::Msi)?,
                 Source::RootDma => root(ResourceKind::Dma)?,
+                // Made only where OSTD enabled CPU 0's SynIC; elsewhere the slot is left
+                // out, and the supervisor starts no service that needs it (ABI 2.7).
+                Source::RootHyperv if hyperv::available() => root(ResourceKind::Hyperv)?,
+                Source::RootHyperv => continue,
                 Source::RootEcam => Object::Resource(Arc::new(
                     Resource::new(
                         ResourceKind::DeviceMemory,

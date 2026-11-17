@@ -9,12 +9,19 @@
 //! hypervisor-present bit and the interface signature, are written here with the place
 //! Microsoft's Hypervisor Top Level Functional Specification (TLFS) defines them.
 
+use core::mem::offset_of;
+
 use hvdef::{
     HV_CPUID_FUNCTION_HV_INTERFACE, HV_CPUID_FUNCTION_HV_VENDOR_AND_MAX_FUNCTION,
     HV_CPUID_FUNCTION_MS_HV_FEATURES, HV_CPUID_FUNCTION_MS_HV_IMPLEMENTATION_LIMITS,
-    HV_CPUID_FUNCTION_VERSION_AND_FEATURES, HV_PAGE_SHIFT, HV_X64_MSR_APIC_FREQUENCY,
-    HV_X64_MSR_TSC_FREQUENCY, HvFeatures,
-    hypercall::{HvGuestOsOpenSource, HvGuestOsOpenSourceType, MsrHypercallContents},
+    HV_CPUID_FUNCTION_VERSION_AND_FEATURES, HV_MESSAGE_PAYLOAD_SIZE, HV_MESSAGE_SIZE,
+    HV_PAGE_SHIFT, HV_PAGE_SIZE, HV_X64_MSR_APIC_FREQUENCY, HV_X64_MSR_SINT0,
+    HV_X64_MSR_TSC_FREQUENCY, HvFeatures, HvMessageFlags, HvMessageHeader, HvMessageType,
+    HvSynicScontrol, HvSynicSimpSiefp, HvSynicSint, HypercallCode, NUM_SINTS,
+    hypercall::{
+        Control, HvGuestOsOpenSource, HvGuestOsOpenSourceType, HypercallOutput,
+        MsrHypercallContents, PostMessage, SignalEvent,
+    },
 };
 
 /// What this file reads of the CPU.
@@ -242,3 +249,138 @@ pub(crate) fn hypercall_msr(current: u64, page: u64) -> Option<u64> {
         .ok()
         .map(MsrHypercallContents::into_bits)
 }
+
+// The SynIC and the two hypercalls of VMBus (Moruna's system design, section 1F, "VMBus,
+// split by the microkernel rule"; work item 1.9c). `kernel/hyperv.rs` writes the MSRs and
+// makes the calls with the values these give.
+
+/// The synthetic interrupt source VMBus uses (`vmbus_core::VMBUS_SINT`), the one SINT the
+/// core enables, on CPU 0 only.
+pub(crate) const VMBUS_SINT: u8 = 2;
+
+/// Its MSR: `HV_X64_MSR_SINT0` and the SINT's number (TLFS, "SINTx Registers").
+pub(crate) const VMBUS_SINT_MSR: u32 = HV_X64_MSR_SINT0 + VMBUS_SINT as u32;
+
+/// Whether the core may use the SynIC for VMBus: Hyper-V, and the partition holds
+/// `AccessHypercallMsrs` and `AccessSynicRegs` (leaf `0x40000003` EAX bits 5 and 2),
+/// `PostMessages` and `SignalEvents` (EBX bits 4 and 5), the two hypercalls VMBus makes.
+pub(crate) fn synic_msrs(cpu: &impl Cpu) -> bool {
+    hyperv_features(cpu).is_some_and(|features| {
+        let privileges = features.privileges();
+        privileges.access_hypercall_msrs()
+            && privileges.access_synic_msrs()
+            && privileges.post_messages()
+            && privileges.signal_events()
+    })
+}
+
+/// The value to write to `HV_X64_MSR_SIMP` or `HV_X64_MSR_SIEFP` to place the message
+/// page or the event-flags page at the guest physical address `page` and enable it, from
+/// the MSR's `current` value, its reserved bits kept (TLFS, "SIMP Register", "SIEFP
+/// Register"). `None` when `page` is not a page address the MSR can hold.
+pub(crate) fn synic_page_msr(current: u64, page: u64) -> Option<u64> {
+    if page & ((1 << HV_PAGE_SHIFT) - 1) != 0 {
+        return None;
+    }
+    HvSynicSimpSiefp::from_bits(current)
+        .with_enabled(true)
+        .with_base_gpn_checked(page >> HV_PAGE_SHIFT)
+        .ok()
+        .map(HvSynicSimpSiefp::into_bits)
+}
+
+/// The value to write to SINT 2's MSR from its `current` value: delivered at `vector`,
+/// unmasked, not polled, and acknowledged at the local APIC as every other interrupt is
+/// (no auto-EOI); its reserved bits kept (TLFS, "SINTx Registers").
+pub(crate) fn sint_msr(current: u64, vector: u8) -> u64 {
+    HvSynicSint::from_bits(current)
+        .with_vector(vector)
+        .with_masked(false)
+        .with_auto_eoi(false)
+        .with_polling(false)
+        .into_bits()
+}
+
+/// The value to write to `HV_X64_MSR_SCONTROL` from its `current` value: the SynIC
+/// enabled, its reserved bits kept (TLFS, "SCONTROL Register").
+pub(crate) fn scontrol_msr(current: u64) -> u64 {
+    HvSynicScontrol::from_bits(current)
+        .with_enabled(true)
+        .into_bits()
+}
+
+/// `HvCallPostMessage`'s input value: a slow call, its input one page in memory.
+pub(crate) const POST_MESSAGE: u64 = Control::new()
+    .with_code(HypercallCode::HvCallPostMessage.0)
+    .into_bits();
+
+/// `HvCallSignalEvent`'s input value: a fast call, its input in a register.
+pub(crate) const SIGNAL_EVENT: u64 = Control::new()
+    .with_code(HypercallCode::HvCallSignalEvent.0)
+    .with_fast(true)
+    .into_bits();
+
+/// The bytes of `HvCallPostMessage`'s input.
+pub(crate) const POST_MESSAGE_SIZE: usize = size_of::<PostMessage>();
+
+/// `HvCallPostMessage`'s input, as it lies in its page: the connection ID, the message
+/// type, the payload's size and the payload, the rest zero. `None` for a payload over
+/// the 240 bytes a message carries.
+pub(crate) fn post_message_input(
+    connection_id: u32,
+    message_type: u32,
+    payload: &[u8],
+) -> Option<[u8; POST_MESSAGE_SIZE]> {
+    if payload.len() > HV_MESSAGE_PAYLOAD_SIZE {
+        return None;
+    }
+    let mut input = [0; POST_MESSAGE_SIZE];
+    let mut put = |at: usize, value: u32| input[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    put(offset_of!(PostMessage, connection_id), connection_id);
+    put(offset_of!(PostMessage, message_type), message_type);
+    put(offset_of!(PostMessage, payload_size), payload.len() as u32);
+    let at = offset_of!(PostMessage, payload);
+    input[at..at + payload.len()].copy_from_slice(payload);
+    Some(input)
+}
+
+/// `HvCallSignalEvent`'s input as the fast call passes it, in one register: the
+/// connection ID, and the event flag above it.
+pub(crate) fn signal_event_input(connection_id: u32, flag: u16) -> u64 {
+    const _: () = assert!(size_of::<SignalEvent>() == 8);
+    (u64::from(connection_id) << (8 * offset_of!(SignalEvent, connection_id)))
+        | (u64::from(flag) << (8 * offset_of!(SignalEvent, flag_number)))
+}
+
+/// A hypercall's status, from the result value it returns in RAX.
+pub(crate) fn hypercall_status(result: u64) -> u16 {
+    HypercallOutput::from_bits(result).call_status().0
+}
+
+/// Where SINT 2's message slot lies in the message page: a slot of 256 bytes a SINT.
+pub(crate) const MESSAGE_SLOT: usize = VMBUS_SINT as usize * HV_MESSAGE_SIZE;
+
+/// Where a message's type lies in its slot.
+pub(crate) const MESSAGE_TYPE: usize = offset_of!(HvMessageHeader, typ);
+
+/// Where a message's flags lie in its slot.
+pub(crate) const MESSAGE_FLAGS: usize = offset_of!(HvMessageHeader, flags);
+
+/// Whether a slot whose type is `typ` holds a message: an empty slot's is
+/// `HvMessageTypeNone`.
+pub(crate) fn message_present(typ: u32) -> bool {
+    typ != HvMessageType::HvMessageTypeNone.0
+}
+
+/// Whether a message's `flags` say another waits behind it, so that once its slot is
+/// empty the guest writes `HV_X64_MSR_EOM` for the hypervisor to deliver the next (TLFS,
+/// "SynIC Message Flags").
+pub(crate) fn message_pending(flags: u8) -> bool {
+    HvMessageFlags::from_bits(flags).message_pending()
+}
+
+/// The bytes of one SINT's event flags: the page holds every SINT's, in order.
+pub(crate) const EVENT_FLAGS_SIZE: usize = HV_PAGE_SIZE as usize / NUM_SINTS;
+
+/// Where SINT 2's event flags lie in the event-flags page.
+pub(crate) const EVENT_FLAGS: usize = VMBUS_SINT as usize * EVENT_FLAGS_SIZE;

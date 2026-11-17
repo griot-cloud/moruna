@@ -2,11 +2,11 @@
   "added_files": [
     {
       "path": "src/arch/x86/cpu/hypervisor.rs",
-      "sha256": "62c4e390a8a981092b676763f2baf8fcee8b01d8f89b89702df9249b213e9d2c"
+      "sha256": "c3945554706dead0a602ebac60009e5497251ebf623c43fa84ddc05e5ad507bd"
     },
     {
       "path": "src/arch/x86/kernel/hyperv.rs",
-      "sha256": "45b3f5dd75cc08cd48102291dec3e51faebe17483d200c51429f91ff6bb5c0e1"
+      "sha256": "8a41e94bef45ae58e85c21497136895552faed1ea178cbd494fa6da22d538d04"
     },
     {
       "path": "src/arch/x86/kernel/tsc/boot_wait.rs",
@@ -46,7 +46,7 @@
       "upstream_sha256": "dc0fa48d1d848e0ee26e6e561af82dd40ca74e8c0f976f5e70c69cd01e805e45"
     },
     "src/arch/x86/kernel/mod.rs": {
-      "patched_sha256": "b45f9b427b06864fc17c133c71caef4e4a9ae4e4087057b3cc4201a399127a1c",
+      "patched_sha256": "3e153eea479cb72b55c8bdc903945499731a53a1d9cf4e2b7388fbd6b442e8e1",
       "upstream_sha256": "e01579a3256bbb7a3a620fdcdc63a45c80e1349b4579e10a025726c9d4d570fa"
     },
     "src/arch/x86/kernel/tsc.rs": {
@@ -54,7 +54,7 @@
       "upstream_sha256": "b8232083c633be0fec1ac54216e2cb5d54595d10876847741a6331c265783550"
     },
     "src/arch/x86/mod.rs": {
-      "patched_sha256": "4714777f20587779e2f104ba6c3f46cf1c73a68553560ebad5584743305c2f87",
+      "patched_sha256": "b18152dc07dd6b952a5d62f19ff114639570f2e35e8ece8e05a1e9c154c365dd",
       "upstream_sha256": "660b5a76184cb63f9e92b170104e6b77bbea79a3bfc428cac47e6845c1d26af3"
     },
     "src/arch/x86/power.rs": {
