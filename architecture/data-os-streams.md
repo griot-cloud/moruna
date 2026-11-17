@@ -795,3 +795,10 @@ and switches to the new one when the call answers.
     planned row was 21.5 and none would have booted. Rows are now Score 19 + 2, Enrich 17 + 4,
     Audit 19 + 2, Occupancy 20 + 1. node-for-job.py's check assumed 256 MiB for the kernel;
     its fix, and a launch error that names the real cause, are E's (in D's files).
+- **2026-11-17: P's race fix confirmed under KVM** (`be78ad45`). Before it, one-month Enrich
+  failed at morsel 20 at budgets 8 and 17 ("it said a batch was done without a record for
+  it"; every task had 2 deferred and more batches than records). After it, 9 of 9 repeats
+  completed (Enrich at 8 and 17, Score at 8). Enrich at 17.5 + 4 GiB is now refused before
+  launch ("needs at least 24.50 GiB"). One-month job_s: Enrich 15.6 s at 8, Score 10.2 s at 8
+  and 7.4 s at 2 (about 950k rows/s), with first rows at 2.0 to 4.2 s. The steady state, at
+  0.5 to 0.95M rows/s, is the next limit, and a larger budget runs slower (P).
