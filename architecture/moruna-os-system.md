@@ -262,8 +262,14 @@ if it does, this section changes first.
   | a signal handle | Makes a handle that can signal one connection ID and nothing else, to give to that channel's driver |
   | signal | `HvSignalEvent`, through a signal handle |
 
-  - The SynIC is enabled on CPU 0 only, and every channel targets it.
+  - The SynIC is enabled on CPU 0 only, and every channel targets it, by the VP index read from
+    `HV_X64_MSR_VP_INDEX` on CPU 0, never assumed to be 0.
   - A GPADL's guest page numbers come from the DMA grant a driver already uses to pin memory.
+  - **DMA on Hyper-V:** `vmbus`, `storvsc` and `netvsc` each get a whole copy of `root.dma`.
+    With no IOMMU, a process that can write a VMBus ring can already name any guest page to the
+    host, so a ring holder is trusted with all guest memory and the grant adds nothing. The
+    narrowing is by process: only VMBus processes get it, and only on Hyper-V. With an IOMMU, page
+    numbers become I/O addresses and this rule is revisited.
   - Added kernel-mode lines and calls are counted in `data-os.md` section 0.
 - **In the `vmbus` process:** `moruna-vmbus` wired to those calls. It serves drivers a small
   protocol, `moruna.driver.vmbus`: list the offers of an interface, open a channel, share memory
