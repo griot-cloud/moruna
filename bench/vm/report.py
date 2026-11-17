@@ -38,8 +38,47 @@ def load(results_dir):
         except ValueError:
             continue
         if isinstance(rec, dict) and isinstance(rec.get("spec"), dict):
+            if rec["spec"].get("engine", "").startswith("moruna-vm") and "first_rows_s" not in rec:
+                rec["first_rows_s"] = first_rows(os.path.join(results_dir, rec["spec"]["id"] + ".stdout"))
             out.append(rec)
     return out
+
+
+def first_rows(stdout_path):
+    """When a 0.7 run's first rows reached its sink, in seconds from the engine's start: the
+    sink's task starting to write (its event's t_us), else the first heartbeat with rows out (to
+    about a second). The engine's start-up is the time before it: the arena, the planes, the
+    first morsel."""
+    beat = None
+    try:
+        lines = open(stdout_path, errors="replace")
+    except OSError:
+        return None
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("type") == "event" and e.get("kind") == "task_started" and e.get("task") == "sink":
+            return e["t_us"] / 1e6
+        if beat is None and e.get("type") == "heartbeat" and (e.get("rows_out") or 0) > 0:
+            beat = e["t_ms"] / 1e3
+    return beat
+
+
+def phases(rec):
+    """A 0.7 run's wall in three (Brackly, 2026-11-17): the VM's start-up (the node built, the
+    inputs staged, QEMU launched, the boot: all before the engine's job begins), the engine's
+    start-up (before its first rows), and the operational time (the first rows to the output
+    written, the outputs read off the output disk included). The bar is judged on the last."""
+    vm = rec.get("vm") or {}
+    job, outputs = vm.get("job_s"), vm.get("outputs_s") or 0
+    if job is None:
+        return None, None, None
+    vm_start = rec["wall_s"] - job - outputs
+    engine_start = rec.get("first_rows_s")
+    operational = job + outputs - (engine_start or 0)
+    return vm_start, engine_start, operational
 
 
 def med(xs):
@@ -86,11 +125,10 @@ def rows_for(recs, machine, workload):
                              "rust" if e in ("moruna-vm", "rust-baseline", "moruna066-rust") else "python"),
             "runs": len(runs), "ok": len(ok),
             "wall_s": med([r["wall_s"] for r in ok]),
-            # 0.7's wall without the VM's launch and boot, for the bar taken either way (Brackly
-            # chooses the column).
-            "wall_noboot_s": med([r["wall_s"] - ((r.get("vm") or {}).get("launch_s") or 0)
-                                  - ((r.get("vm") or {}).get("boot_s") or 0) for r in ok])
-            if e.startswith("moruna-vm") else None,
+            # 0.7's wall in three (phases): the bar is judged on the operational time.
+            "vm_start_s": med([phases(r)[0] for r in ok]) if e.startswith("moruna-vm") else None,
+            "engine_start_s": med([phases(r)[1] for r in ok]) if e.startswith("moruna-vm") else None,
+            "operational_s": med([phases(r)[2] for r in ok]) if e.startswith("moruna-vm") else None,
             "cpu_s": med([r["cpu_s"] for r in ok]),
             "peak_gib": med([r["cg_peak_bytes"] / (1 << 30) for r in ok]),
             "oom": sum(r.get("oom_kills", 0) for r in runs),
@@ -117,23 +155,23 @@ def speedups(table):
     if not vm or vm["wall_s"] is None:
         return ["0.7 (moruna-vm) has no measured run."]
     others = {e: r for e, r in table.items() if not e.startswith("moruna-vm") and r["wall_s"]}
-    noboot = vm.get("wall_noboot_s")
+    operational = vm.get("operational_s")
     lines = []
     for group, name in ((2, "the plain Rust pool"), (5, "native expressions"), (3, "0.6.6"),
                         (4, "the Python engines")):
         rows = [(r["wall_s"], e) for e, r in others.items() if r["group"] == group]
         if rows:
             w, e = min(rows)
-            without = f"; {w / noboot:.2f}x without launch and boot" if noboot else ""
-            lines.append(f"- against {name} (best: {e}, {w:.1f} s): {w / vm['wall_s']:.2f}x{without}")
+            ops = f"{w / operational:.2f}x on operational time; " if operational else ""
+            lines.append(f"- against {name} (best: {e}, {w:.1f} s): {ops}{w / vm['wall_s']:.2f}x with start-up")
     if not others:
         return lines
     best_wall, best = min((r["wall_s"], e) for e, r in others.items())
     least_cpu, cheapest = min((r["cpu_s"], e) for e, r in others.items() if r["cpu_s"] is not None)
     cpu_ok = vm["cpu_s"] is not None and vm["cpu_s"] <= least_cpu
     passed = True
-    for label, wall in (("with launch and boot in the wall", vm["wall_s"]),
-                        ("without launch and boot", noboot)):
+    for label, wall in (("on operational time (the bar)", operational),
+                        ("with start-up (the total)", vm["wall_s"])):
         if not wall:
             continue
         x = best_wall / wall
@@ -146,7 +184,8 @@ def speedups(table):
         s, v = vm["split"], vm.get("vm") or {}
         parts = {"read and decode": s.get("read_decode_s"), "the function": s.get("function_s"),
                  "encode and write": s.get("encode_write_s"), "waits": s.get("wait_s"),
-                 "boot": v.get("boot_s"), "staging": v.get("stage_s"), "outputs": v.get("outputs_s")}
+                 "the VM's start-up": vm.get("vm_start_s"), "the engine's start-up": vm.get("engine_start_s"),
+                 "outputs": v.get("outputs_s")}
         known = {k: x for k, x in parts.items() if x}
         job = v.get("job_s")
         where = ", ".join(f"{k} {x:.1f} s" for k, x in sorted(known.items(), key=lambda kv: -kv[1]))
@@ -181,16 +220,17 @@ def render(recs, machines):
             if not table:
                 continue
             out.append(f"### {wl}\n")
-            out.append("| Group | Engine | Function | Wall s | Wall less launch, boot s | CPU s | Peak GiB | OOM | "
-                       "Launch s | Boot s | Stage s | Read+decode s | Function s | Encode+write s | Waits s | Output | "
-                       "Runs ok |")
+            out.append("| Group | Engine | Function | Operational s | Total s | Start-up: VM s | Start-up: engine s | "
+                       "CPU s | Peak GiB | OOM | Launch s | Boot s | Stage s | Read+decode s | Function s | "
+                       "Encode+write s | Waits s | Output | Runs ok |")
             out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- "
-                       "| --- |")
+                       "| --- | --- | --- |")
             for e, r in sorted(table.items(), key=lambda kv: (kv[1]["group"], kv[0])):
                 s = r["split"]
                 v = r.get("vm") or {}
-                out.append(f"| {r['group']} | {e} | {r['function']} | {fmt(r['wall_s'])} | "
-                           f"{fmt(r.get('wall_noboot_s'))} | {fmt(r['cpu_s'])} | "
+                ops = r.get("operational_s") if r.get("operational_s") is not None else r["wall_s"]
+                out.append(f"| {r['group']} | {e} | {r['function']} | {fmt(ops)} | {fmt(r['wall_s'])} | "
+                           f"{fmt(r.get('vm_start_s'), 2)} | {fmt(r.get('engine_start_s'), 2)} | {fmt(r['cpu_s'])} | "
                            f"{fmt(r['peak_gib'], 2)} | {r['oom']} | {fmt(v.get('launch_s'), 2)} | "
                            f"{fmt(v.get('boot_s'), 2)} | {fmt(v.get('stage_s'), 2)} | "
                            f"{fmt(s['read_decode_s'])} | {fmt(s['function_s'])} | {fmt(s['encode_write_s'])} | "
@@ -201,6 +241,11 @@ def render(recs, machines):
                 spread = (max(noise) - min(noise)) / statistics.median(noise)
                 out.append(f"- noise: 0.6.6 against itself, {len(noise)} runs, spread {spread:.1%} of the median")
             out.append("")
+    out.append("Operational time is a run's first rows to its output written; 0.7's start-up is apart: "
+               "the VM's (the node built, the inputs staged, the launch and the boot; gone in mode 1, where "
+               "Moruna is the node) and the engine's (before its first rows: the arena, the planes, the first "
+               "morsel). A control's own start (its process, imports, session) stays inside its wall, as "
+               "measured, so its operational time is its wall. The bar is judged on operational time.\n")
     out.append("A split column is empty where the engine's report has no figure for it: the Python "
                "engines report none, and 0.6.6's report does not split decode from read or encode "
                "from write.")

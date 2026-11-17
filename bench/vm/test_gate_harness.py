@@ -158,7 +158,19 @@ def fake(engine, repeat, wall, cpu, canon_digest, workload="enrich", noise=None)
                      "machine": "d8", "repeat": repeat, "noise": noise},
             "ok": True, "wall_s": wall, "cpu_s": cpu, "cg_peak_bytes": 2 << 30, "oom_kills": 0,
             "canon": canon_digest, "split": {"function_s": 1.0}, "function": None, "boot_s": 0.5 if engine == "moruna-vm" else None,
-            "vm": {"launch_s": 0.2, "boot_s": 0.5} if engine == "moruna-vm" else None}
+            "vm": {"launch_s": 0.2, "boot_s": 0.5, "job_s": wall - 0.8, "outputs_s": 0.1} if engine == "moruna-vm" else None,
+            "first_rows_s": 0.3 if engine == "moruna-vm" else None}
+
+
+def test_first_rows_from_a_run_console(tmp_path):
+    out = tmp_path / "g.stdout"
+    out.write_text('{"type":"heartbeat","t_ms":1043,"rows_out":0}\n'
+                   '{"type":"heartbeat","t_ms":2044,"rows_out":56294}\n'
+                   '{"type":"event","kind":"task_started","task":"sink","t_us":1650000}\n')
+    assert report.first_rows(str(out)) == 1.65
+    out.write_text('{"type":"heartbeat","t_ms":2044,"rows_out":56294}\nnot json\n')
+    assert report.first_rows(str(out)) == 2.044
+    assert report.first_rows(str(tmp_path / "none")) is None
 
 
 def test_the_report(tmp_path):
@@ -172,23 +184,28 @@ def test_the_report(tmp_path):
     for i, rec in enumerate(recs):
         json.dump(rec, open(tmp_path / f"g-{i}.json", "w"))
     text = report.render(report.load(str(tmp_path)), ["d8"])
-    assert "| 1 | moruna-vm | rust | 2.0 | 1.3 | 12.0 |" in text
-    assert "against the plain Rust pool (best: rust-baseline, 4.0 s): 2.00x; 3.08x without launch and boot" in text
-    assert "**PASS** with launch and boot in the wall" in text and "**PASS** without launch and boot" in text
+    # 2.0 s in all: 0.7 s of the VM's start-up, 0.3 s of the engine's, 1.0 s operational.
+    assert "| 1 | moruna-vm | rust | 1.0 | 2.0 | 0.70 | 0.30 | 12.0 |" in text, text
+    assert "| 2 | rust-baseline | rust | 4.0 | 4.0 |  |  | 14.0 |" in text
+    assert ("against the plain Rust pool (best: rust-baseline, 4.0 s): 4.00x on operational time; 2.00x with "
+            "start-up") in text
+    assert "**PASS** on operational time (the bar)" in text and "**PASS** with start-up (the total)" in text
+    assert "A control's own start" in text
     assert "DIFFERS" in text  # duckdb-sql's rows are not 0.6.6's
     assert "noise" in text
     slow = [fake("moruna-vm", 1, 3.9, 15.0, good), fake("rust-baseline", 1, 4.0, 14.0, good)]
     table, _ = report.rows_for(slow, "d8", "enrich")
     lines = report.speedups(table)
-    # 3.9 s with launch and boot misses; 3.2 s without them misses too (4.0 / 3.2 = 1.25x).
-    assert any("**MISS** with launch and boot" in line for line in lines)
-    assert any("**MISS** without launch and boot" in line for line in lines)
+    # 3.9 s in all misses; operational, 2.9 s, misses too (4.0 / 2.9 = 1.38x).
+    assert any("**MISS** with start-up" in line for line in lines)
+    assert any("**MISS** on operational time" in line for line in lines)
+    assert any("the VM's start-up 0.7 s" in line for line in lines), lines
     edge = [fake("moruna-vm", 1, 3.3, 13.0, good), fake("rust-baseline", 1, 4.0, 14.0, good)]
     table, _ = report.rows_for(edge, "d8", "enrich")
     lines = report.speedups(table)
-    # 3.3 s misses; without launch and boot, 2.6 s passes (1.54x).
-    assert any("**MISS** with launch and boot" in line for line in lines)
-    assert any("**PASS** without launch and boot" in line for line in lines)
+    # 3.3 s in all misses; operational, 2.3 s, passes (1.74x).
+    assert any("**MISS** with start-up" in line for line in lines)
+    assert any("**PASS** on operational time" in line for line in lines)
     assert report.speedups({}) == ["0.7 (moruna-vm) has no measured run."]
 
 
