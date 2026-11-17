@@ -10,11 +10,7 @@ use core::fmt;
 
 use moruna_api::Cloud;
 
-use crate::{
-    Refusal,
-    config::{Bound, NodeConfig},
-    json,
-};
+use crate::{Refusal, config::NodeConfig, json};
 
 /// The most bytes a hand-over is: what one channel message carries
 /// (`moruna_abi::limits::CHANNEL_MAX_BYTES`).
@@ -56,6 +52,9 @@ pub struct Handover {
     pub wall_clock: u64,
     /// The core's monotonic clock, in nanoseconds, when `wall_clock` was read.
     pub read_at_ns: u64,
+    /// The node's memory: the machine account's limit, which every service and job is carved
+    /// from, as the supervisor gave it to `platform`. The node document's `memory_bytes`.
+    pub memory_bytes: u64,
 }
 
 /// Why a hand-over is not sent or not taken.
@@ -100,6 +99,7 @@ impl Handover {
             "instance": self.instance,
             "wall_clock": self.wall_clock,
             "read_at_ns": self.read_at_ns,
+            "memory_bytes": self.memory_bytes,
             "config": self.config.document(),
         })
         .to_string()
@@ -110,8 +110,8 @@ impl Handover {
         Ok(message)
     }
 
-    /// The hand-over a message holds, for `api`. The node config in it is validated again, all
-    /// but `functions.cache_bytes`' upper bound, which only `platform` can check.
+    /// The hand-over a message holds, for `api`. The node config in it is validated again, on a
+    /// node of the hand-over's own `memory_bytes`.
     pub fn decode(message: &[u8]) -> Result<Handover, HandoverError> {
         if message.len() > MESSAGE_MAX {
             return Err(HandoverError::TooLarge(message.len()));
@@ -119,7 +119,14 @@ impl Handover {
         let json = json::parse(message).map_err(HandoverError::Shape)?;
         let read = || -> Result<_, Refusal> {
             let fields = json.object("the hand-over")?;
-            fields.only(&["cloud", "instance", "wall_clock", "read_at_ns", "config"])?;
+            fields.only(&[
+                "cloud",
+                "instance",
+                "wall_clock",
+                "read_at_ns",
+                "memory_bytes",
+                "config",
+            ])?;
             Ok((
                 fields.need("cloud", "cloud")?.string("cloud")?,
                 fields.need("instance", "instance")?.string("instance")?,
@@ -129,10 +136,13 @@ impl Handover {
                 fields
                     .need("read_at_ns", "read_at_ns")?
                     .unsigned("read_at_ns")?,
+                fields
+                    .need("memory_bytes", "memory_bytes")?
+                    .unsigned("memory_bytes")?,
                 fields.need("config", "config")?,
             ))
         };
-        let (cloud, instance, wall_clock, read_at_ns, config) =
+        let (cloud, instance, wall_clock, read_at_ns, memory_bytes, config) =
             read().map_err(HandoverError::Shape)?;
         let cloud = [Cloud::OpenStack, Cloud::Azure, Cloud::None]
             .into_iter()
@@ -142,11 +152,12 @@ impl Handover {
             return Err(HandoverError::Instance);
         }
         Ok(Handover {
-            config: NodeConfig::read(config, Bound::Checked).map_err(HandoverError::Config)?,
+            config: NodeConfig::read(config, memory_bytes).map_err(HandoverError::Config)?,
             instance: instance.to_string(),
             cloud,
             wall_clock,
             read_at_ns,
+            memory_bytes,
         })
     }
 

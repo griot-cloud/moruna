@@ -19,7 +19,8 @@ pub const VERSION: u64 = 1;
 pub const KEYS_MAX: usize = 8;
 /// One MiB: `functions.cache_bytes` is a whole number of them.
 pub const MIB: u64 = 1 << 20;
-/// `functions.cache_bytes` when node config does not give it: 1 GiB.
+/// `functions.cache_bytes` when node config does not give it: 1 GiB, or half the node's memory
+/// when that is less.
 pub const CACHE_BYTES_DEFAULT: u64 = 1 << 30;
 /// The least `functions.cache_bytes` may be: 64 MiB.
 pub const CACHE_BYTES_MIN: u64 = 64 * MIB;
@@ -172,9 +173,6 @@ pub enum Refusal {
         /// Half the node's memory.
         most: u64,
     },
-    /// `functions.cache_bytes` is given, and the node's memory is not known, so its upper bound
-    /// cannot be checked.
-    CacheUnchecked,
 }
 
 impl fmt::Display for Refusal {
@@ -227,40 +225,27 @@ impl fmt::Display for Refusal {
                 f,
                 "`functions.cache_bytes` is {given}: the most is {most}, half the node's memory"
             ),
-            Refusal::CacheUnchecked => f.write_str(
-                "`functions.cache_bytes` cannot be checked: the node's memory is not known",
-            ),
         }
     }
-}
-
-/// How `functions.cache_bytes`' upper bound is checked.
-#[derive(Clone, Copy)]
-pub(crate) enum Bound {
-    /// Against half the node's memory, when it is known.
-    Node(Option<u64>),
-    /// Not again: `platform` checked it before it handed the config over.
-    Checked,
 }
 
 impl NodeConfig {
     /// Validates an instance's user-data as node config version 1.
     ///
-    /// `node_memory_bytes` is the node's memory, which bounds `functions.cache_bytes` at its
-    /// half. With `None` the bound cannot be checked, so a config that gives `cache_bytes` is
-    /// refused; one that leaves it out takes the default, which is not held to that bound.
-    pub fn validate(
-        user_data: &[u8],
-        node_memory_bytes: Option<u64>,
-    ) -> Result<NodeConfig, Refusal> {
+    /// `node_memory_bytes` is the node's memory: the machine account's limit, which every
+    /// service and job is carved from, as the supervisor reads it (PM, 2026-11-18). It bounds
+    /// `functions.cache_bytes` at its half. A config that leaves `cache_bytes` out takes 1 GiB
+    /// or that half, whichever is less, and is never refused for it: a default is not the
+    /// operator's choice.
+    pub fn validate(user_data: &[u8], node_memory_bytes: u64) -> Result<NodeConfig, Refusal> {
         if user_data.iter().all(u8::is_ascii_whitespace) {
             return Err(Refusal::Missing);
         }
-        NodeConfig::read(&json::parse(user_data)?, Bound::Node(node_memory_bytes))
+        NodeConfig::read(&json::parse(user_data)?, node_memory_bytes)
     }
 
-    /// Reads a node config from its JSON.
-    pub(crate) fn read(json: &Json, bound: Bound) -> Result<NodeConfig, Refusal> {
+    /// Reads a node config from its JSON, on a node of `node_memory_bytes`.
+    pub(crate) fn read(json: &Json, node_memory_bytes: u64) -> Result<NodeConfig, Refusal> {
         let root = json.object("node config")?;
         // The version first: a later version may have fields this one does not know.
         match root.get("moruna") {
@@ -280,7 +265,10 @@ impl NodeConfig {
         let tls = api.get("tls").map(tls).transpose()?;
 
         let functions = match root.get("functions") {
-            None => Functions::default(),
+            None => Functions {
+                keys: Vec::new(),
+                cache_bytes: default_cache_bytes(node_memory_bytes),
+            },
             Some(functions) => {
                 let functions = functions.object("functions")?;
                 functions.only(&["keys", "cache_bytes"])?;
@@ -290,10 +278,11 @@ impl NodeConfig {
                         Some(list) => keys(list, "functions.keys", 0)?,
                     },
                     cache_bytes: match functions.get("cache_bytes") {
-                        None => CACHE_BYTES_DEFAULT,
-                        Some(given) => {
-                            cache_bytes(given.unsigned("functions.cache_bytes")?, bound)?
-                        }
+                        None => default_cache_bytes(node_memory_bytes),
+                        Some(given) => cache_bytes(
+                            given.unsigned("functions.cache_bytes")?,
+                            node_memory_bytes,
+                        )?,
                     },
                 }
             }
@@ -373,22 +362,23 @@ fn tls(tls: &Json) -> Result<Tls, Refusal> {
     })
 }
 
+/// `functions.cache_bytes` when node config does not give it: 1 GiB, or half the node's memory
+/// when that is less (PM, 2026-11-18). Never refused, even under 64 MiB.
+fn default_cache_bytes(node_memory_bytes: u64) -> u64 {
+    CACHE_BYTES_DEFAULT.min(node_memory_bytes / 2)
+}
+
 /// `functions.cache_bytes` as node config gives it: a whole number of MiB, from 64 MiB to half
 /// the node's memory.
-fn cache_bytes(given: u64, bound: Bound) -> Result<u64, Refusal> {
+fn cache_bytes(given: u64, node_memory_bytes: u64) -> Result<u64, Refusal> {
+    let most = node_memory_bytes / 2;
     if !given.is_multiple_of(MIB) {
-        return Err(Refusal::CacheNotMib(given));
-    }
-    if given < CACHE_BYTES_MIN {
-        return Err(Refusal::CacheTooSmall(given));
-    }
-    match bound {
-        Bound::Checked => Ok(given),
-        Bound::Node(None) => Err(Refusal::CacheUnchecked),
-        Bound::Node(Some(memory)) if given > memory / 2 => Err(Refusal::CacheTooLarge {
-            given,
-            most: memory / 2,
-        }),
-        Bound::Node(Some(_)) => Ok(given),
+        Err(Refusal::CacheNotMib(given))
+    } else if given < CACHE_BYTES_MIN {
+        Err(Refusal::CacheTooSmall(given))
+    } else if given > most {
+        Err(Refusal::CacheTooLarge { given, most })
+    } else {
+        Ok(given)
     }
 }

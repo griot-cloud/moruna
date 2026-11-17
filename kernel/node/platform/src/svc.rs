@@ -1,12 +1,14 @@
 //! The machine's traits on the node itself: connections through the network server's sockets
-//! (`moruna.net`), the core's monotonic clock, and the channel the supervisor links to `api`.
+//! (`moruna.net`), the core's monotonic clock, and the channel the supervisor links to `api`; and
+//! the node's memory, from the supervisor's start message.
 //!
-//! All three are written on `moruna-svc`, which on a host is a model of the same kernel calls, so
-//! they are tested there too: the sockets against the real network server over its loopback.
+//! They are written on `moruna-svc`, which on a host is a model of the same kernel calls, so they
+//! are tested there too: the sockets against the real network server over its loopback.
 
 use alloc::{format, string::String, vec, vec::Vec};
 use core::net::{IpAddr, Ipv4Addr};
 
+use moruna_node::Bootstrap;
 use moruna_svc::{
     CallError, Channel, DEADLINE_INFINITE, Error, Handle, Memory, Rights, Signals, map, now,
     wait_one,
@@ -193,10 +195,26 @@ impl Clock for Monotonic {
     }
 }
 
-/// The channel to `api`, one message a hand-over and one its answer.
-pub struct ApiLink(pub Channel);
+/// A channel as whole messages that carry no handle: the link to `api` (the hand-over, and its
+/// answer), and the supervisor's start message.
+pub struct ChannelLink(pub Channel);
 
-impl ApiLink {
+/// The node's memory, from the message the supervisor queues on `platform`'s `supervisor` slot
+/// before it starts `platform` (its `platform` bootstrap): the machine account's limit, which
+/// every service and job is carved from (item 1.4, PM 2026-11-18). The message is read by
+/// `deadline`, and anything but that bootstrap is refused.
+pub fn node_memory(supervisor: Channel, deadline: u64) -> Result<u64, String> {
+    let message = ChannelLink(supervisor)
+        .receive(deadline)
+        .map_err(|error| match error {
+            LinkError::Closed => String::from("the supervisor closed its end and sent none"),
+            error => format!("the supervisor's message: {error}"),
+        })?;
+    Bootstrap::platform_memory(&message, 0)
+        .ok_or_else(|| String::from("the supervisor's message is not platform's bootstrap"))
+}
+
+impl ChannelLink {
     /// Waits for any of `signals` until `deadline`, and says which were seen.
     fn wait(&self, signals: Signals, deadline: u64) -> Result<Signals, LinkError> {
         match wait_one(&self.0.0, signals, deadline) {
@@ -214,7 +232,7 @@ fn refused(error: Error) -> LinkError {
     }
 }
 
-impl Link for ApiLink {
+impl Link for ChannelLink {
     fn send(&mut self, message: &[u8], deadline: u64) -> Result<(), LinkError> {
         loop {
             match self.0.write_with(message, &mut []) {

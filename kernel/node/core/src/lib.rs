@@ -100,6 +100,7 @@ impl Config {
                             until_stopped: true,
                         },
                         ("linux", []) => Bootstrap::Linux,
+                        ("platform", []) => Bootstrap::Platform,
                         _ => return Err(ConfigError::Syntax),
                     };
                     if bootstraps.iter().any(|(k, _)| k.same_kind(kind)) {
@@ -323,14 +324,20 @@ mod tests {
 /// The sole node root-transfer header. This is a boot message, not a service
 /// protocol handshake. No unversioned/truncated/trailing message is accepted.
 ///
-/// Its eight bytes: `MNBT`, the version (1), the flags, the kind (1 devices, 2 Linux)
-/// and the handles it carries. The one flag is the device manager's: bit 0, it serves
-/// until it is stopped (node.conf's `bootstrap devices NAME until-stopped`, system
-/// design 1C). Without it, it ends once its last client has gone, as CI's boot has it.
+/// Its eight bytes: `MNBT`, the version (1), the flags, the kind (1 devices, 2 Linux,
+/// 3 platform) and the handles it carries. The one flag is the device manager's: bit 0,
+/// it serves until it is stopped (node.conf's `bootstrap devices NAME until-stopped`,
+/// system design 1C). Without it, it ends once its last client has gone, as CI's boot
+/// has it.
+///
+/// `Platform` transfers no root: its message is the header and the node's memory
+/// ([`Bootstrap::platform_message`]), the machine account's limit as the supervisor reads
+/// it (system design 1D; item 1.4, PM 2026-11-18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bootstrap {
     Devices { until_stopped: bool },
     Linux,
+    Platform,
 }
 impl Bootstrap {
     pub const fn header(self) -> &'static [u8; 8] {
@@ -342,16 +349,39 @@ impl Bootstrap {
                 until_stopped: true,
             } => b"MNBT\x01\x01\x01\x05",
             Self::Linux => b"MNBT\x01\x00\x02\x01",
+            Self::Platform => b"MNBT\x01\x00\x03\x00",
         }
     }
     pub const fn handles(self) -> usize {
         match self {
             Self::Devices { .. } => 5,
             Self::Linux => 1,
+            Self::Platform => 0,
         }
     }
     pub fn accepts(self, bytes: &[u8], handles: usize) -> bool {
-        bytes == self.header() && handles == self.handles()
+        match self {
+            Self::Platform => Self::platform_memory(bytes, handles).is_some(),
+            _ => bytes == self.header() && handles == self.handles(),
+        }
+    }
+    /// The platform bootstrap's message: its header, then the node's memory in bytes,
+    /// little-endian.
+    pub fn platform_message(memory_bytes: u64) -> [u8; 16] {
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(Self::Platform.header());
+        bytes[8..].copy_from_slice(&memory_bytes.to_le_bytes());
+        bytes
+    }
+    /// The node's memory a platform bootstrap message carries: exactly the header and
+    /// eight bytes, no handle, and more than zero.
+    pub fn platform_memory(bytes: &[u8], handles: usize) -> Option<u64> {
+        let (header, memory) = bytes.split_first_chunk::<8>()?;
+        if header != Self::Platform.header() || handles != 0 {
+            return None;
+        }
+        let memory = u64::from_le_bytes(memory.try_into().ok()?);
+        (memory != 0).then_some(memory)
     }
     /// The bootstrap a message is, when it is exactly one.
     pub fn decode(bytes: &[u8], handles: usize) -> Option<Bootstrap> {
@@ -363,6 +393,7 @@ impl Bootstrap {
                 until_stopped: true,
             },
             Self::Linux,
+            Self::Platform,
         ]
         .into_iter()
         .find(|b| b.accepts(bytes, handles))
@@ -416,6 +447,9 @@ mod boot_tests {
         assert_eq!(Bootstrap::decode(&UNTIL_STOPPED.header()[..7], 5), None);
         assert!(DEVICES.same_kind(UNTIL_STOPPED));
         assert!(!DEVICES.same_kind(Bootstrap::Linux));
+        let platform = Bootstrap::platform_message(1 << 30);
+        assert_eq!(Bootstrap::decode(&platform, 0), Some(Bootstrap::Platform));
+        assert!(!DEVICES.same_kind(Bootstrap::Platform));
     }
     #[test]
     fn until_stopped_is_a_form_of_the_devices_bootstrap_alone() {
@@ -454,6 +488,47 @@ mod boot_tests {
         ] {
             assert_eq!(node(twice), Err(ConfigError::Duplicate), "{twice:?}");
         }
+    }
+    #[test]
+    fn the_platform_bootstrap_carries_the_node_s_memory_and_no_handle() {
+        let memory = 24_526_286_848;
+        let message = Bootstrap::platform_message(memory);
+        assert_eq!(&message[..8], b"MNBT\x01\x00\x03\x00");
+        assert_eq!(Bootstrap::platform_memory(&message, 0), Some(memory));
+        assert!(Bootstrap::Platform.accepts(&message, 0));
+        assert_eq!(Bootstrap::Platform.handles(), 0);
+        // A handle, a header alone, a byte short or over, another kind's header, a later
+        // version, and no memory at all are each refused.
+        assert_eq!(Bootstrap::platform_memory(&message, 1), None);
+        assert!(!Bootstrap::Platform.accepts(Bootstrap::Platform.header(), 0));
+        assert_eq!(Bootstrap::platform_memory(&message[..15], 0), None);
+        let mut longer = message.to_vec();
+        longer.push(0);
+        assert_eq!(Bootstrap::platform_memory(&longer, 0), None);
+        let mut other = message;
+        other[..8].copy_from_slice(Bootstrap::Linux.header());
+        assert_eq!(Bootstrap::platform_memory(&other, 0), None);
+        let mut later = message;
+        later[4] = 2;
+        assert_eq!(Bootstrap::platform_memory(&later, 0), None);
+        assert_eq!(
+            Bootstrap::platform_memory(&Bootstrap::platform_message(0), 0),
+            None
+        );
+        // The other kinds do not take it.
+        assert!(!Bootstrap::Linux.accepts(&message, 0));
+        assert!(!DEVICES.accepts(&message, 0));
+    }
+    #[test]
+    fn a_node_config_bootstraps_platform_once() {
+        let config = b"moruna-node 1\nservice platform image.platform 16777216\nbootstrap platform platform\n";
+        let node = Config::parse(config, 1 << 30).unwrap();
+        assert_eq!(node.bootstraps, [(Bootstrap::Platform, "platform".into())]);
+        let twice = b"moruna-node 1\nservice platform image.platform 16777216\nbootstrap platform platform\nbootstrap platform platform\n";
+        assert_eq!(Config::parse(twice, 1 << 30), Err(ConfigError::Duplicate));
+        // Its slot is `supervisor`, which no grant or link may also fill.
+        let aliased = b"moruna-node 1\nservice platform image.platform 16777216\nbootstrap platform platform\ngrant platform supervisor spare\n";
+        assert_eq!(Config::parse(aliased, 1 << 30), Err(ConfigError::Duplicate));
     }
     #[test]
     fn bootstrap_and_grants_cannot_alias_child_slots() {

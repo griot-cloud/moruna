@@ -24,7 +24,7 @@ use moruna_netstack::Stack;
 use moruna_node_config::{Cloud, NodeConfig};
 use moruna_node_platform::{
     machine::{Link, LinkError},
-    svc::ApiLink,
+    svc::ChannelLink,
 };
 use moruna_svc::deadline_in;
 use netstack_protocol::{Cidr, Interface, Policy, Target};
@@ -469,17 +469,21 @@ fn the_wait_for_a_connection_ends_when_the_network_server_does() {
     node.end();
 }
 
+/// The node's memory in the tests' hand-overs: 2 GiB.
+const MEMORY_BYTES: u64 = 2 << 30;
+
 /// A hand-over as `platform` makes one: a valid node config, an instance and its cloud,
-/// and the wall clock.
+/// the wall clock and the node's memory.
 fn handed() -> Handover {
     let user_data =
         br#"{"moruna":1,"api":{"token_keys":["AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="]}}"#;
     Handover {
-        config: NodeConfig::validate(user_data, None).expect("a valid node config"),
+        config: NodeConfig::validate(user_data, MEMORY_BYTES).expect("a valid node config"),
         instance: String::from("3f6c1d2e-8b7a-4c55-9e1f-0a2b3c4d5e6f"),
         cloud: Cloud::OpenStack,
         wall_clock: 1_794_931_200,
         read_at_ns: 4_200_000_000,
+        memory_bytes: MEMORY_BYTES,
     }
 }
 
@@ -489,7 +493,7 @@ fn handed() -> Handover {
 fn the_hand_over_crosses_a_channel_from_platform_s_half() {
     let (ours, theirs) = Channel::create().expect("a channel");
     let platform = thread::spawn(move || {
-        let mut link = ApiLink(ours);
+        let mut link = ChannelLink(ours);
         link.send(
             &handed().encode().expect("encoded"),
             deadline_in(5 * SECOND),
@@ -520,7 +524,7 @@ fn api_answers_ready_once_its_listener_first_opens() {
         });
         error
     });
-    let mut platform = ApiLink(ours);
+    let mut platform = ChannelLink(ours);
     platform
         .send(
             &handed().encode().expect("encoded"),
