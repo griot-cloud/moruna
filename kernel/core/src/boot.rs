@@ -231,6 +231,7 @@ fn start_manifest(machine: &Arc<Account>) -> Result<usize, String> {
                 Source::RootInterrupt => root(ResourceKind::Interrupt)?,
                 Source::RootMsi => root(ResourceKind::Msi)?,
                 Source::RootDma => root(ResourceKind::Dma)?,
+                Source::RootClock => root(ResourceKind::Clock)?,
                 Source::RootEcam => Object::Resource(Arc::new(
                     Resource::new(
                         ResourceKind::DeviceMemory,

@@ -49,7 +49,7 @@ built yet.
 | --- | --- | --- |
 | Linux | Tens of millions of lines, with every driver | Over 350 system calls, plus every driver's `ioctl` |
 | Asterinas, whole | OSTD (about 49,000 lines) plus its Linux layer (about 137,000) plus its components (about 42,000) | 245 Linux calls |
-| The data OS | OSTD (about 49,000) plus Moruna's core (9,821 lines on 2026-11-17, with §2's mechanisms of A, B1 and P merged) | Moruna's 71 native calls |
+| The data OS | OSTD (about 49,000) plus Moruna's core (9,868 lines on 2026-11-18, with §2's mechanisms of A, B1 and P merged, and 5.0's wall clock and yield) | Moruna's 73 native calls |
 
 How the figures are measured, so each merge updates them the same way: kernel-mode lines are
 `wc -l` over `kernel/core/src` (tests included); native calls are the call numbers the
@@ -57,7 +57,10 @@ dispatcher in `kernel/core/src/syscall.rs` answers. Measured so, the table's fir
 (`b3d51a64`) had 6,952 lines and 59 calls, where it said 55. Since then: 2026-11-17, at
 `d3201370` (A, B1, C, D, E and P merged, A's wake queue reverted), 9,821 lines and 71 calls. The growth is A's data
 path (slots, windows, clock page), B1's personality mechanisms
-(personality entry, snapshots and clones, the pager, thread state) and P's plane calls. Every
+(personality entry, snapshots and clones, the pager, thread state) and P's plane calls. Then
+2026-11-18, item 5.0 (ABI 2.8, on `work/5.0-rust-std`): 9,868 lines and 73 calls, the node's
+wall clock on the clock page with `clock_set_realtime`, and `thread_yield`, 47 lines and two
+calls. Item 1.9c's ABI 2.7 (`root.hyperv`, six calls) is counted when it merges. Every
 call that is reachable but no gate job uses is a removal candidate on stream U's list. The
 exceptions are the device and DMA calls, which are kept for the accelerator path.
 
@@ -335,6 +338,8 @@ budget.
 | Futex wait and wake | Exists (`FUTEX_WAIT`, `FUTEX_WAKE`) | A call per batch: waits happen only when a ring is empty | None new |
 | No timer ticks or device interrupts on worker cores (C5) | New | Preemption jitter and cache disturbance on a pinned worker | Changes to OSTD's timer and interrupt routing. Built only if C5's measurement shows a gain, and counted under §0. |
 | A clock readable without a call | New: a read-only page the kernel updates | `clock_gettime` calls on every timed batch | One page and its update. Small. |
+| The node's one wall clock on that page | New (ABI 2.8, item 5.0): a realtime base and where it came from, written under the page's sequence at boot (the CMOS clock) and at each `clock_set_realtime`, which only the holder of `root.clock` (`platform`) may make | A wall clock in each service: the network server's TLS time and std's `SystemTime` read the page | One call and two words of the page: 47 lines with the yield below |
+| Yield the CPU | New (ABI 2.8, item 5.0): `thread_yield` | A spin-then-yield loop (std's, a library's) holding its CPU until the tick | One call, a call into OSTD's scheduler |
 | Revoke a task's write access to a set of windows | Partly exists (`PROCESS_PROTECT`, `batch_put`'s unmap) | The record check's need for bytes no task can write (DP1), paid once per group of batches, not per batch (§5) | A call that takes a list. Small. |
 | The personality entry, copy-on-write clones, a user pager, thread state and interruption | New (`kernel-is-the-machine.md` §4.1) | Running Linux programs with no Linux code in kernel mode (§4) | The largest addition: four mechanisms, each tested in the core's own suite. Size to be measured against the table in §0. |
 

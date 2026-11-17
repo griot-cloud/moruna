@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Moruna quality gate. Run by the git hooks (tools/hooks, `--fast`) and by CI's two test
 # jobs (preamble 6.6). It fails on: an em dash in any tracked text
-# file; cargo fmt drift; a clippy warning; a wildcard arm over Tier or
+# file but Rust's vendored library/ (kernel/vendor/rust-std); cargo fmt drift; a clippy warning; a wildcard arm over Tier or
 # StagingCodec (tools/lint/no_tier_wildcard.sh, CT-T14); a broken link, a tab
 # or a page in no toctree under docs/ (tools/docs/check_docs.py; CI also builds
 # the site with Sphinx, warnings as errors); a commit-message rule the DCO self-test
@@ -260,7 +260,9 @@ fi
 
 step "em dashes"
 EM="$(printf '\xe2\x80\x94')"
-if git ls-files -z | xargs -0 grep -In -e "$EM" -- 2>/dev/null; then
+# Rust's library/ (item 5.0) is vendored as rust-src ships it, apart from its functional
+# patches, so upstream's prose keeps its em dashes (PM, 2026-11-18).
+if git ls-files -z -- . ':(exclude)kernel/vendor/rust-std/' | xargs -0 grep -In -e "$EM" -- 2>/dev/null; then
   fail "em dash found; use a comma, a colon or parentheses (architecture/README.md, conventions)"
 fi
 

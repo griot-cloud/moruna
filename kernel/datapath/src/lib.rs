@@ -48,6 +48,30 @@ pub mod clock {
         put(clock_page::SHIFT, &SHIFT.to_le_bytes());
         bytes
     }
+
+    /// The sequence [`page`] writes: even, so the page reads as written.
+    pub const FIRST_SEQUENCE: u64 = 2;
+
+    /// The realtime base (`clock_page::REALTIME_BASE`, ABI 2.8) of a wall clock that reads
+    /// `utc_ns` when the monotonic clock reads `now`: UTC nanoseconds at the monotonic zero.
+    /// `None` for a time at or before the monotonic clock's start, which no base says.
+    pub fn realtime_base(utc_ns: u64, now: u64) -> Option<u64> {
+        utc_ns.checked_sub(now).filter(|base| *base != 0)
+    }
+
+    /// The writes that give the page the realtime base `base` from `source`
+    /// (`clock_page::realtime`) under its sequence, each an offset and the eight bytes there,
+    /// in order: the sequence made odd, the base, the source, the sequence even again, so a
+    /// reader sees both change or neither. `sequence` is the page's sequence now, even; it is
+    /// `sequence + 2` after.
+    pub fn realtime_writes(sequence: u64, base: u64, source: u64) -> [(usize, [u8; 8]); 4] {
+        [
+            (clock_page::SEQUENCE, (sequence + 1).to_le_bytes()),
+            (clock_page::REALTIME_BASE, base.to_le_bytes()),
+            (clock_page::REALTIME_SOURCE, source.to_le_bytes()),
+            (clock_page::SEQUENCE, (sequence + 2).to_le_bytes()),
+        ]
+    }
 }
 
 /// An object's frames in runs of a large page.
@@ -185,6 +209,66 @@ mod tests {
         assert_eq!(clock::scale(u64::MAX, u64::MAX), u64::MAX - 1);
         // A counter faster than a tick a femtosecond still has a multiplier.
         assert!(clock::multiplier(u64::MAX).is_some());
+    }
+
+    #[test]
+    fn a_wall_clock_s_base_is_its_time_at_the_monotonic_zero() {
+        assert_eq!(
+            clock::realtime_base(1_700_000_000_000_000_000, 5_000),
+            Some(1_699_999_999_999_995_000)
+        );
+        assert_eq!(
+            clock::realtime_base(10, 10),
+            None,
+            "the monotonic clock's start"
+        );
+        assert_eq!(
+            clock::realtime_base(9, 10),
+            None,
+            "before the monotonic clock's start"
+        );
+        assert_eq!(clock::realtime_base(11, 10), Some(1));
+    }
+
+    fn word(page: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(page[at..at + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn a_new_base_and_its_source_change_together_between_an_odd_and_an_even_sequence() {
+        let mut page = clock::page(1, 2).to_vec();
+        page.resize(clock_page::LEN, 0);
+        assert_eq!(word(&page, clock_page::SEQUENCE), clock::FIRST_SEQUENCE);
+        assert_eq!(word(&page, clock_page::REALTIME_BASE), 0);
+        assert_eq!(
+            word(&page, clock_page::REALTIME_SOURCE),
+            clock_page::realtime::UNSET,
+            "the wall clock starts unset"
+        );
+        let mut sequence = clock::FIRST_SEQUENCE;
+        // The machine's clock at boot, then `clock_set_realtime` again and again.
+        for (base, source) in [
+            (40, clock_page::realtime::MACHINE),
+            (42, clock_page::realtime::SET),
+            (43, clock_page::realtime::SET),
+        ] {
+            let mut seen = Vec::new();
+            for (at, bytes) in clock::realtime_writes(sequence, base, source) {
+                page[at..at + 8].copy_from_slice(&bytes);
+                seen.push(word(&page, clock_page::SEQUENCE));
+            }
+            // Odd while the base and the source change, even after: a reader retries across.
+            assert_eq!(
+                seen,
+                [sequence + 1, sequence + 1, sequence + 1, sequence + 2]
+            );
+            sequence += 2;
+            assert_eq!(word(&page, clock_page::REALTIME_BASE), base);
+            assert_eq!(word(&page, clock_page::REALTIME_SOURCE), source);
+        }
+        // The scale is untouched.
+        assert_eq!(word(&page, clock_page::BASE_TSC), 1);
+        assert_eq!(word(&page, clock_page::MULTIPLIER), 2);
     }
 
     #[test]

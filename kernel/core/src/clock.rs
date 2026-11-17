@@ -3,8 +3,10 @@
 //! The clock is the TSC scaled to nanoseconds since boot: `(tsc - origin) * MULTIPLIER >>
 //! SHIFT` (`moruna_datapath::clock`). The clock page publishes that same scale (`moruna_abi::clock_page`), written
 //! once at boot, so a process that maps it reads the time with no call and agrees with
-//! `clock_get` to the nanosecond. The TSC is the one counter and the scale never changes,
-//! so the page is never written again; its sequence lets a later kernel recalibrate.
+//! `clock_get` to the nanosecond. The TSC is the one counter and the scale never changes.
+//! The page is also the node's one wall clock (ABI 2.8): its realtime base and where the base
+//! came from, the CMOS clock's reading at boot, then each `clock_set_realtime`'s, both written
+//! under the page's sequence so a reader sees each change whole.
 //!
 //! Deadlines live in one queue ordered by time; OSTD's 1 kHz timer interrupt pops every
 //! entry that is due, firing a timer object or waking a waiting thread. Every mutation of
@@ -14,7 +16,7 @@
 use alloc::{collections::BTreeMap, sync::Arc, sync::Weak};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use moruna_abi::{DEADLINE_INFINITE, Error, PAGE_SIZE, Signals, charge};
+use moruna_abi::{DEADLINE_INFINITE, Error, PAGE_SIZE, Signals, charge, clock_page};
 use moruna_datapath::clock as scale;
 use ostd::{
     arch::{read_tsc, tsc_freq},
@@ -29,8 +31,12 @@ use crate::{
 };
 
 static MULTIPLIER: AtomicU64 = AtomicU64::new(0);
-/// The realtime clock at boot, in nanoseconds since 1970, read from the CMOS clock.
+/// The realtime base: the wall clock, in nanoseconds since 1970, at the monotonic clock's
+/// zero. The CMOS clock's reading at boot, then each `clock_set_realtime`'s; zero while unset.
 static REALTIME_AT_BOOT: AtomicU64 = AtomicU64::new(0);
+/// The clock page's sequence, kept here, where its one writer (`set_base`) reads it; its lock
+/// is what makes that writer one.
+static PAGE_SEQUENCE: SpinLock<u64> = SpinLock::new(scale::FIRST_SEQUENCE);
 static TSC_ORIGIN: AtomicU64 = AtomicU64::new(0);
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// The clock page, made at boot.
@@ -73,8 +79,32 @@ pub fn init() -> Result<(), &'static str> {
     TSC_ORIGIN.store(origin, Ordering::Release);
     MULTIPLIER.store(multiplier, Ordering::Release);
     make_page(origin, multiplier)?;
-    REALTIME_AT_BOOT.store(rtc::read()?, Ordering::Release);
+    set_base(rtc::read()?, clock_page::realtime::MACHINE);
     timer::register_callback_on_cpu(tick);
+    Ok(())
+}
+
+/// The realtime base becomes `base`, from `source` (`clock_page::realtime`), here and on the
+/// clock page, where readers see the base and the source change together under its sequence.
+fn set_base(base: u64, source: u64) {
+    let mut sequence = PAGE_SEQUENCE.lock();
+    if let Some(page) = page() {
+        for (at, bytes) in scale::realtime_writes(*sequence, base, source) {
+            // Each write lands before the next, as a reader of the sequence needs.
+            core::sync::atomic::fence(Ordering::SeqCst);
+            // The page is one page and every offset is inside it.
+            let _ = page.write(at as u64, &bytes);
+        }
+        *sequence += 2;
+    }
+    REALTIME_AT_BOOT.store(base, Ordering::Release);
+}
+
+/// `clock_set_realtime` (ABI 2.8): the wall clock reads `utc_ns` now. It may be called again
+/// at any time. `InvalidArgs` for a time at or before the monotonic clock's start.
+pub fn set_realtime(utc_ns: u64) -> Result<(), Error> {
+    let base = scale::realtime_base(utc_ns, now()).ok_or(Error::InvalidArgs)?;
+    set_base(base, clock_page::realtime::SET);
     Ok(())
 }
 
@@ -90,13 +120,13 @@ pub fn now() -> u64 {
     )
 }
 
-/// The realtime clock at boot, in nanoseconds since 1970.
+/// The realtime base: the wall clock, in nanoseconds since 1970, at the monotonic zero.
 pub fn realtime_at_boot() -> u64 {
     REALTIME_AT_BOOT.load(Ordering::Acquire)
 }
 
-/// The realtime clock now, in nanoseconds since 1970: the CMOS clock at boot, read once,
-/// advanced by the monotonic clock.
+/// The realtime clock now, in nanoseconds since 1970: the realtime base (the CMOS clock at
+/// boot, or the last `clock_set_realtime`) advanced by the monotonic clock.
 pub fn realtime() -> u64 {
     realtime_at_boot().saturating_add(now())
 }
