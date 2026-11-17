@@ -416,6 +416,7 @@ process datapath
   expect DS-A wake: ok:
   expect DS-A rcu: ok:
   expect DS-A placement: ok:
+  expect DS-A spread: ok:
   expect DS-A avx: ok:
   expect DS-A clock page: ok:
   expect DS-A revoke: ok:

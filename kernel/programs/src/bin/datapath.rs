@@ -31,6 +31,8 @@
 //!
 //! - a wake behind busy threads: a thread woken on a CPU where three threads spin runs
 //!   before any other of them takes the CPU (judged by the order they ran in);
+//! - spreading: twice as many unpinned sleepers as CPUs, each started while the others
+//!   sleep, so they start on one CPU, run on every CPU once woken together;
 //! - AVX state (`avx_fixture.rs`): one more thread than there are CPUs keeps its own
 //!   values in all 16 `ymm` registers through preemption, and one moves between CPUs with
 //!   `thread_set_cpu`, every lane checked at the end;
@@ -118,6 +120,9 @@ fn run() -> i64 {
         return code;
     }
     if let Err(code) = placement(&out, cpus) {
+        return code;
+    }
+    if let Err(code) = spread(&out, cpus) {
         return code;
     }
     if let Err(code) = avx::check(&out, cpus) {
@@ -1298,6 +1303,117 @@ fn placement(out: &Out, cpus: u32) -> Result<(), i64> {
         turns,
         lost,
         on
+    );
+    Ok(())
+}
+
+/// The round `spread`'s sleepers are woken for; past the last, they end.
+static BELL: AtomicU32 = AtomicU32::new(0);
+/// The last round `spread` has ended.
+static BELL_END: AtomicU32 = AtomicU32::new(0);
+/// How many times a sleeper of `spread` has gone to the bell, over all rounds.
+static AT_BELL: AtomicU32 = AtomicU32::new(0);
+/// The CPUs `spread`'s sleepers first ran on, and those each round ran them on, by bit.
+static SPREAD_START: AtomicU64 = AtomicU64::new(0);
+static SPREAD_ROUNDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn cpu_bit(cpu: u32) -> u64 {
+    if cpu < 64 { 1 << cpu } else { 0 }
+}
+
+/// Goes to the bell at once, then, each round, spins until the round ends and records
+/// the CPU it ran on.
+extern "C" fn bell_sleeper(_: u64) -> ! {
+    SPREAD_START.fetch_or(cpu_bit(current_cpu()), Ordering::Relaxed);
+    let mut round = 0;
+    loop {
+        AT_BELL.fetch_add(1, Ordering::Release);
+        while BELL.load(Ordering::Acquire) == round {
+            let _ = futex_wait(&BELL, round, now() + ms(1_000));
+        }
+        round = BELL.load(Ordering::Acquire);
+        let Some(seen) = SPREAD_ROUNDS.get(round as usize - 1) else {
+            break;
+        };
+        while BELL_END.load(Ordering::Acquire) < round {
+            core::hint::spin_loop();
+        }
+        seen.fetch_or(cpu_bit(current_cpu()), Ordering::Relaxed);
+    }
+    thread_exit()
+}
+
+/// Sleeps until `AT_BELL` reaches `count`, for at most 10 s.
+fn until_at_bell(count: u32) -> bool {
+    let end = now() + ms(10_000);
+    while AT_BELL.load(Ordering::Acquire) < count {
+        if now() > end {
+            return false;
+        }
+        let _ = futex_wait(&READY, 1, now() + ms(1));
+    }
+    true
+}
+
+/// Unpinned threads first placed together spread over the CPUs once woken: twice as
+/// many sleepers as CPUs, each started while the others sleep (so every CPU looks the
+/// same to the scheduler and they start on one), are woken together three times, and
+/// in the last round they run on every CPU. A thread that stayed where it was first
+/// placed would leave every CPU but that one idle.
+fn spread(out: &Out, cpus: u32) -> Result<(), i64> {
+    let n = 2 * cpus;
+    let rounds = SPREAD_ROUNDS.len() as u32;
+    pin_current_thread(None).map_err(|e| fail(out, "spread", "unpinning", e))?;
+    let mut threads = Vec::new();
+    for i in 0..n {
+        threads.push(start(out, "spread", bell_sleeper, u64::from(i))?);
+        if !until_at_bell(i + 1) {
+            println!(out, "DS-A spread: FAIL: sleeper {} never ran", i);
+            return Err(1);
+        }
+        // Asleep before the next starts.
+        let _ = futex_wait(&READY, 1, now() + ms(2));
+    }
+    for round in 1..=rounds {
+        BELL.store(round, Ordering::Release);
+        futex_wake(&BELL, n).map_err(|e| fail(out, "spread", "futex_wake", e))?;
+        let _ = futex_wait(&READY, 1, now() + ms(50));
+        BELL_END.store(round, Ordering::Release);
+        if !until_at_bell(n * (round + 1)) {
+            println!(out, "DS-A spread: FAIL: round {} never ended", round);
+            return Err(1);
+        }
+    }
+    BELL.store(rounds + 1, Ordering::Release);
+    let _ = futex_wake(&BELL, n);
+    for t in &threads {
+        join(out, "spread", t)?;
+    }
+    let start = SPREAD_START.load(Ordering::Relaxed);
+    let seen: [u64; 3] = core::array::from_fn(|i| SPREAD_ROUNDS[i].load(Ordering::Relaxed));
+    let last = seen[seen.len() - 1].count_ones();
+    if last < cpus {
+        println!(
+            out,
+            "DS-A spread: FAIL: {} sleepers started on CPUs {:#x} ran on {:#x}, {:#x} and {:#x}: {} of {} CPUs in the last round",
+            n,
+            start,
+            seen[0],
+            seen[1],
+            seen[2],
+            last,
+            cpus
+        );
+        return Err(1);
+    }
+    println!(
+        out,
+        "DS-A spread: ok: {} sleepers started on CPUs {:#x}, woken together, ran on {:#x}, {:#x} and {:#x}: every CPU",
+        n,
+        start,
+        seen[0],
+        seen[1],
+        seen[2]
     );
     Ok(())
 }
