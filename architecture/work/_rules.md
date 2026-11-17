@@ -10,9 +10,14 @@
   (`tools/proof-lab/run.py` shows how to take it). Never steal it. Keep a VM at or under 6 GiB.
   Release it the moment you stop, including when you stop to ask.
 - Host tests of single crates (`cargo test -p …`, `cargo llvm-cov -p …`) don't need the lock. Run
-  every cargo command with `-j 2`: up to six agents share this Mac's 10 cores and 16 GB.
+  every cargo command with `-j 2`, and tests with `RUST_TEST_THREADS=2`: up to nine agents and a
+  boot share this Mac's 10 cores and 16 GB.
 - An item with booted checks is done in two phases: everything that needs no boot first, then a
   report; the PM continues you for the booted checks when what they need is merged.
-- The disk is nearly full: build with `CARGO_INCREMENTAL=0`, and delete `target` when you stop.
+- Free disk as you go: build with `CARGO_INCREMENTAL=0`; delete every `target` folder you made
+  (in your worktree and inside `moruna-arm`) whenever you stop or hand back, and your folders in
+  `moruna-arm`'s `/tmp`. Never delete another agent's.
 - Create nothing in any cloud, and spend nothing.
 - Where your work item and the system design leave a choice open, ask the PM. Do not choose.
+- Scratch files go only in your own folder, `<scratchpad>/<your agent id>/`. Delete only there,
+  never at the scratchpad's top level, which the PM and other agents share.
