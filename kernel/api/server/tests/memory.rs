@@ -1,8 +1,9 @@
 //! The server's memory under the limits: 80 connections, each sending a full 1 MiB body with no
 //! token, then one valid `node` call; then 80 sending 1 MiB bodies with a valid token, half of
-//! each at first, so that eight hold the whole body budget at once. A counting allocator
-//! measures what the server alone holds at its peak; it must stay under 32 MiB, half of `api`'s
-//! 64 MiB account.
+//! each at first, so that eight hold the whole body budget at once; then a job's records filling
+//! the buffer, with a stalled reader, documents waiting, and a page of them polled over MCP. A
+//! counting allocator measures what the server alone holds at its peak; it must stay under
+//! 32 MiB, half of `api`'s 64 MiB account.
 //!
 //! The test is alone in its own binary, so that nothing else allocates while it measures.
 mod common;
@@ -315,15 +316,37 @@ fn eighty_connections_with_1_mib_bodies_and_no_token_stay_under_32_mib() {
     );
     assert!(peak < 32 * 1024 * 1024, "peak {peak} bytes");
 
-    // The documents are checked, the job ends, and the reader, reading again, is sent the rest
-    // from the oldest record the buffer still holds, then the report and the exit.
+    // The documents are checked. With the buffer still full and the reader still stopped, an
+    // agent polls the events over MCP: a page of 1,000 records.
     harness.engine.0.borrow_mut().hold_checks = false;
-    harness.engine.finish(r#"{"rows_out":60000}"#, 0, None);
-    harness.clients[reader].pipe.borrow_mut().capacity = None;
-    settle(&mut harness);
+    settle_but(&mut harness, reader);
     for &client in &waiting {
         assert_eq!(harness.clients[client].response().unwrap().status, 200);
     }
+    PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+    let poller = connect(&mut harness);
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"moruna_job_events","arguments":{{"id":"{RUN}","from":0}}}}}}"#
+    );
+    harness.clients[poller].send(&Harness::post("/mcp", &token, &call));
+    settle_but(&mut harness, reader);
+    let page = harness.clients[poller].response().unwrap().json();
+    let records = page["result"]["structuredContent"]["records"]
+        .as_array()
+        .unwrap();
+    assert_eq!(records.len(), 1_000);
+    let peak = PEAK.load(Ordering::Relaxed);
+    report(
+        "the buffer full, a reader that stopped, an MCP page of 1,000 records",
+        peak,
+    );
+    assert!(peak < 32 * 1024 * 1024, "peak {peak} bytes");
+
+    // The job ends, and the reader, reading again, is sent the rest from the oldest record the
+    // buffer still holds, then the report and the exit.
+    harness.engine.finish(r#"{"rows_out":60000}"#, 0, None);
+    harness.clients[reader].pipe.borrow_mut().capacity = None;
+    settle(&mut harness);
     let stream = String::from_utf8(std::mem::take(&mut harness.clients[reader].received)).unwrap();
     assert!(
         stream.ends_with("\"diagnostic\":null}\n\n"),

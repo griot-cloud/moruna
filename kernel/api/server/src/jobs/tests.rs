@@ -463,6 +463,175 @@ fn a_stream_sends_records_heartbeats_then_the_report_and_the_exit() {
     assert!(text.starts_with("id: 1\n"));
 }
 
+/// The page of the events' tool for [`RUN`] after its record `after`, parsed.
+fn page(jobs: &Jobs, after: u64) -> Value {
+    serde_json::from_str(&jobs.page(RUN, after).expect("the job is kept")).expect("a page is JSON")
+}
+
+/// Each event of `page`: its name, and its number when it has one.
+fn shape(page: &Value) -> Vec<(String, Option<u64>)> {
+    page["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| {
+            (
+                event["event"].as_str().unwrap().to_string(),
+                event["id"].as_u64(),
+            )
+        })
+        .collect()
+}
+
+/// `(name, id)` for a record numbered `id`.
+fn record(id: u64) -> (String, Option<u64>) {
+    ("event".to_string(), Some(id))
+}
+
+/// `(name, None)` for an event with no number.
+fn named(name: &str) -> (String, Option<u64>) {
+    (name.to_string(), None)
+}
+
+#[test]
+fn a_page_holds_the_records_after_from_then_the_end_and_where_to_go_on() {
+    let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
+    running(&mut jobs, &mut engine, V1);
+    // Running, with its first record: that record; after it, nothing yet.
+    let first = page(&jobs, 0);
+    assert_eq!(shape(&first), [record(1)]);
+    assert_eq!(first["records"][0]["data"]["kind"], "attempt_started");
+    assert_eq!(first["next"], 1);
+    assert_eq!(page(&jobs, 1), json!({ "records": [], "next": 1 }));
+    // A heartbeat and a record come. A page holds no heartbeat, as a fresh stream sends none
+    // until the next one comes: the job's latest is `jobs_get`'s.
+    engine.heartbeat(10);
+    engine.log("source", "two");
+    jobs.pump(&mut engine, NOW);
+    let second = page(&jobs, 1);
+    assert_eq!(shape(&second), [record(2)]);
+    assert_eq!(second["records"][0]["data"]["text"], "two");
+    assert_eq!(second["next"], 2);
+    // It ends: after the last record, the report and the exit, with no number; the page says
+    // to go on from where it was, and polled again it says the same.
+    engine.finish(r#"{"rows_out":20}"#, 0, None);
+    jobs.pump(&mut engine, NOW);
+    let end = page(&jobs, 2);
+    assert_eq!(shape(&end), [named("report"), named("exit")]);
+    assert_eq!(
+        end["records"][0]["data"],
+        json!({ "type": "report", "report": { "rows_out": 20 }, "plan": { "id": "plan-1" } })
+    );
+    assert_eq!(
+        end["records"][1]["data"],
+        json!({ "type": "exit", "code": 0, "diagnostic": null })
+    );
+    assert_eq!(end["next"], 2);
+    assert_eq!(page(&jobs, 2), end);
+    // From the start, the page is what a fresh stream sends, event for event.
+    let whole = page(&jobs, 0);
+    let (text, ended) = sent(&jobs, &mut jobs.stream(RUN, None).unwrap());
+    assert!(ended);
+    let streamed: Vec<Value> = text
+        .split("\n\n")
+        .filter(|event| !event.is_empty())
+        .map(|event| {
+            let data = event.rsplit("data: ").next().unwrap();
+            serde_json::from_str(data).unwrap()
+        })
+        .collect();
+    let paged: Vec<Value> = whole["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["data"].clone())
+        .collect();
+    assert_eq!(paged, streamed);
+    assert_eq!(
+        shape(&whole),
+        [record(1), record(2), named("report"), named("exit")]
+    );
+    assert!(jobs.page("ffffffffffffffffffffffffffffffff", 0).is_none());
+}
+
+#[test]
+fn a_page_holds_at_most_1_000_events_and_its_end_whole() {
+    let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
+    running(&mut jobs, &mut engine, V1);
+    for n in 2..=1_500 {
+        engine.log("source", &format!("line {n}"));
+    }
+    // One line too long to read: the end will carry a note of it.
+    engine.say(&"x".repeat(ENGINE_LINE_LIMIT + 1));
+    jobs.pump(&mut engine, NOW);
+    let first = page(&jobs, 0);
+    let ids: Vec<u64> = shape(&first).iter().map(|event| event.1.unwrap()).collect();
+    assert_eq!(ids, (1..=1_000).collect::<Vec<u64>>());
+    assert_eq!(first["next"], 1_000);
+    // Caught up while the job runs: the rest, then the note, as a fresh stream sends it.
+    let rest = page(&jobs, 1_000);
+    let events = shape(&rest);
+    assert_eq!(events.len(), 501);
+    assert_eq!(events[499], record(1_500));
+    assert_eq!(events[500], named("note"));
+    assert_eq!(rest["records"][500]["data"]["skipped_lines"], 1);
+    assert_eq!(rest["next"], 1_500);
+    engine.finish("{}", 0, None);
+    jobs.pump(&mut engine, NOW);
+    // The end is three events: with 997 records it fits, with 998 it waits for the next page.
+    let fits = shape(&page(&jobs, 503));
+    assert_eq!(fits.len(), 1_000);
+    assert_eq!(fits[996], record(1_500));
+    assert_eq!(fits[997..], [named("note"), named("report"), named("exit")]);
+    let waits = page(&jobs, 502);
+    assert_eq!(shape(&waits).len(), 998);
+    assert_eq!(waits["next"], 1_500);
+    assert_eq!(
+        shape(&page(&jobs, 1_500)),
+        [named("note"), named("report"), named("exit")]
+    );
+    // 1,000 records exactly leave no room for the end.
+    let full = page(&jobs, 500);
+    assert_eq!(shape(&full).len(), 1_000);
+    assert_eq!(full["next"], 1_500);
+}
+
+#[test]
+fn a_page_passes_over_what_the_buffer_has_let_go() {
+    let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
+    running(&mut jobs, &mut engine, V1);
+    let line = "x".repeat(512 * 1024);
+    for _ in 0..40 {
+        engine.log("source", &line);
+        jobs.pump(&mut engine, NOW);
+    }
+    let records = jobs.buffered().1 as u64;
+    let kept = page(&jobs, 0);
+    let ids: Vec<u64> = shape(&kept).iter().map(|event| event.1.unwrap()).collect();
+    let first = 41 - records + 1;
+    assert_eq!(
+        ids,
+        (first..=41).collect::<Vec<u64>>(),
+        "the numbers show the gap"
+    );
+    assert_eq!(kept["next"], 41);
+    // A job whose records have all gone gives the page its end alone.
+    engine.finish("{}", 0, None);
+    jobs.pump(&mut engine, NOW);
+    engine.run_as("11111111111111111111111111111111");
+    running_as(&mut jobs, &mut engine, "11111111111111111111111111111111");
+    for _ in 0..40 {
+        engine.log("source", &line);
+        jobs.pump(&mut engine, NOW);
+    }
+    assert_eq!(
+        shape(&page(&jobs, 0)),
+        [named("report"), named("exit")],
+        "the first job's records are all gone"
+    );
+    assert_eq!(page(&jobs, 7)["next"], 7);
+}
+
 #[test]
 fn the_buffer_keeps_the_last_records_within_its_bytes_and_a_stream_passes_the_gap() {
     let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
@@ -630,6 +799,10 @@ fn a_secret_appears_in_nothing_the_node_keeps_or_answers() {
     all.push_str(&serde_json::to_string(&jobs.list()).unwrap());
     assert!(!all.contains(SECRET), "{all}");
     assert_eq!(all.matches("[redacted]").count(), 5, "{all}");
+    // A page of the events' tool: the log, the report and the exit, each redacted.
+    let page = jobs.page(RUN, 0).unwrap();
+    assert!(!page.contains(SECRET), "{page}");
+    assert_eq!(page.matches("[redacted]").count(), 3, "{page}");
     assert_eq!(
         jobs.status(RUN)
             .unwrap()

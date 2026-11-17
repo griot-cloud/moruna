@@ -24,8 +24,9 @@
 //!   last [`AUDIT_LIMIT`] are kept in memory, and `node/audit` answers the newest
 //!   [`AUDIT_ANSWER_LIMIT`], newest first.
 //! - MCP (2D): `POST /mcp` on the same port with the same tokens, MCP's Streamable HTTP,
-//!   stateless, at [`PROTOCOL_VERSION`]: one tool per operation, `moruna_<id>`, but the stream
-//!   of events.
+//!   stateless, at [`PROTOCOL_VERSION`]: one tool per operation, `moruna_<id>`. The stream of
+//!   a job's events is `moruna_job_events`, which answers up to 1,000 of them after a record,
+//!   and the record to ask after next: an agent polls.
 //! - Jobs (3A, 3B): the server is the engine's host. Through an [`EngineHost`] the node gives it
 //!   ([`Server::with_engine`]), it has the engine check a document, starts a fresh engine for
 //!   each job with the host protocol's `spec`, sends `cancel`, and reads `hello`, `heartbeat`,

@@ -14,8 +14,8 @@ use crate::{
 };
 use alloc::{boxed::Box, collections::VecDeque, format, string::String, vec, vec::Vec};
 use moruna_api::{
-    ErrorCode, Heartbeat, Job, JobState, JobStatus, JobSummary, Jobs as JobList, Refusal,
-    Submitted, Validation,
+    EVENTS_PAGE, ErrorCode, Heartbeat, Job, JobState, JobStatus, JobSummary, Jobs as JobList,
+    Refusal, Submitted, Validation,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -204,7 +204,7 @@ struct ExitLine {
 }
 
 /// Where a stream of a job's events has got to.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Stream {
     ordinal: u64,
     /// The buffer position of the next record to send.
@@ -213,6 +213,21 @@ pub(crate) struct Stream {
     heartbeats: u64,
     /// How many of the engine's skipped lines the stream has been told of.
     skipped: u64,
+}
+
+impl Stream {
+    /// A stream of `entry`'s events from its record `from` (its first when `None`): it sends
+    /// the heartbeats that come from now on, and the engine's skipped lines from the first.
+    fn new(entry: &Entry, from: Option<u64>) -> Self {
+        Self {
+            ordinal: entry.ordinal,
+            next: entry
+                .first
+                .saturating_add(from.unwrap_or(1).saturating_sub(1)),
+            heartbeats: entry.heartbeats,
+            skipped: 0,
+        }
+    }
 }
 
 /// The jobs' state.
@@ -401,15 +416,7 @@ impl Jobs {
     /// `GET /v1/jobs/{id}/events`: a stream of the job's events from its record `from` (its
     /// first when `None`), as far back as the buffer still holds them.
     pub(crate) fn stream(&self, id: &str, from: Option<u64>) -> Option<Stream> {
-        let entry = self.entry(id)?;
-        Some(Stream {
-            ordinal: entry.ordinal,
-            next: entry
-                .first
-                .saturating_add(from.unwrap_or(1).saturating_sub(1)),
-            heartbeats: entry.heartbeats,
-            skipped: 0,
-        })
+        self.entry(id).map(|entry| Stream::new(entry, from))
     }
 
     /// Writes to `out` what `stream` can be sent now, as Server-Sent Events: each record as
@@ -424,52 +431,75 @@ impl Jobs {
         else {
             return true;
         };
+        let all = self.records(entry, stream, |id, line| {
+            if out.len() >= STREAM_BATCH {
+                return false;
+            }
+            out.extend_from_slice(format!("id: {id}\nevent: event\ndata: ").as_bytes());
+            out.extend_from_slice(line.as_bytes());
+            out.extend_from_slice(b"\n\n");
+            true
+        });
+        all && tail(entry, stream, |name, line| event(out, name, line))
+    }
+
+    /// The answer of the events' MCP tool (item 3.7): a page of the job `id`'s events after its
+    /// record `after`, as JSON ([`moruna_api::JobEvents`]), or `None` when no job has this ID.
+    ///
+    /// The page holds what a fresh stream from the record after `after` would send at once, up
+    /// to [`EVENTS_PAGE`] events in all: the records, as far back as the buffer still holds
+    /// them, each with its number; then, once every record is in, the note of the engine's
+    /// skipped lines and, once the job has ended, its report and its exit. Those last come
+    /// together or not at all: a page never ends between them. A fresh stream sends no
+    /// heartbeat until one comes, so a page holds none. `next` is the number of the last
+    /// record in the page, or `after` when it holds none.
+    pub(crate) fn page(&self, id: &str, after: u64) -> Option<String> {
+        let entry = self.entry(id)?;
+        let mut stream = Stream::new(entry, Some(after.saturating_add(1)));
+        let mut out = String::from("{\"records\":[");
+        let (mut count, mut next) = (0, after);
+        let all = self.records(entry, &mut stream, |id, line| {
+            if count == EVENTS_PAGE {
+                return false;
+            }
+            page_event(&mut out, count == 0, Some(id), "event", line);
+            count += 1;
+            next = id;
+            true
+        });
+        if all {
+            // Count what follows the records first, on a copy of the stream, to see if it fits.
+            let mut following = 0;
+            tail(entry, &mut stream.clone(), |_, _| following += 1);
+            if count + following <= EVENTS_PAGE {
+                tail(entry, &mut stream, |name, line| {
+                    page_event(&mut out, count == 0, None, name, line);
+                    count += 1;
+                });
+            }
+        }
+        out.push_str(&format!("],\"next\":{next}}}"));
+        Some(out)
+    }
+
+    /// Hands `take` each of `entry`'s records from where `stream` has got to, with its number
+    /// in the job's stream, until `take` says it takes no more. Records the buffer has let go
+    /// of are passed over: the numbers show the gap. Says whether every record was taken.
+    fn records(
+        &self,
+        entry: &Entry,
+        stream: &mut Stream,
+        mut take: impl FnMut(u64, &str) -> bool,
+    ) -> bool {
         let end = entry.first + entry.records;
-        // Records the buffer has let go of are passed over: the IDs show the gap.
         stream.next = stream.next.max(self.front).max(entry.first);
-        while stream.next < end && out.len() < STREAM_BATCH {
-            if let Some(line) = self.lines.get((stream.next - self.front) as usize) {
-                let id = stream.next - entry.first + 1;
-                out.extend_from_slice(format!("id: {id}\nevent: event\ndata: ").as_bytes());
-                out.extend_from_slice(line.as_bytes());
-                out.extend_from_slice(b"\n\n");
+        while stream.next < end {
+            if let Some(line) = self.lines.get((stream.next - self.front) as usize)
+                && !take(stream.next - entry.first + 1, line)
+            {
+                return false;
             }
             stream.next += 1;
-        }
-        if stream.next < end {
-            return false;
-        }
-        if entry.skipped > stream.skipped {
-            stream.skipped = entry.skipped;
-            event(
-                out,
-                "note",
-                &format!(
-                    "{{\"type\":\"note\",\"skipped_lines\":{0},\"message\":\"{0} of the engine's \
-                     lines were longer than {ENGINE_LINE_LIMIT} bytes and were skipped\"}}",
-                    entry.skipped
-                ),
-            );
-        }
-        if entry.heartbeats > stream.heartbeats {
-            stream.heartbeats = entry.heartbeats;
-            if let Some(line) = &entry.heartbeat_line {
-                event(out, "heartbeat", line);
-            }
-        }
-        if !entry.state.ended() {
-            return false;
-        }
-        if let Some(report) = &entry.report {
-            let plan = entry.plan.as_deref().unwrap_or("null");
-            event(
-                out,
-                "report",
-                &format!("{{\"type\":\"report\",\"report\":{report},\"plan\":{plan}}}"),
-            );
-        }
-        if let Some(line) = &entry.exit_line {
-            event(out, "exit", line);
         }
         true
     }
@@ -761,11 +791,63 @@ impl Jobs {
     }
 }
 
+/// What a stream sends once it has sent every record of `entry`, each handed to `send` with
+/// its event's name: a note of the engine's lines skipped since it last told, the heartbeat
+/// that came since it last looked, and, once the job has ended, its report and its exit. Says
+/// whether the stream has ended.
+fn tail(entry: &Entry, stream: &mut Stream, mut send: impl FnMut(&str, &str)) -> bool {
+    if entry.skipped > stream.skipped {
+        stream.skipped = entry.skipped;
+        send(
+            "note",
+            &format!(
+                "{{\"type\":\"note\",\"skipped_lines\":{0},\"message\":\"{0} of the engine's \
+                 lines were longer than {ENGINE_LINE_LIMIT} bytes and were skipped\"}}",
+                entry.skipped
+            ),
+        );
+    }
+    if entry.heartbeats > stream.heartbeats {
+        stream.heartbeats = entry.heartbeats;
+        if let Some(line) = &entry.heartbeat_line {
+            send("heartbeat", line);
+        }
+    }
+    if !entry.state.ended() {
+        return false;
+    }
+    if let Some(report) = &entry.report {
+        let plan = entry.plan.as_deref().unwrap_or("null");
+        send(
+            "report",
+            &format!("{{\"type\":\"report\",\"report\":{report},\"plan\":{plan}}}"),
+        );
+    }
+    if let Some(line) = &entry.exit_line {
+        send("exit", line);
+    }
+    true
+}
+
 /// One Server-Sent Event named `name` whose data is `line`.
 fn event(out: &mut Vec<u8>, name: &str, line: &str) {
     out.extend_from_slice(format!("event: {name}\ndata: ").as_bytes());
     out.extend_from_slice(line.as_bytes());
     out.extend_from_slice(b"\n\n");
+}
+
+/// One event of a page of the events' tool, `{"id":<id>,"event":"<name>","data":<line>}`, its
+/// `id` only for a record, after a comma unless it is the `first`.
+fn page_event(out: &mut String, first: bool, id: Option<u64>, name: &str, line: &str) {
+    if !first {
+        out.push(',');
+    }
+    match id {
+        Some(id) => out.push_str(&format!("{{\"id\":{id},\"event\":\"{name}\",\"data\":")),
+        None => out.push_str(&format!("{{\"event\":\"{name}\",\"data\":")),
+    }
+    out.push_str(line);
+    out.push('}');
 }
 
 /// The answer to a validate: the engine's verdict.

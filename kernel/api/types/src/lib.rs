@@ -433,6 +433,62 @@ pub struct Heartbeat {
     pub staging_bytes: u64,
 }
 
+/// The name of the MCP tool that follows a job's events (item 3.7): MCP stays stateless, so the
+/// tool answers a page of what `GET /v1/jobs/{id}/events` streams, and an agent polls.
+pub const EVENTS_TOOL: &str = "moruna_job_events";
+
+/// The most records one answer of [`EVENTS_TOOL`] holds.
+pub const EVENTS_PAGE: usize = 1_000;
+
+/// What [`EVENTS_TOOL`] does, for the MCP tool list.
+pub const EVENTS_TOOL_SUMMARY: &str = "A job's events, a page at a time: up to 1,000 after the record `from` (0, or absent, for the first), each event and log record with its number, then, once every record has been given and the job has ended, its report and its exit. `next` is the `from` of the next call: poll with it until the exit.";
+
+/// The answer of the MCP tool `moruna_job_events`: a page of a job's events, as a stream of
+/// `GET /v1/jobs/{id}/events` from the record after `from` would send them at once, and where
+/// the next page begins.
+// `D` is an event's JSON: any JSON object, in whatever form the program holds JSON.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
+#[cfg_attr(any(test, feature = "schema"), schemars(rename = "JobEvents"))]
+pub struct JobEvents<D> {
+    /// At most 1,000, in the order the stream sends them: the job's event and log records after
+    /// `from`, then, once they have all been given, a note of the engine's skipped lines if it
+    /// had any, and, once the job has ended, its report and its exit.
+    pub records: Vec<JobEvent<D>>,
+    /// The `from` of the next call: the number of the last record in this page, or this call's
+    /// `from` when the page holds none.
+    pub next: u64,
+}
+
+/// One event of a job's stream, as `GET /v1/jobs/{id}/events` sends it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
+#[cfg_attr(any(test, feature = "schema"), schemars(rename = "JobEvent"))]
+pub struct JobEvent<D> {
+    /// The record's number in the job's stream, from 1, for an `event`; absent for the others.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    /// What it is.
+    pub event: JobEventName,
+    /// Its JSON: the record's line as `moruna_event` renders it, or the engine's message.
+    pub data: D,
+}
+
+/// The name of an event in a job's stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum JobEventName {
+    /// An event or log record of the engine's.
+    Event,
+    /// How many of the engine's lines were too long to read, and were skipped.
+    Note,
+    /// The engine's `report` message: the run's report and its plan.
+    Report,
+    /// The engine's `exit` message: its exit code and diagnostic. Nothing follows it.
+    Exit,
+}
+
 /// An HTTP method the API uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
@@ -491,7 +547,8 @@ pub const ID: &str = "{id}";
 /// One operation of the API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Operation {
-    /// The operation's ID; its MCP tool is `moruna_<id>`.
+    /// The operation's ID. Its MCP tool is `moruna_<id>`, but for the stream of events
+    /// ([`Operation::tool_name`]).
     pub id: &'static str,
     /// Its HTTP method.
     pub method: Method,
@@ -512,15 +569,22 @@ pub struct Operation {
 }
 
 impl Operation {
-    /// The name of the operation's MCP tool.
+    /// The name of the operation's MCP tool: `moruna_<id>`, and [`EVENTS_TOOL`] for the stream
+    /// of events, whose tool answers a page of it.
     pub fn tool_name(&self) -> String {
-        format!("moruna_{}", self.id)
+        match self.response {
+            Response::Events => String::from(EVENTS_TOOL),
+            _ => format!("moruna_{}", self.id),
+        }
     }
 
-    /// Whether the operation has an MCP tool: every operation but a stream of events, which a
-    /// tool's one answer cannot carry.
-    pub const fn has_tool(&self) -> bool {
-        !matches!(self.response, Response::Events)
+    /// What the operation's MCP tool does: the operation's summary, and
+    /// [`EVENTS_TOOL_SUMMARY`] for the stream of events.
+    pub const fn tool_summary(&self) -> &'static str {
+        match self.response {
+            Response::Events => EVENTS_TOOL_SUMMARY,
+            _ => self.summary,
+        }
     }
 
     /// Whether the operation's path carries a run's ID.

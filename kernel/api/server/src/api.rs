@@ -131,7 +131,8 @@ pub(crate) enum Call {
 pub(crate) struct Inputs<'a> {
     /// The run's ID in the path.
     pub id: Option<&'a str>,
-    /// The record a stream of events starts from.
+    /// The record a stream of events starts from; for the events' tool, the record its page
+    /// comes after.
     pub from: Option<u64>,
     /// The body.
     pub body: &'a [u8],
@@ -352,6 +353,13 @@ impl Api {
                 None => Answer::error(ErrorCode::NotFound, "no job has this ID"),
             },
             Response::Report => self.jobs.report(id),
+            // The tool answers a page of the stream, after its record `from` (item 3.7).
+            Response::Events if matches!(shape, Shape::Tool(_)) => {
+                match self.jobs.page(id, inputs.from.unwrap_or(0)) {
+                    Some(page) => Answer::ok(Ok(page.into_bytes())),
+                    None => Answer::error(ErrorCode::NotFound, "no job has this ID"),
+                }
+            }
             Response::Events => match self.jobs.stream(id, inputs.from) {
                 Some(stream) => {
                     self.record(now, grant.as_ref(), operation, operation.status);

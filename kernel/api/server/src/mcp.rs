@@ -2,16 +2,18 @@
 //! stateless. Each request carries one JSON-RPC 2.0 message and is answered with one JSON
 //! response; a notification or a response is answered `202` with no body. No server-sent stream
 //! and no session ID. The tools are the operations, one each, listed exactly as
-//! `kernel/api/mcp-tools.json` (generated from `moruna-api`) lists them.
+//! `kernel/api/mcp-tools.json` (generated from `moruna-api`) lists them. The stream of a job's
+//! events is the tool `moruna_job_events` (item 3.7), which answers a page of it at a time:
+//! an agent polls, with the `next` each page gives.
 
 use crate::{
     api::{Admission, Answer, Api, Call, Inputs, Outcome},
     http::Request,
     token::Grant,
 };
-use alloc::{string::String, vec::Vec};
+use alloc::{borrow::Cow, string::String, vec::Vec};
 use moruna_api::{ErrorCode, OPERATIONS, Request as Body, Scope};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json, value::RawValue};
 
 /// The path MCP is served on.
@@ -55,27 +57,56 @@ pub(crate) fn tools() -> Value {
     serde_json::from_str(TOOLS).unwrap_or(Value::Null)
 }
 
+/// A JSON-RPC answer whose `result` is a tool's.
+#[derive(Serialize)]
+struct ToolReply<'a> {
+    jsonrpc: &'static str,
+    id: &'a Value,
+    result: ToolResult<'a>,
+}
+
+/// A tool result: one text content item, and the answer's JSON or that it is an error.
+#[derive(Serialize)]
+struct ToolResult<'a> {
+    content: [Content<'a>; 1],
+    #[serde(rename = "structuredContent", skip_serializing_if = "Option::is_none")]
+    structured: Option<&'a RawValue>,
+    #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
+    is_error: Option<bool>,
+}
+
+/// A text content item.
+#[derive(Serialize)]
+struct Content<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: Cow<'a, str>,
+}
+
 /// A tool result holding an operation's answer: on success, its JSON as `structuredContent` and
-/// as one text content item; on an error, 2A's error body as the text and `isError`.
-fn tool_result(answer: &Answer) -> Value {
-    let text = String::from_utf8_lossy(&answer.body);
-    if (200..300).contains(&answer.status) {
-        let structured: Value = serde_json::from_slice(&answer.body).unwrap_or(Value::Null);
-        json!({
-            "content": [{ "type": "text", "text": text }],
-            "structuredContent": structured
-        })
-    } else {
-        json!({
-            "content": [{ "type": "text", "text": text }],
-            "isError": true
-        })
+/// as one text content item; on an error, 2A's error body as the text and `isError`. The
+/// answer's JSON is written as the text it is: no tree is made of it, however long it is.
+fn tool_result(answer: &Answer) -> ToolResult<'_> {
+    let ok = (200..300).contains(&answer.status);
+    ToolResult {
+        content: [Content {
+            kind: "text",
+            text: String::from_utf8_lossy(&answer.body),
+        }],
+        structured: ok
+            .then(|| serde_json::from_slice(&answer.body).ok())
+            .flatten(),
+        is_error: (!ok).then_some(true),
     }
 }
 
 /// The answer to the tool call whose JSON-RPC ID is `id`, from the operation's `answer`.
 pub(crate) fn tool_answer(id: &Value, answer: &Answer) -> Answer {
-    reply(id, Ok(tool_result(answer)))
+    Answer::ok(serde_json::to_vec(&ToolReply {
+        jsonrpc: "2.0",
+        id,
+        result: tool_result(answer),
+    }))
 }
 
 /// A `tools/call` message, read for its arguments as they were written.
@@ -169,7 +200,7 @@ impl Api {
             "ping" => Ok(json!({})),
             "tools/list" => Ok(tools()),
             "tools/call" => match self.tool(message.get("params"), body, grant, id, now) {
-                Ok(Outcome::Answer(answer)) => Ok(tool_result(&answer)),
+                Ok(Outcome::Answer(answer)) => return Outcome::Answer(tool_answer(id, &answer)),
                 Ok(later) => return later,
                 Err(refused) => Err(refused),
             },
@@ -179,8 +210,9 @@ impl Api {
     }
 
     /// Runs the operation of the tool `params` names, with the same scope rule as HTTP, and
-    /// records the call. A tool's arguments are its operation's request: a job's fields, the
-    /// run's `id`, or nothing; `body` is the whole message, read for a job as it was written.
+    /// records the call. A tool's arguments are its operation's request: a job's fields; or the
+    /// run's `id`, and `from` for the events' tool, which may be left out; or nothing. `body`
+    /// is the whole message, read for a job as it was written.
     fn tool(
         &mut self,
         params: Option<&Value>,
@@ -198,8 +230,7 @@ impl Api {
             .ok_or((INVALID_PARAMS, "Invalid params: the tool's name is missing"))?;
         let operation = OPERATIONS
             .iter()
-            .filter(|operation| operation.has_tool())
-            .find(|operation| name.strip_prefix("moruna_") == Some(operation.id))
+            .find(|operation| operation.tool_name() == name)
             .ok_or((INVALID_PARAMS, "Invalid params: no tool has this name"))?;
         let empty = Map::new();
         let arguments = match params.get("arguments") {
@@ -229,19 +260,27 @@ impl Api {
             };
             return Ok(self.call_tool(operation, grant, inputs, id, now));
         }
-        let inputs = if operation.takes_id() {
-            match (arguments.get("id").and_then(Value::as_str), arguments.len()) {
-                (Some(run), 1) => Inputs {
-                    id: Some(run),
-                    ..Inputs::default()
-                },
-                _ => return refuse(self, "this operation takes the run's id, and nothing else"),
+        // No operation takes a query without a run's ID.
+        let takes = match (operation.takes_id(), operation.query.is_empty()) {
+            (false, _) => "this operation takes no arguments",
+            (true, true) => "this operation takes the run's id, and nothing else",
+            (true, false) => {
+                "this operation takes the run's id, and from, a record's number, and nothing else"
             }
-        } else if arguments.is_empty() {
-            Inputs::default()
-        } else {
-            return refuse(self, "this operation takes no arguments");
         };
+        let mut inputs = Inputs::default();
+        for (argument, value) in arguments {
+            match argument.as_str() {
+                "id" if operation.takes_id() && value.is_string() => inputs.id = value.as_str(),
+                query if operation.query.contains(&query) && value.is_u64() => {
+                    inputs.from = value.as_u64();
+                }
+                _ => return refuse(self, takes),
+            }
+        }
+        if operation.takes_id() && inputs.id.is_none() {
+            return refuse(self, takes);
+        }
         Ok(self.call_tool(operation, grant, inputs, id, now))
     }
 }

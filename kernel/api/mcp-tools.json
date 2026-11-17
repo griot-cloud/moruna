@@ -807,6 +807,98 @@
       }
     },
     {
+      "description": "A job's events, a page at a time: up to 1,000 after the record `from` (0, or absent, for the first), each event and log record with its number, then, once every record has been given and the job has ended, its report and its exit. `next` is the `from` of the next call: poll with it until the exit.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "description": "The number of the last record already read: the answer's records come after it. 0, or absent, for the first.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "description": "The run's ID.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "moruna_job_events",
+      "outputSchema": {
+        "description": "The answer of the MCP tool `moruna_job_events`: a page of a job's events, as a stream of\n`GET /v1/jobs/{id}/events` from the record after `from` would send them at once, and where\nthe next page begins.",
+        "properties": {
+          "next": {
+            "description": "The `from` of the next call: the number of the last record in this page, or this call's\n`from` when the page holds none.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "records": {
+            "description": "At most 1,000, in the order the stream sends them: the job's event and log records after\n`from`, then, once they have all been given, a note of the engine's skipped lines if it\nhad any, and, once the job has ended, its report and its exit.",
+            "items": {
+              "description": "One event of a job's stream, as `GET /v1/jobs/{id}/events` sends it.",
+              "properties": {
+                "data": {
+                  "additionalProperties": true,
+                  "description": "Its JSON: the record's line as `moruna_event` renders it, or the engine's message.",
+                  "type": "object"
+                },
+                "event": {
+                  "description": "What it is.",
+                  "oneOf": [
+                    {
+                      "const": "event",
+                      "description": "An event or log record of the engine's.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "note",
+                      "description": "How many of the engine's lines were too long to read, and were skipped.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "report",
+                      "description": "The engine's `report` message: the run's report and its plan.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "exit",
+                      "description": "The engine's `exit` message: its exit code and diagnostic. Nothing follows it.",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "id": {
+                  "description": "The record's number in the job's stream, from 1, for an `event`; absent for the others.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "event",
+                "data"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "records",
+          "next"
+        ],
+        "title": "JobEvents",
+        "type": "object"
+      }
+    },
+    {
       "description": "A job's report, the engine's RunReport, once the job has ended.",
       "inputSchema": {
         "additionalProperties": false,
