@@ -153,7 +153,14 @@ mod proof {
             attempt: cfg.attempt,
             directory: &cfg.state_directory,
         };
-        let prepared = native::prepare(&admission, Inbound::Spec { spec, plan: None })?;
+        let prepared = native::prepare(
+            &admission,
+            Inbound::Spec {
+                spec,
+                plan: None,
+                secrets: Default::default(),
+            },
+        )?;
         fs::create_dir(&cfg.evidence_directory)?;
         fs::set_permissions(&cfg.evidence_directory, fs::Permissions::from_mode(0o700))?;
         // Durable exact engine key BEFORE the sole SDK dispatch call.

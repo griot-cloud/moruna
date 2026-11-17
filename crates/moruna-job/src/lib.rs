@@ -56,12 +56,15 @@ pub use call::{CALL_HEADER_MAX, CALL_MAGIC, CALL_VERSION, CallError, ServedCall}
 /// fingerprint (SDD 18 e.4).
 pub use canonical::to_string as canonical_json;
 pub use catalogue::{Catalogue, CatalogueError};
-pub use check::{IMAGE_KIND, Refusal, RefusalCode, check, check_graph, drafts, settings_refusals};
+pub use check::{
+    IMAGE_KIND, Refusal, RefusalCode, check, check_graph, check_secrets, drafts, settings_refusals,
+};
 pub use doc::{
     AzureDoc, BudgetDoc, CHECKPOINT_INTERVAL_BOUNDS_MS, CHECKPOINT_INTERVAL_MS, CheckpointDoc,
     ElasticDoc, ErrorPolicyDoc, GcsDoc, GuaranteeDoc, HostProfileDoc, JobSpec, KindDoc,
-    ObjectStoreDoc, ReportDoc, S3Doc, SPEC_VERSION, SizerDoc, SpecError, StagingDoc, TaskIdsDoc,
-    TaskRefDoc, checkpoint_interval_ms, is_task_id,
+    LITERAL_CREDENTIAL, ObjectStoreDoc, ReportDoc, S3Doc, SPEC_VERSION, SecretRef, SizerDoc,
+    SpecError, StagingDoc, TaskIdsDoc, TaskRefDoc, checkpoint_interval_ms, is_secret_name,
+    is_task_id,
 };
 pub use flatbuffer::{JOB_IDENTIFIER, JobError, is_job_flatbuffer};
 pub use job::{Edge, IN, JOB_VERSION, Job, OUT, PortRef, Reporting, Task, V1_SINK, V1_SOURCE};
