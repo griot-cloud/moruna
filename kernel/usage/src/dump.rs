@@ -169,7 +169,7 @@ fn next_nonzero(
 }
 
 /// The smallest buffer [`encode`] writes a dump in: room for a `b` line's two names.
-pub const BUF_MIN: usize = 512;
+pub const BUF_MIN: usize = 256;
 
 /// Writes one dump of `header.count` counters, `counter(i)` giving counter `i`, as lines built
 /// in `buf` (at most [`LINE_MAX`] bytes of it) and passed to `emit` one at a time. Each counter

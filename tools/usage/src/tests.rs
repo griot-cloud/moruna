@@ -381,6 +381,25 @@ fn fixture(name: &str) -> (PathBuf, report::Config) {
     log.push_str(
         "linux: moruna-engine (pid 3) exited with code 0; 40 calls served; refused: rseq(334) x2\n",
     );
+    // The engine: position independent, so loaded elsewhere than its file says, and its lines
+    // come through the Linux server's console with its prefix.
+    let mut engine = binary(0x9_0000, 2, &[]);
+    engine[16..18].copy_from_slice(&3u16.to_le_bytes());
+    put(&root.join("image/moruna-engine"), &engine);
+    let header = Header {
+        program: "40.0000000000090000",
+        process: "?",
+        instance: 9,
+        seq: 0,
+        addr: 0x7f00_0009_0000,
+        count: 2,
+        wakes: 0,
+    };
+    let mut buf = [0u8; 300];
+    dump::encode(&header, |i| i as u64 + 1, &mut buf, &mut |l: &[u8]| {
+        log.push_str("linux moruna-engine: ");
+        log.push_str(std::str::from_utf8(l).unwrap())
+    });
     put(&job.join("serial.log"), log.as_bytes());
     let cfg = report::Config {
         src,
@@ -388,6 +407,7 @@ fn fixture(name: &str) -> (PathBuf, report::Config) {
         prod_kit: None,
         out: root.join("out"),
         runs: vec![("nyc-score".into(), job)],
+        programs: vec![root.join("image/moruna-engine")],
     };
     (root, cfg)
 }
@@ -440,7 +460,14 @@ fn the_report_counts_calls_and_sorts_what_nothing_used() {
         !job.kernel_areas.contains_key("core and alloc"),
         "the stub is not in the image"
     );
-    assert_eq!((job.dumps, job.broken_dumps), (1, 0));
+    assert_eq!((job.dumps, job.broken_dumps), (2, 0));
+    // The engine, found by --program and loaded elsewhere than its file says.
+    assert_eq!(job.programs["moruna-engine"].lines, (0, 77));
+    assert!(
+        cfg.out
+            .join("jobs/nyc-score/moruna-engine.profraw")
+            .is_file()
+    );
     assert_eq!(r.all.programs["linux"].wakes, 3);
 
     // What nothing used, in the coordinator's order, and the accelerator path apart.
@@ -504,6 +531,7 @@ fn the_report_counts_calls_and_sorts_what_nothing_used() {
             llvm: None,
             out: cfg.out.clone(),
             runs: cfg.runs.clone(),
+            programs: cfg.programs.clone(),
         },
         Some(&fake),
     )
@@ -636,7 +664,15 @@ fn the_command_line_is_parsed_or_refused_by_name() {
             llvm: None,
             out: "o".into(),
             runs: vec![("a".into(), "d1".into()), ("b".into(), "d2".into())],
+            programs: vec![],
         }
+    );
+    let with = parse(&args(
+        "report --src s --kit k --program e1 --program e2 --out o a=d",
+    ))
+    .unwrap();
+    assert!(
+        matches!(with, Command::Report { programs, .. } if programs == [PathBuf::from("e1"), PathBuf::from("e2")])
     );
     assert_eq!(
         parse(&args("profraw --elf e --counters c --out o")).unwrap(),
@@ -660,6 +696,10 @@ fn the_command_line_is_parsed_or_refused_by_name() {
             "--what is not an option",
         ),
         ("profraw --elf e --counters c --out o a=d", "takes no jobs"),
+        (
+            "profraw --elf e --counters c --out o --program p",
+            "takes no jobs or programs",
+        ),
         ("profraw --elf", "needs a value"),
         ("explain", "unknown command"),
     ] {

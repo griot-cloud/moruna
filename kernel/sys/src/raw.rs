@@ -609,6 +609,11 @@ sized!(load64, store64, u64);
 #[path = "usage.rs"]
 #[doc(hidden)]
 pub mod usage;
+/// The engine's (a Linux program): its counters at its exit.
+#[cfg(all(feature = "usage", target_os = "linux", target_arch = "x86_64"))]
+#[path = "usage_linux.rs"]
+#[doc(hidden)]
+pub mod usage;
 
 /// `wait` in the usage build, the dumps' wait (`usage::wait`).
 #[cfg(all(feature = "usage", target_os = "none"))]

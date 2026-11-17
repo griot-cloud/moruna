@@ -121,6 +121,18 @@ pub struct Config {
     pub out: PathBuf,
     /// Each job's label and its MORUNA_USAGE_DIR.
     pub runs: Vec<(String, PathBuf)>,
+    /// Instrumented programs that are not the node's own, by their files: the engine, which
+    /// the job's image carries. Each is named by its file's name.
+    pub programs: Vec<PathBuf>,
+}
+
+/// Where the program `name` is: one of `cfg.programs`, else the kit's.
+fn program_path(cfg: &Config, name: &str) -> PathBuf {
+    cfg.programs
+        .iter()
+        .find(|p| p.file_name().is_some_and(|f| f == name))
+        .cloned()
+        .unwrap_or_else(|| cfg.kit.join("node-user-bins").join(name))
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
@@ -310,12 +322,16 @@ fn evidence(cfg: &Config, label: &str, dir: &Path) -> Result<Evidence, String> {
     let log = String::from_utf8_lossy(&read(&dir.join("serial.log"))?).into_owned();
     let decoded = dump::decode(&log);
     let programs = dump::programs(&decoded.dumps).map_err(|e| format!("{label}: {e}"))?;
-    let programs = named(programs, &kit_index(&cfg.kit)?).map_err(|e| format!("{label}: {e}"))?;
+    let programs = named(programs, &kit_index(cfg)?).map_err(|e| format!("{label}: {e}"))?;
     for (name, program) in &programs {
-        let binary = read(&cfg.kit.join("node-user-bins").join(name))?;
+        let binary = read(&program_path(cfg, name))?;
         let elf = Elf::parse(&binary).map_err(|e| format!("{label}: {name}: {e}"))?;
         let layout = profraw::counters(&elf).map_err(|e| format!("{label}: {name}: {e}"))?;
-        if layout.addr != program.addr || layout.count() != program.counters.len() as u64 {
+        // A position-independent program (the engine, static-pie on musl) is loaded at an
+        // address of its own, so only a fixed-address program's counters must be where its
+        // file puts them.
+        let moved = layout.addr != program.addr && !position_independent(&binary);
+        if moved || layout.count() != program.counters.len() as u64 {
             return Err(format!(
                 "{label}: {name}: its dumps are not of the kit's build ({:#x}, {} counters, against {:#x}, {})",
                 program.addr,
@@ -340,18 +356,28 @@ fn evidence(cfg: &Config, label: &str, dir: &Path) -> Result<Evidence, String> {
     })
 }
 
-/// The kit's programs by their fingerprint (`dump::fingerprint`): a dump names its build that
-/// way, not by a name. Two programs of one fingerprint are both named, joined by `|`.
-pub fn kit_index(kit: &Path) -> Result<BTreeMap<String, String>, String> {
-    let bins = kit.join("node-user-bins");
+/// An ELF of type `ET_DYN`: loaded wherever the loader puts it.
+fn position_independent(elf: &[u8]) -> bool {
+    elf.get(16..18) == Some(&3u16.to_le_bytes())
+}
+
+/// The kit's programs, and the others given, by their fingerprint (`dump::fingerprint`): a
+/// dump names its build that way, not by a name. Two programs of one fingerprint are both
+/// named, joined by `|`.
+pub fn kit_index(cfg: &Config) -> Result<BTreeMap<String, String>, String> {
+    let bins = cfg.kit.join("node-user-bins");
     let mut index: BTreeMap<String, String> = BTreeMap::new();
-    let mut names: Vec<String> = fs::read_dir(&bins)
+    let mut paths: Vec<PathBuf> = fs::read_dir(&bins)
         .map_err(|e| format!("{}: {e}", bins.display()))?
-        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
         .collect();
-    names.sort();
-    for name in names {
-        let Ok(bytes) = fs::read(bins.join(&name)) else {
+    paths.sort();
+    paths.extend(cfg.programs.iter().cloned());
+    for path in paths {
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let Ok(bytes) = fs::read(&path) else {
             continue;
         };
         let Some(print) = Elf::parse(&bytes)
@@ -395,7 +421,7 @@ fn binary(cfg: &Config, name: &str, job: Option<&Path>) -> PathBuf {
     match (name, job) {
         (KERNEL, Some(dir)) => dir.join("kernel.elf"),
         (KERNEL, None) => cfg.kit.join("moruna-microkernel.elf"),
-        (program, _) => cfg.kit.join("node-user-bins").join(program),
+        (program, _) => program_path(cfg, program),
     }
 }
 
@@ -478,12 +504,17 @@ fn program_calls(export: &Export, sources: &Sources) -> BTreeMap<String, u64> {
     calls
 }
 
-/// Covered and total lines of the files under `kernel/` (the program's own and Moruna's).
+/// Covered and total lines of the repository's files (under `kernel/`, `crates/` and `images/`):
+/// the program's own and Moruna's, not the toolchain's or a registry crate's.
 fn own_lines(export: &Export) -> (u64, u64) {
     export
         .files
         .iter()
-        .filter(|f| f.filename.contains("/kernel/"))
+        .filter(|f| {
+            ["/kernel/", "/crates/", "/images/"]
+                .iter()
+                .any(|d| f.filename.contains(d))
+        })
         .fold((0, 0), |(c, t), f| {
             (c + f.summary.lines.covered, t + f.summary.lines.count)
         })
@@ -1015,7 +1046,7 @@ pub fn build(cfg: &Config, tools: &dyn Tools) -> Result<Report, String> {
             tools.export(&binary(cfg, name, job_dir), &indexed)?,
         );
     }
-    let programs = named(dump::programs(&all_dumps)?, &kit_index(&cfg.kit)?)?;
+    let programs = named(dump::programs(&all_dumps)?, &kit_index(cfg)?)?;
     report.all = scope(
         "all jobs", &exports, &image, &programs, &all_linux, &sources,
     );

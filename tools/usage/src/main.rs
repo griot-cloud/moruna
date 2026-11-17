@@ -1,9 +1,13 @@
 //! `moruna-usage`: the usage build's report (stream U, `architecture/data-os-streams.md`).
 //!
 //! ```text
-//! moruna-usage report --src DIR --kit DIR [--prod-kit DIR] [--llvm DIR] --out DIR LABEL=RUN...
+//! moruna-usage report --src DIR --kit DIR [--prod-kit DIR] [--llvm DIR] [--program ELF]...
+//!                     --out DIR LABEL=RUN...
 //! moruna-usage profraw --elf ELF --counters FILE --out FILE
 //! ```
+//!
+//! `--program` names an instrumented program that is not in the kit, such as the engine the
+//! job's image carries.
 //!
 //! `report` reads each job's evidence (a `MORUNA_USAGE_DIR` that `moruna run` filled: the
 //! kernel's counters, the kernel ELF and the serial log with the programs' dumps), builds the
@@ -26,7 +30,7 @@ use std::path::PathBuf;
 
 use moruna_usage::{elf::Elf, profraw};
 
-const USAGE: &str = "usage: moruna-usage report --src DIR --kit DIR [--prod-kit DIR] [--llvm DIR] --out DIR LABEL=RUN...\n       moruna-usage profraw --elf ELF --counters FILE --out FILE";
+const USAGE: &str = "usage: moruna-usage report --src DIR --kit DIR [--prod-kit DIR] [--llvm DIR] [--program ELF]... --out DIR LABEL=RUN...\n       moruna-usage profraw --elf ELF --counters FILE --out FILE";
 
 /// A parsed command line.
 #[derive(Debug, PartialEq, Eq)]
@@ -38,6 +42,7 @@ enum Command {
         llvm: Option<PathBuf>,
         out: PathBuf,
         runs: Vec<(String, PathBuf)>,
+        programs: Vec<PathBuf>,
     },
     Profraw {
         elf: PathBuf,
@@ -50,6 +55,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
     let (command, rest) = args.split_first().ok_or(USAGE)?;
     let mut options: std::collections::BTreeMap<&str, PathBuf> = Default::default();
     let mut runs = Vec::new();
+    let mut programs = Vec::new();
     let mut i = 0;
     while i < rest.len() {
         let arg = rest[i].as_str();
@@ -57,7 +63,9 @@ fn parse(args: &[String]) -> Result<Command, String> {
             let value = rest
                 .get(i + 1)
                 .ok_or_else(|| format!("{arg} needs a value\n{USAGE}"))?;
-            if options.insert(name, PathBuf::from(value)).is_some() {
+            if name == "program" {
+                programs.push(PathBuf::from(value));
+            } else if options.insert(name, PathBuf::from(value)).is_some() {
                 return Err(format!("{arg} given twice"));
             }
             i += 2;
@@ -85,6 +93,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
                 llvm: take("llvm"),
                 out: need(take("out"), "out")?,
                 runs: std::mem::take(&mut runs),
+                programs: std::mem::take(&mut programs),
             };
             if let Command::Report { runs, .. } = &c
                 && runs.is_empty()
@@ -103,8 +112,8 @@ fn parse(args: &[String]) -> Result<Command, String> {
     if let Some(name) = options.keys().next() {
         return Err(format!("--{name} is not an option of {command}\n{USAGE}"));
     }
-    if !runs.is_empty() {
-        return Err(format!("{command} takes no jobs\n{USAGE}"));
+    if !runs.is_empty() || !programs.is_empty() {
+        return Err(format!("{command} takes no jobs or programs\n{USAGE}"));
     }
     Ok(parsed)
 }
@@ -127,6 +136,7 @@ fn run(command: Command, tools: Option<&dyn llvm::Tools>) -> Result<String, Stri
             llvm,
             out,
             runs,
+            programs,
         } => {
             let found;
             let tools = match tools {
@@ -144,6 +154,7 @@ fn run(command: Command, tools: Option<&dyn llvm::Tools>) -> Result<String, Stri
                 prod_kit,
                 out: out.clone(),
                 runs,
+                programs,
             };
             let report = report::build(&cfg, tools)?;
             let table = std::fs::read_to_string(src.join("kernel/linux/core/src/table.rs"))
