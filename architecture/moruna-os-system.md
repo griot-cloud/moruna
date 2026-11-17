@@ -224,6 +224,17 @@ if it does, this section changes first.
   channel targets CPU 0 at first.
 - **`storvsc` and `netvsc`** are driver processes that serve today's block and network driver
   protocols, so nothing above them changes. netvsc speaks NVSP and RNDIS.
+- **Libraries first, as with the API server.** The VMBus client, storvsc and netvsc are each a
+  library without std (`moruna-vmbus`, `moruna-storvsc`, `moruna-netvsc`), tested on the host
+  against a fake of the host's side. The processes only wire them to the core and to each other.
+  - `moruna-vmbus` talks to Hyper-V through a trait, `Hv`: post a message, signal an event, take the
+    next message, read and clear event flags, and give the guest-physical page numbers of a
+    memory object.
+  - The drivers talk to a channel through a trait, `Channel`, defined in `moruna-vmbus`: the
+    channel's two rings (`vmbus_ring`), signal the host, wait for the host's signal, and share more
+    memory with the host (a GPADL).
+- **Versions:** the client offers the newest VMBus version `vmbus_core` defines, then steps down,
+  and refuses anything older than Windows 10's (4.0).
 - **Reused from Microsoft's OpenVMM** (MIT, `no_std`, at e7e7df77): `hvdef`, `x86defs`,
   `vmbus_core`, `vmbus_ring` and `netvsp_protocol` as written, and `storvsp_protocol` with a small
   fork. They are vendored under `kernel/vendor/openvmm` with the licence, the commit and file hashes,
@@ -252,11 +263,15 @@ Sizes are 1.7a's estimates.
 | 1.7a | Findings from reading | Done: `architecture/work/1.7-azure-findings.md` | | |
 | 1.7b | Findings from booting: today's image on Azure, its serial console read | Where the boot stops, and why | small | 1.1, Azure go-ahead |
 | 1.8 | The core on Hyper-V: finding it, clock rates, deadlines, no MCFG, guest OS ID | The core reaches `services started` on Azure's console | medium | 1.7b |
-| 1.9 | VMBus: the core mechanism, the vendored crates, the `vmbus` process | A booted test lists the devices Azure offers; added kernel-mode lines are counted | large | 1.8 |
-| 1.10 | `storvsc` | The node reads its Azure disk; the block driver suite passes | medium | 1.9 |
-| 1.11 | `netvsc` | DHCP and a connection to 443 on Azure; the network driver suite passes | large | 1.9 |
-| 1.12 | `platform` for Azure, with the "ready" report | Azure shows provisioning succeeded | small | 1.4, 1.11 |
-| 1.13 | Bring-up on Azure | 1E's success, on Azure | small | 1.10, 1.12 |
+| 1.9a | The vendored OpenVMM crates | They build without std for the user target; `cargo deny` passes | small | none |
+| 1.9b | `moruna-vmbus`: the client library and the `Channel` trait | Host tests against a fake host: contact, offers, GPADLs, open, close, rescind | large | 1.9a |
+| 1.9c | The core mechanism and the `vmbus` process | A booted test lists the devices Azure offers; added kernel-mode lines are counted | large | 1.8, 1.9b |
+| 1.10a | `moruna-storvsc`: the library | Host tests against a fake storvsp: initialisation, read, write, flush, errors | medium | 1.9a |
+| 1.10b | The `storvsc` driver process | The node reads its Azure disk; the block driver suite passes | medium | 1.9c, 1.10a |
+| 1.11a | `moruna-netvsc`: the library | Host tests against a fake netvsp: NVSP and RNDIS initialisation, send, receive, the VF offer ignored | large | 1.9a |
+| 1.11b | The `netvsc` driver process | DHCP and a connection to 443 on Azure; the network driver suite passes | medium | 1.9c, 1.11a |
+| 1.12 | `platform` for Azure, with the "ready" report | Azure shows provisioning succeeded | small | 1.4, 1.11b |
+| 1.13 | Bring-up on Azure | 1E's success, on Azure | small | 1.10b, 1.12 |
 
 ## 2. The API (Final)
 
@@ -405,8 +420,15 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
 - **`api` is the engine's host.** The host protocol runs unchanged over a channel between `api` and
   the engine, instead of a socket: `api` sends `spec` and `cancel`, and reads `hello`, `heartbeat`,
   event records, `report` and `exit`.
-- **The budget** is the job document's `budget.memory_bytes`, at most the node's memory less 512 MiB
-  kept for the node's services. A larger one is refused at `validate`.
+- **The budget** is the job document's `budget.memory_bytes`, at most the node's memory less 768 MiB:
+  512 MiB kept for the node's services and 256 MiB for a check running beside a job. A larger one
+  is refused.
+- **Validation is the engine's.** `api` does not link `moruna-job`, which needs std. A document is
+  checked by the engine itself:
+  - `validate`: `node-admission` runs the engine's `check` on the document in a short-lived
+    process with a 256 MiB account, also while a job runs, and `api` returns its refusals.
+  - `submit`: the engine refuses an invalid document as it does today (exit code 2, with the
+    refusals), and `api` answers `invalid` with them.
 
 ### 3B. The job operations
 
@@ -423,7 +445,7 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
 | `GET /v1/jobs/{id}/report` | observe | The `RunReport` JSON, once the job has ended |
 
 - **A job is** `{"v1": <job document version 1 as JSON>}` or `{"v2": "<base64 of the MJB2 FlatBuffer>"}`.
-  Either is checked by `moruna-job`'s `check` before it is accepted.
+  Either is checked by the engine (3A) before it runs.
 - **The node fills in** `report.socket` (the channel), `staging` (none) and the run id when absent.
   A document that names a host socket, a `file://` path outside its volumes, or `resume` is refused
   in this release.
