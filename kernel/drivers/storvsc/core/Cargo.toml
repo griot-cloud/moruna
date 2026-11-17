@@ -1,0 +1,17 @@
+[package]
+name = "moruna-storvsc"
+description = "Azure's disk protocol, storvsc, for Moruna drivers: initialisation, then block reads, writes, flush, capacity and serial as SCSI requests on a VMBus channel, the data named by guest page numbers, in safe Rust, every value the host returns checked"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Microsoft's wire types and ring buffer, vendored (kernel/vendor/openvmm/README.md).
+storvsp_protocol = { path = "../../../vendor/openvmm/storvsp_protocol", version = "=0.0.0" }
+scsi_defs = { path = "../../../vendor/openvmm/scsi_defs", version = "=0.0.0" }
+vmbus_ring = { path = "../../../vendor/openvmm/vmbus_ring", version = "=0.0.0" }
+# What vmbus_ring's interface names: a packet's page list, and its payload readers and writers.
+guestmem_core = { path = "../../../vendor/openvmm/guestmem_core", version = "=0.0.0" }
+# The byte views of the wire types, at the version the vendored crates pin.
+zerocopy = { version = "=0.8.63", features = ["derive"] }
