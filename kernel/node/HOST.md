@@ -207,3 +207,29 @@ card on QEMU's user network, COM1 to `OUT/console.log`) and exits 0 when
 It prints the seconds from QEMU's start to the line. Exit 124 is the timeout, 1 is QEMU ending
 first. The console log holds the firmware's screen output (terminal escapes) before GRUB, then
 the kernel's lines.
+
+### The disk's other formats (item 1.5)
+
+Each cloud takes its own format, and every one is made from the one raw disk (system design
+1A). Add `--formats` and a list to the `package.py` line above, for example
+`--formats qcow2 vhd`:
+
+| Format | File in `OUT` | Made by | For |
+| --- | --- | --- | --- |
+| `raw` | `moruna-node.raw` | every build, with or without `--formats` | OpenStack |
+| `qcow2` | `moruna-node.qcow2` | `qemu-img convert -f raw -O qcow2` | OpenStack: `kernel/node/OPENSTACK.md` uploads it |
+| `vhd` | `moruna-node.vhd` | `qemu-img convert -f raw -O vpc -o subformat=fixed,force_size` | Azure |
+
+- **`qemu-img` must be on `PATH`** for `qcow2` or `vhd`: the build refuses to start without it.
+  `command -v qemu-img`, after the `PATH` line above, shows whether `moruna-arm`'s QEMU has it.
+- **The VHD is fixed-size:** the raw disk rounded up to a whole MiB, then the VHD's 512-byte
+  footer, so the file is a whole number of MiB and 512 bytes. `package.py`'s raw disk is a whole
+  MiB already (its size is `(esp_mib + 4) * MIB`), so the VHD holds exactly the raw disk.
+- **Each file's size and SHA-256** are in `OUT/inputs-and-artifacts.json`, under its path.
+- **Boot one** with `kernel/node/tools/uefi-boot.sh OUT CPUS FORMAT`, where `FORMAT` is `raw`
+  (the default when it is left out), `qcow2` or `vhd`. The machine is the same; only the boot
+  disk's file and the QEMU driver that reads it change (`vpc` for the VHD).
+- **The test** is `python3 -I kernel/node/tools/test_formats.py`. It converts small stand-in
+  disks and runs `uefi-boot.sh` against a stand-in for QEMU, so it builds nothing, boots nothing
+  and needs no lock. It needs `qemu-img` on `PATH` and a bash with `EPOCHREALTIME` (5.0 or
+  later, as `uefi-boot.sh` does), and fails rather than skips without them.
