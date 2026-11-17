@@ -31,6 +31,10 @@ FREE1 = ("occupancy", "enrich")
 # 0.7's VM (stream D): a 24 GiB VM takes a job budget of 20.6 GiB or less; its cgroup holds the
 # guest's memory and QEMU's.
 VM = {"vm_memory_gib": 24, "budget_gib": 20.5, "mem": 27}
+# The engine's scratch holds a run's outputs until the output disk takes them, inside the VM's
+# memory, so a job with a large output gives up budget for it (2024's outputs, measured on
+# moruna-bench: Enrich's is the largest).
+SCRATCH_GIB = {"enrich": 4, "score": 2, "audit": 2, "occupancy": 1}
 # The gate image's layer stacks (setup on moruna-bench): MORUNA_PROCESSES=8 and =7.
 STACKS = {"moruna-vm": "/data/gate/stack8", "moruna-vm-free1": "/data/gate/stack7"}
 # The loop's best settings from 0.6.5's grid (make_plan.py rerun): 16 threads over 250,000-row
@@ -71,8 +75,9 @@ def options(engine: str, workload: str, machine: str, cpus: int):
     if engine in ("spark", "ray", "dask"):
         return {"timeout_s": 900}
     if engine in STACKS:
+        scratch = SCRATCH_GIB.get(workload, 1)
         return {"image_stack": STACKS[engine], "vm_memory_gib": VM["vm_memory_gib"],
-                "budget_gib": VM["budget_gib"], "timeout_s": 900}
+                "budget_gib": VM["budget_gib"] + 1 - scratch, "scratch_gib": scratch, "timeout_s": 900}
     return {}
 
 

@@ -100,6 +100,9 @@ def moruna_vm(spec, out, flist):
     report = f"/data/tmp/{spec['id']}.report.json"
     cmd = [MORUNA07, "run", job, "--output", out, "--report", report,
            "--memory-gib", str(spec.get("vm_memory_gib", 24)), "--image-stack", stack]
+    if spec.get("scratch_gib"):
+        # The engine's scratch holds the outputs until the output disk takes them (stream D).
+        cmd += ["--scratch-gib", str(spec["scratch_gib"])]
     return cmd, report
 
 
@@ -231,6 +234,7 @@ def run(spec):
            "cpu_util": round(cpu_s / (wall * spec["cpus"]), 3) if not spec.get("schedule") else None,
            "cg_peak_bytes": peak, "result": result, "applied": applied, "samples": samples}
     rec["ok"] = proc.returncode == 0 and result is not None and not (result or {}).get("error")
+    rec["out_bytes"] = sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(out) for f in fs)
     if rec["ok"]:
         rec["check"] = checksum(spec["workload"], out)
         rec["canon"] = canon(spec, out)
