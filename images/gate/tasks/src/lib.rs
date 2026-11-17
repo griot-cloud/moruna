@@ -1,11 +1,11 @@
-//! What every gate task does: take the plane, then for each batch the engine maps into input
-//! slot 0, write the job's output record into a window of output slot 1 and put it. A batch the
-//! function refuses ends the task with the reason on its console and a non-zero code, as a
-//! Python task that raised ended its stage on 0.6.6.
+//! What every gate task does, in ring mode (stream P, `moruna_sys::plane::Rings`): map its
+//! region and its rings object once, then answer each batch the engine posts with the job's
+//! output, written into windows as records (`moruna_gate_record::parts`: one record when the
+//! answer fits a window, several in order when it does not), and say its exit code on its rings
+//! as it ends. It sleeps on its bell only when it has nothing to do.
 //!
-//! This is the plane's API as it is on `feature/arrow-core-0.7` (`batch_get`, `batch_put`). On
-//! stream P's rings the loop is `Rings::step(|input, window| apply(job, input, window).ok())`:
-//! [`moruna_gate_record::apply`] already has that shape.
+//! A batch the function refuses ends the task with a non-zero code and the reason in its log,
+//! as a Python task that raised ended its stage on 0.6.6.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -14,73 +14,76 @@ extern crate alloc;
 
 use core::fmt::Write;
 
-use moruna_gate_record::{Error, Job, apply};
-use moruna_sys::plane::Plane;
+use moruna_gate_record::parts::{Carry, Wrote, apply_part};
+use moruna_gate_record::{Error, Job};
+use moruna_sys::plane::{Log, Part, Plane, Rings, Step};
 
 /// The task's exit codes.
 pub mod code {
     pub const DONE: i64 = 0;
     pub const NO_PLANE: i64 = 2;
-    pub const NO_INPUT: i64 = 3;
-    pub const NO_OUTPUT: i64 = 4;
-    pub const INPUT: i64 = 5;
-    pub const WINDOW: i64 = 6;
+    pub const NO_RINGS: i64 = 3;
+    pub const RINGS: i64 = 5;
     pub const REFUSED: i64 = 7;
     pub const WINDOW_SMALL: i64 = 8;
-    pub const PUT: i64 = 9;
 }
 
-fn say(job: Job, what: &dyn core::fmt::Display) {
-    if let Some(console) = moruna_sys::start::peek("console") {
-        let mut line = alloc::string::String::new();
-        let _ = writeln!(line, "gate-{}: {what}", job.name());
-        let console = moruna_sys::Console(moruna_sys::Handle::from_raw(console));
-        let _ = console.write_str(&line);
-        core::mem::forget(console);
+fn say(log: &mut Option<Log>, job: Job, what: &dyn core::fmt::Display) {
+    if let Some(log) = log.as_mut() {
+        let _ = writeln!(log, "gate-{}: {what}", job.name());
     }
 }
 
-/// Runs `job` over every batch of the task's plane; the exit code.
+/// Runs `job` over every batch of the task's rings; the exit code, said on the rings.
 pub fn run(job: Job) -> i64 {
     let Some(plane) = Plane::take() else {
         return code::NO_PLANE;
     };
-    let Some(mut input) = plane.input(0) else {
-        return code::NO_INPUT;
+    let mut log = Log::take();
+    let mut rings = match Rings::attach(&plane) {
+        Ok(r) => r,
+        Err(e) => {
+            say(&mut log, job, &alloc::format!("no rings: {e:?}"));
+            return code::NO_RINGS;
+        }
     };
-    let Some(mut output) = plane.output(1) else {
-        return code::NO_OUTPUT;
-    };
+    let mut carry = Carry::new();
+    let mut batches = 0u64;
     loop {
-        let batch = match input.get() {
-            Ok(Some(b)) => b,
-            Ok(None) => return code::DONE,
+        let mut failure: Option<Error> = None;
+        let step = rings.step_parts(|input, window, part| {
+            match apply_part(job, input, window, part, &mut carry) {
+                Ok(Wrote::Last(n)) => Some(Part::Last(n)),
+                Ok(Wrote::More(n)) => Some(Part::More(n)),
+                Err(e) => {
+                    failure = Some(e);
+                    None
+                }
+            }
+        });
+        match step {
+            Ok(Step::Answered(_)) => batches += 1,
+            Ok(Step::NoInput) => rings.wait_input(),
+            Ok(Step::NoWindow) => rings.wait_window(),
+            Ok(Step::Ended) => break,
             Err(e) => {
-                say(job, &alloc::format!("batch_get: {e:?}"));
-                return code::INPUT;
+                let code = match &failure {
+                    Some(Error::WindowTooSmall { .. }) => code::WINDOW_SMALL,
+                    Some(_) => code::REFUSED,
+                    None => code::RINGS,
+                };
+                match failure {
+                    Some(f) => say(&mut log, job, &f),
+                    None => say(&mut log, job, &alloc::format!("the rings: {e:?}")),
+                }
+                drop(log);
+                rings.note();
+                return rings.exit(code);
             }
-        };
-        let mut window = match output.window() {
-            Ok(Some(w)) => w,
-            Ok(None) | Err(_) => {
-                say(job, &"no window for the output");
-                return code::WINDOW;
-            }
-        };
-        let len = match apply(job, batch.bytes(), window.bytes()) {
-            Ok(len) => len,
-            Err(e @ Error::WindowTooSmall { .. }) => {
-                say(job, &e);
-                return code::WINDOW_SMALL;
-            }
-            Err(e) => {
-                say(job, &e);
-                return code::REFUSED;
-            }
-        };
-        if let Err((e, _)) = window.put(0, len as u64) {
-            say(job, &alloc::format!("batch_put: {e:?}"));
-            return code::PUT;
         }
     }
+    say(&mut log, job, &alloc::format!("answered {batches} batches"));
+    drop(log);
+    rings.note();
+    rings.exit(code::DONE)
 }

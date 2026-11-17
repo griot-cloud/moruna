@@ -21,8 +21,10 @@ GiB = 1 << 30
 # `cargo build --release` in images/gate; 0.7's `moruna` CLI (stream D) for moruna-vm.
 GATE = os.environ.get("GATE_BIN", "/home/bench/gate/bin")
 MORUNA07 = os.environ.get("MORUNA07_BIN", "/home/bench/moruna07/bin/moruna")
-NATIVE = ("rust-baseline", "moruna-vm")
+NATIVE = ("rust-baseline", "moruna-vm", "moruna-vm-free1")
 DUMPED = ("score",)
+# The node kit 0.7's runs boot: the gate's kernel, 5ffded0f's code (the integrator, 2026-11-17).
+NODE_KIT = os.environ.get("GATE_NODE_KIT", "/data/boot-gate")
 
 def wr(path, value):
     with open(path, "w") as f: f.write(str(value))
@@ -86,32 +88,42 @@ def canon(spec, out):
 
 def moruna_vm(spec, out, flist):
     """moruna-vm's command and where its report goes: the gate's job (gate_jobs.py) through 0.7's
-    `moruna run` (stream D). PENDING D: the CLI's options are its contract's, as
-    architecture/data-os-streams.md section D describes it (the job, the output directory, the
-    report); they change here if D's land differently."""
+    `moruna run JOB --output DIR --report FILE` (stream D), its native tasks the image of the
+    stack in `image_stack`, its VM `vm_memory_gib`, its job's budget `budget_gib` (D: a 24 GiB VM
+    takes a budget of 20.6 GiB or less). The node's serial console and QEMU's log are kept in
+    /data/tmp/ID.node (MORUNA_KEEP_NODE_LOGS) and moved beside the results."""
     import gate_jobs
+    stack = spec["image_stack"]
+    digest = open(f"{stack}/image.digest").read().strip()
     job = f"{RES}/{spec['id']}.job.json"
-    gate_jobs.write(job, spec["workload"], spec["files"], out, spec.get("image", {}),
-                    cpus=spec["cpus"], mem_gib=spec["mem_gib"])
-    report = f"{RES}/{spec['id']}.report.json"
-    return [MORUNA07, "run", job, "--output", out, "--report", report], report
+    gate_jobs.write(job, spec["workload"], spec["files"], out, {"digest": digest, "location": "/images/gate"},
+                    cpus=spec["cpus"], mem_gib=spec.get("budget_gib", spec["mem_gib"]))
+    os.chmod(job, 0o644)
+    report = f"/data/tmp/{spec['id']}.report.json"
+    cmd = [MORUNA07, "run", job, "--output", out, "--report", report,
+           "--memory-gib", str(spec.get("vm_memory_gib", 24)), "--image-stack", stack]
+    if spec.get("scratch_gib"):
+        # The engine's scratch holds the outputs until the output disk takes them (stream D).
+        cmd += ["--scratch-gib", str(spec["scratch_gib"])]
+    return cmd, report
 
 
 def vm_result(spec, report_path, wall):
-    """moruna-vm's result from 0.7's report: the VM's boot apart, and the time split as far as the
-    report has it (control 5)."""
+    """moruna-vm's result from 0.7's report: the VM's figures (`vm`: boot_s, stage_s, job_s,
+    outputs_s, total_s) apart, and the time split as far as the report has it (control 5)."""
     import runner_split
     try:
         d = json.load(open(report_path))
     except (OSError, ValueError) as e:
-        return {"engine": "moruna-vm", "function": "rust", "wall_s": wall, "error": f"no report: {e}"}
-    vm = d.get("vm") or d.get("host") or {}
+        return {"engine": spec["engine"], "function": "rust", "wall_s": wall, "error": f"no report: {e}"}
+    vm = d.get("vm") or {}
     boot = vm.get("boot_s", (vm.get("boot_ms") or 0) / 1e3 or None)
-    res = {"engine": "moruna-vm", "function": "rust", "wall_s": wall, "boot_s": boot,
+    res = {"engine": spec["engine"], "function": "rust", "wall_s": wall, "boot_s": boot, "vm": vm,
            "version": d.get("version")}
     res["moruna"] = runner_split.split(d)
+    res["split"] = res["moruna"]["split"]
     if d.get("exit") not in (None, "completed", "ok", 0):
-        res["error"] = f"exit {d.get('exit')}"
+        res["error"] = f"exit {d.get('exit')}: {str(d.get('diagnostic'))[:300]}"
     return res
 
 
@@ -121,7 +133,7 @@ def command(spec, out, flist):
     if spec["engine"] == "rust-baseline":
         return as_bench + [f"{GATE}/gate-baseline", "--job", spec["workload"], "--files", flist, "--out", out,
                            "--threads", str(spec.get("threads", 0)), "--batch", str(spec.get("batch", 0))], None
-    if spec["engine"] == "moruna-vm":
+    if spec["engine"].startswith("moruna-vm"):
         cmd, report = moruna_vm(spec, out, flist)
         return as_bench + cmd, report
     return None, None
@@ -165,6 +177,12 @@ def run(spec):
     env = {"PATH": "/usr/bin:/bin", "HOME": "/home/bench", "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1",
            "MKL_NUM_THREADS": "1", "PYTHONPATH": "/home/bench/bench", "JAVA_HOME": "/usr/lib/jvm/java-17-openjdk-amd64", "TMPDIR": "/data/tmp"}
     if spec["engine"] == "duckdb": env["HOME"] = "/home/bench"
+    if spec["engine"].startswith("moruna-vm"):
+        # QEMU with KVM and seccomp first in PATH, the node kit, a scratch for the run's directory,
+        # and where the node's logs go.
+        node_logs = f"/data/tmp/{rid}.node"; shutil.rmtree(node_logs, ignore_errors=True)
+        env.update({"PATH": "/opt/qemu-kvm/bin:/usr/bin:/bin", "MORUNA_NODE_KIT": NODE_KIT,
+                    "TMPDIR": "/data/tmp", "MORUNA_KEEP_NODE_LOGS": node_logs})
     env.update(spec.get("env", {}))
     log = open(f"{RES}/{rid}.log", "w")
     t0 = time.time()
@@ -204,13 +222,21 @@ def run(spec):
     peak = int(rd(f"{cg}/memory.peak").strip() or 0)
     cpu_s = next((int(l.split()[1]) for l in rd(f"{cg}/cpu.stat").splitlines() if l.startswith("usage_usec")), 0) / 1e6
     result = next((json.loads(l[7:]) for l in stdout.splitlines() if l.startswith("RESULT ")), None)
-    if spec["engine"] == "moruna-vm":
+    if spec["engine"].startswith("moruna-vm"):
         result = vm_result(spec, vm_report, wall)
+        # The run's console (the job updates, task logs among them) and its node's logs.
+        open(f"{RES}/{rid}.stdout", "w").write(stdout)
+        if os.path.isdir(f"/data/tmp/{rid}.node"):
+            shutil.rmtree(f"{RES}/{rid}.node", ignore_errors=True)
+            shutil.move(f"/data/tmp/{rid}.node", f"{RES}/{rid}.node")
+        if vm_report and os.path.exists(vm_report):
+            shutil.move(vm_report, f"{RES}/{rid}.report.json")
     rec = {"spec": {k: v for k, v in spec.items() if k != "files"}, "files": len(spec["files"]), "exit_code": proc.returncode,
            "oom_kills": int(events.get("oom_kill", 0)), "wall_s": round(wall, 2), "cpu_s": round(cpu_s, 1),
            "cpu_util": round(cpu_s / (wall * spec["cpus"]), 3) if not spec.get("schedule") else None,
            "cg_peak_bytes": peak, "result": result, "applied": applied, "samples": samples}
     rec["ok"] = proc.returncode == 0 and result is not None and not (result or {}).get("error")
+    rec["out_bytes"] = sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(out) for f in fs)
     if rec["ok"]:
         rec["check"] = checksum(spec["workload"], out)
         rec["canon"] = canon(spec, out)
@@ -218,6 +244,7 @@ def run(spec):
     # split and the VM's boot are the engine's own figures.
     r = result or {}
     rec["boot_s"] = r.get("boot_s")
+    rec["vm"] = r.get("vm")
     rec["split"] = r.get("split") or (r.get("moruna") or {}).get("split")
     rec["function"] = r.get("function")
     shutil.rmtree(out, ignore_errors=True)

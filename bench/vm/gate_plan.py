@@ -18,13 +18,25 @@ MACHINES = {
 }
 NYC = ("score", "occupancy", "enrich", "audit")
 GROUPS = {
-    1: ("moruna-vm",),
+    1: ("moruna-vm", "moruna-vm-free1"),
     2: ("rust-baseline",),
     3: ("moruna", "moruna066-rust"),
     4: ("loop", "polars", "duckdb", "ray", "spark", "dask"),
     5: ("duckdb-sql", "polars-expr"),
 }
 NATIVE_EXPR = {"duckdb-sql": ("enrich", "occupancy"), "polars-expr": ("enrich",)}
+# 0.7 with one vCPU left to the engine (tasks = vCPUs - 1), against all vCPUs: whether anything
+# of the `share` stall (fixed in bdf24e1f) is left. Occupancy and Enrich.
+FREE1 = ("occupancy", "enrich")
+# 0.7's VM (stream D): a 24 GiB VM takes a job budget of 20.6 GiB or less; its cgroup holds the
+# guest's memory and QEMU's.
+VM = {"vm_memory_gib": 24, "budget_gib": 20.5, "mem": 27}
+# The engine's scratch holds a run's outputs until the output disk takes them, inside the VM's
+# memory, so a job with a large output gives up budget for it (2024's outputs, measured on
+# moruna-bench: Enrich's is the largest).
+SCRATCH_GIB = {"enrich": 4, "score": 2, "audit": 2, "occupancy": 1}
+# The gate image's layer stacks (setup on moruna-bench), FROM scratch: MORUNA_PROCESSES=8 and =7.
+STACKS = {"moruna-vm": "/data/gate/stack8s", "moruna-vm-free1": "/data/gate/stack7s"}
 # The loop's best settings from 0.6.5's grid (make_plan.py rerun): 16 threads over 250,000-row
 # batches, 8 threads for Occupancy.
 LOOP = {"enrich": {"threads": 16, "batch": 250000}, "audit": {"threads": 16, "batch": 250000},
@@ -36,13 +48,17 @@ def group_of(engine: str) -> int:
     return next(g for g, es in GROUPS.items() if engine in es)
 
 
-def engines_for(workload: str, with_066_rust: bool = True):
+def engines_for(workload: str, with_066_rust: bool = True, groups=tuple(GROUPS)):
     out = []
     for g in sorted(GROUPS):
+        if g not in groups:
+            continue
         for e in GROUPS[g]:
             if e == "moruna066-rust" and not with_066_rust:
                 continue
             if e in NATIVE_EXPR and workload not in NATIVE_EXPR[e]:
+                continue
+            if e == "moruna-vm-free1" and workload not in FREE1:
                 continue
             out.append(e)
     return out
@@ -58,20 +74,27 @@ def options(engine: str, workload: str, machine: str, cpus: int):
         return {"profiles": f"/data/profiles/gate-{machine}-{engine}-{workload}", "staging": "/data/staging"}
     if engine in ("spark", "ray", "dask"):
         return {"timeout_s": 900}
+    if engine in STACKS:
+        scratch = SCRATCH_GIB.get(workload, 1)
+        return {"image_stack": STACKS[engine], "vm_memory_gib": VM["vm_memory_gib"],
+                "budget_gib": VM["budget_gib"] + 1 - scratch, "scratch_gib": scratch, "timeout_s": 900}
     return {}
 
 
-def nyc(files, machine: str = "d8", with_066_rust: bool = True):
+def nyc(files, machine: str = "d8", with_066_rust: bool = True, groups=tuple(GROUPS), noise: bool = True):
     m = MACHINES[machine]
     plan = []
 
     def add(rid, engine, workload, **kw):
+        mem = VM["mem"] if engine in STACKS else m["mem"]
         plan.append({"id": rid, "engine": engine, "workload": workload, "files": files,
-                     "cpus": m["cpus"], "mem_gib": m["mem"], "group": group_of(engine),
+                     "cpus": m["cpus"], "mem_gib": mem, "group": group_of(engine),
                      "machine": machine, **options(engine, workload, machine, m["cpus"]), **kw})
 
     for wl in NYC:
-        engines = engines_for(wl, with_066_rust)
+        engines = engines_for(wl, with_066_rust, groups)
+        if not engines:
+            continue
         for e in engines:
             # The learning run: 0.6.6 starts from an empty profile store.
             fresh = {"fresh_profiles": True} if e in ("moruna", "moruna066-rust") else {}
@@ -80,7 +103,7 @@ def nyc(files, machine: str = "d8", with_066_rust: bool = True):
             for e in (engines if r % 2 else list(reversed(engines))):
                 add(f"g-{machine}-{wl}-{e}-r{r}", e, wl, repeat=r)
         # The session's noise: 0.6.6 against itself, two pairs.
-        for p in (1, 2):
+        for p in ((1, 2) if noise else ()):
             for side in ("a", "b"):
                 add(f"g-{machine}-{wl}-noise-p{p}{side}", "moruna", wl, repeat=None, noise=f"p{p}")
     return plan

@@ -172,12 +172,12 @@ def test_the_report(tmp_path):
         json.dump(rec, open(tmp_path / f"g-{i}.json", "w"))
     text = report.render(report.load(str(tmp_path)), ["d8"])
     assert "| 1 | moruna-vm | rust | 2.0 | 12.0 |" in text
-    assert "against the plain Rust pool (best: rust-baseline, 4.0 s): 2.00x" in text and "is met" in text
+    assert "against the plain Rust pool (best: rust-baseline, 4.0 s): 2.00x" in text and "**PASS**" in text
     assert "DIFFERS" in text  # duckdb-sql's rows are not 0.6.6's
     assert "noise" in text
     slow = [fake("moruna-vm", 1, 3.9, 15.0, good), fake("rust-baseline", 1, 4.0, 14.0, good)]
     table, _ = report.rows_for(slow, "d8", "enrich")
-    assert any("NOT met" in line and "CPU-seconds higher" in line for line in report.speedups(table))
+    assert any("**MISS**" in line for line in report.speedups(table))
     assert report.speedups({}) == ["0.7 (moruna-vm) has no measured run."]
 
 
@@ -190,10 +190,17 @@ def test_driver_commands(tmp_path, monkeypatch):
                          "--threads", "8", "--batch"] or cmd[cmd.index("--job") + 1] == "score"
     assert report_path is None and cmd[0] == "setpriv"
     monkeypatch.setattr(driver, "RES", str(tmp_path))
-    vm = dict(spec, engine="moruna-vm", image={"digest": "sha256:" + "0" * 64, "location": "/oci"})
+    stack = tmp_path / "stack"
+    stack.mkdir()
+    (stack / "image.digest").write_text("sha256:" + "0" * 64 + "\n")
+    vm = dict(spec, engine="moruna-vm", image_stack=str(stack), budget_gib=20.5, vm_memory_gib=24)
     cmd, report_path = driver.command(vm, "/out", "/list")
     assert cmd[cmd.index(driver.MORUNA07) + 1] == "run" and report_path.endswith(".report.json")
-    assert json.load(open(tmp_path / f"{vm['id']}.job.json"))["kernels"][0]["command"] == ["/gate-score"]
+    assert cmd[cmd.index("--memory-gib") + 1] == "24" and cmd[cmd.index("--image-stack") + 1] == str(stack)
+    doc = json.load(open(tmp_path / f"{vm['id']}.job.json"))
+    assert doc["kernels"][0]["command"] == ["/gate-score"] and doc["kernels"][0]["abi"] == "moruna"
+    assert doc["kernels"][0]["image"]["digest"] == "sha256:" + "0" * 64
+    assert doc["budget"]["memory_bytes"] == int(20.5 * (1 << 30))
     py = dict(spec, engine="moruna", profiles=str(tmp_path / "p"), staging="/s")
     monkeypatch.setattr(driver.os, "chown", lambda *a: None)
     c = driver.runner_command(py, py["id"], "/out", "/list")
