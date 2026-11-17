@@ -5,6 +5,7 @@
 use crate::{
     audit::AuditLog,
     http::{Authorization, Request},
+    mcp::MCP_PATH,
     token::{Grant, TokenKey, Verifier},
 };
 use alloc::{string::String, vec::Vec};
@@ -111,11 +112,14 @@ impl Api {
         }
     }
 
-    /// The answer to `request` at `now`, Unix seconds. The route comes from the operations
-    /// table only: a path in no operation is `not_found`, and a known path with another method
-    /// is `invalid`. An operation that needs a scope needs a valid token (2C); `health` never
-    /// reads the header. Each call of an operation is recorded.
+    /// The answer to `request` at `now`, Unix seconds. `/mcp` is MCP's (2D); every other route
+    /// comes from the operations table only: a path in no operation is `not_found`, and a known
+    /// path with another method is `invalid`. An operation that needs a scope needs a valid
+    /// token (2C); `health` never reads the header. Each call of an operation is recorded.
     pub(crate) fn answer(&mut self, request: &Request, now: u64) -> Answer {
+        if request.path == MCP_PATH {
+            return self.mcp(request, now);
+        }
         let Some(operation) = OPERATIONS.iter().find(|o| o.path == request.path) else {
             return Answer::error(ErrorCode::NotFound, "no operation has this path");
         };
@@ -179,7 +183,7 @@ impl Api {
     }
 
     /// Refuses a call of `operation` with `code`, and records it.
-    fn refuse(
+    pub(crate) fn refuse(
         &mut self,
         operation: &'static Operation,
         grant: Option<&Grant>,
@@ -207,6 +211,12 @@ impl Api {
     #[cfg(test)]
     pub(crate) fn recorded(&self) -> usize {
         self.audit.len()
+    }
+
+    /// The audit record's records, newest first.
+    #[cfg(test)]
+    pub(crate) fn records(&self) -> Vec<moruna_api::AuditRecord> {
+        self.audit.audit().records
     }
 }
 

@@ -18,6 +18,8 @@
 //!   node's [`TokenKey`]s, for this node, expiring within [`MOST_AHEAD_SECONDS`], whose scope
 //!   covers the operation. Each call of an operation leaves an audit record; the last
 //!   [`AUDIT_LIMIT`] are kept in memory, and `node/audit` answers them newest first.
+//! - MCP (2D): `POST /mcp` on the same port with the same tokens, MCP's Streamable HTTP,
+//!   stateless, at [`PROTOCOL_VERSION`]: one tool per operation, `moruna_<id>`.
 //!
 //! The crate is `no_std` with `alloc`. On the kernel, ring's randomness comes from
 //! `moruna_svc::random`, as the network server's does.
@@ -34,6 +36,7 @@ mod audit;
 mod der;
 mod http;
 mod identity;
+mod mcp;
 #[cfg(target_os = "none")]
 mod random;
 mod server;
@@ -48,6 +51,7 @@ pub use api::NodeFacts;
 pub use audit::AUDIT_LIMIT;
 pub use http::{BODY_LIMIT, HEADER_LIMIT};
 pub use identity::{Identity, IdentityError, VALID_AFTER_SECONDS, VALID_BEFORE_SECONDS};
+pub use mcp::PROTOCOL_VERSION;
 pub use server::{CONNECTION_LIMIT, Config, IDLE_LIMIT_MS, Server};
 pub use token::{MOST_AHEAD_SECONDS, TokenKey};
 pub use transport::{Clock, Transport, TransportError};
