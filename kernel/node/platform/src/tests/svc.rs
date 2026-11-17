@@ -273,16 +273,19 @@ fn requests_go_through_the_network_server_s_sockets() {
     server.join().unwrap();
 }
 
-/// The cloud profile's `network.conf` as item 1.3 writes it, and the line item 1.4 adds.
+/// The cloud profile's `network.conf` as item 1.3 writes it, with the supervisor's grant in
+/// place of `listen-api` (item 2.2c: the supervisor mints api's listener from it at each start,
+/// so it holds `listen` as well as `grant`), and the line item 1.4 adds.
 const NETWORK_CONF: &str = "moruna-netstack 1
 interface wan card=net0 dhcp
-grant listen-api rights=listen local=0.0.0.0/0@443 sockets=64
+grant listen-supervisor rights=grant,listen local=0.0.0.0/0@443
 ";
 /// `platform`'s grant, with the local rule a connection needs to leave at all (PM, 2026-11-18).
 const PLATFORM_GRANT: &str = "grant listen-platform rights=connect \
      remote=169.254.169.254/32@80,168.63.129.16/32@80 local=0.0.0.0/0 sockets=4\n";
 
-/// The cloud profile's `node.conf` as items 1.1 and 1.3 write it, and the lines item 1.4 adds.
+/// The cloud profile's `node.conf` as items 1.1 and 1.3 write it, without 1.3's link of api's
+/// listener (item 2.2c), and the lines items 1.4 and 2.2c add.
 const NODE_CONF: &str = "moruna-node 1
 service devices image.devices 67108864
 bootstrap devices devices
@@ -295,19 +298,21 @@ service network image.netstack 67108864
 service api image.api 67108864
 grant network config network.config
 link devices directory-net network directory
-link network listen-api api network
 ";
 const PLATFORM_LINES: &str = "service platform image.platform 16777216
 bootstrap platform platform
 link network listen-platform platform network
-link platform api api platform
 ";
+/// api is started again when it dies, its listener minted at each start from the network
+/// server's `listen-supervisor`, its channel to platform sent as `api-started` (item 2.2c).
+const RESTART_LINE: &str =
+    "restart api network network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=64\n";
 
 #[test]
 fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
     // node.conf: `platform` is the last service, so the supervisor starts it after `network` and
     // `api`, with a 16 MiB account, a network listener and its link to `api`.
-    let text = format!("{NODE_CONF}{PLATFORM_LINES}");
+    let text = format!("{NODE_CONF}{PLATFORM_LINES}{RESTART_LINE}");
     let node = moruna_node::Config::parse(text.as_bytes(), 1 << 30).expect("node.conf");
     let names: Vec<&str> = node.services.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, ["devices", "network", "api", "platform"]);
@@ -327,7 +332,23 @@ fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
         })
     };
     assert!(link("network", "listen-platform", "platform", "network"));
-    assert!(link("platform", "api", "api", "platform"));
+    // No link reaches api: every start of it, the first included, gets its listener and its
+    // channel to platform afresh from the supervisor (item 2.2c).
+    assert!(
+        node.links
+            .iter()
+            .all(|l| l.left != "api" && l.right != "api")
+    );
+    let restart = node.restart.as_ref().expect("api's restart record");
+    assert_eq!(
+        (
+            restart.service.as_str(),
+            restart.slot.as_str(),
+            restart.server.as_str(),
+            restart.granting.as_str()
+        ),
+        ("api", "network", "network", "listen-supervisor")
+    );
     // Its bootstrap: the supervisor's message with the node's memory, on its `supervisor` slot.
     assert!(
         node.bootstraps
@@ -335,10 +356,21 @@ fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
             .any(|(kind, service)| *kind == Bootstrap::Platform && service == "platform")
     );
 
-    // network.conf: the grant is taken as written, with connect as its only right, to the two
+    // network.conf: the supervisor's grant covers the listener the record mints, and no more
+    // than listening on 443 and granting that.
+    let config = parse(&format!("{NETWORK_CONF}{PLATFORM_GRANT}")).expect("network.conf");
+    let (_, supervisor) = config
+        .grants
+        .iter()
+        .find(|(slot, _)| slot == "listen-supervisor")
+        .expect("the supervisor's grant");
+    assert_eq!(supervisor.rights, rights::GRANT | rights::LISTEN);
+    assert!(supervisor.covers(&restart.policy));
+    assert!(config.grants.iter().all(|(slot, _)| slot != "listen-api"));
+
+    // platform's grant is taken as written, with connect as its only right, to the two
     // addresses on port 80 and nowhere else, from any of the node's addresses, and four
     // sockets.
-    let config = parse(&format!("{NETWORK_CONF}{PLATFORM_GRANT}")).expect("network.conf");
     let (_, policy) = config
         .grants
         .iter()
