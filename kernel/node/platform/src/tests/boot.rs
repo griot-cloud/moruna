@@ -1,6 +1,7 @@
 //! The whole boot against the fake clouds: the lines in their order, the hand-over `api` gets,
 //! and every fatal line.
 
+use core::net::Ipv4Addr;
 use std::{
     cell::RefCell,
     format,
@@ -14,11 +15,13 @@ use moruna_node_config::{Cloud, Handover, HandoverError, NodeConfig, base64};
 
 use super::{
     FakeClock, FakeNetwork, RECORDED_AZURE_ID, RECORDED_CONFIG, RECORDED_OPENSTACK_ID,
-    RECORDED_OPENSTACK_TIME, Reply, SECOND, Sent, answer, azure, openstack,
+    RECORDED_OPENSTACK_TIME, Reply, SECOND, Sent, answer, azure, openstack, recorded_health,
+    wire_server,
 };
 use crate::{
     boot::{Fatal, Inputs, READY_LIMIT_NS, Stage, cloud_line, ready_line, run},
     machine::{Clock, Link, LinkError, StreamError},
+    wireserver,
 };
 
 const MS: u64 = 1_000_000;
@@ -69,6 +72,8 @@ struct Booted {
     events: Vec<String>,
     api: FakeApi,
     clock: FakeClock,
+    /// Each request a server saw, and when its connection was made.
+    requests: Vec<(u64, Sent)>,
 }
 
 impl Booted {
@@ -121,6 +126,7 @@ fn boot_with(
         events,
         api,
         clock,
+        requests: network.requests,
     }
 }
 
@@ -147,7 +153,12 @@ fn azure_with(user_data: &[u8]) -> impl FnMut(u64, &Sent) -> Reply + 'static {
         r#"{{"compute":{{"userData":"{}","vmId":"{RECORDED_AZURE_ID}"}},"network":{{}}}}"#,
         base64::encode(user_data)
     );
-    move |_, _| Reply::Answer(answer("200 OK", document.as_bytes()))
+    move |_, sent| {
+        if sent.to.0 == crate::wireserver::ADDRESS {
+            return wire_server(sent);
+        }
+        Reply::Answer(answer("200 OK", document.as_bytes()))
+    }
 }
 
 #[test]
@@ -188,6 +199,95 @@ fn a_node_on_openstack_hands_over_and_says_it_is_ready() {
     assert_eq!(Handover::decode(&booted.api.sent[0]), Ok(handover));
     // api had 10 s from the cloud's line, after the three requests' 6 ms.
     assert_eq!(booted.api.deadlines, [6 * MS + 10 * SECOND; 2]);
+}
+
+/// Who was asked what, in order: the address, the method and the path.
+fn asked(booted: &Booted) -> Vec<(Ipv4Addr, &str, &str)> {
+    booted
+        .requests
+        .iter()
+        .map(|(_, sent)| (sent.to.0, sent.method.as_str(), sent.path.as_str()))
+        .collect()
+}
+
+const IMDS: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
+const AZURE_INSTANCE: &str = "/metadata/instance?api-version=2021-02-01";
+
+#[test]
+fn a_node_on_azure_reports_ready_once_its_config_is_valid() {
+    let clock = FakeClock::default();
+    let latency = clock.clone();
+    let network = FakeNetwork::serving(&clock, move |_, sent| {
+        latency.advance(2 * MS);
+        azure(sent)
+    });
+    let booted = boot_with(network, INPUTS, |_| {});
+    assert!(booted.result.is_ok());
+    // Instance data, then the goal state and the Health document from the WireServer.
+    assert_eq!(
+        asked(&booted),
+        [
+            (IMDS, "GET", AZURE_INSTANCE),
+            (wireserver::ADDRESS, "GET", "/machine?comp=goalstate"),
+            (wireserver::ADDRESS, "POST", "/machine?comp=health"),
+        ]
+    );
+    assert_eq!(booted.requests[2].1.body, recorded_health().as_bytes());
+    // The report came before the hand-over: api's 10 s count from after its 4 ms.
+    assert_eq!(booted.api.deadlines, [6 * MS + 10 * SECOND; 2]);
+    assert_eq!(
+        booted.events,
+        [
+            format!("moruna: cloud azure instance {RECORDED_AZURE_ID}"),
+            "the hand-over".to_string(),
+            "moruna: ready api=10.0.2.15:443 boot_ms=46".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn a_node_on_openstack_makes_no_ready_report() {
+    let booted = boot(|_, sent| {
+        assert_ne!(
+            sent.to.0,
+            wireserver::ADDRESS,
+            "OpenStack has no WireServer"
+        );
+        openstack(sent)
+    });
+    assert!(booted.result.is_ok());
+    assert!(booted.requests.iter().all(|(_, sent)| sent.to.0 == IMDS));
+}
+
+#[test]
+fn a_node_on_azure_with_an_invalid_config_makes_no_ready_report() {
+    let booted = boot(azure_with(br#"{"moruna":2}"#));
+    assert_eq!(asked(&booted), [(IMDS, "GET", AZURE_INSTANCE)]);
+    assert_eq!(booted.result.unwrap_err().stage, Stage::Config);
+}
+
+#[test]
+fn a_ready_report_azure_does_not_take_is_fatal_after_2_minutes() {
+    let booted = boot(|_, sent| {
+        if sent.to.0 == wireserver::ADDRESS {
+            return Reply::Answer(answer("503 Service Unavailable", b""));
+        }
+        azure(sent)
+    });
+    assert_eq!(
+        booted.line(),
+        "moruna: fatal platform: Azure did not take the ready report within 120 s: GET \
+         /machine?comp=goalstate: answered 503"
+    );
+    // The cloud was named; api was never handed its config, and the node never said it was
+    // ready.
+    assert_eq!(
+        booted.events,
+        [format!("moruna: cloud azure instance {RECORDED_AZURE_ID}")]
+    );
+    assert!(booted.api.sent.is_empty());
+    assert_eq!(booted.clock.now(), 120 * SECOND);
+    assert_eq!(booted.requests.len(), 1 + 24);
 }
 
 #[test]

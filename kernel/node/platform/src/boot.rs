@@ -1,7 +1,7 @@
 //! `platform`'s boot, in the order of the system design's section 1D: find the cloud, set the
-//! wall clock, validate node config, hand `api` its config, and print the `cloud` and `ready`
-//! lines. Every way it cannot go on is one [`Fatal`], which prints as section 1B's
-//! `moruna: fatal <stage>: <reason>` line.
+//! wall clock, validate node config, report ready to Azure on Azure (section 1F), hand `api` its
+//! config, and print the `cloud` and `ready` lines. Every way it cannot go on is one [`Fatal`],
+//! which prints as section 1B's `moruna: fatal <stage>: <reason>` line.
 
 use alloc::{
     format,
@@ -17,6 +17,7 @@ use moruna_node_config::{Cloud, Handover, NodeConfig, READY, cloud_name};
 use crate::{
     date, instance,
     machine::{Clock, Link, LinkError, Network},
+    wireserver,
 };
 
 /// The port `api` listens on.
@@ -143,6 +144,12 @@ pub fn run<N: Network, C: Clock, L: Link>(
     // The cloud's line comes before the hand-over, so it is on the console before any line
     // `api` prints once it has its config.
     console(&cloud_line(handover.cloud, &handover.instance));
+
+    // On Azure, the ready report, now that node config is valid (section 1F); without it Azure
+    // reboots the machine. Other clouds want none.
+    if handover.cloud == Cloud::Azure {
+        wireserver::report(network, clock)?;
+    }
 
     // 4. The hand-over, and `api`'s answer, within the limit. The address the ready line
     // names is asked first: the network server answers it at once, and asking it after `api`

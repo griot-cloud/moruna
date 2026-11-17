@@ -3,7 +3,8 @@
 //!
 //! - `console`: where its lines go;
 //! - `account`: its own account, which the network server charges its sockets to;
-//! - `network`: a listener of the network server, granted outbound connections to instance data;
+//! - `network`: a listener of the network server, granted outbound connections to instance data
+//!   and to Azure's WireServer, for the ready report;
 //! - `api`: the channel the supervisor links to `api`, for the hand-over;
 //! - `supervisor`: its `platform` bootstrap, the one message that gives the node's memory.
 //!
