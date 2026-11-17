@@ -42,21 +42,27 @@ class AgainstTheNode(unittest.TestCase):
     """Calls over TLS to the test node."""
 
     def test_reads_node_with_an_observe_token(self) -> None:
-        node = api.node(api.Client(URL, OBSERVE, pin=PIN))
+        client = api.Client(URL, OBSERVE, pin=PIN)
+        node = client.node()
         self.assertEqual(node, api.Node.from_json(DOCUMENT))
         self.assertEqual(node.to_json(), DOCUMENT)
         self.assertIs(node.cloud, api.Cloud.OPENSTACK)
         self.assertEqual(node.executors, [api.Executor(api.ExecutorKind.CPU, 4)])
+        # The method is the function.
+        self.assertEqual(api.node(client), node)
 
     def test_reads_audit_with_an_admin_token(self) -> None:
-        api.node(api.Client(URL, OBSERVE, pin=PIN))
-        audit = api.node_audit(api.Client(URL, ADMIN, pin=PIN.upper()))
+        api.Client(URL, OBSERVE, pin=PIN).node()
+        admin = api.Client(URL, ADMIN, pin=PIN.upper())
+        audit = admin.node_audit()
         newest = audit.records[0]
         self.assertEqual(newest.operation, "node")
         self.assertEqual(newest.key, KEY_ID)
         self.assertEqual(newest.scope, [api.Scope.OBSERVE])
         self.assertEqual(newest.status, 200)
         self.assertEqual(api.Audit.from_json(audit.to_json()), audit)
+        # The method is the function: the function's read shows the method's call, newest.
+        self.assertEqual(api.node_audit(admin).records[0].operation, "node_audit")
 
     def test_is_refused_with_the_wrong_pin_and_sends_nothing(self) -> None:
         admin = api.Client(URL, ADMIN, pin=PIN)
@@ -72,8 +78,9 @@ class AgainstTheNode(unittest.TestCase):
         self.assertEqual(after[0].operation, "node_audit")
 
     def test_health_needs_no_token(self) -> None:
-        health = api.health(api.Client(URL, "not a token", pin=PIN))
-        self.assertEqual(health, api.Health(api.HealthStatus.OK))
+        client = api.Client(URL, "not a token", pin=PIN)
+        self.assertEqual(client.health(), api.Health(api.HealthStatus.OK))
+        self.assertEqual(api.health(client), api.Health(api.HealthStatus.OK))
 
     def test_an_observe_token_is_forbidden_the_audit(self) -> None:
         with self.assertRaises(api.ApiError) as caught:
@@ -148,6 +155,11 @@ class WithoutTheNode(unittest.TestCase):
 
     def test_no_redirect_is_followed(self) -> None:
         self.assertIsNone(_NoRedirect().redirect_request())
+
+    def test_the_client_has_a_method_per_operation(self) -> None:
+        self.assertTrue(issubclass(api.Client, api.Operations))
+        for name in ("health", "node", "node_audit"):
+            self.assertIs(getattr(api.Client, name), getattr(api.Operations, name))
 
     def test_an_answer_is_checked_field_by_field(self) -> None:
         cases = {

@@ -4,7 +4,8 @@
 
 Each object schema is a frozen dataclass with ``from_json``, which checks an answer's fields and
 their types, and ``to_json``; each set of string constants is a ``StrEnum``. Each operation is a
-function that calls it through a client (``moruna.api.Client``) and reads its answer.
+function that calls it through a client (``moruna.api.Client``) and reads its answer, and a
+method of ``Operations``, which ``Client`` inherits: ``client.node()`` is ``node(client)``.
 """
 
 from __future__ import annotations
@@ -391,3 +392,31 @@ def node_audit(client: Caller) -> Audit:
     """
     answer = client.call("node_audit", "GET", "/v1/node/audit", token=True)
     return Audit.from_json(answer)
+
+
+class Operations(Caller):
+    """One method per operation, each a call of the operation's function above.
+    ``moruna.api.Client`` inherits them, and supplies the ``call`` they go through.
+    """
+
+    def health(self) -> Health:
+        """Whether the node is up. The only call that needs no token.
+
+        ``GET /v1/health``, no token. The function ``health(self)``.
+        """
+        return health(self)
+
+    def node(self) -> Node:
+        """The node document: version, instance, cloud, cores, memory, executors, boot time, clock
+        and health.
+
+        ``GET /v1/node``, a token with scope ``observe``. The function ``node(self)``.
+        """
+        return node(self)
+
+    def node_audit(self) -> Audit:
+        """The most recent calls to the node, newest first.
+
+        ``GET /v1/node/audit``, a token with scope ``admin``. The function ``node_audit(self)``.
+        """
+        return node_audit(self)

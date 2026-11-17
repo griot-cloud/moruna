@@ -3,8 +3,10 @@
 
 System design 2E, item 2.5. The generated module holds one class per schema of
 ``kernel/api/openapi.json`` (a dataclass for each object, a ``StrEnum`` for each set of string
-constants) and one function per operation, which calls it through a client and reads its answer.
-The client itself is hand-written beside it, in ``python/moruna/api/__init__.py``.
+constants), one function per operation, which calls it through a client and reads its answer,
+and the class ``Operations``, one method per operation, each a call of its function. The client
+itself is hand-written beside it, in ``python/moruna/api/__init__.py``, and inherits
+``Operations``.
 
 Usage::
 
@@ -44,7 +46,8 @@ HEADER = '''\
 
 Each object schema is a frozen dataclass with ``from_json``, which checks an answer's fields and
 their types, and ``to_json``; each set of string constants is a ``StrEnum``. Each operation is a
-function that calls it through a client (``moruna.api.Client``) and reads its answer.
+function that calls it through a client (``moruna.api.Client``) and reads its answer, and a
+method of ``Operations``, which ``Client`` inherits: ``client.node()`` is ``node(client)``.
 """
 
 from __future__ import annotations
@@ -243,7 +246,17 @@ class Generator:
         return lines
 
     def operations(self) -> list[list[str]]:
+        """One function per operation, then the ``Operations`` class: one method per operation,
+        each a call of its function, which ``Client`` inherits."""
         functions = []
+        methods = [
+            "class Operations(Caller):",
+            *docstring(
+                "One method per operation, each a call of the operation's function above. "
+                "``moruna.api.Client`` inherits them, and supplies the ``call`` they go through.",
+                "    ",
+            ),
+        ]
         for path in sorted(self.paths):
             for method in sorted(self.paths[path]):
                 op = self.paths[path][method]
@@ -266,7 +279,13 @@ class Generator:
                         f"    return {result}.from_json(answer)",
                     ]
                 )
-        return functions
+                methods += [
+                    "",
+                    f"    def {name}(self) -> {result}:",
+                    *docstring(f"{text} The function ``{name}(self)``.", "        "),
+                    f"        return {name}(self)",
+                ]
+        return [*functions, methods]
 
     def module(self) -> str:
         blocks: list[list[str]] = []

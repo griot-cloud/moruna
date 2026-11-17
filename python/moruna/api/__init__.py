@@ -1,13 +1,14 @@
 """A client of a Moruna node's API (system design 2E), on the standard library only.
 
 The types and operations are generated from the API's OpenAPI document into ``_generated``
-(``tools/api/gen_python.py``); this module is the client they are called through::
+(``tools/api/gen_python.py``); this module is the client they are called through. Each operation
+is both a function and a method of the client, generated alike::
 
     from moruna import api
 
     client = api.Client("https://203.0.113.7", token, pin="9f86d0...0a08")
-    node = api.node(client)          # GET /v1/node, an observe token
-    audit = api.node_audit(client)   # GET /v1/node/audit, an admin token
+    node = client.node()             # GET /v1/node, an observe token; api.node(client) too
+    audit = client.node_audit()      # GET /v1/node/audit, an admin token
 
 **Pinning.** With ``pin``, the SHA-256 of the server's certificate in hex (what the node prints
 on its console as ``moruna: tls sha256=<hex>``), the client connects without verifying the
@@ -41,6 +42,7 @@ from moruna.api._generated import (
     HealthStatus,
     Node,
     NodeHealth,
+    Operations,
     Scope,
     health,
     node,
@@ -64,6 +66,7 @@ __all__ = [
     "HealthStatus",
     "Node",
     "NodeHealth",
+    "Operations",
     "PinMismatch",
     "Scope",
     "health",
@@ -105,12 +108,13 @@ class PinMismatch(Error):
         super().__init__(f"the server's certificate has SHA-256 {found}, not the pinned {pin}")
 
 
-class Client:
+class Client(Operations):
     """A client of one node's API: ``Client(url, token, pin=None)``.
 
     ``url`` is ``https://<host>[:<port>]``. ``token`` is sent, as ``Authorization: Bearer``, to
     every operation that needs one, and to no other. ``pin`` is the SHA-256 of the server's
-    certificate in hex; see the module's documentation.
+    certificate in hex; see the module's documentation. The operations' methods
+    (``client.node()`` and the others) are generated, in ``Operations``.
     """
 
     def __init__(self, url: str, token: str, pin: str | None = None) -> None:

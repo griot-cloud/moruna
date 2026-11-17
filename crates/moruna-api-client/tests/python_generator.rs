@@ -118,6 +118,97 @@ fn the_check_fails_when_the_document_changes_without_regenerating() {
     assert!(generate(&check).status.success());
 }
 
+/// Python that runs a generated module (`sys.argv[1]`) and checks, for each operation ID in
+/// `sys.argv[2:]`, that its function and its `Operations` method make the same call and read
+/// the same answer.
+const SAME_CALLS: &str = "import sys, runpy
+m = runpy.run_path(sys.argv[1])
+class Recorder(m['Operations']):
+    def __init__(self):
+        self.calls = []
+    def call(self, operation, method, path, *, token):
+        self.calls.append((operation, method, path, token))
+        return {'status': 'ok', 'records': []} if operation != 'node' else {
+            'version': '0.7.0', 'instance': 'i', 'cloud': 'none', 'cores': 1,
+            'memory_bytes': 1, 'executors': [], 'boot_ms': 1, 'time': 1, 'health': 'ok'}
+for name in sys.argv[2:]:
+    by_function, by_method = Recorder(), Recorder()
+    answer = m[name](by_function)
+    assert getattr(by_method, name)() == answer, name
+    assert by_function.calls == by_method.calls and len(by_method.calls) == 1, name
+    assert by_method.calls[0][0] == name, by_method.calls
+";
+
+/// The operation IDs of an OpenAPI document.
+fn operation_ids(document: &Path) -> Vec<String> {
+    let document: Value = serde_json::from_slice(&std::fs::read(document).unwrap()).unwrap();
+    let mut ids: Vec<String> = document["paths"]
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|methods| methods.as_object().unwrap().values())
+        .map(|operation| operation["operationId"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn the_committed_module_has_a_method_per_operation_that_calls_its_function() {
+    let ids = operation_ids(&root().join("kernel/api/openapi.json"));
+    assert_eq!(ids, ["health", "node", "node_audit"]);
+    let module = root().join("python/moruna/api/_generated.py");
+    let output = python()
+        .args(["-c", SAME_CALLS])
+        .arg(&module)
+        .args(&ids)
+        .output()
+        .expect("python3 runs the module");
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[test]
+fn the_check_fails_when_an_operation_is_added_without_regenerating() {
+    let scratch = Scratch::new();
+    let changed = scratch.document(|document| {
+        document["paths"]["/v1/node/ready"] = json!({"get": {
+            "operationId": "node_ready",
+            "summary": "Whether the node takes work.",
+            "security": [{"bearer": ["observe"]}],
+            "responses": {"200": {"content": {"application/json": {
+                "schema": {"$ref": "#/components/schemas/Health"}}}}}
+        }});
+    });
+    let output = generate(&[Path::new("--check"), Path::new("--openapi"), &changed]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+
+    // Regenerated, the module has the operation's function and its method on `Operations`.
+    let module = scratch.0.join("_generated.py");
+    let output = generate(&[
+        Path::new("--openapi"),
+        &changed,
+        Path::new("--output"),
+        &module,
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = std::fs::read_to_string(&module).unwrap();
+    for expected in [
+        "def node_ready(client: Caller) -> Health:\n",
+        "    answer = client.call(\"node_ready\", \"GET\", \"/v1/node/ready\", token=True)\n",
+        "    def node_ready(self) -> Health:\n",
+        "        return node_ready(self)\n",
+    ] {
+        assert!(text.contains(expected), "{expected:?} not in:\n{text}");
+    }
+    let output = python()
+        .args(["-c", SAME_CALLS])
+        .arg(&module)
+        .args(operation_ids(&changed))
+        .output()
+        .expect("python3 runs the module");
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
 #[test]
 fn the_check_fails_when_the_module_is_missing() {
     let scratch = Scratch::new();
