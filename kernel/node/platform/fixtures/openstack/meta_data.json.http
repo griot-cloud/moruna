@@ -1,0 +1,6 @@
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 427
+date: Tue, 17 Nov 2026 09:30:00 GMT
+
+{"uuid": "83679162-1378-4288-a2d4-70e13ec132aa", "meta": {"role": "moruna-node"}, "hostname": "moruna-node-1.novalocal", "name": "moruna-node-1", "launch_index": 0, "availability_zone": "nova", "random_seed": "AwoRGB8mLTQ7QklQV15lbHN6gYiPlp2kq7K5wMfO1dzj6vH4/wYNFBsiKTA3PkVMU1phaG92fYSLkpmgp661vMPK0djf5u30+wIJEBceJSwzOkFIT1ZdZGtyeYCHjpWc", "project_id": "f7ac731cc11f40efbc03a9f9e1d1d21f", "devices": [], "dedicated_cpus": []}
