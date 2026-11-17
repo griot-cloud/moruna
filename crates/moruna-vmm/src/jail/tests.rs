@@ -93,6 +93,16 @@ fn probe() {
             "nnp",
             libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0).to_string(),
         );
+        // stream E hook (D's file): the signal it gets when its launcher dies.
+        let mut pdeathsig: libc::c_int = -1;
+        libc::prctl(
+            libc::PR_GET_PDEATHSIG,
+            &mut pdeathsig as *mut libc::c_int,
+            0,
+            0,
+            0,
+        );
+        say("pdeathsig", pdeathsig.to_string());
         let mut bounding = 0;
         for cap in 0..64 {
             if libc::prctl(libc::PR_CAPBSET_READ, cap, 0, 0, 0) == 1 {
@@ -414,6 +424,8 @@ fn jail_shows_only_its_entries_and_no_node() {
     assert_eq!(one("uid"), format!("{JAIL_ID} {JAIL_ID}"));
     assert_eq!(one("gid"), format!("{JAIL_ID} {JAIL_ID}"));
     assert_eq!(one("nnp"), "1");
+    // stream E hook (D's file): it dies with its launcher.
+    assert_eq!(one("pdeathsig"), libc::SIGKILL.to_string());
     assert_eq!(one("bounding"), "0");
     assert_eq!(one("caps"), "[0, 0, 0, 0, 0, 0]");
     assert_eq!(one("setuid0"), format!("errno{}", libc::EINVAL));

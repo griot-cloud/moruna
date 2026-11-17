@@ -100,6 +100,7 @@ const STEPS: &[&str] = &[
     "lock securebits",
     "drop capabilities",
     "execve",
+    "set the parent-death signal",
 ];
 const STEP_SETGROUPS: u32 = 0;
 const STEP_UID_MAP: u32 = 1;
@@ -123,6 +124,7 @@ const STEP_AMBIENT: u32 = 18;
 const STEP_SECUREBITS: u32 = 19;
 const STEP_CAPSET: u32 = 20;
 const STEP_EXEC: u32 = 21;
+const STEP_PDEATHSIG: u32 = 22;
 
 enum Op {
     Mkdir(CString),
@@ -155,6 +157,11 @@ struct Prepared {
     stdout: RawFd,
     stderr: RawFd,
     report: RawFd,
+    /// stream E hook (D's file): the read end of a pipe whose write end only the launcher
+    /// keeps open (the child closes its copy), and that copy: an end of file there means the
+    /// launcher died before the child set its parent-death signal.
+    alive_read: RawFd,
+    alive_write: RawFd,
     last_cap: libc::c_ulong,
     _filter: Vec<libc::sock_filter>,
     filter: libc::sock_fprog,
@@ -220,7 +227,12 @@ fn last_cap() -> Result<libc::c_ulong> {
         .map_err(|_| bad("unreadable /proc/sys/kernel/cap_last_cap"))
 }
 
-fn prepare(spec: &Spec<'_>, stdin: RawFd, report: RawFd) -> Result<Prepared> {
+fn prepare(
+    spec: &Spec<'_>,
+    stdin: RawFd,
+    report: RawFd,
+    alive: (RawFd, RawFd),
+) -> Result<Prepared> {
     let root = spec.root;
     let mut ops = Vec::new();
     let mut made = std::collections::BTreeSet::new();
@@ -329,6 +341,8 @@ fn prepare(spec: &Spec<'_>, stdin: RawFd, report: RawFd) -> Result<Prepared> {
         stdout: spec.stdout.as_raw_fd(),
         stderr: spec.stderr.as_raw_fd(),
         report,
+        alive_read: alive.0,
+        alive_write: alive.1,
         last_cap: last_cap()?,
         _filter: filter,
         filter: fprog,
@@ -351,7 +365,34 @@ pub(crate) fn spawn(spec: Spec<'_>) -> Result<Jailed> {
     // SAFETY: freshly created, owned here.
     let (reader, writer) =
         unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
-    let prepared = prepare(&spec, stdin.as_raw_fd(), writer.as_raw_fd())?;
+    // stream E hook (D's file): the jailed program dies with its launcher, however the launcher
+    // dies (a VM that outlived its `moruna run`, SIGKILLed, held its memory and devices with
+    // nothing accounting for it, 2026-11-17). The child sets SIGKILL as its parent-death
+    // signal first, then reads this pipe: its write end is the launcher's alone, so an end of
+    // file means the launcher died before the signal was set. The signal follows the thread
+    // that spawns, so a launcher spawns from a thread that lives as long as the run.
+    let mut alive = [0; 2];
+    // SAFETY: pipe2 fills two descriptors we then own.
+    if unsafe { libc::pipe2(alive.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(VmmError::io(
+            "pipe",
+            "jail parent-death check",
+            &std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: freshly created, owned here.
+    let (alive_read, alive_write) = unsafe {
+        (
+            OwnedFd::from_raw_fd(alive[0]),
+            OwnedFd::from_raw_fd(alive[1]),
+        )
+    };
+    let prepared = prepare(
+        &spec,
+        stdin.as_raw_fd(),
+        writer.as_raw_fd(),
+        (alive_read.as_raw_fd(), alive_write.as_raw_fd()),
+    )?;
     let mut args = CloneArgs {
         flags: NAMESPACES,
         exit_signal: libc::SIGCHLD as u64,
@@ -395,6 +436,9 @@ pub(crate) fn spawn(spec: Spec<'_>) -> Result<Jailed> {
         }
     }
     drop(prepared);
+    // The child has executed its program or failed: past its parent-death check either way.
+    drop(alive_write);
+    drop(alive_read);
     if read == 0 {
         return Ok(jailed);
     }
@@ -452,6 +496,27 @@ unsafe fn child(p: &Prepared) -> ! {
     // owns, which this copy of the address space keeps alive; none allocates or locks.
     unsafe {
         let null = std::ptr::null::<libc::c_char>();
+        // stream E hook (D's file): die with the launcher (see `spawn`), then make sure it
+        // was alive when that was set.
+        if libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        ) != 0
+        {
+            fail(p, STEP_PDEATHSIG);
+        }
+        libc::close(p.alive_write);
+        let mut alive = libc::pollfd {
+            fd: p.alive_read,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if libc::poll(&mut alive, 1, 0) != 0 {
+            libc::_exit(127);
+        }
         write_file(p, &p.setgroups, b"deny", STEP_SETGROUPS);
         write_file(p, &p.uid_map, &p.uid_line, STEP_UID_MAP);
         write_file(p, &p.gid_map, &p.gid_line, STEP_GID_MAP);

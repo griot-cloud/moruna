@@ -606,8 +606,66 @@ fn cost_options(
 /// Run a command line and return the process's exit code (MH 4.2). `cancel` is the surface's
 /// (a signal handler's) way in; a `cancel` message from the peer uses the same token.
 pub fn main(args: &[String], kinds: &Registry, cancel: CancelToken) -> i32 {
+    // stream E hook (D's file): SIGINT and SIGTERM cancel the run, as a peer's `cancel`
+    // does. Before this neither was handled: started in the background, `moruna run`
+    // inherited SIGINT ignored, and a SIGTERM or SIGKILL left its VM running (2026-11-17). On
+    // the Moruna kernel the engine is cancelled through its host, not by signals.
+    #[cfg(unix)]
+    if !moruna_micro::on_kernel() {
+        signals::cancel_on(&cancel);
+    }
     main_as(args, kinds, cancel, &process_env, HEARTBEAT, true)
 }
+
+/// stream E hook (D's file): the process's SIGINT and SIGTERM as a cancel.
+#[cfg(unix)]
+mod signals {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use moruna_kernel::CancelToken;
+
+    static SIGNALLED: AtomicBool = AtomicBool::new(false);
+
+    /// The handler: it only stores to an atomic, which is async-signal-safe.
+    extern "C" fn on_signal(_: libc::c_int) {
+        SIGNALLED.store(true, Ordering::Release);
+    }
+
+    /// Handle SIGINT and SIGTERM (over an inherited "ignore" too) and cancel `cancel` when
+    /// either comes, from a thread that waits for it.
+    pub(super) fn cancel_on(cancel: &CancelToken) {
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            // SAFETY: a zeroed sigaction with an empty mask and a handler that only stores to
+            // an atomic; sigaction copies it.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                action.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigaction(signal, &action, std::ptr::null_mut());
+            }
+        }
+        let cancel = cancel.clone();
+        let _ = std::thread::Builder::new()
+            .name("moruna-signals".into())
+            .spawn(move || {
+                while !SIGNALLED.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                eprintln!("moruna: a signal asked the run to stop: cancelling it");
+                cancel.cancel();
+            });
+    }
+
+    #[cfg(test)]
+    pub(super) fn raised() -> bool {
+        SIGNALLED.load(Ordering::Acquire)
+    }
+}
+
+/// stream E hook (D's file): how long a cancelled VM run's guest has to stop and report before
+/// the run is given up on and its QEMU killed.
+pub const CANCEL_GRACE: Duration = Duration::from_secs(5);
 
 /// [`main`] with the environment and the heartbeat cadence supplied, for tests: the test's
 /// process is not the run's alone, so its own output is left where it goes.
@@ -1232,6 +1290,20 @@ pub fn connect_failure(
     }
 }
 
+/// stream E hook (D's file): a run that was cancelled and did not complete exits
+/// [`exit::CANCELLED`], its diagnostic saying so; any other run keeps its code.
+pub fn cancelled_code(code: i32, cancelled: bool, diagnostic: &mut Option<String>) -> i32 {
+    if !cancelled || code == exit::COMPLETED || code == exit::CANCELLED {
+        return code;
+    }
+    let said = diagnostic.take();
+    *diagnostic = Some(match said {
+        Some(said) => format!("cancelled: {said}"),
+        None => "cancelled".to_string(),
+    });
+    exit::CANCELLED
+}
+
 /// The status a run's exit code says, as the engine's report words it.
 pub fn status_of(code: i32) -> &'static str {
     match code {
@@ -1536,6 +1608,22 @@ fn run_vm(
                 while !done.load(std::sync::atomic::Ordering::Acquire) {
                     if cancel.is_cancelled() {
                         let _ = control.send(&super::protocol::Inbound::Cancel);
+                        // stream E hook (D's file): the guest has CANCEL_GRACE to stop; a
+                        // guest that has not is given up on, and the node shut down below.
+                        let until = std::time::Instant::now() + CANCEL_GRACE;
+                        while !done.load(std::sync::atomic::Ordering::Acquire)
+                            && std::time::Instant::now() < until
+                        {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        if !done.load(std::sync::atomic::Ordering::Acquire) {
+                            eprintln!(
+                                "moruna run --vm: the guest did not stop within {} s of the \
+                                 cancel: its VM is shut down",
+                                CANCEL_GRACE.as_secs()
+                            );
+                            control.abandon();
+                        }
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(50));
@@ -1633,6 +1721,9 @@ fn run_vm(
             error.exit_code()
         }
     };
+    // stream E hook (D's file): a cancelled run that did not complete ends cancelled, whether
+    // its guest stopped or was given up on.
+    let code = cancelled_code(code, cancel.is_cancelled(), &mut diagnostic);
     // C3: a completed run's outputs, from its output disk into the job's output directory.
     let code = match (code, &output_disk, &output_dir) {
         (exit::COMPLETED, Some(disk), Some(out)) => {
@@ -2294,6 +2385,47 @@ mod tests {
         let e = build_node(&dir, Path::new("/j"), &dir.join("o"), &order).unwrap_err();
         assert!(e.contains("not a node kit"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// stream E hook (D's file): a cancelled run that did not complete exits cancelled.
+    #[test]
+    fn a_cancelled_run_exits_cancelled() {
+        let mut said = Some("control: job deadline expired".to_string());
+        assert_eq!(
+            cancelled_code(exit::FAILED, true, &mut said),
+            exit::CANCELLED
+        );
+        assert_eq!(
+            said.as_deref(),
+            Some("cancelled: control: job deadline expired")
+        );
+        let mut none = None;
+        assert_eq!(cancelled_code(8, true, &mut none), exit::CANCELLED);
+        assert_eq!(none.as_deref(), Some("cancelled"));
+        let mut kept = Some("x".to_string());
+        assert_eq!(
+            cancelled_code(exit::COMPLETED, true, &mut kept),
+            exit::COMPLETED
+        );
+        assert_eq!(cancelled_code(exit::FAILED, false, &mut kept), exit::FAILED);
+        assert_eq!(kept.as_deref(), Some("x"));
+    }
+
+    /// stream E hook (D's file): SIGTERM, even over an inherited "ignore", cancels the token
+    /// instead of killing the process.
+    #[cfg(unix)]
+    #[test]
+    fn a_sigterm_cancels_the_run() {
+        let cancel = CancelToken::new();
+        signals::cancel_on(&cancel);
+        // SAFETY: raise delivers SIGTERM to this process, whose handler is now ours.
+        unsafe { libc::raise(libc::SIGTERM) };
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !cancel.is_cancelled() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(signals::raised());
+        assert!(cancel.is_cancelled());
     }
 
     /// stream E hook (D's file): a node that never answered says why, from its console, and
