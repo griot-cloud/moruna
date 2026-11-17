@@ -612,3 +612,46 @@ and switches to the new one when the call answers.
     against 20 ms; 1 CPU passes), and the 9 DS-A lines after it are then missing. A finds the
     cause; E checks whether the NYC numbers move with one vCPU left free. B1's `futex` ("the
     waker woke no one") failed once on 4 CPUs in r6 and passed in r7.
+- **2026-11-17: stream U, the usage build** (Brackly: "once we have tested stuff we'll see what
+  part of moruna os is useless or not being used and we can remove it"). An untimed build that
+  runs the gate's jobs once and records what they used. Stream U's technical calls:
+  - **One switch, off by default.** `MORUNA_USAGE=1 kernel/tools/build.sh OUT` adds
+    `-C instrument-coverage -Zno-profiler-runtime -Cllvm-args=-instrprof-atomic-counter-update-all`
+    and the features `usage` (kernel boot) and `moruna-sys/usage` (every user program). The host
+    side is `moruna` built with `moruna-runtime/usage`, which keeps the evidence in
+    `MORUNA_USAGE_DIR`. Unset, every command is what it was, and the kernel and all user
+    programs build byte for byte as before (checked on the Mac). The timed gate never sets it.
+  - **Coverage, not counters.** Per-call counts are the region counts of the dispatchers' match
+    arms: `syscall.rs` `dispatch` (native calls), `foreign.rs` `fast_call` (Linux calls answered
+    in kernel mode) and `kernel/linux/server` `call`. Counters update atomically, so counts are
+    exact on several CPUs.
+  - **Kernel mode carries no runtime and no dump code.** The node never powers off (the host
+    quits QEMU after the job), so OSTD's `coverage` exit hook would never run, and it would add
+    minicov's C runtime to kernel mode. Instead, after the job's exit, the host waits for the
+    console to settle, pauses the guest over the node's own QMP socket and has QEMU `pmemsave`
+    the kernel's `__llvm_prf_cnts` (its physical address from the kernel ELF's segments). The
+    raw profile (format 10) is rebuilt on the host from the ELF's data and names sections and
+    those counters (`kernel/usage`). Kernel mode gains one static symbol, in the usage build only.
+  - **User programs print their own counters.** `moruna_sys::usage` prints the counters, sparse
+    and checked by a hash, on the console the program already holds: one second after it goes
+    idle having handled something, when busy and its last dump is five seconds old, and at exit.
+    Its waits answer as before. A dump goes out only in the usage build, through the serial log
+    the host already keeps: no new path from a task to the host, no shell, nothing the host
+    sends in. Tasks (the gate's native tasks, Linux programs) are not instrumented.
+  - **Per process.** The kernel's counts are global. Each program's native calls come from the
+    coverage of moruna-sys's wrappers in its own profile, and each dump names its program and
+    process. Linux refusals per process come from the server's end-of-process line, which B2's
+    personality keeps.
+  - **B2 carries over** by adding its dispatcher to the report's `DISPATCHES` table
+    (`tools/usage/src/report.rs`); as a program on moruna-sys it dumps as the server does.
+  - **The report** (`tools/usage`, `moruna-usage report`, Rust, its own workspace) merges each
+    job's profiles and all jobs' with the kernel toolchain's `llvm-profdata` and reads them back
+    with `llvm-cov export`. Its candidates for removal are sorted by what user space can reach
+    (the coordinator's order): native calls never made; kernel-mode code on a direct call path
+    from the user-mode loop, never run; Linux calls never answered; services never started or
+    idle; kernel-mode code reachable only from the kernel. Reachability follows direct calls in
+    the kernel's disassembly, so it is a lower bound. Sizes are lines and bytes (from a
+    production kit's symbols with `--prod-kit`). Only functions compiled into the image count.
+  - **Kept for the accelerator path** (Brackly, 2026-11-17), listed apart with their sizes:
+    `MEMORY_PIN`, `DEVICE_MEMORY_CREATE`, `INTERRUPT_CREATE_MSI`, `DMA_RELEASE`, the drivers
+    and the device manager, OSTD's IOMMU and DMA code, and the core's device, DMA and MSI code.

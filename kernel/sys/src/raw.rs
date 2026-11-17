@@ -79,6 +79,11 @@ pub(crate) fn call0(n: u64) -> (u64, u64) {
 }
 
 pub(crate) fn call1(n: u64, a: u64) -> (u64, u64) {
+    // stream U hook: the usage build's last dump, before `process_exit`.
+    #[cfg(all(feature = "usage", target_os = "none"))]
+    if n == nr::PROCESS_EXIT {
+        crate::usage::at_exit();
+    }
     plain(n, [a, 0, 0, 0, 0, 0])
 }
 
@@ -179,6 +184,9 @@ pub fn process_grant(process: RawHandle, entries: &[u8]) -> u64 {
     unsafe { syscall(nr::PROCESS_GRANT, a) }.0
 }
 
+// stream U hook: in the usage build `wait` is `usage::wait`, below, which dumps when the
+// program goes idle and calls `wait_kernel`, this body.
+#[cfg(not(all(feature = "usage", target_os = "none")))]
 pub fn wait(items: &mut [WaitItem], deadline: u64) -> u64 {
     let a = [
         items.as_mut_ptr() as u64,
@@ -593,3 +601,26 @@ macro_rules! sized {
 sized!(load16, store16, u16);
 sized!(load32, store32, u32);
 sized!(load64, store64, u64);
+
+// stream U hook: `wait` in the usage build, the dumps' wait (`usage::wait`).
+#[cfg(all(feature = "usage", target_os = "none"))]
+pub fn wait(items: &mut [WaitItem], deadline: u64) -> u64 {
+    crate::usage::wait(items, deadline)
+}
+
+/// The `wait` call itself, as `wait` is in every other build.
+#[cfg(all(feature = "usage", target_os = "none"))]
+pub(crate) fn wait_kernel(items: &mut [WaitItem], deadline: u64) -> u64 {
+    let a = [
+        items.as_mut_ptr() as u64,
+        items.len() as u64,
+        deadline,
+        0,
+        0,
+        0,
+    ];
+    const { assert!(core::mem::size_of::<WaitItem>() == wait_item::SIZE) };
+    // SAFETY: the kernel reads and writes `items.len()` 16-byte items, the layout of
+    // `WaitItem`, in the slice.
+    unsafe { syscall(nr::WAIT, a) }.0
+}

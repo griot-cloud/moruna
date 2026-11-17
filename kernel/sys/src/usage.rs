@@ -149,7 +149,7 @@ pub(crate) fn wait(items: &mut [WaitItem], deadline: u64) -> u64 {
             }
             until = deadline.min(t.saturating_add(IDLE));
         }
-        let answer = raw::wait(items, until);
+        let answer = raw::wait_kernel(items, until);
         if until < deadline && Error::from_raw(answer) == Err(Error::TimedOut) {
             dump();
             continue;

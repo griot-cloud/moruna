@@ -35,10 +35,6 @@ mod private_memory;
 pub use private_memory::PrivateMemory;
 pub mod raw;
 pub mod start;
-// stream U hook: the usage build's counters dump (feature `usage`).
-#[cfg(all(feature = "usage", target_os = "none"))]
-#[doc(hidden)]
-pub mod usage;
 
 #[cfg(target_os = "none")]
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -69,9 +65,6 @@ pub fn abi_version() -> u64 {
 
 /// Ends the calling process with `code`.
 pub fn exit(code: i64) -> ! {
-    // stream U hook: the usage build's last dump.
-    #[cfg(all(feature = "usage", target_os = "none"))]
-    usage::at_exit();
     raw::call1(nr::PROCESS_EXIT, code as u64);
     // The kernel never returns from `process_exit`.
     loop {
@@ -329,10 +322,6 @@ impl WaitItem {
 /// Waits until one of `items` raises a signal it awaits, or `deadline` (on [`now`]'s
 /// clock) passes. Returns how many items are satisfied; every item's `observed` is set.
 pub fn wait(items: &mut [WaitItem], deadline: u64) -> Result<usize> {
-    // stream U hook: the usage build dumps when the program goes idle.
-    #[cfg(all(feature = "usage", target_os = "none"))]
-    return check(usage::wait(items, deadline)).map(|n| n as usize);
-    #[cfg(not(all(feature = "usage", target_os = "none")))]
     check(raw::wait(items, deadline)).map(|n| n as usize)
 }
 
@@ -1139,8 +1128,14 @@ macro_rules! main {
     };
 }
 
-// stream U hook: `main!` in the usage build, which also names the program for its dumps
-// (`usage::start`). The macro above is the one every other build has.
+// stream U hooks, at the end of the file so that no line above moves: a panic's location is
+// in the program, and the build without the feature stays byte for byte what it was.
+// The usage build's counters dump (`usage.rs`), and its `main!`, which also names the
+// program for its dumps. Its waits and its exit are hooked in `raw.rs`.
+#[cfg(all(feature = "usage", target_os = "none"))]
+#[doc(hidden)]
+pub mod usage;
+
 #[cfg(all(target_os = "none", feature = "usage"))]
 #[macro_export]
 #[allow_internal_unsafe]
