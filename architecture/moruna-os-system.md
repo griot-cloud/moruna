@@ -570,6 +570,29 @@ There are two kinds:
 - **native:** a static program for the core, as the gate's tasks are today (`images/gate/tasks`);
 - **image:** a Linux program run by the Linux layer, today's `image` kind (SDD 19).
 
+### 5A0. Rust's standard library on Moruna
+
+- **arrow-rs, and most of the Rust ecosystem, need `std`,** and the core's user target has none
+  (item 5.1's finding). A native function in Rust must be an ordinary Rust program, so Moruna
+  becomes a target `std` supports, `target_os = "moruna"`, rather than each library being forked
+  to work without it.
+- **How:**
+  - `std`'s platform layer for Moruna lives in a patched copy of Rust's `library/`, pinned to the
+    kernel's nightly and vendored under `kernel/vendor/rust-std` with the patch marked.
+  - Programs build with `-Zbuild-std=std,panic_abort` against it.
+  - The target becomes `kernel/targets/x86_64-moruna.json`; the `std`-free target stays for the
+    core's own services.
+- **What the platform layer provides,** over `moruna_sys`:
+  - memory from the process's account;
+  - threads, and futex-based locks and condition variables;
+  - the monotonic clock from the clock page;
+  - randomness from the core;
+  - stdout and stderr to the task's log;
+  - arguments and environment from the start page.
+  - Files, sockets and processes answer "unsupported" until a function needs them. A function's
+    data comes through the plane, not through files.
+- **Proof:** arrow-rs's arrays, compute and IPC run in a booted native task.
+
 ### 5A. Rust: `moruna-function`
 
 - **One crate,** `kernel/function/rust`, package `moruna-function`, for the core's user target. It
@@ -623,7 +646,8 @@ There are two kinds:
 
 | Item | Build | Success | Needs |
 |---|---|---|---|
-| 5.1 | `moruna-function` (5A), its guide, and the gate's seven functions moved onto it | Each of the seven gives its rows, as today, in a booted job; an example built from the guide alone runs | 3.2 |
+| 5.0 | Rust's `std` on Moruna (5A0) | A booted native task builds and runs arrow-rs's arrays, compute and IPC | none |
+| 5.1 | `moruna-function` (5A), its guide, and the gate's seven functions moved onto it | Each of the seven gives its rows, as today, in a booted job; an example built from the guide alone runs | 5.0, 3.2 |
 | 5.2 | The header and the static library (5B), with a C conformance function | A C function passes the row check in a booted job | 5.1 |
 | 5.3 | CPython with pyarrow booted on the Linux layer, as an image function | A Python function's rows match in a booted job | 3.2 |
 | 5.4 | `moruna.register` and the end-to-end Python path (5C) | From a laptop: a decorated Python function is registered on a node and runs in a job | 5.3, 3.6 |
