@@ -22,9 +22,9 @@ use guestmem_core::{MemoryWrite, ranges::PagedRange};
 use moruna_storvsc::{Address, PAGE};
 use moruna_vmbus::testing::{Device, Host as Vmbus, TestChannel};
 use scsi_defs::{
-    AdditionalSenseCode, Cdb10, Cdb16, CdbInquiry, DIRECT_ACCESS_DEVICE, ReadCapacity16Data,
-    ReadCapacityDataEx, SERVICE_ACTION_READ_CAPACITY16, ScsiOp, ScsiStatus, SenseData, SenseKey,
-    ServiceActionIn16, VPD_SERIAL_NUMBER, VpdPageHeader,
+    AdditionalSenseCode, Cdb10, Cdb16, CdbInquiry, DIRECT_ACCESS_DEVICE, LunList,
+    ReadCapacity16Data, ReadCapacityDataEx, ReportLuns, SERVICE_ACTION_READ_CAPACITY16, ScsiOp,
+    ScsiStatus, SenseData, SenseKey, ServiceActionIn16, VPD_SERIAL_NUMBER, VpdPageHeader,
     srb::{SrbStatus, SrbStatusAndFlags},
 };
 use storvsp_protocol::{
@@ -245,6 +245,8 @@ pub struct Host {
     pub stalled: bool,
     /// While set, it keeps its completions back.
     pub hold: bool,
+    /// While set, it fails REPORT LUNS as a device that does not know the command.
+    pub refuse_report_luns: bool,
     pub faults: VecDeque<Fault>,
 
     /// Every packet the guest sent: its operation and its transaction ID.
@@ -516,10 +518,60 @@ impl Host {
         });
     }
 
-    /// The five commands the library sends, as `scsidisk` answers them; any other is
+    /// REPORT LUNS for the target a request names, as SPC has it: every LUN of a disk on
+    /// that path and target, in peripheral device addressing; a target with none is not
+    /// there.
+    fn report_luns(&mut self, request: &ScsiRequest, gpns: &[u64]) -> ScsiResult {
+        let len = request.data_transfer_length as usize;
+        assert_eq!(
+            request.data_in, SCSI_IOCTL_DATA_IN,
+            "fake storvsp: REPORT LUNS reads"
+        );
+        assert_eq!(request.cdb_length as usize, size_of::<ReportLuns>());
+        assert_eq!(request.lun, 0, "fake storvsp: REPORT LUNS goes to LUN 0");
+        let cdb = ReportLuns::read_from_prefix(&request.payload).unwrap().0;
+        assert_eq!(cdb.reserved1, [0; 5], "fake storvsp: select report 0");
+        assert_eq!(cdb.allocation_length.get() as usize, len);
+        assert_eq!((cdb.reserved2, cdb.control), (0, 0));
+        if self.refuse_report_luns {
+            return ScsiResult::illegal(AdditionalSenseCode::ILLEGAL_COMMAND);
+        }
+        let luns: Vec<u8> = self
+            .disks
+            .keys()
+            .filter(|(path, target, _)| (*path, *target) == (request.path_id, request.target_id))
+            .map(|(_, _, lun)| *lun)
+            .collect();
+        if luns.is_empty() {
+            return ScsiResult {
+                scsi: ScsiStatus::CHECK_CONDITION,
+                srb: SrbStatus::INVALID_TARGET_ID,
+                moved: 0,
+                sense: None,
+            };
+        }
+        let header = LunList {
+            length: ((luns.len() * 8) as u32).into(),
+            reserved: [0; 4],
+        };
+        let mut page = header.as_bytes().to_vec();
+        for lun in luns {
+            page.extend_from_slice(&[0, lun, 0, 0, 0, 0, 0, 0]);
+        }
+        page.truncate(len);
+        self.memory
+            .write(gpns, &page)
+            .expect("fake storvsp: a page the guest does not have");
+        ScsiResult::good(page.len())
+    }
+
+    /// The six commands the library sends, as `scsidisk` answers them; any other is
     /// the guest's fault.
     fn scsi(&mut self, request: &ScsiRequest, gpns: &[u64]) -> ScsiResult {
         let len = request.data_transfer_length as usize;
+        if ScsiOp(request.payload[0]) == ScsiOp::REPORT_LUNS {
+            return self.report_luns(request, gpns);
+        }
         let key = (request.path_id, request.target_id, request.lun);
         let Some(disk) = self.disks.get_mut(&key) else {
             // `storvsp/src/lib.rs:808-813`.
@@ -822,6 +874,7 @@ pub fn pair_sized(ring: usize) -> (Link, Rc<RefCell<Host>>) {
         refuse: None,
         stalled: false,
         hold: false,
+        refuse_report_luns: false,
         faults: VecDeque::new(),
         seen: Vec::new(),
         offered: Vec::new(),

@@ -147,6 +147,15 @@ impl<C: Channel> Storvsc<C> {
         self.request(address, scsi::inquiry_serial(), SERIAL_BYTES, &[page])
     }
 
+    /// Asks the target of `address` for its logical units (REPORT LUNS), at its LUN 0 as
+    /// SPC has it whatever `address` names. The device writes its answer at the start of the
+    /// guest page `page`; once the request completes, give the bytes it reports to
+    /// [`luns`](crate::luns). A device that does not know the command fails it.
+    pub fn report_luns(&mut self, address: Address, page: u64) -> Result<u64, Error> {
+        let target = Address { lun: 0, ..address };
+        self.request(target, scsi::report_luns(), scsi::LUNS_BYTES, &[page])
+    }
+
     /// Reads `count` blocks from `block` into the guest pages `pages`, from the first page's
     /// first byte (READ 16).
     pub fn read(

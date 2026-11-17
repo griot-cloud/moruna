@@ -1,11 +1,12 @@
 //! The operations a block driver needs: capacity and block size, reads and writes of a block
-//! range by guest page numbers, flush, the serial, and requests in flight together.
+//! range by guest page numbers, flush, the serial, a target's LUNs, and requests in flight
+//! together.
 
 use std::collections::BTreeMap;
 
 use moruna_storvsc::{
-    Address, ChannelError, Disk, Error, Event, Malformed, Operation, PAGE, Storvsc, Wait,
-    scsi::SERIAL_BYTES, serial,
+    AdditionalSenseCode, Address, ChannelError, Disk, Error, Event, Failure, Malformed, Operation,
+    PAGE, SenseKey, SrbStatus, Storvsc, Wait, luns, scsi::SERIAL_BYTES, serial,
 };
 
 use crate::{
@@ -154,6 +155,99 @@ fn flush() {
     let id = device.flush(DISK).unwrap();
     assert_eq!(moved(&mut device, id), 0);
     assert_eq!(flushes(&host), 2);
+}
+
+#[test]
+fn report_luns_lists_the_disks_of_a_target() {
+    let (mut device, host) = device();
+    {
+        let mut host = host.borrow_mut();
+        host.disks
+            .insert((0, 0, 0), FakeDisk::new(512, 64, b"root"));
+        host.disks.insert((0, 1, 5), FakeDisk::new(512, 64, b""));
+    }
+    let listed = |device: &mut Storvsc<_>, target: u8| {
+        let id = device
+            .report_luns(
+                Address {
+                    path: 0,
+                    target,
+                    lun: 9,
+                },
+                4,
+            )
+            .unwrap();
+        let completion = next(device);
+        assert_eq!(completion.id, id);
+        completion.result.map(|n| {
+            let answer = host.borrow().memory.read(&[4], n as usize).unwrap();
+            luns(&answer).unwrap()
+        })
+    };
+    // Sent to LUN 0 of the target whatever the address says, which the fake checks.
+    assert_eq!(listed(&mut device, 0), Ok(vec![0, DISK.lun]));
+    assert_eq!(listed(&mut device, 1), Ok(vec![5]));
+    // A target with no disk is not there.
+    let Err(Failure::Scsi(none)) = listed(&mut device, 2) else {
+        panic!("a target with no disk answered");
+    };
+    assert_eq!(none.srb, SrbStatus::INVALID_TARGET_ID);
+    // A device that does not know the command refuses it.
+    host.borrow_mut().refuse_report_luns = true;
+    let Err(Failure::Scsi(refused)) = listed(&mut device, 0) else {
+        panic!("a refused REPORT LUNS answered");
+    };
+    assert_eq!(
+        refused.sense.map(|s| (s.key, s.code)),
+        Some((
+            SenseKey::ILLEGAL_REQUEST,
+            AdditionalSenseCode::ILLEGAL_COMMAND
+        ))
+    );
+}
+
+#[test]
+fn a_lun_list_is_checked_and_holds_what_a_request_can_name() {
+    let list = |entries: &[[u8; 8]]| {
+        let mut bytes = ((entries.len() * 8) as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(&[0; 4]);
+        for entry in entries {
+            bytes.extend_from_slice(entry);
+        }
+        bytes
+    };
+    assert_eq!(luns(&list(&[])).unwrap(), Vec::<u8>::new());
+    let named = luns(&list(&[
+        [0, 3, 0, 0, 0, 0, 0, 0],
+        // Flat addressing.
+        [0x40, 7, 0, 0, 0, 0, 0, 0],
+        // Again: once.
+        [0, 3, 0, 0, 0, 0, 0, 0],
+        // Flat, above 255.
+        [0x41, 0, 0, 0, 0, 0, 0, 0],
+        // On bus 1.
+        [0x01, 2, 0, 0, 0, 0, 0, 0],
+        // Two levels.
+        [0, 1, 0, 2, 0, 0, 0, 0],
+        // Logical unit addressing.
+        [0x80, 1, 0, 0, 0, 0, 0, 0],
+    ]))
+    .unwrap();
+    assert_eq!(named, [3, 7]);
+    // A list cut short at the bytes asked for: what arrived is used.
+    let mut short = list(&[[0, 1, 0, 0, 0, 0, 0, 0], [0, 2, 0, 0, 0, 0, 0, 0]]);
+    short[3] = 64;
+    assert_eq!(luns(&short).unwrap(), [1, 2]);
+    assert_eq!(
+        luns(&[0; 7]),
+        Err(Malformed("a LUN list shorter than its header"))
+    );
+    let mut ragged = list(&[[0, 1, 0, 0, 0, 0, 0, 0]]);
+    ragged[3] = 9;
+    assert_eq!(
+        luns(&ragged),
+        Err(Malformed("a LUN list whose length is not whole entries"))
+    );
 }
 
 #[test]

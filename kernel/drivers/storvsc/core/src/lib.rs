@@ -9,12 +9,14 @@
 //!   block size (READ CAPACITY 16);
 //! - [`Storvsc::read`] and [`Storvsc::write`] move a block range (READ 16, WRITE 16), and
 //!   [`Storvsc::flush`] is SYNCHRONIZE CACHE;
-//! - [`Storvsc::read_serial`] and [`serial`] give the device's serial (INQUIRY, VPD page 0x80).
+//! - [`Storvsc::read_serial`] and [`serial`] give the device's serial (INQUIRY, VPD page 0x80);
+//! - [`Storvsc::report_luns`] and [`luns`] give a target's logical units (REPORT LUNS), so a
+//!   driver finds its disks with one command a target.
 //!
 //! **Nothing is copied.** Data never passes through the library: a request names the guest
 //! pages the caller gives, in VMBus's "GPA direct" packet form, and the host moves the bytes.
-//! That holds for the capacity and the serial too, which the host writes into a page of the
-//! caller's; the caller then hands that page's bytes to the decoder.
+//! That holds for the capacity, the serial and the LUNs too, which the host writes into a page
+//! of the caller's; the caller then hands that page's bytes to the decoder.
 //!
 //! **The caller drives it.** There is no thread and no async runtime. A request returns its
 //! transaction ID at once; [`Storvsc::poll`] reads what the host has sent and reports each
@@ -50,7 +52,7 @@ use core::fmt;
 
 pub use device::{Completion, Event, Storvsc, VERSIONS};
 pub use moruna_vmbus::{Channel, ChannelError, Wait};
-pub use scsi::{Address, Disk, Failure, ScsiError, Sense, serial};
+pub use scsi::{Address, Disk, Failure, ScsiError, Sense, luns, serial};
 pub use scsi_defs::{AdditionalSenseCode, ScsiStatus, SenseKey, srb::SrbStatus};
 pub use storvsp_protocol::{NtStatus, Operation};
 
