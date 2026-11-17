@@ -766,13 +766,21 @@ fn send_sections_that_cannot_be_used_are_refused() {
             &format!("send sections of {size} bytes, in a buffer of 16384 bytes"),
         );
     }
-    // A section of 32 bytes holds each control message, and the card starts.
+    // A section of 32 bytes holds each control message, and RNDIS initialises, but it
+    // holds no frame of the MTU: the card does not start.
     let (card, host) = start_with(SMALL, |host| host.send_section = 32);
-    let mut card = up(card);
+    let e = down(card);
+    assert!(
+        matches!(
+            e,
+            NetvscError::Unfit {
+                message: 1558,
+                section: 32
+            }
+        ),
+        "{e}"
+    );
     assert_clean(&host);
-    // It holds no frame.
-    let e = card.send(&[0; 60]).unwrap_err();
-    assert!(matches!(e, NetvscError::Unfit { .. }), "{e}");
 }
 
 #[test]

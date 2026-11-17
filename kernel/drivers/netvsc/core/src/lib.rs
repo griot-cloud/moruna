@@ -27,8 +27,9 @@
 //!   nothing here sends `SwitchDataPath`.
 //! - Sub-channels, checksum and segmentation offloads, VLAN, receive-segment coalescing:
 //!   not offered in the NDIS configuration and not used.
-//! - A frame that fits no send-buffer section is refused ([`NetvscError::Unfit`]): how
-//!   it is to be sent by guest page numbers is an open question of item 1.11a.
+//! - Frames are never sent by guest page numbers, only from send-buffer sections. A
+//!   host whose sections cannot hold the largest frame fails [`Netvsc::start`] with
+//!   [`NetvscError::Unfit`], so a started card sends every frame of its MTU.
 //!
 //! # The host is untrusted input
 //!
@@ -117,7 +118,8 @@ pub enum NetvscError {
     /// A frame of this many bytes is no frame of this card: shorter than an Ethernet
     /// header, or longer than the MTU allows.
     Length(usize),
-    /// A frame that fits no section of the send buffer.
+    /// A frame that fits no section of the send buffer. `start` answers it when the
+    /// largest frame of the host's MTU does not fit, and then the card is not started.
     Unfit {
         /// The frame's RNDIS message, in bytes.
         message: usize,
