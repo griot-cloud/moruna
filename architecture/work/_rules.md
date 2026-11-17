@@ -19,3 +19,5 @@
   `moruna-arm`'s `/tmp`. Never delete another agent's.
 - Create nothing in any cloud, and spend nothing.
 - Where your work item and the system design leave a choice open, ask the PM. Do not choose.
+- Scratch files go only in your own folder, `<scratchpad>/<your agent id>/`. Delete only there,
+  never at the scratchpad's top level, which the PM and other agents share.
