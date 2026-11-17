@@ -639,3 +639,17 @@ and switches to the new one when the call answers.
     the integrator under KVM on 1, 2 and 4 CPUs in its moruna-bench slot before the gate. A's
     own slot (after B2) boots it with the old order and placement off, for the with-and-without
     figures.
+- **2026-11-17: A's wake queue reverted** (revert of `bdf24e1f`). Booted under KVM on
+  moruna-bench, it failed its own test and did not fix `share`. `DS-A wake`: longest wake
+  33 ms on 1 CPU (average 16 ms) and 10.0 s on 4 CPUs (average 532 ms). `DS-A share` was still
+  28 ms on 2 CPUs. The NYC gate runs on the kernel of `5ffded0f` (P's, booted clean except
+  `share`), built apart as `/data/boot-gate`. A refixes on its branch and boots it in its own
+  slot before it is merged again.
+  - **D's `moruna run` under KVM, end to end** (QEMU 10.2.1 from the repo's pinned source, with
+    KVM and seccomp, and the launcher's `-sandbox` on; at `bdf24e1f`'s code): stream C's
+    `disk://` job, Parquet to Parquet with the rows unchanged; KD3's image task to Arrow IPC with
+    its rows checked; a failing task whose log records ride the update stream; and a run with
+    its vCPUs placed. A tiny job's VM costs launch 0.6-0.7 s and boot 3.2-4.0 s; its total is
+    8.7-14.0 s. `stage_s` is 0, since the inputs are local files.
+  - Not run under KVM: the launcher's booted test (`data_disks_boot`) compiled to no test
+    without D's `native-tcg-proof` feature. D ran it under TCG.
