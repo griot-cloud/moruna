@@ -120,8 +120,8 @@ impl Granted {
     pub fn notes(&self) -> Vec<String> {
         let m = self.objects.mapped();
         let mut notes = vec![format!(
-            "data OS: the arena is {} granted memory objects of {} bytes, {} mapped with large \
-             pages and every page present, {} mapped plainly",
+            "data OS: the arena made {} granted memory objects of {} bytes as the run needed \
+             them, {} mapped with large pages and every page present, {} mapped plainly",
             m.regions, m.bytes, m.huge, m.plain
         )];
         for disk in self.inputs.iter().chain(self.output.iter()) {
