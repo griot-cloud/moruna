@@ -35,3 +35,10 @@ mod vm;
 pub fn main() {
     boot::boot();
 }
+
+/// Says the core's fatal line for a panic in kernel mode (`moruna: fatal core: <reason>`).
+/// The boot crate's panic handler calls it, then OSTD's handler, which powers the machine
+/// off.
+pub fn panicked(info: &core::panic::PanicInfo) {
+    boot::panicked(info);
+}

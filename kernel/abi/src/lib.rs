@@ -2,8 +2,9 @@
 //!
 //! Everything a process and the kernel must agree on and nothing else: the syscall
 //! numbers, the error codes, the rights a handle carries, the signals an object
-//! raises, the byte layouts the kernel and a process exchange through memory, and the
-//! boot manifest format. The kernel and `moruna-sys` both depend on this crate, so the
+//! raises, the byte layouts the kernel and a process exchange through memory, the
+//! boot manifest format, and the lines the core and the services write on the node's
+//! console as it boots. The kernel and `moruna-sys` both depend on this crate, so the
 //! two sides cannot drift. It holds no code that touches hardware.
 
 #![no_std]
@@ -11,6 +12,8 @@
 
 #[cfg(any(test, feature = "manifest"))]
 extern crate alloc;
+
+pub mod boot_line;
 
 /// The boot manifest's parser and renderer; they allocate, so a process that only
 /// makes syscalls leaves them out.
