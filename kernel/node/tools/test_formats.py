@@ -294,7 +294,7 @@ def modern_bash():
 
 
 class BootDisk(unittest.TestCase):
-    """uefi-boot.sh's FORMAT: the disk it boots and the driver QEMU is told to read it with."""
+    """uefi-boot.sh's FORMAT: the disk it boots and how QEMU is told to read it."""
 
     # In place of QEMU: its arguments to a file, the awaited line to the serial port's file, then
     # it waits to be stopped, as a running machine does.
@@ -336,23 +336,55 @@ exec sleep 60
         self.assertEqual(arguments[arguments.index(boot) - 1], "-drive")
         return boot
 
-    def test_each_format_boots_its_own_file_with_its_driver(self):
-        for name in ("raw", "qcow2", "vhd"):
+    def disks(self):
+        """A stand-in for each format's file. The VHD's is a 1 MiB disk and its footer."""
+        for name in ("raw", "qcow2"):
             (self.out / f"moruna-node.{name}").write_bytes(b"disk")
-        for arguments, name, driver in (((), "raw", "raw"), (("raw",), "raw", "raw"),
-                                        (("qcow2",), "qcow2", "qcow2"), (("vhd",), "vhd", "vpc")):
+        vhd = self.out / "moruna-node.vhd"
+        vhd.write_bytes(b"")
+        os.truncate(vhd, MIB + FOOTER)
+
+    def test_each_format_boots_its_own_file_read_its_own_way(self):
+        self.disks()
+        for arguments, name, read in (((), "raw", "format=raw"), (("raw",), "raw", "format=raw"),
+                                      (("qcow2",), "qcow2", "format=qcow2"),
+                                      (("vhd",), "vhd", f"format=raw,size={MIB}")):
             with self.subTest(arguments=arguments):
                 result = self.boot(str(self.out), "1", *arguments)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 disk = self.out / f"moruna-node.{name}"
-                self.assertEqual(self.drive(), f"if=none,id=boot,format={driver},readonly=on,file={disk}")
-                self.assertIn(f"uefi-boot: boot disk {disk}, read as {driver}", result.stderr)
+                self.assertEqual(self.drive(), f"if=none,id=boot,{read},readonly=on,file={disk}")
+                self.assertIn(f"uefi-boot: boot disk {disk}, read as {read}", result.stderr)
                 self.assertIn('"moruna: services started"', result.stderr)
+
+    def test_the_vhd_is_read_as_raw_less_its_footer(self):
+        # The size comes from the file: 71303680 bytes is item 1.5's real VHD, a 68 MiB disk.
+        vhd = self.out / "moruna-node.vhd"
+        for length in (FOOTER + 512, MIB + FOOTER, 71303680, 3 * MIB + 4096 + FOOTER):
+            with self.subTest(length=length):
+                vhd.write_bytes(b"")
+                os.truncate(vhd, length)
+                result = self.boot(str(self.out), "1", "vhd")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.drive(), f"if=none,id=boot,format=raw,size={length - FOOTER},readonly=on,file={vhd}")
+                self.assertNotIn("vpc", (self.root / "bin/arguments").read_text())
+
+    def test_a_vhd_that_is_not_sectors_and_a_footer_is_refused(self):
+        vhd = self.out / "moruna-node.vhd"
+        for length in (0, 100, FOOTER, MIB + 100, MIB + FOOTER + 1, 71303680 - 1):
+            with self.subTest(length=length):
+                vhd.write_bytes(b"")
+                os.truncate(vhd, length)
+                result = self.boot(str(self.out), "1", "vhd")
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stderr, f"uefi-boot.sh: {vhd} is not a fixed VHD: {length} bytes is not "
+                                                "whole 512-byte sectors and a 512-byte footer\n")
+                self.assertFalse((self.root / "bin/arguments").exists())
 
     def test_the_machine_is_the_same_for_each_format(self):
         machines = []
+        self.disks()
         for name in ("raw", "qcow2", "vhd"):
-            (self.out / f"moruna-node.{name}").write_bytes(b"disk")
             self.assertEqual(self.boot(str(self.out), "2", name).returncode, 0)
             arguments = (self.root / "bin/arguments").read_text().splitlines()
             machines.append([a for a in arguments if not a.startswith("if=none,id=boot,")])

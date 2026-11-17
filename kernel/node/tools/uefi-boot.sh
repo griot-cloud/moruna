@@ -7,8 +7,10 @@
 #   kernel/node/tools/uefi-boot.sh OUT CPUS [FORMAT]
 #
 # FORMAT is the boot disk's format (work item 1.5), one that package.py --formats wrote: raw
-# (the default), qcow2 (OUT/moruna-node.qcow2) or vhd (OUT/moruna-node.vhd, which QEMU reads
-# with its vpc driver). The machine is the same for each.
+# (the default), qcow2 (OUT/moruna-node.qcow2) or vhd (OUT/moruna-node.vhd). A fixed VHD is the
+# disk and then a 512-byte footer, so QEMU reads it as raw with `size=` the file's length less
+# that footer: exactly the disk Azure presents from it, and no VHD driver needed (the project's
+# QEMU has none). The machine is the same for each.
 #
 # Exits 0 once `moruna: services started` is on the console, within 120 s under KVM or 900 s
 # under the emulator, and prints how long after QEMU's start it came. Exits 124 when the time
@@ -28,16 +30,26 @@ case "$cpus" in
   '' | *[!0-9]* | 0*) echo "uefi-boot.sh: CPUS must be a positive number: $cpus" >&2; exit 2 ;;
 esac
 format="${3:-raw}"
-# QEMU's name for the driver that reads each format.
 case "$format" in
-  raw | qcow2) driver="$format" ;;
-  vhd) driver=vpc ;;
+  raw | qcow2 | vhd) ;;
   *) echo "uefi-boot.sh: FORMAT must be raw, qcow2 or vhd: $format" >&2; exit 2 ;;
 esac
 disk="$out/moruna-node.$format"
 if [ ! -f "$disk" ]; then
   echo "uefi-boot.sh: no disk image at $disk (package.py --profile cloud --formats $format writes it)" >&2
   exit 2
+fi
+# How QEMU reads the disk: the VHD as raw, its footer left off.
+if [ "$format" = vhd ]; then
+  length="$(wc -c < "$disk" | tr -d ' ')"
+  size=$((length - 512))
+  if [ "$size" -le 0 ] || [ $((size % 512)) -ne 0 ]; then
+    echo "uefi-boot.sh: $disk is not a fixed VHD: $length bytes is not whole 512-byte sectors and a 512-byte footer" >&2
+    exit 2
+  fi
+  drive="format=raw,size=$size"
+else
+  drive="format=$format"
 fi
 qemu="$(command -v qemu-system-x86_64)" || { echo "uefi-boot.sh: qemu-system-x86_64 is not on PATH" >&2; exit 2; }
 firmware="$(cd "$(dirname "$qemu")/../share/qemu" && pwd)"
@@ -61,7 +73,7 @@ else
   seconds=900
   echo "uefi-boot: TCG (no usable /dev/kvm), $cpus CPUs, $seconds s" >&2
 fi
-echo "uefi-boot: boot disk $disk, read as $driver" >&2
+echo "uefi-boot: boot disk $disk, read as $drive" >&2
 
 console="$out/console.log"
 line="moruna: services started"
@@ -90,7 +102,7 @@ qemu-system-x86_64 -machine q35 -smp "$cpus" -m 2G -nodefaults -no-reboot -displ
   "${accel[@]}" \
   -drive "if=pflash,format=raw,readonly=on,file=$code" \
   -drive "if=pflash,format=raw,file=$vars" \
-  -drive "if=none,id=boot,format=$driver,readonly=on,file=$disk" \
+  -drive "if=none,id=boot,$drive,readonly=on,file=$disk" \
   -device virtio-blk-pci,drive=boot,disable-legacy=on \
   -netdev user,id=net0 -device virtio-net-pci,netdev=net0,disable-legacy=on \
   -serial "file:$console" &

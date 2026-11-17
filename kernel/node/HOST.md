@@ -231,10 +231,12 @@ Each cloud takes its own format, and every one is made from the one raw disk (sy
 - **Each file's size and SHA-256** are in `OUT/inputs-and-artifacts.json`, under its path.
 - **Boot one** with `kernel/node/tools/uefi-boot.sh OUT CPUS FORMAT`, where `FORMAT` is `raw`
   (the default when it is left out), `qcow2` or `vhd`. The machine is the same; only the boot
-  disk's file and the QEMU driver that reads it change (`vpc` for the VHD).
-- **`vhd` cannot boot in `moruna-arm` today:** its QEMU has no `vpc` driver (the table above),
-  so QEMU stops at once with `Unknown driver 'vpc'` and `uefi-boot.sh` exits 1 (item 1.5,
-  2026-11-17). `raw` and `qcow2` boot. How the VHD is booted here is open with the PM.
+  disk's file and how QEMU reads it change.
+- **The VHD is read as raw, its footer left off** (PM, 2026-11-17): `format=raw,size=` the
+  file's length less 512, computed by `uefi-boot.sh` from the file. That is exactly the disk
+  Azure presents from a fixed VHD, and it needs no `vpc` driver, which `moruna-arm`'s QEMU lacks
+  (the table above; with `format=vpc` QEMU stops at once with `Unknown driver 'vpc'`). A `.vhd`
+  whose length is not whole 512-byte sectors and a footer is refused before QEMU starts.
 - **The test** is `python3 -I kernel/node/tools/test_formats.py`. It converts small stand-in
   disks and runs `uefi-boot.sh` against a stand-in for QEMU, so it builds nothing, boots nothing
   and needs no lock. It needs `qemu-img` on `PATH` and a bash with `EPOCHREALTIME` (5.0 or
