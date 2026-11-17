@@ -192,6 +192,12 @@ if it does, this section changes first.
 
 - **`Standard_D4ls_v5`, Generation 2, security type `Standard`.** Azure defaults to Trusted Launch,
   whose Secure Boot refuses our unsigned GRUB. Signing comes later.
+- **The first bring-up runs on `Standard_D4s_v4`** (or `D2s_v4`), Generation 2, in subscription
+  `griot-dev`, Central India, zone 3, with accelerated networking off. `griot-dev` has no quota for
+  any v5 family there (checked 2026-11-17). The v4 size presents the same devices: SCSI disks over
+  VMBus and the synthetic NIC, and no virtual function when accelerated networking is off. The
+  final proof on `Standard_D4ls_v5` needs DLSv5 quota in `griot-dev`, which is Brackly's to ask
+  Azure for.
 - **Accelerated networking cannot be turned off on this size,** so Azure offers a virtual function
   (ConnectX or MANA) beside the synthetic NIC. The node uses the synthetic NIC (netvsc) only. It
   ignores the virtual-PCI offer and never asks Azure to move traffic to the virtual function.
@@ -420,8 +426,15 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
 - **`api` is the engine's host.** The host protocol runs unchanged over a channel between `api` and
   the engine, instead of a socket: `api` sends `spec` and `cancel`, and reads `hello`, `heartbeat`,
   event records, `report` and `exit`.
-- **The budget** is the job document's `budget.memory_bytes`, at most the node's memory less 512 MiB
-  kept for the node's services. A larger one is refused at `validate`.
+- **The budget** is the job document's `budget.memory_bytes`, at most the node's memory less 768 MiB:
+  512 MiB kept for the node's services and 256 MiB for a check running beside a job. A larger one
+  is refused.
+- **Validation is the engine's.** `api` does not link `moruna-job`, which needs std. A document is
+  checked by the engine itself:
+  - `validate`: `node-admission` runs the engine's `check` on the document in a short-lived
+    process with a 256 MiB account, also while a job runs, and `api` returns its refusals.
+  - `submit`: the engine refuses an invalid document as it does today (exit code 2, with the
+    refusals), and `api` answers `invalid` with them.
 
 ### 3B. The job operations
 
@@ -438,7 +451,7 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
 | `GET /v1/jobs/{id}/report` | observe | The `RunReport` JSON, once the job has ended |
 
 - **A job is** `{"v1": <job document version 1 as JSON>}` or `{"v2": "<base64 of the MJB2 FlatBuffer>"}`.
-  Either is checked by `moruna-job`'s `check` before it is accepted.
+  Either is checked by the engine (3A) before it runs.
 - **The node fills in** `report.socket` (the channel), `staging` (none) and the run id when absent.
   A document that names a host socket, a `file://` path outside its volumes, or `resume` is refused
   in this release.
