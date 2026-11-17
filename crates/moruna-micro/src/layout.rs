@@ -56,8 +56,8 @@ pub fn native_task_limit(share: u64, room: u64) -> Option<u64> {
 }
 
 /// The least share a native task runs in: its account at [`TASK_MIN`] beside its plane at its
-/// least (pieces of [`RING_MIN`]: the region, and two rings objects of two windows of two).
-pub const NATIVE_CHILD_MIN: u64 = TASK_MIN + ((IN_FLIGHT + 1) + 2 * 2 * 2) * RING_MIN;
+/// least (pieces of [`RING_MIN`]).
+pub const NATIVE_CHILD_MIN: u64 = TASK_MIN + PLANE_HALF_PIECES * RING_MIN / 2;
 
 /// The CPU a stage's task `instance` is placed on, of `cpus`: one after the instance, so the
 /// first CPU, where the engine's first worker deals the stage's batches, takes a task last.
@@ -210,8 +210,9 @@ pub fn pieces<'a>(len: u64, framing: &'a [u8], body: &[(u64, &'a [u8])]) -> Opti
 
 /// The sizes of a ring task's plane (SDD 30 f.6), from what it holds in flight: the largest
 /// record the engine lays out for it (a piece: a bigger batch goes to the task cut into
-/// pieces), [`IN_FLIGHT`] of them and one more in its input region, and two windows of two
-/// pieces each, for an answer up to twice its batch. The region, the rings object in use and
+/// pieces), [`IN_FLIGHT`] of them and one more in its input region, and [`WINDOWS`] windows of
+/// a piece and a half each, for an answer up to half again its batch (a bigger one goes in
+/// parts). The region, the rings object in use and
 /// one handed back with its records still held fit the stage's plane budget together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RingSizes {
@@ -227,7 +228,35 @@ pub struct RingSizes {
 
 /// Batches each of a ring stage's tasks holds at once: one it works on while the engine lays
 /// out the next, so one engine worker keeps every task of the stage busy.
-pub const IN_FLIGHT: u64 = 2;
+pub const IN_FLIGHT: u64 = 3;
+
+/// The windows of a ring task's rings object: one an answer in flight, so a task can answer a
+/// morsel of [`IN_FLIGHT`] pieces between two of the stage's looks at it.
+pub const WINDOWS: u64 = IN_FLIGHT;
+
+/// A task's plane in half pieces: its region of [`IN_FLIGHT`] pieces and one more, and two
+/// rings objects (the one in use and one handed back) of [`WINDOWS`] windows of a piece and a
+/// half each.
+const PLANE_HALF_PIECES: u64 = 2 * (IN_FLIGHT + 1) + 2 * WINDOWS * 3;
+
+/// Pieces a task may have queued, given to the stage and not yet posted to it, before the
+/// stage holds the worker that brings it more until it has worked some off: a morsel's pieces
+/// past what a task holds in flight wait here, not the worker. A worker that waited for a
+/// task's oldest answer before each piece past the second kept the other seven tasks waiting
+/// for it (32 MiB morsels of three pieces, the NYC gate at 20.5 GiB, 2026-11-17).
+pub const QUEUED_MAX: usize = 2 * IN_FLIGHT as usize;
+
+/// How many of a task's `queued` pieces are posted to it now, with `in_flight` of its pieces
+/// posted and not answered: as many as [`IN_FLIGHT`] leaves room for.
+pub fn to_post(in_flight: usize, queued: usize) -> usize {
+    (IN_FLIGHT as usize).saturating_sub(in_flight).min(queued)
+}
+
+/// Whether a task with `queued` pieces holds the worker that brought them, which waits for its
+/// oldest answer before it goes on: only past [`QUEUED_MAX`].
+pub fn holds_worker(queued: usize) -> bool {
+    queued > QUEUED_MAX
+}
 
 /// The largest piece: the region and windows it makes are what a task holds in flight, never a
 /// share of the budget. Budget shares made each task's plane up to 512 MiB, all of it zeroed
@@ -251,26 +280,24 @@ pub const RINGS_HEAD_MAX: u64 = 1 << 20;
 /// 1 GiB budget were 256 MiB with the head past it, and the kernel refused the object
 /// (`Kernel(Limit)` opening the task's plane, the NYC gate at 8 GiB and more, 2026-11-17).
 pub fn ring_sizes(budget: u64) -> RingSizes {
-    const WINDOWS: u64 = 2;
-    // The region (IN_FLIGHT + 1 pieces) and two rings objects (two windows of two pieces each).
-    const PIECES: u64 = (IN_FLIGHT + 1) + 2 * WINDOWS * 2;
-    let piece = ((budget / PIECES) & !(PAGE - 1)).clamp(RING_MIN, PIECE_MAX);
+    let piece =
+        ((budget / PLANE_HALF_PIECES).saturating_mul(2) & !(PAGE - 1)).clamp(RING_MIN, PIECE_MAX);
     RingSizes {
         piece,
         region: (IN_FLIGHT + 1) * piece,
         windows: WINDOWS,
-        window: 2 * piece,
+        window: (piece + piece / 2) & !(PAGE - 1),
     }
 }
 
 // The largest plane is well within the kernel's largest object.
 const _: () = assert!((IN_FLIGHT + 1) * PIECE_MAX <= OBJECT_MAX);
-const _: () = assert!(2 * 2 * PIECE_MAX + RINGS_HEAD_MAX <= OBJECT_MAX);
+const _: () = assert!(WINDOWS * (PIECE_MAX + PIECE_MAX / 2) + RINGS_HEAD_MAX <= OBJECT_MAX);
 
 /// The most of a stage's budget one native task stands for (the run's `child_share`): the share
 /// whose quarter makes its plane at its largest ([`native_split`]); its account takes at most
 /// [`NATIVE_TASK_MAX`] of the rest.
-pub const NATIVE_CHILD_MAX: u64 = 4 * ((IN_FLIGHT + 1) + 2 * 2 * 2) * PIECE_MAX;
+pub const NATIVE_CHILD_MAX: u64 = 4 * PLANE_HALF_PIECES * PIECE_MAX / 2;
 
 // A native task stands for less than a gibibyte of its stage's budget.
 const _: () = assert!(NATIVE_CHILD_MAX < 1 << 30);
@@ -554,14 +581,14 @@ mod tests {
             s,
             RingSizes {
                 piece: PIECE_MAX,
-                region: 3 * PIECE_MAX,
-                windows: 2,
-                window: 2 * PIECE_MAX,
+                region: 4 * PIECE_MAX,
+                windows: 3,
+                window: 3 * PIECE_MAX / 2,
             }
         );
         assert_eq!(ring_sizes(u64::MAX), s, "never more, whatever the budget");
-        // In use: the region and one rings object, 112 MiB at most, where 512 MiB were.
-        assert_eq!(s.region + s.windows * s.window, 112 * MIB);
+        // In use: the region and one rings object, 136 MiB at most, where 512 MiB were.
+        assert_eq!(s.region + s.windows * s.window, 136 * MIB);
         // A small budget: the region, the rings object and one handed back fit it.
         for budget in [16 * MIB, 64 * MIB, 100 * MIB + 5, 150 * MIB] {
             let s = ring_sizes(budget);
@@ -570,12 +597,116 @@ mod tests {
                 "{budget}: {s:?}"
             );
             assert_eq!(
-                (s.piece % PAGE, s.region, s.window),
-                (0, 3 * s.piece, 2 * s.piece)
+                (s.piece % PAGE, s.window % PAGE, s.region),
+                (0, 0, (IN_FLIGHT + 1) * s.piece)
             );
+            assert!(s.window + PAGE > s.piece + s.piece / 2);
         }
         let small = ring_sizes(MIB);
-        assert_eq!((small.piece, small.region), (RING_MIN, 3 * RING_MIN));
+        assert_eq!((small.piece, small.region), (RING_MIN, 4 * RING_MIN));
+    }
+
+    /// The stage's worker dealing morsels of `pieces` pieces to `tasks` tasks in turn, `cost`
+    /// ticks of its own a morsel (its decode, layout and encode), each piece `work` ticks of a
+    /// task's: when the last task ends, and the ticks the worker spent waiting on one task.
+    /// `queue` is this layout's policy; without it the worker waits for a task's oldest answer
+    /// before each piece past what it holds in flight.
+    fn deal(
+        tasks: usize,
+        morsels: usize,
+        pieces: usize,
+        (cost, work): (u64, u64),
+        queue: bool,
+    ) -> (u64, u64) {
+        let mut now = 0u64;
+        let mut waited = 0u64;
+        // Each task: when its posted pieces end, oldest first, and its queued pieces.
+        let mut posted: Vec<std::collections::VecDeque<u64>> = vec![Default::default(); tasks];
+        let mut queued = vec![0usize; tasks];
+        let mut free = vec![0u64; tasks];
+        let post = |t: usize,
+                    now: u64,
+                    posted: &mut Vec<std::collections::VecDeque<u64>>,
+                    free: &mut Vec<u64>| {
+            let start = now.max(free[t]);
+            free[t] = start + work;
+            posted[t].push_back(free[t]);
+        };
+        for m in 0..morsels {
+            let t = m % tasks;
+            now += cost;
+            let done = |posted: &mut std::collections::VecDeque<u64>, now: u64| {
+                while posted.front().is_some_and(|&end| end <= now) {
+                    posted.pop_front();
+                }
+            };
+            done(&mut posted[t], now);
+            if queue {
+                queued[t] += pieces;
+                loop {
+                    done(&mut posted[t], now);
+                    for _ in 0..to_post(posted[t].len(), queued[t]) {
+                        post(t, now, &mut posted, &mut free);
+                        queued[t] -= 1;
+                    }
+                    if !holds_worker(queued[t]) {
+                        break;
+                    }
+                    let end = posted[t][0];
+                    waited += end - now;
+                    now = end;
+                }
+            } else {
+                for _ in 0..pieces {
+                    done(&mut posted[t], now);
+                    if posted[t].len() >= IN_FLIGHT as usize {
+                        let end = posted[t][0];
+                        waited += end - now;
+                        now = end;
+                        done(&mut posted[t], now);
+                    }
+                    post(t, now, &mut posted, &mut free);
+                }
+            }
+        }
+        // The stage's end: every queued piece goes, each as its task has room.
+        for t in 0..tasks {
+            while queued[t] > 0 {
+                let start = now.max(free[t]);
+                free[t] = start + work;
+                queued[t] -= 1;
+            }
+        }
+        (free.into_iter().max().unwrap_or(0), waited)
+    }
+
+    #[test]
+    fn p_a_morsel_s_pieces_past_a_task_s_room_wait_in_its_queue_not_the_worker() {
+        // The gate's early morsels: eight tasks, morsels of three pieces, the worker's own
+        // work on a morsel about one piece's work of a task's (a 32 MiB morsel's decode, layout
+        // and encode beside a 16 MiB piece of Score).
+        // A morsel of the pieces a task holds in flight: the worker never waits.
+        assert_eq!(deal(8, 64, IN_FLIGHT as usize, (10, 10), true).1, 0);
+        // More pieces than that: the extra wait in the task's queue, not the worker.
+        let pieces = IN_FLIGHT as usize + 1;
+        let (old_end, old_waited) = deal(8, 64, pieces, (10, 10), false);
+        let (end, waited) = deal(8, 64, pieces, (10, 10), true);
+        assert!(
+            waited * 2 <= old_waited,
+            "waited {waited}, was {old_waited}"
+        );
+        assert!(end * 10 < old_end * 9, "ended at {end}, was {old_end}");
+        // Tasks slower than the worker deals: the queue's bound holds it, as it must.
+        assert!(deal(8, 64, 3, (1, 20), true).1 > 0);
+        // The queue is bounded: a task far behind holds the worker again.
+        assert!(!holds_worker(QUEUED_MAX));
+        assert!(holds_worker(QUEUED_MAX + 1));
+        assert_eq!(to_post(0, 5), IN_FLIGHT as usize);
+        assert_eq!(to_post(IN_FLIGHT as usize, 5), 0);
+        assert_eq!(to_post(1, 0), 0);
+        // One task, all the work: the queue bounds what waits, and nothing is lost.
+        let (one, _) = deal(1, 10, 3, (1, 5), true);
+        assert_eq!(one, deal(1, 10, 3, (1, 5), false).0);
     }
 
     #[test]

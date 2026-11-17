@@ -74,8 +74,6 @@ const RING_BYTES: u64 = 64 * 1024;
 // The kernel's largest memory object, which a task's region and rings object are sized under.
 const _: () = assert!(layout::OBJECT_MAX == moruna_abi::limits::MEMORY_MAX_BYTES);
 
-/// Batches each of a ring stage's tasks holds at once ([`layout::IN_FLIGHT`]).
-const IN_FLIGHT: usize = layout::IN_FLIGHT as usize;
 /// The last lines of standard error a failure quotes, as on Linux.
 pub const TAIL_LINES: usize = 20;
 /// A stage's plane holds a record of its input and a window for its output; its arena is
@@ -801,6 +799,7 @@ impl ImageTask {
             stage: self.ports.get().map_or(UNKNOWN_STAGE, |p| p.stage()),
             cancel: self.cancel.get().cloned(),
             in_flight: VecDeque::new(),
+            queued: VecDeque::new(),
             early: VecDeque::new(),
             schema: None,
             busy: Arc::clone(&self.busy),
@@ -855,6 +854,9 @@ pub struct TaskState {
     cancel: Option<CancelToken>,
     /// Ring mode: the batches offered and not yet answered, oldest first.
     in_flight: VecDeque<BatchId>,
+    /// Ring mode: pieces given to the stage and not yet posted to the task, oldest first: a
+    /// morsel's pieces past what the task holds in flight wait here, not the worker.
+    queued: VecDeque<moruna_kernel::arrow::record_batch::RecordBatch>,
     /// What the task put or released while the engine laid out its next batch.
     early: VecDeque<Seen>,
     /// The schema of the task's answers, from its first: a batch of no rows stands for an
@@ -1457,13 +1459,14 @@ impl TaskState {
         }
     }
 
-    /// Ring mode: `batch` goes to the task in pieces of at most its plane's piece, each joining
-    /// the task's batches in flight, of which it holds at most [`IN_FLIGHT`]; the stage answers
+    /// Ring mode: `batch` goes to the task in pieces of at most its plane's piece, queued and
+    /// posted as the task has room ([`layout::IN_FLIGHT`] in flight), and the stage answers
     /// with every answer it has taken meanwhile, joined, the oldest first. It waits for an
-    /// answer only to make room for a piece, and for the task's first (whose schema stands for
-    /// the rest); with no answer come yet it answers with a batch of no rows, and the answers
-    /// come with a later batch, or at the stage's end. The task works while the engine lays out
-    /// its next piece, and one engine worker keeps every task of the stage busy.
+    /// answer only for the task's first (whose schema stands for the rest) and when the task is
+    /// more than [`layout::QUEUED_MAX`] pieces behind; with no answer come it answers with a
+    /// batch of no rows, and the answers come with a later batch, or at the stage's end. A
+    /// morsel's pieces past what the task holds wait in its queue, not the worker, so one
+    /// engine worker keeps every task of the stage busy.
     fn pipelined(
         &mut self,
         batch: &moruna_kernel::arrow::record_batch::RecordBatch,
@@ -1475,29 +1478,35 @@ impl TaskState {
             self.schema = lock(&self.busy.schema).clone();
         }
         let mut taken = Vec::new();
-        for part in self.pieces(batch, piece)? {
-            while self.in_flight.len() >= IN_FLIGHT {
-                taken.push(self.take_oldest(ports, names)?);
-            }
-            let (_, offered) = self.offer(&part, ports, names)?;
-            self.sent += 1;
-            if self.in_flight.is_empty() {
-                self.busy.start();
-            }
-            self.in_flight.push_back(offered);
-        }
+        let pieces = self.pieces(batch, piece)?;
+        self.queued.extend(pieces);
+        self.feed(ports, names)?;
         if self.schema.is_none() && taken.is_empty() {
             taken.push(self.take_oldest(ports, names)?);
+            self.feed(ports, names)?;
         }
-        // The answers that have come, without waiting for any.
-        self.gather(ports, names)?;
-        while let Some(&oldest) = self.in_flight.front()
-            && self
-                .early
-                .iter()
-                .any(|seen| matches!(seen, Seen::Released(b) if *b == oldest))
-        {
-            taken.push(self.take_oldest(ports, names)?);
+        loop {
+            // The answers that have come, without waiting for any: each makes room for one
+            // the task has queued.
+            self.gather(ports, names)?;
+            let mut came = false;
+            while let Some(&oldest) = self.in_flight.front()
+                && self
+                    .early
+                    .iter()
+                    .any(|seen| matches!(seen, Seen::Released(b) if *b == oldest))
+            {
+                taken.push(self.take_oldest(ports, names)?);
+                came = true;
+            }
+            self.feed(ports, names)?;
+            // A task far behind its share holds the worker until it has worked some off.
+            if layout::holds_worker(self.queued.len()) {
+                taken.push(self.take_oldest(ports, names)?);
+                self.feed(ports, names)?;
+            } else if !came {
+                break;
+            }
         }
         match taken.len() {
             0 => {
@@ -1513,6 +1522,23 @@ impl TaskState {
             1 => Ok(taken.remove(0)),
             _ => self.join(taken),
         }
+    }
+
+    /// Posts the task as many of its queued pieces, oldest first, as it has room for
+    /// ([`layout::to_post`]).
+    fn feed(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<()> {
+        for _ in 0..layout::to_post(self.in_flight.len(), self.queued.len()) {
+            let Some(part) = self.queued.pop_front() else {
+                break;
+            };
+            let (_, offered) = self.offer(&part, ports, names)?;
+            self.sent += 1;
+            if self.in_flight.is_empty() {
+                self.busy.start();
+            }
+            self.in_flight.push_back(offered);
+        }
+        Ok(())
     }
 
     /// The answer to the oldest batch in flight, waited for.
@@ -1786,7 +1812,7 @@ impl Kernel for ImageTask {
     }
 
     /// SDD 19 f.6 on the kernel: one record to the task and one back, in lockstep; in ring
-    /// mode in pieces, with at most [`IN_FLIGHT`] in flight, the answers coming with later
+    /// mode in pieces, with at most [`layout::IN_FLIGHT`] in flight, the answers coming with later
     /// batches ([`TaskState::pipelined`]).
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
         self.exchange(state, input, 0)
@@ -1807,7 +1833,12 @@ impl Kernel for ImageTask {
                 ));
             }
             let mut rest = Vec::new();
-            while !st.in_flight.is_empty() {
+            // Every piece the task has queued goes to it, as it has room, and every answer back.
+            loop {
+                st.feed(self.ports.get(), &self.port_names)?;
+                if st.in_flight.is_empty() {
+                    break;
+                }
                 rest.push(st.take_oldest(self.ports.get(), &self.port_names)?);
             }
             let rest = match rest.len() {
