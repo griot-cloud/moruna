@@ -888,3 +888,26 @@ and switches to the new one when the call answers.
     `gve`, the node's job API (`node-admission`), and `storage` and `storage-maintenance`,
     since a mode-1 node boots from its own disk and keeps its home there. A part kept for both
     says so.
+- **2026-11-17: all work reconciled onto this branch, streams stopped** (Brackly: "coordinate
+  and reconcile everything that has been done onto one branch, to the pm, delete the agents
+  and we will re-orient"). At `803e984c`:
+  - **Booted and measured under KVM:** everything up to tag `gate-verified-2026-11-17`
+    (`6c9dd70a`): C's arena by use, lane cap and output layer on disk.out; P's placement,
+    queue, drain fix, sleeping waits, planes ahead, controller notes and feeder split; E's
+    harness, node sizing, launch diagnostics, log store and VM-owner fix; D's `moruna run`.
+  - **Merged after it, not booted:** stream U's usage build (off by default); C's report split
+    (meeting P's feeder split in the scheduler, both kept); stream A's wake queue, placement
+    and spreading (its earlier wake queue failed under KVM); stream B2's Linux layer as the
+    personality with B1's program-mode table, and the drop-in server that replaces
+    `kernel/linux` (deleted here). The engine has only ever run on `kernel/linux`, so the
+    benchmark path at this head is unproven until B2's server boots.
+  - **Mac checks at this head:** root clippy and tests for the scheduler (130), runtime lib
+    (255); kernel host clippy and tests (40); core clippy; user programs' clippy (engine,
+    devices, imagefs, node-admission, plane-test, linux-test). Not checked here:
+    `kernel/linuxlayer`'s own workspace.
+  - **Not merged:** P's unfinished work at the stop (`a685ae9c` on
+    `feature/data-os-p-4b0c77`): a report written on cancel and the budget-2 stall, not built
+    or tested.
+  - **Open:** one-month Score at budget 2 stalls (P's area). The full-year rerun on
+    `6c9dd70a` was stopped part-way; its partial results sit on the India VM's /data until the
+    02:00 UTC shutdown. The VM is idle, the lock released.
