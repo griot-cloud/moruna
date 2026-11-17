@@ -482,13 +482,22 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
 | `GET /v1/jobs/{id}/events` | observe | Server-Sent Events: each event record as its JSON line (`moruna_event`'s rendering), heartbeats, log records, then `report` and `exit`. `?from=<seq>` replays from the node's buffer of the last 100,000 records |
 | `GET /v1/jobs/{id}/report` | observe | The `RunReport` JSON, once the job has ended |
 
-- **A job is** `{"v1": <job document version 1 as JSON>}` or `{"v2": "<base64 of the MJB2 FlatBuffer>"}`.
+- **A job is** `{"v1": <job document version 1 as JSON>}` or `{"v2": "<base64 of the MJB2 FlatBuffer>"}`,
+  with an optional `secrets` map.
   Either is checked by the engine (3A) before it runs.
 - **The node fills in** `report.socket` (the channel), `staging` (none) and the run id when absent.
   A document that names a host socket, a `file://` path outside its volumes, or `resume` is refused
   in this release.
-- **Secrets** (object-store credentials) are redacted in every answer, event, log and report. They
-  live in the engine's memory for the job and in `api`'s memory until the engine has them.
+- **Secrets travel beside the document, by name:**
+  - the job body carries `"secrets": {"<name>": "<value>"}`, at most 32;
+  - the document refers to one where a credential belongs, as `{"secret": "<name>"}`, and never
+    holds a credential itself;
+  - `api` passes the map to the engine in the `spec` message's `secrets` member, outside the
+    document and its digest;
+  - `api` redacts the values in every answer, event, log and report, and drops them when the
+    engine exits. They live only in the engine's and `api`'s memory.
+- **Node mode:** the engine, serving on a channel, fills in the document's gaps and refuses what a
+  node doesn't allow (above). `api` and `node-admission` never read a document.
 
 ### 3C. Volumes
 
