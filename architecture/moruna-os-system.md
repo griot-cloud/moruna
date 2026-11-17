@@ -192,7 +192,12 @@ if it does, this section changes first.
 
 - **`Standard_D4ls_v5`, Generation 2, security type `Standard`.** Azure defaults to Trusted Launch,
   whose Secure Boot refuses our unsigned GRUB. Signing comes later.
-- **The first bring-up runs on `Standard_D4s_v4`** (or `D2s_v4`), Generation 2, in subscription
+- **A node needs no nested virtualization** (Brackly, 2026-11-17): Moruna is the machine, so KVM
+  support no longer limits the choice. A size qualifies when it boots UEFI and presents disks and
+  a network card Moruna drives, and among those the cheapest that holds the job is used. In
+  Central India (public prices, 2026-11-17): `D2s_v4` $0.10 an hour, `D4s_v4` $0.20, `D8s_v4` $0.40,
+  against `D4ls_v5` $0.17 and `D8ds_v6` $0.52.
+- **The first bring-up runs on `Standard_D2s_v4`** (or `D4s_v4`), Generation 2, in subscription
   `griot-dev`, Central India, zone 3, with accelerated networking off. `griot-dev` has no quota for
   any v5 family there (checked 2026-11-17). The v4 size presents the same devices: SCSI disks over
   VMBus and the synthetic NIC, and no virtual function when accelerated networking is off. The
