@@ -1,8 +1,10 @@
 //! CT-T29 plane_record: the data plane's record check (SDD 29) over records arrow itself wrote.
 //! Every record `encode_framing` lays out passes `check_record`, which names the buffers where
-//! `encode_framing` placed them; a stream arrow-ipc writes, re-framed by `reframe`, is the same
-//! record byte for byte; and a compressed record, a dictionary column, a buffer outside the
-//! region, a buffer off its page and bytes that are no record are refused with the reason.
+//! `encode_framing` placed them; a stream arrow-ipc writes, its bitmaps of all ones left out
+//! (`moruna_ipc_check::valid`) and re-framed by `reframe`, is the same record byte for byte, and
+//! smaller by those bitmaps' pages than the stream re-framed as it is; and a compressed record, a
+//! dictionary column, a buffer outside the region, a buffer off its page and bytes that are no
+//! record are refused with the reason.
 
 mod common;
 
@@ -17,6 +19,7 @@ use arrow::record_batch::RecordBatch;
 use common::FakeAllocator;
 use moruna_ipc_check::frame;
 use moruna_ipc_check::record::{Need, PAGE, check_record, framing_need, reframe, stream_parts};
+use moruna_ipc_check::valid::leave_out_all_valid;
 use moruna_kernel::ipc::{Compression, encode_compressed, encode_framing};
 
 fn batches() -> Vec<RecordBatch> {
@@ -119,8 +122,23 @@ fn ct_t29_every_record_encode_framing_writes_passes_with_its_buffers_where_they_
 fn ct_t29_a_stream_reframed_is_the_record_encode_framing_writes() {
     for batch in batches() {
         let (bytes, n, placed) = record(&batch);
-        let (schema_message, batch_message, body) = stream(&batch);
+        let (schema_message, mut batch_message, body) = stream(&batch);
+        let as_written = reframe(&schema_message, &batch_message).expect("reframed as written");
+        let left_out = leave_out_all_valid(&schema_message, &mut batch_message, &mut |at, out| {
+            let at = at as usize;
+            body.get(at..at + out.len())
+                .map(|b| out.copy_from_slice(b))
+                .is_some()
+        })
+        .expect("the bitmaps");
         let reframed = reframe(&schema_message, &batch_message).expect("reframed");
+        // Each bitmap left out was a page of its own.
+        assert_eq!(
+            as_written.record_len - reframed.record_len,
+            left_out.len() as u64 * PAGE,
+            "{:?}",
+            batch.schema()
+        );
         assert_eq!(reframed.framing, bytes[..n].to_vec());
         let mut rebuilt = reframed.framing.clone();
         rebuilt.resize(reframed.record_len as usize, 0);
