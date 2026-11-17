@@ -587,3 +587,28 @@ and switches to the new one when the call answers.
     on a `-` driver line (D's one-line fix, in `kernel/tools/image/src/lib.rs`, was blocked
     by the permission classifier, so it waits for you). `node-for-job.py` works around it per
     node. `node-for-job.py` runs under `python3` on the host and is to be ported to Rust.
+- **2026-11-17: stream P merged** (`7cf337b2`, from `5ffded0f`, which already held D). Under KVM
+  (r7, `c2ff1da6`): DS-P passed on 1, 2 and 4 CPUs, 356 batches of 131,072 rows judged row by
+  row, and the kernel copied for the task only its bells' futex words; the 15 node cases
+  passed; r8 (`5ffded0f`, 1 CPU) passed 210 of 210 with the task's log line read back from its
+  log ring. Coverage: `moruna-plane` 89.0%.
+  - **A native program from an image** (`abi: moruna`, which needs `plane: true`): the engine
+    checks the program's ELF against `kernel/sys/user.ld`'s layout, both ways, and starts it
+    itself with no personality: `Process::create_in`, `process_map_image`, `plane::attach`,
+    `start_with` the log ring. Ring protocol 4 adds the task's exit word (`TASK_EXIT`), read
+    after the process's TERMINATED signal; no word means a fault or a kill. Several output
+    records a batch; a native task's log lines go through `moruna_sys::plane::Log`.
+  - **Integrator's call (security), on P's question:** the job's engine gets a WRITE|TRANSFER
+    duplicate of the root process resource (`grant process root.process` for the initial job,
+    `grant process process process` in engine.conf). Accepted: a process resource only lets
+    its holder create or clone processes, each charged to an account the holder has WRITE on
+    (`process_create`, `process_clone`); it reaches no existing process. TRANSFER is what the
+    grant chain needs to move it. Each native task is charged to the task account the engine
+    carves, the same bound a personality-started task has.
+  - **Open:** `ImageTask`'s ring path (`plane: true`) has not run in a boot; the NYC gate is
+    its first. Decode-in-place is not wired: `ImageTask` copies each batch into the task's
+    region once, counted, and the gate's time split shows it.
+  - **Seen in P's boots, not P's:** DS-A `share` fails on 2 and 4 CPUs in r7 (25 ms and 47 ms
+    against 20 ms; 1 CPU passes), and the 9 DS-A lines after it are then missing. A finds the
+    cause; E checks whether the NYC numbers move with one vCPU left free. B1's `futex` ("the
+    waker woke no one") failed once on 4 CPUs in r6 and passed in r7.
