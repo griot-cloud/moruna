@@ -118,6 +118,23 @@ class NodeSizes(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "2 MiB"):
             self.tool.sizes(gib, gib, 24 * gib + 4096)
 
+    def test_a_job_and_its_scratch_fit_beside_what_the_kernel_keeps(self):
+        # stream E hook (D's file): on a 24 GiB node the processes get 95.17%, so 17 GiB with
+        # 4 GiB of scratch fits and 17.5 with 4 is refused before a launch (it booted and no
+        # service connected, 2026-11-17).
+        gib = 1024 * MIB
+        node, job, *_ = self.tool.sizes(17 * gib, 4 * gib, 24 * gib)
+        self.assertEqual((node, job), (24 * gib, 17 * gib))
+        with self.assertRaisesRegex(ValueError, r"needs at least \d+ \(24\.\d\d GiB\)"):
+            self.tool.sizes(int(17.5 * gib), 4 * gib, 24 * gib)
+        with self.assertRaisesRegex(ValueError, "needs at least"):
+            self.tool.sizes(int(20.5 * gib), gib, 24 * gib)
+        node, *_ = self.tool.sizes(int(20.5 * gib), gib // 2, 24 * gib)
+        self.assertEqual(node, 24 * gib)
+        least, *_ = self.tool.sizes(17 * gib, 4 * gib)
+        self.assertLessEqual(least, 24 * gib)
+        self.assertGreater(least * 24526286848 // (24 * gib), 17 * gib + 4 * gib + sum(self.tool.SERVICES.values()))
+
     def test_a_stack_from_block0_is_attached_alone(self):
         with tempfile.TemporaryDirectory() as tmp:
             build, stack = Path(tmp), Path(tmp) / "stack.layers"
