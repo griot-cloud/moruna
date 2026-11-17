@@ -435,6 +435,10 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
   Linux layer's sockets. It is a new object-store connector, `moruna-net`, beside the `unix://` and
   `vsock://` ones of `moruna-hosted-engine.md` 4.6: it opens a connection, and the network server
   runs TLS on it (`start_tls`, with the node's `tls.roots`).
+- **The network server's TLS needs a trusted time,** which it refuses to start without. It gets it
+  from `platform` at run time, as the wall clock 1D sets: `platform` sends it once over a new link
+  to the network server, and the network server then accepts `start_tls`. Never a build-time clock.
+  Until step 3, the cloud profile gives the network server no `tls.roots` and no TLS.
 - **Egress per job:** `node-admission` holds a network client with only the `grant` right. For each
   job it mints the engine's channel with `connect` and `resolve` limited to the host names in the
   job's object-store settings, on port 443. Nothing else is reachable from a job.
