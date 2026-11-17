@@ -13,15 +13,15 @@ use std::{
 
 use super::{
     FakeClock, FakeNetwork, RECORDED_CONTAINER, RECORDED_INCARNATION, RECORDED_ROLE_INSTANCE,
-    Reply, SECOND, Sent, answer, recorded, recorded_health, wire_server,
+    Reply, SECOND, Sent, answer, chunked, recorded, recorded_health, wire_server,
 };
 use crate::{
     boot::Stage,
     http::Request,
     machine::{Clock, StreamError},
     wireserver::{
-        ADDRESS, GOAL_STATE, GoalState, HEADERS, HEALTH_PATH, LIMIT_NS, PORT, RETRY_NS, VALUE_MAX,
-        report,
+        ADDRESS, GOAL_STATE, GoalState, HEADERS, HEALTH_HEADERS, HEALTH_PATH, LIMIT_NS, PORT,
+        RETRY_NS, VALUE_MAX, report,
     },
     xml,
 };
@@ -294,7 +294,8 @@ fn the_report_is_the_goal_state_then_the_health_document() {
         (sent[0].method.as_str(), sent[0].path.as_str()),
         ("GET", "/machine?comp=goalstate")
     );
-    // The Health document: a POST with the same header and the document's length.
+    // The Health document: a POST with the same header, the document's type, this agent's
+    // name (PM, item 1.12), and the document's length.
     let health = recorded_health();
     assert_eq!(
         sent[1].headers,
@@ -302,6 +303,11 @@ fn the_report_is_the_goal_state_then_the_health_document() {
             ("Host".to_string(), "168.63.129.16".to_string()),
             ("Connection".to_string(), "close".to_string()),
             ("x-ms-version".to_string(), "2012-11-30".to_string()),
+            (
+                "Content-Type".to_string(),
+                "text/xml;charset=utf-8".to_string()
+            ),
+            ("x-ms-agent-name".to_string(), "moruna".to_string()),
             ("Content-Length".to_string(), health.len().to_string()),
         ]
     );
@@ -311,6 +317,7 @@ fn the_report_is_the_goal_state_then_the_health_document() {
     );
     assert_eq!(sent[1].body, health.as_bytes());
     assert_eq!(HEADERS, [("x-ms-version", "2012-11-30")]);
+    assert_eq!(HEALTH_HEADERS[0], HEADERS[0]);
     // It took no time on the clock beyond the requests'.
     assert_eq!(clock.now(), 0);
 }
@@ -448,13 +455,35 @@ fn a_report_not_taken_within_2_minutes_is_fatal() {
 fn the_requests_are_what_the_client_sends() {
     // The Health document is posted as Request::post encodes it.
     let health = recorded_health();
-    let post = Request::post("168.63.129.16", HEALTH_PATH, HEADERS, health.as_bytes());
+    let post = Request::post(
+        "168.63.129.16",
+        HEALTH_PATH,
+        HEALTH_HEADERS,
+        health.as_bytes(),
+    );
     let wire = post.encode();
     let head = format!(
         "POST /machine?comp=health HTTP/1.1\r\nHost: 168.63.129.16\r\nConnection: close\r\n\
-         x-ms-version: 2012-11-30\r\nContent-Length: {}\r\n\r\n",
+         x-ms-version: 2012-11-30\r\nContent-Type: text/xml;charset=utf-8\r\n\
+         x-ms-agent-name: moruna\r\nContent-Length: {}\r\n\r\n",
         health.len()
     );
     assert_eq!(&wire[..head.len()], head.as_bytes());
     assert_eq!(&wire[head.len()..], health.as_bytes());
+}
+
+#[test]
+fn a_wireserver_that_answers_in_chunks_takes_the_report() {
+    // Every answer in chunks, of a few sizes: the goal state is read whole all the same.
+    for size in [1, 7, 512, 1 << 20] {
+        let clock = FakeClock::default();
+        let mut network = FakeNetwork::serving(&clock, move |_, sent| match wire_server(sent) {
+            Reply::Answer(wire) => Reply::Answer(chunked(&wire, size)),
+            other => other,
+        });
+        network.chunk = 5;
+        report(&mut network, &mut clock.clone()).unwrap();
+        assert_eq!(network.requests.len(), 2, "in chunks of {size}");
+        assert_eq!(network.attempts, [0, 0]);
+    }
 }

@@ -11,8 +11,10 @@
 //! 2. `POST http://168.63.129.16/machine?comp=health` with the `Health` document that names
 //!    them, exactly as that Python writes it.
 //!
-//! Both carry the header `x-ms-version: 2012-11-30`, as 1F says, and each is answered `200` when
-//! it is taken. Without the report, Azure reboots the machine.
+//! Both carry the header `x-ms-version: 2012-11-30`, as 1F says. The `POST` also carries
+//! `Content-Type: text/xml;charset=utf-8` and `x-ms-agent-name: moruna`, as every `POST` Microsoft
+//! documents carries a type and an agent's name (PM, item 1.12). Each is answered `200` when it is
+//! taken. Without the report, Azure reboots the machine.
 //!
 //! **A refused report is tried again every 5 s, for up to 2 minutes** (work item 1.12): an
 //! attempt begins every 5 s and has until the next one would begin. A refusal is any answer but
@@ -38,6 +40,13 @@ const HOST: &str = "168.63.129.16";
 
 /// The header both requests carry (1F).
 pub const HEADERS: &[(&str, &str)] = &[("x-ms-version", "2012-11-30")];
+/// The headers the `Health` document is posted with: 1F's, the document's type, and this
+/// agent's name, in the order Microsoft's Python sends them.
+pub const HEALTH_HEADERS: &[(&str, &str)] = &[
+    ("x-ms-version", "2012-11-30"),
+    ("Content-Type", "text/xml;charset=utf-8"),
+    ("x-ms-agent-name", "moruna"),
+];
 /// The goal state.
 pub const GOAL_STATE: Request<'static> = Request::get(HOST, "/machine?comp=goalstate", HEADERS);
 /// Where the `Health` document is posted.
@@ -141,7 +150,7 @@ fn attempt<N: Network>(network: &mut N, deadline: u64) -> Result<(), String> {
     let state = GoalState::parse(&goal.body)
         .map_err(|why| said(&GOAL_STATE, &format!("the goal state {why}")))?;
     let health = state.health();
-    let post = Request::post(HOST, HEALTH_PATH, HEADERS, health.as_bytes());
+    let post = Request::post(HOST, HEALTH_PATH, HEALTH_HEADERS, health.as_bytes());
     let answer = ask(network, &post, deadline).map_err(|error| said(&post, &error))?;
     if answer.status != 200 {
         let status = format!("answered {}", answer.status);

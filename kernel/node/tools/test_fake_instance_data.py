@@ -196,6 +196,8 @@ HEALTH = (
     "</State></Health></Role></RoleInstanceList></Container></Health>"
 )
 VERSION = {"x-ms-version": "2012-11-30"}
+# The headers the node posts the Health document with (PM, item 1.12).
+POSTED = {**VERSION, "Content-Type": "text/xml;charset=utf-8", "x-ms-agent-name": "moruna"}
 
 
 class WireServer(unittest.TestCase):
@@ -222,7 +224,7 @@ class WireServer(unittest.TestCase):
                 "a41f2c7e-93b5-4d0a-8e6c-1f7b2d9e3c58._moruna-node-1",
             )
             # The Health document that reports it ready is taken.
-            response, body = cloud.request("POST", "/machine?comp=health", VERSION, HEALTH, port)
+            response, body = cloud.request("POST", "/machine?comp=health", POSTED, HEALTH, port)
             self.assertEqual(response.status, 200)
             Answers.check_head(self, response, body)
             self.assertEqual(body, b"")
@@ -245,6 +247,14 @@ class WireServer(unittest.TestCase):
             self.assertEqual(cloud.get(goal, None, port)[0].status, 400)
             self.assertEqual(cloud.get(goal, {"x-ms-version": "2015-04-05"}, port)[0].status, 400)
             self.assertEqual(cloud.request("POST", health, None, HEALTH, port)[0].status, 400)
+            # Without the document's type or this agent's name, or with others.
+            for name in ("Content-Type", "x-ms-agent-name"):
+                for value in (None, "other"):
+                    headers = {k: v for k, v in POSTED.items() if k != name}
+                    if value is not None:
+                        headers[name] = value
+                    response, _ = cloud.request("POST", health, headers, HEALTH, port)
+                    self.assertEqual(response.status, 400, (name, value))
             # A document that is not the goal state's, or that says something else.
             for document in [
                 "",
@@ -252,10 +262,10 @@ class WireServer(unittest.TestCase):
                 HEALTH.replace("Ready", "NotReady"),
                 HEALTH + "\n",
             ]:
-                response, _ = cloud.request("POST", health, VERSION, document, port)
+                response, _ = cloud.request("POST", health, POSTED, document, port)
                 self.assertEqual(response.status, 400, document)
             # The methods swapped, and a path it does not have.
-            self.assertEqual(cloud.request("POST", goal, VERSION, HEALTH, port)[0].status, 400)
+            self.assertEqual(cloud.request("POST", goal, POSTED, HEALTH, port)[0].status, 400)
             self.assertEqual(cloud.get(health, VERSION, port)[0].status, 400)
             self.assertEqual(cloud.get("/machine?comp=config", VERSION, port)[0].status, 404)
             log = cloud.log()
@@ -267,8 +277,42 @@ class WireServer(unittest.TestCase):
             response, body = cloud.get("/machine?comp=goalstate", VERSION, port)
             self.assertEqual(response.status, 503)
             Answers.check_head(self, response, body)
-            response, _ = cloud.request("POST", "/machine?comp=health", VERSION, HEALTH, port)
+            response, _ = cloud.request("POST", "/machine?comp=health", POSTED, HEALTH, port)
             self.assertEqual(response.status, 503)
+
+    def test_chunked(self):
+        with self.serving("--chunked") as cloud:
+            # Each answer in chunks, on either address, read whole by a client that reads them.
+            response, body = cloud.get(AZURE, {"Metadata": "true"})
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.getheader("Transfer-Encoding"), "chunked")
+            self.assertIsNone(response.getheader("Content-Length"))
+            self.assertEqual(json.loads(body)["compute"]["vmId"], AZURE_ID)
+            port = cloud.wireserver
+            response, body = cloud.get("/machine?comp=goalstate", VERSION, port)
+            self.assertEqual(response.getheader("Transfer-Encoding"), "chunked")
+            self.assertEqual(ElementTree.fromstring(body).findtext("Incarnation"), "1")
+            response, body = cloud.request("POST", "/machine?comp=health", POSTED, HEALTH, port)
+            self.assertEqual((response.status, body), (200, b""))
+            # On the wire: chunks of at most 512 bytes, each with an extension, and a trailer.
+            raw = raw_get(cloud.port, AZURE, "Metadata: true")
+            head, framed = raw.split(b"\r\n\r\n", 1)
+            self.assertIn(b"\r\nTransfer-Encoding: chunked", head)
+            self.assertNotIn(b"content-length", head.lower())
+            sizes = []
+            rest = framed
+            while True:
+                line, rest = rest.split(b"\r\n", 1)
+                size, extension = line.split(b";", 1)
+                self.assertTrue(extension.startswith(b"fake="), line)
+                sizes.append(int(size, 16))
+                if sizes[-1] == 0:
+                    break
+                self.assertEqual(rest[sizes[-1] : sizes[-1] + 2], b"\r\n")
+                rest = rest[sizes[-1] + 2 :]
+            self.assertEqual(rest, b"X-Fake: chunked\r\n\r\n")
+            self.assertGreater(len(sizes), 2)
+            self.assertTrue(all(0 < size <= CHUNK_MAX for size in sizes[:-1]), sizes)
 
     def test_what_it_refuses_to_start_with(self):
         # The WireServer is Azure's; its address is HOST:PORT; --report needs it.
@@ -284,6 +328,21 @@ class WireServer(unittest.TestCase):
         alone = run("--cloud", "azure", "--config", "valid", "--report", "refuse")
         self.assertNotEqual(alone.returncode, 0)
         self.assertIn("--report needs --wireserver", alone.stderr)
+
+
+AZURE_ID = "5c08b38e-4d57-4c23-ac45-aca61037f084"
+# The most bytes of a chunk `--chunked` sends.
+CHUNK_MAX = 512
+
+
+def raw_get(port, path, header):
+    """The bytes a GET of `path` is answered with, as they come off the wire."""
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
+        connection.sendall(f"GET {path} HTTP/1.1\r\nHost: x\r\n{header}\r\n\r\n".encode())
+        answer = b""
+        while chunk := connection.recv(65536):
+            answer += chunk
+    return answer
 
 
 if __name__ == "__main__":

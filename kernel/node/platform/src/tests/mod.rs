@@ -362,8 +362,8 @@ pub(crate) fn openstack(sent: &Sent) -> Reply {
 
 /// Azure's WireServer, strict about what it is sent: the goal state to a `GET` with the header
 /// `x-ms-version: 2012-11-30`, and its taking of the recorded goal state's `Health` document to a
-/// `POST` with the same header. Anything else is a `400`, which is this fake's, not a documented
-/// answer.
+/// `POST` with the same header, the document's type and this agent's name. Anything else is a
+/// `400`, which is this fake's, not a documented answer.
 pub(crate) fn wire_server(sent: &Sent) -> Reply {
     assert_eq!(
         sent.to,
@@ -371,17 +371,49 @@ pub(crate) fn wire_server(sent: &Sent) -> Reply {
     );
     let versioned = sent.header("x-ms-version") == Some("2012-11-30");
     let host = sent.header("Host") == Some("168.63.129.16");
+    let posted = sent.header("Content-Type") == Some("text/xml;charset=utf-8")
+        && sent.header("x-ms-agent-name") == Some("moruna");
     Reply::Answer(match (sent.method.as_str(), sent.path.as_str()) {
         ("GET", "/machine?comp=goalstate") if versioned && host && sent.body.is_empty() => {
             recorded::goal_state()
         }
         ("POST", "/machine?comp=health")
-            if versioned && host && sent.body == recorded_health().as_bytes() =>
+            if versioned && host && posted && sent.body == recorded_health().as_bytes() =>
         {
             recorded::health_taken()
         }
         _ => answer("400 Bad Request", b""),
     })
+}
+
+/// `wire`, an answer with a `Content-Length`, as the same answer in chunks of `size` bytes: the
+/// length's header swapped for `Transfer-Encoding: chunked`, each chunk's size in lowercase hex,
+/// the last chunk, and no trailers.
+pub(crate) fn chunked(wire: &[u8], size: usize) -> Vec<u8> {
+    let at = wire
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("a head");
+    let head = core::str::from_utf8(&wire[..at]).expect("an ASCII head");
+    let mut out = String::new();
+    for line in head.split("\r\n") {
+        let length = line
+            .split_once(':')
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("content-length"));
+        if !length {
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+    }
+    out.push_str("Transfer-Encoding: chunked\r\n\r\n");
+    let mut out = out.into_bytes();
+    for piece in wire[at + 4..].chunks(size) {
+        out.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+        out.extend_from_slice(piece);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"0\r\n\r\n");
+    out
 }
 
 /// Azure's Instance Metadata Service, from the recorded answers, and its WireServer.
