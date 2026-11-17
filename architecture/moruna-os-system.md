@@ -543,13 +543,21 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
   Linux layer's sockets. It is a new object-store connector, `moruna-net`, beside the `unix://` and
   `vsock://` ones of `moruna-hosted-engine.md` 4.6: it opens a connection, and the network server
   runs TLS on it (`start_tls`, with the node's `tls.roots`).
-- **The network server's TLS needs a trusted time,** which it refuses to start without. It gets it
-  from `platform` at run time, as the wall clock 1D sets: `platform` sends it once over a new link
-  to the network server, and the network server then accepts `start_tls`. Never a build-time clock.
-  Until step 3, the cloud profile gives the network server no `tls.roots` and no TLS.
-- **Egress per job:** `node-admission` holds a network client with only the `grant` right. For each
-  job it mints the engine's channel with `connect` and `resolve` limited to the host names in the
-  job's object-store settings, on port 443. Nothing else is reachable from a job.
+- **The network server's TLS needs a trusted time,** which it refuses to start without. It reads the
+  node's one wall clock, the core's (5A0's clock page, `realtime_base_ns` and its set flag), and
+  refuses TLS while that clock is unset. `platform` sets it through `clock_set_realtime` on
+  `root.clock` from instance data's `Date` before `ready`, and again every hour, which keeps S3 and
+  Blob request signing inside their 15-minute skew on a node that runs for months. No second clock,
+  no link for it, never a build-time clock: the cloud profile refuses `tls-unix-seconds`.
+- **Trusted roots:** the cloud profile's `tls.roots` is Mozilla's set, generated from a pinned
+  `webpki-roots` into `kernel/node/cloud/tls-roots.pem`, with its version and SHA-256 beside it.
+- **Egress per job:** the engine's check (3B) answers with the job's needs: its object-store host
+  names, its volumes (3C) and its functions (3E). `node-admission` grants exactly those. For the
+  network it holds a client with `grant,connect` on the name rule `*` at port 443 (every name, held
+  by admission alone, which never connects itself), and mints each job's channel with `connect`
+  limited to that job's host names, on port 443. Nothing else is reachable from a job.
+- **Connections are reused:** the connector keeps an HTTP/1.1 keep-alive pool per host, bounded by
+  the job's socket budget (64), so a range read never pays a new TCP and TLS handshake.
 - **Object stores, in order:** the S3 API (any endpoint), then Azure Blob.
 - **Throughput is measured** in item 3.4: one large object read through the connector, MB/s,
   against the same read with `curl` on the same cloud's Linux.
