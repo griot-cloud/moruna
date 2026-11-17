@@ -54,6 +54,13 @@ pub(crate) fn footer_for(want: u64) -> u64 {
 /// grows, up to the lane's share.
 pub(crate) const START_BYTES: u64 = 8 << 20;
 
+// Stream C (2026-11-17): a lane's share is capped, whatever the budget.
+/// The most one lane's file buffer grows to: a file rolls at this less its footer. A larger
+/// budget buys more room and more lanes, not larger files or larger morsels (a morsel is at
+/// most half a lane's buffer), so the first morsels and the memory first touched before the
+/// first row stay the same at any budget.
+pub const LANE_MAX_BYTES: u64 = 64 << 20;
+
 /// The bytes a batch's rows occupy, which is what the encoder reads: not the capacity of the
 /// buffers they are a slice of. A morsel read back from staging is a slice of the segment it
 /// was staged in, and measured by its buffers it looked several times its size, so the sink
@@ -285,6 +292,7 @@ impl FileBuffers {
         if let Some(free) = self.alloc.available(tier) {
             want = want.min(class_floor(free / (2 * count as u64)).max(floor));
         }
+        let want = want.min(LANE_MAX_BYTES).max(floor);
         self.keep.store(
             if count == 2 { 1 } else { count },
             std::sync::atomic::Ordering::SeqCst,

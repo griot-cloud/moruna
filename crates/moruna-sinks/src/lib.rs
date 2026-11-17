@@ -36,6 +36,7 @@ mod stats;
 mod stream;
 mod tensor_sink;
 
+pub use file_buf::LANE_MAX_BYTES;
 pub use handle::SinkHandle;
 pub use ipc_sink::{ArrowIpcSink, ArrowIpcSinkConfig};
 pub use parquet_sink::{ParquetSink, ParquetSinkConfig};
