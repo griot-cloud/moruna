@@ -218,23 +218,41 @@ if it does, this section changes first.
   `0x40000022` (TSC) and `0x40000023` (local APIC), and the PIT last, with a deadline (1B).
 - **Timer:** the local APIC timer at the rate Hyper-V gives. Nothing from the old PC (PIT, PIC,
   HPET, CMOS clock) is assumed.
-- **No PCI bus:** Generation 2 has no ACPI MCFG. The core boots without `root.ecam`, and `devices`
-  runs with no PCI functions. Today the core refuses to boot without MCFG (`kernel/core/src/boot.rs`).
+- **No PCI bus:** Generation 2 has no ACPI MCFG. Today the core refuses to boot without it
+  (`kernel/core/src/boot.rs`). Instead, `root.ecam` then covers an empty range, `devices` finds no
+  PCI function and says so in one line, and the boot goes on. The same holds on any machine
+  without MCFG.
 - **Guest OS ID:** written before the hypercall page, in the TLFS's open-source encoding. Item 1.8
   proposes the exact value with its TLFS citation; the PM approves it.
 - **Power-off:** ACPI S5 (1B).
 
 ### VMBus, split by the microkernel rule
 
-- **In the core, one mechanism,** granted to the `vmbus` process only:
-  - the hypercall page, and the hypercalls `HvPostMessage` and `HvSignalEvent`;
-  - each CPU's SynIC message and event pages, mapped read-only to `vmbus`;
-  - SINT 2's interrupt delivered to `vmbus`, and its end-of-message write.
+- **In the core, one mechanism.** When Hyper-V is found, the core sets up the hypercall page and
+  CPU 0's SynIC, and makes one boot capability, `root.hyperv`, which the supervisor grants to the
+  `vmbus` process only. The calls on it:
 
-  Added kernel-mode lines are counted in `data-os.md` section 0.
-- **In the `vmbus` process:** the version handshake, offers, opening and closing channels, GPADLs
-  (guest memory shared with the host), and each channel's ring pair mapped to its driver. Every
-  channel targets CPU 0 at first.
+  | Call | What it does |
+  |---|---|
+  | post a message | `HvPostMessage` to a connection ID: a type and up to 240 bytes. Answers ok, busy, or Hyper-V's status |
+  | take a message | Copies out the message waiting on SINT 2, marks the slot empty, and writes end-of-message when one more is pending |
+  | map the event flags | Maps CPU 0's event-flags page into the caller, once |
+  | the interrupt | Gives an interrupt object for SINT 2, waited on as a driver waits on its device's |
+  | a signal handle | Makes a handle that can signal one connection ID and nothing else, to give to that channel's driver |
+  | signal | `HvSignalEvent`, through a signal handle |
+
+  - The SynIC is enabled on CPU 0 only, and every channel targets it.
+  - A GPADL's guest page numbers come from the DMA grant a driver already uses to pin memory.
+  - Added kernel-mode lines and calls are counted in `data-os.md` section 0.
+- **In the `vmbus` process:** `moruna-vmbus` wired to those calls. It serves drivers a small
+  protocol, `moruna.driver.vmbus`: list the offers of an interface, open a channel, share memory
+  with the host, close.
+  - Opening a channel gives the driver the ring memory, the channel's signal handle, and a wake
+    word.
+  - **Out:** a driver writes its ring and signals the host itself, through its signal handle.
+  - **In:** the host's interrupt reaches `vmbus`, which reads the event flags and wakes the
+    drivers whose channels have data. That is one hop on the way in, accepted for the first
+    bring-up.
 - **`storvsc` and `netvsc`** are driver processes that serve today's block and network driver
   protocols, so nothing above them changes. netvsc speaks NVSP and RNDIS.
 - **Libraries first, as with the API server.** The VMBus client, storvsc and netvsc are each a
