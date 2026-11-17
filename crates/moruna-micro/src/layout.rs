@@ -400,6 +400,56 @@ pub fn retire<P>(
     }
 }
 
+/// How long a stage waits on its task with no answer come before it says where the wait stands,
+/// and again each time as long again: a wait that never ended used to say nothing (item 3.1,
+/// the full-year hang). A log line, not a cancel.
+pub const WAIT_NOTE_NS: u64 = 60 * 1_000_000_000;
+
+/// When a wait on a task is due to say where it stands ([`WAIT_NOTE_NS`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitNotes {
+    since: u64,
+    next: u64,
+}
+
+impl WaitNotes {
+    /// A wait begun at `now`, in nanoseconds of the kernel's clock.
+    pub fn begin(now: u64) -> WaitNotes {
+        WaitNotes {
+            since: now,
+            next: now.saturating_add(WAIT_NOTE_NS),
+        }
+    }
+
+    /// At `now`: the whole seconds the wait has lasted when it is due to say so, the next
+    /// time [`WAIT_NOTE_NS`] later; `None` until then.
+    pub fn due(&mut self, now: u64) -> Option<u64> {
+        if now < self.next {
+            return None;
+        }
+        self.next = now.saturating_add(WAIT_NOTE_NS);
+        Some(now.saturating_sub(self.since) / 1_000_000_000)
+    }
+}
+
+/// The line a stage writes while it waits on its task with no answer come: the stage, the
+/// task (its instance), how long, what the stage holds of the task's, and each of the task's
+/// windows as the plane has it (`given`, `held`, `idle`, `fresh`).
+pub fn wait_note(
+    stage: &str,
+    task: usize,
+    waited_s: u64,
+    (in_flight, queued, held): (usize, usize, u64),
+    windows: Option<&[&str]>,
+) -> String {
+    format!(
+        "image `{stage}` task {task}: waited {waited_s} s for its answer with none come; \
+         {in_flight} batches in flight, {queued} pieces queued, {held} records kept in place; \
+         its windows: {}",
+        windows.map_or_else(|| String::from("not a ring task's"), |w| w.join(", "))
+    )
+}
+
 /// Whether the record a task put is kept where it is and handed on as it lies (no copy),
 /// or copied into the run's arena so its window goes back at once: kept while fewer than
 /// `windows - 1` records of the task's are still held downstream, so the task always has a
@@ -981,6 +1031,33 @@ mod tests {
             Duration::from_secs(5),
         );
         assert_eq!(unread.unwrap_err(), "actual Account read: BadHandle");
+    }
+
+    #[test]
+    fn p_3_1_a_long_wait_on_a_task_says_where_it_stands_every_minute() {
+        const S: u64 = 1_000_000_000;
+        let mut notes = WaitNotes::begin(5 * S);
+        assert_eq!(notes.due(5 * S), None);
+        assert_eq!(notes.due(64 * S), None, "under a minute");
+        assert_eq!(notes.due(65 * S), Some(60), "a minute in");
+        assert_eq!(notes.due(100 * S), None, "said once");
+        assert_eq!(
+            notes.due(125 * S + 3),
+            Some(120),
+            "and again a minute later"
+        );
+        assert_eq!(notes.due(126 * S), None);
+        // A wait looked at late says it once, with how long it has really lasted.
+        let mut late = WaitNotes::begin(0);
+        assert_eq!(late.due(1000 * S), Some(1000));
+        assert_eq!(late.due(1001 * S), None);
+        let line = wait_note("score", 3, 120, (2, 1, 2), Some(&["held", "held", "idle"]));
+        assert_eq!(
+            line,
+            "image `score` task 3: waited 120 s for its answer with none come; 2 batches in \
+             flight, 1 pieces queued, 2 records kept in place; its windows: held, held, idle"
+        );
+        assert!(wait_note("s", 0, 60, (0, 0, 0), None).ends_with("its windows: not a ring task's"));
     }
 
     #[test]
