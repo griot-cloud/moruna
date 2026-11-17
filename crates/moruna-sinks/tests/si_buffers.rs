@@ -242,3 +242,30 @@ fn a_buffer_the_arena_cannot_grow_rolls_its_file_at_what_it_holds() {
         (morsels * rows as u64) as i64
     );
 }
+
+#[test]
+fn the_lane_share_is_capped_whatever_the_budget() {
+    // The arenas E's one-month Score had at budgets of 2, 8 and 20.5 GiB, and the file size the
+    // runtime gives the sink out of its quarter of each (`kinds/parquet.rs`).
+    assert_eq!(moruna_sinks::LANE_MAX_BYTES, 64 * MIB);
+    for (arena, lane) in [
+        (641_925_120u64, 16 * MIB),
+        (2_574_647_296, 64 * MIB),
+        (6_601_179_136, 64 * MIB),
+    ] {
+        let claim = 1u64 << (63 - (arena / 4).leading_zeros());
+        let file_bytes = (1u64 << 30).min(claim / 2);
+        let scratch = Scratch::new("buffers-cap");
+        let reactor = FakeReactor::new();
+        let alloc = FakeAllocator::new().with_limit(Tier::Host, arena);
+        let mut sink = sink(&scratch, file_bytes, &reactor, Arc::new(alloc.clone())).with_lanes(8);
+        sink.open(&table_source_schema()).expect("open");
+        block_on(sink.write(0, arena_payload(&alloc, 1_000, 0))).expect("write");
+        assert_eq!(
+            sink.stats().roll_bytes,
+            lane - MIB,
+            "arena {arena}: a lane of {lane} bytes rolls at it less the footer"
+        );
+        sink.finish().expect("finish");
+    }
+}

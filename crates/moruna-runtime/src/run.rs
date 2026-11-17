@@ -526,15 +526,11 @@ fn drive(
     } else {
         2
     };
-    let morsel_max = match claim {
-        0 => config::MORSEL_MAX_BYTES,
-        claim => (claim / (2 * buffers)).clamp(config::MORSEL_MIN_BYTES, config::MORSEL_MAX_BYTES),
-    };
+    let (morsel_max, lane) = morsel_cap(claim, buffers);
     if morsel_max < config::MORSEL_MAX_BYTES {
         notes.push(format!(
-            "morsels are at most {morsel_max} bytes, half of one of the sink's {buffers} {} byte \
-             file buffers",
-            claim / buffers
+            "morsels are at most {morsel_max} bytes, half of one of the sink's {buffers} {lane} \
+             byte file buffers"
         ));
     }
     let mut plans = Vec::with_capacity(sources.len());
@@ -1391,6 +1387,21 @@ impl Sizing {
     }
 }
 
+// Stream C (2026-11-17): a lane's buffer, and so a morsel, is capped whatever the budget.
+/// The morsel cap for a sink that claimed `claim` bytes of the arena into `buffers` file
+/// buffers, and the size of one of those buffers: a morsel is at most half a buffer, so every
+/// morsel fits an ordinary file, and a buffer is at most [`moruna_sinks::LANE_MAX_BYTES`], so
+/// a larger budget buys room and concurrency, not larger first morsels. No claim, no cap
+/// below `MORSEL_MAX_BYTES`.
+fn morsel_cap(claim: u64, buffers: u64) -> (u64, u64) {
+    if claim == 0 {
+        return (config::MORSEL_MAX_BYTES, 0);
+    }
+    let lane = (claim / buffers.max(1)).min(moruna_sinks::LANE_MAX_BYTES);
+    let morsel = (lane / 2).clamp(config::MORSEL_MIN_BYTES, config::MORSEL_MAX_BYTES);
+    (morsel, lane)
+}
+
 /// `ArenaConfig::host_bytes` (12 f.1, 02 f.1, 11 f.1).
 ///
 /// The *allowance* is `ceiling - baseline - reserve - expected kernel state`: the bytes the run
@@ -1622,6 +1633,36 @@ mod tests {
 
     /// MH 4.7: `staging.durable` declares `durable_staging=present`, over a profile or none,
     /// and refuses a profile that says otherwise.
+    /// Stream C (2026-11-17): at the arenas E's one-month Score had at budgets of 2, 8 and
+    /// 20.5 GiB, a sink on eight lanes gets buffers of 16, 64 and 64 MiB, and morsels of at
+    /// most 8, 32 and 32 MiB: the budget no longer makes the first morsels larger.
+    #[test]
+    fn morsels_and_lane_buffers_are_capped_whatever_the_budget() {
+        let claim = |arena: u64| {
+            let share = (arena as f64 * config::SINK_BUFFER_SHARE) as u64;
+            1u64 << (63 - share.leading_zeros())
+        };
+        let mib = 1u64 << 20;
+        for (arena, lane, morsel) in [
+            (641_925_120u64, 16 * mib, 8 * mib),
+            (2_574_647_296, 64 * mib, 32 * mib),
+            (6_601_179_136, 64 * mib, 32 * mib),
+        ] {
+            assert_eq!(morsel_cap(claim(arena), 8), (morsel, lane), "arena {arena}");
+        }
+        const { assert!(moruna_sinks::LANE_MAX_BYTES / 2 >= config::MORSEL_MIN_BYTES) };
+        assert_eq!(
+            morsel_cap(0, 8),
+            (config::MORSEL_MAX_BYTES, 0),
+            "no claim, no cap"
+        );
+        assert_eq!(
+            morsel_cap(4 * mib, 2).0,
+            config::MORSEL_MIN_BYTES,
+            "never below the floor"
+        );
+    }
+
     #[test]
     fn staging_durable_is_a_declared_profile() {
         use moruna_kernel::{Guarantee, HostProfile};

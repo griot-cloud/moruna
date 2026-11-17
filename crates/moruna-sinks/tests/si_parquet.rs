@@ -363,9 +363,12 @@ fn si_t16_the_file_buffer_is_one_size_class() {
 
     let roll = sink.stats().roll_bytes;
     let requested = roll + (1 << 20);
+    // Stream C (2026-11-17): a lane's buffer is at most `LANE_MAX_BYTES`, so the class is the
+    // row group's or that cap's, whichever is smaller; the footer is inside it either way.
+    let class = row_group.min(moruna_sinks::LANE_MAX_BYTES);
     assert_eq!(
-        requested, row_group,
-        "f.1: the request is the {row_group} byte class with the footer inside it, not {requested}"
+        requested, class,
+        "f.1: the request is the {class} byte class with the footer inside it, not {requested}"
     );
     assert!(
         requested.is_power_of_two(),
