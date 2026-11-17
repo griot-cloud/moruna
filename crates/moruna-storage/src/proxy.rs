@@ -172,9 +172,8 @@ async fn exchange(
 }
 
 /// One HTTP/1.1 exchange of `req` over `stream`, which is this request's alone; `label`
-/// names the peer in every error. The response's body drives the connection to its end
-/// (shared by the socket connector and the network server's, `crate::net`).
-pub(crate) async fn exchange_on<S>(
+/// names the peer in every error. The response's body drives the connection to its end.
+async fn exchange_on<S>(
     stream: S,
     label: Arc<str>,
     req: HttpRequest,
@@ -267,8 +266,9 @@ impl Drop for DrivenBody {
 }
 
 /// The request line in origin form (`/bucket/key?query`) with the authority moved to `Host`,
-/// which is what an HTTP/1.1 server expects from a client that is not talking to a proxy.
-fn origin_form(req: HttpRequest) -> HttpRequest {
+/// which is what an HTTP/1.1 server expects from a client that is not talking to a proxy
+/// (the network server's connector, `crate::net`, sends the same).
+pub(crate) fn origin_form(req: HttpRequest) -> HttpRequest {
     let (mut parts, body) = req.into_parts();
     if !parts.headers.contains_key(http::header::HOST)
         && let Some(authority) = parts.uri.authority()
