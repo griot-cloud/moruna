@@ -353,12 +353,17 @@ Implements the OS design, section 2.
 - **If `api` dies, the node keeps running** (the OS design's step 2) and the supervisor starts it
   again, at most 5 times in 10 minutes; a sixth death is fatal (1B). A restarted `api` needs fresh
   channels, so:
-  - **its listener:** the supervisor holds a network-server client whose grant has only the `grant`
-    right, limited to listening on 443. At each start it mints `api`'s listener channel from it
-    (`Client::grant`).
-  - **its hand-over:** the supervisor makes a fresh `platform`-`api` channel pair at each start and
-    sends `platform` its end over a supervisor-to-`platform` control channel. `platform` keeps the
-    validated config and sends the hand-over again.
+  - **its listener:** the supervisor holds a network-server client whose grant is
+    `rights=grant,listen local=0.0.0.0/0@443`. A grant can hand out only what it holds, so it holds
+    `listen`, but the supervisor never listens itself. At each start it mints `api`'s listener from
+    it (`Client::grant`). `node.conf`'s one record says it all:
+    `restart api network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=64`, giving
+    the service, its listener slot, the supervisor's granting slot and the policy. `network.conf`
+    has no `listen-api` grant.
+  - **its hand-over, the same at every start, the first included:** the supervisor makes a fresh
+    `platform`-`api` channel pair and sends `platform` its end, as `api-started`, over `platform`'s
+    bootstrap channel, which the supervisor keeps. `platform` keeps the validated config and sends
+    the hand-over on each new end. Every start has 1D's 10 s to answer `ready`.
   - **its identity:** a restarted `api` makes a new key and certificate when node config has no
     `tls`, and prints the new fingerprint line. The audit ring starts empty.
 - **Two crates.** The logic (HTTP, TLS, routing, tokens, audit, MCP) is the library
