@@ -357,8 +357,9 @@ Implements the OS design, section 2.
     `rights=grant,listen local=0.0.0.0/0@443`. A grant can hand out only what it holds, so it holds
     `listen`, but the supervisor never listens itself. At each start it mints `api`'s listener from
     it (`Client::grant`). `node.conf`'s one record says it all:
-    `restart api network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=64`, giving
-    the service, its listener slot, the supervisor's granting slot and the policy. `network.conf`
+    `restart api network network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=64`,
+    giving the service, its listener slot, the network server's service, its granting slot, and
+    the policy. `network.conf`
     has no `listen-api` grant.
   - **its hand-over, the same at every start, the first included:** the supervisor makes a fresh
     `platform`-`api` channel pair and sends `platform` its end, as `api-started`, over `platform`'s
