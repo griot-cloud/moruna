@@ -50,9 +50,13 @@ pub(crate) fn is_object(text: &str) -> bool {
 }
 
 /// Whether `name` is a secret's name: 1 to 64 of ASCII letters, digits, `_`, `-`, `.` and `:`,
-/// as a port's name is.
+/// the first a letter or a digit, as a port's name is (`moruna_job::is_port_name`).
 pub(crate) fn is_secret_name(name: &str) -> bool {
-    (1..=64).contains(&name.len())
+    name.len() <= 64
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric())
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
@@ -77,7 +81,9 @@ impl Secrets {
         let mut forms = Vec::with_capacity(named.len());
         for (name, secret) in named {
             if !is_secret_name(name) {
-                return Err("a secret's name is 1 to 64 of letters, digits, _ - . and :");
+                return Err(
+                    "a secret's name is 1 to 64 of letters, digits, _ - . and :, the first a letter or a digit",
+                );
             }
             if secret.is_empty() {
                 return Err("a secret is not empty");

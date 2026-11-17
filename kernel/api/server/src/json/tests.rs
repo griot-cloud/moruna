@@ -70,7 +70,7 @@ fn an_empty_secret_a_bad_name_and_too_many_are_refused() {
         Secrets::new(map.iter()).map(|_| ())
     };
     assert!(one("key", "").is_err());
-    for name in ["", "a b", "k/1", &"x".repeat(65)] {
+    for name in ["", "a b", "k/1", "-key", ".key", &"x".repeat(65)] {
         assert!(one(name, "v").is_err(), "{name}");
     }
     for name in ["s3.secret_access_key", "A-1:b", &"x".repeat(64)] {

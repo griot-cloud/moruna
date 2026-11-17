@@ -806,6 +806,7 @@ fn every_sink_kind_builds() {
     let mut store = ObjectStoreDoc {
         gcs: Some(GcsDoc {
             bucket: Some("g".into()),
+            ..GcsDoc::default()
         }),
         azure: Some(AzureDoc {
             account: Some("acct".into()),

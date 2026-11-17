@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::doc::{
     AzureDoc, BudgetDoc, CheckpointDoc, ElasticDoc, ErrorPolicyDoc, GcsDoc, GuaranteeDoc,
-    HostProfileDoc, ObjectStoreDoc, S3Doc, SizerDoc, StagingDoc,
+    HostProfileDoc, ObjectStoreDoc, S3Doc, SecretRef, SizerDoc, StagingDoc,
 };
 use crate::flex;
 use crate::generated::moruna::job::fb;
@@ -118,6 +118,7 @@ impl Job {
             object_store: root
                 .object_store()
                 .map(read_object_store)
+                .transpose()?
                 .unwrap_or_default(),
             checkpoint: root
                 .checkpoint()
@@ -484,23 +485,53 @@ fn write_staging<'b>(
     )
 }
 
-fn read_object_store(o: fb::ObjectStore<'_>) -> ObjectStoreDoc {
-    ObjectStoreDoc {
+/// A reference to a secret, as the document holds it.
+fn read_secret(reference: Option<fb::SecretRef<'_>>) -> Option<SecretRef> {
+    reference.map(|r| SecretRef::new(r.secret()))
+}
+
+fn read_object_store(o: fb::ObjectStore<'_>) -> Result<ObjectStoreDoc, JobError> {
+    let doc = ObjectStoreDoc {
         s3: o.s3().map(|s| S3Doc {
             endpoint: s.endpoint().map(str::to_string),
             region: s.region().map(str::to_string),
             bucket: s.bucket().map(str::to_string),
+            access_key_id: read_secret(s.access_key_id_ref()),
+            secret_access_key: read_secret(s.secret_access_key_ref()),
+            session_token: read_secret(s.session_token_ref()),
         }),
         gcs: o.gcs().map(|g| GcsDoc {
             bucket: g.bucket().map(str::to_string),
+            service_account_json: read_secret(g.service_account_json_ref()),
         }),
         azure: o.azure().map(|a| AzureDoc {
             account: a.account().map(str::to_string),
             container: a.container().map(str::to_string),
+            access_key: read_secret(a.access_key_ref()),
         }),
         local_root: o.local_root().map(str::to_string),
         allow_http: o.allow_http(),
+    };
+    for (field, reference) in doc.secret_refs() {
+        if !crate::is_secret_name(&reference.secret) {
+            return Err(JobError::field(
+                field,
+                format!("`{}` is not a secret's name", reference.secret),
+            ));
+        }
     }
+    Ok(doc)
+}
+
+/// A reference to a secret, written.
+fn write_secret<'b>(
+    b: &mut flatbuffers::FlatBufferBuilder<'b>,
+    reference: &Option<SecretRef>,
+) -> Option<flatbuffers::WIPOffset<fb::SecretRef<'b>>> {
+    reference.as_ref().map(|r| {
+        let secret = Some(b.create_string(&r.secret));
+        fb::SecretRef::create(b, &fb::SecretRefArgs { secret })
+    })
 }
 
 fn write_object_store<'b>(
@@ -511,23 +542,44 @@ fn write_object_store<'b>(
         let endpoint = opt_str(b, &s.endpoint);
         let region = opt_str(b, &s.region);
         let bucket = opt_str(b, &s.bucket);
+        let access_key_id_ref = write_secret(b, &s.access_key_id);
+        let secret_access_key_ref = write_secret(b, &s.secret_access_key);
+        let session_token_ref = write_secret(b, &s.session_token);
         fb::S3::create(
             b,
             &fb::S3Args {
                 endpoint,
                 region,
                 bucket,
+                access_key_id_ref,
+                secret_access_key_ref,
+                session_token_ref,
             },
         )
     });
     let gcs = d.gcs.as_ref().map(|g| {
         let bucket = opt_str(b, &g.bucket);
-        fb::Gcs::create(b, &fb::GcsArgs { bucket })
+        let service_account_json_ref = write_secret(b, &g.service_account_json);
+        fb::Gcs::create(
+            b,
+            &fb::GcsArgs {
+                bucket,
+                service_account_json_ref,
+            },
+        )
     });
     let azure = d.azure.as_ref().map(|a| {
         let account = opt_str(b, &a.account);
         let container = opt_str(b, &a.container);
-        fb::Azure::create(b, &fb::AzureArgs { account, container })
+        let access_key_ref = write_secret(b, &a.access_key);
+        fb::Azure::create(
+            b,
+            &fb::AzureArgs {
+                account,
+                container,
+                access_key_ref,
+            },
+        )
     });
     let local_root = opt_str(b, &d.local_root);
     fb::ObjectStore::create(
