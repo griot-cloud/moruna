@@ -34,6 +34,11 @@ mod error;
 mod lane;
 mod record;
 mod serve;
+/// The task a call at a time, which the C library (`kernel/function/c`, system design 5B) is
+/// the Arrow C Data Interface over. Not part of this crate's interface (5A): a function in Rust
+/// calls [`serve`].
+#[doc(hidden)]
+pub mod task;
 
 #[cfg(not(any(target_os = "moruna", moruna_function_sys)))]
 pub mod host;
