@@ -20,6 +20,10 @@ pub mod vm;
 #[cfg(feature = "cvm_guest")]
 pub(crate) mod tdx_guest;
 
+// moruna: the deadline of the boot waits (Moruna's system design, section 1B), for the
+// wait outside this module that has one (`boot/smp.rs`).
+pub(crate) use kernel::tsc::boot_wait;
+
 #[cfg(feature = "cvm_guest")]
 use crate::mm::frame::unaccepted;
 

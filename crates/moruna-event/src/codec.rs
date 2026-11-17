@@ -10,7 +10,12 @@
 //! ids, headers), then the FlatBuffers verifier, then every value an event holds. It never
 //! panics.
 
-use std::fmt::Write as _;
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::fmt::Write as _;
 
 use flatbuffers::{FlatBufferBuilder, ForwardsUOffset, Vector, WIPOffset};
 use moruna_record::{Decoded, decode as decode_record, encode_into, encoded_len};

@@ -262,6 +262,234 @@ impl Lifecycle {
     pub fn state(&self, index: usize) -> Option<State> {
         self.states.get(index).copied()
     }
+    /// How many services the node has.
+    pub fn count(&self) -> usize {
+        self.states.len()
+    }
+}
+
+/// The services limit (`architecture/moruna-os-system.md`, section 1B): every service has
+/// started within this long of the supervisor's own start.
+pub const START_LIMIT_NS: u64 = 5_000_000_000;
+
+/// Why the node's services did not all start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartError<E> {
+    /// Service `index` could not be started. No service after it was tried.
+    Refused { index: usize, error: E },
+    /// Service `index` had not started when the limit passed. It may be running, and its
+    /// lifecycle says so, so that stopping the node ends it; no service after it was tried.
+    Late { index: usize },
+}
+
+/// Starts the node's services in order, within the services limit.
+///
+/// `began_ns` is the clock at the supervisor's own start and `now_ns` reads that clock;
+/// `start` starts service `index`. A service has started in time when the clock, read once
+/// its start has returned, is at most [`START_LIMIT_NS`] past `began_ns`. The first that
+/// has not ends the starting with [`StartError::Late`], as the first that `start` refuses
+/// ends it with [`StartError::Refused`]. Starting a process does not assert its readiness.
+pub fn start_services<E>(
+    lifecycle: &mut Lifecycle,
+    began_ns: u64,
+    mut now_ns: impl FnMut() -> u64,
+    mut start: impl FnMut(usize) -> Result<(), E>,
+) -> Result<(), StartError<E>> {
+    for index in 0..lifecycle.count() {
+        start(index).map_err(|error| StartError::Refused { index, error })?;
+        lifecycle.started(index);
+        if now_ns().saturating_sub(began_ns) > START_LIMIT_NS {
+            return Err(StartError::Late { index });
+        }
+    }
+    Ok(())
+}
+
+/// The supervisor's failure lines on the node's console
+/// (`architecture/moruna-os-system.md`, section 1B). Each is one line.
+pub mod line {
+    use core::fmt::{self, Display};
+
+    use moruna_abi::boot_line::{Fatal, SERVICES};
+
+    /// `moruna: fatal services: <reason>`: the supervisor cannot go on.
+    pub fn fatal<R: Display>(reason: R) -> Fatal<&'static str, R> {
+        Fatal {
+            stage: SERVICES,
+            reason,
+        }
+    }
+
+    /// `moruna: fatal services: <name> did not start within 5 s`: the services limit
+    /// ([`START_LIMIT_NS`](super::START_LIMIT_NS)) passed before the service had started.
+    pub struct Late<'a>(pub &'a str);
+
+    impl Display for Late<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fatal(format_args!("{} did not start within 5 s", self.0)).fmt(f)
+        }
+    }
+
+    /// `moruna: fatal service <name>: ended`: a service ended, which stops the node.
+    pub struct Ended<'a>(pub &'a str);
+
+    impl Display for Ended<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            Fatal {
+                stage: format_args!("service {}", self.0),
+                reason: "ended",
+            }
+            .fmt(f)
+        }
+    }
+}
+
+#[cfg(test)]
+mod start_tests {
+    use alloc::{format, vec::Vec};
+
+    use super::*;
+
+    const SECOND: u64 = 1_000_000_000;
+
+    /// Starts `count` services whose starts return at `clock`'s readings, in order, and
+    /// answers the result, the services whose start was tried, and the lifecycle.
+    fn run(
+        count: usize,
+        began: u64,
+        clock: &[u64],
+        refuse: Option<usize>,
+    ) -> (Result<(), StartError<&'static str>>, Vec<usize>, Lifecycle) {
+        let mut lifecycle = Lifecycle::new(count);
+        let mut tried = Vec::new();
+        let mut readings = clock.iter().copied();
+        let result = start_services(
+            &mut lifecycle,
+            began,
+            || readings.next().expect("one reading for each start"),
+            |index| {
+                tried.push(index);
+                if refuse == Some(index) {
+                    Err("no such program")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        (result, tried, lifecycle)
+    }
+
+    #[test]
+    fn the_limit_is_the_five_seconds_its_line_says() {
+        assert_eq!(START_LIMIT_NS, 5 * SECOND);
+        assert!(format!("{}", line::Late("x")).ends_with("within 5 s"));
+    }
+
+    #[test]
+    fn services_that_start_within_the_limit_are_all_started() {
+        let began = 7 * SECOND;
+        let (result, tried, lifecycle) = run(
+            3,
+            began,
+            &[began + 1, began + SECOND, began + 4 * SECOND],
+            None,
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(tried, [0, 1, 2]);
+        for index in 0..3 {
+            assert_eq!(lifecycle.state(index), Some(State::Running));
+        }
+    }
+
+    #[test]
+    fn a_start_at_exactly_the_limit_is_in_time_and_one_past_it_is_late() {
+        let began = 100;
+        let (result, _, _) = run(1, began, &[began + START_LIMIT_NS], None);
+        assert_eq!(result, Ok(()));
+        let (result, _, lifecycle) = run(1, began, &[began + START_LIMIT_NS + 1], None);
+        assert_eq!(result, Err(StartError::Late { index: 0 }));
+        // It did start, late: stopping the node must end it.
+        assert_eq!(lifecycle.state(0), Some(State::Running));
+    }
+
+    #[test]
+    fn the_first_late_service_is_named_and_none_after_it_is_started() {
+        let began = 3 * SECOND;
+        let (result, tried, lifecycle) = run(
+            4,
+            began,
+            &[began + SECOND, began + 6 * SECOND, began + 7 * SECOND],
+            None,
+        );
+        assert_eq!(result, Err(StartError::Late { index: 1 }));
+        assert_eq!(tried, [0, 1]);
+        assert_eq!(lifecycle.state(0), Some(State::Running));
+        assert_eq!(lifecycle.state(1), Some(State::Running));
+        assert_eq!(lifecycle.state(2), Some(State::Pending));
+        assert_eq!(lifecycle.state(3), Some(State::Pending));
+    }
+
+    #[test]
+    fn a_supervisor_slow_before_its_first_start_names_the_first_service() {
+        // Its own start counts: the limit is from the supervisor's start, not the first
+        // service's.
+        let (result, tried, _) = run(2, 0, &[9 * SECOND], None);
+        assert_eq!(result, Err(StartError::Late { index: 0 }));
+        assert_eq!(tried, [0]);
+    }
+
+    #[test]
+    fn a_refused_start_ends_the_starting_and_is_not_marked_started() {
+        let (result, tried, lifecycle) = run(3, 0, &[1], Some(1));
+        assert_eq!(
+            result,
+            Err(StartError::Refused {
+                index: 1,
+                error: "no such program"
+            })
+        );
+        assert_eq!(tried, [0, 1]);
+        assert_eq!(lifecycle.state(0), Some(State::Running));
+        assert_eq!(lifecycle.state(1), Some(State::Pending));
+        assert_eq!(lifecycle.state(2), Some(State::Pending));
+    }
+
+    #[test]
+    fn a_clock_read_before_the_supervisors_start_is_in_time() {
+        let (result, _, _) = run(1, 10 * SECOND, &[SECOND], None);
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn a_node_with_no_services_has_started_them_all() {
+        let (result, tried, lifecycle) = run(0, 0, &[], None);
+        assert_eq!(result, Ok(()));
+        assert!(tried.is_empty());
+        assert_eq!(lifecycle.count(), 0);
+    }
+
+    #[test]
+    fn the_supervisors_failure_lines_are_exactly_the_system_designs() {
+        assert_eq!(
+            format!("{}", line::Ended("devices")),
+            "moruna: fatal service devices: ended"
+        );
+        assert_eq!(
+            format!("{}", line::Late("netstack")),
+            "moruna: fatal services: netstack did not start within 5 s"
+        );
+        assert_eq!(
+            format!("{}", line::fatal("missing boot capability image.api")),
+            "moruna: fatal services: missing boot capability image.api"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                line::fatal(format_args!("config: {:?}", ConfigError::Version))
+            ),
+            "moruna: fatal services: config: Version"
+        );
+    }
 }
 
 #[cfg(test)]
