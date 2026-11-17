@@ -1,0 +1,19 @@
+# The cloud profile, step 1 (system design 1A): the one disk image for every cloud.
+# Only the node supervisor starts in the initial manifest; it starts `devices` as node.conf
+# says (item 1.3 adds `netstack`, its network.conf and `api`). package.py --profile cloud
+# --assets kernel/node/cloud validates node.conf with its actual parser. Driver table data and
+# driver images are emitted by moruna-image.
+moruna-image 1
+process node-supervisor
+  handle console console
+  handle root.process root.process
+  handle root.device root.device
+  handle root.ecam root.ecam
+  handle root.msi root.msi
+  handle root.dma root.dma
+  handle program:devices image.devices
+  handle data:node.conf config
+  driver 1af4:1042 virtio-blk block
+  driver 1af4:1041 virtio-net net
+  driver 1b36:0010 nvme nvme
+  driver 1ae0:0042 gve net

@@ -121,3 +121,89 @@ Placing the vCPUs alone takes out the spread (other host work landing on the vCP
 the isolated cores take out the host's tick: about 25 times less time lost. What is left (about
 0.23 interruptions a millisecond) is the guest's own stretched tick and the Azure hypervisor
 under this VM.
+
+## Building and booting the cloud image on the Mac (items 1.1 to 1.5)
+
+The cloud profile (system design 1A) is built by `kernel/node/tools/package.py --profile cloud`
+and booted from UEFI by `kernel/node/tools/uefi-boot.sh`. Both need Linux tools, so on the
+project's arm64 Mac they run in `moruna-arm`, the project's Linux container, where the x86_64
+machine runs under QEMU's emulator (TCG). Under KVM, on a Linux x86_64 host with the same
+packages, the commands are the same.
+
+### The VM lock
+
+Building an image and every boot need `~/.vm-lock` (protocol: `tools/proof-lab/run.py`;
+`architecture/work/_rules.md`). Never take it while `~/.vm-lock-next` names someone else, never
+steal it, and release it, and stop `moruna-arm`, whenever you aren't building or booting:
+
+```
+mkdir -m 700 ~/.vm-lock && echo "<who> <item> $(date -u +%FT%TZ)" > ~/.vm-lock/owner
+container start moruna-arm
+# ... build, boot ...
+container stop moruna-arm && rm ~/.vm-lock/owner && rmdir ~/.vm-lock
+```
+
+Host tests of single crates (`cargo test -p ...`) need no lock: run them on the Mac with `-j 4`.
+
+### `moruna-arm`
+
+Apple `container` (`/opt/homebrew/bin/container`), image `ubuntu:24.04`, arm64, 4 CPUs, 6 GiB:
+keep it at or under 6 GiB. It mounts `/Users/brackly/Desktop/Projects/moruna` at `/src`, so a
+worktree is `/src/.claude/worktrees/<name>`. Run commands with
+`container exec moruna-arm bash -lc 'cd /src/.claude/worktrees/<name> && ...'`. `git` does not
+work inside it (a worktree's `.git` names a Mac path): commit on the Mac.
+
+What it holds (set up for items 0.1 and 1.1, 2026-11-17):
+
+| What | Where | For |
+| --- | --- | --- |
+| QEMU 10.2.1 (CI's pin), vhost-user | `/opt/qemu/bin`, **not on `PATH`**: `export PATH=/opt/qemu/bin:$PATH` | every boot |
+| QEMU's UEFI firmware (edk2) | `/opt/qemu/share/qemu/edk2-x86_64-code.fd`, vars template `edk2-i386-vars.fd` | `uefi-boot.sh` finds them beside `qemu-system-x86_64` |
+| GRUB for x86_64 EFI | package `grub-efi-amd64-bin:amd64`, modules in `/usr/lib/grub/x86_64-efi`; `grub-mkstandalone` from `grub-common` | `package.py` |
+| `sgdisk`, mtools | packages `gdisk`, `mtools` | `package.py` |
+| x86_64 Linux C compilers | packages `gcc-x86-64-linux-gnu`, `libc6-dev-amd64-cross`, `musl-dev:amd64` | `kernel/tools/build.sh` (CI's boot image) |
+| Rust | rustup: `1.98.1` with target `x86_64-unknown-linux-musl`; `nightly-2026-07-21` with `rust-src` and `x86_64-unknown-none` (`rustup toolchain install` in `kernel/`) | both builds |
+
+The amd64 packages come through multiarch: `dpkg --add-architecture amd64`,
+`/etc/apt/sources.list.d/ubuntu.sources` restricted to `Architectures: arm64`, and
+`/etc/apt/sources.list.d/amd64.sources` naming `http://archive.ubuntu.com/ubuntu/` (noble,
+noble-updates, noble-security; main universe; `Architectures: amd64`). To set up a fresh
+container the same way:
+
+```
+apt-get update
+apt-get install -y --no-install-recommends gcc-x86-64-linux-gnu libc6-dev-amd64-cross \
+  musl-dev:amd64 grub-efi-amd64-bin:amd64 gdisk mtools
+```
+
+CI's boot image (`kernel/tools/build.sh`) also needs python:3.14-slim's OCI layout:
+`kernel/tools/python-layout.sh` on the Mac (Apple `container` pulls it) writes
+`kernel/target/oci/python`.
+
+### Build the cloud image
+
+Inside `moruna-arm`, from the worktree root, with the lock held (about 2 minutes once Cargo's
+caches are warm):
+
+```
+export PATH=/opt/qemu/bin:$HOME/.cargo/bin:$PATH CARGO_INCREMENTAL=0
+python3 kernel/node/tools/package.py --profile cloud --description kernel/node/cloud.image \
+  --assets kernel/node/cloud --out OUT --node-memory 2147483648
+```
+
+`OUT` must not exist yet. It gets `moruna-node.raw` (the GPT disk: GRUB as
+`EFI/BOOT/BOOTX64.EFI`, `boot/moruna-kernel.elf`, `boot/initramfs.cpio`), the payload it was
+made from, and `inputs-and-artifacts.json` with every input's and output's digest.
+
+### Boot it
+
+```
+kernel/node/tools/uefi-boot.sh OUT CPUS
+```
+
+It runs item 1.1's machine (q35, 2 GiB, edk2, the disk read-only on virtio-blk, one virtio-net
+card on QEMU's user network, COM1 to `OUT/console.log`) and exits 0 when
+`moruna: services started` is on the console: within 120 s under KVM, 900 s under the emulator.
+It prints the seconds from QEMU's start to the line. Exit 124 is the timeout, 1 is QEMU ending
+first. The console log holds the firmware's screen output (terminal escapes) before GRUB, then
+the kernel's lines.
