@@ -120,7 +120,7 @@ fn run() -> i64 {
     } else {
         failed += 1;
     }
-    let mut v = match vsock::Client::connect(channel, deadline_in(60 * SECONDS)) {
+    let mut v = match vsock::Client::connect(channel, deadline_in(moruna_svc::READY_TIMEOUT)) {
         Ok(v) => v,
         Err(e) => {
             println!(out, "KB3 vsock: FAIL: hello to vsock0: {:?}", e);
