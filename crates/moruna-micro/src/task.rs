@@ -305,6 +305,30 @@ pub struct ImageTask {
     ahead: layout::Ahead<OpenedPlane>,
 }
 
+/// Where a ring stage's workers' time inside the stage goes, in nanoseconds: cutting batches
+/// into pieces, laying the pieces out in the tasks' regions, waiting for room there or on the
+/// rings, waiting for the tasks' answers, taking them (decoding in place, landing, joining),
+/// and polling for answers already come. The rest of a worker's time is the scheduler's
+/// (decode, encode, idle: the run's report says it worker by worker). Always on: two reads of
+/// the kernel's clock a step.
+#[derive(Debug, Default)]
+struct Feeder {
+    cut: std::sync::atomic::AtomicU64,
+    layout: std::sync::atomic::AtomicU64,
+    room: std::sync::atomic::AtomicU64,
+    wait: std::sync::atomic::AtomicU64,
+    take: std::sync::atomic::AtomicU64,
+    poll: std::sync::atomic::AtomicU64,
+}
+
+/// The places of [`TaskState::timed`], as [`Feeder`]'s fields.
+const CUT: usize = 0;
+const LAYOUT: usize = 1;
+const ROOM: usize = 2;
+const WAIT: usize = 3;
+const TAKE: usize = 4;
+const POLL: usize = 5;
+
 /// What a ring stage's tasks share.
 #[derive(Debug, Default)]
 struct Busy {
@@ -314,6 +338,8 @@ struct Busy {
     /// The schema of the stage's answers, from the first any task gave: the stage waits for
     /// one answer, not one a task, before it stands batches of no rows in for answers.
     schema: Mutex<Option<moruna_kernel::arrow::datatypes::SchemaRef>>,
+    /// Where the stage's workers' time inside the stage went, summed over its tasks.
+    feeder: Feeder,
     /// What each task did, by instance, summed over the tasks an instance had.
     figures: Mutex<Vec<Option<layout::TaskFigures>>>,
 }
@@ -524,10 +550,23 @@ impl ImageTask {
     /// and account, and the most that held a batch at once. `None` for a stage on descriptors.
     pub fn note(&self) -> Option<String> {
         self.rings.then(|| {
-            layout::stage_note(
-                &self.name,
-                &lock(&self.busy.figures),
-                self.busy.peak.load(std::sync::atomic::Ordering::Relaxed),
+            let f = &self.busy.feeder;
+            let s = |t: &std::sync::atomic::AtomicU64| {
+                t.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
+            };
+            format!(
+                "{}; its workers in the stage: cutting {:.2} s, laying out {:.2} s, waiting for room {:.2} s, waiting for answers {:.2} s, taking answers {:.2} s, polling {:.2} s",
+                layout::stage_note(
+                    &self.name,
+                    &lock(&self.busy.figures),
+                    self.busy.peak.load(std::sync::atomic::Ordering::Relaxed),
+                ),
+                s(&f.cut),
+                s(&f.layout),
+                s(&f.room),
+                s(&f.wait),
+                s(&f.take),
+                s(&f.poll)
             )
         })
     }
@@ -831,6 +870,7 @@ impl ImageTask {
             instance: ctx.instance,
             cpu: self.cpu_of(ctx.instance),
             recorded: false,
+            timed: [0; 6],
         }
     }
 }
@@ -895,6 +935,8 @@ pub struct TaskState {
     cpu: Option<u32>,
     /// Its figures are in the stage's ([`TaskState::record`]).
     recorded: bool,
+    /// This task's share of the stage's [`Feeder`] times, in nanoseconds, added at its end.
+    timed: [u64; 6],
 }
 
 impl Drop for TaskState {
@@ -982,6 +1024,20 @@ impl TaskState {
             f.deferred += self.deferred;
             f.cpu = self.cpu;
             f.peak = f.peak.max(peak);
+            let feeder = &self.busy.feeder;
+            for (at, ns) in [
+                &feeder.cut,
+                &feeder.layout,
+                &feeder.room,
+                &feeder.wait,
+                &feeder.take,
+                &feeder.poll,
+            ]
+            .into_iter()
+            .zip(self.timed)
+            {
+                at.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+            }
             f.limit = limit;
         }
     }
@@ -1154,6 +1210,19 @@ impl TaskState {
         ports: Option<&Arc<StagePorts>>,
         names: &[String],
     ) -> Result<(u64, BatchId)> {
+        let (started, room) = (moruna_svc::now(), self.timed[ROOM]);
+        let offered = self.offer_timed(batch, ports, names);
+        let spent = moruna_svc::now().saturating_sub(started);
+        self.timed[LAYOUT] += spent.saturating_sub(self.timed[ROOM] - room);
+        offered
+    }
+
+    fn offer_timed(
+        &mut self,
+        batch: &moruna_kernel::arrow::record_batch::RecordBatch,
+        ports: Option<&Arc<StagePorts>>,
+        names: &[String],
+    ) -> Result<(u64, BatchId)> {
         let (framing, placed) =
             moruna_kernel::ipc::encode_framing(batch, PAGE as usize, 0, self.alloc.as_ref())?;
         let pieces: Vec<(u64, u64)> = placed
@@ -1228,6 +1297,13 @@ impl TaskState {
 
     /// One step of the plane while the engine waits for room: whether anything came.
     fn step(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<bool> {
+        let started = moruna_svc::now();
+        let stepped = self.step_timed(ports, names);
+        self.timed[ROOM] += moruna_svc::now().saturating_sub(started);
+        stepped
+    }
+
+    fn step_timed(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<bool> {
         let deadline = moruna_svc::now().saturating_add(LOOK_NS);
         let event = self
             .plane
@@ -1446,6 +1522,19 @@ impl TaskState {
         ports: Option<&Arc<StagePorts>>,
         names: &[String],
     ) -> Result<Payload> {
+        let (started, waited) = (moruna_svc::now(), self.timed[WAIT]);
+        let answer = self.answers_timed(offered, ports, names);
+        let spent = moruna_svc::now().saturating_sub(started);
+        self.timed[TAKE] += spent.saturating_sub(self.timed[WAIT] - waited);
+        answer
+    }
+
+    fn answers_timed(
+        &mut self,
+        offered: BatchId,
+        ports: Option<&Arc<StagePorts>>,
+        names: &[String],
+    ) -> Result<Payload> {
         let mut parts = Vec::new();
         loop {
             match self.wait_any(ports, names)? {
@@ -1502,7 +1591,9 @@ impl TaskState {
             self.schema = lock(&self.busy.schema).clone();
         }
         let mut taken = Vec::new();
+        let started = moruna_svc::now();
         let pieces = self.pieces(batch, piece)?;
+        self.timed[CUT] += moruna_svc::now().saturating_sub(started);
         self.queued.extend(pieces);
         self.feed(ports, names)?;
         if self.schema.is_none() && taken.is_empty() {
@@ -1628,6 +1719,13 @@ impl TaskState {
     /// Takes what the task has done by now, without waiting: its records and releases go to
     /// [`Self::early`], in order, and its port calls are served.
     fn gather(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<()> {
+        let started = moruna_svc::now();
+        let gathered = self.gather_timed(ports, names);
+        self.timed[POLL] += moruna_svc::now().saturating_sub(started);
+        gathered
+    }
+
+    fn gather_timed(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<()> {
         loop {
             // A poll: it looks, and never spins or sleeps.
             let event = self
@@ -1695,6 +1793,17 @@ impl TaskState {
     /// Steps the plane until the task puts a record, releases a batch or ends, serving its
     /// port calls, looking at the run's cancel and at how the task ended meanwhile.
     fn wait_any(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<Seen> {
+        let started = moruna_svc::now();
+        let seen = self.wait_any_timed(ports, names);
+        self.timed[WAIT] += moruna_svc::now().saturating_sub(started);
+        seen
+    }
+
+    fn wait_any_timed(
+        &mut self,
+        ports: Option<&Arc<StagePorts>>,
+        names: &[String],
+    ) -> Result<Seen> {
         if let Some(seen) = self.early.pop_front() {
             return Ok(seen);
         }

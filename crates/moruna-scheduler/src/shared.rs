@@ -368,6 +368,8 @@ pub(crate) struct Shared {
     pub(crate) checkpoint_quiet: AtomicBool,
     /// The decodes and encodes the drives hand to the workers (RB1, `offload`).
     pub(crate) offload: crate::offload::Offload,
+    // stream P: where each worker's time goes, for the run's report.
+    pub(crate) times: Arc<crate::times::Times>,
 
     pub(crate) last_manifest: Mutex<Option<std::path::PathBuf>>,
 
@@ -707,6 +709,7 @@ impl Shared {
             checkpoint_pause: AtomicBool::new(false),
             checkpoint_quiet: AtomicBool::new(false),
             offload: crate::offload::Offload::default(),
+            times: Arc::new(crate::times::Times::new(workers)),
             last_manifest: Mutex::new(None),
             jobs,
             job_inbox: Mutex::new(inbox),

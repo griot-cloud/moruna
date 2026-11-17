@@ -384,6 +384,13 @@ fn ho_t7_peer_gone_the_run_continues() {
             .is_some_and(|n| n.starts_with("the peer stopped receiving"))),
         "{notes:?}"
     );
+    // stream P: where each worker's time went, worker by worker.
+    assert!(
+        notes.iter().any(|n| n.as_str().is_some_and(|n| {
+            n.starts_with("engine worker ") && n.contains(" s, functions ") && n.contains(", idle ")
+        })),
+        "{notes:?}"
+    );
     let _ = std::fs::remove_file(&socket);
 }
 

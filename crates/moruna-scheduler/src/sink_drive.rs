@@ -203,11 +203,17 @@ fn write_loop(
                                 offload,
                                 move || inline.offload_inline(),
                                 move || {
+                                    let started = std::time::Instant::now();
                                     let end = owner.sinks.get(index).ok_or_else(|| {
                                         MorunaError::Sink(format!("no sink {index}"))
                                     })?;
                                     let guard = end.sink.read().unwrap_or_else(|e| e.into_inner());
-                                    guard.encode(seq, payload)
+                                    let encoded = guard.encode(seq, payload);
+                                    owner.times.here().encode.fetch_add(
+                                        crate::times::since(started),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    encoded
                                 },
                             )
                             .await?;
