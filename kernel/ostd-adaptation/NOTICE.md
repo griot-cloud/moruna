@@ -27,6 +27,13 @@ kernel mode and so counted against §0:
   quiescent state (`UserMode::execute`), as it does in Linux, and
   `sync::report_quiescent_state` lets the core's idle task pass one each time it wakes.
 
+One more, marked `moruna:` (item 1.4, the system design's section 1B):
+
+- **The counter at the core's first instruction.** Each boot protocol's entry
+  (`__multiboot2_entry`, `__multiboot_entry`, `__pvh_entry`, `__linux_boot`) records the
+  time-stamp counter first thing, and `boot::entry_tsc` gives it. The core's clock counts
+  from it, so `boot_ms` includes OSTD's own start-up.
+
 Three of its comments lose their em dashes (`src/log/logger.rs`, `src/log/macros.rs`,
 `src/task/scheduler/mod.rs`), which the repository's quality check refuses in every
 tracked file; their code is unchanged.
