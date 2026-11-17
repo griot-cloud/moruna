@@ -111,6 +111,18 @@ const WAIT_LEN: usize = 16;
 /// one bell hears.
 pub const SLICE_NS: u64 = 1_000_000;
 
+/// Whether a task of `windows` windows, `idle` of them idle and `given` on its free ring or in
+/// its hands, is given its idle windows back now: when at least half are idle, so one regrant
+/// covers several; when it waits for one on its port; and whenever it has none left to write
+/// in, however it waits. A native task sleeps on its bell for a window
+/// (`moruna_sys::plane::Rings::wait_window`) and never says so on its port: with three
+/// windows, two holding records the stage kept in place and the third idle, the half rule
+/// alone never gave the third back, and the task and the stage waited on each other for good
+/// (item 3.1, the full-year hang).
+pub fn gives_idle(idle: usize, given: usize, windows: usize, port_wait: bool) -> bool {
+    idle > 0 && (idle * 2 >= windows || given == 0 || port_wait)
+}
+
 /// Where a ring task's input region comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Region {
@@ -318,6 +330,24 @@ impl<C: RingCalls> RingPlane<C> {
             return None;
         };
         t.engine.exit(&*o.view)
+    }
+
+    /// Each window of ring task `task`'s current rings object, for a diagnosis: `given` (on
+    /// its free ring or in its hands), `held` (a record the engine has not dropped), `idle`
+    /// (dropped, not given back yet) or `fresh` (never given).
+    pub fn window_states(&self, task: TaskId) -> Option<Vec<&'static str>> {
+        let t = self.tasks.get(&task.0)?;
+        Some(
+            t.windows
+                .iter()
+                .map(|w| match w {
+                    Win::Fresh => "fresh",
+                    Win::Given => "given",
+                    Win::Batch => "held",
+                    Win::Idle => "idle",
+                })
+                .collect(),
+        )
     }
 
     /// Places ring task `task` on `cpu` before it starts, or nowhere in particular with `None`
@@ -1063,14 +1093,13 @@ impl<C: RingCalls> RingPlane<C> {
         }
         self.settle_ring();
         let low = self.tasks.get(&id).is_some_and(|t| {
-            let idle = t
-                .windows
-                .iter()
-                .filter(|w| matches!(w, Win::Idle | Win::Fresh))
-                .count();
-            idle > 0
-                && (idle * 2 >= t.windows.len()
-                    || t.wait.is_some_and(|w| w.1 == layout::WAIT_WINDOW))
+            let of = |f: fn(&Win) -> bool| t.windows.iter().filter(|w| f(w)).count();
+            gives_idle(
+                of(|w| matches!(w, Win::Idle | Win::Fresh)),
+                of(|w| *w == Win::Given),
+                t.windows.len(),
+                t.wait.is_some_and(|w| w.1 == layout::WAIT_WINDOW),
+            )
         });
         if low {
             self.give_idle(id)?;
