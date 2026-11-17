@@ -66,7 +66,8 @@ struct CardLink {
     receive: Option<u32>,
     link: Option<u32>,
     generation: u32,
-    sends: Vec<u32>,
+    /// The sends outstanding: each request's id, and the frames it carries.
+    sends: Vec<(u32, u32)>,
     batch: u32,
     failed: Option<String>,
 }
@@ -109,13 +110,20 @@ impl CardLink {
         }
         let mut k = 0;
         while k < self.sends.len() {
-            match self.core.reply(self.sends[k], 0) {
+            let (id, frames) = self.sends[k];
+            match self.core.reply(id, 0) {
                 Ok(mut f) => {
+                    // moruna.driver.net's `send` answers the frames' count once every one is
+                    // on the device's ring, and refuses a batch whole.
                     let mut decoder = f.decoder();
-                    <()>::decode(&mut decoder).map_err(|e| format!("send answer: {e:?}"))?;
+                    let taken =
+                        u32::decode(&mut decoder).map_err(|e| format!("send answer: {e:?}"))?;
                     decoder
                         .finish()
                         .map_err(|e| format!("send answer trailer: {e:?}"))?;
+                    if taken != frames {
+                        return Err(format!("a send of {frames} frames was answered {taken}"));
+                    }
                     self.sends.swap_remove(k);
                 }
                 Err(CallError::TimedOut) => k += 1,
@@ -173,10 +181,11 @@ impl CardLink {
             if batch.is_empty() {
                 return Ok(());
             }
+            let frames = batch.len() as u32;
             let mut e = Encoder::new();
             batch.encode(&mut e).map_err(|e| format!("{e:?}"))?;
-            self.sends
-                .push(self.core.send(4, e).map_err(|e| format!("send: {e:?}"))?);
+            let id = self.core.send(4, e).map_err(|e| format!("send: {e:?}"))?;
+            self.sends.push((id, frames));
         }
     }
 }
@@ -392,15 +401,12 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
             return Err(format!("grant {slot} names a slot the boot did not give"));
         }
     }
-    let mut listeners = Vec::new();
+    let mut granted = Vec::new();
     for slot in slots {
         let Some((_, policy)) = config.grants.iter().find(|(s, _)| *s == slot) else {
             return Err(format!("slot {slot} has no grant"));
         };
-        let channel = start::take(&slot)
-            .map(Channel)
-            .ok_or_else(|| format!("slot {slot} was taken"))?;
-        listeners.push((channel, policy.clone()));
+        granted.push((slot, policy.clone()));
     }
     let (mut links, cards) = if config.interfaces.is_empty() {
         (Vec::new(), Vec::new())
@@ -460,6 +466,16 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
         ));
     }
     println!(out, "{}", up);
+    // The listeners are taken only now, once the server has started: one that cannot start
+    // ends holding none, so its clients see it go when its process ends, after its fatal
+    // line, and the console names the cause first (system design 1B).
+    let mut listeners = Vec::new();
+    for (slot, policy) in granted {
+        let channel = start::take(&slot)
+            .map(Channel)
+            .ok_or_else(|| format!("slot {slot} was taken"))?;
+        listeners.push((channel, policy));
+    }
     let shared = Shared::new(stack);
     let mut d = moruna_svc::Dispatcher::new();
     for (channel, policy) in listeners {
