@@ -5,10 +5,10 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use moruna_abi::boot_line::{CORE, Fatal, HYPERV, Hypervisor as Line, KVM};
+use moruna_abi::boot_line::{CORE, Fatal, HYPERV, Hypervisor as Line, KVM, OTHER};
 
 use super::hypervisor::{
-    APIC_TIMER_DIVIDE, Cpu, GUEST_OS_ID, HYPERV_LINE, Hypervisor, KVM_LINE, TscSource,
+    APIC_TIMER_DIVIDE, Cpu, GUEST_OS_ID, HYPERV_LINE, Hypervisor, KVM_LINE, OTHER_LINE, TscSource,
     apic_timer_count, hypercall_msr, hypercall_msrs, hypervisor, tsc_rate,
 };
 use super::pit_presence::{NO_PIT_FOR_APIC_TIMER, NO_PIT_FOR_TSC, READS, counts};
@@ -148,7 +148,7 @@ fn no_kvmclock() -> Option<u64> {
 fn kvm_is_found_by_its_signature_and_its_clock_gives_the_tsc_rate() {
     let cpu = kvm();
     assert_eq!(hypervisor(&cpu), Some(Hypervisor::Kvm));
-    assert_eq!(Hypervisor::Kvm.line(), Some("moruna: hypervisor kvm"));
+    assert_eq!(Hypervisor::Kvm.line(), "moruna: hypervisor kvm");
     assert_eq!(
         tsc_rate(&cpu, kvmclock(2_995_200_000)),
         Some((2_995_200_000, TscSource::Kvmclock))
@@ -165,7 +165,7 @@ fn kvm_is_found_by_its_signature_and_its_clock_gives_the_tsc_rate() {
 fn hyper_v_is_found_by_its_interface_and_gives_both_rates() {
     let cpu = azure(hyperv_features(true, true, true));
     assert_eq!(hypervisor(&cpu), Some(Hypervisor::HyperV));
-    assert_eq!(Hypervisor::HyperV.line(), Some("moruna: hypervisor hyperv"));
+    assert_eq!(Hypervisor::HyperV.line(), "moruna: hypervisor hyperv");
     // kvmclock first, which answers nothing off KVM; leaf 0x15, which is empty; the MSR.
     assert_eq!(
         tsc_rate(&cpu, no_kvmclock),
@@ -268,14 +268,14 @@ fn a_machine_with_nothing_at_all_leaves_the_pit() {
 }
 
 #[test]
-fn another_hypervisor_is_present_and_unnamed() {
+fn another_hypervisor_is_present_and_called_other() {
     // QEMU's emulator, as CI's boots and this Mac's run.
     let tcg = nothing_at_all().leaf(1, leaf_1(true)).leaf(
         0x4000_0000,
         [0x4000_0001, word(b"TCGT"), word(b"CGTC"), word(b"GTCG")],
     );
     assert_eq!(hypervisor(&tcg), Some(Hypervisor::Other));
-    assert_eq!(Hypervisor::Other.line(), None);
+    assert_eq!(Hypervisor::Other.line(), "moruna: hypervisor other");
     assert_eq!(tsc_rate(&tcg, no_kvmclock), None);
     // A hypervisor bit with no hypervisor leaves at all.
     let bare = nothing_at_all().leaf(1, leaf_1(true));
@@ -329,6 +329,7 @@ fn the_hypercall_msrs_need_their_privilege() {
 fn the_lines_are_the_consoles() {
     assert_eq!(HYPERV_LINE, Line(HYPERV).to_string());
     assert_eq!(KVM_LINE, Line(KVM).to_string());
+    assert_eq!(OTHER_LINE, Line(OTHER).to_string());
     assert_eq!(
         NO_PIT_FOR_TSC,
         Fatal {

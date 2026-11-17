@@ -3,11 +3,11 @@
 //! moruna: the hypervisor at boot (Moruna's system design, section 1F, "The core on
 //! Hyper-V"; work item 1.8).
 //!
-//! The boot processor finds the hypervisor, says which on the console when it is Hyper-V
-//! or KVM, and on Hyper-V reports the guest OS identity and places the hypercall page,
-//! mapped executable in kernel mode only, for the core's VMBus mechanism (item 1.9c),
-//! which makes the calls. No hypercall is made here. What is decided, rather than done,
-//! is in `cpu/hypervisor.rs`, which the host tests check.
+//! The boot processor finds the hypervisor, says which on the console (Hyper-V, KVM or
+//! another; nothing on bare metal), and on Hyper-V reports the guest OS identity and
+//! places the hypercall page, mapped executable in kernel mode only, for the core's VMBus
+//! mechanism (item 1.9c), which makes the calls. No hypercall is made here. What is
+//! decided, rather than done, is in `cpu/hypervisor.rs`, which the host tests check.
 
 use spin::Once;
 
@@ -49,8 +49,8 @@ static HYPERCALL_PAGE: Once<KVirtArea> = Once::new();
 /// holds a stale translation of the page's new mapping.
 pub(in crate::arch) fn init_on_bsp() {
     let found = hypervisor::hypervisor(&ThisCpu);
-    if let Some(line) = found.and_then(Hypervisor::line) {
-        crate::early_println!("{}", line);
+    if let Some(found) = found {
+        crate::early_println!("{}", found.line());
     }
     if found == Some(Hypervisor::HyperV) {
         set_up_hypercall_page();
@@ -61,9 +61,15 @@ pub(in crate::arch) fn init_on_bsp() {
 /// Hypercall Interface (x86/x64)").
 ///
 /// The page is a frame of the kernel's own, so nothing else uses the memory the overlay
-/// covers (step 6). The page is placed even when firmware left one enabled, as Linux does
-/// for a guest (`arch/x86/hyperv/hv_init.c`), so it is always a page the kernel holds.
-/// Anything that stops it is logged, and the boot goes on with no hypercall page.
+/// covers (step 6). Anything that stops it is logged, and the boot goes on with no
+/// hypercall page.
+///
+/// Where the TLFS says to write the guest OS ID only if it is zero (step 3) and to keep a
+/// hypercall page already enabled (step 5), this does as Linux does for a guest
+/// (`arch/x86/hyperv/hv_init.c`): it always writes Moruna's ID, and always moves the page
+/// to its own frame. A page firmware left enabled lies in memory the OS reclaims, which
+/// the frame allocator may hand out for anything; keeping it there would leave an
+/// overlay that faults on every write over memory the kernel believes is its own.
 fn set_up_hypercall_page() {
     use hvdef::{HV_X64_MSR_GUEST_OS_ID, HV_X64_MSR_HYPERCALL};
     use x86::msr::{rdmsr, wrmsr};
@@ -107,8 +113,10 @@ fn set_up_hypercall_page() {
     );
 
     // SAFETY: as above. Writing the guest OS ID changes only what the hypervisor knows
-    // of the guest (step 3). The hypercall page overlays a frame the kernel holds for
-    // good and maps nowhere writable, so nothing of the kernel is hidden by it (step 7).
+    // of the guest (step 3), and is done whatever firmware wrote there (see above). The
+    // hypercall page overlays a frame the kernel holds for good and never writes, so
+    // nothing of the kernel is hidden by it, and the page firmware may have left enabled
+    // elsewhere is moved off memory the frame allocator hands out (step 7).
     unsafe {
         wrmsr(HV_X64_MSR_GUEST_OS_ID, hypervisor::GUEST_OS_ID);
         wrmsr(HV_X64_MSR_HYPERCALL, enabled);

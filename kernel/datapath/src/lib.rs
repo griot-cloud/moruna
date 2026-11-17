@@ -48,6 +48,31 @@ pub mod clock {
         put(clock_page::SHIFT, &SHIFT.to_le_bytes());
         bytes
     }
+
+    /// How long the kernel waits at boot for the CMOS clock to answer and hold still
+    /// (`architecture/moruna-os-system.md`, section 1B: no wait without a deadline in boot
+    /// code): 100 ms. A CMOS clock sets its update flag for at most about 2 ms a second, so
+    /// one that is there answers well within it; a machine with none loses 100 ms of boot.
+    pub const CMOS_WAIT_NS: u64 = 100_000_000;
+
+    /// Looks at `ready`, pausing between looks, until it answers true or, after a look that
+    /// answered false, the clock `now` reads `deadline` or later; whether it answered true.
+    /// There is always at least one look, even past the deadline.
+    pub fn wait_until(
+        now: impl Fn() -> u64,
+        deadline: u64,
+        mut ready: impl FnMut() -> bool,
+    ) -> bool {
+        loop {
+            if ready() {
+                return true;
+            }
+            if now() >= deadline {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+    }
 }
 
 /// An object's frames in runs of a large page.
@@ -208,6 +233,71 @@ mod tests {
             + ((u128::from(tsc - word(clock_page::BASE_TSC)) * u128::from(m)) >> shift) as u64;
         assert_eq!(read, clock::scale(tsc - 777, m));
         assert!(read.abs_diff(1_000_000_000) <= 1, "{read}");
+    }
+
+    /// A clock that reads `start` first and `step` nanoseconds more at each reading after.
+    fn ticking(start: u64, step: u64) -> impl Fn() -> u64 {
+        let next = core::cell::Cell::new(start);
+        move || {
+            let now = next.get();
+            next.set(now.saturating_add(step));
+            now
+        }
+    }
+
+    #[test]
+    fn a_cmos_clock_that_answers_is_read_well_within_its_deadline() {
+        assert_eq!(clock::CMOS_WAIT_NS, 100_000_000);
+        // An update in progress for 2 ms, the longest a CMOS clock takes, looked at every
+        // 10 microseconds.
+        let looks = core::cell::Cell::new(0u64);
+        assert!(clock::wait_until(
+            ticking(0, 10_000),
+            clock::CMOS_WAIT_NS,
+            || {
+                looks.set(looks.get() + 1);
+                looks.get() > 200
+            }
+        ));
+        assert_eq!(looks.get(), 201);
+        // Not updating at all: one look.
+        let looks = core::cell::Cell::new(0);
+        assert!(clock::wait_until(ticking(0, 1), 0, || {
+            looks.set(looks.get() + 1);
+            true
+        }));
+        assert_eq!(looks.get(), 1);
+    }
+
+    #[test]
+    fn a_machine_with_no_cmos_clock_gives_up_at_the_deadline() {
+        // Ports with nothing behind them read as all ones: always updating. With the
+        // deadline 100 ms after a boot clock read at 5 s, the wait ends at the first look at
+        // or past it.
+        let start = 5_000_000_000;
+        let looks = core::cell::Cell::new(0u64);
+        assert!(!clock::wait_until(
+            ticking(start, 1_000_000),
+            start + clock::CMOS_WAIT_NS,
+            || {
+                looks.set(looks.get() + 1);
+                false
+            }
+        ));
+        assert_eq!(looks.get(), 101);
+        // A deadline already passed: one look, and it ends.
+        let looks = core::cell::Cell::new(0);
+        assert!(!clock::wait_until(ticking(10, 1), 5, || {
+            looks.set(looks.get() + 1);
+            false
+        }));
+        assert_eq!(looks.get(), 1);
+        // A clock that saturates still reaches the deadline.
+        assert!(!clock::wait_until(
+            ticking(u64::MAX - 1, 5),
+            u64::MAX,
+            || false
+        ));
     }
 
     /// A frame allocator for the tests: runs while `runs` lasts, then none; single frames

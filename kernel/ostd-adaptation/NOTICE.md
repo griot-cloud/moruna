@@ -65,8 +65,9 @@ It also adds what the core needs on Hyper-V (`architecture/moruna-os-system.md`,
   `late_init_on_bsp` in `src/arch/x86/mod.rs` before the clock rates are taken). CPUID
   leaf 1's hypervisor bit, then Microsoft's interface: leaves up to `0x40000005` and
   leaf `0x40000001` answering `Hv#1`, as the TLFS asks; otherwise KVM by its signature.
-  It prints `moruna: hypervisor hyperv` or `moruna: hypervisor kvm`, and nothing on a
-  machine with no hypervisor or another one.
+  It prints `moruna: hypervisor hyperv`, `moruna: hypervisor kvm`, or
+  `moruna: hypervisor other` for any other hypervisor present, and nothing on a machine
+  with none.
 - **Clock rates** (`src/arch/x86/kernel/tsc.rs`, `src/arch/x86/timer/apic.rs`). The TSC's
   rate comes from kvmclock, then CPUID leaf 0x15, then Hyper-V's
   `HV_X64_MSR_TSC_FREQUENCY` when leaf `0x40000003` says the frequency MSRs may be read
@@ -90,7 +91,9 @@ It also adds what the core needs on Hyper-V (`architecture/moruna-os-system.md`,
   mode only in a kernel virtual area, by `HV_X64_MSR_HYPERCALL` with its reserved bits
   kept. The mapping and the frame are kept for as long as the machine runs; nothing calls
   the page yet (item 1.9c). A locked hypercall MSR, or a page that does not enable, is
-  logged and the boot goes on.
+  logged and the boot goes on. As Linux does, the ID is always written and a page firmware
+  left enabled is always moved, where the TLFS would keep both: firmware's page lies in
+  memory the OS reclaims, so keeping it would be unsafe.
 
 Every Hyper-V constant is the vendored `hvdef`'s (`../vendor/openvmm/hvdef`, MIT), which
 OSTD now depends on for the x86 kernel target. What is decided rather than done is in two

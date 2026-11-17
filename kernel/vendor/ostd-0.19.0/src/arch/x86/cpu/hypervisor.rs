@@ -56,18 +56,19 @@ const KVM_SIGNATURE: [u8; 12] = *b"KVMKVMKVM\0\0\0";
 /// volume 2A, CPUID, leaf 15H). Not a Hyper-V leaf, so not `hvdef`'s.
 const TSC_CRYSTAL_LEAF: u32 = 0x15;
 
-/// The console line for each hypervisor the core names (`moruna_abi::boot_line`, which
-/// the host tests hold these to).
+/// The console line for each kind of hypervisor (`moruna_abi::boot_line`, which the host
+/// tests hold these to). A machine with no hypervisor has none.
 pub(crate) const HYPERV_LINE: &str = "moruna: hypervisor hyperv";
 pub(crate) const KVM_LINE: &str = "moruna: hypervisor kvm";
+pub(crate) const OTHER_LINE: &str = "moruna: hypervisor other";
 
 impl Hypervisor {
-    /// The console line for this hypervisor, if the core names it.
-    pub(crate) fn line(self) -> Option<&'static str> {
+    /// The console line for this hypervisor.
+    pub(crate) fn line(self) -> &'static str {
         match self {
-            Hypervisor::HyperV => Some(HYPERV_LINE),
-            Hypervisor::Kvm => Some(KVM_LINE),
-            Hypervisor::Other => None,
+            Hypervisor::HyperV => HYPERV_LINE,
+            Hypervisor::Kvm => KVM_LINE,
+            Hypervisor::Other => OTHER_LINE,
         }
     }
 }
@@ -226,7 +227,8 @@ pub(crate) const GUEST_OS_ID: u64 = HvGuestOsOpenSource::new()
 
 /// The value to write to `HV_X64_MSR_HYPERCALL` to place the hypercall page at the guest
 /// physical address `page` and enable it, from the MSR's `current` value: its reserved
-/// bits kept, as the TLFS asks ("Establishing the Hypercall Interface (x86/x64)").
+/// bits kept, as the TLFS asks ("Establishing the Hypercall Interface (x86/x64)"). A page
+/// already enabled is moved, never kept (`kernel/hyperv.rs` says why).
 /// `None` when the MSR is locked, so the page cannot be placed, or `page` is not a page
 /// address the MSR can hold.
 pub(crate) fn hypercall_msr(current: u64, page: u64) -> Option<u64> {
