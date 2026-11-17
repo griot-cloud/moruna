@@ -44,14 +44,21 @@ pub fn name_valid(name: &str) -> bool {
     })
 }
 
-/// Whether `pattern` is a name, or `*.` and a name.
+/// The pattern every name matches (`moruna.net` 3.2): what node-admission's client holds,
+/// at 443, to mint each job's channel for the job's own names (system design 3D).
+pub const EVERY_NAME: &str = "*";
+
+/// Whether `pattern` is a name, `*.` and a name, or `*`.
 fn pattern_valid(pattern: &str) -> bool {
-    name_valid(pattern.strip_prefix("*.").unwrap_or(pattern))
+    pattern == EVERY_NAME || name_valid(pattern.strip_prefix("*.").unwrap_or(pattern))
 }
 
-/// Whether the lowercase name `name` matches `pattern`: the same name, or for
-/// `*.domain` any name below `domain` (not `domain` itself).
+/// Whether the lowercase name `name` matches `pattern`: the same name, for `*.domain`
+/// any name below `domain` (not `domain` itself), and for `*` every name.
 pub fn name_matches(pattern: &str, name: &str) -> bool {
+    if pattern == EVERY_NAME {
+        return true;
+    }
     match pattern.strip_prefix("*.") {
         Some(domain) => {
             name.len() > domain.len() + 1 && name.ends_with(domain) && {
@@ -63,8 +70,15 @@ pub fn name_matches(pattern: &str, name: &str) -> bool {
     }
 }
 
-/// Whether every name `child` matches, `parent` matches.
+/// Whether every name `child` matches, `parent` matches. `*` covers every pattern, and
+/// only `*` covers `*`.
 fn pattern_covers(parent: &str, child: &str) -> bool {
+    if parent == EVERY_NAME {
+        return true;
+    }
+    if child == EVERY_NAME {
+        return false;
+    }
     match (parent.strip_prefix("*."), child.strip_prefix("*.")) {
         (_, None) => name_matches(parent, child),
         (Some(p), Some(c)) => c == p || name_matches(parent, c),
@@ -295,6 +309,65 @@ mod tests {
     }
 
     #[test]
+    fn the_rule_star_matches_every_name_at_its_ports_and_only_star_covers_it() {
+        assert!(name_matches("*", "api.example.com"));
+        assert!(name_matches("*", "localhost"));
+        assert!(pattern_valid("*"));
+        // `*` is a pattern, never a name: nothing resolves or is opened as `*`.
+        assert!(!name_valid("*"));
+        assert_eq!(normalise_name("*"), None);
+        for bad in ["**", "*.", "*.*", "a.*", "*a.com"] {
+            assert!(!pattern_valid(bad), "{bad:?}");
+        }
+        let star = |first, last| NameRule {
+            pattern: "*".into(),
+            first,
+            last,
+        };
+        let name = |pattern: &str, first, last| NameRule {
+            pattern: pattern.into(),
+            first,
+            last,
+        };
+        // At its ports only.
+        let admission = Policy {
+            rights: rights::CONNECT | rights::GRANT,
+            remote: vec![],
+            local: vec![],
+            names: vec![star(443, 443)],
+            sockets: 64,
+        };
+        assert_eq!(admission.validate(), Ok(()));
+        assert!(admission.may_connect_name("store.example.test", 443));
+        assert!(!admission.may_connect_name("store.example.test", 80));
+        assert!(admission.may_resolve("anything.test"));
+        // It covers any name, `*.domain` and `*` at its ports, and nothing beyond them.
+        let job = |names: alloc::vec::Vec<NameRule>| Policy {
+            rights: rights::CONNECT,
+            remote: vec![],
+            local: vec![],
+            names,
+            sockets: 64,
+        };
+        assert!(admission.covers(&job(vec![name("a.test", 443, 443), name("b.c", 443, 443)])));
+        assert!(admission.covers(&job(vec![name("*.example.com", 443, 443)])));
+        assert!(admission.covers(&job(vec![star(443, 443)])));
+        assert!(!admission.covers(&job(vec![name("a.test", 80, 80)])));
+        assert!(!admission.covers(&job(vec![name("a.test", 443, 444)])));
+        assert!(!admission.covers(&job(vec![star(1, 65535)])));
+        // Nothing narrower covers `*`.
+        let narrow = |names| Policy {
+            rights: rights::CONNECT | rights::GRANT,
+            remote: vec![],
+            local: vec![],
+            names,
+            sockets: 64,
+        };
+        assert!(!narrow(vec![name("*.com", 0, 65535)]).covers(&job(vec![star(443, 443)])));
+        assert!(!narrow(vec![name("a.test", 0, 65535)]).covers(&job(vec![star(443, 443)])));
+    }
+
+    #[test]
     fn ke2_name_rules_permit_resolving_and_connecting_by_name() {
         let p = Policy {
             rights: rights::CONNECT,
@@ -331,7 +404,8 @@ mod tests {
         let mut bad = good.clone();
         bad.remote = vec![good.remote[0]; RULES_MAX + 1];
         assert_eq!(bad.validate(), Err(net::Error::BadPolicy));
-        for pattern in ["", "*.", "*", "a..b", "**.a", "a.*.b"] {
+        // `*` alone is every name (3.2); these are not patterns.
+        for pattern in ["", "*.", "**", "*.*", "a..b", "**.a", "a.*.b"] {
             let mut bad = good.clone();
             bad.names = vec![NameRule {
                 pattern: pattern.to_string(),

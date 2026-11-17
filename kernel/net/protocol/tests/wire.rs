@@ -120,6 +120,6 @@ fn caller_owned_ingress_major_explicitly_refuses_legacy_payload_protocol() {
         netstack_protocol::net::ID.accepts(&hello),
         Err(moruna_svc::Refusal::MajorMismatch)
     );
-    assert_eq!(netstack_protocol::net::ID.major, 2);
-    assert_eq!(netstack_protocol::net::ID.minor, 0);
+    assert_eq!(netstack_protocol::net::ID.major, 3);
+    assert_eq!(netstack_protocol::net::ID.minor, 2);
 }

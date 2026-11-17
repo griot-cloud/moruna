@@ -11,7 +11,9 @@
 //! checks every request against the policy before doing anything.
 //!
 //! `node-admission` mints it per job with `grant` (`moruna.net`'s request 14) on its own
-//! network client. The network server refuses a grant its client's policy does not cover.
+//! network client, which holds `grant,connect` on every name at 443 (the rule `*`,
+//! `moruna.net` 3.2) and never connects itself. The network server refuses a grant its
+//! client's policy does not cover. A job's hosts never include `*`: it is no host name.
 
 use alloc::{string::String, vec::Vec};
 use core::net::{IpAddr, Ipv6Addr};

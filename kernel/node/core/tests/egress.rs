@@ -9,13 +9,16 @@ use moruna_node::egress::{self, EgressError, MintError, PORT};
 use moruna_svc::{CallError, Channel, Dispatcher, Turn, deadline_in, now};
 use netstack_protocol::{Addr, Endpoint, Policy, Target, dns, net, rights};
 
-/// The network server of these tests: a loopback resolver it asks at 127.0.0.1, the
-/// slot `listen-admission` with what a node-admission client may mint, and the slot `listen-peer`
-/// for the test's own server and resolver.
+/// The network server of these tests: a loopback resolver it asks at 127.0.0.1; the slot
+/// `listen-admission` as the cloud profile gives node-admission its client (every name at
+/// 443, `grant` and `connect`: system design 3D); two narrower slots, to show a mint is
+/// bounded by its minting client; and the slot `listen-peer` for the test's own server and
+/// resolver.
 const CONFIG: &str = "moruna-netstack 1
 setting dns-queries 4
 dns 127.0.0.1
-grant listen-admission rights=connect,grant local=any names=*.objects.test@443,store.example.test@443 sockets=64
+grant listen-admission rights=grant,connect local=any names=*@443 sockets=64
+grant listen-narrow rights=grant,connect local=any names=*.objects.test@443,store.example.test@443 sockets=64
 grant listen-grantonly rights=grant local=any sockets=64
 grant listen-peer rights=connect,listen,udp,resolve remote=127.0.0.0/8 local=127.0.0.0/8 sockets=16
 ";
@@ -132,7 +135,7 @@ fn hosts_that_make_no_policy_are_refused_by_name() {
         Err(EgressError::NoSockets)
     );
     for host in [
-        "10.0.0.5", "::1", "", "a b.test", "-a.test", "a..test", "*.test",
+        "10.0.0.5", "::1", "", "a b.test", "-a.test", "a..test", "*.test", "*",
     ] {
         assert_eq!(
             egress::policy(&hosts(&["ok.test", host]), 8),
@@ -244,30 +247,37 @@ fn admission_mints_a_jobs_channel_and_the_job_reaches_its_host_only() {
 fn admission_mints_only_what_its_own_policy_covers() {
     let (mut slots, server) = serve();
     let admission_listener = slots.remove("listen-admission").unwrap();
+    let narrow_listener = slots.remove("listen-narrow").unwrap();
     let grant_only_listener = slots.remove("listen-grantonly").unwrap();
+    let not_permitted = MintError::Refused(CallError::Remote(net::Error::NotPermitted));
+    // node-admission's client (`*@443`) mints any job's names, up to its own sockets.
     let mut admission = client(&admission_listener);
-    // Hosts under its own name rules, and up to its own socket bound.
     for listed in [
         &["a.objects.test", "b.c.objects.test"][..],
         &["store.example.test"][..],
+        &["s3.eu-west-1.amazonaws.com", "acct.blob.core.windows.net"][..],
     ] {
-        assert!(egress::mint(&mut admission, &hosts(listed), 64).is_ok());
+        assert!(
+            egress::mint(&mut admission, &hosts(listed), 64).is_ok(),
+            "{listed:?}"
+        );
     }
-    // A host outside them, or more sockets than it holds.
-    let not_permitted = MintError::Refused(CallError::Remote(net::Error::NotPermitted));
-    for (listed, sockets) in [
-        (&["elsewhere.test"][..], 4),
-        (&["objects.test"][..], 4),
-        (&["a.objects.test"][..], 65),
-    ] {
+    assert_eq!(
+        not_minted(egress::mint(&mut admission, &hosts(&["a.test"]), 65)),
+        not_permitted
+    );
+    // A narrower client mints only under its own names.
+    let mut narrow = client(&narrow_listener);
+    assert!(egress::mint(&mut narrow, &hosts(&["a.objects.test"]), 4).is_ok());
+    for listed in [&["elsewhere.test"][..], &["objects.test"][..]] {
         assert_eq!(
-            not_minted(egress::mint(&mut admission, &hosts(listed), sockets)),
+            not_minted(egress::mint(&mut narrow, &hosts(listed), 4)),
             not_permitted,
             "{listed:?}"
         );
     }
     // A client with only the `grant` right mints nothing with `connect`: a child's
-    // rights must be its parent's (`Policy::covers`). See item 3.4's report.
+    // rights must be its parent's (`Policy::covers`).
     let mut grant_only = client(&grant_only_listener);
     assert_eq!(
         not_minted(egress::mint(
@@ -283,8 +293,10 @@ fn admission_mints_only_what_its_own_policy_covers() {
         MintError::Policy(EgressError::NoHosts)
     );
     drop(grant_only);
+    drop(narrow);
     drop(admission);
     drop(grant_only_listener);
+    drop(narrow_listener);
     drop(admission_listener);
     drop(slots);
     server.join().unwrap();

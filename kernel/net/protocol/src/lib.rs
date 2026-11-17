@@ -1,4 +1,4 @@
-//! `moruna.net` 3.0 (SDD 31, d.1): the network server's sockets, for the processes of a
+//! `moruna.net` 3.2 (SDD 31, d.1): the network server's sockets, for the processes of a
 //! node that speak to the network. A client connects, listens and accepts, sends and
 //! receives TCP bytes with backpressure and closes each half of a connection; binds
 //! UDP sockets and sends and receives datagrams; pings; and resolves names.
@@ -28,7 +28,7 @@ mod policy;
 mod suites;
 mod types;
 
-pub use policy::{name_matches, name_valid, normalise_name};
+pub use policy::{EVERY_NAME, name_matches, name_valid, normalise_name};
 pub use suites::{SUITE_NAME, pair_suite, suite};
 pub use types::{
     Addr, Cidr, Endpoint, Info, Interface, NameRule, Opened, Policy, Rule, SocketState,
@@ -91,7 +91,9 @@ mod transport {
         pub protocol wire {
             name = "moruna.net";
             major = 3;
-            minor = 0;
+            // 3.2: the name rule `*`, every name at its ports (item 3.4). It follows item
+            // 1.3b's 3.1; the PM renumbers at merge if that changes.
+            minor = 2;
             requests {
                 /// The interfaces, their addresses and links, the resolver's servers, and
                 /// this connection's policy.

@@ -12,7 +12,8 @@
 //! ```
 //!
 //! A rule is `ADDR/PREFIX` with an optional `@PORT` or `@FIRST-LAST` (every port
-//! without), or `any` for every IPv4 and IPv6 address. A grant's `SLOT` names a
+//! without), or `any` for every IPv4 and IPv6 address. A name pattern is a name,
+//! `*.domain` for every name below it, or `*` for every name. A grant's `SLOT` names a
 //! listener slot of the server's (`listen*`); every connection through it holds that
 //! policy. `#` begins a comment. Anything else, and every value out of range, is
 //! refused with its line.
@@ -585,6 +586,27 @@ grant listen-any rights=connect,listen,udp,ping,resolve,grant remote=any local=a
         assert_eq!(a.sockets, 16);
         assert_eq!(c.grants[1].1.remote, Policy::everything(0).remote);
         assert_eq!(c.grants[1].1.sockets, 64);
+    }
+
+    #[test]
+    fn the_rule_star_is_every_name_at_its_ports() {
+        let c = parse(
+            "moruna-netstack 1\n\
+             grant listen-admission rights=grant,connect local=any names=*@443 sockets=64\n",
+        )
+        .expect("parses");
+        let (_, a) = &c.grants[0];
+        assert_eq!(a.rights, rights::GRANT | rights::CONNECT);
+        let rule = &a.names[0];
+        assert_eq!(
+            (rule.pattern.as_str(), rule.first, rule.last),
+            ("*", 443, 443)
+        );
+        for bad in ["*.*", "**", "a.*", "*a.test"] {
+            let text =
+                alloc::format!("moruna-netstack 1\ngrant listen rights=connect names={bad}@443\n");
+            assert!(parse(&text).is_err(), "{bad}");
+        }
     }
 
     #[test]
