@@ -3,7 +3,9 @@
 How to put the node on an OpenStack cloud: upload its image, create one machine from it with
 node config as user-data and a firewall rule for port 443 only, read its console, check it, and
 delete everything (system design `architecture/moruna-os-system.md`, section 1E; work item 1.5).
-It is written for Servercore, cloud `servercore` in `~/.config/openstack/clouds.yaml`.
+It is written for Servercore, cloud `servercore` in `~/.config/openstack/clouds.yaml`. The
+machine boots from the image itself where the flavor has a disk of its own (step 4a), and from a
+2 GB volume made from the image where it has none (step 4b).
 
 - **Written 2026-11-17 and not run.** Item 1.6 runs it, and corrects it here where it is wrong.
 - **Every `openstack` line below was checked without a cloud:** parsed by the argument parsers of
@@ -23,8 +25,10 @@ a command changes.
 | Value | What it is | Where it comes from |
 | --- | --- | --- |
 | `<REGION>` | The Servercore region the machine is created in | The project's account. `openstack --os-cloud servercore catalog list` names the regions that have a `compute` endpoint |
-| `<FLAVOR>` | The name or ID of the smallest flavor with 1 CPU and 1 GiB of memory or more, and a disk of its own | Step 4's `flavor list` |
+| `<FLAVOR>` | The name or ID of the smallest flavor with 1 CPU and 1 GiB of memory or more. Whether it has a disk of its own decides step 4's path | Step 4's `flavor list` |
 | `<EXTERNAL_NETWORK>` | The name or ID of the external network the machine is put on | Step 4's `network list --external` |
+| `<VOLUME_TYPE>` | Step 4b only: the type of the boot volume | Step 4b's `volume type list` |
+| `<ZONE>` | Step 4b only: the availability zone the boot volume and the server are both created in | Step 4b's `availability zone list` |
 | `<OUT>` | The directory `package.py` wrote, holding `moruna-node.qcow2` | The build, below |
 | `<RUN>` | A new directory for this run's files: node config, the IDs, the console log, the times. Outside the repository, since a private key is kept there | The operator chooses it. Step 1 makes it |
 | `<NAME>` | One name for this run's image, security group and server, for example `moruna-node-20261117-1` | The operator chooses it. No other image, group or server of the project has it |
@@ -125,8 +129,12 @@ openstack --os-cloud servercore --os-region-name <REGION> security group rule li
 
 The list must show exactly one `ingress` rule: `tcp`, port range `443:443`, `0.0.0.0/0`. It also
 shows the two `egress` rules OpenStack puts in every new group (any protocol, one for IPv4 and
-one for IPv6). This recipe leaves them: they let nothing in, and the node's request for its
-instance data (`169.254.169.254`, port 80; 1D) is outbound traffic.
+one for IPv6). This recipe leaves them (PM, 2026-11-17):
+
+- they let nothing in;
+- the node itself denies outbound traffic that is not granted (1C);
+- the node's request for its instance data (`169.254.169.254`, port 80; 1D) is outbound
+  traffic, and so, later, is a job's reach to object storage.
 
 ## 4. The server
 
@@ -136,11 +144,14 @@ Find the two values first. Both commands only read.
 openstack --os-cloud servercore --os-region-name <REGION> flavor list --sort-column RAM
 ```
 
-`<FLAVOR>` is the first row with `VCPUs` of 1 or more, `RAM` of 1024 (MiB) or more, and a `Disk`
-(GiB) that is not 0. The server boots from the image on the flavor's own disk. A flavor with
-disk 0 is for a boot from a volume (Nova's `zero_disk_flavor` policy can refuse an image boot on
-one), and this recipe makes no volume: if every small flavor on Servercore has disk 0, stop and
-report.
+`<FLAVOR>` is the first row with `VCPUs` of 1 or more and `RAM` of 1024 (MiB) or more. Its `Disk`
+column (GiB) decides how the server boots:
+
+- **`Disk` is not 0: step 4a.** The server boots from the image, on the flavor's own disk.
+- **`Disk` is 0: step 4b.** The server boots from a volume made from the image. A flavor with
+  disk 0 is for a boot from a volume (Nova's `zero_disk_flavor` policy can refuse an image boot
+  on one). Servercore's small flavors mostly have no disk of their own, so this is the path
+  expected there (PM, 2026-11-17).
 
 ```
 openstack --os-cloud servercore --os-region-name <REGION> network list --external
@@ -148,7 +159,14 @@ openstack --os-cloud servercore --os-region-name <REGION> network list --externa
 
 `<EXTERNAL_NETWORK>` is the external network the project may put a machine on.
 
-Create the server, and note the time the command returns:
+Either path creates the server the same way otherwise:
+
+- No key pair, no password, no config drive and no floating IP: nobody logs in, the node reads
+  its config from the metadata service (1D), and its address is the external network's.
+- No `--wait`: with it, the command writes its progress to standard output, into the ID's file.
+- The time the command returns is noted, for step 5.
+
+### 4a. From the image
 
 ```
 openstack --os-cloud servercore --os-region-name <REGION> server create \
@@ -157,9 +175,64 @@ openstack --os-cloud servercore --os-region-name <REGION> server create \
   -f value -c id <NAME> > <RUN>/server.id && date -u +%s > <RUN>/created.at
 ```
 
-- No key pair, no password, no config drive and no floating IP: nobody logs in, the node reads
-  its config from the metadata service (1D), and its address is the external network's.
-- No `--wait`: with it, the command writes its progress to standard output, into the ID's file.
+### 4b. From a volume
+
+Find the volume's two values first. These commands only read.
+
+```
+openstack --os-cloud servercore --os-region-name <REGION> volume type list
+openstack --os-cloud servercore --os-region-name <REGION> availability zone list --volume
+openstack --os-cloud servercore --os-region-name <REGION> availability zone list --compute
+```
+
+`<VOLUME_TYPE>` is one of the types. `<ZONE>` is a zone that both zone lists name: the volume
+and the server are created in the same one.
+
+Make the volume from the image, 2 GB:
+
+```
+openstack --os-cloud servercore --os-region-name <REGION> volume create \
+  --image "$(cat <RUN>/image.id)" --size 2 --type <VOLUME_TYPE> --availability-zone <ZONE> \
+  -f value -c id <NAME> > <RUN>/volume.id
+```
+
+Wait for the image to be copied onto it, at most 5 minutes:
+
+```
+for _ in $(seq 60); do
+  state="$(openstack --os-cloud servercore --os-region-name <REGION> volume show \
+    "$(cat <RUN>/volume.id)" -f value -c status)"
+  echo "$state"
+  [ "$state" = creating ] || [ "$state" = downloading ] || break
+  sleep 5
+done
+```
+
+It must end at `available`. Then read the volume back:
+
+```
+openstack --os-cloud servercore --os-region-name <REGION> volume show "$(cat <RUN>/volume.id)" \
+  -c status -c size -c bootable -c volume_image_metadata
+```
+
+Go on only when `bootable` is `true` and `volume_image_metadata` holds the image's four
+properties of step 2: a server booted from a volume takes its firmware, machine type and device
+models from there. If the volume ends at `error`, or is not `available` after the 5 minutes, go
+to step 7 and report.
+
+Create the server from the volume, in the volume's zone:
+
+```
+openstack --os-cloud servercore --os-region-name <REGION> server create \
+  --volume "$(cat <RUN>/volume.id)" --flavor <FLAVOR> --network <EXTERNAL_NETWORK> \
+  --availability-zone <ZONE> \
+  --security-group "$(cat <RUN>/group.id)" --user-data <RUN>/node-config.json \
+  -f value -c id <NAME> > <RUN>/server.id && date -u +%s > <RUN>/created.at
+```
+
+The volume outlives the server: step 7 deletes it.
+
+### After either
 
 Wait for the server to leave `BUILD`, at most 5 minutes:
 
@@ -233,12 +306,27 @@ It must print `ACTIVE`.
 
 ## 7. Delete everything
 
-In this order: the group is in use until the server is gone. After a step that failed, delete
-what was created before it: each command here applies when its file in `<RUN>` holds an ID.
+In this order: the volume and the group are in use until the server is gone, and a volume made
+from an image can keep that image in use. After a step that failed, delete what was created
+before it: each command here applies when its file in `<RUN>` holds an ID.
 
 ```
 openstack --os-cloud servercore --os-region-name <REGION> server delete --wait \
   "$(cat <RUN>/server.id)"
+```
+
+After step 4b only, the boot volume. Wait for the server to let go of it, at most 2 minutes,
+then delete it:
+
+```
+for _ in $(seq 24); do
+  state="$(openstack --os-cloud servercore --os-region-name <REGION> volume show \
+    "$(cat <RUN>/volume.id)" -f value -c status)"
+  echo "$state"
+  [ "$state" = in-use ] || [ "$state" = detaching ] || break
+  sleep 5
+done
+openstack --os-cloud servercore --os-region-name <REGION> volume delete "$(cat <RUN>/volume.id)"
 ```
 
 ```
@@ -251,8 +339,8 @@ openstack --os-cloud servercore --os-region-name <REGION> image delete "$(cat <R
 ```
 
 That is everything this recipe created: the server (its port on the external network was made
-with it and goes with it), the group (its rules go with it) and the image. It made no volume,
-floating IP, key pair, network or router.
+with it and goes with it), the boot volume of step 4b, the group (its rules go with it) and the
+image. It made no floating IP, key pair, network or router, and after step 4a no volume.
 
 Show that each is gone. Every one of these three must fail, saying it found nothing:
 
@@ -260,6 +348,13 @@ Show that each is gone. Every one of these three must fail, saying it found noth
 openstack --os-cloud servercore --os-region-name <REGION> server show "$(cat <RUN>/server.id)"
 openstack --os-cloud servercore --os-region-name <REGION> security group show "$(cat <RUN>/group.id)"
 openstack --os-cloud servercore --os-region-name <REGION> image show "$(cat <RUN>/image.id)"
+```
+
+After step 4b, so must this one. A volume takes a few seconds to go: while it still answers,
+with the status `deleting`, run it again.
+
+```
+openstack --os-cloud servercore --os-region-name <REGION> volume show "$(cat <RUN>/volume.id)"
 ```
 
 Then list what the project still holds. Nothing in these lists is named `<NAME>` or has an ID

@@ -143,7 +143,8 @@ container start moruna-arm
 container stop moruna-arm && rm ~/.vm-lock/owner && rmdir ~/.vm-lock
 ```
 
-Host tests of single crates (`cargo test -p ...`) need no lock: run them on the Mac with `-j 4`.
+Host tests of single crates (`cargo test -p ...`) need no lock: run them on the Mac with `-j 2`
+(`architecture/work/_rules.md`: up to six agents share its 10 cores and 16 GB).
 
 ### `moruna-arm`
 
@@ -221,7 +222,12 @@ Each cloud takes its own format, and every one is made from the one raw disk (sy
 | `vhd` | `moruna-node.vhd` | `qemu-img convert -f raw -O vpc -o subformat=fixed,force_size` | Azure |
 
 - **`qemu-img` must be on `PATH`** for `qcow2` or `vhd`: the build refuses to start without it.
-  `command -v qemu-img`, after the `PATH` line above, shows whether `moruna-arm`'s QEMU has it.
+  **`moruna-arm` has none** (verified 2026-11-17 with `command -v qemu-img` and a search of its
+  whole filesystem): `/opt/qemu/bin` holds `qemu-system-x86_64` alone, QEMU's tools not having
+  been installed with it. Until one is put there, `--formats qcow2 vhd` cannot run in it.
+  Ubuntu's `qemu-utils` package (QEMU 8.2.2's `qemu-img`, 2.1 MB with three small libraries) is
+  one source; QEMU 10.2.1's own tools, built from its source, are the other. Which is the PM's
+  to say.
 - **The VHD is fixed-size:** the raw disk rounded up to a whole MiB, then the VHD's 512-byte
   footer, so the file is a whole number of MiB and 512 bytes. `package.py`'s raw disk is a whole
   MiB already (its size is `(esp_mib + 4) * MIB`), so the VHD holds exactly the raw disk.

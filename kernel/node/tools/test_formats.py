@@ -7,8 +7,8 @@ raw files, and the boot script is run against a stand-in for QEMU that records i
 Run: python3 -I kernel/node/tools/test_formats.py
 
 Two of its classes need more than Python, and fail (they are never skipped) without it:
-- `Conversions` needs `qemu-img` on PATH, the tool package.py --formats runs. In moruna-arm:
-  `export PATH=/opt/qemu/bin:$PATH` (kernel/node/HOST.md).
+- `Conversions` needs `qemu-img` on PATH, the tool package.py --formats runs (kernel/node/HOST.md
+  says where one is).
 - `BootDisk` needs a bash with EPOCHREALTIME (5.0 or later), which uefi-boot.sh itself needs.
   macOS's /bin/bash is 3.2; Homebrew's is found when it is installed.
 """
@@ -225,7 +225,7 @@ class Conversions(unittest.TestCase):
     def setUpClass(cls):
         if shutil.which("qemu-img") is None:
             raise AssertionError("qemu-img is not on PATH: package.py --formats and these tests need it "
-                                 "(moruna-arm: export PATH=/opt/qemu/bin:$PATH)")
+                                 "(kernel/node/HOST.md, the disk's other formats)")
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
