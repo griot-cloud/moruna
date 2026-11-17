@@ -147,6 +147,27 @@ def fmt(x, nd=1):
     return "" if x is None else f"{x:.{nd}f}"
 
 
+# Brackly's first gate (2026-11-17): no regressions. 0.7 must be faster than both 0.6.6 rows, its
+# Rust function and its Python one, on every job before the 1.5x bar applies.
+SIX = (("moruna066-rust", "0.6.6 with the Rust function"), ("moruna", "0.6.6 with the Python function"))
+
+
+def no_regression(table):
+    """The first gate's verdict for 0.7's row: (verdict, the sentence). 0.7's operational time
+    against each 0.6.6 row's wall, as the bar is judged; unchecked when a 0.6.6 row is missing."""
+    vm = table.get("moruna-vm")
+    if not vm or vm.get("operational_s") is None:
+        return None, None
+    missing = [name for e, name in SIX if not (table.get(e) or {}).get("wall_s")]
+    if missing:
+        return "unchecked", f"no regression: unchecked, no row for {' or '.join(missing)}"
+    ops = vm["operational_s"]
+    parts = [f"{name} {table[e]['wall_s']:.1f} s ({table[e]['wall_s'] / ops:.2f}x)" for e, name in SIX]
+    verdict = "PASS" if all(ops < table[e]["wall_s"] for e, _ in SIX) else "MISS"
+    return verdict, (f"**{verdict}** no regression (the first gate: faster than both 0.6.6 rows): 0.7's "
+                     f"operational {ops:.1f} s against {', '.join(parts)}; with start-up {vm['wall_s']:.1f} s")
+
+
 def speedups(table):
     """0.7 against every other row. Brackly's bar (2026-11-17): PASS when 0.7's median wall is at
     least 1.5 times faster than the best other row's and its CPU-seconds are no more than any
@@ -156,7 +177,8 @@ def speedups(table):
         return ["0.7 (moruna-vm) has no measured run."]
     others = {e: r for e, r in table.items() if not e.startswith("moruna-vm") and r["wall_s"]}
     operational = vm.get("operational_s")
-    lines = []
+    _, gate = no_regression(table)
+    lines = [f"- {gate}"] if gate else []
     for group, name in ((2, "the plain Rust pool"), (5, "native expressions"), (3, "0.6.6"),
                         (4, "the Python engines")):
         rows = [(r["wall_s"], e) for e, r in others.items() if r["group"] == group]
@@ -220,16 +242,18 @@ def render(recs, machines):
             if not table:
                 continue
             out.append(f"### {wl}\n")
-            out.append("| Group | Engine | Function | Operational s | Total s | Start-up: VM s | Start-up: engine s | "
-                       "CPU s | Peak GiB | OOM | Launch s | Boot s | Stage s | Read+decode s | Function s | "
-                       "Encode+write s | Waits s | Output | Runs ok |")
+            out.append("| Group | Engine | Function | Operational s | Total s | No regression | Start-up: VM s | "
+                       "Start-up: engine s | CPU s | Peak GiB | OOM | Launch s | Boot s | Stage s | Read+decode s | "
+                       "Function s | Encode+write s | Waits s | Output | Runs ok |")
             out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- "
-                       "| --- | --- | --- |")
+                       "| --- | --- | --- | --- |")
+            gate, _ = no_regression(table)
             for e, r in sorted(table.items(), key=lambda kv: (kv[1]["group"], kv[0])):
                 s = r["split"]
                 v = r.get("vm") or {}
                 ops = r.get("operational_s") if r.get("operational_s") is not None else r["wall_s"]
                 out.append(f"| {r['group']} | {e} | {r['function']} | {fmt(ops)} | {fmt(r['wall_s'])} | "
+                           f"{gate if e == 'moruna-vm' and gate else ''} | "
                            f"{fmt(r.get('vm_start_s'), 2)} | {fmt(r.get('engine_start_s'), 2)} | {fmt(r['cpu_s'])} | "
                            f"{fmt(r['peak_gib'], 2)} | {r['oom']} | {fmt(v.get('launch_s'), 2)} | "
                            f"{fmt(v.get('boot_s'), 2)} | {fmt(v.get('stage_s'), 2)} | "
@@ -245,7 +269,9 @@ def render(recs, machines):
                "the VM's (the node built, the inputs staged, the launch and the boot; gone in mode 1, where "
                "Moruna is the node) and the engine's (before its first rows: the arena, the planes, the first "
                "morsel). A control's own start (its process, imports, session) stays inside its wall, as "
-               "measured, so its operational time is its wall. The bar is judged on operational time.\n")
+               "measured, so its operational time is its wall. The bar is judged on operational time, after "
+               "the first gate: no regressions, 0.7 faster than both 0.6.6 rows (the Rust and the Python "
+               "function) on every job.\n")
     out.append("A split column is empty where the engine's report has no figure for it: the Python "
                "engines report none, and 0.6.6's report does not split decode from read or encode "
                "from write.")
