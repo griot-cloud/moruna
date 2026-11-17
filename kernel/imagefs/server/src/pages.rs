@@ -5,181 +5,119 @@
 //! one of `scratch::DEFAULT_QUOTA` bytes the server carves out of its own when the
 //! directory first needs a page, held until the connection ends.
 //!
-//! A file is a run of chunks of [`CHUNK`] bytes; a chunk is mapped into the server only
-//! while a read or a write copies through it.
+//! A file is a run of chunks that grow with it (`moruna_imagefs::chunks`), each one
+//! memory object, under the server's budget of handles. A read or a write maps only the
+//! pages of a chunk it copies through, and copies them at once: the chunks are the
+//! server's alone, since a scratch file is never mapped by a client.
 
-use alloc::{collections::BTreeMap, format, vec::Vec};
+use alloc::{format, string::String};
 
 use moruna_imagefs::{
+    chunks::{Backing, Budget, Chunked, Cost},
     error::{Error as FsError, Result},
-    scratch::{DEFAULT_QUOTA, Id, Store},
+    scratch::DEFAULT_QUOTA,
 };
-use moruna_svc::{Account, Error, Mapping, Memory, map as mapflags};
+use moruna_svc::{Account, Error, Mapping, Memory, Usage, charge, map as mapflags};
 
-/// A chunk of a scratch file: what each memory object holds.
-pub const CHUNK: u64 = 16 * 1024;
+/// What the server keeps of its own account when it carves a default one: its heap,
+/// its messages and its replies are charged there.
+const HEAP_RESERVE: u64 = 16 << 20;
 
-struct File {
-    size: u64,
-    chunks: Vec<Memory>,
+/// Where a scratch directory's chunks are made: memory objects charged to its account.
+pub struct Pages {
+    /// `None` until one is given or needed.
+    account: Option<Account>,
 }
 
-pub struct Pages {
-    /// The account the chunks are charged to; `None` until one is given or needed.
-    account: Option<Account>,
-    files: BTreeMap<Id, File>,
+/// A scratch directory's store: `account`'s, or a default one's, under `budget`.
+pub fn store(account: Option<Account>, budget: Budget) -> Chunked<Pages> {
+    Chunked::new(Pages { account }, budget)
 }
 
 fn kernel(what: &str, e: Error) -> FsError {
     match e {
-        Error::QuotaExceeded => FsError::NoSpace,
+        // The account, the handle table or the machine is full: the client's NoSpace.
+        Error::QuotaExceeded | Error::Limit | Error::NoMemory => FsError::NoSpace,
         e => FsError::Io(format!("the scratch directory's {what}: {}", e.name())),
     }
 }
 
-/// Copies `data` into a mapping from `at`, eight bytes an access where it can.
-fn copy_in(view: &Mapping<'_>, mut at: usize, data: &[u8]) -> Result<()> {
-    let fail = |e: Error| kernel("chunk", e);
-    let mut i = 0;
-    while i < data.len() && !at.is_multiple_of(8) {
-        view.write8(at, data[i]).map_err(fail)?;
-        i += 1;
-        at += 1;
-    }
-    while data.len() - i >= 8 {
-        let mut word = [0u8; 8];
-        word.copy_from_slice(&data[i..i + 8]);
-        view.write64(at, u64::from_le_bytes(word)).map_err(fail)?;
-        i += 8;
-        at += 8;
-    }
-    while i < data.len() {
-        view.write8(at, data[i]).map_err(fail)?;
-        i += 1;
-        at += 1;
-    }
-    Ok(())
+/// `len` bytes of `chunk` from `at`, mapped: the pages they lie on, and where they begin
+/// in the mapping.
+fn window(chunk: &Memory, at: u64, len: usize, flags: u64) -> Result<(Mapping<'_>, usize)> {
+    const PAGE: u64 = moruna_imagefs::chunks::PAGE;
+    let first = at / PAGE * PAGE;
+    let end = (at + len as u64).next_multiple_of(PAGE);
+    let view = chunk
+        .map(first, end - first, flags)
+        .map_err(|e| kernel("chunk", e))?;
+    Ok((view, (at - first) as usize))
 }
 
 impl Pages {
-    /// A store charging `account`, or, when `None`, an account it carves when it first
-    /// needs one.
-    pub fn new(account: Option<Account>) -> Pages {
-        Pages {
-            account,
-            files: BTreeMap::new(),
-        }
-    }
-
     fn account(&mut self) -> Result<&Account> {
         if self.account.is_none() {
+            let own = Usage::own().map_err(|e| kernel("server's account", e))?;
+            if own.room() < DEFAULT_QUOTA + HEAP_RESERVE {
+                return Err(FsError::NoSpace);
+            }
             let carved = Account::carve(DEFAULT_QUOTA, "scratch")
                 .map_err(|e| kernel(&format!("default account of {DEFAULT_QUOTA} bytes"), e))?;
             self.account = Some(carved);
         }
-        self.account.as_ref().ok_or_else(|| {
-            FsError::Io(alloc::string::String::from(
-                "the scratch directory has no account",
-            ))
-        })
-    }
-
-    /// Each chunk of file `id` that `offset .. offset + len` touches, with the range of
-    /// it: `(chunk, from, to)`, and where in the caller's buffer it begins.
-    fn spans(offset: u64, len: usize) -> impl Iterator<Item = (usize, u64, u64, usize)> {
-        let end = offset + len as u64;
-        let mut at = offset;
-        core::iter::from_fn(move || {
-            if at >= end {
-                return None;
-            }
-            let chunk = at / CHUNK;
-            let from = at % CHUNK;
-            let to = (end - chunk * CHUNK).min(CHUNK);
-            let done = (at - offset) as usize;
-            at = chunk * CHUNK + to;
-            Some((chunk as usize, from, to, done))
-        })
+        self.account
+            .as_ref()
+            .ok_or_else(|| FsError::Io(String::from("the scratch directory has no account")))
     }
 }
 
-impl Store for Pages {
-    fn resize(&mut self, id: Id, size: u64) -> Result<()> {
-        let need = usize::try_from(size.div_ceil(CHUNK)).map_err(|_| FsError::NoSpace)?;
-        let have = self.files.get(&id).map_or(0, |f| f.chunks.len());
-        let mut grown = Vec::new();
-        if need > have {
-            let account = self.account()?;
-            for _ in have..need {
-                // A refusal drops what this call made: nothing about the file changes.
-                grown.push(Memory::create_in(CHUNK, &account.0).map_err(|e| kernel("pages", e))?);
-            }
+impl Backing for Pages {
+    type Chunk = Memory;
+
+    fn cost(&self) -> Cost {
+        Cost {
+            object: charge::OBJECT,
+            page: charge::PAGE + charge::PAGE_RECORD,
         }
-        let file = self.files.entry(id).or_insert(File {
-            size: 0,
-            chunks: Vec::new(),
-        });
-        file.chunks.extend(grown);
-        if size < file.size && !size.is_multiple_of(CHUNK) {
-            // A later growth reads zeros where the cut bytes were.
-            let last = &file.chunks[need - 1];
-            let from = size % CHUNK;
-            let view = last
-                .map(0, CHUNK, mapflags::READ | mapflags::WRITE)
-                .map_err(|e| kernel("chunk", e))?;
-            let zeros = [0u8; 512];
-            let mut at = from;
-            while at < CHUNK {
-                let n = (CHUNK - at).min(zeros.len() as u64) as usize;
-                copy_in(&view, at as usize, &zeros[..n])?;
-                at += n as u64;
-            }
-        }
-        // Keep the old chunks and length if preparing the tail mapping is refused.
-        // Only release truncated storage after all fallible work has succeeded.
-        file.chunks.truncate(need);
-        file.size = size;
+    }
+
+    fn room(&mut self) -> Result<Option<u64>> {
+        // Without READ on the account its figures are unknown, and the kernel alone
+        // refuses what does not fit.
+        Ok(self.account()?.usage().ok().map(|u| u.room()))
+    }
+
+    fn create(&mut self, len: u64) -> Result<Memory> {
+        Memory::create_in(len, &self.account()?.0).map_err(|e| kernel("pages", e))
+    }
+
+    fn read(&self, chunk: &Memory, at: u64, buf: &mut [u8]) -> Result<()> {
+        let (view, from) = window(chunk, at, buf.len(), mapflags::READ)?;
+        // No other process maps a chunk and the server writes none while it reads.
+        let bytes = view.bytes().get(from..from + buf.len());
+        buf.copy_from_slice(bytes.ok_or(FsError::BadRange)?);
         Ok(())
     }
 
-    fn read(&self, id: Id, offset: u64, buf: &mut [u8]) -> Result<()> {
-        let Some(file) = self.files.get(&id) else {
-            return if buf.is_empty() {
-                Ok(())
-            } else {
-                Err(FsError::BadRange)
-            };
-        };
-        if offset + buf.len() as u64 > file.size {
-            return Err(FsError::BadRange);
-        }
-        for (chunk, from, to, done) in Pages::spans(offset, buf.len()) {
-            let view = file.chunks[chunk]
-                .map(0, CHUNK, mapflags::READ)
-                .map_err(|e| kernel("chunk", e))?;
-            let n = (to - from) as usize;
-            view.read(from as usize, &mut buf[done..done + n])
-                .map_err(|e| kernel("chunk", e))?;
-        }
+    fn write(&self, chunk: &Memory, at: u64, bytes: &[u8]) -> Result<()> {
+        let (mut view, from) = window(chunk, at, bytes.len(), mapflags::READ | mapflags::WRITE)?;
+        // The region is shared with no one: one copy hands the bytes over.
+        let region = view.shared_region().map_err(|e| kernel("chunk", e))?;
+        region
+            .get_mut(from..from + bytes.len())
+            .ok_or(FsError::BadRange)?
+            .copy_from_slice(bytes);
         Ok(())
     }
 
-    fn write(&mut self, id: Id, offset: u64, bytes: &[u8]) -> Result<()> {
-        let file = self.files.get(&id).ok_or(FsError::BadRange)?;
-        if offset + bytes.len() as u64 > file.size {
-            return Err(FsError::BadRange);
-        }
-        for (chunk, from, to, done) in Pages::spans(offset, bytes.len()) {
-            let view = file.chunks[chunk]
-                .map(0, CHUNK, mapflags::READ | mapflags::WRITE)
-                .map_err(|e| kernel("chunk", e))?;
-            let n = (to - from) as usize;
-            copy_in(&view, from as usize, &bytes[done..done + n])?;
-        }
+    fn zero(&self, chunk: &Memory, from: u64, to: u64) -> Result<()> {
+        let len = usize::try_from(to - from).map_err(|_| FsError::BadRange)?;
+        let (mut view, at) = window(chunk, from, len, mapflags::READ | mapflags::WRITE)?;
+        let region = view.shared_region().map_err(|e| kernel("chunk", e))?;
+        region
+            .get_mut(at..at + len)
+            .ok_or(FsError::BadRange)?
+            .fill(0);
         Ok(())
-    }
-
-    fn free(&mut self, id: Id) {
-        self.files.remove(&id);
     }
 }

@@ -634,22 +634,17 @@ fn drive(
     // minimum-morsel work funded, before any child is started.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if let Some(gate) = &gate {
-        let count = packaged
-            .iter()
-            .filter(|stage| stage.native_singleton())
-            .count();
+        // Each live instance of a stage is a child of its own (an image's MORUNA_PROCESSES, one
+        // task process each): the share is a child's, and each instance carves its account
+        // within it (stream E, for the gate's native tasks on every core).
+        let count = crate::native_account::native_children(
+            packaged
+                .iter()
+                .filter(|stage| stage.native_singleton())
+                .map(|stage| stage.kernel().kind()),
+        )
+        .map_err(|error| *error)?;
         if count > 0 {
-            for stage in packaged.iter().filter(|stage| stage.native_singleton()) {
-                if !matches!(stage.kernel().kind(), moruna_kernel::KernelKind::Stateful { max_instances } if max_instances.get() == 1)
-                {
-                    return Err(MorunaError::Config {
-                        name: "budget.native_children",
-                        msg: "native child share requires exactly one live instance per stage"
-                            .into(),
-                    }
-                    .into());
-                }
-            }
             let planning = moruna_controller::fixed_commitment_budget(
                 &moruna_controller::FixedCommitmentInput {
                     ceiling_bytes: limits.memory_ceiling,
@@ -1062,6 +1057,8 @@ fn drive(
     let (view, shutdown_notes) = started.unwind();
 
     notes.extend(shutdown_notes);
+    // stream P: each native stage's tasks, once they have ended (E's gate shows them).
+    notes.extend(packaged.iter().filter_map(|stage| stage.task_note()));
     // Stream C (data OS, C3): a completed run's outputs are one layer on `disk.out`.
     let layer_failure = data_os::finish(
         granted.as_ref(),

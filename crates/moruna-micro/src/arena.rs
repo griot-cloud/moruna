@@ -2,12 +2,14 @@
 //! C's module. Only stream C writes this file.
 //!
 //! On the Moruna kernel the arena's host regions are DMA memory objects charged to the
-//! engine's own account (the run's), made when the run starts and mapped once, with large
-//! pages and every page present (`map::HUGE | map::POPULATE`, contract C4). Until stream A
-//! answers those flags the objects are mapped plainly, and their pages still never fault: the
-//! kernel allocates a memory object's pages, zeroed, when it is made, and fills every page
-//! table entry when it is mapped. Nothing is given back while the run lasts, so a page the
-//! arena reuses is never zeroed again.
+//! engine's own account (the run's), each mapped once, with large pages and every page present
+//! (`map::HUGE | map::POPULATE`, contract C4). Where the kernel refuses those flags the objects
+//! are mapped plainly, and their pages still never fault: the kernel allocates a memory
+//! object's pages, zeroed, when it is made, and fills every page table entry when it is
+//! mapped. The arena makes a small object when the run starts and one more each time an
+//! allocation finds the ones made full, each as large as all before it, up to its budget, so a
+//! run pays for zeroing what it uses, not what it may use.
+//! Nothing is given back while the run lasts, so a page the arena reuses is never zeroed again.
 //!
 //! [`Objects`] is the arena's [`HostBacking`]. [`Pins`] gives one device the arena's pages:
 //! each region is pinned through the device's DMA resource once, the first time an operation

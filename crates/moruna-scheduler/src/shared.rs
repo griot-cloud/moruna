@@ -93,6 +93,8 @@ pub(crate) struct Slot {
 pub(crate) struct InstancePool {
     pub(crate) slots: Mutex<Vec<Slot>>,
     pub(crate) max: usize,
+    // stream P: where the next dealt batch goes, for a kernel that deals its instances.
+    pub(crate) dealt: std::sync::atomic::AtomicUsize,
 }
 
 /// One kernel stage: the kernel, its instance pool and its counters (e.3).
@@ -555,6 +557,7 @@ impl Shared {
                         Some(InstancePool {
                             slots: Mutex::new(slots),
                             max,
+                            dealt: std::sync::atomic::AtomicUsize::new(0),
                         })
                     }
                 };

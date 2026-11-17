@@ -41,6 +41,8 @@ mod sc_t44_a_refused_output_asks_for_room;
 mod sc_t45_an_immovable_wall_ends_the_run;
 mod sc_t46_a_stuck_sink_is_flushed;
 mod sc_t4_one_record_per_morsel_stage;
+// stream P: a native stage's instances fed in turn.
+mod sc_p_dealt_instances;
 mod sc_t5_knobs_immediate;
 mod sc_t6_instance_affinity;
 mod sc_t7_error_policies;

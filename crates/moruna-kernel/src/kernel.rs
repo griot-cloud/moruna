@@ -333,4 +333,13 @@ pub trait Kernel: Send + Sync + 'static {
         let _ = instance;
         None
     }
+    // stream P (architecture/data-os.md section 5): a native stage's instances fed in turn.
+    /// Whether the stage's free instances take its batches in turn, whichever worker brings
+    /// them (f.4). For a kernel whose instances run apart from the engine and keep batches in
+    /// flight of their own, an image's task processes: such an instance has no cache on a
+    /// worker to keep warm, and one worker can keep every instance busy. `false` for every
+    /// kernel that does not say otherwise: a worker keeps the instance it last held.
+    fn deals_instances(&self) -> bool {
+        false
+    }
 }

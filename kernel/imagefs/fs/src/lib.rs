@@ -9,7 +9,9 @@
 //! - [`cache`]: the bounded page cache that reads a page only when it is touched and
 //!   believes it only once it matches its hash;
 //! - [`map`]: how a mapping of a file's pages is filled;
-//! - [`scratch`]: the per-task writable directory, and the store that meters its bytes.
+//! - [`scratch`]: the per-task writable directory, and the store that meters its bytes;
+//! - [`chunks`]: a scratch file's bytes as a run of growing chunks, under a budget of
+//!   handles.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -17,6 +19,7 @@
 extern crate alloc;
 
 pub mod cache;
+pub mod chunks;
 pub mod error;
 pub mod format;
 pub mod fs;

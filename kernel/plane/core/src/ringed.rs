@@ -320,6 +320,17 @@ impl<C: RingCalls> RingPlane<C> {
         t.engine.exit(&*o.view)
     }
 
+    /// Places ring task `task` on `cpu` before it starts, or nowhere in particular with `None`
+    /// (`ring::layout::PLACE`): the task pins its thread there as it attaches.
+    pub fn place(&mut self, task: TaskId, cpu: Option<u32>) -> Result<(), PlaneError> {
+        let t = self.tasks.get(&task.0).ok_or(PlaneError::Unknown("task"))?;
+        let Some(Owner::Rings(o)) = self.owners.get(&t.rings) else {
+            return Err(PlaneError::Unknown("rings"));
+        };
+        t.engine.place(&*o.view, cpu);
+        Ok(())
+    }
+
     /// Whether `task` is a ring task.
     pub fn is_ring(&self, task: TaskId) -> bool {
         self.tasks.contains_key(&task.0)

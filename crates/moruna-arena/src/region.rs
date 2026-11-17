@@ -47,10 +47,11 @@ pub fn syscall_counts() -> SyscallCounts {
     }
 }
 
-/// Memory granted to the process at start, which the host regions are carved from in place
-/// of mappings of the arena's own (`architecture/data-os.md` §3, contract C4): every page is
-/// present when it is given, so no buffer faults on it, and none is given back while the run
-/// lasts, so none is zeroed again when it is reused.
+/// Memory granted to the process, which the host regions are carved from in place of mappings
+/// of the arena's own (`architecture/data-os.md` §3, contract C4): one region at start, and one
+/// more each time the run first needs it. Every page is present when it is given, so no buffer
+/// faults on it, and none is given back while the run lasts, so none is zeroed again when it
+/// is reused.
 pub trait HostBacking: Send + Sync {
     /// The most bytes one region may have.
     fn region_max(&self) -> u64;

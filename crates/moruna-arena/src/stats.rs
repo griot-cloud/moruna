@@ -87,6 +87,8 @@ impl Inner {
         for region in &self.devices {
             double_release += region.space.double_releases();
         }
+        // The next region a granted arena would make serves an allocation as well as any made.
+        let largest_free = largest_free.max(self.next_region());
         ArenaStats {
             slabs_by_class,
             largest_free,

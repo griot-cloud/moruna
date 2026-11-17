@@ -58,6 +58,12 @@ pub mod layout {
     pub const MODE: usize = 72;
     /// Raised each time the engine hands the task a new rings object (unmap mode).
     pub const GENERATION: usize = 80;
+    /// The CPU the engine places the task on, plus one; zero leaves it where the kernel put
+    /// it. The task pins its thread there as it attaches (`moruna_sys::plane::Rings`): the
+    /// kernel keeps a thread on the CPU it first ran on, and a stage's tasks, each started
+    /// while the others slept, all went to one CPU (the NYC gate, 2026-11-17). A word of
+    /// protocol 4 that a task of an older engine reads as zero.
+    pub const PLACE: usize = 88;
 
     // The moving words, a cache line each.
     /// Input entries the engine has posted.
@@ -354,6 +360,7 @@ impl Engine {
             TASK_NOTE,
             TASK_EXIT,
             TASK_EXIT_CODE,
+            PLACE,
         ] {
             s.store(at, 0);
         }
@@ -564,6 +571,12 @@ impl Engine {
         changed
     }
 
+    /// Places the task on `cpu`, before it starts, or nowhere in particular with `None`
+    /// ([`PLACE`]).
+    pub fn place(&self, s: &impl Shared, cpu: Option<u32>) {
+        s.store(PLACE, cpu.map_or(0, |c| u64::from(c) + 1));
+    }
+
     /// The exit code the task said, if it said one ([`Task::exit`]). The task wrote it, so
     /// it is only the task's word: the engine judges the task by what it put.
     pub fn exit(&self, s: &impl Shared) -> Option<i64> {
@@ -595,6 +608,8 @@ pub struct Task {
     engine_bell: u32,
     /// The task's note as it last raised it.
     note: u64,
+    /// The CPU the engine placed the task on ([`PLACE`]), as the task attached.
+    pub place: Option<u32>,
 }
 
 impl Task {
@@ -602,6 +617,10 @@ impl Task {
     pub fn attach(s: &impl Shared) -> Result<Task, Bad> {
         let (geometry, mode) = Geometry::read(s)?;
         let t = Task {
+            place: match s.load(PLACE) {
+                0 => None,
+                v => u32::try_from(v - 1).ok(),
+            },
             geometry,
             mode,
             generation: s.load(GENERATION),

@@ -244,6 +244,10 @@ impl Kernel for GuardedKernel {
     fn waiting_state(&self, instance: usize) -> Option<Vec<u8>> {
         self.inner.waiting_state(instance)
     }
+    // stream P: a native stage's instances fed in turn.
+    fn deals_instances(&self) -> bool {
+        self.inner.deals_instances()
+    }
 }
 
 /// A source whose every batch is checked by its task's [`GivesGuard`].

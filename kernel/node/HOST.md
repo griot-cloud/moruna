@@ -54,6 +54,8 @@ moruna run --vm JOB.json [--image node-image.json] [the options above]
   the executable's `bin`: `kernel/tools/build.sh`'s output, with `kernel/node/tools/node-for-job.py`
   and `configure.py` in its `node/tools/` and `kernel/node/standalone.image` in its `node/`.
   `--image-stack` attaches other image layers (a `moruna-layer stack` directory) than the kit's.
+  A stack whose lowest layer is on `block0` is attached alone; the kit's own (`node-linux`, from
+  `block2`) has the kit's two image filesystem fixtures below it, which no job reads.
 - **The launch witness** is `--launch-witness`, else `$XDG_STATE_HOME/moruna/launches` (or
   `~/.local/state/moruna/launches`).
 - **The output directory** is new or empty; when the job completes, the output layer on the

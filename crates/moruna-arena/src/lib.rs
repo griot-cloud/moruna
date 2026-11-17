@@ -15,6 +15,12 @@
 //! marks the newest grown regions *draining*: they take no new allocation, and each is unmapped
 //! when its last buffer comes home. Neither method is on the contract's
 //! `Allocator`, so no consumer can call them: they are the facade's alone (MH 4.4).
+//!
+//! On granted memory ([`Arena::with_backing`]) the budget is the arena's from the start, as a
+//! mapping's address space is, and its memory is made as the run first needs it: a small
+//! region at start, and one more each time an allocation finds the regions made so far full,
+//! each as large as all before it. A mapping's pages come the same way, when a buffer first
+//! lands on them (RB4).
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -30,7 +36,7 @@ pub mod region;
 mod stats;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use moruna_kernel::{
     AllocStats, Allocator, Buffer, DeviceId, Guarantee, MorunaError, Result, Tier, TierKind,
@@ -91,6 +97,12 @@ impl Default for ArenaConfig {
 /// huge pages when the host has them and a small change of the budget is never a region.
 pub const REGION_ROUNDING: u64 = 2 * 1024 * 1024;
 
+/// The region a granted arena makes at start, when its budget is larger. Each later region is
+/// as large as all made before it, up to the backing's largest, so the memory made follows
+/// what the run uses and not its budget: a run that needs 20 MiB of a 20 GiB budget makes
+/// 32 MiB, and one that needs 3 GiB makes at most one backing region more than that.
+pub const FIRST_GRANTED_REGION: u64 = 32 * 1024 * 1024;
+
 /// One host region: the region `new` reserved, or one `grow` added.
 struct HostRegion {
     space: Space,
@@ -100,8 +112,9 @@ struct HostRegion {
     /// Set by `shrink`: the region takes no new allocation and is unmapped when its last buffer
     /// is released.
     draining: AtomicBool,
-    /// True for the region `new` made. It never drains: the run's first region is what every
-    /// zero-length buffer points into, and the budget arithmetic of 11 f.1 sized it.
+    /// True for the region `new` made, and for each region a granted arena made out of its
+    /// budget. None drains: the run's first region is what every zero-length buffer points
+    /// into, and the budget arithmetic of 11 f.1 sized them all.
     base: bool,
     /// True for a side region (RB5, [`Inner::alloc_side`]): one large buffer the other regions
     /// had room for by charge but not in one piece. Draining from birth, so it takes nothing
@@ -166,6 +179,15 @@ struct Inner {
     /// Where host regions come from when the process does not map them itself (the data OS's
     /// granted memory objects); `None` maps them with `mmap`.
     backing: Option<Arc<dyn HostBacking>>,
+    /// Host bytes of the budget not yet made into regions: granted memory only, and zero once
+    /// the run has needed all of it. Changed only under the host write lock, so a reader that
+    /// holds the read lock sees it and the regions agree.
+    uncommitted: AtomicU64,
+    /// The host budget a granted arena makes its regions out of; zero for a mapped arena.
+    granted_budget: u64,
+    /// Held while a region is made out of `uncommitted`, so two allocations that both find the
+    /// regions full make one region, not two.
+    committing: Mutex<()>,
 }
 
 /// The memory arena (d.1).
@@ -181,11 +203,17 @@ impl Arena {
         Arena::build(cfg, None)
     }
 
-    /// Reserve the host budget on memory `backing` grants, in regions of at most its largest,
-    /// and every device region as [`Arena::new`] does. The regions are the run's fixed budget:
-    /// none drains, and no page of them is given back, so a reused page is never zeroed again
-    /// (`architecture/data-os.md` C4). `pretouch` and `memlock` do not apply: the backing's
-    /// pages are present and resident when it gives them.
+    /// Reserve the host budget on memory `backing` grants, and every device region as
+    /// [`Arena::new`] does. The budget is the arena's capacity from the start, but only its
+    /// first region, [`FIRST_GRANTED_REGION`] at most, is made now: each further region is made
+    /// when an allocation finds the regions made so far full, as large as all made before it and
+    /// at most the backing's largest, until the budget is made. What is made follows what the
+    /// run uses, never more than twice it or one backing region more: a run that needs a few
+    /// hundred megabytes of a 20 GiB budget makes a few hundred megabytes, and does not wait
+    /// for the rest to be zeroed before its first batch. The regions are the
+    /// run's fixed budget: none drains, and no page of them is given back, so a reused page is
+    /// never zeroed again (`architecture/data-os.md` C4). `pretouch` and `memlock` do not
+    /// apply: the backing's pages are present and resident when it gives them.
     pub fn with_backing(cfg: ArenaConfig, backing: Arc<dyn HostBacking>) -> Result<Arc<Arena>> {
         Arena::build(cfg, Some(backing))
     }
@@ -242,6 +270,7 @@ impl Arena {
                 ),
             });
         }
+        let mut uncommitted = 0;
         let (hosts, pinned) = match &backing {
             None => {
                 let host = region::new_host(
@@ -255,11 +284,16 @@ impl Arena {
                 let pinned = host.pinned;
                 (vec![host], pinned)
             }
-            // Granted memory is resident: a run whose tier is page-locked has it so.
-            Some(backing) => (
-                granted(backing.as_ref(), host_bytes, align)?,
-                host_tier == Tier::PinnedHost,
-            ),
+            // Granted memory is resident: a run whose tier is page-locked has it so. One region
+            // now; the rest of the budget as the run needs it (`Inner::alloc_committed`).
+            Some(backing) => {
+                let first = host_bytes
+                    .min(FIRST_GRANTED_REGION)
+                    .min(region::granted_chunk(backing.as_ref(), align));
+                let hosts = granted(backing.as_ref(), first, align)?;
+                uncommitted = host_bytes - first;
+                (hosts, host_tier == Tier::PinnedHost)
+            }
         };
         let huge_pages_active = hosts.iter().all(|h| h.huge_pages_active);
         let host_tier = if pinned { Tier::PinnedHost } else { Tier::Host };
@@ -283,6 +317,7 @@ impl Arena {
             })
             .collect();
         let devices = Self::devices(&cfg, align)?;
+        let granted_budget = if backing.is_some() { host_bytes } else { 0 };
         tracing::info!(
             target: "arena.reserved",
             host_bytes,
@@ -290,6 +325,7 @@ impl Arena {
             huge_pages = huge_pages_active,
             regions = host_allocs.len(),
             granted = backing.is_some(),
+            uncommitted,
             devices = devices.len(),
             "arena reserved"
         );
@@ -317,6 +353,9 @@ impl Arena {
                 side_made: AtomicU64::new(0),
                 retired_double_release: AtomicU64::new(0),
                 backing,
+                uncommitted: AtomicU64::new(uncommitted),
+                granted_budget,
+                committing: Mutex::new(()),
             }),
         }))
     }
@@ -558,10 +597,13 @@ impl Arena {
     }
 
     /// Bytes reserved for `tier`; zero for a tier this arena has no region for (d.1). For the
-    /// host tier, every region still mapped, draining ones included, because they are resident.
+    /// host tier, every region still mapped, draining ones included, because they are resident,
+    /// and the budget a granted arena has yet to make into regions, because it is the arena's.
     pub fn region_bytes(&self, tier: Tier) -> u64 {
         if self.inner.is_host(tier) {
-            return self.inner.read_host().iter().map(|r| r.space.bytes()).sum();
+            let host = self.inner.read_host();
+            let mapped: u64 = host.iter().map(|r| r.space.bytes()).sum();
+            return mapped + self.inner.uncommitted.load(Ordering::SeqCst);
         }
         match self.inner.space_of(tier) {
             Some(space) => space.bytes(),
@@ -582,17 +624,18 @@ impl Arena {
     }
 
     /// Largest single allocation currently possible in `tier`, for controller diagnostics
-    /// (d.1, f.5). A draining region serves nothing, so it is not counted.
+    /// (d.1, f.5). A draining region serves nothing, so it is not counted; the next region a
+    /// granted arena would make is.
     pub fn largest_free(&self, tier: Tier) -> u64 {
         if self.inner.is_host(tier) {
-            return self
-                .inner
-                .read_host()
+            let host = self.inner.read_host();
+            return host
                 .iter()
                 .filter(|r| !r.draining.load(Ordering::SeqCst))
                 .map(|r| r.space.largest_free())
                 .max()
-                .unwrap_or(0);
+                .unwrap_or(0)
+                .max(self.inner.next_region());
         }
         match self.inner.space_of(tier) {
             Some(space) => space.largest_free(),
@@ -603,6 +646,13 @@ impl Arena {
     /// The arena's own figures for the run report (section j).
     pub fn arena_stats(&self) -> ArenaStats {
         self.inner.arena_stats()
+    }
+
+    /// Host bytes of the budget a granted arena has not yet made into regions: they are the
+    /// arena's, and made when an allocation first needs them. Zero for an arena that maps its
+    /// own regions, whose pages come when a buffer first lands on them instead.
+    pub fn uncommitted_bytes(&self) -> u64 {
+        self.inner.uncommitted.load(Ordering::SeqCst)
     }
 }
 
@@ -748,17 +798,120 @@ impl Inner {
             .iter()
             .filter(|r| !r.draining.load(Ordering::SeqCst))
             .map(|r| r.space.bytes())
-            .sum();
+            .sum::<u64>()
+            + self.uncommitted.load(Ordering::SeqCst);
         let in_use = host.iter().map(|r| r.space.in_use()).sum();
         Err((budget, in_use))
     }
 
-    /// Host bytes in the regions that serve allocations: neither draining nor side regions.
+    /// Host bytes in the regions that serve allocations, neither draining nor side regions,
+    /// and in the budget a granted arena has yet to make into regions.
     fn live_capacity(&self, host: &[Arc<HostRegion>]) -> u64 {
         host.iter()
             .filter(|r| !r.side && !r.draining.load(Ordering::SeqCst))
             .map(|r| r.space.bytes())
-            .sum()
+            .sum::<u64>()
+            + self.uncommitted.load(Ordering::SeqCst)
+    }
+
+    /// The largest region a granted arena could still make out of its budget, and so the
+    /// largest allocation one more region could serve; zero when there is none to make.
+    fn next_region(&self) -> u64 {
+        match &self.backing {
+            Some(backing) => self
+                .uncommitted
+                .load(Ordering::SeqCst)
+                .min(region::granted_chunk(backing.as_ref(), self.align)),
+            None => 0,
+        }
+    }
+
+    /// The bytes of the region a granted arena makes for an allocation charged `charge`: as
+    /// large as all it has made of its budget so far, so what it has made is never more than
+    /// twice what the run needed, or one backing region more; at least `charge` and
+    /// [`FIRST_GRANTED_REGION`]; at most the backing's largest and what is left of the budget.
+    fn region_for(&self, charge: u64) -> u64 {
+        let left = self.uncommitted.load(Ordering::SeqCst);
+        let made = self.granted_budget.saturating_sub(left);
+        made.max(region::align_up(charge, self.align))
+            .max(FIRST_GRANTED_REGION)
+            .min(self.next_region())
+    }
+
+    /// A host allocation the regions made so far cannot serve, served from one more region made
+    /// now out of the budget a granted arena has not yet made (`Arena::with_backing`). The
+    /// region is sized by `region_for`, and serves every later allocation too: none drains, and the budget's arithmetic is unchanged, because the
+    /// budget counted it from the start. `None` when there is nothing left to make, the budget
+    /// has no room for `bytes`, or one more region would not hold them in one piece (a side
+    /// region may, `alloc_side`). `seen` is what was left to make before the caller's
+    /// `alloc_host`: when it was nothing, that call saw every region there will be.
+    fn alloc_committed(&self, bytes: u64, seen: u64) -> Option<(*mut u8, Tier)> {
+        let backing = self.backing.as_ref()?;
+        if seen == 0 {
+            return None;
+        }
+        // One region at a time. An allocation that waited here finds the region the one before
+        // it made, and makes none of its own.
+        let _committing = self.committing.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(served) = self.alloc_host(bytes) {
+            return Some(served);
+        }
+        let charge = crate::classes::charge_of(bytes);
+        let take = self.region_for(charge);
+        if take < GRANULE || charge > take {
+            return None;
+        }
+        {
+            let host = self.read_host();
+            let in_use: u64 = host.iter().map(|r| r.space.in_use()).sum();
+            let limit = self
+                .live_capacity(&host)
+                .min(self.host_cap.load(Ordering::SeqCst));
+            if in_use.saturating_add(charge) > limit {
+                return None;
+            }
+        }
+        let made = match region::new_granted(backing.as_ref(), take, self.align) {
+            Ok(made) => made,
+            Err(e) => {
+                tracing::warn!(target: "arena.commit", bytes = take, error = %e, "the backing refused a region of the budget");
+                return None;
+            }
+        };
+        let region = Arc::new(HostRegion {
+            space: Space::new(
+                made.mapping.base(),
+                made.mapping.bytes(),
+                self.host_tier,
+                made.mapping.bytes() < SMALL_BUDGET_BYTES,
+                Arc::clone(&self.host_watermark),
+            ),
+            _mapping: made.mapping,
+            draining: AtomicBool::new(false),
+            base: true,
+            side: false,
+        });
+        // Served before the region is seen, so the allocation that made it is the one it serves.
+        let served = region
+            .space
+            .alloc(bytes)
+            .ok()
+            .map(|(ptr, _)| (ptr, self.host_tier));
+        {
+            let mut host = self.write_host();
+            // After the budget's other regions and before any grown one, so the regions a shrink
+            // would pick are still the last to fill.
+            let at = host.iter().position(|r| !r.base).unwrap_or(host.len());
+            host.insert(at, region);
+            self.uncommitted.fetch_sub(take, Ordering::SeqCst);
+        }
+        tracing::info!(
+            target: "arena.commit",
+            bytes = take,
+            uncommitted = self.uncommitted.load(Ordering::SeqCst),
+            "the arena made a region of its budget"
+        );
+        served
     }
 
     /// RB5 (2026-11-14): a large host request the regions have room for by charge but not in
@@ -843,7 +996,8 @@ impl Allocator for Arena {
                 .filter(|r| r.side)
                 .map(|r| r.space.in_use())
                 .sum();
-            let bytes = bytes.min(self.inner.host_cap.load(Ordering::SeqCst));
+            let bytes = (bytes + self.inner.uncommitted.load(Ordering::SeqCst))
+                .min(self.inner.host_cap.load(Ordering::SeqCst));
             return Some(bytes.saturating_sub(in_use.saturating_add(side)));
         }
         self.inner
@@ -869,8 +1023,11 @@ impl Allocator for Arena {
         }
         let inner = &self.inner;
         let served = if inner.is_host(tier) {
+            // Read before the regions are, so a region made while they are searched is found.
+            let seen = inner.uncommitted.load(Ordering::SeqCst);
             inner
                 .alloc_host(bytes as u64)
+                .or_else(|refused| inner.alloc_committed(bytes as u64, seen).ok_or(refused))
                 .or_else(|refused| inner.alloc_side(bytes as u64).ok_or(refused))
         } else {
             match inner.space_of(tier) {

@@ -143,19 +143,19 @@ products are most of Score's time: 9.7 billion multiply-adds for these rows.
 ## The native tasks
 
 `tasks/build.sh` builds `gate-JOB` for the seven jobs as `kernel/tools/build.sh` builds the
-kernel's programs: the kernel's nightly, core and alloc from source, the user linker script.
-Each task takes its plane, then for each batch of input slot 0 writes the job's output record into
-a window of output slot 1 and puts it (`record::apply`, which has the shape of stream P's
-`Rings::step`). A 0.7 job names the task as an `image` function with `command: ["/gate-JOB"]` and
-`plane: true` (`bench/vm/gate_jobs.py`).
+kernel's programs: the kernel's nightly, core and alloc from source, the user linker script, and
+the gate's one CPU setting. Each task runs in ring mode (stream P's `moruna_sys::plane::Rings`):
+it maps its region and its rings object once, answers each batch through `Rings::step_parts`
+(`record::parts`: one record when the answer fits a window, several in order when it does not,
+the rows after the first part copied out of the input and carried), says a refusal's reason in its
+log (`moruna_sys::plane::Log`), and says its exit code on its rings as it ends.
 
-What the task API on this base cannot yet express, reported to the integrator:
-
-- **Starting a native program.** On the kernel an `image` entry's command starts through the Linux
-  personality (`moruna-micro`'s `ImageTask`); a native program needs the runner to start it as a
-  process of the kernel with its plane attached.
-- **An output larger than its window.** A task answers one batch with one record in one window.
-  Enrich's output is larger than its input (four more columns), so the engine must size windows
-  from the stage's amplification, or let a task put several records for one batch.
-- **The task's log.** A refusal is written to the console when the manifest gives the task one;
-  a task has no log ring of its own through `moruna_sys` yet.
+A 0.7 job names the task as an `image` function with `command: ["/gate-JOB"]`, `plane: true` and
+`abi: "moruna"` (`bench/vm/gate_jobs.py`): the engine checks the program is of the kernel's user
+target and starts it itself, with no Linux personality (stream P). `tasks/image.sh` builds the
+gate image: the seven tasks at its root, derived as the node's image is, its environment declaring
+`MORUNA_PROCESSES` (the task processes a stage runs; a job entry cannot set a `MORUNA_` name), and
+writes the layer stack `moruna run --image-stack` attaches, with its digest in `image.digest`. The
+image carries the engine (`/moruna/bin/moruna-engine`), since it replaces the kit's, and its
+lowest layer is on `block0`, so the node attaches it alone, without the kit's two image filesystem
+fixtures (`layers/layer-1.img` and `layer-2.img`, 106 MB) no job reads.

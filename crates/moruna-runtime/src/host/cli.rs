@@ -1525,7 +1525,13 @@ fn run_vm(
         });
         // A run that did not complete keeps its node's logs (the guest's serial console, QEMU's
         // and the vsock back end's), since the run's directory goes with the node.
-        if !matches!(result, Ok(ref s) if s.code == exit::COMPLETED) {
+        // The gate keeps every run's node logs beside its results (stream E): a directory in
+        // MORUNA_KEEP_NODE_LOGS gets them whatever the run's end.
+        if let Some(keep) = std::env::var_os("MORUNA_KEEP_NODE_LOGS") {
+            if let Err(why) = keep_diagnostics(run.runtime_dir(), std::path::Path::new(&keep)) {
+                eprintln!("moruna run --vm: the node's logs were not kept: {why}");
+            }
+        } else if !matches!(result, Ok(ref s) if s.code == exit::COMPLETED) {
             let kept = std::env::temp_dir().join(format!("moruna-diagnostics-{name}"));
             match keep_diagnostics(run.runtime_dir(), &kept) {
                 Ok(()) => eprintln!(
