@@ -118,6 +118,20 @@ class NodeSizes(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "2 MiB"):
             self.tool.sizes(gib, gib, 24 * gib + 4096)
 
+    def test_a_stack_from_block0_is_attached_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build, stack = Path(tmp), Path(tmp) / "stack.layers"
+            fixtures = [build / "layers/layer-1.img", build / "layers/layer-2.img"]
+            stack.write_text("moruna-layers 1\nlayer block0 aa\nlayer block1 bb\n")
+            self.assertEqual(self.tool.kit_layers(build, stack), [])
+            stack.write_text("moruna-layers 1\nlayer block2 aa\n")
+            self.assertEqual(self.tool.kit_layers(build, stack), fixtures)
+            for text, refused in (("moruna-layers 1\nlayer block1 aa\n", "block1"),
+                                  ("moruna-layers 1\n", "no layer")):
+                stack.write_text(text)
+                with self.assertRaisesRegex(ValueError, refused):
+                    self.tool.kit_layers(build, stack)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -155,4 +155,7 @@ A 0.7 job names the task as an `image` function with `command: ["/gate-JOB"]`, `
 target and starts it itself, with no Linux personality (stream P). `tasks/image.sh` builds the
 gate image: the seven tasks at its root, derived as the node's image is, its environment declaring
 `MORUNA_PROCESSES` (the task processes a stage runs; a job entry cannot set a `MORUNA_` name), and
-writes the layer stack `moruna run --image-stack` attaches, with its digest in `image.digest`.
+writes the layer stack `moruna run --image-stack` attaches, with its digest in `image.digest`. The
+image carries the engine (`/moruna/bin/moruna-engine`), since it replaces the kit's, and its
+lowest layer is on `block0`, so the node attaches it alone, without the kit's two image filesystem
+fixtures (`layers/layer-1.img` and `layer-2.img`, 106 MB) no job reads.
