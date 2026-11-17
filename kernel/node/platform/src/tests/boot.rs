@@ -81,9 +81,12 @@ impl Booted {
     }
 }
 
+/// The node's memory in these boots, as the supervisor gives it.
+const MEMORY: u64 = 8 << 30;
+
 const INPUTS: Inputs = Inputs {
     started_ns: 0,
-    memory_bytes: Some(8 << 30),
+    memory_bytes: MEMORY,
 };
 
 /// Boots against `network`, with `api` changed by `prepare` from one that answers `ready`.
@@ -160,12 +163,14 @@ fn a_node_on_openstack_hands_over_and_says_it_is_ready() {
     assert_eq!(
         handover,
         Handover {
-            config: NodeConfig::validate(RECORDED_CONFIG.as_bytes(), None).unwrap(),
+            config: NodeConfig::validate(RECORDED_CONFIG.as_bytes(), MEMORY).unwrap(),
             instance: RECORDED_OPENSTACK_ID.to_string(),
             cloud: Cloud::OpenStack,
             // The Date of the answer that named the cloud, and when that answer arrived.
             wall_clock: RECORDED_OPENSTACK_TIME,
             read_at_ns: 4 * MS,
+            // The node's memory the supervisor gave.
+            memory_bytes: MEMORY,
         }
     );
     // The cloud's line, then the hand-over, then, once api has answered, the ready line: three
@@ -194,7 +199,7 @@ fn a_node_on_azure_hands_over_and_says_it_is_ready() {
     assert_eq!(handover.wall_clock, RECORDED_OPENSTACK_TIME + 2);
     assert_eq!(
         handover.config,
-        NodeConfig::validate(RECORDED_CONFIG.as_bytes(), None).unwrap()
+        NodeConfig::validate(RECORDED_CONFIG.as_bytes(), MEMORY).unwrap()
     );
     assert_eq!(
         booted.events,
@@ -304,7 +309,7 @@ fn the_function_cache_needs_the_node_s_memory() {
         256 << 20
     );
     let small = Inputs {
-        memory_bytes: Some(256 << 20),
+        memory_bytes: 256 << 20,
         ..INPUTS
     };
     assert_eq!(
@@ -312,19 +317,20 @@ fn the_function_cache_needs_the_node_s_memory() {
         "moruna: fatal config: `functions.cache_bytes` is 268435456: the most is 134217728, \
          half the node's memory"
     );
-    let unknown = Inputs {
-        memory_bytes: None,
-        ..INPUTS
+    // A config that leaves the cache at its default takes 1 GiB or half the node's memory, and
+    // `api` is handed the memory it was judged on.
+    let default = |memory_bytes| {
+        let network = FakeNetwork::serving(&FakeClock::default(), |_, sent| openstack(sent));
+        let inputs = Inputs {
+            memory_bytes,
+            ..INPUTS
+        };
+        let handover = boot_with(network, inputs, |_| {}).result.unwrap();
+        assert_eq!(handover.memory_bytes, memory_bytes);
+        handover.config.functions.cache_bytes
     };
-    assert_eq!(
-        boot_with(network(), unknown, |_| {}).line(),
-        "moruna: fatal config: `functions.cache_bytes` cannot be checked: the node's memory is \
-         not known"
-    );
-    // A config that leaves the cache at its default boots without the node's memory.
-    let network = FakeNetwork::serving(&FakeClock::default(), |_, sent| openstack(sent));
-    let booted = boot_with(network, unknown, |_| {});
-    assert_eq!(booted.result.unwrap().config.functions.cache_bytes, 1 << 30);
+    assert_eq!(default(MEMORY), 1 << 30);
+    assert_eq!(default(1_500_000_000), 750_000_000);
 }
 
 #[test]
@@ -348,11 +354,12 @@ fn a_config_too_large_to_hand_over_is_fatal() {
     assert!(config.len() > 64 * 1024 && config.len() < 1 << 20);
     let booted = boot(openstack_with(config.as_bytes()));
     let Err(HandoverError::TooLarge(bytes)) = (Handover {
-        config: NodeConfig::validate(config.as_bytes(), None).unwrap(),
+        config: NodeConfig::validate(config.as_bytes(), MEMORY).unwrap(),
         instance: RECORDED_OPENSTACK_ID.to_string(),
         cloud: Cloud::OpenStack,
         wall_clock: RECORDED_OPENSTACK_TIME,
         read_at_ns: 0,
+        memory_bytes: MEMORY,
     })
     .encode() else {
         panic!("the hand-over fits");

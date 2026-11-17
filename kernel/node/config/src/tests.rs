@@ -46,7 +46,7 @@ fn tls() -> (String, String) {
 }
 
 fn validate(text: &str) -> Result<NodeConfig, Refusal> {
-    NodeConfig::validate(text.as_bytes(), Some(MEMORY))
+    NodeConfig::validate(text.as_bytes(), MEMORY)
 }
 
 fn refusal(text: &str) -> Refusal {
@@ -301,7 +301,7 @@ fn a_missing_config_and_one_that_is_not_json_are_refused() {
         assert!(matches!(refusal(text), Refusal::NotJson(_)), "{text:?}");
     }
     assert!(matches!(
-        NodeConfig::validate(b"{\"moruna\":1,\"api\":\"\xff\"}", Some(MEMORY)),
+        NodeConfig::validate(b"{\"moruna\":1,\"api\":\"\xff\"}", MEMORY),
         Err(Refusal::NotJson(_))
     ));
     assert_eq!(
@@ -584,22 +584,22 @@ fn tls_is_certificate_blocks_and_one_private_key_block() {
 #[test]
 fn the_function_cache_is_whole_mib_from_64_mib_to_half_the_node_s_memory() {
     let sized = |bytes: u64| with(&format!(r#","functions":{{"cache_bytes":{bytes}}}"#));
-    let cache = |bytes: u64, memory: Option<u64>| {
+    let cache = |bytes: u64, memory: u64| {
         NodeConfig::validate(sized(bytes).as_bytes(), memory).map(|c| c.functions.cache_bytes)
     };
-    assert_eq!(cache(64 << 20, Some(MEMORY)), Ok(64 << 20));
-    assert_eq!(cache(MEMORY / 2, Some(MEMORY)), Ok(MEMORY / 2));
+    assert_eq!(cache(64 << 20, MEMORY), Ok(64 << 20));
+    assert_eq!(cache(MEMORY / 2, MEMORY), Ok(MEMORY / 2));
     assert_eq!(
-        cache((64 << 20) + 1, Some(MEMORY)),
+        cache((64 << 20) + 1, MEMORY),
         Err(Refusal::CacheNotMib((64 << 20) + 1))
     );
-    assert_eq!(cache(0, Some(MEMORY)), Err(Refusal::CacheTooSmall(0)));
+    assert_eq!(cache(0, MEMORY), Err(Refusal::CacheTooSmall(0)));
     assert_eq!(
-        cache(63 << 20, Some(MEMORY)),
+        cache(63 << 20, MEMORY),
         Err(Refusal::CacheTooSmall(63 << 20))
     );
     assert_eq!(
-        cache(MEMORY / 2 + (1 << 20), Some(MEMORY)),
+        cache(MEMORY / 2 + (1 << 20), MEMORY),
         Err(Refusal::CacheTooLarge {
             given: MEMORY / 2 + (1 << 20),
             most: MEMORY / 2
@@ -607,33 +607,36 @@ fn the_function_cache_is_whole_mib_from_64_mib_to_half_the_node_s_memory() {
     );
     // A node of 100 MiB has no room for the least cache.
     assert_eq!(
-        cache(64 << 20, Some(100 << 20)),
+        cache(64 << 20, 100 << 20),
         Err(Refusal::CacheTooLarge {
             given: 64 << 20,
             most: 50 << 20
         })
     );
-    // Without the node's memory the bound cannot be checked, so a given size is refused.
-    assert_eq!(cache(64 << 20, None), Err(Refusal::CacheUnchecked));
+    // The machine account of a 24 GiB node (PM, 2026-11-18): half of it, rounded down to a MiB.
+    let node = 24_526_286_848;
+    assert_eq!(cache(11_695 << 20, node), Ok(11_695 << 20));
+    assert!(matches!(
+        cache(11_696 << 20, node),
+        Err(Refusal::CacheTooLarge { most, .. }) if most == node / 2
+    ));
 }
 
 #[test]
 fn the_default_function_cache_is_1_gib_or_half_the_node_s_memory_and_never_refused() {
-    let default = |text: &str, memory: Option<u64>| {
+    let default = |text: &str, memory: u64| {
         NodeConfig::validate(text.as_bytes(), memory).map(|c| c.functions.cache_bytes)
     };
     // With no `functions`, and with `functions` that leaves `cache_bytes` out.
     for text in [with(""), with(r#","functions":{"keys":[]}"#)] {
         // 1 GiB on a node with at least 2 GiB.
-        assert_eq!(default(&text, Some(MEMORY)), Ok(1 << 30));
-        assert_eq!(default(&text, Some(2 << 30)), Ok(1 << 30));
+        assert_eq!(default(&text, MEMORY), Ok(1 << 30));
+        assert_eq!(default(&text, 2 << 30), Ok(CACHE_BYTES_DEFAULT));
         // Half the node's memory on a smaller one, not rounded and not held to 64 MiB.
-        assert_eq!(default(&text, Some((2 << 30) - 4096)), Ok((1 << 30) - 2048));
-        assert_eq!(default(&text, Some(1 << 30)), Ok(512 << 20));
-        assert_eq!(default(&text, Some(100 << 20)), Ok(50 << 20));
-        assert_eq!(default(&text, Some(0)), Ok(0));
-        // 1 GiB when the node's memory is not known.
-        assert_eq!(default(&text, None), Ok(CACHE_BYTES_DEFAULT));
+        assert_eq!(default(&text, (2 << 30) - 4096), Ok((1 << 30) - 2048));
+        assert_eq!(default(&text, 1 << 30), Ok(512 << 20));
+        assert_eq!(default(&text, 100 << 20), Ok(50 << 20));
+        assert_eq!(default(&text, 0), Ok(0));
     }
 }
 
@@ -686,7 +689,6 @@ fn every_refusal_is_one_printable_line_of_its_own() {
             given: 1 << 40,
             most: 1 << 32,
         },
-        Refusal::CacheUnchecked,
     ];
     let mut seen: Vec<String> = Vec::new();
     for refusal in refusals {
@@ -739,6 +741,7 @@ fn handover() -> Handover {
         cloud: Cloud::OpenStack,
         wall_clock: 1_794_931_200,
         read_at_ns: 2_140_000_000,
+        memory_bytes: MEMORY,
     }
 }
 
@@ -756,7 +759,8 @@ fn a_hand_over_survives_the_round_trip() {
         let message = least.encode().unwrap();
         assert_eq!(Handover::decode(&message), Ok(least));
     }
-    // A cache `platform` accepted for a large node is not judged again by `api`.
+    // `api` judges the config on the node the hand-over says: a cache that fits a large node
+    // is taken, and the same cache on a smaller one is refused.
     let large = Handover {
         config: NodeConfig {
             functions: Functions {
@@ -765,9 +769,24 @@ fn a_hand_over_survives_the_round_trip() {
             },
             ..full.config.clone()
         },
+        memory_bytes: 2 << 40,
         ..full
     };
-    assert_eq!(Handover::decode(&large.encode().unwrap()), Ok(large));
+    assert_eq!(
+        Handover::decode(&large.encode().unwrap()),
+        Ok(large.clone())
+    );
+    let small = Handover {
+        memory_bytes: (2 << 40) - (2 << 20),
+        ..large
+    };
+    assert_eq!(
+        Handover::decode(&small.encode().unwrap()),
+        Err(HandoverError::Config(Refusal::CacheTooLarge {
+            given: 1 << 40,
+            most: (1 << 40) - (1 << 20)
+        }))
+    );
 }
 
 #[test]
@@ -783,6 +802,7 @@ fn a_hand_over_is_one_json_object_with_node_config_written_out() {
             "instance": "0d6b3a3c-7b1f-4f0e-9d39-2f6c1a9e5b77",
             "wall_clock": 1_794_931_200u64,
             "read_at_ns": 2_140_000_000u64,
+            "memory_bytes": 8_589_934_592u64,
             "config": {
                 "moruna": 1,
                 "api": {
@@ -852,10 +872,21 @@ fn a_hand_over_that_is_not_one_is_refused() {
         HandoverError::Shape(Refusal::NotNumber("read_at_ns"))
     );
     assert_eq!(
+        changed(&|json| json["memory_bytes"] = "8 GiB".into()),
+        HandoverError::Shape(Refusal::NotNumber("memory_bytes"))
+    );
+    assert_eq!(
         changed(&|json| json["cloud"] = 1.into()),
         HandoverError::Shape(Refusal::NotString("cloud"))
     );
-    for field in ["cloud", "instance", "wall_clock", "read_at_ns", "config"] {
+    for field in [
+        "cloud",
+        "instance",
+        "wall_clock",
+        "read_at_ns",
+        "memory_bytes",
+        "config",
+    ] {
         let refused = changed(&|json| {
             json.as_object_mut().unwrap().remove(field);
         });

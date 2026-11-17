@@ -15,12 +15,13 @@ bench = false
 
 [dependencies]
 moruna-svc.workspace = true
+# The supervisor's start message to `platform` (its `platform` bootstrap), and node.conf's parser.
+moruna-node = { path = "../core", version = "=0.1.0" }
 moruna-node-config = { path = "../config", version = "=0.1.0" }
 netstack-protocol = { path = "../../net/protocol", version = "=0.1.0" }
 serde_json = { version = "=1.0.154", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
-# The real network server on a host, for the test of the sockets' wiring, and the two parsers
-# that read the profile lines this item adds.
+# The real network server on a host, for the test of the sockets' wiring and of the profile line
+# this item adds to its configuration.
 moruna-netstack = { path = "../../net/stack", version = "=0.1.0" }
-moruna-node = { path = "../core", version = "=0.1.0" }

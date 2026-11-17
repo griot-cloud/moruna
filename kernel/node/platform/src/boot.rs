@@ -98,8 +98,10 @@ pub fn ready_line(address: Ipv4Addr, boot_ms: u64) -> String {
 pub struct Inputs {
     /// The monotonic clock when `platform` started: instance data's 90 s count from it.
     pub started_ns: u64,
-    /// The node's memory, which bounds `functions.cache_bytes`; `None` when it is not known.
-    pub memory_bytes: Option<u64>,
+    /// The node's memory: the machine account's limit, which the supervisor gives `platform` at
+    /// start ([`crate::svc::node_memory`]). It bounds `functions.cache_bytes`, and the hand-over
+    /// carries it.
+    pub memory_bytes: u64,
 }
 
 /// Boots: returns the hand-over `api` took, having printed the `cloud` and `ready` lines through
@@ -133,6 +135,7 @@ pub fn run<N: Network, C: Clock, L: Link>(
         cloud: found.cloud,
         wall_clock,
         read_at_ns: found.read_at_ns,
+        memory_bytes: inputs.memory_bytes,
     };
     let message = handover
         .encode()

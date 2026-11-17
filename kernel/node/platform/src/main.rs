@@ -4,7 +4,8 @@
 //! - `console`: where its lines go;
 //! - `account`: its own account, which the network server charges its sockets to;
 //! - `network`: a listener of the network server, granted outbound connections to instance data;
-//! - `api`: the channel the supervisor links to `api`, for the hand-over.
+//! - `api`: the channel the supervisor links to `api`, for the hand-over;
+//! - `supervisor`: its `platform` bootstrap, the one message that gives the node's memory.
 //!
 //! On a fatal error it prints the line and exits with failure, which stops the node. Once the
 //! node is ready it stays, idle and holding the hand-over: a service that ends stops the node.
@@ -21,7 +22,7 @@ use moruna_node_config::Handover;
 use moruna_node_platform::{
     boot::{self, Fatal, Inputs, Stage},
     instance,
-    svc::{ApiLink, Monotonic, Wan},
+    svc::{self, ChannelLink, Monotonic, Wan},
 };
 use moruna_svc::{
     Account, Channel, Console, DEADLINE_INFINITE, Signals, now, println, start, wait_one,
@@ -40,12 +41,16 @@ fn boot(console: &Console, started_ns: u64) -> Result<Handover, Fatal> {
     let listener = start::take("network")
         .map(Channel)
         .ok_or_else(|| instance_data("platform was started without its network channel".into()))?;
-    let api = start::take("api").map(Channel).ok_or_else(|| {
-        Fatal::new(
-            Stage::Platform,
-            "platform was started without its channel to api",
-        )
-    })?;
+    let own = |reason: &str| Fatal::new(Stage::Platform, reason);
+    let api = start::take("api")
+        .map(Channel)
+        .ok_or_else(|| own("platform was started without its channel to api"))?;
+    let supervisor = start::take("supervisor")
+        .map(Channel)
+        .ok_or_else(|| own("platform was started without its bootstrap"))?;
+    // The supervisor queues the message before it starts `platform`, so it is not waited for.
+    let memory_bytes = svc::node_memory(supervisor, now())
+        .map_err(|error| own(&format!("the node's memory is not known: {error}")))?;
 
     // The network server, within instance data's limit.
     let deadline = started_ns.saturating_add(instance::LIMIT_NS);
@@ -67,14 +72,11 @@ fn boot(console: &Console, started_ns: u64) -> Result<Handover, Fatal> {
     boot::run(
         &mut network,
         &mut clock,
-        &mut ApiLink(api),
+        &mut ChannelLink(api),
         &mut |line: &str| println!(console, "{}", line),
         Inputs {
             started_ns,
-            // Open, asked of the PM in item 1.4's report: which figure is the node's memory.
-            // Until it is given, a node config that sets `functions.cache_bytes` is refused,
-            // because its upper bound (half the node's memory) cannot be checked.
-            memory_bytes: None,
+            memory_bytes,
         },
     )
 }
