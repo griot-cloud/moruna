@@ -872,6 +872,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-node-platform"
+version = "0.1.0"
+dependencies = [
+ "moruna-netstack",
+ "moruna-node",
+ "moruna-node-config",
+ "moruna-svc",
+ "netstack-protocol",
+ "serde_json",
+]
+
+[[package]]
 name = "moruna-node-proof"
 version = "0.1.0"
 dependencies = [

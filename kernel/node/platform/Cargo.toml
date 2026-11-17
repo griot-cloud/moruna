@@ -1,0 +1,26 @@
+[package]
+name = "moruna-node-platform"
+description = "The node's `platform` process: finds the cloud from instance data, sets the wall clock, validates node config and hands it to `api`"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The program runs only on the microkernel; the library holds the logic and is tested on a host.
+[[bin]]
+name = "platform"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+moruna-svc.workspace = true
+moruna-node-config = { path = "../config", version = "=0.1.0" }
+netstack-protocol = { path = "../../net/protocol", version = "=0.1.0" }
+serde_json = { version = "=1.0.154", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+# The real network server on a host, for the test of the sockets' wiring, and the two parsers
+# that read the profile lines this item adds.
+moruna-netstack = { path = "../../net/stack", version = "=0.1.0" }
+moruna-node = { path = "../core", version = "=0.1.0" }
