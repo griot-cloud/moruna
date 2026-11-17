@@ -269,7 +269,7 @@ if it does, this section changes first.
   protocol, `moruna.driver.vmbus`: list the offers of an interface, open a channel, share memory
   with the host, close.
   - Opening a channel gives the driver the ring memory, the channel's signal handle, and a wake
-    word.
+    channel.
   - **Out:** a driver writes its ring and signals the host itself, through its signal handle.
   - **In:** the host's interrupt reaches `vmbus`, which reads the event flags and wakes the
     drivers whose channels have data. That is one hop on the way in, accepted for the first

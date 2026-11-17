@@ -8,15 +8,23 @@
 //! - **offers:** the channels the host offers of one interface ID, a kind of device;
 //! - **open:** a channel opened on rings `vmbus` makes, which gives the driver the
 //!   rings' memory, a signal handle that signals that channel's connection ID and nothing
-//!   else, and a wake word;
+//!   else, and a wake channel;
 //! - **share:** more of the driver's memory shared with the host, as a GPADL whose ID the
 //!   driver names to its device;
 //! - **close:** the channel closed, and its rings the driver's alone again.
 //!
 //! Packets travel in the rings with no hop through `vmbus`: a driver writes its outgoing
 //! ring and signals the host itself. The way in has one hop: the host's interrupt reaches
-//! `vmbus`, which reads the event flags and bumps the wake word of each channel the host
-//! signalled ([`wake`]). The driver waits on that word with a futex.
+//! `vmbus`, which reads the event flags and writes an empty message to the wake channel of
+//! each channel the host signalled. A driver waits only on handles: its wake channel turns
+//! readable among its clients' channels. A write that finds the wake channel full is
+//! dropped, since a message is pending already; the driver reads them all, then looks at
+//! its rings. `vmbus` closes the wake channel once the channel is closed or rescinded, so
+//! its peer-closed signal says the device is gone.
+//!
+//! A driver reaches `vmbus` through the listener of its kind of device ([`Class`]): `scsi`
+//! for disks, `net` for network cards. A connection lists and opens the offers of its
+//! class's interface and no other's, so a disk driver cannot open the network card.
 //!
 //! A channel belongs to the connection that opened it: only it may share memory on it or
 //! close it, and `vmbus` closes it when the connection goes.
@@ -70,6 +78,44 @@ impl Wire for Id {
     }
 }
 
+/// Hyper-V's synthetic SCSI controller, which carries a machine's disks (storvsc).
+pub const SCSI: Guid = guid::guid!("ba6163d9-04a1-4d29-b605-72e2ffb1dc7f");
+
+/// Hyper-V's synthetic network card (netvsc).
+pub const NET: Guid = guid::guid!("f8615163-df3e-46c5-913f-f2d2f965ed0e");
+
+/// A kind of device, and the listener its drivers reach `vmbus` through: a connection on
+/// it lists and opens the offers of the class's interface only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// SCSI controllers, which carry the disks (`storvsc`).
+    Scsi,
+    /// Network cards (`netvsc`).
+    Net,
+}
+
+impl Class {
+    /// Every class, in the order `vmbus` takes their listeners.
+    pub const ALL: [Class; 2] = [Class::Scsi, Class::Net];
+
+    /// The interface ID of the class's offers.
+    pub fn interface(self) -> Id {
+        match self {
+            Class::Scsi => Id(SCSI),
+            Class::Net => Id(NET),
+        }
+    }
+
+    /// The start handle `vmbus` listens on for the class's drivers, which node config
+    /// links to the driver.
+    pub fn slot(self) -> &'static str {
+        match self {
+            Class::Scsi => "scsi",
+            Class::Net => "net",
+        }
+    }
+}
+
 /// One channel the host offers of the interface asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Offer {
@@ -106,7 +152,8 @@ pub struct Opened {
     /// The channel's signal handle (`ObjectType::HvSignal`): it signals the host on the
     /// channel's connection ID, and nothing else.
     pub signal: Handle,
-    /// The channel's wake word: one page, readable only ([`wake`]).
+    /// The channel's wake channel: `vmbus` writes it an empty message when the host
+    /// signals the channel, and closes it once the channel is closed or rescinded.
     pub wake: Handle,
 }
 
@@ -123,24 +170,6 @@ impl Wire for Opened {
             wake,
         })
     }
-}
-
-/// The page `open` gives as a channel's wake word, which `vmbus` writes and the driver
-/// only reads.
-pub mod wake {
-    /// The page's size.
-    pub const SIZE: u64 = 4096;
-    /// A 32-bit counter, 4-aligned, that `vmbus` increments each time the host signals
-    /// the channel, and then wakes the futex on it: a driver waits while it holds the
-    /// value it last saw.
-    pub const COUNTER: usize = 0;
-    /// A 32-bit word, [`OPEN`] while the channel is open, [`GONE`] once it is closed or
-    /// the host has rescinded it; set before the counter's last increment.
-    pub const STATE: usize = 4;
-    /// The channel is open.
-    pub const OPEN: u32 = 0;
-    /// The channel is closed, or the device is gone: no more signals come.
-    pub const GONE: u32 = 1;
 }
 
 /// The fewest pages a ring takes: a page of control words and one of data.
@@ -168,7 +197,8 @@ moruna_svc::protocol! {
         minor = 0;
         requests {
             /// The channels the host offers of `interface`, once contact with the host is
-            /// made. A channel the host has rescinded is not among them.
+            /// made. A channel the host has rescinded is not among them, and an interface
+            /// that is not the connection's class has none.
             1 => fn offers(interface: Id) -> Vec<Offer>;
             /// Opens `channel` on new rings of `pages` pages, the first `outgoing` of them
             /// the ring the driver writes. Answered once the host has opened it.
@@ -185,7 +215,8 @@ moruna_svc::protocol! {
         errors {
             /// There is no contact with the host.
             1 => NotConnected;
-            /// The host offers no such channel, or has rescinded it.
+            /// The host offers no such channel of the connection's class, or has
+            /// rescinded it.
             2 => NoSuchChannel;
             /// The channel is opened already, or belongs to another connection.
             3 => Busy;
@@ -212,8 +243,6 @@ mod tests {
     use moruna_svc::ProtocolError;
 
     use super::*;
-
-    const SCSI: Guid = guid::guid!("ba6163d9-04a1-4d29-b605-72e2ffb1dc7f");
 
     /// The body `value` encodes to, with no handle in it.
     fn body<T: Wire>(value: T) -> Vec<u8> {
@@ -318,11 +347,12 @@ mod tests {
     }
 
     #[test]
-    fn the_wake_word_is_a_counter_and_a_state_in_one_page() {
-        assert_eq!((wake::COUNTER, wake::STATE), (0, 4));
-        assert_eq!((wake::OPEN, wake::GONE), (0, 1));
-        assert!(wake::STATE as u64 + 4 <= wake::SIZE);
-        assert_eq!(wake::COUNTER % 4, 0);
+    fn each_class_has_its_interface_and_its_listener() {
+        assert_eq!(Class::ALL, [Class::Scsi, Class::Net]);
+        assert_eq!(Class::Scsi.interface(), Id(SCSI));
+        assert_eq!(Class::Net.interface(), Id(NET));
+        assert_eq!((Class::Scsi.slot(), Class::Net.slot()), ("scsi", "net"));
+        assert_eq!(NET.to_string(), "f8615163-df3e-46c5-913f-f2d2f965ed0e");
     }
 
     #[test]

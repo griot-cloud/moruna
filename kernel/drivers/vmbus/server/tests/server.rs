@@ -17,17 +17,10 @@ use moruna_svc::{
     CallError, Channel, ClientCore, Dispatcher, Encoder, Handle, Memory, ObjectType, Status, Wire,
     deadline_in,
 };
+use moruna_svc::{Error as SysError, limits};
 use moruna_vmbus::{ChannelId, GpadlId, Hv, HvError, HvMessage, MemoryId, PostError, Version};
-use moruna_vmbus_server::{Host, Vmbus, WakeId, factory, message, page_numbers, post_result};
-use vmbus_protocol::{Id, Offer, Opened, vmbus, wake};
-
-/// What a wake word holds, as the fake node keeps it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Word {
-    counter: u32,
-    gone: bool,
-    dropped: bool,
-}
+use moruna_vmbus_server::{Host, Vmbus, factory, message, page_numbers, post_result};
+use vmbus_protocol::{Class, Id, Offer, Opened, vmbus};
 
 /// The node under the process: Hyper-V's side is the fake host; the rest is recorded.
 struct Node {
@@ -36,12 +29,10 @@ struct Node {
     /// Pinned memory, by ID: how many pages.
     pinned: BTreeMap<u64, usize>,
     released: Vec<u64>,
-    wakes: BTreeMap<u64, Word>,
     signals: Vec<u32>,
     next: u64,
     fail_rings: Option<vmbus::Error>,
     fail_signal: Option<vmbus::Error>,
-    fail_wake: Option<vmbus::Error>,
 }
 
 impl Node {
@@ -51,12 +42,10 @@ impl Node {
             console: Vec::new(),
             pinned: BTreeMap::new(),
             released: Vec::new(),
-            wakes: BTreeMap::new(),
             signals: Vec::new(),
             next: 0,
             fail_rings: None,
             fail_signal: None,
-            fail_wake: None,
         }
     }
 
@@ -132,28 +121,6 @@ impl Host for Node {
         Ok(Handle::inert())
     }
 
-    fn wake(&mut self) -> Result<(Handle, WakeId), vmbus::Error> {
-        if let Some(error) = self.fail_wake.take() {
-            return Err(error);
-        }
-        let id = self.id();
-        self.wakes.insert(id, Word::default());
-        Ok((Memory::create(wake::SIZE).unwrap().0, WakeId(id)))
-    }
-
-    fn bump(&mut self, wake: WakeId, gone: bool) {
-        let word = self.wakes.get_mut(&wake.0).expect("a live wake word");
-        assert!(!word.dropped, "a dropped wake word is never bumped");
-        word.counter += 1;
-        word.gone |= gone;
-    }
-
-    fn drop_wake(&mut self, wake: WakeId) {
-        let word = self.wakes.get_mut(&wake.0).expect("a live wake word");
-        assert!(!word.dropped, "a wake word is dropped once");
-        word.dropped = true;
-    }
-
     fn say(&mut self, line: fmt::Arguments<'_>) {
         self.console.push(line.to_string());
     }
@@ -171,11 +138,30 @@ fn connected() -> Shared {
     vmbus
 }
 
-/// A driver's connection to the process: its end, and the dispatcher serving the other.
+/// A disk driver's connection to the process, through the `scsi` listener: its end, and
+/// the dispatcher serving the other.
 fn driver(vmbus: &Shared, d: &mut Dispatcher) -> Channel {
+    driver_of(vmbus, d, Class::Scsi)
+}
+
+/// A connection through the listener of `class`.
+fn driver_of(vmbus: &Shared, d: &mut Dispatcher, class: Class) -> Channel {
     let (mine, theirs) = Channel::create().unwrap();
-    d.serve(theirs, factory(vmbus.clone())()).unwrap();
+    d.serve(theirs, factory(vmbus.clone(), class)()).unwrap();
     mine
+}
+
+/// The empty messages waiting on a wake channel, read, and then how it stands: `ShouldWait`
+/// while `vmbus` holds the other end, `PeerClosed` once it has let go.
+fn wakes(wake: &Channel) -> (usize, SysError) {
+    let mut count = 0;
+    loop {
+        match wake.read(&mut [], &mut []) {
+            Ok((0, 0)) => count += 1,
+            Ok(other) => panic!("a wake message that is not empty: {other:?}"),
+            Err(error) => return (count, error),
+        }
+    }
 }
 
 /// Answers delivered by the process outside a request.
@@ -241,40 +227,39 @@ fn contact_is_made_at_start_and_every_offer_is_said_on_the_console() {
 }
 
 #[test]
-fn a_driver_lists_the_offers_of_its_interface() {
+fn a_driver_lists_the_offers_of_its_class_only() {
     let vmbus = connected();
     let mut d = Dispatcher::new();
-    let end = driver(&vmbus, &mut d);
+    let disks = driver(&vmbus, &mut d);
+    let nics = driver_of(&vmbus, &mut d, Class::Net);
     let lists = serve(
         &vmbus,
         &mut d,
         thread::spawn(move || {
-            let mut c = client(end);
+            let mut c = client(disks);
+            let mut n = client(nics);
             [
                 c.offers(Id(SCSI)),
                 c.offers(Id(NIC)),
                 c.offers(Id(instance(9))),
+                n.offers(Id(NIC)),
+                n.offers(Id(SCSI)),
             ]
             .map(|answer| answer.unwrap())
         }),
         |_| {},
     );
-    assert_eq!(
-        lists,
-        [
-            vec![Offer {
-                channel: 2,
-                instance: Id(instance(2)),
-                subchannel: 0
-            }],
-            vec![Offer {
-                channel: 1,
-                instance: Id(instance(1)),
-                subchannel: 0
-            }],
-            vec![],
-        ]
-    );
+    let disk = Offer {
+        channel: 2,
+        instance: Id(instance(2)),
+        subchannel: 0,
+    };
+    let nic = Offer {
+        channel: 1,
+        instance: Id(instance(1)),
+        subchannel: 0,
+    };
+    assert_eq!(lists, [vec![disk], vec![], vec![], vec![nic], vec![]]);
 }
 
 #[test]
@@ -288,25 +273,35 @@ fn offers_asked_before_contact_wait_for_it() {
     assert!(vmbus.borrow().has_unsent());
     let mut d = Dispatcher::new();
     let end = driver(&vmbus, &mut d);
+    let nics = driver_of(&vmbus, &mut d, Class::Net);
     let mut retried = false;
-    let list = serve(
+    let lists = serve(
         &vmbus,
         &mut d,
-        thread::spawn(move || client(end).offers(Id(SCSI))),
+        thread::spawn(move || {
+            let disks = thread::spawn(move || client(end).offers(Id(SCSI)));
+            let other = client(nics).offers(Id(SCSI));
+            (disks.join().unwrap(), other)
+        }),
         |vmbus| {
-            if vmbus.pending() == 1 && !retried {
+            if vmbus.pending() == 2 && !retried {
                 retried = true;
                 vmbus.retry();
             }
         },
     );
-    assert!(retried, "the answer waited for contact");
-    assert_eq!(list.unwrap().len(), 1);
+    assert!(retried, "the answers waited for contact");
+    assert_eq!(lists.0.unwrap().len(), 1);
+    assert_eq!(
+        lists.1.unwrap(),
+        [],
+        "not the class of the connection that asked"
+    );
     assert!(!vmbus.borrow().has_unsent());
 }
 
 #[test]
-fn opening_a_channel_gives_its_rings_signal_and_wake_word() {
+fn opening_a_channel_gives_its_rings_signal_and_wake_channel() {
     let vmbus = connected();
     let mut d = Dispatcher::new();
     let end = driver(&vmbus, &mut d);
@@ -323,11 +318,13 @@ fn opening_a_channel_gives_its_rings_signal_and_wake_word() {
     let Opened {
         rings,
         signal,
-        wake: word,
+        wake,
     } = opened;
     assert_eq!(rings.info().unwrap().0, ObjectType::Memory);
     assert!(signal.info().is_ok());
-    assert_eq!(word.info().unwrap().0, ObjectType::Memory);
+    assert_eq!(wake.info().unwrap().0, ObjectType::Channel);
+    // Nothing has come from the host yet.
+    assert_eq!(wakes(&Channel(wake)), (0, SysError::ShouldWait));
     let vmbus = vmbus.borrow();
     let node = vmbus.host();
     assert!(node.hv.is_open(ChannelId(2)));
@@ -339,7 +336,6 @@ fn opening_a_channel_gives_its_rings_signal_and_wake_word() {
     );
     // The signal handle signals the connection ID of channel 2's offer.
     assert_eq!(node.signals, [connection_of(ChannelId(2))]);
-    assert_eq!(node.wakes.len(), 1);
     assert_eq!(vmbus.channels(), 1);
     assert_eq!(vmbus.pending(), 0);
     drop(end);
@@ -356,17 +352,19 @@ fn opens_the_process_cannot_make_are_refused_with_their_reason() {
         thread::spawn(move || {
             let mut c = client(end);
             let unknown = c.open(99, 8, 4).map(|_| ());
+            let network = c.open(1, 8, 4).map(|_| ());
             let small = c.open(2, 3, 2).map(|_| ());
             let lopsided = c.open(2, 8, 7).map(|_| ());
             let first = c.open(2, 8, 4).map(|_| ());
             let second = c.open(2, 8, 4).map(|_| ());
-            [unknown, small, lopsided, first, second]
+            [unknown, network, small, lopsided, first, second]
         }),
         |_| {},
     );
     assert_eq!(
         answers,
         [
+            Err(CallError::Remote(vmbus::Error::NoSuchChannel)),
             Err(CallError::Remote(vmbus::Error::NoSuchChannel)),
             Err(CallError::Remote(vmbus::Error::BadRings)),
             Err(CallError::Remote(vmbus::Error::BadRings)),
@@ -382,29 +380,28 @@ fn what_the_node_cannot_give_is_handed_back() {
     let mut d = Dispatcher::new();
     let end = driver(&vmbus, &mut d);
     {
-        // An open asks the node for rings, then a signal, then a wake word: each fails
-        // once, in that order, one open each.
+        // An open asks the node for rings, then a signal: each fails once, in that order,
+        // one open each.
         let mut v = vmbus.borrow_mut();
         let node = v.host_mut();
         node.fail_rings = Some(vmbus::Error::NoResources);
         node.fail_signal = Some(vmbus::Error::NoResources);
-        node.fail_wake = Some(vmbus::Error::NoResources);
     }
     let answers = serve(
         &vmbus,
         &mut d,
         thread::spawn(move || {
             let mut c = client(end);
-            let answers = [(); 4].map(|()| c.open(2, 8, 4).map(|_| ()));
+            let answers = [(); 3].map(|()| c.open(2, 8, 4).map(|_| ()));
             (answers, c.into_core().into_channel())
         }),
         |_| {},
     );
     let refused = || Err(CallError::Remote(vmbus::Error::NoResources));
-    assert_eq!(answers.0, [refused(), refused(), refused(), Ok(())]);
-    // The rings of the two refused after their rings were made were released.
+    assert_eq!(answers.0, [refused(), refused(), Ok(())]);
+    // The rings of the one refused after its rings were made were released.
     let vmbus = vmbus.borrow();
-    assert_eq!(vmbus.host().released.len(), 2);
+    assert_eq!(vmbus.host().released.len(), 1);
     assert_eq!(vmbus.host().pinned.len(), 1);
     assert_eq!(vmbus.channels(), 1);
     drop(answers.1);
@@ -426,7 +423,6 @@ fn an_open_the_host_refuses_is_refused_and_its_memory_released() {
     let vmbus = vmbus.borrow();
     let node = vmbus.host();
     assert!(node.pinned.is_empty() && node.released.len() == 1);
-    assert!(node.wakes.values().all(|w| w.dropped));
     assert!(node.said("the host refused to open channel 2: status 0x5"));
     assert_eq!(vmbus.channels(), 0);
 }
@@ -467,7 +463,7 @@ fn a_driver_shares_memory_on_its_open_channel() {
     let node = vmbus.host();
     // The second memory pinned, after the rings: two pages.
     let pages = node.hv.gpadl_pages(GpadlId(shared)).unwrap();
-    assert_eq!(pages, [0x3_0000, 0x3_0001]);
+    assert_eq!(pages, [0x2_0000, 0x2_0001]);
     assert_eq!(node.hv.gpadl_count(), 2);
     drop(end);
 }
@@ -516,12 +512,14 @@ fn closing_tears_down_the_shared_memory_and_lets_go_of_the_rings() {
         &mut d,
         thread::spawn(move || {
             let mut c = client(end);
-            c.open(2, 8, 4).unwrap();
+            let wake = Channel(c.open(2, 8, 4).unwrap().wake);
             c.share(2, Memory::create(8192).unwrap().0).unwrap();
             let closed = c.close(2);
+            // Let go of before the answer: the driver hears of it with no message.
+            let woken = wakes(&wake);
             let again = c.close(2);
             let never = c.close(1);
-            (closed, again, never)
+            (closed, woken, again, never)
         }),
         |_| {},
     );
@@ -529,6 +527,7 @@ fn closing_tears_down_the_shared_memory_and_lets_go_of_the_rings() {
         answers,
         (
             Ok(()),
+            (0, SysError::PeerClosed),
             Err(CallError::Remote(vmbus::Error::NotOpen)),
             Err(CallError::Remote(vmbus::Error::NotOpen))
         )
@@ -539,52 +538,75 @@ fn closing_tears_down_the_shared_memory_and_lets_go_of_the_rings() {
     assert_eq!(node.hv.gpadl_count(), 0);
     assert!(node.pinned.is_empty());
     assert_eq!(node.released.len(), 2);
-    let word = node.wakes.values().next().unwrap();
-    assert_eq!((word.counter, word.gone, word.dropped), (1, true, true));
     assert_eq!((vmbus.channels(), vmbus.pending()), (0, 0));
 }
 
 #[test]
-fn the_hosts_signal_bumps_the_wake_word_of_that_channel_only() {
+fn the_hosts_signal_wakes_the_driver_of_that_channel_only() {
     let vmbus = connected();
     let mut d = Dispatcher::new();
-    let end = driver(&vmbus, &mut d);
-    let end = serve(
+    let disks = driver(&vmbus, &mut d);
+    let nics = driver_of(&vmbus, &mut d, Class::Net);
+    let (wake, nic_wake, ends) = serve(
         &vmbus,
         &mut d,
         thread::spawn(move || {
-            let mut c = client(end);
-            c.open(2, 8, 4).unwrap();
-            c.into_core().into_channel()
+            let mut c = client(disks);
+            let mut n = client(nics);
+            let wake = Channel(c.open(2, 8, 4).unwrap().wake);
+            let nic_wake = Channel(n.open(1, 4, 2).unwrap().wake);
+            (
+                wake,
+                nic_wake,
+                [c.into_core().into_channel(), n.into_core().into_channel()],
+            )
         }),
         |_| {},
     );
     let mut v = vmbus.borrow_mut();
     v.host_mut().hv.signal_guest(ChannelId(2));
-    // Channel 1 is not open: its flag is not the process's to read.
-    v.host_mut().hv.signal_guest(ChannelId(1));
     v.interrupted();
     v.host_mut().hv.signal_guest(ChannelId(2));
     v.interrupted();
+    // An interrupt with no flag for the channel wakes nobody.
     v.interrupted();
-    let word = *v.host().wakes.values().next().unwrap();
-    assert_eq!((word.counter, word.gone), (2, false));
+    assert_eq!(wakes(&wake), (2, SysError::ShouldWait));
+    assert_eq!(wakes(&nic_wake), (0, SysError::ShouldWait));
+    // A driver that does not read its wake channel fills it, and the writes that find it
+    // full are dropped: the message waiting already says the same.
+    for _ in 0..limits::CHANNEL_DEPTH + 5 {
+        v.host_mut().hv.signal_guest(ChannelId(2));
+        v.interrupted();
+    }
+    assert_eq!(wakes(&wake), (limits::CHANNEL_DEPTH, SysError::ShouldWait));
+    assert_eq!(v.fatal(), None);
+    drop(ends);
+}
+
+#[test]
+fn a_channel_that_is_not_open_is_not_the_processs_to_wake() {
+    let vmbus = connected();
+    let mut v = vmbus.borrow_mut();
+    // Channel 1 is not open: its flag is not the process's to read.
+    v.host_mut().hv.signal_guest(ChannelId(1));
+    v.interrupted();
     assert!(v.host_mut().hv.test_and_clear(ChannelId(1)));
-    drop(end);
 }
 
 #[test]
 fn a_driver_that_goes_has_its_channels_closed() {
     let vmbus = connected();
     let mut d = Dispatcher::new();
-    let end = driver(&vmbus, &mut d);
+    let disks = driver(&vmbus, &mut d);
+    let nics = driver_of(&vmbus, &mut d, Class::Net);
     serve(
         &vmbus,
         &mut d,
         thread::spawn(move || {
-            let mut c = client(end);
+            let mut c = client(disks);
+            let mut n = client(nics);
             c.open(2, 8, 4).unwrap();
-            c.open(1, 4, 2).unwrap();
+            n.open(1, 4, 2).unwrap();
             c.share(2, Memory::create(4096).unwrap().0).unwrap();
         }),
         |_| {},
@@ -641,9 +663,9 @@ fn a_rescinded_channel_is_gone_for_its_driver() {
         &mut d,
         thread::spawn(move || {
             let mut c = client(end);
-            c.open(2, 8, 4).unwrap();
+            let wake = Channel(c.open(2, 8, 4).unwrap().wake);
             c.share(2, Memory::create(4096).unwrap().0).unwrap();
-            c.into_core().into_channel()
+            (wake, c.into_core().into_channel())
         }),
         |_| {},
     );
@@ -653,8 +675,8 @@ fn a_rescinded_channel_is_gone_for_its_driver() {
         v.interrupted();
         let node = v.host();
         assert!(node.said("vmbus: channel 2 rescinded"));
-        let word = node.wakes.values().next().unwrap();
-        assert!(word.gone && word.dropped);
+        // The driver hears the device has gone: its wake channel is closed.
+        assert_eq!(wakes(&end.0), (0, SysError::PeerClosed));
         assert!(node.pinned.is_empty(), "the rings and the shared memory");
         assert_eq!(node.hv.released, [2]);
         assert_eq!(v.channels(), 0);
