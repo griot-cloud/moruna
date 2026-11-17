@@ -89,8 +89,8 @@ def canon(spec, out):
 def moruna_vm(spec, out, flist):
     """moruna-vm's command and where its report goes: the gate's job (gate_jobs.py) through 0.7's
     `moruna run JOB --output DIR --report FILE` (stream D), its native tasks the image of the
-    stack in `image_stack`, its VM `vm_memory_gib`, its job's budget `budget_gib` (D: a 24 GiB VM
-    takes a budget of 20.6 GiB or less). The node's serial console and QEMU's log are kept in
+    stack in `image_stack`, its VM `vm_memory_gib`, its job's budget `budget_gib` (with its scratch,
+    at most what the node holds: gate_plan.VM). The node's serial console and QEMU's log are kept in
     /data/tmp/ID.node (MORUNA_KEEP_NODE_LOGS) and moved beside the results."""
     import gate_jobs
     stack = spec["image_stack"]

@@ -125,14 +125,18 @@ def command(engine, out, tag):
     if engine == "moruna-vm":
         sys.path.insert(0, HERE)
         import gate_jobs
+        import gate_plan
         job = f"/data/tmp/{tag}.job.json"
         digest = open(f"{STACK}/image.digest").read().strip()
+        # The plan's sizing: the job's budget is what its scratch leaves of what the node holds.
+        scratch = gate_plan.SCRATCH_GIB["occupancy"]
         gate_jobs.write(job, "occupancy", [FILE], out, {"digest": digest, "location": "/images/gate"},
-                        cpus=8, mem_gib=20.5)
+                        cpus=8, mem_gib=gate_plan.VM["job_and_scratch_gib"] - scratch)
         os.chmod(job, 0o644)
         report = f"/data/tmp/{tag}.report.json"
-        return as_bench + [MORUNA07, "run", job, "--output", out, "--report", report, "--memory-gib", "24",
-                           "--image-stack", STACK], report
+        return as_bench + [MORUNA07, "run", job, "--output", out, "--report", report, "--memory-gib",
+                           str(gate_plan.VM["vm_memory_gib"]), "--image-stack", STACK,
+                           "--scratch-gib", str(scratch)], report
     if engine == "rust-pool":
         files = f"/data/tmp/{tag}.files"
         wr(files, FILE)
