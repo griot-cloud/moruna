@@ -30,25 +30,68 @@ fn secure_random(bytes: &mut [u8]) -> Result<(), getrandom::Error> {
 #[cfg(target_os = "none")]
 getrandom::register_custom_getrandom!(secure_random);
 
-/// A trusted boot-provided UTC anchor. Monotonic time is only elapsed duration;
-/// it never becomes an invented Unix timestamp. Expiry/rollback fails closed.
+/// A trusted UTC anchor: given at boot (`tls-unix-seconds`), or later, once, by the
+/// node's `platform` over the clock link (system design 3D). Monotonic time is only
+/// elapsed duration; it never becomes an invented Unix timestamp. An unanchored clock,
+/// expiry and rollback all fail closed: no time, so no TLS.
 #[derive(Debug)]
 pub struct TrustedTime {
-    unix_seconds: u64,
-    monotonic_start: u64,
+    /// Zero until the clock is anchored.
+    unix_seconds: AtomicU64,
+    monotonic_start: AtomicU64,
     valid_ns: u64,
     monotonic_now: AtomicU64,
     invalid: AtomicBool,
 }
+
+/// Why an anchor was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Anchor {
+    /// The clock has its anchor already: it is given once.
+    Already,
+    /// Not a time: zero, or past the last second of year 9999.
+    BadTime,
+}
+
+/// The last second of year 9999, the latest anchor taken, as the configuration's.
+const LATEST: u64 = 253_402_300_799;
+
 impl TrustedTime {
     pub fn new(unix_seconds: u64, monotonic_start: u64, valid_ns: u64) -> Option<Self> {
-        (unix_seconds > 0 && valid_ns > 0 && valid_ns <= 86_400_000_000_000).then_some(Self {
-            unix_seconds,
-            monotonic_start,
+        let time = Self::unanchored(valid_ns, monotonic_start)?;
+        time.anchor(unix_seconds, monotonic_start).ok()?;
+        Some(time)
+    }
+    /// A clock with no anchor yet, valid for `valid_ns` once it has one: until
+    /// [`TrustedTime::anchor`], it gives no time.
+    pub fn unanchored(valid_ns: u64, monotonic_now: u64) -> Option<Self> {
+        (valid_ns > 0 && valid_ns <= 86_400_000_000_000).then_some(Self {
+            unix_seconds: AtomicU64::new(0),
+            monotonic_start: AtomicU64::new(monotonic_now),
             valid_ns,
-            monotonic_now: AtomicU64::new(monotonic_start),
+            monotonic_now: AtomicU64::new(monotonic_now),
             invalid: AtomicBool::new(false),
         })
+    }
+    /// Anchors the clock: `unix_seconds` is UTC at the monotonic time `now`. Once.
+    pub fn anchor(&self, unix_seconds: u64, now: u64) -> Result<(), Anchor> {
+        if unix_seconds == 0 || unix_seconds > LATEST {
+            return Err(Anchor::BadTime);
+        }
+        if self.anchored() {
+            return Err(Anchor::Already);
+        }
+        self.update(now);
+        self.monotonic_start.store(
+            self.monotonic_now.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.unix_seconds.store(unix_seconds, Ordering::Release);
+        Ok(())
+    }
+    /// Whether the clock has its anchor.
+    pub fn anchored(&self) -> bool {
+        self.unix_seconds.load(Ordering::Acquire) != 0
     }
     pub fn update(&self, now: u64) {
         let previous = self.monotonic_now.fetch_max(now, Ordering::Relaxed);
@@ -59,18 +102,19 @@ impl TrustedTime {
 }
 impl TimeProvider for TrustedTime {
     fn current_time(&self) -> Option<UnixTime> {
-        if self.invalid.load(Ordering::Relaxed) {
+        let unix_seconds = self.unix_seconds.load(Ordering::Acquire);
+        if unix_seconds == 0 || self.invalid.load(Ordering::Relaxed) {
             return None;
         }
         let elapsed = self
             .monotonic_now
             .load(Ordering::Relaxed)
-            .checked_sub(self.monotonic_start)?;
+            .checked_sub(self.monotonic_start.load(Ordering::Relaxed))?;
         if elapsed >= self.valid_ns {
             return None;
         }
         Some(UnixTime::since_unix_epoch(Duration::from_secs(
-            self.unix_seconds.checked_add(elapsed / 1_000_000_000)?,
+            unix_seconds.checked_add(elapsed / 1_000_000_000)?,
         )))
     }
 }
@@ -647,6 +691,48 @@ mod tests {
         assert!(buffer.resize(33).is_err());
         assert_eq!(buffer.bytes.capacity(), allocated);
     }
+    #[test]
+    fn an_unanchored_clock_gives_no_time_until_its_one_anchor() {
+        assert!(TrustedTime::unanchored(0, 0).is_none());
+        assert!(TrustedTime::unanchored(86_400_000_000_001, 0).is_none());
+        let clock = TrustedTime::unanchored(10_000_000_000, 50).unwrap();
+        assert!(!clock.anchored());
+        assert!(clock.current_time().is_none());
+        clock.update(1_000_000_050);
+        assert!(clock.current_time().is_none());
+        // Not a time.
+        assert_eq!(clock.anchor(0, 1_000_000_050), Err(Anchor::BadTime));
+        assert_eq!(
+            clock.anchor(LATEST + 1, 1_000_000_050),
+            Err(Anchor::BadTime)
+        );
+        assert!(!clock.anchored());
+        // The anchor counts from the monotonic time it was given at.
+        assert_eq!(clock.anchor(1_800_000_000, 2_000_000_050), Ok(()));
+        assert!(clock.anchored());
+        assert_eq!(clock.current_time().unwrap().as_secs(), 1_800_000_000);
+        clock.update(5_000_000_050);
+        assert_eq!(clock.current_time().unwrap().as_secs(), 1_800_000_003);
+        // Once.
+        assert_eq!(
+            clock.anchor(1_900_000_000, 5_000_000_050),
+            Err(Anchor::Already)
+        );
+        assert_eq!(clock.current_time().unwrap().as_secs(), 1_800_000_003);
+        // Valid for its span from the anchor, not from the clock's making.
+        clock.update(12_000_000_050);
+        assert!(clock.current_time().is_none());
+        // An anchor given at a time before the latest seen is a rollback: no time.
+        let clock = TrustedTime::unanchored(10_000_000_000, 100).unwrap();
+        clock.update(500);
+        assert_eq!(clock.anchor(1_800_000_000, 400), Ok(()));
+        assert!(clock.current_time().is_none());
+        // A boot anchor is an anchor: the clock link's is refused after it.
+        let clock = TrustedTime::new(1_800_000_000, 0, 10).unwrap();
+        assert_eq!(clock.anchor(1_800_000_000, 1), Err(Anchor::Already));
+        assert!(TrustedTime::new(LATEST + 1, 0, 10).is_none());
+    }
+
     #[test]
     fn trusted_clock_failure_cannot_be_undone_by_rewinding() {
         let clock = TrustedTime::new(1_700_000_000, 10, 100).unwrap();

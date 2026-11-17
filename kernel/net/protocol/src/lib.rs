@@ -385,6 +385,32 @@ pub mod net {
     }
 }
 
+moruna_svc::protocol! {
+    /// `moruna.net.clock` 1.0 (system design 3D): the one link on which the node's
+    /// `platform` gives the network server the wall clock. TLS needs a trusted time, and
+    /// the network server has no clock source of its own that works on every cloud, so
+    /// it takes `platform`'s, set from the instance data's `Date` (1D), never a
+    /// build-time clock. Until it has it, `start_tls` is refused `TlsUnavailable`.
+    pub protocol clock {
+        name = "moruna.net.clock";
+        major = 1;
+        minor = 0;
+        requests {
+            /// UTC now, in seconds since the Unix epoch: the anchor of TLS's clock. Once.
+            1 => fn set_utc(unix_seconds: u64) -> ();
+        }
+        events {}
+        errors {
+            /// The clock has its anchor already: it is given once.
+            1 => Already;
+            /// The network server has no TLS roots, so no TLS whose clock to anchor.
+            2 => NoTls;
+            /// Not a time: zero, or past the last second of year 9999.
+            3 => BadTime;
+        }
+    }
+}
+
 /// Sole bounded public server control codec; never contains private key bytes.
 pub struct ServerIdentitySpec {
     /// Public DER chain, at most8 certificates/48KiB.

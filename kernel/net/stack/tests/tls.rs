@@ -361,6 +361,137 @@ fn an_expired_boot_anchor_refuses_tls_before_any_handshake() {
     server.join().unwrap();
 }
 
+/// The clock link's client, as `platform` holds it.
+fn clock_client(channel: Channel) -> netstack_protocol::clock::Client {
+    netstack_protocol::clock::Client::connect(channel, deadline_in(10_000_000_000)).unwrap()
+}
+
+/// Roots from the boot, and a clock with no anchor: what a cloud node's network server
+/// starts with (system design 3D).
+fn unanchored(ca: &Certificate) -> Trust {
+    Trust::new(
+        vec![ca.der().to_vec()],
+        TrustedTime::unanchored(60_000_000_000, now()).unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn tls_waits_for_the_clock_platform_sends_then_verifies() {
+    use netstack_protocol::clock;
+    let (ca, config) = credentials();
+    let (mut slots, link, server) = common::serve_with_clock(CONFIG, Some(unanchored(&ca)));
+    let listener = slots.remove("listen").unwrap();
+    let mut a = client(moruna_svc::connect(&listener).unwrap());
+    let mut b = client(moruna_svc::connect(&listener).unwrap());
+    let (listening, address) = b
+        .listen(Endpoint::new(Addr::v4(127, 0, 0, 1), 0), 2)
+        .unwrap();
+    // Before platform has given the time: refused, and the socket is untouched.
+    let early = a.open(Target::Endpoint(address), None).unwrap();
+    let _early_peer = b.accept(listening).unwrap();
+    assert_eq!(
+        a.start_tls(early.socket, "peer.ke2.test".into()),
+        Err(moruna_svc::CallError::Remote(net::Error::TlsUnavailable))
+    );
+    // Not a time.
+    let mut platform = clock_client(link);
+    for nonsense in [0, 253_402_300_800, u64::MAX] {
+        assert_eq!(
+            platform.set_utc(nonsense),
+            Err(moruna_svc::CallError::Remote(clock::Error::BadTime))
+        );
+    }
+    assert_eq!(
+        a.start_tls(early.socket, "peer.ke2.test".into()),
+        Err(moruna_svc::CallError::Remote(net::Error::TlsUnavailable))
+    );
+    // The time: from now on TLS is verified against it.
+    platform.set_utc(UTC).unwrap();
+    // Once.
+    assert_eq!(
+        platform.set_utc(UTC + 60),
+        Err(moruna_svc::CallError::Remote(clock::Error::Already))
+    );
+    let opened = a.open(Target::Endpoint(address), None).unwrap();
+    let peer = peer(b, listening, config);
+    a.start_tls(opened.socket, "peer.ke2.test".into()).unwrap();
+    assert!(send(&mut a, opened.socket, b"ke2-private-data"));
+    let mut reply = Vec::new();
+    loop {
+        let bytes = common::receive(&mut a, opened.socket, 32).unwrap();
+        if bytes.is_empty() {
+            break;
+        }
+        reply.extend(bytes);
+    }
+    assert_eq!(reply, b"verified-reply");
+    a.shutdown(opened.socket).unwrap();
+    drop(a);
+    peer.join().unwrap();
+    drop(platform);
+    drop(listener);
+    drop(slots);
+    server.join().unwrap();
+}
+
+#[test]
+fn a_time_that_makes_the_peer_s_certificate_invalid_fails_the_handshake() {
+    // The anchor is the only time the server has: one long after the test CA's
+    // certificates expire makes every chain invalid, with no plaintext fallback.
+    let (ca, config) = credentials();
+    let (mut slots, link, server) = common::serve_with_clock(CONFIG, Some(unanchored(&ca)));
+    let listener = slots.remove("listen").unwrap();
+    let mut a = client(moruna_svc::connect(&listener).unwrap());
+    let mut b = client(moruna_svc::connect(&listener).unwrap());
+    let (listening, address) = b
+        .listen(Endpoint::new(Addr::v4(127, 0, 0, 1), 0), 1)
+        .unwrap();
+    let mut platform = clock_client(link);
+    platform.set_utc(253_402_300_000).unwrap();
+    let opened = a.open(Target::Endpoint(address), None).unwrap();
+    let peer = peer(b, listening, config);
+    assert_eq!(
+        a.start_tls(opened.socket, "peer.ke2.test".into()),
+        Err(moruna_svc::CallError::Remote(net::Error::TlsFailed))
+    );
+    drop(a);
+    peer.join().unwrap();
+    drop(platform);
+    drop(listener);
+    drop(slots);
+    server.join().unwrap();
+}
+
+#[test]
+fn with_no_roots_there_is_no_tls_to_anchor() {
+    use netstack_protocol::clock;
+    let (slots, link, server) = common::serve_with_clock(CONFIG, None);
+    let mut platform = clock_client(link);
+    assert_eq!(
+        platform.set_utc(UTC),
+        Err(moruna_svc::CallError::Remote(clock::Error::NoTls))
+    );
+    drop(platform);
+    drop(slots);
+    server.join().unwrap();
+}
+
+#[test]
+fn a_boot_anchor_is_the_anchor_and_the_clock_link_is_refused_after_it() {
+    use netstack_protocol::clock;
+    let (ca, _) = credentials();
+    let (slots, link, server) = common::serve_with_clock(CONFIG, Some(trust(&ca)));
+    let mut platform = clock_client(link);
+    assert_eq!(
+        platform.set_utc(UTC),
+        Err(moruna_svc::CallError::Remote(clock::Error::Already))
+    );
+    drop(platform);
+    drop(slots);
+    server.join().unwrap();
+}
+
 #[test]
 fn caller_memory_validation_does_not_consume_queued_plaintext() {
     use moruna_svc::{CallError, Memory, Rights, map};

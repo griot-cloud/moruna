@@ -8,7 +8,7 @@ use moruna_svc::{
     Channel, Context, Decoder, Dispatcher, Factory, Handler, Outcome, ProtocolError, ProtocolId,
     Status, Wire,
 };
-use netstack_protocol::{Addr, Endpoint, Policy, Target, net};
+use netstack_protocol::{Addr, Endpoint, Policy, Target, clock, net};
 
 use crate::Stack;
 
@@ -215,6 +215,42 @@ impl Handler for Session {
         match self.shared.stack.try_borrow_mut() {
             Ok(mut st) => st.connection_closed(id),
             Err(_) => self.shared.gone.borrow_mut().push(id),
+        }
+    }
+}
+
+/// The clock link's handler (`moruna.net.clock`, system design 3D): `platform`, the only
+/// holder of the link's other end, anchors TLS's clock with the wall clock once it has
+/// it. The server serves the link as one channel, not as a listener, so no other
+/// process can reach it.
+pub struct ClockSession {
+    shared: Rc<Shared>,
+    now: fn() -> u64,
+}
+
+impl ClockSession {
+    /// The clock link's handler over `shared`, reading monotonic time from `now`.
+    pub fn new(shared: Rc<Shared>, now: fn() -> u64) -> ClockSession {
+        ClockSession { shared, now }
+    }
+}
+
+impl Handler for ClockSession {
+    fn protocol(&self) -> ProtocolId {
+        clock::ID
+    }
+
+    fn handle(&mut self, _cx: &mut Context<'_>, ordinal: u16, d: &mut Decoder<'_>) -> Outcome {
+        if ordinal != 1 {
+            return Outcome::Status(Status::UnknownMethod);
+        }
+        let Some(unix_seconds) = args::<u64>(d) else {
+            return Outcome::Status(Status::BadMessage);
+        };
+        let now = (self.now)();
+        match self.shared.stack.borrow_mut().anchor_tls(unix_seconds, now) {
+            Ok(()) => Outcome::reply(()),
+            Err(e) => Outcome::Failure(e.code()),
         }
     }
 }

@@ -6,7 +6,7 @@
 
 use std::{collections::BTreeMap, rc::Rc, thread};
 
-use moruna_netstack::{Card, Shared, Stack, after_turn, factory, parse};
+use moruna_netstack::{Card, ClockSession, Shared, Stack, after_turn, factory, parse};
 use moruna_svc::{Channel, Dispatcher, Turn, now};
 
 pub const MAC_A: u64 = 0x5254_004b_4502;
@@ -112,6 +112,27 @@ pub fn serve_with_tls(
     wire: Wire,
     trust: Option<moruna_netstack::tls::Trust>,
 ) -> (BTreeMap<String, Channel>, thread::JoinHandle<()>) {
+    serve_linked(config, macs, wire, trust, None)
+}
+
+/// As [`serve_with_tls`], with no cards, and the server also serving the clock link
+/// (`moruna.net.clock`): returns the link's other end, the end `platform` holds.
+pub fn serve_with_clock(
+    config: &str,
+    trust: Option<moruna_netstack::tls::Trust>,
+) -> (BTreeMap<String, Channel>, Channel, thread::JoinHandle<()>) {
+    let (ours, theirs) = Channel::create().expect("a channel");
+    let (slots, join) = serve_linked(config, &[], no_external_cards(), trust, Some(theirs));
+    (slots, ours, join)
+}
+
+fn serve_linked(
+    config: &str,
+    macs: &[u64],
+    wire: Wire,
+    trust: Option<moruna_netstack::tls::Trust>,
+    clock: Option<Channel>,
+) -> (BTreeMap<String, Channel>, thread::JoinHandle<()>) {
     let config = parse(config).expect("the configuration");
     let mut ours = BTreeMap::new();
     let mut theirs = Vec::new();
@@ -140,6 +161,10 @@ pub fn serve_with_tls(
         for (listener, policy) in theirs {
             d.listen(listener, factory(Rc::clone(&shared), policy))
                 .expect("listen");
+        }
+        if let Some(clock) = clock {
+            d.serve(clock, Box::new(ClockSession::new(Rc::clone(&shared), now)))
+                .expect("serve the clock link");
         }
         loop {
             after_turn(&shared, &mut d, now());
@@ -170,7 +195,7 @@ pub fn receive(
     max: u32,
 ) -> Result<Vec<u8>, moruna_svc::CallError<netstack_protocol::net::Error>> {
     use moruna_svc::{CallError, Memory, Rights, map};
-    let size = (u64::from(max.max(1)) + 4095) / 4096 * 4096;
+    let size = u64::from(max.max(1)).div_ceil(4096) * 4096;
     let memory = Memory::create_in(size, &client.account().0).map_err(CallError::Kernel)?;
     let loan = Memory(
         memory
