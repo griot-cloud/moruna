@@ -182,6 +182,50 @@ fn a_run_that_needs_little_of_a_large_budget_makes_little() {
 }
 
 #[test]
+fn what_is_made_follows_what_the_run_uses_not_its_budget() {
+    const GIB: u64 = 1024 * MIB;
+    let first = moruna_arena::FIRST_GRANTED_REGION;
+    let heap = Heap::new(256 * MIB);
+    let arena = Arena::with_backing(config(GIB), heap.clone()).expect("a granted arena");
+    // A small region at start, whatever the budget; each grant is a region and one alignment.
+    assert_eq!(heap.given(), vec![first + 64 * 1024]);
+    assert_eq!(arena.host_capacity(), GIB);
+    let made = |arena: &Arena| GIB - arena.uncommitted_bytes();
+    let mut held = Vec::new();
+    for i in 1..=300u64 {
+        held.push(arena.alloc(MIB as usize, Tier::Host).expect("room"));
+        let used = i * MIB;
+        assert!(
+            made(&arena) <= (2 * used).max(first),
+            "{used} bytes used, {} made",
+            made(&arena)
+        );
+    }
+    // Each region as large as all before it, up to one grant.
+    let regions: Vec<u64> = heap.given().iter().map(|b| b - 64 * 1024).collect();
+    assert_eq!(
+        regions,
+        vec![first, first, 2 * first, 4 * first, 256 * MIB - 64 * 1024],
+        "{regions:?}"
+    );
+    drop(held);
+}
+
+#[test]
+fn a_large_first_allocation_makes_a_region_that_holds_it() {
+    let heap = Heap::new(256 * MIB);
+    let arena = Arena::with_backing(config(1024 * MIB), heap.clone()).expect("a granted arena");
+    // The Parquet sink's 128 MiB buffer, past the first region.
+    let big = arena
+        .alloc(128 * MIB as usize, Tier::Host)
+        .expect("a region for it");
+    assert_eq!(heap.given().len(), 2);
+    assert_eq!(heap.given()[1], 128 * MIB + 64 * 1024);
+    assert_eq!(arena.side_regions(), 0);
+    drop(big);
+}
+
+#[test]
 fn allocations_that_find_the_regions_full_together_make_each_region_once() {
     let heap = Heap::new(4 * MIB);
     let budget = 64 * MIB;
