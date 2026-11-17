@@ -291,7 +291,8 @@ impl Arena {
                     .min(FIRST_GRANTED_REGION)
                     .min(region::granted_chunk(backing.as_ref(), align));
                 let hosts = granted(backing.as_ref(), first, align)?;
-                uncommitted = host_bytes - first;
+                let made: u64 = hosts.iter().map(|h| h.mapping.bytes()).sum();
+                uncommitted = host_bytes - made;
                 (hosts, host_tier == Tier::PinnedHost)
             }
         };
@@ -685,9 +686,16 @@ fn granted(backing: &dyn HostBacking, bytes: u64, align: u64) -> Result<Vec<regi
     let mut out = Vec::new();
     let mut left = bytes;
     while left >= GRANULE {
-        let take = left.min(chunk);
-        out.push(region::new_granted(backing, take, align)?);
-        left -= take;
+        let asked = left.min(chunk);
+        let host = region::new_granted(backing, asked, align)?;
+        // A misaligned grant may hold an alignment less than asked: what it holds is counted,
+        // and the shortfall is not chased with a grant of its own.
+        let short = host.mapping.bytes() < asked;
+        left = left.saturating_sub(host.mapping.bytes());
+        out.push(host);
+        if short {
+            break;
+        }
     }
     Ok(out)
 }
@@ -878,12 +886,13 @@ impl Inner {
                 return None;
             }
         };
+        let usable = made.mapping.bytes();
         let region = Arc::new(HostRegion {
             space: Space::new(
                 made.mapping.base(),
-                made.mapping.bytes(),
+                usable,
                 self.host_tier,
-                made.mapping.bytes() < SMALL_BUDGET_BYTES,
+                usable < SMALL_BUDGET_BYTES,
                 Arc::clone(&self.host_watermark),
             ),
             _mapping: made.mapping,
@@ -903,11 +912,12 @@ impl Inner {
             // would pick are still the last to fill.
             let at = host.iter().position(|r| !r.base).unwrap_or(host.len());
             host.insert(at, region);
-            self.uncommitted.fetch_sub(take, Ordering::SeqCst);
+            self.uncommitted
+                .fetch_sub(usable.min(take), Ordering::SeqCst);
         }
         tracing::info!(
             target: "arena.commit",
-            bytes = take,
+            bytes = usable,
             uncommitted = self.uncommitted.load(Ordering::SeqCst),
             "the arena made a region of its budget"
         );

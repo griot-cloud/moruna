@@ -22,7 +22,9 @@ use parquet::file::properties::WriterProperties;
 
 use crate::checkpoint::{CommittedFile, Ledger};
 use crate::commit::{ObjectPrefix, TMP_SUFFIX};
-use crate::file_buf::{FileBuf, FileBuffers, TOO_LARGE, differing_field, hex, rows_bytes};
+use crate::file_buf::{
+    FileBuf, FileBuffers, TOO_LARGE, differing_field, footer_for, hex, rows_bytes,
+};
 use crate::stats::SinkStats;
 use crate::{Phase, host_tier, part_name, require_host};
 
@@ -228,15 +230,12 @@ impl ParquetSink {
             0 => self.cfg.file_bytes,
             lane => lane,
         };
-        let (buf, roll_bytes) =
+        let (file, roll_bytes) =
             self.buffers
                 .alloc_file_buf(min_bytes, self.cfg.row_group_bytes, file_bytes)?;
         lane.roll_bytes = roll_bytes;
         self.lock().stats.roll_bytes = roll_bytes;
-        let shared = Arc::new(Mutex::new(FileBuf {
-            buf: Some(buf),
-            used: 0,
-        }));
+        let shared = Arc::new(Mutex::new(file));
         let writer = ArrowWriter::try_new(
             ArenaWrite {
                 shared: Arc::clone(&shared),
@@ -459,6 +458,25 @@ impl ParquetSink {
                 }
             }
         }
+        // Stream C (2026-11-17): the buffer grows with the file. Room for the morsel and the
+        // footer is made before it is encoded; when the arena has none, a file that holds
+        // morsels rolls at what it holds and the morsel opens the next, so a tight arena writes
+        // smaller files rather than refusing the run.
+        if let Some(current) = lane.current.as_ref() {
+            let so_far =
+                current.writer.bytes_written() as u64 + current.writer.in_progress_size() as u64;
+            let need = so_far.saturating_add(bytes);
+            let roomy = current
+                .shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reserve(need.saturating_add(footer_for(need)));
+            if !roomy && !current.seqs.is_empty() && pending.is_none() {
+                let need = if bytes > lane.roll_bytes { bytes } else { 0 };
+                pending = Some(self.roll(lane)?);
+                self.open_file(lane, need)?;
+            }
+        }
         let roll_bytes = lane.roll_bytes;
         let Some(current) = lane.current.as_mut() else {
             return Err(MorunaError::Sink("the sink has no open file".into()));
@@ -611,11 +629,11 @@ impl Sink for ParquetSink {
         inner.declared = Some(Arc::clone(schema));
         // A fresh run's output is the prefix's whole content (f.1, 2026-11-14).
         inner.stats.earlier_files_removed = self.dest.clear_earlier_output("parquet");
-        // The file buffers, now, while the arena holds nothing else: the pair's bytes, one
-        // buffer per lane (f.12).
-        let lane = self
-            .buffers
-            .alloc_set(self.cfg.file_bytes, self.max_lanes)?;
+        // Each lane's share of the pair's bytes (f.12). No buffer is made here (stream C,
+        // 2026-11-17): a lane makes its own when it opens its first file, and it grows with the
+        // file, so a sink that writes little holds little and a lane that never opens a file
+        // holds nothing.
+        let lane = self.buffers.lane_cap(self.cfg.file_bytes, self.max_lanes);
         self.lane_bytes
             .store(lane, std::sync::atomic::Ordering::SeqCst);
         inner.phase = Phase::Open;

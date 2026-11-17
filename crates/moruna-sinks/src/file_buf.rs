@@ -49,6 +49,11 @@ pub(crate) fn footer_for(want: u64) -> u64 {
     FOOTER_HEADROOM.min(want.max(2) / 2)
 }
 
+// Stream C (2026-11-17): a lane's buffer starts small and grows with its file.
+/// The bytes a lane's file buffer starts with when no spare is free: it doubles as the file
+/// grows, up to the lane's share.
+pub(crate) const START_BYTES: u64 = 8 << 20;
+
 /// The bytes a batch's rows occupy, which is what the encoder reads: not the capacity of the
 /// buffers they are a slice of. A morsel read back from staging is a slice of the segment it
 /// was staged in, and measured by its buffers it looked several times its size, so the sink
@@ -69,26 +74,73 @@ pub(crate) fn rows_bytes(batch: &RecordBatch) -> u64 {
 pub(crate) struct FileBuf {
     pub(crate) buf: Option<Buffer>,
     pub(crate) used: usize,
+    /// Where the buffer grows from when the file outgrows it, and how far: `None` for a buffer
+    /// sized for one morsel, which never grows (h).
+    pub(crate) growth: Option<Growth>,
+}
+
+// Stream C (2026-11-17): a lane's buffer is made at its first file and grows with it.
+/// How a file buffer grows: from `alloc`, to at most `cap` bytes, a size class at a time.
+#[derive(Clone)]
+pub(crate) struct Growth {
+    pub(crate) alloc: Arc<dyn Allocator>,
+    pub(crate) cap: u64,
 }
 
 impl FileBuf {
-    /// Append `data` at the end of what the encoder has written, or refuse with `TOO_LARGE`
-    /// when the buffer cannot hold it: never a truncated file (h).
+    /// Append `data` at the end of what the encoder has written, growing the buffer when it is
+    /// full, or refuse with `TOO_LARGE` when it cannot hold it: never a truncated file (h).
     pub(crate) fn append(&mut self, data: &[u8]) -> std::io::Result<()> {
-        let FileBuf { buf, used } = self;
+        let end = self.used + data.len();
+        let len = self.buf.as_ref().map_or(0, |b| b.len());
+        if self.buf.is_some() && end > len && !self.reserve(end as u64) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!("{TOO_LARGE}: {end} bytes into {len} bytes"),
+            ));
+        }
+        let FileBuf { buf, used, .. } = self;
         let Some(buf) = buf.as_mut() else {
             return Err(std::io::Error::other("the output buffer is gone"));
         };
-        let end = *used + data.len();
-        if end > buf.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                format!("{TOO_LARGE}: {end} bytes into {} bytes", buf.len()),
-            ));
-        }
         buf[*used..end].copy_from_slice(data);
         *used = end;
         Ok(())
+    }
+
+    /// Room for `need` bytes in all: true when the buffer holds them, grown when it did not
+    /// into a larger class (twice its size, or the class `need` falls in, at most `cap`), the
+    /// bytes written so far copied over and the old buffer given back; false when it cannot
+    /// grow that far (no growth, past `cap`, or the arena has no such buffer).
+    pub(crate) fn reserve(&mut self, need: u64) -> bool {
+        let Some(buf) = self.buf.as_ref() else {
+            return false;
+        };
+        let len = buf.len() as u64;
+        if need <= len {
+            return true;
+        }
+        let Some(growth) = &self.growth else {
+            return false;
+        };
+        if need > growth.cap {
+            return false;
+        }
+        let tier = host_tier(&*growth.alloc);
+        // Twice the buffer first, so a growing file is copied a bounded number of times; the
+        // least class that holds `need` when the arena has nothing that large.
+        let doubled = class_ceil(need.max(len.saturating_mul(2))).min(growth.cap);
+        let least = class_ceil(need).min(growth.cap);
+        let bigger = [doubled, least]
+            .into_iter()
+            .filter_map(|want| usize::try_from(want).ok())
+            .find_map(|want| growth.alloc.alloc(want, tier).ok());
+        let Some(mut bigger) = bigger else {
+            return false;
+        };
+        bigger[..self.used].copy_from_slice(&buf[..self.used]);
+        self.buf = Some(bigger);
+        true
     }
 }
 
@@ -115,8 +167,11 @@ impl FileBuffers {
     }
 
     /// The file buffer and the roll size it implies (f.1). A morsel that needs more than
-    /// `file_bytes` gets the buffer it needs or nothing; an ordinary file takes the largest
-    /// buffer the arena will give between `file_bytes` and the class its row group needs.
+    /// `file_bytes` gets a buffer sized for it, which does not grow, or nothing. An ordinary
+    /// file rolls at `file_bytes` (the lane's share, less the footer) but starts in a spare or in
+    /// a buffer of [`START_BYTES`], and the buffer grows with the file up to `file_bytes`
+    /// (stream C, 2026-11-17): a run that writes a few megabytes holds a few megabytes, where
+    /// every lane used to hold its whole share from the sink's `open`.
     ///
     /// Every request is a whole size class and the footer headroom lives *inside* it (f.1).
     /// Asking for `row_group_bytes + footer` asked for 129 MiB at the default row group, and
@@ -127,13 +182,7 @@ impl FileBuffers {
         min_bytes: u64,
         row_group_bytes: u64,
         file_bytes: u64,
-    ) -> Result<(Buffer, u64)> {
-        if min_bytes == 0
-            && let Some(buf) = self.spare.lock().unwrap_or_else(|e| e.into_inner()).pop()
-        {
-            let want = buf.len() as u64;
-            return Ok((buf, want - footer_for(want)));
-        }
+    ) -> Result<(FileBuf, u64)> {
         // `row_group_bytes` is a flush threshold and an upper bound, so the footer may come out
         // of its class; `min_bytes` is a morsel that has to fit, so its class is sized above the
         // footer as well as above the morsel.
@@ -154,13 +203,36 @@ impl FileBuffers {
         // and completes, which is what S6 asks of every other knob: degrade, never refuse
         // what can still be done.
         let floor = hard.max(class_ceil(GRANULE));
-        let mut want = class_ceil(file_bytes).max(floor);
+        let cap = class_ceil(file_bytes).max(floor);
+        let growth = (min_bytes == 0).then(|| Growth {
+            alloc: Arc::clone(&self.alloc),
+            cap,
+        });
+        let file = |buf: Buffer, growth: Option<Growth>| FileBuf {
+            buf: Some(buf),
+            used: 0,
+            growth,
+        };
+        if min_bytes == 0
+            && let Some(buf) = self.spare.lock().unwrap_or_else(|e| e.into_inner()).pop()
+        {
+            let cap = cap.max(buf.len() as u64);
+            let growth = growth.map(|g| Growth { cap, ..g });
+            return Ok((file(buf, growth), cap - footer_for(cap)));
+        }
+        let first = match min_bytes {
+            0 => class_ceil(START_BYTES).min(cap).max(floor),
+            _ => cap,
+        };
+        let mut want = first;
         loop {
             match usize::try_from(want) {
                 Ok(capacity) => match self.alloc.alloc(capacity, host_tier(&*self.alloc)) {
-                    // The footer is spent out of the class, so the file rolls below it.
+                    // The footer is spent out of the class, so the file rolls below it. An
+                    // ordinary file rolls at its cap, to which its buffer grows; one whose first
+                    // buffer the arena already had to halve rolls at what it got.
                     Ok(buf) => {
-                        if want < soft {
+                        if want < soft.min(cap) && want < first {
                             tracing::info!(
                                 target: "moruna::sink",
                                 requested_row_group_bytes = row_group_bytes,
@@ -168,7 +240,9 @@ impl FileBuffers {
                                 "the arena cannot hold this row group target; writing smaller row groups"
                             );
                         }
-                        return Ok((buf, want - footer_for(want)));
+                        let roll_at = if want < first { want } else { cap };
+                        let growth = growth.map(|g| Growth { cap: roll_at, ..g });
+                        return Ok((file(buf, growth), roll_at - footer_for(roll_at)));
                     }
                     // Below the floor the error stands: a sink that cannot hold one row group
                     // cannot encode one.
@@ -197,11 +271,12 @@ impl FileBuffers {
         }
     }
 
-    /// The pair's bytes, `2 x file_bytes`, as `count` buffers (08 f.12): a sink that encodes
-    /// into `count` files at once holds what one with two buffers held, divided between them,
-    /// and keeps up to `count` spares. Taken at `open` while the arena is still empty, as the
-    /// pair is. Returns the size of each buffer.
-    pub(crate) fn alloc_set(&self, file_bytes: u64, count: usize) -> Result<u64> {
+    /// The share of the pair's bytes, `2 x file_bytes`, each of `count` lanes may grow its file
+    /// buffer to (08 f.12): a sink that encodes into `count` files at once holds at most what
+    /// one with two buffers held, divided between them, and keeps up to `count` spares. Nothing
+    /// is allocated here (stream C, 2026-11-17): a lane's buffer is made when it opens its first
+    /// file, so a lane that never opens one holds nothing.
+    pub(crate) fn lane_cap(&self, file_bytes: u64, count: usize) -> u64 {
         let count = count.max(2);
         let tier = host_tier(&*self.alloc);
         let floor = class_ceil(GRANULE);
@@ -214,24 +289,7 @@ impl FileBuffers {
             if count == 2 { 1 } else { count },
             std::sync::atomic::Ordering::SeqCst,
         );
-        loop {
-            let capacity = usize::try_from(want).map_err(|_| {
-                MorunaError::Sink(format!(
-                    "a file buffer of {want} bytes does not fit this platform"
-                ))
-            })?;
-            let set: Result<Vec<Buffer>> = (0..count)
-                .map(|_| self.alloc.alloc(capacity, tier))
-                .collect();
-            match set {
-                Ok(set) => {
-                    *self.spare.lock().unwrap_or_else(|e| e.into_inner()) = set;
-                    return Ok(want);
-                }
-                Err(e) if want <= floor => return Err(e),
-                Err(_) => want = (want / 2).max(floor),
-            }
-        }
+        want
     }
 }
 
