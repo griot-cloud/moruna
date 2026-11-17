@@ -202,6 +202,19 @@ impl Outbound {
     }
 }
 
+/// The job's secrets by name, as the `spec` message carries them beside the document (system
+/// design 3B). They never go into the document or its digest; what prints them prints only
+/// their names.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secrets(pub std::collections::BTreeMap<String, String>);
+
+impl std::fmt::Debug for Secrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0.keys()).finish()
+    }
+}
+
 /// A message from the peer to Moruna (MH 4.3).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -214,6 +227,10 @@ pub enum Inbound {
         /// document is planned by the default planner.
         #[serde(default)]
         plan: Option<String>,
+        /// The job's secrets, by name: what the references in its object-store settings
+        /// (`{"secret": "<name>"}`) resolve to.
+        #[serde(default, skip_serializing_if = "is_empty")]
+        secrets: Secrets,
     },
     /// Cancel the run: the manifest is written and the process exits 130.
     Cancel,
@@ -232,6 +249,10 @@ pub enum Inbound {
         #[serde(default)]
         error: Option<String>,
     },
+}
+
+fn is_empty(secrets: &Secrets) -> bool {
+    secrets.0.is_empty()
 }
 
 impl Inbound {
@@ -611,13 +632,44 @@ mod tests {
             Ok(Inbound::Spec {
                 spec: serde_json::json!({"a": 1}),
                 plan: None,
+                secrets: Default::default(),
             })
         );
+        // The job's secrets, by name, beside the document; what prints them prints their names.
+        let with = Inbound::parse(
+            r#"{"type":"spec","spec":{},"secrets":{"aws.key":"hunter2","gcs":"x"}}"#,
+        )
+        .expect("a spec with secrets");
+        let Inbound::Spec { secrets, .. } = &with else {
+            panic!("a spec")
+        };
+        assert_eq!(
+            secrets.0.get("aws.key").map(String::as_str),
+            Some("hunter2")
+        );
+        let printed = format!("{with:?}");
+        assert!(
+            printed.contains("aws.key") && !printed.contains("hunter2"),
+            "{printed}"
+        );
+        assert!(
+            Inbound::parse(r#"{"type":"spec","spec":{},"secrets":{"k":1}}"#).is_err(),
+            "a secret is a string"
+        );
+        // None is no member at all, as a peer before 3.2 writes it.
+        let none = serde_json::to_string(&Inbound::Spec {
+            spec: serde_json::json!({}),
+            plan: None,
+            secrets: Default::default(),
+        })
+        .unwrap();
+        assert!(!none.contains("secrets"), "{none}");
         assert_eq!(
             Inbound::parse("{\"type\":\"spec\",\"spec\":{},\"plan\":\"TVBMMQ==\"}"),
             Ok(Inbound::Spec {
                 spec: serde_json::json!({}),
                 plan: Some("TVBMMQ==".into()),
+                secrets: Default::default(),
             })
         );
         assert!(Inbound::parse("{\"type\":\"resize\",\"memory\":1}").is_err());

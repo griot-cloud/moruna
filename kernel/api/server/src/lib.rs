@@ -24,7 +24,16 @@
 //!   last [`AUDIT_LIMIT`] are kept in memory, and `node/audit` answers the newest
 //!   [`AUDIT_ANSWER_LIMIT`], newest first.
 //! - MCP (2D): `POST /mcp` on the same port with the same tokens, MCP's Streamable HTTP,
-//!   stateless, at [`PROTOCOL_VERSION`]: one tool per operation, `moruna_<id>`.
+//!   stateless, at [`PROTOCOL_VERSION`]: one tool per operation, `moruna_<id>`, but the stream
+//!   of events.
+//! - Jobs (3A, 3B): the server is the engine's host. Through an [`EngineHost`] the node gives it
+//!   ([`Server::with_engine`]), it has the engine check a document, starts a fresh engine for
+//!   each job with the host protocol's `spec`, sends `cancel`, and reads `hello`, `heartbeat`,
+//!   the framed event records, `report` and `exit`. One job runs at a time; the last
+//!   [`JOBS_KEPT`] are kept with their state, heartbeat, exit and report; the last
+//!   [`EVENTS_KEPT`] event and log records, within [`EVENT_BUFFER_BYTES`], are kept for
+//!   `GET /v1/jobs/{id}/events`, which sends them as Server-Sent Events and replays from
+//!   `?from=`. What a job says is secret appears in no answer, event, log or report.
 //!
 //! The crate is `no_std` with `alloc`. On the kernel, ring's randomness comes from
 //! `moruna_svc::random`, as the network server's does.
@@ -33,14 +42,23 @@
 #![warn(missing_docs)]
 
 extern crate alloc;
+// The tests' helpers are shared with the end-to-end tests, which name this crate from outside.
+#[cfg(test)]
+extern crate self as moruna_api_server;
 #[cfg(test)]
 extern crate std;
 
 mod api;
 mod audit;
 mod der;
+mod engine;
+#[cfg(test)]
+#[path = "../tests/common/engine.rs"]
+mod fake;
 mod http;
 mod identity;
+mod jobs;
+mod json;
 mod mcp;
 #[cfg(target_os = "none")]
 mod random;
@@ -54,8 +72,10 @@ mod transport;
 
 pub use api::NodeFacts;
 pub use audit::{AUDIT_ANSWER_LIMIT, AUDIT_LIMIT};
+pub use engine::{ENGINE_LINE_LIMIT, EngineHost, HostError, NoEngine};
 pub use http::{BODY_BUDGET, BODY_LIMIT, HEADER_LIMIT};
 pub use identity::{Identity, IdentityError, VALID_AFTER_SECONDS, VALID_BEFORE_SECONDS};
+pub use jobs::{EVENT_BUFFER_BYTES, EVENTS_KEPT, JOBS_KEPT, REPORT_BYTES};
 pub use mcp::PROTOCOL_VERSION;
 pub use server::{CONNECTION_LIMIT, Config, HANDSHAKE_LIMIT_MS, IDLE_LIMIT_MS, OPEN_LIMIT, Server};
 pub use token::{MOST_AHEAD_SECONDS, TokenKey};

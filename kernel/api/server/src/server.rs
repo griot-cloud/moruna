@@ -5,13 +5,14 @@
 
 use crate::{
     api::{Api, NodeFacts},
+    engine::{EngineHost, NoEngine},
     http::{BODY_BUDGET, Budget, Session},
     identity::Identity,
     tls::{self, Tls, WallClock},
     token::TokenKey,
     transport::{Clock, Transport, TransportError},
 };
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use rustls::ServerConfig;
 
 /// The most connections served at once. A connection accepted beyond them has its first request
@@ -165,15 +166,26 @@ impl<T: Transport> Connection<T> {
 }
 
 impl<T: Transport, C: Clock> Server<T, C> {
-    /// A server for `config`, with time from `clock`.
+    /// A server for `config`, with time from `clock`, on a node that runs no jobs: the job
+    /// operations that need the engine answer `busy`.
     pub fn new(config: Config, clock: C) -> Result<Self, rustls::Error> {
+        Self::with_engine(config, clock, Box::new(NoEngine))
+    }
+
+    /// A server for `config`, with time from `clock`, that runs jobs through `engine` (system
+    /// design, section 3A). The caller polls when the engine has sent something, too.
+    pub fn with_engine(
+        config: Config,
+        clock: C,
+        engine: Box<dyn EngineHost>,
+    ) -> Result<Self, rustls::Error> {
         let wall = Arc::new(WallClock::default());
         wall.set(clock.unix_seconds());
         Ok(Self {
             tls: tls::config(&config.identity, wall.clone())?,
             wall,
             clock,
-            api: Api::new(config.facts, config.token_keys),
+            api: Api::new(config.facts, config.token_keys, engine),
             connections: Vec::new(),
             budget: Budget::new(BODY_BUDGET),
             scratch: vec![0; READ_CHUNK],
@@ -207,13 +219,14 @@ impl<T: Transport, C: Clock> Server<T, C> {
         }
     }
 
-    /// Moves every connection as far as it can go now: reads what has arrived, answers it,
-    /// writes what can be written, and closes each connection that is done, broken, idle, or
-    /// past its handshake's limit.
+    /// Reads what the engine has sent, then moves every connection as far as it can go now:
+    /// reads what has arrived, answers it, writes what can be written, and closes each
+    /// connection that is done, broken, idle, or past its handshake's limit.
     pub fn poll(&mut self) {
         let now_ms = self.clock.monotonic_ms();
         let now = self.clock.unix_seconds();
         self.wall.set(now);
+        self.api.pump(now);
         let mut index = 0;
         while index < self.connections.len() {
             let keep = self.connections[index].drive(
@@ -226,7 +239,7 @@ impl<T: Transport, C: Clock> Server<T, C> {
                 index += 1;
             } else {
                 let mut connection = self.connections.remove(index);
-                connection.session.release(&mut self.budget);
+                connection.session.end(&mut self.api, &mut self.budget);
                 connection.transport.close();
             }
         }

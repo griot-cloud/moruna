@@ -331,6 +331,7 @@ name = "devices"
 version = "0.1.0"
 dependencies = [
  "devices-protocol",
+ "moruna-abi",
  "moruna-driver-table",
  "moruna-mmio",
  "moruna-node",
@@ -446,6 +447,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
+name = "flatbuffers"
+version = "25.12.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
+dependencies = [
+ "bitflags 2.13.2",
+ "rustc_version",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -547,16 +558,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
 dependencies = [
  "byteorder",
-]
-
-[[package]]
-name = "heapless"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
-dependencies = [
- "hash32",
- "stable_deref_trait",
 ]
 
 [[package]]
@@ -792,9 +793,12 @@ dependencies = [
  "getrandom 0.2.17",
  "httparse",
  "moruna-api",
+ "moruna-event",
+ "moruna-record",
  "moruna-svc",
  "ring",
  "rustls",
+ "serde",
  "serde_json",
 ]
 
@@ -810,6 +814,15 @@ name = "moruna-driver-table"
 version = "0.1.0"
 dependencies = [
  "moruna-abi",
+]
+
+[[package]]
+name = "moruna-event"
+version = "0.6.6"
+dependencies = [
+ "flatbuffers",
+ "moruna-record",
+ "serde",
 ]
 
 [[package]]
@@ -900,20 +913,32 @@ name = "moruna-netstack"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
- "heapless 0.9.3",
+ "heapless",
  "moruna-svc",
  "netstack-protocol",
  "rcgen",
  "ring",
  "rustls",
- "smoltcp 0.13.1",
+ "smoltcp",
  "zeroize",
+]
+
+[[package]]
+name = "moruna-netvsc"
+version = "0.1.0"
+dependencies = [
+ "guestmem_core",
+ "moruna-vmbus",
+ "netvsp_protocol",
+ "vmbus_ring",
+ "zerocopy",
 ]
 
 [[package]]
 name = "moruna-node"
 version = "0.1.0"
 dependencies = [
+ "moruna-abi",
  "moruna-sys",
 ]
 
@@ -921,13 +946,20 @@ dependencies = [
 name = "moruna-node-api"
 version = "0.1.0"
 dependencies = [
- "heapless 0.8.0",
+ "heapless",
+ "httparse",
+ "moruna-api",
+ "moruna-api-server",
  "moruna-netstack",
  "moruna-node-config",
  "moruna-node-platform",
  "moruna-svc",
  "netstack-protocol",
- "smoltcp 0.12.0",
+ "rcgen",
+ "ring",
+ "rustls",
+ "serde_json",
+ "smoltcp",
 ]
 
 [[package]]
@@ -990,6 +1022,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-ostd-adaptation"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+]
+
+[[package]]
 name = "moruna-pci"
 version = "0.1.0"
 dependencies = [
@@ -1044,6 +1083,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-storvsc"
+version = "0.1.0"
+dependencies = [
+ "guestmem_core",
+ "moruna-vmbus",
+ "scsi_defs",
+ "storvsp_protocol",
+ "vmbus_ring",
+ "zerocopy",
+]
+
+[[package]]
 name = "moruna-svc"
 version = "0.1.0"
 dependencies = [
@@ -1072,6 +1123,18 @@ dependencies = [
  "moruna-mmio",
  "moruna-pci",
  "moruna-svc",
+]
+
+[[package]]
+name = "moruna-vmbus"
+version = "0.1.0"
+dependencies = [
+ "guestmem_core",
+ "guid",
+ "hvdef",
+ "moruna-vmbus",
+ "vmbus_core",
+ "vmbus_ring",
 ]
 
 [[package]]
@@ -1543,6 +1606,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8188909339ccc0c68cfb5a04648313f09621e8b87dc03095454f1a11f6c5d436"
 
 [[package]]
+name = "rustc_version"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
+dependencies = [
+ "semver",
+]
+
+[[package]]
 name = "rustls"
 version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1645,6 +1717,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1712,20 +1790,6 @@ checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 
 [[package]]
 name = "smoltcp"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dad095989c1533c1c266d9b1e8d70a1329dd3723c3edac6d03bbd67e7bf6f4bb"
-dependencies = [
- "bitflags 1.3.2",
- "byteorder",
- "cfg-if",
- "defmt 0.3.101",
- "heapless 0.8.0",
- "managed",
-]
-
-[[package]]
-name = "smoltcp"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f73d40463bba65efc9adc6370b56df76d563cc46e2482bba58351b4afb7535e"
@@ -1734,7 +1798,7 @@ dependencies = [
  "byteorder",
  "cfg-if",
  "defmt 0.3.101",
- "heapless 0.9.3",
+ "heapless",
  "managed",
 ]
 

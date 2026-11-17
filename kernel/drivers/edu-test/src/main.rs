@@ -47,7 +47,7 @@ fn run() -> i64 {
         .lookup(String::from("edu0"))
         .map_err(|e| format!("looking up edu0: {e:?}"))
         .and_then(|c| {
-            edu::Client::connect(c, deadline_in(60 * SECONDS))
+            edu::Client::connect(c, deadline_in(moruna_svc::READY_TIMEOUT))
                 .map_err(|e| format!("hello to edu0: {e:?}"))
         })
         .and_then(|mut c| {

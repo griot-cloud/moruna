@@ -30,7 +30,7 @@ fn get(path: &str, token: Option<&str>) -> Request {
     Request {
         method: "GET".to_string(),
         path: path.to_string(),
-        query: false,
+        query: None,
         authorization: token.map_or(Authorization::Missing, |token| {
             Authorization::One(format!("Bearer {token}").into_bytes())
         }),
@@ -44,7 +44,11 @@ fn body(answer: &Answer) -> Value {
 
 /// An API whose one token key is `signer`'s.
 fn api(signer: &Signer) -> Api {
-    Api::new(facts(), vec![TokenKey::new(signer.public())])
+    Api::new(
+        facts(),
+        vec![TokenKey::new(signer.public())],
+        Box::new(crate::NoEngine),
+    )
 }
 
 #[test]
@@ -87,7 +91,7 @@ fn health_never_reads_the_header() {
     assert_eq!(api.recorded(), 0, "health leaves no record");
     // Not even refused.
     let mut query = get("/v1/health", None);
-    query.query = true;
+    query.query = Some(String::new());
     assert_eq!(api.answer(&query, &[], NOW).status, 400);
     assert_eq!(api.recorded(), 0);
 }
@@ -121,13 +125,13 @@ fn what_no_operation_takes_is_refused() {
     refused(api.answer(&head, &[], NOW), 400, "invalid");
     assert_eq!(api.recorded(), 0, "no operation was called");
     let mut query = get("/v1/node", Some(&admin));
-    query.query = true;
+    query.query = Some(String::new());
     refused(api.answer(&query, &[], NOW), 400, "invalid");
     let with_body = get("/v1/node", Some(&admin));
     refused(api.answer(&with_body, b"{}", NOW), 400, "invalid");
     // A token is checked before the request is.
     let mut no_token = get("/v1/node", None);
-    no_token.query = true;
+    no_token.query = Some("x=1".to_string());
     refused(api.answer(&no_token, &[], NOW), 401, "unauthorized");
     assert_eq!(api.recorded(), 3);
 }
@@ -160,12 +164,13 @@ fn a_token_is_needed_and_its_scope_must_cover_the_operation() {
     assert_eq!(status(&mut api, "/v1/node", Some(&none)), 403);
     assert_eq!(status(&mut api, "/v1/node/audit", Some(&observe)), 403);
     assert_eq!(status(&mut api, "/v1/node/audit", Some(&submit)), 403);
-    // An operation called without a grant at all is unauthorized.
-    let node = &OPERATIONS[1];
-    assert_eq!(api.call(node, None, NOW).status, 401);
+    // A scope is checked before the request is: a query does not hide a forbidden call.
+    let mut query = get("/v1/node/audit", Some(&observe));
+    query.query = Some("x=1".to_string());
+    assert_eq!(api.answer(&query, &[], NOW).status, 403);
     let audit = api.records();
-    assert_eq!(audit[0].operation, "node");
-    assert_eq!(audit[0].status, 401);
+    assert_eq!(audit[0].operation, "node_audit");
+    assert_eq!(audit[0].status, 403);
     assert_eq!(audit[1].scope, [Scope::Submit]);
     assert_eq!(audit[1].key, TokenKey::new(signer.public()).id());
 }
@@ -200,7 +205,8 @@ fn audit_answers_the_newest_1000_of_the_10000_it_keeps() {
     };
     let node = &OPERATIONS[1];
     for second in 0..=AUDIT_LIMIT as u64 {
-        assert_eq!(api.call(node, Some(&grant), NOW + second).status, 200);
+        let outcome = api.call_tool(node, &grant, Inputs::default(), &Value::Null, NOW + second);
+        assert!(matches!(outcome, Outcome::Answer(answer) if answer.status == 200));
     }
     assert_eq!(
         api.recorded(),

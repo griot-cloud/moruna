@@ -44,7 +44,7 @@ type Client = imagefs::Client;
 
 fn connect(listener: &Channel) -> Result<Client, String> {
     let channel = moruna_svc::connect(listener).map_err(|e| format!("connecting: {e:?}"))?;
-    let mut c = Client::connect(channel, deadline_in(300 * SECONDS))
+    let mut c = Client::connect(channel, deadline_in(moruna_svc::READY_TIMEOUT))
         .map_err(|e| format!("hello to imagefs: {e:?}"))?;
     c.core().set_timeout(300 * SECONDS);
     Ok(c)
@@ -598,22 +598,17 @@ fn readonly_view(listener: &Channel) -> Result<String, String> {
     Ok("actual readonly source directory retained after source disconnect; mutations and parent escapes refused".into())
 }
 
-/// KB5-T9: the account protocol cannot decode old unchecked-budget requests.
+/// KB5-T9: the account protocol cannot decode old unchecked-budget requests. The server is
+/// waited for first (it serves only once its layer disks are up), and the refusal is given 5 s.
 fn old_major_refused(listener: &Channel) -> Result<(), String> {
-    let channel = moruna_svc::connect(listener).map_err(|e| format!("connecting: {e:?}"))?;
     let old = moruna_svc::protocol::ProtocolId::new(imagefs::ID.name, 1, 1);
-    match moruna_svc::ClientCore::connect(channel, old, deadline_in(5 * SECONDS)) {
-        Err(moruna_svc::CallError::Refused(refusal))
-            if refusal.reason == moruna_svc::protocol::Refusal::MajorMismatch
-                && refusal.server == imagefs::ID.hello() =>
-        {
-            Ok(())
-        }
-        other => Err(format!(
-            "the old major was not refused before requests: {:?}",
-            other.map(|_| ())
-        )),
-    }
+    conformance::old_major_refused(
+        listener,
+        imagefs::ID,
+        old,
+        moruna_svc::READY_TIMEOUT,
+        5 * SECONDS,
+    )
 }
 
 fn run() -> i64 {

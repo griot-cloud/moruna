@@ -1,30 +1,34 @@
-//! The node's `api` process (system design 1C and 2B), step 1: it owns the node's one
-//! listening port, TCP 443, and closes every connection it accepts. That proves the
-//! node's address, its route and the cloud's firewall rule. Step 2 gives the port TLS
-//! and the API's operations: the library `moruna-api-server`, which the program wires
-//! to these sockets (work item 2.2b).
+//! The node's `api` process (system design 1C, 2B and 2C; work items 1.3 and 2.2b): it
+//! owns the node's one listening port, TCP 443, and serves the node's API there through
+//! the library `moruna-api-server`: TLS 1.3, HTTP/1.1, the operations, tokens, the audit
+//! record and MCP. This crate only wires that library to the network server's sockets and
+//! to `platform`'s hand-over.
 //!
-//! The network server opens a listener on one of its interfaces' addresses, never on
-//! every address at once. So the listener is opened on the address of the node's one
-//! interface, `wan`, once DHCP has given it one, and it follows the lease (system
-//! design 1C): [`Service`] asks the network server for `wan`'s address every
-//! [`ADDRESS_POLL_NS`] while it has no listener, and every [`LEASE_POLL_NS`] while it
-//! listens. When the address is no longer the listener's, because the lease moved or
-//! was lost, it closes the listener, and opens one on the address `wan` has next.
-//!
-//! Before it listens, the process takes `platform`'s hand-over (system design 1D,
-//! work item 1.4): the first message on its `platform` link, the validated node config
-//! with the instance, the cloud and the wall clock. It keeps it, for step 2 serves with
-//! it. Once its listener first opens it answers `platform` with
-//! [`moruna_node_config::READY`], once, and `platform` then says the node is ready.
+//! - **The hand-over** (system design 1D, work item 1.4): the first message on the
+//!   `platform` link, the validated node config with the instance, the cloud, the wall
+//!   clock and the node's memory ([`handover`]). The server's identity, token keys and
+//!   node document come from it ([`node`]).
+//! - **The identity's line:** `moruna: tls sha256=<fingerprint>`, printed as soon as the
+//!   identity is made, before the listener opens and so before `ready`.
+//! - **The listener** follows `wan`'s lease (system design 1C). The network server opens a
+//!   listener on one of its interfaces' addresses, never on every address, so the process
+//!   asks for `wan`'s address every [`ADDRESS_POLL_NS`] while it has no listener and every
+//!   [`LEASE_POLL_NS`] while it listens; when the address is no longer the listener's, the
+//!   listener closes and one opens at the next ([`network::Network`]).
+//! - **`ready`:** once the listener first opens, the process answers `platform` with
+//!   [`moruna_node_config::READY`], once, and the node document's `boot_ms` is the core's
+//!   monotonic clock then.
+//! - **Serving:** each accepted socket is one server connection, its bytes moved by
+//!   requests the process sends to the network server without waiting on them
+//!   ([`network::Conn`]). One thread: a loop takes the network server's answers, polls the
+//!   server, sends what is to send, and waits for the next answer or deadline ([`run`]).
 //!
 //! Every wait here is on the network server, which ends within 30 s of its start if no
-//! lease comes (system design 1B), or on `platform`, which ends within 90 s if it finds
-//! no instance data; a request to a server that has ended fails, and the process then
-//! stops with that failure, as `moruna: fatal api: <reason>`.
+//! lease comes (system design 1B), or on `platform`; a request to a server that has ended
+//! fails, and the process then stops with that failure, as `moruna: fatal api: <reason>`.
 //!
-//! This library is the process's logic, so that it is tested on a host against the
-//! network server's own stack; `main.rs` gives it the process's start handles.
+//! This library is the process's logic, tested on a host against the network server's own
+//! stack; `main.rs` gives it the process's start handles.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -32,15 +36,16 @@
 
 extern crate alloc;
 
-use alloc::{format, string::String, vec, vec::Vec};
-use core::{convert::Infallible, fmt};
+use alloc::{format, rc::Rc, string::String, vec, vec::Vec};
+use core::{cell::RefCell, convert::Infallible, fmt};
 
+use moruna_api_server::{IdentityError, Server};
 use moruna_node_config::{Handover, HandoverError, READY};
-use moruna_svc::{
-    Account, CallError, Channel, DEADLINE_INFINITE, Encoder, Handle, Signals, Wire, deadline_in,
-    wait_one,
-};
-use netstack_protocol::{Addr, Endpoint, Info, Opened, net};
+use moruna_svc::{Account, CallError, Channel, DEADLINE_INFINITE, Handle, Signals, now, wait_one};
+use netstack_protocol::{Addr, Endpoint, Info, net};
+
+pub mod network;
+pub mod node;
 
 #[cfg(test)]
 mod tests;
@@ -61,10 +66,6 @@ pub const ADDRESS_POLL_NS: u64 = 100_000_000;
 /// How often it asks again while it listens, to follow the lease.
 pub const LEASE_POLL_NS: u64 = 1_000_000_000;
 
-/// `moruna.net`'s `accept` (its request 4), which the process sends without waiting
-/// for its answer, so that it can ask after the lease meanwhile.
-const ACCEPT: u16 = 4;
-
 /// Why the process cannot go on.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
@@ -74,12 +75,19 @@ pub enum Error {
     NoInterface,
     /// A request to the network server failed: which, and how.
     Network(&'static str, CallError<net::Error>),
+    /// The kernel refused something the process needs for its connections: what, and why.
+    Kernel(&'static str, moruna_svc::Error),
     /// The link to `platform` failed: what was being done, and the kernel's refusal.
     Link(&'static str, moruna_svc::Error),
     /// A message from `platform` carries handles, which no message of the hand-over does.
     LinkHandles,
     /// `platform`'s hand-over is refused.
     Handover(HandoverError),
+    /// The server's TLS identity could not be made: the operator's `tls` (when `true`), or
+    /// the node's own.
+    Identity(bool, IdentityError),
+    /// The server could not be made from its config.
+    Server(String),
 }
 
 impl fmt::Display for Error {
@@ -88,11 +96,15 @@ impl fmt::Display for Error {
             Error::NoSlot(slot) => write!(f, "no {slot} slot"),
             Error::NoInterface => write!(f, "the network server has no interface {INTERFACE}"),
             Error::Network(request, error) => write!(f, "{request}: {error:?}"),
+            Error::Kernel(what, error) => write!(f, "{what}: {}", error.name()),
             Error::Link(what, error) => {
                 write!(f, "the link to platform: {what}: {}", error.name())
             }
             Error::LinkHandles => f.write_str("a message from platform carries handles"),
             Error::Handover(error) => write!(f, "{error}"),
+            Error::Identity(true, error) => write!(f, "node config's tls: {error}"),
+            Error::Identity(false, error) => write!(f, "the node's own TLS identity: {error}"),
+            Error::Server(why) => write!(f, "the API server: {why}"),
         }
     }
 }
@@ -142,164 +154,25 @@ pub fn address(info: &Info) -> Result<Option<Addr>, Error> {
         .find(|a| a.is_v4() && a.is_host()))
 }
 
-/// What one step of the [`Service`] did.
+/// What the listener did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// It opened the node's listener here.
+    /// It opened here.
     Listening(Endpoint),
-    /// It closed the listener here: `wan`'s address is no longer this one.
+    /// It closed here: `wan`'s address is no longer this one.
     Unlistened(Endpoint),
-    /// It accepted a connection from here and closed it at once.
-    Closed(Endpoint),
-    /// Nothing happened within the step's wait.
-    Idle,
 }
 
 impl Event {
-    /// What the process says of it on the console, if anything.
-    pub fn line(&self) -> Option<String> {
+    /// What the process says of it on the console.
+    pub fn line(&self) -> String {
         match self {
-            Event::Listening(at) => Some(format!("api: listening on {at}")),
-            Event::Unlistened(at) => Some(format!(
-                "api: stopped listening on {at}: {INTERFACE}'s address changed"
-            )),
-            Event::Closed(_) | Event::Idle => None,
-        }
-    }
-}
-
-/// Step 1's service: the node's one listener, on `wan`'s leased address at port 443,
-/// closing each connection it accepts.
-pub struct Service {
-    client: net::Client,
-    /// The listener's socket, and where it listens.
-    listener: Option<(u32, Endpoint)>,
-    /// The `accept` waiting on the listener: its request's id.
-    accept: Option<u32>,
-}
-
-impl Service {
-    /// The service, on a connection to the network server ([`connect`]).
-    pub fn new(client: net::Client) -> Service {
-        Service {
-            client,
-            listener: None,
-            accept: None,
-        }
-    }
-
-    /// Where it listens, if it does.
-    pub fn listening(&self) -> Option<Endpoint> {
-        self.listener.map(|(_, at)| at)
-    }
-
-    /// Waits for the next thing to do, at most a poll's time, and does it.
-    pub fn step(&mut self) -> Result<Event, Error> {
-        match self.listener {
-            None => self.open(),
-            Some((socket, at)) => self.serve(socket, at),
-        }
-    }
-
-    /// With no listener: one on `wan`'s address, once it has one.
-    fn open(&mut self) -> Result<Event, Error> {
-        let Some(found) = address(&asked("info", self.client.info())?)? else {
-            // Sleeps until the next ask, or until the server has gone, which that ask
-            // then reports.
-            match wait_one(
-                &self.client.core().channel().0,
-                Signals::PEER_CLOSED,
-                deadline_in(ADDRESS_POLL_NS),
-            ) {
-                Ok(_) | Err(moruna_svc::Error::TimedOut) => return Ok(Event::Idle),
-                Err(e) => return Err(Error::Network("wait", CallError::Kernel(e))),
-            }
-        };
-        let (socket, at) = asked(
-            "listen",
-            self.client.listen(Endpoint::new(found, PORT), BACKLOG),
-        )?;
-        self.listener = Some((socket, at));
-        Ok(Event::Listening(at))
-    }
-
-    /// With a listener: the next connection, closed at once; or, after a poll's time
-    /// without one, the lease looked at again.
-    fn serve(&mut self, socket: u32, at: Endpoint) -> Result<Event, Error> {
-        let txid = match self.accept {
-            Some(txid) => txid,
-            None => {
-                let mut args = Encoder::new();
-                socket
-                    .encode(&mut args)
-                    .map_err(|_| Error::Network("accept", CallError::Malformed))?;
-                let txid = asked(
-                    "accept",
-                    self.client
-                        .core()
-                        .send(ACCEPT, args)
-                        .map_err(CallError::typed),
-                )?;
-                self.accept = Some(txid);
-                txid
-            }
-        };
-        match self
-            .client
-            .core()
-            .reply(txid, deadline_in(LEASE_POLL_NS))
-            .map_err(CallError::typed)
-        {
-            Ok(frame) => {
-                self.accept = None;
-                let opened = accepted(frame)?;
-                asked("close", self.client.close(opened.socket))?;
-                Ok(Event::Closed(opened.remote))
-            }
-            Err(CallError::TimedOut) => {
-                if address(&asked("info", self.client.info())?)? == Some(at.addr) {
-                    return Ok(Event::Idle);
-                }
-                self.unlisten(socket, txid)?;
-                Ok(Event::Unlistened(at))
-            }
-            Err(error) => {
-                self.accept = None;
-                Err(Error::Network("accept", error))
+            Event::Listening(at) => format!("api: listening on {at}"),
+            Event::Unlistened(at) => {
+                format!("api: stopped listening on {at}: {INTERFACE}'s address changed")
             }
         }
     }
-
-    /// Closes the listener, and takes the answer of the `accept` that waited on it.
-    fn unlisten(&mut self, socket: u32, txid: u32) -> Result<(), Error> {
-        asked("close", self.client.close(socket))?;
-        self.listener = None;
-        self.accept = None;
-        match self
-            .client
-            .core()
-            .reply(txid, DEADLINE_INFINITE)
-            .map_err(CallError::typed)
-        {
-            // The listener's close answers it.
-            Err(CallError::Remote(net::Error::Closed)) => Ok(()),
-            // Or it had taken a connection just before: closed too.
-            Ok(frame) => {
-                let opened = accepted(frame)?;
-                asked("close", self.client.close(opened.socket))
-            }
-            Err(error) => Err(Error::Network("accept", error)),
-        }
-    }
-}
-
-/// The connection an `accept`'s answer opened.
-fn accepted(mut frame: moruna_svc::frame::Frame) -> Result<Opened, Error> {
-    let mut decoder = frame.decoder();
-    let opened = Opened::decode(&mut decoder)
-        .and_then(|opened| decoder.finish().map(|()| opened))
-        .map_err(|_| Error::Network("accept", CallError::Malformed))?;
-    Ok(opened)
 }
 
 /// `platform`'s hand-over: the first message on the `platform` link, waited for as long
@@ -357,26 +230,46 @@ pub fn ready(platform: &Channel) -> Result<(), Error> {
 }
 
 /// The whole process, on its connection to the network server and its link to
-/// `platform`: the hand-over, then the [`Service`], saying each of its lines with
-/// `say`, and answering `platform` once its listener first opens. It returns only when
-/// it cannot go on.
+/// `platform`, on a node of `cores` CPUs: the hand-over, the server made from it and its
+/// identity's line, then the loop that serves, saying each line with `say` and answering
+/// `platform` once its listener first opens. It returns only when it cannot go on.
 pub fn run(
     client: net::Client,
     platform: &Channel,
+    cores: u32,
     say: &mut dyn FnMut(&str),
 ) -> Result<Infallible, Error> {
-    // Kept for as long as the process runs: step 2 serves with it (work item 2.2b).
-    let _handover = handover(platform)?;
-    let mut service = Service::new(client);
+    let handover = handover(platform)?;
+    let config = node::config(&handover, cores, now())?;
+    say(&format!(
+        "moruna: tls sha256={}",
+        config.identity.fingerprint()
+    ));
+    let mut server = Server::new(config, node::NodeClock::new(&handover))
+        .map_err(|e| Error::Server(format!("{e:?}")))?;
+    let network = Rc::new(RefCell::new(network::Network::new(client)));
     let mut answered = false;
     loop {
-        let event = service.step()?;
-        if let Some(line) = event.line() {
-            say(&line);
+        let accepted = network.borrow_mut().take()?;
+        for socket in accepted {
+            server.accept(network::Conn::new(network.clone(), socket));
         }
-        if !answered && matches!(event, Event::Listening(_)) {
-            ready(platform)?;
-            answered = true;
+        let at = now();
+        if let Some(event) = network.borrow_mut().tend(at)? {
+            say(&event.line());
+            if !answered && matches!(event, Event::Listening(_)) {
+                // System design 1B: from the core's first instruction to ready.
+                server.facts_mut().boot_ms = at / 1_000_000;
+                ready(platform)?;
+                answered = true;
+            }
         }
+        server.poll();
+        network.borrow_mut().flush()?;
+        let mut deadline = network.borrow().look_at();
+        if let Some(ms) = server.deadline() {
+            deadline = deadline.min(ms.saturating_mul(1_000_000));
+        }
+        network.borrow_mut().wait(deadline)?;
     }
 }

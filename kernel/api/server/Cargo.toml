@@ -8,8 +8,13 @@ publish.workspace = true
 
 [dependencies]
 moruna-api = { path = "../types", version = "=0.1.0" }
+# A job's events (system design 3B): the record each one is, and its rendering as JSON.
+moruna-event = { path = "../../../crates/moruna-event", version = "=0.6.6", default-features = false }
+moruna-record = { path = "../../../crates/moruna-record", version = "=0.6.6", default-features = false }
 httparse = { version = "=1.10.1", default-features = false }
-serde_json = { version = "=1.0.154", default-features = false, features = ["alloc"] }
+serde = { version = "=1.0.229", default-features = false, features = ["alloc", "derive"] }
+# `raw_value`: a job's document and its report pass through as the text they arrived as.
+serde_json = { version = "=1.0.154", default-features = false, features = ["alloc", "raw_value"] }
 # The network server's versions (kernel/net/stack).
 rustls = { version = "=0.23.45", default-features = false, features = ["ring"] }
 ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }

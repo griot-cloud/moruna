@@ -2,9 +2,10 @@
 # Judges a boot's serial log (SDD 20 k, SDD 23 k, SDD 25 k): every line the image's
 # description expects (moruna-image's OUT/expect) present in the serial log or in
 # console0's file, every CPU online and every CPU having run a process thread,
-# nothing failed, no panic, every disk the description names holding the pattern it
-# says (what the block and NVMe tests wrote, or what the boot wrote, untouched), the
-# vsock test's and the engine's runs' lines, and QEMU's status the kernel's success.
+# nothing failed, no `moruna: fatal` line, no panic, every disk the description names
+# holding the pattern it says (what the block and NVMe tests wrote, or what the boot
+# wrote, untouched), the vsock test's and the engine's runs' lines, and QEMU's status
+# the kernel's success.
 # Prints each verdict.
 #
 #   kernel/tools/check-boot.sh LOG QEMU_STATUS EXPECT CPUS [generic|deadline]
@@ -43,9 +44,10 @@ done < "$expect_file"
 expect "kk: $cpus CPUs online"
 expect "kk: process threads ran on $cpus of $cpus CPUs"
 
-# A test's failure line and a refused boot, exactly; a panic in any case (OSTD prints
+# A test's failure line and a refused boot, exactly; any failure line of the node's console
+# (`moruna: fatal <stage>: <reason>`, system design 1B); a panic in any case (OSTD prints
 # "Non-resettable panic!", a program's handler "panicked").
-for bad in "FAIL:" "kk: boot refused" "kk: accounting broken"; do
+for bad in "FAIL:" "kk: boot refused" "kk: accounting broken" "moruna: fatal"; do
   if grep -qF -- "$bad" "$seen"; then
     echo "FOUND \"$bad\":"
     grep -F -- "$bad" "$seen"

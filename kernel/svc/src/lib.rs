@@ -32,7 +32,7 @@ pub mod server;
 pub mod sim;
 pub mod wire;
 
-pub use client::{CallError, ClientCore, connect, deadline_in};
+pub use client::{CallError, ClientCore, READY_TIMEOUT, connect, deadline_in, ready};
 pub use frame::{Kind, Transport};
 #[cfg(not(any(target_os = "none", feature = "native")))]
 pub use moruna_abi::map;

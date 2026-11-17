@@ -56,7 +56,7 @@ fn open(directory: &mut directory::Client) -> Result<block::Client, String> {
     let channel = directory
         .lookup(String::from("block0"))
         .map_err(|e| format!("looking up block0: {e:?}"))?;
-    let mut client = block::Client::connect(channel, deadline_in(60 * SECONDS))
+    let mut client = block::Client::connect(channel, deadline_in(moruna_svc::READY_TIMEOUT))
         .map_err(|e| format!("hello to block0: {e:?}"))?;
     client.core().set_timeout(60 * SECONDS);
     Ok(client)

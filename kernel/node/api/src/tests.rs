@@ -1,10 +1,18 @@
-//! The process's logic on a host (work item 1.3), against the network server's own
-//! stack: the cloud node's interface and grant, a DHCP server on its wire that a test
-//! can hold back or make move the lease, and beside it a second card that stands for
-//! the host at the other end of the node's network.
+//! The process's logic on a host (work items 1.3 and 2.2b), against the network server's
+//! own stack: the cloud node's interface and grant, a DHCP server on its wire that a test
+//! can hold back or make move the lease, and beside it a second card that stands for the
+//! host at the other end of the node's network.
+//!
+//! This file holds that harness and the tests that need no network; `tests/network.rs`
+//! tests the network side, and `tests/serve.rs` the whole process serving HTTPS.
 
 #[path = "../../../net/stack/tests/common/mod.rs"]
 mod common;
+#[path = "../../../api/server/tests/common/signer.rs"]
+mod signer;
+
+mod network;
+mod serve;
 
 use std::{
     collections::BTreeMap,
@@ -16,18 +24,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::{
-    MAC_A, MAC_B, Rng, Wire, dhcp_answer_offering, dhcp_request, no_external_cards, receive, serve,
-    serve_until,
-};
+use common::{MAC_A, MAC_B, Rng, Wire, dhcp_answer_offering, dhcp_request, serve_until};
+use moruna_api::{Cloud, Executor, ExecutorKind, NodeHealth};
+use moruna_api_server::{Clock, IdentityError, TokenKey};
 use moruna_netstack::Stack;
-use moruna_node_config::{Cloud, NodeConfig};
-use moruna_node_platform::{
-    machine::{Link, LinkError},
-    svc::ApiLink,
-};
+use moruna_node_config::{NodeConfig, PublicKey, base64};
 use moruna_svc::deadline_in;
-use netstack_protocol::{Cidr, Interface, Policy, Target};
+use netstack_protocol::{Cidr, Interface, Policy};
+use rcgen::{CertificateParams, KeyPair};
+use signer::Signer;
 
 use super::*;
 
@@ -43,6 +48,11 @@ grant listen-host rights=connect remote=10.0.2.0/24 local=10.0.2.2/32 sockets=8
 
 const NODE_ADDRESS: Addr = Addr::v4(10, 0, 2, 15);
 const SECOND: u64 = 1_000_000_000;
+/// The node's memory in the tests' hand-overs: 2 GiB.
+const MEMORY_BYTES: u64 = 2 << 30;
+/// The tests' instance ID, and the wall clock their hand-overs carry.
+const INSTANCE: &str = "3f6c1d2e-8b7a-4c55-9e1f-0a2b3c4d5e6f";
+const WALL_CLOCK: u64 = 1_794_931_200;
 
 /// What the test's DHCP server does.
 #[derive(Default)]
@@ -102,11 +112,16 @@ struct Node {
 impl Node {
     /// The server, its DHCP server answering from the start, or only once told.
     fn start(answers: bool) -> Node {
+        Node::configured(NODE, answers)
+    }
+
+    /// The same, with the network server's configuration `config`.
+    fn configured(config: &str, answers: bool) -> Node {
         let lease = Arc::new(Lease::default());
         lease.answers.store(answers, Ordering::SeqCst);
         let stop = Arc::new(AtomicBool::new(false));
         let (slots, server) = serve_until(
-            NODE,
+            config,
             &[MAC_A, MAC_B],
             wire(lease.clone()),
             None,
@@ -124,11 +139,11 @@ impl Node {
         self.slots.remove(name).expect("a listener slot")
     }
 
-    /// `api`'s service, on a connection through its slot.
-    fn api(&mut self) -> (Service, Channel) {
+    /// `api`'s connection to the server through its slot, and the slot.
+    fn api(&mut self) -> (net::Client, Channel) {
         let network = self.slot("listen-api");
         let client = connect(&network, account()).expect("the network server");
-        (Service::new(client), network)
+        (client, network)
     }
 
     /// Waits for the server to end, which it does once its last client and listener
@@ -140,7 +155,7 @@ impl Node {
 }
 
 fn account() -> Account {
-    Account::carve(8 << 20, "api-test").expect("an account")
+    Account::carve(16 << 20, "api-test").expect("an account")
 }
 
 /// The host outside the node.
@@ -152,19 +167,73 @@ fn host(listener: &Channel) -> net::Client {
     client
 }
 
-/// Steps `service` until an event `wanted` holds, within 30 s: every event until then,
-/// that one last.
-fn until(service: &mut Service, wanted: impl Fn(&Event) -> bool) -> Vec<Event> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut events = Vec::new();
-    loop {
-        let event = service.step().expect("a step");
-        events.push(event);
-        if wanted(&event) {
-            return events;
-        }
-        assert!(Instant::now() < deadline, "not within 30 s: {events:?}");
+/// Node config with these token keys and, when given, the operator's TLS identity.
+fn user_data(keys: &[[u8; 32]], tls: Option<(&str, &str)>) -> String {
+    let keys: Vec<String> = keys
+        .iter()
+        .map(|k| format!("\"{}\"", PublicKey(*k).to_base64()))
+        .collect();
+    let tls = tls.map_or(String::new(), |(certificate, key)| {
+        format!(
+            r#","tls":{{"certificate":{},"key":{}}}"#,
+            serde_json::Value::from(certificate),
+            serde_json::Value::from(key)
+        )
+    });
+    format!(
+        r#"{{"moruna":1,"api":{{"token_keys":[{}]{tls}}}}}"#,
+        keys.join(",")
+    )
+}
+
+/// A hand-over as `platform` makes one, of `user_data`, its wall clock read now.
+fn handover_of(user_data: &str) -> Handover {
+    Handover {
+        config: NodeConfig::validate(user_data.as_bytes(), MEMORY_BYTES)
+            .expect("a valid node config"),
+        instance: String::from(INSTANCE),
+        cloud: Cloud::OpenStack,
+        wall_clock: WALL_CLOCK,
+        read_at_ns: now(),
+        memory_bytes: MEMORY_BYTES,
     }
+}
+
+/// A hand-over whose node config holds one token key.
+fn handed() -> Handover {
+    handover_of(&user_data(&[[7; 32]], None))
+}
+
+/// `der` as a PEM block of `label`.
+fn pem(label: &str, der: &[u8]) -> String {
+    let text = base64::encode(der);
+    let lines: Vec<&str> = text
+        .as_bytes()
+        .chunks(64)
+        .map(|line| std::str::from_utf8(line).unwrap())
+        .collect();
+    format!(
+        "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+        lines.join("\n")
+    )
+}
+
+/// An operator's certificate for `name` and its key, in PEM, and the certificate's DER.
+fn operator(name: &str) -> (String, String, Vec<u8>) {
+    let key = KeyPair::generate().unwrap();
+    let certificate = CertificateParams::new(vec![String::from(name)])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    (
+        pem("CERTIFICATE", certificate.der()),
+        pem("PRIVATE KEY", &key.serialize_der()),
+        certificate.der().to_vec(),
+    )
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn interface(name: &str, addrs: &[Cidr]) -> Interface {
@@ -222,40 +291,64 @@ fn the_node_s_address_is_wan_s_ipv4_address() {
 
 #[test]
 fn a_failure_is_the_node_s_fatal_line_with_the_service_s_name() {
+    let fatal = |error: Error| Fatal(&error).to_string();
     assert_eq!(
-        Fatal(&Error::Network("accept", CallError::PeerClosed)).to_string(),
+        fatal(Error::Network("accept", CallError::PeerClosed)),
         "moruna: fatal api: accept: PeerClosed"
     );
     assert_eq!(
-        Fatal(&Error::NoSlot("network")).to_string(),
+        fatal(Error::NoSlot("network")),
         "moruna: fatal api: no network slot"
     );
     assert_eq!(
-        Fatal(&Error::NoInterface).to_string(),
+        fatal(Error::NoInterface),
         "moruna: fatal api: the network server has no interface wan"
     );
     assert_eq!(
-        Error::Network("listen", CallError::Remote(net::Error::NotPermitted)).to_string(),
-        "listen: Remote(NotPermitted)"
-    );
-    assert_eq!(
-        Fatal(&Error::Link(
+        fatal(Error::Link(
             "waiting for the hand-over",
             moruna_svc::Error::PeerClosed
-        ))
-        .to_string(),
+        )),
         format!(
             "moruna: fatal api: the link to platform: waiting for the hand-over: {}",
             moruna_svc::Error::PeerClosed.name()
         )
     );
     assert_eq!(
-        Fatal(&Error::LinkHandles).to_string(),
+        fatal(Error::Kernel(
+            "a connection's memory",
+            moruna_svc::Error::NoMemory
+        )),
+        format!(
+            "moruna: fatal api: a connection's memory: {}",
+            moruna_svc::Error::NoMemory.name()
+        )
+    );
+    assert_eq!(
+        fatal(Error::LinkHandles),
         "moruna: fatal api: a message from platform carries handles"
     );
     assert_eq!(
-        Fatal(&Error::Handover(HandoverError::Instance)).to_string(),
+        fatal(Error::Handover(HandoverError::Instance)),
         "moruna: fatal api: the hand-over's `instance` is not an instance ID"
+    );
+    assert_eq!(
+        fatal(Error::Identity(true, IdentityError::Mismatch)),
+        format!(
+            "moruna: fatal api: node config's tls: {}",
+            IdentityError::Mismatch
+        )
+    );
+    assert_eq!(
+        fatal(Error::Identity(false, IdentityError::Random)),
+        format!(
+            "moruna: fatal api: the node's own TLS identity: {}",
+            IdentityError::Random
+        )
+    );
+    assert_eq!(
+        fatal(Error::Server(String::from("no"))),
+        "moruna: fatal api: the API server: no"
     );
 }
 
@@ -263,342 +356,105 @@ fn a_failure_is_the_node_s_fatal_line_with_the_service_s_name() {
 fn the_process_says_when_it_listens_and_when_it_stops() {
     let at = Endpoint::new(NODE_ADDRESS, 443);
     assert_eq!(
-        Event::Listening(at).line().as_deref(),
-        Some("api: listening on 10.0.2.15:443")
+        Event::Listening(at).line(),
+        "api: listening on 10.0.2.15:443"
     );
     assert_eq!(
-        Event::Unlistened(at).line().as_deref(),
-        Some("api: stopped listening on 10.0.2.15:443: wan's address changed")
+        Event::Unlistened(at).line(),
+        "api: stopped listening on 10.0.2.15:443: wan's address changed"
     );
-    assert_eq!(Event::Closed(at).line(), None);
-    assert_eq!(Event::Idle.line(), None);
 }
 
-/// The whole of step 1: the listener opens on the address DHCP gives `wan`, on port
-/// 443, and not before; a connection from outside is accepted and then closed by the
-/// node; and no other port answers.
+/// The wall clock is the hand-over's, carried forward by the monotonic time since
+/// `platform` read it, a whole second at a time.
 #[test]
-fn the_listener_opens_on_the_leased_address_and_every_connection_is_closed() {
-    let mut node = Node::start(false);
-    let outside = node.slot("listen-host");
-    let (mut api, network) = node.api();
-
-    // No lease yet: no listener, and each step waits a poll's time for one.
-    for _ in 0..3 {
-        let asked = Instant::now();
-        assert_eq!(api.step(), Ok(Event::Idle));
-        assert!(asked.elapsed() >= Duration::from_nanos(ADDRESS_POLL_NS));
-        assert_eq!(api.listening(), None);
-    }
-    node.lease.answers.store(true, Ordering::SeqCst);
-    let at = Endpoint::new(NODE_ADDRESS, 443);
-    let events = until(&mut api, |e| *e == Event::Listening(at));
-    assert!(events[..events.len() - 1].iter().all(|e| *e == Event::Idle));
-    assert_eq!(api.listening(), Some(at));
-
-    let mut host = host(&outside);
-    for _ in 0..3 {
-        let opened = host
-            .open(Target::Endpoint(at), None)
-            .expect("a connection to 443 is accepted");
-        assert_eq!(opened.remote, at);
-        // The node's side: accepted, and closed at once.
-        assert_eq!(api.step(), Ok(Event::Closed(opened.local)));
-        // The host's side: the end of the stream, with nothing in it.
-        assert_eq!(receive(&mut host, opened.socket, 64), Ok(vec![]));
-        host.close(opened.socket).expect("close");
-    }
-    // No connection: the step waits a lease poll, finds the lease unchanged, and keeps
-    // the listener.
-    let asked = Instant::now();
-    assert_eq!(api.step(), Ok(Event::Idle));
-    assert!(asked.elapsed() >= Duration::from_nanos(LEASE_POLL_NS));
-    assert_eq!(api.listening(), Some(at));
-
-    // Any other port refuses the connection.
-    for port in [444, 80, 8443] {
-        assert_eq!(
-            host.open(Target::Endpoint(Endpoint::new(NODE_ADDRESS, port)), None)
-                .map(|_| ()),
-            Err(CallError::Remote(net::Error::Refused)),
-            "port {port}"
-        );
-    }
-    // And 443 still answers after them.
-    let opened = host.open(Target::Endpoint(at), None).expect("443 again");
-    assert_eq!(api.step(), Ok(Event::Closed(opened.local)));
-
-    drop((api, host, network, outside));
-    node.end();
+fn the_wall_clock_is_carried_forward_from_the_hand_over() {
+    let mut handover = handed();
+    handover.read_at_ns = 50 * SECOND;
+    let clock = node::NodeClock::new(&handover);
+    assert_eq!(clock.unix_seconds_at(50 * SECOND), WALL_CLOCK);
+    assert_eq!(clock.unix_seconds_at(51 * SECOND - 1), WALL_CLOCK);
+    assert_eq!(clock.unix_seconds_at(51 * SECOND), WALL_CLOCK + 1);
+    assert_eq!(clock.unix_seconds_at(3_650 * SECOND), WALL_CLOCK + 3_600);
+    // A monotonic time before the reading is the reading's.
+    assert_eq!(clock.unix_seconds_at(0), WALL_CLOCK);
+    // Now, on the core's clocks.
+    let now_clock = node::NodeClock::new(&handed());
+    assert!((WALL_CLOCK..WALL_CLOCK + 2).contains(&now_clock.unix_seconds()));
+    let ms = now_clock.monotonic_ms();
+    assert!((ms..ms + 1_000).contains(&(now() / 1_000_000)));
 }
 
-/// The listener follows the lease (system design 1C): lost, it closes; given again at
-/// another address, it opens there, and connections to it are served.
+/// The node document's facts and the token keys come from the hand-over (work item 2.2b).
 #[test]
-fn the_listener_follows_the_lease_to_its_new_address() {
-    let mut node = Node::start(true);
-    let outside = node.slot("listen-host");
-    let (mut api, network) = node.api();
-    let first = Endpoint::new(NODE_ADDRESS, 443);
-    until(&mut api, |e| *e == Event::Listening(first));
-
-    // The lease is lost, and the DHCP server holds its answer.
-    node.lease.offer.store(16, Ordering::SeqCst);
-    node.lease.answers.store(false, Ordering::SeqCst);
-    node.lease.renew.store(true, Ordering::SeqCst);
-    let events = until(&mut api, |e| *e == Event::Unlistened(first));
-    assert!(events.len() <= 3, "{events:?}");
-    assert_eq!(api.listening(), None);
-    // No address, so no listener.
-    assert_eq!(api.step(), Ok(Event::Idle));
-    assert_eq!(api.listening(), None);
-
-    // The new lease, at another address.
-    node.lease.answers.store(true, Ordering::SeqCst);
-    let second = Endpoint::new(Addr::v4(10, 0, 2, 16), 443);
-    let events = until(&mut api, |e| *e == Event::Listening(second));
+fn the_server_s_config_comes_from_the_hand_over() {
+    let keys = [[7; 32], [9; 32]];
+    let handover = handover_of(&user_data(&keys, None));
+    let config = node::config(&handover, 3, now()).expect("a config");
+    let facts = &config.facts;
+    assert_eq!(facts.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(facts.version, node::VERSION);
+    assert_eq!(facts.instance, INSTANCE);
+    assert_eq!(facts.cloud, Cloud::OpenStack);
+    assert_eq!(facts.cores, 3);
+    assert_eq!(facts.memory_bytes, MEMORY_BYTES);
+    assert_eq!(
+        facts.executors,
+        [Executor {
+            kind: ExecutorKind::Cpu,
+            slots: 3
+        }]
+    );
+    assert_eq!(facts.boot_ms, 0);
+    assert_eq!(facts.health, NodeHealth::Ok);
+    assert_eq!(config.token_keys, keys.map(TokenKey::new));
+    // No `tls`: the node's own identity, a fresh one each time.
+    let fingerprint = config.identity.fingerprint();
+    assert_eq!(fingerprint.len(), 64);
     assert!(
-        events[..events.len() - 1].iter().all(|e| *e == Event::Idle),
-        "{events:?}"
+        fingerprint
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
     );
-    let mut host = host(&outside);
-    let opened = host
-        .open(Target::Endpoint(second), None)
-        .expect("a connection to the new address");
-    assert_eq!(api.step(), Ok(Event::Closed(opened.local)));
-    assert_eq!(receive(&mut host, opened.socket, 64), Ok(vec![]));
-
-    drop((api, host, network, outside));
-    node.end();
+    let again = node::config(&handover, 3, now()).expect("a config");
+    assert_ne!(again.identity.fingerprint(), fingerprint);
 }
 
 #[test]
-fn the_port_has_one_owner() {
-    let mut node = Node::start(true);
-    let network = node.slot("listen-api");
-    let mut first = Service::new(connect(&network, account()).expect("a connection"));
-    let mut second = Service::new(connect(&network, account()).expect("another"));
-    let at = Endpoint::new(NODE_ADDRESS, 443);
-    until(&mut first, |e| *e == Event::Listening(at));
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let refused = loop {
-        match second.step() {
-            Ok(Event::Idle) if Instant::now() < deadline => continue,
-            other => break other,
-        }
-    };
+fn the_operator_s_tls_is_the_identity_when_node_config_has_one() {
+    let (certificate, key, der) = operator("node.example");
+    let handover = handover_of(&user_data(&[[7; 32]], Some((&certificate, &key))));
+    let config = node::config(&handover, 1, now()).expect("a config");
+    assert_eq!(config.identity.certificate(), der.as_slice());
+    let digest = ring::digest::digest(&ring::digest::SHA256, &der);
+    assert_eq!(config.identity.fingerprint(), hex(digest.as_ref()));
+
+    // A key that is not the certificate's is refused, and the process stops on it.
+    let (_, other_key, _) = operator("other.example");
+    let handover = handover_of(&user_data(&[[7; 32]], Some((&certificate, &other_key))));
     assert_eq!(
-        refused,
-        Err(Error::Network(
-            "listen",
-            CallError::Remote(net::Error::AddressInUse)
-        ))
+        node::config(&handover, 1, now()).err(),
+        Some(Error::Identity(true, IdentityError::Mismatch))
     );
-    drop((first, second, network));
-    node.end();
-}
-
-#[test]
-fn a_network_server_with_no_wan_is_refused() {
-    let lo = "moruna-netstack 1
-grant listen-api rights=listen local=0.0.0.0/0@443 sockets=64
-";
-    let (mut slots, server) = serve(lo, &[], no_external_cards());
-    let network = slots.remove("listen-api").expect("the api's slot");
-    let mut api = Service::new(connect(&network, account()).expect("the network server"));
-    assert_eq!(api.step(), Err(Error::NoInterface));
-    drop((api, network, slots));
-    server.join().expect("the network server");
-}
-
-#[test]
-fn no_network_server_is_a_failure_to_connect() {
-    let (network, server) = Channel::create().expect("a channel");
-    drop(server);
-    assert_eq!(
-        connect(&network, account()).err(),
-        Some(Error::Network("connect", CallError::PeerClosed))
-    );
-}
-
-/// Steps until a step fails, on a thread: its failure.
-fn failure(mut api: Service) -> thread::JoinHandle<Error> {
-    thread::spawn(move || {
-        loop {
-            if let Err(error) = api.step() {
-                return error;
-            }
-        }
-    })
-}
-
-/// What the process sees when the network server finds no lease in time and exits:
-/// its wait for the node's address ends with the failure it then stops on.
-#[test]
-fn the_wait_for_the_address_ends_when_the_network_server_does() {
-    let mut node = Node::start(false);
-    let (api, network) = node.api();
-    let waiting = failure(api);
-    thread::sleep(Duration::from_nanos(3 * ADDRESS_POLL_NS));
-    assert!(!waiting.is_finished(), "the wait ended with no address");
-    node.stop.store(true, Ordering::SeqCst);
-    assert!(matches!(
-        waiting.join().expect("the wait"),
-        Error::Network(_, CallError::PeerClosed)
-    ));
-    drop(network);
-    node.end();
-}
-
-/// And the same once it serves: a wait for a connection ends when the network server
-/// does.
-#[test]
-fn the_wait_for_a_connection_ends_when_the_network_server_does() {
-    let mut node = Node::start(true);
-    let (mut api, network) = node.api();
-    until(&mut api, |e| matches!(e, Event::Listening(_)));
-    let serving = failure(api);
-    thread::sleep(Duration::from_millis(250));
-    assert!(!serving.is_finished(), "a step failed with no reason to");
-    node.stop.store(true, Ordering::SeqCst);
-    assert!(matches!(
-        serving.join().expect("the service"),
-        Error::Network(_, CallError::PeerClosed)
-    ));
-    drop(network);
-    node.end();
-}
-
-/// A hand-over as `platform` makes one: a valid node config, an instance and its cloud,
-/// and the wall clock.
-fn handed() -> Handover {
-    let user_data =
-        br#"{"moruna":1,"api":{"token_keys":["AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="]}}"#;
-    Handover {
-        config: NodeConfig::validate(user_data, None).expect("a valid node config"),
-        instance: String::from("3f6c1d2e-8b7a-4c55-9e1f-0a2b3c4d5e6f"),
-        cloud: Cloud::OpenStack,
-        wall_clock: 1_794_931_200,
-        read_at_ns: 4_200_000_000,
-    }
 }
 
 /// The hand-over over a real channel, `platform`'s own end of the link on the other
 /// side: `api` takes it whole and answers `ready`.
 #[test]
 fn the_hand_over_crosses_a_channel_from_platform_s_half() {
+    use moruna_node_platform::{machine::Link, svc::ChannelLink};
     let (ours, theirs) = Channel::create().expect("a channel");
+    let handed = handed();
+    let sent = handed.clone();
     let platform = thread::spawn(move || {
-        let mut link = ApiLink(ours);
-        link.send(
-            &handed().encode().expect("encoded"),
-            deadline_in(5 * SECOND),
-        )
-        .expect("sent");
+        let mut link = ChannelLink(ours);
+        link.send(&sent.encode().expect("encoded"), deadline_in(5 * SECOND))
+            .expect("sent");
         link.receive(deadline_in(5 * SECOND))
     });
-    assert_eq!(handover(&theirs), Ok(handed()));
+    assert_eq!(handover(&theirs), Ok(handed));
     assert_eq!(ready(&theirs), Ok(()));
     assert_eq!(platform.join().expect("platform"), Ok(READY.to_vec()));
-}
-
-/// The whole process: it takes the hand-over, opens its listener once the lease comes,
-/// and only then answers `ready`, once: a listener that moves with the lease does not
-/// answer again.
-#[test]
-fn api_answers_ready_once_its_listener_first_opens() {
-    let mut node = Node::start(false);
-    let outside = node.slot("listen-host");
-    let network = node.slot("listen-api");
-    let client = connect(&network, account()).expect("the network server");
-    let (ours, theirs) = Channel::create().expect("a channel");
-    let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let said = lines.clone();
-    let api = thread::spawn(move || {
-        let Err(error) = run(client, &theirs, &mut |line: &str| {
-            said.lock().unwrap().push(line.to_string())
-        });
-        error
-    });
-    let mut platform = ApiLink(ours);
-    platform
-        .send(
-            &handed().encode().expect("encoded"),
-            deadline_in(5 * SECOND),
-        )
-        .expect("the hand-over");
-    // No lease, so no listener, so no answer.
-    assert_eq!(
-        platform.receive(deadline_in(SECOND / 2)),
-        Err(LinkError::TimedOut)
-    );
-    assert!(lines.lock().unwrap().is_empty());
-
-    node.lease.answers.store(true, Ordering::SeqCst);
-    assert_eq!(
-        platform.receive(deadline_in(30 * SECOND)),
-        Ok(READY.to_vec())
-    );
-    // The listener had opened by then, and it serves.
-    assert_eq!(*lines.lock().unwrap(), ["api: listening on 10.0.2.15:443"]);
-    let mut host = host(&outside);
-    let opened = host
-        .open(Target::Endpoint(Endpoint::new(NODE_ADDRESS, 443)), None)
-        .expect("a connection to 443");
-    assert_eq!(receive(&mut host, opened.socket, 64), Ok(vec![]));
-
-    // The lease moves: the listener follows, and `ready` is not said twice.
-    node.lease.offer.store(16, Ordering::SeqCst);
-    node.lease.renew.store(true, Ordering::SeqCst);
-    let moved = "api: listening on 10.0.2.16:443";
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !lines.lock().unwrap().iter().any(|l| l == moved) {
-        assert!(Instant::now() < deadline, "{:?}", lines.lock().unwrap());
-        thread::sleep(Duration::from_millis(50));
-    }
-    assert_eq!(
-        platform.receive(deadline_in(3 * SECOND / 2)),
-        Err(LinkError::TimedOut)
-    );
-
-    node.stop.store(true, Ordering::SeqCst);
-    assert!(matches!(
-        api.join().expect("api"),
-        Error::Network(_, CallError::PeerClosed)
-    ));
-    drop((host, network, outside, platform));
-    node.end();
-}
-
-/// A hand-over that is refused stops the process before it listens.
-#[test]
-fn a_refused_hand_over_stops_the_process_before_it_listens() {
-    let mut node = Node::start(true);
-    let network = node.slot("listen-api");
-    let client = connect(&network, account()).expect("the network server");
-    let (ours, theirs) = Channel::create().expect("a channel");
-    ours.write_with(b"{}", &mut []).expect("written");
-    let mut said = Vec::new();
-    let Err(error) = run(client, &theirs, &mut |line: &str| {
-        said.push(line.to_string())
-    });
-    assert!(
-        matches!(error, Error::Handover(HandoverError::Shape(_))),
-        "{error:?}"
-    );
-    assert!(
-        Fatal(&error)
-            .to_string()
-            .starts_with("moruna: fatal api: the hand-over is refused: "),
-        "{error}"
-    );
-    assert!(said.is_empty());
-    // Nothing listens.
-    let mut other = Service::new(connect(&network, account()).expect("again"));
-    let at = Endpoint::new(NODE_ADDRESS, 443);
-    until(&mut other, |e| *e == Event::Listening(at));
-    drop((other, network, ours));
-    node.end();
 }
 
 #[test]
@@ -642,4 +498,14 @@ fn the_link_to_platform_fails_when_platform_has_gone_or_sends_handles() {
     // An empty message is no hand-over.
     ours.write_with(b"", &mut []).expect("written");
     assert!(matches!(handover(&theirs), Err(Error::Handover(_))));
+}
+
+#[test]
+fn no_network_server_is_a_failure_to_connect() {
+    let (network, server) = Channel::create().expect("a channel");
+    drop(server);
+    assert_eq!(
+        connect(&network, account()).err(),
+        Some(Error::Network("connect", CallError::PeerClosed))
+    );
 }

@@ -39,7 +39,14 @@ fn converse(mut reader: BufReader<UnixStream>, spec: Value, cancel: bool) -> Res
         .get("run_id")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    send(&mut conn, &Inbound::Spec { spec, plan: None })?;
+    send(
+        &mut conn,
+        &Inbound::Spec {
+            spec,
+            plan: None,
+            secrets: Default::default(),
+        },
+    )?;
     common::converse(
         assigned,
         cancel,

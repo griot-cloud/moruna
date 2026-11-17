@@ -614,6 +614,16 @@ fn run() -> i64 {
         }
         Err(e) => {
             println!(out, "KB3 devices: FAIL: {}", e);
+            // The node's console line for a service that cannot go on (the system design,
+            // section 1B): the stage is the service's own name.
+            println!(
+                out,
+                "{}",
+                moruna_abi::boot_line::Fatal {
+                    stage: "devices",
+                    reason: &e
+                }
+            );
             1
         }
     }

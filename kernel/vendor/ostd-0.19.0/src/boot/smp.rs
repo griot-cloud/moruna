@@ -199,6 +199,22 @@ fn wait_for_all_aps_started(num_cpus: usize) {
         HW_CPU_ID_MAP.lock().len() == num_cpus
     }
 
+    // moruna: on x86 the wait has a deadline (Moruna's system design, section 1B), the one
+    // the two calibration waits have. A CPU that never starts ends the boot with the core's
+    // fatal line and a power-off, where upstream waited for ever.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::arch::boot_wait;
+
+        let started = boot_wait::wait(crate::arch::read_tsc, core::hint::spin_loop, || {
+            is_all_aps_started(num_cpus)
+        });
+        if !started {
+            crate::early_println!("{}", boot_wait::CPU_START_TIMED_OUT);
+            crate::power::poweroff(crate::power::ExitCode::Failure);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     while !is_all_aps_started(num_cpus) {
         core::hint::spin_loop();
     }
