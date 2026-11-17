@@ -252,6 +252,11 @@ pub fn dhcp_server(router: bool) -> Wire {
 /// That server's answer to the frame `f`: an offer for a discover and an acknowledgement
 /// for a request, and nothing for any other frame.
 pub fn dhcp_answer(f: &[u8], router: bool) -> Option<Vec<u8>> {
+    dhcp_answer_offering(f, [10, 0, 2, 15], router)
+}
+
+/// The same server offering `address` in 10.0.2.0/24 instead.
+pub fn dhcp_answer_offering(f: &[u8], address: [u8; 4], router: bool) -> Option<Vec<u8>> {
     let server_mac = EthernetAddress([0x52, 0x55, 0x0a, 0x00, 0x02, 0x02]);
     let server_ip = Ipv4Address::new(10, 0, 2, 2);
     let (client, xid, kind) = dhcp_request(f)?;
@@ -268,7 +273,7 @@ pub fn dhcp_answer(f: &[u8], router: bool) -> Option<Vec<u8>> {
         secs: 0,
         client_hardware_address: client,
         client_ip: Ipv4Address::UNSPECIFIED,
-        your_ip: Ipv4Address::new(10, 0, 2, 15),
+        your_ip: Ipv4Address::from(address),
         server_ip,
         router: router.then_some(server_ip),
         subnet_mask: Some(Ipv4Address::new(255, 255, 255, 0)),

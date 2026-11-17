@@ -2,9 +2,9 @@
 //!
 //! Its start handles are the supervisor's: `console`, its own `account`, and `network`,
 //! the listener of the network server's grant `listen-api`, which permits listening on
-//! port 443 and nothing else. It connects to the network server, waits for the node's
-//! address, opens its listener there on 443 and says so, then accepts each connection
-//! and closes it.
+//! port 443 and nothing else. It connects to the network server and runs [`Service`]:
+//! a listener on `wan`'s leased address at 443, which follows the lease, closing each
+//! connection it accepts. It says when it starts and stops listening.
 //!
 //! It never ends by itself. When it cannot go on (a start handle is missing, or a
 //! request to the network server fails) it prints `moruna: fatal api: <reason>` and
@@ -17,7 +17,7 @@
 
 use core::convert::Infallible;
 
-use moruna_node_api::{Error, Fatal, await_address, connect, listen, turn};
+use moruna_node_api::{Error, Fatal, Service, connect};
 use moruna_svc::{Account, Channel, Console, println, start};
 
 moruna_svc::main!(run);
@@ -38,11 +38,10 @@ fn serve(out: &Console) -> Result<Infallible, Error> {
     let account = start::take("account")
         .map(Account)
         .ok_or(Error::NoSlot("account"))?;
-    let mut client = connect(&network, account)?;
-    let address = await_address(&mut client)?;
-    let (listener, at) = listen(&mut client, address)?;
-    println!(out, "api: listening on {}", at);
+    let mut service = Service::new(connect(&network, account)?);
     loop {
-        turn(&mut client, listener)?;
+        if let Some(line) = service.step()?.line() {
+            println!(out, "{}", line);
+        }
     }
 }
