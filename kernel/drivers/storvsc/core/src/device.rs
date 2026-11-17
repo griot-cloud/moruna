@@ -229,6 +229,27 @@ impl<C: Channel> Storvsc<C> {
         }
     }
 
+    /// Asks the host to signal the driver when there is something to do, without sleeping:
+    /// true when there is already, a packet to [`poll`](Storvsc::poll) or room again after
+    /// [`Error::Full`]. A driver that waits on handles, its clients' and the `vmbus` wake
+    /// channel's, polls until `None`, then arms, and waits only when this answers false:
+    /// the host's next packet signals the channel. Unlike [`wait`](Storvsc::wait), it leaves
+    /// the host's signal on.
+    pub fn arm(&mut self) -> Result<bool, Error> {
+        if matches!(self.state, State::Failed) {
+            return Err(Error::Failed);
+        }
+        match self.rings.arm(&self.channel) {
+            Ok(ready) => Ok(ready),
+            Err(e) => Err(self.broken(e)),
+        }
+    }
+
+    /// The channel, for the driver that waits on it: on a node, its wake channel.
+    pub fn channel(&self) -> &C {
+        &self.channel
+    }
+
     /// A corrupt ring ends the device.
     fn broken(&mut self, e: Error) -> Error {
         if matches!(e, Error::Ring(_)) {

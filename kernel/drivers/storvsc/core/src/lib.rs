@@ -18,7 +18,9 @@
 //!
 //! **The caller drives it.** There is no thread and no async runtime. A request returns its
 //! transaction ID at once; [`Storvsc::poll`] reads what the host has sent and reports each
-//! completion with that ID; [`Storvsc::wait`] sleeps until the host signals. Requests may be
+//! completion with that ID; [`Storvsc::wait`] sleeps until the host signals, and
+//! [`Storvsc::arm`] asks it to signal and returns at once, for a driver that waits on its
+//! channel's wake among other handles, as a node's `storvsc` process does. Requests may be
 //! in flight together, as many as the ring holds of the largest ([`Storvsc::limit`]), and
 //! complete in any order. There are no sub-channels.
 //!

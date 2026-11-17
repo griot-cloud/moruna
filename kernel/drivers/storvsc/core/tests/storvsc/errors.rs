@@ -28,6 +28,7 @@ fn failure(device: &mut Storvsc<Link>, id: u64) -> Failure {
 fn assert_failed(device: &mut Storvsc<Link>) {
     assert!(matches!(device.poll(), Err(Error::Failed)));
     assert!(matches!(device.wait(None), Err(Error::Failed)));
+    assert!(matches!(device.arm(), Err(Error::Failed)));
     assert!(matches!(device.flush(DISK), Err(Error::Failed)));
     assert!(matches!(device.read_serial(DISK, 1), Err(Error::Failed)));
 }

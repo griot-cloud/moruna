@@ -442,6 +442,32 @@ fn a_wait_returns_at_once_when_a_packet_is_there() {
 }
 
 #[test]
+fn arm_leaves_the_hosts_signal_on_and_says_when_there_is_work() {
+    let (mut device, host) = device();
+    // Nothing to read and nothing refused: nothing to do, and nothing slept.
+    let idles = host.borrow().idles;
+    assert!(!device.arm().unwrap());
+    assert_eq!(host.borrow().idles, idles);
+    // With the signal on, the host signals as it answers.
+    let id = device.flush(DISK).unwrap();
+    assert!(device.arm().unwrap(), "the answer is in the ring");
+    assert_eq!(next(&mut device).id, id);
+    assert!(matches!(device.poll(), Ok(None)));
+    assert!(!device.arm().unwrap());
+    assert_eq!(
+        device.wait(Some(0)).unwrap(),
+        Wait::Signalled,
+        "the host's signal, which the channel kept"
+    );
+    // A wait turns the signal off again: the next answer comes unsignalled.
+    let id = device.flush(DISK).unwrap();
+    assert_eq!(next(&mut device).id, id);
+    assert_eq!(device.wait(Some(0)).unwrap(), Wait::TimedOut);
+    // The channel the driver waits on is the device's.
+    assert_eq!(device.channel().host_signals(), host.borrow().signals);
+}
+
+#[test]
 fn a_closed_channel_is_an_error_to_the_caller() {
     let (mut device, host) = device();
     // The host takes the channel away; the guest learns of it at its next call on it.
