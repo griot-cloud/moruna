@@ -320,6 +320,56 @@ pub fn cut(rows: usize, len: u64, piece: u64) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Values made ahead, each on a thread of its own, and taken in turn: what a stage makes for
+/// each of its tasks before the task starts, so the kernel's zeroing of it and the host's
+/// faulting it in are spread over the CPUs, not paid one task after another. A native stage's
+/// eight planes, made each as its task started, held its start about 3 s under nested KVM
+/// (0.9 GiB, the NYC gate, 2026-11-17).
+pub struct Ahead<T> {
+    made: std::sync::Mutex<Vec<Option<std::thread::JoinHandle<T>>>>,
+}
+
+impl<T: Send + 'static> Default for Ahead<T> {
+    fn default() -> Self {
+        Ahead {
+            made: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl<T: Send + 'static> Ahead<T> {
+    /// Starts making the values of `0..n`, `make(i)` each on a thread of its own, unless they
+    /// were started already.
+    pub fn start(&self, n: usize, make: impl Fn(usize) -> T + Send + Sync + 'static) {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if !made.is_empty() {
+            return;
+        }
+        let make = std::sync::Arc::new(make);
+        *made = (0..n)
+            .map(|i| {
+                let make = std::sync::Arc::clone(&make);
+                std::thread::Builder::new()
+                    .name(format!("ahead-{i}"))
+                    .spawn(move || make(i))
+                    .ok()
+            })
+            .collect();
+    }
+
+    /// The value of `i`, waited for; `None` when it was not made ahead (never started, taken
+    /// already, or its thread could not start or panicked): the caller makes it now.
+    pub fn take(&self, i: usize) -> Option<T> {
+        let handle = self
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(i)
+            .and_then(Option::take)?;
+        handle.join().ok()
+    }
+}
+
 /// A stage's cleanup of its task's account (SB-I9): the task's `process` handle, for a native
 /// task the stage started itself, is released first, since the process it names (its address
 /// space, its image) is charged to the account; then `usage` (bytes used and reserved, `None`
@@ -831,6 +881,33 @@ mod tests {
             note.contains("task 2: 0 batches, 0 records, 0 deferred, cpu any"),
             "{note}"
         );
+    }
+
+    #[test]
+    fn p_a_stage_s_planes_are_made_ahead_together_and_taken_in_turn() {
+        use std::time::{Duration, Instant};
+        let ahead = Ahead::<usize>::default();
+        assert_eq!(ahead.take(0), None, "nothing made ahead yet");
+        let started = Instant::now();
+        ahead.start(8, |i| {
+            std::thread::sleep(Duration::from_millis(100));
+            i * 10
+        });
+        // A second start makes nothing more.
+        ahead.start(8, |_| unreachable!("made twice"));
+        let taken: Vec<_> = (0..8).map(|i| ahead.take(i)).collect();
+        let took = started.elapsed();
+        assert_eq!(taken, (0..8).map(|i| Some(i * 10)).collect::<Vec<_>>());
+        assert!(
+            took < Duration::from_millis(500),
+            "eight made together, not one after another: {took:?}"
+        );
+        assert_eq!(ahead.take(3), None, "each taken once");
+        assert_eq!(ahead.take(8), None, "none past those made");
+        // A value whose making panicked is made by the caller.
+        let failing = Ahead::<u8>::default();
+        failing.start(1, |_| panic!("its plane could not be made"));
+        assert_eq!(failing.take(0), None);
     }
 
     #[test]

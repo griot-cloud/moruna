@@ -186,6 +186,24 @@ pub fn program(path: &str, native: bool) -> std::result::Result<Option<Vec<u8>>,
 
 /// Loads `elf` into `process`: a memory object of its bytes, which the kernel parses and maps
 /// (`process_map_image`). Its entry point.
+/// A ring task's plane, opened: the plane, the task's id in it, and its port.
+type OpenedPlane = std::result::Result<(RingPlane<Calls>, TaskId, Channel), PlaneError>;
+
+/// A ring task's plane of `budget` bytes ([`layout::ring_sizes`]), the task placed on `cpu`:
+/// each task on a CPU of its own, since the kernel keeps a thread where it first ran, and
+/// tasks started while the others slept all went to one.
+fn open_ring_plane(budget: u64, cpu: Option<u32>) -> OpenedPlane {
+    let mut plane = RingPlane::new(Calls, budget);
+    let sizes = layout::ring_sizes(budget);
+    let (task, port) = plane.open_ring(RingShape {
+        region: Region::New(sizes.region),
+        windows: sizes.windows,
+        window_bytes: sizes.window,
+    })?;
+    plane.place(task, cpu)?;
+    Ok((plane, task, port))
+}
+
 fn load_native(process: &moruna_svc::Process, elf: &[u8]) -> std::result::Result<u64, KernelError> {
     let bytes = layout::pages(elf.len() as u64).ok_or(KernelError::OutOfRange)?;
     let memory = moruna_svc::Memory::create(bytes)?;
@@ -283,6 +301,8 @@ pub struct ImageTask {
     /// What the stage's tasks share: how many hold a batch, their answers' schema, and what
     /// each did, for the run's report.
     busy: Arc<Busy>,
+    /// Ring mode: every task's plane, made ahead as the first task starts.
+    ahead: layout::Ahead<OpenedPlane>,
 }
 
 /// What a ring stage's tasks share.
@@ -375,6 +395,7 @@ impl ImageTask {
                 figures: Mutex::new(vec![None; processes]),
                 ..Busy::default()
             }),
+            ahead: layout::Ahead::default(),
         })
     }
 
@@ -569,29 +590,32 @@ impl ImageTask {
         } else {
             ceiling.min(PLANE_BUDGET_MAX)
         };
-        let mut plane = RingPlane::new(Calls, budget);
-        let (task, port) = if self.rings {
-            let sizes = layout::ring_sizes(budget);
-            plane
-                .open_ring(RingShape {
-                    region: Region::New(sizes.region),
-                    windows: sizes.windows,
-                    window_bytes: sizes.window,
-                })
-                .and_then(|(task, port)| {
-                    // Each task on a CPU of its own: the kernel keeps a thread where it first
-                    // ran, and tasks started while the others slept all went to one.
-                    plane.place(task, self.cpu_of(ctx.instance))?;
-                    Ok((task, Some(port)))
-                })
+        let (plane, task, port) = if self.rings {
+            // Every task's plane is made ahead, together, as the first task starts: the kernel
+            // zeroes each and the host faults its pages in on CPUs of their own, not one task
+            // after another. A task restarted later makes its own now.
+            let cpus: Vec<Option<u32>> = (0..self.memory.len()).map(|i| self.cpu_of(i)).collect();
+            self.ahead.start(self.memory.len(), move |i| {
+                open_ring_plane(budget, cpus.get(i).copied().flatten())
+            });
+            let opened = match self.ahead.take(ctx.instance) {
+                Some(opened) => opened,
+                None => open_ring_plane(budget, self.cpu_of(ctx.instance)),
+            };
+            let (plane, task, port) =
+                opened.map_err(|e| plane_error(name, "opening the task's plane", e))?;
+            (plane, task, Some(port))
         } else {
-            plane.open(Shape {
-                inputs: 1,
-                outputs: 1,
-                port: !self.port_names.is_empty(),
-            })
-        }
-        .map_err(|e| plane_error(name, "opening the task's plane", e))?;
+            let mut plane = RingPlane::new(Calls, budget);
+            let (task, port) = plane
+                .open(Shape {
+                    inputs: 1,
+                    outputs: 1,
+                    port: !self.port_names.is_empty(),
+                })
+                .map_err(|e| plane_error(name, "opening the task's plane", e))?;
+            (plane, task, port)
+        };
         let slots: Vec<moruna_svc::Handle> = plane
             .slots(task)
             .map_err(|e| plane_error(name, "its slots", e))?
