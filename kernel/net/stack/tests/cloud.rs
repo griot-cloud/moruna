@@ -2,19 +2,21 @@
 //! configuration is read as written; its first DHCP lease gives the boot's network
 //! line, once, `gateway none` when the lease names no router; no lease is due 30 s
 //! after the server's start; and its one grant, which only listens on port 443,
-//! refuses every way out.
+//! refuses every way out, and holds at most 81 sockets of 64 KiB buffers each way
+//! (work item 1.3b).
 
 mod common;
 
 use common::{MAC_A, MAC_B, PAIR, Rng, Wire, dhcp_server, serve};
-use moruna_netstack::{Card, Stack, boot::LEASE_WITHIN_NS, parse};
+use moruna_netstack::{Buffers, Card, Stack, boot::LEASE_WITHIN_NS, parse};
 use moruna_svc::{CallError, Channel, deadline_in};
 use netstack_protocol::{Addr, Cidr, Endpoint, Policy, Rule, Target, net, rights};
 
-/// `kernel/node/cloud/network.conf`, exactly as work item 1.3 gives it.
+/// `kernel/node/cloud/network.conf`, exactly as work item 1.3 gives it, with the grant
+/// work item 1.3b gives `api`: 80 connections, system design 2B's cap, and the listener.
 const NETWORK_CONF: &str = "moruna-netstack 1
 interface wan card=net0 dhcp
-grant listen-api rights=listen local=0.0.0.0/0@443 sockets=64
+grant listen-api rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536
 ";
 
 const MS: u64 = 1_000_000;
@@ -100,9 +102,16 @@ fn the_cloud_configuration_is_read_as_written() {
                     last: 443,
                 }],
                 names: vec![],
-                sockets: 64,
+                sockets: 81,
             }
         )]
+    );
+    assert_eq!(
+        config.buffers("listen-api"),
+        Buffers {
+            rx: Some(65536),
+            tx: Some(65536),
+        }
     );
     // No TLS in the network server until step 3 (system design 3D).
     assert_eq!(config.settings.tls_unix_seconds, 0);

@@ -36,9 +36,9 @@ use core::cell::RefCell;
 
 use devices_protocol::directory;
 use moruna_netstack::{
-    Card, Config, Shared, Stack, after_turn,
+    Card, Config, Grant, Shared, Stack, after_turn,
     boot::{NO_LEASE, fatal},
-    factory, parse,
+    granted, parse,
 };
 use moruna_svc::{
     CallError, Channel, ClientCore, Completions, Console, DEADLINE_INFINITE, Decoder, Encoder,
@@ -400,7 +400,7 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
         let channel = start::take(&slot)
             .map(Channel)
             .ok_or_else(|| format!("slot {slot} was taken"))?;
-        listeners.push((channel, policy.clone()));
+        listeners.push((channel, Grant::new(policy.clone(), config.buffers(&slot))));
     }
     let (mut links, cards) = if config.interfaces.is_empty() {
         (Vec::new(), Vec::new())
@@ -462,8 +462,8 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
     println!(out, "{}", up);
     let shared = Shared::new(stack);
     let mut d = moruna_svc::Dispatcher::new();
-    for (channel, policy) in listeners {
-        d.listen(channel, factory(shared.clone(), policy))
+    for (channel, grant) in listeners {
+        d.listen(channel, granted(shared.clone(), grant))
             .map_err(|e| format!("listening: {}", e.name()))?;
     }
     let watches: Vec<Handle> = links

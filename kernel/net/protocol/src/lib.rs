@@ -170,8 +170,10 @@ mod transport {
                 8 => WrongKind;
                 /// A request of the same kind already waits on the socket.
                 9 => InUse;
-                /// The connection holds as many sockets as its policy allows, or the server
-                /// as many as its configuration allows.
+                /// The connection's grant holds as many sockets as its policy allows (every
+                /// connection through the grant's listener counted together, closing
+                /// sockets until they are freed), or the server as many as its
+                /// configuration allows.
                 10 => TooMany;
                 /// The socket is not connected, or its sending half has been shut down.
                 11 => NotConnected;

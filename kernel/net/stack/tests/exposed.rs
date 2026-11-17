@@ -6,15 +6,16 @@
 mod common;
 
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
 
-use common::{MAC_A, Rng, Wire, serve};
+use common::{MAC_A, Rng, Wire, serve, serve_until};
 use moruna_netstack::Stack;
 use moruna_svc::{Channel, deadline_in};
 use netstack_protocol::{Addr, Endpoint, net};
@@ -471,5 +472,210 @@ fn a_peer_that_sends_past_its_window_is_acknowledged_for_the_window_only() {
                 seen.acked.map(|a| a.wrapping_sub(ISN + 1))
             );
         },
+    );
+}
+
+/// `api`'s grant in the cloud profile (work item 1.3b): 80 connections and the listener,
+/// each socket with 64 KiB to receive and 64 KiB to send.
+const API_GRANT: &str =
+    "grant listen-api rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536";
+const API_SOCKETS: usize = 81;
+const API_BUFFERS: usize = 65536 + 65536;
+
+/// What the crowd of abandoning peers did and saw, and the most the node held.
+#[derive(Default)]
+struct Crowd {
+    /// SYNs sent; handshakes the node finished, each then abandoned; SYNs it reset.
+    sent: u32,
+    opened: u32,
+    refused: u32,
+    /// SYNs neither answered nor reset within a second.
+    unanswered: u32,
+    /// The most sockets, and bytes of their buffers, the node held after any poll.
+    most_sockets: usize,
+    most_buffered: usize,
+    /// The well-behaved peer that comes afterwards: its handshake finished, and the
+    /// node's FIN, which is `api` closing it, seen.
+    valid_opened: bool,
+    valid_closed: bool,
+}
+
+/// The work item's success check. 10,000 connections are opened against `api`'s grant
+/// and abandoned: each peer finishes its handshake and then says nothing again, not
+/// even to the FIN `api`'s close sends. The node never holds more than the grant's 81
+/// sockets, nor more than 81 times 128 KiB of their buffers; a SYN that finds the grant
+/// full is answered with a reset; and a well-behaved connection afterwards is served.
+/// The linger is a tenth of a second here (30 s by default), so that the 10,000 pass
+/// in seconds: an abandoned connection is reset, and freed, once it has passed.
+#[test]
+fn ten_thousand_abandoned_connections_never_exceed_the_grant_and_the_next_is_served() {
+    const TARGET: u32 = 10_000;
+    const BURST: u32 = 100;
+    const VALID: (Ipv4Address, u16) = (Ipv4Address::new(192, 0, 2, 10), 50000);
+    const VALID_ISN: u32 = 5000;
+    let attacking = Arc::new(AtomicBool::new(false));
+    let crowd = Arc::new(Mutex::new(Crowd::default()));
+    let wire: Wire = {
+        let (attacking, crowd) = (attacking.clone(), crowd.clone());
+        let mut internet = Internet::new();
+        // Each SYN not yet answered, and when it went.
+        let mut waiting: BTreeMap<(Ipv4Address, u16), Instant> = BTreeMap::new();
+        let mut last_burst = Instant::now();
+        let mut valid_syn: Option<Instant> = None;
+        Box::new(move |st: &mut Stack, _: &mut Rng| {
+            let segments = internet.take(st);
+            let mut crowd = crowd.lock().unwrap();
+            crowd.most_sockets = crowd.most_sockets.max(st.sockets());
+            crowd.most_buffered = crowd.most_buffered.max(st.buffered());
+            for s in &segments {
+                if s.to == VALID {
+                    match s.control {
+                        TcpControl::Syn if !crowd.valid_opened => {
+                            crowd.valid_opened = true;
+                            st.card_mut(0).port.deliver(to_node(
+                                VALID,
+                                TcpControl::None,
+                                VALID_ISN + 1,
+                                Some(s.seq.wrapping_add(1)),
+                                &[],
+                            ));
+                        }
+                        TcpControl::Fin if crowd.valid_opened && !crowd.valid_closed => {
+                            // `api` closed it: the peer closes its half too.
+                            crowd.valid_closed = true;
+                            st.card_mut(0).port.deliver(to_node(
+                                VALID,
+                                TcpControl::Fin,
+                                VALID_ISN + 1,
+                                Some(s.seq.wrapping_add(1)),
+                                &[],
+                            ));
+                        }
+                        TcpControl::Rst if !crowd.valid_opened => valid_syn = None,
+                        _ => {}
+                    }
+                    continue;
+                }
+                if waiting.remove(&s.to).is_none() {
+                    // An abandoned connection's FIN, its retransmissions, its reset:
+                    // nobody answers.
+                    continue;
+                }
+                match s.control {
+                    TcpControl::Syn => {
+                        crowd.opened += 1;
+                        // The handshake's end, and then nothing, ever.
+                        st.card_mut(0).port.deliver(to_node(
+                            s.to,
+                            TcpControl::None,
+                            1,
+                            Some(s.seq.wrapping_add(1)),
+                            &[],
+                        ));
+                    }
+                    TcpControl::Rst => crowd.refused += 1,
+                    _ => {
+                        waiting.insert(s.to, Instant::now());
+                    }
+                }
+            }
+            let before = waiting.len();
+            waiting.retain(|_, at| at.elapsed() < Duration::from_secs(1));
+            crowd.unanswered += (before - waiting.len()) as u32;
+            if !attacking.load(Ordering::SeqCst) {
+                return;
+            }
+            if crowd.opened < TARGET {
+                if waiting.is_empty() && last_burst.elapsed() >= Duration::from_millis(10) {
+                    last_burst = Instant::now();
+                    for _ in 0..BURST {
+                        // Every peer from an address of its own, as the internet's are.
+                        let n = crowd.sent;
+                        let from = (
+                            Ipv4Address::from(0xc612_0000u32 + n),
+                            40000 + (n % 20000) as u16,
+                        );
+                        waiting.insert(from, Instant::now());
+                        st.card_mut(0)
+                            .port
+                            .deliver(to_node(from, TcpControl::Syn, 0, None, &[]));
+                        crowd.sent += 1;
+                    }
+                }
+            } else if !crowd.valid_opened
+                && valid_syn.is_none_or(|at| at.elapsed() >= Duration::from_millis(100))
+            {
+                // Afterwards, a well-behaved peer, which tries again after a reset.
+                valid_syn = Some(Instant::now());
+                st.card_mut(0)
+                    .port
+                    .deliver(to_node(VALID, TcpControl::Syn, VALID_ISN, None, &[]));
+            }
+        })
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let (mut slots, server) = serve_until(
+        &node(API_GRANT, "setting tcp-linger-ms 100\n"),
+        &[MAC_A],
+        wire,
+        None,
+        stop.clone(),
+    );
+    let listener = slots.remove("listen-api").expect("slot");
+    // `api` in step 1: every connection accepted and closed at once.
+    let accepted = Arc::new(AtomicU32::new(0));
+    let valid_accepted = Arc::new(AtomicBool::new(false));
+    let api = {
+        let mut api = client(&listener);
+        let (accepted, valid_accepted) = (accepted.clone(), valid_accepted.clone());
+        let (l, _) = api
+            .listen(Endpoint::new(Addr::v4(10, 0, 2, 15), PORT), 64)
+            .expect("the listener on 443");
+        thread::spawn(move || {
+            while let Ok(c) = api.accept(l) {
+                accepted.fetch_add(1, Ordering::SeqCst);
+                if c.remote == Endpoint::new(Addr::v4(192, 0, 2, 10), VALID.1) {
+                    valid_accepted.store(true, Ordering::SeqCst);
+                }
+                let _ = api.close(c.socket);
+            }
+        })
+    };
+    attacking.store(true, Ordering::SeqCst);
+    let served = until(Duration::from_secs(600), || {
+        crowd.lock().unwrap().valid_closed && valid_accepted.load(Ordering::SeqCst)
+    });
+    stop.store(true, Ordering::SeqCst);
+    server.join().expect("the server did not panic");
+    api.join().expect("the api thread");
+    let crowd = crowd.lock().unwrap();
+    eprintln!(
+        "{} SYNs: {} opened and abandoned, {} reset at the bound, {} unanswered; {} accepted; \
+         at most {} sockets and {} bytes of buffers",
+        crowd.sent,
+        crowd.opened,
+        crowd.refused,
+        crowd.unanswered,
+        accepted.load(Ordering::SeqCst),
+        crowd.most_sockets,
+        crowd.most_buffered
+    );
+    assert!(crowd.opened >= TARGET, "only {} opened", crowd.opened);
+    assert!(
+        crowd.most_sockets <= API_SOCKETS,
+        "{} sockets held",
+        crowd.most_sockets
+    );
+    assert!(
+        crowd.most_buffered <= API_SOCKETS * API_BUFFERS,
+        "{} bytes of buffers held",
+        crowd.most_buffered
+    );
+    // The bound was reached, and what found it full was told so.
+    assert!(crowd.refused > 0, "no SYN found the grant full");
+    assert_eq!(crowd.unanswered, 0, "SYNs left unanswered");
+    assert!(
+        served,
+        "the well-behaved connection afterwards was not served"
     );
 }
