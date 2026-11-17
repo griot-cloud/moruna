@@ -24,6 +24,12 @@
 //! Unpinned, a thread is free to run anywhere: the next time it is queued the scheduler
 //! places it as it places a new thread.
 //!
+//! A woken task runs before the tasks a slice preempted: it waits in its CPU's wake queue,
+//! which is taken first, at most [`WOKEN_FIRST`] in a row while a preempted task waits.
+//! So a wake waits at most for what is left of the running task's slice, not for every
+//! task queued on its CPU; and a task that never sleeps still runs at least once every
+//! `WOKEN_FIRST + 1` turns.
+//!
 //! A worker's core runs its pinned worker (C5). While some core has no pinned thread, the
 //! scheduler places an unpinned thread on such a core, and an unpinned thread queued on a
 //! core with a pinned thread moves to one: a reactor, a ticker or a helper that first ran
@@ -95,6 +101,10 @@ static PENDING: AtomicUsize = AtomicUsize::new(0);
 /// Whether unpinned threads keep off the cores of pinned ones while a core is free of them.
 const PLACE_AWAY: bool = true;
 
+/// How many woken tasks may run in a row before a preempted task that waits; zero runs
+/// every queue first in, first out, as before woken tasks went first.
+const WOKEN_FIRST: u32 = 4;
+
 /// Bit `i` is set while CPU `i` has a pinned thread.
 static PINNED_CPUS: AtomicU64 = AtomicU64::new(0);
 /// Bit `i` is set for every CPU there is.
@@ -119,7 +129,12 @@ fn bit(cpu: usize) -> u64 {
 
 struct RunQueue {
     current: Option<Arc<Task>>,
+    /// The tasks a slice preempted, and new ones, first in, first out.
     queue: VecDeque<Arc<Task>>,
+    /// The tasks woken from a wait, first in, first out, taken before `queue`.
+    woken: VecDeque<Arc<Task>>,
+    /// The woken tasks run in a row while `queue` waited.
+    woken_run: u32,
     idle: Arc<Task>,
     ticks: u32,
     /// Runnable tasks on this CPU other than its idle task, read without the lock by
@@ -160,22 +175,48 @@ impl RunQueue {
         }
     }
 
-    /// Whether `task` is this CPU's current task or waits in its queue.
+    /// Whether `task` is this CPU's current task or waits in one of its queues.
     fn holds(&self, task: &Arc<Task>) -> bool {
         self.current.as_ref().is_some_and(|c| Arc::ptr_eq(c, task))
             || self.queue.iter().any(|queued| Arc::ptr_eq(queued, task))
+            || self.woken.iter().any(|queued| Arc::ptr_eq(queued, task))
+    }
+
+    /// Whether a task waits to run.
+    fn waiting(&self) -> bool {
+        !self.queue.is_empty() || !self.woken.is_empty()
+    }
+
+    /// The next task to run: a woken one, unless `WOKEN_FIRST` of them have run in a row
+    /// while a preempted one waited.
+    fn take_next(&mut self) -> Option<Arc<Task>> {
+        let woken_turn =
+            !self.woken.is_empty() && (self.queue.is_empty() || self.woken_run < WOKEN_FIRST);
+        if woken_turn {
+            self.woken_run = if self.queue.is_empty() {
+                0
+            } else {
+                self.woken_run + 1
+            };
+            self.woken.pop_front()
+        } else {
+            self.woken_run = 0;
+            self.queue.pop_front()
+        }
     }
 
     fn publish(&self) {
         let busy = self.current.as_ref().is_some_and(|c| !self.is_idle(c));
-        self.load
-            .store(self.queue.len() + usize::from(busy), Ordering::Relaxed);
+        self.load.store(
+            self.queue.len() + self.woken.len() + usize::from(busy),
+            Ordering::Relaxed,
+        );
     }
 
     /// Stretches this CPU's tick while nothing waits on it, and brings it back when
     /// something does. Called on the CPU itself, with its queue's lock held.
     fn retick(&mut self) {
-        let stretch = !self.boot && self.current.is_some() && self.queue.is_empty();
+        let stretch = !self.boot && self.current.is_some() && !self.waiting();
         if stretch != self.stretched {
             self.stretched = stretch;
             ostd::timer::set_tick_stretch(if stretch { STRETCH } else { 1 });
@@ -189,7 +230,7 @@ impl LocalRunQueue for RunQueue {
     }
 
     fn update_current(&mut self, flags: UpdateFlags) -> bool {
-        let waiting = !self.queue.is_empty();
+        let waiting = self.waiting();
         match flags {
             // The boot context (no current task) is never preempted: it leaves for a
             // task only when it yields, once the boot is done.
@@ -213,7 +254,7 @@ impl LocalRunQueue for RunQueue {
     }
 
     fn try_pick_next(&mut self) -> Option<&Arc<Task>> {
-        let next = match self.queue.pop_front() {
+        let next = match self.take_next() {
             Some(task) => task,
             None if self.current.is_none() => self.idle.clone(),
             None => return None,
@@ -361,7 +402,12 @@ impl Scheduler for Cpus {
         // reschedule; one still in its boot context takes the task when it yields.
         let idle = rq.current.as_ref().is_some_and(|c| rq.is_idle(c));
         let kick = idle || rq.stretched;
-        rq.queue.push_back(runnable);
+        // A task woken from a wait runs before the ones a slice preempted.
+        if flags == EnqueueFlags::Wake && WOKEN_FIRST > 0 {
+            rq.woken.push_back(runnable);
+        } else {
+            rq.queue.push_back(runnable);
+        }
         rq.publish();
         kick.then_some(target)
     }
@@ -410,6 +456,8 @@ pub fn init() -> Result<(), &'static str> {
         queues.push(SpinLock::new(RunQueue {
             current: None,
             queue: VecDeque::new(),
+            woken: VecDeque::new(),
+            woken_run: 0,
             idle: Arc::new(task),
             ticks: 0,
             load,

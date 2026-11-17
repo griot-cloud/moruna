@@ -413,6 +413,7 @@ process datapath
   expect DS-A pin: ok:
   expect DS-A ticks: ok:
   expect DS-A share: ok:
+  expect DS-A wake: ok:
   expect DS-A rcu: ok:
   expect DS-A placement: ok:
   expect DS-A avx: ok:

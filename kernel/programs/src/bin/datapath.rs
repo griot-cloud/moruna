@@ -29,6 +29,8 @@
 //!   makes and frees more memory than the machine has, each freed frame waiting for a
 //!   grace period.
 //!
+//! - a wake behind busy threads: a thread woken on a CPU where three threads spin runs
+//!   within what is left of the running one's slice, not after every one queued;
 //! - AVX state (`avx_fixture.rs`): one more thread than there are CPUs keeps its own
 //!   values in all 16 `ymm` registers through preemption, and one moves between CPUs with
 //!   `thread_set_cpu`, every lane checked at the end;
@@ -107,6 +109,9 @@ fn run() -> i64 {
         return code;
     }
     if let Err(code) = share(&out, cpus) {
+        return code;
+    }
+    if let Err(code) = wake(&out, cpus) {
         return code;
     }
     if let Err(code) = rcu(&out, cpus) {
@@ -1271,6 +1276,106 @@ fn placement(out: &Out, cpus: u32) -> Result<(), i64> {
         turns,
         lost,
         on
+    );
+    Ok(())
+}
+
+/// `wake`'s requests: the sleeper waits while this holds the last one it served.
+static WAKE_WORD: AtomicU32 = AtomicU32::new(0);
+/// When the last wake was asked for, on `now`'s clock.
+static WAKE_AT: AtomicU64 = AtomicU64::new(0);
+/// The sleeper's wakes, their total and their longest latency, in nanoseconds.
+static WAKES: AtomicU64 = AtomicU64::new(0);
+static WAKE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WAKE_MAX: AtomicU64 = AtomicU64::new(0);
+/// Set to end the sleeper.
+static WAKE_STOP: AtomicU32 = AtomicU32::new(0);
+
+/// Pinned to CPU `cpu`, sleeps until woken and times each wake.
+extern "C" fn sleeper_timed(cpu: u64) -> ! {
+    if pin_current_thread(Some(cpu as u32)).is_ok() {
+        JOINED.store(1, Ordering::Release);
+        let mut served = 0;
+        while WAKE_STOP.load(Ordering::Acquire) == 0 {
+            let _ = futex_wait(&WAKE_WORD, served, now() + ms(1_000));
+            let asked = WAKE_WORD.load(Ordering::Acquire);
+            if asked == served {
+                continue;
+            }
+            let latency = now().saturating_sub(WAKE_AT.load(Ordering::Acquire));
+            WAKES.fetch_add(1, Ordering::Relaxed);
+            WAKE_TOTAL.fetch_add(latency, Ordering::Relaxed);
+            WAKE_MAX.fetch_max(latency, Ordering::Relaxed);
+            served = asked;
+        }
+    }
+    thread_exit()
+}
+
+/// A thread woken on a CPU where three others spin runs within what is left of the
+/// running one's slice (10 ms), not after each one queued there.
+fn wake(out: &Out, cpus: u32) -> Result<(), i64> {
+    const ROUNDS: u64 = 20;
+    let last = u64::from(cpus - 1);
+    STOP.store(0, Ordering::Relaxed);
+    JOINED.store(0, Ordering::Relaxed);
+    pin_current_thread(None).map_err(|e| fail(out, "wake", "unpinning", e))?;
+    let mut spinners = Vec::new();
+    for _ in 0..3 {
+        spinners.push(start(out, "wake", spinner, last)?);
+    }
+    let sleeper = start(out, "wake", sleeper_timed, last)?;
+    if !until(&JOINED, 10_000) {
+        println!(
+            out,
+            "DS-A wake: FAIL: the sleeper never ran on CPU {}", last
+        );
+        return Err(1);
+    }
+    for _ in 0..ROUNDS {
+        // About 15 ms apart, so a wake falls anywhere in a spinner's slice.
+        let _ = futex_wait(&READY, 1, now() + ms(15));
+        WAKE_AT.store(now(), Ordering::Release);
+        WAKE_WORD.fetch_add(1, Ordering::AcqRel);
+        futex_wake(&WAKE_WORD, 1).map_err(|e| fail(out, "wake", "futex_wake", e))?;
+    }
+    // The last wake served.
+    let end = now() + ms(10_000);
+    while WAKES.load(Ordering::Relaxed) < ROUNDS && now() < end {
+        let _ = futex_wait(&READY, 1, now() + ms(5));
+    }
+    WAKE_STOP.store(1, Ordering::Release);
+    WAKE_WORD.fetch_add(1, Ordering::AcqRel);
+    let _ = futex_wake(&WAKE_WORD, 1);
+    STOP.store(1, Ordering::Relaxed);
+    join(out, "wake", &sleeper)?;
+    for t in &spinners {
+        join(out, "wake", t)?;
+    }
+    let (wakes, total, max) = (
+        WAKES.load(Ordering::Relaxed),
+        WAKE_TOTAL.load(Ordering::Relaxed),
+        WAKE_MAX.load(Ordering::Relaxed),
+    );
+    if wakes != ROUNDS || max > ms(15) {
+        println!(
+            out,
+            "DS-A wake: FAIL: {} of {} wakes behind 3 spinning threads on CPU {}, the longest {} ns, {} ns on average",
+            wakes,
+            ROUNDS,
+            last,
+            max,
+            total / wakes.max(1)
+        );
+        return Err(1);
+    }
+    println!(
+        out,
+        "DS-A wake: ok: {} wakes behind 3 spinning threads on CPU {} ran after {} ns on average, the longest {} ns",
+        wakes,
+        last,
+        total / wakes,
+        max
     );
     Ok(())
 }
