@@ -371,6 +371,13 @@ data; we're supposed to measure that, simple."
     only when its median wall is at least 1.5x faster than the best of **every** row, the
     native-expression rows included, and its CPU-seconds are no more than any row's. A job that
     misses gets another round on the stage its time split names; it is not done.
+  - **Judged on operational time** (Brackly, 2026-11-17): "disambiguate the startup times and
+    the operational time". Mode 2 (the Moruna VM on Azure's Linux) keeps being benchmarked.
+    Every table has two columns. Operational time runs from the first rows to the output
+    written, and the bar is judged on it against every engine's job time. Start-up is shown
+    apart: the VM's (launch, boot, stage), which goes away in mode 1, and the engine's (the
+    setup before the first rows), which stays and is a cost to cut. Start-up is measured
+    properly once mode 1 exists.
   - **Then prune what the OS does not use** (Brackly, same day). The timed runs carry no
     counters. They keep what already exists: the Linux calls the server refused, the processes
     the boot started, and the report's `vm` object. A separate, untimed usage build (stream U:

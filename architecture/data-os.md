@@ -602,6 +602,20 @@ step against §0's table, and they grow only by the mechanisms named in §2.
        under a monitor. Mode 1 later needs drivers for the machine it boots on; that is not
        0.7.0 work.
      - The monitor (QEMU today, with the launcher's jail) belongs to mode 2 only.
+     - **Done includes mode 1** (Brackly, 2026-11-17): "the definition of done for the moruna
+       vm is to boot up a node in servercore and azure", from our own uploaded image. It is part
+       of 0.7.0 (the PM's reading, given to Brackly to correct), and it is planned as a stream
+       once 0.7's operational numbers allow. What it needs, checked against the code:
+       - **Both clouds:** a boot from a standard disk image (UEFI or BIOS, with GRUB loading the
+         multiboot2 kernel); the boot paths are in OSTD. DHCP, which the net server has. A
+         platform module (cloud detection, metadata at 169.254.169.254), which is new. The
+         node's own job API over TLS, since no host runs `moruna run`; TLS is in the net stack.
+       - **Servercore** (OpenStack, KVM): virtio-blk and virtio-net, which exist. It comes first.
+       - **Azure:** NVMe on v6 types, which exists. Azure's network card over VMBus, which is
+         new and the largest item (no Hyper-V code exists yet). The WireServer report-ready
+         call, which is new. MANA comes later.
+       - The network stack (net server, DHCP, TLS, virtio-net, NVMe, gve) is kept for mode 1,
+         even though mode 2's job VMs never use it.
      - C7 in mode 1 reads "one client per node". A client's jobs there run side by side as
        processes, kept apart by the kernel's accounts. This is the reading only; it is not
        built.
