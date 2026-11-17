@@ -890,6 +890,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-ostd-adaptation"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+]
+
+[[package]]
 name = "moruna-pci"
 version = "0.1.0"
 dependencies = [
