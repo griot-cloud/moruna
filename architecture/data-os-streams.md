@@ -769,3 +769,15 @@ and switches to the new one when the call answers.
     reported both ways, and cutting boot is work regardless (fast deployment).
   - **Shmem THP `advise`** changed nothing: QEMU does not madvise its memfd, so
     ShmemHugePages stayed 0. A `within_size` run follows.
+- **2026-11-17: P's placement, account cap and plane sizing under KVM** (`c06344c2`, E's
+  one-month Score smoke, 8 processes).
+  - **At 20.5 GiB:** completes, total 21.1 s (launch 0.14, boot 2.52, job 17.7). The tasks ran
+    one per CPU. After the first 2 s the run does about 1.4M rows/s, against 0.35M before (the
+    pool: 2.7M). First rows came at 11.1 s, against 24.1 s. The commit step halved, to 7.25 GiB
+    at about 10 s, and is still there; it is no longer the task accounts (C).
+  - **At 2 GiB:** refused. A native stage's footprint, eight 112 MiB planes plus a morsel, is
+    981 MB against its 625 MB budget. This is new with the plane sizing (P).
+  - The month went out as 34 batches of 4 MiB morsels, and two tasks got none (P).
+  - **Shmem THP, `within_size` against `never`:** no huge pages (ShmemHugePages 0) and no
+    change in the first row. The cost before the first row is the guest's own commit, not the
+    host's page size. Host huge pages (a hugetlb memfd with reserved pages) are left aside.
