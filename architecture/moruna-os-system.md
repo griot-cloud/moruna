@@ -287,14 +287,17 @@ if it does, this section changes first.
   - **Disks are found in one place:** storvsc registers each disk in `devices`' directory (a
     `register` request, a right only driver links carry), with its serial, size and read-only flag,
     so 3C's `disk://<serial>` works the same on every cloud. Serials follow Microsoft's Azure udev
-    rules: the controller whose instance ID starts `00000000-0000-` holds the OS disk (LUN 0,
-    registered as `boot`, read-only, never a volume) and the resource disk (LUN 1, `resource`);
-    the data-disk controller's LUN n is `lun-<n>`. If no disk matches the OS-disk rule, every disk
-    is registered read-only.
+    rules (WALinuxAgent's `66-azure-storage.rules`, azure-vm-utils' `80-azure-disk.rules`): on the
+    root controller `{f8b3781a-1e82-4818-a1c3-63d806ec15bb}` (or a Gen 1 `00000000-0000-` one), LUN 0
+    is the OS disk (registered as `boot`, read-only, never a volume) and LUN 1 the resource disk
+    (`resource`); on `{f8b3781b/c/d-…}`, LUN n is `lun-<n>`. A disk no rule names is printed and not
+    registered; if no disk matches the OS-disk rule, every disk is registered read-only. Disks are
+    found at start by REPORT LUNS; disks attached later are a known limit.
   - **vmbus serves one listener slot per interface class,** `scsi` and `net`; a connection lists
     and opens only that class's offers.
-  - **A service linked to a service that isn't on this machine isn't on it either** (the supervisor
-    drops it, transitively), so storvsc and netvsc never start, with their DMA grants, off Hyper-V.
+  - **A client of a service that isn't on this machine isn't on it either** (the supervisor drops
+    it, transitively, along client links only; a server never goes for losing a client), so storvsc
+    and netvsc never start, with their DMA grants, off Hyper-V.
 - **Libraries first, as with the API server.** The VMBus client, storvsc and netvsc are each a
   library without std (`moruna-vmbus`, `moruna-storvsc`, `moruna-netvsc`), tested on the host
   against a fake of the host's side. The processes only wire them to the core and to each other.
