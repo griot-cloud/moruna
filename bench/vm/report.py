@@ -86,6 +86,11 @@ def rows_for(recs, machine, workload):
                              "rust" if e in ("moruna-vm", "rust-baseline", "moruna066-rust") else "python"),
             "runs": len(runs), "ok": len(ok),
             "wall_s": med([r["wall_s"] for r in ok]),
+            # 0.7's wall without the VM's launch and boot, for the bar taken either way (Brackly
+            # chooses the column).
+            "wall_noboot_s": med([r["wall_s"] - ((r.get("vm") or {}).get("launch_s") or 0)
+                                  - ((r.get("vm") or {}).get("boot_s") or 0) for r in ok])
+            if e.startswith("moruna-vm") else None,
             "cpu_s": med([r["cpu_s"] for r in ok]),
             "peak_gib": med([r["cg_peak_bytes"] / (1 << 30) for r in ok]),
             "oom": sum(r.get("oom_kills", 0) for r in runs),
@@ -112,23 +117,31 @@ def speedups(table):
     if not vm or vm["wall_s"] is None:
         return ["0.7 (moruna-vm) has no measured run."]
     others = {e: r for e, r in table.items() if not e.startswith("moruna-vm") and r["wall_s"]}
+    noboot = vm.get("wall_noboot_s")
     lines = []
     for group, name in ((2, "the plain Rust pool"), (5, "native expressions"), (3, "0.6.6"),
                         (4, "the Python engines")):
         rows = [(r["wall_s"], e) for e, r in others.items() if r["group"] == group]
         if rows:
             w, e = min(rows)
-            lines.append(f"- against {name} (best: {e}, {w:.1f} s): {w / vm['wall_s']:.2f}x")
+            without = f"; {w / noboot:.2f}x without launch and boot" if noboot else ""
+            lines.append(f"- against {name} (best: {e}, {w:.1f} s): {w / vm['wall_s']:.2f}x{without}")
     if not others:
         return lines
     best_wall, best = min((r["wall_s"], e) for e, r in others.items())
     least_cpu, cheapest = min((r["cpu_s"], e) for e, r in others.items() if r["cpu_s"] is not None)
-    x = best_wall / vm["wall_s"]
     cpu_ok = vm["cpu_s"] is not None and vm["cpu_s"] <= least_cpu
-    passed = x >= TARGET and cpu_ok
-    verdict = "PASS" if passed else "MISS"
-    lines.append(f"- **{verdict}**: {x:.2f}x the best row's wall ({best}, {best_wall:.1f} s; the bar is "
-                 f"{TARGET}x), CPU {vm['cpu_s']} s against the least of any row ({cheapest}, {least_cpu} s)")
+    passed = True
+    for label, wall in (("with launch and boot in the wall", vm["wall_s"]),
+                        ("without launch and boot", noboot)):
+        if not wall:
+            continue
+        x = best_wall / wall
+        ok = x >= TARGET and cpu_ok
+        passed = passed and ok
+        lines.append(f"- **{'PASS' if ok else 'MISS'}** {label}: {x:.2f}x the best row's wall ({best}, "
+                     f"{best_wall:.1f} s, against {wall:.1f} s; the bar is {TARGET}x), CPU {vm['cpu_s']} s "
+                     f"against the least of any row ({cheapest}, {least_cpu} s)")
     if not passed:
         s, v = vm["split"], vm.get("vm") or {}
         parts = {"read and decode": s.get("read_decode_s"), "the function": s.get("function_s"),
@@ -168,13 +181,16 @@ def render(recs, machines):
             if not table:
                 continue
             out.append(f"### {wl}\n")
-            out.append("| Group | Engine | Function | Wall s | CPU s | Peak GiB | OOM | Launch s | Boot s | Stage s | "
-                       "Read+decode s | Function s | Encode+write s | Waits s | Output | Runs ok |")
-            out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+            out.append("| Group | Engine | Function | Wall s | Wall less launch, boot s | CPU s | Peak GiB | OOM | "
+                       "Launch s | Boot s | Stage s | Read+decode s | Function s | Encode+write s | Waits s | Output | "
+                       "Runs ok |")
+            out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- "
+                       "| --- |")
             for e, r in sorted(table.items(), key=lambda kv: (kv[1]["group"], kv[0])):
                 s = r["split"]
                 v = r.get("vm") or {}
-                out.append(f"| {r['group']} | {e} | {r['function']} | {fmt(r['wall_s'])} | {fmt(r['cpu_s'])} | "
+                out.append(f"| {r['group']} | {e} | {r['function']} | {fmt(r['wall_s'])} | "
+                           f"{fmt(r.get('wall_noboot_s'))} | {fmt(r['cpu_s'])} | "
                            f"{fmt(r['peak_gib'], 2)} | {r['oom']} | {fmt(v.get('launch_s'), 2)} | "
                            f"{fmt(v.get('boot_s'), 2)} | {fmt(v.get('stage_s'), 2)} | "
                            f"{fmt(s['read_decode_s'])} | {fmt(s['function_s'])} | {fmt(s['encode_write_s'])} | "
