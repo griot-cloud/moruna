@@ -1000,6 +1000,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-storvsc"
+version = "0.1.0"
+dependencies = [
+ "guestmem_core",
+ "moruna-vmbus",
+ "scsi_defs",
+ "storvsp_protocol",
+ "vmbus_ring",
+ "zerocopy",
+]
+
+[[package]]
 name = "moruna-svc"
 version = "0.1.0"
 dependencies = [
