@@ -1,4 +1,3 @@
-// moruna: em dashes (U+2014) written as the escape \u{2014} in strings, for the repository's text rule.
 //! Exposes a number of modules with different kinds of strings.
 //!
 //! Each module contains `&str` constants named `TINY`, `SMALL`, `MEDIUM`,
@@ -35,10 +34,10 @@ pub mod en {
         "Rust is blazingly fast and memory-efficient: with no runtime or garbage
          collector, it can power performance-critical services, run on embedded
          devices, and easily integrate with other languages.  Rust’s rich type system
-         and ownership model guarantee memory-safety and thread-safety \u{2014} enabling you
+         and ownership model guarantee memory-safety and thread-safety — enabling you
          to eliminate many classes of bugs at compile-time.  Rust has great
          documentation, a friendly compiler with useful error messages, and top-notch
-         tooling \u{2014} an integrated package manager and build tool, smart multi-editor
+         tooling — an integrated package manager and build tool, smart multi-editor
          support with auto-completion and type inspections, an auto-formatter, and
          more."
     }
@@ -55,7 +54,7 @@ pub mod zh {
          系统和所有权模型保证了内存安全和线程安全，\
          让您在编译期就能够消除各种各样的错误。\
          Rust 拥有出色的文档、友好的编译器和清晰\
-         的错误提示信息， 还集成了一流的工具\u{2014}\u{2014}\
+         的错误提示信息， 还集成了一流的工具——\
          包管理器和构建工具， 智能地自动补全和类\
          型检验的多编辑器支持， 以及自动格式化代\
          码等等。"

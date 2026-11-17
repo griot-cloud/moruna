@@ -1,4 +1,3 @@
-// moruna: em dashes (U+2014) written "--" in comments, for the repository's text rule.
 //! A module for working with processes.
 //!
 //! This module is mostly concerned with spawning and interacting with child
@@ -1079,7 +1078,7 @@ impl Command {
     ///
     /// An error is only returned for failures that occur while the child is
     /// being spawned. Once the child has started successfully, anything that
-    /// happens to it afterwards -- including being terminated by a signal -- is
+    /// happens to it afterwards — including being terminated by a signal — is
     /// reported through its [`ExitStatus`] rather than as an error from the
     /// spawning method.
     ///

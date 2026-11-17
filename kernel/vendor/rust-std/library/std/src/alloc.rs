@@ -1,4 +1,3 @@
-// moruna: em dashes (U+2014) written "--" in comments, for the repository's text rule.
 //! Memory allocation APIs.
 //!
 //! In a given program, the standard library has one “global” memory allocator
@@ -299,8 +298,8 @@ static HOOK: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 
 /// Registers a custom allocation error hook, replacing any that was previously registered.
 ///
-/// The allocation error hook is invoked when an infallible memory allocation fails -- that is,
-/// as a consequence of calling [`handle_alloc_error`] -- before the runtime aborts.
+/// The allocation error hook is invoked when an infallible memory allocation fails — that is,
+/// as a consequence of calling [`handle_alloc_error`] — before the runtime aborts.
 ///
 /// The allocation error hook is a global resource. [`take_alloc_error_hook`] may be used to
 /// retrieve a previously registered hook and wrap or discard it.

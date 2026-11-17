@@ -16,13 +16,10 @@ builds for `kernel/targets/x86_64-moruna.json` (`kernel/tools/build-std.sh`).
   `cp -R "$(rustc +nightly-2026-07-21 --print sysroot)/lib/rustlib/src/rust/library" library`.
   Nothing else was fetched for it: the third-party crates under `library/vendor` are the ones
   `rust-src` carries.
-- **std's own dependencies at build time:** Cargo's build-std reads `library/Cargo.lock` but not
-  `library/.cargo/config.toml`, so it takes std's crates.io dependencies (`hashbrown`, `libc`,
-  `cfg-if`, `rustc-demangle`) from crates.io, at the versions and checksums the lock pins: the
-  same bytes as their copies in `library/vendor`. This is what build-std does with the
-  toolchain's own `rust-src` too.
 
-Every file not listed below is byte for byte the `rust-src` file. To check:
+Upstream's files stay as `rust-src` has them, apart from the functional patches below; the
+repository's text rules do not apply to this copy (`tools/quality/check.sh` leaves it out of its
+em-dash check). Every file not listed below is byte for byte the `rust-src` file. To check:
 
 ```sh
 diff -r "$(rustc +nightly-2026-07-21 --print sysroot)/lib/rustlib/src/rust/library" library
@@ -33,8 +30,7 @@ lists exactly the files below.
 ## What changed
 
 Every change is marked `moruna:` in the file it is in (`grep -rn "moruna:" library`), except
-those in `Cargo.lock` and the vendored crates' `.cargo-checksum.json`, files Cargo writes and
-which hold no comment.
+`Cargo.lock`'s, a file Cargo writes, which holds no comment.
 
 ### The platform layer: `target_os = "moruna"`
 
@@ -46,31 +42,51 @@ arm beside Motor's.
 
 - **Entry:** `sys/pal/moruna`: `_start` takes the start page's address, gives the first thread
   its table of thread-local keys, runs the program's `main` and exits with its code, once the
-  log has stdout's and stderr's last line. `abort_internal`, where a panic ends, does the same
+  last line of stdout and stderr is out. `abort_internal`, where a panic ends, does the same
   with code 101, a panicking program's code on Moruna.
 - **alloc:** the process's heap, `moruna_sys`'s, which std's `System` allocates from.
-- **thread:** spawn (a stack of its own with a guard page, and a key table), join, sleep and
-  yield; thread-local storage is std's key-based kind (`thread_local::key`, as Motor and Xous),
-  each thread's FS base pointing at its table. The core has no call that gives the CPU away, so
-  yield is a hint to the CPU only.
+- **thread:** spawn, with a 2 MiB stack by default (as Linux's std; arrow-rs and query engines
+  recurse deeply) and a guard page below it, and a key table; join, sleep, and yield
+  (`thread_yield`, ABI 2.8). Thread-local storage is std's key-based kind
+  (`thread_local::key`, as Motor and Xous), each thread's FS base pointing at its table.
 - **sync:** std's futex `Mutex`, `Condvar`, `RwLock`, `Once` and thread parking, over the core's
   futex calls (`moruna_sys::rt::futex`, with timeouts on the monotonic clock).
-- **time:** `Instant` from the clock page. A native task is given no realtime base, so
-  `SystemTime::now` is unsupported (it panics, as on std's other platforms without a wall
-  clock); `SystemTime`'s arithmetic works.
+- **time:** `Instant` from the clock page; `SystemTime` from the node's wall clock on the same
+  page (ABI 2.8: its realtime base, set from the CMOS clock at boot and by `platform`). While
+  the wall clock is unset it reads 1970 plus the monotonic clock, as the Linux layer's does; it
+  never panics.
 - **random:** the core's `random_read`.
 - **stdio:** stdout and stderr are lines of the task's log (`moruna_sys::plane::Log`, start slot
-  `log`), and stdin is empty. A task with no log slot has its output dropped.
+  `log`); with no log, lines on its console (start slot `console`), each in one write; with
+  neither, dropped. stdin is empty.
 - **env and args:** from the start page: the arguments are the process's name, and the
-  environment is empty.
+  environment is empty; setting a variable is unsupported.
 - **fs, net, process, pipe:** std's unsupported implementations: every call answers
   `Unsupported`.
+- **`std::os::moruna`:** `moruna_sys`, std's own copy, re-exported as Hermit's std re-exports
+  `hermit_abi`, so a program reaches Moruna's calls with std's state (its start page, the slots
+  std took, its log) rather than through a second copy.
+
+### Offline: std's dependencies are `library/vendor`'s
+
+Cargo's build-std reads `library/Cargo.lock` but not `library/.cargo/config.toml`, so by itself
+it takes std's crates.io dependencies from crates.io. `library/Cargo.toml`'s `[patch.crates-io]`
+points each of the 30 crates `rust-src` vendors at its copy in `library/vendor`, so std's lock
+names no registry and its build fetches nothing; `build-std.sh` checks the lock before every
+build and builds `--offline`. A build without std's optional features (no backtrace
+symbolication, no tests) uses only some of them, and Cargo says the others' patches were not
+used.
+
+### Files
 
 | File | Lines | Changed | SHA-256 in `rust-src` | SHA-256 here |
 |---|---|---|---|---|
-| `Cargo.lock` | 484 | +26 -0 | `9e87d1ac04edbf5fa61e27cb21984a83566573a007767713868965fba70acb6d` | `4721f4f472771ba8a518dca156c58c1a92df2b612c5a8c1eca144a70a1ab4a69` |
+| `Cargo.lock` | 424 | +30 -64 | `9e87d1ac04edbf5fa61e27cb21984a83566573a007767713868965fba70acb6d` | `333f5bc1f18d100f8f8255bbdaddca78db00643f6327262b27bb19af5d9e9b35` |
+| `Cargo.toml` | 122 | +32 -0 | `b346ae33bd9648949894510a2bcc1d1f8b78c7301c3110e4a98b68bacd3b4584` | `571f4569f6f5718a19f1feac9b58841fca3145f98b74ad2ef50805694023cf3a` |
 | `std/Cargo.toml` | 176 | +5 -0 | `ef320a0ca2b3bb4d68c3cdeb2fd226ac83d93093bb1c10f4390dcfd8c11f1a9a` | `5ff5f3e4fdf4a742129c90edb418181c353b7a77faf86fb7437aa65909b3176b` |
 | `std/build.rs` | 109 | +2 -0 | `f5510c905e126f1de772d73c02cacb7a5ed0a485a22fb99f395593b16a9de8b2` | `b37021b451d7c8538070febf22a2c0cbc554094d081d2ecfab113edca628c49b` |
+| `std/src/os/mod.rs` | 150 | +3 -0 | `b05633fdbbfe57827651e13afc896ac9b1edfdbcca13d1a6bb4d5444c82bdb0e` | `ff54c71423bf05a6f61d7d6a661ec5a85b5a0f84e805d427077f03bf030c91f9` |
+| `std/src/os/moruna/mod.rs` | 14 | +14 -0 | new | `cb0cee87c33e0eedf611156d2b76e0c482fbe2ee41f8bcf88c909f17730f4028` |
 | `std/src/sys/alloc/mod.rs` | 144 | +5 -0 | `7c40f1c30fcf850a5fa25361f779b7b1205c94486fb42acf83e9dda1e71915da` | `a6e88909538a209dedecdc31a201ce72d8c5a185daa2cb6a78d1b0f466c67e3f` |
 | `std/src/sys/alloc/moruna.rs` | 3 | +3 -0 | new | `2b58b859d36bdb9ff1091b7ed1c37ecf148129bbae45da353dc48f206559e648` |
 | `std/src/sys/args/mod.rs` | 71 | +7 -0 | `555d13de7285b38f85c22c162a3e6a34bbdbdc3d5161185d93f7c5339fe366e9` | `3fb4a68bc12be14c5c7a4f9acba8f13cd07919bf6e74cfeda4f2ce5b70f6a426` |
@@ -96,56 +112,14 @@ arm beside Motor's.
 | `std/src/sys/thread_local/mod.rs` | 231 | +9 -0 | `bc072e04d8564c050420e597b89e2b100502bb1395423277c057ca8aec70317a` | `c18b209709b464353043f33284439d14f2bf2e0eb65fcc6901ee982c50b0d7d0` |
 | `std/src/sys/time/mod.rs` | 57 | +4 -0 | `449afdd86955252a302d889032a6cb2cbb04dd786f8cb81d9a9059ad933e7e4c` | `dc5f131f9033808546387962e3c22d24f962204bc06b42123d328775035dbbfa` |
 
-Nothing is removed and no line of `rust-src`'s is changed: the layer only adds. `Cargo.lock`
-gains the three Moruna crates std now depends on (`moruna-sys`, `moruna-abi`,
-`moruna-record`), as `cargo metadata` writes them.
+No upstream file is removed, and outside `Cargo.lock` no upstream line changes: the layer only
+adds. `Cargo.lock` gains the three Moruna crates std depends on (`moruna-sys`, `moruna-abi`,
+`moruna-record`), and its 30 vendored crates lose their registry source and checksum, as
+`cargo metadata --offline` writes them with the patches.
 
 ### Building with it
 
 `kernel/tools/build-std.sh MANIFEST` builds a program for `kernel/targets/x86_64-moruna.json`
 with `-Zbuild-std=std,panic_abort`, `__CARGO_TESTS_ONLY_SRC_ROOT` pointing build-std at this
-`library/`, and the native programs' link (static, `kernel/sys/user.ld`). The proof is
-`kernel/examples/std-arrow`.
-
-### Text only: em dashes
-
-The repository's text rule (no em dash, U+2014, in a tracked file; `tools/quality/check.sh`)
-applies to this copy too. In each of these files every em dash of a comment or of prose is
-written `--`, and the one file whose em dashes are in string literals (a benchmark's corpus)
-writes them as the escape `\u{2014}`, so its strings are the same bytes. A marker line was added
-at the top of each. No code changed. A crate under `library/vendor` records the new SHA-256 of
-its file in its `.cargo-checksum.json`, which Cargo checks.
-
-| File | SHA-256 in `rust-src` | SHA-256 here |
-|---|---|---|
-| `alloc/src/ffi/c_str.rs` | `a9a4e636ee388b4c9690ea643f2a6ea1d1f406431fdd5f0cb86fea5c9f465178` | `9e5a7aa2739f48e8c8644503955bb6abc61e5286941fa3a8b91ef54126feb035` |
-| `alloc/src/ffi/mod.rs` | `d7bd201345e8fc6c792937e548b7c229975e39180f98f5b2c4e292964c07f375` | `9da82be6ba542226d8c305c2b7477f0b32881f5392a34d8f83c62797f882b077` |
-| `core/src/ascii/ascii_char.rs` | `fcf1bfaab18788738efce4b5edf8e08600627bf6d897787a671bd2f27eac3673` | `8a96897c63068a4256cbb93f13877046d9bb72860313990a5155327950f83d9d` |
-| `core/src/cell.rs` | `9688204c59a29b83e3f4108f11c5a827dde4c8627e35ce173678c21b9abeb8a7` | `923c2c38806be96565f25b5763be6f3047a6909810453b0e888d9765f9d61422` |
-| `core/src/char/methods.rs` | `43651b8f604d20a0a45d58139003a154114acc84e794b5094e72fa6b8db3c945` | `2c6c38d5001ded9cac996898fc7e1a85aade02556133d63b6b9bcfd2a96f7aad` |
-| `core/src/io/error.rs` | `461fb8ea5dc086b197f43a362ee6fe3dd5b41ab59f47265b3cdb6086c51327fc` | `c003832217768c0d6771aac554aa6f3f50b6be757e2ddcb7f5461229f2c62ac8` |
-| `core/src/mem/mod.rs` | `80a2ca9dc509606b7be5e083e106d5927647444868557190eaac87fbf218ecb7` | `084003df302792acd12ac175f73d4e18ca5e7e16988284139ad29c755c49975e` |
-| `core/src/num/mod.rs` | `1978e979505fdeec8e489a4fa6e070fe557c0295e106ee1096a5cb8ffa39fc8e` | `792c0ee5b374b0f8f133bad455714f2549fa369389ba3156d4af69daf9d7cf4d` |
-| `core/src/task/wake.rs` | `7c2ceba687944836ea4d42859ec1e191fb14144503257a9cd1ad381f352d1fc1` | `e438a2da17c5aab9b1be41b456541503fe9bb6c7fb441c219efce4e5965abb24` |
-| `coretests/benches/str/corpora.rs` | `f275a16e44f7646cb4317f28bd604881dcf845b7103327116548838c2d69b19b` | `c8aca2a9a45410aadda59452c94e643bd7672d598e933f5ffe8b0f110b6f9ed4` |
-| `std/src/alloc.rs` | `74400627286d27c36dd2f51bb32433851e54d5a0a2dcd2365ed301c5fd91ee54` | `c749f5f257689718e18993bdbd421f675b024d605245dc71c508af397984b080` |
-| `std/src/ffi/mod.rs` | `082280aa251604243b72563ed62915b686c0b47fd1ac70d4070131cc20d393c3` | `9e577e161b8e164947d21cd0775c7b651f2cd80d6c2f82d7e0572d20f677b275` |
-| `std/src/process.rs` | `5cab3fe1f471db27db7c3d79d4123613ba0646983f5ad3236bfaaab87f4abaa5` | `109e84264994032eb6bb96323796aa9fe2ddca9cc8052e210cbf3060ea6b04ee` |
-| `std/src/sys/net/connection/xous/tcplistener.rs` | `7cccc82e4b741b46939eaf5207c4ccfcea79682c485c8cd41c1431887e2e9a36` | `0bc148588010d6eb2448ec72c9c435918c2c3b173684fe01e33729ca24694489` |
-| `std/src/sys/net/connection/xous/udp.rs` | `b9610cd0dc20fc5619cfe9e26c66282df273dc642d42bf311fde68c0fccab191` | `d636a8506b4de8c8a241a3ea8b8183042e09d47d0cee5fd7efe2b326470f8de2` |
-| `std/src/sys/pal/uefi/helpers.rs` | `cecd697ccb5cdc3c68b32b3e4ee2a7ce7b1aa657bb6ac36d2825771ae48cf9fc` | `c7474cfc3ac5d82ad171b1e6789223ca67c0b04afd5b666ac3747b4e25a0e7d0` |
-| `stdarch/crates/stdarch-gen-common/src/lib.rs` | `ce8ba0b55240debe033e3766fd7ee7e204da98e4ad37bcf6e37123e3df1dba38` | `5d79a4d3cc6ade486eb12e4f174ddb82a5a594633b8c7cda1e1f1117301a3bfc` |
-| `vendor/rand-0.9.2/CHANGELOG.md` | `3a56b7876eff2d0dd9d0975844b251236af71e385f413ac06c241e6996038cd7` | `65484dd26377ec5d002076e235482d5aeb9dc20b946df7b954ebe39b43f14436` |
-| `vendor/rand_core-0.9.3/CHANGELOG.md` | `01ed6dbeab8975c68fd08e14f3579a964ad7579efa60998e70848cc3b6862647` | `7ab00a6f65b374041c9ad3af940281dd5bcc2984664322784b8526480b5e91fc` |
-| `vendor/shlex-1.3.0/src/quoting_warning.md` | `566d6509211ddcd4afbd4f1117c5234567f6b6d01f5da60acfaef011362be045` | `d3b38e8ef4f2748d3fc43785d2e4c1d101eb764c9f7baba2da036535fbe56ca7` |
-| `vendor/wasip3-0.6.0+wasi-0.3.0-rc-2026-03-15/src/http_compat/conversions.rs` | `8f5562c525e6bf3036a7293263b3331c8156183c03127d4394f3c4bff52afb8b` | `faf56a542a1939baa803bbf6e8af9c5bb5ffb4d4a8ae0faebab3d3255f642c99` |
-
-The four crates' checksum files changed with them, one hash each:
-`vendor/rand-0.9.2/.cargo-checksum.json`, `vendor/rand_core-0.9.3/.cargo-checksum.json`,
-`vendor/shlex-1.3.0/.cargo-checksum.json` and
-`vendor/wasip3-0.6.0+wasi-0.3.0-rc-2026-03-15/.cargo-checksum.json`.
-
-`.gitignore`, beside this file, keeps three of the copy's directories from the repository's
-`target/` and `build/` rules: `vendor/cc-1.2.0/src/target`, and `src/build` and `tests/build` of
-`vendor/object-0.39.1`, are source. The checksum files are JSON, which has no comment, so they
-carry no marker.
+`library/`, getrandom's custom backend (`kernel/getrandom`, the core's `random_read`), and the
+native programs' link (static, `kernel/sys/user.ld`). The proof is `kernel/examples/std-arrow`.

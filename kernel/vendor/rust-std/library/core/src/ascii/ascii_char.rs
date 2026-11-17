@@ -1,4 +1,3 @@
-// moruna: em dashes (U+2014) written "--" in comments, for the repository's text rule.
 //! This uses the name `AsciiChar`, even though it's not exposed that way right now,
 //! because it avoids a whole bunch of "are you sure you didn't mean `char`?"
 //! suggestions from rustc if you get anything slightly wrong in here, and overall
@@ -1041,7 +1040,7 @@ impl AsciiChar {
     /// whitespace][infra-aw]. There are several other definitions in
     /// wide use. For instance, [the POSIX locale][pct] includes
     /// 0x0B VERTICAL TAB as well as all the above characters,
-    /// but--from the very same specification--[the default rule for
+    /// but—from the very same specification—[the default rule for
     /// "field splitting" in the Bourne shell][bfs] considers *only*
     /// SPACE, HORIZONTAL TAB, and LINE FEED as whitespace.
     ///

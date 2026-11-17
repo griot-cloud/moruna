@@ -1,4 +1,3 @@
-// moruna: em dashes (U+2014) written "--" in comments, for the repository's text rule.
 #![stable(feature = "futures_api", since = "1.36.0")]
 
 use crate::any::Any;
@@ -471,7 +470,7 @@ impl Waker {
     /// when the `Waker`s would awaken the same task. However, if this function
     /// returns `true`, it is guaranteed that the `Waker`s will awaken the same task.
     ///
-    /// This function is primarily used for optimization purposes -- for example,
+    /// This function is primarily used for optimization purposes — for example,
     /// this type's [`clone_from`](Self::clone_from) implementation uses it to
     /// avoid cloning the waker when they would wake the same task anyway.
     #[inline]
@@ -800,7 +799,7 @@ impl LocalWaker {
     /// when the `Waker`s would awaken the same task. However, if this function
     /// returns `true`, it is guaranteed that the `Waker`s will awaken the same task.
     ///
-    /// This function is primarily used for optimization purposes -- for example,
+    /// This function is primarily used for optimization purposes — for example,
     /// this type's [`clone_from`](Self::clone_from) implementation uses it to
     /// avoid cloning the waker when they would wake the same task anyway.
     #[inline]

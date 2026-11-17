@@ -1,4 +1,3 @@
-// moruna: em dashes (U+2014) written "--" in comments, for the repository's text rule.
 //! Contains most of the shared UEFI specific stuff. Some of this might be moved to `std::os::uefi`
 //! if needed but no point in adding extra public API when there is not Std support for UEFI in the
 //! first place
@@ -657,7 +656,7 @@ pub(crate) fn get_device_path_from_map(map: &Path) -> io::Result<BorrowedDeviceP
 /// - `handle` must always be a valid UEFI handle corresponding to the `service_guid`.
 /// - Copying `ServiceProtocol` is sound as long as `handle` remains valid.
 /// - For most service binding protocols (in edk2 implementations), such handles remain valid
-///   for the lifetime of the UEFI environment -- effectively `'static`.
+///   for the lifetime of the UEFI environment — effectively `'static`.
 #[derive(Clone, Copy)]
 pub(crate) struct ServiceProtocol {
     service_guid: r_efi::efi::Guid,

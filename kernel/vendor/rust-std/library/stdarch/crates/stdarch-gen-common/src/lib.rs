@@ -1,4 +1,3 @@
-// moruna: em dashes (U+2014) written "--" in comments, for the repository's text rule.
 //! Shared check/bless harness for stdarch generators.
 
 use std::error::Error as StdError;
@@ -106,13 +105,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Run a generator under the chosen `mode`, reconciling its output with `committed`.
 ///
 /// Arguments:
-/// - `committed` -- the directory holding the in-tree (committed) source files.
+/// - `committed` — the directory holding the in-tree (committed) source files.
 ///   Files inside `committed` whose first line begins with [`GENERATED_MARKER`]
 ///   are treated as owned by the generator. Anything else is treated as
 ///   hand-written and is left untouched by `Bless` and ignored by `Check`.
 ///   So generated files coexist with hand-written files in the same  directory.
-/// - `mode` -- what to do with the generator's output.
-/// - `generate` -- closure that writes the generator's output into the
+/// - `mode` — what to do with the generator's output.
+/// - `generate` — closure that writes the generator's output into the
 ///   directory it is given. Its error is wrapped in [`Error::Generator`].
 ///
 /// Behavior per mode:
@@ -171,7 +170,7 @@ fn discover_owned(dir: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Returns every file name in `dir` (scratch dir -- all files are generator output).
+/// Returns every file name in `dir` (scratch dir — all files are generator output).
 fn discover_all(dir: &Path) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for entry in fs::read_dir(dir)? {

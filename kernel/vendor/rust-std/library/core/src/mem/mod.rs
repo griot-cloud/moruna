@@ -1,4 +1,3 @@
-// moruna: em dashes (U+2014) written "--" in comments, for the repository's text rule.
 //! Basic functions for dealing with memory, values, and types.
 //!
 //! The contents of this module can be seen as belonging to a few families:
@@ -176,7 +175,7 @@ pub mod type_info;
 /// erring on the side of (double-)dropping.
 ///
 /// Also, `ManuallyDrop` prevents us from having to "touch" `v` after transferring the
-/// ownership to `s` -- the final step of interacting with `v` to dispose of it without
+/// ownership to `s` — the final step of interacting with `v` to dispose of it without
 /// running its destructor is entirely avoided.
 ///
 /// [`Box`]: ../../std/boxed/struct.Box.html
@@ -1368,7 +1367,7 @@ impl<T> fmt::Debug for Discriminant<T> {
 /// If an enum has opted-in to having a [primitive representation] for its discriminant,
 /// then it's possible to use pointers to read the memory location storing the discriminant.
 /// That **cannot** be done for enums using the [default representation], however, as it's
-/// undefined what layout the discriminant has and where it's stored -- it might not even be
+/// undefined what layout the discriminant has and where it's stored — it might not even be
 /// stored at all!
 ///
 /// [`as`]: ../../std/keyword.as.html
@@ -1552,8 +1551,8 @@ impl<T> SizedTypeProperties for T {}
 /// #[repr(C, align(4))]
 /// struct Align4(u32);
 ///
-/// assert_eq!(mem::offset_of!(Struct<dyn Debug>, a), 0); // OK -- Sized field
-/// assert_eq!(mem::offset_of!(Struct<Align4>, b), 4); // OK -- not DST
+/// assert_eq!(mem::offset_of!(Struct<dyn Debug>, a), 0); // OK — Sized field
+/// assert_eq!(mem::offset_of!(Struct<Align4>, b), 4); // OK — not DST
 ///
 /// // assert_eq!(mem::offset_of!(Struct<dyn Debug>, b), 1);
 /// // ^^^ error[E0277]: ... cannot be known at compilation time
@@ -1614,8 +1613,8 @@ impl<T> SizedTypeProperties for T {}
 ///
 /// The following unstable features expand the functionality of `offset_of!`:
 ///
-/// * [`offset_of_enum`] -- allows `enum` variants to be traversed as if they were fields.
-/// * [`offset_of_slice`] -- allows getting the offset of a field of type `[T]`.
+/// * [`offset_of_enum`] — allows `enum` variants to be traversed as if they were fields.
+/// * [`offset_of_slice`] — allows getting the offset of a field of type `[T]`.
 ///
 /// # Examples
 ///

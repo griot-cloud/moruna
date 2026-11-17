@@ -1,4 +1,3 @@
-// moruna: em dashes (U+2014) written "--" in comments, for the repository's text rule.
 #![unstable(feature = "core_io", issue = "154046")]
 
 // On 64-bit platforms, `io::Error` may use a bit-packed representation to
@@ -158,7 +157,7 @@ enum ErrorData<C> {
 // have on 32 bit platforms.
 //
 // (For the sake of being explicit: the alignment requirement here only matters
-// if `error/repr_bitpacked.rs` is in use -- for the unpacked repr it doesn't
+// if `error/repr_bitpacked.rs` is in use — for the unpacked repr it doesn't
 // matter at all)
 #[doc(hidden)]
 #[unstable(feature = "io_const_error_internals", issue = "none")]

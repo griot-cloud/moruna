@@ -1,11 +1,10 @@
-<!-- moruna: em dashes (U+2014) written "--", for the repository's text rule. -->
 # Changelog
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.9.3] -- 2025-02-29
+## [0.9.3] — 2025-02-29
 ### Other
 - Remove `zerocopy` dependency (#1607)
 - Deprecate `rand_core::impls::fill_via_u32_chunks`, `fill_via_u64_chunks` (#1607)

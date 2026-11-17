@@ -1,4 +1,3 @@
-// moruna: em dashes (U+2014) written "--" in comments, for the repository's text rule.
 //! Utilities related to FFI bindings.
 //!
 //! This module provides utilities to handle data across non-Rust
@@ -51,7 +50,7 @@
 //!
 //! * **Internal nul characters** - When C strings have a nul
 //! terminator character, this usually means that they cannot have nul
-//! characters in the middle -- a nul character would essentially
+//! characters in the middle — a nul character would essentially
 //! truncate the string. Rust strings *can* have nul characters in
 //! the middle, because nul does not have to mark the end of the
 //! string in Rust.

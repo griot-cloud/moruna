@@ -1,4 +1,3 @@
-// moruna: em dashes (U+2014) written "--" in comments, for the repository's text rule.
 //! [`CString`] and its related types.
 
 use core::borrow::Borrow;
@@ -56,7 +55,7 @@ use crate::vec::Vec;
 /// way do *not* contain the trailing nul terminator. This is useful
 /// when you will be calling an extern function that takes a `*const
 /// u8` argument which is not necessarily nul-terminated, plus another
-/// argument with the length of the string -- like C's `strndup()`.
+/// argument with the length of the string — like C's `strndup()`.
 /// You can of course get the slice's length with its
 /// [`len`][slice::len] method.
 ///

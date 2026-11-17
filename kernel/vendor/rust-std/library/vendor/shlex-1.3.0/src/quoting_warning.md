@@ -1,4 +1,3 @@
-<!-- moruna: em dashes (U+2014) written "--", for the repository's text rule. -->
 // vim: textwidth=99
 /*
 Meta note: This file is loaded as a .rs file by rustdoc only.
@@ -205,7 +204,7 @@ A
 B
 ```
 
-But other shells don't support it -- including Dash, a popular choice for `/bin/sh`, and Busybox's
+But other shells don't support it — including Dash, a popular choice for `/bin/sh`, and Busybox's
 Ash, frequently seen on stripped-down embedded systems.  This crate's quoting functionality [tries
 to be compatible](crate#compatibility) with those shells, plus all other POSIX-compatible shells.
 That makes ANSI-C quoting a no-go.
@@ -353,9 +352,9 @@ separator.  Treatment as a word separator only happens for `b"\xa0"` alone, whic
 
 [^escbs]: For example, Dash doesn't remove the backslash from `"\!"` because it simply doesn't know
     anything about `!` as a special character: it doesn't support history expansion.  On the other
-    end of the spectrum, Zsh supports history expansion and does remove the backslash -- though only
+    end of the spectrum, Zsh supports history expansion and does remove the backslash — though only
     in interactive mode.  Bash's behavior is weirder.  It supports history expansion, and if you
-    write `"\!"`, the backslash does prevent history expansion from occurring -- but it doesn't get
+    write `"\!"`, the backslash does prevent history expansion from occurring — but it doesn't get
     removed!
 
 */

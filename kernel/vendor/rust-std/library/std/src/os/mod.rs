@@ -119,6 +119,9 @@ pub mod l4re;
 pub mod macos;
 #[cfg(target_os = "motor")]
 pub mod motor;
+// moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
+#[cfg(target_os = "moruna")]
+pub mod moruna;
 #[cfg(target_os = "netbsd")]
 pub mod netbsd;
 #[cfg(any(target_os = "nto", target_os = "qnx"))]

@@ -1,4 +1,3 @@
-// moruna: em dashes (U+2014) written "--" in comments, for the repository's text rule.
 //! Numeric traits and functions for the built-in numeric types.
 
 #![stable(feature = "rust1", since = "1.0.0")]
@@ -1117,7 +1116,7 @@ impl u8 {
     /// whitespace][infra-aw]. There are several other definitions in
     /// wide use. For instance, [the POSIX locale][pct] includes
     /// U+000B VERTICAL TAB as well as all the above characters,
-    /// but--from the very same specification--[the default rule for
+    /// but—from the very same specification—[the default rule for
     /// "field splitting" in the Bourne shell][bfs] considers *only*
     /// SPACE, HORIZONTAL TAB, and LINE FEED as whitespace.
     ///

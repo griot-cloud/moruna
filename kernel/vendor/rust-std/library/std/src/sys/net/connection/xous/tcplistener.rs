@@ -1,4 +1,3 @@
-// moruna: em dashes (U+2014) written "--" in comments, for the repository's text rule.
 use core::convert::TryInto;
 use core::sync::atomic::{Atomic, AtomicBool, AtomicU16, AtomicUsize, Ordering};
 
@@ -130,7 +129,7 @@ impl TcpListener {
             0,
         ) {
             if receive_request.raw[0] != 0 {
-                // Error case -- code lives at byte 4 (where the send path
+                // Error case — code lives at byte 4 (where the send path
                 // also reads it). Byte 1 is part of the marker header.
                 if receive_request.raw[4] == NetError::TimedOut as u8 {
                     return Err(io::const_error!(io::ErrorKind::TimedOut, "accept timed out"));

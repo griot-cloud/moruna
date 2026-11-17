@@ -1,4 +1,3 @@
-// moruna: em dashes (U+2014) written "--" in comments, for the repository's text rule.
 use super::{
     body_writer::BodyWriter, to_internal_error_code, IncomingRequestBody, IncomingResponseBody,
     Request as HttpRequest, RequestOptionsExtension, Response as HttpResponse,
@@ -19,9 +18,9 @@ use std::{any::Any, convert::TryFrom};
 ///
 /// # See Also
 ///
-/// - [`http_from_wasi_response`] -- converts a WASI response back into a host-side HTTP response.
-/// - [`BodyWriter`] -- for streaming body data into WASI.
-/// - [`IncomingResponseBody`] -- for handling pending or unstarted response states.
+/// - [`http_from_wasi_response`] — converts a WASI response back into a host-side HTTP response.
+/// - [`BodyWriter`] — for streaming body data into WASI.
+/// - [`IncomingResponseBody`] — for handling pending or unstarted response states.
 pub fn http_into_wasi_response<T>(mut resp: HttpResponse<T>) -> Result<WasiHttpResponse, ErrorCode>
 where
     T: http_body::Body + Any,
@@ -64,9 +63,9 @@ where
 ///
 /// # See Also
 ///
-/// - [`http_into_wasi_response`] -- the inverse conversion.
-/// - [`IncomingResponseBody`] -- for handling WASI-to-host body streams.
-/// - [`ErrorCode`] -- for standardized error reporting.
+/// - [`http_into_wasi_response`] — the inverse conversion.
+/// - [`IncomingResponseBody`] — for handling WASI-to-host body streams.
+/// - [`ErrorCode`] — for standardized error reporting.
 pub fn http_from_wasi_response(resp: WasiHttpResponse) -> Result<HttpResponse, ErrorCode> {
     let mut builder = http::Response::builder().status(resp.get_status_code());
 
@@ -86,10 +85,10 @@ pub fn http_from_wasi_response(resp: WasiHttpResponse) -> Result<HttpResponse, E
 ///
 /// # See Also
 ///
-/// - [`http_from_wasi_response`] -- for converting WASI responses back into standard HTTP responses.
-/// - [`http_into_wasi_response`] -- for converting HTTP responses into WASI format.
-/// - [`BodyWriter`] -- for streaming request bodies to WASI.
-/// - [`IncomingRequestBody`] -- for managing unstarted or in-progress request states.
+/// - [`http_from_wasi_response`] — for converting WASI responses back into standard HTTP responses.
+/// - [`http_into_wasi_response`] — for converting HTTP responses into WASI format.
+/// - [`BodyWriter`] — for streaming request bodies to WASI.
+/// - [`IncomingRequestBody`] — for managing unstarted or in-progress request states.
 pub fn http_into_wasi_request<T>(mut req: HttpRequest<T>) -> Result<WasiHttpRequest, ErrorCode>
 where
     T: http_body::Body + Any,
@@ -147,10 +146,10 @@ where
 ///
 /// # See Also
 ///
-/// - [`http_into_wasi_request`] -- converts from host HTTP requests into WASI requests.
-/// - [`http_from_wasi_request`] -- converts from WASI responses into host responses.
-/// - [`IncomingRequestBody`] -- for streaming WASI request bodies into host code.
-/// - [`RequestOptionsExtension`] -- for carrying optional request metadata.
+/// - [`http_into_wasi_request`] — converts from host HTTP requests into WASI requests.
+/// - [`http_from_wasi_request`] — converts from WASI responses into host responses.
+/// - [`IncomingRequestBody`] — for streaming WASI request bodies into host code.
+/// - [`RequestOptionsExtension`] — for carrying optional request metadata.
 pub fn http_from_wasi_request(req: WasiHttpRequest) -> Result<HttpRequest, ErrorCode> {
     let uri = {
         let mut builder = http::Uri::builder();
