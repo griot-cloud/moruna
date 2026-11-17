@@ -66,6 +66,7 @@ pub(crate) fn worker_loop(
     // Whether this worker's last unit was an offloaded job (RB1): the next turn is a function's,
     // if the policy has one.
     let mut offloaded_last = false;
+    crate::times::Times::mark(worker);
     loop {
         shared.heartbeat.touch(worker);
         if shared.stopping.load(Ordering::SeqCst) {
@@ -78,12 +79,24 @@ pub(crate) fn worker_loop(
                 // has a death to find and the run ends with a diagnostic rather than a hang.
                 return;
             }
+            let started = std::time::Instant::now();
             let outcome = run_job(&shared, worker, request.job);
+            shared
+                .times
+                .of(worker)
+                .jobs
+                .fetch_add(crate::times::since(started), Ordering::Relaxed);
             let _ = request.reply.send(outcome);
             continue;
         }
         if !active_slot(&shared, worker) || shared.gated() {
-            idle(&shared, worker, &parker);
+            let started = std::time::Instant::now();
+            park(&shared, worker, &parker);
+            shared
+                .times
+                .of(worker)
+                .parked
+                .fetch_add(crate::times::since(started), Ordering::Relaxed);
             continue;
         }
         // RB1: a decode or an encode a drive handed over is what feeds the functions or frees
@@ -145,7 +158,8 @@ pub(crate) fn worker_loop(
             idle(&shared, worker, &parker);
             continue;
         };
-        match run_task(
+        let started = std::time::Instant::now();
+        let ran = run_task(
             &shared,
             worker,
             stage,
@@ -154,7 +168,13 @@ pub(crate) fn worker_loop(
             false,
             Some(claim),
             learn.as_ref(),
-        ) {
+        );
+        shared
+            .times
+            .of(worker)
+            .functions
+            .fetch_add(crate::times::since(started), Ordering::Relaxed);
+        match ran {
             Ok(_) | Err(MorunaError::Cancelled) => {}
             Err(e) => crate::policy::terminate(&shared, e),
         }
@@ -163,7 +183,18 @@ pub(crate) fn worker_loop(
     shared.heartbeat.exited_clean(worker);
 }
 
+/// Nothing to do: the time goes to the worker's idle.
 fn idle(shared: &Shared, worker: u16, parker: &Parker) {
+    let started = std::time::Instant::now();
+    park(shared, worker, parker);
+    shared
+        .times
+        .of(worker)
+        .idle
+        .fetch_add(crate::times::since(started), Ordering::Relaxed);
+}
+
+fn park(shared: &Shared, worker: u16, parker: &Parker) {
     shared.heartbeat.parked(worker, true);
     parker.park_timeout(Duration::from_millis(1));
     shared.heartbeat.parked(worker, false);

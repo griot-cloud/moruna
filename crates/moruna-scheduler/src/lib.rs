@@ -52,6 +52,8 @@ mod sink_drive;
 mod slots;
 mod source_drive;
 mod stats;
+// stream P: where each worker's time goes.
+mod times;
 mod wall;
 mod worker;
 
@@ -208,6 +210,13 @@ impl Scheduler {
     /// told too (MH 4.3 task events): called on the thread on which each fact became true.
     pub fn set_stage_hook(&self, hook: moruna_kernel::StageHook) {
         self.shared.set_stage_hook(hook);
+    }
+
+    // stream P: where each worker's time goes, for the run's report.
+    /// One note a worker that did anything: its seconds decoding, encoding, running the
+    /// functions' units, idle, parked and in the stages' starts and ends; and the drives'.
+    pub fn worker_notes(&self) -> Vec<String> {
+        self.shared.times.notes()
     }
 
     /// Installed by the facade before the kernels' instances are made, so what a kernel prints

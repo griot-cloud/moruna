@@ -569,6 +569,7 @@ fn submit<'a>(
         let decoder = Arc::clone(&source.source);
         let alloc = Arc::clone(&shared.alloc);
         let owned = split.clone();
+        let times = Arc::clone(&shared.times);
         Box::pin(async move {
             let fetched = source
                 .source
@@ -577,7 +578,15 @@ fn submit<'a>(
             crate::offload::on_worker(
                 &shared.offload,
                 || shared.offload_inline(),
-                move || decoder.decode(&owned, fetched, alloc.as_ref(), tier),
+                move || {
+                    let started = std::time::Instant::now();
+                    let decoded = decoder.decode(&owned, fetched, alloc.as_ref(), tier);
+                    times
+                        .here()
+                        .decode
+                        .fetch_add(crate::times::since(started), Ordering::Relaxed);
+                    decoded
+                },
             )
             .await
         })

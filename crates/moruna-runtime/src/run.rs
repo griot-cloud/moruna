@@ -1058,9 +1058,16 @@ fn drive(
         .controller
         .take()
         .map(|controller| controller.stop());
+    // stream P: where each worker's time went, as the run ends.
+    let worker_notes = started
+        .scheduler
+        .as_ref()
+        .map(|scheduler| scheduler.worker_notes())
+        .unwrap_or_default();
     let (view, shutdown_notes) = started.unwind();
 
     notes.extend(shutdown_notes);
+    notes.extend(worker_notes);
     // stream P: each native stage's tasks, once they have ended (E's gate shows them).
     notes.extend(packaged.iter().filter_map(|stage| stage.task_note()));
     // Stream C (data OS, C3): a completed run's outputs are one layer on `disk.out`.
