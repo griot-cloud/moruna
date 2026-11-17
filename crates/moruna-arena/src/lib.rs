@@ -18,9 +18,9 @@
 //!
 //! On granted memory ([`Arena::with_backing`]) the budget is the arena's from the start, as a
 //! mapping's address space is, and its memory is made as the run first needs it: a small
-//! region at start, and one more each time an allocation finds the regions made so far full,
-//! each as large as all before it. A mapping's pages come the same way, when a buffer first
-//! lands on them (RB4).
+//! region at start, then steps of what is in use (at most [`GRANTED_STEP_MAX`]), each made
+//! ahead of need on a thread of its own, or when an allocation finds the regions full. A
+//! mapping's pages come the same way, when a buffer first lands on them (RB4).
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -97,11 +97,22 @@ impl Default for ArenaConfig {
 /// huge pages when the host has them and a small change of the budget is never a region.
 pub const REGION_ROUNDING: u64 = 2 * 1024 * 1024;
 
-/// The region a granted arena makes at start, when its budget is larger. Each later region is
-/// as large as all made before it, up to the backing's largest, so the memory made follows
-/// what the run uses and not its budget: a run that needs 20 MiB of a 20 GiB budget makes
-/// 32 MiB, and one that needs 3 GiB makes at most one backing region more than that.
+/// The region a granted arena makes at start, when its budget is larger.
 pub const FIRST_GRANTED_REGION: u64 = 32 * 1024 * 1024;
+
+/// The most a granted arena adds in one step for allocations a region holds several of
+/// (stream C, 2026-11-17). A step is what is in use, at least [`GRANTED_STEP_MIN`] and at most
+/// this, so what the arena has made stays within a step or two of what the run holds,
+/// whatever its budget. An allocation larger than a step gets a region of its own size.
+pub const GRANTED_STEP_MAX: u64 = 64 * 1024 * 1024;
+
+/// The least a granted arena adds in one step.
+pub const GRANTED_STEP_MIN: u64 = 16 * 1024 * 1024;
+
+/// When the free bytes of the regions a granted arena has made fall below this, it makes its
+/// next step ahead of need, on a thread of its own: the kernel zeroes a region's pages as it
+/// makes it, which a worker that found the regions full would otherwise wait for.
+pub const GRANTED_AHEAD_BELOW: u64 = 32 * 1024 * 1024;
 
 /// One host region: the region `new` reserved, or one `grow` added.
 struct HostRegion {
@@ -186,8 +197,12 @@ struct Inner {
     /// The host budget a granted arena makes its regions out of; zero for a mapped arena.
     granted_budget: u64,
     /// Held while a region is made out of `uncommitted`, so two allocations that both find the
-    /// regions full make one region, not two.
+    /// regions full make one region, not two, and a region made ahead is not made twice.
     committing: Mutex<()>,
+    /// The thread making the next region ahead of need, while one is.
+    ahead: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Regions made ahead of need over the run.
+    ahead_made: AtomicU64,
 }
 
 /// The memory arena (d.1).
@@ -205,12 +220,14 @@ impl Arena {
 
     /// Reserve the host budget on memory `backing` grants, and every device region as
     /// [`Arena::new`] does. The budget is the arena's capacity from the start, but only its
-    /// first region, [`FIRST_GRANTED_REGION`] at most, is made now: each further region is made
-    /// when an allocation finds the regions made so far full, as large as all made before it and
-    /// at most the backing's largest, until the budget is made. What is made follows what the
-    /// run uses, never more than twice it or one backing region more: a run that needs a few
-    /// hundred megabytes of a 20 GiB budget makes a few hundred megabytes, and does not wait
-    /// for the rest to be zeroed before its first batch. The regions are the
+    /// first region, [`FIRST_GRANTED_REGION`] at most, is made now. Each further region is a
+    /// step of what is in use, between [`GRANTED_STEP_MIN`] and [`GRANTED_STEP_MAX`] (an
+    /// allocation larger than a step gets a region of its own size), made ahead of need on a
+    /// thread of its own when the free bytes of the regions fall below [`GRANTED_AHEAD_BELOW`],
+    /// or when an allocation finds them full, until the budget is made. The budget sizes
+    /// nothing: what is made stays within a step and the bytes kept ahead of what the run
+    /// holds, and a run that holds a few hundred megabytes of a 20 GiB budget makes a few
+    /// hundred megabytes, without a worker waiting for the kernel to zero them. The regions are the
     /// run's fixed budget: none drains, and no page of them is given back, so a reused page is
     /// never zeroed again (`architecture/data-os.md` C4). `pretouch` and `memlock` do not
     /// apply: the backing's pages are present and resident when it gives them.
@@ -357,6 +374,8 @@ impl Arena {
                 uncommitted: AtomicU64::new(uncommitted),
                 granted_budget,
                 committing: Mutex::new(()),
+                ahead: Mutex::new(None),
+                ahead_made: AtomicU64::new(0),
             }),
         }))
     }
@@ -655,6 +674,25 @@ impl Arena {
     pub fn uncommitted_bytes(&self) -> u64 {
         self.inner.uncommitted.load(Ordering::SeqCst)
     }
+
+    /// Regions a granted arena made ahead of need over the run (`GRANTED_AHEAD_BELOW`).
+    pub fn regions_made_ahead(&self) -> u64 {
+        self.inner.ahead_made.load(Ordering::Relaxed)
+    }
+
+    /// Waits until no region is being made ahead of need, so what the arena has made is
+    /// settled: before reading its figures, and before a run's report.
+    pub fn settle(&self) {
+        let ahead = self
+            .inner
+            .ahead
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(thread) = ahead {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl std::fmt::Debug for Arena {
@@ -834,16 +872,119 @@ impl Inner {
         }
     }
 
-    /// The bytes of the region a granted arena makes for an allocation charged `charge`: as
-    /// large as all it has made of its budget so far, so what it has made is never more than
-    /// twice what the run needed, or one backing region more; at least `charge` and
-    /// [`FIRST_GRANTED_REGION`]; at most the backing's largest and what is left of the budget.
-    fn region_for(&self, charge: u64) -> u64 {
-        let left = self.uncommitted.load(Ordering::SeqCst);
-        let made = self.granted_budget.saturating_sub(left);
-        made.max(region::align_up(charge, self.align))
-            .max(FIRST_GRANTED_REGION)
+    /// The bytes of the region a granted arena makes for an allocation charged `charge` when
+    /// `in_use` bytes are held: a step of what is in use, at least [`GRANTED_STEP_MIN`] and at
+    /// most [`GRANTED_STEP_MAX`], or `charge` when that is larger; at most the backing's
+    /// largest and what is left of the budget. Never a share of the budget: what is made
+    /// follows what the run holds.
+    fn region_for(&self, charge: u64, in_use: u64) -> u64 {
+        let step = region::align_up(in_use.clamp(GRANTED_STEP_MIN, GRANTED_STEP_MAX), self.align);
+        step.max(region::align_up(charge, self.align))
             .min(self.next_region())
+    }
+
+    /// The bytes of the budget's regions a granted arena has made.
+    fn made(&self) -> u64 {
+        self.granted_budget
+            .saturating_sub(self.uncommitted.load(Ordering::SeqCst))
+    }
+
+    /// `made` as a region of the budget, not yet among the arena's regions.
+    fn budget_region(&self, made: region::HostRegion) -> Arc<HostRegion> {
+        let usable = made.mapping.bytes();
+        Arc::new(HostRegion {
+            space: Space::new(
+                made.mapping.base(),
+                usable,
+                self.host_tier,
+                usable < SMALL_BUDGET_BYTES,
+                Arc::clone(&self.host_watermark),
+            ),
+            _mapping: made.mapping,
+            draining: AtomicBool::new(false),
+            base: true,
+            side: false,
+        })
+    }
+
+    /// Puts `region`, made of the budget, among the budget's regions: after the others and
+    /// before any grown one, so the regions a shrink would pick are still the last to fill.
+    /// Called with `committing` held. Its usable bytes leave what is left to make.
+    fn add_budget_region(&self, region: Arc<HostRegion>, asked: u64) {
+        let usable = region.space.bytes();
+        {
+            let mut host = self.write_host();
+            let at = host.iter().position(|r| !r.base).unwrap_or(host.len());
+            host.insert(at, region);
+            self.uncommitted
+                .fetch_sub(usable.min(asked), Ordering::SeqCst);
+        }
+        tracing::info!(
+            target: "arena.commit",
+            bytes = usable,
+            uncommitted = self.uncommitted.load(Ordering::SeqCst),
+            "the arena made a region of its budget"
+        );
+    }
+
+    /// After a host allocation: when the free bytes of the regions made fall below
+    /// [`GRANTED_AHEAD_BELOW`] and the budget has more to make, the next step is made ahead of
+    /// need on a thread of its own, one at a time. Two loads and a comparison when it is not.
+    fn consider_ahead(self: &Arc<Self>) {
+        if self.backing.is_none() || self.uncommitted.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let made = self.made();
+        if made.saturating_sub(self.host_watermark.live()) >= GRANTED_AHEAD_BELOW
+            || made >= self.host_cap.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let mut ahead = self.ahead.lock().unwrap_or_else(|e| e.into_inner());
+        if ahead.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        if let Some(done) = ahead.take() {
+            let _ = done.join();
+        }
+        let inner = Arc::downgrade(self);
+        *ahead = std::thread::Builder::new()
+            .name("moruna-arena-ahead".into())
+            .spawn(move || {
+                if let Some(inner) = inner.upgrade() {
+                    inner.make_ahead();
+                }
+            })
+            .ok();
+    }
+
+    /// Makes the next step of a granted arena's budget, if the free bytes of its regions are
+    /// still below [`GRANTED_AHEAD_BELOW`] once no other region is being made.
+    fn make_ahead(&self) {
+        let Some(backing) = self.backing.as_ref() else {
+            return;
+        };
+        let _committing = self.committing.lock().unwrap_or_else(|e| e.into_inner());
+        let live = self.host_watermark.live();
+        let made = self.made();
+        // Nothing past a cap the watcher set (RB4): a region it would never let be used.
+        let room = self.host_cap.load(Ordering::SeqCst).saturating_sub(made);
+        if made.saturating_sub(live) >= GRANTED_AHEAD_BELOW || room < GRANULE {
+            return;
+        }
+        let take = region::align_down(self.region_for(0, live).min(room), self.align);
+        if take < GRANULE {
+            return;
+        }
+        match region::new_granted(backing.as_ref(), take, self.align) {
+            Ok(made) => {
+                self.add_budget_region(self.budget_region(made), take);
+                self.ahead_made.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::warn!(target: "arena.commit", bytes = take, error = %e, "the backing refused a region made ahead");
+            }
+        }
     }
 
     /// A host allocation the regions made so far cannot serve, served from one more region made
@@ -865,11 +1006,7 @@ impl Inner {
             return Some(served);
         }
         let charge = crate::classes::charge_of(bytes);
-        let take = self.region_for(charge);
-        if take < GRANULE || charge > take {
-            return None;
-        }
-        {
+        let in_use = {
             let host = self.read_host();
             let in_use: u64 = host.iter().map(|r| r.space.in_use()).sum();
             let limit = self
@@ -878,6 +1015,11 @@ impl Inner {
             if in_use.saturating_add(charge) > limit {
                 return None;
             }
+            in_use
+        };
+        let take = self.region_for(charge, in_use);
+        if take < GRANULE || charge > take {
+            return None;
         }
         let made = match region::new_granted(backing.as_ref(), take, self.align) {
             Ok(made) => made,
@@ -886,41 +1028,14 @@ impl Inner {
                 return None;
             }
         };
-        let usable = made.mapping.bytes();
-        let region = Arc::new(HostRegion {
-            space: Space::new(
-                made.mapping.base(),
-                usable,
-                self.host_tier,
-                usable < SMALL_BUDGET_BYTES,
-                Arc::clone(&self.host_watermark),
-            ),
-            _mapping: made.mapping,
-            draining: AtomicBool::new(false),
-            base: true,
-            side: false,
-        });
+        let region = self.budget_region(made);
         // Served before the region is seen, so the allocation that made it is the one it serves.
         let served = region
             .space
             .alloc(bytes)
             .ok()
             .map(|(ptr, _)| (ptr, self.host_tier));
-        {
-            let mut host = self.write_host();
-            // After the budget's other regions and before any grown one, so the regions a shrink
-            // would pick are still the last to fill.
-            let at = host.iter().position(|r| !r.base).unwrap_or(host.len());
-            host.insert(at, region);
-            self.uncommitted
-                .fetch_sub(usable.min(take), Ordering::SeqCst);
-        }
-        tracing::info!(
-            target: "arena.commit",
-            bytes = usable,
-            uncommitted = self.uncommitted.load(Ordering::SeqCst),
-            "the arena made a region of its budget"
-        );
+        self.add_budget_region(region, take);
         served
     }
 
@@ -1058,6 +1173,9 @@ impl Allocator for Arena {
         match served {
             Ok((ptr, served_tier)) => {
                 inner.allocations.fetch_add(1, Ordering::Relaxed);
+                if inner.is_host(tier) {
+                    inner.consider_ahead();
+                }
                 let handle: Arc<dyn moruna_kernel::ArenaHandle> = Arc::clone(inner) as Arc<_>;
                 // SAFETY: `ptr` is `bytes` bytes inside a region this arena reserved for
                 // `tier`; that region stays mapped until it holds no live buffer (AR-I3),
