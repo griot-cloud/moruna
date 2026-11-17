@@ -913,6 +913,8 @@ version = "0.1.0"
 dependencies = [
  "heapless",
  "moruna-netstack",
+ "moruna-node-config",
+ "moruna-node-platform",
  "moruna-svc",
  "netstack-protocol",
  "smoltcp",

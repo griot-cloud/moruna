@@ -21,6 +21,11 @@ use common::{
     serve_until,
 };
 use moruna_netstack::Stack;
+use moruna_node_config::{Cloud, NodeConfig};
+use moruna_node_platform::{
+    machine::{Link, LinkError},
+    svc::ApiLink,
+};
 use moruna_svc::deadline_in;
 use netstack_protocol::{Cidr, Interface, Policy, Target};
 
@@ -233,6 +238,25 @@ fn a_failure_is_the_node_s_fatal_line_with_the_service_s_name() {
         Error::Network("listen", CallError::Remote(net::Error::NotPermitted)).to_string(),
         "listen: Remote(NotPermitted)"
     );
+    assert_eq!(
+        Fatal(&Error::Link(
+            "waiting for the hand-over",
+            moruna_svc::Error::PeerClosed
+        ))
+        .to_string(),
+        format!(
+            "moruna: fatal api: the link to platform: waiting for the hand-over: {}",
+            moruna_svc::Error::PeerClosed.name()
+        )
+    );
+    assert_eq!(
+        Fatal(&Error::LinkHandles).to_string(),
+        "moruna: fatal api: a message from platform carries handles"
+    );
+    assert_eq!(
+        Fatal(&Error::Handover(HandoverError::Instance)).to_string(),
+        "moruna: fatal api: the hand-over's `instance` is not an instance ID"
+    );
 }
 
 #[test]
@@ -443,4 +467,179 @@ fn the_wait_for_a_connection_ends_when_the_network_server_does() {
     ));
     drop(network);
     node.end();
+}
+
+/// A hand-over as `platform` makes one: a valid node config, an instance and its cloud,
+/// and the wall clock.
+fn handed() -> Handover {
+    let user_data =
+        br#"{"moruna":1,"api":{"token_keys":["AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="]}}"#;
+    Handover {
+        config: NodeConfig::validate(user_data, None).expect("a valid node config"),
+        instance: String::from("3f6c1d2e-8b7a-4c55-9e1f-0a2b3c4d5e6f"),
+        cloud: Cloud::OpenStack,
+        wall_clock: 1_794_931_200,
+        read_at_ns: 4_200_000_000,
+    }
+}
+
+/// The hand-over over a real channel, `platform`'s own end of the link on the other
+/// side: `api` takes it whole and answers `ready`.
+#[test]
+fn the_hand_over_crosses_a_channel_from_platform_s_half() {
+    let (ours, theirs) = Channel::create().expect("a channel");
+    let platform = thread::spawn(move || {
+        let mut link = ApiLink(ours);
+        link.send(
+            &handed().encode().expect("encoded"),
+            deadline_in(5 * SECOND),
+        )
+        .expect("sent");
+        link.receive(deadline_in(5 * SECOND))
+    });
+    assert_eq!(handover(&theirs), Ok(handed()));
+    assert_eq!(ready(&theirs), Ok(()));
+    assert_eq!(platform.join().expect("platform"), Ok(READY.to_vec()));
+}
+
+/// The whole process: it takes the hand-over, opens its listener once the lease comes,
+/// and only then answers `ready`, once: a listener that moves with the lease does not
+/// answer again.
+#[test]
+fn api_answers_ready_once_its_listener_first_opens() {
+    let mut node = Node::start(false);
+    let outside = node.slot("listen-host");
+    let network = node.slot("listen-api");
+    let client = connect(&network, account()).expect("the network server");
+    let (ours, theirs) = Channel::create().expect("a channel");
+    let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let said = lines.clone();
+    let api = thread::spawn(move || {
+        let Err(error) = run(client, &theirs, &mut |line: &str| {
+            said.lock().unwrap().push(line.to_string())
+        });
+        error
+    });
+    let mut platform = ApiLink(ours);
+    platform
+        .send(
+            &handed().encode().expect("encoded"),
+            deadline_in(5 * SECOND),
+        )
+        .expect("the hand-over");
+    // No lease, so no listener, so no answer.
+    assert_eq!(
+        platform.receive(deadline_in(SECOND / 2)),
+        Err(LinkError::TimedOut)
+    );
+    assert!(lines.lock().unwrap().is_empty());
+
+    node.lease.answers.store(true, Ordering::SeqCst);
+    assert_eq!(
+        platform.receive(deadline_in(30 * SECOND)),
+        Ok(READY.to_vec())
+    );
+    // The listener had opened by then, and it serves.
+    assert_eq!(*lines.lock().unwrap(), ["api: listening on 10.0.2.15:443"]);
+    let mut host = host(&outside);
+    let opened = host
+        .open(Target::Endpoint(Endpoint::new(NODE_ADDRESS, 443)), None)
+        .expect("a connection to 443");
+    assert_eq!(receive(&mut host, opened.socket, 64), Ok(vec![]));
+
+    // The lease moves: the listener follows, and `ready` is not said twice.
+    node.lease.offer.store(16, Ordering::SeqCst);
+    node.lease.renew.store(true, Ordering::SeqCst);
+    let moved = "api: listening on 10.0.2.16:443";
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !lines.lock().unwrap().iter().any(|l| l == moved) {
+        assert!(Instant::now() < deadline, "{:?}", lines.lock().unwrap());
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        platform.receive(deadline_in(3 * SECOND / 2)),
+        Err(LinkError::TimedOut)
+    );
+
+    node.stop.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        api.join().expect("api"),
+        Error::Network(_, CallError::PeerClosed)
+    ));
+    drop((host, network, outside, platform));
+    node.end();
+}
+
+/// A hand-over that is refused stops the process before it listens.
+#[test]
+fn a_refused_hand_over_stops_the_process_before_it_listens() {
+    let mut node = Node::start(true);
+    let network = node.slot("listen-api");
+    let client = connect(&network, account()).expect("the network server");
+    let (ours, theirs) = Channel::create().expect("a channel");
+    ours.write_with(b"{}", &mut []).expect("written");
+    let mut said = Vec::new();
+    let Err(error) = run(client, &theirs, &mut |line: &str| {
+        said.push(line.to_string())
+    });
+    assert!(
+        matches!(error, Error::Handover(HandoverError::Shape(_))),
+        "{error:?}"
+    );
+    assert!(
+        Fatal(&error)
+            .to_string()
+            .starts_with("moruna: fatal api: the hand-over is refused: "),
+        "{error}"
+    );
+    assert!(said.is_empty());
+    // Nothing listens.
+    let mut other = Service::new(connect(&network, account()).expect("again"));
+    let at = Endpoint::new(NODE_ADDRESS, 443);
+    until(&mut other, |e| *e == Event::Listening(at));
+    drop((other, network, ours));
+    node.end();
+}
+
+#[test]
+fn the_link_to_platform_fails_when_platform_has_gone_or_sends_handles() {
+    // Gone before its hand-over.
+    let (ours, theirs) = Channel::create().expect("a channel");
+    drop(ours);
+    assert_eq!(
+        handover(&theirs),
+        Err(Error::Link(
+            "waiting for the hand-over",
+            moruna_svc::Error::PeerClosed
+        ))
+    );
+    assert_eq!(
+        ready(&theirs),
+        Err(Error::Link(
+            "answering ready",
+            moruna_svc::Error::PeerClosed
+        ))
+    );
+    // Gone while api waits for it.
+    let (ours, theirs) = Channel::create().expect("a channel");
+    let waiting = thread::spawn(move || handover(&theirs));
+    thread::sleep(Duration::from_millis(100));
+    assert!(!waiting.is_finished());
+    drop(ours);
+    assert_eq!(
+        waiting.join().expect("the wait"),
+        Err(Error::Link(
+            "waiting for the hand-over",
+            moruna_svc::Error::PeerClosed
+        ))
+    );
+    // A message with a handle in it.
+    let (ours, theirs) = Channel::create().expect("a channel");
+    let (spare, _kept) = Channel::create().expect("another");
+    ours.write_with(&handed().encode().expect("encoded"), &mut [Some(spare.0)])
+        .expect("written");
+    assert_eq!(handover(&theirs), Err(Error::LinkHandles));
+    // An empty message is no hand-over.
+    ours.write_with(b"", &mut []).expect("written");
+    assert!(matches!(handover(&theirs), Err(Error::Handover(_))));
 }

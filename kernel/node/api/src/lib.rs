@@ -12,9 +12,16 @@
 //! listens. When the address is no longer the listener's, because the lease moved or
 //! was lost, it closes the listener, and opens one on the address `wan` has next.
 //!
+//! Before it listens, the process takes `platform`'s hand-over (system design 1D,
+//! work item 1.4): the first message on its `platform` link, the validated node config
+//! with the instance, the cloud and the wall clock. It keeps it, for step 2 serves with
+//! it. Once its listener first opens it answers `platform` with
+//! [`moruna_node_config::READY`], once, and `platform` then says the node is ready.
+//!
 //! Every wait here is on the network server, which ends within 30 s of its start if no
-//! lease comes (system design 1B); a request to a server that has ended fails, and the
-//! process then stops with that failure, as `moruna: fatal api: <reason>`.
+//! lease comes (system design 1B), or on `platform`, which ends within 90 s if it finds
+//! no instance data; a request to a server that has ended fails, and the process then
+//! stops with that failure, as `moruna: fatal api: <reason>`.
 //!
 //! This library is the process's logic, so that it is tested on a host against the
 //! network server's own stack; `main.rs` gives it the process's start handles.
@@ -25,11 +32,13 @@
 
 extern crate alloc;
 
-use alloc::{format, string::String};
-use core::fmt;
+use alloc::{format, string::String, vec, vec::Vec};
+use core::{convert::Infallible, fmt};
 
+use moruna_node_config::{Handover, HandoverError, READY};
 use moruna_svc::{
-    Account, CallError, Channel, DEADLINE_INFINITE, Encoder, Signals, Wire, deadline_in, wait_one,
+    Account, CallError, Channel, DEADLINE_INFINITE, Encoder, Handle, Signals, Wire, deadline_in,
+    wait_one,
 };
 use netstack_protocol::{Addr, Endpoint, Info, Opened, net};
 
@@ -65,6 +74,12 @@ pub enum Error {
     NoInterface,
     /// A request to the network server failed: which, and how.
     Network(&'static str, CallError<net::Error>),
+    /// The link to `platform` failed: what was being done, and the kernel's refusal.
+    Link(&'static str, moruna_svc::Error),
+    /// A message from `platform` carries handles, which no message of the hand-over does.
+    LinkHandles,
+    /// `platform`'s hand-over is refused.
+    Handover(HandoverError),
 }
 
 impl fmt::Display for Error {
@@ -73,6 +88,11 @@ impl fmt::Display for Error {
             Error::NoSlot(slot) => write!(f, "no {slot} slot"),
             Error::NoInterface => write!(f, "the network server has no interface {INTERFACE}"),
             Error::Network(request, error) => write!(f, "{request}: {error:?}"),
+            Error::Link(what, error) => {
+                write!(f, "the link to platform: {what}: {}", error.name())
+            }
+            Error::LinkHandles => f.write_str("a message from platform carries handles"),
+            Error::Handover(error) => write!(f, "{error}"),
         }
     }
 }
@@ -171,11 +191,6 @@ impl Service {
     /// Where it listens, if it does.
     pub fn listening(&self) -> Option<Endpoint> {
         self.listener.map(|(_, at)| at)
-    }
-
-    /// The connection to the network server.
-    pub fn client(&mut self) -> &mut net::Client {
-        &mut self.client
     }
 
     /// Waits for the next thing to do, at most a poll's time, and does it.
@@ -285,4 +300,83 @@ fn accepted(mut frame: moruna_svc::frame::Frame) -> Result<Opened, Error> {
         .and_then(|opened| decoder.finish().map(|()| opened))
         .map_err(|_| Error::Network("accept", CallError::Malformed))?;
     Ok(opened)
+}
+
+/// `platform`'s hand-over: the first message on the `platform` link, waited for as long
+/// as it takes, and decoded (its node config validated again).
+pub fn handover(platform: &Channel) -> Result<Handover, Error> {
+    let message = loop {
+        match platform.needed() {
+            Ok(Some((bytes, handles))) => {
+                let mut message = vec![0; bytes];
+                let mut carried: Vec<Option<Handle>> = (0..handles).map(|_| None).collect();
+                if bytes != 0 || handles != 0 {
+                    platform
+                        .read(&mut message, &mut carried)
+                        .map_err(|e| Error::Link("reading the hand-over", e))?;
+                }
+                if handles != 0 {
+                    // They close as they drop.
+                    return Err(Error::LinkHandles);
+                }
+                break message;
+            }
+            // Nothing yet: waits for it, or for `platform` to go, which the next look
+            // reports.
+            Ok(None) => {
+                wait_one(
+                    &platform.0,
+                    Signals::READABLE | Signals::PEER_CLOSED,
+                    DEADLINE_INFINITE,
+                )
+                .map_err(|e| Error::Link("waiting for the hand-over", e))?;
+            }
+            Err(e) => return Err(Error::Link("waiting for the hand-over", e)),
+        }
+    };
+    Handover::decode(&message).map_err(Error::Handover)
+}
+
+/// Answers `platform`'s hand-over: [`READY`], once the listener is open.
+pub fn ready(platform: &Channel) -> Result<(), Error> {
+    loop {
+        match platform.write_with(READY, &mut []) {
+            Ok(()) => return Ok(()),
+            // Its queue is full: waits for it to read, or to go.
+            Err(moruna_svc::Error::ShouldWait) => {
+                wait_one(
+                    &platform.0,
+                    Signals::WRITABLE | Signals::PEER_CLOSED,
+                    DEADLINE_INFINITE,
+                )
+                .map_err(|e| Error::Link("answering ready", e))?;
+            }
+            Err(e) => return Err(Error::Link("answering ready", e)),
+        }
+    }
+}
+
+/// The whole process, on its connection to the network server and its link to
+/// `platform`: the hand-over, then the [`Service`], saying each of its lines with
+/// `say`, and answering `platform` once its listener first opens. It returns only when
+/// it cannot go on.
+pub fn run(
+    client: net::Client,
+    platform: &Channel,
+    say: &mut dyn FnMut(&str),
+) -> Result<Infallible, Error> {
+    // Kept for as long as the process runs: step 2 serves with it (work item 2.2b).
+    let _handover = handover(platform)?;
+    let mut service = Service::new(client);
+    let mut answered = false;
+    loop {
+        let event = service.step()?;
+        if let Some(line) = event.line() {
+            say(&line);
+        }
+        if !answered && matches!(event, Event::Listening(_)) {
+            ready(platform)?;
+            answered = true;
+        }
+    }
 }
