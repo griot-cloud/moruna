@@ -150,9 +150,9 @@ it does not. A refusal's reason goes to the task's log and the task ends with ex
 before; the exit codes are the ones the tasks always had (`moruna_function::code`).
 `tasks/tests/serve.rs` runs each task on the data plane in memory (`moruna_function::host`) over
 every fixture case and finds its rows bit for bit those of the record path the tasks ran on
-before 5.1 (`record/`), and the oracle's `hash_exact`. arrow-ipc writes a validity bitmap for every
-column, so a task's record takes about a page a column more than the record path's did (one row
-of Enrich: 47 pages); the rows are the same.
+before 5.1 (`record/`), and the oracle's `hash_exact`, and each record the bytes the record path's
+took: arrow-ipc writes a validity bitmap of all ones for a column with no nulls, a page of its own
+in a record, and `moruna-function` leaves it out as the record path did.
 
 `tasks/build.sh` builds `gate-JOB` for the seven jobs as Rust programs with std for the core
 (system design 5A0, item 5.0): the kernel's nightly, std from Moruna's copy of Rust's library, the

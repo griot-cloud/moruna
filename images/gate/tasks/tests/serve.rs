@@ -13,7 +13,7 @@ use arrow::ipc::reader::{FileReader, StreamReader};
 use moruna_function::code;
 use moruna_function::host::{Outcome, Plane, record};
 use moruna_gate_functions::{batch, canon};
-use moruna_gate_record::{Error, Job};
+use moruna_gate_record::{Error, Job, compute, decode, encode, parts};
 use moruna_ipc_check::frame::END_OF_STREAM;
 use moruna_ipc_check::record::{Need, check_record, framing_need};
 use serde_json::Value;
@@ -208,12 +208,8 @@ fn one_task_answers_every_case_in_order() {
 }
 
 /// An answer bigger than a window, in windows a few pages more than one row's record (as the
-/// record path's own test cut it, there in its encoder's pages): the parts, joined, are the
-/// one-record answer, row for row and bit for bit.
-///
-/// arrow-ipc writes a validity bitmap for every column, nulls or none, and a record puts each
-/// buffer on a page of its own, so one row's record is about a page a column larger than the
-/// record path's, which left an all-valid bitmap out: Enrich's one row takes 47 pages.
+/// record path's own test cut it): the parts, joined, are the one-record answer, row for row
+/// and bit for bit.
 #[test]
 fn parts_rebuild_the_answer() {
     let cases = [
@@ -286,5 +282,59 @@ fn each_program_runs_and_finds_no_plane_outside_one() {
             said.starts_with(&format!("{name}: no plane")),
             "{name}: {said}"
         );
+    }
+}
+
+/// `input`'s rows repeated to `n`.
+fn repeated(input: &RecordBatch, n: usize) -> RecordBatch {
+    let copies: Vec<RecordBatch> = (0..n.div_ceil(input.num_rows()))
+        .map(|_| input.clone())
+        .collect();
+    join(&copies).slice(0, n)
+}
+
+/// The bytes of the record of `job`'s output on `input`, and of its first row's: as the record
+/// path laid them out before 5.1, and as the SDK lays them out.
+fn record_bytes(name: &str, input: &RecordBatch) -> [u64; 4] {
+    let r = record(input).unwrap();
+    let mut words = vec![0u64; r.len().div_ceil(8)];
+    let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut words);
+    bytes[..r.len()].copy_from_slice(&r);
+    let read = decode::Batch::read(&bytes[..r.len()]).unwrap();
+    let o = compute(Job::by_name(name).unwrap(), &read).unwrap();
+    let one = parts::slice_output(&o, 0, 1).unwrap();
+    let out = batch::by_name(name).unwrap()(input).unwrap();
+    [
+        encode::lay_out(&o.fields, &o.columns, o.rows)
+            .unwrap()
+            .record_len,
+        encode::lay_out(&one.fields, &one.columns, 1)
+            .unwrap()
+            .record_len,
+        record(&out).unwrap().len() as u64,
+        record(&out.slice(0, 1)).unwrap().len() as u64,
+    ]
+}
+
+/// A record takes the bytes the record path's did, for one row and for 64Ki rows of input:
+/// arrow-ipc's bitmaps of all ones are left out, as that encoder left them out.
+#[test]
+fn records_take_the_bytes_the_record_path_took() {
+    let jobs = [
+        ("enrich", "inputs/nyc/main.arrow"),
+        ("audit", "inputs/nyc/main.arrow"),
+        ("occupancy", "inputs/nyc/main.arrow"),
+        ("score", "inputs/nyc/main.arrow"),
+        ("fw_minhash", "inputs/fineweb/main.arrow"),
+        ("ov_shape", "inputs/overture/main.arrow"),
+        ("ov_attrs", "inputs/overture/main.arrow"),
+    ];
+    for (name, path) in jobs {
+        let input = read_ipc(path);
+        let [_, before_one, _, sdk_one] = record_bytes(name, &input);
+        let [before_all, _, sdk_all, _] = record_bytes(name, &repeated(&input, 65_536));
+        assert_eq!(sdk_one, before_one, "{name}: one row");
+        assert_eq!(sdk_all, before_all, "{name}: 64Ki rows");
+        eprintln!("{name}: one row {sdk_one} bytes, 64Ki rows of input {sdk_all} bytes, as before");
     }
 }

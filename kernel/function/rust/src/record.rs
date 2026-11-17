@@ -17,8 +17,12 @@ use arrow_ipc::convert::fb_to_schema;
 use arrow_ipc::reader::read_record_batch;
 use arrow_ipc::writer::StreamEncoder;
 use arrow_schema::{DataType, Schema};
-use moruna_ipc_check::frame::CONTINUATION;
+use moruna_ipc_check::fb::Table;
+use moruna_ipc_check::format;
+use moruna_ipc_check::frame::{self, CONTINUATION};
 use moruna_ipc_check::record::{Need, check_record, framing_need, reframe, stream_parts};
+use moruna_ipc_check::schema::check_schema;
+use moruna_ipc_check::walk::{Body, Plan, Rule, Span, walk};
 
 use crate::error::FunctionError;
 use crate::lane::{Lane, Mapped, Posted};
@@ -207,16 +211,96 @@ pub(crate) fn encode(batch: &RecordBatch) -> Result<Encoded, FunctionError> {
     let chunks = Chunks::new(encoder.encode(batch)?);
     let schema = chunks.message(0)?;
     let at = schema.len();
-    let batch_message = chunks.message(at)?;
+    let mut batch_message = chunks.message(at)?;
+    let body_at = at + batch_message.len();
+    leave_out_all_valid(&schema, &mut batch_message, &chunks, body_at)?;
     let laid = reframe(&schema, &batch_message).map_err(output)?;
     check_record(&laid.framing, laid.record_len).map_err(output)?;
     Ok(Encoded {
-        body_at: at + batch_message.len(),
+        body_at,
         chunks,
         framing: laid.framing,
         record_len: laid.record_len,
         moves: laid.moves,
     })
+}
+
+/// The root table of the whole message `bytes` (its marker and length, then the flatbuffer).
+fn message_table(bytes: &[u8]) -> Result<Table<'_>, String> {
+    let len = frame::message_len(bytes)?;
+    Table::root(&bytes[8..8 + len])
+}
+
+/// The header table of the whole message `bytes`, which must be of header type `want`.
+fn header_table(bytes: &[u8], want: u8) -> Result<Table<'_>, String> {
+    let message = message_table(bytes)?;
+    if message.u8(format::message::HEADER_TYPE, format::header::NONE)? != want {
+        return Err(String::from("a message of another type"));
+    }
+    message
+        .table(format::message::HEADER)?
+        .ok_or_else(|| String::from("a message without its header"))
+}
+
+/// Every buffer the check's walk reaches, numbered in entry order, and of the validity bitmaps
+/// among them, the entry and the bits it covers.
+#[derive(Default)]
+struct Bitmaps {
+    next: usize,
+    found: Vec<(usize, Span, usize)>,
+}
+
+impl Plan for Bitmaps {
+    fn take(&mut self, _: &str, _: &'static str, span: Span, rule: Rule) -> Result<Span, String> {
+        if let Rule::Validity(bits) = rule {
+            self.found.push((self.next, span, bits));
+        }
+        self.next += 1;
+        Ok(span)
+    }
+}
+
+/// Whether the first `bits` bits of the bitmap at `at` are all set (least significant first).
+fn all_set(chunks: &Chunks, at: usize, bits: usize) -> bool {
+    let Some(bytes) = chunks.bytes(at, bits.div_ceil(8)) else {
+        return false;
+    };
+    let (whole, rest) = (bits / 8, bits % 8);
+    let mask = (1u8 << rest).wrapping_sub(1);
+    bytes[..whole].iter().all(|b| *b == 0xff) && (rest == 0 || bytes[whole] & mask == mask)
+}
+
+/// Leaves out every validity bitmap with no bit clear: arrow-ipc writes one for each column and
+/// list child, all ones when nothing is null, and in a record each takes a page of its own. A
+/// zero-length bitmap is how the format says "no nulls", and its node already counts none, so
+/// the batch read back is the same; this is what the gate's own encoder wrote. The bitmaps are
+/// found by the engine's own walk (`moruna_ipc_check::walk`), the order arrow-ipc reads them in.
+fn leave_out_all_valid(
+    schema: &[u8],
+    batch_message: &mut [u8],
+    chunks: &Chunks,
+    body_at: usize,
+) -> Result<(), FunctionError> {
+    let fields = header_table(schema, format::header::SCHEMA)
+        .and_then(check_schema)
+        .map_err(output)?;
+    let body = Body {
+        len: usize::try_from(frame::body_length(batch_message).map_err(output)?)
+            .map_err(|_| output("a negative body length"))?,
+        addr: 0,
+    };
+    let version = message_table(batch_message)
+        .and_then(|m| m.i16(format::message::VERSION, format::version::V1))
+        .map_err(output)?;
+    let mut bitmaps = Bitmaps::default();
+    let record_batch = header_table(batch_message, format::header::RECORD_BATCH).map_err(output)?;
+    walk(record_batch, body, version, &fields, Some(&mut bitmaps)).map_err(output)?;
+    for (entry, span, bits) in bitmaps.found {
+        if span.len > 0 && all_set(chunks, body_at + span.offset, bits) {
+            frame::write_entry(batch_message, entry, span.offset as i64, 0).map_err(output)?;
+        }
+    }
+    Ok(())
 }
 
 impl Encoded {
@@ -421,6 +505,80 @@ mod tests {
             arrow_schema::UnionMode::Dense,
         );
         assert!(has_dictionary(&union));
+    }
+
+    #[test]
+    fn all_set_reads_only_the_bits_it_covers() {
+        let c = Chunks::new(vec![Buffer::from_vec(vec![0xffu8, 0x07, 0x00])]);
+        assert!(all_set(&c, 0, 0));
+        assert!(all_set(&c, 0, 8));
+        assert!(
+            all_set(&c, 0, 11),
+            "the eleventh bit is the third of the second byte"
+        );
+        assert!(!all_set(&c, 0, 12));
+        assert!(all_set(&c, 1, 3));
+        assert!(!all_set(&c, 2, 1));
+        assert!(!all_set(&c, 3, 1), "past the bytes");
+    }
+
+    /// The non-empty buffers of a record, and the record read back.
+    fn laid(b: &RecordBatch) -> (usize, u64, RecordBatch) {
+        let e = encode(b).unwrap();
+        let r = e.to_vec().unwrap();
+        let Ok(Need::Framing(end)) = framing_need(&r) else {
+            panic!("no framing")
+        };
+        let checked = check_record(&r[..end], r.len() as u64).unwrap();
+        let buffers = checked.buffers.iter().filter(|(_, len)| *len > 0).count();
+        let mut stream = r.clone();
+        stream.extend_from_slice(&moruna_ipc_check::frame::END_OF_STREAM);
+        let mut reader =
+            arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(stream), None).unwrap();
+        (buffers, e.record_len, reader.next().unwrap().unwrap())
+    }
+
+    #[test]
+    fn a_bitmap_with_nothing_null_is_left_out_and_the_rest_kept() {
+        use arrow_array::ListArray;
+        // No nulls: the values, the offsets and the data, no bitmap; four pages in all.
+        let none = batch(1);
+        let (buffers, len, back) = laid(&none);
+        assert_eq!((buffers, back), (3, none.clone()));
+        assert!(len <= 4 * 4096, "{len}");
+        // A null keeps its column's bitmap, and only that one.
+        let a: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]));
+        let s: ArrayRef = Arc::new(StringArray::from(vec!["x", "y", "z"]));
+        let some = RecordBatch::try_from_iter([("a", a), ("s", s)]).unwrap();
+        let (buffers, _, back) = laid(&some);
+        assert_eq!((buffers, back), (4, some.clone()));
+        // A slice whose nulls are all outside it has none left.
+        let (buffers, _, back) = laid(&some.slice(2, 1));
+        assert_eq!((buffers, back), (3, some.slice(2, 1)));
+        // A list and its child, nothing null: the offsets and the values.
+        let l: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![]),
+        ]));
+        let lists = RecordBatch::try_from_iter([("l", l)]).unwrap();
+        let (buffers, _, back) = laid(&lists);
+        assert_eq!((buffers, back), (2, lists.clone()));
+        // A null in the child only: the child's bitmap stays, the list's goes.
+        let l: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1), None]),
+        ]));
+        let child_null = RecordBatch::try_from_iter([("l", l)]).unwrap();
+        let (buffers, _, back) = laid(&child_null);
+        assert_eq!((buffers, back), (3, child_null));
+        // A struct whose child has nulls: the struct's own bitmap goes.
+        let i: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(2)]));
+        let st: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("x", DataType::Int64, true)),
+            i,
+        )]));
+        let nested = RecordBatch::try_from_iter([("st", st)]).unwrap();
+        let (buffers, _, back) = laid(&nested);
+        assert_eq!((buffers, back), (2, nested));
     }
 
     #[test]
