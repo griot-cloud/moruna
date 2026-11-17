@@ -14,7 +14,10 @@
 //!
 //! Each connection is one task, with its own open files and its own scratch
 //! directory at `/tmp`, whose bytes are memory objects charged to the directory's
-//! account (`pages`). The server ends when its last client and listener have gone.
+//! account (`pages`). Every directory's chunks share one budget of the server's
+//! handles, and the rest of its handle table is its own ([`HANDLE_RESERVE`]), so a full
+//! scratch directory is its client's `NoSpace`, never the server's end. The server ends
+//! when its last client and listener have gone.
 
 #![no_std]
 #![no_main]
@@ -38,6 +41,7 @@ use imagefs_protocol::{
 };
 use moruna_imagefs::{
     cache::{Cache, Disk, Fetch},
+    chunks::Budget,
     error::Error as FsError,
     format::{Kind, PAGE, PAGE_U64},
     fs::{Place, Tree},
@@ -49,7 +53,7 @@ use moruna_imagefs::{
 };
 use moruna_svc::{
     Account, CallError, Channel, Console, Context, DEADLINE_INFINITE, Dispatcher, Encoder, Handle,
-    Mapping, Memory, Rights, Wire, deadline_in, map as mapflags, println, start,
+    Mapping, Memory, Rights, Wire, deadline_in, limits, map as mapflags, println, start,
 };
 
 mod pages;
@@ -61,6 +65,22 @@ const CACHE_PAGES: u32 = 4096;
 /// The mappings kept for the next task that maps the same pages.
 const MAP_CACHE_BYTES: u64 = 64 << 20;
 const MAP_CACHE_ENTRIES: usize = 256;
+/// The handles the server keeps for itself. The rest of its table holds the scratch
+/// directories' chunks, and a chunk the rest has no room for is `NoSpace`. Its own are at
+/// most a handle a start slot, a device a layer (a page of `layer` lines), a channel and
+/// an account for each connection, listener or view the dispatcher waits on, the kept
+/// mappings, a message's handles in and a reply's out, and one at a time each for the
+/// heap's next block, a new mapping and its duplicate.
+const HANDLE_RESERVE: usize = 1024;
+const _: () = assert!(
+    limits::START_HANDLES_MAX
+        + PAGE / 73
+        + 2 * limits::WAIT_MAX_ITEMS
+        + MAP_CACHE_ENTRIES
+        + 2 * limits::CHANNEL_MAX_HANDLES
+        + 3
+        <= HANDLE_RESERVE
+);
 /// Requests in flight to one device at once: within a channel's queue.
 const IN_FLIGHT: usize = 32;
 const SECONDS: u64 = 1_000_000_000;
@@ -261,6 +281,8 @@ struct Shared {
     served: u64,
     capacity: Option<moruna_svc::WatchCapacity>,
     views: Vec<(Channel, Task, moruna_svc::WatchPermit)>,
+    /// The handles every scratch directory's chunks share.
+    scratch_handles: Budget,
 }
 
 impl Shared {
@@ -969,7 +991,7 @@ impl imagefs::Server for Task {
 
         let shared = self.shared.clone();
         let sh = shared.borrow();
-        let store = pages::Pages::new(Some(Account(account)));
+        let store = pages::store(Some(Account(account)), sh.scratch_handles.clone());
         scratch
             .set_store(alloc::boxed::Box::new(store))
             .map_err(|e| sh.fail(e))
@@ -1213,6 +1235,7 @@ fn mount(out: &Console) -> Result<Shared, String> {
         served: 0,
         capacity: None,
         views: Vec::new(),
+        scratch_handles: Budget::new(limits::HANDLES_PER_PROCESS - HANDLE_RESERVE),
     })
 }
 
@@ -1229,6 +1252,7 @@ fn run() -> i64 {
     };
     let mut dispatcher = Dispatcher::new();
     shared.borrow_mut().capacity = Some(dispatcher.watch_capacity());
+    let budget = shared.borrow().scratch_handles.clone();
     let mut listeners = 0;
     for i in 0..start::count() {
         let Some((_, _, slot)) = start::entry(i) else {
@@ -1241,12 +1265,13 @@ fn run() -> i64 {
             continue;
         };
         let s = shared.clone();
+        let budget = budget.clone();
         let factory = imagefs::factory(move || Task {
             shared: s.clone(),
             // Its bytes in memory objects charged to an account (SDD 20 f.18): the one
             // its task's starter gives, or one carved when it first needs a page.
             scratch: Rc::new(RefCell::new(Scratch::with_store(alloc::boxed::Box::new(
-                pages::Pages::new(None),
+                pages::store(None, budget.clone()),
             )))),
             root: None,
             readonly: false,

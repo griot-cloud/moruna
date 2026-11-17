@@ -653,3 +653,52 @@ and switches to the new one when the call answers.
     8.7-14.0 s. `stage_s` is 0, since the inputs are local files.
   - Not run under KVM: the launcher's booted test (`data_disks_boot`) compiled to no test
     without D's `native-tcg-proof` feature. D ran it under TCG.
+- **2026-11-17: imagefs's scratch store, the gate blocker E found** (integrator's agent,
+  branch `worktree-agent-a18d4664dfd2c8f66`). Every NYC run with about 27 MB of Parquet
+  output or more ended with `imagefs: panicked: memory allocation of 8192 bytes failed` and
+  the node stopped.
+  - **The cause, read from the code (not booted):** a /tmp file was 16 KiB chunks, one
+    memory object and one handle each, in imagefs's one table of 4,096 handles shared by
+    every connection. At the run's end the engine's scratch holds the output three times:
+    the sinks' files under `/tmp/out`, the layer writer's spill (`.data-part`) and the
+    layer (`moruna_image::layerfile::write`). For 27 MB that is about 3 x 1,648 chunks,
+    over the table. The layer is copied through a `BufReader` and a `BufWriter`, 8 KiB a
+    call: a write's growth took the table's last handle, and the next read's 8 KiB reply
+    (`Scratch::read`'s buffer, a heap block over 2 KiB, so its own memory object) found no
+    handle, and `alloc` aborted. The outputs that passed (12.9 MB, about 2,400 chunks)
+    stayed under it; the line between is near 21 MB.
+  - **The store** (`moruna_imagefs::chunks`, host-tested; `imagefs/server/src/pages.rs`
+    is its kernel backing). A file's chunks grow with it: the first is what the first
+    growth needs (at least a page), each later one the largest of 16 KiB, an eighth of
+    the file and the growth, at most 16 MiB, and never more than the account has room
+    for, so a file fills its account to the last growth that fits.
+    - Waste past a file's end: under `max(16 KiB, size / 8 + 4 KiB)`, and under 16 MiB,
+      besides the kernel's record (256 bytes a chunk, 16 a page). A small file costs a
+      page, not 16 KiB.
+    - Handles: 27 MB is 48 chunks, 4 GiB 309, 16 GiB 1,077 (in 32 KiB writes). The
+      chunks of all scratch directories share a budget of 3,072 handles (one file of
+      47 GiB); imagefs keeps 1,024 for itself, a bound checked at compile time against
+      its own holders (start slots, layer devices, connections and their accounts, kept
+      mappings, a message's handles each way, the heap's next block).
+  - **No panic on exhaustion:** a growth is counted against the budget and the account's
+    room before any chunk is made, and is `NoSpace` to the client when either is short;
+    `QuotaExceeded`, `Limit` and `NoMemory` from the kernel are `NoSpace` too. A default
+    account (no `scratch_account`) is carved only while imagefs keeps 16 MiB of its own
+    account for its heap and messages.
+  - **The copy path:** a read or a write mapped every 16 KiB chunk it touched, whole,
+    and copied a byte a call (reads) or a word a call (writes): per MiB of 32 KiB
+    requests, 64 to 96 map and unmap pairs, and 1,048,576 single-byte loads or 131,072
+    word stores, each through a bounds check. Now a call maps only the pages it touches,
+    usually in one chunk, and copies them with one `memcpy` (the chunks are imagefs's
+    alone: no client maps a scratch file): 32 pairs per MiB. Counted, not timed.
+  - Tests: 8 host tests in `chunks` (offsets across chunk boundaries, resizes up and down,
+    zeros after a cut, the budget's and the account's refusals with nothing made, a failed
+    chunk undone, a scratch directory on chunks); `chunks.rs` 99.4% of lines,
+    `moruna-imagefs` 98.4%. imagefs's clippy and release build on the user target.
+  - **For the integrator's boot:** a NYC run with 27 MB or more of output completes, and
+    imagefs prints no panic. imagefs's boot test (`imagefs-test`'s scratch quota of
+    256 KiB) still refuses within 32 KiB of its limit.
+  - **Open, for E:** the output layer needs about three times the output in the engine's
+    scratch account (plus up to an eighth for growth), so 1 GiB holds outputs to about
+    300 MB. Streaming the layer onto `disk.out` without the spill and the layer file is
+    the engine's change.
