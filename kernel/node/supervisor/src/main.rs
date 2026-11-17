@@ -167,7 +167,7 @@ fn prepare(console: &Console) -> Result<Prepared, String> {
             // account's limit that every service and job is carved from (item 1.4).
             Bootstrap::Platform => Vec::new(),
             Bootstrap::Linux => alloc::vec![root()?],
-            Bootstrap::Devices => alloc::vec![
+            Bootstrap::Devices { .. } => alloc::vec![
                 root()?,
                 take("root.device")?,
                 take("root.ecam")?,
@@ -368,6 +368,8 @@ fn run() -> i64 {
         lifecycle.started(index);
         println!(console, "node: service {} started", index);
     }
+    // System design 1B: the boot line once every service in node.conf has started.
+    println!(console, "moruna: services started");
     loop {
         if let Err(e) = collect(&guardians, &mut descendants, false) {
             println!(console, "node: child supervision failed: {}", e);

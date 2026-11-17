@@ -339,8 +339,119 @@ mod kd3_command_tests {
     }
 }
 
-fn run() -> Result<(), String> {
-    let mut args: Vec<_> = std::env::args().collect();
+const USAGE: &str = "usage: moruna-node-image [--profile standalone] DESCRIPTION ASSETS NODE_RAM CPUS AGENT_PORT\n       moruna-node-image --profile cloud DESCRIPTION ASSETS NODE_RAM";
+
+/// The node RAM a profile's accounts are checked against: whole 2 MiB pages, 256 MiB at least.
+fn node_ram(ram: &str) -> Result<u64, String> {
+    let ram: u64 = ram.parse().map_err(|_| "invalid node RAM")?;
+    if ram < 256 * 1024 * 1024 || !ram.is_multiple_of(2 * 1024 * 1024) {
+        return Err("invalid fixed VM resources".into());
+    }
+    Ok(ram)
+}
+
+/// The description, which must start the node supervisor and nothing else, binding each
+/// `(slot, file)` to exactly that data file.
+fn supervisor_only(
+    description: &str,
+    profile: &str,
+    bindings: &[(&str, &str)],
+) -> Result<moruna_image::DescProcess, String> {
+    let description =
+        Description::parse(&fs::read_to_string(description).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    if description.processes.len() != 1 || description.processes[0].program != "node-supervisor" {
+        return Err(format!("{profile} image must start only node-supervisor"));
+    }
+    let process = description
+        .processes
+        .into_iter()
+        .next()
+        .ok_or("missing node-supervisor")?;
+    for (slot, file) in bindings {
+        if !process
+            .handles
+            .iter()
+            .any(|h| h.slot == *slot && h.source == DescSource::Data((*file).into()))
+        {
+            return Err(format!("boot {slot} must bind exact {file}"));
+        }
+    }
+    Ok(process)
+}
+
+/// network.conf through the network server's parser, its listener grants matching the node's
+/// actual channel bindings.
+fn network_config(
+    assets: &Path,
+    node: &moruna_node::Config,
+) -> Result<moruna_netstack::Config, String> {
+    let network = page(assets, "network.conf")?;
+    let network = moruna_netstack::parse(
+        std::str::from_utf8(&network).map_err(|_| "network config encoding")?,
+    )
+    .map_err(|e| format!("network config: {e}"))?;
+    let service = node
+        .services
+        .iter()
+        .find(|s| s.image == "image.netstack")
+        .ok_or("missing native network service")?;
+    let mut linked = Vec::new();
+    for link in &node.links {
+        if link.left == service.name && link.left_slot.starts_with("listen") {
+            linked.push(link.left_slot.as_str());
+        }
+        if link.right == service.name && link.right_slot.starts_with("listen") {
+            linked.push(link.right_slot.as_str());
+        }
+    }
+    if network
+        .grants
+        .iter()
+        .any(|(slot, _)| !linked.contains(&slot.as_str()))
+        || linked
+            .iter()
+            .any(|slot| !network.grants.iter().any(|(s, _)| s.as_str() == *slot))
+    {
+        return Err("network listener grants must match actual node channel bindings".into());
+    }
+    Ok(network)
+}
+
+/// The cloud profile (system design 1A, work item 1.1): the supervisor and node.conf, and,
+/// when node.conf runs the network server, network.conf. Nothing a launcher's node has (no
+/// engine config, agent port, layers or resources contract).
+fn cloud(args: &[String]) -> Result<(), String> {
+    let [description, assets, ram] = args else {
+        return Err(USAGE.into());
+    };
+    let ram = node_ram(ram)?;
+    let assets = Path::new(assets);
+    let process = supervisor_only(description, "cloud", &[("config", "node.conf")])?;
+    let node = moruna_node::Config::parse(&page(assets, "node.conf")?, ram)
+        .map_err(|e| format!("node config: {e:?}"))?;
+    if node.services.iter().any(|s| s.image == "image.netstack") {
+        if !process.handles.iter().any(|h| {
+            h.slot == "network.config" && h.source == DescSource::Data("network.conf".into())
+        }) {
+            return Err("boot network.config must bind exact network.conf".into());
+        }
+        network_config(assets, &node)?;
+    }
+    Ok(())
+}
+
+fn run(mut args: Vec<String>) -> Result<(), String> {
+    if args.get(1).map(String::as_str) == Some("--profile") {
+        match args.get(2).map(String::as_str) {
+            Some("standalone") => {
+                args.drain(1..3);
+            }
+            Some("cloud") => return cloud(&args[3..]),
+            Some(other) => return Err(format!("unknown profile {other}: standalone or cloud")),
+            None => return Err(USAGE.into()),
+        }
+    }
     let proof_command = args
         .last()
         .is_some_and(|arg| arg == "--kd3-conformance-proof");
@@ -351,40 +462,24 @@ fn run() -> Result<(), String> {
         args.pop();
     }
     let [_, description, assets, ram, cpus, port] = args.as_slice() else {
-        return Err("usage: moruna-node-image DESCRIPTION ASSETS NODE_RAM CPUS AGENT_PORT".into());
+        return Err(USAGE.into());
     };
-    let ram: u64 = ram.parse().map_err(|_| "invalid node RAM")?;
+    let ram = node_ram(ram)?;
     let cpus: u32 = cpus.parse().map_err(|_| "invalid CPU count")?;
     let port: u32 = port.parse().map_err(|_| "invalid agent port")?;
-    if ram < 256 * 1024 * 1024
-        || ram % (2 * 1024 * 1024) != 0
-        || cpus == 0
-        || cpus > 64
-        || port == 0
-    {
+    if cpus == 0 || cpus > 64 || port == 0 {
         return Err("invalid fixed VM resources".into());
     }
     let assets = Path::new(assets);
-    let description =
-        Description::parse(&fs::read_to_string(description).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-    if description.processes.len() != 1 || description.processes[0].program != "node-supervisor" {
-        return Err("standalone image must start only node-supervisor".into());
-    }
-    let process = &description.processes[0];
-    for (slot, file) in [
-        ("config", "node.conf"),
-        ("initial.job", "initial.job"),
-        ("engine.config", "engine.conf"),
-    ] {
-        if !process
-            .handles
-            .iter()
-            .any(|h| h.slot == slot && h.source == DescSource::Data(file.into()))
-        {
-            return Err(format!("boot {slot} must bind exact {file}"));
-        }
-    }
+    let process = supervisor_only(
+        description,
+        "standalone",
+        &[
+            ("config", "node.conf"),
+            ("initial.job", "initial.job"),
+            ("engine.config", "engine.conf"),
+        ],
+    )?;
     let node = moruna_node::Config::parse(&page(assets, "node.conf")?, ram)
         .map_err(|e| format!("node config: {e:?}"))?;
     if node.services.iter().any(|s| s.image == "image.maintenance") {
@@ -416,35 +511,7 @@ fn run() -> Result<(), String> {
             return Err(format!("admission {slot} must bind exact {source}"));
         }
     }
-    let network = page(assets, "network.conf")?;
-    let network = moruna_netstack::parse(
-        std::str::from_utf8(&network).map_err(|_| "network config encoding")?,
-    )
-    .map_err(|e| format!("network config: {e}"))?;
-    let service = node
-        .services
-        .iter()
-        .find(|s| s.image == "image.netstack")
-        .ok_or("missing native network service")?;
-    let mut linked = Vec::new();
-    for link in &node.links {
-        if link.left == service.name && link.left_slot.starts_with("listen") {
-            linked.push(link.left_slot.as_str());
-        }
-        if link.right == service.name && link.right_slot.starts_with("listen") {
-            linked.push(link.right_slot.as_str());
-        }
-    }
-    if network
-        .grants
-        .iter()
-        .any(|(slot, _)| !linked.contains(&slot.as_str()))
-        || linked
-            .iter()
-            .any(|slot| !network.grants.iter().any(|(s, _)| s.as_str() == *slot))
-    {
-        return Err("network listener grants must match actual node channel bindings".into());
-    }
+    let network = network_config(assets, &node)?;
     if network.settings.tls_unix_seconds == 0 {
         return Err("standalone TLS requires an explicitly injected trusted UTC anchor".into());
     }
@@ -488,7 +555,7 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 fn main() -> ExitCode {
-    match run() {
+    match run(std::env::args().collect()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("moruna-node-image: {e}");
@@ -557,5 +624,306 @@ mod maintenance_tests {
                 .unwrap_err()
                 .contains("bucket")
         );
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    const RAM: &str = "2147483648";
+
+    fn node_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
+    }
+
+    fn args(words: &[&str]) -> Vec<String> {
+        core::iter::once("moruna-node-image")
+            .chain(words.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    /// A fresh directory holding the committed cloud assets, any file replaced by `changes`.
+    struct Assets(std::path::PathBuf);
+    impl Assets {
+        fn new(tag: &str, changes: &[(&str, &str)]) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "moruna-node-image-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&root).unwrap();
+            fs::copy(node_dir().join("cloud/node.conf"), root.join("node.conf")).unwrap();
+            fs::copy(node_dir().join("cloud.image"), root.join("cloud.image")).unwrap();
+            for (name, text) in changes {
+                fs::write(root.join(name), text).unwrap();
+            }
+            Self(root)
+        }
+        fn path(&self, name: &str) -> String {
+            self.0.join(name).to_string_lossy().into_owned()
+        }
+        fn cloud(&self, ram: &str) -> Result<(), String> {
+            let (image, assets) = (self.path("cloud.image"), self.path(""));
+            run(args(&["--profile", "cloud", &image, &assets, ram]))
+        }
+    }
+    impl Drop for Assets {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn the_committed_cloud_profile_validates_and_writes_no_launcher_contract() {
+        let image = node_dir().join("cloud.image");
+        let assets = node_dir().join("cloud");
+        run(args(&[
+            "--profile",
+            "cloud",
+            image.to_str().unwrap(),
+            assets.to_str().unwrap(),
+            RAM,
+        ]))
+        .unwrap();
+        assert!(!assets.join("node-resources.json").exists());
+        let copy = Assets::new("copy", &[]);
+        copy.cloud(RAM).unwrap();
+        assert!(!copy.0.join("node-resources.json").exists());
+    }
+
+    #[test]
+    fn an_unknown_or_missing_profile_is_refused() {
+        let err = run(args(&["--profile", "bios", "d", "a", RAM])).unwrap_err();
+        assert_eq!(err, "unknown profile bios: standalone or cloud");
+        assert_eq!(run(args(&["--profile"])).unwrap_err(), USAGE);
+    }
+
+    #[test]
+    fn cloud_takes_no_cpus_or_agent_port() {
+        let assets = Assets::new("arity", &[]);
+        let (image, dir) = (assets.path("cloud.image"), assets.path(""));
+        let err = run(args(&[
+            "--profile",
+            "cloud",
+            &image,
+            &dir,
+            RAM,
+            "2",
+            "5100",
+        ]))
+        .unwrap_err();
+        assert_eq!(err, USAGE);
+        assert_eq!(
+            run(args(&["--profile", "cloud", &image, &dir])).unwrap_err(),
+            USAGE
+        );
+    }
+
+    #[test]
+    fn cloud_refuses_bad_node_ram() {
+        let assets = Assets::new("ram", &[]);
+        assert_eq!(assets.cloud("lots").unwrap_err(), "invalid node RAM");
+        assert_eq!(
+            assets.cloud("134217728").unwrap_err(),
+            "invalid fixed VM resources"
+        );
+        assert_eq!(
+            assets.cloud("268435457").unwrap_err(),
+            "invalid fixed VM resources"
+        );
+    }
+
+    #[test]
+    fn cloud_refuses_a_description_it_does_not_list() {
+        let unbound = Assets::new(
+            "unbound",
+            &[(
+                "cloud.image",
+                "moruna-image 1\nprocess node-supervisor\n  handle console console\n  handle data:other.conf config\n",
+            )],
+        );
+        assert_eq!(
+            unbound.cloud(RAM).unwrap_err(),
+            "boot config must bind exact node.conf"
+        );
+        let other = Assets::new(
+            "other",
+            &[(
+                "cloud.image",
+                "moruna-image 1\nprocess devices\n  handle console console\n",
+            )],
+        );
+        assert_eq!(
+            other.cloud(RAM).unwrap_err(),
+            "cloud image must start only node-supervisor"
+        );
+        let missing = Assets::new("missing", &[]);
+        fs::remove_file(missing.0.join("cloud.image")).unwrap();
+        assert!(missing.cloud(RAM).is_err());
+    }
+
+    /// The committed node.conf with the network server item 1.3 adds, bound in the description.
+    const NETWORKED: &str = "moruna-node 1\nservice devices image.devices 67108864\nservice network image.netstack 67108864\nbootstrap devices devices\ngrant network config network.config\nlink devices directory-net network directory\n";
+    const BOUND: &str = "moruna-image 1\nprocess node-supervisor\n  handle console console\n  handle data:node.conf config\n  handle data:network.conf network.config\n";
+
+    #[test]
+    fn cloud_validates_node_config_with_its_parser() {
+        let budget = Assets::new(
+            "budget",
+            &[(
+                "node.conf",
+                "moruna-node 1\nservice devices image.devices 268435456\nservice other image.devices 268435456\n",
+            )],
+        );
+        assert_eq!(
+            budget.cloud("268435456").unwrap_err(),
+            "node config: Budget"
+        );
+        let unknown = Assets::new(
+            "unknown",
+            &[("node.conf", "moruna-node 1\nservices devices\n")],
+        );
+        assert_eq!(unknown.cloud(RAM).unwrap_err(), "node config: Syntax");
+        let missing = Assets::new("nonode", &[]);
+        fs::remove_file(missing.0.join("node.conf")).unwrap();
+        assert!(missing.cloud(RAM).unwrap_err().starts_with("node.conf: "));
+    }
+
+    #[test]
+    fn cloud_checks_network_conf_only_when_node_conf_runs_the_network_server() {
+        // Item 1.1's profile runs no network server: network.conf is neither needed nor read.
+        let none = Assets::new("nonet", &[("network.conf", "not a network config")]);
+        none.cloud(RAM).unwrap();
+        // With one, network.conf must be bound and pass the network server's parser.
+        let unbound = Assets::new(
+            "unbound-net",
+            &[
+                ("node.conf", NETWORKED),
+                ("network.conf", "moruna-netstack 1\n"),
+            ],
+        );
+        assert_eq!(
+            unbound.cloud(RAM).unwrap_err(),
+            "boot network.config must bind exact network.conf"
+        );
+        let grantless = Assets::new(
+            "grantless",
+            &[
+                ("node.conf", NETWORKED),
+                ("cloud.image", BOUND),
+                (
+                    "network.conf",
+                    "moruna-netstack 1\ninterface wan card=net0 dhcp\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            grantless.cloud(RAM).unwrap_err(),
+            "network config: line 0: no grant: nothing could reach the server"
+        );
+        let listener = Assets::new(
+            "listener",
+            &[
+                ("node.conf", NETWORKED),
+                ("cloud.image", BOUND),
+                (
+                    "network.conf",
+                    "moruna-netstack 1\ninterface wan card=net0 dhcp\ngrant listen-api rights=listen\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            listener.cloud(RAM).unwrap_err(),
+            "network listener grants must match actual node channel bindings"
+        );
+        let linked = Assets::new(
+            "linked",
+            &[
+                (
+                    "node.conf",
+                    &format!(
+                        "{NETWORKED}service api image.devices 4096\nlink api server network listen-api\n"
+                    ),
+                ),
+                ("cloud.image", BOUND),
+                (
+                    "network.conf",
+                    "moruna-netstack 1\ninterface wan card=net0 dhcp\ngrant listen-api rights=listen\n",
+                ),
+            ],
+        );
+        linked.cloud(RAM).unwrap();
+        let unreadable = Assets::new(
+            "unreadable",
+            &[("node.conf", NETWORKED), ("cloud.image", BOUND)],
+        );
+        assert!(
+            unreadable
+                .cloud(RAM)
+                .unwrap_err()
+                .starts_with("network.conf: ")
+        );
+        let binary = Assets::new(
+            "binary",
+            &[("node.conf", NETWORKED), ("cloud.image", BOUND)],
+        );
+        fs::write(binary.0.join("network.conf"), [0xff_u8, 0xfe]).unwrap();
+        assert_eq!(binary.cloud(RAM).unwrap_err(), "network config encoding");
+        let unserved = Assets::new(
+            "unserved",
+            &[
+                (
+                    "node.conf",
+                    "moruna-node 1\nservice network image.netstack 67108864\n",
+                ),
+                ("cloud.image", BOUND),
+                (
+                    "network.conf",
+                    "moruna-netstack 1\ngrant listen-api rights=listen\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            unserved.cloud(RAM).unwrap_err(),
+            "network listener grants must match actual node channel bindings"
+        );
+    }
+
+    #[test]
+    fn standalone_is_the_default_and_named_profile_alike() {
+        let assets = Assets::new("standalone", &[]);
+        let (image, dir) = (assets.path("cloud.image"), assets.path(""));
+        let expected = "boot initial.job must bind exact initial.job";
+        assert_eq!(
+            run(args(&[&image, &dir, RAM, "2", "5100"])).unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            run(args(&[
+                "--profile",
+                "standalone",
+                &image,
+                &dir,
+                RAM,
+                "2",
+                "5100"
+            ]))
+            .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            run(args(&[&image, &dir, RAM, "0", "5100"])).unwrap_err(),
+            "invalid fixed VM resources"
+        );
+        assert_eq!(
+            run(args(&[&image, &dir, RAM, "2", "port"])).unwrap_err(),
+            "invalid agent port"
+        );
+        assert_eq!(run(args(&[&image, &dir, RAM])).unwrap_err(), USAGE);
     }
 }

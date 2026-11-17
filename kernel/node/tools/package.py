@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Build a standalone node and an x86_64 UEFI GPT image, without mounts.
+"""Build a node and an x86_64 UEFI GPT image, without mounts.
+
+The profile says which node: `standalone` (the default), the node the Linux-node launcher
+starts, with its engine, layers and launcher descriptor; or `cloud` (system design 1A), the
+one disk image for every cloud, which holds only what kernel/node/cloud.image lists and takes
+no agent port, CPU count, layers, writable homes, user network or guest CID.
 
 All inputs are explicit local files. This command does not fetch layers, install
 host tools, acquire credentials, upload an image or start a virtual machine.
@@ -13,13 +18,39 @@ from pathlib import Path
 import shutil
 import subprocess
 
+PROFILES = ("standalone", "cloud")
+# The user programs each profile's image starts; `--package` adds to them.
+PROGRAMS = {
+    "standalone": ["moruna-node-supervisor", "node-admission", "moruna-storage-service", "devices", "imagefs", "linux", "netstack", "engine",
+                   "virtio-blk", "virtio-vsock", "virtio-net", "nvme", "gve"],
+    "cloud": ["moruna-node-supervisor", "devices", "virtio-blk", "virtio-net", "nvme", "gve"],
+}
+# The flags only a launcher's node takes, refused for a cloud image.
+LAUNCHER_FLAGS = (("agent_port", "--agent-port"), ("cpus", "--cpus"), ("layer", "--layer"),
+                  ("writable_home", "--writable-home"), ("user_network", "--user-network"), ("cid", "--cid"))
+# The C of a user program (`ring`, which the network server brings in) is compiled as
+# kernel/tools/build.sh compiles it: by clang, freestanding, for the bare x86_64 ELF target.
+USER_CC = "CC_x86_64_moruna_user"
+USER_CFLAGS = "CFLAGS_x86_64_moruna_user"
+USER_C_FLAGS = "--target=x86_64-unknown-none -ffreestanding -mno-red-zone -fno-stack-protector"
+
+
+def user_c(environment):
+    """The two C compiler variables of the user build, as kernel/tools/build.sh sets them:
+    the caller's compiler, or clang; build.sh's flags, then the caller's. They name the user
+    target, so no host tool and no kernel build reads them."""
+    flags = " ".join(part for part in (USER_C_FLAGS, environment.get(USER_CFLAGS, "").strip()) if part)
+    return {USER_CC: environment.get(USER_CC) or "clang", USER_CFLAGS: flags}
+
 
 def command(args, cwd, env=None):
     subprocess.run([str(a) for a in args], cwd=cwd, env=env, check=True)
 
 
-def main():
+def arguments(argv=None):
+    """The command line, checked for its profile before anything is built."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", choices=PROFILES, default="standalone")
     parser.add_argument("--description", type=Path, required=True)
     parser.add_argument("--assets", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
@@ -27,13 +58,29 @@ def main():
     parser.add_argument("--layer", action="append", type=Path, default=[])
     parser.add_argument("--writable-home", action="append", type=Path, default=[])
     parser.add_argument("--user-network", action="store_true")
-    parser.add_argument("--cid", type=int, default=3)
-    parser.add_argument("--agent-port", type=int, required=True)
+    parser.add_argument("--cid", type=int)
+    parser.add_argument("--agent-port", type=int)
     parser.add_argument("--node-memory", type=int, required=True)
-    parser.add_argument("--cpus", type=int, required=True)
-    args = parser.parse_args()
+    parser.add_argument("--cpus", type=int)
+    args = parser.parse_args(argv)
+    if args.profile == "cloud":
+        given = [flag for name, flag in LAUNCHER_FLAGS if getattr(args, name) not in (None, False, [])]
+        if given:
+            parser.error(f"the cloud profile takes no {', '.join(given)}")
+        return parser, args
+    missing = [flag for name, flag in (("agent_port", "--agent-port"), ("cpus", "--cpus")) if getattr(args, name) is None]
+    if missing:
+        parser.error(f"the following arguments are required: {', '.join(missing)}")
+    if args.cid is None:
+        args.cid = 3
     if args.cid <= 2 or args.cid > 0xffffffff or args.agent_port <= 0 or args.agent_port > 0xffffffff or len(args.layer) > 16 or len(args.writable_home) > 4:
         parser.error("invalid guest CID or layer count")
+    return parser, args
+
+
+def main():
+    parser, args = arguments()
+    cloud = args.profile == "cloud"
     kernel = Path(__file__).resolve().parents[2]
     description = args.description.resolve(strict=True)
     assets = args.assets.resolve(strict=True)
@@ -60,7 +107,8 @@ def main():
         target = payload / item.relative_to(assets)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(item, target)
-    profile = json.loads((payload / "profile.json").read_text())
+    # configure.py's rendering profile is the standalone node's; a cloud image has none.
+    profile = {} if cloud else json.loads((payload / "profile.json").read_text())
     additions=[]
     if profile.get("storage_provider") == "bucket": additions.append("  handle data:storage.credential storage.credential")
     if profile.get("storage_provider")=="local-single-node-home":
@@ -87,13 +135,15 @@ def main():
     env["RUSTFLAGS"] = flags
     command([*cargo, "build", *common, "-p", "moruna-microkernel-boot"], kernel, env)
     env["RUSTFLAGS"] = f"{flags} -Zunstable-options -C link-arg=-T{kernel / 'sys/user.ld'} -C link-arg=-static"
-    packages = list(dict.fromkeys([
-        "moruna-node-supervisor", "node-admission", "moruna-storage-service", "devices", "imagefs", "linux", "netstack", "engine",
-        "virtio-blk", "virtio-vsock", "virtio-net", "nvme", "gve", *args.package,
-    ]))
+    env.update(user_c(os.environ))
+    packages =list(dict.fromkeys([*PROGRAMS[args.profile], *args.package]))
     package_args = [word for package in packages for word in ("-p", package)]
     user_common = ["--locked", "--offline", "--release", "--target", user_target, *std]
-    command([*cargo, "-Zunstable-options", "-Zjson-target-spec", "build", *user_common, *package_args, "--features", "moruna-storage-service/service"], kernel, env)
+    # The storage service's feature names a package only the standalone node builds.
+    features = [] if "moruna-storage-service" not in packages else ["--features", "moruna-storage-service/service"]
+    # The JSON target's -Z flags follow `build`, as in kernel/tools/build.sh: this nightly
+    # refuses them before the subcommand.
+    command([*cargo, "build", "-Zunstable-options", "-Zjson-target-spec", *user_common, *package_args, *features], kernel, env)
     target_dir = Path(os.environ.get("CARGO_TARGET_DIR", kernel / "target"))
     if not target_dir.is_absolute():
         target_dir = kernel / target_dir
@@ -107,10 +157,15 @@ def main():
     # Explicit host target avoids the kernel workspace's default bare-metal target.
     host = subprocess.check_output(["rustc", "+nightly-2026-07-21", "-vV"], cwd=kernel, text=True)
     host = next(line.removeprefix("host: ") for line in host.splitlines() if line.startswith("host: "))
-    command([*cargo, "run", "--locked", "--offline", "--release", "--target", host,
-             "-p", "moruna-node-image", "--", description, payload,
-             args.node_memory, args.cpus, args.agent_port], kernel, host_env)
-    resources = json.loads((payload / "node-resources.json").read_text())
+    if cloud:
+        command([*cargo, "run", "--locked", "--offline", "--release", "--target", host,
+                 "-p", "moruna-node-image", "--", "--profile", "cloud", description, payload,
+                 args.node_memory], kernel, host_env)
+    else:
+        command([*cargo, "run", "--locked", "--offline", "--release", "--target", host,
+                 "-p", "moruna-node-image", "--", description, payload,
+                 args.node_memory, args.cpus, args.agent_port], kernel, host_env)
+        resources = json.loads((payload / "node-resources.json").read_text())
     command([*cargo, "run", "--locked", "--offline", "--release", "--target", host,
              "-p", "moruna-image", "--", description, binaries, payload], kernel, host_env)
     elf = target_dir / target / "release" / "moruna-microkernel"
@@ -122,7 +177,9 @@ def main():
     config = out / "grub.cfg"
     config.write_text("set timeout=0\nset default=0\nmenuentry 'Moruna' {\n search --file --set=root /boot/moruna-kernel.elf\n multiboot2 /boot/moruna-kernel.elf\n module2 /boot/initramfs.cpio\n boot\n}\n")
     boot = out / "BOOTX64.EFI"
-    command(["grub-mkstandalone", "-O", "x86_64-efi", "-o", boot,
+    # GRUB reads the boot files from the GPT disk's FAT32 system partition: its partition and
+    # filesystem modules are loaded with it, or `search` finds no device holding the kernel.
+    command(["grub-mkstandalone", "-O", "x86_64-efi", "--modules=part_gpt fat", "-o", boot,
              f"boot/grub/grub.cfg={config}"], out)
     boot_inputs = [boot, payload / "moruna-kernel.elf", payload / "initramfs.cpio"]
     if any(path.stat().st_size >= 0xffffffff for path in boot_inputs):
@@ -149,6 +206,11 @@ def main():
     evidence = {}
     for path in [description, *(payload / p.relative_to(assets) for p in files), payload / "manifest", payload / "initramfs.cpio", payload / "moruna-kernel.elf", boot, disk]:
         evidence[str(path)] = {"size": path.stat().st_size, "sha256": hashlib.file_digest(path.open("rb"), "sha256").hexdigest()}
+    if cloud:
+        # No launcher descriptor, resources contract or writable inputs: a cloud boots the disk.
+        (out / "inputs-and-artifacts.json").write_text(json.dumps(evidence, indent=2) + "\n")
+        print(f"Packaged {disk} (cloud profile); boot and hardware validation remain required.")
+        return
     def artifact(path):
         with path.open("rb") as file:
             digest = hashlib.file_digest(file, "sha256").hexdigest()

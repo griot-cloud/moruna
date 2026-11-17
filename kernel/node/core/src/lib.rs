@@ -89,14 +89,21 @@ impl Config {
                     }
                     continue;
                 }
-                ["bootstrap", kind, service] if identifier(service) => {
-                    let kind = match *kind {
-                        "devices" => Bootstrap::Devices,
-                        "linux" => Bootstrap::Linux,
-                        "platform" => Bootstrap::Platform,
+                ["bootstrap", kind, service, flags @ ..] if identifier(service) => {
+                    let kind = match (*kind, flags) {
+                        ("devices", []) => Bootstrap::Devices {
+                            until_stopped: false,
+                        },
+                        // System design 1C: a node's device manager lives as long as the
+                        // node, not until its last client leaves.
+                        ("devices", ["until-stopped"]) => Bootstrap::Devices {
+                            until_stopped: true,
+                        },
+                        ("linux", []) => Bootstrap::Linux,
+                        ("platform", []) => Bootstrap::Platform,
                         _ => return Err(ConfigError::Syntax),
                     };
-                    if bootstraps.iter().any(|(k, _)| *k == kind) {
+                    if bootstraps.iter().any(|(k, _)| k.same_kind(kind)) {
                         return Err(ConfigError::Duplicate);
                     }
                     bootstraps.push((kind, (*service).into()));
@@ -317,26 +324,37 @@ mod tests {
 /// The sole node root-transfer header. This is a boot message, not a service
 /// protocol handshake. No unversioned/truncated/trailing message is accepted.
 ///
+/// Its eight bytes: `MNBT`, the version (1), the flags, the kind (1 devices, 2 Linux,
+/// 3 platform) and the handles it carries. The one flag is the device manager's: bit 0,
+/// it serves until it is stopped (node.conf's `bootstrap devices NAME until-stopped`,
+/// system design 1C). Without it, it ends once its last client has gone, as CI's boot
+/// has it.
+///
 /// `Platform` transfers no root: its message is the header and the node's memory
 /// ([`Bootstrap::platform_message`]), the machine account's limit as the supervisor reads
 /// it (system design 1D; item 1.4, PM 2026-11-18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bootstrap {
-    Devices,
+    Devices { until_stopped: bool },
     Linux,
     Platform,
 }
 impl Bootstrap {
     pub const fn header(self) -> &'static [u8; 8] {
         match self {
-            Self::Devices => b"MNBT\x01\x00\x01\x05",
+            Self::Devices {
+                until_stopped: false,
+            } => b"MNBT\x01\x00\x01\x05",
+            Self::Devices {
+                until_stopped: true,
+            } => b"MNBT\x01\x01\x01\x05",
             Self::Linux => b"MNBT\x01\x00\x02\x01",
             Self::Platform => b"MNBT\x01\x00\x03\x00",
         }
     }
     pub const fn handles(self) -> usize {
         match self {
-            Self::Devices => 5,
+            Self::Devices { .. } => 5,
             Self::Linux => 1,
             Self::Platform => 0,
         }
@@ -365,20 +383,111 @@ impl Bootstrap {
         let memory = u64::from_le_bytes(memory.try_into().ok()?);
         (memory != 0).then_some(memory)
     }
+    /// The bootstrap a message is, when it is exactly one.
+    pub fn decode(bytes: &[u8], handles: usize) -> Option<Bootstrap> {
+        [
+            Self::Devices {
+                until_stopped: false,
+            },
+            Self::Devices {
+                until_stopped: true,
+            },
+            Self::Linux,
+            Self::Platform,
+        ]
+        .into_iter()
+        .find(|b| b.accepts(bytes, handles))
+    }
+    /// Whether two bootstraps are of one kind, whatever their flags: a node has at
+    /// most one of each kind.
+    pub fn same_kind(self, other: Bootstrap) -> bool {
+        core::mem::discriminant(&self) == core::mem::discriminant(&other)
+    }
 }
 
 #[cfg(test)]
 mod boot_tests {
     use super::*;
+    const DEVICES: Bootstrap = Bootstrap::Devices {
+        until_stopped: false,
+    };
+    const UNTIL_STOPPED: Bootstrap = Bootstrap::Devices {
+        until_stopped: true,
+    };
     #[test]
     fn bootstrap_requires_exact_version_kind_bytes_and_handle_count() {
-        assert!(Bootstrap::Devices.accepts(Bootstrap::Devices.header(), 5));
-        assert!(!Bootstrap::Devices.accepts(b"roots", 5));
-        assert!(!Bootstrap::Devices.accepts(Bootstrap::Linux.header(), 5));
+        assert!(DEVICES.accepts(DEVICES.header(), 5));
+        assert!(!DEVICES.accepts(b"roots", 5));
+        assert!(!DEVICES.accepts(Bootstrap::Linux.header(), 5));
         assert!(!Bootstrap::Linux.accepts(Bootstrap::Linux.header(), 0));
         let mut invalid = *Bootstrap::Linux.header();
         invalid[4] = 2;
         assert!(!Bootstrap::Linux.accepts(&invalid, 1));
+    }
+    #[test]
+    fn the_device_manager_s_flag_is_its_own_header() {
+        // CI's boot sends the header it always has; a node's supervisor may set the flag.
+        assert_eq!(DEVICES.header(), b"MNBT\x01\x00\x01\x05");
+        assert_eq!(UNTIL_STOPPED.header(), b"MNBT\x01\x01\x01\x05");
+        assert_eq!(UNTIL_STOPPED.handles(), 5);
+        assert!(UNTIL_STOPPED.accepts(UNTIL_STOPPED.header(), 5));
+        assert!(!UNTIL_STOPPED.accepts(DEVICES.header(), 5));
+        assert!(!DEVICES.accepts(UNTIL_STOPPED.header(), 5));
+        for kind in [DEVICES, UNTIL_STOPPED, Bootstrap::Linux] {
+            assert_eq!(Bootstrap::decode(kind.header(), kind.handles()), Some(kind));
+            assert_eq!(Bootstrap::decode(kind.header(), kind.handles() + 1), None);
+        }
+        // No flag is defined for Linux, and no other flag for the device manager.
+        let mut linux = *Bootstrap::Linux.header();
+        linux[5] = 1;
+        assert_eq!(Bootstrap::decode(&linux, 1), None);
+        let mut other = *DEVICES.header();
+        other[5] = 2;
+        assert_eq!(Bootstrap::decode(&other, 5), None);
+        assert_eq!(Bootstrap::decode(&UNTIL_STOPPED.header()[..7], 5), None);
+        assert!(DEVICES.same_kind(UNTIL_STOPPED));
+        assert!(!DEVICES.same_kind(Bootstrap::Linux));
+        let platform = Bootstrap::platform_message(1 << 30);
+        assert_eq!(Bootstrap::decode(&platform, 0), Some(Bootstrap::Platform));
+        assert!(!DEVICES.same_kind(Bootstrap::Platform));
+    }
+    #[test]
+    fn until_stopped_is_a_form_of_the_devices_bootstrap_alone() {
+        let node = |bootstraps: &str| {
+            Config::parse(
+                alloc::format!(
+                    "moruna-node 1\nservice devices image.devices 4096\nservice linux image.linux 4096\n{bootstraps}"
+                )
+                .as_bytes(),
+                1 << 20,
+            )
+        };
+        let config =
+            node("bootstrap devices devices until-stopped\nbootstrap linux linux\n").unwrap();
+        assert_eq!(
+            config.bootstraps,
+            [
+                (UNTIL_STOPPED, String::from("devices")),
+                (Bootstrap::Linux, String::from("linux"))
+            ]
+        );
+        let config = node("bootstrap devices devices\n").unwrap();
+        assert_eq!(config.bootstraps, [(DEVICES, String::from("devices"))]);
+        for refused in [
+            "bootstrap linux linux until-stopped\n",
+            "bootstrap devices devices until-started\n",
+            "bootstrap devices devices until-stopped until-stopped\n",
+            "bootstrap admission devices until-stopped\n",
+        ] {
+            assert_eq!(node(refused), Err(ConfigError::Syntax), "{refused:?}");
+        }
+        // One device manager, with the flag or without it.
+        for twice in [
+            "bootstrap devices devices\nbootstrap devices linux until-stopped\n",
+            "bootstrap devices devices until-stopped\nbootstrap devices linux\n",
+        ] {
+            assert_eq!(node(twice), Err(ConfigError::Duplicate), "{twice:?}");
+        }
     }
     #[test]
     fn the_platform_bootstrap_carries_the_node_s_memory_and_no_handle() {
@@ -408,7 +517,7 @@ mod boot_tests {
         );
         // The other kinds do not take it.
         assert!(!Bootstrap::Linux.accepts(&message, 0));
-        assert!(!Bootstrap::Devices.accepts(&message, 0));
+        assert!(!DEVICES.accepts(&message, 0));
     }
     #[test]
     fn a_node_config_bootstraps_platform_once() {
