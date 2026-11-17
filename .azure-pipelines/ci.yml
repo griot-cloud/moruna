@@ -304,6 +304,7 @@ stages:
               packages=(-p moruna-abi -p moruna-loader -p moruna-handles -p moruna-quota -p moruna-svc -p moruna-image
                 -p moruna-vmbus -p hvdef -p x86defs -p vmbus_core -p vmbus_ring -p netvsp_protocol -p storvsp_protocol
                 -p scsi_defs -p open_enum -p guid -p guestmem_core -p safeatomic -p net_backend_core
+                -p moruna-storvsc
                 -p moruna-mmio -p moruna-pci -p moruna-virtio -p moruna-driver-table -p moruna-imagefs
                 -p moruna-linux -p linux-protocol -p moruna-nvme -p moruna-gve -p net-protocol)
               cargo clippy --locked --target "$host" --all-targets "${packages[@]}" --features moruna-abi/manifest -- -D warnings

@@ -11,7 +11,7 @@ use storvsp_protocol::{
 use zerocopy::IntoBytes;
 
 use crate::{
-    Address, Channel, Disk, Error, Failure, Malformed, PAGE,
+    Address, Channel, Disk, Error, Failure, Malformed, PAGE, Wait,
     ring::{Kind, Received, Rings, field},
     scsi::{self, Command, SERIAL_BYTES},
 };
@@ -77,6 +77,7 @@ pub struct Storvsc<C: Channel> {
     /// The next transaction ID. IDs start at 1 and are never used twice, so a completion
     /// the host sends twice, or late, names nothing in flight.
     next_id: u64,
+    /// The most requests in flight; 0 until the properties answer sets it.
     limit: usize,
     pending: BTreeMap<u64, Pending>,
     version: Option<u16>,
@@ -84,22 +85,16 @@ pub struct Storvsc<C: Channel> {
 }
 
 impl<C: Channel> Storvsc<C> {
-    /// Takes an open channel and sends the first step of the initialisation. `limit` is the
-    /// most requests in flight at once. Poll until [`Event::Ready`].
-    ///
-    /// Item 1.10a asks for "the channel's limit from the properties answer", but the answer
-    /// (`storvsp_protocol::ChannelProperties`, and OpenVMM's storvsp at `storvsp:1101-1146`)
-    /// carries no such limit: only the largest transfer and the sub-channel count. Until the
-    /// PM says where the limit comes from, the caller gives it. The ring adds its own bound:
-    /// a request it has no room for is refused with [`Error::Full`].
-    pub fn new(channel: C, limit: usize) -> Result<Storvsc<C>, Error<C::Error>> {
+    /// Takes an open channel and sends the first step of the initialisation. Poll until
+    /// [`Event::Ready`].
+    pub fn new(channel: C) -> Result<Storvsc<C>, Error> {
         let rings = Rings::new(&channel).map_err(Error::Ring)?;
         let mut device = Storvsc {
             channel,
             rings,
             state: State::Failed,
             next_id: 1,
-            limit,
+            limit: 0,
             pending: BTreeMap::new(),
             version: None,
             max_transfer: 0,
@@ -119,6 +114,15 @@ impl<C: Channel> Storvsc<C> {
         self.max_transfer
     }
 
+    /// The most requests in flight at once: as many as the ring to the host holds of the
+    /// largest request, at least 1 and at most 256. The properties answer carries no such
+    /// limit (`storvsp_protocol::ChannelProperties`; `storvsp:1101-1146`), so it follows from
+    /// the ring and from the largest transfer, which that answer bounds. Zero until ready.
+    /// A request the ring still has no room for is refused with [`Error::Full`].
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
     /// The requests sent and not yet completed.
     pub fn in_flight(&self) -> usize {
         self.pending.len()
@@ -127,7 +131,7 @@ impl<C: Channel> Storvsc<C> {
     /// Asks for the capacity of the disk at `address` (READ CAPACITY 16). The device writes
     /// its answer at the start of the guest page `page`; once the request completes, give
     /// the bytes it reports to [`Disk::from_capacity`].
-    pub fn read_capacity(&mut self, address: Address, page: u64) -> Result<u64, Error<C::Error>> {
+    pub fn read_capacity(&mut self, address: Address, page: u64) -> Result<u64, Error> {
         self.request(
             address,
             scsi::read_capacity16(),
@@ -139,7 +143,7 @@ impl<C: Channel> Storvsc<C> {
     /// Asks for the serial of the disk at `address` (INQUIRY, VPD page 0x80). The device
     /// writes its answer at the start of the guest page `page`; once the request completes,
     /// give the bytes it reports to [`serial`](crate::serial).
-    pub fn read_serial(&mut self, address: Address, page: u64) -> Result<u64, Error<C::Error>> {
+    pub fn read_serial(&mut self, address: Address, page: u64) -> Result<u64, Error> {
         self.request(address, scsi::inquiry_serial(), SERIAL_BYTES, &[page])
     }
 
@@ -151,7 +155,7 @@ impl<C: Channel> Storvsc<C> {
         block: u64,
         count: u32,
         pages: &[u64],
-    ) -> Result<u64, Error<C::Error>> {
+    ) -> Result<u64, Error> {
         let bytes = span(disk, block, count)?;
         self.request(disk.address(), scsi::read16(block, count), bytes, pages)
     }
@@ -164,14 +168,14 @@ impl<C: Channel> Storvsc<C> {
         block: u64,
         count: u32,
         pages: &[u64],
-    ) -> Result<u64, Error<C::Error>> {
+    ) -> Result<u64, Error> {
         let bytes = span(disk, block, count)?;
         self.request(disk.address(), scsi::write16(block, count), bytes, pages)
     }
 
     /// Asks the disk at `address` to put every write it has answered on stable storage
     /// (SYNCHRONIZE CACHE).
-    pub fn flush(&mut self, address: Address) -> Result<u64, Error<C::Error>> {
+    pub fn flush(&mut self, address: Address) -> Result<u64, Error> {
         self.request(address, scsi::synchronize_cache(), 0, &[])
     }
 
@@ -181,7 +185,7 @@ impl<C: Channel> Storvsc<C> {
     /// An error here is about one packet, which is gone, and the device goes on, except
     /// during the initialisation and for [`Error::Ring`]: after those every call answers
     /// [`Error::Failed`].
-    pub fn poll(&mut self) -> Result<Option<Event>, Error<C::Error>> {
+    pub fn poll(&mut self) -> Result<Option<Event>, Error> {
         loop {
             let starting = match self.state {
                 State::Starting(step, id) => Some((step, id)),
@@ -211,20 +215,22 @@ impl<C: Channel> Storvsc<C> {
         }
     }
 
-    /// Sleeps until the host signals. Returns at once when there is a packet to read, or
-    /// room again after a request was refused with [`Error::Full`] for want of it.
-    pub fn wait(&mut self) -> Result<(), Error<C::Error>> {
+    /// Sleeps until the host signals, or until `deadline`, nanoseconds on the node's monotonic
+    /// clock, passes; with none, only a signal or the channel ends the wait. Returns
+    /// [`Wait::Signalled`] at once when there is a packet to read, or room again after a
+    /// request was refused with [`Error::Full`] for want of it.
+    pub fn wait(&mut self, deadline: Option<u64>) -> Result<Wait, Error> {
         if matches!(self.state, State::Failed) {
             return Err(Error::Failed);
         }
-        match self.rings.wait(&mut self.channel) {
-            Ok(()) => Ok(()),
+        match self.rings.wait(&mut self.channel, deadline) {
+            Ok(wait) => Ok(wait),
             Err(e) => Err(self.broken(e)),
         }
     }
 
     /// A corrupt ring ends the device.
-    fn broken(&mut self, e: Error<C::Error>) -> Error<C::Error> {
+    fn broken(&mut self, e: Error) -> Error {
         if matches!(e, Error::Ring(_)) {
             self.state = State::Failed;
         }
@@ -238,7 +244,7 @@ impl<C: Channel> Storvsc<C> {
     }
 
     /// Sends a step of the initialisation and makes it the one in flight.
-    fn start(&mut self, step: Step) -> Result<(), Error<C::Error>> {
+    fn start(&mut self, step: Step) -> Result<(), Error> {
         let version;
         let (operation, body): (Operation, &[u8]) = match step {
             Step::Begin => (Operation::BEGIN_INITIALIZATION, &[]),
@@ -266,7 +272,7 @@ impl<C: Channel> Storvsc<C> {
         operation: Operation,
         body: &[u8],
         data: Option<PagedRange<'_>>,
-    ) -> Result<(), Error<C::Error>> {
+    ) -> Result<(), Error> {
         match self
             .rings
             .send(&mut self.channel, id, operation, body, data)
@@ -281,7 +287,7 @@ impl<C: Channel> Storvsc<C> {
     /// completion of that step (`storvsc:649-661`), and must answer it with success
     /// (`storvsc:663-668`), except that a version it does not speak is answered with
     /// `REVISION_MISMATCH` (`storvsp:1057-1090`), and the next older one is offered.
-    fn advance(&mut self, step: Step, id: u64, packet: &Received) -> Result<bool, Error<C::Error>> {
+    fn advance(&mut self, step: Step, id: u64, packet: &Received) -> Result<bool, Error> {
         let (header, body) = match packet.kind {
             Kind::Completion(got) if got == id => packet.completion().map_err(Error::Malformed)?,
             Kind::Completion(got) => return Err(Error::UnknownTransaction(got)),
@@ -317,6 +323,9 @@ impl<C: Channel> Storvsc<C> {
                 ))?;
                 let named = Rings::max_pages(&self.channel) as u64 * PAGE as u64;
                 self.max_transfer = named.min(properties.max_transfer_bytes as u64) as u32;
+                // The largest request names the pages of the largest transfer.
+                let pages = (self.max_transfer as usize).div_ceil(PAGE);
+                self.limit = Rings::limit(&self.channel, pages);
             }
             Step::Begin | Step::End => {}
         }
@@ -335,7 +344,7 @@ impl<C: Channel> Storvsc<C> {
     /// Takes a packet the host sent once ready: a completion, matched to its request by
     /// transaction ID (`storvsc:505-525`), or a packet of the host's own, of which only the
     /// bus-changed notice is expected and it asks nothing of this driver (`storvsc:495-503`).
-    fn complete(&mut self, packet: &Received) -> Result<Option<Completion>, Error<C::Error>> {
+    fn complete(&mut self, packet: &Received) -> Result<Option<Completion>, Error> {
         match packet.kind {
             Kind::Completion(id) => {
                 let pending = self
@@ -368,7 +377,7 @@ impl<C: Channel> Storvsc<C> {
         command: Command,
         bytes: u32,
         pages: &[u64],
-    ) -> Result<u64, Error<C::Error>> {
+    ) -> Result<u64, Error> {
         match self.state {
             State::Starting(..) => return Err(Error::NotReady),
             State::Ready => {}
@@ -405,7 +414,7 @@ impl<C: Channel> Storvsc<C> {
 }
 
 /// The bytes of `count` blocks from `block`, when they lie within the disk.
-fn span<E>(disk: &Disk, block: u64, count: u32) -> Result<u32, Error<E>> {
+fn span(disk: &Disk, block: u64, count: u32) -> Result<u32, Error> {
     if count == 0 {
         return Err(Error::Empty);
     }

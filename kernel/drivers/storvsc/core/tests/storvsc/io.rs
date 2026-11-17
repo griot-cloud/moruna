@@ -4,18 +4,19 @@
 use std::collections::BTreeMap;
 
 use moruna_storvsc::{
-    Address, Disk, Error, Event, Malformed, Operation, PAGE, Storvsc, scsi::SERIAL_BYTES, serial,
+    Address, ChannelError, Disk, Error, Event, Malformed, Operation, PAGE, Storvsc, Wait,
+    scsi::SERIAL_BYTES, serial,
 };
 
 use crate::{
-    LIMIT, device, disk,
-    fake::{DISK, Down, FakeDisk, Rng, pair, pair_sized},
+    device, disk,
+    fake::{DISK, FakeDisk, Rng, pair, pair_sized},
     moved, next, pages_for, pattern, ready,
 };
 
 #[test]
 fn capacity_and_block_size() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     let disk = disk(&mut device, &host, 9);
     assert_eq!(disk.address(), DISK);
     assert_eq!(disk.blocks(), 2048);
@@ -40,7 +41,7 @@ fn capacity_and_block_size() {
 
 #[test]
 fn written_blocks_read_back_at_the_first_the_last_and_a_middle_block() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     let disk = disk(&mut device, &host, 0);
     let size = disk.block_size() as usize;
     let last = disk.blocks() - 1;
@@ -95,7 +96,7 @@ fn written_blocks_read_back_at_the_first_the_last_and_a_middle_block() {
 
 #[test]
 fn a_range_past_the_end_is_refused() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     let disk = disk(&mut device, &host, 0);
     let sent = host.borrow().seen.len();
     let pages = [1, 2, 3, 4];
@@ -142,7 +143,7 @@ fn a_range_past_the_end_is_refused() {
 
 #[test]
 fn flush() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     let flushes = |host: &std::cell::RefCell<crate::fake::Host>| {
         host.borrow().disks[&(DISK.path, DISK.target, DISK.lun)].flushes
     };
@@ -157,7 +158,7 @@ fn flush() {
 
 #[test]
 fn the_serial() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     let id = device.read_serial(DISK, 12).unwrap();
     let n = moved(&mut device, id) as usize;
     // The page's four-byte header and the serial: less than was asked for.
@@ -197,7 +198,14 @@ fn the_serial() {
 
 #[test]
 fn thirty_two_requests_in_flight_complete_out_of_order() {
-    let (mut device, host, _) = device();
+    // Transfers of up to 51 pages make the largest request 512 bytes, and the ring of 16 KiB
+    // holds 32 of those: the limit is 32.
+    let (link, host) = pair();
+    host.borrow_mut().max_transfer_bytes = 51 * PAGE as u32;
+    let mut device = Storvsc::new(link).unwrap();
+    ready(&mut device);
+    let limit = device.limit();
+    assert_eq!(limit, 32);
     let disk = disk(&mut device, &host, 0);
     let size = disk.block_size() as usize;
     let mut rng = Rng::new(0x1_10a);
@@ -205,20 +213,20 @@ fn thirty_two_requests_in_flight_complete_out_of_order() {
     // Thirty-two writes, each of two blocks from its own page, none answered yet.
     host.borrow_mut().hold = true;
     let mut writes = BTreeMap::new();
-    for n in 0..LIMIT as u64 {
+    for n in 0..limit as u64 {
         let data = pattern(100 + n, 2 * size);
         host.borrow_mut().memory.write(&[60 + n], &data).unwrap();
         let block = 10 * n + 3;
         let id = device.write(&disk, block, 2, &[60 + n]).unwrap();
         assert!(writes.insert(id, (block, data)).is_none(), "ID {id} twice");
     }
-    assert_eq!(device.in_flight(), LIMIT);
-    assert_eq!(host.borrow().held(), LIMIT);
+    assert_eq!(device.in_flight(), limit);
+    assert_eq!(host.borrow().held(), limit);
     assert!(matches!(device.poll(), Ok(None)));
     // The thirty-third has no room, and the host never sees it.
     assert!(matches!(device.flush(DISK), Err(Error::Full)));
     assert!(matches!(device.read(&disk, 0, 1, &[1]), Err(Error::Full)));
-    assert_eq!(device.in_flight(), LIMIT);
+    assert_eq!(device.in_flight(), limit);
 
     host.borrow_mut().shuffle(&mut rng);
     host.borrow_mut().release();
@@ -232,7 +240,7 @@ fn thirty_two_requests_in_flight_complete_out_of_order() {
         assert!(!order.contains(&completion.id), "{} twice", completion.id);
         order.push(completion.id);
     }
-    assert_eq!(order.len(), LIMIT);
+    assert_eq!(order.len(), limit);
     assert_eq!(device.in_flight(), 0);
     let submitted: Vec<u64> = writes.keys().copied().collect();
     assert_ne!(order, submitted, "the completions came in the order sent");
@@ -247,7 +255,7 @@ fn thirty_two_requests_in_flight_complete_out_of_order() {
         assert!(!writes.contains_key(&id), "ID {id} used again");
         reads.insert(id, (page, data.clone()));
     }
-    assert_eq!(device.in_flight(), LIMIT);
+    assert_eq!(device.in_flight(), limit);
     host.borrow_mut().shuffle(&mut rng);
     host.borrow_mut().release();
     let mut seen = 0;
@@ -260,13 +268,13 @@ fn thirty_two_requests_in_flight_complete_out_of_order() {
         assert_eq!(host.borrow().memory.read(&[page], 2 * size).unwrap(), data);
         seen += 1;
     }
-    assert_eq!(seen, LIMIT);
+    assert_eq!(seen, limit);
     assert_eq!(device.in_flight(), 0);
 }
 
 #[test]
 fn the_pages_must_cover_the_transfer() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     let disk = disk(&mut device, &host, 0);
     // Nine blocks of 512 bytes are a page and a half.
     assert!(matches!(
@@ -290,9 +298,9 @@ fn the_pages_must_cover_the_transfer() {
 
 #[test]
 fn a_transfer_larger_than_the_channel_allows_is_refused() {
-    let (link, host, _) = pair();
+    let (link, host) = pair();
     host.borrow_mut().max_transfer_bytes = 8 * 512;
-    let mut device = Storvsc::new(link, LIMIT).unwrap();
+    let mut device = Storvsc::new(link).unwrap();
     ready(&mut device);
     let disk = disk(&mut device, &host, 0);
     let pages = [1, 2, 3];
@@ -322,7 +330,7 @@ fn a_transfer_larger_than_the_channel_allows_is_refused() {
 #[test]
 fn the_largest_transfer_the_ring_can_name_goes_through() {
     // One page of ring, a host with no limit: 497 pages a request.
-    let (link, host, _) = pair_sized(PAGE);
+    let (link, host) = pair_sized(PAGE);
     {
         let mut host = host.borrow_mut();
         host.max_transfer_bytes = u32::MAX;
@@ -330,7 +338,7 @@ fn the_largest_transfer_the_ring_can_name_goes_through() {
         host.disks
             .insert((0, 0, 3), FakeDisk::new(4096, 600, b"large"));
     }
-    let mut device = Storvsc::new(link, LIMIT).unwrap();
+    let mut device = Storvsc::new(link).unwrap();
     ready(&mut device);
     let disk = disk(&mut device, &host, 0);
     let count = device.max_transfer_bytes() / disk.block_size();
@@ -353,84 +361,105 @@ fn the_largest_transfer_the_ring_can_name_goes_through() {
 
 #[test]
 fn a_full_ring_refuses_the_request_and_wakes_the_wait_when_it_has_room() {
-    let (link, host, wire) = pair_sized(PAGE);
-    let mut device = Storvsc::new(link, 10_000).unwrap();
+    // A ring of one page and transfers of 51 pages: requests of 512 bytes, 8 in flight by
+    // the rule, but the ring holds 7 of them, since 8 of its bytes are never used.
+    let (link, host) = pair_sized(PAGE);
+    host.borrow_mut().max_transfer_bytes = 51 * PAGE as u32;
+    let mut device = Storvsc::new(link).unwrap();
     ready(&mut device);
+    assert_eq!(device.limit(), 8);
+    let disk = disk(&mut device, &host, 0);
+    let count = device.max_transfer_bytes() / disk.block_size();
+    let pages: Vec<u64> = (1..=51).collect();
 
-    // The host stops reading. Flushes go into the ring until one does not fit.
+    // The host stops reading. Writes go into the ring until one does not fit.
     host.borrow_mut().stalled = true;
     let mut sent = Vec::new();
     let refused = loop {
-        match device.flush(DISK) {
+        match device.write(&disk, 0, count, &pages) {
             Ok(id) => sent.push(id),
             Err(e) => break e,
         }
     };
     assert!(matches!(refused, Error::Full));
-    // 88 bytes a packet in 4096 bytes of ring, of which 8 are never used.
-    assert_eq!(sent.len(), (PAGE - 8) / 88);
-    assert_eq!(device.in_flight(), sent.len());
-    assert!(matches!(device.flush(DISK), Err(Error::Full)));
+    assert_eq!(sent.len(), 7);
+    assert_eq!(device.in_flight(), 7);
 
     // Nothing wakes the wait while the host reads nothing.
-    assert!(matches!(device.wait(), Err(Error::Channel(Down::Stuck))));
+    assert_eq!(device.wait(Some(0)).unwrap(), Wait::TimedOut);
 
     // The host reads again, and answers nothing yet: the signal that ends the wait is the
     // one the guest asked for, room in the ring.
-    assert!(matches!(device.flush(DISK), Err(Error::Full)));
+    assert!(matches!(
+        device.write(&disk, 0, count, &pages),
+        Err(Error::Full)
+    ));
     {
         let mut host = host.borrow_mut();
         host.stalled = false;
         host.hold = true;
     }
-    device.wait().unwrap();
+    assert_eq!(device.wait(None).unwrap(), Wait::Signalled);
     assert!(matches!(device.poll(), Ok(None)));
-    let id = device.flush(DISK).unwrap();
-    sent.push(id);
+    sent.push(device.write(&disk, 0, count, &pages).unwrap());
+    // Now the limit, not the ring, refuses the next one.
+    assert_eq!(device.in_flight(), 8);
+    assert!(matches!(device.flush(DISK), Err(Error::Full)));
 
-    // With room and nothing refused, a wait has nothing to return for.
-    assert!(matches!(device.wait(), Err(Error::Channel(Down::Stuck))));
+    // With nothing refused for want of room, a wait has nothing to return for.
+    assert_eq!(device.wait(Some(0)).unwrap(), Wait::TimedOut);
 
-    // Every flush is answered once the host lets its answers go, in the order sent.
+    // Every write is answered once the host lets its answers go, in the order sent. The
+    // wait finds them without sleeping: with no deadline, a sleep here would never end.
     host.borrow_mut().release();
-    let waits = wire.waits.get();
-    device.wait().unwrap();
-    assert_eq!(wire.waits.get(), waits, "a wait slept with packets to read");
+    let idles = host.borrow().idles;
+    assert_eq!(device.wait(None).unwrap(), Wait::Signalled);
+    assert_eq!(
+        host.borrow().idles,
+        idles,
+        "a wait slept with packets to read"
+    );
     for id in &sent {
-        assert_eq!(moved(&mut device, *id), 0);
+        assert_eq!(moved(&mut device, *id), count * disk.block_size());
     }
     assert!(matches!(device.poll(), Ok(None)));
     assert_eq!(device.in_flight(), 0);
-    assert_eq!(
-        host.borrow().disks[&(DISK.path, DISK.target, DISK.lun)].flushes,
-        sent.len()
-    );
 }
 
 #[test]
 fn a_wait_returns_at_once_when_a_packet_is_there() {
-    let (mut device, _, wire) = device();
+    let (mut device, host) = device();
     let id = device.flush(DISK).unwrap();
-    let waits = wire.waits.get();
-    device.wait().unwrap();
-    assert_eq!(wire.waits.get(), waits);
+    // The answer is in the ring and the host did not signal: the guest masks the signal
+    // between waits. A wait with no deadline that slept now would never end.
+    let idles = host.borrow().idles;
+    assert_eq!(device.wait(None).unwrap(), Wait::Signalled);
+    assert_eq!(host.borrow().idles, idles);
     assert_eq!(next(&mut device).id, id);
     // With nothing in flight and nothing to read, the wait is the channel's.
-    assert!(matches!(device.wait(), Err(Error::Channel(Down::Stuck))));
-    assert_eq!(wire.waits.get(), waits + 1);
+    assert_eq!(device.wait(Some(0)).unwrap(), Wait::TimedOut);
+    assert_eq!(host.borrow().idles, idles + 1);
 }
 
 #[test]
 fn a_closed_channel_is_an_error_to_the_caller() {
-    let (mut device, _, wire) = device();
-    wire.closed.set(true);
+    let (mut device, host) = device();
+    // The host takes the channel away; the guest learns of it at its next call on it.
+    host.borrow_mut().rescind = true;
+    assert!(matches!(
+        device.wait(Some(0)),
+        Err(Error::Channel(ChannelError::Closed))
+    ));
     // The request is in the ring, and the host cannot be told.
     assert!(matches!(
         device.flush(DISK),
-        Err(Error::Channel(Down::Closed))
+        Err(Error::Channel(ChannelError::Closed))
     ));
     assert_eq!(device.in_flight(), 0);
-    assert!(matches!(device.wait(), Err(Error::Channel(Down::Closed))));
+    assert!(matches!(
+        device.wait(None),
+        Err(Error::Channel(ChannelError::Closed))
+    ));
     // The device is not failed by it: the channel's owner decides what a closed channel
     // means.
     assert!(matches!(device.poll(), Ok(None)));
@@ -438,7 +467,7 @@ fn a_closed_channel_is_an_error_to_the_caller() {
 
 #[test]
 fn transaction_ids_are_never_zero_and_never_used_twice() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     let mut ids = Vec::new();
     for _ in 0..200 {
         let id = device.flush(DISK).unwrap();
@@ -513,8 +542,11 @@ fn a_serial_answer_is_checked() {
 
 #[test]
 fn every_error_says_what_it_is() {
-    let errors: Vec<(Error<Down>, &str)> = vec![
-        (Error::Channel(Down::Closed), "the channel failed: Closed"),
+    let errors: Vec<(Error, &str)> = vec![
+        (
+            Error::Channel(ChannelError::Closed),
+            "the channel failed: the channel is closed",
+        ),
         (
             Error::Ring(vmbus_ring::Error::InvalidRingPointer),
             "a ring is corrupt: invalid ring buffer pointer",

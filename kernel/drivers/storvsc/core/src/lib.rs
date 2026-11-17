@@ -19,7 +19,11 @@
 //! **The caller drives it.** There is no thread and no async runtime. A request returns its
 //! transaction ID at once; [`Storvsc::poll`] reads what the host has sent and reports each
 //! completion with that ID; [`Storvsc::wait`] sleeps until the host signals. Requests may be
-//! in flight together and complete in any order. There are no sub-channels.
+//! in flight together, as many as the ring holds of the largest ([`Storvsc::limit`]), and
+//! complete in any order. There are no sub-channels.
+//!
+//! The channel is `moruna-vmbus`'s [`Channel`]: a node's `vmbus` process gives one to the
+//! driver, and a host test uses `moruna_vmbus::testing::TestChannel`.
 //!
 //! **The host is untrusted input.** Every packet is bounded and checked before it is used: its
 //! type, its size, its operation, its transaction ID, and the byte count it claims. A
@@ -36,15 +40,14 @@
 
 extern crate alloc;
 
-pub mod channel;
 mod device;
 mod ring;
 pub mod scsi;
 
 use core::fmt;
 
-pub use channel::Channel;
 pub use device::{Completion, Event, Storvsc, VERSIONS};
+pub use moruna_vmbus::{Channel, ChannelError, Wait};
 pub use scsi::{Address, Disk, Failure, ScsiError, Sense, serial};
 pub use scsi_defs::{AdditionalSenseCode, ScsiStatus, SenseKey, srb::SrbStatus};
 pub use storvsp_protocol::{NtStatus, Operation};
@@ -62,13 +65,12 @@ impl fmt::Display for Malformed {
     }
 }
 
-/// Why a call could not be made, or what the host sent that cannot be used. `E` is the
-/// channel's own error.
+/// Why a call could not be made, or what the host sent that cannot be used.
 #[derive(Debug)]
-pub enum Error<E> {
+pub enum Error {
     /// The channel refused to signal or to wait. A request that meets it is in the ring but
     /// not in flight: if the host answers it anyway, the answer is an unknown transaction.
-    Channel(E),
+    Channel(ChannelError),
     /// A ring's control words or a packet's descriptor are corrupt. The device is unusable
     /// from here on.
     Ring(vmbus_ring::Error),
@@ -105,10 +107,10 @@ pub enum Error<E> {
     ShortBuffer,
 }
 
-impl<E: fmt::Debug> fmt::Display for Error<E> {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Channel(e) => write!(f, "the channel failed: {e:?}"),
+            Error::Channel(e) => write!(f, "the channel failed: {e}"),
             Error::Ring(e) => write!(f, "a ring is corrupt: {e}"),
             Error::Malformed(what) => write!(f, "the host sent {what}"),
             Error::Unexpected(operation) => {

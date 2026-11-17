@@ -9,11 +9,8 @@ mod io;
 
 use std::{cell::RefCell, rc::Rc};
 
-use fake::{DISK, Host, Link, Wire, pair};
-use moruna_storvsc::{Completion, Disk, Event, PAGE, Storvsc};
-
-/// The most requests in flight the tests allow, unless a test asks for another number.
-const LIMIT: usize = 32;
+use fake::{DISK, Host, Link, pair};
+use moruna_storvsc::{Completion, Disk, Event, PAGE, Storvsc, Wait};
 
 /// Polls until the initialisation finishes.
 fn ready(device: &mut Storvsc<Link>) {
@@ -21,17 +18,20 @@ fn ready(device: &mut Storvsc<Link>) {
         match device.poll().expect("the initialisation") {
             Some(Event::Ready) => return,
             Some(event) => panic!("{event:?} before the device was ready"),
-            None => device.wait().expect("the host's next step"),
+            None => assert_eq!(
+                device.wait(None).expect("the host's next step"),
+                Wait::Signalled
+            ),
         }
     }
 }
 
 /// A device that has finished its initialisation against the fake with its defaults.
-fn device() -> (Storvsc<Link>, Rc<RefCell<Host>>, Rc<Wire>) {
-    let (link, host, wire) = pair();
-    let mut device = Storvsc::new(link, LIMIT).unwrap();
+fn device() -> (Storvsc<Link>, Rc<RefCell<Host>>) {
+    let (link, host) = pair();
+    let mut device = Storvsc::new(link).unwrap();
     ready(&mut device);
-    (device, host, wire)
+    (device, host)
 }
 
 /// The next completion, which must be there.

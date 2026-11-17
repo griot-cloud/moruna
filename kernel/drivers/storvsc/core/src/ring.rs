@@ -10,11 +10,11 @@ use guestmem_core::{MemoryRead, MemoryWrite, ranges::PagedRange};
 use storvsp_protocol::{NtStatus, Operation, Packet, SCSI_REQUEST_LEN_MAX};
 use vmbus_ring::{
     IncomingOffset, IncomingPacketType, OutgoingOffset, OutgoingPacket, OutgoingPacketType,
-    PacketSize, ReadError, WriteError, gparange::GpaRange,
+    PacketSize, ReadError, Ring, RingMem, WriteError, gparange::GpaRange,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::{Channel, Error, Malformed};
+use crate::{Channel, Error, Malformed, Wait};
 
 /// Bytes of the header every storvsp packet starts with.
 pub(crate) const HEADER: usize = size_of::<Packet>();
@@ -103,6 +103,19 @@ impl Rings {
         by_ring.min(by_descriptor)
     }
 
+    /// The most requests in flight: as many as the ring to the host holds of the largest
+    /// request packet, which names `pages` pages, at least 1 and at most 256 (the PM's rule,
+    /// after Linux's storvsc). With no pages the largest request is the in-band one.
+    pub(crate) fn limit<C: Channel>(channel: &C, pages: usize) -> usize {
+        let largest = match pages {
+            0 => PacketSize::in_band(PACKET),
+            pages => {
+                PacketSize::in_band(PACKET) + size_of::<u64>() + size_of::<GpaRange>() + pages * 8
+            }
+        };
+        (channel.outgoing().mem().len() / largest).clamp(1, 256)
+    }
+
     /// Sends one packet that asks for a completion under `id`: `operation`, then `body`, zero
     /// padded (`storvsc:591-628`). With `data` it is a GPA direct packet naming those pages
     /// (`storvsc:563-588`); without, an in-band one (`storvsc:542-560`).
@@ -113,7 +126,7 @@ impl Rings {
         operation: Operation,
         body: &[u8],
         data: Option<PagedRange<'_>>,
-    ) -> Result<(), Error<C::Error>> {
+    ) -> Result<(), Error> {
         let header = Packet {
             operation,
             flags: 0,
@@ -153,7 +166,7 @@ impl Rings {
             ring.commit_write(&mut self.write)
         };
         if signal {
-            channel.signal().map_err(Error::Channel)?;
+            channel.signal_host().map_err(Error::Channel)?;
         }
         Ok(())
     }
@@ -162,7 +175,7 @@ impl Rings {
     pub(crate) fn receive<C: Channel>(
         &mut self,
         channel: &mut C,
-    ) -> Result<Option<Received>, Error<C::Error>> {
+    ) -> Result<Option<Received>, Error> {
         let (received, signal) = {
             let ring = channel.incoming();
             let mut next = self.read.clone();
@@ -188,17 +201,22 @@ impl Rings {
             (Received { kind, len, bytes }, signal)
         };
         if signal {
-            channel.signal().map_err(Error::Channel)?;
+            channel.signal_host().map_err(Error::Channel)?;
         }
         Ok(Some(received))
     }
 
-    /// Sleeps until the host signals, unless there is already something to do: a packet to
-    /// read, or room for the packet that was refused. The order is the ring's rule for not
-    /// missing a signal, as OpenVMM's `vmbus_async` keeps it
+    /// Sleeps until the host signals or `deadline` passes, unless there is already something
+    /// to do: a packet to read, or room for the packet that was refused. The order is the
+    /// ring's rule for not missing a signal, as OpenVMM's `vmbus_async` keeps it
     /// (`vm/devices/vmbus/vmbus_async/src/core.rs:109-147`, `:190-227`): ask for the signal
-    /// first, then look at the ring again, and only then sleep.
-    pub(crate) fn wait<C: Channel>(&mut self, channel: &mut C) -> Result<(), Error<C::Error>> {
+    /// first, then look at the ring again, and only then sleep. A channel's incoming ring
+    /// starts with the host's signal masked, so the first wait is the first unmasking.
+    pub(crate) fn wait<C: Channel>(
+        &mut self,
+        channel: &mut C,
+        deadline: Option<u64>,
+    ) -> Result<Wait, Error> {
         let ready = {
             let incoming = channel.incoming();
             incoming.set_interrupt_mask(false);
@@ -214,7 +232,11 @@ impl Rings {
             }
             ready
         };
-        let waited = if ready { Ok(()) } else { channel.wait() };
+        let waited = if ready {
+            Ok(Wait::Signalled)
+        } else {
+            channel.wait(deadline)
+        };
         // Back to polling: the host need not signal while this side is reading and writing.
         channel.incoming().set_interrupt_mask(true);
         if self.wanted != 0 {

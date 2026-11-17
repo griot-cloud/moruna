@@ -7,6 +7,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The channel a driver talks through (system design 1F).
+moruna-vmbus = { path = "../../vmbus/core", version = "=0.1.0" }
 # Microsoft's wire types and ring buffer, vendored (kernel/vendor/openvmm/README.md).
 storvsp_protocol = { path = "../../../vendor/openvmm/storvsp_protocol", version = "=0.0.0" }
 scsi_defs = { path = "../../../vendor/openvmm/scsi_defs", version = "=0.0.0" }
@@ -15,3 +17,7 @@ vmbus_ring = { path = "../../../vendor/openvmm/vmbus_ring", version = "=0.0.0" }
 guestmem_core = { path = "../../../vendor/openvmm/guestmem_core", version = "=0.0.0" }
 # The byte views of the wire types, at the version the vendored crates pin.
 zerocopy = { version = "=0.8.63", features = ["derive"] }
+
+[dev-dependencies]
+# The in-memory channel the tests' fake storvsp sits behind.
+moruna-vmbus = { path = "../../vmbus/core", version = "=0.1.0", features = ["testing"] }

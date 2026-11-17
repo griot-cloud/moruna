@@ -1,20 +1,26 @@
-//! A fake storvsp: the host's side of storvsc over a pair of rings in memory, its disks byte
-//! vectors, strict about the order of the initialisation and the size and content of every
-//! packet the guest sends. It follows OpenVMM's `storvsp` (`vm/devices/storage/storvsp`) and
-//! its `scsidisk` for what a host answers, and panics when the guest breaks the protocol, so
-//! that a test fails where the fault is.
+//! A fake storvsp: the host's side of storvsc, the [`Device`] behind `moruna-vmbus`'s in-memory
+//! [`TestChannel`], its disks byte vectors, strict about the order of the initialisation and
+//! the size and content of every packet the guest sends. It follows OpenVMM's `storvsp`
+//! (`vm/devices/storage/storvsp`) and its `scsidisk` for what a host answers, and panics when
+//! the guest breaks the protocol, so that a test fails where the fault is.
 //!
-//! Beside it: the guest memory its disks read and write by page number, the in-memory
-//! [`Channel`] that joins it to the library, and a small fixed-seed random number generator.
+//! It reads what the guest sends when the channel calls it, as a host would. It writes its
+//! answers through a second writer on the same ring, so that a test can also deliver them,
+//! or packets of its own, between the library's calls: `TestChannel` reaches its host only
+//! from inside those calls, and the library owns the channel.
+//!
+//! Beside it: the guest memory its disks read and write by page number, and a small
+//! fixed-seed random number generator.
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::{BTreeMap, VecDeque},
     rc::Rc,
 };
 
-use guestmem_core::{MemoryRead, MemoryWrite, ranges::PagedRange};
-use moruna_storvsc::{Address, Channel, PAGE};
+use guestmem_core::{MemoryWrite, ranges::PagedRange};
+use moruna_storvsc::{Address, PAGE};
+use moruna_vmbus::testing::{Device, Host as Vmbus, TestChannel};
 use scsi_defs::{
     AdditionalSenseCode, Cdb10, Cdb16, CdbInquiry, DIRECT_ACCESS_DEVICE, ReadCapacity16Data,
     ReadCapacityDataEx, SERVICE_ACTION_READ_CAPACITY16, ScsiOp, ScsiStatus, SenseData, SenseKey,
@@ -28,9 +34,8 @@ use storvsp_protocol::{
     VERSION_WIN8,
 };
 use vmbus_ring::{
-    FlatRingMem, IncomingOffset, IncomingPacketType, IncomingRing, OutgoingOffset, OutgoingPacket,
-    OutgoingPacketType, OutgoingRing, ReadError, TransferPageRange, WriteError,
-    gparange::MultiPagedRangeBuf,
+    FlatRingMem, IncomingPacketType, OutgoingPacket, OutgoingPacketType, OutgoingRing, Ring,
+    TransferPageRange, WriteError, gparange::MultiPagedRangeBuf,
 };
 use zerocopy::{FromBytes, FromZeros, IntoBytes};
 
@@ -209,17 +214,21 @@ impl ScsiResult {
     }
 }
 
-/// The fake storvsp.
+/// The channel's two rings as the fake sees them.
+struct Rings {
+    /// The ring the guest writes.
+    to_host: FlatRingMem,
+    /// The ring the guest reads.
+    to_guest: FlatRingMem,
+    /// The fake's writer on the ring the guest reads.
+    writer: OutgoingRing<FlatRingMem>,
+}
+
+/// The fake storvsp's state, shared by the [`Fake`] device and the test.
 pub struct Host {
-    incoming: IncomingRing<FlatRingMem>,
-    outgoing: OutgoingRing<FlatRingMem>,
-    read: IncomingOffset,
-    write: OutgoingOffset,
-    /// The ring the guest writes, for tests that corrupt it.
-    pub to_host: FlatRingMem,
-    /// The ring the guest reads, for tests that corrupt it.
-    pub to_guest: FlatRingMem,
-    signalled: bool,
+    rings: Option<Rings>,
+    /// Set when a write wants the guest told; the device tells it on its next call.
+    signal: bool,
     phase: Phase,
     answers: VecDeque<Answer>,
 
@@ -244,12 +253,29 @@ pub struct Host {
     pub offered: Vec<u16>,
     /// The version agreed.
     pub version: Option<u16>,
+
+    /// Times the guest signalled, and times it waited with nothing to wake it.
+    pub signals: usize,
+    pub idles: usize,
+    /// Set to take the channel away, as a rescind does, at the device's next call.
+    pub rescind: bool,
 }
 
 impl Host {
-    /// Whether the host has signalled the guest since this was last asked.
-    pub fn take_signal(&mut self) -> bool {
-        std::mem::take(&mut self.signalled)
+    fn rings(&self) -> &Rings {
+        self.rings
+            .as_ref()
+            .expect("the fake's rings are set up with the channel")
+    }
+
+    /// The ring the guest writes, for tests that corrupt it.
+    pub fn to_host(&self) -> &FlatRingMem {
+        &self.rings().to_host
+    }
+
+    /// The ring the guest reads, for tests that corrupt it.
+    pub fn to_guest(&self) -> &FlatRingMem {
+        &self.rings().to_guest
     }
 
     /// Completions made and not yet sent.
@@ -271,22 +297,22 @@ impl Host {
         self.send_answers();
     }
 
-    /// Reads everything the guest has sent and answers it.
-    pub fn run(&mut self) {
+    /// Reads everything the guest has sent through the channel, and answers it.
+    fn serve(&mut self, vmbus: &mut Vmbus) {
         if self.stalled {
             return;
         }
         loop {
-            let mut next = self.read.clone();
-            let packet = match self.incoming.read(&mut next) {
-                Ok(packet) => packet,
-                Err(ReadError::Empty) => break,
-                Err(ReadError::Corrupt(e)) => panic!("fake storvsp: the guest's ring: {e}"),
+            let received = match vmbus.read() {
+                Ok(Some(received)) => received,
+                Ok(None) => break,
+                Err(e) => panic!("fake storvsp: the guest's ring: {e}"),
             };
+            let packet = received.packet;
             let id = packet
                 .transaction_id
                 .expect("fake storvsp: a packet that asks for no completion");
-            let payload = packet.payload.reader(&self.incoming).read_all().unwrap();
+            let payload = received.payload;
             assert_eq!(payload.len(), PACKET, "fake storvsp: the packet's size");
             let header = Packet::read_from_prefix(&payload).unwrap().0;
             assert_eq!(header.flags, 0, "fake storvsp: the packet's flags");
@@ -294,12 +320,10 @@ impl Host {
             let body: [u8; SCSI_REQUEST_LEN_MAX] = payload[HEADER..].try_into().unwrap();
             let ranges = match packet.typ {
                 IncomingPacketType::InBand => None,
-                IncomingPacketType::GpaDirect(count, range) => {
-                    let mut words = vec![0u64; range.len() / 8];
-                    range
-                        .reader(&self.incoming)
-                        .read(words.as_mut_bytes())
-                        .unwrap();
+                IncomingPacketType::GpaDirect(count, _) => {
+                    let (words, rest) = received.ranges.as_chunks::<8>();
+                    assert!(rest.is_empty(), "fake storvsp: page ranges in whole words");
+                    let words = words.iter().map(|word| u64::from_le_bytes(*word)).collect();
                     Some(
                         MultiPagedRangeBuf::from_range_buffer(count as usize, words)
                             .expect("fake storvsp: the packet's page ranges"),
@@ -307,10 +331,6 @@ impl Host {
                 }
                 other => panic!("fake storvsp: a packet of type {other:?}"),
             };
-            self.read = next;
-            if self.incoming.commit_read(&mut self.read) {
-                self.signalled = true;
-            }
             self.seen.push((header.operation, id));
             match header.operation {
                 Operation::EXECUTE_SRB => self.execute(id, &body, ranges),
@@ -662,26 +682,26 @@ impl Host {
 
     /// Writes one packet into the ring to the guest. False when the ring has no room.
     fn put(&mut self, typ: OutgoingPacketType<'_>, id: u64, payload: &[u8]) -> bool {
-        let mut next = self.write.clone();
+        let writer = &self.rings().writer;
+        let mut offset = writer.outgoing().unwrap();
         let packet = OutgoingPacket {
             transaction_id: id,
             size: payload.len(),
             typ,
         };
-        match self.outgoing.write(&mut next, &packet) {
+        match writer.write(&mut offset, &packet) {
             Ok(range) => {
-                range.writer(&self.outgoing).write(payload).unwrap();
-                self.write = next;
-                self.outgoing.set_pending_send_size(0).unwrap();
-                if self.outgoing.commit_write(&mut self.write) {
-                    self.signalled = true;
+                range.writer(writer).write(payload).unwrap();
+                writer.set_pending_send_size(0).unwrap();
+                if writer.commit_write(&mut offset) {
+                    self.signal = true;
                 }
                 true
             }
             // As a host does: ask the guest for a signal once it has read enough to make
             // room, and send the rest then.
             Err(WriteError::Full(size)) => {
-                self.outgoing.set_pending_send_size(size).unwrap();
+                writer.set_pending_send_size(size).unwrap();
                 false
             }
             Err(WriteError::Corrupt(e)) => panic!("fake storvsp: the ring to the guest: {e}"),
@@ -740,80 +760,38 @@ fn nt_status(srb: SrbStatus) -> NtStatus {
     }
 }
 
-/// Why the in-memory channel refused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Down {
-    /// The test closed it.
-    Closed,
-    /// A wait that nothing would ever end: the host has nothing more to say.
-    Stuck,
-}
+/// The device on the far end of the [`TestChannel`]: it runs the fake storvsp whenever the
+/// guest signals or is about to wait.
+pub struct Fake(Rc<RefCell<Host>>);
 
-/// What a test can see and change of the channel while the library holds it.
-#[derive(Default)]
-pub struct Wire {
-    /// Signals the guest sent.
-    pub signals: Cell<usize>,
-    /// Times the guest slept.
-    pub waits: Cell<usize>,
-    /// Set to close the channel.
-    pub closed: Cell<bool>,
-}
-
-/// The guest's end of a channel in memory, with the fake storvsp on the other: a signal
-/// runs the fake at once, and a wait runs it and returns if it signalled.
-pub struct Link {
-    incoming: IncomingRing<FlatRingMem>,
-    outgoing: OutgoingRing<FlatRingMem>,
-    host: Rc<RefCell<Host>>,
-    wire: Rc<Wire>,
-}
-
-impl Channel for Link {
-    type Memory = FlatRingMem;
-    type Shared = ();
-    type Gpadl = ();
-    type Error = Down;
-
-    fn incoming(&self) -> &IncomingRing<FlatRingMem> {
-        &self.incoming
-    }
-
-    fn outgoing(&self) -> &OutgoingRing<FlatRingMem> {
-        &self.outgoing
-    }
-
-    fn signal(&mut self) -> Result<(), Down> {
-        if self.wire.closed.get() {
-            return Err(Down::Closed);
+impl Fake {
+    fn serve(&self, vmbus: &mut Vmbus) {
+        let mut host = self.0.borrow_mut();
+        if host.rescind {
+            vmbus.rescind();
+            return;
         }
-        self.wire.signals.set(self.wire.signals.get() + 1);
-        self.host.borrow_mut().run();
-        Ok(())
-    }
-
-    fn wait(&mut self) -> Result<(), Down> {
-        if self.wire.closed.get() {
-            return Err(Down::Closed);
-        }
-        // A guest that sleeps with the host's signal masked is never woken.
-        self.incoming
-            .verify_interrupts_unmasked()
-            .expect("a wait with the host's signal masked");
-        self.wire.waits.set(self.wire.waits.get() + 1);
-        let mut host = self.host.borrow_mut();
-        host.run();
-        if host.take_signal() {
-            Ok(())
-        } else {
-            Err(Down::Stuck)
+        host.serve(vmbus);
+        if std::mem::take(&mut host.signal) {
+            vmbus.signal_driver();
         }
     }
+}
 
-    fn share(&mut self, (): ()) -> Result<(), Down> {
-        panic!("storvsc shares no memory with the host")
+impl Device for Fake {
+    fn signalled(&mut self, vmbus: &mut Vmbus) {
+        self.0.borrow_mut().signals += 1;
+        self.serve(vmbus);
+    }
+
+    fn idle(&mut self, vmbus: &mut Vmbus) {
+        self.0.borrow_mut().idles += 1;
+        self.serve(vmbus);
     }
 }
+
+/// The channel the library gets in the tests.
+pub type Link = TestChannel<Fake>;
 
 /// The address of the disk every test starts with.
 pub const DISK: Address = Address {
@@ -824,27 +802,15 @@ pub const DISK: Address = Address {
 
 /// A channel of two rings of `ring` bytes each, and the fake storvsp on its far end with
 /// one disk at [`DISK`]: 512-byte blocks, 2048 of them.
-pub fn pair_sized(ring: usize) -> (Link, Rc<RefCell<Host>>, Rc<Wire>) {
-    let to_host = FlatRingMem::new(ring);
-    let to_guest = FlatRingMem::new(ring);
-    let incoming = IncomingRing::new(to_host.clone()).unwrap();
-    // The host sleeps between packets, so the guest signals each time the ring fills
-    // from empty.
-    incoming.set_interrupt_mask(false);
-    let outgoing = OutgoingRing::new(to_guest.clone()).unwrap();
+pub fn pair_sized(ring: usize) -> (Link, Rc<RefCell<Host>>) {
     let mut disks = BTreeMap::new();
     disks.insert(
         (DISK.path, DISK.target, DISK.lun),
         FakeDisk::new(512, 2048, b"6002248042d1c9a3"),
     );
     let host = Rc::new(RefCell::new(Host {
-        read: incoming.incoming().unwrap(),
-        write: outgoing.outgoing().unwrap(),
-        incoming,
-        outgoing,
-        to_host: to_host.clone(),
-        to_guest: to_guest.clone(),
-        signalled: false,
+        rings: None,
+        signal: false,
         phase: Phase::Begin,
         answers: VecDeque::new(),
         memory: Memory::new(256),
@@ -860,17 +826,22 @@ pub fn pair_sized(ring: usize) -> (Link, Rc<RefCell<Host>>, Rc<Wire>) {
         seen: Vec::new(),
         offered: Vec::new(),
         version: None,
+        signals: 0,
+        idles: 0,
+        rescind: false,
     }));
-    let wire = Rc::new(Wire::default());
-    let link = Link {
-        incoming: IncomingRing::new(to_guest).unwrap(),
-        outgoing: OutgoingRing::new(to_host).unwrap(),
-        host: host.clone(),
-        wire: wire.clone(),
-    };
-    (link, host, wire)
+    let mut link = TestChannel::new(ring, ring, Fake(host.clone())).unwrap();
+    let to_host = link.host().incoming().mem().clone();
+    let to_guest = link.host().outgoing().mem().clone();
+    let writer = OutgoingRing::new(to_guest.clone()).unwrap();
+    host.borrow_mut().rings = Some(Rings {
+        to_host,
+        to_guest,
+        writer,
+    });
+    (link, host)
 }
 
-pub fn pair() -> (Link, Rc<RefCell<Host>>, Rc<Wire>) {
+pub fn pair() -> (Link, Rc<RefCell<Host>>) {
     pair_sized(RING)
 }

@@ -2,11 +2,11 @@
 //! not completions, packets it has no business sending, and rings it has scribbled on. Each
 //! is an error to the caller, and none of them a panic.
 
-use std::sync::atomic::Ordering;
+use std::{cell::RefCell, rc::Rc, sync::atomic::Ordering};
 
 use moruna_storvsc::{
-    AdditionalSenseCode, Address, Error, Event, Failure, Malformed, NtStatus, Operation, PAGE,
-    ScsiError, ScsiStatus, Sense, SenseKey, SrbStatus, Storvsc,
+    AdditionalSenseCode, Address, Disk, Error, Event, Failure, Malformed, NtStatus, Operation,
+    PAGE, ScsiError, ScsiStatus, Sense, SenseKey, SrbStatus, Storvsc,
 };
 use scsi_defs::SenseData;
 use vmbus_ring::RingMem;
@@ -27,14 +27,14 @@ fn failure(device: &mut Storvsc<Link>, id: u64) -> Failure {
 /// Once a ring is corrupt every call answers `Failed`.
 fn assert_failed(device: &mut Storvsc<Link>) {
     assert!(matches!(device.poll(), Err(Error::Failed)));
-    assert!(matches!(device.wait(), Err(Error::Failed)));
+    assert!(matches!(device.wait(None), Err(Error::Failed)));
     assert!(matches!(device.flush(DISK), Err(Error::Failed)));
     assert!(matches!(device.read_serial(DISK, 1), Err(Error::Failed)));
 }
 
 #[test]
 fn a_scsi_error_is_surfaced_with_its_sense_data() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     let disk = disk(&mut device, &host, 0);
     host.borrow_mut().faults.push_back(Fault::Scsi {
         srb: SrbStatus::ERROR,
@@ -67,7 +67,7 @@ fn a_scsi_error_is_surfaced_with_its_sense_data() {
 
 #[test]
 fn a_disk_that_is_not_there_is_a_scsi_error() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     let nowhere = Address {
         path: 0,
         target: 0,
@@ -90,7 +90,7 @@ fn a_disk_that_is_not_there_is_a_scsi_error() {
 
 #[test]
 fn a_disk_with_no_serial_is_a_scsi_error() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     host.borrow_mut()
         .disks
         .get_mut(&(DISK.path, DISK.target, DISK.lun))
@@ -115,7 +115,7 @@ fn a_disk_with_no_serial_is_a_scsi_error() {
 
 #[test]
 fn a_range_the_host_refuses_is_a_scsi_error() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     let disk = disk(&mut device, &host, 0);
     // The disk shrinks under a guest that still believes the capacity it read.
     host.borrow_mut()
@@ -148,7 +148,7 @@ fn a_range_the_host_refuses_is_a_scsi_error() {
 
 #[test]
 fn sense_data_is_read_in_either_format_and_only_when_marked_valid() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     let scsi = |device: &mut Storvsc<Link>, id| match failure(device, id) {
         Failure::Scsi(error) => error,
         other => panic!("{other:?}"),
@@ -203,7 +203,7 @@ fn sense_data_is_read_in_either_format_and_only_when_marked_valid() {
 
 #[test]
 fn a_status_that_is_not_success_fails_the_request() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     for status in [
         NtStatus::IO_TIMEOUT,
         NtStatus::DEVICE_BUSY,
@@ -243,7 +243,7 @@ fn a_status_that_is_not_success_fails_the_request() {
 
 #[test]
 fn a_completion_for_an_unknown_transaction_is_an_error_and_the_device_goes_on() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     let packet = Host::packet(Operation::COMPLETE_IO, NtStatus::SUCCESS, &[]);
     for id in [0, 1, 5, 6, 7, u64::MAX] {
         assert!(host.borrow_mut().inject(Raw::Completion, id, &packet));
@@ -268,7 +268,7 @@ fn a_completion_for_an_unknown_transaction_is_an_error_and_the_device_goes_on() 
 
 #[test]
 fn a_completion_sent_twice_completes_once() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     host.borrow_mut().faults.push_back(Fault::Twice);
     let id = device.flush(DISK).unwrap();
     assert_eq!(moved(&mut device, id), 0);
@@ -284,7 +284,7 @@ fn a_completion_sent_twice_completes_once() {
 
 #[test]
 fn a_completion_of_the_wrong_size_fails_its_request() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     for size in [0, 8, 16, PACKET - 16, PACKET - 8, PACKET + 8, 3 * PACKET] {
         host.borrow_mut().faults.push_back(Fault::Size(size));
         let id = device.flush(DISK).unwrap();
@@ -300,7 +300,7 @@ fn a_completion_of_the_wrong_size_fails_its_request() {
 
 #[test]
 fn a_completion_that_is_not_marked_as_one_fails_its_request() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     for operation in [
         Operation::EXECUTE_SRB,
         Operation::ENUMERATE_BUS,
@@ -322,7 +322,7 @@ fn a_completion_that_is_not_marked_as_one_fails_its_request() {
 
 #[test]
 fn a_completion_that_moved_the_wrong_number_of_bytes_fails_its_request() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     let disk = disk(&mut device, &host, 0);
 
     // More than was asked for: no host moves that.
@@ -367,7 +367,7 @@ fn a_completion_that_moved_the_wrong_number_of_bytes_fails_its_request() {
 
 #[test]
 fn the_hosts_own_packets_are_ignored_or_refused() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     let notice = Host::packet(Operation::ENUMERATE_BUS, NtStatus::SUCCESS, &[]);
 
     // The bus-changed notice asks nothing: it is read and dropped, whatever its length
@@ -434,29 +434,40 @@ fn a_corrupt_ring_pointer_ends_the_device() {
     // The host's write pointer in the ring the guest reads: not a multiple of 8, and
     // past the ring's end.
     for pointer in [4, 12, 4 * PAGE as u32, u32::MAX] {
-        let (mut device, host, _) = device();
-        host.borrow().to_guest.control()[0].store(pointer, Ordering::Relaxed);
+        let (mut device, host) = device();
+        host.borrow().to_guest().control()[0].store(pointer, Ordering::Relaxed);
         assert!(matches!(device.poll(), Err(Error::Ring(_))), "{pointer}");
         assert_failed(&mut device);
     }
     // The same, found by a wait.
-    let (mut device, host, _) = device();
-    host.borrow().to_guest.control()[0].store(1, Ordering::Relaxed);
-    assert!(matches!(device.wait(), Err(Error::Ring(_))));
+    let (mut device, host) = device();
+    host.borrow().to_guest().control()[0].store(1, Ordering::Relaxed);
+    assert!(matches!(device.wait(None), Err(Error::Ring(_))));
     assert_failed(&mut device);
+}
+
+/// A device on a ring of one page with transfers of 51 pages, so that its largest requests
+/// fill the ring before they reach the limit (7 of them fit, and the limit is 8), the disk
+/// it reads, and the pages a largest request names.
+fn small_ring() -> (Storvsc<Link>, Rc<RefCell<Host>>, Disk, u32, Vec<u64>) {
+    let (link, host) = pair_sized(PAGE);
+    host.borrow_mut().max_transfer_bytes = 51 * PAGE as u32;
+    let mut device = Storvsc::new(link).unwrap();
+    ready(&mut device);
+    let disk = disk(&mut device, &host, 0);
+    let count = device.max_transfer_bytes() / disk.block_size();
+    (device, host, disk, count, (1..=51).collect())
 }
 
 #[test]
 fn a_corrupt_read_pointer_in_the_ring_to_the_host_ends_the_device() {
-    let (link, host, _) = pair_sized(PAGE);
-    let mut device = Storvsc::new(link, 10_000).unwrap();
-    ready(&mut device);
+    let (mut device, host, disk, count, pages) = small_ring();
     // The host stops reading and scribbles on its own read pointer. The guest looks at
     // that pointer when the ring seems full.
     host.borrow_mut().stalled = true;
-    host.borrow().to_host.control()[1].store(5, Ordering::Relaxed);
+    host.borrow().to_host().control()[1].store(5, Ordering::Relaxed);
     let error = loop {
-        match device.flush(DISK) {
+        match device.write(&disk, 0, count, &pages) {
             Ok(_) => {}
             Err(e) => break e,
         }
@@ -467,21 +478,23 @@ fn a_corrupt_read_pointer_in_the_ring_to_the_host_ends_the_device() {
 
 #[test]
 fn a_corrupt_read_pointer_found_while_waiting_for_room_ends_the_device() {
-    let (link, host, _) = pair_sized(PAGE);
-    let mut device = Storvsc::new(link, 10_000).unwrap();
-    ready(&mut device);
+    let (mut device, host, disk, count, pages) = small_ring();
     host.borrow_mut().stalled = true;
-    while device.flush(DISK).is_ok() {}
-    assert!(matches!(device.flush(DISK), Err(Error::Full)));
-    host.borrow().to_host.control()[1].store(PAGE as u32, Ordering::Relaxed);
-    assert!(matches!(device.wait(), Err(Error::Ring(_))));
+    while device.write(&disk, 0, count, &pages).is_ok() {}
+    assert!(matches!(
+        device.write(&disk, 0, count, &pages),
+        Err(Error::Full)
+    ));
+    assert!(device.in_flight() < device.limit());
+    host.borrow().to_host().control()[1].store(PAGE as u32, Ordering::Relaxed);
+    assert!(matches!(device.wait(None), Err(Error::Ring(_))));
     assert_failed(&mut device);
 }
 
 /// Writes a packet's descriptor straight into the ring the guest reads, and moves the
 /// host's write pointer past it: what a host that ignores the ring's rules can do.
 fn scribble(host: &Host, descriptor: [u16; 4], after: &[u8]) {
-    let ring = &host.to_guest;
+    let ring = host.to_guest();
     let at = ring.control()[0].load(Ordering::Relaxed) as usize;
     let mut bytes = Vec::new();
     for field in descriptor {
@@ -516,7 +529,7 @@ fn a_corrupt_packet_descriptor_ends_the_device() {
         ([9, 3, 11, 1], &[0; 72], "a page-range packet with no range"),
     ];
     for (descriptor, after, what) in cases {
-        let (mut device, host, _) = device();
+        let (mut device, host) = device();
         scribble(&host.borrow(), descriptor, after);
         assert!(matches!(device.poll(), Err(Error::Ring(_))), "{what}");
         assert_failed(&mut device);
@@ -524,7 +537,7 @@ fn a_corrupt_packet_descriptor_ends_the_device() {
 
     // A packet that says it is no bigger than its descriptor is not corrupt, only empty,
     // and too short to be anything.
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     scribble(&host.borrow(), [6, 2, 2, 0], &[]);
     assert!(matches!(device.poll(), Err(Error::Malformed(_))));
     assert!(matches!(device.poll(), Ok(None)));
@@ -532,7 +545,7 @@ fn a_corrupt_packet_descriptor_ends_the_device() {
 
 #[test]
 fn completions_come_in_the_hosts_order_and_events_carry_their_ids() {
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     host.borrow_mut().hold = true;
     let ids: Vec<u64> = (0..4).map(|_| device.flush(DISK).unwrap()).collect();
     host.borrow_mut().release();

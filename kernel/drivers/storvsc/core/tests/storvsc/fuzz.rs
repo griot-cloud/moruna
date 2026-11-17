@@ -11,7 +11,7 @@ use vmbus_ring::RingMem;
 use zerocopy::{FromZeros, IntoBytes};
 
 use crate::{
-    LIMIT, device, disk,
+    device, disk,
     fake::{DISK, Host, Link, PACKET, Raw, Rng, pair},
     moved, pattern,
 };
@@ -135,8 +135,9 @@ fn submit(device: &mut Storvsc<Link>, disk: &Disk, rng: &mut Rng, in_flight: &mu
 #[test]
 fn ten_thousand_random_host_packets_with_requests_in_flight() {
     let mut rng = Rng::new(0x0001_010a_5eed);
-    let (mut device, host, _) = device();
+    let (mut device, host) = device();
     let disk = disk(&mut device, &host, 0);
+    let limit = device.limit();
     let mut in_flight = BTreeSet::new();
     let mut seen = Seen::default();
     let mut sent = 0;
@@ -145,7 +146,7 @@ fn ten_thousand_random_host_packets_with_requests_in_flight() {
     // flight first, and let go now and then.
     host.borrow_mut().hold = true;
     while sent < 10_000 {
-        if in_flight.len() < LIMIT / 2 || rng.below(4) == 0 {
+        if in_flight.len() < limit / 2 || rng.below(4) == 0 {
             submit(&mut device, &disk, &mut rng, &mut in_flight);
         }
         if rng.below(50) == 0 {
@@ -172,7 +173,7 @@ fn ten_thousand_random_host_packets_with_requests_in_flight() {
         if rng.below(3) != 0 {
             drain(&mut device, &mut in_flight, &mut seen);
         }
-        assert!(device.in_flight() <= LIMIT);
+        assert!(device.in_flight() <= limit);
     }
 
     // Every kind of answer was reached, so the run tested what it claims to.
@@ -205,10 +206,10 @@ fn random_host_packets_during_the_initialisation() {
     let mut rng = Rng::new(0x0002_010a_5eed);
     let (mut ready, mut failed) = (0, 0);
     for _ in 0..2_000 {
-        let (link, host, _) = pair();
+        let (link, host) = pair();
         // The fake reads nothing, so every answer the guest gets is noise.
         host.borrow_mut().stalled = true;
-        let mut device = Storvsc::new(link, LIMIT).unwrap();
+        let mut device = Storvsc::new(link).unwrap();
         for _ in 0..1 + rng.below(3) {
             let kind = KINDS[rng.below(KINDS.len() as u64) as usize];
             // The first step's transaction is 1; aim at it half the time.
@@ -231,7 +232,7 @@ fn random_host_packets_during_the_initialisation() {
         // Whatever came of it, the device answers and does not panic.
         let _ = device.flush(DISK);
         let _ = device.read_capacity(DISK, 1);
-        let _ = device.wait();
+        let _ = device.wait(Some(0));
         assert_eq!(device.in_flight(), 0);
     }
     // Noise that is the right answer to the first step moves the guest to the second, and
@@ -245,17 +246,18 @@ fn random_scribbles_on_the_rings() {
     let mut rng = Rng::new(0x0003_010a_5eed);
     let mut failed = 0;
     for _ in 0..500 {
-        let (mut device, host, _) = device();
+        let (mut device, host) = device();
         let disk = disk(&mut device, &host, 0);
+        let limit = device.limit();
         // The fake reads and writes nothing more: from here the rings are the test's.
         host.borrow_mut().stalled = true;
         for _ in 0..40 {
             {
                 let host = host.borrow();
                 let ring = if rng.below(2) == 0 {
-                    &host.to_guest
+                    host.to_guest()
                 } else {
-                    &host.to_host
+                    host.to_host()
                 };
                 match rng.below(3) {
                     // A control word: the pointers, the mask, the pending size, the
@@ -285,7 +287,7 @@ fn random_scribbles_on_the_rings() {
             let page = 1 + rng.below(200);
             let outcome = match rng.below(6) {
                 0 => device.poll().map(drop),
-                1 => device.wait(),
+                1 => device.wait(Some(0)).map(drop),
                 2 => device.flush(DISK).map(drop),
                 3 => device.read(&disk, rng.below(2000), 1, &[page]).map(drop),
                 4 => device.write(&disk, rng.below(2000), 8, &[page]).map(drop),
@@ -295,7 +297,7 @@ fn random_scribbles_on_the_rings() {
                 failed += 1;
                 break;
             }
-            assert!(device.in_flight() <= LIMIT);
+            assert!(device.in_flight() <= limit);
         }
     }
     // A scribbled ring is found out, nearly every time.
