@@ -329,6 +329,10 @@ pub(crate) fn admissible(shared: &Shared, stage_ix: usize, worker: u16) -> bool 
         return true;
     };
     let slots = pool.slots.lock().unwrap_or_else(|e| e.into_inner());
+    // stream P: a kernel that deals its instances takes any free one.
+    if shared.stages[stage_ix].kernel.deals_instances() {
+        return slots.iter().any(|slot| !slot.in_use);
+    }
     slots
         .iter()
         .any(|slot| !slot.in_use && (slot.owner == Some(worker) || borrowable(shared, slot.owner)))
@@ -347,18 +351,35 @@ pub(crate) fn acquire(shared: &Shared, stage_ix: usize, worker: u16) -> Result<O
         return Ok(None);
     };
     let mut slots = pool.slots.lock().unwrap_or_else(|e| e.into_inner());
+    // stream P: a kernel that deals its instances gets the next free one after the last dealt,
+    // so one worker keeps every instance busy (an image's task processes).
+    let dealt = if shared.stages[stage_ix].kernel.deals_instances() {
+        let from = pool.dealt.load(Ordering::Relaxed);
+        let n = slots.len();
+        let next = (0..n).map(|k| (from + k) % n).find(|&at| !slots[at].in_use);
+        if let Some(at) = next {
+            pool.dealt.store(at + 1, Ordering::Relaxed);
+        }
+        Some(next)
+    } else {
+        None
+    };
     // f.4: prefer the instance this worker last held; else one whose home cannot come for it.
     let mine = slots
         .iter()
         .position(|slot| !slot.in_use && slot.owner == Some(worker));
-    let chosen = match mine {
-        Some(index) => index,
-        None => match slots
-            .iter()
-            .position(|slot| !slot.in_use && borrowable(shared, slot.owner))
-        {
+    let chosen = match (dealt, mine) {
+        (Some(Some(index)), _) => index,
+        (Some(None), _) => return Ok(None),
+        (None, mine) => match mine {
             Some(index) => index,
-            None => return Ok(None),
+            None => match slots
+                .iter()
+                .position(|slot| !slot.in_use && borrowable(shared, slot.owner))
+            {
+                Some(index) => index,
+                None => return Ok(None),
+            },
         },
     };
     let Some(slot) = slots.get_mut(chosen) else {

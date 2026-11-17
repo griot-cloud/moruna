@@ -33,3 +33,7 @@ moruna-pci = { path = "../../kernel/drivers/pci", version = "=0.1.0" }
 moruna-virtio = { path = "../../kernel/drivers/virtio", version = "=0.1.0" }
 
 imagefs-protocol = { workspace = true }
+
+# stream P: the plane's rings layout, which a test checks the ring sizes against on any host.
+[dev-dependencies]
+moruna-plane = { workspace = true }

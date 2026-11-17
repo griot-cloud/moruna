@@ -134,14 +134,54 @@ pub struct RingSizes {
 /// The least region and window: a record of a small batch and its framing.
 pub const RING_MIN: u64 = 1 << 20;
 
-/// [`RingSizes`] for a plane of `budget` bytes, in whole pages.
+/// The largest memory object the kernel makes (`moruna_abi::limits::MEMORY_MAX_BYTES`): a
+/// task's region is one, and its rings object, every window and the rings' pages, is another.
+pub const OBJECT_MAX: u64 = 256 << 20;
+
+/// What a rings object holds before its windows, at most: its header and its rings' entries
+/// (`moruna_plane::ring::Geometry::windows_at`, a few pages for two windows).
+pub const RINGS_HEAD_MAX: u64 = 1 << 20;
+
+/// [`RingSizes`] for a plane of `budget` bytes, in whole pages. Whatever the budget, the region
+/// and the rings object are each one object the kernel makes: the windows are bounded so the
+/// rings object, its head included, is at most [`OBJECT_MAX`]. Two windows of an eighth of a
+/// 1 GiB budget were 256 MiB with the head past it, and the kernel refused the object
+/// (`Kernel(Limit)` opening the task's plane, the NYC gate at 8 GiB and more, 2026-11-17).
 pub fn ring_sizes(budget: u64) -> RingSizes {
+    const WINDOWS: u64 = 2;
     let quarter = (budget / 4) & !(PAGE - 1);
     let eighth = (budget / 8) & !(PAGE - 1);
+    let window_max = ((OBJECT_MAX - RINGS_HEAD_MAX) / WINDOWS) & !(PAGE - 1);
     RingSizes {
-        region: quarter.clamp(RING_MIN, WINDOW_MAX),
-        windows: 2,
-        window: eighth.clamp(RING_MIN, WINDOW_MAX),
+        region: quarter.clamp(RING_MIN, WINDOW_MAX.min(OBJECT_MAX)),
+        windows: WINDOWS,
+        window: eighth.clamp(RING_MIN, window_max),
+    }
+}
+
+/// A stage's cleanup of its task's account (SB-I9): the task's `process` handle, for a native
+/// task the stage started itself, is released first, since the process it names (its address
+/// space, its image) is charged to the account; then `usage` (bytes used and reserved, `None`
+/// when the account is gone) is read until both are zero, for at most `wait`. Holding the
+/// handle while waiting made every native task's account look busy for the whole wait: eight
+/// tasks held a finished run 40 s (the NYC gate, 2026-11-17).
+pub fn retire<P>(
+    process: Option<P>,
+    mut usage: impl FnMut() -> Result<Option<(u64, u64)>, String>,
+    wait: std::time::Duration,
+) -> Result<(), String> {
+    drop(process);
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match usage()? {
+            Some((0, 0)) => return Ok(()),
+            None => return Err("original Account observer disappeared before retirement".into()),
+            Some(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("actual child Account did not retire within bounded cleanup".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
@@ -380,7 +420,7 @@ mod tests {
             RingSizes {
                 region: 256 * MIB,
                 windows: 2,
-                window: 128 * MIB
+                window: (255 * MIB / 2) & !(PAGE - 1),
             }
         );
         assert!(s.region + 2 * s.windows * s.window <= 1 << 30);
@@ -388,6 +428,88 @@ mod tests {
         assert_eq!((small.region, small.window), (RING_MIN, RING_MIN));
         assert_eq!(ring_sizes(16 * MIB + 5).region % PAGE, 0);
         assert_eq!(ring_sizes(u64::MAX).region, WINDOW_MAX);
+    }
+
+    #[test]
+    fn p_a_task_s_objects_fit_the_kernel_s_largest_at_any_budget() {
+        const MIB: u64 = 1 << 20;
+        // From the least plane to far past any node, and around where the gate was refused.
+        let budgets = (0..=46).map(|shift| 1u64 << shift).chain([
+            1020 * MIB,
+            1 << 30,
+            (1 << 30) + PAGE,
+            3 << 30,
+            20_992 * MIB,
+            u64::MAX,
+        ]);
+        for budget in budgets {
+            let s = ring_sizes(budget);
+            assert!(s.region <= OBJECT_MAX, "region at {budget}: {s:?}");
+            assert!(
+                s.windows * s.window + RINGS_HEAD_MAX <= OBJECT_MAX,
+                "rings object at {budget}: {s:?}"
+            );
+            assert!(s.window >= RING_MIN && s.region >= RING_MIN);
+            assert_eq!((s.region % PAGE, s.window % PAGE), (0, 0));
+        }
+    }
+
+    #[test]
+    fn p_a_native_task_s_process_goes_before_its_account_is_asked_to_retire() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        // The process handle: while it lives, its process is charged to the account.
+        struct Handle(Arc<AtomicBool>);
+        impl Drop for Handle {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let gone = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&gone);
+        let usage = move || {
+            Ok(Some(if seen.load(Ordering::SeqCst) {
+                (0, 0)
+            } else {
+                (8 << 20, 0)
+            }))
+        };
+        let started = Instant::now();
+        retire(
+            Some(Handle(Arc::clone(&gone))),
+            usage,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "retired at once, not at the bound: {:?}",
+            started.elapsed()
+        );
+        // A task of the personality has no handle here; its account is read as it is.
+        retire(None::<Handle>, || Ok(Some((0, 0))), Duration::ZERO).unwrap();
+    }
+
+    #[test]
+    fn p_an_account_that_does_not_retire_or_is_gone_is_said() {
+        use std::time::{Duration, Instant};
+        let started = Instant::now();
+        let busy = retire(
+            None::<()>,
+            || Ok(Some((4096, 4096))),
+            Duration::from_millis(20),
+        );
+        assert!(busy.unwrap_err().contains("did not retire"));
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        let gone = retire(None::<()>, || Ok(None), Duration::from_secs(5));
+        assert!(gone.unwrap_err().contains("disappeared"));
+        let unread = retire(
+            None::<()>,
+            || Err("actual Account read: BadHandle".into()),
+            Duration::from_secs(5),
+        );
+        assert_eq!(unread.unwrap_err(), "actual Account read: BadHandle");
     }
 
     #[test]
