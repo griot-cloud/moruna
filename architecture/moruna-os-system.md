@@ -84,7 +84,8 @@ Implements the OS design, section 1, OpenStack column.
 - **`boot_ms`** counts from the core's first instruction to ready. Firmware and GRUB time is
   measured from outside, at bring-up, as create-to-ready.
 - **Limits:** services started within 5 s; an address within 30 s; instance data within 90 s.
-- **Failure:** one line, `moruna: fatal <stage>: <reason>`, then the machine powers off. A node
+- **Failure:** one line, `moruna: fatal <stage>: <reason>`, then the machine powers off. The stage
+  is `core`, or the name of the service that can't go on, unless this document names another. A node
   never hangs silently, never restarts itself in a loop, and never offers a prompt. A service that
   dies stops the node (SDD 33), except `api`, which is restarted (2B).
 - **Power-off is ACPI S5 on every machine:** SLP_TYPa from the DSDT's `\_S5` object (found by
@@ -92,7 +93,8 @@ Implements the OS design, section 1, OpenStack column.
   written with SLP_EN to the FADT's PM1a control register. OSTD today powers off only through
   QEMU's test exit device, which no cloud has. That device stays for CI's exit codes alone.
 - **No wait without a deadline in boot code.** OSTD's PIT calibration waits forever on a machine
-  with no PIT. Every such wait gets a deadline and, when it passes, a `fatal` line.
+  with no PIT. Every such wait gets a deadline and, when it passes, a `fatal` line: the PIT and APIC
+  timer calibrations, and the wait for the other CPUs to start.
 
 ### 1C. Network
 
