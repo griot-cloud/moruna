@@ -60,6 +60,24 @@ def sizes(job_memory, scratch, node_memory=None):
     return node_memory, job_memory, account, scratch, admission
 
 
+def kit_layers(build, stack_list):
+    """The kit's layer disks the node attaches below a stack, from the stack's own list: the
+    device of its lowest layer (`layer blockN ...`, `moruna-layer stack`'s FIRST) is how many
+    disks come before it. A stack from block0 is attached alone (an image of its own, as the
+    gate's, `--image-stack`); one from block2 has the kit's two image filesystem fixtures below
+    it (`layers/layer-1.img` and `layer-2.img`, the kit's own `node-linux`), which no job reads."""
+    fixtures = [build / "layers/layer-1.img", build / "layers/layer-2.img"]
+    for line in stack_list.read_text().splitlines():
+        words = line.split()
+        if len(words) >= 2 and words[0] == "layer":
+            first = words[1].removeprefix("block")
+            if first in ("0", "2"):
+                return fixtures[:int(first)]
+            raise ValueError(f"{stack_list}: the lowest layer is on {words[1]}; a node puts it on block0, "
+                             "or on block2 above the kit's two fixtures")
+    raise ValueError(f"{stack_list}: no layer")
+
+
 def place(source, destination):
     """`source` at `destination`: a hard link where the file system allows one, else a copy."""
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -177,7 +195,10 @@ def main():
     command([build / "moruna-storage-provision", "plan", "--output", out / "home.root", "--capacity", 64 * MIB,
              "--alignment", 4096, "--log-bytes", MIB, "--role", "single-node-home", "--workspace", "moruna-ci", "--bucket", "jobs"])
     command([build / "moruna-storage-provision", "format", "--image", home, "--root", out / "home.root"])
-    layers = [build / "layers/layer-1.img", build / "layers/layer-2.img"]
+    try:
+        layers = kit_layers(build, linux / "stack.layers")
+    except ValueError as error:
+        parser.error(str(error))
     index = 1
     while (linux / f"stack-{index}.img").is_file():
         layers.append(linux / f"stack-{index}.img")
