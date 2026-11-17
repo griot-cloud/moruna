@@ -1575,11 +1575,11 @@ impl TaskState {
     /// Ring mode: `batch` goes to the task in pieces of at most its plane's piece, queued and
     /// posted as the task has room ([`layout::IN_FLIGHT`] in flight), and the stage answers
     /// with every answer it has taken meanwhile, joined, the oldest first. It waits for an
-    /// answer only for the task's first (whose schema stands for the rest) and when the task is
-    /// more than [`layout::QUEUED_MAX`] pieces behind; with no answer come it answers with a
-    /// batch of no rows, and the answers come with a later batch, or at the stage's end. A
-    /// morsel's pieces past what the task holds wait in its queue, not the worker, so one
-    /// engine worker keeps every task of the stage busy.
+    /// answer only for the task's first (whose schema stands for the rest) and to make room for
+    /// pieces still queued, since it returns with none queued ([`layout::QUEUED_MAX`]); with
+    /// no answer come it answers with a batch of no rows, and the answers come with a later
+    /// batch, or at the stage's end. A morsel of [`layout::IN_FLIGHT`] pieces is posted at
+    /// once, so one engine worker keeps every task of the stage busy.
     fn pipelined(
         &mut self,
         batch: &moruna_kernel::arrow::record_batch::RecordBatch,
@@ -1615,7 +1615,8 @@ impl TaskState {
                 came = true;
             }
             self.feed(ports, names)?;
-            // A task far behind its share holds the worker until it has worked some off.
+            // Nothing stays queued past this unit: a queued piece holds its morsel's memory,
+            // and under memory pressure no unit may come to post it ([`layout::QUEUED_MAX`]).
             if layout::holds_worker(self.queued.len()) {
                 taken.push(self.take_oldest(ports, names)?);
                 self.feed(ports, names)?;
@@ -1623,6 +1624,7 @@ impl TaskState {
                 break;
             }
         }
+        debug_assert!(self.queued.is_empty(), "a unit left pieces queued");
         match taken.len() {
             0 => {
                 let schema = self.schema.clone().ok_or_else(|| {
