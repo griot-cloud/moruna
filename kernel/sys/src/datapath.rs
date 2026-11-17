@@ -109,6 +109,13 @@ impl ClockPage {
         self.address
     }
 
+    /// The page [`ClockPage::map`] mapped at `address` (item 5.0: std's clock keeps the address,
+    /// not the page).
+    #[cfg(all(feature = "rt", not(test)))]
+    pub(crate) fn at(address: u64) -> ClockPage {
+        ClockPage { address }
+    }
+
     /// The page's fields, read under its sequence.
     pub fn reading(&self) -> ClockReading {
         // SAFETY: the kernel mapped the whole page readable at `address`, aligned to a

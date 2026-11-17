@@ -23,7 +23,7 @@
 // attribute a program needs; the macro carries it so the program can forbid unsafe code.
 #![cfg_attr(target_os = "none", expect(internal_features))]
 
-#[cfg(feature = "heap")]
+#[cfg(any(feature = "heap", test))]
 extern crate alloc;
 
 pub mod datapath;
@@ -34,6 +34,9 @@ pub mod plane;
 mod private_memory;
 pub use private_memory::PrivateMemory;
 pub mod raw;
+// Item 5.0: the runtime of Rust's std on Moruna (feature `rt`), and its host tests.
+#[cfg(any(feature = "rt", test))]
+pub mod rt;
 pub mod start;
 
 #[cfg(target_os = "none")]
