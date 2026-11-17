@@ -310,6 +310,7 @@ fn evidence(cfg: &Config, label: &str, dir: &Path) -> Result<Evidence, String> {
     let log = String::from_utf8_lossy(&read(&dir.join("serial.log"))?).into_owned();
     let decoded = dump::decode(&log);
     let programs = dump::programs(&decoded.dumps).map_err(|e| format!("{label}: {e}"))?;
+    let programs = named(programs, &kit_index(&cfg.kit)?).map_err(|e| format!("{label}: {e}"))?;
     for (name, program) in &programs {
         let binary = read(&cfg.kit.join("node-user-bins").join(name))?;
         let elf = Elf::parse(&binary).map_err(|e| format!("{label}: {name}: {e}"))?;
@@ -337,6 +338,56 @@ fn evidence(cfg: &Config, label: &str, dir: &Path) -> Result<Evidence, String> {
         dumps: decoded.dumps.len(),
         broken: decoded.broken,
     })
+}
+
+/// The kit's programs by their fingerprint (`dump::fingerprint`): a dump names its build that
+/// way, not by a name. Two programs of one fingerprint are both named, joined by `|`.
+pub fn kit_index(kit: &Path) -> Result<BTreeMap<String, String>, String> {
+    let bins = kit.join("node-user-bins");
+    let mut index: BTreeMap<String, String> = BTreeMap::new();
+    let mut names: Vec<String> = fs::read_dir(&bins)
+        .map_err(|e| format!("{}: {e}", bins.display()))?
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    names.sort();
+    for name in names {
+        let Ok(bytes) = fs::read(bins.join(&name)) else {
+            continue;
+        };
+        let Some(print) = Elf::parse(&bytes)
+            .ok()
+            .and_then(|e| profraw::fingerprint(&e))
+        else {
+            continue;
+        };
+        index
+            .entry(print)
+            .and_modify(|n| {
+                n.push('|');
+                n.push_str(&name);
+            })
+            .or_insert(name);
+    }
+    Ok(index)
+}
+
+/// Programs keyed by fingerprint, keyed and named by the kit's program instead.
+pub fn named(
+    programs: BTreeMap<String, dump::Program>,
+    index: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, dump::Program>, String> {
+    let mut out = BTreeMap::new();
+    for (print, mut program) in programs {
+        let name = index
+            .get(&print)
+            .ok_or_else(|| format!("dumps of a program not in the kit (build {print})"))?;
+        if name.contains('|') {
+            return Err(format!("dumps of build {print}, which is each of {name}"));
+        }
+        program.program.clone_from(name);
+        out.insert(name.clone(), program);
+    }
+    Ok(out)
 }
 
 /// The binary a profile belongs to.
@@ -964,7 +1015,7 @@ pub fn build(cfg: &Config, tools: &dyn Tools) -> Result<Report, String> {
             tools.export(&binary(cfg, name, job_dir), &indexed)?,
         );
     }
-    let programs = dump::programs(&all_dumps)?;
+    let programs = named(dump::programs(&all_dumps)?, &kit_index(&cfg.kit)?)?;
     report.all = scope(
         "all jobs", &exports, &image, &programs, &all_linux, &sources,
     );

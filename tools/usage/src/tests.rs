@@ -80,6 +80,9 @@ fn put(path: &Path, bytes: &[u8]) {
 /// A program or kernel ELF with `counters` 8-byte counters at `addr`, and these functions.
 fn binary(addr: u64, counters: usize, functions: &[(&str, u64)]) -> Vec<u8> {
     let cnts = vec![0u8; counters * 8];
+    // The first function's name hash: the address, so each program's fingerprint differs.
+    let mut data = [0u8; 64];
+    data[..8].copy_from_slice(&addr.to_le_bytes());
     let symbols: Vec<(&str, u64, u64, u8)> = functions
         .iter()
         .enumerate()
@@ -98,7 +101,7 @@ fn binary(addr: u64, counters: usize, functions: &[(&str, u64)]) -> Vec<u8> {
                 name: "__llvm_prf_data",
                 kind: 1,
                 addr: addr + 0x10_0000,
-                bytes: &[0; 64],
+                bytes: &data,
                 size: 0,
             },
             Sec {
@@ -363,7 +366,7 @@ fn fixture(name: &str) -> (PathBuf, report::Config) {
     put(&job.join("kernel.cnts"), &[1u8; 48]);
     let mut log = String::from("kk: boot\n");
     let header = Header {
-        program: "linux",
+        program: "40.000000000057a010",
         process: "linux",
         instance: 7,
         seq: 0,
@@ -520,13 +523,52 @@ fn evidence_from_another_build_or_tree_is_refused() {
     let fake = Fake {
         merges: RefCell::new(Vec::new()),
     };
-    // The kit's Linux server has another counter layout than the dumps.
+    // The kit's Linux server is another build: no program in the kit has the dumps'
+    // fingerprint.
     put(
         &cfg.kit.join("node-user-bins/linux"),
         &binary(0x57_b000, 4, &[]),
     );
     let err = report::build(&cfg, &fake).unwrap_err();
+    assert!(err.contains("not in the kit"), "{err}");
+    // Its fingerprint, but another counter layout.
+    let mut data = [0u8; 64];
+    data[..8].copy_from_slice(&0x57_a010u64.to_le_bytes());
+    let other = elf(
+        &[
+            Sec {
+                name: "__llvm_prf_data",
+                kind: 1,
+                addr: 0x70_0000,
+                bytes: &data,
+                size: 0,
+            },
+            Sec {
+                name: "__llvm_prf_cnts",
+                kind: 1,
+                addr: 0x57_b000,
+                bytes: &[0; 32],
+                size: 0,
+            },
+            Sec {
+                name: "__llvm_prf_names",
+                kind: 1,
+                addr: 0x80_0000,
+                bytes: b"n",
+                size: 0,
+            },
+        ],
+        &[],
+        0,
+    );
+    put(&cfg.kit.join("node-user-bins/linux"), &other);
+    let err = report::build(&cfg, &fake).unwrap_err();
     assert!(err.contains("not of the kit's build"), "{err}");
+    // Two programs of one build cannot be told apart.
+    put(&cfg.kit.join("node-user-bins/linux-copy"), &other);
+    let err = report::build(&cfg, &fake).unwrap_err();
+    assert!(err.contains("each of linux|linux-copy"), "{err}");
+    fs::remove_file(cfg.kit.join("node-user-bins/linux-copy")).unwrap();
     // The kernel's counters are not the kernel's size.
     put(&cfg.runs[0].1.join("kernel.cnts"), &[0u8; 8]);
     assert!(report::build(&cfg, &fake).unwrap_err().contains("kernel"));

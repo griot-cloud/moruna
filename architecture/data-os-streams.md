@@ -619,8 +619,16 @@ and switches to the new one when the call answers.
     `-C instrument-coverage -Zno-profiler-runtime -Cllvm-args=-instrprof-atomic-counter-update-all`
     and the features `usage` (kernel boot) and `moruna-sys/usage` (every user program). The host
     side is `moruna` built with `moruna-runtime/usage`, which keeps the evidence in
-    `MORUNA_USAGE_DIR`. Unset, every command is what it was, and the kernel and all user
-    programs build byte for byte as before (checked on the Mac). The timed gate never sets it.
+    `MORUNA_USAGE_DIR`. Unset, every command is what it was. Checked on the Mac against
+    `9a34ba31`: the kernel ELF, 55 of the 57 user programs and `moruna-vmm`'s binaries are the
+    same files byte for byte; `storage` and `storage-maintenance` load the same bytes (every
+    loadable segment) and differ only in the `.llvm.<hash>` suffixes of 89 local symbol names,
+    which LLVM hashes from the module and which any edit to `kernel/sys/src/raw.rs` changes, a
+    comment at its end included. So no behaviour changes. The timed gate never sets it.
+  - **Hooks move no line.** A panic's location is compiled into the program, so a hook goes at
+    the end of a file or on an existing line: `raw.rs` declares `usage.rs` and holds the `wait`
+    and `process_exit` hooks; `lib.rs` is untouched; `RunningNode::shutdown` calls
+    `usage_hook!`, which outside the usage build is its first argument.
   - **Coverage, not counters.** Per-call counts are the region counts of the dispatchers' match
     arms: `syscall.rs` `dispatch` (native calls), `foreign.rs` `fast_call` (Linux calls answered
     in kernel mode) and `kernel/linux/server` `call`. Counters update atomically, so counts are
@@ -632,16 +640,19 @@ and switches to the new one when the call answers.
     the kernel's `__llvm_prf_cnts` (its physical address from the kernel ELF's segments). The
     raw profile (format 10) is rebuilt on the host from the ELF's data and names sections and
     those counters (`kernel/usage`). Kernel mode gains one static symbol, in the usage build only.
-  - **User programs print their own counters.** `moruna_sys::usage` prints the counters, sparse
+  - **User programs print their own counters.** `moruna_sys::raw::usage` prints them, sparse
     and checked by a hash, on the console the program already holds: one second after it goes
     idle having handled something, when busy and its last dump is five seconds old, and at exit.
     Its waits answer as before. A dump goes out only in the usage build, through the serial log
     the host already keeps: no new path from a task to the host, no shell, nothing the host
     sends in. Tasks (the gate's native tasks, Linux programs) are not instrumented.
   - **Per process.** The kernel's counts are global. Each program's native calls come from the
-    coverage of moruna-sys's wrappers in its own profile, and each dump names its program and
-    process. Linux refusals per process come from the server's end-of-process line, which B2's
-    personality keeps.
+    coverage of moruna-sys's wrappers in its own profile. A dump names its process, and its
+    build by a fingerprint (the size and first record of its `__llvm_prf_data`), which the
+    report matches to the kit's program. Linux refusals per process come from the server's
+    end-of-process line, which B2's personality keeps.
+  - **Not instrumented:** `moruna-engine` (the job's runtime, a musl Linux program, not an OS
+    service) and the gate's native tasks. Their native calls are in the kernel's counts.
   - **B2 carries over** by adding its dispatcher to the report's `DISPATCHES` table
     (`tools/usage/src/report.rs`); as a program on moruna-sys it dumps as the server does.
   - **The report** (`tools/usage`, `moruna-usage report`, Rust, its own workspace) merges each
