@@ -228,3 +228,71 @@ fn damaged_records_are_errors_not_panics() {
     }
     assert!(Job::by_name("nope").is_none());
 }
+
+/// An answer bigger than a window, written part by part into small windows: the parts, read
+/// back and joined, are the one-record answer, row for row and bit for bit.
+#[test]
+fn parts_rebuild_the_answer() {
+    use moruna_gate_record::parts::{Carry, Wrote, apply_part};
+    // Each window a few pages more than one row's record (a page a buffer, and the framing).
+    let cases = [
+        ("enrich", "inputs/nyc/main.arrow", 160),
+        ("occupancy", "inputs/nyc/main.arrow", 160),
+        ("score", "inputs/nyc/main.arrow", 40),
+        ("fw_minhash", "inputs/fineweb/main.arrow", 64),
+        ("ov_attrs", "inputs/overture/main.arrow", 72),
+        ("ov_shape", "inputs/overture/main.arrow", 100),
+    ];
+    for (name, input, kib) in cases {
+        let job = Job::by_name(name).unwrap();
+        let batch = read_ipc(&fixtures().join(input));
+        let (buf, len) = record_of(&batch);
+        let record = &bytemuck::cast_slice::<u64, u8>(&buf)[..len];
+        let mut big = aligned(len * 8 + (1 << 22));
+        let whole = {
+            let w: &mut [u8] = bytemuck::cast_slice_mut(&mut big);
+            let n = apply(job, record, w).unwrap();
+            read_record(&w[..n])
+        };
+        let mut window = aligned(kib << 10);
+        let mut carry = Carry::new();
+        let mut parts = Vec::new();
+        for part in 0.. {
+            let w: &mut [u8] = bytemuck::cast_slice_mut(&mut window);
+            let wrote = apply_part(job, record, w, part, &mut carry)
+                .unwrap_or_else(|e| panic!("{name} part {part}: {e}"));
+            let (n, last) = match wrote {
+                Wrote::Last(n) => (n, true),
+                Wrote::More(n) => (n, false),
+            };
+            parts.push(read_record(&w[..n]));
+            assert_eq!(carry.pending(), !last);
+            if last {
+                break;
+            }
+        }
+        assert!(parts.len() > 1, "{name}: one part");
+        let joined = arrow::compute::concat_batches(&whole.schema(), &parts).unwrap();
+        assert_eq!(joined.num_rows(), whole.num_rows(), "{name}");
+        for i in 0..whole.num_columns() {
+            same(
+                joined.column(i).as_ref(),
+                whole.column(i).as_ref(),
+                &format!("{name}: column {i}"),
+            );
+        }
+        eprintln!("{name}: {} rows in {} parts", whole.num_rows(), parts.len());
+    }
+    // A later part with nothing carried, and a window too small for one row, are errors.
+    let mut carry = Carry::new();
+    let mut tiny = aligned(4096);
+    let w: &mut [u8] = bytemuck::cast_slice_mut(&mut tiny);
+    let input = read_ipc(&fixtures().join("inputs/nyc/main.arrow"));
+    let (buf, len) = record_of(&input);
+    let record = &bytemuck::cast_slice::<u64, u8>(&buf)[..len];
+    assert!(apply_part(Job::Audit, record, w, 1, &mut carry).is_err());
+    assert!(matches!(
+        apply_part(Job::Audit, record, w, 0, &mut carry),
+        Err(Error::WindowTooSmall { .. })
+    ));
+}

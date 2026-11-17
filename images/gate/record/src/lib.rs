@@ -21,6 +21,7 @@ pub mod encode;
 pub mod fb;
 pub mod large;
 pub mod nyc;
+pub mod parts;
 pub mod types;
 
 use alloc::format;
@@ -111,16 +112,21 @@ impl Job {
 /// leaves no record.
 pub fn apply(job: Job, input: &[u8], window: &mut [u8]) -> Result<usize, Error> {
     let batch = decode::Batch::read(input)?;
-    let out = match job {
-        Job::Enrich => nyc::enrich(&batch)?,
-        Job::Audit => nyc::audit(&batch)?,
-        Job::Occupancy => nyc::occupancy(&batch)?,
-        Job::Score => nyc::score(&batch)?,
-        Job::FwMinhash => large::fw_minhash(&batch)?,
-        Job::OvShape => large::ov_shape(&batch)?,
-        Job::OvAttrs => large::ov_attrs(&batch)?,
-    };
+    let out = compute(job, &batch)?;
     encode::write(&out.fields, &out.columns, out.rows, window)
+}
+
+/// `job`'s output for a record read.
+pub fn compute<'a>(job: Job, batch: &decode::Batch<'a>) -> Result<Output<'a>, Error> {
+    match job {
+        Job::Enrich => nyc::enrich(batch),
+        Job::Audit => nyc::audit(batch),
+        Job::Occupancy => nyc::occupancy(batch),
+        Job::Score => nyc::score(batch),
+        Job::FwMinhash => large::fw_minhash(batch),
+        Job::OvShape => large::ov_shape(batch),
+        Job::OvAttrs => large::ov_attrs(batch),
+    }
 }
 
 /// A function's output: its fields and columns.

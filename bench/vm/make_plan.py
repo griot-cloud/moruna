@@ -277,8 +277,11 @@ elif mode == "gate-nyc":
     # the second argument: d8 (D8ds_v6) first, then d4 (D4ls_v5).
     import gate_plan
     machine = sys.argv[2] if len(sys.argv) > 2 else "d8"
-    plan = gate_plan.nyc(Y2024, machine, with_066_rust="--no-066-rust" not in sys.argv)
-    mode = f"gate-nyc-{machine}"
+    # --core: groups 1, 2, 3 and 5 first, with the noise pairs; --rest: group 4 after.
+    groups = (1, 2, 3, 5) if "--core" in sys.argv else (4,) if "--rest" in sys.argv else (1, 2, 3, 4, 5)
+    plan = gate_plan.nyc(Y2024, machine, with_066_rust="--no-066-rust" not in sys.argv, groups=groups,
+                         noise="--rest" not in sys.argv)
+    mode = f"gate-nyc-{machine}" + ("-core" if "--core" in sys.argv else "-rest" if "--rest" in sys.argv else "")
 elif mode == "gate-ooc":
     # The large jobs, once per build: Overture and FineWeb as rerun7 downloaded them.
     import gate_plan

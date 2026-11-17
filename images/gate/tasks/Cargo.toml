@@ -14,7 +14,7 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-moruna-sys = { path = "../../../kernel/sys", features = ["heap"] }
+moruna-sys = { path = "../../../kernel/sys", features = ["heap", "log"] }
 moruna-gate-record = { path = "../record" }
 
 [profile.dev]

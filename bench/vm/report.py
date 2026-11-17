@@ -86,6 +86,8 @@ def rows_for(recs, machine, workload):
             "peak_gib": med([r["cg_peak_bytes"] / (1 << 30) for r in ok]),
             "oom": sum(r.get("oom_kills", 0) for r in runs),
             "boot_s": med([r.get("boot_s") for r in ok]),
+            "vm": {k: med([(r.get("vm") or {}).get(k) for r in ok])
+                   for k in ("boot_s", "stage_s", "job_s", "outputs_s", "total_s")},
             "split": {k: med([s.get(k) for s in splits]) for k in
                       ("read_decode_s", "function_s", "encode_write_s", "wait_s")},
             "output": match(ok[0], ref, workload) if ok else "no run passed",
@@ -99,34 +101,42 @@ def fmt(x, nd=1):
 
 
 def speedups(table):
+    """0.7 against every other row. Brackly's bar (2026-11-17): PASS when 0.7's median wall is at
+    least 1.5 times faster than the best other row's and its CPU-seconds are no more than any
+    row's; a miss names where 0.7's time goes."""
     vm = table.get("moruna-vm")
-    lines = []
     if not vm or vm["wall_s"] is None:
         return ["0.7 (moruna-vm) has no measured run."]
-
-    def best(group):
-        rows = [(r["wall_s"], e, r) for e, r in table.items() if r["group"] == group and r["wall_s"]]
-        return min(rows, key=lambda x: x[0]) if rows else None
-
-    for group, name in ((2, "the plain Rust pool"), (5, "native expressions"), (3, "0.6.6"), (4, "the Python engines")):
-        b = best(group)
-        if not b:
-            continue
-        x = b[0] / vm["wall_s"]
-        line = f"- against {name} (best: {b[1]}, {b[0]:.1f} s): {x:.2f}x"
-        if group == 2:
-            cpu_ok = vm["cpu_s"] is not None and b[2]["cpu_s"] is not None and vm["cpu_s"] <= b[2]["cpu_s"]
-            met = x >= TARGET and cpu_ok
-            line += (f"; the PM's target ({TARGET}x, CPU-seconds no worse: {vm['cpu_s']} against "
-                     f"{b[2]['cpu_s']}) is {'met' if met else 'NOT met'}")
-            if not met:
-                gap = []
-                if x < TARGET:
-                    gap.append(f"wall {x:.2f}x of {TARGET}x")
-                if not cpu_ok:
-                    gap.append("CPU-seconds higher")
-                line += f" (gap: {', '.join(gap)})"
-        lines.append(line)
+    others = {e: r for e, r in table.items() if not e.startswith("moruna-vm") and r["wall_s"]}
+    lines = []
+    for group, name in ((2, "the plain Rust pool"), (5, "native expressions"), (3, "0.6.6"),
+                        (4, "the Python engines")):
+        rows = [(r["wall_s"], e) for e, r in others.items() if r["group"] == group]
+        if rows:
+            w, e = min(rows)
+            lines.append(f"- against {name} (best: {e}, {w:.1f} s): {w / vm['wall_s']:.2f}x")
+    if not others:
+        return lines
+    best_wall, best = min((r["wall_s"], e) for e, r in others.items())
+    least_cpu, cheapest = min((r["cpu_s"], e) for e, r in others.items() if r["cpu_s"] is not None)
+    x = best_wall / vm["wall_s"]
+    cpu_ok = vm["cpu_s"] is not None and vm["cpu_s"] <= least_cpu
+    passed = x >= TARGET and cpu_ok
+    verdict = "PASS" if passed else "MISS"
+    lines.append(f"- **{verdict}**: {x:.2f}x the best row's wall ({best}, {best_wall:.1f} s; the bar is "
+                 f"{TARGET}x), CPU {vm['cpu_s']} s against the least of any row ({cheapest}, {least_cpu} s)")
+    if not passed:
+        s, v = vm["split"], vm.get("vm") or {}
+        parts = {"read and decode": s.get("read_decode_s"), "the function": s.get("function_s"),
+                 "encode and write": s.get("encode_write_s"), "waits": s.get("wait_s"),
+                 "boot": v.get("boot_s"), "staging": v.get("stage_s"), "outputs": v.get("outputs_s")}
+        known = {k: x for k, x in parts.items() if x}
+        job = v.get("job_s")
+        where = ", ".join(f"{k} {x:.1f} s" for k, x in sorted(known.items(), key=lambda kv: -kv[1]))
+        lines.append(f"  - where 0.7's time goes: {where or 'no split'}; the VM's job {job} s of "
+                     f"its total {v.get('total_s')} s; the wall {vm['wall_s']:.1f} s")
+        if known:
+            lines.append(f"  - the stage that loses most: {max(known, key=known.get)}")
     return lines
 
 
