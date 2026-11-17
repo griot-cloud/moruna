@@ -255,6 +255,47 @@ fn is_empty(secrets: &Secrets) -> bool {
     secrets.0.is_empty()
 }
 
+/// What a check on a channel reads (`moruna check-job --listen`, system design 3A): one line,
+/// the document as `spec` carries it, and the names of the secrets the job comes with, never
+/// their values.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CheckRequest {
+    /// The one message.
+    Check {
+        /// The document: version 1 as JSON, version 2's FlatBuffers as standard base64.
+        spec: serde_json::Value,
+        /// The names of the job's secrets.
+        #[serde(default)]
+        secrets: Vec<String>,
+    },
+}
+
+/// One refusal of a checked document: its field and a sentence that says what to change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckRefusal {
+    /// The field, as a path from the document's root.
+    pub field: String,
+    /// What is wrong with it.
+    pub message: String,
+}
+
+/// What a check on a channel answers, one line, before it exits.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CheckAnswer {
+    /// The one answer.
+    Checked {
+        /// Whether the document would run: no refusal.
+        ok: bool,
+        /// Every refusal, by field.
+        refusals: Vec<CheckRefusal>,
+        /// The budget the job runs with, in bytes: the document's, or on a node, when it names
+        /// none, the most the node allows. `None` when neither is known.
+        memory_bytes: Option<u64>,
+    },
+}
+
 impl Inbound {
     /// Read one line. An unreadable line is an `Err` with the reason, which the session notes
     /// and otherwise ignores.

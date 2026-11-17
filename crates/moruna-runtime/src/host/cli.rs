@@ -8,9 +8,13 @@ use std::time::Duration;
 
 use moruna_kernel::CancelToken;
 
+use moruna_job::Job;
+
 use super::events::EventOptions;
+use super::node::Node;
+use super::protocol::{CheckAnswer, CheckRefusal, CheckRequest};
 use super::session::{self, HEARTBEAT, HostOptions, Outcome};
-use super::transport::Address;
+use super::transport::{self, Address, Conn};
 use super::{VERSION, exit};
 use crate::job::build::process_env;
 use crate::kinds::Registry;
@@ -20,9 +24,10 @@ use crate::packaged::PackageHost;
 pub const USAGE: &str = "usage: moruna run <spec.json> [--arg NAME=VALUE]... [--resolver MODULE:ATTRIBUTE] [--plan <plan.mplan>] [--strict] [--events-json] [--cost-store <dir>] [--cost-model <name>] [--sandbox-python <path>] [--sandbox-cgroup <dir>] [--kinds <kinds.json>]...
        moruna run <spec.json> --output <dir> [--report <file>] [--input NAME=URL]... [--memory-gib N | --memory BYTES] [--scratch-gib N] [--node-kit <dir>] [--image-stack <dir>] [--launch-witness <dir>] [--vcpu-cpus <list>]
        moruna run --vm <spec.json> [--image <node-image.json>] [the options above]
-       moruna serve --listen <unix:///path | vsock://CID:PORT | channel:SLOT> [--no-strict] [--cost-store <dir>] [--cost-model <name>] [--sandbox-python <path>] [--sandbox-cgroup <dir>] [--kinds <kinds.json>]...
+       moruna serve --listen <unix:///path | vsock://CID:PORT | channel:SLOT> [--budget-max BYTES] [--no-strict] [--cost-store <dir>] [--cost-model <name>] [--sandbox-python <path>] [--sandbox-cgroup <dir>] [--kinds <kinds.json>]...
        moruna kinds [--kinds <kinds.json>]...
-       moruna check-job <spec.json> [--secret NAME]... [--node channel:SLOT] [--kinds <kinds.json>]...
+       moruna check-job <spec.json> [--secret NAME]... [--node channel:SLOT [--budget-max BYTES]] [--kinds <kinds.json>]...
+       moruna check-job --listen <address> [--node channel:SLOT [--budget-max BYTES]] [--kinds <kinds.json>]...
        moruna explain <spec.json> [--planner <name>] [--out <plan.mplan>] [--kinds <kinds.json>]...
        moruna --version
 
@@ -155,6 +160,9 @@ pub enum Command {
         strict: bool,
         /// What a `.pex` package's sandbox needs (17 e.6).
         packages: PackageHost,
+        /// `--budget-max BYTES`, on a channel: the most a job's budget may be on the node
+        /// (system design 3A); a document that names none is given all of it.
+        budget_max: Option<u64>,
     },
     /// Read actual governed historical rows through the host's scoped native reader.
     TaskOutput {
@@ -180,6 +188,20 @@ pub enum Command {
         /// `--node channel:SLOT`: check by node mode's rules too, as `moruna serve --listen
         /// channel:SLOT` takes the document (system design 3B).
         node: Option<String>,
+        /// `--budget-max BYTES`, with `--node`: the most a job's budget may be on the node.
+        budget_max: Option<u64>,
+    },
+    /// `moruna check-job --listen <address>` (system design 3A): the check a node runs for
+    /// `validate`, reading the document and its secrets' names from the peer
+    /// ([`super::protocol::CheckRequest`]) and answering its refusals and its budget
+    /// ([`super::protocol::CheckAnswer`]).
+    CheckOn {
+        /// Where the peer is: on a node, the channel `node-admission` started the check with.
+        listen: Address,
+        /// `--node channel:SLOT`, as for `CheckJob`.
+        node: Option<String>,
+        /// `--budget-max BYTES`, with `--node`.
+        budget_max: Option<u64>,
     },
     /// `moruna explain <spec.json> [--planner <name>] [--out <plan.mplan>]` (SDD 26 d.5): the
     /// document's plan, as JSON on standard output, and as the plan document at `out`.
@@ -410,6 +432,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             let mut listen = None;
             let mut strict = true;
             let mut packages = PackageHost::default();
+            let mut budget_max = None;
             while let Some(arg) = rest.next() {
                 if sandbox_option(arg, &mut rest, &mut packages, "moruna serve")? {
                     continue;
@@ -422,16 +445,24 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                         listen =
                             Some(Address::parse(text).map_err(|e| format!("moruna serve: {e}"))?);
                     }
+                    "--budget-max" => budget_max = Some(bytes_option(&mut rest, "moruna serve")?),
                     "--no-strict" => strict = false,
                     "--strict" => strict = true,
                     other => return Err(format!("moruna serve: unknown argument `{other}`")),
                 }
             }
             let listen = listen.ok_or_else(|| "moruna serve: --listen is required".to_string())?;
+            if budget_max.is_some() && !matches!(listen, Address::Channel(_)) {
+                return Err(
+                    "moruna serve: --budget-max is node mode's, with --listen channel:SLOT"
+                        .to_string(),
+                );
+            }
             Ok(Command::Serve {
                 listen,
                 strict,
                 packages,
+                budget_max,
             })
         }
         Some("task-output") => {
@@ -489,8 +520,21 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             let mut spec = None;
             let mut secrets = Vec::new();
             let mut node = None;
+            let mut listen = None;
+            let mut budget_max = None;
             while let Some(arg) = rest.next() {
                 match arg {
+                    "--listen" => {
+                        let text = rest.next().ok_or_else(|| {
+                            "moruna check-job: --listen needs an address".to_string()
+                        })?;
+                        listen = Some(
+                            Address::parse(text).map_err(|e| format!("moruna check-job: {e}"))?,
+                        );
+                    }
+                    "--budget-max" => {
+                        budget_max = Some(bytes_option(&mut rest, "moruna check-job")?);
+                    }
                     "--secret" => {
                         let name = rest.next().ok_or_else(|| {
                             "moruna check-job: --secret needs a secret's name".to_string()
@@ -528,11 +572,32 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                     }
                 }
             }
+            if budget_max.is_some() && node.is_none() {
+                return Err(
+                    "moruna check-job: --budget-max is a node's, with --node channel:SLOT"
+                        .to_string(),
+                );
+            }
+            if let Some(listen) = listen {
+                if spec.is_some() || !secrets.is_empty() {
+                    return Err(
+                        "moruna check-job: with --listen, the document and its secrets' \
+                                names come from the peer"
+                            .to_string(),
+                    );
+                }
+                return Ok(Command::CheckOn {
+                    listen,
+                    node,
+                    budget_max,
+                });
+            }
             let spec = spec.ok_or_else(|| "moruna check-job: which document?".to_string())?;
             Ok(Command::CheckJob {
                 spec,
                 secrets,
                 node,
+                budget_max,
             })
         }
         Some("explain") => {
@@ -805,15 +870,38 @@ fn main_as(
             spec,
             secrets,
             node,
+            budget_max,
         } => {
             let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
+            let node = node.map(|channel| Node {
+                channel,
+                budget_max,
+            });
             return check_job_with(
                 Path::new(&spec),
                 kinds,
                 &secrets,
-                node.as_deref(),
+                node.as_ref(),
                 &mut std::io::stderr().lock(),
             );
+        }
+        Command::CheckOn {
+            listen,
+            node,
+            budget_max,
+        } => {
+            let node = node.map(|channel| Node {
+                channel,
+                budget_max,
+            });
+            let conn = transport::listen(&listen).and_then(|listener| listener.accept());
+            return match conn {
+                Ok(conn) => check_conn(conn, kinds, node.as_ref()),
+                Err(error) => {
+                    eprintln!("moruna check-job: --listen {listen}: {error}");
+                    exit::SPEC_REFUSED
+                }
+            };
         }
         Command::Explain { spec, planner, out } => {
             return explain(
@@ -887,10 +975,9 @@ fn main_as(
             listen,
             strict,
             packages,
-        } => session::serve(
-            &listen,
-            kinds,
-            &HostOptions {
+            budget_max,
+        } => {
+            let opts = HostOptions {
                 cost: cost.clone(),
                 strict,
                 env,
@@ -901,8 +988,19 @@ fn main_as(
                 events: EventOptions::default(),
                 args: Vec::new(),
                 pulled_images: pulled_images(),
-            },
-        ),
+            };
+            match listen {
+                Address::Channel(_) => session::serve_channel(
+                    &Node {
+                        channel: listen.to_string(),
+                        budget_max,
+                    },
+                    kinds,
+                    &opts,
+                ),
+                _ => session::serve(&listen, kinds, &opts),
+            }
+        }
     };
     eprintln!("{}", summary(&outcome));
     outcome.code
@@ -932,7 +1030,7 @@ pub fn check_job_with(
     spec: &Path,
     kinds: &Registry,
     secrets: &[&str],
-    node: Option<&str>,
+    node: Option<&Node>,
     out: &mut dyn Write,
 ) -> i32 {
     let read = std::fs::read(spec)
@@ -945,45 +1043,151 @@ pub fn check_job_with(
             return exit::SPEC_REFUSED;
         }
     };
-    let catalogue = match moruna_job::Catalogue::from_listing(kinds.listing()) {
-        Ok(catalogue) => catalogue,
-        Err(e) => {
-            let _ = writeln!(
-                out,
-                "moruna check-job: the kinds of this binary cannot be checked against: {e}"
-            );
+    let refused = match check_refusals(&job, kinds, secrets, node) {
+        Ok(refused) => refused,
+        Err(reason) => {
+            let _ = writeln!(out, "moruna check-job: {reason}");
             return exit::FAILED;
         }
     };
-    let mut refused: Vec<(String, String)> = Vec::new();
-    let mut add = |found: Result<(), Vec<moruna_job::Refusal>>| {
-        refused.extend(
-            found
-                .err()
-                .into_iter()
-                .flatten()
-                .map(|r| (r.field, r.message)),
-        );
-    };
-    add(moruna_job::check(&job, &catalogue));
-    add(moruna_job::check_secrets(&job, secrets));
-    if let Some(channel) = node {
-        let node = super::node::Node {
-            channel: channel.to_string(),
-        };
-        refused.extend(
-            super::node::refusals(&job, &node)
-                .into_iter()
-                .map(|r| (r.field, r.reason)),
-        );
-    }
     if refused.is_empty() {
         return exit::COMPLETED;
     }
-    for (field, message) in &refused {
-        let _ = writeln!(out, "{field}: {message}");
+    for refusal in &refused {
+        let _ = writeln!(out, "{}: {}", refusal.field, refusal.message);
     }
     exit::SPEC_REFUSED
+}
+
+/// Every refusal of `job`: the kinds' first, then the secrets', then node mode's. `Err` when the
+/// kinds of this binary cannot be checked against.
+fn check_refusals(
+    job: &Job,
+    kinds: &Registry,
+    secrets: &[&str],
+    node: Option<&Node>,
+) -> Result<Vec<CheckRefusal>, String> {
+    let catalogue = moruna_job::Catalogue::from_listing(kinds.listing())
+        .map_err(|e| format!("the kinds of this binary cannot be checked against: {e}"))?;
+    let mut refused: Vec<CheckRefusal> = Vec::new();
+    let mut add = |found: Result<(), Vec<moruna_job::Refusal>>| {
+        refused.extend(found.err().into_iter().flatten().map(|r| CheckRefusal {
+            field: r.field,
+            message: r.message,
+        }));
+    };
+    add(moruna_job::check(job, &catalogue));
+    add(moruna_job::check_secrets(job, secrets));
+    if let Some(node) = node {
+        refused.extend(
+            super::node::refusals(job, node)
+                .into_iter()
+                .map(|r| CheckRefusal {
+                    field: r.field,
+                    message: r.reason,
+                }),
+        );
+    }
+    Ok(refused)
+}
+
+/// `moruna check-job --listen` once the peer has connected on `conn` (system design 3A): read
+/// one [`CheckRequest`], answer one [`CheckAnswer`], close. Exits 0 when the document would run,
+/// 2 when it is refused (or the request is not one), and 1 when the kinds cannot be checked
+/// against or the answer cannot be written.
+pub fn check_conn(conn: Conn, kinds: &Registry, node: Option<&Node>) -> i32 {
+    let (reader, mut writer, closer) = conn.into_parts();
+    let mut reader = std::io::BufReader::new(reader);
+    let refusal = |field: &str, message: String| {
+        vec![CheckRefusal {
+            field: field.to_string(),
+            message,
+        }]
+    };
+    let request = match super::protocol::read_line(&mut reader, super::protocol::MAX_SPEC_LINE) {
+        Ok(Some(line)) => serde_json::from_str::<CheckRequest>(&line)
+            .map_err(|e| refusal("spec", format!("not a check: {e}"))),
+        Ok(None) => Err(refusal(
+            "spec",
+            "the peer closed the connection before sending a check".to_string(),
+        )),
+        Err(e) => Err(refusal(
+            "spec",
+            format!("the peer's message could not be read: {e}"),
+        )),
+    };
+    let checked = request.and_then(|CheckRequest::Check { spec, secrets }| {
+        let (job, _) = super::session::job_of(spec).map_err(|e| refusal(&e.field, e.reason))?;
+        if let Some(name) = secrets
+            .iter()
+            .find(|name| !moruna_job::is_secret_name(name))
+        {
+            return Err(refusal(
+                "secrets",
+                format!("`{name}` is not a secret's name"),
+            ));
+        }
+        Ok((job, secrets))
+    });
+    let (code, answer) = match checked {
+        Err(refusals) => (
+            exit::SPEC_REFUSED,
+            CheckAnswer::Checked {
+                ok: false,
+                refusals,
+                memory_bytes: None,
+            },
+        ),
+        Ok((job, secrets)) => {
+            let names: Vec<&str> = secrets.iter().map(String::as_str).collect();
+            let memory_bytes = match node {
+                Some(node) => super::node::budget(&job, node),
+                None => job.budget.memory_bytes,
+            };
+            match check_refusals(&job, kinds, &names, node) {
+                Ok(refusals) => (
+                    if refusals.is_empty() {
+                        exit::COMPLETED
+                    } else {
+                        exit::SPEC_REFUSED
+                    },
+                    CheckAnswer::Checked {
+                        ok: refusals.is_empty(),
+                        refusals,
+                        memory_bytes,
+                    },
+                ),
+                Err(reason) => {
+                    eprintln!("moruna check-job: {reason}");
+                    closer();
+                    return exit::FAILED;
+                }
+            }
+        }
+    };
+    let line = serde_json::to_string(&answer).unwrap_or_default() + "\n";
+    let written = writer
+        .write_all(line.as_bytes())
+        .and_then(|()| writer.flush());
+    closer();
+    match written {
+        Ok(()) => code,
+        Err(error) => {
+            eprintln!("moruna check-job: the answer could not be written: {error}");
+            exit::FAILED
+        }
+    }
+}
+
+/// A number of bytes the command line gives, more than zero.
+fn bytes_option<'a>(
+    rest: &mut impl Iterator<Item = &'a str>,
+    command: &str,
+) -> Result<u64, String> {
+    rest.next()
+        .and_then(|text| text.parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| format!("{command}: --budget-max needs a number of bytes, more than zero"))
 }
 
 /// `moruna explain` (SDD 26 d.5): the plan of the document at `spec` by the planner `planner`
@@ -2065,6 +2269,7 @@ mod tests {
                 listen: Address::parse("vsock://-1:5000").expect("address"),
                 strict: true,
                 packages: PackageHost::default(),
+                budget_max: None,
             })
         );
         assert_eq!(
@@ -2073,6 +2278,69 @@ mod tests {
                 listen: Address::parse("/tmp/m.sock").expect("address"),
                 strict: false,
                 packages: PackageHost::default(),
+                budget_max: None,
+            })
+        );
+        assert_eq!(
+            parse(&args(&[
+                "serve",
+                "--listen",
+                "channel:engine",
+                "--budget-max",
+                "1073741824"
+            ])),
+            Ok(Command::Serve {
+                listen: Address::Channel("engine".into()),
+                strict: true,
+                packages: PackageHost::default(),
+                budget_max: Some(1 << 30),
+            })
+        );
+        for bad in [
+            &["serve", "--listen", "/tmp/m.sock", "--budget-max", "1024"][..],
+            &["serve", "--listen", "channel:engine", "--budget-max", "0"],
+            &[
+                "serve",
+                "--listen",
+                "channel:engine",
+                "--budget-max",
+                "lots",
+            ],
+            &["serve", "--listen", "channel:engine", "--budget-max"],
+        ] {
+            assert!(parse(&args(bad)).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            parse(&args(&[
+                "check-job",
+                "--listen",
+                "channel:check",
+                "--node",
+                "channel:engine",
+                "--budget-max",
+                "4096"
+            ])),
+            Ok(Command::CheckOn {
+                listen: Address::Channel("check".into()),
+                node: Some("channel:engine".into()),
+                budget_max: Some(4096),
+            })
+        );
+        for bad in [
+            &["check-job", "--listen", "channel:check", "job.json"][..],
+            &["check-job", "--listen", "channel:check", "--secret", "k"],
+            &["check-job", "job.json", "--budget-max", "4096"],
+            &["check-job", "--listen"],
+            &["check-job", "--listen", "tcp://x:1"],
+        ] {
+            assert!(parse(&args(bad)).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            parse(&args(&["check-job", "--listen", "unix:///run/check.sock"])),
+            Ok(Command::CheckOn {
+                listen: Address::Unix("/run/check.sock".into()),
+                node: None,
+                budget_max: None,
             })
         );
         // 17 e.6: the sandbox's interpreter and cgroup, on run and serve, and not on run --vm.
@@ -2112,6 +2380,7 @@ mod tests {
                 listen: Address::parse("/tmp/m.sock").expect("address"),
                 strict: true,
                 packages: host,
+                budget_max: None,
             })
         );
         assert!(

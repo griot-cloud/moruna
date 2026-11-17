@@ -11,15 +11,39 @@
 //!   and writes the volumes the cloud attaches (`disk://`, item 3.3) and object storage; it has
 //!   no file system of its own, so in this release every `file://` path is outside its volumes,
 //!   and so is a root for them (`object_store.local_root`).
+//! - Its budget (system design 3A): given the most a job on the node may have (`--budget-max`,
+//!   the node's memory less 768 MiB, which `node-admission` knows), a larger
+//!   `budget.memory_bytes` is refused, and a document that names none is given all of it: a node
+//!   runs one job.
 
 use moruna_job::{Job, SpecError};
 use serde_json::Value;
 
-/// What node mode needs to know: the channel the job is served on.
+/// What node mode needs to know: the channel the job is served on, and the most its budget may
+/// be.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Node {
     /// The channel's address, as `report.socket` names it: `channel:<slot>`.
     pub channel: String,
+    /// The most a job's budget may be on this node, in bytes: the node's memory less 768 MiB
+    /// (system design 3A). `None`: no bound, and a document that names no budget keeps none.
+    pub budget_max: Option<u64>,
+}
+
+impl Node {
+    /// Node mode on `channel`, with no bound on the budget.
+    pub fn on(channel: impl Into<String>) -> Node {
+        Node {
+            channel: channel.into(),
+            budget_max: None,
+        }
+    }
+}
+
+/// The budget `job` runs with on `node`: the document's, or, when it names none, the most the
+/// node allows.
+pub fn budget(job: &Job, node: &Node) -> Option<u64> {
+    job.budget.memory_bytes.or(node.budget_max)
 }
 
 /// Whether `text` names a `file:` URL, in any case.
@@ -69,6 +93,18 @@ pub fn refusals(job: &Job, node: &Node) -> Vec<SpecError> {
                  attached volumes and object storage",
             )
         }));
+    }
+    if let (Some(budget), Some(max)) = (job.budget.memory_bytes, node.budget_max)
+        && budget > max
+    {
+        refused.push(SpecError::new(
+            "budget.memory_bytes",
+            format!(
+                "{budget} bytes is more than a job on this node may have, {max} bytes (the \
+                 node's memory less 768 MiB, kept for its services and a check): ask for less, \
+                 or leave it out for all of it"
+            ),
+        ));
     }
     if job.object_store.local_root.is_some() {
         refused.push(SpecError::new(
@@ -124,6 +160,7 @@ pub fn admit(
         return Err(refusal);
     }
     job.report.socket = Some(node.channel.clone());
+    job.budget.memory_bytes = budget(job, node);
     if job.id.is_none() {
         job.id = Some(mint().ok_or_else(|| SpecError::new("run_id", "no run ID could be made"))?);
     }

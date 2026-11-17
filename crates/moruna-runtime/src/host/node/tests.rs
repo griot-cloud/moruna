@@ -5,9 +5,7 @@ use moruna_job::JobSpec;
 use serde_json::json;
 
 fn node() -> Node {
-    Node {
-        channel: "channel:engine".to_string(),
-    }
+    Node::on("channel:engine")
 }
 
 fn job(document: Value) -> Job {
@@ -116,6 +114,44 @@ fn what_a_node_refuses_is_refused_by_its_field() {
         "{}",
         refusal.reason
     );
+}
+
+/// Given the most a job may have on the node, a larger budget is refused and none is all of it.
+#[test]
+fn a_nodes_budget_bounds_the_jobs_and_fills_it_in() {
+    let bounded = Node {
+        budget_max: Some(1 << 30),
+        ..node()
+    };
+    let with_budget = |bytes: u64| {
+        let mut document = sound();
+        document["budget"] = json!({"memory_bytes": bytes});
+        job(document)
+    };
+    // At the bound, taken as it is.
+    let mut at = with_budget(1 << 30);
+    assert!(refusals(&at, &bounded).is_empty());
+    admit(&mut at, &bounded, || Some("0".repeat(32))).unwrap();
+    assert_eq!(at.budget.memory_bytes, Some(1 << 30));
+    // Over it, refused by its field, saying what the node allows.
+    let over = with_budget((1 << 30) + 4096);
+    let refused = refusals(&over, &bounded);
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].field, "budget.memory_bytes");
+    assert!(
+        refused[0].reason.contains("1073741824 bytes") && refused[0].reason.contains("768 MiB"),
+        "{}",
+        refused[0].reason
+    );
+    // None: all of it, and so the budget the check reports.
+    let mut none = job(sound());
+    assert_eq!(budget(&none, &bounded), Some(1 << 30));
+    admit(&mut none, &bounded, || Some("0".repeat(32))).unwrap();
+    assert_eq!(none.budget.memory_bytes, Some(1 << 30));
+    // With no bound, the document's own, or none.
+    assert_eq!(budget(&job(sound()), &node()), None);
+    assert_eq!(budget(&with_budget(4096), &node()), Some(4096));
+    assert!(refusals(&with_budget(u64::MAX), &node()).is_empty());
 }
 
 #[test]
