@@ -13,6 +13,8 @@
   every cargo command with `-j 2`: up to six agents share this Mac's 10 cores and 16 GB.
 - An item with booted checks is done in two phases: everything that needs no boot first, then a
   report; the PM continues you for the booted checks when what they need is merged.
-- The disk is nearly full: build with `CARGO_INCREMENTAL=0`, and delete `target` when you stop.
+- Free disk as you go: build with `CARGO_INCREMENTAL=0`; delete every `target` folder you made
+  (in your worktree and inside `moruna-arm`) whenever you stop or hand back, and your folders in
+  `moruna-arm`'s `/tmp`. Never delete another agent's.
 - Create nothing in any cloud, and spend nothing.
 - Where your work item and the system design leave a choice open, ask the PM. Do not choose.
