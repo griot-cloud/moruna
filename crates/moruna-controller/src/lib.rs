@@ -964,6 +964,10 @@ pub(crate) struct Inner {
     queue: Mutex<VecDeque<RecordSummary>>,
     /// The sizer factory `prepare` builds each stage's sizer with.
     factory: Mutex<SizerFactory>,
+    // stream P: the controller's decisions in the run's report.
+    /// The knobs it moved, as it moved them, for the report (a lock of its own: knobs are
+    /// performed with the state's released).
+    decisions: Mutex<summary::Decisions>,
 }
 
 /// The resource controller.
@@ -1025,6 +1029,15 @@ impl Inner {
         }
         if let Some(budgets) = actions.budgets {
             self.peers.placement.set_budgets(budgets);
+        }
+        {
+            let mut decisions = self.decisions.lock().unwrap_or_else(|e| e.into_inner());
+            for knob in &actions.knobs {
+                decisions.note(knob);
+            }
+            if let Some(diagnostic) = &actions.terminate {
+                decisions.ended(diagnostic);
+            }
         }
         for knob in actions.knobs {
             tracing::debug!(target: "ctl.adjust", knob = ?knob, "knob");
@@ -1155,6 +1168,7 @@ impl Controller {
                 },
                 queue: Mutex::new(VecDeque::new()),
                 factory: Mutex::new(factory),
+                decisions: Mutex::new(summary::Decisions::new()),
             }),
             tick: Mutex::new(None),
             stop_flag: Arc::new(AtomicBool::new(false)),
