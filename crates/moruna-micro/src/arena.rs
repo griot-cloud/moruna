@@ -6,9 +6,9 @@
 //! (`map::HUGE | map::POPULATE`, contract C4). Where the kernel refuses those flags the objects
 //! are mapped plainly, and their pages still never fault: the kernel allocates a memory
 //! object's pages, zeroed, when it is made, and fills every page table entry when it is
-//! mapped. The arena makes a small object when the run starts and one more each time an
-//! allocation finds the ones made full, each as large as all before it, up to its budget, so a
-//! run pays for zeroing what it uses, not what it may use.
+//! mapped. The arena makes a small object when the run starts and then steps of what is in use,
+//! up to its budget, most of them ahead of need on a thread of its own, so a run pays for
+//! zeroing what it uses, not what it may use, and its workers rarely wait for it.
 //! Nothing is given back while the run lasts, so a page the arena reuses is never zeroed again.
 //!
 //! [`Objects`] is the arena's [`HostBacking`]. [`Pins`] gives one device the arena's pages:

@@ -138,25 +138,22 @@ fn the_budget_is_made_into_regions_of_at_most_one_grant_as_the_run_needs_them() 
     assert_eq!(arena.region_bytes(Tier::Host), 10 * MIB);
     assert_eq!(arena.available(Tier::Host), Some(10 * MIB));
 
-    // Buffers fill the first region before a second is made, and so on. Granule buffers fill
-    // the regions exactly.
-    let per_region = (chunk / GRANULE as u64) as usize;
+    // Regions are made as the buffers need them, some ahead of need, never past the budget.
+    // Granule buffers fill the regions exactly.
     let mut held = Vec::new();
     for i in 0..160u32 {
         let mut b = arena.alloc(GRANULE, Tier::Host).expect("room");
         b.fill(i as u8);
         assert!(arena.contains(b.as_ptr()));
         held.push(b);
-        let made = heap.given().len();
-        let want = if held.len() <= per_region {
-            1
-        } else if held.len() <= 2 * per_region {
-            2
-        } else {
-            3
-        };
-        assert_eq!(made, want, "after {} buffers", held.len());
+        let made: u64 = heap.given().iter().sum();
+        assert!(
+            made <= 10 * MIB,
+            "after {} buffers, {made} made",
+            held.len()
+        );
     }
+    arena.settle();
     assert!(held.iter().enumerate().all(|(i, b)| b[0] == i as u8));
     assert_eq!(heap.given().len(), 3);
     assert!(heap.given().iter().all(|b| *b <= 4 * MIB));
@@ -201,8 +198,14 @@ fn a_run_that_needs_little_of_a_large_budget_makes_little() {
     for _ in 0..100 {
         held.push(arena.alloc(GRANULE, Tier::Host).expect("room"));
     }
-    // 100 granules need two regions of 63.
-    assert_eq!(heap.given().len(), 2);
+    arena.settle();
+    // 100 granules hold 6.25 MiB: what is made is that, a little ahead of need, and a step.
+    let made: u64 = heap.given().iter().sum();
+    let used = 100 * GRANULE as u64;
+    assert!(
+        made <= used + moruna_arena::GRANTED_AHEAD_BELOW + 4 * MIB,
+        "{made} made for {used}"
+    );
     assert_eq!(arena.host_capacity(), 1024 * MIB);
     assert_eq!(
         arena.available(Tier::Host),
@@ -220,23 +223,24 @@ fn what_is_made_follows_what_the_run_uses_not_its_budget() {
     assert_eq!(heap.given(), vec![first]);
     assert_eq!(arena.host_capacity(), GIB);
     let made = |arena: &Arena| GIB - arena.uncommitted_bytes();
+    let step = moruna_arena::GRANTED_STEP_MAX;
+    let ahead = moruna_arena::GRANTED_AHEAD_BELOW;
     let mut held = Vec::new();
     for i in 1..=300u64 {
         held.push(arena.alloc(MIB as usize, Tier::Host).expect("room"));
+        arena.settle();
         let used = i * MIB;
+        // What is made stays within a step and the free bytes kept ahead of what is used.
         assert!(
-            made(&arena) <= (2 * used).max(first),
+            made(&arena) <= (used + ahead + step).max(first),
             "{used} bytes used, {} made",
             made(&arena)
         );
     }
-    // Each region as large as all before it, up to one grant.
+    // No region for these buffers is larger than a step, and some were made ahead of need.
     let regions = heap.given();
-    assert_eq!(
-        regions,
-        vec![first, first, 2 * first, 4 * first, 256 * MIB],
-        "{regions:?}"
-    );
+    assert!(regions.iter().all(|r| *r <= step.max(first)), "{regions:?}");
+    assert!(arena.regions_made_ahead() > 0);
     drop(held);
 }
 
@@ -367,11 +371,17 @@ fn a_large_buffer_past_what_is_left_to_make_gets_a_side_region() {
         .alloc(2 * MIB as usize, Tier::Host)
         .expect("first region");
     // Room by charge, but neither the first region nor the 1 MiB left holds 2 MiB in one
-    // piece: a side grant.
+    // piece: a side grant. The 1 MiB left may have been made ahead of need meanwhile.
     let side = arena.alloc(2 * MIB as usize, Tier::Host);
     assert!(side.is_ok(), "{side:?}");
+    arena.settle();
     assert_eq!(arena.side_regions(), 1);
-    assert_eq!(heap.given().len(), 2);
+    assert!(heap.given().len() <= 3, "{:?}", heap.given());
+    assert!(
+        heap.given().contains(&(2 * MIB)),
+        "the side grant: {:?}",
+        heap.given()
+    );
     drop((small, big, side));
 }
 
@@ -520,4 +530,101 @@ fn a_skewed_grant_is_asked_again_or_used_an_alignment_short() {
     let tiny = Heap::skewed(ALIGN as u64);
     let refused = Arena::with_backing(config(ALIGN as u64), tiny).unwrap_err();
     assert!(matches!(refused, MorunaError::Config { name, .. } if name == "budget.host"));
+}
+
+#[test]
+fn steps_follow_what_is_in_use_not_the_budget() {
+    // The same buffers on a 1 GiB and a 16 GiB budget make the same regions.
+    let regions_for = |budget: u64| {
+        let heap = Heap::new(256 * MIB);
+        let arena = Arena::with_backing(config(budget), heap.clone()).expect("a granted arena");
+        let mut held = Vec::new();
+        for _ in 0..200 {
+            held.push(arena.alloc(MIB as usize, Tier::Host).expect("room"));
+            arena.settle();
+        }
+        drop(held);
+        heap.given()
+    };
+    let small = regions_for(1024 * MIB);
+    let large = regions_for(16 * 1024 * MIB);
+    assert_eq!(small, large);
+    let made: u64 = large.iter().sum();
+    assert!(
+        made < 2 * 200 * MIB,
+        "{made} made for 200 MiB held: {large:?}"
+    );
+}
+
+#[test]
+fn a_request_larger_than_a_step_gets_a_region_of_its_own_size() {
+    let heap = Heap::new(256 * MIB);
+    let arena = Arena::with_backing(config(4096 * MIB), heap.clone()).expect("a granted arena");
+    let big = arena
+        .alloc(100 * MIB as usize, Tier::Host)
+        .expect("a region of its own");
+    arena.settle();
+    assert!(heap.given().contains(&(128 * MIB)), "{:?}", heap.given());
+    assert_eq!(arena.side_regions(), 0);
+    drop(big);
+}
+
+#[test]
+fn the_next_step_is_made_ahead_of_need_and_serves_without_a_wait() {
+    let heap = Heap::new(256 * MIB);
+    let arena = Arena::with_backing(config(1024 * MIB), heap.clone()).expect("a granted arena");
+    let first = moruna_arena::FIRST_GRANTED_REGION;
+    // Fill the first region past the mark: the next step is made on a thread of its own.
+    let mut held = Vec::new();
+    for _ in 0..(first / MIB) / 2 {
+        held.push(arena.alloc(MIB as usize, Tier::Host).expect("room"));
+    }
+    arena.settle();
+    assert!(arena.regions_made_ahead() >= 1);
+    let made_before = heap.given().len();
+    // The next buffers land in the region made ahead: none of them makes one of its own.
+    for _ in 0..(first / MIB) / 2 + 4 {
+        held.push(arena.alloc(MIB as usize, Tier::Host).expect("room"));
+    }
+    let made_after = heap.given().len();
+    assert!(
+        made_after <= made_before + 1,
+        "{made_before} then {made_after}: {:?}",
+        heap.given()
+    );
+    drop(held);
+}
+
+#[test]
+fn nothing_is_made_ahead_past_the_budget() {
+    let heap = Heap::new(256 * MIB);
+    let arena = Arena::with_backing(config(40 * MIB), heap.clone()).expect("a granted arena");
+    let held = arena.alloc(MIB as usize, Tier::Host).expect("room");
+    arena.settle();
+    let made: u64 = heap.given().iter().sum();
+    assert_eq!(
+        made,
+        40 * MIB,
+        "the first 32 MiB and the 8 MiB left, made ahead"
+    );
+    assert_eq!(arena.uncommitted_bytes(), 0);
+    let again = arena.alloc(MIB as usize, Tier::Host).expect("room");
+    arena.settle();
+    assert_eq!(
+        heap.given().iter().sum::<u64>(),
+        40 * MIB,
+        "nothing past the budget"
+    );
+    drop((held, again));
+    // An arena that maps its own regions makes nothing ahead.
+    let own = Arena::new(ArenaConfig {
+        huge_pages: Guarantee::Absent,
+        memlock: Guarantee::Absent,
+        ..config(4 * MIB)
+    })
+    .expect("an arena");
+    let b = own.alloc(MIB as usize, Tier::Host).expect("room");
+    own.settle();
+    assert_eq!(own.regions_made_ahead(), 0);
+    drop(b);
 }
