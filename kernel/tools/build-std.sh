@@ -50,6 +50,27 @@ flags="$flags -Zunstable-options -C link-arg=-T$kernel/sys/user.ld -C link-arg=-
 # getrandom knows no `target_os = "moruna"`: its custom backend is kernel/getrandom's, the
 # core's random_read, the one source of entropy (PM, 2026-11-18).
 flags="$flags --cfg getrandom_backend=\"custom\""
+# Cargo's build-std fingerprints std and the crates std depends on as it does a registry's: an
+# edit to library/ or to the Moruna crates std builds on (moruna-sys, moruna-abi,
+# moruna-record) would leave std stale in a target directory that is kept, as moruna-arm's
+# shared one is. A digest of those sources goes into every unit's metadata, so an edit rebuilds
+# std and what links it, and an unchanged tree rebuilds nothing.
+inputs="$(python3 - "$kernel/.." <<'PY'
+import hashlib, os, sys
+root = sys.argv[1]
+digest = hashlib.sha256()
+for top in ("kernel/vendor/rust-std/library", "kernel/sys", "kernel/abi", "crates/moruna-record"):
+    for here, dirs, files in os.walk(os.path.join(root, top)):
+        dirs[:] = sorted(d for d in dirs if d != "target")
+        for name in sorted(files):
+            path = os.path.join(here, name)
+            digest.update(os.path.relpath(path, root).encode() + b"\0")
+            with open(path, "rb") as f:
+                digest.update(hashlib.sha256(f.read()).digest())
+print(digest.hexdigest()[:16])
+PY
+)"
+flags="$flags -C metadata=moruna-std-$inputs"
 
 # This entry owns the flags: an inherited encoded set must not replace them.
 unset CARGO_ENCODED_RUSTFLAGS
