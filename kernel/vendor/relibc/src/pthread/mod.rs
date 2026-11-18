@@ -70,6 +70,9 @@ pub unsafe fn terminate_from_main_thread() {
 bitflags::bitflags! {
     pub struct PthreadFlags: usize {
         const DETACHED = 1;
+        /// Moruna: the thread has reached its end joinable, its block kept, so a detach
+        /// after it frees the block once the kernel says the thread has ended.
+        const EXITED = 2;
     }
 }
 
@@ -276,6 +279,16 @@ pub unsafe fn join(thread: &Pthread) -> Result<Retval, Errno> {
     // Waitval starts locked, and is unlocked when the thread finishes.
     let retval = *thread.waitval.wait();
 
+    // Moruna: the waitval is posted by the ending thread while it still runs. Its block is
+    // freed only once the kernel says the thread has ended (system design 5B).
+    #[cfg(target_os = "moruna")]
+    if let Some(tcb) = unsafe { thread.tcb_selfref.get().read().as_ref() } {
+        let handle = tcb.os_specific.take_handle();
+        if handle != 0 {
+            unsafe { relibc_moruna::thread::join(handle) };
+        }
+    }
+
     // We have now awaited the thread and received its return value. POSIX states that the
     // pthread_t of this thread, will no longer be valid. In practice, we can thus deallocate the
     // thread state.
@@ -286,9 +299,44 @@ pub unsafe fn join(thread: &Pthread) -> Result<Retval, Errno> {
 }
 
 pub unsafe fn detach(thread: &Pthread) -> Result<(), Errno> {
-    thread
+    #[cfg(target_os = "moruna")]
+    return unsafe { detach_moruna(thread) };
+
+    #[cfg(not(target_os = "moruna"))]
+    {
+        thread
+            .flags
+            .fetch_or(PthreadFlags::DETACHED.bits(), Ordering::AcqRel);
+        Ok(())
+    }
+}
+
+/// Moruna: a detach. A thread still running frees its own block at its end; one that has
+/// reached its end joinable, its block kept, has its block freed by the runtime with its stack,
+/// once the kernel says it has ended.
+#[cfg(target_os = "moruna")]
+unsafe fn detach_moruna(thread: &Pthread) -> Result<(), Errno> {
+    let tcb = unsafe { thread.tcb_selfref.get().read() };
+    // Taken before the flag is set: a thread that sees the flag may free its block at once.
+    let handle = match unsafe { tcb.as_ref() } {
+        Some(tcb) => tcb.os_specific.take_handle(),
+        None => 0,
+    };
+    let before = thread
         .flags
         .fetch_or(PthreadFlags::DETACHED.bits(), Ordering::AcqRel);
+    if before & PthreadFlags::EXITED.bits() != 0 {
+        // Its block is kept, and is this detach's to free.
+        unsafe {
+            OS_TID_TO_PTHREAD.lock().remove(&thread.os_tid.get().read());
+        }
+        if handle != 0 {
+            unsafe { relibc_moruna::thread::detach_releasing(handle, tcb as usize) };
+        }
+    } else if handle != 0 {
+        // `thread` may be freed from here on: not read again.
+        unsafe { relibc_moruna::thread::detach(handle) };
+    }
     Ok(())
 }
 
@@ -307,10 +355,20 @@ pub unsafe fn testcancel() {
 }
 
 pub unsafe fn exit_current_thread(retval: Retval) -> ! {
-    // Run pthread_cleanup_push/pthread_cleanup_pop destructors.
-    unsafe { header::run_destructor_stack() };
+    // Moruna: the thread's end is the runtime's one (system design 5B): relibc's part
+    // (`moruna_thread_end`, below), then std's thread-locals' destructors.
+    #[cfg(target_os = "moruna")]
+    {
+        unsafe { relibc_moruna::thread::end_current() };
+    }
 
-    unsafe { header::tls::run_all_destructors() };
+    #[cfg(not(target_os = "moruna"))]
+    {
+        // Run pthread_cleanup_push/pthread_cleanup_pop destructors.
+        unsafe { header::run_destructor_stack() };
+
+        unsafe { header::tls::run_all_destructors() };
+    }
 
     let this = current_thread().expect("failed to obtain current thread when exiting");
     let stack_base = this.stack_base;
@@ -324,7 +382,15 @@ pub unsafe fn exit_current_thread(retval: Retval) -> ! {
         thread_fd.dup_into_upper(b"status").unwrap()
     };
 
-    if this.flags.load(Ordering::Acquire) & PthreadFlags::DETACHED.bits() != 0 {
+    // Moruna: said once, so a detach either finds the thread still running (and the thread then
+    // frees its own block) or finds it at its end joinable, its block the detach's to free.
+    #[cfg(target_os = "moruna")]
+    let flags = this
+        .flags
+        .fetch_or(PthreadFlags::EXITED.bits(), Ordering::AcqRel);
+    #[cfg(not(target_os = "moruna"))]
+    let flags = this.flags.load(Ordering::Acquire);
+    if flags & PthreadFlags::DETACHED.bits() != 0 {
         // When detached, the thread state no longer makes any sense, and can immediately be
         // deallocated.
         unsafe { dealloc_thread(this) };
@@ -360,8 +426,9 @@ unsafe fn dealloc_thread(thread: &Pthread) {
         }
     }
     // Moruna: the thread's block, kept past its end since its pthread_t lies in it, is freed
-    // now: by the join, or by a detached thread at its own end, which reads no thread-local
-    // after (system design 5B). Every block, the first thread's too, is the runtime's to free.
+    // now: by the join, once the kernel has said the thread ended, or by a detached thread at
+    // its own end, which reads no thread-local after (system design 5B). Every block, the first
+    // thread's too, is the runtime's to free.
     #[cfg(target_os = "moruna")]
     unsafe {
         let tcb = thread.tcb_selfref.get().read();
@@ -403,6 +470,7 @@ unsafe fn create_moruna(
         header::PTHREAD_CREATE_JOINABLE => (),
         other => unreachable!("unknown detachstate {}", other),
     }
+    let detached = flags.contains(PthreadFlags::DETACHED);
     let synchronization_mutex = unsafe { Mutex::locked(0) };
     let created = AtomicPtr::<Tcb>::new(ptr::null_mut());
     let start = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(MorunaStart {
@@ -413,19 +481,32 @@ unsafe fn create_moruna(
         created: &raw const created,
         mutex: &raw const synchronization_mutex,
     }));
-    if relibc_moruna::thread::spawn(attrs.stacksize, moruna_thread_start, start as usize).is_err() {
+    let spawned =
+        relibc_moruna::thread::spawn(attrs.stacksize, moruna_thread_start, start as usize);
+    let Ok(thread) = spawned else {
         // SAFETY: no thread started, so the start is still this function's.
         drop(unsafe { alloc::boxed::Box::from_raw(start) });
         return Err(Errno(EAGAIN));
-    }
+    };
     let _ = synchronization_mutex.lock();
-    // SAFETY: the new thread stored its Tcb before it unlocked the mutex.
-    let new_tcb = unsafe { &mut *created.load(Ordering::Acquire) };
-    let os_tid = unsafe { new_tcb.pthread.os_tid.get().read() };
-    OS_TID_TO_PTHREAD
-        .lock()
-        .insert(os_tid, ForceSendSync(new_tcb));
-    Ok(&raw const new_tcb.pthread as *mut _)
+    // The new thread stored its Tcb, and put itself in OS_TID_TO_PTHREAD, before it unlocked
+    // the mutex.
+    let new_tcb = created.load(Ordering::Acquire);
+    // Its address only: a detached thread may have ended, its block freed, by now.
+    let pthread = new_tcb
+        .cast::<u8>()
+        .wrapping_add(core::mem::offset_of!(Tcb, pthread))
+        .cast::<Pthread>();
+    if detached {
+        // It frees its own block at its end; its stack goes once the kernel says it has ended.
+        unsafe { relibc_moruna::thread::detach(thread) };
+    } else {
+        // A joinable thread keeps its block until its join or its detach, which take the handle
+        // and free the block once the kernel says it has ended. It waits for the handle before
+        // its routine runs.
+        unsafe { (*new_tcb).generic.os_specific.give_handle(thread) };
+    }
+    Ok(pthread as pthread_t)
 }
 
 /// Moruna: a new thread's first code, its block installed by the runtime.
@@ -436,14 +517,30 @@ extern "C" fn moruna_thread_start(start: usize) {
     let tcb = unsafe { Tcb::adopt_current() };
     tcb.pthread.flags = start.flags.bits().into();
     tcb.pthread.stack_size = start.stack_size;
-    unsafe { tcb.pthread.os_tid.get().write(Sys::current_os_tid()) };
-    // SAFETY: the creator waits on the mutex, so both still live.
+    let os_tid = Sys::current_os_tid();
+    unsafe { tcb.pthread.os_tid.get().write(os_tid) };
+    let tcb: *mut Tcb = tcb;
+    OS_TID_TO_PTHREAD.lock().insert(os_tid, ForceSendSync(tcb));
+    // SAFETY: the creator waits on the mutex, so both still live; neither is read after.
     unsafe {
         (*start.created).store(tcb, Ordering::Release);
         (*start.mutex).manual_unlock();
     }
+    if !start.flags.contains(PthreadFlags::DETACHED) {
+        // SAFETY: the thread's own Tcb, joinable: kept until its join or its detach.
+        unsafe { (*tcb).generic.os_specific.wait_for_handle() };
+    }
     let retval = (start.routine)(start.arg);
     unsafe { exit_current_thread(Retval(retval)) }
+}
+
+/// Moruna: relibc's part of every thread's end, std's threads' and its own, which the runtime
+/// runs before std's (`moruna_sys::rt::thread::end_current`): the cleanup handlers and the
+/// `thread_local` destructors (`__cxa_thread_atexit_impl`), then the keys' destructors.
+#[cfg(target_os = "moruna")]
+pub(crate) unsafe extern "C" fn moruna_thread_end() {
+    unsafe { header::run_destructor_stack() };
+    unsafe { header::tls::run_all_destructors() };
 }
 
 pub const SIGRT_RLCT_CANCEL: usize = 33;

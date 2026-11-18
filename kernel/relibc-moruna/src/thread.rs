@@ -43,13 +43,70 @@ pub fn yield_now() -> Result<()> {
 /// Starts a thread on the one thread path (system design 5B): its stack (`stack` bytes at
 /// least, with a guard page) and its block of TLS and control block are the runtime's, installed
 /// before `main(arg)` runs. relibc's own part of the control block is zeroed; the thread makes it
-/// relibc's `Tcb` first.
+/// relibc's `Tcb` first. The thread's runtime handle, which [`join`], [`detach`] or
+/// [`detach_releasing`] takes once.
 #[cfg(target_os = "moruna")]
-pub fn spawn(stack: usize, main: extern "C" fn(usize), arg: usize) -> Result<()> {
+pub fn spawn(stack: usize, main: extern "C" fn(usize), arg: usize) -> Result<usize> {
     os::spawn(stack, main, arg).map_err(from_kernel)
 }
 
-/// Ends the calling thread, its block kept for whoever frees it with [`release`].
+/// Waits for the kernel to say the thread `spawn` started has ended: only then may its kept
+/// block be freed ([`release`]), never on a word the ending thread itself writes while it runs.
+///
+/// # Safety
+///
+/// `thread` is a handle [`spawn`] gave, taken once.
+#[cfg(target_os = "moruna")]
+pub unsafe fn join(thread: usize) {
+    // SAFETY: the caller's contract.
+    unsafe { os::join(thread) }
+}
+
+/// Detaches a thread that frees its own block at its end; its stack goes once it has ended.
+///
+/// # Safety
+///
+/// `thread` is a handle [`spawn`] gave, taken once.
+#[cfg(target_os = "moruna")]
+pub unsafe fn detach(thread: usize) {
+    // SAFETY: the caller's contract.
+    unsafe { os::detach(thread) }
+}
+
+/// Detaches a thread that ended with its block `control` kept: the runtime frees both its stack
+/// and the block once the kernel says it has ended.
+///
+/// # Safety
+///
+/// `thread` is a handle [`spawn`] gave, taken once, and `control` that thread's block, which
+/// nothing else frees.
+#[cfg(target_os = "moruna")]
+pub unsafe fn detach_releasing(thread: usize, control: usize) {
+    // SAFETY: the caller's contract.
+    unsafe { os::detach_releasing(thread, control) }
+}
+
+/// Sets the C library's part of every thread's end, std's threads' and its own: the runtime
+/// runs it, then std's.
+#[cfg(target_os = "moruna")]
+pub fn at_thread_end(end: unsafe extern "C" fn()) {
+    os::at_thread_end(end)
+}
+
+/// The calling thread's end, as every thread on the one thread path has it: the C library's
+/// part (set by [`at_thread_end`]), then std's thread-locals' destructors.
+///
+/// # Safety
+///
+/// Nothing reads the values of the thread's thread-locals after.
+#[cfg(target_os = "moruna")]
+pub unsafe fn end_current() {
+    // SAFETY: the caller's contract.
+    unsafe { os::end_current() }
+}
+
+/// Ends the calling thread, its end already run ([`end_current`]), its block kept for whoever
+/// frees it.
 #[cfg(target_os = "moruna")]
 pub fn exit() -> ! {
     os::thread_exit()

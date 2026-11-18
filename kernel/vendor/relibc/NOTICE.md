@@ -65,8 +65,14 @@ branches from.
     and the log and before the init arrays and `main` (relibc's start without those, argv the
     process's name, no environment), and `moruna_libc_exit`, `exit` for a `main` that returned.
   - `src/pthread/mod.rs`: `pthread_create` takes the runtime's one thread path (its stack, its
-    block of TLS, made from the program's template); a thread ends keeping its block, in which its
-    `pthread_t` lies, and its join or its detach frees it.
+    block of TLS, made from the program's template), and keeps the runtime's handle of the thread
+    in its `Tcb`; a joinable thread ends keeping its block, in which its `pthread_t` lies, and its
+    join or its detach frees it only once the kernel says the thread has ended (the join waits on
+    the handle; a detach after the end hands the block to the runtime, which frees it with the
+    stack). A thread's end is the runtime's (`end_current`): relibc's part, `moruna_thread_end`
+    (cleanup handlers, `thread_local` and key destructors), then std's thread-locals', on
+    `pthread_create`'s threads and std's alike. `src/platform/moruna/mod.rs`'s `ThreadId` holds
+    the handle.
 - **The `target_os` sites:** 59 `target_os = "linux"` conditions outside Linux's platform also
   take `target_os = "moruna"`, so Moruna has Linux's ABI constants (errno, flags, modes, signal
   numbers, the layouts of `stat` and the others). Not the four that make Linux system calls:

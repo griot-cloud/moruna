@@ -102,21 +102,29 @@ fn of_timespec(t: &timespec) -> moruna::time::Timespec {
     }
 }
 
-/// A thread's id, given by its creator, or on first asking for the first thread: what
-/// relibc's control block keeps for a Moruna thread (`OsSpecific`).
+/// What relibc's control block keeps for a Moruna thread (`OsSpecific`): its id, given on first
+/// asking, and for a thread `pthread_create` started, the runtime's handle of it, which its join
+/// or its detach takes, so its kept block is freed only once the kernel says it has ended.
 #[derive(Debug, Default)]
-pub struct ThreadId(AtomicUsize);
+pub struct ThreadId {
+    id: AtomicUsize,
+    /// The handle `relibc_moruna::thread::spawn` gave; zero when there is none or it was taken.
+    handle: AtomicUsize,
+    /// Set by the creator once `handle` is: a joinable thread waits for it before its routine
+    /// runs, so a join or a detach always finds the handle.
+    ready: AtomicU32,
+}
 
 /// The next thread's id; the first thread's is 1.
 static NEXT_THREAD: AtomicUsize = AtomicUsize::new(1);
 
 impl ThreadId {
     fn get(&self) -> usize {
-        match self.0.load(Ordering::Acquire) {
+        match self.id.load(Ordering::Acquire) {
             0 => {
                 let id = NEXT_THREAD.fetch_add(1, Ordering::Relaxed);
                 match self
-                    .0
+                    .id
                     .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
                 {
                     Ok(_) => id,
@@ -125,6 +133,25 @@ impl ThreadId {
             }
             id => id,
         }
+    }
+
+    /// The creator's: gives the new thread its handle, and lets it run its routine.
+    pub(crate) fn give_handle(&self, handle: usize) {
+        self.handle.store(handle, Ordering::Release);
+        self.ready.store(1, Ordering::Release);
+        let _ = moruna::thread::futex_wake(&self.ready, 1);
+    }
+
+    /// The new thread's: waits for its creator to give it its handle.
+    pub(crate) fn wait_for_handle(&self) {
+        while self.ready.load(Ordering::Acquire) == 0 {
+            let _ = moruna::thread::futex_wait(&self.ready, 0, None);
+        }
+    }
+
+    /// The join's or the detach's: the handle, once; zero for a thread with none.
+    pub(crate) fn take_handle(&self) -> usize {
+        self.handle.swap(0, Ordering::AcqRel)
     }
 }
 

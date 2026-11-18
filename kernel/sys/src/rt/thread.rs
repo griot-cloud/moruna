@@ -3,15 +3,19 @@
 //!
 //! A thread gets a stack of its own (a memory object, with a guard page below it) and its block
 //! of ELF TLS with its control block ([`super::tls`]), which its FS base points at before its
-//! runtime's code runs on it. That code (std's thread start, or the C library's) runs its own
-//! thread-local destructors before it returns; then the thread frees its block and ends, or
-//! [`exit`] does so from anywhere in it. A joined thread's stack is unmapped by the join; a
-//! thread dropped without a join is kept on a list, and its stack is unmapped by the next spawn
-//! after it has ended.
+//! runtime's code runs on it. Every thread ends the same way, whichever runtime started it
+//! ([`end_current`]): the C library's work at a thread's end, then std's, each set by its
+//! runtime ([`at_thread_end`]), so a thread runs both runtimes' thread-local destructors; then
+//! the thread frees its block and ends, or [`exit`] does so from anywhere in it. A joined
+//! thread's stack is unmapped by the join, once the kernel says the thread has ended; a thread
+//! dropped without a join is kept on a list, and its stack (and its block, when it ended with its
+//! block kept: [`Thread::detach_releasing`]) is freed by the next spawn after the kernel says it
+//! has ended.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicU32;
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use core::time::Duration;
 
 use moruna_abi::{Error, PAGE_SIZE};
@@ -36,6 +40,66 @@ struct Running {
     handle: os::ThreadHandle,
     /// Unmapped when dropped, after the thread has ended.
     _stack: os::Stack,
+    /// The thread's block when it ended with it kept, freed when dropped, after the thread has
+    /// ended.
+    kept: Kept,
+}
+
+/// A block that outlived its thread's code: the C library's joinable thread keeps its block,
+/// which its `pthread_t` lies in, until its join or its detach. Null for none.
+struct Kept(*mut tls::Control);
+
+// SAFETY: the block is no thread's once its thread has ended, and only `Kept`'s drop frees it.
+unsafe impl Send for Kept {}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        // SAFETY: a `Running` is dropped once its thread has ended (`reap`), and the block is
+        // that thread's, which nothing reads after its end; null frees nothing.
+        unsafe { tls::release(self.0) };
+    }
+}
+
+/// The runtimes whose code runs on a thread (system design 5B), each with its own work at a
+/// thread's end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Runtime {
+    /// The C library: its cleanup handlers and its thread-local and key destructors.
+    Libc = 0,
+    /// std: its thread-locals' destructors and its handle of the thread.
+    Std = 1,
+}
+
+/// Each runtime's work at a thread's end, in the order [`end_current`] runs them; null for none.
+static ENDS: [AtomicPtr<()>; 2] = [
+    AtomicPtr::new(ptr::null_mut()),
+    AtomicPtr::new(ptr::null_mut()),
+];
+
+/// Sets `runtime`'s work at the end of every thread but the first: its start's to set, once,
+/// before the program's threads run.
+pub fn at_thread_end(runtime: Runtime, end: unsafe extern "C" fn()) {
+    ENDS[runtime as usize].store(end as *mut (), Ordering::Release);
+}
+
+/// The end of the calling thread, whichever runtime started it: the C library's work first,
+/// since POSIX runs a thread's cleanup handlers before its thread-local destructors, then std's.
+/// A thread [`spawn`] started runs it once its code has returned; the C library's
+/// `pthread_exit` runs it before it ends its thread.
+///
+/// # Safety
+///
+/// It is the calling thread's end: nothing reads the values of its thread-locals after.
+pub unsafe fn end_current() {
+    for end in &ENDS {
+        let end = end.load(Ordering::Acquire);
+        if !end.is_null() {
+            // SAFETY: only `at_thread_end` stores here, a function of this type.
+            let end: unsafe extern "C" fn() = unsafe { core::mem::transmute(end) };
+            // SAFETY: the caller's contract: the thread's end.
+            unsafe { end() };
+        }
+    }
 }
 
 /// Threads dropped without a join.
@@ -69,6 +133,7 @@ pub fn spawn(stack: usize, main: extern "C" fn(usize), arg: usize) -> Result<Thr
             running: Some(Running {
                 handle,
                 _stack: stack,
+                kept: Kept(ptr::null_mut()),
             }),
         }),
         Err(error) => {
@@ -88,7 +153,8 @@ pub(super) extern "C" fn trampoline(start: u64) -> ! {
     os::thread_exit()
 }
 
-/// A started thread's life: its block installed, its runtime's code run, its block freed.
+/// A started thread's life: its block installed, its runtime's code run, its end
+/// ([`end_current`]), its block freed.
 ///
 /// # Safety
 ///
@@ -100,23 +166,45 @@ pub(super) unsafe fn run(start: u64) {
     let Start { main, arg, block } = *start;
     block.install();
     main(arg);
+    // SAFETY: the thread's code has returned: its end.
+    unsafe { end_current() };
     tls::release_current();
 }
 
-/// Ends the calling thread from anywhere in its code, as `pthread_exit` does: its block is
-/// freed, so its runtime has run its thread-local destructors first. Its stack goes with its
-/// join, or after it as for any detached thread.
+/// Ends the calling thread from anywhere in its code: its end run ([`end_current`]) and its
+/// block freed. Its stack goes with its join, or after it as for any detached thread.
+///
+/// # Safety
+///
+/// As [`end_current`]'s: nothing on the thread's stack refers to its thread-locals' values.
 #[cfg(not(test))]
-pub fn exit() -> ! {
+pub unsafe fn exit() -> ! {
+    // SAFETY: the caller's contract.
+    unsafe { end_current() };
     tls::release_current();
     os::thread_exit()
 }
 
 impl Thread {
-    /// Waits for the thread to end, then unmaps its stack.
+    /// Waits for the kernel to say the thread has ended, then unmaps its stack.
     pub fn join(mut self) {
         if let Some(running) = self.running.take() {
             os::join(&running.handle);
+        }
+    }
+
+    /// Detaches a thread that ends, or has ended, with its block kept (the C library's joinable
+    /// thread, detached after its end): its stack and `control` are freed once the kernel says
+    /// it has ended, never while its last instructions may still run.
+    ///
+    /// # Safety
+    ///
+    /// `control` is this thread's block, kept past its code's end, which nothing else frees and
+    /// nothing reads after the thread has ended.
+    pub unsafe fn detach_releasing(mut self, control: *mut tls::Control) {
+        if let Some(mut running) = self.running.take() {
+            running.kept = Kept(control);
+            DETACHED.lock().push(running);
         }
     }
 }
@@ -249,6 +337,73 @@ mod tests {
             reap();
             std::thread::yield_now();
         }
+    }
+
+    static KEPT: AtomicPtr<tls::Control> = AtomicPtr::new(ptr::null_mut());
+    static HOLD: AtomicU32 = AtomicU32::new(0);
+
+    extern "C" fn keep_block_until_let_go(_: usize) {
+        // As the C library's joinable thread does: its block outlives its code, since the
+        // runtime finds no block of its to free.
+        KEPT.store(tls::current(), Ordering::SeqCst);
+        os::install(ptr::null_mut());
+        while HOLD.load(Ordering::Acquire) == 0 {
+            futex::futex_wait(&HOLD, 0, None);
+        }
+    }
+
+    #[test]
+    fn a_block_kept_past_its_thread_s_end_is_freed_with_its_stack_once_it_has_ended() {
+        let _only = DETACHING.lock().unwrap();
+        let before = DETACHED.lock().len();
+        let thread = spawn(0, keep_block_until_let_go, 0).unwrap();
+        while KEPT.load(Ordering::SeqCst).is_null() {
+            std::thread::yield_now();
+        }
+        // SAFETY: the thread's block, which it no longer has, and which only this frees.
+        unsafe { thread.detach_releasing(KEPT.load(Ordering::SeqCst)) };
+        reap();
+        assert_eq!(DETACHED.lock().len(), before + 1, "still running: kept");
+        HOLD.store(1, Ordering::Release);
+        futex::futex_wake_all(&HOLD);
+        while DETACHED.lock().len() > before {
+            reap();
+            std::thread::yield_now();
+        }
+    }
+
+    std::thread_local! {
+        static ENDING: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    }
+    /// The runtimes' ends the threads of [`every_thread_ends_with_the_c_library_s_end_then_std_s`]
+    /// ran, in order.
+    static ENDS_RUN: Mutex<Vec<Runtime>> = Mutex::new(Vec::new());
+
+    unsafe extern "C" fn libc_end() {
+        if ENDING.with(core::cell::Cell::get) {
+            ENDS_RUN.lock().unwrap().push(Runtime::Libc);
+        }
+    }
+
+    unsafe extern "C" fn std_end() {
+        if ENDING.with(core::cell::Cell::get) {
+            ENDS_RUN.lock().unwrap().push(Runtime::Std);
+        }
+    }
+
+    extern "C" fn mark_ending(_: usize) {
+        ENDING.with(|e| e.set(true));
+    }
+
+    #[test]
+    fn every_thread_ends_with_the_c_library_s_end_then_std_s() {
+        // Every test's threads run these from here on: they record only the threads marked.
+        at_thread_end(Runtime::Libc, libc_end);
+        at_thread_end(Runtime::Std, std_end);
+        spawn(0, mark_ending, 0).unwrap().join();
+        assert_eq!(*ENDS_RUN.lock().unwrap(), [Runtime::Libc, Runtime::Std]);
+        spawn(0, mark_ending, 0).unwrap().join();
+        assert_eq!(ENDS_RUN.lock().unwrap().len(), 4, "each thread, once");
     }
 
     #[test]

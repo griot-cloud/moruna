@@ -280,7 +280,8 @@ pub unsafe extern "C" fn relibc_start_v1(
 /// Moruna: the C library's start (system design 5B). The one `_start`, std's, calls it after the
 /// first thread's block of TLS and control block and std's log, and before the init arrays and
 /// `main`: what `relibc_start_v1` does but for those, the program's arguments the process's name
-/// and its environment empty, as `main` gets them.
+/// and its environment empty, as `main` gets them; and relibc's part of every thread's end,
+/// set on the runtime's one thread path.
 #[cfg(target_os = "moruna")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moruna_libc_init() {
@@ -312,6 +313,8 @@ pub unsafe extern "C" fn moruna_libc_init() {
         unsafe { platform::environ = platform::OUR_ENVIRON.unsafe_mut().as_mut_ptr() };
     }
     init_array();
+    // relibc's part of every thread's end, before std's, on the runtime's one thread path.
+    relibc_moruna::thread::at_thread_end(crate::pthread::moruna_thread_end);
     if unsafe { crate::platform::logger::init().is_err() } {
         log::error!("Logger has already been initialised");
     }

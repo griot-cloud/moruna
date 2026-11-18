@@ -24,6 +24,7 @@ pub use host::*;
 mod core_os {
     use core::sync::atomic::AtomicU32;
 
+    use std::boxed::Box;
     use std::os::moruna::moruna_sys as sys;
 
     use super::Access;
@@ -144,16 +145,75 @@ mod core_os {
 
     /// Starts a thread on the one thread path, std's and the C library's (system design 5B): a
     /// stack of `stack` bytes at least with a guard page, and the thread's block of TLS with its
-    /// control block, installed before `main(arg)` runs. The thread is not joined through the
-    /// runtime: its stack is unmapped after it ends, and relibc waits on its own futex.
-    pub fn spawn(stack: usize, main: extern "C" fn(usize), arg: usize) -> Result<(), u32> {
+    /// control block, installed before `main(arg)` runs. Its runtime handle, boxed, as an
+    /// address, which [`join`] or [`detach`] or [`detach_releasing`] takes once.
+    pub fn spawn(stack: usize, main: extern "C" fn(usize), arg: usize) -> Result<usize, u32> {
         sys::rt::thread::spawn(stack, main, arg)
-            .map(drop)
+            .map(|thread| Box::into_raw(Box::new(thread)).expose_provenance())
             .map_err(code)
     }
 
-    /// Ends the calling thread and keeps its block, which its `pthread_t` lies in, for the
-    /// join or the detach that frees it ([`release`]).
+    /// Takes back the handle [`spawn`] gave.
+    ///
+    /// # Safety
+    ///
+    /// `thread` is a handle `spawn` gave, taken once.
+    unsafe fn handle(thread: usize) -> Box<sys::rt::thread::Thread> {
+        // SAFETY: the caller's contract.
+        unsafe { Box::from_raw(core::ptr::with_exposed_provenance_mut(thread)) }
+    }
+
+    /// Waits for the kernel to say the thread has ended, then unmaps its stack.
+    ///
+    /// # Safety
+    ///
+    /// `thread` is a handle [`spawn`] gave, taken once.
+    pub unsafe fn join(thread: usize) {
+        // SAFETY: the caller's contract.
+        unsafe { handle(thread) }.join()
+    }
+
+    /// Detaches the thread: its stack is unmapped once the kernel says it has ended. The thread
+    /// frees its own block at its end.
+    ///
+    /// # Safety
+    ///
+    /// `thread` is a handle [`spawn`] gave, taken once.
+    pub unsafe fn detach(thread: usize) {
+        // SAFETY: the caller's contract.
+        drop(unsafe { handle(thread) })
+    }
+
+    /// Detaches a thread that ended with its block `control` kept: the block and the stack are
+    /// freed once the kernel says it has ended.
+    ///
+    /// # Safety
+    ///
+    /// `thread` is a handle [`spawn`] gave, taken once, and `control` that thread's block, which
+    /// nothing else frees.
+    pub unsafe fn detach_releasing(thread: usize, control: usize) {
+        let control = core::ptr::with_exposed_provenance_mut(control);
+        // SAFETY: the caller's contract.
+        unsafe { handle(thread).detach_releasing(control) }
+    }
+
+    /// Sets the C library's part of every thread's end (`rt::thread::end_current`).
+    pub fn at_thread_end(end: unsafe extern "C" fn()) {
+        sys::rt::thread::at_thread_end(sys::rt::thread::Runtime::Libc, end)
+    }
+
+    /// The calling thread's end: the C library's part, then std's.
+    ///
+    /// # Safety
+    ///
+    /// Nothing reads the values of the thread's thread-locals after.
+    pub unsafe fn end_current() {
+        // SAFETY: the caller's contract.
+        unsafe { sys::rt::thread::end_current() }
+    }
+
+    /// Ends the calling thread, its end already run, and keeps its block, which its
+    /// `pthread_t` lies in, for the join or the detach that frees it ([`release`]).
     pub fn thread_exit() -> ! {
         sys::thread_exit()
     }

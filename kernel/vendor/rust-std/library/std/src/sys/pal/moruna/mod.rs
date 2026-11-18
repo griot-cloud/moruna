@@ -24,6 +24,9 @@ use crate::io;
 pub extern "C" fn _start(start_page: u64) -> ! {
     moruna_sys::rt::start(start_page);
     moruna_sys::rt::stdio::open();
+    // std's part of every thread's end, on the one thread path: std's threads and the C
+    // library's run it alike (item 5.2b).
+    moruna_sys::rt::thread::at_thread_end(moruna_sys::rt::thread::Runtime::Std, thread_end);
     unsafe extern "C" {
         #[linkage = "extern_weak"]
         static moruna_libc_init: Option<unsafe extern "C" fn()>;
@@ -42,10 +45,8 @@ pub extern "C" fn _start(start_page: u64) -> ! {
     // takes an argument count and a null-terminated vector of them.
     let code = unsafe { main(1, argv) };
     // The first thread's thread-locals, as Hermit's std does.
-    unsafe {
-        crate::sys::thread_local::destructors::run();
-    }
-    crate::rt::thread_cleanup();
+    // SAFETY: `main` has returned: nothing refers to them.
+    unsafe { thread_end() };
     // SAFETY: the C library's `exit`, which ends the process through std's runtime.
     if let Some(exit) = unsafe { moruna_libc_exit } {
         unsafe { exit(code) };
@@ -63,6 +64,20 @@ unsafe extern "C" {
     static __init_array_end: extern "C" fn();
     static __fini_array_start: extern "C" fn();
     static __fini_array_end: extern "C" fn();
+}
+
+/// std's part of a thread's end (`moruna_sys::rt::thread::end_current`), whichever runtime
+/// started the thread: its thread-locals' destructors, as Hermit's std runs them itself, then its
+/// handle of the thread. The first thread's runs after `main`.
+///
+/// # Safety
+///
+/// It is the calling thread's end: nothing refers to its thread-locals.
+#[cfg(not(test))]
+unsafe extern "C" fn thread_end() {
+    // SAFETY: the caller's contract.
+    unsafe { crate::sys::thread_local::destructors::run() };
+    crate::rt::thread_cleanup();
 }
 
 /// Runs the functions between `start` and `end`, in order.

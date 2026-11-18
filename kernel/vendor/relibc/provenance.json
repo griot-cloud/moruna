@@ -181,11 +181,11 @@
     },
     "src/pthread/mod.rs": {
       "upstream_sha256": "e7f3e47a4dbd46cf3c9ffc442cd3dd006fff64c43cb1625f4b23774955eb6d31",
-      "patched_sha256": "c7ce33cdb0b354d08f2401faa5c142f5df02afc4f795180a3f4f5f3ed438c6c8"
+      "patched_sha256": "13d6e2ba6283f4d7df7de17ee4802e8fe0efcde4328a493daaa24f4c7135d411"
     },
     "src/start.rs": {
       "upstream_sha256": "a5c46a5191151a37b7d3f94f19e5d0133846a41d738e12e4f7eaeee9d475d27f",
-      "patched_sha256": "7b66be439e4bfbeb597a98719c02cd3b80e592459f2ff4a1115afec3c3b214ef"
+      "patched_sha256": "afa3b7d1b214cd104946990941b2655a288a137fb69fcae2b0831822ac379658"
     },
     "src/sync/mod.rs": {
       "upstream_sha256": "ab27e6ab289cf59cd8934a60618fee2d561e5b6faa8f5e004188e3d723b9c222",
@@ -199,7 +199,7 @@
     },
     {
       "path": "src/platform/moruna/mod.rs",
-      "sha256": "397bab69a3facb8d999e0cdc3006b98f21b6a954f3e536629984e40d613e9bb6"
+      "sha256": "9c56fb6ad9e0059fa9518db1bb6ad5ceb1039dcf30b1ffc441c32180fbe1dc82"
     },
     {
       "path": "src/platform/moruna/ptrace.rs",
