@@ -124,8 +124,8 @@ fn a_completion_that_says_something_else_frees_its_section_and_is_refused() {
         host.borrow_mut().lenient = true;
         host.borrow_mut().hold = true;
         assert!(card.send(&[1; 60]).unwrap());
-        // The frame went in section 0, and its transaction is its section.
-        host.borrow_mut().raw_completion(0, payload);
+        // The frame went in section 0, and its transaction is its section's, 1.
+        host.borrow_mut().raw_completion(1, payload);
         let e = poll(&mut card).unwrap_err();
         assert_malformed(&e, part);
         // The host has answered the transaction, so the section is free: both are.

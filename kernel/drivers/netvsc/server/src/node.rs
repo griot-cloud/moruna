@@ -9,6 +9,7 @@
 use alloc::{boxed::Box, format, rc::Rc, string::String, vec, vec::Vec};
 use core::{
     cell::{Cell, RefCell},
+    fmt,
     sync::atomic::AtomicU8,
 };
 
@@ -18,7 +19,7 @@ use moruna_netvsc_server::{
 };
 use moruna_svc::{
     CallError, Channel, Completions, DEADLINE_INFINITE, Dispatcher, Handle, Signals, Watch,
-    connect, deadline_in, wait_one,
+    connect, deadline_in, now, wait_one,
 };
 use moruna_sys::{Console, Mapping, Memory, hyperv::HvSignal, map, println, start};
 use moruna_vmbus::{ChannelError, GpadlId, MemoryId, Wait};
@@ -232,8 +233,24 @@ fn take(name: &str) -> Result<Handle, String> {
     start::take(name).ok_or_else(|| format!("no start handle {name}"))
 }
 
+/// The console, and when the process started: each step of the card's start is said with
+/// the milliseconds since then, so a start that stops is seen to stop, and where.
+struct Steps<'a> {
+    console: &'a Console,
+    started: u64,
+}
+
+impl Steps<'_> {
+    fn say(&self, line: fmt::Arguments<'_>) {
+        let ms = now().saturating_sub(self.started) / 1_000_000;
+        println!(self.console, "netvsc: {} ms: {}", ms, line);
+    }
+}
+
 /// The first synthetic network card `vmbus` offers, opened and started.
-fn card(console: &Console, vmbus_listener: &Channel) -> Result<Netvsc<Opening, Mapped>, String> {
+fn card(steps: &Steps<'_>, vmbus_listener: &Channel) -> Result<Netvsc<Opening, Mapped>, String> {
+    let console = steps.console;
+    steps.say(format_args!("asking vmbus for the synthetic network cards"));
     let channel = connect(vmbus_listener).map_err(|e| format!("vmbus: {e:?}"))?;
     let mut vmbus = vmbus::Client::connect(channel, deadline_in(ANSWER_NS))
         .map_err(|e| format!("vmbus: {e:?}"))?;
@@ -241,6 +258,10 @@ fn card(console: &Console, vmbus_listener: &Channel) -> Result<Netvsc<Opening, M
     let offers = vmbus
         .offers(Class::Net.interface())
         .map_err(|e| format!("vmbus's offers: {e:?}"))?;
+    steps.say(format_args!(
+        "contact: vmbus offers {} channels of synthetic network cards",
+        offers.len()
+    ));
     let mut cards = offers.iter().filter(|offer| offer.subchannel == 0);
     let offer = cards
         .next()
@@ -252,21 +273,36 @@ fn card(console: &Console, vmbus_listener: &Channel) -> Result<Netvsc<Opening, M
         );
     }
     let instance = offer.instance.0;
+    steps.say(format_args!(
+        "card {instance}: opening channel {} on {RING_PAGES} pages of rings",
+        offer.channel
+    ));
     let opened = vmbus
         .open(offer.channel, RING_PAGES, OUTGOING_PAGES)
         .map_err(|e| format!("card {instance}: open: {e:?}"))?;
+    steps.say(format_args!("card {instance}: channel opened"));
     let (receive, receive_memory) = buffer(1, RECEIVE_BUFFER)?;
     let (send, send_memory) = buffer(2, SEND_BUFFER)?;
     let unshared = vec![(receive.id, receive_memory), (send.id, send_memory)];
     let channel = Opening::new(opened, vmbus, offer.channel, unshared)
         .map_err(|e| format!("card {instance}: {e}"))?;
-    let card = Netvsc::start(channel, receive, send, Some(deadline_in(START_NS)))
-        .map_err(|e| format!("card {instance}: {e}"))?;
+    steps.say(format_args!(
+        "card {instance}: buffers made; starting the card"
+    ));
+    let card = Netvsc::start_saying(
+        channel,
+        receive,
+        send,
+        Some(deadline_in(START_NS)),
+        &mut |line| steps.say(line),
+    )
+    .map_err(|e| format!("card {instance}: {e}"))?;
     println!(console, "netvsc: card {instance}: {}", describe(&card));
     Ok(card)
 }
 
-fn serve(console: &Console) -> Result<(), String> {
+fn serve(console: &Console, started: u64) -> Result<(), String> {
+    let steps = Steps { console, started };
     let vmbus_listener = Channel(take("vmbus")?);
     // The registrar's connection first, before the card is up. The device manager holds
     // the network server's lookup of `net0` until this connection closes, after the card
@@ -275,7 +311,10 @@ fn serve(console: &Console) -> Result<(), String> {
     let mut directory = devices_protocol::open_directory(devices, deadline_in(ANSWER_NS))
         .map_err(|e| format!("the device manager: {e:?}"))?;
     directory.core().set_timeout(ANSWER_NS);
-    let mut card = card(console, &vmbus_listener)?;
+    steps.say(format_args!(
+        "connected to the device manager's register-netvsc"
+    ));
+    let mut card = card(&steps, &vmbus_listener)?;
     let wake = card
         .channel()
         .take_wake()
@@ -298,7 +337,7 @@ fn serve(console: &Console) -> Result<(), String> {
     // Registered once it is served: a lookup of the name connects at once. The connection
     // closes when registering is done, which the device manager's waiting lookups hear.
     match directory.register_net(String::from(NAME), theirs) {
-        Ok(()) => println!(console, "netvsc: served as {}", NAME),
+        Ok(()) => steps.say(format_args!("served as {NAME}")),
         Err(e) => println!(
             console,
             "netvsc: {}: the device manager did not register it: {:?}", NAME, e
@@ -332,10 +371,11 @@ fn serve(console: &Console) -> Result<(), String> {
 /// The process: it serves until the card fails or goes, which ends it, and the node with
 /// it.
 pub fn run() -> i64 {
+    let started = now();
     let Some(console) = start::take("console").map(Console) else {
         return 1;
     };
-    match serve(&console) {
+    match serve(&console, started) {
         Ok(()) => 0,
         Err(reason) => {
             println!(

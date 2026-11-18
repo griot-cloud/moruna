@@ -15,7 +15,12 @@
 //! too: it refuses a receive buffer whose ID is 0 with `FAILURE`, as Azure did on the first
 //! boot of netvsc (`moruna: fatal netvsc: ... the host refused the receive buffer with
 //! status 0x00000002`, console 2026-11-18T0146, image 4ba46ef5), where netvsp takes any
-//! ID. Every guest that works there gives a receive buffer an ID that is not 0.
+//! ID. Every guest that works there gives a receive buffer an ID that is not 0. It
+//! neither answers nor acts on a packet that asks for a completion under transaction ID
+//! 0, as Hyper-V does (Linux, `drivers/hv/channel.c`, `vmbus_next_request_id`): the
+//! second boot's start stopped there (console 2026-11-18T0213, image cf0271f5). And it
+//! reads the guest's ring only when signalled ([`Host::strict`]), so a signal the guest
+//! owes and does not give is a start that waits until its deadline.
 //!
 //! A test holds the fake as `Rc<RefCell<Host>>` and the card as a [`Card`]. What a test
 //! has the host send is queued, and goes on the ring the next time the card does
@@ -493,6 +498,13 @@ pub struct Host {
     pub completes: Completes,
     /// A paused host reads again as soon as the guest waits for it.
     pub wakes_on_wait: bool,
+    /// A host that reads the guest's ring only when the guest signals it, as Hyper-V's
+    /// does: by VMBus's rule (Linux's `hv_ringbuffer_write`, `hv_need_to_signal`), a
+    /// commit is signalled only when the ring was empty before it and the host has not
+    /// masked its interrupt. A guest that commits without the signal the rule asks for, or
+    /// waits with a packet uncommitted, waits until its deadline. Otherwise the fake also
+    /// reads whenever the guest is about to wait, which would hide such a guest.
+    pub strict: bool,
     /// The host takes its offer back: the channel closes once what is queued has gone.
     pub rescind: bool,
     /// Completions put off until the guest waits.
@@ -509,6 +521,8 @@ pub struct Host {
     pub filter: u32,
     /// The ID the guest gave its receive buffer.
     pub receive_id: Option<u16>,
+    /// Packets that asked for a completion under transaction ID 0, which Hyper-V ignores.
+    pub ignored: usize,
 
     // What happened.
     /// Every version the guest offered, in order.
@@ -625,6 +639,8 @@ impl Host {
             then: Vec::new(),
             completes: Completes::First,
             wakes_on_wait: false,
+            // As Hyper-V: every test runs against a host that reads only when signalled.
+            strict: true,
             rescind: false,
             deferred: Vec::new(),
             version: None,
@@ -635,6 +651,7 @@ impl Host {
             initialized: false,
             filter: 0,
             receive_id: None,
+            ignored: 0,
             offers: Vec::new(),
             messages: Vec::new(),
             frames: Vec::new(),
@@ -725,6 +742,17 @@ impl Host {
                 IncomingPacketType::Completion => {
                     self.completed(received.packet.transaction_id.unwrap(), &received.payload);
                 }
+                // Hyper-V does not acknowledge, nor act on, a packet that asks for a
+                // completion under transaction ID 0: the ID is its own, for messages the
+                // guest did not ask for (Linux, `drivers/hv/channel.c`,
+                // `vmbus_next_request_id`, which never hands one out for that reason).
+                IncomingPacketType::InBand if received.packet.transaction_id == Some(0) => {
+                    self.ignored += 1;
+                    self.violation(
+                        "a packet asking for a completion under transaction ID 0, which Hyper-V never answers"
+                            .into(),
+                    );
+                }
                 IncomingPacketType::InBand => {
                     self.message(received.packet.transaction_id, &received.payload);
                 }
@@ -742,7 +770,12 @@ impl Host {
         for transaction in std::mem::take(&mut self.deferred) {
             self.complete(transaction, Status::SUCCESS);
         }
-        self.run(ring);
+        if self.strict && !self.wakes_on_wait {
+            // Only what the host itself has to send: it reads when signalled.
+            self.flush(ring);
+        } else {
+            self.run(ring);
+        }
     }
 
     /// Puts on the ring what waits for it: queued packets while the ring has room, and
