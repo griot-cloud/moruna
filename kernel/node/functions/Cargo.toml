@@ -7,6 +7,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# `address_shown`: an address as the node shows it, its query (a credential) never (3E).
+moruna-api = { path = "../../api/types", version = "=0.1.0" }
 # SHA-256, pure Rust and the same on the kernel's target and a host (SDD 27).
 moruna-imagefs = { path = "../../imagefs/fs", version = "=0.1.0" }
 # The fetch on a node (item 3.4): a channel minted per image's host (egress), the network

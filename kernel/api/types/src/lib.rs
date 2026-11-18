@@ -23,6 +23,7 @@
 extern crate alloc;
 
 use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
+use core::fmt;
 use serde::{Deserialize, Serialize};
 
 #[cfg(any(test, feature = "schema"))]
@@ -438,9 +439,36 @@ pub struct Heartbeat {
     pub staging_bytes: u64,
 }
 
+/// What the node shows in place of an address's query (system design 3E).
+pub const QUERY_HIDDEN: &str = "?…";
+
+/// A function's address as the node shows it, everywhere but where `node-admission` fetches
+/// (system design 3E: `GET /v1/functions`, events, diagnostics, console and log lines): its
+/// scheme, host and path, with any query replaced by [`QUERY_HIDDEN`]. A query is a credential,
+/// a SAS or a pre-signed URL's signature, kept only to fetch. Being neither scheme, host nor
+/// path, credentials before the host's `@` are not shown either, nor a fragment, which is never
+/// sent. An address with none of them is shown as it is.
+pub fn address_shown(address: &str) -> String {
+    let (scheme, rest) = match address.find("://") {
+        Some(at) => address.split_at(at + "://".len()),
+        None => ("", address),
+    };
+    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let (path, after) = tail.split_at(tail.find(['?', '#']).unwrap_or(tail.len()));
+    let query = if after.starts_with('?') {
+        QUERY_HIDDEN
+    } else {
+        ""
+    };
+    format!("{scheme}{host}{path}{query}")
+}
+
 /// A function image to register, the body of `POST /v1/functions` (system design 3E). Unknown
 /// fields are refused.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct FunctionRegistration {
@@ -458,13 +486,26 @@ pub struct FunctionRegistration {
     pub signature: String,
 }
 
+impl fmt::Debug for FunctionRegistration {
+    /// The registration, its address as the node shows it: never its query.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FunctionRegistration")
+            .field("name", &self.name)
+            .field("address", &address_shown(&self.address))
+            .field("sha256", &self.sha256)
+            .field("signature", &self.signature)
+            .finish()
+    }
+}
+
 /// A registered function, as `GET /v1/functions` lists it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
 pub struct Function {
     /// The name a job names it by.
     pub name: String,
-    /// Where its image is fetched from.
+    /// Where its image is fetched from, as the node shows it: its scheme, host and path, with
+    /// any query (a SAS or a pre-signed URL's signature) replaced by `?…`.
     pub address: String,
     /// The SHA-256 of its image, as 64 lowercase hexadecimal digits.
     pub sha256: String,
@@ -473,6 +514,29 @@ pub struct Function {
     pub key: String,
     /// When it was registered, in Unix seconds.
     pub registered: u64,
+}
+
+impl Function {
+    /// The function as the node shows it: its address as [`address_shown`] gives it.
+    pub fn shown(&self) -> Function {
+        Function {
+            address: address_shown(&self.address),
+            ..self.clone()
+        }
+    }
+}
+
+impl fmt::Debug for Function {
+    /// The function, its address as the node shows it: never its query.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Function")
+            .field("name", &self.name)
+            .field("address", &address_shown(&self.address))
+            .field("sha256", &self.sha256)
+            .field("key", &self.key)
+            .field("registered", &self.registered)
+            .finish()
+    }
 }
 
 /// The answer to `GET /v1/functions`.
@@ -807,7 +871,7 @@ pub const OPERATIONS: &[Operation] = &[
         query: &[],
         response: Response::Functions,
         status: 200,
-        summary: "Every registered function: its name, address, SHA-256, the key that signed it and when it was registered.",
+        summary: "Every registered function: its name, its address with any query shown as ?…, SHA-256, the key that signed it and when it was registered.",
     },
 ];
 

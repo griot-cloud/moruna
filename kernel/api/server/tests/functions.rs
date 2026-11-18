@@ -53,6 +53,33 @@ fn a_signed_function_is_registered_and_listed() {
 }
 
 #[test]
+fn a_sas_address_is_answered_and_listed_without_its_query() {
+    // A private store's image, by its SAS (3E): the query is a credential, never shown.
+    let sas = "sv=2022-11-02&sr=c&sp=r&se=2026-11-18T18%3A00Z&spr=https&sig=FAKEfake%2Bfake%3D";
+    let address = format!("https://acct.blob.core.windows.net/functions/gate-score?{sas}");
+    let shown = "https://acct.blob.core.windows.net/functions/gate-score?…";
+    let mut harness = Harness::new();
+    let client = harness.connect();
+    let admin = harness.token(&["admin"]);
+    let body = registration("gate-score", &address, IMAGE, &harness.signer);
+    let registered = harness.exchange(client, &Harness::post("/v1/functions", &admin, &body));
+    assert_eq!(registered.status, 201);
+    assert_eq!(registered.json()["address"], shown);
+    let observer = Harness::bearer(&harness.token(&["observe"]));
+    let list = harness.get(client, "/v1/functions", &observer);
+    assert_eq!(list.status, 200);
+    assert_eq!(list.json()["functions"][0]["address"], shown);
+    assert_eq!(list.json()["functions"][0]["sha256"], sha256_hex(IMAGE));
+    for answer in [&registered, &list] {
+        let text = answer.json().to_string();
+        assert!(
+            !text.contains("sig=") && !text.contains("FAKEfake"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn a_bad_signature_an_unknown_key_and_a_lesser_scope_are_refused() {
     let mut harness = Harness::new();
     let client = harness.connect();

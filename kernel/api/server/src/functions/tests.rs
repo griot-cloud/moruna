@@ -239,6 +239,36 @@ fn the_registry_is_bounded() {
 }
 
 #[test]
+fn a_sas_address_is_shown_without_its_query_and_kept_whole_for_the_fetch() {
+    let signer = Signer::new();
+    let mut registry = Registry::new(vec![FunctionKey::new(signer.public())]);
+    let address = "https://acct.blob.core.windows.net/functions/gate-score?sp=r&sig=FAKEfake%3D";
+    let shown = "https://acct.blob.core.windows.net/functions/gate-score?…";
+    let answer = registry.register(
+        registration("gate-score", address, IMAGE, &signer).as_bytes(),
+        NOW,
+    );
+    assert_eq!(answer.status, 201);
+    assert_eq!(body(&answer)["address"], shown, "the answer shows no query");
+    assert_eq!(
+        registry.list().functions[0].address,
+        shown,
+        "nor does the list"
+    );
+    // Only what node-admission is given to fetch keeps it.
+    let fetched = registry.registered(&["gate-score".to_string()]);
+    assert_eq!(fetched[0].address, address);
+    // An address with no query is shown as it is.
+    let plain = "https://images.example.com/gate-enrich";
+    let text = registration("gate-enrich", plain, IMAGE, &signer);
+    assert_eq!(
+        body(&registry.register(text.as_bytes(), NOW))["address"],
+        plain
+    );
+    assert_eq!(registry.list().functions[0].address, plain);
+}
+
+#[test]
 fn a_function_a_job_uses_that_is_not_registered_is_refused() {
     let signer = Signer::new();
     let mut registry = Registry::new(vec![FunctionKey::new(signer.public())]);

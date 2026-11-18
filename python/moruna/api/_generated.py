@@ -304,7 +304,9 @@ class Function:
     """The name a job names it by."""
 
     address: str
-    """Where its image is fetched from."""
+    """Where its image is fetched from, as the node shows it: its scheme, host and path, with any
+    query (a SAS or a pre-signed URL's signature) replaced by `?…`.
+    """
 
     sha256: str
     """The SHA-256 of its image, as 64 lowercase hexadecimal digits."""
@@ -871,8 +873,8 @@ class Validation:
 
 
 def functions_list(client: Caller) -> Functions:
-    """Every registered function: its name, address, SHA-256, the key that signed it and when it was
-    registered.
+    """Every registered function: its name, its address with any query shown as ?…, SHA-256, the key
+    that signed it and when it was registered.
 
     ``GET /v1/functions``, a token with scope ``observe``.
     """
@@ -997,8 +999,8 @@ class Operations(Caller):
     """
 
     def functions_list(self) -> Functions:
-        """Every registered function: its name, address, SHA-256, the key that signed it and when it
-        was registered.
+        """Every registered function: its name, its address with any query shown as ?…, SHA-256, the
+        key that signed it and when it was registered.
 
         ``GET /v1/functions``, a token with scope ``observe``. The function
         ``functions_list(self)``.

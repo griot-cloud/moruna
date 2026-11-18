@@ -36,8 +36,9 @@ use core::fmt;
 use moruna_imagefs::sha256;
 
 /// A function a job uses, as it was registered: its name, the address its image is fetched
-/// from, and the image's SHA-256.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// from, and the image's SHA-256. The address is whole, to fetch; its `Debug` shows it as
+/// [`moruna_api::address_shown`] does, never its query (3E).
+#[derive(Clone, PartialEq, Eq)]
 pub struct Registered {
     /// The name the job names it by.
     pub name: String,
@@ -69,6 +70,17 @@ impl Registered {
             address: address.to_string(),
             sha256: bytes,
         })
+    }
+}
+
+impl fmt::Debug for Registered {
+    /// The function, its address as the node shows it: never its query.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Registered")
+            .field("name", &self.name)
+            .field("address", &moruna_api::address_shown(&self.address))
+            .field("sha256", &self.sha256)
+            .finish()
     }
 }
 
