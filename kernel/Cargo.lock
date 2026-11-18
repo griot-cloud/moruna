@@ -1300,6 +1300,13 @@ name = "node-functions"
 version = "0.1.0"
 dependencies = [
  "moruna-imagefs",
+ "moruna-netstack",
+ "moruna-node",
+ "moruna-node-http",
+ "moruna-svc",
+ "netstack-protocol",
+ "rcgen",
+ "rustls",
 ]
 
 [[package]]

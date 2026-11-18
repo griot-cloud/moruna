@@ -9,3 +9,15 @@ publish.workspace = true
 [dependencies]
 # SHA-256, pure Rust and the same on the kernel's target and a host (SDD 27).
 moruna-imagefs = { path = "../../imagefs/fs", version = "=0.1.0" }
+# The fetch on a node (item 3.4): a channel minted per image's host (egress), the network
+# server's client and TLS, and the node's HTTP client.
+moruna-node = { path = "../core", version = "=0.1.0" }
+moruna-node-http = { path = "../http", version = "=0.1.0" }
+moruna-svc.workspace = true
+netstack-protocol = { path = "../../net/protocol", version = "=0.1.0" }
+
+[dev-dependencies]
+# The real network server on a host, with TLS, for the fetch end to end.
+moruna-netstack = { path = "../../net/stack", version = "=0.1.0" }
+rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "crypto"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
