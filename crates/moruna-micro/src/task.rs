@@ -878,8 +878,9 @@ impl ImageTask {
 
     /// Starts the image's native program itself (`abi: moruna`): a process of the kernel made
     /// from the engine's process resource and charged to the task's account, the ELF loaded
-    /// by the kernel, the plane attached (its region, its rings object and its port) and the
-    /// log ring given under `log`. The personality has no part in it.
+    /// by the kernel, the plane attached (its region, its rings object and its port), the log
+    /// ring given under `log` and the stage's environment under `env` (item 5.5). The
+    /// personality has no part in it.
     #[allow(clippy::too_many_arguments)]
     fn start_native(
         &self,
@@ -913,8 +914,14 @@ impl ImageTask {
         let log = ring
             .give()
             .map_err(|e| kernel_error(format!("image `{name}`: {e}")))?;
+        // Its environment, as an image task's process gets its own (item 5.5): the slot `env`,
+        // which std's start reads and the C library's `environ` is built from.
+        let env = moruna_sys::env::give(&self.env).map_err(|e| fail("its environment", e))?;
         process
-            .start_with(entry, &mut [(Some(log), "log")])
+            .start_with(
+                entry,
+                &mut [(Some(log), "log"), (Some(env), moruna_sys::env::SLOT)],
+            )
             .map_err(|e| fail("starting its process", e))?;
         drop(account);
         *lock(&memory.account) = Some((kept, limit));

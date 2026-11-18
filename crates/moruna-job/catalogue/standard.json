@@ -552,7 +552,7 @@
           "params": {
             "type": "object",
             "additionalProperties": true,
-            "description": "The function's params, data only, given to its process as `MORUNA_PARAMS`, as an\n`image` task's are."
+            "description": "The function's params, data only, given to its process as `MORUNA_PARAMS`, as an\n`image` task's are, whether the function is native or an image."
           }
         },
         "required": [
