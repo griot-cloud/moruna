@@ -279,7 +279,12 @@ fn controllers(
 fn serve(console: &Console) -> Result<(), String> {
     let dma = take("dma")?;
     let vmbus_listener = Channel(take("vmbus")?);
+    // The registrar's connection first, before the scan. The device manager holds a lookup
+    // of a disk not yet registered until this connection closes, after the last disk.
     let devices = Channel(take("devices")?);
+    let mut directory = devices_protocol::open_directory(devices, deadline_in(ANSWER_NS))
+        .map_err(|e| format!("the device manager: {e:?}"))?;
+    directory.core().set_timeout(ANSWER_NS);
     let scratch = Page::new(&dma)?;
     let (_vmbus, found) = controllers(&vmbus_listener, &scratch)?;
     drop(scratch);
@@ -320,9 +325,6 @@ fn serve(console: &Console) -> Result<(), String> {
             }))
             .map_err(|e| format!("watching a wake channel: {}", e.name()))?;
     }
-    let mut directory = devices_protocol::open_directory(devices, deadline_in(ANSWER_NS))
-        .map_err(|e| format!("the device manager: {e:?}"))?;
-    directory.core().set_timeout(ANSWER_NS);
     let served: Vec<_> = driver.borrow().disks().cloned().collect();
     for (index, disk) in served.into_iter().enumerate() {
         let (ours, theirs) =

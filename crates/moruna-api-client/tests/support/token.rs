@@ -11,19 +11,40 @@ use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 /// The header every token carries.
 const HEADER: &str = r#"{"alg":"EdDSA","typ":"JWT"}"#;
 
-/// A token key: an Ed25519 key pair whose public half is one of the node's `token_keys`.
-pub struct Key(Ed25519KeyPair);
+/// An Ed25519 key pair: a token key, whose public half is one of the node's `token_keys`, or a
+/// function key, one of its `functions.keys`.
+pub struct Key(Ed25519KeyPair, Vec<u8>);
 
 impl Key {
     /// A new key pair.
     pub fn generate() -> Self {
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("an Ed25519 key");
-        Self(Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("the key just made"))
+        Self(
+            Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("the key just made"),
+            pkcs8.as_ref().to_vec(),
+        )
     }
 
     /// The public key's 32 bytes, as node config's `token_keys` holds them (base64 there).
     pub fn public(&self) -> Vec<u8> {
         self.0.public_key().as_ref().to_vec()
+    }
+
+    /// The private key as the operator holds it, as `openssl genpkey -algorithm ed25519` writes
+    /// it: PKCS#8 version 1 DER, the seed alone. ring makes version 2, whose seed this takes.
+    pub fn pkcs8(&self) -> Vec<u8> {
+        /// What comes before the seed in both versions' Ed25519 documents (RFC 8410).
+        const SEED_AT: usize = 16;
+        const V1: &[u8] = &[
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        [V1, &self.1[SEED_AT..SEED_AT + 32]].concat()
+    }
+
+    /// The signature of `message`.
+    pub fn sign(&self, message: &[u8]) -> Vec<u8> {
+        self.0.sign(message).as_ref().to_vec()
     }
 
     /// A token for the node `aud`, with this scope, expiring `ttl` seconds from now.

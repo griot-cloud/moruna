@@ -123,7 +123,7 @@ class Profiles(unittest.TestCase):
         # VMBus processes, which the supervisor starts on Hyper-V only (1F).
         self.assertEqual(cloud, ["moruna-node-supervisor", "devices", "netstack", "moruna-node-api",
                                  "moruna-node-platform", "virtio-blk", "virtio-net", "nvme", "gve",
-                                 "moruna-vmbus-server", "moruna-storvsc-server"])
+                                 "moruna-vmbus-server", "moruna-storvsc-server", "moruna-netvsc-server"])
         for absent in ("virtio-vsock", "imagefs", "linux", "node-admission", "moruna-storage-service", "engine",
                        "storvsc-check"):
             self.assertNotIn(absent, cloud)

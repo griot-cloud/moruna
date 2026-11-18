@@ -103,6 +103,7 @@ impl<C: Channel> Storvsc<C> {
             max_pages: 0,
         };
         device.start(Step::Begin)?;
+        device.commit()?;
         Ok(device)
     }
 
@@ -236,6 +237,12 @@ impl<C: Channel> Storvsc<C> {
             };
             let packet = match self.rings.receive(&mut self.channel) {
                 Ok(Some(packet)) => packet,
+                // What was sent while reading (a step of the initialisation) goes to
+                // the host, and its answer may be there at once.
+                Ok(None) if self.rings.uncommitted() => {
+                    self.commit()?;
+                    continue;
+                }
                 Ok(None) => return Ok(None),
                 Err(e) => return Err(self.broken(e)),
             };
@@ -281,8 +288,23 @@ impl<C: Channel> Storvsc<C> {
         if matches!(self.state, State::Failed) {
             return Err(Error::Failed);
         }
-        match self.rings.arm(&self.channel) {
+        match self.rings.arm(&mut self.channel) {
             Ok(ready) => Ok(ready),
+            Err(e) => Err(self.broken(e)),
+        }
+    }
+
+    /// Sends the host every request written since the last commit: one commit of the ring
+    /// to the host, and a signal only if VMBus's rule asks for one (the ring was empty
+    /// before it and the host has not masked its interrupt). Requests made back to back go
+    /// together; [`arm`](Storvsc::arm), [`wait`](Storvsc::wait) and a
+    /// [`poll`](Storvsc::poll) that answers `None` commit too.
+    pub fn commit(&mut self) -> Result<(), Error> {
+        if matches!(self.state, State::Failed) {
+            return Err(Error::Failed);
+        }
+        match self.rings.commit(&mut self.channel) {
+            Ok(()) => Ok(()),
             Err(e) => Err(self.broken(e)),
         }
     }

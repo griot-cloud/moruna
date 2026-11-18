@@ -36,7 +36,8 @@ PROGRAMS = {
     "standalone": ["moruna-node-supervisor", "node-admission", "moruna-storage-service", "devices", "imagefs", "linux", "netstack", "engine",
                    "virtio-blk", "virtio-vsock", "virtio-net", "nvme", "gve"],
     "cloud": ["moruna-node-supervisor", "devices", "netstack", "moruna-node-api", "moruna-node-platform",
-              "virtio-blk", "virtio-net", "nvme", "gve", "moruna-vmbus-server", "moruna-storvsc-server"],
+              "virtio-blk", "virtio-net", "nvme", "gve", "moruna-vmbus-server", "moruna-storvsc-server",
+              "moruna-netvsc-server"],
 }
 # For tests only, never the release image: the cloud's programs, `api` with its test route.
 PROGRAMS["cloud-test"] = PROGRAMS["cloud"]

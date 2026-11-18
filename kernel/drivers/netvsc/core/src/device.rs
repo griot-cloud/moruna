@@ -163,6 +163,7 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
             });
         }
         card.filter()?;
+        card.wire.flush()?;
         Ok(card)
     }
 
@@ -182,6 +183,24 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         self.link
     }
 
+    /// Asks the host to signal when there is something to do, without waiting: true when
+    /// there is already, a packet to [`poll`](Netvsc::poll), or room for a frame
+    /// [`send`](Netvsc::send) found none for. A driver that waits on handles (its clients'
+    /// and, on a node, its channel's wake channel) polls until `None`, sends what waits,
+    /// then arms, and waits only when this answers false: the host's next packet, or the
+    /// room, signals the channel. It [flushes](Netvsc::flush) first, so nothing written is
+    /// left uncommitted while the driver sleeps. As `moruna_storvsc::Storvsc::arm`.
+    pub fn arm(&mut self) -> Result<bool, NetvscError> {
+        self.wire.arm()
+    }
+
+    /// Sends the host everything written since the last flush (frames, completions): one
+    /// commit of the ring to the host, and a signal only if VMBus's rule asks for one (the
+    /// ring was empty before it and the host has not masked its interrupt).
+    pub fn flush(&mut self) -> Result<(), NetvscError> {
+        self.wire.flush()
+    }
+
     /// The channel, for the caller to wait on between polls.
     pub fn channel(&mut self) -> &mut C {
         &mut self.wire.channel
@@ -193,6 +212,10 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
     ///
     /// `Ok(false)` when no section is free or the ring to the host has no room: the
     /// frame was not sent, and can be once `poll` has read what the host sent next.
+    ///
+    /// Frames sent back to back go to the host together, at the next
+    /// [`flush`](Netvsc::flush) (or [`arm`](Netvsc::arm), or a `poll` that answers `None`):
+    /// one commit of the ring, and at most one signal, by VMBus's rule.
     ///
     /// Source: `netvsp_protocol`'s `Message1SendRndisPacket`, which names a section of
     /// the send buffer by its index; netvsp `parse_packet` and
@@ -247,7 +270,11 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
     /// REMOTE_NDIS_INDICATE_STATUS_MSG.
     pub fn poll(&mut self) -> Result<Option<Event<'_>>, NetvscError> {
         match self.pump()? {
-            None => Ok(None),
+            None => {
+                // The completions written while reading go to the host together.
+                self.wire.flush()?;
+                Ok(None)
+            }
             Some(Seen::Frame) => Ok(Some(Event::Frame(&self.frame))),
             Some(Seen::Link(up)) => Ok(Some(Event::Link(up))),
             Some(Seen::Control(_)) => malformed(unasked()),

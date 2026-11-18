@@ -117,8 +117,9 @@ fn the_ring_to_the_host_fills_and_recovers() {
     };
     let (card, host) = start_on(PAGE, 16 * PAGE, settings, |host| host.send_section = 2048);
     let mut card = up(card);
-    // Take the signal the host left while the card started.
-    assert_eq!(card.wait(), Ok(Wait::Signalled));
+    // Read what the start left, and take any signal it left.
+    assert_eq!(drain(&mut card), []);
+    let _ = card.wait();
     let mut random = Random(3);
     let frames: Vec<Vec<u8>> = (0..70).map(|i| random.frame(100 + i)).collect();
     host.borrow_mut().paused = true;
@@ -140,6 +141,115 @@ fn the_ring_to_the_host_fills_and_recovers() {
         assert!(card.send(frame).unwrap());
         assert_eq!(drain(&mut card), []);
     }
+    assert_clean(&host);
+    assert!(
+        host.borrow().frames == frames,
+        "a frame changed or was lost"
+    );
+}
+
+#[test]
+fn frames_sent_back_to_back_go_to_the_host_with_one_signal() {
+    let (mut card, host) = started(ROOMY);
+    let mut random = Random(0xb47c);
+    let frames: Vec<Vec<u8>> = (0..8).map(|i| random.frame(60 + 180 * i)).collect();
+    let before = card.signals();
+    for frame in &frames {
+        assert!(card.put(frame).unwrap());
+    }
+    // Written, not committed: the host has seen nothing, and was not signalled.
+    assert_eq!(card.signals(), before);
+    assert!(host.borrow().frames.is_empty());
+    card.commit().unwrap();
+    assert_eq!(card.signals(), before + 1, "one signal for the batch");
+    assert!(
+        host.borrow().frames == frames,
+        "a frame changed or was lost"
+    );
+    // Nothing left to commit: a flush signals nothing.
+    card.commit().unwrap();
+    assert_eq!(card.signals(), before + 1);
+    // An arm flushes what was sent, with the batch's one signal.
+    assert_eq!(drain(&mut card), []);
+    let before = card.signals();
+    assert!(card.put(&frames[0]).unwrap() && card.put(&frames[1]).unwrap());
+    card.arm().unwrap();
+    assert_eq!(card.signals(), before + 1);
+    assert_eq!(host.borrow().frames.len(), 10);
+    assert_clean(&host);
+}
+
+#[test]
+fn a_full_ring_takes_the_batch_written_before_it_to_the_host_first() {
+    // A one-page ring to the host holds 63 frames' packets. Unflushed, the 64th finds the
+    // ring full of the batch: the batch is committed, the host reads it, and the 64th goes.
+    let settings = Settings {
+        receive_buffer: 8 * PAGE,
+        send_buffer: 64 * PAGE,
+    };
+    let (card, host) = start_on(PAGE, 16 * PAGE, settings, |host| host.send_section = 2048);
+    let mut card = up(card);
+    assert_eq!(drain(&mut card), []);
+    let _ = card.wait();
+    let mut random = Random(0x40);
+    let frames: Vec<Vec<u8>> = (0..64).map(|i| random.frame(100 + i)).collect();
+    let before = card.signals();
+    for frame in &frames {
+        assert!(card.put(frame).unwrap());
+    }
+    assert_eq!(card.signals(), before + 1, "the full ring's commit");
+    assert_eq!(host.borrow().frames.len(), 63);
+    card.commit().unwrap();
+    assert_eq!(card.signals(), before + 2);
+    assert!(
+        host.borrow().frames == frames,
+        "a frame changed or was lost"
+    );
+    assert_eq!(drain(&mut card), []);
+    assert_clean(&host);
+}
+
+#[test]
+fn arm_says_when_there_is_work_and_leaves_the_hosts_signal_on() {
+    // The ring to the host is one page, so it is the ring that runs out.
+    let settings = Settings {
+        receive_buffer: 8 * PAGE,
+        send_buffer: 64 * PAGE,
+    };
+    let (card, host) = start_on(PAGE, 16 * PAGE, settings, |host| host.send_section = 2048);
+    let mut card = up(card);
+    assert_eq!(drain(&mut card), []);
+    let _ = card.wait();
+    // Nothing to read and nothing refused: nothing to do.
+    assert!(!card.arm().unwrap());
+    // A frame comes: there is work, and the host signalled as it delivered.
+    let mut random = Random(0xa4);
+    let frame = random.frame(200);
+    host.borrow_mut().deliver(&[&frame]);
+    assert!(card.arm().unwrap(), "the frame is in the ring");
+    assert_eq!(drain(&mut card), [Got::Frame(frame)]);
+    assert!(!card.arm().unwrap());
+    assert_eq!(card.wait(), Ok(Wait::Signalled), "the host's signal, kept");
+    // The host stops reading and keeps its completions: the ring to it fills, and a
+    // frame is refused. Nothing to read and no room: nothing to do yet.
+    let frames: Vec<Vec<u8>> = (0..70).map(|i| random.frame(100 + i)).collect();
+    host.borrow_mut().paused = true;
+    host.borrow_mut().hold = true;
+    let mut sent = 0;
+    while card.send(&frames[sent]).unwrap() {
+        sent += 1;
+    }
+    assert!(!card.arm().unwrap());
+    // The host reads again and answers nothing: the room alone is work.
+    host.borrow_mut().paused = false;
+    card.run_host();
+    assert!(card.arm().unwrap(), "the ring to the host has room");
+    for frame in &frames[sent..] {
+        assert!(card.send(frame).unwrap());
+    }
+    assert!(!card.arm().unwrap(), "the room was used and nothing came");
+    host.borrow_mut().release();
+    assert_eq!(drain(&mut card), []);
     assert_clean(&host);
     assert!(
         host.borrow().frames == frames,

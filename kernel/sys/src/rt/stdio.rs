@@ -110,6 +110,13 @@ impl Sink {
     }
 }
 
+/// Takes the task's log slot, or finds its console, now: the program's start does so before
+/// `main` (system design 5B), so the C library's descriptors 1 and 2, which write through here,
+/// find std's writer. Writing does so too, if nothing has.
+pub fn open() {
+    SINK.lock().open();
+}
+
 /// Writes `bytes`; every byte is taken, whether or not the line is kept.
 pub fn write(bytes: &[u8]) -> usize {
     SINK.lock().write(bytes);
@@ -185,6 +192,7 @@ mod tests {
     #[test]
     fn a_task_with_neither_log_nor_console_takes_and_drops_its_output() {
         // A host process has no start page: no log slot, no console slot.
+        open();
         let mut sink = Sink::Unopened;
         sink.write(b"nowhere\n");
         assert!(matches!(sink, Sink::None));

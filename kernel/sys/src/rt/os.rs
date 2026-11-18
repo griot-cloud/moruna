@@ -54,27 +54,48 @@ mod moruna {
         }
     }
 
-    /// The calling thread's table of thread-local keys: the address its FS base holds in its
-    /// first word.
-    pub(in crate::rt) fn table() -> *mut *mut u8 {
-        let table: usize;
-        // SAFETY: `install` set this thread's FS base to a table whose first word holds the
-        // table's own address before any key was read (`rt::start` for the first thread, the
-        // thread's start for every other); the load reads that word.
+    /// The calling thread's thread pointer: the address its FS base holds, which its control
+    /// block's first word holds again (the psABI's FS:0, read because `rdfsbase` may not be
+    /// enabled). Every thread the runtime runs has one from before its first instruction of
+    /// std's or the C library's.
+    pub(in crate::rt) fn thread_pointer() -> *mut u8 {
+        let base: u64;
+        // SAFETY: the thread's FS base is its control block, whose first word is its address
+        // (`tls::Block::new`); the load reads that word.
         unsafe {
             core::arch::asm!(
                 "mov {}, qword ptr fs:[0]",
-                out(reg) table,
+                out(reg) base,
                 options(nostack, readonly, preserves_flags),
             );
         }
-        core::ptr::with_exposed_provenance_mut(table)
+        core::ptr::with_exposed_provenance_mut(base as usize)
     }
 
-    /// Points the calling thread's FS base at `table`.
-    pub(in crate::rt) fn install(table: *mut *mut u8) {
+    /// Points the calling thread's FS base at `pointer`, a control block (null: none).
+    pub(in crate::rt) fn install(pointer: *mut u8) {
         // The address is this process's own memory, so the kernel takes it.
-        let _ = crate::set_fs(table.expose_provenance() as u64);
+        let _ = crate::set_fs(pointer.expose_provenance() as u64);
+    }
+
+    /// The program's TLS template, from its own headers, which the std linker script maps at
+    /// `__ehdr_start` (`kernel/targets/x86_64-moruna.ld`).
+    pub(in crate::rt) fn template() -> super::super::tls::Template {
+        use super::super::tls::Template;
+        unsafe extern "C" {
+            static __ehdr_start: u8;
+        }
+        let start = &raw const __ehdr_start;
+        // SAFETY: the linker maps the ELF header and the program headers it names at
+        // `__ehdr_start`, in the program's first segment, readable for its life.
+        let headers = unsafe {
+            let head = core::slice::from_raw_parts(start, 64);
+            let phoff = u64::from_le_bytes(head[32..40].try_into().unwrap_or([0; 8])) as usize;
+            let entsize = u16::from_le_bytes([head[54], head[55]]) as usize;
+            let count = u16::from_le_bytes([head[56], head[57]]) as usize;
+            core::slice::from_raw_parts(start, phoff + entsize * count)
+        };
+        Template::from_headers(headers).unwrap_or(Template::NONE)
     }
 
     /// The CPUs online, from the start page; one when it says none.
@@ -238,15 +259,27 @@ mod host {
     }
 
     std::thread_local! {
-        static TABLE: Cell<usize> = const { Cell::new(0) };
+        static POINTER: Cell<usize> = const { Cell::new(0) };
     }
 
-    pub(in crate::rt) fn table() -> *mut *mut u8 {
-        core::ptr::with_exposed_provenance_mut(TABLE.with(Cell::get))
+    /// The host's threads have their own FS base: the stand-in keeps the pointer aside.
+    pub(in crate::rt) fn thread_pointer() -> *mut u8 {
+        core::ptr::with_exposed_provenance_mut(POINTER.with(Cell::get))
     }
 
-    pub(in crate::rt) fn install(table: *mut *mut u8) {
-        TABLE.with(|t| t.set(table.expose_provenance()));
+    pub(in crate::rt) fn install(pointer: *mut u8) {
+        POINTER.with(|t| t.set(pointer.expose_provenance()));
+    }
+
+    /// A template of eight initialized bytes in a TLS of 96, aligned to 16.
+    pub(in crate::rt) fn template() -> super::super::tls::Template {
+        static IMAGE: [u8; 8] = *b"host tls";
+        super::super::tls::Template {
+            image: IMAGE.as_ptr() as usize,
+            image_len: IMAGE.len(),
+            size: 96,
+            align: 16,
+        }
     }
 
     pub(in crate::rt) fn cpus() -> usize {

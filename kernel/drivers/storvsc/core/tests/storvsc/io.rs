@@ -373,6 +373,7 @@ fn thirty_two_requests_in_flight_complete_out_of_order() {
         assert!(writes.insert(id, (block, data)).is_none(), "ID {id} twice");
     }
     assert_eq!(device.in_flight(), limit);
+    device.commit().unwrap();
     assert_eq!(host.borrow().held(), limit);
     assert!(matches!(device.poll(), Ok(None)));
     // The thirty-third has no room, and the host never sees it.
@@ -594,6 +595,34 @@ fn a_wait_returns_at_once_when_a_packet_is_there() {
 }
 
 #[test]
+fn requests_made_back_to_back_go_to_the_host_with_one_signal() {
+    let (mut device, host) = device();
+    let (signals, seen) = (device.channel().host_signals(), host.borrow().seen.len());
+    let ids: Vec<u64> = (0..8).map(|_| device.flush(DISK).unwrap()).collect();
+    // Written, not committed: the host has seen none of them, and was not signalled.
+    assert_eq!(device.channel().host_signals(), signals);
+    assert_eq!(host.borrow().seen.len(), seen);
+    device.commit().unwrap();
+    assert_eq!(
+        device.channel().host_signals(),
+        signals + 1,
+        "one signal for eight"
+    );
+    assert_eq!(host.borrow().seen.len(), seen + 8);
+    for id in ids {
+        assert_eq!(moved(&mut device, id), 0);
+    }
+    // Nothing left to commit: a commit signals nothing.
+    device.commit().unwrap();
+    assert_eq!(device.channel().host_signals(), signals + 1);
+    // An arm commits what was written, with one signal.
+    let id = device.flush(DISK).unwrap();
+    assert!(device.arm().unwrap(), "the answer is in the ring");
+    assert_eq!(device.channel().host_signals(), signals + 2);
+    assert_eq!(moved(&mut device, id), 0);
+}
+
+#[test]
 fn arm_leaves_the_hosts_signal_on_and_says_when_there_is_work() {
     let (mut device, host) = device();
     // Nothing to read and nothing refused: nothing to do, and nothing slept.
@@ -628,12 +657,13 @@ fn a_closed_channel_is_an_error_to_the_caller() {
         device.wait(Some(0)),
         Err(Error::Channel(ChannelError::Closed))
     ));
-    // The request is in the ring, and the host cannot be told.
+    // The request is written to the ring, and the commit cannot tell the host.
+    device.flush(DISK).unwrap();
     assert!(matches!(
-        device.flush(DISK),
+        device.commit(),
         Err(Error::Channel(ChannelError::Closed))
     ));
-    assert_eq!(device.in_flight(), 0);
+    assert_eq!(device.in_flight(), 1);
     assert!(matches!(
         device.wait(None),
         Err(Error::Channel(ChannelError::Closed))

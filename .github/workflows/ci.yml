@@ -109,7 +109,7 @@ jobs:
         run: |
           rustup component add llvm-tools-preview
           cargo install cargo-llvm-cov --locked --version 0.8.5
-          "$FREETHREADED" -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin pyyaml uv
+          "$FREETHREADED" -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin pyyaml uv cryptography
       - name: The vmm jail may make user namespaces, and reach the programs it binds in
         # The jail's child binds moruna-vhost-vsock into its root from inside a user namespace
         # that does not map the runner's user, so it walks the path as "other". An installed
@@ -219,7 +219,7 @@ jobs:
           python-version: "3.14t"
       - name: uv, and the benchmarks' dependencies
         run: |
-          python -m pip install --quiet --only-binary=:all: numpy pytest pyarrow uv
+          python -m pip install --quiet --only-binary=:all: numpy pytest pyarrow uv cryptography
       - name: python/tests against a wheel built from this commit
         env:
           MORUNA_PYTHON: ${{ steps.freethreaded.outputs.python-path }}
@@ -358,7 +358,7 @@ jobs:
             -p hvdef -p x86defs -p vmbus_core -p vmbus_ring -p netvsp_protocol -p storvsp_protocol
             -p scsi_defs -p open_enum -p guid -p guestmem_core -p safeatomic -p net_backend_core
             -p moruna-storvsc -p moruna-storvsc-server -p storvsc-check -p block-protocol -p devices -p devices-protocol
-            -p moruna-netvsc
+            -p moruna-netvsc -p moruna-netvsc-server
             -p moruna-mmio -p moruna-pci -p moruna-virtio -p moruna-driver-table -p moruna-imagefs
             -p moruna-linux -p linux-protocol -p moruna-nvme -p moruna-gve -p net-protocol
             -p moruna-datapath -p moruna-sys -p moruna-node -p moruna-netstack -p netstack-protocol -p node-functions -p moruna-api-server -p moruna-ostd-adaptation)
