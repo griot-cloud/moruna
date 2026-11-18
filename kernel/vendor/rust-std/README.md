@@ -40,15 +40,27 @@ module Moruna implements is a file of a few lines over Moruna's runtime, `moruna
 logic is, tested on a host. The selections in the `mod.rs` files gain a `target_os = "moruna"`
 arm beside Motor's.
 
-- **Entry:** `sys/pal/moruna`: `_start` takes the start page's address, gives the first thread
-  its table of thread-local keys, runs the program's `main` and exits with its code, once the
-  last line of stdout and stderr is out. `abort_internal`, where a panic ends, does the same
-  with code 101, a panicking program's code on Moruna.
+- **Entry:** `sys/pal/moruna`, the one `_start` for std and the C library (system design 5B).
+  In order: the first thread's thread-locals and control block from the start page's process;
+  std's log, which stdout and stderr (and the C library's descriptors 1 and 2) write to; the C
+  library's own initialization when one is linked (it defines `moruna_libc_init`, a weak symbol
+  here); then `main`, with the process's name as its one argument (`argc` 1). After `main`, the
+  first thread's thread-local destructors, and the exit with its code once the last line of
+  stdout and stderr is out. `abort_internal`, where a panic ends, exits with code 101, a
+  panicking program's code on Moruna.
 - **alloc:** the process's heap, `moruna_sys`'s, which std's `System` allocates from.
-- **thread:** spawn, with a 2 MiB stack by default (as Linux's std; arrow-rs and query engines
-  recurse deeply) and a guard page below it, and a key table; join, sleep, and yield
-  (`thread_yield`, ABI 2.8). Thread-local storage is std's key-based kind
-  (`thread_local::key`, as Motor and Xous), each thread's FS base pointing at its table.
+- **thread:** the one thread path, `moruna_sys::rt::thread`, which the C library's
+  `pthread_create` takes too: a 2 MiB stack by default (as Linux's std; arrow-rs and query
+  engines recurse deeply) with a guard page below it; join, sleep, and yield (`thread_yield`,
+  ABI 2.8). std's thread start runs its thread-locals' destructors itself before the thread
+  ends, as Hermit's std does.
+- **thread-local storage:** native ELF TLS (`has-thread-local`, the `local-exec` model; x86_64
+  psABI variant II), the key table gone (system design 5B). Each thread's block is its TLS,
+  made from the program's `PT_TLS` template, directly below its control block, whose address
+  is the thread's FS base and the control block's first word (FS:0).
+  `kernel/targets/x86_64-moruna.ld` maps the program's headers at `__ehdr_start`, where the
+  runtime finds the template. The control block (`moruna_sys::rt::tls::Control`) begins as
+  relibc's `GenericTcb` does and keeps 512 bytes for the C library's per-thread state.
 - **sync:** std's futex `Mutex`, `Condvar`, `RwLock`, `Once` and thread parking, over the core's
   futex calls (`moruna_sys::rt::futex`, with timeouts on the monotonic clock).
 - **time:** `Instant` from the clock page; `SystemTime` from the node's wall clock on the same
@@ -97,7 +109,7 @@ used.
 | `std/src/sys/io/error/mod.rs` | 48 | +5 -0 | `1b591042fe82bc290244f6099db38bdb233578cdbcb2d927eab1181f035389d7` | `ad87700d9467fc5c6d9bf978ded0380d9bd15436fd99c40711999359e884f22c` |
 | `std/src/sys/io/error/moruna.rs` | 43 | +43 -0 | new | `21cbf255f65ed305d6f9e32708fea40deb7ac67e484252e17df769d204d08948` |
 | `std/src/sys/pal/mod.rs` | 72 | +5 -0 | `251dee50eff49b81ae5283ffd9871635dc63c316e0156a0f6f69672657ddbec3` | `6feb3489f30948c6a4bf197beb558874a5ef495beeb2365c1d43b786d144e99d` |
-| `std/src/sys/pal/moruna/mod.rs` | 52 | +52 -0 | new | `620d9f0aaf9c8b87c7ac1bda8be3fbe465753fc82a0002bf3f772e7c710e8f5a` |
+| `std/src/sys/pal/moruna/mod.rs` | 78 | +78 -0 | new | `830c87ffc1d3213cafe5e7fba42f5f4340d1f1bcd7f691a44ad378e40e98ebfc` |
 | `std/src/sys/random/mod.rs` | 138 | +5 -0 | `38d7c91c3fee07226c5071a4e8edd75dd693f54cd76bc7f2a06fd8b80d0cb794` | `0603c349f20dcd2d5f87321465ed3d7fb2840841aa5baadd6b4bb752ea9a8af7` |
 | `std/src/sys/random/moruna.rs` | 7 | +7 -0 | new | `b5e898270826fc097a484efb411cc622261702726e0edee54e3d2b39330c207e` |
 | `std/src/sys/stdio/mod.rs` | 57 | +5 -0 | `ffc59c348ecc12e0d4748855309112f13979392983cafb677be6b82fc6e74d59` | `5a4ee16a5de372d607316f6efc08e7a11b5cf1b4a4f83cdfbfbe0ca7c47c443f` |
@@ -108,8 +120,8 @@ used.
 | `std/src/sys/sync/rwlock/mod.rs` | 37 | +2 -0 | `5438fdbc0ade05b50d7350c252ccb9d37bea596355560fbdc695f4937d727ef3` | `7fbee57f5ac665965a6b0d30dedb4f803dd8ef8255a7d6313b998d7ee97cd80f` |
 | `std/src/sys/sync/thread_parking/mod.rs` | 51 | +2 -0 | `26f989d09efadae98b1fa6447b386d8eda21b9fc3ef99c8bea3154d6625788a3` | `cc9cc6f4ad37c89e4cf5e8babff0a51d16e8a1e088fb2420c57eab279f26ec74` |
 | `std/src/sys/thread/mod.rs` | 162 | +8 -0 | `3590ca4dc8b112c787b14fcc5585add929a6e7c827ce01c329c2ef43e45587d6` | `cc4904f4fad1399a9a5bc508ca0bdf0cc635113d5def953898d80ab099c13352` |
-| `std/src/sys/thread/moruna.rs` | 49 | +49 -0 | new | `6c349e214785bf6ccaa640b7dbcb0117543f39742eda9a79fb5a2f79552c2601` |
-| `std/src/sys/thread_local/mod.rs` | 231 | +9 -0 | `bc072e04d8564c050420e597b89e2b100502bb1395423277c057ca8aec70317a` | `c18b209709b464353043f33284439d14f2bf2e0eb65fcc6901ee982c50b0d7d0` |
+| `std/src/sys/thread/moruna.rs` | 56 | +56 -0 | new | `f2b35db105dfebc57d5f0924220c75c649f7fa7fdb16cfb2d2b83de0e385876e` |
+| `std/src/sys/thread_local/mod.rs` | 224 | +2 -0 | `bc072e04d8564c050420e597b89e2b100502bb1395423277c057ca8aec70317a` | `346931af35a4f0c38e0751681f94fe71f3172a04cb77b2da733c8f9f07754b75` |
 | `std/src/sys/time/mod.rs` | 57 | +4 -0 | `449afdd86955252a302d889032a6cb2cbb04dd786f8cb81d9a9059ad933e7e4c` | `dc5f131f9033808546387962e3c22d24f962204bc06b42123d328775035dbbfa` |
 
 No upstream file is removed, and outside `Cargo.lock` no upstream line changes: the layer only
@@ -122,4 +134,7 @@ adds. `Cargo.lock` gains the three Moruna crates std depends on (`moruna-sys`, `
 `kernel/tools/build-std.sh MANIFEST` builds a program for `kernel/targets/x86_64-moruna.json`
 with `-Zbuild-std=std,panic_abort`, `__CARGO_TESTS_ONLY_SRC_ROOT` pointing build-std at this
 `library/`, getrandom's custom backend (`kernel/getrandom`, the core's `random_read`), and the
-native programs' link (static, `kernel/sys/user.ld`). The proof is `kernel/examples/std-arrow`.
+native programs' static link, with their layout and the TLS template
+(`kernel/targets/x86_64-moruna.ld`). A digest of this `library/`, the target and the Moruna
+crates std depends on goes into every unit's metadata, since build-std does not notice an edit to
+them by itself. The proof is `kernel/examples/std-arrow`.

@@ -18,6 +18,13 @@ impl Thread {
             };
             let rust_start = init.init();
             rust_start();
+
+            // std runs its thread-locals' destructors itself, before the runtime frees the
+            // thread's block (`moruna_sys::rt::thread`), as Hermit's std does.
+            unsafe {
+                crate::sys::thread_local::destructors::run();
+            }
+            crate::rt::thread_cleanup();
         }
 
         let arg = Box::into_raw(init).expose_provenance();
