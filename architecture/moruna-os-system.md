@@ -396,6 +396,9 @@ Implements the OS design, section 2.
     `listen`, but the supervisor never listens itself. At each start it mints `api`'s listener from
     it (`Client::grant`). `node.conf`'s one record says it all:
     `restart api network network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000`,
+    and a fresh connection to `node-admission` at every start (the supervisor holds a client of
+    admission's listener and connects anew; a dead api's connection closes, and admission ends its
+    jobs),
     giving the service, its listener slot, the network server's service, its granting slot, and
     the policy. `network.conf`
     has no `listen-api` grant.
