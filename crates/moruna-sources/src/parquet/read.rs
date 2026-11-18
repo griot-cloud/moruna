@@ -6,11 +6,13 @@ use moruna_kernel::{Allocator, BoxFuture, Payload, Result, RowRange, Split, Tier
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+    RowSelector,
 };
 use parquet::file::metadata::ParquetMetaData;
 
+use super::parts::GroupFetch;
 use super::reader::ArenaChunks;
-use super::{ParquetSource, append};
+use super::{ParquetSource, append, parts};
 use crate::stats::Counters;
 use crate::util::{oversized, page_ceil, page_floor, resolve_range, source_err};
 
@@ -48,7 +50,7 @@ pub(crate) fn read<'a>(
 /// A split's projected column chunks, fetched and not yet decoded (RB1,
 /// `architecture/worker-io.md`): what the drive hands a worker to decode.
 pub(crate) struct ParquetFetched {
-    chunks: ArenaChunks,
+    fetch: GroupFetch,
     range: RowRange,
 }
 
@@ -76,8 +78,8 @@ fn fetch_now(
     let range = resolve_range(split, rows)?;
     Counters::add(&source.counters().reads, 1);
     let last = range.end >= split.rows;
-    if let Some(chunks) = source.fetched_last(split.id, last) {
-        return Ok(ParquetFetched { chunks, range });
+    if let Some(fetch) = source.fetched_last(split.id, last) {
+        return Ok(ParquetFetched { fetch, range });
     }
 
     let group = file
@@ -167,10 +169,10 @@ fn fetch_now(
         fetched.push((start, bytes));
     }
 
-    let chunks = ArenaChunks::new(file_len, fetched);
+    let fetch = GroupFetch::new(ArenaChunks::new(file_len, fetched));
     Counters::add(&source.counters().group_fetches, 1);
-    source.keep_fetched(split.id, &chunks, last);
-    Ok(ParquetFetched { chunks, range })
+    source.keep_fetched(split.id, &fetch, last);
+    Ok(ParquetFetched { fetch, range })
 }
 
 /// The CPU half of a read: decode a fetched split into a payload in arena buffers of `tier`.
@@ -183,29 +185,22 @@ pub(crate) fn decode_fetched(
     tier: Tier,
 ) -> Result<Payload> {
     let (file, entry) = source.entry(split)?;
-    let ParquetFetched { chunks, range } = fetched;
-    let mask = ProjectionMask::leaves(
-        file.metadata.file_metadata().schema_descr(),
-        file.projected.iter().copied(),
-    );
+    let ParquetFetched {
+        fetch: GroupFetch { chunks, decode },
+        range,
+    } = fetched;
     // A range of a group decodes only the pages it covers when they can be located (`pages`):
     // the group alone, with its page locations, as row group 0.
     let partial = range.start != 0 || range.end != split.rows;
-    let (metadata, row_group) = match partial
+    let indexed = partial
         .then(|| source.paged(split, file, entry, &chunks))
-        .flatten()
-    {
-        Some(indexed) => {
-            Counters::add(&source.counters().ranges_paged, 1);
-            (indexed, 0)
-        }
-        None => (std::sync::Arc::clone(&file.metadata), entry.row_group),
-    };
+        .flatten();
+    if indexed.is_some() {
+        Counters::add(&source.counters().ranges_paged, 1);
+    }
     if partial {
         Counters::add(&source.counters().ranges_decoded, 1);
     }
-    let arrow_meta = ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())
-        .map_err(|e| source_err(split.id, e.to_string()))?;
     let wanted = (range.end - range.start).max(1);
     // 3A (6.3a): a range whose columns are flat is decoded a batch at a time into its arena
     // buffers (`append`), so what a read holds outside the arena never exceeds its own decoded
@@ -218,25 +213,43 @@ pub(crate) fn decode_fetched(
     } else {
         wanted
     };
-    let selection = RowSelection::from_consecutive_ranges(
-        std::iter::once(range.start as usize..range.end as usize),
-        split.rows as usize,
-    );
+    let batch_size = usize::try_from(batch_rows).unwrap_or(usize::MAX);
     // 6.3l: what this decode's page readers take from the fetch is counted, so a group read in
     // parts shows what its parts decode again (`SourceStats::page_bytes_decoded`).
     let taken = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let chunks = chunks.counting(std::sync::Arc::clone(&taken));
-    let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(chunks, arrow_meta)
-        .with_row_groups(vec![row_group])
-        .with_projection(mask)
-        .with_batch_size(usize::try_from(batch_rows).unwrap_or(usize::MAX));
-    if partial {
-        builder = builder.with_row_selection(selection);
-    }
     let started = std::time::Instant::now();
-    let reader = builder
-        .build()
-        .map_err(|e| source_err(split.id, format!("building the row group reader: {e}")))?;
+    let built = match &indexed {
+        // A part of a group whose pages are located takes the dictionary pages the group's parts
+        // share, decompressed once by the first of them to decode (`parts`, 6.3l).
+        Some(indexed) => {
+            let chunks = std::sync::Arc::new(chunks);
+            let kept = decode.kept(file, indexed, &chunks, alloc, tier, split.id)?;
+            parts::reader(indexed, &chunks, &kept, batch_size, part_selection(range))
+        }
+        None => {
+            let arrow_meta = ArrowReaderMetadata::try_new(
+                std::sync::Arc::clone(&file.metadata),
+                ArrowReaderOptions::new(),
+            )
+            .map_err(|e| source_err(split.id, e.to_string()))?;
+            let mask = ProjectionMask::leaves(
+                file.metadata.file_metadata().schema_descr(),
+                file.projected.iter().copied(),
+            );
+            let mut builder =
+                ParquetRecordBatchReaderBuilder::new_with_metadata(chunks, arrow_meta)
+                    .with_row_groups(vec![entry.row_group])
+                    .with_projection(mask)
+                    .with_batch_size(batch_size);
+            if partial {
+                builder = builder.with_row_selection(part_selection(range));
+            }
+            builder.build()
+        }
+    };
+    let reader =
+        built.map_err(|e| source_err(split.id, format!("building the row group reader: {e}")))?;
     let decode_error = |e: moruna_kernel::arrow::error::ArrowError| {
         source_err(
             split.id,
@@ -328,6 +341,23 @@ pub(crate) fn decode_fetched(
         "parquet read",
     );
     Ok(payload)
+}
+
+/// The rows a part of a row group selects (3A, 6.3l): the rows before it skipped, and its own,
+/// and nothing after them. A selection that ran to the group's end had its decoder skip the rest
+/// of the group once its rows were read, value by value through the rest of the page it ended in
+/// (0.16 ms a part on the NYC year), for rows it never returns.
+fn part_selection(range: RowRange) -> RowSelection {
+    let mut selectors = Vec::with_capacity(2);
+    if range.start > 0 {
+        selectors.push(RowSelector::skip(
+            usize::try_from(range.start).unwrap_or(usize::MAX),
+        ));
+    }
+    selectors.push(RowSelector::select(
+        usize::try_from(range.end - range.start).unwrap_or(usize::MAX),
+    ));
+    RowSelection::from(selectors)
 }
 
 /// The rows a batch of a range of `wanted` rows decodes at once (3A, 6.3a): as many as the
@@ -512,6 +542,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_part_selects_its_rows_and_nothing_after_them() {
+        let selectors = |start, end| -> Vec<(bool, usize)> {
+            part_selection(RowRange { start, end })
+                .iter()
+                .map(|s| (s.skip, s.row_count))
+                .collect()
+        };
+        assert_eq!(selectors(0, 10), vec![(false, 10)]);
+        assert_eq!(selectors(25, 40), vec![(true, 25), (false, 15)]);
+        assert_eq!(
+            part_selection(RowRange { start: 25, end: 40 }).row_count(),
+            15
+        );
+    }
 
     #[test]
     fn close_spans_become_one_page_aligned_range() {

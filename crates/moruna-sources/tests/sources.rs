@@ -2092,3 +2092,124 @@ fn fact_a_group_in_parts_costs_more_the_more_its_parts() {
         );
     }
 }
+
+/// SO-T48 the_parts_of_a_group_are_its_rows (item 6.3l, system design 3A). A row group cut into
+/// parts, wherever the cuts fall (a part of one row, a part that starts inside a page, the
+/// group's first and last rows), gives exactly the rows of the group read whole, nulls and
+/// strings included, when the parts are fetched in order, as the drive fetches them, and then
+/// decoded at once, each on a thread of its own and in no order: the parts share their group's
+/// dictionary pages, and each selects its own rows and none after them.
+///
+/// The dictionary pages the parts share are arena bytes, taken through the allocator of the part
+/// that decoded them, while parts of the group remain; they are gone with the group's last part.
+#[test]
+fn so_t48_the_parts_of_a_group_are_its_rows() {
+    let dir = scratch();
+    // A dictionary in every column, small pages; and the generator's file: nulls, a string column
+    // whose dictionary fills and falls back to plain pages, pages of 20,000 rows.
+    let paged = write_dictionary_pages_parquet(&dir, "t48-pages", 20_000, 1_000);
+    let ledger = write_parquet(&dir, "t48-nulls", 200_000, 100_000, 7);
+    for (path, page_rows) in [(paged, 1_000u64), (ledger.path.clone(), 20_000)] {
+        let source = Arc::new(parquet_at(&path));
+        let split = source.plan().expect("the plan").pop().expect("a group");
+        assert!(source.range_reads_own_rows(&split), "its pages are located");
+        let rows = split.rows;
+        let whole =
+            block_on(parquet_at(&path).read(&split, None, &FakeAllocator::new(), Tier::Host))
+                .expect("the group whole");
+        let whole = table(&whole).clone();
+        let cuts = [
+            0,
+            1,
+            page_rows,
+            page_rows + 1,
+            2 * page_rows + page_rows / 2,
+            rows / 2 + 7,
+            rows - 1,
+            rows,
+        ];
+        let alloc = Arc::new(FakeAllocator::new());
+        let fetched: Vec<_> = cuts
+            .windows(2)
+            .map(|part| {
+                let range = RowRange {
+                    start: part[0],
+                    end: part[1],
+                };
+                let fetched =
+                    block_on(source.fetch(&split, Some(range), alloc.as_ref(), Tier::Host))
+                        .expect("the fetch");
+                (range, fetched)
+            })
+            .collect();
+        let decoding: Vec<_> = fetched
+            .into_iter()
+            .rev()
+            .map(|(range, fetched)| {
+                let (source, split, alloc) =
+                    (Arc::clone(&source), split.clone(), Arc::clone(&alloc));
+                std::thread::spawn(move || {
+                    let payload = source
+                        .decode(&split, fetched, alloc.as_ref(), Tier::Host)
+                        .map_err(|e| e.to_string());
+                    (range, payload)
+                })
+            })
+            .collect();
+        for thread in decoding {
+            let (range, payload) = thread.join().expect("the decoding thread");
+            let payload = payload.expect("the part");
+            let len = usize::try_from(range.end - range.start).expect("rows");
+            let start = usize::try_from(range.start).expect("rows");
+            assert_eq!(
+                table(&payload),
+                &whole.slice(start, len),
+                "{}: rows {range:?} of the group",
+                path.display()
+            );
+        }
+        assert_eq!(
+            alloc.in_use(Tier::Host),
+            0,
+            "{}: nothing is kept once every part has decoded",
+            path.display()
+        );
+
+        // In turn: the dictionaries the first part decoded stay in the arena, taken through that
+        // part's allocator, until the group's last part has decoded.
+        let source = parquet_at(&path);
+        let fetches = FakeAllocator::new();
+        let first = RowRange {
+            start: 0,
+            end: rows / 2,
+        };
+        let last = RowRange {
+            start: rows / 2,
+            end: rows,
+        };
+        let first =
+            block_on(source.fetch(&split, Some(first), &fetches, Tier::Host)).expect("fetch");
+        let last = block_on(source.fetch(&split, Some(last), &fetches, Tier::Host)).expect("fetch");
+        let decodes = FakeAllocator::new();
+        let payload = source
+            .decode(&split, first, &decodes, Tier::Host)
+            .expect("the first part");
+        drop(payload);
+        let kept = decodes.in_use(Tier::Host);
+        assert!(
+            kept > 0,
+            "{}: the group's dictionary pages are the first part's arena bytes",
+            path.display()
+        );
+        let payload = source
+            .decode(&split, last, &decodes, Tier::Host)
+            .expect("the last part");
+        drop(payload);
+        assert_eq!(
+            decodes.in_use(Tier::Host),
+            0,
+            "{}: and go with the last part ({kept} bytes kept until then)",
+            path.display()
+        );
+    }
+}

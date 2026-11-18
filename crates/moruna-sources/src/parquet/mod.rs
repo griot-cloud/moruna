@@ -12,6 +12,7 @@ mod append;
 pub(crate) mod decode_copy;
 mod hint;
 mod pages;
+mod parts;
 mod plan;
 mod read;
 mod reader;
@@ -86,9 +87,10 @@ pub struct ParquetSource {
     /// group whose pages could not be located. Bounded by `PAGED_KEPT`.
     paged: std::sync::Mutex<std::collections::VecDeque<(SplitId, Option<Arc<ParquetMetaData>>)>>,
     /// The split the drive fetched last, while ranges of it remain to be read: the next range
-    /// decodes from these bytes rather than fetching the group's columns again. Fetches run on
-    /// the drive one at a time, so one is enough (f.3, RB3).
-    last_fetch: std::sync::Mutex<Option<(SplitId, reader::ArenaChunks)>>,
+    /// decodes from these bytes rather than fetching the group's columns again, and shares the
+    /// group's decode state (`parts`, 6.3l). Fetches run on the drive one at a time, so one is
+    /// enough (f.3, RB3).
+    last_fetch: std::sync::Mutex<Option<(SplitId, parts::GroupFetch)>>,
     /// The most decoded bytes one decode builds outside the arena at once (3A); `None` decodes
     /// each range in one batch.
     decode_batch_bytes: Option<u64>,
@@ -212,12 +214,13 @@ impl ParquetSource {
         built
     }
 
-    /// The fetched columns of `split` if the drive fetched them last; taking the split's final
-    /// range (`last`) lets them go.
-    pub(crate) fn fetched_last(&self, split: SplitId, last: bool) -> Option<reader::ArenaChunks> {
+    /// The fetched columns of `split`, and the decode state its parts share, if the drive
+    /// fetched them last; taking the split's final range (`last`) lets the source's hold on them
+    /// go, and the parts in flight keep them until they have decoded.
+    pub(crate) fn fetched_last(&self, split: SplitId, last: bool) -> Option<parts::GroupFetch> {
         let mut kept = self.last_fetch.lock().unwrap_or_else(|e| e.into_inner());
         let hit = match kept.as_ref() {
-            Some((id, chunks)) if *id == split => Some(chunks.clone()),
+            Some((id, fetch)) if *id == split => Some(fetch.clone()),
             _ => None,
         };
         if hit.is_some() && last {
@@ -242,10 +245,10 @@ impl ParquetSource {
             .any(|(id, located)| *id == split.id && located.is_none())
     }
 
-    /// Keep `chunks` for the next range of `split`, unless this was its final range.
-    pub(crate) fn keep_fetched(&self, split: SplitId, chunks: &reader::ArenaChunks, last: bool) {
+    /// Keep `fetch` for the next range of `split`, unless this was its final range.
+    pub(crate) fn keep_fetched(&self, split: SplitId, fetch: &parts::GroupFetch, last: bool) {
         *self.last_fetch.lock().unwrap_or_else(|e| e.into_inner()) =
-            (!last).then(|| (split, chunks.clone()));
+            (!last).then(|| (split, fetch.clone()));
     }
 
     /// What this source has done so far (j).
