@@ -675,9 +675,15 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
 - **A function runs one instance per CPU of the job** (the job's `budget.cpu`, or the node's CPUs),
   each a process of its own, on the batches each engine worker hands it. A function that keeps
   state across batches, such as a running total, declares how many instances it can run: one, or
-  a number, in its image (`MORUNA_PROCESSES`, a ceiling, not a count). Its SDK says how (5A, 5B,
-  5C). Parallelism follows the job, never a value fixed when the image was packaged (6.3e, found by
-  6.2 run 3: Score's function ran as one process on a 4-CPU node, 82 s of 93 s).
+  a number, in its image (`MORUNA_PROCESSES`, a ceiling, not a count): its config's `Env`, or a
+  native function's ELF note (`.note.moruna`, owner `Moruna`, type 1, `MORUNA_PROCESSES=N`, which
+  the file's SHA-256 and signature cover). Its SDK says how (5A, 5B, 5C). Parallelism follows the
+  job, never a value fixed when the image was packaged (6.3e, found by 6.2 run 3: Score's function
+  ran as one process on a 4-CPU node, 82 s of 93 s). **Memory bounds the instances and never fails
+  a job that ran before:** each instance is funded with an equal share of what the run has past its
+  arena, at least a function's least, so the run starts as many as that funds, at least one a
+  stage, and is refused only when one does not fit; the report says `N of M instances: the share
+  funds N` (PM, 2026-11-18). One rule for every engine, `moruna_adapters::instances`.
 - **AWS's own S3** (no endpoint) is reached with path-style requests, so its host is
   `s3.<region>.amazonaws.com`, known without the bucket; the region is required.
 
