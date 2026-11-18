@@ -570,12 +570,18 @@ fn lockstep(r: &mut Run) -> Result<(), String> {
     r.start("ring-lockstep", 4 * MIB, 4)?;
     let calls0 = calls(&mut r.plane);
     let c0 = r.plane.counters();
+    // Each batch's time from its post to its record: what a lone batch, one post and then its
+    // answer awaited, costs (6.3p: lingering must cost it nothing).
+    let mut took = Vec::with_capacity(LOCKSTEP as usize);
     for n in 0..LOCKSTEP {
         r.post(n)?;
+        let posted = moruna_svc::now();
         let out = r.record()?;
+        took.push(moruna_svc::now().saturating_sub(posted));
         r.judge(out, n)?;
         r.plane.drop_batch(out).map_err(plane_error)?;
     }
+    took.sort_unstable();
     let spent = calls(&mut r.plane) - calls0;
     let c = r.plane.counters();
     let (copies, sleeps, wakes) = r.wind_up()?;
@@ -602,7 +608,7 @@ fn lockstep(r: &mut Run) -> Result<(), String> {
     }
     println!(
         r.out,
-        "DS-P lockstep: ok: {} batches of {} rows, one at a time, each made in the task's region and read in place, y = 3x + 7 judged on every row, and the task said exit code 0 on its rings and its one log line on its log ring: engine {} calls a batch ({} revokes, {} regrants, {} sleeps on its bell, {} wakes of the task); task {} calls a batch ({} sleeps, {} wakes); the kernel copied {} bytes for the task, its bells' words",
+        "DS-P lockstep: ok: {} batches of {} rows, one at a time, each made in the task's region and read in place, y = 3x + 7 judged on every row, and the task said exit code 0 on its rings and its one log line on its log ring: engine {} calls a batch ({} revokes, {} regrants, {} sleeps on its bell, {} wakes of the task, {} of them as it blocked); task {} calls a batch ({} waits, {} wakes); the kernel copied {} bytes for the task, its bells' words; a batch's post to its record {} us at the median, {} us at least, {} us at most",
         LOCKSTEP,
         ROWS,
         ratio(spent, LOCKSTEP),
@@ -610,10 +616,14 @@ fn lockstep(r: &mut Run) -> Result<(), String> {
         c.regrants - c0.regrants,
         c.bell_sleeps - c0.bell_sleeps,
         c.bells - c0.bells,
+        c.flushes - c0.flushes,
         ratio(sleeps + wakes, LOCKSTEP),
         sleeps,
         wakes,
-        copies
+        copies,
+        took[took.len() / 2] / 1000,
+        took[0] / 1000,
+        took[took.len() - 1] / 1000
     );
     Ok(())
 }
@@ -653,7 +663,7 @@ fn steady(r: &mut Run) -> Result<BatchId, String> {
     let (copies, sleeps, wakes) = r.wind_up()?;
     println!(
         r.out,
-        "DS-P steady: ok: {} batches of {} rows in groups of {} in flight, y = 3x + 7 judged on every row: engine {} calls a batch in the steady state ({} calls for {} batches after the first group; {} revokes and {} regrants in all); task {} calls a batch ({} sleeps, {} wakes); the kernel copied {} bytes for the task, its bells' words",
+        "DS-P steady: ok: {} batches of {} rows in groups of {} in flight, y = 3x + 7 judged on every row: engine {} calls a batch in the steady state ({} calls for {} batches after the first group; {} revokes and {} regrants in all; {} wakes of the task, {} of them as it blocked, and {} posts that woke no one); task {} calls a batch ({} waits, {} wakes); the kernel copied {} bytes for the task, its bells' words",
         GROUPS * GROUP,
         ROWS,
         GROUP,
@@ -662,6 +672,9 @@ fn steady(r: &mut Run) -> Result<BatchId, String> {
         steady_batches,
         c.revokes - c0.revokes,
         c.regrants - c0.regrants,
+        c.bells - c0.bells,
+        c.flushes - c0.flushes,
+        c.deferred - c0.deferred,
         ratio(sleeps + wakes, GROUPS * GROUP),
         sleeps,
         wakes,

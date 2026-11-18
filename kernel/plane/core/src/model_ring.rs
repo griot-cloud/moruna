@@ -276,7 +276,7 @@ impl RingTaskModel {
         self.ended = Some(how);
     }
 
-    fn map(slot: &Slot) -> Option<Mem> {
+    pub(crate) fn map(slot: &Slot) -> Option<Mem> {
         let mut s = slot.borrow_mut();
         if s.current.is_none() {
             let next = s.ready.pop_front()?;

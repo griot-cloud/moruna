@@ -17,7 +17,11 @@
 //!   serves one ring task in protect mode, as an image stage does; otherwise it waits on the
 //!   tasks' slots and ports, looking at the rings every [`SLICE_NS`] while a record is owed. A
 //!   task's waits on port 0, as the first version of the protocol made them, are still
-//!   answered.
+//!   answered;
+//! - a task that **lingers** for more input (`ring::layout::WAITS_LINGER`) is woken once
+//!   [`RingPlane::group`] posts wait for it, before the engine blocks in [`DataPlane::next`]
+//!   (every lingering task the engine posted to since it last woke it), and when its input is
+//!   closed: not for each post, so the plane batches whether or not the task is woken at once.
 //!
 //! **The record check stays safe (DP1).** The engine checks a record only on bytes the task
 //! can no longer write. In [`Mode::Protect`] the engine takes write access to every window
@@ -166,6 +170,11 @@ pub struct Counters {
     pub bells: u64,
     /// Sleeps the engine took on its own bell: each one futex wait.
     pub bell_sleeps: u64,
+    /// Of [`Counters::bells`], the wakes of a lingering task the engine called as it was about
+    /// to block, for the posts it had not woken it for.
+    pub flushes: u64,
+    /// Posts to a lingering task that called no wake: the plane's batching.
+    pub deferred: u64,
 }
 
 /// A window of the current rings object.
@@ -282,6 +291,8 @@ pub struct RingPlane<C: RingCalls> {
     rows: BTreeMap<u64, u64>,
     /// How many times the engine reads the rings before it sleeps.
     pub spins: u32,
+    /// The posts after which the engine wakes a lingering task (`ring::GROUP`).
+    pub group: u64,
     counters: Counters,
     /// A wait returned with something signalled: the slots and ports are read on the next
     /// pass. Otherwise only the rings are, which costs no call.
@@ -308,6 +319,7 @@ impl<C: RingCalls> RingPlane<C> {
             tasks: BTreeMap::new(),
             rows: BTreeMap::new(),
             spins: SPINS,
+            group: ring::GROUP,
             counters: Counters::default(),
             signaled: true,
             exits: BTreeMap::new(),
@@ -745,8 +757,11 @@ impl<C: RingCalls> RingPlane<C> {
             return Err(PlaneError::Full);
         }
         t.inflight.push_back((batch.0, entry));
-        if t.engine.ring(&*view) {
+        let owed = t.engine.owed();
+        if t.engine.ring_in(&*view, self.group) {
             self.counters.bells += 1;
+        } else if t.engine.owed() > owed {
+            self.counters.deferred += 1;
         }
         if let Some(b) = self.plane.batches.get_mut(&batch.0) {
             b.shares += 1;
@@ -838,7 +853,7 @@ impl<C: RingCalls> RingPlane<C> {
                 }
             }
         }
-        if gave && t.engine.ring(&*view) {
+        if gave && t.engine.ring_given(&*view) {
             self.counters.bells += 1;
         }
         if let Some(b) = broke {
@@ -1034,9 +1049,12 @@ impl<C: RingCalls> RingPlane<C> {
                     t.noted = true;
                 }
                 let noted = t.noted;
-                let waits = words
-                    .as_ref()
-                    .is_some_and(|v| !t.handed && v.load(layout::TASK_WAITS) != 0);
+                // A task that sleeps may have asked on port 0 (version 1's wait); a lingering
+                // task never does: it is woken through its bell alone (6.3p), so the engine
+                // makes no call for it here.
+                let waits = words.as_ref().is_some_and(|v| {
+                    !t.handed && !matches!(v.load(layout::TASK_WAITS), 0 | layout::WAITS_LINGER)
+                });
                 let posted = t.mode == Mode::Unmap
                     && words.as_ref().is_some_and(|v| {
                         let mut e = t.engine.clone();
@@ -1433,6 +1451,31 @@ impl<C: RingCalls> RingPlane<C> {
         able.then_some((*id, t.rings))
     }
 
+    /// The engine is about to block: wakes each lingering task it posted to and has not woken
+    /// for those posts ([`ring::Engine::flush`]), so no engine waits out a task's linger.
+    fn flush(&mut self) {
+        let ids: Vec<u32> = self
+            .tasks
+            .iter()
+            .filter(|(_, t)| t.engine.owed() > 0 && !t.refused && !t.handed)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let Some(key) = self.tasks.get(&id).map(|t| t.rings) else {
+                continue;
+            };
+            let Some(view) = self.rings_view(key) else {
+                continue;
+            };
+            if let Some(t) = self.tasks.get_mut(&id)
+                && t.engine.flush(&*view)
+            {
+                self.counters.bells += 1;
+                self.counters.flushes += 1;
+            }
+        }
+    }
+
     /// Whether any ring task has something for the engine, read from the rings alone.
     fn ready(&self) -> bool {
         self.tasks.values().any(|t| {
@@ -1505,7 +1548,7 @@ impl<C: RingCalls> DataPlane for RingPlane<C> {
             .get_mut(&task.0)
             .ok_or(PlaneError::Unknown("task"))?;
         t.engine.close(&*view);
-        if t.engine.ring(&*view) {
+        if t.engine.ring_now(&*view) {
             self.counters.bells += 1;
         }
         match self.plane.calls.close(&t.input) {
@@ -1541,6 +1584,11 @@ impl<C: RingCalls> DataPlane for RingPlane<C> {
             self.signaled = false;
             if !self.plane.events.is_empty() {
                 continue;
+            }
+            // About to wait: a lingering task the engine posted to takes those posts now, not at
+            // its deadline. A poll does not block, so it leaves the task its group.
+            if deadline != 0 {
+                self.flush();
             }
             // Read the rings a while before sleeping: a task that answers within it costs
             // the engine no call. A poll (a deadline of zero) only looks: a stage that polls

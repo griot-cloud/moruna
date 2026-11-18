@@ -13,6 +13,19 @@
 //! said it waits. The kernel keys a futex on a shared memory object by the object and the
 //! offset, so the wake meets the waiter in the other process.
 //!
+//! **The plane batches by design** (item 6.3p). A task that runs out of input while its engine
+//! is posting does not sleep until the next post: it **lingers** ([`layout::WAITS_LINGER`] in
+//! [`layout::TASK_WAITS`]) until a deadline of [`GROUP`] posting intervals, which it measures
+//! itself ([`Pace`]), and lingers only when that is within [`LINGER_MAX_NS`]. The engine does
+//! not wake a lingering task for each post: it wakes it once [`GROUP`] posts wait, before it
+//! blocks waiting on the plane ([`Engine::flush`]), and when it closes the input
+//! ([`Engine::ring_now`]). A task that sleeps ([`layout::WAITS_SLEEP`]) is woken by the next
+//! post, as before. So a task woken at once, by a free CPU or a prompt scheduler, still takes its
+//! batches a group at a time, and an engine never waits out a linger: it wakes the task before
+//! it blocks. The value is an extension of the word's meaning with no change of layout: an
+//! engine of before treats any nonzero word as a wait and wakes the task at each post, and a
+//! task of before never lingers.
+//!
 //! The three rings are single producer, single consumer, with indices that only grow:
 //!
 //! - **input** (the engine posts a batch, the task releases it once it is done with it);
@@ -80,7 +93,9 @@ pub mod layout {
     pub const FREE_TAIL: usize = 448;
     /// Nonzero while the engine sleeps waiting for an output.
     pub const ENGINE_WAITS: usize = 512;
-    /// Nonzero while the task sleeps waiting for an input or a window.
+    /// Nonzero while the task sleeps waiting for an input or a window: [`WAITS_SLEEP`] or
+    /// [`WAITS_LINGER`]. The engine clears it when it wakes the task, which sets it again the
+    /// next time it waits.
     pub const TASK_WAITS: usize = 576;
     /// Nonzero once the engine posts no more input.
     pub const CLOSED: usize = 640;
@@ -123,7 +138,34 @@ pub mod layout {
     pub const WAIT_WINDOW: u8 = b'W';
     /// A request byte that only wakes the engine, answered at once.
     pub const WAKE: u8 = b'N';
+
+    /// [`TASK_WAITS`]: the task sleeps until the engine posts, gives a window or closes, and the
+    /// engine wakes it at the first of these.
+    pub const WAITS_SLEEP: u64 = 1;
+    /// [`TASK_WAITS`]: the task lingers for more input until a deadline of its own. The engine
+    /// wakes it once [`super::GROUP`] posts wait for it, before the engine blocks waiting on the
+    /// plane, and when it closes the input; not for each post. An engine that does not know the
+    /// value takes it as [`WAITS_SLEEP`].
+    pub const WAITS_LINGER: u64 = 2;
 }
+
+/// The posts a lingering task takes at once: the engine wakes it when this many wait for it, and
+/// the task's deadline is this many of the engine's posting intervals. Two halves the bells' calls
+/// a batch, and keeps a lingering task working beside an engine that holds three batches in flight
+/// for it (a stage's tasks, `moruna-micro`'s `layout::IN_FLIGHT`): with a bigger group such an
+/// engine blocks on its own lingering task, waking it only then, and waits out a batch's compute
+/// it would otherwise have overlapped (`batching.rs`'s table, a CPU each: with three in flight a
+/// group of 2 costs the engine 1.08 calls a batch and the task 0.51, against 1.58 and 1.00 when
+/// the task sleeps; a group of 4 or 8 costs the engine 2.43).
+pub const GROUP: u64 = 2;
+
+/// The longest a task lingers, in nanoseconds: a task whose engine posts more slowly than
+/// [`GROUP`] posts in this time sleeps until the next post, as before lingering, because a call
+/// each batch is small beside such intervals, and a batch posted while its engine goes on to other
+/// work never waits longer than this for its task. It is the scheduler's slice (`moruna-sched`'s
+/// `SLICE_TICKS`, 10 ticks of 1 ms): how long a woken task already waited behind the running one
+/// before item 1.11e, the plane's batches with it.
+pub const LINGER_MAX_NS: u64 = 10_000_000;
 
 use layout::*;
 
@@ -339,6 +381,8 @@ pub struct Engine {
     note: u64,
     /// The engine's bell as it stood when the engine last looked at the rings.
     bell_seen: u32,
+    /// Posts made while the task lingered that the engine has not woken it for.
+    owed: u64,
 }
 
 impl Engine {
@@ -377,6 +421,7 @@ impl Engine {
             task_bell: 0,
             note: 0,
             bell_seen: 0,
+            owed: 0,
         }
     }
 
@@ -526,17 +571,78 @@ impl Engine {
         self.closed
     }
 
-    /// Raises the task's bell after a post, a window given or the close, and wakes the task
-    /// if it said it waits: whether it called the wake. One wake a sleep: the engine clears
-    /// the word, which the task sets again the next time it sleeps. The engine never reads
+    /// Raises the task's bell after a post, and wakes the task if it sleeps, or if it lingers and
+    /// [`GROUP`] posts now wait for it: whether it called the wake. One wake a wait: the engine
+    /// clears the word, which the task sets again the next time it waits. The engine never reads
     /// the bell back, which the task could have written.
     pub fn ring(&mut self, s: &impl Shared) -> bool {
+        self.ring_in(s, GROUP)
+    }
+
+    /// [`Engine::ring`] with a group of `group` posts: 1 wakes a lingering task at each post, as
+    /// an engine of protocol 4 did.
+    pub fn ring_in(&mut self, s: &impl Shared, group: u64) -> bool {
+        self.raise(s);
+        match s.load(TASK_WAITS) {
+            0 => {
+                self.owed = 0;
+                false
+            }
+            WAITS_LINGER => {
+                self.owed += 1;
+                self.owed >= group && self.wake(s)
+            }
+            _ => self.wake(s),
+        }
+    }
+
+    /// Raises the task's bell after a window given: a task that sleeps is woken (it may wait for
+    /// the window), a lingering one is not, because it waits for input, which a window does not
+    /// give it.
+    pub fn ring_given(&mut self, s: &impl Shared) -> bool {
+        self.raise(s);
+        match s.load(TASK_WAITS) {
+            0 | WAITS_LINGER => false,
+            _ => self.wake(s),
+        }
+    }
+
+    /// Raises the task's bell after the close, and wakes the task however it waits: the end is
+    /// what a lingering task waits for too.
+    pub fn ring_now(&mut self, s: &impl Shared) -> bool {
+        self.raise(s);
+        s.load(TASK_WAITS) != 0 && self.wake(s)
+    }
+
+    /// The engine is about to block waiting on the plane: wakes a lingering task that posts wait
+    /// for, which would otherwise take them only at its deadline. Whether it called the wake; no
+    /// call when nothing is owed, or when the task, lingering again, has released every input it
+    /// was posted (it took the owed posts at its own deadline). The release count is the task's
+    /// word: a task that lies about it only delays itself.
+    pub fn flush(&mut self, s: &impl Shared) -> bool {
+        if self.owed == 0 {
+            return false;
+        }
+        if s.load(TASK_WAITS) == WAITS_LINGER && s.load(IN_TAIL) < self.in_head {
+            return self.wake(s);
+        }
+        self.owed = 0;
+        false
+    }
+
+    /// Posts made while the task lingered that it has not been woken for.
+    pub fn owed(&self) -> u64 {
+        self.owed
+    }
+
+    fn raise(&mut self, s: &impl Shared) {
         self.task_bell = self.task_bell.wrapping_add(1);
         s.store(TASK_BELL, u64::from(self.task_bell));
         s.fence();
-        if s.load(TASK_WAITS) == 0 {
-            return false;
-        }
+    }
+
+    fn wake(&mut self, s: &impl Shared) -> bool {
+        self.owed = 0;
         s.store(TASK_WAITS, 0);
         s.wake(TASK_BELL);
         true
@@ -775,11 +881,180 @@ impl Task {
     /// deadline: says it waits, reads the bell, and sleeps only if `ready` still says no.
     /// Whether it returned before the deadline.
     pub fn sleep(&self, s: &impl Shared, deadline: u64, ready: impl Fn(&Task) -> bool) -> bool {
-        s.store(TASK_WAITS, 1);
+        self.rest(s, Rest::Sleep(deadline), ready) != Slept::TimedOut
+    }
+
+    /// Waits on the task's bell as `how` says, unless `ready` says, once the wait is said, that
+    /// there is no need: [`Task::arm`], the futex, [`Task::disarm`].
+    pub fn rest(&self, s: &impl Shared, how: Rest, ready: impl Fn(&Task) -> bool) -> Slept {
+        let Some(seq) = self.arm(s, how, ready) else {
+            return Slept::Ready;
+        };
+        let woke = s.wait(TASK_BELL, seq, how.deadline());
+        Task::disarm(s);
+        if woke { Slept::Woken } else { Slept::TimedOut }
+    }
+
+    /// Says the task waits as `how` says, and reads its bell after the fence: the bell's value to
+    /// wait on, or `None` (the word cleared again) when `ready` says what it waits for came
+    /// meanwhile. A post after this changes the bell, so the futex does not sleep through it.
+    pub fn arm(&self, s: &impl Shared, how: Rest, ready: impl Fn(&Task) -> bool) -> Option<u32> {
+        s.store(TASK_WAITS, how.word());
         s.fence();
         let seq = s.load(TASK_BELL) as u32;
-        let woke = ready(self) || s.wait(TASK_BELL, seq, deadline);
+        if ready(self) {
+            Task::disarm(s);
+            return None;
+        }
+        Some(seq)
+    }
+
+    /// Awake again: the task no longer waits.
+    pub fn disarm(s: &impl Shared) {
         s.store(TASK_WAITS, 0);
-        woke
+    }
+
+    /// The input ring's head: how many batches the engine has posted on it.
+    pub fn head(&self, s: &impl Shared) -> u64 {
+        s.load(IN_HEAD)
+    }
+
+    /// Waits for an input or the end once the task has found none (after its spin, if it
+    /// spins), measuring its engine's posts on `pace` with the clock `now`: it lingers or sleeps
+    /// as [`Pace::rest`] says, and a linger that ends at its deadline with nothing come sleeps
+    /// until the next post, so a task whose engine stopped costs one call more and then nothing.
+    /// `forever` is the deadline of a sleep. The futex calls it made: each copies the bell's word.
+    pub fn wait_input(
+        &self,
+        s: &impl Shared,
+        pace: &mut Pace,
+        now: impl Fn() -> u64,
+        forever: u64,
+    ) -> u32 {
+        let at = now();
+        pace.saw(self.head(s), at);
+        let how = pace.rest(at, forever);
+        let slept = self.rest(s, how, |t| t.has_input(s));
+        let mut calls = u32::from(slept.called());
+        if matches!(how, Rest::Linger(_)) && slept == Slept::TimedOut {
+            let again = self.rest(s, Rest::Sleep(forever), |t| t.has_input(s));
+            calls += u32::from(again.called());
+        }
+        pace.saw(self.head(s), now());
+        calls
+    }
+}
+
+/// How a task waits on its bell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rest {
+    /// Until the engine's next post, window or close, or this deadline ([`layout::WAITS_SLEEP`]).
+    Sleep(u64),
+    /// For more input, until this deadline ([`layout::WAITS_LINGER`]): the engine wakes it for a
+    /// group of posts, before it blocks, or for the close.
+    Linger(u64),
+}
+
+impl Rest {
+    /// The deadline, on the kernel's clock.
+    pub fn deadline(self) -> u64 {
+        match self {
+            Rest::Sleep(d) | Rest::Linger(d) => d,
+        }
+    }
+
+    /// What [`layout::TASK_WAITS`] says while the task waits so.
+    pub fn word(self) -> u64 {
+        match self {
+            Rest::Sleep(_) => WAITS_SLEEP,
+            Rest::Linger(_) => WAITS_LINGER,
+        }
+    }
+}
+
+/// How a wait on the bell ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slept {
+    /// What it waited for had come before it slept: no futex call.
+    Ready,
+    /// It slept, and returned before its deadline: a wake, or the bell moved as it went to sleep.
+    Woken,
+    /// It slept until its deadline.
+    TimedOut,
+}
+
+impl Slept {
+    /// Whether the wait called the futex.
+    pub fn called(self) -> bool {
+        self != Slept::Ready
+    }
+}
+
+/// A task's measure of how often its engine posts, from the input ring's head against the task's
+/// clock (the clock page: no call), and how it waits from it ([`Pace::rest`]).
+///
+/// Each look that finds posts the last look did not see is a sample of the interval between
+/// posts: the time since the last look over the posts since. A shorter sample is taken at once and
+/// a longer one by half, so a pause of the engine (a long sample) lengthens the interval only
+/// gradually and a task back in a stream lingers again at its next look.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pace {
+    /// The time of the last look that saw new posts.
+    at: u64,
+    /// The head it saw.
+    head: u64,
+    /// The interval between posts, in nanoseconds; zero until one is measured.
+    interval: u64,
+}
+
+impl Pace {
+    /// A measure that starts at `now`, with the head at `head`.
+    pub fn new(head: u64, now: u64) -> Pace {
+        Pace {
+            at: now,
+            head,
+            interval: 0,
+        }
+    }
+
+    /// The input ring's head stood at `head` at `now`.
+    pub fn saw(&mut self, head: u64, now: u64) {
+        if head <= self.head {
+            if head < self.head {
+                // A head that went back is no ring's: start again from it.
+                *self = Pace::new(head, now);
+            }
+            return;
+        }
+        let sample = (now.saturating_sub(self.at) / (head - self.head)).max(1);
+        self.interval = match self.interval {
+            0 => sample,
+            i if sample <= i => sample,
+            i => i + (sample - i) / 2,
+        };
+        self.at = now;
+        self.head = head;
+    }
+
+    /// The measured interval between the engine's posts, if any.
+    pub fn interval(&self) -> Option<u64> {
+        (self.interval > 0).then_some(self.interval)
+    }
+
+    /// How to wait at `now` for input that has not come: linger until [`GROUP`] intervals from
+    /// now when that is within [`LINGER_MAX_NS`]; otherwise, and before any interval is measured,
+    /// sleep until the next post (or `forever`, the deadline of a wait without one).
+    pub fn rest(&self, now: u64, forever: u64) -> Rest {
+        self.rest_in(now, GROUP, forever)
+    }
+
+    /// [`Pace::rest`] for a group of `group` posts.
+    pub fn rest_in(&self, now: u64, group: u64, forever: u64) -> Rest {
+        match self.interval() {
+            Some(i) if i.saturating_mul(group) <= LINGER_MAX_NS => {
+                Rest::Linger(now.saturating_add(i * group))
+            }
+            _ => Rest::Sleep(forever),
+        }
     }
 }

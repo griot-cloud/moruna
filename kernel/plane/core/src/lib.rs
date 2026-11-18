@@ -42,6 +42,8 @@ pub mod ringed;
 pub mod verify;
 
 #[cfg(test)]
+mod batching;
+#[cfg(test)]
 mod tests;
 
 pub use plane::KernelPlane;
