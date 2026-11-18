@@ -1105,16 +1105,18 @@ impl<C: RingCalls> RingPlane<C> {
     /// before it posts a record of the next, so those releases are there to read. A look that
     /// found the records of two batches gave both before either release, and a stage that
     /// takes a batch's records up to its release took the next one's too (the NYC gate,
-    /// 2026-11-17). A cookie of no input the task holds moves nothing.
+    /// 2026-11-17). A cookie of no input in flight comes after every release read: a record
+    /// answering none (a function's total, written at the end, moruna-function's `u64::MAX`)
+    /// was posted with no batch held, after the releases of all it had taken.
     fn release_ahead_of(&mut self, id: u32, cookie: u64) -> Result<(), PlaneError> {
         self.count_released(id)?;
         loop {
             let Some(t) = self.tasks.get_mut(&id) else {
                 return Ok(());
             };
-            let ahead = t.releases > 0
-                && t.inflight.front().is_some_and(|(_, e)| e.cookie != cookie)
-                && t.inflight.iter().any(|(_, e)| e.cookie == cookie);
+            // An input ahead of the one `cookie` answers, or any, when it answers none in flight.
+            let ahead =
+                t.releases > 0 && t.inflight.front().is_some_and(|(_, e)| e.cookie != cookie);
             if !ahead {
                 return Ok(());
             }
