@@ -37,6 +37,8 @@ fn assert_failed(device: &mut Storvsc<Link>) {
 fn a_scsi_error_is_surfaced_with_its_sense_data() {
     let (mut device, host) = device();
     let disk = disk(&mut device, &host, 0);
+    // The first read passes; the fault is the second's.
+    host.borrow_mut().faults.push_back(Fault::Pass);
     host.borrow_mut().faults.push_back(Fault::Scsi {
         srb: SrbStatus::ERROR,
         scsi: ScsiStatus::CHECK_CONDITION,
@@ -46,6 +48,8 @@ fn a_scsi_error_is_surfaced_with_its_sense_data() {
             2,
         )),
     });
+    let id = device.read(&disk, 5, 1, &[1]).unwrap();
+    assert_eq!(moved(&mut device, id), 512);
     let id = device.read(&disk, 5, 1, &[1]).unwrap();
     assert_eq!(
         failure(&mut device, id),

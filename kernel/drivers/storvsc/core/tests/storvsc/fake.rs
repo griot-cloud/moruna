@@ -157,6 +157,9 @@ impl FakeDisk {
 /// What the fake does wrong to the next SCSI request, when a test asks it to.
 #[derive(Clone, Copy)]
 pub enum Fault {
+    /// Nothing: the request is answered as it should be, so a fault queued after it is the
+    /// next request's.
+    Pass,
     /// Fails the command with this result.
     Scsi {
         srb: SrbStatus,
@@ -530,7 +533,7 @@ impl Host {
                     .with_autosense_valid(true);
                 header.status = nt_status(SrbStatus::ERROR);
             }
-            Some(Fault::Scsi { .. }) | None => {}
+            Some(Fault::Scsi { .. } | Fault::Pass) | None => {}
         }
         let mut bytes = [header.as_bytes(), response.as_bytes()].concat();
         bytes.resize(size, 0);
