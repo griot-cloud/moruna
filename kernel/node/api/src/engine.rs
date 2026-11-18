@@ -102,14 +102,17 @@ pub fn sizes(budget: u64, staging: bool) -> Sizes {
 
 /// The engine supervisor's configuration for a job of `budget` bytes on a node whose job bound
 /// is `bound`, `staging` when it stages on a volume, `network` when it names hosts (its network,
-/// which `node-admission` mints and grants it as `network`), `functions` when it uses a
-/// registered function (the process resource a native one is started from, item 3.6); refused
-/// when the budget leaves the program no memory past the engine's own.
+/// which `node-admission` mints and grants it as `network`), `volumes` volumes, which
+/// `node-admission` grants it as `volume.<n>` with their list as `volumes` (item 3.3), each
+/// handed to the program as it is given, and `functions` when it uses a registered function
+/// (the process resource a native one is started from, item 3.6); refused when the budget
+/// leaves the program no memory past the engine's own.
 pub fn job_config(
     bound: u64,
     budget: u64,
     staging: bool,
     network: bool,
+    volumes: usize,
     functions: bool,
 ) -> Result<String, HostError> {
     let Sizes { memory, scratch } = sizes(budget, staging);
@@ -123,6 +126,13 @@ pub fn job_config(
     let mut more = String::new();
     if network {
         more.push_str("grant network channel network\n");
+    }
+    for n in 0..volumes {
+        let slot = node_protocol::volume_slot(n);
+        more.push_str(&format!("grant {slot} channel {slot}\n"));
+    }
+    if volumes > 0 {
+        more.push_str(&format!("grant {VOLUMES_SLOT} data {VOLUMES_SLOT}\n"));
     }
     more.push_str(FUNCTIONS_GRANT);
     if functions {
@@ -550,9 +560,10 @@ impl EngineHost for Host {
             .ok_or_else(|| HostError::Failed(String::from("the engine's check named no budget")))?;
         let staging = verdict.needs.volumes.iter().any(|v| v.staging);
         let network = !verdict.needs.hosts.is_empty();
+        let volumes = verdict.needs.volumes.len();
         let functions = !verdict.needs.functions.is_empty();
         let config = config_memory(&job_config(
-            self.bound, budget, staging, network, functions,
+            self.bound, budget, staging, network, volumes, functions,
         )?)?;
         let (ours, theirs) = Host::channel()?;
         let needs = &verdict.needs;

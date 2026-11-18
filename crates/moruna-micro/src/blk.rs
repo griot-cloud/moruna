@@ -36,6 +36,7 @@ use moruna_kernel::{Allocator, ObjectMetadata, Reactor};
 
 use crate::arena::Objects;
 use crate::devices;
+use crate::volume::{io::Volume, layer::Files};
 
 /// What the engine was granted on the Moruna kernel: the arena's memory objects and every data
 /// disk, brought up.
@@ -46,6 +47,12 @@ pub struct Granted {
     output: Option<disk::Disk>,
     /// The current run's output layer, made with its reactor.
     layer: Arc<Mutex<Option<Arc<out::Output>>>>,
+    /// The volumes the node granted (item 3.3): each source's layer, read only.
+    sources: Vec<Arc<Files>>,
+    /// Each sink's volume, which the run writes a layer onto.
+    sink_volumes: Vec<Volume>,
+    /// The layers the current run writes onto its sinks' volumes, made with its reactor.
+    sinks: Arc<Mutex<Vec<Arc<out::Output>>>>,
 }
 
 impl Granted {
@@ -62,14 +69,24 @@ impl Granted {
                 let objects = Objects::new();
                 let mut inputs = Vec::new();
                 let mut output = None;
+                let mut volumes = false;
                 for slot in crate::start::slots() {
                     if slot.starts_with(devices::INPUT_PREFIX) {
                         inputs.push(device::open(&slot, &objects, false)?);
                     } else if slot == devices::OUTPUT {
                         output = Some(device::open(&slot, &objects, true)?);
+                    } else if slot == crate::volume::GRANTS_SLOT {
+                        volumes = true;
                     }
                 }
-                Ok(Some(Granted::new(objects, inputs, output)))
+                let (sources, sinks) = if volumes {
+                    granted_volumes(&objects)?
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                Ok(Some(
+                    Granted::new(objects, inputs, output).with_volumes(sources, sinks),
+                ))
             })
             .clone()
     }
@@ -85,7 +102,27 @@ impl Granted {
             inputs,
             output,
             layer: Arc::default(),
+            sources: Vec::new(),
+            sink_volumes: Vec::new(),
+            sinks: Arc::default(),
         }
+    }
+
+    /// The same, with the node's volumes: each source's layer, and each sink's volume.
+    pub fn with_volumes(mut self, sources: Vec<Arc<Files>>, sinks: Vec<Volume>) -> Granted {
+        self.sources = sources;
+        self.sink_volumes = sinks;
+        self
+    }
+
+    /// The sources' volumes' layers.
+    pub fn sources(&self) -> &[Arc<Files>] {
+        &self.sources
+    }
+
+    /// The sinks' volumes.
+    pub fn sink_volumes(&self) -> &[Volume] {
+        &self.sink_volumes
     }
 
     /// The arena's memory.
@@ -113,16 +150,28 @@ impl Granted {
         metadata: Option<Arc<dyn ObjectMetadata>>,
         alloc: Arc<dyn Allocator>,
     ) -> std::io::Result<(Arc<dyn Reactor>, Option<Arc<dyn ObjectMetadata>>)> {
-        if self.inputs.is_empty() && self.output.is_none() {
+        if self.inputs.is_empty()
+            && self.output.is_none()
+            && self.sources.is_empty()
+            && self.sink_volumes.is_empty()
+        {
             return Ok((reactor, metadata));
         }
-        let disks = Arc::new(reactor::DiskReactor::new(
-            reactor,
-            metadata,
-            self.inputs.iter().cloned(),
-            self.output.clone().map(|d| (d, alloc)),
-        )?);
+        let disks = Arc::new(
+            reactor::DiskReactor::new(
+                reactor,
+                metadata,
+                self.inputs.iter().cloned(),
+                self.output.clone().map(|d| (d, alloc.clone())),
+            )?
+            .with_volumes(
+                self.sources.iter().cloned(),
+                self.sink_volumes.iter().cloned(),
+                alloc,
+            ),
+        );
         *self.layer.lock().unwrap_or_else(|e| e.into_inner()) = disks.output();
+        *self.sinks.lock().unwrap_or_else(|e| e.into_inner()) = disks.sinks();
         Ok((disks.clone(), Some(disks)))
     }
 
@@ -153,6 +202,24 @@ impl Granted {
         Some(layer.finish(root))
     }
 
+    /// Ends the layers the run wrote onto its sinks' volumes (item 3.3): each finished in place
+    /// when the run `completed`, its tables, its tree and its header after them; left with no
+    /// header otherwise, which a source then refuses. By serial.
+    pub fn finish_volumes(&self, completed: bool) -> Vec<(String, Result<out::Written, String>)> {
+        let layers = std::mem::take(&mut *self.sinks.lock().unwrap_or_else(|e| e.into_inner()));
+        if !completed {
+            return Vec::new();
+        }
+        layers
+            .into_iter()
+            .map(|layer| {
+                let serial = layer.target().name().to_string();
+                // A volume's files are the sinks' alone: nothing is picked up from the scratch.
+                (serial, layer.finish(Path::new(NO_ROOT)))
+            })
+            .collect()
+    }
+
     /// The report's lines: how the arena's memory was mapped and what each disk moved.
     pub fn notes(&self) -> Vec<String> {
         let m = self.objects.mapped();
@@ -161,6 +228,31 @@ impl Granted {
              them, {} mapped with large pages and every page present, {} mapped plainly",
             m.regions, m.bytes, m.huge, m.plain
         )];
+        for volume in self
+            .sources
+            .iter()
+            .map(|f| f.volume())
+            .chain(self.sink_volumes.iter())
+        {
+            let s = volume.stats();
+            notes.push(format!(
+                "data OS: volume {} ({} bytes, {}): {} requests, {} bytes placed by its driver, \
+                 {} bytes through bounces, {} requests moved through a bounce, at most {} on their \
+                 way at once",
+                volume.serial(),
+                volume.capacity(),
+                if volume.writable() {
+                    "a sink's"
+                } else {
+                    "a source's"
+                },
+                s.requests,
+                s.placed_bytes,
+                s.bounced_bytes,
+                s.fallbacks,
+                s.in_flight_max
+            ));
+        }
         for disk in self.inputs.iter().chain(self.output.iter()) {
             let s = disk.stats();
             notes.push(format!(
@@ -179,4 +271,38 @@ impl Granted {
         }
         notes
     }
+}
+
+/// A root no sink writes under: a volume's layer takes nothing from the scratch.
+const NO_ROOT: &str = "/moruna/no-root-for-a-volume";
+
+/// The volumes the node granted the engine (`node-admission`, item 3.3), from their list
+/// ([`crate::volume::GRANTS_SLOT`]): each its driver's client on its connection, a source's
+/// layer opened and its index checked, a sink's volume to write.
+fn granted_volumes(objects: &Arc<Objects>) -> Result<(Vec<Arc<Files>>, Vec<Volume>), String> {
+    let text = crate::granted_data(crate::volume::GRANTS_SLOT)?;
+    let text = String::from_utf8(text).map_err(|_| "the node's volume grants are not UTF-8")?;
+    let mut sources = Vec::new();
+    let mut sinks = Vec::new();
+    for grant in crate::volume::parse_grants(&text)? {
+        let handle = crate::start::take(&grant.slot).ok_or_else(|| {
+            format!(
+                "volume {}: no `{}` was granted, its driver's connection",
+                grant.serial, grant.slot
+            )
+        })?;
+        let driver = crate::volume::block::BlockDriver::open(
+            moruna_svc::Channel(handle),
+            Arc::clone(objects),
+            grant.sink,
+        )
+        .map_err(|why| format!("volume {}: {why}", grant.serial))?;
+        let volume = Volume::new(&grant.serial, Arc::new(driver), grant.sink)?;
+        if grant.sink {
+            sinks.push(volume);
+        } else {
+            sources.push(Arc::new(Files::open(volume)?));
+        }
+    }
+    Ok((sources, sinks))
 }

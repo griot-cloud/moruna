@@ -620,6 +620,7 @@ dependencies = [
  "imagefs-protocol",
  "moruna-imagefs",
  "moruna-svc",
+ "moruna-sys",
 ]
 
 [[package]]
@@ -1325,6 +1326,7 @@ dependencies = [
 name = "node-admission"
 version = "0.1.0"
 dependencies = [
+ "block-protocol",
  "devices-protocol",
  "moruna-node",
  "moruna-storage-format",

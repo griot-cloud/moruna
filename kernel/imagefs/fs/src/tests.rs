@@ -1171,3 +1171,68 @@ fn an_attached_layer_is_sealed_as_its_index_says_and_lies_inside_the_region() {
     assert!(disk.device_pages(2).is_err());
     assert_eq!(disk.device_pages(1), Ok(spans[1].pages));
 }
+
+/// Item 3.6: an attached file whose pages lie one after another is mapped where it lies, each
+/// page checked against its hash first, once; a range with a hole or past the file is not.
+#[test]
+fn an_attached_files_pages_in_one_run_are_mapped_where_they_lie() {
+    let (region, spans) = archive_region();
+    let (mut attached, over) = crate::attached::attach(region.clone(), spans.clone(), 64).unwrap();
+    let scratch = Scratch::new();
+    let found = |attached: &mut Cache<crate::attached::AttachedDisk<Vec<u8>>>, path: &[u8]| {
+        let tree = Tree {
+            overlay: &over,
+            scratch: &scratch,
+        };
+        let Place::Image(Found::File { layer, node, .. }) =
+            tree.resolve(attached, path, true).unwrap()
+        else {
+            panic!("a file");
+        };
+        (layer, over.file(attached, layer, &node).unwrap())
+    };
+    // libc.so: 9000 bytes, three pages in one extent.
+    let (layer, libc) = found(&mut attached, b"/usr/lib/libc.so");
+    let lp = libc.run_of(0, 3).expect("one run");
+    assert_eq!(libc.run_of(1, 2), Some(lp + 1));
+    assert_eq!(libc.run_of(0, 4), None, "past the file");
+    assert_eq!(libc.run_of(0, 0), None);
+    let at = crate::attached::in_place(&mut attached, layer, lp, 3).unwrap();
+    assert_eq!(at, spans[layer].offset + lp * PAGE as u64);
+    let at = at as usize;
+    assert_eq!(&region[at..at + 9000], &[9u8; 9000][..]);
+    // Checked once: the second asks nothing more of the layer, and answers the same.
+    let before = attached.stats();
+    assert_eq!(
+        crate::attached::in_place(&mut attached, layer, lp, 3),
+        Ok(at as u64)
+    );
+    assert_eq!(attached.stats(), before);
+    assert_eq!(attached.disk_ref().region(), &region);
+    // The sparse file: three pages of hole, then two of data, then a tail of zeros.
+    let (_, sparse) = found(&mut attached, b"/sparse");
+    assert_eq!(sparse.run_of(0, 5), None, "a hole is no page of the layer");
+    assert!(sparse.run_of(3, 2).is_some());
+    // A page changed in the region is refused when it is mapped, not given.
+    let mut changed = region.clone();
+    changed[at + 4096 + 7] ^= 0xff;
+    let (mut bad, _) = crate::attached::attach(changed, spans.clone(), 64).unwrap();
+    assert!(matches!(
+        crate::attached::in_place(&mut bad, layer, lp, 3),
+        Err(Error::Corrupt(_))
+    ));
+    // Pages past the layer, none, or no layer at all.
+    let past = spans[layer].pages;
+    assert_eq!(
+        crate::attached::in_place(&mut attached, layer, past, 1),
+        Err(Error::BadRange)
+    );
+    assert_eq!(
+        crate::attached::in_place(&mut attached, layer, 0, 0),
+        Err(Error::BadRange)
+    );
+    assert!(matches!(
+        crate::attached::in_place(&mut attached, 9, 0, 1),
+        Err(Error::Io(_))
+    ));
+}

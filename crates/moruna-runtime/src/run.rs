@@ -2492,8 +2492,9 @@ mod data_os {
         }
     }
 
-    /// Finishes the output layer when the run completed and has an output disk, and says what
-    /// the arena and the disks did; the failure, if the layer could not be finished.
+    /// Finishes the output layer when the run completed and has an output disk, and each layer
+    /// its sinks wrote onto a volume (item 3.3), and says what the arena, the disks and the
+    /// volumes did; the first failure, if a layer could not be finished.
     pub(crate) fn finish(
         granted: Option<&Granted>,
         completed: bool,
@@ -2522,6 +2523,23 @@ mod data_os {
                 })
             }
             None => {}
+        }
+        // Item 3.3: the layers the sinks wrote onto their volumes, each finished in place.
+        for (serial, finished) in granted.finish_volumes(completed) {
+            match finished {
+                Ok(w) => notes.push(format!(
+                    "data OS: volume {serial}'s layer is {} bytes: {} files of {} bytes in {} \
+                     directories, written as the sinks wrote them",
+                    w.bytes, w.files, w.data, w.directories
+                )),
+                Err(msg) => {
+                    failure.get_or_insert(MorunaError::Io {
+                        op: "a volume's layer",
+                        target: serial,
+                        msg,
+                    });
+                }
+            }
         }
         notes.extend(granted.notes());
         notes.push(format!(

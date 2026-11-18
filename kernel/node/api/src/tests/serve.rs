@@ -427,7 +427,7 @@ fn a_later_start_s_node_document_says_the_node_s_boot_ms() {
 /// HTTPS, while the process waits on the engine's channel as well as the network server.
 #[test]
 fn a_node_with_admission_reports_its_job_bound_and_checks_in_an_engine() {
-    const BOUND: u64 = 6_580 << 20;
+    const BOUND: u64 = 6_564 << 20;
     let admission = super::admission::Admission::start(BOUND);
     let mut node = Node::start(true);
     let outside = node.slot("listen-host");

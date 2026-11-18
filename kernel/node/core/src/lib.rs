@@ -14,6 +14,20 @@ pub const MAX_CONFIG: usize = 4096;
 /// The least a `rest` account may be: admission's own 128 MiB, its 256 MiB check account and
 /// a job of 256 MiB (system design 3A).
 pub const REST_LEAST: u64 = 640 << 20;
+
+/// What the supervisor keeps of its own account once it has carved the `rest` account: room for
+/// what it makes after its start, the network client and channels each start of the service that
+/// restarts takes, the records of its children's accounts, and its own heap.
+pub const SUPERVISOR_RESERVE: u64 = 16 << 20;
+
+/// The `rest` account when the supervisor's own account has `free` bytes it can still charge or
+/// carve: all of it less [`SUPERVISOR_RESERVE`], in whole pages; `None` when that is under
+/// [`REST_LEAST`]. The supervisor carves it last, from what it actually has free then
+/// ([`Config::carving_order`]); [`Config::parse`] refuses a node too small by the same rule.
+pub fn rest_bytes(free: u64) -> Option<u64> {
+    let bytes = free.saturating_sub(SUPERVISOR_RESERVE) & !4095;
+    (bytes >= REST_LEAST).then_some(bytes)
+}
 pub const MAX_SERVICES: usize = 16;
 pub const MAX_JOB_GRANTS: usize = 24;
 
@@ -84,6 +98,9 @@ pub struct Config {
     pub admission: Option<String>,
     /// The one service the supervisor starts again when it dies (`restart`, item 2.2c).
     pub restart: Option<Restart>,
+    /// The service that takes the rest of the node's memory (`service NAME IMAGE rest`), whose
+    /// account the supervisor carves last ([`Config::carving_order`]).
+    pub rest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,13 +252,14 @@ impl Config {
         if services.is_empty() {
             return Err(ConfigError::Empty);
         }
+        // The rest is what is left once every other account is carved, less the supervisor's
+        // reserve: what the supervisor will carve last, at most (it carves from what it actually
+        // has free then).
         if let Some(index) = rest {
-            let room = (available - total) & !4095;
-            if room < REST_LEAST {
-                return Err(ConfigError::Budget);
-            }
-            services[index].account_bytes = room;
+            services[index].account_bytes =
+                rest_bytes(available - total).ok_or(ConfigError::Budget)?;
         }
+        let rest = rest.map(|index| services[index].name.clone());
         // Every destination slot and transferred boot capability has one owner.
         let mut destinations: Vec<(&str, &str)> = Vec::new();
         let mut sources: Vec<&str> = Vec::new();
@@ -342,7 +360,22 @@ impl Config {
             bootstraps,
             admission,
             restart,
+            rest,
         })
+    }
+
+    /// The order the supervisor carves its services' accounts in, by their place in
+    /// [`Config::services`]: every fixed account in node.conf's order, then the `rest` account,
+    /// whatever its place, so a service listed after it still gets its own.
+    pub fn carving_order(&self) -> Vec<usize> {
+        let rest = self
+            .rest
+            .as_ref()
+            .and_then(|name| self.services.iter().position(|s| &s.name == name));
+        (0..self.services.len())
+            .filter(|index| Some(*index) != rest)
+            .chain(rest)
+            .collect()
     }
 
     /// The node as this machine runs it. With `hyperv` (the supervisor holds [`HYPERV`]),
@@ -1169,15 +1202,35 @@ mod boot_tests {
     fn one_service_takes_the_rest_of_the_nodes_memory() {
         let config = b"moruna-node 1\nservice api image.api 67108864\nservice admission image.admission rest\n";
         let node = Config::parse(config, 2 << 30).unwrap();
-        assert_eq!(node.services[1].account_bytes, (2 << 30) - (64 << 20));
+        // All the node's memory less api's account and the supervisor's reserve.
+        assert_eq!(
+            node.services[1].account_bytes,
+            (2 << 30) - (64 << 20) - SUPERVISOR_RESERVE
+        );
+        assert_eq!(node.rest.as_deref(), Some("admission"));
         // Whole pages, and never below what admission needs.
         let odd = Config::parse(config, (2 << 30) + 100).unwrap();
-        assert_eq!(odd.services[1].account_bytes, (2 << 30) - (64 << 20));
         assert_eq!(
-            Config::parse(config, (64 << 20) + REST_LEAST - 4096),
+            odd.services[1].account_bytes,
+            (2 << 30) - (64 << 20) - SUPERVISOR_RESERVE
+        );
+        assert_eq!(
+            Config::parse(config, (64 << 20) + SUPERVISOR_RESERVE + REST_LEAST - 4096),
             Err(ConfigError::Budget)
         );
-        assert!(Config::parse(config, (64 << 20) + REST_LEAST).is_ok());
+        assert!(Config::parse(config, (64 << 20) + SUPERVISOR_RESERVE + REST_LEAST).is_ok());
+        assert_eq!(
+            rest_bytes(REST_LEAST + SUPERVISOR_RESERVE + 100),
+            Some(REST_LEAST)
+        );
+        assert_eq!(rest_bytes(REST_LEAST + SUPERVISOR_RESERVE - 1), None);
+        assert_eq!(rest_bytes(0), None);
+        // No `rest`: none, and the accounts are carved in node.conf's order.
+        let fixed = Config::parse(b"moruna-node 1\nservice a image.a 4096\n", 8192).unwrap();
+        assert_eq!(
+            (fixed.rest.clone(), fixed.carving_order()),
+            (None, alloc::vec![0])
+        );
         let twice = b"moruna-node 1\nservice a image.a rest\nservice b image.b rest\n";
         assert_eq!(Config::parse(twice, 8 << 30), Err(ConfigError::Duplicate));
     }
@@ -1213,11 +1266,72 @@ mod boot_tests {
             let others: u64 = others.iter().map(|s| s.account_bytes).sum();
             assert_eq!(others, 832 * MIB);
             let admission = admission[0].account_bytes;
-            assert_eq!(others + admission, room & !4095);
+            assert_eq!(others + admission + SUPERVISOR_RESERVE, room & !4095);
             // Admission's own 128 MiB and the 256 MiB check account come out of its account.
             bounds.push((gib, (admission - 384 * MIB) / MIB));
         }
-        assert_eq!(bounds, [(2, 733), (8, 6580), (16, 14376)]);
+        assert_eq!(bounds, [(2, 717), (8, 6564), (16, 14360)]);
+    }
+
+    /// The supervisor carves every fixed account first and the `rest` account last, from what
+    /// its own account actually has free then, less its reserve: a service node.conf lists after
+    /// the one that takes the rest still gets its account, as the cloud-check profile's
+    /// `storvsc-check` after node-admission does. A ledger of the supervisor's own account, which
+    /// pays each child account's record besides holding its limit, as the core's does.
+    #[test]
+    fn a_service_listed_after_rest_gets_its_account() {
+        const RECORD: u64 = 4096;
+        let check = include_bytes!("../../cloud-check/node.conf");
+        let after = b"moruna-node 1\n\
+            service api image.api 67108864\n\
+            service admission image.admission rest\n\
+            service late image.late 33554432\n";
+        for (text, hyperv) in [(&check[..], true), (&check[..], false), (&after[..], false)] {
+            for gib in [2u64, 8] {
+                let room = (gib << 30) / 10_000 * 9_517;
+                let node = Config::parse(text, room).unwrap().on_machine(hyperv);
+                let order = node.carving_order();
+                let rest = node.rest.as_deref().expect("a rest service");
+                let last = *order.last().unwrap();
+                assert_eq!(node.services[last].name, rest);
+                let mut sorted = order.clone();
+                sorted.sort_unstable();
+                assert_eq!(sorted, (0..node.services.len()).collect::<Vec<_>>());
+                // The supervisor's own account as it carves.
+                let mut free = room;
+                for &index in &order {
+                    let bytes = if index == last {
+                        rest_bytes(free).expect("the rest fits")
+                    } else {
+                        node.services[index].account_bytes
+                    };
+                    assert!(
+                        bytes + RECORD <= free,
+                        "{} gets no account",
+                        node.services[index].name
+                    );
+                    free -= bytes + RECORD;
+                }
+                // The supervisor keeps its reserve, less the last record.
+                assert!(free + RECORD >= SUPERVISOR_RESERVE, "{free}");
+            }
+        }
+        // In the check variant the check is listed after node-admission and carved before it.
+        let node = Config::parse(check, 2 << 30).unwrap();
+        let order = node.carving_order();
+        let at = |name: &str| {
+            let index = node.services.iter().position(|s| s.name == name).unwrap();
+            order.iter().position(|i| *i == index).unwrap()
+        };
+        assert!(
+            node.services.iter().position(|s| s.name == "storvsc-check")
+                > node
+                    .services
+                    .iter()
+                    .position(|s| s.name == "node-admission")
+        );
+        assert!(at("storvsc-check") < at("node-admission"));
+        assert_eq!(at("node-admission"), order.len() - 1);
     }
     #[test]
     fn admission_is_told_the_nodes_memory_on_a_slot_of_its_own() {

@@ -60,6 +60,18 @@ impl FileMap {
         }
         Some((extent.start != 0).then(|| extent.start + (page - first)))
     }
+
+    /// The layer page of file page `first` when the `pages` pages from it lie one after another
+    /// in the layer, in one extent with no hole: a range a mapping can take where it lies
+    /// (item 3.6); `None` otherwise, or past the file's end.
+    pub fn run_of(&self, first: u64, pages: u64) -> Option<u64> {
+        let last = first.checked_add(pages)?.checked_sub(1)?;
+        let start = self.layer_page(first)??;
+        let end = self.layer_page(last)??;
+        let at = self.runs.partition_point(|(f, _)| *f <= first);
+        let (from, extent) = self.runs[at.checked_sub(1)?];
+        (end - start == last - first && last < from + extent.pages).then_some(start)
+    }
 }
 
 impl Layer {

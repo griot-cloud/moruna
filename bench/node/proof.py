@@ -2,7 +2,7 @@
 
     proof.py --url https://ADDRESS:443 --pin SHA256 (--token TOKEN | --token-key PEM --instance ID)
              --function-key PEM --functions DIR --function-base URL
-             --data volume --source-serial S --sink-serial S --volume-out DIR
+             --data volume --source-serial S --sink-serial S --volume-image FILE [--unpacker BIN]
            | --data blob --blob-account A --blob-container C [--blob-endpoint URL]
              [--jobs score,occupancy,enrich,audit] [--periods 2024-01,2024]
              [--references ~/moruna-data/nyc] [--gate-canon BIN] [--events sse|mcp]
@@ -15,16 +15,20 @@ Against one node, in order:
    test function key whose public half is in the node's config. One the node already lists with
    the same SHA-256 is left as it is.
 2. **Runs Score, Occupancy, Enrich and Audit** (bench/vm/workloads.py) on January 2024, then on
-   all of 2024, one job at a time (3A: a node runs one), each as gate_jobs.py's document: the
+   all of 2024, one job at a time (3A: a node runs one), each as gate_jobs.py's document with
+   its function the registered task, `{"kind": "function", "function": "gate-JOB"}` (3.6): the
    normalised files from the source volume (3C, `disk://SERIAL/FILE`) or from Blob (3.5,
    `az://CONTAINER/nyc/FILE`, the account key by secret name), the output to the sink volume or
-   to Blob.
+   to Blob. The sink writes the volume's layer from its first byte, so each run's output is read
+   back (`moruna-engine volume unpack` on the volume's image, 3.3) before the next run.
 3. **Follows each job's events** to its report and exit: over Server-Sent Events, or over MCP's
    `moruna_jobs_events` (3.7). A lost connection resumes after the last record it had (`from` is
    that record's number: the records after it come).
 4. **Checks the output** against 0.6.6's reference, `REFERENCES/reference-JOB-PERIOD.json`
    (references.py): its rows and canonical hashes (gate-canon/1; `gate-canon` when it is given,
-   else canon.py, which the year does not fit), within the job's tolerance where it has one.
+   else canon.py, which the year does not fit), within the tolerance of the columns the
+   reference names tolerant. canon.py reads Parquet with pyarrow; where there is none, only
+   gate-canon hashes, and a month whose tolerant values differ is not compared.
 
 Every run's record is written to `RESULTS/JOB-PERIOD.json`, the summary to `RESULTS/proof.json`,
 and a table is printed. The exit code is 0 only when all of them pass.
@@ -44,9 +48,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(1, os.path.join(HERE, "engines"))
 sys.path.insert(2, os.path.join(HERE, "..", "vm"))
-import canon  # noqa: E402
 import gate_jobs  # noqa: E402
 import node_api  # noqa: E402
+
+try:
+    import canon  # noqa: E402 (it reads Parquet with pyarrow)
+except ImportError:  # no pyarrow here: gate-canon hashes
+    canon = None
+NO_CANON = "canon.py needs pyarrow, which is not here"
 
 JOBS = ("score", "occupancy", "enrich", "audit")
 PERIODS = ("2024-01", "2024")
@@ -54,11 +63,6 @@ MiB = 1 << 20
 # What a node keeps from a job's budget (3A): 512 MiB for its services, 256 MiB for a check.
 NODE_KEEPS = 768 * MiB
 BLOB_SECRET = "blob-key"
-
-PENDING = ("how a job names a registered function is item 3.6's (here the gate's image kernel, its "
-           "location the registered address), and reading the sink volume back is item 3.3's "
-           "(here `--volume-out`, the volume's files as read back after each run): this follows "
-           "them when 3.3 and 3.6 merge")
 
 
 def files(period):
@@ -73,10 +77,11 @@ def plan(jobs, periods):
 
 
 class Volumes:
-    """Sources on one volume, outputs on another, by serial (3C)."""
+    """Sources on one volume, outputs on another, by serial (3C); the sink volume's image is
+    `image` where this runs, read back by `unpacker volume unpack` (3.3)."""
 
-    def __init__(self, source, sink, out_root):
-        self.source, self.sink, self.out_root = source, sink, out_root
+    def __init__(self, source, sink, image, unpacker="moruna-engine"):
+        self.source, self.sink, self.image, self.unpacker = source, sink, image, unpacker
 
     def document_extras(self):
         return {}, {}
@@ -88,11 +93,22 @@ class Volumes:
         return f"disk://{self.sink}/proof/{run['id']}/"
 
     def fetch(self, run, dest):
-        """The run's output, as the sink volume's files were read back (see PENDING)."""
-        src = os.path.join(self.out_root, "proof", run["id"])
-        if not os.path.isdir(src):
-            raise FileNotFoundError(f"no output of {run['id']} under {self.out_root}")
-        shutil.copytree(src, dest, dirs_exist_ok=True)
+        """The run's output: the sink volume unpacked (the last run's layer), its `proof/RUN`."""
+        unpacked = dest.rstrip("/") + ".volume"
+        shutil.rmtree(unpacked, ignore_errors=True)
+        try:
+            p = subprocess.run([self.unpacker, "volume", "unpack", self.image, unpacked],
+                               capture_output=True, text=True, check=False)
+            if p.returncode != 0:
+                raise RuntimeError(f"volume unpack: {p.stderr.strip()[-300:] or p.returncode}")
+            src = os.path.join(unpacked, "proof", run["id"])
+            if not os.path.isdir(src):
+                found = sorted(os.path.relpath(os.path.join(d, f), unpacked)
+                               for d, _, fs in os.walk(unpacked) for f in fs)
+                raise FileNotFoundError(f"no proof/{run['id']} in the sink volume: {found[:8]}")
+            shutil.copytree(src, dest, dirs_exist_ok=True)
+        finally:
+            shutil.rmtree(unpacked, ignore_errors=True)
 
 
 class Blob:
@@ -118,12 +134,12 @@ class Blob:
         self.store.download(f"{self.outputs_prefix}{run['id']}/", dest)
 
 
-def document(run, data, function_base, cpus, memory_bytes):
+def document(run, data, cpus, memory_bytes):
     """The run's job: gate_jobs.py's document over `data`'s inputs and output, its function the
-    registered gate task (see PENDING), and the secrets it names."""
-    image = {"location": f"{function_base}/gate-{run['job']}"}
-    doc = gate_jobs.document(run["job"], data.inputs(run["period"]), data.output(run), image, cpus=cpus,
+    registered gate task by name (3.6), and the secrets it names."""
+    doc = gate_jobs.document(run["job"], data.inputs(run["period"]), data.output(run), {}, cpus=cpus,
                              mem_gib=memory_bytes / (1 << 30))
+    doc["kernels"] = [{"kind": "function", "function": f"gate-{run['job']}"}]
     doc["budget"]["memory_bytes"] = int(memory_bytes)
     extras, secrets = data.document_extras()
     doc.update(extras)
@@ -274,6 +290,8 @@ def canonical(job, out, gate_canon=None, dump=None):
         d = json.loads(p.stdout)
         d["by"], d["dump"] = "gate-canon", dump
         return d
+    if canon is None:
+        return {"error": f"{NO_CANON}: give --gate-canon"}
     table = canon.read_output([out])
     if table is None:
         return {"error": "no output files"}
@@ -289,7 +307,7 @@ def compare(job, mine, ref, refs_dir, gate_canon=None):
     c = {"rows": mine["rows"] == ref["rows"], "hash_exact": mine["hash_exact"] == ref["hash_exact"],
          "hash_all": mine["hash_all"] == ref["hash_all"], "rows_mine": mine["rows"], "rows_ref": ref["rows"],
          "by": mine.get("by")}
-    tolerant = canon.SPECS[job].get("tolerant")
+    tolerant = ref.get("tolerant")
     if c["hash_all"] and c["rows"]:
         c.update(ok=True, verdict="bit for bit")
     elif not (c["rows"] and c["hash_exact"] and tolerant):
@@ -301,11 +319,13 @@ def compare(job, mine, ref, refs_dir, gate_canon=None):
         detail = json.loads(p.stdout) if p.stdout.strip().startswith("{") else {"error": p.stderr.strip()[-300:]}
         c.update(ok=p.returncode == 0, tolerance=detail)
         c["verdict"] = "within tolerance (gate-canon)" if c["ok"] else "DIFFERS beyond the tolerance (gate-canon)"
-    elif "tolerant_rows" in ref and "tolerant_rows" in mine:
+    elif "tolerant_rows" in ref and "tolerant_rows" in mine and canon is not None:
         t = canon.compare(job, ref, mine)
         c.update(ok=t["ok"], differing=t["differing"], max_abs=t["max_abs"])
         c["verdict"] = (f"within tolerance ({t['differing']} values differ, max {t['max_abs']:.1e})" if t["ok"]
                         else "DIFFERS beyond the tolerance")
+    elif "tolerant_rows" in ref and canon is None:
+        c.update(ok=False, verdict=f"not compared: the tolerant values differ and {NO_CANON}")
     else:
         c.update(ok=False, verdict="not compared: no tolerant rows to compare (give --gate-canon for the year)")
     return c
@@ -332,7 +352,7 @@ def run_one(node, run, data, a, follow, log=print, sleep=time.sleep, clock=time.
     """One job on the node, followed to its end, its output checked."""
     t0 = clock()
     deadline = t0 + (a.timeout_s if run["period"] != "2024" else a.year_timeout_s)
-    doc, secrets = document(run, data, a.function_base, a.cpus, a.memory_bytes)
+    doc, secrets = document(run, data, a.cpus, a.memory_bytes)
     rec = {"run": run, "data": a.data, "events_by": a.events}
     try:
         jid = submit(node, doc, secrets, deadline, sleep=sleep, clock=clock, log=log)
@@ -376,7 +396,7 @@ def run_one(node, run, data, a, follow, log=print, sleep=time.sleep, clock=time.
     ref = json.load(open(ref_path))
     dump = os.path.join(a.work, f"{run['id']}.dump") if a.gate_canon and ref.get("dump") else None
     mine = canonical(run["job"], out, a.gate_canon, dump)
-    if a.gate_canon and "error" not in mine and "tolerant_rows" in ref and canon.SPECS[run["job"]].get("tolerant") \
+    if a.gate_canon and canon is not None and "error" not in mine and "tolerant_rows" in ref and ref.get("tolerant") \
             and mine["hash_exact"] == ref["hash_exact"] and mine["hash_all"] != ref["hash_all"]:
         mine = dict(mine, tolerant_rows=canonical(run["job"], out)["tolerant_rows"])
     rec["canon"] = {k: v for k, v in mine.items() if k != "tolerant_rows"}
@@ -412,9 +432,9 @@ def tokens_of(a):
 
 def data_of(a):
     if a.data == "volume":
-        if not (a.source_serial and a.sink_serial and a.volume_out):
-            raise SystemExit("proof.py: --data volume needs --source-serial, --sink-serial and --volume-out")
-        return Volumes(a.source_serial, a.sink_serial, a.volume_out)
+        if not (a.source_serial and a.sink_serial and a.volume_image):
+            raise SystemExit("proof.py: --data volume needs --source-serial, --sink-serial and --volume-image")
+        return Volumes(a.source_serial, a.sink_serial, a.volume_image, a.unpacker)
     if not (a.blob_account and a.blob_container and os.environ.get("BENCH_KEY")):
         raise SystemExit("proof.py: --data blob needs --blob-account, --blob-container "
                          "and BENCH_KEY in the environment")
@@ -436,7 +456,8 @@ def parse(argv):
     p.add_argument("--data", choices=("volume", "blob"), required=True)
     p.add_argument("--source-serial", default=None)
     p.add_argument("--sink-serial", default=None)
-    p.add_argument("--volume-out", default=None, help="the sink volume's files, as read back after each run")
+    p.add_argument("--volume-image", default=None, help="the sink volume's image where this runs, read back after each run")
+    p.add_argument("--unpacker", default="moruna-engine", help="the engine that unpacks it (`volume unpack`)")
     p.add_argument("--blob-account", default=None)
     p.add_argument("--blob-container", default=None)
     p.add_argument("--blob-endpoint", default=None, help="a local emulator's (Azurite's) endpoint")
@@ -448,7 +469,7 @@ def parse(argv):
     p.add_argument("--gate-canon", default=None, help="the gate-canon binary (needed for the year)")
     p.add_argument("--events", choices=("sse", "mcp"), default="sse")
     p.add_argument("--memory-gib", type=float, default=None,
-                   help="each job's budget; by default the most the node takes, its memory less 768 MiB (3A)")
+                   help="each job's budget; by default the most the node takes (its job_memory_bytes, 3A)")
     p.add_argument("--cpus", type=int, default=4)
     p.add_argument("--timeout-s", type=float, default=3600, help="a month's run, at most")
     p.add_argument("--year-timeout-s", type=float, default=6 * 3600)
@@ -474,12 +495,12 @@ def main(argv=None, transport=None, sign=None, log=print, sleep=time.sleep, cloc
     data = data_of(a)
     sign = sign or (lambda digest: node_api.sign_digest(a.function_key, digest))
     facts = node.node()
-    a.memory_bytes = int(a.memory_gib * (1 << 30)) if a.memory_gib else facts["memory_bytes"] - NODE_KEEPS
+    a.memory_bytes = (int(a.memory_gib * (1 << 30)) if a.memory_gib
+                      else facts.get("job_memory_bytes") or facts["memory_bytes"] - NODE_KEEPS)
     os.makedirs(a.results, exist_ok=True)
     os.makedirs(a.work, exist_ok=True)
     log(f"proof: node {facts.get('instance')} on {facts.get('cloud')}, version {facts.get('version')}; "
         f"budget {a.memory_bytes / (1 << 30):.2f} GiB, {a.cpus} CPUs; data from {a.data}; events by {a.events}")
-    log(f"proof: pending: {PENDING}")
     jobs = a.jobs.split(",")
     register(node, jobs, a.functions, a.function_base, sign, log)
     follow = follow_sse if a.events == "sse" else follow_mcp

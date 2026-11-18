@@ -383,6 +383,20 @@ pub fn tree(dir: &Path) -> Result<Entry> {
     })
 }
 
+/// The tree of `dir` (its directories, regular files and symbolic links, each with its
+/// permission bits) as one layer, written to the new file `out`. `moruna volume pack` and
+/// `moruna-layer pack` both pack with it, so a layer is the same whichever packs it, on any
+/// machine: the format names no architecture.
+pub fn pack(dir: &Path, out: &Path) -> Result<LayerFile> {
+    if out.symlink_metadata().is_ok() {
+        return Err(bad(format!(
+            "{} exists; a layer is written to a new file",
+            out.display()
+        )));
+    }
+    write(&tree(dir)?, out)
+}
+
 /// Writes `root` as a layer file at `out`.
 pub fn write(root: &Entry, out: &Path) -> Result<LayerFile> {
     let mut flat = flatten(root)?;

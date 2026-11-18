@@ -24,3 +24,5 @@ moruna-node = { path = "../core", version = "=0.1.0" }
 moruna-storage-service = { path = "../../storage", version = "=0.1.0" }
 moruna-storage-format = { path = "../../../crates/moruna-storage-format", version = "=0.6.6", default-features = false, features = ["pure"] }
 devices-protocol = { path = "../../devices/protocol", version = "=0.1.0" }
+# A source volume's writer lease, which admission holds for the job's length (item 3.3).
+block-protocol = { path = "../../drivers/block-protocol", version = "=0.1.0" }

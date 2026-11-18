@@ -381,6 +381,13 @@ impl Session {
         self.closing
     }
 
+    /// Whether a request is being answered and the server is the one to move: an answer that
+    /// comes later (a document's verdict), or the next events of a stream, with nothing of it
+    /// queued for the client to take.
+    pub(crate) fn answering(&self) -> bool {
+        (self.waiting.is_some() || self.stream.is_some()) && self.pending().is_empty()
+    }
+
     /// No more bytes will arrive: the requests that have are answered, then the session closes.
     pub(crate) fn finish(&mut self) {
         self.finished = true;

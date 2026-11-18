@@ -7,6 +7,10 @@
 //! from the region into a cache slot only when something touches it, and believed only once
 //! it matches its hash, as a block device's page is. [`attach`] mounts every span, lowest
 //! first, and refuses one whose header's seal is not the one the archive's index gave it.
+//!
+//! A file's pages that lie one after another in a layer are mapped where they lie, with no copy
+//! ([`in_place`]): each is checked against its hash first, once, since nothing writes the
+//! region.
 
 use alloc::{format, vec, vec::Vec};
 
@@ -34,6 +38,8 @@ pub struct AttachedDisk<R: AsRef<[u8]>> {
     region: R,
     spans: Vec<Span>,
     slots: Vec<u8>,
+    /// Each layer's pages checked in place, a bit a page ([`in_place`]).
+    checked: Vec<Vec<u64>>,
 }
 
 impl<R: AsRef<[u8]>> AttachedDisk<R> {
@@ -65,11 +71,29 @@ impl<R: AsRef<[u8]>> AttachedDisk<R> {
                 }
             }
         }
+        let checked = spans
+            .iter()
+            .map(|s| vec![0u64; s.pages.div_ceil(64) as usize])
+            .collect();
         Ok(AttachedDisk {
             region,
             spans,
             slots: vec![0; slots as usize * PAGE],
+            checked,
         })
+    }
+
+    /// The region.
+    pub fn region(&self) -> &R {
+        &self.region
+    }
+
+    fn is_checked(&self, layer: usize, page: u64) -> bool {
+        self.checked[layer][(page / 64) as usize] & (1 << (page % 64)) != 0
+    }
+
+    fn check(&mut self, layer: usize, page: u64) {
+        self.checked[layer][(page / 64) as usize] |= 1 << (page % 64);
     }
 
     /// The spans.
@@ -131,6 +155,39 @@ impl<R: AsRef<[u8]>> Disk for AttachedDisk<R> {
             .map(|span| span.pages)
             .ok_or_else(|| Error::Io(format!("no layer {layer}")))
     }
+}
+
+/// Where pages `first..first + pages` of layer `layer` lie in the region, in bytes from its
+/// first: for a mapping that takes them where they lie, with no copy (item 3.6). Each page is
+/// checked against its hash, from the layer's tables, before it is given, once: nothing writes
+/// the region. Refused when a page is past its layer or does not match its hash.
+pub fn in_place<R: AsRef<[u8]>>(
+    cache: &mut Cache<AttachedDisk<R>>,
+    layer: usize,
+    first: u64,
+    pages: u64,
+) -> Result<u64> {
+    let span = *cache
+        .disk_ref()
+        .spans
+        .get(layer)
+        .ok_or_else(|| Error::Io(format!("no layer {layer}")))?;
+    if pages == 0 || first.checked_add(pages).is_none_or(|end| end > span.pages) {
+        return Err(Error::BadRange);
+    }
+    for page in first..first + pages {
+        if cache.disk_ref().is_checked(layer, page) {
+            continue;
+        }
+        let expected = cache.expected(layer, page)?;
+        if crate::sha256::digest(cache.disk_ref().page(layer, page)?) != expected {
+            return Err(Error::Corrupt(format!(
+                "layer {layer}: page {page}, mapped where it lies, does not match its hash"
+            )));
+        }
+        cache.disk().check(layer, page);
+    }
+    Ok(span.offset + first * PAGE_U64)
 }
 
 /// `region`'s spans mounted as an image's layers, lowest first, over a cache of `slots` pages,
