@@ -9,6 +9,10 @@
 - Building the boot image (`build.sh`, `package.py`) and every boot need `~/.vm-lock`
   (`tools/proof-lab/run.py` shows how to take it). Never steal it. Keep a VM at or under 6 GiB.
   Release it the moment you stop, including when you stop to ask.
+- **A booted turn holds both locks:** take `~/.vm-lock` first, then `~/.mac-build-lock`, and hold
+  both until the turn's build and boot are done (2026-11-18: an image build beside other agents'
+  cargo builds filled the Mac's disk and stopped the turn). A build or test on the Mac alone takes
+  only `~/.mac-build-lock`. Never take them in the other order.
 - Host tests of single crates (`cargo test -p …`, `cargo llvm-cov -p …`) don't need the lock. Run
   every cargo command with `-j 2`, and tests with `RUST_TEST_THREADS=2`: up to nine agents and a
   boot share this Mac's 10 cores and 16 GB.
