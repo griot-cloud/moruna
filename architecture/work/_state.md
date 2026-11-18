@@ -21,6 +21,8 @@ Boot evidence is kept in `~/moruna-data/boots/` (chain logs, scripts, run report
 
 ## The PM's, in order
 
+Run 6 next: the node alone at feature's tip (the asynchronous fetch, 6.3g, 6.3r's gap fix), its table merged with run 5's Linux engines.
+
 Benchmark run 5 so far (results 202611182200, image b11c1342): node Score 55–57 s 6/6, Occupancy 15.8–17.6 s, Enrich 63–74 s 6/6, Audit 17.4–17.9 s 4/6 (2 failed on 6.3r's gap). The Linux engines are installing and running this time (0.6.6's Rust Score 30.3 s, 0.6.6 Python 60.1 s, Dask 78.8 s).
 
 
@@ -34,7 +36,7 @@ Benchmark run 5 is ready (`~/moruna-data/chain-bench5.sh <commit>`): the node im
 |---|---|---|---|---|
 | 1 | 6.3s a Completed run lost a row group | MERGED 56cc2040 (`work/6.3s-rows`) | none | Done: SC-T50, SC-T51; a source closes only when no read waits to be retried and every read taken from its cursor was pushed. 6.3d's 768-column test passes with it |
 | 2 | 6.3n push into a closed stage | MERGED with 6.3s (its test is SC-T51) | none | Done: the same root as 6.3s |
-| 3 | 6.3r several instances fail on the node | MERGED f7c561e9; gap fix on `work/6.3r-taking-outstanding` (uncommitted) | none | Run 5: Score 6/6, Enrich 6/6, Audit r2 failed 'done without a record'. Found: wait_for_room can move the only batch in flight into `taking`, and step() then read `in_flight` empty as nothing outstanding and dropped the task's release, so later answers went to the wrong batches. Fix: step() counts `outstanding()`. Needs the x86_64 compile check, then merge |
+| 3 | 6.3r several instances fail on the node | MERGED f7c561e9 and the gap fix 75347b85 (dc352acc) | boots in ~/moruna-data/boots | Done, booted: Score 2/2, Audit 2/2, Enrich and Occupancy complete with step() counting outstanding(). Run 6 on the node confirms |
 | 4 | 6.3h, j, k bytes out in place (the stack) | MERGED 47a393a5 | scratch in wip | Booted check passed (TCG proof boot, 4 CPUs, January): Enrich amplification 2.17 (15.06 in run 3), out/in 1.172; Audit 1.22 and 0.216; Occupancy 1.27 and 0.247. 6.3m (a unit's output is not its own morsel's) has three failing tests at 1ad2c093, not merged, and is still to build |
 | 5 | 6.3i the node reports job CPU | MERGED with 6.3g (c9627493, 8b65a548) | none | Done: booted, KB5 accounts, quota and cpu |
 | 5b | 6.3t the drive's fetches run one at a time | MERGED 4c7eb964 (requests in flight) and a906df5d (asynchronous fetch, ranges share a group's fetch) | none | Done on the host: SO-T49 to SO-T52. Run 5 (image b11c1342, before the asynchronous fetch): Occupancy 15.8–17.6 s from 18.6. Left: measure the asynchronous fetch on the node (run 6) |
