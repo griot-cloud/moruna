@@ -732,3 +732,15 @@ fn nt_t6_virtio_net_configuration_frames_and_commands() {
     assert_eq!(ctrl_queue(4, true), 8);
     assert_eq!(ctrl_queue(1, false), 2);
 }
+
+/// NT-T6, item 1.6f (Servercore run 9: 46 buffers refused against 23 frames taken, and
+/// the metadata service never answered): a frame whose header has `DATA_VALID` (2) is
+/// delivered. Linux's tun writes `DATA_VALID` on every frame whose checksum the host
+/// trusts, whatever the guest negotiated, and Linux's virtio_net takes it.
+#[test]
+fn nt_t6_a_frame_with_data_valid_is_delivered() {
+    use crate::net::received;
+    let page = Fake::new(4096);
+    page.poke(0, &[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
+    assert_eq!(received(&page, 0, 4096, 12 + 60, 1514), Ok(12..72));
+}
