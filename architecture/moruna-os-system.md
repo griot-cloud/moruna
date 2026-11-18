@@ -554,6 +554,15 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
   row group by its pages), not refused while workers idle. The no-kernel read target lets
   `read_ahead` reads fit at their charge. Found by 6.3a: at 3A's split of 1 GiB, one of two workers
   idled half the run, because each whole row group was charged twice its size.
+- **A function's memory is measured, never assumed.** A job's budget has two parts: the arena,
+  which holds the Arrow batches in flight, and the room above it, where each function instance keeps
+  its own working memory. The room each instance needs comes from measurement: the warm-up's memory
+  facts on small batches (`moruna check`, carried with the function's registration), refined by
+  what every run on the node observes, kept per function image. The arena's share and the number of
+  instances follow from that. A function with no measurement yet is warmed up on the job's first
+  small batches before the run is sized. No default factor stands in for a measurement (6.3g, found
+  2026-11-18: the node sized the room from a fixed factor of 4.0, because registration carried no
+  warm-up).
 - **Memory on a node is computed, never a constant.** Each service has a fixed account in node.conf
   except `node-admission`, which takes `rest`: node memory less every other account and the kernel's
   share. Jobs and checks are carved from it. The job bound is admission's account less the 256 MiB
