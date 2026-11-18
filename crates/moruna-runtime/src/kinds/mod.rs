@@ -172,6 +172,7 @@ pub struct Context {
     pulled: Option<std::path::PathBuf>,
     args: serde_json::Map<String, serde_json::Value>,
     calls: Vec<(usize, Arc<moruna_kernel::StagePorts>)>,
+    cpu: Option<f64>,
 }
 
 impl Context {
@@ -188,7 +189,21 @@ impl Context {
             pulled: None,
             args: serde_json::Map::new(),
             calls: Vec::new(),
+            cpu: None,
         }
+    }
+
+    /// The job's `budget.cpu`, which a stage of processes runs one instance per CPU of (system
+    /// design 3E).
+    pub fn job_cpu(mut self, cpu: Option<f64>) -> Context {
+        self.cpu = cpu;
+        self
+    }
+
+    /// The job's CPUs (system design 3E): its `budget.cpu` rounded up, or `node`, the CPUs of
+    /// the machine it runs on, when it names none (`moruna_adapters::instances::cpus`).
+    pub fn cpus(&self, node: usize) -> usize {
+        moruna_adapters::instances::cpus(self.cpu, node)
     }
 
     /// The OCI layout the runner pulled the job's registry images into (SDD 19 d.2).
