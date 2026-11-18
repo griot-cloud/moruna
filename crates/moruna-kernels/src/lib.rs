@@ -13,6 +13,11 @@
 //!
 //! The fingerprint is `sha256(name, canonical args, crate version)` (MH 4.9), so a host can
 //! pin a standard kernel in a job document without shipping any code.
+//!
+//! The kernel catalogue (system design 4A) is [`catalogue`]: kernels named by a versioned
+//! identity, `moruna.<name>@<version>`, each with a specification (`spec/<name>.md`), a
+//! conformance corpus (`conformance/<name>/`) and a CPU reference, and [`conformance`], the
+//! two formats and the runner that holds every implementation to its corpus.
 
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
@@ -20,6 +25,8 @@
 #![allow(clippy::result_large_err)]
 
 pub mod args;
+pub mod catalogue;
+pub mod conformance;
 pub mod expr;
 pub mod ops;
 
