@@ -70,6 +70,14 @@ The functions. Each entry has a `kind`.
 {"kind": "std", "name": "select", "args": {"columns": ["review_id", "score"]}}
 ```
 
+**`function`**: `function` is the name a node's functions are registered under (`POST /v1/functions`), and the task runs that function:
+
+```json
+{"kind": "function", "function": "taxi.clean"}
+```
+
+In version 2 it is a function task of kind `function` whose settings are `{"function": "<registered name>"}`. A node fetches each registered function a job names before the job starts, and refuses a name that is not registered at `validate`.
+
 A `package` entry can set `fingerprint`, as printed by `moruna check`. Moruna then refuses to run the job if the loaded function's fingerprint differs, so a document cannot run a function that has changed since it was checked.
 
 ## sink

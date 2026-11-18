@@ -551,7 +551,7 @@ fn a_check_on_a_channel_answers_its_refusals_and_the_budget() {
     assert_eq!(
         answer,
         json!({"type": "checked", "ok": true, "refusals": [], "memory_bytes": max,
-               "hosts": ["s3.example.com"], "volumes": [], "functions": ["std"]})
+               "hosts": ["s3.example.com"], "volumes": [], "functions": []})
     );
     // A document's volumes and hosts, as the check answers them for node-admission to keep.
     let mut disks = document(scratch.path());

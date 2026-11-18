@@ -98,6 +98,11 @@ fn what_a_node_refuses_is_refused_by_its_field() {
         ["report.socket"]
     );
     assert_eq!(with(&|d| d["resume"] = json!("auto")), ["resume"]);
+    // AWS's own S3 with no region: its host is not known.
+    assert_eq!(
+        with(&|d| d["object_store"]["s3"] = json!({"bucket": "b"})),
+        ["object_store.s3.region"]
+    );
     // Every one at once, in the order the document is read; the first is what admit refuses.
     let mut all = sound();
     all["source"]["url"] = json!("file:///in");
@@ -169,9 +174,10 @@ fn a_jobs_needs_are_its_hosts_volumes_and_functions() {
         "moruna_spec": 1,
         "source": {"kind": "parquet", "url": ["disk://vol-a/in/1.parquet", "DISK://vol-b/2"]},
         "kernels": [
+            {"kind": "function", "function": "taxi.clean"},
             {"kind": "std", "name": "select", "args": {"columns": ["a"]}},
-            {"kind": "package", "path": "/p.pex", "fingerprint": "f"},
-            {"kind": "std", "name": "cast", "args": {"columns": {"a": "double"}}},
+            {"kind": "function", "function": "taxi.score"},
+            {"kind": "function", "function": "taxi.clean"},
         ],
         "sink": {"kind": "parquet", "url": "disk://vol-c/out/",
                  "options": {"spill": ["disk://vol-a/spill/"]}},
@@ -203,9 +209,18 @@ fn a_jobs_needs_are_its_hosts_volumes_and_functions() {
                     write: true
                 },
             ],
-            functions: vec!["std".to_string(), "package".to_string()],
+            functions: vec!["taxi.clean".to_string(), "taxi.score".to_string()],
         }
     );
+    // AWS's own S3: its region's host, path-style.
+    let aws = job(json!({
+        "moruna_spec": 1,
+        "source": {"kind": "parquet", "url": "s3://b/in/"},
+        "sink": {"kind": "parquet", "url": "s3://b/out/"},
+        "object_store": {"s3": {"region": "EU-West-1"}},
+    }));
+    assert_eq!(needs(&aws).hosts, ["s3.eu-west-1.amazonaws.com"]);
+    assert!(refusals(&aws, &node()).is_empty());
     // An endpoint with no host of its own (a host socket, or AWS's default) gives none.
     let socket = job(json!({
         "moruna_spec": 1,

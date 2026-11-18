@@ -91,8 +91,8 @@ pub struct NodeNeeds {
     /// Each `disk://<serial>` it names, written by a sink and only read otherwise; a serial
     /// both read and written is written. By serial.
     pub volumes: Vec<VolumeNeed>,
-    /// The kinds of its function tasks, each once, in the order the document names them: a
-    /// function by its registered name (3E).
+    /// The registered functions it uses (3E), each once, in the order the document names them:
+    /// each function task of kind `function` names one by its `function` setting.
     pub functions: Vec<String>,
 }
 
@@ -136,13 +136,16 @@ fn disk_serials<'a>(value: &'a Value, found: &mut Vec<&'a str>) {
 pub fn needs(job: &Job) -> NodeNeeds {
     let mut hosts = Vec::new();
     let store = &job.object_store;
-    if let Some(host) = store
-        .s3
-        .as_ref()
-        .and_then(|s3| s3.endpoint.as_deref())
-        .and_then(url_host)
-    {
-        hosts.push(host);
+    if let Some(s3) = &store.s3 {
+        // With no endpoint the engine asks AWS's own S3, path-style, at its region's host.
+        let host = match (&s3.endpoint, &s3.region) {
+            (Some(endpoint), _) => url_host(endpoint),
+            (None, Some(region)) => {
+                Some(format!("s3.{}.amazonaws.com", region.to_ascii_lowercase()))
+            }
+            (None, None) => None,
+        };
+        hosts.extend(host);
     }
     if let Some(account) = store.azure.as_ref().and_then(|a| a.account.as_deref()) {
         hosts.push(format!(
@@ -166,8 +169,10 @@ pub fn needs(job: &Job) -> NodeNeeds {
         for serial in found {
             *volumes.entry(serial.to_string()).or_insert(write) |= write;
         }
-        if task.role == moruna_job::Role::Kernel && !functions.contains(&task.kind) {
-            functions.push(task.kind.clone());
+        if let Some(name) = task.function_name()
+            && !functions.iter().any(|f| f == name)
+        {
+            functions.push(name.to_string());
         }
     }
     NodeNeeds {
@@ -206,6 +211,16 @@ pub fn refusals(job: &Job, node: &Node) -> Vec<SpecError> {
                  node's memory less 768 MiB, kept for its services and a check): ask for less, \
                  or leave it out for all of it"
             ),
+        ));
+    }
+    if let Some(s3) = &job.object_store.s3
+        && s3.endpoint.is_none()
+        && s3.region.is_none()
+    {
+        refused.push(SpecError::new(
+            "object_store.s3.region",
+            "a job on a node that uses AWS's own S3 names its region: the node lets the job \
+             reach s3.<region>.amazonaws.com and nothing else",
         ));
     }
     if job.object_store.local_root.is_some() {
