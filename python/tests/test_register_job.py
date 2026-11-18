@@ -11,7 +11,6 @@ import base64
 import hashlib
 import json
 import sys
-import tarfile
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -26,6 +25,8 @@ serialization = pytest.importorskip("cryptography.hazmat.primitives.serializatio
 ed25519 = pytest.importorskip("cryptography.hazmat.primitives.asymmetric.ed25519")
 
 PLATFORM = "linux/x86_64"
+#: The page every layer file of an archive starts on.
+PAGE = 4096
 
 CODE = '''
 import pyarrow as pa
@@ -101,23 +102,33 @@ def test_a_decorated_function_is_registered_by_its_name(project, tmp_path: Path)
     (registration,) = node.registered
     assert answered is registration
     assert registration.name == "add_one"
-    path = f"/functions/add_one-{registration.sha256}.tar"
+    path = f"/functions/add_one-{registration.sha256}.mia"
     assert registration.address == f"{store.url}{path}?sig=x"
     uploaded = store.objects[path]
     assert hashlib.sha256(uploaded).hexdigest() == registration.sha256
     key.public_key().verify(
         base64.b64decode(registration.signature), bytes.fromhex(registration.sha256)
     )
-    # The file is the image built for the node's platform, alone in its layout.
-    saved = tmp_path / "uploaded.tar"
-    saved.write_bytes(uploaded)
-    with tarfile.open(saved) as archive:
-        index = json.loads(archive.extractfile("index.json").read())  # type: ignore[union-attr]
-        (entry,) = index["manifests"]
-        blobs = tmp_path / "images" / "blobs" / "sha256"
-        manifest = json.loads((blobs / entry["digest"].split(":")[1]).read_bytes())
-        config = json.loads((blobs / manifest["config"]["digest"].split(":")[1]).read_bytes())
+    # The file is a Moruna image archive of the image built for the node's platform: its
+    # index, then its layer files, converted here, at page-aligned offsets, every byte counted.
+    assert uploaded[:8] == b"MRNIMAG1" and uploaded[12:16] == bytes(4)
+    length = int.from_bytes(uploaded[8:12], "little")
+    index = json.loads(uploaded[16 : 16 + length])
+    assert index["moruna_image_archive"] == 1
+    config = json.loads(index["record"]["config"])
     assert config["architecture"] == "amd64"
+    manifest = json.loads(index["record"]["manifest"])
+    assert [layer["digest"] for layer in index["record"]["layers"]] == [
+        layer["digest"] for layer in manifest["layers"]
+    ]
+    at = -(-(16 + length) // PAGE) * PAGE
+    for span, layer in zip(index["layers"], index["record"]["layers"], strict=True):
+        assert span["offset"] == at
+        header = uploaded[at : at + PAGE]
+        assert header[:8] == b"MRNLAYR1"
+        assert hashlib.sha256(header).hexdigest() == layer["seal"]
+        at += span["pages"] * PAGE
+    assert at == len(uploaded)
 
 
 def test_a_function_class_is_registered_under_the_name_given(project, tmp_path: Path) -> None:

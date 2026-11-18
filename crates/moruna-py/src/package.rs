@@ -53,6 +53,26 @@ pub fn package_wasm(py: Python<'_>, module: &str, manifest: &str, out: &str) -> 
     Ok(())
 }
 
+/// `_core.image_archive(layout, reference, out)` (system design 3E and 5C, work item 5.4): the
+/// image `reference` names in the OCI layout `layout`, converted on this machine into the layer
+/// files Moruna's image filesystem serves and written as the Moruna image archive `out`, the
+/// one file `moruna.register` signs and uploads. Answers its SHA-256, 64 lowercase hex digits,
+/// and its length; a refusal is a `ValueError` saying why.
+#[pyfunction]
+pub fn image_archive(
+    py: Python<'_>,
+    layout: &str,
+    reference: &str,
+    out: &str,
+) -> PyResult<(String, u64)> {
+    py.detach(|| {
+        let source = moruna_image::OciLayout::open(layout)?;
+        moruna_image::archive::write(&source, reference, Path::new(out))
+    })
+    .map(|written| (written.sha256_hex(), written.size))
+    .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 /// The inputs of 16 b from their spellings: the arguments as JSON text, the assets as a path.
 fn inputs(args: Option<&str>, assets: Option<String>) -> PyResult<Inputs> {
     let args = match args {
@@ -330,6 +350,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(package_wasm, m)?)?;
     m.add_function(wrap_pyfunction!(check_package, m)?)?;
     m.add_function(wrap_pyfunction!(aot, m)?)?;
+    m.add_function(wrap_pyfunction!(image_archive, m)?)?;
     m.add_function(wrap_pyfunction!(load, m)?)?;
     m.add_class::<PyPackageKernel>()?;
     #[cfg(target_os = "linux")]
