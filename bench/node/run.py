@@ -31,7 +31,10 @@ One run, in order, every step on the run's resource group in `griot-dev` (azure.
        run-command ran one before (engines/measure.py), the container's account and key given to
        it as environment variables. Each run's summary line lands in `live/` as it ends.
    - **The node**, from its VHD (`kernel/node/AZURE.md`'s steps, as `azure-up.sh --proof` runs
-     them: TCP 443 from `--from` alone), read from its console until `ready`; the gate tasks
+     them: TCP 443 from `--from` alone), ready when GET /v1/health answers 200; its pin from its
+     console (the boot diagnostics blob, read directly with the account's key), which the
+     certificate it serves must match (openssl s_client, 1E); its instance the machine's vmId,
+     cross-checked with the console's; the gate tasks
      registered as its functions as proof.py does (3E: each in container `functions`, at its SAS
      address, by its SHA-256 and a signature with the run's function key); then, once the data is
      in the container, Moruna's runs in the plan's order, each through its API as proof.py runs a
@@ -99,7 +102,10 @@ import table  # noqa: E402
 ENG, CODE, DATA = "/opt/engines", "/opt/bench", "/data"
 MEASURE = [f"{ENG}/venv-harness/bin/python", f"{CODE}/bench/node/engines/measure.py"]
 JAVA_HOME = "/usr/lib/jvm/java-17-openjdk-amd64"
-# The console is read every 10 s, for at most 10 minutes: AZURE.md's bound for a node to be ready.
+# The node is ready when GET /v1/health answers 200, asked every 10 s for at most 10 minutes
+# (AZURE.md's bound, azure-up.sh step 7); then its console is read every 10 s, for at most 10
+# minutes more, until it shows the pin and `moruna: ready`.
+HEALTH_WAIT = (10, 600)
 CONSOLE_WAIT = (10, 600)
 MiB, GiB = 1 << 20, 1 << 30
 LOG = os.path.join(REPO, "architecture", "benchmark-log.md")
@@ -209,6 +215,18 @@ class DryRun:
     def wait_for(self, event, stop, what):
         self.note(f"the node's runs wait until {what}")
         return event.is_set()
+
+    def health(self, address):
+        self.step("api", f"GET https://{address}/v1/health (no token, any certificate: readiness only)")
+        return True
+
+    def served_pin(self, address):
+        o = node_api.OPENSSL
+        self.step("local", f"{o} s_client -connect {address}:443 | {o} x509 -outform DER | {o} dgst -sha256 -r")
+        return "<served-pin>"
+
+    def read_text(self, path):
+        return ""
 
     def read_state(self, path, steps):
         """A batch's state as the machine would put it: every step ended."""
@@ -356,15 +374,28 @@ class Real:
     def read_state(self, path, steps):
         """A batch's state as `az` downloaded it to `path`, or None; the file is removed."""
         try:
-            with open(path) as f:
-                return json.load(f)
-        except (OSError, ValueError):
+            return json.loads(self.read_text(path) or "")
+        except ValueError:
+            return None
+
+    def read_text(self, path):
+        """What `az` downloaded to `path`, or None; the file is removed."""
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except OSError:
             return None
         finally:
             try:
                 os.remove(path)
             except OSError:
                 pass
+
+    def health(self, address):
+        return node_api.health(address) == 200
+
+    def served_pin(self, address):
+        return node_api.served_pin(address)
 
 
 class SpecBlob(proof.Blob):
@@ -422,6 +453,8 @@ class Bench:
         # `stop`: a side failed, the other stops at its next run; `data_ready`: the node may start.
         self.stop, self.data_ready = threading.Event(), threading.Event()
         self.node_recs, self.polls = {}, 0
+        # The node's console: its blob once known, the reads so far, the last note said of it.
+        self.console_at, self.console_reads, self.last_note = None, 0, None
 
     def base(self):
         return f"https://{self.c.account}.blob.core.windows.net"
@@ -507,26 +540,78 @@ class Bench:
         x.az(azure.node_ip(c))
         x.az(azure.node_vm(c, f"{self.sec}/node-config.json"))
 
-    def node_ready(self):
-        x = self.x
-
-        def look():
+    def console(self):
+        """The node's serial console, parsed (node_api.console), or None while it cannot be read:
+        the boot diagnostics blob in the run's account, read directly with its key; the CLI's
+        get-boot-log only when that fails (on 2026-11-18 it failed on every call, on the CLI's own
+        bug). A `moruna: fatal` line stops the run."""
+        x, c, s = self.x, self.c, self.secrets
+        try:
+            if self.console_at is None:
+                uri = x.az(azure.boot_log_uri(c), out="serial-console-uri")
+                self.console_at = (azure.console_blob(c, uri) if x.answers
+                                   else ("<boot-diagnostics-container>", "<serial-console-log>"))
+            self.console_reads += 1
+            path = os.path.join(self.sec, f"console-{self.console_reads}.log")
+            x.az(azure.blob_download(c, s["storage-key"], *self.console_at, path), secrets=s)
+            text = x.read_text(path)
+        except (RuntimeError, ValueError) as e:
+            # Made with --no-wait: until the machine and its log exist, `az` says so; look again.
+            self.once(f"the console's blob was not read ({str(e)[-160:]}); get-boot-log instead")
             try:
-                text = x.az(azure.boot_log(self.c), out="console")
-            except RuntimeError as e:
-                # Made with --no-wait: until the machine and its log exist, `az` says so; look again.
-                x.note(f"no console yet: {str(e)[-160:]}")
+                text = x.az(azure.boot_log(c), out="console")
+            except RuntimeError as e2:
+                self.once(f"nor by get-boot-log: {str(e2)[-160:]}")
                 return None
-            info = node_api.console(text or "")
-            if info.get("fatal"):
-                raise RuntimeError(f"the node stopped: moruna: fatal {info['fatal']}")
-            return info if "boot_ms" in info else None
+        info = node_api.console(text or "")
+        if info.get("fatal"):
+            raise RuntimeError(f"the node stopped: moruna: fatal {info['fatal']}")
+        return info
 
-        info = x.poll("the console shows `moruna: ready` or `moruna: fatal`", *CONSOLE_WAIT, look) or {}
-        address = x.value("node-address", x.az(azure.node_address(self.c), out="node-address"))
-        x.connect(f"https://{address}", x.value("node-pin", info.get("pin")))
+    def once(self, text):
+        """A note, unless it is the one said last (a poll says the same thing many times)."""
+        if text != self.last_note:
+            self.last_note = text
+            self.x.note(text)
+
+    def node_ready(self):
+        """The node ready, as azure-up.sh finds it (1E): GET /v1/health answers 200; its console
+        shows `moruna: tls sha256=` and `moruna: ready`; the certificate it serves is that pin
+        (openssl s_client), or the run stops rather than connect unpinned; its instance is the
+        machine's vmId, and the console's when it names one."""
+        x, c = self.x, self.c
+        address = x.value("node-address", x.az(azure.node_address(c), out="node-address"))
+
+        def up():
+            if x.health(address):
+                return True
+            self.console()  # a `moruna: fatal` line ends the wait
+            return None
+
+        if not x.poll("GET /v1/health answers 200 (or the console says `moruna: fatal`)", *HEALTH_WAIT, up):
+            raise RuntimeError(f"the node did not answer GET https://{address}/v1/health with 200 within "
+                               f"{HEALTH_WAIT[1]} s")
+
+        def lines():
+            info = self.console() or {}
+            return info if (info.get("pin") and "boot_ms" in info) or not x.answers else None
+
+        info = x.poll("its console shows `moruna: tls sha256=` and `moruna: ready`", *CONSOLE_WAIT, lines)
+        if info is None:
+            raise RuntimeError(f"the node answers on {address}, but its console was not read within "
+                               f"{CONSOLE_WAIT[1]} s: without its pin the run does not connect (1E)")
+        pin = x.value("node-pin", info.get("pin")).lower()
+        served = x.served_pin(address)
+        if x.answers and served != pin:
+            raise RuntimeError(f"the certificate {address} serves (sha256 {served or 'not read'}) is not the one its "
+                               f"console printed ({pin}): the run does not connect (1E)")
+        vm_id = x.value("instance-id", x.az(azure.node_vm_id(c), out="instance-id"))
+        if x.answers and info.get("instance") and info["instance"].lower() != vm_id.lower():
+            raise RuntimeError(f"the console's instance {info['instance']} is not the node machine's vmId {vm_id}")
+        x.connect(f"https://{address}", pin)
         self.boot_ms = info.get("boot_ms")
-        tokens = x.tokens(f"{self.sec}/token-key.pem", x.value("instance-id", info.get("instance")))
+        # The tokens' audience is the instance as the node itself names it.
+        tokens = x.tokens(f"{self.sec}/token-key.pem", info.get("instance") or vm_id)
         self.node = node_api.Node(x.transport, tokens)
         facts = self.node.node()
         # The most the node takes (3A: a larger budget is refused), as proof.py gives every job.

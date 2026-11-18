@@ -217,6 +217,13 @@ def test_the_dry_run_lists_every_command_and_creates_nothing(tmp_path):
     assert not any("blob upload -c data" in a for a in azs)
     first = [i for i, a in enumerate(azs) if "vm create -n bench-linux" in a or "-c vhds -n node.vhd" in a]
     assert "bench-linux" in azs[first[0]] and "node.vhd" in azs[first[1]]
+    # The node: ready by /v1/health, its pin from its console's blob (get-boot-log only as a
+    # fallback), checked against the certificate it serves, its instance the machine's vmId.
+    assert any(" GET https://<node-address>/v1/health " in line for line in steps)
+    assert any("get-boot-log-uris" in a for a in azs) and not any("get-boot-log -n" in a for a in azs)
+    assert any("blob download -c '<boot-diagnostics-container>'" in a for a in azs)
+    assert any("s_client -connect <node-address>:443" in line for line in steps)
+    assert any("vm show -n moruna-node --query vmId" in a for a in azs)
     notes = "\n".join(line for line in lines if line.startswith("      # "))
     assert "the node's runs wait until the data is in the container" in notes
     assert "data: 12 files made in Azure by the Linux machine from https://d37ci6vzurychx.cloudfront.net" in notes
@@ -439,6 +446,8 @@ def test_real_mode_needs_its_inputs(tmp_path):
 # --- The whole run, against fakes --------------------------------------------------------------
 
 PIN = "ab" * 32
+CONSOLE_URI = ("https://mrnb202611180900.blob.core.windows.net/bootdiagnostics-morunanod-0b1c/"
+               "moruna-node.0b1c.serialconsole.log")
 
 
 # A schema 3.1 report, as the node's engine writes it (docs/run-report.md): reads and decodes on
@@ -497,17 +506,32 @@ class Fake(run.DryRun):
     answers = True
 
     def __init__(self, results, fail_on=None, node=None, console_after=0, reveal=None, data_ok=True,
-                 wheel="built"):
+                 wheel="built", health_after=0, served=PIN, vm_id="i-1", console_text=None):
         super().__init__(io.StringIO())
         self.results, self.fail_on, self.azs, self.node = results, fail_on, [], node or FakeNode()
         self.console_after, self.reveal, self.data_ok, self.wheel = console_after, reveal, data_ok, wheel
         self.files, self.uploaded, self.states, self.shown, self.started = {}, {}, {}, {}, []
+        self.health_after, self.served, self.vm_id, self.healths = health_after, served, vm_id, 0
+        # Azure's serial log, as the node writes it (1B), with its line ends.
+        self.console_text = console_text or (f"moruna: cloud azure instance i-1\r\nmoruna: tls sha256={PIN}\r\n"
+                                             "moruna: ready api=10.0.0.4:443 boot_ms=2140\r\n")
 
     def write(self, path, text):
         self.files[path] = text
 
     def read_state(self, path, steps):
         return self.files.pop(path, None)
+
+    def read_text(self, path):
+        return self.files.pop(path, None)
+
+    def health(self, address):
+        assert address == "203.0.113.9"
+        self.healths += 1
+        return self.healths > self.health_after
+
+    def served_pin(self, address):
+        return self.served
 
     def machine(self, name, steps):
         """The state batch.py would leave after `steps`: each one's end, or stopped at `fail_on`."""
@@ -557,12 +581,19 @@ class Fake(run.DryRun):
             return "KEY"
         if "generate-sas" in text:
             return "sv=1&sig=x"
+        if "get-boot-log-uris" in text:
+            return CONSOLE_URI
         if "get-boot-log" in text:
-            # Made with --no-wait: the first looks may find no machine yet.
-            if sum("get-boot-log" in a for a in self.azs) <= self.console_after:
-                raise RuntimeError("az: (ResourceNotFound) the machine is not there yet")
-            return (f"moruna: cloud azure instance i-1\nmoruna: tls sha256={PIN}\n"
-                    "moruna: ready api=10.0.0.4:443 boot_ms=2140\n")
+            # The CLI's own bug, on every call (2026-11-18): the console is read from its blob.
+            raise RuntimeError("az: TypeError: unsupported operand type(s) for +=: 'int' and 'NoneType'")
+        if "blob download -c bootdiagnostics-" in text:
+            # Made with --no-wait: the first looks may find no console yet.
+            if sum("-c bootdiagnostics-" in a for a in self.azs) <= self.console_after:
+                raise RuntimeError("The specified blob does not exist. ErrorCode:BlobNotFound")
+            self.files[cmd[cmd.index("-f") + 1]] = self.console_text
+            return ""
+        if "--query vmId" in text:
+            return self.vm_id
         if "public-ip show" in text:
             return "203.0.113.9"
         if "group exists" in text:
@@ -640,8 +671,12 @@ def test_a_whole_run_against_fakes(tmp_path):
     assert x.azs[-2].startswith("az group delete") and x.azs[-1].startswith("az group exists")
     assert ("POST", "/v1/jobs", "t-submit") in x.node.calls and ("GET", "/v1/node", "t-observe") in x.node.calls
     assert ("POST", "/v1/functions", "t-admin") in x.node.calls and ("GET", "/v1/functions", "t-observe") in x.node.calls
-    # The console was looked at again while the machine was not there yet.
-    assert sum("get-boot-log" in a for a in x.azs) == 3
+    # The console's blob was read again while it was not there yet (get-boot-log, tried each time it
+    # was not, failed on the CLI's bug); its address asked once.
+    assert sum("blob download -c bootdiagnostics-morunanod-0b1c -n moruna-node.0b1c.serialconsole.log" in a
+               for a in x.azs) == 3
+    assert sum("get-boot-log-uris" in a for a in x.azs) == 1
+    assert sum("get-boot-log -n" in a for a in x.azs) == 2
     node_rec = json.load(open(tmp_path / "node" / "score-moruna-node-r1.json"))
     # Operational time is the engine's own wall, its report's 3,000 ms; start-up is the job record's
     # submitted_ms to started_ms, 749 ms, though both are the same whole second (item 2.4); the
@@ -894,6 +929,84 @@ def test_the_dry_run_runs_the_sides_one_after_the_other(tmp_path):
     assert seen == [1] and stop.is_set()
     x.parallel([lambda: seen.append(4)], stop)
     assert seen == [1]
+
+
+def ready(tmp_path, **kw):
+    """A Bench through node_ready against a Fake whose get-boot-log always fails on the CLI's bug."""
+    x = Fake(str(tmp_path), **kw)
+    b = run.Bench(nyc_plan(), x, cloud(), Args(), str(tmp_path), str(tmp_path))
+    b.secrets["storage-key"] = "KEY"
+    return x, b
+
+
+def test_the_node_is_ready_by_its_health_and_pinned_by_its_console_blob(tmp_path):
+    """The 2026-11-18 failure: get-boot-log raised the CLI's TypeError on every call while the node
+    answered /v1/health. Readiness is /v1/health; the console is its blob, read with the key."""
+    x, b = ready(tmp_path, health_after=3, console_after=1)
+    b.node_ready()
+    assert x.healths == 4 and x.transport is x.node and b.budget == 13 << 30 and b.boot_ms == 2140
+    # While /v1/health said no, the console was read for a `fatal` line; then for the pin.
+    reads = [a for a in x.azs if "-c bootdiagnostics-" in a]
+    assert len(reads) == 4 and all("--account-key KEY" in a for a in reads)
+    assert sum("get-boot-log -n" in a for a in x.azs) == 1
+    out = x.out.getvalue()
+    assert out.count("get-boot-log instead") == 1 and out.count("TypeError: unsupported operand") == 1
+    # The instance is the machine's vmId, the console's when it names one: the tokens' audience.
+    assert any("vm show -n moruna-node --query vmId" in a for a in x.azs)
+
+
+@pytest.mark.parametrize("kw,message", [
+    # No console within the bound: the run does not connect unpinned.
+    ({"console_after": 10 ** 6}, "console was not read within 600 s: without its pin the run does not connect"),
+    # The served certificate is not the console's: 1E.
+    ({"served": "cd" * 32}, f"sha256 {'cd' * 32}\\) is not the one its console printed \\({PIN}\\)"),
+    ({"served": ""}, "sha256 not read"),
+    ({"vm_id": "i-2"}, "the console's instance i-1 is not the node machine's vmId i-2"),
+    ({"health_after": 10 ** 6}, "did not answer GET https://203.0.113.9/v1/health with 200 within 600 s"),
+    ({"health_after": 10 ** 6, "console_text": "moruna: fatal network: no lease\r\n"},
+     "the node stopped: moruna: fatal network: no lease"),
+])
+def test_a_node_that_is_not_ready_or_not_its_console_is_never_connected(tmp_path, kw, message):
+    x, b = ready(tmp_path, **kw)
+    with pytest.raises(RuntimeError, match=message):
+        b.node_ready()
+    assert not hasattr(x, "transport") and b.node is None
+
+
+def test_the_console_without_an_instance_line_takes_the_vm_id(tmp_path):
+    x, b = ready(tmp_path, vm_id="i-1", console_text=f"moruna: tls sha256={PIN.upper()}\r\nmoruna: ready boot_ms=9\r\n")
+    b.node_ready()
+    assert b.boot_ms == 9 and x.transport is x.node
+
+
+def test_the_console_blob_is_in_the_run_account():
+    c = cloud()
+    assert azure.console_blob(c, CONSOLE_URI + "\n") == ("bootdiagnostics-morunanod-0b1c",
+                                                          "moruna-node.0b1c.serialconsole.log")
+    for uri in ("", "<serial-console-uri>", "https://other.blob.core.windows.net/c/n",
+                "http://mrnb202611180900.blob.core.windows.net/c/n", "https://mrnb202611180900.blob.core.windows.net/c"):
+        with pytest.raises(ValueError, match="not a blob of the run's account"):
+            azure.console_blob(c, uri)
+    assert "serialConsoleLogBlobUri" in azure.boot_log_uri(c) and "vmId" in azure.node_vm_id(c)
+    for cmd in (azure.boot_log_uri(c), azure.node_vm_id(c)):
+        azure.guard(c, cmd)
+
+
+def test_a_console_address_that_is_not_the_runs_falls_back_to_get_boot_log(tmp_path):
+    class Elsewhere(Fake):
+        def az(self, cmd, out=None, secrets=None):
+            if "get-boot-log-uris" in " ".join(cmd):
+                self.azs.append(" ".join(cmd))
+                return "https://elsewhere.blob.core.windows.net/c/n"
+            if "get-boot-log -n" in " ".join(cmd):
+                self.azs.append(" ".join(cmd))
+                return self.console_text
+            return super().az(cmd, out, secrets)
+    x = Elsewhere(str(tmp_path))
+    b = run.Bench(nyc_plan(), x, cloud(), Args(), str(tmp_path), str(tmp_path))
+    b.secrets["storage-key"] = "KEY"
+    b.node_ready()
+    assert "not a blob of the run's account" in x.out.getvalue() and b.boot_ms == 2140
 
 
 def test_a_job_that_fails_or_times_out(tmp_path, monkeypatch):
@@ -1244,6 +1357,11 @@ def test_https_pins_the_certificate(tmp_path):
             self.end_headers()
             self.wfile.write(json.dumps({"auth": self.headers["Authorization"], "body": json.loads(body)}).encode())
 
+        def do_GET(self):
+            self.send_response(200 if self.path == "/v1/health" else 404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def log_message(self, *a):
             pass
 
@@ -1264,7 +1382,19 @@ def test_https_pins_the_certificate(tmp_path):
     with pytest.raises(ConnectionError, match="pinned"):
         node_api.Https(url, "00" * 32)("GET", "/v1/node")
     th.join()
+    # Readiness takes any certificate; the pin is read from the served one as azure-up.sh does.
+    port = srv.server_address[1]
+    th = threading.Thread(target=srv.handle_request)
+    th.start()
+    assert node_api.health("127.0.0.1", port) == 200
+    th.join()
+    th = threading.Thread(target=srv.handle_request)
+    th.start()
+    assert node_api.served_pin("127.0.0.1", port, openssl=OPENSSL) == hashlib.sha256(der).hexdigest()
+    th.join()
     srv.server_close()
+    assert node_api.health("127.0.0.1", port, timeout=2) is None
+    assert node_api.served_pin("127.0.0.1", port, openssl=OPENSSL) == ""
 
 
 # --- The engines' scripts ----------------------------------------------------------------------
