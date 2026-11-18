@@ -15,7 +15,10 @@
 //! `attach` (item 3.6) mounts another image in place: a read-only memory object holding its
 //! layer files (a Moruna image archive), each where its span says, with a cache of its own;
 //! the connection it answers is a task's root over that image, and the image lives until its
-//! last connection closes.
+//! last connection closes. Its files' pages that lie one after another are mapped where they lie,
+//! with no copy: a snapshot of the image's own memory object, each page checked against its
+//! hash first, once (`moruna_imagefs::attached::in_place`). The console says the server's account
+//! at each attach and each image's end.
 //!
 //! Each connection is one task, with its own open files and its own scratch
 //! directory at `/tmp`, whose bytes are memory objects charged to the directory's
@@ -60,7 +63,7 @@ use moruna_imagefs::{
 };
 use moruna_svc::{
     Account, CallError, Channel, Console, Context, DEADLINE_INFINITE, Dispatcher, Encoder, Handle,
-    Mapping, Memory, Rights, Wire, deadline_in, limits, map as mapflags, println, start,
+    Mapping, Memory, Rights, Usage, Wire, deadline_in, limits, map as mapflags, println, start,
 };
 
 mod pages;
@@ -241,9 +244,21 @@ impl Disk for BlockDisk {
 /// What the server needs of a cache's disk beyond the reader's [`Disk`]: how much one transfer
 /// into a mapping may be, how many requests it has sent, and a mapping's runs filled straight
 /// from the layer, whose pages the caller then checks against their hashes.
-trait Backing: Disk + 'static {
+trait Backing: Disk + Sized + 'static {
+    /// Whether the disk is an attached image's (item 3.6).
+    const ATTACHED: bool = false;
     fn max_pages(&self, layer: usize) -> u64;
     fn requests(&self) -> u64;
+    /// A mapping of `pages` pages of layer `layer` from its page `first`, taken where they lie
+    /// with no copy, each page checked: `None` where the disk cannot give one (a block device).
+    fn in_place(
+        _cache: &mut Cache<Self>,
+        _layer: usize,
+        _first: u64,
+        _pages: u64,
+    ) -> Option<Result<Memory, FsError>> {
+        None
+    }
     fn read_runs(
         &mut self,
         layer: usize,
@@ -297,7 +312,7 @@ impl Backing for BlockDisk {
 /// An attached image's memory object, mapped read only for as long as the image lives: its
 /// layers' pages are read where they lie.
 struct ArchiveView {
-    _memory: Memory,
+    memory: Memory,
     view: Mapping<'static>,
 }
 
@@ -310,8 +325,35 @@ impl AsRef<[u8]> for ArchiveView {
 type AttachedImage = AttachedDisk<ArchiveView>;
 
 impl Backing for AttachedImage {
+    const ATTACHED: bool = true;
+
     fn max_pages(&self, _: usize) -> u64 {
         u64::MAX
+    }
+
+    /// A snapshot of the image's own memory object over the pages, which reads them where
+    /// they lie, read only for whoever maps it.
+    fn in_place(
+        cache: &mut Cache<Self>,
+        layer: usize,
+        first: u64,
+        pages: u64,
+    ) -> Option<Result<Memory, FsError>> {
+        Some(
+            attached::in_place(cache, layer, first, pages).and_then(|offset| {
+                let image = &cache.disk_ref().region().memory;
+                let snapshot =
+                    moruna_sys::personality::memory_snapshot(image, offset, pages * PAGE_U64, None)
+                        .map_err(|e| {
+                            FsError::Io(format!("a snapshot of the image's pages: {}", e.name()))
+                        })?;
+                snapshot
+                    .0
+                    .duplicate(Rights::READ | Rights::MAP | Rights::DUPLICATE | Rights::TRANSFER)
+                    .map(Memory)
+                    .map_err(|e| FsError::Io(format!("a snapshot's handle: {}", e.name())))
+            }),
+        )
     }
 
     fn requests(&self) -> u64 {
@@ -401,6 +443,8 @@ struct Shared<D: Backing> {
     map_hits: u64,
     map_pages_read: u64,
     map_pages_copied: u64,
+    /// Pages mapped where they lie, with no copy (an attached image's, item 3.6).
+    map_pages_in_place: u64,
     served: u64,
     capacity: Option<moruna_svc::WatchCapacity>,
     /// What every image's connections hand the main loop to serve.
@@ -913,6 +957,16 @@ impl<D: Backing> imagefs::Server for Task<D> {
         if first + pages > map.pages() {
             return Err(imagefs::Error::BadRange);
         }
+        // An attached image's pages that lie one after another are mapped where they lie (item
+        // 3.6): a snapshot of its own memory object, new for each mapping and never kept, since
+        // a snapshot maps into one process.
+        if let Some(lp) = map.run_of(first, pages)
+            && let Some(made) = D::in_place(&mut sh.cache, *layer, lp, pages)
+        {
+            let memory = made.map_err(|e| sh.fail(e))?;
+            sh.map_pages_in_place += pages;
+            return Ok(memory);
+        }
         let key = (*layer, *index, first, pages);
         if let Some(memory) = sh.kept(key) {
             return Ok(memory);
@@ -1193,7 +1247,7 @@ impl<D: Backing> imagefs::Server for Task<D> {
             .map_detached(0, end, 0)
             .map_err(|_| imagefs::Error::BadRange)?;
         let region = ArchiveView {
-            _memory: image,
+            memory: image,
             view,
         };
         let (cache, overlay) = attached::attach(region, spans, ATTACHED_PAGES).map_err(|e| {
@@ -1216,11 +1270,16 @@ impl<D: Backing> imagefs::Server for Task<D> {
             map_hits: 0,
             map_pages_read: 0,
             map_pages_copied: 0,
+            map_pages_in_place: 0,
             served: 0,
             capacity: Some(capacity),
             pending: pending.clone(),
             scratch_handles: budget.clone(),
         }));
+        account_line(
+            &image.borrow().out,
+            &format!("attached an image of {} layers", layers.len()),
+        );
         let root = Task {
             shared: image,
             scratch: Rc::new(RefCell::new(Scratch::with_store(alloc::boxed::Box::new(
@@ -1255,6 +1314,39 @@ impl<D: Backing> imagefs::Server for Task<D> {
                 })
             })
             .collect()
+    }
+}
+
+/// `imagefs: <what>; account: <used> bytes held, peak <peak>, limit <limit>`: the server's own
+/// account, at each attach and each attached image's end (item 3.6).
+fn account_line(out: &Console, what: &str) {
+    match Usage::own() {
+        Ok(usage) => println!(
+            out,
+            "imagefs: {}; account: {} bytes held, peak {}, limit {}",
+            what,
+            usage.used,
+            usage.peak,
+            usage.limit
+        ),
+        Err(e) => println!(out, "imagefs: {}; account: unread: {}", what, e.name()),
+    }
+}
+
+/// An attached image's end, its last connection closed: what its mappings took, and the
+/// server's account after.
+impl<D: Backing> Drop for Shared<D> {
+    fn drop(&mut self) {
+        if D::ATTACHED {
+            account_line(
+                &self.out,
+                &format!(
+                    "an attached image ended: {} pages mapped in place, {} read and {} copied \
+                     into mappings",
+                    self.map_pages_in_place, self.map_pages_read, self.map_pages_copied
+                ),
+            );
+        }
     }
 }
 
@@ -1429,6 +1521,7 @@ fn mount(out: &Console) -> Result<Shared<BlockDisk>, String> {
         map_hits: 0,
         map_pages_read: 0,
         map_pages_copied: 0,
+        map_pages_in_place: 0,
         served: 0,
         capacity: None,
         pending: Rc::new(RefCell::new(Vec::new())),

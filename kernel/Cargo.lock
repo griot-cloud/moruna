@@ -620,6 +620,7 @@ dependencies = [
  "imagefs-protocol",
  "moruna-imagefs",
  "moruna-svc",
+ "moruna-sys",
 ]
 
 [[package]]
