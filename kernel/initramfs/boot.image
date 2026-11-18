@@ -326,7 +326,8 @@ link supervisor.quota quota.supervisor
 # resource from the supervisor, and a connection to that image filesystem for each
 # program it runs; LX-T10 to LX-T16 run unmodified Linux programs through it: static
 # musl, its threads, dynamic glibc, a refused call, isolation, the forward's round
-# trip, and CPython 3.14.
+# trip, and CPython 3.14; and CPython importing pyarrow (item 5.3), from /kc1/pyarrow in the
+# image's top layer, with the calls it is refused.
 process imagefs-linux imagefs
   handle console console
   handle data:linux/stack.layers layers
@@ -349,6 +350,7 @@ process linux-test
   expect KC1 isolation: ok:
   expect KC1 forward: ok:
   expect KC1 cpython: ok: python3 -c printed 2432902008176640000
+  expect KC1 pyarrow: ok: python3 imported pyarrow 25.0.1 and pyarrow.compute and added a column
   expect KD2 granted: ok:
   expect KB5 hog: ok:
   expect KB5 linux protocol: ok:

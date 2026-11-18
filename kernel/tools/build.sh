@@ -192,6 +192,11 @@ cp "$kernel/linux/programs/kd2/transform.py" "$kernel/linux/programs/kd2/arrowli
 (cd "$kernel/.." && cargo run --quiet --release --locked -p moruna-testkit \
   --bin kd2-fixture -- "$programs/kd2")
 cp "$kernel/linux/programs/greeting.txt" "$programs/kc1/greeting.txt"
+# Item 5.3: pyarrow as the repository's lock pins it, at /kc1/pyarrow, for KC1's pyarrow probe:
+# CPython importing pyarrow and pyarrow.compute through the personality, as a Python function's
+# image does. The wheel is kept between builds beside the programs' target directory.
+python3 "$kernel/tools/pyarrow-layer.py" "$programs/kc1/pyarrow" \
+  "${CARGO_TARGET_DIR:-$kernel/target}/pyarrow-wheel"
 if [ ! -r "$python_layout/index.json" ]; then
   echo "build.sh: no OCI layout of python:3.14-slim at $python_layout (kernel/tools/python-layout.sh writes it)" >&2
   exit 1

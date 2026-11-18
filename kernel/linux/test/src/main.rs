@@ -6,6 +6,7 @@
 //!   (LX-T11);
 //! - a dynamically linked glibc program runs through `ld-linux` (LX-T12);
 //! - CPython 3.14 from the official image's layers computes 20! as JSON (LX-T13);
+//! - CPython imports pyarrow 25.0.1 and pyarrow.compute and adds a column (item 5.3);
 //! - `socket` is refused with `ENOSYS`, the process goes on, and it is counted (LX-T14);
 //! - a Linux process reaches no handle, no other task's files (LX-T15);
 //! - the forward's round trip and the fast calls, measured (LX-T16);
@@ -152,6 +153,28 @@ fn cpython(c: &mut linux::Client) -> Result<String, String> {
     }
     Ok(format!(
         "python3 -c printed 2432902008176640000 in {} s; {} calls served; refused: {}",
+        r.seconds,
+        r.ended.served,
+        refused(&r)
+    ))
+}
+
+/// What KC1's pyarrow probe runs: pyarrow and pyarrow.compute imported from their own directory
+/// in the image (build.sh, kernel/tools/pyarrow-layer.py) and a column added, as a Python
+/// function's image does (item 5.3).
+const PYARROW: &str = "import sys; sys.path.insert(0, '/kc1/pyarrow'); \
+    import pyarrow as pa, pyarrow.compute as pc; \
+    b = pa.record_batch({'a': [1, 2, 3], 'b': [10, 20, 30]}); \
+    print(pa.__version__, pc.add(b.column('a'), b.column('b')).to_pylist())";
+
+fn pyarrow(c: &mut linux::Client) -> Result<String, String> {
+    let r = run_program(c, &["/usr/local/bin/python3", "-c", PYARROW])?;
+    exited_zero(&r, "python3")?;
+    if r.text.trim_end() != "25.0.1 [11, 22, 33]" {
+        return Err(format!("printed `{}`", r.text.trim_end()));
+    }
+    Ok(format!(
+        "python3 imported pyarrow 25.0.1 and pyarrow.compute and added a column in {} s; {} calls served; refused: {}",
         r.seconds,
         r.ended.served,
         refused(&r)
@@ -337,6 +360,7 @@ fn run() -> i64 {
     ok &= check(&out, "isolation", isolate(&mut c));
     ok &= check(&out, "forward", bench(&mut c));
     ok &= check(&out, "cpython", cpython(&mut c));
+    ok &= check(&out, "pyarrow", pyarrow(&mut c));
     match granted(&mut c) {
         Ok(detail) => println!(out, "KD2 granted: ok: {}", detail),
         Err(why) => {
