@@ -129,6 +129,14 @@ Implements the OS design, section 1, OpenStack column.
   interface wan card=net0 dhcp
   ```
 
+- **A service can wait for an interface's address** (item 1.11f): `moruna.net` 3.3's
+  `address(interface)` is a request that waits, as `accept` does. It is answered with the
+  interface's IPv4 address at once if it holds one, and otherwise as soon as it takes one (its
+  first lease, or the next after a lost one), within the caller's deadline; one waits a
+  connection. `platform` waits on it when a request cannot begin for lack of an address (the
+  network server has no route), and begins the request as soon as the address comes, instead
+  of a retry interval later (1D).
+
 - **The network server faces the internet, so its limits hold against anyone** (item 1.3b):
   - smoltcp 0.13.1, which fixes a window-underflow panic (upstream issue 1048);
   - a grant's `sockets=` counts every socket, closing ones included, and refuses at accept;

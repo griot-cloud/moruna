@@ -1,17 +1,21 @@
 //! The network server on a host (SDD 31, k): its stack and dispatcher on a thread of
 //! their own, run as the server's loop runs them, with its cards joined to whatever
-//! a test puts at the other end of their wire.
+//! a test puts at the other end of their wire. It names everything it takes from `std`, so a
+//! `no_std` crate's tests include it too (`platform`'s, item 1.11f).
 
 #![allow(dead_code)]
 
 use std::{
+    boxed::Box,
     collections::BTreeMap,
     rc::Rc,
+    string::String,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    thread,
+    thread, vec,
+    vec::Vec,
 };
 
 use moruna_netstack::{Card, Grant, Shared, Stack, after_turn, granted, parse};

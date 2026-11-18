@@ -27,6 +27,7 @@ Inbound TLS termination is not implemented by this component yet. A TCP listener
 | 19 | `start_tls_server(socket, identity)` on a pristine accepted socket |
 | 20 | `release_server_identity(identity)`, retiring associated sockets |
 | 21 | `tls_alpn(socket)` after successful handshake |
+| 22 | `address(interface) -> Cidr` (3.3, item 1.11f): the interface's IPv4 address, at once if it holds one, otherwise once it takes one (a lease, or the next after a lost one); one waits a connection (`InUse`); `NotFound` for no such interface or one that never takes an IPv4 address |
 
 The public client constructor takes the actual caller Account, performs the major-3 handshake and account binding within the supplied deadline, and retains that Account for subsequent loans. The server checks immutable charged Account identity before mapping any stream or credential loan, using ABI 2.5 `Account::matches`; same names, ancestry and service-pool accounts confer no substitution authority. Socket numbers and installed identity numbers belong only to their connection. Disconnect retires sockets, credential contexts and outstanding loans. Error numbers remain unchanged, including `TlsUnavailable` (19) and `TlsFailed` (20).
 
