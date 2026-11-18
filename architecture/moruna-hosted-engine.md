@@ -152,6 +152,7 @@ Two entry points, one binary (`moruna`), built from `moruna-runtime` with the Py
 
 - **`moruna run <spec.json> [--strict]`**, load, resolve, execute, report, exit. Exit code: 0 completed; 2 spec refused (named field); 3 budget refused (parent P5 diagnostic); 4 kernel error under `terminate`; 5 resume refused; 130 cancelled.
 - **`moruna serve --listen vsock://-1:5000`**, the guest-agent mode. Wait for one `spec` message on the socket, run it exactly as `moruna run` would, stream heartbeats, send the report, exit. One job per process, by design: the VM exists for one run.
+- **`moruna serve --listen channel:<slot>`**, node mode (system design 3A, 3B): the protocol over the channel of the Moruna kernel `node-admission` started the engine with, granted under `<slot>`, whose other end is the node's `api`. Each message on the channel is the next piece of the byte stream, at most 64 KiB, with no handle; the stream ends when the peer closes its end. The engine fills in what the node decides when the document leaves it out (`report.socket`, the channel; the run's id; no staging directory) and refuses, by field, a `report.socket` other than the channel, an object store's `unix://` or `vsock://` endpoint, a `file://` path (a job on a node reads and writes attached volumes and object storage) and `resume`. Off the Moruna kernel there is no channel, and the address is refused. `moruna check-job <spec> --node channel:<slot>` checks a document by the same rules, and `--secret <name>` (repeated) names the secrets the job comes with.
 
 The Python package keeps `moruna.run(...)`; it builds the same `RunSpec` and calls the same facade. Nothing in the library path changes for a notebook user.
 
@@ -189,7 +190,7 @@ Messages to Moruna:
 
 | message | effect |
 |---|---|
-| `spec` (serve mode only) | the `RunSpec`, and optionally `plan`, the plan document's FlatBuffers as base64 (SDD 26), which the run starts from instead of the default planner's; a second `spec` is refused |
+| `spec` (serve mode only) | the `RunSpec`, and optionally `plan`, the plan document's FlatBuffers as base64 (SDD 26), which the run starts from instead of the default planner's, and optionally `secrets`, the job's secrets by name (`{"<name>": "<value>"}`), which the references in the document's object-store settings (`{"secret": "<name>"}`) resolve to when the engine builds its object stores; they never go into the document, its digest, an event, a log or the report, and a reference to a name not given is refused by its field; a second `spec` is refused |
 | `cancel` | the existing `CancelToken`; manifest written; exit 130 |
 | `checkpoint` | write the manifest now (the host is about to destroy the guest) |
 | `port_reply` | the answer to `port_call` `call`: `v` (1), `call`, and exactly one of `ok` (base64) or `error` (the port's refusal, handed to the stage); one that answers nothing waiting is a note in the report (§4.10) |

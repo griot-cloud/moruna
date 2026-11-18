@@ -13,9 +13,17 @@ description = "Moruna's run events: the FlatBuffers schema, the record each even
 # tells without linking the run.
 [dependencies]
 # The record every event is (SDD 21): its layout, byte for byte.
-moruna-record = { workspace = true, features = ["std"] }
+moruna-record = { workspace = true }
 # The event body is FlatBuffers, as the job and plan documents are.
 flatbuffers = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
+# The workspace's serde, at its version, without std: the node's `api` process, which is `no_std`
+# with `alloc`, decodes and renders a job's events with this crate (system design 3B).
+serde = { version = "=1.0.229", default-features = false, features = ["alloc", "derive"] }
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = ["std"]
+# The JSON text of an event (`EventMsg::json_line`), the frame's reader and writer over
+# `std::io`, and the `std::error::Error` impls of the record. Without it the crate is `no_std`
+# with `alloc`: it encodes, decodes, and hands a serializer the rendering (`EventMsg::rendering`).
+std = ["moruna-record/std", "serde/std", "dep:serde_json"]

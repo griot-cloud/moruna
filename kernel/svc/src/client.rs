@@ -128,6 +128,24 @@ pub fn connect(listener: &Channel) -> Result<Channel, CallError<u32>> {
     Ok(mine)
 }
 
+/// How long a client waits for a server it was linked to at boot to come up. A server answers
+/// its first hello only once it serves, after its own start (its devices, its disks, its
+/// layers), which on a loaded machine under QEMU's emulator has taken more than the 5 s a check
+/// gave its whole exchange. A check waits this long for the server ([`ready`]) and times only
+/// its exchange after that.
+pub const READY_TIMEOUT: u64 = 300 * 1_000_000_000;
+
+/// The server listening on `listener`, up: a connection whose `Hello` for `id` it welcomed,
+/// waited for until `deadline` (from [`READY_TIMEOUT`]). Its start is over by the time this
+/// returns, so a check that times the server's behaviour starts its clock after it.
+pub fn ready(
+    listener: &Channel,
+    id: ProtocolId,
+    deadline: u64,
+) -> Result<ClientCore, CallError<u32>> {
+    ClientCore::connect(connect(listener)?, id, deadline)
+}
+
 /// One connection's client: the channel, the server's version, the request ids in
 /// flight, and the events and early replies read while waiting for another reply.
 pub struct ClientCore {

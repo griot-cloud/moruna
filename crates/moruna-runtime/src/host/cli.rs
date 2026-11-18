@@ -20,9 +20,9 @@ use crate::packaged::PackageHost;
 pub const USAGE: &str = "usage: moruna run <spec.json> [--arg NAME=VALUE]... [--resolver MODULE:ATTRIBUTE] [--plan <plan.mplan>] [--strict] [--events-json] [--cost-store <dir>] [--cost-model <name>] [--sandbox-python <path>] [--sandbox-cgroup <dir>] [--kinds <kinds.json>]...
        moruna run <spec.json> --output <dir> [--report <file>] [--input NAME=URL]... [--memory-gib N | --memory BYTES] [--scratch-gib N] [--node-kit <dir>] [--image-stack <dir>] [--launch-witness <dir>] [--vcpu-cpus <list>]
        moruna run --vm <spec.json> [--image <node-image.json>] [the options above]
-       moruna serve --listen <unix:///path | vsock://CID:PORT> [--no-strict] [--cost-store <dir>] [--cost-model <name>] [--sandbox-python <path>] [--sandbox-cgroup <dir>] [--kinds <kinds.json>]...
+       moruna serve --listen <unix:///path | vsock://CID:PORT | channel:SLOT> [--no-strict] [--cost-store <dir>] [--cost-model <name>] [--sandbox-python <path>] [--sandbox-cgroup <dir>] [--kinds <kinds.json>]...
        moruna kinds [--kinds <kinds.json>]...
-       moruna check-job <spec.json> [--kinds <kinds.json>]...
+       moruna check-job <spec.json> [--secret NAME]... [--node channel:SLOT] [--kinds <kinds.json>]...
        moruna explain <spec.json> [--planner <name>] [--out <plan.mplan>] [--kinds <kinds.json>]...
        moruna --version
 
@@ -174,6 +174,12 @@ pub enum Command {
     CheckJob {
         /// The document.
         spec: String,
+        /// The names of the secrets the job comes with (`--secret NAME`, repeated): a reference
+        /// in the document to any other is refused.
+        secrets: Vec<String>,
+        /// `--node channel:SLOT`: check by node mode's rules too, as `moruna serve --listen
+        /// channel:SLOT` takes the document (system design 3B).
+        node: Option<String>,
     },
     /// `moruna explain <spec.json> [--planner <name>] [--out <plan.mplan>]` (SDD 26 d.5): the
     /// document's plan, as JSON on standard output, and as the plan document at `out`.
@@ -480,17 +486,54 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             )),
         },
         Some("check-job") => {
-            let spec = rest
-                .next()
-                .ok_or_else(|| "moruna check-job: which document?".to_string())?;
-            match rest.next() {
-                None => Ok(Command::CheckJob {
-                    spec: spec.to_string(),
-                }),
-                Some(extra) => Err(format!(
-                    "moruna check-job: one document, and `{extra}` is a second"
-                )),
+            let mut spec = None;
+            let mut secrets = Vec::new();
+            let mut node = None;
+            while let Some(arg) = rest.next() {
+                match arg {
+                    "--secret" => {
+                        let name = rest.next().ok_or_else(|| {
+                            "moruna check-job: --secret needs a secret's name".to_string()
+                        })?;
+                        if !moruna_job::is_secret_name(name) {
+                            return Err(format!(
+                                "moruna check-job: `{name}` is not a secret's name: 1 to 64 of \
+                                 letters, digits, _ - . and :, the first a letter or a digit"
+                            ));
+                        }
+                        secrets.push(name.to_string());
+                    }
+                    "--node" => {
+                        let text = rest.next().ok_or_else(|| {
+                            "moruna check-job: --node needs the channel, channel:SLOT".to_string()
+                        })?;
+                        match Address::parse(text) {
+                            Ok(channel @ Address::Channel(_)) => node = Some(channel.to_string()),
+                            _ => {
+                                return Err(format!(
+                                    "moruna check-job: --node takes a channel, channel:SLOT, not \
+                                     `{text}`"
+                                ));
+                            }
+                        }
+                    }
+                    other if other.starts_with("--") => {
+                        return Err(format!("moruna check-job: unknown argument `{other}`"));
+                    }
+                    document if spec.is_none() => spec = Some(document.to_string()),
+                    extra => {
+                        return Err(format!(
+                            "moruna check-job: one document, and `{extra}` is a second"
+                        ));
+                    }
+                }
             }
+            let spec = spec.ok_or_else(|| "moruna check-job: which document?".to_string())?;
+            Ok(Command::CheckJob {
+                spec,
+                secrets,
+                node,
+            })
         }
         Some("explain") => {
             let mut spec = None;
@@ -758,8 +801,19 @@ fn main_as(
             println!("{}", kinds.listing().to_json());
             return exit::COMPLETED;
         }
-        Command::CheckJob { spec } => {
-            return check_job(Path::new(&spec), kinds, &mut std::io::stderr().lock());
+        Command::CheckJob {
+            spec,
+            secrets,
+            node,
+        } => {
+            let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
+            return check_job_with(
+                Path::new(&spec),
+                kinds,
+                &secrets,
+                node.as_deref(),
+                &mut std::io::stderr().lock(),
+            );
         }
         Command::Explain { spec, planner, out } => {
             return explain(
@@ -867,6 +921,20 @@ fn events_stream() -> std::io::Result<std::sync::Arc<std::sync::Mutex<Box<dyn Wr
 /// code of a refused document (2) when there is one or the document cannot be read, and 1 when
 /// the kinds themselves cannot be checked against.
 pub fn check_job(spec: &Path, kinds: &Registry, out: &mut dyn Write) -> i32 {
+    check_job_with(spec, kinds, &[], None, out)
+}
+
+/// [`check_job`] for a job that comes with the secrets `secrets` names, each reference in the
+/// document to another refused by its field (system design 3B), and with `node`, a channel
+/// (`channel:SLOT`), by node mode's rules too ([`super::node::refusals`]). Every refusal is
+/// written, the kinds' first, then the secrets', then node mode's.
+pub fn check_job_with(
+    spec: &Path,
+    kinds: &Registry,
+    secrets: &[&str],
+    node: Option<&str>,
+    out: &mut dyn Write,
+) -> i32 {
     let read = std::fs::read(spec)
         .map_err(|e| moruna_job::SpecError::new("spec", format!("{}: {e}", spec.display())))
         .and_then(|bytes| super::session::read_document(&bytes).map_err(|(_, refused)| refused));
@@ -887,15 +955,35 @@ pub fn check_job(spec: &Path, kinds: &Registry, out: &mut dyn Write) -> i32 {
             return exit::FAILED;
         }
     };
-    match moruna_job::check(&job, &catalogue) {
-        Ok(()) => exit::COMPLETED,
-        Err(refusals) => {
-            for refusal in &refusals {
-                let _ = writeln!(out, "{refusal}");
-            }
-            exit::SPEC_REFUSED
-        }
+    let mut refused: Vec<(String, String)> = Vec::new();
+    let mut add = |found: Result<(), Vec<moruna_job::Refusal>>| {
+        refused.extend(
+            found
+                .err()
+                .into_iter()
+                .flatten()
+                .map(|r| (r.field, r.message)),
+        );
+    };
+    add(moruna_job::check(&job, &catalogue));
+    add(moruna_job::check_secrets(&job, secrets));
+    if let Some(channel) = node {
+        let node = super::node::Node {
+            channel: channel.to_string(),
+        };
+        refused.extend(
+            super::node::refusals(&job, &node)
+                .into_iter()
+                .map(|r| (r.field, r.reason)),
+        );
     }
+    if refused.is_empty() {
+        return exit::COMPLETED;
+    }
+    for (field, message) in &refused {
+        let _ = writeln!(out, "{field}: {message}");
+    }
+    exit::SPEC_REFUSED
 }
 
 /// `moruna explain` (SDD 26 d.5): the plan of the document at `spec` by the planner `planner`
@@ -1573,7 +1661,11 @@ fn run_vm(
                 // memory and CPUs, and its jail's namespaces.
                 cgroup: &moruna_vmm::jail::Cgroup::Undelegated,
             },
-            super::protocol::Inbound::Spec { spec, plan },
+            super::protocol::Inbound::Spec {
+                spec,
+                plan,
+                secrets: Default::default(),
+            },
             deadline,
             &devices,
         )?;

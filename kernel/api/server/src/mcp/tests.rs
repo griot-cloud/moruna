@@ -28,6 +28,7 @@ fn api(signer: &Signer) -> Api {
             health: NodeHealth::Ok,
         },
         vec![TokenKey::new(signer.public())],
+        alloc::boxed::Box::new(crate::NoEngine),
     )
 }
 
@@ -35,7 +36,7 @@ fn post(token: Option<&str>) -> Request {
     Request {
         method: "POST".to_string(),
         path: MCP_PATH.to_string(),
-        query: false,
+        query: None,
         authorization: token.map_or(Authorization::Missing, |token| {
             Authorization::One(format!("Bearer {token}").into_bytes())
         }),
@@ -92,7 +93,7 @@ fn initialize_ping_and_list_answer() {
     assert_eq!(json_of(&answer)["result"], expected);
     assert_eq!(
         expected["tools"].as_array().unwrap().len(),
-        OPERATIONS.len()
+        OPERATIONS.iter().filter(|op| op.has_tool()).count()
     );
     assert_eq!(
         api.recorded(),
@@ -297,7 +298,7 @@ fn only_post_is_served_on_mcp() {
     assert_eq!(api.answer(&delete, &[], NOW).status, 400);
     let token = signer.token("i-1", NOW + 60, &["observe"]);
     let mut query = post(Some(&token));
-    query.query = true;
+    query.query = Some(String::new());
     let ping = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
     assert_eq!(api.answer(&query, ping, NOW).status, 400);
 }

@@ -159,6 +159,8 @@ impl ToEarlyBootInfo for BootInformation<'_> {
 // SAFETY: The name does not collide with other symbols.
 #[unsafe(no_mangle)]
 unsafe extern "sysv64" fn __multiboot2_entry(boot_magic: u32, boot_params: u64) -> ! {
+    // moruna: the core's clock counts from here (`crate::boot::entry_tsc`).
+    crate::boot::record_entry_tsc();
     assert_eq!(boot_magic, multiboot2::MAGIC);
     let mb2_info =
         unsafe { BootInformation::load(boot_params as *const BootInformationHeader).unwrap() };

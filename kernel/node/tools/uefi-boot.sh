@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # Boots the node's disk image, OUT/moruna-node.raw (package.py --profile cloud), from UEFI
 # firmware in QEMU: the machine of system design 1A and work item 1.1. A q35 machine (MACHINE
-# below), one read-only virtio disk (the node never writes its boot disk), one virtio network card, and the
-# first serial port written to OUT/console.log. No direct kernel load, no vsock, no host socket.
+# below), one read-only virtio disk (the node never writes its boot disk), one virtio network
+# card, and the first serial port written to OUT/console.log. No direct kernel load, no vsock,
+# no host socket.
 #
-#   [MACHINE=pc] kernel/node/tools/uefi-boot.sh OUT CPUS
+#   [MACHINE=pc] kernel/node/tools/uefi-boot.sh OUT CPUS [FORMAT]
 #
 # MACHINE is QEMU's machine type: `q35`, the default and 1A's machine, or `pc` (i440FX), which
 # has no MCFG and so no PCI Express configuration space: work item 1.8's boot without MCFG.
+#
+# FORMAT is the boot disk's format (work item 1.5), one that package.py --formats wrote: raw
+# (the default), qcow2 (OUT/moruna-node.qcow2) or vhd (OUT/moruna-node.vhd). A fixed VHD is the
+# disk and then a 512-byte footer, so QEMU reads it as raw with `size=` the file's length less
+# that footer: exactly the disk Azure presents from it, and no VHD driver needed (the project's
+# QEMU has none). The machine is the same for each.
 #
 # Exits 0 once `moruna: services started` is on the console, within 120 s under KVM or 900 s
 # under the emulator, and prints how long after QEMU's start it came. Exits 124 when the time
@@ -17,8 +24,8 @@
 # OUT/edk2-vars.fd.
 set -euo pipefail
 
-if [ "$#" -ne 2 ]; then
-  echo "usage: uefi-boot.sh OUT CPUS" >&2
+if [ "$#" -ne 2 ] && [ "$#" -ne 3 ]; then
+  echo "usage: uefi-boot.sh OUT CPUS [FORMAT]" >&2
   exit 2
 fi
 out="$(cd "$1" && pwd)"
@@ -31,10 +38,27 @@ case "$machine" in
   q35 | pc) ;;
   *) echo "uefi-boot.sh: MACHINE must be q35 or pc: $machine" >&2; exit 2 ;;
 esac
-disk="$out/moruna-node.raw"
+format="${3:-raw}"
+case "$format" in
+  raw | qcow2 | vhd) ;;
+  *) echo "uefi-boot.sh: FORMAT must be raw, qcow2 or vhd: $format" >&2; exit 2 ;;
+esac
+disk="$out/moruna-node.$format"
 if [ ! -f "$disk" ]; then
-  echo "uefi-boot.sh: no disk image at $disk (package.py --profile cloud writes it)" >&2
+  echo "uefi-boot.sh: no disk image at $disk (package.py --profile cloud --formats $format writes it)" >&2
   exit 2
+fi
+# How QEMU reads the disk: the VHD as raw, its footer left off.
+if [ "$format" = vhd ]; then
+  length="$(wc -c < "$disk" | tr -d ' ')"
+  size=$((length - 512))
+  if [ "$size" -le 0 ] || [ $((size % 512)) -ne 0 ]; then
+    echo "uefi-boot.sh: $disk is not a fixed VHD: $length bytes is not whole 512-byte sectors and a 512-byte footer" >&2
+    exit 2
+  fi
+  drive="format=raw,size=$size"
+else
+  drive="format=$format"
 fi
 qemu="$(command -v qemu-system-x86_64)" || { echo "uefi-boot.sh: qemu-system-x86_64 is not on PATH" >&2; exit 2; }
 firmware="$(cd "$(dirname "$qemu")/../share/qemu" && pwd)"
@@ -58,6 +82,7 @@ else
   seconds=900
   echo "uefi-boot: TCG (no usable /dev/kvm), $machine, $cpus CPUs, $seconds s" >&2
 fi
+echo "uefi-boot: boot disk $disk, read as $drive" >&2
 
 console="$out/console.log"
 line="moruna: services started"
@@ -86,7 +111,7 @@ qemu-system-x86_64 -machine "$machine" -smp "$cpus" -m 2G -nodefaults -no-reboot
   "${accel[@]}" \
   -drive "if=pflash,format=raw,readonly=on,file=$code" \
   -drive "if=pflash,format=raw,file=$vars" \
-  -drive "if=none,id=boot,format=raw,readonly=on,file=$disk" \
+  -drive "if=none,id=boot,$drive,readonly=on,file=$disk" \
   -device virtio-blk-pci,drive=boot,disable-legacy=on \
   -netdev user,id=net0 -device virtio-net-pci,netdev=net0,disable-legacy=on \
   -serial "file:$console" &
