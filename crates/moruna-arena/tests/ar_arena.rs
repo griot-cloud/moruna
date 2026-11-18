@@ -1,5 +1,5 @@
 //! The AR tests that need no process-wide state and little memory: AR-T1, AR-T2, AR-T5,
-//! AR-T7, AR-T8, AR-T10 and AR-T12 of `architecture/sdd/02-arena.md` section k.
+//! AR-T7, AR-T8, AR-T10, AR-T12 and AR-T18 of `architecture/sdd/02-arena.md` section k.
 //!
 //! They share one test binary because each one links `arrow` statically and the quality
 //! job builds the workspace twice, once for coverage; twelve binaries for twelve tests put
@@ -8,6 +8,8 @@
 //! memory-heavy tests keep another.
 
 mod common;
+
+use std::sync::{Arc, Barrier};
 
 use moruna_arena::{Arena, ArenaConfig};
 use moruna_kernel::{
@@ -131,6 +133,57 @@ fn ar_t5_stats_exact() {
     }
 
     drop(live);
+    assert_eq!(arena.stats().host_in_use, 0);
+    assert_eq!(arena.arena_stats().double_release, 0);
+}
+
+// AR-T18 refusal_flushes_caches (02 k): a thread's cache never causes a refusal. Another thread
+// leaves two 512 KiB slots in its cache and lives on; the region's last megabyte is served all
+// the same, because a refusal first flushes every thread's cache and then decides. The size is
+// below a side region's least (RB5), so nothing but the flush can serve it. f.3.
+
+#[test]
+fn ar_t18_refusal_flushes_caches() {
+    const SLOT: usize = 512 << 10;
+    let region = 4u64 << 20;
+    let slots = (region / SLOT as u64) as usize;
+    let arena = common::host_arena(region);
+    let (cached, done) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+    let other = {
+        let (arena, cached, done) = (Arc::clone(&arena), Arc::clone(&cached), Arc::clone(&done));
+        std::thread::spawn(move || {
+            let held: Vec<Buffer> = (0..slots)
+                .map(|_| arena.alloc(SLOT, Tier::Host).expect("room"))
+                .collect();
+            assert_eq!(arena.stats().host_in_use, region);
+            // A quantum's worth comes back into this thread's cache, the rest to the class list.
+            drop(held);
+            cached.wait();
+            done.wait();
+        })
+    };
+    cached.wait();
+    assert_eq!(
+        arena.stats().host_in_use,
+        0,
+        "a cached slot is in no buffer"
+    );
+    assert_eq!(arena.available(Tier::Host), Some(region));
+    let mine: Vec<Buffer> = (0..slots)
+        .map(|i| {
+            arena
+                .alloc(SLOT, Tier::Host)
+                .unwrap_or_else(|e| panic!("slot {i} refused: {e}"))
+        })
+        .collect();
+    assert_eq!(arena.stats().host_in_use, region);
+    assert!(
+        arena.alloc(64 << 10, Tier::Host).is_err(),
+        "and then the region is full"
+    );
+    done.wait();
+    other.join().expect("the other thread");
+    drop(mine);
     assert_eq!(arena.stats().host_in_use, 0);
     assert_eq!(arena.arena_stats().double_release, 0);
 }

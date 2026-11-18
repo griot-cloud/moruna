@@ -83,6 +83,21 @@ pub(crate) fn class_for(bytes: u64) -> Option<usize> {
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(crate) struct OutOfSpace;
 
+/// What [`Space::give_back`] did with the bytes: the slot whose last bytes came back is the
+/// caller's to keep or put back (a thread's cache, `lanes.rs`); anything else is done.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum Returned {
+    /// The last bytes of the class `class` slot at `offset` came back: free, and on no list.
+    Slot {
+        /// The slot's class.
+        class: usize,
+        /// The slot's offset in the region.
+        offset: u64,
+    },
+    /// Nothing for the caller to keep: what [`Space::release`] would have said.
+    Done(Release),
+}
+
 /// What a release did, so the caller can keep the statistics exact (AR-I5).
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(crate) enum Release {
@@ -353,10 +368,56 @@ impl Space {
     }
 
     fn alloc_class(&self, c: usize, requested: u64) -> Result<u64, OutOfSpace> {
-        match self.try_class(c, requested) {
-            Ok(off) => Ok(off),
-            Err(OutOfSpace) => self.alloc_merged(c, requested),
+        let off = match self.try_class(c) {
+            Some(off) => off,
+            None => self.merged(c)?,
+        };
+        self.activate(off, requested, class_size(c));
+        Ok(off)
+    }
+
+    /// Up to `want` free slots of class `c` for a thread's cache (`lanes.rs`), at least one when
+    /// the region has room for one, taken as an allocation takes its slot: the class list first,
+    /// then a fresh slab or a larger class's slot, then merged buddies. The slots are free and on
+    /// no list, so no allocation and no merge sees them until [`Space::hand_out`] gives one to a
+    /// buffer or [`Space::put_back`] returns it. The class lock is taken once.
+    pub(crate) fn take(&self, c: usize, want: usize, out: &mut Vec<u64>) {
+        let before = out.len();
+        {
+            let mut fl = self.lock_free(c);
+            while out.len() - before < want {
+                let more = (want - (out.len() - before)).min(fl.len());
+                if more > 0 {
+                    let at = fl.len() - more;
+                    out.extend(fl.drain(at..));
+                    continue;
+                }
+                match self.refill(c, &mut fl) {
+                    Some(off) => out.push(off),
+                    None => break,
+                }
+            }
         }
+        if out.len() == before
+            && let Ok(off) = self.merged(c)
+        {
+            out.push(off);
+        }
+    }
+
+    /// Give a slot [`Space::take`] took to a buffer of `requested` bytes: what `alloc` does once
+    /// it has its slot. Returns the slot's address.
+    pub(crate) fn hand_out(&self, off: u64, requested: u64, c: usize) -> *mut u8 {
+        self.activate(off, requested, class_size(c));
+        // SAFETY: `off` is a class slot `take` cut from this region, so it is below `bytes`
+        // and the address is inside the mapping this `Space` owns (AR-I2).
+        unsafe { self.base.add(off as usize) }
+    }
+
+    /// Put free class `c` slots back on their list: a thread's cache flushing, or a slot whose
+    /// last bytes came back that no cache keeps.
+    pub(crate) fn put_back(&self, c: usize, slots: impl IntoIterator<Item = u64>) {
+        self.lock_free(c).extend(slots);
     }
 
     /// Serve class `c` from what the free lists hold once free buddies are merged (f.5).
@@ -371,7 +432,7 @@ impl Space {
     /// request is served from the smallest block that fits. Two free buddies are the whole of
     /// their parent, aligned to its size, so the parent is a block whatever slab or seed block
     /// each half came from, and nothing is ever off every list while another thread looks.
-    fn alloc_merged(&self, c: usize, requested: u64) -> Result<u64, OutOfSpace> {
+    fn merged(&self, c: usize) -> Result<u64, OutOfSpace> {
         let mut lists: Vec<_> = (0..CLASS_COUNT).map(|k| self.lock_free(k)).collect();
         for k in 0..CLASS_COUNT - 1 {
             let size = class_size(k);
@@ -405,34 +466,30 @@ impl Space {
             lists[k].push(buddy);
         }
         self.mark_range(off, class_size(c), c as u8);
-        drop(lists);
-        self.activate(off, requested, class_size(c));
         Ok(off)
     }
 
-    /// Serve class `c` from its own list, a fresh slab or a larger class's free slot.
-    fn try_class(&self, c: usize, requested: u64) -> Result<u64, OutOfSpace> {
+    /// A free slot of class `c` from its own list, a fresh slab or a larger class's free slot.
+    fn try_class(&self, c: usize) -> Option<u64> {
         let mut fl = self.lock_free(c);
-        if let Some(off) = fl.pop() {
-            drop(fl);
-            self.activate(off, requested, class_size(c));
-            return Ok(off);
+        match fl.pop() {
+            Some(off) => Some(off),
+            None => self.refill(c, &mut fl),
         }
+    }
+
+    /// Class `c`'s list is empty: a slot from a fresh slab, the rest of the slab pushed onto the
+    /// list, or from a larger class's free slot split down. The caller holds the class lock.
+    fn refill(&self, c: usize, fl: &mut Vec<u64>) -> Option<u64> {
         // Fresh region first, then a larger class's stranded slot. The second is what keeps
         // f.5's stranding from becoming a refusal in a region that still holds free slots of
         // another class (e.1): a class never returns a slab to the bump area, but a slot on a
         // larger class's free list splits down like any block in the small-budget mode.
-        let off = if self.small_mode {
-            self.split_down(c, &mut fl).ok_or(OutOfSpace)?
+        if self.small_mode {
+            self.split_down(c, fl)
         } else {
-            match self.claim_slab(c, &mut fl) {
-                Some(off) => off,
-                None => self.split_down(c, &mut fl).ok_or(OutOfSpace)?,
-            }
-        };
-        drop(fl);
-        self.activate(off, requested, class_size(c));
-        Ok(off)
+            self.claim_slab(c, fl).or_else(|| self.split_down(c, fl))
+        }
     }
 
     /// Claim a slab for class `c` and push every slot but the one returned (f.3). The
@@ -511,22 +568,34 @@ impl Space {
     /// Return `len` bytes at `ptr` (f.4). A zero-length buffer owns nothing and returns
     /// nothing, which is what makes `alloc(0)` and a zero half of `split_at` safe.
     pub(crate) fn release(&self, ptr: *mut u8, len: u64) -> Release {
+        match self.give_back(ptr, len) {
+            Returned::Slot { class, offset } => {
+                self.put_back(class, [offset]);
+                Release::Freed
+            }
+            Returned::Done(released) => released,
+        }
+    }
+
+    /// [`Space::release`], except that a class slot whose last bytes came back is handed to the
+    /// caller, free and on no list, instead of going back on its class list.
+    pub(crate) fn give_back(&self, ptr: *mut u8, len: u64) -> Returned {
         if len == 0 {
-            return Release::Partial;
+            return Returned::Done(Release::Partial);
         }
         let off = (ptr as usize - self.base as usize) as u64;
         let g = (off / GRANULE) as usize;
         match self.mark[g].load(Ordering::Acquire) {
             MARK_NONE => {
                 self.double_release.fetch_add(1, Ordering::Relaxed);
-                Release::Double
+                Returned::Done(Release::Double)
             }
-            MARK_LARGE => self.release_large(off, len),
+            MARK_LARGE => Returned::Done(self.release_large(off, len)),
             mark => self.release_class(off, len, mark as usize),
         }
     }
 
-    fn release_class(&self, off: u64, len: u64, c: usize) -> Release {
+    fn release_class(&self, off: u64, len: u64, c: usize) -> Returned {
         let size = class_size(c);
         let slot = off & !(size - 1);
         let sg = (slot / GRANULE) as usize;
@@ -534,7 +603,7 @@ impl Space {
             let cur = self.outstanding[sg].load(Ordering::Acquire);
             if cur == 0 {
                 self.double_release.fetch_add(1, Ordering::Relaxed);
-                return Release::Double;
+                return Returned::Done(Release::Double);
             }
             let next = cur.saturating_sub(len);
             if self.outstanding[sg]
@@ -544,12 +613,14 @@ impl Space {
                 continue;
             }
             if next > 0 {
-                return Release::Partial;
+                return Returned::Done(Release::Partial);
             }
-            self.lock_free(c).push(slot);
             self.in_use.fetch_sub(size, Ordering::Relaxed);
             self.watermark.release(size);
-            return Release::Freed;
+            return Returned::Slot {
+                class: c,
+                offset: slot,
+            };
         }
     }
 

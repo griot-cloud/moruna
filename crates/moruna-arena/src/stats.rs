@@ -15,7 +15,8 @@ pub struct ArenaStats {
     pub slabs_by_class: [u32; CLASS_COUNT],
     /// The largest single host allocation still possible (d.1).
     pub largest_free: u64,
-    /// Host bytes on class free lists: charged to a class, held by no buffer (f.5).
+    /// Host bytes on class free lists and in the threads' caches: charged to a class, held by
+    /// no buffer (f.5).
     pub stranded_bytes: u64,
     /// Releases that found nothing live at the address, summed over every region: a double
     /// release, or a release of a tier this arena never hands out (h).
@@ -89,6 +90,8 @@ impl Inner {
         }
         // The next region a granted arena would make serves an allocation as well as any made.
         let largest_free = largest_free.max(self.next_region());
+        // A thread's cached slots are charged to a class and held by no buffer too.
+        let stranded_bytes = stranded_bytes + self.lanes.cached();
         ArenaStats {
             slabs_by_class,
             largest_free,
