@@ -180,6 +180,16 @@ fn serve(scratch: &Scratch, spec: Value) -> Served {
 
 /// [`serve`] on a node whose jobs may have at most `budget_max` bytes.
 fn serve_bounded(scratch: &Scratch, spec: Value, budget_max: Option<u64>) -> Served {
+    let node = Node {
+        channel: "channel:engine".to_string(),
+        budget_max,
+        volumes: None,
+    };
+    serve_on(scratch, spec, Some(node))
+}
+
+/// Serves `spec` as [`serve`] does, in node mode on `node`, or off a node with `None`.
+fn serve_on(scratch: &Scratch, spec: Value, node: Option<Node>) -> Served {
     let input = scratch.path().join("in.parquet");
     let out = scratch.path().join("out");
     let kinds = kinds(&input, &out);
@@ -202,28 +212,22 @@ fn serve_bounded(scratch: &Scratch, spec: Value, budget_max: Option<u64>) -> Ser
             bytes
         }
     });
-    let node = Node {
-        channel: "channel:engine".to_string(),
-        budget_max,
-        volumes: None,
+    let options = session::HostOptions {
+        cost: None,
+        strict: true,
+        env: &no_env,
+        cancel: CancelToken::new(),
+        heartbeat: HEARTBEAT,
+        packages: moruna_runtime::packaged::PackageHost::default(),
+        capture_process: false,
+        events: Default::default(),
+        args: Vec::new(),
+        pulled_images: None,
     };
-    let outcome = session::serve_node(
-        over_messages(engine.clone()),
-        &node,
-        &kinds,
-        &session::HostOptions {
-            cost: None,
-            strict: true,
-            env: &no_env,
-            cancel: CancelToken::new(),
-            heartbeat: HEARTBEAT,
-            packages: moruna_runtime::packaged::PackageHost::default(),
-            capture_process: false,
-            events: Default::default(),
-            args: Vec::new(),
-            pulled_images: None,
-        },
-    );
+    let outcome = match &node {
+        Some(node) => session::serve_node(over_messages(engine.clone()), node, &kinds, &options),
+        None => session::serve_conn(over_messages(engine.clone()), &kinds, &options),
+    };
     // The engine has returned: its end is closed, and the peer reads to the end at once. A
     // peer still reading after a while is a failure that says how the engine closed, not a hang.
     let waited = std::time::Instant::now();
@@ -703,4 +707,112 @@ fn a_reference_in_a_files_document_is_refused() {
             && diagnostic.contains("no secret named `aws.id`"),
         "{diagnostic}"
     );
+}
+
+/// An S3 API on this machine's loopback that refuses every request with `403 Forbidden` and says
+/// back the key ID and the secret key it was given, as a careless server might: its port.
+fn forbidding_store() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+    let port = listener.local_addr().expect("its address").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => break,
+                }
+            }
+            let body = format!(
+                "<Error><Code>InvalidAccessKeyId</Code><AWSAccessKeyId>AKIA-NODE-ID</AWSAccessKeyId>\
+                 <SignatureProvided>{SECRET}</SignatureProvided></Error>"
+            );
+            let _ = write!(
+                stream,
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    port
+}
+
+/// Every file under `dir`, read as text.
+fn files_under(dir: &Path) -> Vec<(std::path::PathBuf, String)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("a directory").flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(files_under(&path));
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            found.push((path, String::from_utf8_lossy(&bytes).into_owned()));
+        }
+    }
+    found
+}
+
+/// A store that refuses the job's credentials (item 3.5): the run fails with the store's error
+/// naming the secrets the credentials came from, and no credential's value is in anything the
+/// engine says (its events, its report, its exit) or writes (its report file, its logs), though
+/// the store said them back.
+#[test]
+fn a_store_that_refuses_the_credentials_names_the_secrets_never_their_values() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("store_refuses");
+    let port = forbidding_store();
+    let document = json!({
+        "moruna_spec": 1,
+        "source": {"kind": "parquet", "url": "s3://taxi/yellow_tripdata_2024-01.parquet"},
+        "sink": {"kind": "count"},
+        "budget": {"memory_bytes": 1u64 << 30, "cpu": 2.0},
+        "object_store": {"s3": {"endpoint": format!("http://127.0.0.1:{port}"),
+                                "region": "us-east-1",
+                                "access_key_id": {"secret": "aws.id"},
+                                "secret_access_key": {"secret": "aws.key"}},
+                         "allow_http": true},
+        "report": {"file": scratch.path().join("report-<run_id>.json").to_string_lossy(),
+                   "logs": scratch.path().join("logs-<run_id>").to_string_lossy()},
+    });
+    let served = serve_on(
+        &scratch,
+        json!({"spec": document, "secrets": secrets()}),
+        None,
+    );
+    assert_ne!(served.outcome.code, exit::COMPLETED);
+    assert_ne!(
+        served.outcome.code,
+        exit::SPEC_REFUSED,
+        "the document is sound"
+    );
+    let diagnostic = exit_of(&served)["diagnostic"]
+        .as_str()
+        .expect("a diagnostic")
+        .to_string();
+    assert!(
+        diagnostic.contains("the store refused the credentials this job gave it")
+            && diagnostic.contains("secret `aws.id` (object_store.s3.access_key_id)")
+            && diagnostic.contains("secret `aws.key` (object_store.s3.secret_access_key)"),
+        "{diagnostic}"
+    );
+    let said = String::from_utf8_lossy(&served.bytes);
+    assert!(
+        !said.contains(SECRET) && !said.contains("AKIA-NODE-ID"),
+        "a credential crossed the channel: {said}"
+    );
+    assert!(
+        said.contains("<secret `aws.key`>"),
+        "what the store said back was read again: {said}"
+    );
+    let written = files_under(scratch.path());
+    assert!(!written.is_empty(), "the run wrote its report and logs");
+    for (path, text) in written {
+        assert!(
+            !text.contains(SECRET) && !text.contains("AKIA-NODE-ID"),
+            "a credential in {}",
+            path.display()
+        );
+    }
 }

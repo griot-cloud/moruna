@@ -1456,6 +1456,7 @@ impl<'a> S3<'a> {
   pub const VT_ACCESS_KEY_ID_REF: ::flatbuffers::VOffsetT = 16;
   pub const VT_SECRET_ACCESS_KEY_REF: ::flatbuffers::VOffsetT = 18;
   pub const VT_SESSION_TOKEN_REF: ::flatbuffers::VOffsetT = 20;
+  pub const VT_VIRTUAL_HOSTED_STYLE_REQUEST: ::flatbuffers::VOffsetT = 22;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -1473,6 +1474,7 @@ impl<'a> S3<'a> {
     if let Some(x) = args.bucket { builder.add_bucket(x); }
     if let Some(x) = args.region { builder.add_region(x); }
     if let Some(x) = args.endpoint { builder.add_endpoint(x); }
+    builder.add_virtual_hosted_style_request(args.virtual_hosted_style_request);
     builder.finish()
   }
 
@@ -1519,6 +1521,13 @@ impl<'a> S3<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<SecretRef>>(S3::VT_SESSION_TOKEN_REF, None)}
   }
+  #[inline]
+  pub fn virtual_hosted_style_request(&self) -> bool {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<bool>(S3::VT_VIRTUAL_HOSTED_STYLE_REQUEST, Some(false)).unwrap()}
+  }
 }
 
 impl ::flatbuffers::Verifiable for S3<'_> {
@@ -1533,6 +1542,7 @@ impl ::flatbuffers::Verifiable for S3<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<SecretRef>>("access_key_id_ref", Self::VT_ACCESS_KEY_ID_REF, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<SecretRef>>("secret_access_key_ref", Self::VT_SECRET_ACCESS_KEY_REF, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<SecretRef>>("session_token_ref", Self::VT_SESSION_TOKEN_REF, false)?
+     .visit_field::<bool>("virtual_hosted_style_request", Self::VT_VIRTUAL_HOSTED_STYLE_REQUEST, false)?
      .finish();
     Ok(())
   }
@@ -1544,6 +1554,7 @@ pub struct S3Args<'a> {
     pub access_key_id_ref: Option<::flatbuffers::WIPOffset<SecretRef<'a>>>,
     pub secret_access_key_ref: Option<::flatbuffers::WIPOffset<SecretRef<'a>>>,
     pub session_token_ref: Option<::flatbuffers::WIPOffset<SecretRef<'a>>>,
+    pub virtual_hosted_style_request: bool,
 }
 impl<'a> Default for S3Args<'a> {
   #[inline]
@@ -1555,6 +1566,7 @@ impl<'a> Default for S3Args<'a> {
       access_key_id_ref: None,
       secret_access_key_ref: None,
       session_token_ref: None,
+      virtual_hosted_style_request: false,
     }
   }
 }
@@ -1589,6 +1601,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> S3Builder<'a, 'b, A> {
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<SecretRef>>(S3::VT_SESSION_TOKEN_REF, session_token_ref);
   }
   #[inline]
+  pub fn add_virtual_hosted_style_request(&mut self, virtual_hosted_style_request: bool) {
+    self.fbb_.push_slot::<bool>(S3::VT_VIRTUAL_HOSTED_STYLE_REQUEST, virtual_hosted_style_request, false);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> S3Builder<'a, 'b, A> {
     let start = _fbb.start_table();
     S3Builder {
@@ -1612,6 +1628,7 @@ impl ::core::fmt::Debug for S3<'_> {
       ds.field("access_key_id_ref", &self.access_key_id_ref());
       ds.field("secret_access_key_ref", &self.secret_access_key_ref());
       ds.field("session_token_ref", &self.session_token_ref());
+      ds.field("virtual_hosted_style_request", &self.virtual_hosted_style_request());
       ds.finish()
   }
 }
@@ -1747,6 +1764,7 @@ impl<'a> Azure<'a> {
   pub const VT_ACCOUNT: ::flatbuffers::VOffsetT = 4;
   pub const VT_CONTAINER: ::flatbuffers::VOffsetT = 8;
   pub const VT_ACCESS_KEY_REF: ::flatbuffers::VOffsetT = 10;
+  pub const VT_SAS_TOKEN_REF: ::flatbuffers::VOffsetT = 12;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -1758,6 +1776,7 @@ impl<'a> Azure<'a> {
     args: &'args AzureArgs<'args>
   ) -> ::flatbuffers::WIPOffset<Azure<'bldr>> {
     let mut builder = AzureBuilder::new(_fbb);
+    if let Some(x) = args.sas_token_ref { builder.add_sas_token_ref(x); }
     if let Some(x) = args.access_key_ref { builder.add_access_key_ref(x); }
     if let Some(x) = args.container { builder.add_container(x); }
     if let Some(x) = args.account { builder.add_account(x); }
@@ -1786,6 +1805,13 @@ impl<'a> Azure<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<SecretRef>>(Azure::VT_ACCESS_KEY_REF, None)}
   }
+  #[inline]
+  pub fn sas_token_ref(&self) -> Option<SecretRef<'a>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<SecretRef>>(Azure::VT_SAS_TOKEN_REF, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for Azure<'_> {
@@ -1797,6 +1823,7 @@ impl ::flatbuffers::Verifiable for Azure<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("account", Self::VT_ACCOUNT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("container", Self::VT_CONTAINER, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<SecretRef>>("access_key_ref", Self::VT_ACCESS_KEY_REF, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<SecretRef>>("sas_token_ref", Self::VT_SAS_TOKEN_REF, false)?
      .finish();
     Ok(())
   }
@@ -1805,6 +1832,7 @@ pub struct AzureArgs<'a> {
     pub account: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub container: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub access_key_ref: Option<::flatbuffers::WIPOffset<SecretRef<'a>>>,
+    pub sas_token_ref: Option<::flatbuffers::WIPOffset<SecretRef<'a>>>,
 }
 impl<'a> Default for AzureArgs<'a> {
   #[inline]
@@ -1813,6 +1841,7 @@ impl<'a> Default for AzureArgs<'a> {
       account: None,
       container: None,
       access_key_ref: None,
+      sas_token_ref: None,
     }
   }
 }
@@ -1835,6 +1864,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> AzureBuilder<'a, 'b, A> {
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<SecretRef>>(Azure::VT_ACCESS_KEY_REF, access_key_ref);
   }
   #[inline]
+  pub fn add_sas_token_ref(&mut self, sas_token_ref: ::flatbuffers::WIPOffset<SecretRef<'b >>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<SecretRef>>(Azure::VT_SAS_TOKEN_REF, sas_token_ref);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> AzureBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     AzureBuilder {
@@ -1855,6 +1888,7 @@ impl ::core::fmt::Debug for Azure<'_> {
       ds.field("account", &self.account());
       ds.field("container", &self.container());
       ds.field("access_key_ref", &self.access_key_ref());
+      ds.field("sas_token_ref", &self.sas_token_ref());
       ds.finish()
   }
 }

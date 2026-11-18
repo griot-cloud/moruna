@@ -870,6 +870,58 @@ fn every_sink_kind_builds() {
         store.azure.as_ref().and_then(|a| a.access_key.as_deref()),
         Some("a2V5")
     );
+    // Each secret's name is kept with the field it fills, for errors to name; a credential the
+    // runner gave has none.
+    let names: Vec<(&str, &str)> = store
+        .secret_names
+        .iter()
+        .map(|(field, name)| (field.as_str(), name.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("object_store.azure.access_key", "azure"),
+            ("object_store.gcs.service_account_json", "gcs"),
+            ("object_store.s3.secret_access_key", "aws.key"),
+            ("object_store.s3.session_token", "aws.token"),
+        ]
+    );
+    assert!(!format!("{store:?}").contains("S3-SECRET"), "{store:?}");
+    // Azure Blob's SAS token, and S3's virtual-host style, reach the stores built.
+    let sas = ObjectStoreDoc {
+        s3: Some(S3Doc {
+            endpoint: Some("https://b.objects.example.com".into()),
+            virtual_hosted_style_request: true,
+            ..S3Doc::default()
+        }),
+        azure: Some(AzureDoc {
+            account: Some("acct".into()),
+            sas_token: Some(moruna_job::SecretRef::new("blob-sas")),
+            ..AzureDoc::default()
+        }),
+        ..ObjectStoreDoc::default()
+    };
+    let mut built = crate::job::build::object_store_of(&sas);
+    assert!(
+        built
+            .s3
+            .as_ref()
+            .is_some_and(|s| s.virtual_hosted_style_request)
+    );
+    let tokens: std::collections::BTreeMap<String, String> =
+        [("blob-sas".to_string(), "sv=1&sig=x".to_string())].into();
+    crate::job::build::with_secrets(&mut built, &sas, &tokens).expect("the token is given");
+    assert_eq!(
+        built.azure.as_ref().and_then(|a| a.sas_token.as_deref()),
+        Some("sv=1&sig=x")
+    );
+    assert_eq!(
+        built
+            .secret_names
+            .get("object_store.azure.sas_token")
+            .map(String::as_str),
+        Some("blob-sas")
+    );
     let mut fewer = given.clone();
     fewer.remove("gcs");
     let refused = crate::job::build::with_secrets(

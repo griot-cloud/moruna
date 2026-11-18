@@ -19,6 +19,7 @@
 #![allow(clippy::result_large_err)]
 
 mod copy;
+mod credentials;
 mod fdcache;
 mod file_blocking;
 #[cfg(any(all(target_os = "linux", feature = "uring"), test))]
@@ -109,6 +110,10 @@ impl Default for ReactorConfig {
 /// or, when a field is `None` there, from the environment the way the `object_store`
 /// crate reads it (`AWS_*`, `GOOGLE_*`, `AZURE_*`); the reactor does not read the
 /// environment itself.
+///
+/// A credential is never printed: `Debug` says only whether each is set, and every error of a
+/// store's says the secret it came from by name ([`ObjectStoreConfig::secret_names`]), never its
+/// value (system design 3B).
 #[derive(Clone, Debug, Default)]
 pub struct ObjectStoreConfig {
     /// S3 and S3-compatible endpoints.
@@ -121,10 +126,23 @@ pub struct ObjectStoreConfig {
     pub local_root: Option<std::path::PathBuf>,
     /// Permit plain-HTTP endpoints (MinIO in CI); false in every default.
     pub allow_http: bool,
+    /// The secret each credential was resolved from, by name, keyed by the document's field
+    /// it fills (`object_store.s3.secret_access_key` to `aws.key`): what a store's error names
+    /// in its place. A credential with none here came from the runner, and an error names its
+    /// field.
+    pub secret_names: std::collections::BTreeMap<String, String>,
+}
+
+/// What `Debug` shows of a credential: whether it is set, never its value.
+fn shown(credential: &Option<String>) -> &'static str {
+    match credential {
+        Some(_) => "Some(<redacted>)",
+        None => "None",
+    }
 }
 
 /// S3 and S3-compatible credentials and endpoints.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct S3Config {
     /// Custom endpoint (MinIO, R2); `None` is AWS. `unix:///path` or `vsock://cid:port` names
     /// a socket a host proxies (MH 4.6): the client speaks plain HTTP/1.1 over it, path-style,
@@ -140,10 +158,39 @@ pub struct S3Config {
     pub session_token: Option<String>,
     /// Default bucket when the URL is a bare key; the URL's bucket wins.
     pub bucket: Option<String>,
+    /// `endpoint` is the bucket's own host and a request names the key alone (virtual-host
+    /// style); otherwise a request names the bucket in its path (path-style).
+    pub virtual_hosted_style_request: bool,
+}
+
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field(
+                "access_key_id",
+                &format_args!("{}", shown(&self.access_key_id)),
+            )
+            .field(
+                "secret_access_key",
+                &format_args!("{}", shown(&self.secret_access_key)),
+            )
+            .field(
+                "session_token",
+                &format_args!("{}", shown(&self.session_token)),
+            )
+            .field("bucket", &self.bucket)
+            .field(
+                "virtual_hosted_style_request",
+                &self.virtual_hosted_style_request,
+            )
+            .finish()
+    }
 }
 
 /// Google Cloud Storage credentials.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct GcsConfig {
     /// Service account file.
     pub service_account_path: Option<std::path::PathBuf>,
@@ -153,8 +200,21 @@ pub struct GcsConfig {
     pub bucket: Option<String>,
 }
 
-/// Azure Blob Storage credentials.
-#[derive(Clone, Debug, Default)]
+impl std::fmt::Debug for GcsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GcsConfig")
+            .field("service_account_path", &self.service_account_path)
+            .field(
+                "service_account_json",
+                &format_args!("{}", shown(&self.service_account_json)),
+            )
+            .field("bucket", &self.bucket)
+            .finish()
+    }
+}
+
+/// Azure Blob Storage credentials: an account key or a SAS token.
+#[derive(Clone, Default)]
 pub struct AzureConfig {
     /// Storage account.
     pub account: Option<String>,
@@ -162,6 +222,19 @@ pub struct AzureConfig {
     pub access_key: Option<String>,
     /// Default container.
     pub container: Option<String>,
+    /// A shared access signature token (the query string Azure gives), in place of the key.
+    pub sas_token: Option<String>,
+}
+
+impl std::fmt::Debug for AzureConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AzureConfig")
+            .field("account", &self.account)
+            .field("access_key", &format_args!("{}", shown(&self.access_key)))
+            .field("container", &self.container)
+            .field("sas_token", &format_args!("{}", shown(&self.sas_token)))
+            .finish()
+    }
 }
 
 /// Seams the tests of section k drive: an opener that can refuse `O_DIRECT` for one path

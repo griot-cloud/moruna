@@ -300,10 +300,10 @@ fn a_jobs_needs_are_its_hosts_volumes_and_functions() {
     assert_eq!(
         needs(&every),
         NodeNeeds {
+            // GCS is not reached from a node: its settings mint no host (item 3.5).
             hosts: vec![
                 "myaccount.blob.core.windows.net".to_string(),
                 "s3.example.com".to_string(),
-                "storage.googleapis.com".to_string(),
             ],
             volumes: vec![
                 VolumeNeed {
@@ -342,6 +342,99 @@ fn a_jobs_needs_are_its_hosts_volumes_and_functions() {
         "object_store": {"s3": {"endpoint": "unix:///run/egress.sock"}},
     }));
     assert!(needs(&socket).hosts.is_empty());
+}
+
+/// What a job's network may reach comes from its object-store settings and nothing else (system
+/// design 3D, item 3.5): exactly the S3 endpoint's host, path-style or the bucket's own host,
+/// and exactly `<account>.blob.core.windows.net`; never a host a URL, a credential or another
+/// setting names.
+#[test]
+fn the_hosts_a_node_mints_are_exactly_the_endpoints_and_the_accounts() {
+    let with = |store: Value| {
+        needs(&job(json!({
+            "moruna_spec": 1,
+            "source": {"kind": "parquet",
+                       "url": ["s3://in/taxi/", "az://c/taxi/", "https://elsewhere.example.com/x"]},
+            "sink": {"kind": "parquet", "url": "s3://out/score/"},
+            "object_store": store,
+        })))
+        .hosts
+    };
+    // MinIO as the boot has it: path-style, the endpoint's host.
+    assert_eq!(
+        with(
+            json!({"s3": {"endpoint": "https://minio.test", "region": "us-east-1",
+                           "access_key_id": {"secret": "s3-key"},
+                           "secret_access_key": {"secret": "s3-secret"}}})
+        ),
+        ["minio.test"]
+    );
+    // Virtual-host style: the bucket's own host, which the endpoint names.
+    assert_eq!(
+        with(
+            json!({"s3": {"endpoint": "https://in.objects.example.com:443",
+                           "virtual_hosted_style_request": true}})
+        ),
+        ["in.objects.example.com"]
+    );
+    // Azure Blob by account key or by SAS token: the account's host, whatever the credential.
+    for credential in [
+        json!({"access_key": {"secret": "blob-key"}}),
+        json!({"sas_token": {"secret": "blob-sas"}}),
+    ] {
+        let mut azure = json!({"account": "moruna35", "container": "c"});
+        azure
+            .as_object_mut()
+            .unwrap()
+            .extend(credential.as_object().unwrap().clone());
+        assert_eq!(
+            with(json!({"azure": azure})),
+            ["moruna35.blob.core.windows.net"]
+        );
+    }
+    // Both stores: both hosts, each once, sorted; nothing for GCS.
+    assert_eq!(
+        with(json!({"s3": {"endpoint": "https://minio.test"},
+                    "azure": {"account": "moruna35"},
+                    "gcs": {"bucket": "g"}})),
+        ["minio.test", "moruna35.blob.core.windows.net"]
+    );
+}
+
+/// A job on a node that uses Azure Blob names a storage account Azure could have: with none, or
+/// with a name that is not one, the host it would reach is not known, and it is refused by its
+/// field.
+#[test]
+fn azure_blob_on_a_node_names_its_account() {
+    let with = |store: Value, url: &str| {
+        refused(json!({
+            "moruna_spec": 1,
+            "source": {"kind": "parquet", "url": url},
+            "sink": {"kind": "count"},
+            "object_store": store,
+        }))
+    };
+    assert!(with(json!({"azure": {"account": "moruna35"}}), "az://c/in/").is_empty());
+    for account in ["Moruna35", "ab", "a.evil.example", &"a".repeat(25)] {
+        assert_eq!(
+            with(json!({"azure": {"account": account}}), "az://c/in/"),
+            ["object_store.azure.account"],
+            "{account}"
+        );
+    }
+    assert_eq!(
+        with(json!({"azure": {"container": "c"}}), "az://c/in/"),
+        ["object_store.azure.account"]
+    );
+    for url in ["az://c/in/", "ABFS://c/in/", "azure://c/in/"] {
+        assert_eq!(
+            with(json!({}), url),
+            ["object_store.azure.account"],
+            "{url}"
+        );
+    }
+    assert!(with(json!({}), "disk://vol/in/").is_empty());
+    assert!(is_storage_account("abc") && is_storage_account(&"0".repeat(24)));
 }
 
 #[test]

@@ -742,12 +742,13 @@ fn host_profile_of(job: &Job) -> Result<Option<HostProfile>> {
 /// The object store a document names: endpoints and names, and no credential. The runner
 /// supplies credentials on the `RunSpec` it builds (`moruna.run(..., storage=...)`), or the
 /// store's client reads them where it runs (its environment, its instance's identity).
-fn object_store_of(doc: &ObjectStoreDoc) -> ObjectStoreConfig {
+pub(crate) fn object_store_of(doc: &ObjectStoreDoc) -> ObjectStoreConfig {
     ObjectStoreConfig {
         s3: doc.s3.as_ref().map(|s| S3Config {
             endpoint: s.endpoint.clone(),
             region: s.region.clone(),
             bucket: s.bucket.clone(),
+            virtual_hosted_style_request: s.virtual_hosted_style_request,
             ..S3Config::default()
         }),
         gcs: doc.gcs.as_ref().map(|g| GcsConfig {
@@ -761,19 +762,22 @@ fn object_store_of(doc: &ObjectStoreDoc) -> ObjectStoreConfig {
         }),
         local_root: doc.local_root.as_deref().map(PathBuf::from),
         allow_http: doc.allow_http,
+        secret_names: Default::default(),
     }
 }
 
 /// Resolves the references to secrets in `doc`, the document's object-store settings, into
 /// `store`, the object stores built from it, with `secrets`, the job's secrets by name (system
 /// design 3B). A reference to a name not given is refused by its field, and a place the document
-/// leaves empty is left as it was.
+/// leaves empty is left as it was. Each secret's name is kept with the field it fills
+/// (`store.secret_names`), so that a store's error names the secret, never its value.
 pub fn with_secrets(
     store: &mut ObjectStoreConfig,
     doc: &ObjectStoreDoc,
     secrets: &std::collections::BTreeMap<String, String>,
 ) -> std::result::Result<(), moruna_job::SpecError> {
-    let resolve =
+    let mut names = std::mem::take(&mut store.secret_names);
+    let mut resolve =
         |slot: &mut Option<String>, field: &str, reference: &Option<moruna_job::SecretRef>| {
             let Some(reference) = reference else {
                 return Ok(());
@@ -788,6 +792,7 @@ pub fn with_secrets(
                 )
             })?;
             *slot = Some(value.clone());
+            names.insert(field.to_string(), reference.secret.clone());
             Ok(())
         };
     if let Some(doc) = &doc.s3 {
@@ -823,7 +828,13 @@ pub fn with_secrets(
             "object_store.azure.access_key",
             &doc.access_key,
         )?;
+        resolve(
+            &mut azure.sas_token,
+            "object_store.azure.sas_token",
+            &doc.sas_token,
+        )?;
     }
+    store.secret_names = names;
     Ok(())
 }
 
