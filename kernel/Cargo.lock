@@ -912,6 +912,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-net-session"
+version = "0.1.0"
+dependencies = [
+ "moruna-netstack",
+ "moruna-node-http",
+ "moruna-svc",
+ "netstack-protocol",
+ "rcgen",
+ "rustls",
+]
+
+[[package]]
 name = "moruna-netstack"
 version = "0.1.0"
 dependencies = [
