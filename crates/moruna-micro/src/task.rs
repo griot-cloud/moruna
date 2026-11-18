@@ -390,6 +390,9 @@ pub struct ImageTask {
     /// Told the bytes of the stage's room its other tasks did not need, once a warm-up sized
     /// them (system design 3A): the run's arena takes them.
     on_sized: OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
+    /// The account each instance whose task passed its room is started with since (system
+    /// design 3A), by instance.
+    restarted: Mutex<std::collections::BTreeMap<usize, u64>>,
 }
 
 /// Where a ring stage's workers' time inside the stage goes, in nanoseconds: cutting batches
@@ -440,6 +443,11 @@ struct Busy {
     warming: std::sync::atomic::AtomicBool,
     /// The warm-up's readings and what it found.
     warm: Mutex<Warm>,
+    /// Each time a task passed its room and was started again, as the stage's note says it.
+    restarts: Mutex<Vec<String>>,
+    /// The margin of the measurement the stage's tasks are sized from: what a restart widens
+    /// the need a refusal names by (system design 3A); none before one.
+    margin: Mutex<f64>,
 }
 
 /// A stage's warm-up on its first task (system design 3A; PM, 2026-11-18).
@@ -538,6 +546,7 @@ impl ImageTask {
             busy: Arc::new(Busy::default()),
             ahead: layout::Ahead::default(),
             on_sized: OnceLock::new(),
+            restarted: Mutex::new(std::collections::BTreeMap::new()),
         }
         .with_processes(processes))
     }
@@ -697,11 +706,25 @@ impl ImageTask {
                 .map_err(|e| plane_error(&self.name, "granting explicit reply window", e))?;
             st.window = Some(bytes);
         }
-        if st.rings && st.instance == 0 && self.warming() {
-            return self.warm(st, &batch);
-        }
         if st.rings {
-            return st.pipelined(&batch, self.ports.get(), &self.port_names);
+            loop {
+                let answered = if st.instance == 0 && self.warming() {
+                    self.warm(st, &batch)
+                } else {
+                    st.pipelined(&batch, self.ports.get(), &self.port_names)
+                };
+                match answered {
+                    // A refusal of the run's arena is applied again as it is (RB5); a task that
+                    // passed its own room is given a larger one (system design 3A).
+                    Err(cause)
+                        if !matches!(cause, MorunaError::Alloc { .. })
+                            && st.passed_room().is_some() =>
+                    {
+                        self.restart(st, cause)?
+                    }
+                    answered => return answered,
+                }
+            }
         }
         // Explicit output admission is complete BEFORE the child can read this request.
         let (len, _) = st.offer(&batch, self.ports.get(), &self.port_names)?;
@@ -760,6 +783,10 @@ impl ImageTask {
                 .as_ref()
                 .map(|said| format!("; {said}"))
                 .unwrap_or_default()
+                + &lock(&self.busy.restarts)
+                    .iter()
+                    .map(|said| format!("; {said}"))
+                    .collect::<String>()
         })
     }
 
@@ -806,9 +833,10 @@ impl ImageTask {
 
     /// Each task's plane for pieces of `piece` bytes and its account at `account` bytes, as the
     /// node's readings of the function size them (system design 3A), in place of the share's
-    /// rule.
-    pub fn size_measured(&self, piece: u64, account: u64) {
+    /// rule; `margin` is the measurement's, which a restart widens the need it names by.
+    pub fn size_measured(&self, piece: u64, account: u64, margin: f64) {
         *lock(&self.measured) = Some((piece, account));
+        *lock(&self.busy.margin) = margin;
     }
 
     /// Warm the stage up on its first task before its others start (system design 3A; PM,
@@ -837,6 +865,76 @@ impl ImageTask {
     /// warm-up has sized them.
     pub fn on_sized(&self, f: Box<dyn Fn(u64) + Send + Sync>) {
         let _ = self.on_sized.set(f);
+    }
+
+    /// A task that passed its room, started again (system design 3A; PM, 2026-11-18): its
+    /// unanswered pieces landed from the records the engine kept, oldest first; the task retired
+    /// with its account; a new one carved at twice the account (`layout::restarted_limit`, as far
+    /// as the engine's room allows); and the unit given to it as it stood, the copied pieces
+    /// queued first and the answers already taken kept. The stage's note says it, and the old
+    /// task's figures, its peak beside its largest piece, are its reading in the report. A
+    /// function that keeps state is not started again (it has no checkpoint to start from), nor
+    /// one whose account cannot grow: either fails with `cause`.
+    fn restart(&self, st: &mut TaskState, cause: MorunaError) -> Result<()> {
+        let Some(usage) = st.passed_room() else {
+            return Err(cause);
+        };
+        if !matches!(self.hints().resume, moruna_kernel::ResumePolicy::Reinit) {
+            return Err(cause);
+        }
+        // The old account comes back when the task is retired.
+        let room = Usage::own()
+            .map(|own| own.room())
+            .unwrap_or(0)
+            .saturating_add(usage.limit);
+        let needed = usage.peak.saturating_add(usage.refused_max);
+        let margin = *lock(&self.busy.margin);
+        let Some(grown) = layout::restarted_limit(usage.limit, needed, margin, room) else {
+            return Err(cause);
+        };
+        let unanswered = st.unanswered()?;
+        let posted = unanswered.len();
+        let queued: Vec<_> = st.queued.drain(..).collect();
+        let ready = std::mem::take(&mut st.ready);
+        let (applying, schema, instance) = (st.applying, st.schema.clone(), st.instance);
+        let ctx = InitCtx {
+            instance,
+            device: None,
+            alloc: Arc::clone(&st.alloc),
+        };
+        // It holds no batch now: the stage's count of tasks holding one says so.
+        st.count_busy(false);
+        st.teardown();
+        lock(&self.restarted).insert(instance, grown);
+        let mut fresh = self.start(&ctx).map_err(|again| {
+            kernel_error(format!(
+                "{cause}; and its task, which passed its room, could not be started again: {again}"
+            ))
+        })?;
+        fresh.queued = unanswered.into_iter().chain(queued).collect();
+        fresh.ready = ready;
+        fresh.applying = applying;
+        if fresh.schema.is_none() {
+            fresh.schema = schema;
+        }
+        *st = fresh;
+        let said = format!(
+            "task {instance} passed its account of {} bytes ({} {} refused, the largest {} bytes; \
+             its peak {} bytes): started again with an account of {grown} bytes, its {posted} \
+             unanswered pieces posted again",
+            usage.limit,
+            usage.refused,
+            if usage.refused == 1 {
+                "charge"
+            } else {
+                "charges"
+            },
+            usage.refused_max,
+            usage.peak
+        );
+        tracing::warn!(target: "micro", image = %self.name, "{said}");
+        lock(&self.busy.restarts).push(said);
+        Ok(())
     }
 
     /// Whether the stage is warming up on its first task.
@@ -1002,7 +1100,7 @@ impl ImageTask {
                     Ok((at, counts)) => {
                         let piece = layout::PIECES[at];
                         let count = counts.first().copied().unwrap_or(0);
-                        self.size_measured(piece, account(piece));
+                        self.size_measured(piece, account(piece), margin);
                         self.cap_pieces(piece);
                         self.fund(1 + count);
                         said.push_str(&format!(
@@ -1133,7 +1231,7 @@ impl ImageTask {
         .map_err(|e| kernel_error(format!("image `{name}`: hello to the personality: {e:?}")))?;
         // The 2.0 handshake rejects the old unaccounted 1.x wire layouts before
         // any run_plane request is sent. Every 2.0 method is available at minor 0.
-        let (account, kept, limit) = self.carve(ceiling, false)?;
+        let (account, kept, limit) = self.carve(ceiling, false, ctx.instance)?;
         let mut body = Encoder::new();
         let plane_arg = LinuxPlane {
             root: self
@@ -1185,7 +1283,12 @@ impl ImageTask {
 
     /// The task's account, carved out of the engine's (SDD 30 f.11): the account, a read-only
     /// handle to it the stage keeps, and its limit.
-    fn carve(&self, ceiling: u64, native: bool) -> Result<(Account, Account, u64)> {
+    fn carve(
+        &self,
+        ceiling: u64,
+        native: bool,
+        instance: usize,
+    ) -> Result<(Account, Account, u64)> {
         let name = &self.name;
         let room = Usage::own()
             .map_err(|e| {
@@ -1195,10 +1298,15 @@ impl ImageTask {
                 ))
             })?
             .room();
-        let limit = match *lock(&self.measured) {
-            Some((_, account)) => layout::measured_task_limit(account, room),
-            None if native => layout::native_task_limit(ceiling, room),
-            None => layout::task_limit(ceiling, room),
+        // A task started again after it passed its room has the larger account it was given
+        // (system design 3A); else a measured task's, else the share's.
+        let restarted = lock(&self.restarted).get(&instance).copied();
+        let limit = match (restarted, *lock(&self.measured)) {
+            (Some(account), _) | (None, Some((_, account))) => {
+                layout::measured_task_limit(account, room)
+            }
+            (None, None) if native => layout::native_task_limit(ceiling, room),
+            (None, None) => layout::task_limit(ceiling, room),
         };
         let limit = limit.ok_or_else(|| {
             kernel_error(format!(
@@ -1247,7 +1355,7 @@ impl ImageTask {
         };
         let resource =
             process_resource().map_err(|e| kernel_error(format!("image `{name}`: {e}")))?;
-        let (account, kept, limit) = self.carve(ceiling, true)?;
+        let (account, kept, limit) = self.carve(ceiling, true, ctx.instance)?;
         let process =
             moruna_svc::Process::create_in(resource, &layout::account_name(name), &account.0)
                 .map_err(|e| fail("making its process", e))?;
@@ -1335,6 +1443,7 @@ impl ImageTask {
             instance: ctx.instance,
             cpu: self.cpu_of(ctx.instance),
             recorded: false,
+            torn: false,
             timed: [0; 6],
         }
     }
@@ -1419,12 +1528,83 @@ pub struct TaskState {
     cpu: Option<u32>,
     /// Its figures are in the stage's ([`TaskState::record`]).
     recorded: bool,
+    /// Its end has run ([`TaskState::teardown`]): a task started again is torn down before its
+    /// drop.
+    torn: bool,
     /// This task's share of the stage's [`Feeder`] times, in nanoseconds, added at its end.
     timed: [u64; 6],
 }
 
 impl Drop for TaskState {
     fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+impl TaskState {
+    /// Whether the task passed its room (system design 3A): its process ended, and its account
+    /// counted a charge it refused (ABI 2.10), never guessed from how it ended. The account's
+    /// figures then.
+    fn passed_room(&self) -> Option<Usage> {
+        self.ended.as_ref()?;
+        match self.memory.usage() {
+            Some(Ok(usage)) if usage.refused > 0 => Some(usage),
+            _ => None,
+        }
+    }
+
+    /// The batches posted to the task and not answered, oldest first, landed in the run's arena
+    /// from the records the engine kept (system design 3A): the one whose answer was being taken,
+    /// then those in flight. The parts of an answer being taken are let go: its batch is posted
+    /// again whole.
+    fn unanswered(&mut self) -> Result<Vec<moruna_kernel::arrow::record_batch::RecordBatch>> {
+        let ids: Vec<BatchId> = self
+            .taking
+            .take()
+            .map(|taking| taking.offered)
+            .into_iter()
+            .chain(self.in_flight.drain(..))
+            .collect();
+        ids.into_iter().map(|id| self.land_input(id)).collect()
+    }
+
+    /// An input record the engine holds, copied into the run's arena, and let go.
+    fn land_input(
+        &mut self,
+        id: BatchId,
+    ) -> Result<moruna_kernel::arrow::record_batch::RecordBatch> {
+        let (view, offset, len) = self.plane.batch_view(id).ok_or_else(|| {
+            kernel_error(format!(
+                "image `{}`: a batch posted to its task whose record the engine does not hold",
+                self.name
+            ))
+        })?;
+        let ptr = moruna_plane::ringed::View::base(&*view) + offset as usize;
+        // SAFETY: the record lies at `offset` of the engine's mapping `view`, which the decoded
+        // batch keeps; the engine holds the record, so nothing writes it (DP-I4) until the hold
+        // is dropped below, after the landing copy.
+        #[allow(unsafe_code)]
+        let batch = unsafe { rings::record_over(view, ptr, len) }?;
+        let landed = moruna_adapters::land::land_table(batch, &self.alloc)?;
+        self.plane
+            .drop_batch(id)
+            .map_err(|e| plane_error(&self.name, "the engine's hold", e))?;
+        match landed.0 {
+            Payload::Table(batch, _) => Ok(batch),
+            _ => Err(kernel_error(format!(
+                "image `{}`: a batch posted to its task is not a table",
+                self.name
+            ))),
+        }
+    }
+
+    /// The task's end, once: its figures recorded, its process ended and its account retired.
+    /// Its drop, and a restart before it, come here (system design 3A).
+    fn teardown(&mut self) {
+        if self.torn {
+            return;
+        }
+        self.torn = true;
         // A task retired before its stage's end is still in the report.
         self.record();
         // Read an already-available ORIGINAL terminal reply, never manufacture one
@@ -1804,10 +1984,15 @@ impl TaskState {
         // the task's region.
         self.copied += body;
         self.alloc.note_boundary_copy(body);
-        // The task's share keeps it until the task releases it or ends.
-        self.plane
-            .drop_batch(id)
-            .map_err(|e| plane_error(&self.name, "the engine's hold", e))?;
+        // The task's share keeps it until the task releases it or ends. In ring mode the engine
+        // keeps its own hold until it has taken the batch's answer, so that a task that passed
+        // its room can be given it again (system design 3A): the region holds the next piece
+        // beside every record kept ([`layout::room_for_next`]).
+        if !self.rings {
+            self.plane
+                .drop_batch(id)
+                .map_err(|e| plane_error(&self.name, "the engine's hold", e))?;
+        }
         Ok((len, id))
     }
 
@@ -2354,6 +2539,12 @@ impl TaskState {
                 return Err(e);
             }
         };
+        // Its answer taken, the engine lets the batch's record go (ring mode).
+        if self.rings {
+            self.plane
+                .drop_batch(taking.offered)
+                .map_err(|e| plane_error(&self.name, "the engine's hold", e))?;
+        }
         self.count_busy(!self.in_flight.is_empty());
         if let (None, Payload::Table(batch, _)) = (&self.schema, &answer) {
             let schema = batch.schema();

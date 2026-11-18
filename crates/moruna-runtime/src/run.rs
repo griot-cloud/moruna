@@ -737,7 +737,8 @@ fn drive(
                 };
                 let stage = stages[at];
                 let name = stage.fund(sized.instances);
-                stage.size_measured(sized.piece, sized.account);
+                let margin = facts[at].as_ref().map_or(0.0, moruna_cost::Memory::margin);
+                stage.size_measured(sized.piece, sized.account, margin);
                 notes.extend(moruna_adapters::instances::short_note(
                     &name,
                     sized.instances,

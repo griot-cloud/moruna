@@ -119,6 +119,27 @@ pub struct Line {
     pub input_bytes_max: u64,
 }
 
+/// Whether a ring task's region has room for the next piece beside `outstanding` records the
+/// engine still holds (6.3g's restart): the engine keeps each input record until it has taken
+/// its answer, so that a task that passed its room can be given them again. A region is
+/// [`IN_FLIGHT`] pieces and one more ([`ring_sizes`]), and the engine never posts past
+/// [`IN_FLIGHT`] outstanding ([`to_post`]), so the region never fills only because it holds
+/// records (PM, 2026-11-18).
+pub fn room_for_next(outstanding: u64, sizes: &RingSizes) -> bool {
+    outstanding.saturating_add(1).saturating_mul(sizes.piece) <= sizes.region
+}
+
+/// The account a task that passed its room is started again with (system design 3A; PM,
+/// 2026-11-18): the larger of twice the one it had and what its refusal says it needed, its
+/// account's peak and the largest charge refused, widened by the measurement's `margin`, so one
+/// restart reaches the need the refusal named; as far as the engine's `room` allows a task's
+/// account beside the engine's own half ([`measured_task_limit`]). `None` when that is no
+/// larger, and the stage then fails as it did.
+pub fn restarted_limit(limit: u64, needed: u64, margin: f64, room: u64) -> Option<u64> {
+    let needed = ((needed as f64) * (1.0 + margin.max(0.0))).ceil() as u64;
+    measured_task_limit(limit.saturating_mul(2).max(needed), room).filter(|&grown| grown > limit)
+}
+
 /// The pieces a stage's first task warms up on, the smallest first (system design 3A; PM,
 /// 2026-11-18): one at a time, each answer's account peak read against the bytes laid out. In
 /// ascending order the peak, the account's high-water mark, is the last piece's.
@@ -1107,6 +1128,70 @@ mod tests {
         assert_eq!(task_cpu(8, 8), 1, "more tasks than CPUs go round again");
         assert_eq!(task_cpu(0, 1), 0);
         assert_eq!(task_cpu(3, 0), 0, "no CPU count: the first");
+    }
+
+    #[test]
+    fn a_region_holds_the_next_piece_beside_every_record_the_engine_keeps() {
+        for budget in [
+            RING_MIN,
+            4 << 20,
+            16 << 20,
+            64 << 20,
+            256 << 20,
+            1 << 30,
+            u64::MAX,
+        ] {
+            let sizes = ring_sizes(budget);
+            for outstanding in 0..=IN_FLIGHT {
+                assert!(
+                    room_for_next(outstanding, &sizes),
+                    "a plane of {budget} bytes, {outstanding} records kept: {sizes:?}"
+                );
+            }
+            assert!(
+                !room_for_next(IN_FLIGHT + 1, &sizes),
+                "and no more than that"
+            );
+        }
+        // The engine never posts past IN_FLIGHT outstanding, whatever it has queued.
+        for outstanding in 0..=IN_FLIGHT as usize {
+            for queued in 0..8 {
+                assert!(outstanding + to_post(outstanding, queued) <= IN_FLIGHT as usize);
+            }
+        }
+    }
+
+    #[test]
+    fn a_task_that_passed_its_room_is_started_again_with_twice_it_or_its_need() {
+        const MIB: u64 = 1 << 20;
+        // A refusal that names less than twice the account: twice it.
+        assert_eq!(
+            restarted_limit(16 * MIB, 20 * MIB, 0.0, 1024 * MIB),
+            Some(32 * MIB)
+        );
+        // gate-grows on the booted check (6.3g turn 2): an account of 9347072 bytes, its peak
+        // 2561184 and a charge of 42107136 refused. Doubling took three restarts, to 74776576
+        // bytes; the need the refusal names takes one, to enough for it.
+        let (limit, peak, refused) = (9_347_072, 2_561_184, 42_107_136);
+        let grown = restarted_limit(limit, peak + refused, 0.02, 1024 * MIB).expect("grown");
+        assert!(grown >= peak + refused && grown > 2 * limit, "{grown}");
+        assert_eq!(grown % PAGE, 0, "in whole pages");
+        assert!(
+            grown < 2 * (peak + refused),
+            "not past what the margin asks"
+        );
+        // As far as half the engine's room.
+        assert_eq!(
+            restarted_limit(300 * MIB, 0, 0.0, 1024 * MIB),
+            Some(512 * MIB)
+        );
+        assert_eq!(
+            restarted_limit(limit, peak + refused, 0.0, 64 * MIB),
+            Some(32 * MIB)
+        );
+        // No larger: none, and the stage fails as it did.
+        assert_eq!(restarted_limit(512 * MIB, 600 * MIB, 0.0, 1024 * MIB), None);
+        assert_eq!(restarted_limit(16 * MIB, 0, 0.0, 0), None);
     }
 
     #[test]

@@ -95,6 +95,28 @@ pub unsafe fn payload_over<M: Send + Sync + std::panic::RefUnwindSafe + 'static>
     Ok(unsafe { Payload::table_in(batch, tier) })
 }
 
+/// A record the engine holds in a task's region, decoded over its bytes (6.3g's restart): a
+/// view, not a copy, which `mapping` keeps; the caller lands it before it lets the record go.
+///
+/// # Safety
+///
+/// As [`payload_over`]: the bytes at `ptr` are mapped for `len` bytes and unwritten for as long
+/// as `mapping` lives.
+#[allow(unsafe_code)]
+pub unsafe fn record_over<M: Send + Sync + std::panic::RefUnwindSafe + 'static>(
+    mapping: M,
+    ptr: usize,
+    len: u64,
+) -> Result<moruna_kernel::arrow::record_batch::RecordBatch> {
+    let at = NonNull::new(ptr as *mut u8)
+        .ok_or_else(|| kernel_error("a record mapped at address 0".to_string()))?;
+    // SAFETY: the caller's contract: the bytes are mapped and unwritten for as long as `mapping`
+    // lives, which every buffer over them keeps.
+    let buffer =
+        unsafe { ArrowBuffer::from_custom_allocation(at, len as usize, Arc::new(mapping)) };
+    moruna_kernel::ipc::decode(buffer, crate::layout::PAGE as usize)
+}
+
 /// Lays a record out at `at` of `view`: its framing, then each body buffer at its offset,
 /// the gaps zero ([`crate::layout::pieces`]). The bytes of the body it copied.
 pub fn write_record<V: View>(

@@ -220,11 +220,12 @@ impl Packaged {
     }
 
     /// Each of the stage's tasks sized from the node's readings of its function (system design
-    /// 3A): a plane for pieces of `piece` bytes and an account of `account` bytes.
+    /// 3A): a plane for pieces of `piece` bytes and an account of `account` bytes, with the
+    /// readings' `margin`.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    pub(crate) fn size_measured(&self, piece: u64, account: u64) {
+    pub(crate) fn size_measured(&self, piece: u64, account: u64, margin: f64) {
         if let Packaged::Task(k) = self {
-            k.size_measured(piece, account);
+            k.size_measured(piece, account, margin);
         }
     }
 
