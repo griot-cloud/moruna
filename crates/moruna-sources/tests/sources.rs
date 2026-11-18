@@ -2213,3 +2213,171 @@ fn so_t48_the_parts_of_a_group_are_its_rows() {
         );
     }
 }
+
+/// Polls every future in turn until all are done, as the drive polls its reads in flight.
+fn poll_all<T>(mut futures: Vec<moruna_kernel::BoxFuture<'_, T>>) -> Vec<T> {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut out: Vec<Option<T>> = futures.iter().map(|_| None).collect();
+    while out.iter().any(Option::is_none) {
+        for (i, future) in futures.iter_mut().enumerate() {
+            if out[i].is_none()
+                && let std::task::Poll::Ready(v) = future.as_mut().poll(&mut cx)
+            {
+                out[i] = Some(v);
+            }
+        }
+        if out.iter().any(Option::is_none) {
+            std::thread::park_timeout(std::time::Duration::from_millis(5));
+        }
+    }
+    out.into_iter().map(|v| v.expect("done")).collect()
+}
+
+/// A source over one generated object, read through a fake reactor with a latency.
+fn object_source(
+    name: &str,
+    rows: u64,
+    group_rows: u64,
+) -> (ParquetSource, FakeReactor, Arc<dyn Allocator>) {
+    let dir = scratch();
+    let file = write_parquet(&dir, name, rows, group_rows, 0);
+    let alloc: Arc<dyn Allocator> = Arc::new(FakeAllocator::new());
+    let url = format!("s3://bucket/{name}.parquet");
+    let reactor = FakeReactor::new()
+        .with_latency(std::time::Duration::from_millis(40))
+        .with_file(&url, std::fs::read(&file.path).expect("the fixture"));
+    let source = ParquetSource::with_allocator(
+        ParquetSourceConfig {
+            urls: vec![url],
+            ..ParquetSourceConfig::default()
+        },
+        Arc::new(reactor.clone()) as Arc<dyn Reactor>,
+        Arc::new(reactor.clone()) as Arc<dyn ObjectMetadata>,
+        alloc.clone(),
+    )
+    .expect("a source over the object");
+    (source, reactor, alloc)
+}
+
+// 6.3t: the fetches of reads in flight together are in flight together. The drive polls each
+// of its reads in turn; a fetch that waited on its requests before returning held every other
+// read back, so a node read a year from Blob one row group at a time (6.2 runs 3 and 5).
+#[test]
+fn so_t50_two_groups_are_fetched_at_once() {
+    let (source, reactor, alloc) = object_source("t50-two", 200, 100);
+    let plan = source.plan().expect("the plan");
+    assert_eq!(plan.len(), 2, "two row groups");
+    let before = reactor.ops().len();
+    let reads = poll_all(
+        plan.iter()
+            .map(|split| source.read(split, None, alloc.as_ref(), Tier::Host))
+            .collect(),
+    );
+    let rows: u64 = reads.into_iter().map(|r| r.expect("read").rows()).sum();
+    assert_eq!(rows, 200);
+    let gets: Vec<_> = reactor.ops()[before..]
+        .iter()
+        .filter(|op| op.kind == OpKind::ReadObject)
+        .cloned()
+        .collect();
+    assert_eq!(gets.len(), 2, "one request a group");
+    let first_back = gets[0].t_resolve.expect("resolved");
+    assert!(
+        gets[1].t_submit < first_back,
+        "the second group's request went out before the first came back: {:?}",
+        gets.iter()
+            .map(|g| (g.t_submit, g.t_resolve))
+            .collect::<Vec<_>>()
+    );
+}
+
+// 6.3t: the ranges of one group read together share one fetch of its columns: a range whose
+// group another range is fetching waits for that fetch instead of starting a second one.
+#[test]
+fn so_t51_the_ranges_of_a_group_share_one_fetch() {
+    let (source, reactor, alloc) = object_source("t51-ranges", 100, 100);
+    let plan = source.plan().expect("the plan");
+    let split = &plan[0];
+    let before = reactor.ops().len();
+    let ranges = [
+        RowRange { start: 0, end: 30 },
+        RowRange { start: 30, end: 60 },
+        RowRange {
+            start: 60,
+            end: 100,
+        },
+    ];
+    let reads = poll_all(
+        ranges
+            .iter()
+            .map(|r| source.read(split, Some(*r), alloc.as_ref(), Tier::Host))
+            .collect(),
+    );
+    let rows: Vec<u64> = reads.into_iter().map(|r| r.expect("read").rows()).collect();
+    assert_eq!(rows, vec![30, 30, 40]);
+    let gets = reactor.ops()[before..]
+        .iter()
+        .filter(|op| op.kind == OpKind::ReadObject)
+        .count();
+    assert_eq!(gets, 1, "one fetch of the group for its three ranges");
+    assert_eq!(source.stats().group_fetches, 1);
+    // The final range let the source's hold go: another read of the group fetches it again.
+    block_on(source.read(
+        split,
+        Some(RowRange { start: 0, end: 10 }),
+        alloc.as_ref(),
+        Tier::Host,
+    ))
+    .expect("again");
+    assert_eq!(source.stats().group_fetches, 2);
+}
+
+// 6.3t: a read dropped while it fetches its group (a cancelled run) lets the group's other
+// ranges fetch it themselves; none waits for a fetch that will not come.
+#[test]
+fn so_t52_a_dropped_fetch_leaves_no_range_waiting() {
+    let (source, _reactor, alloc) = object_source("t52-drop", 100, 100);
+    let plan = source.plan().expect("the plan");
+    let split = &plan[0];
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut first = source.read(
+        split,
+        Some(RowRange { start: 0, end: 50 }),
+        alloc.as_ref(),
+        Tier::Host,
+    );
+    assert!(
+        first.as_mut().poll(&mut cx).is_pending(),
+        "the first range is fetching"
+    );
+    let mut second = source.read(
+        split,
+        Some(RowRange {
+            start: 50,
+            end: 100,
+        }),
+        alloc.as_ref(),
+        Tier::Host,
+    );
+    assert!(
+        second.as_mut().poll(&mut cx).is_pending(),
+        "the second waits for it"
+    );
+    drop(first);
+    let payload = block_on(second).expect("the second fetches the group itself");
+    assert_eq!(payload.rows(), 50);
+}

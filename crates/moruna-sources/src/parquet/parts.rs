@@ -12,7 +12,7 @@
 //! decode, into arena buffers of that part's read (`Kept`): admission sees them as bytes that
 //! read has taken (6.3c), and they are freed when the last part holding them has decoded, since
 //! every part's fetch holds the group's `GroupDecode` and the source lets go of it with the
-//! group's last fetch (`ParquetSource::fetched_last`). Every part's column readers take the kept
+//! group's fetch (`ParquetSource::claim_fetch`). Every part's column readers take the kept
 //! page in place of the file's (`WithKeptDictionary`), so the parts stay independent: any worker
 //! decodes any part, in any order, several at once. What a part still does for itself is decode
 //! the kept page into its column reader's dictionary (`set_dict`, a copy of the dictionary's
