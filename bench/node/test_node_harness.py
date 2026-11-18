@@ -446,6 +446,7 @@ def test_real_mode_needs_its_inputs(tmp_path):
 # --- The whole run, against fakes --------------------------------------------------------------
 
 PIN = "ab" * 32
+WHEEL_SHA = "6f" * 32
 CONSOLE_URI = ("https://mrnb202611180900.blob.core.windows.net/bootdiagnostics-morunanod-0b1c/"
                "moruna-node.0b1c.serialconsole.log")
 
@@ -553,7 +554,8 @@ class Fake(run.DryRun):
             return "normalized rows 41169720\nDATA " + json.dumps(rec)
         if st["id"] == "setup":
             return "SETUP " + json.dumps({"installed": {"duckdb": True}, "wheel_066": self.wheel, "wheel_066_s": 1800,
-                                          "wheel_066_name": "moruna-0.6.6-cp314-cp314t-linux_x86_64.whl"})
+                                          "wheel_066_name": "moruna-0.6.6-cp314-cp314t-linux_x86_64.whl",
+                                          "wheel_066_sha256": WHEEL_SHA})
         if "measure.py run" in text:
             assert st["env"]["BENCH_ACCOUNT"] == "mrnb202611180900" and st["secrets"] == ["BENCH_KEY"]
             rid = text.split("--id ")[1].split()[0]
@@ -709,6 +711,13 @@ def test_a_whole_run_against_fakes(tmp_path):
     assert "**PASS** no regression" in log and "**PASS** the bar: 1.50x" in log
     assert "#### Miss" not in log
     assert json.load(open(tmp_path / "setup.json"))["wheel_066"] == "built"
+    # Which 0.6.6 ran: the wheel's source and SHA-256, in summary.json, table.md and the log's table.
+    wheel = {"source": "built", "name": "moruna-0.6.6-cp314-cp314t-linux_x86_64.whl", "sha256": WHEEL_SHA,
+             "seconds": 1800}
+    assert json.load(open(tmp_path / "summary.json"))["wheel_066"] == wheel == x.summary["wheel_066"]
+    line = ("0.6.6's wheel: built on the Linux machine, in 1800 s outside every timing: "
+            f"`moruna-0.6.6-cp314-cp314t-linux_x86_64.whl`, sha256 {WHEEL_SHA}.")
+    assert table_text.startswith(line + "\n") and log.count(line) == 1
     # Three batches on the Linux machine, each started once; the node's outputs checked in the last,
     # after every Linux run, and its records then carry the verdict.
     assert x.started == ["setup", "runs", "checks"]
@@ -728,6 +737,27 @@ def test_a_wheel_from_pypi_or_given_is_not_kept_again(tmp_path):
     x = Fake(str(tmp_path), wheel="pypi")
     run.Bench(nyc_plan(), x, azure.Cloud("202611180900"), args, str(tmp_path), "/s").go()
     assert not any("blob download -c code" in a for a in x.azs)
+    assert open(tmp_path / "table.md").read().startswith("0.6.6's wheel: PyPI's release, in 1800 s")
+
+
+def test_the_table_names_the_wheel_066_it_ran(tmp_path):
+    """The wheel's source and SHA-256 from setup.json, in summary.json and at the table's head
+    (also under --table while the plan runs); no line before the setup has ended."""
+    assert run.wheel_066(str(tmp_path)) is None
+    (tmp_path / "setup.json").write_text("not json")
+    assert run.wheel_066(str(tmp_path)) is None
+    (tmp_path / "setup.json").write_text(json.dumps({"installed": {}}))
+    assert run.wheel_066(str(tmp_path)) is None
+    (tmp_path / "setup.json").write_text(json.dumps({"wheel_066": "container", "wheel_066_name": "w.whl",
+                                                     "wheel_066_sha256": WHEEL_SHA, "wheel_066_s": 2}))
+    assert run.wheel_066(str(tmp_path)) == {"source": "container", "name": "w.whl", "sha256": WHEEL_SHA, "seconds": 2}
+    out = io.StringIO()
+    assert run.main(["--plan", "nyc-2024", "--table", str(tmp_path)], out=out) == 0
+    assert (f"0.6.6's wheel: given with --wheel066, in 2 s outside every timing: `w.whl`, sha256 {WHEEL_SHA}."
+            in out.getvalue())
+    assert json.load(open(tmp_path / "summary.json"))["wheel_066"]["sha256"] == WHEEL_SHA
+    assert table.wheel_line({"source": "odd"}) == "0.6.6's wheel: odd: `name not recorded`, sha256 not recorded."
+    assert "0.6.6's wheel" not in table.render(summary_of([rec("duckdb", 1, 3.5)]))
 
 
 def test_each_run_lands_as_it_finishes_and_the_table_reads_them_so_far(tmp_path):

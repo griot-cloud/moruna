@@ -945,14 +945,11 @@ class Bench:
             node_image = f"{self.a.vhd} ({image['bytes']} bytes, sha256 {image['sha256']})"
         made = ("uploaded from this machine" if self.from_mac else
                 f"made in Azure from {self.plan['dataset'].get('source_url')}, each file the plan's SHA-256")
-        wheel = setup.get("wheel_066")
-        if setup.get("wheel_066_name"):
-            wheel = f"{wheel}, {setup['wheel_066_name']} (sha256 {setup.get('wheel_066_sha256')})"
+        # 0.6.6's wheel (source, name, SHA-256) is in the table itself (summary.json, table.md).
         return {"date": self.c.stamp, "commit": commit, "node_image": node_image,
                 "machines": f"{self.c.size}, zone {self.c.zone}, {self.c.location}, subscription {self.c.subscription}",
                 "linux_image": setup.get("linux_image"),
-                "data": f"read and written in Blob container `data`, {made}; 0.6.6's wheel {wheel} "
-                        f"in {setup.get('wheel_066_s')} s, outside every timing",
+                "data": f"read and written in Blob container `data`, {made}",
                 "results": os.path.relpath(self.results, REPO)}
 
     # 5. Tear down ----------------------------------------------------------------------------------
@@ -1019,6 +1016,9 @@ def finish(plan, results, meta, log=LOG):
     """The summary, the table and the run's log entry (none when `log` is None), from the records
     under `results`."""
     summary = collect.summarise(collect.load(results), plan)
+    wheel = wheel_066(results)
+    if wheel:
+        summary["wheel_066"] = wheel
     collect.write(results, summary)
     open(os.path.join(results, "table.md"), "w").write(table.render(summary) + "\n")
     if log:
@@ -1026,6 +1026,21 @@ def finish(plan, results, meta, log=LOG):
                            for m in rootcause.misses(summary))
         table.append(log, table.entry(summary, meta, misses))
     return summary
+
+
+def wheel_066(results):
+    """0.6.6's wheel as the Linux machine's setup recorded it (`setup.json`): where it came from
+    (`container`: given with --wheel066; `pypi`; `built` on the machine), its name, its SHA-256 and
+    the seconds it took. None before the setup has ended."""
+    try:
+        with open(os.path.join(results, "setup.json")) as f:
+            setup = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(setup, dict) or not setup.get("wheel_066"):
+        return None
+    return {"source": setup["wheel_066"], "name": setup.get("wheel_066_name"),
+            "sha256": setup.get("wheel_066_sha256"), "seconds": setup.get("wheel_066_s")}
 
 
 def local(plan, args, out=sys.stdout, python=sys.executable):
