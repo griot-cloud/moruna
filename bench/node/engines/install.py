@@ -17,8 +17,9 @@ Packages are not pinned, as bench/vm's were not: each run records its engine's v
 engine's Blob reader comes with it (store.py), installed here, outside every timing: Dask's adlfs,
 DuckDB's `azure` extension (into ROOT/duckdb-ext), and Spark's hadoop-azure, the version of the
 Hadoop its pyspark carries, resolved into ROOT/ivy (that needs the JVM).
-0.6.6 is not on PyPI, so `--moruna066` names its wheel, or a source tree (a `git archive` of the
-0.6.6 commit) that is built into one with `uv build`. Builds run `cargo` with `--jobs` jobs.
+`--moruna066` names 0.6.6's wheel (setup-linux.sh's: given, from PyPI once 0.6.6 is released there,
+or built), or a source tree (a `git archive` of the 0.6.6 commit) that is built into one with
+`uv build`. Builds run `cargo` with `--jobs` jobs.
 
     install.py --root DIR --gate-src images/gate [--moruna066 WHEEL_OR_TREE] [--engines a,b]
 

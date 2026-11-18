@@ -11,7 +11,23 @@
    "yellow_tripdata_2024-07.parquet", "yellow_tripdata_2024-08.parquet", "yellow_tripdata_2024-09.parquet",
    "yellow_tripdata_2024-10.parquet", "yellow_tripdata_2024-11.parquet", "yellow_tripdata_2024-12.parquet"
   ],
-  "rows": 41169720
+  "rows": 41169720,
+  "source_url": "https://d37ci6vzurychx.cloudfront.net/trip-data/{file}",
+  "pyarrow": "24.0.0",
+  "sha256": {
+   "yellow_tripdata_2024-01.parquet": "6a19429d80c91ae8e059066ede6fe1f0041dd6cd186dc8f0446430d5407ff690",
+   "yellow_tripdata_2024-02.parquet": "9917c400d40bcbce2bad675c51aba1180062097d7ebd76fe321c2f0c6c18ae2f",
+   "yellow_tripdata_2024-03.parquet": "8c4b876adac6f9541533068438be7c2bc406641fb4017c08d7036fff14f0b002",
+   "yellow_tripdata_2024-04.parquet": "108e0b0c775cc74646b0abf5378021e02feabf84a78fb27465f756714722d2d0",
+   "yellow_tripdata_2024-05.parquet": "f2abde0407792cfd9dd8d97cee9f865ed8797d55928aff004e4629211779f6b3",
+   "yellow_tripdata_2024-06.parquet": "947e8e24c9dccf08a2dc9245147ef7ef3a4a122e074c62e186eb7a44504f1053",
+   "yellow_tripdata_2024-07.parquet": "6d005bd254f722f40d9520b03745856291cfdd97e1bfe26b4af6e21b935fab10",
+   "yellow_tripdata_2024-08.parquet": "229dde54c0a8122f3a60ceafc7369280ce5a17a92c15b7f2c447ff7cf2634d6e",
+   "yellow_tripdata_2024-09.parquet": "45a0bd291eb19133c311771ec2fb618cc834d7ab1ff6feb28504eca398847b24",
+   "yellow_tripdata_2024-10.parquet": "f6f750585c954621b38a6a550ab666bbba5f75f091102a165903016b6d708079",
+   "yellow_tripdata_2024-11.parquet": "42ea1301f3264e53f9f97a595906cae0df709311609d2bb699ecf01ca8b757f9",
+   "yellow_tripdata_2024-12.parquet": "4597a469f783c5670ffc9c8ed22d1557f8fcafa9a100db366cd7d438bbc79116"
+  }
  },
  "jobs": ["score", "occupancy", "enrich", "audit"],
  "engines": ["moruna-node", "moruna066", "moruna066-rust", "rust-pool", "duckdb", "duckdb-sql", "polars", "polars-expr",

@@ -18,6 +18,10 @@ from the node).
 **Data** (`linux_data`): `blob`, every engine reads its inputs (`inputs`, blob names under
 `nyc/`) from and writes its output (`output`, under `out/<run id>`) to the run's one container,
 with its own Blob reader (store.py); `local` (the Mac's check with no emulator) reads local files.
+The dataset's `source_url`, `sha256` and `pyarrow` let the Linux machine make the container's
+copies itself (work item 6.2b): each file fetched from `source_url` (`{file}` its name),
+normalised by bench/vm/normalize.py with that pyarrow, and checked against its SHA-256, the Mac's
+copy's in `source_dir`.
 
 The native-expression rows run only the jobs that have a native form (bench/vm/native_exprs.py):
 DuckDB SQL for Enrich and Occupancy, Polars expressions for Enrich.
@@ -44,7 +48,10 @@ ENGINES = {
 REFERENCE = "moruna066"
 FIELDS = {"plan", "name", "dataset", "jobs", "engines", "repeats", "learning_run", "noise_pairs", "machine",
           "linux_data", "timeout_s", "notes"}
-DATASET = {"name", "source_dir", "files", "rows"}
+DATASET = {"name", "source_dir", "files", "rows", "source_url", "sha256", "pyarrow"}
+# The data made in Azure (run.py, engines/dataprep.py) needs all three: where each file is fetched
+# from, the pyarrow that normalises it as the Mac's copies were, and each copy's SHA-256.
+MADE_IN_AZURE = ("source_url", "sha256", "pyarrow")
 MACHINE = {"size", "zone", "cpus", "mem_gib", "image", "os_disk_gib"}
 LINUX_DATA = ("blob", "local")
 
@@ -81,6 +88,20 @@ def check(plan: dict) -> dict:
         raise PlanError("dataset.files: one or more Parquet file names, without a directory")
     if len(set(files)) != len(files):
         raise PlanError("dataset.files: a file is named twice")
+    d = plan["dataset"]
+    if any(k in d for k in MADE_IN_AZURE):
+        if not all(k in d for k in MADE_IN_AZURE):
+            raise PlanError(f"dataset: {', '.join(MADE_IN_AZURE)} go together")
+        if not isinstance(d["source_url"], str) or "{file}" not in d["source_url"] \
+                or not d["source_url"].startswith("https://"):
+            raise PlanError("dataset.source_url: an https address with `{file}` where each file's name goes")
+        digests = d["sha256"]
+        if not isinstance(digests, dict) or set(digests) != set(files) or not all(
+                isinstance(v, str) and len(v) == 64 and all(ch in "0123456789abcdef" for ch in v)
+                for v in digests.values()):
+            raise PlanError("dataset.sha256: each file's SHA-256, 64 lowercase hex digits, for every file and no other")
+        if not isinstance(d["pyarrow"], str) or not d["pyarrow"]:
+            raise PlanError("dataset.pyarrow: the version that wrote the copies, such as 24.0.0")
     for key, known in (("jobs", JOBS), ("engines", tuple(ENGINES))):
         vals = plan[key]
         if not vals or not isinstance(vals, list):

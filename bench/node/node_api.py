@@ -118,6 +118,45 @@ def console(text: str) -> dict:
     return out
 
 
+def health(host: str, port: int = 443, timeout: float = 5.0):
+    """The status of GET /v1/health (no token: the node's readiness, as azure-up.sh step 7 asks it
+    with `curl -k`), any certificate taken, or None when nothing answers. It decides nothing about
+    trust: the pin is checked apart (served_pin) and on every call after (Https)."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    conn = http.client.HTTPSConnection(host, port, context=ctx, timeout=timeout)
+    try:
+        conn.request("GET", "/v1/health")
+        return conn.getresponse().status
+    except (OSError, http.client.HTTPException):
+        return None
+    finally:
+        conn.close()
+
+
+def served_pin(host: str, port: int = 443, openssl: str = OPENSSL, timeout: float = 30.0) -> str:
+    """The SHA-256 of the certificate the node serves, read as azure-up.sh reads it (1E):
+    `openssl s_client` | `openssl x509 -outform DER` | `openssl dgst -sha256 -r`. "" when none."""
+    s_client = subprocess.Popen([openssl, "s_client", "-connect", f"{host}:{port}"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    x509 = subprocess.Popen([openssl, "x509", "-outform", "DER"], stdin=s_client.stdout, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL)
+    s_client.stdout.close()
+    try:
+        der, _ = x509.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        for p in (s_client, x509):
+            p.kill()
+        return ""
+    finally:
+        s_client.wait()
+    if x509.returncode != 0 or not der:
+        return ""
+    p = subprocess.run([openssl, "dgst", "-sha256", "-r"], input=der, capture_output=True, timeout=timeout)
+    return p.stdout.decode().split()[0].lower() if p.returncode == 0 and p.stdout.strip() else ""
+
+
 class Https:
     """The real transport: HTTPS to the node, its certificate pinned."""
 

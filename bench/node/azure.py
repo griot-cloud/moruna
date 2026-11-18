@@ -11,12 +11,15 @@ type, accelerated networking off, boot diagnostics into the run's account from t
 power-on, so it is never restarted, node config as user-data), made with `--no-wait`.
 
 The Linux machine for the other engines is the node's size in the node's zone, with the same
-network settings; it has no inbound rule at all and is driven only through `az vm run-command`.
+network settings; it has no inbound rule at all and is driven only through `az vm run-command`,
+each of which starts a detached batch (engines/batch.py) and returns, so none nears Azure's 90
+minutes; the batches report through the run's `results` container.
 Both machines have a public address, since a new virtual network gives a machine no outbound
 access without one, and the Linux machine installs its engines from the internet.
 """
 import dataclasses
 import shlex
+import urllib.parse
 
 SUBSCRIPTION = "griot-dev"
 LOCATION = "centralindia"
@@ -80,6 +83,11 @@ def upload(c: Cloud, key: str, container: str, name: str, path: str, page=False)
     return blob(c, key, "blob", "upload", "-c", container, "-n", name, "-f", path, *kind, "-o", "none")
 
 
+def blob_download(c: Cloud, key: str, container: str, name: str, path: str):
+    """One blob of the run's account into the file `path` on this machine."""
+    return blob(c, key, "blob", "download", "-c", container, "-n", name, "-f", path, "-o", "none")
+
+
 def sas(c: Cloud, key: str, container: str, permissions: str, expiry: str):
     """A container SAS: made from the key on this machine, no call to Azure."""
     return blob(c, key, "container", "generate-sas", "-n", container, "--permissions", permissions,
@@ -131,7 +139,30 @@ def node_vm(c: Cloud, user_data: str):
 
 
 def boot_log(c: Cloud):
+    """The CLI's own read of the console: a fallback only. On 2026-11-18 it failed on every call
+    with the CLI's bug (`TypeError: unsupported operand type(s) for +=: 'int' and 'NoneType'`)."""
     return c.az("vm", "boot-diagnostics", "get-boot-log", "-n", NODE)
+
+
+def boot_log_uri(c: Cloud):
+    """Where the node's serial console is kept: a blob of the run's account (boot diagnostics into
+    it from the first power-on), read directly with the account's key (`console_blob`)."""
+    return c.az("vm", "boot-diagnostics", "get-boot-log-uris", "-n", NODE, "--query", "serialConsoleLogBlobUri",
+                "-o", "tsv")
+
+
+def console_blob(c: Cloud, uri: str):
+    """The (container, blob) of the console's `uri`, which must be in the run's account."""
+    parts = urllib.parse.urlsplit((uri or "").strip())
+    container, _, name = parts.path.lstrip("/").partition("/")
+    if parts.scheme != "https" or parts.hostname != f"{c.account}.blob.core.windows.net" or not (container and name):
+        raise ValueError(f"the console is not a blob of the run's account {c.account}: {uri!r}")
+    return container, urllib.parse.unquote(name)
+
+
+def node_vm_id(c: Cloud):
+    """The node machine's `vmId`: the instance its tokens name (1B's `moruna: cloud azure instance`)."""
+    return c.az("vm", "show", "-n", NODE, "--query", "vmId", "-o", "tsv")
 
 
 def linux_vm(c: Cloud, ssh_public_key: str):
