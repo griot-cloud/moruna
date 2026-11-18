@@ -160,6 +160,7 @@ mod proof {
                 plan: None,
                 secrets: Default::default(),
                 measured: Default::default(),
+                measured_by: Default::default(),
             },
         )?;
         fs::create_dir(&cfg.evidence_directory)?;

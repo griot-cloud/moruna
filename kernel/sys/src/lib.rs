@@ -446,6 +446,27 @@ impl Account {
     pub fn usage(&self) -> Result<Usage> {
         Usage::of(&self.0)
     }
+
+    /// The CPU time charged to it, in nanoseconds, kernel time included (`account_cpu`,
+    /// ABI 2.10): what the threads of every process charged to it, or to an account carved
+    /// out of it, have used since it was made, ended ones included. A thread's time is
+    /// charged as it leaves its CPU. `BadSyscall` from a kernel before ABI 2.10.
+    pub fn cpu(&self) -> Result<u64> {
+        cpu_of(&self.0)
+    }
+}
+
+/// The CPU time charged to the caller's own account, as [`Account::cpu`] gives an
+/// account's: the caller's process, every other charged to its account, and every
+/// account carved out of it.
+pub fn own_cpu() -> Result<u64> {
+    check(raw::account_cpu(0))
+}
+
+/// The CPU time charged to the account `handle` names: an account, or a process's, with
+/// `READ` ([`Account::cpu`]).
+pub fn cpu_of(handle: &Handle) -> Result<u64> {
+    check(raw::account_cpu(handle.raw()))
 }
 
 /// An account's figures (`account_info`), in bytes.
@@ -458,6 +479,13 @@ pub struct Usage {
     pub peak: u64,
     /// Held for the accounts carved out of it: the sum of their limits.
     pub reserved: u64,
+    /// The charges it refused since it was made (ABI 2.10): an object refused with
+    /// `QuotaExceeded`, or a page its process touched and could not pay for, which ended
+    /// the process. Its own: what an account carved out of it refused is counted there.
+    /// Zero from a kernel before 2.10.
+    pub refused: u64,
+    /// The largest request among them, in bytes (ABI 2.10).
+    pub refused_max: u64,
     name: [u8; limits::NAME_MAX],
 }
 
@@ -474,6 +502,8 @@ impl Usage {
             used: word(info::USED),
             peak: word(info::PEAK),
             reserved: word(info::RESERVED),
+            refused: word(info::REFUSED),
+            refused_max: word(info::REFUSED_MAX),
             name,
         })
     }

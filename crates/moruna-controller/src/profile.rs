@@ -78,6 +78,15 @@ pub(crate) struct Profile {
     /// finished.
     #[serde(default)]
     pub best_target: u64,
+    /// The instances the stage ran when the file was written (system design 3A): its fixed term
+    /// is theirs together, and its settled target was searched at that count. Zero in a file
+    /// written before 2026-11-18, which counts as one.
+    #[serde(default)]
+    pub instances: u16,
+    /// Not trusted in place of a probe whatever its evidence: a file that does not say the
+    /// count it was written at, read for a stage of more than one instance. Never written.
+    #[serde(skip)]
+    pub uncounted: bool,
 }
 
 /// Records a profile must hold, summed across runs, before a fresh run trusts it in place of
@@ -90,11 +99,38 @@ impl Profile {
     /// input schema (the caller knows the file matched exactly), from enough records, and
     /// holding every figure the solve of f.3 needs.
     pub(crate) fn trusted(&self) -> bool {
-        self.runs >= 1
+        !self.uncounted
+            && self.runs >= 1
             && self.a_k_samples >= TRUSTED_SAMPLES
             && self.a_k_arena > 0.0
             && self.a_anon > 0.0
             && self.probe_a_anon > 0.0
+    }
+}
+
+impl Profile {
+    /// The count the file was written at; an older file's counts as one.
+    pub(crate) fn written_at(&self) -> u16 {
+        self.instances.max(1)
+    }
+
+    /// The profile as a stage of `instances` instances may use it (system design 3A; PM,
+    /// 2026-11-18): as it stands at the count it was written at; at another, its fixed term
+    /// scaled by now / then, since each instance holds its own (a process, its interpreter),
+    /// and its settled target dropped, since it was searched where each instance had a larger
+    /// or a smaller share; and not trusted when the file does not say its count and the stage
+    /// has more than one. The per-byte figures stand: a morsel goes to one instance. `None`
+    /// when it is used as it stands.
+    pub(crate) fn at_count(&self, instances: u16) -> Option<Profile> {
+        let (then, now) = (self.written_at(), instances.max(1));
+        if then == now {
+            return None;
+        }
+        let mut scaled = self.clone();
+        scaled.c_anon = crate::model::scale(self.c_anon, f64::from(now) / f64::from(then));
+        scaled.best_target = 0;
+        scaled.uncounted = self.instances == 0;
+        Some(scaled)
     }
 }
 
@@ -208,6 +244,10 @@ pub(crate) fn load_nearest(
 /// long history moves slowly and a first run is taken as it stands.
 pub(crate) fn merge(stored: &Profile, fresh: &Profile) -> Profile {
     let blend = |old: f64, new: f64| old * (1.0 - NEW_RUN_WEIGHT) + new * NEW_RUN_WEIGHT;
+    // What was stored, at the count the new run ran at (system design 3A): its fixed term
+    // scaled to it, and a settled target searched at another count not kept.
+    let scaled = stored.at_count(fresh.instances);
+    let stored = scaled.as_ref().unwrap_or(stored);
     Profile {
         version: VERSION,
         fingerprint: fresh.fingerprint.clone(),
@@ -236,6 +276,8 @@ pub(crate) fn merge(stored: &Profile, fresh: &Profile) -> Profile {
         } else {
             stored.best_target
         },
+        instances: fresh.instances,
+        uncounted: false,
     }
 }
 
@@ -317,6 +359,8 @@ pub(crate) fn from_stage(state: &crate::ControllerState, at: usize) -> Option<Pr
             _ => ctl.a_anon_seed,
         },
         best_target: ctl.sizer.settled_target().unwrap_or(0),
+        instances: state.max_instances(ctl.stage),
+        uncounted: false,
     })
 }
 

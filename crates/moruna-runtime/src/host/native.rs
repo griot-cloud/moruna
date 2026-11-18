@@ -935,6 +935,7 @@ mod tests {
                 plan: None,
                 secrets: Default::default(),
                 measured: Default::default(),
+                measured_by: Default::default(),
             }
         }
         fn fail_start(&self, admission: Admission<'_>, prepared: PreparedLaunch) -> StartError {
@@ -993,6 +994,7 @@ mod tests {
             plan: None,
             secrets: Default::default(),
             measured: Default::default(),
+            measured_by: Default::default(),
         };
         let authority = run_authority(&key, &v2);
         assert_eq!(
@@ -1006,6 +1008,7 @@ mod tests {
             plan: None,
             secrets: Default::default(),
             measured: Default::default(),
+            measured_by: Default::default(),
         };
         assert_eq!(run_authority(&key, &v1).job_digest, "");
         let garbled = Inbound::Spec {
@@ -1013,6 +1016,7 @@ mod tests {
             plan: None,
             secrets: Default::default(),
             measured: Default::default(),
+            measured_by: Default::default(),
         };
         assert_eq!(run_authority(&key, &garbled).job_digest, "");
     }

@@ -572,21 +572,47 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
     function that is exactly a line has no margin.
   - **Whose measurement stands:** the node's own readings override a registration's (3E). A native
     function has no client warm-up: its first job on a node warms it up.
+  - **Whose measurement sizes what** (6.3g phase 3): a registration's facts size the arena's share
+    and the number of instances only, since a client's process holds none of the function's
+    interpreter. An instance's account and its plane come from the node's own readings or the
+    in-job warm-up, and keep the share's rule until one exists.
   - **Where it is kept:** `api`'s registry, by function image (not admission's cache, which
     evicts), shown by `GET /v1/functions` and returned in the job's report, so a client keeps it
     past the node's life and sends it with the next registration.
   - **Every run refines it:** each instance's account peak with the largest piece it was given, a
-    pair a run, and the line fitted again over the pairs. No new core call.
+    pair a run, and the line fitted again over the pairs. No new core call. With a registration's
+    facts, the slope is the client's and the node's fixed term is the node's peak less the slope
+    times the piece. With none, readings that span less than twice their least piece say no slope:
+    the fixed term is the largest peak, and a piece above their range is scaled up in proportion.
   - **The warm-up on the job's first batches is skipped** when the facts rest on 32 units or more,
-    the controller's rule for a profile; the run still records and refines.
+    the controller's rule for a profile; the run still records and refines. Otherwise the stage's
+    first instance takes pieces of 1, 2, 4, 8 and 16 MiB, one at a time, and after each answer its
+    account's peak is read against the bytes laid out (no output ratio); the stage's other
+    instances start once that fit sizes them, and the arena is divided again through the limits
+    watcher's path. Only that stage waits: a worker that finds none of its started instances free
+    takes other stages' work.
+  - **A morsel fits the instance it goes to** (6.3f's evidence: a Python image function at four
+    instances was killed for memory, sized from a profile learned at one): a piece is at most the
+    instance's room less the fixed term, over the bytes per byte. The kernel says that largest
+    morsel; the controller holds the stage's target to it, below its least morsel if it must (a
+    smaller morsel is only slower), and the kernel cuts a larger batch at it, since a target
+    bounds only what the source reads for its first consumer. On the node it is the smaller of
+    the piece an instance's account holds and its plane's piece, so no batch is past its input
+    region either.
+  - **A profile remembered at one instance count is not applied unscaled at another:** the profile
+    keeps the count it was written at; read at another count, its fixed term is scaled by now over
+    then and its settled target is not used, and it is still trusted; a file that does not say its
+    count is not trusted on a stage of more than one instance.
   - **When the job's CPUs do not all fit, the piece shrinks first,** down to the least piece, and
     only then do fewer instances run: memory bounds the unit of work, never the workers.
   - **The fixed leasts** (an account of 16 MiB, a share of 29 MiB) are only where a function with no
     measurement yet starts; a measured function gets its measured fixed term.
   - **A function that passes its room** is given a larger one, started again, and has its
-    unanswered pieces posted again, and the measurement is recorded. One that keeps state restarts
-    from its last checkpoint; with none the job fails, naming the function, with the measurement
-    recorded so the next run is sized right.
+    unanswered pieces posted again, and the measurement is recorded. Passing it is read from its
+    account's count of refused charges (`account_info`, ABI 2.10), never guessed from how it
+    ended; the larger room comes from the job's, doubling up to the whole of it, and the report
+    says so. One that keeps state restarts from its last checkpoint; with none the job fails,
+    naming the function, with the measurement recorded so the next run is sized right.
   - **Off the node** (the library, `moruna run`) the run finds what `moruna check` measured in its
     observation store, by the function and its declared input, and sizes its arena from that before
     any source is built. A measurement stands over what the function declares; a function measured

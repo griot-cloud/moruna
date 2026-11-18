@@ -49,7 +49,7 @@ built yet.
 | --- | --- | --- |
 | Linux | Tens of millions of lines, with every driver | Over 350 system calls, plus every driver's `ioctl` |
 | Asterinas, whole | OSTD (about 49,000 lines) plus its Linux layer (about 137,000) plus its components (about 42,000) | 245 Linux calls |
-| The data OS | OSTD (about 49,000) plus Moruna's core (10,239 lines on 2026-11-18, with §2's mechanisms of A, B1 and P merged, Hyper-V's mechanism for VMBus, 5.0's wall clock and yield, and an ended process's exit code) | Moruna's 79 native calls, six of them only on Hyper-V |
+| The data OS | OSTD (about 49,000) plus Moruna's core (10,517 lines on 2026-11-18, with §2's mechanisms of A, B1 and P merged, Hyper-V's mechanism for VMBus, 5.0's wall clock and yield, an ended process's exit code, 5.3b's two fast calls, an account's CPU time and the charges it refused) | Moruna's 80 native calls, six of them only on Hyper-V |
 
 How the figures are measured, so each merge updates them the same way: kernel-mode lines are
 `wc -l` over `kernel/core/src` (tests included); native calls are the call numbers the
@@ -69,7 +69,12 @@ its VP index and the two hypercalls, about 245 lines in `src/arch/x86/kernel/hyp
 about 155 of values and layouts in `src/arch/x86/cpu/hypervisor.rs`, which the host tests
 check. Then item 5.0 (ABI 2.8, `work/5.0-rust-std` merged with `feature/arrow-core-0.7`):
 10,216 lines and 79 calls, the node's wall clock on the clock page with `clock_set_realtime`,
-and `thread_yield`, 50 lines and two calls. Every
+and `thread_yield`, 50 lines and two calls. Then item 6.3i (ABI 2.10, on
+`feature/arrow-core-0.7` at `30d9e12f`, which with item 5.3b's two fast calls of ABI 2.9 measures
+10,452 lines and 79 calls): 10,517 lines and 80 calls. `account_cpu` and an account's CPU time,
+charged along the accounts it was carved from as a thread leaves its CPU, are 52 lines and one call;
+the charges an account refused, which `account_info` writes for a caller that asks for its 80 bytes
+(a third argument, the buffer's size: 0, 64 or 80), are 13 lines and no call. Every
 call that is reachable but no gate job uses is a removal candidate on stream U's list. The
 exceptions are the device and DMA calls, which are kept for the accelerator path.
 
@@ -351,6 +356,8 @@ budget.
 | Yield the CPU | New (ABI 2.8, item 5.0): `thread_yield` | A spin-then-yield loop (std's, a library's) holding its CPU until the tick | One call, a call into OSTD's scheduler |
 | Revoke a task's write access to a set of windows | Partly exists (`PROCESS_PROTECT`, `batch_put`'s unmap) | The record check's need for bytes no task can write (DP1), paid once per group of batches, not per batch (§5) | A call that takes a list. Small. |
 | The personality entry, copy-on-write clones, a user pager, thread state and interruption | New (`kernel-is-the-machine.md` §4.1) | Running Linux programs with no Linux code in kernel mode (§4) | The largest addition: four mechanisms, each tested in the core's own suite. Size to be measured against the table in §0. |
+| An account's CPU time | New (ABI 2.10, `moruna-os-system.md` §3A and §6B, item 6.3i): each slice a thread runs is charged, as it leaves its CPU, to its process's account and to every account that one was carved from; `account_cpu` reads an account's | A job's cost known to no one but each process that ran it: a node reads what a job's engine and its function instances used from the job's own account | One call and one atomic an account, added to with no lock: 52 lines of the core; the walk and the answer are `moruna-quota`'s, tested on the host. |
+| The charges an account refused | New (ABI 2.10, items 6.3i and 6.3g): each account counts the charges it refused and keeps the largest request among them; `account_info` writes both after its 64 bytes for a caller whose third argument, the size of its buffer, is 80. The argument must be 0, 64 or 80: 0 and 64 are the call ABI 2.3 made, any other size is refused | An instance that passed its room looking like any other crash: its starter reads the instance's account and restarts it with more room | No call: two words of the account's ledger and 16 bytes of `account_info`, 13 lines of the core; the counting is `moruna-quota`'s and the size rule `moruna-abi`'s, both tested on the host. Nothing is written past the 64-byte buffer of a caller built before 2.10. |
 | Hyper-V's mechanism for VMBus: post, take, the event flags, SINT 2's interrupt, signal handles | New (ABI 2.7, `moruna-os-system.md` §1F, item 1.9c) | VMBus's protocol in kernel mode: it is the `vmbus` process's, and each driver signals the host itself | Six calls, made only on Hyper-V, and CPU 0's SynIC in OSTD: 244 lines of the core and about 400 of OSTD (§0). |
 
 **Nothing of the engine's logic goes into the kernel.** That covers decode, the scheduler, the

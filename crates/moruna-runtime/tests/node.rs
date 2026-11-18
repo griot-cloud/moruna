@@ -359,7 +359,7 @@ fn a_function_s_measured_memory_comes_with_the_job_and_sizes_the_engine() {
                         "input_bytes_min": 16000, "input_bytes_max": 16000000});
     let lean = json!({"fixed_bytes": 0.0, "per_input_byte": 0.0, "spread": 0.0, "units": 21,
                       "input_bytes_min": 16000, "input_bytes_max": 16000000});
-    let ran = |run: &str, function: &str, measured: Option<Value>| {
+    let ran = |run: &str, function: &str, measured: Option<Value>, by: Option<Value>| {
         let out = scratch.path().join(format!("out-{run}"));
         std::fs::create_dir_all(&out).expect("out");
         let mut kinds = kinds(&scratch.path().join("in.parquet"), &out);
@@ -369,6 +369,9 @@ fn a_function_s_measured_memory_comes_with_the_job_and_sizes_the_engine() {
         let mut message = json!({"spec": document(function)});
         if let Some(measured) = measured {
             message["measured"] = measured;
+        }
+        if let Some(by) = by {
+            message["measured_by"] = by;
         }
         let node = Node {
             channel: "channel:engine".to_string(),
@@ -408,13 +411,13 @@ fn a_function_s_measured_memory_comes_with_the_job_and_sizes_the_engine() {
 
     // Nothing came with the job: the function starts where one nothing is known of starts, two
     // thirds of the allowance above the arena.
-    let (unknown, notes, task) = ran("unknown", "hungry", None);
+    let (unknown, notes, task) = ran("unknown", "hungry", None, None);
     assert!((unknown - 2.0 / 3.0).abs() < 0.02, "{unknown}");
     assert!(!said(&notes, "came with the job") && task.get("measured").is_none());
 
     // The facts came with the job, by the function's name, beside others' it does not use.
     let both = json!({"hungry": hungry.clone(), "lean": lean.clone(), "other": lean.clone()});
-    let (room, notes, task) = ran("hungry", "hungry", Some(both.clone()));
+    let (room, notes, task) = ran("hungry", "hungry", Some(both.clone()), None);
     assert!(
         room > 0.8,
         "sized for twelve bytes a byte in flight: {room}"
@@ -433,7 +436,7 @@ fn a_function_s_measured_memory_comes_with_the_job_and_sizes_the_engine() {
     // The report returns them on the function's task.
     assert_eq!(task["measured"], hungry);
 
-    let (room, _, task) = ran("lean", "lean", Some(both));
+    let (room, _, task) = ran("lean", "lean", Some(both.clone()), None);
     assert!(
         room < 0.3,
         "a function measured to hold nothing leaves the arena the room: {room}"
@@ -443,13 +446,31 @@ fn a_function_s_measured_memory_comes_with_the_job_and_sizes_the_engine() {
     // What is not a measurement sizes nothing, and the run says so.
     let mut wrong = hungry.clone();
     wrong["per_input_byte"] = json!(-1.0);
-    let (room, notes, task) = ran("wrong", "hungry", Some(json!({"hungry": wrong})));
+    let (room, notes, task) = ran("wrong", "hungry", Some(json!({"hungry": wrong})), None);
     assert!((room - unknown).abs() < 0.02, "{room}");
     assert!(
         said(&notes, "for the function `hungry` is not a measurement"),
         "{notes:?}"
     );
     assert!(task.get("measured").is_none());
+
+    // The node's own readings of the function, as `api` says whose they are (phase 3): said as
+    // the node's, and sized as before on a host (their accounts and planes are the node's).
+    let (_, notes, task) = ran(
+        "by-node",
+        "hungry",
+        Some(both),
+        Some(json!({"hungry": "node", "lean": "registration"})),
+    );
+    assert!(
+        said(
+            &notes,
+            "the measured memory of the function of stage 1 (the node's own readings) came with \
+             the job"
+        ),
+        "{notes:?}"
+    );
+    assert_eq!(task["measured"], hungry);
 }
 
 fn exit_of(served: &Served) -> &Value {

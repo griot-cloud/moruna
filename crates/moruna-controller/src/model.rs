@@ -286,11 +286,11 @@ pub(crate) fn envelope(state: &ControllerState, at: usize) -> Envelope {
         scale(anon_for_stage, 1.0 / per_anon_byte)
     };
     Envelope {
-        min: state.cfg.morsel_min,
+        min: state.target_min(at),
         max: from_budget
             .min(from_anon)
-            .min(state.cfg.morsel_max)
-            .max(state.cfg.morsel_min),
+            .min(state.target_max(at))
+            .max(state.target_min(at)),
     }
 }
 
@@ -364,7 +364,19 @@ pub(crate) fn fits_arena(state: &ControllerState, targets: &[u64]) -> bool {
 /// RC-I1: reduce morsel targets, largest stage first, until the working set fits. Returns the
 /// targets that fit, which is what the controller then writes and nothing else.
 pub(crate) fn enforce(state: &ControllerState, targets: &[u64]) -> Vec<u64> {
-    let mut targets = targets.to_vec();
+    // Every target held below what one of its stage's instances can take first, whatever the
+    // inequalities would allow (system design 3A).
+    let mut targets: Vec<u64> = targets
+        .iter()
+        .enumerate()
+        .map(|(at, target)| {
+            if at < state.stages.len() {
+                (*target).min(state.target_max(at))
+            } else {
+                *target
+            }
+        })
+        .collect();
     // Each pass halves the largest target. Every target is bounded below by `morsel_min`, so
     // this terminates: at worst every stage reaches the floor, and a floor that still does not
     // fit is a budget the run cannot be sized for, which f.7 turns into a diagnostic rather
@@ -378,23 +390,27 @@ pub(crate) fn enforce(state: &ControllerState, targets: &[u64]) -> Vec<u64> {
         if fits(state, &targets) {
             break;
         }
-        let floor = state.cfg.morsel_min;
+        let floor = |at: usize| state.target_min(at);
         let Some(largest) = largest_index(&targets, |at| !waiting[at], floor)
             .or_else(|| largest_index(&targets, |at| waiting[at], floor))
         else {
             break;
         };
-        targets[largest] = (targets[largest] / 2).max(floor);
+        targets[largest] = (targets[largest] / 2).max(floor(largest));
     }
     targets
 }
 
-/// The largest target above `floor` among the stages `eligible` admits.
-fn largest_index(targets: &[u64], eligible: impl Fn(usize) -> bool, floor: u64) -> Option<usize> {
+/// The largest target above its stage's `floor` among the stages `eligible` admits.
+fn largest_index(
+    targets: &[u64],
+    eligible: impl Fn(usize) -> bool,
+    floor: impl Fn(usize) -> u64,
+) -> Option<usize> {
     targets
         .iter()
         .enumerate()
-        .filter(|(at, bytes)| eligible(*at) && **bytes > floor)
+        .filter(|(at, bytes)| eligible(*at) && **bytes > floor(*at))
         .max_by_key(|(_, bytes)| **bytes)
         .map(|(at, _)| at)
 }
@@ -422,7 +438,7 @@ pub(crate) fn solve(state: &ControllerState) -> Solution {
     // amplification, not a path of its own.
     let target = common_target(state, worker_half);
     let targets: Vec<u64> = (0..stages)
-        .map(|_| target.clamp(state.cfg.morsel_min, state.cfg.morsel_max))
+        .map(|at| state.clamp_target(at, target))
         .collect();
 
     let max_allowance = state

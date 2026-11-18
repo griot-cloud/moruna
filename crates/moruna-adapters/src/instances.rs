@@ -254,6 +254,66 @@ pub fn fund(
     }))
 }
 
+/// Funds the stages whose functions the node measured (system design 3A; PM, 2026-11-18): each
+/// stage asks for `wanted` instances, and `costs[k]` is what one of its instances costs at the
+/// `k`th of the pieces, the largest first (its plane and its account at that piece). The largest
+/// piece at which every instance asked for fits in `room` is taken; when none does, the least
+/// piece, with as many instances as the room funds there, at least one a stage, given out a
+/// stage at a time in turn, as [`fund`] gives them. Memory bounds the unit of work first and the
+/// workers only after. Answers the piece's place and each stage's count; refused when one
+/// instance a stage does not fit at the least piece, or a stage gives no cost for a piece.
+pub fn fund_measured(
+    room: u64,
+    stages: &[(usize, Vec<u64>)],
+) -> Result<(usize, Vec<usize>), String> {
+    let pieces = stages
+        .iter()
+        .map(|(_, costs)| costs.len())
+        .min()
+        .unwrap_or(0);
+    if stages.is_empty() || pieces == 0 {
+        return Err("no measured stage, or one with no piece to cost".into());
+    }
+    let total = |at: usize, counts: &[usize]| -> u64 {
+        stages
+            .iter()
+            .zip(counts)
+            .map(|((_, costs), &n)| costs[at].saturating_mul(n as u64))
+            .fold(0u64, u64::saturating_add)
+    };
+    let wanted: Vec<usize> = stages.iter().map(|(n, _)| (*n).max(1)).collect();
+    if let Some(at) = (0..pieces).find(|&at| total(at, &wanted) <= room) {
+        return Ok((at, wanted));
+    }
+    let least = pieces - 1;
+    let mut counts = vec![1usize; stages.len()];
+    if total(least, &counts) > room {
+        return Err(format!(
+            "{} measured stages need {} bytes for one instance each at their least piece; the run \
+             has {room} bytes after funded allocations",
+            stages.len(),
+            total(least, &counts)
+        ));
+    }
+    loop {
+        let mut gave = false;
+        for (at, want) in wanted.iter().enumerate() {
+            if counts[at] < *want {
+                counts[at] += 1;
+                if total(least, &counts) <= room {
+                    gave = true;
+                } else {
+                    counts[at] -= 1;
+                }
+            }
+        }
+        if !gave {
+            break;
+        }
+    }
+    Ok((least, counts))
+}
+
 /// The run report's note of a stage memory left short of what the rule asked for: `N of M
 /// instances: the share funds N`, after the stage's name.
 pub fn short_note(stage: &str, funded: usize, asked: usize) -> Option<String> {
@@ -274,6 +334,55 @@ pub fn count_note(instances: usize, cpus: usize) -> String {
         format!("{counted}, the most a stage runs, for the job's {cpus} CPUs")
     } else {
         format!("{counted} for the job's {cpus} CPUs: the function declares at most {instances}")
+    }
+}
+
+#[cfg(test)]
+mod measured_tests {
+    use super::*;
+
+    const MIB: u64 = 1 << 20;
+
+    /// Costs at 16, 8, 4, 2 and 1 MiB pieces: a plane of 13 pieces, an account of 5 MiB.
+    fn costs() -> Vec<u64> {
+        [16u64, 8, 4, 2, 1]
+            .iter()
+            .map(|p| 13 * p * MIB + 5 * MIB)
+            .collect()
+    }
+
+    #[test]
+    fn the_piece_shrinks_before_the_instances_do() {
+        // Room for four at the largest piece: every instance, at it.
+        assert_eq!(
+            fund_measured(4 * 213 * MIB, &[(4, costs())]),
+            Ok((0, vec![4]))
+        );
+        // Not at 16 MiB, but at 8.
+        assert_eq!(
+            fund_measured(4 * 109 * MIB, &[(4, costs())]),
+            Ok((1, vec![4]))
+        );
+        // Not even at the least piece: as many as fit there, the least piece.
+        assert_eq!(
+            fund_measured(3 * 18 * MIB, &[(4, costs())]),
+            Ok((4, vec![3]))
+        );
+        // Two stages short at the least piece: given out in turn.
+        assert_eq!(
+            fund_measured(3 * 18 * MIB, &[(4, costs()), (4, costs())]),
+            Ok((4, vec![2, 1]))
+        );
+        // One a stage at the least does not fit: refused, saying so.
+        let refused = fund_measured(17 * MIB, &[(4, costs())]).unwrap_err();
+        assert!(
+            refused.contains("one instance each at their least piece"),
+            "{refused}"
+        );
+        assert!(fund_measured(1 << 40, &[]).is_err());
+        assert!(fund_measured(1 << 40, &[(1, Vec::new())]).is_err());
+        // A stage asking for none is asked for one.
+        assert_eq!(fund_measured(1 << 40, &[(0, costs())]), Ok((0, vec![1])));
     }
 }
 

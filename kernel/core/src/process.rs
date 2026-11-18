@@ -1262,7 +1262,8 @@ fn current_thread() -> Option<Arc<Thread>> {
 }
 
 /// OSTD's pre-schedule hook: the thread leaving its CPU keeps its FPU registers and FS
-/// base, and is charged the CPU time of its slice.
+/// base, and is charged the CPU time of its slice, as are its process and its process's
+/// account (`account_cpu`, ABI 2.10).
 pub fn deactivate_current(_guard: &DisabledLocalIrqGuard) {
     if let Some(thread) = current_thread() {
         thread.fpu.lock().save();
@@ -1273,6 +1274,9 @@ pub fn deactivate_current(_guard: &DisabledLocalIrqGuard) {
         let used = clock::now().saturating_sub(since);
         thread.cpu_ns.fetch_add(used, Ordering::Relaxed);
         thread.process.cpu_ns.fetch_add(used, Ordering::Relaxed);
+        // ABI 2.10: and its process's account, with every account that one was carved
+        // out of, so an account's CPU time is its processes' and its children's.
+        thread.process.account().charge_cpu(used);
     }
 }
 

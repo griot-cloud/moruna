@@ -14,19 +14,29 @@
 //! account, whose limit is the physical memory the kernel found less its own reserve,
 //! is never overcommitted. A charge that does not fit is refused (`QuotaExceeded`); a
 //! page fault whose page cannot be charged ends its process with the account named.
+//! An account counts the charges it refused, and the largest (ABI 2.10): `account_info`
+//! gives them, so a starter tells a process that passed its room from any other end.
+//!
+//! An account is charged CPU time too (ABI 2.10, item 6.3i): each slice a thread runs is
+//! charged, as the thread leaves its CPU, to the account its process is charged to and
+//! to every account that one was carved out of, so an account's time is its own
+//! processes' and its children's, ended ones included. `account_cpu` reads it. The
+//! arithmetic is `moruna_quota`'s, tested on the host.
 //!
 //! Lock order: an account's ledger is a leaf, taken under any other lock and holding
-//! none.
+//! none. Its CPU time is an atomic and takes no lock.
 
 use alloc::{format, string::String, sync::Arc};
 
 use moruna_abi::{Error, account_info, valid_name, write_u64};
-use moruna_quota::{Exceeded, Ledger, Usage};
+use moruna_quota::{Carved, CpuTime, Exceeded, Ledger, Usage};
 use ostd::{early_println, sync::SpinLock};
 
 pub struct Account {
     name: String,
     ledger: SpinLock<Ledger>,
+    /// The CPU time charged to it: its own processes' and its children's (ABI 2.10).
+    cpu: CpuTime,
     /// The account its limit is held in; `None` for the machine's.
     parent: Option<Arc<Account>>,
     limit: u64,
@@ -41,6 +51,7 @@ impl Account {
         Arc::new(Account {
             name: String::from("machine"),
             ledger: SpinLock::new(Ledger::new(limit)),
+            cpu: CpuTime::new(),
             parent: None,
             limit,
             _record: None,
@@ -83,6 +94,7 @@ impl Account {
         Ok(Arc::new(Account {
             name: String::from(name),
             ledger: SpinLock::new(Ledger::new(limit)),
+            cpu: CpuTime::new(),
             parent: Some(self.clone()),
             limit,
             _record: Some(record),
@@ -131,10 +143,31 @@ impl Account {
         )
     }
 
-    /// `account_info`'s 64 bytes.
+    /// Charges `ns` of CPU time a thread of a process charged here has used, to this
+    /// account and to every account it was carved out of (ABI 2.10). The scheduler's
+    /// switch calls it with interrupts off: atomics only, no lock.
+    pub fn charge_cpu(&self, ns: u64) {
+        moruna_quota::charge_cpu(self, ns);
+    }
+
+    /// `account_cpu`'s answer (ABI 2.10): the CPU time charged to this account, and
+    /// `running`, the slice the calling thread is in, when its process's account,
+    /// `caller`, is this one or was carved out of it.
+    pub fn cpu_ns(&self, caller: &Account, running: u64) -> u64 {
+        let running = moruna_quota::within(caller, self).then_some(running);
+        moruna_quota::cpu_answer(self.cpu.total(), running)
+    }
+
+    /// `account_info`'s bytes: the 64 of ABI 2.3, then the charges it refused (ABI 2.10),
+    /// which a caller that does not ask for them is not written.
     pub fn info(&self) -> [u8; account_info::SIZE] {
-        let u = self.usage();
+        let (u, refused) = {
+            let ledger = self.ledger.lock();
+            (ledger.usage(), ledger.refusals())
+        };
         let mut out = [0u8; account_info::SIZE];
+        write_u64(&mut out, account_info::REFUSED, refused.count);
+        write_u64(&mut out, account_info::REFUSED_MAX, refused.largest);
         write_u64(&mut out, account_info::LIMIT, u.limit);
         write_u64(&mut out, account_info::USED, u.used);
         write_u64(&mut out, account_info::PEAK, u.peak);
@@ -143,6 +176,16 @@ impl Account {
         let n = name.len().min(moruna_abi::limits::NAME_MAX);
         out[account_info::NAME..account_info::NAME + n].copy_from_slice(&name[..n]);
         out
+    }
+}
+
+impl Carved for Account {
+    fn cpu(&self) -> &CpuTime {
+        &self.cpu
+    }
+
+    fn parent(&self) -> Option<&Account> {
+        self.parent.as_deref()
     }
 }
 

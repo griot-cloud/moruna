@@ -239,6 +239,11 @@ pub struct RunSpec {
     /// job uses, in the `spec` message), one a stage; empty, or `None` for a stage, where it
     /// came with none. The run sizes itself from it before what its own store holds.
     pub measured: Vec<Option<moruna_cost::Memory>>,
+    /// Whether each stage's measurement in [`RunSpec::measured`] is the node's own reading of
+    /// its function (system design 3A), one a stage, `false` where it is a registration's or
+    /// there is none: the node's sizes the stage's instances' accounts and planes, a
+    /// registration's the arena's share and the instances only.
+    pub measured_by_node: Vec<bool>,
     /// Clamps and translations the surface reports (12 f.3).
     pub notes: Vec<String>,
     /// The job document's content address (MH 4.1), when the run was built from one. Recorded
@@ -301,6 +306,7 @@ impl RunSpec {
             resume: None,
             resume_auto: false,
             measured: Vec::new(),
+            measured_by_node: Vec::new(),
             notes: Vec::new(),
             spec_digest: None,
         }

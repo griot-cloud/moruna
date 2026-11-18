@@ -50,9 +50,113 @@ pub fn native_split(share: u64) -> (u64, u64) {
     (budget, account)
 }
 
+/// The largest piece one task of a stage takes (system design 3A; PM, 2026-11-18): its plane's
+/// piece, or `account`, the piece its account holds by the function's measured line, where that
+/// is less; `account` is 0 when nothing measured the function. A batch is cut at it, so none is
+/// past what its task's account holds, nor its plane's input region.
+pub fn piece_cap(plane: u64, account: u64) -> u64 {
+    if account == 0 {
+        plane
+    } else {
+        plane.min(account)
+    }
+}
+
 /// [`task_limit`] for a native task, out of its `share` ([`native_split`]).
 pub fn native_task_limit(share: u64, room: u64) -> Option<u64> {
     task_limit(native_split(share).1, room)
+}
+
+/// The pieces a measured function's instances are sized for, the largest first (system design
+/// 3A): from [`PIECE_MAX`] down to [`RING_MIN`], halving. When the job's instances do not all
+/// fit, the piece shrinks first, down to the least, and only then do fewer instances run (PM,
+/// 2026-11-18): memory bounds the unit of work, never the workers.
+pub const PIECES: [u64; 5] = [
+    PIECE_MAX,
+    PIECE_MAX / 2,
+    PIECE_MAX / 4,
+    PIECE_MAX / 8,
+    RING_MIN,
+];
+
+const _: () = assert!(PIECE_MAX / 16 == RING_MIN);
+
+/// The plane a task gets for pieces of `piece` bytes: the plane budget that makes its pieces
+/// that size ([`ring_sizes`]) and the bytes the plane then is (its region and its two rings
+/// objects of windows).
+pub fn plane_for(piece: u64) -> (u64, u64) {
+    let budget = piece.clamp(RING_MIN, PIECE_MAX) / 2 * PLANE_HALF_PIECES;
+    let s = ring_sizes(budget);
+    (budget, s.region + 2 * s.windows * s.window)
+}
+
+/// The account a measured task is carved at (system design 3A): `account` bytes, what the
+/// node's readings of the function say one of its processes holds at its piece, in whole pages,
+/// and never more than half of what is left in the engine's account (`room`), as
+/// [`task_limit`] keeps it. The least [`TASK_MIN`] is not applied: it is where a function with
+/// no measurement starts, and a measured function gets its measured need (PM, 2026-11-18).
+/// `None` when not a page is left.
+pub fn measured_task_limit(account: u64, room: u64) -> Option<u64> {
+    let limit = account.next_multiple_of(PAGE).min(room / 2) & !(PAGE - 1);
+    (limit >= PAGE).then_some(limit)
+}
+
+/// A function's measured line as the run carried it (system design 3A): what a stage's warm-up
+/// keeps the slope of when a registration measured it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Line {
+    /// Bytes one process holds whatever its batch.
+    pub fixed_bytes: f64,
+    /// Bytes it holds per byte of input.
+    pub per_input_byte: f64,
+    /// The root mean square of the units' departures from the line.
+    pub spread: f64,
+    /// The units it was fitted from.
+    pub units: u64,
+    /// The least input bytes they covered.
+    pub input_bytes_min: u64,
+    /// The most input bytes they covered.
+    pub input_bytes_max: u64,
+}
+
+/// Whether a ring task's region has room for the next piece beside `outstanding` records the
+/// engine still holds (6.3g's restart): the engine keeps each input record until it has taken
+/// its answer, so that a task that passed its room can be given them again. A region is
+/// [`IN_FLIGHT`] pieces and one more ([`ring_sizes`]), and the engine never posts past
+/// [`IN_FLIGHT`] outstanding ([`to_post`]), so the region never fills only because it holds
+/// records (PM, 2026-11-18).
+pub fn room_for_next(outstanding: u64, sizes: &RingSizes) -> bool {
+    outstanding.saturating_add(1).saturating_mul(sizes.piece) <= sizes.region
+}
+
+/// The account a task that passed its room is started again with (system design 3A; PM,
+/// 2026-11-18): the larger of twice the one it had and what its refusal says it needed, its
+/// account's peak and the largest charge refused, widened by the measurement's `margin`, so one
+/// restart reaches the need the refusal named; as far as the engine's `room` allows a task's
+/// account beside the engine's own half ([`measured_task_limit`]). `None` when that is no
+/// larger, and the stage then fails as it did.
+pub fn restarted_limit(limit: u64, needed: u64, margin: f64, room: u64) -> Option<u64> {
+    let needed = ((needed as f64) * (1.0 + margin.max(0.0))).ceil() as u64;
+    measured_task_limit(limit.saturating_mul(2).max(needed), room).filter(|&grown| grown > limit)
+}
+
+/// The pieces a stage's first task warms up on, the smallest first (system design 3A; PM,
+/// 2026-11-18): one at a time, each answer's account peak read against the bytes laid out. In
+/// ascending order the peak, the account's high-water mark, is the last piece's.
+pub const WARM_PIECES: [u64; 5] = [1 << 20, 2 << 20, 4 << 20, 8 << 20, 16 << 20];
+
+/// The account one process of a function needs at pieces of `piece` bytes by its measured line
+/// (system design 3A), in whole pages: `fixed + per_byte x piece`, or for a line with no slope
+/// the fixed term scaled in proportion past the top of its range, `top`; widened by `margin`
+/// (as `moruna_cost::Memory::account`, which the engine sizes a node's readings with).
+pub fn line_account(fixed: f64, per_byte: f64, margin: f64, top: u64, piece: u64) -> u64 {
+    let piece = piece as f64;
+    let at = if per_byte == 0.0 && top > 0 && piece > top as f64 {
+        fixed * piece / top as f64
+    } else {
+        fixed + per_byte * piece
+    };
+    ((at * (1.0 + margin)).max(0.0).ceil() as u64).next_multiple_of(PAGE)
 }
 
 /// The least share a native task runs in: its account at [`TASK_MIN`] beside its plane at its
@@ -83,6 +187,10 @@ pub struct TaskFigures {
     pub peak: u64,
     /// Its account's limit, in bytes.
     pub limit: u64,
+    /// The largest piece it was given: the bytes of the batch's buffers, without the record's
+    /// framing. With `peak`, the pair a run refines the function's measured memory from
+    /// (system design 3A).
+    pub largest: u64,
 }
 
 /// The run report's note of a ring stage's tasks: each one's batches, CPU and account, and
@@ -96,13 +204,14 @@ pub fn stage_note(stage: &str, tasks: &[Option<TaskFigures>], busy_peak: usize) 
     for (i, t) in tasks.iter().enumerate() {
         match t {
             Some(t) => note.push_str(&format!(
-                "; task {i}: {} batches, {} records, {} deferred, cpu {}, account peak {} of {} bytes{}",
+                "; task {i}: {} batches, {} records, {} deferred, cpu {}, account peak {} of {} bytes, largest piece {} bytes{}",
                 t.batches,
                 t.records,
                 t.deferred,
                 t.cpu.map_or_else(|| "any".to_string(), |c| c.to_string()),
                 t.peak,
                 t.limit,
+                t.largest,
                 if t.states > 1 {
                     format!(", {} tasks in turn", t.states)
                 } else {
@@ -1022,6 +1131,161 @@ mod tests {
     }
 
     #[test]
+    fn a_region_holds_the_next_piece_beside_every_record_the_engine_keeps() {
+        for budget in [
+            RING_MIN,
+            4 << 20,
+            16 << 20,
+            64 << 20,
+            256 << 20,
+            1 << 30,
+            u64::MAX,
+        ] {
+            let sizes = ring_sizes(budget);
+            for outstanding in 0..=IN_FLIGHT {
+                assert!(
+                    room_for_next(outstanding, &sizes),
+                    "a plane of {budget} bytes, {outstanding} records kept: {sizes:?}"
+                );
+            }
+            assert!(
+                !room_for_next(IN_FLIGHT + 1, &sizes),
+                "and no more than that"
+            );
+        }
+        // The engine never posts past IN_FLIGHT outstanding, whatever it has queued.
+        for outstanding in 0..=IN_FLIGHT as usize {
+            for queued in 0..8 {
+                assert!(outstanding + to_post(outstanding, queued) <= IN_FLIGHT as usize);
+            }
+        }
+    }
+
+    #[test]
+    fn a_task_that_passed_its_room_is_started_again_with_twice_it_or_its_need() {
+        const MIB: u64 = 1 << 20;
+        // A refusal that names less than twice the account: twice it.
+        assert_eq!(
+            restarted_limit(16 * MIB, 20 * MIB, 0.0, 1024 * MIB),
+            Some(32 * MIB)
+        );
+        // gate-grows on the booted check (6.3g turn 2): an account of 9347072 bytes, its peak
+        // 2561184 and a charge of 42107136 refused. Doubling took three restarts, to 74776576
+        // bytes; the need the refusal names takes one, to enough for it.
+        let (limit, peak, refused) = (9_347_072, 2_561_184, 42_107_136);
+        let grown = restarted_limit(limit, peak + refused, 0.02, 1024 * MIB).expect("grown");
+        assert!(grown >= peak + refused && grown > 2 * limit, "{grown}");
+        assert_eq!(grown % PAGE, 0, "in whole pages");
+        assert!(
+            grown < 2 * (peak + refused),
+            "not past what the margin asks"
+        );
+        // As far as half the engine's room.
+        assert_eq!(
+            restarted_limit(300 * MIB, 0, 0.0, 1024 * MIB),
+            Some(512 * MIB)
+        );
+        assert_eq!(
+            restarted_limit(limit, peak + refused, 0.0, 64 * MIB),
+            Some(32 * MIB)
+        );
+        // No larger: none, and the stage fails as it did.
+        assert_eq!(restarted_limit(512 * MIB, 600 * MIB, 0.0, 1024 * MIB), None);
+        assert_eq!(restarted_limit(16 * MIB, 0, 0.0, 0), None);
+    }
+
+    #[test]
+    fn a_line_s_account_is_its_need_at_a_piece_in_whole_pages() {
+        const MIB: u64 = 1 << 20;
+        assert!(
+            WARM_PIECES.windows(2).all(|w| w[0] < w[1]),
+            "the smallest first"
+        );
+        assert_eq!(WARM_PIECES[4], PIECE_MAX, "up to the largest piece");
+        // 30 MiB and six bytes a byte, at 4 MiB pieces: 54 MiB.
+        assert_eq!(
+            line_account(30.0 * MIB as f64, 6.0, 0.0, 16 * MIB, 4 * MIB),
+            54 * MIB
+        );
+        // Widened by the margin, in whole pages.
+        let widened = line_account(30.0 * MIB as f64, 6.0, 0.1, 16 * MIB, 4 * MIB);
+        assert_eq!(widened % PAGE, 0);
+        assert!(widened >= (54.0 * 1.1 * MIB as f64) as u64 && widened < 60 * MIB);
+        // No slope: as it is within the range, in proportion past it.
+        assert_eq!(
+            line_account(4.0 * MIB as f64, 0.0, 0.0, 16 * MIB, MIB),
+            4 * MIB
+        );
+        assert_eq!(
+            line_account(4.0 * MIB as f64, 0.0, 0.0, 16 * MIB, 32 * MIB),
+            8 * MIB
+        );
+        // Nothing measured holds nothing.
+        assert_eq!(line_account(0.0, 0.0, 0.0, 0, 16 * MIB), 0);
+        // A carried line's figures, as a stage's warm-up is given them.
+        let line = Line {
+            fixed_bytes: 30.0 * MIB as f64,
+            per_input_byte: 6.0,
+            spread: 0.0,
+            units: 6,
+            input_bytes_min: MIB,
+            input_bytes_max: 16 * MIB,
+        };
+        assert_eq!(
+            line_account(
+                line.fixed_bytes,
+                line.per_input_byte,
+                line.spread,
+                line.input_bytes_max,
+                4 * MIB
+            ),
+            54 * MIB
+        );
+        assert!(line.units > 0 && line.input_bytes_min < line.input_bytes_max);
+    }
+
+    #[test]
+    fn a_task_s_piece_is_its_plane_s_or_less_where_its_account_holds_less() {
+        let plane = ring_sizes(native_split(256 << 20).0).piece;
+        assert_eq!(
+            piece_cap(plane, 0),
+            plane,
+            "nothing measured: the plane's piece"
+        );
+        assert_eq!(
+            piece_cap(plane, plane / 4),
+            plane / 4,
+            "the account holds less"
+        );
+        assert_eq!(
+            piece_cap(plane, plane * 4),
+            plane,
+            "never past the input region"
+        );
+    }
+
+    #[test]
+    fn a_measured_task_s_plane_is_for_its_piece_and_its_account_its_need() {
+        for piece in PIECES {
+            let (budget, bytes) = plane_for(piece);
+            let s = ring_sizes(budget);
+            assert_eq!(s.piece, piece, "the plane is for pieces of {piece} bytes");
+            assert_eq!(bytes, s.region + 2 * s.windows * s.window);
+            assert!(bytes <= OBJECT_MAX * 2);
+        }
+        // Out of the pieces' range, the nearest end.
+        assert_eq!(plane_for(1), plane_for(RING_MIN));
+        assert_eq!(plane_for(u64::MAX), plane_for(PIECE_MAX));
+        // Pieces of 16 MiB: 208 MiB of plane, as a share of 832 MiB makes.
+        assert_eq!(plane_for(PIECE_MAX).1, NATIVE_CHILD_MAX / 4);
+        // The account in whole pages, under half the room, and no least.
+        assert_eq!(measured_task_limit(4_758_480, 1 << 30), Some(4_759_552));
+        assert_eq!(measured_task_limit(64 << 20, 64 << 20), Some(32 << 20));
+        assert_eq!(measured_task_limit(1, 1 << 30), Some(PAGE));
+        assert_eq!(measured_task_limit(1 << 20, PAGE), None);
+    }
+
+    #[test]
     fn p_the_report_says_each_task_s_batches_cpu_and_account() {
         let t = TaskFigures {
             states: 1,
@@ -1031,6 +1295,7 @@ mod tests {
             cpu: Some(3),
             peak: 40 << 20,
             limit: 128 << 20,
+            largest: 16 << 20,
         };
         let note = stage_note("score", &[Some(t), None, Some(TaskFigures::default())], 2);
         assert!(
@@ -1039,7 +1304,7 @@ mod tests {
         );
         assert!(
             note.contains(
-                "task 0: 12 batches, 13 records, 2 deferred, cpu 3, account peak 41943040 of 134217728 bytes;"
+                "task 0: 12 batches, 13 records, 2 deferred, cpu 3, account peak 41943040 of 134217728 bytes, largest piece 16777216 bytes;"
             ),
             "{note}"
         );

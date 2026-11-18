@@ -219,6 +219,61 @@ impl Packaged {
         }
     }
 
+    /// Each of the stage's tasks sized from the node's readings of its function (system design
+    /// 3A): a plane for pieces of `piece` bytes and an account of `account` bytes, with the
+    /// readings' `margin`.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn size_measured(&self, piece: u64, account: u64, margin: f64) {
+        if let Packaged::Task(k) = self {
+            k.size_measured(piece, account, margin);
+        }
+    }
+
+    /// Each of the stage's tasks takes pieces of at most `bytes`, what its account holds by the
+    /// function's measured line (system design 3A).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn cap_pieces(&self, bytes: u64) {
+        if let Packaged::Task(k) = self {
+            k.cap_pieces(bytes);
+        }
+    }
+
+    /// The stage warms up on its first task before its others start (system design 3A): the
+    /// node has no readings of its function. `client` is what its registration measured, whose
+    /// slope the fit keeps; `freed` is told the room the others did not need. Whether it
+    /// does: a stage of the data plane's tasks only.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn warm_up(
+        &self,
+        client: Option<&moruna_cost::Memory>,
+        freed: Box<dyn Fn(u64) + Send + Sync>,
+    ) -> bool {
+        let Packaged::Task(k) = self else {
+            return false;
+        };
+        k.on_sized(freed);
+        k.warm_up(client.map(|m| moruna_micro::layout::Line {
+            fixed_bytes: m.fixed_bytes,
+            per_input_byte: m.per_input_byte,
+            spread: m.spread,
+            units: m.units,
+            input_bytes_min: m.input_bytes_min,
+            input_bytes_max: m.input_bytes_max,
+        }));
+        true
+    }
+
+    /// What each instance of the stage's tasks held (system design 3A): its account's peak and
+    /// limit and the largest piece it was given; `None` for a stage that is not one of the
+    /// data plane's tasks.
+    pub fn task_figures(&self) -> Option<Vec<Option<moruna_micro::layout::TaskFigures>>> {
+        match self {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::Task(k) => Some(k.figures()),
+            _ => None,
+        }
+    }
+
     // stream P: what a native stage's tasks did, in the run's report.
     /// The report's note of what the stage's tasks did (an image stage on the rings): each
     /// task's batches, CPU and account, and the most that held a batch at once.

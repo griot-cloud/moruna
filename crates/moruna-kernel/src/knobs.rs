@@ -103,6 +103,9 @@ pub struct StageStats {
     pub skipped: u32,
     /// Instances alive.
     pub instances_live: u16,
+    /// The largest morsel one of the stage's instances can take, as its kernel says it
+    /// (`Kernel::morsel_bytes_max`); `None` when nothing bounds it but the run's memory.
+    pub morsel_bytes_max: Option<u64>,
 }
 
 /// The scheduler's counters as the controller reads them.

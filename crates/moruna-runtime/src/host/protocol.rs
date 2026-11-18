@@ -221,6 +221,19 @@ impl std::fmt::Debug for Secrets {
 /// no part of the document or its digest.
 pub type Measured = std::collections::BTreeMap<String, moruna_cost::Memory>;
 
+/// Whose a function's measured memory is, as the `spec` message's `measured_by` says it by the
+/// function's registered name (system design 3A): a registration's sizes the arena's share and
+/// the instances only, since a client's process holds none of the function's interpreter; the
+/// node's own readings size the instances' accounts and planes too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasuredBy {
+    /// The registration's, as its client measured it.
+    Registration,
+    /// The node's, from jobs that ran the function there.
+    Node,
+}
+
 /// A message from the peer to Moruna (MH 4.3).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -241,6 +254,9 @@ pub enum Inbound {
         /// with none is absent, and the run sizes it as one nothing is known of.
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         measured: Measured,
+        /// Whose each of those is, by registered name; one not named is a registration's.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        measured_by: std::collections::BTreeMap<String, MeasuredBy>,
     },
     /// Cancel the run: the manifest is written and the process exits 130.
     Cancel,
@@ -716,6 +732,7 @@ mod tests {
                 plan: None,
                 secrets: Default::default(),
                 measured: Default::default(),
+                measured_by: Default::default(),
             })
         );
         // The job's secrets, by name, beside the document; what prints them prints their names.
@@ -751,6 +768,16 @@ mod tests {
         };
         let score = measured.get("gate-score").expect("by name");
         assert_eq!((score.per_input_byte, score.units), (0.054, 21));
+        let by = Inbound::parse(r#"{"type":"spec","spec":{},"measured_by":{"gate-score":"node"}}"#)
+            .expect("whose");
+        let Inbound::Spec { measured_by, .. } = &by else {
+            panic!("a spec")
+        };
+        assert_eq!(measured_by.get("gate-score"), Some(&MeasuredBy::Node));
+        assert!(
+            Inbound::parse(r#"{"type":"spec","spec":{},"measured_by":{"f":"guess"}}"#).is_err(),
+            "a measurement is a registration's or the node's"
+        );
         assert_eq!(
             Inbound::parse(&serde_json::to_string(&with).expect("written")),
             Ok(with.clone()),
@@ -767,6 +794,7 @@ mod tests {
             plan: None,
             secrets: Default::default(),
             measured: Default::default(),
+            measured_by: Default::default(),
         })
         .unwrap();
         assert!(
@@ -780,6 +808,7 @@ mod tests {
                 plan: Some("TVBMMQ==".into()),
                 secrets: Default::default(),
                 measured: Default::default(),
+                measured_by: Default::default(),
             })
         );
         assert!(Inbound::parse("{\"type\":\"resize\",\"memory\":1}").is_err());

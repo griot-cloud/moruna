@@ -563,6 +563,20 @@ pub struct StageReport {
     pub output_wait_s: Option<f64>,
 }
 
+/// What one instance of a stage whose function runs as processes of its own held (system
+/// design 3A): its account's peak and limit, and the largest piece it was given. The account
+/// is the function's whole memory, its process and its working memory, so its peak beside the
+/// largest piece is the pair a run refines the function's measured memory from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct InstanceMemory {
+    /// The most its account held at once, in bytes.
+    pub account_peak_bytes: u64,
+    /// Its account's limit, in bytes.
+    pub account_limit_bytes: u64,
+    /// The largest piece it was given: its batch's bytes.
+    pub largest_piece_bytes: u64,
+}
+
 /// What the user reads and what S1 to S4 are measured from (d.1). Pure in the trace, the
 /// limits and the meta (TR-I3).
 #[derive(Clone, Debug, Serialize)]
@@ -670,6 +684,12 @@ pub struct RunReport {
     /// The cost model's key is made of them (`CostKey::schema`, `CostKey::fingerprint`).
     #[serde(skip)]
     pub part_digests: PartDigests,
+    /// Each kernel stage's instances, stage 1 first, for a stage whose function runs as
+    /// processes of its own: what each held (system design 3A). Empty for any other stage, and
+    /// an instance whose task did not end is not among them. The facade fills it, as it fills
+    /// [`RunReport::part_digests`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub instance_memory: Vec<Vec<InstanceMemory>>,
 }
 
 fn io_paths_json<S: Serializer>(p: &IoPaths, s: S) -> core::result::Result<S::Ok, S::Error> {
@@ -1144,6 +1164,7 @@ impl RunReport {
             io: meta.io.clone(),
             object_io: meta.object_io,
             part_digests: PartDigests::default(),
+            instance_memory: Vec::new(),
         }
     }
 

@@ -733,6 +733,11 @@ fn tasks(
         put(&mut entry, "key", task.id.clone());
         put(&mut entry, "role", task.role.as_str());
         put(&mut entry, "kind", task.kind.clone());
+        // A registered function's task names the function (system design 3E): what the node's
+        // registry keeps the function's readings under.
+        if let Some(function) = task.function_name() {
+            put(&mut entry, "function", function);
+        }
         if let Some(digest) = task
             .settings
             .get("image")
@@ -778,6 +783,20 @@ fn tasks(
                         stage_figures(&mut entry, s);
                         errors = s.errors;
                         ran = s.morsels > 0;
+                    }
+                    // What each of its instances held (system design 3A): what a node refines
+                    // the function's measurement from, on the task that leads its stage.
+                    if members.first() == Some(&i)
+                        && let Some(held) = report
+                            .instance_memory
+                            .get(usize::from(stage) - 1)
+                            .filter(|held| !held.is_empty())
+                    {
+                        put(
+                            &mut entry,
+                            "instances_memory",
+                            serde_json::to_value(held).unwrap_or(Value::Null),
+                        );
                     }
                     // The function's measured memory as the job came with it (system design
                     // 3A), on the task that leads its stage.
@@ -1017,6 +1036,7 @@ mod tests {
             policy: None,
             io: Default::default(),
             object_io: None,
+            instance_memory: Vec::new(),
             part_digests: moruna_trace::PartDigests {
                 source_schemas: vec![Some([1; 32])],
                 stage_schemas: (0..stages).map(|_| Some([2; 32])).collect(),
@@ -1105,6 +1125,46 @@ mod tests {
             value["tasks"][2].get("measured").is_none(),
             "only the task that leads the stage"
         );
+        assert!(value["tasks"][1].get("instances_memory").is_none());
+
+        // What each instance held, on the task that leads its stage, as the report gives it.
+        let mut r = r;
+        let held = moruna_trace::InstanceMemory {
+            account_peak_bytes: 4_758_480,
+            account_limit_bytes: 134_217_728,
+            largest_piece_bytes: 16 << 20,
+        };
+        r.instance_memory = vec![vec![held, held]];
+        let value = doc(&r, None, &context);
+        assert_eq!(
+            value["tasks"][1]["instances_memory"],
+            json!([
+                {"account_peak_bytes": 4_758_480, "account_limit_bytes": 134_217_728,
+                 "largest_piece_bytes": 16u64 << 20},
+                {"account_peak_bytes": 4_758_480, "account_limit_bytes": 134_217_728,
+                 "largest_piece_bytes": 16u64 << 20},
+            ])
+        );
+        assert!(value["tasks"][2].get("instances_memory").is_none());
+        // A stage of no instances is said as none.
+        r.instance_memory = vec![Vec::new()];
+        assert!(
+            doc(&r, None, &context)["tasks"][1]
+                .get("instances_memory")
+                .is_none()
+        );
+        // A registered function's task names it; another task does not.
+        assert!(value["tasks"][1].get("function").is_none());
+        let mut job = context.job.clone();
+        job.tasks[1] = Task::kernel(
+            "shout",
+            KindDoc::new(
+                moruna_job::FUNCTION_KIND,
+                serde_json::Map::from_iter([("function".to_string(), json!("gate-score"))]),
+            ),
+        );
+        let named = ReportContext { job, ..context };
+        assert_eq!(doc(&r, None, &named)["tasks"][1]["function"], "gate-score");
         let key = &value["tasks"][1]["observation"]["key"];
         assert_eq!(key["kind"], "image");
         assert_eq!(key["settings"], moruna_cost::Digest([7; 32]).to_hex());

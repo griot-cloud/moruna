@@ -13,9 +13,17 @@
 //! ([`Tables`]). The root table and the three tables over the top of user space, which
 //! no unmap inside user space can cover, are the space's fixed charge
 //! (`moruna_abi::charge::SPACE`).
+//!
+//! An account is charged CPU time as well (ABI 2.10, item 6.3i): what the threads of the
+//! processes charged to it have used, and what every account carved out of it was charged
+//! ([`CpuTime`], [`charge_cpu`]). `account_cpu` reads it ([`cpu_answer`]). And an account
+//! counts the charges it refused ([`Refusals`], ABI 2.10): how many, and the largest, which
+//! `account_info` gives a caller that asks for its 80 bytes.
 
 #![no_std]
 #![forbid(unsafe_code)]
+
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use moruna_abi::charge;
 
@@ -49,6 +57,19 @@ pub struct Exceeded {
     pub usage: Usage,
 }
 
+/// The charges an account refused since it was made (ABI 2.10, items 6.3i and 6.3g): what
+/// tells a process that passed its account's room, refused an object or ended at a page it
+/// could not pay for, from one that ended for any other reason. They are the account's own:
+/// a charge an account carved out of it refuses is counted there, not here, and a carve that
+/// does not fit is no charge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Refusals {
+    /// How many charges it refused.
+    pub count: u64,
+    /// The largest request among them, in bytes.
+    pub largest: u64,
+}
+
 /// More given back than was charged or held: a broken invariant of the kernel's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Underflow {
@@ -56,14 +77,15 @@ pub struct Underflow {
     pub held: u64,
 }
 
-/// One account's figures: what is charged to it, what it holds for its children, and
-/// the most it ever had charged.
+/// One account's figures: what is charged to it, what it holds for its children, the
+/// most it ever had charged, and the charges it refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ledger {
     limit: u64,
     used: u64,
     peak: u64,
     reserved: u64,
+    refusals: Refusals,
 }
 
 impl Ledger {
@@ -74,7 +96,16 @@ impl Ledger {
             used: 0,
             peak: 0,
             reserved: 0,
+            refusals: Refusals {
+                count: 0,
+                largest: 0,
+            },
         }
+    }
+
+    /// The charges it refused since it was made (ABI 2.10).
+    pub fn refusals(&self) -> Refusals {
+        self.refusals
     }
 
     pub fn usage(&self) -> Usage {
@@ -94,9 +125,12 @@ impl Ledger {
             .is_some_and(|total| total <= self.limit)
     }
 
-    /// Charges `bytes`; refused, with nothing changed, when they do not fit.
+    /// Charges `bytes`; refused, with nothing charged and the refusal counted, when they
+    /// do not fit.
     pub fn charge(&mut self, bytes: u64) -> Result<(), Exceeded> {
         if !self.fits(bytes) {
+            self.refusals.count = self.refusals.count.saturating_add(1);
+            self.refusals.largest = self.refusals.largest.max(bytes);
             return Err(Exceeded {
                 asked: bytes,
                 usage: self.usage(),
@@ -232,8 +266,78 @@ pub fn table_steps(slots: usize) -> u64 {
     (slots as u64).div_ceil(charge::HANDLE_SLOTS)
 }
 
+/// The CPU time charged to one account (ABI 2.10), in nanoseconds, kernel time included:
+/// what the threads of the processes charged to it have used, and what was charged to
+/// every account carved out of it. It only grows: a process that has ended and a carved
+/// account that is gone stay counted. One atomic, so the scheduler's switch charges it
+/// with interrupts off and no lock held.
+#[derive(Debug, Default)]
+pub struct CpuTime(AtomicU64);
+
+impl CpuTime {
+    /// No time charged.
+    pub const fn new() -> CpuTime {
+        CpuTime(AtomicU64::new(0))
+    }
+
+    /// Charges `ns` more.
+    pub fn add(&self, ns: u64) {
+        self.0.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    /// Everything charged so far.
+    pub fn total(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// An account as its CPU charge sees it: its own time, and the account its limit was
+/// carved out of.
+pub trait Carved {
+    /// The CPU time charged to it.
+    fn cpu(&self) -> &CpuTime;
+    /// The account it was carved out of; `None` for the machine's.
+    fn parent(&self) -> Option<&Self>;
+}
+
+/// Charges `ns` of CPU time a thread used to `account`, the one its process is charged
+/// to, and to every account that one was carved out of, up to the machine's: an account's
+/// time is its own processes' and its children's, as its limit holds theirs.
+pub fn charge_cpu<A: Carved>(account: &A, ns: u64) {
+    let mut at = Some(account);
+    while let Some(account) = at {
+        account.cpu().add(ns);
+        at = account.parent();
+    }
+}
+
+/// Whether `account` is `tree` itself or was carved out of it, at any depth: whether CPU
+/// time charged to `account` is charged to `tree` too. The same account, not an equal one.
+pub fn within<A: Carved>(account: &A, tree: &A) -> bool {
+    let mut at = Some(account);
+    while let Some(account) = at {
+        if core::ptr::eq(account, tree) {
+            return true;
+        }
+        at = account.parent();
+    }
+    false
+}
+
+/// What `account_cpu` answers for an account charged `total` nanoseconds: with `running`,
+/// the slice the calling thread is in and has not been charged yet, when its process is
+/// charged within the account (`None` when it is not). Never past `i64::MAX`, which a
+/// caller would read as an error.
+pub fn cpu_answer(total: u64, running: Option<u64>) -> u64 {
+    total
+        .saturating_add(running.unwrap_or(0))
+        .min(i64::MAX as u64)
+}
+
 #[cfg(test)]
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 #[cfg(test)]
 mod tests {
@@ -558,5 +662,283 @@ mod tests {
         assert_eq!(table_steps(64), 1);
         assert_eq!(table_steps(65), 2);
         assert_eq!(table_steps(4096), 64);
+    }
+
+    use alloc::sync::Arc;
+
+    /// An account as the core keeps one, for its CPU time: carved out of a parent it
+    /// holds, as `kernel/core/src/account.rs` holds its own.
+    #[derive(Debug, Default)]
+    struct Node {
+        cpu: CpuTime,
+        parent: Option<Arc<Node>>,
+    }
+
+    impl Carved for Node {
+        fn cpu(&self) -> &CpuTime {
+            &self.cpu
+        }
+        fn parent(&self) -> Option<&Node> {
+            self.parent.as_deref()
+        }
+    }
+
+    fn carve(parent: &Arc<Node>) -> Arc<Node> {
+        Arc::new(Node {
+            cpu: CpuTime::new(),
+            parent: Some(parent.clone()),
+        })
+    }
+
+    /// A process: its threads' slices are charged to the account it was made in.
+    struct Process(Arc<Node>);
+
+    impl Process {
+        fn ran(&self, ns: u64) {
+            charge_cpu(&*self.0, ns);
+        }
+    }
+
+    /// 6.3i, for 6.3g: an account counts the charges it refuses, how many and the largest,
+    /// and nothing else about it moves; a charge that fits, a charge given back and a carve
+    /// that does not fit count nothing.
+    #[test]
+    fn i63_a_ledger_counts_the_charges_it_refuses_and_the_largest() {
+        let mut l = Ledger::new(16 * 4096);
+        assert_eq!(l.refusals(), Refusals::default());
+        l.charge(12 * 4096).unwrap();
+        assert_eq!(l.refusals(), Refusals::default());
+        // Past the limit: refused, counted, the figures as they were.
+        let before = l.usage();
+        assert!(l.charge(5 * 4096).is_err());
+        assert_eq!(
+            l.refusals(),
+            Refusals {
+                count: 1,
+                largest: 5 * 4096
+            }
+        );
+        assert_eq!(l.usage(), before);
+        // A smaller one after it, still past the four pages left, is counted and is not the
+        // largest; a larger one is.
+        assert!(l.charge(4 * 4096 + 32).is_err());
+        assert!(l.charge(64 * MIB).is_err());
+        assert_eq!(
+            l.refusals(),
+            Refusals {
+                count: 3,
+                largest: 64 * MIB
+            }
+        );
+        // What fits is still charged, and a charge given back takes no refusal with it.
+        l.charge(4 * 4096).unwrap();
+        l.uncharge(16 * 4096).unwrap();
+        assert_eq!(l.refusals().count, 3);
+        assert_eq!(l.usage().used, 0);
+        // A carve that does not fit is no charge, nor is one that does.
+        assert!(l.reserve(17 * 4096).is_err());
+        l.reserve(16 * 4096).unwrap();
+        assert_eq!(l.refusals().count, 3);
+        // Held whole for a child, it refuses the next charge of its own: a page.
+        assert!(l.charge(4096).is_err());
+        assert_eq!(
+            l.refusals(),
+            Refusals {
+                count: 4,
+                largest: 64 * MIB
+            }
+        );
+        // A request no counter holds is refused and counted, never wrapped.
+        let mut big = Ledger::new(u64::MAX);
+        big.charge(u64::MAX - 1).unwrap();
+        assert!(big.charge(u64::MAX).is_err());
+        assert_eq!(
+            big.refusals(),
+            Refusals {
+                count: 1,
+                largest: u64::MAX
+            }
+        );
+    }
+
+    /// 6.3i, for 6.3g: the refusals are each account's own. An instance that passes the
+    /// account carved for it is counted there and not in the engine's; the engine, its room
+    /// held for its instances, counts its own.
+    #[test]
+    fn i63_a_carved_account_s_refusals_are_its_own_and_its_parent_s_are_its_parent_s() {
+        // The engine's account, and an instance's carved out of it: the parent holds the
+        // child's limit, whole.
+        let mut engine = Ledger::new(64 * MIB);
+        engine.reserve(16 * MIB).unwrap();
+        let mut instance = Ledger::new(16 * MIB);
+        // The instance fills its account and asks for a page more: its account refuses.
+        instance.charge(16 * MIB - 4096).unwrap();
+        assert!(instance.charge(4096 + 32).is_err());
+        assert_eq!(
+            instance.refusals(),
+            Refusals {
+                count: 1,
+                largest: 4128
+            }
+        );
+        // The engine's account was never asked: the charge was the instance's.
+        assert_eq!(engine.refusals(), Refusals::default());
+        assert_eq!(engine.usage().used, 0);
+        // The engine's own charge past what it has left beside its instances is its own.
+        engine.charge(48 * MIB).unwrap();
+        assert!(engine.charge(MIB).is_err());
+        assert_eq!(
+            engine.refusals(),
+            Refusals {
+                count: 1,
+                largest: MIB
+            }
+        );
+        assert_eq!(instance.refusals().count, 1);
+        // The instance restarted in a new account with more room: nothing refused yet, and
+        // the engine keeps what it counted when the first one's limit comes back.
+        engine.unreserve(16 * MIB).unwrap();
+        engine.uncharge(32 * MIB).unwrap();
+        engine.reserve(32 * MIB).unwrap();
+        let mut again = Ledger::new(32 * MIB);
+        again.charge(16 * MIB + 4128).unwrap();
+        assert_eq!(again.refusals(), Refusals::default());
+        assert_eq!(engine.refusals().count, 1);
+    }
+
+    /// 6.3i: a slice is charged along the parent chain, so a job's account holds the CPU of
+    /// its engine and of every function instance carved from it, and nothing of its
+    /// neighbour's.
+    #[test]
+    fn i63_a_slice_is_charged_to_the_account_and_to_every_account_above_it() {
+        let machine = Arc::new(Node::default());
+        let admission = carve(&machine);
+        let job = carve(&admission);
+        let runtime = carve(&job);
+        let task = carve(&runtime);
+        let other_job = carve(&admission);
+
+        Process(task.clone()).ran(5);
+        for account in [&task, &runtime, &job, &admission, &machine] {
+            assert_eq!(account.cpu.total(), 5);
+        }
+        // The engine's own threads: its account and those above, not the instance's.
+        Process(runtime.clone()).ran(7);
+        assert_eq!(task.cpu.total(), 5);
+        for account in [&runtime, &job, &admission, &machine] {
+            assert_eq!(account.cpu.total(), 12);
+        }
+        // A neighbour is charged its own, and the accounts above hold both.
+        assert_eq!(other_job.cpu.total(), 0);
+        Process(other_job.clone()).ran(100);
+        assert_eq!(other_job.cpu.total(), 100);
+        assert_eq!(job.cpu.total(), 12);
+        assert_eq!(admission.cpu.total(), 112);
+        assert_eq!(machine.cpu.total(), 112);
+        // No time is no charge, and the machine's account has nothing above it.
+        charge_cpu(&*task, 0);
+        charge_cpu(&*machine, 1);
+        assert_eq!(task.cpu.total(), 5);
+        assert_eq!(machine.cpu.total(), 113);
+        assert_eq!(admission.cpu.total(), 112);
+    }
+
+    /// 6.3i: the time is the account's, not the process's: a process that has ended stays
+    /// counted, and another made in the account adds to it.
+    #[test]
+    fn i63_an_ended_process_stays_counted() {
+        let machine = Arc::new(Node::default());
+        let job = carve(&machine);
+        let first = Process(job.clone());
+        first.ran(40);
+        first.ran(2);
+        drop(first);
+        assert_eq!(job.cpu.total(), 42);
+        assert_eq!(machine.cpu.total(), 42);
+        let second = Process(job.clone());
+        second.ran(8);
+        drop(second);
+        assert_eq!(job.cpu.total(), 50);
+        assert_eq!(machine.cpu.total(), 50);
+    }
+
+    /// 6.3i: an account carved from another is charged its own processes' time alone, its
+    /// parent that and its own; a carved account that is gone leaves its time in its
+    /// parent, and one carved after it starts at nothing.
+    #[test]
+    fn i63_a_carved_account_s_time_is_its_parent_s_too_and_outlives_it() {
+        let engine = Arc::new(Node::default());
+        Process(engine.clone()).ran(3);
+        let instance = carve(&engine);
+        Process(instance.clone()).ran(30);
+        assert_eq!(instance.cpu.total(), 30);
+        assert_eq!(engine.cpu.total(), 33);
+        // The instance ends and its account goes: the last holder drops it.
+        assert_eq!(Arc::strong_count(&instance), 1);
+        drop(instance);
+        assert_eq!(engine.cpu.total(), 33);
+        let next = carve(&engine);
+        assert_eq!(next.cpu.total(), 0);
+        Process(next.clone()).ran(4);
+        assert_eq!(next.cpu.total(), 4);
+        assert_eq!(engine.cpu.total(), 37);
+    }
+
+    /// 6.3i: slices charged at once from several CPUs all land.
+    #[test]
+    fn i63_slices_charged_from_several_cpus_at_once_all_land() {
+        let job = Arc::new(Node::default());
+        let instances: alloc::vec::Vec<_> = (0..4).map(|_| carve(&job)).collect();
+        let cpus: alloc::vec::Vec<_> = instances
+            .iter()
+            .cloned()
+            .map(|instance| {
+                std::thread::spawn(move || {
+                    for _ in 0..10_000 {
+                        charge_cpu(&*instance, 3);
+                    }
+                })
+            })
+            .collect();
+        for cpu in cpus {
+            cpu.join().unwrap();
+        }
+        for instance in &instances {
+            assert_eq!(instance.cpu.total(), 30_000);
+        }
+        assert_eq!(job.cpu.total(), 120_000);
+    }
+
+    /// 6.3i: whose running slice `account_cpu` adds: the caller's, when its process is
+    /// charged to the account read or to one carved from it.
+    #[test]
+    fn i63_an_account_is_within_itself_and_within_what_it_was_carved_from() {
+        let machine = Arc::new(Node::default());
+        let engine = carve(&machine);
+        let instance = carve(&engine);
+        let neighbour = carve(&machine);
+        assert!(within(&*engine, &*engine));
+        assert!(within(&*instance, &*engine));
+        assert!(within(&*instance, &*machine));
+        assert!(!within(&*engine, &*instance));
+        assert!(!within(&*neighbour, &*engine));
+        assert!(!within(&*machine, &*engine));
+        // The same account, not one that reads the same.
+        assert_eq!(engine.cpu.total(), neighbour.cpu.total());
+        assert!(!within(&*engine, &*neighbour));
+    }
+
+    #[test]
+    fn i63_the_answer_adds_the_caller_s_running_slice_and_is_never_an_error() {
+        assert_eq!(cpu_answer(0, None), 0);
+        assert_eq!(cpu_answer(1_000, None), 1_000);
+        assert_eq!(cpu_answer(1_000, Some(250)), 1_250);
+        assert_eq!(cpu_answer(1_000, Some(0)), 1_000);
+        // 292 years of CPU time is the most it says: above it a caller reads an error.
+        let most = i64::MAX as u64;
+        assert_eq!(cpu_answer(most, None), most);
+        assert_eq!(cpu_answer(most, Some(1)), most);
+        assert_eq!(cpu_answer(u64::MAX, Some(u64::MAX)), most);
+        assert!(moruna_abi::Error::from_raw(cpu_answer(u64::MAX, None)).is_ok());
     }
 }

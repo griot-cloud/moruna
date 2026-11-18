@@ -456,6 +456,8 @@ impl Account {
             used: account.used.load(Ordering::Relaxed),
             peak: account.peak.load(Ordering::Relaxed),
             reserved: 0,
+            refused: 0,
+            refused_max: 0,
         })
     }
     pub fn matches(&self, other: &Handle) -> Result<bool> {
@@ -488,6 +490,10 @@ pub struct Usage {
     pub peak: u64,
     /// Held for the accounts carved out of it: none here.
     pub reserved: u64,
+    /// The charges it refused (ABI 2.10): none here, where no charge is refused.
+    pub refused: u64,
+    /// The largest of them, in bytes: none here.
+    pub refused_max: u64,
 }
 
 impl Usage {

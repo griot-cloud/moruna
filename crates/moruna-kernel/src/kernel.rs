@@ -344,4 +344,23 @@ pub trait Kernel: Send + Sync + 'static {
     fn deals_instances(&self) -> bool {
         false
     }
+    /// How many of a stateful kernel's instances may be given work now, the first ones; the
+    /// rest are started, and given work, once it rises (system design 3A: a function measured by
+    /// nothing yet is warmed up on its first instance, and the others are sized from what that
+    /// finds). A worker that finds none of a stage's ready instances free takes other work, so
+    /// only that stage waits. Every instance, for a kernel that does not say otherwise.
+    fn instances_ready(&self) -> usize {
+        usize::MAX
+    }
+    /// The largest morsel, in input bytes, one of this kernel's instances can take inside its own
+    /// room (system design 3A: a function's measured memory bounds its morsel, piece <= (room -
+    /// fixed) / per-byte): `None` when nothing bounds it but the run's memory, which the
+    /// controller's inequalities already hold it to. The controller holds the stage's target to
+    /// it, below `morsel_min` if it must, since a smaller morsel is only slower and a larger one
+    /// fails the instance; and the kernel cuts a larger batch into slices of it, since the target
+    /// bounds only what the source reads for its first consumer (PM, 2026-11-18). Read on every
+    /// tick: a warm-up's measurement may lower it.
+    fn morsel_bytes_max(&self) -> Option<u64> {
+        None
+    }
 }

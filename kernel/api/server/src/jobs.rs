@@ -25,7 +25,7 @@ use alloc::{
 };
 use moruna_api::{
     EVENTS_PAGE, EVENTS_PAGE_BYTES, ErrorCode, Function, Heartbeat, Job, JobState, JobStatus,
-    JobSummary, Jobs as JobList, Measured, Refusal, Submitted, Validation,
+    JobSummary, Jobs as JobList, Measured, MeasuredBy, Refusal, Submitted, Validation,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -129,6 +129,66 @@ struct Flight {
     heartbeat: Option<Arc<str>>,
     report: Option<(Arc<str>, Option<Arc<str>>)>,
     skipped: u64,
+    /// The functions the job uses, each name with its image's SHA-256 as the registry had it
+    /// when the job started: what the job's readings are of (system design 3A).
+    functions: Vec<(String, String)>,
+}
+
+/// One function task of a report, as the node reads it for the function's readings (system
+/// design 3A): its registered name, and what each of its instances held.
+#[derive(Deserialize)]
+struct ReadTask {
+    #[serde(default)]
+    function: Option<String>,
+    #[serde(default)]
+    instances_memory: Vec<ReadInstance>,
+}
+
+#[derive(Deserialize)]
+struct ReadInstance {
+    account_peak_bytes: u64,
+    largest_piece_bytes: u64,
+}
+
+#[derive(Deserialize)]
+struct ReadReport {
+    #[serde(default)]
+    tasks: Vec<ReadTask>,
+}
+
+/// What a report read of one function a job used (system design 3A): its name, its image's
+/// SHA-256 as the job started with it, and each instance's `(largest piece, account peak)`.
+pub(crate) type Reading = (String, String, Vec<(u64, u64)>);
+
+/// What a job's report says of each function the job uses (system design 3A): its name, its
+/// image as the job started with it, and each instance's largest piece and account peak.
+fn readings_of(report: &str, functions: &[(String, String)]) -> Vec<Reading> {
+    let Ok(read) = serde_json::from_str::<ReadReport>(report) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Reading> = Vec::new();
+    for task in read.tasks {
+        let Some(name) = task.function else {
+            continue;
+        };
+        let Some((_, sha256)) = functions.iter().find(|(n, _)| *n == name) else {
+            continue;
+        };
+        let pairs: Vec<(u64, u64)> = task
+            .instances_memory
+            .iter()
+            .map(|i| (i.largest_piece_bytes, i.account_peak_bytes))
+            .filter(|(x, _)| *x > 0)
+            .collect();
+        if pairs.is_empty() {
+            continue;
+        }
+        match out.iter_mut().find(|(n, _, _)| *n == name) {
+            Some((_, _, kept)) => kept.extend(pairs),
+            None => out.push((name, sha256.clone(), pairs)),
+        }
+    }
+    out
 }
 
 /// A document waiting for the engine's check.
@@ -218,16 +278,32 @@ impl Parsed {
 
 /// The `spec` message `spec` with the measured memory of the functions the job uses beside the
 /// document, by each one's registered name: its `measured` member, for those of `registered`
-/// the registry holds a measurement of (system design 3A, 3E). The engine sizes the job from
-/// it. A job none of whose functions was measured is sent as it is.
+/// the registry holds a measurement of, and its `measured_by` member, whose each is (system
+/// design 3A, 3E). The engine sizes the job from it: a registration's sizes the arena's share
+/// and the instances, the node's their accounts and planes too. A job none of whose functions
+/// was measured is sent as it is.
 fn with_measured(spec: &str, registered: &[Function]) -> String {
     let measured: BTreeMap<&str, &Measured> = registered
         .iter()
         .filter_map(|function| Some((function.name.as_str(), function.measured.as_ref()?)))
         .collect();
-    match (spec.strip_suffix("}\n"), serde_json::to_string(&measured)) {
-        (Some(head), Ok(named)) if !measured.is_empty() => {
-            format!("{head},\"measured\":{named}}}\n")
+    let by: BTreeMap<&str, MeasuredBy> = registered
+        .iter()
+        .filter(|function| function.measured.is_some())
+        .map(|function| {
+            (
+                function.name.as_str(),
+                function.measured_by.unwrap_or(MeasuredBy::Registration),
+            )
+        })
+        .collect();
+    match (
+        spec.strip_suffix("}\n"),
+        serde_json::to_string(&measured),
+        serde_json::to_string(&by),
+    ) {
+        (Some(head), Ok(named), Ok(by)) if !measured.is_empty() => {
+            format!("{head},\"measured\":{named},\"measured_by\":{by}}}\n")
         }
         _ => String::from(spec),
     }
@@ -330,6 +406,9 @@ pub(crate) struct Jobs {
     ordinals: u64,
     /// The answers that waiting calls can now have.
     resolved: Vec<(u64, Answer)>,
+    /// What the jobs' reports read of the functions they used, for the registry (system design
+    /// 3A): each function's name, its image, and each instance's largest piece and account peak.
+    readings: Vec<Reading>,
 }
 
 /// An answer with `value` as its body and this status, its secrets taken out.
@@ -388,6 +467,13 @@ impl Jobs {
         core::mem::take(&mut self.resolved)
     }
 
+    /// What the reports that have come read of the functions their jobs used, taken: each
+    /// function's name, its image's SHA-256 as the job started with it, and each instance's
+    /// largest piece and account peak (system design 3A).
+    pub(crate) fn readings(&mut self) -> Vec<Reading> {
+        core::mem::take(&mut self.readings)
+    }
+
     /// `POST /v1/jobs/validate`: queues the document in `body` for the engine's check, and
     /// gives the ticket its verdict will come under; or the answer, when the body is no job.
     pub(crate) fn validate(&mut self, body: &[u8]) -> Result<u64, Answer> {
@@ -438,6 +524,11 @@ impl Jobs {
             return;
         };
         let spec = with_measured(spec, &verdict.registered);
+        let functions = verdict
+            .registered
+            .iter()
+            .map(|f| (f.name.clone(), f.sha256.clone()))
+            .collect();
         let started = host.start(spec.as_bytes(), verdict);
         let ticket = check.wanted.then_some(check.ticket);
         if let Err(error) = started {
@@ -457,6 +548,7 @@ impl Jobs {
             heartbeat: None,
             report: None,
             skipped: 0,
+            functions,
         });
     }
 
@@ -809,6 +901,8 @@ impl Jobs {
             "heartbeat" => self.heartbeat(Arc::from(text), now_ms),
             "report" => {
                 if let Ok(message) = serde_json::from_str::<ReportLine<'_>>(&text) {
+                    let readings = readings_of(message.report.get(), &flight.functions);
+                    self.readings.extend(readings);
                     let report = Arc::from(message.report.get());
                     let plan = message.plan.map(|plan| Arc::from(plan.get()));
                     self.keep_report(report, plan);

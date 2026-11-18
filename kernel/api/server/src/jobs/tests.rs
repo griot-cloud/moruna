@@ -1117,6 +1117,47 @@ fn a_submit_is_checked_and_started_with_the_checks_budget_and_needs() {
     assert!(!sent.contains("measured"), "{sent}");
 }
 
+/// System design 3A (6.3g phase 3): what a report says each instance of a function held is
+/// kept for the function's image as the job started with it.
+#[test]
+fn a_report_s_readings_are_of_the_image_the_job_started_with() {
+    let functions = [
+        ("taxi.clean".to_string(), "ab".repeat(32)),
+        ("taxi.score".to_string(), "cd".repeat(32)),
+    ];
+    let report = json!({"tasks": [
+        {"key": "rows", "role": "source"},
+        {"key": "clean", "kind": "function", "function": "taxi.clean", "instances_memory": [
+            {"account_peak_bytes": 5_000_000, "account_limit_bytes": 134_217_728,
+             "largest_piece_bytes": 16_777_216},
+            {"account_peak_bytes": 4_000_000, "account_limit_bytes": 134_217_728,
+             "largest_piece_bytes": 8_000_000}]},
+        {"key": "again", "kind": "function", "function": "taxi.clean", "instances_memory": [
+            {"account_peak_bytes": 6_000_000, "account_limit_bytes": 1,
+             "largest_piece_bytes": 16_777_216},
+            {"account_peak_bytes": 6_000_000, "account_limit_bytes": 1,
+             "largest_piece_bytes": 0}]},
+        {"key": "score", "kind": "function", "function": "taxi.score"},
+        {"key": "other", "kind": "function", "function": "not.started", "instances_memory": [
+            {"account_peak_bytes": 1, "account_limit_bytes": 1, "largest_piece_bytes": 1}]},
+    ]})
+    .to_string();
+    assert_eq!(
+        readings_of(&report, &functions),
+        vec![(
+            "taxi.clean".to_string(),
+            "ab".repeat(32),
+            vec![
+                (16_777_216, 5_000_000),
+                (8_000_000, 4_000_000),
+                (16_777_216, 6_000_000)
+            ]
+        )]
+    );
+    assert!(readings_of("not JSON", &functions).is_empty());
+    assert!(readings_of("{}", &functions).is_empty());
+}
+
 /// System design 3A, 3E (6.3g): the measured memory of the functions a job uses goes to the
 /// engine in the `spec` message, beside the document and the secrets, by registered name.
 #[test]
@@ -1170,8 +1211,12 @@ fn the_spec_carries_the_measured_memory_of_the_functions_the_job_uses() {
     assert_eq!(message["spec"]["moruna_spec"], 1);
     assert_eq!(message["secrets"], json!({"aws.key": "hunter2"}));
     // The function the job uses that was measured, and no other: not the one it uses that was
-    // not, nor the one that was and that it does not use.
+    // not, nor the one that was and that it does not use; and whose the measurement is.
     assert_eq!(message["measured"], json!({"taxi.clean": measured(21)}));
+    assert_eq!(
+        message["measured_by"],
+        json!({"taxi.clean": "registration"})
+    );
 
     // The helper alone: every measured function of the job's, and a message left as it is.
     let both = registry.registered(&["taxi.clean".to_string(), "taxi.audit".to_string()]);
@@ -1180,6 +1225,10 @@ fn the_spec_carries_the_measured_memory_of_the_functions_the_job_uses() {
     assert_eq!(
         message["measured"],
         json!({"taxi.audit": measured(40), "taxi.clean": measured(21)})
+    );
+    assert_eq!(
+        message["measured_by"],
+        json!({"taxi.audit": "registration", "taxi.clean": "registration"})
     );
     let none = registry.registered(&["taxi.score".to_string()]);
     assert_eq!(

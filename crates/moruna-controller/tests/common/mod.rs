@@ -194,6 +194,7 @@ pub fn stats(active: u16, busy: u16) -> SchedulerStats {
             errors: 0,
             skipped: 0,
             instances_live: 1,
+            morsel_bytes_max: None,
         }],
         workers_active: active,
         workers_busy: busy,

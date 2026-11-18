@@ -73,7 +73,7 @@ fn probe(v: RawHandle) -> Option<usize> {
         if v == 0 {
             Error::BadHandle.to_raw()
         } else {
-            raw::account_info(v, &mut [0; 64])
+            raw::account_info(v, &mut [0; moruna_abi::account_info::SIZE])
         },
         if v == 0 {
             Error::BadHandle.to_raw()

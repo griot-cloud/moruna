@@ -24,7 +24,7 @@ pub(crate) fn check(state: &mut ControllerState, r: &TraceRecord, actions: &mut 
         return;
     };
     let stage = state.stages[at].stage;
-    let morsel_min = state.cfg.morsel_min;
+    let morsel_min = state.target_min(at);
 
     if state.stages[at].device_breaches >= 1 {
         // Once is a retry worth making; twice on the same stage is a device budget the stage

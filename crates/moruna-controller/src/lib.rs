@@ -483,6 +483,10 @@ pub(crate) struct StageCtl {
     pub state_by_instance: HashMap<u16, u64>,
     /// Instances the scheduler reports alive.
     pub instances_live: u16,
+    /// The largest morsel one of the stage's instances can take, as its kernel says it, read
+    /// at `prepare` and on every tick (system design 3A); `None` when nothing bounds it but the
+    /// run's memory.
+    pub morsel_cap: Option<u64>,
     /// Prediction errors of the active sizer, newest last (f.8).
     pub sizer_errors: VecDeque<f64>,
     /// Prediction errors of the shadow rule sizer, newest last (f.8).
@@ -567,6 +571,7 @@ impl StageCtl {
             bytes_in_window: VecDeque::new(),
             state_by_instance: HashMap::new(),
             instances_live: 0,
+            morsel_cap: None,
             sizer_errors: VecDeque::new(),
             shadow_errors: VecDeque::new(),
             predicted_peak: None,
@@ -740,6 +745,27 @@ impl ControllerState {
     /// The kernel stages, which is `S` in f.3.
     pub(crate) fn stage_count(&self) -> usize {
         self.stages.len()
+    }
+
+    /// The largest target stage `at` may have: `morsel_max`, held below the largest morsel one
+    /// of its instances can take where its kernel says one (system design 3A).
+    pub(crate) fn target_max(&self, at: usize) -> u64 {
+        let max = self.cfg.morsel_max;
+        self.stages
+            .get(at)
+            .and_then(|ctl| ctl.morsel_cap)
+            .map_or(max, |cap| cap.clamp(1, max.max(1)))
+    }
+
+    /// The least target stage `at` may have: `morsel_min`, or its largest where that is less. A
+    /// smaller morsel is only slower; a larger one fails the instance (PM, 2026-11-18).
+    pub(crate) fn target_min(&self, at: usize) -> u64 {
+        self.cfg.morsel_min.min(self.target_max(at))
+    }
+
+    /// `bytes` held to stage `at`'s range.
+    pub(crate) fn clamp_target(&self, at: usize, bytes: u64) -> u64 {
+        bytes.clamp(self.target_min(at), self.target_max(at))
     }
 
     /// The queues: one per edge of the run's DAG (Q0 to Qn in a chain).

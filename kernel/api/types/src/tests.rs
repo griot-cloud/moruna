@@ -542,6 +542,115 @@ fn a_function_and_its_registration_round_trip_3e() {
     );
 }
 
+/// System design 3A (6.3g phase 3): a function's memory as the node measures it from its
+/// readings, with the client's slope and without one.
+#[test]
+fn the_node_measures_a_function_from_its_readings_3a() {
+    const MIB: u64 = 1 << 20;
+    assert_eq!(Measured::from_readings(&[], None), None);
+    assert_eq!(
+        Measured::from_readings(&[(0, 9)], None),
+        None,
+        "a piece of nothing says nothing"
+    );
+    for x in [0.0, 1.0, 2.0, 1e12, 0.25] {
+        assert!(
+            (super::sqrt(x) * super::sqrt(x) - x).abs() <= x * 1e-12 + 1e-300,
+            "{x}"
+        );
+    }
+    assert_eq!(
+        (
+            super::sqrt(-1.0),
+            super::sqrt(f64::NAN),
+            super::sqrt(f64::INFINITY)
+        ),
+        (0.0, 0.0, 0.0)
+    );
+
+    // Score's run 3 readings: four instances, 16 MiB pieces, 4.5 MiB peaks.
+    let score = [(16 * MIB, 4_758_480); 4];
+    // Without the client's measurement: one size, so the fixed term is the largest peak.
+    let alone = Measured::from_readings(&score, None).expect("measured");
+    assert_eq!(
+        (alone.fixed_bytes, alone.per_input_byte),
+        (4_758_480.0, 0.0)
+    );
+    assert_eq!(alone.units, 4);
+    assert_eq!(
+        (alone.input_bytes_min, alone.input_bytes_max),
+        (16 * MIB, 16 * MIB)
+    );
+    assert!(alone.spread < 1e-12 && alone.output_per_input_byte.is_none());
+    // A span under twice its least is one size too: the largest peak stands.
+    let near =
+        Measured::from_readings(&[(10 * MIB, 4 * MIB), (16 * MIB, 5 * MIB)], None).expect("m");
+    assert_eq!(
+        (near.fixed_bytes, near.per_input_byte),
+        ((5 * MIB) as f64, 0.0)
+    );
+
+    // With the client's: its slope, and the node's fixed term, the largest peak less it.
+    let client = Measured {
+        fixed_bytes: 1_310_720.0,
+        per_input_byte: 0.054,
+        output_per_input_byte: Some(0.21),
+        spread: 0.02,
+        units: 21,
+        input_bytes_min: 149_000,
+        input_bytes_max: 33_525_000,
+    };
+    let both = Measured::from_readings(&score, Some(&client)).expect("measured");
+    assert_eq!(both.per_input_byte, 0.054);
+    let fixed = 4_758_480.0 - 0.054 * (16 * MIB) as f64;
+    assert!((both.fixed_bytes - fixed).abs() < 1e-6, "{both:?}");
+    assert_eq!(both.output_per_input_byte, Some(0.21), "the client's");
+    assert!(both.spread < 1e-12, "every reading is on the line");
+    // A function measured to hold more per byte than any reading shows: the fixed term is not
+    // less than nothing.
+    let steep = Measured {
+        per_input_byte: 1.0,
+        ..client.clone()
+    };
+    assert_eq!(
+        Measured::from_readings(&score, Some(&steep))
+            .expect("m")
+            .fixed_bytes,
+        0.0
+    );
+
+    // Over a wide span without the client's: the line through the readings.
+    let line = [(MIB, 5 * MIB), (4 * MIB, 8 * MIB), (16 * MIB, 20 * MIB)];
+    let wide = Measured::from_readings(&line, None).expect("measured");
+    assert!((wide.per_input_byte - 1.0).abs() < 1e-9, "{wide:?}");
+    assert!(
+        (wide.fixed_bytes - (4 * MIB) as f64).abs() < 1.0,
+        "{wide:?}"
+    );
+    assert!(wide.spread < 1e-9);
+    // Kept to what memory can be: through the origin, or flat at the mean.
+    let below = Measured::from_readings(&[(MIB, 0), (4 * MIB, 6 * MIB)], None).expect("m");
+    assert_eq!(below.fixed_bytes, 0.0);
+    assert!(below.per_input_byte > 1.0, "{below:?}");
+    let falling = Measured::from_readings(&[(MIB, 8 * MIB), (4 * MIB, 2 * MIB)], None).expect("m");
+    assert_eq!(
+        (falling.fixed_bytes, falling.per_input_byte),
+        ((5 * MIB) as f64, 0.0)
+    );
+    // A spread: readings a tenth either side of their line.
+    let noisy = Measured::from_readings(
+        &[(16 * MIB, 11 * MIB), (16 * MIB, 9 * MIB)],
+        Some(&Measured {
+            per_input_byte: 0.0,
+            ..client.clone()
+        }),
+    )
+    .expect("m");
+    assert_eq!(noisy.fixed_bytes, (11 * MIB) as f64);
+    assert!((noisy.spread - 0.129).abs() < 0.01, "{}", noisy.spread);
+    assert!(Z95 * noisy.spread > 0.2);
+}
+
 /// System design 3A, 3E (6.3g): a registration may carry the function's measured memory, and a
 /// listed function shows it and whose it is.
 #[test]

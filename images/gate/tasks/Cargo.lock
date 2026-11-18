@@ -676,6 +676,7 @@ dependencies = [
  "moruna-ipc-check",
  "moruna-plane",
  "moruna-sys",
+ "serde_json",
 ]
 
 [[package]]

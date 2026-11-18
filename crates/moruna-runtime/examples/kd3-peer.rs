@@ -46,6 +46,7 @@ fn converse(mut reader: BufReader<UnixStream>, spec: Value, cancel: bool) -> Res
             plan: None,
             secrets: Default::default(),
             measured: Default::default(),
+            measured_by: Default::default(),
         },
     )?;
     common::converse(

@@ -77,6 +77,10 @@ It refuses to know: where morsel bytes are (placement); how big a morsel should 
 
 **SC-I18. A stage that joins its inputs by morsel applies one set of one number (0.6.1, contracts d.16).** For a kernel whose `aligns_inputs` is true (`moruna.std.join`), a worker that takes a morsel on one port keeps it with the others of its number until every port has given one, and only then calls `Kernel::apply_aligned` with the set, port 0 first; the output keeps the number, the record is one per set, and each port's share is released once the call returns. A set its ended inputs will never complete ends the run naming the stage, the number and the ports it came on, unless the error policy skipped a morsel upstream, in which case the incomplete sets are dropped and counted as the stage's skips.
 
+**SC-I19. A stage's instances not yet ready wait without a worker (6.3g, system design 3A).** A stateful kernel says how many of its instances may be given work now (`Kernel::instances_ready`, every one by default): the first ones. `init_instances` makes only those; `admissible` and `acquire` consider only those, and a dealt stage deals among them; the rest are made by `acquire` when they become ready. A worker that finds none of a stage's ready instances free takes other stages' work, so a stage warming up on its first instance holds no other worker. SC-T53.
+
+**SC-I20. No read or knob passes what the consumer's instances take (6.3g, system design 3A).** A `MorselTarget` knob is clamped into the stage's range, `morsel_min..=morsel_max` held below the kernel's `morsel_bytes_max` (and `morsel_min` with it, where that is less); the source drive's reads for a stage's first consumer are sized in that range, and a split's short remainder is not joined to a read that it would take past the range's top. SC-T54.
+
 ## d. Interfaces
 
 ### d.1 Exposed
@@ -400,6 +404,10 @@ Tests use `FakePlacement`, `FakeSource`, `FakeSink`, `FakeKernel`, `FakeTrace`, 
 **SC-T45 an_immovable_wall_ends_the_run.** (`src/tests/sc_t45_an_immovable_wall_ends_the_run.rs`) A kernel whose every apply is refused, on one worker, with a placement that frees nothing: the run is ended with the allocation error after the wall has stood for the quiet limit (five seconds) and before four times it, and placement was asked for room first. f.26, RB5.
 
 **SC-T46 a_stuck_sink_is_flushed (2026-11-15).** A lagging sink that never commits by itself is flushed by a plain checkpoint; one that does not lag is not; `stuck` is true only once a checkpoint saw the same watermark with morsels delivered past it. f.12.
+
+**SC-T53 instances_wait_for_a_warm_up (2026-11-18).** (`src/tests/sc_p_instances_wait_for_a_warm_up.rs`) A dealt stateful stage of four instances that says one is ready until its first five applies have run, followed by a stateless stage, on four workers: only instance 0 is made before the run; the first five applies are all on it; every other instance is made after them; the run completes with no apply overlapping on an instance; and the stage after it ran on two or more workers while the first was warming. SC-I19.
+
+**SC-T54 the_cap_bounds_reads_and_knobs (2026-11-18).** Through the runtime (`crates/moruna-runtime/tests/instance_room.rs`): a stage whose kernel takes at most 2 MiB, the source's first consumer, is given no morsel past 2 MiB over four splits of 8 MiB. SC-I20.
 
 **SC-T44 a_refused_output_asks_for_room_first.** (`src/tests/sc_t44_a_refused_output_asks_for_room.rs`) A kernel whose 2nd and 5th applies fail with `Alloc`: placement is asked for room in the host tier twice, once per refusal, for a positive number of bytes, and the run completes with every morsel once. f.26, RB5.
 

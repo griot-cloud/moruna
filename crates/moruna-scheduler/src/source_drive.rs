@@ -120,9 +120,17 @@ fn range_end(
     if !split.sub_splittable {
         return split.rows;
     }
+    // The range is the first consumer's: below what one of its instances can take, where its
+    // kernel says that (system design 3A).
+    let (min, max) = crate::knobs::morsel_range(
+        shared,
+        end.target_stage,
+        shared.cfg.morsel_min,
+        shared.cfg.morsel_max,
+    );
     let target = bytes
         .unwrap_or_else(|| shared.knobs.morsel_target(end.target_stage))
-        .clamp(shared.cfg.morsel_min, shared.cfg.morsel_max);
+        .clamp(min, max);
     // RB3: the target is bytes in memory and the split's estimate is bytes on disk, so the rows
     // are sized by what reads have actually decoded to (f.5).
     let ratio = end.decoded.ratio();
@@ -131,7 +139,11 @@ fn range_end(
     let end = (start + rows).min(split.rows);
     // A remainder under half a read is taken with this one, not read on its own: a read pays
     // for its split's fetch and its buffers' fixed cost whatever its rows (RB3).
-    if split.rows - end < rows / 2 {
+    // But not past what one of the consumer's instances can take, where its kernel says it
+    // (system design 3A); a consumer that says nothing reads as it always did.
+    let capped = max < shared.cfg.morsel_max;
+    let most = rows_for(split, ((max as f64) / ratio).max(1.0) as u64);
+    if split.rows - end < rows / 2 && (!capped || split.rows - start <= most) {
         split.rows
     } else {
         end

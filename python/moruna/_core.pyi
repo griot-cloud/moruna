@@ -250,7 +250,7 @@ def run(
     checkpoint_interval: float = ...,
     keep_checkpoint: bool = ...,
     resume: str | None = ...,
-    cost: CostSession | None = ...,
+    cost: CostSession | bool | None = ...,
     engine_ports: EnginePorts | None = ...,
     sandbox_python: str | None = ...,
     sandbox_cgroup: str | None = ...,

@@ -133,6 +133,7 @@ fn drive(
         resume,
         resume_auto,
         measured: carried,
+        measured_by_node,
         notes: spec_notes,
         spec_digest,
     } = spec;
@@ -390,7 +391,20 @@ fn drive(
     };
     // What the job came with stands first (on a node, the registry's, in the `spec` message:
     // system design 3E); the run's own store answers for a stage that came with none.
-    let measured = with_carried(carried, found, &mut notes);
+    // The node's own readings of each stage's function, which size its instances' accounts and
+    // planes too; a registration's sizes the arena's share and the instances only (PM,
+    // 2026-11-18: a client's process holds none of the function's interpreter).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let by_node: Vec<Option<moruna_cost::Memory>> = carried
+        .iter()
+        .enumerate()
+        .map(|(at, memory)| {
+            memory
+                .clone()
+                .filter(|_| measured_by_node.get(at).copied().unwrap_or(false))
+        })
+        .collect();
+    let measured = with_carried(carried, &measured_by_node, found, &mut notes);
     let outside = out_of_arena(&kernels, &measured, workers_start, &mut notes);
     let kernel_state = expected_kernel_state(&kernels).saturating_add(outside.fixed_bytes);
     let sizing = Sizing {
@@ -666,6 +680,9 @@ fn drive(
         })
         .collect();
 
+    // The room a stage's warm-up finds its other tasks do not need (system design 3A): the
+    // limits watcher hands it to the arena, through the arena's arithmetic.
+    let freed_room = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Native singleton commitments must also leave the controller's initial
     // minimum-morsel work funded, before any child is started.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -695,11 +712,56 @@ fn drive(
             let physical = sizing
                 .allowance(limits.memory_ceiling)
                 .saturating_sub(arena_bytes);
+            // The stages the node measured are sized from their readings first (system design
+            // 3A), leaving the others room for one instance each at their least; the others then
+            // share what is left by today's rule.
+            let room = physical.min(planning);
+            let stage_of = |stage: &crate::packaged::Packaged| {
+                kernels
+                    .iter()
+                    .position(|k| std::ptr::addr_eq(Arc::as_ptr(k), Arc::as_ptr(&stage.kernel())))
+            };
+            let facts: Vec<Option<moruna_cost::Memory>> = stages
+                .iter()
+                .map(|stage| stage_of(stage).and_then(|at| by_node.get(at).cloned().flatten()))
+                .collect();
+            let others = facts.iter().filter(|f| f.is_none()).count() as u64;
+            let (by_stage, used) = fund_by_node(
+                room.saturating_sub(others * moruna_micro::layout::NATIVE_CHILD_MIN),
+                &wanted,
+                &facts,
+            )?;
+            for (at, sized) in by_stage.iter().enumerate() {
+                let Some(sized) = sized else {
+                    continue;
+                };
+                let stage = stages[at];
+                let name = stage.fund(sized.instances);
+                let margin = facts[at].as_ref().map_or(0.0, moruna_cost::Memory::margin);
+                stage.size_measured(sized.piece, sized.account, margin);
+                notes.extend(moruna_adapters::instances::short_note(
+                    &name,
+                    sized.instances,
+                    wanted[at],
+                ));
+                let plane = moruna_micro::layout::plane_for(sized.piece).1;
+                notes.push(format!(
+                    "{name}: {} instances sized from the node's readings of its function, each a \
+                     plane of {plane} bytes for pieces of {} bytes and an account of {} bytes",
+                    sized.instances, sized.piece, sized.account
+                ));
+                stage.bind(gate, &sampler, plane + sized.account);
+            }
+            let room = room.saturating_sub(used);
+            let unmeasured: Vec<usize> = (0..stages.len())
+                .filter(|&at| facts[at].is_none())
+                .collect();
+            let wanted_u: Vec<usize> = unmeasured.iter().map(|&at| wanted[at]).collect();
             // Memory bounds the instances and never fails a job that ran before (PM,
             // 2026-11-18): as many as the room funds at their least, at least one a stage.
             let funded = moruna_adapters::instances::fund(
-                physical.min(planning),
-                &wanted,
+                room,
+                &wanted_u,
                 moruna_micro::layout::PAGE,
                 // stream P: a native task's account at its least beside its plane at its least.
                 moruna_micro::layout::NATIVE_CHILD_MIN,
@@ -708,11 +770,16 @@ fn drive(
                 name: "budget.native_children",
                 msg,
             })?
-            .ok_or_else(|| MorunaError::Config {
-                name: "budget.native_children",
-                msg: "native singleton has no admitted child share".into(),
-            })?;
-            for ((stage, &asked), &instances) in stages.iter().zip(&wanted).zip(&funded.counts) {
+            .unwrap_or(moruna_adapters::instances::Funded {
+                share: 0,
+                counts: Vec::new(),
+            });
+            for ((stage, &asked), &instances) in unmeasured
+                .iter()
+                .map(|&at| stages[at])
+                .zip(&wanted_u)
+                .zip(&funded.counts)
+            {
                 let name = stage.fund(instances);
                 notes.extend(moruna_adapters::instances::short_note(
                     &name, instances, asked,
@@ -721,6 +788,40 @@ fn drive(
                 // at their largest), not for its whole share: the rest stays the run's.
                 let share = funded.share.min(moruna_micro::layout::NATIVE_CHILD_MAX);
                 stage.bind(gate, &sampler, share);
+                // Its pieces no larger than its account holds by its function's measured line,
+                // whoever measured it (system design 3A; PM, 2026-11-18).
+                if let Some(memory) =
+                    stage_of(stage).and_then(|at| measured.get(at).cloned().flatten())
+                {
+                    let piece = instance_piece(&memory, share);
+                    stage.cap_pieces(piece);
+                    if piece < u64::MAX {
+                        notes.push(format!(
+                            "{name}: pieces of at most {piece} bytes, what an instance's account of \
+                             {} bytes holds by its function's measured memory",
+                            moruna_micro::layout::native_split(share).1
+                        ));
+                    }
+                }
+                // A function the node has no readings of, and none resting on enough units to
+                // stand for a warm-up, warms up on the job's first pieces on its first task, and
+                // its others start once that sizes them (system design 3A; PM, 2026-11-18).
+                let line = stage_of(stage).and_then(|at| measured.get(at).cloned().flatten());
+                if warms_up(line.as_ref(), instances) {
+                    let freed = Arc::clone(&freed_room);
+                    let warms = stage.warm_up(
+                        line.as_ref(),
+                        Box::new(move |bytes| {
+                            freed.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+                        }),
+                    );
+                    if warms {
+                        notes.push(format!(
+                            "{name}: warms up on its first task before its other {} start",
+                            instances - 1
+                        ));
+                    }
+                }
             }
             // The controller sees the instances the run starts.
             for (info, kernel) in kernel_infos.iter_mut().zip(&kernels) {
@@ -1047,7 +1148,14 @@ fn drive(
                 arena,
                 controller: controller.clone(),
                 scheduler: scheduler.clone(),
-                sizing: Box::new(move |ceiling| sizing.divide(ceiling, &mut Vec::new())),
+                sizing: {
+                    let freed = Arc::clone(&freed_room);
+                    Box::new(move |ceiling| {
+                        sizing
+                            .divide(ceiling, &mut Vec::new())
+                            .saturating_add(freed.load(std::sync::atomic::Ordering::Relaxed))
+                    })
+                },
                 start_ns,
                 workers_max,
                 tick: std::time::Duration::from_millis(config::TICK_MS),
@@ -1251,6 +1359,7 @@ fn drive(
             .map(|s| digest_of(topology.sink_input(s)))
             .collect(),
     };
+    computed.instance_memory = instance_memory(&kernels, &packaged);
     if let Some(cause) = final_failure.or(layer_failure) {
         return Err(RunError::bare(cause)
             .with_report(Some(computed))
@@ -1684,6 +1793,147 @@ fn expected_out_of_arena_amplification(kernels: &[Arc<dyn moruna_kernel::Kernel>
         .fold(0.0, f64::max)
 }
 
+/// The largest piece one native task of a stage takes in its `share` by its function's measured
+/// line (system design 3A; PM, 2026-11-18): piece <= (account - fixed) / per-byte, its account
+/// what the share leaves beside its plane (`moruna_micro::layout::native_split`); at least one
+/// byte, and `u64::MAX` for a line that does not grow.
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+fn instance_piece(memory: &moruna_cost::Memory, share: u64) -> u64 {
+    let account = moruna_micro::layout::native_split(share).1;
+    let piece = memory.piece_within(account as f64);
+    if piece.is_finite() {
+        (piece as u64).max(1)
+    } else {
+        u64::MAX
+    }
+}
+
+/// The units a function's measurement rests on past which a stage does not warm up on the
+/// job's first pieces (system design 3A): the controller's rule for a profile it trusts.
+const WARM_UP_SKIPPED_AT: u64 = 32;
+
+/// Whether a stage of `instances` tasks whose function the node has no readings of warms up on
+/// its first task (system design 3A; PM, 2026-11-18): when what it carries (`line`, a
+/// registration's or the store's) rests on fewer than [`WARM_UP_SKIPPED_AT`] units, or there is
+/// none, and it has other tasks to size.
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+fn warms_up(line: Option<&moruna_cost::Memory>, instances: usize) -> bool {
+    instances > 1 && line.is_none_or(|m| m.units < WARM_UP_SKIPPED_AT)
+}
+
+/// What the run sizes a measured stage's instances at (system design 3A).
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SizedByNode {
+    /// The instances it starts.
+    instances: usize,
+    /// The pieces each is given, the largest.
+    piece: u64,
+    /// Each one's account, in whole pages.
+    account: u64,
+}
+
+/// The native stages whose functions the node measured (`facts[at]`, its own readings of the
+/// function's account), sized from those readings (system design 3A; PM, 2026-11-18): an
+/// instance costs its plane for its piece and its account at that piece
+/// (`moruna_cost::Memory::account`), the largest piece at which every instance asked for fits
+/// in `room` is taken, else the least piece with as many as fit there
+/// (`moruna_adapters::instances::fund_measured`). Each stage's sizing, `None` for one the node
+/// did not measure, and the bytes the measured stages take of the room. Refused, naming the
+/// budget, when one instance a measured stage does not fit at the least piece.
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+fn fund_by_node(
+    room: u64,
+    wanted: &[usize],
+    facts: &[Option<moruna_cost::Memory>],
+) -> Result<(Vec<Option<SizedByNode>>, u64)> {
+    use moruna_micro::layout::{PAGE, PIECES, plane_for};
+    let account = |memory: &moruna_cost::Memory, piece: u64| {
+        (memory.account(piece as f64).ceil() as u64).next_multiple_of(PAGE)
+    };
+    let measured: Vec<(usize, &moruna_cost::Memory)> = facts
+        .iter()
+        .enumerate()
+        .filter_map(|(at, memory)| Some((at, memory.as_ref()?)))
+        .collect();
+    let mut out = vec![None; facts.len()];
+    if measured.is_empty() {
+        return Ok((out, 0));
+    }
+    let table: Vec<(usize, Vec<u64>)> = measured
+        .iter()
+        .map(|&(at, memory)| {
+            let costs = PIECES
+                .iter()
+                .map(|&piece| plane_for(piece).1 + account(memory, piece))
+                .collect();
+            (wanted.get(at).copied().unwrap_or(1), costs)
+        })
+        .collect();
+    let (k, counts) = moruna_adapters::instances::fund_measured(room, &table).map_err(|msg| {
+        MorunaError::Config {
+            name: "budget.native_children",
+            msg,
+        }
+    })?;
+    let piece = PIECES[k];
+    let mut used = 0u64;
+    for ((&(at, memory), &instances), (_, costs)) in measured.iter().zip(&counts).zip(&table) {
+        out[at] = Some(SizedByNode {
+            instances,
+            piece,
+            account: account(memory, piece),
+        });
+        used = used.saturating_add(costs[k].saturating_mul(instances as u64));
+    }
+    Ok((out, used))
+}
+
+/// What each instance of each kernel stage held, stage 1 first (system design 3A): for a stage
+/// whose function runs as the data plane's tasks, its instances' account peaks and limits and
+/// the largest pieces they were given; for any other stage, nothing. A stage is the packaged
+/// stage whose kernel it runs.
+fn instance_memory(
+    kernels: &[Arc<dyn moruna_kernel::Kernel>],
+    packaged: &[crate::packaged::Packaged],
+) -> Vec<Vec<moruna_trace::InstanceMemory>> {
+    let stages: Vec<Vec<moruna_trace::InstanceMemory>> = kernels
+        .iter()
+        .map(|kernel| {
+            packaged
+                .iter()
+                .find(|stage| std::ptr::addr_eq(Arc::as_ptr(&stage.kernel()), Arc::as_ptr(kernel)))
+                .and_then(crate::packaged::Packaged::task_figures)
+                .unwrap_or_default()
+                .into_iter()
+                .flatten()
+                .map(|f| moruna_trace::InstanceMemory {
+                    account_peak_bytes: f.peak,
+                    account_limit_bytes: f.limit,
+                    largest_piece_bytes: f.largest,
+                })
+                .collect()
+        })
+        .collect();
+    if stages.iter().all(Vec::is_empty) {
+        Vec::new()
+    } else {
+        stages
+    }
+}
+
 /// The out-of-arena cost per byte in flight of a chain with no kernels (see
 /// `expected_out_of_arena_amplification`): one byte beside each byte in flight, which leaves
 /// the arena two thirds of what the shares leave.
@@ -1691,9 +1941,11 @@ const COPY_OUT_OF_ARENA_AMPLIFICATION: f64 = 1.0;
 
 /// Each stage's measured memory: what the job came with (`carried`, one a stage or none at
 /// all), and for a stage that came with none, what the run's own store holds (`found`). The
-/// stages sized from what the job came with are said in `notes`.
+/// stages sized from what the job came with are said in `notes`, each that the node itself
+/// measured (`by_node`, one a stage or none at all) as the node's readings.
 fn with_carried(
     carried: Vec<Option<moruna_cost::Memory>>,
+    by_node: &[bool],
     found: Vec<Option<moruna_cost::Memory>>,
     notes: &mut Vec<String>,
 ) -> Vec<Option<moruna_cost::Memory>> {
@@ -1704,7 +1956,12 @@ fn with_carried(
         .enumerate()
         .map(|(at, found)| match carried.next().flatten() {
             Some(memory) => {
-                stages.push((at + 1).to_string());
+                let whose = if by_node.get(at).copied().unwrap_or(false) {
+                    " (the node's own readings)"
+                } else {
+                    ""
+                };
+                stages.push(format!("{}{whose}", at + 1));
                 Some(memory)
             }
             None => found,
@@ -2312,6 +2569,7 @@ mod tests {
         assert_eq!(
             rates(with_carried(
                 vec![line(3.0), None],
+                &[],
                 vec![line(5.0), line(7.0), None],
                 &mut said
             )),
@@ -2321,9 +2579,29 @@ mod tests {
             said,
             vec!["the measured memory of the function of stage 1 came with the job"]
         );
+        // The node's own readings are said as such.
+        let mut said = Vec::new();
+        with_carried(
+            vec![line(3.0), line(4.0)],
+            &[false, true],
+            vec![None, None],
+            &mut said,
+        );
+        assert_eq!(
+            said,
+            vec![
+                "the measured memory of the function of stage 1, 2 (the node's own readings) \
+                 came with the job"
+            ]
+        );
         let mut said = Vec::new();
         assert_eq!(
-            rates(with_carried(Vec::new(), vec![line(5.0), None], &mut said)),
+            rates(with_carried(
+                Vec::new(),
+                &[],
+                vec![line(5.0), None],
+                &mut said
+            )),
             vec![Some(5.0), None]
         );
         assert!(said.is_empty());
@@ -2334,6 +2612,109 @@ mod tests {
         assert_eq!(
             out_of_arena(&beside, &[Some(one), None], 4, &mut notes).per_byte,
             DEFAULT_OUT_OF_ARENA_AMPLIFICATION
+        );
+    }
+
+    /// System design 3A (6.3g phase 3): a stage the node measured is sized from its readings,
+    /// the piece shrinking before its instances do; another is left to today's rule.
+    #[test]
+    fn a_stage_warms_up_unless_its_facts_rest_on_enough_units_or_it_has_one_task() {
+        let line = |units: u64| moruna_cost::Memory {
+            fixed_bytes: 1.0,
+            per_input_byte: 1.0,
+            output_per_input_byte: None,
+            spread: 0.0,
+            units,
+            input_bytes_min: 1,
+            input_bytes_max: 2,
+        };
+        assert!(warms_up(None, 4), "nothing measured it");
+        assert!(warms_up(Some(&line(6)), 4), "a check's six units");
+        assert!(
+            !warms_up(Some(&line(WARM_UP_SKIPPED_AT)), 4),
+            "enough units"
+        );
+        assert!(!warms_up(None, 1), "no other task to size");
+    }
+
+    #[test]
+    fn an_instance_s_pieces_are_what_its_account_holds_by_the_measured_line() {
+        const MIB: u64 = 1 << 20;
+        let share = 256 * MIB;
+        let account = moruna_micro::layout::native_split(share).1;
+        // A Python function's 30 MiB and six bytes a byte.
+        let line = moruna_cost::Memory {
+            fixed_bytes: (30 * MIB) as f64,
+            per_input_byte: 6.0,
+            output_per_input_byte: None,
+            spread: 0.0,
+            units: 6,
+            input_bytes_min: MIB,
+            input_bytes_max: 16 * MIB,
+        };
+        assert_eq!(instance_piece(&line, share), (account - 30 * MIB) / 6);
+        // The fixed part alone past the account: one byte, the least there is.
+        let big = moruna_cost::Memory {
+            fixed_bytes: (account + MIB) as f64,
+            ..line.clone()
+        };
+        assert_eq!(instance_piece(&big, share), 1);
+        // A line that does not grow bounds nothing.
+        let flat = moruna_cost::Memory {
+            fixed_bytes: 0.0,
+            per_input_byte: 0.0,
+            ..line
+        };
+        assert_eq!(instance_piece(&flat, share), u64::MAX);
+    }
+
+    #[test]
+    fn a_stage_the_node_measured_is_sized_from_its_readings() {
+        use moruna_micro::layout::{PIECES, plane_for};
+        const MIB: u64 = 1 << 20;
+        // Score's readings: 4.5 MiB at 16 MiB pieces, one size.
+        let score = moruna_cost::Memory {
+            fixed_bytes: 4.5 * MIB as f64,
+            per_input_byte: 0.0,
+            output_per_input_byte: None,
+            spread: 0.0,
+            units: 4,
+            input_bytes_min: 16 * MIB,
+            input_bytes_max: 16 * MIB,
+        };
+        let account = (4.5 * MIB as f64) as u64;
+        let at = |piece: u64| plane_for(piece).1 + account;
+        // Nothing measured: nothing sized, nothing taken.
+        assert_eq!(
+            fund_by_node(1 << 40, &[4], &[None]).expect("nothing to fund"),
+            (vec![None], 0)
+        );
+        // Room for four at 16 MiB: four, at 16 MiB, each its plane and its 4.5 MiB account.
+        let (sized, used) =
+            fund_by_node(4 * at(PIECES[0]), &[4, 2], &[Some(score.clone()), None]).expect("funded");
+        assert_eq!(
+            sized,
+            vec![
+                Some(SizedByNode {
+                    instances: 4,
+                    piece: 16 * MIB,
+                    account
+                }),
+                None
+            ]
+        );
+        assert_eq!(used, 4 * at(PIECES[0]));
+        // Room for four only at 4 MiB: the piece shrinks, the instances stay.
+        let (sized, _) = fund_by_node(4 * at(PIECES[2]), &[4], &[Some(score.clone())]).expect("f");
+        assert_eq!(sized[0].map(|s| (s.instances, s.piece)), Some((4, 4 * MIB)));
+        // Not even at 1 MiB: fewer instances at the least piece.
+        let (sized, _) = fund_by_node(2 * at(MIB), &[4], &[Some(score.clone())]).expect("f");
+        assert_eq!(sized[0].map(|s| (s.instances, s.piece)), Some((2, MIB)));
+        // Not one: refused by the budget's name.
+        let refused = fund_by_node(MIB, &[4], &[Some(score)]).unwrap_err();
+        assert!(
+            refused.to_string().contains("budget.native_children"),
+            "{refused}"
         );
     }
 
