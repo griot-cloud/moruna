@@ -222,6 +222,10 @@ pub(crate) fn decode_fetched(
         std::iter::once(range.start as usize..range.end as usize),
         split.rows as usize,
     );
+    // 6.3l: what this decode's page readers take from the fetch is counted, so a group read in
+    // parts shows what its parts decode again (`SourceStats::page_bytes_decoded`).
+    let taken = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let chunks = chunks.counting(std::sync::Arc::clone(&taken));
     let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(chunks, arrow_meta)
         .with_row_groups(vec![row_group])
         .with_projection(mask)
@@ -272,6 +276,10 @@ pub(crate) fn decode_fetched(
             into.append(&batch)?;
         }
     }
+    Counters::add(
+        &source.counters().page_bytes_decoded,
+        taken.load(std::sync::atomic::Ordering::Relaxed),
+    );
     let (batch, copied) = match into {
         Some(into) => {
             let batch = into.finish()?;

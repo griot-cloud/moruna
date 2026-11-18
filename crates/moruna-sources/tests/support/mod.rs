@@ -190,6 +190,64 @@ pub fn write_dictionary_parquet(dir: &Path, name: &str, rows: u64) -> PathBuf {
     path
 }
 
+/// A Parquet file of one row group of `rows` rows in pages of `page_rows`, every column
+/// dictionary encoded, as Parquet writers encode by default (SO-T47): `when` holds a value for
+/// every two rows (a timestamp, an id), so its dictionary page is most of its chunk; `zone` a
+/// few hundred values, `fare` a few thousand and `flag` two strings, whose dictionaries are
+/// small beside their pages. Snappy, as pyarrow writes by default.
+pub fn write_dictionary_pages_parquet(
+    dir: &Path,
+    name: &str,
+    rows: u64,
+    page_rows: usize,
+) -> PathBuf {
+    let path = dir.join(format!("{name}.parquet"));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("when", DataType::Int64, false),
+        Field::new("zone", DataType::Int64, false),
+        Field::new("fare", DataType::Float64, false),
+        Field::new("flag", DataType::Utf8, false),
+    ]));
+    let properties = parquet::file::properties::WriterProperties::builder()
+        .set_max_row_group_row_count(Some(rows as usize))
+        .set_data_page_row_count_limit(page_rows)
+        .set_write_batch_size(page_rows)
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .build();
+    let when: Int64Array = (0..rows)
+        .map(|r| 1_700_000_000_000 + (r / 2) as i64 * 1_000)
+        .collect::<Vec<_>>()
+        .into();
+    let zone: Int64Array = (0..rows)
+        .map(|r| (r * 7_919 % 263) as i64)
+        .collect::<Vec<_>>()
+        .into();
+    let fare: Float64Array = (0..rows)
+        .map(|r| (r * 31 % 4_000) as f64 * 0.25)
+        .collect::<Vec<_>>()
+        .into();
+    let flag: StringArray = (0..rows)
+        .map(|r| Some(if r % 17 == 0 { "Y" } else { "N" }))
+        .collect::<Vec<_>>()
+        .into();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(when) as ArrayRef,
+            Arc::new(zone) as ArrayRef,
+            Arc::new(fare) as ArrayRef,
+            Arc::new(flag) as ArrayRef,
+        ],
+    )
+    .expect("the batch");
+    let file = std::fs::File::create(&path).expect("the parquet file");
+    let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, Some(properties))
+        .expect("the parquet writer");
+    writer.write(&batch).expect("writing the batch");
+    writer.close().expect("closing the file");
+    path
+}
+
 /// A Parquet file with one very large string row among small ones (SO-T14).
 pub fn write_one_huge_row(dir: &Path, name: &str, huge_bytes: usize) -> PathBuf {
     let path = dir.join(format!("{name}.parquet"));
