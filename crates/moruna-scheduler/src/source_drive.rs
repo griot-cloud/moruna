@@ -521,7 +521,7 @@ pub(crate) fn drive(
                 if waits.retry.is_empty() {
                     worked |= issue_reads(&shared, source, &mut inflight, learned);
                 }
-                close_when_exhausted(&shared, source, &inflight);
+                close_when_exhausted(&shared, source, &inflight, &waits);
             }
         }
         // A read waiting out its backoff is work in flight for the stall detector (RB5): it will
@@ -1016,17 +1016,30 @@ fn source_diagnostic(e: MorunaError, split: u32, rows: RowRange) -> MorunaError 
     }
 }
 
-/// f.5: when the plan is exhausted (no split at or after the cursor has a row left) and no read
-/// is in flight, close the source's queues and say so; the run's sources are exhausted when the
-/// last of them is.
-fn close_when_exhausted(shared: &Shared, source: &SourceEnd, inflight: &[InFlight<'_>]) {
-    if !inflight.is_empty() || source.exhausted.load(Ordering::SeqCst) {
+/// f.5: when the plan is exhausted (no split at or after the cursor has a row left), no read is
+/// in flight and none waits to be read again, close the source's queues and say so; the run's
+/// sources are exhausted when the last of them is.
+///
+/// A read that met a full arena (RB5) has left `inflight` but not the plan: the cursor is already
+/// past its rows, and it is still to come. Closing on `inflight` alone dropped it: the sink
+/// finished without it and the run reported `Completed` with its rows missing (a 768-column copy
+/// read back 35,000 of 40,000 rows), or its retry was pushed into the closed queue and ended the
+/// run "push: stage 0 is closed" (items 6.3s and 6.3n, SC-T50).
+fn close_when_exhausted(
+    shared: &Shared,
+    source: &SourceEnd,
+    inflight: &[InFlight<'_>],
+    waits: &Waits,
+) {
+    if !inflight.is_empty() || !waits.retry.is_empty() || source.exhausted.load(Ordering::SeqCst) {
         return;
     }
     {
         let mut cursor = source.cursor.lock().unwrap_or_else(|e| e.into_inner());
         settle(&mut cursor, &source.plan);
-        if (cursor.split_index as usize) < source.plan.len() {
+        // Every read taken from the cursor is pushed before the queues close: a read the cursor
+        // passed and nobody pushed is rows the sink would never see.
+        if (cursor.split_index as usize) < source.plan.len() || !cursor.issued.is_empty() {
             return;
         }
     }
