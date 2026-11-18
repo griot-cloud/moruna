@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """The cloud profile's TLS roots (system design 3D): Mozilla's root set, as curl publishes it.
 
-    tls-roots.py fetch --release YYYY-MM-DD [--from DIR] [--dir kernel/node/cloud]
-    tls-roots.py check [--dir kernel/node/cloud]
+    tls-roots.py fetch --release YYYY-MM-DD [--from DIR] [--roots DIR] [--dir DIR]
+    tls-roots.py check [--roots DIR] [--dir DIR]
 
 `fetch` takes curl's dated release `cacert-<date>.pem` from https://curl.se/ca/ (MPL-2.0), checks
 its SHA-256 against the one curl publishes beside it (`cacert-<date>.pem.sha256`), and writes:
 
-- `cacert.pem`: the release, byte for byte as curl published it;
-- `tls.roots`: its certificates as the network server reads its roots (SDD 31 d): four
+- into `--dir` (kernel/node/cloud, the cloud profile's assets, which hold only what ships):
+  `tls.roots`, its certificates as the network server reads its roots (SDD 31 d): four
   little-endian bytes of length, then the SDK Wire encoding of the list of DER certificates
   (a four-byte count, then each certificate's four-byte length and bytes);
-- `tls-roots.txt`: the release, where it came from, and both files' SHA-256.
+- into `--roots` (kernel/node/tools/roots, the source material): `cacert.pem`, the release byte
+  for byte as curl published it, and `tls-roots.txt`, the release, where it came from, and both
+  files' SHA-256.
 
 With `--from DIR` the two files are read from DIR, as downloaded by another client (a host
 whose Python has no certificate store), and checked the same way.
@@ -41,7 +43,9 @@ BEGIN = "-----BEGIN CERTIFICATE-----"
 END = "-----END CERTIFICATE-----"
 RELEASE = re.compile(r"\d{4}-\d{2}-\d{2}")
 DIGEST = re.compile(r"[0-9a-f]{64}")
+# Where the list ships from, and where its source and record are kept.
 DEFAULT_DIR = Path(__file__).resolve().parents[1] / "cloud"
+DEFAULT_ROOTS = Path(__file__).resolve().parent / "roots"
 
 
 class Refused(Exception):
@@ -146,8 +150,9 @@ def downloaded(directory: Path):
     return get
 
 
-def fetch(release: str, directory: Path, get=download) -> str:
-    """Fetches `release`, checks it, writes the three files into `directory`; returns the record."""
+def fetch(release: str, sources: Path, directory: Path, get=download) -> str:
+    """Fetches `release` and checks it; writes the list into `directory` and the release and its
+    record into `sources`; returns the record."""
     if not RELEASE.fullmatch(release):
         raise Refused(f"a release is a date, YYYY-MM-DD: {release!r}")
     url = f"{SOURCE}/cacert-{release}.pem"
@@ -158,18 +163,19 @@ def fetch(release: str, directory: Path, get=download) -> str:
     roots = certificates(utf8(pem))
     encoded = encode(roots)
     written = record(release, pem, encoded, len(roots))
-    (directory / "cacert.pem").write_bytes(pem)
+    (sources / "cacert.pem").write_bytes(pem)
     (directory / "tls.roots").write_bytes(encoded)
-    (directory / "tls-roots.txt").write_text(written)
+    (sources / "tls-roots.txt").write_text(written)
     return written
 
 
-def check(directory: Path) -> str:
-    """Refuses unless `tls.roots` and `tls-roots.txt` agree with `cacert.pem`; returns the record."""
+def check(sources: Path, directory: Path) -> str:
+    """Refuses unless `directory`'s `tls.roots` and `sources`' `tls-roots.txt` agree with
+    `sources`' `cacert.pem`; returns the record."""
     try:
-        pem = (directory / "cacert.pem").read_bytes()
+        pem = (sources / "cacert.pem").read_bytes()
         roots = (directory / "tls.roots").read_bytes()
-        written = (directory / "tls-roots.txt").read_text()
+        written = (sources / "tls-roots.txt").read_text()
     except OSError as error:
         raise Refused(f"{error.filename}: {error.strerror}") from None
     fields = dict(line.split(" ", 1) for line in written.splitlines() if " " in line)
@@ -191,16 +197,17 @@ def main(argv=None) -> int:
     fetching.add_argument("--release", required=True, help="the release's date, YYYY-MM-DD")
     fetching.add_argument("--from", dest="source", type=Path,
                           help="read the release and its .sha256 from this directory")
-    fetching.add_argument("--dir", type=Path, default=DEFAULT_DIR)
-    checking = commands.add_parser("check", help="check the committed files agree")
-    checking.add_argument("--dir", type=Path, default=DEFAULT_DIR)
+    for command in (fetching, commands.add_parser("check", help="check the committed files agree")):
+        command.add_argument("--roots", type=Path, default=DEFAULT_ROOTS,
+                             help="where cacert.pem and tls-roots.txt are kept")
+        command.add_argument("--dir", type=Path, default=DEFAULT_DIR, help="where tls.roots ships from")
     args = parser.parse_args(argv)
     try:
         if args.command == "fetch":
             get = downloaded(args.source) if args.source else download
-            print(fetch(args.release, args.dir, get), end="")
+            print(fetch(args.release, args.roots, args.dir, get), end="")
         else:
-            print(check(args.dir), end="")
+            print(check(args.roots, args.dir), end="")
     except Refused as refused:
         print(f"tls-roots.py: {refused}", file=sys.stderr)
         return 1

@@ -125,7 +125,7 @@ class Profiles(unittest.TestCase):
             assets.mkdir()
             (assets / "node.conf").write_text("moruna-node 1\n")
             description = Path(tmp) / "cloud.image"
-            description.write_text("moruna-image 1\n")
+            description.write_text("moruna-image 1\nprocess node-supervisor\n  handle data:node.conf config\n")
             argv = ["package.py", "--profile", "cloud", "--description", str(description), "--assets", str(assets),
                     "--out", str(Path(tmp) / "out"), "--node-memory", str(2 << 30)]
             with mock.patch.object(package, "command", record), \
@@ -166,12 +166,11 @@ class Profiles(unittest.TestCase):
         rendered = out / "standalone.image"
         return files, rendered.read_text() if rendered.exists() else None
 
-    def test_a_cloud_image_carries_only_the_files_its_description_binds(self):
-        """The committed cloud profile: kernel/node/cloud/ also holds cacert.pem and tls-roots.txt,
-        the source and record of tls.roots, which cloud.image does not bind; they stay out."""
+    def test_the_committed_cloud_profile_s_assets_are_exactly_what_its_image_binds(self):
+        """kernel/node/cloud/ holds what ships; the roots' source and record are kept apart."""
         kernel = TOOL.parents[2]
         assets = kernel / "node/cloud"
-        self.assertTrue((assets / "cacert.pem").is_file() and (assets / "tls-roots.txt").is_file())
+        self.assertEqual(sorted(p.name for p in assets.iterdir()), ["network.conf", "node.conf", "tls.roots"])
         with tempfile.TemporaryDirectory() as tmp:
             files, rendered = self.payload_of(
                 ["--profile", "cloud", "--description", str(kernel / "node/cloud.image"), "--assets", str(assets),
@@ -183,7 +182,7 @@ class Profiles(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             assets = Path(tmp) / "assets"
             (assets / "layers").mkdir(parents=True)
-            for name in ("node.conf", "storage.credential", "unbound.txt", "layers/layer-1.img", "layers/other.img"):
+            for name in ("node.conf", "storage.credential", "layers/layer-1.img"):
                 (assets / name).write_text("x\n")
             # The bucket provider binds the credential (package.py's rendering of configure.py's profile).
             (assets / "profile.json").write_text('{"storage_provider": "bucket"}\n')
@@ -195,6 +194,35 @@ class Profiles(unittest.TestCase):
                  "--layer", "layers/layer-1.img"])
         self.assertEqual(files, ["layers/layer-1.img", "node.conf", "storage.credential"])
         self.assertIn("  handle data:storage.credential storage.credential\n", rendered)
+
+    def test_an_asset_the_description_does_not_bind_is_refused_by_name(self):
+        """Nothing is left out unseen: a file the image would not carry is refused before anything
+        is built, whether it is a stray file, an unnamed layer or a config with no recipient."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for profile, extra in (("cloud", ["cacert.pem", "tls-roots.txt"]),
+                                   ("standalone", ["layers/other.img", "maintenance.conf"])):
+                assets = Path(tmp) / profile / "assets"
+                (assets / "layers").mkdir(parents=True)
+                for name in ("node.conf", *extra):
+                    (assets / name).write_text("x\n")
+                if profile == "standalone":
+                    (assets / "profile.json").write_text("{}\n")
+                description = Path(tmp) / profile / "node.image"
+                description.write_text("moruna-image 1\nprocess node-supervisor\n  handle data:node.conf config\n")
+                out = Path(tmp) / profile / "out"
+                argv = ["package.py", "--description", str(description), "--assets", str(assets), "--out", str(out),
+                        "--node-memory", str(2 << 30)]
+                argv += ["--profile", "cloud"] if profile == "cloud" else ["--agent-port", "5100", "--cpus", "2"]
+                built = []
+                error = io.StringIO()
+                with mock.patch.object(package, "command", lambda *a, **k: built.append(a)), \
+                        mock.patch.object(package.shutil, "which", lambda tool: f"/usr/bin/{tool}"), \
+                        mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(error), \
+                        self.assertRaises(SystemExit):
+                    package.main()
+                self.assertIn(f"assets the description does not bind: {', '.join(sorted(extra))}", error.getvalue())
+                self.assertEqual(built, [])
+                self.assertFalse(out.exists())
 
     def test_a_launcher_s_node_without_its_profile_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

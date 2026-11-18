@@ -188,9 +188,14 @@ def main():
     text = description.read_text()
     if additions:
         text += "\n".join(additions) + "\n"
-    # The image carries only what its description binds, and a launcher's node its layers: an
-    # asset nothing names (a source the bound file was made from, a record) is left out.
+    # The assets hold exactly what ships: what the description binds, and a launcher's node's
+    # layers. The one other file is configure.py's profile.json, which package.py reads above to
+    # render a launcher's node's description and does not ship. Anything else is refused by name,
+    # so nothing is left out unseen.
     wanted = bound(text) | {name.as_posix() for name in args.layer}
+    unbound = sorted(present.keys() - wanted - ({"profile.json"} if not cloud else set()))
+    if unbound:
+        parser.error(f"assets the description does not bind: {', '.join(unbound)}")
     missing = sorted(bound(text) - present.keys())
     if missing:
         parser.error(f"the description binds data the assets do not hold: {', '.join(missing)}")
