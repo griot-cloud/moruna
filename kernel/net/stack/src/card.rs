@@ -11,7 +11,8 @@
 //! frames back from the stack until a send of its own made the channel readable, and for
 //! good once the stack had nothing to send: the node stopped acknowledging and answered
 //! nothing. Filing first leaves no answer behind: one that comes after the channel was
-//! read to its end keeps it readable, and the next turn takes it.
+//! read to its end keeps it readable, and the next turn takes it. The rule's one
+//! implementation is `ClientCore::file_all`.
 
 use alloc::{format, string::String, vec::Vec};
 
@@ -26,8 +27,8 @@ const SEND_OVERHEAD: usize = 64;
 pub trait Answers {
     /// Sends request `ordinal` with `body`, without waiting; its id.
     fn send(&mut self, ordinal: u16, body: Encoder) -> Result<u32, CallError<u32>>;
-    /// Reads one answer that is there and files it; `TimedOut` when none is.
-    fn file_one(&mut self) -> Result<(), CallError<u32>>;
+    /// Reads every answer there is and files it (`ClientCore::file_all`): how many.
+    fn file_all(&mut self) -> Result<usize, CallError<u32>>;
     /// The answer to `txid` if it has been filed; `None` while it is still to come.
     fn take(&mut self, txid: u32) -> Option<Result<Message, CallError<u32>>>;
 }
@@ -36,8 +37,8 @@ impl Answers for ClientCore {
     fn send(&mut self, ordinal: u16, body: Encoder) -> Result<u32, CallError<u32>> {
         ClientCore::send(self, ordinal, body)
     }
-    fn file_one(&mut self) -> Result<(), CallError<u32>> {
-        self.file(0)
+    fn file_all(&mut self) -> Result<usize, CallError<u32>> {
+        ClientCore::file_all(self)
     }
     fn take(&mut self, txid: u32) -> Option<Result<Message, CallError<u32>>> {
         self.take_reply(txid)
@@ -91,13 +92,9 @@ impl<C: Answers> CardLink<C> {
     /// first, then each reply taken (see the module's rule); then asks again for what was
     /// answered.
     pub fn pump(&mut self) -> Result<Taken, String> {
-        loop {
-            match self.core.file_one() {
-                Ok(()) => {}
-                Err(CallError::TimedOut) => break,
-                Err(e) => return Err(format!("the card's answers: {e:?}")),
-            }
-        }
+        self.core
+            .file_all()
+            .map_err(|e| format!("the card's answers: {e:?}"))?;
         let mut taken = Taken::default();
         if let Some(t) = self.receive
             && let Some(answer) = self.core.take(t)

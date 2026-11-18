@@ -280,6 +280,29 @@ impl ClientCore {
         self.pump(deadline)
     }
 
+    /// Reads every frame there is, without waiting, and files each as [`ClientCore::file`]
+    /// does: how many it filed. `TimedOut` never comes from it: an empty channel ends it.
+    ///
+    /// **Read the channel to its end, file everything, then take each reply** (work item
+    /// 1.3c). A client that waits for its channel to be readable and then asks for its
+    /// replies one at a time without waiting ([`ClientCore::reply`] with a deadline already
+    /// passed) loses wake-ups: asking for one reply reads, and files, every other answer it
+    /// meets first, so an answer that comes after its own was asked for, and is read while
+    /// another is looked for, sits filed with the channel empty, and nothing wakes the
+    /// client for it again. Read with this once a turn, then take each reply
+    /// ([`ClientCore::take_reply`]); an answer that comes after keeps the channel readable,
+    /// and the next turn takes it.
+    pub fn file_all(&mut self) -> Result<usize, CallError<u32>> {
+        let mut filed = 0;
+        loop {
+            match self.pump(0) {
+                Ok(()) => filed += 1,
+                Err(CallError::TimedOut) => return Ok(filed),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// The reply to request `txid` if it has been filed, without waiting, as
     /// [`ClientCore::reply`] gives it; `None` while it is still to come. A `txid` this client
     /// never sent, or whose reply was already taken, is `Malformed`.

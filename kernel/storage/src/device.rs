@@ -10,6 +10,7 @@ use moruna_svc::{CallError, DEADLINE_INFINITE, Encoder, Memory, Wire};
 
 #[path = "device_async.rs"]
 mod async_io;
+#[cfg(target_os = "none")]
 pub(crate) use async_io::reserved::Prepared as ReservedIo;
 pub use async_io::{CancelState, Completion, MAX_IN_FLIGHT, Observation, Observed, Poll, Ticket};
 /// Exact native block refusal or transport diagnostic; never replaced with empty data.
@@ -145,6 +146,10 @@ impl Device {
             .close()
     }
 }
+
+#[cfg(test)]
+#[path = "device_tests.rs"]
+mod tests;
 struct Controller {
     client: Option<block::Client>,
     lease: u64,
@@ -168,8 +173,13 @@ impl Controller {
         let channel = directory
             .lookup(String::from(name))
             .map_err(Error::Directory)?;
-        let mut client = block::Client::connect(channel, moruna_svc::deadline_in(timeout_ns))
+        let client = block::Client::connect(channel, moruna_svc::deadline_in(timeout_ns))
             .map_err(Error::Driver)?;
+        Self::over(client, timeout_ns)
+    }
+    /// The controller over a connection to its driver: its geometry checked and its
+    /// writer lease claimed.
+    fn over(mut client: block::Client, timeout_ns: u64) -> Result<Self, Error> {
         client.core().set_timeout(timeout_ns);
         let info = client.info().map_err(Error::Driver)?;
         if info.read_only

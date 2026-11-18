@@ -1,6 +1,16 @@
 //! Actual nonblocking submit/poll on the SAME SDK connection and writer lease. Pending
 //! owns original DMA Memory + actual Account until ORIGINAL reply. Cancel intent and
 //! soft timeout never release pins, return memory, or stand in for device completion.
+//!
+//! **Read the channel to its end, file everything, then take each reply** (work item
+//! 1.3c). The owner's turn reads the driver's answers once, [`Device::file_answers`]
+//! (`ClientCore::file_all`, the rule's one implementation), and then polls its tickets;
+//! a ticket's poll only takes its own answer, and never reads. Polled with a read each
+//! (`reply(txid, now)`), one ticket's poll read, and filed, another's answer that came
+//! after that ticket was polled; the turn ended with the answer filed and the channel
+//! empty, and nothing woke the owner for it again. An answer that comes after the turn's
+//! read keeps the channel readable, and the next turn takes it.
+#[cfg(target_os = "none")]
 #[path = "device_reserved.rs"]
 pub mod reserved;
 use super::{Controller, Device, Error};
@@ -64,7 +74,7 @@ struct Pending {
     txid: u32,
     phase: Phase,
     original: Option<Memory>,
-    account: Option<Rc<moruna_sys::Account>>,
+    account: Option<Rc<moruna_svc::Account>>,
     _budget: Option<Memory>,
     sector: u64,
     count: u32,
@@ -127,7 +137,7 @@ impl Device {
         sector: u64,
         count: u32,
         memory: Memory,
-        account: Rc<moruna_sys::Account>,
+        account: Rc<moruna_svc::Account>,
     ) -> Result<Ticket, Error> {
         self.submit_data(sector, count, memory, account, Phase::Read)
     }
@@ -137,7 +147,7 @@ impl Device {
         sector: u64,
         count: u32,
         memory: Memory,
-        account: Rc<moruna_sys::Account>,
+        account: Rc<moruna_svc::Account>,
     ) -> Result<Ticket, Error> {
         self.submit_data(sector, count, memory, account, Phase::Write)
     }
@@ -148,7 +158,7 @@ impl Device {
         sector: u64,
         count: u32,
         memory: Memory,
-        account: Rc<moruna_sys::Account>,
+        account: Rc<moruna_svc::Account>,
     ) -> Result<Ticket, Error> {
         self.submit_data(sector, count, memory, account, Phase::WriteThenSync)
     }
@@ -157,7 +167,7 @@ impl Device {
         sector: u64,
         count: u32,
         memory: Memory,
-        account: Rc<moruna_sys::Account>,
+        account: Rc<moruna_svc::Account>,
         phase: Phase,
     ) -> Result<Ticket, Error> {
         let sector = self.sector(sector, count)?;
@@ -180,15 +190,15 @@ impl Device {
         {
             return Err(Error::Geometry);
         }
-        // Validate actual backing before any request; Mapping owns its real Memory view.
-        let _mapping = memory
+        // Validate actual backing before any request; Mapping owns its real Memory view,
+        // and goes at the end of the statement.
+        let _ = memory
             .map(
                 0,
                 bytes.checked_add(4095).ok_or(Error::Geometry)? / 4096 * 4096,
                 0,
             )
             .map_err(Error::Memory)?;
-        drop(_mapping);
         let budget = Memory::create_in(4096, &account.0).map_err(Error::Memory)?;
         let loan_rights = Rights::READ
             | Rights::MAP
@@ -308,8 +318,19 @@ impl Device {
             None => Ok(CancelState::Collected),
         }
     }
-    /// Nonblocking original-completion pump. reply(txid,now) may file other real replies
-    /// in ClientCore, but never waits for one, resubmits, or treats timeout as completion.
+    /// Reads every answer the driver has sent, without waiting, and files it, once a turn
+    /// before the turn's tickets are polled (see the module's rule). A connection that
+    /// fails quarantines every original, as a poll that met it did.
+    pub fn file_answers(&self) -> Result<(), Error> {
+        self.controller
+            .try_borrow_mut()
+            .map_err(|_| Error::Busy)?
+            .file_answers();
+        Ok(())
+    }
+    /// Nonblocking original-completion poll: it takes the ticket's answer if the turn's
+    /// read filed it, and never reads the channel, waits, resubmits, or treats a soft
+    /// timeout as completion.
     pub fn poll(&self, ticket: &Ticket) -> Result<Poll, Error> {
         self.ticket(ticket)?;
         let mut owner = self.controller.try_borrow_mut().map_err(|_| Error::Busy)?;
@@ -386,6 +407,16 @@ impl Controller {
         self.last_error = Some(cause);
         self.client = None;
     }
+    /// Reads every answer there is and files it (`ClientCore::file_all`); a transport
+    /// failure quarantines every original.
+    fn file_answers(&mut self) {
+        let Some(client) = self.client.as_mut() else {
+            return;
+        };
+        if let Err(error) = client.core().file_all() {
+            self.quarantine(Error::Driver(error.typed()));
+        }
+    }
     fn poll_original(&mut self, id: u64) -> Result<Poll, Error> {
         let Some(pending) = self.async_state.pending.get(&id) else {
             return Err(Error::Geometry);
@@ -395,7 +426,11 @@ impl Controller {
         }
         let txid = pending.txid;
         let reply = match self.client.as_mut() {
-            Some(client) => client.core().reply(txid, moruna_svc::now()),
+            // Taken only: the turn's read filed it (see the module's rule).
+            Some(client) => client
+                .core()
+                .take_reply(txid)
+                .unwrap_or(Err(CallError::TimedOut)),
             None => {
                 self.quarantine(Error::Closed);
                 return Ok(Poll::Quarantined(Error::Closed));
@@ -602,6 +637,8 @@ impl Device {
     /// through this view. No waits, new connections, resubmits or synthetic completions.
     pub fn pump(&self) -> Result<alloc::vec::Vec<Observed>, Error> {
         let mut owner = self.controller.try_borrow_mut().map_err(|_| Error::Busy)?;
+        // Every answer read and filed first, then each taken (see the module's rule).
+        owner.file_answers();
         let ids = owner
             .async_state
             .pending

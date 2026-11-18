@@ -10,13 +10,14 @@ description = "Native governed object storage over actual caller Memory, block a
 moruna-svc.workspace = true
 blake3 = { version = "=1.8.7", default-features = false, features = ["pure"] }
 moruna-storage-format = { path = "../../crates/moruna-storage-format", version = "=0.6.6", features = ["pure", "crypto"] }
+# The device's protocols, on the host too: the device and its tickets are tested there
+# (work item 1.3c).
+block-protocol = { path = "../drivers/block-protocol", version = "=0.1.0" }
+devices-protocol = { path = "../devices/protocol", version = "=0.1.0" }
 
 [target.'cfg(target_os = "none")'.dependencies]
 moruna-sys.workspace = true
-block-protocol = { path = "../drivers/block-protocol", version = "=0.1.0" }
 netstack-protocol = { path = "../net/protocol", version = "=0.1.0" }
-
-devices-protocol = { path = "../devices/protocol", version = "=0.1.0" }
 
 [features]
 default = []
