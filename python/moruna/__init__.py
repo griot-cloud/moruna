@@ -59,9 +59,10 @@ from moruna._core import (
     TensorSource,
     inspect_host,
 )
-from moruna._job import Function, Job, JobSpec, Sink, Source, Task, function, image
+from moruna._job import Function, Job, JobSpec, Sink, Source, Task, function, image, register
 from moruna._kinds import DeclaredKind, KindCall, kind, kinds
 from moruna._ports import BytesWriter, FileWriter, Ports, Resolver, Writer
+from moruna._register import Refused as RegisterRefused
 from moruna._report import RunReport
 
 __version__: str = _core.__version__
@@ -89,6 +90,7 @@ __all__ = [
     "ParquetSource",
     "PlanError",
     "Ports",
+    "RegisterRefused",
     "Resolver",
     "ResumeError",
     "RunReport",
@@ -108,6 +110,7 @@ __all__ = [
     "kinds",
     "load",
     "read_events",
+    "register",
     "run",
     "std",
 ]

@@ -30,12 +30,15 @@ pub struct TestNode {
     pub document: Node,
     /// The key its tokens are signed with, one of its `token_keys`.
     pub key: token::Key,
+    /// The operator's key function images are signed with, its one `functions.keys` entry.
+    pub function_key: token::Key,
 }
 
 impl TestNode {
-    /// Start a node with a fresh identity and one token key.
+    /// Start a node with a fresh identity, one token key and one function key.
     pub fn start() -> Self {
         let key = token::Key::generate();
+        let function_key = token::Key::generate();
         let document = document();
         let identity = cert::generate(INSTANCE, now());
         let fingerprint = Fingerprint::of(&identity.certificate).to_string();
@@ -43,6 +46,7 @@ impl TestNode {
             instance: INSTANCE.to_string(),
             document: document.clone(),
             token_keys: vec![key.public()],
+            function_keys: vec![function_key.public()],
             identity,
         });
         Self {
@@ -50,6 +54,7 @@ impl TestNode {
             fingerprint,
             document,
             key,
+            function_key,
         }
     }
 
