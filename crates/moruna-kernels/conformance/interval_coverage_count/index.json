@@ -1,0 +1,213 @@
+{
+  "format": "moruna-kernel-corpus/1",
+  "kernel": "moruna.interval_coverage_count",
+  "cases": [
+    {
+      "name": "basic",
+      "version": 1,
+      "tests": ["params", "ordering", "multi_batch"],
+      "about": "On ten buckets five wide, two batches each give their own cells in key order, overlapping intervals summed.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 5, "size": 10},
+      "inputs": [{"file": "basic.in.arrow"}],
+      "expected": "basic.expected.arrow"
+    },
+    {
+      "name": "midnight_wrap",
+      "version": 1,
+      "tests": ["wrap", "ordering"],
+      "about": "On a day of minutes in microseconds, trips across midnight count in the last minutes and the first, in key order.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 60000000, "size": 1440},
+      "inputs": [{"file": "midnight.in.arrow"}],
+      "expected": "midnight.expected.arrow"
+    },
+    {
+      "name": "midnight_edges",
+      "version": 1,
+      "tests": ["wrap"],
+      "about": "A trip ending at 00:00 stops at 23:59, one starting at 00:00 counts in minute 0, and a start a day later is the same minute.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 60000000, "size": 1440},
+      "inputs": [{"file": "midnight_edges.in.arrow"}],
+      "expected": "midnight_edges.expected.arrow"
+    },
+    {
+      "name": "longer_than_the_grid",
+      "version": 1,
+      "tests": ["wrap"],
+      "about": "On four buckets, ten buckets from bucket 3 count once per pass (3, 2, 2, 3), and four count each bucket once.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 1, "size": 4},
+      "inputs": [{"file": "longer.in.arrow"}],
+      "expected": "longer.expected.arrow"
+    },
+    {
+      "name": "one_bucket",
+      "version": 1,
+      "tests": ["wrap", "params"],
+      "about": "On a ring of one bucket every length counts whole, and a zero length nothing.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 7, "size": 1},
+      "inputs": [{"file": "one_bucket.in.arrow"}],
+      "expected": "one_bucket.expected.arrow"
+    },
+    {
+      "name": "zero_and_negative_lengths",
+      "version": 1,
+      "tests": ["length"],
+      "about": "A length of zero, of minus one or of Int64's least covers nothing.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 1, "size": 8},
+      "inputs": [{"file": "lengths.in.arrow"}],
+      "expected": "lengths.expected.arrow"
+    },
+    {
+      "name": "negative_starts_floor",
+      "version": 1,
+      "tests": ["rounding"],
+      "about": "With step 10 and size 6, position -1 is in bucket 5, -60 in bucket 0 and -61 in bucket 5.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 10, "size": 6},
+      "inputs": [{"file": "floor.in.arrow"}],
+      "expected": "floor.expected.arrow"
+    },
+    {
+      "name": "nulls_skip_the_row",
+      "version": 1,
+      "tests": ["nulls"],
+      "about": "A null group, start or length skips its row; the other rows count.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 1, "size": 4},
+      "inputs": [{"file": "nulls.in.arrow"}],
+      "expected": "nulls.expected.arrow"
+    },
+    {
+      "name": "sliced",
+      "version": 1,
+      "tests": ["sliced", "nulls"],
+      "about": "Rows 2 to 5 of eight count, with a null among them, and the rows around them do not.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 1, "size": 4},
+      "inputs": [{"file": "sliced.in.arrow", "slice": [2, 4]}],
+      "expected": "sliced.expected.arrow"
+    },
+    {
+      "name": "empty",
+      "version": 1,
+      "tests": ["empty"],
+      "about": "A batch of zero rows gives a batch of zero rows.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 1, "size": 4},
+      "inputs": [{"file": "empty.in.arrow"}],
+      "expected": "empty.expected.arrow"
+    },
+    {
+      "name": "no_batches",
+      "version": 1,
+      "tests": ["empty"],
+      "about": "No batches give no rows.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 1, "size": 4},
+      "inputs": [{"file": "no_batches.in.arrow"}],
+      "expected": "empty.expected.arrow"
+    },
+    {
+      "name": "domain_dense",
+      "version": 1,
+      "tests": ["domain", "params"],
+      "about": "With the domain [0, 3] every group is in it and the cells are those of no domain.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 1, "size": 8, "groups": [0, 3]},
+      "inputs": [{"file": "domain.in.arrow"}],
+      "expected": "domain.expected.arrow"
+    },
+    {
+      "name": "no_domain",
+      "version": 1,
+      "tests": ["domain"],
+      "about": "With no domain the same batch gives the same cells.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 1, "size": 8},
+      "inputs": [{"file": "domain.in.arrow"}],
+      "expected": "domain.expected.arrow"
+    },
+    {
+      "name": "domain_miss",
+      "version": 1,
+      "tests": ["domain"],
+      "about": "With the domain [1, 2], group 3 is outside it: the batch is counted on the sparse table and gives the same cells.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 1, "size": 8, "groups": [1, 2]},
+      "inputs": [{"file": "domain.in.arrow"}],
+      "expected": "domain.expected.arrow"
+    },
+    {
+      "name": "domain_miss_below_and_null",
+      "version": 1,
+      "tests": ["domain", "nulls", "wrap"],
+      "about": "A group below the domain counts, a null row is skipped, and an interval from the last bucket wraps.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 1, "size": 8, "groups": [1, 2]},
+      "inputs": [{"file": "domain_miss.in.arrow"}],
+      "expected": "domain_miss.expected.arrow"
+    },
+    {
+      "name": "extremes",
+      "version": 1,
+      "tests": ["params", "wrap", "ordering"],
+      "about": "Groups at Int32's ends and starts at Int64's ends, on the widest ring, 2^31 - 1 buckets.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 1, "size": 2147483647},
+      "inputs": [{"file": "extremes.in.arrow"}],
+      "expected": "extremes.expected.arrow"
+    },
+    {
+      "name": "occupancy",
+      "version": 1,
+      "tests": ["occupancy", "wrap"],
+      "about": "Sixty real trips of January 2024 give Occupancy as written's cells (0.6.6's function), across midnight, over four hours, backwards and of no time.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 60000000, "size": 1440, "groups": [0, 299]},
+      "inputs": [{"file": "occupancy.in.arrow"}],
+      "expected": "occupancy.expected.arrow"
+    },
+    {
+      "name": "overflow_refused",
+      "version": 1,
+      "tests": ["overflow", "error"],
+      "about": "Two lengths of Int64's largest on a ring of one overflow the count, and the batch is refused.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 1, "size": 1},
+      "inputs": [{"file": "overflow.in.arrow"}],
+      "error": {"at": "apply", "contains": "overflows Int64"}
+    },
+    {
+      "name": "step_zero_refused",
+      "version": 1,
+      "tests": ["params", "error"],
+      "about": "A step of zero is refused at configure.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 0, "size": 4},
+      "inputs": [{"file": "basic.in.arrow"}],
+      "error": {"at": "configure", "contains": "`step` must be at least 1"}
+    },
+    {
+      "name": "size_too_large_refused",
+      "version": 1,
+      "tests": ["params", "error"],
+      "about": "A size past 2^31 - 1 is refused at configure.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 1, "size": 2147483648},
+      "inputs": [{"file": "basic.in.arrow"}],
+      "error": {"at": "configure", "contains": "`size` must be 1 to"}
+    },
+    {
+      "name": "domain_too_large_refused",
+      "version": 1,
+      "tests": ["params", "domain", "error"],
+      "about": "A domain whose dense table would pass 2^24 cells is refused at configure.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 1, "size": 1440, "groups": [0, 20000]},
+      "inputs": [{"file": "basic.in.arrow"}],
+      "error": {"at": "configure", "contains": "dense table"}
+    },
+    {
+      "name": "unknown_parameter_refused",
+      "version": 1,
+      "tests": ["params", "error"],
+      "about": "A parameter the kernel does not take is refused at configure.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 1, "size": 4, "origin": 0},
+      "inputs": [{"file": "basic.in.arrow"}],
+      "error": {"at": "configure", "contains": "unknown argument `origin`"}
+    },
+    {
+      "name": "wrong_type_refused",
+      "version": 1,
+      "tests": ["error"],
+      "about": "A group column of Int64 is refused at plan.",
+      "params": {"group": "group", "start": "start", "length": "length", "step": 1, "size": 4},
+      "inputs": [{"file": "wrong_type.in.arrow"}],
+      "error": {"at": "schema", "contains": "must be Int32"}
+    }
+  ]
+}

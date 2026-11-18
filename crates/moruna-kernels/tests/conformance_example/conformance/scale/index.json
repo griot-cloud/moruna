@@ -1,0 +1,117 @@
+{
+  "format": "moruna-kernel-corpus/1",
+  "kernel": "example.scale",
+  "cases": [
+    {
+      "name": "scales",
+      "version": 1,
+      "tests": [
+        "params",
+        "nulls"
+      ],
+      "about": "Each x gives x * factor within its allowed error; a null gives a null; 1e308 * 3 is +inf, which only +inf matches.",
+      "params": {
+        "factor": 3.0
+      },
+      "inputs": [
+        {
+          "file": "x.in.arrow"
+        }
+      ],
+      "expected": "x.expected.arrow",
+      "allowed": {
+        "x": {
+          "file": "x.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "exact_where_unbounded",
+      "version": 1,
+      "tests": [
+        "params"
+      ],
+      "about": "Where an element's allowed error is null, the product must be the expected bit for bit.",
+      "params": {
+        "factor": 3.0
+      },
+      "inputs": [
+        {
+          "file": "x.in.arrow"
+        }
+      ],
+      "expected": "x.expected.arrow",
+      "allowed": {
+        "x": {
+          "file": "x_exact.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "sliced",
+      "version": 1,
+      "tests": [
+        "sliced"
+      ],
+      "about": "A batch whose arrays start at row 2 gives the products of its rows.",
+      "params": {
+        "factor": 0.5
+      },
+      "inputs": [
+        {
+          "file": "x.in.arrow",
+          "slice": [
+            2,
+            4
+          ]
+        }
+      ],
+      "expected": "sliced.expected.arrow",
+      "allowed": {
+        "x": {
+          "file": "sliced.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "empty",
+      "version": 1,
+      "tests": [
+        "empty"
+      ],
+      "about": "A batch of zero rows gives a batch of zero rows.",
+      "params": {
+        "factor": 2.0
+      },
+      "inputs": [
+        {
+          "file": "empty.in.arrow"
+        }
+      ],
+      "expected": "empty.expected.arrow",
+      "allowed": {
+        "x": {
+          "file": "empty.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "two_batches_exact",
+      "version": 1,
+      "tests": [
+        "multi_batch",
+        "nulls"
+      ],
+      "about": "With no allowed error given, each of two batches is compared bit for bit.",
+      "params": {
+        "factor": -4.0
+      },
+      "inputs": [
+        {
+          "file": "two.in.arrow"
+        }
+      ],
+      "expected": "two.expected.arrow"
+    }
+  ]
+}

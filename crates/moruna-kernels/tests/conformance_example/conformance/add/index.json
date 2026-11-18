@@ -1,0 +1,59 @@
+{
+  "format": "moruna-kernel-corpus/1",
+  "kernel": "example.add",
+  "cases": [
+    {
+      "name": "adds",
+      "version": 1,
+      "tests": ["params", "multi_batch"],
+      "about": "Each of two batches gives x + addend, in its rows' order.",
+      "params": {"addend": 10},
+      "inputs": [{"file": "adds.in.arrow"}],
+      "expected": "adds.expected.arrow"
+    },
+    {
+      "name": "nulls_stay_null",
+      "version": 1,
+      "tests": ["nulls"],
+      "about": "A null x gives a null; the others give x + addend.",
+      "params": {"addend": -1},
+      "inputs": [{"file": "nulls.in.arrow"}],
+      "expected": "nulls.expected.arrow"
+    },
+    {
+      "name": "sliced",
+      "version": 1,
+      "tests": ["sliced", "nulls"],
+      "about": "A batch whose arrays start at offset 3 gives the sum of those rows alone.",
+      "params": {"addend": 100},
+      "inputs": [{"file": "nulls.in.arrow", "slice": [3, 4]}],
+      "expected": "sliced.expected.arrow"
+    },
+    {
+      "name": "empty",
+      "version": 1,
+      "tests": ["empty"],
+      "about": "A batch of zero rows gives a batch of zero rows.",
+      "params": {"addend": 1},
+      "inputs": [{"file": "empty.in.arrow"}],
+      "expected": "empty.expected.arrow"
+    },
+    {
+      "name": "overflow_refused",
+      "version": 1,
+      "tests": ["overflow", "error"],
+      "about": "A sum past Int64's largest value refuses the batch.",
+      "params": {"addend": 1},
+      "inputs": [{"file": "max.in.arrow"}],
+      "error": {"at": "apply", "contains": "overflow"}
+    },
+    {
+      "name": "addend_required",
+      "version": 1,
+      "tests": ["params", "error"],
+      "about": "A configure without addend is refused.",
+      "inputs": [{"file": "adds.in.arrow"}],
+      "error": {"at": "configure"}
+    }
+  ]
+}
