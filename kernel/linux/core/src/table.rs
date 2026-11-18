@@ -2,8 +2,8 @@
 //! answers, by number, with who answers it. The kernel answers the fast calls itself;
 //! the server answers the rest. A number not in the table is refused with `ENOSYS`
 //! and counted against the process; so is a call the server takes only in part (a
-//! `clone` that is not a thread, a `futex` operation the kernel does not have), under
-//! its own number.
+//! `clone` or `clone3` that is not a thread, a `futex` operation the kernel does not
+//! have, an `mremap` of anything but anonymous memory), under its own number.
 
 use moruna_abi::{forward::fast, forward::table, limits, write_u32};
 
@@ -160,6 +160,7 @@ pub const TABLE: &[(u64, &str, Status)] = &[
         "sched_yield",
         Status::Fast(fast::SCHED_YIELD),
     ),
+    (nr::MREMAP, "mremap", Status::Fast(fast::MREMAP)),
     (nr::MADVISE, "madvise", Status::Fast(fast::MADVISE)),
     (nr::DUP, "dup", Status::Server),
     (nr::DUP2, "dup2", Status::Server),
@@ -244,6 +245,11 @@ pub const TABLE: &[(u64, &str, Status)] = &[
     (nr::RENAMEAT, "renameat", Status::Server),
     (nr::READLINKAT, "readlinkat", Status::Server),
     (nr::FACCESSAT, "faccessat", Status::Server),
+    (
+        nr::SET_ROBUST_LIST,
+        "set_robust_list",
+        Status::Fast(fast::SET_ROBUST_LIST),
+    ),
     (nr::EPOLL_PWAIT, "epoll_pwait", Status::Server),
     (nr::EVENTFD, "eventfd", Status::Server),
     (nr::EVENTFD2, "eventfd2", Status::Server),
@@ -252,6 +258,7 @@ pub const TABLE: &[(u64, &str, Status)] = &[
     (nr::PRLIMIT64, "prlimit64", Status::Server),
     (nr::RENAMEAT2, "renameat2", Status::Server),
     (nr::GETRANDOM, "getrandom", Status::Fast(fast::GETRANDOM)),
+    (nr::CLONE3, "clone3", Status::Server),
     (nr::CLOSE_RANGE, "close_range", Status::Server),
     (nr::FACCESSAT2, "faccessat2", Status::Server),
     (nr::EPOLL_PWAIT2, "epoll_pwait2", Status::Server),
@@ -261,18 +268,15 @@ pub const TABLE: &[(u64, &str, Status)] = &[
 const REFUSED_NAMES: &[(u64, &str)] = &[
     (nr::RT_SIGRETURN, "rt_sigreturn"),
     (nr::PIPE, "pipe"),
-    (nr::MREMAP, "mremap"),
     (nr::SOCKET, "socket"),
     (nr::CONNECT, "connect"),
     (nr::FORK, "fork"),
     (nr::VFORK, "vfork"),
     (nr::GETDENTS, "getdents"),
-    (nr::SET_ROBUST_LIST, "set_robust_list"),
     (nr::PIPE2, "pipe2"),
     (nr::GETCPU, "getcpu"),
     (nr::STATX, "statx"),
     (nr::RSEQ, "rseq"),
-    (nr::CLONE3, "clone3"),
 ];
 
 /// Who answers call `number`; `None` when it is refused.
@@ -327,6 +331,28 @@ mod tests {
         for (n, _) in REFUSED_NAMES {
             assert_eq!(status(*n), None, "{n} is both refused and in the table");
         }
+    }
+
+    /// Item 5.3b: the calls pyarrow was refused are answered; `rseq` stays refused (it
+    /// needs the scheduler to abort a critical section on preemption).
+    #[test]
+    fn lx_t1_pyarrow_calls_answered() {
+        assert_eq!(status(nr::MREMAP), Some(Status::Fast(fast::MREMAP)));
+        assert_eq!(
+            status(nr::SET_ROBUST_LIST),
+            Some(Status::Fast(fast::SET_ROBUST_LIST))
+        );
+        assert_eq!(status(nr::CLONE3), Some(Status::Server));
+        assert_eq!(status(nr::SYSINFO), Some(Status::Server));
+        assert_eq!(status(nr::RSEQ), None);
+        assert_eq!(super::name(nr::RSEQ), Some("rseq"));
+        let t = forward_table();
+        assert_eq!(t[table::CALLS + nr::MREMAP as usize], fast::MREMAP);
+        assert_eq!(
+            t[table::CALLS + nr::SET_ROBUST_LIST as usize],
+            fast::SET_ROBUST_LIST
+        );
+        assert_eq!(t[table::CALLS + nr::CLONE3 as usize], fast::NONE);
     }
 
     #[test]

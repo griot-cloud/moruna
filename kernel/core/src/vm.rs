@@ -21,7 +21,7 @@
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use moruna_abi::{Error, PAGE_SIZE, charge, map};
+use moruna_abi::{Error, PAGE_SIZE, charge, forward::remap, map};
 use moruna_datapath::place;
 use ostd::{
     mm::{
@@ -653,6 +653,117 @@ impl Space {
         drop(removed);
         drop(frames);
         Ok(())
+    }
+
+    /// `mremap` of a forwarded process's private anonymous memory (ABI 2.9, item 5.3b):
+    /// the old range must lie in one area of zero pages the process mapped itself. It
+    /// shrinks in place; grows in place when the addresses after the area are free; and
+    /// otherwise, when it may, moves: its zero pages are mapped at a new address, with no
+    /// copy. Returns where the mapping is, or `None` for an area that is not such memory
+    /// (a file's, the image's, the stack's), whose request is forwarded. What it maps is
+    /// charged as `map` charges it.
+    pub fn remap(&self, request: &remap::Request) -> Result<Option<u64>, Error> {
+        let mut inner = self.inner.lock();
+        let area = Space::area_at(&inner, request.old).map(|(start, area)| {
+            let anonymous = area.kind == Kind::Mapping && matches!(area.backing, Backing::Zero);
+            (start, area.end, anonymous)
+        });
+        if let Some((_, _, false)) = area {
+            return Ok(None);
+        }
+        let tail_free = match (area, request.new_end()) {
+            (Some((_, end, _)), Some(new_end)) if new_end > end && new_end <= map_end() => {
+                !Space::overlaps(&inner, end, new_end)
+            }
+            _ => false,
+        };
+        let span = area.map(|(start, end, _)| (start, end));
+        let old = request.old;
+        match remap::plan(request, span, tail_free) {
+            remap::Plan::Fault => Err(Error::Fault),
+            remap::Plan::NoMemory => Err(Error::NoMemory),
+            remap::Plan::Same => Ok(Some(old)),
+            remap::Plan::Shrink => {
+                drop(inner);
+                let keep = old + request.new_len;
+                self.unmap(keep, request.old_len - request.new_len, Some(Kind::Mapping))?;
+                Ok(Some(old))
+            }
+            remap::Plan::Grow => {
+                let start = span.map_or(old, |(start, _)| start);
+                self.grow(&mut inner, start, old + request.new_len)?;
+                Ok(Some(old))
+            }
+            remap::Plan::Move => self
+                .relocate(&mut inner, old, old + request.old_len, request.new_len)
+                .map(Some),
+        }
+    }
+
+    /// Grows the area at `start` to end at `end`, over addresses no area holds: the
+    /// tables its new pages need are charged first; the pages are zero pages, allocated
+    /// when touched.
+    fn grow(&self, inner: &mut Inner, start: u64, end: u64) -> Result<(), Error> {
+        let old_end = inner.areas.get(&start).ok_or(Error::BadState)?.end;
+        let (_, after) = inner.neighbours(old_end, end);
+        let added = moruna_quota::tables(&[(old_end, end)], Some(old_end), after, map_end());
+        self.charge(inner, added.bytes())?;
+        inner.tables += added.pages;
+        if let Some(area) = inner.areas.get_mut(&start) {
+            area.end = end;
+        }
+        Ok(())
+    }
+
+    /// Moves the zero pages of `old .. old_end`, part or all of one area, to a free range
+    /// of `len` bytes: the range's record and tables are charged first, its pages keep
+    /// their frames and their charge, and the old range is left unmapped. Returns where.
+    fn relocate(&self, inner: &mut Inner, old: u64, old_end: u64, len: u64) -> Result<u64, Error> {
+        let va = Space::find_free(inner, len)?;
+        let end = va + len;
+        // The new area is added while the old range is still mapped, and the old one's
+        // tables freed once the new one is, so each region is counted once throughout.
+        let (before, after) = inner.neighbours(va, end);
+        let added = moruna_quota::tables(&[(va, end)], before, after, map_end());
+        let split_bytes = Space::split_bytes(inner, old, old_end);
+        self.charge(inner, split_bytes + charge::AREA + added.bytes())?;
+        Space::split(inner, old);
+        Space::split(inner, old_end);
+        let Some(piece) = inner.areas.remove(&old) else {
+            self.settle(inner);
+            return Err(Error::BadState);
+        };
+        let pages: Vec<u64> = inner.zero.range(old..old_end).map(|(p, _)| *p).collect();
+        for page in pages {
+            if let Some(frame) = inner.zero.remove(&page) {
+                inner.zero.insert(va + (page - old), frame);
+            }
+        }
+        let area = Area {
+            end,
+            kind: Kind::Mapping,
+            prot: piece.prot,
+            backing: Backing::Zero,
+        };
+        inner.areas.insert(va, area.clone());
+        inner.tables += added.pages;
+        let (before, after) = inner.neighbours(old, old_end);
+        let freed = moruna_quota::tables(&[(old, old_end)], before, after, map_end());
+        inner.tables -= freed.pages;
+        if let Some(brk) = &mut inner.brk
+            && brk.current > old
+            && brk.start < old_end
+        {
+            brk.current = brk.current.min(old).max(brk.start);
+        }
+        self.settle(inner);
+        // No entry of the old range stays, so no thread reaches the pages there; the new
+        // range's are filled from the same frames. One that could not be is filled when
+        // first touched, as any zero page is.
+        self.unmap_ptes(old, old_end - old);
+        self.reclaim(&freed.reclaim);
+        let _ = self.fill_ptes(inner, va, &area, va, end);
+        Ok(va)
     }
 
     /// Sets the protection of whole pages `va .. va + len`, every one of which must be

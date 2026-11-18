@@ -20,8 +20,8 @@ use alloc::{
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use moruna_abi::{
-    ABI_VERSION, Error, PAGE_SIZE, RawHandle, Signals, charge, limits, map, process_end::End,
-    start_page, valid_name,
+    ABI_VERSION, Error, PAGE_SIZE, RawHandle, Signals, charge, forward::robust, limits, map,
+    process_end::End, start_page, valid_name,
 };
 use moruna_handles::HandleTable;
 use moruna_loader::elf;
@@ -817,6 +817,9 @@ pub struct Thread {
     fpu: SpinLock<FpuContext, LocalIrqDisabled>,
     /// The word cleared and woken when the thread ends (`set_tid_address`).
     pub clear_tid: AtomicU64,
+    /// The head of its robust futexes' list, walked when it ends (`set_robust_list`,
+    /// ABI 2.9); zero for none.
+    pub robust_list: AtomicU64,
     /// The registers of a thread waiting on its forward, for `forward_clone`.
     pub parked: SpinLock<Option<UserContext>>,
     /// Its last port call's reply, mapped until its next port call or its end: the
@@ -866,6 +869,8 @@ impl Thread {
             fs_base: AtomicU64::new(fs_base),
             fpu: SpinLock::new(FpuContext::new()),
             clear_tid: AtomicU64::new(clear_tid),
+            // A new thread has no list until it names one, as Linux's.
+            robust_list: AtomicU64::new(0),
             parked: SpinLock::new(None),
             port_reply: SpinLock::new(None),
             cpu_ns: AtomicU64::new(0),
@@ -987,6 +992,7 @@ fn run(thread: Arc<Thread>, context: UserContext) {
             }
         }
     }
+    release_robust(&thread);
     clear_child_tid(&thread);
     if let Some((addr, span, memory)) = thread.port_reply.lock().take() {
         // The plane's own mapping: only it can have removed it, and it has not.
@@ -1002,6 +1008,41 @@ fn run(thread: Arc<Thread>, context: UserContext) {
     thread.set_waker(None);
     thread.signaller.update(Signals::NONE, Signals::TERMINATED);
     thread.process.thread_ended();
+}
+
+/// A thread that ends leaves each robust futex it still holds marked owner-died, with
+/// one waiter woken (`set_robust_list`, ABI 2.9, item 5.3b): before its clear-tid word,
+/// as Linux's exit does, and whether or not its process goes on, for a futex in memory
+/// another process maps too.
+fn release_robust(thread: &Thread) {
+    let head = thread.robust_list.swap(0, Ordering::Relaxed);
+    if head != 0 {
+        robust::release(head, thread.tid, &mut RobustWords(thread));
+    }
+}
+
+/// An ended thread's memory, as the robust list's walk reaches it: the copies a call
+/// makes, and the futex queues of its process.
+struct RobustWords<'a>(&'a Thread);
+
+impl robust::Memory for RobustWords<'_> {
+    fn read_u64(&mut self, addr: u64) -> Option<u64> {
+        usercopy::read_u64(&self.0.process.space, addr).ok()
+    }
+
+    fn read_u32(&mut self, addr: u64) -> Option<u32> {
+        let mut word = [0u8; 4];
+        usercopy::read_exact(&self.0.process.space, addr, &mut word).ok()?;
+        Some(u32::from_le_bytes(word))
+    }
+
+    fn compare_exchange(&mut self, addr: u64, old: u32, new: u32) -> Option<u32> {
+        usercopy::compare_exchange_u32(&self.0.process.space, addr, old, new).ok()
+    }
+
+    fn wake(&mut self, addr: u64) {
+        let _ = futex::wake(self.0.process.koid, addr, 1, futex::ALL);
+    }
 }
 
 /// A thread that ends on its own, its process going on, clears its `set_tid_address`

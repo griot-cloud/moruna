@@ -2,6 +2,7 @@
 //! (`kernel/linux/server`) is this over the kernel's forward and the image filesystem.
 //!
 //! - [`table`]: every call, by number, and who answers it;
+//! - [`clone`]: `clone` and `clone3` of a thread;
 //! - [`types`]: Linux's structures and constants, as bytes;
 //! - [`elf`]: what a program's headers say to map, interpreter included;
 //! - [`stack`]: the first stack, as `execve` lays it out;
@@ -17,6 +18,7 @@
 
 extern crate alloc;
 
+pub mod clone;
 pub mod elf;
 pub mod events;
 pub mod fd;

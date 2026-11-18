@@ -108,3 +108,27 @@ pub fn read_u64(space: &Space, ptr: u64) -> Result<u64, Error> {
 pub fn write_u32(space: &Space, ptr: u64, value: u32) -> Result<(), Error> {
     write(space, ptr, &value.to_le_bytes())
 }
+
+fn exchange(space: &Space, ptr: u64, old: u32, new: u32) -> Result<u32, Error> {
+    let addr = usize::try_from(ptr).map_err(|_| Error::Fault)?;
+    let (reader, writer) = space.vm.reader_writer(addr, 4).map_err(|_| Error::Fault)?;
+    let (held, _) = writer
+        .atomic_compare_exchange(&reader, old, new)
+        .map_err(|_| Error::Fault)?;
+    space.count_copy(4);
+    Ok(held)
+}
+
+/// Replaces the `u32` at `ptr` (aligned) with `new` if it holds `old`, in one atomic
+/// step against the process's own threads; returns what it held. A robust futex's
+/// word is marked owner-died so (ABI 2.9).
+pub fn compare_exchange_u32(space: &Space, ptr: u64, old: u32, new: u32) -> Result<u32, Error> {
+    if !ptr.is_multiple_of(4) {
+        return Err(Error::InvalidArgs);
+    }
+    if let Ok(held) = exchange(space, ptr, old, new) {
+        return Ok(held);
+    }
+    prepare(space, ptr, 4, true)?;
+    exchange(space, ptr, old, new)
+}

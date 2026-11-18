@@ -10,7 +10,8 @@
 //!
 //! The fast calls are the ones on the caller's own memory, time and threads: a futex,
 //! the clocks and sleeping, anonymous `mmap`, `munmap`, `mprotect`, `brk`, `madvise`,
-//! the FS base, `set_tid_address`, `getrandom`, `exit` and `gettid`. They act only on
+//! the FS base, `set_tid_address`, `getrandom`, `exit` and `gettid`; since ABI 2.9,
+//! `mremap` of anonymous memory and `set_robust_list`. They act only on
 //! the calling thread and its process (KK-I1), and a call they do not take (a mapping
 //! of a file, a futex operation they do not know) is forwarded instead.
 
@@ -18,7 +19,7 @@ use alloc::{collections::BTreeSet, string::String, sync::Arc, vec::Vec};
 
 use moruna_abi::{
     DEADLINE_INFINITE, Error, PAGE_SIZE,
-    forward::{fast, reply, request, table},
+    forward::{fast, remap, reply, request, robust, table},
     limits, map, read_u32, read_u64, write_u32, write_u64,
 };
 use ostd::{
@@ -212,6 +213,10 @@ fn send(
             thread.set_fs(0);
             thread
                 .clear_tid
+                .store(0, core::sync::atomic::Ordering::Relaxed);
+            // The old program's list went with its memory, as Linux's `execve` drops it.
+            thread
+                .robust_list
                 .store(0, core::sync::atomic::Ordering::Relaxed);
             Flow::Continue
         }
@@ -518,6 +523,22 @@ fn mmap_anonymous(thread: &Thread, a: [u64; 6]) -> Fast {
     })
 }
 
+/// `mremap` (ABI 2.9, item 5.3b) of a private anonymous mapping, as `remap` says: in
+/// place, or moved with `MREMAP_MAYMOVE` with no copy. Any other request is forwarded,
+/// and the server refuses it.
+fn mremap(thread: &Thread, a: [u64; 6]) -> Fast {
+    let request = match remap::request(a[0], a[1], a[2], a[3]) {
+        Ok(request) => request,
+        Err(remap::Refusal::Invalid) => return Fast::Value(fail(errno::EINVAL)),
+        Err(remap::Refusal::Forward) => return Fast::Forward,
+    };
+    match thread.process.space.remap(&request) {
+        Ok(Some(va)) => Fast::Value(va),
+        Ok(None) => Fast::Forward,
+        Err(e) => Fast::Value(map_error(e)),
+    }
+}
+
 fn fill_random(thread: &Thread, buf: u64, len: u64) -> u64 {
     let len = len.min(64 * 1024) as usize;
     let mut bytes = Vec::new();
@@ -681,6 +702,17 @@ fn fast_call(thread: &Thread, which: u8, a: [u64; 6]) -> Fast {
                 .clear_tid
                 .store(a[0], core::sync::atomic::Ordering::Relaxed);
             Fast::Value(thread.tid)
+        }
+        fast::MREMAP => mremap(thread, a),
+        // ABI 2.9: the list is walked when the thread ends (`process::release_robust`).
+        fast::SET_ROBUST_LIST => {
+            if a[1] != robust::HEAD_SIZE {
+                return Fast::Value(fail(errno::EINVAL));
+            }
+            thread
+                .robust_list
+                .store(a[0], core::sync::atomic::Ordering::Relaxed);
+            Fast::Value(0)
         }
         fast::GETRANDOM => {
             // GRND_NONBLOCK, GRND_RANDOM and GRND_INSECURE: the source never blocks.
