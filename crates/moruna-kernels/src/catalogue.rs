@@ -138,7 +138,7 @@ impl core::fmt::Debug for Implementation {
 pub const CPU_REFERENCE: &str = "cpu-reference";
 
 /// Every implementation this build has, the CPU references first.
-pub const IMPLEMENTATIONS: &[Implementation] = &[];
+pub const IMPLEMENTATIONS: &[Implementation] = &[crate::interval_coverage_count::CPU];
 
 /// Every implementation this build has.
 pub fn implementations() -> &'static [Implementation] {
