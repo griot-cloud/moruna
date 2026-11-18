@@ -7,8 +7,9 @@
 //! The figures are the account's, which the kernel holds the program to (SDD 20 f.18):
 //! the total is its limit, and what is free is what is left of it, its limit less what
 //! is charged to it and what it holds for the accounts carved from it. A program started
-//! without an account is told nothing of memory: `sysinfo` is refused and
-//! `/proc/meminfo` is not found, rather than a figure nobody chose.
+//! without an account (a plain `run`) is charged to the server's own, and `sysinfo`
+//! answers from that account, as it answers a granted program from its own (item 5.3b);
+//! its `/proc/meminfo` is not found, rather than a figure nobody chose.
 
 use alloc::{format, vec::Vec};
 
@@ -25,6 +26,18 @@ pub const CPU_ONLINE: &[u8] = b"/sys/devices/system/cpu/online";
 pub struct Memory {
     pub total: u64,
     pub free: u64,
+}
+
+impl Memory {
+    /// An account's figures as its program is told them: the total its limit, and free
+    /// what is left of it, its limit less what is charged (`used`) and what it holds for
+    /// the accounts carved from it (`reserved`).
+    pub fn of(limit: u64, used: u64, reserved: u64) -> Memory {
+        Memory {
+            total: limit,
+            free: limit.saturating_sub(used).saturating_sub(reserved),
+        }
+    }
 }
 
 /// `sysinfo`'s answer for `memory`: total and free RAM, no swap, one process,
@@ -115,5 +128,26 @@ mod tests {
         assert!(file(MEMINFO, Some(half), 2).is_some());
         assert_eq!(file(CPU_ONLINE, None, 2), Some(b"0-1\n".to_vec()));
         assert_eq!(file(b"/proc/stat", Some(half), 2), None);
+    }
+
+    /// LX-T21 (item 5.3b): an account's figures as `sysinfo` says them, for a granted
+    /// program's account and for the server's own, which a plain `run` is charged to.
+    #[test]
+    fn lx_t21_sysinfo_from_an_account() {
+        let server = Memory::of(256 << 20, 40 << 20, 16 << 20);
+        assert_eq!(
+            server,
+            Memory {
+                total: 256 << 20,
+                free: 200 << 20
+            }
+        );
+        let s = sysinfo(server, 0);
+        assert_eq!(word(&s, 32), 256 << 20);
+        assert_eq!(word(&s, 40), 200 << 20);
+        // More charged and held than the limit, as an account over its limit after a
+        // child's reservation: nothing free.
+        assert_eq!(Memory::of(8 << 20, 6 << 20, 4 << 20).free, 0);
+        assert_eq!(Memory::of(8 << 20, 9 << 20, 0).free, 0);
     }
 }

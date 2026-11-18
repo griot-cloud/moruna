@@ -42,10 +42,13 @@ pub mod manifest;
 /// that the supervisor names an ended service's exit code (1B). ABI 2.8 (item 5.0, Rust's
 /// std on Moruna) adds the node's wall clock and a yield: the clock page's `REALTIME_BASE`
 /// and `REALTIME_SOURCE`, the boot capability `root.clock` (`ResourceKind::Clock`) and its
-/// `clock_set_realtime`, and `thread_yield`, after 2.7's six calls.
+/// `clock_set_realtime`, and `thread_yield`, after 2.7's six calls. ABI 2.9 (item 5.3b, the
+/// calls pyarrow asks of the Linux personality) adds two fast calls of a forward:
+/// [`forward::fast::MREMAP`] ([`forward::remap`]) and [`forward::fast::SET_ROBUST_LIST`]
+/// ([`forward::robust`]).
 pub const ABI_MAJOR: u16 = 2;
 /// See [`ABI_MAJOR`].
-pub const ABI_MINOR: u16 = 8;
+pub const ABI_MINOR: u16 = 9;
 /// The packed version `abi_version` returns.
 pub const ABI_VERSION: u64 = ((ABI_MAJOR as u64) << 16) | ABI_MINOR as u64;
 
@@ -1170,8 +1173,277 @@ pub mod forward {
         pub const TIME: u8 = 17;
         /// `clock_getres(clock, timespec)`.
         pub const CLOCK_GETRES: u8 = 18;
+        /// ABI 2.9: `mremap(old, old_len, new_len, flags)` of a private anonymous
+        /// mapping, as [`super::remap`] says; any other is forwarded.
+        pub const MREMAP: u8 = 19;
+        /// ABI 2.9: `set_robust_list(head, len)`: the list of robust futexes the kernel
+        /// releases when the thread ends, as [`super::robust`] says.
+        pub const SET_ROBUST_LIST: u8 = 20;
         /// One past the highest.
-        pub const COUNT: u8 = 19;
+        pub const COUNT: u8 = 21;
+    }
+
+    /// `mremap` (ABI 2.9, item 5.3b): what the kernel takes of it, and how it answers.
+    ///
+    /// The kernel takes a request of whole pages of one private anonymous mapping (one
+    /// area of zero pages a forwarded process mapped itself), with [`MAYMOVE`] or no
+    /// flag. It shrinks the mapping in place; it grows it in place when the addresses
+    /// after it are free; otherwise, with [`MAYMOVE`], it moves it: the same pages are
+    /// mapped at a new address, with no copy. What it maps is charged to the process's
+    /// account as `mmap` is. A request of anything else ([`FIXED`], [`DONTUNMAP`], an
+    /// `old_len` of zero, a mapping of a file or of the image) is forwarded, and the
+    /// server refuses it.
+    pub mod remap {
+        use crate::PAGE_SIZE;
+
+        /// `MREMAP_MAYMOVE`: the mapping may move.
+        pub const MAYMOVE: u64 = 1;
+        /// `MREMAP_FIXED`: to the address given; forwarded.
+        pub const FIXED: u64 = 2;
+        /// `MREMAP_DONTUNMAP`: the old range stays mapped; forwarded.
+        pub const DONTUNMAP: u64 = 4;
+
+        /// A request the kernel takes: its lengths in whole pages.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct Request {
+            pub old: u64,
+            pub old_len: u64,
+            pub new_len: u64,
+            pub may_move: bool,
+        }
+
+        impl Request {
+            /// The end of the old range; `None` past the top of the address space.
+            pub fn old_end(&self) -> Option<u64> {
+                self.old.checked_add(self.old_len)
+            }
+
+            /// The end of the range grown in place; `None` past the top.
+            pub fn new_end(&self) -> Option<u64> {
+                self.old.checked_add(self.new_len)
+            }
+        }
+
+        /// A request the kernel does not take.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Refusal {
+            /// `EINVAL`, as Linux answers it.
+            Invalid,
+            /// Not the kernel's: forwarded, and the server refuses it.
+            Forward,
+        }
+
+        fn whole_pages(len: u64) -> Option<u64> {
+            len.checked_add(PAGE_SIZE - 1).map(|v| v & !(PAGE_SIZE - 1))
+        }
+
+        /// Reads `mremap(old, old_len, new_len, flags)` as Linux does: `EINVAL` for an
+        /// unaligned address, a new length of zero or an unknown flag, and for
+        /// `FIXED` or `DONTUNMAP` without `MAYMOVE`.
+        pub fn request(
+            old: u64,
+            old_len: u64,
+            new_len: u64,
+            flags: u64,
+        ) -> Result<Request, Refusal> {
+            if flags & !(MAYMOVE | FIXED | DONTUNMAP) != 0
+                || flags & (FIXED | DONTUNMAP) != 0 && flags & MAYMOVE == 0
+                || !old.is_multiple_of(PAGE_SIZE)
+            {
+                return Err(Refusal::Invalid);
+            }
+            let (Some(old_len), Some(new_len)) = (whole_pages(old_len), whole_pages(new_len))
+            else {
+                return Err(Refusal::Invalid);
+            };
+            if new_len == 0 {
+                return Err(Refusal::Invalid);
+            }
+            if flags & (FIXED | DONTUNMAP) != 0 || old_len == 0 {
+                return Err(Refusal::Forward);
+            }
+            Ok(Request {
+                old,
+                old_len,
+                new_len,
+                may_move: flags & MAYMOVE != 0,
+            })
+        }
+
+        /// What the kernel does with a request.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Plan {
+            /// Nothing: the lengths are the same.
+            Same,
+            /// Unmaps `old + new_len .. old + old_len`.
+            Shrink,
+            /// The mapping ends at `old + new_len`, in place.
+            Grow,
+            /// The pages go to a new address, with no copy.
+            Move,
+            /// `EFAULT`: no mapping holds the whole old range.
+            Fault,
+            /// `ENOMEM`: it cannot grow in place and may not move.
+            NoMemory,
+        }
+
+        /// The plan for `request` of the mapping `start .. end` holding its address
+        /// (`None` when nothing is mapped there), where `tail_free` says whether the
+        /// addresses from `end` to `old + new_len` are free and in the address space.
+        /// The old range must lie in the mapping, as Linux's must lie in one area; it
+        /// grows in place only when it ends where the mapping does.
+        pub fn plan(request: &Request, area: Option<(u64, u64)>, tail_free: bool) -> Plan {
+            let Some((start, end)) = area else {
+                return Plan::Fault;
+            };
+            let Some(old_end) = request.old_end() else {
+                return Plan::Fault;
+            };
+            if request.old < start || old_end > end {
+                return Plan::Fault;
+            }
+            if request.new_len == request.old_len {
+                Plan::Same
+            } else if request.new_len < request.old_len {
+                Plan::Shrink
+            } else if old_end == end && tail_free {
+                Plan::Grow
+            } else if request.may_move {
+                Plan::Move
+            } else {
+                Plan::NoMemory
+            }
+        }
+    }
+
+    /// Robust futexes (ABI 2.9, item 5.3b): the list `set_robust_list` names, which the
+    /// kernel walks when the thread ends, as Linux's exit does.
+    ///
+    /// `struct robust_list_head` is three words: the first entry (`next`), the offset
+    /// from an entry to its futex word, and the entry whose lock or unlock was under way
+    /// (`list_op_pending`). Each entry's first word is the next entry; the list ends
+    /// where an entry is the head itself. A pointer's lowest bit marks a PI futex. Each
+    /// futex the ended thread still owns (its id in [`TID_MASK`]) is marked
+    /// [`OWNER_DIED`], keeping [`WAITERS`], and one waiter is woken when it had any, so
+    /// the next owner learns its holder died (`EOWNERDEAD`).
+    pub mod robust {
+        /// `sizeof(struct robust_list_head)`: what `set_robust_list` must be given.
+        pub const HEAD_SIZE: u64 = 24;
+        /// Byte offset of the head's futex offset (a signed word).
+        pub const FUTEX_OFFSET: u64 = 8;
+        /// Byte offset of the head's pending entry.
+        pub const PENDING: u64 = 16;
+        /// `FUTEX_WAITERS`: a thread waits on the word.
+        pub const WAITERS: u32 = 0x8000_0000;
+        /// `FUTEX_OWNER_DIED`: its owner ended holding it.
+        pub const OWNER_DIED: u32 = 0x4000_0000;
+        /// `FUTEX_TID_MASK`: the owner's thread id.
+        pub const TID_MASK: u32 = 0x3fff_ffff;
+        /// `ROBUST_LIST_LIMIT`: the most entries walked, so a list that loops ends.
+        pub const LIMIT: usize = 2048;
+        /// The most times one word is tried while other threads change it.
+        pub const RETRIES: usize = 64;
+
+        /// The ended thread's memory, as the kernel reaches it.
+        pub trait Memory {
+            /// The word at `addr`; `None` when it cannot be read.
+            fn read_u64(&mut self, addr: u64) -> Option<u64>;
+            /// The futex word at `addr`; `None` when it cannot be read.
+            fn read_u32(&mut self, addr: u64) -> Option<u32>;
+            /// Replaces the futex word at `addr` with `new` if it holds `old`, at once;
+            /// what it held, or `None` when it cannot be written.
+            fn compare_exchange(&mut self, addr: u64, old: u32, new: u32) -> Option<u32>;
+            /// Wakes one thread waiting on the futex word at `addr`.
+            fn wake(&mut self, addr: u64);
+        }
+
+        /// An entry pointer: the entry, and whether it is a PI futex's.
+        fn entry(word: u64) -> (u64, bool) {
+            (word & !1, word & 1 != 0)
+        }
+
+        /// Walks the list at `head` of thread `tid`, which has ended, as Linux's
+        /// `exit_robust_list` does: every futex it still owns is marked owner-died and
+        /// one of its waiters woken; the pending entry last. A word that cannot be read
+        /// ends the walk. Returns how many futexes were marked.
+        pub fn release(head: u64, tid: u64, memory: &mut impl Memory) -> usize {
+            let Some(first) = memory.read_u64(head) else {
+                return 0;
+            };
+            let Some(offset) = memory.read_u64(head.wrapping_add(FUTEX_OFFSET)) else {
+                return 0;
+            };
+            let Some(pending) = memory.read_u64(head.wrapping_add(PENDING)) else {
+                return 0;
+            };
+            let (pending, pending_pi) = entry(pending);
+            let (mut at, mut pi) = entry(first);
+            let mut marked = 0;
+            let mut left = LIMIT;
+            while at != head {
+                let next = memory.read_u64(at);
+                if at != pending {
+                    match death(at.wrapping_add(offset), tid, pi, false, memory) {
+                        Some(true) => marked += 1,
+                        Some(false) => {}
+                        None => return marked,
+                    }
+                }
+                let Some(next) = next else {
+                    return marked;
+                };
+                (at, pi) = entry(next);
+                left -= 1;
+                if left == 0 {
+                    break;
+                }
+            }
+            if pending != 0
+                && death(pending.wrapping_add(offset), tid, pending_pi, true, memory) == Some(true)
+            {
+                marked += 1;
+            }
+            marked
+        }
+
+        /// Linux's `handle_futex_death` for the word at `addr`: `Some(true)` when it was
+        /// marked owner-died, `Some(false)` when it is not the thread's (or the pending
+        /// unlock had released it, whose waiter is woken), `None` when it cannot be
+        /// reached, which ends the walk.
+        fn death(
+            addr: u64,
+            tid: u64,
+            pi: bool,
+            pending: bool,
+            memory: &mut impl Memory,
+        ) -> Option<bool> {
+            if !addr.is_multiple_of(4) {
+                return None;
+            }
+            for _ in 0..RETRIES {
+                let word = memory.read_u32(addr)?;
+                let owner = word & TID_MASK;
+                // An unlock under way released it before the thread ended: its waiter is
+                // woken to take it, and the word is left as it is.
+                if pending && !pi && owner == 0 {
+                    memory.wake(addr);
+                    return Some(false);
+                }
+                if u64::from(owner) != tid {
+                    return Some(false);
+                }
+                let died = (word & WAITERS) | OWNER_DIED;
+                if memory.compare_exchange(addr, word, died)? != word {
+                    continue;
+                }
+                // A PI futex's waiters are the PI state's, which this kernel has none of.
+                if !pi && word & WAITERS != 0 {
+                    memory.wake(addr);
+                }
+                return Some(true);
+            }
+            Some(false)
+        }
     }
 
     /// A request, the kernel to the server: [`request::SIZE`] bytes.
@@ -1528,7 +1800,7 @@ mod tests {
         assert!(!valid_name(b""));
         assert!(!valid_name(b"Upper"));
         assert!(!valid_name(&[b'a'; 33]));
-        assert_eq!(ABI_VERSION, 0x2_0008);
+        assert_eq!(ABI_VERSION, 0x2_0009);
         assert_eq!(nr::HYPERV_POST, nr::THREAD_INTERRUPT + 1);
         // ABI 2.8's two calls follow 2.7's six.
         assert_eq!(nr::CLOCK_SET_REALTIME, nr::HYPERV_SIGNAL + 1);
@@ -1574,6 +1846,10 @@ mod tests {
         assert_eq!(forward::request::SIZE, forward::request::IP + 8);
         assert_eq!(forward::reply::SIZE, forward::reply::BRK + 8);
         const { assert!(forward::fast::CLOCK_GETRES < forward::fast::COUNT) };
+        // ABI 2.9's two fast calls follow 2.0's eighteen.
+        assert_eq!(forward::fast::MREMAP, forward::fast::CLOCK_GETRES + 1);
+        assert_eq!(forward::fast::SET_ROBUST_LIST, forward::fast::MREMAP + 1);
+        assert_eq!(forward::fast::SET_ROBUST_LIST + 1, forward::fast::COUNT);
         let mut word = [0u8; 16];
         assert!(write_u64(&mut word, 8, 0x0123_4567_89ab_cdef));
         assert_eq!(read_u64(&word, 8), Some(0x0123_4567_89ab_cdef));
@@ -1732,5 +2008,284 @@ mod tests {
         assert_eq!(charge::TABLE_REGIONS[2], 512 * charge::TABLE_REGIONS[1]);
         const { assert!(charge::THREAD >= 128 * PAGE_SIZE) };
         const { assert!(charge::SPACE.is_multiple_of(PAGE_SIZE)) };
+    }
+
+    /// LX-T18 (item 5.3b): `mremap` as the kernel reads it, and its plan for a mapping.
+    #[test]
+    fn lx_t18_mremap_requests_and_plans() {
+        use forward::remap::{self, Plan, Refusal, Request};
+        let page = PAGE_SIZE;
+        let at = 0x1000_0000;
+        // Lengths round up to whole pages; only MAYMOVE is the kernel's.
+        assert_eq!(
+            remap::request(at, page + 1, 3 * page, remap::MAYMOVE),
+            Ok(Request {
+                old: at,
+                old_len: 2 * page,
+                new_len: 3 * page,
+                may_move: true
+            })
+        );
+        let plain = remap::request(at, page, 2 * page, 0).unwrap();
+        assert!(!plain.may_move);
+        assert_eq!(plain.old_end(), Some(at + page));
+        assert_eq!(plain.new_end(), Some(at + 2 * page));
+        // Linux's EINVAL: an unaligned address, a new length of zero, an unknown flag,
+        // FIXED or DONTUNMAP without MAYMOVE, a length past the top.
+        for (old, old_len, new_len, flags) in [
+            (at + 1, page, page, 0),
+            (at, page, 0, remap::MAYMOVE),
+            (at, page, page, 8),
+            (at, page, page, remap::FIXED),
+            (at, page, page, remap::DONTUNMAP),
+            (at, u64::MAX, page, 0),
+            (at, page, u64::MAX - 1, 0),
+        ] {
+            assert_eq!(
+                remap::request(old, old_len, new_len, flags),
+                Err(Refusal::Invalid),
+                "{old:#x} {old_len} {new_len} {flags}"
+            );
+        }
+        // Not the kernel's: forwarded, and the server refuses it.
+        for (old_len, flags) in [
+            (page, remap::MAYMOVE | remap::FIXED),
+            (page, remap::MAYMOVE | remap::DONTUNMAP),
+            (0, remap::MAYMOVE),
+        ] {
+            assert_eq!(
+                remap::request(at, old_len, page, flags),
+                Err(Refusal::Forward)
+            );
+        }
+        let request = |old_len: u64, new_len: u64, may_move: bool| Request {
+            old: at,
+            old_len: old_len * page,
+            new_len: new_len * page,
+            may_move,
+        };
+        let whole = Some((at, at + 4 * page));
+        assert_eq!(remap::plan(&request(4, 4, false), whole, false), Plan::Same);
+        assert_eq!(
+            remap::plan(&request(4, 1, false), whole, false),
+            Plan::Shrink
+        );
+        assert_eq!(remap::plan(&request(4, 8, false), whole, true), Plan::Grow);
+        assert_eq!(remap::plan(&request(4, 8, true), whole, false), Plan::Move);
+        assert_eq!(
+            remap::plan(&request(4, 8, false), whole, false),
+            Plan::NoMemory
+        );
+        // A range ending inside its mapping cannot grow in place: the mapping goes on.
+        assert_eq!(remap::plan(&request(2, 3, true), whole, true), Plan::Move);
+        assert_eq!(
+            remap::plan(&request(2, 3, false), whole, true),
+            Plan::NoMemory
+        );
+        // The tail of a mapping grows the mapping in place.
+        let tail = Some((at - 2 * page, at + 4 * page));
+        assert_eq!(remap::plan(&request(4, 6, false), tail, true), Plan::Grow);
+        // Nothing mapped, or an old range past its mapping: EFAULT.
+        assert_eq!(remap::plan(&request(4, 8, true), None, true), Plan::Fault);
+        assert_eq!(remap::plan(&request(5, 8, true), whole, true), Plan::Fault);
+        assert_eq!(
+            remap::plan(&request(1, 2, true), Some((at + page, at + 2 * page)), true),
+            Plan::Fault
+        );
+        let top = Request {
+            old: u64::MAX - page + 1,
+            old_len: 2 * page,
+            new_len: 3 * page,
+            may_move: true,
+        };
+        assert_eq!(top.old_end(), None);
+        assert_eq!(top.new_end(), None);
+        assert_eq!(
+            remap::plan(&top, Some((top.old, u64::MAX)), true),
+            Plan::Fault
+        );
+    }
+
+    /// A thread's memory for LX-T20: words by address, and the wakes made.
+    #[derive(Default)]
+    struct Words {
+        words: alloc::collections::BTreeMap<u64, u64>,
+        futexes: alloc::collections::BTreeMap<u64, u32>,
+        woken: alloc::vec::Vec<u64>,
+        /// Futex words another thread changes once, the first time each is exchanged.
+        racing: alloc::collections::BTreeMap<u64, u32>,
+        /// Futex words that read but cannot be written.
+        read_only: alloc::vec::Vec<u64>,
+        /// Futex words others keep changing: every exchange finds another value.
+        busy: alloc::vec::Vec<u64>,
+        exchanges: usize,
+    }
+
+    impl forward::robust::Memory for Words {
+        fn read_u64(&mut self, addr: u64) -> Option<u64> {
+            self.words.get(&addr).copied()
+        }
+        fn read_u32(&mut self, addr: u64) -> Option<u32> {
+            self.futexes.get(&addr).copied()
+        }
+        fn compare_exchange(&mut self, addr: u64, old: u32, new: u32) -> Option<u32> {
+            self.exchanges += 1;
+            if self.read_only.contains(&addr) {
+                return None;
+            }
+            if self.busy.contains(&addr) {
+                return Some(old ^ 1);
+            }
+            if let Some(changed) = self.racing.remove(&addr) {
+                self.futexes.insert(addr, changed);
+                return Some(changed);
+            }
+            let held = *self.futexes.get(&addr)?;
+            if held == old {
+                self.futexes.insert(addr, new);
+            }
+            Some(held)
+        }
+        fn wake(&mut self, addr: u64) {
+            self.woken.push(addr);
+        }
+    }
+
+    /// A list at `head` whose first entry is `first`, with a futex offset of zero and
+    /// nothing pending.
+    fn robust_list(head: u64, first: u64) -> Words {
+        let mut m = Words::default();
+        m.words.insert(head, first);
+        m.words.insert(head + forward::robust::FUTEX_OFFSET, 0);
+        m.words.insert(head + forward::robust::PENDING, 0);
+        m
+    }
+
+    /// LX-T20 (item 5.3b): a robust list walked when its thread ends.
+    #[test]
+    fn lx_t20_robust_list_released() {
+        use forward::robust::{self, OWNER_DIED, TID_MASK, WAITERS};
+        const HEAD: u64 = 0x7000;
+        const TID: u64 = 42;
+        // Each futex word 0x20 past its entry.
+        let offset = 0x20u64;
+        let entries = [0x8000u64, 0x8100, 0x8200, 0x8300];
+        let mut m = robust_list(HEAD, entries[0]);
+        m.words.insert(HEAD + robust::FUTEX_OFFSET, offset);
+        for (i, e) in entries.iter().enumerate() {
+            m.words.insert(*e, *entries.get(i + 1).unwrap_or(&HEAD));
+        }
+        // The last entry is a PI futex's: its pointer's low bit is set.
+        m.words.insert(entries[2], entries[3] | 1);
+        // Held with a waiter; held alone; another thread's; held, as a PI futex.
+        m.futexes.insert(entries[0] + offset, TID as u32 | WAITERS);
+        m.futexes.insert(entries[1] + offset, TID as u32);
+        m.futexes.insert(entries[2] + offset, 7 | WAITERS);
+        m.futexes.insert(entries[3] + offset, TID as u32 | WAITERS);
+        assert_eq!(robust::release(HEAD, TID, &mut m), 3);
+        assert_eq!(m.futexes[&(entries[0] + offset)], OWNER_DIED | WAITERS);
+        assert_eq!(m.futexes[&(entries[1] + offset)], OWNER_DIED);
+        assert_eq!(
+            m.futexes[&(entries[2] + offset)],
+            7 | WAITERS,
+            "not its own"
+        );
+        assert_eq!(m.futexes[&(entries[3] + offset)], OWNER_DIED | WAITERS);
+        // One waiter woken where there were waiters; a PI futex's are not the kernel's.
+        assert_eq!(m.woken, [entries[0] + offset]);
+
+        // A negative offset (a signed word), and the pending entry: held, it is
+        // marked; released by the unlock under way, its waiter is woken.
+        let back = 8u64.wrapping_neg();
+        let mut m = robust_list(HEAD, HEAD);
+        m.words.insert(HEAD + robust::FUTEX_OFFSET, back);
+        m.words.insert(HEAD + robust::PENDING, 0x9008);
+        m.futexes.insert(0x9000, TID as u32);
+        assert_eq!(robust::release(HEAD, TID, &mut m), 1);
+        assert_eq!(m.futexes[&0x9000], OWNER_DIED);
+        m.futexes.insert(0x9000, 0);
+        assert_eq!(robust::release(HEAD, TID, &mut m), 0);
+        assert_eq!(m.futexes[&0x9000], 0, "left as the unlock left it");
+        assert_eq!(m.woken, [0x9000]);
+        // A pending PI futex released by its unlock wakes nobody.
+        m.words.insert(HEAD + robust::PENDING, 0x9008 | 1);
+        assert_eq!(robust::release(HEAD, TID, &mut m), 0);
+        assert_eq!(m.woken, [0x9000]);
+        // A pending entry that is also on the list is released once, last.
+        let mut m = robust_list(HEAD, 0x9008);
+        m.words.insert(0x9008, HEAD);
+        m.words.insert(HEAD + robust::FUTEX_OFFSET, back);
+        m.words.insert(HEAD + robust::PENDING, 0x9008);
+        m.futexes.insert(0x9000, TID as u32 | WAITERS);
+        assert_eq!(robust::release(HEAD, TID, &mut m), 1);
+        assert_eq!(m.exchanges, 1);
+        assert_eq!(m.woken, [0x9000]);
+
+        // A word another thread changes is tried again: a waiter arrived meanwhile.
+        let mut m = robust_list(HEAD, 0xa000);
+        m.words.insert(0xa000, HEAD);
+        m.futexes.insert(0xa000, TID as u32);
+        m.racing.insert(0xa000, TID as u32 | WAITERS);
+        assert_eq!(robust::release(HEAD, TID, &mut m), 1);
+        assert_eq!(m.futexes[&0xa000], OWNER_DIED | WAITERS);
+        assert_eq!(m.woken, [0xa000]);
+        assert_eq!(m.exchanges, 2);
+        // A thread id past the mask is never an owner.
+        let mut m = robust_list(HEAD, 0xa000);
+        m.words.insert(0xa000, HEAD);
+        m.futexes.insert(0xa000, TID_MASK);
+        assert_eq!(robust::release(HEAD, u64::from(TID_MASK) + 1, &mut m), 0);
+    }
+
+    /// LX-T20 (item 5.3b): what ends a walk early, and a list that never ends.
+    #[test]
+    fn lx_t20_robust_list_bounded() {
+        use forward::robust::{self, OWNER_DIED, RETRIES};
+        const HEAD: u64 = 0x7000;
+        const TID: u64 = 9;
+        // No head, no offset, no pending word: nothing is walked.
+        assert_eq!(robust::release(HEAD, TID, &mut Words::default()), 0);
+        let mut m = Words::default();
+        m.words.insert(HEAD, HEAD);
+        assert_eq!(robust::release(HEAD, TID, &mut m), 0);
+        m.words.insert(HEAD + robust::FUTEX_OFFSET, 0);
+        assert_eq!(robust::release(HEAD, TID, &mut m), 0);
+        // An empty list: the head names itself.
+        let mut m = robust_list(HEAD, HEAD);
+        assert_eq!(robust::release(HEAD, TID, &mut m), 0);
+        assert_eq!(m.exchanges, 0);
+        // A futex word that cannot be read, or written, or is unaligned, ends the walk
+        // there; an entry whose next cannot be read ends it after that entry.
+        let mut m = robust_list(HEAD, 0xb000);
+        m.words.insert(0xb000, 0xb100);
+        m.words.insert(0xb100, HEAD);
+        m.futexes.insert(0xb100, TID as u32);
+        assert_eq!(robust::release(HEAD, TID, &mut m), 0);
+        assert_eq!(m.futexes[&0xb100], TID as u32, "not reached");
+        let mut m = robust_list(HEAD, 0xb000);
+        m.words.insert(0xb000, HEAD);
+        m.futexes.insert(0xb000, TID as u32);
+        m.read_only.push(0xb000);
+        assert_eq!(robust::release(HEAD, TID, &mut m), 0);
+        let mut m = robust_list(HEAD, 0xb002);
+        m.words.insert(0xb002, HEAD);
+        assert_eq!(robust::release(HEAD, TID, &mut m), 0);
+        let mut m = robust_list(HEAD, 0xb000);
+        m.futexes.insert(0xb000, TID as u32);
+        assert_eq!(robust::release(HEAD, TID, &mut m), 1);
+        assert_eq!(m.futexes[&0xb000], OWNER_DIED);
+        // A list that loops is walked LIMIT entries, no more.
+        let mut m = robust_list(HEAD, 0xc000);
+        m.words.insert(0xc000, 0xc000);
+        m.futexes.insert(0xc000, 1);
+        assert_eq!(robust::release(HEAD, TID, &mut m), 0);
+        // A word others keep changing is given up after RETRIES tries.
+        let mut m = robust_list(HEAD, 0xd000);
+        m.words.insert(0xd000, HEAD);
+        m.futexes.insert(0xd000, TID as u32);
+        m.busy.push(0xd000);
+        assert_eq!(robust::release(HEAD, TID, &mut m), 0);
+        assert_eq!(m.exchanges, RETRIES);
+        assert!(m.woken.is_empty());
     }
 }

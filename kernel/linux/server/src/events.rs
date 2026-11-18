@@ -523,12 +523,24 @@ impl Task {
         Ok(0)
     }
 
-    /// `sysinfo`: the account the program was granted, as the kernel has it now;
-    /// refused without one.
+    /// `sysinfo`: the account the program was granted, as the kernel has it now; for a
+    /// plain `run`'s program, granted none, the account its process is charged to, the
+    /// server's own (item 5.3b).
     pub fn sysinfo(&mut self, at: u64) -> Result<u64, u64> {
-        let Some(memory) = self.machine()? else {
-            self.refused.count(nr::SYSINFO);
-            return Err(errno::ENOSYS);
+        let memory = match self.machine()? {
+            Some(memory) => memory,
+            None => {
+                let usage = self.process.usage().map_err(|e| {
+                    println!(
+                        self.shared.borrow().out,
+                        "linux: {}: the account it is charged to: {}",
+                        self.name,
+                        e.name()
+                    );
+                    errno::EIO
+                })?;
+                machine::Memory::of(usage.limit, usage.used, usage.reserved)
+            }
         };
         let info = machine::sysinfo(memory, moruna_svc::now());
         memory::write(&self.process, at, &info)?;
@@ -551,10 +563,11 @@ impl Task {
             );
             errno::EIO
         })?;
-        Ok(Some(machine::Memory {
-            total: usage.limit,
-            free: usage.room(),
-        }))
+        Ok(Some(machine::Memory::of(
+            usage.limit,
+            usage.used,
+            usage.reserved,
+        )))
     }
 
     /// A file the server writes itself at `path`, for this program.

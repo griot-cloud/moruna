@@ -13,6 +13,7 @@ use moruna_abi::{
     read_u32, read_u64, write_u64,
 };
 use moruna_linux::{
+    clone,
     fd::{DupError, Entry, Fds},
     path,
     refused::Refused,
@@ -682,6 +683,7 @@ impl Task {
             nr::FUTEX => self.refuse(number),
             nr::WAIT4 | nr::WAITID => Answer::Value(fail(errno::ECHILD)),
             nr::CLONE => self.clone(token, a),
+            nr::CLONE3 => self.clone3(token, a[0], a[1]),
             nr::EXECVE => self.execve(threads, a[0], a[1], a[2]),
             nr::EXIT_GROUP => {
                 let code = a[0] as i32 & 0xff;
@@ -1542,37 +1544,45 @@ impl Task {
     /// `clone`: a thread of this process, as a thread library makes one. A new process
     /// (`fork`, `vfork`, a `clone` without `CLONE_VM`) is not in the table: refused.
     fn clone(&mut self, token: u64, a: [u64; 6]) -> Answer {
-        const CLONE_VM: u64 = 0x100;
-        const CLONE_SIGHAND: u64 = 0x800;
-        const CLONE_VFORK: u64 = 0x4000;
-        const CLONE_THREAD: u64 = 0x10000;
-        const CLONE_SETTLS: u64 = 0x80000;
-        const CLONE_PARENT_SETTID: u64 = 0x10_0000;
-        const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
-        const CLONE_CHILD_SETTID: u64 = 0x100_0000;
-        let [flags, stack, ptid, ctid, tls, _] = a;
-        let thread = CLONE_VM | CLONE_SIGHAND | CLONE_THREAD;
-        if flags & thread != thread || flags & CLONE_VFORK != 0 {
-            return self.refuse(nr::CLONE);
+        match clone::clone(a) {
+            Ok(thread) => self.spawn(token, thread),
+            Err(clone::Refusal::NotThread) => self.refuse(nr::CLONE),
+            Err(clone::Refusal::Errno(e)) => Answer::Value(fail(e)),
         }
-        if stack == 0 {
-            return Answer::Value(fail(errno::EINVAL));
+    }
+
+    /// `clone3(args, size)` (item 5.3b): its `struct clone_args` read and mapped onto
+    /// `clone`'s thread; anything else is refused, as `clone`'s is.
+    fn clone3(&mut self, token: u64, args: u64, size: u64) -> Answer {
+        let bytes =
+            match clone::args_len(size).and_then(|len| memory::read(&self.process, args, len)) {
+                Ok(bytes) => bytes,
+                Err(e) => return Answer::Value(fail(e)),
+            };
+        match clone::clone3(&bytes) {
+            Ok(thread) => self.spawn(token, thread),
+            Err(clone::Refusal::NotThread) => self.refuse(nr::CLONE3),
+            Err(clone::Refusal::Errno(e)) => Answer::Value(fail(e)),
         }
-        let tls = if flags & CLONE_SETTLS != 0 { tls } else { 0 };
-        let clear = if flags & CLONE_CHILD_CLEARTID != 0 {
-            ctid
-        } else {
-            0
-        };
-        let set = if flags & CLONE_PARENT_SETTID != 0 {
-            ptid
-        } else {
-            0
-        };
-        match self.process.clone_thread(token, stack, tls, clear, set) {
+    }
+
+    /// Starts `thread` with the registers of the calling thread `token`: its id, or the
+    /// error.
+    fn spawn(&mut self, token: u64, thread: clone::Thread) -> Answer {
+        let clone::Thread {
+            stack,
+            tls,
+            clear_tid,
+            parent_tid,
+            child_tid,
+        } = thread;
+        match self
+            .process
+            .clone_thread(token, stack, tls, clear_tid, parent_tid)
+        {
             Ok(tid) => {
-                if flags & CLONE_CHILD_SETTID != 0
-                    && memory::write_u32(&self.process, ctid, tid as u32).is_err()
+                if child_tid != 0
+                    && memory::write_u32(&self.process, child_tid, tid as u32).is_err()
                 {
                     return Answer::Value(fail(errno::EFAULT));
                 }
