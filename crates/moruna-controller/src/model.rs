@@ -59,7 +59,7 @@ const READ_AHEAD_SHARE: f64 = 0.5;
 const READ_AHEAD_INITIAL: u16 = 2;
 /// What the source drive charges the arena per byte a read decodes to: twice, the most a size
 /// class rounds a buffer up by (02 e.2; the scheduler's `ARENA_ROUNDING`).
-const READ_CHARGE: u64 = 2;
+pub const READ_CHARGE: u64 = 2;
 /// The promotion window f.3 starts from (`queue.promotion_window`).
 const PROMOTION_WINDOW_INITIAL: u16 = 2;
 

@@ -25,6 +25,7 @@ use crate::commit::{ObjectPrefix, TMP_SUFFIX};
 use crate::file_buf::{
     FileBuf, FileBuffers, TOO_LARGE, differing_field, footer_for, hex, rows_bytes,
 };
+use crate::lane_heap::{self, Bounds};
 use crate::stats::SinkStats;
 use crate::{Phase, host_tier, part_name, require_host};
 
@@ -33,6 +34,54 @@ const KIND: &str = "parquet";
 
 /// The marker `finish` writes once every file is committed (e.2).
 const SUCCESS: &str = "_SUCCESS";
+
+/// What a run grants a Parquet sink once it knows the sink's schema (system design 3A, item
+/// 6.3d): its writers' heap above the arena, every lane together, and its two file buffers'
+/// bytes in the arena. The run claims a grant when it builds the sink, before the schema is
+/// known, sets it after it has validated its graph and capped its arena, and the sink reads it
+/// at `open`. Clones share the grant.
+#[derive(Clone, Debug, Default)]
+pub struct WriterGrant(Arc<Granted>);
+
+#[derive(Debug, Default)]
+struct Granted {
+    set: std::sync::atomic::AtomicBool,
+    writers: std::sync::atomic::AtomicU64,
+    file_buffers: std::sync::atomic::AtomicU64,
+}
+
+impl WriterGrant {
+    /// A grant not set yet.
+    pub fn new() -> WriterGrant {
+        WriterGrant::default()
+    }
+
+    /// Grant `writers` bytes of heap to the writers, every lane together (`None` keeps
+    /// parquet's own limits), and `file_buffers` bytes of the arena to the sink's two file
+    /// buffers.
+    pub fn grant(&self, writers: Option<u64>, file_buffers: u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.0.writers.store(writers.unwrap_or(0), SeqCst);
+        self.0.file_buffers.store(file_buffers, SeqCst);
+        self.0.set.store(true, SeqCst);
+    }
+
+    /// The writers' heap granted, `None` before the grant or when it keeps parquet's limits.
+    pub fn writers(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let writers = self.0.writers.load(SeqCst);
+        (self.0.set.load(SeqCst) && writers > 0).then_some(writers)
+    }
+
+    /// The file buffers' bytes granted, `None` before the grant.
+    pub fn file_buffers(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.0
+            .set
+            .load(SeqCst)
+            .then(|| self.0.file_buffers.load(SeqCst))
+    }
+}
 
 /// Where a Parquet sink writes and how big its pieces are.
 pub struct ParquetSinkConfig {
@@ -86,6 +135,10 @@ struct Current {
     shared: Arc<Mutex<FileBuf>>,
     seqs: Vec<Seq>,
     rows: u64,
+    /// The decoded bytes written into the file, and how many of them were in row groups
+    /// already flushed (6.3d): what the lane's pages are counted by.
+    decoded: u64,
+    flushed_decoded: u64,
 }
 
 /// One file an encode can write into, and the byte count it rolls at (f.1). The sink keeps as
@@ -96,6 +149,14 @@ struct Current {
 struct Lane {
     current: Option<Current>,
     roll_bytes: u64,
+    /// The writer limits of the lane's heap allowance (6.3d), when the sink has one.
+    bounds: Option<Bounds>,
+    /// The Rust heap the lane's writer holds: every call into it counts its thread's heap here
+    /// (6.3d), where the program's allocator counts the heap (`moruna_kernel::held`).
+    heap: moruna_kernel::Held,
+    /// The most the writer's heap grew in one slice of the in-progress row group, its first
+    /// slice aside (which makes the row group's column writers).
+    jump: u64,
 }
 
 /// A rolled file whose bytes are with the reactor and not yet committed.
@@ -138,6 +199,13 @@ pub struct ParquetSink {
     lane_bytes: std::sync::atomic::AtomicU64,
     /// Where a worker that finds every lane busy waits next, round robin.
     next_lane: std::sync::atomic::AtomicUsize,
+    /// The heap the run gives the sink's writers, every lane together (system design 3A,
+    /// 6.3d); `None` keeps parquet's own limits.
+    writer_share: Option<u64>,
+    /// The run's grant, read at `open` (6.3d): it sets the writers' heap and the file buffers.
+    grant: Option<WriterGrant>,
+    /// One lane's part of it, settled at `open` with the lanes it holds.
+    lane_heap: Option<u64>,
 }
 
 impl ParquetSink {
@@ -175,6 +243,9 @@ impl ParquetSink {
             max_lanes: 2,
             lane_bytes: std::sync::atomic::AtomicU64::new(0),
             next_lane: std::sync::atomic::AtomicUsize::new(0),
+            writer_share: None,
+            grant: None,
+            lane_heap: None,
         })
     }
 
@@ -183,6 +254,95 @@ impl ParquetSink {
     pub fn with_lanes(mut self, lanes: usize) -> ParquetSink {
         self.max_lanes = lanes.max(1);
         self
+    }
+
+    /// Keep the sink's writers within `bytes` of heap, every lane together (system design 3A,
+    /// item 6.3d): their share of the room above the arena. At `open` the share is divided
+    /// among as many lanes, up to [`ParquetSink::with_lanes`], as each hold their columns'
+    /// codecs and the writer's least heap ([`crate::writer_lanes`]); a schema one lane cannot
+    /// hold is refused. Each lane's page, dictionary and write limits are derived from its part
+    /// and the schema's leaf columns, its row group is flushed before what it holds reaches its
+    /// part less a margin, and its file rolls before the file's page index outgrows its share
+    /// ([`crate::lane_heap`]). Only row group, page, encoding and file boundaries move. `None`,
+    /// the default, keeps parquet's own limits.
+    pub fn with_writer_heap(mut self, bytes: Option<u64>) -> ParquetSink {
+        self.writer_share = bytes.filter(|&bytes| bytes > 0);
+        self
+    }
+
+    /// Take the writers' heap and the file buffers from `grant` at `open` (system design 3A,
+    /// item 6.3d): the run sets it once it knows the sink's schema. The writers' heap is as
+    /// [`ParquetSink::with_writer_heap`] would set it, and the file buffers bound
+    /// `ParquetSinkConfig::file_bytes` at half of them. A grant not set by `open` changes
+    /// nothing.
+    pub fn with_grant(mut self, grant: WriterGrant) -> ParquetSink {
+        self.grant = Some(grant);
+        self
+    }
+
+    /// The codec the writer compresses a column with, unless a column of `writer_props` says
+    /// otherwise.
+    fn compression(&self) -> Compression {
+        self.props
+            .compression(&parquet::schema::types::ColumnPath::new(Vec::new()))
+    }
+
+    /// Divide the writers' share among the lanes `schema`'s columns let it hold (6.3d), before
+    /// the file buffers are divided among the same lanes; refuse a schema one lane cannot hold.
+    fn plan_lanes(&mut self, schema: &SchemaRef) -> Result<()> {
+        if let Some(share) = self.writer_share {
+            let leaves = lane_heap::leaves_of(schema)?;
+            let planned = crate::writer_lanes(share, self.max_lanes, &leaves, self.compression())
+                .map_err(|least| lane_refusal(leaves.count, least, share))?;
+            self.max_lanes = planned.lanes;
+            self.lane_heap = Some(planned.lane_bytes);
+        }
+        self.lock().stats.lanes = self.max_lanes as u64;
+        Ok(())
+    }
+
+    /// The writer's properties for `schema`, and the limits of the lane's allowance when the
+    /// sink has one (6.3d): parquet's limits, or the sink's `writer_props`, lowered to what the
+    /// allowance holds for the schema's leaf columns. A payload whose schema has more columns
+    /// than one lane holds is refused, as `open` refuses one.
+    fn writer_props(&self, schema: &SchemaRef) -> Result<(WriterProperties, Option<Bounds>)> {
+        let Some(allowance) = self.lane_heap else {
+            return Ok((self.props.clone(), None));
+        };
+        let leaves = lane_heap::leaves_of(schema)?;
+        let compression = self.compression();
+        let least = crate::least_lane_bytes(&leaves, compression);
+        if least > allowance {
+            return Err(lane_refusal(leaves.count, least, allowance));
+        }
+        self.lock().stats.writer_heap_measured = moruna_kernel::held::heap_counting();
+        let props = &self.props;
+        // A bounded lane writes the claim's page, or parquet's when that is smaller (6.3d).
+        let page = props
+            .data_page_size_limit()
+            .min(usize::try_from(crate::CLAIM_PAGE_BYTES).unwrap_or(usize::MAX));
+        let mut bounds = lane_heap::bounds(
+            allowance,
+            &leaves,
+            compression,
+            props.data_page_row_count_limit(),
+            page,
+            props.dictionary_page_size_limit(),
+            props.write_batch_size(),
+        );
+        let mut builder = props
+            .clone()
+            .into_builder()
+            .set_data_page_row_count_limit(bounds.page_rows)
+            .set_write_batch_size(bounds.write_batch)
+            .set_data_page_size_limit(bounds.page_bytes)
+            .set_dictionary_page_size_limit(bounds.dictionary_bytes);
+        // A fixed-width column whose dictionary's empty hash index the lane cannot hold is
+        // written plain; its dictionary otherwise keeps parquet's limit, bounded by the flush.
+        for path in std::mem::take(&mut bounds.plain) {
+            builder = builder.set_column_dictionary_enabled(path, false);
+        }
+        Ok((builder.build(), Some(bounds)))
     }
 
     /// Name the run whose id goes into every file's footer metadata (e.2). Unset, the footer
@@ -235,14 +395,19 @@ impl ParquetSink {
                 .alloc_file_buf(min_bytes, self.cfg.row_group_bytes, file_bytes)?;
         lane.roll_bytes = roll_bytes;
         self.lock().stats.roll_bytes = roll_bytes;
+        let (props, bounds) = self.writer_props(&schema)?;
+        lane.bounds = bounds;
         let shared = Arc::new(Mutex::new(file));
-        let writer = ArrowWriter::try_new(
-            ArenaWrite {
-                shared: Arc::clone(&shared),
-            },
-            schema,
-            Some(self.props.clone()),
-        )
+        let writer = {
+            let _counted = lane.heap.enter_heap();
+            ArrowWriter::try_new(
+                ArenaWrite {
+                    shared: Arc::clone(&shared),
+                },
+                schema,
+                Some(props),
+            )
+        }
         .map_err(|e| MorunaError::Sink(format!("parquet writer: {e}")))?;
         lane.current = Some(Current {
             name: part_name(index, "parquet"),
@@ -250,7 +415,10 @@ impl ParquetSink {
             shared,
             seqs: Vec::new(),
             rows: 0,
+            decoded: 0,
+            flushed_decoded: 0,
         });
+        lane.jump = 0;
         Ok(())
     }
 
@@ -266,6 +434,7 @@ impl ParquetSink {
             shared,
             seqs,
             rows,
+            ..
         } = current;
         let seq_min = seqs.iter().min().copied().unwrap_or(0);
         let seq_max = seqs.iter().max().copied().unwrap_or(0);
@@ -283,7 +452,11 @@ impl ParquetSink {
                 seq_max.to_string(),
             ));
         }
-        writer.close().map_err(|e| encode_error(&e.to_string()))?;
+        {
+            // 6.3d: closing frees what the writer holds; that is counted out of the lane's heap.
+            let _counted = lane.heap.enter_heap();
+            writer.close().map_err(|e| encode_error(&e.to_string()))?;
+        }
         let (buf, used) = {
             let mut file = shared.lock().unwrap_or_else(|e| e.into_inner());
             (file.buf.take(), file.used)
@@ -442,7 +615,17 @@ impl ParquetSink {
             Some(current) => {
                 let so_far = current.writer.bytes_written() as u64
                     + current.writer.in_progress_size() as u64;
-                if !current.seqs.is_empty() && so_far + bytes > lane.roll_bytes {
+                // 6.3d: a file whose page index would pass its share of the lane's heap with this
+                // morsel rolls too, and the page index the footer will carry counts toward the
+                // file's bytes: small pages make a large one.
+                let index = lane.bounds.as_ref().map_or(0, |b| {
+                    let row_groups = current.writer.flushed_row_groups().len() as u64 + 1;
+                    b.index(current.rows + rows, current.decoded + bytes, row_groups)
+                });
+                let index_full = lane.bounds.as_ref().is_some_and(|b| index > b.index_share);
+                if !current.seqs.is_empty()
+                    && (so_far + bytes + index > lane.roll_bytes || index_full)
+                {
                     // A morsel larger than a file gets a file of its own, sized for it (h); one
                     // that fits an ordinary file gets an ordinary file. Asking every roll for
                     // twice the morsel doubled the buffer's class whenever morsels were a large
@@ -478,26 +661,64 @@ impl ParquetSink {
             }
         }
         let roll_bytes = lane.roll_bytes;
+        let bounds = lane.bounds.as_ref();
+        let heap = &lane.heap;
+        let jump = &mut lane.jump;
+        // 6.3d: the writer's heap is measured where the program's allocator counts it, and
+        // estimated from parquet's own figure where it does not.
+        let measured = moruna_kernel::held::heap_counting();
         let Some(current) = lane.current.as_mut() else {
             return Err(MorunaError::Sink("the sink has no open file".into()));
         };
-        current
-            .writer
-            .write(&batch)
-            .map_err(|e| encode_error(&e.to_string()))?;
+        // The footer shares the buffer, so a row group may not be allowed to grow past the roll
+        // size: `row_group_bytes` is a target, and `roll_bytes` is what the arena agreed to.
+        let target = self.cfg.row_group_bytes.min(roll_bytes);
+        // 6.3d: with a heap allowance the morsel is written in slices (zero copy) of no more
+        // rows than bring an eighth of a page, so what a write converts stays within its share,
+        // and the row group is flushed once the heap the writer's calls hold, and twice the most
+        // one slice grew it by, reach the allowance less its codecs and a slice.
+        let all = batch.num_rows();
+        let slice = bounds.map_or(all, |b| b.slice(all, bytes)).max(1);
+        let mut at = 0;
+        while at < all {
+            let take = slice.min(all - at);
+            let first = current.writer.in_progress_rows() == 0;
+            let before = heap.held();
+            {
+                let _counted = heap.enter_heap();
+                current
+                    .writer
+                    .write(&batch.slice(at, take))
+                    .map_err(|e| encode_error(&e.to_string()))?;
+            }
+            if !first {
+                *jump = (*jump).max(heap.held().saturating_sub(before));
+            }
+            at += take;
+            current.decoded += bytes * take as u64 / all as u64;
+            let writer = &current.writer;
+            if writer.in_progress_size() as u64 >= target
+                || bounds.is_some_and(|b| {
+                    b.flush(
+                        measured.then(|| (heap.held(), *jump)),
+                        writer.memory_size() as u64,
+                    )
+                })
+            {
+                let _counted = heap.enter_heap();
+                current
+                    .writer
+                    .flush()
+                    .map_err(|e| encode_error(&e.to_string()))?;
+                current.flushed_decoded = current.decoded;
+                *jump = 0;
+            }
+        }
         // The payload's arena bytes go back to the arena here, before the reactor has written
         // anything: the encoder has consumed them and the sink keeps no second copy (SI-I1).
         drop(batch);
         current.rows += rows;
         current.seqs.push(seq);
-        // The footer shares the buffer, so a row group may not be allowed to grow past the roll
-        // size: `row_group_bytes` is a target, and `roll_bytes` is what the arena agreed to.
-        if current.writer.in_progress_size() as u64 >= self.cfg.row_group_bytes.min(roll_bytes) {
-            current
-                .writer
-                .flush()
-                .map_err(|e| encode_error(&e.to_string()))?;
-        }
         {
             let mut inner = self.lock();
             inner.stats.writes += 1;
@@ -605,6 +826,21 @@ impl ParquetSink {
         }
     }
 }
+
+/// A schema whose columns one lane's writer heap cannot hold (6.3d). The facade refuses such a
+/// run before it starts with the least budget that holds it; this is the sink's own refusal,
+/// for a sink run without the facade or a payload wider than the schema it was opened with.
+fn lane_refusal(leaves: usize, least: u64, given: u64) -> MorunaError {
+    MorunaError::Config {
+        name: "budget.host",
+        msg: format!(
+            "a Parquet writer of {leaves} leaf columns needs at least {least} bytes of heap for \
+             one lane, its columns' codecs at the smallest page and its own least heap, and is \
+             given {given}: give the run a larger budget"
+        ),
+    }
+}
+
 fn encode_error(msg: &str) -> MorunaError {
     if msg.contains(TOO_LARGE) {
         MorunaError::Sink(msg.to_string())
@@ -620,8 +856,21 @@ impl Sink for ParquetSink {
                 "the parquet sink accepts a table schema".into(),
             ));
         };
+        self.lock().phase.require_created()?;
+        // 6.3d: the run's grant, set once it knew this schema, gives the writers' heap and the
+        // file buffers.
+        if let Some(grant) = &self.grant {
+            if let Some(writers) = grant.writers() {
+                self.writer_share = Some(writers);
+            }
+            if let Some(file_buffers) = grant.file_buffers() {
+                self.cfg.file_bytes = self.cfg.file_bytes.min(file_buffers / 2);
+            }
+        }
+        // 6.3d: the writers' share is divided among the lanes the schema's columns let it
+        // hold, before the file buffers are divided among the same lanes.
+        self.plan_lanes(schema)?;
         let mut inner = self.lock();
-        inner.phase.require_created()?;
         // f.1: the schema `open` is given is the chain's, and a kernel the chain cannot see
         // through (a Python kernel, 05 d.1) reports its input schema as its output. The real
         // output schema is the first payload's, so the writer is built there and this one is
@@ -783,8 +1032,10 @@ impl Sink for ParquetSink {
                 "the parquet sink accepts a table schema".into(),
             ));
         };
+        self.lock().phase.require_created()?;
+        // 6.3d: as at `open`.
+        self.plan_lanes(schema)?;
         let mut inner = self.lock();
-        inner.phase.require_created()?;
         let doc = Ledger::parse(KIND, state)?;
         let (ledger, above) = Ledger::restore(KIND, doc, committed_seq)?;
         let keep: BTreeSet<String> = ledger.committed().iter().map(|f| f.name.clone()).collect();

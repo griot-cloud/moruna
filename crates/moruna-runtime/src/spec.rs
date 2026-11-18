@@ -29,7 +29,8 @@ pub struct BuildCtx {
     pub object_metadata: Option<Arc<dyn ObjectMetadata>>,
     /// The run's identity, minted or read from a manifest.
     pub run_id: RunId,
-    /// The arena's host capacity when the run started.
+    /// The arena's host capacity when the run started: its largest, before the sinks' writers
+    /// claim their need above it (3A, 6.3d).
     pub arena_bytes: u64,
     /// What the run may hold above its arena: its allowance (the budget less what the process
     /// held before the arena, the reserve and the kernels' declared state) less the arena.
@@ -39,14 +40,32 @@ pub struct BuildCtx {
     /// The workers the run may have at most: a sink that encodes on workers opens a file per
     /// worker that may encode at once (08 f.12, RB1).
     pub workers: u16,
-    /// The file buffers the sinks claimed out of the arena ([`BuildCtx::claim_file_buffer`]).
+    /// The file buffers the sinks claimed out of the arena ([`BuildCtx::claim_file_buffer`],
+    /// and the run's grants, 6.3d).
     pub(crate) sink_buffer: Arc<std::sync::atomic::AtomicU64>,
+    /// Each writer claim, in the order the sinks were built: the facade fits each sink's writers
+    /// to its schema once the schemas are known, and sets its grant.
+    pub(crate) writer_claims: Arc<std::sync::Mutex<Vec<WriterClaim>>>,
+    /// The decode batch a source reads at each read ([`BuildCtx::decode_batch`]).
+    pub(crate) decode_batch: moruna_sources::DecodeBatch,
+    /// How many sources claimed room for their decoders ([`BuildCtx::claim_decoders`]).
+    pub(crate) decoders: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// One sink's claim on the room above the arena (6.3d): the codec its columns keep state for,
+/// and the grant the facade sets once it knows the sink's schema.
+#[derive(Clone, Debug)]
+pub(crate) struct WriterClaim {
+    /// The codec the sink compresses its columns with.
+    pub compression: parquet::basic::Compression,
+    /// What the run grants the sink.
+    pub grant: moruna_sinks::WriterGrant,
 }
 
 /// How many times its batch one decode may hold outside the arena at its height: twice for the
 /// buffers it grows by doubling, and as much again for its pages, dictionaries and levels
 /// (`BuildCtx::decode_batch_bytes`).
-const DECODE_HOLDS: u64 = 4;
+pub(crate) const DECODE_HOLDS: u64 = 4;
 
 impl BuildCtx {
     /// The most one sink that encodes files in the arena (Parquet) may hold for its file
@@ -78,10 +97,66 @@ impl BuildCtx {
     /// quarter of that. A decoder builds a batch in buffers that grow by doubling, so twice the
     /// batch, and beside them holds its columns' current pages, their dictionaries and their
     /// definition levels, about as much again: a worker's decode holds up to four times its
-    /// batch, and the workers' decodes together no more than the headroom.
+    /// batch, and the workers' decodes together no more than the headroom. A run whose sinks'
+    /// writers claim room above the arena sets a smaller batch once it knows their need
+    /// ([`BuildCtx::decode_batch`]).
     pub fn decode_batch_bytes(&self) -> Option<u64> {
         let share = self.headroom_bytes / (u64::from(self.workers.max(1)) * DECODE_HOLDS);
         (share > 0).then_some(share)
+    }
+
+    /// The run's decode batch, which a source reads at each read (3A, items 6.3a and 6.3d):
+    /// [`BuildCtx::decode_batch_bytes`] until the sinks' writers claim their need above the
+    /// arena, and what the arena and the writers leave the decoders after.
+    pub fn decode_batch(&self) -> moruna_sources::DecodeBatch {
+        self.decode_batch.clone()
+    }
+
+    /// Claim room above the arena for one sink's writers (system design 3A, item 6.3d), for a
+    /// sink whose writer keeps each lane's state on the heap (Parquet), compressing its columns
+    /// with `compression`, and its file buffers in the arena. The claim is a grant the run sets
+    /// once it knows the sink's schema, before anything runs: the writers' need, one lane per
+    /// worker at [`moruna_sinks::CLAIM_PAGE_BYTES`] when the budget holds it, claimed before
+    /// the arena takes the rest ([`moruna_sinks::fit_writers`]), and the file buffers' share of
+    /// the arena that leaves. A run whose sink cannot hold one lane is refused before it starts,
+    /// with the least budget that holds it.
+    pub fn claim_writer_heap(
+        &self,
+        compression: parquet::basic::Compression,
+    ) -> moruna_sinks::WriterGrant {
+        let grant = moruna_sinks::WriterGrant::new();
+        self.writer_claims
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(WriterClaim {
+                compression,
+                grant: grant.clone(),
+            });
+        grant
+    }
+
+    /// Claim room above the arena for one source's decoders (system design 3A, item 6.3d), for a
+    /// source that decodes outside the arena with one column reader per projected leaf column
+    /// (Parquet): what they hold whatever their batch
+    /// ([`moruna_sources::decode_fixed_bytes`]), one decode per worker, claimed beside the
+    /// arena's least once the run knows the source's schema, before the sinks' writers and
+    /// before the rest is divided.
+    pub fn claim_decoders(&self) {
+        self.decoders
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many sources have claimed with [`BuildCtx::claim_decoders`].
+    pub(crate) fn decoder_claims(&self) -> usize {
+        self.decoders.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The claims made with [`BuildCtx::claim_writer_heap`], in the order they were made.
+    pub(crate) fn writer_claims(&self) -> Vec<WriterClaim> {
+        self.writer_claims
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// What the sinks claimed with [`BuildCtx::claim_file_buffer`]; zero when none claimed.
@@ -412,6 +487,9 @@ mod tests {
             sinks: 1,
             workers: 1,
             sink_buffer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            writer_claims: Arc::new(std::sync::Mutex::new(Vec::new())),
+            decode_batch: moruna_sources::DecodeBatch::new(),
+            decoders: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -441,6 +519,40 @@ mod tests {
             ..ctx(None)
         };
         assert_eq!(two.decode_batch_bytes(), Some(25 << 20));
+    }
+
+    /// 3A (6.3d): a Parquet sink claims a grant as it is built, before its schema is known; the
+    /// claim records its codec and shares the grant the run sets later, and the decode batch is
+    /// the run's, shared with the sources.
+    #[test]
+    fn a_writer_claim_is_a_grant_the_run_sets_later() {
+        let two = BuildCtx {
+            headroom_bytes: 200 << 20,
+            workers: 2,
+            ..ctx(None)
+        };
+        let zstd = parquet::basic::Compression::ZSTD(Default::default());
+        assert!(two.writer_claims().is_empty());
+        let grant = two.claim_writer_heap(zstd);
+        assert_eq!((grant.writers(), grant.file_buffers()), (None, None));
+        let claims = two.writer_claims();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].compression, zstd);
+        claims[0].grant.grant(Some(100 << 20), 32 << 20);
+        assert_eq!(
+            grant.writers(),
+            Some(100 << 20),
+            "the claim shares the grant"
+        );
+        assert_eq!(grant.file_buffers(), Some(32 << 20));
+        let batch = two.decode_batch();
+        assert_eq!(batch.get(), None);
+        two.decode_batch.set(two.decode_batch_bytes());
+        assert_eq!(batch.get(), Some(25 << 20), "the run's batch, shared");
+        assert_eq!(two.decoder_claims(), 0);
+        two.claim_decoders();
+        two.clone().claim_decoders();
+        assert_eq!(two.decoder_claims(), 2, "clones count into the same claims");
     }
 
     /// A built source or sink is handed back unchanged; a builder is run.

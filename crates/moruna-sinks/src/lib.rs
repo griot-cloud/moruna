@@ -27,6 +27,7 @@ mod commit;
 mod file_buf;
 mod handle;
 mod ipc_sink;
+mod lane_heap;
 mod parquet_sink;
 // A user's `moruna.Sink` subclass (f.10, e.6), 2026-09-29.
 #[cfg(feature = "python")]
@@ -39,7 +40,12 @@ mod tensor_sink;
 pub use file_buf::LANE_MAX_BYTES;
 pub use handle::SinkHandle;
 pub use ipc_sink::{ArrowIpcSink, ArrowIpcSinkConfig};
-pub use parquet_sink::{ParquetSink, ParquetSinkConfig};
+pub use lane_heap::{
+    CLAIM_PAGE_BYTES, FALLBACK_FACTOR, Leaves, WriterFit, WriterLanes, codec_bytes, fit_writers,
+    lane_bytes_for_page, lane_codec_bytes, lane_page_bytes, least_lane_bytes, leaves_of,
+    writer_lanes,
+};
+pub use parquet_sink::{ParquetSink, ParquetSinkConfig, WriterGrant};
 #[cfg(feature = "python")]
 pub use py_sink::{PySink, PySinkStats};
 pub use reorder::ReorderBuffer;

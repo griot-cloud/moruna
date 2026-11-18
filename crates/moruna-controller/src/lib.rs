@@ -46,6 +46,9 @@ mod summary;
 mod tick;
 
 pub use admission::{FixedCommitmentInput, fixed_commitment_budget};
+/// What the source drive charges the arena per byte a read decodes to (the run sizes its arena's
+/// least by it, system design 3A, 6.3d).
+pub use model::READ_CHARGE;
 pub use sizer::{
     Envelope, LearnedSizer, ModelSizer, Observation, Proposal, RuleSizer, Sizer, SizerOutcome,
 };

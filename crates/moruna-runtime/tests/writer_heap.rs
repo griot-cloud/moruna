@@ -2,9 +2,14 @@
 //!
 //! A Parquet sink encodes on the run's workers, one lane per worker that may encode at once, and
 //! each lane's `ArrowWriter` keeps on the heap, outside the arena, its in-progress row group's
-//! encoded pages and every column's dictionary and open page. The arena sizing (12 f.1) leaves
-//! the run `BuildCtx::headroom_bytes` above the arena for everything it holds there, so what the
-//! sink's writers hold has to stay within that room, whatever the columns and the lanes.
+//! encoded pages and every column's dictionary and open page. The sink claims its writers' need
+//! above the arena (`BuildCtx::claim_writer_heap`): once the run knows the sink's schema it
+//! grants one lane per worker at the claim's page, or a smaller page, or fewer lanes, before the
+//! arena takes the rest (system design 3A), and what its writers hold has to stay within that
+//! claim, whatever the columns and the lanes. Each column also keeps a Zstandard context in the
+//! C library's memory, which this allocator does not see and the claim counts by its measured
+//! size; a run whose columns one lane cannot hold is refused before it starts, naming the least
+//! budget that holds them. The run's note says what the writers claimed.
 //!
 //! The sink is measured exactly: the run's sink is the kind registry's own Parquet sink, wrapped
 //! so that every call the scheduler makes into it runs with its thread's allocations counted by
@@ -46,7 +51,8 @@ thread_local! {
 /// What the sink holds on the heap between calls, all lanes together, and the most it has held.
 static HELD: AtomicI64 = AtomicI64::new(0);
 static HELD_PEAK: AtomicI64 = AtomicI64::new(0);
-/// The room the run's arena sizing left above the arena, as the sink's builder was given it.
+/// The room the run's arena sizing left above the arena, as the sink's builder was given it
+/// (before the writers' claim).
 static HEADROOM: AtomicU64 = AtomicU64::new(0);
 static ARENA: AtomicU64 = AtomicU64::new(0);
 static WORKERS: AtomicU64 = AtomicU64::new(0);
@@ -56,6 +62,8 @@ static WORKERS: AtomicU64 = AtomicU64::new(0);
 struct Counting;
 
 fn counted(delta: i64) {
+    // As the engine's allocator does: the sink measures its writers' heap.
+    moruna_kernel::held::heap_counted(delta);
     let _ = ARMED.try_with(|armed| {
         if armed.get() {
             let net = NET.with(|n| {
@@ -212,7 +220,8 @@ fn child_run() {
                         HEADROOM.store(ctx.headroom_bytes, Ordering::SeqCst);
                         ARENA.store(ctx.arena_bytes, Ordering::SeqCst);
                         WORKERS.store(u64::from(ctx.workers), Ordering::SeqCst);
-                        Ok(Box::new(Measured(sink.build(ctx)?)) as Box<dyn Sink>)
+                        let built = sink.build(ctx)?;
+                        Ok(Box::new(Measured(built)) as Box<dyn Sink>)
                     }))
                 })
                 .collect();
@@ -253,43 +262,31 @@ fn grouped(path: &Path, groups: i64, rows: i64, group: impl Fn(i64, i64) -> Reco
     writer.close().expect("closed");
 }
 
-/// The columns of the wide table: a feature table of flags and codes.
-const COLUMNS: usize = 384;
-
-/// Rows of `COLUMNS` small categorical columns (four values each, a byte apiece): 77 MB decoded
-/// at 200,000 rows, under a third of the smaller budget. Parquet encodes each column with a
-/// dictionary of four entries, so its encoded pages are a few bits a row, while the writer holds
-/// every value of a column's open page as a `u64` dictionary index and an `i16` level.
-fn categorical(from: i64, rows: i64) -> RecordBatch {
-    let columns: Vec<(String, arrow::array::ArrayRef)> = (0..COLUMNS)
-        .map(|c| {
-            let values = (from..from + rows).map(|r| ((r / 7 + c as i64) % 4) as i8);
-            (
-                format!("c{c}"),
-                Arc::new(Int8Array::from_iter_values(values)) as arrow::array::ArrayRef,
-            )
-        })
-        .collect();
-    RecordBatch::try_from_iter(columns).expect("a group")
+/// Rows of `columns` small categorical columns (four values each, a byte apiece): parquet
+/// encodes each with a dictionary of four entries, so its pages are a few bits a row, while
+/// the writer holds every value of a column's open page as a `u64` dictionary index and an
+/// `i16` level, and each column keeps a Zstandard context.
+fn categorical(columns: usize) -> impl Fn(i64, i64) -> RecordBatch {
+    move |from, rows| {
+        let columns: Vec<(String, arrow::array::ArrayRef)> = (0..columns)
+            .map(|c| {
+                let values = (from..from + rows).map(|r| ((r / 7 + c as i64) % 4) as i8);
+                (
+                    format!("c{c}"),
+                    Arc::new(Int8Array::from_iter_values(values)) as arrow::array::ArrayRef,
+                )
+            })
+            .collect();
+        RecordBatch::try_from_iter(columns).expect("a group")
+    }
 }
 
-/// 3A, 6.3d: a copy of a wide table of small categorical columns, two workers, the smallest
-/// budget. Each lane's writer keeps its columns' open pages, dictionaries and row group pages on
-/// the heap, and what all the lanes keep stays within the room the arena sizing leaves above the
-/// arena (`BuildCtx::headroom_bytes`); the run completes under its ceiling.
-///
-/// Fails before the fix (2026-11-18, the Mac): the writers held 261 MB against a room of 79 MB,
-/// for 77 MB of rows, and the controller stopped the run at 1.78 times its ceiling. The same
-/// rows into a `count` sink complete at 0.52 of it (`moruna-engine`, release).
-#[test]
-fn the_writers_heap_stays_within_the_room_above_the_arena() {
-    let _serial = one_run_at_a_time();
-    let scratch = Scratch::new("writer_heap");
-    let file = scratch.path().join("in.parquet");
-    let (groups, rows) = (8i64, 25_000i64);
-    grouped(&file, groups, rows, categorical);
-    let budget = BUDGETS[0];
-    let out = scratch.path().join("out");
+const GROUPS: i64 = 8;
+const ROWS: i64 = 25_000;
+
+/// A copy of `file` into a Parquet sink under `out` at `budget` on two workers, in a process of
+/// its own; what its sink held, against what it was granted, is printed.
+fn copy(scratch: &Scratch, file: &Path, out: &Path, budget: u64) -> serde_json::Value {
     let outcome = apart::run(
         "child_run",
         &json!({
@@ -301,23 +298,246 @@ fn the_writers_heap_stays_within_the_room_above_the_arena() {
         }),
     );
     let sink = &outcome["sink"];
-    let held = sink["held_peak"].as_i64().expect("measured");
-    let headroom = sink["headroom"].as_i64().expect("the room above the arena");
     eprintln!(
-        "the sink's writers held {held} bytes at most, against {headroom} bytes above an arena of \
-         {} with {} workers; the run: {}, peak {} of the ceiling, {}",
-        sink["arena"],
+        "at {budget} bytes the sink's writers held {} bytes at most, against their claim {:?} \
+         (writers, arena, decoders, their fixed need) with {} workers; the run: {}, peak {} of \
+         the ceiling, {}",
+        sink["held_peak"],
+        claim(&outcome),
         sink["workers"],
         outcome["report"]["exit"],
         outcome["report"]["peak_fraction_of_ceiling"],
         outcome["error"]
     );
-    assert!(headroom > 0, "the run was sized: {outcome}");
-    assert!(
-        held <= headroom,
-        "the sink's writers held {held} bytes outside the arena, more than the {headroom} bytes \
-         the arena sizing leaves above it"
+    outcome
+}
+
+/// The report's notes.
+fn notes(outcome: &serde_json::Value) -> Vec<String> {
+    outcome["report"]["notes"]
+        .as_array()
+        .map(|notes| {
+            notes
+                .iter()
+                .filter_map(|n| n.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What the run's note says the sinks' writers claimed above the arena, the arena it left, the
+/// decoders' room above it, and the part of that room their columns hold whatever the batch:
+/// `None` when nothing was claimed.
+fn claim(outcome: &serde_json::Value) -> Option<(u64, u64, u64, u64)> {
+    let note = notes(outcome)
+        .into_iter()
+        .find(|n| n.starts_with("the sinks' writers claim "))?;
+    let number = |after: &str| -> u64 {
+        note.split(after)
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{after} in {note}"))
+    };
+    Some((
+        number("the sinks' writers claim "),
+        number("the arena is "),
+        number("and the "),
+        number("decoders', "),
+    ))
+}
+
+/// The leaf columns of `columns` categorical columns, as the sink sees them.
+fn leaves_of(columns: usize) -> moruna_sinks::Leaves {
+    moruna_sinks::leaves_of(&categorical(columns)(0, 1).schema()).expect("leaves")
+}
+
+fn zstd() -> parquet::basic::Compression {
+    parquet::basic::Compression::ZSTD(Default::default())
+}
+
+/// 3A, 6.3d: a copy of 96 small categorical columns, two workers, the smallest budget. The
+/// writers claim their need above the arena before the arena takes the rest: their codecs at the
+/// claim's page do not fit two lanes, so memory bounds the page before the lanes (P1). The sink
+/// writes on one lane per worker at a smaller page, the report says so with the budget that
+/// keeps the claim's page, what the writers hold on the heap stays within their claim, and the
+/// run completes under its ceiling.
+///
+/// Before the fix (2026-11-18, the Mac) the writers' heap came from parquet's defaults: 384 such
+/// columns held 261 MB against a room of 79 MB, and the controller stopped the run at 1.78
+/// times its ceiling.
+#[test]
+fn a_wide_table_writes_smaller_pages_before_fewer_lanes() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("writer_heap_pages");
+    let file = scratch.path().join("in.parquet");
+    grouped(&file, GROUPS, ROWS, categorical(96));
+    let budget = BUDGETS[0];
+    let out = scratch.path().join("out");
+    let outcome = copy(&scratch, &file, &out, budget);
+    let held = outcome["sink"]["held_peak"].as_i64().expect("measured");
+    let (writers, arena, _, fixed) = claim(&outcome).expect("the writers claimed their need");
+    assert_eq!(
+        fixed,
+        2 * 96 * moruna_sources::FIXED_COLUMN_DECODE_BYTES,
+        "one decode per worker of 96 fixed-width columns"
     );
-    apart::within(&outcome, "a copy of a wide categorical table", budget);
-    assert_eq!(support::read_back_rows(&out), (groups * rows) as u64);
+    let least = moruna_sinks::least_lane_bytes(&leaves_of(96), zstd());
+    let at_claim =
+        moruna_sinks::lane_bytes_for_page(&leaves_of(96), zstd(), moruna_sinks::CLAIM_PAGE_BYTES);
+    assert!(
+        writers >= 2 * least && writers < 2 * at_claim,
+        "two lanes below the claim's page: {writers} ({least} least, {at_claim} at the claim)"
+    );
+    assert!(arena > 0);
+    assert!(
+        held <= writers as i64,
+        "the sink's writers held {held} bytes outside the arena, more than their {writers} byte \
+         claim above it"
+    );
+    let report = apart::within(&outcome, "a copy of 96 categorical columns", budget);
+    let notes = notes(&outcome);
+    assert!(
+        !notes.iter().any(|n| n.contains("not one per worker")),
+        "one lane per worker: {notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("writers' heap is measured by the counting allocator")),
+        "the report says the heap was measured: {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|n| n.contains("writes pages of at most")
+            && n.contains(&format!("keeps {}", moruna_sinks::CLAIM_PAGE_BYTES))),
+        "the report notes the page and the budget that keeps the claim's: {notes:?}"
+    );
+    assert_eq!(report["exit"], json!("Completed"));
+    assert_eq!(support::read_back_rows(&out), (GROUPS * ROWS) as u64);
+}
+
+/// A copy of `columns` such columns in groups of `rows` rows, whose decoders' fixed need and
+/// one writer lane at the least page the smallest budget cannot hold beside the arena's least:
+/// refused before the run starts, naming the least budget that holds them; a run at that budget
+/// writes on one lane, its writers within their claim, and completes under its ceiling.
+fn refused_then_held(name: &str, columns: usize, rows: i64) {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new(name);
+    let file = scratch.path().join("in.parquet");
+    grouped(&file, GROUPS, rows, categorical(columns));
+    let out = scratch.path().join("out");
+    let refused = copy(&scratch, &file, &out, BUDGETS[0]);
+    let least = moruna_sinks::least_lane_bytes(&leaves_of(columns), zstd());
+    let error = refused["error"].as_str().expect("refused");
+    assert!(error.starts_with("config budget.host:"), "{error}");
+    assert!(
+        error.contains(&format!("{columns} leaf columns")),
+        "{error}"
+    );
+    assert!(error.contains(&least.to_string()), "{error}");
+    let decoders = 2 * columns as u64 * moruna_sources::FIXED_COLUMN_DECODE_BYTES;
+    assert!(error.contains(&decoders.to_string()), "{error}");
+    let budget: u64 = error
+        .rsplit("The least budget that holds it is ")
+        .next()
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .expect("the least budget is named");
+    assert!(budget > BUDGETS[0], "{budget}");
+    assert!(
+        !out.exists() || support::read_back_rows(&out) == 0,
+        "nothing was written"
+    );
+    let outcome = copy(&scratch, &file, &out, budget);
+    apart::within(&outcome, "a copy at the least budget named", budget);
+    let held = outcome["sink"]["held_peak"].as_i64().expect("measured");
+    let (writers, _, _, fixed) = claim(&outcome).expect("the claims");
+    assert_eq!(
+        (writers, fixed),
+        (least, decoders),
+        "one lane at the least page"
+    );
+    assert!(held <= writers as i64, "{held} over {writers}");
+    assert!(
+        notes(&outcome)
+            .iter()
+            .any(|n| n.contains("writes on 1 lanes, not one per worker")),
+        "the report notes the lanes: {:?}",
+        notes(&outcome)
+    );
+    assert_eq!(support::read_back_rows(&out), (GROUPS * rows) as u64);
+}
+
+/// 3A, 6.3d: 384 such columns at the smallest budget: refused, then held at the least budget
+/// named, on one lane.
+#[test]
+fn a_wide_table_one_lane_cannot_hold_is_refused_then_held_at_the_least_budget() {
+    refused_then_held("writer_heap_384", 384, ROWS);
+}
+
+/// 3A, 6.3d: 768 such columns, in smaller groups, the same (before 6.3s's fix a read the
+/// controller cut was sometimes pushed after its queue closed, and the run ended "staging: push:
+/// stage 0 is closed" or completed a row group short).
+#[test]
+fn a_wider_table_is_refused_then_held_at_the_least_budget() {
+    refused_then_held("writer_heap_768", 768, ROWS / 5);
+}
+
+/// 3A, 6.3d: a chain whose kernels declare nothing outside the arena (`rename`, `select`),
+/// writing Parquet, at the smallest budget. The sink adds no factor: its writers claim their
+/// need above the arena, as the source's decoders claim theirs, and the arena takes the whole
+/// of what is left, so exactly the claims are above it. The run completes under its ceiling with every row. Before
+/// 6.3d, the arena took the whole allowance and the writers had no room at any budget
+/// (HO-T20, PN-T25 refused).
+#[test]
+fn a_chain_declaring_nothing_outside_the_arena_leaves_its_writers_their_claim() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("writer_heap_free_chain");
+    let file = scratch.path().join("in.parquet");
+    grouped(&file, GROUPS, ROWS, categorical(8));
+    let budget = BUDGETS[0];
+    let out = scratch.path().join("out");
+    let outcome = apart::run(
+        "child_run",
+        &json!({
+            "moruna_spec": 1,
+            "source": {"kind": "parquet", "url": file},
+            "kernels": [
+                {"kind": "std", "name": "rename", "args": {"columns": {"c0": "first"}}},
+                {"kind": "std", "name": "select", "args": {"columns": ["first", "c1", "c2"]}},
+            ],
+            "sink": {"kind": "parquet", "url": out},
+            "budget": {"memory_bytes": budget, "cpu": 2.0},
+            "profiles_dir": scratch.path().join("profiles"),
+        }),
+    );
+    apart::within(&outcome, "a free chain into Parquet", budget);
+    let notes = notes(&outcome);
+    let sized = notes
+        .iter()
+        .find(|n| n.starts_with("arena sized at"))
+        .expect("the arena's note");
+    assert!(sized.contains("then 1.00 of the"), "{sized}");
+    assert!(
+        sized.contains("by the 0.00 bytes the chain is expected to allocate"),
+        "{sized}"
+    );
+    let (writers, _, decoders, fixed) = claim(&outcome).expect("the writers claimed their need");
+    let three =
+        moruna_sinks::lane_bytes_for_page(&leaves_of(3), zstd(), moruna_sinks::CLAIM_PAGE_BYTES);
+    assert_eq!(
+        writers,
+        2 * three,
+        "two lanes of three columns at the claim's page"
+    );
+    assert_eq!(
+        fixed,
+        2 * 8 * moruna_sources::FIXED_COLUMN_DECODE_BYTES,
+        "the source's eight columns, one decode per worker"
+    );
+    assert!(
+        decoders - fixed < 64 << 10,
+        "only the claims are above the arena: {decoders} for {fixed}"
+    );
+    assert_eq!(support::read_back_rows(&out), (GROUPS * ROWS) as u64);
 }

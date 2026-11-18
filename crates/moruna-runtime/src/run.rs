@@ -392,15 +392,25 @@ fn drive(
     // system design 3E); the run's own store answers for a stage that came with none.
     let measured = with_carried(carried, found, &mut notes);
     let outside = out_of_arena(&kernels, &measured, workers_start, &mut notes);
+    // 3A (6.3g, 6.3d): the fixed claims held outside the arena compose as one sum: the stateful
+    // kernels' declared state and the functions' measured fixed bytes here, the sources'
+    // decoders' fixed need and the sinks' writers' need once their schemas are known, after the
+    // graph is validated (below). Until then the arena is sized at its largest from the claims
+    // known here, and its pages are not touched.
     let kernel_state = expected_kernel_state(&kernels).saturating_add(outside.fixed_bytes);
-    let sizing = Sizing {
+    let mut sizing = Sizing {
         baseline: baseline_bytes,
         kernel_state,
+        workers: workers_max,
+        read_least: 0,
+        file_buffers: false,
+        decoders: 0,
+        writers: 0,
         out_of_arena: outside.per_byte,
         page_bytes: limits.page_bytes,
         queues: u64::from(topology.queue_count()),
     };
-    let arena_bytes = sizing.divide(limits.memory_ceiling, &mut notes);
+    let mut arena_bytes = sizing.divide(limits.memory_ceiling, &mut notes);
     // N-7: a budget under the run's floor cannot be honoured, and is refused here, before
     // anything exists, with the floor named. A refusal is honest; an overshoot is not. An
     // injected allocator is the caller's arena and not the facade's to size.
@@ -518,7 +528,11 @@ fn drive(
         sinks: topology.sinks(),
         workers: workers_max,
         sink_buffer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        writer_claims: Arc::new(std::sync::Mutex::new(Vec::new())),
+        decode_batch: moruna_sources::DecodeBatch::new(),
+        decoders: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
+    ctx.decode_batch.set(ctx.decode_batch_bytes());
     // MH 4.10: the stages' ports answer to the run's cancel, and their waits are told to the
     // scheduler's counters (which the controller reads) and to the stage hook (which the host
     // hears). They are bound before any source or sink is built: an image's source or sink starts
@@ -537,38 +551,31 @@ fn drive(
     for stage in &packaged {
         stage.bind_run_ports(&run_ports);
     }
-    let mut sources: Vec<Arc<dyn moruna_kernel::Source>> = Vec::with_capacity(source_specs.len());
-    for spec in source_specs {
-        sources.push(spec.build(&ctx)?);
+    // 3A (6.3d): a sink whose writer keeps its lanes on the heap claims a grant as it is built;
+    // the run sets it once the graph is validated and the sink's schema is known.
+    let mut built_sinks: Vec<Box<dyn Sink>> = Vec::with_capacity(sink_specs.len());
+    // Which sink made each writer claim, to fit its writers to its schema below.
+    let mut claimed_by: Vec<u16> = Vec::new();
+    for (at, spec) in sink_specs.into_iter().enumerate() {
+        built_sinks.push(spec.build(&ctx)?);
+        while claimed_by.len() < ctx.writer_claims().len() {
+            claimed_by.push(at as u16);
+        }
     }
+    let mut sources: Vec<Arc<dyn moruna_kernel::Source>> = Vec::with_capacity(source_specs.len());
+    // Which source made each decoder claim (3A, 6.3d), to count its columns below.
+    let mut decoding: Vec<usize> = Vec::new();
+    for (at, spec) in source_specs.into_iter().enumerate() {
+        sources.push(spec.build(&ctx)?);
+        while decoding.len() < ctx.decoder_claims() {
+            decoding.push(at);
+        }
+    }
+    // A sink that encodes on workers (08 f.12) divides its file buffers into one per worker
+    // that may encode at once (below).
+    let encodes_on_workers = built_sinks.iter().any(|sink| sink.encodes_on_workers());
     // What an engine source's engine decided when it planned the read: true of the run whatever
     // becomes of it, since the plan was made (and its budgets charged) when the source was built.
-    let mut built_sinks: Vec<Box<dyn Sink>> = Vec::with_capacity(sink_specs.len());
-    for spec in sink_specs {
-        built_sinks.push(spec.build(&ctx)?);
-    }
-    let sink_buffer_bytes = ctx.sink_buffer_bytes();
-    // A sink that encodes files in the arena holds two file buffers of half its claim; a morsel
-    // is at most half a file, so every morsel fits an ordinary file and none needs a buffer of
-    // its own that the arena may no longer be able to give.
-    let claim = match sink_buffer_bytes {
-        0 => 0,
-        _ => ctx.file_buffer_share(),
-    };
-    // A sink that encodes on workers (08 f.12) divides the same bytes into one buffer per
-    // worker that may encode at once, so a morsel is at most half of one of those.
-    let buffers = if built_sinks.iter().any(|sink| sink.encodes_on_workers()) {
-        u64::from(workers_max.max(2))
-    } else {
-        2
-    };
-    let (morsel_max, lane) = morsel_cap(claim, buffers);
-    if morsel_max < config::MORSEL_MAX_BYTES {
-        notes.push(format!(
-            "morsels are at most {morsel_max} bytes, half of one of the sink's {buffers} {lane} \
-             byte file buffers"
-        ));
-    }
     let mut plans = Vec::with_capacity(sources.len());
     for source in &sources {
         plans.push(source.plan()?);
@@ -646,6 +653,208 @@ fn drive(
         topology: topology.clone(),
     };
     let schemas = moruna_scheduler::validate_graph(&pipeline)?;
+    // 3A (6.3d): the claims on the room, in order, now that the sources' and sinks' schemas
+    // are known and before anything runs or reads. First the arena's least, one read in flight
+    // per worker at its charge, and the sources' decoders' fixed need, one decode per worker of
+    // each projected column; then the sinks' writers, one lane per worker at the claim's page,
+    // or (memory bounding the page before the lanes) at the largest page that fits, or on fewer
+    // lanes at the least page; then the rest, divided between the arena and the decoders'
+    // batches by the chain's own factor. A run whose first claims leave no lane is refused
+    // here, with the least budget that holds it. The arena was made at its largest and none of
+    // its pages is touched yet, so it is capped here at what the claims leave it. An injected
+    // allocator is the caller's arena, and its budget is not the facade's to name.
+    for &at in &decoding {
+        if let Some(moruna_kernel::SourceSchema::Table(schema)) =
+            sources.get(at).map(|source| source.schema())
+            && let (Ok(columns), Ok(read)) = (
+                moruna_sources::decode_fixed_bytes(&schema),
+                moruna_sources::read_least_arena_bytes(&schema),
+            )
+        {
+            sizing.decoders = sizing
+                .decoders
+                .saturating_add(columns.saturating_mul(u64::from(workers_max.max(1))));
+            sizing.read_least = sizing.read_least.max(read);
+        }
+    }
+    let claims = ctx.writer_claims();
+    sizing.file_buffers = !claims.is_empty();
+    let mut writer_grants: Vec<Option<u64>> = vec![None; claims.len()];
+    let mut wanted: Vec<(usize, u16, moruna_sinks::Leaves)> = Vec::new();
+    for (at, sink) in claimed_by.iter().enumerate().take(claims.len()) {
+        if let Some(moruna_kernel::SourceSchema::Table(schema)) = topology
+            .sink_input(*sink)
+            .and_then(|input| schemas.get(usize::from(input)))
+            && let Ok(leaves) = moruna_sinks::leaves_of(schema)
+        {
+            wanted.push((at, *sink, leaves));
+        }
+    }
+    if !wanted.is_empty() {
+        let workers = usize::from(workers_max.max(1));
+        let sinks: Vec<(moruna_sinks::Leaves, parquet::basic::Compression)> = wanted
+            .iter()
+            .map(|(at, _, leaves)| (leaves.clone(), claims[*at].compression))
+            .collect();
+        let room = sizing.writers_room(limits.memory_ceiling);
+        match moruna_sinks::fit_writers(room, workers, &sinks) {
+            Ok(fits) => {
+                for ((at, sink, leaves), fit) in wanted.iter().zip(&fits) {
+                    writer_grants[*at] = Some(fit.bytes());
+                    sizing.writers = sizing.writers.saturating_add(fit.bytes());
+                    let columns = leaves.count;
+                    if fit.lanes < workers {
+                        notes.push(format!(
+                            "sink {sink} writes on {} lanes, not one per worker: its {columns} \
+                             leaf columns need {} bytes a lane at the least page (their codecs \
+                             and the writer's least heap), and the budget leaves its writers \
+                             {room} bytes beside the arena's least and the decoders' fixed need, \
+                             so a worker waits for a free lane",
+                            fit.lanes, fit.lane_bytes
+                        ));
+                    }
+                    // P1 (6.3d): memory bounds the page, never the lanes; a page below the
+                    // claim's is said, with the budget that keeps it.
+                    let claim_page = moruna_sinks::CLAIM_PAGE_BYTES;
+                    if fit.page < claim_page {
+                        let keep: u64 = sinks
+                            .iter()
+                            .map(|(leaves, compression)| {
+                                moruna_sinks::lane_bytes_for_page(leaves, *compression, claim_page)
+                                    .saturating_mul(workers as u64)
+                            })
+                            .sum();
+                        let budget = with_baseline_margin(least_ceiling_for_writers(&sizing, keep));
+                        notes.push(format!(
+                            "sink {sink} writes pages of at most {} bytes, not {claim_page}: its \
+                             {columns} leaf columns' codecs at {claim_page} byte pages would \
+                             take more than the budget leaves its writers ({room} bytes beside \
+                             the arena's least and the decoders' fixed need); a budget of \
+                             {budget} bytes keeps {claim_page}",
+                            fit.page
+                        ));
+                    }
+                    notes.push(if moruna_kernel::held::heap_counting() {
+                        format!(
+                            "sink {sink}'s writers' heap is measured by the counting allocator, \
+                             and each lane's row group is flushed by it"
+                        )
+                    } else {
+                        format!(
+                            "sink {sink}'s writers' heap is estimated: no counting allocator is \
+                             installed, so each lane's row group is flushed by parquet's \
+                             estimate times {}",
+                            moruna_sinks::FALLBACK_FACTOR
+                        )
+                    });
+                }
+            }
+            Err(least) if arena.is_some() => {
+                let budget = with_baseline_margin(least_ceiling_for_writers(&sizing, least));
+                let (sink, columns) = match wanted.as_slice() {
+                    [(_, sink, leaves)] => (format!("sink {sink}'s writer"), leaves.count),
+                    _ => (
+                        "the sinks' writers".to_string(),
+                        wanted.iter().map(|(_, _, leaves)| leaves.count).sum(),
+                    ),
+                };
+                return Err(MorunaError::Config {
+                    name: "budget.host",
+                    msg: format!(
+                        "the budget of {} bytes cannot hold {sink}: its {columns} leaf columns \
+                         need at least {least} bytes of heap for one lane (their codecs at the \
+                         smallest page and the writer's least heap), and the budget leaves its \
+                         writers {room} bytes beside the arena's least and the {} bytes the \
+                         sources' decoders hold whatever their batch. The least budget that holds \
+                         it is {budget} bytes (this process's least, and a 64th more for what \
+                         another holds before its arena).",
+                        limits.memory_ceiling, sizing.decoders
+                    ),
+                }
+                .into());
+            }
+            Err(_) => {}
+        }
+    }
+    if arena.is_some()
+        && sizing.decoders > 0
+        && sizing.allowance(limits.memory_ceiling)
+            < sizing.arena_least().saturating_add(sizing.decoders)
+    {
+        let budget = with_baseline_margin(least_ceiling_for_writers(&sizing, 1));
+        return Err(MorunaError::Config {
+            name: "budget.host",
+            msg: format!(
+                "the budget of {} bytes cannot hold the sources' decoders: their columns hold {} \
+                 bytes outside the arena whatever their batch, one decode per worker, beside the \
+                 arena's least of {} bytes. The least budget that holds them is {budget} bytes \
+                 (this process's least, and a 64th more for what another holds before its \
+                 arena).",
+                limits.memory_ceiling,
+                sizing.decoders,
+                sizing.arena_least()
+            ),
+        }
+        .into());
+    }
+    let mut capped = None;
+    if sizing.claimed() {
+        // The arena takes what the claims leave it: the same arithmetic with the writers held
+        // outside it, and its note in place of the one made before they were known.
+        let mut sized = Vec::new();
+        arena_bytes = sizing.divide(limits.memory_ceiling, &mut sized);
+        notes.retain(|note| !note.starts_with("arena sized at "));
+        notes.extend(sized);
+        if let Some(arena) = &arena
+            && arena_bytes < arena.regions_capacity()
+        {
+            arena.cap_host(Some(arena_bytes));
+            capped = Some(arena_bytes);
+        }
+    }
+    // The file buffers are the capped arena's, and a decode builds its batches in what the
+    // writers and the arena leave above it.
+    let file_share = file_buffer_share(arena_bytes, ctx.sinks);
+    for (claim, writers) in claims.iter().zip(&writer_grants) {
+        claim.grant.grant(*writers, file_share);
+        ctx.sink_buffer
+            .fetch_add(file_share, std::sync::atomic::Ordering::SeqCst);
+    }
+    if sizing.claimed() {
+        let decoders = sizing.decoders_room(limits.memory_ceiling, arena_bytes);
+        let batch = decode_batch_of(decoders.saturating_sub(sizing.decoders), workers_max);
+        ctx.decode_batch.set(batch);
+        notes.push(format!(
+            "the sinks' writers claim {} bytes above the arena, the arena is {arena_bytes} \
+             bytes, and the {decoders} bytes left above it are its decoders', {} of them their \
+             columns' whatever the batch: a decode builds batches of {} bytes",
+            sizing.writers,
+            sizing.decoders,
+            batch.unwrap_or(0)
+        ));
+    }
+    let sink_buffer_bytes = ctx.sink_buffer_bytes();
+    // A sink that encodes files in the arena holds two file buffers of half its claim; a morsel
+    // is at most half a file, so every morsel fits an ordinary file and none needs a buffer of
+    // its own that the arena may no longer be able to give.
+    let claim = match sink_buffer_bytes {
+        0 => 0,
+        _ => file_share,
+    };
+    // A sink that encodes on workers (08 f.12) divides the same bytes into one buffer per
+    // worker that may encode at once, so a morsel is at most half of one of those.
+    let buffers = if encodes_on_workers {
+        u64::from(workers_max.max(2))
+    } else {
+        2
+    };
+    let (morsel_max, lane) = morsel_cap(claim, buffers);
+    if morsel_max < config::MORSEL_MAX_BYTES {
+        notes.push(format!(
+            "morsels are at most {morsel_max} bytes, half of one of the sink's {buffers} {lane} \
+             byte file buffers"
+        ));
+    }
     #[cfg_attr(
         not(all(target_os = "linux", target_arch = "x86_64")),
         allow(unused_mut)
@@ -692,9 +901,10 @@ fn drive(
                 },
                 &kernel_infos,
             )?;
+            // 3A (6.3d): the writers' claim and the decoders' fixed need are theirs.
             let physical = sizing
-                .allowance(limits.memory_ceiling)
-                .saturating_sub(arena_bytes);
+                .decoders_room(limits.memory_ceiling, arena_bytes)
+                .saturating_sub(sizing.decoders);
             // Memory bounds the instances and never fails a job that ran before (PM,
             // 2026-11-18): as many as the room funds at their least, at least one a stage.
             let funded = moruna_adapters::instances::fund(
@@ -1052,7 +1262,7 @@ fn drive(
                 workers_max,
                 tick: std::time::Duration::from_millis(config::TICK_MS),
             },
-            WatchState::new(arena_bytes),
+            WatchState::new(arena_bytes).capped_at(capped),
         )
     });
     // stream P: a cancelled run says where its workers are as the cancel reaches it, into the
@@ -1418,6 +1628,20 @@ struct Sizing {
     /// Held outside the arena whatever the morsel: the stateful kernels' declared state, and
     /// what the functions were measured to hold whatever their batch (system design 3A).
     kernel_state: u64,
+    /// The run's workers: the arena's least and the decoders' fixed need are per worker.
+    workers: u16,
+    /// The least one read takes of the arena whatever its rows (3A, 6.3d): its columns'
+    /// buffers at the arena's smallest class; zero until the run knows the sources' schemas.
+    read_least: u64,
+    /// Whether the run's sinks keep file buffers in the arena (a Parquet sink's, a quarter of
+    /// it, `config::SINK_BUFFER_SHARE`): the arena's least then holds its reads beside them.
+    file_buffers: bool,
+    /// What the sources' decoders hold outside the arena whatever their batch (3A, 6.3d): zero
+    /// until the run knows the sources' schemas, then one decode per worker.
+    decoders: u64,
+    /// What the sinks' writers claim above the arena (3A, 6.3d): zero until the run knows the
+    /// sinks' schemas, then their lanes' need.
+    writers: u64,
     out_of_arena: f64,
     page_bytes: usize,
     /// The run's queues: the buffer catalog's floor holds every one's promotion window.
@@ -1488,18 +1712,91 @@ impl Sizing {
             .saturating_sub(self.kernel_state)
     }
 
-    /// The arena's host bytes for `ceiling`: sized over the allowance, `ceiling - baseline -
-    /// reserve - expected kernel state`, the bytes the run may hold at all.
+    /// The arena's least (3A, 6.3d, the first claim on the room): one read in flight per worker
+    /// at its charge, so no worker idles for want of a read; a read at the least morsel
+    /// (`READ_CHARGE x MORSEL_MIN_BYTES`), or a wide read's columns' buffers at the arena's
+    /// smallest class when they are more ([`Sizing::read_least`]); never below
+    /// `ARENA_FLOOR_BYTES`; and beside the sinks' file buffers when they keep them in the arena
+    /// ([`Sizing::file_buffers`]), so the reads are not cut to make room for them (a 768-column
+    /// copy whose arena held its two reads and not the buffers beside them cut its 8 row groups
+    /// into 13 reads, 2026-11-18). What the arena gets above it is efficiency, not need.
+    fn arena_least(&self) -> u64 {
+        let read = (moruna_controller::READ_CHARGE * config::MORSEL_MIN_BYTES).max(self.read_least);
+        let reads = (u64::from(self.workers.max(1)) * read).max(ARENA_FLOOR_BYTES);
+        if self.file_buffers {
+            (reads as f64 / (1.0 - config::SINK_BUFFER_SHARE)).ceil() as u64
+        } else {
+            reads
+        }
+    }
+
+    /// Whether the claims are known: the decoders' or the writers' need is set.
+    fn claimed(&self) -> bool {
+        self.decoders > 0 || self.writers > 0
+    }
+
+    /// The room the sinks' writers may claim at `ceiling` (3A, 6.3d, the second claim): the
+    /// allowance less the first claim, the arena's least and the decoders' fixed need.
+    fn writers_room(&self, ceiling: u64) -> u64 {
+        self.allowance(ceiling)
+            .saturating_sub(self.arena_least())
+            .saturating_sub(self.decoders)
+    }
+
+    /// What the claims leave at `ceiling`, to be divided between the arena and the decoders'
+    /// batches by the chain's factor (3A, 6.3d, the third claim).
+    fn rest(&self, ceiling: u64) -> u64 {
+        self.writers_room(ceiling).saturating_sub(self.writers)
+    }
+
+    /// The decoders' room above an arena of `arena` bytes at `ceiling`: the allowance less the
+    /// arena and the writers' claim, which holds the decoders' fixed need and their batches.
+    fn decoders_room(&self, ceiling: u64, arena: u64) -> u64 {
+        self.allowance(ceiling)
+            .saturating_sub(arena)
+            .saturating_sub(self.writers)
+    }
+
+    /// The arena's host bytes for `ceiling`. Before the claims are known: sized over the
+    /// allowance, `ceiling - baseline - reserve - expected kernel state`, by the chain's factor.
+    /// After (3A, 6.3d): the arena's least, and its share by the chain's factor of what the
+    /// claims leave.
     fn divide(&self, ceiling: u64, notes: &mut Vec<String>) -> u64 {
-        arena_host_bytes(
-            ceiling,
-            self.baseline,
-            config::RESERVE_FRACTION,
-            self.kernel_state,
-            self.out_of_arena,
-            self.page_bytes,
-            notes,
-        )
+        if !self.claimed() {
+            return arena_host_bytes(
+                ceiling,
+                self.baseline,
+                config::RESERVE_FRACTION,
+                self.kernel_state,
+                self.out_of_arena,
+                self.page_bytes,
+                notes,
+            );
+        }
+        let granule = (self.page_bytes as u64).max(GRANULE_BYTES);
+        let allowance = self.allowance(ceiling);
+        let least = self.arena_least().min(allowance);
+        let rest = self.rest(ceiling);
+        let share = arena_share(self.out_of_arena);
+        // Never more than the arena sized before the claims, which is the region the run made.
+        let largest = Sizing {
+            decoders: 0,
+            writers: 0,
+            ..*self
+        }
+        .divide(ceiling, &mut Vec::new());
+        let arena = ((least + (rest as f64 * share) as u64) / granule * granule).min(largest);
+        notes.push(format!(
+            "arena sized at {arena} bytes, of the {allowance} byte allowance: its least, {least} \
+             bytes (one read in flight per worker at its charge), then {share:.2} of the {rest} \
+             bytes the claims leave, by the {:.2} bytes the chain is expected to allocate \
+             outside the arena per byte in flight; above it the sources' decoders claim {} \
+             bytes whatever their batch and the sinks' writers {}",
+            out_of_arena_factor(self.out_of_arena),
+            self.decoders,
+            self.writers
+        ));
+        arena
     }
 }
 
@@ -1557,14 +1854,8 @@ fn arena_host_bytes(
         .saturating_sub(baseline)
         .saturating_sub(reserve)
         .saturating_sub(kernel_state);
-    // A negative or non-finite declaration is a kernel saying nothing useful, not a licence to
-    // size the arena over the allowance.
-    let a_anon = if out_of_arena_amplification.is_finite() {
-        out_of_arena_amplification.max(0.0)
-    } else {
-        DEFAULT_OUT_OF_ARENA_AMPLIFICATION
-    };
-    let share = ARENA_INFLIGHT_COST / (ARENA_INFLIGHT_COST + a_anon);
+    let a_anon = out_of_arena_factor(out_of_arena_amplification);
+    let share = arena_share(out_of_arena_amplification);
     let arena = (allowance as f64 * share) as u64;
     let arena = arena.max(ARENA_FLOOR_BYTES.min(allowance)) / granule * granule;
     let headroom = ceiling.saturating_sub(baseline).saturating_sub(arena);
@@ -1577,6 +1868,42 @@ fn arena_host_bytes(
          it"
     ));
     arena
+}
+
+/// The chain's out-of-arena factor as the arena is sized by it: a negative or non-finite
+/// declaration is a kernel saying nothing useful, not a licence to size the arena over the
+/// allowance, and counts as `DEFAULT_OUT_OF_ARENA_AMPLIFICATION`.
+fn out_of_arena_factor(out_of_arena_amplification: f64) -> f64 {
+    if out_of_arena_amplification.is_finite() {
+        out_of_arena_amplification.max(0.0)
+    } else {
+        DEFAULT_OUT_OF_ARENA_AMPLIFICATION
+    }
+}
+
+/// The arena's share of what the allowance holds for it and the chain's decoders, by the
+/// chain's factor (`arena_host_bytes`).
+fn arena_share(out_of_arena_amplification: f64) -> f64 {
+    ARENA_INFLIGHT_COST / (ARENA_INFLIGHT_COST + out_of_arena_factor(out_of_arena_amplification))
+}
+
+/// The most one sink that encodes files in the arena (Parquet) may hold for its file buffers
+/// in an arena of `arena_bytes`: `config::SINK_BUFFER_SHARE` of it, divided among `sinks` and
+/// rounded down to the arena's size class so the buffer the sink asks for is the one it is
+/// given (`BuildCtx::file_buffer_share`, for the arena the claims leave).
+fn file_buffer_share(arena_bytes: u64, sinks: u16) -> u64 {
+    let share = (arena_bytes as f64 * config::SINK_BUFFER_SHARE) as u64 / u64::from(sinks.max(1));
+    match share {
+        0 => 0,
+        n => 1u64 << (63 - n.leading_zeros()),
+    }
+}
+
+/// The decode batch of `room` bytes above the arena shared by `workers` decodes
+/// (`BuildCtx::decode_batch_bytes`, for the room the claims leave the decoders).
+fn decode_batch_of(room: u64, workers: u16) -> Option<u64> {
+    let batch = room / (u64::from(workers.max(1)) * crate::spec::DECODE_HOLDS);
+    (batch > 0).then_some(batch)
 }
 
 /// The arena's own cost per byte in flight. RC f.3 divides the arena in half, one half for what
@@ -1610,6 +1937,37 @@ fn object_io_for(arena_bytes: u64, notes: &mut Vec<String>) -> moruna_reactor::O
         moruna_storage::net::SOCKETS,
     ));
     io
+}
+
+/// The least ceiling at which the sinks' writers may claim `need` bytes above the arena, beside
+/// the arena's least and the decoders' fixed need (3A, 6.3d): the room they may claim
+/// ([`Sizing::writers_room`]) grows with the ceiling, so it is found by bisection, to a page.
+fn least_ceiling_for_writers(sizing: &Sizing, need: u64) -> u64 {
+    let given = |ceiling: u64| sizing.writers_room(ceiling);
+    let share = need;
+    let (mut low, mut high) = (sizing.floor(), 1u64 << 50);
+    if given(low) >= share {
+        return low;
+    }
+    while high - low > 4096 {
+        let mid = low + (high - low) / 2;
+        if given(mid) >= share {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    high
+}
+
+/// A least budget found for this process, named for any (6.3d): the arena is sized over what
+/// the process held before it existed, which differs a little from one process to the next (a
+/// run under coverage held 0.1 MB more, and the least named for it was 16 KB short), so a
+/// 64th more, to a MiB.
+fn with_baseline_margin(ceiling: u64) -> u64 {
+    ceiling
+        .saturating_add(ceiling / 64)
+        .next_multiple_of(1 << 20)
 }
 
 /// The out-of-arena amplification assumed for a kernel that declares none: the same figure the
@@ -1669,6 +2027,10 @@ const ARENA_FLOOR_BYTES: u64 =
 /// allowance as arena, which left the reserve as all the room there was for those bytes: a
 /// Parquet file copied at 256 MiB peaked at 0.99 of its ceiling with a 177 MB arena it used a
 /// fraction of, measured by the operating system (F8.9).
+///
+/// The sinks add no factor (3A, 6.3d): a Parquet sink's writers need a fixed amount per lane,
+/// whatever is in flight, and claim it above the arena before the arena takes the rest
+/// ([`Sizing::writers_room`]).
 fn expected_out_of_arena_amplification(kernels: &[Arc<dyn moruna_kernel::Kernel>]) -> f64 {
     if kernels.is_empty() {
         return COPY_OUT_OF_ARENA_AMPLIFICATION;
@@ -2434,6 +2796,110 @@ mod tests {
         assert!(notes[0].starts_with("stage 2:"), "{}", notes[0]);
     }
 
+    /// 3A (6.3d): the claims on the room, in order. First the arena's least, one read per worker
+    /// at its charge and never below the arena's floor, and the decoders' fixed need; the
+    /// writers may claim what those leave; the arena takes its least and its share of the rest
+    /// by the chain's factor, never more than it was before the claims, and the decoders keep
+    /// their fixed need and the other share. A chain declaring nothing outside the arena keeps
+    /// exactly the writers' claim and the decoders' fixed need above it.
+    #[test]
+    fn the_claims_on_the_room_are_taken_in_order() {
+        let ceiling = 672u64 << 20;
+        let four = Sizing {
+            workers: 4,
+            ..sizing()
+        };
+        assert_eq!(
+            four.arena_least(),
+            (4 * 2 * config::MORSEL_MIN_BYTES).max(ARENA_FLOOR_BYTES)
+        );
+        let many = Sizing {
+            workers: 64,
+            ..sizing()
+        };
+        assert_eq!(many.arena_least(), 64 * 2 * config::MORSEL_MIN_BYTES);
+        // A wide read's buffers, and beside the file buffers a Parquet sink keeps in the arena.
+        let wide = Sizing {
+            workers: 2,
+            read_least: 96 << 20,
+            ..sizing()
+        };
+        assert_eq!(wide.arena_least(), 2 * (96 << 20));
+        let buffered = Sizing {
+            file_buffers: true,
+            ..wide
+        };
+        assert_eq!(
+            buffered.arena_least(),
+            (2.0 * (96u64 << 20) as f64 / (1.0 - config::SINK_BUFFER_SHARE)).ceil() as u64
+        );
+        for factor in [0.0, 1.0, 4.0] {
+            let mut sized = Sizing {
+                out_of_arena: factor,
+                decoders: 12 << 20,
+                ..four
+            };
+            let allowance = sized.allowance(ceiling);
+            let least = sized.arena_least();
+            let room = sized.writers_room(ceiling);
+            assert_eq!(room, allowance - least - (12 << 20));
+            // The writers take the whole room: the arena keeps its least.
+            sized.writers = room;
+            let arena = sized.divide(ceiling, &mut Vec::new());
+            assert!(
+                arena <= least && arena + GRANULE_BYTES > least,
+                "{factor}: an arena of {arena} against its least {least}"
+            );
+            assert!(
+                sized.decoders_room(ceiling, arena) >= sized.decoders,
+                "{factor}: the decoders keep their need"
+            );
+            // The writers take a third of it: the arena takes its share of the rest.
+            sized.writers = room / 3;
+            let mut notes = Vec::new();
+            let arena = sized.divide(ceiling, &mut notes);
+            let rest = sized.rest(ceiling);
+            let largest = Sizing {
+                decoders: 0,
+                writers: 0,
+                ..sized
+            }
+            .divide(ceiling, &mut Vec::new());
+            let expected = (least + (rest as f64 * arena_share(factor)) as u64).min(largest);
+            assert!(
+                arena.abs_diff(expected) < GRANULE_BYTES,
+                "{factor}: {arena} of {rest}"
+            );
+            assert!(
+                notes[0].starts_with(&format!("arena sized at {arena} bytes")),
+                "{notes:?}"
+            );
+            if factor == 0.0 {
+                assert!(
+                    sized.decoders_room(ceiling, arena) - sized.decoders < GRANULE_BYTES,
+                    "a free chain: only the claims are above its arena"
+                );
+            }
+        }
+    }
+
+    /// 3A (6.3d): the arena's share by the chain's factor, a nonsense factor counting as the
+    /// default.
+    #[test]
+    fn the_arena_takes_its_share_by_the_chains_factor() {
+        assert_eq!(arena_share(0.0), 1.0);
+        assert!((arena_share(1.0) - 2.0 / 3.0).abs() < 1e-12);
+        assert_eq!(arena_share(-1.0), 1.0);
+        assert_eq!(
+            arena_share(f64::NAN),
+            ARENA_INFLIGHT_COST / (ARENA_INFLIGHT_COST + DEFAULT_OUT_OF_ARENA_AMPLIFICATION)
+        );
+        assert_eq!(file_buffer_share(0, 1), 0);
+        assert_eq!(file_buffer_share(256 << 20, 2), 32 << 20);
+        assert_eq!(decode_batch_of(0, 4), None);
+        assert_eq!(decode_batch_of(160 << 20, 4), Some(10 << 20));
+    }
+
     /// What a job's budget lets the object stores have in flight (3A, 3.5b), derived from the
     /// budget through the node's split (`host::node::sizes`) and the arena sizing of a copy, at
     /// two budgets: 3.5's lock turn's, a 2 GiB node's `job_memory_bytes` of 590,237,696 bytes
@@ -2447,6 +2913,11 @@ mod tests {
         let copy = |baseline: u64| Sizing {
             baseline,
             kernel_state: 0,
+            workers: 1,
+            read_least: 0,
+            file_buffers: false,
+            decoders: 0,
+            writers: 0,
             out_of_arena: COPY_OUT_OF_ARENA_AMPLIFICATION,
             page_bytes: 4096,
             queues: 2,
@@ -2495,10 +2966,59 @@ mod tests {
         Sizing {
             baseline: 16 << 20,
             kernel_state: 0,
+            workers: 1,
+            read_least: 0,
+            file_buffers: false,
+            decoders: 0,
+            writers: 0,
             out_of_arena: 0.0,
             page_bytes: 4096,
             queues: 2,
         }
+    }
+
+    /// 3A (6.3d): the least budget named for writers that the room cannot hold lets them claim
+    /// at least their need, and a MiB less does not, beside the decoders' fixed need.
+    #[test]
+    fn the_least_budget_for_writers_holds_their_need_and_no_less() {
+        let copy = Sizing {
+            out_of_arena: 1.0,
+            ..sizing()
+        };
+        for (workers, decoders, need) in [(2u16, 0u64, 124_000_000u64), (4, 30 << 20, 233_000_000)]
+        {
+            let sized = Sizing {
+                workers,
+                decoders,
+                ..copy
+            };
+            let budget = least_ceiling_for_writers(&sized, need);
+            assert!(sized.writers_room(budget) >= need, "{workers} {need}");
+            assert!(
+                sized.writers_room(budget - (1 << 20)) < need,
+                "{workers} {need}"
+            );
+        }
+        // The floor holds the arena's least; a byte of room for the writers is no lower.
+        let first = least_ceiling_for_writers(&copy, 1);
+        assert!(
+            first >= copy.floor() && copy.writers_room(first) >= 1,
+            "{first}"
+        );
+        // What the writers already claimed is not counted twice.
+        let claimed = Sizing {
+            writers: 100 << 20,
+            ..copy
+        };
+        assert_eq!(
+            least_ceiling_for_writers(&claimed, 124_000_000),
+            least_ceiling_for_writers(&copy, 124_000_000)
+        );
+        // The budget named is a 64th more, to a MiB.
+        let least = 832_856_009u64;
+        let named = with_baseline_margin(least);
+        assert_eq!(named % (1 << 20), 0);
+        assert!((least + least / 64..least + least / 64 + (1 << 20)).contains(&named));
     }
 
     /// The arena is sized over the whole allowance, and says so.

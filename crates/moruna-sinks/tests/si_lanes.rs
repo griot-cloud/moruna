@@ -8,7 +8,7 @@ use std::sync::{Arc, Barrier};
 
 use common::{CountingAlloc, Scratch, arena_payload, block_on, object_bytes, table_source_schema};
 use moruna_kernel::{Allocator, Encoded, Sink};
-use moruna_sinks::{ParquetSink, ParquetSinkConfig};
+use moruna_sinks::{ParquetSink, ParquetSinkConfig, WriterGrant};
 use moruna_testkit::{FakeAllocator, FakeReactor};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
@@ -123,4 +123,104 @@ fn si_t33_write_is_encode_then_put() {
     let summary = sink.finish().expect("finish");
     assert_eq!(summary.rows, 2 * ROWS as u64);
     assert_eq!(sink.committed_seq(), Some(1));
+}
+
+/// 6.3d: in a program whose allocator does not count the heap (this test binary installs
+/// none), a sink with a writer heap estimates it from parquet's own figure, says so, and writes
+/// every row.
+#[test]
+fn without_a_counting_allocator_the_writers_heap_is_estimated() {
+    assert!(
+        !moruna_kernel::held::heap_counting(),
+        "this binary counts nothing"
+    );
+    let scratch = Scratch::new("lanes-estimated");
+    let reactor = FakeReactor::new();
+    let alloc = CountingAlloc::new(FakeAllocator::new());
+    let mut sink = ParquetSink::new(
+        ParquetSinkConfig {
+            url: scratch.url(),
+            ..ParquetSinkConfig::default()
+        },
+        Arc::new(reactor.clone()),
+        Arc::clone(&alloc) as Arc<dyn Allocator>,
+    )
+    .expect("parquet sink")
+    .with_lanes(1)
+    .with_writer_heap(Some(8 << 20));
+    sink.open(&table_source_schema()).expect("open");
+    for seq in 0..20u64 {
+        let encoded = sink
+            .encode(seq, arena_payload(alloc.fake(), ROWS, seq as i64 * 1_000))
+            .expect("encode");
+        block_on(sink.put(encoded)).expect("put");
+    }
+    let summary = sink.finish().expect("finish");
+    assert_eq!(summary.rows, 20 * ROWS as u64);
+    assert!(!sink.stats().writer_heap_measured, "estimated, and said so");
+}
+
+/// A sink over a grant, written with 20 morsels: its lanes and the files it wrote.
+fn granted(name: &str, grant: &WriterGrant, set: Option<(Option<u64>, u64)>) -> (u64, usize) {
+    let scratch = Scratch::new(name);
+    let reactor = FakeReactor::new();
+    let alloc = CountingAlloc::new(FakeAllocator::new());
+    let mut sink = ParquetSink::new(
+        ParquetSinkConfig {
+            url: scratch.url(),
+            row_group_bytes: 16 << 10,
+            ..ParquetSinkConfig::default()
+        },
+        Arc::new(reactor.clone()),
+        Arc::clone(&alloc) as Arc<dyn Allocator>,
+    )
+    .expect("parquet sink")
+    .with_lanes(4)
+    .with_grant(grant.clone());
+    if let Some((writers, file_buffers)) = set {
+        grant.grant(writers, file_buffers);
+    }
+    sink.open(&table_source_schema()).expect("open");
+    for seq in 0..20u64 {
+        let encoded = sink
+            .encode(seq, arena_payload(alloc.fake(), ROWS, seq as i64 * 1_000))
+            .expect("encode");
+        block_on(sink.put(encoded)).expect("put");
+    }
+    let summary = sink.finish().expect("finish");
+    assert_eq!(summary.rows, 20 * ROWS as u64);
+    (sink.stats().lanes, summary.files.len())
+}
+
+/// 3A (6.3d): the run grants a sink its writers' heap and its file buffers once it knows the
+/// sink's schema, before the sink opens, and the sink reads the grant at `open`. A grant not
+/// set changes nothing; one lane's need is one lane; file buffers of a few KiB make small files.
+#[test]
+fn a_grant_set_before_open_gives_the_writers_and_the_file_buffers() {
+    let unset = granted("grant-unset", &WriterGrant::new(), None);
+    assert_eq!(unset.0, 4, "no grant: parquet's limits on every lane");
+    let leaves = moruna_sinks::leaves_of(match &table_source_schema() {
+        moruna_kernel::SourceSchema::Table(schema) => schema,
+        _ => unreachable!(),
+    })
+    .expect("leaves");
+    let zstd = parquet::basic::Compression::ZSTD(Default::default());
+    let one = moruna_sinks::least_lane_bytes(&leaves, zstd);
+    let grant = WriterGrant::new();
+    assert_eq!((grant.writers(), grant.file_buffers()), (None, None));
+    let lanes = granted("grant-one-lane", &grant, Some((Some(one), 1 << 30)));
+    assert_eq!(lanes.0, 1, "one lane's need is one lane");
+    assert_eq!(grant.writers(), Some(one));
+    let small = granted(
+        "grant-small-files",
+        &WriterGrant::new(),
+        Some((None, 64 << 10)),
+    );
+    assert_eq!(small.0, 4, "no writers' heap: parquet's limits");
+    assert!(
+        small.1 > unset.1,
+        "small file buffers make more files: {} against {}",
+        small.1,
+        unset.1
+    );
 }

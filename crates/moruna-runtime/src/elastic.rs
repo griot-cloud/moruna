@@ -87,6 +87,14 @@ impl WatchState {
         }
     }
 
+    /// The state of a run whose arena the facade capped at `cap` before the watcher started
+    /// (system design 3A, 6.3d: the sinks' writers claimed their need above it), so the watcher
+    /// keeps that cap and does not report it as a ceiling that fell.
+    pub(crate) fn capped_at(mut self, cap: Option<u64>) -> WatchState {
+        self.capped = cap;
+        self
+    }
+
     fn note(&mut self, note: String) {
         if !self.notes.contains(&note) {
             self.notes.push(note);

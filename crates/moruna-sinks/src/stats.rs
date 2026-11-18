@@ -28,4 +28,12 @@ pub struct SinkStats {
     /// The byte count a Parquet file actually rolls at: `sink.file_bytes`, or less when the
     /// arena could not serve a buffer that large (08 f.1).
     pub roll_bytes: u64,
+    /// The lanes a Parquet sink writes on (08 f.12): the run's workers, or fewer when one
+    /// lane's columns need more of the writers' heap than a worker's part of it (6.3d). Zero
+    /// for a sink without lanes, or before `open`.
+    pub lanes: u64,
+    /// Whether a Parquet sink's writers' heap was measured, by the counting allocator the engine
+    /// and the Python extension install, or estimated from parquet's own figure where the
+    /// program installs none (6.3d, `lane_heap::FALLBACK_FACTOR`).
+    pub writer_heap_measured: bool,
 }
