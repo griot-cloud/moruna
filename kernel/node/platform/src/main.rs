@@ -10,7 +10,9 @@
 //!
 //! On a fatal error it prints the line and exits with failure, which stops the node. Once the
 //! node is ready it stays, holding the hand-over, and sets the wall clock again from its cloud's
-//! `Date` every hour: a service that ends stops the node.
+//! `Date` every hour: a service that ends stops the node. A re-read that fails prints
+//! `platform: wall clock not refreshed: <reason>` once, and the next that succeeds
+//! `platform: wall clock refreshed`; the clock runs on either way.
 
 #![no_std]
 #![no_main]
@@ -22,7 +24,7 @@ use alloc::{format, string::String};
 
 use moruna_node_config::{Cloud, Handover};
 use moruna_node_platform::{
-    boot::{self, Fatal, Inputs, RETIME_NS, Stage},
+    boot::{self, Fatal, Inputs, RETIME_NS, Refresh, Stage},
     instance,
     machine::{Clock, WallClock},
     svc::{self, ChannelLink, Monotonic, Wan},
@@ -126,14 +128,16 @@ fn run() -> i64 {
     };
     // Every hour, the wall clock again from the cloud's `Date`. One that cannot be read leaves
     // the clock running as it was set, and the next hour tries again.
+    let mut refresh = Refresh::default();
     let mut next = ready.clock.now().saturating_add(RETIME_NS);
     loop {
         ready.clock.sleep_until(next);
-        let _ = boot::retime(
+        refresh.run(
             &mut ready.network,
             &mut ready.clock,
             &mut ready.wall,
             ready.cloud,
+            &mut |line: &str| println!(console, "{}", line),
         );
         next = next.saturating_add(RETIME_NS);
     }

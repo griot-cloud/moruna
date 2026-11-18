@@ -70,16 +70,21 @@ impl Fatal {
     }
 }
 
+/// Writes `reason` as a console line shows it: it may quote what came from outside the node, so
+/// as one line of printable ASCII, at most [`REASON_SHOWN`] characters.
+fn write_reason(f: &mut impl Write, reason: &str) -> fmt::Result {
+    for character in reason.chars().take(REASON_SHOWN) {
+        let shown = character == ' ' || character.is_ascii_graphic();
+        f.write_char(if shown { character } else { '?' })?;
+    }
+    Ok(())
+}
+
 impl fmt::Display for Fatal {
-    /// The console line. The reason may quote what came from outside the node, so it is shown
-    /// as one line of printable ASCII.
+    /// The console line.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "moruna: fatal {}: ", self.stage.name())?;
-        for character in self.reason.chars().take(REASON_SHOWN) {
-            let shown = character == ' ' || character.is_ascii_graphic();
-            f.write_char(if shown { character } else { '?' })?;
-        }
-        Ok(())
+        write_reason(f, &self.reason)
     }
 }
 
@@ -220,4 +225,49 @@ pub fn retime<N: Network, C: Clock, W: WallClock>(
         date::parse(&date).ok_or_else(|| String::from("the Date header is not an IMF-fixdate"))?;
     set_wall_clock(wall, clock, unix_seconds, read_at_ns)?;
     Ok(unix_seconds)
+}
+
+/// The line once a re-read succeeds after one failed.
+pub const REFRESHED: &str = "platform: wall clock refreshed";
+
+/// The line when a re-read fails, the first since the clock was last set.
+pub fn not_refreshed_line(reason: &str) -> String {
+    let mut line = String::from("platform: wall clock not refreshed: ");
+    // Writing to a String does not fail.
+    let _ = write_reason(&mut line, reason);
+    line
+}
+
+/// What `platform` says of its hourly re-reads (system design 3D): the first that fails, then
+/// nothing until one succeeds, which it says too. Neither is fatal: the clock runs on as it was
+/// last set.
+#[derive(Debug, Default)]
+pub struct Refresh {
+    /// Whether the last re-read failed.
+    failing: bool,
+}
+
+impl Refresh {
+    /// One re-read ([`retime`]), saying through `console` whether it changed from failing to
+    /// not or back.
+    pub fn run<N: Network, C: Clock, W: WallClock>(
+        &mut self,
+        network: &mut N,
+        clock: &mut C,
+        wall: &mut W,
+        cloud: Cloud,
+        console: &mut dyn FnMut(&str),
+    ) {
+        match retime(network, clock, wall, cloud) {
+            Ok(_) if self.failing => {
+                self.failing = false;
+                console(REFRESHED);
+            }
+            Err(reason) if !self.failing => {
+                self.failing = true;
+                console(&not_refreshed_line(&reason));
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
 }

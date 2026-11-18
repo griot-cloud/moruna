@@ -17,7 +17,7 @@ use super::{
     openstack,
 };
 use crate::{
-    boot::{Inputs, RETIME_LIMIT_NS, RETIME_NS, retime, run},
+    boot::{Inputs, REFRESHED, RETIME_LIMIT_NS, RETIME_NS, Refresh, retime, run},
     machine::{Clock, Link, LinkError},
 };
 
@@ -205,4 +205,51 @@ fn a_re_read_that_fails_leaves_the_clock_as_it_was() {
     let (result, times, _) = retimed(Cloud::OpenStack, &mut refusing, |_, sent| openstack(sent));
     assert_eq!(result, Err("InvalidArgs".to_string()));
     assert!(times.is_empty());
+}
+
+#[test]
+fn a_failed_re_read_is_said_once_and_its_recovery_once() {
+    // The instance document fails, fails, answers, answers, fails, fails, answers, hour by hour:
+    // each failure after an answer is said once, and each answer after a failure.
+    let failing = [true, true, false, false, true, true, false];
+    let mut hour = 0;
+    let clock = FakeClock::default();
+    let mut network = FakeNetwork::serving(&clock, move |_, sent| {
+        let fails = failing[hour];
+        hour += 1;
+        if fails {
+            Reply::Answer(answer("503 Service Unavailable", b"\x07"))
+        } else {
+            openstack(sent)
+        }
+    });
+    let mut wall = FakeWall::default();
+    let mut refresh = Refresh::default();
+    let mut lines = Vec::new();
+    for _ in 0..7 {
+        refresh.run(
+            &mut network,
+            &mut clock.clone(),
+            &mut wall,
+            Cloud::OpenStack,
+            &mut |line: &str| lines.push(line.to_string()),
+        );
+    }
+    let not_refreshed = format!("platform: wall clock not refreshed: GET {META}: answered 503");
+    assert_eq!(
+        lines,
+        [
+            not_refreshed.clone(),
+            REFRESHED.to_string(),
+            not_refreshed,
+            REFRESHED.to_string()
+        ]
+    );
+    // The clock was set by each re-read that answered, and by no other.
+    assert_eq!(wall.times(), [RECORDED_OPENSTACK_TIME * SECOND; 3]);
+    // A reason from outside the node is shown as printable ASCII.
+    assert_eq!(
+        crate::boot::not_refreshed_line("a\tb\u{e9}"),
+        "platform: wall clock not refreshed: a?b?"
+    );
 }
