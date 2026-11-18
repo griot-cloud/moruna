@@ -294,7 +294,9 @@ fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
     let names: Vec<&str> = node.services.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(
         names,
-        ["devices", "network", "api", "platform", "vmbus", "storvsc"]
+        [
+            "devices", "vmbus", "storvsc", "netvsc", "network", "api", "platform"
+        ]
     );
     let node = node.on_machine(false);
     let names: Vec<&str> = node.services.iter().map(|s| s.name.as_str()).collect();
