@@ -212,9 +212,22 @@ impl Card {
         self.host.borrow_mut().flush(self.driver.channel().host());
     }
 
+    /// Sends one frame, and flushes: each frame its own commit.
     pub fn send(&mut self, frame: &[u8]) -> Result<bool, NetvscError> {
+        let sent = self.put(frame)?;
+        self.driver.flush()?;
+        Ok(sent)
+    }
+
+    /// Sends one frame, unflushed: it goes to the host with the next flush.
+    pub fn put(&mut self, frame: &[u8]) -> Result<bool, NetvscError> {
         self.flush();
         self.driver.send(frame)
+    }
+
+    /// Flushes what was sent.
+    pub fn commit(&mut self) -> Result<(), NetvscError> {
+        self.driver.flush()
     }
 
     pub fn poll(&mut self) -> Result<Option<Got>, NetvscError> {
@@ -242,6 +255,12 @@ impl Card {
     pub fn wait(&mut self) -> Result<Wait, ChannelError> {
         self.flush();
         self.driver.channel().wait(Some(DEADLINE))
+    }
+
+    /// Asks the host to signal when there is something to do: whether there is already.
+    pub fn arm(&mut self) -> Result<bool, NetvscError> {
+        self.flush();
+        self.driver.arm()
     }
 
     /// Has the host read everything the card has sent, and answer.
