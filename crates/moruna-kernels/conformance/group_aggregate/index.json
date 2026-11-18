@@ -1,0 +1,1113 @@
+{
+  "format": "moruna-kernel-corpus/1",
+  "kernel": "moruna.group_aggregate",
+  "cases": [
+    {
+      "name": "every_aggregate",
+      "version": 1,
+      "tests": [
+        "nulls",
+        "multi_batch",
+        "ordering",
+        "params"
+      ],
+      "about": "count, sum, min, max and mean over two batches on the hash path: null keys are groups and sort last, null values are skipped, NaN is a float's min and max.",
+      "params": {
+        "keys": [
+          "zone",
+          "minute"
+        ],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "rows"
+          },
+          {
+            "op": "count",
+            "column": "fare",
+            "as": "fares"
+          },
+          {
+            "op": "sum",
+            "column": "n",
+            "as": "n_sum"
+          },
+          {
+            "op": "min",
+            "column": "fare",
+            "as": "fare_min"
+          },
+          {
+            "op": "max",
+            "column": "fare",
+            "as": "fare_max"
+          },
+          {
+            "op": "mean",
+            "column": "n",
+            "as": "n_mean"
+          },
+          {
+            "op": "sum",
+            "column": "fare",
+            "as": "fare_sum"
+          },
+          {
+            "op": "mean",
+            "column": "fare",
+            "as": "fare_mean"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "trips.in.arrow"
+        }
+      ],
+      "expected": "trips.expected.arrow"
+    },
+    {
+      "name": "every_aggregate_dense",
+      "version": 1,
+      "tests": [
+        "nulls",
+        "multi_batch",
+        "params"
+      ],
+      "about": "The same on the dense path of a declared domain gives the same rows.",
+      "params": {
+        "keys": [
+          "zone",
+          "minute"
+        ],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "rows"
+          },
+          {
+            "op": "count",
+            "column": "fare",
+            "as": "fares"
+          },
+          {
+            "op": "sum",
+            "column": "n",
+            "as": "n_sum"
+          },
+          {
+            "op": "min",
+            "column": "fare",
+            "as": "fare_min"
+          },
+          {
+            "op": "max",
+            "column": "fare",
+            "as": "fare_max"
+          },
+          {
+            "op": "mean",
+            "column": "n",
+            "as": "n_mean"
+          },
+          {
+            "op": "sum",
+            "column": "fare",
+            "as": "fare_sum"
+          },
+          {
+            "op": "mean",
+            "column": "fare",
+            "as": "fare_mean"
+          }
+        ],
+        "domain": {
+          "zone": [
+            0,
+            9
+          ],
+          "minute": [
+            0,
+            1439
+          ]
+        }
+      },
+      "inputs": [
+        {
+          "file": "trips.in.arrow"
+        }
+      ],
+      "expected": "trips.expected.arrow"
+    },
+    {
+      "name": "dense_declined",
+      "version": 1,
+      "tests": [
+        "nulls",
+        "multi_batch",
+        "params"
+      ],
+      "about": "Zone 3, outside its declared [0, 2], arrives in the second batch: the instance continues on the hash path and gives the same rows.",
+      "params": {
+        "keys": [
+          "zone",
+          "minute"
+        ],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "rows"
+          },
+          {
+            "op": "count",
+            "column": "fare",
+            "as": "fares"
+          },
+          {
+            "op": "sum",
+            "column": "n",
+            "as": "n_sum"
+          },
+          {
+            "op": "min",
+            "column": "fare",
+            "as": "fare_min"
+          },
+          {
+            "op": "max",
+            "column": "fare",
+            "as": "fare_max"
+          },
+          {
+            "op": "mean",
+            "column": "n",
+            "as": "n_mean"
+          },
+          {
+            "op": "sum",
+            "column": "fare",
+            "as": "fare_sum"
+          },
+          {
+            "op": "mean",
+            "column": "fare",
+            "as": "fare_mean"
+          }
+        ],
+        "domain": {
+          "zone": [
+            0,
+            2
+          ],
+          "minute": [
+            0,
+            1439
+          ]
+        }
+      },
+      "inputs": [
+        {
+          "file": "trips.in.arrow"
+        }
+      ],
+      "expected": "trips.expected.arrow"
+    },
+    {
+      "name": "sliced",
+      "version": 1,
+      "tests": [
+        "sliced",
+        "nulls",
+        "multi_batch"
+      ],
+      "about": "Batches whose arrays start at offset 1 are read where they lie: only their rows count.",
+      "params": {
+        "keys": [
+          "zone",
+          "minute"
+        ],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "rows"
+          },
+          {
+            "op": "count",
+            "column": "fare",
+            "as": "fares"
+          },
+          {
+            "op": "sum",
+            "column": "n",
+            "as": "n_sum"
+          },
+          {
+            "op": "min",
+            "column": "fare",
+            "as": "fare_min"
+          },
+          {
+            "op": "max",
+            "column": "fare",
+            "as": "fare_max"
+          },
+          {
+            "op": "mean",
+            "column": "n",
+            "as": "n_mean"
+          },
+          {
+            "op": "sum",
+            "column": "fare",
+            "as": "fare_sum"
+          },
+          {
+            "op": "mean",
+            "column": "fare",
+            "as": "fare_mean"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "trips.in.arrow",
+          "slice": [
+            1,
+            2
+          ]
+        }
+      ],
+      "expected": "sliced.expected.arrow"
+    },
+    {
+      "name": "sliced_dense",
+      "version": 1,
+      "tests": [
+        "sliced",
+        "nulls",
+        "params"
+      ],
+      "about": "The same slices on the dense path.",
+      "params": {
+        "keys": [
+          "zone",
+          "minute"
+        ],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "rows"
+          },
+          {
+            "op": "count",
+            "column": "fare",
+            "as": "fares"
+          },
+          {
+            "op": "sum",
+            "column": "n",
+            "as": "n_sum"
+          },
+          {
+            "op": "min",
+            "column": "fare",
+            "as": "fare_min"
+          },
+          {
+            "op": "max",
+            "column": "fare",
+            "as": "fare_max"
+          },
+          {
+            "op": "mean",
+            "column": "n",
+            "as": "n_mean"
+          },
+          {
+            "op": "sum",
+            "column": "fare",
+            "as": "fare_sum"
+          },
+          {
+            "op": "mean",
+            "column": "fare",
+            "as": "fare_mean"
+          }
+        ],
+        "domain": {
+          "zone": [
+            0,
+            9
+          ],
+          "minute": [
+            0,
+            1439
+          ]
+        }
+      },
+      "inputs": [
+        {
+          "file": "trips.in.arrow",
+          "slice": [
+            1,
+            2
+          ]
+        }
+      ],
+      "expected": "sliced.expected.arrow"
+    },
+    {
+      "name": "empty_batch",
+      "version": 1,
+      "tests": [
+        "empty"
+      ],
+      "about": "A batch of no rows adds no group: nothing at finish.",
+      "params": {
+        "keys": [
+          "k"
+        ],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "n"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "empty.in.arrow"
+        }
+      ],
+      "expected": "empty.expected.arrow"
+    },
+    {
+      "name": "no_batch",
+      "version": 1,
+      "tests": [
+        "empty"
+      ],
+      "about": "No batch at all: nothing at finish.",
+      "params": {
+        "keys": [
+          "k"
+        ],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "n"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "none.in.arrow"
+        }
+      ],
+      "expected": "empty.expected.arrow"
+    },
+    {
+      "name": "empty_partial",
+      "version": 1,
+      "tests": [
+        "empty",
+        "params"
+      ],
+      "about": "No rows in partial mode: no partial result.",
+      "params": {
+        "keys": [
+          "k"
+        ],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "n"
+          }
+        ],
+        "mode": "partial",
+        "instances": 4
+      },
+      "inputs": [
+        {
+          "file": "empty.in.arrow"
+        }
+      ],
+      "expected": "empty.expected.arrow"
+    },
+    {
+      "name": "all_null_values",
+      "version": 1,
+      "tests": [
+        "nulls"
+      ],
+      "about": "A group whose values are all null counts 2 rows and 0 values; its sum, min, max and mean are null.",
+      "params": {
+        "keys": [
+          "k"
+        ],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "rows"
+          },
+          {
+            "op": "count",
+            "column": "v",
+            "as": "values"
+          },
+          {
+            "op": "sum",
+            "column": "v",
+            "as": "sum"
+          },
+          {
+            "op": "min",
+            "column": "v",
+            "as": "min"
+          },
+          {
+            "op": "max",
+            "column": "v",
+            "as": "max"
+          },
+          {
+            "op": "mean",
+            "column": "v",
+            "as": "mean"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "all_null.in.arrow"
+        }
+      ],
+      "expected": "all_null.expected.arrow"
+    },
+    {
+      "name": "float_keys",
+      "version": 1,
+      "tests": [
+        "ordering",
+        "nulls"
+      ],
+      "about": "-0.0 groups with 0.0 and every NaN with every other, after +infinity; null last.",
+      "params": {
+        "keys": [
+          "x"
+        ],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "n"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "float_keys.in.arrow"
+        }
+      ],
+      "expected": "float_keys.expected.arrow"
+    },
+    {
+      "name": "string_keys",
+      "version": 1,
+      "tests": [
+        "ordering",
+        "nulls"
+      ],
+      "about": "Strings group by value and sort by their bytes (B, a, b, é); null last.",
+      "params": {
+        "keys": [
+          "s"
+        ],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "n"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "strings.in.arrow"
+        }
+      ],
+      "expected": "strings.expected.arrow"
+    },
+    {
+      "name": "string_and_decimal_keys",
+      "version": 1,
+      "tests": [
+        "ordering",
+        "multi_batch"
+      ],
+      "about": "A string key and a decimal key together; an Int32 sum is Int64.",
+      "params": {
+        "keys": [
+          "s",
+          "d"
+        ],
+        "aggregates": [
+          {
+            "op": "sum",
+            "column": "v",
+            "as": "t"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "string_decimal.in.arrow"
+        }
+      ],
+      "expected": "string_decimal.expected.arrow"
+    },
+    {
+      "name": "float_sum_exact",
+      "version": 1,
+      "tests": [
+        "rounding"
+      ],
+      "about": "A float sum is the exact sum rounded once: 1e16 + 1 - 1e16 keeps its 1, and 1e-300 is not lost to it.",
+      "params": {
+        "keys": [
+          "k"
+        ],
+        "aggregates": [
+          {
+            "op": "sum",
+            "column": "v",
+            "as": "s"
+          },
+          {
+            "op": "mean",
+            "column": "v",
+            "as": "m"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "float_sum.in.arrow"
+        }
+      ],
+      "expected": "float_sum.expected.arrow"
+    },
+    {
+      "name": "float_sum_any_order",
+      "version": 1,
+      "tests": [
+        "rounding",
+        "multi_batch"
+      ],
+      "about": "The same values reversed and in two batches give the same bits.",
+      "params": {
+        "keys": [
+          "k"
+        ],
+        "aggregates": [
+          {
+            "op": "sum",
+            "column": "v",
+            "as": "s"
+          },
+          {
+            "op": "mean",
+            "column": "v",
+            "as": "m"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "float_sum_reversed.in.arrow"
+        }
+      ],
+      "expected": "float_sum.expected.arrow"
+    },
+    {
+      "name": "float_sum_specials",
+      "version": 1,
+      "tests": [
+        "rounding",
+        "overflow"
+      ],
+      "about": "An infinity wins; both infinities are NaN; an exact total past the largest double is infinity; -0.0 + -0.0 is +0.0.",
+      "params": {
+        "keys": [
+          "k"
+        ],
+        "aggregates": [
+          {
+            "op": "sum",
+            "column": "v",
+            "as": "s"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "float_specials.in.arrow"
+        }
+      ],
+      "expected": "float_specials.expected.arrow"
+    },
+    {
+      "name": "float_min_max",
+      "version": 1,
+      "tests": [
+        "ordering"
+      ],
+      "about": "-0.0 is less than +0.0, and -infinity is a minimum.",
+      "params": {
+        "keys": [
+          "k"
+        ],
+        "aggregates": [
+          {
+            "op": "min",
+            "column": "v",
+            "as": "lo"
+          },
+          {
+            "op": "max",
+            "column": "v",
+            "as": "hi"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "min_max.in.arrow"
+        }
+      ],
+      "expected": "min_max.expected.arrow"
+    },
+    {
+      "name": "unsigned_and_temporal",
+      "version": 1,
+      "tests": [
+        "params"
+      ],
+      "about": "A sum of UInt8 is UInt64, min and max keep UInt8 and Date32, a mean of integers is Float64.",
+      "params": {
+        "keys": [
+          "k"
+        ],
+        "aggregates": [
+          {
+            "op": "sum",
+            "column": "v",
+            "as": "s"
+          },
+          {
+            "op": "min",
+            "column": "v",
+            "as": "lo"
+          },
+          {
+            "op": "max",
+            "column": "v",
+            "as": "hi"
+          },
+          {
+            "op": "mean",
+            "column": "v",
+            "as": "m"
+          },
+          {
+            "op": "min",
+            "column": "d",
+            "as": "first"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "unsigned.in.arrow"
+        }
+      ],
+      "expected": "unsigned.expected.arrow"
+    },
+    {
+      "name": "sum_overflow",
+      "version": 1,
+      "tests": [
+        "overflow",
+        "error"
+      ],
+      "about": "A final Int64 sum past Int64 refuses the run at finish, naming the group.",
+      "params": {
+        "keys": [
+          "k"
+        ],
+        "aggregates": [
+          {
+            "op": "sum",
+            "column": "v",
+            "as": "s"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "overflow.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "apply",
+        "contains": "the sum `s` of the group (1)"
+      }
+    },
+    {
+      "name": "sum_back_in_range",
+      "version": 1,
+      "tests": [
+        "overflow"
+      ],
+      "about": "A total that passes Int64 in between and ends in range is no overflow.",
+      "params": {
+        "keys": [
+          "k"
+        ],
+        "aggregates": [
+          {
+            "op": "sum",
+            "column": "v",
+            "as": "s"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "back_in_range.in.arrow"
+        }
+      ],
+      "expected": "back_in_range.expected.arrow"
+    },
+    {
+      "name": "keys_only",
+      "version": 1,
+      "tests": [
+        "ordering",
+        "nulls"
+      ],
+      "about": "No aggregates: the distinct keys, in order.",
+      "params": {
+        "keys": [
+          "a"
+        ]
+      },
+      "inputs": [
+        {
+          "file": "keys_only.in.arrow"
+        }
+      ],
+      "expected": "keys_only.expected.arrow"
+    },
+    {
+      "name": "partial_form",
+      "version": 1,
+      "tests": [
+        "params",
+        "nulls",
+        "overflow"
+      ],
+      "about": "Partial mode gives each aggregate's state: an Int64 total past Int64 kept exactly as Decimal128(38, 0), float sums in their one encoding, a mean's sum and count.",
+      "params": {
+        "keys": [
+          "k"
+        ],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "rows"
+          },
+          {
+            "op": "sum",
+            "column": "n",
+            "as": "n_sum"
+          },
+          {
+            "op": "sum",
+            "column": "v",
+            "as": "v_sum"
+          },
+          {
+            "op": "mean",
+            "column": "n",
+            "as": "n_mean"
+          },
+          {
+            "op": "mean",
+            "column": "v",
+            "as": "v_mean"
+          }
+        ],
+        "mode": "partial"
+      },
+      "inputs": [
+        {
+          "file": "partial.in.arrow"
+        }
+      ],
+      "expected": "partial.expected.arrow"
+    },
+    {
+      "name": "final_merge",
+      "version": 1,
+      "tests": [
+        "multi_batch",
+        "overflow",
+        "nulls"
+      ],
+      "about": "Final mode merges partial results: counts and totals add (a partial past Int64 comes back in range), a null partial adds nothing, a mean divides the merged sum by the merged count.",
+      "params": {
+        "keys": [
+          "k"
+        ],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "rows"
+          },
+          {
+            "op": "sum",
+            "column": "n",
+            "as": "n_sum"
+          },
+          {
+            "op": "sum",
+            "column": "v",
+            "as": "v_sum"
+          },
+          {
+            "op": "mean",
+            "column": "n",
+            "as": "n_mean"
+          },
+          {
+            "op": "mean",
+            "column": "v",
+            "as": "v_mean"
+          }
+        ],
+        "mode": "final"
+      },
+      "inputs": [
+        {
+          "file": "merge.in.arrow"
+        }
+      ],
+      "expected": "merge.expected.arrow"
+    },
+    {
+      "name": "no_keys",
+      "version": 1,
+      "tests": [
+        "params",
+        "error"
+      ],
+      "about": "No keys is refused at configure.",
+      "params": {
+        "keys": [],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "n"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "empty.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "configure",
+        "contains": "names no column"
+      }
+    },
+    {
+      "name": "unknown_op",
+      "version": 1,
+      "tests": [
+        "params",
+        "error"
+      ],
+      "about": "An unknown aggregate is refused at configure.",
+      "params": {
+        "keys": [
+          "k"
+        ],
+        "aggregates": [
+          {
+            "op": "median",
+            "column": "v",
+            "as": "m"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "empty.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "configure",
+        "contains": "`median`"
+      }
+    },
+    {
+      "name": "sum_of_strings",
+      "version": 1,
+      "tests": [
+        "error"
+      ],
+      "about": "A sum of a string column is refused at plan.",
+      "params": {
+        "keys": [
+          "s"
+        ],
+        "aggregates": [
+          {
+            "op": "sum",
+            "column": "s",
+            "as": "t"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "strings.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "schema",
+        "contains": "does not take"
+      }
+    },
+    {
+      "name": "domain_of_strings",
+      "version": 1,
+      "tests": [
+        "params",
+        "error"
+      ],
+      "about": "A declared domain of a string key is refused at plan.",
+      "params": {
+        "keys": [
+          "s"
+        ],
+        "domain": {
+          "s": [
+            0,
+            1
+          ]
+        }
+      },
+      "inputs": [
+        {
+          "file": "strings.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "schema",
+        "contains": "integer keys"
+      }
+    },
+    {
+      "name": "occupancy",
+      "version": 1,
+      "tests": [
+        "multi_batch"
+      ],
+      "about": "Occupancy's counting step after its expansion (bench/vm/workloads.py): the first 1000 trips of January 2024, 16953 rows in three batches, against workloads.py's np.unique, on the hash path.",
+      "params": {
+        "keys": [
+          "zone",
+          "minute_of_day"
+        ],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "car_minutes"
+          }
+        ]
+      },
+      "inputs": [
+        {
+          "file": "occupancy.in.arrow"
+        }
+      ],
+      "expected": "occupancy.expected.arrow"
+    },
+    {
+      "name": "occupancy_dense",
+      "version": 1,
+      "tests": [
+        "multi_batch",
+        "params"
+      ],
+      "about": "Occupancy's counting step after its expansion (bench/vm/workloads.py): the first 1000 trips of January 2024, 16953 rows in three batches, against workloads.py's np.unique, on the dense path of 4G.4's domain (zones 0 to 299, minutes 0 to 1439).",
+      "params": {
+        "keys": [
+          "zone",
+          "minute_of_day"
+        ],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "car_minutes"
+          }
+        ],
+        "domain": {
+          "zone": [
+            0,
+            299
+          ],
+          "minute_of_day": [
+            0,
+            1439
+          ]
+        }
+      },
+      "inputs": [
+        {
+          "file": "occupancy.in.arrow"
+        }
+      ],
+      "expected": "occupancy.expected.arrow"
+    },
+    {
+      "name": "occupancy_partial",
+      "version": 1,
+      "tests": [
+        "multi_batch",
+        "params"
+      ],
+      "about": "Occupancy's counting step after its expansion (bench/vm/workloads.py): the first 1000 trips of January 2024, 16953 rows in three batches, against workloads.py's np.unique, in partial mode: for count alone the partial form is the final form.",
+      "params": {
+        "keys": [
+          "zone",
+          "minute_of_day"
+        ],
+        "aggregates": [
+          {
+            "op": "count",
+            "as": "car_minutes"
+          }
+        ],
+        "mode": "partial"
+      },
+      "inputs": [
+        {
+          "file": "occupancy.in.arrow"
+        }
+      ],
+      "expected": "occupancy.expected.arrow"
+    }
+  ]
+}
