@@ -26,6 +26,10 @@ use netstack_protocol::{
 /// The one port a job reaches: HTTPS.
 pub const PORT: u16 = 443;
 
+/// The sockets a job's channel holds at once: its socket bound (system design 3D), which the
+/// engine's connector keeps its pool of connections within.
+pub const SOCKETS: u32 = 64;
+
 /// Why a job's hosts make no policy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EgressError {
