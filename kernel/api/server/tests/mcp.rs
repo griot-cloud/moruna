@@ -113,7 +113,9 @@ fn a_client_initializes_lists_and_calls_each_tool() {
             "moruna_jobs_get",
             "moruna_jobs_cancel",
             "moruna_jobs_events",
-            "moruna_jobs_report"
+            "moruna_jobs_report",
+            "moruna_functions_register",
+            "moruna_functions_list"
         ]
     );
 
@@ -156,6 +158,73 @@ fn a_client_initializes_lists_and_calls_each_tool() {
         ]
     );
     assert_eq!(text(&audit["result"]), audit["result"]["structuredContent"]);
+}
+
+/// 3E through MCP: a function is registered with the tool's arguments as its registration, and
+/// listed; a registration that does not verify is a tool error.
+#[test]
+fn a_function_is_registered_and_listed_through_mcp() {
+    let mut harness = Harness::new();
+    let client = harness.connect();
+    let admin = harness.token(&["admin"]);
+    let image = b"\x7fELF gate-score";
+    let arguments: Value = serde_json::from_str(&common::signer::registration(
+        "gate-score",
+        "https://images.example.com/gate-score",
+        image,
+        &harness.signer,
+    ))
+    .unwrap();
+    let call = |id, name: &str, arguments: Value| {
+        request(
+            id,
+            "tools/call",
+            json!({ "name": name, "arguments": arguments }),
+        )
+    };
+    let registered = answer(
+        &post(
+            &mut harness,
+            client,
+            &admin,
+            &call(5, "moruna_functions_register", arguments.clone()),
+        ),
+        5,
+    );
+    let function = &registered["result"]["structuredContent"];
+    assert_eq!(function["name"], "gate-score");
+    assert_eq!(function["sha256"], common::signer::sha256_hex(image));
+    let listed = answer(
+        &post(
+            &mut harness,
+            client,
+            &admin,
+            &call(6, "moruna_functions_list", json!({})),
+        ),
+        6,
+    );
+    assert_eq!(
+        listed["result"]["structuredContent"]["functions"][0]["name"],
+        "gate-score"
+    );
+    let mut forged = arguments;
+    forged["sha256"] = common::signer::sha256_hex(b"another image").into();
+    let refused = answer(
+        &post(
+            &mut harness,
+            client,
+            &admin,
+            &call(7, "moruna_functions_register", forged),
+        ),
+        7,
+    );
+    assert_eq!(refused["result"]["isError"], true);
+    assert!(
+        text(&refused["result"])["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not verify")
+    );
 }
 
 #[test]

@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use moruna_api::{
-    Audit, AuditRecord, ErrorBody, ErrorCode, Health, HealthStatus, Job, JobState, JobStatus,
-    JobSummary, Jobs, Node, OPERATIONS, Refusal, Response, Submitted, Validation,
+    Audit, AuditRecord, ErrorBody, ErrorCode, Function, FunctionRegistration, Functions, Health,
+    HealthStatus, Job, JobState, JobStatus, JobSummary, Jobs, Node, OPERATIONS, Refusal, Response,
+    Submitted, Validation,
 };
 use ring::digest::{SHA256, digest};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -47,6 +48,9 @@ struct State {
     audit: Mutex<Vec<AuditRecord>>,
     /// The jobs submitted, oldest first.
     jobs: Mutex<Vec<JobStatus>>,
+    /// The functions registered (3E), by name. The stand-in checks no signature: a
+    /// registration whose signature is `bad` is refused, as one that does not verify is.
+    functions: Mutex<Vec<Function>>,
 }
 
 /// Serve on a port of 127.0.0.1 until the test process ends; the address it listens on.
@@ -68,6 +72,7 @@ pub fn serve(config: Config) -> SocketAddr {
         config,
         audit: Mutex::new(Vec::new()),
         jobs: Mutex::new(Vec::new()),
+        functions: Mutex::new(Vec::new()),
     });
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
@@ -228,6 +233,11 @@ fn answer(state: &State, head: &str, body: &[u8]) -> (u16, String) {
             false => Err((ErrorCode::Conflict, "the job has not ended".to_string())),
         }),
         Response::Events => job(state, id).map(|job| events(&job, query)),
+        Response::Function => register(state, body),
+        Response::Functions => {
+            let functions = state.functions.lock().expect("the functions").clone();
+            Ok(json(&Functions { functions }))
+        }
     };
     match result {
         Ok(body) => {
@@ -236,6 +246,34 @@ fn answer(state: &State, head: &str, body: &[u8]) -> (u16, String) {
         }
         Err((code, message)) => refuse(state, operation.id, caller, code, &message),
     }
+}
+
+/// `POST /v1/functions`: the registration kept by name, or refused when its signature is `bad`.
+fn register(state: &State, body: &[u8]) -> Result<String, (ErrorCode, String)> {
+    let given: FunctionRegistration = serde_json::from_slice(body).map_err(|_| {
+        (
+            ErrorCode::Invalid,
+            "not a function's registration".to_string(),
+        )
+    })?;
+    if given.signature == "bad" {
+        return Err((
+            ErrorCode::Invalid,
+            "the signature does not verify under any of node config's functions.keys".to_string(),
+        ));
+    }
+    let function = Function {
+        name: given.name,
+        address: given.address,
+        sha256: given.sha256,
+        key: "stand-in".to_string(),
+        registered: now(),
+    };
+    let mut functions = state.functions.lock().expect("the functions");
+    functions.retain(|kept| kept.name != function.name);
+    functions.push(function.clone());
+    functions.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(json(&function))
 }
 
 fn json(value: &impl serde::Serialize) -> String {

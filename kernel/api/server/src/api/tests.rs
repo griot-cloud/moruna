@@ -47,6 +47,7 @@ fn api(signer: &Signer) -> Api {
     Api::new(
         facts(),
         vec![TokenKey::new(signer.public())],
+        vec![crate::FunctionKey::new(signer.public())],
         Box::new(crate::NoEngine),
     )
 }
