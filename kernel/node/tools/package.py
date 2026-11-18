@@ -50,6 +50,28 @@ def user_c(environment):
 # The disk's formats. `raw` is the disk itself; each other one is a file beside it.
 FORMATS = ("raw", "qcow2", "vhd")
 MIB = 1024 * 1024
+# The boot payload's file naming the GUID of the image's own disk (system design 3C, item
+# 3.3), and what it holds while the image it is computed from is built.
+DISK_GUID = "disk.guid"
+PLACEHOLDER = "00000000-0000-0000-0000-000000000000"
+
+
+def disk_guid(files):
+    """The GPT disk GUID of an image built from `files`, in order: the first 16 bytes of the
+    SHA-256 of their lengths and bytes, as an RFC 9562 version 8 GUID in sgdisk's text form.
+    The same files give the same GUID, and another build another, so a block driver tells the
+    disk the node booted from (the one whose GPT header names the GUID the boot payload
+    carries) from another Moruna image's disk attached as a volume."""
+    digest = hashlib.sha256()
+    for path in files:
+        data = Path(path).read_bytes()
+        digest.update(len(data).to_bytes(8, "little"))
+        digest.update(data)
+    raw = bytearray(digest.digest()[:16])
+    raw[6] = (raw[6] & 0x0F) | 0x80
+    raw[8] = (raw[8] & 0x3F) | 0x80
+    text = raw.hex().upper()
+    return f"{text[:8]}-{text[8:12]}-{text[12:16]}-{text[16:20]}-{text[20:]}"
 
 
 def command(args, cwd, env=None):
@@ -227,9 +249,16 @@ def main():
                  "-p", "moruna-node-image", "--", description, payload,
                  args.node_memory, args.cpus, args.agent_port], kernel, host_env)
         resources = json.loads((payload / "node-resources.json").read_text())
-    command([*cargo, "run", "--locked", "--offline", "--release", "--target", host,
-             "-p", "moruna-image", "--", description, binaries, payload], kernel, host_env)
+    # The image is built once with a placeholder GUID, which names it by its content, then
+    # again with that GUID in its payload: the disk carries the GUID the boot payload says.
+    (payload / DISK_GUID).write_text(PLACEHOLDER + "\n")
+    image_command = [*cargo, "run", "--locked", "--offline", "--release", "--target", host,
+                     "-p", "moruna-image", "--", description, binaries, payload]
+    command(image_command, kernel, host_env)
     elf = target_dir / target / "release" / "moruna-microkernel"
+    guid = disk_guid([payload / "initramfs.cpio", elf])
+    (payload / DISK_GUID).write_text(guid + "\n")
+    command(image_command, kernel, host_env)
     # Preserve the real ELF machine type. The EM_386 patch used only by QEMU's
     # direct -kernel loader is deliberately not part of a GRUB boot image.
     if elf.read_bytes()[:4] != b"\x7fELF":
@@ -263,7 +292,8 @@ def main():
     disk = out / "moruna-node.raw"
     with disk.open("xb") as file:
         file.truncate((esp_mib + 4) * MIB)
-    command(["sgdisk", "--clear", f"--new=1:2048:+{esp_mib}M", "--typecode=1:ef00", disk], out)
+    command(["sgdisk", "--clear", f"--disk-guid={guid}", f"--new=1:2048:+{esp_mib}M", "--typecode=1:ef00",
+             disk], out)
     with disk.open("r+b") as destination, esp.open("rb") as source:
         destination.seek(2048 * 512)
         shutil.copyfileobj(source, destination)

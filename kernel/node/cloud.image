@@ -3,7 +3,9 @@
 # names: `devices`, the network server (`netstack`, configured by network.conf), `api` and
 # `platform` (items 1.1, 1.3 and 1.4). package.py --profile cloud --assets kernel/node/cloud
 # validates node.conf and network.conf with their actual parsers. Driver table data and driver
-# images are emitted by moruna-image.
+# images are emitted by moruna-image. package.py writes disk.guid, the GPT disk GUID of the
+# image's own disk, which `devices` passes to its drivers so the boot disk is never a volume
+# (system design 3C, item 3.3).
 moruna-image 1
 process node-supervisor
   handle console console
@@ -18,6 +20,7 @@ process node-supervisor
   handle program:platform image.platform
   handle data:node.conf config
   handle data:network.conf network.config
+  handle data:disk.guid disk.guid
   driver 1af4:1042 virtio-blk block
   driver 1af4:1041 virtio-net net
   driver 1b36:0010 nvme nvme

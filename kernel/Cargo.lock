@@ -810,6 +810,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-disk"
+version = "0.1.0"
+
+[[package]]
 name = "moruna-driver-table"
 version = "0.1.0"
 dependencies = [
@@ -2011,6 +2015,7 @@ name = "virtio-blk"
 version = "0.1.0"
 dependencies = [
  "block-protocol",
+ "moruna-disk",
  "moruna-mmio",
  "moruna-pci",
  "moruna-svc",

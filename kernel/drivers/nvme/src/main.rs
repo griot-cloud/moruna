@@ -620,6 +620,40 @@ impl Handler for Connection {
                 };
                 n.transfer_at(cx, ordinal == 7, token, registration, page, sector, count)
             }
+            11 | 12 => {
+                let token = if ordinal == 12 {
+                    let Some(token) = decode::<u64>(d) else {
+                        return bad;
+                    };
+                    Some(token)
+                } else {
+                    None
+                };
+                let (Some(id), Some(offset), Some(sector), Some(count)) = (
+                    decode::<u32>(d),
+                    decode::<u64>(d),
+                    decode::<u64>(d),
+                    decode::<u32>(d),
+                ) else {
+                    return bad;
+                };
+                if d.finish().is_err() {
+                    return bad;
+                }
+                let Some(registration) = self.registrations.get(&id).cloned() else {
+                    return Outcome::Failure(block::Error::NoRegistration.code());
+                };
+                // A command's data starts a page here (its PRP list), so a placed transfer
+                // that starts inside one is one this driver cannot make: the client moves it
+                // another way (protocol 2.1).
+                let page = (offset % 4096 == 0)
+                    .then(|| u32::try_from(offset / 4096).ok())
+                    .flatten();
+                let Some(page) = page else {
+                    return Outcome::Failure(block::Error::BadBuffer.code());
+                };
+                n.transfer_at(cx, ordinal == 12, token, registration, page, sector, count)
+            }
             8 => {
                 let Some(id) = decode::<u32>(d) else {
                     return bad;

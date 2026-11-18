@@ -358,7 +358,7 @@ jobs:
             -p scsi_defs -p open_enum -p guid -p guestmem_core -p safeatomic -p net_backend_core
             -p moruna-storvsc
             -p moruna-netvsc
-            -p moruna-mmio -p moruna-pci -p moruna-virtio -p moruna-driver-table -p moruna-imagefs
+            -p moruna-mmio -p moruna-pci -p moruna-virtio -p moruna-disk -p moruna-driver-table -p moruna-imagefs
             -p moruna-linux -p linux-protocol -p moruna-nvme -p moruna-gve -p net-protocol
             -p moruna-datapath -p moruna-sys -p moruna-node -p moruna-ostd-adaptation)
           cargo clippy --locked --target "$host" --all-targets "${packages[@]}" --features moruna-abi/manifest -- -D warnings

@@ -2,18 +2,27 @@
 //! its supervisor gave it, for the one virtio-blk device whose windows it holds.
 //!
 //! A read or a write pins the client's memory object through the driver's DMA
-//! resource and hands its pages to the device as one descriptor chain (a header, one
-//! part per page, a status byte), so the data moves between the disk and the client's
-//! memory with no copy. The request is answered when the device returns the chain;
-//! its pin then goes to the quarantine, which the driver releases since the device is
-//! done with it. Requests that find the queue full wait, in order, for room.
+//! resource and hands its pages to the device as a descriptor chain (a header, one part
+//! for each run of pages the device sees one after another, a status byte), so the data
+//! moves between the disk and the client's memory with no copy, and a transfer on large
+//! pages takes a few descriptors, however long. A transfer of more parts than the queue
+//! chains is cut into several chains, each whole sectors (`moruna_virtio::sg`). It is
+//! answered when the device has returned every chain; its pin then goes to the
+//! quarantine, which the driver releases since the device is done with it. Chains that
+//! find the queue full wait, in order, for room.
 //!
 //! A registered buffer (protocol 1.1) is pinned once, when the client registers it,
 //! and its pages' device addresses kept with the connection; `read_at` and `write_at`
 //! hand the device some of those pages and pin nothing. Each transfer holds the
 //! registration while it is in flight, so a registration ended (or a connection
 //! closed) under a transfer keeps its pin until the device returns the chain, and
-//! only then does the pin go to the quarantine.
+//! only then does the pin go to the quarantine. `read_to` and `write_from` (protocol 2.1)
+//! start a transfer at any byte of a registration.
+//!
+//! At start the driver asks the device its serial (`GET_ID`) and reads its GPT header: the
+//! disk whose header names the GUID of the node's image (`disk.guid`, which the device
+//! manager passes on from the boot payload) is the disk the node booted from, never a
+//! volume (`architecture/moruna-os-system.md` 3C, item 3.3).
 
 #![no_std]
 #![no_main]
@@ -33,17 +42,18 @@ use alloc::{
 use core::cell::RefCell;
 
 use block_protocol::{Info, block, lease};
+use moruna_disk::Guid;
 use moruna_mmio::Region;
 use moruna_pci::dma::DmaBuffer;
 use moruna_svc::{
     Channel, Completions, Console, Context, DEADLINE_INFINITE, Decoder, Dispatcher, Handle,
     Handler, Interrupt, Memory, Outcome, Pending, Pin, ProtocolError, ProtocolId, Signals, Status,
-    Watch, Wire, dma_release, println, start,
+    Watch, Wire, deadline_in, dma_release, map, println, start, wait_one,
 };
 use moruna_virtio::{
     Buffer,
     device::{Device, VirtQueue},
-    kind,
+    kind, sg,
 };
 
 moruna_svc::main!(run);
@@ -57,12 +67,18 @@ const F_FLUSH: u64 = 1 << 9;
 const T_IN: u32 = 0;
 const T_OUT: u32 = 1;
 const T_FLUSH: u32 = 4;
+const T_GET_ID: u32 = 8;
 const S_OK: u8 = 0;
 /// A slot of the header page: the 16-byte request header, then the status byte.
 const SLOT: usize = 32;
 const SLOTS: usize = 4096 / SLOT;
-/// The largest transfer, in pages: one descriptor each, plus the header and status.
-const MAX_PAGES: u32 = 256;
+/// The largest transfer: 1 MiB, whatever the queue's size, which bounds only how many
+/// parts one chain has.
+const MAX_BYTES: u64 = 1 << 20;
+/// The bytes of the sectors the device addresses (virtio 1.2, 5.2.4).
+const SECTOR: u64 = 512;
+/// How long the device has to answer the requests made at start.
+const START_NS: u64 = 30_000_000_000;
 
 enum Op {
     Read,
@@ -92,11 +108,26 @@ enum LeaseTag {
 struct Request {
     op: Op,
     sector: u64,
-    pages: Vec<u64>,
-    bytes: u64,
+    /// The data, as device ranges.
+    ranges: Vec<(u64, u32)>,
     hold: Hold,
     pending: Option<Pending>,
     lease: Option<LeaseTag>,
+}
+
+/// A request on its way: the chains the device has yet to return, and whether every one
+/// returned so far succeeded.
+struct Transfer {
+    request: Request,
+    left: usize,
+    ok: bool,
+}
+
+/// One chain of a transfer: its first sector, relative to the transfer's, and its data.
+struct Piece {
+    transfer: u64,
+    sector: u64,
+    ranges: Vec<(u64, u32)>,
 }
 
 struct Block {
@@ -104,8 +135,14 @@ struct Block {
     queue: VirtQueue,
     headers: DmaBuffer,
     free_slots: Vec<usize>,
-    in_flight: BTreeMap<u16, (usize, Request)>,
-    waiting: VecDeque<Request>,
+    /// Each chain the device holds, by its head: its header slot and its transfer.
+    in_flight: BTreeMap<u16, (usize, u64)>,
+    waiting: VecDeque<Piece>,
+    transfers: BTreeMap<u64, Transfer>,
+    next_transfer: u64,
+    /// The most data parts one chain has: the queue's size less the header and the
+    /// status, and no more than the device's `seg_max`.
+    parts: usize,
     info: Info,
     flush: bool,
     writer: lease::Lease,
@@ -115,21 +152,25 @@ struct Block {
     served: u64,
     /// Why the device can no longer be used; the driver ends with it.
     failed: Option<String>,
+    /// What the device said its serial is (`GET_ID`), when it said one.
+    serial: Option<String>,
+    /// Whether it is the disk the node booted from.
+    boot: bool,
 }
 
 impl Block {
-    /// Hands the device as many waiting requests as the queue takes.
+    /// Hands the device as many waiting chains as the queue takes.
     fn submit_waiting(&mut self) -> Result<(), String> {
         let mut notify = false;
-        while let Some(request) = self.waiting.front() {
-            let parts = request.pages.len() + 2;
+        while let Some(piece) = self.waiting.front() {
+            let parts = piece.ranges.len() + 2;
             if self.free_slots.is_empty() || self.queue.queue.free() < parts {
                 break;
             }
-            let Some(request) = self.waiting.pop_front() else {
+            let Some(piece) = self.waiting.pop_front() else {
                 break;
             };
-            self.submit(request)?;
+            self.submit(piece)?;
             notify = true;
         }
         if notify {
@@ -138,7 +179,12 @@ impl Block {
         Ok(())
     }
 
-    fn submit(&mut self, request: Request) -> Result<(), String> {
+    fn submit(&mut self, piece: Piece) -> Result<(), String> {
+        let request = &self
+            .transfers
+            .get(&piece.transfer)
+            .ok_or("a chain of no transfer")?
+            .request;
         let slot = self.free_slots.pop().ok_or("no header slot")?;
         let at = slot * SLOT;
         let (kind, writes) = match request.op {
@@ -146,43 +192,37 @@ impl Block {
             Op::Write => (T_OUT, false),
             Op::Flush => (T_FLUSH, false),
         };
+        let sector = request.sector + piece.sector;
         let h = &self.headers.map;
         let w = |e: moruna_svc::Error| format!("header: {}", e.name());
         h.write32(at, kind).map_err(w)?;
         h.write32(at + 4, 0).map_err(w)?;
-        h.write64(at + 8, request.sector).map_err(w)?;
+        h.write64(at + 8, sector).map_err(w)?;
         h.write8(at + 16, 0xff).map_err(w)?;
-        let mut chain = Vec::with_capacity(request.pages.len() + 2);
-        chain.push(Buffer {
-            addr: self.headers.addr(at),
-            len: 16,
-            device_writes: false,
-        });
-        let mut left = request.bytes;
-        for page in &request.pages {
-            let len = left.min(4096);
-            chain.push(Buffer {
-                addr: *page,
-                len: len as u32,
-                device_writes: writes,
-            });
-            left -= len;
-        }
-        chain.push(Buffer {
-            addr: self.headers.addr(at + 16),
-            len: 1,
-            device_writes: true,
-        });
+        let chain = sg::chain(
+            Buffer {
+                addr: self.headers.addr(at),
+                len: 16,
+                device_writes: false,
+            },
+            &piece.ranges,
+            writes,
+            Buffer {
+                addr: self.headers.addr(at + 16),
+                len: 1,
+                device_writes: true,
+            },
+        );
         let head = self
             .queue
             .queue
             .add(&chain)
             .map_err(|e| format!("queue: {e:?}"))?;
-        self.in_flight.insert(head, (slot, request));
+        self.in_flight.insert(head, (slot, piece.transfer));
         Ok(())
     }
 
-    /// Answers every request the device has returned.
+    /// Answers every request the device has returned all the chains of.
     fn complete(&mut self, done: &mut Completions) -> Result<(), String> {
         let mut finished = 0;
         while let Some(used) = self
@@ -191,7 +231,7 @@ impl Block {
             .pop_used()
             .map_err(|e| format!("used ring: {e:?}"))?
         {
-            let (slot, mut request) = self
+            let (slot, id) = self
                 .in_flight
                 .remove(&used.head)
                 .ok_or("the device returned a chain not in flight")?;
@@ -201,8 +241,24 @@ impl Block {
                 .read8(slot * SLOT + 16)
                 .map_err(|e| format!("status: {}", e.name()))?;
             self.free_slots.push(slot);
-            self.finish_lease(request.lease.take(), status == S_OK);
-            let outcome = if status != S_OK {
+            finished += 1;
+            let transfer = self
+                .transfers
+                .get_mut(&id)
+                .ok_or("the device returned a chain of no transfer")?;
+            transfer.left -= 1;
+            transfer.ok &= status == S_OK;
+            if transfer.left > 0 {
+                continue;
+            }
+            let Some(Transfer {
+                mut request, ok, ..
+            }) = self.transfers.remove(&id)
+            else {
+                continue;
+            };
+            self.finish_lease(request.lease.take(), ok);
+            let outcome = if !ok {
                 Outcome::Failure(block::Error::Io.code())
             } else {
                 match request.hold {
@@ -224,7 +280,6 @@ impl Block {
                 done.complete(pending, outcome);
             }
             self.served += 1;
-            finished += 1;
         }
         if finished > 0 {
             // The device has finished with every pin closed so far.
@@ -287,7 +342,9 @@ impl Block {
         let Ok((pin, _)) = Pin::create(&self.device.dma, &buffer.0, read, &mut pages) else {
             return fail(block::Error::BadBuffer);
         };
-        pages.truncate(bytes.div_ceil(4096) as usize);
+        let Ok(ranges) = sg::ranges(&pages, 0, bytes) else {
+            return fail(block::Error::BadBuffer);
+        };
         let lease = if matches!(op, Op::Write) {
             match self.writer.write(cx.connection(), token.unwrap_or(0)) {
                 Ok(io) => Some(LeaseTag::Original(io)),
@@ -302,8 +359,7 @@ impl Block {
         self.queue_request(Request {
             op,
             sector,
-            pages,
-            bytes,
+            ranges,
             hold: Hold::Buffer(buffer, pin),
             pending: Some(cx.defer()),
             lease,
@@ -320,7 +376,7 @@ impl Block {
         Ok(Registration { _pin: pin, pages })
     }
 
-    /// A transfer between the disk and pages of a registration.
+    /// A transfer between the disk and a registration, from its byte `offset`.
     #[expect(
         clippy::too_many_arguments,
         reason = "The protocol keeps connection authority, registration pages and disk range distinct"
@@ -331,7 +387,7 @@ impl Block {
         op: Op,
         token: Option<u64>,
         registration: Rc<Registration>,
-        page: u32,
+        offset: u64,
         sector: u64,
         count: u32,
     ) -> Outcome {
@@ -349,12 +405,9 @@ impl Block {
             return Outcome::Failure(error.code());
         }
         let bytes = block_protocol::bytes(&self.info, count);
-        let first = page as usize;
-        let n = bytes.div_ceil(4096) as usize;
-        let Some(pages) = registration.pages.get(first..first + n) else {
+        let Ok(ranges) = sg::ranges(&registration.pages, offset, bytes) else {
             return Outcome::Failure(block::Error::BadBuffer.code());
         };
-        let pages = pages.to_vec();
         let lease = if matches!(op, Op::Write) {
             match self.writer.write(cx.connection(), token.unwrap_or(0)) {
                 Ok(io) => Some(LeaseTag::Original(io)),
@@ -369,8 +422,7 @@ impl Block {
         self.queue_request(Request {
             op,
             sector,
-            pages,
-            bytes,
+            ranges,
             hold: Hold::Registered(registration),
             pending: Some(cx.defer()),
             lease,
@@ -421,8 +473,7 @@ impl Block {
                 self.queue_request(Request {
                     op: Op::Flush,
                     sector: 0,
-                    pages: Vec::new(),
-                    bytes: 0,
+                    ranges: Vec::new(),
                     hold: Hold::None,
                     pending: None,
                     lease: Some(LeaseTag::Release(release)),
@@ -441,10 +492,41 @@ impl Block {
         }
     }
 
-    /// Queues a request for the device. If the device cannot take it, the driver
-    /// records why and ends after this turn, which closes every connection.
-    fn queue_request(&mut self, request: Request) -> Outcome {
-        self.waiting.push_back(request);
+    /// Queues a request for the device, as the chains the queue takes. If the device
+    /// cannot take it, the driver records why and ends after this turn, which closes
+    /// every connection.
+    fn queue_request(&mut self, mut request: Request) -> Outcome {
+        let pieces = if request.ranges.is_empty() {
+            vec![sg::Request {
+                sector: 0,
+                ranges: Vec::new(),
+            }]
+        } else {
+            match sg::requests(&request.ranges, SECTOR, self.parts) {
+                Ok(pieces) => pieces,
+                Err(_) => {
+                    self.finish_lease(request.lease.take(), false);
+                    return Outcome::Failure(block::Error::BadBuffer.code());
+                }
+            }
+        };
+        let id = self.next_transfer;
+        self.next_transfer += 1;
+        self.transfers.insert(
+            id,
+            Transfer {
+                request,
+                left: pieces.len(),
+                ok: true,
+            },
+        );
+        for piece in pieces {
+            self.waiting.push_back(Piece {
+                transfer: id,
+                sector: piece.sector,
+                ranges: piece.ranges,
+            });
+        }
         if let Err(e) = self.submit_waiting() {
             self.failed.get_or_insert(e);
         }
@@ -520,8 +602,7 @@ impl Handler for Connection {
                 b.queue_request(Request {
                     op: Op::Flush,
                     sector: 0,
-                    pages: Vec::new(),
-                    bytes: 0,
+                    ranges: Vec::new(),
                     hold: Hold::None,
                     pending,
                     lease,
@@ -572,7 +653,34 @@ impl Handler for Connection {
                     return Outcome::Failure(block::Error::NoRegistration.code());
                 };
                 let op = if ordinal == 6 { Op::Read } else { Op::Write };
-                b.transfer_at(cx, op, token, registration, page, sector, count)
+                let offset = u64::from(page) * 4096;
+                b.transfer_at(cx, op, token, registration, offset, sector, count)
+            }
+            11 | 12 => {
+                let token = if ordinal == 12 {
+                    let Some(token) = decode::<u64>(d) else {
+                        return Outcome::Status(Status::BadMessage);
+                    };
+                    Some(token)
+                } else {
+                    None
+                };
+                let (Some(id), Some(offset), Some(sector), Some(count)) = (
+                    decode::<u32>(d),
+                    decode::<u64>(d),
+                    decode::<u64>(d),
+                    decode::<u32>(d),
+                ) else {
+                    return Outcome::Status(Status::BadMessage);
+                };
+                if d.finish().is_err() {
+                    return Outcome::Status(Status::BadMessage);
+                }
+                let Some(registration) = self.registrations.get(&id).cloned() else {
+                    return Outcome::Failure(block::Error::NoRegistration.code());
+                };
+                let op = if ordinal == 11 { Op::Read } else { Op::Write };
+                b.transfer_at(cx, op, token, registration, offset, sector, count)
             }
             8 => {
                 let Some(id) = decode::<u32>(d) else {
@@ -662,23 +770,154 @@ impl Watch for Irq {
     }
 }
 
-fn open() -> Result<(Block, Interrupt), String> {
+/// Makes one request at start, before the driver serves: `kind` for `sector`, its data the
+/// `len` bytes of `data` at `at`, and waits for the device's answer. Whether it succeeded.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "One request's every part, made once at start"
+)]
+fn ask(
+    device: &Device,
+    queue: &mut VirtQueue,
+    line: &Interrupt,
+    headers: &DmaBuffer,
+    kind: u32,
+    sector: u64,
+    data: &DmaBuffer,
+    at: usize,
+    len: u32,
+) -> Result<bool, String> {
+    let h = &headers.map;
+    let w = |e: moruna_svc::Error| format!("header: {}", e.name());
+    h.write32(0, kind).map_err(w)?;
+    h.write32(4, 0).map_err(w)?;
+    h.write64(8, sector).map_err(w)?;
+    h.write8(16, 0xff).map_err(w)?;
+    let chain = sg::chain(
+        Buffer {
+            addr: headers.addr(0),
+            len: 16,
+            device_writes: false,
+        },
+        &[(data.addr(at), len)],
+        true,
+        Buffer {
+            addr: headers.addr(16),
+            len: 1,
+            device_writes: true,
+        },
+    );
+    queue
+        .queue
+        .add(&chain)
+        .map_err(|e| format!("queue: {e:?}"))?;
+    device.notify(queue)?;
+    let deadline = deadline_in(START_NS);
+    loop {
+        if queue
+            .queue
+            .pop_used()
+            .map_err(|e| format!("used ring: {e:?}"))?
+            .is_some()
+        {
+            break;
+        }
+        wait_one(&line.0, Signals::SIGNALED, deadline)
+            .map_err(|e| format!("the device did not answer at start: {}", e.name()))?;
+        line.ack()
+            .map_err(|e| format!("interrupt_ack: {}", e.name()))?;
+    }
+    let status = h.read8(16).map_err(|e| format!("status: {}", e.name()))?;
+    dma_release(&device.dma).map_err(|e| format!("dma_release: {}", e.name()))?;
+    Ok(status == S_OK)
+}
+
+/// The device's serial, when it states one (`GET_ID`), and whether it is the disk the node
+/// booted from: its logical block 1 a GPT header naming `image`.
+fn identify(
+    device: &Device,
+    queue: &mut VirtQueue,
+    line: &Interrupt,
+    headers: &DmaBuffer,
+    block: u64,
+    sectors: u64,
+    image: Option<&Guid>,
+) -> Result<(Option<String>, bool), String> {
+    let probe = DmaBuffer::new(&device.dma, 2 * 4096)?;
+    let serial = if ask(
+        device,
+        queue,
+        line,
+        headers,
+        T_GET_ID,
+        0,
+        &probe,
+        0,
+        moruna_disk::VIRTIO_ID_BYTES as u32,
+    )? {
+        let mut id = [0u8; moruna_disk::VIRTIO_ID_BYTES];
+        probe
+            .map
+            .read(0, &mut id)
+            .map_err(|e| format!("the serial: {}", e.name()))?;
+        moruna_disk::serial(&id)
+    } else {
+        None
+    };
+    let header_sector = block / SECTOR;
+    let mut boot = false;
+    if let Some(image) = image
+        && block <= 4096
+        && sectors >= 2 * header_sector
+        && ask(
+            device,
+            queue,
+            line,
+            headers,
+            T_IN,
+            header_sector,
+            &probe,
+            4096,
+            block as u32,
+        )?
+    {
+        let mut header = vec![0u8; block as usize];
+        probe
+            .map
+            .read(4096, &mut header)
+            .map_err(|e| format!("the GPT header: {}", e.name()))?;
+        boot = moruna_disk::is_boot(&header, image);
+    }
+    Ok((serial, boot))
+}
+
+fn open(image: Option<&Guid>) -> Result<(Block, Interrupt), String> {
     let (device, line) = Device::open(kind::BLOCK, F_SEG_MAX | F_RO | F_BLK_SIZE | F_FLUSH, 0)?;
     let features = device.features;
     // virtio-blk addresses 512-byte sectors whatever logical block size it advertises
-    // (virtio 1.2, 5.2.4), so the protocol's sector is 512 bytes.
-    let (sectors, seg_max) = device
+    // (virtio 1.2, 5.2.4), so the protocol's sector is 512 bytes; the logical block is
+    // where the GPT header is.
+    let (sectors, seg_max, blk_size) = device
         .transport
-        .device_config(|c| Ok((c.read64(0)?, c.read32(12)?)))
+        .device_config(|c| Ok((c.read64(0)?, c.read32(12)?, c.read32(20)?)))
         .map_err(|e| format!("device configuration: {e}"))?;
-    let queue = device.queue(0, 256)?;
-    let mut pages = MAX_PAGES.min(queue.queue.size() as u32 - 2);
+    let block = if features & F_BLK_SIZE != 0 && blk_size >= 512 && blk_size.is_power_of_two() {
+        u64::from(blk_size)
+    } else {
+        SECTOR
+    };
+    let mut queue = device.queue(0, 256)?;
+    let mut parts = queue.queue.size() as usize - 2;
     if features & F_SEG_MAX != 0 && seg_max != 0 {
-        pages = pages.min(seg_max);
+        parts = parts.min(seg_max as usize);
+    }
+    if parts < 2 {
+        return Err(format!("a queue whose chains hold {parts} parts of data"));
     }
     let headers = DmaBuffer::new(&device.dma, 4096)?;
     let slots = SLOTS.min(queue.queue.size() as usize);
     device.ready()?;
+    let (serial, boot) = identify(&device, &mut queue, &line, &headers, block, sectors, image)?;
     Ok((
         Block {
             device,
@@ -687,10 +926,13 @@ fn open() -> Result<(Block, Interrupt), String> {
             free_slots: (0..slots).rev().collect(),
             in_flight: BTreeMap::new(),
             waiting: VecDeque::new(),
+            transfers: BTreeMap::new(),
+            next_transfer: 0,
+            parts,
             info: Info {
-                sector_size: 512,
+                sector_size: SECTOR as u32,
                 sectors,
-                max_sectors: pages * (4096 / 512),
+                max_sectors: (MAX_BYTES / SECTOR) as u32,
                 read_only: features & F_RO != 0,
             },
             flush: features & F_FLUSH != 0,
@@ -700,9 +942,27 @@ fn open() -> Result<(Block, Interrupt), String> {
             ready: Vec::new(),
             served: 0,
             failed: None,
+            serial,
+            boot,
         },
         line,
     ))
+}
+
+/// The GUID of the node's image's disk, from the boot payload's `disk.guid`, which the device
+/// manager passes on when the boot gave it one.
+fn image_guid() -> Result<Option<Guid>, String> {
+    let Some(handle) = start::take("disk.guid") else {
+        return Ok(None);
+    };
+    let mut page = [0u8; 4096];
+    Memory(handle)
+        .map(0, 4096, map::READ)
+        .and_then(|m| m.read(0, &mut page))
+        .map_err(|e| format!("reading disk.guid: {}", e.name()))?;
+    Guid::from_file(&page)
+        .map(Some)
+        .ok_or_else(|| String::from("disk.guid holds no GUID"))
 }
 
 fn run() -> i64 {
@@ -714,7 +974,8 @@ fn run() -> i64 {
         println!(out, "KB3 {}: FAIL: no listener", name);
         return 1;
     };
-    let (block, line) = match open() {
+    let opened = image_guid().and_then(|image| open(image.as_ref()));
+    let (block, line) = match opened {
         Ok(b) => b,
         Err(e) => {
             println!(out, "KB3 {}: FAIL: {}", name, e);
@@ -722,6 +983,11 @@ fn run() -> i64 {
         }
     };
     let info = block.info;
+    let serial = match &block.serial {
+        Some(serial) => format!(", serial {serial}"),
+        None => String::from(", no serial"),
+    };
+    let boot = if block.boot { ", the boot disk" } else { "" };
     let block = Rc::new(RefCell::new(block));
     let mut dispatcher = Dispatcher::new();
     let shared = block.clone();
@@ -747,12 +1013,14 @@ fn run() -> i64 {
     }
     println!(
         out,
-        "KB3 {}: virtio-blk up: {} sectors of {} bytes, {} sectors a transfer{}",
+        "KB3 {}: virtio-blk up: {} sectors of {} bytes, {} sectors a transfer{}{}{}",
         name,
         info.sectors,
         info.sector_size,
         info.max_sectors,
-        if info.read_only { ", read only" } else { "" }
+        if info.read_only { ", read only" } else { "" },
+        serial,
+        boot
     );
     loop {
         let (busy, ready, failure) = {

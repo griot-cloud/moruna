@@ -158,5 +158,40 @@ class Profiles(unittest.TestCase):
                 self.assertFalse(out.exists())
 
 
+
+class DiskGuid(unittest.TestCase):
+    """The image's own GPT disk GUID (system design 3C, item 3.3)."""
+
+    def files(self, tmp, *contents):
+        paths = []
+        for i, data in enumerate(contents):
+            path = Path(tmp) / f"f{i}"
+            path.write_bytes(data)
+            paths.append(path)
+        return paths
+
+    def test_the_same_content_gives_the_same_guid_and_other_content_another(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            one = package.disk_guid(self.files(tmp, b"kernel", b"initramfs"))
+            again = package.disk_guid(self.files(tmp, b"kernel", b"initramfs"))
+            self.assertEqual(one, again)
+            self.assertNotEqual(one, package.disk_guid(self.files(tmp, b"kernel", b"initramfs!")))
+            # The files' bounds count: the same bytes split otherwise are another image.
+            self.assertNotEqual(one, package.disk_guid(self.files(tmp, b"kerneli", b"nitramfs")))
+            self.assertNotEqual(one, package.PLACEHOLDER)
+
+    def test_the_guid_is_sgdisks_text_form_of_a_version_8_guid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            guid = package.disk_guid(self.files(tmp, b"x"))
+        self.assertRegex(guid, r"^[0-9A-F]{8}-[0-9A-F]{4}-8[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$")
+
+    def test_the_payload_names_it_and_the_cloud_supervisor_passes_it_to_devices(self):
+        node = TOOL.parents[1]
+        image = (node / "cloud.image").read_text()
+        self.assertIn(f"  handle data:{package.DISK_GUID} disk.guid\n", image)
+        conf = (node / "cloud" / "node.conf").read_text()
+        self.assertIn("grant devices disk.guid disk.guid\n", conf)
+
+
 if __name__ == "__main__":
     unittest.main()

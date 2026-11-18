@@ -10,7 +10,9 @@
 //!    window over its 4 KiB of configuration space, one over each memory BAR, a range
 //!    of MSI slots, and a DMA resource for its requester id alone. It starts the
 //!    table's program with duplicates of those, a console and a listener, and
-//!    publishes the listener as `SERVICEn` in the directory.
+//!    publishes the listener as `SERVICEn` in the directory. When the boot gave it the
+//!    GUID of the node's image's disk (`disk.guid`, item 3.3), each driver is given it
+//!    too, read only, to tell the disk the node booted from.
 //! 4. It serves the directory on every `directory*` slot and control on every
 //!    `control*` slot, and watches each driver: one that ends is started again with
 //!    the same resources (its pages in flight wait in its DMA resource's quarantine
@@ -112,6 +114,8 @@ struct State {
     out: Console,
     roots: Roots,
     images: Vec<(String, Handle)>,
+    /// The boot payload's `disk.guid`, which every driver is given.
+    guid: Option<Handle>,
     devices: Vec<Device>,
     shutting: bool,
     restarted: u32,
@@ -156,6 +160,12 @@ impl State {
         handles.push((Some(dup(&d.msi, "msi")?), "msi"));
         handles.push((Some(dup(&d.dma, "dma")?), "dma"));
         handles.push((Some(theirs.0), "listen"));
+        if let Some(guid) = &self.guid {
+            let guid = guid
+                .duplicate(Rights::READ | Rights::MAP | Rights::TRANSFER)
+                .map_err(|e| format!("duplicating disk.guid: {}", e.name()))?;
+            handles.push((Some(guid), "disk.guid"));
+        }
         let escrow = self
             .guardian
             .publish(&process)
@@ -707,6 +717,7 @@ fn serve(out: &Console) -> Result<String, String> {
         out: console,
         roots,
         images,
+        guid: start::take("disk.guid"),
         devices,
         shutting: false,
         restarted: 0,
