@@ -39,6 +39,13 @@ fn credentials() -> (Certificate, Arc<ServerConfig>) {
     credentials_with_names(1)
 }
 fn credentials_with_names(count: usize) -> (Certificate, Arc<ServerConfig>) {
+    credentials_adjusted(count, |_| {})
+}
+/// A CA and a peer under it, the peer's certificate as `adjust` leaves it.
+fn credentials_adjusted(
+    count: usize,
+    adjust: impl FnOnce(&mut CertificateParams),
+) -> (Certificate, Arc<ServerConfig>) {
     let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let key = KeyPair::generate().unwrap();
@@ -48,10 +55,9 @@ fn credentials_with_names(count: usize) -> (Certificate, Arc<ServerConfig>) {
     for i in 1..count {
         names.push(format!("additional-{i}.ke2.test"));
     }
-    let leaf = CertificateParams::new(names)
-        .unwrap()
-        .signed_by(&leaf_key, &ca, &key)
-        .unwrap();
+    let mut leaf = CertificateParams::new(names).unwrap();
+    adjust(&mut leaf);
+    let leaf = leaf.signed_by(&leaf_key, &ca, &key).unwrap();
     let config =
         ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -359,13 +365,15 @@ fn tls_waits_for_the_wall_clock_then_verifies() {
     let (listening, address) = b
         .listen(Endpoint::new(Addr::v4(127, 0, 0, 1), 0), 2)
         .unwrap();
-    // While the wall clock is unset: refused, and the socket is untouched.
+    // While the wall clock is unset: refused before the socket is touched (no handshake byte
+    // reaches the peer), and the socket takes no plaintext after: no downgrade.
     let early = a.open(Target::Endpoint(address), None).unwrap();
-    let _early_peer = b.accept(listening).unwrap();
+    let early_peer = b.accept(listening).unwrap();
     assert_eq!(
         a.start_tls(early.socket, "peer.ke2.test".into()),
         Err(moruna_svc::CallError::Remote(net::Error::TlsUnavailable))
     );
+    refused_and_untouched(&mut a, early.socket, &mut b, early_peer.socket);
     // The clock is set: from now on TLS is verified against it, with nothing told to the
     // network server.
     page.store(UTC_NS, Ordering::Relaxed);
@@ -385,6 +393,131 @@ fn tls_waits_for_the_wall_clock_then_verifies() {
     a.shutdown(opened.socket).unwrap();
     drop(a);
     peer.join().unwrap();
+    drop(listener);
+    drop(slots);
+    server.join().unwrap();
+}
+
+/// After a `start_tls` refused before any handshake: the socket takes no plaintext (no
+/// downgrade), and once it is closed its peer has received nothing at all, no handshake byte.
+fn refused_and_untouched(a: &mut net::Client, socket: u32, b: &mut net::Client, peer: u32) {
+    assert_eq!(
+        common::send(a, socket, b"must-not-be-plaintext"),
+        Err(moruna_svc::CallError::Remote(net::Error::TlsFailed))
+    );
+    a.close(socket).unwrap();
+    let mut seen = Vec::new();
+    while let Ok(bytes) = common::receive(b, peer, 64) {
+        if bytes.is_empty() {
+            break;
+        }
+        seen.extend(bytes);
+    }
+    assert_eq!(seen, b"", "the peer received bytes from a refused socket");
+}
+
+/// A TLS server peer that records every application byte it decrypts, until the handshake or
+/// the connection fails.
+fn recording_peer(
+    mut c: net::Client,
+    listener: u32,
+    config: Arc<ServerConfig>,
+) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let opened = c.accept(listener).unwrap();
+        let mut tls = ServerConnection::new(config).unwrap();
+        let mut plain = Vec::new();
+        while let Ok(bytes) =
+            common::receive(&mut c, opened.socket, netstack_protocol::RECEIVE_MAX as u32)
+        {
+            if bytes.is_empty()
+                || tls.read_tls(&mut Cursor::new(bytes)).is_err()
+                || tls.process_new_packets().is_err()
+            {
+                break;
+            }
+            let _ = tls.reader().read_to_end(&mut plain);
+            let mut output = Vec::new();
+            tls.write_tls(&mut output).unwrap();
+            if !output.is_empty() && !send(&mut c, opened.socket, &output) {
+                break;
+            }
+        }
+        plain
+    })
+}
+
+/// UTC nanoseconds at midnight of a day.
+const JUNE_2025: u64 = 1_748_736_000_000_000_000;
+const JUNE_2026: u64 = 1_780_272_000_000_000_000;
+const JUNE_2027: u64 = 1_811_808_000_000_000_000;
+
+#[test]
+fn a_wall_clock_outside_the_peer_s_certificate_fails_the_handshake_and_moves_no_byte() {
+    // The peer's certificate is valid for 2026 only. Its chain is trusted, its name right: the
+    // wall clock alone decides.
+    for (wall, verified) in [(JUNE_2025, false), (JUNE_2027, false), (JUNE_2026, true)] {
+        let (ca, config) = credentials_adjusted(1, |leaf| {
+            leaf.not_before = rcgen::date_time_ymd(2026, 1, 1);
+            leaf.not_after = rcgen::date_time_ymd(2027, 1, 1);
+        });
+        let trust = Trust::new(vec![ca.der().to_vec()], wall_at(wall)).unwrap();
+        let (mut slots, server) = serve_with_tls(CONFIG, &[], no_external_cards(), Some(trust));
+        let listener = slots.remove("listen").unwrap();
+        let mut a = client(moruna_svc::connect(&listener).unwrap());
+        let mut b = client(moruna_svc::connect(&listener).unwrap());
+        let (l, at) = b
+            .listen(Endpoint::new(Addr::v4(127, 0, 0, 1), 0), 1)
+            .unwrap();
+        let opened = a.open(Target::Endpoint(at), None).unwrap();
+        let peer = recording_peer(b, l, config);
+        let started = a.start_tls(opened.socket, "peer.ke2.test".into());
+        if verified {
+            assert_eq!(started, Ok(()), "{wall}");
+            assert!(send(&mut a, opened.socket, b"ke2-private-data"));
+            a.shutdown(opened.socket).unwrap();
+            drop(a);
+            assert_eq!(peer.join().unwrap(), b"ke2-private-data");
+        } else {
+            // Before the certificate begins, and after it ends: no TLS, and no byte of the
+            // caller's goes anywhere, encrypted or plain.
+            assert_eq!(
+                started,
+                Err(moruna_svc::CallError::Remote(net::Error::TlsFailed)),
+                "{wall}"
+            );
+            assert!(common::send(&mut a, opened.socket, b"must-not-be-sent").is_err());
+            assert!(common::receive(&mut a, opened.socket, 32).is_err());
+            drop(a);
+            assert_eq!(peer.join().unwrap(), b"", "{wall}");
+        }
+        drop(listener);
+        drop(slots);
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn with_no_roots_start_tls_is_refused_whatever_the_wall_clock_says() {
+    // A server given no roots has no TLS at all: it takes no time either, so no clock, set or
+    // not, can make a handshake start. Refused before the socket is touched, as an unset clock
+    // is.
+    let (mut slots, server) = serve_with_tls(CONFIG, &[], no_external_cards(), None);
+    let listener = slots.remove("listen").unwrap();
+    let mut a = client(moruna_svc::connect(&listener).unwrap());
+    let mut b = client(moruna_svc::connect(&listener).unwrap());
+    let (l, at) = b
+        .listen(Endpoint::new(Addr::v4(127, 0, 0, 1), 0), 1)
+        .unwrap();
+    let opened = a.open(Target::Endpoint(at), None).unwrap();
+    let incoming = b.accept(l).unwrap();
+    assert_eq!(
+        a.start_tls(opened.socket, "peer.ke2.test".into()),
+        Err(moruna_svc::CallError::Remote(net::Error::TlsUnavailable))
+    );
+    refused_and_untouched(&mut a, opened.socket, &mut b, incoming.socket);
+    drop(a);
+    drop(b);
     drop(listener);
     drop(slots);
     server.join().unwrap();
