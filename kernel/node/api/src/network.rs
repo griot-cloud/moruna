@@ -16,6 +16,14 @@
 //! [`Network::take`] takes every answer that has come, [`Network::flush`] sends what is to
 //! send, and [`Network::wait`] waits for the next answer. A connection's memory is charged
 //! to the process's account, which the connection to the network server is bound to.
+//!
+//! **Read the channel to its end, file everything, then take each reply** (work item 1.3c).
+//! Asking the client core for one reply reads, and files, every other answer it meets
+//! first. Asked one id at a time, an answer that comes after its own id was asked for and is
+//! read while a later id's is looked for stays filed, untaken, with the channel empty:
+//! [`Network::wait`] is not woken for it, and its connection waits until something else
+//! comes. Filing first leaves none behind: one that comes after the channel was read to its
+//! end keeps it readable, and the next turn takes it.
 
 use alloc::{
     collections::{BTreeMap, VecDeque},
@@ -27,7 +35,8 @@ use core::cell::RefCell;
 
 use moruna_api_server::{Transport, TransportError};
 use moruna_svc::{
-    CallError, Channel, Encoder, Memory, Rights, Signals, WaitItem, Wire, frame::Frame, map, wait,
+    CallError, Channel, ClientCore, Encoder, Memory, Rights, Signals, WaitItem, Wire, frame::Frame,
+    map, wait,
 };
 use netstack_protocol::{Endpoint, Opened, net};
 
@@ -164,14 +173,31 @@ impl Network {
     }
 
     /// Takes every answer that has come, without waiting: the sockets accepted since, each
-    /// a new connection for the server.
+    /// a new connection for the server. The channel is read to its end first, then each
+    /// reply taken (see the module's rule).
     pub fn take(&mut self) -> Result<Vec<u32>, Error> {
+        self.take_reading(|core| core.file(0))
+    }
+
+    /// [`Network::take`], reading each answer there is with `read`: a client core's
+    /// `file(0)`, or a test's, which sends one more while the answers are read.
+    fn take_reading(
+        &mut self,
+        mut read: impl FnMut(&mut ClientCore) -> Result<(), CallError<u32>>,
+    ) -> Result<Vec<u32>, Error> {
+        loop {
+            match read(self.client.core()) {
+                Ok(()) => {}
+                Err(CallError::TimedOut) => break,
+                Err(error) => return Err(Error::Network("answers", CallError::typed(error))),
+            }
+        }
         let mut accepted = Vec::new();
         let ids: Vec<u32> = self.requests.keys().copied().collect();
         for id in ids {
-            let answer = match self.client.core().reply(id, 0) {
-                Err(CallError::TimedOut) => continue,
-                answer => answer.map_err(CallError::typed::<net::Error>),
+            let answer = match self.client.core().take_reply(id) {
+                None => continue,
+                Some(answer) => answer.map_err(CallError::typed::<net::Error>),
             };
             let Some(request) = self.requests.remove(&id) else {
                 continue;
@@ -417,6 +443,9 @@ fn decoded<T: Wire>(mut frame: Frame, what: &'static str) -> Result<T, Error> {
         .and_then(|value| decoder.finish().map(|()| value))
         .map_err(|_| Error::Network(what, CallError::Malformed))
 }
+
+#[cfg(test)]
+mod tests;
 
 /// One accepted connection, as the API server's transport.
 pub struct Conn {

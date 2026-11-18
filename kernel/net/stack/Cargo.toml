@@ -11,6 +11,7 @@ zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 smoltcp = { version = "=0.13.1", default-features = false, features = ["alloc", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-dhcpv4", "proto-dns", "socket-tcp-reno", "socket-tcp-cubic", "iface-max-addr-count-8", "iface-neighbor-cache-count-64", "dns-max-server-count-4", "dns-max-result-count-8", "auto-icmp-echo-reply"] }
 moruna-svc.workspace = true
 netstack-protocol = { path = "../protocol", version = "=0.1.0" }
+net-protocol = { path = "../../drivers/net-protocol", version = "=0.1.0" }
 
 rustls = { version = "=0.23.45", default-features = false, features = ["ring"] }
 

@@ -9,6 +9,7 @@
 extern crate alloc;
 
 pub mod boot;
+pub mod card;
 pub mod config;
 pub mod device;
 pub mod grant;
