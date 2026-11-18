@@ -277,47 +277,23 @@ fn requests_go_through_the_network_server_s_sockets() {
     server.join().unwrap();
 }
 
-/// The cloud profile's `network.conf` as item 1.3 writes it, with the supervisor's grant in
-/// place of `listen-api` (item 2.2c: the supervisor mints api's listener from it at each start,
-/// so it holds `listen` as well as `grant`), and the line item 1.4 adds.
-const NETWORK_CONF: &str = "moruna-netstack 1
-interface wan card=net0 dhcp
-grant listen-supervisor rights=grant,listen local=0.0.0.0/0@443
-";
+/// The cloud profile's `network.conf` and `node.conf` as committed (items 1.1, 1.3, 1.3b, 1.4,
+/// 1.9c and 2.2c), read from the files themselves so that no copy here can go stale.
+const NETWORK_CONF: &str = include_str!("../../../cloud/network.conf");
+const NODE_CONF: &str = include_str!("../../../cloud/node.conf");
 /// `platform`'s grant, with the local rule a connection needs to leave at all (PM, 2026-11-18).
 const PLATFORM_GRANT: &str = "grant listen-platform rights=connect \
      remote=169.254.169.254/32@80,168.63.129.16/32@80 local=0.0.0.0/0 sockets=4\n";
 
-/// The cloud profile's `node.conf` as items 1.1 and 1.3 write it, without 1.3's link of api's
-/// listener (item 2.2c), and the lines items 1.4 and 2.2c add.
-const NODE_CONF: &str = "moruna-node 1
-service devices image.devices 67108864
-bootstrap devices devices
-grant devices drivers drivers
-grant devices driver.virtio-blk driver.virtio-blk
-grant devices driver.virtio-net driver.virtio-net
-grant devices driver.nvme driver.nvme
-grant devices driver.gve driver.gve
-service network image.netstack 67108864
-service api image.api 67108864
-grant network config network.config
-link devices directory-net network directory
-";
-const PLATFORM_LINES: &str = "service platform image.platform 16777216
-bootstrap platform platform
-link network listen-platform platform network
-";
-/// api is started again when it dies, its listener minted at each start from the network
-/// server's `listen-supervisor`, its channel to platform sent as `api-started` (item 2.2c).
-const RESTART_LINE: &str =
-    "restart api network network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=64\n";
-
 #[test]
 fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
-    // node.conf: `platform` is the last service, so the supervisor starts it after `network` and
-    // `api`, with a 16 MiB account, a network listener and its link to `api`.
-    let text = format!("{NODE_CONF}{PLATFORM_LINES}{RESTART_LINE}");
-    let node = moruna_node::Config::parse(text.as_bytes(), 1 << 30).expect("node.conf");
+    // node.conf: on a machine that is not Hyper-V, which runs no `vmbus`, `platform` is the last
+    // service, so the supervisor starts it after `network` and `api`, with a 16 MiB account
+    // and a network listener.
+    let node = moruna_node::Config::parse(NODE_CONF.as_bytes(), 1 << 30).expect("node.conf");
+    let names: Vec<&str> = node.services.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["devices", "network", "api", "platform", "vmbus"]);
+    let node = node.on_machine(false);
     let names: Vec<&str> = node.services.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, ["devices", "network", "api", "platform"]);
     let platform = node.services.last().unwrap();
@@ -361,8 +337,8 @@ fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
     );
 
     // network.conf: the supervisor's grant covers the listener the record mints, and no more
-    // than listening on 443 and granting that.
-    let config = parse(&format!("{NETWORK_CONF}{PLATFORM_GRANT}")).expect("network.conf");
+    // than listening on 443 and granting that, with item 1.3b's bounds for api's listener.
+    let config = parse(NETWORK_CONF).expect("network.conf");
     let (_, supervisor) = config
         .grants
         .iter()
@@ -371,9 +347,21 @@ fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
     assert_eq!(supervisor.rights, rights::GRANT | rights::LISTEN);
     assert!(supervisor.covers(&restart.policy));
     assert!(config.grants.iter().all(|(slot, _)| slot != "listen-api"));
+    for policy in [supervisor, &restart.policy] {
+        assert_eq!(
+            (
+                policy.sockets,
+                policy.rx,
+                policy.tx,
+                policy.per_peer,
+                policy.linger_ms
+            ),
+            (81, Some(65536), Some(65536), Some(8), Some(5000))
+        );
+    }
 
     // platform's grant is taken as written, with connect as its only right, to the two
-    // addresses on port 80 and nowhere else, from any of the node's addresses, and four
+    // addresses on port 80 and nowhere else, from any of the node's addresses, and sixteen
     // sockets.
     let (_, policy) = config
         .grants
@@ -381,7 +369,7 @@ fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
         .find(|(slot, _)| slot == "listen-platform")
         .expect("platform's grant");
     assert_eq!(policy.rights, rights::CONNECT);
-    assert_eq!(policy.sockets, 4);
+    assert_eq!(policy.sockets, 16);
     let to = |a, b, c, d, port| Endpoint::new(Addr::v4(a, b, c, d), port);
     assert!(policy.may_connect(&to(169, 254, 169, 254, 80)));
     assert!(policy.may_connect(&to(168, 63, 129, 16, 80)));
@@ -433,7 +421,7 @@ fn the_node_s_address_is_its_wan_interface_s_ipv4_address() {
 #[test]
 fn a_node_that_dhcp_has_not_yet_answered_has_no_route_and_no_address() {
     // The cloud profile's interface, on a card where no DHCP server answers.
-    let (slots, server) = serve(&format!("{NETWORK_CONF}{PLATFORM_GRANT}"), &[CARD]);
+    let (slots, server) = serve(NETWORK_CONF, &[CARD]);
     let mut wan = Wan::new(client(&slots["listen-platform"])).unwrap();
     let soon = deadline_in(5 * SECOND);
     assert_eq!(
