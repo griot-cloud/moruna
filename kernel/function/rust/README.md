@@ -12,7 +12,9 @@ moruna_function::serve(|batch: RecordBatch, out: &mut Emit| -> Result<(), Functi
 - `Emit::batch` writes an output batch into a window, and may be called any number of times,
   none included;
 - a returned `FunctionError` ends the task with its message in the task's log;
-- `moruna_function::log` writes a line to the task's log.
+- `moruna_function::log` writes a line to the task's log;
+- `moruna_function::params` and `moruna_function::args` read the task's params and the run's
+  arguments, JSON objects (below).
 
 ## Write one
 
@@ -101,6 +103,30 @@ fn main() -> ExitCode {
 What `end` writes answers no input batch. `end` is called after every batch was answered and
 released and the engine posts no more, with no input too; an error from it ends the task as one
 from `batch` does. Unless a function implements it, `end` writes nothing.
+
+## Params and arguments
+
+A job gives a function task its `params`, a JSON object (`{"function": "taxi.score", "params":
+{"threshold": 0.5}}`), and a run its arguments. A function reads them with
+`moruna_function::params()` and `moruna_function::args()`, each a
+`Result<serde_json::Map<String, serde_json::Value>, FunctionError>`, so `?` takes them in
+`serve`'s closure:
+
+```rust
+fn score(batch: RecordBatch, out: &mut Emit) -> Result<(), FunctionError> {
+    let threshold = moruna_function::params()?
+        .get("threshold")
+        .and_then(|t| t.as_f64())
+        .ok_or("the params name no threshold")?;
+    …
+}
+```
+
+They are the process's `MORUNA_PARAMS` and `MORUNA_ARGS` (`docs/images.md`), which every function
+is given, native or image: on the core std reads them from the process's start slot `env`. Each is
+`{}` when the task was given none, or when the program runs outside a job; one that is not a JSON
+object is an error naming the variable. On a host, `host::Plane` runs the function in the test's
+own process, which sets the variables (`tests/params.rs`).
 
 ## What `serve` promises, and what it asks
 

@@ -47,6 +47,14 @@ What `moruna.function` returns is a `moruna.Function` (see [Tasks](python-run.md
 | `fingerprint` | `str` | 64-character lowercase hexadecimal fingerprint. |
 | `build(...)` | method | Packages the function as an OCI image; see below. |
 
+## `moruna.params`
+
+```python
+moruna.params() -> dict
+```
+
+The task's params: the JSON object a job gives the function's task (`{"kind": "function", "function": "taxi.score", "params": {"threshold": 0.5}}`), which its process reads as `MORUNA_PARAMS` (see [Images and ports](images.md#the-contract)). It is `{}` when the task was given none, or when the code runs outside a job, and a value that is not a JSON object raises `ValueError` naming the variable. A function reads its params the same way in each SDK, native or image: `moruna_function::params()` in Rust and `moruna_params()` in C. Inside an image Moruna builds, `moruna.params()` is the stand-in module's, and reads the same. The image's shim also constructs a class task with its params, and refuses params for a decorated function.
+
 ## Building functions into images
 
 A function is built into an OCI image with the job it is a task of: `job.build()` or `moruna build`, one image per task (see [Jobs and `moruna.run`](python-run.md#building-images) and [Images and ports](images.md)). A decorated function's image runs it as the shim calls it: its `wrapped` callable for each batch, or, stateful, `setup` once and `finish` at the end.

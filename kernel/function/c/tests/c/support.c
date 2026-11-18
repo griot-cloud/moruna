@@ -94,6 +94,12 @@ void int64_column(struct ArrowArray *out, const int64_t *values, const uint8_t *
   out->null_count = nulls;
 }
 
+void float64_column(struct ArrowArray *out, const double *values, int64_t n) {
+  const void *bytes[2] = {NULL, values};
+  size_t lens[2] = {0, (size_t)n * sizeof *values};
+  array(out, n, 2, bytes, lens);
+}
+
 void utf8_column(struct ArrowArray *out, const int32_t *offsets, const char *data, int64_t n) {
   const void *bytes[3] = {NULL, offsets, data};
   size_t lens[3] = {0, (size_t)(n + 1) * sizeof *offsets, strlen(data) + 1};

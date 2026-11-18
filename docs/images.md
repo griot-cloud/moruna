@@ -44,7 +44,7 @@ Moruna starts the image's entrypoint and command, as its config names them, in a
 | --- | --- |
 | `MORUNA_ENTRY` | The task's entry, as its spec names it. |
 | `MORUNA_ROLE` | `source`, `function` or `sink`. |
-| `MORUNA_PARAMS` | The task's params, a JSON object (`{}` when it has none). |
+| `MORUNA_PARAMS` | The task's params, a JSON object (`{}` when it has none). A registered native function's process gets the same four variables (its entry its registered name), in its start slot `env`, and each SDK reads them one way: `moruna_function::params()` in Rust, `moruna_params()` in C, `moruna.params()` in Python. |
 | `MORUNA_ARGS` | The run's arguments, a JSON object. |
 | `MORUNA_PORTS` | The task's ports, a JSON array of names in name order; absent when it has none. |
 | `MORUNA_PORT_SOCKET` | The socket its ports are called on: `fd:N`, a descriptor the process inherits, or `unix:PATH`; absent when it has no port. |
@@ -57,7 +57,7 @@ What it reads and writes depends on its role. Every stream is one Arrow IPC stre
 
 What a process writes on its standard error is the task's log. Any other exit status, a stream that is not Arrow IPC, or a function that writes more or fewer batches than it read, fails the task, and the error quotes the end of the standard error. A run on a Linux node starts the process in its own namespaces and cgroup, with a seccomp filter and no network; on the Moruna kernel a function runs as a task of the data plane.
 
-An image Moruna builds has four kinds of layer: the runtime (`python:3.14-slim`, by digest), one layer per Python distribution its code imports (so tasks that import the same distribution share its layer), the shim, and the task's own code with its bytecode. Its entrypoint is the shim, `python3 /opt/moruna/shim.py --workdir /app`, and its config sets `MORUNA_ENTRY`, so the image also runs by itself under any OCI runtime, Arrow IPC in and out: Inside it, the `moruna` module holds only `Task`, `Source`, `Function`, `Sink`, `Split`, `function` and `polars`, not the engine, so a task's module must not build its job when it is imported: write the job in a module of its own that imports the tasks (`jobs.py`), and build that (`moruna build jobs:job`). Each image's process gets `HOME=/tmp`, the one place it may write, and no user site-packages (`PYTHONNOUSERSITE=1`), so nothing at its start looks the user up.
+An image Moruna builds has four kinds of layer: the runtime (`python:3.14-slim`, by digest), one layer per Python distribution its code imports (so tasks that import the same distribution share its layer), the shim, and the task's own code with its bytecode. Its entrypoint is the shim, `python3 /opt/moruna/shim.py --workdir /app`, and its config sets `MORUNA_ENTRY`, so the image also runs by itself under any OCI runtime, Arrow IPC in and out: Inside it, the `moruna` module holds only `Task`, `Source`, `Function`, `Sink`, `Split`, `function`, `params` and `polars`, not the engine, so a task's module must not build its job when it is imported: write the job in a module of its own that imports the tasks (`jobs.py`), and build that (`moruna build jobs:job`). Each image's process gets `HOME=/tmp`, the one place it may write, and no user site-packages (`PYTHONNOUSERSITE=1`), so nothing at its start looks the user up.
 
 ```sh
 podman run -i --rm -e MORUNA_PARAMS='{"table": "alerts"}' oci:images:sha256:6f1c... < in.arrows > out.arrows

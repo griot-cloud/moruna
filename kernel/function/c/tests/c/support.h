@@ -24,6 +24,8 @@ void counted_free(void *p);
 
 /* A column of n Int64 values, null where valid is not NULL and valid[i] is 0. */
 void int64_column(struct ArrowArray *out, const int64_t *values, const uint8_t *valid, int64_t n);
+/* A column of n Float64 values, none null. */
+void float64_column(struct ArrowArray *out, const double *values, int64_t n);
 /* A Utf8 column of n strings, its offsets as given (n + 1 of them). */
 void utf8_column(struct ArrowArray *out, const int32_t *offsets, const char *data, int64_t n);
 /* An Int32 dictionary column of n keys into a Utf8 dictionary of m strings. */

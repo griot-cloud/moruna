@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use moruna_function::{
-    moruna_emit, moruna_error, moruna_finish, moruna_log, moruna_next, moruna_open,
+    moruna_emit, moruna_error, moruna_finish, moruna_log, moruna_next, moruna_open, moruna_params,
 };
 
 unsafe extern "C" {
@@ -31,6 +31,7 @@ unsafe extern "C" {
     pub fn moruna_test_cpp_sizes() -> usize;
     pub fn moruna_test_codes(codes: *mut c_int);
     pub fn moruna_test_sum() -> c_int;
+    pub fn moruna_test_params() -> c_int;
 }
 
 /// What a C `main` returns, as the program's exit code.
@@ -62,4 +63,6 @@ pub fn without_a_task() {
         moruna_error(task, ptr::null());
         assert_eq!(moruna_finish(task), 2);
     }
+    // Named, not called: its first call reads the params once for the program (tests/params.rs).
+    std::hint::black_box(moruna_params as extern "C" fn() -> *const std::ffi::c_char);
 }
