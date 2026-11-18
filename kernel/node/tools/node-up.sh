@@ -29,7 +29,8 @@
 # It returns once `moruna: network` is on the console (exit 0), within 120 s under KVM or 300 s
 # under the emulator, and prints how long after QEMU's start it came, QEMU left running with its
 # process ID in OUT/qemu.pid. When a `moruna: fatal` line comes first it prints it, waits up to
-# 30 s for the machine to power itself off, says whether it did, and exits 1. It exits 1 too
+# 90 s for the machine to power itself off (the node's 60 s hold after a fatal line, system
+# design 1B, and 30 s), says whether it did, and exits 1. It exits 1 too
 # when QEMU ends first, and 124 when the time runs out. On each of those QEMU is stopped.
 set -euo pipefail
 
@@ -160,12 +161,12 @@ while :; do
     fi
     if line="$(grep -m 1 -F -- "moruna: fatal" "$console")"; then
       echo "node-up: \"$line\" $(elapsed) s after QEMU's start" >&2
-      for _ in $(seq 150); do
+      for _ in $(seq 450); do
         running || break
         sleep 0.2
       done
       if running; then
-        echo "node-up: the machine did not power off within 30 s of the fatal line" >&2
+        echo "node-up: the machine did not power off within 90 s of the fatal line" >&2
         stop
       else
         echo "node-up: the machine powered off $(elapsed) s after QEMU's start" >&2

@@ -57,13 +57,19 @@ mod qemu_isa_debug {
 // moruna: ACPI S5, the power-off every machine has (Moruna's system design, section 1B).
 // The QEMU device above stays first, for the exit codes CI reads; no cloud has it.
 mod acpi_s5;
+// moruna: the hold before a failed machine enters S5 (section 1B, work item 1.6c).
+mod hold;
 
 /// moruna: enters ACPI S5: SLP_TYPa from the DSDT's `\_S5` package, written with SLP_EN to
 /// the FADT's PM1a control register. Returns if the firmware describes no such power-off,
 /// or if the machine is still running some time after the write.
 ///
+/// A machine that failed has printed its `moruna: fatal` line: it stays halted for
+/// `hold::HOLD_SECONDS` before the write, so a cloud's console can still be read (section
+/// 1B, work item 1.6c). QEMU's test exit device, tried before this, ends a CI run at once.
+///
 /// Keep this panic-free: the panic handler powers the machine off through it.
-fn try_acpi_s5() {
+fn try_acpi_s5(code: crate::power::ExitCode) {
     use acpi::{address::AddressSpace, fadt::Fadt};
 
     use super::kernel::{acpi::get_acpi_tables, tsc::boot_wait};
@@ -109,10 +115,17 @@ fn try_acpi_s5() {
     let Some(slp_typa) = acpi_s5::slp_typa(aml) else {
         return;
     };
-    // SAFETY: The port is the PM1a control register the firmware's FADT names. Writing
-    // SLP_TYPa with SLP_EN to it powers the machine off; it cannot corrupt the kernel's
-    // memory.
-    unsafe { PortWrite::write_to_port(port, acpi_s5::pm1a_control(slp_typa)) };
+    hold::power_off(
+        matches!(code, crate::power::ExitCode::Failure),
+        || {
+            let count = hold::count(super::tsc_freq());
+            hold::wait(super::read_tsc, core::hint::spin_loop, count);
+        },
+        // SAFETY: The port is the PM1a control register the firmware's FADT names. Writing
+        // SLP_TYPa with SLP_EN to it powers the machine off; it cannot corrupt the kernel's
+        // memory.
+        || unsafe { PortWrite::write_to_port(port, acpi_s5::pm1a_control(slp_typa)) },
+    );
     // A hypervisor may run this CPU a little longer before it acts on the write. Wait for
     // it, within the boot waits' deadline, so that a power-off that worked is not reported
     // as one that failed.
@@ -141,8 +154,8 @@ pub(super) fn init() {
 /// neither powers the machine off, it returns, and the caller halts every CPU.
 pub fn try_poweroff(code: crate::power::ExitCode) {
     qemu_isa_debug::try_exit_qemu(code);
-    // moruna: then ACPI S5, which every machine has.
-    try_acpi_s5();
+    // moruna: then ACPI S5, which every machine has, after the hold when it failed.
+    try_acpi_s5(code);
 }
 
 /// Attempts to restart the system using an architecture-specific mechanism.

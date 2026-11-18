@@ -6,6 +6,8 @@
 //!
 //! - `src/arch/x86/power/acpi_s5.rs`: SLP_TYPa from a DSDT's `\_S5` package, and the value
 //!   the PM1a control register takes (the system design, section 1B, power-off);
+//! - `src/arch/x86/power/hold.rs`: the 60 s a failed machine stays halted after its fatal
+//!   line before it powers off (section 1B, failure; work item 1.6c);
 //! - `src/arch/x86/kernel/tsc/boot_wait.rs`: the deadline of the two calibration waits
 //!   (section 1B, no wait without a deadline in boot code);
 //! - `src/arch/x86/cpu/hypervisor.rs`: which hypervisor the machine runs on, where the
@@ -26,6 +28,11 @@ mod acpi_s5;
 #[cfg(test)]
 #[path = "../../vendor/ostd-0.19.0/src/arch/x86/kernel/tsc/boot_wait.rs"]
 mod boot_wait;
+#[cfg(test)]
+#[path = "../../vendor/ostd-0.19.0/src/arch/x86/power/hold.rs"]
+mod hold;
+#[cfg(test)]
+mod hold_tests;
 #[cfg(test)]
 #[path = "../../vendor/ostd-0.19.0/src/arch/x86/cpu/hypervisor.rs"]
 mod hypervisor;

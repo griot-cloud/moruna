@@ -435,8 +435,8 @@ tr -d '\r' < <RUN>/console.log | grep -a -o 'moruna: cloud azure instance [^ ]*'
   `moruna: ready api=<address>:443 boot_ms=<n>`, with the machine's private address: the public
   one is Azure's, outside the machine.
 - **`boot_ms`** is on the `ready` line (1B).
-- **`moruna: fatal <stage>: <reason>`** is the node refusing to run. It then powers off by ACPI S5,
-  and the machine shows as stopped.
+- **`moruna: fatal <stage>: <reason>`** is the node refusing to run. It stays halted for 60 s, then
+  powers off by ACPI S5, and the machine shows as stopped.
 - The log starts with the firmware's own output, which holds terminal escapes, and its lines end
   in a carriage return, which `tr` takes out.
 

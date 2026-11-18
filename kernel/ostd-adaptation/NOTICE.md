@@ -46,6 +46,13 @@ section 1B; work item 1.2). Each patch is marked with a `moruna:` comment:
   `power::init` has run (a boot wait whose deadline passed) writes the test exit device's
   port too, when the CPU reports QEMU. S5 is not tried before the IRQ chip is up: until
   then a panic may come from reading the ACPI tables, which must not be entered twice.
+- **The hold before a failed machine powers off** (`src/arch/x86/power.rs`; section 1B,
+  failure; work item 1.6c). A power-off for a failure (`ExitCode::Failure`: a fatal line,
+  a panic) waits 60 s on the TSC before the S5 write, the CPU pausing with nothing else to
+  do, so a cloud console that is served only while the machine runs (OpenStack's) can
+  still be read. Before the TSC's rate is known (a fatal line of its own calibration) it
+  counts 60 s at 4 GHz, the fastest rate a cloud CPU runs. QEMU's test exit device, tried
+  first, ends a CI run at once as before; a power-off for success does not wait.
 - **Deadlines on the two calibration waits** (`src/arch/x86/kernel/tsc.rs`,
   `src/arch/x86/timer/apic.rs`). The PIT calibration of the TSC and of the APIC timer each
   halted until the next PIT interrupt, for ever on a machine with no PIT. Each now pauses
@@ -60,10 +67,12 @@ section 1B; work item 1.2). Each patch is marked with a `moruna:` comment:
   the machine off. `src/arch/x86/mod.rs` gives the deadline's module the name
   `arch::boot_wait`, by which code outside `arch` reaches it.
 
-Their arithmetic is in two added files that name nothing of OSTD:
+Their arithmetic is in three added files that name nothing of OSTD:
 `src/arch/x86/power/acpi_s5.rs` (the scan of a DSDT for `_S5_`, the package's first
-element, the PM1a value) and `src/arch/x86/kernel/tsc/boot_wait.rs` (the wait, its
-deadline and the three waits' lines).
+element, the PM1a value), `src/arch/x86/power/hold.rs` (the hold's length, its count of
+the TSC, the wait and the order of hold and power-off) and
+`src/arch/x86/kernel/tsc/boot_wait.rs` (the wait, its deadline and the three waits'
+lines).
 
 It also adds what the core needs on Hyper-V (`architecture/moruna-os-system.md`, section
 1F, "The core on Hyper-V"; work item 1.8). Each patch is marked with a `moruna:` comment:
