@@ -33,8 +33,9 @@ use super::{Context, Entry, RunnableKind, Stage};
 /// The `function` kind: a function task.
 pub struct Function;
 
-/// The kind's name, which a job's task names as its kind (system design 3E).
-pub const KIND: &str = "function";
+/// The kind's name, which a job's task names as its kind (system design 3E): the job's own
+/// [`moruna_job::FUNCTION_KIND`], by which the check finds the functions a job uses.
+const KIND: &str = moruna_job::FUNCTION_KIND;
 
 /// A `function` entry's settings.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
