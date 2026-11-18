@@ -323,8 +323,9 @@ class FakeNode:
             return 201, json.dumps({"id": f"j{self.jobs}"}).encode()
         if path.endswith("/cancel"):
             return 200, b"{}"
-        return 200, json.dumps({"id": path.split("/")[3], "state": "completed", "submitted": 101, "started": 102,
-                                "ended": 105, "exit_code": 0}).encode()
+        return 200, json.dumps({"id": path.split("/")[3], "state": "completed", "submitted": 101,
+                                "submitted_ms": 101_250, "started": 101, "started_ms": 101_999, "ended": 105,
+                                "ended_ms": 105_004, "exit_code": 0}).encode()
 
     def stream(self, method, path, token=None):
         self.calls.append((method, path, token))
@@ -439,10 +440,13 @@ def test_a_whole_run_against_fakes(tmp_path):
     assert sum("get-boot-log" in a for a in x.azs) == 3
     node_rec = json.load(open(tmp_path / "node" / "score-moruna-node-r1.json"))
     # Operational time is the engine's own wall, its report's 3,000 ms; start-up is the job record's
-    # submitted (101 s) to started (102 s), within 1 s; the node's job bound (13 GiB) is each
-    # job's budget. The end-to-end time by this machine's clock is kept, and the boot.
-    assert (node_rec["operational_s"], node_rec["startup_s"], node_rec["ok"]) == (3.0, 1, True)
-    assert node_rec["operational_by"] == "the engine's report, wall_ms" and node_rec["startup_within_s"] == 1
+    # submitted_ms to started_ms, 749 ms, though both are the same whole second (item 2.4); the
+    # node's job bound (13 GiB) is each job's budget. The end-to-end time by this machine's clock is
+    # kept, and the boot.
+    assert (node_rec["operational_s"], node_rec["startup_s"], node_rec["ok"]) == (3.0, 0.749, True)
+    assert node_rec["operational_by"] == "the engine's report, wall_ms" and node_rec["startup_within_s"] is None
+    assert node_rec["startup_by"] == "the node's job record, submitted_ms to started_ms"
+    assert node_rec["marks"]["node_times"] == {"submitted": 101.25, "started": 101.999, "ended": 105.004}
     assert node_rec["marks"]["first_rows_s"] == 1.0 and node_rec["marks"]["wall_ms"] == 3000.0
     assert node_rec["marks"]["end_to_end_s"] >= 0 and node_rec["boot_ms"] == 2140
     assert node_rec["memory_gib"] == 13.0 and node_rec["data"] == "blob" and node_rec["cpu_s"] == 20.0
@@ -457,7 +461,7 @@ def test_a_whole_run_against_fakes(tmp_path):
     assert s["duckdb"]["operational_s"] == 12.0 and s["duckdb"]["output"] == "bit for bit"
     assert "duckdb-sql" not in s and "duckdb-sql" in x.summary["jobs"]["enrich"]["engines"]
     table_text = open(tmp_path / "table.md").read()
-    assert ("| Moruna 0.7, the node | rust | 3.0 | 1.00 (±1 s) | 20.0 | 3.00 | 13.00 | blob | 0.7 | 0.3 | 4.0 | 0.2 | 0.3 | "
+    assert ("| Moruna 0.7, the node | rust | 3.0 | 0.75 | 20.0 | 3.00 | 13.00 | blob | 0.7 | 0.3 | 4.0 | 0.2 | 0.3 | "
             "0.0 | bit for bit | 5/5 |") in table_text
     assert "| the plain Rust pool | rust | 4.5 | 0.50 | 30.0 | 2.00 | 14.00 | local copy, 3.0 s apart |" in table_text
     log = open(tmp_path / "benchmark-log.md").read()

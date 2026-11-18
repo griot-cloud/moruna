@@ -418,7 +418,8 @@ class Bench:
         name, the inputs and output in the run's container, the account key by secret name), its
         events followed over SSE to the exit. Every engine's operational time is its own wall on
         the machine that ran it (the PM, 2026-11-18): Moruna's is its report's `wall_ms`. Its
-        start-up is the node's `submitted` to `started`, whole seconds, so within 1 s. Every mark
+        start-up is the node's `submitted` to `started`: to the millisecond from their `_ms` fields
+        (item 2.4), or on a node without them whole seconds, so within 1 s. Every mark
         is kept: this machine's end-to-end time (the answer to the exit seen), the boot's
         `boot_ms` and the first rows at the sink among them. A job the node refuses, or that is
         not followed to its end, is a failed run, and the next run goes on."""
@@ -451,18 +452,24 @@ class Bench:
         report = (got.report or {}).get("report") or {}
         resources = report.get("resources") or {}
         wall_ms = report.get("wall_ms")
-        started, submitted = j.get("started"), j.get("submitted")
+        # The node's times, to the millisecond where it gives them (item 2.4).
+        times = node_api.job_times(j)
+        started, submitted = times["started"], times["submitted"]
+        to_ms = j.get("started_ms") is not None and j.get("submitted_ms") is not None
+        startup = None if started is None or submitted is None else round(started - submitted, 3)
         rec.update({
             "state": j.get("state"), "exit": got.exit,
             "ok": j.get("state") == "completed" and got.exit.get("code") == 0,
             "operational_s": round(wall_ms / 1e3, 3) if isinstance(wall_ms, (int, float)) else None,
             "operational_by": "the engine's report, wall_ms",
-            "startup_s": started - submitted if isinstance(started, int) and isinstance(submitted, int) else None,
-            "startup_by": "the node's job record, submitted to started, whole seconds",
-            "startup_within_s": 1,
+            "startup_s": startup,
+            "startup_by": ("the node's job record, submitted_ms to started_ms" if to_ms
+                           else "the node's job record, submitted to started, whole seconds"),
+            # Whole seconds are marked ± in the table; milliseconds, as the others' times, are not.
+            "startup_within_s": None if to_ms else 1,
             "marks": {"sent": t_sent, "answered": t_answered, "exit_seen": t_seen,
                       "end_to_end_s": round(t_seen - t_answered, 3),
-                      "node_times": {k: j.get(k) for k in ("submitted", "started", "ended")},
+                      "node_times": times,
                       "wall_ms": wall_ms, "first_rows_s": node_api.first_rows_s(got.events()),
                       "resumed": got.resumed},
             "cpu_s": resources.get("cpu_core_s"),

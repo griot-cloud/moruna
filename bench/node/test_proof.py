@@ -83,7 +83,8 @@ class FakeNode:
             return ok({"id": jid, "state": "cancelled"})
         if path.endswith("/report"):
             return ok(job["report"]["report"])
-        return ok({"id": jid, "state": job["state"], "submitted": 100, "started": 101, "ended": 104,
+        return ok({"id": jid, "state": job["state"], "submitted": 100, "submitted_ms": 100_125,
+                   "started": 100, "started_ms": 100_874, "ended": 104, "ended_ms": 104_002,
                    "exit_code": job["exit"]["code"]})
 
     def start(self, body):
@@ -259,7 +260,9 @@ def test_a_whole_proof_passes(world):
     for job in ("score", "enrich"):
         r = result(world, f"{job}-2024-01")
         assert r["ok"] and r["state"] == "completed" and r["output_check"]["verdict"] == "bit for bit"
-        assert r["records"] == 5 and r["first_rows_s"] == 1.5 and r["times"]["ended"] == 104
+        assert r["records"] == 5 and r["first_rows_s"] == 1.5
+        # The node's times, to its millisecond (item 2.4).
+        assert r["times"] == {"submitted": 100.125, "started": 100.874, "ended": 104.002}
         assert r["output_check"]["rows_mine"] == expected(job).num_rows
     s = json.load(open(world / "res" / "proof.json"))
     assert s["ok"] and [x["id"] for x in s["runs"]] == ["score-2024-01", "enrich-2024-01"]
@@ -522,6 +525,19 @@ def test_server_sent_events_are_read_with_their_numbers():
                       ("report", None, {"r": 1}), ("heartbeat", None, {})]:
         f.take(e, rid, d)
     assert f.events() == [{"n": 1}, {"n": 2}] and f.last == 2 and f.report == {"r": 1} and f.exit is None
+
+
+def test_a_job_s_times_are_its_milliseconds_where_the_node_gives_them():
+    # A node with item 2.4: each time to the millisecond, beside its whole seconds.
+    record = {"state": "completed", "submitted": 1794931200, "submitted_ms": 1794931200250,
+              "started": 1794931200, "started_ms": 1794931200999, "ended": 1794931221, "ended_ms": 1794931221251}
+    times = node_api.job_times(record)
+    assert times == {"submitted": 1794931200.25, "started": 1794931200.999, "ended": 1794931221.251}
+    assert round(times["started"] - times["submitted"], 3) == 0.749
+    # A node without them: its whole seconds; a time the job has not reached yet is None.
+    assert node_api.job_times({"submitted": 100, "started": 101}) == {"submitted": 100, "started": 101, "ended": None}
+    assert node_api.job_times({"submitted": 100, "submitted_ms": 100_001, "state": "starting"}) == {
+        "submitted": 100.001, "started": None, "ended": None}
 
 
 def test_comparisons_that_cannot_be_made(tmp_path, monkeypatch):

@@ -100,7 +100,8 @@ def summarise(records, plan: dict) -> dict:
                 "copy_s": med([(r.get("copy_in_s") or 0) + (r.get("copy_out_s") or 0) or None for r in ok]),
                 "operational_s": med([r.get("operational_s") for r in ok]),
                 "startup_s": med([r.get("startup_s") for r in ok]),
-                # Moruna's start-up is read from whole seconds: within this many.
+                # Moruna's start-up is to the millisecond, or from a node without item 2.4 whole
+                # seconds: within this many.
                 "startup_within_s": max((r.get("startup_within_s") or 0 for r in ok), default=0) or None,
                 "cpu_s": med([r.get("cpu_s") for r in ok]),
                 "peak_gib": med([(r.get("peak_bytes") or 0) / (1 << 30) or None for r in ok]),
