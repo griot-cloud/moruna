@@ -1,0 +1,16 @@
+[package]
+name = "relibc-moruna"
+description = "relibc's platform on Moruna: what a C library's system calls are on the core, over moruna-sys (system design 5B)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# On the core: the kernel's calls. On a host the crate runs on stand-ins (src/os.rs), so its
+# logic is tested where moruna-sys cannot build.
+[target.'cfg(target_os = "moruna")'.dependencies]
+moruna-abi.workspace = true
+moruna-sys.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("moruna"))'] }
