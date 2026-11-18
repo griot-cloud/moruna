@@ -520,9 +520,9 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
   event records, `report` and `exit`.
 - **The budget** is the job document's `budget.memory_bytes`: the job's whole memory, and its
   account is exactly that. A document that names no budget gets the node's job bound
-  (`job_memory_bytes`): a node runs one job, so its memory is the job's. It is filled in before the
-  check, so `validate` and the report say the budget the job ran with. Found by 1.3c: a copy with no
-  budget ran at the engine's host default of 326 MiB on a 2 GiB node and ran out of memory. In node mode the engine sizes itself from it: 128 MiB of engine overhead,
+  (`job_memory_bytes`): a node runs one job, so its memory is the job's. The report says the budget
+  the job ran with. (On a 2 GiB node the bound is 590,229,504 bytes, and the engine's 326 MiB arena
+  and 108 MiB scratch are this section's split of it.) In node mode the engine sizes itself from it: 128 MiB of engine overhead,
   scratch at 1/4 of the remainder (unless the document names a staging volume), the arena the rest.
   **The arena bounds how far reading runs ahead, never how many workers decode.** A read that does
   not fit beside those in flight is cut to the room left, from a split that can be cut (a Parquet
