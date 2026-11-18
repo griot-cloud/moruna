@@ -27,6 +27,9 @@
 //!
 //! - The virtual function: a `SendVfAssociation` is acknowledged and ignored, and
 //!   nothing here sends `SwitchDataPath`.
+//! - The send indirection table (`SendIndirectionTable`, NVSP 5), which says which channel
+//!   each flow's frames go on: taken and ignored wherever it comes, acknowledged if asked,
+//!   since the card sends on its one channel ([`Netvsc::take_table`] says the first).
 //! - Sub-channels, checksum and segmentation offloads, VLAN, receive-segment coalescing:
 //!   not offered in the NDIS configuration and not used.
 //! - Frames are never sent by guest page numbers, only from send-buffer sections. A

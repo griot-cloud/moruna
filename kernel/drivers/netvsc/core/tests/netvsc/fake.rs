@@ -528,6 +528,9 @@ pub struct Host {
     /// What the host ignored, as Hyper-V does: packets that asked for a completion under
     /// transaction ID 0, and queries whose input offset lies inside their fields.
     pub ignored: usize,
+    /// Send indirection tables sent asking for a completion, by transaction, until the
+    /// guest acknowledges them.
+    pub tables_asked: Vec<u64>,
 
     // What happened.
     /// Every version the guest offered, in order.
@@ -657,6 +660,7 @@ impl Host {
             filter: 0,
             receive_id: None,
             ignored: 0,
+            tables_asked: Vec::new(),
             offers: Vec::new(),
             messages: Vec::new(),
             frames: Vec::new(),
@@ -1301,6 +1305,13 @@ impl Host {
     /// A completion from the guest: it gives receive sections back, or acknowledges what
     /// the host said of a virtual function.
     fn completed(&mut self, transaction: u64, payload: &[u8]) {
+        if let Some(at) = self.tables_asked.iter().position(|t| *t == transaction) {
+            self.tables_asked.remove(at);
+            if !payload.is_empty() {
+                self.violation("an acknowledgement of the table with a payload".into());
+            }
+            return;
+        }
         if transaction == VF_TRANSACTION {
             self.vf_acknowledged += 1;
             if !payload.is_empty() {
@@ -1395,6 +1406,32 @@ impl Host {
             },
         );
         self.emit(Out::InBand(Some(VF_TRANSACTION), message));
+    }
+
+    /// Sends the send indirection table, as netvsp's `guest_send_indirection_table`
+    /// does: sixteen entries after the message's fields, in a packet that asks for no
+    /// completion; or, with `transaction`, one that asks for one under it.
+    pub fn send_table(&mut self, transaction: Option<u64>) {
+        let entries = 16u32;
+        let offset = (size_of::<protocol::MessageHeader>()
+            + size_of::<protocol::Message5SendIndirectionTable>()) as u32;
+        let mut message = [
+            protocol::MESSAGE5_TYPE_SEND_INDIRECTION_TABLE.as_bytes(),
+            protocol::Message5SendIndirectionTable {
+                table_entry_count: entries,
+                table_offset: offset,
+            }
+            .as_bytes(),
+        ]
+        .concat();
+        // Every flow on channel 0: one channel is open.
+        for _ in 0..entries {
+            message.extend_from_slice(&0u32.to_le_bytes());
+        }
+        if let Some(transaction) = transaction {
+            self.tables_asked.push(transaction);
+        }
+        self.emit(Out::InBand(transaction, message));
     }
 
     /// Delivers a frame to the guest once the filter lets it through and a section is

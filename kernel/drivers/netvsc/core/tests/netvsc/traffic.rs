@@ -379,6 +379,58 @@ fn a_virtual_function_offered_is_acknowledged_and_ignored_and_traffic_continues(
 }
 
 #[test]
+fn the_send_indirection_table_is_taken_and_ignored_during_the_start_and_after() {
+    // Hyper-V sends the table from NVSP 5 (Linux and FreeBSD both take it); the card sends
+    // on one channel, so the table has nothing to steer. The host sends one before the
+    // receive buffer's completion, another with RNDIS initialisation's answer, asking for
+    // an acknowledgement, and a third once the card runs.
+    let mut parts = crate::fake::parts(16 * PAGE, 16 * PAGE, ROOMY);
+    let host = parts.host.clone();
+    host.borrow_mut().mangle = Some(Box::new(|host, step, _| {
+        match step {
+            crate::fake::Step::Answer(protocol::MESSAGE1_TYPE_SEND_RECEIVE_BUFFER) => {
+                host.send_table(None)
+            }
+            crate::fake::Step::Rndis(rndisprot::MESSAGE_TYPE_INITIALIZE_CMPLT) => {
+                host.send_table(Some(0x7ab1e))
+            }
+            _ => {}
+        }
+        crate::fake::Fate::Send
+    }));
+    host.borrow_mut().flush(parts.channel.host());
+    let mut lines = Vec::new();
+    let mut card = moruna_netvsc::Netvsc::start_saying(
+        parts.channel,
+        parts.receive,
+        parts.send,
+        Some(crate::fake::DEADLINE),
+        &mut |line| lines.push(line.to_string()),
+    )
+    .unwrap_or_else(|e| panic!("the card did not start: {e}"));
+    // One line, the first time, whatever came after.
+    let told: Vec<&String> = lines.iter().filter(|l| l.contains("indirection")).collect();
+    assert_eq!(
+        told,
+        ["send indirection table of 16 entries ignored: one channel is served"]
+    );
+    assert!(
+        host.borrow().tables_asked.is_empty(),
+        "the table that asked for an acknowledgement got one"
+    );
+    // After the start: ignored, and not said again.
+    host.borrow_mut().send_table(None);
+    host.borrow_mut().flush(card.channel().host());
+    assert!(matches!(card.poll(), Ok(None)));
+    assert_eq!(card.take_table(), None);
+    let frame = Random(0x7ab).frame(200);
+    assert!(card.send(&frame).unwrap());
+    card.flush().unwrap();
+    assert_eq!(host.borrow().frames, [frame]);
+    assert_clean(&host);
+}
+
+#[test]
 fn a_link_down_then_up_is_reported() {
     let (mut card, host) = started(ROOMY);
     assert!(card.link_up());

@@ -143,7 +143,9 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         nvsp::negotiate(&mut wire, say)?;
         nvsp::configure(&mut wire, say)?;
         let receive = nvsp::receive_buffer(&mut wire, receive, say)?;
+        table(wire.take_table(), say);
         let send = nvsp::send_buffer(&mut wire, send, say)?;
+        table(wire.take_table(), say);
         let mut card = Netvsc {
             wire,
             longest: receive.section,
@@ -165,8 +167,10 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         say(format_args!("RNDIS initialisation sent"));
         card.initialize()?;
         say(format_args!("RNDIS initialised"));
+        table(card.take_table(), say);
         say(format_args!("address queried"));
         card.mac = card.address()?;
+        table(card.take_table(), say);
         let m = card.mac;
         say(format_args!(
             "address {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -174,6 +178,7 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         ));
         say(format_args!("MTU queried"));
         card.mtu = card.frame_size()?;
+        table(card.take_table(), say);
         say(format_args!("MTU {}", card.mtu));
         card.longest = card.mtu as usize + ETHERNET_HEADER;
         // The largest frame and its RNDIS fields must fit one send section, or some
@@ -190,6 +195,7 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         say(format_args!("packet filter {FILTER:#x} sent"));
         card.filter()?;
         card.wire.flush()?;
+        table(card.take_table(), say);
         say(format_args!("packet filter set"));
         say(format_args!(
             "link {}",
@@ -212,6 +218,13 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
     /// The NVSP version the host accepted, as NVSP numbers it: `0x60001` is 6.1.
     pub fn nvsp_version(&self) -> u32 {
         self.wire.version().unwrap_or_default()
+    }
+
+    /// The entry count of the first send indirection table the host sent, once, when it
+    /// has just come, for the console: the table is ignored, since the card sends on its
+    /// one channel.
+    pub fn take_table(&mut self) -> Option<u32> {
+        self.wire.take_table()
     }
 
     /// Whether the link is up, as the host last indicated.
@@ -421,8 +434,14 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         let len = packet.len.min(PAYLOAD);
         match packet.kind {
             Kind::Completion => self.sent(packet.transaction, len),
+            // The send indirection table: ignored (`Wire::table`), and acknowledged if
+            // the host asks.
+            Kind::InBand if self.wire.table(&self.payload[..len]) => match packet.transaction {
+                Some(transaction) => self.owe(Owed::Acknowledged(transaction)),
+                None => Ok(()),
+            },
             Kind::InBand => {
-                // The one message the host sends unasked in a packet of its own is what
+                // The other message the host sends unasked in a packet of its own is what
                 // it says of a virtual function (netvsp `guest_vf_is_available`). It is
                 // acknowledged, when the host asks for that, and ignored: the node uses
                 // the synthetic card only, and never asks for the data path to move
@@ -848,6 +867,16 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
             step,
         )?;
         Ok(())
+    }
+}
+
+/// Says the first send indirection table the host sent, if it has just come: the one line
+/// it gets, since it is ignored (`Wire::table`).
+pub(crate) fn table(news: Option<u32>, say: &mut dyn FnMut(fmt::Arguments<'_>)) {
+    if let Some(entries) = news {
+        say(format_args!(
+            "send indirection table of {entries} entries ignored: one channel is served"
+        ));
     }
 }
 
