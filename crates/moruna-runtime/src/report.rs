@@ -89,6 +89,9 @@ pub struct MetaInput {
     pub policy: Option<moruna_trace::PolicyReport>,
     /// Where the sources' and the sinks' time went (the gate's split).
     pub io: moruna_trace::IoReport,
+    /// What the budget let the object stores have in flight, when the facade built the reactor
+    /// (3A, 3.5b).
+    pub object_io: Option<moruna_trace::ObjectIoReport>,
 }
 
 /// Build the `RunMeta` of 04 d.1 from what the run gathered (12 f.2).
@@ -128,6 +131,7 @@ pub fn meta(input: MetaInput) -> RunMeta {
         buffers: input.buffers,
         policy: input.policy,
         io: input.io,
+        object_io: input.object_io,
     }
 }
 
@@ -234,6 +238,7 @@ mod tests {
             sinks: Vec::new(),
             policy: None,
             io: Default::default(),
+            object_io: None,
             buffers: Some(moruna_trace::BufferReport::of(
                 "known_future",
                 &moruna_kernel::CatalogStats {
@@ -279,6 +284,7 @@ mod tests {
             buffers: None,
             policy: None,
             io: Default::default(),
+            object_io: None,
         });
         assert_eq!(meta.sizer, "rule");
         assert!(meta.bottleneck_timeline.is_empty());

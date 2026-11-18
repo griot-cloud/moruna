@@ -146,6 +146,7 @@ pub fn meta(exit: ExitReason) -> RunMeta {
         buffers: None,
         policy: None,
         io: Default::default(),
+        object_io: None,
     }
 }
 

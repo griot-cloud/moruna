@@ -30,7 +30,8 @@ use serde_json::{Map, Value, json};
 /// gives each source's reads apart from its decodes and each sink's encodes apart from its
 /// writes, and a source's or a sink's task carries its own (`read_ms`, `decode_ms`, `encode_ms`,
 /// `write_ms`; a half done in the same call is absent). 3.1 adds, to 3.0: `budget`, the job's
-/// whole memory budget (system design 3A, item 3.2c).
+/// whole memory budget (system design 3A, item 3.2c); and `object_io`, what the budget let the
+/// object stores have in flight, `room_bytes`, `requests` and `part_bytes` (3A, item 3.5b).
 pub const SCHEMA_VERSION: &str = "3.1";
 
 /// The public digest of a job document (0.6.6): `sha256:` and the hex of SHA-256 over its exact
@@ -988,6 +989,7 @@ mod tests {
             buffers: None,
             policy: None,
             io: Default::default(),
+            object_io: None,
             part_digests: moruna_trace::PartDigests {
                 source_schemas: vec![Some([1; 32])],
                 stage_schemas: (0..stages).map(|_| Some([2; 32])).collect(),

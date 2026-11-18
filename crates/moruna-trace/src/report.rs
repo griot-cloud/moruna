@@ -75,6 +75,9 @@ pub struct RunMeta {
     /// Where the sources' and the sinks' time went: reads apart from decodes, encodes apart
     /// from writes. Empty when the run never started its scheduler.
     pub io: IoReport,
+    /// What the budget let the object stores have in flight; `None` when the run was given a
+    /// reactor of its own.
+    pub object_io: Option<ObjectIoReport>,
 }
 
 /// Where a run's sources' and sinks' time went (the gate's split, `arrow-core-0.7.md` §9):
@@ -94,6 +97,20 @@ impl IoReport {
     pub fn is_empty(&self) -> bool {
         self.sources.is_empty() && self.sinks.is_empty()
     }
+}
+
+/// What the run's budget let the object stores have in flight (system design 3A, item 3.5b), as
+/// the facade derived it from the arena: requests at once and the part a write is cut in, so a
+/// benchmark shows what a budget chose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ObjectIoReport {
+    /// The arena's bytes in flight the requests share: half the arena.
+    pub room_bytes: u64,
+    /// Requests to the stores at once, reads and writes together (N).
+    pub requests: u64,
+    /// Each request's share of the room, at least S3's least part: the part a write is cut in
+    /// before an object's own limits.
+    pub part_bytes: u64,
 }
 
 /// One source's reads and decodes.
@@ -639,6 +656,10 @@ pub struct RunReport {
     /// had no scheduler to time them.
     #[serde(skip_serializing_if = "IoReport::is_empty")]
     pub io: IoReport,
+    /// What the budget let the object stores have in flight (3A, 3.5b): requests at once and the
+    /// part a write is cut in. Absent from the JSON when the run was given a reactor of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_io: Option<ObjectIoReport>,
     /// What identifies each part of the run, as the run resolved it: a source's schema is the
     /// one it gives, a stage's its first input's, a sink's the one it is given; a stage's
     /// fingerprint is its kernel's. Filled by the facade that knows them; empty when none did.
@@ -1117,6 +1138,7 @@ impl RunReport {
             buffers: meta.buffers.clone(),
             policy: meta.policy.clone(),
             io: meta.io.clone(),
+            object_io: meta.object_io,
             part_digests: PartDigests::default(),
         }
     }

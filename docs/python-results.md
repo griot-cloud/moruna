@@ -9,12 +9,14 @@ A report is one JSON document with one canonical form. `report.bytes()` is that 
 Schema `3.1` adds, to `3.0`:
 
 - `budget`, the job's whole memory budget.
+- `object_io`, what the budget let the object stores have in flight: `room_bytes`, `requests` and `part_bytes`.
 
 | Attribute | Type | Meaning |
 | --- | --- | --- |
 | `schema_version`, `moruna` | `str`, `str` | The document's schema, `"MAJOR.MINOR"` (`"3.1"`; a reader refuses an unknown major), and the Moruna that wrote it. |
 | `host`, `args` | `dict`, `dict` | Where it ran (platform, CPUs, memory limit, CPU quota, devices) and the run's argument values. |
 | `budget` | `dict` | `memory_bytes`, the job's whole memory budget: the spec's, or on a node the node's job bound when the spec names none; `None` when there is none. |
+| `object_io` | `dict` or absent | What the budget let the object stores have in flight: `room_bytes` (half the arena), `requests` (the requests to the stores at once) and `part_bytes` (each request's share, which a larger write is cut in). Absent when the run was given a reactor of its own. |
 | `run_id` | `str` | The run's id, 32 hex characters. |
 | `job_digest` | `str \| None` | The spec's public digest, SHA-256 of its exact bytes (`JobSpec.digest()`), the same from `moruna.run` and `moruna run`; `None` for a job that holds a task a spec cannot hold. |
 | `execution_fingerprint` | `str \| None` | The normalized execution fingerprint the planner and recovery use. It differs from `job_digest` and is not a document identity; `None` for a run refused before its job was built. |

@@ -27,12 +27,74 @@ use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use crate::credentials::{Guard, Store};
 use crate::{AzureConfig, GcsConfig, ObjectStoreConfig, S3Config};
 
-/// The part size of a multipart write (f.4).
-pub(crate) const PART_BYTES: usize = 16 * 1024 * 1024;
-/// Writes at or below this size are a single `put` (f.4).
-pub(crate) const SINGLE_PUT_MAX: usize = 64 * 1024 * 1024;
-/// Parts in flight during a multipart write (f.4).
-pub(crate) const PARTS_IN_FLIGHT: usize = 4;
+/// The smallest part S3 takes, for every part of a multipart upload but the last: a limit of the
+/// protocol, not a tuning (Azure's blocks and Google's are no smaller in practice).
+pub const S3_PART_MIN_BYTES: u64 = 5 << 20;
+/// The most parts S3 takes in one upload: a limit of the protocol.
+pub const S3_PARTS_MAX: u64 = 10_000;
+
+/// What a budget lets the object stores have in flight (system design 3A, item 3.5b): how many
+/// requests at once, and how large a part. Derived from the run's in-flight room, never set:
+/// the arena charges each request's bytes (a read's body lands in the buffer the drive charged
+/// for it, and a write sends from a view of the sink's arena buffer), so what a budget decides is
+/// how much of that room the requests share and how many of them share it.
+///
+/// - `requests` (N) is the room over S3's smallest part, at least one and at most the job's
+///   socket budget (3D: `moruna_storage::net::SOCKETS`, the engine's copy of the node's
+///   `egress::SOCKETS`), so every request may carry at least a part of S3's least size.
+/// - `part_bytes` is the room over N, at least S3's smallest part: each request's share.
+///
+/// An object's own part ([`ObjectIo::part_for`]) is that share, raised so the object fits in S3's
+/// most parts and capped at the object. An object of one part is one `put`; a larger one is a
+/// multipart upload with at most N of its parts in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectIo {
+    /// Requests to the stores at once, reads and writes together (N).
+    pub requests: usize,
+    /// Each request's share of the room: a part's size before an object's own limits.
+    pub part_bytes: u64,
+}
+
+impl ObjectIo {
+    /// The requests and part of a run whose arena has `room` bytes in flight (half the arena,
+    /// as the controller counts a byte in flight: once where a worker holds it, once in the
+    /// queues behind it) and whose job may hold `sockets` connections at once.
+    pub fn for_room(room: u64, sockets: usize) -> ObjectIo {
+        let sockets = u64::try_from(sockets.max(1)).unwrap_or(u64::MAX);
+        let requests = (room / S3_PART_MIN_BYTES).clamp(1, sockets);
+        ObjectIo {
+            requests: usize::try_from(requests).unwrap_or(usize::MAX),
+            part_bytes: (room / requests).max(S3_PART_MIN_BYTES),
+        }
+    }
+
+    /// The part an object of `len` bytes is written in: the share, raised to fit the object in
+    /// S3's most parts, and no larger than the object.
+    pub fn part_for(&self, len: u64) -> u64 {
+        self.part_bytes
+            .max(len.div_ceil(S3_PARTS_MAX))
+            .min(len)
+            .max(1)
+    }
+
+    /// Whether an object of `len` bytes is one `put`: it is one part.
+    pub fn single_put(&self, len: u64) -> bool {
+        len <= self.part_for(len)
+    }
+
+    /// The parts of an object of `len` bytes in flight at once: all of them, up to N.
+    pub fn parts_in_flight(&self, len: u64) -> usize {
+        let parts = usize::try_from(len.div_ceil(self.part_for(len))).unwrap_or(usize::MAX);
+        parts.clamp(1, self.requests.max(1))
+    }
+}
+
+impl Default for ObjectIo {
+    /// A reactor given no budget: no room, so one request at once in parts of S3's least size.
+    fn default() -> ObjectIo {
+        ObjectIo::for_room(0, moruna_storage::net::SOCKETS)
+    }
+}
 
 /// A boxed future, so the seam below is a trait object without an async-trait macro.
 pub(crate) type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -40,7 +102,18 @@ pub(crate) type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// What the reactor asks of an object store (d.2: `get_range`, `put`, multipart, `head`,
 /// `list`).
 pub(crate) trait ObjectBackend: Send + Sync {
+    /// The whole range as one body: for a small object read whole outside the arena (a
+    /// manifest, `files`), never for a read into the arena.
     fn get_range(&self, path: &OsPath, range: Range<u64>) -> BoxFut<object_store::Result<Bytes>>;
+    /// The range read into `dst`, the arena buffer charged for it, piece by piece as the body
+    /// arrives (3A, 3.5b): the read holds outside the arena only the piece on its way in. `dst`
+    /// comes back with the outcome, unless a local read's thread took it.
+    fn read_range(
+        &self,
+        path: &OsPath,
+        range: Range<u64>,
+        dst: moruna_kernel::Buffer,
+    ) -> BoxFut<(Option<moruna_kernel::Buffer>, object_store::Result<()>)>;
     fn put(&self, path: &OsPath, payload: PutPayload) -> BoxFut<object_store::Result<()>>;
     fn put_multipart(&self, path: &OsPath) -> BoxFut<object_store::Result<Box<dyn MultipartSink>>>;
     fn head(&self, path: &OsPath) -> BoxFut<object_store::Result<ObjectMeta>>;
@@ -108,6 +181,24 @@ impl ObjectBackend for StoreBackend {
             Arc::clone(&self.guard),
         );
         Box::pin(async move { guarded(&guard, store.get_range(&path, range).await) })
+    }
+
+    fn read_range(
+        &self,
+        path: &OsPath,
+        range: Range<u64>,
+        dst: moruna_kernel::Buffer,
+    ) -> BoxFut<(Option<moruna_kernel::Buffer>, object_store::Result<()>)> {
+        let (store, path, guard) = (
+            Arc::clone(&self.store),
+            path.clone(),
+            Arc::clone(&self.guard),
+        );
+        Box::pin(async move {
+            let (dst, outcome) =
+                moruna_storage::body::read_range_into(&*store, &path, range, dst).await;
+            (dst, guarded(&guard, outcome))
+        })
     }
 
     fn put(&self, path: &OsPath, payload: PutPayload) -> BoxFut<object_store::Result<()>> {
@@ -258,6 +349,8 @@ pub(crate) struct ObjectLayer {
     /// Set by the tests of section k, which drive the same operations over a wrapper that
     /// counts requests in flight and can fail a named part.
     override_backend: Option<Arc<dyn ObjectBackend>>,
+    /// What the run's budget lets the stores have in flight (3A, 3.5b).
+    budget: ObjectIo,
 }
 
 impl ObjectLayer {
@@ -269,7 +362,14 @@ impl ObjectLayer {
             cfg,
             clients: Mutex::new(HashMap::new()),
             override_backend,
+            budget: ObjectIo::default(),
         }
+    }
+
+    /// The same layer, its writes cut in parts as `budget` says.
+    pub(crate) fn with_io(mut self, budget: ObjectIo) -> ObjectLayer {
+        self.budget = budget;
+        self
     }
 
     /// The client for `url` and the path inside it, built once per `(scheme, container)`.
@@ -576,8 +676,9 @@ fn payload_of(view: moruna_kernel::BufferView) -> PutPayload {
     PutPayload::from_bytes(Bytes::from_owner(ViewBytes(view)))
 }
 
-/// `write_object` (f.4): one `put` up to 64 MiB, multipart with 16 MiB parts above it, at most
-/// four parts in flight, and an abort of the upload on any failure.
+/// `write_object` (f.4): an object of one part is one `put`; a larger one is a multipart upload in
+/// the parts the budget gives it (`ObjectIo`), at most N of them in flight, and an abort of the
+/// upload on any failure. Every part is a view of the sink's arena buffer, sent as it is.
 pub(crate) async fn write(
     layer: &ObjectLayer,
     url: &str,
@@ -591,12 +692,15 @@ pub(crate) async fn write(
     }
     let (backend, path) = layer.resolve(url)?;
     let len = src.len();
-    if len <= SINGLE_PUT_MAX {
+    let budget = layer.budget;
+    if budget.single_put(len as u64) {
         return backend
             .put(&path, payload_of(src.slice(0, len)))
             .await
             .map_err(|e| io(crate::stats::OpKind::WriteObject.as_str(), url, &e));
     }
+    let part_bytes = usize::try_from(budget.part_for(len as u64)).unwrap_or(len);
+    let parts_in_flight = budget.parts_in_flight(len as u64);
     let mut upload = backend
         .put_multipart(&path)
         .await
@@ -607,11 +711,11 @@ pub(crate) async fn write(
     let mut offset = 0usize;
     let mut failure: Option<MorunaError> = None;
     while offset < len && failure.is_none() {
-        let n = PART_BYTES.min(len - offset);
+        let n = part_bytes.min(len - offset);
         let part = upload.part(payload_of(src.slice(offset, n)));
         in_flight.push_back(tokio::spawn(part));
         offset += n;
-        if in_flight.len() >= PARTS_IN_FLIGHT {
+        if in_flight.len() >= parts_in_flight {
             failure = join_one(&mut in_flight, url).await;
         }
     }
@@ -946,6 +1050,57 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The requests and parts a budget's room gives (3A, 3.5b): the room over S3's least part,
+    /// at least one and at most the sockets, each request a share of the room no smaller than
+    /// S3's least part.
+    #[test]
+    fn a_budgets_room_sets_the_requests_and_the_part() {
+        const MIB: u64 = 1 << 20;
+        // No room: one request, in parts of S3's least size.
+        let none = ObjectIo::for_room(0, 64);
+        assert_eq!((none.requests, none.part_bytes), (1, S3_PART_MIN_BYTES));
+        // Less than a part's room: still one request of a whole part.
+        let thin = ObjectIo::for_room(3 * MIB, 64);
+        assert_eq!((thin.requests, thin.part_bytes), (1, S3_PART_MIN_BYTES));
+        // Twenty parts' room and a little: twenty requests, each its share.
+        let room = 20 * S3_PART_MIN_BYTES + 40;
+        let some = ObjectIo::for_room(room, 64);
+        assert_eq!((some.requests, some.part_bytes), (20, room / 20));
+        // More room than the sockets: the sockets bound N, and the parts grow with the room.
+        let wide = ObjectIo::for_room(4096 * MIB, 64);
+        assert_eq!((wide.requests, wide.part_bytes), (64, 64 * MIB));
+        // A socket budget of none is read as one.
+        assert_eq!(ObjectIo::for_room(4096 * MIB, 0).requests, 1);
+    }
+
+    /// An object's part: the share, raised to fit S3's most parts, capped at the object; one
+    /// part is one `put`, and at most N parts are in flight.
+    #[test]
+    fn an_objects_part_fits_s3s_limits_and_the_object() {
+        const MIB: u64 = 1 << 20;
+        let io = ObjectIo {
+            requests: 4,
+            part_bytes: 8 * MIB,
+        };
+        // Smaller than a part: one put of the whole object.
+        assert_eq!(io.part_for(3 * MIB), 3 * MIB);
+        assert!(io.single_put(3 * MIB));
+        assert!(io.single_put(8 * MIB));
+        assert_eq!(io.parts_in_flight(3 * MIB), 1);
+        // Larger: parts of the share, at most N of them in flight.
+        assert!(!io.single_put(8 * MIB + 1));
+        assert_eq!(io.part_for(100 * MIB), 8 * MIB);
+        assert_eq!(io.parts_in_flight(100 * MIB), 4);
+        assert_eq!(io.parts_in_flight(17 * MIB), 3);
+        // So large that the share would pass S3's most parts: the part grows to fit them.
+        let huge = 200_000 * MIB;
+        assert_eq!(io.part_for(huge), huge.div_ceil(S3_PARTS_MAX));
+        assert!(huge.div_ceil(io.part_for(huge)) <= S3_PARTS_MAX);
+        // An empty object is one put of nothing.
+        assert!(io.single_put(0));
+        assert_eq!(io.parts_in_flight(0), 1);
     }
 }
 

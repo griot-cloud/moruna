@@ -62,6 +62,7 @@ use crate::segments::{SegmentEntry, Segments};
 use crate::stats::Counters;
 
 pub use crate::files::ObjectFiles;
+pub use crate::object::{ObjectIo, S3_PART_MIN_BYTES, S3_PARTS_MAX};
 pub use crate::stats::ReactorStats;
 
 /// How long `shutdown` waits for what is in flight before it resolves the rest `Cancelled`
@@ -75,8 +76,9 @@ const BOUNCE_BYTES: usize = 64 * 1024 * 1024;
 pub struct ReactorConfig {
     /// `reactor.threads`.
     pub threads: usize,
-    /// `reactor.object_concurrency`.
-    pub object_concurrency: usize,
+    /// What the run's budget lets the object stores have in flight: requests at once
+    /// (`reactor.object_concurrency`) and the part a write is cut in (3A, 3.5b).
+    pub object_io: ObjectIo,
     /// `reactor.file_depth`.
     pub file_depth: usize,
     /// `page.bytes`, the alignment direct IO needs.
@@ -94,7 +96,7 @@ impl Default for ReactorConfig {
     fn default() -> ReactorConfig {
         ReactorConfig {
             threads: 2,
-            object_concurrency: 8,
+            object_io: ObjectIo::default(),
             file_depth: 32,
             page_bytes: 4096,
             profile: HostProfile::default(),
@@ -338,7 +340,8 @@ impl Reactor {
             counters: Counters::default(),
             segments: Segments::default(),
             fds: FdCache::new(opener),
-            objects: ObjectLayer::new(cfg.object_store.clone(), hooks.object_backend),
+            objects: ObjectLayer::new(cfg.object_store.clone(), hooks.object_backend)
+                .with_io(cfg.object_io),
             engine,
             fallback: blocking,
             cancelled: AtomicBool::new(false),
@@ -368,7 +371,7 @@ impl Reactor {
                 },
             )
         };
-        let queues = runtime::start(&inner, cfg.object_concurrency, cfg.file_depth);
+        let queues = runtime::start(&inner, cfg.object_io.requests, cfg.file_depth);
         Ok(Arc::new(Reactor {
             inner,
             _arena: alloc,

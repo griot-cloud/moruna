@@ -30,7 +30,7 @@ use object_store::path::Path as OsPath;
 use crate::fdcache::tests::{DirectRefusingOpener, scratch_dir};
 use crate::file_blocking::{Done, FileEngine, FileReq};
 use crate::object::{BoxFut, MultipartSink, ObjectBackend, StoreBackend};
-use crate::{Hooks, ObjectStoreConfig, Reactor, ReactorConfig, S3Config, stats::OpKind};
+use crate::{Hooks, ObjectIo, ObjectStoreConfig, Reactor, ReactorConfig, S3Config, stats::OpKind};
 
 /// A profile with every probed path at `g` and nothing declared.
 fn profile(g: Guarantee) -> HostProfile {
@@ -46,7 +46,11 @@ fn profile(g: Guarantee) -> HostProfile {
 fn config(profile: HostProfile) -> ReactorConfig {
     ReactorConfig {
         threads: 2,
-        object_concurrency: 8,
+        // Eight requests at once in parts of 16 MiB: the budget these tests were written for.
+        object_io: ObjectIo {
+            requests: 8,
+            part_bytes: 16 << 20,
+        },
         file_depth: 32,
         page_bytes: 4096,
         profile,
@@ -115,7 +119,8 @@ pub(crate) struct TestBackend {
     counts: Mutex<BackendCounts>,
     latency: Mutex<Duration>,
     fail_part: Mutex<Option<usize>>,
-    /// Fail this many `get_range` calls with a connection reset first (f.3's one retry).
+    /// Fail this many reads (`get_range` or `read_range`) with a connection reset first (f.3's
+    /// one retry).
     fail_gets: AtomicU64,
     /// Multipart parts are counted and discarded rather than stored, so a 200 MiB write does
     /// not need 200 MiB of store as well as 200 MiB of source.
@@ -206,6 +211,29 @@ impl ObjectBackend for Arc<TestBackend> {
                 return Err(reset());
             }
             inner.await
+        })
+    }
+
+    fn read_range(
+        &self,
+        path: &OsPath,
+        range: std::ops::Range<u64>,
+        dst: Buffer,
+    ) -> BoxFut<(Option<Buffer>, object_store::Result<()>)> {
+        let me = Arc::clone(self);
+        let path = path.clone();
+        let delay = self.sleep();
+        me.enter();
+        Box::pin(async move {
+            let _guard = InFlight(Arc::clone(&me));
+            if delay > Duration::ZERO {
+                tokio::time::sleep(delay).await;
+            }
+            if me.fail_gets.load(Ordering::SeqCst) > 0 {
+                me.fail_gets.fetch_sub(1, Ordering::SeqCst);
+                return (Some(dst), Err(reset()));
+            }
+            me.inner.read_range(&path, range, dst).await
         })
     }
 
@@ -722,7 +750,7 @@ fn re_t6_concurrency_bound() {
     let alloc = FakeAllocator::new();
     let backend = TestBackend::new();
     let mut cfg = config(profile(Guarantee::Probed(false)));
-    cfg.object_concurrency = 4;
+    cfg.object_io.requests = 4;
     let reactor = build(
         cfg,
         &alloc,
@@ -1954,7 +1982,7 @@ fn queued_operations_are_cancelled_by_shutdown() {
         .expect("runtime");
     let mut cfg = config(profile(Guarantee::Probed(false)));
     cfg.file_depth = 1;
-    cfg.object_concurrency = 1;
+    cfg.object_io.requests = 1;
     let reactor = build(
         cfg,
         &alloc,
@@ -2087,7 +2115,14 @@ fn the_public_constructor_takes_the_defaults() {
         ..ReactorConfig::default()
     };
     assert_eq!(cfg.threads, 2);
-    assert_eq!(cfg.object_concurrency, 8);
+    assert_eq!(
+        cfg.object_io,
+        ObjectIo {
+            requests: 1,
+            part_bytes: crate::S3_PART_MIN_BYTES
+        },
+        "a reactor given no budget has one request at once, in parts of S3's least size"
+    );
     assert_eq!(cfg.file_depth, 32);
     let reactor = Reactor::new(cfg, Arc::new(alloc)).expect("the reactor builds");
     assert!(
