@@ -604,7 +604,10 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
 - **At job start,** `node-admission` has the engine fetch each function the job names, through its
   job network (3D). The node refuses the job if a SHA-256 differs. Images are cached in memory, up
   to node config's `functions.cache_bytes` (default 1 GiB, at most half the node's memory), until the node stops.
-- **A job names a function** by its registered name. An unregistered name is refused at `validate`.
+- **A job names a function** by its registered name, as a function task's `"function": "<name>"`;
+  the check's `needs.functions` lists them. An unregistered name is refused at `validate`.
+- **AWS's own S3** (no endpoint) is reached with path-style requests, so its host is
+  `s3.<region>.amazonaws.com`, known without the bucket; the region is required.
 
 ### 3F. The full-year hang
 
