@@ -46,7 +46,7 @@ use core::{
 
 pub use moruna_abi::{
     ABI_VERSION, DEADLINE_INFINITE, Error, ObjectType, PAGE_SIZE, RawHandle, ResourceKind, Rights,
-    Signals, charge, forward, limits, map, memory_flags, pin_flags,
+    Signals, charge, forward, limits, map, memory_flags, pin_flags, process_end,
 };
 use moruna_abi::{msi, nr, start_entry, wait_item};
 
@@ -800,6 +800,14 @@ fn forget_moved(handles: &mut [(Option<Handle>, &str)]) {
 pub struct Process(pub Handle);
 
 impl Process {
+    /// How the process ended (`handle_info`, ABI 2.7): its exit code, or that it faulted or
+    /// was killed. Only once it is `TERMINATED`; before, it reads as exit code 0.
+    pub fn end(&self) -> Result<moruna_abi::process_end::End> {
+        let (packed, ended) = raw::call1(nr::HANDLE_INFO, u64::from(self.0.raw()));
+        check(packed)?;
+        Ok(moruna_abi::process_end::End::decode(ended))
+    }
+
     /// Creates an empty process from the process root resource, charged to the caller's
     /// own account: it and everything it causes to exist.
     pub fn create(resource: &Handle, name: &str) -> Result<Process> {

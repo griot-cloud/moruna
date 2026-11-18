@@ -4,9 +4,10 @@
 //! - the supervisor that cannot go on writes `moruna: fatal services: <reason>`;
 //! - a service not started within 5 s of the supervisor's own start is
 //!   `moruna: fatal services: <name> did not start within 5 s`;
-//! - a service that ends is `moruna: fatal <name>: ended`, whether the supervisor sees its
-//!   process end or the channel it watches it by (a bootstrap's, or admission's guardian)
-//!   close first; a service that closes that channel and runs on is
+//! - a service that ends is `moruna: fatal <name>: ended with code <n>`, or `faulted`, or
+//!   `was killed`, as the kernel says it ended, whether the supervisor sees its process end
+//!   or the channel it watches it by (a bootstrap's, or admission's guardian) close first;
+//!   a service that closes that channel and runs on is
 //!   `moruna: fatal <name>: closed its channel to the supervisor`.
 //!
 //! After any of them it kills every child and exits with failure, and the core, with no
@@ -321,6 +322,15 @@ fn collect(
     children.retain(|(_, _, child)| !matches!(moruna_sys::wait_one(&child.0, Signals::TERMINATED, now()), Ok(seen) if seen.contains(Signals::TERMINATED)));
     Ok(())
 }
+/// How `process`, which has ended, ended: its exit code, a fault or a kill (ABI 2.7).
+/// The kernel answers for every process the supervisor holds; were it not to, the line
+/// would still name the service, as ending with code 0.
+fn end(process: &Process) -> moruna_sys::process_end::End {
+    process
+        .end()
+        .unwrap_or(moruna_sys::process_end::End::Code(0))
+}
+
 /// Whether `process` has ended, waiting up to a second: a service that ends closes its
 /// channels a moment before its process is seen to have ended, so its closed guardian
 /// channel can reach the supervisor first.
@@ -473,7 +483,8 @@ fn run() -> i64 {
                 // end or instead of it: the line names the service (1B).
                 Uncollected::Closed(at) => {
                     let index = owners[at];
-                    let gone = Gone::closed_channel(ended(&children[index].process));
+                    let process = &children[index].process;
+                    let gone = Gone::closed_channel(ended(process).then(|| end(process)));
                     lifecycle.terminated(index);
                     println!(
                         console,
@@ -536,11 +547,8 @@ fn run() -> i64 {
                     console,
                     "node: critical service {} terminated; stopping node", index
                 );
-                println!(
-                    console,
-                    "{}",
-                    line::Gone(&children[index].name, Gone::Ended(None))
-                );
+                let gone = Gone::ended(end(&children[index].process));
+                println!(console, "{}", line::Gone(&children[index].name, gone));
                 return stop_node(
                     &console,
                     &children,
