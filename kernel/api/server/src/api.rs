@@ -363,7 +363,7 @@ impl Api {
                 let waiting = if operation.response == Response::Validation {
                     self.jobs.validate(inputs.body)
                 } else {
-                    self.jobs.submit(self.host.as_mut(), inputs.body, now)
+                    self.jobs.submit(inputs.body)
                 };
                 match waiting {
                     Ok(ticket) => {

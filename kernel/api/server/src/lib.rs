@@ -72,7 +72,7 @@ mod transport;
 
 pub use api::NodeFacts;
 pub use audit::{AUDIT_ANSWER_LIMIT, AUDIT_LIMIT};
-pub use engine::{ENGINE_LINE_LIMIT, EngineHost, HostError, NoEngine};
+pub use engine::{ENGINE_LINE_LIMIT, EngineHost, HostError, Needs, NoEngine, Verdict, Volume};
 pub use http::{BODY_BUDGET, BODY_LIMIT, HEADER_LIMIT};
 pub use identity::{Identity, IdentityError, VALID_AFTER_SECONDS, VALID_BEFORE_SECONDS};
 pub use jobs::{EVENT_BUFFER_BYTES, EVENTS_KEPT, JOBS_KEPT, REPORT_BYTES};

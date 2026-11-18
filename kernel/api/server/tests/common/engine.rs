@@ -6,7 +6,7 @@
 //! and when. The crate's unit tests and its end-to-end tests both use it.
 
 use moruna_api::Refusal;
-use moruna_api_server::{EngineHost, HostError};
+use moruna_api_server::{EngineHost, HostError, Needs, Verdict};
 use moruna_event::{Encoder, Event, LogStream, Stamp};
 use std::{
     cell::RefCell,
@@ -35,6 +35,10 @@ pub struct State {
     checking: bool,
     /// The `spec` line of each engine started.
     pub started: Vec<String>,
+    /// The verdict each engine was started with.
+    pub started_with: Vec<Verdict>,
+    /// The budget and needs a sound check answers.
+    pub needs: (Option<u64>, Needs),
     /// What the next start answers, when it is not to start.
     pub refuse_start: Option<HostError>,
     /// The lines sent to the engine after its `spec`.
@@ -168,20 +172,33 @@ impl EngineHost for Engine {
         Ok(())
     }
 
-    fn checked(&mut self) -> Option<Result<Vec<Refusal>, HostError>> {
+    fn checked(&mut self) -> Option<Result<Verdict, HostError>> {
         let mut state = self.0.borrow_mut();
         if !state.checking || state.hold_checks {
             return None;
         }
         state.checking = false;
-        Some(state.verdicts.pop_front().unwrap_or(Ok(Vec::new())))
+        let (memory_bytes, needs) = state.needs.clone();
+        Some(
+            state
+                .verdicts
+                .pop_front()
+                .unwrap_or(Ok(Vec::new()))
+                .map(|refusals| Verdict {
+                    refusals,
+                    memory_bytes,
+                    needs,
+                }),
+        )
     }
 
-    fn start(&mut self, spec: &[u8]) -> Result<(), HostError> {
+    fn start(&mut self, spec: &[u8], verdict: &Verdict) -> Result<(), HostError> {
         let mut state = self.0.borrow_mut();
+        assert!(verdict.refusals.is_empty(), "only a sound job starts");
         if let Some(refusal) = state.refuse_start.take() {
             return Err(refusal);
         }
+        state.started_with.push(verdict.clone());
         assert!(
             spec.ends_with(b"\n") && !spec[..spec.len() - 1].contains(&b'\n'),
             "one line"

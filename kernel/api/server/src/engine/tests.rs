@@ -104,7 +104,10 @@ fn a_node_with_no_engine_runs_no_jobs() {
     let mut none = NoEngine;
     assert_eq!(none.check(b"{}", &[]), Err(HostError::Unavailable));
     assert_eq!(none.checked(), None);
-    assert_eq!(none.start(b"{}\n"), Err(HostError::Unavailable));
+    assert_eq!(
+        none.start(b"{}\n", &Verdict::default()),
+        Err(HostError::Unavailable)
+    );
     assert_eq!(none.send(b"{}\n"), Err(HostError::Unavailable));
     assert_eq!(none.receive(&mut [0; 8]), Err(HostError::WouldBlock));
 }

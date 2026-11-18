@@ -24,6 +24,40 @@ pub enum HostError {
     Unavailable,
 }
 
+/// A volume a job names, by its serial, and whether the job writes it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Volume {
+    /// The serial the cloud gives the disk (`disk://<serial>/...`).
+    pub serial: String,
+    /// Whether the job writes it: a sink's.
+    pub write: bool,
+}
+
+/// What a job needs of the node beyond its budget, as the engine's check answers it: what
+/// `node-admission` keeps with the job for its grants (items 3.3, 3.4 and 3.6).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Needs {
+    /// The hosts it reaches.
+    pub hosts: Vec<String>,
+    /// The volumes it names.
+    pub volumes: Vec<Volume>,
+    /// The registered functions it uses.
+    pub functions: Vec<String>,
+}
+
+/// The engine's check of a document: its refusals, none when it would run, and what the job
+/// would take of the node.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Verdict {
+    /// Every refusal, by field.
+    pub refusals: Vec<Refusal>,
+    /// The budget the job runs with, in bytes: the document's, or the node's most when it
+    /// names none.
+    pub memory_bytes: Option<u64>,
+    /// What else it needs of the node.
+    pub needs: Needs,
+}
+
 /// What the server asks of the node to run jobs: the engine's check of a document, a fresh
 /// engine for a job, and the host protocol's bytes to and from it. `api` does not link
 /// `moruna-job`: a document is checked by the engine itself.
@@ -38,13 +72,14 @@ pub trait EngineHost {
     fn check(&mut self, document: &[u8], secrets: &[String]) -> Result<(), HostError>;
 
     /// The verdict of the check under way, once it has one: the engine's refusals, none when
-    /// the document is sound.
-    fn checked(&mut self) -> Option<Result<Vec<Refusal>, HostError>>;
+    /// the document is sound, and the budget and needs of the job it would be.
+    fn checked(&mut self) -> Option<Result<Verdict, HostError>>;
 
     /// Starts a fresh engine for one job and sends it `spec`, the host protocol's `spec`
     /// message: one line, its line break included, with the job's secrets in its `secrets`
-    /// member.
-    fn start(&mut self, spec: &[u8]) -> Result<(), HostError>;
+    /// member. `verdict` is the engine's check of the same document, sound: the job's budget
+    /// and needs, which the node starts the engine with.
+    fn start(&mut self, spec: &[u8], verdict: &Verdict) -> Result<(), HostError>;
 
     /// Sends the engine one line of the host protocol, its line break included: `cancel`.
     fn send(&mut self, line: &[u8]) -> Result<(), HostError>;
@@ -63,11 +98,11 @@ impl EngineHost for NoEngine {
         Err(HostError::Unavailable)
     }
 
-    fn checked(&mut self) -> Option<Result<Vec<Refusal>, HostError>> {
+    fn checked(&mut self) -> Option<Result<Verdict, HostError>> {
         None
     }
 
-    fn start(&mut self, _spec: &[u8]) -> Result<(), HostError> {
+    fn start(&mut self, _spec: &[u8], _verdict: &Verdict) -> Result<(), HostError> {
         Err(HostError::Unavailable)
     }
 
