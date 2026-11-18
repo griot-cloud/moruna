@@ -21,8 +21,8 @@ use moruna_testkit::{FakeAllocator, FakeReactor, OpKind};
 
 use support::{
     CountingAllocator, Ledger, NoObjectStore, block_on, err, scratch, seed, seed_truncated,
-    write_aligned_safetensors, write_dictionary_parquet, write_npy, write_one_huge_row,
-    write_parquet, write_safetensors, write_safetensors_padded,
+    write_aligned_safetensors, write_dictionary_pages_parquet, write_dictionary_parquet, write_npy,
+    write_one_huge_row, write_parquet, write_safetensors, write_safetensors_padded,
 };
 
 /// A Parquet source over one generated file, reading its bytes through the fake.
@@ -1890,4 +1890,326 @@ fn so_t49_an_objects_group_is_fetched_by_requests_in_flight_together() {
             .map(|r| (r.t_submit, r.t_resolve))
             .collect::<Vec<_>>()
     );
+}
+
+/// A Parquet source over the file at `path`, reading its bytes through the fake.
+fn parquet_at(path: &std::path::Path) -> ParquetSource {
+    ParquetSource::new(
+        ParquetSourceConfig {
+            urls: vec![path.display().to_string()],
+            ..ParquetSourceConfig::default()
+        },
+        Arc::new(seed(FakeReactor::new(), path)) as Arc<dyn Reactor>,
+        Arc::new(NoObjectStore) as Arc<dyn ObjectMetadata>,
+    )
+    .expect("the parquet source")
+}
+
+/// The first row group of the file at `path`, from its footer and the offset index its writer
+/// left: the bytes of its column chunks, which is every page of the group once, and the bytes
+/// of each column's largest data page, summed.
+fn group_pages(path: &std::path::Path) -> (u64, u64) {
+    use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+    use parquet::file::metadata::PageIndexPolicy;
+    let file = std::fs::File::open(path).expect("the file");
+    let options = ArrowReaderOptions::new().with_offset_index_policy(PageIndexPolicy::Required);
+    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options)
+        .expect("the footer and its offset index");
+    let metadata = builder.metadata();
+    let chunks = metadata
+        .row_group(0)
+        .columns()
+        .iter()
+        .map(|chunk| chunk.compressed_size() as u64)
+        .sum();
+    let largest = metadata.offset_index().expect("the offset index")[0]
+        .iter()
+        .map(|column| {
+            column
+                .page_locations()
+                .iter()
+                .map(|page| page.compressed_page_size as u64)
+                .max()
+                .unwrap_or(0)
+        })
+        .sum();
+    (chunks, largest)
+}
+
+/// Read the one row group of the file at `path` in the parts `cuts` bound, in order, as the
+/// drive reads a group it has cut; the bytes of pages the parts' decodes took between them.
+fn page_bytes_in_parts(path: &std::path::Path, cuts: &[u64]) -> u64 {
+    let source = parquet_at(path);
+    let alloc = FakeAllocator::new();
+    let split = source.plan().expect("the plan").remove(0);
+    let mut rows = 0;
+    for part in cuts.windows(2) {
+        let range = RowRange {
+            start: part[0],
+            end: part[1],
+        };
+        let payload =
+            block_on(source.read(&split, Some(range), &alloc, Tier::Host)).expect("a part");
+        rows += payload.rows();
+    }
+    assert_eq!(rows, split.rows, "the parts are the group");
+    let stats = source.stats();
+    assert_eq!(
+        stats.group_fetches, 1,
+        "the parts share one fetch: {stats:?}"
+    );
+    assert_eq!(
+        stats.ranges_paged,
+        cuts.len() as u64 - 1,
+        "each part decodes from the pages it covers: {stats:?}"
+    );
+    stats.page_bytes_decoded
+}
+
+/// SO-T47 a_group_in_parts_decodes_each_page_once (item 6.3l, system design 3A). The arena cuts
+/// a row group's read into parts so that a second worker can decode (6.3a), and a smaller arena
+/// cuts it into more of them. The parts of a group must together cost what the group costs:
+/// decoding a group in k reads decodes each of its pages once, as one read does.
+///
+/// What is unavoidable is stated, and it is all there is: a cut that falls inside a page leaves
+/// that page, in each column, to the read before the cut and the read after it, and each must
+/// decompress it for its own rows, so k reads may decode k - 1 pages of each column twice. A
+/// cut where every column starts a page costs nothing. A column's dictionary page is no part of
+/// it: it is the same page for every part of the group.
+///
+/// Measured in the bytes of pages the decoders take from the group's fetch, which is the work
+/// of decompressing and decoding them and does not move with the machine's load.
+#[test]
+fn so_t47_a_group_in_parts_decodes_each_page_once() {
+    const ROWS: u64 = 65_536;
+    const PAGE_ROWS: u64 = 1_024;
+    const READS: u64 = 16;
+    let dir = scratch();
+    let path = write_dictionary_pages_parquet(&dir, "t47", ROWS, PAGE_ROWS as usize);
+    let (chunks, largest_pages) = group_pages(&path);
+
+    // One read of the group takes each page once: no more than its chunks hold.
+    let whole = parquet_at(&path);
+    let split = whole.plan().expect("the plan").remove(0);
+    assert_eq!(split.rows, ROWS, "one row group");
+    assert!(whole.range_reads_own_rows(&split), "its pages are located");
+    let payload =
+        block_on(whole.read(&split, None, &FakeAllocator::new(), Tier::Host)).expect("the group");
+    assert_eq!(payload.rows(), ROWS);
+    let one = whole.stats().page_bytes_decoded;
+    assert!(
+        one > chunks / 2 && one <= chunks,
+        "one read decodes the group's pages once: {one} bytes of chunks of {chunks}"
+    );
+
+    // Sixteen reads cut where every column starts a page, and sixteen cut inside pages.
+    let step = ROWS / READS;
+    assert_eq!(
+        step % PAGE_ROWS,
+        0,
+        "a cut every {step} rows is on a page start"
+    );
+    let on_pages: Vec<u64> = (0..=READS).map(|i| i * step).collect();
+    let inside_pages: Vec<u64> = (0..=READS)
+        .map(|i| match i {
+            0 => 0,
+            READS => ROWS,
+            i => i * step + PAGE_ROWS / 2,
+        })
+        .collect();
+    let aligned = page_bytes_in_parts(&path, &on_pages);
+    let ragged = page_bytes_in_parts(&path, &inside_pages);
+    let times = |taken: u64| taken as f64 / chunks as f64;
+
+    assert!(
+        aligned <= chunks,
+        "{READS} reads cut on page starts decode each page of the group once: they took {aligned} \
+         bytes of pages, {:.2} times the group's {chunks} (cut inside pages: {ragged}, {:.2} \
+         times)",
+        times(aligned),
+        times(ragged)
+    );
+    let bound = chunks + (READS - 1) * largest_pages;
+    assert!(
+        ragged <= bound,
+        "{READS} reads cut inside pages decode again only the page each cut falls in, one a \
+         column: they took {ragged} bytes of pages, {:.2} times the group's {chunks}, against at \
+         most {bound}",
+        times(ragged)
+    );
+}
+
+/// The cost SO-T47 counts in bytes, in time: one row group of dictionary-encoded columns
+/// decoded whole and in more and more reads. Run with `--release -- --ignored --nocapture`; it
+/// is a measurement, not a gate, and its times move with the machine's load.
+#[test]
+#[ignore = "a measurement of item 6.3l; prints a table"]
+fn fact_a_group_in_parts_costs_more_the_more_its_parts() {
+    const ROWS: u64 = 1_048_576;
+    const PAGE_ROWS: u64 = 16_384;
+    let dir = scratch();
+    let path = write_dictionary_pages_parquet(&dir, "fact-parts", ROWS, PAGE_ROWS as usize);
+    let (chunks, _) = group_pages(&path);
+    let source = parquet_at(&path);
+    let alloc = FakeAllocator::new();
+    let split = source.plan().expect("the plan").remove(0);
+    // The decodes alone, the least of five: the fetch is shared and is not timed.
+    let decode = |cuts: &[u64]| {
+        (0..5)
+            .map(|_| {
+                let mut spent = std::time::Duration::ZERO;
+                for part in cuts.windows(2) {
+                    let range = (cuts.len() > 2).then_some(RowRange {
+                        start: part[0],
+                        end: part[1],
+                    });
+                    let fetched = block_on(source.fetch(&split, range, &alloc, Tier::Host))
+                        .expect("the fetch");
+                    let started = std::time::Instant::now();
+                    let payload = source
+                        .decode(&split, fetched, &alloc, Tier::Host)
+                        .expect("the decode");
+                    spent += started.elapsed();
+                    drop(payload);
+                }
+                spent
+            })
+            .min()
+            .expect("five runs")
+    };
+    let whole = decode(&[0, ROWS]);
+    println!("group of {ROWS} rows, chunks of {chunks} bytes; whole: {whole:?}");
+    for reads in [2u64, 4, 8, 16, 32, 64] {
+        let cuts: Vec<u64> = (0..=reads).map(|i| i * (ROWS / reads)).collect();
+        let before = source.stats().page_bytes_decoded;
+        let spent = decode(&cuts);
+        let taken = (source.stats().page_bytes_decoded - before) / 5;
+        println!(
+            "{reads:3} reads on page starts: {spent:?}, {:.2} times the whole; pages taken {:.2} \
+             times the group's",
+            spent.as_secs_f64() / whole.as_secs_f64(),
+            taken as f64 / chunks as f64
+        );
+    }
+}
+
+/// SO-T48 the_parts_of_a_group_are_its_rows (item 6.3l, system design 3A). A row group cut into
+/// parts, wherever the cuts fall (a part of one row, a part that starts inside a page, the
+/// group's first and last rows), gives exactly the rows of the group read whole, nulls and
+/// strings included, when the parts are fetched in order, as the drive fetches them, and then
+/// decoded at once, each on a thread of its own and in no order: the parts share their group's
+/// dictionary pages, and each selects its own rows and none after them.
+///
+/// The dictionary pages the parts share are arena bytes, taken through the allocator of the part
+/// that decoded them, while parts of the group remain; they are gone with the group's last part.
+#[test]
+fn so_t48_the_parts_of_a_group_are_its_rows() {
+    let dir = scratch();
+    // A dictionary in every column, small pages; and the generator's file: nulls, a string column
+    // whose dictionary fills and falls back to plain pages, pages of 20,000 rows.
+    let paged = write_dictionary_pages_parquet(&dir, "t48-pages", 20_000, 1_000);
+    let ledger = write_parquet(&dir, "t48-nulls", 200_000, 100_000, 7);
+    for (path, page_rows) in [(paged, 1_000u64), (ledger.path.clone(), 20_000)] {
+        let source = Arc::new(parquet_at(&path));
+        let split = source.plan().expect("the plan").pop().expect("a group");
+        assert!(source.range_reads_own_rows(&split), "its pages are located");
+        let rows = split.rows;
+        let whole =
+            block_on(parquet_at(&path).read(&split, None, &FakeAllocator::new(), Tier::Host))
+                .expect("the group whole");
+        let whole = table(&whole).clone();
+        let cuts = [
+            0,
+            1,
+            page_rows,
+            page_rows + 1,
+            2 * page_rows + page_rows / 2,
+            rows / 2 + 7,
+            rows - 1,
+            rows,
+        ];
+        let alloc = Arc::new(FakeAllocator::new());
+        let fetched: Vec<_> = cuts
+            .windows(2)
+            .map(|part| {
+                let range = RowRange {
+                    start: part[0],
+                    end: part[1],
+                };
+                let fetched =
+                    block_on(source.fetch(&split, Some(range), alloc.as_ref(), Tier::Host))
+                        .expect("the fetch");
+                (range, fetched)
+            })
+            .collect();
+        let decoding: Vec<_> = fetched
+            .into_iter()
+            .rev()
+            .map(|(range, fetched)| {
+                let (source, split, alloc) =
+                    (Arc::clone(&source), split.clone(), Arc::clone(&alloc));
+                std::thread::spawn(move || {
+                    let payload = source
+                        .decode(&split, fetched, alloc.as_ref(), Tier::Host)
+                        .map_err(|e| e.to_string());
+                    (range, payload)
+                })
+            })
+            .collect();
+        for thread in decoding {
+            let (range, payload) = thread.join().expect("the decoding thread");
+            let payload = payload.expect("the part");
+            let len = usize::try_from(range.end - range.start).expect("rows");
+            let start = usize::try_from(range.start).expect("rows");
+            assert_eq!(
+                table(&payload),
+                &whole.slice(start, len),
+                "{}: rows {range:?} of the group",
+                path.display()
+            );
+        }
+        assert_eq!(
+            alloc.in_use(Tier::Host),
+            0,
+            "{}: nothing is kept once every part has decoded",
+            path.display()
+        );
+
+        // In turn: the dictionaries the first part decoded stay in the arena, taken through that
+        // part's allocator, until the group's last part has decoded.
+        let source = parquet_at(&path);
+        let fetches = FakeAllocator::new();
+        let first = RowRange {
+            start: 0,
+            end: rows / 2,
+        };
+        let last = RowRange {
+            start: rows / 2,
+            end: rows,
+        };
+        let first =
+            block_on(source.fetch(&split, Some(first), &fetches, Tier::Host)).expect("fetch");
+        let last = block_on(source.fetch(&split, Some(last), &fetches, Tier::Host)).expect("fetch");
+        let decodes = FakeAllocator::new();
+        let payload = source
+            .decode(&split, first, &decodes, Tier::Host)
+            .expect("the first part");
+        drop(payload);
+        let kept = decodes.in_use(Tier::Host);
+        assert!(
+            kept > 0,
+            "{}: the group's dictionary pages are the first part's arena bytes",
+            path.display()
+        );
+        let payload = source
+            .decode(&split, last, &decodes, Tier::Host)
+            .expect("the last part");
+        drop(payload);
+        assert_eq!(
+            decodes.in_use(Tier::Host),
+            0,
+            "{}: and go with the last part ({kept} bytes kept until then)",
+            path.display()
+        );
+    }
 }

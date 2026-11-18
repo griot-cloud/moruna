@@ -24,6 +24,11 @@ pub struct SourceStats {
     pub batches_decoded: u64,
     /// The most memory one of those batches held outside the arena (3A).
     pub largest_batch_bytes: u64,
+    /// Bytes of pages the Parquet decoders took from the column chunks their reads fetched, to
+    /// decompress and decode: dictionary pages and data pages, as they lie in the file. A row
+    /// group decoded by one read takes each of its pages once, so at most its chunks' bytes; a
+    /// group decoded in parts takes a page once for every part whose decoder reads it (6.3l).
+    pub page_bytes_decoded: u64,
     /// Payload bytes copied by the CPU out of a decoder and into the arena (SO-I5).
     pub decode_bytes: u64,
     /// Tensor reads the reactor served on a direct path.
@@ -55,6 +60,7 @@ pub(crate) struct Counters {
     pub(crate) ranges_paged: AtomicU64,
     pub(crate) batches_decoded: AtomicU64,
     pub(crate) largest_batch_bytes: AtomicU64,
+    pub(crate) page_bytes_decoded: AtomicU64,
     pub(crate) decode_bytes: AtomicU64,
     pub(crate) tensor_direct_reads: AtomicU64,
     pub(crate) tensor_buffered_reads: AtomicU64,
@@ -87,6 +93,7 @@ impl Counters {
             ranges_paged: get(&self.ranges_paged),
             batches_decoded: get(&self.batches_decoded),
             largest_batch_bytes: get(&self.largest_batch_bytes),
+            page_bytes_decoded: get(&self.page_bytes_decoded),
             decode_bytes: get(&self.decode_bytes),
             tensor_direct_reads: get(&self.tensor_direct_reads),
             tensor_buffered_reads: get(&self.tensor_buffered_reads),

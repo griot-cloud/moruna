@@ -12,6 +12,9 @@
 //! document asks for is unchanged: page-aligned ranges, `Bytes` over an arena buffer with no
 //! copy, and the decode copy after decoding. Reported as a documentation item.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bytes::{Buf, Bytes};
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::reader::{ChunkReader, Length};
@@ -22,12 +25,26 @@ use parquet::file::reader::{ChunkReader, Length};
 pub(crate) struct ArenaChunks {
     file_len: u64,
     ranges: Vec<(u64, Bytes)>,
+    /// Where the bytes of the pages a decoder takes are counted (`counting`); `None` counts
+    /// nothing, which is what a reader that only walks the pages' headers wants.
+    taken: Option<Arc<AtomicU64>>,
 }
 
 impl ArenaChunks {
     /// `ranges` are `(absolute offset, bytes)`, in ascending offset order and non-overlapping.
     pub(crate) fn new(file_len: u64, ranges: Vec<(u64, Bytes)>) -> ArenaChunks {
-        ArenaChunks { file_len, ranges }
+        ArenaChunks {
+            file_len,
+            ranges,
+            taken: None,
+        }
+    }
+
+    /// These chunks for one decode, which adds to `taken` the bytes of every page its decoder
+    /// takes from them (`SourceStats::page_bytes_decoded`, 6.3l).
+    pub(crate) fn counting(mut self, taken: Arc<AtomicU64>) -> ArenaChunks {
+        self.taken = Some(taken);
+        self
     }
 
     /// `length` bytes at `start`. Both come from page headers, which are untrusted input
@@ -75,7 +92,11 @@ impl ChunkReader for ArenaChunks {
     }
 
     fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
-        self.slice(start, length)
+        let bytes = self.slice(start, length)?;
+        if let Some(taken) = &self.taken {
+            taken.fetch_add(length as u64, Ordering::Relaxed);
+        }
+        Ok(bytes)
     }
 }
 
@@ -96,5 +117,21 @@ mod tests {
         assert_eq!(out, b"56789");
         assert!(chunks.get_read(90).is_err());
         assert!(chunks.get_bytes(u64::MAX - 1, 3).is_err());
+    }
+
+    #[test]
+    fn a_counting_reader_counts_the_bytes_it_serves_and_no_others() {
+        let plain = ArenaChunks::new(100, vec![(10, Bytes::from_static(b"0123456789"))]);
+        let taken = Arc::new(AtomicU64::new(0));
+        let counted = plain.clone().counting(Arc::clone(&taken));
+        assert_eq!(
+            counted.get_bytes(12, 3).unwrap(),
+            Bytes::from_static(b"234")
+        );
+        assert_eq!(counted.get_bytes(10, 10).unwrap().len(), 10);
+        // A request it cannot serve is not counted, nor is what the uncounted reader serves.
+        assert!(counted.get_bytes(18, 5).is_err());
+        assert_eq!(plain.get_bytes(12, 3).unwrap().len(), 3);
+        assert_eq!(taken.load(Ordering::Relaxed), 13);
     }
 }
