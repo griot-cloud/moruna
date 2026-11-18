@@ -146,6 +146,18 @@ pub const IMPLEMENTATIONS: &[Implementation] = &[
         versions: crate::mlp::VERSIONS,
         configure: crate::mlp::configure,
     },
+    Implementation {
+        kernel: "moruna.filter",
+        implementation: CPU_REFERENCE,
+        versions: &[1],
+        configure: crate::selection::configure_filter,
+    },
+    Implementation {
+        kernel: "moruna.take",
+        implementation: CPU_REFERENCE,
+        versions: &[1],
+        configure: crate::selection::configure_take,
+    },
 ];
 
 /// Every implementation this build has.
@@ -269,6 +281,69 @@ mod tests {
             err.to_string().contains("no kernel moruna.nothing@1"),
             "{err}"
         );
+        for kernel in [
+            "moruna.filter@1",
+            "moruna.interval_coverage_count@1",
+            "moruna.mlp_forward@1",
+            "moruna.take@1",
+        ] {
+            assert!(err.to_string().contains(kernel), "names {kernel}: {err}");
+        }
         assert!(configure("not an identity", &Params::default()).is_err());
+        let none = configure_from(&[], "moruna.filter@1", &Params::default())
+            .err()
+            .expect("none");
+        assert!(none.to_string().contains("(it has none)"), "{none}");
+        assert!(configure("moruna.filter@2", &Params::default()).is_err());
+    }
+
+    #[test]
+    fn a_kernel_is_configured_by_its_identity() {
+        let kernel = configure(
+            "moruna.filter@1",
+            &Params::json(serde_json::json!({"predicate": "p"})),
+        )
+        .expect("filter");
+        let id = KernelId::parse("moruna.filter@1").expect("id");
+        let params = Params::json(serde_json::json!({"predicate": "p"}));
+        assert_eq!(kernel.fingerprint(), fingerprint(&id, &params).expect("fp"));
+    }
+
+    #[test]
+    fn the_fingerprint_is_of_the_identity_the_arguments_and_the_data() {
+        use moruna_kernel::arrow::array::Int64Array;
+        use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
+        let id = KernelId::parse("moruna.take@1").expect("id");
+        let other = KernelId::parse("moruna.take@2").expect("id");
+        let empty = fingerprint(&id, &Params::default()).expect("empty");
+        assert_eq!(
+            empty,
+            fingerprint(&id, &Params::json(serde_json::json!({}))).expect("{}")
+        );
+        assert_ne!(empty, fingerprint(&other, &Params::default()).expect("v2"));
+        let a = serde_json::json!({"a": 1, "b": [2, 3]});
+        let b = serde_json::json!({"b": [2, 3], "a": 1});
+        assert_eq!(
+            fingerprint(&id, &Params::json(a)).expect("a"),
+            fingerprint(&id, &Params::json(b)).expect("b")
+        );
+        let values = |v: Vec<i64>| {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(v))]).expect("batch");
+            Params {
+                json: Value::Null,
+                arrays: BTreeMap::from([("values".to_string(), batch)]),
+            }
+        };
+        let one = fingerprint(&id, &values(vec![1, 2])).expect("one");
+        assert_eq!(one, fingerprint(&id, &values(vec![1, 2])).expect("same"));
+        assert_ne!(one, fingerprint(&id, &values(vec![1, 3])).expect("other"));
+        assert_ne!(one, empty);
+        let not_object = Params {
+            json: serde_json::json!([1]),
+            ..values(vec![1])
+        };
+        assert!(fingerprint(&id, &not_object).is_err());
     }
 }

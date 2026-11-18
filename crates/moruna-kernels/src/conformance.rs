@@ -103,6 +103,15 @@
 //! `per-element`), and that every version has a CPU reference
 //! ([`crate::catalogue::CPU_REFERENCE`]) among the implementations and no implementation claims
 //! a version with no specification.
+//!
+//! [`run`] then runs every case of every version each implementation claims, as the engine
+//! would drive the kernel: configure it with the case's parameters; check the output schema it
+//! declares for the inputs' schemas; one instance (`init`); every batch to `apply` (one input),
+//! to `apply_aligned` by position (several inputs joined by morsel) or to `apply_port`, port 0's
+//! first (several inputs); then `finish` for a stateful kernel. Its outputs, concatenated, are
+//! compared with the expected; a refusal must come at the step the case names. An
+//! implementation that fails one case of a version cannot claim that version:
+//! [`Report::verdict`] names every such case and why.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -110,13 +119,18 @@ use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 
-use moruna_kernel::arrow::array::{Array, AsArray};
-use moruna_kernel::arrow::datatypes::{DataType, Field, FieldRef, Float64Type, SchemaRef};
+use moruna_kernel::arrow::array::{Array, ArrayRef, AsArray, new_empty_array};
+use moruna_kernel::arrow::compute::{cast, concat, concat_batches};
+use moruna_kernel::arrow::datatypes::{DataType, Field, FieldRef, Float64Type, Schema, SchemaRef};
 use moruna_kernel::arrow::ipc::reader::FileReader;
 use moruna_kernel::arrow::record_batch::RecordBatch;
+use moruna_kernel::arrow::util::display::array_value_to_string;
+use moruna_kernel::{
+    Allocator, InitCtx, Kernel, KernelKind, KernelState, MorunaError, Payload, SourceSchema,
+};
 use serde_json::{Map, Value};
 
-use crate::catalogue::{CPU_REFERENCE, Implementation, KernelId, is_word, parse_version};
+use crate::catalogue::{CPU_REFERENCE, Implementation, KernelId, Params, is_word, parse_version};
 
 /// The specification template, `spec/_template.md`.
 pub const SPEC_TEMPLATE: &str = include_str!("../spec/_template.md");
@@ -902,6 +916,16 @@ fn case_of(at: usize, value: &Value) -> Result<Case, String> {
 /// file it names is read, so a file that is missing, not Arrow IPC, or shorter than a slice is
 /// a problem here.
 pub fn read_corpus(dir: &Path) -> Result<Corpus, Vec<String>> {
+    match read_corpus_and_problems(dir)? {
+        (corpus, problems) if problems.is_empty() => Ok(corpus),
+        (_, problems) => Err(problems),
+    }
+}
+
+/// The corpus in `dir` and every problem with its files; `Err` only when its index cannot be
+/// read at all. A corpus whose files have problems is still checked against its specification
+/// ([`check`]), so a case's other departures are named beside them.
+fn read_corpus_and_problems(dir: &Path) -> Result<(Corpus, Vec<String>), Vec<String>> {
     let at = |p: String| format!("{}: {p}", dir.display());
     let index = dir.join("index.json");
     let text =
@@ -1014,16 +1038,15 @@ pub fn read_corpus(dir: &Path) -> Result<Corpus, Vec<String>> {
             problems.push(at(format!("{file} is named by no case")));
         }
     }
-    if problems.is_empty() {
-        Ok(Corpus {
+    Ok((
+        Corpus {
             dir: dir.to_path_buf(),
             kernel,
             tolerance,
             cases,
-        })
-    } else {
-        Err(problems)
-    }
+        },
+        problems,
+    ))
 }
 
 /// A catalogue as read from its root: its specifications and corpora by kernel name.
@@ -1089,8 +1112,9 @@ pub fn check(root: &Path, namespace: &str, implementations: &[Implementation]) -
         problems.push(e);
         Vec::new()
     }) {
-        match read_corpus(&dir) {
-            Ok(corpus) => {
+        match read_corpus_and_problems(&dir) {
+            Ok((corpus, found)) => {
+                problems.extend(found);
                 let want = format!("{namespace}.{name}");
                 if corpus.kernel != want {
                     problems.push(format!(
@@ -1226,8 +1250,508 @@ fn agreement(catalogue: &mut Catalogue, namespace: &str, implementations: &[Impl
     }
 }
 
+/// What one implementation did with the cases of one version it claims.
+#[derive(Clone, Debug)]
+pub struct Outcome {
+    /// The implementation's name.
+    pub implementation: String,
+    /// The version.
+    pub id: KernelId,
+    /// The cases it passed.
+    pub passed: usize,
+    /// The cases it failed: the case's name and what went wrong.
+    pub failures: Vec<(String, String)>,
+}
+
+impl Outcome {
+    /// Whether the implementation may claim the version: it passed every case, of which there
+    /// is at least one.
+    pub fn holds(&self) -> bool {
+        self.failures.is_empty() && self.passed > 0
+    }
+}
+
+/// The runner's report: the catalogue's problems, and every claim's outcome.
+#[derive(Debug)]
+pub struct Report {
+    /// The catalogue as read, with its problems.
+    pub catalogue: Catalogue,
+    /// One outcome per implementation and version it claims, in the implementations' order.
+    pub outcomes: Vec<Outcome>,
+}
+
+impl Report {
+    /// `Ok` when the catalogue has no problem and every claim holds; otherwise every problem and
+    /// every failed case, one per line.
+    pub fn verdict(&self) -> Result<(), String> {
+        let mut lines = self.catalogue.problems.clone();
+        for outcome in &self.outcomes {
+            for (case, why) in &outcome.failures {
+                lines.push(format!(
+                    "{} cannot claim {}: case `{case}`: {why}",
+                    outcome.implementation, outcome.id
+                ));
+            }
+        }
+        if lines.is_empty() {
+            Ok(())
+        } else {
+            Err(lines.join("\n"))
+        }
+    }
+}
+
+/// Read and check the catalogue under `root` ([`check`]), then run every case of every version
+/// each implementation claims against it. An implementation that fails one case of a version
+/// cannot claim that version, and [`Report::verdict`] says so.
+pub fn run(
+    root: &Path,
+    namespace: &str,
+    implementations: &[Implementation],
+    alloc: Arc<dyn Allocator>,
+) -> Report {
+    let catalogue = check(root, namespace, implementations);
+    let mut outcomes = Vec::new();
+    for implementation in implementations {
+        let name = implementation
+            .kernel
+            .rsplit_once('.')
+            .map_or(implementation.kernel, |(_, n)| n);
+        let (Some(spec), Some(corpus)) = (catalogue.specs.get(name), catalogue.corpora.get(name))
+        else {
+            continue;
+        };
+        for version in implementation.versions {
+            let Some(spec_version) = spec.version(*version) else {
+                continue;
+            };
+            let mut outcome = Outcome {
+                implementation: implementation.implementation.to_string(),
+                id: spec_version.id.clone(),
+                passed: 0,
+                failures: Vec::new(),
+            };
+            for case in corpus.cases.iter().filter(|c| c.version == *version) {
+                match run_case(&corpus.dir, case, spec_version, implementation, &alloc) {
+                    Ok(()) => outcome.passed += 1,
+                    Err(why) => outcome.failures.push((case.name.clone(), why)),
+                }
+            }
+            outcomes.push(outcome);
+        }
+    }
+    Report {
+        catalogue,
+        outcomes,
+    }
+}
+
+/// The step's name as a case writes it.
+fn step_name(step: Step) -> &'static str {
+    match step {
+        Step::Configure => "configure",
+        Step::Schema => "schema",
+        Step::Apply => "apply",
+    }
+}
+
+/// Whether a refusal at `step` is what `expect` asks for.
+fn refusal(expect: &Expect, step: Step, err: &MorunaError) -> Result<(), String> {
+    let at_step = step_name(step);
+    match expect {
+        Expect::Error { at, contains } if *at == step => match contains {
+            Some(text) if !err.to_string().contains(text.as_str()) => Err(format!(
+                "refused at {at_step} with `{err}`, which does not contain `{text}`"
+            )),
+            _ => Ok(()),
+        },
+        Expect::Error { at, .. } => Err(format!(
+            "refused at {at_step} with `{err}`; the case expects a refusal at {}",
+            step_name(*at)
+        )),
+        Expect::Output(_) => Err(format!("refused at {at_step}: {err}")),
+    }
+}
+
+/// Two schemas agree when they have the same columns, by name, type and nullability, in order.
+/// Metadata is not compared.
+fn same_schema(what: &str, got: &Schema, want: &Schema) -> Result<(), String> {
+    let shape = |s: &Schema| -> Vec<(String, DataType, bool)> {
+        s.fields()
+            .iter()
+            .map(|f| (f.name().clone(), f.data_type().clone(), f.is_nullable()))
+            .collect()
+    };
+    if shape(got) == shape(want) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{what} is {:?}; the expected output's is {:?}",
+            shape(got),
+            shape(want)
+        ))
+    }
+}
+
+/// Run one case against one implementation.
+fn run_case(
+    dir: &Path,
+    case: &Case,
+    spec: &SpecVersion,
+    implementation: &Implementation,
+    alloc: &Arc<dyn Allocator>,
+) -> Result<(), String> {
+    let mut arrays = BTreeMap::new();
+    for (name, source) in &case.arrays {
+        let (_, batches) = read_source(dir, source)?;
+        let batch = batches
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("the array `{name}` has no batch"))?;
+        arrays.insert(name.clone(), batch);
+    }
+    let inputs = case
+        .inputs
+        .iter()
+        .map(|s| read_source(dir, s))
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected = match &case.expect {
+        Expect::Output(file) => Some(read_source(
+            dir,
+            &Source {
+                file: file.clone(),
+                slice: None,
+            },
+        )?),
+        Expect::Error { .. } => None,
+    };
+    let params = Params {
+        json: case.params.clone(),
+        arrays,
+    };
+    let kernel = match (implementation.configure)(case.version, &params) {
+        Ok(kernel) => kernel,
+        Err(e) => return refusal(&case.expect, Step::Configure, &e),
+    };
+    let stateful = matches!(kernel.kind(), KernelKind::Stateful { .. });
+    if stateful == (spec.shape == StateShape::None) {
+        return Err(format!(
+            "the specification's state shape is {:?} and the kernel is {}",
+            spec.shape,
+            if stateful { "stateful" } else { "stateless" }
+        ));
+    }
+    if inputs.len() > usize::from(kernel.max_inputs()) {
+        return Err(format!(
+            "the case gives {} inputs and the kernel takes at most {}",
+            inputs.len(),
+            kernel.max_inputs()
+        ));
+    }
+    let schemas: Vec<SourceSchema> = inputs
+        .iter()
+        .map(|(schema, _)| SourceSchema::Table(Arc::clone(schema)))
+        .collect();
+    let declared = match kernel.output_schema_of(&schemas) {
+        Ok(SourceSchema::Table(schema)) => schema,
+        Ok(SourceSchema::Tensor { .. }) => return Err("it declares a tensor output".into()),
+        Err(e) => return refusal(&case.expect, Step::Schema, &e),
+    };
+    if let Some((want, _)) = &expected {
+        same_schema("the declared output schema", &declared, want)?;
+    }
+    let mut state = kernel
+        .init(&InitCtx {
+            instance: 0,
+            device: None,
+            alloc: Arc::clone(alloc),
+        })
+        .map_err(|e| format!("init: {e}"))?;
+    let mut outputs = Vec::new();
+    let applied = feed(
+        kernel.as_ref(),
+        state.as_mut(),
+        &inputs,
+        stateful,
+        &mut outputs,
+    );
+    if let Err(e) = applied {
+        return refusal(&case.expect, Step::Apply, &e);
+    }
+    let Some((want_schema, want)) = expected else {
+        return Err("it gave its output; the case expects a refusal".into());
+    };
+    let mut got = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        match output {
+            Payload::Table(batch, _) => {
+                same_schema("an output batch's schema", &batch.schema(), &want_schema)?;
+                got.push(batch);
+            }
+            Payload::Tensor(..) => return Err("it gave a tensor".into()),
+        }
+    }
+    let got = concat_batches(&want_schema, &got).map_err(|e| format!("its output: {e}"))?;
+    let want = concat_batches(&want_schema, &want).map_err(|e| format!("the expected: {e}"))?;
+    let mut allowed = BTreeMap::new();
+    for (column, source) in &case.allowed {
+        let (schema, batches) = read_source(dir, source)?;
+        let arrays: Vec<&dyn Array> = batches.iter().map(|b| b.column(0).as_ref()).collect();
+        let array = match arrays.as_slice() {
+            [] => new_empty_array(schema.field(0).data_type()),
+            some => concat(some).map_err(|e| format!("the allowed error of `{column}`: {e}"))?,
+        };
+        allowed.insert(column.clone(), array);
+    }
+    compare(&got, &want, &spec.precision, &allowed)
+}
+
+/// Give a case's batches to an instance, as the engine would: one input, each batch to
+/// `apply`; several inputs joined by morsel, the batches of one position together to
+/// `apply_aligned`; otherwise each port's batches in turn to `apply_port`, port 0 first. Then,
+/// for a stateful kernel, `finish`.
+fn feed(
+    kernel: &dyn Kernel,
+    state: &mut dyn KernelState,
+    inputs: &[(SchemaRef, Vec<RecordBatch>)],
+    stateful: bool,
+    outputs: &mut Vec<Payload>,
+) -> moruna_kernel::Result<()> {
+    match inputs {
+        [(_, batches)] => {
+            for batch in batches {
+                outputs.push(kernel.apply(state, Payload::table(batch.clone())?)?);
+            }
+        }
+        many if kernel.aligns_inputs() => {
+            let count = many.first().map_or(0, |(_, b)| b.len());
+            if many.iter().any(|(_, b)| b.len() != count) {
+                return Err(MorunaError::Plan(
+                    "a kernel that joins its inputs by morsel is given ports of different batch \
+                     counts"
+                        .into(),
+                ));
+            }
+            for at in 0..count {
+                let joined = many
+                    .iter()
+                    .map(|(_, b)| Payload::table(b[at].clone()))
+                    .collect::<moruna_kernel::Result<Vec<_>>>()?;
+                outputs.push(kernel.apply_aligned(state, joined)?);
+            }
+        }
+        many => {
+            for (port, (_, batches)) in many.iter().enumerate() {
+                let port = u16::try_from(port)
+                    .map_err(|_| MorunaError::Plan("more than 65535 inputs".into()))?;
+                for batch in batches {
+                    outputs.push(kernel.apply_port(state, port, Payload::table(batch.clone())?)?);
+                }
+            }
+        }
+    }
+    if stateful && let Some(last) = kernel.finish(state)? {
+        outputs.push(last);
+    }
+    Ok(())
+}
+
+/// The output equals the expected: as many rows, and every column bit for bit, but for the
+/// columns the version bounds ([`Precision::Bounds`]) or the case gives an allowed error for
+/// (`allowed`), which are compared element by element.
+fn compare(
+    got: &RecordBatch,
+    want: &RecordBatch,
+    precision: &Precision,
+    allowed: &BTreeMap<String, ArrayRef>,
+) -> Result<(), String> {
+    if got.num_rows() != want.num_rows() {
+        return Err(format!(
+            "it gave {} rows; the expected output has {}",
+            got.num_rows(),
+            want.num_rows()
+        ));
+    }
+    let schema = want.schema();
+    if let Some(column) = precision
+        .bounds()
+        .into_iter()
+        .flat_map(|t| t.keys())
+        .find(|c| schema.index_of(c).is_err())
+    {
+        return Err(format!(
+            "the tolerance names `{column}`, which the output does not have"
+        ));
+    }
+    for (at, field) in schema.fields().iter().enumerate() {
+        let (g, w) = (got.column(at).as_ref(), want.column(at).as_ref());
+        let rule = match (
+            allowed.get(field.name()),
+            precision.bounds().and_then(|t| t.get(field.name())),
+        ) {
+            (Some(allowed), _) => Some(Rule::Allowed(allowed.as_ref())),
+            (None, Some(bound)) => Some(Rule::Bound(bound)),
+            (None, None) => None,
+        };
+        match rule {
+            Some(rule) => close(g, w, rule),
+            None => exact(g, w),
+        }
+        .map_err(|why| format!("column `{}`: {why}", field.name()))?;
+    }
+    Ok(())
+}
+
+/// A value of an array, for a message.
+fn shown(array: &dyn Array, row: usize) -> String {
+    if array.is_null(row) {
+        return "null".into();
+    }
+    array_value_to_string(array, row).unwrap_or_else(|e| format!("<{e}>"))
+}
+
+/// Logical equality, bit for bit for floats; the first row that differs when not.
+fn exact(got: &dyn Array, want: &dyn Array) -> Result<(), String> {
+    if got.data_type() == want.data_type() && got.to_data() == want.to_data() {
+        return Ok(());
+    }
+    if got.data_type() != want.data_type() || got.len() != want.len() {
+        return Err(format!(
+            "it is {} of {} values; expected {} of {}",
+            got.data_type(),
+            got.len(),
+            want.data_type(),
+            want.len()
+        ));
+    }
+    let row = (0..want.len())
+        .find(|r| got.slice(*r, 1).to_data() != want.slice(*r, 1).to_data())
+        .unwrap_or(0);
+    Err(format!(
+        "row {row} is {}; expected {}",
+        shown(got, row),
+        shown(want, row)
+    ))
+}
+
+/// How a float element may differ from the expected one.
+#[derive(Copy, Clone)]
+enum Rule<'a> {
+    /// The version's bound for the column.
+    Bound(&'a Bound),
+    /// The case's allowed error, an array of the column's shape with `Float64` leaves.
+    Allowed(&'a dyn Array),
+}
+
+/// Equal but for float elements, which are within `rule`: floats, and lists of them.
+fn close(got: &dyn Array, want: &dyn Array, rule: Rule<'_>) -> Result<(), String> {
+    if got.data_type() != want.data_type() || got.len() != want.len() {
+        return exact(got, want);
+    }
+    if let Some(row) = (0..want.len()).find(|r| got.is_null(*r) != want.is_null(*r)) {
+        return Err(format!(
+            "row {row} is {}; expected {}",
+            shown(got, row),
+            shown(want, row)
+        ));
+    }
+    if let Rule::Allowed(allowed) = rule
+        && allowed.len() != want.len()
+    {
+        return Err(format!(
+            "the allowed error has {} values for {}",
+            allowed.len(),
+            want.len()
+        ));
+    }
+    let rows = || (0..want.len()).filter(|r| want.is_valid(*r));
+    // The rule for row `row`'s children: the same bound, or the allowed list's row; a null
+    // allowed row is bit for bit.
+    let child = |row: usize, f: &dyn Fn(&dyn Array) -> ArrayRef| -> Option<Option<ArrayRef>> {
+        match rule {
+            Rule::Bound(_) => Some(None),
+            Rule::Allowed(allowed) if allowed.is_null(row) => None,
+            Rule::Allowed(allowed) => Some(Some(f(allowed))),
+        }
+    };
+    let recurse = |row: usize, g: ArrayRef, w: ArrayRef, a: Option<Option<ArrayRef>>| {
+        match a {
+            None => exact(g.as_ref(), w.as_ref()),
+            Some(None) => close(g.as_ref(), w.as_ref(), rule),
+            Some(Some(a)) => close(g.as_ref(), w.as_ref(), Rule::Allowed(a.as_ref())),
+        }
+        .map_err(|why| format!("row {row}: {why}"))
+    };
+    match want.data_type() {
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+            let as_f64 = |a: &dyn Array| cast(a, &DataType::Float64).map_err(|e| e.to_string());
+            let (g, w) = (as_f64(got)?, as_f64(want)?);
+            let (g, w) = (
+                g.as_primitive::<Float64Type>(),
+                w.as_primitive::<Float64Type>(),
+            );
+            for row in rows() {
+                let (v, e) = (g.value(row), w.value(row));
+                let ok = match rule {
+                    Rule::Bound(bound) => bound.within(v, e),
+                    Rule::Allowed(allowed) if allowed.is_null(row) => v.to_bits() == e.to_bits(),
+                    Rule::Allowed(allowed) => Bound {
+                        abs: allowed.as_primitive::<Float64Type>().value(row),
+                        rel: 0.0,
+                    }
+                    .within(v, e),
+                };
+                if !ok {
+                    let by = match rule {
+                        Rule::Bound(bound) => format!("within {bound:?}"),
+                        Rule::Allowed(allowed) if allowed.is_null(row) => "bit for bit".into(),
+                        Rule::Allowed(allowed) => format!(
+                            "within {}",
+                            allowed.as_primitive::<Float64Type>().value(row)
+                        ),
+                    };
+                    return Err(format!("row {row} is {v}; expected {e} {by}"));
+                }
+            }
+            Ok(())
+        }
+        DataType::FixedSizeList(..) => {
+            let (g, w) = (got.as_fixed_size_list(), want.as_fixed_size_list());
+            for row in rows() {
+                let a = child(row, &|a| a.as_fixed_size_list().value(row));
+                recurse(row, g.value(row), w.value(row), a)?;
+            }
+            Ok(())
+        }
+        DataType::List(_) => {
+            let (g, w) = (got.as_list::<i32>(), want.as_list::<i32>());
+            for row in rows() {
+                let a = child(row, &|a| a.as_list::<i32>().value(row));
+                recurse(row, g.value(row), w.value(row), a)?;
+            }
+            Ok(())
+        }
+        DataType::LargeList(_) => {
+            let (g, w) = (got.as_list::<i64>(), want.as_list::<i64>());
+            for row in rows() {
+                let a = child(row, &|a| a.as_list::<i64>().value(row));
+                recurse(row, g.value(row), w.value(row), a)?;
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "a tolerance applies to floats and lists of them, not {other}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use moruna_kernel::arrow::array::{
+        FixedSizeListArray, Float32Array, Float64Array, Int64Array, LargeListArray, ListArray,
+    };
+    use moruna_kernel::arrow::buffer::{NullBuffer, OffsetBuffer};
+
     use super::*;
 
     #[test]
@@ -1301,5 +1825,274 @@ mod tests {
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("in that order"));
         assert!(!check_template("prose\n").is_empty());
+    }
+
+    fn batch_of(name: &str, array: ArrayRef) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                name,
+                array.data_type().clone(),
+                true,
+            )])),
+            vec![array],
+        )
+        .expect("batch")
+    }
+
+    fn none() -> BTreeMap<String, ArrayRef> {
+        BTreeMap::new()
+    }
+
+    fn bounds(abs: f64) -> Precision {
+        Precision::Bounds(Tolerance::from([(
+            "f".to_string(),
+            Bound { abs, rel: 0.0 },
+        )]))
+    }
+
+    #[test]
+    fn exact_comparison_names_the_first_row_that_differs() {
+        let want = batch_of(
+            "v",
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])),
+        );
+        assert_eq!(compare(&want, &want, &Precision::Exact, &none()), Ok(()));
+        let got = batch_of(
+            "v",
+            Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)])),
+        );
+        let err = compare(&got, &want, &Precision::Exact, &none()).expect_err("differs");
+        assert!(
+            err.contains("column `v`: row 1 is 2; expected null"),
+            "{err}"
+        );
+        let short = batch_of("v", Arc::new(Int64Array::from(vec![1])));
+        let err = compare(&short, &want, &Precision::Exact, &none()).expect_err("rows");
+        assert!(err.contains("gave 1 rows"), "{err}");
+        // Floats are compared bit for bit: -0.0 is not 0.0, and NaN is NaN.
+        let a = batch_of("f", Arc::new(Float64Array::from(vec![0.0, f64::NAN])));
+        let b = batch_of("f", Arc::new(Float64Array::from(vec![-0.0, f64::NAN])));
+        let err = compare(&a, &b, &Precision::Exact, &none()).expect_err("signed zero");
+        assert!(err.contains("row 0"), "{err}");
+        assert_eq!(compare(&b, &b, &Precision::Exact, &none()), Ok(()));
+        let err = exact(a.column(0).as_ref(), want.column(0).as_ref()).expect_err("types");
+        assert!(err.contains("expected Int64"), "{err}");
+    }
+
+    #[test]
+    fn a_bound_applies_to_floats_and_lists_of_them() {
+        let want = batch_of(
+            "f",
+            Arc::new(Float32Array::from(vec![Some(1.0), None, Some(3.0)])),
+        );
+        let got = batch_of(
+            "f",
+            Arc::new(Float32Array::from(vec![Some(1.25), None, Some(3.0)])),
+        );
+        assert_eq!(compare(&got, &want, &bounds(0.5), &none()), Ok(()));
+        let err = compare(&got, &want, &bounds(0.1), &none()).expect_err("outside");
+        assert!(err.contains("row 0 is 1.25; expected 1 within"), "{err}");
+        let nulls = batch_of(
+            "f",
+            Arc::new(Float32Array::from(vec![Some(1.0), Some(2.0), Some(3.0)])),
+        );
+        let err = compare(&nulls, &want, &bounds(9.0), &none()).expect_err("null");
+        assert!(err.contains("row 1"), "{err}");
+        let other = Precision::Bounds(Tolerance::from([(
+            "g".to_string(),
+            Bound { abs: 0.0, rel: 0.0 },
+        )]));
+        let err = compare(&want, &want, &other, &none()).expect_err("names g");
+        assert!(err.contains("`g`"), "{err}");
+        let ints = batch_of("f", Arc::new(Int64Array::from(vec![1, 2, 3])));
+        let err = compare(&ints, &ints, &bounds(1.0), &none()).expect_err("ints");
+        assert!(err.contains("floats"), "{err}");
+        let wider = batch_of(
+            "f",
+            Arc::new(Float64Array::from(vec![Some(1.0), None, Some(3.0)])),
+        );
+        assert!(compare(&wider, &want, &bounds(1.0), &none()).is_err());
+
+        let item = Arc::new(Field::new("item", DataType::Float64, true));
+        let fixed = |v: Vec<f64>| -> ArrayRef {
+            Arc::new(
+                FixedSizeListArray::try_new(
+                    Arc::clone(&item),
+                    2,
+                    Arc::new(Float64Array::from(v)),
+                    Some(NullBuffer::from(vec![true, false])),
+                )
+                .expect("fixed"),
+            )
+        };
+        let want = batch_of("f", fixed(vec![1.0, 2.0, 0.0, 0.0]));
+        let close_by = batch_of("f", fixed(vec![1.0, 2.05, 9.0, 9.0]));
+        assert_eq!(compare(&close_by, &want, &bounds(0.1), &none()), Ok(()));
+        let err = compare(&close_by, &want, &bounds(0.01), &none()).expect_err("far");
+        assert!(err.contains("row 0: row 1 is 2.05"), "{err}");
+
+        let list = |v: Vec<f64>| -> ArrayRef {
+            Arc::new(ListArray::new(
+                Arc::clone(&item),
+                OffsetBuffer::from_lengths([1, 2]),
+                Arc::new(Float64Array::from(v)),
+                None,
+            ))
+        };
+        let want = batch_of("f", list(vec![1.0, 2.0, 3.0]));
+        let close_by = batch_of("f", list(vec![1.0, 2.0, 3.05]));
+        assert_eq!(compare(&close_by, &want, &bounds(0.1), &none()), Ok(()));
+        assert!(compare(&close_by, &want, &bounds(0.01), &none()).is_err());
+        let large = |v: Vec<f64>| -> ArrayRef {
+            Arc::new(LargeListArray::new(
+                Arc::clone(&item),
+                OffsetBuffer::from_lengths([3]),
+                Arc::new(Float64Array::from(v)),
+                None,
+            ))
+        };
+        let want = batch_of("f", large(vec![1.0, 2.0, 3.0]));
+        let close_by = batch_of("f", large(vec![1.0, 2.0, 3.05]));
+        assert_eq!(compare(&close_by, &want, &bounds(0.1), &none()), Ok(()));
+        assert!(compare(&close_by, &want, &bounds(0.01), &none()).is_err());
+    }
+
+    #[test]
+    fn an_allowed_error_applies_element_by_element() {
+        let want = batch_of(
+            "f",
+            Arc::new(Float64Array::from(vec![
+                Some(1.0),
+                None,
+                Some(100.0),
+                Some(5.0),
+            ])),
+        );
+        let got = batch_of(
+            "f",
+            Arc::new(Float64Array::from(vec![
+                Some(1.01),
+                None,
+                Some(101.0),
+                Some(5.0),
+            ])),
+        );
+        let allowed = |v: Vec<Option<f64>>| -> BTreeMap<String, ArrayRef> {
+            BTreeMap::from([("f".to_string(), Arc::new(Float64Array::from(v)) as ArrayRef)])
+        };
+        let ok = allowed(vec![Some(0.02), None, Some(1.0), None]);
+        assert_eq!(compare(&got, &want, &Precision::PerElement, &ok), Ok(()));
+        let tight = allowed(vec![Some(0.02), None, Some(0.5), None]);
+        let err = compare(&got, &want, &Precision::PerElement, &tight).expect_err("row 2");
+        assert!(
+            err.contains("row 2 is 101; expected 100 within 0.5"),
+            "{err}"
+        );
+        let exact_row = allowed(vec![None, None, Some(1.0), None]);
+        let err = compare(&got, &want, &Precision::PerElement, &exact_row).expect_err("row 0");
+        assert!(
+            err.contains("row 0 is 1.01; expected 1 bit for bit"),
+            "{err}"
+        );
+        let short = allowed(vec![Some(1.0)]);
+        let err = compare(&got, &want, &Precision::PerElement, &short).expect_err("short");
+        assert!(
+            err.contains("the allowed error has 1 values for 4"),
+            "{err}"
+        );
+        // Without `allowed`, a per-element version compares bit for bit.
+        assert!(compare(&got, &want, &Precision::PerElement, &none()).is_err());
+
+        // A FixedSizeList<Float32> column, one allowed value per element; a null allowed row
+        // is bit for bit.
+        let item32 = Arc::new(Field::new("item", DataType::Float32, true));
+        let item64 = Arc::new(Field::new("item", DataType::Float64, true));
+        let fixed = |v: Vec<f32>| -> ArrayRef {
+            Arc::new(
+                FixedSizeListArray::try_new(
+                    Arc::clone(&item32),
+                    2,
+                    Arc::new(Float32Array::from(v)),
+                    None,
+                )
+                .expect("fixed"),
+            )
+        };
+        let want = batch_of("f", fixed(vec![1.0, 2.0, 3.0, 4.0]));
+        let got = batch_of("f", fixed(vec![1.0, 2.5, 3.0, 4.0]));
+        let per = |v: Vec<f64>, nulls: Option<Vec<bool>>| -> BTreeMap<String, ArrayRef> {
+            let array = FixedSizeListArray::try_new(
+                Arc::clone(&item64),
+                2,
+                Arc::new(Float64Array::from(v)),
+                nulls.map(NullBuffer::from),
+            )
+            .expect("allowed");
+            BTreeMap::from([("f".to_string(), Arc::new(array) as ArrayRef)])
+        };
+        let ok = per(vec![0.0, 0.5, 0.0, 0.0], None);
+        assert_eq!(compare(&got, &want, &Precision::PerElement, &ok), Ok(()));
+        let tight = per(vec![0.5, 0.1, 0.0, 0.0], None);
+        let err = compare(&got, &want, &Precision::PerElement, &tight).expect_err("tight");
+        assert!(
+            err.contains("row 0: row 1 is 2.5; expected 2 within 0.1"),
+            "{err}"
+        );
+        let null_row = per(vec![0.5, 0.5, 0.0, 0.0], Some(vec![false, true]));
+        let err = compare(&got, &want, &Precision::PerElement, &null_row).expect_err("exact");
+        assert!(err.contains("row 0: row 1 is 2.5; expected 2"), "{err}");
+    }
+
+    #[test]
+    fn allowed_types_mirror_the_output() {
+        let f32_list =
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 4);
+        let want =
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 4);
+        assert_eq!(allowed_type(&f32_list), Some(want.clone()));
+        assert!(same_shape(&want, &allowed_type(&f32_list).expect("shape")));
+        assert!(!same_shape(&DataType::Float32, &DataType::Float64));
+        let list = DataType::List(Arc::new(Field::new("x", DataType::Float16, true)));
+        let large = DataType::LargeList(Arc::new(Field::new("x", DataType::Float16, true)));
+        assert!(same_shape(
+            &allowed_type(&list).expect("list"),
+            &allowed_type(&list).expect("list")
+        ));
+        assert!(!same_shape(
+            &allowed_type(&list).expect("list"),
+            &allowed_type(&large).expect("large")
+        ));
+        assert_eq!(allowed_type(&DataType::Int64), None);
+        let nested = DataType::List(Arc::new(Field::new("x", DataType::Utf8, true)));
+        assert_eq!(allowed_type(&nested), None);
+    }
+
+    #[test]
+    fn schemas_agree_by_name_type_and_nullability() {
+        let a = Schema::new(vec![Field::new("x", DataType::Int64, true)]);
+        let b = Schema::new(vec![Field::new("x", DataType::Int64, false)]);
+        assert_eq!(same_schema("s", &a, &a), Ok(()));
+        assert!(same_schema("s", &a, &b).is_err());
+        let meta = a
+            .clone()
+            .with_metadata([("k".to_string(), "v".to_string())].into());
+        assert_eq!(same_schema("s", &meta, &a), Ok(()));
+    }
+
+    #[test]
+    fn a_refusal_matches_its_step_and_words() {
+        let err = MorunaError::Plan("it overflows".into());
+        let expect = Expect::Error {
+            at: Step::Apply,
+            contains: Some("overflow".into()),
+        };
+        assert_eq!(refusal(&expect, Step::Apply, &err), Ok(()));
+        assert!(refusal(&expect, Step::Schema, &err).is_err());
+        let other = Expect::Error {
+            at: Step::Apply,
+            contains: Some("range".into()),
+        };
+        assert!(refusal(&other, Step::Apply, &err).is_err());
+        assert!(refusal(&Expect::Output("x".into()), Step::Configure, &err).is_err());
     }
 }
