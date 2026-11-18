@@ -427,11 +427,13 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
     // TLS's time is the node's one wall clock, the core's clock page (system design 3D): set at
     // boot from the machine's clock, and by `platform` from its cloud's `Date`. While it is
     // unset, `start_tls` is refused `TlsUnavailable`. With no roots there is no TLS at all.
+    let mut tls_roots = None;
     if let Some(roots) = start::take("tls-roots") {
         let page = ClockPage::map().map_err(|e| format!("the clock page: {}", e.name()))?;
         let time = moruna_netstack::tls::TrustedTime::new(move || page.realtime());
-        let trust =
-            moruna_netstack::tls::Trust::new(read_tls_roots(roots)?, time).map_err(String::from)?;
+        let roots = read_tls_roots(roots)?;
+        tls_roots = Some(roots.len());
+        let trust = moruna_netstack::tls::Trust::new(roots, time).map_err(String::from)?;
         stack.install_tls(trust)?;
     }
     let in_flight = stack.settings.card_sends_in_flight;
@@ -441,6 +443,9 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
         config.grants.len(),
         start::cpus()
     );
+    if let Some(count) = tls_roots {
+        up.push_str(&format!(", TLS with {count} roots"));
+    }
     for (k, x) in stack.ifaces.iter().enumerate() {
         let addrs: Vec<String> = x.info().addrs.iter().map(|c| format!("{c}")).collect();
         let card = if k == 0 {
