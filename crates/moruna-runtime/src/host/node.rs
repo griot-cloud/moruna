@@ -132,6 +132,32 @@ pub fn parse_volumes(text: &str) -> Result<Vec<NodeVolume>, String> {
         .collect()
 }
 
+/// The job's network (system design 3D, item 3.4): on the Moruna kernel, the channel
+/// `node-admission` minted for the hosts the job's check named, installed as the object-store
+/// connector's network, its sockets charged to the engine's own account. `Ok(false)` when the
+/// engine was given none (its job names no host, or it runs off the kernel); an error when it
+/// was given one it cannot use.
+pub fn install_network() -> Result<bool, String> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        use moruna_storage::net::native;
+        if !moruna_micro::start::slots()
+            .iter()
+            .any(|slot| slot == native::SLOT)
+        {
+            return Ok(false);
+        }
+        let account = moruna_micro::start::take("account")
+            .ok_or("the engine was given a network and no account to charge its sockets to")?;
+        if !native::install_from_start(moruna_sys::Account(account)) {
+            return Err("the job's network was taken or installed already".into());
+        }
+        Ok(true)
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    Ok(false)
+}
+
 /// The budget `job` runs with on `node`: the document's, or, when it names none, the most the
 /// node allows.
 pub fn budget(job: &Job, node: &Node) -> Option<u64> {

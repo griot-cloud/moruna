@@ -463,3 +463,10 @@ fn a_staging_volume_is_written_and_said_to_be_staging() {
     document["staging"] = json!({"dir": "disk://vol-out/s/"});
     assert!(refusals(&job(document), &on).is_empty());
 }
+
+#[test]
+fn off_the_kernel_an_engine_has_no_network_to_install() {
+    // The job's network is a channel of the Moruna kernel: anywhere else there is none, and the
+    // job's object stores are built as they are off a node (item 3.4).
+    assert_eq!(install_network(), Ok(false));
+}

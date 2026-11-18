@@ -113,7 +113,7 @@ fn the_engine_s_configurations_are_its_supervisor_s() {
         [
             ("linux", &Source::Personality),
             ("engine", &Source::Channel("engine".into())),
-            ("network", &Source::Service("network".into())),
+            ("network", &Source::Channel("network".into())),
         ]
     );
     // A job that names no host has no network (item 3.4).
