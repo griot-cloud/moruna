@@ -45,6 +45,14 @@ use crate::{HostRegion, Inner};
 /// The most bytes of free slots one thread's cache holds (02 f.3). A refill takes at most half
 /// of it, and a release that would take the cache past it flushes the cache down to half first.
 /// Only classes of at most a quantum are cached, 64 KiB to 1 MiB.
+///
+/// Why 1 MiB and not 8 (PM, 2026-11-18). Above the quantum a buffer takes the regions' path and
+/// shares its lock and counters: about 600 ns a pair with eight threads, against 2 times one
+/// thread's 40 or so for a cached class. A buffer of 2 MiB or more takes tens to hundreds of
+/// microseconds to fill, so that is under 1% of its use. An 8 MiB quantum brought every class
+/// to about 2 times (measured), but each thread would then hold up to 8 MiB of free slots and
+/// widen the peak's bound by as much (AR-I5): real memory out of a small node's budget, to save
+/// under 1%.
 pub const REFILL_QUANTUM: u64 = 1024 * 1024;
 
 /// The classes a cache keeps: 0 to the class of [`REFILL_QUANTUM`].
