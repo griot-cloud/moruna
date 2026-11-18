@@ -24,6 +24,11 @@ impl Volume {
     pub(crate) fn async_wait_handle(&self) -> Result<Handle, Refusal> {
         self.device.async_wait_handle().map_err(device_refusal)
     }
+    /// Reads every answer the driver has sent and files it, once a turn before the
+    /// turn's futures poll their tickets (work item 1.3c, `Device::file_answers`).
+    pub(crate) fn file_answers(&self) -> Result<(), Refusal> {
+        self.device.file_answers().map_err(device_refusal)
+    }
     /// Explicit bounded admission; configuration never creates a second connection.
     pub fn configure_async(&self, limit: usize) -> Result<(), Refusal> {
         self.device.configure_async(limit).map_err(device_refusal)

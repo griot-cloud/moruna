@@ -10,7 +10,7 @@ pub mod admission;
 pub mod authority;
 #[cfg(target_os = "none")]
 pub mod delegation;
-#[cfg(target_os = "none")]
+// On the host too: the device and its tickets are tested there (work item 1.3c).
 pub mod device;
 #[cfg(target_os = "none")]
 pub mod encrypted;

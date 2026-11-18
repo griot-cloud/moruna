@@ -310,6 +310,12 @@ impl Watch for OwnerWatch {
             let mut handles = [];
             while self.kick.read(&mut bytes, &mut handles).is_ok() {}
         }
+        // The driver's answers read to the end and filed once, then each ticket the turn
+        // polls takes its own (work item 1.3c, device_async's rule). Not read now, they
+        // keep the channel readable, and the next turn reads them.
+        if let Ok(volume) = self.owner.volume.try_borrow() {
+            let _ = volume.file_answers();
+        }
         for (pending, outcome) in self.owner.advance() {
             done.complete(pending, outcome);
         }
