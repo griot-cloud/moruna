@@ -2,9 +2,13 @@
 //! Azure's synthetic network card, served as `moruna.driver.net`.
 //!
 //! The supervisor starts it on Hyper-V only, as a client of `vmbus` (a service whose server
-//! is not on a machine is not on it either). It holds its own DMA grant, a copy of
-//! `root.dma` (1F's Hyper-V rule).
+//! is not on a machine is not on it either). It holds no DMA grant: `vmbus` pins the
+//! buffers it shares, and a frame is copied into a send section, so netvsc pins nothing
+//! (1F: a VMBus driver gets a grant only if it pins memory itself).
 //!
+//! 0. It connects to the device manager through its `register-netvsc` listener first
+//!    thing, before the card is up: while that connection is open, a lookup of a name
+//!    nothing has yet, the network server's of `net0`, waits for it.
 //! 1. Through `vmbus`'s `net` listener it lists the synthetic network cards' offers and
 //!    opens the first card's channel; another card is said on the console and not served
 //!    (1C: one interface, on the first card).
@@ -15,11 +19,13 @@
 //!    as every network driver does ([`Driver`]), and registers that listener with the
 //!    device manager as [`NAME`] through the link that carries only that right, so the
 //!    network server finds the card as `net0` and `network.conf` is the same on every
-//!    cloud (1C).
+//!    cloud (1C). Then it closes that connection: it has finished registering.
 //!
 //! A frame out is copied into a free section of the send buffer and named to the host; a
 //! frame in is copied out of its receive section to each subscribed connection, and the
-//! section goes back to the host. Between turns the process waits only on handles: its
+//! section goes back to the host. The frames a turn puts go to the host together, one
+//! commit of the ring and at most one signal (VMBus's rule), not a signal a frame.
+//! Between turns the process waits only on handles: its
 //! clients' channels and the card's wake channel, after asking the host to signal
 //! ([`moruna_netvsc::Netvsc::arm`]), as `storvsc` does. Everything it needs of the node is
 //! in `node.rs`, so this library is tested on a host against `moruna-netvsc`'s fake netvsp.
@@ -40,20 +46,21 @@ use net_protocol::{Info, Ring, Server, net, octets};
 /// The name the card is registered under, which the network server looks up (1C).
 pub const NAME: &str = "net0";
 
-/// The pages of the channel's rings: a control page and 32 of data a ring (128 KiB), the
-/// outgoing ring first, as `storvsc`'s. Frames travel in the buffers, so a ring carries
-/// only small packets that name sections: some two thousand of them each way.
-pub const RING_PAGES: u32 = 66;
+/// The pages of the channel's rings: each ring a control page and 128 of data (512 KiB),
+/// as Linux's netvsc sizes them (`ring_size` 128), the outgoing ring first. netvsp is
+/// tuned for Linux's sizes; item 3.4's throughput measurement on Azure judges them.
+pub const RING_PAGES: u32 = 2 * (1 + 128);
 
 /// The outgoing ring's pages among [`RING_PAGES`].
-pub const OUTGOING_PAGES: u32 = 33;
+pub const OUTGOING_PAGES: u32 = 1 + 128;
 
-/// Bytes of the receive buffer, which the host cuts into sections of a frame each: some
-/// twelve hundred frames of a 1,500-byte MTU in flight.
-pub const RECEIVE_BUFFER: usize = 2 << 20;
+/// Bytes of the receive buffer, which the host cuts into sections of a frame each: 16 MiB,
+/// Linux's netvsc's.
+pub const RECEIVE_BUFFER: usize = 16 << 20;
 
-/// Bytes of the send buffer, in the host's sections of 6,144 bytes: 170 frames in flight.
-pub const SEND_BUFFER: usize = 1 << 20;
+/// Bytes of the send buffer: 6 MiB, Linux's netvsc's 1,024 sections of the host's 6,144
+/// bytes, so 1,024 frames in flight.
+pub const SEND_BUFFER: usize = 6 << 20;
 
 /// The most refusals said on the console; the rest are only counted.
 const REFUSAL_LINES: u64 = 16;
@@ -89,19 +96,20 @@ pub fn describe<C: Channel, S: Shared>(card: &Netvsc<C, S>) -> String {
 struct Transmit<'a, C: Channel, S: Shared>(&'a mut Netvsc<C, S>);
 
 impl<C: Channel, S: Shared> Ring for Transmit<'_, C, S> {
-    /// A frame into a free send section: `Ok(false)` while none is free or the ring to
-    /// the host is full, until the host's completions or its room arrive. The server
-    /// refuses a frame no card of this MTU sends before it gets here, so an error is the
-    /// channel's or the ring's.
+    /// A frame into a free send section, written to the ring and not yet committed:
+    /// `Ok(false)` while no section is free or the ring to the host is full, until the
+    /// host's completions or its room arrive. The server refuses a frame no card of this
+    /// MTU sends before it gets here, so an error is the channel's or the ring's.
     fn put(&mut self, frame: &[u8]) -> Result<bool, String> {
         self.0
             .send(frame)
             .map_err(|e| format!("sending a frame: {e}"))
     }
 
-    /// Each frame is named to the host, and the host signalled, as it is put.
+    /// The frames put since the last flush go to the host together: one commit, and a
+    /// signal only if VMBus's rule asks for one.
     fn flush(&mut self) -> Result<(), String> {
-        Ok(())
+        self.0.flush().map_err(|e| format!("sending frames: {e}"))
     }
 }
 

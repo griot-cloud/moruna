@@ -476,9 +476,12 @@ fn one_send_section_is_enough_whenever_the_host_completes_a_request() {
         assert_eq!(card.mac(), MAC, "{completes:?}");
         assert_eq!(card.mtu(), 1500);
         // The host may still hold the section the last request used. The caller's
-        // loop is a wait and a poll, which brings it back.
-        while card.wait() == Ok(Wait::Signalled) {
+        // loop is a poll until nothing, then a wait, which brings it back.
+        loop {
             assert_eq!(drain(&mut card), []);
+            if card.wait() != Ok(Wait::Signalled) {
+                break;
+            }
         }
         // And the one section carries frames, one at a time.
         host.borrow_mut().hold = true;
@@ -522,9 +525,8 @@ fn a_host_slow_to_read_does_not_stall_the_start() {
 #[test]
 fn the_caller_waits_on_the_cards_channel_between_polls() {
     let (mut card, host) = started(ROOMY);
-    // The host signalled while the card started, and nothing was waited for: the first
-    // wait returns for that, and finds nothing.
-    assert_eq!(card.wait(), Ok(Wait::Signalled));
+    // The start waited for each of the host's answers, and took their signals. What came
+    // with its last answer may be on the ring still: the caller polls before it waits.
     assert_eq!(drain(&mut card), []);
     // Nothing has been sent since.
     assert_eq!(card.wait(), Ok(Wait::TimedOut));

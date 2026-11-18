@@ -338,6 +338,18 @@ impl<C: Channel, N: Node> Driver<C, N> {
 
     /// Hands controller `c` as many waiting transfers as it takes.
     fn submit(&mut self, c: usize) {
+        self.submit_waiting(c);
+        if self.failed.is_some() {
+            return;
+        }
+        // What was sent goes to the host together: one commit, at most one signal.
+        if let Err(e) = self.controllers[c].commit() {
+            self.fail(format!("controller {c}: {e}"));
+        }
+    }
+
+    /// Sends the transfers waiting on controller `c`, in order, until one finds no room.
+    fn submit_waiting(&mut self, c: usize) {
         while let Some(transfer) = self.waiting[c].front() {
             if matches!(transfer.op, Op::Write)
                 && let Some(pin) = transfer.hold.pin()

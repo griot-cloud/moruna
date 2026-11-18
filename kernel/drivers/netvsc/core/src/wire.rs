@@ -2,6 +2,12 @@
 //! host. Signals follow the ring's own rules (`vmbus_ring`): the host is signalled when
 //! a write or a read changes a ring in a way it asked to hear of, and the host is asked
 //! to signal when the ring to it has room again.
+//!
+//! Packets for the host are batched: each is written to the ring at once, and the ones
+//! written since the last [`Wire::flush`] are committed together there, so the host is
+//! signalled at most once for all of them, and only by VMBus's rule (the ring was empty
+//! before the commit and the host has not masked its interrupt). A wait and an arm flush
+//! first, so nothing written is left uncommitted while the driver sleeps.
 
 use alloc::vec::Vec;
 
@@ -9,8 +15,8 @@ use guestmem_core::{MemoryRead, MemoryWrite};
 use moruna_vmbus::{Channel, Wait};
 use netvsp_protocol::protocol::{self, Version};
 use vmbus_ring::{
-    IncomingPacketType, OutgoingPacket, OutgoingPacketType, ReadError, TransferPageRange,
-    WriteError,
+    IncomingPacketType, OutgoingOffset, OutgoingPacket, OutgoingPacketType, ReadError,
+    TransferPageRange, WriteError,
 };
 use zerocopy::{Immutable, IntoBytes};
 
@@ -57,6 +63,9 @@ pub(crate) struct Wire<C: Channel> {
     crowded: bool,
     /// The bytes the host was asked to signal for, while `crowded`.
     wanted: usize,
+    /// Where the packets written since the last flush end: they are not yet committed,
+    /// so the host does not see them.
+    pending: Option<OutgoingOffset>,
     /// When every wait gives up: a time on the node's monotonic clock, in nanoseconds,
     /// as the channel counts it; `None` for never.
     deadline: Option<u64>,
@@ -85,6 +94,7 @@ impl<C: Channel> Wire<C> {
             message: packet_size(None),
             crowded: false,
             wanted: 0,
+            pending: None,
             deadline,
         }
     }
@@ -101,6 +111,7 @@ impl<C: Channel> Wire<C> {
     /// after the caller has read everything, so that a packet that came meanwhile is not
     /// left waiting for a signal already given.
     pub fn arm(&mut self) -> Result<bool, NetvscError> {
+        self.flush()?;
         let incoming = self.channel.incoming();
         incoming.set_interrupt_mask(false);
         let mut at = incoming.incoming()?;
@@ -118,6 +129,7 @@ impl<C: Channel> Wire<C> {
     /// Waits for the host's signal, while initialisation waits for `step`. A wait that
     /// ends at the deadline ends the step.
     pub fn wait(&mut self, step: &'static str) -> Result<(), NetvscError> {
+        self.flush()?;
         match self.channel.wait(self.deadline)? {
             Wait::Signalled => Ok(()),
             Wait::TimedOut => Err(NetvscError::Timeout(step)),
@@ -192,26 +204,37 @@ impl<C: Channel> Wire<C> {
         }))
     }
 
-    /// Puts one packet on the ring to the host; `Ok(false)` when the ring has no room
-    /// for it, and the host has then been asked to signal once it has.
+    /// Writes one packet to the ring to the host, for the next [`flush`](Wire::flush);
+    /// `Ok(false)` when the ring has no room for it even with what was written before
+    /// committed, and the host has then been asked to signal once it has.
     pub fn put(
         &mut self,
         typ: OutgoingPacketType<'_>,
         transaction: u64,
         payload: &[u8],
     ) -> Result<bool, NetvscError> {
-        let outgoing = self.channel.outgoing();
-        let mut at = outgoing.outgoing()?;
         let packet = OutgoingPacket {
             transaction_id: transaction,
             size: payload.len(),
             typ,
         };
         let mut asked = false;
-        let range = loop {
+        let (at, range) = loop {
+            let outgoing = self.channel.outgoing();
+            let batched = self.pending.is_some();
+            let mut at = match self.pending.take() {
+                Some(at) => at,
+                None => outgoing.outgoing()?,
+            };
             match outgoing.write(&mut at, &packet) {
-                Ok(range) => break range,
+                Ok(range) => break (at, range),
                 Err(WriteError::Corrupt(e)) => return Err(e.into()),
+                Err(WriteError::Full(_)) if batched => {
+                    // What was written before goes to the host now, so that it can make
+                    // room; the write is tried again from there.
+                    self.pending = Some(at);
+                    self.flush()?;
+                }
                 Err(WriteError::Full(_)) if asked => return Ok(false),
                 Err(WriteError::Full(bytes)) => {
                     // The host signals once that much is free. It may have made the room
@@ -223,17 +246,27 @@ impl<C: Channel> Wire<C> {
                 }
             }
         };
+        let outgoing = self.channel.outgoing();
         if range.writer(outgoing).write(payload).is_err() {
             return Err(vmbus_ring::Error::InvalidMessageLength.into());
         }
-        let signal = outgoing.commit_write(&mut at);
+        // Written, not yet committed: the host sees it at the next flush.
+        self.pending = Some(at);
         if self.crowded {
             outgoing.set_pending_send_size(0)?;
             self.crowded = false;
         }
-        if signal {
+        Ok(true)
+    }
+
+    /// Commits every packet written since the last flush, and signals the host if VMBus's
+    /// rule says it needs it: once for all of them.
+    pub fn flush(&mut self) -> Result<(), NetvscError> {
+        if let Some(mut at) = self.pending.take()
+            && self.channel.outgoing().commit_write(&mut at)
+        {
             self.channel.signal_host()?;
         }
-        Ok(true)
+        Ok(())
     }
 }

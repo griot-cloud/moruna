@@ -34,8 +34,9 @@ fn device() -> (Storvsc<Link>, Rc<RefCell<Host>>) {
     (device, host)
 }
 
-/// The next completion, which must be there.
+/// The next completion, which must be there once what was sent is committed.
 fn next(device: &mut Storvsc<Link>) -> Completion {
+    device.commit().expect("the commit");
     match device.poll().expect("a completion") {
         Some(Event::Completed(completion)) => completion,
         other => panic!("{other:?} where a completion was due"),

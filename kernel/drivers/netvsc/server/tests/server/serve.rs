@@ -105,6 +105,29 @@ fn frames_out_reach_the_host_in_order_and_are_counted() {
 }
 
 #[test]
+fn a_send_of_many_frames_signals_the_host_once() {
+    // Sections for 42 frames of 6,144 bytes: the whole batch goes at once.
+    let settings = Settings {
+        receive_buffer: 64 * PAGE,
+        send_buffer: 64 * PAGE,
+    };
+    let (mut world, _) = World::new(settings, |_| ());
+    let listener = world.listener(0);
+    let out = frames(0x51, (0..40).map(|i| 60 + i * 30));
+    let batch = wire(&out);
+    let before = world.driver(0).borrow_mut().card().channel().host_signals();
+    let sent = world.serve(thread::spawn(move || client(&listener).send(batch)));
+    assert_eq!(sent, Ok(40));
+    let signals = world.driver(0).borrow_mut().card().channel().host_signals() - before;
+    assert_eq!(signals, 1, "forty frames, one commit, one signal");
+    assert!(
+        world.host(0).borrow().frames == out,
+        "a frame changed or was lost"
+    );
+    assert_clean(world.host(0));
+}
+
+#[test]
 fn frames_in_reach_every_subscribed_connection() {
     let (mut world, commands) = World::new(ROOMY, |_| ());
     let (a, b, c) = (world.listener(0), world.listener(0), world.listener(0));
@@ -285,17 +308,16 @@ fn a_channel_the_host_takes_back_fails_the_driver_and_sends_are_refused() {
     let (first, second) = world.serve(thread::spawn(move || {
         let mut c = client(&listener);
         commands.to(0, |host, _| host.rescind = true);
-        // The send that finds the channel closed is never answered: the process ends, and
-        // the node with it.
-        c.core().set_timeout(SECOND / 2);
+        // The frame is answered once it is on the ring; the commit that follows finds the
+        // channel closed, and the driver fails: the process ends, and the node with it.
         let first = c.send(out.clone());
         let second = c.send(out);
         (first, second)
     }));
-    assert_eq!(first, Err(CallError::TimedOut));
+    assert_eq!(first, Ok(1));
     assert_eq!(second, Err(CallError::Remote(net::Error::Io)));
     assert_eq!(
         world.driver(0).borrow().failed(),
-        Some("sending a frame: the channel is closed")
+        Some("sending frames: the channel is closed")
     );
 }
