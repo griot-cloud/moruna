@@ -42,6 +42,27 @@ def test_canon_is_the_manifest_and_split_blind(job):
     assert canon.canonical(job, again)["hash_all"] == c["hash_all"]
 
 
+def test_canon_py_has_gate_canons_specs():
+    """gate-canon's table (canon.rs, `spec`) governs: canon.py's tolerances and regroupings are
+    the same, read from the Rust source."""
+    import re
+    src = open(os.path.join(HERE, "..", "..", "images", "gate", "functions", "src", "canon.rs")).read()
+    body = src[src.index("pub fn spec("):src.index("pub fn type_class(")]
+    rust = {}
+    for arm in re.finditer(r'"(\w+)" => Spec \{(.*?)\n        \}', body, re.S):
+        tol = {n: (float(a), float(r)) for n, a, r in re.findall(r'\("(\w+)", ([\d.e-]+), ([\d.e-]+)\)', arm[2])}
+        keys = re.search(r'regroup: Some\(\(&\[(.*?)\], &\[(.*?)\]\)\)', arm[2], re.S)
+        regroup = (re.findall(r'"(\w+)"', keys[1]), re.findall(r'"(\w+)"', keys[2])) if keys else None
+        rust[arm[1]] = (tol, regroup)
+    plain = re.search(r'((?:"\w+" \| )+"\w+") => plain', body)[1]
+    for name in re.findall(r'"(\w+)"', plain):
+        rust[name] = ({}, None)
+    py = {wl: (s.get("tolerant", {}), tuple(s["regroup"]) if "regroup" in s else None) for wl, s in canon.SPECS.items()}
+    rust = {wl: (t, tuple(g) if g else None) for wl, (t, g) in rust.items()}
+    assert py == rust
+    assert canon.SPECS["score"]["tolerant"]["predicted_tip"] == (1.1e-6, 0.0)
+
+
 def test_occupancy_regroups_per_batch_counts():
     t = expected("occupancy")
     # Each count split in two rows, as two batches holding the same minute would give.

@@ -34,9 +34,13 @@ pub mod manifest;
 /// ABI 2.6 (0.7, `architecture/data-os.md`) reserves the data OS's calls, flags and layouts:
 /// the data path's mechanisms (stream A) and the user-space personality's (stream B1), each
 /// answered `BadSyscall` until its stream implements it (`architecture/data-os-streams.md`).
+/// ABI 2.7 (`architecture/moruna-os-system.md`, section 1F; item 1.9c) adds Hyper-V's
+/// mechanism for VMBus: the boot capability `root.hyperv` (a resource of kind
+/// [`ResourceKind::Hyperv`]), the object [`ObjectType::HvSignal`], and the six calls of
+/// [`hyperv`], numbered `nr::HYPERV_POST` to `nr::HYPERV_SIGNAL`.
 pub const ABI_MAJOR: u16 = 2;
 /// See [`ABI_MAJOR`].
-pub const ABI_MINOR: u16 = 6;
+pub const ABI_MINOR: u16 = 7;
 /// The packed version `abi_version` returns.
 pub const ABI_VERSION: u64 = ((ABI_MAJOR as u64) << 16) | ABI_MINOR as u64;
 
@@ -208,8 +212,35 @@ pub mod nr {
     pub const THREAD_STATE_WRITE: u64 = BASE + 63;
     /// Interrupts a thread asleep in the core: its wait returns `Interrupted` (§4.1 d).
     pub const THREAD_INTERRUPT: u64 = BASE + 64;
+    // ABI 2.7, Hyper-V's mechanism for VMBus (`crate::hyperv`, section 1F). Each is
+    // `BadState` on a machine where the core found no Hyper-V, which also has no
+    // `root.hyperv` to make it with.
+    /// `hyperv_post(root, connection, type, payload, length) -> status`: `HvPostMessage`
+    /// of `length` bytes (at most `hyperv::PAYLOAD_MAX`) to a connection ID; answers
+    /// Hyper-V's status, `hyperv::SUCCESS`, `hyperv::BUSY` or another.
+    pub const HYPERV_POST: u64 = BASE + 65;
+    /// `hyperv_take(root, out) -> taken`: copies the message waiting on SINT 2
+    /// (`hyperv::MESSAGE_SIZE` bytes) to `out` and frees its slot, writing end-of-message
+    /// when another is pending; 1 if one was taken, 0 if none waited. Never waits.
+    pub const HYPERV_TAKE: u64 = BASE + 66;
+    /// `hyperv_map_events(root) -> address`: maps CPU 0's event-flags page into the
+    /// caller, readable and writable so that it can test and clear a flag; the same
+    /// address on every later call.
+    pub const HYPERV_MAP_EVENTS: u64 = BASE + 67;
+    /// `hyperv_interrupt(root) -> handle`: an interrupt object for SINT 2, raised for each
+    /// message or event flag Hyper-V gives it, and waited on and acknowledged
+    /// (`interrupt_ack`) as a device's is. In `rdx`, the VP index of CPU 0, where SINT 2
+    /// arrives (`HV_X64_MSR_VP_INDEX`, read as the SynIC was enabled): the target a VMBus
+    /// client names for its contact and every channel, which is not always 0.
+    pub const HYPERV_INTERRUPT: u64 = BASE + 68;
+    /// `hyperv_signal_create(root, connection) -> handle`: an `HvSignal` that signals that
+    /// one connection ID and nothing else, to give to that channel's driver.
+    pub const HYPERV_SIGNAL_CREATE: u64 = BASE + 69;
+    /// `hyperv_signal(signal) -> status`: `HvSignalEvent` on the signal's connection ID,
+    /// event flag 0; answers Hyper-V's status. Needs `WRITE` on the signal.
+    pub const HYPERV_SIGNAL: u64 = BASE + 70;
     /// One past the highest call of the table.
-    pub const COUNT: u64 = 65;
+    pub const COUNT: u64 = 71;
     /// The data plane's calls (SDD 29): native numbers a task makes on its own plane,
     /// or a personality server on a task's. The rest of the range is reserved.
     pub const DATA_PLANE: core::ops::Range<u64> = BASE + 0x100..BASE + 0x110;
@@ -508,10 +539,13 @@ pub enum ObjectType {
     Slot = 11,
     /// A memory account: a ceiling, and what is charged to it (ABI 2.3, SDD 20 f.18).
     Account = 12,
+    /// (2.7) The right to signal one Hyper-V connection ID and nothing else
+    /// (`hyperv_signal`), which a VMBus channel's driver holds.
+    HvSignal = 13,
 }
 
 impl ObjectType {
-    pub const ALL: [ObjectType; 12] = [
+    pub const ALL: [ObjectType; 13] = [
         ObjectType::Process,
         ObjectType::Thread,
         ObjectType::Channel,
@@ -524,6 +558,7 @@ impl ObjectType {
         ObjectType::Pin,
         ObjectType::Slot,
         ObjectType::Account,
+        ObjectType::HvSignal,
     ];
 
     pub fn from_raw(raw: u32) -> Option<ObjectType> {
@@ -546,15 +581,20 @@ pub enum ResourceKind {
     /// `memory_pin` for the devices whose PCI requester ids lie in its range (ABI 1.2):
     /// the right to hand a device the physical pages of a memory object.
     Dma = 5,
+    /// (2.7) Hyper-V's mechanism (`hyperv_post`, `hyperv_take`, `hyperv_map_events`,
+    /// `hyperv_interrupt`, `hyperv_signal_create`): `root.hyperv`, which the core makes
+    /// only on Hyper-V. It has no range and is never narrowed.
+    Hyperv = 6,
 }
 
 impl ResourceKind {
-    pub const ALL: [ResourceKind; 5] = [
+    pub const ALL: [ResourceKind; 6] = [
         ResourceKind::Process,
         ResourceKind::DeviceMemory,
         ResourceKind::Interrupt,
         ResourceKind::Msi,
         ResourceKind::Dma,
+        ResourceKind::Hyperv,
     ];
 
     pub fn from_raw(raw: u32) -> Option<ResourceKind> {
@@ -575,6 +615,117 @@ pub mod resource_range {
     pub const MSI_END: u64 = 224;
     /// PCI requester ids (`bus << 8 | device << 3 | function`) a DMA resource may cover.
     pub const DMA_END: u64 = 1 << 16;
+
+    /// The bytes of one bus's configuration space in an ECAM window (PCI Express Base
+    /// Specification, "Enhanced Configuration Access Mechanism"): 32 devices of 8 functions
+    /// of 4 KiB.
+    pub const ECAM_BUS_BYTES: u64 = 1 << 20;
+
+    /// What `root.ecam` covers on a machine whose firmware describes no PCI configuration
+    /// space (no ACPI MCFG), as a Hyper-V Generation 2 machine has none
+    /// (`architecture/moruna-os-system.md`, section 1F, "No PCI bus"): nothing. A device
+    /// manager given it finds no PCI function.
+    pub const NO_ECAM: core::ops::Range<u64> = 0..0;
+
+    /// What `root.ecam` covers on a machine whose firmware describes PCI configuration
+    /// space at `base` for buses `bus_start` to `bus_end` (the MCFG's first segment): from
+    /// its first bus to the end of its last. `None` when the buses run backwards, or the
+    /// window would wrap past the end of a 64-bit address.
+    pub fn ecam(base: u64, bus_start: u8, bus_end: u8) -> Option<core::ops::Range<u64>> {
+        if bus_end < bus_start {
+            return None;
+        }
+        let start = base.checked_add(u64::from(bus_start) * ECAM_BUS_BYTES)?;
+        let end = base.checked_add((u64::from(bus_end) + 1) * ECAM_BUS_BYTES)?;
+        Some(start..end)
+    }
+}
+
+/// Hyper-V's mechanism for VMBus (ABI 2.7; `architecture/moruna-os-system.md`, section
+/// 1F, "VMBus, split by the microkernel rule"): what the six calls exchange, and which
+/// object each takes. The core enables CPU 0's SynIC only, with SINT 2, so every message
+/// and event flag is CPU 0's SINT 2's.
+pub mod hyperv {
+    use crate::{ObjectType, ResourceKind, Rights, nr};
+
+    /// The SINT VMBus uses (`vmbus_core::VMBUS_SINT`).
+    pub const SINT: u32 = 2;
+    /// A SynIC message as `hyperv_take` copies it out: its 16-byte header (type, payload
+    /// size, flags, sender) and 240 bytes of payload, as Hyper-V wrote them.
+    pub const MESSAGE_SIZE: usize = 256;
+    /// The most bytes `hyperv_post` carries (TLFS, `HvCallPostMessage`).
+    pub const PAYLOAD_MAX: usize = 240;
+    /// The size of CPU 0's event-flags page, which `hyperv_map_events` maps.
+    pub const EVENT_PAGE_SIZE: usize = 4096;
+    /// Where SINT 2's flags start in that page: 256 bytes, 2048 flags, a SINT.
+    pub const EVENT_FLAGS_OFFSET: usize = SINT as usize * 256;
+    /// The flags a SINT has.
+    pub const EVENT_FLAGS: u32 = 2048;
+
+    /// `HV_STATUS_SUCCESS`: posted, or signalled.
+    pub const SUCCESS: u64 = 0x0000;
+    /// `HV_STATUS_INSUFFICIENT_BUFFERS`: Hyper-V has no room for the message now; post it
+    /// again later.
+    pub const BUSY: u64 = 0x0013;
+
+    /// The rights an `HvSignal` is made with. It can only signal (`WRITE`), and be given
+    /// to a driver (`DUPLICATE`, `TRANSFER`); a duplicate holds fewer rights, never more,
+    /// and its connection ID never changes.
+    pub const SIGNAL_RIGHTS: Rights = Rights::WRITE
+        .union(Rights::DUPLICATE)
+        .union(Rights::TRANSFER);
+
+    /// What one of the six calls takes as its first handle, and the right it needs there.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Authority {
+        /// `root.hyperv`: a resource of kind [`ResourceKind::Hyperv`], with `WRITE`.
+        Root,
+        /// An [`ObjectType::HvSignal`], with `WRITE`.
+        Signal,
+    }
+
+    impl Authority {
+        /// The object type of the handle.
+        pub const fn object(self) -> ObjectType {
+            match self {
+                Authority::Root => ObjectType::Resource,
+                Authority::Signal => ObjectType::HvSignal,
+            }
+        }
+
+        /// The resource kind, for a resource.
+        pub const fn kind(self) -> Option<ResourceKind> {
+            match self {
+                Authority::Root => Some(ResourceKind::Hyperv),
+                Authority::Signal => None,
+            }
+        }
+
+        /// The right the handle must carry.
+        pub const fn right(self) -> Rights {
+            Rights::WRITE
+        }
+    }
+
+    /// Which handle call `number` takes, if it is one of the six: only the holder of
+    /// `root.hyperv` posts, takes, maps, has the interrupt or makes a signal handle; a
+    /// signal handle only signals.
+    pub const fn authority(number: u64) -> Option<Authority> {
+        match number {
+            nr::HYPERV_POST
+            | nr::HYPERV_TAKE
+            | nr::HYPERV_MAP_EVENTS
+            | nr::HYPERV_INTERRUPT
+            | nr::HYPERV_SIGNAL_CREATE => Some(Authority::Root),
+            nr::HYPERV_SIGNAL => Some(Authority::Signal),
+            _ => None,
+        }
+    }
+
+    /// Whether `hyperv_post` takes a payload of `length` bytes.
+    pub const fn payload_fits(length: u64) -> bool {
+        length <= PAYLOAD_MAX as u64
+    }
 }
 
 /// The flags of `memory_create` (ABI 1.2; zero is the call of ABI 1.0).
@@ -1261,12 +1412,14 @@ mod tests {
         assert_eq!(ObjectType::from_raw(0), None);
         assert_eq!(ObjectType::from_raw(11), Some(ObjectType::Slot));
         assert_eq!(ObjectType::from_raw(12), Some(ObjectType::Account));
-        assert_eq!(ObjectType::from_raw(13), None);
+        assert_eq!(ObjectType::from_raw(13), Some(ObjectType::HvSignal));
+        assert_eq!(ObjectType::from_raw(14), None);
         for k in ResourceKind::ALL {
             assert_eq!(ResourceKind::from_raw(k as u32), Some(k));
         }
         assert_eq!(ResourceKind::from_raw(0), None);
-        assert_eq!(ResourceKind::from_raw(6), None);
+        assert_eq!(ResourceKind::from_raw(6), Some(ResourceKind::Hyperv));
+        assert_eq!(ResourceKind::from_raw(7), None);
     }
 
     #[test]
@@ -1285,8 +1438,9 @@ mod tests {
         assert!(!valid_name(b""));
         assert!(!valid_name(b"Upper"));
         assert!(!valid_name(&[b'a'; 33]));
-        assert_eq!(ABI_VERSION, 0x2_0006);
-        assert_eq!(nr::THREAD_INTERRUPT + 1, nr::BASE + nr::COUNT);
+        assert_eq!(ABI_VERSION, 0x2_0007);
+        assert_eq!(nr::HYPERV_SIGNAL + 1, nr::BASE + nr::COUNT);
+        assert_eq!(nr::HYPERV_POST, nr::THREAD_INTERRUPT + 1);
         assert_eq!(nr::THREAD_SET_CPU, nr::ACCOUNT_MATCHES + 1);
         assert_eq!(nr::PERSONALITY_SET, nr::WINDOWS_PROTECT + 1);
         assert!(nr::is_native(nr::THREAD_SET_CPU) && nr::is_native(nr::THREAD_INTERRUPT));
@@ -1338,6 +1492,100 @@ mod tests {
         assert_eq!(limits::PIN_MAX_PAGES, 65536);
         assert_eq!(resource_range::MSI_END, 224);
         assert_eq!(resource_range::DMA_END, 65536);
+    }
+
+    #[test]
+    fn hyperv_calls_are_numbered_after_the_data_os_and_native() {
+        let calls = [
+            nr::HYPERV_POST,
+            nr::HYPERV_TAKE,
+            nr::HYPERV_MAP_EVENTS,
+            nr::HYPERV_INTERRUPT,
+            nr::HYPERV_SIGNAL_CREATE,
+            nr::HYPERV_SIGNAL,
+        ];
+        for (i, call) in calls.iter().enumerate() {
+            assert_eq!(*call, nr::BASE + 65 + i as u64);
+            assert!(nr::is_native(*call));
+        }
+        assert_eq!(ABI_MINOR, 7);
+    }
+
+    #[test]
+    fn only_root_hyperv_posts_takes_maps_and_makes_signals_and_a_signal_only_signals() {
+        use hyperv::{Authority, authority};
+        for call in [
+            nr::HYPERV_POST,
+            nr::HYPERV_TAKE,
+            nr::HYPERV_MAP_EVENTS,
+            nr::HYPERV_INTERRUPT,
+            nr::HYPERV_SIGNAL_CREATE,
+        ] {
+            let held = authority(call).unwrap();
+            assert_eq!(held, Authority::Root);
+            assert_eq!(held.object(), ObjectType::Resource);
+            assert_eq!(held.kind(), Some(ResourceKind::Hyperv));
+            assert_eq!(held.right(), Rights::WRITE);
+        }
+        let signal = authority(nr::HYPERV_SIGNAL).unwrap();
+        assert_eq!(signal, Authority::Signal);
+        assert_eq!(signal.object(), ObjectType::HvSignal);
+        assert_eq!(signal.kind(), None);
+        assert_eq!(signal.right(), Rights::WRITE);
+        // No other call of the table is one of them.
+        for call in nr::BASE..nr::BASE + nr::COUNT {
+            if !(nr::HYPERV_POST..=nr::HYPERV_SIGNAL).contains(&call) {
+                assert_eq!(authority(call), None, "{call:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_signal_handle_can_be_given_away_and_never_read_mapped_or_waited_on() {
+        use hyperv::SIGNAL_RIGHTS;
+        assert!(SIGNAL_RIGHTS.contains(Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER));
+        for right in [Rights::READ, Rights::MAP, Rights::WAIT] {
+            assert!(!SIGNAL_RIGHTS.contains(right));
+        }
+    }
+
+    #[test]
+    fn a_posted_message_is_at_most_240_bytes() {
+        assert!(hyperv::payload_fits(0));
+        assert!(hyperv::payload_fits(240));
+        assert!(!hyperv::payload_fits(241));
+        assert!(!hyperv::payload_fits(u64::MAX));
+        assert_eq!(hyperv::MESSAGE_SIZE, 16 + hyperv::PAYLOAD_MAX);
+        // SINT 2's 2048 flags are the third 256 bytes of the event-flags page.
+        assert_eq!(hyperv::EVENT_FLAGS_OFFSET, 512);
+        assert_eq!(hyperv::EVENT_FLAGS as usize / 8, 256);
+        const { assert!(hyperv::EVENT_FLAGS_OFFSET + 256 <= hyperv::EVENT_PAGE_SIZE) };
+        assert_eq!((hyperv::SUCCESS, hyperv::BUSY), (0, 0x13));
+    }
+
+    #[test]
+    fn root_ecam_covers_the_mcfgs_buses_or_nothing() {
+        use resource_range::{ECAM_BUS_BYTES, NO_ECAM, ecam};
+        // QEMU's q35: one segment at 0xb000_0000, buses 0 to 255, 256 MiB.
+        assert_eq!(ecam(0xb000_0000, 0, 255), Some(0xb000_0000..0xc000_0000));
+        // A segment whose first bus is not 0: the window starts at that bus's space.
+        assert_eq!(
+            ecam(0xe000_0000, 2, 3),
+            Some(0xe000_0000 + 2 * ECAM_BUS_BYTES..0xe000_0000 + 4 * ECAM_BUS_BYTES)
+        );
+        assert_eq!(ecam(0, 7, 7), Some(7 << 20..8 << 20));
+        // Buses that run backwards describe nothing to cover.
+        assert_eq!(ecam(0xb000_0000, 1, 0), None);
+        // A window that would wrap past the end of a 64-bit address.
+        assert_eq!(ecam(u64::MAX - ECAM_BUS_BYTES, 0, 1), None);
+        assert_eq!(ecam(u64::MAX - ECAM_BUS_BYTES + 1, 0, 0), None);
+        assert_eq!(
+            ecam(u64::MAX - ECAM_BUS_BYTES, 0, 0),
+            Some(u64::MAX - ECAM_BUS_BYTES..u64::MAX)
+        );
+        // No MCFG: the empty range, which a device manager can claim no window of.
+        assert!(NO_ECAM.is_empty());
+        assert_eq!(NO_ECAM.end - NO_ECAM.start, 0);
     }
 
     #[test]

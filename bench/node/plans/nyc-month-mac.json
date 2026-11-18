@@ -1,19 +1,20 @@
 {
  "plan": 1,
  "name": "nyc-month-mac",
- "notes": "Work item 6.1's phase-1 check: each Linux engine's Score on January 2024 on the Mac (run.py --local), with at most 4 threads and nyc-2024's 14 GiB for the engines' memory settings (no cgroup holds them to it here), its rows checked against 0.6.6's Score reference. One run each, no learning run. At 6 GiB, Dask's workers (0.8 x 6 / 4 GiB each, bench/vm's setting) die on the month's one partition.",
+ "notes": "Work item 6.1's checks on the Mac (run.py --local --store-endpoint): each Linux engine's Score, Occupancy and Enrich on January 2024, reading and writing a local Azurite container with its own Blob reader as on Azure, with at most 4 threads and nyc-2024's 14 GiB for the engines' memory settings (no cgroup holds them to it here), its rows checked against 0.6.6's January references. One run each, no learning run.",
  "dataset": {
   "name": "nyc-yellow-2024-01",
   "source_dir": "~/moruna-data/nyc/norm",
   "files": ["yellow_tripdata_2024-01.parquet"],
   "rows": 2964624
  },
- "jobs": ["score"],
- "engines": ["moruna066", "moruna066-rust", "rust-pool", "duckdb", "polars", "ray", "spark", "dask"],
+ "jobs": ["score", "occupancy", "enrich"],
+ "engines": ["moruna066", "moruna066-rust", "rust-pool", "duckdb", "duckdb-sql", "polars", "polars-expr", "ray",
+             "spark", "dask"],
  "repeats": 1,
  "learning_run": false,
  "noise_pairs": 0,
  "machine": {"size": "Mac", "zone": "none", "cpus": 4, "mem_gib": 14},
- "linux_data": "local-copy",
+ "linux_data": "blob",
  "timeout_s": 1800
 }

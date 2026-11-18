@@ -19,9 +19,14 @@ use netstack_protocol::{Addr, Endpoint, Policy, net, rights};
 const SECOND: u64 = 1_000_000_000;
 const MINUTE: u64 = 60 * SECOND;
 
-/// The record of the cloud profile (PM, item 2.2c).
-const RECORD: &str =
-    "restart api network network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=64";
+/// The policy of api's listener: item 1.3b's grant for it, which the cloud profile's record
+/// mints.
+const LISTENER: &str =
+    "rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000";
+
+/// The record of the cloud profile (PM, item 2.2c), with 1.3b's policy.
+const RECORD: &str = "restart api network network listen-supervisor rights=listen \
+     local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000";
 
 /// The cloud profile's node.conf, as items 1.1, 1.3, 1.4 and 2.2c make it.
 const PROFILE: &str = "moruna-node 1
@@ -65,13 +70,19 @@ fn the_profile_s_record_says_everything_a_start_needs() {
         ),
         ("api", "network", "network", "listen-supervisor")
     );
-    // Its policy is the one 1.3's `listen-api` grant had, as network.conf reads it.
-    assert_eq!(
-        record.policy,
-        granted("rights=listen local=0.0.0.0/0@443 sockets=64")
-    );
+    // Its policy is the one 1.3b's `listen-api` grant had, as network.conf reads it.
+    assert_eq!(record.policy, granted(LISTENER));
     assert_eq!(record.policy.rights, rights::LISTEN);
-    assert_eq!(record.policy.sockets, 64);
+    assert_eq!(
+        (
+            record.policy.sockets,
+            record.policy.rx,
+            record.policy.tx,
+            record.policy.per_peer,
+            record.policy.linger_ms
+        ),
+        (81, Some(65536), Some(65536), Some(8), Some(5000))
+    );
     let at = |a, b, c, d, port| Endpoint::new(Addr::v4(a, b, c, d), port);
     assert!(record.policy.may_listen(&at(10, 0, 2, 15, 443)));
     assert!(!record.policy.may_listen(&at(10, 0, 2, 15, 444)));
@@ -97,8 +108,11 @@ fn the_profile_s_record_says_everything_a_start_needs() {
 #[test]
 fn a_record_s_policy_is_read_as_network_conf_reads_a_grant() {
     for options in [
+        LISTENER,
         "rights=listen local=0.0.0.0/0@443 sockets=64",
         "rights=listen local=0.0.0.0/0@443",
+        "rights=listen rx=1024 tx=16777216 per-peer=65536 linger=3600000",
+        "rights=listen per-peer=1 linger=1",
         "rights=connect,listen,udp,ping,resolve,grant remote=any local=any",
         "rights=connect remote=10.47.0.0/24,fd4b:4532::/64@1-65535 local=10.47.0.1/32 \
          names=*.Example.test@443,b.test sockets=16",
@@ -115,7 +129,7 @@ fn a_record_s_policy_is_read_as_network_conf_reads_a_grant() {
 
 #[test]
 fn a_record_that_is_not_one_is_refused() {
-    use ConfigError::{Duplicate, Syntax, Unsupported};
+    use ConfigError::{Duplicate, Syntax};
     let policy = "rights=listen local=0.0.0.0/0@443";
     for (record, error) in [
         // Too few words, or no policy at all.
@@ -195,14 +209,30 @@ fn a_record_that_is_not_one_is_refused() {
             "restart api network network listen-supervisor rights=listen backlog=8",
             Syntax,
         ),
-        // Item 1.3b's buffer sizes: the protocol's policy has no field for them yet.
+        // Item 1.3b's bounds, outside network.conf's ranges for them.
         (
-            &*format!("restart api network network listen-supervisor {policy} rx=65536"),
-            Unsupported,
+            &*format!("restart api network network listen-supervisor {policy} rx=1023"),
+            Syntax,
         ),
         (
-            &*format!("restart api network network listen-supervisor {policy} tx=65536"),
-            Unsupported,
+            &*format!("restart api network network listen-supervisor {policy} tx=16777217"),
+            Syntax,
+        ),
+        (
+            &*format!("restart api network network listen-supervisor {policy} per-peer=0"),
+            Syntax,
+        ),
+        (
+            &*format!("restart api network network listen-supervisor {policy} per-peer=65537"),
+            Syntax,
+        ),
+        (
+            &*format!("restart api network network listen-supervisor {policy} linger=0"),
+            Syntax,
+        ),
+        (
+            &*format!("restart api network network listen-supervisor {policy} linger=3600001"),
+            Syntax,
         ),
     ] {
         assert_eq!(node(record), Err(error), "{record}");
@@ -215,6 +245,8 @@ fn a_record_that_is_not_one_is_refused() {
         "link network listen-api api network",
         "grant api drivers.extra drivers.extra",
         "bootstrap linux api",
+        // Nor is it, or the server it mints from, one only Hyper-V runs (item 1.9c).
+        "grant network root.hyperv root.hyperv",
     ] {
         assert_eq!(node(&format!("{given}\n{RECORD}")), Err(Syntax), "{given}");
     }
@@ -369,8 +401,8 @@ fn the_supervisor_s_grant_mints_the_restarted_service_s_listener() {
     // 2B first wrote: a grant hands out no right it does not hold (`Policy::covers`).
     let (slots, server) = serve(
         "moruna-netstack 1
-grant listen-supervisor rights=grant,listen local=0.0.0.0/0@443
-grant listen-grant-only rights=grant local=0.0.0.0/0@443
+grant listen-supervisor rights=grant,listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000
+grant listen-grant-only rights=grant local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000
 ",
     );
     let record: Restart = node(RECORD).unwrap().restart.unwrap();
@@ -411,12 +443,18 @@ grant listen-grant-only rights=grant local=0.0.0.0/0@443
         drop(api);
         drop(minted);
     }
-    // A policy wider than the supervisor's grant is refused: another port, or more sockets.
+    // A policy wider than the supervisor's grant is refused: another port, more sockets,
+    // larger buffers, a longer linger, more per peer, or bounds left to the server.
     let wider = |options: &str| parse_policy(&words(options)).unwrap();
     for options in [
-        "rights=listen local=0.0.0.0/0@80",
-        "rights=listen local=0.0.0.0/0@443 sockets=65",
-        "rights=listen,connect local=0.0.0.0/0@443 remote=any",
+        "rights=listen local=0.0.0.0/0@80 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000",
+        "rights=listen local=0.0.0.0/0@443 sockets=82 rx=65536 tx=65536 per-peer=8 linger=5000",
+        "rights=listen local=0.0.0.0/0@443 sockets=81 rx=65537 tx=65536 per-peer=8 linger=5000",
+        "rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5001",
+        "rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=9 linger=5000",
+        "rights=listen local=0.0.0.0/0@443 sockets=64",
+        "rights=listen,connect local=0.0.0.0/0@443 remote=any sockets=81 rx=65536 tx=65536 \
+         per-peer=8 linger=5000",
     ] {
         assert_eq!(
             supervisor.grant(wider(options)).map(drop),

@@ -149,8 +149,8 @@ fn pl_t14_a_failed_write_leaves_the_bytes_resident() {
         .collect();
     assert_eq!(
         attempts.len(),
-        8,
-        "one record, two attempts of four pieces (f.10)"
+        6,
+        "one record, two attempts of three pieces: header, framing, data (f.10)"
     );
     let abandoned_end = attempts
         .iter()

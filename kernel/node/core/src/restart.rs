@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! restart SERVICE SLOT SERVER GRANTING POLICY...
-//! restart api network network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=64
+//! restart api network network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000
 //! ```
 //!
 //! - `SERVICE` is the service that is started again; `SLOT` is the start slot its listener of
@@ -14,7 +14,8 @@
 //!   the supervisor keeps: the server's grant for it holds the `grant` right, and every start of
 //!   `SERVICE` mints that listener from it (`Client::grant`).
 //! - `POLICY` is the minted listener's policy, in network.conf's words: `rights=`, `remote=`,
-//!   `local=`, `names=` and `sockets=` ([`parse_policy`]).
+//!   `local=`, `names=`, `sockets=`, and item 1.3b's `rx=`, `tx=`, `per-peer=` and `linger=`
+//!   ([`parse_policy`]). The cloud profile's is 1.3b's grant for api's listener.
 //!
 //! A service that is started again has only what a start can make afresh: its console, its
 //! account, the minted listener, and, when node.conf bootstraps `platform`, a fresh channel to
@@ -31,7 +32,9 @@ use alloc::{
 };
 use core::net::IpAddr;
 
-use netstack_protocol::{Addr, Cidr, NameRule, Policy, Rule, rights};
+use netstack_protocol::{
+    Addr, BUFFER_MAX, BUFFER_MIN, Cidr, LINGER_MAX_MS, NameRule, PER_PEER_MAX, Policy, Rule, rights,
+};
 
 use crate::{ConfigError, identifier};
 
@@ -94,16 +97,19 @@ impl Restart {
 /// A policy in network.conf's words (`kernel/net/stack/src/config.rs`, `grant`): `rights=` (one
 /// or more of `connect`, `listen`, `udp`, `ping`, `resolve`, `grant`, and required), `remote=`
 /// and `local=` rules (`any`, or `ADDR/PREFIX[@PORT|@FIRST-LAST]`, comma separated), `names=`
-/// patterns (`PATTERN[@PORTS]`), and `sockets=` (1 to 65536, 64 by default).
-///
-/// `rx=` and `tx=` (item 1.3b's buffer sizes) are refused as [`ConfigError::Unsupported`]: the
-/// network protocol's `Policy` has no field for them yet. Anything else is a syntax error.
+/// patterns (`PATTERN[@PORTS]`), `sockets=` (1 to 65536, 64 by default), and item 1.3b's
+/// bounds: `rx=` and `tx=` (buffers, [`BUFFER_MIN`] to [`BUFFER_MAX`] bytes), `per-peer=` (1 to
+/// [`PER_PEER_MAX`]) and `linger=` (1 to [`LINGER_MAX_MS`] ms), each left to the network server
+/// when not given. Anything else is a syntax error.
 pub fn parse_policy(words: &[&str]) -> Result<Policy, ConfigError> {
     let mut policy = Policy {
         sockets: 64,
         ..Policy::default()
     };
     let mut had_rights = false;
+    let number = |value: &str, range: core::ops::RangeInclusive<u32>| {
+        value.parse().ok().filter(|v| range.contains(v))
+    };
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
         let parsed = match key {
@@ -119,7 +125,12 @@ pub fn parse_policy(words: &[&str]) -> Result<Policy, ConfigError> {
                 .ok()
                 .filter(|sockets| (1..=65536).contains(sockets))
                 .map(|sockets| policy.sockets = sockets),
-            "rx" | "tx" => return Err(ConfigError::Unsupported),
+            "rx" => number(value, BUFFER_MIN..=BUFFER_MAX).map(|bytes| policy.rx = Some(bytes)),
+            "tx" => number(value, BUFFER_MIN..=BUFFER_MAX).map(|bytes| policy.tx = Some(bytes)),
+            "per-peer" => {
+                number(value, 1..=PER_PEER_MAX).map(|peers| policy.per_peer = Some(peers))
+            }
+            "linger" => number(value, 1..=LINGER_MAX_MS).map(|ms| policy.linger_ms = Some(ms)),
             _ => None,
         };
         if parsed.is_none() {

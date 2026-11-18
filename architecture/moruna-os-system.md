@@ -604,7 +604,10 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
 - **At job start,** `node-admission` has the engine fetch each function the job names, through its
   job network (3D). The node refuses the job if a SHA-256 differs. Images are cached in memory, up
   to node config's `functions.cache_bytes` (default 1 GiB, at most half the node's memory), until the node stops.
-- **A job names a function** by its registered name. An unregistered name is refused at `validate`.
+- **A job names a function** by its registered name, as a function task's `"function": "<name>"`;
+  the check's `needs.functions` lists them. An unregistered name is refused at `validate`.
+- **AWS's own S3** (no endpoint) is reached with path-style requests, so its host is
+  `s3.<region>.amazonaws.com`, known without the bucket; the region is required.
 
 ### 3F. The full-year hang
 
@@ -709,7 +712,18 @@ There are two kinds:
   5A has the same, an end hook).
 - **C needs a libc, and it is relibc** (Redox's, MIT, in Rust) with a Moruna platform layer over
   `moruna-sys` and std, vendored at a pinned commit like OSTD. A minimal runtime breaks on the first
-  real C library; musl would need an in-process Linux syscall layer. Item 5.2b.
+  real C library; musl would need an in-process Linux syscall layer. Item 5.2b. **One runtime, not
+  two:**
+  - std, the SDK and relibc build as one crate graph: one allocator, one `moruna-sys`; relibc's
+    `malloc` is std's global allocator, and relibc drops its own panic and alloc-error items.
+  - **ELF TLS** (x86_64 variant II, FS:0 the thread control block's self pointer) for std and relibc
+    alike; 5.0's key table goes. One control block type holds both runtimes' per-thread state.
+  - **One thread path:** `std::thread::spawn` and `pthread_create` both go through it.
+  - **One `_start`:** sets up TLS, takes the log slot (std owns it; C's fd 1 and 2 write through
+    std's writer), runs relibc's static init when it is linked, then `main`.
+  - Unsupported POSIX (fork, exec, signals, sockets, paths) answers `ENOSYS`/`ENOENT`, as 5A0 says.
+  - C++ (libc++, libc++abi, libunwind over relibc) follows once relibc runs; exceptions never cross
+    a `moruna_*` call.
 - **C, C++ and Zig** link the library into a static native function. Go and others follow when
   someone needs them; nothing in the header is tied to C.
 

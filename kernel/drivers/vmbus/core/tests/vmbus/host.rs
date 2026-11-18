@@ -107,6 +107,8 @@ pub struct FakeHost {
     pub hold_teardown: bool,
     /// The guest's memory, as its `Hv` knows it: page numbers by ID.
     pub memory: BTreeMap<u64, Vec<u64>>,
+    /// The VP index of the guest's CPU 0, which its contact and every channel must target.
+    pub target_vp: u32,
 
     /// Every message the guest posted that the host took: connection ID and type.
     pub posted: Vec<(u32, MessageType)>,
@@ -149,6 +151,7 @@ impl FakeHost {
             hold_open: false,
             hold_teardown: false,
             memory: BTreeMap::new(),
+            target_vp: 0,
             posted: Vec::new(),
             asked: Vec::new(),
             refused: 0,
@@ -327,7 +330,10 @@ impl FakeHost {
             asked >= Version::Win10 as u32,
             "no version below 4.0 is asked"
         );
-        assert_eq!(request.target_message_vp, 0, "messages target CPU 0");
+        assert_eq!(
+            request.target_message_vp, self.target_vp,
+            "messages target CPU 0's VP"
+        );
         assert_eq!(request.parent_to_child_monitor_page_gpa, 0);
         assert_eq!(request.child_to_parent_monitor_page_gpa, 0);
         if asked >= Version::Win10Rs3_1 as u32 {
@@ -511,7 +517,10 @@ impl FakeHost {
             ChannelState::Closed,
             "an open is asked of a closed channel"
         );
-        assert_eq!(request.target_vp, 0, "every channel targets CPU 0");
+        assert_eq!(
+            request.target_vp, self.target_vp,
+            "every channel targets CPU 0's VP"
+        );
         assert_eq!(request.open_id, 0);
         assert!(request.user_data.iter().all(|byte| *byte == 0));
         let ring = request.ring_buffer_gpadl_id.0;
@@ -761,7 +770,7 @@ pub fn drain(client: &mut Client, host: &mut FakeHost) -> Vec<Event> {
 
 /// A client connected to `host`, with the events of the connection.
 pub fn connect(host: &mut FakeHost) -> (Client, Vec<Event>) {
-    let mut client = Client::new();
+    let mut client = Client::new(host.target_vp);
     client.connect().expect("a new client is disconnected");
     let events = drain(&mut client, host);
     (client, events)

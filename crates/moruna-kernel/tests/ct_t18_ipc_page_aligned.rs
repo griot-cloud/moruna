@@ -304,16 +304,21 @@ fn find_first_entry(bytes: &[u8]) -> usize {
             .expect("4 bytes"),
     ) as usize;
     let message = &bytes[rb_start + 8..rb_start + 8 + rb_len];
-    // The first entry is the first 16-byte aligned pair whose second half is a plausible
-    // length: rather than parse flatbuffers here, find the entry by scanning for the offset
-    // and length of the first body piece, which `decode` has already validated.
+    // The entries are 16-byte pairs (offset, length), read here through arrow's own parser of
+    // the message rather than by hand.
     let parsed = arrow::ipc::root_as_message(message).expect("a record batch message");
     let rb = parsed
         .header_as_record_batch()
         .expect("a record batch header");
     let buffers = rb.buffers().expect("buffer entries");
+    // The first entry with bytes: a validity bitmap of all ones is an empty entry (no buffer),
+    // whose offset `decode` has nothing to check.
+    let first = buffers
+        .iter()
+        .position(|b| b.length() > 0)
+        .expect("a buffer with bytes");
     let raw = buffers.bytes();
-    let within = raw.as_ptr() as usize - message.as_ptr() as usize;
+    let within = raw.as_ptr() as usize - message.as_ptr() as usize + 16 * first;
     rb_start + 8 + within
 }
 

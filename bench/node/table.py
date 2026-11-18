@@ -34,7 +34,7 @@ def losing_stage(row):
 def verdicts(engines: dict) -> list:
     """The bar's two steps for Moruna's row, as dicts: step, passed (or None), sentence."""
     node = engines.get(NODE)
-    if not node or node.get("operational_s") is None:
+    if not node or not node.get("operational_s"):
         return [{"step": "no regression", "passed": None, "text": "Moruna has no measured run"}]
     ops = node["operational_s"]
     out = []
@@ -76,25 +76,32 @@ def render(summary: dict) -> str:
     out = []
     for job, j in summary["jobs"].items():
         out.append(f"### {job}\n")
-        out.append("| Engine | Function | Operational s | Start-up s | CPU s | Peak GiB | Read+decode s | Function s "
-                   "| Encode+write s | Waits s | Output against 0.6.6 | Runs ok |")
-        out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+        out.append("| Engine | Function | Operational s | Start-up s | CPU s | Peak GiB | Memory given GiB | Data "
+                   "| Read+decode s | Function s | Encode+write s | Waits s | Output against 0.6.6 | Runs ok |")
+        out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for r in j["engines"].values():
             s = r["split"]
+            data = r.get("data") or ""
+            if "local copy" in data:
+                data += f", {fmt(r.get('copy_s'))} s apart"
             out.append(f"| {r['label']} | {r['function']} | {fmt(r['operational_s'])} | {fmt(r['startup_s'], 2)} | "
-                       f"{fmt(r['cpu_s'])} | {fmt(r['peak_gib'], 2)} | {fmt(s['read_decode_s'])} | "
-                       f"{fmt(s['function_s'])} | {fmt(s['encode_write_s'])} | {fmt(s['wait_s'])} | {r['output']} | "
-                       f"{r['ok']}/{r['runs']} |")
+                       f"{fmt(r['cpu_s'])} | {fmt(r['peak_gib'], 2)} | {fmt(r.get('memory_gib'), 2)} | {data} | "
+                       f"{fmt(s['read_decode_s'])} | {fmt(s['function_s'])} | {fmt(s['encode_write_s'])} | "
+                       f"{fmt(s['wait_s'])} | {r['output']} | {r['ok']}/{r['runs']} |")
         out.append("")
         out.extend(f"- {v['text']}" for v in verdicts(j["engines"]))
         n = j.get("noise") or {}
         if n.get("spread") is not None:
             out.append(f"- noise: 0.6.6 against itself, {n['runs']} runs, spread {n['spread']:.1%} of the median")
         out.append("")
-    out.append("Operational time is a run's first rows to its output written: Moruna's from its sink's first "
-               "rows, the others' from the engine's being ready for its first batch. Start-up is Moruna's "
-               "boot-to-ready and the others' process start, imports and session. Medians of the measured "
-               "repeats; the learning run and the noise pairs are left out.")
+    out.append("Operational time runs from the job's being handed to a ready engine (Moruna: `POST /v1/jobs` "
+               "answered; the others: the call that starts the job, after the session or cluster is up) to the "
+               "output durably written in Blob. Start-up is Moruna's boot-to-ready and the others' process "
+               "start, imports and session or cluster. Every engine reads and writes the run's one Blob "
+               "container with its own reader inside operational time; a row marked `local copy` has no Blob "
+               "reader, and its copies are timed apart. Memory given is what each platform leaves on the same "
+               "machine: the node's memory less 768 MiB for Moruna, the plan's figure on Linux. Medians of the "
+               "measured repeats; the learning run and the noise pairs are left out.")
     return "\n".join(out)
 
 
