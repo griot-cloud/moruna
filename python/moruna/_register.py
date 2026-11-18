@@ -1,33 +1,35 @@
 """``moruna.register``: a Python function registered on a node (system design 3E and 5C, work item
 5.4).
 
-Registration is four steps, each here, none of which needs the engine:
+Registration is four steps, each here:
 
 1. **The image as one file** (:func:`pack`): the function's image, as ``moruna build`` makes it
-   (``_build.build_images``), packed from its OCI layout into one tar of an OCI image layout
-   that holds that image alone: ``oci-layout``, an ``index.json`` naming its one manifest, and
-   its blobs. The tar is written the same way every time (``_build.write_layer``), so one image
-   is one file, bit for bit, and one SHA-256.
+   (``_build.build_images``), converted here, on the client, once, into the layer files Moruna's
+   image filesystem serves, and written as a **Moruna image archive**: a small index (the
+   image's manifest and config, each layer's digest, seal, offset and length), then the layer
+   files at page-aligned offsets (``moruna_image::archive``, through the engine's
+   ``_core.image_archive``; PM, item 3.6). A node fetches it and serves its layers in place,
+   converting nothing. One image is one archive, bit for bit, and one SHA-256.
 2. **The signature** (:func:`signature`): Ed25519 over the 32 bytes of that SHA-256 by the
    operator's key, one of node config's ``functions.keys``, in standard base64. The key is a
    PKCS#8 private key, PEM or DER, as ``openssl genpkey -algorithm ed25519`` writes it, and the
    signing is the ``cryptography`` package's (PM, item 5.4): the extra ``moruna[register]``.
 3. **The upload** (:func:`upload`) to ``store``, object storage the node can read over HTTPS:
    either an ``https://`` prefix, which may carry a query (an Azure SAS), where the file goes to
-   ``<prefix>/<name>-<sha256>.tar`` and that same URL is what the node fetches; or a callable that
+   ``<prefix>/<name>-<sha256>.mia`` and that same URL is what the node fetches; or a callable that
    is given that object's name and returns its two URLs, the one to ``PUT`` it to and the one the
    node fetches it from (an S3 bucket's pair of pre-signed URLs).
 4. **The registration** through ``moruna.api``: ``POST /v1/functions`` with the name, the
    address, the SHA-256 and the signature (``client.functions_register``).
 
 A URL's query is never put in a message: a SAS or a pre-signed URL's query is its credential.
+Only the first step needs the engine; the others are the standard library and ``cryptography``.
 """
 
 from __future__ import annotations
 
 import base64
 import dataclasses
-import json
 import os
 import re
 import ssl
@@ -65,46 +67,26 @@ class Archive:
     size: int
 
 
-def pack(built: _build.Built, work: Path) -> Archive:
-    """``built``'s image as one file under ``work``: a tar of an OCI image layout holding that
-    image alone, named by its SHA-256, the same bytes every time for the same image."""
-    blobs = built.layout / "blobs" / "sha256"
-    manifest_path = blobs / built.digest.split(":", 1)[1]
+#: What writes an archive: ``(layout, reference, out) -> (sha256 hex, length)``.
+Writer = Callable[[str, str, str], tuple[str, int]]
+
+
+def pack(built: _build.Built, work: Path, *, writer: Writer | None = None) -> Archive:
+    """``built``'s image as one file under ``work``: a Moruna image archive named by the image's
+    digest, written by ``writer`` (the engine's ``_core.image_archive`` when it is not given).
+    Its SHA-256 is what is signed and registered."""
+    if writer is None:
+        from . import _core  # noqa: PLC0415, the engine converts the layers
+
+        writer = _core.image_archive
+    work.mkdir(parents=True, exist_ok=True)
+    out = work / f"{built.digest.split(':', 1)[1]}.mia"
+    out.unlink(missing_ok=True)
     try:
-        manifest_bytes = manifest_path.read_bytes()
-        manifest = json.loads(manifest_bytes)
-        digests = [manifest["config"]["digest"], *(layer["digest"] for layer in manifest["layers"])]
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise Refused(f"{built.task}: its image's manifest cannot be read ({exc})") from exc
-    index = {
-        "schemaVersion": 2,
-        "mediaType": _build.MEDIA_INDEX,
-        "manifests": [
-            {
-                "mediaType": _build.MEDIA_MANIFEST,
-                "digest": built.digest,
-                "size": len(manifest_bytes),
-                "annotations": {_build.REF_NAME: built.key, "org.moruna.task": built.task},
-            }
-        ],
-    }
-    entries = [
-        _build.Entry(
-            "oci-layout", "file", _build.FILE_MODE,
-            data=_build.canonical({"imageLayoutVersion": "1.0.0"}),
-        ),
-        _build.Entry("index.json", "file", _build.FILE_MODE, data=_build.canonical(index)),
-    ]  # fmt: skip
-    for digest in dict.fromkeys([built.digest, *digests]):
-        hex_digest = digest.split(":", 1)[1]
-        source = blobs / hex_digest
-        if not source.is_file():
-            raise Refused(f"{built.task}: its image's layout has no blob {digest}")
-        entries.append(
-            _build.Entry(f"blobs/sha256/{hex_digest}", "file", _build.FILE_MODE, source=source)
-        )
-    blob = _build.write_layer(entries, work)
-    return Archive(blob.path, blob.hex, blob.size)
+        sha256, size = writer(str(built.layout), built.digest, str(out))
+    except ValueError as exc:
+        raise Refused(f"{built.task}: its image cannot be made an archive: {exc}") from exc
+    return Archive(out, sha256, size)
 
 
 #: What the signing needs, and how it is installed.
@@ -178,7 +160,7 @@ def _https(url: str, what: str) -> str:
 def object_name(name: str, sha256: str) -> str:
     """The object an image is uploaded as: the registration's name and its SHA-256, so that one
     image of one function is one object, and a changed one is another."""
-    return f"{name}-{sha256}.tar"
+    return f"{name}-{sha256}.mia"
 
 
 def destination(store: Store, name: str, sha256: str) -> tuple[str, str]:
@@ -215,7 +197,7 @@ def upload(archive: Archive, url: str, *, context: ssl.SSLContext | None = None)
     opener = urllib.request.build_opener(handler, _NoRedirect())
     with archive.path.open("rb") as body:
         request = urllib.request.Request(url, data=body, method="PUT")
-        request.add_header("Content-Type", "application/x-tar")
+        request.add_header("Content-Type", "application/octet-stream")
         request.add_header("Content-Length", str(archive.size))
         request.add_header("x-ms-blob-type", "BlockBlob")
         try:
@@ -266,6 +248,9 @@ def register_built(  # noqa: PLR0913, publish's and where to pack
     key: bytes | str | os.PathLike[str],
     work: Path,
     context: ssl.SSLContext | None = None,
+    writer: Writer | None = None,
 ) -> Function:
-    """``built``'s image packed into ``work`` and published as ``name``."""
-    return publish(pack(built, work), client, name=name, store=store, key=key, context=context)
+    """``built``'s image packed into ``work`` (by ``writer``, as :func:`pack` takes it) and
+    published as ``name``."""
+    archive = pack(built, work, writer=writer)
+    return publish(archive, client, name=name, store=store, key=key, context=context)
