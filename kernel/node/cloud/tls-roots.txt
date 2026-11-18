@@ -1,0 +1,5 @@
+release 2026-11-05
+source https://curl.se/ca/cacert-2026-11-05.pem
+cacert.pem sha256 427c064216761a1e72a8b30f0d954d08cb6e4435a82091fb865afd20c8497285
+tls.roots sha256 10052b7c8a91e03b8c4b01c4af977ec6eb72749f77d81b259c9993c1b252f60e
+roots 118

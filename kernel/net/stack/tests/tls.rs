@@ -870,3 +870,25 @@ fn net3_refuses_old_majors_and_unbound_or_rebound_accounts() {
     join.join().unwrap();
 }
 
+#[test]
+fn the_cloud_profile_s_roots_are_mozilla_s_set_and_the_server_takes_them() {
+    use moruna_svc::{Decoder, Wire};
+    // `kernel/node/cloud/tls.roots`, as tls-roots.py converted curl's release (system design
+    // 3D), read as the server reads its `tls-roots` capability: its length, then the Wire list.
+    let bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../node/cloud/tls.roots"
+    ))
+    .unwrap();
+    let length = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+    assert_eq!(length + 4, bytes.len());
+    assert!(length <= 1 << 20);
+    let mut handles = [];
+    let mut decoder = Decoder::new(&bytes[4..], &mut handles);
+    let roots = Vec::<Vec<u8>>::decode(&mut decoder).unwrap();
+    decoder.finish().unwrap();
+    assert!(roots.len() > 100, "{}", roots.len());
+    assert!(roots.len() <= moruna_netstack::tls::ROOTS_MAX);
+    // Every one is a certificate rustls takes as a root.
+    Trust::new(roots, wall_at(UTC_NS)).unwrap();
+}
