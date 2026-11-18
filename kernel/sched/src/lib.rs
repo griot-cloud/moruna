@@ -16,10 +16,13 @@
 //!   out the rest of the running thread's 10 ms slice). These are a network completion's and
 //!   a worker's wakes, which must run while every CPU computes.
 //! - **A wake by the running task** ([`Why::WokenByCurrent`]: the waker is the task running on
-//!   the woken task's CPU) does not preempt it: the woken task runs first at the next pick,
-//!   within [`WOKEN_IN_A_ROW`], and the slice still applies. A producer that wakes its own
-//!   consumer on its CPU keeps that CPU, so the two batch (the ring plane's engine fills a group
-//!   of batches before its task drains them) instead of switching once a batch.
+//!   the woken task's CPU) does not preempt that waker: the woken task runs first at the next
+//!   pick, within [`WOKEN_IN_A_ROW`], and the slice still applies. A producer that wakes its
+//!   own consumer on its CPU keeps that CPU, so the two batch (the ring plane's engine fills a
+//!   group of batches before its task drains them) instead of switching once a batch. Against
+//!   any other task that takes the CPU later the woken task is an ordinary woken one, and the
+//!   minimum applies: a request passing between threads of one CPU, each waking the next and
+//!   waiting, is not held for a slice when the cap gives a computing thread its turn.
 //! - **The idle task** gives way to anything, at once.
 //! - **The tick** of a CPU other than the boot processor is stretched to [`STRETCH`] periods
 //!   while it runs one task or none, and comes back when a task is queued there: such a CPU
@@ -33,7 +36,10 @@
 
 extern crate alloc;
 
-use alloc::{collections::VecDeque, sync::Arc};
+use alloc::{
+    collections::VecDeque,
+    sync::{Arc, Weak},
+};
 
 /// Timer ticks (1 ms each) a task runs before another task waiting on its CPU may take it.
 pub const SLICE_TICKS: u32 = 10;
@@ -60,17 +66,28 @@ pub enum Why {
     New,
     /// Woken from a wait by an interrupt, or by a task on another CPU.
     Woken,
-    /// Woken from a wait by the task running on that CPU.
+    /// Woken from a wait by the task running on that CPU, which it does not preempt.
     WokenByCurrent,
+}
+
+/// A task woken from a wait, and the task that woke it if that was its CPU's running task: the
+/// one task it does not take the CPU from at the minimum. Held weakly: a waker that has ended
+/// is no one's waker, and its address is not given to another task while this waits.
+type Woken<T> = (Arc<T>, Option<Weak<T>>);
+
+/// Whether `waker` is `task`.
+fn woke<T>(waker: &Option<Weak<T>>, task: &Arc<T>) -> bool {
+    waker
+        .as_ref()
+        .is_some_and(|w| core::ptr::eq(w.as_ptr(), Arc::as_ptr(task)))
 }
 
 /// One CPU's run queue. `T` is the task; tasks are told apart by their `Arc`'s address.
 pub struct Queue<T> {
     /// The running task: a task, the idle task, or `None` for the CPU's boot context.
     current: Option<Arc<T>>,
-    /// Tasks woken from a wait, taken first, each with whether it may take the CPU from the
-    /// running task at the minimum (not when the running task woke it).
-    woken: VecDeque<(Arc<T>, bool)>,
+    /// Tasks woken from a wait, taken first.
+    woken: VecDeque<Woken<T>>,
     /// Tasks a slice or a wake preempted, and new tasks.
     rest: VecDeque<Arc<T>>,
     /// Woken tasks run in a row while `rest` waited.
@@ -146,14 +163,15 @@ impl<T> Queue<T> {
     }
 
     /// Whether the running task gives way at `now`: the idle task to any task; a task to a
-    /// task woken by an interrupt or another CPU once it has run [`WAKE_MIN_NS`], and to any
-    /// once it has run a slice. The boot context never does: it leaves when it yields.
+    /// woken task it did not wake itself once it has run [`WAKE_MIN_NS`], and to any once it
+    /// has run a slice. The boot context never does: it leaves when it yields.
     fn gives_way(&self, now: u64) -> bool {
         match &self.current {
             None => false,
             Some(c) if self.is_idle(c) => self.waiting(),
-            Some(_) => {
-                (self.woken.iter().any(|&(_, preempts)| preempts) && self.ran(now) >= WAKE_MIN_NS)
+            Some(c) => {
+                (self.woken.iter().any(|(_, waker)| !woke(waker, c))
+                    && self.ran(now) >= WAKE_MIN_NS)
                     || (self.waiting() && self.ticks >= SLICE_TICKS)
             }
         }
@@ -179,8 +197,16 @@ impl<T> Queue<T> {
         };
         match why {
             Why::New => self.rest.push_back(task),
-            Why::Woken => self.woken.push_back((task, true)),
-            Why::WokenByCurrent => self.woken.push_back((task, false)),
+            Why::Woken => self.woken.push_back((task, None)),
+            Why::WokenByCurrent => {
+                // Its waker is the running task; the idle task and the boot context wake no one.
+                let waker = self
+                    .current
+                    .as_ref()
+                    .filter(|c| !self.is_idle(c))
+                    .map(Arc::downgrade);
+                self.woken.push_back((task, waker));
+            }
         }
         self.kicked |= at_once;
         ask
@@ -217,7 +243,9 @@ impl<T> Queue<T> {
         if !forced && !self.gives_way(now) {
             return false;
         }
-        let next = match self.take_next() {
+        // A running task that gives way stays runnable: it is one more that waits.
+        let stays = self.current.as_ref().is_some_and(|c| !self.is_idle(c));
+        let next = match self.take_next(stays) {
             Some(task) => task,
             None if self.current.is_none() => self.idle.clone(),
             None => return false,
@@ -233,16 +261,15 @@ impl<T> Queue<T> {
     }
 
     /// The next task to run: a woken one, unless [`WOKEN_IN_A_ROW`] of them have run in a row
-    /// while another waited.
-    fn take_next(&mut self) -> Option<Arc<T>> {
-        let woken_turn =
-            !self.woken.is_empty() && (self.rest.is_empty() || self.woken_run < WOKEN_IN_A_ROW);
-        if woken_turn {
-            self.woken_run = if self.rest.is_empty() {
-                0
-            } else {
-                self.woken_run + 1
-            };
+    /// while another waited. `stays` says the running task gives way and waits too: the woken
+    /// task that takes the CPU from it is the first of the row, so a task that never sleeps
+    /// runs once every `WOKEN_IN_A_ROW + 1` turns, not one more.
+    fn take_next(&mut self, stays: bool) -> Option<Arc<T>> {
+        let others = stays || !self.rest.is_empty();
+        // After a full row a preempted task has its turn (one always waits by then).
+        let capped = others && self.woken_run >= WOKEN_IN_A_ROW && !self.rest.is_empty();
+        if !self.woken.is_empty() && !capped {
+            self.woken_run = if others { self.woken_run + 1 } else { 0 };
             self.woken.pop_front().map(|(task, _)| task)
         } else {
             self.woken_run = 0;
@@ -703,6 +730,146 @@ mod tests {
         assert_eq!(running(&q), 3);
         // Task 1 waits behind them; nothing woken is left to preempt task 3 early.
         assert!(!q.tick(MS + 2 * WAKE_MIN_NS));
+    }
+
+    #[test]
+    fn a_chain_of_wakes_on_one_cpu_is_not_held_for_a_slice_by_a_computing_task() {
+        // Task 1 computes. Tasks 2 and 3 pass a request back and forth on its CPU: each wakes
+        // the other and waits, as a client and its server do.
+        let (mut q, t) = queue(true);
+        start(&mut q, &t[0], 0);
+        let mut now = MS;
+        assert!(
+            q.push(t[1].clone(), Why::Woken, now),
+            "the request arrives by an interrupt"
+        );
+        assert!(q.pick(now));
+        let mut hops = vec![];
+        while running(&q) != 1 {
+            let me = running(&q);
+            hops.push(me);
+            let peer = if me == 2 { &t[2] } else { &t[1] };
+            now += 10_000;
+            assert!(
+                !q.push(peer.clone(), Why::WokenByCurrent, now),
+                "its own wake asks for nothing"
+            );
+            q.leave();
+            assert!(q.pick(now));
+        }
+        // After four woken tasks in a row (the first took the CPU from task 1), the computing
+        // task has its turn, and task 2, woken by task 3, waits.
+        assert_eq!(hops, vec![2, 3, 2, 3]);
+        assert!(q.holds(&t[1]));
+        // Task 1 did not wake it: it gives way at the minimum, not at its slice.
+        assert!(!q.tick(now + WAKE_MIN_NS - 1), "under the minimum");
+        assert!(q.tick(now + WAKE_MIN_NS), "at the minimum");
+        assert!(q.pick(now + WAKE_MIN_NS));
+        assert_eq!(running(&q), 2, "the chain goes on");
+        // And again: four more hops, then the computing task for the minimum.
+        now += WAKE_MIN_NS;
+        let mut more = vec![];
+        while running(&q) != 1 {
+            let me = running(&q);
+            more.push(me);
+            let peer = if me == 2 { &t[2] } else { &t[1] };
+            now += 10_000;
+            q.push(peer.clone(), Why::WokenByCurrent, now);
+            q.leave();
+            assert!(q.pick(now));
+        }
+        assert_eq!(more, vec![2, 3, 2, 3]);
+        assert!(q.tick(now + WAKE_MIN_NS));
+    }
+
+    #[test]
+    fn a_task_does_not_preempt_its_waker_when_the_waker_has_the_cpu_back() {
+        // Task 1 wakes five tasks on its own CPU, then its slice ends.
+        let (mut q, t) = queue(true);
+        start(&mut q, &t[0], 0);
+        for consumer in &t[1..] {
+            assert!(!q.push(consumer.clone(), Why::WokenByCurrent, MS));
+        }
+        for tick in 1..SLICE_TICKS {
+            assert!(
+                !q.tick(u64::from(tick) * MS),
+                "tick {tick}: its own wakes do not preempt it"
+            );
+        }
+        assert!(q.tick(10 * MS), "its slice is over");
+        // Four of them run in a row, each waiting again.
+        let mut now = 10 * MS;
+        let mut order = vec![];
+        for _ in 0..4 {
+            assert!(q.pick(now));
+            order.push(running(&q));
+            q.leave();
+            now += 10_000;
+        }
+        assert_eq!(order, vec![2, 3, 4, 5]);
+        // The cap gives task 1 its turn, and task 6, which task 1 woke, still waits: it does
+        // not take the CPU from its waker at the minimum, only at the slice.
+        assert!(q.pick(now));
+        assert_eq!(running(&q), 1);
+        assert!(q.holds(&t[5]));
+        assert!(!q.tick(now + WAKE_MIN_NS));
+        for tick in 2..SLICE_TICKS {
+            assert!(!q.tick(now + u64::from(tick) * MS), "tick {tick}");
+        }
+        assert!(q.tick(now + 10 * MS), "the slice still applies");
+        assert!(q.pick(now + 10 * MS));
+        assert_eq!(running(&q), 6);
+    }
+
+    #[test]
+    fn a_task_that_never_sleeps_runs_once_every_five_turns_beside_woken_ones() {
+        // Task 1 computes alone; tasks 2 to 6 are woken by interrupts, one as each runs.
+        let (mut q, t) = queue(true);
+        start(&mut q, &t[0], 0);
+        let mut now = MS;
+        let mut turns = vec![];
+        let mut next = 1;
+        for _ in 0..10 {
+            // The running task has run the minimum when the next wake comes.
+            now += WAKE_MIN_NS;
+            q.push(t[next].clone(), Why::Woken, now);
+            if running(&q) != 1 {
+                q.leave();
+            }
+            assert!(q.pick(now));
+            turns.push(running(&q));
+            next = if next == 5 { 1 } else { next + 1 };
+        }
+        // Four woken tasks, then task 1 (a woken one waiting), and again.
+        assert_eq!(turns, vec![2, 3, 4, 5, 1, 6, 2, 3, 4, 1]);
+    }
+
+    #[test]
+    fn a_wake_with_no_task_running_names_no_waker() {
+        // The adapter never says "by the running task" from the boot context or the idle task,
+        // but a task woken so is an ordinary woken one.
+        let (mut q, t) = queue(true);
+        assert!(!q.push(t[0].clone(), Why::Woken, 0));
+        assert!(
+            !q.push(t[1].clone(), Why::WokenByCurrent, 0),
+            "the boot context"
+        );
+        assert!(q.yield_now());
+        assert!(q.pick(0));
+        assert_eq!(running(&q), 1);
+        assert!(
+            q.tick(WAKE_MIN_NS),
+            "task 2 takes the CPU from task 1 at the minimum"
+        );
+        // The idle task.
+        let (mut q, t) = queue(false);
+        assert!(q.yield_now());
+        assert!(q.pick(0));
+        assert!(q.push(t[0].clone(), Why::WokenByCurrent, MS));
+        assert!(q.push(t[1].clone(), Why::WokenByCurrent, MS));
+        assert!(q.pick(MS));
+        assert_eq!(running(&q), 1);
+        assert!(q.tick(MS + WAKE_MIN_NS));
     }
 
     #[test]

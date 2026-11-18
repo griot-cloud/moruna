@@ -28,10 +28,12 @@
 //! elsewhere whenever its CPU had a second runnable thread.
 //!
 //! A wake made by the task running on the woken task's CPU (in task context, on that CPU)
-//! does not preempt it: the woken task runs first at the next pick, and the slice still
-//! applies. A producer that wakes its own consumer keeps its CPU, so the two batch: the
-//! ring plane's engine fills a group of batches before its task drains them, where a
-//! switch at each bell cost a call a batch on one CPU.
+//! does not preempt that waker: the woken task runs first at the next pick, and the slice
+//! still applies. A producer that wakes its own consumer keeps its CPU, so the two batch:
+//! the ring plane's engine fills a group of batches before its task drains them, where a
+//! switch at each bell cost a call a batch on one CPU. Against any other task that takes
+//! the CPU later, the woken task is an ordinary woken one and the minimum applies, so a
+//! request passing between threads of one CPU is not held for a computing thread's slice.
 //!
 //! It also records which CPUs ran process threads (the post-schedule hook calls
 //! [`ran_process_thread`]), so a boot can show the processes ran across every CPU.
