@@ -640,6 +640,40 @@ mod tests {
     }
 
     #[test]
+    fn the_cloud_profile_starts_vmbus_and_storvsc_on_hyper_v_only() {
+        let profiles: [&[u8]; 2] = [
+            include_bytes!("../../cloud/node.conf"),
+            include_bytes!("../../cloud-check/node.conf"),
+        ];
+        for text in profiles {
+            let config = Config::parse(text, 1 << 30).unwrap();
+            let names =
+                |c: &Config| -> Vec<String> { c.services.iter().map(|s| s.name.clone()).collect() };
+            let all = names(&config);
+            assert!(all.iter().any(|n| n == "vmbus") && all.iter().any(|n| n == "storvsc"));
+            assert_eq!(config.clone().on_machine(true), config);
+            let elsewhere = config.on_machine(false);
+            let left: Vec<String> = all
+                .iter()
+                .filter(|n| *n != "vmbus" && *n != "storvsc")
+                .cloned()
+                .collect();
+            assert_eq!(
+                names(&elsewhere),
+                left,
+                "devices, its clients and the rest stay"
+            );
+            assert!(
+                elsewhere
+                    .links
+                    .iter()
+                    .all(|l| l.left != "storvsc" && l.right != "storvsc")
+            );
+            assert!(elsewhere.grants.iter().all(|g| g.source != "dma.storvsc"));
+        }
+    }
+
+    #[test]
     fn a_service_the_node_cannot_run_without_is_never_hyper_v_only() {
         let bootstrap = b"moruna-node 1\nservice devices image.devices 4096\nbootstrap devices devices\ngrant devices root.hyperv root.hyperv\n";
         assert_eq!(Config::parse(bootstrap, 8192), Err(ConfigError::Syntax));

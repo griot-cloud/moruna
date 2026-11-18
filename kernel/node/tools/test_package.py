@@ -90,9 +90,27 @@ class Profiles(unittest.TestCase):
         # VMBus processes, which the supervisor starts on Hyper-V only (1F).
         self.assertEqual(cloud, ["moruna-node-supervisor", "devices", "netstack", "moruna-node-api",
                                  "moruna-node-platform", "virtio-blk", "virtio-net", "nvme", "gve",
-                                 "moruna-vmbus-server"])
-        for absent in ("virtio-vsock", "imagefs", "linux", "node-admission", "moruna-storage-service", "engine"):
+                                 "moruna-vmbus-server", "moruna-storvsc-server"])
+        for absent in ("virtio-vsock", "imagefs", "linux", "node-admission", "moruna-storage-service", "engine",
+                       "storvsc-check"):
             self.assertNotIn(absent, cloud)
+
+    def test_the_check_variant_is_the_cloud_profile_and_the_check_alone(self):
+        """Item 1.10b's Azure check: the cloud profile's description and assets, with
+        `storvsc-check`'s program, service and directory link added and nothing else."""
+        node = TOOL.parents[1]
+
+        def records(path):
+            return [line for line in (node / path).read_text().splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")]
+
+        check = records("cloud-check.image")
+        self.assertEqual([line for line in check if "storvsc-check" not in line], records("cloud.image"))
+        self.assertIn("  handle program:storvsc-check image.storvsc-check", check)
+        self.assertEqual(records("cloud-check/node.conf"),
+                         [*records("cloud/node.conf"), "service storvsc-check image.storvsc-check 33554432",
+                          "link devices directory-check storvsc-check directory"])
+        self.assertEqual((node / "cloud-check/network.conf").read_text(), (node / "cloud/network.conf").read_text())
 
     def test_the_user_build_compiles_c_as_build_sh_does(self):
         flags = "--target=x86_64-unknown-none -ffreestanding -mno-red-zone -fno-stack-protector"

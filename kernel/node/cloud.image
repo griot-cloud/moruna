@@ -1,9 +1,10 @@
 # The cloud profile, step 1 (system design 1A): the one disk image for every cloud.
 # Only the node supervisor starts in the initial manifest; it starts the services node.conf
 # names: `devices`, the network server (`netstack`, configured by network.conf), `api` and
-# `platform` (items 1.1, 1.3 and 1.4), and on Hyper-V `vmbus` (item 1.9c). package.py
-# --profile cloud --assets kernel/node/cloud validates node.conf and network.conf with their
-# actual parsers. Driver table data and driver images are emitted by moruna-image.
+# `platform` (items 1.1, 1.3 and 1.4), and on Hyper-V `vmbus` (item 1.9c) and its client
+# `storvsc` (item 1.10b). package.py --profile cloud --assets kernel/node/cloud validates
+# node.conf and network.conf with their actual parsers. Driver table data and driver images
+# are emitted by moruna-image.
 moruna-image 1
 process node-supervisor
   handle console console
@@ -22,6 +23,10 @@ process node-supervisor
   handle root.hyperv root.hyperv
   handle root.dma dma.vmbus
   handle program:vmbus image.vmbus
+  # storvsc (item 1.10b), Azure's disks: its own whole DMA grant, as vmbus's (1F), and its
+  # program. The supervisor starts it where it starts vmbus, whose client it is.
+  handle root.dma dma.storvsc
+  handle program:storvsc image.storvsc
   handle data:node.conf config
   handle data:network.conf network.config
   driver 1af4:1042 virtio-blk block
