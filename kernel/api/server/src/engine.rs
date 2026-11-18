@@ -58,6 +58,92 @@ pub struct Verdict {
     pub needs: Needs,
 }
 
+/// The host protocol's `check` message (`moruna-hosted-engine.md`, `check-job --listen`) for
+/// `document`, as [`EngineHost::check`] is given it, with the names of the job's secrets: one
+/// line, its line break included. A version 1 document is its JSON; a version 2 document's
+/// bytes go as their standard base64, as `spec` carries them.
+pub fn check_line(document: &[u8], secrets: &[String]) -> Vec<u8> {
+    let mut line = Vec::with_capacity(document.len() * 4 / 3 + 64);
+    line.extend_from_slice(b"{\"type\":\"check\",\"spec\":");
+    if document.first() == Some(&b'{') {
+        line.extend_from_slice(document);
+    } else {
+        line.push(b'"');
+        line.extend_from_slice(crate::token::to_base64(document).as_bytes());
+        line.push(b'"');
+    }
+    line.extend_from_slice(b",\"secrets\":");
+    line.extend_from_slice(
+        serde_json::to_string(secrets)
+            .unwrap_or_else(|_| String::from("[]"))
+            .as_bytes(),
+    );
+    line.extend_from_slice(b"}\n");
+    line
+}
+
+/// The `checked` line, as the engine's check answers it.
+#[derive(serde::Deserialize)]
+struct CheckedLine {
+    #[serde(rename = "type")]
+    kind: String,
+    ok: bool,
+    #[serde(default)]
+    refusals: Vec<Refusal>,
+    #[serde(default)]
+    memory_bytes: Option<u64>,
+    #[serde(default)]
+    hosts: Vec<String>,
+    #[serde(default)]
+    volumes: Vec<VolumeLine>,
+    #[serde(default)]
+    functions: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct VolumeLine {
+    serial: String,
+    write: bool,
+}
+
+/// The verdict the engine's check answers in its `checked` line (its line break taken off or
+/// not): its refusals, the job's budget and its needs. A line that is not a `checked` message,
+/// or that refuses the document without saying why, is the check's failure.
+pub fn verdict(line: &[u8]) -> Result<Verdict, HostError> {
+    let checked: CheckedLine = serde_json::from_slice(line.trim_ascii()).map_err(|_| {
+        HostError::Failed(String::from(
+            "the engine's check answered a line that is not its `checked` message",
+        ))
+    })?;
+    if checked.kind != "checked" {
+        return Err(HostError::Failed(alloc::format!(
+            "the engine's check answered `{}`, not `checked`",
+            checked.kind
+        )));
+    }
+    if !checked.ok && checked.refusals.is_empty() {
+        return Err(HostError::Failed(String::from(
+            "the engine's check refused the document without saying why",
+        )));
+    }
+    Ok(Verdict {
+        refusals: checked.refusals,
+        memory_bytes: checked.memory_bytes,
+        needs: Needs {
+            hosts: checked.hosts,
+            volumes: checked
+                .volumes
+                .into_iter()
+                .map(|v| Volume {
+                    serial: v.serial,
+                    write: v.write,
+                })
+                .collect(),
+            functions: checked.functions,
+        },
+    })
+}
+
 /// What the server asks of the node to run jobs: the engine's check of a document, a fresh
 /// engine for a job, and the host protocol's bytes to and from it. `api` does not link
 /// `moruna-job`: a document is checked by the engine itself.

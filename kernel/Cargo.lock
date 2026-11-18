@@ -952,6 +952,7 @@ dependencies = [
 name = "moruna-node-api"
 version = "0.1.0"
 dependencies = [
+ "engine",
  "heapless",
  "httparse",
  "moruna-api",
@@ -961,6 +962,7 @@ dependencies = [
  "moruna-node-platform",
  "moruna-svc",
  "netstack-protocol",
+ "node-protocol",
  "rcgen",
  "ring",
  "rustls",

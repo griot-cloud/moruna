@@ -7,9 +7,9 @@
 //!   hand-over's instance, which every token's `aud` must be.
 //! - **The function keys** (3E): node config's `functions.keys`, which a function image's
 //!   signature must verify under; none when it has none.
-//! - **The node document** (2A): this crate's version, the node's cores, its memory, the
-//!   instance, the cloud, the CPU executor with a slot a core, and health `ok`. `boot_ms`
-//!   is set when the process answers `ready` ([`crate::run`]).
+//! - **The node document** (2A): this crate's version, the node's cores, its memory, the job
+//!   bound `node-admission` answers (3A), the instance, the cloud, the CPU executor with a slot a
+//!   core, and health `ok`. `boot_ms` is set when the process answers `ready` ([`crate::run`]).
 //! - **The wall clock:** the hand-over's, carried forward by the core's monotonic time since
 //!   `platform` read it.
 
@@ -24,9 +24,14 @@ use crate::Error;
 /// The version the node document gives: this crate's.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The API server's config, from the hand-over, for a node of `cores` CPUs, at `now` on
-/// the core's monotonic clock.
-pub fn config(handover: &Handover, cores: u32, now: u64) -> Result<Config, Error> {
+/// The API server's config, from the hand-over, for a node of `cores` CPUs whose jobs may have
+/// `job_memory_bytes` each (0 when it runs none), at `now` on the core's monotonic clock.
+pub fn config(
+    handover: &Handover,
+    cores: u32,
+    job_memory_bytes: u64,
+    now: u64,
+) -> Result<Config, Error> {
     let identity = match &handover.config.api.tls {
         Some(tls) => Identity::from_pem(&tls.certificate, &tls.key)
             .map_err(|error| Error::Identity(true, error))?,
@@ -35,7 +40,7 @@ pub fn config(handover: &Handover, cores: u32, now: u64) -> Result<Config, Error
     };
     Ok(Config {
         identity,
-        facts: facts(handover, cores),
+        facts: facts(handover, cores, job_memory_bytes),
         token_keys: handover
             .config
             .api
@@ -54,13 +59,14 @@ pub fn config(handover: &Handover, cores: u32, now: u64) -> Result<Config, Error
 }
 
 /// The node document's facts: all but `boot_ms`, which is 0 until `ready`.
-pub fn facts(handover: &Handover, cores: u32) -> NodeFacts {
+pub fn facts(handover: &Handover, cores: u32, job_memory_bytes: u64) -> NodeFacts {
     NodeFacts {
         version: String::from(VERSION),
         instance: handover.instance.clone(),
         cloud: handover.cloud,
         cores,
         memory_bytes: handover.memory_bytes,
+        job_memory_bytes,
         executors: vec![Executor {
             kind: ExecutorKind::Cpu,
             slots: cores,

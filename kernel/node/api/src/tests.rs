@@ -11,6 +11,8 @@ mod common;
 #[path = "../../../api/server/tests/common/signer.rs"]
 mod signer;
 
+mod admission;
+mod jobs;
 mod network;
 mod serve;
 
@@ -395,7 +397,7 @@ fn the_function_keys_come_from_node_config() {
         r#"{{"moruna":1,"api":{{"token_keys":["{}"]}},"functions":{{"keys":["{key}"]}}}}"#,
         base64::encode(&[7; 32])
     );
-    let config = node::config(&handover_of(&user_data), 1, now()).expect("a config");
+    let config = node::config(&handover_of(&user_data), 1, 0, now()).expect("a config");
     assert_eq!(
         config.function_keys,
         [moruna_api_server::FunctionKey::new([5; 32])]
@@ -407,8 +409,10 @@ fn the_function_keys_come_from_node_config() {
 fn the_server_s_config_comes_from_the_hand_over() {
     let keys = [[7; 32], [9; 32]];
     let handover = handover_of(&user_data(&keys, None));
-    let config = node::config(&handover, 3, now()).expect("a config");
+    let config = node::config(&handover, 3, 6_849_298_432, now()).expect("a config");
     let facts = &config.facts;
+    // The job bound node-admission answered (system design 3A).
+    assert_eq!(facts.job_memory_bytes, 6_849_298_432);
     assert_eq!(facts.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(facts.version, node::VERSION);
     assert_eq!(facts.instance, INSTANCE);
@@ -435,7 +439,7 @@ fn the_server_s_config_comes_from_the_hand_over() {
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
     );
-    let again = node::config(&handover, 3, now()).expect("a config");
+    let again = node::config(&handover, 3, 0, now()).expect("a config");
     assert_ne!(again.identity.fingerprint(), fingerprint);
 }
 
@@ -443,7 +447,7 @@ fn the_server_s_config_comes_from_the_hand_over() {
 fn the_operator_s_tls_is_the_identity_when_node_config_has_one() {
     let (certificate, key, der) = operator("node.example");
     let handover = handover_of(&user_data(&[[7; 32]], Some((&certificate, &key))));
-    let config = node::config(&handover, 1, now()).expect("a config");
+    let config = node::config(&handover, 1, 0, now()).expect("a config");
     assert_eq!(config.identity.certificate(), der.as_slice());
     let digest = ring::digest::digest(&ring::digest::SHA256, &der);
     assert_eq!(config.identity.fingerprint(), hex(digest.as_ref()));
@@ -452,7 +456,7 @@ fn the_operator_s_tls_is_the_identity_when_node_config_has_one() {
     let (_, other_key, _) = operator("other.example");
     let handover = handover_of(&user_data(&[[7; 32]], Some((&certificate, &other_key))));
     assert_eq!(
-        node::config(&handover, 1, now()).err(),
+        node::config(&handover, 1, 0, now()).err(),
         Some(Error::Identity(true, IdentityError::Mismatch))
     );
 }

@@ -20,6 +20,7 @@ fn api(signer: &Signer) -> Api {
             cloud: Cloud::OpenStack,
             cores: 4,
             memory_bytes: 1 << 33,
+            job_memory_bytes: 6_532 << 20,
             executors: vec![Executor {
                 kind: ExecutorKind::Cpu,
                 slots: 4,

@@ -85,7 +85,9 @@ pub use api::NodeFacts;
 #[cfg(feature = "test-exit")]
 pub use api::TEST_EXIT_PATH;
 pub use audit::{AUDIT_ANSWER_LIMIT, AUDIT_LIMIT};
-pub use engine::{ENGINE_LINE_LIMIT, EngineHost, HostError, Needs, NoEngine, Verdict, Volume};
+pub use engine::{
+    ENGINE_LINE_LIMIT, EngineHost, HostError, Needs, NoEngine, Verdict, Volume, check_line, verdict,
+};
 pub use functions::{ADDRESS_LIMIT, FUNCTIONS_LIMIT, FunctionKey};
 pub use http::{BODY_BUDGET, BODY_LIMIT, HEADER_LIMIT};
 pub use identity::{Identity, IdentityError, VALID_AFTER_SECONDS, VALID_BEFORE_SECONDS};

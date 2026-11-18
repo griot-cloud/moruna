@@ -33,6 +33,9 @@ pub struct NodeFacts {
     pub cores: u32,
     /// The node's memory, in bytes.
     pub memory_bytes: u64,
+    /// The most memory a job may have, in bytes (system design 3A): what `node-admission`
+    /// answers at the start of `api`; 0 on a node that runs no jobs.
+    pub job_memory_bytes: u64,
     /// What the node can run work on.
     pub executors: Vec<Executor>,
     /// Milliseconds from the core's first instruction to ready.
@@ -50,6 +53,7 @@ impl NodeFacts {
             cloud: self.cloud,
             cores: self.cores,
             memory_bytes: self.memory_bytes,
+            job_memory_bytes: self.job_memory_bytes,
             executors: self.executors.clone(),
             boot_ms: self.boot_ms,
             time,

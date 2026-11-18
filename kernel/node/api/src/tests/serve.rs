@@ -127,6 +127,23 @@ impl Https {
     /// `GET path`, with `token` when given: the answer.
     fn get(&mut self, path: &str, token: Option<&str>) -> Answer {
         self.send(path, token);
+        self.answer_whole()
+    }
+
+    /// `POST path` with `body`, and `token`: the answer.
+    fn post(&mut self, path: &str, token: &str, body: &str) -> Answer {
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: node\r\nAuthorization: Bearer {token}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        self.tls.writer().write_all(request.as_bytes()).unwrap();
+        self.flush();
+        self.answer_whole()
+    }
+
+    /// The next whole answer, waited for.
+    fn answer_whole(&mut self) -> Answer {
         loop {
             self.flush();
             if let Some(answer) = self.answer() {
@@ -203,12 +220,18 @@ struct Api {
 }
 
 fn start_api(node: &mut Node) -> Api {
+    start_api_with(node, None)
+}
+
+/// The same, with `admission`, a connection to `node-admission`, when the node runs jobs.
+fn start_api_with(node: &mut Node, admission: Option<Channel>) -> Api {
     let (client, slot) = node.api();
     let (ours, theirs) = Channel::create().expect("a channel");
     let lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let said = lines.clone();
     let thread = thread::spawn(move || {
-        let Err(error) = run(client, &theirs, 3, &mut |line: &str| {
+        let host = admission.map(|channel| jobs(channel).expect("the engine host"));
+        let Err(error) = run(client, &theirs, 3, host, &mut |line: &str| {
             said.lock().unwrap().push(line.to_string())
         });
         error
@@ -389,6 +412,96 @@ fn a_later_start_s_node_document_says_the_node_s_boot_ms() {
     let document = https.get("/v1/node", Some(&observe));
     assert_eq!(document.status, 200, "{:?}", document.body);
     assert_eq!(document.body["boot_ms"], 1_234);
+    node.stop.store(true, Ordering::SeqCst);
+    let error = api.thread.join().expect("api");
+    assert!(
+        matches!(error, Error::Network(_, CallError::PeerClosed)),
+        "{error:?}"
+    );
+    drop((https, outside, api.slot, api.platform));
+    node.end();
+}
+
+/// A node that runs jobs (item 3.2): the node document says the job bound `node-admission`
+/// answered, and a validation is checked by an engine that `node-admission` starts, over
+/// HTTPS, while the process waits on the engine's channel as well as the network server.
+#[test]
+fn a_node_with_admission_reports_its_job_bound_and_checks_in_an_engine() {
+    const BOUND: u64 = 6_532 << 20;
+    let admission = super::admission::Admission::start(BOUND);
+    let mut node = Node::start(true);
+    let outside = node.slot("listen-host");
+    let mut api = start_api_with(&mut node, Some(admission.connect()));
+    let signer = Signer::new();
+    let handover = handover_of(&user_data(&[signer.public()], None));
+    api.platform
+        .send(
+            &handover.encode().expect("encoded"),
+            deadline_in(5 * SECOND),
+        )
+        .expect("the hand-over");
+    assert_eq!(
+        api.platform.receive(deadline_in(30 * SECOND)),
+        Ok(READY.to_vec())
+    );
+    let fingerprint = api.lines.lock().unwrap()[0]
+        .strip_prefix("moruna: tls sha256=")
+        .expect("the identity's line")
+        .to_string();
+    let mut https = Https::open(&outside, Endpoint::new(NODE_ADDRESS, 443), &fingerprint);
+    let observe = signer.token(INSTANCE, WALL_CLOCK + 1_800, &["observe"]);
+    let document = https.get("/v1/node", Some(&observe));
+    assert_eq!(document.status, 200, "{:?}", document.body);
+    assert_eq!(document.body["job_memory_bytes"], BOUND);
+
+    // The check's engine, played on its channel once node-admission has started it.
+    let book = admission.book.clone();
+    let engine = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let channel = loop {
+            if let Some(channel) = book
+                .lock()
+                .unwrap()
+                .started
+                .first_mut()
+                .and_then(|s| s.channel.take())
+            {
+                break channel;
+            }
+            assert!(Instant::now() < deadline, "no check started");
+            thread::sleep(Duration::from_millis(5));
+        };
+        let mut line = Vec::new();
+        while !line.ends_with(b"\n") {
+            wait_one(&channel.0, Signals::READABLE, deadline_in(30 * SECOND)).expect("its line");
+            let (bytes, _) = channel.needed().unwrap().expect("a message");
+            let mut message = vec![0; bytes];
+            channel.read(&mut message, &mut []).unwrap();
+            line.extend_from_slice(&message);
+        }
+        channel
+            .write_with(
+                b"{\"type\":\"checked\",\"ok\":false,\"refusals\":[{\"field\":\"sink.kind\",\"message\":\"no such kind\"}]}\n",
+                &mut [],
+            )
+            .unwrap();
+        line
+    });
+    let submit = signer.token(INSTANCE, WALL_CLOCK + 1_800, &["submit"]);
+    let job = r#"{"v1":{"moruna_spec":1,"sink":{"kind":"nothing"}}}"#;
+    let answer = https.post("/v1/jobs/validate", &submit, job);
+    assert_eq!(answer.status, 200, "{:?}", answer.body);
+    assert_eq!(
+        answer.body,
+        serde_json::json!({"ok": false, "refusals": [{"field": "sink.kind", "message": "no such kind"}]})
+    );
+    let line = engine.join().expect("the engine");
+    assert_eq!(
+        line,
+        b"{\"type\":\"check\",\"spec\":{\"moruna_spec\":1,\"sink\":{\"kind\":\"nothing\"}},\"secrets\":[]}\n"
+    );
+    assert_eq!(admission.config(0), crate::engine::check_config(BOUND));
+
     node.stop.store(true, Ordering::SeqCst);
     let error = api.thread.join().expect("api");
     assert!(

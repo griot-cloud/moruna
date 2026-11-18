@@ -17,6 +17,7 @@ fn facts() -> NodeFacts {
         cloud: Cloud::Azure,
         cores: 4,
         memory_bytes: 8_589_934_592,
+        job_memory_bytes: 6_849_298_432,
         executors: vec![Executor {
             kind: ExecutorKind::Cpu,
             slots: 4,
@@ -66,7 +67,7 @@ fn each_operation_answers_a_token_whose_scope_covers_it() {
         body(&node),
         json!({
             "version": "0.7.0", "instance": "i-1", "cloud": "azure",
-            "cores": 4, "memory_bytes": 8_589_934_592u64,
+            "cores": 4, "memory_bytes": 8_589_934_592u64, "job_memory_bytes": 6_849_298_432u64,
             "executors": [{ "kind": "cpu", "slots": 4 }],
             "boot_ms": 2140, "time": NOW, "health": "degraded"
         })

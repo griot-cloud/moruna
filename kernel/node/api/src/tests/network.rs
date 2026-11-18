@@ -21,7 +21,7 @@ fn turn(network: &Rc<RefCell<Network>>) -> Result<(Vec<u32>, Option<Event>), Err
     let event = network.borrow_mut().tend(now())?;
     network.borrow_mut().flush()?;
     let deadline = network.borrow().look_at().min(now() + TURN_NS);
-    network.borrow_mut().wait(deadline)?;
+    network.borrow_mut().wait(deadline, &[])?;
     Ok((accepted, event))
 }
 
