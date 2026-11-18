@@ -20,6 +20,12 @@
 # NODE_UP_CARD=none the machine has no network card (the check that the node says it has no
 # lease, and powers off).
 #
+# For the volumes' checks (item 3.3): NODE_UP_MEMORY sets the machine's memory (QEMU's -m, 2G
+# by default; at most 6G, this Mac's rule for a VM), NODE_UP_BOOT_SERIAL gives the boot disk a
+# virtio serial, and NODE_UP_VOLUMES attaches each of its space-separated FILE:SERIAL[:ro] as a
+# raw virtio-blk disk with that serial (modern virtio, so the node's virtio-blk driver serves
+# it), read only with `:ro`.
+#
 # It returns once `moruna: network` is on the console (exit 0), within 120 s under KVM or 300 s
 # under the emulator, and prints how long after QEMU's start it came, QEMU left running with its
 # process ID in OUT/qemu.pid. When a `moruna: fatal` line comes first it prints it, waits up to
@@ -46,6 +52,40 @@ case "$card" in
   virtio | none) ;;
   *) echo "node-up.sh: NODE_UP_CARD must be virtio or none: $card" >&2; exit 2 ;;
 esac
+memory="${NODE_UP_MEMORY:-2G}"
+case "$memory" in
+  [1-6]G) ;;
+  *) echo "node-up.sh: NODE_UP_MEMORY must be 1G to 6G: $memory" >&2; exit 2 ;;
+esac
+serial_ok() {
+  case "$1" in
+    '' | *[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  [ "${#1}" -le 20 ]
+}
+boot_serial=""
+if [ -n "${NODE_UP_BOOT_SERIAL:-}" ]; then
+  serial_ok "$NODE_UP_BOOT_SERIAL" || {
+    echo "node-up.sh: NODE_UP_BOOT_SERIAL must be 1 to 20 of [A-Za-z0-9._-]: $NODE_UP_BOOT_SERIAL" >&2
+    exit 2
+  }
+  boot_serial=",serial=$NODE_UP_BOOT_SERIAL"
+fi
+volumes=()
+n=0
+for volume in ${NODE_UP_VOLUMES:-}; do
+  IFS=: read -r file vserial access extra <<< "$volume"
+  if [ -n "${extra:-}" ] || [ ! -f "$file" ] || ! serial_ok "$vserial" \
+     || { [ -n "${access:-}" ] && [ "$access" != ro ]; }; then
+    echo "node-up.sh: NODE_UP_VOLUMES takes FILE:SERIAL[:ro], an existing file and a serial of 1 to 20 of [A-Za-z0-9._-]: $volume" >&2
+    exit 2
+  fi
+  readonly_flag=""
+  [ "${access:-}" = ro ] && readonly_flag=",readonly=on"
+  volumes+=(-drive "if=none,id=volume$n,format=raw$readonly_flag,file=$file"
+            -device "virtio-blk-pci,drive=volume$n,serial=$vserial,disable-legacy=on")
+  n=$((n + 1))
+done
 disk="$out/moruna-node.$format"
 if [ ! -f "$disk" ]; then
   echo "node-up.sh: no disk image at $disk" >&2
@@ -84,18 +124,19 @@ if [ "$card" = virtio ]; then
     -device virtio-net-pci,netdev=net0,disable-legacy=on
   )
 fi
-echo "node-up: ${accel[1]}, $cpus CPUs, $format disk, card $card, $seconds s" >&2
+echo "node-up: ${accel[1]}, $cpus CPUs, $memory, $format disk, card $card, $n volumes, $seconds s" >&2
 
 console="$out/console.log"
 rm -f "$console" "$out/net.pcap" "$pidfile"
 start="$EPOCHREALTIME"
 # In the background, its own process: it stays up after this script returns.
-nohup qemu-system-x86_64 -machine q35 -smp "$cpus" -m 2G -rtc base=utc -nodefaults -no-reboot -display none \
+nohup qemu-system-x86_64 -machine q35 -smp "$cpus" -m "$memory" -rtc base=utc -nodefaults -no-reboot -display none \
   "${accel[@]}" \
   -drive "if=pflash,format=raw,readonly=on,file=$code" \
   -drive "if=pflash,format=raw,file=$vars" \
   -drive "if=none,id=boot,format=$format,readonly=on,file=$disk" \
-  -device virtio-blk-pci,drive=boot,disable-legacy=on \
+  -device "virtio-blk-pci,drive=boot,disable-legacy=on$boot_serial" \
+  ${volumes[@]+"${volumes[@]}"} \
   "${network[@]}" \
   -serial "file:$console" > "$out/qemu.log" 2>&1 < /dev/null &
 qemu_pid=$!

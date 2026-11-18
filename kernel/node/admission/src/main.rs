@@ -3,7 +3,10 @@
 //! Volumes (system design 3C, item 3.3): through the device manager's directory (the
 //! `directory` slot, when the node links one) it knows the node's disks by serial. Every check
 //! is given them as data ([`node_protocol::VOLUMES_SLOT`]), so `validate` refuses a volume no
-//! disk has, and the boot disk; `launch` resolves a job's volumes again, `Invalid` for either.
+//! disk has, and the boot disk; `launch` resolves a job's volumes again, `Invalid` for either,
+//! and grants the engine each as a connection to its driver (`volume.<n>`) with their list
+//! (`volumes`). It holds the writer lease of each source volume for the job's length, so the
+//! engine's connection to it is refused every write by its driver.
 //!
 //! Functions (system design 3E, item 3.6): `api` sends node config's `functions.cache_bytes`
 //! once (`functions`), and the server carves the function cache's account of that size from
@@ -21,6 +24,7 @@
 extern crate alloc;
 mod authority;
 use alloc::{boxed::Box, collections::BTreeMap, rc::Rc, string::String, vec::Vec};
+use block_protocol::block;
 use core::cell::RefCell;
 use devices_protocol::{Block, directory};
 use moruna_svc::{
@@ -55,8 +59,11 @@ struct Job {
     process: Process,
     _account: Account,
     /// What the job needs of the node, as its check answered them: kept for the grants of
-    /// items 3.3, 3.4 and 3.6, which this item does not make yet.
+    /// items 3.4 and 3.6, which this item does not make yet.
     _needs: Needs,
+    /// The writer lease of each source volume, held for as long as the job is: dropped, its
+    /// connection closes and the driver lets the lease go (item 3.3).
+    _leases: Vec<block::Client>,
     state: u32,
     cancel_requested: bool,
     waiters: Vec<Pending>,
@@ -303,15 +310,73 @@ fn fetch_setup(channel: &Channel) -> Option<(net::Client, Account, Console)> {
     Some((client, account, Console(console)))
 }
 
-/// The node's disks, as the device manager's directory lists them; none without a directory.
-fn node_blocks(shared: &Rc<RefCell<Shared>>) -> Result<Vec<Block>, admission::Error> {
+/// A connection to the device manager's directory, when the node links one.
+fn directory_client(
+    shared: &Rc<RefCell<Shared>>,
+) -> Result<Option<directory::Client>, admission::Error> {
     let state = shared.borrow();
     let Some(listener) = &state.directory else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let channel = moruna_svc::connect(listener).map_err(|_| admission::Error::Unavailable)?;
     let mut client = directory::Client::connect(channel, moruna_svc::deadline_in(DIRECTORY_NS))
         .map_err(|_| admission::Error::Unavailable)?;
+    client.core().set_timeout(DIRECTORY_NS);
+    Ok(Some(client))
+}
+
+/// A job's volumes, resolved (`node_protocol::resolve`): for each, in order, a connection to
+/// its driver for the engine, and for a source a writer lease held on a connection of
+/// admission's own; and their list for the engine. `Invalid` for a volume the node does not
+/// grant, `Unavailable` when the directory or a driver does not answer.
+#[expect(
+    clippy::type_complexity,
+    reason = "The engine's slots and handles, and the leases admission keeps"
+)]
+fn volume_grants(
+    shared: &Rc<RefCell<Shared>>,
+    volumes: &[(String, bool)],
+) -> Result<(Vec<(String, Handle)>, Vec<block::Client>), admission::Error> {
+    let mut directory = directory_client(shared)?.ok_or(admission::Error::Unavailable)?;
+    let blocks = directory
+        .blocks()
+        .map_err(|_| admission::Error::Unavailable)?;
+    let resolved =
+        node_protocol::resolve(volumes, &blocks).map_err(|_| admission::Error::Invalid)?;
+    let mut grants = Vec::new();
+    let mut leases = Vec::new();
+    for (n, (block, write)) in resolved.iter().enumerate() {
+        let channel = directory
+            .lookup(block.serial.clone())
+            .map_err(|_| admission::Error::Unavailable)?;
+        grants.push((node_protocol::volume_slot(n), channel.0));
+        if !*write {
+            let channel = directory
+                .lookup(block.serial.clone())
+                .map_err(|_| admission::Error::Unavailable)?;
+            let mut client = block::Client::connect(channel, moruna_svc::deadline_in(DIRECTORY_NS))
+                .map_err(|_| admission::Error::Unavailable)?;
+            client.core().set_timeout(DIRECTORY_NS);
+            match client.acquire_write() {
+                Ok(_) => leases.push(client),
+                // A disk its driver serves read only has no writer to hold.
+                Err(moruna_svc::CallError::Remote(block::Error::ReadOnly)) => {}
+                Err(_) => return Err(admission::Error::Unavailable),
+            }
+        }
+    }
+    let list = node_protocol::volume_grants(&resolved);
+    let data =
+        node_protocol::volumes_data_text(&list).map_err(|_| admission::Error::Unavailable)?;
+    grants.push((String::from(node_protocol::VOLUMES_SLOT), data));
+    Ok((grants, leases))
+}
+
+/// The node's disks, as the device manager's directory lists them; none without a directory.
+fn node_blocks(shared: &Rc<RefCell<Shared>>) -> Result<Vec<Block>, admission::Error> {
+    let Some(mut client) = directory_client(shared)? else {
+        return Ok(Vec::new());
+    };
     client.core().set_timeout(DIRECTORY_NS);
     client.blocks().map_err(|_| admission::Error::Unavailable)
 }
@@ -400,16 +465,17 @@ fn launch_job(shared: &Rc<RefCell<Shared>>, owner: u64, launch: Launch) -> Resul
     if !node_protocol::valid_needs(&needs) {
         return Err(admission::Error::Invalid.into());
     }
+    let mut leases = Vec::new();
     if !needs.1.is_empty() {
         // A job's volumes, resolved again: a serial no disk has, the boot disk, or a sink's
-        // volume served read only is refused, as the check refused it.
-        if shared.borrow().directory.is_none() {
-            return Err(admission::Error::Unavailable.into());
+        // volume served read only is refused, as the check refused it. Each is the engine's
+        // as a connection to its driver, a source's writer lease admission's (item 3.3).
+        let (volumes, held) = volume_grants(shared, &needs.1)?;
+        for (name, handle) in volumes {
+            names.push(name);
+            grants.push(handle);
         }
-        let blocks = node_blocks(shared)?;
-        if node_protocol::resolve(&needs.1, &blocks).is_err() {
-            return Err(admission::Error::Invalid.into());
-        }
+        leases = held;
     }
     if services.len() > node_protocol::MAX_GRANTS {
         return Err(admission::Error::Invalid.into());
@@ -530,6 +596,7 @@ fn launch_job(shared: &Rc<RefCell<Shared>>, owner: u64, launch: Launch) -> Resul
             process,
             _account: account,
             _needs: needs,
+            _leases: leases,
             state: RUNNING,
             cancel_requested: false,
             waiters: Vec::new(),

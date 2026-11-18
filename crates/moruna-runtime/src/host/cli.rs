@@ -30,6 +30,7 @@ pub const USAGE: &str = "usage: moruna run <spec.json> [--arg NAME=VALUE]... [--
        moruna check-job --listen <address> [--node channel:SLOT [--budget-max BYTES] [--volumes <file | slot:NAME>]] [--kinds <kinds.json>]...
        moruna explain <spec.json> [--planner <name>] [--out <plan.mplan>] [--kinds <kinds.json>]...
        moruna volume pack <dir> <out>
+       moruna volume unpack <volume> <dir>
        moruna --version
 
 --kinds names a file of the kinds the program running Moruna serves: a JSON array of
@@ -227,6 +228,16 @@ pub enum Command {
         dir: PathBuf,
         /// The layer file, which must not exist yet.
         out: PathBuf,
+    },
+    /// `moruna volume unpack <volume> <dir>` (item 3.3): the files of the layer a volume holds
+    /// (a layer file, or a whole disk a run's sinks wrote one onto), every page checked against
+    /// the layer's hashes, written under `dir`, a new directory: how a sink's volume is read
+    /// back.
+    VolumeUnpack {
+        /// The layer file or the volume's disk.
+        volume: PathBuf,
+        /// Where its tree is written, which must not exist yet.
+        dir: PathBuf,
     },
     /// `moruna --version`.
     Version,
@@ -666,7 +677,14 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                 dir: PathBuf::from(dir),
                 out: PathBuf::from(out),
             }),
-            _ => Err("moruna volume: `moruna volume pack <dir> <out>`".to_string()),
+            (Some("unpack"), Some(volume), Some(dir), None) => Ok(Command::VolumeUnpack {
+                volume: PathBuf::from(volume),
+                dir: PathBuf::from(dir),
+            }),
+            _ => Err(
+                "moruna volume: `moruna volume pack <dir> <out>` or `moruna volume unpack <volume> <dir>`"
+                    .to_string(),
+            ),
         },
         Some("--version" | "-V" | "version") => Ok(Command::Version),
         Some("--help" | "-h" | "help") => Ok(Command::Help),
@@ -709,6 +727,59 @@ pub fn volume_pack(dir: &Path, out: &Path) -> Result<String, String> {
         layer.pages,
         layer.pages * 4096,
         layer.id
+    ))
+}
+
+/// `moruna volume unpack <volume> <dir>`: the files of the layer `volume` holds (a layer file,
+/// or a disk with one from its first byte), every page checked against its hashes, written under
+/// the new directory `dir` with their permission bits; its directories and symbolic links too.
+pub fn volume_unpack(volume: &Path, dir: &Path) -> Result<String, String> {
+    use moruna_image::layerfile::Item;
+    if dir.symlink_metadata().is_ok() {
+        return Err(format!(
+            "{} exists; a volume is unpacked into a new directory",
+            dir.display()
+        ));
+    }
+    let items =
+        moruna_image::layerfile::read(&[volume.to_path_buf()]).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let (mut files, mut bytes) = (0u64, 0u64);
+    for (path, item) in &items {
+        let at = dir.join(path.trim_start_matches('/'));
+        match item {
+            Item::Directory(_) => {
+                std::fs::create_dir_all(&at).map_err(|e| format!("{}: {e}", at.display()))?
+            }
+            Item::File(mode, data) => {
+                if let Some(parent) = at.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("{}: {e}", parent.display()))?;
+                }
+                std::fs::write(&at, data).map_err(|e| format!("{}: {e}", at.display()))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&at, std::fs::Permissions::from_mode(*mode))
+                        .map_err(|e| format!("{}: {e}", at.display()))?;
+                }
+                files += 1;
+                bytes += data.len() as u64;
+            }
+            Item::Symlink(target) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(target), &at)
+                        .map_err(|e| format!("{}: {e}", at.display()))?;
+                }
+            }
+        }
+    }
+    Ok(format!(
+        "{}: {files} files of {bytes} bytes, every page checked, written under {}",
+        volume.display(),
+        dir.display()
     ))
 }
 
@@ -938,6 +1009,18 @@ fn main_as(
         Command::Kinds => {
             println!("{}", kinds.listing().to_json());
             return exit::COMPLETED;
+        }
+        Command::VolumeUnpack { volume, dir } => {
+            return match volume_unpack(&volume, &dir) {
+                Ok(summary) => {
+                    println!("{summary}");
+                    exit::COMPLETED
+                }
+                Err(reason) => {
+                    eprintln!("moruna volume unpack: {reason}");
+                    exit::FAILED
+                }
+            };
         }
         Command::VolumePack { dir, out } => {
             return match volume_pack(&dir, &out) {
@@ -3121,19 +3204,28 @@ mod volume_pack_tests {
                 out: "nyc.layer".into(),
             })
         );
+        assert_eq!(
+            parse(&args(&["volume", "unpack", "disk.img", "back"])),
+            Ok(Command::VolumeUnpack {
+                volume: "disk.img".into(),
+                dir: "back".into(),
+            })
+        );
         for bad in [
             &["volume"][..],
             &["volume", "pack", "data"],
-            &["volume", "unpack", "a", "b"],
+            &["volume", "repack", "a", "b"],
             &["volume", "pack", "a", "b", "c"],
+            &["volume", "unpack", "a"],
         ] {
             assert_eq!(
                 parse(&args(bad)),
-                Err("moruna volume: `moruna volume pack <dir> <out>`".to_string()),
+                Err("moruna volume: `moruna volume pack <dir> <out>` or `moruna volume unpack <volume> <dir>`".to_string()),
                 "{bad:?}"
             );
         }
         assert!(USAGE.contains("moruna volume pack <dir> <out>"));
+        assert!(USAGE.contains("moruna volume unpack <volume> <dir>"));
     }
 
     #[test]
@@ -3177,6 +3269,35 @@ mod volume_pack_tests {
         );
         assert_eq!(std::fs::read(&fresh).unwrap(), std::fs::read(&out).unwrap());
         assert_eq!(run(&["volume", "pack", d]), exit::SPEC_REFUSED);
+        // Unpacked, from the layer, and from a disk that holds it with room after it, as a
+        // sink's volume does: the same tree back, its bits as they were.
+        let disk = root.join("disk.img");
+        let mut on_disk = std::fs::read(&out).unwrap();
+        on_disk.resize(on_disk.len() + (1 << 20), 0);
+        std::fs::write(&disk, &on_disk).unwrap();
+        for (from, back) in [(&out, root.join("back")), (&disk, root.join("back-disk"))] {
+            let (f, b) = (from.to_str().unwrap(), back.to_str().unwrap());
+            assert_eq!(run(&["volume", "unpack", f, b]), exit::COMPLETED);
+            assert_eq!(
+                std::fs::read(back.join("nyc").join("2024-01.parquet")).unwrap(),
+                month
+            );
+            assert_eq!(
+                std::fs::read(back.join("readme.txt")).unwrap(),
+                b"one month"
+            );
+            assert_eq!(
+                run(&["volume", "unpack", f, b]),
+                exit::FAILED,
+                "into a directory there"
+            );
+        }
+        let summary = volume_unpack(&out, &root.join("again")).unwrap();
+        assert!(summary.contains("2 files of 70009 bytes"), "{summary}");
+        // A disk that holds no layer is refused.
+        let blank = root.join("blank.img");
+        std::fs::write(&blank, vec![0u8; 1 << 16]).unwrap();
+        assert!(volume_unpack(&blank, &root.join("none")).is_err());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

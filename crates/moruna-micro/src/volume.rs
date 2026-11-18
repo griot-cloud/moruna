@@ -27,6 +27,49 @@ mod tests;
 /// The URL scheme a job names a volume's file with.
 pub const SCHEME: &str = "disk://";
 
+/// The start slot of the data `node-admission` grants a job's engine with its volumes.
+pub const GRANTS_SLOT: &str = "volumes";
+
+/// One volume the node granted the engine: the slot of the connection to its driver, the serial
+/// a job names it by, and whether it is a sink's, which the job writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Grant {
+    /// The slot: `volume.<n>`.
+    pub slot: String,
+    /// Its serial.
+    pub serial: String,
+    /// A sink's volume, written; a source's otherwise, read only.
+    pub sink: bool,
+}
+
+/// The volumes `node-admission` granted, from its list ([`GRANTS_SLOT`]): a line each, `<n>
+/// <serial> <source|sink>` (`node_protocol::volume_grants`), the connection's slot
+/// `volume.<n>`.
+pub fn parse_grants(text: &str) -> Result<Vec<Grant>, String> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let bad = || format!("the node's volume grants: `{line}`");
+            match line.split_ascii_whitespace().collect::<Vec<_>>().as_slice() {
+                [n, serial, role] => {
+                    let n: u32 = n.parse().map_err(|_| bad())?;
+                    let sink = match *role {
+                        "sink" => true,
+                        "source" => false,
+                        _ => return Err(bad()),
+                    };
+                    Ok(Grant {
+                        slot: format!("volume.{n}"),
+                        serial: (*serial).to_string(),
+                        sink,
+                    })
+                }
+                _ => Err(bad()),
+            }
+        })
+        .collect()
+}
+
 /// The serial and the path a `disk://<serial>/<path>` URL names; the path may be empty (a
 /// listing of the volume). `None` for another URL, or one with no serial.
 pub fn parse(url: &str) -> Option<(&str, &str)> {
@@ -49,5 +92,29 @@ mod url_tests {
         assert_eq!(parse("disk://lun-0"), None, "no path at all");
         assert_eq!(parse("disk:///x"), None, "no serial");
         assert_eq!(parse("s3://bucket/x"), None);
+    }
+
+    #[test]
+    fn the_nodes_grants_name_each_volumes_slot_serial_and_role() {
+        // As node_protocol::volume_grants writes them.
+        assert_eq!(
+            parse_grants("0 vol-in source\n1 vol-out sink\n").unwrap(),
+            [
+                Grant {
+                    slot: "volume.0".into(),
+                    serial: "vol-in".into(),
+                    sink: false
+                },
+                Grant {
+                    slot: "volume.1".into(),
+                    serial: "vol-out".into(),
+                    sink: true
+                },
+            ]
+        );
+        assert_eq!(parse_grants("").unwrap(), []);
+        for bad in ["x vol source", "0 vol", "0 vol both", "0 vol sink more"] {
+            assert!(parse_grants(bad).is_err(), "{bad}");
+        }
     }
 }

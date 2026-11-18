@@ -253,13 +253,40 @@ pub const VOLUMES_RIGHTS: Rights = Rights::READ
 /// The node's volumes as the data a check is granted ([`VOLUMES_SLOT`]): [`volume_lines`] in a
 /// memory object of whole pages, the text then zeros, with [`VOLUMES_RIGHTS`].
 pub fn volumes_data(blocks: &[Block]) -> Result<Handle, moruna_svc::Error> {
-    let text = volume_lines(blocks);
+    volumes_data_text(&volume_lines(blocks))
+}
+
+/// `text` as the data a check or a job is granted under [`VOLUMES_SLOT`]: a memory object of
+/// whole pages, the text then zeros, with [`VOLUMES_RIGHTS`].
+pub fn volumes_data_text(text: &str) -> Result<Handle, moruna_svc::Error> {
     let pages = (text.len() as u64 + 1).div_ceil(4096) * 4096;
     let memory = Memory::create(pages)?;
     memory
         .map(0, pages, map::READ | map::WRITE)
         .and_then(|m| m.write(0, text.as_bytes()))?;
     memory.0.duplicate(VOLUMES_RIGHTS)
+}
+
+/// The slot of a job's `n`th volume, a connection to its driver (`moruna.driver.block`), which
+/// `node-admission` grants the engine at `launch`, in the order its needs name them.
+pub fn volume_slot(n: usize) -> String {
+    alloc::format!("volume.{n}")
+}
+
+/// The data `node-admission` grants a job's engine with its volumes, under [`VOLUMES_SLOT`]: a
+/// line each, `<n> <serial> <source|sink>`, `n` its slot's ([`volume_slot`]). A source's
+/// writer lease is `node-admission`'s for as long as the job is, so its driver refuses the
+/// engine's writes below the engine (system design 3C).
+pub fn volume_grants(volumes: &[(&Block, bool)]) -> String {
+    let mut text = String::new();
+    for (n, (block, write)) in volumes.iter().enumerate() {
+        text.push_str(&alloc::format!(
+            "{n} {} {}\n",
+            block.serial,
+            if *write { "sink" } else { "source" }
+        ));
+    }
+    text
 }
 
 /// Why a job's volume is not one the node grants it.
@@ -566,6 +593,20 @@ mod tests {
             .and_then(|m| m.read(0, &mut first))
             .expect("it reads");
         assert_eq!(first, [0]);
+    }
+
+    #[test]
+    fn a_jobs_volumes_are_granted_by_slot_and_listed_source_or_sink() {
+        let a = disk("vol-in", true, false);
+        let b = disk("vol-out", false, false);
+        assert_eq!(volume_slot(0), "volume.0");
+        assert_eq!(volume_slot(12), "volume.12");
+        assert_eq!(
+            volume_grants(&[(&a, false), (&b, true)]),
+            "0 vol-in source\n1 vol-out sink\n"
+        );
+        assert_eq!(volume_grants(&[]), "");
+        assert!(valid_grants(&[volume_slot(0), volume_slot(1)], 2));
     }
 
     #[test]

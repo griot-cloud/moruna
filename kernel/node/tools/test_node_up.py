@@ -156,6 +156,38 @@ class NodeUp(unittest.TestCase):
         self.assertEqual(again.returncode, 2)
         self.assertIn("already up", again.stderr)
 
+    def test_volumes_memory_and_the_boot_serial_are_the_checks_ones(self):
+        # Item 3.3: two volumes, one read only, 4 GiB, and a serial on the boot disk.
+        source, sink = self.root / "source.img", self.root / "sink.img"
+        source.write_bytes(b"s")
+        sink.write_bytes(b"k")
+        result = self.up("1", extra={"NODE_UP_MEMORY": "4G", "NODE_UP_BOOT_SERIAL": "moruna-boot",
+                                     "NODE_UP_VOLUMES": f"{source}:vol-src:ro {sink}:vol-out"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = self.arguments()
+        self.assertEqual(arguments[arguments.index("-m") + 1], "4G")
+        self.assertIn("virtio-blk-pci,drive=boot,disable-legacy=on,serial=moruna-boot", arguments)
+        self.assertIn(f"if=none,id=volume0,format=raw,readonly=on,file={source}", arguments)
+        self.assertIn("virtio-blk-pci,drive=volume0,serial=vol-src,disable-legacy=on", arguments)
+        self.assertIn(f"if=none,id=volume1,format=raw,file={sink}", arguments)
+        self.assertIn("virtio-blk-pci,drive=volume1,serial=vol-out,disable-legacy=on", arguments)
+        self.assertIn("2 volumes", result.stderr)
+
+    def test_volumes_and_memory_are_checked_before_qemu_starts(self):
+        disk = self.root / "d.img"
+        disk.write_bytes(b"d")
+        for extra, text in (({"NODE_UP_MEMORY": "8G"}, "1G to 6G"),
+                            ({"NODE_UP_MEMORY": "2048"}, "1G to 6G"),
+                            ({"NODE_UP_BOOT_SERIAL": "a b"}, "NODE_UP_BOOT_SERIAL"),
+                            ({"NODE_UP_VOLUMES": f"{self.root}/none.img:v"}, "FILE:SERIAL"),
+                            ({"NODE_UP_VOLUMES": f"{disk}:{'x' * 21}"}, "FILE:SERIAL"),
+                            ({"NODE_UP_VOLUMES": f"{disk}:v:rw"}, "FILE:SERIAL"),
+                            ({"NODE_UP_VOLUMES": f"{disk}:v:ro:x"}, "FILE:SERIAL")):
+            result = self.up("1", extra=extra)
+            self.assertEqual(result.returncode, 2, extra)
+            self.assertIn(text, result.stderr)
+        self.assertFalse((self.root / "bin/arguments").exists())
+
     def test_its_arguments_are_checked_before_qemu_starts(self):
         for arguments, text in (((), "usage"), (("0",), "positive number"), (("x",), "positive number"),
                                 (("1", "vhd"), "raw or qcow2"), (("1", "qcow2"), "no disk image")):
