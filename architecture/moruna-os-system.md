@@ -266,7 +266,8 @@ if it does, this section changes first.
   - The SynIC is enabled on CPU 0 only, and every channel targets it, by the VP index read from
     `HV_X64_MSR_VP_INDEX` on CPU 0, never assumed to be 0.
   - A GPADL's guest page numbers come from the DMA grant a driver already uses to pin memory.
-  - **DMA on Hyper-V:** `vmbus`, `storvsc` and `netvsc` each get a whole copy of `root.dma`.
+  - **DMA on Hyper-V:** a VMBus process that pins memory itself (`vmbus`, `storvsc`) gets a whole
+    copy of `root.dma`; one that doesn't (`netvsc`, whose buffers `vmbus` shares) gets none.
     With no IOMMU, a process that can write a VMBus ring can already name any guest page to the
     host, so a ring holder is trusted with all guest memory and the grant adds nothing. The
     narrowing is by process: only VMBus processes get it, and only on Hyper-V. With an IOMMU, page
