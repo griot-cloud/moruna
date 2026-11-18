@@ -1,0 +1,30 @@
+[package]
+name = "std-arrow"
+description = "Item 5.0's proof: an ordinary Rust program with std, using arrow-rs, built for Moruna"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Its own workspace: it builds for kernel/targets/x86_64-moruna.json against the vendored std
+# (kernel/tools/build-std.sh), not with the kernel workspace's targets and flags.
+[workspace]
+
+# arrow-rs at the root workspace's version (one arrow), only the crates the proof uses, and none
+# of their optional codecs or formats.
+[dependencies]
+arrow-arith = { version = "=59.3.0", default-features = false }
+arrow-array = { version = "=59.3.0", default-features = false }
+arrow-ipc = { version = "=59.3.0", default-features = false }
+arrow-ord = { version = "=59.3.0", default-features = false }
+arrow-schema = { version = "=59.3.0", default-features = false }
+arrow-select = { version = "=59.3.0", default-features = false }
+# getrandom, as arrow-rs's hasher reaches it, with its backend on Moruna: the core's random_read.
+getrandom = { version = "0.3.4", default-features = false }
+moruna-getrandom = { path = "../../getrandom", version = "=0.1.0" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

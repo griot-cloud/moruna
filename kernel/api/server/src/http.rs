@@ -5,6 +5,7 @@
 
 use crate::{
     api::{Admission, Answer, Api, Call, Outcome},
+    body::Body,
     jobs::Stream,
 };
 use alloc::{format, string::String, vec, vec::Vec};
@@ -218,13 +219,15 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-/// Writes `answer` to `out` as an HTTP/1.1 response, saying `Connection: close` when `close`.
-pub(crate) fn write(answer: &Answer, close: bool, out: &mut Vec<u8>) {
+/// Writes the head of `answer` to `out` as an HTTP/1.1 response's, saying `Connection: close`
+/// when `close`. Its body follows a piece at a time ([`Session`]).
+pub(crate) fn head(answer: &Answer, close: bool, out: &mut Vec<u8>) {
     let mut head = format!("HTTP/1.1 {} {}\r\n", answer.status, reason(answer.status));
-    if !answer.body.is_empty() {
+    let length = answer.body.len();
+    if length > 0 {
         head.push_str("Content-Type: application/json\r\n");
     }
-    head.push_str(&format!("Content-Length: {}\r\n", answer.body.len()));
+    head.push_str(&format!("Content-Length: {length}\r\n"));
     if answer.status == 401 {
         head.push_str("WWW-Authenticate: Bearer\r\n");
     }
@@ -236,7 +239,6 @@ pub(crate) fn write(answer: &Answer, close: bool, out: &mut Vec<u8>) {
     }
     head.push_str("\r\n");
     out.extend_from_slice(head.as_bytes());
-    out.extend_from_slice(&answer.body);
 }
 
 /// The bytes of request bodies the server may still hold, shared by every connection.
@@ -291,6 +293,10 @@ struct Waiting {
     close: bool,
 }
 
+/// The most bytes of an answer's body written into a session's output at a time: the next piece
+/// is written when TLS has taken it all.
+const BODY_PIECE: usize = 32 * 1024;
+
 /// The head of a stream of Server-Sent Events. The stream has no length: it ends when the
 /// connection closes.
 const STREAM_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
@@ -308,6 +314,10 @@ pub(crate) struct Session {
     waiting: Option<Waiting>,
     /// The stream of events being sent.
     stream: Option<Stream>,
+    /// The body of the answer being sent, written into `output` a piece at a time as TLS takes
+    /// it, and whether the connection closes after it.
+    body: Option<Body>,
+    close_after: bool,
     /// The bytes this session holds from the body budget.
     reserved: usize,
     /// Answers not yet taken by TLS; `taken` of them have been.
@@ -338,7 +348,7 @@ impl Session {
     /// How many more decrypted bytes the session wants now: the rest of a head, up to its limit,
     /// or the rest of an admitted body. None once it is closing.
     pub(crate) fn wanted(&self) -> usize {
-        if self.closing || self.waiting.is_some() || self.stream.is_some() {
+        if self.closing || self.waiting.is_some() || self.stream.is_some() || self.body.is_some() {
             return 0;
         }
         let target = self.pending.as_ref().map_or(HEADER_LIMIT, |p| p.length);
@@ -391,6 +401,7 @@ impl Session {
             api.abandon(waiting.ticket);
         }
         self.stream = None;
+        self.body = None;
     }
 
     /// What becomes of a call: its answer now, its answer later, or a stream of events.
@@ -399,7 +410,7 @@ impl Session {
             Outcome::Answer(answer) => {
                 self.release(budget);
                 let close = close || answer.close;
-                self.reply(&answer, close);
+                self.reply(answer, close);
             }
             // The body's share of the budget is held until the answer comes: the document
             // waits with it.
@@ -412,11 +423,18 @@ impl Session {
         }
     }
 
-    /// Queues `answer`, closing after it when `close`.
-    fn reply(&mut self, answer: &Answer, close: bool) {
-        write(answer, close, &mut self.output);
-        if close {
-            self.close();
+    /// Queues `answer`'s head and the first piece of its body; the rest of the body follows as
+    /// TLS takes what is queued. The session closes after it when `close`.
+    fn reply(&mut self, answer: Answer, close: bool) {
+        head(&answer, close, &mut self.output);
+        let mut body = answer.body;
+        if body.fill(&mut self.output, BODY_PIECE) {
+            if close {
+                self.close();
+            }
+        } else {
+            self.body = Some(body);
+            self.close_after = close;
         }
     }
 
@@ -432,6 +450,16 @@ impl Session {
     pub(crate) fn serve(&mut self, api: &mut Api, budget: &mut Budget, now: u64) -> bool {
         let mut answered = false;
         while !self.closing && self.output.is_empty() {
+            if let Some(body) = &mut self.body {
+                if body.fill(&mut self.output, BODY_PIECE) {
+                    self.body = None;
+                    if self.close_after {
+                        self.close();
+                    }
+                }
+                answered = true;
+                break;
+            }
             if let Some(waiting) = &self.waiting {
                 let Some(answer) = api.ready(waiting.ticket) else {
                     break;
@@ -485,7 +513,7 @@ impl Session {
                     } else {
                         Answer::error(ErrorCode::Invalid, message)
                     };
-                    self.reply(&answer, true);
+                    self.reply(answer, true);
                 }
                 Read::Head {
                     request,
@@ -494,7 +522,7 @@ impl Session {
                 } => {
                     self.input.drain(..length);
                     if self.refusing {
-                        self.reply(&busy(), true);
+                        self.reply(busy(), true);
                     } else {
                         match api.admit(&request, body, now) {
                             // Decided on the head: a body that follows is never read, so the
@@ -513,7 +541,7 @@ impl Session {
                                     close: request.close,
                                 });
                             }
-                            Admission::Body(_) => self.reply(&budget_spent(), true),
+                            Admission::Body(_) => self.reply(budget_spent(), true),
                         }
                     }
                 }

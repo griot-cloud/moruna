@@ -15,8 +15,12 @@
 - An item with booted checks is done in two phases: everything that needs no boot first, then a
   report; the PM continues you for the booted checks when what they need is merged.
 - Free disk as you go: build with `CARGO_INCREMENTAL=0`; delete every `target` folder you made
-  (in your worktree and inside `moruna-arm`) whenever you stop or hand back, and your folders in
-  `moruna-arm`'s `/tmp`. Never delete another agent's.
+  in your worktree whenever you stop or hand back, and your folders in `moruna-arm`'s `/tmp`. Never
+  delete another agent's.
+- **Inside `moruna-arm`, build into the shared target:** `export CARGO_TARGET_DIR=/root/target-shared`
+  and pass `build.sh` its fourth argument as `/root/target-shared/host`. It lives on the container's
+  own disk (faster than the mounted worktree) and keeps the dependencies built between lock turns,
+  so a turn's build takes minutes, not most of an hour. Never delete it; the PM cleans it.
 - Create nothing in any cloud, and spend nothing.
 - Where your work item and the system design leave a choice open, ask the PM. Do not choose.
 - Scratch files go only in your own folder, `<scratchpad>/<your agent id>/`. Delete only there,

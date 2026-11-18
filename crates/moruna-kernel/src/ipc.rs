@@ -256,6 +256,27 @@ fn encode(
         bodies.push(body.clone());
     }
 
+    // arrow-ipc gives every column and child a validity bitmap, all ones when nothing is null;
+    // a record leaves those out, as every writer of records does (`moruna_ipc_check::valid`),
+    // since each would take a page of its own. A compressed batch is left as it is.
+    let (schema_message, batch_message) = framing.split_at_mut(rb_start);
+    let left_out = moruna_ipc_check::valid::leave_out_all_valid(
+        schema_message,
+        batch_message,
+        &mut |offset, out| {
+            entries
+                .iter()
+                .zip(&bodies)
+                .find(|((at, len), _)| *at == offset && *len >= out.len() as u64)
+                .map(|(_, body)| out.copy_from_slice(&body.as_slice()[..out.len()]))
+                .is_some()
+        },
+    )
+    .map_err(bad)?;
+    for entry in left_out {
+        bodies[entry] = ArrowBuffer::from_vec(Vec::<u8>::new());
+    }
+
     // The page-aligned layout (e.7, KA11): the framing is page-rounded, every body buffer starts
     // at the next page boundary after the previous one, and the message's entries and body length
     // are rewritten to match, in place.

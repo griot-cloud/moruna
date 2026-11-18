@@ -237,6 +237,7 @@ fn start_manifest(machine: &Arc<Account>) -> Result<usize, String> {
                 // out, and the supervisor starts no service that needs it (ABI 2.7).
                 Source::RootHyperv if hyperv::available() => root(ResourceKind::Hyperv)?,
                 Source::RootHyperv => continue,
+                Source::RootClock => root(ResourceKind::Clock)?,
                 Source::RootEcam => Object::Resource(Arc::new(
                     Resource::new(
                         ResourceKind::DeviceMemory,

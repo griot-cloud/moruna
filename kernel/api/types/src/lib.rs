@@ -12,7 +12,8 @@
 //! A test fails when either file differs from what the types and the table generate.
 //!
 //! Paths start `/v1` and bodies are JSON. Step 2's operations take no request body; step 3's job
-//! operations (3B) take a [`Job`], a run's ID in the path, or both. The crate is `no_std` with
+//! operations (3B) take a [`Job`], a run's ID in the path, or both, and registering a function
+//! (3E) takes a [`FunctionRegistration`]. The crate is `no_std` with
 //! `alloc`, because the node's `api` process uses it; the `schema` feature, for the host only,
 //! adds the generator.
 #![no_std]
@@ -433,6 +434,114 @@ pub struct Heartbeat {
     pub staging_bytes: u64,
 }
 
+/// A function image to register, the body of `POST /v1/functions` (system design 3E). Unknown
+/// fields are refused.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct FunctionRegistration {
+    /// The name a job names the function by (a version 1 `kernels` entry
+    /// `{"kind": "function", "function": "<name>"}`, a version 2 task of kind `function`): 1 to 64
+    /// characters, a lowercase letter first, then lowercase letters, digits, `_`, `-` and `.`.
+    pub name: String,
+    /// Where the image file is fetched from at job start: an `https://` URL. An object store's
+    /// private object is given as a pre-signed or SAS URL.
+    pub address: String,
+    /// The SHA-256 of the image file, as 64 lowercase hexadecimal digits.
+    pub sha256: String,
+    /// An Ed25519 signature over the 32 bytes of that SHA-256, by one of node config's
+    /// `functions.keys`, in standard base64.
+    pub signature: String,
+}
+
+/// A registered function, as `GET /v1/functions` lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
+pub struct Function {
+    /// The name a job names it by.
+    pub name: String,
+    /// Where its image is fetched from.
+    pub address: String,
+    /// The SHA-256 of its image, as 64 lowercase hexadecimal digits.
+    pub sha256: String,
+    /// The first 16 hex characters of the SHA-256 of the public bytes of the key whose signature
+    /// verified, as the audit record names a token key.
+    pub key: String,
+    /// When it was registered, in Unix seconds.
+    pub registered: u64,
+}
+
+/// The answer to `GET /v1/functions`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
+pub struct Functions {
+    /// Every registered function, by name.
+    pub functions: Vec<Function>,
+}
+
+/// The most events one answer of the MCP tool `moruna_jobs_events` holds (item 3.7): MCP stays
+/// stateless, so the tool answers a page of what `GET /v1/jobs/{id}/events` streams, and an
+/// agent polls.
+pub const EVENTS_PAGE: usize = 1_000;
+
+/// The most bytes of events' JSON (their `data`) one page of `moruna_jobs_events` holds; a page
+/// always holds one event, however large.
+pub const EVENTS_PAGE_BYTES: usize = 1024 * 1024;
+
+/// What the MCP tool `moruna_jobs_events` does, for the MCP tool list.
+pub const EVENTS_TOOL_SUMMARY: &str = "A job's events, a page at a time: up to 1,000, and 1 MiB of them, after the record `from` (0, or absent, for the first), each event and log record with its number, then, once every record has been given and the job has ended, its report and its exit. `next` is the `from` of the next call: poll with it until the exit.";
+
+/// What `from` is, to the stream of a job's events and to its MCP tool: the number of the last
+/// record already read, as Server-Sent Events' `Last-Event-ID` is.
+pub const FROM: &str = "The number of the last record already read, as Server-Sent Events' Last-Event-ID: the records after it are sent. 0, or absent, for the first.";
+
+/// The answer of the MCP tool `moruna_jobs_events`: a page of a job's events, as a stream of
+/// `GET /v1/jobs/{id}/events` after the record `from` would send them at once, and where the
+/// next page begins.
+// `D` is an event's JSON: any JSON object, in whatever form the program holds JSON.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
+#[cfg_attr(any(test, feature = "schema"), schemars(rename = "JobEvents"))]
+pub struct JobEvents<D> {
+    /// At most 1,000, and at most 1 MiB of JSON unless the first alone is larger, in the order
+    /// the stream sends them: the job's event and log records after `from`, then, once they
+    /// have all been given, a note of the engine's skipped lines if it had any, and, once the
+    /// job has ended, its report and its exit, which come together.
+    pub records: Vec<JobEvent<D>>,
+    /// The `from` of the next call: the number of the last record in this page, or this call's
+    /// `from` when the page holds none.
+    pub next: u64,
+}
+
+/// One event of a job's stream, as `GET /v1/jobs/{id}/events` sends it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
+#[cfg_attr(any(test, feature = "schema"), schemars(rename = "JobEvent"))]
+pub struct JobEvent<D> {
+    /// The record's number in the job's stream, from 1, for an `event`; absent for the others.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    /// What it is.
+    pub event: JobEventName,
+    /// Its JSON: the record's line as `moruna_event` renders it, or the engine's message.
+    pub data: D,
+}
+
+/// The name of an event in a job's stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum JobEventName {
+    /// An event or log record of the engine's.
+    Event,
+    /// How many of the engine's lines were too long to read, and were skipped.
+    Note,
+    /// The engine's `report` message: the run's report and its plan.
+    Report,
+    /// The engine's `exit` message: its exit code and diagnostic. Nothing follows it.
+    Exit,
+}
+
 /// An HTTP method the API uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
@@ -459,6 +568,8 @@ pub enum Request {
     None,
     /// A [`Job`].
     Job,
+    /// A [`FunctionRegistration`].
+    Function,
 }
 
 /// The type an operation answers with on success.
@@ -483,6 +594,10 @@ pub enum Response {
     Events,
     /// The engine's `RunReport`: a JSON object, as the engine wrote it.
     Report,
+    /// [`Function`].
+    Function,
+    /// [`Functions`].
+    Functions,
 }
 
 /// The name of a run's ID in a path: `{id}`.
@@ -512,15 +627,18 @@ pub struct Operation {
 }
 
 impl Operation {
-    /// The name of the operation's MCP tool.
+    /// The name of the operation's MCP tool: `moruna_<id>`.
     pub fn tool_name(&self) -> String {
         format!("moruna_{}", self.id)
     }
 
-    /// Whether the operation has an MCP tool: every operation but a stream of events, which a
-    /// tool's one answer cannot carry.
-    pub const fn has_tool(&self) -> bool {
-        !matches!(self.response, Response::Events)
+    /// What the operation's MCP tool does: the operation's summary, and
+    /// [`EVENTS_TOOL_SUMMARY`] for the stream of events, whose tool answers a page of it.
+    pub const fn tool_summary(&self) -> &'static str {
+        match self.response {
+            Response::Events => EVENTS_TOOL_SUMMARY,
+            _ => self.summary,
+        }
     }
 
     /// Whether the operation's path carries a run's ID.
@@ -652,7 +770,7 @@ pub const OPERATIONS: &[Operation] = &[
         query: &["from"],
         response: Response::Events,
         status: 200,
-        summary: "A job's events as Server-Sent Events: each event and log record as its JSON line, heartbeats, then the report and the exit. `from` replays from that record of the node's buffer.",
+        summary: "A job's events as Server-Sent Events: each event and log record as its JSON line, heartbeats, then the report and the exit. `from` is the last record already read, as Server-Sent Events' Last-Event-ID: the node's buffer is replayed after it.",
     },
     Operation {
         id: "jobs_report",
@@ -664,6 +782,28 @@ pub const OPERATIONS: &[Operation] = &[
         response: Response::Report,
         status: 200,
         summary: "A job's report, the engine's RunReport, once the job has ended.",
+    },
+    Operation {
+        id: "functions_register",
+        method: Method::Post,
+        path: "/v1/functions",
+        scope: Some(Scope::Admin),
+        request: Request::Function,
+        query: &[],
+        response: Response::Function,
+        status: 201,
+        summary: "Register a function image by name: its https:// address, its SHA-256, and an Ed25519 signature over that SHA-256 by one of node config's functions.keys. Nothing is fetched until a job names it; registering a name again replaces it.",
+    },
+    Operation {
+        id: "functions_list",
+        method: Method::Get,
+        path: "/v1/functions",
+        scope: Some(Scope::Observe),
+        request: Request::None,
+        query: &[],
+        response: Response::Functions,
+        status: 200,
+        summary: "Every registered function: its name, address, SHA-256, the key that signed it and when it was registered.",
     },
 ];
 

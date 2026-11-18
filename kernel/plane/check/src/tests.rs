@@ -1516,3 +1516,129 @@ fn record_reframe_refuses_what_it_cannot_lay_out() {
     assert_eq!(laid.moves, vec![(0, PAGE, 32)]);
     assert_eq!(laid.record_len, PAGE + 32);
 }
+
+// ---- valid ----
+
+/// A body of `bytes`, read as `leave_out_all_valid` reads one.
+fn reader(body: &[u8]) -> impl FnMut(u64, &mut [u8]) -> bool + '_ {
+    move |offset, out| {
+        let at = offset as usize;
+        match body.get(at..at + out.len()) {
+            Some(b) => {
+                out.copy_from_slice(b);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+#[test]
+fn valid_all_set_reads_only_the_bits_it_covers() {
+    use crate::valid::all_set;
+    let b = [0xffu8, 0x07, 0x00];
+    assert!(all_set(&b, 0));
+    assert!(all_set(&b, 8));
+    assert!(
+        all_set(&b, 11),
+        "the eleventh bit is the third of the second byte"
+    );
+    assert!(!all_set(&b, 12));
+    assert!(!all_set(&b[..1], 9), "fewer bytes than the bits");
+}
+
+#[test]
+fn valid_leaves_out_a_bitmap_of_all_ones_and_keeps_the_rest() {
+    use crate::valid::leave_out_all_valid;
+    // Ten rows of an Int64 column: its bitmap at 0, its values at 8.
+    let schema = schema_message(vec![int_field("x", 64)]);
+    let rb = record_batch(10, vec![(10, 0)], vec![(0, 2), (8, 80)]);
+    let mut body = vec![0u8; 88];
+    body[..2].copy_from_slice(&[0xff, 0x03]);
+    let mut batch = batch_message(rb.clone(), 88);
+    let out = leave_out_all_valid(&schema, &mut batch, &mut reader(&body)).unwrap();
+    assert_eq!(out, vec![0]);
+    assert_eq!(
+        frame::buffer_entries(&batch).unwrap(),
+        vec![(0, 0), (8, 80)]
+    );
+    // The record laid out from it has the values alone.
+    let laid = reframe(&schema, &batch).unwrap();
+    assert_eq!(laid.moves, vec![(8, PAGE, 80)]);
+    // A clear bit keeps it, as does a body that cannot be read.
+    body[1] = 0x01;
+    let mut batch = batch_message(rb.clone(), 88);
+    assert!(
+        leave_out_all_valid(&schema, &mut batch, &mut reader(&body))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        frame::buffer_entries(&batch).unwrap(),
+        vec![(0, 2), (8, 80)]
+    );
+    let mut batch = batch_message(rb, 88);
+    assert!(
+        leave_out_all_valid(&schema, &mut batch, &mut |_, _| false)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn valid_finds_bitmaps_of_children_in_the_walks_order() {
+    use crate::valid::leave_out_all_valid;
+    // A struct of two rows with no nulls, over an Int32 child with one: the struct's bitmap
+    // goes, the child's stays.
+    let schema = schema_message(vec![field(
+        "s",
+        types::STRUCT,
+        Some(Tb::default()),
+        vec![int_field("c", 32)],
+    )]);
+    let rb = record_batch(2, vec![(2, 0), (2, 1)], vec![(0, 1), (8, 1), (16, 8)]);
+    let mut body = vec![0u8; 24];
+    body[0] = 0x03;
+    body[8] = 0x01;
+    let mut batch = batch_message(rb, 24);
+    let out = leave_out_all_valid(&schema, &mut batch, &mut reader(&body)).unwrap();
+    assert_eq!(out, vec![0]);
+    assert_eq!(
+        frame::buffer_entries(&batch).unwrap(),
+        vec![(0, 0), (8, 1), (16, 8)]
+    );
+}
+
+#[test]
+fn valid_leaves_a_compressed_batch_and_refuses_what_the_walk_refuses() {
+    use crate::valid::leave_out_all_valid;
+    let schema = schema_message(vec![int_field("x", 64)]);
+    let body = [0xffu8; 40];
+    let rb = record_batch(4, vec![(4, 0)], vec![(0, 1), (8, 32)])
+        .with(3, V::T(Tb::default().with(compression::CODEC, V::I8(1))));
+    let mut batch = batch_message(rb, 40);
+    assert!(
+        leave_out_all_valid(&schema, &mut batch, &mut reader(&body))
+            .unwrap()
+            .is_empty()
+    );
+    // A buffer past the body, a schema where the batch should be, and a batch where the
+    // schema should be.
+    let rb = record_batch(4, vec![(4, 0)], vec![(0, 1), (8, 64)]);
+    let mut batch = batch_message(rb.clone(), 40);
+    refused(
+        leave_out_all_valid(&schema, &mut batch, &mut reader(&body)),
+        "outside the body",
+    );
+    let mut wrong = schema.clone();
+    refused(
+        leave_out_all_valid(&schema, &mut wrong, &mut reader(&body)),
+        "another type",
+    );
+    let mut batch = batch_message(rb, 72);
+    let copy = batch.clone();
+    refused(
+        leave_out_all_valid(&copy, &mut batch, &mut reader(&body)),
+        "another type",
+    );
+}

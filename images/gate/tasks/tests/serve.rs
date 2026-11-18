@@ -11,11 +11,11 @@ use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, Float64Type};
 use arrow::ipc::reader::{FileReader, StreamReader};
 use moruna_function::code;
-use moruna_function::host::{Outcome, Plane, record};
+use moruna_function::host::{Input, Outcome, Plane, record};
 use moruna_gate_functions::{batch, canon};
 use moruna_gate_record::{Error, Job, compute, decode, encode, parts};
 use moruna_ipc_check::frame::END_OF_STREAM;
-use moruna_ipc_check::record::{Need, check_record, framing_need};
+use moruna_ipc_check::record::{Need, check_record, framing_need, stream_parts};
 use serde_json::Value;
 
 fn fixtures() -> PathBuf {
@@ -336,5 +336,96 @@ fn records_take_the_bytes_the_record_path_took() {
         assert_eq!(sdk_one, before_one, "{name}: one row");
         assert_eq!(sdk_all, before_all, "{name}: 64Ki rows");
         eprintln!("{name}: one row {sdk_one} bytes, 64Ki rows of input {sdk_all} bytes, as before");
+    }
+}
+
+/// The record the engine lays out for `input` (`moruna_kernel::ipc::encode_framing`, as it
+/// posts a batch to a task), whole: its framing, then each body buffer in its place.
+fn engine_record(input: &RecordBatch) -> Vec<u8> {
+    let alloc = moruna_testkit::FakeAllocator::new();
+    let (framing, bodies) = moruna_kernel::ipc::encode_framing(input, 4096, 0, &alloc).unwrap();
+    let Ok(Need::Framing(n)) = framing_need(&framing) else {
+        panic!("no framing")
+    };
+    let (_, batch_at) = stream_parts(&framing[..n]).unwrap();
+    let body = moruna_ipc_check::frame::body_length(&framing[batch_at]).unwrap() as usize;
+    let mut bytes = framing[..n].to_vec();
+    bytes.resize(n + body, 0);
+    for (at, buffer) in &bodies {
+        bytes[*at..at + buffer.len()].copy_from_slice(buffer.as_slice());
+    }
+    bytes
+}
+
+/// The record arrow-ipc's own stream of `input` takes laid out as it is, every column with its
+/// bitmap: what the engine posted before the bitmaps of all ones were left out.
+fn as_written(input: &RecordBatch) -> u64 {
+    use moruna_ipc_check::frame::message_len;
+    let mut writer =
+        arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &input.schema()).unwrap();
+    writer.write(input).unwrap();
+    let bytes = writer.into_inner().unwrap();
+    let schema = message_len(&bytes).unwrap() + 8;
+    let rb = message_len(&bytes[schema..]).unwrap() + 8;
+    moruna_ipc_check::record::reframe(&bytes[..schema], &bytes[schema..schema + rb])
+        .unwrap()
+        .record_len
+}
+
+/// The engine's input records leave the bitmaps of all ones out through the same function as
+/// the SDK (`moruna_ipc_check::valid`): each job's input record, as the fixture and at 64Ki
+/// rows, is the SDK's byte for byte and smaller than it was, and a task answers the engine's
+/// record with the rows it gave before 5.1 and the oracle's hash.
+#[test]
+fn the_engines_input_records_are_the_sdks_and_answer_the_same() {
+    let jobs = [
+        ("enrich", "inputs/nyc/main.arrow"),
+        ("audit", "inputs/nyc/main.arrow"),
+        ("occupancy", "inputs/nyc/main.arrow"),
+        ("score", "inputs/nyc/main.arrow"),
+        ("fw_minhash", "inputs/fineweb/main.arrow"),
+        ("ov_shape", "inputs/overture/main.arrow"),
+        ("ov_attrs", "inputs/overture/main.arrow"),
+    ];
+    let m = manifest();
+    for (name, path) in jobs {
+        let fixture = read_ipc(path);
+        for (label, input) in [
+            ("fixture", fixture.clone()),
+            ("64Ki", repeated(&fixture, 65_536)),
+        ] {
+            let engine = engine_record(&input);
+            assert_eq!(
+                engine,
+                record(&input).unwrap(),
+                "{name} {label}: the SDK's record"
+            );
+            let was = as_written(&input);
+            assert!(
+                (engine.len() as u64) < was,
+                "{name} {label}: no bitmap left out"
+            );
+            eprintln!(
+                "{name} input, {label} ({} rows): {was} bytes before, {} after",
+                input.num_rows(),
+                engine.len()
+            );
+        }
+        let job = batch::by_name(name).unwrap();
+        let outcome = Plane::new()
+            .named(format!("gate-{name}"))
+            .run([Input::Record(engine_record(&fixture))], move || {
+                moruna_gate_tasks::serve(job)
+            })
+            .unwrap();
+        assert_eq!(outcome.said, Some(code::DONE), "{name}: {:?}", outcome.log);
+        let got = join(&outcome.answers[0].batches);
+        same(&got, &before(name, &fixture).unwrap(), name);
+        let ours = canon::canonical(name, &[got], false).unwrap();
+        assert_eq!(
+            ours.hash_exact,
+            m["jobs"][name]["main"]["hash_exact"].as_str().unwrap(),
+            "{name}"
+        );
     }
 }

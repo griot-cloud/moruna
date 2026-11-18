@@ -14,6 +14,9 @@ process node-supervisor
   handle root.ecam root.ecam
   handle root.msi root.msi
   handle root.dma root.dma
+  # ABI 2.8 (item 5.0): the right to set the wall clock, which node.conf grants `platform`
+  # alone (`grant platform clock root.clock`, with item 1.4's platform service).
+  handle root.clock root.clock
   handle program:devices image.devices
   handle program:netstack image.netstack
   handle program:api image.api
