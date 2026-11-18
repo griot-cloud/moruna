@@ -216,6 +216,10 @@ impl Handler for Session {
                 Some(socket) => authorized!(st.tls_alpn(id, socket)),
                 None => bad,
             },
+            22 => match args::<String>(d) {
+                Some(interface) => authorized!(st.address(cx, id, interface)),
+                None => bad,
+            },
             _ => Outcome::Status(Status::UnknownMethod),
         }
     }

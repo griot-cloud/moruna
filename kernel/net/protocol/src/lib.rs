@@ -1,7 +1,8 @@
-//! `moruna.net` 3.2 (SDD 31, d.1): the network server's sockets, for the processes of a
+//! `moruna.net` 3.3 (SDD 31, d.1): the network server's sockets, for the processes of a
 //! node that speak to the network. A client connects, listens and accepts, sends and
 //! receives TCP bytes with backpressure and closes each half of a connection; binds
-//! UDP sockets and sends and receives datagrams; pings; and resolves names.
+//! UDP sockets and sends and receives datagrams; pings; resolves names; and (since 3.3)
+//! waits for an interface's IPv4 address.
 //!
 //! Every connection holds a [`Policy`], fixed when the connection's listener was
 //! granted: the boot's configuration gives each listener slot of the server one, and a
@@ -16,9 +17,12 @@
 //! are linked to.
 //!
 //! Sockets are numbered per connection and close with it. Requests that wait (open,
-//! accept, a receive with nothing queued, a send that finds no room, a resolve, a ping)
-//! are answered when what they wait for happens, so a client may have one of each
-//! outstanding per socket; a second of the same kind on one socket is `InUse`.
+//! accept, a receive with nothing queued, a send that finds no room, a resolve, a ping,
+//! an interface's address) are answered when what they wait for happens, so a client may
+//! have one of each outstanding per socket, and one `address` per connection; a second
+//! of the same kind is `InUse`. `address` has no deadline at the server: the client's own
+//! bounds it. An answer that comes after the client stopped waiting is only filed, and
+//! until it comes another `address` on that connection is `InUse`.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -106,7 +110,8 @@ mod transport {
             // 3.1 (work item 1.3b): a policy bounds its sockets' buffers, the sockets
             // one peer holds, and how long a closing socket lingers.
             // 3.2 (item 3.4): the name rule `*`, every name at its ports.
-            minor = 2;
+            // 3.3 (item 1.11f): `address`, a request that waits for an interface's address.
+            minor = 3;
             requests {
                 /// The interfaces, their addresses and links, the resolver's servers, and
                 /// this connection's policy.
@@ -163,6 +168,13 @@ mod transport {
                 20 => fn release_server_identity(identity:u32) -> ();
                 /// Public negotiated ALPN after authenticated handshake; no peer identity claim.
                 21 => fn tls_alpn(socket:u32) -> Option<Vec<u8>>;
+                /// The IPv4 address of the interface named `interface`: answered at once if
+                /// it holds one, and otherwise as soon as it takes one (its first DHCP
+                /// lease, or the next after a lost one), as `accept` waits for a
+                /// connection. One waits per connection. An interface that holds none and
+                /// is not set by DHCP never takes one: `NotFound`, as for no interface of
+                /// that name.
+                22 since 3 => fn address(interface: String) -> Cidr;
             }
             events {}
             errors {
@@ -184,7 +196,8 @@ mod transport {
                 7 => NoSocket;
                 /// The socket is not of the kind the request needs.
                 8 => WrongKind;
-                /// A request of the same kind already waits on the socket.
+                /// A request of the same kind already waits on the socket, or, for
+                /// `address`, on the connection.
                 9 => InUse;
                 /// The connection's grant holds as many sockets as its policy allows (every
                 /// connection through the grant's listener counted together, closing
@@ -193,7 +206,8 @@ mod transport {
                 10 => TooMany;
                 /// The socket is not connected, or its sending half has been shut down.
                 11 => NotConnected;
-                /// The name has no address.
+                /// The name has no address; or no interface has that name, or the one
+                /// that has will never hold an IPv4 address (`address`).
                 12 => NotFound;
                 /// The resolver has no server, or the name is not one a resolver takes.
                 13 => NoResolver;
@@ -392,6 +406,11 @@ pub mod net {
             identity: u32,
         ) -> Result<(), moruna_svc::CallError<Error>> {
             self.transport.release_server_identity(identity)
+        }
+        /// Canonical `address` request from the single schema (3.3): waits, within the
+        /// client's timeout, for the interface's IPv4 address.
+        pub fn address(&mut self, interface: String) -> Result<Cidr, moruna_svc::CallError<Error>> {
+            self.transport.address(interface)
         }
         /// Canonical `tls_alpn` request from the single schema.
         pub fn tls_alpn(

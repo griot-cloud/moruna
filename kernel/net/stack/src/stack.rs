@@ -188,6 +188,11 @@ impl Iface {
         self.iface.has_ip_addr(ip(a))
     }
 
+    /// The interface's IPv4 address, if it holds one.
+    fn ipv4(&self) -> Option<Cidr> {
+        self.addrs().into_iter().find(|c| c.addr.is_v4())
+    }
+
     /// What `info` says of the interface.
     pub fn info(&self) -> IfaceInfo {
         IfaceInfo {
@@ -318,6 +323,9 @@ struct Conn {
     sockets: BTreeMap<u32, Sock>,
     /// Connects by name still resolving, which count against the grant's bound.
     resolving: u32,
+    /// An `address` waiting for its interface (by index) to hold an IPv4 address: one a
+    /// connection (`moruna.net` 3.3).
+    address: Option<(usize, Pending)>,
     /// A handle to the client's channel that can only be waited on: the client has
     /// gone when it says `PEER_CLOSED`, which the stack can see before the dispatcher's
     /// next turn does.
@@ -789,6 +797,7 @@ impl Stack {
             }
         }
         self.say_bounds();
+        self.answer_addresses();
         #[cfg(debug_assertions)]
         self.recount();
     }
@@ -1014,6 +1023,7 @@ impl Stack {
             next: 1,
             sockets: BTreeMap::new(),
             resolving: 0,
+            address: None,
             watch: watch(),
         });
     }
@@ -1631,6 +1641,42 @@ impl Stack {
         match fits(self) {
             Err(net::Error::TooMany) if self.reap(conn) => fits(self),
             other => other,
+        }
+    }
+
+    /// The IPv4 address of interface `name` (`moruna.net` 3.3): answered at once if it
+    /// holds one; otherwise, if DHCP sets it, once it takes one ([`Stack::poll`] answers
+    /// it), one waiting a connection.
+    pub fn address(&mut self, cx: &mut Context<'_>, conn: u64, name: String) -> Outcome {
+        let Some(i) = self.ifaces.iter().position(|x| x.name == name) else {
+            return fail(net::Error::NotFound);
+        };
+        if let Some(cidr) = self.ifaces[i].ipv4() {
+            return Outcome::reply(cidr);
+        }
+        // An interface that DHCP does not set holds only what it was configured with.
+        if self.ifaces[i].dhcp.is_none() {
+            return fail(net::Error::NotFound);
+        }
+        let Some(c) = self.conns.get_mut(&conn) else {
+            return fail(net::Error::NotFound);
+        };
+        if c.address.is_some() {
+            return fail(net::Error::InUse);
+        }
+        c.address = Some((i, cx.defer()));
+        Outcome::Deferred
+    }
+
+    /// Answers every `address` whose interface now holds an IPv4 address.
+    fn answer_addresses(&mut self) {
+        for c in self.conns.values_mut() {
+            let Some(cidr) = c.address.as_ref().and_then(|(i, _)| self.ifaces[*i].ipv4()) else {
+                continue;
+            };
+            if let Some((_, pending)) = c.address.take() {
+                self.ready.push((pending, Outcome::reply(cidr)));
+            }
         }
     }
 

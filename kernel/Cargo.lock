@@ -1043,6 +1043,7 @@ dependencies = [
 name = "moruna-node-platform"
 version = "0.1.0"
 dependencies = [
+ "heapless",
  "imagefs-protocol",
  "moruna-netstack",
  "moruna-node",
@@ -1051,6 +1052,7 @@ dependencies = [
  "moruna-svc",
  "netstack-protocol",
  "serde_json",
+ "smoltcp",
 ]
 
 [[package]]

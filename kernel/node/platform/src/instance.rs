@@ -5,6 +5,10 @@
 //! - **A cloud is named** only by a `200` whose body parses as that cloud's document. OpenStack's
 //!   user-data is a second request, once its document has named it.
 //! - **Any other answer** moves to the next cloud at once, and round again after the last.
+//! - **No address yet:** a request that cannot begin because the node has no address (the
+//!   network server has no route) waits for `wan`'s address, as the network server gives it
+//!   ([`Network::address`]), and begins again as soon as the address comes (work item 1.11f).
+//!   Once the node has had an address, a request with no route is asked again a second later.
 //! - **No answer** (a connection refused, timed out, or broken before a whole answer) and a
 //!   **`410`** are asked again, a second after that request began.
 //! - **At most 5 requests begin in any second.**
@@ -25,7 +29,7 @@ use moruna_node_config::{Cloud, Refusal, base64, instance_valid};
 use crate::{
     boot::{Fatal, Stage},
     http::{self, Header, HttpError, Request, Response},
-    machine::{Clock, Network},
+    machine::{Clock, Network, StreamError},
 };
 
 /// Where a cloud serves instance data.
@@ -102,6 +106,9 @@ enum Next {
     Now(Asking),
     /// Ask this a second after the last request began.
     Later(Asking),
+    /// The request could not begin, for no route: ask this as soon as the node has an
+    /// address, if it had none yet.
+    Routed(Asking),
 }
 
 impl Asking {
@@ -127,6 +134,9 @@ impl Asking {
     fn judge(self, answer: Result<Response, HttpError>, arrived: u64) -> (Next, String) {
         let response = match answer {
             Ok(response) => response,
+            Err(error @ HttpError::Stream(StreamError::Unreachable)) => {
+                return (Next::Routed(self), error.to_string());
+            }
             Err(error @ (HttpError::Stream(_) | HttpError::Closed)) => {
                 return (Next::Later(self), error.to_string());
             }
@@ -272,6 +282,9 @@ pub fn find<N: Network, C: Clock>(
     let mut pace = Pace::default();
     let mut asking = Asking::Azure;
     let mut earliest = started;
+    // Whether the node has had an address: before it has, a request with no route waits for
+    // one rather than for the next second.
+    let mut addressed = false;
     let mut last = String::from("no request was made");
     loop {
         let Some(begun) = pace.begin(clock, earliest, deadline) else {
@@ -289,6 +302,26 @@ pub fn find<N: Network, C: Clock>(
             Next::Now(asking) => asking,
             Next::Later(asking) => {
                 earliest = begun.saturating_add(RETRY_NS);
+                asking
+            }
+            Next::Routed(asking) if addressed => {
+                earliest = begun.saturating_add(RETRY_NS);
+                asking
+            }
+            Next::Routed(asking) => {
+                match network.address(deadline) {
+                    // The address has come: the request begins again at once.
+                    Ok(_) => {
+                        addressed = true;
+                        earliest = clock.now();
+                    }
+                    // Past the limit, the next turn says so; anything else is asked again a
+                    // second later.
+                    Err(error) => {
+                        earliest = begun.saturating_add(RETRY_NS);
+                        last = format!("{last}, and the node's address: {error}");
+                    }
+                }
                 asking
             }
         };

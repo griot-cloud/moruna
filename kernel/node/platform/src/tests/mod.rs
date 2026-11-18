@@ -19,6 +19,7 @@ mod clock;
 mod date;
 mod http;
 mod instance;
+mod lease;
 mod svc;
 mod wireserver;
 
@@ -305,6 +306,11 @@ pub(crate) struct FakeNetwork {
     pub(crate) requests: Vec<(u64, Sent)>,
     /// The node's address on `wan`.
     pub(crate) address: Result<Ipv4Addr, StreamError>,
+    /// When the node takes that address: asked before then, the network server answers
+    /// then, or at the caller's deadline if that comes first.
+    pub(crate) address_at: u64,
+    /// When the address was asked for, and the caller's deadline.
+    pub(crate) address_asked: Vec<(u64, u64)>,
     /// The most bytes one write takes or one read gives.
     pub(crate) chunk: usize,
 }
@@ -322,6 +328,8 @@ impl FakeNetwork {
             attempts: Vec::new(),
             requests: Vec::new(),
             address: Ok(Ipv4Addr::new(10, 0, 2, 15)),
+            address_at: 0,
+            address_asked: Vec::new(),
             chunk: 1500,
         }
     }
@@ -371,7 +379,13 @@ impl Network for FakeNetwork {
         })
     }
 
-    fn address(&mut self, _: u64) -> Result<Ipv4Addr, StreamError> {
+    fn address(&mut self, deadline: u64) -> Result<Ipv4Addr, StreamError> {
+        self.address_asked.push((self.clock.now(), deadline));
+        if self.address_at >= deadline {
+            self.clock.sleep_until(deadline);
+            return Err(StreamError::Deadline);
+        }
+        self.clock.sleep_until(self.address_at);
         self.address.clone()
     }
 }

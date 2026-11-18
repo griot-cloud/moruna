@@ -24,7 +24,8 @@ pub trait Network {
         deadline: u64,
     ) -> Result<Self::Stream<'_>, StreamError>;
 
-    /// The node's own address on the interface `wan`.
+    /// The node's own address on the interface `wan`: at once when it holds one, and
+    /// otherwise as soon as it takes one, waiting for it until `deadline` (work item 1.11f).
     fn address(&mut self, deadline: u64) -> Result<Ipv4Addr, StreamError>;
 }
 
