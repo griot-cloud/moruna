@@ -36,13 +36,14 @@ use signer::Signer;
 
 use super::*;
 
-/// The cloud node's network configuration (work item 1.3: its interface, and its one
-/// grant exactly as written), and a second card on the same wire with the gateway's
-/// address, whose grant reaches the node's network as a host outside it would.
+/// The cloud node's network configuration (work item 1.3: its interface; and its one
+/// grant exactly as written, with work item 1.3b's bounds), and a second card on the same
+/// wire with the gateway's address, whose grant reaches the node's network as a host
+/// outside it would.
 const NODE: &str = "moruna-netstack 1
 interface wan card=net0 dhcp
 interface host card=net1 ipv4=10.0.2.2/24
-grant listen-api rights=listen local=0.0.0.0/0@443 sockets=64
+grant listen-api rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000
 grant listen-host rights=connect remote=10.0.2.0/24 local=10.0.2.2/32 sockets=8
 ";
 

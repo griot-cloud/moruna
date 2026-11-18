@@ -65,9 +65,6 @@ const LEGACY_CONNECTION: u32 = 1;
 /// for every later message (`server:2539-2544`).
 const CONTACT_CONNECTION: u32 = 4;
 
-/// Every channel, and the connection's own messages, target CPU 0 (system design 1F).
-const TARGET_VP: u32 = 0;
-
 /// The client opens a channel once at a time, so its open requests need no telling
 /// apart (`client:1144`).
 const OPEN_ID: u32 = 0;
@@ -337,17 +334,16 @@ pub struct Client {
     /// Messages not yet posted, each with the connection ID it goes to (`client:1638-1644`).
     unsent: VecDeque<(u32, OutgoingMessage)>,
     events: VecDeque<Event>,
-}
-
-impl Default for Client {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// The VP the connection's messages and every channel target: CPU 0's, whose SynIC
+    /// alone is enabled (system design 1F), by the index Hyper-V gives it.
+    target_vp: u32,
 }
 
 impl Client {
-    /// A disconnected client.
-    pub fn new() -> Client {
+    /// A disconnected client whose contact and channels target the virtual processor
+    /// `target_vp`: CPU 0's VP index, as Hyper-V numbers it (`HV_X64_MSR_VP_INDEX`; the
+    /// core's `hyperv_interrupt` gives it). It is not always 0.
+    pub fn new(target_vp: u32) -> Client {
         Client {
             state: State::Disconnected,
             connection: LEGACY_CONNECTION,
@@ -356,7 +352,13 @@ impl Client {
             next_gpadl: 1,
             unsent: VecDeque::new(),
             events: VecDeque::new(),
+            target_vp,
         }
+    }
+
+    /// The VP the client's messages and channels target.
+    pub fn target_vp(&self) -> u32 {
+        self.target_vp
     }
 
     /// Where the connection stands.
@@ -439,7 +441,7 @@ impl Client {
         };
         let message = protocol::InitiateContact {
             version_requested: version as u32,
-            target_message_vp: TARGET_VP,
+            target_message_vp: self.target_vp,
             interrupt_page_or_target_info: target,
             parent_to_child_monitor_page_gpa: 0,
             child_to_parent_monitor_page_gpa: 0,
@@ -483,8 +485,9 @@ impl Client {
         Ok(())
     }
 
-    /// Opens `channel` on the rings in `ring`, targeting CPU 0: first the ring's GPADL,
-    /// then the open request (`driver:95-129`). The answer comes through
+    /// Opens `channel` on the rings in `ring`, targeting CPU 0's VP (the client's
+    /// [`target_vp`](Client::target_vp)): first the ring's GPADL, then the open request
+    /// (`driver:95-129`). The answer comes through
     /// [`poll`](Client::poll): [`Event::Opened`] or [`Event::OpenFailed`].
     pub fn open(
         &mut self,
@@ -929,15 +932,15 @@ impl Client {
         entry.gpadls.insert(gpadl, GpadlState::Created);
         match ring {
             // The host has the rings: ask it to open the channel on them, targeting
-            // CPU 0 (`client:1142-1151`, `driver:113-129`). With no feature negotiated the
-            // request is `OpenChannel` (`client:1188-1197`).
+            // CPU 0's VP (`client:1142-1151`, `driver:113-129`). With no feature
+            // negotiated the request is `OpenChannel` (`client:1188-1197`).
             Some(incoming_at) if !rescinded => {
                 entry.ring = Ring::Opening { gpadl };
                 self.send(OutgoingMessage::new(&protocol::OpenChannel {
                     channel_id: id,
                     open_id: OPEN_ID,
                     ring_buffer_gpadl_id: gpadl,
-                    target_vp: TARGET_VP,
+                    target_vp: self.target_vp,
                     downstream_ring_buffer_page_offset: incoming_at,
                     user_data: protocol::UserDefinedData::default(),
                 }));

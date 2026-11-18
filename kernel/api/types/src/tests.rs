@@ -321,11 +321,48 @@ fn the_operations_table_is_the_design_table() {
     );
     assert!(OPERATIONS.iter().all(|op| !op.summary.is_empty()));
     for op in OPERATIONS {
+        let events = op.id == "jobs_events";
+        // Every operation has a tool, the stream of events one that answers a page (item 3.7).
         assert_eq!(op.tool_name(), format!("moruna_{}", op.id));
-        assert_eq!(op.has_tool(), op.id != "jobs_events", "{}", op.id);
-        assert_eq!(op.query.is_empty(), op.id != "jobs_events", "{}", op.id);
+        if events {
+            assert_eq!(op.tool_summary(), EVENTS_TOOL_SUMMARY);
+        } else {
+            assert_eq!(op.tool_summary(), op.summary);
+        }
+        assert_eq!(op.query.is_empty(), !events, "{}", op.id);
     }
     assert_eq!(OPERATIONS[8].query, ["from"]);
+}
+
+#[test]
+fn a_page_of_events_round_trips() {
+    let page: JobEvents<Value> = round_trip(
+        r#"{"records":[
+            {"id":4,"event":"event","data":{"type":"event","kind":"log","text":"one"}},
+            {"event":"note","data":{"type":"note","skipped_lines":1}},
+            {"event":"report","data":{"type":"report","report":{"rows_out":3},"plan":null}},
+            {"event":"exit","data":{"type":"exit","code":0,"diagnostic":null}}
+        ],"next":4}"#,
+    );
+    assert_eq!(page.next, 4);
+    let names: Vec<JobEventName> = page.records.iter().map(|record| record.event).collect();
+    assert_eq!(
+        names,
+        [
+            JobEventName::Event,
+            JobEventName::Note,
+            JobEventName::Report,
+            JobEventName::Exit
+        ]
+    );
+    assert_eq!(page.records[0].id, Some(4));
+    assert_eq!(page.records[1].id, None);
+    assert_eq!(page.records[3].data["code"], 0);
+    let empty: JobEvents<Value> = round_trip(r#"{"records":[],"next":0}"#);
+    assert!(empty.records.is_empty());
+    refused::<JobEventName>(r#""heartbeat""#);
+    assert_eq!((EVENTS_PAGE, EVENTS_PAGE_BYTES), (1_000, 1 << 20));
+    assert!(FROM.contains("Last-Event-ID") && FROM.contains("after it"));
 }
 
 #[test]

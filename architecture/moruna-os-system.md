@@ -84,7 +84,8 @@ Implements the OS design, section 1, OpenStack column.
 - **`boot_ms`** counts from the core's first instruction to ready. Firmware and GRUB time is
   measured from outside, at bring-up, as create-to-ready.
 - **Limits:** services started within 5 s; an address within 30 s; instance data within 90 s.
-- **Failure:** one line, `moruna: fatal <stage>: <reason>`, then the machine powers off. The stage
+- **Failure:** the line `moruna: fatal <stage>: <reason>`, then the machine powers off. The first
+  fatal line is the cause, and tools read only it; consequence lines may follow. The stage
   is `core`, or the name of the service that can't go on, unless this document names another. A node
   never hangs silently, never restarts itself in a loop, and never offers a prompt. A service that
   dies stops the node (SDD 33), except `api`, which is restarted (2B).
@@ -524,7 +525,7 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
 | `GET /v1/jobs` | observe | The last 100 jobs, newest first: id, state, times |
 | `GET /v1/jobs/{id}` | observe | State (`starting`, `running`, `completed`, `failed`, `cancelled`), times, the latest heartbeat's fields, exit code |
 | `POST /v1/jobs/{id}/cancel` | submit | Sends `cancel`; `conflict` if the job has ended |
-| `GET /v1/jobs/{id}/events` | observe | Server-Sent Events: each event record as its JSON line (`moruna_event`'s rendering), heartbeats, log records, then `report` and `exit`. `?from=<seq>` replays from the node's buffer of the last 100,000 records |
+| `GET /v1/jobs/{id}/events` | observe | Server-Sent Events: each event record as its JSON line (`moruna_event`'s rendering), heartbeats, log records, then `report` and `exit`. `?from=<seq>` replays the records after `<seq>` (as SSE's `Last-Event-ID`) from the node's buffer of the last 100,000 records. MCP's `moruna_jobs_events` (`id`, `from`) answers the same records as pages of at most 1,000 records or 1 MiB, with `next` |
 | `GET /v1/jobs/{id}/report` | observe | The `RunReport` JSON, once the job has ended |
 
 - **A job is** `{"v1": <job document version 1 as JSON>}` or `{"v2": "<base64 of the MJB2 FlatBuffer>"}`,
@@ -547,11 +548,22 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
 ### 3C. Volumes
 
 - **A job reads and writes attached volumes,** named by the serial the cloud gives the disk: the
-  Cinder volume ID on OpenStack, `lun-<n>` on Azure. In the job: `disk://<serial>/<path>`.
-- `devices` reports every block device with its serial. `node-admission` grants the engine exactly
-  the volumes its job names, read-only for sources and read-write for sinks. Today's `disk://`
-  support (stream D) does the rest.
-- **The boot disk is never a volume.**
+  Cinder volume ID on OpenStack (virtio-blk's `GET_ID`), `lun-<n>` on Azure. In the job:
+  `disk://<serial>/<path>`, where a volume holds one moruna-image layer (the output disk's format)
+  and `<path>` names a file in it; `moruna volume pack <dir> <out>` makes a source volume.
+- **A volume is served by its driver** (virtio-blk or storvsc) through `moruna.driver.block`, and
+  the engine reads and writes it as that protocol's client. Data moves by the client's page numbers
+  with no copy, in large pipelined requests. One path on every cloud, and read-only is enforced
+  below the engine: a source's connection gets no write lease. (Changed 2026-11-17 night from
+  stream D's engine-driven virtio-blk, because Azure's disks are storvsc's and two paths are one too
+  many; 3.3 measures the driver path against the direct one, and a loss is fixed in the protocol.)
+- Every driver registers its disks in `devices`' directory with serial, size and read-only flag.
+  The engine's check answers the job's `needs.volumes` (`[{"serial", "write"}]`); api passes them to
+  `node-admission`'s `launch`, which grants exactly those connections. An unknown serial or the boot
+  disk is refused at `validate`.
+- **The boot disk is never a volume.** The image carries its own GPT disk GUID, derived from its
+  content hash at packaging; the driver marks the disk with that GUID as `boot` (storvsc also by
+  Microsoft's rule, 1F).
 
 ### 3D. The network for jobs
 
@@ -564,9 +576,12 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
   refuses TLS while that clock is unset. `platform` sets it through `clock_set_realtime` on
   `root.clock` from instance data's `Date` before `ready`, and again every hour, which keeps S3 and
   Blob request signing inside their 15-minute skew on a node that runs for months. No second clock,
-  no link for it, never a build-time clock: the cloud profile refuses `tls-unix-seconds`.
-- **Trusted roots:** the cloud profile's `tls.roots` is Mozilla's set, generated from a pinned
-  `webpki-roots` into `kernel/node/cloud/tls-roots.pem`, with its version and SHA-256 beside it.
+  no link for it, never a build-time clock. TLS accepts the clock once it is set by the machine's
+  CMOS at boot or by `platform`; test machines set it with QEMU's `-rtc`, so `tls-unix-seconds` is
+  gone everywhere.
+- **Trusted roots:** the cloud profile's `tls.roots` is Mozilla's set as curl publishes it
+  (`cacert.pem`, MPL-2.0), a pinned dated release checked against curl's SHA-256, converted to the
+  server's DER list in `kernel/node/cloud/`.
 - **Egress per job:** the engine's check (3B) answers with the job's needs: its object-store host
   names, its volumes (3C) and its functions (3E). `node-admission` grants exactly those. For the
   network it holds a client with `grant,connect` on the name rule `*` at port 443 (every name, held
@@ -588,8 +603,20 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
     Nothing is fetched at registration.
 - **At job start,** `node-admission` has the engine fetch each function the job names, through its
   job network (3D). The node refuses the job if a SHA-256 differs. Images are cached in memory, up
-  to node config's `function_cache_bytes` (default 1 GiB), until the node stops.
-- **A job names a function** by its registered name. An unregistered name is refused at `validate`.
+  to node config's `functions.cache_bytes` (default 1 GiB, at most half the node's memory), until the node stops.
+- **A job names a function** by its registered name, as a function task's `"function": "<name>"`;
+  the check's `needs.functions` lists them. An unregistered name is refused at `validate`.
+- **AWS's own S3** (no endpoint) is reached with path-style requests, so its host is
+  `s3.<region>.amazonaws.com`, known without the bucket; the region is required.
+
+### Known costs, scheduled after the OS path
+
+- **Window copies at IPC sinks and spills:** a batch held in a plane window is copied when an Arrow
+  IPC sink or a staging spill writes it, because the plane's memory is a second pool the arena does
+  not own. The fix is one pool: the plane draws its memory objects from the run's arena, under one
+  budget, so windows are arena memory a disk already reaches. Parquet sinks are unaffected.
+- **Page per buffer in records** (SDD 01 e.7): under 1% at 64Ki rows; revisited only if a time split
+  points at it.
 
 ### 3F. The full-year hang
 
@@ -682,13 +709,30 @@ There are two kinds:
   int  moruna_open(struct moruna_task **task);
   int  moruna_next(struct moruna_task *task, struct ArrowArray *out, struct ArrowSchema *schema); /* 1 batch, 0 end, <0 error */
   int  moruna_emit(struct moruna_task *task, struct ArrowArray *batch, struct ArrowSchema *schema); /* takes ownership */
-  void moruna_log(struct moruna_task *task, int level, const char *line);
+  void moruna_log(struct moruna_task *task, const char *line);
   void moruna_error(struct moruna_task *task, const char *message);
   int  moruna_finish(struct moruna_task *task);
   ```
 
-- **A batch from `moruna_next`** stays valid until its `release` is called. The window is given
-  back then.
+- **A batch from `moruna_next`** stays valid until its `release` is called; its window goes back
+  at the next `moruna_next` or `moruna_finish`, so an answer emitted after the release still answers
+  it. A failed call returns the negated exit code (`MORUNA_E_…`, as 5A's); `moruna_emit` takes
+  ownership of both structs, and may be called with no batch held (an aggregate's answer at the end;
+  5A has the same, an end hook).
+- **C needs a libc, and it is relibc** (Redox's, MIT, in Rust) with a Moruna platform layer over
+  `moruna-sys` and std, vendored at a pinned commit like OSTD. A minimal runtime breaks on the first
+  real C library; musl would need an in-process Linux syscall layer. Item 5.2b. **One runtime, not
+  two:**
+  - std, the SDK and relibc build as one crate graph: one allocator, one `moruna-sys`; relibc's
+    `malloc` is std's global allocator, and relibc drops its own panic and alloc-error items.
+  - **ELF TLS** (x86_64 variant II, FS:0 the thread control block's self pointer) for std and relibc
+    alike; 5.0's key table goes. One control block type holds both runtimes' per-thread state.
+  - **One thread path:** `std::thread::spawn` and `pthread_create` both go through it.
+  - **One `_start`:** sets up TLS, takes the log slot (std owns it; C's fd 1 and 2 write through
+    std's writer), runs relibc's static init when it is linked, then `main`.
+  - Unsupported POSIX (fork, exec, signals, sockets, paths) answers `ENOSYS`/`ENOENT`, as 5A0 says.
+  - C++ (libc++, libc++abi, libunwind over relibc) follows once relibc runs; exceptions never cross
+    a `moruna_*` call.
 - **C, C++ and Zig** link the library into a static native function. Go and others follow when
   someone needs them; nothing in the header is tied to C.
 

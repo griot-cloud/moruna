@@ -157,6 +157,12 @@ version = "=5.2.0"
 [target.x86_64-unknown-none.dependencies.bit_field]
 version = "0.10.1"
 
+# moruna: Hyper-V's constants and layouts, vendored from Microsoft's OpenVMM (MIT,
+# ../openvmm), for finding Hyper-V, its clock rates and the hypercall page (work item 1.8).
+[target.x86_64-unknown-none.dependencies.hvdef]
+version = "=0.0.0"
+path = "../openvmm/hvdef"
+
 [target.x86_64-unknown-none.dependencies.int-to-c-enum]
 version = "0.1.0"
 

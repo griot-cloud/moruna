@@ -908,6 +908,7 @@ fn narrowed_grant(p: &mut Probe) -> Result<(), Fail> {
         local: vec![Rule::any_port(Cidr::new(lo4, 32))],
         names: vec![],
         sockets: 2,
+        ..Policy::default()
     };
     let mut c = through(must(grant(p, narrow.clone())?, "grant")?)?;
     let got = c.info().map_err(wire)?;
@@ -994,6 +995,21 @@ fn wider_grant(p: &mut Probe) -> Result<(), Fail> {
             grant(p, names)?,
             net::Error::NotPermitted,
             "a grant of a name",
+        )?;
+    }
+    // Buffers its parent's do not hold (3.1): larger, or given where the parent's are
+    // the server's.
+    let mut buffers = i.policy.clone();
+    buffers.rx = Some(
+        i.policy
+            .rx
+            .map_or(crate::BUFFER_MIN, |r| r.saturating_add(1)),
+    );
+    if buffers.validate().is_ok() && !i.policy.covers(&buffers) {
+        refuses(
+            grant(p, buffers)?,
+            net::Error::NotPermitted,
+            "a grant of larger buffers",
         )?;
     }
     let mut bad = i.policy.clone();

@@ -411,8 +411,32 @@ pub fn run_file(
 
 /// `moruna serve --listen <address>`: wait for one peer, say `hello`, wait for its `spec`, run
 /// it as `moruna run` would, and exit (MH 4.2). One job per process. On a channel
-/// (`channel:<slot>`) it serves in node mode ([`serve_node`]).
+/// (`channel:<slot>`) it serves in node mode ([`serve_channel`]), with no bound on the budget.
 pub fn serve(address: &Address, kinds: &Registry, opts: &HostOptions<'_>) -> Outcome {
+    match address {
+        Address::Channel(_) => serve_channel(&Node::on(address.to_string()), kinds, opts),
+        _ => serve_at(address, None, kinds, opts),
+    }
+}
+
+/// `moruna serve --listen channel:<slot> [--budget-max BYTES]`: [`serve`] in node mode on
+/// `node`'s channel.
+pub fn serve_channel(node: &Node, kinds: &Registry, opts: &HostOptions<'_>) -> Outcome {
+    match Address::parse(&node.channel) {
+        Ok(address @ Address::Channel(_)) => serve_at(&address, Some(node), kinds, opts),
+        _ => {
+            let refusal = SpecError::new("listen", format!("{} is not a channel", node.channel));
+            refused_without_document(None, &refusal, &Wire::new(None, Instant::now()))
+        }
+    }
+}
+
+fn serve_at(
+    address: &Address,
+    node: Option<&Node>,
+    kinds: &Registry,
+    opts: &HostOptions<'_>,
+) -> Outcome {
     let listener = match transport::listen(address) {
         Ok(listener) => listener,
         Err(error) => {
@@ -428,14 +452,22 @@ pub fn serve(address: &Address, kinds: &Registry, opts: &HostOptions<'_>) -> Out
         }
     };
     drop(listener);
-    match address {
-        Address::Channel(_) => {
-            let node = Node {
-                channel: address.to_string(),
-            };
-            serve_node(conn, &node, kinds, opts)
+    serve_on(conn, node, kinds, opts)
+}
+
+/// The document a `spec` (or a check's) message carries: version 1 as JSON, version 2's
+/// FlatBuffers as a base64 string, whose bytes come back beside the job for its digest.
+pub fn job_of(spec: serde_json::Value) -> Result<(Job, Option<Vec<u8>>), SpecError> {
+    match spec {
+        serde_json::Value::String(encoded) => {
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded.as_bytes())
+                .map_err(|e| SpecError::new("spec", format!("not base64 FlatBuffers: {e}")))?;
+            let job = Job::from_flatbuffer(&bytes).map_err(job_refusal)?;
+            Ok((job, Some(bytes)))
         }
-        _ => serve_conn(conn, kinds, opts),
+        other => JobSpec::from_value(other).map(|spec| (Job::from_v1(&spec), None)),
     }
 }
 
@@ -487,22 +519,12 @@ fn serve_on(conn: Conn, node: Option<&Node>, kinds: &Registry, opts: &HostOption
             }) => {
                 let raw = spec.clone();
                 // Version 1 is the document as JSON; version 2 is its FlatBuffers, as base64.
-                let read = match spec {
-                    serde_json::Value::String(encoded) => {
-                        use base64::Engine as _;
-                        base64::engine::general_purpose::STANDARD
-                            .decode(encoded.as_bytes())
-                            .map_err(|e| {
-                                SpecError::new("spec", format!("not base64 FlatBuffers: {e}"))
-                            })
-                            .and_then(|bytes| {
-                                let job = Job::from_flatbuffer(&bytes).map_err(job_refusal)?;
-                                wire.set_document(&bytes);
-                                Ok(job)
-                            })
+                let read = job_of(spec).map(|(job, bytes)| {
+                    if let Some(bytes) = bytes {
+                        wire.set_document(&bytes);
                     }
-                    other => JobSpec::from_value(other).map(|spec| Job::from_v1(&spec)),
-                };
+                    job
+                });
                 let plan = match plan {
                     None => Ok(None),
                     Some(encoded) => {

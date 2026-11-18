@@ -32,6 +32,35 @@ impl Display for Core<'_> {
     }
 }
 
+/// The hypervisor the core found (`architecture/moruna-os-system.md`, section 1F; work item
+/// 1.8): `moruna: hypervisor <name>`, [`HYPERV`], [`KVM`] or [`OTHER`]. The core says
+/// nothing on a machine with no hypervisor.
+pub struct Hypervisor<'a>(pub &'a str);
+
+/// Microsoft's hypervisor, found by its interface signature `Hv#1`.
+pub const HYPERV: &str = "hyperv";
+/// KVM, found by its signature `KVMKVMKVM`.
+pub const KVM: &str = "kvm";
+/// A hypervisor present and neither of those: QEMU's emulator, Xen, VMware and the rest.
+pub const OTHER: &str = "other";
+
+/// What the core says when the CMOS clock does not answer within its deadline
+/// (`architecture/moruna-os-system.md`, section 1B: no wait without a deadline in boot
+/// code). The core then has no wall clock until `platform` sets it from instance data
+/// (section 1D), and the boot goes on.
+pub const NO_CMOS_CLOCK: &str = "moruna: no CMOS clock; the wall clock comes from instance data";
+
+impl Display for Hypervisor<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "moruna: hypervisor {}", self.0)
+    }
+}
+
+/// What `devices` says when `root.ecam` covers nothing, as on a machine whose firmware
+/// describes no PCI configuration space (section 1F, "No PCI bus"). It then serves with no
+/// driver.
+pub const NO_PCI_BUS: &str = "devices: no PCI bus on this machine";
+
 /// A failure's line: `moruna: fatal <stage>: <reason>`.
 ///
 /// It is always one line: a line break in the reason is written as a space.
@@ -107,6 +136,31 @@ mod tests {
     }
 
     #[test]
+    fn the_hypervisor_line_names_the_hypervisor_found() {
+        assert_eq!(
+            format!("{}", Hypervisor(HYPERV)),
+            "moruna: hypervisor hyperv"
+        );
+        assert_eq!(format!("{}", Hypervisor(KVM)), "moruna: hypervisor kvm");
+        assert_eq!(format!("{}", Hypervisor(OTHER)), "moruna: hypervisor other");
+    }
+
+    #[test]
+    fn the_core_says_when_there_is_no_cmos_clock() {
+        assert_eq!(
+            NO_CMOS_CLOCK,
+            "moruna: no CMOS clock; the wall clock comes from instance data"
+        );
+        assert!(!NO_CMOS_CLOCK.contains('\n'));
+    }
+
+    #[test]
+    fn devices_says_so_when_there_is_no_pci_bus() {
+        assert_eq!(NO_PCI_BUS, "devices: no PCI bus on this machine");
+        assert!(!NO_PCI_BUS.contains('\n'));
+    }
+
+    #[test]
     fn a_fatal_line_names_its_stage_and_its_reason() {
         let line = Fatal {
             stage: CORE,
@@ -117,10 +171,13 @@ mod tests {
             "moruna: fatal core: the bootloader passed no initramfs"
         );
         let line = Fatal {
-            stage: format_args!("service {}", "devices"),
-            reason: "ended",
+            stage: "devices",
+            reason: format_args!("ended with code {}", 0),
         };
-        assert_eq!(format!("{line}"), "moruna: fatal service devices: ended");
+        assert_eq!(
+            format!("{line}"),
+            "moruna: fatal devices: ended with code 0"
+        );
         let line = Fatal {
             stage: SERVICES,
             reason: format_args!("{} did not start within 5 s", "api"),

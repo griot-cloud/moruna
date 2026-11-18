@@ -208,7 +208,8 @@ card on QEMU's user network, COM1 to `OUT/console.log`) and exits 0 when
 `moruna: services started` is on the console: within 120 s under KVM, 900 s under the emulator.
 It prints the seconds from QEMU's start to the line. Exit 124 is the timeout, 1 is QEMU ending
 first. The console log holds the firmware's screen output (terminal escapes) before GRUB, then
-the kernel's lines.
+the kernel's lines. `MACHINE=pc kernel/node/tools/uefi-boot.sh OUT CPUS` boots the same disk on
+QEMU's i440FX machine instead, which has no MCFG (item 1.8).
 
 ### Bring it up and talk to it (items 1.3, 1.4 and 2.2b)
 

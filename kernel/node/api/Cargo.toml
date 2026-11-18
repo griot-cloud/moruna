@@ -28,8 +28,8 @@ moruna-api = { path = "../../api/types", version = "=0.1.0" }
 moruna-netstack = { path = "../../net/stack", version = "=0.1.0" }
 # platform's own end of the link, for the hand-over's test over a real channel.
 moruna-node-platform = { path = "../platform", version = "=0.1.0" }
-smoltcp = { version = "=0.12.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-dhcpv4"] }
-heapless = { version = "=0.8.0", default-features = false }
+smoltcp = { version = "=0.13.1", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-dhcpv4"] }
+heapless = { version = "=0.9.3", default-features = false }
 # An HTTPS client, a token issuer and the answers' JSON, as the API server's own tests have
 # them, at the workspace's versions.
 rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }

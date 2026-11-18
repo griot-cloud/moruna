@@ -862,7 +862,7 @@ mod profile_tests {
                 (
                     "node.conf",
                     &format!(
-                        "{NETWORKED}service api image.devices 4096\nlink api server network listen-api\n"
+                        "{NETWORKED}service api image.devices 4096\nlink network listen-api api server\n"
                     ),
                 ),
                 ("cloud.image", BOUND),

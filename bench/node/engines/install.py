@@ -13,7 +13,10 @@ The engines and their packages are bench/vm/install.py's (`PIP`), one virtual en
 | `rust-pool` | none | `gate-baseline` and `gate-canon` from images/gate, `cargo build --release` |
 | `harness` | CPython 3.14 | pyarrow, numpy: measure.py's own environment, for bench/vm/canon.py |
 
-Packages are not pinned, as bench/vm's were not: each run records its engine's version.
+Packages are not pinned, as bench/vm's were not: each run records its engine's version. Each
+engine's Blob reader comes with it (store.py), installed here, outside every timing: Dask's adlfs,
+DuckDB's `azure` extension (into ROOT/duckdb-ext), and Spark's hadoop-azure, the version of the
+Hadoop its pyspark carries, resolved into ROOT/ivy (that needs the JVM).
 0.6.6 is not on PyPI, so `--moruna066` names its wheel, or a source tree (a `git archive` of the
 0.6.6 commit) that is built into one with `uv build`. Builds run `cargo` with `--jobs` jobs.
 
@@ -37,7 +40,7 @@ PIP = {
     "moruna066": ("3.14t", ["{wheel}", "pyarrow", "numpy"]),
     "ray": ("3.14+gil", ["ray[data]", "pyarrow", "pandas", "numpy"]),
     "spark": ("3.14+gil", ["pyspark", "pyarrow", "pandas", "numpy"]),
-    "dask": ("3.14+gil", ["dask[distributed,dataframe]", "pyarrow", "pandas", "numpy"]),
+    "dask": ("3.14+gil", ["dask[distributed,dataframe]", "adlfs", "pyarrow", "pandas", "numpy"]),
     "duckdb": ("3.14+gil", ["duckdb", "pyarrow", "numpy"]),
     "polars": ("3.14+gil", ["polars", "pyarrow", "numpy"]),
     "harness": ("3.14+gil", ["pyarrow", "numpy"]),
@@ -115,6 +118,29 @@ def java():
     return p.stderr.splitlines()[0] if p.returncode == 0 and p.stderr else None
 
 
+def spark_azure(root, log, have_java):
+    """hadoop-azure for Spark's wasbs://: the version of the Hadoop client pyspark carries, its
+    jars resolved into ROOT/ivy by a session that only starts, so a run's session finds them."""
+    python = venv_python(root, "spark")
+    try:
+        found = subprocess.run([python, "-I", "-c", "import glob, os, pyspark; print(' '.join(glob.glob(os.path.join("
+                                "os.path.dirname(pyspark.__file__), 'jars', 'hadoop-client-api-*.jar'))))"],
+                               capture_output=True, text=True).stdout.split()
+    except OSError:
+        found = []
+    if not found:
+        return {"packages": "", "ivy": "", "azure_note": "pyspark carries no Hadoop client jar"}
+    version = os.path.basename(found[0])[len("hadoop-client-api-"):-len(".jar")]
+    out = {"packages": f"org.apache.hadoop:hadoop-azure:{version}", "ivy": os.path.join(root, "ivy")}
+    if have_java:
+        sh([python, "-I", "-c", "import sys; from pyspark.sql import SparkSession as S; "
+            "S.builder.master('local[1]').config('spark.jars.packages', sys.argv[1])"
+            ".config('spark.jars.ivy', sys.argv[2]).getOrCreate().stop()", out["packages"], out["ivy"]], log)
+    else:
+        out["azure_note"] = "hadoop-azure not resolved: no JVM"
+    return out
+
+
 def install(engine, a, log):
     rec = {"engine": engine, "started": time.time()}
     if engine == "rust-pool":
@@ -143,8 +169,15 @@ def install(engine, a, log):
         make_venv(a.root, VENV[engine], interp, pkgs, log)
     if engine != "rust-pool":
         rec.update(versions(venv_python(a.root, engine), [MODULE[engine], "pyarrow", "numpy"]))
+    if engine == "duckdb":
+        ext = os.path.join(a.root, "duckdb-ext")
+        sh([venv_python(a.root, engine), "-I", "-c",
+            "import duckdb, sys; c = duckdb.connect(); c.execute(f\"SET extension_directory='{sys.argv[1]}'\"); "
+            "c.install_extension('azure'); c.load_extension('azure')", ext], log)
+        rec["azure_extension"] = ext
     if engine == "spark":
         rec["java"] = java()
+        rec.update(spark_azure(a.root, log, rec["java"]))
         if not rec["java"]:
             rec["note"] = "no JVM: Spark installs but cannot run here"
     rec["install_s"] = round(time.time() - rec.pop("started"), 1)
