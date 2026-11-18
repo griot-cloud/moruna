@@ -8,6 +8,9 @@
              [--jobs score,occupancy,enrich,audit] [--periods 2024-01,2024]
              [--references ~/moruna-data/nyc] [--gate-canon BIN] [--events sse|mcp]
              [--memory-gib G] [--cpus N] [--results DIR] [--work DIR]
+    proof.py --check-only --data blob --blob-account A --blob-container C --blob-outputs PREFIX
+             [--blob-endpoint URL] [--jobs ...] [--periods ...] [--references DIR]
+             [--gate-canon BIN] [--results DIR] [--work DIR]
 
 Against one node, in order:
 
@@ -35,7 +38,16 @@ Against one node, in order:
    gate-canon hashes, and a month whose tolerant values differ is not compared.
 
 Every run's record is written to `RESULTS/JOB-PERIOD.json`, the summary to `RESULTS/proof.json`,
-and a table is printed. The exit code is 0 only when all of them pass.
+and a table is printed. The exit code is 0 only when all of them pass. A run's record names
+where its output is (`output`): under `--blob-outputs`, which is `proof/` and the time proof.py
+started, to the second, when it is not given.
+
+**`--check-only`** (work item 3.8c) does step 4 alone, for the outputs a proof's jobs have
+written already: it asks no node, registers nothing and submits nothing. Each run's output is
+fetched from under `--blob-outputs`, the prefix that proof was given or took, by the same names
+and with the same credential, and checked against the same references; the records, the summary
+and the exit code are the same. It is for a proof whose jobs ran and whose outputs could not be
+fetched where proof.py ran (2026-11-18, Servercore: no CA roots for Blob's certificate).
 
 The Blob credential, the account key (`BENCH_KEY`, as on Azure) or a container SAS that reads,
 writes and lists the data's container (`BENCH_SAS`, as on Servercore, work item 3.8b: the jobs
@@ -85,6 +97,8 @@ SAS_NAMES = (SAS_ENV, BLOB_SAS_ENV)
 # A SAS's signature is looked for alone only when it is this long: a real one is 44 characters of
 # base64, and a shorter piece would hide ordinary text.
 SIG_LEAST = 8
+# What a proof against a node must be given, and a check of outputs already written need not.
+NODE_ARGUMENTS = ("url", "pin", "function_key", "functions", "function_base")
 
 
 def sas_of(env=None, name=SAS_ENV):
@@ -419,7 +433,7 @@ def run_one(node, run, data, a, follow, log=print, sleep=time.sleep, clock=time.
     t0 = clock()
     deadline = t0 + (a.timeout_s if run["period"] != "2024" else a.year_timeout_s)
     doc, secrets = document(run, data, a.cpus, a.memory_bytes)
-    rec = {"run": run, "data": a.data, "events_by": a.events}
+    rec = {"run": run, "data": a.data, "output": data.output(run), "events_by": a.events}
     try:
         jid = submit(node, doc, secrets, deadline, sleep=sleep, clock=clock, log=log)
     except node_api.ApiError as e:
@@ -446,6 +460,12 @@ def run_one(node, run, data, a, follow, log=print, sleep=time.sleep, clock=time.
     if status.get("state") != "completed" or got.exit.get("code") != 0:
         rec.update(ok=False, diagnostic=got.exit.get("diagnostic"))
         return rec
+    return check(rec, run, data, a)
+
+
+def check(rec, run, data, a):
+    """`rec` with the run's output fetched and checked against 0.6.6's reference: its check
+    (`output_check`), its canonical form (`canon`) and whether it is the reference (`ok`)."""
     out = os.path.join(a.work, run["id"])
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
@@ -469,6 +489,15 @@ def run_one(node, run, data, a, follow, log=print, sleep=time.sleep, clock=time.
     rec["ok"] = bool(rec["output_check"]["ok"])
     if rec["ok"] and not a.keep_output:
         shutil.rmtree(out, ignore_errors=True)
+    return rec
+
+
+def check_one(run, data, a, clock=time.time):
+    """`--check-only`: the output a run's job wrote already, fetched and checked as `run_one`
+    does it once its job has ended; no node is asked."""
+    t0 = clock()
+    rec = check({"run": run, "data": a.data, "output": data.output(run), "check_only": True}, run, data, a)
+    rec["seconds"] = round(clock() - t0, 3)
     return rec
 
 
@@ -513,14 +542,16 @@ def data_of(a):
 
 def parse(argv):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--url", required=True, help="the node's API, https://ADDRESS:443")
-    p.add_argument("--pin", required=True, help="the SHA-256 the console's `moruna: tls` line printed")
+    p.add_argument("--check-only", action="store_true",
+                   help="ask no node: fetch the outputs already under --blob-outputs and check them")
+    p.add_argument("--url", default=None, help="the node's API, https://ADDRESS:443")
+    p.add_argument("--pin", default=None, help="the SHA-256 the console's `moruna: tls` line printed")
     p.add_argument("--token", default=None, help="a token with the admin scope (2C)")
     p.add_argument("--token-key", default=None, help="else the token key, to make one for each scope")
     p.add_argument("--instance", default=None, help="and the node's instance ID, the tokens' `aud`")
-    p.add_argument("--function-key", required=True, help="the test function key (its public half in node config)")
-    p.add_argument("--functions", required=True, help="the directory of the gate tasks, gate-JOB")
-    p.add_argument("--function-base", required=True,
+    p.add_argument("--function-key", default=None, help="the test function key (its public half in node config)")
+    p.add_argument("--functions", default=None, help="the directory of the gate tasks, gate-JOB")
+    p.add_argument("--function-base", default=None,
                    help="where the node fetches them from, URL/gate-JOB (?FUNCTIONS_SAS from the environment)")
     p.add_argument("--data", choices=("volume", "blob"), required=True)
     p.add_argument("--source-serial", default=None)
@@ -531,7 +562,9 @@ def parse(argv):
     p.add_argument("--blob-container", default=None)
     p.add_argument("--blob-endpoint", default=None, help="a local emulator's (Azurite's) endpoint")
     p.add_argument("--blob-inputs", default="nyc/", help="the prefix of the normalised files in the container")
-    p.add_argument("--blob-outputs", default=f"proof/{time.strftime('%Y%m%d-%H%M%S')}/")
+    p.add_argument("--blob-outputs", default=None,
+                   help="the prefix of the outputs in the container, RUN/ under it (proof/ and this time, "
+                        "to the second, by default); with --check-only, the one the proof wrote under")
     p.add_argument("--jobs", default=",".join(JOBS))
     p.add_argument("--periods", default=",".join(PERIODS))
     p.add_argument("--references", default="~/moruna-data/nyc")
@@ -547,6 +580,17 @@ def parse(argv):
     p.add_argument("--keep-output", action="store_true")
     a = p.parse_args(argv)
     a.references = os.path.expanduser(a.references)
+    if a.check_only:
+        # A sink volume holds its last run's output alone, and a time of now names no outputs.
+        if a.data != "blob" or a.blob_outputs is None:
+            raise SystemExit("proof.py: --check-only needs --data blob and --blob-outputs, the prefix the "
+                             "proof's outputs are under")
+    else:
+        missing = [f"--{n.replace('_', '-')}" for n in NODE_ARGUMENTS if getattr(a, n) is None]
+        if missing:
+            raise SystemExit(f"proof.py: {', '.join(missing)} must be given (--check-only alone needs none)")
+        if a.blob_outputs is None:
+            a.blob_outputs = f"proof/{time.strftime('%Y%m%d-%H%M%S')}/"
     for j in a.jobs.split(","):
         if j not in JOBS:
             raise SystemExit(f"proof.py: no job {j!r}")
@@ -571,29 +615,44 @@ def main(argv=None, transport=None, sign=None, log=print, sleep=time.sleep, cloc
         with open(path, "w") as f:
             f.write(redact(json.dumps(obj, indent=1, default=str)))
 
-    node = node_api.Node(transport or node_api.Https(a.url, a.pin), tokens_of(a))
-    data = data_of(a)
-    sign = sign or (lambda digest: node_api.sign_digest(a.function_key, digest))
-    facts = node.node()
-    a.memory_bytes = (int(a.memory_gib * (1 << 30)) if a.memory_gib
-                      else facts.get("job_memory_bytes") or facts["memory_bytes"] - NODE_KEEPS)
-    os.makedirs(a.results, exist_ok=True)
-    os.makedirs(a.work, exist_ok=True)
-    log(f"proof: node {facts.get('instance')} on {facts.get('cloud')}, version {facts.get('version')}; "
-        f"budget {a.memory_bytes / (1 << 30):.2f} GiB, {a.cpus} CPUs; data from {a.data}; events by {a.events}")
     jobs = a.jobs.split(",")
-    try:
-        register(node, jobs, a.functions, a.function_base, sign, log, sas)
-    except node_api.ApiError as e:
-        raise SystemExit(f"proof.py: a function was not registered: {redact(e)}") from None
-    follow = follow_sse if a.events == "sse" else follow_mcp
+    if a.check_only:
+        # No node: what its jobs wrote is fetched and checked, and nothing else is done.
+        data, facts = data_of(a), None
+        os.makedirs(a.results, exist_ok=True)
+        os.makedirs(a.work, exist_ok=True)
+        log(f"proof: check only: the outputs under {data.store.az(a.blob_outputs)} against the references in "
+            f"{a.references}; no node is asked, nothing is registered and no job is submitted")
+
+        def one(run):
+            return check_one(run, data, a, clock=clock)
+    else:
+        node = node_api.Node(transport or node_api.Https(a.url, a.pin), tokens_of(a))
+        data = data_of(a)
+        sign = sign or (lambda digest: node_api.sign_digest(a.function_key, digest))
+        facts = node.node()
+        a.memory_bytes = (int(a.memory_gib * (1 << 30)) if a.memory_gib
+                          else facts.get("job_memory_bytes") or facts["memory_bytes"] - NODE_KEEPS)
+        os.makedirs(a.results, exist_ok=True)
+        os.makedirs(a.work, exist_ok=True)
+        log(f"proof: node {facts.get('instance')} on {facts.get('cloud')}, version {facts.get('version')}; "
+            f"budget {a.memory_bytes / (1 << 30):.2f} GiB, {a.cpus} CPUs; data from {a.data}; events by {a.events}")
+        try:
+            register(node, jobs, a.functions, a.function_base, sign, log, sas)
+        except node_api.ApiError as e:
+            raise SystemExit(f"proof.py: a function was not registered: {redact(e)}") from None
+        follow = follow_sse if a.events == "sse" else follow_mcp
+
+        def one(run):
+            return run_one(node, run, data, a, follow, log=log, sleep=sleep, clock=clock)
     records = []
     for run in plan(jobs, a.periods.split(",")):
-        rec = run_one(node, run, data, a, follow, log=log, sleep=sleep, clock=clock)
+        rec = one(run)
         write(os.path.join(a.results, f"{run['id']}.json"), rec)
         log(f"   {run['id']}: {'pass' if rec.get('ok') else 'FAIL'}: {outcome(rec)}")
         records.append(rec)
-    summary = {"node": facts, "data": a.data, "events": a.events, "ok": all(r.get("ok") for r in records),
+    summary = {"node": facts, "data": a.data, "events": None if a.check_only else a.events,
+               "check_only": a.check_only, "ok": all(r.get("ok") for r in records),
                "runs": [{"id": r["run"]["id"], "ok": r.get("ok"), "state": r.get("state"),
                          "seconds": r.get("seconds"), "verdict": (r.get("output_check") or {}).get("verdict")}
                         for r in records]}

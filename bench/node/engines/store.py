@@ -23,12 +23,16 @@ A store may hold a container SAS in place of the key (work item 3.8b: the proof 
 whose data is in nyc-blob.sh's Blob container, read and written with that container's SAS; the
 account key stays with nyc-blob.sh). Such a store only downloads (`download`), by Blob's REST API
 on the standard library: List Blobs and Get Blob, each with the SAS as its query, which a
-container SAS with read and list allows.
+container SAS with read and list allows. Over `https://` the store's certificate is always
+verified, against CA roots that are looked for where Python's own default has none (`ca_context`,
+work item 3.8c).
 """
 import dataclasses
+import functools
 import http.client
 import os
 import shutil
+import ssl
 import time
 import urllib.parse
 import urllib.request
@@ -37,6 +41,71 @@ from xml.etree import ElementTree
 # Azurite's well-known development account (not a secret: it is in Azurite's documentation).
 AZURITE_ACCOUNT = "devstoreaccount1"
 AZURITE_KEY = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+# The system's CA bundle on macOS, the BSDs and Alpine.
+SYSTEM_CA_FILE = "/etc/ssl/cert.pem"
+
+
+class NoCaRoots(RuntimeError):
+    """There are no CA roots to verify a store's certificate against."""
+
+
+def ca_bundles(env=None):
+    """Where CA roots are looked for when Python's default paths give none, in order, each as
+    (what it is, its file or ""): the file `SSL_CERT_FILE` names, the system's bundle, and
+    certifi's when certifi is installed."""
+    env = os.environ if env is None else env
+    try:
+        import certifi
+        bundled = certifi.where()
+    except ImportError:
+        bundled = ""
+    return [("SSL_CERT_FILE", env.get("SSL_CERT_FILE", "")), ("the system's bundle", SYSTEM_CA_FILE),
+            ("certifi", bundled)]
+
+
+def ca_context(ctx=None, bundles=None):
+    """A TLS context that verifies the server's certificate and name against CA roots, always:
+    Python's default context when it has any (`ctx`, when given, in its place); else that context
+    with the first of `bundles` (`ca_bundles`) that gives it roots. python.org's build for macOS
+    has none of its own: its OpenSSL names a cert.pem that is not installed, and every `https://`
+    fails with CERTIFICATE_VERIFY_FAILED (found by the proof on Servercore, 2026-11-18). With no
+    roots anywhere it raises `NoCaRoots`, naming what was tried: verification is never turned off."""
+    if ctx is None:
+        ctx = ssl.create_default_context()
+        # A directory of roots at OpenSSL's default path is read only as a certificate needs
+        # one: the context counts none of them, and has them.
+        capath = ssl.get_default_verify_paths().capath
+        if capath and os.listdir(capath):
+            return ctx
+    if ctx.cert_store_stats()["x509"]:
+        return ctx
+    tried = []
+    for what, path in ca_bundles() if bundles is None else bundles:
+        if not path:
+            tried.append(f"{what} (there is none)")
+            continue
+        try:
+            ctx.load_verify_locations(cafile=path)
+            return ctx
+        except OSError as e:  # no such file, or one with no certificate in it (ssl.SSLError)
+            tried.append(f"{what}, {path} ({e.strerror or e})")
+    raise NoCaRoots("no CA roots to verify the store's certificate against: Python's default paths "
+                    f"({ssl.get_default_verify_paths().openssl_cafile}) gave none, nor did "
+                    + ", ".join(tried) + "; name a CA bundle in SSL_CERT_FILE")
+
+
+@functools.lru_cache(maxsize=1)
+def tls_context():
+    """`ca_context`, made once: the roots are read from their file once for a whole run."""
+    return ca_context()
+
+
+def urlopen(url, timeout=120):
+    """The SAS path's opener: urllib's, an `https://` address verified against `tls_context`'s
+    roots. A plain `http://` one (a local emulator's) needs none."""
+    if urllib.parse.urlsplit(url).scheme != "https":
+        return urllib.request.urlopen(url, timeout=timeout)
+    return urllib.request.urlopen(url, timeout=timeout, context=tls_context())
 
 
 @dataclasses.dataclass(frozen=True)
@@ -175,7 +244,7 @@ class Store:
         url = f"{self.blob_endpoint}/{self.container}" + (f"/{urllib.parse.quote(path)}" if path else "")
         return f"{url}?{query + '&' if query else ''}{self.sas.lstrip('?')}"
 
-    def sas_names(self, prefix, opener=urllib.request.urlopen):
+    def sas_names(self, prefix, opener=urlopen):
         """The names of the blobs under `prefix` (List Blobs, page by page)."""
         names, marker = [], ""
         while True:
@@ -190,7 +259,7 @@ class Store:
             if not marker:
                 return names
 
-    def sas_download(self, prefix, dest, opener=urllib.request.urlopen, tries=3, wait_s=5.0):
+    def sas_download(self, prefix, dest, opener=urlopen, tries=3, wait_s=5.0):
         """`download` with the SAS: each blob under `prefix` (Get Blob), tried `tries` times."""
         total = 0
         base = prefix.rstrip("/")

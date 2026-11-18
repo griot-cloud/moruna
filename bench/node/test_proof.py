@@ -8,12 +8,15 @@ and a real TLS stream that drops. Nothing here reaches a node or a cloud.
     python3 -m pytest -q bench/node/test_proof.py
 """
 import hashlib
+import io
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import threading
+import types
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -727,9 +730,10 @@ class FakeBlob:
     """Blob's REST API as a container SAS reaches it, over plain HTTP on the loopback (as an
     emulator's endpoint is): List Blobs a page of `page` names at a time, and Get Blob, each only
     with the SAS as its query, else 403. The container's blobs are the files under `root`, by
-    their paths from it. `fail_once` names a blob whose first Get is cut short."""
+    their paths from it. `fail_once` names a blob whose first Get is cut short. With `tls`, a
+    certificate and its key, it is served over HTTPS, as Azure serves it."""
 
-    def __init__(self, root, container="data", page=1, fail_once=None):
+    def __init__(self, root, container="data", page=1, fail_once=None, tls=None):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         import urllib.parse as up
         self.root, self.container, self.page, self.fail_once = str(root), container, page, fail_once
@@ -770,7 +774,11 @@ class FakeBlob:
                 pass
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
-        self.endpoint = f"http://127.0.0.1:{self.server.server_address[1]}/acct"
+        if tls:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(*tls)
+            self.server.socket = ctx.wrap_socket(self.server.socket, server_side=True)
+        self.endpoint = f"http{'s' if tls else ''}://127.0.0.1:{self.server.server_address[1]}/acct"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def listing(self, prefix, marker):
@@ -858,6 +866,156 @@ def test_a_sas_store_downloads_by_list_and_get_page_by_page_and_tries_again(tmp_
         blob.close()
 
 
+# --- The CA roots the SAS path verifies Blob's certificate against (work item 3.8c) -------------
+
+def certificate(root, name):
+    """A self-signed certificate for 127.0.0.1 and its key, as PEM files."""
+    key, cert = root / f"{name}.key.pem", root / f"{name}.pem"
+    subprocess.run([OPENSSL, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+                    "-keyout", str(key), "-out", str(cert), "-days", "1", "-subj", f"/CN={name}",
+                    "-addext", "subjectAltName=IP:127.0.0.1"], check=True, capture_output=True)
+    return str(cert), str(key)
+
+
+def no_roots():
+    """A context as Python's default is where OpenSSL's default paths hold nothing (python.org's
+    build for macOS): it verifies the certificate and the name, and has no root to verify against."""
+    return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
+@pytest.fixture
+def own_context(monkeypatch):
+    """The store's context is made once for a run; a test makes its own, from a context with no
+    roots and the bundles it names: `own_context(bundles)`."""
+    real = store.ca_context
+
+    def use(bundles):
+        store.tls_context.cache_clear()
+        monkeypatch.setattr(store, "ca_context", lambda: real(no_roots(), bundles))
+    store.tls_context.cache_clear()
+    yield use
+    store.tls_context.cache_clear()
+
+
+@pytest.mark.skipif(not OPENSSL, reason="needs openssl to make a certificate")
+def test_a_context_with_no_default_roots_falls_back_to_the_first_bundle_there_is(tmp_path, own_context):
+    cert, key = certificate(tmp_path, "blob")
+    other, _ = certificate(tmp_path, "other")
+    (tmp_path / "empty.pem").write_text("not a certificate\n")
+    bundles = [("SSL_CERT_FILE", ""), ("a file that is not there", str(tmp_path / "none.pem")),
+               ("a file with no certificate", str(tmp_path / "empty.pem")), ("the system's bundle", cert),
+               ("certifi", other)]
+    ctx = store.ca_context(no_roots(), bundles)
+    # The first bundle that has roots, and no other; the certificate and the name still verified.
+    assert ctx.cert_store_stats()["x509"] == 1
+    assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
+    root = tmp_path / "container"
+    (root / "proof/p/score-2024").mkdir(parents=True)
+    (root / "proof/p/score-2024/part-0.parquet").write_bytes(b"rows")
+    blob = FakeBlob(root, page=5, tls=(cert, key))
+    try:
+        assert blob.endpoint.startswith("https://")
+        s = store.Store("acct", "", "data", blob.endpoint, DATA_SAS)
+        # The store's own opener, no opener given: over HTTPS it verifies against that context.
+        own_context(bundles)
+        assert s.sas_names("proof/p/") == ["proof/p/score-2024/part-0.parquet"]
+        assert s.download("proof/p/score-2024/", str(tmp_path / "out")) == len(b"rows")
+        assert (tmp_path / "out/part-0.parquet").read_bytes() == b"rows"
+        # Roots that did not sign the store's certificate: the store is refused, not trusted.
+        own_context(bundles[4:])
+        with pytest.raises(OSError, match="CERTIFICATE_VERIFY_FAILED"):
+            s.sas_names("proof/p/")
+    finally:
+        blob.close()
+
+
+def test_no_roots_anywhere_is_an_error_that_names_what_was_tried(tmp_path, own_context):
+    (tmp_path / "empty.pem").write_text("not a certificate\n")
+    bundles = [("SSL_CERT_FILE", ""), ("the system's bundle", str(tmp_path / "none.pem")),
+               ("certifi", str(tmp_path / "empty.pem"))]
+    with pytest.raises(store.NoCaRoots) as stop:
+        store.ca_context(no_roots(), bundles)
+    why = str(stop.value)
+    assert why.startswith("no CA roots to verify the store's certificate against: Python's default paths (")
+    assert "SSL_CERT_FILE (there is none)" in why
+    assert f"the system's bundle, {tmp_path / 'none.pem'} (No such file or directory)" in why
+    assert f"certifi, {tmp_path / 'empty.pem'} (" in why and why.endswith("name a CA bundle in SSL_CERT_FILE")
+    # An https:// address is not opened without roots: the error is the download's.
+    own_context(bundles)
+    with pytest.raises(store.NoCaRoots, match="nor did SSL_CERT_FILE"):
+        store.Store("acct", "", "data", "", DATA_SAS).download("proof/p/", str(tmp_path / "x"))
+    assert not (tmp_path / "x").exists()
+
+
+def test_where_the_roots_are_looked_for_and_a_default_that_has_them(tmp_path, monkeypatch):
+    found = store.ca_bundles({"SSL_CERT_FILE": "/my/roots.pem"})
+    assert [what for what, _ in found] == ["SSL_CERT_FILE", "the system's bundle", "certifi"]
+    assert found[0][1] == "/my/roots.pem" and found[1][1] == "/etc/ssl/cert.pem"
+    assert store.ca_bundles({})[0] == ("SSL_CERT_FILE", "")
+    # certifi's bundle when certifi is installed, and none when it is not.
+    monkeypatch.setitem(sys.modules, "certifi", types.SimpleNamespace(where=lambda: "/site/cacert.pem"))
+    assert store.ca_bundles({})[2] == ("certifi", "/site/cacert.pem")
+    monkeypatch.setitem(sys.modules, "certifi", None)
+    assert store.ca_bundles({})[2] == ("certifi", "")
+
+    # A context that has roots is taken as it is: no bundle is read.
+    class Loaded:
+        def cert_store_stats(self):
+            return {"x509": 3, "crl": 0, "x509_ca": 3}
+
+        def load_verify_locations(self, cafile):
+            raise AssertionError(f"{cafile} was read")
+    ctx = Loaded()
+    assert store.ca_context(ctx, [("the system's bundle", "/etc/ssl/cert.pem")]) is ctx
+    # Python's default context: with a directory of roots at OpenSSL's default path it is taken
+    # as it is (the roots are read as they are needed); with none anywhere, the error.
+    made = []
+    monkeypatch.setattr(store.ssl, "create_default_context", lambda: made.append(no_roots()) or made[-1])
+    (tmp_path / "certs").mkdir()
+    (tmp_path / "certs" / "4042bcee.0").write_text("a root, by its hash\n")
+    paths = types.SimpleNamespace(capath=str(tmp_path / "certs"), openssl_cafile="/openssl/cert.pem")
+    monkeypatch.setattr(store.ssl, "get_default_verify_paths", lambda: paths)
+    assert store.ca_context(bundles=[]) is made[-1]
+    paths.capath = None
+    with pytest.raises(store.NoCaRoots, match=r"default paths \(/openssl/cert.pem\) gave none"):
+        store.ca_context(bundles=[])
+
+
+def test_an_opener_that_is_given_is_the_one_used_and_plain_http_needs_no_roots(tmp_path, monkeypatch):
+    """A fake opener works as it did: the store's own context is not made for it, nor for a
+    local emulator's plain HTTP."""
+    def never():
+        raise AssertionError("the roots were looked for")
+    store.tls_context.cache_clear()
+    monkeypatch.setattr(store, "ca_context", never)
+    listing = (b"<EnumerationResults><Blobs><Blob><Name>proof/p/a.parquet</Name></Blob>"
+               b"<Blob><Name>proof/p/dir/</Name></Blob></Blobs><NextMarker /></EnumerationResults>")
+    opened = []
+
+    class Answer(io.BytesIO):
+        headers = {}
+
+    def opener(url, timeout):
+        opened.append((url, timeout))
+        return Answer(listing if "comp=list" in url else b"rows")
+    s = store.Store("acct", "", "data", "", DATA_SAS)
+    assert s.sas_names("proof/p/", opener) == ["proof/p/a.parquet", "proof/p/dir/"]
+    assert s.sas_download("proof/p/", str(tmp_path / "out"), opener=opener) == len(b"rows")
+    assert (tmp_path / "out/a.parquet").read_bytes() == b"rows"
+    assert opened[0] == ("https://acct.blob.core.windows.net/data?restype=container&comp=list"
+                         f"&prefix=proof%2Fp%2F&{DATA_SAS}", 120)
+    assert opened[-1] == (f"https://acct.blob.core.windows.net/data/proof/p/a.parquet?{DATA_SAS}", 120)
+    # The store's own opener over plain HTTP.
+    root = tmp_path / "container"
+    (root / "nyc").mkdir(parents=True)
+    (root / "nyc/a.parquet").write_bytes(b"input")
+    blob = FakeBlob(root)
+    try:
+        assert store.Store("acct", "", "data", blob.endpoint, DATA_SAS).sas_names("nyc/") == ["nyc/a.parquet"]
+    finally:
+        blob.close()
+
+
 def test_a_whole_proof_from_and_to_blob_with_the_data_sas(world, monkeypatch):
     """As openstack-up.sh --proof runs it: the jobs read and write the data container with its
     SAS by secret name, the outputs are fetched with it, and it is never said or written."""
@@ -887,7 +1045,178 @@ def test_a_whole_proof_from_and_to_blob_with_the_data_sas(world, monkeypatch):
         assert body["v1"]["source"]["url"][0].startswith("az://data/nyc/")
         assert body["v1"]["sink"]["url"] == f"az://data/proof/{job['run']}/"
     for job in ("score", "enrich"):
-        assert result(world, f"{job}-2024-01")["output_check"]["verdict"] == "bit for bit"
+        r = result(world, f"{job}-2024-01")
+        assert r["output_check"]["verdict"] == "bit for bit"
+        # A run's record names where its output is: what --check-only is given to check it again.
+        assert r["output"] == f"az://data/proof/{job}-2024-01/" and "check_only" not in r
+    assert json.load(open(world / "res" / "proof.json"))["check_only"] is False
     assert any("comp=list&prefix=proof%2Fenrich-2024-01%2F" in r for r in blob.requests)
     for part in data_secret_parts() + secret_parts():
         assert part not in "\n".join(said) and part not in written(world)
+
+
+# --- --check-only: the outputs a proof's jobs wrote already (work item 3.8c) --------------------
+
+def outputs(container, tables, prefix="proof/p/"):
+    """Each run's output in the container, where its job wrote it: PREFIX and the run's name."""
+    for run, table in tables.items():
+        out = container / prefix / run
+        out.mkdir(parents=True)
+        pq.write_table(table, out / "part-0.parquet")
+
+
+def check_only(world, blob, monkeypatch, *extra, jobs="score,enrich", sas=DATA_SAS):
+    """proof.py --check-only over the fake Blob, with the data's SAS in the environment. There is
+    no node: one asked, a signature made or a wait fails the test."""
+    def no_node(*a, **k):
+        raise AssertionError("--check-only asked a node")
+    monkeypatch.delenv("BENCH_KEY", raising=False)
+    monkeypatch.delenv("FUNCTIONS_SAS", raising=False)
+    monkeypatch.setenv("BENCH_SAS", sas)
+    argv = ["--check-only", "--data", "blob", "--blob-account", "acct", "--blob-container", "data",
+            "--blob-endpoint", blob.endpoint, "--blob-outputs", "proof/p/", "--jobs", jobs, "--periods", "2024-01",
+            "--references", str(world / "ref"), "--results", str(world / "res"),
+            "--work", str(world / "work")] + list(extra)
+    said = []
+    rc = proof.main(argv, transport=no_node, sign=no_node, log=said.append, sleep=no_node, clock=lambda: 0.0)
+    return rc, said
+
+
+def test_check_only_passes_on_the_outputs_a_proof_wrote(world, monkeypatch):
+    container = world / "container"
+    outputs(container, {"score-2024-01": expected("score"), "enrich-2024-01": expected("enrich")})
+    # Another proof's outputs, under another prefix, are not these.
+    outputs(container, {"score-2024-01": expected("enrich")}, prefix="proof/q/")
+    blob = FakeBlob(container, page=5)
+    try:
+        rc, said = check_only(world, blob, monkeypatch)
+    finally:
+        blob.close()
+    assert rc == 0, said
+    for job in ("score", "enrich"):
+        r = result(world, f"{job}-2024-01")
+        assert r["ok"] and r["output_check"]["verdict"] == "bit for bit"
+        assert r["output_check"]["rows_mine"] == expected(job).num_rows and r["canon"]["by"] == "canon.py"
+        # Where a run of the proof named its output, and nothing of a job: none ran.
+        assert r["output"] == f"az://data/proof/p/{job}-2024-01/" and r["check_only"] and r["data"] == "blob"
+        assert not {"job_id", "state", "exit", "times", "events_by"} & set(r)
+    s = json.load(open(world / "res" / "proof.json"))
+    assert s["ok"] and s["check_only"] and s["node"] is None and s["events"] is None
+    assert [(x["id"], x["ok"], x["verdict"]) for x in s["runs"]] == [
+        ("score-2024-01", True, "bit for bit"), ("enrich-2024-01", True, "bit for bit")]
+    # Each output is fetched as a run fetches it: List Blobs under PREFIX and RUN/, then its blob.
+    lists = [r for r in blob.requests if "comp=list" in r]
+    assert [r.split("prefix=")[1].split("&")[0] for r in lists] == ["proof%2Fp%2Fscore-2024-01%2F",
+                                                                   "proof%2Fp%2Fenrich-2024-01%2F"]
+    assert len(blob.requests) == 4 and not any("proof/q/" in r for r in blob.requests)
+    assert said[0].startswith("proof: check only: the outputs under az://data/proof/p/ against the references in ")
+    assert "score-2024-01: pass: bit for bit" in said[1] and "bit for bit" in said[-1]
+    assert not os.listdir(world / "work")
+    for part in data_secret_parts():
+        assert part not in "\n".join(said) and part not in written(world)
+
+
+def test_check_only_fails_when_an_output_is_missing(world, monkeypatch):
+    container = world / "container"
+    outputs(container, {"score-2024-01": expected("score")})
+    blob = FakeBlob(container, page=5)
+    try:
+        rc, said = check_only(world, blob, monkeypatch)
+    finally:
+        blob.close()
+    assert rc == 1
+    assert result(world, "score-2024-01")["ok"]
+    r = result(world, "enrich-2024-01")
+    assert not r["ok"] and r["output_check"] == {"ok": False, "verdict": "no canonical form: no output files"}
+    s = json.load(open(world / "res" / "proof.json"))
+    assert not s["ok"] and [x["ok"] for x in s["runs"]] == [True, False]
+    assert any("enrich-2024-01: FAIL: no canonical form: no output files" in line for line in said)
+
+
+def test_check_only_fails_when_an_output_is_wrong(world, monkeypatch):
+    t = expected("enrich")
+    changed = t.set_column(t.schema.get_field_index("tip_share"), "tip_share",
+                           pa.array([None if v is None else v + 1.0 for v in t["tip_share"].to_pylist()]))
+    container = world / "container"
+    outputs(container, {"score-2024-01": expected("score"), "enrich-2024-01": changed})
+    blob = FakeBlob(container, page=5)
+    try:
+        rc, said = check_only(world, blob, monkeypatch, "--keep-output")
+    finally:
+        blob.close()
+    assert rc == 1
+    assert result(world, "score-2024-01")["ok"]
+    r = result(world, "enrich-2024-01")
+    assert not r["ok"] and r["output_check"]["verdict"] == "DIFFERS" and r["output_check"]["rows"]
+    assert not json.load(open(world / "res" / "proof.json"))["ok"]
+    assert any("enrich-2024-01: FAIL: DIFFERS" in line for line in said)
+    # The output that differs is kept where it was fetched to, as a run keeps it.
+    assert os.listdir(world / "work" / "enrich-2024-01") == ["part-0.parquet"]
+
+
+def test_check_only_with_an_output_that_cannot_be_fetched_fails_and_says_why(world, monkeypatch):
+    """A store that refuses the SAS (one past its time, say) fails the run, without the SAS."""
+    container = world / "container"
+    outputs(container, {"score-2024-01": expected("score")})
+    blob = FakeBlob(container, page=5)
+    refused = DATA_SAS.replace("sp=racwl", "sp=r")
+    try:
+        rc, said = check_only(world, blob, monkeypatch, jobs="score", sas=refused)
+    finally:
+        blob.close()
+    r = result(world, "score-2024-01")
+    assert rc == 1 and not r["ok"] and r["output_check"]["verdict"].startswith("output not fetched: ")
+    assert "403" in r["output_check"]["verdict"]
+    for part in (refused, DATA_SIG, "DATAdataDATAdata+data/data="):
+        assert part not in "\n".join(said) and part not in written(world)
+
+
+@pytest.mark.skipif(not (GATE and os.path.isdir(os.path.join(NYC, "out066"))),
+                    reason="GATE_CANON and 0.6.6's January outputs (references.py --keep-output) under BENCH_NYC")
+def test_check_only_with_gate_canon_passes_on_0_6_6_s_own_january_outputs(tmp_path, monkeypatch):
+    """As the PM runs it after a proof: the four jobs' outputs fetched from Blob with the SAS and
+    checked by gate-canon against 0.6.6's references. The container here is the references'
+    directory, its `out066/` standing for the proof's prefix."""
+    blob = FakeBlob(NYC, page=3)
+    monkeypatch.delenv("BENCH_KEY", raising=False)
+    monkeypatch.setenv("BENCH_SAS", DATA_SAS)
+    said = []
+    try:
+        rc = proof.main(["--check-only", "--data", "blob", "--blob-account", "acct", "--blob-container", "data",
+                         "--blob-endpoint", blob.endpoint, "--blob-outputs", "out066/", "--periods", "2024-01",
+                         "--references", NYC, "--gate-canon", GATE, "--results", str(tmp_path / "res"),
+                         "--work", str(tmp_path / "work")], log=said.append)
+    finally:
+        blob.close()
+    assert rc == 0, said
+    s = json.load(open(tmp_path / "res" / "proof.json"))
+    assert [(x["id"], x["verdict"]) for x in s["runs"]] == [(f"{job}-2024-01", "bit for bit") for job in proof.JOBS]
+    assert result(tmp_path, "score-2024-01")["canon"]["by"] == "gate-canon"
+
+
+def test_what_check_only_needs_and_what_a_proof_against_a_node_needs(tmp_path):
+    only = ["--check-only", "--data", "blob", "--blob-account", "acct", "--blob-container", "data",
+            "--jobs", "score", "--periods", "2024-01"]
+    # The prefix the outputs are under: a time of now names none.
+    with pytest.raises(SystemExit, match="--check-only needs --data blob and --blob-outputs"):
+        proof.parse(only)
+    # A sink volume holds its last run's output alone.
+    with pytest.raises(SystemExit, match="--check-only needs --data blob and --blob-outputs"):
+        proof.parse(["--check-only", "--data", "volume", "--blob-outputs", "proof/p/"])
+    a = proof.parse(only + ["--blob-outputs", "proof/p/"])
+    assert a.check_only and a.blob_outputs == "proof/p/" and (a.url, a.pin, a.function_key) == (None, None, None)
+    # The year's check needs gate-canon, as in a proof.
+    with pytest.raises(SystemExit, match="needs --gate-canon"):
+        proof.parse(only + ["--blob-outputs", "proof/p/", "--periods", "2024"])
+    # A proof against a node still needs the node and the functions, each named when it is missing.
+    argv = args(tmp_path)
+    for name in ("--url", "--function-base"):
+        at = argv.index(name)
+        with pytest.raises(SystemExit, match=f"proof.py: {name} must be given"):
+            proof.parse(argv[:at] + argv[at + 2:])
+    with pytest.raises(SystemExit, match="--url, --pin, --function-key, --functions, --function-base must be given"):
+        proof.parse(["--data", "blob"])
+    # Its outputs go under proof/ and the time it started, when no prefix is given.
+    a = proof.parse(argv)
+    assert not a.check_only and a.blob_outputs.startswith("proof/2") and a.blob_outputs.endswith("/")
+    assert proof.parse(argv + ["--blob-outputs", "proof/mine/"]).blob_outputs == "proof/mine/"
