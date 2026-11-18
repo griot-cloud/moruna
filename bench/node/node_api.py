@@ -125,7 +125,7 @@ class Https:
         self.host, self.port = parts.hostname, parts.port or 443
         self.pin, self.timeout = pin.lower(), timeout
 
-    def __call__(self, method, path, body=None, token=None):
+    def _connect(self):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -135,14 +135,43 @@ class Https:
             der = conn.sock.getpeercert(binary_form=True)
             if hashlib.sha256(der).hexdigest() != self.pin:
                 raise ConnectionError(f"the node's certificate is not the pinned one ({self.pin})")
-            headers = {"Authorization": f"Bearer {token}"} if token else {}
-            data = None
-            if body is not None:
-                data = json.dumps(body).encode()
-                headers["Content-Type"] = "application/json"
-            conn.request(method, path, body=data, headers=headers)
-            r = conn.getresponse()
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+
+    @staticmethod
+    def _request(conn, method, path, body, token):
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        conn.request(method, path, body=data, headers=headers)
+        return conn.getresponse()
+
+    def __call__(self, method, path, body=None, token=None):
+        conn = self._connect()
+        try:
+            r = self._request(conn, method, path, body, token)
             return r.status, r.read()
+        finally:
+            conn.close()
+
+    def stream(self, method, path, token=None):
+        """A streamed answer (Server-Sent Events) line by line, as it comes. A status other than
+        200 is an `ApiError`; a connection that ends early raises what ended it (`OSError`,
+        `http.client.HTTPException`, a read that timed out), for the caller to resume from."""
+        conn = self._connect()
+        try:
+            r = self._request(conn, method, path, None, token)
+            if r.status != 200:
+                raise ApiError(f"{method} {path}: {r.status} {r.read()[:300]!r}")
+            while True:
+                line = r.readline()
+                if not line:
+                    return
+                yield line.decode(errors="replace").rstrip("\r\n")
         finally:
             conn.close()
 
