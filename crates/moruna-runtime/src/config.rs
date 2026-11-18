@@ -32,8 +32,6 @@ pub const FREEZE_MORSELS: u32 = 100;
 pub const READAHEAD_SPLITS: u16 = 2;
 /// `reactor.threads`.
 pub const REACTOR_THREADS: usize = 2;
-/// `reactor.object_concurrency`.
-pub const REACTOR_OBJECT_CONCURRENCY: usize = 8;
 /// `reactor.file_depth`.
 pub const REACTOR_FILE_DEPTH: usize = 32;
 /// `trace.channel_capacity`.
@@ -68,6 +66,7 @@ pub fn resolved(
     checkpoint_enabled: bool,
     checkpoint_interval_ms: u64,
     policy: &str,
+    object_io: moruna_reactor::ObjectIo,
 ) -> serde_json::Value {
     serde_json::json!({
         "scheduler.policy": policy,
@@ -88,7 +87,8 @@ pub fn resolved(
         "workers.max": workers_max,
         "readahead.splits": read_ahead,
         "reactor.threads": REACTOR_THREADS,
-        "reactor.object_concurrency": REACTOR_OBJECT_CONCURRENCY,
+        "reactor.object_concurrency": object_io.requests,
+        "reactor.object_part_bytes": object_io.part_bytes,
         "reactor.file_depth": REACTOR_FILE_DEPTH,
         "trace.channel_capacity": TRACE_CHANNEL_CAPACITY,
         "trace.memory_limit": TRACE_MEMORY_LIMIT,

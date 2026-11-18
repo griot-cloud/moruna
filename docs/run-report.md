@@ -9,6 +9,7 @@ Every job produces a run report, computed from a record Moruna keeps of every mo
 `3.1` adds, to `3.0`:
 
 - `budget`, the job's whole memory budget.
+- `object_io`, what the budget let the object stores have in flight.
 
 In `3.0` a sink's `excluded_rows` is gone, and `io` and a source's or a sink's task give reads, decodes, encodes and writes apart. `2.1` added `execution_fingerprint`; in `2.0`, `tasks` holds every figure of a task, and the `stages` of schema 1 are gone.
 
@@ -46,6 +47,7 @@ The trace's own fields follow the same rule: a field it measures in seconds, nan
 | `args` | The run's argument values, by name. |
 | `host` | Where it ran: `platform` (`os/arch`), `cpus`, `memory_limit_bytes`, `cpu_quota_cores`, `limits_source` and `devices`. |
 | `budget` | `memory_bytes`, the job's whole memory budget: the spec's `budget.memory_bytes`, or on a node the node's job bound when the spec names none; `null` when there is none. On a node the engine runs within the arena's share of it, which `host.memory_limit_bytes` says. Added in schema 3.1. |
+| `object_io` | What the budget let the object stores have in flight: `room_bytes`, the arena's bytes in flight (half the arena); `requests`, the requests to the stores at once, that room over S3's least part of 5 MiB, at least one and at most the job's 64 sockets; and `part_bytes`, each request's share of the room, at least 5 MiB, which a write larger than one part is cut in. Absent when the run was given a reactor of its own. Added in schema 3.1. |
 | `exit` | `code`, `status` (`"completed"`, `"terminated"`, `"cancelled"`, or `"refused"` when the document, its budget or its resume was refused before the run started) and `diagnostic`, the reason the job stopped. A run refused before it started has no trace: its document has its identity, `exit`, `notes`, `args`, `plan` and each task `skipped`. |
 | `tasks` | One entry per task, in the spec's order; see below. |
 | `resources` | `cpu_core_s`, `peak_memory_bytes` (the whole process's) and `memory_basis`, how it was measured. |

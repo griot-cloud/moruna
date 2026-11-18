@@ -695,20 +695,20 @@ async fn run_read_object(inner: Arc<Inner>, op: ReadObjectOp, _permit: OwnedSema
         inner.resolve(tx, Err(MorunaError::Cancelled));
         return;
     }
-    let mut dst = dst;
-    let result = read_object_body(&inner, &url, offset, &mut dst).await;
-    match result {
-        Ok(()) => inner.resolve(tx, Ok(dst)),
+    match read_object_body(&inner, &url, offset, dst).await {
+        Ok(dst) => inner.resolve(tx, Ok(dst)),
         Err(e) => inner.resolve(tx, Err(e)),
     }
 }
 
+/// The range into `dst`, the arena buffer the caller charged for it, piece by piece as the body
+/// arrives (3A, 3.5b): nothing of the range is held outside the arena but the piece on its way in.
 async fn read_object_body(
     inner: &Arc<Inner>,
     url: &str,
     offset: u64,
-    dst: &mut Buffer,
-) -> Result<()> {
+    dst: Buffer,
+) -> Result<Buffer> {
     let len = dst.len();
     if dst.host_ptr().is_none() {
         return Err(MorunaError::Staging(format!(
@@ -718,34 +718,33 @@ async fn read_object_body(
     }
     let (backend, path) = inner.objects.resolve(url)?;
     let range = offset..offset + len as u64;
-    let mut body = backend.get_range(&path, range.clone()).await;
-    if let Err(e) = &body {
-        // f.3: one reactor-level retry on a connection reset, above the object_store crate's
-        // own backoff.
-        if crate::object::is_transport_error(e) {
-            inner.counters.note_fallback();
-            inner.counters.warn_fallback(
-                OpKind::ReadObject,
-                crate::paths::P_OBJECT,
-                &e.to_string(),
-            );
-            body = backend.get_range(&path, range).await;
-        }
+    let (mut dst, mut outcome) = backend.read_range(&path, range.clone(), dst).await;
+    // f.3: one reactor-level retry on a connection reset, above the object_store crate's own
+    // backoff. The retry reads the whole range into the same buffer again.
+    let reset = match &outcome {
+        Err(e) if crate::object::is_transport_error(e) => Some(e.to_string()),
+        _ => None,
+    };
+    if let Some(reset) = reset
+        && let Some(again) = dst.take()
+    {
+        inner.counters.note_fallback();
+        inner
+            .counters
+            .warn_fallback(OpKind::ReadObject, crate::paths::P_OBJECT, &reset);
+        (dst, outcome) = backend.read_range(&path, range, again).await;
     }
-    let bytes = body.map_err(|e| crate::object::io("read_object", url, &e))?;
-    if bytes.len() != len {
-        return Err(MorunaError::Io {
-            op: "read_object",
-            target: url.to_string(),
-            msg: format!("short read: {} of {len} bytes", bytes.len()),
-        });
-    }
-    // The ingress copy (b): out of the network library's buffer into the arena. It is the one
+    outcome.map_err(|e| crate::object::io("read_object", url, &e))?;
+    let dst = dst.ok_or_else(|| MorunaError::Io {
+        op: "read_object",
+        target: url.to_string(),
+        msg: "the read's buffer did not come back".into(),
+    })?;
+    // The ingress copy (b): out of the network library's pieces into the arena. It is the one
     // copy on this path and it is counted apart from payload copies (G-I2).
-    dst.as_mut().copy_from_slice(&bytes);
     inner.counters.note_object_read(len as u64);
     inner.counters.note_ingress(len as u64);
-    Ok(())
+    Ok(dst)
 }
 
 async fn run_write_object(inner: Arc<Inner>, op: WriteObjectOp, _permit: OwnedSemaphorePermit) {

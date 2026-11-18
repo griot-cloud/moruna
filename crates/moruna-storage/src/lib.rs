@@ -5,6 +5,7 @@
 
 pub mod artifact;
 pub mod blocks;
+pub mod body;
 pub mod bucket;
 pub mod cache;
 pub mod checkpoint;

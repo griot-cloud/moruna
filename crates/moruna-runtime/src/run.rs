@@ -433,15 +433,23 @@ fn drive(
         }
     };
 
-    // 3. Reactor.
+    // 3. Reactor. What the object stores may have in flight is the budget's (3A, 3.5b): the
+    // arena's room for bytes in flight, shared by requests of at least S3's least part.
+    let object_io = object_io_for(arena_bytes, &mut notes);
+    let mut object_io_built = None;
     let (reactor, object_metadata): (Arc<dyn Reactor>, Option<Arc<dyn ObjectMetadata>>) =
         match components.reactor {
             Some(reactor) => (reactor, components.object_metadata),
             None => {
+                object_io_built = Some(moruna_trace::ObjectIoReport {
+                    room_bytes: object_room(arena_bytes),
+                    requests: object_io.requests as u64,
+                    part_bytes: object_io.part_bytes,
+                });
                 let built = moruna_reactor::Reactor::new(
                     ReactorConfig {
                         threads: config::REACTOR_THREADS,
-                        object_concurrency: config::REACTOR_OBJECT_CONCURRENCY,
+                        object_io,
                         file_depth: config::REACTOR_FILE_DEPTH,
                         page_bytes: limits.page_bytes,
                         profile: discovered.profile.clone(),
@@ -754,6 +762,7 @@ fn drive(
                                 checkpoint_enabled,
                                 checkpoint_interval_ms,
                                 &policy,
+                                object_io,
                             ),
                             spec_digest.as_deref(),
                         ),
@@ -1180,6 +1189,7 @@ fn drive(
             moruna_trace::BufferReport::of(engine.eviction_order(), &engine.catalog_stats())
         }),
         io,
+        object_io: object_io_built,
     });
     let view = view.ok_or_else(|| {
         RunError::bare(MorunaError::Io {
@@ -1535,6 +1545,34 @@ fn arena_host_bytes(
 /// the workers hold and one for the queues and the read-ahead behind them, so a byte in flight
 /// costs the arena two.
 const ARENA_INFLIGHT_COST: f64 = 2.0;
+
+/// The bytes an arena of `arena_bytes` may have in flight: half of it, a byte in flight costing
+/// the arena two (`ARENA_INFLIGHT_COST`). The object stores' requests share it (3A, 3.5b).
+pub(crate) fn object_room(arena_bytes: u64) -> u64 {
+    (arena_bytes as f64 / ARENA_INFLIGHT_COST) as u64
+}
+
+/// What the budget lets the object stores have in flight (3A, item 3.5b), derived and never set:
+/// N requests at once is the arena's room over S3's least part, at least one and at most the
+/// job's socket budget (3D: `moruna_storage::net::SOCKETS`, the engine's copy of the node's
+/// `egress::SOCKETS`), and each request's part is the room over N, at least S3's least part. A
+/// range a request reads lands in the arena buffer charged for it and a part it writes is a view
+/// of the sink's, so a request holds outside the arena only the piece on its way. Named in
+/// `notes`, and in the report's `object_io`.
+fn object_io_for(arena_bytes: u64, notes: &mut Vec<String>) -> moruna_reactor::ObjectIo {
+    let room = object_room(arena_bytes);
+    let io = moruna_reactor::ObjectIo::for_room(room, moruna_storage::net::SOCKETS);
+    notes.push(format!(
+        "object stores: {} requests at once in parts of {} bytes: the {room} bytes the \
+         {arena_bytes} byte arena has in flight over S3's least part of {} bytes, at most the \
+         job's {} sockets",
+        io.requests,
+        io.part_bytes,
+        moruna_reactor::S3_PART_MIN_BYTES,
+        moruna_storage::net::SOCKETS,
+    ));
+    io
+}
 
 /// The out-of-arena amplification assumed for a kernel that declares none: the same figure the
 /// controller seeds `a_anon` with before its probe speaks (11 f.3), so the arena is sized against
@@ -2093,6 +2131,63 @@ mod tests {
             Arc::new(FakeKernel::new().amplification(6.0)),
         ];
         assert_eq!(expected_out_of_arena_amplification(&mixed), 6.0);
+    }
+
+    /// What a job's budget lets the object stores have in flight (3A, 3.5b), derived from the
+    /// budget through the node's split (`host::node::sizes`) and the arena sizing of a copy, at
+    /// two budgets: 3.5's lock turn's, a 2 GiB node's `job_memory_bytes` of 590,237,696 bytes
+    /// (ceiling 342,016,000, arena 201,457,664, as its report said); and a 16 GiB node's job
+    /// bound of 14,360 MiB (`kernel/node/core`'s `the_cloud_profile_fits_on_2_8_and_16_gib_nodes`).
+    /// At the small one N is the room over S3's least part and each part a little over it; at
+    /// the large one N reaches the job's socket budget and the parts grow with the room.
+    #[test]
+    fn a_jobs_budget_sets_the_object_stores_requests_and_parts() {
+        const MIB: u64 = 1 << 20;
+        let copy = |baseline: u64| Sizing {
+            baseline,
+            kernel_state: 0,
+            out_of_arena: COPY_OUT_OF_ARENA_AMPLIFICATION,
+            page_bytes: 4096,
+            queues: 2,
+        };
+        let arena_of = |job: u64| {
+            let ceiling = crate::host::node::sizes(job, false).arena;
+            (ceiling, copy(5_530_736).divide(ceiling, &mut Vec::new()))
+        };
+
+        let (ceiling, arena) = arena_of(590_237_696);
+        assert_eq!(
+            (ceiling, arena),
+            (342_016_000, 201_457_664),
+            "3.5's run, as reported"
+        );
+        let mut notes = Vec::new();
+        let small = object_io_for(arena, &mut notes);
+        assert_eq!(object_room(arena), 100_728_832);
+        assert_eq!(small.requests, 19, "the room over S3's least part");
+        assert_eq!(small.part_bytes, 100_728_832 / 19);
+        assert!(small.part_bytes >= moruna_reactor::S3_PART_MIN_BYTES);
+        assert!(
+            notes[0].starts_with("object stores: 19 requests at once in parts of 5301517 bytes"),
+            "{notes:?}"
+        );
+        // The month's files of about 3 MB are each one put; a 64 MiB file is parts of the share.
+        assert!(small.single_put(3_000_000));
+        assert_eq!(small.part_for(64 * MIB), 5_301_517);
+        assert_eq!(small.parts_in_flight(64 * MIB), 13);
+
+        let (_, arena) = arena_of(14_360 * MIB);
+        let large = object_io_for(arena, &mut Vec::new());
+        assert_eq!(
+            large.requests,
+            moruna_storage::net::SOCKETS,
+            "a 16 GiB node's job reaches the socket budget"
+        );
+        assert_eq!(large.part_bytes, object_room(arena) / 64);
+        assert_eq!(
+            large.part_bytes, 52_435_968,
+            "the parts grow with the room: about ten times the small budget's"
+        );
     }
 
     fn sizing() -> Sizing {

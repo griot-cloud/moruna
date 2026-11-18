@@ -12,7 +12,8 @@ Every field of the document is an attribute: ``schema_version`` (``"MAJOR.MINOR"
 refuses a major it does not know); ``moruna``, ``host`` and ``args`` (what ran it, where, and the
 run's argument values); ``budget`` (``memory_bytes``, the job's whole memory budget: the spec's,
 or on a node the node's job bound when the spec names none; ``None`` when there is none);
-``run_id``; ``job_digest`` (the spec's public digest, SHA-256 of its exact
+``object_io`` (what the budget let the object stores have in flight: ``room_bytes``, ``requests``
+and ``part_bytes``; absent when the run was given a reactor of its own); ``run_id``; ``job_digest`` (the spec's public digest, SHA-256 of its exact
 bytes as ``JobSpec.digest()`` gives it, or ``None`` for a job that holds a task a spec cannot
 hold); ``execution_fingerprint`` (the normalized planning and recovery identity, which differs
 from ``job_digest``; ``None`` for a run refused before its job was built); ``exit`` (``code``, ``status`` and ``diagnostic``); ``tasks``

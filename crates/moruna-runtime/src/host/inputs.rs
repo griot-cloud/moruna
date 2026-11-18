@@ -388,8 +388,9 @@ pub fn object_store_of(doc: &moruna_job::ObjectStoreDoc) -> moruna_reactor::Obje
 pub fn fetcher(
     store: moruna_reactor::ObjectStoreConfig,
 ) -> Result<(Arc<moruna_reactor::Reactor>, Arc<dyn Allocator>), String> {
+    let host_bytes = (4 * CHUNK_BYTES) as u64;
     let arena = moruna_arena::Arena::new(moruna_arena::ArenaConfig {
-        host_bytes: (4 * CHUNK_BYTES) as u64,
+        host_bytes,
         ..moruna_arena::ArenaConfig::default()
     })
     .map_err(|e| format!("the staging arena: {e}"))?;
@@ -397,6 +398,11 @@ pub fn fetcher(
     let reactor = moruna_reactor::Reactor::new(
         moruna_reactor::ReactorConfig {
             object_store: store,
+            // What its own arena lets it have in flight, as a run's does (3A, 3.5b).
+            object_io: moruna_reactor::ObjectIo::for_room(
+                crate::run::object_room(host_bytes),
+                moruna_storage::net::SOCKETS,
+            ),
             ..moruna_reactor::ReactorConfig::default()
         },
         alloc.clone(),

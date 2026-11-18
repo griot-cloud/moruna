@@ -60,7 +60,7 @@ It refuses to know: what a file contains; which morsel a buffer belongs to; when
 ```rust
 pub struct ReactorConfig {
     pub threads: usize,                       // reactor.threads
-    pub object_concurrency: usize,            // reactor.object_concurrency
+    pub object_io: ObjectIo,                  // reactor.object_concurrency (N) and the part, from the budget (3.5b)
     pub file_depth: usize,                    // reactor.file_depth
     pub page_bytes: usize,
     pub profile: HostProfile,                 // all fields resolved (DS-I6): Present, Absent or Probed(_)
@@ -178,9 +178,9 @@ An operation is direct-eligible iff `buffer.host_ptr() % page_bytes == 0`, `offs
 
 **f.2 `read_file` (blocking pool).** `spawn_blocking(|| pread(fd, ptr, len, offset))` in a loop until `len` bytes or EOF; direct flag as in e.3; `write_file` uses `pwrite` the same way.
 
-**f.3 `read_object`.** On a reactor thread, acquire a permit from the object semaphore; `object_store.get_range(path, offset..offset+len)`; stream the body into the buffer with a bounded number of chunks in flight; count `ingress_bytes`; release the permit. Retries are the object_store crate's (exponential backoff, 3 attempts) plus one reactor-level retry on connection reset; then `Io`. The client for a URL's scheme and bucket is built once from `ObjectStoreConfig` and cached; an unknown scheme or a backend with no configuration is `Config { name: "object_store" }`.
+**f.3 `read_object`.** On a reactor thread, acquire a permit from the object semaphore; a ranged `get_opts(path, offset..offset+len)` whose answer must be exactly that range; copy the body into the buffer piece by piece as it arrives (`moruna_storage::body::read_range_into`; a local store's file is read straight into it), so the read holds outside the arena only the piece on its way in, never the range (3A, item 3.5b, RE-T23); a body short or long of the range is `Io`; count `ingress_bytes`; release the permit. Until 3.5b the body was collected whole by `get_range` and then copied, so a read held its range twice. Retries are the object_store crate's (exponential backoff, 3 attempts) plus one reactor-level retry on connection reset, which reads the range into the same buffer again; then `Io`. The client for a URL's scheme and bucket is built once from `ObjectStoreConfig` and cached; an unknown scheme or a backend with no configuration is `Config { name: "object_store" }`.
 
-**f.4 `write_object(url, src: BufferView)`.** For `src.len() ≤ 64 MiB`, including zero (an empty object, h), single `put` of a `Bytes` built over the view without copying (`Bytes::from_owner(view)`; the view's owner keeps the arena bytes alive); larger, multipart with 16 MiB parts (each part a `slice` of the view), at most 4 parts in flight; on failure abort the multipart upload and resolve the error; the view is dropped and the caller's bytes are untouched (RE-I1).
+**f.4 `write_object(url, src: BufferView)`.** The budget cuts it (`ObjectIo`, item 3.5b): an object of one part, including zero bytes (an empty object, h), is a single `put` of a `Bytes` built over the view without copying (`Bytes::from_owner(view)`; the view's owner keeps the arena bytes alive); a larger one is a multipart upload in parts of `ObjectIo::part_for(len)` (each part a `slice` of the view), at most `ObjectIo::parts_in_flight(len)` in flight; on failure abort the multipart upload and resolve the error; the view is dropped and the caller's bytes are untouched (RE-I1). `ObjectIo` is derived by the facade from the arena, never set: N requests at once is the arena's room for bytes in flight (half the arena) over S3's least part (5 MiB), at least one and at most the job's socket budget (3D, `moruna_storage::net::SOCKETS`); the part is the room over N, at least 5 MiB, raised so an object fits S3's 10,000 parts and capped at the object. The report's `object_io` and the run's notes give both. Until 3.5b they were constants: 8 requests, 16 MiB parts, 4 in flight, one `put` up to 64 MiB.
 
 **f.4a `delete_object(url)` and `abort_multipart(url, upload_id)`.** The two removal calls contracts d.9 added on 2026-09-22 for a sink's resume (08 f.8). Each has a submission queue of its own and takes an object permit, like every other object operation. A delete is `object_store`'s `delete`, and an object that is not there is `Ok(())`: a resume that runs twice must not fail the second time. An abort reaches the upload through the crate's `MultipartStore`, which is the same client under a second trait and the only route to an upload this process did not start (`MultipartUpload`, what `put_multipart` returns, can abort only the upload it holds and does not survive a crash); an upload the store no longer knows is `Ok(())` for the same reason. A `file://` url is a `LocalFileSystem`, which has no multipart uploads at all, so an abort on one is `Unsupported` rather than a silent success; a delete on one unlinks the file. Neither call is on the payload path, so neither counts bytes.
 
@@ -253,13 +253,13 @@ Tests use the real reactor over `FakeAllocator` buffers (testkit, contracts d.15
 
 **RE-T5 copy_is_dma.** (reference host, E1; `cuda`, skipped and listed without a device) Host→device copy of 1 GiB from a pinned `FakeAllocator` view; worker CPU time under 1% of wall; bytes equal after round trip; with `pinned(false)` the same copy succeeds through the bounce buffer and counts `fallbacks` and `bounce_bytes`. RE-I5, S14.
 
-**RE-T6 concurrency_bound.** 1,000 object reads with `object_concurrency = 4`; the test-local backend wrapper never sees more than 4 in flight; all 1,000 calls return before the first completes. RE-I6.
+**RE-T6 concurrency_bound.** 1,000 object reads with `object_io.requests = 4`; the test-local backend wrapper never sees more than 4 in flight; all 1,000 calls return before the first completes. RE-I6.
 
 **RE-T7 shutdown_completes.** Issue 100 slow operations, `shutdown`; all completions resolve within 5 s; a second `shutdown` returns at once; a `read_file` after `shutdown` resolves `Cancelled`; every cached fd and registered descriptor is closed (`/proc/self/fd` count returns to the pre-test value). RE-I7.
 
 **RE-T8 short_read.** Read past EOF errors for `read_file` and `read_file_opt(.., false)`; `read_file_opt(.., true)` returns the short length, and 0 at an offset past the end. f.1.
 
-**RE-T9 multipart.** 200 MiB `write_object` from a view uses multipart with 16 MiB parts; failure of part 5 aborts the upload (the test-local wrapper asserts `abort_multipart` was called), the completion resolves the error, and the source bytes are unchanged and still owned by the test. f.4, RE-I1.
+**RE-T9 multipart.** 200 MiB `write_object` from a view, with parts of 16 MiB, uses multipart; failure of part 5 aborts the upload (the test-local wrapper asserts `abort_multipart` was called), the completion resolves the error, and the source bytes are unchanged and still owned by the test. f.4, RE-I1.
 
 **RE-T10 uring_vs_blocking_equivalence.** Same operations through both paths produce identical bytes. e.2.
 
@@ -274,6 +274,8 @@ Tests use the real reactor over `FakeAllocator` buffers (testkit, contracts d.15
 **RE-T15 probed_versus_present.** A profile with `io_uring = Present` and a seccomp shim that fails `io_uring_setup` makes `new` return `Config`; with `Probed(true)` and the same shim, `new` succeeds with `io_uring == false` in `IoPaths` and a note; with `Probed(false)` the ring is never attempted. RE-I3, e.2.
 
 **RE-T16 zero_length_object_write.** A zero-length `write_object` to the in-memory store resolves `Ok` on a reactor thread and `head_object` then reports the object with size 0; under a `file://` URL with `local_root` set, it creates an empty file, and over an existing 32-byte file it leaves an empty one. The four other zero-length operations still resolve at once on the caller's thread (h). f.4, h.
+
+**RE-T23 object_read_heap.** Ranges of 4, 16 and 64 MiB of a `file://` object read through the real store backend, each into an arena that holds exactly that range, hold no more than 1 MiB outside the arena, counted by the test binary's own global allocator (item 3.5b; before the fix each held its whole range). f.3.
 
 ## l. Implementation notes for the agent
 
