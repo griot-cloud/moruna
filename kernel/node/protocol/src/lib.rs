@@ -115,7 +115,7 @@ moruna_svc::protocol! {
     pub protocol admission {
         name = "moruna.node.admission";
         major = 1;
-        minor = 1;
+        minor = 2;
         requests {
             /// Launch one engine; names and grants correspond exactly. Config is
             /// the existing KD2 engine configuration; names cannot shadow reserved
@@ -140,6 +140,10 @@ moruna_svc::protocol! {
             /// account, so that it runs beside a job. One check at a time: `Limit` until the
             /// last one is released. Status, cancel, wait and release take its id as a job's.
             6 => fn check(config: Handle, names: Vec<String>, grants: Vec<Handle>, services: Vec<String>) -> u64;
+            /// The most a job's budget may be: `budget_max` of the server's own account, which
+            /// `api` reports as the node's `job_memory_bytes` and starts every engine with.
+            /// `Unavailable` when the server has no account of its own.
+            7 since 2 => fn bound() -> u64;
         }
         events {}
         errors {

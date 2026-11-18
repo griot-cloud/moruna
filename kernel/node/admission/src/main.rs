@@ -241,8 +241,20 @@ impl Handler for Session {
     fn handle(&mut self, cx: &mut Context<'_>, ordinal: u16, d: &mut Decoder<'_>) -> Outcome {
         let owner = cx.connection();
         self.owner = Some(owner);
-        if !(1..=6).contains(&ordinal) {
+        if !(1..=7).contains(&ordinal) {
             return Outcome::Status(Status::UnknownMethod);
+        }
+        if ordinal == 7 {
+            if args::<()>(d).is_none() {
+                return Outcome::Status(Status::BadMessage);
+            }
+            // The job bound (system design 3A): this server's account less the check account
+            // and its own.
+            let state = self.shared.borrow();
+            return match state.own.as_ref().and_then(|own| own.usage().ok()) {
+                Some(usage) => Outcome::reply(node_protocol::budget_max(usage.limit)),
+                None => failure(admission::Error::Unavailable),
+            };
         }
         if ordinal == 6 {
             let Some((config, names, grants, services)) =
@@ -398,7 +410,9 @@ fn duplicate(account: &Account) -> Result<Handle, admission::Error> {
         .map_err(|_| admission::Error::Unavailable)
 }
 
-struct ControlSession(Rc<RefCell<Shared>>, Rc<authority::Authority>);
+/// The control channel's session; the storage authority is `None` on a node that serves `api`
+/// with no storage (system design 3A: jobs reach data through volumes and the network).
+struct ControlSession(Rc<RefCell<Shared>>, Option<Rc<authority::Authority>>);
 impl Handler for ControlSession {
     fn protocol(&self) -> ProtocolId {
         node_protocol::control::ID
@@ -408,9 +422,9 @@ impl Handler for ControlSession {
             let Some(id) = args::<u64>(d) else {
                 return Outcome::Status(Status::BadMessage);
             };
-            return match self.1.revoke(id) {
-                Ok(()) => Outcome::reply(()),
-                Err(()) => Outcome::Failure(1),
+            return match self.1.as_ref().map(|authority| authority.revoke(id)) {
+                Some(Ok(())) => Outcome::reply(()),
+                _ => Outcome::Failure(1),
             };
         }
         if ordinal != 1 {
@@ -591,20 +605,49 @@ fn run() -> i64 {
         check_account,
         check: None,
     }));
-    let Some(policy) = start::take("storage.grants") else {
-        return 1;
-    };
-    let (authority_channel, authority_kind) = match (
+    // API mode: the server serves `api` and runs no initial job (system design 3A). The
+    // services it lends each job's engine are its `linux` and `network` slots, and it needs no
+    // storage: a cloud node's jobs reach data through volumes and the network.
+    let api_mode = listener.is_some() && initial.is_none();
+    if api_mode {
+        for slot in ["linux", "network"] {
+            if let Some(handle) = start::take(slot) {
+                if handle.info().ok().map(|i| i.0) != Some(ObjectType::Channel) {
+                    return 1;
+                }
+                shared
+                    .borrow_mut()
+                    .backends
+                    .insert(String::from(slot), Channel(handle));
+            }
+        }
+    }
+    let policy = start::take("storage.grants");
+    let channels = (
         start::take("storage.authority"),
         start::take("local-home.authority"),
-    ) {
-        (Some(channel), None) => (Channel(channel), "home"),
-        (None, Some(channel)) => (Channel(channel), "local-home"),
+    );
+    let storage = match (policy, channels) {
+        (None, (None, None)) if api_mode => None,
+        (Some(policy), (Some(channel), None)) => Some((policy, Channel(channel), "home")),
+        (Some(policy), (None, Some(channel))) => Some((policy, Channel(channel), "local-home")),
         _ => return 1,
     };
-    let authority = match authority::Authority::load(shared.clone(), policy) {
-        Ok(authority) => authority,
-        Err(()) => return 1,
+    let (authority, masters) = match storage {
+        Some((policy, channel, kind)) => {
+            let authority = match authority::Authority::load(shared.clone(), policy) {
+                Ok(authority) => authority,
+                Err(()) => return 1,
+            };
+            let mut masters = alloc::vec![(channel, kind)];
+            for (slot, kind) in [("local.authority", "local")] {
+                if let Some(channel) = start::take(slot) {
+                    masters.push((Channel(channel), kind));
+                }
+            }
+            (Some(authority), masters)
+        }
+        None => (None, Vec::new()),
     };
     let factory = shared.clone();
     let mut dispatcher = Dispatcher::new();
@@ -624,13 +667,10 @@ fn run() -> i64 {
     {
         return 1;
     }
-    let mut masters = alloc::vec![(authority_channel, authority_kind)];
-    for (slot, kind) in [("local.authority", "local")] {
-        if let Some(channel) = start::take(slot) {
-            masters.push((Channel(channel), kind));
-        }
-    }
     for (channel, kind) in masters {
+        let Some(authority) = authority.as_ref() else {
+            return 1;
+        };
         let handler = match authority.handler(&channel, kind) {
             Ok(handler) => handler,
             Err(()) => return 1,
@@ -649,7 +689,11 @@ fn run() -> i64 {
         return 1;
     }
     if let Some(initial) = initial {
-        match initial_job(&shared, initial, &authority) {
+        // An initial job always has the storage authority: only API mode goes without.
+        let Some(authority) = authority.as_ref() else {
+            return 1;
+        };
+        match initial_job(&shared, initial, authority) {
             Ok(job) => authority.owner(job),
             Err(_) => return 1,
         }
