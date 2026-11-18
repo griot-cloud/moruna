@@ -912,12 +912,181 @@ workload. Nothing is tuned for a benchmark.
 | 6.2 | The first full run | The table of 6B, logged | 3.8, 6.1 |
 | 6.3 | Each miss, through 6C | One work item per root cause | 6.2 |
 
-## 4. Kernels and accelerators (not started)
+## 4. Kernels (Draft, Brackly approved the six 2026-11-18)
 
-The OS design's section 4 stands as written. Its system design is written after 3.8 holds on both
-clouds, as Brackly decided. It will cover the kernel contract and registry, the plane's five verbs,
-Rust GPU libraries measured per kernel, the first engine adapter (DataFusion, and so peQL), and the
-first accelerator.
+The OS design's section 4 stands. This section turns it into the first build: six kernels, the
+contract they share, and how a function calls them. The research behind it is
+`reports/Moruna kernels brief.md` (the full sources are in `reports/Moruna kernels across
+accelerators.md`).
+
+**The promise:** a function that calls Moruna kernels is never slower and often faster when the
+node's hardware changes, and it always gets the same rows. Moruna, not the function, decides where
+each call runs, and says where it ran.
+
+### 4A. The catalogue
+
+- **A kernel is identified by its namespace, name and version,** for example `moruna.expr@1`. Its
+  signature (Arrow types in and out, and its parameters) and its behaviour never change once
+  published. Any change in behaviour is a new version. Old versions stay callable.
+- **Arrow in, Arrow out, with no copy on one device** (Brackly, 2026-11-18). Every kernel's inputs
+  and outputs are Arrow arrays. A kernel reads its inputs where they lie and writes its output
+  into buffers the platform gives it, as a function does on the plane today. A chain of kernels on
+  one device passes buffers, never copies. Moving a batch between devices (the CPU's memory and a
+  GPU's) is a copy the hardware cannot avoid. The platform makes it, counts it as a transfer, puts
+  it in the call's cost (4H) and reports it (4D).
+- **Namespaces:** `moruna` for ours. A vendor or package publishes kernels in its own namespace; no
+  one adds optional behaviour to a `moruna` kernel.
+- **Every kernel has a written specification,** `crates/moruna-kernels/spec/<name>.md`. It states:
+  - the signature in Arrow types, and every parameter;
+  - what happens with nulls, overflow, rounding, ordering and empty input, with no case left to
+    the implementation;
+  - its state shape (4C);
+  - the most output an input can produce, and the state it keeps, as the OS design requires;
+  - for `mlp_forward`, the declared precision and how far a device's answer may differ.
+- **Every kernel has a CPU reference implementation,** in `crates/moruna-kernels`, under the
+  existing `Kernel` trait (`crates/moruna-kernel`). It defines the right answer. A device
+  implementation is an acceleration of it.
+- **Every kernel has a conformance corpus,** `crates/moruna-kernels/conformance/<name>/`: cases of
+  input batches, parameters and expected output, as Arrow IPC files with a small JSON index. One
+  runner, `moruna-kernels`'s conformance test, runs the corpus against every implementation the
+  build has. An implementation passes all of a version's cases or does not claim that version.
+- **The existing standard kernels stay** (`cast`, `rename`, `select`, `filter(expr)`, `fill_null`,
+  `dedupe`, `hash`, `mask`, `explode`, `concat_str`, `date_trunc`, `union`, `join`). Their small
+  filter language is replaced by `expr`'s; each existing kernel gets a specification and a corpus
+  when it is next touched.
+
+### 4B. The first six kernels
+
+| Kernel | Computes | Arrow in | Arrow out | State |
+|---|---|---|---|---|
+| `expr` | A tree of elementwise operations, evaluated in one pass | N equal-length arrays or scalars | M arrays of that length | None |
+| `filter` | The rows a Boolean array selects | A batch and a Boolean array | The compacted batch, or a UInt32 selection array | None |
+| `take` | Rows gathered by position | An index array and a values array (any type) | An array as long as the index | None; the values may be fixed at configure |
+| `group_aggregate` | Count, sum, min, max and mean per group of keys, with a dense path for a small declared key domain | Key arrays and value arrays | Key arrays and one array per aggregate | Accumulate, merge, finish |
+| `interval_coverage_count` | For each group and grid bucket, how many intervals cover it (add at start, subtract past end, running sum) | group Int32, start Int64, length Int64; the grid's step and size | (group, bucket, count UInt64) for non-zero cells, in key order | None per batch; partial results merge by addition |
+| `mlp_forward` | Dense layers (multiply, bias, activation) over a fixed-width feature vector per row | k Float columns, or one `FixedSizeList<Float>` | Float, or `FixedSizeList<Float>` | None per batch; the model is fixed at configure |
+
+- **`expr`'s vocabulary** is Arrow compute's elementwise functions: arithmetic (wrapping and
+  checked), comparison, Boolean logic with nulls, `if_else` and `case_when`, `coalesce` and
+  `fill_null`, `cast`, temporal parts, rounding (with the mode named), and unary maths. Its tree
+  uses Substrait's shape: literal, column, cast, if-then, switch, function call. It is written as
+  JSON in a job document and built by the SDKs (4D). Fusing the tree into one pass is the CPU
+  reference's job; how a device runs it is the device's.
+- **`filter` offers both outputs** and the platform chooses by density, because engines disagree
+  on which is faster and the answer depends on how many rows survive.
+- **`group_aggregate` declares its state size** from its key domain and aggregates, because that
+  one number decides whether a device helps.
+- **`interval_coverage_count`** is new to analytics engines. It replaces "expand each interval to
+  one row per bucket, then count", whose working set is many times its input.
+
+### 4C. State and lifecycle
+
+- **Four state shapes** cover every kernel: none; accumulate, merge and finish; build once and read
+  many (joins, later); per-partition ordered state (windows, later). The first six use the first
+  two. They map onto `KernelKind` and `KernelState` as they are, with `finish` for the merge.
+- **Configure is separate from process.** A kernel is configured once (`expr`'s tree, `mlp_forward`'s
+  model, `take`'s values, the grid) and then processes batches. On the plane that is `load` and
+  `submit`. Loading may be slow (a compile, a bitstream); it is paid once per configured kernel.
+- **Batch size stays out of the kernel.** A kernel accepts any length. The platform sizes batches
+  for the executor, as the OS design says.
+
+### 4D. Calling a kernel from a function
+
+A function stays the user's unit. Inside it, the author calls kernels:
+
+- **Python:** `moruna.kernels`, whose names mirror `pyarrow.compute` where they overlap, so the
+  four benchmark functions change little. Consecutive elementwise calls on the same batch are
+  captured into one `expr`.
+- **Rust:** `moruna_function::kernels`. **C:** `moruna_kernel_call` in `moruna_function.h`.
+
+**How a call is placed** (Brackly to review):
+
+- **(Recommended)** A call is a `submit` on the plane the function already speaks. The batch is
+  already in plane memory, so nothing is copied. The engine places it on an executor: the CPU
+  reference in its own worker, or a device executor. The answer comes back in plane memory. This
+  is what makes placement the platform's, and it is the same path whether the node has a GPU or
+  not.
+- **The CPU shortcut:** when the node has no executor for a kernel but the CPU, the SDK may run the
+  CPU reference in the function's own process, with no round trip. The engine tells the function
+  at configure which kernels are CPU-only on this node. Placement is reported the same way.
+
+**Every call reports where it ran:** the executor, the implementation and version, any data moved
+between devices, and why a device was not used. The job report sums them per kernel and stage. A
+fallback is never silent.
+
+### 4E. Executors and the plane
+
+The plane's five verbs (OS design 4) are the executor interface:
+
+| Verb | For kernels |
+|---|---|
+| describe | The kernels and versions it implements, its slots, its memory, the batch size it prefers |
+| load | Configure a kernel: its parameters, a model, an expression |
+| submit | Run a configured kernel on input buffers into output buffers |
+| complete | Done: status, rows out, timings, placement |
+| cancel | Stop a unit; unload a kernel |
+
+- **The first executor is the CPU,** in the engine's workers. It implements every kernel through
+  the reference implementations, so every kernel is always placeable.
+- **Batches are described by Arrow's C Device Data Interface,** as the OS design says. A batch
+  already on a device stays there for the next kernel on that device.
+- **A device executor may claim a chain of kernels** (`expr` then `filter`, for example) and run it
+  as one pass. It reports the chain as one placement with its parts named.
+
+### 4F. The first accelerator
+
+Decision 3 of the OS design ("chosen when the OS works on both clouds") is now due: the OS works
+on both. The research points to a GPU first, for `mlp_forward` and `group_aggregate`, the two of
+the six with independent evidence of gains on a device. The OS design's table puts an NVIDIA GPU
+on a Linux node first (an executor process on the host speaks the plane to the Moruna VM over shared
+memory). The choice of machine and its cost are Brackly's. Work items 4.1 to 4.8 need no device.
+
+### 4H. Cost and placement
+
+The adaptive runtime (`architecture/adaptive-runtime.md`: the cost model, warm-up, the
+observation store, and the residency-aware scheduling policies) already decides what runs next,
+where, with what memory and at what batch size, for each unit of a kernel applied to a batch. Kernel
+calls join that model; no second optimiser is built.
+
+- **A kernel's cost is per executor.** The cost model's unit becomes (kernel, version, executor):
+  time per row and per batch, peak memory, and its scaling, measured by warm-up on every executor
+  the node `describe`s, and refined by every run, as functions' are (3A, 6.3g).
+- **Moving the data is part of the cost.** The buffer catalog already knows where each batch
+  lives. Placing a call on another device adds the transfer of its inputs, and of its output if
+  the next consumer is elsewhere, at the measured rate of that link. This is why a filter on cold
+  data stays on the CPU and a network's forward pass goes to the GPU.
+- **A function's cost includes its kernel calls.** A function that calls kernels is costed as its
+  own time plus each call's cost on the executor the platform would choose. So `explain` and the
+  scheduler see the effect of a GPU on a function before it runs.
+- **Placement is the cost model's choice,** made by the scheduling policy's "where it runs"
+  decision, now across executors as well as cores. A user may pin a stage, as the OS design allows.
+
+### 4G. What must be measured
+
+No published source measures these, so the kernels' items measure them:
+
+1. `mlp_forward` on the benchmark's 23-128-128-1 network at 10^4, 10^5 and 10^6 rows (4.6, then
+   on the first device);
+2. `interval_coverage_count` against expand-and-count on real months (4.5);
+3. one fused `expr` against separate Arrow calls, and against a Python loop (4.2);
+4. `group_aggregate`'s dense path against its hash path at a 432,000-cell domain (4.4);
+5. the batch size at which a device starts to win, per kernel (on the first device).
+
+### Work items
+
+| Item | Build | Success | Needs |
+|---|---|---|---|
+| 4.1 | The catalogue: the specification format, the conformance corpus format and its runner, versioned identities in `moruna-kernels` (4A) | The runner runs every corpus against the CPU references; an implementation that fails one case cannot claim the version | none |
+| 4.2 | `expr`: specification, corpus, CPU reference that fuses the tree into one pass, the JSON form in a job document, replacing the filter language (4B) | Audit's rule and Enrich's columns as one `expr` each give 0.6.6's rows; the measurement in 4G.3 | 4.1's formats |
+| 4.3 | `filter` (both outputs) and `take` (4B) | Corpus passes; Enrich as `expr` then `filter` gives 0.6.6's rows | 4.1's formats |
+| 4.4 | `group_aggregate`, hash and dense paths, with declared state size (4B, 4C) | Corpus passes; Occupancy as written, through it, gives 0.6.6's rows; 4G.4 | 4.1's formats |
+| 4.5 | `interval_coverage_count` (4B) | Corpus passes; Occupancy through it gives 0.6.6's rows; 4G.2 on real months | 4.1's formats |
+| 4.6 | `mlp_forward`, with a model handle and declared precision (4B) | Corpus passes; Score's network through it gives 0.6.6's rows within its declared tolerance; 4G.1 on CPU | 4.1's formats |
+| 4.7 | Calls from functions: the SDK calls in Python, Rust and C; the plane path and the CPU shortcut; placement in the report (4D) | A Python function calling `moruna.kernels` gets the same rows on both paths, and the report names each call's placement | 4.1, 4.2 |
+| 4.8 | The four benchmark functions as functions calling kernels | The four give 0.6.6's rows through the API on a node; the benchmark reruns them | 4.2 to 4.7 |
+| 4.9 | The executor interface: the CPU executor behind the five verbs, `describe` and chain claims (4E) | The engine places every kernel call through the verbs; a test executor claiming `expr` then `filter` is used | 4.7 |
+| 4.10 | The first device executor (4F) | Brackly's choice of device | 4.9, a decision |
+| 4.11 | Kernel costs in the cost model: the unit (kernel, version, executor), warm-up per executor, transfers from the buffer catalog, a function's cost including its calls, placement by the policy (4H) | `explain` and the scheduler predict a function's time with its kernel calls on the CPU executor within the model's stated error; a second (test) executor with a measured transfer cost is chosen only when the model says it wins | 4.7, 4.9, 6.3o |
 
 ## Traceability to the OS design
 
@@ -928,7 +1097,7 @@ first accelerator.
 | 2. The API | 2A to 2E | Final |
 | 3. Wiring | 3A to 3F | Final; 0.1's risk settled: `kernel/linux` until the new layer returns |
 | 3. "The benchmark returns" | 6 | Final |
-| 4. The two interfaces and the unit of work | 4 | Not started, by decision |
+| 4. The two interfaces and the unit of work | 4 | Draft: the six first kernels (Brackly, 2026-11-18) |
 | 5. Rust first, every language after | 5A to 5C | Final |
 | One image for every cloud | 1A | Final |
 | No shell, no arbitrary command | 1B (no console input), 2A (fixed operations) | Final |

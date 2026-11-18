@@ -145,7 +145,7 @@ The user writes sources, functions and sinks. A function carries one or more ker
 |---|---|---|
 | Opaque | Any code: Rust, or any language in an image | CPU cores |
 | Library | A named kernel that Moruna or a package ships with an implementation per device: matrix multiply, group and aggregate, join, sort, decode, encode | Every executor that implements it |
-| Expression (later) | Typed expressions over columns, which Moruna compiles | CPU, GPU, FPGA |
+| Expression | Typed expressions over columns, evaluated as one fused pass: the `expr` kernel, first of the six (Brackly, 2026-11-18) | CPU, GPU, FPGA |
 
 - **Every function has a CPU kernel.** A device kernel is an acceleration, and it must produce the
   CPU kernel's rows. The benchmark's row check enforces that.
@@ -224,6 +224,7 @@ it.
    them off.
 2. **Azure's first size:** `Standard_D4ls_v5` is the working choice, which means VMBus disk and
    network drivers. Work item 1.7's findings confirm it or change it.
-3. **The first accelerator** is chosen when the OS works on both clouds.
+3. **The first accelerator** is chosen when the OS works on both clouds. That point was reached on
+   2026-11-18 (3.8 and 2.6 hold on Servercore and Azure); the system design's 4F sets out the choice.
 
 The system design and the work items are in `moruna-os-system.md`.
