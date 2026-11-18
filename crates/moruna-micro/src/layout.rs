@@ -486,6 +486,8 @@ pub fn processes(env: &[String]) -> Result<usize, String> {
 pub const NATIVE_BASE: u64 = 0x40_0000;
 
 const PT_LOAD: u32 = 1;
+/// A thread-local storage template's program header.
+const PT_TLS: u32 = 7;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -505,10 +507,11 @@ fn u64_at(b: &[u8], at: usize) -> Option<u64> {
 /// Whether `elf` (the whole program, or at least its ELF header and program headers) is a program of
 /// the Moruna kernel's user target (`x86_64-moruna-user`), as an image entry declaring
 /// `abi: moruna` says its command is: a static x86-64 executable laid out by the user linker
-/// script, whose program headers are its loaded segments and nothing else, read and execute
-/// first at 0x400000, then read only, then read and write. A Linux program has a stack header
-/// (and a static musl one its notes and its thread-local storage), so none passes. `Err` says
-/// what does not match.
+/// script, whose program headers are its loaded segments, read and execute first at 0x400000,
+/// then read only, then read and write, and at most one thread-local storage template, read
+/// only, as a program with std has (`kernel/targets/x86_64-moruna.ld`, item 5.0), which the
+/// kernel's loader takes. A Linux program has a stack header (and a static musl one its notes),
+/// so none passes. `Err` says what does not match.
 pub fn native_elf(elf: &[u8]) -> Result<(), String> {
     if elf.get(..4) != Some(b"\x7fELF".as_slice()) {
         return Err("it is not an ELF program".into());
@@ -536,18 +539,26 @@ pub fn native_elf(elf: &[u8]) -> Result<(), String> {
         u16_at(elf, 54).ok_or_else(short)?,
         u16_at(elf, 56).ok_or_else(short)?,
     );
-    if size != 56 || !(1..=3).contains(&count) {
+    if size != 56 || !(1..=4).contains(&count) {
         return Err(format!(
             "it has {count} program headers of {size} bytes, where the user target's linker \
-             script writes one to three of 56 (its loaded segments)"
+             script writes one to three of 56 (its loaded segments) and, with std, its \
+             thread-local storage"
         ));
     }
     let mut flags = Vec::new();
+    let mut tls = false;
     for i in 0..u64::from(count) {
         let at = usize::try_from(phoff + i * 56)
             .map_err(|_| String::from("its program headers lie past its bytes"))?;
         let ty = u32_at(elf, at)
             .ok_or_else(|| String::from("its program headers lie past its bytes"))?;
+        // std's thread-local storage template (item 5.0): one, read only, after the first
+        // segment.
+        if ty == PT_TLS && i > 0 && !tls && u32_at(elf, at + 4).unwrap_or(0) & (PF_W | PF_X) == 0 {
+            tls = true;
+            continue;
+        }
         if ty != PT_LOAD {
             return Err(format!(
                 "its program header {i} is of type {ty:#x}, not a loaded segment: the user \
@@ -556,7 +567,7 @@ pub fn native_elf(elf: &[u8]) -> Result<(), String> {
         }
         let f = u32_at(elf, at + 4).unwrap_or(0);
         let vaddr = u64_at(elf, at + 16).unwrap_or(0);
-        if i == 0 && vaddr != NATIVE_BASE {
+        if flags.is_empty() && vaddr != NATIVE_BASE {
             return Err(format!(
                 "its first segment is at {vaddr:#x}, where the user target's linker script puts \
                  its text at {NATIVE_BASE:#x}"
@@ -623,6 +634,24 @@ mod tests {
         refused(elf(3, 62, &user), "ELF type 3");
         refused(elf(2, 183, &user), "machine 183");
         refused(elf(2, 62, &[]), "0 program headers");
+        // A program with std (item 5.0): its thread-local storage template, read only, beside
+        // its segments; one only, and never first or writable or alone.
+        let tls = (7, 4, NATIVE_BASE + 0x20000);
+        assert_eq!(
+            native_elf(&elf(2, 62, &[user[0], user[1], user[2], tls])),
+            Ok(())
+        );
+        assert_eq!(native_elf(&elf(2, 62, &[user[0], tls, user[2]])), Ok(()));
+        refused(elf(2, 62, &[user[0], tls, tls]), "type 0x7");
+        refused(elf(2, 62, &[tls, user[0]]), "type 0x7");
+        refused(
+            elf(2, 62, &[user[0], (7, 6, NATIVE_BASE + 0x20000)]),
+            "type 0x7",
+        );
+        refused(
+            elf(2, 62, &[user[0], user[1], user[2], tls, tls]),
+            "5 program headers",
+        );
         // A static musl program: its stack header.
         refused(
             elf(2, 62, &[user[0], (0x6474_e551, 6, 0)]),
