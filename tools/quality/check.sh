@@ -291,6 +291,8 @@ if [ -f Cargo.toml ]; then
   else
     step "tools/lint/no_tier_wildcard.sh not present yet (wave 0 deliverable); skipped"
   fi
+  step "tools/lint/same_bounds.sh"
+  quiet lint tools/lint/same_bounds.sh
   # Supply-chain policy (deny.toml, board F6.5). cargo-deny is a CI tool, not a
   # workspace dependency, so a machine without it still passes this gate.
   # Locally only the offline, deterministic halves are fatal: `bans` (one arrow,

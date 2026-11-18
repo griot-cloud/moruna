@@ -96,6 +96,7 @@ jobs:
         run: |
           cargo fmt --all -- --check
           tools/lint/no_tier_wildcard.sh
+          tools/lint/same_bounds.sh
           tools/docs/check_docs.py
       - name: JB-I12 and PN-I14, the job and plan documents' generated code is what their schemas generate
         run: tools/flatc/generate.sh --check
