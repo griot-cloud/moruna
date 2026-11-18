@@ -2115,6 +2115,7 @@ dependencies = [
  "moruna-record",
  "moruna-svc",
  "moruna-sys",
+ "moruna-testkit",
  "moruna-virtio",
  "node-protocol",
  "sha2 0.11.0",
