@@ -153,6 +153,13 @@ A run that fails part-way deletes the group. One that succeeds leaves the storag
 it until `nyc-blob.sh --delete --run <BLOB_RUN>`, which deletes the group `<BLOB_RUN>/group`
 names and shows it gone. `--dry-run` prints every command and runs none.
 
+**Written 2026-11-18 and not run against Azure.** Every `az` option it uses was checked without a
+cloud: each appears in the help of its command in Azure CLI 2.92.0, the version on the project's
+Mac, with no command sent to Azure; its tests (`kernel/node/tools/test_nyc_blob.py`) run it against
+a stand-in for `az`. The run command's shape (version 2, the key a protected parameter read from
+its file) is the one `bench/node/run.py` used on a real machine (6.2b). What Azure answers is the
+PM's run to find.
+
 ## 1. Node config
 
 Make the run's directory, and the token key pair in it:
