@@ -364,14 +364,15 @@ impl From<RecordBatch> for Input {
     }
 }
 
-/// What the task posted in answer to one input.
+/// What the task posted in answer to one input, or to none ([`Outcome::unheld`]).
 #[derive(Clone, Debug, Default)]
 pub struct Answer {
     /// Each record, as the task wrote it.
     pub records: Vec<Vec<u8>>,
     /// Each record that passed the engine's check, read back.
     pub batches: Vec<RecordBatch>,
-    /// Whether the task released the input, saying it was done with it.
+    /// Whether the task released the input, saying it was done with it; never, for
+    /// [`Outcome::unheld`].
     pub released: bool,
 }
 
@@ -384,6 +385,9 @@ pub struct Outcome {
     pub said: Option<i64>,
     /// Each input's answer, in the inputs' order.
     pub answers: Vec<Answer>,
+    /// What the task posted answering no input it held: written while it held none, as
+    /// [`crate::Function::end`] writes. The engine takes such a record and moves nothing for it.
+    pub unheld: Answer,
     /// The task's log, a line an entry.
     pub log: Vec<String>,
     /// Each record the engine's check refused, with its sentence. On the core the first ends
@@ -392,10 +396,11 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    /// Every batch the task wrote, in order.
+    /// Every batch the task wrote: the answers in the inputs' order, then those answering none.
     pub fn batches(&self) -> Vec<RecordBatch> {
         self.answers
             .iter()
+            .chain([&self.unheld])
             .flat_map(|a| a.batches.iter().cloned())
             .collect()
     }
@@ -514,6 +519,8 @@ struct Run<'a> {
     records: Vec<Vec<u8>>,
     rows: Vec<u64>,
     answers: Vec<Answer>,
+    /// The records answering no input the task held.
+    unheld: Answer,
     refused: Vec<String>,
     /// The records posted and not released, oldest first: offset and length.
     flight: VecDeque<(usize, usize)>,
@@ -538,16 +545,15 @@ impl Run<'_> {
                 return Err(HostError::Rings(String::from("a window given twice")));
             }
             self.engine.ring(self.rings);
-            let answer = usize::try_from(e.cookie)
+            // A record whose cookie is no input the task holds answers none, as the engine
+            // takes it: an aggregate's, written at the end.
+            let held = usize::try_from(e.cookie)
                 .ok()
-                .filter(|i| (self.oldest..self.next).contains(i))
-                .and_then(|i| self.answers.get_mut(i))
-                .ok_or_else(|| {
-                    HostError::Rings(format!(
-                        "a record answering {}, which is not an input the task holds",
-                        e.cookie
-                    ))
-                })?;
+                .filter(|i| (self.oldest..self.next).contains(i));
+            let answer = match held.and_then(|i| self.answers.get_mut(i)) {
+                Some(answer) => answer,
+                None => &mut self.unheld,
+            };
             match read_back(&bytes) {
                 Ok(b) => answer.batches.push(b),
                 Err(why) => self.refused.push(why),
@@ -747,6 +753,7 @@ impl Plane {
             records,
             rows,
             answers: vec![Answer::default(); count],
+            unheld: Answer::default(),
             refused: Vec::new(),
             flight: VecDeque::new(),
             oldest: 0,
@@ -764,7 +771,7 @@ impl Plane {
             return Err(e);
         }
         let said = run.engine.exit(&*rings);
-        let (answers, refused) = (run.answers, run.refused);
+        let (answers, unheld, refused) = (run.answers, run.unheld, run.refused);
         let returned = task
             .join()
             .map_err(|p| HostError::Panicked(panic_message(p)))?;
@@ -773,6 +780,7 @@ impl Plane {
             returned,
             said,
             answers,
+            unheld,
             log,
             refused,
         })
@@ -834,8 +842,8 @@ mod tests {
         assert!(r.is_err(), "a write past the end is refused");
     }
 
-    /// The engine's side against a task that does not keep the protocol: a record the check
-    /// refuses is noted, and one answering an input the task does not hold is the task's fault.
+    /// The engine's side against what a task posts: a record the check refuses is noted, and one
+    /// answering no input the task holds is taken as answering none.
     #[test]
     fn records_are_judged_as_the_engine_judges_them() {
         let g = Geometry::new(4 * PAGE as u64, 2, PAGE as u64).unwrap();
@@ -854,6 +862,7 @@ mod tests {
             records: vec![vec![0u8; 8]],
             rows: vec![0],
             answers: vec![Answer::default()],
+            unheld: Answer::default(),
             refused: Vec::new(),
             flight: VecDeque::new(),
             oldest: 0,
@@ -879,7 +888,10 @@ mod tests {
         assert_eq!(run.answers[0].records, [vec![0u8; 8]]);
         assert_eq!(run.refused.len(), 1, "eight zero bytes are no record");
         post(99);
-        assert!(matches!(run.take(), Err(HostError::Rings(_))));
+        assert!(run.take().unwrap());
+        assert_eq!(run.answers[0].records.len(), 1);
+        assert_eq!(run.unheld.records, [vec![0u8; 8]]);
+        assert_eq!(run.refused.len(), 2);
     }
 
     #[test]

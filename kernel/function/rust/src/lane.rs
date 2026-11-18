@@ -12,6 +12,11 @@ pub(crate) trait Mapped: Send + Sync + RefUnwindSafe {}
 
 impl<T: Send + Sync + RefUnwindSafe> Mapped for T {}
 
+/// The cookie of a record that answers no input: one written while the task holds no batch, as
+/// [`crate::Function::end`] writes. No input has it, and the engine, finding it on no input the
+/// task holds, moves nothing for it and takes the record (`moruna_plane`'s ringed engine).
+pub(crate) const NO_INPUT: u64 = u64::MAX;
+
 /// A batch the engine posted: its record, in place.
 ///
 /// `addr` is valid for reads of `len` bytes, and no one writes them, until the lane releases the
