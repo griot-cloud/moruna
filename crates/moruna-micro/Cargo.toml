@@ -12,6 +12,8 @@ description = "The engine on the Moruna microkernel (SDD 30): the same engine as
 moruna-kernel = { workspace = true }
 moruna-adapters = { workspace = true }
 tracing = { workspace = true }
+# Item 3.6: the `functions` index `node-admission` writes, read with the contract's own parser.
+node-protocol = { workspace = true }
 
 # The kernel's calls exist on the Moruna kernel only, and it runs x86-64 programs: everything
 # that makes them is built for that target alone. Elsewhere the crate says the kernel is not

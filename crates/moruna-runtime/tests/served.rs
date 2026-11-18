@@ -373,7 +373,7 @@ fn kd_t12_declare_and_list() {
     );
     let listing = kinds.listing();
     let names: Vec<&str> = listing.kernels.iter().map(|d| d.name.as_str()).collect();
-    assert_eq!(names, ["image", "package", "scale", "std"]);
+    assert_eq!(names, ["function", "image", "package", "scale", "std"]);
     let listed = listing.kernels.iter().find(|d| d.name == "scale").unwrap();
     assert_eq!(listed, &scale("scale", PortDoc::guest("scale")));
     // The listing an embedder checks with is the catalogue of the same kinds.
@@ -427,7 +427,7 @@ fn kd_t12_declare_and_list() {
         .to_string();
     assert!(refused.contains("a served kind is declared"), "{refused}");
     // The registry the program built is unchanged by what a clone of it declared.
-    assert_eq!(kinds.listing().kernels.len(), 4);
+    assert_eq!(kinds.listing().kernels.len(), 5);
 
     // KD-C1 to KD-C6 over its examples, in a context whose embedder serves its port.
     let suite = moruna_runtime::kinds::served::Served::new(scale("scale", PortDoc::guest("scale")))

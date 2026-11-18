@@ -167,6 +167,9 @@ moruna-abi = { path = "kernel/abi", version = "=0.1.0" }
 vsock-protocol = { path = "kernel/drivers/vsock-protocol", version = "=0.1.0" }
 linux-protocol = { path = "kernel/linux/protocol", version = "=0.1.0" }
 imagefs-protocol = { path = "kernel/imagefs/protocol", version = "=0.1.0" }
+# The functions a job is given (item 3.6): the `functions` index `node-admission` writes and the
+# engine reads, one contract on both sides.
+node-protocol = { path = "kernel/node/protocol", version = "=0.1.0" }
 
 # Test binaries statically link arrow and parquet, and a workspace of a dozen
 # crates with full debug info in every test binary filled a 90 GB disk while six

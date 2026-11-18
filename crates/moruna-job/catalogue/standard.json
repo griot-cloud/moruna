@@ -496,6 +496,43 @@
   ],
   "functions": [
     {
+      "name": "function",
+      "role": "function",
+      "summary": "A function registered on the node, by its name: a native program of the Moruna kernel's user target on the data plane's rings, or a Moruna image archive whose command runs on its own files, its batches as Arrow IPC",
+      "settings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "function": {
+            "type": "string",
+            "description": "The function's registered name (`POST /v1/functions`): 1 to 64 of lowercase letters,\ndigits, `_`, `-` and `.`, a letter first. The node refuses a name it has not registered."
+          }
+        },
+        "required": [
+          "function"
+        ],
+        "description": "A `function` entry's settings.",
+        "title": "function",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "examples": [
+          {
+            "function": "taxi.clean"
+          }
+        ]
+      },
+      "inputs": "batches",
+      "outputs": "batches",
+      "needs": {
+        "network": "no",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no"
+      },
+      "deterministic": "no",
+      "preserves_columns": "no",
+      "isolation": "confined"
+    },
+    {
       "name": "image",
       "role": "function",
       "summary": "An OCI image's command in a sandboxed process, its batches on the data plane: Arrow IPC over its standard input and output, or the plane's calls",

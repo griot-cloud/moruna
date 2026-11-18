@@ -72,6 +72,8 @@ libc = { workspace = true }
 
 [dev-dependencies]
 zip = { workspace = true }
+# Item 3.6: the image layouts a registered image function's archive is written from.
+moruna-image = { workspace = true, features = ["testing"] }
 # PN-T34: the simulated planner, which needs a cost model, sees the run's checkpoint cadence.
 moruna-cost = { workspace = true }
 arrow = { workspace = true }

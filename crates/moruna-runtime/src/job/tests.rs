@@ -1038,7 +1038,7 @@ fn kd_t9_v1_documents_resolve() {
         assert!(
             e.to_string().contains(
                 "kernels[0].kind: no function kind `rust` is registered; this build runs \
-                 image, package, std"
+                 function, image, package, std"
             ),
             "{e}"
         );

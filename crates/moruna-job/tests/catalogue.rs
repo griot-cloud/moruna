@@ -96,7 +96,10 @@ fn jb_t2_embedded_catalogues() {
         names(&standard, Role::Source),
         ["arrow_ipc", "image", "parquet", "tensor"]
     );
-    assert_eq!(names(&standard, Role::Kernel), ["image", "package", "std"]);
+    assert_eq!(
+        names(&standard, Role::Kernel),
+        ["function", "image", "package", "std"]
+    );
     assert_eq!(
         names(&standard, Role::Sink),
         ["arrow_ipc", "image", "parquet", "tensor"]

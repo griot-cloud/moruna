@@ -419,25 +419,8 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
             "a native program makes the data plane's calls itself: it needs `plane: true`",
         ));
     }
-    if !native && (launch.uid, launch.gid) != (0, 0) {
-        return Err(entry.refuse(
-            "image",
-            format!(
-                "the image runs as uid {} and gid {}, and the Linux personality starts every \
-                 program as root (SDD 28): it cannot run as its image says",
-                launch.uid, launch.gid
-            ),
-        ));
-    }
-    if !native && launch.working_dir != "/" {
-        return Err(entry.refuse(
-            "image",
-            format!(
-                "the image's working directory is {}, and the Linux personality starts every \
-                 program in / (SDD 28): it cannot run as its image says",
-                launch.working_dir
-            ),
-        ));
+    if !native && let Some(why) = personality_refusal(&launch) {
+        return Err(entry.refuse("image", why));
     }
     // The engine runs on the same image filesystem as its tasks, so its own view of the image
     // is where the command's PATH is searched.
@@ -504,6 +487,31 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
     });
     stage.packaged = Some(crate::packaged::Packaged::Task(task));
     Ok(stage)
+}
+
+/// Why the Linux personality cannot run `launch` as its image says (SDD 28): it starts every
+/// program as root, in `/`. An image's task on the Moruna kernel is refused for it, and so is a
+/// registered image function's (item 3.6).
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+pub(super) fn personality_refusal(launch: &moruna_image::Launch) -> Option<String> {
+    if (launch.uid, launch.gid) != (0, 0) {
+        return Some(format!(
+            "the image runs as uid {} and gid {}, and the Linux personality starts every \
+             program as root (SDD 28): it cannot run as its image says",
+            launch.uid, launch.gid
+        ));
+    }
+    if launch.working_dir != "/" {
+        return Some(format!(
+            "the image's working directory is {}, and the Linux personality starts every \
+             program in / (SDD 28): it cannot run as its image says",
+            launch.working_dir
+        ));
+    }
+    None
 }
 
 #[cfg(not(target_os = "linux"))]
