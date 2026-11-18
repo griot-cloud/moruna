@@ -2089,6 +2089,7 @@ name = "moruna-kernels"
 version = "0.6.6"
 dependencies = [
  "blake3",
+ "matrixmultiply",
  "moruna-kernel",
  "moruna-testkit",
  "serde_json",

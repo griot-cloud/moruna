@@ -28,6 +28,7 @@ pub mod args;
 pub mod catalogue;
 pub mod conformance;
 pub mod expr;
+pub mod mlp;
 pub mod ops;
 
 use std::collections::HashSet;

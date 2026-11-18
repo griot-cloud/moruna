@@ -15,6 +15,9 @@ blake3 = { workspace = true }
 # SHA-256 for the standard kernels' fingerprints (MH 4.9) and `hash(algo="sha256")`. E2: a
 # table addition (preamble 6.2).
 sha2 = { workspace = true }
+# `mlp_forward`'s blocked matrix multiply (system design 4B, item 4.6; the reason is at the pin in
+# the root Cargo.toml).
+matrixmultiply = { workspace = true }
 
 [dev-dependencies]
 moruna-testkit = { workspace = true }

@@ -138,7 +138,12 @@ impl core::fmt::Debug for Implementation {
 pub const CPU_REFERENCE: &str = "cpu-reference";
 
 /// Every implementation this build has, the CPU references first.
-pub const IMPLEMENTATIONS: &[Implementation] = &[];
+pub const IMPLEMENTATIONS: &[Implementation] = &[Implementation {
+    kernel: "moruna.mlp_forward",
+    implementation: CPU_REFERENCE,
+    versions: crate::mlp::VERSIONS,
+    configure: crate::mlp::configure,
+}];
 
 /// Every implementation this build has.
 pub fn implementations() -> &'static [Implementation] {

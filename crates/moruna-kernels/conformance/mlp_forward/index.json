@@ -1,0 +1,929 @@
+{
+  "format": "moruna-kernel-corpus/1",
+  "kernel": "moruna.mlp_forward",
+  "cases": [
+    {
+      "name": "score_float64",
+      "version": 1,
+      "tests": [
+        "params",
+        "rounding"
+      ],
+      "about": "Score's 23-128-128-1 network on January 2024's first 600 trips in float64, across the CPU reference's 256-row blocks.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "relu",
+          "relu",
+          "identity"
+        ],
+        "inputs": [
+          "x0",
+          "x1",
+          "x2",
+          "x3",
+          "x4",
+          "x5",
+          "x6",
+          "x7",
+          "x8",
+          "x9",
+          "x10",
+          "x11",
+          "x12",
+          "x13",
+          "x14",
+          "x15",
+          "x16",
+          "x17",
+          "x18",
+          "x19",
+          "x20",
+          "x21",
+          "x22"
+        ],
+        "output": "predicted_tip"
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "score.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "score.layer_2.arrow"
+        },
+        "layer_3": {
+          "file": "score.layer_3.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "score.in.arrow"
+        }
+      ],
+      "expected": "score_float64.expected.arrow",
+      "allowed": {
+        "predicted_tip": {
+          "file": "score_float64.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "score_float32",
+      "version": 1,
+      "tests": [
+        "params",
+        "rounding"
+      ],
+      "about": "Score's 23-128-128-1 network on January 2024's first 600 trips in float32, across the CPU reference's 256-row blocks.",
+      "params": {
+        "precision": "float32",
+        "activations": [
+          "relu",
+          "relu",
+          "identity"
+        ],
+        "inputs": [
+          "x0",
+          "x1",
+          "x2",
+          "x3",
+          "x4",
+          "x5",
+          "x6",
+          "x7",
+          "x8",
+          "x9",
+          "x10",
+          "x11",
+          "x12",
+          "x13",
+          "x14",
+          "x15",
+          "x16",
+          "x17",
+          "x18",
+          "x19",
+          "x20",
+          "x21",
+          "x22"
+        ],
+        "output": "predicted_tip"
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "score.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "score.layer_2.arrow"
+        },
+        "layer_3": {
+          "file": "score.layer_3.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "score.in.arrow"
+        }
+      ],
+      "expected": "score_float32.expected.arrow",
+      "allowed": {
+        "predicted_tip": {
+          "file": "score_float32.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "score_sliced",
+      "version": 1,
+      "tests": [
+        "sliced"
+      ],
+      "about": "Score's network on a batch whose arrays start at row 250 of the file (rows 250 to 529).",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "relu",
+          "relu",
+          "identity"
+        ],
+        "inputs": [
+          "x0",
+          "x1",
+          "x2",
+          "x3",
+          "x4",
+          "x5",
+          "x6",
+          "x7",
+          "x8",
+          "x9",
+          "x10",
+          "x11",
+          "x12",
+          "x13",
+          "x14",
+          "x15",
+          "x16",
+          "x17",
+          "x18",
+          "x19",
+          "x20",
+          "x21",
+          "x22"
+        ],
+        "output": "predicted_tip"
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "score.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "score.layer_2.arrow"
+        },
+        "layer_3": {
+          "file": "score.layer_3.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "score.in.arrow",
+          "slice": [
+            250,
+            280
+          ]
+        }
+      ],
+      "expected": "score_sliced.expected.arrow",
+      "allowed": {
+        "predicted_tip": {
+          "file": "score_sliced.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "activation_identity",
+      "version": 1,
+      "tests": [
+        "params",
+        "nested"
+      ],
+      "about": "identity on both layers, a FixedSizeList<Float64, 3> output.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "identity",
+          "identity"
+        ],
+        "inputs": [
+          "f0",
+          "f1",
+          "f2",
+          "f3"
+        ]
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "activation_identity.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "activation_identity.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "activation_identity.in.arrow"
+        }
+      ],
+      "expected": "activation_identity.expected.arrow",
+      "allowed": {
+        "y": {
+          "file": "activation_identity.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "activation_relu",
+      "version": 1,
+      "tests": [
+        "params",
+        "nested"
+      ],
+      "about": "relu on both layers, a FixedSizeList<Float64, 3> output.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "relu",
+          "relu"
+        ],
+        "inputs": [
+          "f0",
+          "f1",
+          "f2",
+          "f3"
+        ]
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "activation_relu.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "activation_relu.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "activation_relu.in.arrow"
+        }
+      ],
+      "expected": "activation_relu.expected.arrow",
+      "allowed": {
+        "y": {
+          "file": "activation_relu.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "activation_sigmoid",
+      "version": 1,
+      "tests": [
+        "params",
+        "nested"
+      ],
+      "about": "sigmoid on both layers, a FixedSizeList<Float64, 3> output.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "sigmoid",
+          "sigmoid"
+        ],
+        "inputs": [
+          "f0",
+          "f1",
+          "f2",
+          "f3"
+        ]
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "activation_sigmoid.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "activation_sigmoid.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "activation_sigmoid.in.arrow"
+        }
+      ],
+      "expected": "activation_sigmoid.expected.arrow",
+      "allowed": {
+        "y": {
+          "file": "activation_sigmoid.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "activation_tanh",
+      "version": 1,
+      "tests": [
+        "params",
+        "nested"
+      ],
+      "about": "tanh on both layers with no bias, a FixedSizeList<Float64, 3> output.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "tanh",
+          "tanh"
+        ],
+        "inputs": [
+          "f0",
+          "f1",
+          "f2",
+          "f3"
+        ]
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "activation_tanh.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "activation_tanh.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "activation_tanh.in.arrow"
+        }
+      ],
+      "expected": "activation_tanh.expected.arrow",
+      "allowed": {
+        "y": {
+          "file": "activation_tanh.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "list_input",
+      "version": 1,
+      "tests": [
+        "params"
+      ],
+      "about": "One FixedSizeList<Float64, 3> column; the other column is ignored.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "relu",
+          "identity"
+        ],
+        "input": "f"
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "small.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "small.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "list_input.in.arrow"
+        }
+      ],
+      "expected": "list_input.expected.arrow",
+      "allowed": {
+        "y": {
+          "file": "list_input.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "float32_columns",
+      "version": 1,
+      "tests": [
+        "params",
+        "rounding"
+      ],
+      "about": "Float32 columns, widened exactly to float64.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "relu",
+          "identity"
+        ],
+        "inputs": [
+          "a",
+          "b",
+          "c"
+        ]
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "small.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "small.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "float32_columns.in.arrow"
+        }
+      ],
+      "expected": "float32_columns.expected.arrow",
+      "allowed": {
+        "y": {
+          "file": "float32_columns.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "float16_columns",
+      "version": 1,
+      "tests": [
+        "params",
+        "rounding"
+      ],
+      "about": "Float16 columns, widened exactly to float64.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "relu",
+          "identity"
+        ],
+        "inputs": [
+          "a",
+          "b",
+          "c"
+        ]
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "small.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "small.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "float16_columns.in.arrow"
+        }
+      ],
+      "expected": "float16_columns.expected.arrow",
+      "allowed": {
+        "y": {
+          "file": "float16_columns.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "float32_list",
+      "version": 1,
+      "tests": [
+        "params",
+        "rounding"
+      ],
+      "about": "A FixedSizeList<Float32, 3> column computed in float32.",
+      "params": {
+        "precision": "float32",
+        "activations": [
+          "relu",
+          "identity"
+        ],
+        "input": "f"
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "small.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "small.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "float32_list.in.arrow"
+        }
+      ],
+      "expected": "float32_list.expected.arrow",
+      "allowed": {
+        "y": {
+          "file": "float32_list.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "narrowed_to_float32",
+      "version": 1,
+      "tests": [
+        "params",
+        "rounding"
+      ],
+      "about": "Float64 columns narrowed to float32, to nearest.",
+      "params": {
+        "precision": "float32",
+        "activations": [
+          "relu",
+          "identity"
+        ],
+        "inputs": [
+          "a",
+          "b",
+          "c"
+        ]
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "small.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "small.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "narrowed.in.arrow"
+        }
+      ],
+      "expected": "narrowed_to_float32.expected.arrow",
+      "allowed": {
+        "y": {
+          "file": "narrowed_to_float32.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "null_column_value",
+      "version": 1,
+      "tests": [
+        "nulls"
+      ],
+      "about": "A null in one column gives a null row of zeros; the other rows are as without it.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "relu",
+          "identity"
+        ],
+        "inputs": [
+          "a",
+          "b",
+          "c"
+        ]
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "small.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "small.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "null_column.in.arrow"
+        }
+      ],
+      "expected": "null_column_value.expected.arrow",
+      "allowed": {
+        "y": {
+          "file": "null_column_value.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "null_list_and_value",
+      "version": 1,
+      "tests": [
+        "nulls"
+      ],
+      "about": "A null list and a null value inside a list each give a null row.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "relu",
+          "identity"
+        ],
+        "input": "f"
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "small.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "small.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "null_list.in.arrow"
+        }
+      ],
+      "expected": "null_list_and_value.expected.arrow",
+      "allowed": {
+        "y": {
+          "file": "null_list_and_value.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "nan_row",
+      "version": 1,
+      "tests": [
+        "overflow"
+      ],
+      "about": "A NaN makes its own row NaN and no other.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "relu",
+          "identity"
+        ],
+        "inputs": [
+          "a",
+          "b",
+          "c"
+        ]
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "small.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "small.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "nan.in.arrow"
+        }
+      ],
+      "expected": "nan_row.expected.arrow",
+      "allowed": {
+        "y": {
+          "file": "nan_row.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "overflow",
+      "version": 1,
+      "tests": [
+        "overflow"
+      ],
+      "about": "A product past Float64's range is an infinity of its sign, never an error.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "identity"
+        ],
+        "inputs": [
+          "v"
+        ]
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "ten.layer_1.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "overflow.in.arrow"
+        }
+      ],
+      "expected": "overflow.expected.arrow",
+      "allowed": {
+        "y": {
+          "file": "overflow.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "empty",
+      "version": 1,
+      "tests": [
+        "empty"
+      ],
+      "about": "A batch of zero rows gives a batch of zero rows.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "relu",
+          "identity"
+        ],
+        "inputs": [
+          "a",
+          "b",
+          "c"
+        ]
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "small.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "small.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "empty.in.arrow"
+        }
+      ],
+      "expected": "empty.expected.arrow",
+      "allowed": {
+        "y": {
+          "file": "empty.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "two_batches",
+      "version": 1,
+      "tests": [
+        "multi_batch"
+      ],
+      "about": "Two batches give their rows in order.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "relu",
+          "identity"
+        ],
+        "inputs": [
+          "a",
+          "b",
+          "c"
+        ]
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "small.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "small.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "two.in.arrow"
+        }
+      ],
+      "expected": "two_batches.expected.arrow",
+      "allowed": {
+        "y": {
+          "file": "two_batches.allowed.arrow"
+        }
+      }
+    },
+    {
+      "name": "unknown_activation",
+      "version": 1,
+      "tests": [
+        "error",
+        "params"
+      ],
+      "about": "An activation the specification does not name is refused at configure.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "relu",
+          "softmax"
+        ],
+        "inputs": [
+          "a",
+          "b",
+          "c"
+        ]
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "small.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "small.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "float32_columns.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "configure",
+        "contains": "softmax"
+      }
+    },
+    {
+      "name": "layers_do_not_chain",
+      "version": 1,
+      "tests": [
+        "error",
+        "params"
+      ],
+      "about": "A layer whose input count is not the previous layer's output count is refused at configure.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "relu",
+          "identity"
+        ],
+        "inputs": [
+          "a",
+          "b",
+          "c"
+        ]
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "small.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "bad.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "float32_columns.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "configure",
+        "contains": "layer 1 gives 8 outputs"
+      }
+    },
+    {
+      "name": "missing_column",
+      "version": 1,
+      "tests": [
+        "error"
+      ],
+      "about": "A named column the input has not is refused at plan.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "relu",
+          "identity"
+        ],
+        "inputs": [
+          "a",
+          "b",
+          "z"
+        ]
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "small.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "small.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "float32_columns.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "schema",
+        "contains": "`z`"
+      }
+    },
+    {
+      "name": "wrong_list_size",
+      "version": 1,
+      "tests": [
+        "error"
+      ],
+      "about": "A list column of another size is refused at plan.",
+      "params": {
+        "precision": "float64",
+        "activations": [
+          "relu",
+          "identity"
+        ],
+        "input": "f"
+      },
+      "arrays": {
+        "layer_1": {
+          "file": "small.layer_1.arrow"
+        },
+        "layer_2": {
+          "file": "small.layer_2.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "wide_list.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "schema",
+        "contains": "FixedSizeList"
+      }
+    }
+  ]
+}
