@@ -121,13 +121,17 @@ impl SourceKind for Parquet {
         Ok(BuiltSource {
             spec: SourceSpec::Build(Box::new(move |ctx| {
                 let meta = ctx.object_metadata()?;
-                // With the arena, so an object URL's footer can be read (MH 4.6).
-                Ok(Arc::new(ParquetSource::with_allocator(
-                    cfg,
-                    ctx.reactor.clone(),
-                    meta,
-                    ctx.alloc.clone(),
-                )?) as Arc<dyn Source>)
+                // With the arena, so an object URL's footer can be read (MH 4.6); decoding in
+                // batches the headroom above the arena holds (3A, 6.3a).
+                Ok(Arc::new(
+                    ParquetSource::with_allocator(
+                        cfg,
+                        ctx.reactor.clone(),
+                        meta,
+                        ctx.alloc.clone(),
+                    )?
+                    .decode_batches_of(ctx.decode_batch_bytes()),
+                ) as Arc<dyn Source>)
             })),
             targets: settings.url.0,
         })

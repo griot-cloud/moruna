@@ -32,6 +32,9 @@ moruna-placement = { workspace = true }
 # its windows back and on the stage's own layout (`moruna_micro::layout`, on every host).
 moruna-plane = { workspace = true }
 moruna-micro = { workspace = true }
+# SC-T47's Parquet row groups, cut to fit the arena (item 6.3a).
+moruna-sources = { workspace = true }
+parquet = { workspace = true }
 
 [features]
 default = []

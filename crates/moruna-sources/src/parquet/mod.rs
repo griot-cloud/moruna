@@ -8,6 +8,7 @@
 //! reactor, decodes one batch, and copies the decoded Arrow buffers into arena buffers of the
 //! requested tier: that copy is the one exception G-I2 grants (SO-I5).
 
+mod append;
 pub(crate) mod decode_copy;
 mod hint;
 mod pages;
@@ -88,6 +89,9 @@ pub struct ParquetSource {
     /// decodes from these bytes rather than fetching the group's columns again. Fetches run on
     /// the drive one at a time, so one is enough (f.3, RB3).
     last_fetch: std::sync::Mutex<Option<(SplitId, reader::ArenaChunks)>>,
+    /// The most decoded bytes one decode builds outside the arena at once (3A); `None` decodes
+    /// each range in one batch.
+    decode_batch_bytes: Option<u64>,
 }
 
 /// How many row groups' page locations a source keeps: more than the reads a run has in flight.
@@ -161,7 +165,22 @@ impl ParquetSource {
             counters,
             paged: std::sync::Mutex::new(std::collections::VecDeque::new()),
             last_fetch: std::sync::Mutex::new(None),
+            decode_batch_bytes: None,
         })
+    }
+
+    /// Decode each read in batches of at most `bytes` decoded bytes, each copied into the
+    /// read's arena buffers as it comes (3A, 6.3a), rather than the whole range at once: the run
+    /// gives it the headroom above its arena over the workers that may decode at once, so the
+    /// decodes in flight hold no more outside the arena than it left for them. `None` keeps one
+    /// batch a range.
+    pub fn decode_batches_of(mut self, bytes: Option<u64>) -> ParquetSource {
+        self.decode_batch_bytes = bytes.filter(|&bytes| bytes > 0);
+        self
+    }
+
+    pub(crate) fn decode_batch_bytes(&self) -> Option<u64> {
+        self.decode_batch_bytes
     }
 
     /// `split`'s row group alone, with its pages located, for a ranged read (`pages`); `None`
@@ -205,6 +224,22 @@ impl ParquetSource {
             *kept = None;
         }
         hit
+    }
+
+    /// Whether a row range of `split` decodes only its own pages (3A): every projected column
+    /// is unrepeated, so its pages can be located from their headers, and they were not found
+    /// unlocatable when a range of this group was decoded before.
+    fn pages_locatable(&self, split: &Split) -> bool {
+        let Ok((file, _)) = self.entry(split) else {
+            return false;
+        };
+        if !pages::locatable(&file.metadata, &file.projected) {
+            return false;
+        }
+        let kept = self.paged.lock().unwrap_or_else(|e| e.into_inner());
+        !kept
+            .iter()
+            .any(|(id, located)| *id == split.id && located.is_none())
     }
 
     /// Keep `chunks` for the next range of `split`, unless this was its final range.
@@ -266,6 +301,12 @@ impl Source for ParquetSource {
         true
     }
 
+    /// A range of a row group shares the group's fetch (`keep_fetched`) and decodes only its own
+    /// pages when they can be located; one whose pages cannot be is read whole.
+    fn range_reads_own_rows(&self, split: &Split) -> bool {
+        split.sub_splittable && self.pages_locatable(split)
+    }
+
     fn fetch<'a>(
         &'a self,
         split: &'a Split,
@@ -290,5 +331,78 @@ impl Source for ParquetSource {
             crate::util::source_err(split.id, "decode was given another source's fetch")
         })?;
         read::decode_fetched(self, split, *fetched, alloc, tier)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ArrayRef, Int64Array, ListArray, RecordBatch};
+    use arrow::datatypes::Int32Type;
+
+    /// One row group of an id and a list column, written to a directory of its own.
+    fn file(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("moruna-parquet-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the directory");
+        let path = dir.join("lists.parquet");
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int64Array::from_iter_values(0..64)) as ArrayRef,
+            ),
+            (
+                "tags",
+                Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
+                    (0..64).map(|r| Some((0..r % 3).map(Some).collect::<Vec<_>>())),
+                )) as ArrayRef,
+            ),
+        ])
+        .expect("the batch");
+        let file = std::fs::File::create(&path).expect("the file");
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None).expect("the writer");
+        writer.write(&batch).expect("the rows");
+        writer.close().expect("closing");
+        path
+    }
+
+    fn source(path: &std::path::Path, columns: Option<Vec<String>>) -> ParquetSource {
+        let reactor = moruna_testkit::FakeReactor::new();
+        ParquetSource::new(
+            ParquetSourceConfig {
+                urls: vec![path.display().to_string()],
+                columns,
+                ..ParquetSourceConfig::default()
+            },
+            Arc::new(reactor.clone()),
+            Arc::new(reactor),
+        )
+        .expect("the source")
+    }
+
+    #[test]
+    fn a_range_reads_own_rows_only_where_its_pages_can_be_located() {
+        let path = file("own-rows");
+        // A repeated column's header gives no rows, so its pages cannot be located (3A).
+        let all = source(&path, None);
+        let split = all.plan().expect("the plan").remove(0);
+        assert!(split.sub_splittable);
+        assert!(!all.range_reads_own_rows(&split));
+
+        // Without it, they can; until a range of the group finds they cannot.
+        let ids = source(&path, Some(vec!["id".to_string()]));
+        let split = ids.plan().expect("the plan").remove(0);
+        assert!(ids.range_reads_own_rows(&split));
+        ids.paged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back((split.id, None));
+        assert!(!ids.range_reads_own_rows(&split));
+
+        // A split this source did not plan is not one it can read part of.
+        let stranger = Split { id: 99, ..split };
+        assert!(!ids.range_reads_own_rows(&stranger));
+        std::fs::remove_dir_all(path.parent().expect("its directory")).ok();
     }
 }

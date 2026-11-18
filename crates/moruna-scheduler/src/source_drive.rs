@@ -6,6 +6,17 @@
 //! `read_ahead` in flight, polls the futures with a waker over its own parker, and pushes each
 //! result into every queue its source gives to, the batch shared (contracts d.16). It holds no
 //! scheduler lock while it waits.
+//!
+//! The arena bounds how far reading runs ahead, never how many workers decode (system design
+//! 3A, item 6.3a): a read that does not fit beside those in flight, though it fits the arena as
+//! the arena stands, is cut to the room left, from a split whose ranges read only their own rows
+//! (`cut_to_room`), rather than refused while workers idle. One kept out by what the queues hold
+//! waits for them to drain, as it did. Each read is charged twice its decoded estimate, so the
+//! reads in flight never hold more than half the arena's bytes; and what a read holds outside the
+//! arena while a worker decodes it never exceeds its own decoded bytes (Parquet's batch decode,
+//! `append` in moruna-sources), which is the arena sizing's assumption for every byte in flight.
+//! So however many workers decode at once, the process stays within the arena and the headroom
+//! above it.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -138,11 +149,13 @@ fn settle(cursor: &mut Cursor, plan: &[Split]) {
 
 /// The next range to issue, and the cursor advanced past it (f.5). `None` when the plan is
 /// exhausted. The range is recorded as issued under the same lock that advances the cursor, so
-/// a checkpoint never sees the cursor past a read it cannot find (MH 4.7).
+/// a checkpoint never sees the cursor past a read it cannot find (MH 4.7). `most_rows`, when
+/// given, cuts the range to at most that many rows (3A, `cut_to_room`); it is at least one.
 fn take_next_range(
     shared: &Shared,
     source: &SourceEnd,
     bytes: Option<u64>,
+    most_rows: Option<u64>,
 ) -> Option<(usize, RowRange, Seq, bool)> {
     let mut cursor = source.cursor.lock().unwrap_or_else(|e| e.into_inner());
     settle(&mut cursor, &source.plan);
@@ -150,7 +163,12 @@ fn take_next_range(
     let split = source.plan.get(index)?;
     let start = cursor.row_offset;
     let whole = !split.sub_splittable;
-    let end = range_end(shared, source, split, start, bytes);
+    let mut end = range_end(shared, source, split, start, bytes);
+    if let Some(most) = most_rows
+        && split.sub_splittable
+    {
+        end = end.min(start.saturating_add(most.max(1)));
+    }
     let seq = cursor.next_seq;
     cursor.next_seq += 1;
     cursor.row_offset = end;
@@ -175,7 +193,7 @@ pub(crate) fn nothing_left(shared: &Shared) -> bool {
     })
 }
 
-/// The range `take_next_range(shared, None)` would issue next, without taking it: its split's
+/// The range `take_next_range(shared, None, None)` would issue next, without taking it: its split's
 /// index and its rows. `None` when the plan is exhausted.
 fn peek_next_range(shared: &Shared, source: &SourceEnd) -> Option<(usize, RowRange)> {
     let mut cursor = source.cursor.lock().unwrap_or_else(|e| e.into_inner());
@@ -223,18 +241,73 @@ const ARENA_ROUNDING: f64 = 2.0;
 /// holding nothing but what the run keeps for itself ends the run naming its split and rows
 /// (h), rather than the drive waiting for bytes nobody will free.
 fn arena_admits(shared: &Shared, inflight: &[InFlight<'_>], charge: u64) -> bool {
-    let Some(available) = shared.alloc.available(tier0(shared)) else {
-        return true;
-    };
+    room(shared, inflight).is_none_or(|room| charge <= room) || holds_nothing(shared, inflight)
+}
+
+/// What the arena has room to charge a read beside what the reads in flight may still be
+/// charged (f.5); `None` when the allocator has no budget for the tier, which bounds nothing.
+fn room(shared: &Shared, inflight: &[InFlight<'_>]) -> Option<u64> {
+    let available = shared.alloc.available(tier0(shared))?;
     let pending: u64 = inflight.iter().map(|entry| entry.charge).sum();
-    if pending.saturating_add(charge) <= available {
-        return true;
-    }
+    Some(available.saturating_sub(pending))
+}
+
+/// Nothing the run holds is on its way to being released: no read in flight, no write in
+/// flight, no worker busy and every queue empty (`arena_admits`).
+fn holds_nothing(shared: &Shared, inflight: &[InFlight<'_>]) -> bool {
     inflight.is_empty()
         && shared.reads_in_flight.load(Ordering::SeqCst) == 0
         && shared.writes_in_flight.load(Ordering::SeqCst) == 0
         && shared.knobs.slots.busy() == 0
         && shared.queues_empty()
+}
+
+/// 3A (6.3a): the most rows from `rows.start` a read of `split` may take to be charged no more
+/// than `room`, when the read at the cursor does not fit: the arena bounds how far reading runs
+/// ahead, never how many workers decode, so a read that does not fit beside those in flight is
+/// cut to the room left rather than refused while workers idle. `None` keeps the read whole:
+/// a split whose ranges do not read only their own rows (`Source::range_reads_own_rows`, a
+/// Parquet row group whose pages cannot be located), or room for less than `morsel_min` bytes.
+fn cut_to_room(
+    shared: &Shared,
+    source: &SourceEnd,
+    split: &Split,
+    rows: RowRange,
+    room: u64,
+    learned: f64,
+) -> Option<u64> {
+    if !split.sub_splittable || !source.source.range_reads_own_rows(split) {
+        return None;
+    }
+    let charge = |most: u64| {
+        read_charge(
+            split,
+            RowRange {
+                start: rows.start,
+                end: rows.start + most,
+            },
+            learned,
+        )
+    };
+    // The charge only grows with the rows, so the most rows that fit is found by halving.
+    let (mut fits, mut over) = (0u64, rows.end.saturating_sub(rows.start));
+    if over == 0 || charge(over) <= room {
+        return None;
+    }
+    while over - fits > 1 {
+        let mid = fits + (over - fits) / 2;
+        if charge(mid) <= room {
+            fits = mid;
+        } else {
+            over = mid;
+        }
+    }
+    let cut = RowRange {
+        start: rows.start,
+        end: rows.start + fits,
+    };
+    let decoded = estimated_bytes(split, cut) as f64 * source.decoded.ratio();
+    (fits > 0 && decoded >= shared.cfg.morsel_min as f64).then_some(fits)
 }
 
 /// A read recorded by `take_next_range` (or by a resume's recompute list) has reached the
@@ -451,14 +524,31 @@ fn issue_reads<'a>(
         let Some((index, rows)) = peek_next_range(shared, source) else {
             break;
         };
-        if !arena_admits(
-            shared,
-            inflight,
-            read_charge(&source.plan[index], rows, learned),
-        ) {
-            break;
+        let split = &source.plan[index];
+        let whole_charge = read_charge(split, rows, learned);
+        // 3A (6.3a): a read that does not fit beside those in flight, though it fits the arena as
+        // the arena stands, is cut to the room left, from a split that can be cut: it is the
+        // reads in flight that keep it out, and cutting it lets a second worker decode. One kept
+        // out by what the queues hold waits for them to drain, as before; cut, it would only
+        // trickle small morsels into the room behind a slow consumer (SC-T22). Any other waits,
+        // or is admitted for the arena to decide when the run holds nothing (`arena_admits`).
+        let mut most_rows = None;
+        if let Some(room) = room(shared, inflight)
+            && whole_charge > room
+        {
+            let kept_out_by_reads = shared
+                .alloc
+                .available(tier0(shared))
+                .is_some_and(|available| whole_charge <= available);
+            most_rows = kept_out_by_reads
+                .then(|| cut_to_room(shared, source, split, rows, room, learned))
+                .flatten();
+            if most_rows.is_none() && !holds_nothing(shared, inflight) {
+                break;
+            }
         }
-        let Some((index, rows, seq, whole)) = take_next_range(shared, source, None) else {
+        let Some((index, rows, seq, whole)) = take_next_range(shared, source, None, most_rows)
+        else {
             break;
         };
         let charge = read_charge(&source.plan[index], rows, learned);
@@ -626,6 +716,10 @@ fn submit<'a>(
         charge,
         attempts: 0,
     });
+    let charged = inflight
+        .iter()
+        .fold(0u64, |sum, entry| sum.saturating_add(entry.charge));
+    source.charged_peak.fetch_max(charged, Ordering::SeqCst);
 }
 
 /// RB5: issue again, in order, every read that met a full arena and whose wait is over, while
@@ -996,7 +1090,8 @@ fn service_helper(
         return;
     }
 
-    let Some((index, rows, seq, whole)) = take_next_range(shared, source, Some(request.bytes))
+    let Some((index, rows, seq, whole)) =
+        take_next_range(shared, source, Some(request.bytes), None)
     else {
         let _ = reply.send(Err(MorunaError::Plan(
             "the source plan is exhausted; there is nothing to probe with".into(),

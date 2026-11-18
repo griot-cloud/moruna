@@ -185,6 +185,35 @@ fn rc_f3_zero_kernels() {
     rig.controller.stop();
 }
 
+/// 3A (6.3a), the zero-kernel path: the source's target lets the read-ahead's reads fit in the
+/// arena at the drive's charge, twice what a read decodes to, so two reads are in flight and two
+/// workers can decode. It was half the arena, and one read at that target was charged the whole
+/// arena: the second worker idled.
+#[test]
+fn rc_f3_zero_kernels_read_ahead_fits_the_arena() {
+    let cfg = config(512 * MIB, 2);
+    let (arena, morsel_max) = (cfg.arena_bytes, cfg.morsel_max);
+    let rig = common::Rig::new(
+        cfg,
+        Vec::new(),
+        FakeKnobs::new(),
+        FakeSampler::new().scripted(steady(100 * MIB, 2)),
+    );
+    rig.run_up();
+
+    let writes = rig.writes();
+    let targets = morsel_targets(&writes);
+    let reads = read_aheads(&writes);
+    assert_eq!((targets.len(), reads.len()), (1, 1));
+    let (target, read_ahead) = (targets[0].1, u64::from(reads[0]));
+    assert!(
+        target * read_ahead * 2 <= arena,
+        "3A: {read_ahead} reads of {target} bytes, charged twice, fit an arena of {arena}"
+    );
+    assert_eq!(target, morsel_max.min(arena / (read_ahead * 2)));
+    rig.controller.stop();
+}
+
 /// h, failures: a sampler whose clock has stopped is not a slow sampler, it is a blind
 /// controller, and a blind controller must not keep sizing.
 #[test]

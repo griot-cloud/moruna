@@ -484,6 +484,9 @@ fn drive(
         object_metadata,
         run_id,
         arena_bytes,
+        headroom_bytes: sizing
+            .allowance(limits.memory_ceiling)
+            .saturating_sub(arena_bytes),
         sinks: topology.sinks(),
         workers: workers_max,
         sink_buffer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
