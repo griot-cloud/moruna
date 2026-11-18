@@ -60,7 +60,7 @@ fn node_answers_the_node_document_field_for_field() {
         response.json(),
         json!({
             "version": "0.7.0", "instance": INSTANCE, "cloud": "openstack",
-            "cores": 4, "memory_bytes": 8_589_934_592u64,
+            "cores": 4, "memory_bytes": 8_589_934_592u64, "job_memory_bytes": 6_849_298_432u64,
             "executors": [{ "kind": "cpu", "slots": 4 }],
             "boot_ms": 2140, "time": WALL + 5, "health": "ok"
         })

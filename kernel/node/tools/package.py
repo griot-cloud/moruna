@@ -16,6 +16,12 @@ it.
 build writes, `qcow2` for OpenStack and `vhd` for Azure, each made from that one raw disk and
 written beside it.
 
+`--system-layer` names a layer file in the format the image filesystem reads (the engine's
+layer, with `/moruna/bin/moruna`): the disk gains a second GPT partition, `moruna-system`,
+holding it whole (system design 1A, item 3.3), which the boot disk's driver serves as the read
+only disk `system`, and the payload gains `linux.layers`, the image filesystem's list naming it
+by its seal (`moruna-layers 1`, then `layer system <seal>`), for the profile to grant.
+
 All inputs are explicit local files. This command does not fetch layers, install
 host tools, acquire credentials, upload an image or start a virtual machine.
 The caller must hold the programme's shared build reservation before invoking it.
@@ -37,7 +43,7 @@ PROGRAMS = {
                    "virtio-blk", "virtio-vsock", "virtio-net", "nvme", "gve"],
     "cloud": ["moruna-node-supervisor", "devices", "netstack", "moruna-node-api", "moruna-node-platform",
               "virtio-blk", "virtio-net", "nvme", "gve", "moruna-vmbus-server", "moruna-storvsc-server",
-              "moruna-netvsc-server"],
+              "moruna-netvsc-server", "imagefs", "linux", "node-admission", "engine"],
 }
 # For tests only, never the release image: the cloud's programs, `api` with its test route.
 PROGRAMS["cloud-test"] = PROGRAMS["cloud"]
@@ -64,6 +70,107 @@ def user_c(environment):
 # The disk's formats. `raw` is the disk itself; each other one is a file beside it.
 FORMATS = ("raw", "qcow2", "vhd")
 MIB = 1024 * 1024
+# The boot payload's file naming the GUID of the image's own disk (system design 3C, item
+# 3.3), and what it holds while the image it is computed from is built.
+DISK_GUID = "disk.guid"
+PLACEHOLDER = "00000000-0000-0000-0000-000000000000"
+# The boot disk's second partition, which holds the engine's layer (system design 1A), and the
+# payload's file naming that layer for the image filesystem (item 3.3).
+SYSTEM_PARTITION = "moruna-system"
+LINUX_LAYERS = "linux.layers"
+# A layer file's first bytes, and its pages (moruna_imagefs::format).
+LAYER_MAGIC = b"MRNLAYR1"
+PAGE = 4096
+# The GPT's first partition starts at 1 MiB, its sectors are 512 bytes, and the disk keeps
+# room after its partitions for the backup table.
+FIRST_SECTOR = 2048
+SECTOR = 512
+
+
+def system_layer(path):
+    """The seal of the layer file at `path`: the SHA-256 of its header page, by which the image
+    filesystem names a layer. A file that is not whole pages of a layer is refused."""
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"the system layer must be a regular file: {path}")
+    size = path.stat().st_size
+    if size == 0 or size % PAGE:
+        raise ValueError(f"the system layer is not whole pages: {path} has {size} bytes")
+    with path.open("rb") as file:
+        header = file.read(PAGE)
+    if header[:len(LAYER_MAGIC)] != LAYER_MAGIC:
+        raise ValueError(f"the system layer is not a layer the image filesystem reads: {path}")
+    return hashlib.sha256(header).hexdigest()
+
+
+def binds(description, path):
+    """Whether the boot description's text binds the payload file `path` (`handle data:PATH
+    SLOT`)."""
+    for line in description.splitlines():
+        words = line.split()
+        if len(words) >= 3 and words[0] == "handle" and words[1] == f"data:{path}":
+            return True
+    return False
+
+
+def linux_layers(seal):
+    """The image filesystem's `layers` text naming the system layer by its seal."""
+    return f"moruna-layers 1\nlayer system {seal}\n"
+
+
+def layout(esp_mib, layer_bytes):
+    """The disk's partitions, in MiB: the EFI system partition from 1 MiB, then, when there is a
+    system layer of `layer_bytes`, `moruna-system` right after it, whole MiB; and the disk's
+    size, with room after them for the backup table. The sgdisk arguments that make them."""
+    system_mib = whole_mib(layer_bytes) // MIB if layer_bytes else 0
+    disk_mib = esp_mib + system_mib + 4
+    args = [f"--new=1:{FIRST_SECTOR}:+{esp_mib}M", "--typecode=1:ef00"]
+    system_sector = None
+    if system_mib:
+        system_sector = FIRST_SECTOR + esp_mib * MIB // SECTOR
+        args += [f"--new=2:{system_sector}:+{system_mib}M", "--typecode=2:8300",
+                 f"--change-name=2:{SYSTEM_PARTITION}"]
+    return {"disk_mib": disk_mib, "esp_mib": esp_mib, "system_mib": system_mib,
+            "system_sector": system_sector, "sgdisk": args}
+
+
+def assemble(disk, esp, layer, guid, esp_mib, cwd, run=None):
+    """Writes the raw disk at `disk`: its GPT (disk GUID `guid`) by sgdisk, run by `run` (the
+    command line's runner unless given), the EFI system partition's image `esp`, and, when
+    `layer` names one, the system layer whole at the start of `moruna-system`. The layout
+    written."""
+    run = run or command
+    planned = layout(esp_mib, layer.stat().st_size if layer else 0)
+    with disk.open("xb") as file:
+        file.truncate(planned["disk_mib"] * MIB)
+    run(["sgdisk", "--clear", f"--disk-guid={guid}", *planned["sgdisk"], disk], cwd)
+    with disk.open("r+b") as destination:
+        with esp.open("rb") as source:
+            destination.seek(FIRST_SECTOR * SECTOR)
+            shutil.copyfileobj(source, destination)
+        if layer:
+            with layer.open("rb") as source:
+                destination.seek(planned["system_sector"] * SECTOR)
+                shutil.copyfileobj(source, destination)
+    return planned
+
+
+def disk_guid(files):
+    """The GPT disk GUID of an image built from `files`, in order: the first 16 bytes of the
+    SHA-256 of their lengths and bytes, as an RFC 9562 version 8 GUID in sgdisk's text form.
+    The same files give the same GUID, and another build another, so a block driver tells the
+    disk the node booted from (the one whose GPT header names the GUID the boot payload
+    carries) from another Moruna image's disk attached as a volume."""
+    digest = hashlib.sha256()
+    for path in files:
+        data = Path(path).read_bytes()
+        digest.update(len(data).to_bytes(8, "little"))
+        digest.update(data)
+    raw = bytearray(digest.digest()[:16])
+    raw[6] = (raw[6] & 0x0F) | 0x80
+    raw[8] = (raw[8] & 0x3F) | 0x80
+    text = raw.hex().upper()
+    return f"{text[:8]}-{text[8:12]}-{text[12:16]}-{text[16:20]}-{text[20:]}"
 
 
 def command(args, cwd, env=None):
@@ -145,6 +252,8 @@ def arguments(argv=None):
     parser.add_argument("--agent-port", type=int)
     parser.add_argument("--node-memory", type=int, required=True)
     parser.add_argument("--cpus", type=int)
+    parser.add_argument("--system-layer", type=Path,
+                        help="a layer file (the engine's) for the boot disk's moruna-system partition")
     parser.add_argument("--formats", nargs="+", choices=FORMATS, default=["raw"], metavar="FORMAT",
                         help="the disk's formats, each written beside the raw disk: raw (the default), qcow2, vhd")
     args = parser.parse_args(argv)
@@ -175,6 +284,15 @@ def main():
         parser.error("output must not be inside the input asset tree")
     if out.exists():
         parser.error("output must be a new directory; existing artifacts are never removed")
+    if binds(description.read_text(), LINUX_LAYERS) and not args.system_layer:
+        parser.error(f"this description binds {LINUX_LAYERS}: pass --system-layer")
+    layer = None
+    if args.system_layer:
+        layer = args.system_layer.absolute()
+        try:
+            seal = system_layer(layer)
+        except ValueError as refused:
+            parser.error(str(refused))
     tools = ["cargo", "rustc", "grub-mkstandalone", "sgdisk", "mformat", "mmd", "mcopy"]
     if any(name != "raw" for name in args.formats):
         tools.append("qemu-img")
@@ -212,7 +330,9 @@ def main():
     unbound = sorted(present.keys() - wanted)
     if unbound:
         parser.error(f"assets the description does not bind: {', '.join(unbound)}")
-    missing = sorted(bound(text) - present.keys())
+    # What package.py writes into the payload itself is never an asset: the disk's GUID, and the
+    # system layer's list (item 3.3).
+    missing = sorted(bound(text) - present.keys() - {DISK_GUID, LINUX_LAYERS})
     if missing:
         parser.error(f"the description binds data the assets do not hold: {', '.join(missing)}")
     files = [item for name, item in present.items() if name in wanted]
@@ -223,6 +343,8 @@ def main():
         target = payload / item.relative_to(assets)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(item, target)
+    if layer:
+        (payload / LINUX_LAYERS).write_text(linux_layers(seal))
     if additions:
         rendered=out / "standalone.image"
         rendered.write_text(text)
@@ -271,9 +393,16 @@ def main():
                  "-p", "moruna-node-image", "--", description, payload,
                  args.node_memory, args.cpus, args.agent_port], kernel, host_env)
         resources = json.loads((payload / "node-resources.json").read_text())
-    command([*cargo, "run", "--locked", "--offline", "--release", "--target", host,
-             "-p", "moruna-image", "--", description, binaries, payload], kernel, host_env)
+    # The image is built once with a placeholder GUID, which names it by its content, then
+    # again with that GUID in its payload: the disk carries the GUID the boot payload says.
+    (payload / DISK_GUID).write_text(PLACEHOLDER + "\n")
+    image_command = [*cargo, "run", "--locked", "--offline", "--release", "--target", host,
+                     "-p", "moruna-image", "--", description, binaries, payload]
+    command(image_command, kernel, host_env)
     elf = target_dir / target / "release" / "moruna-microkernel"
+    guid = disk_guid([payload / "initramfs.cpio", elf, *([layer] if layer else [])])
+    (payload / DISK_GUID).write_text(guid + "\n")
+    command(image_command, kernel, host_env)
     # Preserve the real ELF machine type. The EM_386 patch used only by QEMU's
     # direct -kernel loader is deliberately not part of a GRUB boot image.
     if elf.read_bytes()[:4] != b"\x7fELF":
@@ -305,15 +434,11 @@ def main():
     for name in ("moruna-kernel.elf", "initramfs.cpio"):
         command(["mcopy", "-i", esp, payload / name, f"::/boot/{name}"], out)
     disk = out / "moruna-node.raw"
-    with disk.open("xb") as file:
-        file.truncate((esp_mib + 4) * MIB)
-    command(["sgdisk", "--clear", f"--new=1:2048:+{esp_mib}M", "--typecode=1:ef00", disk], out)
-    with disk.open("r+b") as destination, esp.open("rb") as source:
-        destination.seek(2048 * 512)
-        shutil.copyfileobj(source, destination)
+    assemble(disk, esp, layer, guid, esp_mib, out)
     images = convert(disk, args.formats)
     evidence = recorded([description, *(payload / p.relative_to(assets) for p in files), payload / "manifest",
-                         payload / "initramfs.cpio", payload / "moruna-kernel.elf", boot, disk, *images])
+                         payload / "initramfs.cpio", payload / "moruna-kernel.elf", boot, disk, *images,
+                         *([layer, payload / LINUX_LAYERS] if layer else [])])
     if cloud:
         # No launcher descriptor, resources contract or writable inputs: a cloud boots the disk.
         (out / "inputs-and-artifacts.json").write_text(json.dumps(evidence, indent=2) + "\n")

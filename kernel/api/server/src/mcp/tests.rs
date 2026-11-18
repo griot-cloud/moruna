@@ -20,6 +20,7 @@ fn api(signer: &Signer) -> Api {
             cloud: Cloud::OpenStack,
             cores: 4,
             memory_bytes: 1 << 33,
+            job_memory_bytes: 6_532 << 20,
             executors: vec![Executor {
                 kind: ExecutorKind::Cpu,
                 slots: 4,
@@ -376,6 +377,9 @@ fn api_with_job(signer: &Signer, records: usize, ended: bool) -> (Api, String) {
     let crate::api::Outcome::Wait(ticket) = outcome else {
         panic!("the submit waits for the engine");
     };
+    // The engine's check is handed the job, then its verdict starts the engine.
+    api.pump(NOW);
+    api.pump(NOW);
     engine.attempt_started();
     for n in 1..records {
         engine.log("source", &format!("line {n}"));

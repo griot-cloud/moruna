@@ -39,7 +39,7 @@ extern crate alloc;
 use alloc::{boxed::Box, format, rc::Rc, string::String, vec::Vec};
 use core::cell::RefCell;
 
-use moruna_netvsc::{ETHERNET_HEADER, Event, Netvsc, NetvscError, Shared};
+use moruna_netvsc::{ETHERNET_HEADER, Event, NDIS_VERSION, Netvsc, NetvscError, Nvsp, Shared};
 use moruna_svc::{ConnectionId, Context, Decoder, Factory, Handler, Outcome, Pending, ProtocolId};
 use moruna_vmbus::Channel;
 use net_protocol::{Info, Ring, Server, net, octets};
@@ -63,6 +63,27 @@ pub const RECEIVE_BUFFER: usize = 16 << 20;
 /// bytes, so 1,024 frames in flight.
 pub const SEND_BUFFER: usize = 6 << 20;
 
+/// How long the whole start may take, from the process's start to `net0` registered: the
+/// device manager, vmbus's offers, the channel, both buffers' GPADLs, NVSP and RNDIS. The
+/// node's services start within 5 s (1B), and a start that stops must give the first fatal
+/// line itself, naming the step it stopped at, before another service's deadline speaks.
+pub const START_NS: u64 = 4_000_000_000;
+
+/// The fatal reason for a step the start waited on past [`START_NS`]:
+/// `no answer to RNDIS initialisation within 4 s`.
+pub fn late(what: &str) -> String {
+    format!("no answer to {what} within 4 s")
+}
+
+/// Why the card did not start, for the fatal line: a step that ran past [`START_NS`] is
+/// named ([`late`]); anything else is the card's and the error's.
+pub fn not_started(instance: impl core::fmt::Display, e: NetvscError) -> String {
+    match e {
+        NetvscError::Timeout(step) => late(step),
+        e => format!("card {instance}: {e}"),
+    }
+}
+
 /// The most refusals said on the console; the rest are only counted.
 const REFUSAL_LINES: u64 = 16;
 
@@ -77,11 +98,12 @@ pub fn info<C: Channel, S: Shared>(card: &Netvsc<C, S>) -> Info {
     }
 }
 
-/// The card, in the console's words: its address, MTU and link.
+/// The card, in the console's words: its address, MTU and link, and the NVSP version the
+/// host accepted and the NDIS version stated.
 pub fn describe<C: Channel, S: Shared>(card: &Netvsc<C, S>) -> String {
     let m = octets(net_protocol::mac(card.mac()));
     format!(
-        "address {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, MTU {}, link {}, no offloads",
+        "address {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, MTU {}, link {}, no offloads, NVSP {}, NDIS {}.{}",
         m[0],
         m[1],
         m[2],
@@ -89,7 +111,10 @@ pub fn describe<C: Channel, S: Shared>(card: &Netvsc<C, S>) -> String {
         m[4],
         m[5],
         card.mtu(),
-        if card.link_up() { "up" } else { "down" }
+        if card.link_up() { "up" } else { "down" },
+        Nvsp(card.nvsp_version()),
+        NDIS_VERSION.0,
+        NDIS_VERSION.1
     )
 }
 

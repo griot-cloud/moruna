@@ -11,9 +11,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import sys
-import tarfile
 import types
 from pathlib import Path
 from typing import Any
@@ -159,14 +157,14 @@ def test_signing_without_cryptography_names_the_extra(
 
 def test_a_prefix_s_object_is_named_by_the_function_and_its_sha256_and_keeps_its_query() -> None:
     sha = "ab" * 32
-    want = f"https://acct.blob.core.windows.net/functions/add-one-{sha}.tar?{SAS}"
+    want = f"https://acct.blob.core.windows.net/functions/add-one-{sha}.mia?{SAS}"
     for prefix in (
         f"https://acct.blob.core.windows.net/functions?{SAS}",
         f"https://acct.blob.core.windows.net/functions/?{SAS}",
     ):
         assert register.destination(prefix, "add-one", sha) == (want, want)
     bare = register.destination("https://store.example", "add-one", sha)
-    assert bare == (f"https://store.example/add-one-{sha}.tar",) * 2
+    assert bare == (f"https://store.example/add-one-{sha}.mia",) * 2
 
 
 def test_a_callable_store_gives_its_two_urls() -> None:
@@ -177,7 +175,7 @@ def test_a_callable_store_gives_its_two_urls() -> None:
         return f"https://s3.example/b/{name}?put", f"https://s3.example/b/{name}?get"
 
     put, address = register.destination(presign, "f", "cd" * 32)
-    assert names == [f"f-{'cd' * 32}.tar"]
+    assert names == [f"f-{'cd' * 32}.mia"]
     assert (put, address) == (
         f"https://s3.example/b/{names[0]}?put",
         f"https://s3.example/b/{names[0]}?get",
@@ -213,7 +211,7 @@ def test_an_upload_puts_the_file_as_a_block_blob(tmp_path: Path, store: Any) -> 
     put = store.requests[-1]
     assert (put.method, put.query) == ("PUT", SAS)
     assert put.headers["x-ms-blob-type"] == "BlockBlob"
-    assert put.headers["content-type"] == "application/x-tar"
+    assert put.headers["content-type"] == "application/octet-stream"
     assert put.headers["content-length"] == str(image.size)
 
 
@@ -260,7 +258,7 @@ def test_publish_signs_uploads_and_registers(tmp_path: Path, store: Any, operato
     )  # fmt: skip
     (registration,) = node.registered
     assert answered is registration
-    object_path = f"/functions/add-one-{image.sha256}.tar"
+    object_path = f"/functions/add-one-{image.sha256}.mia"
     assert registration.name == "add-one"
     assert registration.sha256 == image.sha256
     assert registration.address == f"{store.url}{object_path}?{SAS}"
@@ -304,91 +302,85 @@ def test_nothing_is_registered_when_the_upload_fails(
 # The image as one file ------------------------------------------------------------------------
 
 
-def members(path: Path) -> dict[str, bytes]:
-    with tarfile.open(path) as archive_file:
-        return {
-            m.name: archive_file.extractfile(m).read()  # type: ignore[union-attr]
-            for m in archive_file.getmembers()
-            if m.isfile()
-        }
+class Writer:
+    """What the engine's ``_core.image_archive`` is to ``pack``: here it writes ``bytes`` and
+    answers their SHA-256 and length, and keeps what it was asked."""
+
+    def __init__(self, data: bytes = b"MRNIMAG1 an archive", error: str | None = None) -> None:
+        self.data = data
+        self.error = error
+        self.calls: list[tuple[str, str, str]] = []
+
+    def __call__(self, layout: str, reference: str, out: str) -> tuple[str, int]:
+        self.calls.append((layout, reference, out))
+        if self.error is not None:
+            raise ValueError(self.error)
+        Path(out).write_bytes(self.data)
+        return hashlib.sha256(self.data).hexdigest(), len(self.data)
 
 
-def test_an_image_is_one_file_an_oci_layout_of_it_alone(project: Project, tmp_path: Path) -> None:  # noqa: F811
-    out = tmp_path / "images"
-    first = project.build(project.task("kernel_a", platform=X86_64), out=out, platform=X86_64)
-    project.build(project.task("kernel_b", platform=X86_64), out=out, platform=X86_64)
-    packed = register.pack(first, tmp_path / "work")
-    assert packed.sha256 == hashlib.sha256(packed.path.read_bytes()).hexdigest()
-    assert packed.size == packed.path.stat().st_size
-    files = members(packed.path)
-    assert json.loads(files["oci-layout"]) == {"imageLayoutVersion": "1.0.0"}
-    index = json.loads(files["index.json"])
-    (manifest_entry,) = index["manifests"]
-    assert manifest_entry["digest"] == first.digest
-    assert manifest_entry["annotations"]["org.opencontainers.image.ref.name"] == first.key
-    manifest = json.loads(files[f"blobs/sha256/{first.digest.split(':')[1]}"])
-    layers = [layer["digest"] for layer in manifest["layers"]]
-    wanted = {first.digest, manifest["config"]["digest"], *layers}
-    blobs = {name.split("/")[-1] for name in files if name.startswith("blobs/")}
-    # Its own blobs only, though the layout holds kernel_b's image too.
-    assert blobs == {digest.split(":")[1] for digest in wanted}
-    for name, data in files.items():
-        if name.startswith("blobs/"):
-            assert hashlib.sha256(data).hexdigest() == name.split("/")[-1]
-    # Every entry as the reproducible tar writes it.
-    with tarfile.open(packed.path) as archive_file:
-        for member in archive_file.getmembers():
-            assert (member.mtime, member.uid, member.gid) == (0, 0, 0)
+def built(project: Project, tmp_path: Path) -> Any:  # noqa: F811
+    return project.build(
+        project.task("kernel_a", platform=X86_64), out=tmp_path / "images", platform=X86_64
+    )
 
 
-def test_one_image_packs_to_one_file_bit_for_bit(project: Project, tmp_path: Path) -> None:  # noqa: F811
-    task = project.task("kernel_a", platform=X86_64)
-    built = project.build(task, out=tmp_path / "images", platform=X86_64)
-    again = project.build(task, out=tmp_path / "images", platform=X86_64)
-    assert again.reused
-    one = register.pack(built, tmp_path / "one")
-    two = register.pack(again, tmp_path / "two")
-    assert (one.sha256, one.size) == (two.sha256, two.size)
-    assert one.path.read_bytes() == two.path.read_bytes()
-
-
-def test_a_layout_missing_a_blob_or_its_manifest_is_refused(
+def test_pack_writes_the_image_s_archive_named_by_its_digest(
     project: Project,  # noqa: F811
     tmp_path: Path,
 ) -> None:
-    built = project.build(
-        project.task("kernel_a", platform=X86_64), out=tmp_path / "images", platform=X86_64
+    image = built(project, tmp_path)
+    writer = Writer()
+    packed = register.pack(image, tmp_path / "work", writer=writer)
+    out = tmp_path / "work" / f"{image.digest.split(':')[1]}.mia"
+    assert writer.calls == [(str(image.layout), image.digest, str(out))]
+    assert packed == register.Archive(
+        out, hashlib.sha256(writer.data).hexdigest(), len(writer.data)
     )
-    manifest = json.loads(
-        (built.layout / "blobs" / "sha256" / built.digest.split(":")[1]).read_bytes()
-    )
-    layer = manifest["layers"][-1]["digest"].split(":")[1]
-    (built.layout / "blobs" / "sha256" / layer).unlink()
-    with pytest.raises(register.Refused, match="has no blob"):
-        register.pack(built, tmp_path / "work")
-    (built.layout / "blobs" / "sha256" / built.digest.split(":")[1]).unlink()
-    with pytest.raises(register.Refused, match="manifest cannot be read"):
-        register.pack(built, tmp_path / "work")
+    assert out.read_bytes() == writer.data
+    # Packed again: the archive made before is replaced, never appended to or refused.
+    again = register.pack(image, tmp_path / "work", writer=Writer(b"MRNIMAG1 again"))
+    assert again.path.read_bytes() == b"MRNIMAG1 again"
 
 
-def test_register_built_publishes_the_packed_image(
+def test_an_image_that_cannot_be_an_archive_is_refused_naming_the_task(
+    project: Project,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    image = built(project, tmp_path)
+    with pytest.raises(register.Refused, match=r"kernel_a: .*a layer the converter refuses"):
+        register.pack(
+            image, tmp_path / "work", writer=Writer(error="a layer the converter refuses")
+        )
+
+
+def test_pack_without_a_writer_is_the_engine_s(
+    project: Project,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = built(project, tmp_path)
+    writer = Writer()
+    core = types.ModuleType("_core")
+    core.image_archive = writer  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, f"{support.BUILDER_PACKAGE}._core", core)
+    register.pack(image, tmp_path / "work")
+    assert len(writer.calls) == 1
+
+
+def test_register_built_publishes_the_packed_archive(
     project: Project,  # noqa: F811
     tmp_path: Path,
     store: Any,
     operator: Any,
 ) -> None:
-    built = project.build(
-        project.task("kernel_a", platform=X86_64), out=tmp_path / "images", platform=X86_64
-    )
+    image = built(project, tmp_path)
     node = Node()
+    writer = Writer(b"MRNIMAG1 kernel_a's archive")
     register.register_built(
-        built, node, name="kernel-a", store=f"{store.url}/f", key=pkcs8(operator),
-        work=tmp_path / "work", context=store.context(),
+        image, node, name="kernel-a", store=f"{store.url}/f", key=pkcs8(operator),
+        work=tmp_path / "work", context=store.context(), writer=writer,
     )  # fmt: skip
     (registration,) = node.registered
-    uploaded = store.objects[f"/f/kernel-a-{registration.sha256}.tar"]
-    assert hashlib.sha256(uploaded).hexdigest() == registration.sha256
-    saved = tmp_path / "uploaded.tar"
-    saved.write_bytes(uploaded)
-    index = json.loads(members(saved)["index.json"])
-    assert [m["digest"] for m in index["manifests"]] == [built.digest]
+    assert registration.sha256 == hashlib.sha256(writer.data).hexdigest()
+    assert store.objects[f"/f/kernel-a-{registration.sha256}.mia"] == writer.data

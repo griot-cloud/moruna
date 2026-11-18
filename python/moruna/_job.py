@@ -953,8 +953,9 @@ def register(  # noqa: PLR0913, the build's keywords as ``job.build`` takes them
     token) by name, for a job to run there (system design 3E and 5C, work item 5.4).
 
     Its image is built as ``job.build`` builds one, for ``platform`` (the node's,
-    ``linux/x86_64``, by default) into the OCI layout ``out``; packed into one file, a tar of an
-    OCI image layout holding that image; signed with ``key``, the operator's Ed25519 private
+    ``linux/x86_64``, by default) into the OCI layout ``out``; converted here into the layer
+    files Moruna's image filesystem serves and packed as one Moruna image archive, which the
+    node runs in place; signed with ``key``, the operator's Ed25519 private
     key in PKCS#8 (PEM or DER, its bytes, its text or its file's path), whose public half is one
     of node config's ``functions.keys``; uploaded to ``store``, object storage the node reads
     over HTTPS (an ``https://`` prefix, which may carry an Azure SAS, or a callable from the

@@ -1,4 +1,9 @@
 //! Launches only the boot-granted engine; channel possession is admission authority.
+//!
+//! Volumes (system design 3C, item 3.3): through the device manager's directory (the
+//! `directory` slot, when the node links one) it knows the node's disks by serial. Every check
+//! is given them as data ([`node_protocol::VOLUMES_SLOT`]), so `validate` refuses a volume no
+//! disk has, and the boot disk; `launch` resolves a job's volumes again, `Invalid` for either.
 #![no_std]
 #![no_main]
 #![forbid(unsafe_code)]
@@ -6,6 +11,7 @@ extern crate alloc;
 mod authority;
 use alloc::{boxed::Box, collections::BTreeMap, rc::Rc, string::String, vec::Vec};
 use core::cell::RefCell;
+use devices_protocol::{Block, directory};
 use moruna_svc::{
     Channel, Completions, Context, Decoder, Dispatcher, Handle, Handler, Outcome, Pending,
     ProtocolId, Signals, Status, Watch, Wire,
@@ -13,10 +19,13 @@ use moruna_svc::{
 use moruna_sys::{Account, Console, ObjectType, Process, Rights, println, start};
 use netstack_protocol::net;
 use node_protocol::{CANCELLED, CHECK_BYTES, MAX_JOBS, Needs, RUNNING, TERMINATED, admission};
-moruna_sys::main!(run);
 
-/// The account of admission's client of the network server (item 3.4).
+/// The account of admission's client of the network server (item 3.4), carved from its own.
 const NETWORK_BYTES: u64 = 4 << 20;
+
+/// How long the device manager's directory has to list the node's disks.
+const DIRECTORY_NS: u64 = 10_000_000_000;
+moruna_sys::main!(run);
 
 struct Job {
     owner: u64,
@@ -43,9 +52,9 @@ struct Shared {
     shutdown_done: bool,
     shutdown: Option<Pending>,
     backends: BTreeMap<String, Channel>,
-    /// The node's memory, the machine account's limit, which the supervisor sends at start
-    /// (item 1.4): a job's budget is at most this less 768 MiB (system design 3A).
-    node_memory: u64,
+
+    /// The server's own account: every job's is carved from it (system design 3A).
+    own: Option<Account>,
     /// Where each check's account is carved from: `CHECK_BYTES` of the server's own account,
     /// set aside at start when it serves `api`. `None`: checks are unavailable.
     check_account: Option<Account>,
@@ -55,7 +64,24 @@ struct Shared {
     /// on every name at 443, from which each job's network is minted (system design 3D, item
     /// 3.4). It never connects itself. `None`: jobs that name hosts are refused.
     network: Option<net::Client>,
+    /// The device manager's directory, through which the node's disks are listed (item 3.3):
+    /// `None` on a node that links none, which then has no volumes.
+    directory: Option<Channel>,
 }
+
+/// The node's disks, as the device manager's directory lists them; none without a directory.
+fn node_blocks(shared: &Rc<RefCell<Shared>>) -> Result<Vec<Block>, admission::Error> {
+    let state = shared.borrow();
+    let Some(listener) = &state.directory else {
+        return Ok(Vec::new());
+    };
+    let channel = moruna_svc::connect(listener).map_err(|_| admission::Error::Unavailable)?;
+    let mut client = directory::Client::connect(channel, moruna_svc::deadline_in(DIRECTORY_NS))
+        .map_err(|_| admission::Error::Unavailable)?;
+    client.core().set_timeout(DIRECTORY_NS);
+    client.blocks().map_err(|_| admission::Error::Unavailable)
+}
+
 struct End {
     shared: Rc<RefCell<Shared>>,
     job: u64,
@@ -128,6 +154,17 @@ fn launch_job(
     } = launch;
     if !node_protocol::valid_needs(&needs) {
         return Err(admission::Error::Invalid);
+    }
+    if !needs.1.is_empty() {
+        // A job's volumes, resolved again: a serial no disk has, the boot disk, or a sink's
+        // volume served read only is refused, as the check refused it.
+        if shared.borrow().directory.is_none() {
+            return Err(admission::Error::Unavailable);
+        }
+        let blocks = node_blocks(shared)?;
+        if node_protocol::resolve(&needs.1, &blocks).is_err() {
+            return Err(admission::Error::Invalid);
+        }
     }
     if services.len() > node_protocol::MAX_GRANTS {
         return Err(admission::Error::Invalid);
@@ -262,8 +299,20 @@ impl Handler for Session {
     fn handle(&mut self, cx: &mut Context<'_>, ordinal: u16, d: &mut Decoder<'_>) -> Outcome {
         let owner = cx.connection();
         self.owner = Some(owner);
-        if !(1..=6).contains(&ordinal) {
+        if !(1..=7).contains(&ordinal) {
             return Outcome::Status(Status::UnknownMethod);
+        }
+        if ordinal == 7 {
+            if args::<()>(d).is_none() {
+                return Outcome::Status(Status::BadMessage);
+            }
+            // The job bound (system design 3A): this server's account less the check account
+            // and its own.
+            let state = self.shared.borrow();
+            return match state.own.as_ref().and_then(|own| own.usage().ok()) {
+                Some(usage) => Outcome::reply(node_protocol::budget_max(usage.limit)),
+                None => failure(admission::Error::Unavailable),
+            };
         }
         if ordinal == 6 {
             let Some((config, names, grants, services)) =
@@ -277,20 +326,27 @@ impl Handler for Session {
             };
         }
         if ordinal == 1 {
-            // The arguments in order: the first six, then the job's needs.
-            let Some(((account, budget, config, names, grants, services), needs)) =
-                args::<(
-                    (Handle, u64, Handle, Vec<String>, Vec<Handle>, Vec<String>),
-                    Needs,
-                )>(d)
+            let Some((budget, config, names, grants, services, needs)) =
+                args::<(u64, Handle, Vec<String>, Vec<Handle>, Vec<String>, Needs)>(d)
             else {
                 return Outcome::Status(Status::BadMessage);
             };
-            // A job's budget is at most the node's memory less 768 MiB (system design 3A).
-            let node_memory = self.shared.borrow().node_memory;
-            if let Err(e) = node_protocol::admits(budget, node_memory) {
-                return failure(e);
-            }
+            // The job's account is carved from this server's own (system design 3A), and its
+            // budget is at most that account less the check account and its own overhead.
+            let account = {
+                let state = self.shared.borrow();
+                let Some(own) = state.own.as_ref() else {
+                    return failure(admission::Error::Unavailable);
+                };
+                let limit = own.usage().map(|u| u.limit).unwrap_or(0);
+                if let Err(e) = node_protocol::admits(budget, limit) {
+                    return failure(e);
+                }
+                match duplicate(own) {
+                    Ok(handle) => handle,
+                    Err(e) => return failure(e),
+                }
+            };
             return match launch_job(
                 &self.shared,
                 owner,
@@ -367,10 +423,15 @@ fn check_job(
     shared: &Rc<RefCell<Shared>>,
     owner: u64,
     config: Handle,
-    names: Vec<String>,
-    grants: Vec<Handle>,
+    mut names: Vec<String>,
+    mut grants: Vec<Handle>,
     services: Vec<String>,
 ) -> Result<u64, admission::Error> {
+    // The node's volumes, which the check refuses a job's against (item 3.3).
+    let volumes = node_protocol::volumes_data(&node_blocks(shared)?)
+        .map_err(|_| admission::Error::Unavailable)?;
+    names.push(node_protocol::VOLUMES_SLOT.into());
+    grants.push(volumes);
     let account = {
         let state = shared.borrow();
         if state.check.is_some_and(|id| state.jobs.contains_key(&id)) {
@@ -380,11 +441,7 @@ fn check_job(
             .check_account
             .as_ref()
             .ok_or(admission::Error::Unavailable)?;
-        let rights = check.0.info().map_err(|_| admission::Error::Unavailable)?.1;
-        check
-            .0
-            .duplicate(rights)
-            .map_err(|_| admission::Error::Unavailable)?
+        duplicate(check)?
     };
     let id = launch_job(
         shared,
@@ -403,15 +460,22 @@ fn check_job(
     Ok(id)
 }
 
-/// The node's memory, as the supervisor's message on `supervisor` carries it.
-fn read_node_memory(supervisor: Handle) -> Option<u64> {
-    let mut bytes = [0u8; 16];
-    let mut handles = [None];
-    let (count, carried) = Channel(supervisor).read(&mut bytes, &mut handles).ok()?;
-    moruna_node::Bootstrap::platform_memory(&bytes[..count], carried)
+/// A handle to `account` with its rights, for a carve.
+fn duplicate(account: &Account) -> Result<Handle, admission::Error> {
+    let rights = account
+        .0
+        .info()
+        .map_err(|_| admission::Error::Unavailable)?
+        .1;
+    account
+        .0
+        .duplicate(rights)
+        .map_err(|_| admission::Error::Unavailable)
 }
 
-struct ControlSession(Rc<RefCell<Shared>>, Rc<authority::Authority>);
+/// The control channel's session; the storage authority is `None` on a node that serves `api`
+/// with no storage (system design 3A: jobs reach data through volumes and the network).
+struct ControlSession(Rc<RefCell<Shared>>, Option<Rc<authority::Authority>>);
 impl Handler for ControlSession {
     fn protocol(&self) -> ProtocolId {
         node_protocol::control::ID
@@ -421,9 +485,9 @@ impl Handler for ControlSession {
             let Some(id) = args::<u64>(d) else {
                 return Outcome::Status(Status::BadMessage);
             };
-            return match self.1.revoke(id) {
-                Ok(()) => Outcome::reply(()),
-                Err(()) => Outcome::Failure(1),
+            return match self.1.as_ref().map(|authority| authority.revoke(id)) {
+                Some(Ok(())) => Outcome::reply(()),
+                _ => Outcome::Failure(1),
             };
         }
         if ordinal != 1 {
@@ -486,7 +550,10 @@ fn initial_job(
         .ok_or(admission::Error::Invalid)?;
     let initial =
         moruna_node::InitialJob::parse(&bytes[..end]).map_err(|_| admission::Error::Invalid)?;
-    let account = start::take("account").ok_or(admission::Error::Unavailable)?;
+    let account = {
+        let state = shared.borrow();
+        duplicate(state.own.as_ref().ok_or(admission::Error::Unavailable)?)?
+    };
     let config = start::take("initial-config").ok_or(admission::Error::Unavailable)?;
     let mut names = Vec::new();
     let mut grants = Vec::new();
@@ -559,14 +626,9 @@ fn run() -> i64 {
     let Some(control) = start::take("control").map(Channel) else {
         return 1;
     };
-    let Some(node_memory) = start::take("supervisor").and_then(read_node_memory) else {
-        println!(
-            console,
-            "moruna: fatal node-admission: the node's memory is not known: the supervisor sent \
-             none on `supervisor`"
-        );
-        return 1;
-    };
+
+    // Its own account: what every job, the check account and the network client are carved
+    // from (system design 3A; node.conf gives it the rest of the node's memory).
     let own = start::take("account").map(Account);
     // The job network's client (item 3.4), on its own small account: the memory it lends the
     // network server, and the clients of the channels it mints.
@@ -609,25 +671,56 @@ fn run() -> i64 {
         shutdown_done: false,
         shutdown: None,
         backends: BTreeMap::new(),
-        node_memory,
+        own,
         check_account,
         check: None,
         network,
+        directory: start::take("directory").map(Channel),
     }));
-    let Some(policy) = start::take("storage.grants") else {
-        return 1;
-    };
-    let (authority_channel, authority_kind) = match (
+    // API mode: the server serves `api` and runs no initial job (system design 3A). The
+    // service it lends each job's engine is its `linux` slot (each job's network is minted for
+    // it, item 3.4), and it needs no storage: a cloud node's jobs reach data through volumes
+    // and the network.
+    let api_mode = listener.is_some() && initial.is_none();
+    if api_mode {
+        for slot in ["linux"] {
+            if let Some(handle) = start::take(slot) {
+                if handle.info().ok().map(|i| i.0) != Some(ObjectType::Channel) {
+                    return 1;
+                }
+                shared
+                    .borrow_mut()
+                    .backends
+                    .insert(String::from(slot), Channel(handle));
+            }
+        }
+    }
+    let policy = start::take("storage.grants");
+    let channels = (
         start::take("storage.authority"),
         start::take("local-home.authority"),
-    ) {
-        (Some(channel), None) => (Channel(channel), "home"),
-        (None, Some(channel)) => (Channel(channel), "local-home"),
+    );
+    let storage = match (policy, channels) {
+        (None, (None, None)) if api_mode => None,
+        (Some(policy), (Some(channel), None)) => Some((policy, Channel(channel), "home")),
+        (Some(policy), (None, Some(channel))) => Some((policy, Channel(channel), "local-home")),
         _ => return 1,
     };
-    let authority = match authority::Authority::load(shared.clone(), policy) {
-        Ok(authority) => authority,
-        Err(()) => return 1,
+    let (authority, masters) = match storage {
+        Some((policy, channel, kind)) => {
+            let authority = match authority::Authority::load(shared.clone(), policy) {
+                Ok(authority) => authority,
+                Err(()) => return 1,
+            };
+            let mut masters = alloc::vec![(channel, kind)];
+            for (slot, kind) in [("local.authority", "local")] {
+                if let Some(channel) = start::take(slot) {
+                    masters.push((Channel(channel), kind));
+                }
+            }
+            (Some(authority), masters)
+        }
+        None => (None, Vec::new()),
     };
     let factory = shared.clone();
     let mut dispatcher = Dispatcher::new();
@@ -647,13 +740,10 @@ fn run() -> i64 {
     {
         return 1;
     }
-    let mut masters = alloc::vec![(authority_channel, authority_kind)];
-    for (slot, kind) in [("local.authority", "local")] {
-        if let Some(channel) = start::take(slot) {
-            masters.push((Channel(channel), kind));
-        }
-    }
     for (channel, kind) in masters {
+        let Some(authority) = authority.as_ref() else {
+            return 1;
+        };
         let handler = match authority.handler(&channel, kind) {
             Ok(handler) => handler,
             Err(()) => return 1,
@@ -672,7 +762,11 @@ fn run() -> i64 {
         return 1;
     }
     if let Some(initial) = initial {
-        match initial_job(&shared, initial, &authority) {
+        // An initial job always has the storage authority: only API mode goes without.
+        let Some(authority) = authority.as_ref() else {
+            return 1;
+        };
+        match initial_job(&shared, initial, authority) {
             Ok(job) => authority.owner(job),
             Err(_) => return 1,
         }

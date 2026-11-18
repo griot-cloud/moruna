@@ -6,6 +6,7 @@
 //! `initialize` only answers), so anything but the awaited completion is refused.
 
 use alloc::{format, vec, vec::Vec};
+use core::fmt;
 
 use moruna_vmbus::Channel;
 use netvsp_protocol::protocol::{self, Status, Version};
@@ -23,21 +24,36 @@ use crate::{
 pub(crate) const OFFERS: [Version; 3] = [Version::V61, Version::V6, Version::V5];
 
 /// The transactions of initialisation's requests. A sent frame's transaction is its
-/// section's index, which is below this.
+/// section's index plus one ([`transaction`]), which is below this.
 const REQUEST: u64 = 1 << 32;
+
+/// The transaction that names send section `section` to the host: its index plus one, so
+/// that it is never 0. Hyper-V neither acknowledges nor acts on a packet that asks for a
+/// completion under transaction ID 0, which is its own, for messages the guest did not
+/// ask for: Linux never hands one out for that reason (`drivers/hv/channel.c`,
+/// `vmbus_next_request_id`). netvsc sent its first RNDIS request, in section 0, under
+/// ID 0, and Azure's host never answered it (console 2026-11-18T0213, image cf0271f5).
+pub(crate) fn transaction(section: u32) -> u64 {
+    u64::from(section) + 1
+}
 
 /// The largest frame of standard Ethernet, a 1,500-byte payload and its header, which
 /// NVSP's NDIS configuration calls the MTU. It is netvsp's `DEFAULT_MTU` and its
 /// smallest: what the host uses when the guest states none.
 const FRAME: u32 = 1500 + ETHERNET_HEADER as u32;
 
-/// The NDIS version stated to the host, 6.30: what netvsp's test guest states
-/// (`send_ndis_version_message`). netvsp reads it only to list the OIDs it supports.
-const NDIS: (u32, u32) = (6, 30);
-
-/// The IDs this driver gives its receive buffer and its send buffer, as netvsp's test
-/// guest does. The host names the receive buffer by its ID in every receive.
-pub(crate) const RECEIVE_BUFFER: u16 = 0;
+/// The IDs this driver gives its receive buffer and its send buffer: Linux's hv_netvsc's,
+/// `NETVSC_RECEIVE_BUFFER_ID` 0xcafe and `NETVSC_SEND_BUFFER_ID` 0
+/// (`drivers/net/hyperv/hyperv_net.h`). The host names the receive buffer by its ID in
+/// every receive.
+///
+/// The receive buffer's must not be 0: Azure's host refused one with ID 0 with `FAILURE`
+/// (the first Azure boot of netvsc, console 2026-11-18T0146, image 4ba46ef5), where
+/// netvsp, whose test guest this driver first copied, takes any ID. Every guest that works
+/// on Hyper-V gives it an ID that is not 0: Linux and DPDK 0xcafe (`HN_NVS_RXBUF_SIG` in
+/// FreeBSD too), and Microsoft's own UEFI netvsc 0x1981 (`MsvmPkg/NetvscDxe/NetvscDxe.c`,
+/// `RECEIVE_BUFFER_ID`). Linux's send buffer ID of 0 works on Azure.
+pub(crate) const RECEIVE_BUFFER: u16 = 0xcafe;
 const SEND_BUFFER: u16 = 0;
 
 /// The receive buffer, and the sections the host cut it into.
@@ -79,15 +95,19 @@ impl<M> Sections<M> {
         Some(section)
     }
 
-    /// Frees the section a transaction names; `false` when it names none that is held.
+    /// Frees the section a transaction names ([`transaction`]); `false` when it names
+    /// none that is held.
     pub fn give(&mut self, transaction: u64) -> bool {
-        let held = usize::try_from(transaction)
-            .ok()
-            .and_then(|section| self.busy.get_mut(section));
-        match held {
+        let Some(section) = transaction
+            .checked_sub(1)
+            .and_then(|section| u32::try_from(section).ok())
+        else {
+            return false;
+        };
+        match self.busy.get_mut(section as usize) {
             Some(busy) if *busy => {
                 *busy = false;
-                self.free.push(transaction as u32);
+                self.free.push(section);
                 true
             }
             _ => false,
@@ -171,9 +191,13 @@ fn request<C: Channel, T: IntoBytes + Immutable>(
 /// `protocol_version`. Both of the message's fields carry the version offered: the
 /// protocol crate notes they were once a minimum and a maximum and now state one
 /// version.
-pub(crate) fn negotiate<C: Channel>(wire: &mut Wire<C>) -> Result<Version, NetvscError> {
+pub(crate) fn negotiate<C: Channel>(
+    wire: &mut Wire<C>,
+    say: &mut dyn FnMut(fmt::Arguments<'_>),
+) -> Result<Version, NetvscError> {
     let mut payload = [0; PAYLOAD];
     for (number, version) in OFFERS.into_iter().enumerate() {
+        say(format_args!("NVSP {} offered", crate::Nvsp(version as u32)));
         let init = protocol::MessageInit {
             protocol_version: version as u32,
             protocol_version2: version as u32,
@@ -191,8 +215,17 @@ pub(crate) fn negotiate<C: Channel>(wire: &mut Wire<C>) -> Result<Version, Netvs
             body(&payload[..len], protocol::MESSAGE_TYPE_INIT_COMPLETE, what)?;
         if complete.status == Status::SUCCESS {
             wire.negotiated(version);
+            say(format_args!(
+                "NVSP {} accepted",
+                crate::Nvsp(version as u32)
+            ));
             return Ok(version);
         }
+        say(format_args!(
+            "NVSP {} refused with status {:#x}",
+            crate::Nvsp(version as u32),
+            complete.status.0
+        ));
     }
     Err(NetvscError::Version)
 }
@@ -214,8 +247,14 @@ pub(crate) fn negotiate<C: Channel>(wire: &mut Wire<C>) -> Result<Version, Netvs
 ///
 /// Source: `netvsp_protocol`'s `Message2SendNdisConfig` and `Message1SendNdisVersion`;
 /// netvsp `initialize`, the `SendNdisConfig` and `SendNdisVersion` arms.
-pub(crate) fn configure<C: Channel>(wire: &mut Wire<C>) -> Result<(), NetvscError> {
+pub(crate) fn configure<C: Channel>(
+    wire: &mut Wire<C>,
+    say: &mut dyn FnMut(fmt::Arguments<'_>),
+) -> Result<(), NetvscError> {
     let mut payload = [0; PAYLOAD];
+    say(format_args!(
+        "NDIS configuration sent: frames of {FRAME} bytes"
+    ));
     let config = protocol::Message2SendNdisConfig {
         mtu: FRAME,
         reserved: 0,
@@ -229,9 +268,14 @@ pub(crate) fn configure<C: Channel>(wire: &mut Wire<C>) -> Result<(), NetvscErro
         "the NDIS configuration",
         &mut payload,
     )?;
+    say(format_args!(
+        "NDIS configuration completed; NDIS version {}.{} sent",
+        crate::NDIS_VERSION.0,
+        crate::NDIS_VERSION.1
+    ));
     let version = protocol::Message1SendNdisVersion {
-        ndis_major_version: NDIS.0,
-        ndis_minor_version: NDIS.1,
+        ndis_major_version: crate::NDIS_VERSION.0,
+        ndis_minor_version: crate::NDIS_VERSION.1,
     };
     request(
         wire,
@@ -241,6 +285,7 @@ pub(crate) fn configure<C: Channel>(wire: &mut Wire<C>) -> Result<(), NetvscErro
         "the NDIS version",
         &mut payload,
     )?;
+    say(format_args!("NDIS version completed"));
     Ok(())
 }
 
@@ -254,8 +299,17 @@ pub(crate) fn configure<C: Channel>(wire: &mut Wire<C>) -> Result<(), NetvscErro
 pub(crate) fn receive_buffer<C: Channel, S: Shared>(
     wire: &mut Wire<C>,
     buffer: Buffer<S>,
+    say: &mut dyn FnMut(fmt::Arguments<'_>),
 ) -> Result<Receive<S>, NetvscError> {
+    say(format_args!(
+        "receive buffer: sharing {} bytes",
+        buffer.memory.len()
+    ));
     let gpadl_handle = wire.channel.share(buffer.id)?;
+    say(format_args!(
+        "receive buffer: GPADL {:#x} made; sent with ID {RECEIVE_BUFFER:#x}",
+        gpadl_handle.0
+    ));
     let memory = buffer.memory;
     let what = "the receive buffer";
     let mut payload = [0; PAYLOAD];
@@ -281,6 +335,7 @@ pub(crate) fn receive_buffer<C: Channel, S: Shared>(
         return Err(NetvscError::Refused {
             step: what,
             status: complete.status.0,
+            nvsp: wire.version(),
         });
     }
     if complete.num_sections != 1 {
@@ -298,13 +353,18 @@ pub(crate) fn receive_buffer<C: Channel, S: Shared>(
         .and_then(|sections| sections.checked_add(start))
         .filter(|end| *end <= memory.len());
     match end {
-        Some(end) if count > 0 && section >= rndis::DATA + ETHERNET_HEADER => Ok(Receive {
-            memory,
-            start,
-            end,
-            section,
-            count,
-        }),
+        Some(end) if count > 0 && section >= rndis::DATA + ETHERNET_HEADER => {
+            say(format_args!(
+                "receive buffer accepted: {count} sections of {section} bytes from byte {start}"
+            ));
+            Ok(Receive {
+                memory,
+                start,
+                end,
+                section,
+                count,
+            })
+        }
         _ => Err(NetvscError::Malformed(format!(
             "{count} receive sections of {section} bytes from byte {start}, in a buffer of {} bytes",
             memory.len()
@@ -322,8 +382,17 @@ pub(crate) fn receive_buffer<C: Channel, S: Shared>(
 pub(crate) fn send_buffer<C: Channel, S: Shared>(
     wire: &mut Wire<C>,
     buffer: Buffer<S>,
+    say: &mut dyn FnMut(fmt::Arguments<'_>),
 ) -> Result<Sections<S>, NetvscError> {
+    say(format_args!(
+        "send buffer: sharing {} bytes",
+        buffer.memory.len()
+    ));
     let gpadl_handle = wire.channel.share(buffer.id)?;
+    say(format_args!(
+        "send buffer: GPADL {:#x} made; sent with ID {SEND_BUFFER:#x}",
+        gpadl_handle.0
+    ));
     let memory = buffer.memory;
     let what = "the send buffer";
     let mut payload = [0; PAYLOAD];
@@ -349,6 +418,7 @@ pub(crate) fn send_buffer<C: Channel, S: Shared>(
         return Err(NetvscError::Refused {
             step: what,
             status: complete.status.0,
+            nvsp: wire.version(),
         });
     }
     let size = complete.section_size as usize;
@@ -363,5 +433,8 @@ pub(crate) fn send_buffer<C: Channel, S: Shared>(
             memory.len()
         )));
     }
+    say(format_args!(
+        "send buffer accepted: {count} sections of {size} bytes"
+    ));
     Ok(Sections::new(memory, size, count))
 }

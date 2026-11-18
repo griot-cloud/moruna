@@ -2099,6 +2099,7 @@ dependencies = [
 name = "moruna-micro"
 version = "0.6.6"
 dependencies = [
+ "block-protocol",
  "imagefs-protocol",
  "libc",
  "linux-protocol",
@@ -2223,6 +2224,7 @@ dependencies = [
  "moruna-cost",
  "moruna-discovery",
  "moruna-event",
+ "moruna-image",
  "moruna-job",
  "moruna-kernel",
  "moruna-kernels",

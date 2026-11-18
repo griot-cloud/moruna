@@ -24,6 +24,8 @@ moruna-vmbus = { path = "../../vmbus/core", version = "=0.1.0" }
 vmbus-protocol = { path = "../../vmbus/protocol", version = "=0.1.0" }
 block-protocol = { path = "../../block-protocol", version = "=0.1.0" }
 devices-protocol = { path = "../../../devices/protocol", version = "=0.1.0" }
+# The boot disk's GPT, and its `moruna-system` partition served as a window (item 3.3).
+moruna-disk = { path = "../../disk", version = "=0.1.0" }
 
 [target.'cfg(target_os = "none")'.dependencies]
 moruna-sys.workspace = true

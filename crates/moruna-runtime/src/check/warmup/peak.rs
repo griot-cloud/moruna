@@ -1,7 +1,10 @@
 //! The high-water marks a unit's peak memory is read from (SDD 24 p.4): what was in use at the
 //! most, over the call, and never a reading before and after it.
 //!
-//! - **The arena**: `moruna_arena::Arena::host_peak`, exact, reset at the unit's start.
+//! - **The arena**: `moruna_arena::Arena::host_peak`, reset at the unit's start, exact to within
+//!   threads × `moruna_arena::REFILL_QUANTUM` (SDD 02 AR-I5): never below the most the arena held
+//!   at once, but a thread's cached free slots count as in use, so a unit's spike may understate
+//!   by at most threads × the quantum, what the caches gave back after the reset.
 //! - **Moruna's counting allocator** ([`CountingAllocator`]): a program that installs it as its
 //!   global allocator (the Python extension does, and the tests) has every heap byte the
 //!   process allocates through Rust counted, exactly, with a mark reset at the unit's start.

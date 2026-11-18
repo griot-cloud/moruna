@@ -134,7 +134,7 @@ fn a_client_initializes_lists_and_calls_each_tool() {
     let node = answer(&post(&mut harness, client, &admin, &call("moruna_node")), 3);
     let document = json!({
         "version": "0.7.0", "instance": INSTANCE, "cloud": "openstack",
-        "cores": 4, "memory_bytes": 8_589_934_592u64,
+        "cores": 4, "memory_bytes": 8_589_934_592u64, "job_memory_bytes": 6_849_298_432u64,
         "executors": [{ "kind": "cpu", "slots": 4 }],
         "boot_ms": 2140, "time": WALL + 2, "health": "ok"
     });

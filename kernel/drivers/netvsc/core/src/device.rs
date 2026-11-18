@@ -2,7 +2,7 @@
 //! send-buffer sections and in from receive-buffer sections.
 
 use alloc::{collections::VecDeque, format, string::String, vec::Vec};
-use core::ops::Range;
+use core::{fmt, ops::Range};
 
 use moruna_vmbus::Channel;
 use netvsp_protocol::{
@@ -113,6 +113,21 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         send: Buffer<S>,
         deadline: Option<u64>,
     ) -> Result<Netvsc<C, S>, NetvscError> {
+        Netvsc::start_saying(channel, receive, send, deadline, &mut |_| {})
+    }
+
+    /// [`start`](Netvsc::start), saying each step to `say` as it is taken, and what the
+    /// host answered: the NVSP version, the NDIS configuration and version, each buffer
+    /// shared, sent and accepted (with its sections), RNDIS's initialisation, the address,
+    /// the MTU, the packet filter and the link. A start that stops is seen to stop after
+    /// the last line said.
+    pub fn start_saying(
+        channel: C,
+        receive: Buffer<S>,
+        send: Buffer<S>,
+        deadline: Option<u64>,
+        say: &mut dyn FnMut(fmt::Arguments<'_>),
+    ) -> Result<Netvsc<C, S>, NetvscError> {
         for (bytes, what) in [
             (
                 receive.memory.len(),
@@ -125,10 +140,10 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
             }
         }
         let mut wire = Wire::new(channel, deadline);
-        nvsp::negotiate(&mut wire)?;
-        nvsp::configure(&mut wire)?;
-        let receive = nvsp::receive_buffer(&mut wire, receive)?;
-        let send = nvsp::send_buffer(&mut wire, send)?;
+        nvsp::negotiate(&mut wire, say)?;
+        nvsp::configure(&mut wire, say)?;
+        let receive = nvsp::receive_buffer(&mut wire, receive, say)?;
+        let send = nvsp::send_buffer(&mut wire, send, say)?;
         let mut card = Netvsc {
             wire,
             longest: receive.section,
@@ -147,9 +162,19 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
             owed: VecDeque::new(),
             frame: Vec::new(),
         };
+        say(format_args!("RNDIS initialisation sent"));
         card.initialize()?;
+        say(format_args!("RNDIS initialised"));
+        say(format_args!("address queried"));
         card.mac = card.address()?;
+        let m = card.mac;
+        say(format_args!(
+            "address {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            m[0], m[1], m[2], m[3], m[4], m[5]
+        ));
+        say(format_args!("MTU queried"));
         card.mtu = card.frame_size()?;
+        say(format_args!("MTU {}", card.mtu));
         card.longest = card.mtu as usize + ETHERNET_HEADER;
         // The largest frame and its RNDIS fields must fit one send section, or some
         // frames could never be sent: the card would not be one. Checked before the
@@ -162,8 +187,14 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
                 section: card.send.size,
             });
         }
+        say(format_args!("packet filter {FILTER:#x} sent"));
         card.filter()?;
         card.wire.flush()?;
+        say(format_args!("packet filter set"));
+        say(format_args!(
+            "link {}",
+            if card.link { "up" } else { "down" }
+        ));
         Ok(card)
     }
 
@@ -176,6 +207,11 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
     /// header.
     pub fn mtu(&self) -> u32 {
         self.mtu
+    }
+
+    /// The NVSP version the host accepted, as NVSP numbers it: `0x60001` is 6.1.
+    pub fn nvsp_version(&self) -> u32 {
+        self.wire.version().unwrap_or_default()
     }
 
     /// Whether the link is up, as the host last indicated.
@@ -247,7 +283,7 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         self.send.memory.write(at + rndis::DATA, frame);
         let sent = self.name(section, protocol::DATA_CHANNEL_TYPE, message)?;
         if !sent {
-            self.send.give(section.into());
+            self.send.give(nvsp::transaction(section));
         }
         Ok(sent)
     }
@@ -282,8 +318,8 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
     }
 
     /// Names the RNDIS message of `len` bytes in `section` to the host; `Ok(false)` when
-    /// the ring has no room. The transaction is the section, so the host's completion
-    /// says which section to free.
+    /// the ring has no room. The transaction is the section's ([`nvsp::transaction`],
+    /// never 0), so the host's completion says which section to free.
     fn name(&mut self, section: u32, channel_type: u32, len: usize) -> Result<bool, NetvscError> {
         let packet = protocol::Message1SendRndisPacket {
             channel_type,
@@ -295,7 +331,7 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
             .message(protocol::MESSAGE1_TYPE_SEND_RNDIS_PACKET, &packet);
         self.wire.put(
             OutgoingPacketType::InBandWithCompletion,
-            section.into(),
+            nvsp::transaction(section),
             &bytes[..size],
         )
     }
@@ -653,6 +689,7 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
             status => Err(NetvscError::Refused {
                 step,
                 status: status.unwrap_or_default(),
+                nvsp: self.wire.version(),
             }),
         }
     }

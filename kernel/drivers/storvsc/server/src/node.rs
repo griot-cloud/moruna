@@ -13,15 +13,14 @@ use core::{
     sync::atomic::AtomicU8,
 };
 
-use devices_protocol::Block;
 use moruna_storvsc::{ChannelError, Storvsc, Wait};
 use moruna_storvsc_server::{
     Controller, Driver, Node, OUTGOING_PAGES, RING_PAGES, factory, plan,
     scan::{self, Scratch},
 };
 use moruna_svc::{
-    Channel, Completions, DEADLINE_INFINITE, Dispatcher, Handle, Signals, Watch, connect,
-    deadline_in, now, wait_one,
+    CallError, Channel, Completions, DEADLINE_INFINITE, Dispatcher, Handle, Signals, Watch,
+    connect, now, wait_one,
 };
 use moruna_sys::{
     Console, Mapping, Memory, Pin, dma_release, hyperv::HvSignal, map, println, start,
@@ -34,8 +33,19 @@ use zerocopy::FromBytes;
 /// A page, as memory objects and guest page numbers count them.
 const PAGE: u64 = 4096;
 
-/// How long `vmbus` and the device manager may take to answer.
-const ANSWER_NS: u64 = 30_000_000_000;
+/// The nanoseconds left until `deadline`, at least one: the timeout of the next call.
+fn left(deadline: u64) -> u64 {
+    deadline.saturating_sub(now()).max(1)
+}
+
+/// A call's failure, by what it was for: past the start's deadline it is
+/// `no answer to <what> within 4 s`, as the scan's own steps say it.
+fn failed<E: fmt::Debug>(what: &str, e: CallError<E>) -> String {
+    match e {
+        CallError::TimedOut => format!("no answer to {what} within 4 s"),
+        other => format!("{what}: {other:?}"),
+    }
+}
 
 /// A ring's memory: a control page and its data, in the rings `vmbus` made.
 type Ring = SingleMappedRingMem<&'static [AtomicU8]>;
@@ -173,10 +183,12 @@ struct Page {
     _pin: Pin,
     page: u64,
     mapping: Mapping<'static>,
+    /// When the start must have ended: [`scan::START_NS`] after the process started.
+    deadline: u64,
 }
 
 impl Page {
-    fn new(dma: &Handle) -> Result<Page, String> {
+    fn new(dma: &Handle, deadline: u64) -> Result<Page, String> {
         let memory = Memory::create_dma(PAGE).map_err(|e| format!("DMA memory: {}", e.name()))?;
         let mut address = [0];
         let (pin, _) = Pin::create(dma, &memory.0, true, &mut address)
@@ -189,6 +201,7 @@ impl Page {
             _pin: pin,
             page,
             mapping,
+            deadline,
         })
     }
 }
@@ -204,6 +217,10 @@ impl Scratch for Page {
 
     fn now(&self) -> u64 {
         now()
+    }
+
+    fn deadline(&self) -> u64 {
+        self.deadline
     }
 }
 
@@ -239,6 +256,25 @@ impl Watch for Woken {
     }
 }
 
+/// The GUID of the image's own disk, from the boot payload's `disk.guid`, which the supervisor
+/// grants under `disk.guid` (a binding of its own, since a slot is granted to one service).
+fn image_guid(console: &Console) -> Option<moruna_disk::Guid> {
+    let handle = start::take("disk.guid")?;
+    let mut page = [0u8; PAGE as usize];
+    let read = Memory(handle)
+        .map(0, PAGE, map::READ)
+        .and_then(|m| m.read(0, &mut page));
+    if let Err(e) = read {
+        println!(console, "storvsc: reading disk.guid: {}", e.name());
+        return None;
+    }
+    let guid = moruna_disk::Guid::from_file(&page);
+    if guid.is_none() {
+        println!(console, "storvsc: disk.guid holds no GUID");
+    }
+    guid
+}
+
 fn take(name: &str) -> Result<Handle, String> {
     start::take(name).ok_or_else(|| format!("no start handle {name}"))
 }
@@ -253,19 +289,24 @@ fn controllers(
     vmbus_listener: &Channel,
     scratch: &Page,
 ) -> Result<(vmbus::Client, Vec<Scanned>), String> {
+    let deadline = scratch.deadline;
     let channel = connect(vmbus_listener).map_err(|e| format!("vmbus: {e:?}"))?;
-    let mut vmbus = vmbus::Client::connect(channel, deadline_in(ANSWER_NS))
-        .map_err(|e| format!("vmbus: {e:?}"))?;
-    vmbus.core().set_timeout(ANSWER_NS);
+    let mut vmbus =
+        vmbus::Client::connect(channel, deadline).map_err(|e| failed("vmbus's welcome", e))?;
+    vmbus.core().set_timeout(left(deadline));
     let offers = vmbus
         .offers(Class::Scsi.interface())
-        .map_err(|e| format!("vmbus's offers: {e:?}"))?;
+        .map_err(|e| failed("vmbus's offers", e))?;
     let mut found = Vec::new();
     for offer in offers.iter().filter(|offer| offer.subchannel == 0) {
         let instance = offer.instance.0;
+        vmbus.core().set_timeout(left(deadline));
         let opened = vmbus
             .open(offer.channel, RING_PAGES, OUTGOING_PAGES)
-            .map_err(|e| format!("controller {instance}: open: {e:?}"))?;
+            .map_err(|e| {
+                let what = format!("the opening of controller {instance}'s channel");
+                failed(&what, e)
+            })?;
         let channel = Opening::new(opened).map_err(|e| format!("controller {instance}: {e}"))?;
         let mut device =
             scan::start(channel, scratch).map_err(|e| format!("controller {instance}: {e}"))?;
@@ -276,18 +317,19 @@ fn controllers(
     Ok((vmbus, found))
 }
 
-fn serve(console: &Console) -> Result<(), String> {
+fn serve(console: &Console, started: u64) -> Result<(), String> {
+    // The whole start, scan and registrations, within scan::START_NS of the process's
+    // start (1B): a step that runs past it is the fatal line's reason.
+    let deadline = started.saturating_add(scan::START_NS);
     let dma = take("dma")?;
     let vmbus_listener = Channel(take("vmbus")?);
     // The registrar's connection first, before the scan. The device manager holds a lookup
     // of a disk not yet registered until this connection closes, after the last disk.
     let devices = Channel(take("devices")?);
-    let mut directory = devices_protocol::open_directory(devices, deadline_in(ANSWER_NS))
-        .map_err(|e| format!("the device manager: {e:?}"))?;
-    directory.core().set_timeout(ANSWER_NS);
-    let scratch = Page::new(&dma)?;
-    let (_vmbus, found) = controllers(&vmbus_listener, &scratch)?;
-    drop(scratch);
+    let mut directory = devices_protocol::open_directory(devices, deadline)
+        .map_err(|e| failed("the device manager", e))?;
+    let scratch = Page::new(&dma, deadline)?;
+    let (_vmbus, mut found) = controllers(&vmbus_listener, &scratch)?;
     let scans: Vec<Controller<'_>> = found
         .iter()
         .map(|(instance, _, scan)| Controller {
@@ -296,9 +338,29 @@ fn serve(console: &Console) -> Result<(), String> {
         })
         .collect();
     let plan = plan(&scans);
+    drop(scans);
     for line in &plan.lines {
         println!(console, "{}", line);
     }
+    let mut served = plan.served;
+    // The boot disk's `moruna-system` partition, served as `system` when the disk is the one
+    // this image wrote (item 3.3).
+    if let Some(boot) = served.iter().find(|s| s.name.boot).cloned() {
+        let image = image_guid(console);
+        let device = &mut found[boot.controller].1;
+        match scan::boot_table(device, &scratch, &boot.disk) {
+            Ok(table) => {
+                let (window, line) =
+                    moruna_storvsc_server::boot_system(table.as_ref(), image.as_ref());
+                println!(console, "{}", line);
+                if let Some(window) = window {
+                    served.push(moruna_storvsc_server::system(&boot, window));
+                }
+            }
+            Err(e) => println!(console, "storvsc: the boot disk's partition table: {}", e),
+        }
+    }
+    drop(scratch);
     let mut wakes = Vec::new();
     let mut devices_found = Vec::new();
     for (_, device, _) in found {
@@ -313,7 +375,7 @@ fn serve(console: &Console) -> Result<(), String> {
         console: Console(said),
         dma,
     };
-    let driver: Shared = Rc::new(RefCell::new(Driver::new(os, devices_found, plan.served)));
+    let driver: Shared = Rc::new(RefCell::new(Driver::new(os, devices_found, served)));
     let mut dispatcher = Dispatcher::new();
     let gone = Rc::new(Cell::new(false));
     for wake in wakes {
@@ -332,14 +394,8 @@ fn serve(console: &Console) -> Result<(), String> {
         dispatcher
             .listen(ours, factory(driver.clone(), index))
             .map_err(|e| format!("a disk's listener: {}", e.name()))?;
-        let block = Block {
-            serial: disk.name.serial.clone(),
-            sector_size: disk.disk.block_size(),
-            sectors: disk.disk.blocks(),
-            read_only: disk.name.read_only,
-            boot: disk.name.boot,
-        };
-        if let Err(e) = directory.register(block, theirs) {
+        directory.core().set_timeout(left(deadline));
+        if let Err(e) = directory.register(moruna_storvsc_server::block(&disk), theirs) {
             println!(
                 console,
                 "storvsc: {}: the device manager did not register it: {:?}", disk.name.serial, e
@@ -369,10 +425,11 @@ fn serve(console: &Console) -> Result<(), String> {
 
 /// The process: it serves until a controller fails, which ends it, and the node with it.
 pub fn run() -> i64 {
+    let started = now();
     let Some(console) = start::take("console").map(Console) else {
         return 1;
     };
-    match serve(&console) {
+    match serve(&console, started) {
         Ok(()) => 0,
         Err(reason) => {
             println!(

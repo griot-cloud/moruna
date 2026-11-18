@@ -76,6 +76,21 @@ pub struct Served {
     pub disk: Disk,
     /// Its serial, and whether it is served read-only and is the boot disk.
     pub name: Name,
+    /// The window of the disk it is, in the disk's blocks: the boot disk's `moruna-system`
+    /// partition (item 3.3), which no request reaches past. `None`: the whole disk.
+    pub window: Option<moruna_disk::Slice>,
+}
+
+impl Served {
+    /// Its blocks: its window's, or the disk's.
+    pub fn blocks(&self) -> u64 {
+        self.window.map_or(self.disk.blocks(), |w| w.sectors)
+    }
+
+    /// The disk's block of its block `block`.
+    fn first(&self) -> u64 {
+        self.window.map_or(0, |w| w.first)
+    }
 }
 
 enum Op {
@@ -222,7 +237,7 @@ impl<C: Channel, N: Node> Driver<C, N> {
             .saturating_sub(PAGE as u32);
         Info {
             sector_size: size,
-            sectors: served.disk.blocks(),
+            sectors: served.blocks(),
             max_sectors: (room / size).max(1),
             read_only: served.name.read_only,
         }
@@ -357,18 +372,20 @@ impl<C: Channel, N: Node> Driver<C, N> {
                 self.node.sync(pin, true);
             }
             let disk = self.disks[transfer.disk].served.disk;
+            // A window's block is the disk's that many blocks on: `check` held it inside.
+            let block = transfer.block + self.disks[transfer.disk].served.first();
             let device = &mut self.controllers[c];
             let sent = match transfer.op {
                 Op::Read => device.read_offset(
                     &disk,
-                    transfer.block,
+                    block,
                     transfer.count,
                     transfer.offset,
                     &transfer.pages,
                 ),
                 Op::Write => device.write_offset(
                     &disk,
-                    transfer.block,
+                    block,
                     transfer.count,
                     transfer.offset,
                     &transfer.pages,

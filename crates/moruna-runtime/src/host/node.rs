@@ -15,6 +15,9 @@
 //!   the node's memory less 768 MiB, which `node-admission` knows), a larger
 //!   `budget.memory_bytes` is refused, and a document that names none is given all of it: a node
 //!   runs one job.
+//! - Its volumes (system design 3C): given the node's disks (`--volumes`, which
+//!   `node-admission` grants every check), a `disk://<serial>` no disk has is refused, and so is
+//!   the disk the node booted from, which is never a volume, and a sink's volume served read only.
 
 use moruna_job::{Job, SpecError};
 use serde_json::Value;
@@ -30,16 +33,103 @@ pub struct Node {
     /// The most a job's budget may be on this node, in bytes: the node's memory less 768 MiB
     /// (system design 3A). `None`: no bound, and a document that names no budget keeps none.
     pub budget_max: Option<u64>,
+    /// The node's disks (system design 3C). `None`: not known, and no volume is refused.
+    pub volumes: Option<Vec<NodeVolume>>,
 }
 
 impl Node {
-    /// Node mode on `channel`, with no bound on the budget.
+    /// Node mode on `channel`, with no bound on the budget and its disks not known.
     pub fn on(channel: impl Into<String>) -> Node {
         Node {
             channel: channel.into(),
             budget_max: None,
+            volumes: None,
         }
     }
+}
+
+/// What the engine keeps of a job's account for itself: the supervisor and the Linux
+/// personality's process (system design 3A).
+pub const ENGINE_OVERHEAD: u64 = 128 << 20;
+
+/// How a job's whole memory, its account, is spent on a node (system design 3A).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sizes {
+    /// The engine's own: [`ENGINE_OVERHEAD`], or all of a budget smaller than it.
+    pub overhead: u64,
+    /// In-memory scratch: a quarter of what is left, none when the job names a staging volume.
+    pub scratch: u64,
+    /// The rest: what `moruna` sizes itself to.
+    pub arena: u64,
+}
+
+/// [`Sizes`] of a budget of `whole` bytes, in whole pages; `staging_volume` when the job names
+/// one, so that it needs no in-memory scratch.
+pub fn sizes(whole: u64, staging_volume: bool) -> Sizes {
+    let overhead = ENGINE_OVERHEAD.min(whole);
+    let rest = whole - overhead;
+    let scratch = if staging_volume {
+        0
+    } else {
+        (rest / 4) & !4095
+    };
+    Sizes {
+        overhead,
+        scratch,
+        arena: rest - scratch,
+    }
+}
+
+/// Whether `job` names a staging volume: a `disk://` staging directory, the volume its check's
+/// needs mark `staging` (item 3.3).
+pub fn names_staging_volume(job: &Job) -> bool {
+    job.staging
+        .dir
+        .as_deref()
+        .is_some_and(|dir| disk_serial(dir).is_some())
+}
+
+/// One of the node's disks, as `node-admission` grants a check them: its serial, its bytes,
+/// whether its driver serves it read only, and whether the node booted from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeVolume {
+    /// The serial the cloud gives it, which a job names it by.
+    pub serial: String,
+    /// Its bytes.
+    pub bytes: u64,
+    /// Its driver refuses every write.
+    pub read_only: bool,
+    /// The disk the node booted from, which is never a volume.
+    pub boot: bool,
+}
+
+/// The node's disks from `node-admission`'s list: a line each, `<serial> <bytes> <ro|rw>
+/// <boot|data>` (`node_protocol::volume_lines`).
+pub fn parse_volumes(text: &str) -> Result<Vec<NodeVolume>, String> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+        .map(|(i, line)| {
+            let bad = || format!("the node's volumes, line {}: `{line}`", i + 1);
+            match line.split_ascii_whitespace().collect::<Vec<_>>().as_slice() {
+                [serial, bytes, access, kind] => Ok(NodeVolume {
+                    serial: (*serial).to_string(),
+                    bytes: bytes.parse().map_err(|_| bad())?,
+                    read_only: match *access {
+                        "ro" => true,
+                        "rw" => false,
+                        _ => return Err(bad()),
+                    },
+                    boot: match *kind {
+                        "boot" => true,
+                        "data" => false,
+                        _ => return Err(bad()),
+                    },
+                }),
+                _ => Err(bad()),
+            }
+        })
+        .collect()
 }
 
 /// The budget `job` runs with on `node`: the document's, or, when it names none, the most the
@@ -89,10 +179,11 @@ pub struct NodeNeeds {
     /// sorted.
     pub hosts: Vec<String>,
     /// Each `disk://<serial>` it names, written by a sink and only read otherwise; a serial
-    /// both read and written is written. By serial.
+    /// both read and written is written; the one `staging.dir` names is written, and its
+    /// staging volume. By serial.
     pub volumes: Vec<VolumeNeed>,
-    /// The kinds of its function tasks, each once, in the order the document names them: a
-    /// function by its registered name (3E).
+    /// The registered functions it uses (3E), each once, in the order the document names them:
+    /// each function task of kind `function` names one by its `function` setting.
     pub functions: Vec<String>,
 }
 
@@ -122,6 +213,98 @@ fn disk_serial(text: &str) -> Option<&str> {
     (!serial.is_empty()).then_some(serial)
 }
 
+/// Whether `value` holds an `s3://` URL, in any case of the scheme.
+fn names_s3(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text
+            .get(..5)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("s3://")),
+        Value::Array(items) => items.iter().any(names_s3),
+        Value::Object(map) => map.values().any(names_s3),
+        _ => false,
+    }
+}
+
+/// Every `disk://` URL's serial in `value`, with its place under `field`.
+fn disk_urls(field: &str, value: &Value, found: &mut Vec<(String, String)>) {
+    match value {
+        Value::String(text) => {
+            if let Some(serial) = disk_serial(text) {
+                found.push((field.to_string(), serial.to_string()));
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                disk_urls(&format!("{field}[{i}]"), item, found);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                disk_urls(&format!("{field}.{key}"), item, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What the node's disks refuse of `job`'s volumes, each by its field: a serial no disk has,
+/// the boot disk, a sink's volume served read only.
+fn volume_refusals(job: &Job, attached: &[NodeVolume], refused: &mut Vec<SpecError>) {
+    let named: Vec<&str> = attached
+        .iter()
+        .filter(|v| !v.boot)
+        .map(|v| v.serial.as_str())
+        .collect();
+    let has = if named.is_empty() {
+        "it has none".to_string()
+    } else {
+        format!("its volumes are {}", named.join(", "))
+    };
+    for (i, task) in job.tasks.iter().enumerate() {
+        let write = task.role == moruna_job::Role::Sink;
+        let mut found = Vec::new();
+        for (key, value) in &task.settings {
+            disk_urls(&format!("{}.{key}", job.field(i)), value, &mut found);
+        }
+        for (field, serial) in found {
+            let reason = match attached.iter().find(|v| v.serial == serial) {
+                None => format!(
+                    "volume `{serial}` is not attached to this node: {has}; attach a disk with \
+                     that serial, or name one of them"
+                ),
+                Some(v) if v.boot => format!(
+                    "volume `{serial}` is the disk this node booted from, which is never a job's \
+                     volume: {has}"
+                ),
+                Some(v) if write && v.read_only => format!(
+                    "volume `{serial}` is read only on this node: a sink writes a volume the \
+                     node can write"
+                ),
+                Some(_) => continue,
+            };
+            refused.push(SpecError::new(field, reason));
+        }
+    }
+    if let Some(serial) = job.staging.dir.as_deref().and_then(disk_serial) {
+        let reason = match attached.iter().find(|v| v.serial == serial) {
+            None => Some(format!(
+                "staging volume `{serial}` is not attached to this node: {has}; attach a disk \
+                 with that serial, or name one of them"
+            )),
+            Some(v) if v.boot => Some(format!(
+                "staging volume `{serial}` is the disk this node booted from, which is never a \
+                 job's volume: {has}"
+            )),
+            Some(v) if v.read_only => Some(format!(
+                "staging volume `{serial}` is read only on this node: a job stages on a volume \
+                 the node can write"
+            )),
+            Some(_) => None,
+        };
+        refused.extend(reason.map(|reason| SpecError::new("staging.dir", reason)));
+    }
+}
+
 /// Every `disk://` serial in `value`.
 fn disk_serials<'a>(value: &'a Value, found: &mut Vec<&'a str>) {
     match value {
@@ -136,13 +319,16 @@ fn disk_serials<'a>(value: &'a Value, found: &mut Vec<&'a str>) {
 pub fn needs(job: &Job) -> NodeNeeds {
     let mut hosts = Vec::new();
     let store = &job.object_store;
-    if let Some(host) = store
-        .s3
-        .as_ref()
-        .and_then(|s3| s3.endpoint.as_deref())
-        .and_then(url_host)
-    {
-        hosts.push(host);
+    if let Some(s3) = &store.s3 {
+        // With no endpoint the engine asks AWS's own S3, path-style, at its region's host.
+        let host = match (&s3.endpoint, &s3.region) {
+            (Some(endpoint), _) => url_host(endpoint),
+            (None, Some(region)) => {
+                Some(format!("s3.{}.amazonaws.com", region.to_ascii_lowercase()))
+            }
+            (None, None) => None,
+        };
+        hosts.extend(host);
     }
     if let Some(account) = store.azure.as_ref().and_then(|a| a.account.as_deref()) {
         hosts.push(format!(
@@ -155,7 +341,11 @@ pub fn needs(job: &Job) -> NodeNeeds {
     }
     hosts.sort();
     hosts.dedup();
-    let mut volumes: std::collections::BTreeMap<String, bool> = Default::default();
+    // Each serial: whether the job writes it, and whether it stages there.
+    let mut volumes: std::collections::BTreeMap<String, (bool, bool)> = Default::default();
+    if let Some(serial) = job.staging.dir.as_deref().and_then(disk_serial) {
+        volumes.insert(serial.to_string(), (true, true));
+    }
     let mut functions: Vec<String> = Vec::new();
     for task in &job.tasks {
         let write = task.role == moruna_job::Role::Sink;
@@ -164,17 +354,26 @@ pub fn needs(job: &Job) -> NodeNeeds {
             disk_serials(value, &mut found);
         }
         for serial in found {
-            *volumes.entry(serial.to_string()).or_insert(write) |= write;
+            volumes
+                .entry(serial.to_string())
+                .or_insert((write, false))
+                .0 |= write;
         }
-        if task.role == moruna_job::Role::Kernel && !functions.contains(&task.kind) {
-            functions.push(task.kind.clone());
+        if let Some(name) = task.function_name()
+            && !functions.iter().any(|f| f == name)
+        {
+            functions.push(name.to_string());
         }
     }
     NodeNeeds {
         hosts,
         volumes: volumes
             .into_iter()
-            .map(|(serial, write)| VolumeNeed { serial, write })
+            .map(|(serial, (write, staging))| VolumeNeed {
+                serial,
+                write,
+                staging,
+            })
             .collect(),
         functions,
     }
@@ -207,6 +406,28 @@ pub fn refusals(job: &Job, node: &Node) -> Vec<SpecError> {
                  or leave it out for all of it"
             ),
         ));
+    }
+    // AWS's own S3 is its region's host: one with neither endpoint nor region, or `s3://`
+    // URLs with no `object_store.s3` at all, would leave a host the node cannot name.
+    let unnamed = match &job.object_store.s3 {
+        Some(s3) => s3.endpoint.is_none() && s3.region.is_none(),
+        None => job.tasks.iter().any(|task| {
+            let mut found = false;
+            for value in task.settings.values() {
+                found |= names_s3(value);
+            }
+            found
+        }),
+    };
+    if unnamed {
+        refused.push(SpecError::new(
+            "object_store.s3.region",
+            "a job on a node that uses AWS's own S3 names its region: the node lets the job \
+             reach s3.<region>.amazonaws.com and nothing else",
+        ));
+    }
+    if let Some(attached) = &node.volumes {
+        volume_refusals(job, attached, &mut refused);
     }
     if job.object_store.local_root.is_some() {
         refused.push(SpecError::new(
@@ -262,7 +483,11 @@ pub fn admit(
         return Err(refusal);
     }
     job.report.socket = Some(node.channel.clone());
-    job.budget.memory_bytes = budget(job, node);
+    // The budget is the job's whole memory, its account exactly (system design 3A): the
+    // engine sizes itself to the arena's share of it, never the whole.
+    if let Some(whole) = budget(job, node) {
+        job.budget.memory_bytes = Some(sizes(whole, names_staging_volume(job)).arena);
+    }
     if job.id.is_none() {
         job.id = Some(mint().ok_or_else(|| SpecError::new("run_id", "no run ID could be made"))?);
     }

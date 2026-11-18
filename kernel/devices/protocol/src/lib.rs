@@ -14,6 +14,9 @@
 //! has not finished registering, which it says by closing its connection: so a client that
 //! starts before that driver, as the network server starts before `netvsc`, finds what it
 //! registers.
+//! The device manager's own block drivers (virtio-blk) register their disks the same way,
+//! through a `register` listener it gives each, and `blocks` lists every disk registered
+//! (minor 3), which is what a node grants a job's volumes from (item 3.3).
 //! `moruna.devices.control`
 //! is for the processes the boot description links to it, and no other: it restarts a
 //! driver, and hands out the resources a driver of a device holds (without its DMA
@@ -124,7 +127,7 @@ moruna_svc::protocol! {
     pub protocol directory {
         name = "moruna.devices.directory";
         major = 1;
-        minor = 2;
+        minor = 3;
         requests {
             /// A new connection to the service published as `name`, or to the device
             /// registered under that name; answered once its driver is running. A name
@@ -136,13 +139,19 @@ moruna_svc::protocol! {
             2 => fn list() -> Vec<Entry>;
             /// Minor 1: registers `block`, which the caller serves on `listener`: a lookup
             /// of its serial connects through `listener`. Only through a
-            /// [`REGISTER_SLOTS`] listener, which may make no other request.
+            /// [`REGISTER_SLOTS`] listener, which may make no other request. A serial whose
+            /// driver has let go of its listener is registered again: a driver started again
+            /// registers its disk again.
             3 => fn register(block: Block, listener: Channel) -> ();
             /// Minor 2: registers a network card, which the caller serves as
             /// `moruna.driver.net` on `listener`, under `name` ([`valid_name`]): a lookup
             /// of `name` connects through `listener`. Only through a [`REGISTER_SLOTS`]
             /// listener.
             4 => fn register_net(name: String, listener: Channel) -> ();
+            /// Minor 3: every block device registered, in the order they were: its serial,
+            /// its size, and whether it is the disk the node booted from (system design 3C).
+            /// Only through a `directory*` listener.
+            5 since 3 => fn blocks() -> Vec<Block>;
         }
         events {}
         errors {
@@ -238,8 +247,8 @@ mod tests {
 
     #[test]
     fn a_block_device_travels_whole() {
-        assert_eq!(directory::REQUESTS, &[1, 2, 3, 4]);
-        assert_eq!((directory::ID.major, directory::ID.minor), (1, 2));
+        assert_eq!(directory::REQUESTS, &[1, 2, 3, 4, 5]);
+        assert_eq!((directory::ID.major, directory::ID.minor), (1, 3));
         let boot = Block {
             read_only: true,
             boot: true,

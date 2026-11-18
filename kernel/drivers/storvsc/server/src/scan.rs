@@ -4,7 +4,12 @@
 //! CAPACITY instead (the PM's decision for 1.10b). Disks attached while the node runs are
 //! not found: a known limit.
 //!
-//! Every step waits with a deadline, and one that passes ends the scan with a reason.
+//! Every step waits until the start's deadline ([`Scratch::deadline`]), and one that runs
+//! past it ends the scan with a reason that names it: `no answer to REPORT LUNS within 4 s`.
+//!
+//! The boot disk's GPT is read too ([`boot_table`]): its disk GUID, which the image's must be,
+//! and its `moruna-system` partition, which holds the node's engine layer and is served as a
+//! window of it (item 3.3).
 
 use alloc::{format, string::String, vec, vec::Vec};
 
@@ -13,8 +18,11 @@ use moruna_storvsc::{
     scsi::LUNS_BYTES,
 };
 
-/// How long each step of the scan may take: the initialisation, and each command.
-pub const STEP_NS: u64 = 10_000_000_000;
+/// How long a VMBus driver's whole start may take: the node's services start within 5 s
+/// (1B), and a start that stops must give the first fatal line itself, naming the step it
+/// stopped at, before another service's deadline speaks. On the node the scan of every
+/// controller counts against it, from the process's start.
+pub const START_NS: u64 = 4_000_000_000;
 
 /// The target scanned on each controller: Hyper-V puts every disk at path 0, target 0, its
 /// LUN its place on the controller.
@@ -38,6 +46,13 @@ pub trait Scratch {
 
     /// Now, in nanoseconds on the node's monotonic clock.
     fn now(&self) -> u64;
+
+    /// When the start must have ended, on the same clock. The node's process gives
+    /// [`START_NS`] after its own start, for the whole scan; by default a step gets
+    /// [`START_NS`] from when it begins.
+    fn deadline(&self) -> u64 {
+        self.now().saturating_add(START_NS)
+    }
 }
 
 /// What the scan of one controller found, and what it says of what it did not serve.
@@ -66,7 +81,7 @@ pub fn no_device(srb: SrbStatus) -> bool {
 /// The device on `channel`, once its initialisation has finished, by the deadline.
 pub fn start<C: Channel, S: Scratch>(channel: C, scratch: &S) -> Result<Storvsc<C>, String> {
     let mut device = Storvsc::new(channel).map_err(|e| format!("the initialisation: {e}"))?;
-    let deadline = scratch.now().saturating_add(STEP_NS);
+    let deadline = scratch.deadline();
     loop {
         match device.poll() {
             Ok(Some(Event::Ready)) => return Ok(device),
@@ -79,7 +94,7 @@ pub fn start<C: Channel, S: Scratch>(channel: C, scratch: &S) -> Result<Storvsc<
 fn wait<C: Channel>(device: &mut Storvsc<C>, deadline: u64, what: &str) -> Result<(), String> {
     match device.wait(Some(deadline)) {
         Ok(Wait::Signalled) => Ok(()),
-        Ok(Wait::TimedOut) => Err(format!("{what} was not answered within 10 s")),
+        Ok(Wait::TimedOut) => Err(format!("no answer to {what} within 4 s")),
         Err(e) => Err(format!("{what}: {e}")),
     }
 }
@@ -92,7 +107,7 @@ fn call<C: Channel, S: Scratch>(
     send: impl FnOnce(&mut Storvsc<C>) -> Result<u64, Error>,
 ) -> Result<Result<u32, Failure>, String> {
     let id = send(device).map_err(|e| format!("{what}: {e}"))?;
-    let deadline = scratch.now().saturating_add(STEP_NS);
+    let deadline = scratch.deadline();
     loop {
         match device.poll() {
             Ok(Some(Event::Completed(Completion { id: done, result }))) if done == id => {
@@ -157,4 +172,88 @@ pub fn scan<C: Channel, S: Scratch>(device: &mut Storvsc<C>, scratch: &S) -> Res
         }
     }
     Ok(found)
+}
+
+/// The bytes of a page.
+const PAGE_BYTES: u64 = 4096;
+
+/// Reads `count` blocks from `block` of `disk` into the scratch page: its bytes, or `None` when
+/// the host fails the read.
+fn read_page<C: Channel, S: Scratch>(
+    device: &mut Storvsc<C>,
+    scratch: &S,
+    disk: &Disk,
+    block: u64,
+    count: u32,
+) -> Result<Option<Vec<u8>>, String> {
+    let page = scratch.page();
+    let what = format!("a read of block {block} of the boot disk");
+    match call(device, scratch, &what, |d| {
+        d.read(disk, block, count, &[page])
+    })? {
+        Ok(moved) => Ok(Some(answer(scratch, moved))),
+        Err(_) => Ok(None),
+    }
+}
+
+/// What the boot disk's GPT says: the disk GUID its checked header names, and its
+/// `moruna-system` partition as a window of its blocks, when it has one its entries hold whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Table {
+    /// The header's disk GUID.
+    pub guid: moruna_disk::Guid,
+    /// The `moruna-system` partition.
+    pub system: Option<moruna_disk::Slice>,
+}
+
+/// The GPT of `disk`, the boot disk: the primary header at block 1, checked, and the entries it
+/// names, read a page at a time into the scratch page and checked (`moruna_disk`). `None` when
+/// the disk has no header GPT checks.
+pub fn boot_table<C: Channel, S: Scratch>(
+    device: &mut Storvsc<C>,
+    scratch: &S,
+    disk: &Disk,
+) -> Result<Option<Table>, String> {
+    let size = u64::from(disk.block_size());
+    if size > PAGE_BYTES || disk.blocks() < 2 {
+        return Ok(None);
+    }
+    let Some(header) = read_page(device, scratch, disk, 1, 1)? else {
+        return Ok(None);
+    };
+    let Some(guid) = moruna_disk::disk_guid(&header) else {
+        return Ok(None);
+    };
+    Ok(Some(Table {
+        guid,
+        system: system(device, scratch, disk, &header)?,
+    }))
+}
+
+/// The `moruna-system` partition the checked header `header` of `disk` names, as a window of
+/// its blocks: `None` when its entries are not whole and checked, or none is it.
+fn system<C: Channel, S: Scratch>(
+    device: &mut Storvsc<C>,
+    scratch: &S,
+    disk: &Disk,
+    header: &[u8],
+) -> Result<Option<moruna_disk::Slice>, String> {
+    let size = u64::from(disk.block_size());
+    let Some(entries) = moruna_disk::entries(header) else {
+        return Ok(None);
+    };
+    let per_page = PAGE_BYTES / size;
+    let mut bytes = Vec::new();
+    for page in 0..entries.bytes().div_ceil(PAGE_BYTES) {
+        let block = entries.lba + page * per_page;
+        if block + per_page > disk.blocks() {
+            return Ok(None);
+        }
+        match read_page(device, scratch, disk, block, per_page as u32)? {
+            Some(read) => bytes.extend_from_slice(&read),
+            None => return Ok(None),
+        }
+    }
+    Ok(moruna_disk::find(&bytes, &entries, moruna_disk::SYSTEM)
+        .and_then(|p| moruna_disk::Slice::of(&p, size, size, disk.blocks())))
 }

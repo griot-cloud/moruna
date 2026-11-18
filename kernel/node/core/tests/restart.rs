@@ -9,8 +9,8 @@ use moruna_netstack::{Shared, Stack, after_turn, factory, parse};
 use moruna_node::{
     Bootstrap, Config, ConfigError, Lifecycle, Restart, State,
     restart::{
-        API_STARTED, Deaths, PLATFORM_SLOT, RESTARTS_MAX, Verdict, WINDOW_NS, api_started,
-        ended_line, fatal_line, parse_policy, restarted_line,
+        API_STARTED, Deaths, PLATFORM_SLOT, RESTARTS_MAX, SUPERVISOR, Verdict, WINDOW_NS,
+        api_started, ended_line, fatal_line, parse_policy, restarted_line,
     },
 };
 use moruna_svc::{Account, CallError, Channel, Dispatcher, Turn, deadline_in, now};
@@ -487,5 +487,205 @@ grant listen-grant-only rights=grant local=0.0.0.0/0@443 sockets=81 rx=65536 tx=
     drop(alone);
     drop(supervisor);
     drop(slots);
+    server.join().unwrap();
+}
+
+/// The record of the cloud profile with step 3 (item 3.2): `api` gets a fresh connection to
+/// `node-admission` on its `admission` slot at each start.
+const CONNECTING: &str = "restart api network network listen-supervisor admission rights=listen \
+     local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000";
+
+/// The supervisor's own link: it is the client of `node-admission`'s listener.
+const SUPERVISOR_LINK: &str = "service node-admission image.admission 16777216
+link node-admission listen supervisor admission";
+
+#[test]
+fn a_record_may_name_a_slot_each_start_is_connected_on_through_the_supervisor() {
+    let config = node(&format!("{SUPERVISOR_LINK}\n{CONNECTING}")).expect("node.conf");
+    let record = config.restart.as_ref().expect("the record");
+    assert_eq!(record.connect.as_deref(), Some("admission"));
+    assert_eq!(record.policy, granted(LISTENER));
+    // The link is the supervisor's: no service's slot is filled on its client side.
+    let link = config
+        .links
+        .iter()
+        .find(|l| l.right == SUPERVISOR)
+        .expect("the supervisor's link");
+    assert_eq!(
+        (
+            link.left.as_str(),
+            link.left_slot.as_str(),
+            link.right_slot.as_str()
+        ),
+        ("node-admission", "listen", "admission")
+    );
+    assert!(config.links.iter().all(|l| l.right != "api"));
+    // Without one, as before.
+    assert_eq!(node(RECORD).unwrap().restart.unwrap().connect, None);
+}
+
+#[test]
+fn a_connect_slot_needs_the_supervisor_s_link_and_no_other() {
+    use ConfigError::{Duplicate, Syntax};
+    let policy = "rights=listen local=0.0.0.0/0@443";
+    let admission = "service node-admission image.admission 16777216";
+    for (extra, error) in [
+        // A slot with no link, and a link with no slot.
+        (format!("{admission}\n{CONNECTING}"), Syntax),
+        (format!("{SUPERVISOR_LINK}\n{RECORD}"), Syntax),
+        (SUPERVISOR_LINK.to_string(), Syntax),
+        // The link names another slot, or there are two.
+        (
+            format!("{admission}\nlink node-admission listen supervisor jobs\n{CONNECTING}"),
+            Syntax,
+        ),
+        (
+            format!(
+                "{SUPERVISOR_LINK}\nlink node-admission second supervisor admission\n{CONNECTING}"
+            ),
+            Syntax,
+        ),
+        // Slots a start fills itself, or its listener's.
+        (
+            format!(
+                "{admission}\nlink node-admission listen supervisor platform\nrestart api network network listen-supervisor platform {policy}"
+            ),
+            Syntax,
+        ),
+        (
+            format!(
+                "{admission}\nlink node-admission listen supervisor network\nrestart api network network listen-supervisor network {policy}"
+            ),
+            Syntax,
+        ),
+        (
+            format!(
+                "{admission}\nlink node-admission listen supervisor console\nrestart api network network listen-supervisor console {policy}"
+            ),
+            Syntax,
+        ),
+        (
+            format!(
+                "{admission}\nlink node-admission listen supervisor Admission\nrestart api network network listen-supervisor Admission {policy}"
+            ),
+            Syntax,
+        ),
+        // The supervisor is no service, never a server, and never the one restarted.
+        (
+            format!("service supervisor image.x 4096\n{SUPERVISOR_LINK}\n{CONNECTING}"),
+            Syntax,
+        ),
+        (
+            format!("{SUPERVISOR_LINK}\nlink supervisor x api y\n{CONNECTING}"),
+            Syntax,
+        ),
+        (
+            format!(
+                "{SUPERVISOR_LINK}\nrestart supervisor network network listen-supervisor admission {policy}"
+            ),
+            Syntax,
+        ),
+        // The server's slot is its own once.
+        (
+            format!("{SUPERVISOR_LINK}\ngrant node-admission listen x\n{CONNECTING}"),
+            Duplicate,
+        ),
+    ] {
+        assert_eq!(node(&extra), Err(error), "{extra}");
+    }
+}
+
+moruna_svc::protocol! {
+    /// A server for the test of the supervisor's connections: one call.
+    pub protocol probe {
+        name = "moruna.test.probe";
+        major = 1;
+        minor = 0;
+        requests {
+            /// The connection's number, in the order the server took them.
+            1 => fn which() -> u64;
+        }
+        events {}
+        errors {}
+    }
+}
+
+/// One connection of the probe: its number, and the server's count of closed ones.
+struct Probe {
+    number: u64,
+    closed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl probe::Server for Probe {
+    fn which(&mut self, _: &mut moruna_svc::Context<'_>) -> Result<u64, probe::Error> {
+        Ok(self.number)
+    }
+}
+
+struct Session(probe::Serve<Probe>);
+
+impl moruna_svc::Handler for Session {
+    fn protocol(&self) -> moruna_svc::ProtocolId {
+        probe::ID
+    }
+    fn handle(
+        &mut self,
+        cx: &mut moruna_svc::Context<'_>,
+        ordinal: u16,
+        d: &mut moruna_svc::Decoder<'_>,
+    ) -> moruna_svc::Outcome {
+        self.0.handle(cx, ordinal, d)
+    }
+    fn closed(&mut self) {
+        self.0
+            .0
+            .closed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// What the supervisor does at each start: a fresh connection through its end of the link,
+/// which works, and which the server sees close when the start that held it has gone, while
+/// the link itself stays for the next start.
+#[test]
+fn each_start_s_connection_is_fresh_and_ends_with_it() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    let closed = Arc::new(AtomicU64::new(0));
+    let (server_end, supervisor_end) = Channel::create().expect("the link");
+    let counted = closed.clone();
+    let server = thread::spawn(move || {
+        let mut dispatcher = Dispatcher::new();
+        let mut number = 0;
+        dispatcher
+            .listen(
+                server_end,
+                Box::new(move || {
+                    number += 1;
+                    Box::new(Session(probe::Serve(Probe {
+                        number,
+                        closed: counted.clone(),
+                    }))) as Box<dyn moruna_svc::Handler>
+                }),
+            )
+            .expect("listening");
+        let _ = dispatcher.run();
+    });
+    for start in 1..=3u64 {
+        let channel = moruna_svc::connect(&supervisor_end).expect("a fresh connection");
+        let mut client =
+            probe::Client::connect(channel, deadline_in(5 * SECOND)).expect("welcomed");
+        assert_eq!(client.which(), Ok(start));
+        // The start dies: the server sees its connection close.
+        drop(client);
+        let deadline = now() + 5 * SECOND;
+        while closed.load(Ordering::SeqCst) < start {
+            assert!(now() < deadline, "start {start}'s connection did not close");
+            thread::yield_now();
+        }
+    }
+    drop(supervisor_end);
     server.join().unwrap();
 }

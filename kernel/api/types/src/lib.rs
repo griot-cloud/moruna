@@ -59,6 +59,10 @@ pub struct Node {
     pub cores: u32,
     /// The node's memory, in bytes.
     pub memory_bytes: u64,
+    /// The most memory a job may have, in bytes: `node-admission`'s account less its own and
+    /// the check's (system design 3A). A job whose budget is larger is refused; 0 on a node
+    /// that runs no jobs.
+    pub job_memory_bytes: u64,
     /// What the node can run work on.
     pub executors: Vec<Executor>,
     /// Milliseconds from the core's first instruction to ready.

@@ -33,6 +33,8 @@ moruna-plan = { workspace = true }
 moruna-event = { workspace = true }
 moruna-kernels = { workspace = true }
 moruna-package = { workspace = true }
+# `_core.image_archive`: a function's image as the one file `moruna.register` uploads (5.4).
+moruna-image = { workspace = true }
 moruna-wasm = { workspace = true }
 moruna-sandbox = { workspace = true }
 moruna-arena = { workspace = true }

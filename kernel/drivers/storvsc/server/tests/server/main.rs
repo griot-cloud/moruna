@@ -177,3 +177,37 @@ fn at(lun: u8) -> Address {
         lun,
     }
 }
+
+/// Writes a GPT onto `bytes`, a disk of 512-byte blocks: the primary header at block 1, 128
+/// entries of 128 bytes from block 2, the partitions `parts` (`name`, first block, last).
+pub fn gpt(bytes: &mut [u8], parts: &[(&str, u64, u64)]) {
+    let blocks = bytes.len() as u64 / 512;
+    let mut table = vec![0u8; 128 * 128];
+    for (i, (name, first, last)) in parts.iter().enumerate() {
+        let e = &mut table[i * 128..(i + 1) * 128];
+        e[..16].copy_from_slice(&[0xaf; 16]);
+        e[16..32].copy_from_slice(&[i as u8 + 1; 16]);
+        e[32..40].copy_from_slice(&first.to_le_bytes());
+        e[40..48].copy_from_slice(&last.to_le_bytes());
+        for (j, unit) in name.encode_utf16().enumerate() {
+            e[56 + 2 * j..58 + 2 * j].copy_from_slice(&unit.to_le_bytes());
+        }
+    }
+    let mut h = vec![0u8; 512];
+    h[..8].copy_from_slice(moruna_disk::SIGNATURE);
+    h[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+    h[12..16].copy_from_slice(&92u32.to_le_bytes());
+    h[24..32].copy_from_slice(&1u64.to_le_bytes());
+    h[32..40].copy_from_slice(&(blocks - 1).to_le_bytes());
+    h[40..48].copy_from_slice(&34u64.to_le_bytes());
+    h[48..56].copy_from_slice(&(blocks - 34).to_le_bytes());
+    h[56..72].copy_from_slice(&[0x42; 16]);
+    h[72..80].copy_from_slice(&2u64.to_le_bytes());
+    h[80..84].copy_from_slice(&128u32.to_le_bytes());
+    h[84..88].copy_from_slice(&128u32.to_le_bytes());
+    h[88..92].copy_from_slice(&moruna_disk::crc32(&table).to_le_bytes());
+    let crc = moruna_disk::crc32(&h[..92]);
+    h[16..20].copy_from_slice(&crc.to_le_bytes());
+    bytes[512..1024].copy_from_slice(&h);
+    bytes[1024..1024 + table.len()].copy_from_slice(&table);
+}

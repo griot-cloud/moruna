@@ -374,14 +374,111 @@ fn a_receive_buffer_the_host_cannot_use_is_refused_by_name() {
             e,
             NetvscError::Refused {
                 step: "the receive buffer",
-                status: 2
+                status: 2,
+                nvsp: Some(0x60001)
             }
         ),
         "{e}"
     );
+    // The refusal says the versions in use, for the console.
     assert_eq!(
         e.to_string(),
-        "the host refused the receive buffer with status 0x00000002"
+        "the host refused the receive buffer with status 0x00000002 (NVSP 6.1, NDIS 6.30)"
+    );
+    assert_clean(&host);
+}
+
+#[test]
+fn the_receive_buffer_has_an_id_azures_host_takes_and_every_receive_names_it() {
+    // Azure's host refused a receive buffer whose ID was 0 with FAILURE (console
+    // 2026-11-18T0146), and the fake refuses one so too: the card gives Linux's 0xcafe.
+    let (mut card, host) = started(SMALL);
+    assert_eq!(host.borrow().receive_id, Some(0xcafe));
+    assert_eq!(card.nvsp_version(), 0x60001);
+    assert_eq!(moruna_netvsc::Nvsp(card.nvsp_version()).to_string(), "6.1");
+    // The host names the buffer by that ID in each receive, and the card takes them.
+    host.borrow_mut().inject(&[9; 60]);
+    assert_eq!(drain(&mut card), [Got::Frame(vec![9; 60])]);
+    assert_clean(&host);
+}
+
+#[test]
+fn the_start_says_each_step_and_what_the_host_answered() {
+    let mut first = parts(16 * PAGE, 16 * PAGE, SMALL);
+    let host = first.host.clone();
+    host.borrow_mut().flush(first.channel.host());
+    let mut lines = Vec::new();
+    let card = Netvsc::start_saying(
+        first.channel,
+        first.receive,
+        first.send,
+        Some(DEADLINE),
+        &mut |line| lines.push(line.to_string()),
+    );
+    assert!(card.is_ok());
+    assert_eq!(
+        lines,
+        [
+            "NVSP 6.1 offered",
+            "NVSP 6.1 accepted",
+            "NDIS configuration sent: frames of 1514 bytes",
+            "NDIS configuration completed; NDIS version 6.30 sent",
+            "NDIS version completed",
+            "receive buffer: sharing 32768 bytes",
+            "receive buffer: GPADL 0x1 made; sent with ID 0xcafe",
+            "receive buffer accepted: 18 sections of 1806 bytes from byte 0",
+            "send buffer: sharing 16384 bytes",
+            "send buffer: GPADL 0x2 made; sent with ID 0x0",
+            "send buffer accepted: 2 sections of 6144 bytes",
+            "RNDIS initialisation sent",
+            "RNDIS initialised",
+            "address queried",
+            "address 00:15:5d:01:02:03",
+            "MTU queried",
+            "MTU 1500",
+            "packet filter 0xb sent",
+            "packet filter set",
+            "link up",
+        ]
+    );
+    // A start that stops is seen to stop: the last line says where.
+    let older = parts(16 * PAGE, 16 * PAGE, SMALL);
+    older.host.borrow_mut().versions = vec![Version::V6 as u32];
+    let mut lines = Vec::new();
+    let _ = Netvsc::start_saying(
+        older.channel,
+        older.receive,
+        older.send,
+        Some(DEADLINE),
+        &mut |line| lines.push(line.to_string()),
+    );
+    assert_eq!(
+        lines[..3],
+        [
+            "NVSP 6.1 offered",
+            "NVSP 6.1 refused with status 0x0",
+            "NVSP 6.0 offered"
+        ]
+    );
+}
+
+#[test]
+fn no_packet_asks_for_a_completion_under_transaction_0() {
+    // Hyper-V neither answers nor acts on such a packet, and the fake does as it does:
+    // netvsc's first RNDIS request went in section 0 under ID 0, and Azure's host never
+    // answered it (console 2026-11-18T0213). Each section's transaction is its index
+    // plus one. The two sections carry frames over and over, each completed.
+    let (mut card, host) = started(SMALL);
+    for round in 0..4u8 {
+        assert!(card.send(&[round; 60]).unwrap());
+        assert!(card.send(&[round + 10; 60]).unwrap());
+        assert_eq!(drain(&mut card), []);
+    }
+    assert_eq!(host.borrow().ignored, 0);
+    assert_eq!(host.borrow().frames.len(), 8);
+    assert!(
+        host.borrow().strict,
+        "a host that reads only when signalled"
     );
     assert_clean(&host);
 }

@@ -9,7 +9,7 @@
 use crate::{
     api::{Answer, error_body},
     body::{Body, Text},
-    engine::{Checked, ENGINE_LINE_LIMIT, EngineHost, HostError, Message, Wire},
+    engine::{ENGINE_LINE_LIMIT, EngineHost, HostError, Message, Verdict, Wire},
     functions::Registry,
     json::{Secrets, compact, is_object},
     token::base64,
@@ -117,6 +117,19 @@ struct Check {
     /// The names of the job's secrets, which its document may refer to.
     names: Vec<String>,
     secrets: Secrets,
+    /// For a submit: the `spec` message the engine is sent once the document is found sound,
+    /// its secrets in the clear, wiped when it is let go.
+    spec: Option<String>,
+    /// For a submit: whether the call that asked still waits for the job's id.
+    wanted: bool,
+}
+
+impl Drop for Check {
+    fn drop(&mut self) {
+        if let Some(spec) = &mut self.spec {
+            spec.replace_range(.., &"\0".repeat(spec.len()));
+        }
+    }
 }
 
 /// A job as its body gives it: what the engine is sent, and what it is checked as.
@@ -320,9 +333,10 @@ fn failed(error: HostError, secrets: &Secrets) -> Answer {
 }
 
 impl Jobs {
-    /// Whether an engine is in flight: a job is starting or running.
+    /// Whether an engine is in flight, or a submitted job is being checked: a job is starting
+    /// or running.
     pub(crate) fn busy(&self) -> bool {
-        self.flight.is_some()
+        self.flight.is_some() || self.checks.iter().any(|check| check.spec.is_some())
     }
 
     fn ticket(&mut self) -> u64 {
@@ -345,47 +359,67 @@ impl Jobs {
             document: parsed.document(),
             names: parsed.names,
             secrets: parsed.secrets,
+            spec: None,
+            wanted: true,
         });
         Ok(ticket)
     }
 
-    /// `POST /v1/jobs`: starts a fresh engine with the job in `body`, and gives the ticket the
-    /// engine's verdict will come under; or the answer, when no engine was started.
-    pub(crate) fn submit(
-        &mut self,
-        host: &mut dyn EngineHost,
-        body: &[u8],
-        now: u64,
-    ) -> Result<u64, Answer> {
+    /// `POST /v1/jobs`: queues the job in `body` for the engine's check, and gives the ticket
+    /// the job's id, or its refusal, will come under; or the answer, when the body is no job or
+    /// a job is already starting or running. Once the engine finds the document sound, a fresh
+    /// engine is started with the check's budget and needs (system design 3A).
+    pub(crate) fn submit(&mut self, body: &[u8]) -> Result<u64, Answer> {
         if self.busy() {
             return Err(Answer::error(ErrorCode::Busy, "a job is running"));
         }
         let parsed = Parsed::of(body).map_err(|why| Answer::error(ErrorCode::Invalid, why))?;
-        let mut spec = parsed.message();
-        let started = host.start(spec.as_bytes());
-        // The message held the secrets in the clear: overwrite it before it is let go.
-        spec.replace_range(.., &"\0".repeat(spec.len()));
-        started.map_err(|error| failed(error, &parsed.secrets))?;
         let ticket = self.ticket();
+        let spec = parsed.message();
+        self.checks.push_back(Check {
+            ticket,
+            document: parsed.document(),
+            names: parsed.names,
+            secrets: parsed.secrets,
+            spec: Some(spec),
+            wanted: true,
+        });
+        Ok(ticket)
+    }
+
+    /// Starts the job `check` found sound by `verdict`, as its submit asked.
+    fn start(&mut self, host: &mut dyn EngineHost, mut check: Check, verdict: &Verdict, now: u64) {
+        let Some(spec) = check.spec.as_deref() else {
+            return;
+        };
+        let started = host.start(spec.as_bytes(), verdict);
+        let ticket = check.wanted.then_some(check.ticket);
+        if let Err(error) = started {
+            if let Some(ticket) = ticket {
+                self.resolved.push((ticket, failed(error, &check.secrets)));
+            }
+            return;
+        }
         self.ordinals += 1;
         self.wire.clear();
         self.flight = Some(Flight {
             ordinal: self.ordinals,
-            ticket: Some(ticket),
-            secrets: parsed.secrets,
+            ticket,
+            secrets: core::mem::take(&mut check.secrets),
             submitted: now,
             listed: false,
             heartbeat: None,
             report: None,
             skipped: 0,
         });
-        Ok(ticket)
     }
 
     /// A call that waited under `ticket` has gone: its answer is not wanted.
     pub(crate) fn abandon(&mut self, ticket: u64) {
         self.resolved.retain(|(resolved, _)| *resolved != ticket);
         match self.checks.iter().position(|check| check.ticket == ticket) {
+            // A submitted job goes on without the call: it is listed when it starts.
+            Some(at) if self.checks[at].spec.is_some() => self.checks[at].wanted = false,
             Some(0) if self.checking => self.unwanted = true,
             Some(at) => {
                 self.checks.remove(at);
@@ -589,7 +623,7 @@ impl Jobs {
     /// Moves the checks and the engine in flight as far as they go now. A check's verdict also
     /// refuses each function the job uses that is not in `functions` (3E).
     pub(crate) fn pump(&mut self, host: &mut dyn EngineHost, functions: &Registry, now: u64) {
-        self.pump_checks(host, functions);
+        self.pump_checks(host, functions, now);
         if self.flight.is_none() {
             return;
         }
@@ -619,27 +653,46 @@ impl Jobs {
         self.wire.settle();
     }
 
-    /// Hands the engine the next document to check, and takes the verdict of the one it has: the
-    /// engine's refusals, and one for each function the job uses that is not registered.
-    fn pump_checks(&mut self, host: &mut dyn EngineHost, functions: &Registry) {
+    /// Hands the engine the next document to check, and takes the verdict of the one it has: a
+    /// validation's answer, or for a submit, the job started, or its refusal. The refusals are the
+    /// engine's, and one for each function the job uses that is not registered.
+    fn pump_checks(&mut self, host: &mut dyn EngineHost, functions: &Registry, now: u64) {
         if self.checking
             && let Some(verdict) = host.checked()
         {
             self.checking = false;
-            if let Some(check) = self.checks.pop_front()
-                && !core::mem::take(&mut self.unwanted)
-            {
-                let answer = match verdict {
-                    Ok(Checked {
-                        mut refusals,
-                        functions: used,
-                    }) => {
-                        refusals.extend(functions.refusals(&used));
-                        validation(refusals, &check.secrets)
+            let verdict = verdict.map(|mut verdict| {
+                let unregistered = functions.refusals(&verdict.needs.functions);
+                verdict.refusals.extend(unregistered);
+                verdict
+            });
+            let unwanted = core::mem::take(&mut self.unwanted);
+            if let Some(check) = self.checks.pop_front() {
+                match (verdict, check.spec.is_some()) {
+                    (Ok(verdict), true) if verdict.refusals.is_empty() => {
+                        self.start(host, check, &verdict, now);
                     }
-                    Err(error) => failed(error, &check.secrets),
-                };
-                self.resolved.push((check.ticket, answer));
+                    (Ok(verdict), true) => {
+                        if check.wanted {
+                            let answer = refused(verdict.refusals, &check.secrets);
+                            self.resolved.push((check.ticket, answer));
+                        }
+                    }
+                    (Err(error), true) => {
+                        if check.wanted {
+                            self.resolved
+                                .push((check.ticket, failed(error, &check.secrets)));
+                        }
+                    }
+                    (verdict, false) if !unwanted => {
+                        let answer = match verdict {
+                            Ok(verdict) => validation(verdict.refusals, &check.secrets),
+                            Err(error) => failed(error, &check.secrets),
+                        };
+                        self.resolved.push((check.ticket, answer));
+                    }
+                    _ => {}
+                }
             }
         }
         while !self.checking {
@@ -959,6 +1012,16 @@ fn page_event<'a>(
 }
 
 /// The answer to a validate: the engine's verdict.
+/// A submit's answer when the engine's check refuses its document: `invalid`, saying each
+/// refusal by its field.
+fn refused(refusals: Vec<Refusal>, secrets: &Secrets) -> Answer {
+    let said: Vec<String> = refusals
+        .iter()
+        .map(|r| format!("{}: {}", r.field, r.message))
+        .collect();
+    refusal(ErrorCode::Invalid, &said.join("; "), secrets)
+}
+
 fn validation(refusals: Vec<Refusal>, secrets: &Secrets) -> Answer {
     let verdict = Validation {
         ok: refusals.is_empty(),

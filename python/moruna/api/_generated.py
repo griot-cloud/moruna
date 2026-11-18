@@ -709,6 +709,12 @@ class Node:
     memory_bytes: int
     """The node's memory, in bytes."""
 
+    job_memory_bytes: int
+    """The most memory a job may have, in bytes: `node-admission`'s account less its own and the
+    check's (system design 3A). A job whose budget is larger is refused; 0 on a node that runs no
+    jobs.
+    """
+
     executors: list[Executor]
     """What the node can run work on."""
 
@@ -731,6 +737,7 @@ class Node:
             cloud=_enum(Cloud, *_at(data, "cloud", where)),
             cores=_int(*_at(data, "cores", where), 0, None),
             memory_bytes=_int(*_at(data, "memory_bytes", where), 0, None),
+            job_memory_bytes=_int(*_at(data, "job_memory_bytes", where), 0, None),
             executors=[
                 Executor.from_json(*item) for item in _items(*_at(data, "executors", where))
             ],
@@ -747,6 +754,7 @@ class Node:
             "cloud": self.cloud.value,
             "cores": self.cores,
             "memory_bytes": self.memory_bytes,
+            "job_memory_bytes": self.job_memory_bytes,
             "executors": [item.to_json() for item in self.executors],
             "boot_ms": self.boot_ms,
             "time": self.time,

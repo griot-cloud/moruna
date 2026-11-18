@@ -408,6 +408,48 @@
       "isolation": "builtin"
     },
     {
+      "name": "rows",
+      "role": "source",
+      "summary": "Rows the run makes itself, `id` from 0 and `value` = `id % 1000`, as generate_series makes them: no input",
+      "settings": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "description": "A `rows` source's settings.",
+        "examples": [
+          {
+            "rows": 1000
+          },
+          {
+            "rows": 1000000000
+          }
+        ],
+        "properties": {
+          "rows": {
+            "description": "How many rows the source makes; at least one.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rows"
+        ],
+        "title": "rows",
+        "type": "object"
+      },
+      "inputs": "nothing",
+      "outputs": "batches",
+      "needs": {
+        "network": "no",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no"
+      },
+      "deterministic": "yes",
+      "preserves_columns": "yes",
+      "isolation": "builtin"
+    },
+    {
       "name": "tensor",
       "role": "source",
       "summary": "Safetensors or .npy tensor files on a local disk",
@@ -946,6 +988,32 @@
       },
       "inputs": "batches",
       "outputs": "files",
+      "needs": {
+        "network": "no",
+        "egress": [],
+        "gpu": "no",
+        "model_port": "no"
+      },
+      "deterministic": "yes",
+      "preserves_columns": "yes",
+      "isolation": "builtin"
+    },
+    {
+      "name": "count",
+      "role": "sink",
+      "summary": "Keeps nothing and counts the rows and bytes that reach it, as /dev/null would: no output",
+      "settings": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "description": "A `count` sink's settings: none.",
+        "examples": [
+          {}
+        ],
+        "title": "count",
+        "type": "object"
+      },
+      "inputs": "batches",
+      "outputs": "nothing",
       "needs": {
         "network": "no",
         "egress": [],

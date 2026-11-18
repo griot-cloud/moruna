@@ -120,7 +120,7 @@ fn kd_t1_resolve_or_refuse() {
     assert_eq!(declared.role, Role::Kernel);
     // A name is resolved within its role: no source is called `std`, no sink `std`.
     let e = error_of(kinds.source("source", "std"));
-    let sources = "arrow_ipc, image, parquet, tensor";
+    let sources = "arrow_ipc, image, parquet, rows, tensor";
     assert_eq!(
         e.to_string(),
         refusal(SpecError::new(
@@ -133,7 +133,7 @@ fn kd_t1_resolve_or_refuse() {
     assert_eq!(refused_field(&e).as_deref(), Some("sink.kind"));
     assert!(
         e.to_string()
-            .contains("this build writes arrow_ipc, image, parquet"),
+            .contains("this build writes arrow_ipc, count, image, parquet"),
         "{e}"
     );
     let e = error_of(kinds.kernel("kernels[3]", "java"));
@@ -389,8 +389,8 @@ fn kd_t6_listing() {
     let names =
         |list: &[Declaration]| -> Vec<String> { list.iter().map(|d| d.name.clone()).collect() };
     assert_eq!(names(&listing.kernels), ["image", "package", "std"]);
-    let sinks = ["arrow_ipc", "image", "parquet", "tensor"];
-    let sources = ["arrow_ipc", "image", "parquet", "tensor"];
+    let sinks = ["arrow_ipc", "count", "image", "parquet", "tensor"];
+    let sources = ["arrow_ipc", "image", "parquet", "rows", "tensor"];
     assert_eq!(names(&listing.sinks), sinks);
     assert_eq!(names(&listing.sources), sources);
     for (role, list) in [

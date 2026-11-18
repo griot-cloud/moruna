@@ -1,6 +1,8 @@
-"""``moruna.register``'s last steps against the test node (work item 5.4): an image file signed
-with the operator's key, uploaded to a fake object store over HTTPS, and registered through
-``moruna.api``, the node checking the signature as 3E says.
+"""``moruna.register``'s last steps against the test node (work item 5.4): an image's Moruna
+image archive signed with the operator's key, uploaded to a fake object store over HTTPS, and
+registered through ``moruna.api``, the node checking the signature as 3E says. The archive here
+is bytes that start as one does: the node checks its signature, not its contents, which
+``moruna_image::archive`` and the engine's tests do.
 
 Run by ``tests/clients.rs``, which starts the node and passes it in the environment:
 
@@ -70,6 +72,7 @@ class AgainstTheNode(unittest.TestCase):
         self.store.close()
 
     def archive(self, data: bytes) -> _register.Archive:
+        data = b"MRNIMAG1" + data
         path = self.scratch / hashlib.sha256(data).hexdigest()
         path.write_bytes(data)
         return _register.Archive(path, hashlib.sha256(data).hexdigest(), len(data))
@@ -87,13 +90,13 @@ class AgainstTheNode(unittest.TestCase):
     def test_registers_an_image_the_node_verifies(self) -> None:
         image = self.archive(b"an image of add-one")
         function = self.publish(image, "add-one")
-        put = f"/functions/add-one-{image.sha256}.tar"
+        put = f"/functions/add-one-{image.sha256}.mia"
         self.assertEqual(function.name, "add-one")
         self.assertEqual(function.sha256, image.sha256)
         self.assertEqual(function.key, KEY_ID)
         # The node fetches what was uploaded, the SAS with it.
         self.assertEqual(function.address, f"{self.store.url}{put}?{SAS}")
-        self.assertEqual(self.store.objects[put], b"an image of add-one")
+        self.assertEqual(self.store.objects[put], b"MRNIMAG1an image of add-one")
         upload = self.store.requests[-1]
         self.assertEqual((upload.method, upload.query), ("PUT", SAS))
         self.assertEqual(upload.headers["x-ms-blob-type"], "BlockBlob")
@@ -157,7 +160,7 @@ class AgainstTheNode(unittest.TestCase):
             )
 
         function = self.publish(image, "presigned", store=presign)
-        name = f"presigned-{image.sha256}.tar"
+        name = f"presigned-{image.sha256}.mia"
         self.assertEqual(seen, [name])
         self.assertEqual(function.address, f"{self.store.url}/bucket/{name}?X-Amz-Signature=get")
         self.assertEqual(self.store.requests[-1].query, "X-Amz-Signature=put")

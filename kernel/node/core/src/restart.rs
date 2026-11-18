@@ -4,8 +4,8 @@
 //! node.conf names it with one record, which says everything a fresh start needs:
 //!
 //! ```text
-//! restart SERVICE SLOT SERVER GRANTING POLICY...
-//! restart api network network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000
+//! restart SERVICE SLOT SERVER GRANTING [CONNECT] POLICY...
+//! restart api network network listen-supervisor admission rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000
 //! ```
 //!
 //! - `SERVICE` is the service that is started again; `SLOT` is the start slot its listener of
@@ -13,6 +13,11 @@
 //! - `SERVER` is the network server's service, and `GRANTING` its listener slot whose other end
 //!   the supervisor keeps: the server's grant for it holds the `grant` right, and every start of
 //!   `SERVICE` mints that listener from it (`Client::grant`).
+//! - `CONNECT`, when the record names one (item 3.2), is a start slot the service gets a fresh
+//!   connection on at each start: the supervisor is the client of a server's listener through
+//!   node.conf's `link SERVER SLOT supervisor CONNECT` ([`SUPERVISOR`]), and connects afresh for
+//!   every start, so a connection ends with the start that held it (`api`'s to `node-admission`,
+//!   whose jobs end with it).
 //! - `POLICY` is the minted listener's policy, in network.conf's words: `rights=`, `remote=`,
 //!   `local=`, `names=`, `sockets=`, and item 1.3b's `rx=`, `tx=`, `per-peer=` and `linger=`
 //!   ([`parse_policy`]). The cloud profile's is 1.3b's grant for api's listener.
@@ -20,7 +25,8 @@
 //! A service that is started again has only what a start can make afresh: its console, its
 //! account, the minted listener, and, when node.conf bootstraps `platform`, a fresh channel to
 //! `platform` on its slot `platform`, whose other end `platform` is sent with [`API_STARTED`]
-//! (PM, item 2.2c). So it may take no grant, link or bootstrap of node.conf's.
+//! (PM, item 2.2c), and the connection on `CONNECT` (PM, item 3.2). So it may take no grant, link
+//! or bootstrap of node.conf's.
 //!
 //! It is started again at most [`RESTARTS_MAX`] times in [`WINDOW_NS`]: the next death in that
 //! time stops the node ([`Deaths`]).
@@ -46,6 +52,11 @@ pub const WINDOW_NS: u64 = 10 * 60 * 1_000_000_000;
 /// The slot a restarted service gets its fresh channel to `platform` on.
 pub const PLATFORM_SLOT: &str = "platform";
 
+/// The name a `link`'s client side gives the supervisor itself: `link SERVER SLOT supervisor
+/// CONNECT` makes the supervisor the client of `SERVER`'s listener, which it connects through for
+/// each start of the service that restarts (item 3.2). No service may take the name.
+pub const SUPERVISOR: &str = "supervisor";
+
 /// The message the supervisor sends `platform` on its bootstrap channel at each start of the
 /// service that restarts: these bytes and one handle, the service's fresh channel's other end
 /// (PM, item 2.2c). It follows the bootstrap's own message, the node's memory.
@@ -67,6 +78,9 @@ pub struct Restart {
     pub server: String,
     /// The server's listener slot the supervisor grants from.
     pub granting: String,
+    /// The start slot the service gets a fresh connection on at each start, through the
+    /// supervisor's `link SERVER SLOT supervisor CONNECT` (item 3.2).
+    pub connect: Option<String>,
     /// The minted listener's policy.
     pub policy: Policy,
 }
@@ -77,11 +91,21 @@ impl Restart {
         let [service, slot, server, granting, options @ ..] = words else {
             return Err(ConfigError::Syntax);
         };
+        // A policy word is always `KEY=VALUE`: a first word that is not one names `CONNECT`.
+        let (connect, options) = match options {
+            [connect, options @ ..] if !connect.contains('=') => (Some(*connect), options),
+            _ => (None, options),
+        };
         if ![service, slot, server, granting]
             .iter()
             .all(|word| identifier(word))
             || service == server
+            || [service, server].contains(&&SUPERVISOR)
             || ["account", "console", PLATFORM_SLOT].contains(slot)
+            || connect.is_some_and(|connect| {
+                !identifier(connect)
+                    || ["account", "console", PLATFORM_SLOT, slot].contains(&connect)
+            })
         {
             return Err(ConfigError::Syntax);
         }
@@ -90,6 +114,7 @@ impl Restart {
             slot: slot.to_string(),
             server: server.to_string(),
             granting: granting.to_string(),
+            connect: connect.map(str::to_string),
             policy: parse_policy(options)?,
         })
     }

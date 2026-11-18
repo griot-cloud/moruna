@@ -133,6 +133,7 @@ pub fn facts() -> NodeFacts {
         cloud: Cloud::OpenStack,
         cores: 4,
         memory_bytes: 8_589_934_592,
+        job_memory_bytes: 6_849_298_432,
         executors: vec![Executor {
             kind: ExecutorKind::Cpu,
             slots: 4,

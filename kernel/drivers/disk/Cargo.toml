@@ -1,0 +1,9 @@
+[package]
+name = "moruna-disk"
+description = "What a block driver tells of its disk: the serial it is found by, and whether it is the disk the node booted from (the GPT disk GUID the node's image carries), in safe Rust with no dependencies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

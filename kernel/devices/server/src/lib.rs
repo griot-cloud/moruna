@@ -32,8 +32,8 @@ use core::cell::RefCell;
 
 use devices_protocol::{Block, Entry, REGISTER_SLOTS, directory, valid_name};
 use moruna_svc::{
-    Channel, Context, Decoder, Handler, Outcome, Pending, ProtocolError, ProtocolId, Status, Wire,
-    connect,
+    Channel, Context, Decoder, Handler, Outcome, Pending, ProtocolError, ProtocolId, Signals,
+    Status, Wire, connect, wait_one,
 };
 
 /// What a connection to the directory may ask, by the listener it came through.
@@ -85,6 +85,14 @@ struct Registered {
     listener: Channel,
 }
 
+impl Registered {
+    /// Whether its driver has let go of its listener: a driver started again registers its
+    /// device again, and the name is free for it (item 3.3).
+    fn gone(&self) -> bool {
+        wait_one(&self.listener.0, Signals::PEER_CLOSED, 0).is_ok()
+    }
+}
+
 /// The devices drivers have registered, by name, and the lookups waiting for them.
 #[derive(Default)]
 pub struct Registry {
@@ -104,7 +112,8 @@ impl Registry {
     }
 
     /// Registers `block`, served on `listener`, unless its serial is a name taken already:
-    /// `published` says whether a driver's service has it.
+    /// `published` says whether a driver's service has it. A name whose driver has let go of
+    /// its listener is taken no more.
     pub fn register(
         &mut self,
         block: Block,
@@ -139,16 +148,28 @@ impl Registry {
         listener: Channel,
         published: bool,
     ) -> Result<(), directory::Error> {
-        if published || self.entry(&name).is_some() {
+        if published {
             return Err(directory::Error::Exists);
         }
-        self.entries.push(Registered {
+        let entry = Registered {
             name,
             kind,
             listener,
-        });
+        };
+        let at = match self.entries.iter().position(|e| e.name == entry.name) {
+            // Its driver has gone: the driver started again takes the name.
+            Some(at) if self.entries[at].gone() => {
+                self.entries[at] = entry;
+                at
+            }
+            Some(_) => return Err(directory::Error::Exists),
+            None => {
+                self.entries.push(entry);
+                self.entries.len() - 1
+            }
+        };
         // The lookups that waited for it.
-        let name = &self.entries[self.entries.len() - 1].name;
+        let name = &self.entries[at].name;
         let (found, waiting): (Vec<_>, Vec<_>) = core::mem::take(&mut self.waiting)
             .into_iter()
             .partition(|(wanted, _)| wanted == name);
@@ -304,7 +325,7 @@ impl<D: Drivers> Handler for Directory<D> {
     fn handle(&mut self, cx: &mut Context<'_>, ordinal: u16, d: &mut Decoder<'_>) -> Outcome {
         let bad = Outcome::Status(Status::BadMessage);
         match (ordinal, self.access) {
-            (1 | 2, Access::Register) | (3 | 4, Access::Lookup) => refused(),
+            (1 | 2 | 5, Access::Register) | (3 | 4, Access::Lookup) => refused(),
             (1, Access::Lookup) => {
                 let Some(name) = arguments::<String>(d) else {
                     return bad;
@@ -323,6 +344,13 @@ impl<D: Drivers> Handler for Directory<D> {
             }
             (2, Access::Lookup) => match d.finish() {
                 Ok(()) => Outcome::reply(self.drivers.list()),
+                Err(_) => bad,
+            },
+            (5, Access::Lookup) => match d.finish() {
+                Ok(()) => {
+                    let blocks: Vec<Block> = self.registry.borrow().blocks().cloned().collect();
+                    Outcome::reply(blocks)
+                }
                 Err(_) => bad,
             },
             (3, Access::Register) => {

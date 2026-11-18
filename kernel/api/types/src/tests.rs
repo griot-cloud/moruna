@@ -41,7 +41,7 @@ fn node_round_trips_the_design_document() {
     let node: Node = round_trip(
         r#"{
             "version": "0.7.0", "instance": "<id>", "cloud": "openstack",
-            "cores": 4, "memory_bytes": 8589934592,
+            "cores": 4, "memory_bytes": 8589934592, "job_memory_bytes": 6849298432,
             "executors": [{ "kind": "cpu", "slots": 4 }],
             "boot_ms": 2140, "time": 1794931200, "health": "ok"
         }"#,
@@ -54,6 +54,7 @@ fn node_round_trips_the_design_document() {
             cloud: Cloud::OpenStack,
             cores: 4,
             memory_bytes: 8_589_934_592,
+            job_memory_bytes: 6_849_298_432,
             executors: vec![Executor {
                 kind: ExecutorKind::Cpu,
                 slots: 4,
@@ -68,7 +69,7 @@ fn node_round_trips_the_design_document() {
 /// A node document with this cloud and health, each a JSON value.
 fn node_json(cloud: &str, health: &str) -> String {
     format!(
-        r#"{{"version":"0.7.0","instance":"i-1","cloud":{cloud},"cores":1,"memory_bytes":1,"executors":[],"boot_ms":1,"time":1,"health":{health}}}"#
+        r#"{{"version":"0.7.0","instance":"i-1","cloud":{cloud},"cores":1,"memory_bytes":1,"job_memory_bytes":1,"executors":[],"boot_ms":1,"time":1,"health":{health}}}"#
     )
 }
 

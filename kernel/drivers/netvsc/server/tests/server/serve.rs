@@ -4,7 +4,8 @@
 
 use std::{thread, time::Duration};
 
-use moruna_netvsc_server::describe;
+use moruna_netvsc::NetvscError;
+use moruna_netvsc_server::{describe, late, not_started};
 use moruna_svc::{CallError, Channel, deadline_in};
 use net_protocol::{Frame, Info, net};
 use netvsp_protocol::protocol::Status;
@@ -72,9 +73,47 @@ fn the_card_is_served_with_its_address_its_mtu_and_its_link() {
     let mut driver = world.driver(0).borrow_mut();
     assert_eq!(
         describe(driver.card()),
-        "address 00:15:5d:01:02:03, MTU 1500, link up, no offloads"
+        "address 00:15:5d:01:02:03, MTU 1500, link up, no offloads, NVSP 6.1, NDIS 6.30"
     );
     assert!(driver.failed().is_none());
+}
+
+#[test]
+fn a_start_that_runs_past_its_deadline_names_the_step_it_stopped_at() {
+    // The host never answers RNDIS initialisation: the card's start ends at its deadline,
+    // and the fatal line says where, as 1B's first fatal line must.
+    let mut parts = crate::fake::parts(16 * PAGE, 16 * PAGE, ROOMY);
+    parts.host.borrow_mut().mangle = crate::fake::on(
+        crate::fake::Step::Rndis(netvsp_protocol::rndisprot::MESSAGE_TYPE_INITIALIZE_CMPLT),
+        0,
+        |_, _| crate::fake::Fate::Drop,
+    );
+    parts.host.borrow_mut().flush(parts.channel.host());
+    let e = moruna_netvsc::Netvsc::start(
+        parts.channel,
+        parts.receive,
+        parts.send,
+        Some(crate::fake::DEADLINE),
+    )
+    .err()
+    .expect("a start with no answer");
+    assert!(
+        matches!(e, NetvscError::Timeout("RNDIS initialisation")),
+        "{e}"
+    );
+    assert_eq!(
+        not_started("7ced8d9f", e),
+        "no answer to RNDIS initialisation within 4 s"
+    );
+    assert_eq!(
+        late("the receive buffer's GPADL"),
+        "no answer to the receive buffer's GPADL within 4 s"
+    );
+    // Anything else names the card and the error.
+    assert_eq!(
+        not_started("7ced8d9f", NetvscError::Version),
+        "card 7ced8d9f: the host accepts no NVSP version from 5 up"
+    );
 }
 
 #[test]

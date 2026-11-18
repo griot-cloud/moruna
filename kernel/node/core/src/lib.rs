@@ -11,6 +11,9 @@ pub mod restart;
 pub use restart::Restart;
 
 pub const MAX_CONFIG: usize = 4096;
+/// The least a `rest` account may be: admission's own 128 MiB, its 256 MiB check account and
+/// a job of 256 MiB (system design 3A).
+pub const REST_LEAST: u64 = 640 << 20;
 pub const MAX_SERVICES: usize = 16;
 pub const MAX_JOB_GRANTS: usize = 24;
 
@@ -125,6 +128,7 @@ impl Config {
         let mut links = Vec::new();
         let mut bootstraps: Vec<(Bootstrap, String)> = Vec::new();
         let mut admission: Option<String> = None;
+        let mut rest: Option<usize> = None;
         let mut restart: Option<Restart> = None;
         for line in lines {
             let words: Vec<_> = line.split_ascii_whitespace().collect();
@@ -202,16 +206,26 @@ impl Config {
             if services.iter().any(|s| s.name == name) {
                 return Err(ConfigError::Duplicate);
             }
-            let account_bytes = bytes.parse::<u64>().map_err(|_| ConfigError::Budget)?;
-            if account_bytes == 0 || account_bytes % 4096 != 0 {
-                return Err(ConfigError::Budget);
-            }
-            total = total
-                .checked_add(account_bytes)
-                .ok_or(ConfigError::Budget)?;
-            if total > available {
-                return Err(ConfigError::Budget);
-            }
+            // `rest`: the node's memory less every other service's account (system design
+            // 3A), for one service, settled once every other is read.
+            let account_bytes = if bytes == "rest" {
+                if rest.replace(services.len()).is_some() {
+                    return Err(ConfigError::Duplicate);
+                }
+                0
+            } else {
+                let account_bytes = bytes.parse::<u64>().map_err(|_| ConfigError::Budget)?;
+                if account_bytes == 0 || account_bytes % 4096 != 0 {
+                    return Err(ConfigError::Budget);
+                }
+                total = total
+                    .checked_add(account_bytes)
+                    .ok_or(ConfigError::Budget)?;
+                if total > available {
+                    return Err(ConfigError::Budget);
+                }
+                account_bytes
+            };
             services.push(Service {
                 name: name.into(),
                 image: image.into(),
@@ -220,6 +234,13 @@ impl Config {
         }
         if services.is_empty() {
             return Err(ConfigError::Empty);
+        }
+        if let Some(index) = rest {
+            let room = (available - total) & !4095;
+            if room < REST_LEAST {
+                return Err(ConfigError::Budget);
+            }
+            services[index].account_bytes = room;
         }
         // Every destination slot and transferred boot capability has one owner.
         let mut destinations: Vec<(&str, &str)> = Vec::new();
@@ -240,9 +261,31 @@ impl Config {
             sources.push(&grant.source);
             destinations.push((&grant.service, &grant.slot));
         }
+        // The supervisor's own link: the client of one server's listener, which it connects
+        // through for each start of the service that restarts, on the slot the record names
+        // (item 3.2). Its end is the supervisor's, so it fills no service's slot.
+        let supervised: Vec<&Link> = links
+            .iter()
+            .filter(|link| link.right == restart::SUPERVISOR)
+            .collect();
+        let connect = restart
+            .as_ref()
+            .and_then(|record| record.connect.as_deref());
+        match (supervised.as_slice(), connect) {
+            ([], None) => {}
+            ([link], Some(slot)) if link.right_slot == slot => {}
+            _ => return Err(ConfigError::Syntax),
+        }
+        if services.iter().any(|s| s.name == restart::SUPERVISOR)
+            || links.iter().any(|link| link.left == restart::SUPERVISOR)
+        {
+            return Err(ConfigError::Syntax);
+        }
         for link in &links {
             destinations.push((&link.left, &link.left_slot));
-            destinations.push((&link.right, &link.right_slot));
+            if link.right != restart::SUPERVISOR {
+                destinations.push((&link.right, &link.right_slot));
+            }
         }
         if let Some(record) = &restart {
             // A service started again has only what a start makes afresh: no grant, link
@@ -255,6 +298,9 @@ impl Config {
             }
             destinations.push((&record.service, &record.slot));
             destinations.push((&record.server, &record.granting));
+            if let Some(connect) = &record.connect {
+                destinations.push((&record.service, connect));
+            }
             if bootstraps
                 .iter()
                 .any(|(kind, _)| *kind == Bootstrap::Platform)
@@ -790,7 +836,8 @@ mod tests {
             include_bytes!("../../cloud-check/node.conf"),
         ];
         for text in profiles {
-            let config = Config::parse(text, 1 << 30).unwrap();
+            // node-admission takes the rest of a 2 GiB node (item 3.2).
+            let config = Config::parse(text, 2 << 30).unwrap();
             let names =
                 |c: &Config| -> Vec<String> { c.services.iter().map(|s| s.name.clone()).collect() };
             let all = names(&config);
@@ -821,7 +868,7 @@ mod tests {
                     .all(|l| !l.left_slot.starts_with("register"))
             );
             // netvsc pins nothing, so it has no DMA grant anywhere (1F).
-            let on_hyperv = Config::parse(text, 1 << 30).unwrap();
+            let on_hyperv = Config::parse(text, 2 << 30).unwrap();
             assert!(on_hyperv.grants.iter().all(|g| g.service != "netvsc"));
         }
     }
@@ -1117,6 +1164,60 @@ mod boot_tests {
         // Its slot is `supervisor`, which no grant or link may also fill.
         let aliased = b"moruna-node 1\nservice platform image.platform 16777216\nbootstrap platform platform\ngrant platform supervisor spare\n";
         assert_eq!(Config::parse(aliased, 1 << 30), Err(ConfigError::Duplicate));
+    }
+    #[test]
+    fn one_service_takes_the_rest_of_the_nodes_memory() {
+        let config = b"moruna-node 1\nservice api image.api 67108864\nservice admission image.admission rest\n";
+        let node = Config::parse(config, 2 << 30).unwrap();
+        assert_eq!(node.services[1].account_bytes, (2 << 30) - (64 << 20));
+        // Whole pages, and never below what admission needs.
+        let odd = Config::parse(config, (2 << 30) + 100).unwrap();
+        assert_eq!(odd.services[1].account_bytes, (2 << 30) - (64 << 20));
+        assert_eq!(
+            Config::parse(config, (64 << 20) + REST_LEAST - 4096),
+            Err(ConfigError::Budget)
+        );
+        assert!(Config::parse(config, (64 << 20) + REST_LEAST).is_ok());
+        let twice = b"moruna-node 1\nservice a image.a rest\nservice b image.b rest\n";
+        assert_eq!(Config::parse(twice, 8 << 30), Err(ConfigError::Duplicate));
+    }
+
+    /// The cloud profile as committed (system design 1A, 3A; `kernel/node/cloud/node.conf`) on
+    /// 2, 8 and 16 GiB nodes: its services' accounts, node-admission taking the rest, and the job
+    /// bound that leaves, with the processes' share of a node's memory node-for-job.py measured
+    /// (95.17%). Step 3's services are imagefs 256 MiB, linux 256 MiB and no storage (item 3.2).
+    #[test]
+    fn the_cloud_profile_fits_on_2_8_and_16_gib_nodes() {
+        const MIB: u64 = 1 << 20;
+        let profile = include_bytes!("../../cloud/node.conf");
+        let mut bounds = Vec::new();
+        for gib in [2u64, 8, 16] {
+            let room = (gib << 30) / 10_000 * 9_517;
+            let node = Config::parse(profile, room).expect("the cloud profile fits");
+            let (admission, others): (Vec<&Service>, Vec<&Service>) = node
+                .services
+                .iter()
+                .partition(|s| s.name == "node-admission");
+            let account = |name: &str| {
+                others
+                    .iter()
+                    .find(|s| s.name == name)
+                    .unwrap()
+                    .account_bytes
+            };
+            assert_eq!(
+                (account("imagefs"), account("linux")),
+                (256 * MIB, 256 * MIB)
+            );
+            assert!(others.iter().all(|s| s.name != "storage"));
+            let others: u64 = others.iter().map(|s| s.account_bytes).sum();
+            assert_eq!(others, 832 * MIB);
+            let admission = admission[0].account_bytes;
+            assert_eq!(others + admission, room & !4095);
+            // Admission's own 128 MiB and the 256 MiB check account come out of its account.
+            bounds.push((gib, (admission - 384 * MIB) / MIB));
+        }
+        assert_eq!(bounds, [(2, 733), (8, 6580), (16, 14376)]);
     }
     #[test]
     fn admission_is_told_the_nodes_memory_on_a_slot_of_its_own() {

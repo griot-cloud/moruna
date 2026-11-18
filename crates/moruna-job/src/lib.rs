@@ -67,7 +67,9 @@ pub use doc::{
     is_task_id,
 };
 pub use flatbuffer::{JOB_IDENTIFIER, JobError, is_job_flatbuffer};
-pub use job::{Edge, IN, JOB_VERSION, Job, OUT, PortRef, Reporting, Task, V1_SINK, V1_SOURCE};
+pub use job::{
+    Edge, FUNCTION_KIND, IN, JOB_VERSION, Job, OUT, PortRef, Reporting, Task, V1_SINK, V1_SOURCE,
+};
 pub use kind::{
     ArrowField, ArrowSchema, Declaration, Fact, Flow, Isolation, LISTING_VERSION, Listing, Needs,
     Provenance, Requirement, Role, SCHEMA_DIALECT, Served, Urls, is_kind_name, settings_schema,

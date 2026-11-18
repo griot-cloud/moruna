@@ -11,6 +11,17 @@
 //! It can also misbehave on demand: [`Host::mangle`] alters its answers, and the `raw`
 //! methods put any packet at all on the ring to the guest.
 //!
+//! Where Azure's host (Hyper-V's vmswitch) is known to be stricter than netvsp, the fake is
+//! too: it refuses a receive buffer whose ID is 0 with `FAILURE`, as Azure did on the first
+//! boot of netvsc (`moruna: fatal netvsc: ... the host refused the receive buffer with
+//! status 0x00000002`, console 2026-11-18T0146, image 4ba46ef5), where netvsp takes any
+//! ID. Every guest that works there gives a receive buffer an ID that is not 0. It
+//! neither answers nor acts on a packet that asks for a completion under transaction ID
+//! 0, as Hyper-V does (Linux, `drivers/hv/channel.c`, `vmbus_next_request_id`): the
+//! second boot's start stopped there (console 2026-11-18T0213, image cf0271f5). And it
+//! reads the guest's ring only when signalled ([`Host::strict`]), so a signal the guest
+//! owes and does not give is a start that waits until its deadline.
+//!
 //! A test holds the fake as `Rc<RefCell<Host>>` and the card as a [`Card`]. What a test
 //! has the host send is queued, and goes on the ring the next time the card does
 //! anything, or the host runs.
@@ -46,8 +57,9 @@ pub const CONTROL_SECTIONS: u32 = 16;
 pub const FRAME_AT: usize = 256;
 /// netvsp's transaction for what it says of a virtual function.
 pub const VF_TRANSACTION: u64 = 0x8000_0000_0000_0000;
-/// The receive buffer's ID, as the guest names it and the host echoes it.
-pub const RECEIVE_SET: u16 = 0;
+/// The receive buffer's ID, as the guest names it and the host echoes it: Linux's
+/// `NETVSC_RECEIVE_BUFFER_ID`.
+pub const RECEIVE_SET: u16 = 0xcafe;
 /// The address the fake card has.
 pub const MAC: [u8; 6] = [0x00, 0x15, 0x5d, 0x01, 0x02, 0x03];
 /// The deadline every test gives the card: on the test channel, any deadline has
@@ -247,6 +259,10 @@ impl Card {
         self.driver.mtu()
     }
 
+    pub fn nvsp_version(&self) -> u32 {
+        self.driver.nvsp_version()
+    }
+
     pub fn link_up(&self) -> bool {
         self.driver.link_up()
     }
@@ -435,6 +451,8 @@ enum Out {
 }
 
 struct ReceiveBuffer {
+    /// The ID the guest gave it, which names it in every receive.
+    id: u16,
     memory: Memory,
     section: usize,
     control: Vec<u32>,
@@ -480,6 +498,13 @@ pub struct Host {
     pub completes: Completes,
     /// A paused host reads again as soon as the guest waits for it.
     pub wakes_on_wait: bool,
+    /// A host that reads the guest's ring only when the guest signals it, as Hyper-V's
+    /// does: by VMBus's rule (Linux's `hv_ringbuffer_write`, `hv_need_to_signal`), a
+    /// commit is signalled only when the ring was empty before it and the host has not
+    /// masked its interrupt. A guest that commits without the signal the rule asks for, or
+    /// waits with a packet uncommitted, waits until its deadline. Otherwise the fake also
+    /// reads whenever the guest is about to wait, which would hide such a guest.
+    pub strict: bool,
     /// The host takes its offer back: the channel closes once what is queued has gone.
     pub rescind: bool,
     /// Completions put off until the guest waits.
@@ -494,6 +519,10 @@ pub struct Host {
     initialized: bool,
     /// The packet filter the guest set.
     pub filter: u32,
+    /// The ID the guest gave its receive buffer.
+    pub receive_id: Option<u16>,
+    /// Packets that asked for a completion under transaction ID 0, which Hyper-V ignores.
+    pub ignored: usize,
 
     // What happened.
     /// Every version the guest offered, in order.
@@ -610,6 +639,8 @@ impl Host {
             then: Vec::new(),
             completes: Completes::First,
             wakes_on_wait: false,
+            // As Hyper-V: every test runs against a host that reads only when signalled.
+            strict: true,
             rescind: false,
             deferred: Vec::new(),
             version: None,
@@ -619,6 +650,8 @@ impl Host {
             send: None,
             initialized: false,
             filter: 0,
+            receive_id: None,
+            ignored: 0,
             offers: Vec::new(),
             messages: Vec::new(),
             frames: Vec::new(),
@@ -709,6 +742,17 @@ impl Host {
                 IncomingPacketType::Completion => {
                     self.completed(received.packet.transaction_id.unwrap(), &received.payload);
                 }
+                // Hyper-V does not acknowledge, nor act on, a packet that asks for a
+                // completion under transaction ID 0: the ID is its own, for messages the
+                // guest did not ask for (Linux, `drivers/hv/channel.c`,
+                // `vmbus_next_request_id`, which never hands one out for that reason).
+                IncomingPacketType::InBand if received.packet.transaction_id == Some(0) => {
+                    self.ignored += 1;
+                    self.violation(
+                        "a packet asking for a completion under transaction ID 0, which Hyper-V never answers"
+                            .into(),
+                    );
+                }
                 IncomingPacketType::InBand => {
                     self.message(received.packet.transaction_id, &received.payload);
                 }
@@ -726,7 +770,12 @@ impl Host {
         for transaction in std::mem::take(&mut self.deferred) {
             self.complete(transaction, Status::SUCCESS);
         }
-        self.run(ring);
+        if self.strict && !self.wakes_on_wait {
+            // Only what the host itself has to send: it reads when signalled.
+            self.flush(ring);
+        } else {
+            self.run(ring);
+        }
     }
 
     /// Puts on the ring what waits for it: queued packets while the ring has room, and
@@ -982,9 +1031,7 @@ impl Host {
         let Some(config) = self.config else {
             return self.violation("the receive buffer before the NDIS configuration".into());
         };
-        if message.id != RECEIVE_SET {
-            self.violation(format!("receive buffer ID {}", message.id));
-        }
+        self.receive_id = Some(message.id);
         let section = self
             .receive_section
             .unwrap_or(FRAME_AT as u32 + config.mtu + 36);
@@ -996,8 +1043,12 @@ impl Host {
                 0
             }
         };
-        let status = if count > CONTROL_SECTIONS {
+        // Azure's host refuses a receive buffer whose ID is 0 (see the module's docs).
+        let status = if message.id == 0 {
+            Status::FAILURE
+        } else if count > CONTROL_SECTIONS {
             self.receive = Some(ReceiveBuffer {
+                id: message.id,
                 memory: memory.unwrap(),
                 section: section as usize,
                 control: (0..CONTROL_SECTIONS).rev().collect(),
@@ -1277,6 +1328,7 @@ impl Host {
     /// Sends an RNDIS control message as it is.
     fn control_as_is(&mut self, message: Vec<u8>) {
         let receive = self.receive.as_mut().unwrap();
+        let set = receive.id;
         let section = receive.control.pop().expect("a free control section");
         let at = section as usize * receive.section;
         receive.memory.write(at, &message);
@@ -1286,12 +1338,7 @@ impl Host {
         };
         self.lent.insert(section.into(), vec![section]);
         let payload = self.rndis_packet(protocol::CONTROL_CHANNEL_TYPE);
-        self.emit(Out::Transfer(
-            section.into(),
-            RECEIVE_SET,
-            payload,
-            vec![range],
-        ));
+        self.emit(Out::Transfer(section.into(), set, payload, vec![range]));
     }
 
     /// Indicates the link's state, as netvsp's `indicate_status` does.
@@ -1340,6 +1387,7 @@ impl Host {
     /// test's to see that the sections are free.
     pub fn deliver(&mut self, frames: &[&[u8]]) {
         let receive = self.receive.as_mut().unwrap();
+        let set = receive.id;
         let mut sections = Vec::new();
         let mut ranges = Vec::new();
         for frame in frames {
@@ -1359,7 +1407,7 @@ impl Host {
         let transaction = u64::from(sections[0]);
         self.lent.insert(transaction, sections);
         let payload = self.rndis_packet(protocol::DATA_CHANNEL_TYPE);
-        self.emit(Out::Transfer(transaction, RECEIVE_SET, payload, ranges));
+        self.emit(Out::Transfer(transaction, set, payload, ranges));
     }
 
     // What no well-behaved host does.

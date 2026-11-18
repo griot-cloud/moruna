@@ -32,6 +32,7 @@
 mod classes;
 mod handle;
 mod index;
+mod lanes;
 mod large;
 pub mod region;
 mod stats;
@@ -47,8 +48,12 @@ use crate::classes::{GRANULE, SMALL_BUDGET_BYTES, Space, Watermark};
 use crate::index::RangeIndex;
 use crate::region::Mapping;
 
+pub use crate::lanes::REFILL_QUANTUM;
 pub use crate::region::{Granted, HostBacking};
 pub use crate::stats::ArenaStats;
+
+/// What a `Buffer` holds to find its way home (contracts d.3).
+type Handle = Arc<dyn moruna_kernel::ArenaHandle>;
 
 /// How the facade builds the arena (d.1). Every value comes from discovery or the
 /// controller: the arena decides nothing, it reserves what it is told to reserve.
@@ -187,8 +192,9 @@ impl Drop for HostWriter<'_> {
 /// Everything a `Buffer` needs to find its way home. `Buffer`s hold an `Arc` of this, so
 /// the regions outlive every buffer cut from them.
 struct Inner {
-    /// The host regions, oldest first. Read-locked on every allocation and release, and
-    /// write-locked only by `grow`, `shrink` and the release that retires a drained region.
+    /// The host regions, oldest first. Read-locked by an allocation a thread's cache cannot
+    /// serve (`lanes`), and write-locked only by `grow`, `shrink`, a new region of the budget and
+    /// the release that retires a drained region.
     host: RwLock<Vec<Arc<HostRegion>>>,
     /// The host regions' bounds for `tier_of`, which reads them with no lock; published from
     /// `host` each time its write lock is let go (`write_host`).
@@ -200,6 +206,8 @@ struct Inner {
     page_bytes: usize,
     pinned: bool,
     huge_pages_active: bool,
+    /// Allocations by a thread with no lane (one that is ending); every other is counted on its
+    /// thread's lane ([`lanes`]).
     allocations: AtomicU64,
     foreign: AtomicU64,
     /// Payload bytes a source decoded or a sink encoded with the CPU, and bytes an
@@ -242,6 +250,10 @@ struct Inner {
     ahead: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Regions made ahead of need over the run.
     ahead_made: AtomicU64,
+    /// The arena's identity, by which a thread finds its lane ([`lanes`]).
+    id: u64,
+    /// Each thread's lane, the handle its buffers hold ([`lanes::Lane`]).
+    lanes: lanes::Registry,
 }
 
 /// The memory arena (d.1).
@@ -418,6 +430,8 @@ impl Arena {
                 committing: Mutex::new(()),
                 ahead: Mutex::new(None),
                 ahead_made: AtomicU64::new(0),
+                id: lanes::next_id(),
+                lanes: lanes::Registry::default(),
             }),
         }))
     }
@@ -519,6 +533,11 @@ impl Arena {
             region.draining.store(true, Ordering::SeqCst);
             marked += region.space.bytes();
         }
+        // Every thread's cache puts back what it holds of a draining region and lets go of it,
+        // so the region holds only what buffers hold and is retired when they come home.
+        self.inner
+            .lanes
+            .flush(&|region| region.draining.load(Ordering::SeqCst), true);
         self.inner.retire_drained(&mut host);
         drop(host);
         if marked > 0 {
@@ -585,6 +604,8 @@ impl Arena {
         if self.inner.pinned || self.inner.backing.is_some() {
             return 0;
         }
+        // What the threads' caches hold is free too.
+        self.inner.lanes.flush(&|_| true, false);
         let page = self.inner.page_bytes as u64;
         let released: u64 = self
             .inner
@@ -674,8 +695,11 @@ impl Arena {
     }
 
     /// The most host bytes the arena has had in use at once since [`Arena::reset_host_peak`]
-    /// (or since it was made), exact: every charge raises the mark as it is made, whichever
-    /// region it is in. What warm-up's peak of a unit reads (SDD 24 p.4).
+    /// (or since it was made), whichever region they were in. What warm-up's peak of a unit reads
+    /// (SDD 24 p.4). The mark moves where the regions' count does, when a thread's cache is
+    /// refilled or flushed and for a buffer no cache serves, so it is exact to within threads ×
+    /// [`REFILL_QUANTUM`]: never below the most in use at once, and above it by at most what the
+    /// caches held then (AR-I5).
     pub fn host_peak(&self) -> u64 {
         self.inner.host_watermark.peak()
     }
@@ -687,9 +711,11 @@ impl Arena {
 
     /// Largest single allocation currently possible in `tier`, for controller diagnostics
     /// (d.1, f.5). A draining region serves nothing, so it is not counted; the next region a
-    /// granted arena would make is.
+    /// granted arena would make is. The threads' caches are flushed first, as a refusal flushes
+    /// them, so their slots count.
     pub fn largest_free(&self, tier: Tier) -> u64 {
         if self.inner.is_host(tier) {
+            self.inner.lanes.flush(&|_| true, false);
             let host = self.inner.read_host();
             return host
                 .iter()
@@ -705,8 +731,10 @@ impl Arena {
         }
     }
 
-    /// The arena's own figures for the run report (section j).
+    /// The arena's own figures for the run report (section j), with the threads' caches
+    /// flushed first, so the largest free allocation counts their slots.
     pub fn arena_stats(&self) -> ArenaStats {
+        self.inner.lanes.flush(&|_| true, false);
         self.inner.arena_stats()
     }
 
@@ -734,6 +762,14 @@ impl Arena {
         if let Some(thread) = ahead {
             let _ = thread.join();
         }
+    }
+}
+
+/// The lanes go with the arena: each then lives only as long as a buffer that holds it, and
+/// the arena's memory with them ([`lanes`]).
+impl Drop for Arena {
+    fn drop(&mut self) {
+        self.inner.lanes.clear();
     }
 }
 
@@ -862,13 +898,55 @@ impl Inner {
             .map(|r| r.space.tier())
     }
 
+    /// Serve a host allocation (f.3): from this thread's cache when it keeps the class, and
+    /// otherwise from the regions. A refusal first flushes every thread's cache and asks the
+    /// regions again, so nothing is refused while slots sit in a cache; then a granted arena makes
+    /// a region of its budget, and a large request may get a side region (RB5).
+    fn alloc_host_buffer(
+        self: &Arc<Self>,
+        bytes: u64,
+        lane: Option<&lanes::Lane>,
+    ) -> core::result::Result<(*mut u8, Handle), (u64, u64)> {
+        // Read before the regions are, so a region made while they are searched is found.
+        let seen = self.uncommitted.load(Ordering::SeqCst);
+        // A cap or a live side region has every allocation checked against the budget as a
+        // whole (RB4, RB5), which the regions' path does.
+        if let (Some(lane), Some(class)) = (lane, lanes::cached_class(bytes))
+            && self.host_cap.load(Ordering::SeqCst) == u64::MAX
+            && self.side_live.load(Ordering::SeqCst) == 0
+            && let Some((ptr, handle)) = self.alloc_cached(lane, class, bytes)
+        {
+            return Ok((ptr, handle));
+        }
+        self.alloc_host(bytes, lane)
+            .or_else(|_| {
+                self.lanes.flush(&|_| true, false);
+                self.alloc_host(bytes, lane)
+            })
+            .or_else(|refused| self.alloc_committed(bytes, seen, lane).ok_or(refused))
+            .or_else(|refused| self.alloc_side(bytes, lane).ok_or(refused))
+    }
+
+    /// The handle a buffer cut from `region` holds: this thread's for the region, or the arena
+    /// itself for a thread with no lane.
+    fn handle_in(self: &Arc<Self>, region: &Arc<HostRegion>, lane: Option<&lanes::Lane>) -> Handle {
+        match lane {
+            Some(lane) => lane.handle_for(region),
+            None => Arc::clone(self) as Handle,
+        }
+    }
+
     /// Serve a host allocation from the oldest region that is not draining and can hold it
     /// (f.3). Oldest first, so the regions a shrink would pick are the last to fill.
-    fn alloc_host(&self, bytes: u64) -> core::result::Result<(*mut u8, Tier), (u64, u64)> {
+    fn alloc_host(
+        self: &Arc<Self>,
+        bytes: u64,
+        lane: Option<&lanes::Lane>,
+    ) -> core::result::Result<(*mut u8, Handle), (u64, u64)> {
         let host = self.read_host();
         let cap = self.host_cap.load(Ordering::SeqCst);
         if cap != u64::MAX {
-            let in_use: u64 = host.iter().map(|r| r.space.in_use()).sum();
+            let in_use = self.held(&host);
             if in_use.saturating_add(bytes) > cap {
                 return Err((cap, in_use));
             }
@@ -877,7 +955,7 @@ impl Inner {
         // budget is checked as a whole: the regions together never hold more than their
         // capacity, whichever of them the bytes are in (RB5).
         if self.side_live.load(Ordering::SeqCst) > 0 {
-            let in_use: u64 = host.iter().map(|r| r.space.in_use()).sum();
+            let in_use = self.held(&host);
             let limit = self.live_capacity(&host).min(cap);
             if in_use.saturating_add(crate::classes::charge_of(bytes)) > limit {
                 return Err((limit, in_use));
@@ -888,7 +966,7 @@ impl Inner {
                 continue;
             }
             if let Ok((ptr, _charged)) = region.space.alloc(bytes) {
-                return Ok((ptr, region.space.tier()));
+                return Ok((ptr, self.handle_in(region, lane)));
             }
         }
         let budget = host
@@ -897,8 +975,14 @@ impl Inner {
             .map(|r| r.space.bytes())
             .sum::<u64>()
             + self.uncommitted.load(Ordering::SeqCst);
-        let in_use = host.iter().map(|r| r.space.in_use()).sum();
-        Err((budget, in_use))
+        Err((budget, self.held(&host)))
+    }
+
+    /// Host bytes held by buffers, exact when read (AR-I5): what the regions count less what
+    /// the threads' caches hold, which the regions count as in use from refill to flush (f.3).
+    fn held(&self, host: &[Arc<HostRegion>]) -> u64 {
+        let counted: u64 = host.iter().map(|r| r.space.in_use()).sum();
+        counted.saturating_sub(self.lanes.cached())
     }
 
     /// Host bytes in the regions that serve allocations, neither draining nor side regions,
@@ -981,6 +1065,8 @@ impl Inner {
     /// After a host allocation: when the free bytes of the regions made fall below
     /// [`GRANTED_AHEAD_BELOW`] and the budget has more to make, the next step is made ahead of
     /// need on a thread of its own, one at a time. Two loads and a comparison when it is not.
+    /// The regions' own count is the measure: a slot in a thread's cache is not free to any other
+    /// thread's allocation.
     fn consider_ahead(self: &Arc<Self>) {
         if self.backing.is_none() || self.uncommitted.load(Ordering::Relaxed) == 0 {
             return;
@@ -1045,7 +1131,12 @@ impl Inner {
     /// has no room for `bytes`, or one more region would not hold them in one piece (a side
     /// region may, `alloc_side`). `seen` is what was left to make before the caller's
     /// `alloc_host`: when it was nothing, that call saw every region there will be.
-    fn alloc_committed(&self, bytes: u64, seen: u64) -> Option<(*mut u8, Tier)> {
+    fn alloc_committed(
+        self: &Arc<Self>,
+        bytes: u64,
+        seen: u64,
+        lane: Option<&lanes::Lane>,
+    ) -> Option<(*mut u8, Handle)> {
         let backing = self.backing.as_ref()?;
         if seen == 0 {
             return None;
@@ -1053,13 +1144,13 @@ impl Inner {
         // One region at a time. An allocation that waited here finds the region the one before
         // it made, and makes none of its own.
         let _committing = self.committing.lock().unwrap_or_else(|e| e.into_inner());
-        if let Ok(served) = self.alloc_host(bytes) {
+        if let Ok(served) = self.alloc_host(bytes, lane) {
             return Some(served);
         }
         let charge = crate::classes::charge_of(bytes);
         let in_use = {
             let host = self.read_host();
-            let in_use: u64 = host.iter().map(|r| r.space.in_use()).sum();
+            let in_use = self.held(&host);
             let limit = self
                 .live_capacity(&host)
                 .min(self.host_cap.load(Ordering::SeqCst));
@@ -1085,7 +1176,7 @@ impl Inner {
             .space
             .alloc(bytes)
             .ok()
-            .map(|(ptr, _)| (ptr, self.host_tier));
+            .map(|(ptr, _)| (ptr, self.handle_in(&region, lane)));
         self.add_budget_region(region, take);
         served
     }
@@ -1099,13 +1190,17 @@ impl Inner {
     /// over the whole dataset). `None` when the arena is page-locked or touched at reservation
     /// (a side region would have to be prepared the same way), the request is small, or the
     /// budget has no room for it.
-    fn alloc_side(&self, bytes: u64) -> Option<(*mut u8, Tier)> {
+    fn alloc_side(
+        self: &Arc<Self>,
+        bytes: u64,
+        lane: Option<&lanes::Lane>,
+    ) -> Option<(*mut u8, Handle)> {
         if self.pinned || bytes < SIDE_MIN || (self.pretouch && self.backing.is_none()) {
             return None;
         }
         let charge = crate::classes::charge_of(bytes);
         let mut host = self.write_host();
-        let in_use: u64 = host.iter().map(|r| r.space.in_use()).sum();
+        let in_use = self.held(&host);
         let limit = self
             .live_capacity(&host)
             .min(self.host_cap.load(Ordering::SeqCst));
@@ -1148,11 +1243,13 @@ impl Inner {
             side: true,
         });
         let (ptr, _) = side.space.alloc(bytes).ok()?;
+        // Draining from birth, so the handle is the buffer's own and no cache keeps the region.
+        let handle = self.handle_in(&side, lane);
         host.push(side);
         self.side_live.fetch_add(1, Ordering::SeqCst);
         self.side_made.fetch_add(1, Ordering::Relaxed);
         tracing::info!(target: "arena.side", bytes, charge, "a large buffer got a side region");
-        Some((ptr, self.host_tier))
+        Some((ptr, handle))
     }
 }
 
@@ -1166,6 +1263,8 @@ impl Allocator for Arena {
             let (bytes, in_use) = live.fold((0u64, 0u64), |(b, u), r| {
                 (b + r.space.bytes(), u + r.space.in_use())
             });
+            // The caches hold slots of these regions only, which are free (f.3).
+            let in_use = in_use.saturating_sub(self.inner.lanes.cached());
             // A side region's bytes count against the budget too (RB5).
             let side: u64 = host
                 .iter()
@@ -1198,17 +1297,23 @@ impl Allocator for Arena {
             return Err(MorunaError::Unsupported("rdma"));
         }
         let inner = &self.inner;
+        // This thread's lane: its cache of free slots, and the handles its buffers hold, words no
+        // other thread writes unless it releases a buffer this one allocated.
+        let lane = inner.lane();
         let served = if inner.is_host(tier) {
-            // Read before the regions are, so a region made while they are searched is found.
-            let seen = inner.uncommitted.load(Ordering::SeqCst);
             inner
-                .alloc_host(bytes as u64)
-                .or_else(|refused| inner.alloc_committed(bytes as u64, seen).ok_or(refused))
-                .or_else(|refused| inner.alloc_side(bytes as u64).ok_or(refused))
+                .alloc_host_buffer(bytes as u64, lane.as_deref())
+                .map(|(ptr, handle)| (ptr, inner.host_tier, handle))
         } else {
             match inner.space_of(tier) {
                 Some(space) => match space.alloc(bytes as u64) {
-                    Ok((ptr, _charged)) => Ok((ptr, space.tier())),
+                    Ok((ptr, _charged)) => {
+                        let handle: Handle = match &lane {
+                            Some(lane) => Arc::clone(lane) as Handle,
+                            None => Arc::clone(inner) as Handle,
+                        };
+                        Ok((ptr, space.tier(), handle))
+                    }
                     Err(_) => Err((space.bytes(), space.in_use())),
                 },
                 None => {
@@ -1222,12 +1327,17 @@ impl Allocator for Arena {
             }
         };
         match served {
-            Ok((ptr, served_tier)) => {
-                inner.allocations.fetch_add(1, Ordering::Relaxed);
+            Ok((ptr, served_tier, handle)) => {
+                // Counted on the lane, summed when read (AR-I5).
+                match &lane {
+                    Some(lane) => lane.count(),
+                    None => {
+                        inner.allocations.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 if inner.is_host(tier) {
                     inner.consider_ahead();
                 }
-                let handle: Arc<dyn moruna_kernel::ArenaHandle> = Arc::clone(inner) as Arc<_>;
                 // SAFETY: `ptr` is `bytes` bytes inside a region this arena reserved for
                 // `tier`; that region stays mapped until it holds no live buffer (AR-I3),
                 // the allocator will not hand the same bytes out again until they are released,
@@ -1454,6 +1564,35 @@ mod tests {
 
         drop(b);
         assert_eq!(arena.stats().host_in_use, 0);
+    }
+
+    /// A buffer of a thread with no lane (one that is ending) holds the arena itself and goes
+    /// home through it: found by its region, and a draining region it was the last of is retired.
+    #[test]
+    fn a_release_through_the_arena_itself_finds_its_region() {
+        let arena = Arena::new(cfg(4 << 20)).expect("arena");
+        arena.grow(16 << 20).expect("grown");
+        let first = arena.alloc(4 << 20, Tier::Host).expect("the first region");
+        let grown = arena.alloc(64 << 10, Tier::Host).expect("the grown region");
+        let (ptr, len) = (grown.host_ptr().expect("a host buffer"), grown.len());
+        // Its own handle is let go of without a release, so the arena's is the only one.
+        std::mem::forget(grown);
+        assert_eq!(arena.shrink(1), 16 << 20);
+        assert_eq!(
+            arena.draining_bytes(),
+            16 << 20,
+            "its buffer still holds it"
+        );
+        let handle: &dyn moruna_kernel::ArenaHandle = arena.inner.as_ref();
+        handle.release(ptr, len, Tier::Host);
+        assert_eq!(
+            arena.draining_bytes(),
+            0,
+            "retired when its buffer came home"
+        );
+        drop(first);
+        assert_eq!(arena.stats().host_in_use, 0);
+        assert_eq!(arena.arena_stats().double_release, 0);
     }
 
     #[test]

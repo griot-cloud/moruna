@@ -14,6 +14,10 @@
 //!                                             onward (OUT/stack.layers), the image's
 //!                                             record (OUT/image.record, SDD 30 f.12)
 //!                                             and its digest (OUT/image.digest)
+//! moruna-layer archive LAYOUT REFERENCE OUT   the image as a Moruna image archive OUT, the
+//!                                             one file a node registers (system design 3E,
+//!                                             5C); prints its SHA-256, its length and the
+//!                                             image's digest
 //! moruna-layer fixture OUT                    the CI boot's two layers, their list
 //!                                             and the check list (feature `testing`)
 //! ```
@@ -34,11 +38,12 @@ fn main() -> ExitCode {
             derive(layout, reference, dir, name, out, cmd)
         }
         [_, "stack", layout, reference, out, first] => stack(layout, reference, out, first),
+        [_, "archive", layout, reference, out] => archive(layout, reference, out),
         #[cfg(feature = "testing")]
         [_, "fixture", out] => fixture(out),
         _ => {
             eprintln!(
-                "usage: moruna-layer convert LAYOUT REFERENCE OUT | derive LAYOUT REFERENCE DIR NAME OUT CMD... | stack LAYOUT REFERENCE OUT FIRST | fixture OUT"
+                "usage: moruna-layer convert LAYOUT REFERENCE OUT | derive LAYOUT REFERENCE DIR NAME OUT CMD... | stack LAYOUT REFERENCE OUT FIRST | archive LAYOUT REFERENCE OUT | fixture OUT"
             );
             return ExitCode::from(2);
         }
@@ -150,6 +155,18 @@ fn stack(
     }
     lines.push(format!("image {digest}"));
     Ok(lines.join("\n"))
+}
+
+/// The image as a Moruna image archive: `SHA256 LENGTH IMAGE`.
+fn archive(layout: &str, reference: &str, out: &str) -> Result<String, moruna_image::Error> {
+    let source = moruna_image::OciLayout::open(Path::new(layout))?;
+    let written = moruna_image::archive::write(&source, reference, Path::new(out))?;
+    Ok(format!(
+        "{} {} {}",
+        written.sha256_hex(),
+        written.size,
+        written.image
+    ))
 }
 
 #[cfg(feature = "testing")]
