@@ -172,6 +172,18 @@ fn request<C: Channel, T: IntoBytes + Immutable>(
             {
                 return Ok(packet.len.min(PAYLOAD));
             }
+            // The send indirection table, which may come at any time: ignored, and
+            // acknowledged if the host asks (`Wire::table`).
+            Some(packet)
+                if matches!(packet.kind, Kind::InBand)
+                    && wire.table(&payload[..packet.len.min(PAYLOAD)]) =>
+            {
+                if let Some(table) = packet.transaction {
+                    while !wire.put(OutgoingPacketType::Completion, table, &[])? {
+                        wire.wait(what)?;
+                    }
+                }
+            }
             Some(_) => {
                 return Err(NetvscError::Malformed(format!(
                     "another packet where its answer to {what} is due"

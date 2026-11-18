@@ -18,7 +18,7 @@ use vmbus_ring::{
     IncomingPacketType, OutgoingOffset, OutgoingPacket, OutgoingPacketType, ReadError,
     TransferPageRange, WriteError,
 };
-use zerocopy::{Immutable, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::NetvscError;
 
@@ -68,6 +68,10 @@ pub(crate) struct Wire<C: Channel> {
     pending: Option<OutgoingOffset>,
     /// The NVSP version in use, once negotiated.
     version: Option<u32>,
+    /// Whether the host has sent its send indirection table.
+    table_seen: bool,
+    /// The first table's entry count, until it is said.
+    table_news: Option<u32>,
     /// When every wait gives up: a time on the node's monotonic clock, in nanoseconds,
     /// as the channel counts it; `None` for never.
     deadline: Option<u64>,
@@ -98,6 +102,8 @@ impl<C: Channel> Wire<C> {
             wanted: 0,
             pending: None,
             version: None,
+            table_seen: false,
+            table_news: None,
             deadline,
         }
     }
@@ -111,6 +117,35 @@ impl<C: Channel> Wire<C> {
     /// The NVSP version in use, once negotiated.
     pub fn version(&self) -> Option<u32> {
         self.version
+    }
+
+    /// If the packet just read, whose payload's first bytes are `payload`, is the host's
+    /// send indirection table, notes it (its entry count, the first time) and says so.
+    ///
+    /// Hyper-V sends the table from NVSP 5: which of the card's channels each flow's
+    /// frames go on. Linux takes it (`netvsc_receive_inband`, `netvsc_send_table`), and
+    /// FreeBSD's hn takes and ignores it. This card sends on its one channel, so the table
+    /// has nothing to steer: it is ignored, wherever it comes, during the start or after.
+    pub fn table(&mut self, payload: &[u8]) -> bool {
+        let Ok((header, rest)) = protocol::MessageHeader::read_from_prefix(payload) else {
+            return false;
+        };
+        if header.message_type != protocol::MESSAGE5_TYPE_SEND_INDIRECTION_TABLE {
+            return false;
+        }
+        if !self.table_seen {
+            self.table_seen = true;
+            let entries = protocol::Message5SendIndirectionTable::read_from_prefix(rest)
+                .map(|(table, _)| table.table_entry_count)
+                .unwrap_or(0);
+            self.table_news = Some(entries);
+        }
+        true
+    }
+
+    /// The first table's entry count, once, when it has just come: for the console.
+    pub fn take_table(&mut self) -> Option<u32> {
+        self.table_news.take()
     }
 
     /// Asks the host to signal when there is something to do, without waiting: true when

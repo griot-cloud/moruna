@@ -267,6 +267,22 @@ fn frames_wait_for_room_on_the_ring_to_the_host_and_go_in_order() {
 }
 
 #[test]
+fn the_send_indirection_table_is_ignored_and_said_once() {
+    let (mut world, commands) = World::new(ROOMY, |_| ());
+    world.serve(thread::spawn(move || {
+        commands.to(0, |host, _| host.send_table(None));
+        commands.to(0, |host, _| host.send_table(None));
+    }));
+    let mut driver = world.driver(0).borrow_mut();
+    assert!(driver.failed().is_none());
+    assert_eq!(driver.refused(), 0);
+    assert_eq!(
+        driver.take_lines(),
+        ["netvsc: send indirection table of 16 entries ignored: one channel is served"]
+    );
+}
+
+#[test]
 fn a_link_change_answers_the_connections_waiting_for_one_and_is_said() {
     let (mut world, commands) = World::new(ROOMY, |_| ());
     let listener = world.listener(0);
