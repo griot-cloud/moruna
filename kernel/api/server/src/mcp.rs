@@ -3,7 +3,7 @@
 //! response; a notification or a response is answered `202` with no body. No server-sent stream
 //! and no session ID. The tools are the operations, one each, listed exactly as
 //! `kernel/api/mcp-tools.json` (generated from `moruna-api`) lists them. The stream of a job's
-//! events is the tool `moruna_job_events` (item 3.7), which answers a page of it at a time:
+//! events is the tool `moruna_jobs_events` (item 3.7), which answers a page of it at a time:
 //! an agent polls, with the `next` each page gives.
 
 use crate::{

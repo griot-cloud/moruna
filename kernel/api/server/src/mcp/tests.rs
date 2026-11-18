@@ -374,7 +374,7 @@ fn api_with_job(signer: &Signer, records: usize, ended: bool) -> (Api, String) {
 /// The events' tool called with `arguments`: its result.
 fn events(api: &mut Api, token: &str, arguments: &str) -> Value {
     let call = format!(
-        r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"moruna_job_events","arguments":{arguments}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"moruna_jobs_events","arguments":{arguments}}}}}"#
     );
     json_of(&send(api, Some(token), &call))["result"].clone()
 }

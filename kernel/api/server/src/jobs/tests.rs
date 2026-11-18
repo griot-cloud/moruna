@@ -446,8 +446,8 @@ fn a_stream_sends_records_heartbeats_then_the_report_and_the_exit() {
         "event: report\ndata: {\"type\":\"report\",\"report\":{\"rows_out\":20},\"plan\":{\"id\":\"plan-1\"}}\n\n\
          event: exit\ndata: {\"type\":\"exit\",\"code\":0,\"diagnostic\":null}\n\n"
     );
-    // A replay of the ended job, from its third record on.
-    let mut replay = jobs.stream(RUN, Some(3)).unwrap();
+    // A replay of the ended job after its second record: from its third on.
+    let mut replay = jobs.stream(RUN, Some(2)).unwrap();
     let (text, ended) = sent(&jobs, &mut replay);
     assert!(ended);
     assert!(text.starts_with("id: 3\nevent: event\n"), "{text}");
@@ -456,9 +456,11 @@ fn a_stream_sends_records_heartbeats_then_the_report_and_the_exit() {
         "heartbeats are not replayed"
     );
     assert!(text.ends_with("\"diagnostic\":null}\n\n") && text.contains("event: report\n"));
-    // From past its last record: only the end. From zero: all of it.
-    let (text, _) = sent(&jobs, &mut jobs.stream(RUN, Some(99)).unwrap());
-    assert!(text.starts_with("event: report\n"));
+    // After its last record, or past it: only the end. After zero: all of it.
+    for from in [3, 99] {
+        let (text, _) = sent(&jobs, &mut jobs.stream(RUN, Some(from)).unwrap());
+        assert!(text.starts_with("event: report\n"), "{from}: {text}");
+    }
     let (text, _) = sent(&jobs, &mut jobs.stream(RUN, Some(0)).unwrap());
     assert!(text.starts_with("id: 1\n"));
 }
@@ -596,6 +598,62 @@ fn a_page_holds_at_most_1_000_events_and_its_end_whole() {
     assert_eq!(full["next"], 1_500);
 }
 
+/// The bytes of the events' JSON in `page`.
+fn data_bytes(page: &Value) -> usize {
+    page["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["data"].to_string().len())
+        .sum()
+}
+
+#[test]
+fn a_page_holds_at_most_1_mib_of_events_but_always_one() {
+    let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
+    running(&mut jobs, &mut engine, V1);
+    // Records of a little over 100 KiB: after the first, small, record, ten fit in 1 MiB and
+    // the eleventh does not.
+    let line = "x".repeat(100 * 1024);
+    for _ in 0..20 {
+        engine.log("source", &line);
+    }
+    // A record whose JSON alone is over 1 MiB: each byte under 0x20 is written `\u00XX`.
+    engine.log("source", &"\u{1}".repeat(200 * 1024));
+    jobs.pump(&mut engine, NOW);
+    let ids = |page: &Value| -> Vec<u64> {
+        shape(page)
+            .iter()
+            .map(|event| event.1.expect("a record"))
+            .collect()
+    };
+    let first = page(&jobs, 0);
+    assert_eq!(ids(&first), (1..=11).collect::<Vec<u64>>());
+    assert!(data_bytes(&first) <= EVENTS_PAGE_BYTES);
+    assert_eq!(first["next"], 11);
+    let second = page(&jobs, 11);
+    assert_eq!(ids(&second), (12..=21).collect::<Vec<u64>>());
+    assert_eq!(second["next"], 21);
+    // The large record has a page of its own.
+    let large = page(&jobs, 21);
+    assert_eq!(ids(&large), [22]);
+    assert!(data_bytes(&large) > EVENTS_PAGE_BYTES);
+    assert_eq!(large["next"], 22);
+    // The end, with a report of 950 KiB, does not fit after it: it comes alone, next.
+    engine.finish(
+        &format!("{{\"pad\":\"{}\"}}", "r".repeat(950 * 1024)),
+        0,
+        None,
+    );
+    jobs.pump(&mut engine, NOW);
+    assert_eq!(ids(&page(&jobs, 21)), [22]);
+    let end = page(&jobs, 22);
+    assert_eq!(shape(&end), [named("report"), named("exit")]);
+    assert_eq!(end["next"], 22);
+    // After record 20: the record of 100 KiB, which the large one does not fit after.
+    assert_eq!(shape(&page(&jobs, 20)), [record(21)]);
+}
+
 #[test]
 fn a_page_passes_over_what_the_buffer_has_let_go() {
     let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
@@ -605,16 +663,22 @@ fn a_page_passes_over_what_the_buffer_has_let_go() {
         engine.log("source", &line);
         jobs.pump(&mut engine, NOW);
     }
+    // Followed from the start, the pages begin at the oldest record kept, and their numbers show
+    // the gap. Records of 512 KiB come one to a page: two are over 1 MiB.
     let records = jobs.buffered().1 as u64;
-    let kept = page(&jobs, 0);
-    let ids: Vec<u64> = shape(&kept).iter().map(|event| event.1.unwrap()).collect();
+    let (mut ids, mut next) = (Vec::new(), 0);
+    while next < 41 {
+        let kept = page(&jobs, next);
+        assert_eq!(shape(&kept).len(), 1);
+        ids.extend(shape(&kept).iter().map(|event| event.1.unwrap()));
+        next = kept["next"].as_u64().unwrap();
+    }
     let first = 41 - records + 1;
     assert_eq!(
         ids,
         (first..=41).collect::<Vec<u64>>(),
         "the numbers show the gap"
     );
-    assert_eq!(kept["next"], 41);
     // A job whose records have all gone gives the page its end alone.
     engine.finish("{}", 0, None);
     jobs.pump(&mut engine, NOW);

@@ -131,8 +131,8 @@ pub(crate) enum Call {
 pub(crate) struct Inputs<'a> {
     /// The run's ID in the path.
     pub id: Option<&'a str>,
-    /// The record a stream of events starts from; for the events' tool, the record its page
-    /// comes after.
+    /// The record a stream of events, or the events' tool's page, comes after: the last one
+    /// the reader has.
     pub from: Option<u64>,
     /// The body.
     pub body: &'a [u8],

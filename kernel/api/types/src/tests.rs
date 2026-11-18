@@ -322,12 +322,11 @@ fn the_operations_table_is_the_design_table() {
     assert!(OPERATIONS.iter().all(|op| !op.summary.is_empty()));
     for op in OPERATIONS {
         let events = op.id == "jobs_events";
-        // Every operation has a tool, the stream of events one of its own name (item 3.7).
+        // Every operation has a tool, the stream of events one that answers a page (item 3.7).
+        assert_eq!(op.tool_name(), format!("moruna_{}", op.id));
         if events {
-            assert_eq!(op.tool_name(), "moruna_job_events");
             assert_eq!(op.tool_summary(), EVENTS_TOOL_SUMMARY);
         } else {
-            assert_eq!(op.tool_name(), format!("moruna_{}", op.id));
             assert_eq!(op.tool_summary(), op.summary);
         }
         assert_eq!(op.query.is_empty(), !events, "{}", op.id);
@@ -362,8 +361,8 @@ fn a_page_of_events_round_trips() {
     let empty: JobEvents<Value> = round_trip(r#"{"records":[],"next":0}"#);
     assert!(empty.records.is_empty());
     refused::<JobEventName>(r#""heartbeat""#);
-    assert_eq!(EVENTS_PAGE, 1_000);
-    assert_eq!(EVENTS_TOOL, "moruna_job_events");
+    assert_eq!((EVENTS_PAGE, EVENTS_PAGE_BYTES), (1_000, 1 << 20));
+    assert!(FROM.contains("Last-Event-ID") && FROM.contains("after it"));
 }
 
 #[test]

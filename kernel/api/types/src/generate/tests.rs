@@ -168,7 +168,7 @@ fn openapi_has_every_operation_with_its_security_and_the_error_body() {
             "{path}"
         );
     }
-    // The stream of events is text, replayed from `from`; the report is any JSON object.
+    // The stream of events is text, replayed after `from`; the report is any JSON object.
     let events = &document["paths"]["/v1/jobs/{id}/events"]["get"];
     assert_eq!(events["operationId"], "jobs_events");
     assert_eq!(events["security"], observe);
@@ -178,8 +178,14 @@ fn openapi_has_every_operation_with_its_security_and_the_error_body() {
     );
     assert_eq!(
         events["parameters"][1],
-        json!({ "name": "from", "in": "query", "required": false,
+        json!({ "name": "from", "in": "query", "required": false, "description": FROM,
                 "schema": { "type": "integer", "minimum": 0 } })
+    );
+    assert!(
+        events["summary"]
+            .as_str()
+            .unwrap()
+            .contains("replayed after it")
     );
     let report = &document["paths"]["/v1/jobs/{id}/report"]["get"];
     assert_eq!(report["operationId"], "jobs_report");
@@ -380,7 +386,7 @@ fn mcp_has_one_tool_per_operation_with_its_input_and_output() {
         ("moruna_jobs_list", Some("Jobs"), Some(&nothing)),
         ("moruna_jobs_get", Some("JobStatus"), Some(&id)),
         ("moruna_jobs_cancel", Some("JobStatus"), Some(&id)),
-        ("moruna_job_events", Some("JobEvents"), Some(&events)),
+        ("moruna_jobs_events", Some("JobEvents"), Some(&events)),
         ("moruna_jobs_report", None, Some(&id)),
     ];
     for ((tool, operation), (name, title, input)) in tools.iter().zip(OPERATIONS).zip(expected) {
@@ -426,6 +432,6 @@ fn mcp_has_one_tool_per_operation_with_its_input_and_output() {
         tools[8]["description"]
             .as_str()
             .unwrap()
-            .contains("up to 1,000 after the record `from`")
+            .contains("up to 1,000, and 1 MiB of them, after the record `from`")
     );
 }

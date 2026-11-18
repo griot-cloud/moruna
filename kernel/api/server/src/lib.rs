@@ -25,16 +25,17 @@
 //!   [`AUDIT_ANSWER_LIMIT`], newest first.
 //! - MCP (2D): `POST /mcp` on the same port with the same tokens, MCP's Streamable HTTP,
 //!   stateless, at [`PROTOCOL_VERSION`]: one tool per operation, `moruna_<id>`. The stream of
-//!   a job's events is `moruna_job_events`, which answers up to 1,000 of them after a record,
-//!   and the record to ask after next: an agent polls.
+//!   a job's events is `moruna_jobs_events`, which answers a page of them after a record, up to
+//!   1,000 and 1 MiB, and the record to ask after next: an agent polls.
 //! - Jobs (3A, 3B): the server is the engine's host. Through an [`EngineHost`] the node gives it
 //!   ([`Server::with_engine`]), it has the engine check a document, starts a fresh engine for
 //!   each job with the host protocol's `spec`, sends `cancel`, and reads `hello`, `heartbeat`,
 //!   the framed event records, `report` and `exit`. One job runs at a time; the last
 //!   [`JOBS_KEPT`] are kept with their state, heartbeat, exit and report; the last
 //!   [`EVENTS_KEPT`] event and log records, within [`EVENT_BUFFER_BYTES`], are kept for
-//!   `GET /v1/jobs/{id}/events`, which sends them as Server-Sent Events and replays from
-//!   `?from=`. What a job says is secret appears in no answer, event, log or report.
+//!   `GET /v1/jobs/{id}/events`, which sends them as Server-Sent Events and replays them after
+//!   `?from=`, the last record the reader has, as Server-Sent Events' `Last-Event-ID` is. What
+//!   a job says is secret appears in no answer, event, log or report.
 //!
 //! The crate is `no_std` with `alloc`. On the kernel, ring's randomness comes from
 //! `moruna_svc::random`, as the network server's does.

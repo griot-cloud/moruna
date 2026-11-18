@@ -1,6 +1,7 @@
 //! The job operations end to end, over TLS, against the tests' engine (item 3.2, phase 1): a
 //! job validated, submitted, followed over Server-Sent Events and reported; busy, cancel and
-//! the engine's refusals; `?from=`; the scopes; MCP; and a credential that appears nowhere.
+//! the engine's refusals; `?from=`, after which a stream replays; the scopes; MCP, the events'
+//! page polled to the end; and a credential that appears nowhere.
 mod common;
 
 use common::{Harness, Response, WALL, engine::RUN};
@@ -378,25 +379,38 @@ fn the_job_operations_need_their_scopes() {
 }
 
 #[test]
-fn from_replays_from_that_record_and_nothing_else_is_a_query() {
+fn from_replays_after_that_record_and_nothing_else_is_a_query() {
     let mut harness = Harness::new();
     submit(&mut harness);
     for n in 0..4 {
         harness.engine.log("source", &format!("line {n}"));
     }
     harness.settle();
-    let stream = follow(&mut harness, "?from=4");
+    // `from` is the last record the reader has, as Last-Event-ID is: the stream goes on after it.
+    let stream = follow(&mut harness, "?from=3");
     let replayed = events(&received(&mut harness, stream));
     let ids: Vec<Option<u64>> = replayed.iter().map(|event| event.0).collect();
     assert_eq!(ids, [Some(4), Some(5)]);
     assert_eq!(replayed[0].2["text"], "line 2");
-    // An ended job replays to its end.
+    // An ended job replays to its end; from 0, all of it, as with no from.
     harness.engine.finish("{}", 0, None);
     harness.settle();
     let whole = follow(&mut harness, "");
     let all = events(&received(&mut harness, whole));
     assert_eq!(all.len(), 7, "five records, the report and the exit");
     assert!(harness.clients[whole].server_closed());
+    let zero = follow(&mut harness, "?from=0");
+    assert_eq!(events(&received(&mut harness, zero)), all);
+    let last = follow(&mut harness, "?from=5");
+    let end: Vec<String> = events(&received(&mut harness, last))
+        .into_iter()
+        .map(|event| event.1)
+        .collect();
+    assert_eq!(
+        end,
+        ["report", "exit"],
+        "after the last record, only the end"
+    );
     let observer = Harness::bearer(&harness.token(&["observe"]));
     let client = harness.connect();
     for query in ["?from=", "?from=x", "?from=-1", "?to=3", "?from=1&x=2", "?"] {
@@ -599,7 +613,7 @@ fn an_mcp_client_runs_a_job_through_the_tools() {
         ("moruna_jobs_get", json!({ "id": RUN, "from": 1 })),
         ("moruna_jobs_list", json!({ "id": RUN })),
         ("moruna_jobs_validate", json!({ "v3": {} })),
-        ("moruna_job_events", json!({ "from": 1 })),
+        ("moruna_jobs_events", json!({ "from": 1 })),
     ] {
         let refused = tool(&mut harness, client, &token, name, arguments);
         assert_eq!(refused["isError"], true, "{name}");
@@ -610,9 +624,9 @@ fn an_mcp_client_runs_a_job_through_the_tools() {
                 .contains(r#""code":"invalid""#)
         );
     }
-    // The events' tool has its own name; the operation's ID is no tool's.
+    // A tool no operation has is JSON-RPC's invalid params.
     let call = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call",
-                       "params": { "name": "moruna_jobs_events", "arguments": { "id": RUN } } });
+                       "params": { "name": "moruna_job_events", "arguments": { "id": RUN } } });
     let response = harness.exchange(client, &Harness::post("/mcp", &token, &call.to_string()));
     assert_eq!(response.json()["error"]["code"], -32_602);
     // observe lists and reads, and does not submit: a tool error with forbidden.
@@ -662,7 +676,7 @@ fn poll(harness: &mut Harness, index: usize, token: &str, from: u64) -> (Vec<Val
         harness,
         index,
         token,
-        "moruna_job_events",
+        "moruna_jobs_events",
         json!({ "id": RUN, "from": from }),
     );
     assert!(result.get("isError").is_none(), "{result}");
@@ -701,7 +715,7 @@ fn an_mcp_client_follows_a_job_to_its_report_by_polling_its_events() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|tool| tool["name"] == "moruna_job_events")
+        .find(|tool| tool["name"] == "moruna_jobs_events")
         .cloned()
         .expect("the events' tool is listed");
     assert_eq!(events_tool["inputSchema"]["required"], json!(["id"]));

@@ -5,7 +5,7 @@
 //! order a JSON map keeps, and each file ends in one newline.
 
 use crate::{
-    Audit, ErrorBody, Health, Job, JobEvents, JobStatus, Jobs, Node, OPERATIONS, Operation,
+    Audit, ErrorBody, FROM, Health, Job, JobEvents, JobStatus, Jobs, Node, OPERATIONS, Operation,
     Request, Response, Submitted, Validation,
 };
 use alloc::{string::String, vec::Vec};
@@ -92,6 +92,7 @@ pub fn openapi(operations: &[Operation]) -> Value {
                 "name": name,
                 "in": "query",
                 "required": false,
+                "description": FROM,
                 "schema": { "type": "integer", "minimum": 0 }
             }));
         }
@@ -151,10 +152,6 @@ pub fn openapi(operations: &[Operation]) -> Value {
         }
     })
 }
-
-/// What the one query parameter any operation takes, `from`, is to a tool: the events' tool
-/// answers the records after it.
-const FROM: &str = "The number of the last record already read: the answer's records come after it. 0, or absent, for the first.";
 
 /// The MCP tool list for `operations`, as MCP's `tools/list` result: one tool per operation,
 /// named as [`Operation::tool_name`] says and described as [`Operation::tool_summary`] says. A

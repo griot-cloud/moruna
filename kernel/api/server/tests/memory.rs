@@ -14,6 +14,7 @@ use common::{
     facts, pinned,
     signer::Signer,
 };
+use moruna_api::EVENTS_PAGE_BYTES;
 use moruna_api_server::{BODY_BUDGET, BODY_LIMIT, Config, Identity, OPEN_LIMIT, Server, TokenKey};
 use rustls::{ClientConnection, pki_types::ServerName};
 use std::{
@@ -326,7 +327,7 @@ fn eighty_connections_with_1_mib_bodies_and_no_token_stay_under_32_mib() {
     PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
     let poller = connect(&mut harness);
     let call = format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"moruna_job_events","arguments":{{"id":"{RUN}","from":0}}}}}}"#
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"moruna_jobs_events","arguments":{{"id":"{RUN}","from":0}}}}}}"#
     );
     harness.clients[poller].send(&Harness::post("/mcp", &token, &call));
     settle_but(&mut harness, reader);
@@ -364,6 +365,53 @@ fn eighty_connections_with_1_mib_bodies_and_no_token_stay_under_32_mib() {
         "with a gap where it fell behind"
     );
     assert!(harness.clients[reader].server_closed());
+    // The reader's connection is gone. Its pipe, written while the server ran, stands for the
+    // network server's buffer of the connection, not the server's: let it go, as the network
+    // server would.
+    harness.clients[reader].pipe = Rc::new(RefCell::new(Pipe::default()));
+
+    // A second job tells records of 12 KiB until they fill the buffer: 1,000 of them would be
+    // all of its 12 MiB. Polled over MCP, a page stops at 1 MiB, and the server stays under
+    // 32 MiB.
+    let second = "22222222222222222222222222222222";
+    harness.engine.run_as(second);
+    let submitter = connect(&mut harness);
+    harness.clients[submitter].send(&Harness::post("/v1/jobs", &submit, job));
+    settle(&mut harness);
+    harness.engine.attempt_started();
+    settle(&mut harness);
+    assert_eq!(harness.clients[submitter].response().unwrap().status, 201);
+    let large = "x".repeat(12 * 1024);
+    for _ in 0..1_100 {
+        harness.engine.log("source", &large);
+    }
+    settle(&mut harness);
+    PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+    let poller = connect(&mut harness);
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"moruna_jobs_events","arguments":{{"id":"{second}","from":0}}}}}}"#
+    );
+    harness.clients[poller].send(&Harness::post("/mcp", &token, &call));
+    settle(&mut harness);
+    let page = harness.clients[poller].response().unwrap().json();
+    let records = page["result"]["structuredContent"]["records"]
+        .as_array()
+        .unwrap();
+    let bytes: usize = records
+        .iter()
+        .map(|record| record["data"].to_string().len())
+        .sum();
+    assert!(
+        bytes <= EVENTS_PAGE_BYTES && bytes > EVENTS_PAGE_BYTES - 13 * 1024,
+        "{bytes}"
+    );
+    assert!((80..90).contains(&records.len()), "{}", records.len());
+    let peak = PEAK.load(Ordering::Relaxed);
+    report(
+        "the buffer full of records of 12 KiB, an MCP page of them",
+        peak,
+    );
+    assert!(peak < 32 * 1024 * 1024, "peak {peak} bytes");
 }
 
 fn report(case: &str, peak: usize) {

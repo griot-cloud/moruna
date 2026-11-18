@@ -433,27 +433,34 @@ pub struct Heartbeat {
     pub staging_bytes: u64,
 }
 
-/// The name of the MCP tool that follows a job's events (item 3.7): MCP stays stateless, so the
-/// tool answers a page of what `GET /v1/jobs/{id}/events` streams, and an agent polls.
-pub const EVENTS_TOOL: &str = "moruna_job_events";
-
-/// The most records one answer of [`EVENTS_TOOL`] holds.
+/// The most events one answer of the MCP tool `moruna_jobs_events` holds (item 3.7): MCP stays
+/// stateless, so the tool answers a page of what `GET /v1/jobs/{id}/events` streams, and an
+/// agent polls.
 pub const EVENTS_PAGE: usize = 1_000;
 
-/// What [`EVENTS_TOOL`] does, for the MCP tool list.
-pub const EVENTS_TOOL_SUMMARY: &str = "A job's events, a page at a time: up to 1,000 after the record `from` (0, or absent, for the first), each event and log record with its number, then, once every record has been given and the job has ended, its report and its exit. `next` is the `from` of the next call: poll with it until the exit.";
+/// The most bytes of events' JSON (their `data`) one page of `moruna_jobs_events` holds; a page
+/// always holds one event, however large.
+pub const EVENTS_PAGE_BYTES: usize = 1024 * 1024;
 
-/// The answer of the MCP tool `moruna_job_events`: a page of a job's events, as a stream of
-/// `GET /v1/jobs/{id}/events` from the record after `from` would send them at once, and where
-/// the next page begins.
+/// What the MCP tool `moruna_jobs_events` does, for the MCP tool list.
+pub const EVENTS_TOOL_SUMMARY: &str = "A job's events, a page at a time: up to 1,000, and 1 MiB of them, after the record `from` (0, or absent, for the first), each event and log record with its number, then, once every record has been given and the job has ended, its report and its exit. `next` is the `from` of the next call: poll with it until the exit.";
+
+/// What `from` is, to the stream of a job's events and to its MCP tool: the number of the last
+/// record already read, as Server-Sent Events' `Last-Event-ID` is.
+pub const FROM: &str = "The number of the last record already read, as Server-Sent Events' Last-Event-ID: the records after it are sent. 0, or absent, for the first.";
+
+/// The answer of the MCP tool `moruna_jobs_events`: a page of a job's events, as a stream of
+/// `GET /v1/jobs/{id}/events` after the record `from` would send them at once, and where the
+/// next page begins.
 // `D` is an event's JSON: any JSON object, in whatever form the program holds JSON.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
 #[cfg_attr(any(test, feature = "schema"), schemars(rename = "JobEvents"))]
 pub struct JobEvents<D> {
-    /// At most 1,000, in the order the stream sends them: the job's event and log records after
-    /// `from`, then, once they have all been given, a note of the engine's skipped lines if it
-    /// had any, and, once the job has ended, its report and its exit.
+    /// At most 1,000, and at most 1 MiB of JSON unless the first alone is larger, in the order
+    /// the stream sends them: the job's event and log records after `from`, then, once they
+    /// have all been given, a note of the engine's skipped lines if it had any, and, once the
+    /// job has ended, its report and its exit, which come together.
     pub records: Vec<JobEvent<D>>,
     /// The `from` of the next call: the number of the last record in this page, or this call's
     /// `from` when the page holds none.
@@ -547,8 +554,7 @@ pub const ID: &str = "{id}";
 /// One operation of the API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Operation {
-    /// The operation's ID. Its MCP tool is `moruna_<id>`, but for the stream of events
-    /// ([`Operation::tool_name`]).
+    /// The operation's ID; its MCP tool is `moruna_<id>`.
     pub id: &'static str,
     /// Its HTTP method.
     pub method: Method,
@@ -569,17 +575,13 @@ pub struct Operation {
 }
 
 impl Operation {
-    /// The name of the operation's MCP tool: `moruna_<id>`, and [`EVENTS_TOOL`] for the stream
-    /// of events, whose tool answers a page of it.
+    /// The name of the operation's MCP tool: `moruna_<id>`.
     pub fn tool_name(&self) -> String {
-        match self.response {
-            Response::Events => String::from(EVENTS_TOOL),
-            _ => format!("moruna_{}", self.id),
-        }
+        format!("moruna_{}", self.id)
     }
 
     /// What the operation's MCP tool does: the operation's summary, and
-    /// [`EVENTS_TOOL_SUMMARY`] for the stream of events.
+    /// [`EVENTS_TOOL_SUMMARY`] for the stream of events, whose tool answers a page of it.
     pub const fn tool_summary(&self) -> &'static str {
         match self.response {
             Response::Events => EVENTS_TOOL_SUMMARY,
@@ -716,7 +718,7 @@ pub const OPERATIONS: &[Operation] = &[
         query: &["from"],
         response: Response::Events,
         status: 200,
-        summary: "A job's events as Server-Sent Events: each event and log record as its JSON line, heartbeats, then the report and the exit. `from` replays from that record of the node's buffer.",
+        summary: "A job's events as Server-Sent Events: each event and log record as its JSON line, heartbeats, then the report and the exit. `from` is the last record already read, as Server-Sent Events' Last-Event-ID: the node's buffer is replayed after it.",
     },
     Operation {
         id: "jobs_report",

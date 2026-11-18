@@ -890,6 +890,7 @@
             }
           },
           {
+            "description": "The number of the last record already read, as Server-Sent Events' Last-Event-ID: the records after it are sent. 0, or absent, for the first.",
             "in": "query",
             "name": "from",
             "required": false,
@@ -928,7 +929,7 @@
             ]
           }
         ],
-        "summary": "A job's events as Server-Sent Events: each event and log record as its JSON line, heartbeats, then the report and the exit. `from` replays from that record of the node's buffer."
+        "summary": "A job's events as Server-Sent Events: each event and log record as its JSON line, heartbeats, then the report and the exit. `from` is the last record already read, as Server-Sent Events' Last-Event-ID: the node's buffer is replayed after it."
       }
     },
     "/v1/jobs/{id}/report": {

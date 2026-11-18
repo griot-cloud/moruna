@@ -1,6 +1,6 @@
 //! The jobs (system design, sections 3A and 3B): one at a time, each in a fresh engine the node
 //! starts; the last 100 with their state, heartbeat, exit and report; and the node's buffer of
-//! the last event and log records, which a stream of events replays from.
+//! the last event and log records, which a stream of events replays after a record.
 //!
 //! The server is the engine's host: it sends `spec` and `cancel`, and reads `hello`,
 //! `heartbeat`, the framed event records, `report` and `exit`. It never reads a job document:
@@ -14,8 +14,8 @@ use crate::{
 };
 use alloc::{boxed::Box, collections::VecDeque, format, string::String, vec, vec::Vec};
 use moruna_api::{
-    EVENTS_PAGE, ErrorCode, Heartbeat, Job, JobState, JobStatus, JobSummary, Jobs as JobList,
-    Refusal, Submitted, Validation,
+    EVENTS_PAGE, EVENTS_PAGE_BYTES, ErrorCode, Heartbeat, Job, JobState, JobStatus, JobSummary,
+    Jobs as JobList, Refusal, Submitted, Validation,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -216,14 +216,12 @@ pub(crate) struct Stream {
 }
 
 impl Stream {
-    /// A stream of `entry`'s events from its record `from` (its first when `None`): it sends
+    /// A stream of `entry`'s events after its record `after` (from its first when 0): it sends
     /// the heartbeats that come from now on, and the engine's skipped lines from the first.
-    fn new(entry: &Entry, from: Option<u64>) -> Self {
+    fn new(entry: &Entry, after: u64) -> Self {
         Self {
             ordinal: entry.ordinal,
-            next: entry
-                .first
-                .saturating_add(from.unwrap_or(1).saturating_sub(1)),
+            next: entry.first.saturating_add(after),
             heartbeats: entry.heartbeats,
             skipped: 0,
         }
@@ -413,10 +411,12 @@ impl Jobs {
         }
     }
 
-    /// `GET /v1/jobs/{id}/events`: a stream of the job's events from its record `from` (its
-    /// first when `None`), as far back as the buffer still holds them.
+    /// `GET /v1/jobs/{id}/events`: a stream of the job's events after its record `from`, the
+    /// last one the reader has, as Server-Sent Events' `Last-Event-ID` is (from its first when
+    /// `None`), as far back as the buffer still holds them.
     pub(crate) fn stream(&self, id: &str, from: Option<u64>) -> Option<Stream> {
-        self.entry(id).map(|entry| Stream::new(entry, from))
+        self.entry(id)
+            .map(|entry| Stream::new(entry, from.unwrap_or(0)))
     }
 
     /// Writes to `out` what `stream` can be sent now, as Server-Sent Events: each record as
@@ -446,32 +446,39 @@ impl Jobs {
     /// The answer of the events' MCP tool (item 3.7): a page of the job `id`'s events after its
     /// record `after`, as JSON ([`moruna_api::JobEvents`]), or `None` when no job has this ID.
     ///
-    /// The page holds what a fresh stream from the record after `after` would send at once, up
-    /// to [`EVENTS_PAGE`] events in all: the records, as far back as the buffer still holds
-    /// them, each with its number; then, once every record is in, the note of the engine's
-    /// skipped lines and, once the job has ended, its report and its exit. Those last come
-    /// together or not at all: a page never ends between them. A fresh stream sends no
-    /// heartbeat until one comes, so a page holds none. `next` is the number of the last
-    /// record in the page, or `after` when it holds none.
+    /// The page holds what a fresh stream after the record `after` would send at once, up to
+    /// [`EVENTS_PAGE`] events and [`EVENTS_PAGE_BYTES`] of their JSON in all, but always one:
+    /// the records, as far back as the buffer still holds them, each with its number; then,
+    /// once every record is in, the note of the engine's skipped lines and, once the job has
+    /// ended, its report and its exit. Those last come together or not at all: a page never
+    /// ends between them. A fresh stream sends no heartbeat until one comes, so a page holds
+    /// none. `next` is the number of the last record in the page, or `after` when it holds
+    /// none.
     pub(crate) fn page(&self, id: &str, after: u64) -> Option<String> {
         let entry = self.entry(id)?;
-        let mut stream = Stream::new(entry, Some(after.saturating_add(1)));
+        let mut stream = Stream::new(entry, after);
         let mut out = String::from("{\"records\":[");
-        let (mut count, mut next) = (0, after);
+        let (mut count, mut bytes, mut next) = (0, 0, after);
+        // Whether `more` events of `size` bytes in all fit after what the page holds.
+        let fits = |count: usize, bytes: usize, more: usize, size: usize| {
+            count == 0 || (count + more <= EVENTS_PAGE && bytes + size <= EVENTS_PAGE_BYTES)
+        };
         let all = self.records(entry, &mut stream, |id, line| {
-            if count == EVENTS_PAGE {
+            if !fits(count, bytes, 1, line.len()) {
                 return false;
             }
             page_event(&mut out, count == 0, Some(id), "event", line);
-            count += 1;
-            next = id;
+            (count, bytes, next) = (count + 1, bytes + line.len(), id);
             true
         });
         if all {
-            // Count what follows the records first, on a copy of the stream, to see if it fits.
-            let mut following = 0;
-            tail(entry, &mut stream.clone(), |_, _| following += 1);
-            if count + following <= EVENTS_PAGE {
+            // Measure what follows the records first, on a copy of the stream, to see if it
+            // fits.
+            let (mut more, mut size) = (0, 0);
+            tail(entry, &mut stream.clone(), |_, line| {
+                (more, size) = (more + 1, size + line.len());
+            });
+            if fits(count, bytes, more, size) {
                 tail(entry, &mut stream, |name, line| {
                     page_event(&mut out, count == 0, None, name, line);
                     count += 1;

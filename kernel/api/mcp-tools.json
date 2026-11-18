@@ -807,12 +807,12 @@
       }
     },
     {
-      "description": "A job's events, a page at a time: up to 1,000 after the record `from` (0, or absent, for the first), each event and log record with its number, then, once every record has been given and the job has ended, its report and its exit. `next` is the `from` of the next call: poll with it until the exit.",
+      "description": "A job's events, a page at a time: up to 1,000, and 1 MiB of them, after the record `from` (0, or absent, for the first), each event and log record with its number, then, once every record has been given and the job has ended, its report and its exit. `next` is the `from` of the next call: poll with it until the exit.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
           "from": {
-            "description": "The number of the last record already read: the answer's records come after it. 0, or absent, for the first.",
+            "description": "The number of the last record already read, as Server-Sent Events' Last-Event-ID: the records after it are sent. 0, or absent, for the first.",
             "minimum": 0,
             "type": "integer"
           },
@@ -826,9 +826,9 @@
         ],
         "type": "object"
       },
-      "name": "moruna_job_events",
+      "name": "moruna_jobs_events",
       "outputSchema": {
-        "description": "The answer of the MCP tool `moruna_job_events`: a page of a job's events, as a stream of\n`GET /v1/jobs/{id}/events` from the record after `from` would send them at once, and where\nthe next page begins.",
+        "description": "The answer of the MCP tool `moruna_jobs_events`: a page of a job's events, as a stream of\n`GET /v1/jobs/{id}/events` after the record `from` would send them at once, and where the\nnext page begins.",
         "properties": {
           "next": {
             "description": "The `from` of the next call: the number of the last record in this page, or this call's\n`from` when the page holds none.",
@@ -837,7 +837,7 @@
             "type": "integer"
           },
           "records": {
-            "description": "At most 1,000, in the order the stream sends them: the job's event and log records after\n`from`, then, once they have all been given, a note of the engine's skipped lines if it\nhad any, and, once the job has ended, its report and its exit.",
+            "description": "At most 1,000, and at most 1 MiB of JSON unless the first alone is larger, in the order\nthe stream sends them: the job's event and log records after `from`, then, once they\nhave all been given, a note of the engine's skipped lines if it had any, and, once the\njob has ended, its report and its exit, which come together.",
             "items": {
               "description": "One event of a job's stream, as `GET /v1/jobs/{id}/events` sends it.",
               "properties": {
