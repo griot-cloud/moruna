@@ -108,6 +108,14 @@ mod moruna {
         crate::thread_yield();
     }
 
+    /// Fills `page` with the page of `memory` at `offset`: whether it has one (item 5.5).
+    pub(in crate::rt) fn env_page(memory: &Memory, offset: u64, page: &mut [u8]) -> bool {
+        memory
+            .map(offset, PAGE_SIZE, map::READ)
+            .and_then(|m| m.read(0, page))
+            .is_ok()
+    }
+
     /// Writes `line` on the console `console`, in one call.
     #[cfg(feature = "rt")]
     pub(in crate::rt) fn console_write(console: moruna_abi::RawHandle, line: &[u8]) {
@@ -288,6 +296,11 @@ mod host {
 
     pub(in crate::rt) fn yield_now() {
         std::thread::yield_now();
+    }
+
+    /// A host process has no `env` slot, so nothing reaches here: no page.
+    pub(in crate::rt) fn env_page(_: &crate::Memory, _: u64, _: &mut [u8]) -> bool {
+        false
     }
 
     /// A host process has no console slot, so nothing reaches here.

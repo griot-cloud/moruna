@@ -280,8 +280,8 @@ pub unsafe extern "C" fn relibc_start_v1(
 /// Moruna: the C library's start (system design 5B). The one `_start`, std's, calls it after the
 /// first thread's block of TLS and control block and std's log, and before the init arrays and
 /// `main`: what `relibc_start_v1` does but for those, the program's arguments the process's name
-/// and its environment empty, as `main` gets them; and relibc's part of every thread's end,
-/// set on the runtime's one thread path.
+/// and its environment std's (its start slot `env`, item 5.5), as `main` gets them; and relibc's
+/// part of every thread's end, set on the runtime's one thread path.
 #[cfg(target_os = "moruna")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moruna_libc_init() {
@@ -292,9 +292,13 @@ pub unsafe extern "C" fn moruna_libc_init() {
     arg0.extend_from_slice(name.as_bytes());
     arg0.push(0);
     let arg0 = Box::leak(arg0.into_boxed_slice()).as_ptr();
-    // A start's stack as Linux lays one out: argc, argv and its null, envp's null, and an
+    // A start's stack as Linux lays one out: argc, argv and its null, envp (moruna: each entry
+    // of std's environment, a C string std keeps for the process's life) and its null, and an
     // auxiliary vector with nothing in it.
-    let words: &'static mut [usize; 6] = Box::leak(Box::new([1, arg0 as usize, 0, 0, AT_NULL, 0]));
+    let mut words: Vec<usize> = Vec::from([1, arg0 as usize, 0]);
+    words.extend(relibc_moruna::process::environment().map(|entry| entry as usize));
+    words.extend([0, AT_NULL, 0]);
+    let words: &'static mut [usize] = Box::leak(words.into_boxed_slice());
     let sp: &'static Stack = unsafe { &*words.as_ptr().cast::<Stack>() };
 
     unsafe { relibc_verify_host() };

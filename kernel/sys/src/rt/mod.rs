@@ -5,6 +5,7 @@
 //!
 //! - [`start`] and [`exit`]: the program's entry hands the start page here before `main`, and its
 //!   exit code after; [`abort`] ends it after a panic.
+//! - [`env`]: the process's environment, its start slot `env` (item 5.5), read once at the start.
 //! - [`futex`]: the futex calls with a timeout, which std's `Mutex`, `Condvar`, `RwLock`, `Once` and
 //!   thread parking are built on.
 //! - [`time`]: `Instant` from the clock page, and `SystemTime` from the realtime base it carries
@@ -18,6 +19,7 @@
 //!
 //! Every call the kernel answers goes through `os`, the one module a host test replaces.
 
+pub mod env;
 pub mod futex;
 mod lock;
 #[cfg(feature = "rt")]
@@ -34,13 +36,15 @@ pub mod tls;
 pub const ABORT_CODE: i32 = 101;
 
 /// The program's start, before `main`: records the start page the kernel passed the first
-/// thread (`rdi`), and gives that thread its thread-locals and control block. A program with no
-/// memory for them cannot run its first line: it ends with [`ABORT_CODE`].
+/// thread (`rdi`), gives that thread its thread-locals and control block, and reads the
+/// process's environment (its slot `env`). A program with no memory for its block cannot run
+/// its first line: it ends with [`ABORT_CODE`].
 pub fn start(start_page: u64) {
     crate::start::init(start_page);
     if !tls::install_main() {
         crate::exit(i64::from(ABORT_CODE));
     }
+    env::load();
 }
 
 /// Ends the process with `code`, once stdout's and stderr's last line is in the log.

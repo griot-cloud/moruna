@@ -63,7 +63,8 @@ branches from.
     adopted rather than a TLS block made.
   - `src/start.rs`: `moruna_libc_init`, which std's `_start` calls after the first thread's block
     and the log and before the init arrays and `main` (relibc's start without those, argv the
-    process's name, no environment), and `moruna_libc_exit`, `exit` for a `main` that returned.
+    process's name, `environ` std's environment, the start slot `env` of item 5.5), and
+    `moruna_libc_exit`, `exit` for a `main` that returned.
   - `src/pthread/mod.rs`: `pthread_create` takes the runtime's one thread path (its stack, its
     block of TLS, made from the program's template), and keeps the runtime's handle of the thread
     in its `Tcb`; a joinable thread ends keeping its block, in which its `pthread_t` lies, and its

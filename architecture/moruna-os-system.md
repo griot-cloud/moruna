@@ -717,7 +717,8 @@ There are two kinds:
   - the monotonic clock from the clock page;
   - randomness from the core;
   - stdout and stderr to the task's log;
-  - arguments and environment from the start page.
+  - arguments and environment from the start page: a native process's environment is its `env`
+    start slot (item 5.5).
   - Files, sockets and processes answer "unsupported" until a function needs them. A function's
     data comes through the plane, not through files.
 - **Decisions from item 5.0:**
