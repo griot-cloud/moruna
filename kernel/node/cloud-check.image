@@ -31,6 +31,14 @@ process node-supervisor
   # program. The supervisor starts it where it starts vmbus, whose client it is.
   handle root.dma dma.storvsc
   handle program:storvsc image.storvsc
+  # Step 3 (item 3.2): the image filesystem, the Linux personality, node-admission and the
+  # engine's supervisor, which node-admission starts for each job and each check; and the
+  # image filesystem's layer list, which package.py --system-layer writes (item 3.3).
+  handle program:imagefs image.imagefs
+  handle program:linux image.linux
+  handle program:node-admission image.admission
+  handle program:engine image.engine
+  handle data:linux.layers linux.layers
   # The check (item 1.10b).
   handle program:storvsc-check image.storvsc-check
   handle data:node.conf config

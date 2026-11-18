@@ -15,8 +15,8 @@ use crate::engine::{Host, PIECE, Shared, Sizes, check_config, job_config, sizes}
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
-/// An 8 GiB node's job bound (the cloud profile's).
-const BOUND: u64 = 6_532 * MIB;
+/// An 8 GiB node's job bound (the cloud profile's, item 3.2).
+const BOUND: u64 = 6_628 * MIB;
 
 fn host(admission: &Admission) -> Host {
     jobs(admission.connect()).expect("the engine host")

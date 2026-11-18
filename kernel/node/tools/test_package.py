@@ -119,12 +119,14 @@ class Profiles(unittest.TestCase):
         cloud = package.PROGRAMS["cloud"]
         # Step 1's processes (system design 1A): the network server, api and platform beside
         # the supervisor, the device manager and its drivers (items 1.1, 1.3 and 1.4), and the
-        # VMBus processes, which the supervisor starts on Hyper-V only (1F).
+        # VMBus processes, which the supervisor starts on Hyper-V only (1F); and step 3's (item
+        # 3.2): the image filesystem, the Linux personality, node-admission and the engine's
+        # supervisor. No storage, no vsock.
         self.assertEqual(cloud, ["moruna-node-supervisor", "devices", "netstack", "moruna-node-api",
                                  "moruna-node-platform", "virtio-blk", "virtio-net", "nvme", "gve",
-                                 "moruna-vmbus-server", "moruna-storvsc-server"])
-        for absent in ("virtio-vsock", "imagefs", "linux", "node-admission", "moruna-storage-service", "engine",
-                       "storvsc-check"):
+                                 "moruna-vmbus-server", "moruna-storvsc-server",
+                                 "imagefs", "linux", "node-admission", "engine"])
+        for absent in ("virtio-vsock", "moruna-storage-service", "storvsc-check"):
             self.assertNotIn(absent, cloud)
 
     def test_the_check_variant_is_the_cloud_profile_and_the_check_alone(self):

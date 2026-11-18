@@ -805,7 +805,8 @@ mod tests {
             include_bytes!("../../cloud-check/node.conf"),
         ];
         for text in profiles {
-            let config = Config::parse(text, 1 << 30).unwrap();
+            // node-admission takes the rest of a 2 GiB node (item 3.2).
+            let config = Config::parse(text, 2 << 30).unwrap();
             let names =
                 |c: &Config| -> Vec<String> { c.services.iter().map(|s| s.name.clone()).collect() };
             let all = names(&config);
@@ -1124,34 +1125,42 @@ mod boot_tests {
         assert_eq!(Config::parse(twice, 8 << 30), Err(ConfigError::Duplicate));
     }
 
-    /// The cloud profile (system design 1A, 3A) on 2, 8 and 16 GiB nodes: its services'
-    /// accounts, admission taking the rest, and the job bound that leaves, with the processes'
-    /// share of a node's memory node-for-job.py measured (95.17%).
+    /// The cloud profile as committed (system design 1A, 3A; `kernel/node/cloud/node.conf`) on
+    /// 2, 8 and 16 GiB nodes: its services' accounts, node-admission taking the rest, and the job
+    /// bound that leaves, with the processes' share of a node's memory node-for-job.py measured
+    /// (95.17%). Step 3's services are imagefs 256 MiB, linux 256 MiB and no storage (item 3.2).
     #[test]
     fn the_cloud_profile_fits_on_2_8_and_16_gib_nodes() {
         const MIB: u64 = 1 << 20;
-        let profile = b"moruna-node 1\n\
-            service devices image.devices 67108864\n\
-            service network image.netstack 67108864\n\
-            service api image.api 67108864\n\
-            service platform image.platform 16777216\n\
-            service vmbus image.vmbus 33554432\n\
-            service imagefs image.imagefs 268435456\n\
-            service linux image.linux 268435456\n\
-            service storage image.storage 134217728\n\
-            service admission image.admission rest\n";
+        let profile = include_bytes!("../../cloud/node.conf");
         let mut bounds = Vec::new();
         for gib in [2u64, 8, 16] {
             let room = (gib << 30) / 10_000 * 9_517;
             let node = Config::parse(profile, room).expect("the cloud profile fits");
-            let others: u64 = node.services[..8].iter().map(|s| s.account_bytes).sum();
-            assert_eq!(others, 880 * MIB);
-            let admission = node.services[8].account_bytes;
+            let (admission, others): (Vec<&Service>, Vec<&Service>) = node
+                .services
+                .iter()
+                .partition(|s| s.name == "node-admission");
+            let account = |name: &str| {
+                others
+                    .iter()
+                    .find(|s| s.name == name)
+                    .unwrap()
+                    .account_bytes
+            };
+            assert_eq!(
+                (account("imagefs"), account("linux")),
+                (256 * MIB, 256 * MIB)
+            );
+            assert!(others.iter().all(|s| s.name != "storage"));
+            let others: u64 = others.iter().map(|s| s.account_bytes).sum();
+            assert_eq!(others, 784 * MIB);
+            let admission = admission[0].account_bytes;
             assert_eq!(others + admission, room & !4095);
             // Admission's own 128 MiB and the 256 MiB check account come out of its account.
             bounds.push((gib, (admission - 384 * MIB) / MIB));
         }
-        assert_eq!(bounds, [(2, 685), (8, 6532), (16, 14328)]);
+        assert_eq!(bounds, [(2, 781), (8, 6628), (16, 14424)]);
     }
     #[test]
     fn admission_is_told_the_nodes_memory_on_a_slot_of_its_own() {
