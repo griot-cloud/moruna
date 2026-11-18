@@ -17,6 +17,10 @@
       "sha256": "8907433b12deb9d2cb5a6800d41e7ce6b6c2eb35568d5df1272256b9cc2c02b5"
     },
     {
+      "path": "src/arch/x86/power/hold.rs",
+      "sha256": "20d448de0871ef03792149288171598ad03c41f6605789d79f38851fe2938d07"
+    },
+    {
       "path": "src/arch/x86/timer/pit/presence.rs",
       "sha256": "e932eac544c80f4697eb96762db1f7923068968429c816a0bc81a559238f8a92"
     }
@@ -74,7 +78,7 @@
       "upstream_sha256": "660b5a76184cb63f9e92b170104e6b77bbea79a3bfc428cac47e6845c1d26af3"
     },
     "src/arch/x86/power.rs": {
-      "patched_sha256": "f7fcbdd852d173fe9edd3f50b50654c6331acd1d39def3b6a317a1826ad5e599",
+      "patched_sha256": "1b549ac812e5961b69e4db4844691b9d90deb110dcdd79ba8964da0796627255",
       "upstream_sha256": "4af3057c7a0115ad3599299754f7142d47721b57e183ab949343f53ac71f05cb"
     },
     "src/arch/x86/timer/apic.rs": {
