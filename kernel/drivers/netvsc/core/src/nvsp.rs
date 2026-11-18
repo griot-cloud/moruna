@@ -31,13 +31,18 @@ const REQUEST: u64 = 1 << 32;
 /// smallest: what the host uses when the guest states none.
 const FRAME: u32 = 1500 + ETHERNET_HEADER as u32;
 
-/// The NDIS version stated to the host, 6.30: what netvsp's test guest states
-/// (`send_ndis_version_message`). netvsp reads it only to list the OIDs it supports.
-const NDIS: (u32, u32) = (6, 30);
-
-/// The IDs this driver gives its receive buffer and its send buffer, as netvsp's test
-/// guest does. The host names the receive buffer by its ID in every receive.
-pub(crate) const RECEIVE_BUFFER: u16 = 0;
+/// The IDs this driver gives its receive buffer and its send buffer: Linux's hv_netvsc's,
+/// `NETVSC_RECEIVE_BUFFER_ID` 0xcafe and `NETVSC_SEND_BUFFER_ID` 0
+/// (`drivers/net/hyperv/hyperv_net.h`). The host names the receive buffer by its ID in
+/// every receive.
+///
+/// The receive buffer's must not be 0: Azure's host refused one with ID 0 with `FAILURE`
+/// (the first Azure boot of netvsc, console 2026-11-18T0146, image 4ba46ef5), where
+/// netvsp, whose test guest this driver first copied, takes any ID. Every guest that works
+/// on Hyper-V gives it an ID that is not 0: Linux and DPDK 0xcafe (`HN_NVS_RXBUF_SIG` in
+/// FreeBSD too), and Microsoft's own UEFI netvsc 0x1981 (`MsvmPkg/NetvscDxe/NetvscDxe.c`,
+/// `RECEIVE_BUFFER_ID`). Linux's send buffer ID of 0 works on Azure.
+pub(crate) const RECEIVE_BUFFER: u16 = 0xcafe;
 const SEND_BUFFER: u16 = 0;
 
 /// The receive buffer, and the sections the host cut it into.
@@ -230,8 +235,8 @@ pub(crate) fn configure<C: Channel>(wire: &mut Wire<C>) -> Result<(), NetvscErro
         &mut payload,
     )?;
     let version = protocol::Message1SendNdisVersion {
-        ndis_major_version: NDIS.0,
-        ndis_minor_version: NDIS.1,
+        ndis_major_version: crate::NDIS_VERSION.0,
+        ndis_minor_version: crate::NDIS_VERSION.1,
     };
     request(
         wire,
@@ -281,6 +286,7 @@ pub(crate) fn receive_buffer<C: Channel, S: Shared>(
         return Err(NetvscError::Refused {
             step: what,
             status: complete.status.0,
+            nvsp: wire.version(),
         });
     }
     if complete.num_sections != 1 {
@@ -349,6 +355,7 @@ pub(crate) fn send_buffer<C: Channel, S: Shared>(
         return Err(NetvscError::Refused {
             step: what,
             status: complete.status.0,
+            nvsp: wire.version(),
         });
     }
     let size = complete.section_size as usize;

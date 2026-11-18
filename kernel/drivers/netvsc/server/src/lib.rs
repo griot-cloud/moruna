@@ -39,7 +39,7 @@ extern crate alloc;
 use alloc::{boxed::Box, format, rc::Rc, string::String, vec::Vec};
 use core::cell::RefCell;
 
-use moruna_netvsc::{ETHERNET_HEADER, Event, Netvsc, NetvscError, Shared};
+use moruna_netvsc::{ETHERNET_HEADER, Event, NDIS_VERSION, Netvsc, NetvscError, Nvsp, Shared};
 use moruna_svc::{ConnectionId, Context, Decoder, Factory, Handler, Outcome, Pending, ProtocolId};
 use moruna_vmbus::Channel;
 use net_protocol::{Info, Ring, Server, net, octets};
@@ -77,11 +77,12 @@ pub fn info<C: Channel, S: Shared>(card: &Netvsc<C, S>) -> Info {
     }
 }
 
-/// The card, in the console's words: its address, MTU and link.
+/// The card, in the console's words: its address, MTU and link, and the NVSP version the
+/// host accepted and the NDIS version stated.
 pub fn describe<C: Channel, S: Shared>(card: &Netvsc<C, S>) -> String {
     let m = octets(net_protocol::mac(card.mac()));
     format!(
-        "address {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, MTU {}, link {}, no offloads",
+        "address {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, MTU {}, link {}, no offloads, NVSP {}, NDIS {}.{}",
         m[0],
         m[1],
         m[2],
@@ -89,7 +90,10 @@ pub fn describe<C: Channel, S: Shared>(card: &Netvsc<C, S>) -> String {
         m[4],
         m[5],
         card.mtu(),
-        if card.link_up() { "up" } else { "down" }
+        if card.link_up() { "up" } else { "down" },
+        Nvsp(card.nvsp_version()),
+        NDIS_VERSION.0,
+        NDIS_VERSION.1
     )
 }
 

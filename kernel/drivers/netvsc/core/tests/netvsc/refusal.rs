@@ -661,7 +661,8 @@ fn receive_sections_that_do_not_lie_in_the_buffer_are_refused() {
             e,
             NetvscError::Refused {
                 step: "the receive buffer",
-                status: 2
+                status: 2,
+                ..
             }
         ),
         "{e}"
@@ -747,7 +748,8 @@ fn send_sections_that_cannot_be_used_are_refused() {
             e,
             NetvscError::Refused {
                 step: "the send buffer",
-                status: 2
+                status: 2,
+                ..
             }
         ),
         "{e}"
@@ -820,7 +822,9 @@ fn an_rndis_request_the_host_refuses_or_fails_ends_the_start() {
             put32(b, RNDIS_STATUS, status)
         }));
         match e {
-            NetvscError::Refused { step: s, status: n } if s == step && n == status => {}
+            NetvscError::Refused {
+                step: s, status: n, ..
+            } if s == step && n == status => {}
             other => panic!("{step}: {other}"),
         }
     }
@@ -829,7 +833,7 @@ fn an_rndis_request_the_host_refuses_or_fails_ends_the_start() {
     }));
     assert_eq!(
         e.to_string(),
-        "the host refused the packet filter with status 0xc0010015"
+        "the host refused the packet filter with status 0xc0010015 (NVSP 6.1, NDIS 6.30)"
     );
 }
 

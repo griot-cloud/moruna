@@ -72,7 +72,7 @@ fn the_card_is_served_with_its_address_its_mtu_and_its_link() {
     let mut driver = world.driver(0).borrow_mut();
     assert_eq!(
         describe(driver.card()),
-        "address 00:15:5d:01:02:03, MTU 1500, link up, no offloads"
+        "address 00:15:5d:01:02:03, MTU 1500, link up, no offloads, NVSP 6.1, NDIS 6.30"
     );
     assert!(driver.failed().is_none());
 }
