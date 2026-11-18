@@ -11,9 +11,14 @@
   Release it the moment you stop, including when you stop to ask.
 - **A booted turn takes the Mac build lock too only when the Mac is short of disk:** if
   `df -h /System/Volumes/Data` shows under 20 GB free when the turn starts, take `~/.vm-lock` first,
-  then `~/.mac-build-lock`, and hold both until the turn's build and boot are done (2026-11-18: an
+  then a Mac slot, and hold both until the turn's build and boot are done (2026-11-18: an
   image build beside cargo builds filled the disk). With 20 GB or more free, the VM lock alone.
   Never take them in the other order.
+- **Mac builds and tests take a Mac slot:** `~/.mac-build-lock` or `~/.mac-build-lock-2`, by
+  `mkdir`, with an `owner` file naming your agent id, item and UTC time. Remove it the moment you
+  stop building. If `~/.mac-build-lock-next` names someone else, they take the next free slot
+  first. When it is empty, write your name there while you wait, and clear it once you hold a slot.
+  Poll every 30 s.
 - Host tests of single crates (`cargo test -p …`, `cargo llvm-cov -p …`) don't need the lock. Run
   every cargo command with `-j 2`, and tests with `RUST_TEST_THREADS=2`: up to nine agents and a
   boot share this Mac's 10 cores and 16 GB.
