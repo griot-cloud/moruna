@@ -279,8 +279,8 @@ fn controllers(
 fn serve(console: &Console) -> Result<(), String> {
     let dma = take("dma")?;
     let vmbus_listener = Channel(take("vmbus")?);
-    // The registrar's connection first, before the scan: while it is open, a lookup of a
-    // disk not yet registered waits for the scan rather than finding nothing.
+    // The registrar's connection first, before the scan. The device manager holds a lookup
+    // of a disk not yet registered until this connection closes, after the last disk.
     let devices = Channel(take("devices")?);
     let mut directory = devices_protocol::open_directory(devices, deadline_in(ANSWER_NS))
         .map_err(|e| format!("the device manager: {e:?}"))?;

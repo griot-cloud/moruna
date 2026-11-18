@@ -13,8 +13,8 @@
 //!    publishes the listener as `SERVICEn` in the directory.
 //! 4. It serves the directory on every `directory*` slot, registration on every
 //!    `register*` slot (the library's `Directory`; a lookup of a name nothing has waits
-//!    while a registrar's connection is open), and control on every `control*` slot, and
-//!    watches each driver: one that ends is started again with
+//!    while a held `register*` slot's driver has not finished registering), and control
+//!    on every `control*` slot, and watches each driver: one that ends is started again with
 //!    the same resources (its pages in flight wait in its DMA resource's quarantine
 //!    until the new driver has reset the device). Lookups that arrive meanwhile are
 //!    answered once it runs.
@@ -247,8 +247,9 @@ impl Watch for Driver {
     }
 }
 
-/// Sends the answers of lookups that waited for a registrar whose connection has since
-/// closed, outside any request. An answer whose client has gone is dropped.
+/// Sends the answers of lookups that waited for a held slot's driver that has since
+/// finished (its connection closed, outside any request). An answer whose client has gone
+/// is dropped.
 fn answer_waiting(dispatcher: &mut Dispatcher, registry: &RefCell<Registry>) {
     let ready = registry.borrow_mut().take_ready();
     for (pending, outcome) in ready {
@@ -753,12 +754,15 @@ fn serve(out: &Console) -> Result<String, String> {
         let factory: moruna_svc::Factory = if let Some(access) = Access::of(slot) {
             let s = state.clone();
             let registry = registry.clone();
+            // A held register slot: its driver is on this machine, and lookups of a name
+            // nothing has wait until it has finished, connected or not.
+            let held = (access == Access::Register).then(|| registry.borrow_mut().expect());
             Box::new(move || {
-                Box::new(Directory::new(
-                    Published(s.clone()),
-                    registry.clone(),
-                    access,
-                )) as Box<dyn Handler>
+                let directory = Directory::new(Published(s.clone()), registry.clone(), access);
+                Box::new(match held {
+                    Some(number) => directory.through(number),
+                    None => directory,
+                }) as Box<dyn Handler>
             })
         } else if slot.starts_with("control") {
             let s = state.clone();

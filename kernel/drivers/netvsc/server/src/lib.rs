@@ -6,9 +6,10 @@
 //! buffers it shares, and a frame is copied into a send section, so netvsc pins nothing
 //! (1F: a VMBus driver gets a grant only if it pins memory itself).
 //!
-//! 0. It connects to the device manager through its `register-netvsc` listener first
-//!    thing, before the card is up: while that connection is open, a lookup of a name
-//!    nothing has yet, the network server's of `net0`, waits for it.
+//! 0. The device manager holds its `register-netvsc` slot, so a lookup of a name nothing
+//!    has yet (the network server's of `net0`) waits until netvsc has finished
+//!    registering, whether or not it has connected. It connects first thing, before the
+//!    card is up, and finishes by closing that connection once `net0` is registered.
 //! 1. Through `vmbus`'s `net` listener it lists the synthetic network cards' offers and
 //!    opens the first card's channel; another card is said on the console and not served
 //!    (1C: one interface, on the first card).

@@ -11,14 +11,16 @@
 //! can put a name in the directory, and that driver can learn nothing from it.
 //!
 //! Such a driver starts beside the directory's clients: the network server looks `net0` up as
-//! soon as it starts, and `netvsc` registers it only once Azure's card is up. So a driver
-//! connects through its `register*` listener first thing, and a lookup of a name nothing has
-//! waits while such a connection is open: it is answered when the name is registered, or
-//! with `NotFound` once every registrar's connection has closed, which is how a driver says
-//! it has finished registering. A `register*` listener holds nothing by itself: one whose
-//! driver is not on this machine (off Hyper-V the supervisor links none) or never connects
-//! holds no lookup, and a name a driver of the device manager publishes (`net0` of
-//! virtio-net) is answered at once whatever is open.
+//! soon as it starts, and `netvsc` registers it only once Azure's card is up. A `register*`
+//! slot the device manager holds means its driver is on this machine (the supervisor links
+//! it only there: off Hyper-V the link goes with the driver). So a lookup of a name nothing
+//! has waits while any held slot's driver has not finished registering ([`Registry::expect`]),
+//! whether or not it has connected yet; a driver finishes by closing its connection through
+//! the slot ([`Registry::finished`]). The lookup is answered when the name is registered, or
+//! with `NotFound` once every held slot's driver has finished. A slot that is not held holds
+//! nothing, and a name a driver of the device manager publishes (`net0` of virtio-net) is
+//! answered at once whatever waits. The wait cannot hang the node: a driver that ends stops
+//! it, and one that hangs runs into `platform`'s instance-data deadline, which names it.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -87,17 +89,16 @@ struct Registered {
 #[derive(Default)]
 pub struct Registry {
     entries: Vec<Registered>,
-    /// Connections open through `register*` listeners: while one is, its driver has not
-    /// finished registering.
-    registrars: usize,
-    /// Lookups of a name nothing has, while a registrar's connection is open.
+    /// For each held `register*` slot: whether its driver has finished registering.
+    finished: Vec<bool>,
+    /// Lookups of a name nothing has, while a held slot's driver has not finished.
     waiting: Vec<(String, Pending)>,
     /// Answers to lookups that waited, for the device manager's loop to send.
     ready: Vec<(Pending, Outcome)>,
 }
 
 impl Registry {
-    /// No device registered, and no registrar connected.
+    /// No device registered, and no `register*` slot held.
     pub fn new() -> Registry {
         Registry::default()
     }
@@ -198,15 +199,21 @@ impl Registry {
             .map(|registered| registered.name.as_str())
     }
 
-    /// A registrar's connection has opened.
-    fn registrar_opened(&mut self) {
-        self.registrars += 1;
+    /// A `register*` slot the device manager holds: its driver is on this machine, and
+    /// lookups of a name nothing has wait until it has [`finished`](Registry::finished),
+    /// whether or not it has connected yet. The slot's number, for that.
+    pub fn expect(&mut self) -> usize {
+        self.finished.push(false);
+        self.finished.len() - 1
     }
 
-    /// A registrar's connection has closed: its driver has finished. Once none is open,
-    /// the lookups still waiting are answered `NotFound`.
-    fn registrar_closed(&mut self) {
-        self.registrars = self.registrars.saturating_sub(1);
+    /// The driver of held slot `number` has finished registering: a connection through the
+    /// slot has closed. Once every held slot's driver has, the lookups still waiting are
+    /// answered `NotFound`.
+    pub fn finished(&mut self, number: usize) {
+        if let Some(finished) = self.finished.get_mut(number) {
+            *finished = true;
+        }
         if !self.awaited() {
             for (_, pending) in core::mem::take(&mut self.waiting) {
                 self.ready
@@ -215,9 +222,10 @@ impl Registry {
         }
     }
 
-    /// Whether a registrar's connection is open, so a lookup of a name nothing has waits.
+    /// Whether a held slot's driver has yet to finish, so a lookup of a name nothing has
+    /// waits.
     pub fn awaited(&self) -> bool {
-        self.registrars > 0
+        self.finished.iter().any(|finished| !finished)
     }
 
     /// Lookups waiting for a name.
@@ -245,26 +253,27 @@ pub struct Directory<D: Drivers> {
     drivers: D,
     registry: Rc<RefCell<Registry>>,
     access: Access,
-    /// Whether it is a registrar's connection that has not closed: until it does, lookups
-    /// of a name nothing has wait.
-    registering: bool,
+    /// The held `register*` slot it came through, as [`Registry::expect`] numbered it: its
+    /// close says the slot's driver has finished registering.
+    slot: Option<usize>,
 }
 
 impl<D: Drivers> Directory<D> {
-    /// A connection through a listener of `access`, served from `drivers` and `registry`:
-    /// made as the connection is accepted. A [`Access::Register`] connection holds lookups
-    /// of a name nothing has until it closes.
+    /// A connection through a listener of `access`, served from `drivers` and `registry`.
     pub fn new(drivers: D, registry: Rc<RefCell<Registry>>, access: Access) -> Directory<D> {
-        let registering = access == Access::Register;
-        if registering {
-            registry.borrow_mut().registrar_opened();
-        }
         Directory {
             drivers,
             registry,
             access,
-            registering,
+            slot: None,
         }
+    }
+
+    /// The connection came through held `register*` slot `number` ([`Registry::expect`]):
+    /// when it closes, that slot's driver has finished.
+    pub fn through(mut self, number: usize) -> Directory<D> {
+        self.slot = Some(number);
+        self
     }
 
     /// Sends the answers of lookups that waited, through this request's context.
@@ -354,11 +363,10 @@ impl<D: Drivers> Handler for Directory<D> {
     /// have left waiting are answered by the device manager's loop
     /// ([`Registry::take_ready`]).
     fn closed(&mut self) {
-        if self.registering
+        if let Some(number) = self.slot
             && let Ok(mut registry) = self.registry.try_borrow_mut()
         {
-            self.registering = false;
-            registry.registrar_closed();
+            registry.finished(number);
         }
     }
 }

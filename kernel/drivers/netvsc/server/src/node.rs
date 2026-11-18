@@ -268,8 +268,9 @@ fn card(console: &Console, vmbus_listener: &Channel) -> Result<Netvsc<Opening, M
 
 fn serve(console: &Console) -> Result<(), String> {
     let vmbus_listener = Channel(take("vmbus")?);
-    // The registrar's connection first, before the card is up: while it is open, the
-    // network server's lookup of `net0` waits for the card rather than finding nothing.
+    // The registrar's connection first, before the card is up. The device manager holds
+    // the network server's lookup of `net0` until this connection closes, after the card
+    // is registered.
     let devices = Channel(take("devices")?);
     let mut directory = devices_protocol::open_directory(devices, deadline_in(ANSWER_NS))
         .map_err(|e| format!("the device manager: {e:?}"))?;

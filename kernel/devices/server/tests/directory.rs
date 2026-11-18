@@ -1,7 +1,8 @@
 //! Host tests of the device manager's directory (item 1.10b): block devices registered
 //! through a `register*` listener, found by serial through a `directory*` one, and what
 //! each listener's connections may not ask. Item 1.11b: network cards registered by name,
-//! and lookups that wait while a registrar's connection is open, and for nothing else.
+//! and lookups that wait while a held `register*` slot's driver has not finished, and for
+//! nothing else.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -89,22 +90,26 @@ impl World {
         Directory::new(Fake { block0, net0 }, self.registry.clone(), access)
     }
 
-    /// A `register*` listener, as the device manager serves one: its driver's end. A
-    /// connection through it is a registrar's from the moment it is accepted.
+    /// A held `register*` slot, as the device manager serves one: its driver's end. Its
+    /// driver is awaited from now on, until a connection through it closes.
     fn register_listener(&mut self) -> Channel {
         let (ours, theirs) = Channel::create().unwrap();
         let registry = self.registry.clone();
+        let number = registry.borrow_mut().expect();
         self.dispatcher
             .listen(
                 ours,
                 Box::new(move || {
                     // A registrar looks nothing up: its `block0` is no one's.
                     let block0 = Channel::create().unwrap().0;
-                    Box::new(Directory::new(
-                        Fake { block0, net0: None },
-                        registry.clone(),
-                        Access::Register,
-                    )) as Box<dyn Handler>
+                    Box::new(
+                        Directory::new(
+                            Fake { block0, net0: None },
+                            registry.clone(),
+                            Access::Register,
+                        )
+                        .through(number),
+                    ) as Box<dyn Handler>
                 }),
             )
             .unwrap();
@@ -215,9 +220,9 @@ fn a_registered_network_card_is_found_by_its_name() {
 }
 
 #[test]
-fn a_lookup_waits_while_a_registrar_is_connected_until_the_name_is_registered_or_it_closes() {
+fn a_lookup_waits_for_a_held_slots_driver_until_the_name_is_registered_or_it_has_finished() {
     let mut world = World::new();
-    let registrar = world.connection(Access::Register);
+    let slot = world.register_listener();
     let early = world.connection(Access::Lookup);
     let unknown = world.connection(Access::Lookup);
     assert!(world.registry.borrow().awaited());
@@ -225,11 +230,11 @@ fn a_lookup_waits_while_a_registrar_is_connected_until_the_name_is_registered_or
     let answers = world.serve(thread::spawn(move || {
         // The network server looks its card up before the driver has registered it, and
         // another client looks up a name no driver will register.
+        let mut r = client(moruna_svc::connect(&slot).unwrap());
         let net0 = thread::spawn(move || client(early).lookup("net0".into()));
         let lun9 = thread::spawn(move || client(unknown).lookup("lun-9".into()).map(|_| ()));
         thread::sleep(Duration::from_millis(100));
         assert!(!net0.is_finished() && !lun9.is_finished(), "both wait");
-        let mut r = client(registrar);
         r.register_net("net0".into(), listener).unwrap();
         let net0 = net0.join().unwrap();
         thread::sleep(Duration::from_millis(50));
@@ -252,12 +257,10 @@ fn a_lookup_waits_while_a_registrar_is_connected_until_the_name_is_registered_or
 }
 
 #[test]
-fn a_register_listener_whose_driver_is_not_here_or_never_connects_holds_no_lookup() {
+fn with_no_register_slot_held_nothing_waits() {
+    // Off Hyper-V the supervisor links no register slot to the device manager: the link
+    // goes with its driver. A name nothing has is answered at once.
     let mut world = World::new();
-    // One whose driver is not on this machine: its end is gone. One whose driver is here
-    // and never connects: its end stays, unused.
-    drop(world.register_listener());
-    let silent = world.register_listener();
     let lookup = world.connection(Access::Lookup);
     let answers = world.serve(thread::spawn(move || {
         let mut c = client(lookup);
@@ -271,26 +274,41 @@ fn a_register_listener_whose_driver_is_not_here_or_never_connects_holds_no_looku
     let registry = world.registry.borrow();
     assert!(!registry.awaited());
     assert_eq!(registry.waiting(), 0);
-    drop(silent);
 }
 
 #[test]
-fn a_registrar_connected_through_its_listener_holds_lookups_until_it_closes() {
+fn a_registry_awaits_each_held_slot_until_its_driver_has_finished() {
+    let mut registry = Registry::new();
+    assert!(!registry.awaited());
+    let (storvsc, netvsc) = (registry.expect(), registry.expect());
+    registry.finished(storvsc);
+    registry.finished(storvsc);
+    // A number no slot was given changes nothing.
+    registry.finished(7);
+    assert!(registry.awaited(), "netvsc has not finished");
+    registry.finished(netvsc);
+    assert!(!registry.awaited());
+    assert!(registry.take_ready().is_empty());
+}
+
+#[test]
+fn a_held_slots_driver_not_yet_connected_holds_a_lookup_until_it_connects_and_registers() {
     let mut world = World::new();
-    let listener = world.register_listener();
+    let slot = world.register_listener();
     let lookup = world.connection(Access::Lookup);
     let (card, driver_end) = Channel::create().unwrap();
     let answers = world.serve(thread::spawn(move || {
-        // The driver connects first thing, as netvsc does, and registers once its card is
-        // up; the network server's lookup meanwhile waits.
-        let mut r = directory::Client::connect(
-            moruna_svc::connect(&listener).unwrap(),
-            deadline_in(10_000_000_000),
-        )
-        .unwrap();
+        // The network server looks net0 up before netvsc has even connected: the slot is
+        // held, so its driver is on this machine, and the lookup waits for it.
         let net0 = thread::spawn(move || client(lookup).lookup("net0".into()));
         thread::sleep(Duration::from_millis(100));
-        assert!(!net0.is_finished(), "the lookup waits for the registrar");
+        assert!(
+            !net0.is_finished(),
+            "the lookup waits for the slot's driver"
+        );
+        let mut r = client(moruna_svc::connect(&slot).unwrap());
+        thread::sleep(Duration::from_millis(50));
+        assert!(!net0.is_finished(), "connected, not registered");
         r.register_net("net0".into(), card).unwrap();
         drop(r);
         net0.join().unwrap()
@@ -300,17 +318,16 @@ fn a_registrar_connected_through_its_listener_holds_lookups_until_it_closes() {
 }
 
 #[test]
-fn on_q35_virtio_nets_net0_is_answered_at_once_even_while_a_registrar_is_open() {
+fn virtio_nets_net0_is_answered_at_once_even_while_a_held_slot_waits() {
+    // On q35 no register slot is held and virtio-net publishes net0. Even with a held slot
+    // whose driver has not finished, a name the device manager's drivers publish does not
+    // wait for it.
     let mut world = World::q35();
-    let registrar = world.connection(Access::Register);
+    let _slot = world.register_listener();
     let lookup = world.connection(Access::Lookup);
-    let found = world.serve(thread::spawn(move || {
-        // A registrar is connected and has not finished: a name a driver of the device
-        // manager publishes does not wait for it.
-        let _registrar = client(registrar);
-        client(lookup).lookup("net0".into())
-    }));
-    assert!(arrived(&world.net0[1], &found.unwrap()));
+    let found = world.serve(thread::spawn(move || client(lookup).lookup("net0".into())));
+    assert!(arrived(&world.net0[0], &found.unwrap()));
+    assert!(world.registry.borrow().awaited());
 }
 
 #[test]
