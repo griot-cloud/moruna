@@ -1,6 +1,7 @@
 //! Azure's "ready" report (system design, section 1F, "`platform` on Azure"; work item 1.12).
 //!
-//! Once node config is valid on Azure, `platform` tells Azure the machine is provisioned, as
+//! Once the node is ready on Azure (system design 1B: `api` answers and `imagefs` has mounted
+//! the engine's layer; item 1.6e), `platform` tells Azure the machine is provisioned, as
 //! Microsoft's "Create Linux images without a provisioning agent" shows it
 //! (<https://learn.microsoft.com/en-us/azure/virtual-machines/linux/no-agent>, "Generic steps"):
 //!
