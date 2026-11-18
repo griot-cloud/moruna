@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # The cloud image's system layer (system design 1A, items 3.2 and 3.3): Moruna's engine,
 # `moruna-engine` built as kernel/tools/build.sh builds it (x86_64, static, musl), at
-# /moruna/bin/moruna beside an empty /tmp, packed by that engine's own `volume pack` into the
-# new layer file OUT. `package.py --system-layer OUT` writes it whole into the boot disk's
-# moruna-system partition. Every image and every boot of one take their engine this way.
+# /moruna/bin/moruna beside an empty /tmp, packed into the new layer file OUT by `moruna-layer
+# pack`, built for this machine from the same tree. `package.py --system-layer OUT` writes it
+# whole into the boot disk's moruna-system partition. Every image and every boot of one take
+# their engine this way.
 #
 #   kernel/node/tools/system-layer.sh OUT
 #
-# OUT must not exist yet. The engine is built in CARGO_TARGET_DIR (the root workspace's
-# `target` when unset), and run once, for `volume pack`, so the machine must run x86_64 Linux
-# programs. It needs, as build.sh does, a C compiler for x86_64 Linux (x86_64-linux-gnu-gcc, or
-# gcc on x86_64), musl (musl-gcc on x86_64, or musl-dev:amd64's specs), and the root toolchain's
+# OUT must not exist yet. The engine is only the layer's payload and never runs here: the
+# packer is this machine's own (an arm64 Linux, such as moruna-arm, runs no x86_64 program), and
+# packs as the engine's `volume pack` does (moruna_image::layerfile::pack; the format names no
+# architecture). Both are built in CARGO_TARGET_DIR (the root workspace's `target` when unset).
+# It needs, as build.sh does, a C compiler for x86_64 Linux (x86_64-linux-gnu-gcc, or gcc on
+# x86_64), musl (musl-gcc on x86_64, or musl-dev:amd64's specs), and the root toolchain's
 # x86_64-unknown-linux-musl target. Nothing is fetched.
 set -euo pipefail
 
@@ -62,8 +65,16 @@ case "$target" in
   *) target="$root/$target" ;;
 esac
 engine="$target/$musl/release/moruna-engine"
-if [ ! -x "$engine" ]; then
+if [ ! -f "$engine" ]; then
   echo "system-layer.sh: the build left no engine at $engine" >&2
+  exit 1
+fi
+# The packer, for this machine, with the host tools' flags (build.sh's).
+(cd "$root" && RUSTFLAGS="--cfg polyval_force_soft" \
+  cargo build --quiet --release --locked -p moruna-image --bin moruna-layer)
+packer="$target/release/moruna-layer"
+if [ ! -x "$packer" ]; then
+  echo "system-layer.sh: the build left no packer at $packer" >&2
   exit 1
 fi
 
@@ -74,4 +85,4 @@ mkdir -p "$tree/moruna/bin" "$tree/tmp"
 chmod 0755 "$tree" "$tree/moruna" "$tree/moruna/bin" "$tree/tmp"
 cp "$engine" "$tree/moruna/bin/moruna"
 chmod 0755 "$tree/moruna/bin/moruna"
-"$engine" volume pack "$tree" "$out"
+"$packer" pack "$tree" "$out"
