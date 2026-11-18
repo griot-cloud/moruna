@@ -35,6 +35,8 @@ import unittest
 TOOLS = Path(__file__).resolve().parent
 SCRIPT = TOOLS / "openstack-up.sh"
 RECIPE = TOOLS.parent / "OPENSTACK.md"
+# The repository whose bench/node/proof.py and api-checks.py run, as the script names it.
+REPO = str(TOOLS.parents[2])
 NAME = "moruna-node-name"
 REGION = "region-1"
 ZONE = "zone-1a"
@@ -112,6 +114,13 @@ DRY_RUN = [
     "nc -vz -w 5 \"$(cat RUNDIR/address)\" 443",
     "! nc -vz -w 5 \"$(cat RUNDIR/address)\" 22",
     f"[ \"$({OS} server show {SERVER} -f value -c status)\" = ACTIVE ]",
+    "tr -d '\\r' < RUNDIR/console.log | grep -a -o 'moruna: tls sha256=[0-9a-f]*' | head -1 | cut -d= -f2 "
+    "> RUNDIR/console.pin && [ -s RUNDIR/console.pin ]",
+    "tr -d '\\r' < RUNDIR/console.log | grep -a -o 'moruna: cloud openstack instance [^ ]*' | head -1 "
+    "| cut -d' ' -f5 > RUNDIR/instance && [ -s RUNDIR/instance ]",
+    f"python3 -I {REPO}/kernel/node/tools/api-checks.py --url \"https://$(cat RUNDIR/address):443\" "
+    "--pin \"$(cat RUNDIR/console.pin)\" --token-key RUNDIR/token-key.pem --instance \"$(cat RUNDIR/instance)\" "
+    "--openssl openssl --results RUNDIR/api-checks.json --cloud openstack",
     f"touch RUNDIR/console.log RUNDIR/console.err; {CONSOLE}",
     f"{OS} floating ip delete {cat('fip.id')}",
     f"{OS} server delete --wait {SERVER}",
@@ -161,6 +170,45 @@ def from_volume():
 
 
 DRY_RUN_VOLUME = from_volume()
+
+# With --proof (work item 3.8b): nyc-blob.sh's file, and the inputs azure-up.sh --proof takes.
+ACCOUNT = "mrnnycname"
+PROOF_ARGS = ("--proof", "--blob", "BLOBFILE", "--tasks", "TASKS", "--nyc", "NYCDIR", "--gate-canon", "GATECANON")
+DATA_SAS = "se=2026-11-18T20%3A00Z&sp=racwl&spr=https&sv=2022-11-02&sr=c&sig=DATAdataDATAdata%2Bdata%3D"
+FUNCTIONS_SAS = "se=2026-11-18T20%3A00Z&sp=r&spr=https&sv=2022-11-02&sr=c&sig=FUNCfuncFUNCfunc%2Bfunc%3D"
+BLOB = (f"account={ACCOUNT}\ncontainer=data\nfunctions=functions\ndata_sas={DATA_SAS}\n"
+        f"functions_sas={FUNCTIONS_SAS}\nexpires=2026-11-18T20:00Z\n")
+# The function key and node config with it, in place of the base node config.
+PROOF_KEYS = [
+    "openssl genpkey -algorithm ed25519 -out RUNDIR/function-key.pem",
+    "openssl pkey -in RUNDIR/function-key.pem -pubout -outform DER | tail -c 32 | base64 > RUNDIR/function-key.pub",
+    "printf '{\"moruna\":1,\"api\":{\"token_keys\":[\"%s\"]},\"functions\":{\"keys\":[\"%s\"]}}\\n' "
+    "\"$(cat RUNDIR/token-key.pub)\" \"$(cat RUNDIR/function-key.pub)\" > RUNDIR/node-config.json",
+]
+# The proof itself, after the node's checks and before the API's.
+PROOF = (
+    "BENCH_SAS=\"$(sed -n 's/^data_sas=//p' BLOBFILE)\" FUNCTIONS_SAS=\"$(sed -n 's/^functions_sas=//p' BLOBFILE)\" "
+    f"MORUNA_BENCH_OPENSSL=openssl python3 -I {REPO}/bench/node/proof.py "
+    "--url \"https://$(cat RUNDIR/address):443\" --pin \"$(cat RUNDIR/console.pin)\" "
+    "--token-key RUNDIR/token-key.pem --instance \"$(cat RUNDIR/instance)\" --function-key RUNDIR/function-key.pem "
+    f"--functions TASKS --function-base https://{ACCOUNT}.blob.core.windows.net/functions --data blob "
+    f"--blob-account {ACCOUNT} --blob-container data --periods 2024-01,2024 --references NYCDIR "
+    "--gate-canon GATECANON --results RUNDIR/proof --work RUNDIR/proof-work")
+
+
+def with_proof():
+    lines = []
+    for line in DRY_RUN:
+        if line.startswith("printf '{\"moruna\":1,"):
+            lines += PROOF_KEYS
+            continue
+        if "/api-checks.py " in line:
+            lines.append(PROOF)
+        lines.append(line.replace("--flavor BL1.1-2048-16 ", "--flavor SL1.4-16384-128 "))
+    return lines
+
+
+DRY_RUN_PROOF = with_proof()
 
 # The stand-in for `openstack`: records every call, refuses one off cloud servercore and the
 # region, and answers as Servercore would. Each made thing's ID is `id-<kind>`.
@@ -265,6 +313,28 @@ case "$*" in *" 443") exit 0 ;; *) exit 1 ;; esac
 SLEEP = """#!/bin/sh
 exit 0
 """
+# A stand-in for python3: proof.py and api-checks.py are recorded with the SASes their
+# environment gave them, and write their results; anything else is the real Python.
+PYTHON = f"""#!/bin/sh
+case "$2" in
+  */bench/node/proof.py | */kernel/node/tools/api-checks.py)
+    {{ printf 'python3'; for a in "$@"; do printf ' %s' "$a"; done
+       printf ' |data=%s|functions=%s|openssl=%s\\n' "${{BENCH_SAS:-}}" "${{FUNCTIONS_SAS:-}}" "${{MORUNA_BENCH_OPENSSL:-}}"; }} >> "$STUB_LOG"
+    results=""; previous=""
+    for a in "$@"; do [ "$previous" = --results ] && results="$a"; previous="$a"; done
+    case "$2" in
+      */proof.py)
+        mkdir -p "$results" && printf '{{"ok":%s}}' "${{STUB_PROOF_OK:-true}}" > "$results/proof.json"
+        echo "proof: score-2024-01 pass"
+        exit "${{STUB_PROOF_EXIT:-0}}" ;;
+      *)
+        printf '{{"ok":%s}}' "${{STUB_CHECKS_OK:-true}}" > "$results"
+        echo "api-checks: all 9 checks pass"
+        exit "${{STUB_CHECKS_EXIT:-0}}" ;;
+    esac ;;
+esac
+exec {sys.executable} "$@"
+"""
 NEVER = """#!/bin/sh
 echo "$(basename "$0") $* (called in a dry run)" >> "$STUB_LOG"
 exit 99
@@ -295,6 +365,18 @@ class OpenstackUp(unittest.TestCase):
         self.state.mkdir()
         self.log = self.root / "calls"
         self.log.touch()
+        # The proof's inputs: nyc-blob.sh's file, the four tasks, the eight references and
+        # gate-canon.
+        (self.root / "BLOBFILE").write_text(BLOB)
+        (self.root / "BLOBFILE").chmod(0o600)
+        (self.root / "TASKS").mkdir()
+        (self.root / "NYCDIR").mkdir()
+        for job in ("score", "occupancy", "enrich", "audit"):
+            (self.root / f"TASKS/gate-{job}").write_bytes(b"\x7fELF a task")
+            for period in ("2024-01", "2024"):
+                (self.root / f"NYCDIR/reference-{job}-{period}.json").write_text("{}")
+        (self.root / "GATECANON").write_text("#!/bin/sh\n")
+        (self.root / "GATECANON").chmod(0o755)
 
     def stubs(self, **scripts):
         for name, text in scripts.items():
@@ -303,7 +385,7 @@ class OpenstackUp(unittest.TestCase):
             path.chmod(0o755)
 
     def live(self):
-        self.stubs(openstack=OPENSTACK, openssl=OPENSSL, nc=NC, sleep=SLEEP)
+        self.stubs(openstack=OPENSTACK, openssl=OPENSSL, nc=NC, sleep=SLEEP, python3=PYTHON)
 
     def calls(self):
         return self.log.read_text().splitlines()
@@ -334,11 +416,32 @@ class OpenstackUp(unittest.TestCase):
         self.assertEqual(self.calls(), [], "a dry run runs nothing")
         self.assertFalse((self.root / "RUNDIR").exists())
 
+    def test_a_dry_run_of_the_proof_prints_its_commands_and_runs_none(self):
+        self.stubs(openstack=NEVER, openssl=NEVER, nc=NEVER, perl=NEVER, python3=NEVER)
+        done = self.run_script(*self.arguments(*PROOF_ARGS, "--dry-run"))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.splitlines(), DRY_RUN_PROOF)
+        self.assertEqual(done.stderr, "")
+        self.assertEqual(self.calls(), [], "a dry run runs nothing")
+        self.assertFalse((self.root / "RUNDIR").exists())
+        # The proof's flavor, and only the proof's; neither SAS is in what is printed.
+        self.assertEqual(sum(" --flavor SL1.4-16384-128 " in line for line in DRY_RUN_PROOF), 1)
+        self.assertFalse(any("SL1.4" in line for line in DRY_RUN + DRY_RUN_VOLUME))
+        self.assertNotIn("sig=", done.stdout)
+        # The API's checks, last before the deletion, on every run; the proof just before them.
+        for lines in (DRY_RUN, DRY_RUN_VOLUME, DRY_RUN_PROOF):
+            checks = next(i for i, line in enumerate(lines) if "/api-checks.py " in line)
+            self.assertTrue(lines[checks + 1].startswith("touch RUNDIR/console.log"), lines[checks + 1])
+        self.assertEqual(DRY_RUN_PROOF[DRY_RUN_PROOF.index(PROOF) + 1].split()[2],
+                         f"{REPO}/kernel/node/tools/api-checks.py")
+
     def test_every_openstack_call_is_bounded_on_cloud_servercore_and_the_region(self):
-        for line in DRY_RUN_VOLUME:
+        for line in DRY_RUN_VOLUME + DRY_RUN_PROOF:
             rest = line.replace(f"{BOUND} 120 openstack --os-cloud servercore --os-region-name {REGION} ", "")
             rest = rest.replace(f"{BOUND} 600 openstack --os-cloud servercore --os-region-name {REGION} ", "")
             rest = rest.replace("moruna: cloud openstack instance", "")
+            # The API's checks name the cloud they expect, last on their line.
+            rest = rest.removesuffix(" --cloud openstack") if "/api-checks.py " in rest else rest
             self.assertNotIn("openstack", rest, line)
             self.assertNotIn("alarm", rest, line)
         # The upload alone has 600 s.
@@ -363,10 +466,12 @@ class OpenstackUp(unittest.TestCase):
 
     def test_the_recipe_holds_every_command_the_script_runs_and_no_other(self):
         recipe = commands(RECIPE.read_text())
-        placeholders = [("RUNDIR", "<RUN>"), ("OUTDIR/", "<OUT>/"), (NAME, "<NAME>"), (ZONE, "<ZONE>"),
-                        (REGION, "<REGION>")]
+        placeholders = [(REPO, "<REPO>"), ("RUNDIR", "<RUN>"), ("OUTDIR/", "<OUT>/"), (NAME, "<NAME>"),
+                        (ZONE, "<ZONE>"), (REGION, "<REGION>"), ("BLOBFILE", "<BLOB_RUN>/blob"),
+                        (ACCOUNT, "<ACCOUNT>"), ("TASKS", "<TASKS>"), ("NYCDIR", "<NYC>"),
+                        ("GATECANON", "<GATE_CANON>")]
         script = []
-        for line in DRY_RUN + [line for line in DRY_RUN_VOLUME if line not in DRY_RUN]:
+        for line in DRY_RUN + [line for line in DRY_RUN_VOLUME + DRY_RUN_PROOF if line not in DRY_RUN]:
             for value, placeholder in placeholders:
                 line = line.replace(value, placeholder)
             if line not in script:
@@ -379,6 +484,11 @@ class OpenstackUp(unittest.TestCase):
             "--boot image --name <NAME> 2>&1 | tee <RUN>.log",
             "kernel/node/tools/openstack-up.sh --qcow2 <OUT>/moruna-node.qcow2 --run <RUN> --region <REGION> "
             "--boot volume --zone <ZONE> --name <NAME> 2>&1 | tee <RUN>.log",
+            "kernel/node/tools/nyc-blob.sh --run <BLOB_RUN> --tasks <TASKS> 2>&1 | tee <BLOB_RUN>.log",
+            "kernel/node/tools/openstack-up.sh --qcow2 <OUT>/moruna-node.qcow2 --run <RUN> --region <REGION> "
+            "--boot image --name <NAME> --proof --blob <BLOB_RUN>/blob --tasks <TASKS> --nyc <NYC> "
+            "--gate-canon <GATE_CANON> 2>&1 | tee <RUN>.log",
+            "kernel/node/tools/nyc-blob.sh --delete --run <BLOB_RUN> 2>&1 | tee -a <BLOB_RUN>.log",
         ])
 
     def test_the_guard_refuses_before_anything_runs(self):
@@ -441,6 +551,66 @@ class OpenstackUp(unittest.TestCase):
         self.assertEqual(done.returncode, 2)
         self.assertIn("must be new", done.stderr)
         self.assertEqual(self.calls(), [])
+
+    def test_the_proof_is_refused_without_its_inputs_before_anything_runs(self):
+        self.stubs(openstack=NEVER, openssl=NEVER, nc=NEVER, perl=NEVER, python3=NEVER)
+        for arguments, boot, reason in [
+            (["--proof"], "image", "--proof needs --blob, --tasks, --nyc and --gate-canon"),
+            ([*PROOF_ARGS[:7]], "image", "--proof needs --blob, --tasks, --nyc and --gate-canon"),
+            ([*PROOF_ARGS], "volume", "--proof boots from the image: its flavor SL1.4-16384-128 has a disk"),
+            (["--blob", "BLOBFILE"], "image", "--blob, --tasks, --nyc and --gate-canon go with --proof"),
+            (["--gate-canon", "GATECANON"], "image", "--blob, --tasks, --nyc and --gate-canon go with --proof"),
+        ]:
+            for dry in ([], ["--dry-run"]):
+                done = self.run_script(*self.arguments(*arguments, *dry, boot=boot))
+                self.assertEqual(done.returncode, 2, (arguments, done.stderr))
+                self.assertIn(reason, done.stderr)
+                self.assertEqual(done.stdout, "")
+        for missing, reason in [
+            ("BLOBFILE", "no blob file at BLOBFILE (nyc-blob.sh's)"),
+            ("TASKS/gate-enrich", "no gate task at TASKS/gate-enrich"),
+            ("NYCDIR/reference-audit-2024.json", "no reference at NYCDIR/reference-audit-2024.json"),
+            ("GATECANON", "no gate-canon program at GATECANON"),
+        ]:
+            path = self.root / missing
+            kept = path.read_bytes()
+            path.unlink()
+            try:
+                done = self.run_script(*self.arguments(*PROOF_ARGS, "--dry-run"))
+                self.assertEqual(done.returncode, 2, missing)
+                self.assertIn(reason, done.stderr)
+            finally:
+                path.write_bytes(kept)
+                (self.root / "BLOBFILE").chmod(0o600)
+        # gate-canon must be a program, not only a file.
+        (self.root / "GATECANON").chmod(0o644)
+        done = self.run_script(*self.arguments(*PROOF_ARGS))
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("no gate-canon program", done.stderr)
+        (self.root / "GATECANON").chmod(0o755)
+        # The blob file holds the SASes: its owner's alone, and whole.
+        blob = self.root / "BLOBFILE"
+        for mode in (0o640, 0o604, 0o644):
+            blob.chmod(mode)
+            done = self.run_script(*self.arguments(*PROOF_ARGS, "--dry-run"))
+            self.assertEqual(done.returncode, 2, oct(mode))
+            self.assertIn("may be read by others than its owner", done.stderr)
+        blob.chmod(0o600)
+        for text, reason in [
+            (BLOB.replace(f"account={ACCOUNT}", "account=My-Account"), "account 'My-Account' is not 3 to 24"),
+            (BLOB.replace(f"account={ACCOUNT}", "account=ab"), "account 'ab' is not 3 to 24"),
+            (BLOB.replace(f"account={ACCOUNT}\n", ""), "account '' is not"),
+            (BLOB.replace("container=data", "container=da;ta"), "container 'da;ta' is not"),
+            (BLOB.replace("functions=functions\n", ""), "container '' is not"),
+            (BLOB.replace(f"data_sas={DATA_SAS}\n", ""), "holds no data_sas"),
+            (BLOB.replace(f"functions_sas={FUNCTIONS_SAS}", "functions_sas="), "holds no functions_sas"),
+        ]:
+            blob.write_text(text)
+            done = self.run_script(*self.arguments(*PROOF_ARGS, "--dry-run"))
+            self.assertEqual(done.returncode, 2, text)
+            self.assertIn(reason, done.stderr)
+            self.assertNotIn("sig=", done.stderr, "no refusal shows a SAS")
+        self.assertEqual(self.calls(), [], "a refusal runs nothing")
 
     def test_without_a_name_the_run_gets_one_of_its_own(self):
         self.stubs(openstack=NEVER, openssl=NEVER, nc=NEVER, perl=NEVER)
@@ -514,6 +684,86 @@ class OpenstackUp(unittest.TestCase):
         self.assertEqual((run / "address").read_text().strip(), "203.0.113.7")
         self.assertIn("moruna: ready api=192.168.77.139:443 boot_ms=2140", done.stdout)
         self.assertEqual((run / "console.log").read_bytes(), CONSOLE_LINES.encode())
+        # The API's checks (2.6), last, on the floating IP, pinned to the console's certificate,
+        # with tokens for the console's instance; no proof without --proof.
+        self.assertEqual((run / "console.pin").read_text().strip(),
+                         "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")
+        self.assertEqual((run / "instance").read_text().strip(), INSTANCE)
+        python = [call for call in self.calls() if call.startswith("python3 ")]
+        self.assertEqual(python, [
+            f"python3 -I {REPO}/kernel/node/tools/api-checks.py --url https://203.0.113.7:443 "
+            "--pin 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 --token-key RUNDIR/token-key.pem "
+            f"--instance {INSTANCE} --openssl openssl --results RUNDIR/api-checks.json --cloud openstack "
+            "|data=|functions=|openssl="])
+        everything = self.calls()
+        self.assertLess(everything.index(python[0]),
+                        everything.index(f"{PREFIX}floating ip delete id-fip"), "before the deletion")
+        self.assertGreater(everything.index(python[0]), everything.index("nc -vz -w 5 203.0.113.7 22"))
+        self.assertEqual(json.loads((run / "api-checks.json").read_text()), {"ok": True})
+        self.assertIn("api-checks: all 9 checks pass\n", done.stdout)
+
+    def test_the_api_checks_failing_fail_the_run_and_everything_is_deleted(self):
+        self.live()
+        done = self.run_script(*self.arguments(), extra={"STUB_CHECKS_EXIT": "1", "STUB_CHECKS_OK": "false"})
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertNotIn("create-to-ready", done.stdout)
+        deleted = [call for call in self.openstack() if re.search(r" (delete|remove|unset) ", f" {call} ")]
+        self.assertEqual(deleted[0], "floating ip delete id-fip")
+        self.assertEqual(deleted[-1], "image delete id-image")
+        self.assertEqual(json.loads((self.root / "RUNDIR/api-checks.json").read_text()), {"ok": False})
+
+    def test_a_proof_runs_on_sl1_4_from_nyc_blob_with_its_sases_in_its_environment_only(self):
+        self.live()
+        done = self.run_script(*self.arguments(*PROOF_ARGS))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("proof: score-2024-01 pass\n", done.stdout)
+        self.assertRegex(done.stdout, r"create-to-ready \d+ s, boot_ms 2140\n$")
+        run = self.root / "RUNDIR"
+        key = base64.b64encode(b"0" * 32).decode()
+        self.assertEqual(json.loads((run / "node-config.json").read_text()),
+                         {"moruna": 1, "api": {"token_keys": [key]}, "functions": {"keys": [key]}})
+        self.assertTrue((run / "function-key.pem").exists())
+        server = next(call for call in self.openstack() if call.startswith("server create "))
+        self.assertEqual(server, "server create --image id-image --flavor SL1.4-16384-128 --network id-network "
+                                 f"--security-group id-group --user-data RUNDIR/node-config.json -f value -c id {NAME}")
+        python = [call for call in self.calls() if call.startswith("python3 ")]
+        self.assertEqual(len(python), 2)
+        proof, checks = python
+        argv, env = proof.split(" |data=")
+        self.assertEqual(env, f"{DATA_SAS}|functions={FUNCTIONS_SAS}|openssl=openssl")
+        self.assertEqual(argv, (
+            f"python3 -I {REPO}/bench/node/proof.py --url https://203.0.113.7:443 "
+            "--pin 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 "
+            f"--token-key RUNDIR/token-key.pem --instance {INSTANCE} --function-key RUNDIR/function-key.pem "
+            f"--functions TASKS --function-base https://{ACCOUNT}.blob.core.windows.net/functions --data blob "
+            f"--blob-account {ACCOUNT} --blob-container data --periods 2024-01,2024 --references NYCDIR "
+            "--gate-canon GATECANON --results RUNDIR/proof --work RUNDIR/proof-work"))
+        self.assertIn("/api-checks.py ", checks)
+        self.assertTrue(checks.endswith(" |data=|functions=|openssl="), "the checks are given no SAS")
+        self.assertEqual(json.loads((run / "proof/proof.json").read_text()), {"ok": True})
+        # Neither SAS is on any command line, nor in what the script said, nor in the run's files
+        # but the blob file it was given.
+        for call in self.calls():
+            self.assertNotIn("sig=", call.split(" |data=")[0])
+        for said in (done.stdout, done.stderr):
+            self.assertNotIn("sig=", said)
+        for path in run.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(b"sig=", path.read_bytes(), path)
+
+    def test_a_proof_that_fails_still_runs_the_api_checks_then_fails_the_run(self):
+        self.live()
+        done = self.run_script(*self.arguments(*PROOF_ARGS),
+                               extra={"STUB_PROOF_EXIT": "1", "STUB_PROOF_OK": "false"})
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertNotIn("create-to-ready", done.stdout)
+        calls = self.calls()
+        python = [call for call in calls if call.startswith("python3 ")]
+        self.assertEqual([call.split()[2].rsplit("/", 1)[1] for call in python], ["proof.py", "api-checks.py"])
+        self.assertLess(calls.index(python[1]), calls.index(f"{PREFIX}floating ip delete id-fip"))
+        self.assertTrue(any(call == f"{PREFIX}image delete id-image" for call in calls))
+        self.assertEqual(json.loads((self.root / "RUNDIR/proof/proof.json").read_text()), {"ok": False})
+        self.assertEqual(json.loads((self.root / "RUNDIR/api-checks.json").read_text()), {"ok": True})
 
     def test_the_console_is_read_from_the_create_on(self):
         self.live()

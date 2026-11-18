@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Brings the node up on Servercore, checks it, and deletes everything it made (work item 1.5b;
 # system design 1E): the steps of kernel/node/OPENSTACK.md, in order, each the same command.
+# With --proof it runs the proof on the node too (work item 3.8b), and every run ends with the
+# API's checks from outside the cloud (work item 2.6).
 #
 #   kernel/node/tools/openstack-up.sh --qcow2 OUT/moruna-node.qcow2 --run RUN --region REGION
-#       --boot image [--name moruna-node-NAME] [--cloud servercore] [--dry-run]
+#       --boot image [--name moruna-node-NAME] [--cloud servercore]
+#       [--proof --blob FILE --tasks DIR --nyc DIR --gate-canon BIN] [--dry-run]
 #   kernel/node/tools/openstack-up.sh --qcow2 OUT/moruna-node.qcow2 --run RUN --region REGION
 #       --boot volume --zone ZONE [--name moruna-node-NAME] [--cloud servercore] [--dry-run]
 #
@@ -18,7 +21,28 @@
 # - --zone: with --boot volume only, and then required: the availability zone the volume and the
 #   server are made in, for example ru-3b. The volume's type is basic.ZONE.
 # - --name: the one name of everything the run makes, `moruna-node-<yyyymmddHHMM>` when not given.
+# - --proof: the four NYC jobs through the node's API (work item 3.8b), on flavor SL1.4-16384-128
+#   (4 vCPUs and 16 GiB, as Azure's D4s_v4) in place of BL1.1-2048-16; with --boot image only, as
+#   that flavor has its own disk. Node config also holds a function key the run makes (system
+#   design 3E). Once the node is ready and checked, bench/node/proof.py registers each gate task
+#   at its address in nyc-blob.sh's `functions` container, with that container's read-only SAS;
+#   runs Score, Occupancy, Enrich and Audit on 2024-01 and on all of 2024, reading `nyc/` and
+#   writing `proof/<stamp>/` in nyc-blob.sh's data container with that container's SAS (by secret
+#   name, 3B), from Azure over the internet; and checks every output against 0.6.6's references.
+#   Its results are kept in RUN/proof. Both SASes reach proof.py in its environment only. It needs:
+#   - --blob: nyc-blob.sh's mode-600 file, which names the storage account and its two containers
+#     and holds their SASes;
+#   - --tasks: the gate tasks built for the core (images/gate/tasks/build.sh's core/bin), at least
+#     gate-score, gate-occupancy, gate-enrich and gate-audit: the ones nyc-blob.sh uploaded;
+#   - --nyc: the directory of 0.6.6's references, reference-JOB-PERIOD.json (~/moruna-data/nyc);
+#   - --gate-canon: gate-canon built for this machine (images/gate), which checks the year.
 # - --dry-run: prints every command, one to a line, and runs none of them.
+#
+# Every run ends with the API's checks (work item 2.6, kernel/node/tools/api-checks.py), after the
+# proof when there is one, whether or not it passed: health, the node document over HTTPS and
+# over MCP, and a token from another key and one for another instance each refused, every
+# connection pinned to the certificate the console printed. Their results are kept in
+# RUN/api-checks.json.
 #
 # A guard refuses, before anything runs, any cloud but servercore and any name not
 # `moruna-node-*`, and refuses a name that the project's images, security groups, networks,
@@ -30,7 +54,8 @@
 #
 # It exits 0 when every check of 1E passes: the server is ACTIVE, the console shows
 # `moruna: ready` and `moruna: cloud openstack`, the floating IP accepts on 443 and not on 22, and
-# nothing of the run is left. It prints create-to-ready and boot_ms. Any failure exits 1, after the
+# nothing of the run is left; and when the API's checks pass and, with --proof, all eight runs of
+# the proof. It prints create-to-ready and boot_ms. Any failure exits 1, after the
 # console is read into RUN once more and everything is deleted; a refusal exits 2.
 set -euo pipefail
 
@@ -42,6 +67,13 @@ name=""
 qcow2=""
 run=""
 dry=0
+proof=0
+blob=""
+tasks=""
+nyc=""
+gate_canon=""
+# The repository this script is in, whose bench/node/proof.py and api-checks.py run.
+repo="$(cd "$(dirname "$0")/../../.." && pwd)"
 openssl="${MORUNA_OPENSSL:-}"
 if [ -z "$openssl" ]; then
   # macOS's own openssl is LibreSSL, which has no Ed25519 (kernel/node/OPENSTACK.md, step 1).
@@ -54,7 +86,7 @@ refuse() {
 }
 
 usage() {
-  echo "usage: openstack-up.sh --qcow2 QCOW2 --run RUN --region REGION --boot image|volume [--zone ZONE] [--name moruna-node-NAME] [--cloud servercore] [--dry-run]" >&2
+  echo "usage: openstack-up.sh --qcow2 QCOW2 --run RUN --region REGION --boot image|volume [--zone ZONE] [--name moruna-node-NAME] [--cloud servercore] [--proof --blob FILE --tasks DIR --nyc DIR --gate-canon BIN] [--dry-run]" >&2
   exit 2
 }
 
@@ -67,6 +99,11 @@ while [ "$#" -gt 0 ]; do
     --boot) [ "$#" -ge 2 ] || usage; boot="$2"; shift 2 ;;
     --name) [ "$#" -ge 2 ] || usage; name="$2"; shift 2 ;;
     --cloud) [ "$#" -ge 2 ] || usage; cloud="$2"; shift 2 ;;
+    --proof) proof=1; shift ;;
+    --blob) [ "$#" -ge 2 ] || usage; blob="$2"; shift 2 ;;
+    --tasks) [ "$#" -ge 2 ] || usage; tasks="$2"; shift 2 ;;
+    --nyc) [ "$#" -ge 2 ] || usage; nyc="$2"; shift 2 ;;
+    --gate-canon) [ "$#" -ge 2 ] || usage; gate_canon="$2"; shift 2 ;;
     --dry-run) dry=1; shift ;;
     *) usage ;;
   esac
@@ -99,6 +136,51 @@ esac
 
 [ -f "$qcow2" ] || refuse "no qcow2 image at $qcow2"
 
+# The proof's inputs, every one there before anything runs, not even in a dry run.
+flavor=BL1.1-2048-16
+jobs="score occupancy enrich audit"
+account=""
+container=""
+functions=""
+if [ "$proof" -eq 1 ]; then
+  flavor=SL1.4-16384-128
+  [ "$boot" = image ] || refuse "--proof boots from the image: its flavor SL1.4-16384-128 has a disk of its own"
+  { [ -n "$blob" ] && [ -n "$tasks" ] && [ -n "$nyc" ] && [ -n "$gate_canon" ]; } \
+    || refuse "--proof needs --blob, --tasks, --nyc and --gate-canon"
+  [ -f "$blob" ] || refuse "no blob file at $blob (nyc-blob.sh's)"
+  # It holds the SASes: its owner's alone.
+  case "$(ls -l "$blob")" in
+    -r[w-]-------*) ;;
+    *) refuse "$blob may be read by others than its owner, and it holds the SASes: make it mode 600" ;;
+  esac
+  value() { sed -n "s/^$1=//p" "$blob" | head -1; }
+  account="$(value account)"
+  container="$(value container)"
+  functions="$(value functions)"
+  case "$account" in
+    '' | *[!a-z0-9]*) refuse "$blob: account '$account' is not 3 to 24 lowercase letters and digits" ;;
+  esac
+  { [ "${#account}" -ge 3 ] && [ "${#account}" -le 24 ]; } \
+    || refuse "$blob: account '$account' is not 3 to 24 lowercase letters and digits"
+  for name_of in "$container" "$functions"; do
+    case "$name_of" in
+      '' | -* | *- | *[!a-z0-9-]*) refuse "$blob: container '$name_of' is not lowercase letters, digits and inner dashes" ;;
+    esac
+  done
+  for sas in data_sas functions_sas; do
+    [ -n "$(value "$sas")" ] || refuse "$blob holds no $sas"
+  done
+  for j in $jobs; do
+    [ -f "$tasks/gate-$j" ] || refuse "no gate task at $tasks/gate-$j"
+    for period in 2024-01 2024; do
+      [ -f "$nyc/reference-$j-$period.json" ] || refuse "no reference at $nyc/reference-$j-$period.json"
+    done
+  done
+  { [ -f "$gate_canon" ] && [ -x "$gate_canon" ]; } || refuse "no gate-canon program at $gate_canon"
+elif [ -n "$blob$tasks$nyc$gate_canon" ]; then
+  refuse "--blob, --tasks, --nyc and --gate-canon go with --proof"
+fi
+
 if [ "$dry" -eq 0 ] && [ -e "$run" ]; then
   refuse "$run exists: the run's directory must be new"
 fi
@@ -115,6 +197,12 @@ R="$(q "$run")"
 Q="$(q "$qcow2")"
 O="$(q "$openssl")"
 N="$name"
+B="$(q "$blob")"
+T="$(q "$tasks")"
+Y="$(q "$nyc")"
+C="$(q "$gate_canon")"
+PROOF="$(q "$repo/bench/node/proof.py")"
+CHECKS="$(q "$repo/kernel/node/tools/api-checks.py")"
 # Every openstack call: bounded by perl's alarm, which the call keeps across exec and which ends
 # it; `exit 127` when it cannot be run at all. Each names the cloud and the region.
 BOUND="perl -e 'alarm shift; exec @ARGV; exit 127'"
@@ -183,7 +271,15 @@ say "node config"
 step "mkdir -m 700 $R"
 step "$O genpkey -algorithm ed25519 -out $R/token-key.pem"
 step "$O pkey -in $R/token-key.pem -pubout -outform DER | tail -c 32 | base64 > $R/token-key.pub"
-step "printf '{\"moruna\":1,\"api\":{\"token_keys\":[\"%s\"]}}\\n' \"\$(cat $R/token-key.pub)\" > $R/node-config.json"
+if [ "$proof" -eq 1 ]; then
+  # With --proof, a function key pair too: node config's one function key (3E), whose private
+  # half signs the gate tasks proof.py registers.
+  step "$O genpkey -algorithm ed25519 -out $R/function-key.pem"
+  step "$O pkey -in $R/function-key.pem -pubout -outform DER | tail -c 32 | base64 > $R/function-key.pub"
+  step "printf '{\"moruna\":1,\"api\":{\"token_keys\":[\"%s\"]},\"functions\":{\"keys\":[\"%s\"]}}\\n' \"\$(cat $R/token-key.pub)\" \"\$(cat $R/function-key.pub)\" > $R/node-config.json"
+else
+  step "printf '{\"moruna\":1,\"api\":{\"token_keys\":[\"%s\"]}}\\n' \"\$(cat $R/token-key.pub)\" > $R/node-config.json"
+fi
 
 # 2. The name, which must be new: from here on, whatever happens, what the run makes is deleted.
 say "the name $N"
@@ -261,7 +357,7 @@ step "$OS router add subnet $ROUTER $SUBNET"
 # returns.
 if [ "$boot" = image ]; then
   say "server, from the image"
-  step "$OS server create --image $IMAGE --flavor BL1.1-2048-16 --network $NETWORK --security-group $GROUP --user-data $R/node-config.json -f value -c id $N > $R/server.id && date -u +%s > $R/created.at"
+  step "$OS server create --image $IMAGE --flavor $flavor --network $NETWORK --security-group $GROUP --user-data $R/node-config.json -f value -c id $N > $R/server.id && date -u +%s > $R/created.at"
 else
   say "volume"
   step "$OS volume create --image $IMAGE --size 2 --bootable --type basic.$zone --availability-zone $zone -f value -c id $N > $R/volume.id"
@@ -296,3 +392,23 @@ say "checks"
 step "nc -vz -w 5 \"\$(cat $R/address)\" 443"
 step "! nc -vz -w 5 \"\$(cat $R/address)\" 22"
 step "[ \"\$($OS server show $SERVER -f value -c status)\" = ACTIVE ]"
+# The certificate's fingerprint and the instance, from the console (1B): every call to the API
+# from here on is pinned to the one, and its tokens are for the other.
+step "tr -d '\\r' < $R/console.log | grep -a -o 'moruna: tls sha256=[0-9a-f]*' | head -1 | cut -d= -f2 > $R/console.pin && [ -s $R/console.pin ]"
+step "tr -d '\\r' < $R/console.log | grep -a -o 'moruna: cloud openstack instance [^ ]*' | head -1 | cut -d' ' -f5 > $R/instance && [ -s $R/instance ]"
+
+# 10, with --proof: the four NYC jobs through the API (work item 3.8b) on 2024-01 and on all of
+# 2024, from and to nyc-blob.sh's data container, each output checked against 0.6.6's reference;
+# the results in RUN/proof. The SASes reach proof.py in its environment, read from the blob file,
+# never on a command line, and it redacts both wherever it would show them. A proof that fails
+# fails the run, after the API's checks.
+proof_failed=0
+if [ "$proof" -eq 1 ]; then
+  say "proof"
+  step "BENCH_SAS=\"\$(sed -n 's/^data_sas=//p' $B)\" FUNCTIONS_SAS=\"\$(sed -n 's/^functions_sas=//p' $B)\" MORUNA_BENCH_OPENSSL=$O python3 -I $PROOF --url \"https://\$(cat $R/address):443\" --pin \"\$(cat $R/console.pin)\" --token-key $R/token-key.pem --instance \"\$(cat $R/instance)\" --function-key $R/function-key.pem --functions $T --function-base https://$account.blob.core.windows.net/$functions --data blob --blob-account $account --blob-container $container --periods 2024-01,2024 --references $Y --gate-canon $C --results $R/proof --work $R/proof-work" || proof_failed=1
+fi
+
+# 10, last: the API's checks from outside the cloud (work item 2.6), on every run.
+say "the API's checks"
+step "python3 -I $CHECKS --url \"https://\$(cat $R/address):443\" --pin \"\$(cat $R/console.pin)\" --token-key $R/token-key.pem --instance \"\$(cat $R/instance)\" --openssl $O --results $R/api-checks.json --cloud openstack"
+[ "$proof_failed" -eq 0 ] || exit 1

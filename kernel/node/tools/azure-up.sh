@@ -40,14 +40,21 @@
 #   It takes no --data-disk.
 # - --dry-run: prints every command, one to a line, and runs none of them.
 #
+# Every run ends with the API's checks (work item 2.6, kernel/node/tools/api-checks.py), after
+# --job's and the proof's steps, the proof's whether or not it passed: health, the node document
+# over HTTPS and over MCP, and a token from another key and one for another instance each
+# refused, every connection pinned to the certificate the console printed. Their results are
+# kept in RUN/api-checks.json.
+#
 # A guard refuses, before anything runs, any subscription but griot-dev and any group not named
 # `moruna-node-*`, and refuses a group that already exists: the script deletes only the group it
 # made. Every `az` command names the subscription with --subscription; none sets a default.
 #
 # It exits 0 when every check of 1E passes on Azure: the node answers on 443 within 10 minutes,
 # its console shows `moruna: ready` and `moruna: cloud azure`, 443 accepts and 22 does not, the
-# served certificate is the one the console printed, and GET /v1/node answers; with --job, the job
-# ends with exit 0 and counts its 10,000,000 rows; with --proof, all eight runs of the proof pass.
+# served certificate is the one the console printed, and GET /v1/node answers; when the API's
+# checks pass; with --job, when the job ends with exit 0 and counts its 10,000,000 rows; with
+# --proof, when all eight runs of the proof pass.
 # It prints create-to-ready and boot_ms, and with --job the job's wall_ms. Any failure exits 1,
 # after the console log is read into RUN and the group deleted; a refusal exits 2.
 set -euo pipefail
@@ -175,6 +182,7 @@ T="$(q "$tasks")"
 N="$(q "$nyc")"
 C="$(q "$gate_canon")"
 PROOF="$(q "$repo/bench/node/proof.py")"
+CHECKS="$(q "$repo/kernel/node/tools/api-checks.py")"
 S="--subscription $subscription"
 G="$group"
 A="$account"
@@ -349,8 +357,15 @@ fi
 # 9, with --proof: the four NYC jobs through the API (work item 3.8) on 2024-01 and on all of 2024,
 # from and to Blob, each output checked against 0.6.6's reference; the results in RUN/proof. The
 # account key and the SAS reach proof.py in its environment, never on a command line, and it
-# redacts both wherever it would show them.
+# redacts both wherever it would show them. A proof that fails fails the run, after the API's
+# checks.
+proof_failed=0
 if [ "$proof" -eq 1 ]; then
   say "proof"
-  step "BENCH_KEY=\"\$(cat $R/account.key)\" FUNCTIONS_SAS=\"\$(cat $R/functions.sas)\" MORUNA_BENCH_OPENSSL=$O python3 -I $PROOF --url \"https://\$(cat $R/address):443\" --pin \"\$(cat $R/console.pin)\" --token-key $R/token-key.pem --instance \"\$(cat $R/instance)\" --function-key $R/function-key.pem --functions $T --function-base https://$A.blob.core.windows.net/functions --data blob --blob-account $A --blob-container data --periods 2024-01,2024 --references $N --gate-canon $C --results $R/proof --work $R/proof-work"
+  step "BENCH_KEY=\"\$(cat $R/account.key)\" FUNCTIONS_SAS=\"\$(cat $R/functions.sas)\" MORUNA_BENCH_OPENSSL=$O python3 -I $PROOF --url \"https://\$(cat $R/address):443\" --pin \"\$(cat $R/console.pin)\" --token-key $R/token-key.pem --instance \"\$(cat $R/instance)\" --function-key $R/function-key.pem --functions $T --function-base https://$A.blob.core.windows.net/functions --data blob --blob-account $A --blob-container data --periods 2024-01,2024 --references $N --gate-canon $C --results $R/proof --work $R/proof-work" || proof_failed=1
 fi
+
+# 9, last: the API's checks from outside the cloud (work item 2.6), on every run.
+say "the API's checks"
+step "python3 -I $CHECKS --url \"https://\$(cat $R/address):443\" --pin \"\$(cat $R/console.pin)\" --token-key $R/token-key.pem --instance \"\$(cat $R/instance)\" --openssl $O --results $R/api-checks.json --cloud azure"
+[ "$proof_failed" -eq 0 ] || exit 1

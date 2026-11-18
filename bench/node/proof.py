@@ -4,6 +4,7 @@
              --function-key PEM --functions DIR --function-base URL
              --data volume --source-serial S --sink-serial S --volume-image FILE [--unpacker BIN]
            | --data blob --blob-account A --blob-container C [--blob-endpoint URL]
+             [--blob-outputs PREFIX]
              [--jobs score,occupancy,enrich,audit] [--periods 2024-01,2024]
              [--references ~/moruna-data/nyc] [--gate-canon BIN] [--events sse|mcp]
              [--memory-gib G] [--cpus N] [--results DIR] [--work DIR]
@@ -21,8 +22,8 @@ Against one node, in order:
    all of 2024, one job at a time (3A: a node runs one), each as gate_jobs.py's document with
    its function the registered task, `{"kind": "function", "function": "gate-JOB"}` (3.6): the
    normalised files from the source volume (3C, `disk://SERIAL/FILE`) or from Blob (3.5,
-   `az://CONTAINER/nyc/FILE`, the account key by secret name), the output to the sink volume or
-   to Blob. The sink writes the volume's layer from its first byte, so each run's output is read
+   `az://CONTAINER/nyc/FILE`, the account key or a container SAS by secret name), the output to
+   the sink volume or to Blob. The sink writes the volume's layer from its first byte, so each run's output is read
    back (`moruna-engine volume unpack` on the volume's image, 3.3) before the next run.
 3. **Follows each job's events** to its report and exit: over Server-Sent Events, or over MCP's
    `moruna_jobs_events` (3.7). A lost connection resumes after the last record it had (`from` is
@@ -36,11 +37,13 @@ Against one node, in order:
 Every run's record is written to `RESULTS/JOB-PERIOD.json`, the summary to `RESULTS/proof.json`,
 and a table is printed. The exit code is 0 only when all of them pass.
 
-The Blob account key (`BENCH_KEY`) and the functions' SAS (`FUNCTIONS_SAS`, the query string
-Azure gives, with or without its `?`) are read from the environment, never from the command line,
-and never printed or written: wherever either would show (an address, a node's diagnostic that
-quotes one, an error), the logs and the results name it instead, `<FUNCTIONS_SAS>` or
-`<BENCH_KEY>`.
+The Blob credential, the account key (`BENCH_KEY`, as on Azure) or a container SAS that reads,
+writes and lists the data's container (`BENCH_SAS`, as on Servercore, work item 3.8b: the jobs
+read and write with it by secret name, `object_store.azure.sas_token`, and the outputs are fetched
+with it), and the functions' SAS (`FUNCTIONS_SAS`), each SAS the query string Azure gives, with or
+without its `?`, are read from the environment, never from the command line, and never printed
+or written: wherever one would show (an address, a node's diagnostic that quotes one, an error),
+the logs and the results name it instead, `<FUNCTIONS_SAS>`, `<BENCH_SAS>` or `<BENCH_KEY>`.
 """
 import argparse
 import hashlib
@@ -72,18 +75,23 @@ MiB = 1 << 20
 # What a node keeps from a job's budget (3A): 512 MiB for its services, 256 MiB for a check.
 NODE_KEEPS = 768 * MiB
 BLOB_SECRET = "blob-key"
-# The environment's secrets: the Blob account key, and the SAS each function's address carries.
+BLOB_SAS_SECRET = "blob-sas"
+# The environment's secrets: the Blob account key or the data's container SAS, and the SAS each
+# function's address carries.
 BLOB_KEY_ENV = "BENCH_KEY"
+BLOB_SAS_ENV = "BENCH_SAS"
 SAS_ENV = "FUNCTIONS_SAS"
+SAS_NAMES = (SAS_ENV, BLOB_SAS_ENV)
 # A SAS's signature is looked for alone only when it is this long: a real one is 44 characters of
 # base64, and a shorter piece would hide ordinary text.
 SIG_LEAST = 8
 
 
-def sas_of(env=None):
-    """The functions' SAS from the environment: Azure's query string without its `?`, or ""."""
+def sas_of(env=None, name=SAS_ENV):
+    """A SAS from the environment, the functions' by default: Azure's query string without its
+    `?`, or ""."""
     env = os.environ if env is None else env
-    return env.get(SAS_ENV, "").strip().lstrip("?")
+    return env.get(name, "").strip().lstrip("?")
 
 
 def address(function_base, name, sas=""):
@@ -102,7 +110,7 @@ class Redact:
             if not value:
                 continue
             pairs[value] = f"<{name}>"
-            if name == SAS_ENV:
+            if name in SAS_NAMES:
                 for sig in re.findall(r"(?:^|&)sig=([^&]*)", value):
                     for piece in {sig, urllib.parse.unquote(sig)}:
                         if len(piece) >= SIG_LEAST:
@@ -164,17 +172,21 @@ class Volumes:
 
 
 class Blob:
-    """Sources and outputs in one Blob container (3.5), the account key by secret name."""
+    """Sources and outputs in one Blob container (3.5), the account key or the container's SAS
+    by secret name."""
 
     def __init__(self, store, inputs_prefix="nyc/", outputs_prefix="proof/"):
         self.store, self.inputs_prefix, self.outputs_prefix = store, inputs_prefix, outputs_prefix
 
     def document_extras(self):
-        azure = {"account": self.store.account, "container": self.store.container,
-                 "access_key": {"secret": BLOB_SECRET}}
+        azure = {"account": self.store.account, "container": self.store.container}
+        if self.store.sas:
+            azure["sas_token"], secrets = {"secret": BLOB_SAS_SECRET}, {BLOB_SAS_SECRET: self.store.sas}
+        else:
+            azure["access_key"], secrets = {"secret": BLOB_SECRET}, {BLOB_SECRET: self.store.key}
         if self.store.endpoint.startswith("http://"):
             azure["allow_http"] = True
-        return {"object_store": {"azure": azure}}, {BLOB_SECRET: self.store.key}
+        return {"object_store": {"azure": azure}}, secrets
 
     def inputs(self, period):
         return [self.store.az(self.inputs_prefix + f) for f in files(period)]
@@ -488,11 +500,14 @@ def data_of(a):
         if not (a.source_serial and a.sink_serial and a.volume_image):
             raise SystemExit("proof.py: --data volume needs --source-serial, --sink-serial and --volume-image")
         return Volumes(a.source_serial, a.sink_serial, a.volume_image, a.unpacker)
-    if not (a.blob_account and a.blob_container and os.environ.get("BENCH_KEY")):
+    key, sas = os.environ.get(BLOB_KEY_ENV, ""), sas_of(name=BLOB_SAS_ENV)
+    if not (a.blob_account and a.blob_container and (key or sas)):
         raise SystemExit("proof.py: --data blob needs --blob-account, --blob-container "
-                         "and BENCH_KEY in the environment")
+                         "and BENCH_KEY or BENCH_SAS in the environment")
+    if key and sas:
+        raise SystemExit("proof.py: --data blob takes BENCH_KEY or BENCH_SAS, not both")
     import store
-    return Blob(store.Store(a.blob_account, os.environ["BENCH_KEY"], a.blob_container, a.blob_endpoint or ""),
+    return Blob(store.Store(a.blob_account, key, a.blob_container, a.blob_endpoint or "", sas),
                 a.blob_inputs, a.blob_outputs)
 
 
@@ -547,7 +562,8 @@ def main(argv=None, transport=None, sign=None, log=print, sleep=time.sleep, cloc
     a = parse(argv)
     sas = sas_of()
     # Every line said and every record written goes through it: no secret is shown or kept.
-    redact = Redact({SAS_ENV: sas, BLOB_KEY_ENV: os.environ.get(BLOB_KEY_ENV, "")})
+    redact = Redact({SAS_ENV: sas, BLOB_KEY_ENV: os.environ.get(BLOB_KEY_ENV, ""),
+                     BLOB_SAS_ENV: sas_of(name=BLOB_SAS_ENV)})
     say = log
     log = lambda line: say(redact(line))  # noqa: E731
 

@@ -29,7 +29,9 @@ It is written for subscription `griot-dev`, region Central India (`centralindia`
   Three options add steps, each marked below: `--data-disk` attaches an empty 4 GiB data disk at
   LUN 0 (steps 4, 6 and 10), `--job` runs a job through the API once the node is ready
   (step 9), and `--proof` runs the proof of work item 3.8 on a `Standard_D4s_v4` (steps 1, 3, 6
-  and 9); each goes after `--group` below, and `--proof` takes no `--data-disk`. A run:
+  and 9); each goes after `--group` below, and `--proof` takes no `--data-disk`. Every run ends
+  with the API's checks from outside the cloud (work item 2.6; step 9), and fails if any of them
+  fails. A run:
 
   ```
   kernel/node/tools/azure-up.sh --vhd <OUT>/moruna-node.vhd --run <RUN> --from <FROM> \
@@ -59,7 +61,7 @@ a command changes.
 | `<TASKS>` | With `--proof`: the directory of the gate tasks built for the core, holding at least `gate-score`, `gate-occupancy`, `gate-enrich` and `gate-audit` | `images/gate/tasks/build.sh`, which writes them to its target's `core/bin` |
 | `<NYC>` | With `--proof`: the directory holding the twelve normalised months of 2024, `norm/yellow_tripdata_2024-MM.parquet` (about 800 MB), and 0.6.6's references, `reference-JOB-PERIOD.json` and `reference-score-2024.dump` | `~/moruna-data/nyc` on the project's Mac (`bench/node/references.py`) |
 | `<GATE_CANON>` | With `--proof`: `gate-canon` built for the operator's machine, which hashes the outputs and checks the year | `images/gate`: `cargo build --release -p moruna-gate-baseline --bin gate-canon` |
-| `<REPO>` | With `--proof`: the repository's root, whose `bench/node/proof.py` runs the proof | The checkout `azure-up.sh` is in; it names its own |
+| `<REPO>` | The repository's root, whose `kernel/node/tools/api-checks.py` and, with `--proof`, `bench/node/proof.py` run | The checkout `azure-up.sh` is in; it names its own |
 
 The machine's own address and its instance ID are read from Azure and from its console into
 `<RUN>`, and the commands read them from there.
@@ -625,7 +627,34 @@ BENCH_KEY="$(cat <RUN>/account.key)" FUNCTIONS_SAS="$(cat <RUN>/functions.sas)" 
 
 A month's run may take at most an hour and the year's six (`proof.py`'s `--timeout-s` and
 `--year-timeout-s`); one past its time is cancelled and fails. Step 10 deletes the data, the
-outputs and the functions with the account.
+outputs and the functions with the account. A proof that fails fails the run, after the API's
+checks below.
+
+### The API's checks
+
+Last, on every run, after `--job`'s and the proof's steps, the proof's whether or not it passed:
+the API's proof from outside the cloud (work item 2.6, `kernel/node/tools/api-checks.py`). Every
+connection is pinned to `<RUN>/console.pin` before anything is sent. It checks, in order:
+
+- `GET /v1/health` with no token answers `{"status":"ok"}`;
+- `GET /v1/node` with an `observe` token of the run's key answers the node document, its `cloud`
+  `azure` and its `instance` the console's;
+- over MCP (`POST /mcp`, the same token): `initialize` answers as server `moruna`; `tools/list`
+  names `moruna_health`, `moruna_node` and `moruna_node_audit`; `tools/call` of `moruna_node`
+  answers the same node document;
+- a token signed by another key, made for the check and thrown away, and one of the run's key
+  for another instance are each refused with `401 unauthorized`, on `/v1/node` and on `/mcp`.
+
+Its results are kept in `<RUN>/api-checks.json`, its tokens nowhere. The rest of 2.6, `api` killed
+and the node still answering, cannot be done on a cloud node, which has no way in but its API;
+item 2.2c's booted test covers it.
+
+```
+python3 -I <REPO>/kernel/node/tools/api-checks.py --url "https://$(cat <RUN>/address):443" \
+  --pin "$(cat <RUN>/console.pin)" --token-key <RUN>/token-key.pem \
+  --instance "$(cat <RUN>/instance)" --openssl openssl --results <RUN>/api-checks.json \
+  --cloud azure
+```
 
 ## 10. Delete everything
 
