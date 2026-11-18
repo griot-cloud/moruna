@@ -9,12 +9,14 @@ uncommitted work is saved under `~/moruna-data/wip/<branch>/`:
 - `tracked.patch`: `git apply` it on `base`;
 - `untracked.tgz`: untar it in the tree's root.
 
+Boot evidence is kept in `~/moruna-data/boots/` (chain logs, scripts, run reports), one folder per boot, after its worktree is deleted.
+
 ## Helpers (two)
 
 | Item | Branch | State |
 |---|---|---|
-| 6.3d the Parquet writers' memory | `work/6.3d-writer-heap` 114ec8c5 on 56cc2040; 814 tests pass with the 768-column test | PM decided: writers get up to their room at an ample budget, their claim as the floor (the year was written in 130 row groups, not 51–55). Then its report | The claim order and the wide read's arena least are built; the 768-column test is no longer ignored. The five crates' suites are running; then commit, the release table and pairs once the load drops, and coverage |
-| 6.3g a function's memory measured | phases 1–2 merged (081e145c); phase 3 host side committed (e82a08bb, plus the gate's two Python fixes) on `work/6.3g-function-memory-measured` | Rule 1 (the per-instance morsel cap plus the kernel's cut), rule 2 (profiles scaled by count), 6.3i's refused-charge commit, the gate's two Python fixes; then a booted turn |
+| 6.3d the Parquet writers' memory | `work/6.3d-writer-heap` 114ec8c5 on 56cc2040; 814 tests pass with the 768-column test | PM decided: the writers' extra comes only from what the arena's working size (sized with the claims) leaves, never from the arena: a tight run was terminated at the arena's least. Don't relax si_lane_heap; isolate it. A decode batch is never 0 bytes. Then the 672 MiB table and its report | The claim order and the wide read's arena least are built; the 768-column test is no longer ignored. The five crates' suites are running; then commit, the release table and pairs once the load drops, and coverage |
+| 6.3g a function's memory measured | phases 1–2 merged (081e145c); phase 3 at 8af13d2c (host side, the gate's Python fixes, 6.3i's two commits); its booted turn holds the VM lock from 21:09Z | Rule 1 (the per-instance morsel cap plus the kernel's cut), rule 2 (profiles scaled by count), 6.3i's refused-charge commit, the gate's two Python fixes; then a booted turn |
 
 ## The PM's, in order
 
