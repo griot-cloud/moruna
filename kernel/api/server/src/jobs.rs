@@ -48,9 +48,11 @@ struct Entry {
     ordinal: u64,
     id: String,
     state: JobState,
-    submitted: u64,
-    started: Option<u64>,
-    ended: Option<u64>,
+    /// When the node took it, began to run it and saw it end, on the wall clock in Unix
+    /// milliseconds; the answers give each in seconds too.
+    submitted_ms: u64,
+    started_ms: Option<u64>,
+    ended_ms: Option<u64>,
     heartbeat: Option<Heartbeat>,
     /// The latest heartbeat as the engine wrote it, and how many there have been.
     heartbeat_line: Option<Arc<str>>,
@@ -68,14 +70,22 @@ struct Entry {
     skipped: u64,
 }
 
+/// A time on the wall clock in Unix milliseconds, in Unix seconds.
+const fn seconds(ms: u64) -> u64 {
+    ms / 1_000
+}
+
 impl Entry {
     fn summary(&self) -> JobSummary {
         JobSummary {
             id: self.id.clone(),
             state: self.state,
-            submitted: self.submitted,
-            started: self.started,
-            ended: self.ended,
+            submitted: seconds(self.submitted_ms),
+            submitted_ms: self.submitted_ms,
+            started: self.started_ms.map(seconds),
+            started_ms: self.started_ms,
+            ended: self.ended_ms.map(seconds),
+            ended_ms: self.ended_ms,
         }
     }
 
@@ -83,9 +93,12 @@ impl Entry {
         JobStatus {
             id: self.id.clone(),
             state: self.state,
-            submitted: self.submitted,
-            started: self.started,
-            ended: self.ended,
+            submitted: seconds(self.submitted_ms),
+            submitted_ms: self.submitted_ms,
+            started: self.started_ms.map(seconds),
+            started_ms: self.started_ms,
+            ended: self.ended_ms.map(seconds),
+            ended_ms: self.ended_ms,
             heartbeat: self.heartbeat.clone(),
             exit_code: self.exit_code,
         }
@@ -100,7 +113,8 @@ struct Flight {
     ticket: Option<u64>,
     /// What the job says is secret, kept to redact what the engine says until it exits.
     secrets: Secrets,
-    submitted: u64,
+    /// When the engine was started with the job, on the wall clock in Unix milliseconds.
+    submitted_ms: u64,
     /// Whether the engine has told the run's ID, so that the job is in the list.
     listed: bool,
     /// A heartbeat and a report that came before the run's ID, and the lines passed over.
@@ -388,7 +402,13 @@ impl Jobs {
     }
 
     /// Starts the job `check` found sound by `verdict`, as its submit asked.
-    fn start(&mut self, host: &mut dyn EngineHost, mut check: Check, verdict: &Verdict, now: u64) {
+    fn start(
+        &mut self,
+        host: &mut dyn EngineHost,
+        mut check: Check,
+        verdict: &Verdict,
+        now_ms: u64,
+    ) {
         let Some(spec) = check.spec.as_deref() else {
             return;
         };
@@ -406,7 +426,7 @@ impl Jobs {
             ordinal: self.ordinals,
             ticket,
             secrets: core::mem::take(&mut check.secrets),
-            submitted: now,
+            submitted_ms: now_ms,
             listed: false,
             heartbeat: None,
             report: None,
@@ -620,10 +640,11 @@ impl Jobs {
         true
     }
 
-    /// Moves the checks and the engine in flight as far as they go now. A check's verdict also
+    /// Moves the checks and the engine in flight as far as they go at `now_ms`, the wall clock in
+    /// Unix milliseconds, which times what happens to the job now. A check's verdict also
     /// refuses each function the job uses that is not in `functions` (3E).
-    pub(crate) fn pump(&mut self, host: &mut dyn EngineHost, functions: &Registry, now: u64) {
-        self.pump_checks(host, functions, now);
+    pub(crate) fn pump(&mut self, host: &mut dyn EngineHost, functions: &Registry, now_ms: u64) {
+        self.pump_checks(host, functions, now_ms);
         if self.flight.is_none() {
             return;
         }
@@ -631,7 +652,7 @@ impl Jobs {
         let mut read = 0;
         while self.flight.is_some() && read < POLL_BYTES {
             match host.receive(&mut scratch) {
-                Ok(0) => self.end(None, None, now),
+                Ok(0) => self.end(None, None, now_ms),
                 Ok(count) => {
                     read += count;
                     self.wire.push(&scratch[..count]);
@@ -639,15 +660,15 @@ impl Jobs {
                         let message = self.wire.next();
                         self.count_skipped();
                         match message {
-                            Some(Message::Line(line)) => self.line(line, now),
-                            Some(Message::Record(record)) => self.record(&record, now),
-                            Some(Message::Garbled) => self.end(None, None, now),
+                            Some(Message::Line(line)) => self.line(line, now_ms),
+                            Some(Message::Record(record)) => self.record(&record, now_ms),
+                            Some(Message::Garbled) => self.end(None, None, now_ms),
                             None => break,
                         }
                     }
                 }
                 Err(HostError::WouldBlock) => break,
-                Err(error) => self.lost(error, now),
+                Err(error) => self.lost(error, now_ms),
             }
         }
         self.wire.settle();
@@ -656,20 +677,20 @@ impl Jobs {
     /// The engine is lost before or while it runs, for `error`: a submit still waiting hears it,
     /// in its words (the node's refusal of a job's start, a function that changed since it was
     /// registered, say: item 3.6), and the job, if it began, ends.
-    fn lost(&mut self, error: HostError, now: u64) {
+    fn lost(&mut self, error: HostError, now_ms: u64) {
         if let Some(flight) = &mut self.flight
             && let Some(ticket) = flight.ticket.take()
         {
             let answer = failed(error, &flight.secrets);
             self.resolved.push((ticket, answer));
         }
-        self.end(None, None, now);
+        self.end(None, None, now_ms);
     }
 
     /// Hands the engine the next document to check, and takes the verdict of the one it has: a
     /// validation's answer, or for a submit, the job started, or its refusal. The refusals are the
     /// engine's, and one for each function the job uses that is not registered.
-    fn pump_checks(&mut self, host: &mut dyn EngineHost, functions: &Registry, now: u64) {
+    fn pump_checks(&mut self, host: &mut dyn EngineHost, functions: &Registry, now_ms: u64) {
         if self.checking
             && let Some(verdict) = host.checked()
         {
@@ -684,7 +705,7 @@ impl Jobs {
             if let Some(check) = self.checks.pop_front() {
                 match (verdict, check.spec.is_some()) {
                     (Ok(verdict), true) if verdict.refusals.is_empty() => {
-                        self.start(host, check, &verdict, now);
+                        self.start(host, check, &verdict, now_ms);
                     }
                     (Ok(verdict), true) => {
                         if check.wanted {
@@ -747,7 +768,7 @@ impl Jobs {
     }
 
     /// One line of the host protocol from the engine.
-    fn line(&mut self, line: Vec<u8>, now: u64) {
+    fn line(&mut self, line: Vec<u8>, now_ms: u64) {
         let Some(flight) = &self.flight else {
             return;
         };
@@ -759,7 +780,7 @@ impl Jobs {
             return;
         };
         match typed.kind.as_str() {
-            "heartbeat" => self.heartbeat(Arc::from(text), now),
+            "heartbeat" => self.heartbeat(Arc::from(text), now_ms),
             "report" => {
                 if let Ok(message) = serde_json::from_str::<ReportLine<'_>>(&text) {
                     let report = Arc::from(message.report.get());
@@ -770,7 +791,7 @@ impl Jobs {
             "exit" => {
                 if let Ok(exit) = serde_json::from_str::<ExitLine>(&text) {
                     let line = Some((exit.code, exit.diagnostic, Arc::from(text)));
-                    self.end(line.as_ref().map(|l| l.0), line, now);
+                    self.end(line.as_ref().map(|l| l.0), line, now_ms);
                 }
             }
             // `hello`, `limits_changed` and the port messages change nothing the node keeps.
@@ -779,7 +800,7 @@ impl Jobs {
     }
 
     /// A heartbeat: the job's latest, and the sign that it runs.
-    fn heartbeat(&mut self, line: Arc<str>, now: u64) {
+    fn heartbeat(&mut self, line: Arc<str>, now_ms: u64) {
         let Some(entry) = self.current() else {
             if let Some(flight) = &mut self.flight {
                 flight.heartbeat = Some(line);
@@ -791,7 +812,7 @@ impl Jobs {
         entry.heartbeats += 1;
         if entry.state == JobState::Starting {
             entry.state = JobState::Running;
-            entry.started = Some(now);
+            entry.started_ms = Some(now_ms);
         }
     }
 
@@ -829,7 +850,7 @@ impl Jobs {
 
     /// One event record from the engine: the first tells the run's ID, which makes the job; each
     /// is kept in the buffer as its JSON line.
-    fn record(&mut self, record: &[u8], now: u64) {
+    fn record(&mut self, record: &[u8], now_ms: u64) {
         let Ok(event) = moruna_event::decode(record) else {
             return;
         };
@@ -843,7 +864,8 @@ impl Jobs {
         if !flight.listed {
             flight.listed = true;
             let id = event.run.unwrap_or(event.start);
-            let (ordinal, submitted, skipped) = (flight.ordinal, flight.submitted, flight.skipped);
+            let (ordinal, submitted_ms, skipped) =
+                (flight.ordinal, flight.submitted_ms, flight.skipped);
             let (heartbeat, report) = (flight.heartbeat.take(), flight.report.take());
             if let Some(ticket) = flight.ticket.take() {
                 let submitted = Submitted { id: id.clone() };
@@ -854,9 +876,9 @@ impl Jobs {
                 ordinal,
                 id,
                 state: JobState::Starting,
-                submitted,
-                started: None,
-                ended: None,
+                submitted_ms,
+                started_ms: None,
+                ended_ms: None,
                 heartbeat: None,
                 heartbeat_line: None,
                 heartbeats: 0,
@@ -875,7 +897,7 @@ impl Jobs {
                 }
             }
             if let Some(line) = heartbeat {
-                self.heartbeat(line, now);
+                self.heartbeat(line, now_ms);
             }
             if let Some((report, plan)) = report {
                 self.keep_report(report, plan);
@@ -898,7 +920,12 @@ impl Jobs {
     /// The engine has ended: with its `exit` message (`code`, and the message's code,
     /// diagnostic and line), or without one. A job that had begun ends; a submit still waiting
     /// hears why its document did not become a job.
-    fn end(&mut self, code: Option<i32>, exit: Option<(i32, Option<String>, Arc<str>)>, now: u64) {
+    fn end(
+        &mut self,
+        code: Option<i32>,
+        exit: Option<(i32, Option<String>, Arc<str>)>,
+        now_ms: u64,
+    ) {
         let Some(mut flight) = self.flight.take() else {
             return;
         };
@@ -935,7 +962,7 @@ impl Jobs {
                 Some(CANCELLED) => JobState::Cancelled,
                 _ => JobState::Failed,
             };
-            entry.ended = Some(now);
+            entry.ended_ms = Some(now_ms);
             entry.exit_code = code;
             entry.exit_line = exit.map(|(_, _, line)| line);
         }

@@ -124,7 +124,7 @@ fn the_check_fails_when_the_document_changes_without_regenerating() {
 /// registration, or nothing.
 const SAME_CALLS: &str = "import sys, runpy, inspect
 m = runpy.run_path(sys.argv[1])
-JOB = {'id': 'run-1', 'state': 'running', 'submitted': 1}
+JOB = {'id': 'run-1', 'state': 'running', 'submitted': 1, 'submitted_ms': 1500}
 FUNCTION = {'name': 'gate-score', 'address': 'https://x/gate-score', 'sha256': 'ab' * 32,
             'key': '0123456789abcdef', 'registered': 1}
 ANSWERS = {

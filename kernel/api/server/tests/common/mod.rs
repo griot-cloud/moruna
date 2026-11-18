@@ -93,25 +93,25 @@ impl Transport for End {
     }
 }
 
-/// A clock the test moves.
+/// A clock the test moves: the monotonic clock, and the wall clock, which starts at [`WALL`].
 #[derive(Clone, Debug)]
 pub struct TestClock {
     pub ms: Rc<Cell<u64>>,
-    pub unix: Rc<Cell<u64>>,
+    pub unix_ms: Rc<Cell<u64>>,
 }
 
 impl TestClock {
     pub fn new() -> Self {
         Self {
             ms: Rc::new(Cell::new(1_000)),
-            unix: Rc::new(Cell::new(WALL)),
+            unix_ms: Rc::new(Cell::new(WALL * 1_000)),
         }
     }
 
     /// Moves both clocks on by `ms` milliseconds.
     pub fn advance(&self, ms: u64) {
         self.ms.set(self.ms.get() + ms);
-        self.unix.set(WALL + (self.ms.get() - 1_000) / 1_000);
+        self.unix_ms.set(self.unix_ms.get() + ms);
     }
 }
 
@@ -120,8 +120,8 @@ impl Clock for TestClock {
         self.ms.get()
     }
 
-    fn unix_seconds(&self) -> u64 {
-        self.unix.get()
+    fn unix_ms(&self) -> u64 {
+        self.unix_ms.get()
     }
 }
 

@@ -378,8 +378,8 @@ fn api_with_job(signer: &Signer, records: usize, ended: bool) -> (Api, String) {
         panic!("the submit waits for the engine");
     };
     // The engine's check is handed the job, then its verdict starts the engine.
-    api.pump(NOW);
-    api.pump(NOW);
+    api.pump(NOW * 1_000);
+    api.pump(NOW * 1_000);
     engine.attempt_started();
     for n in 1..records {
         engine.log("source", &format!("line {n}"));
@@ -387,7 +387,7 @@ fn api_with_job(signer: &Signer, records: usize, ended: bool) -> (Api, String) {
     if ended {
         engine.finish(r#"{"rows_out":3}"#, 0, None);
     }
-    api.pump(NOW);
+    api.pump(NOW * 1_000);
     assert_eq!(api.ready(ticket).unwrap().status, 201);
     (api, signer.token("i-1", NOW + 60, &["observe"]))
 }

@@ -14,7 +14,9 @@
 //! 2. `api` reads it ([`Handover::decode`]) and keeps it.
 //! 3. Once its listener is open, `api` writes one message, [`READY`].
 //!
-//! `api` carries the wall clock forward with [`Handover::wall_clock_at`].
+//! `api` reads the node's one wall clock from the core's clock page (system design 3D); while
+//! that is unset, it carries the hand-over's forward, as [`Handover::wall_clock_at`] does in
+//! seconds.
 //!
 //! The crate is `no_std` with `alloc`: both processes run on the microkernel.
 #![no_std]

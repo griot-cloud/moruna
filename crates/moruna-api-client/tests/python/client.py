@@ -103,6 +103,12 @@ class AgainstTheNode(unittest.TestCase):
         assert status.heartbeat is not None
         self.assertEqual((status.heartbeat.rows_out, status.heartbeat.bottleneck), (3, "sink"))
         self.assertIsNone(status.exit_code)
+        # The times to the millisecond beside their seconds (item 2.4).
+        assert status.started_ms is not None
+        self.assertLessEqual(status.submitted_ms, status.started_ms)
+        self.assertEqual((status.submitted, status.started),
+                         (status.submitted_ms // 1000, status.started_ms // 1000))
+        self.assertIsNone(status.ended_ms)
         self.assertEqual(api.JobStatus.from_json(status.to_json()), status)
         self.assertEqual(api.jobs_list(observe).jobs[0].id, run)
         with self.assertRaises(api.ApiError) as caught:
@@ -116,6 +122,8 @@ class AgainstTheNode(unittest.TestCase):
         self.assertIs(admin.jobs_cancel(run).state, api.JobState.RUNNING)
         ended = observe.jobs_get(run)
         self.assertEqual((ended.state, ended.exit_code), (api.JobState.CANCELLED, 130))
+        assert ended.ended_ms is not None
+        self.assertEqual(ended.ended, ended.ended_ms // 1000)
         with self.assertRaises(api.ApiError) as caught:
             api.jobs_cancel(admin, run)
         self.assertEqual(caught.exception.code, api.ErrorCode.CONFLICT)

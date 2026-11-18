@@ -242,6 +242,17 @@ def sse(text: str):
     return out
 
 
+def job_times(record):
+    """A job record's `submitted`, `started` and `ended` in Unix seconds, each to the millisecond
+    from its `_ms` field where the node gives one (item 2.4), else its whole seconds; None where it
+    has neither."""
+    times = {}
+    for name in ("submitted", "started", "ended"):
+        ms = record.get(f"{name}_ms")
+        times[name] = ms / 1e3 if ms is not None else record.get(name)
+    return times
+
+
 def first_rows_s(events):
     """When the first rows reached the sink, in seconds from the engine's start (report.py's
     rule: the sink's task starting, else the first heartbeat with rows out)."""

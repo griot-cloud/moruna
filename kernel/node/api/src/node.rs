@@ -10,8 +10,11 @@
 //! - **The node document** (2A): this crate's version, the node's cores, its memory, the job
 //!   bound `node-admission` answers (3A), the instance, the cloud, the CPU executor with a slot a
 //!   core, and health `ok`. `boot_ms` is set when the process answers `ready` ([`crate::run`]).
-//! - **The wall clock:** the hand-over's, carried forward by the core's monotonic time since
-//!   `platform` read it.
+//! - **The wall clock** (system design 3D): the node's one, the core's, read from the clock
+//!   page, which `platform` sets at boot and again every hour. It times everything: tokens, the
+//!   audit record, the node document's `time`, a job's times, and the node's own certificate.
+//!   While the page says it is unset, it is the hand-over's, carried forward by the core's
+//!   monotonic time since `platform` read it.
 
 use alloc::{string::String, vec, vec::Vec};
 
@@ -25,17 +28,18 @@ use crate::Error;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The API server's config, from the hand-over, for a node of `cores` CPUs whose jobs may have
-/// `job_memory_bytes` each (0 when it runs none), at `now` on the core's monotonic clock.
+/// `job_memory_bytes` each (0 when it runs none), at `wall_clock` in Unix seconds
+/// ([`NodeClock`]).
 pub fn config(
     handover: &Handover,
     cores: u32,
     job_memory_bytes: u64,
-    now: u64,
+    wall_clock: u64,
 ) -> Result<Config, Error> {
     let identity = match &handover.config.api.tls {
         Some(tls) => Identity::from_pem(&tls.certificate, &tls.key)
             .map_err(|error| Error::Identity(true, error))?,
-        None => Identity::generate(&handover.instance, handover.wall_clock_at(now))
+        None => Identity::generate(&handover.instance, wall_clock)
             .map_err(|error| Error::Identity(false, error))?,
     };
     Ok(Config {
@@ -76,29 +80,56 @@ pub fn facts(handover: &Handover, cores: u32, job_memory_bytes: u64) -> NodeFact
     }
 }
 
-/// The server's clock: the core's monotonic clock, and the hand-over's wall clock carried
-/// forward by it.
+/// The server's clock: the core's monotonic clock, and the node's one wall clock (system design
+/// 3D), the core's, read from its clock page; while the page says that is unset, the
+/// hand-over's wall clock carried forward by the monotonic clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeClock {
     /// The wall clock, in Unix seconds, when `platform` read it.
     wall_clock: u64,
     /// The core's monotonic clock, in nanoseconds, then.
     read_at_ns: u64,
+    /// The core's clock page (on the kernel; a host has none).
+    #[cfg(target_os = "none")]
+    page: moruna_svc::ClockPage,
 }
 
 impl NodeClock {
-    /// The clock the hand-over gives.
-    pub fn new(handover: &Handover) -> NodeClock {
-        NodeClock {
+    /// The clock the hand-over gives, with, on the kernel, the core's clock page, mapped now:
+    /// a page that does not map is the process's failure, as it is the network server's.
+    pub fn new(handover: &Handover) -> Result<NodeClock, Error> {
+        Ok(NodeClock {
             wall_clock: handover.wall_clock,
             read_at_ns: handover.read_at_ns,
+            #[cfg(target_os = "none")]
+            page: moruna_svc::ClockPage::map()
+                .map_err(|error| Error::Kernel("the clock page", error))?,
+        })
+    }
+
+    /// The wall clock, in Unix milliseconds, when the core's wall clock reads `realtime_ns`,
+    /// nanoseconds since 1970 (`None` while it is unset), and its monotonic clock `now`: the
+    /// core's, or while it is unset the hand-over's carried forward.
+    pub fn unix_ms_at(&self, realtime_ns: Option<u64>, now: u64) -> u64 {
+        match realtime_ns {
+            Some(realtime_ns) => realtime_ns / 1_000_000,
+            None => {
+                let since = now.saturating_sub(self.read_at_ns) / 1_000_000;
+                self.wall_clock.saturating_mul(1_000).saturating_add(since)
+            }
         }
     }
 
-    /// The wall clock, in Unix seconds, when the core's monotonic clock reads `now`.
-    pub fn unix_seconds_at(&self, now: u64) -> u64 {
-        let since = now.saturating_sub(self.read_at_ns) / 1_000_000_000;
-        self.wall_clock.saturating_add(since)
+    /// The core's wall clock now, in nanoseconds since 1970; `None` while it is unset.
+    #[cfg(target_os = "none")]
+    fn realtime(&self) -> Option<u64> {
+        self.page.realtime()
+    }
+
+    /// A host has no clock page: its wall clock is the hand-over's.
+    #[cfg(not(target_os = "none"))]
+    fn realtime(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -107,7 +138,7 @@ impl Clock for NodeClock {
         moruna_svc::now() / 1_000_000
     }
 
-    fn unix_seconds(&self) -> u64 {
-        self.unix_seconds_at(moruna_svc::now())
+    fn unix_ms(&self) -> u64 {
+        self.unix_ms_at(self.realtime(), moruna_svc::now())
     }
 }

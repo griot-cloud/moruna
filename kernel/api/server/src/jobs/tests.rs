@@ -7,7 +7,9 @@ use crate::fake::{Engine, RUN};
 use alloc::string::ToString;
 use serde_json::{Value, json};
 
-const NOW: u64 = 1_794_931_200;
+/// The wall clock when the tests' jobs are pumped, in Unix milliseconds: not on a whole
+/// second, so that a time kept in seconds would show.
+const NOW: u64 = 1_794_931_200_250;
 const V1: &str = r#"{"v1": {"moruna_spec": 1,
     "source": {"kind": "rows", "rows": 1000},
     "sink": {"kind": "count"}}}"#;
@@ -80,18 +82,20 @@ fn a_job_goes_from_spec_to_exit() {
     jobs.pump(&mut engine, &Registry::default(), NOW + 1);
     assert_eq!(body(&resolved(&mut jobs, ticket)), json!({ "id": RUN }));
     let status = jobs.status(RUN).unwrap();
+    // Submitted when the engine was started with it, to the millisecond, and in seconds too.
     assert_eq!(
         serde_json::to_value(&status).unwrap(),
-        json!({ "id": RUN, "state": "starting", "submitted": NOW })
+        json!({ "id": RUN, "state": "starting",
+                "submitted": 1_794_931_200, "submitted_ms": NOW })
     );
-    // The first heartbeat says it runs.
+    // The first heartbeat says it runs: 750 ms on, which is in the next whole second.
     engine.heartbeat(100);
     engine.log("source", "made 100 rows");
-    jobs.pump(&mut engine, &Registry::default(), NOW + 2);
+    jobs.pump(&mut engine, &Registry::default(), NOW + 750);
     let status = jobs.status(RUN).unwrap();
     assert_eq!(
-        (status.state, status.started),
-        (JobState::Running, Some(NOW + 2))
+        (status.state, status.started, status.started_ms),
+        (JobState::Running, Some(1_794_931_201), Some(NOW + 750))
     );
     let heartbeat = status.heartbeat.unwrap();
     assert_eq!(
@@ -102,12 +106,22 @@ fn a_job_goes_from_spec_to_exit() {
     assert_eq!(jobs.report(RUN).status, 409, "not before it has ended");
     engine.heartbeat(1000);
     engine.finish(r#"{"rows_out": 1000, "exit": {"code": 0}}"#, 0, None);
-    jobs.pump(&mut engine, &Registry::default(), NOW + 9);
+    jobs.pump(&mut engine, &Registry::default(), NOW + 9_749);
     assert!(!jobs.busy());
     let status = jobs.status(RUN).unwrap();
     assert_eq!(
-        (status.state, status.ended, status.exit_code),
-        (JobState::Completed, Some(NOW + 9), Some(0))
+        (
+            status.state,
+            status.ended,
+            status.ended_ms,
+            status.exit_code
+        ),
+        (
+            JobState::Completed,
+            Some(1_794_931_209),
+            Some(NOW + 9_749),
+            Some(0)
+        )
     );
     assert_eq!(status.heartbeat.unwrap().rows_out, 1000);
     // The report is the engine's, as it wrote it.
@@ -119,10 +133,55 @@ fn a_job_goes_from_spec_to_exit() {
     );
     assert_eq!(
         serde_json::to_value(jobs.list()).unwrap(),
-        json!({ "jobs": [{ "id": RUN, "state": "completed", "submitted": NOW,
-                           "started": NOW + 2, "ended": NOW + 9 }] })
+        json!({ "jobs": [{ "id": RUN, "state": "completed",
+                           "submitted": 1_794_931_200, "submitted_ms": NOW,
+                           "started": 1_794_931_201, "started_ms": NOW + 750,
+                           "ended": 1_794_931_209, "ended_ms": NOW + 9_749 }] })
     );
     assert_eq!(jobs.buffered().1, 2);
+}
+
+/// A job's three times are the wall clock's milliseconds at each of its moments, in order, and
+/// its seconds are those divided by 1,000, in the list and in its status alike (item 2.4).
+#[test]
+fn a_job_s_times_are_to_the_millisecond_and_its_seconds_are_them_divided() {
+    let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
+    let ticket = submit(&mut jobs, &mut engine, V1.as_bytes()).unwrap();
+    engine.attempt_started();
+    jobs.pump(&mut engine, &Registry::default(), NOW + 1);
+    resolved(&mut jobs, ticket);
+    // Start-up under a second, as most are: within the same second, then over one.
+    engine.heartbeat(10);
+    jobs.pump(&mut engine, &Registry::default(), NOW + 749);
+    engine.exit(0, None);
+    jobs.pump(&mut engine, &Registry::default(), NOW + 21_001);
+    let status = jobs.status(RUN).unwrap();
+    let summary = jobs.list().jobs.remove(0);
+    let ms = (status.submitted_ms, status.started_ms, status.ended_ms);
+    assert_eq!(ms, (NOW, Some(NOW + 749), Some(NOW + 21_001)));
+    assert_eq!(
+        ms,
+        (summary.submitted_ms, summary.started_ms, summary.ended_ms)
+    );
+    let (submitted, started, ended) = (ms.0, ms.1.unwrap(), ms.2.unwrap());
+    assert!(submitted <= started && started <= ended, "in order");
+    assert_eq!(started - submitted, 749, "start-up to the millisecond");
+    assert_eq!(ended - started, 20_252);
+    for record in [
+        (status.submitted, status.started, status.ended),
+        (summary.submitted, summary.started, summary.ended),
+    ] {
+        assert_eq!(
+            record,
+            (
+                submitted / 1_000,
+                Some(started / 1_000),
+                Some(ended / 1_000)
+            )
+        );
+    }
+    // Whole seconds cannot tell that start-up: both are the same second.
+    assert_eq!(status.submitted, status.started.unwrap());
 }
 
 #[test]
@@ -1018,7 +1077,12 @@ fn a_submit_is_checked_and_started_with_the_checks_budget_and_needs() {
     let image = b"\x7fELF taxi.clean";
     let address = "https://images.example.com/taxi.clean";
     let registration = crate::signer::registration("taxi.clean", address, image, &signer);
-    assert_eq!(registry.register(registration.as_bytes(), NOW).status, 201);
+    assert_eq!(
+        registry
+            .register(registration.as_bytes(), NOW / 1_000)
+            .status,
+        201
+    );
     engine.0.borrow_mut().hold_checks = true;
     let ticket = jobs.submit(V1.as_bytes()).unwrap();
     jobs.pump(&mut engine, &registry, NOW);

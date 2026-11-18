@@ -45,7 +45,7 @@ extern crate alloc;
 use alloc::{boxed::Box, format, rc::Rc, string::String, vec, vec::Vec};
 use core::{cell::RefCell, convert::Infallible, fmt};
 
-use moruna_api_server::{IdentityError, Server};
+use moruna_api_server::{Clock, IdentityError, Server};
 use moruna_node_config::{Handover, HandoverError, READY};
 use moruna_svc::{Account, CallError, Channel, DEADLINE_INFINITE, Handle, Signals, now, wait_one};
 use netstack_protocol::{Addr, Endpoint, Info, net};
@@ -275,13 +275,14 @@ pub fn run(
             .map_err(|error| Error::Admission("the function cache and the job bound", error))?,
         None => 0,
     };
-    let config = node::config(&handover, cores, bound, now())?;
+    // The node's one wall clock times everything, the node's own certificate first.
+    let clock = node::NodeClock::new(&handover)?;
+    let config = node::config(&handover, cores, bound, clock.unix_seconds())?;
     say(&format!(
         "moruna: tls sha256={}",
         config.identity.fingerprint()
     ));
     let host = jobs.map(|host| Rc::new(RefCell::new(host)));
-    let clock = node::NodeClock::new(&handover);
     let mut server = match &host {
         Some(host) => Server::with_engine(config, clock, Box::new(engine::Shared(host.clone()))),
         None => Server::new(config, clock),

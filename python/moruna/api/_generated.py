@@ -579,10 +579,16 @@ class JobStatus:
     """Where the job is in its life."""
 
     submitted: int
-    """When the node took the job, in Unix seconds."""
+    """When the node took the job, in Unix seconds: `submitted_ms` divided by 1,000."""
+
+    submitted_ms: int
+    """When the node took the job, in Unix milliseconds on the node's wall clock."""
 
     ended: int | None = None
-    """When it ended, in Unix seconds; absent until it has."""
+    """When it ended, in Unix seconds: `ended_ms` divided by 1,000; absent until it has."""
+
+    ended_ms: int | None = None
+    """When it ended, in Unix milliseconds on the node's wall clock; absent until it has."""
 
     exit_code: int | None = None
     """The engine's exit code; absent until the job has ended."""
@@ -591,7 +597,10 @@ class JobStatus:
     """The engine's latest heartbeat; absent until it has sent one."""
 
     started: int | None = None
-    """When it began to run, in Unix seconds; absent until it has."""
+    """When it began to run, in Unix seconds: `started_ms` divided by 1,000; absent until it has."""
+
+    started_ms: int | None = None
+    """When it began to run, in Unix milliseconds on the node's wall clock; absent until it has."""
 
     @classmethod
     def from_json(cls, value: Any, where: str = "JobStatus") -> JobStatus:
@@ -601,10 +610,13 @@ class JobStatus:
             id=_str(*_at(data, "id", where)),
             state=_enum(JobState, *_at(data, "state", where)),
             submitted=_int(*_at(data, "submitted", where), 0, None),
+            submitted_ms=_int(*_at(data, "submitted_ms", where), 0, None),
             ended=_maybe(data, "ended", where, lambda at: _int(*at, 0, None)),
+            ended_ms=_maybe(data, "ended_ms", where, lambda at: _int(*at, 0, None)),
             exit_code=_maybe(data, "exit_code", where, lambda at: _int(*at, None, None)),
             heartbeat=_maybe(data, "heartbeat", where, lambda at: Heartbeat.from_json(*at)),
             started=_maybe(data, "started", where, lambda at: _int(*at, 0, None)),
+            started_ms=_maybe(data, "started_ms", where, lambda at: _int(*at, 0, None)),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -613,15 +625,20 @@ class JobStatus:
             "id": self.id,
             "state": self.state.value,
             "submitted": self.submitted,
+            "submitted_ms": self.submitted_ms,
         }
         if self.ended is not None:
             data["ended"] = self.ended
+        if self.ended_ms is not None:
+            data["ended_ms"] = self.ended_ms
         if self.exit_code is not None:
             data["exit_code"] = self.exit_code
         if self.heartbeat is not None:
             data["heartbeat"] = self.heartbeat.to_json()
         if self.started is not None:
             data["started"] = self.started
+        if self.started_ms is not None:
+            data["started_ms"] = self.started_ms
         return data
 
 
@@ -636,13 +653,22 @@ class JobSummary:
     """Where the job is in its life."""
 
     submitted: int
-    """When the node took the job, in Unix seconds."""
+    """When the node took the job, in Unix seconds: `submitted_ms` divided by 1,000."""
+
+    submitted_ms: int
+    """When the node took the job, in Unix milliseconds on the node's wall clock."""
 
     ended: int | None = None
-    """When it ended, in Unix seconds; absent until it has."""
+    """When it ended, in Unix seconds: `ended_ms` divided by 1,000; absent until it has."""
+
+    ended_ms: int | None = None
+    """When it ended, in Unix milliseconds on the node's wall clock; absent until it has."""
 
     started: int | None = None
-    """When it began to run, in Unix seconds; absent until it has."""
+    """When it began to run, in Unix seconds: `started_ms` divided by 1,000; absent until it has."""
+
+    started_ms: int | None = None
+    """When it began to run, in Unix milliseconds on the node's wall clock; absent until it has."""
 
     @classmethod
     def from_json(cls, value: Any, where: str = "JobSummary") -> JobSummary:
@@ -652,8 +678,11 @@ class JobSummary:
             id=_str(*_at(data, "id", where)),
             state=_enum(JobState, *_at(data, "state", where)),
             submitted=_int(*_at(data, "submitted", where), 0, None),
+            submitted_ms=_int(*_at(data, "submitted_ms", where), 0, None),
             ended=_maybe(data, "ended", where, lambda at: _int(*at, 0, None)),
+            ended_ms=_maybe(data, "ended_ms", where, lambda at: _int(*at, 0, None)),
             started=_maybe(data, "started", where, lambda at: _int(*at, 0, None)),
+            started_ms=_maybe(data, "started_ms", where, lambda at: _int(*at, 0, None)),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -662,11 +691,16 @@ class JobSummary:
             "id": self.id,
             "state": self.state.value,
             "submitted": self.submitted,
+            "submitted_ms": self.submitted_ms,
         }
         if self.ended is not None:
             data["ended"] = self.ended
+        if self.ended_ms is not None:
+            data["ended_ms"] = self.ended_ms
         if self.started is not None:
             data["started"] = self.started
+        if self.started_ms is not None:
+            data["started_ms"] = self.started_ms
         return data
 
 

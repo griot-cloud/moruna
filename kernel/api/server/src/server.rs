@@ -242,9 +242,11 @@ impl<T: Transport, C: Clock> Server<T, C> {
     /// connection that is done, broken, idle, or past its handshake's limit.
     pub fn poll(&mut self) {
         let now_ms = self.clock.monotonic_ms();
-        let now = self.clock.unix_seconds();
+        // One reading of the wall clock: the jobs' times in milliseconds, all else in seconds.
+        let wall_ms = self.clock.unix_ms();
+        let now = wall_ms / 1_000;
         self.wall.set(now);
-        self.api.pump(now);
+        self.api.pump(wall_ms);
         let mut index = 0;
         while index < self.connections.len() {
             let keep = self.connections[index].drive(

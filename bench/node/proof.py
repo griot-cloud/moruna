@@ -425,8 +425,7 @@ def run_one(node, run, data, a, follow, log=print, sleep=time.sleep, clock=time.
         rec.update(ok=False, state="timed out", seconds=round(clock() - t0, 3), records=len(got.records))
         return rec
     status = node.job(jid)
-    rec.update(state=status.get("state"), exit=got.exit, times={k: status.get(k) for k in
-                                                               ("submitted", "started", "ended")},
+    rec.update(state=status.get("state"), exit=got.exit, times=node_api.job_times(status),
                seconds=round(clock() - t0, 3), records=len(got.records), resumed=got.resumed,
                first_rows_s=node_api.first_rows_s(got.events()))
     report = (got.report or {}).get("report") if got.report else None

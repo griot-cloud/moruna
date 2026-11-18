@@ -82,6 +82,30 @@ fn the_clock_moves_a_token_to_expiry() {
     unauthorized(&harness.get(client, "/v1/node", &header));
 }
 
+/// When `platform` sets the node's wall clock again (system design 3D), the next call is judged
+/// by it: each call is checked against the clock as it reads then, and nothing of a token is
+/// kept between calls, so a step moves a token's expiry by the step and no more.
+#[test]
+fn a_token_is_judged_by_the_wall_clock_as_it_reads_at_each_call() {
+    let mut harness = Harness::new();
+    let token = harness.signer.token(INSTANCE, WALL + 10, &["observe"]);
+    let header = Harness::bearer(&token);
+    harness.clock.advance(10_000);
+    // A refusal closes its connection: each call has its own.
+    let client = harness.connect();
+    unauthorized(&harness.get(client, "/v1/node", &header));
+    // Set 400 ms back: the token is in its last second again.
+    let wall = &harness.clock.unix_ms;
+    wall.set(wall.get() - 400);
+    let client = harness.connect();
+    assert_eq!(harness.get(client, "/v1/node", &header).status, 200);
+    // Set 400 ms on again: expired, as before the step.
+    let wall = &harness.clock.unix_ms;
+    wall.set(wall.get() + 400);
+    let client = harness.connect();
+    unauthorized(&harness.get(client, "/v1/node", &header));
+}
+
 #[test]
 fn observe_reads_node_but_not_audit_and_admin_reads_both() {
     let mut harness = Harness::new();

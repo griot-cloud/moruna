@@ -98,8 +98,13 @@ pub fn document() -> Node {
 
 /// The wall clock, in Unix seconds.
 pub fn now() -> u64 {
-    SystemTime::now()
+    now_ms() / 1_000
+}
+
+/// The wall clock, in Unix milliseconds: a job's times, as the node keeps them (item 2.4).
+pub fn now_ms() -> u64 {
+    let since = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("after 1970")
-        .as_secs()
+        .expect("after 1970");
+    u64::try_from(since.as_millis()).expect("a time in milliseconds fits")
 }

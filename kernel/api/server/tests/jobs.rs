@@ -96,7 +96,7 @@ fn a_job_is_validated_submitted_followed_and_reported() {
     let status = harness.get(client, &format!("/v1/jobs/{RUN}"), &observer);
     assert_eq!(
         status.json(),
-        json!({ "id": RUN, "state": "starting", "submitted": WALL })
+        json!({ "id": RUN, "state": "starting", "submitted": WALL, "submitted_ms": WALL * 1_000 })
     );
     // Follow it: what the buffer holds, then each thing as the engine says it.
     let stream = follow(&mut harness, "");
@@ -105,7 +105,7 @@ fn a_job_is_validated_submitted_followed_and_reported() {
     assert_eq!((first[0].0, first[0].1.as_str()), (Some(1), "event"));
     assert_eq!(first[0].2["kind"], "attempt_started");
     assert_eq!(first[0].2["type"], "event");
-    harness.clock.advance(2_000);
+    harness.clock.advance(1_987);
     harness.engine.heartbeat(500);
     harness.engine.log("source", "made 500 rows");
     harness.settle();
@@ -121,9 +121,14 @@ fn a_job_is_validated_submitted_followed_and_reported() {
     let status = harness
         .get(client, &format!("/v1/jobs/{RUN}"), &observer)
         .json();
+    // 1,987 ms on: the millisecond, and its whole second, 1.
     assert_eq!(
-        (&status["state"], &status["started"]),
-        (&json!("running"), &json!(WALL + 2))
+        (&status["state"], &status["started"], &status["started_ms"]),
+        (
+            &json!("running"),
+            &json!(WALL + 1),
+            &json!(WALL * 1_000 + 1_987)
+        )
     );
     assert_eq!(status["heartbeat"]["rows_out"], 500);
     let report = harness.get(client, &format!("/v1/jobs/{RUN}/report"), &observer);
@@ -153,8 +158,18 @@ fn a_job_is_validated_submitted_followed_and_reported() {
         .get(client, &format!("/v1/jobs/{RUN}"), &observer)
         .json();
     assert_eq!(
-        (&status["state"], &status["ended"], &status["exit_code"]),
-        (&json!("completed"), &json!(WALL + 5), &json!(0))
+        (
+            &status["state"],
+            &status["ended"],
+            &status["ended_ms"],
+            &status["exit_code"]
+        ),
+        (
+            &json!("completed"),
+            &json!(WALL + 4),
+            &json!(WALL * 1_000 + 4_987),
+            &json!(0)
+        )
     );
     let report = harness.get(client, &format!("/v1/jobs/{RUN}/report"), &observer);
     assert_eq!(report.status, 200);
@@ -165,8 +180,10 @@ fn a_job_is_validated_submitted_followed_and_reported() {
     let list = harness.get(client, "/v1/jobs", &observer).json();
     assert_eq!(
         list,
-        json!({ "jobs": [{ "id": RUN, "state": "completed", "submitted": WALL,
-                           "started": WALL + 2, "ended": WALL + 5 }] })
+        json!({ "jobs": [{ "id": RUN, "state": "completed",
+                           "submitted": WALL, "submitted_ms": WALL * 1_000,
+                           "started": WALL + 1, "started_ms": WALL * 1_000 + 1_987,
+                           "ended": WALL + 4, "ended_ms": WALL * 1_000 + 4_987 }] })
     );
     // Every call left its record, with the status it was answered with.
     let admin = harness.token(&["admin"]);

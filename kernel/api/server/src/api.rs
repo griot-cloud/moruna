@@ -426,10 +426,12 @@ impl Api {
         Outcome::Answer(answer)
     }
 
-    /// Moves the jobs as far as they go now: the engine's messages and the checks. An answer
-    /// that has come is recorded, and kept for the call that waits for it.
-    pub(crate) fn pump(&mut self, now: u64) {
-        self.jobs.pump(self.host.as_mut(), &self.functions, now);
+    /// Moves the jobs as far as they go at `wall_ms`, the wall clock in Unix milliseconds: the
+    /// engine's messages and the checks. An answer that has come is recorded, at that time in
+    /// seconds, and kept for the call that waits for it.
+    pub(crate) fn pump(&mut self, wall_ms: u64) {
+        let now = wall_ms / 1_000;
+        self.jobs.pump(self.host.as_mut(), &self.functions, wall_ms);
         for (ticket, answer) in self.jobs.resolved() {
             let Some(pending) = self.pending.remove(&ticket) else {
                 continue;

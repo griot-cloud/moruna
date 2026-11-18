@@ -31,7 +31,15 @@ pub trait Clock {
     /// A monotonic clock, in milliseconds from any fixed start. It times the idle limit.
     fn monotonic_ms(&self) -> u64;
 
-    /// The wall clock, in Unix seconds: the node document's `time`, a token's expiry and the
-    /// audit record's time.
-    fn unix_seconds(&self) -> u64;
+    /// The node's one wall clock, in Unix milliseconds (system design 3D). The server reads it
+    /// once a poll: a job's times are that reading, and all else the poll does is it in
+    /// seconds.
+    fn unix_ms(&self) -> u64;
+
+    /// The wall clock, in Unix seconds: [`Clock::unix_ms`] divided by 1,000. The node
+    /// document's `time`, a token's expiry, the audit record's time, and a job's times in
+    /// seconds.
+    fn unix_seconds(&self) -> u64 {
+        self.unix_ms() / 1_000
+    }
 }
