@@ -10,13 +10,15 @@
 //! to find a disk whatever drives it (`architecture/moruna-os-system.md`, section 3C).
 //! From minor 2 such a driver registers a network card the same way, by name (`netvsc`'s
 //! `net0`), so the network server finds Azure's card as it finds a virtio-net one (1C).
-//! A lookup of a name nothing has yet waits while a driver linked to a `register*` listener
-//! has not finished registering, which it says by closing its connection: so a client that
-//! starts before that driver, as the network server starts before `netvsc`, finds what it
-//! registers.
 //! The device manager's own block drivers (virtio-blk) register their disks the same way,
-//! through a `register` listener it gives each, and `blocks` lists every disk registered
-//! (minor 3), which is what a node grants a job's volumes from (item 3.3).
+//! through a `register` listener it gives each on a node, and `blocks` lists every disk
+//! registered (minor 3), which is what a node grants a job's volumes from (item 3.3).
+//! A lookup of a name nothing has yet waits while a driver given a `register*` listener,
+//! whoever started it, has not finished registering, which it says by closing its connection
+//! (or by letting the listener go, or ending, without having connected): so a client that
+//! starts before that driver, as the network server starts before `netvsc` and the image
+//! filesystem before the boot disk's virtio-blk registers `system` (item 1.6d), finds what it
+//! registers.
 //! `moruna.devices.control`
 //! is for the processes the boot description links to it, and no other: it restarts a
 //! driver, and hands out the resources a driver of a device holds (without its DMA
@@ -52,7 +54,9 @@ pub fn hand_over_names(bars: &[usize]) -> String {
 
 /// The prefix of the device manager's listener slots whose connections may `register` a
 /// block device and do nothing else: the boot description links one to each driver the
-/// node's supervisor starts (`register-storvsc`), and to nothing else. Connections through
+/// node's supervisor starts (`register-storvsc`), and to nothing else; on a node the device
+/// manager gives each block driver it starts one of its own, in the driver's start slot of
+/// this name. Connections through
 /// a `directory*` slot may look up and list, and not register.
 pub const REGISTER_SLOTS: &str = "register";
 

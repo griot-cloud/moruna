@@ -6,34 +6,43 @@
 //!
 //! What a connection may ask depends on the listener it came through ([`Access`]): a
 //! `directory*` listener's may look up and list, and a `register*` listener's may register a
-//! device and nothing else. The boot description links a `register*` listener only to a
-//! driver the supervisor starts (`storvsc`, item 1.10b; `netvsc`, item 1.11b), so no client
-//! can put a name in the directory, and that driver can learn nothing from it.
+//! device and nothing else. Only drivers are given a `register*` slot: the boot description
+//! links one to each driver the supervisor starts (`storvsc`, item 1.10b; `netvsc`, item
+//! 1.11b), and on a node the device manager gives one to each block driver it starts
+//! (virtio-blk, item 3.3). So no client can put a name in the directory, and a driver can
+//! learn nothing from it.
 //!
 //! Such a driver starts beside the directory's clients: the network server looks `net0` up as
-//! soon as it starts, and `netvsc` registers it only once Azure's card is up. A `register*`
-//! slot the device manager holds means its driver is on this machine (the supervisor links
-//! it only there: off Hyper-V the link goes with the driver). So a lookup of a name nothing
-//! has waits while any held slot's driver has not finished registering ([`Registry::expect`]),
-//! whether or not it has connected yet; a driver finishes by closing its connection through
-//! the slot ([`Registry::finished`]). The lookup is answered when the name is registered, or
-//! with `NotFound` once every held slot's driver has finished. A slot that is not held holds
-//! nothing, and a name a driver of the device manager publishes (`net0` of virtio-net) is
-//! answered at once whatever waits. The wait cannot hang the node: a driver that ends stops
-//! it, and one that hangs runs into `platform`'s instance-data deadline, which names it.
+//! soon as it starts, and `netvsc` registers it only once Azure's card is up; the image
+//! filesystem looks `system` up as soon as it starts, and the boot disk's virtio-blk
+//! registers it only once the disk is up (on Servercore's KVM the lookup came first, item
+//! 1.6d). So every `register*` slot handed out, by the supervisor or by the device manager,
+//! is held from then until its driver has finished registering ([`Held`]): a lookup of a
+//! name nothing has waits while any held slot's driver has not finished
+//! ([`Registry::expect`]), whether or not it has connected yet. A driver finishes by closing
+//! its connection through the slot ([`Registry::finished`]), or by letting the slot go, or
+//! ending, without having connected through it (a virtio-blk disk with nothing to register).
+//! The lookup is answered when the name is registered, or with `NotFound` once every held
+//! slot's driver has finished. A slot not handed out holds nothing (the supervisor links
+//! storvsc's and netvsc's only on Hyper-V: elsewhere the link goes with the driver), and a
+//! name a driver of the device manager publishes (`net0` of virtio-net) is answered at once
+//! whatever waits. The wait cannot hang the node: a driver that ends finishes its slot (the
+//! device manager gives a driver it starts again a new one), and one that hangs runs into
+//! the boot's deadlines: the client's own call (imagefs's and the network server's lookups
+//! wait 300 s) and `platform`'s instance-data deadline, which names it.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
-use alloc::{rc::Rc, string::String, vec::Vec};
+use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
 use core::cell::RefCell;
 
 use devices_protocol::{Block, Entry, REGISTER_SLOTS, directory, valid_name};
 use moruna_svc::{
-    Channel, Context, Decoder, Handler, Outcome, Pending, ProtocolError, ProtocolId, Signals,
-    Status, Wire, connect, wait_one,
+    Channel, Context, Decoder, Factory, Handler, Outcome, Pending, ProtocolError, ProtocolId,
+    Signals, Status, Wire, connect, wait_one,
 };
 
 /// What a connection to the directory may ask, by the listener it came through.
@@ -220,7 +229,7 @@ impl Registry {
             .map(|registered| registered.name.as_str())
     }
 
-    /// A `register*` slot the device manager holds: its driver is on this machine, and
+    /// A `register*` slot handed to a driver ([`Held`]): its driver is on this machine, and
     /// lookups of a name nothing has wait until it has [`finished`](Registry::finished),
     /// whether or not it has connected yet. The slot's number, for that.
     pub fn expect(&mut self) -> usize {
@@ -257,6 +266,60 @@ impl Registry {
     /// The answers of lookups that waited and now have one, to send.
     pub fn take_ready(&mut self) -> Vec<(Pending, Outcome)> {
         core::mem::take(&mut self.ready)
+    }
+}
+
+/// A `register*` slot handed to a driver, by the supervisor (a `register*` slot of the device
+/// manager's start page, linked to a driver it starts) or by the device manager (the
+/// `register` slot it gives each block driver it starts): held from the moment it is handed
+/// out until its driver has finished registering, so that a lookup of a name nothing has
+/// waits for it ([`Registry::expect`]). One mechanism, whoever started the driver (item 1.6d).
+pub struct Held {
+    registry: Rc<RefCell<Registry>>,
+    /// The slot's number, as [`Registry::expect`] gave it.
+    number: usize,
+    /// Whether a connection has come through the slot: its close finishes the slot then.
+    connected: bool,
+}
+
+impl Held {
+    /// Hands a slot out: from now on a lookup of a name nothing has waits for its driver.
+    pub fn new(registry: &Rc<RefCell<Registry>>) -> Held {
+        let number = registry.borrow_mut().expect();
+        Held {
+            registry: registry.clone(),
+            number,
+            connected: false,
+        }
+    }
+
+    /// The factory of the slot's listener: each connection through it is a registrar
+    /// ([`Access::Register`]) served from `drivers`, whose close says the driver has
+    /// finished ([`Directory::through`]). Should the listener go with no connection having
+    /// come through it, its driver having let the slot go or ended first, the slot's driver
+    /// has finished then.
+    pub fn factory<D, F>(mut self, mut drivers: F) -> Factory
+    where
+        D: Drivers + 'static,
+        F: FnMut() -> D + 'static,
+    {
+        Box::new(move || {
+            self.connected = true;
+            let directory = Directory::new(drivers(), self.registry.clone(), Access::Register);
+            Box::new(directory.through(self.number)) as Box<dyn Handler>
+        })
+    }
+}
+
+impl Drop for Held {
+    /// A slot that goes with no connection come through it: its driver has finished, having
+    /// registered nothing.
+    fn drop(&mut self) {
+        if !self.connected
+            && let Ok(mut registry) = self.registry.try_borrow_mut()
+        {
+            registry.finished(self.number);
+        }
     }
 }
 

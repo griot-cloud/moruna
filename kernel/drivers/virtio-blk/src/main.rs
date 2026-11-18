@@ -87,6 +87,10 @@ const SECTOR: u64 = 512;
 const START_NS: u64 = 30_000_000_000;
 /// How long the device manager's directory has to take the disk's registration.
 const REGISTER_NS: u64 = 60_000_000_000;
+/// Work item 1.6d, a diagnosis build only (`register-late`): how long the driver waits, once
+/// its device is up, before it registers its disks.
+#[cfg(feature = "register-late")]
+const REGISTER_LATE_NS: u64 = 10_000_000_000;
 
 enum Op {
     Read,
@@ -1071,6 +1075,26 @@ fn register(
     Ok(served)
 }
 
+/// Work item 1.6d, a diagnosis build only: waits [`REGISTER_LATE_NS`] before the driver
+/// registers its disks, so that a client's lookup of one (imagefs's of `system`) comes
+/// before it, the order Servercore's KVM gave in run 8.
+#[cfg(feature = "register-late")]
+fn register_late(out: &Console, name: &str) {
+    println!(
+        out,
+        "KB3 {}: registers its disks in {} s (register-late, a diagnosis build)",
+        name,
+        REGISTER_LATE_NS / 1_000_000_000
+    );
+    let waited = moruna_svc::Timer::create().and_then(|timer| {
+        timer.set(deadline_in(REGISTER_LATE_NS))?;
+        wait_one(&timer.0, Signals::SIGNALED, DEADLINE_INFINITE)
+    });
+    if let Err(e) = waited {
+        println!(out, "KB3 {}: register-late: waiting: {}", name, e.name());
+    }
+}
+
 /// The GUID of the node's image's disk, from the boot payload's `disk.guid`, which the device
 /// manager passes on when the boot gave it one.
 fn image_guid() -> Result<Option<Guid>, String> {
@@ -1191,6 +1215,8 @@ fn run() -> i64 {
         boot,
         system
     );
+    #[cfg(feature = "register-late")]
+    register_late(&out, name);
     if let Some(slot) = start::take(devices_protocol::REGISTER_SLOTS)
         && !disks.is_empty()
     {

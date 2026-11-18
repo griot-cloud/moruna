@@ -13,8 +13,11 @@
 //!    publishes the listener as `SERVICEn` in the directory. When the boot gave it the
 //!    GUID of the node's image's disk (`disk.guid`, item 3.3), each driver is given it
 //!    too, read only, to tell the disk the node booted from. On a node (it serves until
-//!    stopped), each block driver is also given a `register` listener of the directory,
-//!    through which it registers its disk by serial as `storvsc` does (system design 3C).
+//!    stopped), each block driver is also given a `register` slot of its own, a listener
+//!    of the directory through which it registers its disks as `storvsc` does (system
+//!    design 3C). The slot is held from the moment the driver is started with it until the
+//!    driver has finished registering (the library's `Held`, item 1.6d), as each
+//!    `register*` slot the supervisor links is; a driver started again is given a new one.
 //! 4. It serves the directory on every `directory*` slot, registration on every
 //!    `register*` slot (the library's `Directory`; a lookup of a name nothing has waits
 //!    while a held `register*` slot's driver has not finished registering), and control
@@ -44,7 +47,7 @@ use alloc::{
 use core::cell::RefCell;
 
 use devices_protocol::{Entry, HAND_OVER_SLOT, Windows, control, directory, hand_over_names};
-use moruna_devices::{Access, Directory, Drivers, Registry};
+use moruna_devices::{Access, Directory, Drivers, Held, Registry};
 use moruna_driver_table::Table;
 use moruna_mmio::Sub;
 use moruna_pci::{Address, Bar, CONFIG_SIZE, Config, DEVICES, FUNCTIONS};
@@ -116,8 +119,13 @@ struct State {
     images: Vec<(String, Handle)>,
     /// The boot payload's `disk.guid`, which every driver is given.
     guid: Option<Handle>,
-    /// On a node, the directory's `register` listener, which every block driver is given.
-    register: Option<Channel>,
+    /// The directory's registry, which holds each `register` slot a block driver is given.
+    registry: Rc<RefCell<Registry>>,
+    /// Whether each block driver is given a `register` slot: on a node.
+    registers: bool,
+    /// The `register` slots handed to block drivers started since the loop last listened:
+    /// the device manager's end of each, and its hold.
+    registrars: Vec<(Channel, Held)>,
     devices: Vec<Device>,
     shutting: bool,
     restarted: u32,
@@ -168,14 +176,14 @@ impl State {
                 .map_err(|e| format!("duplicating disk.guid: {}", e.name()))?;
             handles.push((Some(guid), "disk.guid"));
         }
-        if let Some(register) = &self.register
-            && d.name.starts_with(BLOCK_SERVICE)
-        {
-            let register = register
-                .0
-                .duplicate(Rights::WRITE | Rights::TRANSFER)
-                .map_err(|e| format!("duplicating the register listener: {}", e.name()))?;
-            handles.push((Some(register), devices_protocol::REGISTER_SLOTS));
+        // A block driver's own `register` slot, held from now until it has finished
+        // registering (item 1.6d). Should it not start, the hold goes and is finished.
+        let mut registrar = None;
+        if self.registers && d.name.starts_with(BLOCK_SERVICE) {
+            let (ours, theirs) =
+                Channel::create().map_err(|e| format!("channel_create: {}", e.name()))?;
+            handles.push((Some(theirs.0), devices_protocol::REGISTER_SLOTS));
+            registrar = Some((ours, Held::new(&self.registry)));
         }
         let escrow = self
             .guardian
@@ -191,6 +199,7 @@ impl State {
             .0
             .duplicate(Rights::READ | Rights::WAIT)
             .map_err(|e| format!("duplicating the process: {}", e.name()))?;
+        self.registrars.extend(registrar);
         let d = &mut self.devices[index];
         d.process = Some(process);
         d.listener = Some(ours);
@@ -281,6 +290,23 @@ fn answer_waiting(dispatcher: &mut Dispatcher, registry: &RefCell<Registry>) {
     for (pending, outcome) in ready {
         let _ = dispatcher.complete(pending, outcome);
     }
+}
+
+/// Listens on the `register` slots handed to the block drivers started since the last time
+/// (`State::start`, which a driver's watch calls to start it again), each served as its
+/// [`Held`] says.
+fn listen_registrars(
+    dispatcher: &mut Dispatcher,
+    state: &Rc<RefCell<State>>,
+) -> Result<(), String> {
+    let registrars = core::mem::take(&mut state.borrow_mut().registrars);
+    for (listener, held) in registrars {
+        let s = state.clone();
+        dispatcher
+            .listen(listener, held.factory(move || Published(s.clone())))
+            .map_err(|e| format!("listening for registrations: {}", e.name()))?;
+    }
+    Ok(())
 }
 
 /// The services the device manager's drivers publish, for the directory. A lookup for a
@@ -716,39 +742,24 @@ fn serve(out: &Console) -> Result<String, String> {
             .duplicate(Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER)
             .map_err(|e| format!("duplicating the console: {}", e.name()))?,
     );
+    let registry = Rc::new(RefCell::new(Registry::new()));
+    // On a node, which serves until it is stopped, the block drivers register their disks
+    // through a `register` slot each, as a driver the supervisor starts does through its link
+    // (system design 3C, item 3.3).
     let state = Rc::new(RefCell::new(State {
         out: console,
         roots,
         images,
         guid: start::take("disk.guid"),
-        register: None,
+        registry: registry.clone(),
+        registers: until_stopped,
+        registrars: Vec::new(),
         devices,
         shutting: false,
         restarted: 0,
         guardian: moruna_node::Guardian::new(supervisor),
     }));
     let mut dispatcher = Dispatcher::new();
-    let registry = Rc::new(RefCell::new(Registry::new()));
-    if until_stopped {
-        // On a node, which serves until it is stopped, the block drivers register their disks
-        // through a listener of the directory's own, as a driver the supervisor starts does
-        // through its link (system design 3C, item 3.3).
-        let (register, served) =
-            Channel::create().map_err(|e| format!("channel_create: {}", e.name()))?;
-        let s = state.clone();
-        let registered = registry.clone();
-        let factory: moruna_svc::Factory = Box::new(move || {
-            Box::new(Directory::new(
-                Published(s.clone()),
-                registered.clone(),
-                Access::Register,
-            )) as Box<dyn Handler>
-        });
-        dispatcher
-            .listen(served, factory)
-            .map_err(|e| format!("listening for registrations: {}", e.name()))?;
-        state.borrow_mut().register = Some(register);
-    }
     let count = state.borrow().devices.len();
     let mut started = Vec::new();
     let mut handed = Vec::new();
@@ -775,6 +786,7 @@ fn serve(out: &Console) -> Result<String, String> {
             }))
             .map_err(|e| format!("watching {}: {}", d.name, e.name()))?;
     }
+    listen_registrars(&mut dispatcher, &state)?;
     println!(
         out,
         "KB3 devices: started {} drivers: {}; no driver for {}",
@@ -801,17 +813,21 @@ fn serve(out: &Console) -> Result<String, String> {
         };
         let factory: moruna_svc::Factory = if let Some(access) = Access::of(slot) {
             let s = state.clone();
-            let registry = registry.clone();
-            // A held register slot: its driver is on this machine, and lookups of a name
-            // nothing has wait until it has finished, connected or not.
-            let held = (access == Access::Register).then(|| registry.borrow_mut().expect());
-            Box::new(move || {
-                let directory = Directory::new(Published(s.clone()), registry.clone(), access);
-                Box::new(match held {
-                    Some(number) => directory.through(number),
-                    None => directory,
-                }) as Box<dyn Handler>
-            })
+            match access {
+                // A register slot the supervisor linked to a driver it starts: its driver is
+                // on this machine, and the slot is held as a block driver's is.
+                Access::Register => Held::new(&registry).factory(move || Published(s.clone())),
+                Access::Lookup => {
+                    let registry = registry.clone();
+                    Box::new(move || {
+                        Box::new(Directory::new(
+                            Published(s.clone()),
+                            registry.clone(),
+                            Access::Lookup,
+                        )) as Box<dyn Handler>
+                    })
+                }
+            }
         } else if slot.starts_with("control") {
             let s = state.clone();
             let supervisor = slot == HAND_OVER_SLOT;
@@ -842,6 +858,7 @@ fn serve(out: &Console) -> Result<String, String> {
             dispatcher
                 .turn(DEADLINE_INFINITE)
                 .map_err(|e| format!("wait: {}", e.name()))?;
+            listen_registrars(&mut dispatcher, &state)?;
             answer_waiting(&mut dispatcher, &registry);
         }
     }
@@ -849,6 +866,7 @@ fn serve(out: &Console) -> Result<String, String> {
         dispatcher
             .turn(DEADLINE_INFINITE)
             .map_err(|e| format!("wait: {}", e.name()))?;
+        listen_registrars(&mut dispatcher, &state)?;
         answer_waiting(&mut dispatcher, &registry);
     }
     // Every client has gone: the drivers' listeners close, and each driver ends when
