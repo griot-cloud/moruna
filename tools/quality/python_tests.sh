@@ -14,7 +14,10 @@ trap 'rm -rf "$work"' EXIT
 # project into .venv, a whole release build thrown away before maturin builds the wheel again.
 uv tool run --from "maturin>=1.15,<2.0" maturin build --release -i "$MORUNA_PYTHON" --out "$work/dist" >/dev/null
 uv venv --python "$MORUNA_PYTHON" "$work/venv" >/dev/null
-uv pip install --python "$work/venv" --quiet "$work"/dist/*.whl pyarrow pytest numpy pyyaml pip uv
+# `cryptography` as CI installs it: the registration tests sign with it and skip without it, and
+# a file whose every test skips collects nothing, which pytest exits 5 for (2026-11-18: the gate
+# failed test_register.py and test_register_job.py for that, never for what they test).
+uv pip install --python "$work/venv" --quiet "$work"/dist/*.whl pyarrow pytest numpy pyyaml pip uv cryptography
 # Run from a copy of the tests so no stale extension module in python/ is importable.
 cp -R python/tests "$work/tests"
 # One process per test file: a run's budget counts what its process already holds, and the
