@@ -58,6 +58,21 @@ use moruna_vmbus::{ChannelError, MemoryId};
 
 pub use device::{Event, Netvsc};
 
+/// The NDIS version stated to the host, 6.30: what Linux's hv_netvsc states from NVSP 5
+/// (`ndis_version = 0x0006001e`) and netvsp's test guest states
+/// (`send_ndis_version_message`). netvsp reads it only to list the OIDs it supports.
+pub const NDIS_VERSION: (u32, u32) = (6, 30);
+
+/// An NVSP version, as the console says it: `0x60001` is 6.1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Nvsp(pub u32);
+
+impl fmt::Display for Nvsp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.0 >> 16, self.0 & 0xffff)
+    }
+}
+
 /// Bytes of an Ethernet header: destination, source, EtherType.
 pub const ETHERNET_HEADER: usize = 14;
 /// Bytes of a page, the unit memory is shared with the host in.
@@ -112,6 +127,9 @@ pub enum NetvscError {
         step: &'static str,
         /// The NVSP or RNDIS status the host gave.
         status: u32,
+        /// The NVSP version in use, once negotiated: the refusal says it, and the NDIS
+        /// version stated ([`NDIS_VERSION`]).
+        nvsp: Option<u32>,
     },
     /// The host sent what no well-behaved host does. What it sent is dropped.
     Malformed(String),
@@ -138,8 +156,18 @@ impl fmt::Display for NetvscError {
             NetvscError::Buffer(what) => write!(f, "{what}"),
             NetvscError::Timeout(step) => write!(f, "the host did not answer {step} in time"),
             NetvscError::Version => f.write_str("the host accepts no NVSP version from 5 up"),
-            NetvscError::Refused { step, status } => {
-                write!(f, "the host refused {step} with status {status:#010x}")
+            NetvscError::Refused { step, status, nvsp } => {
+                write!(f, "the host refused {step} with status {status:#010x}")?;
+                match nvsp {
+                    Some(version) => write!(
+                        f,
+                        " (NVSP {}, NDIS {}.{})",
+                        Nvsp(*version),
+                        NDIS_VERSION.0,
+                        NDIS_VERSION.1
+                    ),
+                    None => Ok(()),
+                }
             }
             NetvscError::Malformed(what) => write!(f, "the host sent {what}"),
             NetvscError::NotSent(status) => {
