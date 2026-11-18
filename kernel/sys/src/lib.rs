@@ -479,6 +479,13 @@ pub struct Usage {
     pub peak: u64,
     /// Held for the accounts carved out of it: the sum of their limits.
     pub reserved: u64,
+    /// The charges it refused since it was made (ABI 2.10): an object refused with
+    /// `QuotaExceeded`, or a page its process touched and could not pay for, which ended
+    /// the process. Its own: what an account carved out of it refused is counted there.
+    /// Zero from a kernel before 2.10.
+    pub refused: u64,
+    /// The largest request among them, in bytes (ABI 2.10).
+    pub refused_max: u64,
     name: [u8; limits::NAME_MAX],
 }
 
@@ -495,6 +502,8 @@ impl Usage {
             used: word(info::USED),
             peak: word(info::PEAK),
             reserved: word(info::RESERVED),
+            refused: word(info::REFUSED),
+            refused_max: word(info::REFUSED_MAX),
             name,
         })
     }

@@ -47,7 +47,10 @@ pub mod manifest;
 /// [`forward::fast::MREMAP`] ([`forward::remap`]) and [`forward::fast::SET_ROBUST_LIST`]
 /// ([`forward::robust`]). ABI 2.10 (`architecture/moruna-os-system.md`, sections 3A and 6B;
 /// item 6.3i) adds `account_cpu`: the CPU time charged to an account, beside the memory
-/// `account_info` gives, so that a node says what a job's processes cost.
+/// `account_info` gives, so that a node says what a job's processes cost; and the charges an
+/// account refused, their count and the largest, which `account_info` writes after its 64
+/// bytes for a caller that asks for [`account_info::SIZE`] (a third argument, the size of
+/// the caller's buffer, whose zero is the call ABI 2.3 made).
 pub const ABI_MAJOR: u16 = 2;
 /// See [`ABI_MAJOR`].
 pub const ABI_MINOR: u16 = 10;
@@ -173,8 +176,13 @@ pub mod nr {
     /// the limit, whole pages, is held from the parent until the new account is gone.
     pub const ACCOUNT_CREATE: u64 = BASE + 50;
     /// Added in ABI 2.3: an account's limit, use, peak, what it holds for the accounts
-    /// carved from it, and its name ([`crate::account_info`]): `(account, out)`, the
-    /// account the caller's own (zero), an account or a process's.
+    /// carved from it, and its name ([`crate::account_info`]): `(account, out, size)`, the
+    /// account the caller's own (zero), an account or a process's. ABI 2.10 added `size`,
+    /// what the caller's buffer holds ([`crate::account_info::written`]):
+    /// [`crate::account_info::SIZE`] has the charges the account refused written after
+    /// the rest; zero, the call ABI 2.3 made, and [`crate::account_info::SIZE_2_3`] write
+    /// the 64 bytes of ABI 2.3 and no more; any other size is `InvalidArgs` with nothing
+    /// written, so a layout this kernel does not know is never misread.
     pub const ACCOUNT_INFO: u64 = BASE + 51;
     /// ABI 2.5: exact capability/charged-origin identity, with READ on both:
     /// `(account, object)`, object only Account or Memory. Returns 0 or 1; no
@@ -860,7 +868,10 @@ pub mod resource_info {
     pub const LEN: usize = 16;
 }
 
-/// The 64 bytes `account_info` writes (ABI 2.3), little endian.
+/// The bytes `account_info` writes, little endian: 64 (ABI 2.3) and, for a caller whose
+/// third argument is [`account_info::SIZE`], the 16 after them (ABI 2.10). The kernel
+/// writes exactly what [`account_info::written`] says for the size it is given, never past
+/// the buffer of a caller built before 2.10.
 ///
 /// ```text
 /// offset 0   u64 the limit, bytes
@@ -868,16 +879,44 @@ pub mod resource_info {
 /// offset 16  u64 the most that was ever charged to it at once, bytes
 /// offset 24  u64 what it holds for the accounts carved from it: their limits, bytes
 /// offset 32  [u8; 32] its name, zero padded
+/// offset 64  u64 the charges it refused since it was made, a count (ABI 2.10)
+/// offset 72  u64 the largest request among them, bytes (ABI 2.10)
 /// ```
 ///
-/// Room left in it is `limit - used - reserved`.
+/// Room left in it is `limit - used - reserved`. The refusals are the account's own: a
+/// charge an account carved from it refuses is counted there, and a carve that does not fit
+/// is no charge. A process that passed its room (an object refused with `QuotaExceeded`, or
+/// a page fault its account could not pay for, which ends it) has an account that counts
+/// one; one that ended for another reason does not.
 pub mod account_info {
-    pub const SIZE: usize = 64;
+    /// What a caller that asks for the refusals is written (ABI 2.10): its third argument.
+    pub const SIZE: usize = 80;
+    /// What every other caller is written: the layout of ABI 2.3, the first bytes of
+    /// [`SIZE`]'s.
+    pub const SIZE_2_3: usize = 64;
     pub const LIMIT: usize = 0;
     pub const USED: usize = 8;
     pub const PEAK: usize = 16;
     pub const RESERVED: usize = 24;
     pub const NAME: usize = 32;
+    pub const REFUSED: usize = 64;
+    pub const REFUSED_MAX: usize = 72;
+
+    /// The bytes `account_info` writes for a caller whose third argument is `size`, what
+    /// its buffer holds: zero (the call ABI 2.3 made, which had no such argument) and
+    /// [`SIZE_2_3`] are the 64 bytes of ABI 2.3, [`SIZE`] those and the refusals. `None`
+    /// for any other size: the call is `InvalidArgs` and writes nothing, so neither a
+    /// layout a later ABI adds nor a register a caller never set is answered with bytes
+    /// it would misread.
+    pub const fn written(size: u64) -> Option<usize> {
+        if size == 0 || size == SIZE_2_3 as u64 {
+            Some(SIZE_2_3)
+        } else if size == SIZE as u64 {
+            Some(SIZE)
+        } else {
+            None
+        }
+    }
 }
 
 /// What the kernel charges an account (ABI 2.3, SDD 20 f.18), in bytes. Every page a
@@ -2003,8 +2042,45 @@ mod tests {
 
     #[test]
     fn kb5_t1_account_layout_and_charges() {
-        assert_eq!(account_info::SIZE, account_info::NAME + limits::NAME_MAX);
+        assert_eq!(
+            account_info::SIZE_2_3,
+            account_info::NAME + limits::NAME_MAX
+        );
         assert_eq!(account_info::RESERVED, account_info::PEAK + 8);
+        // ABI 2.10's two words follow the 64 bytes of 2.3, which stay as they were.
+        assert_eq!(account_info::SIZE_2_3, 64);
+        assert_eq!(account_info::REFUSED, account_info::SIZE_2_3);
+        assert_eq!(account_info::REFUSED_MAX, account_info::REFUSED + 8);
+        assert_eq!(account_info::SIZE, account_info::REFUSED_MAX + 8);
+        // What the kernel writes for the size a caller gives: a caller built before 2.10
+        // passes zero and is written its 64 bytes, never 80; 64 and 80 say themselves.
+        assert_eq!(account_info::written(0), Some(64));
+        assert_eq!(account_info::written(64), Some(64));
+        assert_eq!(account_info::written(80), Some(80));
+        // Any other size is refused: one between the layouts, one a later ABI might add,
+        // an address or whatever else a caller left in the register.
+        for unknown in [
+            1,
+            8,
+            63,
+            65,
+            72,
+            79,
+            81,
+            96,
+            4096,
+            0x7fff_ffff_e000,
+            u64::MAX,
+        ] {
+            assert_eq!(account_info::written(unknown), None, "{unknown}");
+        }
+        // Nothing is ever written past the largest layout, or short of the 2.3 one.
+        for size in 0..=4096u64 {
+            if let Some(len) = account_info::written(size) {
+                assert!((account_info::SIZE_2_3..=account_info::SIZE).contains(&len));
+                assert!(size == 0 || len as u64 == size, "{size} wrote {len}");
+            }
+        }
         assert_eq!(Error::QuotaExceeded.code(), 15);
         assert_eq!(Error::from_code(15), Some(Error::QuotaExceeded));
         assert_eq!(Error::QuotaExceeded.name(), "quota exceeded");

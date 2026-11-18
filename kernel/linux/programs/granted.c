@@ -7,6 +7,8 @@
      granted and the CPUs: the total its account's limit, what is free what is left of it
      (moruna.linux 2.0), and the native account_info call on its own account (ABI 2.3)
      names the account its starter carved, with that limit and something charged to it;
+     the call writes exactly what the size it is given says (ABI 2.10): 64 bytes for 0 and
+     64, 80 with the charges the account refused for 80, and nothing for any other size;
    - eventfd and epoll as tokio's mio uses them: an edge-triggered eventfd, a wait that
      blocks until another thread writes, a wait that times out, a blocking read woken by
      a write, a nonblocking read refused with EAGAIN;
@@ -52,10 +54,29 @@ static long native1(unsigned long nr, unsigned long a) {
     return r;
 }
 
-static long native2(unsigned long nr, unsigned long a, unsigned long b) {
+/* A native call of three arguments: the third goes in rdx, where the kernel also returns its
+   second value, so the register is both given and taken back. */
+static long native3(unsigned long nr, unsigned long a, unsigned long b, unsigned long c) {
     long r;
-    __asm__ volatile("syscall" : "=a"(r) : "a"(nr), "D"(a), "S"(b) : "rcx", "r11", "rdx", "memory");
+    __asm__ volatile("syscall" : "=a"(r), "+d"(c) : "a"(nr), "D"(a), "S"(b) : "rcx", "r11", "memory");
     return r;
+}
+
+/* account_info on its own account (zero) with `size` as its third argument, what the
+   caller's buffer holds (ABI 2.10), into 12 words each set to a guard first. Returns how
+   many whole words the kernel wrote, counted from the first, or the call's error (negative)
+   when it wrote none; -1000 when it wrote words apart from each other or with an error. */
+#define ACCOUNT_WORDS 12
+#define ACCOUNT_GUARD 0xa5a55a5aa5a55a5aULL
+static long account_words(unsigned long size, uint64_t account[ACCOUNT_WORDS]) {
+    for (int i = 0; i < ACCOUNT_WORDS; i++) account[i] = ACCOUNT_GUARD;
+    long r = native3(NATIVE_ACCOUNT_INFO, 0, (unsigned long)account, size);
+    int written = 0;
+    while (written < ACCOUNT_WORDS && account[written] != ACCOUNT_GUARD) written++;
+    for (int i = written; i < ACCOUNT_WORDS; i++)
+        if (account[i] != ACCOUNT_GUARD) return -1000;
+    if (r != 0) return written == 0 ? r : -1000;
+    return written;
 }
 
 static int efd_wait, efd_block;
@@ -129,13 +150,29 @@ int main(void) {
     if (free_bytes == 0 || free_bytes >= WANT_MEMORY)
         return fail("sysinfo's freeram is not what is left of its account");
     /* Its own account, read with the kernel's call (zero names the caller's own): limit,
-       charged, peak, held for children, then its name. */
-    uint64_t account[8];
-    if (native2(NATIVE_ACCOUNT_INFO, 0, (unsigned long)account) != 0)
-        return fail("account_info on its own account");
+       charged, peak, held for children, then its name. The call's third argument is what
+       the caller's buffer holds (ABI 2.10; unused before): 80 has the charges the account
+       refused written after the 64 bytes of ABI 2.3; zero, the call a program built before
+       2.10 makes, and 64 are written those 64 bytes and not one more; any other size is
+       refused with invalid arguments (-4) and nothing is written, whether a size between
+       the layouts or an address a caller left in the register. */
+    uint64_t wide[ACCOUNT_WORDS], other[ACCOUNT_WORDS], account[ACCOUNT_WORDS];
+    if (account_words(80, wide) != 10)
+        return fail("account_info with a buffer of 80 bytes did not write exactly 80");
+    if (account_words(64, other) != 8)
+        return fail("account_info with a buffer of 64 bytes did not write exactly 64");
+    if (account_words(72, other) != -4 || account_words((unsigned long)other, other) != -4)
+        return fail("account_info with a size it does not know was not refused, nothing written");
+    if (account_words(0, account) != 8)
+        return fail("account_info as ABI 2.3 called it did not write exactly 64 bytes");
     if (account[0] != WANT_MEMORY || account[1] == 0 || account[2] < account[1] ||
         strncmp((const char *)&account[4], "linux-test.granted", 32) != 0)
         return fail("its account is not the one its starter carved");
+    if (wide[0] != account[0] || memcmp(&wide[4], &account[4], 32) != 0)
+        return fail("the 80 bytes do not begin with the 64 of ABI 2.3");
+    /* It was refused nothing: it has stayed within its account. */
+    if (wide[8] != 0 || wide[9] != 0)
+        return fail("its account counts a refused charge it never made");
     if (read_file("/sys/devices/system/cpu/online", text, sizeof text) < 0 || text[0] != '0')
         return fail("/sys/devices/system/cpu/online");
     long cpus = sysconf(_SC_NPROCESSORS_ONLN);
@@ -187,7 +224,8 @@ int main(void) {
 
     printf("granted: ok: start page names probe (handle %u, handle_info answered), "
            "sysinfo and /proc/meminfo say %lu MiB, %lu KiB of it free, %ld CPUs; its account "
-           "linux-test.granted has %llu KiB charged; epoll: idle wait %llu ms, "
+           "linux-test.granted has %llu KiB charged, read as 64 bytes for sizes 0 and 64, as 80 "
+           "with no charge refused for 80, and refused for 72 and for an address; epoll: idle wait %llu ms, "
            "woken by a write in %llu ms, an edge once, a blocking read woken; rename replaced "
            "a file and RENAME_NOREPLACE was EEXIST\n",
            handle, WANT_MEMORY >> 20, free_bytes >> 10, cpus,

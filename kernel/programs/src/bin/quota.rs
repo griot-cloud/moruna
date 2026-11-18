@@ -6,13 +6,16 @@
 //!   freeing it gives the charge back with the peak kept; mapping it charges the mapper,
 //!   not the account; children carved out of an account never sum past it (a third
 //!   child, a page of memory and a child larger than its parent are each refused with
-//!   `QuotaExceeded`), and a child gone gives its limit back;
+//!   `QuotaExceeded`), and a child gone gives its limit back; the full account counts the
+//!   one charge it refused and its size (ABI 2.10), its child and its parent none, and a
+//!   carve that does not fit is no charge;
 //! - `KB5 quota`: three children from `quota-hog`, each in an account carved out of its
 //!   own: one makes memory objects until the kernel refuses one with `QuotaExceeded`, one
 //!   touches zero pages until the kernel ends it with its account named, and one goes on
 //!   making, writing and freeing memory while the other two have filled theirs; this
-//!   process reads each account's figures, and once they are gone every limit it carved
-//!   has come back to it;
+//!   process reads each account's figures, the one charge each of the first two was
+//!   refused among them (ABI 2.10), and once they are gone every limit it carved has come
+//!   back to it;
 //! - `KB5 cpu` (ABI 2.10, item 6.3i): each of those children's accounts was charged the
 //!   CPU time its process used, read through the account and through the ended process;
 //!   its own account, which theirs were carved from, was charged theirs and its own; the
@@ -133,6 +136,18 @@ fn accounts() -> Result<(u64, u64), (&'static str, Option<Error>)> {
         a1.carve_from(8 * MIB, "quota.a1.big"),
         Error::QuotaExceeded,
         "a child larger than its parent",
+    )?;
+    // ABI 2.10: the account counts the charge it refused, the page of memory, and its
+    // size. The two carves were no charges, and the refusal is neither its child's nor
+    // the account's it was carved from.
+    let u = usage(&a, "account_info")?;
+    want(
+        u.refused == 1 && u.refused_max == charge::memory(1),
+        "a full account did not count the one charge it refused, and its size",
+    )?;
+    want(
+        usage(&a1, "account_info")?.refused == 0 && own()?.refused == start.refused,
+        "a refused charge or carve was counted where no charge was refused",
     )?;
     // Account limits are whole pages; metadata charges need not be. Choose the
     // first aligned limit strictly beyond the actual remaining room so this
@@ -343,6 +358,8 @@ fn tasks(
     let image = slot("hog-image");
     // Its own account's CPU time before any child runs: what the children add is theirs.
     let cpu_before = own_time()?;
+    // And the charges it has refused itself: its children's refusals are not its own.
+    let refused_before = own()?.refused;
     let mut steady = child(&resource, &image, "quota-steady", 8 * MIB)?;
     steady.start(out, b"steady")?;
 
@@ -369,6 +386,11 @@ fn tasks(
         seen.used == used && seen.name() == "quota-call",
         "the call child's account read through its process is not what it reported",
     )?;
+    // ABI 2.10: its account counts the object it was refused, once, and its size.
+    want(
+        seen.refused == 1 && seen.refused_max == one,
+        "the call child's account did not count the one object it was refused",
+    )?;
 
     // Touches past its account: the kernel ends it at the first page it cannot charge.
     let mut touch = child(&resource, &image, "quota-touch", 4 * MIB)?;
@@ -388,6 +410,12 @@ fn tasks(
         t.peak <= t.limit && t.peak + charge::ZERO_PAGE > t.limit,
         "the touch child was not ended at its account's limit",
     )?;
+    // ABI 2.10: the page it could not pay for is the one charge its account refused, which
+    // tells this end from any other.
+    want(
+        t.refused == 1 && t.refused_max == charge::ZERO_PAGE,
+        "the touch child's account did not count the page it could not pay for",
+    )?;
 
     // Beside them, the steady child runs on, and the call child is still there.
     if let Err((e, _)) = steady.talk.write(b"go", []) {
@@ -403,6 +431,13 @@ fn tasks(
         return Err(("telling the call child to end", Some(e)));
     }
     call.ended()?;
+    // The child that stayed within its account was refused nothing, and the two refusals
+    // are their accounts' own: this one, which holds their limits, counts neither.
+    want(
+        usage(&steady.account, "account_info of the steady child")?.refused == 0
+            && own()?.refused == refused_before,
+        "a charge was counted refused in an account that refused none",
+    )?;
 
     // KB5 cpu (ABI 2.10): each child's account was charged the time its process used, and
     // an ended process stays counted, read through its account or through the process.
@@ -488,7 +523,7 @@ fn run() -> i64 {
         Ok((object, reserved)) => {
             println!(
                 out,
-                "KB5 accounts: ok: its own account `quota` has the manifest's 64 MiB; an object of 1 MiB charged {} bytes to the account it was made in, whose peak read back the same and whose use went to 0 when it was freed; mapping it charged the mapper; children of 4 and 4 MiB filled an account of 8, and a third, a page of memory and a child larger than its parent were refused with quota exceeded; a child gone gave its limit back",
+                "KB5 accounts: ok: its own account `quota` has the manifest's 64 MiB; an object of 1 MiB charged {} bytes to the account it was made in, whose peak read back the same and whose use went to 0 when it was freed; mapping it charged the mapper; children of 4 and 4 MiB filled an account of 8, and a third, a page of memory and a child larger than its parent were refused with quota exceeded, and the full account counted the one charge it refused, the page, its child and its parent none; a child gone gave its limit back",
                 object
             );
             reserved
@@ -502,7 +537,7 @@ fn run() -> i64 {
     match tasks(&out, reserved) {
         Ok((made, used, peak)) => println!(
             out,
-            "KB5 quota: ok: quota-call made {} objects of 1 MiB in its 8 MiB account ({} bytes charged) and the next was refused with quota exceeded; quota-touch wrote zero pages until the kernel ended it at its 4 MiB account's limit (peak {} bytes); quota-steady made, wrote and freed 32 MiB meanwhile and ended with 0; every limit carved came back",
+            "KB5 quota: ok: quota-call made {} objects of 1 MiB in its 8 MiB account ({} bytes charged) and the next was refused with quota exceeded; quota-touch wrote zero pages until the kernel ended it at its 4 MiB account's limit (peak {} bytes); quota-steady made, wrote and freed 32 MiB meanwhile and ended with 0; the first two accounts each counted the one charge refused, quota-steady's and their parent's none; every limit carved came back",
             made,
             used,
             peak

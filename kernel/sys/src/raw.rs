@@ -263,10 +263,15 @@ pub fn account_matches(account: RawHandle, object: RawHandle) -> u64 {
     call2(nr::ACCOUNT_MATCHES, account as u64, object as u64).0
 }
 
-/// `account_info` (ABI 2.3) of `account`, zero for the caller's own.
+/// `account_info` (ABI 2.3) of `account`, zero for the caller's own, with the charges it
+/// refused (ABI 2.10): the call says its buffer holds `account_info::SIZE` bytes, and the
+/// kernel writes exactly those. A kernel before 2.10 writes the first 64 and leaves the
+/// rest of `out` as it was.
 pub fn account_info(account: RawHandle, out: &mut [u8; moruna_abi::account_info::SIZE]) -> u64 {
-    let a = [account as u64, out.as_mut_ptr() as u64, 0, 0, 0, 0];
-    // SAFETY: the kernel writes `account_info::SIZE` bytes to `out`, which holds them.
+    let size = moruna_abi::account_info::SIZE as u64;
+    let a = [account as u64, out.as_mut_ptr() as u64, size, 0, 0, 0];
+    // SAFETY: the kernel writes at most `account_info::SIZE` bytes to `out`, which holds
+    // them.
     unsafe { syscall(nr::ACCOUNT_INFO, a) }.0
 }
 

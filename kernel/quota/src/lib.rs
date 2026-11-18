@@ -16,7 +16,9 @@
 //!
 //! An account is charged CPU time as well (ABI 2.10, item 6.3i): what the threads of the
 //! processes charged to it have used, and what every account carved out of it was charged
-//! ([`CpuTime`], [`charge_cpu`]). `account_cpu` reads it ([`cpu_answer`]).
+//! ([`CpuTime`], [`charge_cpu`]). `account_cpu` reads it ([`cpu_answer`]). And an account
+//! counts the charges it refused ([`Refusals`], ABI 2.10): how many, and the largest, which
+//! `account_info` gives a caller that asks for its 80 bytes.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -55,6 +57,19 @@ pub struct Exceeded {
     pub usage: Usage,
 }
 
+/// The charges an account refused since it was made (ABI 2.10, items 6.3i and 6.3g): what
+/// tells a process that passed its account's room, refused an object or ended at a page it
+/// could not pay for, from one that ended for any other reason. They are the account's own:
+/// a charge an account carved out of it refuses is counted there, not here, and a carve that
+/// does not fit is no charge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Refusals {
+    /// How many charges it refused.
+    pub count: u64,
+    /// The largest request among them, in bytes.
+    pub largest: u64,
+}
+
 /// More given back than was charged or held: a broken invariant of the kernel's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Underflow {
@@ -62,14 +77,15 @@ pub struct Underflow {
     pub held: u64,
 }
 
-/// One account's figures: what is charged to it, what it holds for its children, and
-/// the most it ever had charged.
+/// One account's figures: what is charged to it, what it holds for its children, the
+/// most it ever had charged, and the charges it refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ledger {
     limit: u64,
     used: u64,
     peak: u64,
     reserved: u64,
+    refusals: Refusals,
 }
 
 impl Ledger {
@@ -80,7 +96,16 @@ impl Ledger {
             used: 0,
             peak: 0,
             reserved: 0,
+            refusals: Refusals {
+                count: 0,
+                largest: 0,
+            },
         }
+    }
+
+    /// The charges it refused since it was made (ABI 2.10).
+    pub fn refusals(&self) -> Refusals {
+        self.refusals
     }
 
     pub fn usage(&self) -> Usage {
@@ -100,9 +125,12 @@ impl Ledger {
             .is_some_and(|total| total <= self.limit)
     }
 
-    /// Charges `bytes`; refused, with nothing changed, when they do not fit.
+    /// Charges `bytes`; refused, with nothing charged and the refusal counted, when they
+    /// do not fit.
     pub fn charge(&mut self, bytes: u64) -> Result<(), Exceeded> {
         if !self.fits(bytes) {
+            self.refusals.count = self.refusals.count.saturating_add(1);
+            self.refusals.largest = self.refusals.largest.max(bytes);
             return Err(Exceeded {
                 asked: bytes,
                 usage: self.usage(),
@@ -669,6 +697,113 @@ mod tests {
         fn ran(&self, ns: u64) {
             charge_cpu(&*self.0, ns);
         }
+    }
+
+    /// 6.3i, for 6.3g: an account counts the charges it refuses, how many and the largest,
+    /// and nothing else about it moves; a charge that fits, a charge given back and a carve
+    /// that does not fit count nothing.
+    #[test]
+    fn i63_a_ledger_counts_the_charges_it_refuses_and_the_largest() {
+        let mut l = Ledger::new(16 * 4096);
+        assert_eq!(l.refusals(), Refusals::default());
+        l.charge(12 * 4096).unwrap();
+        assert_eq!(l.refusals(), Refusals::default());
+        // Past the limit: refused, counted, the figures as they were.
+        let before = l.usage();
+        assert!(l.charge(5 * 4096).is_err());
+        assert_eq!(
+            l.refusals(),
+            Refusals {
+                count: 1,
+                largest: 5 * 4096
+            }
+        );
+        assert_eq!(l.usage(), before);
+        // A smaller one after it, still past the four pages left, is counted and is not the
+        // largest; a larger one is.
+        assert!(l.charge(4 * 4096 + 32).is_err());
+        assert!(l.charge(64 * MIB).is_err());
+        assert_eq!(
+            l.refusals(),
+            Refusals {
+                count: 3,
+                largest: 64 * MIB
+            }
+        );
+        // What fits is still charged, and a charge given back takes no refusal with it.
+        l.charge(4 * 4096).unwrap();
+        l.uncharge(16 * 4096).unwrap();
+        assert_eq!(l.refusals().count, 3);
+        assert_eq!(l.usage().used, 0);
+        // A carve that does not fit is no charge, nor is one that does.
+        assert!(l.reserve(17 * 4096).is_err());
+        l.reserve(16 * 4096).unwrap();
+        assert_eq!(l.refusals().count, 3);
+        // Held whole for a child, it refuses the next charge of its own: a page.
+        assert!(l.charge(4096).is_err());
+        assert_eq!(
+            l.refusals(),
+            Refusals {
+                count: 4,
+                largest: 64 * MIB
+            }
+        );
+        // A request no counter holds is refused and counted, never wrapped.
+        let mut big = Ledger::new(u64::MAX);
+        big.charge(u64::MAX - 1).unwrap();
+        assert!(big.charge(u64::MAX).is_err());
+        assert_eq!(
+            big.refusals(),
+            Refusals {
+                count: 1,
+                largest: u64::MAX
+            }
+        );
+    }
+
+    /// 6.3i, for 6.3g: the refusals are each account's own. An instance that passes the
+    /// account carved for it is counted there and not in the engine's; the engine, its room
+    /// held for its instances, counts its own.
+    #[test]
+    fn i63_a_carved_account_s_refusals_are_its_own_and_its_parent_s_are_its_parent_s() {
+        // The engine's account, and an instance's carved out of it: the parent holds the
+        // child's limit, whole.
+        let mut engine = Ledger::new(64 * MIB);
+        engine.reserve(16 * MIB).unwrap();
+        let mut instance = Ledger::new(16 * MIB);
+        // The instance fills its account and asks for a page more: its account refuses.
+        instance.charge(16 * MIB - 4096).unwrap();
+        assert!(instance.charge(4096 + 32).is_err());
+        assert_eq!(
+            instance.refusals(),
+            Refusals {
+                count: 1,
+                largest: 4128
+            }
+        );
+        // The engine's account was never asked: the charge was the instance's.
+        assert_eq!(engine.refusals(), Refusals::default());
+        assert_eq!(engine.usage().used, 0);
+        // The engine's own charge past what it has left beside its instances is its own.
+        engine.charge(48 * MIB).unwrap();
+        assert!(engine.charge(MIB).is_err());
+        assert_eq!(
+            engine.refusals(),
+            Refusals {
+                count: 1,
+                largest: MIB
+            }
+        );
+        assert_eq!(instance.refusals().count, 1);
+        // The instance restarted in a new account with more room: nothing refused yet, and
+        // the engine keeps what it counted when the first one's limit comes back.
+        engine.unreserve(16 * MIB).unwrap();
+        engine.uncharge(32 * MIB).unwrap();
+        engine.reserve(32 * MIB).unwrap();
+        let mut again = Ledger::new(32 * MIB);
+        again.charge(16 * MIB + 4128).unwrap();
+        assert_eq!(again.refusals(), Refusals::default());
+        assert_eq!(engine.refusals().count, 1);
     }
 
     /// 6.3i: a slice is charged along the parent chain, so a job's account holds the CPU of

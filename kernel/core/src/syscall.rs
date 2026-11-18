@@ -125,7 +125,7 @@ pub fn dispatch(thread: &Arc<Thread>, ctx: &mut UserContext) -> Flow {
         nr::PROCESS_PLANE => process_plane(p, a[0], a[1], a[2], a[3]),
         nr::PROCESS_GRANT => process_grant(p, a[0], a[1], a[2]),
         nr::ACCOUNT_CREATE => account_create(p, a[0], a[1], a[2], a[3]),
-        nr::ACCOUNT_INFO => account_info(p, a[0], a[1]),
+        nr::ACCOUNT_INFO => account_info(p, a[0], a[1], a[2]),
         nr::ACCOUNT_MATCHES => account_matches(p, a[0], a[1]),
         // ABI 2.10 (item 6.3i): the CPU time charged to an account.
         nr::ACCOUNT_CPU => account_cpu(thread, a[0]),
@@ -511,11 +511,16 @@ fn account_create(p: &Process, parent: u64, limit: u64, name: u64, len: u64) -> 
     insert(p, Object::Account(child))
 }
 
-/// `account_info` (ABI 2.3): the 64 bytes of `moruna_abi::account_info` of the caller's
-/// own account (zero), an account, or a process's, with `READ`, written to `out`.
-fn account_info(p: &Process, account: u64, out: u64) -> Ret {
+/// `account_info` (ABI 2.3): the bytes of `moruna_abi::account_info` of the caller's own
+/// account (zero), an account, or a process's, with `READ`, written to `out`. `size` (ABI
+/// 2.10) is what the caller's buffer holds: 80 has the charges the account refused
+/// written after the rest; zero, the call a caller built before 2.10 makes, and 64 write
+/// the 64 bytes of ABI 2.3 and no more; any other size is `InvalidArgs` and writes
+/// nothing. The handle is looked up first, as for every call (KK-I2).
+fn account_info(p: &Process, account: u64, out: u64, size: u64) -> Ret {
     let account = account_of(p, account, Rights::READ)?;
-    usercopy::write(&p.space, out, &account.info())?;
+    let len = moruna_abi::account_info::written(size).ok_or(Error::InvalidArgs)?;
+    usercopy::write(&p.space, out, &account.info()[..len])?;
     one(0)
 }
 

@@ -14,6 +14,8 @@
 //! account, whose limit is the physical memory the kernel found less its own reserve,
 //! is never overcommitted. A charge that does not fit is refused (`QuotaExceeded`); a
 //! page fault whose page cannot be charged ends its process with the account named.
+//! An account counts the charges it refused, and the largest (ABI 2.10): `account_info`
+//! gives them, so a starter tells a process that passed its room from any other end.
 //!
 //! An account is charged CPU time too (ABI 2.10, item 6.3i): each slice a thread runs is
 //! charged, as the thread leaves its CPU, to the account its process is charged to and
@@ -156,10 +158,16 @@ impl Account {
         moruna_quota::cpu_answer(self.cpu.total(), running)
     }
 
-    /// `account_info`'s 64 bytes.
+    /// `account_info`'s bytes: the 64 of ABI 2.3, then the charges it refused (ABI 2.10),
+    /// which a caller that does not ask for them is not written.
     pub fn info(&self) -> [u8; account_info::SIZE] {
-        let u = self.usage();
+        let (u, refused) = {
+            let ledger = self.ledger.lock();
+            (ledger.usage(), ledger.refusals())
+        };
         let mut out = [0u8; account_info::SIZE];
+        write_u64(&mut out, account_info::REFUSED, refused.count);
+        write_u64(&mut out, account_info::REFUSED_MAX, refused.largest);
         write_u64(&mut out, account_info::LIMIT, u.limit);
         write_u64(&mut out, account_info::USED, u.used);
         write_u64(&mut out, account_info::PEAK, u.peak);
