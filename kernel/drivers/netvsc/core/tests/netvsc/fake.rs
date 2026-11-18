@@ -216,6 +216,27 @@ impl Parts {
     }
 }
 
+#[cfg(feature = "trace-first-frames")]
+impl Parts {
+    /// Starts the card as [`Parts::start`] does, with `trace` noting its first frames from
+    /// the start on (work item 1.11c).
+    pub fn start_traced(mut self, trace: moruna_netvsc::trace::Trace) -> Result<Card, NetvscError> {
+        self.host.borrow_mut().flush(self.channel.host());
+        let driver = Netvsc::start_traced(
+            self.channel,
+            self.receive,
+            self.send,
+            Some(DEADLINE),
+            &mut |_| {},
+            trace,
+        )?;
+        Ok(Card {
+            driver,
+            host: self.host,
+        })
+    }
+}
+
 /// The card under test, and the host it talks to. Before the card does anything, what
 /// the test had the host send goes on the ring.
 pub struct Card {
@@ -291,6 +312,12 @@ impl Card {
     /// How many times the card has signalled the host.
     pub fn signals(&mut self) -> usize {
         self.driver.channel().host_signals()
+    }
+
+    /// The lines the card's trace noted since they were last taken (work item 1.11c).
+    #[cfg(feature = "trace-first-frames")]
+    pub fn take_trace(&mut self) -> Vec<String> {
+        self.driver.take_trace()
     }
 }
 

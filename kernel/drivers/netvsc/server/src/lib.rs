@@ -186,9 +186,25 @@ impl<C: Channel, S: Shared> Driver<C, S> {
         core::mem::take(&mut self.server.ready)
     }
 
-    /// The lines to write on the console.
+    /// The lines to write on the console. A diagnosis build's trace of the card's first
+    /// frames (work item 1.11c) comes first, each of its lines with its own time.
     pub fn take_lines(&mut self) -> Vec<String> {
+        #[cfg(feature = "trace-first-frames")]
+        self.traced();
         core::mem::take(&mut self.lines)
+    }
+
+    /// The trace's lines since they were last taken, put before the driver's own.
+    #[cfg(feature = "trace-first-frames")]
+    fn traced(&mut self) {
+        let mut lines: Vec<String> = self
+            .card
+            .take_trace()
+            .into_iter()
+            .map(|line| format!("netvsc: {line}"))
+            .collect();
+        lines.append(&mut self.lines);
+        self.lines = lines;
     }
 
     fn fail(&mut self, why: String) {

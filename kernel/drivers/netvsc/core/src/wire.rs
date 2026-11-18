@@ -75,6 +75,10 @@ pub(crate) struct Wire<C: Channel> {
     /// When every wait gives up: a time on the node's monotonic clock, in nanoseconds,
     /// as the channel counts it; `None` for never.
     deadline: Option<u64>,
+    /// The trace of the first frames, in a diagnosis build (work item 1.11c): it sees each
+    /// commit as it is made.
+    #[cfg(feature = "trace-first-frames")]
+    pub trace: Option<crate::trace::Trace>,
 }
 
 /// The NVSP packet size of `version`, in the ring's whole eight-byte words. netvsp
@@ -105,6 +109,8 @@ impl<C: Channel> Wire<C> {
             table_seen: false,
             table_news: None,
             deadline,
+            #[cfg(feature = "trace-first-frames")]
+            trace: None,
         }
     }
 
@@ -306,10 +312,16 @@ impl<C: Channel> Wire<C> {
     /// Commits every packet written since the last flush, and signals the host if VMBus's
     /// rule says it needs it: once for all of them.
     pub fn flush(&mut self) -> Result<(), NetvscError> {
-        if let Some(mut at) = self.pending.take()
-            && self.channel.outgoing().commit_write(&mut at)
-        {
+        let Some(mut at) = self.pending.take() else {
+            return Ok(());
+        };
+        let signal = self.channel.outgoing().commit_write(&mut at);
+        if signal {
             self.channel.signal_host()?;
+        }
+        #[cfg(feature = "trace-first-frames")]
+        if let Some(trace) = self.trace.as_mut() {
+            trace.committed(signal);
         }
         Ok(())
     }

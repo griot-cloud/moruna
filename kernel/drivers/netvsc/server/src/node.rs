@@ -274,9 +274,24 @@ struct Steps<'a> {
 }
 
 impl Steps<'_> {
+    #[cfg(not(feature = "trace-first-frames"))]
     fn say(&self, line: fmt::Arguments<'_>) {
         let ms = now().saturating_sub(self.started) / 1_000_000;
         println!(self.console, "netvsc: {} ms: {}", ms, line);
+    }
+
+    /// A diagnosis build's steps (work item 1.11c) are said to the microsecond, on the clock
+    /// of its trace's lines: the packet filter, the link and `served as net0` among them.
+    #[cfg(feature = "trace-first-frames")]
+    fn say(&self, line: fmt::Arguments<'_>) {
+        let ns = now().saturating_sub(self.started);
+        println!(
+            self.console,
+            "netvsc: {}.{:03} ms: {}",
+            ns / 1_000_000,
+            ns / 1_000 % 1_000,
+            line
+        );
     }
 }
 
@@ -332,13 +347,34 @@ fn card(steps: &Steps<'_>, vmbus_listener: &Channel) -> Result<Netvsc<Opening, M
     steps.say(format_args!(
         "card {instance}: buffers made; starting the card"
     ));
+    #[cfg(not(feature = "trace-first-frames"))]
     let card = Netvsc::start_saying(channel, receive, send, Some(deadline), &mut |line| {
         steps.say(line)
-    })
-    .map_err(|e| match late_share.get() {
+    });
+    // A diagnosis build traces the card's first frames from its start on (work item 1.11c),
+    // on the clock of the start's lines.
+    #[cfg(feature = "trace-first-frames")]
+    let card = {
+        let started = steps.started;
+        let clock = Box::new(move || now().saturating_sub(started));
+        Netvsc::start_traced(
+            channel,
+            receive,
+            send,
+            Some(deadline),
+            &mut |line| steps.say(line),
+            moruna_netvsc::trace::Trace::new(clock),
+        )
+    };
+    #[cfg_attr(not(feature = "trace-first-frames"), allow(unused_mut))]
+    let mut card = card.map_err(|e| match late_share.get() {
         Some(what) => late(what),
         None => not_started(instance, e),
     })?;
+    #[cfg(feature = "trace-first-frames")]
+    for line in card.take_trace() {
+        println!(console, "netvsc: {}", line);
+    }
     println!(console, "netvsc: card {instance}: {}", describe(&card));
     Ok(card)
 }
