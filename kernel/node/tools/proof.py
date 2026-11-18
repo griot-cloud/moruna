@@ -256,7 +256,7 @@ def main():
                                         "network": 64 * MIB, "admission": 1536 * MIB, "storage": 128 * MIB}}
         (out / "profile.json").write_text(json.dumps(profile) + "\n")
         (out / "storage.conf").write_text("moruna-storage 1\ntimeout-ns 5000000000\nbody-limit 1048576\nsession-limit 4\nprovider single-node-home\nblock-service nvme0\nalignment 4096\n")
-        (out / "network.conf").write_text(f"moruna-netstack 1\nsetting tls-unix-seconds {int(time.time())}\nsetting tls-time-valid-ms 3600000\ngrant listen-engine rights=connect remote=127.0.0.0/8 local=127.0.0.0/8 sockets=8\n")
+        (out / "network.conf").write_text("moruna-netstack 1\ngrant listen-engine rights=connect remote=127.0.0.0/8 local=127.0.0.0/8 sockets=8\n")
         case_grant = None
         if fixture_mode:
             authored_command = json.loads(args.kd3_conformance_proof.read_text())
@@ -276,6 +276,7 @@ def main():
             elif args.kd3_case:
                 raise ValueError("Python library command must not receive Rust case grant")
         command(["python3", tools / "configure.py", "--profile", out / "profile.json", "--out", out / "assets",
+                 "--profile-out", out / "configured-profile.json",
                  "--image-record", args.image_record, "--layers", args.linux_layers, "--network", out / "network.conf",
                  "--tls-roots", args.io_net / "roots" if args.io_phase else args.tls_roots, "--engine-bindings", out / "canonical/engine.bindings",
                  "--storage-config", out / "storage.conf", "--storage-grants", out / "canonical/storage.grants",
@@ -432,7 +433,9 @@ def main():
             if backend.poll() is not None:
                 raise RuntimeError("actual vsock backend exited before binding")
             time.sleep(0.01)
-        qemu_args = [args.qemu, *accel_args(args.accel), "-machine", "q35", "-m", f"{RAM // MIB}M",
+        # -rtc base=utc: the machine's clock, which the core reads at boot as the wall clock
+        # TLS uses (system design 3D).
+        qemu_args = [args.qemu, *accel_args(args.accel), "-machine", "q35", "-rtc", "base=utc", "-m", f"{RAM // MIB}M",
                      "-smp", args.cpus, "-display", "none", "-monitor", "none", "-no-reboot", "-nodefaults",
                      "-serial", f"file:{out / 'serial.log'}", "-qmp", f"unix:{out / 'qmp.sock'},server=on,wait=off",
                      "-object", f"memory-backend-memfd,id=ram0,size={RAM},share=on", "-numa", "node,memdev=ram0",

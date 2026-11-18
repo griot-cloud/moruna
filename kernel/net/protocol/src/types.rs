@@ -219,7 +219,8 @@ impl Wire for Rule {
     }
 }
 
-/// A name, or every name below a domain (`*.example.com`), and a range of ports.
+/// A name, every name below a domain (`*.example.com`), or every name (`*`, from 3.2), and
+/// a range of ports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NameRule {
     pub pattern: String,

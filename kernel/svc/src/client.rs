@@ -243,27 +243,51 @@ impl ClientCore {
         Ok(())
     }
 
+    /// A filed reply as its caller is given it: a `Failure` as the error it names.
+    fn answer(mut frame: Frame) -> Result<Frame, CallError<u32>> {
+        if frame.kind == Kind::Reply {
+            return Ok(frame);
+        }
+        let mut d = frame.decoder();
+        let code = u32::decode(&mut d)?;
+        d.finish()?;
+        Err(match Status::from_code(code) {
+            Some(status) => CallError::Status(status),
+            None if code != 0 && code < Status::FIRST => CallError::Remote(code),
+            None => CallError::Malformed,
+        })
+    }
+
     /// Waits for the reply to request `txid`. A `Failure` is returned as the error it
     /// names.
     pub fn reply(&mut self, txid: u32, deadline: u64) -> Result<Frame, CallError<u32>> {
         loop {
-            if let Some(mut frame) = self.replies.remove(&txid) {
-                if frame.kind == Kind::Reply {
-                    return Ok(frame);
-                }
-                let mut d = frame.decoder();
-                let code = u32::decode(&mut d)?;
-                d.finish()?;
-                return Err(match Status::from_code(code) {
-                    Some(status) => CallError::Status(status),
-                    None if code != 0 && code < Status::FIRST => CallError::Remote(code),
-                    None => CallError::Malformed,
-                });
+            if let Some(frame) = self.replies.remove(&txid) {
+                return Self::answer(frame);
             }
             if !self.in_flight.contains(&txid) {
                 return Err(CallError::Malformed);
             }
             self.pump(deadline)?;
+        }
+    }
+
+    /// Reads one frame, waiting for it until `deadline`, and files it: a reply under its id,
+    /// for whoever takes it ([`ClientCore::take_reply`]), an event in the queue. For a client
+    /// several threads share, whose one reader waits on the channel itself, holding no lock
+    /// while it waits, and then files what has arrived: `TimedOut` once nothing more is there.
+    pub fn file(&mut self, deadline: u64) -> Result<(), CallError<u32>> {
+        self.pump(deadline)
+    }
+
+    /// The reply to request `txid` if it has been filed, without waiting, as
+    /// [`ClientCore::reply`] gives it; `None` while it is still to come. A `txid` this client
+    /// never sent, or whose reply was already taken, is `Malformed`.
+    pub fn take_reply(&mut self, txid: u32) -> Option<Result<Frame, CallError<u32>>> {
+        match self.replies.remove(&txid) {
+            Some(frame) => Some(Self::answer(frame)),
+            None if self.in_flight.contains(&txid) => None,
+            None => Some(Err(CallError::Malformed)),
         }
     }
 

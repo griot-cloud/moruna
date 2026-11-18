@@ -11,8 +11,12 @@ use moruna_svc::{
     ProtocolId, Signals, Status, Watch, Wire,
 };
 use moruna_sys::{Account, Console, ObjectType, Process, Rights, println, start};
+use netstack_protocol::net;
 use node_protocol::{CANCELLED, CHECK_BYTES, MAX_JOBS, Needs, RUNNING, TERMINATED, admission};
 moruna_sys::main!(run);
+
+/// The account of admission's client of the network server (item 3.4).
+const NETWORK_BYTES: u64 = 4 << 20;
 
 struct Job {
     owner: u64,
@@ -47,6 +51,10 @@ struct Shared {
     check_account: Option<Account>,
     /// The check that holds the check account, until it is released.
     check: Option<u64>,
+    /// Admission's own client of the network server, on the slot `network`: `grant,connect`
+    /// on every name at 443, from which each job's network is minted (system design 3D, item
+    /// 3.4). It never connects itself. `None`: jobs that name hosts are refused.
+    network: Option<net::Client>,
 }
 struct End {
     shared: Rc<RefCell<Shared>>,
@@ -144,6 +152,19 @@ fn launch_job(
             names.push(service);
             grants.push(grant);
         }
+    }
+    // The job's network (system design 3D, item 3.4): `connect` to the hosts its check named,
+    // at 443, and nothing else, as the engine's slot `network`. A job that names none has none.
+    if !needs.0.is_empty() {
+        let mut state = shared.borrow_mut();
+        let client = state
+            .network
+            .as_mut()
+            .ok_or(admission::Error::Unavailable)?;
+        let channel = moruna_node::egress::mint(client, &needs.0, moruna_node::egress::SOCKETS)
+            .map_err(|_| admission::Error::Unavailable)?;
+        names.push("network".into());
+        grants.push(channel.0);
     }
     if !node_protocol::valid_grants(&names, grants.len()) || budget == 0 || budget % 4096 != 0 {
         return Err(admission::Error::Invalid);
@@ -546,10 +567,18 @@ fn run() -> i64 {
         );
         return 1;
     };
+    let own = start::take("account").map(Account);
+    // The job network's client (item 3.4), on its own small account: the memory it lends the
+    // network server, and the clients of the channels it mints.
+    let network = start::take("network").map(Channel).and_then(|listener| {
+        let account = own.as_ref()?.carve_from(NETWORK_BYTES, "network").ok()?;
+        let channel = moruna_svc::connect(&listener).ok()?;
+        net::Client::connect(channel, moruna_svc::deadline_in(30_000_000_000), account).ok()
+    });
     // The check account, set aside when the server serves `api` and runs no initial job: a
     // check runs beside a job (system design 3A).
     let check_account = if listener.is_some() && initial.is_none() {
-        match start::take("account").map(|own| Account(own).carve_from(CHECK_BYTES, "check")) {
+        match own.as_ref().map(|own| own.carve_from(CHECK_BYTES, "check")) {
             Some(Ok(account)) => Some(account),
             Some(Err(e)) => {
                 println!(
@@ -583,6 +612,7 @@ fn run() -> i64 {
         node_memory,
         check_account,
         check: None,
+        network,
     }));
     let Some(policy) = start::take("storage.grants") else {
         return 1;

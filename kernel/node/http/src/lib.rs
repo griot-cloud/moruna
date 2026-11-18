@@ -1,7 +1,24 @@
-//! The minimal HTTP/1.1 client (work item 1.4, step 1): one `GET` or `POST` a connection, the
+//! The node's minimal HTTP/1.1 client (work item 1.4, step 1), shared by `platform`, which asks
+//! instance data in plain HTTP, and `node-admission`, which fetches function images over HTTPS
+//! with the network server's TLS (system design 3D, 3E): one `GET` or `POST` a connection, the
 //! answer's body by its `Content-Length` or in chunks (`Transfer-Encoding: chunked`, which every
 //! HTTP/1.1 client must read; PM, item 1.12). No other transfer coding, no redirects, no
-//! keep-alive, and at most 1 MiB of answer, head and body together, framing included.
+//! keep-alive, and at most [`RESPONSE_MAX`] of answer, head and body together, framing
+//! included, unless the caller gives its own limit ([`exchange_within`]).
+//!
+//! The client is written against [`Stream`], a connection as bytes; [`net`] gives the one through
+//! the network server's sockets, by address or by name, with TLS when asked. `no_std`, with
+//! `alloc`.
+#![no_std]
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+extern crate alloc;
+// The tests run on a host, with the network server's own logic over loopback.
+#[cfg(test)]
+extern crate std;
+
+pub mod net;
 
 use alloc::{
     string::{String, ToString},
@@ -9,9 +26,49 @@ use alloc::{
 };
 use core::{fmt, ops::Range};
 
-use crate::machine::{Stream, StreamError};
+/// Why a connection was not made, or broke.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamError {
+    /// The peer refused the connection.
+    Refused,
+    /// The connection was not established in time, as the network server judges it.
+    TimedOut,
+    /// No interface reaches the address: the node has no address yet.
+    Unreachable,
+    /// The peer reset the connection.
+    Reset,
+    /// The caller's deadline passed first.
+    Deadline,
+    /// Anything else, in words.
+    Other(String),
+}
 
-/// The most bytes of an answer, head and body together: 1 MiB.
+impl fmt::Display for StreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StreamError::Refused => f.write_str("connection refused"),
+            StreamError::TimedOut => f.write_str("connection timed out"),
+            StreamError::Unreachable => f.write_str("no route to the address"),
+            StreamError::Reset => f.write_str("connection reset"),
+            StreamError::Deadline => f.write_str("the deadline passed"),
+            StreamError::Other(why) => f.write_str(why),
+        }
+    }
+}
+
+/// One TCP connection, as bytes. Dropping it closes it.
+pub trait Stream {
+    /// Sends some of `bytes`, waiting for room until `deadline` (the monotonic clock, in
+    /// nanoseconds): how many were taken, at least one.
+    fn write(&mut self, bytes: &[u8], deadline: u64) -> Result<usize, StreamError>;
+
+    /// Receives into `buffer`, waiting for bytes until `deadline`: how many arrived, and 0 once
+    /// the peer has finished sending.
+    fn read(&mut self, buffer: &mut [u8], deadline: u64) -> Result<usize, StreamError>;
+}
+
+/// The most bytes of an answer, head and body together, unless a caller says otherwise
+/// ([`exchange_within`]): 1 MiB.
 pub const RESPONSE_MAX: usize = 1 << 20;
 
 /// A request: `GET`, or `POST` with a body.
@@ -130,8 +187,8 @@ pub enum HttpError {
     Stream(StreamError),
     /// The server closed the connection before a whole answer.
     Closed,
-    /// The answer is over [`RESPONSE_MAX`].
-    TooLarge,
+    /// The answer is over its limit, in bytes: [`RESPONSE_MAX`], or what the caller said.
+    TooLarge(usize),
     /// The answer is not HTTP/1.1 as this client reads it; what is wrong with it.
     Malformed(&'static str),
 }
@@ -141,7 +198,10 @@ impl fmt::Display for HttpError {
         match self {
             HttpError::Stream(error) => error.fmt(f),
             HttpError::Closed => f.write_str("the connection closed before a whole answer"),
-            HttpError::TooLarge => f.write_str("the answer is over 1 MiB"),
+            HttpError::TooLarge(limit) if limit % (1 << 20) == 0 => {
+                write!(f, "the answer is over {} MiB", limit >> 20)
+            }
+            HttpError::TooLarge(limit) => write!(f, "the answer is over {limit} bytes"),
             HttpError::Malformed(what) => write!(f, "the answer is not HTTP/1.1: {what}"),
         }
     }
@@ -160,14 +220,16 @@ struct Reader<'s, S> {
     stream: &'s mut S,
     deadline: u64,
     bytes: Vec<u8>,
+    /// The most bytes of the answer, head and body together.
+    limit: usize,
 }
 
 impl<S: Stream> Reader<'_, S> {
-    /// Reads once more, never past `limit` bytes of answer in all, nor past [`RESPONSE_MAX`].
+    /// Reads once more, never past `limit` bytes of answer in all, nor past the answer's limit.
     fn more(&mut self, limit: usize) -> Result<(), HttpError> {
-        let limit = limit.min(RESPONSE_MAX);
+        let limit = limit.min(self.limit);
         if self.bytes.len() >= limit {
-            return Err(HttpError::TooLarge);
+            return Err(HttpError::TooLarge(self.limit));
         }
         let mut chunk = [0u8; 4096];
         let room = chunk.len().min(limit - self.bytes.len());
@@ -202,16 +264,28 @@ impl<S: Stream> Reader<'_, S> {
             }
             // A CR at the end may be the first half of the next read's CRLF.
             searched = self.bytes.len().saturating_sub(1).max(*at);
-            self.more(RESPONSE_MAX)?;
+            self.more(self.limit)?;
         }
     }
 }
 
-/// Sends `request` on a fresh connection and reads its answer, all by `deadline`.
+/// Sends `request` on a fresh connection and reads its answer, all by `deadline`, at most
+/// [`RESPONSE_MAX`] of it.
 pub fn exchange<S: Stream>(
     stream: &mut S,
     request: &Request<'_>,
     deadline: u64,
+) -> Result<Response, HttpError> {
+    exchange_within(stream, request, deadline, RESPONSE_MAX)
+}
+
+/// As [`exchange`], with at most `limit` bytes of answer, head and body together, framing
+/// included: a longer one is [`HttpError::TooLarge`], and no more of it is read.
+pub fn exchange_within<S: Stream>(
+    stream: &mut S,
+    request: &Request<'_>,
+    deadline: u64,
+    limit: usize,
 ) -> Result<Response, HttpError> {
     let wire = request.encode();
     let mut sent = 0;
@@ -227,6 +301,7 @@ pub fn exchange<S: Stream>(
         stream,
         deadline,
         bytes: Vec::new(),
+        limit,
     };
     let mut searched = 0;
     let head_end = loop {
@@ -237,7 +312,7 @@ pub fn exchange<S: Stream>(
             break searched + at;
         }
         searched = answer.bytes.len().saturating_sub(HEAD_END.len() - 1);
-        answer.more(RESPONSE_MAX)?;
+        answer.more(limit)?;
     };
     let (status, headers) = head(&answer.bytes[..head_end])?;
     let mut response = Response {
@@ -247,13 +322,18 @@ pub fn exchange<S: Stream>(
     };
 
     let body_start = head_end + HEAD_END.len();
-    response.body = match framing(&response)? {
+    // A length too long to be a number is over this answer's limit, whatever it is.
+    let framing = framing(&response).map_err(|error| match error {
+        HttpError::TooLarge(_) => HttpError::TooLarge(limit),
+        error => error,
+    })?;
+    response.body = match framing {
         // Exactly Content-Length bytes. What follows them is not read.
         Framing::Length(length) => {
             let end = body_start
                 .checked_add(length)
-                .filter(|end| *end <= RESPONSE_MAX)
-                .ok_or(HttpError::TooLarge)?;
+                .filter(|end| *end <= limit)
+                .ok_or(HttpError::TooLarge(limit))?;
             answer.fill(end)?;
             answer.bytes[body_start..end].to_vec()
         }
@@ -363,27 +443,27 @@ fn framing(response: &Response) -> Result<Framing, HttpError> {
         Header::One(text) => text
             .parse()
             .map(Framing::Length)
-            .map_err(|_| HttpError::TooLarge),
+            .map_err(|_| HttpError::TooLarge(usize::MAX)),
     }
 }
 
 /// A chunked body that begins at `at` (RFC 9112, section 7.1): each chunk's size in hex, with
 /// any extensions after a `;`, which are ignored as the RFC asks; its data and a CRLF; then the
 /// last chunk, of size 0, any trailers, which are read and dropped, and an empty line. Framing,
-/// data and trailers count against [`RESPONSE_MAX`] with the head.
+/// data and trailers count against the answer's limit with the head.
 fn chunked<S: Stream>(answer: &mut Reader<'_, S>, mut at: usize) -> Result<Vec<u8>, HttpError> {
     let mut body = Vec::new();
     loop {
         let line = answer.line(&mut at)?;
-        let size = chunk_size(&answer.bytes[line])?;
+        let size = chunk_size(&answer.bytes[line], answer.limit)?;
         if size == 0 {
             break;
         }
         let end = at
             .checked_add(size)
             .and_then(|data_end| data_end.checked_add(2))
-            .filter(|end| *end <= RESPONSE_MAX)
-            .ok_or(HttpError::TooLarge)?;
+            .filter(|end| *end <= answer.limit)
+            .ok_or(HttpError::TooLarge(answer.limit))?;
         answer.fill(end)?;
         if &answer.bytes[end - 2..end] != b"\r\n" {
             return Err(HttpError::Malformed(
@@ -405,8 +485,9 @@ fn chunked<S: Stream>(answer: &mut Reader<'_, S>, mut at: usize) -> Result<Vec<u
     }
 }
 
-/// The size on a chunk's line: hex digits, then blank space and extensions, if any.
-fn chunk_size(line: &[u8]) -> Result<usize, HttpError> {
+/// The size on a chunk's line, at most `limit`: hex digits, then blank space and extensions, if
+/// any.
+fn chunk_size(line: &[u8], limit: usize) -> Result<usize, HttpError> {
     let text = printable(line).ok_or(HttpError::Malformed(
         "a byte in a chunk's size line is not printable ASCII",
     ))?;
@@ -415,16 +496,16 @@ fn chunk_size(line: &[u8]) -> Result<usize, HttpError> {
     if size.is_empty() || !size.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(HttpError::Malformed("a chunk's size is not hexadecimal"));
     }
-    // Leading zeros say nothing; more than eight digits is far over the limit.
+    // Leading zeros say nothing; more than sixteen digits is past any limit.
     let digits = size.trim_start_matches('0');
     if digits.is_empty() {
         return Ok(0);
     }
-    if digits.len() > 8 {
-        return Err(HttpError::TooLarge);
-    }
     match usize::from_str_radix(digits, 16) {
-        Ok(size) if size <= RESPONSE_MAX => Ok(size),
-        _ => Err(HttpError::TooLarge),
+        Ok(size) if digits.len() <= 16 && size <= limit => Ok(size),
+        _ => Err(HttpError::TooLarge(limit)),
     }
 }
+
+#[cfg(test)]
+mod tests;

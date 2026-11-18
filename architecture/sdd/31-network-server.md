@@ -44,43 +44,18 @@ TLS 1.3 is the only enabled version. The standard rustls verifier checks chain s
 
 ## d. Trust and time injection
 
-The boot may give the server a read-only `tls-roots` memory capability. Its representation is four little-endian bytes containing the following payload length, then the SDK Wire encoding of `Vec<Vec<u8>>`; every inner value is a DER CA certificate. Maximum payload: 1 MiB; maximum roots: 64. Trailing bytes inside the payload or malformed DER fail server startup. Roots are copied into an immutable rustls configuration before any client is served, and callers cannot replace them.
+The boot may give the server a read-only `tls-roots` memory capability. Its representation is four little-endian bytes containing the following payload length, then the SDK Wire encoding of `Vec<Vec<u8>>`; every inner value is a DER CA certificate. Maximum payload: 1 MiB; maximum roots: 256 (Mozilla's set as curl published it on 2026-11-05, the cloud profile's roots, has 118; system design 3D). Trailing bytes inside the payload or malformed DER fail server startup. Roots are copied into an immutable rustls configuration before any client is served, and callers cannot replace them.
 
-The same trusted boot configuration supplies `setting tls-unix-seconds N` and `setting tls-time-valid-ms N`. The UTC value is an externally established anchor at server initialization, not the monotonic kernel counter interpreted as Unix time. Its provenance is the boot supervisor's responsibility: deployment must obtain and authenticate current time before supplying it. There is no production RTC, unauthenticated NTP, fixed epoch or guessed timestamp added here. If that responsibility cannot be fulfilled, TLS is unavailable.
+TLS's time is the node's one wall clock, the core's clock page (ABI 2.8; system design 3D), which the server reads on every handshake. The core sets it at boot from the machine's clock (a test machine's from QEMU's `-rtc`), and `platform` sets it from its cloud's `Date` before `ready` and every hour. While the page says the clock is unset there is no time: a new handshake fails closed, `start_tls` refuses `TlsUnavailable`, and no TLS server identity is made. The server keeps no time of its own: no anchor, no validity window, no build-time clock, and no setting gives one (`tls-unix-seconds` and `tls-time-valid-ms` are gone, and a configuration naming either is refused). Existing authenticated records do not re-verify certificate validity on each receive; connections still obey TCP and protocol timeouts. Updating roots requires a fresh server process.
 
-The time provider adds monotonic elapsed seconds to the trusted anchor. The validity window is positive and at most one day; after expiry or a monotonic rollback it returns no time. A new TLS handshake then fails closed. An expired anchor does not silently renew itself. Existing authenticated records do not re-verify certificate validity on each receive; connections still obey TCP and protocol timeouts. Updating time or roots requires a fresh server process, with fresh trusted boot inputs.
+Without the roots capability, raw networking still works and `start_tls` explicitly refuses `TlsUnavailable`.
 
-Either both the roots capability and a nonzero anchor are supplied, or neither. A partial configuration fails startup. Without either, raw networking still works and `start_tls` explicitly refuses `TlsUnavailable`.
-
-## e. Crypto and target support
-
-ring 0.17.14's cached primary source `src/rand.rs` explicitly implements `SystemRandom` for `target_os = "none"` when `less-safe-getrandom-custom-or-rdrand` is enabled, forwarding to getrandom. getrandom 0.2.17 provides `register_custom_getrandom!` for unsupported targets. The sole registered implementation calls `moruna_svc::random`, which calls the approved ABI `random_read`; failure is returned to ring. No deterministic generator, raw local RDRAND implementation or secondary entropy path is used for TLS. smoltcp's separately seeded pseudo-random sequence is not TLS entropy.
-
-The rustls `ClientConfig::builder_with_details` no-std API accepts explicit crypto/time providers. The unbuffered API requires the caller to transmit encoded records before acknowledging `TransmitTlsData`, and discard exactly the bytes reported by each state. The implementation follows that contract and bounds each turn's work.
-
-Primary references: [ring target randomness](https://docs.rs/ring/0.17.14/ring/), [rustls unbuffered API](https://docs.rs/rustls/0.23.45/rustls/unbuffered/), and the corresponding cached crate sources. These establish API support, not successful compilation or execution on Moruna. The ring C/assembly cross-build for `x86_64-unknown-none` remains a required proof. Upstream [ring issue 1832](https://github.com/briansmith/ring/issues/1832) documents an important limitation: its build script does not select ELF assembly for an unknown OS, while x86_64 code assumes those routines exist. The reviewed build-only patch is `kernel/net/ring-none.patch`; exact registry archive/build-script/patch hashes are in `kernel/net/ring-provenance.json`. It selects ELF assembly only for x86_64 `none`, and uses the upstream freestanding-header path with clang and no red zone or stack protector. It changes no crypto source. The actual native-target userland check subsequently failed in ring C compilation through host `/usr/include/assert.h` → `features-time64.h` → missing `bits/wordsize.h`. This is the recorded reason to enable the freestanding adaptation, not a successful link claim. Exact upstream ring 0.17.14 is now vendored at `kernel/vendor/ring-0.17.14`; only `build.rs` differs among all 391 upstream files. `ring-upstream-files.sha256` and `ring-provenance.json` bind the archive, every original file and the patched build script. The kernel workspace excludes that path as a member and selects it through its sole `[patch.crates-io]`, outside `net/*`; the root std workspace and the proof registry vendor are not mutated. Actual baremetal compile/link and boot remain required. If the toolchain cannot build it, report the concrete error before choosing another provider; never weaken verification to obtain a binary.
-
-## f. Stack and dispatcher
-
-Each configured card is a `moruna.driver.net` connection discovered through the device directory. The server asks for address, MTU and link state, refuses unknown offloads, subscribes to frames and maintains one outstanding receive and link watch. Card frames and sends have bounded queues. The loopback interface stays in the process. Its frames are looped through the same smoltcp machinery, not answered by a fake socket implementation.
-
-The dispatcher waits on client channels, card channels and a timer at the next stack deadline. Each turn polls ingress, protocol requests, egress and completion replies. Deferred operations preserve backpressure. TLS uses the same TCP buffers and wakeups, adds a handshake deadline and schedules another turn if its bounded state-machine work is not finished.
-
-DHCPv4 uses smoltcp's lease events to replace IPv4 address, default route and DHCP DNS servers; loss removes those values. Explicit DNS servers precede DHCP-provided servers. Each interface's DNS socket receives only servers reachable from that interface. Resolution starts A and AAAA queries, cancels both on failure/disconnect, and is bounded by a configured deadline. Two resolver slots are the minimum useful capacity because each name consumes two queries.
-
-## i. Configuration and resource bounds
-
-Configuration starts `moruna-netstack 1`; existing `setting`, `interface`, `dns` and `grant` lines remain unchanged. Unknown names, malformed values, duplicate interfaces/grants and invalid policies fail with the line that supplied them.
-
-TLS additions:
 
 | Setting | Default | Bound |
 |---|---:|---:|
 | `tls-sockets-max` | 16 | 1..1024, also charged to original socket grant |
 | `tls-buffer-bytes` | 65536 | 16640..1048576 per socket buffer and cumulative incoming handshake |
 | `tls-handshake-timeout-ms` | 30000 | 1..3600000 |
-| `tls-unix-seconds` | absent/disabled | explicit 1..253402300799 |
-| `tls-time-valid-ms` | 3600000 | 1..86400000 |
 | `dns-queries` | 16 | 2..256 per interface |
 
 A TLS application send accepts at most one record (16384 bytes), returning a partial count when needed. TLS processing yields after 64 states per poll. Input, output and decrypted application buffers are bounded; cumulative handshake input is bounded even when fragmented over many polls. Full buffers apply backpressure. The configured simultaneous TLS socket cap includes failed TLS states until the caller closes them. A failed handshake cannot continually allocate replacements on one socket.

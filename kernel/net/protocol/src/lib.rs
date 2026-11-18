@@ -1,4 +1,4 @@
-//! `moruna.net` 3.1 (SDD 31, d.1): the network server's sockets, for the processes of a
+//! `moruna.net` 3.2 (SDD 31, d.1): the network server's sockets, for the processes of a
 //! node that speak to the network. A client connects, listens and accepts, sends and
 //! receives TCP bytes with backpressure and closes each half of a connection; binds
 //! UDP sockets and sends and receives datagrams; pings; and resolves names.
@@ -30,7 +30,7 @@ mod policy;
 mod suites;
 mod types;
 
-pub use policy::{name_matches, name_valid, normalise_name};
+pub use policy::{EVERY_NAME, name_matches, name_valid, normalise_name};
 pub use suites::{SUITE_NAME, pair_suite, suite};
 pub use types::{
     Addr, Cidr, Endpoint, Info, Interface, NameRule, Opened, Policy, Rule, SocketState,
@@ -105,7 +105,8 @@ mod transport {
             major = 3;
             // 3.1 (work item 1.3b): a policy bounds its sockets' buffers, the sockets
             // one peer holds, and how long a closing socket lingers.
-            minor = 1;
+            // 3.2 (item 3.4): the name rule `*`, every name at its ports.
+            minor = 2;
             requests {
                 /// The interfaces, their addresses and links, the resolver's servers, and
                 /// this connection's policy.
@@ -149,7 +150,8 @@ mod transport {
                 /// A socket's state, endpoints and queues.
                 15 => fn status(socket: u32) -> SocketStatus;
                 /// Upgrades a pristine established outbound TCP socket to verified TLS
-                /// 1.3 under the boot's trust roots and UTC clock. No plaintext fallback.
+                /// 1.3 under the boot's trust roots and the node's wall clock (refused
+                /// `TlsUnavailable` while it is unset). No plaintext fallback.
                 16 => fn start_tls(socket:u32,server_name:String) -> ();
                 /// One actual immutable Account binding before any network operation.
                 17 => fn bind_account(account:Handle) -> ();

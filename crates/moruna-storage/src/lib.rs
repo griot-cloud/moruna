@@ -12,6 +12,7 @@ pub mod conformance;
 pub mod local;
 #[cfg(all(feature = "native", target_os = "linux", target_arch = "x86_64"))]
 pub mod native;
+pub mod net;
 pub mod port;
 pub mod prefetch;
 pub mod provision;

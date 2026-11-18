@@ -124,7 +124,7 @@ fn caller_owned_ingress_major_explicitly_refuses_legacy_payload_protocol() {
         netstack_protocol::net::ID.accepts(&hello),
         Err(moruna_svc::Refusal::MajorMismatch)
     );
-    // 3.1 (work item 1.3b): a policy's bounds on memory.
+    // 3.1 (work item 1.3b): a policy's bounds on memory; 3.2 (item 3.4): the name rule `*`.
     assert_eq!(netstack_protocol::net::ID.major, 3);
-    assert_eq!(netstack_protocol::net::ID.minor, 1);
+    assert_eq!(netstack_protocol::net::ID.minor, 2);
 }

@@ -107,7 +107,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 start="$EPOCHREALTIME"
-qemu-system-x86_64 -machine "$machine" -smp "$cpus" -m 2G -nodefaults -no-reboot -display none \
+qemu-system-x86_64 -machine "$machine" -smp "$cpus" -m 2G -rtc base=utc -nodefaults -no-reboot -display none \
   "${accel[@]}" \
   -drive "if=pflash,format=raw,readonly=on,file=$code" \
   -drive "if=pflash,format=raw,file=$vars" \

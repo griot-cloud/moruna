@@ -912,6 +912,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-net-session"
+version = "0.1.0"
+dependencies = [
+ "moruna-netstack",
+ "moruna-node-http",
+ "moruna-svc",
+ "netstack-protocol",
+ "rcgen",
+ "rustls",
+]
+
+[[package]]
 name = "moruna-netstack"
 version = "0.1.0"
 dependencies = [
@@ -996,6 +1008,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-node-http"
+version = "0.1.0"
+dependencies = [
+ "moruna-netstack",
+ "moruna-svc",
+ "netstack-protocol",
+ "rcgen",
+ "rustls",
+]
+
+[[package]]
 name = "moruna-node-image"
 version = "0.1.0"
 dependencies = [
@@ -1014,6 +1037,7 @@ dependencies = [
  "moruna-netstack",
  "moruna-node",
  "moruna-node-config",
+ "moruna-node-http",
  "moruna-svc",
  "netstack-protocol",
  "serde_json",
@@ -1298,6 +1322,7 @@ dependencies = [
  "moruna-storage-service",
  "moruna-svc",
  "moruna-sys",
+ "netstack-protocol",
  "node-protocol",
 ]
 
@@ -1306,6 +1331,13 @@ name = "node-functions"
 version = "0.1.0"
 dependencies = [
  "moruna-imagefs",
+ "moruna-netstack",
+ "moruna-node",
+ "moruna-node-http",
+ "moruna-svc",
+ "netstack-protocol",
+ "rcgen",
+ "rustls",
 ]
 
 [[package]]

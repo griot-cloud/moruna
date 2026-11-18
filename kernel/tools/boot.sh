@@ -136,7 +136,7 @@ echo "boot: vsock through $backend (guest cid 3), its host side $uds" >&2
 set +e
 timeout --kill-after=5 "$seconds" qemu-system-x86_64 \
   "${accel[@]}" \
-  -m "$memory" -smp "$cpus" \
+  -m "$memory" -smp "$cpus" -rtc base=utc \
   -nographic -display none -monitor none -serial stdio -no-reboot \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
   "${devices[@]}" \

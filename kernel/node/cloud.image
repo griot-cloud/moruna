@@ -38,6 +38,10 @@ process node-supervisor
   handle program:netvsc image.netvsc
   handle data:node.conf config
   handle data:network.conf network.config
+  # Mozilla's roots as curl publishes them, for the network server's TLS (system design 3D):
+  # kernel/node/tools/tls-roots.py converts it from curl's release, kept with its record in
+  # kernel/node/tools/roots/.
+  handle data:tls.roots tls.roots
   driver 1af4:1042 virtio-blk block
   driver 1af4:1041 virtio-net net
   driver 1b36:0010 nvme nvme

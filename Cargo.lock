@@ -2129,6 +2129,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-net-session"
+version = "0.1.0"
+dependencies = [
+ "moruna-svc",
+ "netstack-protocol",
+]
+
+[[package]]
 name = "moruna-package"
 version = "0.6.6"
 dependencies = [
@@ -2419,6 +2427,7 @@ dependencies = [
  "libc",
  "moruna-kernel",
  "moruna-micro",
+ "moruna-net-session",
  "moruna-storage-format",
  "moruna-storage-service",
  "moruna-svc",

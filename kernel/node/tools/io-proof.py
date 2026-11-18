@@ -96,7 +96,7 @@ def main():
         result["root_sha256"] = root_hash
         proof = Path(__file__).with_name("proof.py").resolve()
         for phase in ("created", "existing"):
-            # Regenerate only the explicit trusted UTC anchor/config using the same
+            # Regenerate only the network config using the same
             # CA/key and actual peer endpoint. NEVER provision/replace home again.
             command(["python3", args.net_proof, "prepare", args.out, "--card", "net0", "--port", ready["port"]])
             before = digest(home)

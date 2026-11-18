@@ -133,6 +133,11 @@ fn set_base(base: u64, source: u64) {
 pub fn set_realtime(utc_ns: u64) -> Result<(), Error> {
     let base = scale::realtime_base(utc_ns, now()).ok_or(Error::InvalidArgs)?;
     set_base(base, clock_page::realtime::SET);
+    // The node's one wall clock changed: said on the console, once a set (system design 3D).
+    early_println!(
+        "kk: clock: the wall clock set to {} s since 1970",
+        utc_ns / 1_000_000_000
+    );
     Ok(())
 }
 

@@ -14,13 +14,13 @@ use std::{
 use moruna_node_config::{Cloud, Handover, HandoverError, NodeConfig, base64};
 
 use super::{
-    FakeClock, FakeNetwork, RECORDED_AZURE_ID, RECORDED_CONFIG, RECORDED_OPENSTACK_ID,
+    FakeClock, FakeNetwork, FakeWall, RECORDED_AZURE_ID, RECORDED_CONFIG, RECORDED_OPENSTACK_ID,
     RECORDED_OPENSTACK_TIME, Reply, SECOND, Sent, answer, azure, openstack, recorded_health,
     wire_server,
 };
 use crate::{
-    boot::{Fatal, Inputs, READY_LIMIT_NS, Stage, cloud_line, ready_line, run, serve},
-    machine::{Clock, Control, FOREVER, Link, LinkError, StreamError},
+    boot::{Fatal, Inputs, READY_LIMIT_NS, RETIME_NS, Stage, cloud_line, ready_line, run, serve},
+    machine::{Clock, Control, Link, LinkError, StreamError},
     wireserver,
 };
 
@@ -127,6 +127,7 @@ struct Booted {
     clock: FakeClock,
     /// Each request a server saw, and when its connection was made.
     requests: Vec<(u64, Sent)>,
+    wall: FakeWall,
 }
 
 impl Booted {
@@ -159,9 +160,11 @@ fn boot_with(
     prepare(&mut api);
     let api = Rc::new(RefCell::new(api));
     let console = events.clone();
+    let mut wall = FakeWall::default();
     let result = run(
         &mut network,
         &mut clock,
+        &mut wall,
         &mut FakeControl(api.clone()),
         &mut |line: &str| console.borrow_mut().push(line.to_string()),
         inputs,
@@ -177,6 +180,7 @@ fn boot_with(
         api,
         clock,
         requests: network.requests,
+        wall,
     }
 }
 
@@ -245,6 +249,12 @@ fn a_node_on_openstack_hands_over_and_says_it_is_ready() {
             "the hand-over".to_string(),
             "moruna: ready api=10.0.2.15:443 boot_ms=46".to_string(),
         ]
+    );
+    // The node's wall clock was set once, before the hand-over: to that Date as of when its
+    // answer arrived, 2 ms before (system design 3D).
+    assert_eq!(
+        booted.wall.times(),
+        [RECORDED_OPENSTACK_TIME * SECOND + 2 * MS]
     );
     // What api got is the hand-over, as its half of the crate reads it: before the node was
     // ready, so with no boot_ms.
@@ -767,7 +777,15 @@ fn served(prepare: impl FnOnce(&mut FakeApi)) -> (Fatal, Handover, FakeApi) {
     let mut api = FakeApi::new(&clock, &events);
     prepare(&mut api);
     let api = Rc::new(RefCell::new(api));
-    let fatal = serve(&mut clock, &mut FakeControl(api.clone()), &handover);
+    let mut network = FakeNetwork::serving(&clock, |_, sent| openstack(sent));
+    let fatal = serve(
+        &mut network,
+        &mut clock,
+        &mut FakeWall::default(),
+        &mut FakeControl(api.clone()),
+        &handover,
+        &mut |line: &str| panic!("serve said {line}"),
+    );
     let api = Rc::try_unwrap(api).ok().unwrap().into_inner();
     (fatal, handover, api)
 }
@@ -794,8 +812,8 @@ fn each_later_start_of_api_gets_the_same_hand_over() {
             t + 80 * MS + 10 * SECOND,
         ]
     );
-    // A start is waited for with no deadline: api may never die.
-    assert_eq!(api.channels, [FOREVER; 4]);
+    // A start is waited for until the hour's re-read of the wall clock (none came here).
+    assert_eq!(api.channels, [t + RETIME_NS; 4]);
     // When the supervisor's channel ends, so does platform, with the reason.
     assert_eq!(
         fatal.to_string(),

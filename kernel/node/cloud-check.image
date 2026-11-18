@@ -39,6 +39,9 @@ process node-supervisor
   handle program:storvsc-check image.storvsc-check
   handle data:node.conf config
   handle data:network.conf network.config
+  # Mozilla's roots, as the cloud profile's (system design 3D): a copy of kernel/node/cloud's,
+  # which test_package.py keeps the same.
+  handle data:tls.roots tls.roots
   driver 1af4:1042 virtio-blk block
   driver 1af4:1041 virtio-net net
   driver 1b36:0010 nvme nvme

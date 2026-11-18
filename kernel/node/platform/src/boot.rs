@@ -16,7 +16,7 @@ use moruna_node_config::{Cloud, Handover, NodeConfig, READY, cloud_name};
 
 use crate::{
     date, instance,
-    machine::{Clock, Control, FOREVER, Link, LinkError, Network},
+    machine::{Clock, Control, Link, LinkError, Network, WallClock},
     wireserver,
 };
 
@@ -71,16 +71,21 @@ impl Fatal {
     }
 }
 
+/// Writes `reason` as a console line shows it: it may quote what came from outside the node, so
+/// as one line of printable ASCII, at most [`REASON_SHOWN`] characters.
+fn write_reason(f: &mut impl Write, reason: &str) -> fmt::Result {
+    for character in reason.chars().take(REASON_SHOWN) {
+        let shown = character == ' ' || character.is_ascii_graphic();
+        f.write_char(if shown { character } else { '?' })?;
+    }
+    Ok(())
+}
+
 impl fmt::Display for Fatal {
-    /// The console line. The reason may quote what came from outside the node, so it is shown
-    /// as one line of printable ASCII.
+    /// The console line.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "moruna: fatal {}: ", self.stage.name())?;
-        for character in self.reason.chars().take(REASON_SHOWN) {
-            let shown = character == ' ' || character.is_ascii_graphic();
-            f.write_char(if shown { character } else { '?' })?;
-        }
-        Ok(())
+        write_reason(f, &self.reason)
     }
 }
 
@@ -105,12 +110,28 @@ pub struct Inputs {
     pub memory_bytes: u64,
 }
 
+/// Sets the node's wall clock to `unix_seconds` as of `read_at_ns` on the monotonic clock: what it
+/// reads now is that time and the time since.
+fn set_wall_clock<C: Clock, W: WallClock>(
+    wall: &mut W,
+    clock: &C,
+    unix_seconds: u64,
+    read_at_ns: u64,
+) -> Result<(), String> {
+    let utc_ns = unix_seconds
+        .checked_mul(instance::SECOND)
+        .ok_or_else(|| String::from("the time is past what the clock holds"))?
+        .saturating_add(clock.now().saturating_sub(read_at_ns));
+    wall.set(utc_ns)
+}
+
 /// Boots: returns the hand-over `api` took, with the node's `boot_ms` from the ready line for
-/// `api`'s later starts, having printed the `cloud` and `ready` lines through `console`, or the
-/// reason the node must stop.
-pub fn run<N: Network, C: Clock, K: Control>(
+/// `api`'s later starts, having set the wall clock through `wall` and printed the `cloud` and
+/// `ready` lines through `console`, or the reason the node must stop.
+pub fn run<N: Network, C: Clock, W: WallClock, K: Control>(
     network: &mut N,
     clock: &mut C,
+    wall: &mut W,
     control: &mut K,
     console: &mut dyn FnMut(&str),
     inputs: Inputs,
@@ -125,6 +146,13 @@ pub fn run<N: Network, C: Clock, K: Control>(
             .ok_or("the Date header of the answer that named the cloud is not an IMF-fixdate"),
     }
     .map_err(|reason| Fatal::new(Stage::InstanceData, reason))?;
+    // It is the node's one wall clock (system design 3D): the network server's TLS reads it.
+    set_wall_clock(wall, clock, wall_clock, found.read_at_ns).map_err(|reason| {
+        Fatal::new(
+            Stage::InstanceData,
+            format!("the wall clock was not set from the Date header: {reason}"),
+        )
+    })?;
 
     // 3. Node config: the instance's user-data.
     let config = found
@@ -221,10 +249,19 @@ fn exchange<L: Link>(link: &mut L, message: &[u8], deadline: u64) -> Result<(), 
 
 /// After the boot, hands `handover` again to each new start of `api`, as the supervisor sends
 /// that start's channel (system design 2B; PM, item 2.2c), with 1D's 10 s for `ready` each
-/// time, counted from when the channel arrives. Nothing reaches the console: the supervisor's
-/// restart line and `api`'s new `tls` line say what happened. Returns only the reason it cannot
-/// go on.
-pub fn serve<C: Clock, K: Control>(clock: &mut C, control: &mut K, handover: &Handover) -> Fatal {
+/// time, counted from when the channel arrives. Nothing about `api` reaches the console: the
+/// supervisor's restart line and `api`'s new `tls` line say what happened. Every hour between
+/// them it sets the wall clock again ([`Refresh`], system design 3D), saying through `console`
+/// only a re-read that fails after one that did not, and the next that succeeds. Returns only
+/// the reason it cannot go on.
+pub fn serve<N: Network, C: Clock, W: WallClock, K: Control>(
+    network: &mut N,
+    clock: &mut C,
+    wall: &mut W,
+    control: &mut K,
+    handover: &Handover,
+    console: &mut dyn FnMut(&str),
+) -> Fatal {
     let message = match handover.encode() {
         Ok(message) => message,
         Err(error) => {
@@ -234,10 +271,18 @@ pub fn serve<C: Clock, K: Control>(clock: &mut C, control: &mut K, handover: &Ha
             );
         }
     };
+    let mut refresh = Refresh::default();
+    let mut next = clock.now().saturating_add(RETIME_NS);
     loop {
-        // The wait for a start has no deadline: `api` may never die.
-        let mut link = match control.next_api(FOREVER) {
+        // A start is waited for until the hour's re-read of the wall clock, then again: `api`
+        // may never die.
+        let mut link = match control.next_api(next) {
             Ok(link) => link,
+            Err(LinkError::TimedOut) => {
+                refresh.run(network, clock, wall, handover.cloud, console);
+                next = next.saturating_add(RETIME_NS);
+                continue;
+            }
             Err(error) => {
                 return Fatal::new(
                     Stage::Platform,
@@ -248,6 +293,75 @@ pub fn serve<C: Clock, K: Control>(clock: &mut C, control: &mut K, handover: &Ha
         let deadline = clock.now().saturating_add(READY_LIMIT_NS);
         if let Err(fatal) = exchange(&mut link, &message, deadline) {
             return fatal;
+        }
+    }
+}
+
+/// How often `platform` sets the wall clock again once the node is ready (system design 3D): S3
+/// and Blob sign requests with it, and refuse any more than 15 minutes from their own.
+pub const RETIME_NS: u64 = 3600 * instance::SECOND;
+
+/// How long the request that reads the `Date` again may take.
+pub const RETIME_LIMIT_NS: u64 = 10 * instance::SECOND;
+
+/// Sets the wall clock again from the `Date` of `cloud`'s instance document: one request, within
+/// [`RETIME_LIMIT_NS`]; returns the Unix seconds it was set to. When it cannot, the clock runs on
+/// as it was last set and the reason is returned: the node goes on either way.
+pub fn retime<N: Network, C: Clock, W: WallClock>(
+    network: &mut N,
+    clock: &mut C,
+    wall: &mut W,
+    cloud: Cloud,
+) -> Result<u64, String> {
+    let deadline = clock.now().saturating_add(RETIME_LIMIT_NS);
+    let (date, read_at_ns) = instance::date_of(network, clock, cloud, deadline)?;
+    let unix_seconds =
+        date::parse(&date).ok_or_else(|| String::from("the Date header is not an IMF-fixdate"))?;
+    set_wall_clock(wall, clock, unix_seconds, read_at_ns)?;
+    Ok(unix_seconds)
+}
+
+/// The line once a re-read succeeds after one failed.
+pub const REFRESHED: &str = "platform: wall clock refreshed";
+
+/// The line when a re-read fails, the first since the clock was last set.
+pub fn not_refreshed_line(reason: &str) -> String {
+    let mut line = String::from("platform: wall clock not refreshed: ");
+    // Writing to a String does not fail.
+    let _ = write_reason(&mut line, reason);
+    line
+}
+
+/// What `platform` says of its hourly re-reads (system design 3D): the first that fails, then
+/// nothing until one succeeds, which it says too. Neither is fatal: the clock runs on as it was
+/// last set.
+#[derive(Debug, Default)]
+pub struct Refresh {
+    /// Whether the last re-read failed.
+    failing: bool,
+}
+
+impl Refresh {
+    /// One re-read ([`retime`]), saying through `console` whether it changed from failing to
+    /// not or back.
+    pub fn run<N: Network, C: Clock, W: WallClock>(
+        &mut self,
+        network: &mut N,
+        clock: &mut C,
+        wall: &mut W,
+        cloud: Cloud,
+        console: &mut dyn FnMut(&str),
+    ) {
+        match retime(network, clock, wall, cloud) {
+            Ok(_) if self.failing => {
+                self.failing = false;
+                console(REFRESHED);
+            }
+            Err(reason) if !self.failing => {
+                self.failing = true;
+                console(&not_refreshed_line(&reason));
+            }
+            Ok(_) | Err(_) => {}
         }
     }
 }

@@ -45,7 +45,8 @@ PROGRAMS["cloud-test"] = PROGRAMS["cloud"]
 FEATURES = {"standalone": [], "cloud": [], "cloud-test": ["moruna-node-api/test-exit"]}
 # The flags only a launcher's node takes, refused for a cloud image.
 LAUNCHER_FLAGS = (("agent_port", "--agent-port"), ("cpus", "--cpus"), ("layer", "--layer"),
-                  ("writable_home", "--writable-home"), ("user_network", "--user-network"), ("cid", "--cid"))
+                  ("writable_home", "--writable-home"), ("user_network", "--user-network"), ("cid", "--cid"),
+                  ("profile_json", "--profile-json"))
 # The C of a user program (`ring`, which the network server brings in) is compiled as
 # kernel/tools/build.sh compiles it: by clang, freestanding, for the bare x86_64 ELF target.
 USER_CC = "CC_x86_64_moruna_user"
@@ -117,6 +118,16 @@ def recorded(paths):
     return evidence
 
 
+def bound(description):
+    """The asset files `description` binds: the NAME of each `handle data:NAME SLOT`."""
+    names = set()
+    for line in description.splitlines():
+        words = line.split()
+        if len(words) == 3 and words[0] == "handle" and words[1].startswith("data:"):
+            names.add(words[1].removeprefix("data:"))
+    return names
+
+
 def arguments(argv=None):
     """The command line, checked for its profile before anything is built."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -125,6 +136,8 @@ def arguments(argv=None):
     parser.add_argument("--assets", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--package", action="append", default=[])
+    parser.add_argument("--profile-json", type=Path,
+                        help="configure.py's validated profile (its --profile-out), which renders a launcher's node's description")
     parser.add_argument("--layer", action="append", type=Path, default=[])
     parser.add_argument("--writable-home", action="append", type=Path, default=[])
     parser.add_argument("--user-network", action="store_true")
@@ -140,7 +153,8 @@ def arguments(argv=None):
         if given:
             parser.error(f"the {args.profile} profile takes no {', '.join(given)}")
         return parser, args
-    missing = [flag for name, flag in (("agent_port", "--agent-port"), ("cpus", "--cpus")) if getattr(args, name) is None]
+    missing = [flag for name, flag in (("agent_port", "--agent-port"), ("cpus", "--cpus"), ("profile_json", "--profile-json"))
+               if getattr(args, name) is None]
     if missing:
         parser.error(f"the following arguments are required: {', '.join(missing)}")
     if args.cid is None:
@@ -168,21 +182,17 @@ def main():
         if shutil.which(tool) is None:
             parser.error(f"required tool unavailable: {tool}")
     # Do not follow asset symlinks into a host home or silently package sockets.
-    files = []
+    present = {}
     for item in sorted(assets.rglob("*")):
         if item.is_symlink() or not (item.is_dir() or item.is_file()):
             parser.error(f"asset must be a regular file or directory: {item}")
         if item.is_file():
-            files.append(item)
-    out.mkdir(mode=0o700, parents=False)
-    payload = out / "payload"
-    payload.mkdir()
-    for item in files:
-        target = payload / item.relative_to(assets)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(item, target)
+            present[item.relative_to(assets).as_posix()] = item
     # configure.py's rendering profile is the standalone node's; a cloud image has none.
-    profile = {} if cloud else json.loads((payload / "profile.json").read_text())
+    try:
+        profile = {} if cloud else json.loads(args.profile_json.read_text())
+    except (OSError, ValueError) as error:
+        parser.error(f"the profile {args.profile_json}: {error}")
     additions=[]
     if profile.get("storage_provider") == "bucket": additions.append("  handle data:storage.credential storage.credential")
     if profile.get("storage_provider")=="local-single-node-home":
@@ -193,9 +203,29 @@ def main():
         additions += ["  handle program:storage-maintenance image.maintenance",
                       "  handle data:maintenance.conf maintenance.server-config",
                       "  handle data:maintenance.conf maintenance.client-config"]
+    text = description.read_text()
+    if additions:
+        text += "\n".join(additions) + "\n"
+    # The assets hold exactly what ships: what the description binds, and a launcher's node's
+    # layers. Anything else is refused by name, so nothing is left out unseen.
+    wanted = bound(text) | {name.as_posix() for name in args.layer}
+    unbound = sorted(present.keys() - wanted)
+    if unbound:
+        parser.error(f"assets the description does not bind: {', '.join(unbound)}")
+    missing = sorted(bound(text) - present.keys())
+    if missing:
+        parser.error(f"the description binds data the assets do not hold: {', '.join(missing)}")
+    files = [item for name, item in present.items() if name in wanted]
+    out.mkdir(mode=0o700, parents=False)
+    payload = out / "payload"
+    payload.mkdir()
+    for item in files:
+        target = payload / item.relative_to(assets)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(item, target)
     if additions:
         rendered=out / "standalone.image"
-        rendered.write_text(description.read_text() + "\n".join(additions) + "\n")
+        rendered.write_text(text)
         description=rendered
     target = "x86_64-unknown-none"
     # Separate real user ABI; core/alloc and binaries must not reuse kernel output.

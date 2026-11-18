@@ -90,7 +90,7 @@ console="$out/console.log"
 rm -f "$console" "$out/net.pcap" "$pidfile"
 start="$EPOCHREALTIME"
 # In the background, its own process: it stays up after this script returns.
-nohup qemu-system-x86_64 -machine q35 -smp "$cpus" -m 2G -nodefaults -no-reboot -display none \
+nohup qemu-system-x86_64 -machine q35 -smp "$cpus" -m 2G -rtc base=utc -nodefaults -no-reboot -display none \
   "${accel[@]}" \
   -drive "if=pflash,format=raw,readonly=on,file=$code" \
   -drive "if=pflash,format=raw,file=$vars" \

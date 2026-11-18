@@ -41,9 +41,9 @@ use moruna_netstack::{
     granted, parse,
 };
 use moruna_svc::{
-    CallError, Channel, ClientCore, Completions, Console, DEADLINE_INFINITE, Decoder, Encoder,
-    Handle, Memory, Rights, Signals, Timer, Watch, Wire, deadline_in, limits, now, println, random,
-    start,
+    CallError, Channel, ClientCore, ClockPage, Completions, Console, DEADLINE_INFINITE, Decoder,
+    Encoder, Handle, Memory, Rights, Signals, Timer, Watch, Wire, deadline_in, limits, now,
+    println, random, start,
 };
 use net_protocol::{Frame, Link, SEND_FRAMES_MAX, net as card};
 
@@ -424,24 +424,17 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
         )?
     };
     let mut stack = Stack::new(&config, &cards, u64::from_le_bytes(seed), now())?;
-    match (start::take("tls-roots"), config.settings.tls_unix_seconds) {
-        (None, 0) => {}
-        (Some(roots), seconds) if seconds > 0 => {
-            let time = moruna_netstack::tls::TrustedTime::new(
-                seconds,
-                now(),
-                config.settings.tls_time_valid_ms * 1_000_000,
-            )
-            .ok_or("invalid trusted TLS clock anchor")?;
-            let trust = moruna_netstack::tls::Trust::new(read_tls_roots(roots)?, time)
-                .map_err(String::from)?;
-            stack.install_tls(trust)?;
-        }
-        _ => {
-            return Err(String::from(
-                "TLS needs both the tls-roots capability and a trusted UTC anchor",
-            ));
-        }
+    // TLS's time is the node's one wall clock, the core's clock page (system design 3D): set at
+    // boot from the machine's clock, and by `platform` from its cloud's `Date`. While it is
+    // unset, `start_tls` is refused `TlsUnavailable`. With no roots there is no TLS at all.
+    let mut tls_roots = None;
+    if let Some(roots) = start::take("tls-roots") {
+        let page = ClockPage::map().map_err(|e| format!("the clock page: {}", e.name()))?;
+        let time = moruna_netstack::tls::TrustedTime::new(move || page.realtime());
+        let roots = read_tls_roots(roots)?;
+        tls_roots = Some(roots.len());
+        let trust = moruna_netstack::tls::Trust::new(roots, time).map_err(String::from)?;
+        stack.install_tls(trust)?;
     }
     let in_flight = stack.settings.card_sends_in_flight;
     let mut up = format!(
@@ -450,6 +443,9 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
         config.grants.len(),
         start::cpus()
     );
+    if let Some(count) = tls_roots {
+        up.push_str(&format!(", TLS with {count} roots"));
+    }
     for (k, x) in stack.ifaces.iter().enumerate() {
         let addrs: Vec<String> = x.info().addrs.iter().map(|c| format!("{c}")).collect();
         let card = if k == 0 {

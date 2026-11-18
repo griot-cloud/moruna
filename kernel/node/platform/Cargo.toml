@@ -18,6 +18,8 @@ moruna-svc.workspace = true
 # The supervisor's start message to `platform` (its `platform` bootstrap), and node.conf's parser.
 moruna-node = { path = "../core", version = "=0.1.0" }
 moruna-node-config = { path = "../config", version = "=0.1.0" }
+# The minimal HTTP/1.1 client and its byte streams, shared with node-admission.
+moruna-node-http = { path = "../http", version = "=0.1.0" }
 netstack-protocol = { path = "../../net/protocol", version = "=0.1.0" }
 serde_json = { version = "=1.0.154", default-features = false, features = ["alloc"] }
 

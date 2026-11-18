@@ -698,9 +698,6 @@ impl Stack {
     /// Takes the frames delivered, answers what can be answered, and sends.
     pub fn poll(&mut self, now: u64) {
         self.now = now;
-        if let Some(trust) = &self.trust {
-            trust.time.update(now);
-        }
         self.expire_server_identities();
         let t = instant(now);
         for _ in 0..LOOPBACK_ROUNDS {
