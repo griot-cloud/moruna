@@ -345,6 +345,68 @@ impl Handler for Idle {
     }
 }
 
+/// A calc server that serves only after `delay`, as a server waiting for its devices or layers
+/// at boot does: connections and hellos wait on its listener meanwhile.
+fn late_calc_server(delay: std::time::Duration) -> (Channel, JoinHandle<Result<(), Error>>) {
+    serve(move || {
+        thread::sleep(delay);
+        Dispatcher::new()
+    })
+}
+
+#[test]
+fn kb5_t9_an_old_major_is_refused_however_late_the_server_starts() {
+    const MS: u64 = 1_000_000;
+    let old = ProtocolId::new("moruna.test.calc", 0, 9);
+    // A server that serves after 600 ms, and a check whose exchange is given 100 ms.
+    let (listener, join) = late_calc_server(std::time::Duration::from_millis(600));
+    // Timed from before the server's start, the refusal "did not come": imagefs-test's and
+    // linux-test's KB5 checks, on a loaded machine under the emulator.
+    let channel = client::connect(&listener).expect("connect");
+    match moruna_svc::ClientCore::connect(channel, old, deadline_in(100 * MS)) {
+        Err(CallError::TimedOut) => {}
+        other => panic!(
+            "expected the early check to time out, got {:?}",
+            other.map(|_| ())
+        ),
+    }
+    // Waiting for the server first, the refusal comes within the exchange's 100 ms.
+    let started = now();
+    conformance::old_major_refused(&listener, calc::ID, old, 10_000 * MS, 100 * MS)
+        .expect("refused once the server is up");
+    assert!(
+        now() - started >= 400 * MS,
+        "it waited for the server's start"
+    );
+    // `ready` on a server already up answers at once.
+    let up = client::ready(&listener, calc::ID, deadline_in(100 * MS)).expect("up");
+    assert_eq!(up.server_minor(), calc::ID.minor);
+    drop(up);
+    // A server that welcomes the "old" major fails the check, naming what it answered.
+    let why = conformance::old_major_refused(
+        &listener,
+        calc::ID,
+        ProtocolId::new("moruna.test.calc", 1, 0),
+        10_000 * MS,
+        100 * MS,
+    )
+    .expect_err("major 1 is the server's own");
+    assert!(
+        why.contains("not refused") && why.contains("Ok(())"),
+        "{why}"
+    );
+    drop(listener);
+    join.join().expect("server").expect("run");
+    // A server that never comes up is said, after the readiness bound and not the exchange's.
+    let (listener, _held) = Channel::create().expect("channel");
+    let why = conformance::old_major_refused(&listener, calc::ID, old, 200 * MS, 100 * MS)
+        .expect_err("nobody serves");
+    assert!(
+        why.contains("did not come up") && why.contains("TimedOut"),
+        "{why}"
+    );
+}
+
 #[test]
 fn sv_t3_the_handshake_refuses_with_its_reason() {
     let (listener, join) = calc_server();

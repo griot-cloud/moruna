@@ -101,7 +101,20 @@ fn a_client_initializes_lists_and_calls_each_tool() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["moruna_health", "moruna_node", "moruna_node_audit"]);
+    assert_eq!(
+        names,
+        [
+            "moruna_health",
+            "moruna_node",
+            "moruna_node_audit",
+            "moruna_jobs_validate",
+            "moruna_jobs_submit",
+            "moruna_jobs_list",
+            "moruna_jobs_get",
+            "moruna_jobs_cancel",
+            "moruna_jobs_report"
+        ]
+    );
 
     let call = |name: &str| request(3, "tools/call", json!({ "name": name, "arguments": {} }));
     let health = answer(

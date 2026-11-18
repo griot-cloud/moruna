@@ -4,7 +4,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     arch::{
-        kernel::apic::{self, Apic, DivideConfig},
+        kernel::{
+            apic::{self, Apic, DivideConfig},
+            tsc::boot_wait,
+        },
         timer::pit::OperatingMode,
         trap::TrapFrame,
         tsc_freq,
@@ -109,6 +112,28 @@ fn init_deadline_mode_config() {
 fn init_periodic_mode_config() {
     info!("Enable APIC periodic mode");
 
+    // moruna: on Hyper-V the timer's rate is `HV_X64_MSR_APIC_FREQUENCY`'s, and nothing is
+    // calibrated (Moruna's system design, section 1F, "Clock rates"; work item 1.8).
+    // Elsewhere it is calibrated against the PIT as before, once the PIT is found to be
+    // there: a machine with none says so and powers off at once.
+    if let Some(init_count) = crate::arch::cpu::hypervisor::apic_timer_count(
+        &crate::arch::kernel::hyperv::ThisCpu,
+        TIMER_FREQ,
+    ) {
+        info!(
+            "APIC timer: init {:#x} from Hyper-V's frequency",
+            init_count
+        );
+        CONFIG.call_once(|| Config::PeriodicMode {
+            init_count: u64::from(init_count),
+        });
+        return;
+    }
+    if !super::pit::is_present() {
+        crate::early_println!("{}", super::pit::presence::NO_PIT_FOR_APIC_TIMER);
+        crate::power::poweroff(crate::power::ExitCode::Failure);
+    }
+
     // Allocate IRQ
     let mut irq = IrqLine::alloc().unwrap();
     irq.on_active(pit_callback);
@@ -124,16 +149,22 @@ fn init_periodic_mode_config() {
     apic.set_timer_init_count(0xFFFF_FFFF);
 
     // Wait until `CONFIG` is ready
-    loop {
-        crate::arch::irq::enable_local_and_halt();
-
-        // Disable local IRQs so they won't come after checking `CONFIG`
-        // but before halting the CPU.
-        crate::arch::irq::disable_local();
-
-        if CONFIG.is_completed() {
-            break;
-        }
+    //
+    // moruna: the wait has a deadline (Moruna's system design, section 1B), as the TSC's
+    // calibration has (`kernel/tsc.rs`): it pauses with local IRQs enabled where upstream
+    // halted until the next interrupt, and ends with local IRQs disabled.
+    let measured = boot_wait::wait(
+        crate::arch::read_tsc,
+        || {
+            crate::arch::irq::enable_local();
+            core::hint::spin_loop();
+            crate::arch::irq::disable_local();
+        },
+        || CONFIG.is_completed(),
+    );
+    if !measured {
+        crate::early_println!("{}", boot_wait::APIC_TIMER_TIMED_OUT);
+        crate::power::poweroff(crate::power::ExitCode::Failure);
     }
 
     // Disable PIT

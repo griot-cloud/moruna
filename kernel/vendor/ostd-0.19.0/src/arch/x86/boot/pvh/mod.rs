@@ -275,6 +275,8 @@ impl ToEarlyBootInfo for HvmStartInfoV0 {
 // SAFETY: The name does not collide with other symbols.
 #[unsafe(no_mangle)]
 unsafe extern "sysv64" fn __pvh_entry(start_info_ptr: *const HvmStartInfoV0) -> ! {
+    // moruna: the core's clock counts from here (`crate::boot::entry_tsc`).
+    crate::boot::record_entry_tsc();
     // SAFETY: We get the start-of-day structure from the VMM, so by contract the pointer is valid
     // and the underlying memory is initialized. The V0 fields are always present regardless of
     // the version number.

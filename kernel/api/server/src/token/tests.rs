@@ -27,6 +27,19 @@ fn base64url_round_trips_and_refuses_what_is_not_canonical() {
 }
 
 #[test]
+fn standard_base64_reads_its_padding_and_its_own_alphabet() {
+    assert_eq!(base64(b"").unwrap(), b"");
+    assert_eq!(base64(b"TUpCMg==").unwrap(), b"MJB2");
+    assert_eq!(base64(b"TUpCMjM=").unwrap(), b"MJB23");
+    assert_eq!(base64(b"+/+/").unwrap(), [0xfb, 0xff, 0xbf]);
+    assert!(base64(b"TUpCMg").is_none(), "padding left out");
+    assert!(base64(b"TUpCMg=").is_none());
+    assert!(base64(b"-_-_").is_none(), "base64url, not base64");
+    assert!(base64(b"TQ=a").is_none());
+    assert!(base64(b"TR==").is_none(), "unused bits set");
+}
+
+#[test]
 fn key_ids_are_the_first_16_hex_of_the_public_key_digest() {
     let key = TokenKey::new([7; 32]);
     let digest = digest::digest(&digest::SHA256, &[7; 32]);

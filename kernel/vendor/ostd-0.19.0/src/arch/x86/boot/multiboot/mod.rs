@@ -385,6 +385,8 @@ impl ToEarlyBootInfo for MultibootLegacyInfo {
 // SAFETY: The name does not collide with other symbols.
 #[unsafe(no_mangle)]
 unsafe extern "sysv64" fn __multiboot_entry(boot_magic: u32, boot_params: u64) -> ! {
+    // moruna: the core's clock counts from here (`crate::boot::entry_tsc`).
+    crate::boot::record_entry_tsc();
     assert_eq!(boot_magic, MULTIBOOT_ENTRY_MAGIC);
     let mb1_info =
         unsafe { &*(paddr_to_vaddr(boot_params as usize) as *const MultibootLegacyInfo) };

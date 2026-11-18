@@ -1,0 +1,35 @@
+[package]
+name = "moruna-vmbus-server"
+description = "The vmbus process: moruna-vmbus's client wired to the core's Hyper-V mechanism (root.hyperv), serving moruna.driver.vmbus to VMBus drivers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+bench = false
+
+# The process itself, for the kernel's user target only: on a host it is an empty program,
+# and the library above is what the host tests run.
+[[bin]]
+name = "vmbus"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+moruna-svc.workspace = true
+moruna-vmbus = { path = "../core", version = "=0.1.0" }
+vmbus-protocol = { path = "../protocol", version = "=0.1.0" }
+# A SynIC message as the core copies it out, read into the library's `HvMessage`.
+hvdef = { path = "../../../vendor/openvmm/hvdef", version = "=0.0.0" }
+
+[target.'cfg(target_os = "none")'.dependencies]
+moruna-sys.workspace = true
+
+[dev-dependencies]
+# The fake host of moruna-vmbus's own tests (`../core/tests/vmbus/host.rs`), which the
+# server's tests drive the server against.
+guid = { path = "../../../vendor/openvmm/guid", version = "=0.0.0" }
+vmbus_core = { path = "../../../vendor/openvmm/vmbus_core", version = "=0.0.0" }
+vmbus_ring = { path = "../../../vendor/openvmm/vmbus_ring", version = "=0.0.0" }

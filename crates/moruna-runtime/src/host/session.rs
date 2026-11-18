@@ -23,10 +23,12 @@ use moruna_trace::RunReport;
 use super::events::{EventOptions, Events, Meta, unix_ns_now};
 use super::lifecycle::{Ending, Layout, Lifecycle, PlanRun, Steps};
 use super::logs::{Capture, FINISH_WAIT, Tell, attempt_dir};
+use super::node::Node;
 use super::ports::HostPorts;
 use super::protocol::{self, Heartbeat, Inbound, LimitsMsg, Outbound};
 use super::transport::{self, Address, Conn};
 use super::{VERSION, diagnostic, exit, exit_code};
+use crate::job::build::with_secrets;
 use crate::job::{BuildOptions, build};
 use crate::kinds::Registry;
 use crate::observe::RunObserver;
@@ -117,6 +119,9 @@ pub struct Wire {
     /// bytes, as `JobSpec.digest()` computes it. Absent for a version 1 document sent as JSON
     /// over `moruna serve`, whose bytes are not the document's.
     document_digest: Mutex<Option<String>>,
+    /// The job's secrets, by name, as the `spec` message gave them beside the document (system
+    /// design 3B): taken when the job's object stores are built, and never written anywhere.
+    secrets: Mutex<std::collections::BTreeMap<String, String>>,
 }
 
 impl Wire {
@@ -130,7 +135,18 @@ impl Wire {
             epoch_ns: unix_ns_now().saturating_sub(started.elapsed().as_nanos() as i64),
             frame: Mutex::new(Vec::new()),
             document_digest: Mutex::new(None),
+            secrets: Mutex::new(std::collections::BTreeMap::new()),
         })
+    }
+
+    /// Keep the job's secrets until its object stores are built.
+    pub fn set_secrets(&self, secrets: std::collections::BTreeMap<String, String>) {
+        *self.secrets.lock().unwrap_or_else(|e| e.into_inner()) = secrets;
+    }
+
+    /// The job's secrets, taken: none are left here.
+    pub fn take_secrets(&self) -> std::collections::BTreeMap<String, String> {
+        std::mem::take(&mut *self.secrets.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Record the exact bytes of the document this run was given, by their public digest.
@@ -394,8 +410,33 @@ pub fn run_file(
 }
 
 /// `moruna serve --listen <address>`: wait for one peer, say `hello`, wait for its `spec`, run
-/// it as `moruna run` would, and exit (MH 4.2). One job per process.
+/// it as `moruna run` would, and exit (MH 4.2). One job per process. On a channel
+/// (`channel:<slot>`) it serves in node mode ([`serve_channel`]), with no bound on the budget.
 pub fn serve(address: &Address, kinds: &Registry, opts: &HostOptions<'_>) -> Outcome {
+    match address {
+        Address::Channel(_) => serve_channel(&Node::on(address.to_string()), kinds, opts),
+        _ => serve_at(address, None, kinds, opts),
+    }
+}
+
+/// `moruna serve --listen channel:<slot> [--budget-max BYTES]`: [`serve`] in node mode on
+/// `node`'s channel.
+pub fn serve_channel(node: &Node, kinds: &Registry, opts: &HostOptions<'_>) -> Outcome {
+    match Address::parse(&node.channel) {
+        Ok(address @ Address::Channel(_)) => serve_at(&address, Some(node), kinds, opts),
+        _ => {
+            let refusal = SpecError::new("listen", format!("{} is not a channel", node.channel));
+            refused_without_document(None, &refusal, &Wire::new(None, Instant::now()))
+        }
+    }
+}
+
+fn serve_at(
+    address: &Address,
+    node: Option<&Node>,
+    kinds: &Registry,
+    opts: &HostOptions<'_>,
+) -> Outcome {
     let listener = match transport::listen(address) {
         Ok(listener) => listener,
         Err(error) => {
@@ -411,11 +452,38 @@ pub fn serve(address: &Address, kinds: &Registry, opts: &HostOptions<'_>) -> Out
         }
     };
     drop(listener);
-    serve_conn(conn, kinds, opts)
+    serve_on(conn, node, kinds, opts)
+}
+
+/// The document a `spec` (or a check's) message carries: version 1 as JSON, version 2's
+/// FlatBuffers as a base64 string, whose bytes come back beside the job for its digest.
+pub fn job_of(spec: serde_json::Value) -> Result<(Job, Option<Vec<u8>>), SpecError> {
+    match spec {
+        serde_json::Value::String(encoded) => {
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded.as_bytes())
+                .map_err(|e| SpecError::new("spec", format!("not base64 FlatBuffers: {e}")))?;
+            let job = Job::from_flatbuffer(&bytes).map_err(job_refusal)?;
+            Ok((job, Some(bytes)))
+        }
+        other => JobSpec::from_value(other).map(|spec| (Job::from_v1(&spec), None)),
+    }
 }
 
 /// [`serve`] once the peer has connected.
 pub fn serve_conn(conn: Conn, kinds: &Registry, opts: &HostOptions<'_>) -> Outcome {
+    serve_on(conn, None, kinds, opts)
+}
+
+/// [`serve`] in node mode, once the peer, the node's `api`, has connected on `node`'s channel
+/// (system design 3A, 3B): the document is taken by node mode's rules ([`super::node::admit`])
+/// before it is built, and a refusal is the run's, exit 2, by its field.
+pub fn serve_node(conn: Conn, node: &Node, kinds: &Registry, opts: &HostOptions<'_>) -> Outcome {
+    serve_on(conn, Some(node), kinds, opts)
+}
+
+fn serve_on(conn: Conn, node: Option<&Node>, kinds: &Registry, opts: &HostOptions<'_>) -> Outcome {
     let started = Instant::now();
     let (reader, writer, closer) = conn.into_parts();
     let wire = Wire::new(Some(writer), started);
@@ -444,25 +512,19 @@ pub fn serve_conn(conn: Conn, kinds: &Registry, opts: &HostOptions<'_>) -> Outco
             }
         };
         match Inbound::parse(&line) {
-            Ok(Inbound::Spec { spec, plan }) => {
+            Ok(Inbound::Spec {
+                spec,
+                plan,
+                secrets,
+            }) => {
                 let raw = spec.clone();
                 // Version 1 is the document as JSON; version 2 is its FlatBuffers, as base64.
-                let read = match spec {
-                    serde_json::Value::String(encoded) => {
-                        use base64::Engine as _;
-                        base64::engine::general_purpose::STANDARD
-                            .decode(encoded.as_bytes())
-                            .map_err(|e| {
-                                SpecError::new("spec", format!("not base64 FlatBuffers: {e}"))
-                            })
-                            .and_then(|bytes| {
-                                let job = Job::from_flatbuffer(&bytes).map_err(job_refusal)?;
-                                wire.set_document(&bytes);
-                                Ok(job)
-                            })
+                let read = job_of(spec).map(|(job, bytes)| {
+                    if let Some(bytes) = bytes {
+                        wire.set_document(&bytes);
                     }
-                    other => JobSpec::from_value(other).map(|spec| Job::from_v1(&spec)),
-                };
+                    job
+                });
                 let plan = match plan {
                     None => Ok(None),
                     Some(encoded) => {
@@ -477,14 +539,22 @@ pub fn serve_conn(conn: Conn, kinds: &Registry, opts: &HostOptions<'_>) -> Outco
                     }
                 };
                 match read.and_then(|job| plan.map(|plan| (job, plan))) {
-                    Ok((job, plan)) => {
-                        if job.report.socket.is_some() {
-                            wire.note(
+                    Ok((mut job, plan)) => {
+                        match node {
+                            Some(node) => {
+                                let mint = || crate::run::mint_run_id().ok().map(|id| id.to_hex());
+                                if let Err(refusal) = super::node::admit(&mut job, node, mint) {
+                                    break refused_without_document(Some(&raw), &refusal, &wire);
+                                }
+                            }
+                            None if job.report.socket.is_some() => wire.note(
                                 "report.socket is ignored under moruna serve: the peer that sent \
                                  the document is the peer"
                                     .to_string(),
-                            );
+                            ),
+                            None => {}
                         }
+                        wire.set_secrets(secrets.0);
                         break match plan {
                             Some(plan) => {
                                 run_plan(plan, job, kinds, opts, &wire, Some(reader), Mode::Serve)
@@ -652,7 +722,16 @@ fn run_planned(
                 args: run_args.clone(),
                 held: Vec::new(),
             },
-        ) {
+        )
+        .and_then(|mut built| {
+            // The references to secrets in the document's object-store settings, resolved with
+            // the secrets the peer gave beside it (none from a file): a name not given is the
+            // document's refusal, by its field.
+            let secrets = wire.take_secrets();
+            with_secrets(&mut built.spec.object_store, &job.object_store, &secrets)
+                .map_err(crate::job::refusal)?;
+            Ok(built)
+        }) {
             Ok(built) => Ok((plan, built, run_args)),
             Err(error) => Err((Some(plan), error)),
         },

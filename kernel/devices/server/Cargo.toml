@@ -18,3 +18,5 @@ moruna-driver-table = { path = "../table", version = "=0.1.0" }
 devices-protocol = { path = "../protocol", version = "=0.1.0" }
 
 moruna-node = { path = "../../node/core", version = "=0.1.0" }
+# The node's console line for a service that cannot go on (the system design, section 1B).
+moruna-abi.workspace = true

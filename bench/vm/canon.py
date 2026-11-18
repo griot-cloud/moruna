@@ -36,8 +36,11 @@ CANON_NAN = 0x7FF8000000000000
 
 # Per workload: the columns compared within a tolerance (abs, rel), and the regrouping of a
 # per-batch aggregate (keys, summed columns). Every other column must match bit for bit.
+# gate-canon's table (images/gate/functions/src/canon.rs, `spec`) governs, and this one is the
+# same (test_gate_harness.py checks it): Score's is one step of the sixth decimal, 1.1e-6, so a
+# value NumPy rounds one way and another engine the other is within it.
 SPECS = {
-    "score": {"tolerant": {"predicted_tip": (1e-6, 0.0)}},
+    "score": {"tolerant": {"predicted_tip": (1.1e-6, 0.0)}},
     "enrich": {},
     "audit": {},
     "occupancy": {"regroup": (["zone", "minute_of_day"], ["car_minutes"])},

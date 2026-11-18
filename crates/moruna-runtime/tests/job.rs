@@ -527,11 +527,41 @@ fn jb_t28_check_job_command() {
     assert_eq!(
         cli::parse(&args(&["check-job", "a.json"])),
         Ok(Command::CheckJob {
-            spec: "a.json".into()
+            spec: "a.json".into(),
+            secrets: Vec::new(),
+            node: None,
+            budget_max: None,
+        })
+    );
+    assert_eq!(
+        cli::parse(&args(&[
+            "check-job",
+            "--secret",
+            "aws.key",
+            "a.json",
+            "--secret",
+            "gcs",
+            "--node",
+            "channel:engine"
+        ])),
+        Ok(Command::CheckJob {
+            spec: "a.json".into(),
+            secrets: vec!["aws.key".into(), "gcs".into()],
+            node: Some("channel:engine".into()),
+            budget_max: None,
         })
     );
     assert!(cli::parse(&args(&["check-job"])).is_err());
     assert!(cli::parse(&args(&["check-job", "a.json", "b.json"])).is_err());
+    for bad in [
+        &["check-job", "a.json", "--secret"][..],
+        &["check-job", "a.json", "--secret", "-x"],
+        &["check-job", "a.json", "--node", "unix:///s"],
+        &["check-job", "a.json", "--node"],
+        &["check-job", "a.json", "--bogus"],
+    ] {
+        assert!(cli::parse(&args(bad)).is_err(), "{bad:?}");
+    }
     // Through `main`, the exit code is the same.
     let code = |file: &std::path::Path| {
         let argv = args(&["check-job", &file.display().to_string()]);

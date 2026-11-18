@@ -1,0 +1,24 @@
+[package]
+name = "moruna-netvsc"
+description = "Azure's synthetic network card, netvsc, for Moruna drivers: NVSP and RNDIS over a VMBus channel, Ethernet frames out through send-buffer sections and in from receive-buffer sections, in safe Rust, everything the host sends checked; tested against a fake of the host's side, not yet proven on Azure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The channel a driver sees (system design 1F).
+moruna-vmbus = { path = "../../vmbus/core", version = "=0.1.0" }
+# Microsoft's OpenVMM crates, vendored (kernel/vendor/openvmm): the NVSP and RNDIS wire
+# types and the ring buffer the work item names, and the reader and writer a ring's
+# ranges are used through (`guestmem_core`).
+netvsp_protocol = { path = "../../../vendor/openvmm/netvsp_protocol", version = "=0.0.0" }
+vmbus_ring = { path = "../../../vendor/openvmm/vmbus_ring", version = "=0.0.0" }
+guestmem_core = { path = "../../../vendor/openvmm/guestmem_core", version = "=0.0.0" }
+# The wire types are read and written as bytes through zerocopy's traits: the vendored
+# crates' own version, already in the lock file.
+zerocopy = "=0.8.63"
+
+[dev-dependencies]
+# The in-memory channel the fake netvsp sits behind. Never on in a node.
+moruna-vmbus = { path = "../../vmbus/core", version = "=0.1.0", features = ["testing"] }

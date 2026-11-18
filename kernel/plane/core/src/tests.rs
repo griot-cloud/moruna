@@ -672,6 +672,26 @@ fn dp_ring_conformance_passes_on_the_kernel_model() {
 }
 
 #[test]
+fn a_task_is_never_left_without_a_window_while_one_is_idle() {
+    use crate::ringed::gives_idle;
+    // Item 3.1: three windows, two held, one idle, a task asleep on its bell (no port wait).
+    assert!(
+        gives_idle(1, 0, 3, false),
+        "no window left: the idle one goes back"
+    );
+    // Half idle or more: one regrant covers them.
+    assert!(gives_idle(2, 1, 3, false));
+    assert!(gives_idle(1, 1, 2, false));
+    // A window in hand and under half idle: the regrant waits for more.
+    assert!(!gives_idle(1, 1, 3, false));
+    assert!(!gives_idle(1, 3, 8, false));
+    // A task waiting on its port is answered at once.
+    assert!(gives_idle(1, 3, 8, true));
+    // Nothing idle, nothing to give.
+    assert!(!gives_idle(0, 0, 3, true));
+}
+
+#[test]
 fn dp_ring_measures_calls_per_batch() {
     let f = fixtures();
     for protect in [true, false] {

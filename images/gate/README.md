@@ -8,8 +8,8 @@ runtime, so it is its own Cargo workspace, as `images/python` is stream P's.
 | Path | What it is |
 | --- | --- |
 | `functions/` | The seven functions: a `no_std` core over column slices, and Arrow `RecordBatch` in, `RecordBatch` out on arrow-rs 59.3.0 (`batch.rs`), and gate-canon/1 (`canon.rs`) |
-| `record/` | A function on the data plane: a page-aligned input record read in place, the output record written into a window (`apply`), `no_std`, safe |
-| `tasks/` | The seven native tasks, `gate-JOB`, static programs of `x86_64-moruna-user` on `moruna_sys::plane` (`tasks/build.sh`) |
+| `record/` | A function on the data plane: a page-aligned input record read in place, the output record written into a window (`apply`), `no_std`, safe. The native path until 5.1, kept as the tasks' reference |
+| `tasks/` | The seven native tasks, `gate-JOB`, programs on `moruna-function` (`kernel/function/rust`, system design 5A) built for the core with std (`tasks/build.sh`, item 5.0) |
 | `baseline/` | `gate-baseline`, the PM's control 2 (a rayon pool over arrow-rs and parquet), and `gate-canon`, the canonical hash of any engine's output |
 | `py066/` | `moruna_gate`, the PM's control 1: the seven ports as a Python extension 0.6.6's `moruna.run` runs (`check.py` checks a build against the fixtures) |
 | `fixtures/` | The oracle's inputs and Python's outputs (`bench/vm/gate_oracle.py`), and `manifest.json` |
@@ -142,13 +142,23 @@ products are most of Score's time: 9.7 billion multiply-adds for these rows.
 
 ## The native tasks
 
-`tasks/build.sh` builds `gate-JOB` for the seven jobs as `kernel/tools/build.sh` builds the
-kernel's programs: the kernel's nightly, core and alloc from source, the user linker script, and
-the gate's one CPU setting. Each task runs in ring mode (stream P's `moruna_sys::plane::Rings`):
-it maps its region and its rings object once, answers each batch through `Rings::step_parts`
-(`record::parts`: one record when the answer fits a window, several in order when it does not,
-the rows after the first part copied out of the input and carried), says a refusal's reason in its
-log (`moruna_sys::plane::Log`), and says its exit code on its rings as it ends.
+Each task is a function on `moruna-function` (system design 5A, item 5.1), the SDK's first user
+and its conformance suite: `main` is `moruna_gate_tasks::serve(batch::JOB)`, which calls the job's
+arrow-rs port (`functions/src/batch.rs`) on each batch, read in place from its record, and writes
+its output back into windows: one record when it fits a window, several in order, cut by rows, when
+it does not. A refusal's reason goes to the task's log and the task ends with exit code 7, as
+before; the exit codes are the ones the tasks always had (`moruna_function::code`).
+`tasks/tests/serve.rs` runs each task on the data plane in memory (`moruna_function::host`) over
+every fixture case and finds its rows bit for bit those of the record path the tasks ran on
+before 5.1 (`record/`), and the oracle's `hash_exact`, and each record the bytes the record path's
+took: arrow-ipc writes a validity bitmap of all ones for a column with no nulls, a page of its own
+in a record, and `moruna-function` leaves it out as the record path did, through the function the
+engine's own `encode_framing` uses for its records too (`moruna_ipc_check::valid`).
+
+`tasks/build.sh` builds `gate-JOB` for the seven jobs as Rust programs with std for the core
+(system design 5A0, item 5.0): the kernel's nightly, std from Moruna's copy of Rust's library, the
+user linker script, and the gate's one CPU setting. It needs item 5.0's target and std, and says
+so without them.
 
 A 0.7 job names the task as an `image` function with `command: ["/gate-JOB"]`, `plane: true` and
 `abi: "moruna"` (`bench/vm/gate_jobs.py`): the engine checks the program is of the kernel's user

@@ -1,21 +1,34 @@
-# The gate's native tasks: each job's function as a program of the Moruna kernel's user target,
-# on the data plane (`moruna_sys::plane`). Built by build.sh as kernel/tools/build.sh builds the
-# kernel's own programs: the kernel's nightly, core and alloc from source, the user linker
-# script. Its own workspace, since it builds for that target only.
+# The gate's native tasks: each job's function as a native Moruna function on moruna-function
+# (architecture/moruna-os-system.md 5A, item 5.1), its first users and its conformance suite. They
+# build for the core with Rust's std (5A0, item 5.0), as build.sh says, and for a host, where their
+# tests run them on the data plane in memory. Its own workspace, since it builds for the core.
 [workspace]
 resolver = "3"
 
 [package]
 name = "moruna-gate-tasks"
-description = "The gate's seven functions as native Moruna tasks on the data plane"
+description = "The gate's seven functions as native Moruna functions on moruna-function"
 version = "0.7.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
 
 [dependencies]
-moruna-sys = { path = "../../../kernel/sys", features = ["heap", "log"] }
+moruna-function = { path = "../../../kernel/function/rust" }
+# The seven ports, RecordBatch in and RecordBatch out (its `arrow` feature, on by default).
+moruna-gate-functions = { path = "../functions" }
+
+[dev-dependencies]
+# The native path the tasks ran on before 5.1, which they are compared with bit for bit.
 moruna-gate-record = { path = "../record" }
+arrow = { version = "=59.3.0", default-features = false, features = ["ipc"] }
+bytemuck = { version = "=1.25.0" }
+moruna-ipc-check = { path = "../../../kernel/plane/check" }
+serde_json = { version = "=1.0.151" }
+# The engine's own record encoder (`moruna_kernel::ipc::encode_framing`), which lays out the
+# records the engine posts to a task, and an allocator for its framing.
+moruna-kernel = { path = "../../../crates/moruna-kernel" }
+moruna-testkit = { path = "../../../crates/moruna-testkit" }
 
 [profile.dev]
 panic = "abort"

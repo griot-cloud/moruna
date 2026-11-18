@@ -335,7 +335,7 @@ impl From<StartError> for VmmError {
 }
 fn checked_identity(spec: &mut Inbound, run: moruna_kernel::RunId) -> Result<(String, String)> {
     use base64::Engine as _;
-    let Inbound::Spec { spec, plan } = spec else {
+    let Inbound::Spec { spec, plan, .. } = spec else {
         return Err(refused("canonical Spec required"));
     };
     let bytes = match spec {
@@ -933,6 +933,7 @@ mod tests {
             Inbound::Spec {
                 spec: serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap(),
                 plan: None,
+                secrets: Default::default(),
             }
         }
         fn fail_start(&self, admission: Admission<'_>, prepared: PreparedLaunch) -> StartError {
@@ -989,6 +990,7 @@ mod tests {
                 base64::engine::general_purpose::STANDARD.encode(bytes),
             ),
             plan: None,
+            secrets: Default::default(),
         };
         let authority = run_authority(&key, &v2);
         assert_eq!(
@@ -1000,11 +1002,13 @@ mod tests {
         let v1 = Inbound::Spec {
             spec: serde_json::json!({"moruna_spec": 1}),
             plan: None,
+            secrets: Default::default(),
         };
         assert_eq!(run_authority(&key, &v1).job_digest, "");
         let garbled = Inbound::Spec {
             spec: serde_json::Value::String("not base64!".into()),
             plan: None,
+            secrets: Default::default(),
         };
         assert_eq!(run_authority(&key, &garbled).job_digest, "");
     }
@@ -1049,6 +1053,7 @@ mod tests {
         let Inbound::Spec {
             spec,
             plan: Some(plan),
+            ..
         } = &prepared.spec
         else {
             panic!("default plan must be pinned")

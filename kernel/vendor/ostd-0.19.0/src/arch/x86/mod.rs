@@ -20,6 +20,10 @@ pub mod vm;
 #[cfg(feature = "cvm_guest")]
 pub(crate) mod tdx_guest;
 
+// moruna: the deadline of the boot waits (Moruna's system design, section 1B), for the
+// wait outside this module that has one (`boot/smp.rs`).
+pub(crate) use kernel::tsc::boot_wait;
+
 #[cfg(feature = "cvm_guest")]
 use crate::mm::frame::unaccepted;
 
@@ -95,6 +99,10 @@ pub(crate) unsafe fn late_init_on_bsp() {
     irq::chip::init(&io_mem_builder);
     irq::ipi::init();
 
+    // moruna: the hypervisor, said on the console before the clock rates are taken from it,
+    // and Hyper-V's hypercall page placed before the other CPUs start (work item 1.8), then
+    // CPU 0's SynIC enabled, here on CPU 0 (work item 1.9c).
+    kernel::hyperv::init_on_bsp();
     kernel::tsc::init_tsc_freq();
     timer::init_on_bsp();
 

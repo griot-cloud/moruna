@@ -10,16 +10,32 @@ method of ``Operations``, which ``Client`` inherits: ``client.node()`` is ``node
 
 from __future__ import annotations
 
+import urllib.parse
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
 
 
+@dataclass(frozen=True, slots=True)
+class ServerSentEvent:
+    """One event of a stream: its ID when it has one, its name, and its data, read as JSON."""
+
+    id: int | None
+    event: str
+    data: Any
+
+
 class Caller(Protocol):
     """What an operation is called through: ``moruna.api.Client``."""
 
-    def call(self, operation: str, method: str, path: str, *, token: bool) -> Any:
-        """Call ``method path`` (with the token when ``token``) and return the JSON answer."""
+    def call(self, operation: str, method: str, path: str, *, token: bool, body: Any = None) -> Any:
+        """Call ``method path`` (with the token when ``token``, and ``body`` as its JSON body
+        when it has one) and return the JSON answer."""
+        ...
+
+    def stream(self, operation: str, path: str, *, token: bool) -> Iterator[ServerSentEvent]:
+        """Call ``GET path`` and return its answer's Server-Sent Events as they arrive."""
         ...
 
 
@@ -55,12 +71,42 @@ def _int(value: Any, where: str, low: int | None, high: int | None) -> int:
     return value
 
 
+def _strings(value: Any, where: str) -> dict[str, str]:
+    return {key: _str(item, f"{where}.{key}") for key, item in _object(value, where).items()}
+
+
+def _bool(value: Any, where: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{where}: expected a boolean, found {type(value).__name__}")
+    return value
+
+
 def _enum[E: StrEnum](kind: type[E], value: Any, where: str) -> E:
     text = _str(value, where)
     try:
         return kind(text)
     except ValueError:
         raise ValueError(f"{where}: {text!r} is not a {kind.__name__}") from None
+
+
+def _maybe[T](
+    data: dict[str, Any], key: str, where: str, read: Callable[[tuple[Any, str]], T]
+) -> T | None:
+    """A field that may be absent or null: read when it is there."""
+    if data.get(key) is None:
+        return None
+    return read((data[key], f"{where}.{key}"))
+
+
+def _segment(value: str) -> str:
+    """A value as one segment of a path."""
+    return urllib.parse.quote(value, safe="")
+
+
+def _query(**parameters: int | None) -> str:
+    """The query of the parameters that are given; nothing when none is."""
+    given = {name.rstrip("_"): value for name, value in parameters.items() if value is not None}
+    return "?" + urllib.parse.urlencode(given) if given else ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,6 +326,257 @@ class HealthStatus(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class Heartbeat:
+    """The fields of the engine's heartbeat (`moruna-hosted-engine.md`, section 4.3)."""
+
+    t_ms: int
+    """Milliseconds since the engine began the run."""
+
+    rows_out: int
+    """Rows the last stage has produced so far."""
+
+    bytes_out: int
+    """Bytes the last stage has produced so far."""
+
+    active_workers: int
+    """Workers allowed to take tasks."""
+
+    staging_bytes: int
+    """Bytes staged on disk."""
+
+    anon_bytes: int | None = None
+    """The engine's anonymous memory, in bytes."""
+
+    bottleneck: str | None = None
+    """What holds the run back, as the engine's controller last judged it."""
+
+    ceiling_bytes: int | None = None
+    """The memory ceiling in force, in bytes."""
+
+    committed_seq: int | None = None
+    """The sink's commit watermark."""
+
+    @classmethod
+    def from_json(cls, value: Any, where: str = "Heartbeat") -> Heartbeat:
+        """Read an answer's JSON value; a ``ValueError`` says where it is wrong."""
+        data = _object(value, where)
+        return cls(
+            t_ms=_int(*_at(data, "t_ms", where), 0, None),
+            rows_out=_int(*_at(data, "rows_out", where), 0, None),
+            bytes_out=_int(*_at(data, "bytes_out", where), 0, None),
+            active_workers=_int(*_at(data, "active_workers", where), 0, 65535),
+            staging_bytes=_int(*_at(data, "staging_bytes", where), 0, None),
+            anon_bytes=_maybe(data, "anon_bytes", where, lambda at: _int(*at, 0, None)),
+            bottleneck=_maybe(data, "bottleneck", where, lambda at: _str(*at)),
+            ceiling_bytes=_maybe(data, "ceiling_bytes", where, lambda at: _int(*at, 0, None)),
+            committed_seq=_maybe(data, "committed_seq", where, lambda at: _int(*at, 0, None)),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        """The JSON value, as the node writes it."""
+        data: dict[str, Any] = {
+            "t_ms": self.t_ms,
+            "rows_out": self.rows_out,
+            "bytes_out": self.bytes_out,
+            "active_workers": self.active_workers,
+            "staging_bytes": self.staging_bytes,
+        }
+        if self.anon_bytes is not None:
+            data["anon_bytes"] = self.anon_bytes
+        if self.bottleneck is not None:
+            data["bottleneck"] = self.bottleneck
+        if self.ceiling_bytes is not None:
+            data["ceiling_bytes"] = self.ceiling_bytes
+        if self.committed_seq is not None:
+            data["committed_seq"] = self.committed_seq
+        return data
+
+
+@dataclass(frozen=True, slots=True)
+class Job:
+    """A job as a client hands it to the node: the job document, as version 1 JSON (`v1`) or as
+    version 2's FlatBuffers in base64 (`v2`), exactly one of the two, and the secrets its
+    object-store settings refer to by name (`{"secret": "<name>"}`).
+    """
+
+    secrets: dict[str, str] | None = None
+    """The job's secrets (object-store credentials), by name: at most 32. They reach the engine
+    beside the document, never in it, and the node shows none of them in any answer, event, log
+    or report of this job.
+    """
+
+    v1: dict[str, Any] | None = None
+    """The job document, version 1, as JSON."""
+
+    v2: str | None = None
+    """The job document, version 2: its `MJB2` FlatBuffer in standard base64."""
+
+    @classmethod
+    def from_json(cls, value: Any, where: str = "Job") -> Job:
+        """Read an answer's JSON value; a ``ValueError`` says where it is wrong."""
+        data = _object(value, where)
+        return cls(
+            secrets=_maybe(data, "secrets", where, lambda at: _strings(*at)),
+            v1=_maybe(data, "v1", where, lambda at: _object(*at)),
+            v2=_maybe(data, "v2", where, lambda at: _str(*at)),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        """The JSON value, as the node writes it."""
+        data: dict[str, Any] = {}
+        if self.secrets is not None:
+            data["secrets"] = self.secrets
+        if self.v1 is not None:
+            data["v1"] = self.v1
+        if self.v2 is not None:
+            data["v2"] = self.v2
+        return data
+
+
+class JobState(StrEnum):
+    """Where a job is in its life."""
+
+    STARTING = "starting"
+    """The engine has taken the document and has not yet said how the run goes."""
+
+    RUNNING = "running"
+    """The engine runs it."""
+
+    COMPLETED = "completed"
+    """It ended well: exit code 0."""
+
+    FAILED = "failed"
+    """It ended with an error."""
+
+    CANCELLED = "cancelled"
+    """It was cancelled: exit code 130."""
+
+
+@dataclass(frozen=True, slots=True)
+class JobStatus:
+    """The answer to `GET /v1/jobs/{id}` and to `POST /v1/jobs/{id}/cancel`."""
+
+    id: str
+    """The run's ID."""
+
+    state: JobState
+    """Where the job is in its life."""
+
+    submitted: int
+    """When the node took the job, in Unix seconds."""
+
+    ended: int | None = None
+    """When it ended, in Unix seconds; absent until it has."""
+
+    exit_code: int | None = None
+    """The engine's exit code; absent until the job has ended."""
+
+    heartbeat: Heartbeat | None = None
+    """The engine's latest heartbeat; absent until it has sent one."""
+
+    started: int | None = None
+    """When it began to run, in Unix seconds; absent until it has."""
+
+    @classmethod
+    def from_json(cls, value: Any, where: str = "JobStatus") -> JobStatus:
+        """Read an answer's JSON value; a ``ValueError`` says where it is wrong."""
+        data = _object(value, where)
+        return cls(
+            id=_str(*_at(data, "id", where)),
+            state=_enum(JobState, *_at(data, "state", where)),
+            submitted=_int(*_at(data, "submitted", where), 0, None),
+            ended=_maybe(data, "ended", where, lambda at: _int(*at, 0, None)),
+            exit_code=_maybe(data, "exit_code", where, lambda at: _int(*at, None, None)),
+            heartbeat=_maybe(data, "heartbeat", where, lambda at: Heartbeat.from_json(*at)),
+            started=_maybe(data, "started", where, lambda at: _int(*at, 0, None)),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        """The JSON value, as the node writes it."""
+        data: dict[str, Any] = {
+            "id": self.id,
+            "state": self.state.value,
+            "submitted": self.submitted,
+        }
+        if self.ended is not None:
+            data["ended"] = self.ended
+        if self.exit_code is not None:
+            data["exit_code"] = self.exit_code
+        if self.heartbeat is not None:
+            data["heartbeat"] = self.heartbeat.to_json()
+        if self.started is not None:
+            data["started"] = self.started
+        return data
+
+
+@dataclass(frozen=True, slots=True)
+class JobSummary:
+    """One job in the list: its ID, its state and its times."""
+
+    id: str
+    """The run's ID."""
+
+    state: JobState
+    """Where the job is in its life."""
+
+    submitted: int
+    """When the node took the job, in Unix seconds."""
+
+    ended: int | None = None
+    """When it ended, in Unix seconds; absent until it has."""
+
+    started: int | None = None
+    """When it began to run, in Unix seconds; absent until it has."""
+
+    @classmethod
+    def from_json(cls, value: Any, where: str = "JobSummary") -> JobSummary:
+        """Read an answer's JSON value; a ``ValueError`` says where it is wrong."""
+        data = _object(value, where)
+        return cls(
+            id=_str(*_at(data, "id", where)),
+            state=_enum(JobState, *_at(data, "state", where)),
+            submitted=_int(*_at(data, "submitted", where), 0, None),
+            ended=_maybe(data, "ended", where, lambda at: _int(*at, 0, None)),
+            started=_maybe(data, "started", where, lambda at: _int(*at, 0, None)),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        """The JSON value, as the node writes it."""
+        data: dict[str, Any] = {
+            "id": self.id,
+            "state": self.state.value,
+            "submitted": self.submitted,
+        }
+        if self.ended is not None:
+            data["ended"] = self.ended
+        if self.started is not None:
+            data["started"] = self.started
+        return data
+
+
+@dataclass(frozen=True, slots=True)
+class Jobs:
+    """The answer to `GET /v1/jobs`."""
+
+    jobs: list[JobSummary]
+    """The last 100 jobs, newest first."""
+
+    @classmethod
+    def from_json(cls, value: Any, where: str = "Jobs") -> Jobs:
+        """Read an answer's JSON value; a ``ValueError`` says where it is wrong."""
+        data = _object(value, where)
+        return cls(
+            jobs=[JobSummary.from_json(*item) for item in _items(*_at(data, "jobs", where))],
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        """The JSON value, as the node writes it."""
+        return {
+            "jobs": [item.to_json() for item in self.jobs],
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class Node:
     """The node document, the answer to `GET /v1/node`."""
 
@@ -353,6 +650,35 @@ class NodeHealth(StrEnum):
     """Running, with a fault."""
 
 
+@dataclass(frozen=True, slots=True)
+class Refusal:
+    """One refusal of a job document, with the field it is about."""
+
+    field: str
+    """Where the problem is: `tasks[0].kind`, `budget.memory_bytes`, or `spec` for the document as a
+    whole.
+    """
+
+    message: str
+    """One sentence that says what to change."""
+
+    @classmethod
+    def from_json(cls, value: Any, where: str = "Refusal") -> Refusal:
+        """Read an answer's JSON value; a ``ValueError`` says where it is wrong."""
+        data = _object(value, where)
+        return cls(
+            field=_str(*_at(data, "field", where)),
+            message=_str(*_at(data, "message", where)),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        """The JSON value, as the node writes it."""
+        return {
+            "field": self.field,
+            "message": self.message,
+        }
+
+
 class Scope(StrEnum):
     """What a token allows. `admin` covers `submit`, and `submit` covers `observe`."""
 
@@ -366,6 +692,62 @@ class Scope(StrEnum):
     """Administer the node, and everything `submit` allows."""
 
 
+@dataclass(frozen=True, slots=True)
+class Submitted:
+    """The answer to `POST /v1/jobs`: the job the node has taken."""
+
+    id: str
+    """The run's ID."""
+
+    @classmethod
+    def from_json(cls, value: Any, where: str = "Submitted") -> Submitted:
+        """Read an answer's JSON value; a ``ValueError`` says where it is wrong."""
+        data = _object(value, where)
+        return cls(
+            id=_str(*_at(data, "id", where)),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        """The JSON value, as the node writes it."""
+        return {
+            "id": self.id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Validation:
+    """The answer to `POST /v1/jobs/validate`: whether the engine takes the document."""
+
+    ok: bool
+    """Whether the document is sound."""
+
+    refusals: list[Refusal] | None = None
+    """Why not, when it is not: `moruna-job`'s refusals."""
+
+    @classmethod
+    def from_json(cls, value: Any, where: str = "Validation") -> Validation:
+        """Read an answer's JSON value; a ``ValueError`` says where it is wrong."""
+        data = _object(value, where)
+        return cls(
+            ok=_bool(*_at(data, "ok", where)),
+            refusals=_maybe(
+                data,
+                "refusals",
+                where,
+                lambda at: [Refusal.from_json(*item) for item in _items(*at)],
+            ),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        """The JSON value, as the node writes it."""
+        data: dict[str, Any] = {
+            "ok": self.ok,
+        }
+        if self.refusals is not None:
+            data["refusals"] = [item.to_json() for item in self.refusals]
+        return data
+
+
 def health(client: Caller) -> Health:
     """Whether the node is up. The only call that needs no token.
 
@@ -373,6 +755,75 @@ def health(client: Caller) -> Health:
     """
     answer = client.call("health", "GET", "/v1/health", token=False)
     return Health.from_json(answer)
+
+
+def jobs_list(client: Caller) -> Jobs:
+    """The last 100 jobs, newest first: each one's ID, state and times.
+
+    ``GET /v1/jobs``, a token with scope ``observe``.
+    """
+    answer = client.call("jobs_list", "GET", "/v1/jobs", token=True)
+    return Jobs.from_json(answer)
+
+
+def jobs_submit(client: Caller, job: Job) -> Submitted:
+    """Run a job in a fresh engine and answer its run ID. Busy while a job runs; invalid with the
+    engine's refusals.
+
+    ``POST /v1/jobs``, a token with scope ``submit``.
+    """
+    answer = client.call("jobs_submit", "POST", "/v1/jobs", token=True, body=job.to_json())
+    return Submitted.from_json(answer)
+
+
+def jobs_validate(client: Caller, job: Job) -> Validation:
+    """Whether the engine takes a job document, and its refusals when it does not. Nothing runs.
+
+    ``POST /v1/jobs/validate``, a token with scope ``submit``.
+    """
+    answer = client.call(
+        "jobs_validate", "POST", "/v1/jobs/validate", token=True, body=job.to_json()
+    )
+    return Validation.from_json(answer)
+
+
+def jobs_get(client: Caller, id: str) -> JobStatus:
+    """One job: its state, its times, the engine's latest heartbeat and its exit code.
+
+    ``GET /v1/jobs/{id}``, a token with scope ``observe``.
+    """
+    answer = client.call("jobs_get", "GET", f"/v1/jobs/{_segment(id)}", token=True)
+    return JobStatus.from_json(answer)
+
+
+def jobs_cancel(client: Caller, id: str) -> JobStatus:
+    """Tell the engine to cancel a job, and answer the job as it stands. Conflict if the job has
+    ended.
+
+    ``POST /v1/jobs/{id}/cancel``, a token with scope ``submit``.
+    """
+    answer = client.call("jobs_cancel", "POST", f"/v1/jobs/{_segment(id)}/cancel", token=True)
+    return JobStatus.from_json(answer)
+
+
+def jobs_events(client: Caller, id: str, *, from_: int | None = None) -> Iterator[ServerSentEvent]:
+    """A job's events as Server-Sent Events: each event and log record as its JSON line, heartbeats,
+    then the report and the exit. `from` replays from that record of the node's buffer.
+
+    ``GET /v1/jobs/{id}/events``, a token with scope ``observe``.
+    """
+    return client.stream(
+        "jobs_events", f"/v1/jobs/{_segment(id)}/events" + _query(from_=from_), token=True
+    )
+
+
+def jobs_report(client: Caller, id: str) -> dict[str, Any]:
+    """A job's report, the engine's RunReport, once the job has ended.
+
+    ``GET /v1/jobs/{id}/report``, a token with scope ``observe``.
+    """
+    answer = client.call("jobs_report", "GET", f"/v1/jobs/{_segment(id)}/report", token=True)
+    return _object(answer, "jobs_report's answer")
 
 
 def node(client: Caller) -> Node:
@@ -405,6 +856,65 @@ class Operations(Caller):
         ``GET /v1/health``, no token. The function ``health(self)``.
         """
         return health(self)
+
+    def jobs_list(self) -> Jobs:
+        """The last 100 jobs, newest first: each one's ID, state and times.
+
+        ``GET /v1/jobs``, a token with scope ``observe``. The function ``jobs_list(self)``.
+        """
+        return jobs_list(self)
+
+    def jobs_submit(self, job: Job) -> Submitted:
+        """Run a job in a fresh engine and answer its run ID. Busy while a job runs; invalid with
+        the engine's refusals.
+
+        ``POST /v1/jobs``, a token with scope ``submit``. The function ``jobs_submit(self,
+        job)``.
+        """
+        return jobs_submit(self, job)
+
+    def jobs_validate(self, job: Job) -> Validation:
+        """Whether the engine takes a job document, and its refusals when it does not. Nothing runs.
+
+        ``POST /v1/jobs/validate``, a token with scope ``submit``. The function
+        ``jobs_validate(self, job)``.
+        """
+        return jobs_validate(self, job)
+
+    def jobs_get(self, id: str) -> JobStatus:
+        """One job: its state, its times, the engine's latest heartbeat and its exit code.
+
+        ``GET /v1/jobs/{id}``, a token with scope ``observe``. The function ``jobs_get(self,
+        id)``.
+        """
+        return jobs_get(self, id)
+
+    def jobs_cancel(self, id: str) -> JobStatus:
+        """Tell the engine to cancel a job, and answer the job as it stands. Conflict if the job has
+        ended.
+
+        ``POST /v1/jobs/{id}/cancel``, a token with scope ``submit``. The function
+        ``jobs_cancel(self, id)``.
+        """
+        return jobs_cancel(self, id)
+
+    def jobs_events(self, id: str, *, from_: int | None = None) -> Iterator[ServerSentEvent]:
+        """A job's events as Server-Sent Events: each event and log record as its JSON line,
+        heartbeats, then the report and the exit. `from` replays from that record of the node's
+        buffer.
+
+        ``GET /v1/jobs/{id}/events``, a token with scope ``observe``. The function
+        ``jobs_events(self, id, from_=from_)``.
+        """
+        return jobs_events(self, id, from_=from_)
+
+    def jobs_report(self, id: str) -> dict[str, Any]:
+        """A job's report, the engine's RunReport, once the job has ended.
+
+        ``GET /v1/jobs/{id}/report``, a token with scope ``observe``. The function
+        ``jobs_report(self, id)``.
+        """
+        return jobs_report(self, id)
 
     def node(self) -> Node:
         """The node document: version, instance, cloud, cores, memory, executors, boot time, clock

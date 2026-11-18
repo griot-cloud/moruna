@@ -6,11 +6,13 @@ Run: python3 -I kernel/node/tools/test_package.py
 import contextlib
 import importlib.util
 import io
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 TOOL = Path(__file__).resolve().parent / "package.py"
 SPEC = importlib.util.spec_from_file_location("package", TOOL)
@@ -83,9 +85,68 @@ class Profiles(unittest.TestCase):
 
     def test_cloud_builds_only_its_programs(self):
         cloud = package.PROGRAMS["cloud"]
-        self.assertEqual(cloud, ["moruna-node-supervisor", "devices", "virtio-blk", "virtio-net", "nvme", "gve"])
-        for absent in ("virtio-vsock", "imagefs", "linux", "node-admission", "moruna-storage-service", "engine", "netstack"):
+        # Step 1's processes (system design 1A): the network server, api and platform beside
+        # the supervisor, the device manager and its drivers (items 1.1, 1.3 and 1.4), and
+        # `vmbus`, which the supervisor starts on Hyper-V only (item 1.9c).
+        self.assertEqual(cloud, ["moruna-node-supervisor", "devices", "netstack", "moruna-node-api",
+                                 "moruna-node-platform", "virtio-blk", "virtio-net", "nvme", "gve",
+                                 "moruna-vmbus-server"])
+        for absent in ("virtio-vsock", "imagefs", "linux", "node-admission", "moruna-storage-service", "engine"):
             self.assertNotIn(absent, cloud)
+
+    def test_the_user_build_compiles_c_as_build_sh_does(self):
+        flags = "--target=x86_64-unknown-none -ffreestanding -mno-red-zone -fno-stack-protector"
+        # Nothing set by the caller: clang, and build.sh's flags.
+        self.assertEqual(package.user_c({}), {"CC_x86_64_moruna_user": "clang", "CFLAGS_x86_64_moruna_user": flags})
+        self.assertEqual(package.user_c({"CC_x86_64_moruna_user": "", "CFLAGS_x86_64_moruna_user": " "}),
+                         {"CC_x86_64_moruna_user": "clang", "CFLAGS_x86_64_moruna_user": flags})
+        # The caller's compiler is kept, and its flags follow build.sh's.
+        self.assertEqual(package.user_c({"CC_x86_64_moruna_user": "clang-18", "CFLAGS_x86_64_moruna_user": "-O1", "CC": "gcc"}),
+                         {"CC_x86_64_moruna_user": "clang-18", "CFLAGS_x86_64_moruna_user": f"{flags} -O1"})
+        # The same two variables, and the same values, as kernel/tools/build.sh gives its user build.
+        build = (TOOL.parents[2] / "tools/build.sh").read_text()
+        self.assertIn('user_cc="${CC_x86_64_moruna_user:-clang}"', build)
+        self.assertIn('CC_x86_64_moruna_user="$user_cc" \\\n', build)
+        self.assertIn(f'CFLAGS_x86_64_moruna_user="{flags} ${{CFLAGS_x86_64_moruna_user:-}}" \\\n', build)
+
+    def test_the_user_build_alone_gets_the_c_compiler(self):
+        """main(), run up to its second build with nothing built: the kernel's build has no C
+        compiler set, and the user programs' build has build.sh's."""
+        class Stop(Exception):
+            pass
+
+        builds = []
+
+        def record(args, cwd, env=None):
+            builds.append(([str(a) for a in args], dict(env)))
+            if len(builds) == 2:
+                raise Stop
+
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp) / "assets"
+            assets.mkdir()
+            (assets / "node.conf").write_text("moruna-node 1\n")
+            description = Path(tmp) / "cloud.image"
+            description.write_text("moruna-image 1\n")
+            argv = ["package.py", "--profile", "cloud", "--description", str(description), "--assets", str(assets),
+                    "--out", str(Path(tmp) / "out"), "--node-memory", str(2 << 30)]
+            with mock.patch.object(package, "command", record), \
+                    mock.patch.object(package.shutil, "which", lambda tool: f"/usr/bin/{tool}"), \
+                    mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ):
+                os.environ.pop("CC_x86_64_moruna_user", None)
+                os.environ["CFLAGS_x86_64_moruna_user"] = "-O1"
+                with self.assertRaises(Stop):
+                    package.main()
+        (kernel_args, kernel_env), (user_args, user_env) = builds
+        self.assertIn("moruna-microkernel-boot", kernel_args)
+        self.assertNotIn("CC_x86_64_moruna_user", kernel_env)
+        self.assertEqual(kernel_env["CFLAGS_x86_64_moruna_user"], "-O1")
+        self.assertIn("-Zjson-target-spec", user_args)
+        self.assertEqual([user_args[i + 1] for i, word in enumerate(user_args) if word == "-p"], package.PROGRAMS["cloud"])
+        self.assertEqual(user_env["CC_x86_64_moruna_user"], "clang")
+        self.assertEqual(user_env["CFLAGS_x86_64_moruna_user"],
+                         "--target=x86_64-unknown-none -ffreestanding -mno-red-zone -fno-stack-protector -O1")
+        self.assertIn("-C link-arg=-static", user_env["RUSTFLAGS"])
 
     def test_the_command_refuses_before_building_anything(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -270,9 +270,13 @@ fn run() -> i64 {
     if let Err((e, _)) = rings.write(b"process", [for_rings]) {
         return fail(&out, "handing the rings' test its process resource", e);
     }
-    // SDD 25: the device manager does the device work with the device roots.
+    // SDD 25: the device manager does the device work with the device roots, and ends
+    // once its last client has gone.
     if let Err((e, _)) = devices.write(
-        moruna_node::Bootstrap::Devices.header(),
+        moruna_node::Bootstrap::Devices {
+            until_stopped: false,
+        }
+        .header(),
         [root_process, root_device, root_ecam, root_msi, root_dma],
     ) {
         return fail(&out, "handing the device manager its roots", e);

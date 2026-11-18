@@ -1,0 +1,16 @@
+[package]
+name = "moruna-ostd-adaptation"
+description = "Host tests of the arithmetic Moruna's patches add to the vendored OSTD"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+bench = false
+
+[dev-dependencies]
+# The fatal line the patched boot waits must say (the system design, section 1B).
+moruna-abi.workspace = true
+# Hyper-V's constants, which `cpu/hypervisor.rs` takes from it as OSTD does (work item 1.8).
+hvdef = { path = "../vendor/openvmm/hvdef", version = "=0.0.0" }

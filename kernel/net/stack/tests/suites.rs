@@ -8,6 +8,9 @@ mod common;
 use common::{Flaws, MAC_A, MAC_B, PAIR, link, serve};
 use moruna_svc::conformance::{self, Listener, Summary};
 
+/// Each check's name and its result.
+type Checks = Vec<(String, Result<(), String>)>;
+
 fn failures(checks: &[(String, Result<(), String>)]) -> Vec<String> {
     checks
         .iter()
@@ -16,7 +19,7 @@ fn failures(checks: &[(String, Result<(), String>)]) -> Vec<String> {
         .collect()
 }
 
-fn run_one_checks(listener: moruna_svc::Channel) -> (Summary, Vec<(String, Result<(), String>)>) {
+fn run_one_checks(listener: moruna_svc::Channel) -> (Summary, Checks) {
     let mut checks = Vec::new();
     let summary = conformance::run(
         &netstack_protocol::suite(),
