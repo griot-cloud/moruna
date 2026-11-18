@@ -1268,10 +1268,14 @@ impl Host {
         }
         let start = packet.data_offset as usize;
         let end = start + packet.data_length as usize;
+        // Laid out as Linux's netvsc_xmit lays out a frame with no per-packet information,
+        // the layout Azure's host carries at scale: the data right after the fields, and
+        // the (empty) per-packet information there too, never inside the fields (as Azure
+        // refused an RNDIS query's empty input inside its fields).
         let plain_frame = packet.oob_data_offset == 0
             && packet.oob_data_length == 0
             && packet.num_oob_data_elements == 0
-            && packet.per_packet_info_offset == 0
+            && packet.per_packet_info_offset as usize == size_of::<rndisprot::Packet>()
             && packet.per_packet_info_length == 0
             && packet.vc_handle == 0
             && packet.reserved == 0;
@@ -1459,6 +1463,29 @@ impl Host {
             // it.
             ranges.push(TransferPageRange {
                 byte_count: receive.section as u32,
+                byte_offset: at as u32,
+            });
+        }
+        let transaction = u64::from(sections[0]);
+        self.lent.insert(transaction, sections);
+        let payload = self.rndis_packet(protocol::DATA_CHANNEL_TYPE);
+        self.emit(Out::Transfer(transaction, set, payload, ranges));
+    }
+
+    /// Delivers whole RNDIS messages in one receive, a section each, each range as long
+    /// as its message, as a host that names only the bytes it wrote does.
+    pub fn deliver_messages(&mut self, messages: &[Vec<u8>]) {
+        let receive = self.receive.as_mut().unwrap();
+        let set = receive.id;
+        let mut sections = Vec::new();
+        let mut ranges = Vec::new();
+        for message in messages {
+            let section = receive.data.pop_front().expect("a free receive section");
+            let at = section as usize * receive.section;
+            receive.memory.write(at, message);
+            sections.push(section);
+            ranges.push(TransferPageRange {
+                byte_count: message.len() as u32,
                 byte_offset: at as u32,
             });
         }
