@@ -932,8 +932,18 @@ each call runs, and says where it ran.
   and outputs are Arrow arrays. A kernel reads its inputs where they lie and writes its output
   into buffers the platform gives it, as a function does on the plane today. A chain of kernels on
   one device passes buffers, never copies. Moving a batch between devices (the CPU's memory and a
-  GPU's) is a copy the hardware cannot avoid. The platform makes it, counts it as a transfer, puts
-  it in the call's cost (4H) and reports it (4D).
+  GPU's) is a transfer. The platform makes it, counts it, puts it in the call's cost (4H) and
+  reports it (4D).
+- **Device memory is part of the arena, and transfers are DMA** (Brackly, 2026-11-18). A device's
+  memory is the arena's `Device` tier (`crates/moruna-kernel/src/tier.rs`), under the job's one
+  budget, beside `PinnedHost`, `Host` and `Disk`. A transfer is the device's own DMA engine moving
+  pages the arena has pinned and mapped for it: no CPU copy, and no bounce buffer, which is where a
+  Linux driver usually spends CPU. Because the arena owns both sides, the scheduler's residency
+  decisions span them:
+  - it keeps a batch on the device for the next kernel there;
+  - it moves the next batch by DMA while the device computes the current one;
+  - it evicts device memory to host memory by DMA when the budget needs the room;
+  - it charges each move to the cost model as what it is: bytes over a measured link.
 - **Namespaces:** `moruna` for ours. A vendor or package publishes kernels in its own namespace; no
   one adds optional behaviour to a `moruna` kernel.
 - **Every kernel has a written specification,** `crates/moruna-kernels/spec/<name>.md`. It states:
@@ -1033,6 +1043,11 @@ The plane's five verbs (OS design 4) are the executor interface:
   the reference implementations, so every kernel is always placeable.
 - **Batches are described by Arrow's C Device Data Interface,** as the OS design says. A batch
   already on a device stays there for the next kernel on that device.
+- **A device executor's driver owns the DMA path** (the OS design's "a small driver process; we
+  define the device's side"). On a Moruna node it maps arena pages for the device through the
+  IOMMU and drives the device's copy engines. On a Linux node, the host's executor registers the
+  shared memory the Moruna VM's arena lives in with the vendor's driver, so the device DMAs straight
+  from the VM's pages, with no copy across the VM boundary.
 - **A device executor may claim a chain of kernels** (`expr` then `filter`, for example) and run it
   as one pass. It reports the chain as one placement with its parts named.
 
