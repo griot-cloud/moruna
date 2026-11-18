@@ -32,6 +32,7 @@
 mod classes;
 mod handle;
 mod index;
+mod lanes;
 mod large;
 pub mod region;
 mod stats;
@@ -242,6 +243,10 @@ struct Inner {
     ahead: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Regions made ahead of need over the run.
     ahead_made: AtomicU64,
+    /// The arena's identity, by which a thread finds its lane ([`lanes`]).
+    id: u64,
+    /// Each thread's lane, the handle its buffers hold ([`lanes::Lane`]).
+    lanes: lanes::Registry,
 }
 
 /// The memory arena (d.1).
@@ -418,6 +423,8 @@ impl Arena {
                 committing: Mutex::new(()),
                 ahead: Mutex::new(None),
                 ahead_made: AtomicU64::new(0),
+                id: lanes::next_id(),
+                lanes: lanes::Registry::default(),
             }),
         }))
     }
@@ -734,6 +741,14 @@ impl Arena {
         if let Some(thread) = ahead {
             let _ = thread.join();
         }
+    }
+}
+
+/// The lanes go with the arena: each then lives only as long as a buffer that holds it, and
+/// the arena's memory with them ([`lanes`]).
+impl Drop for Arena {
+    fn drop(&mut self) {
+        self.inner.lanes.clear();
     }
 }
 
@@ -1227,7 +1242,8 @@ impl Allocator for Arena {
                 if inner.is_host(tier) {
                     inner.consider_ahead();
                 }
-                let handle: Arc<dyn moruna_kernel::ArenaHandle> = Arc::clone(inner) as Arc<_>;
+                // This thread's lane, not the arena's one `Arc`: a word no other thread writes.
+                let handle: Arc<dyn moruna_kernel::ArenaHandle> = inner.lane();
                 // SAFETY: `ptr` is `bytes` bytes inside a region this arena reserved for
                 // `tier`; that region stays mapped until it holds no live buffer (AR-I3),
                 // the allocator will not hand the same bytes out again until they are released,
