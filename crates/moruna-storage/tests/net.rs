@@ -630,3 +630,20 @@ fn a_body_cut_short_is_an_error_not_a_short_object() {
     assert!(read.is_err(), "{read:?}");
     until_open(&seen, 0);
 }
+
+#[test]
+fn a_job_installs_its_network_once() {
+    // This test binary's only install: a job has one network, and every store it builds from
+    // then on shares its one connector.
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let network = Arc::new(proxy(
+        "store.objects.test",
+        "127.0.0.1:9".parse().unwrap(),
+        &seen,
+    ));
+    assert!(moruna_storage::net::installed().is_none());
+    assert!(moruna_storage::net::install(network.clone()));
+    assert!(!moruna_storage::net::install(network));
+    let first = format!("{:?}", moruna_storage::net::installed().unwrap());
+    assert!(first.contains("sockets: 64"), "{first}");
+}

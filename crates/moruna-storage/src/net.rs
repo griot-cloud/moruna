@@ -32,7 +32,7 @@ use std::fmt;
 use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -87,6 +87,22 @@ pub trait NetSocket: Send + Sync {
     /// Ends the connection both ways, now: a `send` or `receive` waiting on another
     /// thread returns (an error, or the end of the stream), and nothing more moves.
     fn close(&self);
+}
+
+/// The job's network, once the engine has it: one connector, so one pool of connections, for
+/// every store the job reaches (system design 3D).
+static INSTALLED: OnceLock<NetConnector> = OnceLock::new();
+
+/// Installs the job's network: every store built from now on reaches its host through
+/// `network`, on at most [`SOCKETS`] connections at once between them. The first install holds;
+/// a second is refused (`false`), since a job has one network.
+pub fn install(network: Arc<dyn Network>) -> bool {
+    INSTALLED.set(NetConnector::new(network)).is_ok()
+}
+
+/// The job's network's connector, once [`install`]ed.
+pub fn installed() -> Option<NetConnector> {
+    INSTALLED.get().cloned()
 }
 
 /// The connector `object_store` asks for a client. Every client it makes reaches its
