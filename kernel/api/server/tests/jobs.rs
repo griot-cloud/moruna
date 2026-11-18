@@ -855,19 +855,78 @@ fn an_mcp_client_follows_a_job_to_its_report_by_polling_its_events() {
 }
 
 #[test]
-fn a_call_that_waits_past_the_idle_limit_is_let_go() {
+fn a_call_answered_after_the_idle_limit_gets_its_answer() {
+    // Idle is the client's (system design 2's Limits): a call being answered is not idle, however
+    // long its answer takes (a submit waits on a function's fetch); a client silent before its
+    // request still is, and the clock starts again from the answer.
+    let mut harness = Harness::new();
+    let token = harness.token(&["submit"]);
+    harness.engine.0.borrow_mut().hold_checks = true;
+    let client = harness.connect();
+    let silent = harness.connect();
+    harness.send(client, &Harness::post("/v1/jobs/validate", &token, JOB));
+    harness.settle();
+    assert!(harness.clients[client].response().is_none());
+    harness.clock.advance(IDLE_LIMIT_MS + 30_000);
+    harness.settle();
+    assert!(
+        !harness.clients[client].server_closed(),
+        "a call being answered is not idle"
+    );
+    assert!(
+        harness.clients[silent].server_closed(),
+        "a client silent for 60 s before its request is"
+    );
+    harness.engine.0.borrow_mut().hold_checks = false;
+    harness.settle();
+    let response = harness.clients[client]
+        .response()
+        .expect("its answer, 90 s after its request");
+    assert_eq!(response.json(), json!({ "ok": true }));
+    harness.clock.advance(IDLE_LIMIT_MS - 1);
+    harness.settle();
+    assert!(!harness.clients[client].server_closed(), "not yet");
+    harness.clock.advance(1);
+    harness.settle();
+    assert!(
+        harness.clients[client].server_closed(),
+        "idle for 60 s after its answer"
+    );
+}
+
+#[test]
+fn a_stream_with_nothing_to_send_for_60_s_stays_open() {
+    // A stream is a request being answered: while its job says nothing, the server is the one to
+    // move, and the next event still reaches the client.
+    let mut harness = Harness::new();
+    submit(&mut harness);
+    let stream = follow(&mut harness, "");
+    assert_eq!(events(&received(&mut harness, stream)).len(), 1);
+    harness.clock.advance(IDLE_LIMIT_MS + 30_000);
+    harness.settle();
+    assert!(!harness.clients[stream].server_closed());
+    harness.engine.log("source", "made 500 rows");
+    harness.settle();
+    let next = events(&received(&mut harness, stream));
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].2["text"], "made 500 rows");
+}
+
+#[test]
+fn a_call_whose_client_hangs_up_is_answered_to_nobody() {
     let mut harness = Harness::new();
     let token = harness.token(&["submit"]);
     harness.engine.0.borrow_mut().hold_checks = true;
     let client = harness.connect();
     harness.send(client, &Harness::post("/v1/jobs/validate", &token, JOB));
-    assert!(harness.clients[client].response().is_none());
-    harness.clock.advance(IDLE_LIMIT_MS);
     harness.settle();
-    assert!(harness.clients[client].server_closed());
-    // Its verdict comes to nobody; the next validate is checked and answered.
+    harness.clients[client].hang_up();
+    harness.settle();
+    // Its verdict comes to nobody, and the connection goes; the next validate is checked and
+    // answered.
     harness.engine.0.borrow_mut().hold_checks = false;
     harness.settle();
+    assert!(harness.clients[client].server_closed());
     let token = harness.token(&["submit"]);
     let next = harness.connect();
     let response = harness.exchange(next, &Harness::post("/v1/jobs/validate", &token, JOB));
