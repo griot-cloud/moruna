@@ -398,7 +398,9 @@ impl<K: Kept> Cache<K> {
 }
 
 mod handover;
-pub use handover::{MemoryImage, handover};
+pub use handover::{MemoryImage, handover, handover_of};
+
+pub mod worker;
 
 pub mod https;
 

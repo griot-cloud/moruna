@@ -94,6 +94,20 @@ pub fn handover(
     functions: &[Registered],
     images: &[Rc<MemoryImage>],
 ) -> Result<Vec<(String, Handle)>, String> {
+    let granted = images
+        .iter()
+        .map(|image| Ok((image.len(), image.grant()?)))
+        .collect::<Result<Vec<(u64, Handle)>, String>>()?;
+    handover_of(functions, granted)
+}
+
+/// [`handover`]'s handles for `functions`, whose images are `images`, each its length and a
+/// read-only handle to it, in the same order: as the fetch worker answers them
+/// ([`crate::worker`]).
+pub fn handover_of(
+    functions: &[Registered],
+    images: Vec<(u64, Handle)>,
+) -> Result<Vec<(String, Handle)>, String> {
     if functions.is_empty() && images.is_empty() {
         return Ok(Vec::new());
     }
@@ -106,11 +120,11 @@ pub fn handover(
     }
     let entries: Vec<Entry> = functions
         .iter()
-        .zip(images)
-        .map(|(function, image)| Entry {
+        .zip(&images)
+        .map(|(function, (len, _))| Entry {
             name: function.name.clone(),
             sha256: function.sha256,
-            size: image.len(),
+            size: *len,
         })
         .collect();
     let text = contract::index(&entries).map_err(|e| format!("the functions' index: {e:?}"))?;
@@ -127,8 +141,8 @@ pub fn handover(
             .map_err(|e| format!("writing the functions' index: {}", e.name()))?;
     }
     let mut out = Vec::with_capacity(images.len() + 1);
-    for (n, image) in images.iter().enumerate() {
-        out.push((contract::slot(n), image.grant()?));
+    for (n, (_, handle)) in images.into_iter().enumerate() {
+        out.push((contract::slot(n), handle));
     }
     let index = index
         .0

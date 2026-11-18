@@ -356,3 +356,127 @@ fn a_jobs_registrations_are_one_for_each_function_it_uses_in_order() {
     let bad = registrations(&names[..1], &[entry("gate-score", "XYZ")]).unwrap_err();
     assert!(bad.contains("no SHA-256"), "{bad}");
 }
+
+/// A fetch the test holds too: what it serves, what it was asked, and a gate that keeps it
+/// from answering until the test opens it.
+#[derive(Clone)]
+struct Remote(
+    std::sync::Arc<std::sync::Mutex<Served>>,
+    std::sync::Arc<std::sync::Mutex<bool>>,
+);
+
+impl Fetch for Remote {
+    fn fetch(&mut self, address: &str, limit: u64) -> Result<Vec<u8>, FetchError> {
+        while !*self.1.lock().unwrap() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.0.lock().unwrap().fetch(address, limit)
+    }
+}
+
+/// The worker's answer, waited for within 10 s.
+fn answered(fetcher: &worker::Fetcher) -> Result<Vec<(u64, moruna_svc::Handle)>, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(answer) = fetcher.answer() {
+            return answer;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no answer within 10 s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn the_worker_fetches_while_its_caller_goes_on_and_answers_each_job() {
+    let served = std::sync::Arc::new(std::sync::Mutex::new(Served::with(&[
+        ("https://x/gate-score", SCORE),
+        ("https://x/gate-enrich", ENRICH),
+        ("https://x/gate-altered", b"not what was registered"),
+    ])));
+    let open = std::sync::Arc::new(std::sync::Mutex::new(true));
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (ours, theirs) = moruna_svc::Channel::create().unwrap();
+    let worker = {
+        let mut fetch = Remote(served.clone(), open.clone());
+        let lines = lines.clone();
+        std::thread::spawn(move || {
+            worker::serve(&theirs, &mut fetch, &mut |line| {
+                lines.lock().unwrap().push(line.to_string())
+            })
+        })
+    };
+    let fetcher = worker::Fetcher::new(ours);
+    let score = registered("gate-score", "https://x/gate-score", SCORE);
+    let enrich = registered("gate-enrich", "https://x/gate-enrich", ENRICH);
+
+    // Before the cache is made, a job's functions are refused.
+    fetcher.images(core::slice::from_ref(&score)).unwrap();
+    assert!(answered(&fetcher).unwrap_err().contains("not set up"));
+    let cache_account = account(1 << 20);
+    let handle = cache_account
+        .0
+        .duplicate(Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER)
+        .unwrap();
+    fetcher.cache(1 << 20, handle).unwrap();
+
+    // A fetch that has not ended: the caller is not held, and has no answer yet.
+    *open.lock().unwrap() = false;
+    fetcher.images(&[score.clone(), enrich.clone()]).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(
+        fetcher.answer().is_none(),
+        "the caller goes on while it fetches"
+    );
+    *open.lock().unwrap() = true;
+    let images = answered(&fetcher).unwrap();
+    let lens: Vec<u64> = images.iter().map(|(len, _)| *len).collect();
+    assert_eq!(lens, [SCORE.len() as u64, ENRICH.len() as u64]);
+    assert_eq!(read(&images[1].1, ENRICH.len()), ENRICH);
+    assert!(!images[0].1.info().unwrap().1.contains(Rights::WRITE));
+    let given = handover_of(&[score.clone(), enrich.clone()], images).unwrap();
+    let names: Vec<&str> = given.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["function.0", "function.1", "functions"]);
+    assert_eq!(cache_account.usage().unwrap().used, 2 * 4096);
+
+    // A second job finds them kept: nothing is fetched again.
+    fetcher.images(core::slice::from_ref(&score)).unwrap();
+    assert_eq!(answered(&fetcher).unwrap().len(), 1);
+    assert_eq!(served.lock().unwrap().asked.len(), 2, "not fetched again");
+    {
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 3);
+        let fetched = format!("gate-score: {} bytes, fetched", SCORE.len());
+        let kept = format!(
+            "gate-score: {} bytes, kept from an earlier job",
+            SCORE.len()
+        );
+        assert!(lines[0].ends_with(&fetched), "{lines:?}");
+        assert!(lines[2].ends_with(&kept), "{lines:?}");
+    }
+
+    // An image changed since it was registered is refused, naming it, and never kept.
+    let altered = registered(
+        "gate-altered",
+        "https://x/gate-altered",
+        b"registered bytes",
+    );
+    fetcher.images(&[score.clone(), altered]).unwrap();
+    let refused = answered(&fetcher).unwrap_err();
+    assert!(
+        refused.starts_with("the function `gate-altered`'s image has changed"),
+        "{refused}"
+    );
+    assert_eq!(cache_account.usage().unwrap().used, 2 * 4096);
+
+    // Its caller gone, the worker ends; a worker gone is a refusal.
+    drop(fetcher);
+    worker.join().unwrap();
+    let (ours, theirs) = moruna_svc::Channel::create().unwrap();
+    drop(theirs);
+    let orphan = worker::Fetcher::new(ours);
+    assert!(orphan.answer().unwrap().unwrap_err().contains("has ended"));
+    assert!(orphan.channel().0.info().is_ok());
+}
