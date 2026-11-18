@@ -1,8 +1,9 @@
-"""The node benchmark from one command on the Mac (system design 6, work items 6.1 and 6.2).
+"""The node benchmark from one command on the Mac (system design 6, work items 6.1, 6.2 and 6.2b).
 
     bench/node/run.py --plan PLAN --dry-run [--vhd F] [--tasks DIR] [--from ADDRESS] [--ref066 REF]
-                      [--stamp yyyymmddHHMM]
-    bench/node/run.py --plan PLAN --go --vhd F --tasks DIR --from ADDRESS [--ref066 REF]
+                      [--wheel066 WHEEL] [--data-from-mac] [--stamp yyyymmddHHMM]
+    bench/node/run.py --plan PLAN --go --vhd F --tasks DIR --from ADDRESS [--ref066 REF] [--wheel066 WHEEL]
+                      [--data-from-mac]
     bench/node/run.py --plan PLAN --local --engines-root DIR --results DIR [--store-endpoint URL]
                       [--reference-json F]
     bench/node/run.py --plan PLAN --table bench/node/results/<stamp>
@@ -16,34 +17,50 @@ One run, in order, every step on the run's resource group in `griot-dev` (azure.
 
 1. **Provision:** the group; a storage account with containers for the node's disk, the data
    (the one container every engine reads its inputs from and writes its output to), the code,
-   the functions and the results; the plan's data uploaded; the Moruna node from its VHD
-   (`kernel/node/AZURE.md`'s steps, as `azure-up.sh --proof` runs them: TCP 443 from `--from`
-   alone) and one Linux machine (Ubuntu 24.04) for the other engines, each the plan's size in its
-   zone. The node is read from its console until `ready`; the Linux machine builds 0.6.6's wheel
-   once and keeps it in the container, and installs every engine with its Blob reader
-   (engines/setup-linux.sh).
-2. **Register** the gate tasks as the node's functions as proof.py does (3E): each in container
-   `functions`, at its SAS address, by its SHA-256 and a signature with the run's function key.
-3. **Run** the plan's runs one at a time, in its order (plan.py): Moruna's through its API as
-   proof.py runs a job (its document, the account key by secret name, its events followed over
-   SSE to the exit), every other engine's over `az vm run-command` (engines/measure.py), the
-   container's account and key given to it as environment variables. Each output is checked
-   against 0.6.6's on the Linux machine.
+   the functions and the results; the harness and the plan's runs uploaded; and one Linux machine
+   (Ubuntu 24.04) for the other engines, the plan's size in its zone.
+2. **Two sides at once,** since they are two machines; each side makes its runs one at a time.
+   - **The Linux machine** runs its steps as detached batches (engines/batch.py, each started by
+     one `az vm run-command` as a systemd unit, so no command outlives Azure's 90 minutes, and
+     followed from here through the run's container, `results/batch/NAME.json`):
+     - `setup`: the plan's data, made in Azure (engines/data-linux.sh: fetched from its public
+       source, normalised by bench/vm/normalize.py, each file checked against the plan's SHA-256,
+       uploaded to the container), then every engine installed with its Blob reader
+       (engines/setup-linux.sh; 0.6.6's wheel from --wheel066, else PyPI, else built there);
+     - `runs`: every Linux run of the plan, in its order, each a fresh measure.py process, as each
+       run-command ran one before (engines/measure.py), the container's account and key given to
+       it as environment variables. Each run's summary line lands in `live/` as it ends.
+   - **The node**, from its VHD (`kernel/node/AZURE.md`'s steps, as `azure-up.sh --proof` runs
+     them: TCP 443 from `--from` alone), read from its console until `ready`; the gate tasks
+     registered as its functions as proof.py does (3E: each in container `functions`, at its SAS
+     address, by its SHA-256 and a signature with the run's function key); then, once the data is
+     in the container, Moruna's runs in the plan's order, each through its API as proof.py runs a
+     job (its document, the account key by secret name, its events followed over SSE to the exit).
+3. **Check** each node output against 0.6.6's on the Linux machine, as one more batch (`checks`)
+   after the Linux runs, so no check runs beside a measured run.
 4. **Collect** the records into `bench/node/results/<stamp>/`, the table into its `table.md`, and
    the run's entry, with a root-cause entry for each miss (rootcause.py), into
    `architecture/benchmark-log.md`. When a step fails, what the Linux machine holds is still
-   collected (summary.json and table.md, no log entry) before the tear-down.
+   collected (summary.json and table.md, no log entry) before the tear-down; a failure on either
+   side stops the other at its next run.
 5. **Tear down:** the resource group is deleted, always, even when a step failed, and shown gone.
 
-`--dry-run` prints every command of that run, in order, and does nothing else: no `az` command
-runs, nothing is created and no file is written. Values only a real run learns (the storage key,
-the node's address) are printed as `<names>`. The image, the tasks and the operator's address are
-checked when given, as a real run checks them before it creates anything. Creating resources
-needs the PM's go-ahead each time (1E), so a real run needs `--go`, which says it was given.
+`--data-from-mac` uploads the plan's data from `source_dir` instead (as before 6.2b, at the Mac's
+upload speed): the fallback when the public source cannot be fetched or does not normalise to the
+plan's SHA-256s, which stops a run before any measured run. `--wheel066` gives the Linux machine
+0.6.6's wheel (a run that builds it keeps it in its results directory for the next one).
+
+`--dry-run` prints every command of that run, in order (the Linux side's first, then the node's),
+and does nothing else: no `az` command runs, nothing is created and no file is written. Values
+only a real run learns (the storage key, the node's address) are printed as `<names>`. The image,
+the tasks and the operator's address are checked when given, as a real run checks them before it
+creates anything. Creating resources needs the PM's go-ahead each time (1E), so a real run needs
+`--go`, which says it was given.
 
 No secret is shown or kept: the storage key and every SAS are replaced by their names in what is
 printed, in commands.log and in every record, the functions' SAS also by its signature alone
-(proof.Redact).
+(proof.Redact). On the Linux machine they live in the batch's env file (mode 600), never in a
+command line.
 
 `--local` runs the plan's Linux runs on this machine with measure.py, with no cloud: the engines'
 check on the Mac (work item 6.1, phase 1), each engine reading and writing a local Blob emulator's
@@ -56,11 +73,13 @@ import http.client
 import ipaddress
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -79,15 +98,33 @@ import table  # noqa: E402
 
 ENG, CODE, DATA = "/opt/engines", "/opt/bench", "/data"
 MEASURE = [f"{ENG}/venv-harness/bin/python", f"{CODE}/bench/node/engines/measure.py"]
-JAVA = "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64"
+JAVA_HOME = "/usr/lib/jvm/java-17-openjdk-amd64"
 # The console is read every 10 s, for at most 10 minutes: AZURE.md's bound for a node to be ready.
 CONSOLE_WAIT = (10, 600)
 MiB, GiB = 1 << 20, 1 << 30
 LOG = os.path.join(REPO, "architecture", "benchmark-log.md")
+# The Linux machine's batches (engines/batch.py): their state, steps and env files.
+BATCH = f"{DATA}/batch"
+# The variables the starting run-command writes to a batch's env file (mode 600): the machine's own
+# PATH and HOME, as each run had them under run-command, and the secrets the steps name.
+BATCH_ENV = ("PATH", "HOME", "BASE", "SAS_CODE", "SAS_RESULTS", "BENCH_KEY")
+# A run's step is killed by the batch at the run's own timeout and this much more: measure.py's
+# fetch of the output, its canonical form and the comparison, all outside every timing.
+MEASURE_SLACK_S = 900
+# The other steps' bounds: the data (fetch, normalise, check, upload); the engines' setup, with
+# 0.6.6's build (45-60 min) when no wheel is found; runs.json; one node output's check.
+DATA_BOUND_S, SETUP_BOUND_S, FETCH_BOUND_S, CHECK_BOUND_S = 1800, 3 * 3600, 300, 1800
+# How long past a step's bound the harness waits for the batch's word before it asks the machine.
+STALL_S = 600
+# How often each batch's state is read from the container.
+POLL_S = {"setup": 30, "runs": 30, "checks": 20}
 
 
 class DryRun:
-    """Prints each step; answers with `<names>` where a real run would learn a value."""
+    """Prints each step; answers with `<names>` where a real run would learn a value. The two
+    sides run one after the other, the Linux machine's first."""
+
+    answers = False  # its answers are made up: what the machine says is not judged
 
     def __init__(self, out=sys.stdout):
         self.out, self.n = out, 0
@@ -158,6 +195,25 @@ class DryRun:
     def note(self, text):
         self.say(f"      # {text}")
 
+    def parallel(self, sides, stop):
+        """The sides one after the other; the first failure stops the rest."""
+        for side in sides:
+            if stop.is_set():
+                return
+            try:
+                side()
+            except BaseException:
+                stop.set()
+                raise
+
+    def wait_for(self, event, stop, what):
+        self.note(f"the node's runs wait until {what}")
+        return event.is_set()
+
+    def read_state(self, path, steps):
+        """A batch's state as the machine would put it: every step ended."""
+        return {"state": "done", "steps": [{"id": st["id"], "exit": 0, "stdout": ""} for st in steps]}
+
 
 class DryTransport:
     """The dry run's node: each call printed, a job answered as completed."""
@@ -175,22 +231,31 @@ class DryTransport:
 class Real:
     """Runs each step. Every `az` command is checked by azure.guard first, and logged to the run's
     commands.log. Every secret the run holds (`secrets`, which Bench fills) is replaced by its name
-    in what is said, logged and saved."""
+    in what is said, logged and saved. The two sides run at once, each in a thread of its own."""
+
+    answers = True
+    # After one side fails, how long the others are given to reach their next step; how often a
+    # side that waits looks whether the other has stopped.
+    WIND_DOWN_S, WAIT_SLICE_S = 60, 5
 
     def __init__(self, cloud, log_path, out=sys.stdout):
         self.cloud, self.log, self.out = cloud, open(log_path, "a"), out
         self.transport, self.secrets = None, {}
+        self.lock = threading.Lock()
 
     def redact(self, text, extra=None):
         return proof.Redact({**self.secrets, **(extra or {})})(text)
 
     def say(self, text):
-        self.out.write(self.redact(text) + "\n")
-        self.out.flush()
+        text = self.redact(text)
+        with self.lock:
+            self.out.write(text + "\n")
+            self.out.flush()
 
     def _run(self, cmd, text):
-        self.log.write(f"{time.strftime('%H:%M:%S')} {text}\n")
-        self.log.flush()
+        with self.lock:
+            self.log.write(f"{time.strftime('%H:%M:%S')} {text}\n")
+            self.log.flush()
         p = subprocess.run(cmd, capture_output=True, text=True)
         if p.returncode != 0:
             raise RuntimeError(self.redact(f"{text[:200]}: exit {p.returncode}: {p.stderr.strip()[-500:]}"))
@@ -246,6 +311,61 @@ class Real:
     def note(self, text):
         self.say(f"# {text}")
 
+    def parallel(self, sides, stop):
+        """Every side at once, each in a thread; returns when all have ended. The first failure
+        sets `stop`, which each side reads before its next run, and is raised when the others have
+        ended, or WIND_DOWN_S after it at most (a node's job is not cut short: the group goes)."""
+        errors = []
+
+        def run(side):
+            try:
+                side()
+            except BaseException as e:  # noqa: BLE001 (raised from the calling thread)
+                errors.append(e)
+                stop.set()
+
+        threads = [threading.Thread(target=run, args=(s,), name=getattr(s, "__name__", "side"), daemon=True)
+                   for s in sides]
+        for t in threads:
+            t.start()
+        try:
+            failed_at = None
+            while True:
+                alive = [t for t in threads if t.is_alive()]
+                if not alive:
+                    break
+                if errors and failed_at is None:
+                    failed_at = time.time()
+                if failed_at is not None and time.time() - failed_at > self.WIND_DOWN_S:
+                    break
+                alive[0].join(min(1.0, self.WIND_DOWN_S))
+        except BaseException:  # Ctrl-C here: the sides stop at their next run, and the run tears down
+            stop.set()
+            raise
+        if errors:
+            raise errors[0]
+
+    def wait_for(self, event, stop, what):
+        if not event.is_set():
+            self.note(f"the node's runs wait until {what}")
+        while not event.wait(self.WAIT_SLICE_S):
+            if stop.is_set():
+                return False
+        return True
+
+    def read_state(self, path, steps):
+        """A batch's state as `az` downloaded it to `path`, or None; the file is removed."""
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
 
 class SpecBlob(proof.Blob):
     """proof.py's Blob data for one run of a plan: the spec's inputs, its output prefix."""
@@ -261,16 +381,47 @@ class SpecBlob(proof.Blob):
         return self.store.az(self.spec["output"].rstrip("/") + "/")
 
 
+def batch_start(name):
+    """The run-command that starts batch `name` on the Linux machine and returns at once: the
+    harness (once) and the batch's steps from container `code`, its env file from the command's
+    parameters, then batch.py as systemd unit `moruna-bench-NAME`. It prints `STARTED NAME`, or
+    `ALREADY NAME` when that batch was started before, so a repeated command never runs a second
+    batch beside the first."""
+    unit, steps, env = f"moruna-bench-{name}", f"{BATCH}/{name}.steps.json", f"{BATCH}/{name}.env"
+    batch = f"{CODE}/bench/node/engines/batch.py"
+    started = f"{BATCH}/{name}.started"
+    return "; ".join([
+        "set -eu",
+        f"mkdir -p {CODE} {BATCH}",
+        f"chmod 700 {BATCH}",
+        f"if [ -e {started} ]; then echo ALREADY {name}; exit 0; fi",
+        f'if [ ! -f {batch} ]; then curl -sSf "$BASE/code/harness.tar.gz?$SAS_CODE" | tar -xz -C {CODE}; fi',
+        f'curl -sSf -o {steps} "$BASE/code/batch-{name}.json?$SAS_CODE"',
+        "umask 077",
+        "printf '%s=%s\\n' " + " ".join(f'{k} "${{{k}:-}}"' for k in BATCH_ENV) + f" > {env}",
+        f"touch {started}",
+        f"systemd-run --unit={unit} --description='Moruna benchmark, batch {name}' /usr/bin/python3 {batch} "
+        f"--name {name} --steps {steps} --env {env} --dir {BATCH} --logs {DATA}/results/batch/{name} "
+        f"|| {{ rm -f {started}; exit 1; }}",
+        f"echo STARTED {name}"])
+
+
 class Bench:
     def __init__(self, plan, x, cloud, args, results, secrets_dir):
         self.plan, self.x, self.c, self.a = plan, x, cloud, args
         self.results, self.sec = results, secrets_dir
         self.runs = plans.runs(plan, DATA)
+        self.by_id = {r["id"]: r for r in self.runs}
         self.with_node = "moruna-node" in plan["engines"]
+        self.from_mac = bool(getattr(args, "data_from_mac", False))
+        self.wheel066 = getattr(args, "wheel066", "") or ""
         # Every secret the run learns, by name: the executor redacts them wherever they would show.
         self.secrets, self.setup, self.collected = {}, None, False
         x.secrets = self.secrets
         self.node, self.boot_ms, self.budget = None, None, None
+        # `stop`: a side failed, the other stops at its next run; `data_ready`: the node may start.
+        self.stop, self.data_ready = threading.Event(), threading.Event()
+        self.node_recs, self.polls = {}, 0
 
     def base(self):
         return f"https://{self.c.account}.blob.core.windows.net"
@@ -281,6 +432,9 @@ class Bench:
     def operator(self):
         return getattr(self.a, "operator", "") or "<operator-address>"
 
+    def where(self, side):
+        return [r for r in self.runs if r["where"] == side]
+
     # 1. Provision ---------------------------------------------------------------------------------
     def prepare(self):
         x, sec = self.x, self.sec
@@ -288,6 +442,11 @@ class Bench:
         machines = 2 if self.with_node else 1
         x.note(f"run {self.c.stamp}: group {self.c.group} in {self.c.subscription}, {len(self.runs)} runs; "
                f"{machines} machines of {self.c.size} at once, {machines * m['cpus']} vCPUs")
+        side = f"the Linux machine's {len(self.where('linux'))} runs as one detached batch, one at a time"
+        if self.with_node:
+            side += (f"; the node's {len(self.where('node'))} alongside, one at a time, once the data is in "
+                     "the container")
+        x.note(side)
         for line in getattr(self.a, "checked", ()):
             x.note(line)
         token_key = x.keygen(f"{sec}/token-key.pem")
@@ -295,10 +454,14 @@ class Bench:
         x.write(f"{sec}/node-config.json", json.dumps(node_api.node_config(token_key, [function_key]), indent=1))
         x.local(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", f"{sec}/linux-key"])
         x.local(["git", "-C", REPO, "archive", "--format=tar.gz", "-o", f"{sec}/harness.tar.gz", "HEAD"])
-        x.local(["git", "-C", REPO, "archive", "--format=tar.gz", "-o", f"{sec}/moruna-066.tar.gz", self.a.ref066])
+        if not self.wheel066:
+            # 0.6.6's tree, for the build when PyPI has no 0.6.6 either.
+            x.local(["git", "-C", REPO, "archive", "--format=tar.gz", "-o", f"{sec}/moruna-066.tar.gz", self.a.ref066])
         x.write(f"{sec}/runs.json", json.dumps(self.runs, indent=1))
 
     def provision(self):
+        """What both sides need, and the Linux machine; the node's own resources are its side's
+        first step (provision_node), so its upload of the image is not on the Linux side's way."""
         x, c, sec = self.x, self.c, self.sec
         x.az(azure.group_create(c))
         for cmd in azure.storage(c):
@@ -307,31 +470,42 @@ class Bench:
         s["storage-key"] = key = x.az(azure.storage_key(c), out="storage-key")
         for cmd in azure.containers(c, key):
             x.az(cmd, secrets=s)
-        src = os.path.expanduser(self.plan["dataset"]["source_dir"])
-        for f in self.plan["dataset"]["files"]:
-            # The one container every engine reads from and writes to (store.py): inputs under nyc/.
-            x.az(azure.upload(c, key, "data", f"nyc/{f}", os.path.join(src, f)), secrets=s)
-        for name in ("harness.tar.gz", "moruna-066.tar.gz", "runs.json"):
+        if self.from_mac:
+            src = os.path.expanduser(self.plan["dataset"]["source_dir"])
+            for f in self.plan["dataset"]["files"]:
+                # The one container every engine reads from and writes to (store.py): inputs under nyc/.
+                x.az(azure.upload(c, key, "data", f"nyc/{f}", os.path.join(src, f)), secrets=s)
+            self.data_ready.set()
+        names = ["harness.tar.gz", "runs.json"] + ([] if self.wheel066 else ["moruna-066.tar.gz"])
+        for name in names:
             x.az(azure.upload(c, key, "code", name, f"{sec}/{name}"), secrets=s)
+        if self.wheel066:
+            x.az(azure.upload(c, key, "code", os.path.basename(self.wheel066), self.wheel066), secrets=s)
         # Long enough for the slowest plan; the account goes with the group at the end. `code` is
-        # written once, by the setup's 0.6.6 wheel; `functions` is read only, by the node (3E).
+        # written once, by the setup's 0.6.6 wheel; `functions` is read only, by the node (3E). Every
+        # SAS is made here, before the sides start.
         expiry = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=48)).strftime("%Y-%m-%dT%H:%MZ")
         for container, perms in (("code", "racw"), ("results", "racwl")):
             s[f"sas-{container}"] = x.az(azure.sas(c, key, container, perms, expiry), out=f"sas-{container}", secrets=s)
+        if self.with_node:
+            s[proof.SAS_ENV] = x.az(azure.sas(c, key, "functions", "r", expiry), out=proof.SAS_ENV, secrets=s)
         for cmd in azure.nsgs(c, self.operator()):
             x.az(cmd)
-        if self.with_node:
-            # The proof's functions: the gate tasks in `functions`, fetched by a read-only SAS.
-            for job in self.plan["jobs"]:
-                x.az(azure.upload(c, key, "functions", f"gate-{job}", f"{self.tasks()}/gate-{job}"), secrets=s)
-            s[proof.SAS_ENV] = x.az(azure.sas(c, key, "functions", "r", expiry), out=proof.SAS_ENV, secrets=s)
-            x.az(azure.upload(c, key, "vhds", "node.vhd", getattr(self.a, "vhd", "") or "<node.vhd>", page=True),
-                 secrets=s)
-            vhd = x.az(azure.blob_url(c, key, "vhds", "node.vhd"), out="vhd-url", secrets=s)
-            x.az(azure.node_disk(c, vhd, x.az(azure.account_id(c), out="account-id")))
-            x.az(azure.node_ip(c))
-            x.az(azure.node_vm(c, f"{sec}/node-config.json"))
         x.az(azure.linux_vm(c, f"{sec}/linux-key.pub"))
+
+    def provision_node(self):
+        """The node's own resources: the proof's functions (the gate tasks in `functions`, fetched
+        by a read-only SAS), its image as a page blob, its disk, address and machine."""
+        x, c, s = self.x, self.c, self.secrets
+        key = s["storage-key"]
+        for job in self.plan["jobs"]:
+            x.az(azure.upload(c, key, "functions", f"gate-{job}", f"{self.tasks()}/gate-{job}"), secrets=s)
+        x.az(azure.upload(c, key, "vhds", "node.vhd", getattr(self.a, "vhd", "") or "<node.vhd>", page=True),
+             secrets=s)
+        vhd = x.az(azure.blob_url(c, key, "vhds", "node.vhd"), out="vhd-url", secrets=s)
+        x.az(azure.node_disk(c, vhd, x.az(azure.account_id(c), out="account-id")))
+        x.az(azure.node_ip(c))
+        x.az(azure.node_vm(c, f"{self.sec}/node-config.json"))
 
     def node_ready(self):
         x = self.x
@@ -362,18 +536,6 @@ class Bench:
         x.note(f"node {facts.get('instance', '<instance>')}, version {facts.get('version', '<version>')}: "
                f"each job's budget {self.budget} bytes")
 
-    def setup_linux(self):
-        x, s = self.x, self.secrets
-        params = [f"BASE={self.base()}", f"SAS_CODE={s['sas-code']}"]
-        out = x.az(azure.run_command(self.c, "@" + os.path.join(HERE, "engines", "setup-linux.sh"), params),
-                   out="setup", secrets=s)
-        x.az(azure.run_command(self.c, f'curl -sSf -o {DATA}/runs.json "$BASE/code/runs.json?$SAS_CODE"',
-                               [f"BASE={self.base()}", f"SAS_CODE={s['sas-code']}"]), secrets=s)
-        image = x.az(azure.image_version(self.c), out="linux-image-version")
-        setup = next((json.loads(line[6:]) for line in (out or "").splitlines() if line.startswith("SETUP ")), {})
-        self.setup = dict(setup, linux_image=image)
-        x.save(os.path.join(self.results, "setup.json"), self.setup)
-
     def register(self):
         """The gate tasks as the node's functions, as proof.py registers them (3E): each at its
         SAS address in `functions`, by its SHA-256, signed with the run's function key."""
@@ -388,30 +550,188 @@ class Bench:
             digest = f"<sha256-of-gate-{job}>"
             self.node.register(f"gate-{job}", proof.address(where, f"gate-{job}", sas), digest, x.sign(key, digest))
 
-    # 2. Run ----------------------------------------------------------------------------------------
+    # The Linux machine's batches ----------------------------------------------------------------
+    def batch_params(self):
+        """The starting run-command's parameters: what its env file keeps (BATCH_ENV)."""
+        s = self.secrets
+        return [f"BASE={self.base()}", f"SAS_CODE={s['sas-code']}", f"SAS_RESULTS={s['sas-results']}",
+                f"BENCH_KEY={s['storage-key']}"]
+
+    def store_env(self):
+        """The run's container, as measure.py and the engines read it (store.py); its key is the
+        secret BENCH_KEY, from the batch's env file."""
+        return {"BENCH_ACCOUNT": self.c.account, "BENCH_CONTAINER": "data"}
+
+    def batch(self, name, steps, on_step, after_start=None):
+        """`steps` run on the Linux machine as one detached batch, started by one run-command and
+        followed from here: `on_step(step, ended)` as each step's end is read from the container.
+        A step that outlasts its bound by STALL_S more, with no word from the batch, stops the run,
+        with what the machine says of the unit."""
+        x, s, c = self.x, self.secrets, self.c
+        path = os.path.join(self.sec, f"batch-{name}.json")
+        x.write(path, json.dumps(steps, indent=1))
+        x.az(azure.upload(c, s["storage-key"], "code", f"batch-{name}.json", path), secrets=s)
+        out = x.az(azure.run_command(c, batch_start(name), self.batch_params()), out=f"started {name}", secrets=s)
+        if x.answers and not re.search(rf"^(STARTED|ALREADY) {name}$", out or "", re.M):
+            raise RuntimeError(f"the batch {name} did not start on the Linux machine: {(out or '')[-500:]}")
+        x.note(f"the Linux machine runs batch {name}: {len(steps)} steps, one at a time")
+        if after_start:
+            after_start()
+        by_id = {st["id"]: st for st in steps}
+        seen, since = [0], [time.time()]
+
+        def look():
+            if self.stop.is_set():
+                return {"state": "stopped"}
+            state = self.batch_state(name, steps)
+            ended = (state or {}).get("steps") or []
+            for rec in ended[seen[0]:]:
+                on_step(by_id[rec["id"]], rec)
+            if len(ended) > seen[0]:
+                seen[0], since[0] = len(ended), time.time()
+            if state and state.get("state") in ("done", "failed"):
+                x.save(os.path.join(self.results, "batch", f"{name}.json"), state)
+                if state["state"] == "failed":
+                    raise RuntimeError(f"the batch {name} stopped on the Linux machine: {state.get('error')}")
+                return state
+            bound = (steps[seen[0]]["timeout_s"] if seen[0] < len(steps) else 0) + STALL_S
+            if time.time() - since[0] > bound:
+                self.stalled(name, bound)
+            return None
+
+        total = sum(st["timeout_s"] for st in steps) + STALL_S * (len(steps) + 1)
+        got = x.poll(f"batch {name} ends (each step within its bound and {STALL_S} s more)", POLL_S[name], total, look)
+        if got is None:
+            raise RuntimeError(f"the batch {name} did not end within {total} s")
+        return got
+
+    def batch_state(self, name, steps):
+        """The batch's state from `results/batch/NAME.json`, or None while there is none."""
+        x, s = self.x, self.secrets
+        self.polls += 1
+        local = os.path.join(self.sec, f"state-{name}-{self.polls}.json")
+        try:
+            x.az(azure.blob_download(self.c, s["storage-key"], "results", f"batch/{name}.json", local), secrets=s)
+        except RuntimeError as e:
+            if "BlobNotFound" not in str(e):
+                x.note(f"the state of batch {name} was not read, read again next time: {str(e)[-200:]}")
+            return None
+        return x.read_state(local, steps)
+
+    def stalled(self, name, bound):
+        out = self.x.az(azure.run_command(
+            self.c, f"systemctl status moruna-bench-{name} --no-pager -n 20 || true; "
+                    f"tail -c 1000 {BATCH}/{name}.state.json || true"), out="the unit's status", secrets=self.secrets)
+        raise RuntimeError(f"the batch {name}: no step ended within {bound} s of the last; the machine says: "
+                           f"{(out or '')[-800:]}")
+
+    # The Linux side ---------------------------------------------------------------------------------
+    def linux_side(self):
+        self.batch("setup", self.setup_steps(), self.setup_done)
+        if not self.stop.is_set():
+            self.batch("runs", self.linux_steps(), self.linux_done, after_start=self.keep_wheel)
+
+    def setup_steps(self):
+        """The data (unless it came from the Mac), then the engines (setup-linux.sh), then the
+        plan's runs.json: every one outside every timing."""
+        st, d = [], self.plan["dataset"]
+        if not self.from_mac:
+            spec = {"source_url": d["source_url"], "sha256": d["sha256"], "prefix": "nyc/",
+                    "normalize": f"{CODE}/bench/vm/normalize.py"}
+            st.append({"id": "data", "argv": ["bash", f"{CODE}/bench/node/engines/data-linux.sh", d["pyarrow"],
+                                              json.dumps(spec, separators=(",", ":"))],
+                       "env": self.store_env(), "secrets": ["BENCH_KEY"], "timeout_s": DATA_BOUND_S})
+        env = {"BASE": self.base(), "V066": getattr(self.a, "version066", "") or "0.6.6"}
+        if self.wheel066:
+            env["WHEEL066"] = os.path.basename(self.wheel066)
+        st.append({"id": "setup", "argv": ["bash", f"{CODE}/bench/node/engines/setup-linux.sh"], "env": env,
+                   "secrets": ["SAS_CODE"], "timeout_s": SETUP_BOUND_S})
+        fetch = f'curl -sSf -o {DATA}/runs.json "$BASE/code/runs.json?$SAS_CODE"'
+        st.append({"id": "runs-json", "argv": ["bash", "-c", fetch], "env": {"BASE": self.base()},
+                   "secrets": ["SAS_CODE"], "timeout_s": FETCH_BOUND_S})
+        return st
+
+    def setup_done(self, step, ended):
+        x = self.x
+        if step["id"] == "data":
+            got = tagged(ended.get("stdout"), "DATA ") or {
+                "ok": False, "error": ended.get("error") or f"no DATA line, exit {ended.get('exit')}: "
+                                                             f"{(ended.get('stderr') or '')[-300:]}"}
+            x.save(os.path.join(self.results, "data.json"), got)
+            if x.answers and not got.get("ok"):
+                raise RuntimeError(f"the data was not made in Azure: {got.get('error')}. Run again with "
+                                   "--data-from-mac to upload the Mac's copies")
+            took = "" if got.get("fetch_s") is None else (
+                f": fetched in {got['fetch_s']} s, normalised in {got.get('normalize_s')} s, "
+                f"uploaded in {got.get('upload_s')} s")
+            x.note(f"the data is in the container, each file the plan's SHA-256{took}")
+            self.data_ready.set()
+        elif step["id"] == "setup":
+            image = x.az(azure.image_version(self.c), out="linux-image-version")
+            self.setup = dict(tagged(ended.get("stdout"), "SETUP ") or {}, linux_image=image)
+            x.save(os.path.join(self.results, "setup.json"), self.setup)
+        elif x.answers and ended.get("exit") != 0:
+            raise RuntimeError(f"the setup's step {step['id']} failed: exit {ended.get('exit')}: "
+                               f"{(ended.get('stderr') or ended.get('error') or '')[-300:]}")
+
+    def keep_wheel(self):
+        """0.6.6's wheel, when the Linux machine built it, kept beside the results for the next
+        run's --wheel066 (a build takes 45-60 min); fetched while the runs go on."""
+        setup = self.setup or {}
+        name = setup.get("wheel_066_name")
+        if setup.get("wheel_066") != "built" or not name:
+            return
+        path = os.path.join(self.results, name)
+        try:
+            key = self.secrets["storage-key"]
+            self.x.az(azure.blob_download(self.c, key, "code", name, path), secrets=self.secrets)
+        except RuntimeError as e:
+            self.x.note(f"0.6.6's built wheel was not kept: {str(e)[-200:]}")
+            return
+        self.x.note(f"0.6.6's wheel, built on the Linux machine in {setup.get('wheel_066_s')} s, is kept at {path}: "
+                    f"the next run takes it with --wheel066 {path}")
+
     def reference_args(self, spec):
         ref = f"{DATA}/ref/{spec['job']}.dump"
         if spec["engine"] == plans.REFERENCE and spec["repeat"] == 0:
             return ["--make-reference", ref]
         return ["--reference-dump", ref]
 
-    def store_params(self):
-        """The run's container, as measure.py and the engines read it (store.py), for run-command."""
-        return [f"BENCH_ACCOUNT={self.c.account}", f"BENCH_KEY={self.secrets['storage-key']}", "BENCH_CONTAINER=data"]
+    def linux_steps(self):
+        """Every Linux run of the plan, in its order: measure.py's command as each run-command ran
+        it before, a fresh process each, with the container's account and key."""
+        blob = self.plan["linux_data"] == "blob"
+        steps = []
+        for spec in self.where("linux"):
+            cmd = MEASURE + ["run", "--spec", f"{DATA}/runs.json", "--id", spec["id"], "--root", ENG, "--results",
+                             f"{DATA}/results", "--work", f"{DATA}/work"] + self.reference_args(spec)
+            env = dict(self.store_env() if blob else {}, JAVA_HOME=JAVA_HOME)
+            steps.append({"id": spec["id"], "argv": cmd, "env": env, "secrets": ["BENCH_KEY"] if blob else [],
+                          "timeout_s": spec["timeout_s"] + MEASURE_SLACK_S})
+        return steps
 
-    def linux(self, spec):
-        cmd = MEASURE + ["run", "--spec", f"{DATA}/runs.json", "--id", spec["id"], "--root", ENG, "--results",
-                         f"{DATA}/results", "--work", f"{DATA}/work"] + self.reference_args(spec)
-        params = self.store_params() if self.plan["linux_data"] == "blob" else []
-        out = self.x.az(azure.run_command(self.c, f"{JAVA} {shlex.join(cmd)}", params), out=f"measured {spec['id']}",
-                        secrets=self.secrets)
-        got = measured(out)
+    def linux_done(self, step, ended):
+        """A Linux run's record lands here as it ends, from measure.py's summary line, so a partial
+        table can be made while the plan runs (`--table`); the full one replaces it at the end."""
+        spec = self.by_id[step["id"]]
+        got = measured(ended.get("stdout"))
         if got:
             self.x.say(f"      {json.dumps(got)}")
-        # The run's record lands here as it finishes, from measure.py's summary line, so a partial
-        # table can be made while the plan runs (`--table`); the full one replaces it at the end.
-        self.x.save(os.path.join(self.results, "live", f"{spec['id']}.json"), live_record(spec, got))
-        return got
+        detail = ended.get("error") or (ended.get("stderr") or "").strip()[-300:] or None
+        self.x.save(os.path.join(self.results, "live", f"{spec['id']}.json"), live_record(spec, got, detail))
+
+    # The node's side --------------------------------------------------------------------------------
+    def node_side(self):
+        self.provision_node()
+        self.node_ready()
+        self.register()
+        if not self.x.wait_for(self.data_ready, self.stop, "the data is in the container"):
+            return
+        for spec in self.where("node"):
+            if self.stop.is_set():
+                return
+            self.x.note(f"run {spec['id']}")
+            self.moruna(spec)
 
     def moruna(self, spec):
         """One job on the node, as proof.py runs one: its document (the registered function by
@@ -422,9 +742,10 @@ class Bench:
         (item 2.4), or on a node without them whole seconds, so within 1 s. Every mark
         is kept: this machine's end-to-end time (the answer to the exit seen), the boot's
         `boot_ms` and the first rows at the sink among them. A job the node refuses, or that is
-        not followed to its end, is a failed run, and the next run goes on."""
-        x, s = self.x, self.secrets
-        store = stores.Store(self.c.account, s.get("storage-key", "<storage-key>"), "data")
+        not followed to its end, is a failed run, and the next run goes on. Its output is checked
+        against 0.6.6's after the Linux runs (check_node_outputs)."""
+        x = self.x
+        store = stores.Store(self.c.account, self.secrets.get("storage-key", "<storage-key>"), "data")
         numeric = isinstance(self.budget, int)
         doc, job_secrets = proof.document({"job": spec["job"], "id": spec["id"], "period": None},
                                           SpecBlob(store, spec), spec["cpus"], self.budget if numeric else 0)
@@ -476,39 +797,56 @@ class Bench:
             "peak_bytes": report.get("peak_anon_bytes") or resources.get("peak_memory_bytes"),
             "split": collect.report_split(report),
             "report_budget": report.get("budget"), "object_io": report.get("object_io")})
-        if rec["ok"]:
-            check = MEASURE + ["check", "--workload", spec["job"], "--out", f"{DATA}/work/node-{spec['id']}", "--id",
-                               spec["id"], "--root", ENG, "--results", f"{DATA}/results", "--blob-prefix",
-                               spec["output"]] + self.reference_args(spec)
-            out = x.az(azure.run_command(self.c, shlex.join(check), self.store_params()),
-                       out=f"checked {spec['id']}", secrets=s)
-            verdict = (measured(out) or {}).get("output") or ""
-            # As measure.py's own records say it, so the collector reads it alike (collect.output_verdict).
-            rec["output_check"] = {"verdict": verdict, "ok": verdict.startswith(("bit for bit", "within")),
-                                   "hash_all": verdict == "bit for bit"}
-        else:
+        if not rec["ok"]:
             rec["diagnostic"] = got.exit.get("diagnostic")
         x.save(os.path.join(self.results, "node", f"{spec['id']}.job.json"),
                {"job": j, "report": report, "events": got.events(), "exit": got.exit})
         return self.keep(spec, rec)
 
     def keep(self, spec, rec):
+        self.node_recs[spec["id"]] = rec
         self.x.save(os.path.join(self.results, "node", f"{spec['id']}.json"), rec)
         if not isinstance(self.x, DryRun):
-            outcome = (rec.get("output_check") or {}).get("verdict") or rec.get("error") or rec.get("diagnostic")
+            outcome = ((rec.get("output_check") or {}).get("verdict") or rec.get("error") or rec.get("diagnostic")
+                       or "its output checked after the Linux runs")
             self.x.say(f"      {spec['id']}: {rec.get('state')}, operational {rec.get('operational_s')} s, {outcome}")
         return rec
 
-    # 3. Collect ------------------------------------------------------------------------------------
+    # 3. Check the node's outputs ----------------------------------------------------------------------
+    def check_step(self, spec):
+        argv = MEASURE + ["check", "--workload", spec["job"], "--out", f"{DATA}/work/node-{spec['id']}", "--id",
+                          spec["id"], "--root", ENG, "--results", f"{DATA}/results", "--blob-prefix", spec["output"]]
+        return {"id": spec["id"], "argv": argv + self.reference_args(spec), "env": self.store_env(),
+                "secrets": ["BENCH_KEY"], "timeout_s": CHECK_BOUND_S}
+
+    def check_node_outputs(self):
+        """Each completed node run's output against 0.6.6's, on the Linux machine, as one batch
+        after the Linux runs: measure.py's check, the reference's dump as every Linux run's."""
+        steps = [self.check_step(self.by_id[rid]) for rid, rec in self.node_recs.items() if rec.get("ok")]
+        if steps:
+            self.batch("checks", steps, self.check_done)
+
+    def check_done(self, step, ended):
+        spec, rec = self.by_id[step["id"]], self.node_recs[step["id"]]
+        verdict = (measured(ended.get("stdout")) or {}).get("output") or ""
+        # As measure.py's own records say it, so the collector reads it alike (collect.output_verdict).
+        rec["output_check"] = {"verdict": verdict, "ok": verdict.startswith(("bit for bit", "within")),
+                               "hash_all": verdict == "bit for bit"}
+        self.keep(spec, rec)
+
+    # 4. Collect ------------------------------------------------------------------------------------
     def collect(self, log=True):
         """The Linux machine's records into the results, then the summary, the table and, unless the
-        run stopped early (`log` false), the run's entry in the benchmark log."""
+        run stopped early (`log` false), the run's entry in the benchmark log. A batch still going
+        (the run stopped early) is stopped first, so its files hold still."""
         x, s = self.x, self.secrets
-        script = (f"tar -czf {DATA}/results.tgz -C {DATA} results && curl -sSf -X PUT -H 'x-ms-blob-type: BlockBlob' "
+        units = " ".join(f"moruna-bench-{n}" for n in POLL_S)
+        script = (f"systemctl stop {units} 2>/dev/null || true; "
+                  f"tar -czf {DATA}/results.tgz -C {DATA} results && curl -sSf -X PUT -H 'x-ms-blob-type: BlockBlob' "
                   f'-T {DATA}/results.tgz "$BASE/results/linux.tgz?$SAS_RESULTS"')
         x.az(azure.run_command(self.c, script, [f"BASE={self.base()}", f"SAS_RESULTS={s['sas-results']}"]), secrets=s)
-        x.az(azure.blob(self.c, s["storage-key"], "blob", "download", "-c", "results", "-n", "linux.tgz", "-f",
-                        f"{self.results}/linux.tgz", "-o", "none"), secrets=s)
+        x.az(azure.blob_download(self.c, s["storage-key"], "results", "linux.tgz", f"{self.results}/linux.tgz"),
+             secrets=s)
         x.local(["tar", "-xzf", f"{self.results}/linux.tgz", "-C", self.results])
         self.collected = True
         x.finish(self.plan, self.results, self.meta(), log=log)
@@ -520,14 +858,19 @@ class Bench:
         node_image = self.a.vhd
         if image:
             node_image = f"{self.a.vhd} ({image['bytes']} bytes, sha256 {image['sha256']})"
+        made = ("uploaded from this machine" if self.from_mac else
+                f"made in Azure from {self.plan['dataset'].get('source_url')}, each file the plan's SHA-256")
+        wheel = setup.get("wheel_066")
+        if setup.get("wheel_066_name"):
+            wheel = f"{wheel}, {setup['wheel_066_name']} (sha256 {setup.get('wheel_066_sha256')})"
         return {"date": self.c.stamp, "commit": commit, "node_image": node_image,
                 "machines": f"{self.c.size}, zone {self.c.zone}, {self.c.location}, subscription {self.c.subscription}",
                 "linux_image": setup.get("linux_image"),
-                "data": f"read and written in Blob container `data`; 0.6.6's wheel {setup.get('wheel_066')} "
+                "data": f"read and written in Blob container `data`, {made}; 0.6.6's wheel {wheel} "
                         f"in {setup.get('wheel_066_s')} s, outside every timing",
                 "results": os.path.relpath(self.results, REPO)}
 
-    # 4. Tear down ----------------------------------------------------------------------------------
+    # 5. Tear down ----------------------------------------------------------------------------------
     def teardown(self):
         x = self.x
         x.note("tear down: always, even when a step failed")
@@ -542,17 +885,12 @@ class Bench:
         try:
             self.prepare()
             self.provision()
+            self.x.parallel([self.linux_side] + ([self.node_side] if self.with_node else []), self.stop)
             if self.with_node:
-                self.node_ready()
-            self.setup_linux()
-            if self.with_node:
-                self.register()
-            for spec in self.runs:
-                x = self.x
-                x.note(f"run {spec['id']}")
-                (self.moruna if spec["where"] == "node" else self.linux)(spec)
+                self.check_node_outputs()
             self.collect()
         except BaseException:
+            self.stop.set()
             # What the Linux machine holds is kept before the group goes; the run is not logged.
             if self.setup is not None and not self.collected:
                 try:
@@ -564,10 +902,10 @@ class Bench:
             self.teardown()
 
 
-def live_record(spec, got):
+def live_record(spec, got, detail=None):
     """A Linux run's record from measure.py's summary line (the full one stays on the machine
     until the end): what the table needs, marked `live`, which collect.load lets the full one
-    replace. A run with no summary line is a failed run."""
+    replace. A run with no summary line is a failed run; `detail` says what the batch saw."""
     got = got or {}
     rec = {"spec": spec, "live": True, "ok": bool(got.get("ok")), "memory_gib": spec.get("mem_gib")}
     for k in ("startup_s", "operational_s", "cpu_s", "peak_bytes", "oom_kills", "data", "copy_in_s", "copy_out_s"):
@@ -575,16 +913,21 @@ def live_record(spec, got):
             rec[k] = got[k]
     rec["output_check"] = got.get("check") or {"verdict": got.get("output")}
     if not got:
-        rec["error"] = "no summary line in the run's output"
+        rec["error"] = "no summary line in the run's output" + (f": {detail}" if detail else "")
     return rec
 
 
-def measured(text):
-    """The record's summary line from measure.py's output (run-command keeps the last 4 KiB)."""
+def tagged(text, tag):
+    """The JSON of the last line of `text` that starts with `tag` (`MEASURED `, `SETUP `, `DATA `)."""
     for line in reversed((text or "").splitlines()):
-        if line.startswith("MEASURED "):
-            return json.loads(line[len("MEASURED "):])
+        if line.startswith(tag):
+            return json.loads(line[len(tag):])
     return None
+
+
+def measured(text):
+    """The record's summary line from measure.py's output (the batch keeps its last 8 KiB)."""
+    return tagged(text, "MEASURED ")
 
 
 def finish(plan, results, meta, log=LOG):
@@ -683,20 +1026,51 @@ def task_facts(plan, tasks):
     return out
 
 
+def data_facts(plan, from_mac):
+    """Where the run's data comes from, checked: made in Azure from the plan's public source
+    (the plan must name it and every file's SHA-256), or with `from_mac` the Mac's copies in
+    `source_dir`, each the plan's SHA-256 when the plan gives them. A line to note; a SystemExit
+    says what is wrong."""
+    d = plan["dataset"]
+    files = d["files"]
+    if not from_mac:
+        if not d.get("source_url"):
+            raise SystemExit("run.py: the plan names no public source for its data (dataset.source_url): "
+                             "run with --data-from-mac")
+        return (f"data: {len(files)} files made in Azure by the Linux machine from {d['source_url']}: normalised by "
+                f"bench/vm/normalize.py with pyarrow {d['pyarrow']}, each checked against the plan's SHA-256 "
+                f"before it is uploaded to the container")
+    src = os.path.expanduser(d["source_dir"])
+    missing = [f for f in files if not os.path.isfile(os.path.join(src, f))]
+    if missing:
+        raise SystemExit(f"run.py: the plan's data is not all in {src}: no {', '.join(missing)}")
+    wrong = [f for f in files if d.get("sha256") and sha256_of(os.path.join(src, f)) != d["sha256"][f]]
+    if wrong:
+        raise SystemExit(f"run.py: in {src}, not the plan's SHA-256: {', '.join(wrong)}")
+    total = sum(os.path.getsize(os.path.join(src, f)) for f in files)
+    checked = ", each the plan's SHA-256" if d.get("sha256") else ""
+    return f"data: {len(files)} files from {src}{checked}, {total / MiB:.0f} MiB to upload from this machine"
+
+
 def check_inputs(plan, a, real):
-    """What a run is given, checked before anything is created: the plan's data, and with the
-    node the image, the gate tasks and the operator's address (TCP 443 is admitted from it alone,
-    AZURE.md). A real run needs them all; a dry run checks those it is given. Returns the lines
-    the run notes first; a SystemExit says what is wrong."""
+    """What a run is given, checked before anything is created: the plan's data, 0.6.6's wheel
+    when one is given, and with the node the image, the gate tasks and the operator's address
+    (TCP 443 is admitted from it alone, AZURE.md). A real run needs them all; a dry run checks
+    those it is given. Returns the lines the run notes first; a SystemExit says what is wrong."""
     lines, with_node = [], "moruna-node" in plan["engines"]
     if real and with_node and not (a.vhd and a.tasks and a.operator):
         raise SystemExit("run.py: a real run needs --vhd, --tasks and --from")
-    src = os.path.expanduser(plan["dataset"]["source_dir"])
-    missing = [f for f in plan["dataset"]["files"] if not os.path.isfile(os.path.join(src, f))]
-    if missing:
-        raise SystemExit(f"run.py: the plan's data is not all in {src}: no {', '.join(missing)}")
-    total = sum(os.path.getsize(os.path.join(src, f)) for f in plan["dataset"]["files"])
-    lines.append(f"data: {len(plan['dataset']['files'])} files from {src}, {total / MiB:.0f} MiB to upload")
+    lines.append(data_facts(plan, getattr(a, "data_from_mac", False)))
+    wheel = getattr(a, "wheel066", "")
+    if wheel:
+        a.wheel066 = wheel = os.path.abspath(os.path.expanduser(wheel))
+        name = os.path.basename(wheel)
+        if not os.path.isfile(wheel) or not re.fullmatch(r"moruna-[0-9.]+-cp314-cp314t-\w+\.whl", name):
+            raise SystemExit(f"run.py: --wheel066 {wheel}: not a CPython 3.14t wheel of moruna")
+        lines.append(f"0.6.6's wheel: {name} from this machine, sha256 {sha256_of(wheel)}")
+    else:
+        lines.append(f"0.6.6's wheel: moruna {getattr(a, 'version066', '0.6.6')} from PyPI if it is there, "
+                     f"else built on the Linux machine from {a.ref066}")
     if not with_node:
         return lines
     if a.operator:
@@ -732,7 +1106,14 @@ def main(argv=None, out=sys.stdout):
                    help="this machine's public IPv4 address: the node admits TCP 443 from it alone (AZURE.md)")
     # 0.6.6 has no tag yet: its release commit and the CI commits after it, fix/adaptive-runtime's head.
     p.add_argument("--ref066", default="8018c96ab02867c7201450a9375ce3d9bc4da00e",
-                   help="0.6.6's commit, built on the Linux machine")
+                   help="0.6.6's commit, built on the Linux machine when neither --wheel066 nor PyPI gives its wheel")
+    p.add_argument("--version066", default="0.6.6",
+                   help="0.6.6's version on PyPI: its wheel is taken from there when PyPI has it")
+    p.add_argument("--wheel066", default="",
+                   help="0.6.6's wheel (CPython 3.14t, x86_64) to give the Linux machine, such as the one a run "
+                        "that built it kept in its results directory")
+    p.add_argument("--data-from-mac", action="store_true",
+                   help="upload the plan's data from source_dir, instead of making it in Azure from its public source")
     p.add_argument("--stamp", default="", help="yyyymmddHHMM; now, in UTC, by default")
     p.add_argument("--engines-root", default="", help="--local: install.py's root")
     p.add_argument("--reference-json", default="",

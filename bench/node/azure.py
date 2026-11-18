@@ -11,7 +11,9 @@ type, accelerated networking off, boot diagnostics into the run's account from t
 power-on, so it is never restarted, node config as user-data), made with `--no-wait`.
 
 The Linux machine for the other engines is the node's size in the node's zone, with the same
-network settings; it has no inbound rule at all and is driven only through `az vm run-command`.
+network settings; it has no inbound rule at all and is driven only through `az vm run-command`,
+each of which starts a detached batch (engines/batch.py) and returns, so none nears Azure's 90
+minutes; the batches report through the run's `results` container.
 Both machines have a public address, since a new virtual network gives a machine no outbound
 access without one, and the Linux machine installs its engines from the internet.
 """
@@ -78,6 +80,11 @@ def containers(c: Cloud, key: str):
 def upload(c: Cloud, key: str, container: str, name: str, path: str, page=False):
     kind = ["--type", "page"] if page else []
     return blob(c, key, "blob", "upload", "-c", container, "-n", name, "-f", path, *kind, "-o", "none")
+
+
+def blob_download(c: Cloud, key: str, container: str, name: str, path: str):
+    """One blob of the run's account into the file `path` on this machine."""
+    return blob(c, key, "blob", "download", "-c", container, "-n", name, "-f", path, "-o", "none")
 
 
 def sas(c: Cloud, key: str, container: str, permissions: str, expiry: str):

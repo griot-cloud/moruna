@@ -27,6 +27,8 @@ venv/
 /bench/data/
 *.trace.arrow
 /profiles/
+# A node benchmark run keeps 0.6.6's wheel beside its results when it built it (run.py --wheel066).
+/bench/node/results/**/*.whl
 
 # Editors and OS
 .idea/

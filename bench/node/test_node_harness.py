@@ -91,6 +91,13 @@ def test_the_month_plan():
     (lambda p: p["machine"].update(cpus=0), "machine"),
     (lambda p: p.update(machine=[]), "an object"),
     (lambda p: p.update(linux_data="nfs"), "linux_data"),
+    # The data made in Azure: its source, the writer's pyarrow and every file's SHA-256, together.
+    (lambda p: p["dataset"].pop("pyarrow"), "go together"),
+    (lambda p: p["dataset"].update(source_url="https://example.org/data.parquet"), "`{file}`"),
+    (lambda p: p["dataset"].update(source_url="http://example.org/{file}"), "https"),
+    (lambda p: p["dataset"]["sha256"].pop("yellow_tripdata_2024-12.parquet"), "every file"),
+    (lambda p: p["dataset"]["sha256"].update({"yellow_tripdata_2024-01.parquet": "AB" * 32}), "lowercase hex"),
+    (lambda p: p["dataset"].update(pyarrow=""), "pyarrow"),
 ])
 def test_a_bad_plan_is_refused(change, message):
     p = nyc_plan()
@@ -118,6 +125,7 @@ def test_names_and_the_guard():
     assert c.account.isalnum() and c.account.islower() and 3 <= len(c.account) <= 24
     every = [azure.group_create(c), *azure.storage(c), azure.storage_key(c), *azure.containers(c, "K"),
              azure.upload(c, "K", "data", "f", "/f"), azure.sas(c, "K", "data", "r", "2026-11-18T00:00Z"),
+             azure.blob_download(c, "K", "results", "batch/runs.json", "/s"),
              azure.blob_url(c, "K", "vhds", "node.vhd"), azure.node_disk(c, "u", "i"), azure.account_id(c),
              *azure.nsgs(c, "203.0.113.9"), azure.node_ip(c), azure.node_vm(c, "/cfg"), azure.boot_log(c),
              azure.node_address(c), azure.linux_vm(c, "/k.pub"), azure.image_version(c),
@@ -185,9 +193,16 @@ def test_the_dry_run_lists_every_command_and_creates_nothing(tmp_path):
     runs = plans.runs(nyc_plan())
     linux = [r for r in runs if r["where"] == "linux"]
     node = [r for r in runs if r["where"] == "node"]
-    measured = [a for a in azs if "measure.py run" in a]
-    assert [a.split("--id ")[1].split()[0] for a in measured] == [r["id"] for r in linux]
-    assert sum("measure.py check" in a for a in azs) == len(node)
+    # The Linux machine: three batches (its setup, its runs, the node outputs' checks), each started
+    # by one run-command that returns at once, and the collection; the key reaches it redacted here.
+    starts = [a for a in azs if "run-command invoke" in a and "batch.py --name" in a]
+    assert [a.split("batch.py --name ")[1].split()[0] for a in starts] == ["setup", "runs", "checks"]
+    assert all("'BENCH_KEY=<storage-key>'" in a and "'SAS_RESULTS=<sas-results>'" in a for a in starts)
+    assert sum("run-command invoke" in a for a in azs) == 4
+    assert all(sum(f"-n batch-{n}.json" in a for a in azs) == 1 for n in ("setup", "runs", "checks"))
+    # Each Linux run's record lands as the batch's state says it ended, in the plan's order.
+    live = [line.rsplit("/live/", 1)[1][:-len(".json")] for line in steps if "/live/" in line]
+    assert live == [r["id"] for r in linux]
     assert sum(" POST https://<node-address>/v1/jobs " in line for line in steps) == len(node)
     # Each job followed over SSE to its exit, as proof.py follows one.
     assert sum("/events?from=0 (Server-Sent Events" in line for line in steps) == len(node)
@@ -197,10 +212,14 @@ def test_the_dry_run_lists_every_command_and_creates_nothing(tmp_path):
                in line for line in steps)
     assert sum("blob upload -c functions -n gate-" in a for a in azs) == 4
     assert any("generate-sas -n functions --permissions r " in a for a in azs)
-    assert any("setup-linux.sh" in a for a in azs) and any("--make-reference /data/ref/score.dump" in a for a in azs)
-    # Every engine reads and writes the one container; the key reaches the machine redacted here.
-    assert all("'BENCH_KEY=<storage-key>'" in a and "BENCH_CONTAINER=data" in a for a in measured)
-    assert sum("blob upload -c data -n nyc/yellow_tripdata_2024-" in a for a in azs) == 12
+    # The data is made in Azure: none of it goes from this machine. The Linux machine is made
+    # before the node's image goes up, so its setup does not wait for that upload.
+    assert not any("blob upload -c data" in a for a in azs)
+    first = [i for i, a in enumerate(azs) if "vm create -n bench-linux" in a or "-c vhds -n node.vhd" in a]
+    assert "bench-linux" in azs[first[0]] and "node.vhd" in azs[first[1]]
+    notes = "\n".join(line for line in lines if line.startswith("      # "))
+    assert "the node's runs wait until the data is in the container" in notes
+    assert "data: 12 files made in Azure by the Linux machine from https://d37ci6vzurychx.cloudfront.net" in notes
     # The proof's job document: the function by name, Blob by `az://`, the key by secret name.
     job = next(line for line in steps if " POST https://<node-address>/v1/jobs " in line and "score-moruna-node-r1" in line)
     assert '"kernels":[{"kind":"function","function":"gate-score"}]' in job
@@ -234,7 +253,7 @@ def test_the_dry_run_checks_the_image_the_tasks_and_the_address(tmp_path):
     notes = "\n".join(line for line in lines if line.startswith("      # "))
     assert f"node image: {vhd}, {(2 << 20) + 512} bytes, a fixed VHD of 2 MiB, sha256 " in notes
     assert f"gate tasks: {tasks}: gate-score " in notes and "TCP 443 from 203.0.113.9/32 alone" in notes
-    assert "2 machines of Standard_D4s_v4 at once, 8 vCPUs" in notes and "12 files from" in notes
+    assert "2 machines of Standard_D4s_v4 at once, 8 vCPUs" in notes and "12 files made in Azure" in notes
     steps = [line for line in lines if line.startswith("[")]
     # With the tasks given, proof.py registers them: the node's list first, then each by its SHA-256.
     assert any(" GET https://<node-address>/v1/functions" in line for line in steps)
@@ -273,7 +292,138 @@ def test_wrong_inputs_are_refused_before_anything_runs(tmp_path):
     path = tmp_path / "p.json"
     path.write_text(json.dumps(plan))
     with pytest.raises(SystemExit, match="the plan's data is not all in"):
+        run.main(["--plan", str(path), "--dry-run", "--data-from-mac", "--results", str(tmp_path / "r")],
+                 out=io.StringIO())
+    # Made in Azure, the data needs nothing from this machine, but the plan must say where it is.
+    run.main(["--plan", str(path), "--dry-run", "--results", str(tmp_path / "r")], out=io.StringIO())
+    for k in plans.MADE_IN_AZURE:
+        plan["dataset"].pop(k)
+    path.write_text(json.dumps(plan))
+    with pytest.raises(SystemExit, match="names no public source"):
         run.main(["--plan", str(path), "--dry-run", "--results", str(tmp_path / "r")], out=io.StringIO())
+
+
+def mac_data(tmp_path, wrong=()):
+    """A plan whose data is three small files in `tmp_path/norm`, each the plan's SHA-256 but `wrong`."""
+    plan = nyc_plan()
+    src = tmp_path / "norm"
+    src.mkdir()
+    files = [f"yellow_tripdata_2024-0{m}.parquet" for m in (1, 2, 3)]
+    for f in files:
+        (src / f).write_bytes(f.encode())
+    plan["dataset"].update(source_dir=str(src), files=files,
+                           sha256={f: run.sha256_of(str(src / f)) if f not in wrong else "0" * 64 for f in files})
+    path = tmp_path / "p.json"
+    path.write_text(json.dumps(plan))
+    return str(path), files
+
+
+def test_the_data_from_the_mac_is_the_fallback(tmp_path):
+    """--data-from-mac uploads the Mac's copies as before, each checked against the plan's SHA-256,
+    and the Linux machine's setup then makes no data."""
+    path, files = mac_data(tmp_path)
+    out = io.StringIO()
+    run.main(["--plan", path, "--dry-run", "--data-from-mac", "--results", str(tmp_path / "r")], out=out)
+    lines = out.getvalue().splitlines()
+    assert sum("blob upload -c data -n nyc/yellow_tripdata_2024-" in line for line in lines) == len(files)
+    assert any(f"data: 3 files from {tmp_path / 'norm'}, each the plan's SHA-256, 0 MiB to upload" in line
+               for line in lines)
+    assert "the node's runs wait until" in out.getvalue()
+    (tmp_path / "w").mkdir()
+    wrong, _ = mac_data(tmp_path / "w", wrong=(files[1],))
+    with pytest.raises(SystemExit, match=f"not the plan's SHA-256: {files[1]}"):
+        run.main(["--plan", wrong, "--dry-run", "--data-from-mac", "--results", str(tmp_path / "r")], out=io.StringIO())
+    b = run.Bench(plans.load(path), run.DryRun(io.StringIO()), cloud(), Args(), str(tmp_path), "/s")
+    assert [s["id"] for s in b.setup_steps()] == ["data", "setup", "runs-json"]
+    b.from_mac = True
+    assert [s["id"] for s in b.setup_steps()] == ["setup", "runs-json"]
+
+
+def test_a_wheel_of_0_6_6_given_to_the_run(tmp_path):
+    """--wheel066 goes to the container under its own name for the setup to take (WHEEL066), and
+    0.6.6's tree is then neither archived nor uploaded."""
+    wheel = tmp_path / "moruna-0.6.6-cp314-cp314t-linux_x86_64.whl"
+    wheel.write_bytes(b"wheel")
+    lines = dry(tmp_path, "--wheel066", str(wheel))
+    text = "\n".join(lines)
+    assert f"0.6.6's wheel: {wheel.name} from this machine, sha256 {run.sha256_of(str(wheel))}" in text
+    assert f"blob upload -c code -n {wheel.name} -f {wheel}" in text and "moruna-066.tar.gz" not in text
+    args = Args()
+    args.wheel066 = str(wheel)
+    b = run.Bench(nyc_plan(), run.DryRun(io.StringIO()), cloud(), args, str(tmp_path), "/s")
+    setup = next(s for s in b.setup_steps() if s["id"] == "setup")
+    assert setup["env"] == {"BASE": b.base(), "V066": "0.6.6", "WHEEL066": wheel.name}
+    assert setup["secrets"] == ["SAS_CODE"] and setup["argv"] == ["bash", "/opt/bench/bench/node/engines/setup-linux.sh"]
+    bad = tmp_path / "moruna-0.6.6-cp314-cp314-linux_x86_64.whl"
+    bad.write_bytes(b"gil")
+    with pytest.raises(SystemExit, match="not a CPython 3.14t wheel"):
+        dry(tmp_path, "--wheel066", str(bad))
+    # Without one: PyPI's 0.6.6 when it is there, else a build of --ref066.
+    assert any("moruna 0.6.6 from PyPI if it is there, else built on the Linux machine from 8018c96a" in line
+               for line in dry(tmp_path))
+
+
+def test_the_batches_steps(tmp_path):
+    """The Linux runs as one batch: measure.py's command for each, as each run-command ran it,
+    in the plan's order, its container's account by name and its key a secret of the env file."""
+    b = run.Bench(nyc_plan(), run.DryRun(io.StringIO()), cloud(), Args(), str(tmp_path), "/s")
+    b.secrets.update({"storage-key": "KEY", "sas-code": "sv=c", "sas-results": "sv=r"})
+    linux = [r for r in plans.runs(nyc_plan(), run.DATA) if r["where"] == "linux"]
+    steps = b.linux_steps()
+    assert [s["id"] for s in steps] == [r["id"] for r in linux]
+    assert steps[0]["argv"] == run.MEASURE + [
+        "run", "--spec", "/data/runs.json", "--id", "score-moruna066-r0", "--root", "/opt/engines", "--results",
+        "/data/results", "--work", "/data/work", "--make-reference", "/data/ref/score.dump"]
+    assert steps[1]["argv"][-2:] == ["--reference-dump", "/data/ref/score.dump"]
+    assert steps[0]["env"] == {"BENCH_ACCOUNT": "mrnb202611180900", "BENCH_CONTAINER": "data",
+                               "JAVA_HOME": "/usr/lib/jvm/java-17-openjdk-amd64"}
+    assert all(s["secrets"] == ["BENCH_KEY"] and s["timeout_s"] == 1800 + run.MEASURE_SLACK_S for s in steps)
+    data = b.setup_steps()[0]
+    spec = json.loads(data["argv"][3])
+    assert data["argv"][:3] == ["bash", "/opt/bench/bench/node/engines/data-linux.sh", "24.0.0"]
+    assert spec["source_url"] == "https://d37ci6vzurychx.cloudfront.net/trip-data/{file}" and spec["prefix"] == "nyc/"
+    assert spec["sha256"] == nyc_plan()["dataset"]["sha256"] and spec["normalize"] == "/opt/bench/bench/vm/normalize.py"
+    assert data["secrets"] == ["BENCH_KEY"] and data["env"]["BENCH_CONTAINER"] == "data"
+    node = next(r for r in plans.runs(nyc_plan(), run.DATA) if r["where"] == "node" and r["repeat"] == 1)
+    check = b.check_step(node)
+    assert check["argv"][2:8] == ["check", "--workload", "score", "--out", "/data/work/node-score-moruna-node-r1", "--id"]
+    assert "--blob-prefix" in check["argv"] and check["argv"][-1] == "/data/ref/score.dump"
+    # No secret is in a step: the batch's env file holds them, from the run-command's parameters.
+    text = json.dumps([steps, b.setup_steps(), check])
+    assert "KEY" not in text.replace("BENCH_KEY", "") and "sv=" not in text
+    assert b.batch_params() == ["BASE=https://mrnb202611180900.blob.core.windows.net", "SAS_CODE=sv=c",
+                                "SAS_RESULTS=sv=r", "BENCH_KEY=KEY"]
+
+
+def test_the_batch_starts_once_and_keeps_its_secrets_in_a_file(tmp_path):
+    """The run-command's script in a shell, with curl and systemd-run stood in for: it writes the
+    env file (mode 600, the parameters and the machine's PATH), starts batch.py as a unit, and a
+    second start of the same batch starts nothing."""
+    shims = tmp_path / "bin"
+    shims.mkdir()
+    (shims / "curl").write_text('#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && echo "[]" > "$2"; shift; done\n')
+    (shims / "systemd-run").write_text(f'#!/bin/sh\necho "$@" >> {tmp_path}/units\n')
+    for f in shims.iterdir():
+        f.chmod(0o755)
+    script = run.batch_start("runs").replace("/data/", f"{tmp_path}/data/").replace("/opt/bench", f"{tmp_path}/opt")
+    # The harness is on the machine already (the setup's batch fetched it).
+    (tmp_path / "opt" / "bench" / "node" / "engines").mkdir(parents=True)
+    (tmp_path / "opt" / "bench" / "node" / "engines" / "batch.py").write_text("")
+    env = {"PATH": f"{shims}:/usr/bin:/bin", "BASE": "https://a.blob.core.windows.net", "SAS_CODE": "sv=1&sig=c",
+           "SAS_RESULTS": "sv=1&sig=r", "BENCH_KEY": "K+ey=="}
+    first = subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=env)
+    assert first.returncode == 0 and first.stdout.strip() == "STARTED runs", first.stderr
+    envfile = tmp_path / "data" / "batch" / "runs.env"
+    assert oct(envfile.stat().st_mode & 0o777) == "0o600"
+    import batch
+    got = batch.load_env(str(envfile))
+    assert got["BENCH_KEY"] == "K+ey==" and got["SAS_RESULTS"] == "sv=1&sig=r" and got["PATH"].startswith(str(shims))
+    assert got["HOME"] == ""
+    unit = (tmp_path / "units").read_text()
+    assert unit.startswith("--unit=moruna-bench-runs ") and "batch.py --name runs --steps" in unit
+    assert "K+ey" not in unit and "sig=" not in unit
+    again = subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=env)
+    assert again.stdout.strip() == "ALREADY runs" and (tmp_path / "units").read_text() == unit
 
 
 def test_real_mode_needs_its_inputs(tmp_path):
@@ -339,12 +489,63 @@ class FakeNode:
 
 
 class Fake(run.DryRun):
-    """A run's executor whose cloud is a dictionary: what a real run would learn, made up."""
+    """A run's executor whose cloud is a dictionary: what a real run would learn, made up. The
+    Linux machine runs a batch's steps when it is started, as engines/batch.py would, and its
+    state is read back from the container `reveal` more steps at a time (all at once by default).
+    `fail_on` fails the `az` command, or stops the batch at the step, whose text holds it."""
 
-    def __init__(self, results, fail_on=None, node=None, console_after=0):
+    answers = True
+
+    def __init__(self, results, fail_on=None, node=None, console_after=0, reveal=None, data_ok=True,
+                 wheel="built"):
         super().__init__(io.StringIO())
         self.results, self.fail_on, self.azs, self.node = results, fail_on, [], node or FakeNode()
-        self.console_after = console_after
+        self.console_after, self.reveal, self.data_ok, self.wheel = console_after, reveal, data_ok, wheel
+        self.files, self.uploaded, self.states, self.shown, self.started = {}, {}, {}, {}, []
+
+    def write(self, path, text):
+        self.files[path] = text
+
+    def read_state(self, path, steps):
+        return self.files.pop(path, None)
+
+    def machine(self, name, steps):
+        """The state batch.py would leave after `steps`: each one's end, or stopped at `fail_on`."""
+        ended = []
+        for st in steps:
+            argv = " ".join(st["argv"]) + " "
+            if self.fail_on and self.fail_on in argv:
+                return {"name": name, "state": "failed", "steps": ended, "error": f"failed: {self.fail_on}"}
+            ended.append({"id": st["id"], "exit": 0, "stdout": self.step_out(st, argv)})
+        return {"name": name, "state": "done", "steps": ended}
+
+    def step_out(self, st, text):
+        if st["id"] == "data":
+            spec = json.loads(st["argv"][3])
+            files = {f: {"sha256": h if self.data_ok else "0" * 64, "ok": self.data_ok} for f, h in spec["sha256"].items()}
+            rec = {"ok": self.data_ok, "files": files, "fetch_s": 9.0, "normalize_s": 20.0, "upload_s": 5.0}
+            if not self.data_ok:
+                rec["error"] = f"12 of 12 files differ from the plan's SHA-256: {', '.join(files)}"
+            return "normalized rows 41169720\nDATA " + json.dumps(rec)
+        if st["id"] == "setup":
+            return "SETUP " + json.dumps({"installed": {"duckdb": True}, "wheel_066": self.wheel, "wheel_066_s": 1800,
+                                          "wheel_066_name": "moruna-0.6.6-cp314-cp314t-linux_x86_64.whl"})
+        if "measure.py run" in text:
+            assert st["env"]["BENCH_ACCOUNT"] == "mrnb202611180900" and st["secrets"] == ["BENCH_KEY"]
+            rid = text.split("--id ")[1].split()[0]
+            spec = next(r for r in plans.runs(nyc_plan(), run.DATA) if r["id"] == rid)
+            fast = {"moruna066": 9.0, "moruna066-rust": 6.0, "rust-pool": 4.5}.get(spec["engine"], 12.0)
+            copy = {"data": "local copy", "copy_in_s": 2.0, "copy_out_s": 1.0} if spec["engine"] == "rust-pool" else \
+                {"data": "blob"}
+            rec = {"spec": spec, "ok": True, "startup_s": 0.5, "operational_s": fast, "cpu_s": 30.0,
+                   "peak_bytes": 2 << 30, "memory_gib": spec["mem_gib"], **copy,
+                   "output_check": {"ok": True, "hash_all": True, "verdict": "bit for bit"}}
+            os.makedirs(os.path.join(self.results, "results"), exist_ok=True)
+            json.dump(rec, open(os.path.join(self.results, "results", f"{rid}.json"), "w"))
+            return "MEASURED " + json.dumps({"id": rid, "ok": True, "output": "bit for bit"})
+        if "measure.py check" in text:
+            return 'MEASURED {"ok": true, "output": "bit for bit"}'
+        return ""
 
     def az(self, cmd, out=None, secrets=None):
         azure.guard(azure.Cloud("202611180900"), cmd)
@@ -366,23 +567,26 @@ class Fake(run.DryRun):
             return "203.0.113.9"
         if "group exists" in text:
             return "false"
-        if "setup-linux.sh" in text:
-            return 'SETUP {"installed": {"duckdb": true}, "wheel_066": "built", "wheel_066_s": 1800}'
-        if "measure.py run" in text:
-            assert "BENCH_KEY=KEY" in text and "BENCH_ACCOUNT=mrnb202611180900" in text
-            rid = text.split("--id ")[1].split()[0]
-            spec = next(r for r in plans.runs(nyc_plan(), run.DATA) if r["id"] == rid)
-            fast = {"moruna066": 9.0, "moruna066-rust": 6.0, "rust-pool": 4.5}.get(spec["engine"], 12.0)
-            copy = {"data": "local copy", "copy_in_s": 2.0, "copy_out_s": 1.0} if spec["engine"] == "rust-pool" else \
-                {"data": "blob"}
-            rec = {"spec": spec, "ok": True, "startup_s": 0.5, "operational_s": fast, "cpu_s": 30.0,
-                   "peak_bytes": 2 << 30, "memory_gib": spec["mem_gib"], **copy,
-                   "output_check": {"ok": True, "hash_all": True, "verdict": "bit for bit"}}
-            os.makedirs(os.path.join(self.results, "results"), exist_ok=True)
-            json.dump(rec, open(os.path.join(self.results, "results", f"{rid}.json"), "w"))
-            return "MEASURED " + json.dumps({"id": rid, "ok": True, "output": "bit for bit"})
-        if "measure.py check" in text:
-            return 'MEASURED {"ok": true, "output": "bit for bit"}'
+        if "blob upload -c code -n batch-" in text:
+            self.uploaded[text.split("-n batch-")[1].split(".json")[0]] = json.loads(self.files[cmd[cmd.index("-f") + 1]])
+            return ""
+        if "run-command invoke" in text and "batch.py --name" in text:
+            name = text.split("batch.py --name ")[1].split()[0]
+            assert "BENCH_KEY=KEY" in text and "SAS_RESULTS=sv=1&sig=x" in text and "SAS_CODE=sv=1&sig=x" in text
+            if name in self.states:
+                return f"Enable succeeded:\n[stdout]\nALREADY {name}\n"
+            self.started.append(name)
+            self.states[name] = self.machine(name, self.uploaded[name])
+            return f"Enable succeeded:\n[stdout]\nSTARTED {name}\n\n[stderr]\n"
+        if "blob download -c results -n batch/" in text:
+            name = text.split("-n batch/")[1].split(".json")[0]
+            if name not in self.states:
+                raise RuntimeError("ErrorCode:BlobNotFound")
+            state = self.states[name]
+            shown = self.shown[name] = self.shown.get(name, 0) + (self.reveal or len(state["steps"]) or 1)
+            self.files[cmd[cmd.index("-f") + 1]] = dict(state, steps=state["steps"][:shown],
+                                                        state=state["state"] if shown >= len(state["steps"]) else "running")
+            return ""
         return f"<{out}>" if out else ""
 
     def local(self, cmd, out=None):
@@ -406,7 +610,7 @@ class Fake(run.DryRun):
         return self.node(method, path, body, token)
 
     def poll(self, what, every_s, at_most_s, fn):
-        for _ in range(5):
+        for _ in range(500):
             got = fn()
             if got is not None:
                 return got
@@ -470,28 +674,51 @@ def test_a_whole_run_against_fakes(tmp_path):
     assert "**PASS** no regression" in log and "**PASS** the bar: 1.50x" in log
     assert "#### Miss" not in log
     assert json.load(open(tmp_path / "setup.json"))["wheel_066"] == "built"
+    # Three batches on the Linux machine, each started once; the node's outputs checked in the last,
+    # after every Linux run, and its records then carry the verdict.
+    assert x.started == ["setup", "runs", "checks"]
+    assert [s["id"] for s in x.uploaded["checks"]] == [r["id"] for r in plans.runs(p) if r["where"] == "node"]
+    assert json.load(open(tmp_path / "data.json"))["ok"] and json.load(open(tmp_path / "batch" / "runs.json"))["state"] == "done"
+    # 0.6.6's wheel, built on the machine, kept beside the results for the next run's --wheel066.
+    assert any(f"blob download -c code -n moruna-0.6.6-cp314-cp314t-linux_x86_64.whl -f {tmp_path}/moruna-0.6.6-" in a
+               for a in x.azs)
+    assert "--wheel066" in x.out.getvalue()
+    assert "uploaded from this machine" not in log and "made in Azure from https://" in log
+
+
+def test_a_wheel_from_pypi_or_given_is_not_kept_again(tmp_path):
+    _, tasks = fake_inputs(tmp_path)
+    args = Args()
+    args.tasks = tasks
+    x = Fake(str(tmp_path), wheel="pypi")
+    run.Bench(nyc_plan(), x, azure.Cloud("202611180900"), args, str(tmp_path), "/s").go()
+    assert not any("blob download -c code" in a for a in x.azs)
 
 
 def test_each_run_lands_as_it_finishes_and_the_table_reads_them_so_far(tmp_path):
-    """While the plan runs: Moruna's records and the Linux machine's live ones are on this machine
-    run by run, and `--table` makes the table of those so far; the full records replace them."""
+    """While the plan runs: the Linux machine's live records are on this machine run by run, as
+    its batch's state says each ended, and `--table` makes the table of those so far; the full
+    records replace them. A batch that stops stops the run, and the other side does not start."""
     _, tasks = fake_inputs(tmp_path)
     args = Args()
     args.tasks = tasks
     results = tmp_path / "results"
-    x = Fake(str(results), fail_on="--id occupancy-moruna066-r0 ")
-    with pytest.raises(RuntimeError):
+    x = Fake(str(results), fail_on="--id occupancy-moruna066-r0 ", reveal=7)
+    with pytest.raises(RuntimeError, match="the batch runs stopped on the Linux machine: failed: --id occupancy"):
         run.Bench(nyc_plan(), x, azure.Cloud("202611180900"), args, str(results), "/s").go()
     live = sorted(os.listdir(results / "live"))
     assert "score-duckdb-r1.json" in live and "score-noise-p2b.json" in live and len(live) == 9 * 6 - 6 + 4
+    # Read 7 runs at a time: the state was read again while the batch was still running.
+    assert sum("-n batch/runs.json" in a for a in x.azs) == -(-(9 * 6 - 6 + 4) // 7)
     rec = json.load(open(results / "live" / "score-duckdb-r1.json"))
     assert rec["live"] and rec["spec"]["id"] == "score-duckdb-r1" and rec["ok"] and rec["memory_gib"] == 14
     # The full records (here written by the fake machine) replace the live ones: one record a run.
-    assert len([r for r in collect.load(str(results)) if r["spec"]["job"] == "score"]) == 9 * 6 + 4
+    assert len([r for r in collect.load(str(results)) if r["spec"]["job"] == "score"]) == 9 * 6 - 6 + 4
+    assert not (results / "node").exists() and x.started == ["setup", "runs"]
     out = io.StringIO()
     assert run.main(["--plan", "nyc-2024", "--table", str(results)], out=out) == 0
     text = out.getvalue()
-    assert text.startswith(f"# {9 * 6 + 4} of 250 runs recorded in {results}")
+    assert text.startswith(f"# {9 * 6 - 6 + 4} of 250 runs recorded in {results}")
     assert "| DuckDB | python | 12.0 |" in text and "### occupancy" in text
     assert (results / "summary.json").exists() and (results / "table.md").exists()
     with pytest.raises(SystemExit):
@@ -508,6 +735,9 @@ def test_a_live_record_from_the_summary_line(tmp_path):
     assert rec["output_check"] == got["check"] and rec["memory_gib"] == 14
     lost = run.live_record(spec, None)
     assert not lost["ok"] and lost["error"] == "no summary line in the run's output"
+    # What the batch saw of a run that printed none: its stderr's tail, or that it was killed.
+    told = run.live_record(spec, None, "killed at the batch's bound, 2700 s")
+    assert told["error"] == "no summary line in the run's output: killed at the batch's bound, 2700 s"
     # An older summary line, with the verdict alone.
     assert run.live_record(spec, {"ok": True, "output": "DIFFERS"})["output_check"] == {"verdict": "DIFFERS"}
     # measure.py's summary line carries what the live record needs.
@@ -537,6 +767,133 @@ def test_a_job_the_node_refuses_or_loses_is_a_failed_run(tmp_path):
     assert (r1["ok"], r1["state"]) == (False, "not followed") and "404" in r1["error"]
     assert x.summary["jobs"]["score"]["engines"]["moruna-node"]["runs"] == 5
     assert x.summary["jobs"]["score"]["engines"]["moruna-node"]["ok"] == 4
+    # Only the outputs of the jobs that completed are checked.
+    assert len(x.uploaded["checks"]) == 24 - 2 and "output_check" not in r0
+
+
+def test_the_data_made_in_azure_stops_the_run_when_it_differs(tmp_path):
+    """Files that do not normalise to the plan's SHA-256s are never uploaded (dataprep.py), and the
+    run stops before any measured run, saying how to fall back; the node never starts a job."""
+    _, tasks = fake_inputs(tmp_path)
+    args = Args()
+    args.tasks = tasks
+    x = Fake(str(tmp_path), data_ok=False)
+    with pytest.raises(RuntimeError, match="files differ from the plan's SHA-256.*--data-from-mac"):
+        run.Bench(nyc_plan(), x, azure.Cloud("202611180900"), args, str(tmp_path), "/s").go()
+    assert x.started == ["setup"] and x.node.jobs == 0 and not (tmp_path / "live").exists()
+    assert not json.load(open(tmp_path / "data.json"))["ok"]
+    assert x.azs[-2].startswith("az group delete") and x.azs[-1].startswith("az group exists")
+
+
+@pytest.mark.parametrize("ended,message", [
+    ({"id": "data", "exit": 1, "stdout": "", "stderr": "E: Unable to locate package"}, "no DATA line, exit 1: E: Unable"),
+    ({"id": "runs-json", "exit": 22, "stdout": "", "stderr": "curl: (22) 403"}, "runs-json failed: exit 22"),
+])
+def test_a_failed_setup_step_stops_the_run(tmp_path, ended, message):
+    b = run.Bench(nyc_plan(), Fake(str(tmp_path)), cloud(), Args(), str(tmp_path), "/s")
+    with pytest.raises(RuntimeError, match=message):
+        b.setup_done({"id": ended["id"]}, ended)
+    assert not b.data_ready.is_set()
+    # The engines' setup is a result even when it fails: the runs then fail one by one, recorded.
+    b.setup_done({"id": "setup"}, {"id": "setup", "exit": 1, "stdout": "", "stderr": "boom"})
+    assert b.setup == {"linux_image": "<linux-image-version>"}
+
+
+def started_bench(tmp_path, x, name="runs"):
+    b = run.Bench(nyc_plan(), x, cloud(), Args(), str(tmp_path), str(tmp_path))
+    b.secrets.update({"storage-key": "KEY", "sas-code": "sv=1&sig=x", "sas-results": "sv=1&sig=x"})
+    return b
+
+
+def test_a_batch_that_does_not_start_or_goes_silent_stops_the_run(tmp_path, monkeypatch):
+    class NoStart(Fake):
+        def az(self, cmd, out=None, secrets=None):
+            if "batch.py --name" in " ".join(cmd):
+                self.azs.append(" ".join(cmd))
+                return "Enable succeeded:\n[stderr]\nsystemd-run: Failed to start transient service unit"
+            return super().az(cmd, out, secrets)
+    b = started_bench(tmp_path, NoStart(str(tmp_path)))
+    with pytest.raises(RuntimeError, match="(?s)did not start on the Linux machine: .*Failed to start"):
+        b.batch("runs", b.linux_steps()[:2], b.linux_done)
+
+    # A batch whose state stops changing: past the step's bound and STALL_S more, the machine is asked.
+    class Silent(Fake):
+        def machine(self, name, steps):
+            return {"name": name, "state": "running", "steps": []}
+    x = Silent(str(tmp_path))
+    b = started_bench(tmp_path, x)
+    clock = iter(range(0, 10 ** 9, 1000))
+    monkeypatch.setattr(run.time, "time", lambda: float(next(clock)))
+    with pytest.raises(RuntimeError, match="batch runs: no step ended within 3300 s of the last"):
+        b.batch("runs", b.linux_steps()[:2], b.linux_done)
+    assert "systemctl status moruna-bench-runs" in x.azs[-1]
+    # A state that is not there yet is looked for again, quietly; any other failure to read it is said.
+    assert b.batch_state("checks", []) is None and "was not read" not in x.out.getvalue()
+    x.fail_on = "-n batch/runs.json"
+    assert b.batch_state("runs", []) is None and "the state of batch runs was not read" in x.out.getvalue()
+
+
+def test_a_batch_already_started_is_not_started_again(tmp_path):
+    x = Fake(str(tmp_path))
+    b = started_bench(tmp_path, x)
+    steps = b.linux_steps()[:3]
+    b.batch("runs", steps, b.linux_done)
+    b.batch("runs", steps, b.linux_done)
+    assert x.started == ["runs"] and len(os.listdir(tmp_path / "live")) == 3
+    # A side told to stop stops at its next look.
+    b.stop.set()
+    assert b.batch("runs", steps, b.linux_done) == {"state": "stopped"}
+
+
+def test_the_sides_run_at_once_and_the_first_failure_stops_the_other(tmp_path):
+    x = run.Real(cloud(), str(tmp_path / "log"), io.StringIO())
+    stop, seen = run.threading.Event(), []
+
+    def node():
+        seen.append("node")
+        raise RuntimeError("the node stopped: moruna: fatal")
+
+    def linux():
+        for _ in range(500):
+            if stop.wait(0.01):
+                seen.append("linux saw stop")
+                return
+    with pytest.raises(RuntimeError, match="fatal"):
+        x.parallel([linux, node], stop)
+    assert stop.is_set() and set(seen) == {"node", "linux saw stop"}
+    # A side that does not stop is left after WIND_DOWN_S: the run tears down regardless.
+    x.WIND_DOWN_S, x.WAIT_SLICE_S = 0.2, 0.01
+    stop.clear()
+    hang = run.threading.Event()
+    with pytest.raises(RuntimeError, match="fatal"):
+        x.parallel([lambda: hang.wait(30), node], stop)
+    hang.set()
+    stop.clear()
+    x.parallel([lambda: seen.append("a"), lambda: seen.append("b")], stop)
+    assert seen[-2:] in (["a", "b"], ["b", "a"]) and not stop.is_set()
+    # The node waits for the data, and gives up when the other side stops.
+    ready = run.threading.Event()
+    run.threading.Timer(0.05, ready.set).start()
+    assert x.wait_for(ready, stop, "the data is in the container")
+    stop.set()
+    assert not x.wait_for(run.threading.Event(), stop, "never")
+    # A state file is read once, then removed; a missing or broken one is no state.
+    (tmp_path / "s.json").write_text('{"state": "done"}')
+    assert x.read_state(str(tmp_path / "s.json"), []) == {"state": "done"} and not (tmp_path / "s.json").exists()
+    (tmp_path / "s.json").write_text("{")
+    assert x.read_state(str(tmp_path / "s.json"), []) is None and x.read_state(str(tmp_path / "none"), []) is None
+
+
+def test_the_dry_run_runs_the_sides_one_after_the_other(tmp_path):
+    x, stop, seen = run.DryRun(io.StringIO()), run.threading.Event(), []
+
+    def fails():
+        raise RuntimeError("no")
+    with pytest.raises(RuntimeError):
+        x.parallel([lambda: seen.append(1), fails, lambda: seen.append(3)], stop)
+    assert seen == [1] and stop.is_set()
+    x.parallel([lambda: seen.append(4)], stop)
+    assert seen == [1]
 
 
 def test_a_job_that_fails_or_times_out(tmp_path, monkeypatch):
@@ -573,11 +930,17 @@ def test_a_job_that_fails_or_times_out(tmp_path, monkeypatch):
 
 
 def test_the_group_is_deleted_when_a_step_fails(tmp_path):
-    x = Fake(str(tmp_path), fail_on="vm create -n moruna-node")
+    x = Fake(str(tmp_path), fail_on="vm create -n bench-linux")
     with pytest.raises(RuntimeError, match="failed"):
         run.Bench(nyc_plan(), x, azure.Cloud("202611180900"), Args(), str(tmp_path), "/s").go()
     assert x.azs[-2].startswith("az group delete") and x.azs[-1].startswith("az group exists")
     assert not any("run-command" in a for a in x.azs)
+    # The node's side failing: the Linux machine's results are still collected, its checks never start.
+    x = Fake(str(tmp_path / "n"), fail_on="vm create -n moruna-node")
+    with pytest.raises(RuntimeError, match="failed"):
+        run.Bench(nyc_plan(), x, azure.Cloud("202611180900"), Args(), str(tmp_path / "n"), "/s").go()
+    assert x.started == ["setup", "runs"] and any("results/linux.tgz" in a for a in x.azs) and x.logged is False
+    assert x.azs[-2].startswith("az group delete")
 
 
 def test_what_the_linux_machine_holds_is_collected_when_a_later_step_fails(tmp_path):
@@ -1331,3 +1694,199 @@ def test_local_runs_the_linux_runs_here(tmp_path, monkeypatch):
     p["linux_data"] = "blob"
     with pytest.raises(SystemExit, match="store-endpoint"):
         run.local(p, A, out)
+
+
+# --- The Linux machine's batch and the data made in Azure (item 6.2b) --------------------------
+
+import batch  # noqa: E402
+import dataprep  # noqa: E402
+
+
+class Puts:
+    """A local stand-in for the container: each PUT kept, as Blob would take it."""
+
+    def __init__(self):
+        import http.server
+        import threading
+        puts = self.puts = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                puts.append((self.path, self.headers.get("x-ms-blob-type"), json.loads(body)))
+                self.send_response(201)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+    def close(self):
+        self.server.shutdown()
+
+
+def test_a_batch_runs_its_steps_one_at_a_time_and_puts_its_state_after_each(tmp_path):
+    """Each step a fresh process, in order, with the machine's PATH, its own env and only the
+    secrets it names; one that fails, overruns its bound (killed, with what measure.py left in
+    its cgroups) or cannot start is a result, and the batch goes on."""
+    py = sys.executable
+    show = ("import json, os; print('noise'); print('MEASURED ' + json.dumps({k: os.environ.get(k) for k in "
+            "('PATH', 'HOME', 'BENCH_KEY', 'SAS_CODE', 'X')}))")
+    steps = [{"id": "a", "argv": [py, "-c", show], "env": {"X": "1"}, "secrets": ["BENCH_KEY"], "timeout_s": 60},
+             {"id": "b", "argv": [py, "-c", "import sys; sys.stderr.write('boom'); sys.exit(3)"], "timeout_s": 60},
+             {"id": "c", "argv": [py, "-c", "import time; time.sleep(30)"], "timeout_s": 0.5},
+             {"id": "d", "argv": [str(tmp_path / "none")]},
+             {"id": "e", "argv": [py, "-c", "print('MEASURED {}')"]}]
+    cg = tmp_path / "cg" / "score-duckdb-r1"
+    cg.mkdir(parents=True)
+    (cg / "cgroup.kill").write_text("0")
+    puts = Puts()
+    try:
+        state = batch.run_batch("runs", steps, {"PATH": os.environ["PATH"], "HOME": "", "SAS_CODE": "s"},
+                                {"BENCH_KEY": "K", "SAS_CODE": "s"}, str(tmp_path / "logs"),
+                                batch.Publisher("runs", str(tmp_path), puts.base, "sv=1&sig=r"),
+                                leftovers=str(tmp_path / "cg"))
+    finally:
+        puts.close()
+    ended = state["steps"]
+    assert state["state"] == "done" and [s["id"] for s in ended] == ["a", "b", "c", "d", "e"]
+    assert all(x["ended"] <= y["started"] for x, y in zip(ended, ended[1:]))
+    got = run.measured(ended[0]["stdout"])
+    assert got == {"PATH": os.environ["PATH"], "HOME": None, "BENCH_KEY": "K", "SAS_CODE": None, "X": "1"}
+    assert (ended[1]["exit"], ended[1]["stderr"]) == (3, "boom")
+    assert ended[2]["timed_out"] and ended[2]["exit"] is None and (cg / "cgroup.kill").read_text() == "1"
+    assert ended[3]["error"].startswith("not started") and ended[4]["exit"] == 0
+    assert (tmp_path / "logs" / "a.out").read_text().startswith("noise\nMEASURED ")
+    # The state, put after each step at results/batch/runs.json with the SAS, and kept here.
+    assert len(puts.puts) == 1 + len(steps) + 1
+    path, kind, last = puts.puts[-1]
+    assert path == "/results/batch/runs.json?sv=1&sig=r" and kind == "BlockBlob" and last["state"] == "done"
+    assert [len(p[2]["steps"]) for p in puts.puts] == [0, 1, 2, 3, 4, 5, 5]
+    assert json.load(open(tmp_path / "runs.state.json"))["state"] == "done"
+
+
+def test_a_batch_that_stops_says_so_and_a_lost_put_is_not_fatal(tmp_path, capsys):
+    states = []
+    with pytest.raises(TypeError):
+        batch.run_batch("runs", [{"id": "a", "argv": None}], {}, {}, str(tmp_path), lambda s: states.append(dict(s)))
+    assert states[-1]["state"] == "failed" and "TypeError" in states[-1]["error"]
+    batch.Publisher("runs", str(tmp_path), "http://127.0.0.1:9", "sv=1", tries=1)({"state": "running"})
+    assert "the state was not put (1)" in capsys.readouterr().err
+    assert json.load(open(tmp_path / "runs.state.json")) == {"state": "running"}
+    assert batch.load_env(str(tmp_path / "none")) == {} and batch.tail(str(tmp_path / "none"), 10) == ""
+
+
+def test_batch_main_reads_its_steps_and_its_env_file(tmp_path):
+    (tmp_path / "steps.json").write_text(json.dumps([{"id": "a", "argv": [sys.executable, "-c", "print('hi')"]}]))
+    (tmp_path / "env").write_text(f"PATH={os.environ['PATH']}\nHOME=\nBENCH_KEY=a=b==\nnot a line\n")
+    assert batch.load_env(str(tmp_path / "env"))["BENCH_KEY"] == "a=b=="
+    assert batch.main(["--name", "setup", "--steps", str(tmp_path / "steps.json"), "--env", str(tmp_path / "env"),
+                       "--dir", str(tmp_path), "--logs", str(tmp_path / "logs")]) == 0
+    state = json.load(open(tmp_path / "setup.state.json"))
+    assert state["steps"][0]["stdout"] == "hi\n" and state["of"] == 1
+
+
+def test_the_linux_scripts_parse():
+    for script in ("setup-linux.sh", "data-linux.sh"):
+        p = subprocess.run(["bash", "-n", os.path.join(HERE, "engines", script)], capture_output=True, text=True)
+        assert p.returncode == 0, p.stderr
+
+
+NORMALIZE = os.path.join(HERE, "..", "vm", "normalize.py")
+
+
+def raw_months(tmp_path, n=2):
+    """TLC-shaped months (their own column names and types): normalize.py's input."""
+    src = tmp_path / "src"
+    src.mkdir()
+    for m in range(1, n + 1):
+        t = pa.table({"VendorID": pa.array([1, 2, 2], pa.int32()),
+                      "tpep_pickup_datetime": pa.array([m * 10 ** 9, m * 10 ** 9 + 60, m * 10 ** 9 + 99],
+                                                       pa.timestamp("us")),
+                      "tpep_dropoff_datetime": pa.array([m * 10 ** 9 + 600] * 3, pa.timestamp("us")),
+                      "PULocationID": pa.array([132, 161, 237], pa.int32()), "fare_amount": [10.5, 7.0, 52.0]})
+        pq.write_table(t, src / f"yellow_tripdata_2024-0{m}.parquet")
+    return src
+
+
+def normalised_digests(tmp_path, src):
+    out = tmp_path / "expected"
+    subprocess.run([sys.executable, NORMALIZE, str(src), str(out)], check=True, capture_output=True)
+    return {f: run.sha256_of(str(out / f)) for f in sorted(os.listdir(out))}
+
+
+def test_the_data_is_fetched_normalised_checked_then_uploaded(tmp_path):
+    src = raw_months(tmp_path)
+    digests = normalised_digests(tmp_path, src)
+    spec = {"source_url": f"file://{src}/{{file}}", "sha256": digests, "prefix": "nyc/", "normalize": NORMALIZE}
+    uploaded = []
+    rec = dataprep.prepare(spec, str(tmp_path / "work"), upload=lambda p, n: uploaded.append((n, run.sha256_of(p))))
+    assert rec["ok"] and sorted(uploaded) == sorted((f"nyc/{f}", h) for f, h in digests.items())
+    assert all(rec["files"][f]["ok"] and rec["files"][f]["raw_bytes"] > 0 for f in digests)
+    assert not (tmp_path / "work" / "raw").exists() and not (tmp_path / "work" / "norm").exists()
+    # One file that does not normalise to the plan's digest: nothing is uploaded.
+    wrong = dict(digests, **{"yellow_tripdata_2024-02.parquet": "0" * 64})
+    uploaded.clear()
+    rec = dataprep.prepare(dict(spec, sha256=wrong), str(tmp_path / "work"), upload=lambda p, n: uploaded.append(n))
+    assert not rec["ok"] and uploaded == [] and "1 of 2 files differ" in rec["error"]
+    assert "yellow_tripdata_2024-02.parquet" in rec["error"] and rec["files"]["yellow_tripdata_2024-01.parquet"]["ok"]
+
+
+def test_data_that_cannot_be_fetched_or_normalised_is_not_uploaded(tmp_path):
+    import functools
+    src = raw_months(tmp_path)
+    digests = normalised_digests(tmp_path, src)
+    os.remove(src / "yellow_tripdata_2024-02.parquet")
+    spec = {"source_url": f"file://{src}/{{file}}", "sha256": digests, "normalize": NORMALIZE}
+    fetcher = functools.partial(dataprep.fetch, tries=2, wait_s=0)
+    rec = dataprep.prepare(spec, str(tmp_path / "w"), upload=pytest.fail, fetcher=fetcher)
+    assert not rec["ok"] and rec["error"] == "1 of 2 files not fetched"
+    assert "not fetched from file://" in rec["files"]["yellow_tripdata_2024-02.parquet"]["error"]
+    bad = tmp_path / "bad.py"
+    bad.write_text("import sys; sys.exit(4)")
+    spec = dict(spec, sha256={"yellow_tripdata_2024-01.parquet": digests["yellow_tripdata_2024-01.parquet"]},
+                normalize=str(bad))
+    rec = dataprep.prepare(spec, str(tmp_path / "w"), upload=pytest.fail)
+    assert not rec["ok"] and rec["error"].startswith("normalize.py exited 4")
+
+
+def test_dataprep_main_prints_its_record(tmp_path, capsys, monkeypatch):
+    src = raw_months(tmp_path, n=1)
+    digests = normalised_digests(tmp_path, src)
+    spec = {"source_url": f"file://{src}/{{file}}", "sha256": digests, "prefix": "nyc/", "normalize": NORMALIZE}
+    got = []
+    assert dataprep.main(["--spec", json.dumps(spec), "--work", str(tmp_path / "w")],
+                         upload=lambda p, n: got.append(n)) == 0
+    line = run.tagged(capsys.readouterr().out, "DATA ")
+    assert line["ok"] and got == ["nyc/yellow_tripdata_2024-01.parquet"]
+    (tmp_path / "spec.json").write_text(json.dumps(dict(spec, sha256={k: "0" * 64 for k in digests})))
+    assert dataprep.main(["--spec", str(tmp_path / "spec.json"), "--work", str(tmp_path / "w")], upload=got.append) == 1
+    for k in ("BENCH_ACCOUNT", "BENCH_KEY", "BENCH_CONTAINER"):
+        monkeypatch.delenv(k, raising=False)
+    with pytest.raises(SystemExit, match="no container"):
+        dataprep.main(["--spec", json.dumps(spec), "--work", str(tmp_path / "w")])
+    # With a container in the environment, its store's upload is the one used.
+    import store as stores
+    monkeypatch.setattr(stores.Store, "upload", lambda self, local, name: got.append((self.container, name)))
+    monkeypatch.setenv("BENCH_ACCOUNT", "acct")
+    monkeypatch.setenv("BENCH_KEY", "KEY")
+    monkeypatch.setenv("BENCH_CONTAINER", "data")
+    assert dataprep.main(["--spec", json.dumps(spec), "--work", str(tmp_path / "w")]) == 0
+    assert got[-1] == ("data", "nyc/yellow_tripdata_2024-01.parquet")
+
+
+JANUARY = os.path.expanduser("~/moruna-data/nyc/yellow_tripdata_2024-01.parquet")
+
+
+@pytest.mark.skipif(not os.path.exists(JANUARY) or pa.__version__ != nyc_plan()["dataset"]["pyarrow"],
+                    reason="needs TLC's January 2024 on this machine and the plan's pyarrow")
+def test_tlcs_january_normalises_to_the_plans_digest(tmp_path):
+    """TLC's own January 2024 (the CloudFront file, kept on this machine), through dataprep.py and
+    normalize.py with the plan's pyarrow, is the plan's copy bit for bit."""
+    jan = "yellow_tripdata_2024-01.parquet"
+    spec = {"source_url": f"file://{os.path.dirname(JANUARY)}/{{file}}",
+            "sha256": {jan: nyc_plan()["dataset"]["sha256"][jan]}, "normalize": NORMALIZE}
+    rec = dataprep.prepare(spec, str(tmp_path), upload=lambda p, n: None)
+    assert rec["ok"], rec
