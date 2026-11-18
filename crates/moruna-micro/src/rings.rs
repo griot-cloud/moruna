@@ -90,7 +90,7 @@ pub unsafe fn payload_over<M: Send + Sync + std::panic::RefUnwindSafe + 'static>
     // SAFETY: the caller's contract: the bytes are mapped and unwritten for as long as `hold`
     // lives, which every buffer over them keeps.
     let buffer = unsafe { ArrowBuffer::from_custom_allocation(at, len as usize, hold) };
-    let batch = crate::in_place::decode(buffer)?;
+    let batch = moruna_kernel::ipc::decode(buffer, crate::layout::PAGE as usize)?;
     // SAFETY: the record's pages are host memory, mapped into this process.
     Ok(unsafe { Payload::table_in(batch, tier) })
 }

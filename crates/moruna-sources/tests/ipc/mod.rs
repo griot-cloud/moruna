@@ -1011,3 +1011,40 @@ fn so_t41_ipc_compressed_malformed_never_panics() {
         );
     }
 }
+
+// 6.3k: a block read in place counts its bytes once (contracts CT-I3). The reactor lands the
+// block in one arena buffer and the decoder leaves every array over it (SO-I5), so the batch's
+// five buffers (the ids, the names' validity, offsets and bytes, the xs) are slices of that
+// one allocation. Counted once for each buffer, a morsel read from an Arrow IPC file said five
+// times what it holds.
+#[test]
+fn so_an_ipc_block_read_in_place_counts_its_bytes_once() {
+    let dir = scratch();
+    let ledger = write_ipc(&dir, "bytes-once.arrow", 0, &[5000]);
+    let reactor = seed(FakeReactor::new(), &ledger.path);
+    let source = source_over(&[&ledger.path], reactor, None, None).expect("the plan");
+    let alloc = CountingAllocator::new(FakeAllocator::new());
+    let splits = source.plan().expect("the plan");
+    let baseline = alloc.fake().in_use(Tier::Host);
+    let payload = block_on(source.read(&splits[0], None, &alloc, Tier::Host)).expect("a block");
+    assert_rows(&ledger, &payload, 0, 5000);
+    assert_eq!(source.stats().decode_bytes, 0, "the block is read in place");
+    let buffers: usize = batch_of_payload(&payload)
+        .columns()
+        .iter()
+        .map(|column| {
+            let data = column.to_data();
+            data.buffers().len() + usize::from(data.nulls().is_some())
+        })
+        .sum();
+    assert_eq!(buffers, 5);
+    // What the payload holds of the arena: the block, read into one buffer.
+    let held = alloc.fake().in_use(Tier::Host) - baseline;
+    let bytes = payload.bytes();
+    assert!(
+        held <= bytes && bytes < held + 4096,
+        "a block of {held} bytes in the arena, read in place as {buffers} buffers, counts \
+         {bytes} bytes, {:.2} times what it holds",
+        bytes as f64 / held as f64
+    );
+}

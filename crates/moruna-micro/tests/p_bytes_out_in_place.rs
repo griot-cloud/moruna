@@ -5,13 +5,17 @@
 //! (`moruna-scheduler`'s worker), and the same figure is the morsel's charge downstream, the
 //! stage's learned growth and the controller's amplification. An image task's answer reaches
 //! the engine in one of three ways (`moruna_micro::task`): kept in place over the record the
-//! task wrote (`in_place::decode`), copied into the run's arena (`land_table`), or as
-//! several records joined and landed.
+//! task wrote, decoded where it lies (`rings::payload_over`), copied into the run's arena
+//! (`land_table`), or as several records joined and landed.
 //!
 //! In 6.2 run 3 the three did not agree. An answer kept in place counted the whole record
 //! once for each of its buffers, so Enrich's reports said 14.8 to 18.7 bytes out per byte in,
 //! where its output is 1.17 times its input, and Score's said 0.22 in the runs whose answers
 //! were mostly joined and 0.73 in the runs whose answers were mostly kept.
+//!
+//! The count is the contracts' (`Payload::bytes`, CT-I3, 6.3k): the allocations a batch holds,
+//! each once. A record kept in place is one allocation, the record: it counts the record,
+//! its framing and its buffers' pages with it, which is what it holds of the task's window.
 
 use std::sync::Arc;
 
@@ -25,7 +29,6 @@ use moruna_kernel::arrow::compute::concat_batches;
 use moruna_kernel::arrow::datatypes::{DataType, Field, Float32Type, Int64Type, Schema};
 use moruna_kernel::arrow::record_batch::RecordBatch;
 use moruna_kernel::{Allocator, Payload, Tier, ipc};
-use moruna_micro::in_place;
 use moruna_micro::layout::{self, PAGE, Piece};
 use moruna_testkit::FakeAllocator;
 
@@ -121,10 +124,11 @@ fn record(batch: &RecordBatch, alloc: &dyn Allocator) -> ArrowBuffer {
     bytes.into()
 }
 
-/// The record kept in place, as `TaskState::output` hands it on (`rings::payload_over`).
+/// The record kept in place, as `TaskState::output` hands it on: decoded where it lies, one
+/// allocation under every buffer (`rings::payload_over`, which maps the task's window).
 fn kept(record: ArrowBuffer) -> Payload {
     Payload::Table(
-        in_place::decode(record).expect("the record decodes in place"),
+        ipc::decode(record, PAGE as usize).expect("the record decodes in place"),
         Tier::Host,
     )
 }
@@ -280,7 +284,7 @@ fn p_a_record_kept_in_place_is_not_copied_and_is_held_until_its_last_buffer_goes
         whole.as_ptr() as usize,
         whole.as_ptr() as usize + whole.len(),
     );
-    let in_place = in_place::decode(whole.clone()).expect("the record decodes in place");
+    let in_place = ipc::decode(whole.clone(), PAGE as usize).expect("the record decodes in place");
     assert_eq!(in_place, answer);
     let mut buffers = buffers(&in_place);
     // 3 int64, a double, a double with its validity, a string's offsets and bytes, a double.
@@ -306,7 +310,7 @@ fn p_a_record_kept_in_place_is_not_copied_and_is_held_until_its_last_buffer_goes
 }
 
 #[test]
-fn p_nested_columns_and_empty_records_kept_in_place_count_as_their_copies_do() {
+fn p_nested_columns_and_empty_records_kept_in_place_count_the_record_once() {
     let alloc: Arc<dyn Allocator> = Arc::new(FakeAllocator::new());
     for rows in [0, 1, 4097] {
         let answer = nested(rows);
@@ -315,15 +319,18 @@ fn p_nested_columns_and_empty_records_kept_in_place_count_as_their_copies_do() {
         let copied = landed(whole.clone(), &alloc);
         assert_eq!(table(&in_place), &answer, "{rows} rows, kept in place");
         assert_eq!(table(&copied), &answer, "{rows} rows, copied");
-        // A copy gives a buffer of no bytes one byte of the arena; nothing else differs.
-        let of_no_bytes = buffers(&answer).iter().filter(|b| b.is_empty()).count() as u64;
+        // What it holds of the task's window: the record, its framing and each buffer's pages,
+        // once, and Arrow's bookkeeping, under a page. Its copy holds the buffers' own bytes.
+        let record = whole.capacity() as u64;
         assert!(
-            in_place.bytes() <= copied.bytes() && copied.bytes() - in_place.bytes() <= of_no_bytes,
-            "{rows} rows: {} bytes kept in place, {} copied, in a record of {} bytes",
+            record <= in_place.bytes() && in_place.bytes() < record + PAGE,
+            "{rows} rows: {} bytes kept in place as {} buffers, in a record of {record} bytes; \
+             {} copied",
             in_place.bytes(),
-            copied.bytes(),
-            whole.len()
+            buffers(table(&in_place)).len(),
+            copied.bytes()
         );
+        assert!(copied.bytes() <= in_place.bytes(), "{rows} rows");
         let (start, end) = (
             whole.as_ptr() as usize,
             whole.as_ptr() as usize + whole.len(),
@@ -335,10 +342,4 @@ fn p_nested_columns_and_empty_records_kept_in_place_count_as_their_copies_do() {
         drop(in_place);
         assert_eq!(whole.strong_count(), 1, "{rows} rows: the record is let go");
     }
-}
-
-#[test]
-fn p_bytes_that_are_no_record_are_refused_in_place() {
-    let garbage = b"this is not an Arrow record, and it says so".to_vec();
-    assert!(in_place::decode(ArrowBuffer::from(garbage)).is_err());
 }

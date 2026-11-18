@@ -22,7 +22,6 @@
 //!   with `run_plane`, whose batches move through [`moruna_plane::KernelPlane`] as pages, whose
 //!   port calls go to the stage's ports (the embedder's, over the host protocol), and whose end,
 //!   refusals and cancellation are the stage's, as on Linux;
-//! - [`in_place`]: a record such a task put, read where it lies as the batch the stage hands on;
 //! - [`functions`]: the registered functions a job uses (item 3.6), each a read-only memory
 //!   object `node-admission` gave the engine, read in place: a native program the stage maps,
 //!   or a Moruna image archive the image filesystem attaches as its task's root.
@@ -38,7 +37,6 @@
 
 pub mod devices;
 pub mod functions;
-pub mod in_place;
 pub mod layout;
 
 // The data OS's engine-side modules (`architecture/data-os-streams.md`): each is written by

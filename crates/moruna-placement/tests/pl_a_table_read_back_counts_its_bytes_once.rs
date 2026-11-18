@@ -1,16 +1,17 @@
 //! 6.3k: a table read back from staging counts its bytes once.
 //!
-//! A morsel's bytes are its payload's (`Payload::bytes`, contracts CT-I3: Arrow's
-//! `get_array_memory_size` for a table), recomputed whenever the payload is replaced. A morsel
-//! evicted to disk comes back as one read into one arena buffer, the record's header page and
-//! its body, decoded in place (`staging::read::decode_record`): every array of the batch is a
-//! slice of that one buffer. Arrow counts a buffer as the whole allocation it is a slice of, so
-//! the batch that comes back counts the whole read once for each of its buffers, and `pop`
-//! gives a morsel whose `bytes` are that (`Entry::into_morsel`): what the stage that takes it
-//! reports as its bytes in, what it claims, and what its growth is learned against.
+//! A morsel's bytes are its payload's (`Payload::bytes`, contracts CT-I3), recomputed whenever
+//! the payload is replaced. A morsel evicted to disk comes back as one read into one arena
+//! buffer, the record's header page and its body, decoded in place
+//! (`staging::read::decode_record`): every array of the batch is a slice of that one buffer.
+//! Arrow counts a buffer as the whole allocation it is a slice of, so by Arrow's count the
+//! batch that comes back is the whole read once for each of its buffers, and `pop` gave a
+//! morsel whose `bytes` were that (`Entry::into_morsel`): what the stage that takes it reports
+//! as its bytes in, what it claims, and what its growth is learned against.
 //!
 //! The same defect as 6.3h's, found there for a function's answer kept in place on the Moruna
-//! kernel. Here it needs no kernel: any run with a disk tier that evicts a table.
+//! kernel. Here it needs no kernel: any run with a disk tier that evicts a table. The count
+//! is the contracts': the allocations a batch holds, each once.
 
 mod common;
 
@@ -120,11 +121,12 @@ fn pl_a_table_read_back_from_staging_counts_its_bytes_once() {
             bytes, payload_bytes,
             "morsel {seq}'s bytes are its payload's"
         );
-        // A table read back lies in one read, its buffers at page boundaries: the same bytes,
-        // less nothing and more by no more than Arrow's own bookkeeping.
+        // A table read back is one read, which it holds whole and counts once: its bytes as
+        // they were pushed, and at most a page more for each of its five buffers, for the
+        // record's framing and for the record's header.
         let ratio = *bytes as f64 / pushed as f64;
         assert!(
-            (ratio - 1.0).abs() < 0.01,
+            pushed <= *bytes && *bytes <= pushed + 7 * common::PAGE as u64,
             "morsel {seq} was pushed with {pushed} bytes and popped with {bytes}, {ratio:.2} \
              times: {read_back} of the tables were read back from disk, and all three as \
              (seq, bytes) are {:?}",
