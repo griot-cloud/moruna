@@ -49,6 +49,7 @@ mod sc_t48_a_morsel_fits_its_tiers;
 // Item 6.3c: a read in flight is counted once by the arena's admission.
 mod sc_t49_a_read_in_flight_is_counted_once;
 mod sc_t4_one_record_per_morsel_stage;
+mod sc_t50_a_waiting_read_is_never_dropped;
 // Item 6.3e: a function runs one instance per CPU of the job unless it declares fewer.
 mod sc_p_a_function_runs_per_cpu;
 // stream P: a native stage's instances fed in turn.
