@@ -103,10 +103,10 @@ JOB = [
     "> RUNDIR/job-events.txt; grep -a '^data: ' RUNDIR/job-events.txt | grep -a '\"type\":\"exit\"' | tail -1 "
     "| cut -c7- > RUNDIR/job-exit.json && cat RUNDIR/job-exit.json && grep -q '\"code\":0[,}]' RUNDIR/job-exit.json",
     f"curl -sS -k --max-time 60 -H \"{AUTH}\" \"https://$(cat RUNDIR/address)/v1/jobs/$(cat RUNDIR/job.id)/report\" "
-    "> RUNDIR/job-report.json && grep -o '\"sinks\":\\[{[^]]*' RUNDIR/job-report.json | grep -o '\"rows\":[0-9]*' "
-    "| head -1 | cut -d: -f2 > RUNDIR/job.rows && [ \"$(cat RUNDIR/job.rows)\" = 10000000 ]",
-    "grep -o '\"wall_s\":[0-9.eE+-]*' RUNDIR/job-report.json | head -1 | cut -d: -f2 > RUNDIR/job.wall "
-    "&& [ -s RUNDIR/job.wall ] && printf 'job: %s rows counted, wall_s %s\\n' \"$(cat RUNDIR/job.rows)\" "
+    "> RUNDIR/job-report.json && python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"sinks\"][0][\"rows\"])' "
+    "RUNDIR/job-report.json > RUNDIR/job.rows && [ \"$(cat RUNDIR/job.rows)\" = 10000000 ]",
+    "python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"wall_ms\"])' RUNDIR/job-report.json > RUNDIR/job.wall "
+    "&& [ -s RUNDIR/job.wall ] && printf 'job: %s rows counted, wall_ms %s\\n' \"$(cat RUNDIR/job.rows)\" "
     "\"$(cat RUNDIR/job.wall)\"",
 ]
 
@@ -166,7 +166,7 @@ case "$*" in
   */v1/health*) printf 200 ;;
   */v1/jobs/validate*) printf '{"ok":true}' ;;
   */events*) printf 'id: 1\nevent: event\ndata: {"type":"event","kind":"attempt_started"}\n\nevent: heartbeat\ndata: {"type":"heartbeat","rows_out":5000000}\n\nevent: report\ndata: {"type":"report","report":{"sinks":[{"sink":0,"rows":%s}]}}\n\nevent: exit\ndata: {"type":"exit","code":%s,"diagnostic":null}\n\n' "${STUB_ROWS:-10000000}" "${STUB_EXIT:-0}" ;;
-  */report*) printf '{"run_id":"0123456789abcdef0123456789abcdef","wall_s":2.5,"stages":[{"name":"count","rows":3}],"sinks":[{"sink":0,"rows":%s,"bytes":0,"files":[],"snapshot_id":null,"version":null}]}' "${STUB_ROWS:-10000000}" ;;
+  */report*) printf '{"run_id":"0123456789abcdef0123456789abcdef","wall_ms":2.5,"stages":[{"name":"count","rows":3}],"sinks":[{"sink":0,"rows":%s,"bytes":0,"files":[],"snapshot_id":null,"version":null}]}' "${STUB_ROWS:-10000000}" ;;
   */v1/jobs*) printf '{"id":"0123456789abcdef0123456789abcdef"}' > "$out"; printf 201 ;;
   */v1/node*) printf '{"version":"0.7.0","cloud":"azure"}' ;;
 esac
@@ -397,8 +397,8 @@ class AzureUp(unittest.TestCase):
         started = time.time()
         done = self.run_script(*self.arguments("--job"))
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("job: 10000000 rows counted, wall_s 2.5\n", done.stdout)
-        self.assertRegex(done.stdout, r"create-to-ready \d+ s, boot_ms 2140, job wall_s 2.5\n$")
+        self.assertIn("job: 10000000 rows counted, wall_ms 2.5\n", done.stdout)
+        self.assertRegex(done.stdout, r"create-to-ready \d+ s, boot_ms 2140, job wall_ms 2.5\n$")
         run = self.root / "RUNDIR"
         self.assertEqual(json.loads((run / "job.json").read_text()),
                          {"v1": {"moruna_spec": 1, "source": {"kind": "rows", "rows": 10000000},

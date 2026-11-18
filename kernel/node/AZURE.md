@@ -447,19 +447,20 @@ curl -sS -k -N --max-time 600 -H "Authorization: Bearer $(cat <RUN>/job-token)" 
   > <RUN>/job-exit.json && cat <RUN>/job-exit.json && grep -q '"code":0[,}]' <RUN>/job-exit.json
 ```
 
-The report: its one sink wrote 10,000,000 rows, and its `wall_s` is the job's wall time:
+The report: its one sink wrote 10,000,000 rows, and its `wall_ms` is the job's wall time, read
+from the report as JSON:
 
 ```
 curl -sS -k --max-time 60 -H "Authorization: Bearer $(cat <RUN>/job-token)" \
   "https://$(cat <RUN>/address)/v1/jobs/$(cat <RUN>/job.id)/report" > <RUN>/job-report.json \
-  && grep -o '"sinks":\[{[^]]*' <RUN>/job-report.json | grep -o '"rows":[0-9]*' | head -1 \
-  | cut -d: -f2 > <RUN>/job.rows && [ "$(cat <RUN>/job.rows)" = 10000000 ]
+  && python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["sinks"][0]["rows"])' \
+  <RUN>/job-report.json > <RUN>/job.rows && [ "$(cat <RUN>/job.rows)" = 10000000 ]
 ```
 
 ```
-grep -o '"wall_s":[0-9.eE+-]*' <RUN>/job-report.json | head -1 | cut -d: -f2 > <RUN>/job.wall \
-  && [ -s <RUN>/job.wall ] \
-  && printf 'job: %s rows counted, wall_s %s\n' "$(cat <RUN>/job.rows)" "$(cat <RUN>/job.wall)"
+python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["wall_ms"])' \
+  <RUN>/job-report.json > <RUN>/job.wall && [ -s <RUN>/job.wall ] \
+  && printf 'job: %s rows counted, wall_ms %s\n' "$(cat <RUN>/job.rows)" "$(cat <RUN>/job.wall)"
 ```
 
 ## 10. Delete everything

@@ -30,7 +30,7 @@
 # its console shows `moruna: ready` and `moruna: cloud azure`, 443 accepts and 22 does not, the
 # served certificate is the one the console printed, and GET /v1/node answers; with --job, the job
 # ends with exit 0 and counts its 10,000,000 rows. It prints create-to-ready and boot_ms, and with
-# --job the job's wall_s. Any failure exits 1, after the console log is read into RUN and the
+# --job the job's wall_ms. Any failure exits 1, after the console log is read into RUN and the
 # group deleted; a refusal exits 2.
 set -euo pipefail
 
@@ -185,7 +185,7 @@ finish() {
       "$(( $(cat "$run/ready.at") - $(cat "$run/created.at") ))" \
       "$(tr -d '\r' < "$run/console.log" | grep -a -o 'moruna: ready .*boot_ms=[0-9]*' | head -1 | sed 's/.*boot_ms=//')"
     if [ -s "$run/job.wall" ]; then
-      printf ', job wall_s %s' "$(cat "$run/job.wall")"
+      printf ', job wall_ms %s' "$(cat "$run/job.wall")"
     fi
     printf '\n'
   fi
@@ -266,6 +266,6 @@ if [ "$job" -eq 1 ]; then
   step "curl -sS -k --max-time 60 $AUTH $JSON \"https://\$(cat $R/address)/v1/jobs/validate\" > $R/job-validate.json && cat $R/job-validate.json && grep -q '\"ok\":true' $R/job-validate.json"
   step "curl -sS -k --max-time 60 -o $R/job-submit.json -w '%{http_code}' $AUTH $JSON \"https://\$(cat $R/address)/v1/jobs\" > $R/job-submit.code && [ \"\$(cat $R/job-submit.code)\" = 201 ] && grep -o '\"id\":\"[^\"]*\"' $R/job-submit.json | head -1 | cut -d'\"' -f4 > $R/job.id && [ -s $R/job.id ]"
   step "curl -sS -k -N --max-time 600 $AUTH \"https://\$(cat $R/address)/v1/jobs/\$(cat $R/job.id)/events\" > $R/job-events.txt; grep -a '^data: ' $R/job-events.txt | grep -a '\"type\":\"exit\"' | tail -1 | cut -c7- > $R/job-exit.json && cat $R/job-exit.json && grep -q '\"code\":0[,}]' $R/job-exit.json"
-  step "curl -sS -k --max-time 60 $AUTH \"https://\$(cat $R/address)/v1/jobs/\$(cat $R/job.id)/report\" > $R/job-report.json && grep -o '\"sinks\":\\[{[^]]*' $R/job-report.json | grep -o '\"rows\":[0-9]*' | head -1 | cut -d: -f2 > $R/job.rows && [ \"\$(cat $R/job.rows)\" = 10000000 ]"
-  step "grep -o '\"wall_s\":[0-9.eE+-]*' $R/job-report.json | head -1 | cut -d: -f2 > $R/job.wall && [ -s $R/job.wall ] && printf 'job: %s rows counted, wall_s %s\\n' \"\$(cat $R/job.rows)\" \"\$(cat $R/job.wall)\""
+  step "curl -sS -k --max-time 60 $AUTH \"https://\$(cat $R/address)/v1/jobs/\$(cat $R/job.id)/report\" > $R/job-report.json && python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"sinks\"][0][\"rows\"])' $R/job-report.json > $R/job.rows && [ \"\$(cat $R/job.rows)\" = 10000000 ]"
+  step "python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"wall_ms\"])' $R/job-report.json > $R/job.wall && [ -s $R/job.wall ] && printf 'job: %s rows counted, wall_ms %s\\n' \"\$(cat $R/job.rows)\" \"\$(cat $R/job.wall)\""
 fi
