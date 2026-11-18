@@ -366,6 +366,7 @@ pub fn object_store_of(doc: &moruna_job::ObjectStoreDoc) -> moruna_reactor::Obje
             endpoint: s.endpoint.clone(),
             region: s.region.clone(),
             bucket: s.bucket.clone(),
+            virtual_hosted_style_request: s.virtual_hosted_style_request,
             ..moruna_reactor::S3Config::default()
         }),
         gcs: doc.gcs.as_ref().map(|g| moruna_reactor::GcsConfig {
@@ -379,6 +380,7 @@ pub fn object_store_of(doc: &moruna_job::ObjectStoreDoc) -> moruna_reactor::Obje
         }),
         local_root: doc.local_root.as_deref().map(PathBuf::from),
         allow_http: doc.allow_http,
+        secret_names: Default::default(),
     }
 }
 

@@ -24,6 +24,7 @@ use moruna_kernel::{MorunaError, ObjectMeta, Result};
 use object_store::path::Path as OsPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
+use crate::credentials::{Guard, Store};
 use crate::{AzureConfig, GcsConfig, ObjectStoreConfig, S3Config};
 
 /// The part size of a multipart write (f.4).
@@ -71,6 +72,8 @@ pub(crate) struct StoreBackend {
     /// hands back) can abort only the upload it holds, and it does not survive a crash.
     /// `None` for the local filesystem, which has no multipart uploads.
     multipart: Option<Arc<dyn object_store::multipart::MultipartStore>>,
+    /// What the store's errors say of its credentials: every error passes through it.
+    guard: Arc<Guard>,
 }
 
 impl StoreBackend {
@@ -78,43 +81,75 @@ impl StoreBackend {
         store: Arc<dyn ObjectStore>,
         multipart: Option<Arc<dyn object_store::multipart::MultipartStore>>,
     ) -> StoreBackend {
-        StoreBackend { store, multipart }
+        StoreBackend {
+            store,
+            multipart,
+            guard: Arc::default(),
+        }
     }
+
+    /// The same backend, its errors read by `guard` (system design 3B).
+    pub(crate) fn guarded(mut self, guard: Guard) -> StoreBackend {
+        self.guard = Arc::new(guard);
+        self
+    }
+}
+
+/// `result` with its error, if any, read by `guard`.
+fn guarded<T>(guard: &Guard, result: object_store::Result<T>) -> object_store::Result<T> {
+    result.map_err(|e| guard.error(e))
 }
 
 impl ObjectBackend for StoreBackend {
     fn get_range(&self, path: &OsPath, range: Range<u64>) -> BoxFut<object_store::Result<Bytes>> {
-        let (store, path) = (Arc::clone(&self.store), path.clone());
-        Box::pin(async move { store.get_range(&path, range).await })
+        let (store, path, guard) = (
+            Arc::clone(&self.store),
+            path.clone(),
+            Arc::clone(&self.guard),
+        );
+        Box::pin(async move { guarded(&guard, store.get_range(&path, range).await) })
     }
 
     fn put(&self, path: &OsPath, payload: PutPayload) -> BoxFut<object_store::Result<()>> {
-        let (store, path) = (Arc::clone(&self.store), path.clone());
-        Box::pin(async move { store.put(&path, payload).await.map(|_| ()) })
+        let (store, path, guard) = (
+            Arc::clone(&self.store),
+            path.clone(),
+            Arc::clone(&self.guard),
+        );
+        Box::pin(async move { guarded(&guard, store.put(&path, payload).await.map(|_| ())) })
     }
 
     fn put_multipart(&self, path: &OsPath) -> BoxFut<object_store::Result<Box<dyn MultipartSink>>> {
-        let (store, path) = (Arc::clone(&self.store), path.clone());
+        let (store, path, guard) = (
+            Arc::clone(&self.store),
+            path.clone(),
+            Arc::clone(&self.guard),
+        );
         Box::pin(async move {
-            let upload = store.put_multipart(&path).await?;
+            let upload = guarded(&guard, store.put_multipart(&path).await)?;
             Ok(Box::new(StoreUpload {
                 upload: Some(upload),
+                guard,
             }) as Box<dyn MultipartSink>)
         })
     }
 
     fn head(&self, path: &OsPath) -> BoxFut<object_store::Result<ObjectMeta>> {
-        let (store, path) = (Arc::clone(&self.store), path.clone());
-        Box::pin(async move { store.head(&path).await.map(|m| meta(&path, &m)) })
+        let (store, path, guard) = (
+            Arc::clone(&self.store),
+            path.clone(),
+            Arc::clone(&self.guard),
+        );
+        Box::pin(async move { guarded(&guard, store.head(&path).await.map(|m| meta(&path, &m))) })
     }
 
     fn list_one_level(
         &self,
         prefix: Option<OsPath>,
     ) -> BoxFut<object_store::Result<(Vec<ObjectMeta>, Vec<OsPath>)>> {
-        let store = Arc::clone(&self.store);
+        let (store, guard) = (Arc::clone(&self.store), Arc::clone(&self.guard));
         Box::pin(async move {
-            let listed = store.list_with_delimiter(prefix.as_ref()).await?;
+            let listed = guarded(&guard, store.list_with_delimiter(prefix.as_ref()).await)?;
             let objects = listed
                 .objects
                 .iter()
@@ -125,15 +160,19 @@ impl ObjectBackend for StoreBackend {
     }
 
     fn delete(&self, path: &OsPath) -> BoxFut<object_store::Result<()>> {
-        let (store, path) = (Arc::clone(&self.store), path.clone());
-        Box::pin(async move { store.delete(&path).await })
+        let (store, path, guard) = (
+            Arc::clone(&self.store),
+            path.clone(),
+            Arc::clone(&self.guard),
+        );
+        Box::pin(async move { guarded(&guard, store.delete(&path).await) })
     }
 
     fn abort_by_id(&self, path: &OsPath, id: &str) -> Option<BoxFut<object_store::Result<()>>> {
         let multipart = Arc::clone(self.multipart.as_ref()?);
-        let (path, id) = (path.clone(), id.to_string());
+        let (path, id, guard) = (path.clone(), id.to_string(), Arc::clone(&self.guard));
         Some(Box::pin(async move {
-            multipart.abort_multipart(&path, &id).await
+            guarded(&guard, multipart.abort_multipart(&path, &id).await)
         }))
     }
 }
@@ -142,12 +181,18 @@ struct StoreUpload {
     /// `None` once the upload has been completed or aborted; a later call on it is the
     /// "already finished" programming error, reported and never a panic.
     upload: Option<Box<dyn object_store::MultipartUpload>>,
+    /// The store's guard: an upload's errors are the store's.
+    guard: Arc<Guard>,
 }
 
 impl MultipartSink for StoreUpload {
     fn part(&mut self, payload: PutPayload) -> BoxFut<object_store::Result<()>> {
+        let guard = Arc::clone(&self.guard);
         match &mut self.upload {
-            Some(upload) => Box::pin(upload.put_part(payload)),
+            Some(upload) => {
+                let part = upload.put_part(payload);
+                Box::pin(async move { guarded(&guard, part.await) })
+            }
             None => Box::pin(async { Err(finished()) }),
         }
     }
@@ -156,14 +201,16 @@ impl MultipartSink for StoreUpload {
         let Some(mut upload) = self.upload.take() else {
             return Box::pin(async { Err(finished()) });
         };
-        Box::pin(async move { upload.complete().await.map(|_| ()) })
+        let guard = Arc::clone(&self.guard);
+        Box::pin(async move { guarded(&guard, upload.complete().await.map(|_| ())) })
     }
 
     fn abort(&mut self) -> BoxFut<object_store::Result<()>> {
         let Some(mut upload) = self.upload.take() else {
             return Box::pin(async { Err(finished()) });
         };
-        Box::pin(async move { upload.abort().await })
+        let guard = Arc::clone(&self.guard);
+        Box::pin(async move { guarded(&guard, upload.abort().await) })
     }
 }
 
@@ -354,12 +401,10 @@ impl ObjectLayer {
                     .s3
                     .as_ref()
                     .ok_or_else(|| config("no s3 configuration"))?;
-                let client = Arc::new(build_s3(
-                    s3,
-                    &located.container,
-                    self.cfg.allow_http,
-                    network,
-                )?);
+                let client = Arc::new(
+                    build_s3(s3, &located.container, self.cfg.allow_http, network)
+                        .map_err(|e| self.redacted(Store::S3, e))?,
+                );
                 (Arc::clone(&client) as Arc<dyn ObjectStore>, Some(client))
             }
             Scheme::Gcs => {
@@ -368,7 +413,9 @@ impl ObjectLayer {
                     .gcs
                     .as_ref()
                     .ok_or_else(|| config("no gcs configuration"))?;
-                let client = Arc::new(build_gcs(gcs, &located.container)?);
+                let client = Arc::new(
+                    build_gcs(gcs, &located.container).map_err(|e| self.redacted(Store::Gcs, e))?,
+                );
                 (Arc::clone(&client) as Arc<dyn ObjectStore>, Some(client))
             }
             Scheme::Azure => {
@@ -377,12 +424,10 @@ impl ObjectLayer {
                     .azure
                     .as_ref()
                     .ok_or_else(|| config("no azure configuration"))?;
-                let client = Arc::new(build_azure(
-                    azure,
-                    &located.container,
-                    self.cfg.allow_http,
-                    network,
-                )?);
+                let client = Arc::new(
+                    build_azure(azure, &located.container, self.cfg.allow_http, network)
+                        .map_err(|e| self.redacted(Store::Azure, e))?,
+                );
                 (Arc::clone(&client) as Arc<dyn ObjectStore>, Some(client))
             }
             Scheme::File => {
@@ -394,7 +439,24 @@ impl ObjectLayer {
                 (Arc::new(local), None)
             }
         };
-        Ok(Arc::new(StoreBackend::new(store, multipart)))
+        let guard = match located.scheme {
+            Scheme::S3 => Guard::of(&self.cfg, Store::S3),
+            Scheme::Gcs => Guard::of(&self.cfg, Store::Gcs),
+            Scheme::Azure => Guard::of(&self.cfg, Store::Azure),
+            Scheme::File => Guard::default(),
+        };
+        Ok(Arc::new(StoreBackend::new(store, multipart).guarded(guard)))
+    }
+
+    /// A store's build error with no credential's value in it (system design 3B).
+    fn redacted(&self, store: Store, error: MorunaError) -> MorunaError {
+        match error {
+            MorunaError::Config { name, msg } => MorunaError::Config {
+                name,
+                msg: Guard::of(&self.cfg, store).redact(&msg),
+            },
+            other => other,
+        }
     }
 }
 
@@ -431,7 +493,14 @@ fn build_s3(
                     .with_virtual_hosted_style_request(false)
                     .with_http_connector(crate::socket::SocketConnector::new(target));
             }
-            None => b = b.with_endpoint(v),
+            None => {
+                b = b.with_endpoint(v);
+                // Virtual-host style: the endpoint is the bucket's own host, used as it is; its
+                // host is the one a node lets the job reach either way (system design 3D).
+                if cfg.virtual_hosted_style_request {
+                    b = b.with_virtual_hosted_style_request(true);
+                }
+            }
         }
     }
     if let Some(v) = &cfg.region {
@@ -481,6 +550,13 @@ fn build_azure(
     }
     if let Some(v) = &cfg.access_key {
         b = b.with_access_key(v);
+    }
+    if let Some(v) = &cfg.sas_token {
+        // The query string Azure gives, with or without its leading `?`.
+        b = b.with_config(
+            object_store::azure::AzureConfigKey::SasKey,
+            v.trim_start_matches('?'),
+        );
     }
     b.build().map_err(|e| config(&format!("azure: {e}")))
 }
@@ -655,7 +731,7 @@ mod tests {
                     region: Some("us-east-1".into()),
                     access_key_id: Some("k".into()),
                     secret_access_key: Some("s".into()),
-                    session_token: None,
+                    ..S3Config::default()
                 }),
                 ..ObjectStoreConfig::default()
             },
@@ -762,9 +838,9 @@ mod tests {
                     bucket: None,
                     endpoint: endpoint.map(String::from),
                     region: Some("us-east-1".into()),
-                    access_key_id: Some("k".into()),
-                    secret_access_key: Some("s".into()),
-                    session_token: None,
+                    access_key_id: Some("AKIA-NODE-TEST".into()),
+                    secret_access_key: Some("node-test-secret-value".into()),
+                    ..S3Config::default()
                 }),
                 azure: Some(AzureConfig {
                     account: Some("acct".into()),
@@ -1038,6 +1114,7 @@ mod store_tests {
                     access_key_id: Some("k".into()),
                     secret_access_key: Some("s".into()),
                     session_token: Some("t".into()),
+                    virtual_hosted_style_request: false,
                 }),
                 gcs: Some(GcsConfig {
                     service_account_json: Some(
@@ -1051,9 +1128,11 @@ mod store_tests {
                     account: Some("account".into()),
                     access_key: Some("a2V5".into()),
                     container: None,
+                    sas_token: None,
                 }),
                 local_root: None,
                 allow_http: true,
+                secret_names: Default::default(),
             },
             None,
         );
@@ -1079,5 +1158,333 @@ mod store_tests {
             bad.resolve("gs://g/k"),
             Err(MorunaError::Config { .. })
         ));
+    }
+}
+
+/// S3 and Azure Blob over the job's network with their credentials from the job's secrets
+/// (item 3.5): each request goes to its store's own host at 443, and a store that refuses the
+/// credentials, even one that says them back, fails with an error naming the secrets, never
+/// carrying their values.
+#[cfg(test)]
+mod secrets_tests {
+    use super::*;
+    use std::io;
+    use std::sync::Condvar;
+
+    /// What each test's credentials are; none may be in any error.
+    const KEY_ID: &str = "AKIA-TEST-35-0001";
+    const SECRET: &str = "wJalrXUtnFEMI-TEST-35-SECRET";
+    const ACCOUNT_KEY: &str = "dGVzdC1hY2NvdW50LWtleS0zNQ==";
+    const SIG: &str = "c2lnLTM1LXRlc3Q%3D";
+
+    /// One request as it reached the network: the host and port it was opened to, and its
+    /// head (request line and headers).
+    #[derive(Clone, Debug)]
+    struct Seen {
+        host: String,
+        port: u16,
+        head: String,
+    }
+
+    /// A network whose every connection answers its first request with `403 Forbidden` and a
+    /// body that says back every credential, as a careless server might.
+    #[derive(Debug, Default)]
+    struct Forbidding {
+        seen: Arc<Mutex<Vec<Seen>>>,
+    }
+
+    impl moruna_storage::net::Network for Forbidding {
+        fn open(
+            &self,
+            host: &str,
+            port: u16,
+        ) -> io::Result<Box<dyn moruna_storage::net::NetSocket>> {
+            Ok(Box::new(Answering {
+                host: host.to_string(),
+                port,
+                seen: Arc::clone(&self.seen),
+                state: Mutex::default(),
+                ready: Condvar::new(),
+            }))
+        }
+    }
+
+    #[derive(Default)]
+    struct Exchange {
+        request: Vec<u8>,
+        answer: Option<Vec<u8>>,
+        closed: bool,
+    }
+
+    struct Answering {
+        host: String,
+        port: u16,
+        seen: Arc<Mutex<Vec<Seen>>>,
+        state: Mutex<Exchange>,
+        ready: Condvar,
+    }
+
+    impl moruna_storage::net::NetSocket for Answering {
+        fn start_tls(&self, server_name: &str) -> io::Result<()> {
+            assert_eq!(server_name, self.host, "TLS for the host connected to");
+            Ok(())
+        }
+
+        fn send(&self, bytes: &[u8]) -> io::Result<usize> {
+            let mut state = self.state.lock().unwrap();
+            state.request.extend_from_slice(bytes);
+            if state.answer.is_none()
+                && let Some(end) = state.request.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                let head = String::from_utf8_lossy(&state.request[..end]).into_owned();
+                self.seen.lock().unwrap().push(Seen {
+                    host: self.host.clone(),
+                    port: self.port,
+                    head,
+                });
+                let body = format!(
+                    "<Error><Code>AccessDenied</Code><AWSAccessKeyId>{KEY_ID}</AWSAccessKeyId>\
+                     <Echo>{SECRET} {ACCOUNT_KEY} {SIG}</Echo></Error>"
+                );
+                state.answer = Some(
+                    format!(
+                        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/xml\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .into_bytes(),
+                );
+                self.ready.notify_all();
+            }
+            Ok(bytes.len())
+        }
+
+        fn receive(&self, buffer: &mut [u8]) -> io::Result<usize> {
+            let mut state = self.state.lock().unwrap();
+            loop {
+                if let Some(answer) = state.answer.as_mut()
+                    && !answer.is_empty()
+                {
+                    let n = answer.len().min(buffer.len());
+                    buffer[..n].copy_from_slice(&answer[..n]);
+                    answer.drain(..n);
+                    return Ok(n);
+                }
+                if state.closed || state.answer.is_some() {
+                    return Ok(0);
+                }
+                state = self.ready.wait(state).unwrap();
+            }
+        }
+
+        fn close(&self) {
+            self.state.lock().unwrap().closed = true;
+            self.ready.notify_all();
+        }
+    }
+
+    fn layer(s3: Option<S3Config>, azure: Option<AzureConfig>) -> ObjectLayer {
+        let mut cfg = ObjectStoreConfig {
+            s3,
+            azure,
+            ..ObjectStoreConfig::default()
+        };
+        for (field, name) in [
+            ("object_store.s3.access_key_id", "s3-key"),
+            ("object_store.s3.secret_access_key", "s3-secret"),
+            ("object_store.azure.access_key", "blob-key"),
+            ("object_store.azure.sas_token", "blob-sas"),
+        ] {
+            cfg.secret_names.insert(field.into(), name.into());
+        }
+        ObjectLayer::new(cfg, None)
+    }
+
+    fn s3(endpoint: &str, virtual_host: bool) -> Option<S3Config> {
+        Some(S3Config {
+            endpoint: Some(endpoint.into()),
+            region: Some("us-east-1".into()),
+            access_key_id: Some(KEY_ID.into()),
+            secret_access_key: Some(SECRET.into()),
+            virtual_hosted_style_request: virtual_host,
+            ..S3Config::default()
+        })
+    }
+
+    /// A range of `url` read through the job's network: the error as the reactor reports it,
+    /// and what reached the network.
+    fn read(l: &ObjectLayer, url: &str) -> (object_store::Error, MorunaError, Vec<Seen>) {
+        let network = Arc::new(Forbidding::default());
+        let connector = NetConnector::new(network.clone());
+        let (backend, path) = l
+            .resolve_through(url, true, Some(connector))
+            .expect("a client over the job's network");
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(backend.get_range(&path, 0..16))
+            .expect_err("the store refuses");
+        let reported = io("read_object", url, &error);
+        let seen = network.seen.lock().unwrap().clone();
+        (error, reported, seen)
+    }
+
+    /// None of `values`, the store's own credentials, is in `said`.
+    fn assert_clean(said: &str, values: &[&str]) {
+        for value in values {
+            assert!(!said.contains(value), "a credential in: {said}");
+        }
+    }
+
+    #[test]
+    fn s3_path_style_goes_to_the_endpoints_host_and_a_refusal_names_the_secrets() {
+        let l = layer(s3("https://objects.example.test", false), None);
+        let (error, reported, seen) = read(&l, "s3://in-bucket/taxi/2024-01.parquet");
+        assert!(
+            matches!(error, object_store::Error::PermissionDenied { .. }),
+            "{error}"
+        );
+        let said = reported.to_string();
+        assert_clean(&said, &[KEY_ID, SECRET]);
+        assert!(
+            said.contains("secret `s3-key` (object_store.s3.access_key_id)")
+                && said.contains("secret `s3-secret` (object_store.s3.secret_access_key)"),
+            "{said}"
+        );
+        assert!(
+            said.contains("<secret `s3-key`>") && said.contains("<secret `s3-secret`>"),
+            "what the store said back is read again: {said}"
+        );
+        assert_eq!(seen.len(), 1, "a refusal is not retried: {seen:?}");
+        assert_eq!(
+            (seen[0].host.as_str(), seen[0].port),
+            ("objects.example.test", 443)
+        );
+        assert!(
+            seen[0]
+                .head
+                .starts_with("GET /in-bucket/taxi/2024-01.parquet HTTP/1.1"),
+            "{}",
+            seen[0].head
+        );
+        // Signed with the key ID, which went to the store and nowhere else.
+        assert!(seen[0].head.contains(KEY_ID), "{}", seen[0].head);
+    }
+
+    #[test]
+    fn s3_virtual_host_style_goes_to_the_buckets_own_host() {
+        let l = layer(s3("https://in-bucket.objects.example.test", true), None);
+        let (_, reported, seen) = read(&l, "s3://in-bucket/taxi/2024-01.parquet");
+        assert_clean(&reported.to_string(), &[KEY_ID, SECRET]);
+        assert_eq!(
+            (seen[0].host.as_str(), seen[0].port),
+            ("in-bucket.objects.example.test", 443)
+        );
+        assert!(
+            seen[0]
+                .head
+                .starts_with("GET /taxi/2024-01.parquet HTTP/1.1"),
+            "{}",
+            seen[0].head
+        );
+    }
+
+    #[test]
+    fn blob_with_an_account_key_goes_to_the_accounts_host_and_names_the_secret() {
+        let azure = AzureConfig {
+            account: Some("moruna35".into()),
+            access_key: Some(ACCOUNT_KEY.into()),
+            ..AzureConfig::default()
+        };
+        let l = layer(None, Some(azure));
+        let (_, reported, seen) = read(&l, "az://out/score/part-0.parquet");
+        let said = reported.to_string();
+        assert_clean(&said, &[ACCOUNT_KEY]);
+        assert!(
+            said.contains("secret `blob-key` (object_store.azure.access_key)"),
+            "{said}"
+        );
+        assert_eq!(
+            (seen[0].host.as_str(), seen[0].port),
+            ("moruna35.blob.core.windows.net", 443)
+        );
+        assert!(
+            seen[0].head.starts_with("GET /out/score/part-0.parquet"),
+            "{}",
+            seen[0].head
+        );
+        assert!(
+            seen[0]
+                .head
+                .to_ascii_lowercase()
+                .contains("authorization: sharedkey moruna35:"),
+            "{}",
+            seen[0].head
+        );
+    }
+
+    #[test]
+    fn blob_with_a_sas_token_signs_with_it_and_names_the_secret() {
+        let azure = AzureConfig {
+            account: Some("moruna35".into()),
+            sas_token: Some(format!("?sv=2024-11-04&ss=b&srt=co&sp=rl&sig={SIG}")),
+            ..AzureConfig::default()
+        };
+        let l = layer(None, Some(azure));
+        let (_, reported, seen) = read(&l, "az://out/score/part-0.parquet");
+        let said = reported.to_string();
+        assert_clean(&said, &[SIG, "c2lnLTM1LXRlc3Q="]);
+        assert!(
+            said.contains("secret `blob-sas` (object_store.azure.sas_token)"),
+            "{said}"
+        );
+        assert_eq!(seen[0].host, "moruna35.blob.core.windows.net");
+        assert!(seen[0].head.contains("sig="), "{}", seen[0].head);
+        assert!(
+            !seen[0]
+                .head
+                .to_ascii_lowercase()
+                .contains("authorization: sharedkey"),
+            "{}",
+            seen[0].head
+        );
+    }
+
+    #[test]
+    fn a_build_error_never_carries_a_credential() {
+        // A key that is not base64 does not build; its error names no value.
+        let azure = AzureConfig {
+            account: Some("moruna35".into()),
+            access_key: Some("not base64! NOT-A-KEY-35".into()),
+            ..AzureConfig::default()
+        };
+        let l = layer(None, Some(azure));
+        let refused = l
+            .resolve_through(
+                "az://out/x",
+                true,
+                Some(NetConnector::new(Arc::new(Forbidding::default()))),
+            )
+            .err()
+            .expect("an access key that is not base64 is refused");
+        assert!(!refused.to_string().contains("NOT-A-KEY-35"), "{refused}");
+        // `Debug` of the configuration says whether each credential is set, never what it is.
+        let shown = format!("{:?}", l.cfg);
+        assert!(!shown.contains("NOT-A-KEY-35"), "{shown}");
+        assert!(shown.contains("Some(<redacted>)"), "{shown}");
+        let shown = format!("{:?}", s3("https://h.test", false).unwrap());
+        assert!(
+            !shown.contains(KEY_ID) && !shown.contains(SECRET),
+            "{shown}"
+        );
+        let shown = format!(
+            "{:?}",
+            GcsConfig {
+                service_account_json: Some("{\"k\":\"GCS-KEY-35\"}".into()),
+                ..GcsConfig::default()
+            }
+        );
+        assert!(!shown.contains("GCS-KEY-35"), "{shown}");
     }
 }
