@@ -647,10 +647,23 @@ impl Jobs {
                     }
                 }
                 Err(HostError::WouldBlock) => break,
-                Err(_) => self.end(None, None, now),
+                Err(error) => self.lost(error, now),
             }
         }
         self.wire.settle();
+    }
+
+    /// The engine is lost before or while it runs, for `error`: a submit still waiting hears it,
+    /// in its words (the node's refusal of a job's start, a function that changed since it was
+    /// registered, say: item 3.6), and the job, if it began, ends.
+    fn lost(&mut self, error: HostError, now: u64) {
+        if let Some(flight) = &mut self.flight
+            && let Some(ticket) = flight.ticket.take()
+        {
+            let answer = failed(error, &flight.secrets);
+            self.resolved.push((ticket, answer));
+        }
+        self.end(None, None, now);
     }
 
     /// Hands the engine the next document to check, and takes the verdict of the one it has: a
@@ -664,6 +677,7 @@ impl Jobs {
             let verdict = verdict.map(|mut verdict| {
                 let unregistered = functions.refusals(&verdict.needs.functions);
                 verdict.refusals.extend(unregistered);
+                verdict.registered = functions.registered(&verdict.needs.functions);
                 verdict
             });
             let unwanted = core::mem::take(&mut self.unwanted);

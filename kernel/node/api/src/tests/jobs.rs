@@ -12,14 +12,31 @@ use node_protocol::{CANCELLED, check_args, serve_args};
 
 use super::{admission::Admission, *};
 use crate::engine::{Host, PIECE, Shared, Sizes, check_config, job_config, sizes};
+use moruna_api::Function;
+use node_protocol::{Refusal, admission::Error as Refused};
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 /// An 8 GiB node's job bound (the cloud profile's, item 3.2).
 const BOUND: u64 = 6_564 * MIB;
 
+/// The function cache's size node config gives (item 3.6).
+const CACHE: u64 = 256 * MIB;
+
 fn host(admission: &Admission) -> Host {
-    jobs(admission.connect()).expect("the engine host")
+    let mut host = jobs(admission.connect()).expect("the engine host");
+    host.set_up(CACHE)
+        .expect("the function cache and the bound");
+    host
+}
+
+/// Waits until `node-admission` has answered the job's launch, which `api` asks without
+/// waiting (item 3.6), and the host has taken the answer.
+fn launched(host: &mut dyn EngineHost, is_launching: &dyn Fn() -> bool) {
+    until(|| {
+        let _ = host.receive(&mut []);
+        !is_launching()
+    });
 }
 
 /// Every message the engine's end holds now.
@@ -57,6 +74,32 @@ fn sound() -> Verdict {
             }],
             functions: vec!["taxi.clean".into()],
         },
+        registered: vec![taxi_clean()],
+    }
+}
+
+/// What the host reads once `node-admission` has answered a launch, within 10 s.
+fn answer(host: &mut Host) -> Result<usize, HostError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut buf = [0u8; 64];
+    loop {
+        match host.receive(&mut buf) {
+            Err(HostError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5))
+            }
+            other => return other,
+        }
+    }
+}
+
+/// `taxi.clean`, as the node registered it.
+fn taxi_clean() -> Function {
+    Function {
+        name: "taxi.clean".into(),
+        address: "https://images.example.com/taxi.clean".into(),
+        sha256: "ab".repeat(32),
+        key: "0123456789abcdef".into(),
+        registered: 0,
     }
 }
 
@@ -91,11 +134,11 @@ fn the_engine_s_configurations_are_its_supervisor_s() {
             assert_eq!(memory + scratch + 128 * MIB, budget);
         }
     }
-    let staged =
-        EngineConfig::parse(&job_config(BOUND, GIB, true, false, 0).unwrap()).expect("it parses");
+    let staged = EngineConfig::parse(&job_config(BOUND, GIB, true, false, 0, false).unwrap())
+        .expect("it parses");
     assert_eq!((staged.memory, staged.scratch), (896 * MIB, 0));
-    let job =
-        EngineConfig::parse(&job_config(BOUND, GIB, false, true, 0).unwrap()).expect("it parses");
+    let job = EngineConfig::parse(&job_config(BOUND, GIB, false, true, 0, true).unwrap())
+        .expect("it parses");
     assert_eq!(job.program, "/moruna/bin/moruna");
     assert_eq!(job.args, serve_args(BOUND));
     assert_eq!(job.env, ["HOME=/tmp"]);
@@ -114,12 +157,15 @@ fn the_engine_s_configurations_are_its_supervisor_s() {
             ("linux", &Source::Personality),
             ("engine", &Source::Channel("engine".into())),
             ("network", &Source::Channel("network".into())),
+            ("functions", &Source::Functions("functions".into())),
+            // A job that uses a function: the process resource a native one starts from.
+            ("process", &Source::Process("process".into())),
         ]
     );
     // A job's volumes (item 3.3): each its driver's connection as node-admission grants it, and
     // their list, handed to the program as they are given.
-    let with =
-        EngineConfig::parse(&job_config(BOUND, GIB, false, false, 2).unwrap()).expect("it parses");
+    let with = EngineConfig::parse(&job_config(BOUND, GIB, false, false, 2, false).unwrap())
+        .expect("it parses");
     let grants: Vec<(&str, &Source)> = with
         .grants
         .iter()
@@ -133,12 +179,21 @@ fn the_engine_s_configurations_are_its_supervisor_s() {
             ("volume.0", &Source::Channel("volume.0".into())),
             ("volume.1", &Source::Channel("volume.1".into())),
             ("volumes", &Source::Data("volumes".into())),
+            ("functions", &Source::Functions("functions".into())),
         ]
     );
-    // A job that names no host has no network (item 3.4).
-    let local =
-        EngineConfig::parse(&job_config(BOUND, GIB, false, false, 0).unwrap()).expect("it parses");
+    // A job that names no host has no network (item 3.4), and every job is given its
+    // functions, which node-admission gives none of to a job that uses none (item 3.6).
+    let local = EngineConfig::parse(&job_config(BOUND, GIB, false, false, 0, false).unwrap())
+        .expect("it parses");
     assert!(local.grants.iter().all(|g| g.slot != "network"));
+    assert!(
+        local
+            .grants
+            .iter()
+            .any(|g| g.source == Source::Functions("functions".into()))
+    );
+    assert!(local.grants.iter().all(|g| g.slot != "process"));
     // A check: 256 MiB less the engine's own, no scratch, its own channel, and the node's
     // volumes node-admission grants it (item 3.3).
     let check = EngineConfig::parse(&check_config(BOUND)).expect("it parses");
@@ -160,11 +215,11 @@ fn the_engine_s_configurations_are_its_supervisor_s() {
     // A budget that leaves the program nothing is refused by its field.
     for budget in [0, 64 * MIB, 128 * MIB] {
         assert!(
-            matches!(job_config(BOUND, budget, false, false, 0), Err(HostError::Refused(why)) if why.starts_with("budget.memory_bytes")),
+            matches!(job_config(BOUND, budget, false, false, 0, false), Err(HostError::Refused(why)) if why.starts_with("budget.memory_bytes")),
             "{budget}"
         );
     }
-    assert!(job_config(BOUND, 128 * MIB + 4096, false, false, 0).is_ok());
+    assert!(job_config(BOUND, 128 * MIB + 4096, false, false, 0, false).is_ok());
 }
 
 /// A check: the host asks the bound first, starts the check with its configuration, the Linux
@@ -176,6 +231,12 @@ fn a_check_runs_in_an_engine_of_its_own_and_answers_its_verdict() {
     let admission = Admission::start(BOUND);
     let mut host = host(&admission);
     assert_eq!(host.bound(), BOUND);
+    // The function cache's size first, then the bound, which counts it (item 3.6).
+    {
+        let book = admission.book.lock().unwrap();
+        assert_eq!(book.asked, ["functions", "bound"]);
+        assert_eq!(book.cache, Some(CACHE));
+    }
     assert!(host.waits().is_empty());
     let document = format!(
         "{{\"moruna_spec\":1,\"name\":\"{}\"}}",
@@ -248,11 +309,24 @@ fn a_check_runs_in_an_engine_of_its_own_and_answers_its_verdict() {
 fn a_job_runs_in_a_fresh_engine_from_spec_to_its_end() {
     let admission = Admission::start(BOUND);
     let mut host = Shared(Rc::new(RefCell::new(host(&admission))));
+    let shared = host.0.clone();
+    let is_launching = move || shared.borrow().launching();
     host.start(SPEC, &sound()).unwrap();
+    // Asked, not waited for (item 3.6): no engine until node-admission answers.
+    launched(&mut host, &is_launching);
     {
         let book = admission.book.lock().unwrap();
         let started = &book.started[0];
         assert_eq!(started.budget, Some(GIB));
+        // The job's functions as registered, for node-admission to fetch and check.
+        assert_eq!(
+            started.functions,
+            [(
+                String::from("taxi.clean"),
+                String::from("https://images.example.com/taxi.clean"),
+                "ab".repeat(32)
+            )]
+        );
         // The job's network, as node-admission mints it for the hosts its check named.
         assert_eq!(started.names, ["engine", "network"]);
         assert_eq!(started.services, ["linux"]);
@@ -268,7 +342,7 @@ fn a_job_runs_in_a_fresh_engine_from_spec_to_its_end() {
     // Its one volume, vol-out, as node-admission grants it (item 3.3).
     assert_eq!(
         admission.config(0),
-        job_config(BOUND, GIB, false, true, 1).unwrap()
+        job_config(BOUND, GIB, false, true, 1, true).unwrap()
     );
     let engine = admission.engine(0);
     assert_eq!(messages(&engine).concat(), SPEC);
@@ -320,6 +394,7 @@ fn a_job_runs_in_a_fresh_engine_from_spec_to_its_end() {
     assert_eq!(host.send(b"{}\n"), Err(HostError::Unavailable));
     // The account is free again: the next job starts.
     host.start(SPEC, &sound()).unwrap();
+    launched(&mut host, &is_launching);
     // And a check beside it.
     host.check(b"{}", &[]).unwrap();
     assert_eq!(host.checked(), None);
@@ -354,6 +429,7 @@ fn a_job_runs_in_a_fresh_engine_from_spec_to_its_end() {
     assert!(matches!(host.checked(), Some(Ok(_))));
     admission.end(3);
     host.start(SPEC, &sound()).unwrap();
+    launched(&mut host, &is_launching);
     let third = admission.book.lock().unwrap().started.len() - 1;
     let last = admission.engine(third);
     let id = admission.book.lock().unwrap().started[third].id;
@@ -363,6 +439,8 @@ fn a_job_runs_in_a_fresh_engine_from_spec_to_its_end() {
     admission.end(id);
     host.start(SPEC, &sound()).unwrap();
     assert!(admission.book.lock().unwrap().released.contains(&id));
+    // One launch at a time.
+    assert_eq!(host.start(SPEC, &sound()), Err(HostError::Unavailable));
 }
 
 /// What the node's admission refuses, and what no engine can be started for.
@@ -383,14 +461,31 @@ fn what_admission_refuses_is_the_call_s_answer() {
         host.start(SPEC, &small),
         Err(HostError::Refused(_))
     ));
-    // Past the node's bound: admission's `Quota`.
+    // Past the node's bound: admission's `Quota`, in the launch's answer (item 3.6).
     let large = Verdict {
         memory_bytes: Some(BOUND + 4096),
         ..sound()
     };
+    host.start(SPEC, &large).unwrap();
     assert!(
-        matches!(host.start(SPEC, &large), Err(HostError::Refused(why)) if why.starts_with("budget.memory_bytes"))
+        matches!(answer(&mut host), Err(HostError::Refused(why)) if why.starts_with("budget.memory_bytes"))
     );
+    // A function that changed since it was registered: the job is refused in admission's
+    // words, which name it (item 3.6).
+    let why = "the function `taxi.clean`'s image has changed since it was registered";
+    admission.book.lock().unwrap().refuse_with = Some(Refusal::new(Refused::Refused, why));
+    host.start(SPEC, &sound()).unwrap();
+    assert_eq!(answer(&mut host), Err(HostError::Refused(why.into())));
+    // A failure of admission's is the node's.
+    admission.book.lock().unwrap().refuse_with = Some(Refusal::new(
+        Refused::Unavailable,
+        "no network to fetch over",
+    ));
+    host.start(SPEC, &sound()).unwrap();
+    assert!(matches!(answer(&mut host), Err(HostError::Failed(why)) if why.contains("no network")));
+    admission.book.lock().unwrap().refuse_with = Some(Refusal::new(Refused::Limit, "busy"));
+    host.start(SPEC, &sound()).unwrap();
+    assert_eq!(answer(&mut host), Err(HostError::Unavailable));
     admission.book.lock().unwrap().refuse = Some(node_protocol::admission::Error::Unavailable);
     assert!(matches!(host.check(b"{}", &[]), Err(HostError::Failed(_))));
     admission.book.lock().unwrap().refuse = Some(node_protocol::admission::Error::Limit);
@@ -407,8 +502,10 @@ fn what_admission_refuses_is_the_call_s_answer() {
 #[test]
 fn a_restarted_api_has_a_fresh_connection_and_its_predecessor_s_job_ended() {
     let admission = Admission::start(BOUND);
-    let mut first = host(&admission);
+    let mut first = Shared(Rc::new(RefCell::new(host(&admission))));
+    let shared = first.0.clone();
     first.start(SPEC, &sound()).unwrap();
+    launched(&mut first, &move || shared.borrow().launching());
     let engine = admission.engine(0);
     // `api` dies: its connection closes with it.
     drop(first);

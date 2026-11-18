@@ -158,7 +158,9 @@ engine's own `encode_framing` uses for its records too (`moruna_ipc_check::valid
 `tasks/build.sh` builds `gate-JOB` for the seven jobs as Rust programs with std for the core
 (system design 5A0, item 5.0): the kernel's nightly, std from Moruna's copy of Rust's library, the
 user linker script, and the gate's one CPU setting. It needs item 5.0's target and std, and says
-so without them.
+so without them. It writes each task stripped, as a node fetches and caches it
+(`TARGET/core/bin/gate-JOB`), with its debug info beside it (`TARGET/core/debug/gate-JOB.debug`,
+which the program names), as `kernel/function/c/build-core.sh` writes its programs.
 
 A 0.7 job names the task as an `image` function with `command: ["/gate-JOB"]`, `plane: true` and
 `abi: "moruna"` (`bench/vm/gate_jobs.py`): the engine checks the program is of the kernel's user

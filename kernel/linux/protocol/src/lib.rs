@@ -122,6 +122,11 @@ pub struct Plane {
     /// (3.0) Actual unconnected read-only imagefs subtree channel for /assets.
     /// None mounts no asset view. No path string is accepted as authority.
     pub assets: Option<Channel>,
+    /// (4.0, item 3.6) The task's root filesystem: an unconnected imagefs connection, as
+    /// `attach` answers one for an image attached in place (a registered function's Moruna
+    /// image archive), whose program, files and scratch directory the task has in place of the
+    /// boot image's. None starts it on the boot image, as every task before.
+    pub root: Option<Channel>,
 }
 
 impl Wire for Plane {
@@ -132,7 +137,8 @@ impl Wire for Plane {
         self.log.encode(e)?;
         self.log_bytes.encode(e)?;
         self.account.encode(e)?;
-        self.assets.encode(e)
+        self.assets.encode(e)?;
+        self.root.encode(e)
     }
     fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
         Ok(Plane {
@@ -143,6 +149,7 @@ impl Wire for Plane {
             log_bytes: u64::decode(d)?,
             account: Handle::decode(d)?,
             assets: Option::<Channel>::decode(d)?,
+            root: Option::<Channel>::decode(d)?,
         })
     }
 }
@@ -206,7 +213,7 @@ moruna_svc::protocol! {
     /// Linux programs as processes.
     pub protocol linux {
         name = "moruna.linux";
-        major = 3;
+        major = 4;
         minor = 0;
         requests {
             /// Runs the program at `path` (absolute, in the image) with `argv` and
@@ -304,7 +311,7 @@ mod tests {
         let names: Vec<&[u8]> = back.handles.iter().map(|(n, _)| &n.0[..]).collect();
         assert_eq!(names, [&b"vsock"[..], &b"linux"[..]]);
         assert!(back.scratch.is_some());
-        assert_eq!((linux::ID.major, linux::ID.minor), (3, 0));
+        assert_eq!((linux::ID.major, linux::ID.minor), (4, 0));
         const {
             assert!(
                 AT_MORUNA_START > 64,
@@ -320,6 +327,7 @@ mod tests {
         let (log, _) = moruna_svc::Channel::create().unwrap();
         let (account, _) = moruna_svc::Channel::create().unwrap();
         let (assets, _) = moruna_svc::Channel::create().unwrap();
+        let (root, _) = moruna_svc::Channel::create().unwrap();
         let plane = Plane {
             input: Some(slot.0),
             output: None,
@@ -328,6 +336,7 @@ mod tests {
             log_bytes: 65536,
             account: account.0,
             assets: Some(assets),
+            root: Some(root),
         };
         let mut e = Encoder::new();
         plane.encode(&mut e).unwrap();
@@ -340,6 +349,28 @@ mod tests {
         assert!(back.input.is_some() && back.output.is_none() && back.port.is_some());
         assert_eq!(back.log_bytes, 65536);
         assert!(back.assets.is_some());
+        assert!(back.root.is_some(), "the task's own root (4.0)");
+        // A task on the boot image is given no root.
+        let (log, _) = moruna_svc::Channel::create().unwrap();
+        let (account, _) = moruna_svc::Channel::create().unwrap();
+        let boot = Plane {
+            input: None,
+            output: None,
+            port: None,
+            log: log.0,
+            log_bytes: 4096,
+            account: account.0,
+            assets: None,
+            root: None,
+        };
+        let mut e = Encoder::new();
+        boot.encode(&mut e).unwrap();
+        moruna_svc::frame::send(&mine, moruna_svc::Kind::Event, 1, 0, e).unwrap();
+        let mut f = moruna_svc::frame::recv(&theirs).unwrap().unwrap();
+        let mut d = f.decoder();
+        let back = Plane::decode(&mut d).unwrap();
+        assert_eq!(d.finish(), Ok(()));
+        assert!(back.root.is_none() && back.assets.is_none());
     }
 }
 
@@ -349,7 +380,7 @@ mod account_protocol_version_tests {
     fn kb5_previous_unaccounted_major_is_refused_before_requests() {
         use moruna_svc::protocol::{ProtocolId, Refusal};
         let current = super::linux::ID;
-        assert_eq!((current.major, current.minor), (3, 0));
+        assert_eq!((current.major, current.minor), (4, 0));
         let old = ProtocolId::new(current.name, 1, 3);
         assert_eq!(current.accepts(&old.hello()), Err(Refusal::MajorMismatch));
         assert_eq!(old.accepts(&current.hello()), Err(Refusal::MajorMismatch));

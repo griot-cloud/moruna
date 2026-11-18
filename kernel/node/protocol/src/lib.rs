@@ -4,7 +4,9 @@
 extern crate alloc;
 use alloc::{format, string::String, vec::Vec};
 use devices_protocol::Block;
-use moruna_svc::{Handle, Memory, Rights, map};
+use moruna_svc::{Decoder, Encoder, Handle, Memory, Rights, Wire, WireError, map};
+
+pub mod functions;
 
 pub const MAX_JOBS: usize = 64;
 pub use moruna_node::MAX_JOB_GRANTS as MAX_GRANTS;
@@ -30,6 +32,112 @@ pub const CHECK_CHANNEL: &str = "check";
 /// functions it uses, by name. `node-admission` keeps them with the job, for items 3.3, 3.4
 /// and 3.6 to grant from.
 pub type Needs = (Vec<String>, Vec<(String, bool)>, Vec<String>);
+
+/// A function a job uses, as `api` registered it (system design 3E): its name, the `https://`
+/// address its file is fetched from, and the file's SHA-256 as 64 lowercase hex digits. `launch`
+/// is given one for each of the job's `needs.functions`, in that order (PM, item 3.6).
+pub type Registered = (String, String, String);
+
+/// How long `node-admission` gives one function's file to arrive (PM, item 3.6): five minutes.
+pub const FETCH_NS: u64 = 300 * 1_000_000_000;
+
+/// What `launch` answers (PM, item 3.6): the job's id, or why it was refused, a sentence that
+/// travels with the refusal, which `api` fails the job with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Launched {
+    /// The engine started: the job's id.
+    Started(u64),
+    /// The job was refused.
+    Refused(Refusal),
+}
+
+/// A refusal of `launch`: one of [`admission::Error`]'s codes, and a sentence saying why, which
+/// names the function when one is the cause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    /// The code: `admission::Error`'s.
+    pub code: u32,
+    /// Why, in one sentence.
+    pub message: String,
+}
+
+impl Refusal {
+    /// `error`, saying `message`.
+    pub fn new(error: admission::Error, message: impl Into<String>) -> Refusal {
+        use moruna_svc::ProtocolError;
+        Refusal {
+            code: error.code(),
+            message: message.into(),
+        }
+    }
+
+    /// The error its code names, `None` for a code this build does not know.
+    pub fn error(&self) -> Option<admission::Error> {
+        use moruna_svc::ProtocolError;
+        admission::Error::from_code(self.code)
+    }
+}
+
+/// A refusal that is only its code, as the requests other than `launch` answer: its sentence
+/// says what the code means for a job's start.
+impl From<admission::Error> for Refusal {
+    fn from(error: admission::Error) -> Refusal {
+        let message = match error {
+            admission::Error::Invalid => "node-admission refused the job's start as invalid",
+            admission::Error::Quota => {
+                "budget.memory_bytes: more than node-admission has for a job"
+            }
+            admission::Error::Unavailable => {
+                "node-admission cannot start the job: a service it needs is not there"
+            }
+            admission::Error::NotFound => "node-admission has no such job",
+            admission::Error::Limit => "node-admission runs as many engines as it may",
+            admission::Error::Refused => "a function the job uses is refused",
+        };
+        Refusal::new(error, message)
+    }
+}
+
+impl Wire for Launched {
+    fn encode(self, e: &mut Encoder) -> Result<(), WireError> {
+        match self {
+            Launched::Started(id) => {
+                0u8.encode(e)?;
+                id.encode(e)
+            }
+            Launched::Refused(refusal) => {
+                1u8.encode(e)?;
+                refusal.code.encode(e)?;
+                refusal.message.encode(e)
+            }
+        }
+    }
+
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        match u8::decode(d)? {
+            0 => Ok(Launched::Started(u64::decode(d)?)),
+            1 => Ok(Launched::Refused(Refusal {
+                code: u32::decode(d)?,
+                message: String::decode(d)?,
+            })),
+            _ => Err(WireError::Invalid),
+        }
+    }
+}
+
+/// What of node-admission's account jobs are carved from: its limit less the function cache's
+/// account, `cache` bytes, which it carves from its own when `api` sends `functions` (PM, item
+/// 3.6), so the job bound ([`budget_max`] of this) is honest.
+pub fn jobs_account(admission_account: u64, cache: u64) -> u64 {
+    admission_account.saturating_sub(cache)
+}
+
+/// The function cache's account for `cache_bytes`, as node config gives it: whole pages, the
+/// most of it an account may be (an account's limit is whole pages; the default, an eighth of
+/// the node's memory, need not be).
+pub fn cache_account(cache_bytes: u64) -> u64 {
+    cache_bytes & !4095
+}
 
 /// The most of each kind of need a job may name.
 pub const MAX_NEEDS: usize = 64;
@@ -224,7 +332,7 @@ moruna_svc::protocol! {
     pub protocol admission {
         name = "moruna.node.admission";
         major = 1;
-        minor = 2;
+        minor = 3;
         requests {
             /// Launch one engine; names and grants correspond exactly. Config is
             /// the existing KD2 engine configuration; names cannot shadow reserved
@@ -233,7 +341,12 @@ moruna_svc::protocol! {
             /// the job for the grants of items 3.3, 3.4 and 3.6; `Invalid` when they
             /// are not `valid_needs`. The job's account of `budget` bytes is carved from
             /// the server's own; a budget past `budget_max` of it is `Quota`.
-            1 => fn launch(budget: u64, config: Handle, names: Vec<String>, grants: Vec<Handle>, services: Vec<String>, needs: Needs) -> u64;
+            /// (1.3, item 3.6) `functions` are the job's `needs.functions` as registered, in
+            /// that order: each file is fetched, within `FETCH_NS`, unless the cache keeps it,
+            /// checked against its SHA-256, and given the engine as `function.N` with the
+            /// `functions` index. The answer is `Launched`: the job's id, or a refusal with
+            /// its sentence, which names the function that is the cause.
+            1 => fn launch(budget: u64, config: Handle, names: Vec<String>, grants: Vec<Handle>, services: Vec<String>, needs: Needs, functions: Vec<Registered>) -> Launched;
             /// Actual process state; termination does not claim a successful exit.
             2 => fn status(job: u64) -> u32;
             /// Kill the caller's job. A returned success means kill was accepted;
@@ -253,6 +366,12 @@ moruna_svc::protocol! {
             /// `api` reports as the node's `job_memory_bytes` and starts every engine with.
             /// `Unavailable` when the server has no account of its own.
             7 since 2 => fn bound() -> u64;
+            /// (1.3, item 3.6) The function cache: an account of `cache_account(cache_bytes)`
+            /// carved from the server's own, node config's `functions.cache_bytes`, which
+            /// `api` sends once at its start, before it asks `bound`, which then counts it.
+            /// A restarted `api` sends the same again, which changes nothing; another size is
+            /// `Invalid`, and an account with no room for it `Quota`.
+            8 since 3 => fn functions(cache_bytes: u64) -> ();
         }
         events {}
         errors {
@@ -261,6 +380,9 @@ moruna_svc::protocol! {
             3 => Unavailable;
             4 => NotFound;
             5 => Limit;
+            /// (1.3, item 3.6) A function the job uses is refused: changed since it was
+            /// registered, larger than the cache, not fetched in time, or not kept.
+            6 => Refused;
         }
     }
 }
@@ -281,6 +403,53 @@ pub fn valid_grants(names: &[String], count: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_launch_answers_its_job_or_its_refusal_with_the_sentence() {
+        let refused = Refusal::new(
+            admission::Error::Refused,
+            "the function `gate-score`'s image has changed since it was registered",
+        );
+        assert_eq!(refused.error(), Some(admission::Error::Refused));
+        for answer in [Launched::Started(7), Launched::Refused(refused)] {
+            let mut e = Encoder::new();
+            answer.clone().encode(&mut e).unwrap();
+            let bytes = e.into_control_bytes().unwrap();
+            let mut d = Decoder::new(&bytes, &mut []);
+            assert_eq!(Launched::decode(&mut d), Ok(answer));
+            assert_eq!(d.finish(), Ok(()));
+        }
+        let mut d = Decoder::new(&[2], &mut []);
+        assert_eq!(Launched::decode(&mut d), Err(WireError::Invalid));
+        assert_eq!(
+            Refusal {
+                code: 99,
+                message: String::new()
+            }
+            .error(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_function_cache_comes_out_of_the_job_bound() {
+        let account = 8u64 << 30;
+        // Nothing carved: the bound as before.
+        assert_eq!(jobs_account(account, 0), account);
+        // A 1 GiB cache is a GiB less for jobs.
+        assert_eq!(
+            budget_max(jobs_account(account, 1 << 30)),
+            budget_max(account) - (1 << 30)
+        );
+        assert_eq!(jobs_account(1 << 20, 1 << 30), 0);
+        // QEMU's 2 GiB node: the default, an eighth of it, is not whole pages; its account is.
+        let default = 2_032_979_968 / 8;
+        assert_eq!(cache_account(default), 254_119_936);
+        assert_eq!(cache_account(default) % 4096, 0);
+        assert_eq!(cache_account(1 << 30), 1 << 30);
+        assert_eq!(FETCH_NS / 1_000_000_000, 300, "five minutes an image");
+    }
+
     #[test]
     fn a_jobs_budget_is_admissions_account_less_384_mib() {
         assert_eq!(RESERVED_BYTES, 384 << 20);

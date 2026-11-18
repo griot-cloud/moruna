@@ -492,7 +492,8 @@ fn the_function_cache_needs_the_node_s_memory() {
         "moruna: fatal config: `functions.cache_bytes` is 268435456: the most is 134217728, \
          half the node's memory"
     );
-    // A config that leaves the cache at its default takes 1 GiB or half the node's memory, and
+    // A config that leaves the cache at its default takes 1 GiB or an eighth of the node's
+    // memory (PM, item 3.6), and
     // `api` is handed the memory it was judged on.
     let default = |memory_bytes| {
         let network = FakeNetwork::serving(&FakeClock::default(), |_, sent| openstack(sent));
@@ -505,7 +506,7 @@ fn the_function_cache_needs_the_node_s_memory() {
         handover.config.functions.cache_bytes
     };
     assert_eq!(default(MEMORY), 1 << 30);
-    assert_eq!(default(1_500_000_000), 750_000_000);
+    assert_eq!(default(1_500_000_000), 187_500_000);
 }
 
 #[test]

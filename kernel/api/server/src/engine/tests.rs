@@ -156,6 +156,7 @@ fn the_checked_line_is_the_verdict() {
         Verdict {
             refusals: Vec::new(),
             memory_bytes: Some(1 << 30),
+            registered: Vec::new(),
             needs: Needs {
                 hosts: vec!["s3.eu-west-1.amazonaws.com".into()],
                 volumes: vec![

@@ -3,7 +3,7 @@
 //! messages (`moruna-hosted-engine.md`, section 4.3) read from the engine's bytes.
 
 use alloc::{string::String, vec::Vec};
-use moruna_api::Refusal;
+use moruna_api::{Function, Refusal};
 use moruna_event::frame::FRAME;
 use moruna_record::{FIXED, MAX_RECORD};
 
@@ -59,6 +59,11 @@ pub struct Verdict {
     pub memory_bytes: Option<u64>,
     /// What else it needs of the node.
     pub needs: Needs,
+    /// The functions the job uses as the node registered them, in `needs.functions` order
+    /// (system design 3E, item 3.6): the server fills them from its registry before it starts
+    /// the job, for `node-admission` to fetch and check each against. The check's own verdict
+    /// has none.
+    pub registered: Vec<Function>,
 }
 
 /// The host protocol's `check` message (`moruna-hosted-engine.md`, `check-job --listen`) for
@@ -147,6 +152,7 @@ pub fn verdict(line: &[u8]) -> Result<Verdict, HostError> {
                 .collect(),
             functions: checked.functions,
         },
+        registered: Vec::new(),
     })
 }
 

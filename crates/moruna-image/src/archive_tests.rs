@@ -211,3 +211,49 @@ fn a_span_ends_where_its_pages_do() {
     };
     assert_eq!(span.end(), 5 * PAGE as u64);
 }
+
+#[test]
+fn an_archives_files_are_read_in_place_across_its_layers() {
+    let scratch = Scratch::new("archive_files");
+    let (_, bytes, _) = written(&scratch, "app");
+    let archive = Archive::parse(&bytes).unwrap();
+    let mut files = archive.files(&bytes).unwrap();
+    assert!(format!("{files:?}").contains("layers: 3"));
+    // The lowest layer's program, the middle one's file, and what the top one removed.
+    assert!(files.is_file("/usr/bin/app"));
+    assert!(files.is_file("/opt/lib.py"));
+    assert!(!files.is_file("/etc/gone"));
+    assert!(!files.is_file("/usr/bin"), "a directory is not a file");
+    assert!(!files.is_file("relative"), "a path is absolute");
+    assert_eq!(files.head("/usr/bin/app", 64).unwrap(), vec![0x7f; 64]);
+    // A file shorter than asked is read whole, across its pages.
+    assert_eq!(
+        files.head("/usr/bin/app", 1 << 20).unwrap(),
+        vec![0x7f; 3 * PAGE + 11]
+    );
+    assert_eq!(
+        files.head("/opt/lib.py", 4096).unwrap(),
+        b"print('a library')\n"
+    );
+    let gone = files.head("/etc/gone", 1).unwrap_err().to_string();
+    assert!(gone.contains("/etc/gone is not in the image"), "{gone}");
+    let directory = files.head("/opt", 1).unwrap_err().to_string();
+    assert!(directory.contains("is not a file"), "{directory}");
+    let bad = files.head("relative", 1).unwrap_err().to_string();
+    assert!(bad.contains("relative"), "{bad}");
+
+    // A page changed after the archive was read is refused when it is read, not believed.
+    let mut changed = bytes.clone();
+    let span = archive.layers[0].span;
+    let data = (span.offset as usize..span.end() as usize)
+        .step_by(PAGE)
+        .find(|at| bytes[*at..*at + PAGE].iter().all(|b| *b == 0x7f))
+        .expect("a whole page of the program");
+    changed[data + 7] ^= 0xff;
+    let mut files = archive.files(&changed).unwrap();
+    assert!(files.head("/usr/bin/app", 1 << 20).is_err());
+    // A layer whose header is not sealed as the index says is not mounted at all.
+    let mut header = bytes.clone();
+    header[archive.layers[1].span.offset as usize + 64] ^= 0xff;
+    assert!(archive.files(&header).is_err());
+}

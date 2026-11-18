@@ -626,19 +626,21 @@ fn the_function_cache_is_whole_mib_from_64_mib_to_half_the_node_s_memory() {
 }
 
 #[test]
-fn the_default_function_cache_is_1_gib_or_half_the_node_s_memory_and_never_refused() {
+fn the_default_function_cache_is_1_gib_or_an_eighth_of_the_node_s_memory_and_never_refused() {
     let default = |text: &str, memory: u64| {
         NodeConfig::validate(text.as_bytes(), memory).map(|c| c.functions.cache_bytes)
     };
     // With no `functions`, and with `functions` that leaves `cache_bytes` out.
     for text in [with(""), with(r#","functions":{"keys":[]}"#)] {
-        // 1 GiB on a node with at least 2 GiB.
+        // 1 GiB on a node with at least 8 GiB.
         assert_eq!(default(&text, MEMORY), Ok(1 << 30));
-        assert_eq!(default(&text, 2 << 30), Ok(CACHE_BYTES_DEFAULT));
-        // Half the node's memory on a smaller one, not rounded and not held to 64 MiB.
-        assert_eq!(default(&text, (2 << 30) - 4096), Ok((1 << 30) - 2048));
-        assert_eq!(default(&text, 1 << 30), Ok(512 << 20));
-        assert_eq!(default(&text, 100 << 20), Ok(50 << 20));
+        assert_eq!(default(&text, 24 << 30), Ok(CACHE_BYTES_DEFAULT));
+        // An eighth of the node's memory on a smaller one, not rounded and not held to 64 MiB:
+        // 256 MiB on 2 GiB, which leaves a 2 GiB node memory for a job (PM, item 3.6).
+        assert_eq!(default(&text, 2 << 30), Ok(256 << 20));
+        assert_eq!(default(&text, (8 << 30) - 4096), Ok((1 << 30) - 512));
+        assert_eq!(default(&text, 1 << 30), Ok(128 << 20));
+        assert_eq!(default(&text, 100 << 20), Ok(12_800 << 10));
         assert_eq!(default(&text, 0), Ok(0));
     }
 }
@@ -878,7 +880,7 @@ const QEMU_2_GIB: u64 = 2_032_979_968;
 #[test]
 fn a_config_with_no_functions_passes_on_a_2_gib_node() {
     let config = NodeConfig::validate(with("").as_bytes(), QEMU_2_GIB).expect("valid");
-    assert_eq!(config.functions.cache_bytes, QEMU_2_GIB / 2);
+    assert_eq!(config.functions.cache_bytes, QEMU_2_GIB / 8);
     assert_ne!(config.functions.cache_bytes % MIB, 0);
     assert!(!config.functions.cache_bytes_given);
     let handed = Handover {

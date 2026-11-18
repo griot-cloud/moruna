@@ -1,24 +1,18 @@
 //! The engine's ACTUAL source filesystem capability, delegated by its Linux task.
 //! A pathname is only a request on that capability, never permission by itself.
-use imagefs_protocol::{Bytes, imagefs};
+//!
+//! The same connection attaches a registered image function's archive (item 3.6): the image
+//! filesystem mounts its layers in place and answers a root over them for one task.
+use imagefs_protocol::{Attached, Bytes, imagefs};
 use moruna_svc::{Channel, ObjectType, Rights};
 use std::sync::{Mutex, OnceLock};
 const TIMEOUT: u64 = 5_000_000_000;
-/// Export one existing source directory as a real READ-only subtree session.
-/// The producer retains source Scratch/Account/lifetime in the canonical service;
-/// the receiving Linux task mounts that capability at its actor-local `/assets`.
-pub fn export_directory(path: &std::path::Path) -> Result<Channel, String> {
-    if !path.is_absolute() {
-        return Err("asset source path must be absolute in the actual engine view".into());
-    }
-    let path = path
-        .to_str()
-        .ok_or("native asset source path is not UTF-8")?;
-    if path.is_empty() || path.len() > 4096 || path.as_bytes().contains(&0) {
-        return Err("invalid asset source path".into());
-    }
+
+/// The engine's connection to the image filesystem it runs on: the start slot `filesystem`,
+/// which the personality grants every program it starts with grants.
+fn client() -> Result<&'static Mutex<imagefs::Client>, String> {
     static SOURCE: OnceLock<Result<Mutex<imagefs::Client>, String>> = OnceLock::new();
-    let client = SOURCE
+    SOURCE
         .get_or_init(|| {
             let source = crate::start::take("filesystem")
                 .ok_or("missing actual source filesystem startup capability")?;
@@ -38,11 +32,39 @@ pub fn export_directory(path: &std::path::Path) -> Result<Channel, String> {
             Ok(Mutex::new(client))
         })
         .as_ref()
-        .map_err(Clone::clone)?;
-    let mut client = client
+        .map_err(Clone::clone)
+}
+
+/// Export one existing source directory as a real READ-only subtree session.
+/// The producer retains source Scratch/Account/lifetime in the canonical service;
+/// the receiving Linux task mounts that capability at its actor-local `/assets`.
+pub fn export_directory(path: &std::path::Path) -> Result<Channel, String> {
+    if !path.is_absolute() {
+        return Err("asset source path must be absolute in the actual engine view".into());
+    }
+    let path = path
+        .to_str()
+        .ok_or("native asset source path is not UTF-8")?;
+    if path.is_empty() || path.len() > 4096 || path.as_bytes().contains(&0) {
+        return Err("invalid asset source path".into());
+    }
+    let mut client = client()?
         .lock()
         .map_err(|_| "actual source filesystem client poisoned")?;
     client
         .export_directory(Bytes(path.as_bytes().to_vec()))
         .map_err(|e| format!("exporting actual readonly asset directory: {e:?}"))
+}
+
+/// A root over the image whose layer files lie in `image`, each where `layers` says (a Moruna
+/// image archive's memory object and its spans): the image filesystem's `attach` (imagefs
+/// 3.1), which checks each layer's seal as it mounts it. The channel is unconnected: the task's
+/// connection, which `run_plane` gives the personality as its root (`moruna.linux` 4.0).
+pub fn attach(image: moruna_svc::Memory, layers: Vec<Attached>) -> Result<Channel, String> {
+    let mut client = client()?
+        .lock()
+        .map_err(|_| "actual source filesystem client poisoned")?;
+    client
+        .attach(image, layers)
+        .map_err(|e| format!("the image filesystem attaching the image: {e:?}"))
 }

@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 moruna-svc.workspace = true
+# An attached image's pages mapped where they lie: a snapshot of its memory object (item 3.6).
+moruna-sys.workspace = true
 moruna-imagefs = { path = "../fs", version = "=0.1.0" }
 imagefs-protocol = { path = "../protocol", version = "=0.1.0" }
 block-protocol = { path = "../../drivers/block-protocol", version = "=0.1.0" }

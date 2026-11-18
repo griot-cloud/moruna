@@ -1034,3 +1034,205 @@ fn pinned_scratch_directory_lives_until_its_last_view_closes() {
     scratch.close(id);
     assert!(scratch.info(id).is_err());
 }
+
+/// Item 3.6: two layer files lying end to end after an index page, as a Moruna image
+/// archive's memory object holds them, attached in place.
+fn archive_region() -> (Vec<u8>, Vec<crate::attached::Span>) {
+    let (lower, upper) = (lower(), upper());
+    let mut region = vec![0xEEu8; PAGE];
+    let mut spans = Vec::new();
+    for layer in [&lower, &upper] {
+        spans.push(crate::attached::Span {
+            offset: region.len() as u64,
+            pages: (layer.len() / PAGE) as u64,
+            seal: sha256::digest(&layer[..PAGE]),
+        });
+        region.extend_from_slice(layer);
+    }
+    (region, spans)
+}
+
+#[test]
+fn attached_layers_read_as_the_same_layers_mounted_from_devices() {
+    let (region, spans) = archive_region();
+    let (mut attached, over) = crate::attached::attach(region, spans.clone(), 64).unwrap();
+    let (mut mounted, reference) = mount(vec![lower(), upper()], 64);
+    let scratch = Scratch::new();
+    for path in [
+        &b"/etc/passwd"[..],
+        b"/bin/sh",
+        b"/sparse",
+        b"/usr/lib/libc.so",
+        b"/opq/upper",
+        b"/replaced/inside",
+    ] {
+        let here = Tree {
+            overlay: &over,
+            scratch: &scratch,
+        };
+        let there = Tree {
+            overlay: &reference,
+            scratch: &scratch,
+        };
+        let Place::Image(found) = here.resolve(&mut attached, path, true).unwrap() else {
+            panic!("an image path");
+        };
+        let Place::Image(expected) = there.resolve(&mut mounted, path, true).unwrap() else {
+            panic!("an image path");
+        };
+        let Found::File { layer, node, .. } = &found else {
+            panic!("a file");
+        };
+        let map = over.file(&mut attached, *layer, node).unwrap();
+        let mut read = Vec::new();
+        for page in 0..map.pages() {
+            let mut buf = [0u8; PAGE];
+            if let Some(lp) = map.layer_page(page).unwrap() {
+                attached.read(*layer, lp, 0, &mut buf).unwrap();
+            }
+            read.extend_from_slice(&buf);
+        }
+        read.truncate(map.size as usize);
+        assert_eq!(read, read_all(&mut mounted, &reference, &expected).unwrap());
+    }
+    // Whiteouts and opaque directories are the layers', whatever holds them.
+    let tree = Tree {
+        overlay: &over,
+        scratch: &scratch,
+    };
+    assert_eq!(
+        tree.resolve(&mut attached, b"/etc/old", true).err(),
+        Some(Error::NotFound)
+    );
+    assert_eq!(attached.disk_ref().spans(), spans.as_slice());
+    assert_eq!(attached.layers().len(), 2);
+}
+
+#[test]
+fn an_attached_layer_is_sealed_as_its_index_says_and_lies_inside_the_region() {
+    let (region, spans) = archive_region();
+    let mut other = spans.clone();
+    other[1].seal = [0; 32];
+    let Err(Error::Corrupt(why)) = crate::attached::attach(region.clone(), other, 64) else {
+        panic!("a layer sealed otherwise is refused");
+    };
+    assert!(
+        why.contains("layer 1") && why.contains("index gives"),
+        "{why}"
+    );
+    for (offset, pages) in [
+        (spans[1].offset + 1, spans[1].pages),
+        (spans[1].offset, spans[1].pages + 1),
+        (spans[1].offset, 0),
+        (spans[0].offset, spans[1].pages),
+        (u64::MAX - 10, 2),
+    ] {
+        let mut wrong = spans.clone();
+        wrong[1].offset = offset;
+        wrong[1].pages = pages;
+        assert!(
+            matches!(
+                crate::attached::attach(region.clone(), wrong, 64),
+                Err(Error::Corrupt(_))
+            ),
+            "{offset} {pages}"
+        );
+    }
+    // A span shorter than its layer file: the header names more pages than it holds.
+    let mut short = spans.clone();
+    short[0].pages = 1;
+    assert!(crate::attached::attach(region.clone(), short, 64).is_err());
+    // A page past a span, and a layer or a slot that is not there, are refused by the disk.
+    let mut disk = crate::attached::AttachedDisk::new(region.clone(), spans.clone(), 16).unwrap();
+    let at = spans[1].offset as usize;
+    assert_eq!(disk.page(1, 0).unwrap(), &region[at..at + PAGE]);
+    assert!(disk.page(1, spans[1].pages).is_err() && disk.page(2, 0).is_err());
+    for read in [
+        Fetch {
+            layer: 0,
+            page: spans[0].pages,
+            slot: 0,
+        },
+        Fetch {
+            layer: 2,
+            page: 0,
+            slot: 0,
+        },
+        Fetch {
+            layer: 0,
+            page: 0,
+            slot: 16,
+        },
+    ] {
+        assert!(matches!(disk.fetch(&[read]), Err(Error::Io(_))), "{read:?}");
+    }
+    let mut out = [0u8; 8];
+    assert!(disk.copy(16, 0, &mut out).is_err());
+    assert!(disk.device_pages(2).is_err());
+    assert_eq!(disk.device_pages(1), Ok(spans[1].pages));
+}
+
+/// Item 3.6: an attached file whose pages lie one after another is mapped where it lies, each
+/// page checked against its hash first, once; a range with a hole or past the file is not.
+#[test]
+fn an_attached_files_pages_in_one_run_are_mapped_where_they_lie() {
+    let (region, spans) = archive_region();
+    let (mut attached, over) = crate::attached::attach(region.clone(), spans.clone(), 64).unwrap();
+    let scratch = Scratch::new();
+    let found = |attached: &mut Cache<crate::attached::AttachedDisk<Vec<u8>>>, path: &[u8]| {
+        let tree = Tree {
+            overlay: &over,
+            scratch: &scratch,
+        };
+        let Place::Image(Found::File { layer, node, .. }) =
+            tree.resolve(attached, path, true).unwrap()
+        else {
+            panic!("a file");
+        };
+        (layer, over.file(attached, layer, &node).unwrap())
+    };
+    // libc.so: 9000 bytes, three pages in one extent.
+    let (layer, libc) = found(&mut attached, b"/usr/lib/libc.so");
+    let lp = libc.run_of(0, 3).expect("one run");
+    assert_eq!(libc.run_of(1, 2), Some(lp + 1));
+    assert_eq!(libc.run_of(0, 4), None, "past the file");
+    assert_eq!(libc.run_of(0, 0), None);
+    let at = crate::attached::in_place(&mut attached, layer, lp, 3).unwrap();
+    assert_eq!(at, spans[layer].offset + lp * PAGE as u64);
+    let at = at as usize;
+    assert_eq!(&region[at..at + 9000], &[9u8; 9000][..]);
+    // Checked once: the second asks nothing more of the layer, and answers the same.
+    let before = attached.stats();
+    assert_eq!(
+        crate::attached::in_place(&mut attached, layer, lp, 3),
+        Ok(at as u64)
+    );
+    assert_eq!(attached.stats(), before);
+    assert_eq!(attached.disk_ref().region(), &region);
+    // The sparse file: three pages of hole, then two of data, then a tail of zeros.
+    let (_, sparse) = found(&mut attached, b"/sparse");
+    assert_eq!(sparse.run_of(0, 5), None, "a hole is no page of the layer");
+    assert!(sparse.run_of(3, 2).is_some());
+    // A page changed in the region is refused when it is mapped, not given.
+    let mut changed = region.clone();
+    changed[at + 4096 + 7] ^= 0xff;
+    let (mut bad, _) = crate::attached::attach(changed, spans.clone(), 64).unwrap();
+    assert!(matches!(
+        crate::attached::in_place(&mut bad, layer, lp, 3),
+        Err(Error::Corrupt(_))
+    ));
+    // Pages past the layer, none, or no layer at all.
+    let past = spans[layer].pages;
+    assert_eq!(
+        crate::attached::in_place(&mut attached, layer, past, 1),
+        Err(Error::BadRange)
+    );
+    assert_eq!(
+        crate::attached::in_place(&mut attached, layer, 0, 0),
+        Err(Error::BadRange)
+    );
+    assert!(matches!(
+        crate::attached::in_place(&mut attached, 9, 0, 1),
+        Err(Error::Io(_))
+    ));
+}
