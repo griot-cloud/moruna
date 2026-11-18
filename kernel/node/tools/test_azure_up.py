@@ -11,6 +11,9 @@ would; one that is never to be called fails the test if it is.
   address that is not IPv4, and a group that already exists, before anything runs.
 - A run that goes well checks the node and deletes the group; one that fails part-way deletes it
   too.
+- `--data-disk` makes an empty 4 GiB StandardSSD disk the machine takes at LUN 0, and prints the
+  console's storvsc lines at the end; `--job` runs a rows-to-count job through the API, follows
+  its events to its exit, and checks exit 0, the sink's 10,000,000 rows, and prints the wall time.
 
 Run: python3 -I kernel/node/tools/test_azure_up.py
 """
@@ -76,6 +79,57 @@ az group list --subscription griot-dev --query "[?starts_with(name, 'moruna-node
 az network watcher list --subscription griot-dev -o table
 """.splitlines()
 
+DATA_DISK = ("az disk create -n moruna-node-data -g moruna-node-name -l centralindia --zone 3 --size-gb 4 "
+             "--sku StandardSSD_LRS --subscription griot-dev -o none")
+DATA_DISK_LINES = "tr -d '\\r' < RUNDIR/console.log | grep -a -e 'storvsc: ' -e 'storvsc-check: '"
+AUTH = 'Authorization: Bearer $(cat RUNDIR/job-token)'
+JOB = [
+    "printf '%s' '{\"v1\":{\"moruna_spec\":1,\"source\":{\"kind\":\"rows\",\"rows\":10000000},"
+    "\"sink\":{\"kind\":\"count\"}}}' > RUNDIR/job.json",
+    "printf '{\"aud\":\"%s\",\"exp\":%s,\"scope\":[\"submit\"]}' \"$(cat RUNDIR/instance)\" "
+    "\"$(( $(date -u +%s) + 1800 ))\" | openssl base64 -A | tr '/+' '_-' | tr -d '=' > RUNDIR/job-token.claims",
+    "printf '%s.%s' \"$(cat RUNDIR/token.header)\" \"$(cat RUNDIR/job-token.claims)\" > RUNDIR/job-token.signed",
+    "openssl pkeyutl -sign -inkey RUNDIR/token-key.pem -rawin -in RUNDIR/job-token.signed | openssl base64 -A "
+    "| tr '/+' '_-' | tr -d '=' > RUNDIR/job-token.signature",
+    "printf '%s.%s\\n' \"$(cat RUNDIR/job-token.signed)\" \"$(cat RUNDIR/job-token.signature)\" > RUNDIR/job-token",
+    f"curl -sS -k --max-time 60 -H \"{AUTH}\" -H 'Content-Type: application/json' --data-binary @RUNDIR/job.json "
+    "\"https://$(cat RUNDIR/address)/v1/jobs/validate\" > RUNDIR/job-validate.json && cat RUNDIR/job-validate.json "
+    "&& grep -q '\"ok\":true' RUNDIR/job-validate.json",
+    f"curl -sS -k --max-time 60 -o RUNDIR/job-submit.json -w '%{{http_code}}' -H \"{AUTH}\" "
+    "-H 'Content-Type: application/json' --data-binary @RUNDIR/job.json \"https://$(cat RUNDIR/address)/v1/jobs\" "
+    "> RUNDIR/job-submit.code && [ \"$(cat RUNDIR/job-submit.code)\" = 201 ] && grep -o '\"id\":\"[^\"]*\"' "
+    "RUNDIR/job-submit.json | head -1 | cut -d'\"' -f4 > RUNDIR/job.id && [ -s RUNDIR/job.id ]",
+    f"curl -sS -k -N --max-time 600 -H \"{AUTH}\" \"https://$(cat RUNDIR/address)/v1/jobs/$(cat RUNDIR/job.id)/events\" "
+    "> RUNDIR/job-events.txt; grep -a '^data: ' RUNDIR/job-events.txt | grep -a '\"type\":\"exit\"' | tail -1 "
+    "| cut -c7- > RUNDIR/job-exit.json && cat RUNDIR/job-exit.json && grep -q '\"code\":0[,}]' RUNDIR/job-exit.json",
+    f"curl -sS -k --max-time 60 -H \"{AUTH}\" \"https://$(cat RUNDIR/address)/v1/jobs/$(cat RUNDIR/job.id)/report\" "
+    "> RUNDIR/job-report.json && grep -o '\"sinks\":\\[{[^]]*' RUNDIR/job-report.json | grep -o '\"rows\":[0-9]*' "
+    "| head -1 | cut -d: -f2 > RUNDIR/job.rows && [ \"$(cat RUNDIR/job.rows)\" = 10000000 ]",
+    "grep -o '\"wall_s\":[0-9.eE+-]*' RUNDIR/job-report.json | head -1 | cut -d: -f2 > RUNDIR/job.wall "
+    "&& [ -s RUNDIR/job.wall ] && printf 'job: %s rows counted, wall_s %s\\n' \"$(cat RUNDIR/job.rows)\" "
+    "\"$(cat RUNDIR/job.wall)\"",
+]
+
+
+def with_options(data_disk: bool, job: bool):
+    """The dry run's commands with `--data-disk` or `--job`: the base list with theirs put in."""
+    lines = []
+    for line in DRY_RUN:
+        if data_disk and line.startswith("az vm create "):
+            line = line.replace("--user-data RUNDIR/node-config.json --no-wait",
+                                "--user-data RUNDIR/node-config.json --attach-data-disks moruna-node-data --no-wait")
+        lines.append(line)
+        if data_disk and line.startswith("az disk create -n moruna-node-os "):
+            lines.append(DATA_DISK)
+        if job and "/v1/node\"" in line:
+            lines += JOB
+        if data_disk and line.startswith("az vm boot-diagnostics get-boot-log ") and "for _ in" not in line:
+            lines.append(DATA_DISK_LINES)
+    return lines
+
+
+DRY_RUN_OPTIONS = with_options(True, True)
+
 # The stand-ins. Each records its call in STUB_LOG, the storage key it was given beside `az`'s.
 AZ = r"""#!/bin/sh
 { printf 'az'; for a in "$@"; do printf ' %s' "$a"; done; printf ' |key=%s\n' "${AZURE_STORAGE_KEY:-}"; } >> "$STUB_LOG"
@@ -105,8 +159,15 @@ esac
 """
 CURL = r"""#!/bin/sh
 echo "curl $*" >> "$STUB_LOG"
+out=""
+previous=""
+for argument in "$@"; do [ "$previous" = -o ] && out="$argument"; previous="$argument"; done
 case "$*" in
   */v1/health*) printf 200 ;;
+  */v1/jobs/validate*) printf '{"ok":true}' ;;
+  */events*) printf 'id: 1\nevent: event\ndata: {"type":"event","kind":"attempt_started"}\n\nevent: heartbeat\ndata: {"type":"heartbeat","rows_out":5000000}\n\nevent: report\ndata: {"type":"report","report":{"sinks":[{"sink":0,"rows":%s}]}}\n\nevent: exit\ndata: {"type":"exit","code":%s,"diagnostic":null}\n\n' "${STUB_ROWS:-10000000}" "${STUB_EXIT:-0}" ;;
+  */report*) printf '{"run_id":"0123456789abcdef0123456789abcdef","wall_s":2.5,"stages":[{"name":"count","rows":3}],"sinks":[{"sink":0,"rows":%s,"bytes":0,"files":[],"snapshot_id":null,"version":null}]}' "${STUB_ROWS:-10000000}" ;;
+  */v1/jobs*) printf '{"id":"0123456789abcdef0123456789abcdef"}' > "$out"; printf 201 ;;
   */v1/node*) printf '{"version":"0.7.0","cloud":"azure"}' ;;
 esac
 """
@@ -169,8 +230,19 @@ class AzureUp(unittest.TestCase):
         self.assertFalse((self.root / "RUNDIR").exists())
         self.assertEqual(done.stderr, "")
 
+    def test_a_dry_run_with_both_options_prints_their_commands_too(self):
+        self.stubs(az=NEVER, openssl=NEVER, curl=NEVER, nc=NEVER)
+        done = self.run_script(*self.arguments("--data-disk", "--job", "--dry-run"))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.splitlines(), DRY_RUN_OPTIONS)
+        self.assertEqual(self.calls(), [])
+        # Each option alone adds its own commands and nothing else.
+        for option, expected in (("--data-disk", with_options(True, False)), ("--job", with_options(False, True))):
+            done = self.run_script(*self.arguments(option, "--dry-run"))
+            self.assertEqual(done.stdout.splitlines(), expected, option)
+
     def test_every_az_command_names_the_subscription_and_the_run_group(self):
-        for line in DRY_RUN:
+        for line in DRY_RUN_OPTIONS:
             # As many subscriptions as `az` commands on the line, each griot-dev.
             self.assertEqual(len(re.findall(r"(?:^|[\s(])az ", line)), line.count("--subscription griot-dev"), line)
             self.assertEqual(line.count("--subscription"), line.count("--subscription griot-dev"), line)
@@ -185,7 +257,7 @@ class AzureUp(unittest.TestCase):
         placeholders = [("RUNDIR", "<RUN>"), ("OUTDIR/", "<OUT>/"), (GROUP, "<NAME>"), ("mrnnodename", "<ACCOUNT>"),
                         ("192.0.2.1", "<FROM>")]
         script = []
-        for line in DRY_RUN:
+        for line in DRY_RUN + [line for line in DRY_RUN_OPTIONS if line not in DRY_RUN]:
             for value, placeholder in placeholders:
                 line = line.replace(value, placeholder)
             script.append(line)
@@ -308,6 +380,64 @@ class AzureUp(unittest.TestCase):
                          ["nc -vz -w 5 203.0.113.7 443", "nc -vz -w 5 203.0.113.7 22"])
         self.assertEqual((run / "instance").read_text().strip(), INSTANCE)
         self.assertEqual((run / "served.pin").read_text(), (run / "console.pin").read_text())
+
+    def test_a_data_disk_is_made_and_taken_at_lun_0(self):
+        self.stubs(az=AZ, openssl=OPENSSL, curl=CURL, nc=NC)
+        done = self.run_script(*self.arguments("--data-disk"))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        az = [call.split(" |key=")[0] for call in self.calls() if call.startswith("az ")]
+        disks = [call for call in az if call.startswith("az disk create")]
+        self.assertEqual(disks[1], DATA_DISK)
+        vm = next(call for call in az if call.startswith("az vm create"))
+        self.assertIn(" --attach-data-disks moruna-node-data --no-wait ", vm)
+        self.assertLess(az.index(disks[1]), az.index(vm), "the disk is made before the machine takes it")
+
+    def test_a_job_runs_through_the_api_to_its_exit_and_its_rows_are_counted(self):
+        self.stubs(az=AZ, openssl=OPENSSL, curl=CURL, nc=NC)
+        started = time.time()
+        done = self.run_script(*self.arguments("--job"))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("job: 10000000 rows counted, wall_s 2.5\n", done.stdout)
+        self.assertRegex(done.stdout, r"create-to-ready \d+ s, boot_ms 2140, job wall_s 2.5\n$")
+        run = self.root / "RUNDIR"
+        self.assertEqual(json.loads((run / "job.json").read_text()),
+                         {"v1": {"moruna_spec": 1, "source": {"kind": "rows", "rows": 10000000},
+                                 "sink": {"kind": "count"}}})
+        # The job's token: for submit, the node's instance, 30 minutes.
+        header, claims, _ = (run / "job-token").read_text().strip().split(".")
+        decode = lambda part: json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+        self.assertEqual(decode(header), {"alg": "EdDSA", "typ": "JWT"})
+        claims = decode(claims)
+        self.assertEqual((claims["aud"], claims["scope"]), (INSTANCE, ["submit"]))
+        self.assertTrue(started + 1790 <= claims["exp"] <= time.time() + 1810)
+        job = [call for call in self.calls() if call.startswith("curl ") and "/v1/jobs" in call]
+        self.assertEqual([call.split()[-1] for call in job], [
+            "https://203.0.113.7/v1/jobs/validate",
+            "https://203.0.113.7/v1/jobs",
+            "https://203.0.113.7/v1/jobs/0123456789abcdef0123456789abcdef/events",
+            "https://203.0.113.7/v1/jobs/0123456789abcdef0123456789abcdef/report",
+        ])
+        token = (run / "job-token").read_text().strip()
+        self.assertTrue(all(f"Authorization: Bearer {token}" in call for call in job))
+        self.assertIn("--data-binary @RUNDIR/job.json", job[0])
+        self.assertIn(" -N ", job[2], "the events are read as they come")
+        self.assertEqual((run / "job.id").read_text().strip(), "0123456789abcdef0123456789abcdef")
+        self.assertEqual(json.loads((run / "job-exit.json").read_text()),
+                         {"type": "exit", "code": 0, "diagnostic": None})
+
+    def test_a_job_that_fails_or_counts_short_fails_the_run_and_deletes_the_group(self):
+        for extra in ({"STUB_EXIT": "1"}, {"STUB_EXIT": "10"}, {"STUB_ROWS": "9999999"}):
+            self.log.write_text("")
+            run = self.root / "RUNDIR"
+            if run.exists():
+                for path in sorted(run.iterdir()):
+                    path.unlink()
+                run.rmdir()
+            self.stubs(az=AZ, openssl=OPENSSL, curl=CURL, nc=NC)
+            done = self.run_script(*self.arguments("--job"), extra=extra)
+            self.assertEqual(done.returncode, 1, (extra, done.stderr))
+            self.assertNotIn("create-to-ready", done.stdout)
+            self.assertTrue(any(call.startswith(f"az group delete -n {GROUP} --yes") for call in self.calls()))
 
     def test_a_served_certificate_that_is_not_the_consoles_fails_and_deletes_the_group(self):
         self.stubs(az=AZ, openssl=OPENSSL.replace("$STUB_PIN *stdin", "0000 *stdin"), curl=CURL, nc=NC)
