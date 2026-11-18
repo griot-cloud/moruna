@@ -149,3 +149,76 @@ fn ct_t11_features_cost() {
         );
     }
 }
+
+/// f.2: a column's bytes are what its own buffers cover, whatever allocation they are part of.
+/// The columns of a record decoded where it lies are slices of the one record: they sum to
+/// about the record (less its framing and its buffers' padding to pages), not to the record
+/// once for each buffer, which is Arrow's count of each column (6.3k).
+#[test]
+fn ct_t11_a_column_s_bytes_are_what_its_own_buffers_cover() {
+    const ROWS: usize = 4096;
+    const PAGE: usize = 4096;
+    let alloc = FakeAllocator::new();
+    // An `int64` column, a `double` with every eighth row null, and a string of three bytes.
+    let ids: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(0..ROWS as i64));
+    let fares: ArrayRef = Arc::new(arrow::array::Float64Array::from_iter(
+        (0..ROWS).map(|r| (r % 8 != 0).then_some(r as f64)),
+    ));
+    let codes: ArrayRef = Arc::new(arrow::array::StringArray::from_iter_values(
+        (0..ROWS).map(|r| ["JFK", "LGA", "EWR"][r % 3]),
+    ));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("fare", DataType::Float64, true),
+        Field::new("code", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(schema, vec![ids, fares, codes]).expect("batch");
+    // Each column's own bytes: 8 a row; 8 a row and a bit a row; 4 a row and one more offset,
+    // and 3 a row.
+    let own = vec![
+        (ROWS * 8) as u64,
+        (ROWS * 8 + ROWS / 8) as u64,
+        ((ROWS + 1) * 4 + ROWS * 3) as u64,
+    ];
+    let heap = MorselFeatures::from_payload(&Payload::table(batch.clone()).expect("table"));
+    assert_eq!(heap.column_bytes, own, "over buffers of its own");
+
+    // The same batch as a record, decoded where it lies: one allocation under every buffer.
+    let (framing, bodies) =
+        moruna_kernel::ipc::encode_framing(&batch, PAGE, 0, &alloc).expect("the framing");
+    let end = bodies
+        .iter()
+        .map(|(offset, body)| offset + body.len())
+        .max()
+        .expect("a body");
+    let mut record = alloc.buffer(end.div_ceil(PAGE) * PAGE, Tier::Host);
+    record[..framing.len()].copy_from_slice(&framing);
+    for (offset, body) in &bodies {
+        record[*offset..*offset + body.len()].copy_from_slice(body.as_slice());
+    }
+    let record = record.into_arrow_buffer().expect("the record");
+    let length = record.len() as u64;
+    let decoded = moruna_kernel::ipc::decode(record, PAGE).expect("the record decodes");
+    assert_eq!(decoded, batch);
+    let payload = Payload::table(decoded.clone()).expect("table");
+    let in_place = MorselFeatures::from_payload(&payload);
+    assert_eq!(in_place.column_bytes, own, "decoded where it lies");
+    let columns: u64 = in_place.column_bytes.iter().sum();
+    // Five buffers and the framing, each at most a page short of the record.
+    assert!(
+        columns <= length && length - columns <= 6 * PAGE as u64,
+        "the columns' {columns} bytes are about the record's {length}"
+    );
+    assert!(
+        in_place.bytes >= length && in_place.bytes < length + PAGE as u64,
+        "and the batch counts the record once: {} bytes",
+        in_place.bytes
+    );
+    // Arrow's count of each column is the record for each of its buffers: one, two, two.
+    let arrow: Vec<u64> = decoded
+        .columns()
+        .iter()
+        .map(|c| c.get_array_memory_size() as u64 / length)
+        .collect();
+    assert_eq!(arrow, vec![1, 2, 2]);
+}
