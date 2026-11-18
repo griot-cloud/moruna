@@ -11,7 +11,21 @@ from typing import Any
 
 import pytest
 
-STANDIN = Path(__file__).resolve().parents[1] / "moruna" / "_standin.py"
+
+def _standin_path() -> Path:
+    """``_standin.py`` beside the ``moruna`` package under test: the installed one when the suite
+    runs against a wheel from a copy of the tests (the gate's ``python_tests.sh``), else the
+    tree's. Found without importing the package."""
+    spec = importlib.util.find_spec("moruna")
+    locations = spec.submodule_search_locations if spec is not None else None
+    for location in locations or []:
+        candidate = Path(location) / "_standin.py"
+        if candidate.is_file():
+            return candidate
+    return Path(__file__).resolve().parents[1] / "moruna" / "_standin.py"
+
+
+STANDIN = _standin_path()
 
 
 def standin() -> types.ModuleType:
