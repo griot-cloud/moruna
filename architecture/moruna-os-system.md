@@ -765,8 +765,14 @@ There are two kinds:
 - **The SDK** keeps `@moruna.source`, `@moruna.function` and `@moruna.sink` (SDD 12). It gains
   `moruna.register(fn, client)`: build the image, sign it with the operator's key, upload it to
   object storage the node can read, and register it through `moruna.api` (2E).
-- **What registration takes for an image function:** the image as one file, the existing layer
-  archive, named by the address and SHA-256 of 3E.
+- **What registration takes for an image function:** one file, a **Moruna image archive** that
+  `moruna.register` makes on the client: an index (manifest, config, digests, each layer's offset,
+  length and seal) and Moruna's own sealed layer files at page-aligned offsets. The node converts
+  nothing: `node-admission` hands the engine the archive as a read-only memory object, and `imagefs`
+  attaches its layers in place (memory-backed, seals checked at mount); the task runs on that view
+  as its root (`run_plane`'s `root`). A native function's file is its ELF, mapped in place. Which
+  it is, is decided by content; anything else is refused. The engine's slots are `function.N` plus
+  a `functions` index (`N NAME SHA256 SIZE`), at most 16 per job.
 
 ### Work items
 
