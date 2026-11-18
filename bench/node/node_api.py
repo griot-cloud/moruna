@@ -6,12 +6,13 @@
   names Homebrew's (`OPENSSL`).
 - **Pinning:** the node's certificate is accepted when its DER's SHA-256 is the fingerprint the
   console printed (`moruna: tls sha256=<hex>`), as `moruna.api.Client` does.
-- **A job:** `POST /v1/jobs` with `{"v1": <job document>}`, `GET /v1/jobs/{id}` until it ends,
-  then its events (`GET /v1/jobs/{id}/events`) and its report (`GET /v1/jobs/{id}/report`).
+- **A job:** `POST /v1/jobs` with `{"v1": <job document>}`; its events, its report and its exit
+  over Server-Sent Events (`GET /v1/jobs/{id}/events`, `Https.stream`); proof.py makes the
+  document and follows the stream, for itself and for run.py.
 
-Operational time is the job's first rows to its output written: the first rows are the sink's
-task starting (its event's `t_us`), else the first heartbeat with rows out, as
-bench/vm/report.py's `first_rows` reads a 0.7 run; the output is written when the job ends.
+The first rows at the sink (`first_rows_s`: the sink's task starting, its event's `t_us`, else
+the first heartbeat with rows out, as bench/vm/report.py's `first_rows` reads a 0.7 run) are kept
+among a run's marks; operational time is the report's `wall_ms` (run.py).
 """
 import base64
 import hashlib
@@ -251,18 +252,3 @@ def first_rows_s(events):
         if beat is None and e.get("type") == "heartbeat" and (e.get("rows_out") or 0) > 0:
             beat = e["t_ms"] / 1e3
     return beat
-
-
-PENDING = ("the source and sink URLs are Blob's as item 3.5 will read them, the native task is named "
-           "as bench/vm/gate_jobs.py names it (how a job names a registered function, 3E, is item "
-           "3.6's), and the job record's times are read as `accepted` and `ended` (item 3.2 names "
-           "them): this follows them when 3.2, 3.5 and 3.6 merge")
-
-
-def job_document(workload, data_urls, out_url, image, cpus, mem_gib):
-    """The benchmark's job on the node: bench/vm/gate_jobs.py's document (Parquet source, the
-    job's function as a native task, Parquet sink), reading and writing Blob. See PENDING."""
-    import sys
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vm"))
-    import gate_jobs
-    return gate_jobs.document(workload, data_urls, out_url, image, cpus=cpus, mem_gib=mem_gib)

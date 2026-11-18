@@ -4,11 +4,11 @@ Everything is made in one resource group of subscription `griot-dev` in Central 
 `moruna-bench-<date>`, and the group is deleted at the end. Every command names the subscription
 and that group, so none can touch another (`guard` checks it).
 
-The Moruna node's steps follow item 1.7b's boot on Azure (a page blob, a Generation 2 managed disk
-from it, a `Standard` security type, accelerated networking off, boot diagnostics turned on and
-the machine restarted so its console is read from power-on), with node config as user-data and an
-inbound rule for 443 only (1E). Item 1.13 writes them as `kernel/node/AZURE.md`; where that
-recipe differs, it wins and this file follows it.
+The Moruna node's steps are `kernel/node/AZURE.md`'s (item 1.13), as `azure-up.sh --proof` runs
+them: a page blob, a Generation 2 managed disk from it, a static address, a network security group
+admitting TCP 443 from the operator's address alone (1E), and the machine (`Standard` security
+type, accelerated networking off, boot diagnostics into the run's account from the first
+power-on, so it is never restarted, node config as user-data), made with `--no-wait`.
 
 The Linux machine for the other engines is the node's size in the node's zone, with the same
 network settings; it has no inbound rule at all and is driven only through `az vm run-command`.
@@ -20,7 +20,8 @@ import shlex
 
 SUBSCRIPTION = "griot-dev"
 LOCATION = "centralindia"
-CONTAINERS = ("vhds", "data", "code", "results")
+# `functions` holds the gate tasks the node fetches by their SAS address (3E), as the proof does.
+CONTAINERS = ("vhds", "data", "code", "functions", "results")
 NODE, LINUX = "moruna-node", "bench-linux"
 
 
@@ -99,32 +100,38 @@ def account_id(c: Cloud):
     return c.az("storage", "account", "show", "-n", c.account, "--query", "id", "-o", "tsv")
 
 
-def nsgs(c: Cloud):
-    """The node's group admits TCP 443 and nothing else; the Linux machine's admits nothing."""
+def nsgs(c: Cloud, operator: str):
+    """The node's group admits TCP 443 from the operator's address alone (AZURE.md, step 5); the
+    Linux machine's admits nothing."""
     return [c.az("network", "nsg", "create", "-n", f"{NODE}-nsg", "-l", c.location, "-o", "none"),
-            c.az("network", "nsg", "rule", "create", "--nsg-name", f"{NODE}-nsg", "-n", "api-443",
+            c.az("network", "nsg", "rule", "create", "--nsg-name", f"{NODE}-nsg", "-n", "https-from-operator",
                  "--priority", "100", "--direction", "Inbound", "--access", "Allow", "--protocol", "Tcp",
-                 "--destination-port-ranges", "443", "-o", "none"),
+                 "--source-address-prefixes", f"{operator}/32", "--source-port-ranges", "*",
+                 "--destination-address-prefixes", "*", "--destination-port-ranges", "443", "-o", "none"),
             c.az("network", "nsg", "create", "-n", f"{LINUX}-nsg", "-l", c.location, "-o", "none")]
 
 
+def node_ip(c: Cloud):
+    """The node's static address, made before the machine (AZURE.md, step 5)."""
+    return c.az("network", "public-ip", "create", "-n", f"{NODE}-ip", "-l", c.location, "--zone", c.zone,
+                "--sku", "Standard", "--allocation-method", "Static", "--version", "IPv4", "-o", "none")
+
+
+def node_address(c: Cloud):
+    return c.az("network", "public-ip", "show", "-n", f"{NODE}-ip", "--query", "ipAddress", "-o", "tsv")
+
+
 def node_vm(c: Cloud, user_data: str):
+    """AZURE.md, step 6: boot diagnostics into the run's account from the first power-on, so the
+    machine is never restarted, and `--no-wait`: the command returns when Azure has taken it."""
     return c.az("vm", "create", "-n", NODE, "-l", c.location, "--attach-os-disk", f"{NODE}-os", "--os-type", "linux",
                 "--size", c.size, "--zone", c.zone, "--security-type", "Standard", "--accelerated-networking", "false",
-                "--public-ip-sku", "Standard", "--nsg", f"{NODE}-nsg", "--user-data", user_data, "-o", "none")
-
-
-def boot_diagnostics(c: Cloud):
-    return [c.az("vm", "boot-diagnostics", "enable", "-n", NODE, "-o", "none"),
-            c.az("vm", "restart", "-n", NODE, "-o", "none")]
+                "--public-ip-address", f"{NODE}-ip", "--nsg", f"{NODE}-nsg", "--boot-diagnostics-storage", c.account,
+                "--user-data", user_data, "--no-wait", "-o", "none")
 
 
 def boot_log(c: Cloud):
     return c.az("vm", "boot-diagnostics", "get-boot-log", "-n", NODE)
-
-
-def public_ip(c: Cloud, vm: str):
-    return c.az("vm", "show", "-d", "-n", vm, "--query", "publicIps", "-o", "tsv")
 
 
 def linux_vm(c: Cloud, ssh_public_key: str):

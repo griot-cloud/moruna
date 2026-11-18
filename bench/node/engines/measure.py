@@ -291,8 +291,13 @@ def record(spec, rid, results, rec):
     rec["id"] = rid
     rec["host"] = {"platform": sys.platform, "cpus": os.cpu_count()}
     json.dump(rec, open(os.path.join(results, f"{rid}.json"), "w"), default=str, indent=1)
-    brief = {k: rec.get(k) for k in ("id", "ok", "exit_code", "startup_s", "operational_s", "cpu_s", "peak_bytes")}
-    brief["output"] = (rec.get("output_check") or {}).get("verdict")
+    # What the table needs (run.py keeps it as the run's live record): a few hundred bytes, inside
+    # the 4 KiB of output run-command returns.
+    brief = {k: rec.get(k) for k in ("id", "ok", "exit_code", "startup_s", "operational_s", "cpu_s", "peak_bytes",
+                                     "oom_kills", "memory_gib", "data", "copy_in_s", "copy_out_s")}
+    check = rec.get("output_check") or {}
+    brief["output"] = check.get("verdict")
+    brief["check"] = {k: check[k] for k in ("ok", "hash_all", "max_abs", "verdict") if k in check}
     print("MEASURED " + json.dumps(brief, default=str), flush=True)
     return rec
 

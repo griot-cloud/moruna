@@ -8,19 +8,39 @@ the bar's two steps for Moruna, judged on operational time as bench/vm/report.py
 2. **The bar:** at least 1.5 times the best other engine's operational time, with CPU-seconds no
    more than the least of any other row.
 
-A miss names the stage of Moruna's split that takes the most time: 6C's first step.
+A miss gives Moruna's time split (read, decode, the function, encode, write, waits) and names the
+stage that takes the most time: 6C's first step.
 """
 import os
 
 TARGET = 1.5
 ZERO_SIX = ("moruna066", "moruna066-rust")
 NODE = "moruna-node"
-STAGES = {"read_decode_s": "read and decode", "function_s": "the function", "encode_write_s": "encode and write",
-          "wait_s": "waits"}
+STAGES = {"read_s": "read", "decode_s": "decode", "function_s": "the function", "encode_s": "encode",
+          "write_s": "write", "wait_s": "waits", "read_decode_s": "read and decode",
+          "encode_write_s": "encode and write"}
+# The table's split columns: each stage, or the joined stage an engine's report gives in its place.
+COLUMNS = (("Read s", "read_s", "read_decode_s"), ("Decode s", "decode_s", None),
+           ("Function s", "function_s", None), ("Encode s", "encode_s", None),
+           ("Write s", "write_s", "encode_write_s"), ("Waits s", "wait_s", None))
 
 
 def fmt(x, nd=1):
     return "" if x is None else f"{x:.{nd}f}"
+
+
+def split_cell(split, key, joint):
+    if split.get(key) is not None:
+        return fmt(split[key])
+    if joint and split.get(joint) is not None:
+        return f"{fmt(split[joint])} ({STAGES[joint]})"
+    return ""
+
+
+def split_text(split):
+    """The split in words, its stages in 6C's order: `read 6.0 s, decode 1.0 s, ...`."""
+    order = ("read_s", "read_decode_s", "decode_s", "function_s", "encode_s", "encode_write_s", "write_s", "wait_s")
+    return ", ".join(f"{STAGES[k]} {split[k]:.1f} s" for k in order if (split or {}).get(k) is not None)
 
 
 def losing_stage(row):
@@ -67,7 +87,8 @@ def verdicts(engines: dict) -> list:
     if not all(v["passed"] for v in out if v["passed"] is not None):
         stage, secs = losing_stage(node)
         out.append({"step": "where", "passed": None,
-                    "text": f"the stage that loses most: {stage}, {secs:.1f} s" if stage else
+                    "text": f"the stage that loses most: {stage}, {secs:.1f} s, of the split: "
+                            f"{split_text(node.get('split'))}" if stage else
                             "the stage that loses most: unknown, the report has no split"})
     return out
 
@@ -76,32 +97,37 @@ def render(summary: dict) -> str:
     out = []
     for job, j in summary["jobs"].items():
         out.append(f"### {job}\n")
-        out.append("| Engine | Function | Operational s | Start-up s | CPU s | Peak GiB | Memory given GiB | Data "
-                   "| Read+decode s | Function s | Encode+write s | Waits s | Output against 0.6.6 | Runs ok |")
-        out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+        out.append("| Engine | Function | Operational s | Start-up s | CPU s | Peak GiB | Memory given GiB | Data | "
+                   + " | ".join(c[0] for c in COLUMNS) + " | Output against 0.6.6 | Runs ok |")
+        out.append("|" + " --- |" * (10 + len(COLUMNS)))
         for r in j["engines"].values():
-            s = r["split"]
+            s = r.get("split") or {}
             data = r.get("data") or ""
             if "local copy" in data:
                 data += f", {fmt(r.get('copy_s'))} s apart"
-            out.append(f"| {r['label']} | {r['function']} | {fmt(r['operational_s'])} | {fmt(r['startup_s'], 2)} | "
+            startup = fmt(r["startup_s"], 2)
+            if startup and r.get("startup_within_s"):
+                startup += f" (±{r['startup_within_s']} s)"
+            out.append(f"| {r['label']} | {r['function']} | {fmt(r['operational_s'])} | {startup} | "
                        f"{fmt(r['cpu_s'])} | {fmt(r['peak_gib'], 2)} | {fmt(r.get('memory_gib'), 2)} | {data} | "
-                       f"{fmt(s['read_decode_s'])} | {fmt(s['function_s'])} | {fmt(s['encode_write_s'])} | "
-                       f"{fmt(s['wait_s'])} | {r['output']} | {r['ok']}/{r['runs']} |")
+                       + " | ".join(split_cell(s, k, joint) for _, k, joint in COLUMNS)
+                       + f" | {r['output']} | {r['ok']}/{r['runs']} |")
         out.append("")
         out.extend(f"- {v['text']}" for v in verdicts(j["engines"]))
         n = j.get("noise") or {}
         if n.get("spread") is not None:
             out.append(f"- noise: 0.6.6 against itself, {n['runs']} runs, spread {n['spread']:.1%} of the median")
         out.append("")
-    out.append("Operational time runs from the job's being handed to a ready engine (Moruna: `POST /v1/jobs` "
-               "answered; the others: the call that starts the job, after the session or cluster is up) to the "
-               "output durably written in Blob. Start-up is Moruna's boot-to-ready and the others' process "
-               "start, imports and session or cluster. Every engine reads and writes the run's one Blob "
-               "container with its own reader inside operational time; a row marked `local copy` has no Blob "
-               "reader, and its copies are timed apart. Memory given is what each platform leaves on the same "
-               "machine: the node's memory less 768 MiB for Moruna, the plan's figure on Linux. Medians of the "
-               "measured repeats; the learning run and the noise pairs are left out.")
+    out.append("Operational time is each engine's own wall on the machine that ran it, from the job handed "
+               "to the ready engine to the output durably written in Blob: Moruna's report's `wall_ms`; the "
+               "others' own timer on the Linux machine, from the call that starts the job, after the session or "
+               "cluster is up. Start-up is Moruna's job record from `submitted` to `started`, in whole seconds "
+               "(so within 1 s), and the others' process start, imports and session or cluster. Every engine "
+               "reads and writes the run's one Blob container with its own reader inside operational time; a "
+               "row marked `local copy` has no Blob reader, and its copies are timed apart. Memory given is "
+               "what each platform leaves a job on the same machine: the node's job bound (`job_memory_bytes`, "
+               "3A) for Moruna, the plan's figure on Linux. Medians of the measured repeats; the learning run "
+               "and the noise pairs are left out.")
     return "\n".join(out)
 
 
