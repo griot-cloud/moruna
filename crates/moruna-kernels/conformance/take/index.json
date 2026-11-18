@@ -1,0 +1,621 @@
+{
+  "format": "moruna-kernel-corpus/1",
+  "kernel": "moruna.take",
+  "cases": [
+    {
+      "name": "fixed_values",
+      "version": 1,
+      "tests": [
+        "params",
+        "ordering"
+      ],
+      "about": "With values fixed at configure, row i of the output is the value at index row i, an index may repeat, and the output is named and typed as the values.",
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "idx.in.arrow"
+        }
+      ],
+      "expected": "idx.expected.arrow"
+    },
+    {
+      "name": "nulls",
+      "version": 1,
+      "tests": [
+        "nulls"
+      ],
+      "about": "A null index entry gives a null, and an entry that selects a null value gives a null.",
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "idx_nulls.in.arrow"
+        }
+      ],
+      "expected": "idx_nulls.expected.arrow"
+    },
+    {
+      "name": "sliced_index",
+      "version": 1,
+      "tests": [
+        "sliced",
+        "nulls"
+      ],
+      "about": "An index whose array starts at row 1 of its buffers is read from its own first row.",
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "idx_nulls.in.arrow",
+          "slice": [
+            1,
+            3
+          ]
+        }
+      ],
+      "expected": "sliced_index.expected.arrow"
+    },
+    {
+      "name": "sliced_values",
+      "version": 1,
+      "tests": [
+        "sliced"
+      ],
+      "about": "Values whose array starts at row 3 of their buffers are numbered from their own first row.",
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow",
+          "slice": [
+            3,
+            4
+          ]
+        }
+      },
+      "inputs": [
+        {
+          "file": "idx_small.in.arrow"
+        }
+      ],
+      "expected": "sliced_values.expected.arrow"
+    },
+    {
+      "name": "empty_index",
+      "version": 1,
+      "tests": [
+        "empty"
+      ],
+      "about": "An index of zero rows gives zero rows.",
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "idx.in.arrow",
+          "slice": [
+            0,
+            0
+          ]
+        }
+      ],
+      "expected": "empty.expected.arrow"
+    },
+    {
+      "name": "no_batches",
+      "version": 1,
+      "tests": [
+        "empty"
+      ],
+      "about": "No index batches give no output.",
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "none.in.arrow"
+        }
+      ],
+      "expected": "none.expected.arrow"
+    },
+    {
+      "name": "nulls_over_no_values",
+      "version": 1,
+      "tests": [
+        "nulls",
+        "empty"
+      ],
+      "about": "An index of nulls alone over no values gives nulls: a null entry is never out of range.",
+      "arrays": {
+        "values": {
+          "file": "no_values.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "all_null.in.arrow"
+        }
+      ],
+      "expected": "all_null.expected.arrow"
+    },
+    {
+      "name": "index_int8",
+      "version": 1,
+      "tests": [
+        "params",
+        "nulls"
+      ],
+      "about": "An index of type int8 gathers as any other.",
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "index_int8.in.arrow"
+        }
+      ],
+      "expected": "index_int8.expected.arrow"
+    },
+    {
+      "name": "index_int16",
+      "version": 1,
+      "tests": [
+        "params",
+        "nulls"
+      ],
+      "about": "An index of type int16 gathers as any other.",
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "index_int16.in.arrow"
+        }
+      ],
+      "expected": "index_int16.expected.arrow"
+    },
+    {
+      "name": "index_int64",
+      "version": 1,
+      "tests": [
+        "params",
+        "nulls"
+      ],
+      "about": "An index of type int64 gathers as any other.",
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "index_int64.in.arrow"
+        }
+      ],
+      "expected": "index_int64.expected.arrow"
+    },
+    {
+      "name": "index_uint8",
+      "version": 1,
+      "tests": [
+        "params",
+        "nulls"
+      ],
+      "about": "An index of type uint8 gathers as any other.",
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "index_uint8.in.arrow"
+        }
+      ],
+      "expected": "index_uint8.expected.arrow"
+    },
+    {
+      "name": "index_uint16",
+      "version": 1,
+      "tests": [
+        "params",
+        "nulls"
+      ],
+      "about": "An index of type uint16 gathers as any other.",
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "index_uint16.in.arrow"
+        }
+      ],
+      "expected": "index_uint16.expected.arrow"
+    },
+    {
+      "name": "index_uint64",
+      "version": 1,
+      "tests": [
+        "params",
+        "nulls"
+      ],
+      "about": "An index of type uint64 gathers as any other.",
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "index_uint64.in.arrow"
+        }
+      ],
+      "expected": "index_uint64.expected.arrow"
+    },
+    {
+      "name": "dictionary_values",
+      "version": 1,
+      "tests": [
+        "dictionary",
+        "nulls"
+      ],
+      "about": "Dictionary values give a dictionary column of the same type with the selected values.",
+      "arrays": {
+        "values": {
+          "file": "dict.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "didx.in.arrow"
+        }
+      ],
+      "expected": "dict.expected.arrow"
+    },
+    {
+      "name": "dictionary_values_sliced",
+      "version": 1,
+      "tests": [
+        "dictionary",
+        "sliced"
+      ],
+      "about": "Sliced dictionary values are numbered from their own first row.",
+      "arrays": {
+        "values": {
+          "file": "dict.values.arrow",
+          "slice": [
+            2,
+            4
+          ]
+        }
+      },
+      "inputs": [
+        {
+          "file": "idx_small.in.arrow"
+        }
+      ],
+      "expected": "dict_sliced.expected.arrow"
+    },
+    {
+      "name": "list_values",
+      "version": 1,
+      "tests": [
+        "nested",
+        "nulls"
+      ],
+      "about": "List values are gathered whole: empty lists, null lists and null items as given.",
+      "arrays": {
+        "values": {
+          "file": "lists.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "lidx.in.arrow"
+        }
+      ],
+      "expected": "lists.expected.arrow"
+    },
+    {
+      "name": "list_values_sliced",
+      "version": 1,
+      "tests": [
+        "nested",
+        "sliced"
+      ],
+      "about": "Sliced list values are numbered from their own first row, offsets included.",
+      "arrays": {
+        "values": {
+          "file": "lists.values.arrow",
+          "slice": [
+            1,
+            4
+          ]
+        }
+      },
+      "inputs": [
+        {
+          "file": "idx_small.in.arrow",
+          "slice": [
+            1,
+            2
+          ]
+        }
+      ],
+      "expected": "lists_sliced.expected.arrow"
+    },
+    {
+      "name": "struct_values",
+      "version": 1,
+      "tests": [
+        "nested",
+        "nulls"
+      ],
+      "about": "Struct values are gathered whole, null structs and null fields as given.",
+      "arrays": {
+        "values": {
+          "file": "structs.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "sidx.in.arrow"
+        }
+      ],
+      "expected": "structs.expected.arrow"
+    },
+    {
+      "name": "not_nullable",
+      "version": 1,
+      "tests": [
+        "params"
+      ],
+      "about": "When neither the values nor the index is nullable, the output is not nullable.",
+      "arrays": {
+        "values": {
+          "file": "nn.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "nn.in.arrow"
+        }
+      ],
+      "expected": "nn.expected.arrow"
+    },
+    {
+      "name": "values_by_morsel",
+      "version": 1,
+      "tests": [
+        "multi_batch",
+        "nulls"
+      ],
+      "about": "With no values fixed, each index batch is taken from the values batch of its morsel.",
+      "inputs": [
+        {
+          "file": "pair.index.arrow"
+        },
+        {
+          "file": "pair.values.arrow"
+        }
+      ],
+      "expected": "pair.expected.arrow"
+    },
+    {
+      "name": "values_by_morsel_sliced",
+      "version": 1,
+      "tests": [
+        "sliced"
+      ],
+      "about": "Both inputs sliced: each is numbered from its own first row.",
+      "inputs": [
+        {
+          "file": "pair.index.arrow",
+          "slice": [
+            2,
+            1
+          ]
+        },
+        {
+          "file": "pair.values.arrow",
+          "slice": [
+            1,
+            2
+          ]
+        }
+      ],
+      "expected": "pair_sliced.expected.arrow"
+    },
+    {
+      "name": "out_of_range",
+      "version": 1,
+      "tests": [
+        "error"
+      ],
+      "about": "An index past the values refuses the batch.",
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "oob.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "apply",
+        "contains": "out of range"
+      }
+    },
+    {
+      "name": "negative_index",
+      "version": 1,
+      "tests": [
+        "error"
+      ],
+      "about": "A negative index refuses the batch.",
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "neg.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "apply",
+        "contains": "out of range"
+      }
+    },
+    {
+      "name": "out_of_range_by_morsel",
+      "version": 1,
+      "tests": [
+        "error"
+      ],
+      "about": "An index past its morsel's values refuses the batch.",
+      "inputs": [
+        {
+          "file": "pair.index.arrow"
+        },
+        {
+          "file": "pair.values.arrow",
+          "slice": [
+            0,
+            2
+          ]
+        }
+      ],
+      "error": {
+        "at": "apply",
+        "contains": "out of range"
+      }
+    },
+    {
+      "name": "index_not_integer",
+      "version": 1,
+      "tests": [
+        "error"
+      ],
+      "about": "An index that is not an integer is refused at plan.",
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "float_idx.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "schema"
+      }
+    },
+    {
+      "name": "index_of_two_columns",
+      "version": 1,
+      "tests": [
+        "error"
+      ],
+      "about": "An index batch of two columns is refused at plan.",
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "two_cols.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "schema"
+      }
+    },
+    {
+      "name": "values_of_two_columns",
+      "version": 1,
+      "tests": [
+        "params",
+        "error"
+      ],
+      "about": "Values fixed at configure that are not one column are refused.",
+      "arrays": {
+        "values": {
+          "file": "two_cols.in.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "idx.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "configure"
+      }
+    },
+    {
+      "name": "json_parameter",
+      "version": 1,
+      "tests": [
+        "params",
+        "error"
+      ],
+      "about": "The kernel takes no JSON parameter.",
+      "params": {
+        "check_bounds": false
+      },
+      "arrays": {
+        "values": {
+          "file": "ints.values.arrow"
+        }
+      },
+      "inputs": [
+        {
+          "file": "idx.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "configure"
+      }
+    },
+    {
+      "name": "one_input_without_values",
+      "version": 1,
+      "tests": [
+        "error"
+      ],
+      "about": "With no values fixed, an index alone is refused at plan.",
+      "inputs": [
+        {
+          "file": "idx.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "schema"
+      }
+    }
+  ]
+}

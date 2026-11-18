@@ -31,6 +31,7 @@ pub mod expr;
 pub mod interval_coverage_count;
 pub mod mlp;
 pub mod ops;
+pub mod selection;
 
 use std::collections::HashSet;
 use std::sync::Arc;

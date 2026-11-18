@@ -1,0 +1,434 @@
+{
+  "format": "moruna-kernel-corpus/1",
+  "kernel": "moruna.filter",
+  "cases": [
+    {
+      "name": "keeps_true_rows",
+      "version": 1,
+      "tests": [
+        "nulls",
+        "ordering",
+        "params"
+      ],
+      "about": "Only rows whose predicate is true are kept, in order, without the predicate column; a null predicate drops its row, and nulls, NaN and -0.0 in kept rows are kept as given.",
+      "params": {
+        "predicate": "p"
+      },
+      "inputs": [
+        {
+          "file": "ten.in.arrow"
+        }
+      ],
+      "expected": "ten.expected.arrow"
+    },
+    {
+      "name": "default_form_is_batch",
+      "version": 1,
+      "tests": [
+        "params"
+      ],
+      "about": "With `output` given as \"batch\" the kernel gives what it gives with no `output`.",
+      "params": {
+        "predicate": "p",
+        "output": "batch"
+      },
+      "inputs": [
+        {
+          "file": "ten.in.arrow"
+        }
+      ],
+      "expected": "ten.expected.arrow"
+    },
+    {
+      "name": "all_true",
+      "version": 1,
+      "tests": [
+        "all_true"
+      ],
+      "about": "A predicate of all true gives every row, without the predicate.",
+      "params": {
+        "predicate": "p"
+      },
+      "inputs": [
+        {
+          "file": "all_true.in.arrow"
+        }
+      ],
+      "expected": "all_true.expected.arrow"
+    },
+    {
+      "name": "all_false",
+      "version": 1,
+      "tests": [
+        "all_false",
+        "empty"
+      ],
+      "about": "A predicate of all false gives a batch of no rows.",
+      "params": {
+        "predicate": "p"
+      },
+      "inputs": [
+        {
+          "file": "all_false.in.arrow"
+        }
+      ],
+      "expected": "all_false.expected.arrow"
+    },
+    {
+      "name": "all_null",
+      "version": 1,
+      "tests": [
+        "nulls",
+        "all_false"
+      ],
+      "about": "A predicate of all nulls selects nothing.",
+      "params": {
+        "predicate": "p"
+      },
+      "inputs": [
+        {
+          "file": "all_null.in.arrow"
+        }
+      ],
+      "expected": "all_false.expected.arrow"
+    },
+    {
+      "name": "empty_batch",
+      "version": 1,
+      "tests": [
+        "empty"
+      ],
+      "about": "A batch of zero rows gives a batch of zero rows.",
+      "params": {
+        "predicate": "p"
+      },
+      "inputs": [
+        {
+          "file": "empty.in.arrow"
+        }
+      ],
+      "expected": "empty.expected.arrow"
+    },
+    {
+      "name": "no_batches",
+      "version": 1,
+      "tests": [
+        "empty"
+      ],
+      "about": "No batches give no output.",
+      "params": {
+        "predicate": "p"
+      },
+      "inputs": [
+        {
+          "file": "none.in.arrow"
+        }
+      ],
+      "expected": "none.expected.arrow"
+    },
+    {
+      "name": "sliced",
+      "version": 1,
+      "tests": [
+        "sliced",
+        "nulls"
+      ],
+      "about": "A batch whose arrays start at row 3 of their buffers is filtered from its own first row.",
+      "params": {
+        "predicate": "p"
+      },
+      "inputs": [
+        {
+          "file": "ten.in.arrow",
+          "slice": [
+            3,
+            6
+          ]
+        }
+      ],
+      "expected": "sliced.expected.arrow"
+    },
+    {
+      "name": "two_batches",
+      "version": 1,
+      "tests": [
+        "multi_batch"
+      ],
+      "about": "Each batch is filtered on its own, and the outputs follow the batches' order.",
+      "params": {
+        "predicate": "p"
+      },
+      "inputs": [
+        {
+          "file": "two.in.arrow"
+        }
+      ],
+      "expected": "ten.expected.arrow"
+    },
+    {
+      "name": "nested_and_dictionary",
+      "version": 1,
+      "tests": [
+        "nested",
+        "dictionary",
+        "nulls"
+      ],
+      "about": "List, struct and dictionary columns keep the selected rows' values, nulls included.",
+      "params": {
+        "predicate": "p"
+      },
+      "inputs": [
+        {
+          "file": "nested.in.arrow"
+        }
+      ],
+      "expected": "nested.expected.arrow"
+    },
+    {
+      "name": "predicate_only",
+      "version": 1,
+      "tests": [
+        "empty"
+      ],
+      "about": "A batch of the predicate alone gives a batch of no columns with the selected rows' count.",
+      "params": {
+        "predicate": "p"
+      },
+      "inputs": [
+        {
+          "file": "only.in.arrow"
+        }
+      ],
+      "expected": "only.expected.arrow"
+    },
+    {
+      "name": "named_predicate_and_nullability",
+      "version": 1,
+      "tests": [
+        "params"
+      ],
+      "about": "The predicate is the column `predicate` names, and the other fields keep their nullability.",
+      "params": {
+        "predicate": "keep"
+      },
+      "inputs": [
+        {
+          "file": "not_null.in.arrow"
+        }
+      ],
+      "expected": "not_null.expected.arrow"
+    },
+    {
+      "name": "selection",
+      "version": 1,
+      "tests": [
+        "params",
+        "nulls"
+      ],
+      "about": "The selection form gives the positions of the rows whose predicate is true, ascending.",
+      "params": {
+        "predicate": "p",
+        "output": "selection"
+      },
+      "inputs": [
+        {
+          "file": "ten.in.arrow"
+        }
+      ],
+      "expected": "ten.selection.arrow"
+    },
+    {
+      "name": "selection_sliced",
+      "version": 1,
+      "tests": [
+        "sliced"
+      ],
+      "about": "A sliced batch's positions count from its own first row.",
+      "params": {
+        "predicate": "p",
+        "output": "selection"
+      },
+      "inputs": [
+        {
+          "file": "ten.in.arrow",
+          "slice": [
+            3,
+            6
+          ]
+        }
+      ],
+      "expected": "sliced.selection.arrow"
+    },
+    {
+      "name": "selection_all_true",
+      "version": 1,
+      "tests": [
+        "all_true"
+      ],
+      "about": "A predicate of all true selects every position.",
+      "params": {
+        "predicate": "p",
+        "output": "selection"
+      },
+      "inputs": [
+        {
+          "file": "all_true.in.arrow"
+        }
+      ],
+      "expected": "all_true.selection.arrow"
+    },
+    {
+      "name": "selection_all_false",
+      "version": 1,
+      "tests": [
+        "all_false"
+      ],
+      "about": "A predicate of all false selects no position.",
+      "params": {
+        "predicate": "p",
+        "output": "selection"
+      },
+      "inputs": [
+        {
+          "file": "all_false.in.arrow"
+        }
+      ],
+      "expected": "all_false.selection.arrow"
+    },
+    {
+      "name": "selection_empty",
+      "version": 1,
+      "tests": [
+        "empty"
+      ],
+      "about": "A batch of zero rows selects no position.",
+      "params": {
+        "predicate": "p",
+        "output": "selection"
+      },
+      "inputs": [
+        {
+          "file": "empty.in.arrow"
+        }
+      ],
+      "expected": "all_false.selection.arrow"
+    },
+    {
+      "name": "selection_two_batches",
+      "version": 1,
+      "tests": [
+        "multi_batch"
+      ],
+      "about": "Each batch's positions count from its own first row.",
+      "params": {
+        "predicate": "p",
+        "output": "selection"
+      },
+      "inputs": [
+        {
+          "file": "two.in.arrow"
+        }
+      ],
+      "expected": "two.selection.arrow"
+    },
+    {
+      "name": "no_predicate_parameter",
+      "version": 1,
+      "tests": [
+        "params",
+        "error"
+      ],
+      "about": "A configure without `predicate` is refused.",
+      "inputs": [
+        {
+          "file": "ten.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "configure"
+      }
+    },
+    {
+      "name": "unknown_output",
+      "version": 1,
+      "tests": [
+        "params",
+        "error"
+      ],
+      "about": "An `output` other than batch or selection is refused.",
+      "params": {
+        "predicate": "p",
+        "output": "mask"
+      },
+      "inputs": [
+        {
+          "file": "ten.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "configure"
+      }
+    },
+    {
+      "name": "unknown_parameter",
+      "version": 1,
+      "tests": [
+        "params",
+        "error"
+      ],
+      "about": "A parameter the kernel does not take is refused.",
+      "params": {
+        "predicate": "p",
+        "expr": "x > 1"
+      },
+      "inputs": [
+        {
+          "file": "ten.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "configure"
+      }
+    },
+    {
+      "name": "missing_predicate_column",
+      "version": 1,
+      "tests": [
+        "error"
+      ],
+      "about": "An input with no column of the predicate's name is refused at plan.",
+      "params": {
+        "predicate": "keep"
+      },
+      "inputs": [
+        {
+          "file": "ten.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "schema",
+        "contains": "keep"
+      }
+    },
+    {
+      "name": "predicate_not_boolean",
+      "version": 1,
+      "tests": [
+        "error"
+      ],
+      "about": "A predicate column that is not Boolean is refused at plan.",
+      "params": {
+        "predicate": "id"
+      },
+      "inputs": [
+        {
+          "file": "ten.in.arrow"
+        }
+      ],
+      "error": {
+        "at": "schema",
+        "contains": "Boolean"
+      }
+    }
+  ]
+}
