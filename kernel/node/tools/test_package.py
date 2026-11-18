@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -204,6 +205,170 @@ class Profiles(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(text, result.stderr)
                 self.assertFalse(out.exists())
+
+
+
+class DiskGuid(unittest.TestCase):
+    """The image's own GPT disk GUID (system design 3C, item 3.3)."""
+
+    def files(self, tmp, *contents):
+        paths = []
+        for i, data in enumerate(contents):
+            path = Path(tmp) / f"f{i}"
+            path.write_bytes(data)
+            paths.append(path)
+        return paths
+
+    def test_the_same_content_gives_the_same_guid_and_other_content_another(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            one = package.disk_guid(self.files(tmp, b"kernel", b"initramfs"))
+            again = package.disk_guid(self.files(tmp, b"kernel", b"initramfs"))
+            self.assertEqual(one, again)
+            self.assertNotEqual(one, package.disk_guid(self.files(tmp, b"kernel", b"initramfs!")))
+            # The files' bounds count: the same bytes split otherwise are another image.
+            self.assertNotEqual(one, package.disk_guid(self.files(tmp, b"kerneli", b"nitramfs")))
+            self.assertNotEqual(one, package.PLACEHOLDER)
+
+    def test_the_guid_is_sgdisks_text_form_of_a_version_8_guid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            guid = package.disk_guid(self.files(tmp, b"x"))
+        self.assertRegex(guid, r"^[0-9A-F]{8}-[0-9A-F]{4}-8[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$")
+
+    def test_the_payload_names_it_and_the_cloud_supervisor_passes_it_to_devices_and_storvsc(self):
+        node = TOOL.parents[1]
+        for profile in ("cloud", "cloud-check"):
+            image = (node / f"{profile}.image").read_text()
+            self.assertIn(f"  handle data:{package.DISK_GUID} disk.guid\n", image)
+            # A slot is granted to one service: storvsc's is a second binding of the same file.
+            self.assertIn(f"  handle data:{package.DISK_GUID} disk.guid.storvsc\n", image)
+            conf = (node / profile / "node.conf").read_text()
+            self.assertIn("grant devices disk.guid disk.guid\n", conf)
+            self.assertIn("grant storvsc disk.guid disk.guid.storvsc\n", conf)
+
+
+
+def a_layer(directory, pages=3, seed=1):
+    """A file shaped as a layer: the magic, then `pages` pages of bytes."""
+    path = Path(directory) / f"layer-{seed}.img"
+    body = bytes((i * 7 + seed) % 251 for i in range(pages * package.PAGE))
+    path.write_bytes(package.LAYER_MAGIC + body[len(package.LAYER_MAGIC):])
+    return path
+
+
+class SystemPartition(unittest.TestCase):
+    """The boot disk's moruna-system partition and the payload's linux.layers (item 3.3)."""
+
+    def test_a_layer_is_named_by_its_seal_and_anything_else_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            layer = a_layer(tmp)
+            seal = package.system_layer(layer)
+            header = layer.read_bytes()[:package.PAGE]
+            import hashlib
+            self.assertEqual(seal, hashlib.sha256(header).hexdigest())
+            self.assertEqual(package.linux_layers(seal), f"moruna-layers 1\nlayer system {seal}\n")
+            for name, data in (("short", package.LAYER_MAGIC), ("other", b"x" * package.PAGE),
+                               ("empty", b"")):
+                path = Path(tmp) / name
+                path.write_bytes(data)
+                with self.assertRaises(ValueError):
+                    package.system_layer(path)
+            with self.assertRaises(ValueError):
+                package.system_layer(Path(tmp))
+            link = Path(tmp) / "link"
+            link.symlink_to(layer)
+            with self.assertRaises(ValueError):
+                package.system_layer(link)
+
+    def test_the_layout_puts_the_system_partition_after_the_esp_in_whole_mib(self):
+        bare = package.layout(64, 0)
+        self.assertEqual((bare["disk_mib"], bare["system_mib"], bare["system_sector"]), (68, 0, None))
+        self.assertEqual(bare["sgdisk"], ["--new=1:2048:+64M", "--typecode=1:ef00"])
+        with_layer = package.layout(64, 5 * package.MIB + 1)
+        self.assertEqual(with_layer["system_mib"], 6)
+        self.assertEqual(with_layer["disk_mib"], 74)
+        self.assertEqual(with_layer["system_sector"], 2048 + 64 * 2048)
+        self.assertEqual(with_layer["sgdisk"][2:], ["--new=2:133120:+6M", "--typecode=2:8300",
+                                                    "--change-name=2:moruna-system"])
+
+    def assembled(self, tmp, layer, run):
+        esp = Path(tmp) / "esp.img"
+        esp.write_bytes(b"E" * package.MIB)
+        disk = Path(tmp) / "disk.raw"
+        planned = package.assemble(disk, esp, layer, "8A1F-TEST", 2, Path(tmp), run=run)
+        return disk, planned
+
+    def test_the_payloads_seal_is_the_partitions_layer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            layer = a_layer(tmp, pages=5)
+            seen = []
+            disk, planned = self.assembled(tmp, layer, lambda args, cwd: seen.append(args))
+            self.assertEqual(seen[0][:3], ["sgdisk", "--clear", "--disk-guid=8A1F-TEST"])
+            self.assertIn("--change-name=2:moruna-system", seen[0])
+            data = disk.read_bytes()
+            self.assertEqual(len(data), planned["disk_mib"] * package.MIB)
+            self.assertEqual(data[2048 * 512:2048 * 512 + package.MIB], b"E" * package.MIB)
+            at = planned["system_sector"] * 512
+            self.assertEqual(data[at:at + layer.stat().st_size], layer.read_bytes())
+            # The seal linux.layers names is the partition's layer's: its header page's SHA-256.
+            import hashlib
+            on_disk = hashlib.sha256(data[at:at + package.PAGE]).hexdigest()
+            named = package.linux_layers(package.system_layer(layer)).split()[-1]
+            self.assertEqual(named, on_disk)
+            # Another layer, another seal.
+            self.assertNotEqual(package.system_layer(a_layer(tmp, seed=2)), named)
+
+    def test_without_a_layer_the_disk_is_its_esp_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seen = []
+            disk, planned = self.assembled(tmp, None, lambda args, cwd: seen.append(args))
+            self.assertNotIn("--change-name=2:moruna-system", seen[0])
+            self.assertEqual(disk.stat().st_size, 6 * package.MIB)
+
+    @unittest.skipUnless(shutil.which("sgdisk"), "sgdisk is not installed")
+    def test_sgdisk_writes_the_partition_the_layer_is_in(self):
+        import struct, zlib
+        with tempfile.TemporaryDirectory() as tmp:
+            layer = a_layer(tmp, pages=300)
+            disk, planned = self.assembled(tmp, layer, package.command)
+            data = disk.read_bytes()
+            header = data[512:1024]
+            self.assertEqual(header[:8], b"EFI PART")
+            lba, count, size = struct.unpack_from("<QII", header, 72)
+            table = data[lba * 512:lba * 512 + count * size]
+            self.assertEqual(zlib.crc32(table) & 0xffffffff, struct.unpack_from("<I", header, 88)[0])
+            names = {}
+            for i in range(count):
+                entry = table[i * size:(i + 1) * size]
+                first, last = struct.unpack_from("<QQ", entry, 32)
+                name = entry[56:128].decode("utf-16-le").rstrip("\0")
+                if name:
+                    names[name] = (first, last)
+            first, last = names["moruna-system"]
+            self.assertEqual(first, planned["system_sector"])
+            self.assertEqual(last - first + 1, planned["system_mib"] * 2048)
+            self.assertEqual(data[first * 512:first * 512 + layer.stat().st_size], layer.read_bytes())
+
+    def test_a_description_that_binds_linux_layers_needs_the_flag_before_anything_is_built(self):
+        self.assertTrue(package.binds("process x\n  handle data:linux.layers layers\n", "linux.layers"))
+        self.assertFalse(package.binds("process x\n  handle data:linux.layers.old layers\n", "linux.layers"))
+        self.assertFalse(package.binds("# handle data:linux.layers layers\n", "linux.layers"))
+        with tempfile.TemporaryDirectory() as tmp:
+            description = Path(tmp) / "d.image"
+            description.write_text("moruna-image 1\nprocess node-supervisor\n"
+                                   "  handle data:linux.layers linux.layers\n")
+            (Path(tmp) / "assets").mkdir()
+            out = Path(tmp) / "out"
+            argv = ["--profile", "cloud", "--description", str(description), "--assets", "assets",
+                    "--out", str(out), "--node-memory", str(2 << 30)]
+            result = subprocess.run([sys.executable, "-I", str(TOOL), *argv], capture_output=True, text=True,
+                                    cwd=tmp)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("this description binds linux.layers: pass --system-layer", result.stderr)
+            self.assertFalse(out.exists(), "refused before anything is built")
+
+    def test_the_command_takes_a_system_layer(self):
+        _, args = package.arguments(["--profile", "cloud", *BASE, "--system-layer", "engine.layer"])
+        self.assertEqual(args.system_layer, Path("engine.layer"))
 
 
 if __name__ == "__main__":

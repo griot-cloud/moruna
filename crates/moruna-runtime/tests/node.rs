@@ -205,6 +205,7 @@ fn serve_bounded(scratch: &Scratch, spec: Value, budget_max: Option<u64>) -> Ser
     let node = Node {
         channel: "channel:engine".to_string(),
         budget_max,
+        volumes: None,
     };
     let outcome = session::serve_node(
         over_messages(engine.clone()),
@@ -514,6 +515,7 @@ fn a_check_on_a_channel_answers_its_refusals_and_the_budget() {
     let node = Node {
         channel: "channel:engine".to_string(),
         budget_max: Some(max),
+        volumes: None,
     };
     let check = |line: String| {
         let (engine, api) = Framed::pair();

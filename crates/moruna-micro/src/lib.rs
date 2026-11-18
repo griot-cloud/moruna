@@ -59,6 +59,9 @@ pub mod task;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod vsock;
 
+// Item 3.3: volumes by serial, on every host; their driver's client on the kernel only.
+pub mod volume;
+
 /// Whether this process runs on the Moruna kernel, started with a start page (SDD 30 d.2).
 pub fn on_kernel() -> bool {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -68,6 +71,53 @@ pub fn on_kernel() -> bool {
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
         false
+    }
+}
+
+/// The most bytes [`granted_data`] reads.
+pub const GRANTED_DATA_MAX: u64 = 1 << 20;
+
+/// The text of the data handle granted under `slot` (a file of the boot's, or one a service
+/// wrote, padded with zeros to whole pages): its bytes before the first zero, at most
+/// [`GRANTED_DATA_MAX`]. Off the Moruna kernel no handle is granted.
+pub fn granted_data(slot: &str) -> Result<Vec<u8>, String> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        use moruna_sys::{Memory, map};
+        const PAGE: u64 = 4096;
+        if !on_kernel() {
+            return Err(format!(
+                "no `{slot}` was granted: this process is not on the Moruna kernel"
+            ));
+        }
+        let memory =
+            Memory(start::take(slot).ok_or_else(|| {
+                format!("no `{slot}` was granted (it holds {:?})", start::slots())
+            })?);
+        let mut out = Vec::new();
+        let mut page = vec![0u8; PAGE as usize];
+        let mut at = 0;
+        while at < GRANTED_DATA_MAX {
+            let mapping = memory.map(at, PAGE, map::READ).map_err(|e| {
+                format!("`{slot}` has no zero byte in its {at} bytes: {}", e.name())
+            })?;
+            mapping
+                .read(0, &mut page)
+                .map_err(|e| format!("reading `{slot}`: {}", e.name()))?;
+            if let Some(end) = page.iter().position(|b| *b == 0) {
+                out.extend_from_slice(&page[..end]);
+                return Ok(out);
+            }
+            out.extend_from_slice(&page);
+            at += PAGE;
+        }
+        Err(format!("`{slot}` is larger than {GRANTED_DATA_MAX} bytes"))
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        Err(format!(
+            "no `{slot}` was granted: data slots exist only on the Moruna kernel"
+        ))
     }
 }
 

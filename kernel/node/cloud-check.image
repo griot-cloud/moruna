@@ -35,6 +35,8 @@ process node-supervisor
   handle program:storvsc-check image.storvsc-check
   handle data:node.conf config
   handle data:network.conf network.config
+  handle data:disk.guid disk.guid
+  handle data:disk.guid disk.guid.storvsc
   driver 1af4:1042 virtio-blk block
   driver 1af4:1041 virtio-net net
   driver 1b36:0010 nvme nvme

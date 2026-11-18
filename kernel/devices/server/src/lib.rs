@@ -19,7 +19,8 @@ use core::cell::RefCell;
 
 use devices_protocol::{Block, Entry, REGISTER_SLOTS, directory};
 use moruna_svc::{
-    Channel, Context, Decoder, Handler, Outcome, ProtocolError, ProtocolId, Status, Wire, connect,
+    Channel, Context, Decoder, Handler, Outcome, ProtocolError, ProtocolId, Signals, Status, Wire,
+    connect, wait_one,
 };
 
 /// What a connection to the directory may ask, by the listener it came through.
@@ -62,6 +63,13 @@ struct Registered {
     listener: Channel,
 }
 
+impl Registered {
+    /// Whether its driver has let go of its listener.
+    fn gone(&self) -> bool {
+        wait_one(&self.listener.0, Signals::PEER_CLOSED, 0).is_ok()
+    }
+}
+
 /// The block devices drivers have registered, by serial.
 #[derive(Default)]
 pub struct Registry {
@@ -75,7 +83,8 @@ impl Registry {
     }
 
     /// Registers `block`, served on `listener`, unless its serial is a name taken already:
-    /// `published` says whether a driver's service has it.
+    /// `published` says whether a driver's service has it. A serial whose driver has let go
+    /// of its listener is taken no more: the driver started again registers it again.
     pub fn register(
         &mut self,
         block: Block,
@@ -85,10 +94,20 @@ impl Registry {
         if !block.valid() {
             return Err(directory::Error::Invalid);
         }
-        if published || self.find(&block.serial).is_some() {
+        if published {
             return Err(directory::Error::Exists);
         }
-        self.blocks.push(Registered { block, listener });
+        match self
+            .blocks
+            .iter()
+            .position(|registered| registered.block.serial == block.serial)
+        {
+            Some(at) if self.blocks[at].gone() => {
+                self.blocks[at] = Registered { block, listener };
+            }
+            Some(_) => return Err(directory::Error::Exists),
+            None => self.blocks.push(Registered { block, listener }),
+        }
         Ok(())
     }
 
@@ -153,7 +172,7 @@ impl<D: Drivers> Handler for Directory<D> {
     fn handle(&mut self, cx: &mut Context<'_>, ordinal: u16, d: &mut Decoder<'_>) -> Outcome {
         let bad = Outcome::Status(Status::BadMessage);
         match (ordinal, self.access) {
-            (1 | 2, Access::Register) | (3, Access::Lookup) => refused(),
+            (1 | 2 | 4, Access::Register) | (3, Access::Lookup) => refused(),
             (1, Access::Lookup) => {
                 let Some(name) = arguments::<String>(d) else {
                     return bad;
@@ -169,6 +188,13 @@ impl<D: Drivers> Handler for Directory<D> {
             }
             (2, Access::Lookup) => match d.finish() {
                 Ok(()) => Outcome::reply(self.drivers.list()),
+                Err(_) => bad,
+            },
+            (4, Access::Lookup) => match d.finish() {
+                Ok(()) => {
+                    let blocks: Vec<Block> = self.registry.borrow().blocks().cloned().collect();
+                    Outcome::reply(blocks)
+                }
                 Err(_) => bad,
             },
             (3, Access::Register) => {

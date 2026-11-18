@@ -1,4 +1,9 @@
 //! Launches only the boot-granted engine; channel possession is admission authority.
+//!
+//! Volumes (system design 3C, item 3.3): through the device manager's directory (the
+//! `directory` slot, when the node links one) it knows the node's disks by serial. Every check
+//! is given them as data ([`node_protocol::VOLUMES_SLOT`]), so `validate` refuses a volume no
+//! disk has, and the boot disk; `launch` resolves a job's volumes again, `Invalid` for either.
 #![no_std]
 #![no_main]
 #![forbid(unsafe_code)]
@@ -6,12 +11,16 @@ extern crate alloc;
 mod authority;
 use alloc::{boxed::Box, collections::BTreeMap, rc::Rc, string::String, vec::Vec};
 use core::cell::RefCell;
+use devices_protocol::{Block, directory};
 use moruna_svc::{
     Channel, Completions, Context, Decoder, Dispatcher, Handle, Handler, Outcome, Pending,
     ProtocolId, Signals, Status, Watch, Wire,
 };
-use moruna_sys::{Account, Console, ObjectType, Process, Rights, println, start};
+use moruna_sys::{Account, Console, Memory, ObjectType, Process, Rights, map, println, start};
 use node_protocol::{CANCELLED, CHECK_BYTES, MAX_JOBS, Needs, RUNNING, TERMINATED, admission};
+
+/// How long the device manager's directory has to list the node's disks.
+const DIRECTORY_NS: u64 = 10_000_000_000;
 moruna_sys::main!(run);
 
 struct Job {
@@ -47,6 +56,37 @@ struct Shared {
     check_account: Option<Account>,
     /// The check that holds the check account, until it is released.
     check: Option<u64>,
+    /// The device manager's directory, through which the node's disks are listed (item 3.3):
+    /// `None` on a node that links none, which then has no volumes.
+    directory: Option<Channel>,
+}
+
+/// The node's disks, as the device manager's directory lists them; none without a directory.
+fn node_blocks(shared: &Rc<RefCell<Shared>>) -> Result<Vec<Block>, admission::Error> {
+    let state = shared.borrow();
+    let Some(listener) = &state.directory else {
+        return Ok(Vec::new());
+    };
+    let channel = moruna_svc::connect(listener).map_err(|_| admission::Error::Unavailable)?;
+    let mut client = directory::Client::connect(channel, moruna_svc::deadline_in(DIRECTORY_NS))
+        .map_err(|_| admission::Error::Unavailable)?;
+    client.core().set_timeout(DIRECTORY_NS);
+    client.blocks().map_err(|_| admission::Error::Unavailable)
+}
+
+/// The node's volumes as data a check is granted: [`node_protocol::volume_lines`], read only.
+fn volumes_data(blocks: &[Block]) -> Result<Handle, admission::Error> {
+    let text = node_protocol::volume_lines(blocks);
+    let pages = (text.len() as u64 + 1).div_ceil(4096) * 4096;
+    let memory = Memory::create(pages).map_err(|_| admission::Error::Unavailable)?;
+    memory
+        .map(0, pages, map::READ | map::WRITE)
+        .and_then(|m| m.write(0, text.as_bytes()))
+        .map_err(|_| admission::Error::Unavailable)?;
+    memory
+        .0
+        .duplicate(Rights::READ | Rights::MAP | Rights::TRANSFER)
+        .map_err(|_| admission::Error::Unavailable)
 }
 struct End {
     shared: Rc<RefCell<Shared>>,
@@ -120,6 +160,17 @@ fn launch_job(
     } = launch;
     if !node_protocol::valid_needs(&needs) {
         return Err(admission::Error::Invalid);
+    }
+    if !needs.1.is_empty() {
+        // A job's volumes, resolved again: a serial no disk has, the boot disk, or a sink's
+        // volume served read only is refused, as the check refused it.
+        if shared.borrow().directory.is_none() {
+            return Err(admission::Error::Unavailable);
+        }
+        let blocks = node_blocks(shared)?;
+        if node_protocol::resolve(&needs.1, &blocks).is_err() {
+            return Err(admission::Error::Invalid);
+        }
     }
     if services.len() > node_protocol::MAX_GRANTS {
         return Err(admission::Error::Invalid);
@@ -365,10 +416,14 @@ fn check_job(
     shared: &Rc<RefCell<Shared>>,
     owner: u64,
     config: Handle,
-    names: Vec<String>,
-    grants: Vec<Handle>,
+    mut names: Vec<String>,
+    mut grants: Vec<Handle>,
     services: Vec<String>,
 ) -> Result<u64, admission::Error> {
+    // The node's volumes, which the check refuses a job's against (item 3.3).
+    let volumes = volumes_data(&node_blocks(shared)?)?;
+    names.push(node_protocol::VOLUMES_SLOT.into());
+    grants.push(volumes);
     let account = {
         let state = shared.borrow();
         if state.check.is_some_and(|id| state.jobs.contains_key(&id)) {
@@ -604,6 +659,7 @@ fn run() -> i64 {
         own,
         check_account,
         check: None,
+        directory: start::take("directory").map(Channel),
     }));
     // API mode: the server serves `api` and runs no initial job (system design 3A). The
     // services it lends each job's engine are its `linux` and `network` slots, and it needs no

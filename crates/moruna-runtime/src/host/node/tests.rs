@@ -207,15 +207,18 @@ fn a_jobs_needs_are_its_hosts_volumes_and_functions() {
             volumes: vec![
                 VolumeNeed {
                     serial: "vol-a".into(),
-                    write: true
+                    write: true,
+                    staging: false,
                 },
                 VolumeNeed {
                     serial: "vol-b".into(),
-                    write: false
+                    write: false,
+                    staging: false,
                 },
                 VolumeNeed {
                     serial: "vol-c".into(),
-                    write: true
+                    write: true,
+                    staging: false,
                 },
             ],
             functions: vec!["taxi.clean".to_string(), "taxi.score".to_string()],
@@ -287,10 +290,17 @@ fn a_jobs_budget_is_spent_on_the_engine_its_scratch_and_its_arena() {
             arena: 0
         }
     );
-    // A disk:// staging URL is a volume; a directory is not.
+    // A disk:// staging directory is a volume, the one the check's needs mark staging (3.3);
+    // no staging directory is none.
     let mut staged = sound();
-    staged["staging"] = json!({"url": "disk://vol-s/spill/"});
-    assert!(names_staging_volume(&job(staged)));
+    staged["staging"] = json!({"dir": "disk://vol-s/spill/"});
+    assert!(names_staging_volume(&job(staged.clone())));
+    assert!(
+        needs(&job(staged))
+            .volumes
+            .iter()
+            .any(|v| v.staging && v.serial == "vol-s")
+    );
     assert!(!names_staging_volume(&job(sound())));
 }
 
@@ -300,4 +310,156 @@ fn schemes_are_read_without_regard_to_case_and_only_at_the_start() {
     assert!(!is_file_url("s3://bucket/file://x"));
     assert!(is_host_socket("unix:/x") && is_host_socket("VSOCK://2:1"));
     assert!(!is_host_socket("https://unix.example.com") && !is_host_socket("uni"));
+}
+
+fn attached() -> Vec<NodeVolume> {
+    parse_volumes("vol-1 1073741824 ro data\nvol-out 2147483648 rw data\nboot 4294967296 ro boot\n")
+        .expect("the node's volumes")
+}
+
+/// The node's disks as `node-admission` writes them, and every line it does not.
+#[test]
+fn the_nodes_volumes_are_a_line_a_disk() {
+    let volumes = attached();
+    assert_eq!(
+        volumes[0],
+        NodeVolume {
+            serial: "vol-1".into(),
+            bytes: 1 << 30,
+            read_only: true,
+            boot: false,
+        }
+    );
+    assert!(volumes[2].boot && !volumes[1].read_only);
+    assert_eq!(parse_volumes("").unwrap(), Vec::new());
+    assert_eq!(parse_volumes("\n  \n").unwrap(), Vec::new());
+    for bad in [
+        "vol-1 12 ro",
+        "vol-1 twelve ro data",
+        "vol-1 12 rx data",
+        "vol-1 12 ro root",
+        "vol-1 12 ro data extra",
+    ] {
+        assert!(parse_volumes(bad).unwrap_err().contains("line 1"), "{bad}");
+    }
+}
+
+/// Given the node's disks, a job's volumes are refused by their field: a serial no disk has,
+/// the boot disk, a sink's volume served read only; a node whose disks are not known refuses none.
+#[test]
+fn a_volume_no_disk_has_or_the_boot_disk_is_refused_by_its_field() {
+    let on = Node {
+        volumes: Some(attached()),
+        ..node()
+    };
+    assert!(refusals(&job(sound()), &on).is_empty(), "vol-1 is attached");
+    let with = |source: &str, sink: &str| {
+        let mut document = sound();
+        document["source"]["url"] = json!(source);
+        document["sink"]["url"] = json!(sink);
+        job(document)
+    };
+    let fields = |job: &Job, node: &Node| -> Vec<(String, String)> {
+        refusals(job, node)
+            .into_iter()
+            .map(|r| (r.field, r.reason))
+            .collect()
+    };
+    let unknown = fields(&with("disk://vol-9/in/", "disk://vol-out/out/"), &on);
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+    assert!(
+        unknown[0].1.contains("volume `vol-9` is not attached"),
+        "{unknown:?}"
+    );
+    assert!(
+        unknown[0].1.contains("its volumes are vol-1, vol-out"),
+        "{unknown:?}"
+    );
+    let boot = fields(&with("disk://boot/in/", "s3://bucket/out/"), &on);
+    assert_eq!(boot.len(), 1, "{boot:?}");
+    assert!(
+        boot[0].1.contains("the disk this node booted from"),
+        "{boot:?}"
+    );
+    assert_eq!(boot[0].0, unknown[0].0, "the source's url both times");
+    let read_only = fields(&with("disk://vol-out/in/", "disk://vol-1/out/"), &on);
+    assert_eq!(read_only.len(), 1, "{read_only:?}");
+    assert!(
+        read_only[0].1.contains("read only on this node"),
+        "{read_only:?}"
+    );
+    let none = Node {
+        volumes: Some(Vec::new()),
+        ..node()
+    };
+    let nothing = fields(&job(sound()), &none);
+    assert!(nothing[0].1.contains("it has none"), "{nothing:?}");
+    assert!(
+        refusals(&with("disk://vol-9/in/", "disk://boot/out/"), &node()).is_empty(),
+        "disks not known: nothing refused"
+    );
+}
+
+/// The volume `staging.dir` names is the job's staging volume: written, and said so, and
+/// refused as any volume is when the node has no such disk.
+#[test]
+fn a_staging_volume_is_written_and_said_to_be_staging() {
+    let mut document = sound();
+    document["staging"] = json!({"dir": "disk://vol-out/stage/"});
+    let staged = job(document.clone());
+    let volumes = needs(&staged).volumes;
+    assert_eq!(
+        volumes,
+        vec![
+            VolumeNeed {
+                serial: "vol-1".into(),
+                write: false,
+                staging: false,
+            },
+            VolumeNeed {
+                serial: "vol-out".into(),
+                write: true,
+                staging: true,
+            },
+        ]
+    );
+    // Only a staging volume says so on the wire.
+    let line = serde_json::to_string(&volumes).unwrap();
+    assert_eq!(
+        line,
+        r#"[{"serial":"vol-1","write":false},{"serial":"vol-out","write":true,"staging":true}]"#
+    );
+    let back: Vec<VolumeNeed> = serde_json::from_str(&line).unwrap();
+    assert_eq!(back, volumes);
+    // A source's volume that is also the staging volume is written.
+    document["staging"] = json!({"dir": "disk://vol-1/stage/"});
+    assert_eq!(
+        needs(&job(document.clone())).volumes,
+        vec![VolumeNeed {
+            serial: "vol-1".into(),
+            write: true,
+            staging: true,
+        }]
+    );
+    // Against the node's disks: none with the serial, the boot disk, a read-only one.
+    let on = Node {
+        volumes: Some(attached()),
+        ..node()
+    };
+    for (dir, said) in [
+        ("disk://vol-9/s/", "is not attached"),
+        ("disk://boot/s/", "booted from"),
+        ("disk://vol-1/s/", "read only on this node"),
+    ] {
+        document["staging"] = json!({ "dir": dir });
+        let refused = refusals(&job(document.clone()), &on);
+        let staging: Vec<_> = refused
+            .iter()
+            .filter(|r| r.field == "staging.dir")
+            .collect();
+        assert_eq!(staging.len(), 1, "{dir}: {refused:?}");
+        assert!(staging[0].reason.contains(said), "{dir}: {refused:?}");
+    }
+    document["staging"] = json!({"dir": "disk://vol-out/s/"});
+    assert!(refusals(&job(document), &on).is_empty());
 }

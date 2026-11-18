@@ -8,6 +8,9 @@
 //! to it, whose connections may register and do nothing else ([`REGISTER_SLOTS`]); the
 //! device is then found as any other, by its serial (`lun-0`, `boot`), so there is one way
 //! to find a disk whatever drives it (`architecture/moruna-os-system.md`, section 3C).
+//! The device manager's own block drivers (virtio-blk) register theirs the same way, through
+//! a `register` listener it gives each, and `blocks` lists every disk registered (minor 2),
+//! which is what a node grants a job's volumes from.
 //! `moruna.devices.control`
 //! is for the processes the boot description links to it, and no other: it restarts a
 //! driver, and hands out the resources a driver of a device holds (without its DMA
@@ -112,7 +115,7 @@ moruna_svc::protocol! {
     pub protocol directory {
         name = "moruna.devices.directory";
         major = 1;
-        minor = 1;
+        minor = 2;
         requests {
             /// A new connection to the service published as `name`, or to the block
             /// device registered under that serial; answered once its driver is running.
@@ -121,8 +124,13 @@ moruna_svc::protocol! {
             2 => fn list() -> Vec<Entry>;
             /// Minor 1: registers `block`, which the caller serves on `listener`: a lookup
             /// of its serial connects through `listener`. Only through a
-            /// [`REGISTER_SLOTS`] listener, which may make no other request.
+            /// [`REGISTER_SLOTS`] listener, which may make no other request. A serial whose
+            /// driver has let go of its listener is registered again: a driver started again
+            /// registers its disk again.
             3 => fn register(block: Block, listener: Channel) -> ();
+            /// Minor 2: every block device registered, in the order they were: its serial,
+            /// its size, and whether it is the disk the node booted from (system design 3C).
+            4 since 2 => fn blocks() -> Vec<Block>;
         }
         events {}
         errors {
@@ -216,8 +224,8 @@ mod tests {
 
     #[test]
     fn a_block_device_travels_whole() {
-        assert_eq!(directory::REQUESTS, &[1, 2, 3]);
-        assert_eq!((directory::ID.major, directory::ID.minor), (1, 1));
+        assert_eq!(directory::REQUESTS, &[1, 2, 3, 4]);
+        assert_eq!((directory::ID.major, directory::ID.minor), (1, 2));
         let boot = Block {
             read_only: true,
             boot: true,
