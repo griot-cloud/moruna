@@ -3,14 +3,19 @@
 //! line, once, `gateway none` when the lease names no router; no lease is due 30 s
 //! after the server's start; and its one grant, which only listens on port 443,
 //! refuses every way out, and holds at most 81 sockets of 64 KiB buffers each way, 8 a
-//! peer, each closing one for at most 5 s (work item 1.3b).
+//! peer, each closing one for at most 5 s (work item 1.3b). A DISCOVER with no answer is
+//! sent again after 1 s, doubling to 64 s, each delay randomized by a tenth; a REQUEST after
+//! 4 s (work item 1.11c).
 
 mod common;
 
-use common::{MAC_A, MAC_B, PAIR, Rng, Wire, dhcp_server, serve};
-use moruna_netstack::{Card, Stack, boot::LEASE_WITHIN_NS, parse};
+use std::sync::{Arc, Mutex};
+
+use common::{MAC_A, MAC_B, PAIR, Rng, Wire, dhcp_request, dhcp_server, serve};
+use moruna_netstack::{Card, Stack, boot::LEASE_WITHIN_NS, dhcp::is_discover, parse};
 use moruna_svc::{CallError, Channel, deadline_in};
 use netstack_protocol::{Addr, Cidr, Endpoint, Policy, Rule, Target, net, rights};
+use smoltcp::wire::DhcpMessageType;
 
 /// `kernel/node/cloud/network.conf`, exactly as work item 1.3 gives it, with the grant
 /// work item 1.3b gives `api`: 80 connections, system design 2B's cap, and the
@@ -183,11 +188,12 @@ fn losing_the_first_discover(mut then: Wire) -> Wire {
     })
 }
 
-/// RFC 2131 4.1: a DISCOVER with no answer is sent again after 4 s, not smoltcp's 10 s, so one
-/// answer lost at boot costs the node 4 s (found on Azure, run 8: the lease came 10 s late). The
-/// lease's line says when it came, and no lease is said lost before one was held.
+/// Work item 1.11c: Azure drops what the guest sends for a while after its card starts, and
+/// says nothing when the path opens. A DISCOVER with no answer is sent again after 1 s (within
+/// a tenth), so one lost at boot costs the node about a second, not RFC 2131's example 4 s.
+/// The lease's line says when it came, and no lease is said lost before one was held.
 #[test]
-fn a_lost_first_discover_is_sent_again_after_four_seconds() {
+fn a_lost_first_discover_is_sent_again_after_a_second() {
     let started = 2 * SECOND;
     let mut stack = cloud_stack(started);
     let mut wire = losing_the_first_discover(dhcp_server(true));
@@ -198,7 +204,7 @@ fn a_lost_first_discover_is_sent_again_after_four_seconds() {
     assert!(leased, "no lease in 30 s: {:?}", stack.notes);
     let after = t - started;
     assert!(
-        (4 * SECOND..5 * SECOND).contains(&after),
+        (900 * MS..1200 * MS).contains(&after),
         "the lease came {} ms after the start",
         after / MS
     );
@@ -216,6 +222,132 @@ fn a_lost_first_discover_is_sent_again_after_four_seconds() {
         "{:?}",
         stack.notes
     );
+}
+
+type Times = Arc<Mutex<Vec<u64>>>;
+
+/// A wire nothing answers on, which notes when each DISCOVER went.
+fn noting_discovers(sent: Times) -> impl FnMut(&mut Stack, u64) {
+    move |stack: &mut Stack, t: u64| {
+        for f in std::mem::take(&mut stack.card_mut(0).port.tx) {
+            if is_discover(&f) {
+                sent.lock().unwrap().push(t);
+            }
+        }
+    }
+}
+
+/// Polls `stack` every 10 ms from `*t` for `span`, `wire` given the time of each poll.
+fn drive_timed(stack: &mut Stack, wire: &mut impl FnMut(&mut Stack, u64), t: &mut u64, span: u64) {
+    let end = *t + span;
+    while *t < end {
+        stack.poll(*t);
+        wire(stack, *t);
+        *t += 10 * MS;
+    }
+}
+
+/// The gaps between DISCOVERs, in ms.
+fn gaps(sent: &Times) -> Vec<u64> {
+    let sent = sent.lock().unwrap();
+    sent.windows(2).map(|w| (w[1] - w[0]) / MS).collect()
+}
+
+/// Asserts each gap is its base, in seconds, within a tenth and the 10 ms a poll takes.
+#[track_caller]
+fn assert_backoff(gaps: &[u64], bases: &[u64]) {
+    assert_eq!(gaps.len(), bases.len(), "gaps {gaps:?}");
+    for (gap, base) in gaps.iter().zip(bases) {
+        let base = base * 1000;
+        assert!(
+            (base - base / 10..=base + base / 10 + 10).contains(gap),
+            "a gap of {gap} ms where {base} ms within a tenth was due: {gaps:?}"
+        );
+    }
+}
+
+/// RFC 2131 4.1's randomized exponential backoff: with no answer, DISCOVERs go 1, 2, 4, 8,
+/// 16 and 32 s apart, then every 64 s (eight gaps in 200 s), each gap within a tenth of its
+/// base; and a link that comes back starts the schedule over.
+#[test]
+fn unanswered_discovers_back_off_from_a_second_to_a_minute_and_start_over_at_link_up() {
+    let mut t = SECOND;
+    let mut stack = cloud_stack(t);
+    let sent: Times = Arc::default();
+    let mut wire = noting_discovers(sent.clone());
+    drive_timed(&mut stack, &mut wire, &mut t, 200 * SECOND);
+    assert_eq!(
+        sent.lock().unwrap()[0],
+        SECOND,
+        "the first goes at the first poll"
+    );
+    assert_backoff(&gaps(&sent), &[1, 2, 4, 8, 16, 32, 64, 64]);
+
+    // The link goes and comes back: a DISCOVER at once, then 1 s and 2 s again.
+    sent.lock().unwrap().clear();
+    stack.set_link(0, false);
+    stack.set_link(0, true);
+    let back = t;
+    drive_timed(&mut stack, &mut wire, &mut t, 3500 * MS);
+    assert_eq!(sent.lock().unwrap()[0], back);
+    assert_backoff(&gaps(&sent), &[1, 2]);
+    assert_eq!(bound(&stack), 0);
+}
+
+/// A REQUEST, which follows an OFFER over a path that works, is sent again after 4 s as
+/// before; only DISCOVERs start at a second.
+#[test]
+fn a_lost_request_is_sent_again_after_four_seconds() {
+    let started = SECOND;
+    let mut stack = cloud_stack(started);
+    let mut server = dhcp_server(true);
+    let mut lost = false;
+    let mut wire: Wire = Box::new(move |stack: &mut Stack, rng: &mut Rng| {
+        let tx = &mut stack.card_mut(0).port.tx;
+        if !lost
+            && let Some(at) = tx.iter().position(|f| {
+                dhcp_request(f).is_some_and(|(_, _, kind)| kind == DhcpMessageType::Request)
+            })
+        {
+            tx.remove(at);
+            lost = true;
+        }
+        server(stack, rng);
+    });
+    let mut t = started;
+    let leased = drive(&mut stack, &mut wire, &mut t, 30 * SECOND, |s| {
+        bound(s) == 1
+    });
+    assert!(leased, "no lease in 30 s: {:?}", stack.notes);
+    let after = t - started;
+    assert!(
+        (4 * SECOND..4 * SECOND + 100 * MS).contains(&after),
+        "the lease came {} ms after the start",
+        after / MS
+    );
+}
+
+/// A lease taken, then lost with its link, starts the DISCOVERs over at a second, however many
+/// went before it.
+#[test]
+fn a_lease_lost_later_starts_the_discovers_over() {
+    let mut t = SECOND;
+    let mut stack = cloud_stack(t);
+    // Three DISCOVERs go unanswered (at 0, 1 and 3 s), then the server answers.
+    let sent: Times = Arc::default();
+    let mut deaf = noting_discovers(sent.clone());
+    drive_timed(&mut stack, &mut deaf, &mut t, 4 * SECOND);
+    assert_eq!(sent.lock().unwrap().len(), 3);
+    let mut server = dhcp_server(true);
+    let leased = drive(&mut stack, &mut server, &mut t, 30 * SECOND, |s| {
+        bound(s) == 1
+    });
+    assert!(leased, "no lease in 30 s: {:?}", stack.notes);
+    sent.lock().unwrap().clear();
+    stack.set_link(0, false);
+    stack.set_link(0, true);
+    drive_timed(&mut stack, &mut deaf, &mut t, 1500 * MS);
+    assert_backoff(&gaps(&sent), &[1]);
 }
 
 #[test]

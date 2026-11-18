@@ -45,6 +45,7 @@ use crate::{
     boot::{LEASE_WITHIN_NS, network_line},
     config::{Config, Congestion, Settings},
     device::Port,
+    dhcp::Discovery,
     grant::Grant,
 };
 
@@ -52,18 +53,19 @@ use crate::{
 const EPHEMERAL_FIRST: u16 = 49152;
 /// Rounds of loopback a poll takes before it leaves the rest for the next.
 const LOOPBACK_ROUNDS: usize = 32;
-/// When a DHCP client sends its first DISCOVER or REQUEST again with no answer, in seconds:
-/// RFC 2131 4.1's 4 s, where smoltcp's defaults are 10 s and 5 s. One answer lost while a
-/// cloud's network is still being set up at boot then costs the node's start 4 s, not 10.
-const DHCP_RETRY_S: u64 = 4;
+/// When a DHCP client sends its first REQUEST again with no answer, in seconds: RFC 2131
+/// 4.1's 4 s, where smoltcp's default is 5 s. A REQUEST follows an OFFER, over a path that
+/// works. A DISCOVER's delays are [`Discovery`]'s (system design 1C, work item 1.11c).
+const REQUEST_RETRY_S: u64 = 4;
 
-/// An interface's DHCP client, timed as RFC 2131 4.1 says (see [`DHCP_RETRY_S`]); a REQUEST's
-/// wait still doubles every two tries, as smoltcp does.
+/// An interface's DHCP client: a REQUEST timed as RFC 2131 4.1 says (see
+/// [`REQUEST_RETRY_S`]), its wait still doubling every two tries, as smoltcp does; a
+/// DISCOVER sent again after the delay [`Iface::egress`] sets before each poll.
 fn dhcp_client() -> dhcpv4::Socket<'static> {
     let mut socket = dhcpv4::Socket::new();
     let mut retry = dhcpv4::RetryConfig::default();
-    retry.discover_timeout = Duration::from_secs(DHCP_RETRY_S);
-    retry.initial_request_timeout = Duration::from_secs(DHCP_RETRY_S);
+    retry.discover_timeout = Duration::from_micros(crate::dhcp::FIRST_NS / 1000);
+    retry.initial_request_timeout = Duration::from_secs(REQUEST_RETRY_S);
     socket.set_retry_config(retry);
     socket
 }
@@ -146,9 +148,39 @@ pub struct Iface {
     gateway4: Option<Addr>,
     gateway6: Option<Addr>,
     dhcp_dns: Vec<Addr>,
+    /// The DHCP client's DISCOVERs: when it sends the next one again.
+    discovery: Option<Discovery>,
 }
 
 impl Iface {
+    /// Sends what the interface's sockets have to send. A DHCP client's next DISCOVER is
+    /// first given its delay, and the DISCOVERs the poll made are counted (`crate::dhcp`).
+    fn egress(&mut self, t: Instant) {
+        if let (Some(h), Some(d)) = (self.dhcp, self.discovery.as_ref()) {
+            let socket = self.set.get_mut::<dhcpv4::Socket>(h);
+            let mut retry = socket.get_retry_config();
+            retry.discover_timeout = Duration::from_micros(d.next_ns() / 1000);
+            socket.set_retry_config(retry);
+        }
+        let before = self.port.tx.len();
+        let _ = self.iface.poll_egress(t, &mut self.port, &mut self.set);
+        if let Some(d) = self.discovery.as_mut() {
+            for _ in self.port.tx[before..]
+                .iter()
+                .filter(|f| crate::dhcp::is_discover(f))
+            {
+                d.discovered();
+            }
+        }
+    }
+
+    /// The DHCP client starts over: its next DISCOVER is followed by the first delay again.
+    fn rediscover(&mut self) {
+        if let Some(d) = self.discovery.as_mut() {
+            d.restart();
+        }
+    }
+
     fn addrs(&self) -> Vec<Cidr> {
         self.iface
             .ip_addrs()
@@ -448,6 +480,7 @@ impl Stack {
                 netstack_mac(card.mac),
             )));
             ic.random_seed = next_seed();
+            let discovery_seed = ic.random_seed;
             let mut iface = Interface::new(ic, &mut port, t);
             let mut full = false;
             iface.update_ip_addrs(|a| {
@@ -498,6 +531,9 @@ impl Stack {
             );
             x.gateway4 = c.gateway4;
             x.gateway6 = c.gateway6;
+            // Its delays are randomized from the interface's own seed, turned so as not to
+            // repeat smoltcp's draws from it.
+            x.discovery = c.dhcp.then(|| Discovery::new(!discovery_seed));
             ifaces.push(x);
         }
         let mut stack = Stack {
@@ -545,6 +581,7 @@ impl Stack {
             && let Some(h) = i.dhcp
         {
             i.set.get_mut::<dhcpv4::Socket>(h).reset();
+            i.rediscover();
         }
         i.up = up;
         if !up {
@@ -743,7 +780,7 @@ impl Stack {
                 if !x.up {
                     continue;
                 }
-                let _ = x.iface.poll_egress(t, &mut x.port, &mut x.set);
+                x.egress(t);
             }
             for o in self.orphans.iter_mut() {
                 o.sent = true;
@@ -820,6 +857,8 @@ impl Stack {
         x.dhcp_dns.clear();
         let note = match event {
             Some((cidr, router, servers)) => {
+                // A lease taken: a client that loses it later starts its DISCOVERs over.
+                x.rediscover();
                 x.iface.update_ip_addrs(|a| {
                     let _ = a.push(IpCidr::Ipv4(cidr));
                 });
@@ -2931,6 +2970,7 @@ impl Iface {
             gateway4: None,
             gateway6: None,
             dhcp_dns: Vec::new(),
+            discovery: None,
         }
     }
 }

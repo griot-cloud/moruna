@@ -12,6 +12,7 @@ pub mod boot;
 pub mod card;
 pub mod config;
 pub mod device;
+pub mod dhcp;
 pub mod grant;
 mod session;
 mod stack;
