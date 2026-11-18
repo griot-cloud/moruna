@@ -65,7 +65,7 @@ impl Resource {
     /// The root resource of `kind`, covering everything of that kind.
     pub fn root(kind: ResourceKind, account: &Arc<Account>) -> Result<Resource, Error> {
         let range = match kind {
-            ResourceKind::Process => 0..0,
+            ResourceKind::Process | ResourceKind::Clock => 0..0,
             ResourceKind::DeviceMemory => 0..resource_range::DEVICE_END,
             ResourceKind::Interrupt => 0..resource_range::INTERRUPT_END,
             ResourceKind::Msi => 0..resource_range::MSI_END,

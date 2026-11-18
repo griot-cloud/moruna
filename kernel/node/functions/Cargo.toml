@@ -1,0 +1,11 @@
+[package]
+name = "node-functions"
+description = "A node's function images: fetched at a job's start, checked against their registered SHA-256, and kept in a cache bounded by node config's functions.cache_bytes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# SHA-256, pure Rust and the same on the kernel's target and a host (SDD 27).
+moruna-imagefs = { path = "../../imagefs/fs", version = "=0.1.0" }

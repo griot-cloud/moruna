@@ -238,6 +238,12 @@ impl Space {
         self.double_release.load(Ordering::Relaxed)
     }
 
+    /// The region's bounds, `[start, end)`: what [`Space::contains`] answers for.
+    pub(crate) fn range(&self) -> (usize, usize) {
+        let b = self.base as usize;
+        (b, b + self.bytes as usize)
+    }
+
     /// True when `ptr` is inside this region (f.7).
     pub(crate) fn contains(&self, ptr: *const u8) -> bool {
         let p = ptr as usize;

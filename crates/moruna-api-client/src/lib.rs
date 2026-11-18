@@ -46,8 +46,8 @@
 use std::io::{BufRead, BufReader};
 
 use moruna_api::{
-    Audit, ErrorBody, ErrorCode, ErrorDetail, Health, Job, JobStatus, Jobs, Method, Node,
-    Operation, Submitted, Validation,
+    Audit, ErrorBody, ErrorCode, ErrorDetail, Function, FunctionRegistration, Functions, Health,
+    Job, JobStatus, Jobs, Method, Node, Operation, Submitted, Validation,
 };
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde::Serialize;
@@ -79,7 +79,8 @@ pub struct Client {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Event {
     /// The record's number in the job's stream, from 1, for an `event`; `None` for the others.
-    /// A later call with `from` this number replays from this record.
+    /// A later call with `from` this number replays the records after this one, as Server-Sent
+    /// Events' `Last-Event-ID` does.
     pub id: Option<u64>,
     /// What it is: `event` (an event or log record), `heartbeat`, `report` or `exit`.
     pub name: String,
@@ -219,6 +220,22 @@ impl Client {
         self.send(operation("jobs_submit")?, None, Some(job))
     }
 
+    /// `POST /v1/functions`: register a function image by name, with its address, its SHA-256
+    /// and an Ed25519 signature over that SHA-256 by one of node config's `functions.keys`
+    /// (system design 3E). Nothing is fetched until a job names it; registering a name again
+    /// replaces it. It needs an `admin` token.
+    pub fn functions_register(
+        &self,
+        registration: &FunctionRegistration,
+    ) -> Result<Function, Error> {
+        self.send(operation("functions_register")?, None, Some(registration))
+    }
+
+    /// `GET /v1/functions`: every registered function. It needs an `observe` token.
+    pub fn functions_list(&self) -> Result<Functions, Error> {
+        self.call(operation("functions_list")?)
+    }
+
     /// `GET /v1/jobs`: the last 100 jobs, newest first. It needs an `observe` token.
     pub fn jobs_list(&self) -> Result<Jobs, Error> {
         self.call(operation("jobs_list")?)
@@ -242,9 +259,10 @@ impl Client {
         self.send(operation("jobs_report")?, Some(id), None::<&()>)
     }
 
-    /// `GET /v1/jobs/{id}/events`: the job's events as they arrive, from its record `from`
-    /// (its first when `None`) as far back as the node's buffer holds them: each event and log
-    /// record, heartbeats, then the report and the exit. It needs an `observe` token.
+    /// `GET /v1/jobs/{id}/events`: the job's events as they arrive, after its record `from`, the
+    /// last one already read (from its first when `None` or 0), as far back as the node's
+    /// buffer holds them: each event and log record, heartbeats, then the report and the exit.
+    /// It needs an `observe` token.
     pub fn jobs_events(&self, id: &str, from: Option<u64>) -> Result<Events, Error> {
         let operation = operation("jobs_events")?;
         let mut url = self.url(operation, Some(id));

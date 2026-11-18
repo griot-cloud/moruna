@@ -266,7 +266,8 @@ if it does, this section changes first.
   - The SynIC is enabled on CPU 0 only, and every channel targets it, by the VP index read from
     `HV_X64_MSR_VP_INDEX` on CPU 0, never assumed to be 0.
   - A GPADL's guest page numbers come from the DMA grant a driver already uses to pin memory.
-  - **DMA on Hyper-V:** `vmbus`, `storvsc` and `netvsc` each get a whole copy of `root.dma`.
+  - **DMA on Hyper-V:** a VMBus process that pins memory itself (`vmbus`, `storvsc`) gets a whole
+    copy of `root.dma`; one that doesn't (`netvsc`, whose buffers `vmbus` shares) gets none.
     With no IOMMU, a process that can write a VMBus ring can already name any guest page to the
     host, so a ring holder is trusted with all guest memory and the grant adds nothing. The
     narrowing is by process: only VMBus processes get it, and only on Hyper-V. With an IOMMU, page
@@ -392,7 +393,7 @@ Implements the OS design, section 2.
     `rights=grant,listen local=0.0.0.0/0@443`. A grant can hand out only what it holds, so it holds
     `listen`, but the supervisor never listens itself. At each start it mints `api`'s listener from
     it (`Client::grant`). `node.conf`'s one record says it all:
-    `restart api network network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=64`,
+    `restart api network network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000`,
     giving the service, its listener slot, the network server's service, its granting slot, and
     the policy. `network.conf`
     has no `listen-api` grant.
@@ -504,9 +505,16 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
 - **`api` is the engine's host.** The host protocol runs unchanged over a channel between `api` and
   the engine, instead of a socket: `api` sends `spec` and `cancel`, and reads `hello`, `heartbeat`,
   event records, `report` and `exit`.
-- **The budget** is the job document's `budget.memory_bytes`, at most the node's memory less 768 MiB:
-  512 MiB kept for the node's services and 256 MiB for a check running beside a job. A larger one
-  is refused.
+- **The budget** is the job document's `budget.memory_bytes`: the job's whole memory, and its
+  account is exactly that. In node mode the engine sizes itself from it: 128 MiB of engine overhead,
+  scratch at 1/4 of the remainder (unless the document names a staging volume), the arena the rest.
+- **Memory on a node is computed, never a constant.** Each service has a fixed account in node.conf
+  except `node-admission`, which takes `rest`: node memory less every other account and the kernel's
+  share. Jobs and checks are carved from it. The job bound is admission's account less the 256 MiB
+  check account (no scratch) and admission's own 128 MiB; `GET /v1/node` reports it as
+  `job_memory_bytes`, and a larger budget is refused. One image serves any node size. The cloud
+  profile's step-3 services are imagefs 256 MiB (a cache), linux 256 MiB, storage 128 MiB. The engine
+  receives its channel as it is (`grant <slot> channel <from>`, only with `runs 1`).
 - **Validation is the engine's.** `api` does not link `moruna-job`, which needs std. A document is
   checked by the engine itself:
   - `validate`: `node-admission` runs the engine's `check` on the document in a short-lived
@@ -557,6 +565,10 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
   below the engine: a source's connection gets no write lease. (Changed 2026-11-17 night from
   stream D's engine-driven virtio-blk, because Azure's disks are storvsc's and two paths are one too
   many; 3.3 measures the driver path against the direct one, and a loss is fixed in the protocol.)
+- **The engine's slots:** `volume.<n>` (a driver connection each) and a data slot `volumes`, one line
+  per volume, `<n> <serial> source|sink`. Admission holds the writer lease on every source volume
+  for the job's length, so the engine can read it and never write it. File bytes are as trusted as
+  an object store's; the layer's index is checked.
 - Every driver registers its disks in `devices`' directory with serial, size and read-only flag.
   The engine's check answers the job's `needs.volumes` (`[{"serial", "write"}]`); api passes them to
   `node-admission`'s `launch`, which grants exactly those connections. An unknown serial or the boot
@@ -601,10 +613,25 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
     `function_keys` (added to 1D's schema, 0 to 8 keys).
   - The node checks the signature and stores the entry. `GET /v1/functions` (observe) lists them.
     Nothing is fetched at registration.
-- **At job start,** `node-admission` has the engine fetch each function the job names, through its
-  job network (3D). The node refuses the job if a SHA-256 differs. Images are cached in memory, up
+- **At job start,** `node-admission` fetches each function the job names: it mints itself a channel
+  limited to the address's host on 443, fetches over HTTPS with the network server's TLS, checks the
+  SHA-256, and hands the engine the image as a read-only memory object, with no copy. The node
+  refuses the job if a SHA-256 differs. `address` is `https://` only (a pre-signed or SAS URL for a
+  private store); admission holds no store credentials. Images are cached in memory, up
   to node config's `functions.cache_bytes` (default 1 GiB, at most half the node's memory), until the node stops.
-- **A job names a function** by its registered name. An unregistered name is refused at `validate`.
+- **A job names a function** by its registered name, as a function task's `"function": "<name>"`;
+  the check's `needs.functions` lists them. An unregistered name is refused at `validate`.
+- **AWS's own S3** (no endpoint) is reached with path-style requests, so its host is
+  `s3.<region>.amazonaws.com`, known without the bucket; the region is required.
+
+### Known costs, scheduled after the OS path
+
+- **Window copies at IPC sinks and spills:** a batch held in a plane window is copied when an Arrow
+  IPC sink or a staging spill writes it, because the plane's memory is a second pool the arena does
+  not own. The fix is one pool: the plane draws its memory objects from the run's arena, under one
+  budget, so windows are arena memory a disk already reaches. Parquet sinks are unaffected.
+- **Page per buffer in records** (SDD 01 e.7): under 1% at 64Ki rows; revisited only if a time split
+  points at it.
 
 ### 3F. The full-year hang
 

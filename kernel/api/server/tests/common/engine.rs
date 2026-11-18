@@ -30,6 +30,9 @@ pub struct State {
     pub checked_names: Vec<Vec<String>>,
     /// The verdicts the next checks give, in order; a check with none finds the document sound.
     pub verdicts: VecDeque<Result<Vec<Refusal>, HostError>>,
+    /// The functions the next checks answer the job uses (its `needs.functions`), in order; a
+    /// check with none answers those of `needs`.
+    pub functions: VecDeque<Vec<String>>,
     /// While set, a check under way gives no verdict.
     pub hold_checks: bool,
     checking: bool,
@@ -178,7 +181,10 @@ impl EngineHost for Engine {
             return None;
         }
         state.checking = false;
-        let (memory_bytes, needs) = state.needs.clone();
+        let (memory_bytes, mut needs) = state.needs.clone();
+        if let Some(functions) = state.functions.pop_front() {
+            needs.functions = functions;
+        }
         Some(
             state
                 .verdicts

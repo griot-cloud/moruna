@@ -23,6 +23,35 @@ pub fn base64url(bytes: &[u8]) -> String {
     text
 }
 
+/// `bytes` in standard base64 with padding (RFC 4648, section 4), as node config writes keys.
+#[allow(dead_code)] // Not every crate that includes this file registers functions.
+pub fn base64(bytes: &[u8]) -> String {
+    let url = base64url(bytes).replace('-', "+").replace('_', "/");
+    let padding = (4 - url.len() % 4) % 4;
+    format!("{url}{}", "=".repeat(padding))
+}
+
+/// The SHA-256 of `bytes`, as 64 lowercase hexadecimal digits.
+#[allow(dead_code)] // Not every crate that includes this file registers functions.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A function's registration (system design 3E) for `image` at `address`, signed by `signer`.
+#[allow(dead_code)] // Not every crate that includes this file registers functions.
+pub fn registration(name: &str, address: &str, image: &[u8], signer: &Signer) -> String {
+    let sha256 = sha256_hex(image);
+    let digest = ring::digest::digest(&ring::digest::SHA256, image);
+    let signature = base64(&signer.signature(digest.as_ref()));
+    format!(
+        r#"{{"name":"{name}","address":"{address}","sha256":"{sha256}","signature":"{signature}"}}"#
+    )
+}
+
 /// A token issuer's key pair.
 pub struct Signer {
     pair: Ed25519KeyPair,
@@ -51,6 +80,13 @@ impl Signer {
             .as_ref()
             .try_into()
             .expect("an Ed25519 public key is 32 bytes")
+    }
+
+    /// An Ed25519 signature over `message` by this key: a function image's is over the 32 bytes
+    /// of its SHA-256 (system design 3E).
+    #[allow(dead_code)] // Not every crate that includes this file registers functions.
+    pub fn signature(&self, message: &[u8]) -> Vec<u8> {
+        self.pair.sign(message).as_ref().to_vec()
     }
 
     /// A compact JWT whose header and claims are these JSON texts, signed by this key.

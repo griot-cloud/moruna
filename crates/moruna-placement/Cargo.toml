@@ -24,6 +24,9 @@ cudarc = { workspace = true, optional = true }
 [dev-dependencies]
 # The fakes of contracts d.15; every PL test is written against them (k).
 moruna-testkit = { workspace = true }
+# PL-T10's spill test lays a stream out as e.7 did before the bitmaps of all ones were left
+# out, to measure what a spill saves.
+moruna-ipc-check = { workspace = true }
 
 [features]
 default = []

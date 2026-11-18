@@ -88,9 +88,6 @@ pub struct Network {
     listener: Option<(u32, Endpoint)>,
     /// An accept is outstanding on the listener.
     accepting: bool,
-    /// The last accept was refused for want of sockets: none is asked again until a
-    /// connection has closed.
-    full: bool,
     /// When the lease is looked at next, on the core's monotonic clock.
     look_at: u64,
     /// The requests sent and not yet answered, by their ids.
@@ -105,7 +102,6 @@ impl Network {
             client,
             listener: None,
             accepting: false,
-            full: false,
             look_at: 0,
             requests: BTreeMap::new(),
             streams: BTreeMap::new(),
@@ -198,8 +194,6 @@ impl Network {
                         }
                         // The listener has closed: its lease moved.
                         Err(CallError::Remote(net::Error::Closed)) if !current => {}
-                        // The grant's sockets are all held: none is asked until one closes.
-                        Err(CallError::Remote(net::Error::TooMany)) => self.full = true,
                         Err(error) => return Err(Error::Network("accept", error)),
                     }
                 }
@@ -247,7 +241,6 @@ impl Network {
                 Request::Close(socket) => match answer {
                     Ok(_) | Err(CallError::Remote(_)) => {
                         self.streams.remove(&socket);
-                        self.full = false;
                     }
                     Err(error) => return Err(Error::Network("close", error)),
                 },
@@ -289,7 +282,6 @@ impl Network {
     pub fn flush(&mut self) -> Result<(), Error> {
         if let Some((listener, _)) = self.listener
             && !self.accepting
-            && !self.full
         {
             let id = self.send(ACCEPT, listener, "accept")?;
             self.requests.insert(id, Request::Accept(listener));

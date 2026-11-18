@@ -746,6 +746,42 @@ fn handover() -> Handover {
         wall_clock: 1_794_931_200,
         read_at_ns: 2_140_000_000,
         memory_bytes: MEMORY,
+        boot_ms: None,
+    }
+}
+
+/// The node's `boot_ms` goes only in a later start's hand-over, and comes back as it went
+/// (item 2.2c).
+#[test]
+fn a_later_start_s_hand_over_carries_the_node_s_boot_ms() {
+    // The first start's has none: its message is as before.
+    let first = handover();
+    let message = first.encode().unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&message).unwrap();
+    assert!(json.get("boot_ms").is_none(), "{json}");
+    assert_eq!(Handover::decode(&message).unwrap().boot_ms, None);
+    // A later start's carries it.
+    let later = Handover {
+        boot_ms: Some(2_518),
+        ..handover()
+    };
+    let message = later.encode().unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&message).unwrap();
+    assert_eq!(json["boot_ms"], 2_518);
+    assert_eq!(Handover::decode(&message), Ok(later));
+    // It is a count of milliseconds, or the hand-over is refused.
+    for value in [
+        serde_json::json!("2518"),
+        serde_json::json!(-1),
+        serde_json::json!(2.5),
+    ] {
+        let mut json = json.clone();
+        json["boot_ms"] = value.clone();
+        assert_eq!(
+            Handover::decode(json.to_string().as_bytes()),
+            Err(HandoverError::Shape(Refusal::NotNumber("boot_ms"))),
+            "{value}"
+        );
     }
 }
 
@@ -982,10 +1018,10 @@ fn a_hand_over_that_is_not_one_is_refused() {
         HandoverError::Config(Refusal::Version("2".to_string()))
     );
     assert_eq!(
-        changed(&|json| json["boot_ms"] = 1.into()),
+        changed(&|json| json["booted_ms"] = 1.into()),
         HandoverError::Shape(Refusal::Unknown {
             within: "the hand-over",
-            field: "boot_ms".to_string()
+            field: "booted_ms".to_string()
         })
     );
     assert_eq!(

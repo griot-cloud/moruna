@@ -486,3 +486,22 @@ process personality
   exits 0
 # stream B1 hook: the supervisor sends the test its process resource.
 link supervisor.personality personality.supervisor
+
+# Item 5.0 (system design 5A0): an ordinary Rust program with std, built against Rust's
+# library/ with Moruna's platform layer (kernel/vendor/rust-std, kernel/tools/build-std.sh), and
+# arrow-rs: arrays, compute, IPC in memory, threads under one Mutex, a 2 MiB stack, the wall
+# clock, getrandom from the core. It has no log slot, so std writes its lines on the console.
+process std-arrow
+  memory 64MiB
+  handle console console
+  expect std-arrow: started as std-arrow
+  expect std-arrow: sum of 10 values is 55
+  expect std-arrow: filter value > 5 keeps [7, 9, 8, 6, 10]
+  expect std-arrow: sort gives [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  expect std-arrow: an IPC stream in memory reads back 5 rows: ["g", "i", "h", "f", "j"]
+  expect std-arrow: two threads pushed 2000 values under one Mutex
+  expect std-arrow: a thread recursed through 1 MiB of its stack
+  expect std-arrow: the wall clock reads a time after 2025
+  expect std-arrow: getrandom gave 32 bytes from the core
+  expect std-arrow: ok
+  exits 0

@@ -163,10 +163,10 @@ pub fn pieces(draft: RecordDraft, header: Buffer, record_start: u64, page: u64) 
 /// `BufferView` (contracts d.3 requires arena provenance), so its bytes are brought into an
 /// arena buffer once and the copy is declared through `Allocator::note_payload_copy`.
 ///
-/// In arrow 59.3.0 the encoder always writes its own validity bitmap, even for a column with
-/// no nulls and even when the array carries an arena-backed one, so 09 e.3's "the pieces are
-/// the batch's own buffers" holds for the data buffers and not for the bitmaps. Reported as a
-/// finding.
+/// In arrow 59.3.0 the encoder writes a validity bitmap of its own for every column with no
+/// nulls, all ones, which `encode_framing` leaves out of the record (`moruna_ipc_check::valid`);
+/// what it can still hand here is a bitmap with nulls that starts mid-byte, which arrow copies to
+/// re-slice it. 09 e.3's "the pieces are the batch's own buffers" holds for every other buffer.
 fn arena_backed(buffer: ArrowBuffer, alloc: &dyn Allocator) -> moruna_kernel::Result<PieceSrc> {
     if buffer.is_empty() || alloc.contains(buffer.as_ptr()) {
         return Ok(PieceSrc::Arrow(buffer));

@@ -25,6 +25,12 @@ ring = { version = "=0.17.14", default-features = false, features = ["alloc", "l
 getrandom = { version = "=0.2.17", features = ["custom"] }
 moruna-svc.workspace = true
 
+[features]
+# For the `cloud-test` image profile only, never a release image (work item 2.2c): a request to
+# `/v1/test/exit`, with no token, asks the server's caller to end, so that a test can kill `api`
+# from outside the node's design. Without it that path is in no operation.
+test-exit = []
+
 [dev-dependencies]
 # A real rustls client for the tests, as the network server's tests use; `tls12` so that a test
 # can show the server refuses a TLS 1.2 client.

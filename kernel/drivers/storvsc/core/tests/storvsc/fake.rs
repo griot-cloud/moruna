@@ -22,9 +22,9 @@ use guestmem_core::{MemoryWrite, ranges::PagedRange};
 use moruna_storvsc::{Address, PAGE};
 use moruna_vmbus::testing::{Device, Host as Vmbus, TestChannel};
 use scsi_defs::{
-    AdditionalSenseCode, Cdb10, Cdb16, CdbInquiry, DIRECT_ACCESS_DEVICE, ReadCapacity16Data,
-    ReadCapacityDataEx, SERVICE_ACTION_READ_CAPACITY16, ScsiOp, ScsiStatus, SenseData, SenseKey,
-    ServiceActionIn16, VPD_SERIAL_NUMBER, VpdPageHeader,
+    AdditionalSenseCode, Cdb10, Cdb16, CdbInquiry, DIRECT_ACCESS_DEVICE, LunList,
+    ReadCapacity16Data, ReadCapacityDataEx, ReportLuns, SERVICE_ACTION_READ_CAPACITY16, ScsiOp,
+    ScsiStatus, SenseData, SenseKey, ServiceActionIn16, VPD_SERIAL_NUMBER, VpdPageHeader,
     srb::{SrbStatus, SrbStatusAndFlags},
 };
 use storvsp_protocol::{
@@ -92,24 +92,42 @@ impl Memory {
     /// The first `len` bytes of the pages `gpns`, in order. `None` names a page the guest
     /// does not have.
     pub fn read(&self, gpns: &[u64], len: usize) -> Option<Vec<u8>> {
+        self.read_from(gpns, 0, len)
+    }
+
+    /// `len` bytes of the pages `gpns`, in order, from byte `offset` of the first.
+    pub fn read_from(&self, gpns: &[u64], offset: usize, len: usize) -> Option<Vec<u8>> {
         let mut out = Vec::with_capacity(len);
+        let mut skip = offset;
         for gpn in gpns {
             let at = self.page(*gpn)?;
-            let take = PAGE.min(len - out.len());
-            out.extend_from_slice(&self.bytes[at..at + take]);
+            let take = (PAGE - skip).min(len - out.len());
+            out.extend_from_slice(&self.bytes[at + skip..at + skip + take]);
+            skip = 0;
         }
         (out.len() == len).then_some(out)
     }
 
     /// Writes `data` over the first bytes of the pages `gpns`, in order.
     pub fn write(&mut self, gpns: &[u64], data: &[u8]) -> Option<()> {
-        let mut chunks = data.chunks(PAGE);
+        self.write_at(gpns, 0, data)
+    }
+
+    /// Writes `data` over the pages `gpns`, in order, from byte `offset` of the first.
+    pub fn write_at(&mut self, gpns: &[u64], offset: usize, data: &[u8]) -> Option<()> {
+        let mut left = data;
+        let mut skip = offset;
         for gpn in gpns {
-            let Some(chunk) = chunks.next() else { break };
+            if left.is_empty() {
+                break;
+            }
             let at = self.page(*gpn)?;
-            self.bytes[at..at + chunk.len()].copy_from_slice(chunk);
+            let (chunk, rest) = left.split_at((PAGE - skip).min(left.len()));
+            self.bytes[at + skip..at + skip + chunk.len()].copy_from_slice(chunk);
+            left = rest;
+            skip = 0;
         }
-        chunks.next().is_none().then_some(())
+        left.is_empty().then_some(())
     }
 }
 
@@ -139,6 +157,9 @@ impl FakeDisk {
 /// What the fake does wrong to the next SCSI request, when a test asks it to.
 #[derive(Clone, Copy)]
 pub enum Fault {
+    /// Nothing: the request is answered as it should be, so a fault queued after it is the
+    /// next request's.
+    Pass,
     /// Fails the command with this result.
     Scsi {
         srb: SrbStatus,
@@ -245,6 +266,8 @@ pub struct Host {
     pub stalled: bool,
     /// While set, it keeps its completions back.
     pub hold: bool,
+    /// While set, it fails REPORT LUNS as a device that does not know the command.
+    pub refuse_report_luns: bool,
     pub faults: VecDeque<Fault>,
 
     /// Every packet the guest sent: its operation and its transaction ID.
@@ -442,17 +465,22 @@ impl Host {
             "fake storvsp: bytes after the descriptor block"
         );
         let len = request.data_transfer_length as usize;
-        let gpns = match &ranges {
+        let (gpns, offset) = match &ranges {
             None => {
                 assert_eq!(len, 0, "fake storvsp: data and no pages");
-                Vec::new()
+                (Vec::new(), 0)
             }
             Some(ranges) => {
                 assert_eq!(ranges.range_count(), 1, "fake storvsp: one range a request");
                 let range = ranges.first().unwrap();
-                assert_eq!(range.offset(), 0, "fake storvsp: the range's offset");
+                assert!(range.offset() < PAGE, "fake storvsp: the range's offset");
                 assert_eq!(range.len(), len, "fake storvsp: the range's length");
-                range.gpns().to_vec()
+                assert_eq!(
+                    range.gpns().len(),
+                    (range.offset() + len).div_ceil(PAGE),
+                    "fake storvsp: the pages the range spans"
+                );
+                (range.gpns().to_vec(), range.offset())
             }
         };
 
@@ -464,7 +492,7 @@ impl Host {
                 moved: 0,
                 sense,
             },
-            _ => self.scsi(&request, &gpns),
+            _ => self.scsi(&request, &gpns, offset),
         };
 
         // `storvsp`'s completion (`storvsp/src/lib.rs:1389-1432`).
@@ -505,7 +533,7 @@ impl Host {
                     .with_autosense_valid(true);
                 header.status = nt_status(SrbStatus::ERROR);
             }
-            Some(Fault::Scsi { .. }) | None => {}
+            Some(Fault::Scsi { .. } | Fault::Pass) | None => {}
         }
         let mut bytes = [header.as_bytes(), response.as_bytes()].concat();
         bytes.resize(size, 0);
@@ -516,10 +544,64 @@ impl Host {
         });
     }
 
-    /// The five commands the library sends, as `scsidisk` answers them; any other is
-    /// the guest's fault.
-    fn scsi(&mut self, request: &ScsiRequest, gpns: &[u64]) -> ScsiResult {
+    /// REPORT LUNS for the target a request names, as SPC has it: every LUN of a disk on
+    /// that path and target, in peripheral device addressing; a target with none is not
+    /// there.
+    fn report_luns(&mut self, request: &ScsiRequest, gpns: &[u64]) -> ScsiResult {
         let len = request.data_transfer_length as usize;
+        assert_eq!(
+            request.data_in, SCSI_IOCTL_DATA_IN,
+            "fake storvsp: REPORT LUNS reads"
+        );
+        assert_eq!(request.cdb_length as usize, size_of::<ReportLuns>());
+        assert_eq!(request.lun, 0, "fake storvsp: REPORT LUNS goes to LUN 0");
+        let cdb = ReportLuns::read_from_prefix(&request.payload).unwrap().0;
+        assert_eq!(cdb.reserved1, [0; 5], "fake storvsp: select report 0");
+        assert_eq!(cdb.allocation_length.get() as usize, len);
+        assert_eq!((cdb.reserved2, cdb.control), (0, 0));
+        if self.refuse_report_luns {
+            return ScsiResult::illegal(AdditionalSenseCode::ILLEGAL_COMMAND);
+        }
+        let luns: Vec<u8> = self
+            .disks
+            .keys()
+            .filter(|(path, target, _)| (*path, *target) == (request.path_id, request.target_id))
+            .map(|(_, _, lun)| *lun)
+            .collect();
+        if luns.is_empty() {
+            return ScsiResult {
+                scsi: ScsiStatus::CHECK_CONDITION,
+                srb: SrbStatus::INVALID_TARGET_ID,
+                moved: 0,
+                sense: None,
+            };
+        }
+        let header = LunList {
+            length: ((luns.len() * 8) as u32).into(),
+            reserved: [0; 4],
+        };
+        let mut page = header.as_bytes().to_vec();
+        for lun in luns {
+            page.extend_from_slice(&[0, lun, 0, 0, 0, 0, 0, 0]);
+        }
+        page.truncate(len);
+        self.memory
+            .write(gpns, &page)
+            .expect("fake storvsp: a page the guest does not have");
+        ScsiResult::good(page.len())
+    }
+
+    /// The six commands the library sends, as `scsidisk` answers them; any other is
+    /// the guest's fault.
+    fn scsi(&mut self, request: &ScsiRequest, gpns: &[u64], offset: usize) -> ScsiResult {
+        let len = request.data_transfer_length as usize;
+        let op = ScsiOp(request.payload[0]);
+        if !matches!(op, ScsiOp::READ16 | ScsiOp::WRITE16) {
+            assert_eq!(offset, 0, "fake storvsp: an offset on {op:?}");
+        }
+        if op == ScsiOp::REPORT_LUNS {
+            return self.report_luns(request, gpns);
+        }
         let key = (request.path_id, request.target_id, request.lun);
         let Some(disk) = self.disks.get_mut(&key) else {
             // `storvsp/src/lib.rs:808-813`.
@@ -571,12 +653,12 @@ impl Host {
                 if read {
                     let data = disk.bytes[at..at + len].to_vec();
                     self.memory
-                        .write(gpns, &data)
+                        .write_at(gpns, offset, &data)
                         .expect("fake storvsp: a page the guest does not have");
                 } else {
                     let data = self
                         .memory
-                        .read(gpns, len)
+                        .read_from(gpns, offset, len)
                         .expect("fake storvsp: a page the guest does not have");
                     disk.bytes[at..at + len].copy_from_slice(&data);
                 }
@@ -822,6 +904,7 @@ pub fn pair_sized(ring: usize) -> (Link, Rc<RefCell<Host>>) {
         refuse: None,
         stalled: false,
         hold: false,
+        refuse_report_luns: false,
         faults: VecDeque::new(),
         seen: Vec::new(),
         offered: Vec::new(),

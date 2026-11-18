@@ -807,6 +807,98 @@
       }
     },
     {
+      "description": "A job's events, a page at a time: up to 1,000, and 1 MiB of them, after the record `from` (0, or absent, for the first), each event and log record with its number, then, once every record has been given and the job has ended, its report and its exit. `next` is the `from` of the next call: poll with it until the exit.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "description": "The number of the last record already read, as Server-Sent Events' Last-Event-ID: the records after it are sent. 0, or absent, for the first.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "description": "The run's ID.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "moruna_jobs_events",
+      "outputSchema": {
+        "description": "The answer of the MCP tool `moruna_jobs_events`: a page of a job's events, as a stream of\n`GET /v1/jobs/{id}/events` after the record `from` would send them at once, and where the\nnext page begins.",
+        "properties": {
+          "next": {
+            "description": "The `from` of the next call: the number of the last record in this page, or this call's\n`from` when the page holds none.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "records": {
+            "description": "At most 1,000, and at most 1 MiB of JSON unless the first alone is larger, in the order\nthe stream sends them: the job's event and log records after `from`, then, once they\nhave all been given, a note of the engine's skipped lines if it had any, and, once the\njob has ended, its report and its exit, which come together.",
+            "items": {
+              "description": "One event of a job's stream, as `GET /v1/jobs/{id}/events` sends it.",
+              "properties": {
+                "data": {
+                  "additionalProperties": true,
+                  "description": "Its JSON: the record's line as `moruna_event` renders it, or the engine's message.",
+                  "type": "object"
+                },
+                "event": {
+                  "description": "What it is.",
+                  "oneOf": [
+                    {
+                      "const": "event",
+                      "description": "An event or log record of the engine's.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "note",
+                      "description": "How many of the engine's lines were too long to read, and were skipped.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "report",
+                      "description": "The engine's `report` message: the run's report and its plan.",
+                      "type": "string"
+                    },
+                    {
+                      "const": "exit",
+                      "description": "The engine's `exit` message: its exit code and diagnostic. Nothing follows it.",
+                      "type": "string"
+                    }
+                  ]
+                },
+                "id": {
+                  "description": "The record's number in the job's stream, from 1, for an `event`; absent for the others.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "event",
+                "data"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "records",
+          "next"
+        ],
+        "title": "JobEvents",
+        "type": "object"
+      }
+    },
+    {
       "description": "A job's report, the engine's RunReport, once the job has ended.",
       "inputSchema": {
         "additionalProperties": false,
@@ -823,6 +915,134 @@
       },
       "name": "moruna_jobs_report",
       "outputSchema": {
+        "type": "object"
+      }
+    },
+    {
+      "description": "Register a function image by name: its https:// address, its SHA-256, and an Ed25519 signature over that SHA-256 by one of node config's functions.keys. Nothing is fetched until a job names it; registering a name again replaces it.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "A function image to register, the body of `POST /v1/functions` (system design 3E). Unknown\nfields are refused.",
+        "properties": {
+          "address": {
+            "description": "Where the image file is fetched from at job start: an `https://` URL. An object store's\nprivate object is given as a pre-signed or SAS URL.",
+            "type": "string"
+          },
+          "name": {
+            "description": "The name a job names the function by (a version 1 `kernels` entry\n`{\"kind\": \"function\", \"function\": \"<name>\"}`, a version 2 task of kind `function`): 1 to 64\ncharacters, a lowercase letter first, then lowercase letters, digits, `_`, `-` and `.`.",
+            "type": "string"
+          },
+          "sha256": {
+            "description": "The SHA-256 of the image file, as 64 lowercase hexadecimal digits.",
+            "type": "string"
+          },
+          "signature": {
+            "description": "An Ed25519 signature over the 32 bytes of that SHA-256, by one of node config's\n`functions.keys`, in standard base64.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "address",
+          "sha256",
+          "signature"
+        ],
+        "title": "FunctionRegistration",
+        "type": "object"
+      },
+      "name": "moruna_functions_register",
+      "outputSchema": {
+        "description": "A registered function, as `GET /v1/functions` lists it.",
+        "properties": {
+          "address": {
+            "description": "Where its image is fetched from.",
+            "type": "string"
+          },
+          "key": {
+            "description": "The first 16 hex characters of the SHA-256 of the public bytes of the key whose signature\nverified, as the audit record names a token key.",
+            "type": "string"
+          },
+          "name": {
+            "description": "The name a job names it by.",
+            "type": "string"
+          },
+          "registered": {
+            "description": "When it was registered, in Unix seconds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sha256": {
+            "description": "The SHA-256 of its image, as 64 lowercase hexadecimal digits.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "address",
+          "sha256",
+          "key",
+          "registered"
+        ],
+        "title": "Function",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Every registered function: its name, address, SHA-256, the key that signed it and when it was registered.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "moruna_functions_list",
+      "outputSchema": {
+        "description": "The answer to `GET /v1/functions`.",
+        "properties": {
+          "functions": {
+            "description": "Every registered function, by name.",
+            "items": {
+              "description": "A registered function, as `GET /v1/functions` lists it.",
+              "properties": {
+                "address": {
+                  "description": "Where its image is fetched from.",
+                  "type": "string"
+                },
+                "key": {
+                  "description": "The first 16 hex characters of the SHA-256 of the public bytes of the key whose signature\nverified, as the audit record names a token key.",
+                  "type": "string"
+                },
+                "name": {
+                  "description": "The name a job names it by.",
+                  "type": "string"
+                },
+                "registered": {
+                  "description": "When it was registered, in Unix seconds.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "sha256": {
+                  "description": "The SHA-256 of its image, as 64 lowercase hexadecimal digits.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "address",
+                "sha256",
+                "key",
+                "registered"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "functions"
+        ],
+        "title": "Functions",
         "type": "object"
       }
     }

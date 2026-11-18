@@ -297,6 +297,120 @@ class ExecutorKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class Function:
+    """A registered function, as `GET /v1/functions` lists it."""
+
+    name: str
+    """The name a job names it by."""
+
+    address: str
+    """Where its image is fetched from."""
+
+    sha256: str
+    """The SHA-256 of its image, as 64 lowercase hexadecimal digits."""
+
+    key: str
+    """The first 16 hex characters of the SHA-256 of the public bytes of the key whose signature
+    verified, as the audit record names a token key.
+    """
+
+    registered: int
+    """When it was registered, in Unix seconds."""
+
+    @classmethod
+    def from_json(cls, value: Any, where: str = "Function") -> Function:
+        """Read an answer's JSON value; a ``ValueError`` says where it is wrong."""
+        data = _object(value, where)
+        return cls(
+            name=_str(*_at(data, "name", where)),
+            address=_str(*_at(data, "address", where)),
+            sha256=_str(*_at(data, "sha256", where)),
+            key=_str(*_at(data, "key", where)),
+            registered=_int(*_at(data, "registered", where), 0, None),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        """The JSON value, as the node writes it."""
+        return {
+            "name": self.name,
+            "address": self.address,
+            "sha256": self.sha256,
+            "key": self.key,
+            "registered": self.registered,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FunctionRegistration:
+    """A function image to register, the body of `POST /v1/functions` (system design 3E). Unknown
+    fields are refused.
+    """
+
+    name: str
+    """The name a job names the function by (a version 1 `kernels` entry `{"kind": "function",
+    "function": "<name>"}`, a version 2 task of kind `function`): 1 to 64 characters, a lowercase
+    letter first, then lowercase letters, digits, `_`, `-` and `.`.
+    """
+
+    address: str
+    """Where the image file is fetched from at job start: an `https://` URL. An object store's
+    private object is given as a pre-signed or SAS URL.
+    """
+
+    sha256: str
+    """The SHA-256 of the image file, as 64 lowercase hexadecimal digits."""
+
+    signature: str
+    """An Ed25519 signature over the 32 bytes of that SHA-256, by one of node config's
+    `functions.keys`, in standard base64.
+    """
+
+    @classmethod
+    def from_json(cls, value: Any, where: str = "FunctionRegistration") -> FunctionRegistration:
+        """Read an answer's JSON value; a ``ValueError`` says where it is wrong."""
+        data = _object(value, where)
+        return cls(
+            name=_str(*_at(data, "name", where)),
+            address=_str(*_at(data, "address", where)),
+            sha256=_str(*_at(data, "sha256", where)),
+            signature=_str(*_at(data, "signature", where)),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        """The JSON value, as the node writes it."""
+        return {
+            "name": self.name,
+            "address": self.address,
+            "sha256": self.sha256,
+            "signature": self.signature,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Functions:
+    """The answer to `GET /v1/functions`."""
+
+    functions: list[Function]
+    """Every registered function, by name."""
+
+    @classmethod
+    def from_json(cls, value: Any, where: str = "Functions") -> Functions:
+        """Read an answer's JSON value; a ``ValueError`` says where it is wrong."""
+        data = _object(value, where)
+        return cls(
+            functions=[
+                Function.from_json(*item) for item in _items(*_at(data, "functions", where))
+            ],
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        """The JSON value, as the node writes it."""
+        return {
+            "functions": [item.to_json() for item in self.functions],
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class Health:
     """The answer to `GET /v1/health`."""
 
@@ -748,6 +862,29 @@ class Validation:
         return data
 
 
+def functions_list(client: Caller) -> Functions:
+    """Every registered function: its name, address, SHA-256, the key that signed it and when it was
+    registered.
+
+    ``GET /v1/functions``, a token with scope ``observe``.
+    """
+    answer = client.call("functions_list", "GET", "/v1/functions", token=True)
+    return Functions.from_json(answer)
+
+
+def functions_register(client: Caller, functionregistration: FunctionRegistration) -> Function:
+    """Register a function image by name: its https:// address, its SHA-256, and an Ed25519
+    signature over that SHA-256 by one of node config's functions.keys. Nothing is fetched until
+    a job names it; registering a name again replaces it.
+
+    ``POST /v1/functions``, a token with scope ``admin``.
+    """
+    answer = client.call(
+        "functions_register", "POST", "/v1/functions", token=True, body=functionregistration.to_json()
+    )
+    return Function.from_json(answer)
+
+
 def health(client: Caller) -> Health:
     """Whether the node is up. The only call that needs no token.
 
@@ -808,7 +945,8 @@ def jobs_cancel(client: Caller, id: str) -> JobStatus:
 
 def jobs_events(client: Caller, id: str, *, from_: int | None = None) -> Iterator[ServerSentEvent]:
     """A job's events as Server-Sent Events: each event and log record as its JSON line, heartbeats,
-    then the report and the exit. `from` replays from that record of the node's buffer.
+    then the report and the exit. `from` is the last record already read, as Server-Sent Events'
+    Last-Event-ID: the node's buffer is replayed after it.
 
     ``GET /v1/jobs/{id}/events``, a token with scope ``observe``.
     """
@@ -849,6 +987,25 @@ class Operations(Caller):
     """One method per operation, each a call of the operation's function above.
     ``moruna.api.Client`` inherits them, and supplies the ``call`` they go through.
     """
+
+    def functions_list(self) -> Functions:
+        """Every registered function: its name, address, SHA-256, the key that signed it and when it
+        was registered.
+
+        ``GET /v1/functions``, a token with scope ``observe``. The function
+        ``functions_list(self)``.
+        """
+        return functions_list(self)
+
+    def functions_register(self, functionregistration: FunctionRegistration) -> Function:
+        """Register a function image by name: its https:// address, its SHA-256, and an Ed25519
+        signature over that SHA-256 by one of node config's functions.keys. Nothing is fetched
+        until a job names it; registering a name again replaces it.
+
+        ``POST /v1/functions``, a token with scope ``admin``. The function
+        ``functions_register(self, functionregistration)``.
+        """
+        return functions_register(self, functionregistration)
 
     def health(self) -> Health:
         """Whether the node is up. The only call that needs no token.
@@ -900,8 +1057,8 @@ class Operations(Caller):
 
     def jobs_events(self, id: str, *, from_: int | None = None) -> Iterator[ServerSentEvent]:
         """A job's events as Server-Sent Events: each event and log record as its JSON line,
-        heartbeats, then the report and the exit. `from` replays from that record of the node's
-        buffer.
+        heartbeats, then the report and the exit. `from` is the last record already read, as
+        Server-Sent Events' Last-Event-ID: the node's buffer is replayed after it.
 
         ``GET /v1/jobs/{id}/events``, a token with scope ``observe``. The function
         ``jobs_events(self, id, from_=from_)``.

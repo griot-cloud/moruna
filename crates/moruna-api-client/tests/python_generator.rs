@@ -120,15 +120,19 @@ fn the_check_fails_when_the_document_changes_without_regenerating() {
 
 /// Python that runs a generated module (`sys.argv[1]`) and checks, for each operation ID in
 /// `sys.argv[2:]`, that its function and its `Operations` method make the same call and read
-/// the same answer. An operation is called with what it takes: a run's ID, a job, or nothing.
+/// the same answer. An operation is called with what it takes: a run's ID, a job, a function's
+/// registration, or nothing.
 const SAME_CALLS: &str = "import sys, runpy, inspect
 m = runpy.run_path(sys.argv[1])
 JOB = {'id': 'run-1', 'state': 'running', 'submitted': 1}
+FUNCTION = {'name': 'gate-score', 'address': 'https://x/gate-score', 'sha256': 'ab' * 32,
+            'key': '0123456789abcdef', 'registered': 1}
 ANSWERS = {
     'node': {'version': '0.7.0', 'instance': 'i', 'cloud': 'none', 'cores': 1,
              'memory_bytes': 1, 'executors': [], 'boot_ms': 1, 'time': 1, 'health': 'ok'},
     'jobs_validate': {'ok': True}, 'jobs_submit': {'id': 'run-1'}, 'jobs_list': {'jobs': [JOB]},
-    'jobs_get': JOB, 'jobs_cancel': JOB, 'jobs_report': {'rows_out': 1}}
+    'jobs_get': JOB, 'jobs_cancel': JOB, 'jobs_report': {'rows_out': 1},
+    'functions_register': FUNCTION, 'functions_list': {'functions': [FUNCTION]}}
 class Recorder(m['Operations']):
     def __init__(self):
         self.calls = []
@@ -140,7 +144,11 @@ class Recorder(m['Operations']):
         return iter([m['ServerSentEvent'](1, 'event', {'kind': 'attempt_started'})])
 def given(function):
     parameters = list(inspect.signature(function).parameters.items())[1:]
-    return [m['Job'](v1={'moruna_spec': 1}) if name == 'job' else 'run 1'
+    made = {'job': lambda: m['Job'](v1={'moruna_spec': 1}),
+            'functionregistration': lambda: m['FunctionRegistration'](
+                name='gate-score', address='https://x/gate-score', sha256='ab' * 32,
+                signature='c2ln')}
+    return [made.get(name, lambda: 'run 1')()
             for name, parameter in parameters if parameter.default is inspect.Parameter.empty]
 for name in sys.argv[2:]:
     by_function, by_method = Recorder(), Recorder()
@@ -156,6 +164,8 @@ for name in sys.argv[2:]:
         assert '/run%201' in by_method.calls[0][2], by_method.calls
     if name in ('jobs_validate', 'jobs_submit'):
         assert by_method.calls[0][4] == {'v1': {'moruna_spec': 1}}, by_method.calls
+    if name == 'functions_register':
+        assert by_method.calls[0][4]['name'] == 'gate-score', by_method.calls
 ";
 
 /// The operation IDs of an OpenAPI document.
@@ -178,6 +188,8 @@ fn the_committed_module_has_a_method_per_operation_that_calls_its_function() {
     assert_eq!(
         ids,
         [
+            "functions_list",
+            "functions_register",
             "health",
             "jobs_cancel",
             "jobs_events",
