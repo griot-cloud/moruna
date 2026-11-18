@@ -521,6 +521,11 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
 - **The budget** is the job document's `budget.memory_bytes`: the job's whole memory, and its
   account is exactly that. In node mode the engine sizes itself from it: 128 MiB of engine overhead,
   scratch at 1/4 of the remainder (unless the document names a staging volume), the arena the rest.
+  **The arena bounds how far reading runs ahead, never how many workers decode.** A read that does
+  not fit beside those in flight is cut to the room left, from a split that can be cut (a Parquet
+  row group by its pages), not refused while workers idle. The no-kernel read target lets
+  `read_ahead` reads fit at their charge. Found by 6.3a: at 3A's split of 1 GiB, one of two workers
+  idled half the run, because each whole row group was charged twice its size.
 - **Memory on a node is computed, never a constant.** Each service has a fixed account in node.conf
   except `node-admission`, which takes `rest`: node memory less every other account and the kernel's
   share. Jobs and checks are carved from it. The job bound is admission's account less the 256 MiB
