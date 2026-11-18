@@ -28,6 +28,17 @@ const DATA_PAGE_V2: i64 = 3;
 /// How deep a skipped value may nest (a page header's statistics are two levels down).
 const DEPTH: u8 = 16;
 
+/// Whether the pages of `metadata`'s `projected` leaf columns can be located from their
+/// headers: a header gives a page's rows only in a column with no repetition, so every
+/// projected column must have none. A row group whose pages are found to be unlocatable later
+/// (`one_group_indexed`) is told apart by the source.
+pub(crate) fn locatable(metadata: &ParquetMetaData, projected: &[usize]) -> bool {
+    let schema = metadata.file_metadata().schema_descr();
+    projected
+        .iter()
+        .all(|&leaf| leaf < schema.num_columns() && schema.column(leaf).max_rep_level() == 0)
+}
+
 /// Row group `row_group` of `metadata` on its own, with page locations for its `projected` leaf
 /// columns, read from the column chunks in `chunks`; `None` when its pages cannot be located
 /// from their headers. The returned metadata holds one row group, so a reader built on it
@@ -39,16 +50,15 @@ pub(crate) fn one_group_indexed(
     chunks: &impl ChunkReader,
 ) -> Option<Arc<ParquetMetaData>> {
     let group = metadata.row_groups().get(row_group)?;
-    let schema = metadata.file_metadata().schema_descr();
+    if !locatable(metadata, projected) {
+        return None;
+    }
     let mut index = Vec::with_capacity(group.num_columns());
     for leaf in 0..group.num_columns() {
         if !projected.contains(&leaf) {
             // Never read: a reader only opens the columns of its projection.
             index.push(OffsetIndexBuilder::new().build());
             continue;
-        }
-        if schema.column(leaf).max_rep_level() != 0 {
-            return None;
         }
         let chunk = group.column(leaf);
         let start = u64::try_from(
@@ -360,6 +370,9 @@ mod tests {
                 .clone();
             assert!(meta.offset_index().is_none(), "the file has no page index");
             let meta = Arc::new(meta);
+            assert!(locatable(&meta, &[0, 1, 2]));
+            assert!(!locatable(&meta, &[0, 9]), "no such column");
+            assert!(one_group_indexed(&meta, 0, &[0, 9], &bytes).is_none());
             let indexed = one_group_indexed(&meta, 0, &[0, 1, 2], &bytes).expect("located");
             let index = indexed.offset_index().expect("an offset index");
             for column in &index[0] {

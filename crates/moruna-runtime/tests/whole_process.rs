@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arrow::array::{Int64Array, RecordBatch, StringArray};
+use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use moruna_job::JobSpec;
 use moruna_kernel::{
@@ -300,4 +300,128 @@ fn a_budget_under_the_floor_is_refused_with_the_floor() {
     assert!(floor > budget, "{message}");
     assert!(message.contains("an arena of"), "{message}");
     assert!(!scratch.path().join("out").exists(), "nothing was written");
+}
+
+/// A file of `groups` row groups of `rows` rows each, written a group at a time from `group`.
+fn grouped(path: &Path, groups: i64, rows: i64, group: impl Fn(i64, i64) -> RecordBatch) {
+    let first = group(0, rows);
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_max_row_group_row_count(Some(rows as usize))
+        .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
+        .build();
+    let file = std::fs::File::create(path).expect("the input file");
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new(file, first.schema(), Some(props)).expect("a writer");
+    writer.write(&first).expect("a group");
+    writer.flush().expect("the group closed");
+    for g in 1..groups {
+        writer.write(&group(g * rows, rows)).expect("a group");
+        writer.flush().expect("the group closed");
+    }
+    writer.close().expect("closed");
+}
+
+/// `file` into a count sink with two workers at the smaller budget: the run completes, the
+/// controller never stops it for outgrowing its ceiling, and the process stays under it.
+fn counted_within(scratch: &Scratch, file: &Path, rows: u64, what: &str) {
+    let budget = BUDGETS[0];
+    let outcome = apart::run(
+        "child_run",
+        &json!({
+            "moruna_spec": 1,
+            "source": {"kind": "parquet", "url": file},
+            "sink": {"kind": "count"},
+            "budget": {"memory_bytes": budget, "cpu": 2.0},
+            "profiles_dir": scratch.path().join("profiles"),
+        }),
+    );
+    let report = apart::within(&outcome, what, budget);
+    let notes = report["notes"].as_array().expect("notes");
+    assert!(
+        !notes
+            .iter()
+            .filter_map(|n| n.as_str())
+            .any(|n| n.contains("rather than let the operating system stop it")),
+        "{what}: {notes:?}"
+    );
+    assert_eq!(report["sinks"][0]["rows"].as_u64(), Some(rows), "{what}");
+}
+
+/// 3A (6.3a): two workers decode at once, each holding one batch outside the arena. A row
+/// group here decodes to about 68 MB of nullable measures: built whole in the heap it holds
+/// more than its own bytes while it is decoded, and two decodes at once pass the headroom the
+/// arena leaves at 256 MiB (about 79 MB). Decoded whole (`decode_batches_of(None)`), this run
+/// was stopped for outgrowing its ceiling; in batches it ends at about 0.77 of it.
+#[test]
+fn two_decoding_workers_hold_a_batch_each_outside_the_arena() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("whole_batches");
+    let file = scratch.path().join("in.parquet");
+    let (groups, rows) = (5i64, 1_400_000i64);
+    grouped(&file, groups, rows, |from, rows| {
+        // Taxi-like columns: nullable measures of many distinct values.
+        let measure = |salt: i64| {
+            Arc::new(Float64Array::from_iter((from..from + rows).map(|r| {
+                (r % 13 != salt).then(|| ((r * 2_654_435_761 + salt) % 1_000_003) as f64 / 7.0)
+            }))) as _
+        };
+        RecordBatch::try_from_iter([
+            ("a", measure(1)),
+            ("b", measure(2)),
+            ("c", measure(3)),
+            ("d", measure(4)),
+            ("e", measure(5)),
+            ("f", measure(6)),
+        ])
+        .expect("a group")
+    });
+    counted_within(
+        &scratch,
+        &file,
+        (groups * rows) as u64,
+        "two workers decoding row groups of 68 MB",
+    );
+}
+
+/// 3A (6.3a): string-heavy data, a FineWeb-like text column whose rows are skewed (most a few
+/// hundred bytes, one in five hundred a hundred kilobytes), read by two workers at the smaller
+/// budget. A part of a group holds its text whole outside the arena until it ends, which is no
+/// more than its own decoded bytes, the arena sizing's assumption for every byte in flight.
+#[test]
+fn string_heavy_parts_hold_no_more_than_their_own_bytes() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("whole_text");
+    let file = scratch.path().join("in.parquet");
+    let (groups, rows) = (4i64, 60_000i64);
+    grouped(&file, groups, rows, |from, rows| {
+        let text: Vec<String> = (from..from + rows)
+            .map(|r| {
+                let length = if r % 500 == 7 {
+                    100_000
+                } else {
+                    150 + (r % 7) as usize * 60
+                };
+                let mut row = note(r);
+                while row.len() < length {
+                    row.push_str(&note(r + row.len() as i64));
+                }
+                row.truncate(length);
+                row
+            })
+            .collect();
+        RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int64Array::from_iter_values(from..from + rows)) as _,
+            ),
+            ("text", Arc::new(StringArray::from(text)) as _),
+        ])
+        .expect("a group")
+    });
+    counted_within(
+        &scratch,
+        &file,
+        (groups * rows) as u64,
+        "two workers decoding skewed text",
+    );
 }

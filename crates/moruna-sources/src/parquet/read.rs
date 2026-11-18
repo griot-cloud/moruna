@@ -7,9 +7,10 @@ use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
 };
+use parquet::file::metadata::ParquetMetaData;
 
-use super::ParquetSource;
 use super::reader::ArenaChunks;
+use super::{ParquetSource, append};
 use crate::stats::Counters;
 use crate::util::{oversized, page_ceil, page_floor, resolve_range, source_err};
 
@@ -144,6 +145,7 @@ fn fetch_now(
     }
 
     let chunks = ArenaChunks::new(file_len, fetched);
+    Counters::add(&source.counters().group_fetches, 1);
     source.keep_fetched(split.id, &chunks, last);
     Ok(ParquetFetched { chunks, range })
 }
@@ -170,12 +172,29 @@ pub(crate) fn decode_fetched(
         .then(|| source.paged(split, file, entry, &chunks))
         .flatten()
     {
-        Some(indexed) => (indexed, 0),
+        Some(indexed) => {
+            Counters::add(&source.counters().ranges_paged, 1);
+            (indexed, 0)
+        }
         None => (std::sync::Arc::clone(&file.metadata), entry.row_group),
     };
+    if partial {
+        Counters::add(&source.counters().ranges_decoded, 1);
+    }
     let arrow_meta = ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())
         .map_err(|e| source_err(split.id, e.to_string()))?;
     let wanted = (range.end - range.start).max(1);
+    // 3A (6.3a): a range whose columns are flat is decoded a batch at a time into its arena
+    // buffers (`append`), so what a read holds outside the arena never exceeds its own decoded
+    // bytes: one batch of its fixed-width columns, and the bytes of string and binary columns
+    // that have no exact figure (a part of a group, or a file that does not state them). Any
+    // other range is decoded whole and copied, as before.
+    let appended = append::writable(&file.schema);
+    let batch_rows = if appended {
+        batch_rows(source, split, file, entry, &chunks, wanted)
+    } else {
+        wanted
+    };
     let selection = RowSelection::from_consecutive_ranges(
         std::iter::once(range.start as usize..range.end as usize),
         split.rows as usize,
@@ -183,7 +202,7 @@ pub(crate) fn decode_fetched(
     let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(chunks, arrow_meta)
         .with_row_groups(vec![row_group])
         .with_projection(mask)
-        .with_batch_size(usize::try_from(wanted).unwrap_or(usize::MAX));
+        .with_batch_size(usize::try_from(batch_rows).unwrap_or(usize::MAX));
     if partial {
         builder = builder.with_row_selection(selection);
     }
@@ -191,33 +210,66 @@ pub(crate) fn decode_fetched(
     let reader = builder
         .build()
         .map_err(|e| source_err(split.id, format!("building the row group reader: {e}")))?;
-    let mut batches = Vec::new();
-    for batch in reader {
-        batches.push(batch.map_err(|e| {
-            source_err(
-                split.id,
-                format!(
-                    "decoding row group {} of {}: {e}",
-                    entry.row_group,
-                    file.path.display()
-                ),
-            )
-        })?);
-    }
-    let decoded = concat(&file.schema, batches, split.id)?;
-    if decoded.num_rows() as u64 != range.end - range.start {
-        return Err(source_err(
+    let decode_error = |e: moruna_kernel::arrow::error::ArrowError| {
+        source_err(
             split.id,
             format!(
-                "the decoder returned {} rows for a range of {} (SO-I4)",
-                decoded.num_rows(),
-                range.end - range.start
+                "decoding row group {} of {}: {e}",
+                entry.row_group,
+                file.path.display()
             ),
-        ));
+        )
+    };
+    let rows = usize::try_from(range.end - range.start).unwrap_or(usize::MAX);
+    let mut batches = Vec::new();
+    let mut into: Option<append::Appender> = None;
+    for batch in reader {
+        let batch = batch.map_err(&decode_error)?;
+        source
+            .counters()
+            .batch(batch.get_array_memory_size() as u64);
+        if !appended {
+            batches.push(batch);
+            continue;
+        }
+        if into.is_none() {
+            // A whole group's decoded bytes are exact when its file states them (`plan`), and
+            // only then; a share of them by rows bounds no part of it.
+            let exact = (!partial && !split.estimated).then_some(split.column_bytes.as_slice());
+            into = Some(append::Appender::reserve(
+                split.id,
+                &batch.schema(),
+                rows,
+                exact,
+                alloc,
+                tier,
+            )?);
+        }
+        if let Some(into) = into.as_mut() {
+            into.append(&batch)?;
+        }
     }
-
-    let (batch, copied) = super::decode_copy::copy_batch(&decoded, alloc, tier)?;
-    drop(decoded);
+    let (batch, copied) = match into {
+        Some(into) => {
+            let batch = into.finish()?;
+            let copied = append::payload_bytes(&batch);
+            (batch, copied)
+        }
+        None => {
+            let decoded = concat(&file.schema, batches, split.id)?;
+            if decoded.num_rows() as u64 != range.end - range.start {
+                return Err(source_err(
+                    split.id,
+                    format!(
+                        "the decoder returned {} rows for a range of {} (SO-I4)",
+                        decoded.num_rows(),
+                        range.end - range.start
+                    ),
+                ));
+            }
+            super::decode_copy::copy_batch(&decoded, alloc, tier)?
+        }
+    };
     Counters::add(&source.counters().decode_bytes, copied);
     // G-I2 grants a source decoding a non-layout-preserving format exactly one CPU copy of a
     // morsel's payload, and this is where it is counted (contracts d.3).
@@ -245,6 +297,57 @@ pub(crate) fn decode_fetched(
         "parquet read",
     );
     Ok(payload)
+}
+
+/// The rows a batch of a range of `wanted` rows decodes at once (3A, 6.3a): as many as the
+/// source's decode batch holds (`ParquetSource::decode_batches_of`, the headroom above the arena
+/// over the workers that decode at once), by the split's decoded bytes a row, and never fewer
+/// than a page holds, in the projected column whose pages hold the fewest rows. A source with no
+/// decode batch, or a group whose pages cannot be located, decodes its range in one batch.
+fn batch_rows(
+    source: &ParquetSource,
+    split: &Split,
+    file: &super::plan::FileMeta,
+    entry: &super::plan::Entry,
+    chunks: &ArenaChunks,
+    wanted: u64,
+) -> u64 {
+    let Some(bytes) = source.decode_batch_bytes() else {
+        return wanted;
+    };
+    let per_row = (split.uncompressed_bytes / split.rows.max(1)).max(1);
+    let rows = bytes / per_row;
+    if rows >= wanted {
+        // The range fits one batch: its pages need not be located for a floor.
+        return wanted;
+    }
+    let Some(floor) = source
+        .paged(split, file, entry, chunks)
+        .and_then(|indexed| page_rows(&indexed, &file.projected))
+    else {
+        return wanted;
+    };
+    rows.max(floor).clamp(1, wanted)
+}
+
+/// The rows a page holds in the `projected` column whose pages hold the fewest, each column
+/// counted by its largest page; `None` when no projected column has a located page.
+fn page_rows(indexed: &ParquetMetaData, projected: &[usize]) -> Option<u64> {
+    let group = indexed.offset_index()?.first()?;
+    let rows = indexed.row_group(0).num_rows();
+    projected
+        .iter()
+        .filter_map(|&leaf| {
+            let pages = group.get(leaf)?.page_locations();
+            let starts: Vec<i64> = pages.iter().map(|page| page.first_row_index).collect();
+            starts
+                .iter()
+                .zip(starts.iter().skip(1).chain(std::iter::once(&rows)))
+                .map(|(start, end)| u64::try_from(end - start).unwrap_or(0))
+                .max()
+        })
+        .filter(|&rows| rows > 0)
+        .min()
 }
 
 /// Merge spans whose gap is under `COALESCE_GAP`, then round each outward to page boundaries

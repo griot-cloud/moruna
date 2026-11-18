@@ -292,6 +292,10 @@ pub(crate) struct SourceEnd {
     /// Reads that met a full arena and wait to be issued again (RB5): in flight, for the stall
     /// detector.
     pub(crate) waiting_reads: std::sync::atomic::AtomicUsize,
+    /// The most its reads in flight were ever charged at once (f.5). Admission keeps it within
+    /// the arena for every read it admits or cuts to fit (3A); only a read that cannot be cut,
+    /// admitted when the run holds nothing, may pass it, for the arena to decide.
+    pub(crate) charged_peak: std::sync::atomic::AtomicU64,
     pub(crate) helper_tx: Sender<HelperRequest>,
     pub(crate) helper_rx: Mutex<Option<Receiver<HelperRequest>>>,
     pub(crate) handle: Mutex<Option<JoinHandle<()>>>,
@@ -663,6 +667,7 @@ impl Shared {
                 out: EndCounters::default(),
                 decoded: crate::decode_ratio::DecodeRatio::default(),
                 waiting_reads: std::sync::atomic::AtomicUsize::new(0),
+                charged_peak: std::sync::atomic::AtomicU64::new(0),
                 helper_tx,
                 helper_rx: Mutex::new(Some(helper_rx)),
                 handle: Mutex::new(None),

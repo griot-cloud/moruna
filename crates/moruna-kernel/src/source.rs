@@ -79,6 +79,15 @@ pub trait Source: Send + Sync {
     fn decodes_on_workers(&self) -> bool {
         false
     }
+    /// Whether a row range of `split` is read for its own rows only: the ranges of one split
+    /// share what is fetched for it, and each decodes just the rows it covers. The drive cuts a
+    /// read that does not fit beside those in flight to the room the arena has left only from
+    /// such a split (system design 3A); any other is read whole, one at a time when only one
+    /// fits. The default is `split.sub_splittable`, for a source whose ranges are slices of
+    /// what it reads.
+    fn range_reads_own_rows(&self, split: &Split) -> bool {
+        split.sub_splittable
+    }
     /// The I/O half of a read: a split's (or a row range's) bytes, into buffers from `alloc`.
     /// Runs on the drive and may wait on the reactor. Called only when `decodes_on_workers`.
     fn fetch<'a>(

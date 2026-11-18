@@ -31,6 +31,9 @@ pub struct BuildCtx {
     pub run_id: RunId,
     /// The arena's host capacity when the run started.
     pub arena_bytes: u64,
+    /// What the run may hold above its arena: its allowance (the budget less what the process
+    /// held before the arena, the reserve and the kernels' declared state) less the arena.
+    pub headroom_bytes: u64,
     /// How many sinks the run has: they share the arena's file buffer share (contracts d.16).
     pub sinks: u16,
     /// The workers the run may have at most: a sink that encodes on workers opens a file per
@@ -39,6 +42,11 @@ pub struct BuildCtx {
     /// The file buffers the sinks claimed out of the arena ([`BuildCtx::claim_file_buffer`]).
     pub(crate) sink_buffer: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// How many times its batch one decode may hold outside the arena at its height: twice for the
+/// buffers it grows by doubling, and as much again for its pages, dictionaries and levels
+/// (`BuildCtx::decode_batch_bytes`).
+const DECODE_HOLDS: u64 = 4;
 
 impl BuildCtx {
     /// The most one sink that encodes files in the arena (Parquet) may hold for its file
@@ -63,6 +71,17 @@ impl BuildCtx {
         self.sink_buffer
             .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
         bytes
+    }
+
+    /// The most decoded bytes one decode may build outside the arena at once (system design 3A,
+    /// item 6.3a): the headroom above the arena over the workers that may decode at once, and a
+    /// quarter of that. A decoder builds a batch in buffers that grow by doubling, so twice the
+    /// batch, and beside them holds its columns' current pages, their dictionaries and their
+    /// definition levels, about as much again: a worker's decode holds up to four times its
+    /// batch, and the workers' decodes together no more than the headroom.
+    pub fn decode_batch_bytes(&self) -> Option<u64> {
+        let share = self.headroom_bytes / (u64::from(self.workers.max(1)) * DECODE_HOLDS);
+        (share > 0).then_some(share)
     }
 
     /// What the sinks claimed with [`BuildCtx::claim_file_buffer`]; zero when none claimed.
@@ -383,6 +402,7 @@ mod tests {
             object_metadata: metadata,
             run_id: RunId([3; 16]),
             arena_bytes: 139_198_464,
+            headroom_bytes: 0,
             sinks: 1,
             workers: 1,
             sink_buffer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -402,6 +422,19 @@ mod tests {
             ..self::ctx(None)
         };
         assert_eq!(empty.claim_file_buffer(), 0);
+    }
+
+    /// 3A (6.3a): a decode's batch is the headroom above the arena over the workers that may
+    /// decode at once, halved; a run with no headroom decodes each range whole.
+    #[test]
+    fn a_decode_batch_shares_the_headroom_among_the_workers() {
+        assert_eq!(ctx(None).decode_batch_bytes(), None);
+        let two = BuildCtx {
+            headroom_bytes: 200 << 20,
+            workers: 2,
+            ..ctx(None)
+        };
+        assert_eq!(two.decode_batch_bytes(), Some(25 << 20));
     }
 
     /// A built source or sink is handed back unchanged; a builder is run.

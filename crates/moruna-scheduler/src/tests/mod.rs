@@ -41,6 +41,9 @@ mod sc_t43_a_refused_output_waits;
 mod sc_t44_a_refused_output_asks_for_room;
 mod sc_t45_an_immovable_wall_ends_the_run;
 mod sc_t46_a_stuck_sink_is_flushed;
+// Item 6.3a: a budget bounds how far reading runs ahead, not how many workers decode.
+mod sc_t47_a_budget_bounds_reads_not_decoders;
+mod sc_t47_b_parquet_groups_cut_by_their_pages;
 mod sc_t4_one_record_per_morsel_stage;
 // stream P: a native stage's instances fed in turn.
 mod sc_p_dealt_instances;

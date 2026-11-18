@@ -57,6 +57,9 @@ const KERNEL_ANON_SHARE: f64 = 0.6;
 const READ_AHEAD_SHARE: f64 = 0.5;
 /// The read-ahead depth f.3 starts from (`readahead.splits`).
 const READ_AHEAD_INITIAL: u16 = 2;
+/// What the source drive charges the arena per byte a read decodes to: twice, the most a size
+/// class rounds a buffer up by (02 e.2; the scheduler's `ARENA_ROUNDING`).
+const READ_CHARGE: u64 = 2;
 /// The promotion window f.3 starts from (`queue.promotion_window`).
 const PROMOTION_WINDOW_INITIAL: u16 = 2;
 
@@ -585,8 +588,11 @@ pub(crate) fn initial_knobs(state: &mut ControllerState) -> Result<Actions> {
 
     if state.stage_count() == 0 {
         // The zero-kernel path of f.3: there is no stage to size for, so the source drive
-        // reads at a target of its own and one worker moves the morsels through.
-        let bytes = state.cfg.morsel_max.min(state.budgets.host / 2);
+        // reads at a target of its own and one worker moves the morsels through. The target
+        // lets the read-ahead's reads fit in the arena at their charge (3A, 6.3a): the arena
+        // bounds how far reading runs ahead, never how many workers decode.
+        let reads = u64::from(READ_AHEAD_INITIAL) * READ_CHARGE;
+        let bytes = state.cfg.morsel_max.min(state.budgets.host / reads);
         state.active_workers = 1;
         state.read_ahead = READ_AHEAD_INITIAL;
         actions.knobs.push(Knob::MorselTarget { stage: 0, bytes });

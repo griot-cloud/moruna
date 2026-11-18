@@ -25,6 +25,22 @@ const MORSEL: u64 = 1024;
 /// The host tier holds eight morsels; the run moves forty-eight.
 const ARENA: u64 = 8 * MORSEL;
 
+/// Every one of the 48 splits' rows reached the sink once, as morsels numbered from 0 with no
+/// gap and none twice. A split may arrive as more than one morsel: a read that fits the arena but
+/// not beside the reads in flight is cut to the room left (3A, 6.3a).
+fn every_row_once(rig: &super::common::Rig, rows: u64, what: &str) {
+    assert_eq!(rows, 48 * 128, "{what}: every row reached the sink");
+    let mut written = rig.sink.written();
+    written.sort_unstable();
+    let count = written.len() as u64;
+    assert_eq!(
+        written,
+        (0..count).collect::<Vec<u64>>(),
+        "{what}: every morsel reached the sink once"
+    );
+    assert!(count >= 48, "{what}: {count} morsels");
+}
+
 fn copy_rig(alloc: FakeAllocator, read_ahead: u16) -> super::common::Rig {
     RigBuilder::new()
         .cfg(|cfg| {
@@ -44,20 +60,14 @@ fn sc_t22_copy_behind_a_slow_sink_never_meets_a_full_arena() {
     for read_ahead in [1u16, 2, 4] {
         let alloc = FakeAllocator::new().with_limit(Tier::Host, ARENA);
         let rig = copy_rig(alloc.clone(), read_ahead);
-        match rig.scheduler.run(CancelToken::new()) {
-            Ok(crate::RunOutcome::Completed { .. }) => {}
+        let rows = match rig.scheduler.run(CancelToken::new()) {
+            Ok(crate::RunOutcome::Completed { sinks }) => sinks[0].rows,
             other => panic!(
                 "read-ahead {read_ahead}: a copy behind a slow sink ended with {other:?}; the \
                  arena refused a read the drive should not have issued"
             ),
-        }
-        let mut written = rig.sink.written();
-        written.sort_unstable();
-        assert_eq!(
-            written,
-            (0..48).collect::<Vec<u64>>(),
-            "read-ahead {read_ahead}: every morsel reached the sink once"
-        );
+        };
+        every_row_once(&rig, rows, &format!("read-ahead {read_ahead}"));
         assert_eq!(
             alloc.in_use(Tier::Host),
             0,
@@ -159,13 +169,11 @@ fn sc_t22_copy_behind_a_slow_sink_waits_for_its_replacements() {
         .sink(FakeSink::new().latency(Duration::from_millis(2)))
         .alloc(FakeAllocator::new().with_limit(Tier::Host, ARENA))
         .go();
-    match rig.scheduler.run(CancelToken::new()) {
-        Ok(crate::RunOutcome::Completed { .. }) => {}
+    let rows = match rig.scheduler.run(CancelToken::new()) {
+        Ok(crate::RunOutcome::Completed { sinks }) => sinks[0].rows,
         other => panic!("expected Completed, got {other:?}"),
-    }
-    let mut written = rig.sink.written();
-    written.sort_unstable();
-    assert_eq!(written, (0..48).collect::<Vec<u64>>(), "every morsel, once");
+    };
+    every_row_once(&rig, rows, "behind replacements");
     assert_eq!(
         source.fresh_behind_evicted.load(Ordering::SeqCst),
         0,

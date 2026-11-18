@@ -327,6 +327,77 @@ fn so_t5_one_decode_copy() {
     assert_eq!(alloc.stats().payload_copies_total, 0);
 }
 
+// SO-T5b (system design 3A, item 6.3a). A read decoded in batches, each copied into the read's
+// arena buffers as it comes: the same payload as one batch gives, with each payload byte copied
+// once (G-I2), and no batch larger than a page's rows need make it.
+#[test]
+fn so_t5b_a_read_in_batches_is_the_read_copied_once() {
+    let dir = scratch();
+    let ledger = write_parquet(&dir, "t5b", 200_000, 100_000, 7);
+    let whole = parquet_over(&ledger, seed(FakeReactor::new(), &ledger.path));
+    // The smallest batch there is: as many rows as a page holds.
+    let batched =
+        parquet_over(&ledger, seed(FakeReactor::new(), &ledger.path)).decode_batches_of(Some(1));
+    let alloc = CountingAllocator::new(FakeAllocator::new());
+    let splits = batched.plan().expect("the plan");
+    // A whole group, and a part of one, whose strings are held until the part ends.
+    for (split, rows) in [
+        (&splits[0], None),
+        (
+            &splits[1],
+            Some(RowRange {
+                start: 12_345,
+                end: 87_654,
+            }),
+        ),
+    ] {
+        let one = block_on(whole.read(split, rows, &FakeAllocator::new(), Tier::Host))
+            .expect("one batch");
+        let (copies, copied) = (alloc.payload_copies(), alloc.payload_copy_bytes());
+        let many = block_on(batched.read(split, rows, &alloc, Tier::Host)).expect("in batches");
+        assert_eq!(
+            table(&many),
+            table(&one),
+            "split {}: the same rows",
+            split.id
+        );
+        let held: u64 = table(&many)
+            .columns()
+            .iter()
+            .map(|c| {
+                let data = c.to_data();
+                let bitmap = data.nulls().map_or(0, |n| n.inner().inner().len() as u64);
+                data.buffers().iter().map(|b| b.len() as u64).sum::<u64>() + bitmap
+            })
+            .sum();
+        assert_eq!(alloc.payload_copies(), copies + 1, "one copy a read");
+        assert_eq!(
+            alloc.payload_copy_bytes() - copied,
+            held,
+            "every payload byte copied once"
+        );
+        if rows.is_none() {
+            // A part keeps its group's fetch for the next part (`keep_fetched`); a whole group
+            // keeps nothing but its payload.
+            assert_eq!(
+                alloc.fake().in_use(Tier::Host),
+                held,
+                "and nothing else kept"
+            );
+        }
+    }
+    let (one, many) = (whole.stats(), batched.stats());
+    assert_eq!(one.batches_decoded, 2, "{one:?}");
+    assert!(many.batches_decoded >= 8, "{many:?}");
+    assert!(
+        many.largest_batch_bytes * 3 < one.largest_batch_bytes,
+        "a batch is a part of the range: {} against {}",
+        many.largest_batch_bytes,
+        one.largest_batch_bytes
+    );
+    assert_eq!(many.decode_bytes, alloc.payload_copy_bytes());
+}
+
 // SO-T6 stateless. SO-I6.
 #[test]
 fn so_t6_stateless() {
