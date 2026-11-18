@@ -21,8 +21,9 @@ One run, in order, every step on the run's resource group in `griot-dev` (azure.
    (Ubuntu 24.04) for the other engines, the plan's size in its zone.
 2. **Two sides at once,** since they are two machines; each side makes its runs one at a time.
    - **The Linux machine** runs its steps as detached batches (engines/batch.py, each started by
-     one `az vm run-command` as a systemd unit, so no command outlives Azure's 90 minutes, and
-     followed from here through the run's container, `results/batch/NAME.json`):
+     one managed run command (v2) as a systemd unit, so no command outlives Azure's 90 minutes,
+     its values given as protected parameters, and followed from here through the run's
+     container, `results/batch/NAME.json`):
      - `setup`: the plan's data, made in Azure (engines/data-linux.sh: fetched from its public
        source, normalised by bench/vm/normalize.py, each file checked against the plan's SHA-256,
        uploaded to the container), then every engine installed with its Blob reader
@@ -111,8 +112,10 @@ MiB, GiB = 1 << 20, 1 << 30
 LOG = os.path.join(REPO, "architecture", "benchmark-log.md")
 # The Linux machine's batches (engines/batch.py): their state, steps and env files.
 BATCH = f"{DATA}/batch"
-# The variables the starting run-command writes to a batch's env file (mode 600): the machine's own
-# PATH and HOME, as each run had them under run-command, and the secrets the steps name.
+# The variables the starting run command writes to a batch's env file (mode 600): the machine's own
+# PATH and HOME, as each run had them under run-command, and the values the steps name, which the
+# start is given as protected parameters (azure.run_command_create), so they reach it as its
+# environment, never as text of its script.
 BATCH_ENV = ("PATH", "HOME", "BASE", "SAS_CODE", "SAS_RESULTS", "BENCH_KEY")
 # A run's step is killed by the batch at the run's own timeout and this much more: measure.py's
 # fetch of the output, its canonical form and the comparison, all outside every timing.
@@ -287,7 +290,8 @@ class Real:
         return self._run(cmd, shlex.join(cmd))
 
     def write(self, path, text):
-        with open(path, "w") as f:
+        """A file of the run's own, readable by this user alone (some hold secrets)."""
+        with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
             f.write(text)
 
     def keygen(self, path):
@@ -413,11 +417,11 @@ class SpecBlob(proof.Blob):
 
 
 def batch_start(name):
-    """The run-command that starts batch `name` on the Linux machine and returns at once: the
-    harness (once) and the batch's steps from container `code`, its env file from the command's
-    parameters, then batch.py as systemd unit `moruna-bench-NAME`. It prints `STARTED NAME`, or
-    `ALREADY NAME` when that batch was started before, so a repeated command never runs a second
-    batch beside the first."""
+    """The script that starts batch `name` on the Linux machine and returns at once: the harness
+    (once) and the batch's steps from container `code`, its env file from the environment the run
+    command gives it (BATCH_ENV), then batch.py as systemd unit `moruna-bench-NAME`. It prints
+    `STARTED NAME`, or `ALREADY NAME` when that batch was started before, so a repeated command
+    never runs a second batch beside the first. It holds no value: each is quoted where used."""
     unit, steps, env = f"moruna-bench-{name}", f"{BATCH}/{name}.steps.json", f"{BATCH}/{name}.env"
     batch = f"{CODE}/bench/node/engines/batch.py"
     started = f"{BATCH}/{name}.started"
@@ -637,10 +641,23 @@ class Bench:
 
     # The Linux machine's batches ----------------------------------------------------------------
     def batch_params(self):
-        """The starting run-command's parameters: what its env file keeps (BATCH_ENV)."""
+        """The starting run command's protected parameters: what its env file keeps (BATCH_ENV)."""
         s = self.secrets
-        return [f"BASE={self.base()}", f"SAS_CODE={s['sas-code']}", f"SAS_RESULTS={s['sas-results']}",
-                f"BENCH_KEY={s['storage-key']}"]
+        return {"BASE": self.base(), "SAS_CODE": s["sas-code"], "SAS_RESULTS": s["sas-results"],
+                "BENCH_KEY": s["storage-key"]}
+
+    def param_files(self):
+        """Each protected parameter's value in a file of the secrets directory (mode 600), for az
+        to read itself (`NAME=@FILE`): no value is on a command line."""
+        files = {}
+        for k, v in self.batch_params().items():
+            files[k] = os.path.join(self.sec, f"param-{k}")
+            self.x.write(files[k], v)
+        return files
+
+    def hide(self, text):
+        """`text` with every secret the run holds replaced by its name."""
+        return proof.Redact(self.secrets)(text or "")
 
     def store_env(self):
         """The run's container, as measure.py and the engines read it (store.py); its key is the
@@ -656,9 +673,26 @@ class Bench:
         path = os.path.join(self.sec, f"batch-{name}.json")
         x.write(path, json.dumps(steps, indent=1))
         x.az(azure.upload(c, s["storage-key"], "code", f"batch-{name}.json", path), secrets=s)
-        out = x.az(azure.run_command(c, batch_start(name), self.batch_params()), out=f"started {name}", secrets=s)
-        if x.answers and not re.search(rf"^(STARTED|ALREADY) {name}$", out or "", re.M):
-            raise RuntimeError(f"the batch {name} did not start on the Linux machine: {(out or '')[-500:]}")
+        unit = f"moruna-bench-{name}"
+        try:
+            x.az(azure.run_command_create(c, unit, batch_start(name), self.param_files()), secrets=s)
+            view = x.az(azure.run_command_view(c, unit), out=f"{unit}'s instance view", secrets=s)
+        finally:
+            # Read, the run command is removed from the machine's model; the unit it started goes on.
+            try:
+                x.az(azure.run_command_delete(c, unit), secrets=s)
+            except RuntimeError as e:
+                x.note(f"the run command {unit} was not deleted (the group's tear-down removes it): {str(e)[-200:]}")
+        if x.answers:
+            try:
+                view = json.loads(view or "{}") or {}
+            except ValueError:
+                view = {"error": f"not JSON: {view}"}
+            if not re.search(rf"^(STARTED|ALREADY) {name}$", view.get("output") or "", re.M):
+                said = f"{view.get('output') or ''}\n{view.get('error') or ''}".strip()
+                raise RuntimeError(self.hide(
+                    f"the batch {name} did not start on the Linux machine ({view.get('executionState')}, exit "
+                    f"{view.get('exitCode')}): {said[-500:]}"))
         x.note(f"the Linux machine runs batch {name}: {len(steps)} steps, one at a time")
         if after_start:
             after_start()
@@ -707,8 +741,8 @@ class Bench:
         out = self.x.az(azure.run_command(
             self.c, f"systemctl status moruna-bench-{name} --no-pager -n 20 || true; "
                     f"tail -c 1000 {BATCH}/{name}.state.json || true"), out="the unit's status", secrets=self.secrets)
-        raise RuntimeError(f"the batch {name}: no step ended within {bound} s of the last; the machine says: "
-                           f"{(out or '')[-800:]}")
+        raise RuntimeError(self.hide(f"the batch {name}: no step ended within {bound} s of the last; the machine "
+                                     f"says: {(out or '')[-800:]}"))
 
     # The Linux side ---------------------------------------------------------------------------------
     def linux_side(self):
@@ -926,10 +960,14 @@ class Bench:
         (the run stopped early) is stopped first, so its files hold still."""
         x, s = self.x, self.secrets
         units = " ".join(f"moruna-bench-{n}" for n in POLL_S)
+        # The address and its SAS from the setup batch's env file, on the machine (v1 run commands
+        # carry no value: azure.run_command); `sed` prints each as written, quoted where used.
+        env = f"{BATCH}/setup.env"
         script = (f"systemctl stop {units} 2>/dev/null || true; "
+                  f"BASE=$(sed -n 's/^BASE=//p' {env}); SAS_RESULTS=$(sed -n 's/^SAS_RESULTS=//p' {env}); "
                   f"tar -czf {DATA}/results.tgz -C {DATA} results && curl -sSf -X PUT -H 'x-ms-blob-type: BlockBlob' "
                   f'-T {DATA}/results.tgz "$BASE/results/linux.tgz?$SAS_RESULTS"')
-        x.az(azure.run_command(self.c, script, [f"BASE={self.base()}", f"SAS_RESULTS={s['sas-results']}"]), secrets=s)
+        x.az(azure.run_command(self.c, script), secrets=s)
         x.az(azure.blob_download(self.c, s["storage-key"], "results", "linux.tgz", f"{self.results}/linux.tgz"),
              secrets=s)
         x.local(["tar", "-xzf", f"{self.results}/linux.tgz", "-C", self.results])
@@ -945,14 +983,11 @@ class Bench:
             node_image = f"{self.a.vhd} ({image['bytes']} bytes, sha256 {image['sha256']})"
         made = ("uploaded from this machine" if self.from_mac else
                 f"made in Azure from {self.plan['dataset'].get('source_url')}, each file the plan's SHA-256")
-        wheel = setup.get("wheel_066")
-        if setup.get("wheel_066_name"):
-            wheel = f"{wheel}, {setup['wheel_066_name']} (sha256 {setup.get('wheel_066_sha256')})"
+        # 0.6.6's wheel (source, name, SHA-256) is in the table itself (summary.json, table.md).
         return {"date": self.c.stamp, "commit": commit, "node_image": node_image,
                 "machines": f"{self.c.size}, zone {self.c.zone}, {self.c.location}, subscription {self.c.subscription}",
                 "linux_image": setup.get("linux_image"),
-                "data": f"read and written in Blob container `data`, {made}; 0.6.6's wheel {wheel} "
-                        f"in {setup.get('wheel_066_s')} s, outside every timing",
+                "data": f"read and written in Blob container `data`, {made}",
                 "results": os.path.relpath(self.results, REPO)}
 
     # 5. Tear down ----------------------------------------------------------------------------------
@@ -1019,6 +1054,9 @@ def finish(plan, results, meta, log=LOG):
     """The summary, the table and the run's log entry (none when `log` is None), from the records
     under `results`."""
     summary = collect.summarise(collect.load(results), plan)
+    wheel = wheel_066(results)
+    if wheel:
+        summary["wheel_066"] = wheel
     collect.write(results, summary)
     open(os.path.join(results, "table.md"), "w").write(table.render(summary) + "\n")
     if log:
@@ -1026,6 +1064,21 @@ def finish(plan, results, meta, log=LOG):
                            for m in rootcause.misses(summary))
         table.append(log, table.entry(summary, meta, misses))
     return summary
+
+
+def wheel_066(results):
+    """0.6.6's wheel as the Linux machine's setup recorded it (`setup.json`): where it came from
+    (`container`: given with --wheel066; `pypi`; `built` on the machine), its name, its SHA-256 and
+    the seconds it took. None before the setup has ended."""
+    try:
+        with open(os.path.join(results, "setup.json")) as f:
+            setup = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(setup, dict) or not setup.get("wheel_066"):
+        return None
+    return {"source": setup["wheel_066"], "name": setup.get("wheel_066_name"),
+            "sha256": setup.get("wheel_066_sha256"), "seconds": setup.get("wheel_066_s")}
 
 
 def local(plan, args, out=sys.stdout, python=sys.executable):

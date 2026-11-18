@@ -93,8 +93,20 @@ def verdicts(engines: dict) -> list:
     return out
 
 
+WHEEL_FROM = {"container": "given with --wheel066", "pypi": "PyPI's release", "built": "built on the Linux machine"}
+
+
+def wheel_line(wheel: dict) -> str:
+    """Which 0.6.6 the 0.6.6 rows ran: the wheel's source, name and SHA-256."""
+    took = "" if wheel.get("seconds") is None else f", in {wheel['seconds']} s outside every timing"
+    return (f"0.6.6's wheel: {WHEEL_FROM.get(wheel.get('source'), wheel.get('source'))}{took}: "
+            f"`{wheel.get('name') or 'name not recorded'}`, sha256 {wheel.get('sha256') or 'not recorded'}.")
+
+
 def render(summary: dict) -> str:
     out = []
+    if summary.get("wheel_066"):
+        out += [wheel_line(summary["wheel_066"]), ""]
     for job, j in summary["jobs"].items():
         out.append(f"### {job}\n")
         out.append("| Engine | Function | Operational s | Start-up s | CPU s | Peak GiB | Memory given GiB | Data | "

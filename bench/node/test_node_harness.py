@@ -129,7 +129,9 @@ def test_names_and_the_guard():
              azure.blob_url(c, "K", "vhds", "node.vhd"), azure.node_disk(c, "u", "i"), azure.account_id(c),
              *azure.nsgs(c, "203.0.113.9"), azure.node_ip(c), azure.node_vm(c, "/cfg"), azure.boot_log(c),
              azure.node_address(c), azure.linux_vm(c, "/k.pub"), azure.image_version(c),
-             azure.run_command(c, "true", ["A=1"]), azure.group_delete(c), azure.group_exists(c)]
+             azure.run_command(c, "true"), azure.run_command_create(c, "rc", "true", {"A": "/a"}),
+             azure.run_command_view(c, "rc"), azure.run_command_delete(c, "rc"), azure.group_delete(c),
+             azure.group_exists(c)]
     for cmd in every:
         azure.guard(c, cmd)
         assert cmd[0] == "az"
@@ -142,6 +144,11 @@ def test_names_and_the_guard():
     ["az", "vm", "create", "-n", "x", "-g", "another", "--subscription", "griot-dev"],
     ["az", "vm", "list"],
     ["az", "storage", "blob", "upload", "--account-name", "someoneelse", "--account-key", "K"],
+    # Run 2's start (2026-11-18): a secret through v1's parameters; and v2's plain ones.
+    ["az", "vm", "run-command", "invoke", "-n", "bench-linux", "--command-id", "RunShellScript", "--scripts", "true",
+     "--parameters", "BENCH_KEY=K", "-g", "moruna-bench-20261118", "--subscription", "griot-dev"],
+    ["az", "vm", "run-command", "create", "--run-command-name", "r", "--vm-name", "bench-linux", "--script", "true",
+     "--parameters", "SAS=a&b", "-g", "moruna-bench-20261118", "--subscription", "griot-dev"],
 ])
 def test_the_guard_refuses_what_is_not_the_run(cmd):
     with pytest.raises(ValueError, match="refused"):
@@ -152,9 +159,28 @@ def test_commands_are_well_formed():
     c = cloud()
     page = azure.upload(c, "K", "vhds", "node.vhd", "/v", page=True)
     assert page[page.index("--type") + 1] == "page"
-    rc = azure.run_command(c, "echo hi", ["SAS=a=b&c"])
-    assert rc.index("--parameters") < rc.index("--query") and rc[rc.index("--parameters") + 1] == "SAS=a=b&c"
+    # The v1 run command takes no parameter: no value can reach it that way (see
+    # test_v1_parameters_lose_a_sas_and_put_values_in_the_script).
     assert "--parameters" not in azure.run_command(c, "true")
+    with pytest.raises(TypeError):
+        azure.run_command(c, "true", ["SAS=a=b&c"])
+    # The v2 one, as the PM ran it on a real machine (2026-11-18): by --run-command-name (az takes
+    # no -n there), synchronous, every value a protected parameter read by az from its file.
+    create = azure.run_command_create(c, "moruna-bench-runs", "echo hi", {"SAS": "/s/param-SAS", "KEY": "/s/k"})
+    assert create[:4] == ["az", "vm", "run-command", "create"] and "-n" not in create
+    for flag, value in (("--run-command-name", "moruna-bench-runs"), ("--vm-name", "bench-linux"),
+                        ("--location", "centralindia"), ("--script", "echo hi"), ("--async-execution", "false"),
+                        ("--timeout-in-seconds", "600"), ("-o", "none"), ("-g", c.group)):
+        assert create[create.index(flag) + 1] == value, flag
+    i = create.index("--protected-parameters")
+    assert create[i + 1:i + 3] == ["SAS=@/s/param-SAS", "KEY=@/s/k"] and create[i + 3].startswith("-")
+    assert "--parameters" not in create
+    view = azure.run_command_view(c, "moruna-bench-runs")
+    assert view[:4] == ["az", "vm", "run-command", "show"] and "--instance-view" in view and "-n" not in view
+    assert view[view.index("--run-command-name") + 1] == "moruna-bench-runs"
+    gone = azure.run_command_delete(c, "moruna-bench-runs")
+    assert gone[:4] == ["az", "vm", "run-command", "delete"] and "--yes" in gone and "-n" not in gone
+    assert gone[gone.index("--run-command-name") + 1] == "moruna-bench-runs"
     node = azure.node_vm(c, "/cfg")
     # AZURE.md, step 6: boot diagnostics into the run's account from power-on, never restarted.
     for flag, value in (("--security-type", "Standard"), ("--accelerated-networking", "false"), ("--zone", "3"),
@@ -194,11 +220,19 @@ def test_the_dry_run_lists_every_command_and_creates_nothing(tmp_path):
     linux = [r for r in runs if r["where"] == "linux"]
     node = [r for r in runs if r["where"] == "node"]
     # The Linux machine: three batches (its setup, its runs, the node outputs' checks), each started
-    # by one run-command that returns at once, and the collection; the key reaches it redacted here.
-    starts = [a for a in azs if "run-command invoke" in a and "batch.py --name" in a]
+    # by one managed run command that returns at once, its values as protected parameters az reads
+    # from files; then the collection, a v1 run command with no parameter at all.
+    starts = [a for a in azs if "run-command create" in a and "batch.py --name" in a]
     assert [a.split("batch.py --name ")[1].split()[0] for a in starts] == ["setup", "runs", "checks"]
-    assert all("'BENCH_KEY=<storage-key>'" in a and "'SAS_RESULTS=<sas-results>'" in a for a in starts)
-    assert sum("run-command invoke" in a for a in azs) == 4
+    assert all("--protected-parameters 'BASE=@<secrets>/param-BASE' 'SAS_CODE=@<secrets>/param-SAS_CODE' "
+               "'SAS_RESULTS=@<secrets>/param-SAS_RESULTS' 'BENCH_KEY=@<secrets>/param-BENCH_KEY' -o none" in a
+               and " --parameters " not in a and "<storage-key>" not in a for a in starts)
+    # Each read, then deleted from the machine's model.
+    for n in ("setup", "runs", "checks"):
+        at = [i for i, a in enumerate(azs) if f"--run-command-name moruna-bench-{n} " in a]
+        assert [azs[i].split()[3] for i in at] == ["create", "show", "delete"] and at == list(range(at[0], at[0] + 3))
+    invokes = [a for a in azs if "run-command invoke" in a]
+    assert len(invokes) == 1 and "linux.tgz" in invokes[0] and "--parameters" not in invokes[0]
     assert all(sum(f"-n batch-{n}.json" in a for a in azs) == 1 for n in ("setup", "runs", "checks"))
     # Each Linux run's record lands as the batch's state says it ended, in the plan's order.
     live = [line.rsplit("/live/", 1)[1][:-len(".json")] for line in steps if "/live/" in line]
@@ -398,39 +432,180 @@ def test_the_batches_steps(tmp_path):
     # No secret is in a step: the batch's env file holds them, from the run-command's parameters.
     text = json.dumps([steps, b.setup_steps(), check])
     assert "KEY" not in text.replace("BENCH_KEY", "") and "sv=" not in text
-    assert b.batch_params() == ["BASE=https://mrnb202611180900.blob.core.windows.net", "SAS_CODE=sv=c",
-                                "SAS_RESULTS=sv=r", "BENCH_KEY=KEY"]
+    assert b.batch_params() == {"BASE": "https://mrnb202611180900.blob.core.windows.net", "SAS_CODE": "sv=c",
+                                "SAS_RESULTS": "sv=r", "BENCH_KEY": "KEY"}
 
 
-def test_the_batch_starts_once_and_keeps_its_secrets_in_a_file(tmp_path):
-    """The run-command's script in a shell, with curl and systemd-run stood in for: it writes the
-    env file (mode 600, the parameters and the machine's PATH), starts batch.py as a unit, and a
-    second start of the same batch starts nothing."""
+# Values shaped like the run's own: an account key (88 characters of base64, with `/` and `+`),
+# the containers' SAS (as `az storage container generate-sas` writes it: `&`, `=`, `%`), and a `?`.
+REAL_KEY = "hQF1JvrcxsFx/+6u64TPkFDueXXd4e4FML+ytnpPCV1faYjHC6X5sSDYc3mVddlv+on3UZbbE/AStiFllBA9xQ=="
+REAL_SAS = "se=2026-11-20T15%3A43Z&sp=rl&spr=https&sv=2024-11-04&sr=c&sig=Qm9%2Fv%2BZ8xT1kq%2F%3D"
+REAL_SAS_RESULTS = "se=2026-11-20T15%3A43Z&sp=racwl&spr=https&sv=2024-11-04&sr=c&sig=a%2Bb%2Fc%3D&x=y?z"
+SH = [s for s in ("/bin/dash",) if os.path.exists(s)]
+
+
+def v1_script_sh(script, params):
+    """script.sh as the v1 run command writes it (measured on Ubuntu 24.04, 2026-11-18): the
+    named parameters, unquoted, as `export N=V ...` on line 1 and `set -- V ...` on line 2, then
+    the script; the v1 handler (run-command-extension-linux main/cmds.go writeTempScript) writes
+    that text verbatim, and runs it with `/bin/sh -c <script.sh>`."""
+    return ("export " + " ".join(f"{k}={v}" for k, v in params.items()) + "\n"
+            + "set -- " + " ".join(params.values()) + "\n" + script)
+
+
+def v2_az(argv, files):
+    """What az does with the harness's `az vm run-command create` (azure-cli 2.92): each argument
+    whose text after its first `=` is `@FILE` becomes that file's text, its line end stripped
+    (core/commands `_expand_file_prefixed_files`); then each protected parameter is split at its
+    first `=` (vm/custom.py `vm_run_command_create`). The script and the parameters it sends."""
+    args = []
+    for a in argv:
+        k, eq, v = a.partition("=")
+        args.append(f"{k}={files[v[1:]].rstrip(os.linesep)}" if eq and v.startswith("@") else a)
+    i = args.index("--protected-parameters") + 1
+    end = next(j for j in range(i, len(args)) if args[j].startswith("-"))
+    return args[args.index("--script") + 1], dict(p.split("=", 1) for p in args[i:end])
+
+
+def v2_handler(tmp_path, script, params, path, shell="/bin/bash"):
+    """What the v2 handler does with them (run-command-handler-linux internal/cmds `runCmd`,
+    internal/files `SaveScriptFile`, internal/exec `Exec` and `SetEnvironmentVariables`): the
+    script saved verbatim as script.sh (mode 0500), each named parameter with a value set in the
+    environment it inherits (os.Setenv), run as `<shell> -c <script.sh>` in its directory."""
+    d = tmp_path / "download" / "moruna-bench-runs" / "0"
+    d.mkdir(parents=True, exist_ok=True)
+    sh = d / "script.sh"
+    if sh.exists():
+        sh.chmod(0o700)
+    sh.write_text(script)
+    sh.chmod(0o500)
+    env = {"PATH": path, "HOME": "/root", **{k: v for k, v in params.items() if v}}
+    # bash as the handler runs it; dash reads the same file itself (see v1's test for why).
+    argv = [shell, "-c", str(sh)] if shell == "/bin/bash" else [shell, str(sh)]
+    return subprocess.run(argv, capture_output=True, text=True, env=env, cwd=d), sh
+
+
+@pytest.mark.skipif(not os.path.exists("/bin/dash"), reason="needs dash, Ubuntu's /bin/sh")
+def test_v1_parameters_lose_a_sas_and_put_values_in_the_script(tmp_path):
+    """The failure of run 2 (2026-11-18), as the PM measured it on Ubuntu 24.04: v1's named
+    parameters are written unquoted, so `&` cuts the line, BASE and the SAS are never set, the key
+    becomes a command, and every value sits in the script. The harness gives v1 none."""
+    params = {"BASE": "https://x.blob.core.windows.net", "SAS": "sv=2024-11-04&ss=b&sig=ab%2Fc%2B%3D&se=2026?x",
+              "KEY": "hQF1/+ab+cd/ef=="}
+    text = v1_script_sh('printf "BASE=%s SAS=%s KEY=%s ARGS=%s\\n" "${BASE-unset}" "${SAS-unset}" "${KEY-unset}" "$#"',
+                        params)
+    assert text.splitlines()[:2] == [
+        "export BASE=https://x.blob.core.windows.net SAS=sv=2024-11-04&ss=b&sig=ab%2Fc%2B%3D&se=2026?x KEY=hQF1/+ab+cd/ef==",
+        "set -- https://x.blob.core.windows.net sv=2024-11-04&ss=b&sig=ab%2Fc%2B%3D&se=2026?x hQF1/+ab+cd/ef=="]
+    sh = tmp_path / "script.sh"
+    sh.write_text(text)
+    sh.chmod(0o500)
+    # Ubuntu's `/bin/sh -c script.sh` is dash running that file (no #! line); dash is asked to read
+    # it here directly, since macOS would hand a file with no #! line to its own /bin/sh, bash.
+    p = subprocess.run(["/bin/dash", str(sh)], capture_output=True, text=True, cwd=tmp_path,
+                       env={"PATH": "/usr/bin:/bin"})
+    assert p.stdout.strip() == "BASE=unset SAS=unset KEY=hQF1/+ab+cd/ef== ARGS=0"
+    assert f"{sh}: 2: hQF1/+ab+cd/ef==: not found" in p.stderr
+    # The harness's v1 run commands (the collection, a stalled batch's status) take no parameter.
+    c = cloud()
+    assert "--parameters" not in azure.run_command(c, "true")
+    with pytest.raises(TypeError):
+        azure.run_command(c, "true", ["BASE=x"])
+
+
+@pytest.mark.parametrize("shell", ["/bin/bash"] + SH)
+def test_the_batch_start_gets_every_value_whole_through_v2(tmp_path, monkeypatch, shell):
+    """The batch's start, formed as az and the v2 handler form it (from their source), with a key
+    and SAS shaped like the real ones: no value is in the command line or the script; each reaches
+    the env file and every URL as given; the unit starts once. Under bash (the v2 handler's
+    shell) and sh (dash, as v1 ran it): the script is plain POSIX sh."""
+    for name, value in (("DATA", tmp_path / "data"), ("BATCH", tmp_path / "data" / "batch"),
+                        ("CODE", tmp_path / "opt" / "bench")):
+        monkeypatch.setattr(run, name, str(value))
     shims = tmp_path / "bin"
     shims.mkdir()
-    (shims / "curl").write_text('#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && echo "[]" > "$2"; shift; done\n')
-    (shims / "systemd-run").write_text(f'#!/bin/sh\necho "$@" >> {tmp_path}/units\n')
+    (shims / "curl").write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" >> {tmp_path}/curl.args\n'
+                                'while [ $# -gt 0 ]; do [ "$1" = -o ] && echo "[]" > "$2"; shift; done\n')
+    (shims / "tar").write_text("#!/bin/sh\ncat > /dev/null\n")
+    (shims / "systemd-run").write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" >> {tmp_path}/units\n')
     for f in shims.iterdir():
         f.chmod(0o755)
-    script = run.batch_start("runs").replace("/data/", f"{tmp_path}/data/").replace("/opt/bench", f"{tmp_path}/opt")
-    # The harness is on the machine already (the setup's batch fetched it).
-    (tmp_path / "opt" / "bench" / "node" / "engines").mkdir(parents=True)
-    (tmp_path / "opt" / "bench" / "node" / "engines" / "batch.py").write_text("")
-    env = {"PATH": f"{shims}:/usr/bin:/bin", "BASE": "https://a.blob.core.windows.net", "SAS_CODE": "sv=1&sig=c",
-           "SAS_RESULTS": "sv=1&sig=r", "BENCH_KEY": "K+ey=="}
-    first = subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=env)
+    path = f"{shims}:/usr/bin:/bin"
+    # The harness's own command: its values in files of the secrets directory.
+    x = run.DryRun(io.StringIO())
+    b = run.Bench(nyc_plan(), x, cloud(), Args(), str(tmp_path), str(tmp_path / "s"))
+    b.secrets.update({"storage-key": REAL_KEY, "sas-code": REAL_SAS, "sas-results": REAL_SAS_RESULTS})
+    values = b.batch_params()
+    files = {f"{tmp_path}/s/param-{k}": v + "\n" for k, v in values.items()}  # a line end: az strips it
+    argv = azure.run_command_create(cloud(), "moruna-bench-runs", run.batch_start("runs"),
+                                    {k: f"{tmp_path}/s/param-{k}" for k in values})
+    command_line = " ".join(argv)
+    assert not any(v in command_line for v in (REAL_KEY, REAL_SAS, REAL_SAS_RESULTS, "sig="))
+    script, params = v2_az(argv, files)
+    assert params == values and script == run.batch_start("runs")
+    assert not any(v in script for v in (REAL_KEY, REAL_SAS, REAL_SAS_RESULTS))
+    first, sh = v2_handler(tmp_path, script, params, path, shell)
     assert first.returncode == 0 and first.stdout.strip() == "STARTED runs", first.stderr
+    assert not any(v in sh.read_text() for v in (REAL_KEY, REAL_SAS, REAL_SAS_RESULTS))
+    # The harness is fetched once, and the steps, each by the SAS whole.
+    fetched = (tmp_path / "curl.args").read_text().splitlines()
+    assert f"{values['BASE']}/code/harness.tar.gz?{REAL_SAS}" in fetched
+    assert f"{values['BASE']}/code/batch-runs.json?{REAL_SAS}" in fetched
     envfile = tmp_path / "data" / "batch" / "runs.env"
     assert oct(envfile.stat().st_mode & 0o777) == "0o600"
     import batch
     got = batch.load_env(str(envfile))
-    assert got["BENCH_KEY"] == "K+ey==" and got["SAS_RESULTS"] == "sv=1&sig=r" and got["PATH"].startswith(str(shims))
-    assert got["HOME"] == ""
+    assert {k: got[k] for k in values} == values and got["PATH"] == path and got["HOME"] == "/root"
     unit = (tmp_path / "units").read_text()
-    assert unit.startswith("--unit=moruna-bench-runs ") and "batch.py --name runs --steps" in unit
-    assert "K+ey" not in unit and "sig=" not in unit
-    again = subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=env)
+    assert unit.startswith("--unit=moruna-bench-runs\n") and "--name\nruns\n--steps\n" in unit
+    assert not any(v in unit for v in (REAL_KEY, REAL_SAS, REAL_SAS_RESULTS))
+    again, _ = v2_handler(tmp_path, script, params, path, shell)
     assert again.stdout.strip() == "ALREADY runs" and (tmp_path / "units").read_text() == unit
+
+
+def test_the_collection_reads_its_values_on_the_machine(tmp_path, monkeypatch):
+    """The collection's v1 run command carries no value: it reads the address and the results'
+    SAS from the setup batch's env file, each whole, under sh."""
+    for name, value in (("DATA", tmp_path / "data"), ("BATCH", tmp_path / "data" / "batch")):
+        monkeypatch.setattr(run, name, str(value))
+    (tmp_path / "data" / "batch").mkdir(parents=True)
+    (tmp_path / "data" / "results").mkdir()
+    (tmp_path / "data" / "batch" / "setup.env").write_text(
+        f"PATH=/usr/bin\nBASE=https://a.blob.core.windows.net\nSAS_CODE={REAL_SAS}\n"
+        f"SAS_RESULTS={REAL_SAS_RESULTS}\nBENCH_KEY={REAL_KEY}\n")
+    shims = tmp_path / "bin"
+    shims.mkdir()
+    (shims / "curl").write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {tmp_path}/curl.args\n')
+    (shims / "systemctl").write_text("#!/bin/sh\nexit 0\n")
+    for f in shims.iterdir():
+        f.chmod(0o755)
+    class Stop(Fake):
+        def az(self, cmd, out=None, secrets=None):
+            if "run-command" in cmd:
+                self.cmd = cmd
+                raise RuntimeError("enough: the command is what is wanted")
+            return super().az(cmd, out, secrets)
+    x = Stop(str(tmp_path / "r"))
+    b = run.Bench(nyc_plan(), x, cloud(), Args(), str(tmp_path / "r"), str(tmp_path / "s"))
+    b.secrets.update({"storage-key": REAL_KEY, "sas-code": REAL_SAS, "sas-results": REAL_SAS_RESULTS})
+    with pytest.raises(RuntimeError, match="enough"):
+        b.collect(log=False)
+    assert x.cmd[:3] == ["az", "vm", "run-command"] and x.cmd[3] == "invoke" and "--parameters" not in x.cmd
+    script = x.cmd[x.cmd.index("--scripts") + 1]
+    assert not any(v in " ".join(x.cmd) for v in (REAL_KEY, REAL_SAS, REAL_SAS_RESULTS))
+    for shell in ["/bin/bash"] + SH:
+        p = subprocess.run([shell, "-c", script], capture_output=True, text=True,
+                           env={"PATH": f"{shims}:/usr/bin:/bin"})
+        assert p.returncode == 0, p.stderr
+        assert f"https://a.blob.core.windows.net/results/linux.tgz?{REAL_SAS_RESULTS}" in \
+            (tmp_path / "curl.args").read_text().splitlines()
+
+
+def test_a_script_az_would_read_as_a_file_is_refused():
+    for script in ("@/etc/passwd", "X=@/etc/passwd; true"):
+        with pytest.raises(ValueError, match="as a file's name"):
+            azure.run_command(cloud(), script)
+    azure.no_file_prefix("a=b @c")
 
 
 def test_real_mode_needs_its_inputs(tmp_path):
@@ -446,6 +621,7 @@ def test_real_mode_needs_its_inputs(tmp_path):
 # --- The whole run, against fakes --------------------------------------------------------------
 
 PIN = "ab" * 32
+WHEEL_SHA = "6f" * 32
 CONSOLE_URI = ("https://mrnb202611180900.blob.core.windows.net/bootdiagnostics-morunanod-0b1c/"
                "moruna-node.0b1c.serialconsole.log")
 
@@ -512,6 +688,7 @@ class Fake(run.DryRun):
         self.console_after, self.reveal, self.data_ok, self.wheel = console_after, reveal, data_ok, wheel
         self.files, self.uploaded, self.states, self.shown, self.started = {}, {}, {}, {}, []
         self.health_after, self.served, self.vm_id, self.healths = health_after, served, vm_id, 0
+        self.views = {}  # each managed run command's instance view, by batch
         # Azure's serial log, as the node writes it (1B), with its line ends.
         self.console_text = console_text or (f"moruna: cloud azure instance i-1\r\nmoruna: tls sha256={PIN}\r\n"
                                              "moruna: ready api=10.0.0.4:443 boot_ms=2140\r\n")
@@ -553,7 +730,8 @@ class Fake(run.DryRun):
             return "normalized rows 41169720\nDATA " + json.dumps(rec)
         if st["id"] == "setup":
             return "SETUP " + json.dumps({"installed": {"duckdb": True}, "wheel_066": self.wheel, "wheel_066_s": 1800,
-                                          "wheel_066_name": "moruna-0.6.6-cp314-cp314t-linux_x86_64.whl"})
+                                          "wheel_066_name": "moruna-0.6.6-cp314-cp314t-linux_x86_64.whl",
+                                          "wheel_066_sha256": WHEEL_SHA})
         if "measure.py run" in text:
             assert st["env"]["BENCH_ACCOUNT"] == "mrnb202611180900" and st["secrets"] == ["BENCH_KEY"]
             rid = text.split("--id ")[1].split()[0]
@@ -601,14 +779,24 @@ class Fake(run.DryRun):
         if "blob upload -c code -n batch-" in text:
             self.uploaded[text.split("-n batch-")[1].split(".json")[0]] = json.loads(self.files[cmd[cmd.index("-f") + 1]])
             return ""
-        if "run-command invoke" in text and "batch.py --name" in text:
+        if "run-command create" in text and "batch.py --name" in text:
             name = text.split("batch.py --name ")[1].split()[0]
-            assert "BENCH_KEY=KEY" in text and "SAS_RESULTS=sv=1&sig=x" in text and "SAS_CODE=sv=1&sig=x" in text
+            # The values reach az as files it reads itself, never as text of the command.
+            assert "KEY" not in text.replace("BENCH_KEY", "") and "sig=" not in text
+            given = dict(p.split("=@", 1) for p in cmd[cmd.index("--protected-parameters") + 1:cmd.index("-o")])
+            values = {k: self.files[path] for k, path in given.items()}
+            assert values == {"BASE": "https://mrnb202611180900.blob.core.windows.net", "SAS_CODE": "sv=1&sig=x",
+                              "SAS_RESULTS": "sv=1&sig=x", "BENCH_KEY": "KEY"}
             if name in self.states:
-                return f"Enable succeeded:\n[stdout]\nALREADY {name}\n"
+                self.views[name] = {"executionState": "Succeeded", "exitCode": 0, "output": f"ALREADY {name}\n"}
+                return ""
             self.started.append(name)
             self.states[name] = self.machine(name, self.uploaded[name])
-            return f"Enable succeeded:\n[stdout]\nSTARTED {name}\n\n[stderr]\n"
+            self.views[name] = {"executionState": "Succeeded", "exitCode": 0, "output": f"STARTED {name}\n",
+                                "error": ""}
+            return ""
+        if "run-command show" in text and "--instance-view" in text:
+            return json.dumps(self.views[text.split("--run-command-name moruna-bench-")[1].split()[0]])
         if "blob download -c results -n batch/" in text:
             name = text.split("-n batch/")[1].split(".json")[0]
             if name not in self.states:
@@ -709,6 +897,13 @@ def test_a_whole_run_against_fakes(tmp_path):
     assert "**PASS** no regression" in log and "**PASS** the bar: 1.50x" in log
     assert "#### Miss" not in log
     assert json.load(open(tmp_path / "setup.json"))["wheel_066"] == "built"
+    # Which 0.6.6 ran: the wheel's source and SHA-256, in summary.json, table.md and the log's table.
+    wheel = {"source": "built", "name": "moruna-0.6.6-cp314-cp314t-linux_x86_64.whl", "sha256": WHEEL_SHA,
+             "seconds": 1800}
+    assert json.load(open(tmp_path / "summary.json"))["wheel_066"] == wheel == x.summary["wheel_066"]
+    line = ("0.6.6's wheel: built on the Linux machine, in 1800 s outside every timing: "
+            f"`moruna-0.6.6-cp314-cp314t-linux_x86_64.whl`, sha256 {WHEEL_SHA}.")
+    assert table_text.startswith(line + "\n") and log.count(line) == 1
     # Three batches on the Linux machine, each started once; the node's outputs checked in the last,
     # after every Linux run, and its records then carry the verdict.
     assert x.started == ["setup", "runs", "checks"]
@@ -728,6 +923,27 @@ def test_a_wheel_from_pypi_or_given_is_not_kept_again(tmp_path):
     x = Fake(str(tmp_path), wheel="pypi")
     run.Bench(nyc_plan(), x, azure.Cloud("202611180900"), args, str(tmp_path), "/s").go()
     assert not any("blob download -c code" in a for a in x.azs)
+    assert open(tmp_path / "table.md").read().startswith("0.6.6's wheel: PyPI's release, in 1800 s")
+
+
+def test_the_table_names_the_wheel_066_it_ran(tmp_path):
+    """The wheel's source and SHA-256 from setup.json, in summary.json and at the table's head
+    (also under --table while the plan runs); no line before the setup has ended."""
+    assert run.wheel_066(str(tmp_path)) is None
+    (tmp_path / "setup.json").write_text("not json")
+    assert run.wheel_066(str(tmp_path)) is None
+    (tmp_path / "setup.json").write_text(json.dumps({"installed": {}}))
+    assert run.wheel_066(str(tmp_path)) is None
+    (tmp_path / "setup.json").write_text(json.dumps({"wheel_066": "container", "wheel_066_name": "w.whl",
+                                                     "wheel_066_sha256": WHEEL_SHA, "wheel_066_s": 2}))
+    assert run.wheel_066(str(tmp_path)) == {"source": "container", "name": "w.whl", "sha256": WHEEL_SHA, "seconds": 2}
+    out = io.StringIO()
+    assert run.main(["--plan", "nyc-2024", "--table", str(tmp_path)], out=out) == 0
+    assert (f"0.6.6's wheel: given with --wheel066, in 2 s outside every timing: `w.whl`, sha256 {WHEEL_SHA}."
+            in out.getvalue())
+    assert json.load(open(tmp_path / "summary.json"))["wheel_066"]["sha256"] == WHEEL_SHA
+    assert table.wheel_line({"source": "odd"}) == "0.6.6's wheel: odd: `name not recorded`, sha256 not recorded."
+    assert "0.6.6's wheel" not in table.render(summary_of([rec("duckdb", 1, 3.5)]))
 
 
 def test_each_run_lands_as_it_finishes_and_the_table_reads_them_so_far(tmp_path):
@@ -842,13 +1058,24 @@ def started_bench(tmp_path, x, name="runs"):
 
 def test_a_batch_that_does_not_start_or_goes_silent_stops_the_run(tmp_path, monkeypatch):
     class NoStart(Fake):
+        def __init__(self, results, view):
+            super().__init__(results)
+            self.view = view
+
         def az(self, cmd, out=None, secrets=None):
-            if "batch.py --name" in " ".join(cmd):
+            if "run-command show" in " ".join(cmd):
                 self.azs.append(" ".join(cmd))
-                return "Enable succeeded:\n[stderr]\nsystemd-run: Failed to start transient service unit"
+                return self.view
             return super().az(cmd, out, secrets)
-    b = started_bench(tmp_path, NoStart(str(tmp_path)))
-    with pytest.raises(RuntimeError, match="(?s)did not start on the Linux machine: .*Failed to start"):
+    # What the machine said is quoted, any secret in it by its name.
+    failed = json.dumps({"executionState": "Failed", "exitCode": 1, "output": "",
+                         "error": "systemd-run: Failed to start transient service unit; key KEY"})
+    b = started_bench(tmp_path, NoStart(str(tmp_path), failed))
+    with pytest.raises(RuntimeError, match=r"(?s)did not start on the Linux machine \(Failed, exit 1\): "
+                                           r".*Failed to start transient service unit; key <storage-key>$"):
+        b.batch("runs", b.linux_steps()[:2], b.linux_done)
+    b = started_bench(tmp_path, NoStart(str(tmp_path), "Internal error"))
+    with pytest.raises(RuntimeError, match="did not start on the Linux machine .*not JSON: Internal error"):
         b.batch("runs", b.linux_steps()[:2], b.linux_done)
 
     # A batch whose state stops changing: past the step's bound and STALL_S more, the machine is asked.
@@ -878,6 +1105,17 @@ def test_a_batch_already_started_is_not_started_again(tmp_path):
     # A side told to stop stops at its next look.
     b.stop.set()
     assert b.batch("runs", steps, b.linux_done) == {"state": "stopped"}
+    # A run command that cannot be deleted is said and left to the group's tear-down; one that
+    # fails to be made is still deleted.
+    x = Fake(str(tmp_path / "d"), fail_on="run-command delete")
+    b = started_bench(tmp_path / "d", x)
+    b.batch("runs", steps, b.linux_done)
+    assert x.started == ["runs"] and "the run command moruna-bench-runs was not deleted" in x.out.getvalue()
+    x = Fake(str(tmp_path / "c"), fail_on="run-command create")
+    b = started_bench(tmp_path / "c", x)
+    with pytest.raises(RuntimeError, match="failed: run-command create"):
+        b.batch("runs", steps, b.linux_done)
+    assert x.azs[-1].startswith("az vm run-command delete --run-command-name moruna-bench-runs ")
 
 
 def test_the_sides_run_at_once_and_the_first_failure_stops_the_other(tmp_path):
