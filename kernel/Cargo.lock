@@ -432,6 +432,7 @@ dependencies = [
  "moruna-storage-format",
  "moruna-storage-service",
  "moruna-svc",
+ "node-protocol",
 ]
 
 [[package]]

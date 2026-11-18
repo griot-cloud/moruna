@@ -82,6 +82,81 @@ fn data_slots(config: &Config) -> Result<BTreeMap<String, Handle>, String> {
     Ok(out)
 }
 
+/// The functions a `grant SLOT functions FROM` hands on: the index the supervisor was given as
+/// `FROM`, and each function's file, `function.N`, taken from the start page once and checked
+/// to be memory; `None` for no such grant, or no index (a job that uses no function).
+struct Functions {
+    slot: String,
+    index: Handle,
+    files: Vec<(String, Handle)>,
+}
+
+fn function_slots(config: &Config) -> Result<Option<Functions>, String> {
+    let Some((slot, from)) = config.grants.iter().find_map(|g| match &g.source {
+        Source::Functions(from) => Some((g.slot.clone(), from.clone())),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    let Some(index) = start::take(&from) else {
+        return Ok(None);
+    };
+    let text = page_text(&index, &from, node_protocol::functions::INDEX_MAX as u64)?;
+    let mut files = Vec::new();
+    for name in engine::function_slots(&text)? {
+        let file = start::take(&name).ok_or_else(|| {
+            format!("the functions' index lists `{name}`, and the supervisor was not given it")
+        })?;
+        match file.info() {
+            Ok((moruna_svc::ObjectType::Memory, _)) => files.push((name, file)),
+            _ => return Err(format!("`{name}` is not a memory object")),
+        }
+    }
+    Ok(Some(Functions { slot, index, files }))
+}
+
+/// The text of the memory object `handle` (`name` in messages): its bytes up to its first zero,
+/// within its first `most` bytes.
+fn page_text(handle: &Handle, name: &str, most: u64) -> Result<String, String> {
+    let memory = Memory(
+        handle
+            .duplicate(Rights::READ | Rights::MAP)
+            .map_err(|e| format!("duplicating {name}: {}", e.name()))?,
+    );
+    let mapping = memory
+        .map(0, most, map::READ)
+        .map_err(|e| format!("mapping {name}: {}", e.name()))?;
+    let mut bytes = alloc::vec![0u8; most as usize];
+    mapping
+        .read(0, &mut bytes)
+        .map_err(|e| format!("reading {name}: {}", e.name()))?;
+    let len = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    bytes.truncate(len);
+    String::from_utf8(bytes).map_err(|_| format!("{name} is not UTF-8"))
+}
+
+/// A run's duplicates of the functions: the index read-only under its slot, and each file
+/// read-only (it may be mapped and handed on, never written) under `function.N`.
+fn function_grants(functions: &Option<Functions>) -> Result<Vec<(Bytes, Handle)>, String> {
+    let Some(functions) = functions else {
+        return Ok(Vec::new());
+    };
+    let mut out = alloc::vec![(
+        b(&functions.slot),
+        functions
+            .index
+            .duplicate(Rights::READ | Rights::MAP | Rights::TRANSFER)
+            .map_err(|e| format!("duplicating the functions' index: {}", e.name()))?,
+    )];
+    for (name, file) in &functions.files {
+        let handle = file
+            .duplicate(Rights::READ | Rights::MAP | Rights::DUPLICATE | Rights::TRANSFER)
+            .map_err(|e| format!("duplicating `{name}`: {}", e.name()))?;
+        out.push((b(name), handle));
+    }
+    Ok(out)
+}
+
 // stream P (architecture/data-os.md section 5)
 /// The process resources the grants name, taken from the supervisor's start page once and
 /// checked to be process resources: each run is given a duplicate.
@@ -366,6 +441,8 @@ fn grants(
                 .map_err(|e| format!("duplicating the data handle `{from}`: {}", e.name()))?,
             Source::Disk(device) => disks.grant(&g.slot, device)?,
             // stream P: the engine makes processes from it, nothing more.
+            // Handed on beside the grants, by `function_grants`.
+            Source::Functions(_) => continue,
             Source::Process(from) => processes
                 .get(from)
                 .ok_or_else(|| format!("no process resource `{from}`"))?
@@ -490,6 +567,13 @@ fn run() -> i64 {
             return 1;
         }
     };
+    let functions = match function_slots(&config) {
+        Ok(f) => f,
+        Err(why) => {
+            println!(out, "KD2 engine: FAIL: {}", why);
+            return 1;
+        }
+    };
     let mut disks = Disks::new();
     let mut argv = Vec::with_capacity(config.args.len() + 1);
     argv.push(b(&config.program));
@@ -533,6 +617,16 @@ fn run() -> i64 {
                 return 1;
             }
         };
+        match function_grants(&functions) {
+            Ok(granted) => handles.extend(granted),
+            Err(why) => {
+                println!(
+                    out,
+                    "KD2 engine: FAIL: run {} of {}: {}", n, config.runs, why
+                );
+                return 1;
+            }
+        }
         let runtime_start = match runtime
             .0
             .duplicate(Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER)
