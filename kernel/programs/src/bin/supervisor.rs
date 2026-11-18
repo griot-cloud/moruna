@@ -59,6 +59,8 @@ fn run() -> i64 {
     let personality = Channel(slot("personality"));
     // stream P hook: the rings' test (DS-P) starts its ring task.
     let rings = Channel(slot("rings"));
+    // Item 5.2b hook: the C functions' test starts its function tasks.
+    let functions = Channel(slot("functions"));
     if abi_version() != moruna_sys::ABI_VERSION {
         println!(
             out,
@@ -269,6 +271,15 @@ fn run() -> i64 {
     };
     if let Err((e, _)) = rings.write(b"process", [for_rings]) {
         return fail(&out, "handing the rings' test its process resource", e);
+    }
+    // Item 5.2b hook (system design 5B): the C functions' test starts its function tasks with a
+    // process resource of its own.
+    let for_functions = match root_process.duplicate(Rights::WRITE | Rights::TRANSFER) {
+        Ok(h) => h,
+        Err(e) => return fail(&out, "duplicating the process resource", e),
+    };
+    if let Err((e, _)) = functions.write(b"process", [for_functions]) {
+        return fail(&out, "handing the functions' test its process resource", e);
     }
     // SDD 25: the device manager does the device work with the device roots, and ends
     // once its last client has gone.

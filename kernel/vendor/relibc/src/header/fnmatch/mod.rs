@@ -1,0 +1,172 @@
+//! `fnmatch.h` implementation.
+//!
+//! See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/fnmatch.h.html>.
+
+use alloc::{borrow::Cow, vec::Vec};
+use core::slice;
+
+use crate::platform::types::{c_char, c_int};
+use posix_regex::{
+    PosixRegex,
+    compile::{Collation, Range, Token},
+    tree::{Tree, TreeBuilder},
+};
+
+/// cbindgen:ignore
+const ONCE: Range = Range(1, Some(1));
+
+/// The input string does not match the specified pattern.
+pub const FNM_NOMATCH: c_int = 1;
+
+/// Disable backslash escaping.
+pub const FNM_NOESCAPE: c_int = 1;
+/// Backslash in the input string only matches backlash in pattern.
+pub const FNM_PATHNAME: c_int = 2;
+/// Leading period in input string only matches period in pattern.
+pub const FNM_PERIOD: c_int = 4;
+/// Compare input string and pattern in a case-insensitive manner.
+pub const FNM_CASEFOLD: c_int = 8;
+/// Equivalent to `FNM_CASEFOLD`.
+pub const FNM_IGNORECASE: c_int = FNM_CASEFOLD;
+// TODO: FNM_EXTMATCH (Non-POSIX)
+
+unsafe fn tokenize(mut pattern: *const u8, flags: c_int) -> Tree {
+    fn any(leading: bool, flags: c_int) -> Token {
+        let mut list = Vec::new();
+        if flags & FNM_PATHNAME == FNM_PATHNAME {
+            list.push(Collation::Char(b'/'))
+        }
+        if leading && flags & FNM_PERIOD == FNM_PERIOD {
+            list.push(Collation::Char(b'.'))
+        }
+        Token::OneOf { invert: true, list }
+    }
+    fn can_push(leading: bool, flags: c_int, c: u8) -> bool {
+        (c != b'/' || flags & FNM_PATHNAME != FNM_PATHNAME)
+            && (c != b'.' || !leading || flags & FNM_PERIOD != FNM_PERIOD)
+    }
+    fn is_leading(flags: c_int, c: u8) -> bool {
+        c == b'/' && flags & FNM_PATHNAME == FNM_PATHNAME
+    }
+
+    let mut leading = true;
+    let mut need_collapsing = false;
+
+    let mut builder = TreeBuilder::default();
+    builder.start_internal(Token::Root, Range(1, Some(1)));
+    builder.start_internal(Token::Alternative, Range(1, Some(1)));
+
+    while unsafe { *pattern != 0 } {
+        let was_leading = leading;
+        leading = false;
+
+        let c = unsafe { *pattern };
+        pattern = unsafe { pattern.add(1) };
+
+        match (c == b'*', need_collapsing) {
+            (true, true) => continue,
+            (true, false) => need_collapsing = true,
+            (false, _) => need_collapsing = false,
+        }
+
+        let (token, range) = match c {
+            b'\\' if flags & FNM_NOESCAPE == FNM_NOESCAPE => {
+                let c = unsafe { *pattern };
+                if c == 0 {
+                    // Trailing backslash. Maybe error here?
+                    break;
+                }
+                pattern = unsafe { pattern.add(1) };
+                leading = is_leading(flags, c);
+                (Token::Char(c), ONCE)
+            }
+            b'?' => (any(was_leading, flags), ONCE),
+            b'*' => (any(was_leading, flags), Range(0, None)),
+            b'[' => {
+                let mut list: Vec<Collation> = Vec::new();
+                let invert = if unsafe { *pattern == b'!' } {
+                    pattern = unsafe { pattern.add(1) };
+                    true
+                } else {
+                    false
+                };
+
+                loop {
+                    let mut c = unsafe { *pattern };
+                    if c == 0 {
+                        break;
+                    }
+                    pattern = unsafe { pattern.add(1) };
+                    match c {
+                        b']' => break,
+                        b'\\' => {
+                            c = unsafe { *pattern };
+                            pattern = unsafe { pattern.add(1) };
+                            if c == 0 {
+                                // Trailing backslash. Maybe error?
+                                break;
+                            }
+                        }
+                        _ => (),
+                    }
+                    if unsafe { *pattern == b'-' && *pattern.add(1) != 0 } {
+                        let end = unsafe { *pattern.add(1) };
+                        pattern = unsafe { pattern.add(2) };
+                        for c in c..=end {
+                            if can_push(was_leading, flags, c) {
+                                list.push(Collation::Char(c));
+                            }
+                        }
+                    } else if can_push(was_leading, flags, c) {
+                        list.push(Collation::Char(c));
+                    }
+                }
+                // Otherwise, there was no closing ]. Maybe error?
+
+                (Token::OneOf { invert, list }, ONCE)
+            }
+            c => {
+                leading = is_leading(flags, c);
+                (Token::Char(c), ONCE)
+            }
+        };
+        builder.leaf(token, range);
+    }
+    builder.leaf(Token::End, ONCE);
+    builder.finish_internal();
+    builder.finish_internal();
+    builder.finish()
+}
+
+/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/fnmatch.html>.
+///
+/// Checks the `input` string to see if it matches `pattern`.
+///
+/// # Safety
+///
+/// The `input` and `pattern` parameters must be non-null and properly aligned.
+#[unsafe(no_mangle)]
+#[linkage = "weak"] // often redefined in GNU programs
+pub unsafe extern "C" fn fnmatch(
+    pattern: *const c_char,
+    input: *const c_char,
+    flags: c_int,
+) -> c_int {
+    let mut len = 0;
+    while unsafe { *input.offset(len) != 0 } {
+        len += 1;
+    }
+    let input = unsafe { slice::from_raw_parts(input.cast::<u8>(), len.cast_unsigned()) };
+
+    let tokens = unsafe { tokenize(pattern.cast::<u8>(), flags) };
+
+    if PosixRegex::new(Cow::Owned(tokens))
+        .case_insensitive(flags & FNM_CASEFOLD == FNM_CASEFOLD)
+        .matches_exact(input)
+        .is_some()
+    {
+        0
+    } else {
+        FNM_NOMATCH
+    }
+}

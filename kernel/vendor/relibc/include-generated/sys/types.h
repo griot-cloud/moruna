@@ -1,0 +1,35 @@
+#ifndef _RELIBC_SYS_TYPES_H
+#define _RELIBC_SYS_TYPES_H
+
+#include <features.h>
+#include <bits/clock-t.h>
+#include <bits/clockid-t.h>
+#include <bits/dev-t.h>
+#include <bits/gid-t.h>
+#include <bits/id-t.h>
+#include <bits/ino-t.h>
+#include <bits/key-t.h>
+#include <bits/mode-t.h>
+#include <bits/nlink-t.h>
+#include <bits/off-t.h>
+#include <bits/pid-t.h>
+#include <bits/reclen-t.h>
+#include <bits/size-t.h>      // for size_t from stddef.h
+#include <bits/ssize-t.h>
+#include <bits/suseconds-t.h>
+#include <bits/sys/stat.h>    // for blkcnt_t and blksize_t
+#include <bits/sys/statvfs.h> // for fsblkcnt_t and fsfilcnt_t
+#include <bits/time-t.h>
+#include <bits/timer-t.h>
+#include <bits/uid-t.h>
+#include <bits/useconds-t.h>  // from older POSIX
+
+// Non-POSIX extras musl has guarded
+#if defined(_BSD_SOURCE) || defined(_GNU_SOURCE)
+#include <sys/types/extra.h>
+#endif
+
+#include <bits/pthread.h>
+
+
+#endif  /* _RELIBC_SYS_TYPES_H */

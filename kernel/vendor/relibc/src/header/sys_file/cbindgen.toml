@@ -1,0 +1,7 @@
+include_guard = "_RELIBC_SYS_FILE_H"
+language = "C"
+no_includes = true
+cpp_compat = true
+
+[enum]
+prefix_with_name = true

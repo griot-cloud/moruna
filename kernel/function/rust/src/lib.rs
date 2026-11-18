@@ -30,6 +30,10 @@
 //! [`host::Plane`] drives, so a function is tested on a laptop as it runs on a node. Nothing else
 //! differs between the two.
 
+// On the core the task's rings are std's own moruna-sys's (`std::os::moruna`), unstable to its
+// users (`rustc_private`), as Hermit's `hermit_abi` is.
+#![cfg_attr(target_os = "moruna", feature(rustc_private))]
+
 mod emit;
 mod error;
 mod lane;

@@ -44,16 +44,22 @@ arm beside Motor's.
   In order: the first thread's thread-locals and control block from the start page's process;
   std's log, which stdout and stderr (and the C library's descriptors 1 and 2) write to; the C
   library's own initialization when one is linked (it defines `moruna_libc_init`, a weak symbol
-  here); then `main`, with the process's name as its one argument (`argc` 1). After `main`, the
-  first thread's thread-local destructors, and the exit with its code once the last line of
-  stdout and stderr is out. `abort_internal`, where a panic ends, exits with code 101, a
+  here); the program's `.preinit_array` and `.init_array`, which `kernel/targets/x86_64-moruna.ld`
+  bounds (item 5.2b); then `main`, with the process's name as its one argument (`argc` 1). After
+  `main`, the first thread's thread-local destructors, then the C library's `exit` when one is
+  linked (`moruna_libc_exit`: its `atexit` functions, the fini array, its streams flushed), or
+  else the fini array here, and the exit with its code once the last line of stdout and stderr
+  is out. `abort_internal`, where a panic ends, exits with code 101, a
   panicking program's code on Moruna.
 - **alloc:** the process's heap, `moruna_sys`'s, which std's `System` allocates from.
 - **thread:** the one thread path, `moruna_sys::rt::thread`, which the C library's
   `pthread_create` takes too: a 2 MiB stack by default (as Linux's std; arrow-rs and query
   engines recurse deeply) with a guard page below it; join, sleep, and yield (`thread_yield`,
-  ABI 2.8). std's thread start runs its thread-locals' destructors itself before the thread
-  ends, as Hermit's std does.
+  ABI 2.8). Every thread ends the runtime's one way, whichever runtime started it
+  (`rt::thread::end_current`, item 5.2b): the C library's part (its cleanup handlers, its
+  `thread_local` and key destructors), then std's (`sys/pal/moruna`'s `thread_end`: its
+  thread-locals' destructors, run by std itself as Hermit's std does, and its handle of the
+  thread), each set by its runtime's start.
 - **thread-local storage:** native ELF TLS (`has-thread-local`, the `local-exec` model; x86_64
   psABI variant II), the key table gone (system design 5B). Each thread's block is its TLS,
   made from the program's `PT_TLS` template, directly below its control block, whose address
@@ -109,7 +115,7 @@ used.
 | `std/src/sys/io/error/mod.rs` | 48 | +5 -0 | `1b591042fe82bc290244f6099db38bdb233578cdbcb2d927eab1181f035389d7` | `ad87700d9467fc5c6d9bf978ded0380d9bd15436fd99c40711999359e884f22c` |
 | `std/src/sys/io/error/moruna.rs` | 43 | +43 -0 | new | `21cbf255f65ed305d6f9e32708fea40deb7ac67e484252e17df769d204d08948` |
 | `std/src/sys/pal/mod.rs` | 72 | +5 -0 | `251dee50eff49b81ae5283ffd9871635dc63c316e0156a0f6f69672657ddbec3` | `6feb3489f30948c6a4bf197beb558874a5ef495beeb2365c1d43b786d144e99d` |
-| `std/src/sys/pal/moruna/mod.rs` | 78 | +78 -0 | new | `830c87ffc1d3213cafe5e7fba42f5f4340d1f1bcd7f691a44ad378e40e98ebfc` |
+| `std/src/sys/pal/moruna/mod.rs` | 166 | +166 -0 | new | `fccbcb14697da2000bea62585df943605ddee74810eedea57f47155edf4f5fc5` |
 | `std/src/sys/random/mod.rs` | 138 | +5 -0 | `38d7c91c3fee07226c5071a4e8edd75dd693f54cd76bc7f2a06fd8b80d0cb794` | `0603c349f20dcd2d5f87321465ed3d7fb2840841aa5baadd6b4bb752ea9a8af7` |
 | `std/src/sys/random/moruna.rs` | 7 | +7 -0 | new | `b5e898270826fc097a484efb411cc622261702726e0edee54e3d2b39330c207e` |
 | `std/src/sys/stdio/mod.rs` | 57 | +5 -0 | `ffc59c348ecc12e0d4748855309112f13979392983cafb677be6b82fc6e74d59` | `5a4ee16a5de372d607316f6efc08e7a11b5cf1b4a4f83cdfbfbe0ca7c47c443f` |
@@ -120,7 +126,7 @@ used.
 | `std/src/sys/sync/rwlock/mod.rs` | 37 | +2 -0 | `5438fdbc0ade05b50d7350c252ccb9d37bea596355560fbdc695f4937d727ef3` | `7fbee57f5ac665965a6b0d30dedb4f803dd8ef8255a7d6313b998d7ee97cd80f` |
 | `std/src/sys/sync/thread_parking/mod.rs` | 51 | +2 -0 | `26f989d09efadae98b1fa6447b386d8eda21b9fc3ef99c8bea3154d6625788a3` | `cc9cc6f4ad37c89e4cf5e8babff0a51d16e8a1e088fb2420c57eab279f26ec74` |
 | `std/src/sys/thread/mod.rs` | 162 | +8 -0 | `3590ca4dc8b112c787b14fcc5585add929a6e7c827ce01c329c2ef43e45587d6` | `cc4904f4fad1399a9a5bc508ca0bdf0cc635113d5def953898d80ab099c13352` |
-| `std/src/sys/thread/moruna.rs` | 56 | +56 -0 | new | `f2b35db105dfebc57d5f0924220c75c649f7fa7fdb16cfb2d2b83de0e385876e` |
+| `std/src/sys/thread/moruna.rs` | 52 | +52 -0 | new | `edcb19fc2f466900a8efa1df718c928258f6b73d806a10aff2fccef7ddb219a3` |
 | `std/src/sys/thread_local/mod.rs` | 224 | +2 -0 | `bc072e04d8564c050420e597b89e2b100502bb1395423277c057ca8aec70317a` | `346931af35a4f0c38e0751681f94fe71f3172a04cb77b2da733c8f9f07754b75` |
 | `std/src/sys/time/mod.rs` | 57 | +4 -0 | `449afdd86955252a302d889032a6cb2cbb04dd786f8cb81d9a9059ad933e7e4c` | `dc5f131f9033808546387962e3c22d24f962204bc06b42123d328775035dbbfa` |
 

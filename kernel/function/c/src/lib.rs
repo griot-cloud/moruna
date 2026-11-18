@@ -11,17 +11,32 @@
 //! each structure's pointers and counts are checked against its type, what arrow-rs would
 //! otherwise assert on; the imported array is then validated in full. A pointer to memory that
 //! is not what the structure says it is remains the function's own fault.
+//!
+//! On the core the archive is the C function's whole runtime: std (whose `_start` starts the
+//! program), this SDK, and relibc on Moruna's platform, the C library (system design 5B).
+
+// Linked whole on the core: nothing in Rust names relibc, whose symbols are the C program's.
+#[cfg(target_os = "moruna")]
+extern crate relibc;
+// getrandom's custom backend, which arrow-array's ahash reaches (item 5.0).
+#[cfg(target_os = "moruna")]
+use moruna_getrandom as _;
 
 use std::ffi::{CStr, c_char, c_int};
 use std::marker::{PhantomData, PhantomPinned};
 use std::sync::Arc;
 
-use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
 use arrow_array::{Array, RecordBatch, RecordBatchOptions, StructArray};
+use arrow_data::ffi::FFI_ArrowArray;
 use arrow_data::layout;
+use arrow_schema::ffi::FFI_ArrowSchema;
 use arrow_schema::{DataType, Schema};
 use sdk::task::Task;
 use sdk::{FunctionError, code};
+
+use crate::import::from_ffi_and_data_type;
+
+mod import;
 
 /// The header's `struct moruna_task`: a task the function holds a pointer to, and only that.
 #[repr(C)]

@@ -1,0 +1,14 @@
+# POSIX header spec: https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/dlfcn.h.html
+#
+# There are no spec quotations relating to includes
+include_guard = "_RELIBC_DLFCN_H"
+language = "C"
+style = "Type"
+no_includes = true
+cpp_compat = true
+
+[enum]
+prefix_with_name = true
+
+[export]
+include = ["Dl_info"]

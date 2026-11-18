@@ -25,6 +25,7 @@ unsafe extern "C" {
     pub fn moruna_test_null_out() -> c_int;
     pub fn moruna_test_child_moved(which: c_int) -> c_int;
     pub fn moruna_example_double() -> c_int;
+    pub fn moruna_test_runtime() -> c_int;
     pub fn moruna_test_array_size() -> usize;
     pub fn moruna_test_schema_size() -> usize;
     pub fn moruna_test_cpp_sizes() -> usize;

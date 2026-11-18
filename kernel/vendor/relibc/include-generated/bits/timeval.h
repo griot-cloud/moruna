@@ -1,0 +1,27 @@
+#ifndef _RELIBC_BITS_TIMEVAL_H
+#define _RELIBC_BITS_TIMEVAL_H
+
+#include <bits/time-t.h>
+#include <bits/suseconds-t.h>
+
+
+/**
+ * See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/sys_select.h.html>.
+ *
+ * Note that the `timeval` struct was specified for
+ * [`sys/time.h`](crate::header::sys_time) in the Open Group Base
+ * Specifications Issue 7 and prior, see
+ * <https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/sys_time.h.html>.
+ */
+struct timeval {
+  /**
+   * Seconds.
+   */
+  time_t tv_sec;
+  /**
+   * Microseconds.
+   */
+  suseconds_t tv_usec;
+};
+
+#endif  /* _RELIBC_BITS_TIMEVAL_H */
