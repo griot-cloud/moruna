@@ -82,6 +82,16 @@ fn run() -> i64 {
             };
             let share = o.percentile(WITHIN);
             worst = worst.max(share);
+            println!(
+                out,
+                "wake: woken by {} on CPU {}, every CPU computing: the median {} us, the {}th percentile {} us, the longest {} us",
+                by.name(),
+                sleeper,
+                o.percentile(50) / 1_000,
+                WITHIN,
+                share / 1_000,
+                o.max() / 1_000
+            );
             if share > BOUND_US * 1_000 {
                 failed = true;
                 let over = o

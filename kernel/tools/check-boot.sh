@@ -8,7 +8,11 @@
 # the kernel's success.
 # Prints each verdict.
 #
-#   kernel/tools/check-boot.sh LOG QEMU_STATUS EXPECT CPUS [generic|deadline]
+#   kernel/tools/check-boot.sh LOG QEMU_STATUS EXPECT CPUS [generic|deadline|alone]
+#
+# `deadline` and `alone` judge an image booted by itself (deadline-boot.sh, wake-boot.sh):
+# its expected lines, its CPUs, no failure and the kernel's success, none of the CI boot's
+# disks, vsock or engine runs.
 #
 # The boot's other files are read from EXPECT's directory (boot.sh's OUT).
 set -euo pipefail
@@ -18,7 +22,7 @@ status="$2"
 expect_file="$3"
 cpus="$4"
 kind="${5:-generic}"
-case "$kind" in generic|deadline) ;; *) echo "unknown boot check kind: $kind" >&2; exit 2 ;; esac
+case "$kind" in generic|deadline|alone) ;; *) echo "unknown boot check kind: $kind" >&2; exit 2 ;; esac
 out="$(dirname "$expect_file")"
 tools="$(cd "$(dirname "$0")" && pwd)"
 fail=0
