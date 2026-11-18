@@ -52,6 +52,21 @@ use crate::{
 const EPHEMERAL_FIRST: u16 = 49152;
 /// Rounds of loopback a poll takes before it leaves the rest for the next.
 const LOOPBACK_ROUNDS: usize = 32;
+/// When a DHCP client sends its first DISCOVER or REQUEST again with no answer, in seconds:
+/// RFC 2131 4.1's 4 s, where smoltcp's defaults are 10 s and 5 s. One answer lost while a
+/// cloud's network is still being set up at boot then costs the node's start 4 s, not 10.
+const DHCP_RETRY_S: u64 = 4;
+
+/// An interface's DHCP client, timed as RFC 2131 4.1 says (see [`DHCP_RETRY_S`]); a REQUEST's
+/// wait still doubles every two tries, as smoltcp does.
+fn dhcp_client() -> dhcpv4::Socket<'static> {
+    let mut socket = dhcpv4::Socket::new();
+    let mut retry = dhcpv4::RetryConfig::default();
+    retry.discover_timeout = Duration::from_secs(DHCP_RETRY_S);
+    retry.initial_request_timeout = Duration::from_secs(DHCP_RETRY_S);
+    socket.set_retry_config(retry);
+    socket
+}
 
 fn fail(e: net::Error) -> Outcome {
     Outcome::Failure(e.code())
@@ -362,6 +377,8 @@ pub struct Stack {
     pub bounds: Vec<String>,
     /// Whether an interface has taken a DHCP lease since the stack was made.
     leased: bool,
+    /// When the stack was made, in nanoseconds: a lease's line says how long after it came.
+    made: u64,
     now: u64,
     next_port: u16,
     next_seq: u16,
@@ -471,7 +488,7 @@ impl Stack {
                 card.up,
                 port,
                 iface,
-                c.dhcp.then(dhcpv4::Socket::new),
+                c.dhcp.then(dhcp_client),
                 Some(dns::Socket::new(
                     &[],
                     (0..s.dns_queries).map(|_| None).collect::<Vec<_>>(),
@@ -502,6 +519,7 @@ impl Stack {
             boot: Vec::new(),
             bounds: Vec::new(),
             leased: false,
+            made: now,
             now,
             next_port: EPHEMERAL_FIRST + (seed % 16384) as u16,
             next_seq: 1,
@@ -775,6 +793,7 @@ impl Stack {
     // ---- interfaces: DHCP, the resolver's servers, routes ----
 
     fn dhcp(&mut self, i: usize) {
+        let after_ms = self.now.saturating_sub(self.made) / 1_000_000;
         let x = &mut self.ifaces[i];
         let Some(h) = x.dhcp else {
             return;
@@ -788,6 +807,12 @@ impl Stack {
             )),
             Some(dhcpv4::Event::Deconfigured) => None,
         };
+        // A lease is lost only when one was held: the client's first poll says it has none.
+        let held = x
+            .iface
+            .ip_addrs()
+            .iter()
+            .any(|c| matches!(c.address(), IpAddress::Ipv4(_)));
         x.iface
             .update_ip_addrs(|a| a.retain(|c| !matches!(c.address(), IpAddress::Ipv4(_))));
         x.iface.routes_mut().remove_default_ipv4_route();
@@ -814,8 +839,8 @@ impl Stack {
                 }
                 self.leased = true;
                 let dns: Vec<String> = x.dhcp_dns.iter().map(|d| format!("{d}")).collect();
-                format!(
-                    "{}: DHCP bound {}/{}, router {}, dns {}",
+                Some(format!(
+                    "{}: DHCP bound {}/{}, router {}, dns {}, {after_ms} ms after the server started",
                     x.name,
                     cidr.address(),
                     cidr.prefix_len(),
@@ -825,11 +850,11 @@ impl Stack {
                     } else {
                         dns.join(" ")
                     }
-                )
+                ))
             }
-            None => format!("{}: DHCP lease lost", x.name),
+            None => held.then(|| format!("{}: DHCP lease lost", x.name)),
         };
-        self.notes.push(note);
+        self.notes.extend(note);
         self.update_resolvers();
     }
 

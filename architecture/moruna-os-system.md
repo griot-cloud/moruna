@@ -102,6 +102,10 @@ Implements the OS design, section 1, OpenStack column.
 ### 1C. Network
 
 - **One interface, `wan`,** on the first network card, set by DHCP: address, mask, gateway, DNS.
+  DHCP is timed as RFC 2131 4.1 says: a DISCOVER or REQUEST with no answer is sent again after
+  4 s. A cloud may lose the first answer while it sets up the network at boot (Azure, run 8), and
+  smoltcp's 10 s default cost the node's start those 10 s. The console's lease line says how many
+  ms after the network server's start it came.
   IPv4 only for now. The network server's config is:
 
   ```
