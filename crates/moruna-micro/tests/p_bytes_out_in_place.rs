@@ -16,10 +16,13 @@
 use std::sync::Arc;
 
 use moruna_adapters::land::land_table;
-use moruna_kernel::arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray};
+use moruna_kernel::arrow::array::{
+    Array, ArrayData, ArrayRef, BooleanArray, FixedSizeListArray, Float64Array, Int32Array,
+    Int64Array, ListArray, StringArray, StructArray,
+};
 use moruna_kernel::arrow::buffer::{Buffer as ArrowBuffer, MutableBuffer};
 use moruna_kernel::arrow::compute::concat_batches;
-use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
+use moruna_kernel::arrow::datatypes::{DataType, Field, Float32Type, Int64Type, Schema};
 use moruna_kernel::arrow::record_batch::RecordBatch;
 use moruna_kernel::{Allocator, Payload, Tier, ipc};
 use moruna_micro::in_place;
@@ -152,6 +155,57 @@ fn table(payload: &Payload) -> &RecordBatch {
     }
 }
 
+/// Every buffer of `batch`: each column's validity and buffers, and its children's.
+fn buffers(batch: &RecordBatch) -> Vec<ArrowBuffer> {
+    fn of(data: &ArrayData, all: &mut Vec<ArrowBuffer>) {
+        all.extend(data.nulls().map(|n| n.buffer().clone()));
+        all.extend(data.buffers().iter().cloned());
+        for child in data.child_data() {
+            of(child, all);
+        }
+    }
+    let mut all = Vec::new();
+    for column in batch.columns() {
+        of(&column.to_data(), &mut all);
+    }
+    all
+}
+
+/// Columns whose buffers are not one a column: a boolean with nulls, a struct of an `int32`
+/// with nulls and a string, a list of `int64` with null lists, and a fixed-size list.
+fn nested(rows: usize) -> RecordBatch {
+    let flag: BooleanArray = (0..rows)
+        .map(|r| (r % 5 != 0).then_some(r % 2 == 0))
+        .collect();
+    let small: Int32Array = (0..rows)
+        .map(|r| (r % 3 != 0).then_some(r as i32))
+        .collect();
+    let name: StringArray = (0..rows).map(|r| Some(format!("zone {r}"))).collect();
+    let pair = StructArray::from(vec![
+        (
+            Arc::new(Field::new("small", DataType::Int32, true)),
+            Arc::new(small) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("name", DataType::Utf8, true)),
+            Arc::new(name) as ArrayRef,
+        ),
+    ]);
+    let stops = ListArray::from_iter_primitive::<Int64Type, _, _>((0..rows).map(|r| {
+        (r % 4 != 0).then(|| (0..r % 3).map(|s| Some((r + s) as i64)).collect::<Vec<_>>())
+    }));
+    let point = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        (0..rows).map(|r| Some(vec![Some(r as f32), Some(r as f32 / 2.0)])),
+        2,
+    );
+    batch(vec![
+        ("flag", Arc::new(flag)),
+        ("pair", Arc::new(pair)),
+        ("stops", Arc::new(stops)),
+        ("point", Arc::new(point)),
+    ])
+}
+
 #[test]
 fn p_an_answer_of_1_17_times_its_input_counts_that_in_place_copied_or_joined() {
     let alloc: Arc<dyn Allocator> = Arc::new(FakeAllocator::new());
@@ -228,12 +282,7 @@ fn p_a_record_kept_in_place_is_not_copied_and_is_held_until_its_last_buffer_goes
     );
     let in_place = in_place::decode(whole.clone()).expect("the record decodes in place");
     assert_eq!(in_place, answer);
-    let mut buffers = Vec::new();
-    for column in in_place.columns() {
-        let data = column.to_data();
-        buffers.extend(data.buffers().iter().cloned());
-        buffers.extend(data.nulls().map(|n| n.buffer().clone()));
-    }
+    let mut buffers = buffers(&in_place);
     // 3 int64, a double, a double with its validity, a string's offsets and bytes, a double.
     assert_eq!(buffers.len(), 9);
     for b in &buffers {
@@ -254,4 +303,42 @@ fn p_a_record_kept_in_place_is_not_copied_and_is_held_until_its_last_buffer_goes
     assert!(whole.strong_count() > 1, "the last buffer holds the record");
     drop(last);
     assert_eq!(whole.strong_count(), 1, "the record is the caller's alone");
+}
+
+#[test]
+fn p_nested_columns_and_empty_records_kept_in_place_count_as_their_copies_do() {
+    let alloc: Arc<dyn Allocator> = Arc::new(FakeAllocator::new());
+    for rows in [0, 1, 4097] {
+        let answer = nested(rows);
+        let whole = record(&answer, alloc.as_ref());
+        let in_place = kept(whole.clone());
+        let copied = landed(whole.clone(), &alloc);
+        assert_eq!(table(&in_place), &answer, "{rows} rows, kept in place");
+        assert_eq!(table(&copied), &answer, "{rows} rows, copied");
+        // A copy gives a buffer of no bytes one byte of the arena; nothing else differs.
+        let of_no_bytes = buffers(&answer).iter().filter(|b| b.is_empty()).count() as u64;
+        assert!(
+            in_place.bytes() <= copied.bytes() && copied.bytes() - in_place.bytes() <= of_no_bytes,
+            "{rows} rows: {} bytes kept in place, {} copied, in a record of {} bytes",
+            in_place.bytes(),
+            copied.bytes(),
+            whole.len()
+        );
+        let (start, end) = (
+            whole.as_ptr() as usize,
+            whole.as_ptr() as usize + whole.len(),
+        );
+        for b in buffers(table(&in_place)) {
+            let at = b.as_ptr() as usize;
+            assert!(start <= at && at + b.len() <= end, "{rows} rows: no copy");
+        }
+        drop(in_place);
+        assert_eq!(whole.strong_count(), 1, "{rows} rows: the record is let go");
+    }
+}
+
+#[test]
+fn p_bytes_that_are_no_record_are_refused_in_place() {
+    let garbage = b"this is not an Arrow record, and it says so".to_vec();
+    assert!(in_place::decode(ArrowBuffer::from(garbage)).is_err());
 }
