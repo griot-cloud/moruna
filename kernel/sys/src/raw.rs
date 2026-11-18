@@ -270,6 +270,12 @@ pub fn account_info(account: RawHandle, out: &mut [u8; moruna_abi::account_info:
     unsafe { syscall(nr::ACCOUNT_INFO, a) }.0
 }
 
+/// `account_cpu` (ABI 2.10) of `account`, zero for the caller's own: the nanoseconds of
+/// CPU time charged to it, or an error. No user pointers.
+pub fn account_cpu(account: RawHandle) -> u64 {
+    call1(nr::ACCOUNT_CPU, account as u64).0
+}
+
 /// `interrupt_create_msi`: the interrupt in `rax`, the message in `rdx`
 /// (`moruna_abi::msi`).
 pub fn interrupt_create_msi(resource: RawHandle, slot: u64) -> (u64, u64) {

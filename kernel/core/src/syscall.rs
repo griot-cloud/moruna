@@ -127,6 +127,8 @@ pub fn dispatch(thread: &Arc<Thread>, ctx: &mut UserContext) -> Flow {
         nr::ACCOUNT_CREATE => account_create(p, a[0], a[1], a[2], a[3]),
         nr::ACCOUNT_INFO => account_info(p, a[0], a[1]),
         nr::ACCOUNT_MATCHES => account_matches(p, a[0], a[1]),
+        // ABI 2.10 (item 6.3i): the CPU time charged to an account.
+        nr::ACCOUNT_CPU => account_cpu(thread, a[0]),
         // ABI 2.6: the data path's mechanisms (stream A) and the personality's (stream B1),
         // each in its own module so that the two streams never write the same file.
         nr::THREAD_SET_CPU => datapath::thread_set_cpu(thread, a).map_err(Into::into),
@@ -515,6 +517,17 @@ fn account_info(p: &Process, account: u64, out: u64) -> Ret {
     let account = account_of(p, account, Rights::READ)?;
     usercopy::write(&p.space, out, &account.info())?;
     one(0)
+}
+
+/// `account_cpu` (ABI 2.10): the nanoseconds of CPU time charged to the caller's own
+/// account (zero), an account's or a process's, with `READ`: its processes' threads' and
+/// those of every account carved out of it, ended ones included. A thread's time is
+/// charged when it leaves its CPU, so the calling thread's running slice is added when
+/// its process is charged within the account.
+fn account_cpu(thread: &Thread, account: u64) -> Ret {
+    let p = &thread.process;
+    let account = account_of(p, account, Rights::READ)?;
+    one(account.cpu_ns(p.account(), thread.slice()))
 }
 
 /// Exact Account capability or immutable Memory charged-owner identity. Neither

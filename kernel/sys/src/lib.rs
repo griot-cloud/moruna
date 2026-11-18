@@ -446,6 +446,27 @@ impl Account {
     pub fn usage(&self) -> Result<Usage> {
         Usage::of(&self.0)
     }
+
+    /// The CPU time charged to it, in nanoseconds, kernel time included (`account_cpu`,
+    /// ABI 2.10): what the threads of every process charged to it, or to an account carved
+    /// out of it, have used since it was made, ended ones included. A thread's time is
+    /// charged as it leaves its CPU. `BadSyscall` from a kernel before ABI 2.10.
+    pub fn cpu(&self) -> Result<u64> {
+        cpu_of(&self.0)
+    }
+}
+
+/// The CPU time charged to the caller's own account, as [`Account::cpu`] gives an
+/// account's: the caller's process, every other charged to its account, and every
+/// account carved out of it.
+pub fn own_cpu() -> Result<u64> {
+    check(raw::account_cpu(0))
+}
+
+/// The CPU time charged to the account `handle` names: an account, or a process's, with
+/// `READ` ([`Account::cpu`]).
+pub fn cpu_of(handle: &Handle) -> Result<u64> {
+    check(raw::account_cpu(handle.raw()))
 }
 
 /// An account's figures (`account_info`), in bytes.

@@ -303,7 +303,8 @@ process vm
 # sum of its children, then starts three children in accounts carved out of its own: one
 # refused an object past its account, one ended by the kernel at the first page its
 # account cannot pay for, and one that runs on beside them. The supervisor gives it a
-# process resource.
+# process resource. KB5 cpu (ABI 2.10, item 6.3i): each child's account was charged its
+# process's CPU time, its own account theirs too, and their time stayed once they had gone.
 process quota
   memory 64MiB
   handle console console
@@ -311,6 +312,7 @@ process quota
   expect KB5 accounts: ok:
   expect KB5 quota: ok:
   expect KB5 full account: ok:
+  expect KB5 cpu: ok:
   expect kk: process quota-touch faulted: a page fault at
   expect could not be charged: account quota-touch has no room for 4128 bytes (limit 4194304 bytes,
   expect kk: process quota-call exited with code 0 (

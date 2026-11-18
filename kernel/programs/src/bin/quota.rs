@@ -12,7 +12,12 @@
 //!   touches zero pages until the kernel ends it with its account named, and one goes on
 //!   making, writing and freeing memory while the other two have filled theirs; this
 //!   process reads each account's figures, and once they are gone every limit it carved
-//!   has come back to it.
+//!   has come back to it;
+//! - `KB5 cpu` (ABI 2.10, item 6.3i): each of those children's accounts was charged the
+//!   CPU time its process used, read through the account and through the ended process;
+//!   its own account, which theirs were carved from, was charged theirs and its own; the
+//!   children and their accounts gone, their time stays in it; its own running slice
+//!   counts; and a handle without `READ` and a memory object are refused.
 //!
 //! Start slots: `console`, `hog-image` (the children's program), and `supervisor`, on
 //! which the supervisor sends a process resource.
@@ -23,8 +28,8 @@
 
 use moruna_kb1_programs::{console, ms, slot};
 use moruna_sys::{
-    Account, Channel, Console, Error, Handle, Memory, Process, Rights, Signals, Usage, charge, map,
-    now, println, wait_one,
+    Account, Channel, Console, Error, Handle, Memory, Process, Rights, Signals, Usage, charge,
+    cpu_of, map, now, own_cpu, println, wait_one,
 };
 
 moruna_sys::main!(run);
@@ -41,6 +46,16 @@ fn own() -> Result<Usage, (&'static str, Option<Error>)> {
 
 fn usage(a: &Account, what: &'static str) -> Result<Usage, (&'static str, Option<Error>)> {
     a.usage().map_err(|e| (what, Some(e)))
+}
+
+/// The CPU time charged to its own account (`account_cpu`, ABI 2.10).
+fn own_time() -> Result<u64, (&'static str, Option<Error>)> {
+    own_cpu().map_err(|e| ("account_cpu on its own account", Some(e)))
+}
+
+/// The CPU time charged to the account `handle` names.
+fn time_of(handle: &Handle, what: &'static str) -> Result<u64, (&'static str, Option<Error>)> {
+    cpu_of(handle).map_err(|e| (what, Some(e)))
 }
 
 fn want(ok: bool, what: &'static str) -> Outcome {
@@ -326,6 +341,8 @@ fn tasks(
         "KB5 full account: ok: whole-area protection and freeing unmap at the exact ceiling; a real split refused; exact peak unchanged; unstarted process charges returned"
     );
     let image = slot("hog-image");
+    // Its own account's CPU time before any child runs: what the children add is theirs.
+    let cpu_before = own_time()?;
     let mut steady = child(&resource, &image, "quota-steady", 8 * MIB)?;
     steady.start(out, b"steady")?;
 
@@ -387,6 +404,42 @@ fn tasks(
     }
     call.ended()?;
 
+    // KB5 cpu (ABI 2.10): each child's account was charged the time its process used, and
+    // an ended process stays counted, read through its account or through the process.
+    let steady_cpu = time_of(&steady.account.0, "account_cpu of the steady child")?;
+    let call_cpu = time_of(&call.account.0, "account_cpu of the call child")?;
+    let touch_cpu = time_of(&touch.account.0, "account_cpu of the touch child")?;
+    want(
+        steady_cpu > 0 && call_cpu > 0 && touch_cpu > 0,
+        "a child that ran was charged no CPU time",
+    )?;
+    want(
+        time_of(&steady.process.0, "account_cpu through an ended process")? == steady_cpu,
+        "an ended child's CPU time read through its process is not its account's",
+    )?;
+    // The account theirs were carved from was charged theirs too, and this process's own.
+    let cpu_with_children = own_time()?;
+    want(
+        cpu_with_children - cpu_before >= steady_cpu + call_cpu + touch_cpu,
+        "the children's CPU time was not charged to the account theirs were carved from",
+    )?;
+    let unreadable = steady
+        .account
+        .0
+        .duplicate(Rights::WRITE)
+        .map_err(|e| ("duplicating an account without READ", Some(e)))?;
+    refused(
+        cpu_of(&unreadable),
+        Error::AccessDenied,
+        "account_cpu through a handle without READ",
+    )?;
+    refused(
+        cpu_of(&image),
+        Error::WrongType,
+        "account_cpu of a memory object",
+    )?;
+    drop(unreadable);
+
     // Every child gone, each limit carved comes back.
     drop(steady);
     drop(call);
@@ -395,6 +448,29 @@ fn tasks(
         own()?.reserved == reserved_before,
         "the children's accounts did not give their limits back",
     )?;
+    // Their accounts gone, their CPU time stays in the account they were carved from.
+    let cpu_after = own_time()?;
+    want(
+        cpu_after >= cpu_with_children,
+        "the children's accounts gone took their CPU time with them",
+    )?;
+    // A thread's time is charged as it leaves its CPU, and its running slice counts when it
+    // reads its own account: this thread sees 5 ms more whether or not it was switched out.
+    let deadline = now() + ms(60_000);
+    while own_time()? - cpu_after < ms(5) {
+        want(
+            now() < deadline,
+            "its own account's CPU time did not move while it ran",
+        )?;
+    }
+    println!(
+        out,
+        "KB5 cpu: ok: quota-steady's account was charged {} ns of CPU time, quota-call's {} ns and quota-touch's {} ns, and quota-steady's read the same through its ended process; its own account, which theirs were carved from, was charged {} ns while they ran, theirs and its own; their accounts gone, their time stayed in it; its own running slice counted; a handle without READ and a memory object were refused",
+        steady_cpu,
+        call_cpu,
+        touch_cpu,
+        cpu_with_children - cpu_before
+    );
     Ok((made, used, t.peak))
 }
 

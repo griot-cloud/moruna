@@ -45,10 +45,12 @@ pub mod manifest;
 /// `clock_set_realtime`, and `thread_yield`, after 2.7's six calls. ABI 2.9 (item 5.3b, the
 /// calls pyarrow asks of the Linux personality) adds two fast calls of a forward:
 /// [`forward::fast::MREMAP`] ([`forward::remap`]) and [`forward::fast::SET_ROBUST_LIST`]
-/// ([`forward::robust`]).
+/// ([`forward::robust`]). ABI 2.10 (`architecture/moruna-os-system.md`, sections 3A and 6B;
+/// item 6.3i) adds `account_cpu`: the CPU time charged to an account, beside the memory
+/// `account_info` gives, so that a node says what a job's processes cost.
 pub const ABI_MAJOR: u16 = 2;
 /// See [`ABI_MAJOR`].
-pub const ABI_MINOR: u16 = 9;
+pub const ABI_MINOR: u16 = 10;
 /// The packed version `abi_version` returns.
 pub const ABI_VERSION: u64 = ((ABI_MAJOR as u64) << 16) | ABI_MINOR as u64;
 
@@ -259,8 +261,17 @@ pub mod nr {
     /// ABI 2.8 (item 5.0): `thread_yield()`: the calling thread gives its CPU to another
     /// ready thread, if there is one, and runs again after it.
     pub const THREAD_YIELD: u64 = BASE + 72;
+    /// ABI 2.10 (item 6.3i): `account_cpu(account) -> nanoseconds`: the CPU time, kernel
+    /// time included, that the threads of every process charged to the account, or to an
+    /// account carved from it, have used since the account was made; a process that has
+    /// ended, and an account carved from it that is gone, stay counted. The account is the
+    /// caller's own (zero), an account or a process's, with `READ`, as `account_info`
+    /// takes it. A thread's time is charged when it leaves its CPU, so a thread running on
+    /// another CPU is counted up to when it last took that CPU; the calling thread's own
+    /// running slice is counted when its process is charged within the account.
+    pub const ACCOUNT_CPU: u64 = BASE + 73;
     /// One past the highest call of the table.
-    pub const COUNT: u64 = 73;
+    pub const COUNT: u64 = 74;
     /// The data plane's calls (SDD 29): native numbers a task makes on its own plane,
     /// or a personality server on a task's. The rest of the range is reserved.
     pub const DATA_PLANE: core::ops::Range<u64> = BASE + 0x100..BASE + 0x110;
@@ -1800,13 +1811,16 @@ mod tests {
         assert!(!valid_name(b""));
         assert!(!valid_name(b"Upper"));
         assert!(!valid_name(&[b'a'; 33]));
-        assert_eq!(ABI_VERSION, 0x2_0009);
+        assert_eq!(ABI_VERSION, 0x2_000a);
         assert_eq!(nr::HYPERV_POST, nr::THREAD_INTERRUPT + 1);
         // ABI 2.8's two calls follow 2.7's six.
         assert_eq!(nr::CLOCK_SET_REALTIME, nr::HYPERV_SIGNAL + 1);
         assert_eq!(nr::THREAD_YIELD, nr::CLOCK_SET_REALTIME + 1);
-        assert_eq!(nr::THREAD_YIELD + 1, nr::BASE + nr::COUNT);
         assert!(nr::is_native(nr::CLOCK_SET_REALTIME) && nr::is_native(nr::THREAD_YIELD));
+        // ABI 2.10's call follows 2.8's two, and is the table's last.
+        assert_eq!(nr::ACCOUNT_CPU, nr::THREAD_YIELD + 1);
+        assert_eq!(nr::ACCOUNT_CPU + 1, nr::BASE + nr::COUNT);
+        assert!(nr::is_native(nr::ACCOUNT_CPU));
         assert_eq!(nr::THREAD_SET_CPU, nr::ACCOUNT_MATCHES + 1);
         assert_eq!(nr::PERSONALITY_SET, nr::WINDOWS_PROTECT + 1);
         assert!(nr::is_native(nr::THREAD_SET_CPU) && nr::is_native(nr::THREAD_INTERRUPT));
