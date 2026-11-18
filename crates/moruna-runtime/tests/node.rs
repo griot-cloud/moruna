@@ -546,8 +546,9 @@ fn a_nodes_budget_is_the_most_a_job_may_have_and_its_default() {
 
 /// A job with no budget gets the node's job bound (system design 3A, item 3.2c): the check
 /// answers the bound and the job runs exactly as one whose budget is the bound, its report
-/// saying the same memory, the arena's share of it (1.3c's 326 MiB of a 2 GiB node's bound). A
-/// document's own budget is kept, and one larger than the bound is refused by its field.
+/// saying the bound as its budget (`budget.memory_bytes`) and the arena's share of it as its
+/// memory limit (1.3c's 326 MiB of a 2 GiB node's bound). A document's own budget is kept, and
+/// one larger than the bound is refused by its field.
 #[test]
 fn a_job_with_no_budget_runs_with_the_nodes_job_bound() {
     let _serial = one_run_at_a_time();
@@ -603,7 +604,11 @@ fn a_job_with_no_budget_runs_with_the_nodes_job_bound() {
             .iter()
             .find(|m| m["type"] == "report")
             .expect("a report");
-        report["report"]["host"]["memory_limit_bytes"].clone()
+        let report = &report["report"];
+        (
+            report["budget"]["memory_bytes"].clone(),
+            report["host"]["memory_limit_bytes"].clone(),
+        )
     };
     let with_budget = |memory: Option<u64>| {
         let mut document = document(scratch.path());
@@ -621,7 +626,7 @@ fn a_job_with_no_budget_runs_with_the_nodes_job_bound() {
         (exit::COMPLETED, json!(bound))
     );
     let none = ran(with_budget(None));
-    assert_eq!(none, arena(bound));
+    assert_eq!(none, (json!(bound), arena(bound)));
     assert_eq!(none, ran(with_budget(Some(bound))));
     // 1.3c's figures: 326 MiB of arena and 108 MiB of scratch beside the engine's own 128 MiB.
     let sizes = moruna_runtime::host::node::sizes(bound, false);
@@ -632,7 +637,7 @@ fn a_job_with_no_budget_runs_with_the_nodes_job_bound() {
         checked(with_budget(Some(own))),
         (exit::COMPLETED, json!(own))
     );
-    assert_eq!(ran(with_budget(Some(own))), arena(own));
+    assert_eq!(ran(with_budget(Some(own))), (json!(own), arena(own)));
     // One larger than the bound is refused by its field.
     let (code, _) = checked(with_budget(Some(bound + 4096)));
     assert_eq!(code, exit::SPEC_REFUSED);

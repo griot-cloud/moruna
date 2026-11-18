@@ -4,7 +4,13 @@ Every job produces a run report, computed from a record Moruna keeps of every mo
 
 ## The schema
 
-`schema_version` is `"MAJOR.MINOR"`. A reader refuses a report whose major it does not know, and reads a later minor of its major, which only adds fields. This release's schema is `2.1`, which adds `execution_fingerprint` to `2.0`. In `2.0`, `tasks` holds every figure of a task, and the `stages` of schema 1 are gone.
+`schema_version` is `"MAJOR.MINOR"`. A reader refuses a report whose major it does not know, and reads a later minor of its major, which only adds fields. This release's schema is `3.1`.
+
+`3.1` adds, to `3.0`:
+
+- `budget`, the job's whole memory budget.
+
+In `3.0` a sink's `excluded_rows` is gone, and `io` and a source's or a sink's task give reads, decodes, encodes and writes apart. `2.1` added `execution_fingerprint`; in `2.0`, `tasks` holds every figure of a task, and the `stages` of schema 1 are gone.
 
 A measurement that was not made is absent from the report, never zero: a zero is a measured zero. A task that ran no morsel has no `wall_ms`; a sink's `snapshot_id` is `null` only when it committed none.
 
@@ -39,6 +45,7 @@ The trace's own fields follow the same rule: a field it measures in seconds, nan
 | `execution_fingerprint` | The normalized execution fingerprint (`sha256:` and hex) the planner and recovery use. It is not the document's identity; `null` for a run refused before its job was built. Added in schema 2.1. |
 | `args` | The run's argument values, by name. |
 | `host` | Where it ran: `platform` (`os/arch`), `cpus`, `memory_limit_bytes`, `cpu_quota_cores`, `limits_source` and `devices`. |
+| `budget` | `memory_bytes`, the job's whole memory budget: the spec's `budget.memory_bytes`, or on a node the node's job bound when the spec names none; `null` when there is none. On a node the engine runs within the arena's share of it, which `host.memory_limit_bytes` says. Added in schema 3.1. |
 | `exit` | `code`, `status` (`"completed"`, `"terminated"`, `"cancelled"`, or `"refused"` when the document, its budget or its resume was refused before the run started) and `diagnostic`, the reason the job stopped. A run refused before it started has no trace: its document has its identity, `exit`, `notes`, `args`, `plan` and each task `skipped`. |
 | `tasks` | One entry per task, in the spec's order; see below. |
 | `resources` | `cpu_core_s`, `peak_memory_bytes` (the whole process's) and `memory_basis`, how it was measured. |
