@@ -506,6 +506,11 @@
           "function": {
             "type": "string",
             "description": "The function's registered name (`POST /v1/functions`): 1 to 64 of lowercase letters,\ndigits, `_`, `-` and `.`, a letter first. The node refuses a name it has not registered."
+          },
+          "params": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "The function's params, data only, given to its process as `MORUNA_PARAMS`, as an\n`image` task's are."
           }
         },
         "required": [
@@ -517,6 +522,12 @@
         "examples": [
           {
             "function": "taxi.clean"
+          },
+          {
+            "function": "taxi.score",
+            "params": {
+              "threshold": 0.5
+            }
           }
         ]
       },

@@ -1,7 +1,8 @@
 //! A registered function as a task, the kind `function` (system design 3E and 5C; item 3.6): a
-//! function task names a function registered on the node, `{"function": NAME}`, and runs the
-//! file the node fetched and verified for it, which `node-admission` gives the engine as a
-//! read-only memory object ([`moruna_micro::functions`]).
+//! function task names a function registered on the node, `{"function": NAME}`, with the
+//! `params` it is given as `MORUNA_PARAMS` (its thresholds and options), and runs the file the
+//! node fetched and verified for it, which `node-admission` gives the engine as a read-only
+//! memory object ([`moruna_micro::functions`]). Its needs are the check's, not its settings'.
 //!
 //! What the file is, its content decides (PM, item 3.6):
 //!
@@ -22,7 +23,7 @@ use moruna_image::archive::{self, Archive};
 use moruna_kernel::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use moruna_job::{Declaration, Fact, Flow, Isolation, Needs, Role, settings_schema};
 
@@ -42,7 +43,17 @@ pub struct Settings {
     /// The function's registered name (`POST /v1/functions`): 1 to 64 of lowercase letters,
     /// digits, `_`, `-` and `.`, a letter first. The node refuses a name it has not registered.
     pub function: String,
+    /// The function's params, data only, given to its process as `MORUNA_PARAMS`, as an
+    /// `image` task's are.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub params: Map<String, Value>,
 }
+
+/// Why a native function is refused params: its program is started with no environment.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const NATIVE_TAKES_NO_PARAMS: &str = "a native function is started with no environment, and \
+                                      `moruna-function` (5A) has no way to read params: \
+                                      give a native function none";
 
 /// Why a function task is refused anywhere but on a Moruna node.
 const ON_A_NODE_ONLY: &str = "a registered function runs on a Moruna node, whose admission gives \
@@ -123,16 +134,21 @@ pub(crate) struct ImageProgram {
 }
 
 /// The environment the runner gives a function's process, as an `image` task's: its role, its
-/// params (a function task has none) and the run's arguments. The image's own config gives
-/// its entry (`MORUNA_ENTRY`).
+/// params and the run's arguments. The image's own config gives its entry (`MORUNA_ENTRY`).
 #[cfg_attr(
     not(all(target_os = "linux", target_arch = "x86_64")),
     allow(dead_code)
 )]
-pub(crate) fn runner_env(args: &serde_json::Map<String, Value>) -> BTreeMap<String, String> {
+pub(crate) fn runner_env(
+    params: &Map<String, Value>,
+    args: &Map<String, Value>,
+) -> BTreeMap<String, String> {
     BTreeMap::from([
         (ROLE_ENV.to_string(), Role::Kernel.as_str().to_string()),
-        (PARAMS_ENV.to_string(), String::from("{}")),
+        (
+            PARAMS_ENV.to_string(),
+            moruna_job::canonical_json(&Value::Object(params.clone())),
+        ),
         (
             ARGS_ENV.to_string(),
             moruna_job::canonical_json(&Value::Object(args.clone())),
@@ -214,7 +230,13 @@ impl RunnableKind for Function {
                       Moruna kernel's user target on the data plane's rings, or a Moruna image \
                       archive whose command runs on its own files, its batches as Arrow IPC"
                 .into(),
-            settings: settings_schema::<Settings>(KIND, vec![json!({"function": "taxi.clean"})]),
+            settings: settings_schema::<Settings>(
+                KIND,
+                vec![
+                    json!({"function": "taxi.clean"}),
+                    json!({"function": "taxi.score", "params": {"threshold": 0.5}}),
+                ],
+            ),
             inputs: Flow::Batches,
             outputs: Flow::Batches,
             needs: Needs::nothing(),
@@ -262,6 +284,9 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
     let (task, what) =
         match content(name, function.bytes()).map_err(|why| entry.refuse("function", why))? {
             Content::Native => {
+                if !settings.params.is_empty() {
+                    return Err(entry.refuse("params", NATIVE_TAKES_NO_PARAMS));
+                }
                 let identity = json!({"function": name, "sha256": sha256, "abi": "moruna"});
                 let task = ImageTask::new(
                     &reference,
@@ -276,7 +301,7 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
                 (task, String::from("a native program"))
             }
             Content::Image(archive) => {
-                let env = runner_env(cx.args());
+                let env = runner_env(&settings.params, cx.args());
                 let program = image_program(name, function.bytes(), &archive, &env)
                     .map_err(|why| entry.refuse("function", why))?;
                 let env = program.launch.env_entries();

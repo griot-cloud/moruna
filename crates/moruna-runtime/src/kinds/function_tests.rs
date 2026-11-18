@@ -118,7 +118,8 @@ fn an_image_functions_command_is_found_in_its_own_files() {
     let bytes = archive_of(&scratch, "score", config(&["score", "--fast"]), &linux());
     let archive = Archive::parse(&bytes).unwrap();
     let args = Map::from_iter([("year".to_string(), json!(2024))]);
-    let env = runner_env(&args);
+    let params = Map::from_iter([("threshold".to_string(), json!(0.5))]);
+    let env = runner_env(&params, &args);
     let program = image_program("taxi.score", &bytes, &archive, &env).unwrap();
     assert_eq!(program.path, "/usr/bin/score");
     assert_eq!(program.launch.command, ["score", "--fast"]);
@@ -127,7 +128,7 @@ fn an_image_functions_command_is_found_in_its_own_files() {
     for wanted in [
         "MORUNA_ENTRY=scoring:Score",
         "MORUNA_ROLE=function",
-        "MORUNA_PARAMS={}",
+        "MORUNA_PARAMS={\"threshold\":0.5}",
         "MORUNA_ARGS={\"year\":2024}",
     ] {
         assert!(
@@ -152,7 +153,11 @@ fn an_image_functions_command_is_found_in_its_own_files() {
 #[test]
 fn an_image_function_the_personality_cannot_run_is_refused() {
     let scratch = Scratch::new("function_refusals");
-    let env = runner_env(&Map::new());
+    let env = runner_env(&Map::new(), &Map::new());
+    assert_eq!(
+        env["MORUNA_PARAMS"], "{}",
+        "a function given no params has none"
+    );
     let refused = |name: &str, config: serde_json::Value, program: &[u8]| {
         let bytes = archive_of(&scratch, name, config, program);
         let archive = Archive::parse(&bytes).unwrap();
@@ -218,6 +223,27 @@ fn a_function_task_is_declared_and_staged_only_on_a_node() {
     let entry = KindEntry::new("kernels[0]", Some(0), &doc);
     let Err(refused) = Function.stage(&entry, &mut cx) else {
         panic!("unknown settings");
+    };
+    assert!(
+        refused.to_string().contains("`function` settings"),
+        "{refused}"
+    );
+    // Params are the kind's, an object; anything else is refused as settings.
+    let with_params: Settings =
+        serde_json::from_value(json!({"function": "taxi.score", "params": {"threshold": 0.5}}))
+            .unwrap();
+    assert_eq!(with_params.params["threshold"], json!(0.5));
+    assert_eq!(declared.examples().len(), 2);
+    let doc = moruna_job::KindDoc::new(
+        KIND.to_string(),
+        Map::from_iter([
+            ("function".to_string(), json!("taxi.score")),
+            ("params".to_string(), json!([1])),
+        ]),
+    );
+    let entry = KindEntry::new("kernels[0]", Some(0), &doc);
+    let Err(refused) = Function.stage(&entry, &mut cx) else {
+        panic!("params that are not an object");
     };
     assert!(
         refused.to_string().contains("`function` settings"),
