@@ -52,6 +52,8 @@ extern crate alloc;
 mod device;
 mod nvsp;
 mod rndis;
+#[cfg(feature = "trace-first-frames")]
+pub mod trace;
 mod wire;
 
 use alloc::string::String;

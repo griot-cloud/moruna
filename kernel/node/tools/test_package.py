@@ -32,9 +32,10 @@ def refused(argv):
     return stop.exception.code, error.getvalue()
 
 
-def first_builds(test, profile):
-    """main() for `profile`, run up to its second build with nothing built: the kernel's build
-    and the user programs' build, each as its arguments and environment."""
+def first_builds(test, profile, extra=()):
+    """main() for `profile`, with the arguments `extra`, run up to its second build with nothing
+    built: the kernel's build and the user programs' build, each as its arguments and
+    environment."""
     class Stop(Exception):
         pass
 
@@ -52,7 +53,7 @@ def first_builds(test, profile):
         description = Path(tmp) / "cloud.image"
         description.write_text("moruna-image 1\nprocess node-supervisor\n  handle data:node.conf config\n")
         argv = ["package.py", "--profile", profile, "--description", str(description), "--assets", str(assets),
-                "--out", str(Path(tmp) / "out"), "--node-memory", str(2 << 30)]
+                "--out", str(Path(tmp) / "out"), "--node-memory", str(2 << 30), *extra]
         with mock.patch.object(package, "command", record), \
                 mock.patch.object(package.shutil, "which", lambda tool: f"/usr/bin/{tool}"), \
                 mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ):
@@ -328,6 +329,21 @@ class Profiles(unittest.TestCase):
         _, (test, _) = first_builds(self, "cloud-test")
         self.assertEqual(test[test.index("--features") + 1], "moruna-node-api/test-exit")
         self.assertEqual([test[i + 1] for i, word in enumerate(test) if word == "-p"], package.PROGRAMS["cloud"])
+
+    def test_a_diagnosis_feature_is_added_to_the_user_build_and_nothing_else(self):
+        """Work item 1.11c: `--feature` turns on one more Cargo feature in the user build, after
+        the profile's own; the kernel's build and the programs are as without it."""
+        trace = "moruna-netvsc-server/trace-first-frames"
+        (kernel, _), (user, _) = first_builds(self, "cloud", ["--feature", trace])
+        (plain_kernel, _), (plain_user, _) = first_builds(self, "cloud")
+        self.assertEqual(kernel, plain_kernel)
+        self.assertNotIn("--features", plain_user)
+        self.assertEqual(user[user.index("--features") + 1], trace)
+        self.assertEqual([word for word in user if word not in ("--features", trace)], plain_user)
+        _, (test, _) = first_builds(self, "cloud-test", ["--feature", trace, "--feature", "a/b"])
+        self.assertEqual(test[test.index("--features") + 1], f"moruna-node-api/test-exit,{trace},a/b")
+        _, args = package.arguments(["--profile", "cloud", *BASE])
+        self.assertEqual(args.feature, [])
 
     def test_the_command_refuses_before_building_anything(self):
         with tempfile.TemporaryDirectory() as tmp:

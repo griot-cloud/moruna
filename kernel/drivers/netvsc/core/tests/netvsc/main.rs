@@ -7,9 +7,13 @@
 //!   recovering, a virtual function offered and ignored, the link going down and up.
 //! - `refusal`: what no well-behaved host sends, refused without a panic.
 //! - `fuzz`: ten thousand random host packets, from a fixed seed.
+//! - `trace`: with the feature `trace-first-frames` only, the first frames each way and the
+//!   host's indications, said with their times (work item 1.11c).
 
 mod fake;
 mod fuzz;
 mod initialise;
 mod refusal;
+#[cfg(feature = "trace-first-frames")]
+mod trace;
 mod traffic;

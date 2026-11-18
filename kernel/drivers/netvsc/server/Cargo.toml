@@ -17,6 +17,13 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[features]
+# Work item 1.11c, for diagnosis only: the card's first frames each way on the console, with
+# their times on netvsc's clock, and the start's lines to the microsecond. A node's normal
+# image never turns it on; `package.py --feature moruna-netvsc-server/trace-first-frames`
+# builds the image that does.
+trace-first-frames = ["moruna-netvsc/trace-first-frames"]
+
 [dependencies]
 moruna-svc.workspace = true
 moruna-netvsc = { path = "../core", version = "=0.1.0" }

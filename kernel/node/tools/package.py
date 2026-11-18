@@ -12,6 +12,11 @@ so that it exits on a request to `/v1/test/exit` and says at each start that it 
 That is the tests' one way to kill `api` from outside the node's design. `cloud` never builds
 it.
 
+`--feature PACKAGE/FEATURE` turns on one more Cargo feature in the user build, for a diagnosis
+build only (work item 1.11c: `moruna-netvsc-server/trace-first-frames`, the network card's first
+frames on the console). It may be given more than once. No release image takes one: without it,
+each profile builds exactly as before.
+
 `--formats` names the disk's formats (system design 1A, work item 1.5): `raw`, the disk every
 build writes, `qcow2` for OpenStack and `vhd` for Azure, each made from that one raw disk and
 written beside it.
@@ -256,6 +261,9 @@ def arguments(argv=None):
     parser.add_argument("--system-layer", type=Path,
                         help="the engine's layer file, as kernel/node/tools/system-layer.sh makes it, "
                              "for the boot disk's moruna-system partition")
+    parser.add_argument("--feature", action="append", default=[], metavar="PACKAGE/FEATURE",
+                        help="one more Cargo feature for the user build, for a diagnosis build only "
+                             "(work item 1.11c: moruna-netvsc-server/trace-first-frames); no release image takes one")
     parser.add_argument("--formats", nargs="+", choices=FORMATS, default=["raw"], metavar="FORMAT",
                         help="the disk's formats, each written beside the raw disk: raw (the default), qcow2, vhd")
     args = parser.parse_args(argv)
@@ -369,7 +377,8 @@ def main():
     package_args = [word for package in packages for word in ("-p", package)]
     user_common = ["--locked", "--offline", "--release", "--target", user_target, *std]
     # The storage service's feature names a package only the standalone node builds.
-    named = [*FEATURES[args.profile], *(["moruna-storage-service/service"] if "moruna-storage-service" in packages else [])]
+    named = [*FEATURES[args.profile], *args.feature,
+             *(["moruna-storage-service/service"] if "moruna-storage-service" in packages else [])]
     features = ["--features", ",".join(named)] if named else []
     # The JSON target's -Z flags follow `build`, as in kernel/tools/build.sh: this nightly
     # refuses them before the subcommand.

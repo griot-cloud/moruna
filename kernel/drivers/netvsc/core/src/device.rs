@@ -128,18 +128,45 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         deadline: Option<u64>,
         say: &mut dyn FnMut(fmt::Arguments<'_>),
     ) -> Result<Netvsc<C, S>, NetvscError> {
-        for (bytes, what) in [
-            (
-                receive.memory.len(),
-                "the receive buffer is not whole pages",
-            ),
-            (send.memory.len(), "the send buffer is not whole pages"),
-        ] {
-            if bytes == 0 || !bytes.is_multiple_of(PAGE) {
-                return Err(NetvscError::Buffer(what));
-            }
-        }
+        whole_pages(&receive, &send)?;
+        Netvsc::begin(Wire::new(channel, deadline), receive, send, say)
+    }
+
+    /// [`start_saying`](Netvsc::start_saying), with `trace` noting the first frames each
+    /// way from the start on: a diagnosis build's only (work item 1.11c).
+    #[cfg(feature = "trace-first-frames")]
+    pub fn start_traced(
+        channel: C,
+        receive: Buffer<S>,
+        send: Buffer<S>,
+        deadline: Option<u64>,
+        say: &mut dyn FnMut(fmt::Arguments<'_>),
+        trace: crate::trace::Trace,
+    ) -> Result<Netvsc<C, S>, NetvscError> {
+        whole_pages(&receive, &send)?;
         let mut wire = Wire::new(channel, deadline);
+        wire.trace = Some(trace);
+        Netvsc::begin(wire, receive, send, say)
+    }
+
+    /// The lines the trace has noted since they were last taken, oldest first: a diagnosis
+    /// build's only (work item 1.11c).
+    #[cfg(feature = "trace-first-frames")]
+    pub fn take_trace(&mut self) -> Vec<String> {
+        self.wire
+            .trace
+            .as_mut()
+            .map(crate::trace::Trace::take)
+            .unwrap_or_default()
+    }
+
+    /// The start's steps on a wire made over the channel, its buffers checked.
+    fn begin(
+        mut wire: Wire<C>,
+        receive: Buffer<S>,
+        send: Buffer<S>,
+        say: &mut dyn FnMut(fmt::Arguments<'_>),
+    ) -> Result<Netvsc<C, S>, NetvscError> {
         nvsp::negotiate(&mut wire, say)?;
         nvsp::configure(&mut wire, say)?;
         let receive = nvsp::receive_buffer(&mut wire, receive, say)?;
@@ -297,6 +324,10 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         let sent = self.name(section, protocol::DATA_CHANNEL_TYPE, message)?;
         if !sent {
             self.send.give(nvsp::transaction(section));
+        }
+        #[cfg(feature = "trace-first-frames")]
+        if sent && let Some(trace) = self.wire.trace.as_mut() {
+            trace.sent(nvsp::transaction(section), section, frame);
         }
         Ok(sent)
     }
@@ -479,6 +510,10 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
             protocol::MESSAGE1_TYPE_SEND_RNDIS_PACKET_COMPLETE,
             "a frame sent",
         )?;
+        #[cfg(feature = "trace-first-frames")]
+        if let Some(trace) = self.wire.trace.as_mut() {
+            trace.completed(transaction, complete.status.0);
+        }
         if complete.status != Status::SUCCESS {
             return Err(NetvscError::NotSent(complete.status.0));
         }
@@ -584,6 +619,10 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         self.receive
             .memory
             .read(at + start as usize, &mut self.frame);
+        #[cfg(feature = "trace-first-frames")]
+        if let Some(trace) = self.wire.trace.as_mut() {
+            trace.received(&self.frame);
+        }
         Ok(Some(Seen::Frame))
     }
 
@@ -598,6 +637,15 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         }
         let indication: rndisprot::IndicateStatus =
             rndis::read(&self.receive.memory, at + rndis::HEADER);
+        #[cfg(feature = "trace-first-frames")]
+        if let Some(trace) = self.wire.trace.as_mut() {
+            let now = match indication.status {
+                rndisprot::STATUS_MEDIA_CONNECT => true,
+                rndisprot::STATUS_MEDIA_DISCONNECT => false,
+                _ => self.link,
+            };
+            trace.indicated(indication.status, self.link, now);
+        }
         let up = match indication.status {
             rndisprot::STATUS_MEDIA_CONNECT => true,
             rndisprot::STATUS_MEDIA_DISCONNECT => false,
@@ -868,6 +916,22 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         )?;
         Ok(())
     }
+}
+
+/// Refuses buffers that are not whole pages, before anything is asked of the channel.
+fn whole_pages<S: Shared>(receive: &Buffer<S>, send: &Buffer<S>) -> Result<(), NetvscError> {
+    for (bytes, what) in [
+        (
+            receive.memory.len(),
+            "the receive buffer is not whole pages",
+        ),
+        (send.memory.len(), "the send buffer is not whole pages"),
+    ] {
+        if bytes == 0 || !bytes.is_multiple_of(PAGE) {
+            return Err(NetvscError::Buffer(what));
+        }
+    }
+    Ok(())
 }
 
 /// Says the first send indirection table the host sent, if it has just come: the one line
