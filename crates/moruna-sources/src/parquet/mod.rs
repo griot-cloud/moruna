@@ -86,14 +86,32 @@ pub struct ParquetSource {
     /// Row groups with their pages located (`pages`), by split, most recent last; `None` for a
     /// group whose pages could not be located. Bounded by `PAGED_KEPT`.
     paged: std::sync::Mutex<std::collections::VecDeque<(SplitId, Option<Arc<ParquetMetaData>>)>>,
-    /// The split the drive fetched last, while ranges of it remain to be read: the next range
-    /// decodes from these bytes rather than fetching the group's columns again, and shares the
-    /// group's decode state (`parts`, 6.3l). Fetches run on the drive one at a time, so one is
-    /// enough (f.3, RB3).
-    last_fetch: std::sync::Mutex<Option<(SplitId, parts::GroupFetch)>>,
+    /// The row groups whose columns are being fetched, or were fetched while ranges of them
+    /// remain to be read: a range decodes from its group's fetch rather than fetching the
+    /// group's columns again, and shares the group's decode state (`parts`, 6.3l; f.3, RB3).
+    /// Fetches are in flight together (6.3t), so a range whose group is still being fetched
+    /// waits for that fetch rather than starting another.
+    fetches: std::sync::Mutex<std::collections::HashMap<SplitId, FetchSlot>>,
     /// The most decoded bytes one decode builds outside the arena at once (3A); `None` decodes
     /// each range in one batch.
     decode_batch_bytes: Option<u64>,
+}
+
+/// A row group's fetch, as the source keeps it for the group's ranges (6.3t).
+enum FetchSlot {
+    /// A range is fetching it; these ranges wait for it.
+    Pending(Vec<std::task::Waker>),
+    /// Fetched, for the ranges still to read it.
+    Ready(parts::GroupFetch),
+}
+
+/// What [`ParquetSource::claim_fetch`] gives a range.
+pub(crate) enum Claim {
+    /// The group's fetch, which another range made.
+    Ready(parts::GroupFetch),
+    /// No range is fetching the group: this one does, and ends it with
+    /// [`ParquetSource::fetched`].
+    Mine,
 }
 
 /// How many row groups' page locations a source keeps: more than the reads a run has in flight.
@@ -166,7 +184,7 @@ impl ParquetSource {
             schema,
             counters,
             paged: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            last_fetch: std::sync::Mutex::new(None),
+            fetches: std::sync::Mutex::new(std::collections::HashMap::new()),
             decode_batch_bytes: None,
         })
     }
@@ -214,19 +232,54 @@ impl ParquetSource {
         built
     }
 
-    /// The fetched columns of `split`, and the decode state its parts share, if the drive
-    /// fetched them last; taking the split's final range (`last`) lets the source's hold on them
-    /// go, and the parts in flight keep them until they have decoded.
-    pub(crate) fn fetched_last(&self, split: SplitId, last: bool) -> Option<parts::GroupFetch> {
-        let mut kept = self.last_fetch.lock().unwrap_or_else(|e| e.into_inner());
-        let hit = match kept.as_ref() {
-            Some((id, fetch)) if *id == split => Some(fetch.clone()),
-            _ => None,
+    /// The fetch of `split`'s group for a range of it: its fetch when a range already fetched
+    /// it, a wait while one is fetching it, or the claim to fetch it ([`Claim::Mine`]), which
+    /// the claimant ends with [`ParquetSource::fetched`]. Taking the split's final range
+    /// (`last`) lets the source's hold on the fetch go; the ranges in flight keep it until they
+    /// have decoded.
+    pub(crate) fn claim_fetch(
+        &self,
+        split: SplitId,
+        last: bool,
+    ) -> impl std::future::Future<Output = Claim> + '_ {
+        std::future::poll_fn(move |cx| {
+            let mut fetches = self.fetches.lock().unwrap_or_else(|e| e.into_inner());
+            match fetches.get_mut(&split) {
+                Some(FetchSlot::Ready(fetch)) => {
+                    let fetch = fetch.clone();
+                    if last {
+                        fetches.remove(&split);
+                    }
+                    std::task::Poll::Ready(Claim::Ready(fetch))
+                }
+                Some(FetchSlot::Pending(waiting)) => {
+                    waiting.push(cx.waker().clone());
+                    std::task::Poll::Pending
+                }
+                None => {
+                    fetches.insert(split, FetchSlot::Pending(Vec::new()));
+                    std::task::Poll::Ready(Claim::Mine)
+                }
+            }
+        })
+    }
+
+    /// The claimed fetch of `split`'s group has ended: kept for the group's other ranges when it
+    /// fetched and this was not the final range, forgotten otherwise (a failed fetch is claimed
+    /// again by the next range that needs it). Every range waiting for it is woken.
+    pub(crate) fn fetched(&self, split: SplitId, fetch: Option<&parts::GroupFetch>, last: bool) {
+        let mut fetches = self.fetches.lock().unwrap_or_else(|e| e.into_inner());
+        let waiting = match fetches.remove(&split) {
+            Some(FetchSlot::Pending(waiting)) => waiting,
+            Some(FetchSlot::Ready(_)) | None => Vec::new(),
         };
-        if hit.is_some() && last {
-            *kept = None;
+        if let (Some(fetch), false) = (fetch, last) {
+            fetches.insert(split, FetchSlot::Ready(fetch.clone()));
         }
-        hit
+        drop(fetches);
+        for waker in waiting {
+            waker.wake();
+        }
     }
 
     /// Whether a row range of `split` decodes only its own pages (3A): every projected column
@@ -243,12 +296,6 @@ impl ParquetSource {
         !kept
             .iter()
             .any(|(id, located)| *id == split.id && located.is_none())
-    }
-
-    /// Keep `fetch` for the next range of `split`, unless this was its final range.
-    pub(crate) fn keep_fetched(&self, split: SplitId, fetch: &parts::GroupFetch, last: bool) {
-        *self.last_fetch.lock().unwrap_or_else(|e| e.into_inner()) =
-            (!last).then(|| (split, fetch.clone()));
     }
 
     /// What this source has done so far (j).
@@ -304,7 +351,7 @@ impl Source for ParquetSource {
         true
     }
 
-    /// A range of a row group shares the group's fetch (`keep_fetched`) and decodes only its own
+    /// A range of a row group shares the group's fetch (`claim_fetch`) and decodes only its own
     /// pages when they can be located; one whose pages cannot be is read whole.
     fn range_reads_own_rows(&self, split: &Split) -> bool {
         split.sub_splittable && self.pages_locatable(split)

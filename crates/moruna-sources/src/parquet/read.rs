@@ -12,7 +12,7 @@ use parquet::file::metadata::ParquetMetaData;
 
 use super::parts::GroupFetch;
 use super::reader::ArenaChunks;
-use super::{ParquetSource, append, parts};
+use super::{Claim, ParquetSource, append, parts};
 use crate::stats::Counters;
 use crate::util::{oversized, page_ceil, page_floor, resolve_range, source_err};
 
@@ -42,7 +42,7 @@ pub(crate) fn read<'a>(
     tier: Tier,
 ) -> BoxFuture<'a, Result<Payload>> {
     Box::pin(async move {
-        let fetched = fetch_now(source, split, rows, alloc, tier)?;
+        let fetched = fetch_range(source, split, rows, alloc, tier).await?;
         decode_fetched(source, split, fetched, alloc, tier)
     })
 }
@@ -55,7 +55,8 @@ pub(crate) struct ParquetFetched {
 }
 
 /// The I/O half of a read: the byte ranges of a split's projected columns, into arena buffers
-/// of `tier`. Waits on the reactor, so it runs on the drive.
+/// of `tier`. It awaits the reactor, so it runs on the drive, and the drive's other reads go on
+/// meanwhile (6.3t).
 pub(crate) fn fetch<'a>(
     source: &'a ParquetSource,
     split: &'a Split,
@@ -63,25 +64,73 @@ pub(crate) fn fetch<'a>(
     alloc: &'a dyn Allocator,
     tier: Tier,
 ) -> BoxFuture<'a, Result<ParquetFetched>> {
-    Box::pin(async move { fetch_now(source, split, rows, alloc, tier) })
+    Box::pin(fetch_range(source, split, rows, alloc, tier))
 }
 
-fn fetch_now(
+/// A range of `split`: its group's fetch, which this range makes when no range of the group is
+/// making it, and otherwise waits for or shares (6.3t). The drive has several reads in flight,
+/// and a fetch that waited on each request in turn held every other read back: a node read a
+/// year of trips from Blob one row group at a time (6.2 runs 3 and 5).
+async fn fetch_range(
     source: &ParquetSource,
     split: &Split,
     rows: Option<RowRange>,
     alloc: &dyn Allocator,
     tier: Tier,
 ) -> Result<ParquetFetched> {
-    let _ = tier;
-    let (file, entry) = source.entry(split)?;
     let range = resolve_range(split, rows)?;
     Counters::add(&source.counters().reads, 1);
     let last = range.end >= split.rows;
-    if let Some(fetch) = source.fetched_last(split.id, last) {
-        return Ok(ParquetFetched { fetch, range });
-    }
+    let fetch = match source.claim_fetch(split.id, last).await {
+        Claim::Ready(fetch) => fetch,
+        Claim::Mine => {
+            let mut claim = Claimed {
+                source,
+                split: split.id,
+                last,
+                ended: false,
+            };
+            let fetched = fetch_group(source, split, alloc, tier).await;
+            claim.end(fetched.as_ref().ok());
+            fetched?
+        }
+    };
+    Ok(ParquetFetched { fetch, range })
+}
 
+/// A range's claim on its group's fetch. Ended, it keeps the fetch for the group's other ranges
+/// (or forgets a failed one); dropped without ending, as a cancelled read is, it lets them claim
+/// the fetch themselves, so none waits for a fetch that will not come.
+struct Claimed<'a> {
+    source: &'a ParquetSource,
+    split: moruna_kernel::SplitId,
+    last: bool,
+    ended: bool,
+}
+
+impl Claimed<'_> {
+    fn end(&mut self, fetch: Option<&GroupFetch>) {
+        self.ended = true;
+        self.source.fetched(self.split, fetch, self.last);
+    }
+}
+
+impl Drop for Claimed<'_> {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.source.fetched(self.split, None, self.last);
+        }
+    }
+}
+
+/// The projected column chunks of `split`'s row group, every request in flight together.
+async fn fetch_group(
+    source: &ParquetSource,
+    split: &Split,
+    alloc: &dyn Allocator,
+    tier: Tier,
+) -> Result<GroupFetch> {
+    let (file, entry) = source.entry(split)?;
     let group = file
         .metadata
         .row_groups()
@@ -143,8 +192,8 @@ fn fetch_now(
     let mut fetched: Vec<(u64, Bytes)> = Vec::with_capacity(issued.len());
     for (start, end, read) in issued {
         let read = match read {
-            Issued::Object(completion, length) => completion.wait().map(|b| (b, length)),
-            Issued::File(completion) => completion.wait(),
+            Issued::Object(completion, length) => completion.await.map(|b| (b, length)),
+            Issued::File(completion) => completion.await,
         };
         let (buffer, filled) = read.map_err(|e| {
             source_err(
@@ -171,8 +220,7 @@ fn fetch_now(
 
     let fetch = GroupFetch::new(ArenaChunks::new(file_len, fetched));
     Counters::add(&source.counters().group_fetches, 1);
-    source.keep_fetched(split.id, &fetch, last);
-    Ok(ParquetFetched { fetch, range })
+    Ok(fetch)
 }
 
 /// The CPU half of a read: decode a fetched split into a payload in arena buffers of `tier`.
