@@ -1801,3 +1801,93 @@ fn so_t46_decoded_split_bytes() {
         );
     }
 }
+
+// 6.3t: an object's row group is fetched in several requests in flight together, each at most
+// a few megabytes and cut where a column chunk starts, not one request after another. One
+// request a group read a node's year of trips from Blob at about 43 MB/s (6.2 run 3).
+#[test]
+fn so_t49_an_objects_group_is_fetched_by_requests_in_flight_together() {
+    use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
+    let dir = scratch();
+    let path = dir.join("t49-wide.parquet");
+    let columns = 6;
+    let rows = 400_000usize;
+    let schema = Arc::new(Schema::new(
+        (0..columns)
+            .map(|c| Field::new(format!("c{c}"), DataType::Int64, false))
+            .collect::<Vec<_>>(),
+    ));
+    let arrays: Vec<Arc<dyn Array>> = (0..columns)
+        .map(|c| {
+            // Values that neither repeat nor run, so each chunk keeps its 3.2 MB.
+            let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ c as u64;
+            let values: Int64Array = (0..rows)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    Some(x as i64)
+                })
+                .collect();
+            Arc::new(values) as Arc<dyn Array>
+        })
+        .collect();
+    let batch = moruna_kernel::arrow::array::RecordBatch::try_new(Arc::clone(&schema), arrays)
+        .expect("the batch");
+    let properties = parquet::file::properties::WriterProperties::builder()
+        .set_max_row_group_row_count(Some(rows))
+        .set_dictionary_enabled(false)
+        .build();
+    let file = std::fs::File::create(&path).expect("the file");
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new(file, schema, Some(properties)).expect("the writer");
+    writer.write(&batch).expect("written");
+    writer.close().expect("closed");
+
+    let alloc: Arc<dyn Allocator> = Arc::new(FakeAllocator::new());
+    let reactor = FakeReactor::new()
+        .with_latency(std::time::Duration::from_millis(30))
+        .with_file(
+            "s3://bucket/t49/wide.parquet",
+            std::fs::read(&path).expect("the fixture"),
+        );
+    let observer = reactor.clone();
+    let source = ParquetSource::with_allocator(
+        ParquetSourceConfig {
+            urls: vec!["s3://bucket/t49/wide.parquet".to_string()],
+            ..ParquetSourceConfig::default()
+        },
+        Arc::new(reactor.clone()) as Arc<dyn Reactor>,
+        Arc::new(reactor) as Arc<dyn ObjectMetadata>,
+        alloc.clone(),
+    )
+    .expect("a source over the object");
+    let plan = source.plan().expect("the plan");
+    assert_eq!(plan.len(), 1, "one row group");
+    let before = observer.ops().len();
+    let payload = block_on(source.read(&plan[0], None, alloc.as_ref(), Tier::Host)).expect("read");
+    assert_eq!(payload.rows(), rows as u64, "every row");
+    let reads: Vec<_> = observer.ops()[before..]
+        .iter()
+        .filter(|op| op.kind == OpKind::ReadObject)
+        .cloned()
+        .collect();
+    assert!(
+        reads.len() >= 2,
+        "a 19 MB group is more than one request: {:?}",
+        reads.iter().map(|r| (r.offset, r.len)).collect::<Vec<_>>()
+    );
+    assert!(
+        reads.iter().all(|r| r.len <= 9 << 20),
+        "each a few megabytes"
+    );
+    let first_resolved = reads[0].t_resolve.expect("the first request resolved");
+    assert!(
+        reads[1..].iter().all(|r| r.t_submit < first_resolved),
+        "every request was issued before the first came back: {:?}",
+        reads
+            .iter()
+            .map(|r| (r.t_submit, r.t_resolve))
+            .collect::<Vec<_>>()
+    );
+}
