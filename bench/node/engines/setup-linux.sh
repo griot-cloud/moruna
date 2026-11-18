@@ -11,12 +11,16 @@
 #   V066      0.6.6's version on PyPI (run.py --version066)
 #   WHEEL066  the name in `code` of the wheel the operator gave (run.py --wheel066), or of the one a
 #             build keeps there
+#   ENGINES   install.py's engines the run needs (run.py: those its runs use, measure.py's own and
+#             gate-canon's); every engine when unset
 #
 # It installs the system's packages (Spark's JVM, a C toolchain), uv, and Rust 1.98.1 (the
 # repository's pin); takes 0.6.6's wheel from the first place that has it (the run's container,
-# PyPI, else a build from 0.6.6's tree, kept in the container); then installs every engine with
-# install.py, each with its Blob reader. The engines read the data from Blob themselves (store.py),
-# so nothing is copied here. Its last line is `SETUP {json}`.
+# PyPI, else a build from 0.6.6's tree, kept in the container); then installs the engines with
+# install.py, each on the newest CPython it installs on, with its Blob reader. The engines read the
+# data from Blob themselves (store.py), so nothing is copied here. Its last line is `SETUP {json}`:
+# per engine whether it installed, its interpreter and, for one that did not, why. It exits 1 when
+# an engine did not install, and the run stops there (work item 6.2c).
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive HOME=/root
 CODE=/opt/bench; SRC066=/opt/src066; ENG=/opt/engines; DATA=/data
@@ -44,8 +48,12 @@ uv python install 3.14 3.14t >/dev/null
 # 3. built here from 0.6.6's tree (45-60 min) and kept in the container.
 V066=${V066:-0.6.6}
 WHEEL066=${WHEEL066:-moruna-$V066-cp314-cp314t-linux_x86_64.whl}
+ENGINES=${ENGINES:-harness,moruna066,moruna066-rust,rust-pool,duckdb,polars,ray,spark,dask}
 start=$(date +%s)
-if curl -sSf -o "$ENG/wheels/$WHEEL066" "$BASE/code/$WHEEL066?$SAS_CODE"; then
+wheel=""
+if [[ ",$ENGINES," != *,moruna066,* ]]; then
+  wheel_from=none
+elif curl -sSf -o "$ENG/wheels/$WHEEL066" "$BASE/code/$WHEEL066?$SAS_CODE"; then
   wheel_from=container
   wheel="$ENG/wheels/$WHEEL066"
 elif rm -f "$ENG/wheels/$WHEEL066" && /opt/uv/bin/pip download -q --no-deps --only-binary=:all: \
@@ -64,15 +72,24 @@ else
 fi
 wheel_s=$(( $(date +%s) - start ))
 
+status=0
 python3 "$CODE/bench/node/engines/install.py" --root "$ENG" --gate-src "$CODE/images/gate" \
-  --moruna066 "$wheel" --jobs "$(nproc)" > "$ENG/install.out" 2>&1 || true
+  ${wheel:+--moruna066 "$wheel"} --engines "$ENGINES" --jobs "$(nproc)" > "$ENG/install.out" 2>&1 || status=$?
 
+# Each engine's interpreter (its version, its GIL, those tried before it) and, for one that did not
+# install, the end of why: the run's setup.json keeps them, and run.py stops on the first.
 python3 - "$ENG/installed.json" "$wheel_from" "$wheel_s" "$(java -version 2>&1 | head -1)" "$wheel" <<'EOF'
 import hashlib, json, os, sys
-installed = {e: r.get("ok") for e, r in json.load(open(sys.argv[1])).items()}
+done = json.load(open(sys.argv[1])) if os.path.exists(sys.argv[1]) else {}
+installed = {e: r.get("ok") for e, r in done.items()}
+errors = {e: str(r.get("error"))[-300:] for e, r in done.items() if not r.get("ok")}
+interpreters = {e: {"python": r.get("python"), "gil": r.get("gil"), "tried": [t["python"] for t in r.get("tried", [])]}
+                for e, r in done.items() if r.get("python")}
 wheel = sys.argv[5]
-print("SETUP " + json.dumps({"installed": installed, "wheel_066": sys.argv[2], "wheel_066_s": int(sys.argv[3]),
-                             "wheel_066_name": os.path.basename(wheel),
-                             "wheel_066_sha256": hashlib.sha256(open(wheel, "rb").read()).hexdigest(),
+print("SETUP " + json.dumps({"installed": installed, "errors": errors, "interpreters": interpreters,
+                             "wheel_066": sys.argv[2] if wheel else None, "wheel_066_s": int(sys.argv[3]),
+                             "wheel_066_name": os.path.basename(wheel) if wheel else None,
+                             "wheel_066_sha256": hashlib.sha256(open(wheel, "rb").read()).hexdigest() if wheel else None,
                              "java": sys.argv[4]}))
 EOF
+exit "$status"

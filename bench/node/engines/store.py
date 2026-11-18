@@ -9,11 +9,11 @@ it travels to a run in the environment (`BENCH_ACCOUNT`, `BENCH_KEY`, `BENCH_CON
 | Engine | Reads and writes with | Names a blob as |
 | --- | --- | --- |
 | 0.6.6 (both functions) | its object store (`storage=`, object_store) | `az://CONTAINER/NAME` |
-| DuckDB | its `azure` extension, a secret from the connection string | `az://CONTAINER/NAME` |
+| DuckDB | its `azure` extension, a secret from the connection string, its curl transport | `az://CONTAINER/NAME` |
 | Polars | its object store (`storage_options`) | `az://CONTAINER/NAME` |
 | Dask | adlfs (`storage_options`) | `abfs://CONTAINER/NAME` |
 | Ray | pyarrow's `AzureFileSystem` | `CONTAINER/NAME` |
-| Spark | hadoop-azure (`wasbs`), the account key in the Hadoop configuration | `wasbs://CONTAINER@ACCOUNT.blob.core.windows.net/NAME` |
+| Spark | hadoop-azure's ABFS driver over the Blob API, the account key in the Hadoop configuration | `abfss://CONTAINER@ACCOUNT.dfs.core.windows.net/NAME` |
 
 The Python function's output, for the engines that run it batch by batch (DuckDB, Polars), is
 written by pyarrow's Parquet writer, as bench/vm's runner wrote it, onto pyarrow's
@@ -101,11 +101,27 @@ class Store:
         """A blob as pyarrow's AzureFileSystem names it."""
         return f"{self.container}/{name}"
 
-    def wasbs(self, name):
-        return f"wasbs://{self.container}@{self.account}.blob.core.windows.net/{name}"
+    def abfss(self, name):
+        """A blob as hadoop-azure's ABFS driver names it (`abfs://` over an emulator's plain HTTP):
+        Hadoop 3.5, which pyspark 4.3 carries, refuses `wasbs://` ("WASB Driver using wasb(s)
+        schema is no longer supported")."""
+        scheme = "abfs" if self.endpoint.startswith("http://") else "abfss"
+        return f"{scheme}://{self.container}@{self.account}.dfs.core.windows.net/{name}"
 
     def spark_conf(self):
-        return {f"spark.hadoop.fs.azure.account.key.{self.account}.blob.core.windows.net": self.key}
+        """The account key for ABFS, and the run's account as it is: no hierarchical namespace
+        (azure.py makes a plain StorageV2 account), so ABFS speaks the Blob service's API
+        (`fns.account.service.type` BLOB), the one an emulator serves too. An emulator is named
+        by its address (`abfs.endpoint`), over its scheme."""
+        conf = {f"spark.hadoop.fs.azure.account.key.{self.account}.dfs.core.windows.net": self.key,
+                f"spark.hadoop.fs.azure.account.key.{self.account}.blob.core.windows.net": self.key,
+                "spark.hadoop.fs.azure.account.hns.enabled": "false",
+                "spark.hadoop.fs.azure.fns.account.service.type": "BLOB"}
+        if self.endpoint:
+            u = urllib.parse.urlsplit(self.endpoint)
+            conf["spark.hadoop.fs.azure.abfs.endpoint"] = u.netloc
+            conf["spark.hadoop.fs.azure.always.use.https"] = str(u.scheme == "https").lower()
+        return conf
 
     # The harness's own reads and writes (outside every timing) ---------------------------------
     def upload(self, local, name):
@@ -115,16 +131,20 @@ class Store:
         pafs.copy_files(local, self.path(name), destination_filesystem=fs)
 
     def download(self, prefix, dest):
-        """Every blob under `prefix` into `dest`; the bytes copied."""
+        """Every blob under `prefix` into `dest`, or the one blob `prefix` names; the bytes copied.
+        A blob at `prefix` with blobs under it is a directory's marker (ABFS over the Blob API
+        leaves an empty one at Spark's output), not the output."""
         import pyarrow.fs as pafs
         fs = self.pyarrow_fs()
         total = 0
         base = self.path(prefix).rstrip("/")
-        single = fs.get_file_info(base)
-        if single.type == pafs.FileType.File:
-            infos = [single]
-        else:
+        try:
             infos = fs.get_file_info(pafs.FileSelector(base, recursive=True, allow_not_found=True))
+        except (NotADirectoryError, OSError):
+            infos = []
+        if not any(i.type == pafs.FileType.File for i in infos):
+            single = fs.get_file_info(base)
+            infos = [single] if single.type == pafs.FileType.File else []
         for info in infos:
             if info.type != pafs.FileType.File:
                 continue
@@ -134,6 +154,24 @@ class Store:
             pafs.copy_files(info.path, dst, source_filesystem=fs)
             total += info.size or 0
         return total
+
+    def drop_markers(self, name):
+        """The empty blobs at the prefixes above `name` (`out` above `out/x`), each deleted, the
+        blobs under it kept; the ones deleted. They are directory markers: hadoop-azure's ABFS
+        driver leaves one at each directory of Spark's output, and pyarrow's Azure filesystem takes
+        them for files, so making a directory under one fails ("Not a directory: 'data/out'"), as
+        Ray's writer and the Rust pool's upload do (found in work item 6.2c)."""
+        import pyarrow.fs as pafs
+        fs = self.pyarrow_fs()
+        parts = name.strip("/").split("/")
+        gone = []
+        for i in range(1, len(parts)):
+            path = self.path("/".join(parts[:i]))
+            info = fs.get_file_info(path)
+            if info.type == pafs.FileType.File and info.size == 0:
+                fs.delete_file(path)
+                gone.append(path)
+        return gone
 
     def create(self):
         """The container (a local emulator's; on Azure, azure.py's commands make it)."""

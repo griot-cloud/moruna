@@ -1,7 +1,8 @@
 """The table of system design 6B, and the run's entry in architecture/benchmark-log.md.
 
 Per job, a row per engine: the medians of operational time, start-up, CPU-seconds and peak
-memory, the time split where the engine reports one, and whether its output is 0.6.6's. Under it,
+memory, the time split where the engine reports one, whether its output is 0.6.6's, and how many
+runs passed, with each failed run's own error (the last line of its engine's stderr). Under it,
 the bar's two steps for Moruna, judged on operational time as bench/vm/report.py judges 0.7:
 
 1. **No regression:** faster than both 0.6.6 rows (the Python and the Rust function).
@@ -76,14 +77,20 @@ def verdicts(engines: dict) -> list:
     best_ops, best = min((r["operational_s"], e) for e, r in others.items())
     cpus = [(r["cpu_s"], e) for e, r in others.items() if r.get("cpu_s") is not None]
     least_cpu, cheapest = min(cpus) if cpus else (None, None)
-    cpu_ok = node.get("cpu_s") is not None and least_cpu is not None and node["cpu_s"] <= least_cpu
     x = best_ops / ops
-    passed = x >= TARGET and cpu_ok
-    out.append({"step": "bar", "passed": passed,
-                "text": f"**{'PASS' if passed else 'MISS'}** the bar: {x:.2f}x the best engine's operational time "
-                        f"({others[best]['label']}, {best_ops:.1f} s, against {ops:.1f} s; the bar is {TARGET}x), "
-                        f"CPU {fmt(node.get('cpu_s'))} s against the least of any row "
-                        f"({others[cheapest]['label'] if cheapest else 'none'}, {fmt(least_cpu)} s)"})
+    time_text = (f"{x:.2f}x the best engine's operational time ({others[best]['label']}, {best_ops:.1f} s, "
+                 f"against {ops:.1f} s; the bar is {TARGET}x)")
+    if node.get("cpu_s") is None and x >= TARGET:
+        # The time holds, but the CPU half cannot be judged: the node did not measure it.
+        out.append({"step": "bar", "passed": None,
+                    "text": f"the bar: unchecked: {time_text}; Moruna's CPU-seconds were not measured"})
+    else:
+        cpu_ok = node.get("cpu_s") is not None and least_cpu is not None and node["cpu_s"] <= least_cpu
+        passed = x >= TARGET and cpu_ok
+        cpu = "not measured" if node.get("cpu_s") is None else f"{fmt(node['cpu_s'])} s"
+        out.append({"step": "bar", "passed": passed,
+                    "text": f"**{'PASS' if passed else 'MISS'}** the bar: {time_text}, CPU {cpu} against the least "
+                            f"of any row ({others[cheapest]['label'] if cheapest else 'none'}, {fmt(least_cpu)} s)"})
     if not all(v["passed"] for v in out if v["passed"] is not None):
         stage, secs = losing_stage(node)
         out.append({"step": "where", "passed": None,
@@ -103,9 +110,42 @@ def wheel_line(wheel: dict) -> str:
             f"`{wheel.get('name') or 'name not recorded'}`, sha256 {wheel.get('sha256') or 'not recorded'}.")
 
 
+def cell(text: str, limit: int = 240) -> str:
+    """`text` as one Markdown table cell: one line, its pipes escaped, at most `limit` characters."""
+    text = " ".join(str(text).split())
+    if len(text) > limit:
+        text = text[:limit - 3] + "..."
+    return text.replace("|", "\\|")
+
+
+def runs_cell(r: dict) -> str:
+    """`ok/runs`, and for each distinct error of the failed runs its line and how many gave it: the
+    last line of the engine's own stderr (collect.failures)."""
+    text = f"{r['ok']}/{r['runs']}"
+    fails = r.get("failures") or []
+    if fails:
+        text += ": " + "; ".join(f"{f['error']} ({len(f['runs'])} of {r['runs']})" if len(fails) > 1
+                                 else f["error"] for f in fails)
+    return cell(text, 400)
+
+
+def sources_lines(sources: list) -> list:
+    """A merged table's results directories (run.py --table A B ...): newest last, with the runs
+    each gave and its 0.6.6 wheel."""
+    out = ["Merged, the newest record of each run: " + (
+        "the directories by their stamps, oldest first:" if all(s.get("stamp") for s in sources)
+        else "a directory has no stamp, so in the order given, oldest first:")]
+    for s in sources:
+        wheel = f"; {wheel_line(s['wheel_066'])}" if s.get("wheel_066") else ""
+        out.append(f"- `{s['dir']}` ({s.get('stamp') or 'no stamp'}): {s['runs']} runs{wheel}")
+    return out + [""]
+
+
 def render(summary: dict) -> str:
     out = []
-    if summary.get("wheel_066"):
+    if summary.get("sources"):
+        out += sources_lines(summary["sources"])
+    elif summary.get("wheel_066"):
         out += [wheel_line(summary["wheel_066"]), ""]
     for job, j in summary["jobs"].items():
         out.append(f"### {job}\n")
@@ -123,7 +163,7 @@ def render(summary: dict) -> str:
             out.append(f"| {r['label']} | {r['function']} | {fmt(r['operational_s'])} | {startup} | "
                        f"{fmt(r['cpu_s'])} | {fmt(r['peak_gib'], 2)} | {fmt(r.get('memory_gib'), 2)} | {data} | "
                        + " | ".join(split_cell(s, k, joint) for _, k, joint in COLUMNS)
-                       + f" | {r['output']} | {r['ok']}/{r['runs']} |")
+                       + f" | {r['output']} | {runs_cell(r)} |")
         out.append("")
         out.extend(f"- {v['text']}" for v in verdicts(j["engines"]))
         n = j.get("noise") or {}
@@ -139,15 +179,17 @@ def render(summary: dict) -> str:
                "reads and writes the run's one Blob container with its own reader inside operational time; a "
                "row marked `local copy` has no Blob reader, and its copies are timed apart. Memory given is "
                "what each platform leaves a job on the same machine: the node's job bound (`job_memory_bytes`, "
-               "3A) for Moruna, the plan's figure on Linux. Medians of the measured repeats; the learning run "
-               "and the noise pairs are left out.")
+               "3A) for Moruna, the plan's figure on Linux. CPU s is blank where it was not measured: Moruna's "
+               "is its report's `resources.cpu_core_s` when the report says `usage_measured`. Medians of the "
+               "measured repeats; the learning run and the noise pairs are left out. A failed run's own error, "
+               "the last line of its engine's stderr, follows its row's count of runs.")
     return "\n".join(out)
 
 
 def entry(summary: dict, meta: dict, misses_text: str = "") -> str:
     """The run's section of architecture/benchmark-log.md."""
     lines = [f"## {meta['date']}: plan {summary['plan']}", ""]
-    for k in ("commit", "node_image", "machines", "linux_image", "data", "results"):
+    for k in ("commit", "engines", "node_image", "machines", "linux_image", "data", "results"):
         if meta.get(k):
             lines.append(f"- {k.replace('_', ' ').capitalize()}: {meta[k]}")
     lines += ["", render(summary)]

@@ -33,6 +33,7 @@ import argparse  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
 import sys  # noqa: E402
+import traceback  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # bench/vm for the jobs' functions. Never bench/node itself: its azure.py would stand in for the
@@ -125,6 +126,7 @@ def moruna(a, fn, marks, res, store):
         marks["done"] = time.time()
         d = r.to_dict()
     except Exception as e:  # a failed run is a result
+        traceback.print_exc()
         d = getattr(e, "report", None)
         d = d.to_dict() if hasattr(d, "to_dict") else (d or {})
         res["error"] = f"{type(e).__name__}: {e}"[:500]
@@ -143,13 +145,20 @@ def duckdb_session(a, res, store):
     res["version"] = d.__version__
     res["settings"] = {"threads": a.cpus, "memory_limit_mib": limit_mib}
     if store:
-        # The azure extension installed by install.py, outside every timing.
+        # The azure extension install.py installed, outside every timing, loaded from there: a
+        # run installs nothing (an extension it lacks fails the run, never downloads in it).
         ext = os.path.join(a.root, "duckdb-ext") if a.root else None
         if ext:
             con.execute(f"SET extension_directory='{ext}'")
+        con.execute("SET autoinstall_known_extensions=false")
         con.execute("LOAD azure")
+        # The Azure SDK's own transport looks for the CA certificates where Ubuntu has none, and
+        # every HTTPS read fails ("Problem with the SSL CA cert (path? access rights?)", run 3):
+        # the extension's curl transport is given the system's (work item 6.2c).
+        con.execute("SET azure_transport_option_type='curl'")
         con.execute(store.duckdb_secret())
-        res["settings"]["azure"] = "the azure extension, a secret from the connection string"
+        res["settings"]["azure"] = ("the azure extension from ROOT/duckdb-ext, its curl transport, a secret from "
+                                    "the connection string")
     src = [store.az(n) for n in a.inputs] if store else a.inputs
     return con, "read_parquet([" + ",".join(f"'{f}'" for f in src) + "])"
 
@@ -253,13 +262,9 @@ def ray(a, fn, marks, res, store):
     r.shutdown()
 
 
-def spark(a, fn, marks, res, store):
-    os.environ["PYSPARK_PYTHON"] = sys.executable
-    os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
-    import pyspark
-    from pyspark.sql import SparkSession
-    marks["imported"] = time.time()
-    res["version"] = pyspark.__version__
+def spark_settings(a, store):
+    """The session's settings, the account key apart (store.spark_conf adds it, and the record never
+    holds it)."""
     conf = {"spark.driver.memory": f"{int(a.mem_gib * (1 << 30) * 0.5) >> 20}m",
             "spark.sql.execution.arrow.maxRecordsPerBatch": "250000",
             "spark.sql.session.timeZone": "UTC", "spark.ui.enabled": "false",
@@ -271,9 +276,25 @@ def spark(a, fn, marks, res, store):
             # the output the same, not faster.
             "spark.sql.parquet.outputTimestampType": "TIMESTAMP_MICROS"}
     if store:
+        # hadoop-azure's jars as install.py resolved them, outside every timing: nothing is
+        # resolved or fetched in the run.
         spark_install = installed(a).get("spark", {})
-        conf.update({"spark.jars.packages": spark_install.get("packages", ""),
-                     "spark.jars.ivy": spark_install.get("ivy", os.path.join(a.tmp, "ivy"))})
+        if spark_install.get("jars"):
+            conf["spark.jars"] = ",".join(spark_install["jars"])
+        else:
+            conf.update({"spark.jars.packages": spark_install.get("packages", ""),
+                         "spark.jars.ivy": spark_install.get("ivy", os.path.join(a.tmp, "ivy"))})
+    return conf
+
+
+def spark(a, fn, marks, res, store):
+    os.environ["PYSPARK_PYTHON"] = sys.executable
+    os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+    import pyspark
+    from pyspark.sql import SparkSession
+    marks["imported"] = time.time()
+    res["version"] = pyspark.__version__
+    conf = spark_settings(a, store)
     b = SparkSession.builder.master(f"local[{a.cpus}]").appName("bench")
     for k, v in {**conf, **(store.spark_conf() if store else {})}.items():
         b = b.config(k, v)
@@ -282,8 +303,8 @@ def spark(a, fn, marks, res, store):
     marks["ready"] = time.time()
     res["settings"] = {"master": f"local[{a.cpus}]", **conf}
     res["output_note"] = "Spark rolls row groups by bytes (parquet.block.size) and writes one file a task"
-    paths = [store.wasbs(n) for n in a.inputs] if store else a.inputs
-    out = store.wasbs(a.out) if store else a.out
+    paths = [store.abfss(n) for n in a.inputs] if store else a.inputs
+    out = store.abfss(a.out) if store else a.out
     marks["start"] = time.time()
     df = session.read.parquet(*paths)
     df.mapInArrow(lambda it: (fn(b) for b in it), SPARK_SCHEMA[a.workload]).write.mode("overwrite").parquet(out)
@@ -368,7 +389,8 @@ def main(argv=None):
            "mem_gib": a.mem_gib, "data": "blob" if store else "local", "marks": marks}
     try:
         RUN[a.engine](a, fn, marks, res, store)
-    except Exception as e:  # a failed run is a result
+    except Exception as e:  # a failed run is a result, its traceback on stderr for measure.py
+        traceback.print_exc()
         res["error"] = f"{type(e).__name__}: {e}"[:500]
     print("RESULT " + json.dumps(res, default=str), flush=True)
     return 1 if res.get("error") else 0
