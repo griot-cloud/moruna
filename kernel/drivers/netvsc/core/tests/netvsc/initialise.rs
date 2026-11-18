@@ -463,6 +463,28 @@ fn the_start_says_each_step_and_what_the_host_answered() {
 }
 
 #[test]
+fn each_rndis_request_is_one_azures_host_answers() {
+    // Azure's host never answered the query of the address while its empty input's offset
+    // was 0 (console 2026-11-18T0250); the fake leaves such a query unanswered too, and
+    // would have stopped this start there. Each query now puts it after its fields, as
+    // Linux and Microsoft's UEFI netvsc do. The rest of what the fake checks of every
+    // request holds as well: control messages on the control channel (1, RMC_CONTROL, as
+    // Linux's netvsc_send_pkt and the UEFI netvsc send them), each receive of an answer
+    // completed with NVSP's RNDIS packet completion under the host's transaction, and no
+    // packet under transaction 0.
+    for completes in [Completes::First, Completes::AfterAnswer, Completes::OnWait] {
+        let (card, host) = start_with(SMALL, |host| host.completes = completes);
+        let card = up(card);
+        assert_eq!(card.mac(), MAC);
+        assert_eq!(card.mtu(), 1500);
+        let host = host.borrow();
+        assert_eq!(host.ignored, 0, "{completes:?}");
+        assert_eq!(host.lent(), 0, "every answer's receive was completed");
+        assert!(host.violations.is_empty(), "{:#?}", host.violations);
+    }
+}
+
+#[test]
 fn no_packet_asks_for_a_completion_under_transaction_0() {
     // Hyper-V neither answers nor acts on such a packet, and the fake does as it does:
     // netvsc's first RNDIS request went in section 0 under ID 0, and Azure's host never

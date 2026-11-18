@@ -739,10 +739,17 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         Ok(())
     }
 
-    /// Queries one value: REMOTE_NDIS_QUERY_MSG with no input, so its input length and
-    /// offset are zero, answered by REMOTE_NDIS_QUERY_CMPLT, whose value lies at an
-    /// offset counted from the RequestId field, the first after the header. Answers
-    /// where the value is in `frame`.
+    /// Queries one value: REMOTE_NDIS_QUERY_MSG with no input, its input's length zero and
+    /// its offset right after the request's fields, answered by REMOTE_NDIS_QUERY_CMPLT,
+    /// whose value lies at an offset counted from the RequestId field, the first after the
+    /// header. Answers where the value is in `frame`.
+    ///
+    /// The empty input's offset is the request's size, as Linux (`rndis_filter.c`,
+    /// `rndis_filter_query_device`: `info_buf_offset = sizeof(struct
+    /// rndis_query_request)`) and Microsoft's UEFI netvsc (`MsvmPkg/NetvscDxe/NetvscDxe.c`:
+    /// `InformationBufferOffset = sizeof (RNDIS_QUERY_REQUEST)`) give it: Azure's host never
+    /// answered the query of the address with offset 0 (console 2026-11-18T0250, image
+    /// c469afe1), where netvsp reads no input when there is none.
     ///
     /// Source: Microsoft, REMOTE_NDIS_QUERY_MSG and REMOTE_NDIS_QUERY_CMPLT; netvsp
     /// `handle_rndis_control_message`, the `MESSAGE_TYPE_QUERY_MSG` arm, and
@@ -753,7 +760,7 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
             request_id,
             oid,
             information_buffer_length: 0,
-            information_buffer_offset: 0,
+            information_buffer_offset: size_of::<rndisprot::QueryRequest>() as u32,
             device_vc_handle: 0,
         };
         let len = self.control(

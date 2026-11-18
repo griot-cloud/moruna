@@ -20,7 +20,11 @@
 //! 0, as Hyper-V does (Linux, `drivers/hv/channel.c`, `vmbus_next_request_id`): the
 //! second boot's start stopped there (console 2026-11-18T0213, image cf0271f5). And it
 //! reads the guest's ring only when signalled ([`Host::strict`]), so a signal the guest
-//! owes and does not give is a start that waits until its deadline.
+//! owes and does not give is a start that waits until its deadline. It leaves unanswered an
+//! RNDIS query whose `InformationBufferOffset` lies inside the query's own fields, as Azure's
+//! host did the third boot's query with offset 0 (console 2026-11-18T0250, image c469afe1):
+//! Linux (`rndis_filter_query_device`) and Microsoft's UEFI netvsc
+//! (`MsvmPkg/NetvscDxe/NetvscDxe.c`) both put an empty input at `sizeof` the request.
 //!
 //! A test holds the fake as `Rc<RefCell<Host>>` and the card as a [`Card`]. What a test
 //! has the host send is queued, and goes on the ring the next time the card does
@@ -521,7 +525,8 @@ pub struct Host {
     pub filter: u32,
     /// The ID the guest gave its receive buffer.
     pub receive_id: Option<u16>,
-    /// Packets that asked for a completion under transaction ID 0, which Hyper-V ignores.
+    /// What the host ignored, as Hyper-V does: packets that asked for a completion under
+    /// transaction ID 0, and queries whose input offset lies inside their fields.
     pub ignored: usize,
 
     // What happened.
@@ -727,6 +732,11 @@ impl Host {
             self.config.expect("a configuration"),
             self.ndis.expect("a version"),
         )
+    }
+
+    /// Receives the guest has not completed yet.
+    pub fn lent(&self) -> usize {
+        self.lent.len()
     }
 
     /// Reads everything the guest has sent and answers it, then sends what was waiting.
@@ -1157,9 +1167,20 @@ impl Host {
                 let Some(request) = plain::<rndisprot::QueryRequest>(fields) else {
                     return self.violation("a short RNDIS query".into());
                 };
-                if request.information_buffer_length != 0 || request.information_buffer_offset != 0
-                {
+                if request.information_buffer_length != 0 {
                     self.violation("a query with input".into());
+                }
+                // Azure's host leaves unanswered a query whose (empty) input lies inside its
+                // own fields: every guest that works there puts it right after them, at
+                // `sizeof(RNDIS_QUERY_REQUEST)` (see the module's docs).
+                if (request.information_buffer_offset as usize)
+                    < size_of::<rndisprot::QueryRequest>()
+                {
+                    self.ignored += 1;
+                    return self.violation(format!(
+                        "a query whose input offset {} lies inside its fields, which Azure's host never answers",
+                        request.information_buffer_offset
+                    ));
                 }
                 let value = match request.oid {
                     Oid::OID_802_3_PERMANENT_ADDRESS | Oid::OID_802_3_CURRENT_ADDRESS => {
