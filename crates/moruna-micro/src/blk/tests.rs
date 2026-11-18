@@ -1046,7 +1046,9 @@ mod reactor_and_layer {
             .write_object("disk://out/late", view(&arena, b"x"))
             .wait();
         assert!(late.is_err());
-        layer.disk().close();
+        if let crate::blk::out::Target::Disk(disk) = layer.target() {
+            disk.close();
+        }
     }
 
     #[test]
@@ -1320,5 +1322,144 @@ mod reactor_and_layer {
         assert!(notes[1].contains("disk.in.g") && notes[2].contains("disk.out"));
         r.shutdown();
         output.close();
+    }
+
+    /// Item 3.3: a source's volume holding a layer, as `moruna volume pack` writes one.
+    fn source_volume(serial: &str) -> (Arc<crate::volume::layer::Files>, Vec<u8>, Vec<u8>) {
+        use crate::volume::fake::{Fake, dir, file, layer};
+        let big = pattern(2 * 1024 * 1024 + 99, 5);
+        let small = b"a,b\n1,2\n".to_vec();
+        let root = dir(vec![
+            ("nyc", dir(vec![("2024-01.parquet", file(big.clone()))])),
+            ("small.csv", file(small.clone())),
+        ]);
+        let fake = Fake::new(layer(&root, 0), 512, 2048, true);
+        let volume = crate::volume::io::Volume::new(serial, fake, false).unwrap();
+        let files = Arc::new(crate::volume::layer::Files::open(volume).unwrap());
+        (files, big, small)
+    }
+
+    #[test]
+    fn a_source_volumes_files_are_read_listed_and_never_written() {
+        let arena = arena();
+        let (files, big, small) = source_volume("vol-src");
+        let inner = Arc::new(Inner::default());
+        let alloc: Arc<dyn Allocator> = arena.clone();
+        let reactor = DiskReactor::new(inner.clone(), None, std::iter::empty(), None)
+            .unwrap()
+            .with_volumes([files], std::iter::empty(), alloc);
+        let url = "disk://vol-src/nyc/2024-01.parquet";
+        let dst = arena.alloc(1_000_000, Tier::Host).unwrap();
+        let got = reactor.read_object(url, 12_345, dst).wait().unwrap();
+        assert_eq!(got[..], big[12_345..1_012_345]);
+        assert_eq!(
+            reactor.head_object(url).wait().unwrap().size,
+            big.len() as u64
+        );
+        let listed: Vec<(String, u64)> = reactor
+            .list_prefix("disk://vol-src/")
+            .wait()
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.url, m.size))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (url.to_string(), big.len() as u64),
+                ("disk://vol-src/small.csv".to_string(), small.len() as u64),
+            ]
+        );
+        let missing = reactor
+            .read_object(
+                "disk://vol-src/none",
+                0,
+                arena.alloc(1, Tier::Host).unwrap(),
+            )
+            .wait()
+            .unwrap_err();
+        assert!(missing.to_string().contains("no such file"), "{missing}");
+        assert!(reactor.head_object("disk://vol-src/none").wait().is_err());
+        let refused = reactor
+            .write_object("disk://vol-src/x", view(&arena, b"x"))
+            .wait()
+            .unwrap_err();
+        assert!(refused.to_string().contains("read only"), "{refused}");
+        assert!(
+            reactor
+                .delete_object("disk://vol-src/small.csv")
+                .wait()
+                .is_err()
+        );
+        assert!(reactor.sinks().is_empty());
+        // Another serial is the wrapped reactor's.
+        assert!(
+            reactor
+                .read_object("disk://vol-other/x", 0, arena.alloc(1, Tier::Host).unwrap())
+                .wait()
+                .is_err()
+        );
+        assert!(inner.calls.lock().unwrap().contains(&"read_object"));
+    }
+
+    #[test]
+    fn a_sinks_volume_takes_the_runs_layer_which_a_source_reads_back() {
+        use crate::volume::fake::Fake;
+        use crate::volume::io::Volume;
+        let arena = arena();
+        let fake = Fake::new(vec![0u8; out_sectors(4 << 20) * 512], 512, 2048, false);
+        let sink = Volume::new("vol-out", fake.clone(), true).unwrap();
+        let inner = Arc::new(Inner::default());
+        let alloc: Arc<dyn Allocator> = arena.clone();
+        let reactor = DiskReactor::new(inner, None, std::iter::empty(), None)
+            .unwrap()
+            .with_volumes(std::iter::empty(), [sink], alloc);
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("score/part-00000.parquet", pattern(3 * 4096 + 77, 6)),
+            ("score/_SUCCESS", Vec::new()),
+            ("top", pattern(300 * 1024 + 1, 7)),
+        ];
+        for (path, bytes) in &files {
+            reactor
+                .write_object(&format!("disk://vol-out/{path}"), view(&arena, bytes))
+                .wait()
+                .unwrap();
+        }
+        assert!(
+            reactor
+                .read_object("disk://vol-out/top", 0, arena.alloc(1, Tier::Host).unwrap())
+                .wait()
+                .is_err(),
+            "a sink's volume is not read"
+        );
+        reactor.delete_object("disk://vol-out/top").wait().unwrap();
+        assert!(reactor.delete_object("disk://vol-out/top").wait().is_err());
+        reactor
+            .write_object("disk://vol-out/top", view(&arena, &files[2].1))
+            .wait()
+            .unwrap();
+        let layers = reactor.sinks();
+        assert_eq!(layers.len(), 1);
+        let written = layers[0].finish(&no_root()).unwrap();
+        assert_eq!(written.files, 3);
+        assert!(fake.flushes.load(Ordering::SeqCst) >= 2);
+        // The volume now holds a layer a source reads.
+        let bytes = fake.disk.lock().unwrap().clone();
+        let back = Fake::new(bytes, 512, 2048, true);
+        let back = crate::volume::layer::Files::open(Volume::new("vol-out", back, false).unwrap())
+            .unwrap();
+        for (path, data) in &files {
+            let f = back.file(path).unwrap().unwrap();
+            let got = crate::volume::fake::Heap::new(data.len().max(1));
+            let addr = crate::volume::io::Bounce::addr(&got);
+            crate::volume::fake::wait(|done| back.read(&f, 0, addr, data.len() as u64, done))
+                .unwrap();
+            assert_eq!(
+                &crate::volume::io::Bounce::bytes(&got)[..data.len()],
+                data.as_slice(),
+                "{path}"
+            );
+        }
+        assert_eq!(arena.stats().host_in_use, 0);
     }
 }

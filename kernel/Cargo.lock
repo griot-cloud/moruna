@@ -814,6 +814,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-disk"
+version = "0.1.0"
+
+[[package]]
 name = "moruna-driver-table"
 version = "0.1.0"
 dependencies = [
@@ -983,6 +987,7 @@ dependencies = [
 name = "moruna-node-api"
 version = "0.1.0"
 dependencies = [
+ "engine",
  "heapless",
  "httparse",
  "moruna-api",
@@ -992,6 +997,7 @@ dependencies = [
  "moruna-node-platform",
  "moruna-svc",
  "netstack-protocol",
+ "node-protocol",
  "rcgen",
  "ring",
  "rustls",
@@ -1159,6 +1165,7 @@ dependencies = [
  "devices-protocol",
  "guestmem_core",
  "moruna-abi",
+ "moruna-disk",
  "moruna-storvsc",
  "moruna-svc",
  "moruna-sys",
@@ -1318,6 +1325,7 @@ dependencies = [
 name = "node-admission"
 version = "0.1.0"
 dependencies = [
+ "devices-protocol",
  "moruna-node",
  "moruna-storage-format",
  "moruna-storage-service",
@@ -1346,6 +1354,7 @@ dependencies = [
 name = "node-protocol"
 version = "0.1.0"
 dependencies = [
+ "devices-protocol",
  "moruna-node",
  "moruna-svc",
 ]
@@ -2141,6 +2150,8 @@ name = "virtio-blk"
 version = "0.1.0"
 dependencies = [
  "block-protocol",
+ "devices-protocol",
+ "moruna-disk",
  "moruna-mmio",
  "moruna-pci",
  "moruna-svc",

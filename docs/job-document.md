@@ -56,6 +56,12 @@ A version 1 document is a JSON object describing one job. Only `moruna_spec`, `s
 
 **`image`**: an OCI image's command as a source: `image` (`build_key`, `digest`, `location`), `entry`, `params` and `needs`, as for an [`image` function](#kernels).
 
+**`rows`**: `rows` is how many rows the run makes itself, as a database's `generate_series` does: two `Int64` columns, `id`, the row's number from 0, and `value`, `id % 1000`, the same rows every time. It reads nothing, so a job that uses it needs no file, volume or object store: a smoke test, a measurement or a sizing run.
+
+```json
+{"kind": "rows", "rows": 1000000}
+```
+
 An `iterator` source exists only in Python and is refused in a document.
 
 ## kernels
@@ -70,11 +76,13 @@ The functions. Each entry has a `kind`.
 {"kind": "std", "name": "select", "args": {"columns": ["review_id", "score"]}}
 ```
 
-**`function`**: `function` is the name of a function registered on the node (`POST /v1/functions`). The node fetches and verifies its file and gives it to the engine, and the file's content decides how it runs: a native program of the Moruna kernel's user target runs on the data plane's rings, and a Moruna image archive runs its command on its own files, its batches as Arrow IPC. `params` is its data, given to its process as `MORUNA_PARAMS`; a native function takes none. It runs only on a Moruna node.
+**`function`**: `function` is the name a node's functions are registered under (`POST /v1/functions`), and the task runs that function; `params` is its data, given to its process as `MORUNA_PARAMS` (a native function takes none):
 
 ```json
 {"kind": "function", "function": "taxi.score", "params": {"threshold": 0.5}}
 ```
+
+In version 2 it is a function task of kind `function` whose settings are `{"function": "<registered name>"}` and its `params`. A node fetches each registered function a job names before the job starts, and refuses a name that is not registered at `validate`. The file's content decides how it runs: a native program of the Moruna kernel's user target runs on the data plane's rings, and a Moruna image archive runs its command on its own files, its batches as Arrow IPC. It runs only on a Moruna node.
 
 A `package` entry can set `fingerprint`, as printed by `moruna check`. Moruna then refuses to run the job if the loaded function's fingerprint differs, so a document cannot run a function that has changed since it was checked.
 
@@ -87,6 +95,12 @@ A `package` entry can set `fingerprint`, as printed by `moruna check`. Moruna th
 **`arrow_ipc`**: `url` is a directory; `options.file_bytes` (default 1 GiB); `options.compression` is `none` (default), `zstd` or `lz4`, and `options.level` the zstd level (default 3). A compressed file is smaller and is opened by any Arrow reader, `pyarrow.ipc.open_file` included.
 
 **`image`**: an OCI image's command as a sink: `image`, `entry`, `params` and `needs`, as for an [`image` function](#kernels). What it writes back at its end as a commit (`snapshot_id`, `version`) is in the report's `sinks`.
+
+**`count`**: keeps nothing, as `/dev/null` does, and counts what reaches it: the report's `sinks` says the rows and bytes, and no file. It takes no settings.
+
+```json
+{"kind": "count"}
+```
 
 ## budget
 

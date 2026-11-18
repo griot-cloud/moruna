@@ -22,6 +22,7 @@ extern crate alloc;
 
 pub mod net;
 pub mod queue;
+pub mod sg;
 pub mod transport;
 
 #[cfg(target_os = "none")]

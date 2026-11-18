@@ -308,14 +308,23 @@ pub enum CheckAnswer {
 }
 
 /// A volume a job names, by the serial the cloud gives its disk, and whether the job writes it:
-/// `{"serial": "…", "write": bool}`.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// `{"serial": "…", "write": bool}`, and `"staging": true` for its staging volume.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VolumeNeed {
     /// The serial, as `disk://<serial>/...` names it.
     pub serial: String,
     /// `true` for a sink's volume, which the job writes; `false` for one it only reads.
     pub write: bool,
+    /// `true` for the volume the job stages on (`staging.dir` names it, `disk://<serial>/...`),
+    /// which the job writes: a node sizes the job's memory with no scratch for its staging.
+    /// Written only when true.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub staging: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Inbound {

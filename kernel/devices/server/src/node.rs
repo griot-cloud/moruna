@@ -10,7 +10,11 @@
 //!    window over its 4 KiB of configuration space, one over each memory BAR, a range
 //!    of MSI slots, and a DMA resource for its requester id alone. It starts the
 //!    table's program with duplicates of those, a console and a listener, and
-//!    publishes the listener as `SERVICEn` in the directory.
+//!    publishes the listener as `SERVICEn` in the directory. When the boot gave it the
+//!    GUID of the node's image's disk (`disk.guid`, item 3.3), each driver is given it
+//!    too, read only, to tell the disk the node booted from. On a node (it serves until
+//!    stopped), each block driver is also given a `register` listener of the directory,
+//!    through which it registers its disk by serial as `storvsc` does (system design 3C).
 //! 4. It serves the directory on every `directory*` slot, registration on every
 //!    `register*` slot (the library's `Directory`; a lookup of a name nothing has waits
 //!    while a held `register*` slot's driver has not finished registering), and control
@@ -57,6 +61,9 @@ const WAIT_NS: u64 = 120_000_000_000;
 /// each I/O queue pair, one per CPU (SDD 25, f.15). A slot holds no vector until its
 /// driver makes an interrupt in it.
 const MSI_PER_FUNCTION: u64 = 16;
+/// The service the driver table names block drivers' devices by (`block0`, `block1`): the
+/// drivers that register their disks (item 3.3).
+const BLOCK_SERVICE: &str = "block";
 
 /// A function found on the bus.
 struct Function {
@@ -107,6 +114,10 @@ struct State {
     out: Console,
     roots: Roots,
     images: Vec<(String, Handle)>,
+    /// The boot payload's `disk.guid`, which every driver is given.
+    guid: Option<Handle>,
+    /// On a node, the directory's `register` listener, which every block driver is given.
+    register: Option<Channel>,
     devices: Vec<Device>,
     shutting: bool,
     restarted: u32,
@@ -151,6 +162,21 @@ impl State {
         handles.push((Some(dup(&d.msi, "msi")?), "msi"));
         handles.push((Some(dup(&d.dma, "dma")?), "dma"));
         handles.push((Some(theirs.0), "listen"));
+        if let Some(guid) = &self.guid {
+            let guid = guid
+                .duplicate(Rights::READ | Rights::MAP | Rights::TRANSFER)
+                .map_err(|e| format!("duplicating disk.guid: {}", e.name()))?;
+            handles.push((Some(guid), "disk.guid"));
+        }
+        if let Some(register) = &self.register
+            && d.name.starts_with(BLOCK_SERVICE)
+        {
+            let register = register
+                .0
+                .duplicate(Rights::WRITE | Rights::TRANSFER)
+                .map_err(|e| format!("duplicating the register listener: {}", e.name()))?;
+            handles.push((Some(register), devices_protocol::REGISTER_SLOTS));
+        }
         let escrow = self
             .guardian
             .publish(&process)
@@ -694,12 +720,35 @@ fn serve(out: &Console) -> Result<String, String> {
         out: console,
         roots,
         images,
+        guid: start::take("disk.guid"),
+        register: None,
         devices,
         shutting: false,
         restarted: 0,
         guardian: moruna_node::Guardian::new(supervisor),
     }));
     let mut dispatcher = Dispatcher::new();
+    let registry = Rc::new(RefCell::new(Registry::new()));
+    if until_stopped {
+        // On a node, which serves until it is stopped, the block drivers register their disks
+        // through a listener of the directory's own, as a driver the supervisor starts does
+        // through its link (system design 3C, item 3.3).
+        let (register, served) =
+            Channel::create().map_err(|e| format!("channel_create: {}", e.name()))?;
+        let s = state.clone();
+        let registered = registry.clone();
+        let factory: moruna_svc::Factory = Box::new(move || {
+            Box::new(Directory::new(
+                Published(s.clone()),
+                registered.clone(),
+                Access::Register,
+            )) as Box<dyn Handler>
+        });
+        dispatcher
+            .listen(served, factory)
+            .map_err(|e| format!("listening for registrations: {}", e.name()))?;
+        state.borrow_mut().register = Some(register);
+    }
     let count = state.borrow().devices.len();
     let mut started = Vec::new();
     let mut handed = Vec::new();
@@ -745,7 +794,6 @@ fn serve(out: &Console) -> Result<String, String> {
             handed.join(", ")
         );
     }
-    let registry = Rc::new(RefCell::new(Registry::new()));
     let mut listeners = 0;
     for i in 0..start::count() {
         let Some((_, _, slot)) = start::entry(i) else {

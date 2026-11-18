@@ -98,6 +98,19 @@ fn what_a_node_refuses_is_refused_by_its_field() {
         ["report.socket"]
     );
     assert_eq!(with(&|d| d["resume"] = json!("auto")), ["resume"]);
+    // AWS's own S3 with no region: its host is not known.
+    assert_eq!(
+        with(&|d| d["object_store"]["s3"] = json!({"bucket": "b"})),
+        ["object_store.s3.region"]
+    );
+    // Nor is it with s3:// URLs and no object_store.s3 at all.
+    assert_eq!(
+        with(&|d| {
+            d["object_store"] = json!({});
+            d["sink"]["url"] = json!("S3://bucket/out/");
+        }),
+        ["object_store.s3.region"]
+    );
     // Every one at once, in the order the document is read; the first is what admit refuses.
     let mut all = sound();
     all["source"]["url"] = json!("file:///in");
@@ -132,7 +145,8 @@ fn a_nodes_budget_bounds_the_jobs_and_fills_it_in() {
     let mut at = with_budget(1 << 30);
     assert!(refusals(&at, &bounded).is_empty());
     admit(&mut at, &bounded, || Some("0".repeat(32))).unwrap();
-    assert_eq!(at.budget.memory_bytes, Some(1 << 30));
+    // The engine sizes itself to the arena's share of the whole.
+    assert_eq!(at.budget.memory_bytes, Some(sizes(1 << 30, false).arena));
     // Over it, refused by its field, saying what the node allows.
     let over = with_budget((1 << 30) + 4096);
     let refused = refusals(&over, &bounded);
@@ -147,7 +161,7 @@ fn a_nodes_budget_bounds_the_jobs_and_fills_it_in() {
     let mut none = job(sound());
     assert_eq!(budget(&none, &bounded), Some(1 << 30));
     admit(&mut none, &bounded, || Some("0".repeat(32))).unwrap();
-    assert_eq!(none.budget.memory_bytes, Some(1 << 30));
+    assert_eq!(none.budget.memory_bytes, Some(sizes(1 << 30, false).arena));
     // With no bound, the document's own, or none.
     assert_eq!(budget(&job(sound()), &node()), None);
     assert_eq!(budget(&with_budget(4096), &node()), Some(4096));
@@ -169,9 +183,10 @@ fn a_jobs_needs_are_its_hosts_volumes_and_functions() {
         "moruna_spec": 1,
         "source": {"kind": "parquet", "url": ["disk://vol-a/in/1.parquet", "DISK://vol-b/2"]},
         "kernels": [
+            {"kind": "function", "function": "taxi.clean"},
             {"kind": "std", "name": "select", "args": {"columns": ["a"]}},
-            {"kind": "package", "path": "/p.pex", "fingerprint": "f"},
-            {"kind": "std", "name": "cast", "args": {"columns": {"a": "double"}}},
+            {"kind": "function", "function": "taxi.score"},
+            {"kind": "function", "function": "taxi.clean"},
         ],
         "sink": {"kind": "parquet", "url": "disk://vol-c/out/",
                  "options": {"spill": ["disk://vol-a/spill/"]}},
@@ -192,20 +207,32 @@ fn a_jobs_needs_are_its_hosts_volumes_and_functions() {
             volumes: vec![
                 VolumeNeed {
                     serial: "vol-a".into(),
-                    write: true
+                    write: true,
+                    staging: false,
                 },
                 VolumeNeed {
                     serial: "vol-b".into(),
-                    write: false
+                    write: false,
+                    staging: false,
                 },
                 VolumeNeed {
                     serial: "vol-c".into(),
-                    write: true
+                    write: true,
+                    staging: false,
                 },
             ],
-            functions: vec!["std".to_string(), "package".to_string()],
+            functions: vec!["taxi.clean".to_string(), "taxi.score".to_string()],
         }
     );
+    // AWS's own S3: its region's host, path-style.
+    let aws = job(json!({
+        "moruna_spec": 1,
+        "source": {"kind": "parquet", "url": "s3://b/in/"},
+        "sink": {"kind": "parquet", "url": "s3://b/out/"},
+        "object_store": {"s3": {"region": "EU-West-1"}},
+    }));
+    assert_eq!(needs(&aws).hosts, ["s3.eu-west-1.amazonaws.com"]);
+    assert!(refusals(&aws, &node()).is_empty());
     // An endpoint with no host of its own (a host socket, or AWS's default) gives none.
     let socket = job(json!({
         "moruna_spec": 1,
@@ -233,10 +260,206 @@ fn a_urls_host_is_its_authoritys_name() {
     assert_eq!(disk_serial("file:///a"), None);
 }
 
+/// A job's whole memory is its account: the engine's 128 MiB, a quarter of the rest as
+/// scratch unless it names a staging volume, and the arena the rest, so that a job at its
+/// budget never needs more than its account.
+#[test]
+fn a_jobs_budget_is_spent_on_the_engine_its_scratch_and_its_arena() {
+    let mib = 1u64 << 20;
+    let at = sizes(1 << 30, false);
+    assert_eq!(
+        at,
+        Sizes {
+            overhead: 128 * mib,
+            scratch: 224 * mib,
+            arena: 672 * mib
+        }
+    );
+    assert_eq!(at.overhead + at.scratch + at.arena, 1 << 30);
+    let volume = sizes(1 << 30, true);
+    assert_eq!((volume.scratch, volume.arena), (0, 896 * mib));
+    // Pages, and a budget smaller than the overhead leaves nothing else.
+    let odd = sizes((1 << 30) + 4096, false);
+    assert_eq!(odd.overhead + odd.scratch + odd.arena, (1 << 30) + 4096);
+    assert_eq!(odd.scratch % 4096, 0);
+    assert_eq!(
+        sizes(64 * mib, false),
+        Sizes {
+            overhead: 64 * mib,
+            scratch: 0,
+            arena: 0
+        }
+    );
+    // A disk:// staging directory is a volume, the one the check's needs mark staging (3.3);
+    // no staging directory is none.
+    let mut staged = sound();
+    staged["staging"] = json!({"dir": "disk://vol-s/spill/"});
+    assert!(names_staging_volume(&job(staged.clone())));
+    assert!(
+        needs(&job(staged))
+            .volumes
+            .iter()
+            .any(|v| v.staging && v.serial == "vol-s")
+    );
+    assert!(!names_staging_volume(&job(sound())));
+}
+
 #[test]
 fn schemes_are_read_without_regard_to_case_and_only_at_the_start() {
     assert!(is_file_url("file:///x") && is_file_url("File:/x") && !is_file_url("fil"));
     assert!(!is_file_url("s3://bucket/file://x"));
     assert!(is_host_socket("unix:/x") && is_host_socket("VSOCK://2:1"));
     assert!(!is_host_socket("https://unix.example.com") && !is_host_socket("uni"));
+}
+
+fn attached() -> Vec<NodeVolume> {
+    parse_volumes("vol-1 1073741824 ro data\nvol-out 2147483648 rw data\nboot 4294967296 ro boot\n")
+        .expect("the node's volumes")
+}
+
+/// The node's disks as `node-admission` writes them, and every line it does not.
+#[test]
+fn the_nodes_volumes_are_a_line_a_disk() {
+    let volumes = attached();
+    assert_eq!(
+        volumes[0],
+        NodeVolume {
+            serial: "vol-1".into(),
+            bytes: 1 << 30,
+            read_only: true,
+            boot: false,
+        }
+    );
+    assert!(volumes[2].boot && !volumes[1].read_only);
+    assert_eq!(parse_volumes("").unwrap(), Vec::new());
+    assert_eq!(parse_volumes("\n  \n").unwrap(), Vec::new());
+    for bad in [
+        "vol-1 12 ro",
+        "vol-1 twelve ro data",
+        "vol-1 12 rx data",
+        "vol-1 12 ro root",
+        "vol-1 12 ro data extra",
+    ] {
+        assert!(parse_volumes(bad).unwrap_err().contains("line 1"), "{bad}");
+    }
+}
+
+/// Given the node's disks, a job's volumes are refused by their field: a serial no disk has,
+/// the boot disk, a sink's volume served read only; a node whose disks are not known refuses none.
+#[test]
+fn a_volume_no_disk_has_or_the_boot_disk_is_refused_by_its_field() {
+    let on = Node {
+        volumes: Some(attached()),
+        ..node()
+    };
+    assert!(refusals(&job(sound()), &on).is_empty(), "vol-1 is attached");
+    let with = |source: &str, sink: &str| {
+        let mut document = sound();
+        document["source"]["url"] = json!(source);
+        document["sink"]["url"] = json!(sink);
+        job(document)
+    };
+    let fields = |job: &Job, node: &Node| -> Vec<(String, String)> {
+        refusals(job, node)
+            .into_iter()
+            .map(|r| (r.field, r.reason))
+            .collect()
+    };
+    let unknown = fields(&with("disk://vol-9/in/", "disk://vol-out/out/"), &on);
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+    assert!(
+        unknown[0].1.contains("volume `vol-9` is not attached"),
+        "{unknown:?}"
+    );
+    assert!(
+        unknown[0].1.contains("its volumes are vol-1, vol-out"),
+        "{unknown:?}"
+    );
+    let boot = fields(&with("disk://boot/in/", "s3://bucket/out/"), &on);
+    assert_eq!(boot.len(), 1, "{boot:?}");
+    assert!(
+        boot[0].1.contains("the disk this node booted from"),
+        "{boot:?}"
+    );
+    assert_eq!(boot[0].0, unknown[0].0, "the source's url both times");
+    let read_only = fields(&with("disk://vol-out/in/", "disk://vol-1/out/"), &on);
+    assert_eq!(read_only.len(), 1, "{read_only:?}");
+    assert!(
+        read_only[0].1.contains("read only on this node"),
+        "{read_only:?}"
+    );
+    let none = Node {
+        volumes: Some(Vec::new()),
+        ..node()
+    };
+    let nothing = fields(&job(sound()), &none);
+    assert!(nothing[0].1.contains("it has none"), "{nothing:?}");
+    assert!(
+        refusals(&with("disk://vol-9/in/", "disk://boot/out/"), &node()).is_empty(),
+        "disks not known: nothing refused"
+    );
+}
+
+/// The volume `staging.dir` names is the job's staging volume: written, and said so, and
+/// refused as any volume is when the node has no such disk.
+#[test]
+fn a_staging_volume_is_written_and_said_to_be_staging() {
+    let mut document = sound();
+    document["staging"] = json!({"dir": "disk://vol-out/stage/"});
+    let staged = job(document.clone());
+    let volumes = needs(&staged).volumes;
+    assert_eq!(
+        volumes,
+        vec![
+            VolumeNeed {
+                serial: "vol-1".into(),
+                write: false,
+                staging: false,
+            },
+            VolumeNeed {
+                serial: "vol-out".into(),
+                write: true,
+                staging: true,
+            },
+        ]
+    );
+    // Only a staging volume says so on the wire.
+    let line = serde_json::to_string(&volumes).unwrap();
+    assert_eq!(
+        line,
+        r#"[{"serial":"vol-1","write":false},{"serial":"vol-out","write":true,"staging":true}]"#
+    );
+    let back: Vec<VolumeNeed> = serde_json::from_str(&line).unwrap();
+    assert_eq!(back, volumes);
+    // A source's volume that is also the staging volume is written.
+    document["staging"] = json!({"dir": "disk://vol-1/stage/"});
+    assert_eq!(
+        needs(&job(document.clone())).volumes,
+        vec![VolumeNeed {
+            serial: "vol-1".into(),
+            write: true,
+            staging: true,
+        }]
+    );
+    // Against the node's disks: none with the serial, the boot disk, a read-only one.
+    let on = Node {
+        volumes: Some(attached()),
+        ..node()
+    };
+    for (dir, said) in [
+        ("disk://vol-9/s/", "is not attached"),
+        ("disk://boot/s/", "booted from"),
+        ("disk://vol-1/s/", "read only on this node"),
+    ] {
+        document["staging"] = json!({ "dir": dir });
+        let refused = refusals(&job(document.clone()), &on);
+        let staging: Vec<_> = refused
+            .iter()
+            .filter(|r| r.field == "staging.dir")
+            .collect();
+        assert_eq!(staging.len(), 1, "{dir}: {refused:?}");
+        assert!(staging[0].reason.contains(said), "{dir}: {refused:?}");
+    }
+    document["staging"] = json!({"dir": "disk://vol-out/s/"});
+    assert!(refusals(&job(document), &on).is_empty());
 }

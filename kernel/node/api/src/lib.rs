@@ -22,7 +22,12 @@
 //! - **Serving:** each accepted socket is one server connection, its bytes moved by
 //!   requests the process sends to the network server without waiting on them
 //!   ([`network::Conn`]). One thread: a loop takes the network server's answers, polls the
-//!   server, sends what is to send, and waits for the next answer or deadline ([`run`]).
+//!   server, sends what is to send, and waits for the next answer, the engines' bytes, or the
+//!   next deadline ([`run`]).
+//! - **Jobs** (system design 3A, work item 3.2): `api` is the engine's host. Each job and each
+//!   check of a document runs in a fresh engine `node-admission` starts, on a channel `api` speaks
+//!   the host protocol on ([`engine`]). `node-admission` answers the node's job bound at the
+//!   start, which the node document reports as `job_memory_bytes`.
 //!
 //! Every wait here is on the network server, which ends within 30 s of its start if no
 //! lease comes (system design 1B), or on `platform`; a request to a server that has ended
@@ -37,7 +42,7 @@
 
 extern crate alloc;
 
-use alloc::{format, rc::Rc, string::String, vec, vec::Vec};
+use alloc::{boxed::Box, format, rc::Rc, string::String, vec, vec::Vec};
 use core::{cell::RefCell, convert::Infallible, fmt};
 
 use moruna_api_server::{IdentityError, Server};
@@ -45,6 +50,7 @@ use moruna_node_config::{Handover, HandoverError, READY};
 use moruna_svc::{Account, CallError, Channel, DEADLINE_INFINITE, Handle, Signals, now, wait_one};
 use netstack_protocol::{Addr, Endpoint, Info, net};
 
+pub mod engine;
 pub mod network;
 pub mod node;
 
@@ -89,6 +95,8 @@ pub enum Error {
     Identity(bool, IdentityError),
     /// The server could not be made from its config.
     Server(String),
+    /// `node-admission` did not answer as it should: what was asked, and how it failed.
+    Admission(&'static str, CallError<node_protocol::admission::Error>),
     /// A request to [`TEST_EXIT_PATH`](moruna_api_server::TEST_EXIT_PATH) came: the
     /// `cloud-test` image's way to end the process, which is no failure (work item 2.2c).
     #[cfg(feature = "test-exit")]
@@ -110,6 +118,7 @@ impl fmt::Display for Error {
             Error::Identity(true, error) => write!(f, "node config's tls: {error}"),
             Error::Identity(false, error) => write!(f, "the node's own TLS identity: {error}"),
             Error::Server(why) => write!(f, "the API server: {why}"),
+            Error::Admission(what, error) => write!(f, "node-admission: {what}: {error:?}"),
             #[cfg(feature = "test-exit")]
             Error::TestExit => write!(f, "a request to {}", moruna_api_server::TEST_EXIT_PATH),
         }
@@ -236,24 +245,40 @@ pub fn ready(platform: &Channel) -> Result<(), Error> {
     }
 }
 
+/// The engine host over `admission`, a connection to `node-admission`, waited for as long as
+/// it takes to answer: the node's job bound is its first question.
+pub fn jobs(admission: Channel) -> Result<engine::Host, Error> {
+    let client = node_protocol::admission::Client::connect(admission, DEADLINE_INFINITE)
+        .map_err(|error| Error::Admission("hello", error))?;
+    engine::Host::new(client).map_err(|error| Error::Admission("the job bound", error))
+}
+
 /// The whole process, on its connection to the network server and its link to
-/// `platform`, on a node of `cores` CPUs: the hand-over, the server made from it and its
-/// identity's line, then the loop that serves, saying each line with `say` and answering
-/// `platform` once its listener first opens. It returns only when it cannot go on.
+/// `platform`, on a node of `cores` CPUs, running jobs through `jobs` when the node runs any:
+/// the hand-over, the server made from it and its identity's line, then the loop that serves,
+/// saying each line with `say` and answering `platform` once its listener first opens. It
+/// returns only when it cannot go on.
 pub fn run(
     client: net::Client,
     platform: &Channel,
     cores: u32,
+    jobs: Option<engine::Host>,
     say: &mut dyn FnMut(&str),
 ) -> Result<Infallible, Error> {
     let handover = handover(platform)?;
-    let config = node::config(&handover, cores, now())?;
+    let bound = jobs.as_ref().map_or(0, engine::Host::bound);
+    let config = node::config(&handover, cores, bound, now())?;
     say(&format!(
         "moruna: tls sha256={}",
         config.identity.fingerprint()
     ));
-    let mut server = Server::new(config, node::NodeClock::new(&handover))
-        .map_err(|e| Error::Server(format!("{e:?}")))?;
+    let host = jobs.map(|host| Rc::new(RefCell::new(host)));
+    let clock = node::NodeClock::new(&handover);
+    let mut server = match &host {
+        Some(host) => Server::with_engine(config, clock, Box::new(engine::Shared(host.clone()))),
+        None => Server::new(config, clock),
+    }
+    .map_err(|e| Error::Server(format!("{e:?}")))?;
     let network = Rc::new(RefCell::new(network::Network::new(client)));
     let mut answered = false;
     loop {
@@ -284,6 +309,15 @@ pub fn run(
         if let Some(ms) = server.deadline() {
             deadline = deadline.min(ms.saturating_mul(1_000_000));
         }
-        network.borrow_mut().wait(deadline)?;
+        // An engine whose channel has ended is let go here, so its closed channel is not waited
+        // on again and its account is free.
+        let engines = match &host {
+            Some(host) => {
+                host.borrow_mut().tend();
+                host.borrow().waits()
+            }
+            None => Vec::new(),
+        };
+        network.borrow_mut().wait(deadline, &engines)?;
     }
 }

@@ -287,21 +287,42 @@ const PLATFORM_GRANT: &str = "grant listen-platform rights=connect \
 
 #[test]
 fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
-    // node.conf: on a machine that is not Hyper-V, which runs no `vmbus`, `platform` is the last
-    // service, so the supervisor starts it after `network` and `api`, with a 16 MiB account
-    // and a network listener.
-    let node = moruna_node::Config::parse(NODE_CONF.as_bytes(), 1 << 30).expect("node.conf");
+    // node.conf: on a machine that is not Hyper-V, which runs no `vmbus` and none of its clients
+    // (`storvsc`, `netvsc`), the supervisor starts `platform` after `network` and `api`, with a
+    // 16 MiB account and a network listener, and then step 3's services (item 3.2),
+    // node-admission taking the rest of a 2 GiB node.
+    let node = moruna_node::Config::parse(NODE_CONF.as_bytes(), 2 << 30).expect("node.conf");
     let names: Vec<&str> = node.services.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(
         names,
         [
-            "devices", "vmbus", "storvsc", "netvsc", "network", "api", "platform"
+            "devices",
+            "vmbus",
+            "storvsc",
+            "netvsc",
+            "network",
+            "api",
+            "platform",
+            "imagefs",
+            "linux",
+            "node-admission"
         ]
     );
     let node = node.on_machine(false);
     let names: Vec<&str> = node.services.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, ["devices", "network", "api", "platform"]);
-    let platform = node.services.last().unwrap();
+    assert_eq!(
+        names,
+        [
+            "devices",
+            "network",
+            "api",
+            "platform",
+            "imagefs",
+            "linux",
+            "node-admission"
+        ]
+    );
+    let platform = node.services.iter().find(|s| s.name == "platform").unwrap();
     assert_eq!(
         (platform.image.as_str(), platform.account_bytes),
         ("image.platform", 16 << 20)
@@ -317,8 +338,9 @@ fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
         })
     };
     assert!(link("network", "listen-platform", "platform", "network"));
-    // No link reaches api: every start of it, the first included, gets its listener and its
-    // channel to platform afresh from the supervisor (item 2.2c).
+    // No link reaches api: every start of it, the first included, gets its listener, its
+    // channel to platform (item 2.2c) and its connection to node-admission (item 3.2) afresh
+    // from the supervisor.
     assert!(
         node.links
             .iter()
@@ -334,6 +356,8 @@ fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
         ),
         ("api", "network", "network", "listen-supervisor")
     );
+    assert_eq!(restart.connect.as_deref(), Some("admission"));
+    assert!(link("node-admission", "listen", "supervisor", "admission"));
     // Its bootstrap: the supervisor's message with the node's memory, on its `supervisor` slot.
     assert!(
         node.bootstraps

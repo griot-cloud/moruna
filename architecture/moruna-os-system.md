@@ -623,7 +623,7 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
   SHA-256, and hands the engine the image as a read-only memory object, with no copy. The node
   refuses the job if a SHA-256 differs. `address` is `https://` only (a pre-signed or SAS URL for a
   private store); admission holds no store credentials. Images are cached in memory, up
-  to node config's `functions.cache_bytes` (default 1 GiB, at most half the node's memory), until the node stops.
+  to node config's `functions.cache_bytes` (default the smaller of 1 GiB and an eighth of the node's memory; an operator's value at most half of it), until the node stops. The cache is an account `node-admission` carves from its own, so the job bound it reports already leaves it out.
 - **A job names a function** by its registered name, as a function task's `"function": "<name>"`;
   the check's `needs.functions` lists them. An unregistered name is refused at `validate`.
 - **AWS's own S3** (no endpoint) is reached with path-style requests, so its host is

@@ -448,6 +448,20 @@ fn grants(
                 .ok_or_else(|| format!("no process resource `{from}`"))?
                 .duplicate(Rights::WRITE | Rights::TRANSFER)
                 .map_err(|e| format!("duplicating the process resource `{from}`: {}", e.name()))?,
+            // The configuration runs once (`Config::parse`): the channel moves to the program
+            // as it is, taken from the start page here.
+            Source::Channel(from) => {
+                let channel = start::take(from).ok_or_else(|| {
+                    format!(
+                        "`grant {} channel {from}` names a channel the supervisor was not given",
+                        g.slot
+                    )
+                })?;
+                match channel.info() {
+                    Ok((moruna_svc::ObjectType::Channel, _)) => channel,
+                    _ => return Err(format!("`{from}` is not a channel")),
+                }
+            }
         };
         out.push((b(&g.slot), handle));
     }
@@ -469,23 +483,29 @@ fn ended_text(e: &Ended) -> String {
 
 /// A reply is not permission to reset an account while original objects/loans
 /// remain. Sequential runs wait for actual accounting release, within a bound.
-fn drain_accounts(runtime: &Account, scratch: &Account) -> Result<(), String> {
+fn drain_accounts(runtime: &Account, scratch: Option<&Account>) -> Result<(), String> {
     let timer = Timer::create().map_err(|e| format!("account drain timer: {}", e.name()))?;
     let deadline = now().saturating_add(5 * SECONDS);
     loop {
         let run = runtime
             .usage()
             .map_err(|e| format!("runtime usage: {}", e.name()))?;
-        let temporary = scratch
-            .usage()
-            .map_err(|e| format!("scratch usage: {}", e.name()))?;
-        if run.used == 0 && run.reserved == 0 && temporary.used == 0 && temporary.reserved == 0 {
+        let (used, reserved) = match scratch {
+            Some(scratch) => {
+                let temporary = scratch
+                    .usage()
+                    .map_err(|e| format!("scratch usage: {}", e.name()))?;
+                (temporary.used, temporary.reserved)
+            }
+            None => (0, 0),
+        };
+        if run.used == 0 && run.reserved == 0 && used == 0 && reserved == 0 {
             return Ok(());
         }
         if now() >= deadline {
             return Err(format!(
                 "original accounts not drained: runtime used={} reserved={}, scratch used={} reserved={}",
-                run.used, run.reserved, temporary.used, temporary.reserved
+                run.used, run.reserved, used, reserved
             ));
         }
         timer
@@ -590,12 +610,16 @@ fn run() -> i64 {
                 return 1;
             }
         };
-        let scratch = match Account::carve(config.scratch, "scratch") {
-            Ok(account) => account,
-            Err(e) => {
-                println!(out, "KD2 engine: FAIL: scratch account: {}", e.name());
-                return 1;
-            }
+        // `scratch 0`: no scratch account (a node's check).
+        let scratch = match config.scratch {
+            0 => None,
+            bytes => match Account::carve(bytes, "scratch") {
+                Ok(account) => Some(account),
+                Err(e) => {
+                    println!(out, "KD2 engine: FAIL: scratch account: {}", e.name());
+                    return 1;
+                }
+            },
         };
         let mut handles = match grants(
             &config,
@@ -657,8 +681,11 @@ fn run() -> i64 {
             }
         };
         let scratch_charge = match scratch
-            .0
-            .duplicate(Rights::READ | Rights::WRITE | Rights::TRANSFER)
+            .as_ref()
+            .map(|s| {
+                s.0.duplicate(Rights::READ | Rights::WRITE | Rights::TRANSFER)
+            })
+            .transpose()
         {
             Ok(handle) => handle,
             Err(e) => {
@@ -687,7 +714,7 @@ fn run() -> i64 {
         let grant = Grant {
             handles,
             account: runtime_charge,
-            scratch: Some(scratch_charge),
+            scratch: scratch_charge,
         };
         match client.run_granted(b(&config.program), argv.clone(), env.clone(), grant) {
             Ok(ended) => {
@@ -710,7 +737,7 @@ fn run() -> i64 {
                 return 1;
             }
         }
-        if let Err(e) = drain_accounts(&runtime, &scratch) {
+        if let Err(e) = drain_accounts(&runtime, scratch.as_ref()) {
             println!(
                 out,
                 "KD2 engine: FAIL: run {} original account retirement: {}", n, e

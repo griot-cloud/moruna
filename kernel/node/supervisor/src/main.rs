@@ -60,6 +60,10 @@ struct Restarting {
     image: Handle,
     /// The supervisor's end of the network server's granting slot.
     granting: Channel,
+    /// The supervisor's client end of the listener node.conf links it to
+    /// (`link SERVER SLOT supervisor CONNECT`), which each start is given a fresh connection
+    /// through on the record's `CONNECT` slot (item 3.2).
+    connector: Option<Channel>,
     /// The network server's client the listeners are minted with, once the first start has
     /// connected it.
     client: Option<net::Client>,
@@ -206,21 +210,27 @@ fn prepare(console: &Console) -> Result<Prepared, String> {
             .handles
             .push((Some(handle), grant.slot.clone()));
     }
+    let mut connector = None;
     for link in &config.links {
         let left = config
             .services
             .iter()
             .position(|s| s.name == link.left)
             .ok_or("unknown link service")?;
+        let (a, b) = Channel::create().map_err(|e| format!("link: {}", e.name()))?;
+        children[left]
+            .handles
+            .push((Some(a.0), link.left_slot.clone()));
+        // The supervisor's own link (item 3.2): it keeps the client's end.
+        if link.right == restart::SUPERVISOR {
+            connector = Some(b);
+            continue;
+        }
         let right = config
             .services
             .iter()
             .position(|s| s.name == link.right)
             .ok_or("unknown link service")?;
-        let (a, b) = Channel::create().map_err(|e| format!("link: {}", e.name()))?;
-        children[left]
-            .handles
-            .push((Some(a.0), link.left_slot.clone()));
         children[right]
             .handles
             .push((Some(b.0), link.right_slot.clone()));
@@ -343,6 +353,7 @@ fn prepare(console: &Console) -> Result<Prepared, String> {
             record: record.clone(),
             image,
             granting: ours,
+            connector: connector.take(),
             client: None,
             deaths: Deaths::new(),
         });
@@ -357,8 +368,10 @@ fn prepare(console: &Console) -> Result<Prepared, String> {
 }
 
 /// What a start of the service that restarts gets besides its console and account: its
-/// listener, minted from the network server, and, when `platform` is bootstrapped, a fresh
-/// channel to `platform`, whose other end `platform` is sent as `api-started`.
+/// listener, minted from the network server; when `platform` is bootstrapped, a fresh channel to
+/// `platform`, whose other end `platform` is sent as `api-started`; and when the record names a
+/// `CONNECT` slot, a fresh connection to the server the supervisor is linked to (item 3.2), which
+/// ends with this start.
 fn fresh(
     restarting: &mut Restarting,
     platform: Option<&Channel>,
@@ -389,6 +402,11 @@ fn fresh(
             .write_with(restart::API_STARTED, &mut [Some(theirs.0)])
             .map_err(|e| format!("api-started to platform: {}", e.name()))?;
         handles.push((Some(ours.0), restart::PLATFORM_SLOT.into()));
+    }
+    if let (Some(slot), Some(connector)) = (&restarting.record.connect, &restarting.connector) {
+        let channel = moruna_svc::connect(connector)
+            .map_err(|e| format!("a connection on its {slot} slot: {e:?}"))?;
+        handles.push((Some(channel.0), slot.clone()));
     }
     Ok(handles)
 }

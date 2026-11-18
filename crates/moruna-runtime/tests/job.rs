@@ -531,6 +531,7 @@ fn jb_t28_check_job_command() {
             secrets: Vec::new(),
             node: None,
             budget_max: None,
+            volumes: None,
         })
     );
     assert_eq!(
@@ -549,6 +550,7 @@ fn jb_t28_check_job_command() {
             secrets: vec!["aws.key".into(), "gcs".into()],
             node: Some("channel:engine".into()),
             budget_max: None,
+            volumes: None,
         })
     );
     assert!(cli::parse(&args(&["check-job"])).is_err());

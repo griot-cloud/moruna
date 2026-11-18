@@ -9,3 +9,4 @@ publish.workspace = true
 moruna-svc.workspace = true
 
 moruna-node = { path = "../core", version = "=0.1.0" }
+devices-protocol = { path = "../../devices/protocol", version = "=0.1.0" }

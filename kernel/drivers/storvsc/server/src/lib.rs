@@ -17,7 +17,11 @@
 //!    and registers it with the device manager under its serial, through the link that
 //!    carries only that right, so a client finds it as any other disk. A lookup of a disk
 //!    not yet registered waits until storvsc has finished: it connects through that link
-//!    before the scan, and closes the connection once the last disk is registered.
+//!    before the scan, and closes the connection once the last disk is registered. The boot
+//!    disk's `moruna-system` partition, which holds the node's engine layer (system design
+//!    1A), is served and registered as a disk of its own, `system`: a window of the boot
+//!    disk, read only, never a volume, and only when the disk's GPT GUID is the image's
+//!    ([`scan::boot_table`], [`boot_system`], [`system`]; item 3.3).
 //!
 //! Data moves by the guest page numbers of the client's memory, named in each request, with
 //! no copy. Everything it needs of the node is behind [`serve::Node`] and [`scan::Scratch`],
@@ -95,6 +99,7 @@ pub fn plan(controllers: &[Controller<'_>]) -> Plan {
                     controller: index,
                     disk: *disk,
                     name,
+                    window: None,
                 }),
                 None => plan.lines.push(format!(
                     "{}, no Azure name: not served",
@@ -129,4 +134,85 @@ pub fn plan(controllers: &[Controller<'_>]) -> Plan {
         plan.served.len()
     ));
     plan
+}
+
+/// The boot disk's `moruna-system` partition, when the process serves it, and the console's
+/// line about it. Microsoft's rule names the OS disk; the image's GUID (`disk.guid`, which
+/// `package.py` gave the disk it wrote) proves it is the disk this image booted from. A disk that
+/// matches the rule and not the GUID, or has no table, or a node that gave no GUID, is still
+/// served read only as `boot`, and its partitions are not served.
+pub fn boot_system(
+    table: Option<&scan::Table>,
+    image: Option<&moruna_disk::Guid>,
+) -> (Option<moruna_disk::Slice>, String) {
+    let unchecked = "served read-only as boot, with no system partition";
+    let Some(image) = image else {
+        return (
+            None,
+            format!(
+                "storvsc: no disk.guid was given: the boot disk's GUID is not checked; {unchecked}"
+            ),
+        );
+    };
+    let Some(table) = table else {
+        return (
+            None,
+            format!("storvsc: the boot disk has no GPT the image wrote; {unchecked}"),
+        );
+    };
+    if table.guid != *image {
+        return (
+            None,
+            format!(
+                "storvsc: the boot disk's GPT disk GUID {} is not the image's {image}; {unchecked}",
+                table.guid
+            ),
+        );
+    }
+    match table.system {
+        Some(window) => (
+            Some(window),
+            format!(
+                "storvsc: the boot disk's {} partition, {} blocks from block {}: {}, read-only",
+                moruna_disk::SYSTEM,
+                window.sectors,
+                window.first,
+                moruna_disk::SYSTEM_SERIAL
+            ),
+        ),
+        None => (
+            None,
+            format!(
+                "storvsc: the boot disk has no {} partition",
+                moruna_disk::SYSTEM
+            ),
+        ),
+    }
+}
+
+/// The boot disk's `moruna-system` partition, `window` of its blocks, served as a disk of its
+/// own: `system`, read only, and, as the boot disk is, never a volume.
+pub fn system(boot: &Served, window: moruna_disk::Slice) -> Served {
+    Served {
+        controller: boot.controller,
+        disk: boot.disk,
+        name: naming::Name {
+            serial: String::from(moruna_disk::SYSTEM_SERIAL),
+            read_only: true,
+            boot: true,
+        },
+        window: Some(window),
+    }
+}
+
+/// What the device manager is told of a disk served: its serial, its blocks (its window's),
+/// and how it is served.
+pub fn block(served: &Served) -> devices_protocol::Block {
+    devices_protocol::Block {
+        serial: served.name.serial.clone(),
+        sector_size: served.disk.block_size(),
+        sectors: served.blocks(),
+        read_only: served.name.read_only,
+        boot: served.name.boot,
+    }
 }

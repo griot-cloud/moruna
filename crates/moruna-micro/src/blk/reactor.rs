@@ -12,6 +12,10 @@
 //!
 //! A sink's `write_object` under [`out::URL`] is the output layer's: [`out::Output`] puts the
 //! file onto `disk.out` as it is written (contract C3).
+//!
+//! Volumes (item 3.3) answer `disk://<serial>/<path>`: a source's volume the files of the layer
+//! it holds ([`Files`]), read straight into the source's buffer by its driver; a sink's volume
+//! the layer the run writes onto it, an [`out::Output`] of its own.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -26,6 +30,15 @@ use super::disk::Disk;
 use super::engine::{Kind, Op};
 use super::out::{self, Output};
 use crate::devices;
+use crate::volume::{self, io::Volume, layer::Files};
+
+/// A volume the reactor answers for.
+enum Mounted {
+    /// A source's: the layer it holds, read only.
+    Source(Arc<Files>),
+    /// A sink's: the layer the run writes onto it.
+    Sink(Arc<Output>),
+}
 
 /// The reactor with the engine's disks in front of it.
 pub struct DiskReactor {
@@ -33,6 +46,7 @@ pub struct DiskReactor {
     metadata: Option<Arc<dyn ObjectMetadata>>,
     disks: BTreeMap<String, Disk>,
     output: Option<Arc<Output>>,
+    volumes: BTreeMap<String, Mounted>,
     dispatch: Dispatch,
 }
 
@@ -67,8 +81,95 @@ impl DiskReactor {
             metadata,
             disks,
             output,
+            volumes: BTreeMap::new(),
             dispatch,
         })
+    }
+
+    /// The reactor with volumes in front of it too, each answering the `disk://<serial>/` URLs
+    /// of its serial: each of `sources` the files of the layer it holds, each of `sinks` the
+    /// layer the run writes onto it, its bounce buffers from `alloc`.
+    pub fn with_volumes(
+        mut self,
+        sources: impl IntoIterator<Item = Arc<Files>>,
+        sinks: impl IntoIterator<Item = Volume>,
+        alloc: Arc<dyn Allocator>,
+    ) -> DiskReactor {
+        for files in sources {
+            let serial = files.volume().serial().to_string();
+            self.volumes.insert(serial, Mounted::Source(files));
+        }
+        let tier = if alloc.is_pinned() {
+            Tier::PinnedHost
+        } else {
+            Tier::Host
+        };
+        for volume in sinks {
+            let serial = volume.serial().to_string();
+            let layer = Output::on_volume(volume, Arc::clone(&alloc), tier, self.dispatch.clone());
+            self.volumes.insert(serial, Mounted::Sink(layer));
+        }
+        self
+    }
+
+    /// The layers the run writes onto its sinks' volumes, which its end finishes.
+    pub fn sinks(&self) -> Vec<Arc<Output>> {
+        self.volumes
+            .values()
+            .filter_map(|m| match m {
+                Mounted::Sink(layer) => Some(Arc::clone(layer)),
+                Mounted::Source(_) => None,
+            })
+            .collect()
+    }
+
+    /// The volume a `disk://<serial>/<path>` URL names, its serial and the path.
+    fn mounted<'a>(&self, url: &'a str) -> Option<(&Mounted, &'a str, &'a str)> {
+        let (serial, path) = volume::parse(url)?;
+        self.volumes.get(serial).map(|m| (m, serial, path))
+    }
+
+    fn resolved<T: Send + 'static>(&self, r: moruna_kernel::Result<T>) -> Completion<T> {
+        Completion::resolved_on(r, self.dispatch.clone())
+    }
+
+    /// A source volume's file read into `dst`.
+    fn read_volume(
+        &self,
+        files: &Files,
+        url: &str,
+        path: &str,
+        offset: u64,
+        dst: Buffer,
+    ) -> Completion<Buffer> {
+        let file = match files.file(path) {
+            Ok(Some(file)) => file,
+            Ok(None) => return self.resolved(Err(io("read_object", url, "no such file"))),
+            Err(why) => return self.resolved(Err(io("read_object", url, why))),
+        };
+        let Some(addr) = dst.host_ptr() else {
+            return self.resolved(Err(io(
+                "read_object",
+                url,
+                "a volume reads into host memory only",
+            )));
+        };
+        let len = dst.len() as u64;
+        let (tx, rx) = Completion::channel_on(self.dispatch.clone());
+        let target = url.to_string();
+        files.read(
+            &file,
+            offset,
+            addr as u64,
+            len,
+            Box::new(move |r| {
+                tx.resolve(
+                    r.map(|()| dst)
+                        .map_err(|why| io("read_object", &target, why)),
+                );
+            }),
+        );
+        rx
     }
 
     /// The run's output layer, when it has an output disk.
@@ -147,7 +248,17 @@ impl Reactor for DiskReactor {
 
     fn read_object(&self, url: &str, offset: u64, dst: Buffer) -> Completion<Buffer> {
         let Some(disk) = self.disk(url) else {
-            return self.inner.read_object(url, offset, dst);
+            return match self.mounted(url) {
+                Some((Mounted::Source(files), _, path)) => {
+                    self.read_volume(files, url, path, offset, dst)
+                }
+                Some((Mounted::Sink(_), serial, _)) => self.resolved(Err(io(
+                    "read_object",
+                    url,
+                    format!("volume {serial} is a sink's, which the run writes and does not read"),
+                ))),
+                None => self.inner.read_object(url, offset, dst),
+            };
         };
         let len = dst.len() as u64;
         if offset
@@ -196,16 +307,23 @@ impl Reactor for DiskReactor {
                 self.dispatch.clone(),
             );
         }
-        if let Some(path) = DiskReactor::output_path(url) {
-            return match &self.output {
-                Some(output) => output.put(path, src),
-                None => Completion::resolved_on(
-                    Err(io("write_object", url, "the run has no output disk")),
-                    self.dispatch.clone(),
-                ),
-            };
+        if let Some(path) = DiskReactor::output_path(url)
+            && let Some(output) = &self.output
+        {
+            return output.put(path, src);
         }
-        self.inner.write_object(url, src)
+        match self.mounted(url) {
+            Some((Mounted::Sink(layer), _, path)) => layer.put(path, src),
+            Some((Mounted::Source(_), serial, _)) => self.resolved(Err(io(
+                "write_object",
+                url,
+                format!("volume {serial} is a source's, which is read only"),
+            ))),
+            None if DiskReactor::output_path(url).is_some() => {
+                self.resolved(Err(io("write_object", url, "the run has no output disk")))
+            }
+            None => self.inner.write_object(url, src),
+        }
     }
 
     fn copy(&self, src: CopySrc, dst: CopyDst) -> Completion<Option<Buffer>> {
@@ -226,6 +344,20 @@ impl Reactor for DiskReactor {
                 Err(io("delete_object", url, "an input disk is read only")),
                 self.dispatch.clone(),
             );
+        }
+        if let Some((mounted, serial, path)) = self.mounted(url)
+            && (self.output.is_none() || DiskReactor::output_path(url).is_none())
+        {
+            let result = match mounted {
+                Mounted::Sink(layer) if layer.remove(path) => Ok(()),
+                Mounted::Sink(_) => Err(io("delete_object", url, "no such file in the layer")),
+                Mounted::Source(_) => Err(io(
+                    "delete_object",
+                    url,
+                    format!("volume {serial} is a source's, which is read only"),
+                )),
+            };
+            return self.resolved(result);
         }
         if let Some(path) = DiskReactor::output_path(url) {
             // A file taken out of the layer; its pages stay on the disk, unnamed.
@@ -263,6 +395,24 @@ impl ObjectMetadata for DiskReactor {
                 self.dispatch.clone(),
             );
         }
+        if let Some((mounted, serial, path)) = self.mounted(url) {
+            let found = match mounted {
+                Mounted::Source(files) => files.file(path),
+                Mounted::Sink(_) => Err(format!(
+                    "volume {serial} is a sink's, which the run writes and does not read"
+                )),
+            };
+            return self.resolved(match found {
+                Ok(Some(file)) => Ok(ObjectMeta {
+                    url: url.to_string(),
+                    size: file.size,
+                    last_modified_ns: None,
+                    e_tag: None,
+                }),
+                Ok(None) => Err(io("head_object", url, "no such file")),
+                Err(why) => Err(io("head_object", url, why)),
+            });
+        }
         match &self.metadata {
             Some(m) => m.head_object(url),
             None => Completion::resolved_on(
@@ -273,6 +423,29 @@ impl ObjectMetadata for DiskReactor {
     }
 
     fn list_prefix(&self, url: &str) -> Completion<Vec<ObjectMeta>> {
+        if let Some((mounted, serial, path)) = self.mounted(url) {
+            let listed = match mounted {
+                Mounted::Source(files) => files.list(path),
+                Mounted::Sink(_) => Err(format!(
+                    "volume {serial} is a sink's, which the run writes and does not read"
+                )),
+            };
+            return self.resolved(
+                listed
+                    .map(|files| {
+                        files
+                            .into_iter()
+                            .map(|(path, size)| ObjectMeta {
+                                url: format!("{}{serial}/{path}", volume::SCHEME),
+                                size,
+                                last_modified_ns: None,
+                                e_tag: None,
+                            })
+                            .collect()
+                    })
+                    .map_err(|why| io("list_prefix", url, why)),
+            );
+        }
         if url.starts_with(devices::SCHEME) {
             // A disk holds one file; a prefix of the scheme lists the disks it names.
             let found = self

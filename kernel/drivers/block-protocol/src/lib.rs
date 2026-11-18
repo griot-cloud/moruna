@@ -6,6 +6,14 @@
 //! pins once and keeps pinned until `unregister` or the connection ends, and then
 //! move sectors to and from any of its pages (`read_at`, `write_at`) with no pin per
 //! request: the image filesystem's page cache works so (SDD 27, f.5).
+//!
+//! Minor 2 places a transfer at any byte of a registration (`read_to`, `write_from`), so a
+//! client reading a byte range of the disk into memory it did not choose lands the whole
+//! sectors in place, and only the sectors at the range's edges pass through a buffer of its
+//! own (`architecture/moruna-os-system.md` 3C, item 3.3). A driver whose device cannot place
+//! data at that byte answers `BadBuffer`, and the client moves that one transfer another way.
+//! The suite checks them only on a driver that announces minor 2 at its welcome, and that the
+//! rest answer them `UnknownMethod`.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -58,7 +66,7 @@ moruna_svc::protocol! {
     pub protocol block {
         name = "moruna.driver.block";
         major = 2;
-        minor = 0;
+        minor = 2;
         requests {
             /// The device's sector size, capacity and largest transfer.
             1 => fn info() -> Info;
@@ -85,6 +93,12 @@ moruna_svc::protocol! {
             9 => fn acquire_write() -> u64;
             /// Close admission and release only after original writes and final flush.
             10 => fn release_write(lease:u64) -> ();
+            /// Reads `count` sectors from `sector` into registered buffer `id`, the first
+            /// byte at its byte `offset`, which need not start a page or a sector.
+            11 since 2 => fn read_to(id: u32, offset: u64, sector: u64, count: u32) -> ();
+            /// Writes `count` sectors at `sector` from registered buffer `id`, from its byte
+            /// `offset`.
+            12 since 2 => fn write_from(lease: u64, id: u32, offset: u64, sector: u64, count: u32) -> ();
         }
         events {}
         errors {
@@ -93,7 +107,8 @@ moruna_svc::protocol! {
             /// A count of zero, or above `max_sectors`.
             2 => BadCount;
             /// The buffer is not a DMA memory object, is smaller than the transfer, or
-            /// lacks a right the transfer needs.
+            /// lacks a right the transfer needs; or (minor 2) the driver cannot place the
+            /// transfer at the byte asked for.
             3 => BadBuffer;
             /// A write to a read-only device.
             4 => ReadOnly;

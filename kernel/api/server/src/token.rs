@@ -89,6 +89,25 @@ pub(crate) fn base64(text: &[u8]) -> Option<Vec<u8>> {
     decode(&text[..text.len() - padding], false)
 }
 
+/// `bytes` in standard base64 with its padding, as the host protocol carries bytes.
+pub(crate) fn to_base64(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let mut word = [0u8; 3];
+        word[..chunk.len()].copy_from_slice(chunk);
+        let bits = u32::from_be_bytes([0, word[0], word[1], word[2]]);
+        for index in 0..4 {
+            if index <= chunk.len() {
+                out.push(char::from(DIGITS[(bits >> (18 - 6 * index)) as usize & 63]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 /// `text` decoded from base64 digits without padding.
 fn decode(text: &[u8], url: bool) -> Option<Vec<u8>> {
     if text.len() % 4 == 1 {
