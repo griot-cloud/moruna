@@ -506,7 +506,11 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
   event records, `report` and `exit`.
 - **The budget** is the job document's `budget.memory_bytes`, at most the node's memory less 768 MiB:
   512 MiB kept for the node's services and 256 MiB for a check running beside a job. A larger one
-  is refused.
+  is refused. Jobs and checks are carved from `node-admission`'s account, which node config sizes
+  at the job bound plus the check account plus its own overhead. A job's budget splits 3/4 arena
+  and 1/4 in-memory scratch unless its document names a staging volume (or the standalone node's
+  split, where one exists); a check gets 256 MiB and no scratch. The engine receives its channel
+  as it is (`grant <slot> channel <from>`, only with `runs 1`).
 - **Validation is the engine's.** `api` does not link `moruna-job`, which needs std. A document is
   checked by the engine itself:
   - `validate`: `node-admission` runs the engine's `check` on the document in a short-lived
@@ -557,6 +561,10 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
   below the engine: a source's connection gets no write lease. (Changed 2026-11-17 night from
   stream D's engine-driven virtio-blk, because Azure's disks are storvsc's and two paths are one too
   many; 3.3 measures the driver path against the direct one, and a loss is fixed in the protocol.)
+- **The engine's slots:** `volume.<n>` (a driver connection each) and a data slot `volumes`, one line
+  per volume, `<n> <serial> source|sink`. Admission holds the writer lease on every source volume
+  for the job's length, so the engine can read it and never write it. File bytes are as trusted as
+  an object store's; the layer's index is checked.
 - Every driver registers its disks in `devices`' directory with serial, size and read-only flag.
   The engine's check answers the job's `needs.volumes` (`[{"serial", "write"}]`); api passes them to
   `node-admission`'s `launch`, which grants exactly those connections. An unknown serial or the boot
@@ -601,8 +609,11 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
     `function_keys` (added to 1D's schema, 0 to 8 keys).
   - The node checks the signature and stores the entry. `GET /v1/functions` (observe) lists them.
     Nothing is fetched at registration.
-- **At job start,** `node-admission` has the engine fetch each function the job names, through its
-  job network (3D). The node refuses the job if a SHA-256 differs. Images are cached in memory, up
+- **At job start,** `node-admission` fetches each function the job names: it mints itself a channel
+  limited to the address's host on 443, fetches over HTTPS with the network server's TLS, checks the
+  SHA-256, and hands the engine the image as a read-only memory object, with no copy. The node
+  refuses the job if a SHA-256 differs. `address` is `https://` only (a pre-signed or SAS URL for a
+  private store); admission holds no store credentials. Images are cached in memory, up
   to node config's `functions.cache_bytes` (default 1 GiB, at most half the node's memory), until the node stops.
 - **A job names a function** by its registered name, as a function task's `"function": "<name>"`;
   the check's `needs.functions` lists them. An unregistered name is refused at `validate`.
