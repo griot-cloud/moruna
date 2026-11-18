@@ -456,17 +456,21 @@ link supervisor.rings rings.supervisor
 # RingPlane runs them as tasks over the plane, with batches of one Int64 column of known values,
 # and judges every row: c-double's twice its input's; c-runtime's a copy made on a thread of its
 # own (pthread_create, malloc, a thread_local), with its fprintf lines in the task's log; and
-# c-sum's -1 first and its total after the input's end. The supervisor gives it a process
-# resource.
+# c-sum's -1 first and its total after the input's end. Item 5.5: c-params, given
+# {"threshold":0.5} in its start slot env as the engine's stage gives a native function its
+# environment, writes 0.5 back as its record (moruna_params and getenv alike). The supervisor
+# gives it a process resource.
 process functions
   handle console console
   handle program:c-double double-image
   handle program:c-runtime runtime-image
   handle program:c-sum sum-image
+  handle program:c-params params-image
   handle data:plane/mib.fixture mib
   expect FN c-double: ok:
   expect FN c-runtime: ok:
   expect FN c-sum: ok:
+  expect FN c-params: ok:
   expect FN functions: ok:
   exits 0
 link supervisor.functions functions.supervisor

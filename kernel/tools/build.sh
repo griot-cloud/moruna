@@ -119,12 +119,13 @@ CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$kernel/target}" \
 cp "${CARGO_TARGET_DIR:-$kernel/target}/x86_64-moruna/release/std-arrow" "$bin/std-arrow"
 # Item 5.2b: the C SDK on the core, by kernel/function/c/build-core.sh with the user target's
 # clang (relibc's headers are committed, kernel/vendor/relibc/include-generated): the C
-# functions double, runtime and sum, which the boot's `functions` test runs as tasks, and
+# functions double, runtime, sum and params (item 5.5), which the boot's `functions` test runs
+# as tasks, and
 # threads, a program of its own, each linked static on relibc and std and stripped. Their debug
 # info stays in TARGET/core/debug.
 CC="$user_cc" CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$kernel/target}" \
   "$kernel/function/c/build-core.sh"
-for name in double runtime sum threads; do
+for name in double runtime sum params threads; do
   cp "${CARGO_TARGET_DIR:-$kernel/target}/core/bin/$name" "$bin/c-$name"
 done
 # And relibc's own C tests, one process of the boot (libc-tests).

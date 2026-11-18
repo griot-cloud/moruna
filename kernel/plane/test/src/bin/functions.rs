@@ -8,9 +8,14 @@
 //!   malloc, a thread_local) and written back, each row its input's, with a line of standard
 //!   error (fprintf) for each batch in its log;
 //! - `c-sum` (the aggregate test): a record of -1 before the first batch is taken, then the
-//!   column's total, which comes after the engine ends its input.
+//!   column's total, which comes after the engine ends its input;
+//! - `c-params` (tests/c/params.c, item 5.5): given `{"threshold":0.5}` as `MORUNA_PARAMS` in
+//!   its start slot `env`, as the engine's stage gives a native function its environment, it
+//!   writes 0.5 back as its one record, read through `moruna_params()` and `getenv` alike, and
+//!   says its four variables in its log.
 //!
-//! Each task says exit code 0 on its rings and ends.
+//! Each task is given its environment as the engine gives one (`moruna_sys::env`), says exit
+//! code 0 on its rings and ends.
 
 #![no_std]
 #![no_main]
@@ -49,6 +54,17 @@ const CHUNK: usize = 8192;
 const LOG_BYTES: u64 = 64 << 10;
 /// What `c-runtime` says on standard error for each batch.
 const COPIED: &str = "copied 131072 rows on a thread of its own";
+/// What `c-params` is given: the four variables every function's process has (item 5.5), as
+/// the engine's stage gives a native function them, its entry its name.
+const PARAMS_ENV: [&str; 4] = [
+    "MORUNA_ARGS={}",
+    "MORUNA_ENTRY=c-params",
+    "MORUNA_PARAMS={\"threshold\":0.5}",
+    "MORUNA_ROLE=function",
+];
+/// The line `c-params` says of them in its log.
+const PARAMS_SAID: &str =
+    "params: entry c-params, role function, params {\"threshold\":0.5}, args {}";
 
 type Plane = RingPlane<Kernel>;
 
@@ -171,8 +187,9 @@ struct Run {
 }
 
 impl Run {
-    /// Starts `image` as task `name` on a ring of its own, with its log ring.
-    fn start(&mut self, name: &'static str, image: &Handle) -> Result<Task, String> {
+    /// Starts `image` as task `name` on a ring of its own, with its log ring and `env` as its
+    /// environment.
+    fn start(&mut self, name: &'static str, image: &Handle, env: &[&str]) -> Result<Task, String> {
         let account = Account::carve(TASK_LIMIT, name).map_err(kernel_error("account_create"))?;
         let process = Process::create_in(&self.resource, name, &account.0)
             .map_err(kernel_error("process_create"))?;
@@ -196,8 +213,12 @@ impl Run {
             .0
             .duplicate(Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER)
             .map_err(kernel_error("handle_duplicate"))?;
+        let env = moruna_sys::env::give(env).map_err(kernel_error("its environment"))?;
         process
-            .start_with(entry, &mut [(Some(given), "log")])
+            .start_with(
+                entry,
+                &mut [(Some(given), "log"), (Some(env), moruna_sys::env::SLOT)],
+            )
             .map_err(kernel_error("process_start"))?;
         Ok(Task {
             id,
@@ -481,6 +502,39 @@ fn sum(r: &mut Run, t: &mut Task) -> Result<(), String> {
     Ok(())
 }
 
+fn params(r: &mut Run, t: &mut Task) -> Result<(), String> {
+    r.post(t, 0)?;
+    r.until(t, "the batch's release", |t| t.released > 0)?;
+    r.finish(t)?;
+    let records = core::mem::take(&mut t.puts);
+    let mut got = Vec::new();
+    for record in &records {
+        let values = r.values(*record)?;
+        got.push(
+            values
+                .iter()
+                .map(|v| f64::from_bits(*v as u64))
+                .collect::<Vec<f64>>(),
+        );
+        r.plane.drop_batch(*record).map_err(plane_error)?;
+    }
+    if got != [vec![0.5]] {
+        return Err(format!(
+            "its records held {got:?}, not one of the one value 0.5"
+        ));
+    }
+    let lines = log_lines(&t.log)?;
+    if !lines.iter().any(|(_, _, text)| text == PARAMS_SAID) {
+        return Err(format!("its log has no line {PARAMS_SAID:?}: {lines:?}"));
+    }
+    println!(
+        r.out,
+        "FN c-params: ok: given {} in its start slot env, it read the threshold through moruna_params and getenv alike and wrote 0.5 back as its record, its four variables in its log, exit code 0 on its rings",
+        PARAMS_ENV[2]
+    );
+    Ok(())
+}
+
 fn run() -> i64 {
     let Some(out) = start::take("console").map(Console) else {
         return 90;
@@ -509,17 +563,18 @@ fn run() -> i64 {
         layout,
     };
     type Test = fn(&mut Run, &mut Task) -> Result<(), String>;
-    let tests: [(&'static str, &str, Test); 3] = [
-        ("c-double", "double-image", double),
-        ("c-runtime", "runtime-image", runtime),
-        ("c-sum", "sum-image", sum),
+    let tests: [(&'static str, &str, &[&str], Test); 4] = [
+        ("c-double", "double-image", &[], double),
+        ("c-runtime", "runtime-image", &[], runtime),
+        ("c-sum", "sum-image", &[], sum),
+        ("c-params", "params-image", &PARAMS_ENV, params),
     ];
-    for (name, image, test) in tests {
+    for (name, image, env, test) in tests {
         let Some(image) = start::take(image) else {
             println!(r.out, "FN {}: FAIL: no image", name);
             return 90;
         };
-        let mut t = match r.start(name, &image) {
+        let mut t = match r.start(name, &image, env) {
             Ok(t) => t,
             Err(why) => {
                 println!(r.out, "FN {}: FAIL: starting it: {}", name, why);
@@ -533,7 +588,7 @@ fn run() -> i64 {
     }
     println!(
         r.out,
-        "FN functions: ok: three C functions on relibc and std, each one static program"
+        "FN functions: ok: four C functions on relibc and std, each one static program"
     );
     0
 }

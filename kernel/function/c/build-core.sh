@@ -14,6 +14,7 @@
 #   bin/double                examples/double.c
 #   bin/sum                   the aggregate test (tests/c/scenarios.c, moruna_test_sum)
 #   bin/runtime               tests/c/runtime.c: malloc, pthread_create, a thread_local, stderr
+#   bin/params                tests/c/params.c: its params, moruna_params and getenv (item 5.5)
 #   bin/threads               tests/threads.rs: std's thread-locals on the C library's threads
 #                             and the C library's on std's
 #   bin/libc-tests            relibc's own C tests that need only what Moruna has (step 5)
@@ -146,8 +147,9 @@ strip_program() {
 link double "$(compile examples/double.c)"
 link sum "$(compile tests/c/sum.c)" "$(compile tests/c/scenarios.c)" "$(compile tests/c/support.c)"
 link runtime "$(compile tests/c/runtime.c)"
+link params "$(compile tests/c/params.c)" "$(compile tests/c/support.c)"
 cp "$threads" "$out/obj/threads"
-for name in double sum runtime threads; do
+for name in double sum runtime params threads; do
   strip_program "$name"
 done
 
