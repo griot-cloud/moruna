@@ -102,10 +102,12 @@ RUSTFLAGS="$flags$usage_flags -Zunstable-options -C link-arg=-T$kernel/sys/user.
   -Zunstable-options -Zjson-target-spec "${build_std[@]}" --workspace \
   --features "$user_features" \
   --exclude moruna-microkernel --exclude moruna-microkernel-boot --exclude moruna-image --exclude moruna-node-image \
-  --exclude relibc-moruna
+  --exclude relibc-moruna --exclude moruna-net-session
 set +x
 # relibc-moruna runs on std's own moruna-sys, so it builds only in the C library's crate graph
 # with std (build-core.sh, below), never in this one of core and alloc.
+# moruna-net-session is a std library too: only moruna-storage's native connector, in the root
+# workspace's engine build, uses it.
 
 bin="${CARGO_TARGET_DIR:-$kernel/target}/$user_target_name/release"
 kernel_bin="${CARGO_TARGET_DIR:-$kernel/target}/$target/release"
