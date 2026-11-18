@@ -4,7 +4,9 @@ How to put the node on Servercore: upload its image, make a private network with
 external network, create one server on it, from the image or from a volume made from the image,
 with node config as user-data and a security group for port 443 only, give it a floating IP, read
 its console, check it, and delete everything (system design `architecture/moruna-os-system.md`,
-section 1E; work items 1.5 and 1.5b). It is written for Servercore, cloud `servercore` in
+section 1E; work items 1.5 and 1.5b). The check ends with the API's proof from outside the cloud
+(section 2, work item 2.6), and a run may also run the NYC taxi proof on the node (section 3,
+work item 3.8b). It is written for Servercore, cloud `servercore` in
 `~/.config/openstack/clouds.yaml`.
 
 - **Corrected 2026-11-18 (work item 1.5b) from item 1.6's runs on Servercore `ru-3`** (the PM's
@@ -57,6 +59,28 @@ section 1E; work items 1.5 and 1.5b). It is written for Servercore, cloud `serve
     --region <REGION> --boot volume --zone <ZONE> --name <NAME> 2>&1 | tee <RUN>.log
   ```
 
+- **Every run ends with the API's checks** from outside the cloud (work item 2.6; step 10), and
+  fails if any of them fails.
+- **With `--proof`** (work item 3.8b), the run also runs the proof on the node: the four NYC taxi
+  jobs through its API, on a month and on the year, from and to Azure Blob over the internet
+  (step 10). It boots from the image only, on the proof's flavor (step 6a), and needs the data in
+  Blob first, made by `kernel/node/tools/nyc-blob.sh` (below, "The proof's data in Azure Blob").
+  The three commands, in order: the data, the run, and the data deleted once the run is done:
+
+  ```
+  kernel/node/tools/nyc-blob.sh --run <BLOB_RUN> --tasks <TASKS> 2>&1 | tee <BLOB_RUN>.log
+  ```
+
+  ```
+  kernel/node/tools/openstack-up.sh --qcow2 <OUT>/moruna-node.qcow2 --run <RUN> \
+    --region <REGION> --boot image --name <NAME> --proof --blob <BLOB_RUN>/blob \
+    --tasks <TASKS> --nyc <NYC> --gate-canon <GATE_CANON> 2>&1 | tee <RUN>.log
+  ```
+
+  ```
+  kernel/node/tools/nyc-blob.sh --delete --run <BLOB_RUN> 2>&1 | tee -a <BLOB_RUN>.log
+  ```
+
 ## The values the operator fills in
 
 Each is written `<LIKE_THIS>` below. Replace every one before running a command. Nothing else in
@@ -69,6 +93,12 @@ a command changes.
 | `<OUT>` | The directory `package.py` wrote, holding `moruna-node.qcow2` | The build, below |
 | `<RUN>` | A new directory for this run's files: node config, the IDs, the console log and its errors, the times. Outside the repository, since a private key is kept there | The operator chooses it. Step 1 makes it |
 | `<NAME>` | One name for everything the run makes, its image, security group, network, subnet, router, volume and server: `moruna-node-` and then lowercase letters, digits and inner dashes, for example `moruna-node-202611181530` | The operator chooses it. The project has nothing of that name yet (step 2) |
+| `<REPO>` | The repository's root, whose `kernel/node/tools/api-checks.py` and, with `--proof`, `bench/node/proof.py` run | The checkout `openstack-up.sh` is in; it names its own |
+| `<BLOB_RUN>` | With `--proof`: `nyc-blob.sh`'s run directory, whose `blob` file (mode 600) names the storage account and its two containers and holds their SASes | The operator chooses it, new, outside the repository; `nyc-blob.sh` makes it |
+| `<ACCOUNT>` | With `--proof`: the storage account `nyc-blob.sh` made, `mrnnyc` and its group's stamp | The `account=` line of `<BLOB_RUN>/blob`; `openstack-up.sh` reads it there |
+| `<TASKS>` | With `--proof`: the gate tasks built for the core (`images/gate/tasks/build.sh`'s `core/bin`), `gate-score`, `gate-occupancy`, `gate-enrich` and `gate-audit`: the ones `nyc-blob.sh` uploaded | The gate's build |
+| `<NYC>` | With `--proof`: the directory of 0.6.6's references, `reference-JOB-PERIOD.json` | `~/moruna-data/nyc` on the project's Mac |
+| `<GATE_CANON>` | With `--proof`: `gate-canon` built for the operator's machine, which checks the year's outputs | `images/gate`'s build |
 
 The server's floating IP and its ID are read from Servercore into `<RUN>`, and the commands read
 them from there.
@@ -87,7 +117,48 @@ them from there.
   (`kernel/node/supervisor/src/main.rs`, `Config::parse`). The file's size and SHA-256 are in
   `<OUT>/inputs-and-artifacts.json`, under its path.
 - **Quota** for one server of 1 vCPU and 2 GiB, one network with its subnet, one router, one
-  floating IP and, for step 6b, one 2 GB volume.
+  floating IP and, for step 6b, one 2 GB volume. With `--proof`, the server has 4 vCPUs and
+  16 GiB.
+- **Python 3**, for the API's checks (standard library only) and, with `--proof`, `proof.py`,
+  which also reads Parquet with pyarrow where it has it (`bench/node/proof.py`).
+- **The image serves the proof's flavor as it is:** the `--node-memory` the image was built with is
+  the build's check of the profile's accounts; at boot the node takes the machine's memory, and
+  carves its job bound from it (system design 3A).
+
+## The proof's data in Azure Blob
+
+With `--proof`, the node reads the twelve normalised months of 2024 from Azure Blob and writes its
+outputs there, over the internet through the network server's own client (`moruna-net`, system
+design 3D), and fetches the four gate tasks from Blob by their addresses (3E).
+`kernel/node/tools/nyc-blob.sh` makes them, in subscription `griot-dev`, Central India, in a
+resource group of its own, `moruna-nyc-<yyyymmddHHMM>`, which must be new:
+
+- a storage account, `mrnnyc` and the group's stamp, with two private containers: `data`, which
+  takes the months under `nyc/` and the outputs under `proof/<stamp>/`, and `functions`, which
+  takes the four tasks of `<TASKS>` (about 6 MB, uploaded from the Mac);
+- the months are made inside Azure, with no upload from the Mac (about 0.3 MB/s): one
+  Standard_D2s_v4 in zone 3, Ubuntu 24.04, with no inbound rule at all, runs 6.2b's
+  `bench/node/engines/data-linux.sh` and `dataprep.py` once, through one managed run command
+  whose one protected parameter is the account key (`kernel/node/tools/nyc-data.sh` carries
+  the code). They fetch each month from NYC TLC's public address, normalise it, check it against
+  `bench/node/plans/nyc-2024.json`'s SHA-256, and upload it. Once their `DATA` line says ok and
+  the container holds the twelve, the machine is deleted with all that was made for it;
+- two container SASes, made on the Mac from the key, https only, expiring in 6 hours: `data`'s
+  reads, adds, creates, writes and lists (`racwl`), and `functions`' reads (`r`), so no function's
+  address carries a write SAS. Both are written, never shown, to `<BLOB_RUN>/blob`, mode 600,
+  with the account and the two containers' names. The key stays in `<BLOB_RUN>/account.key`,
+  mode 600; the node and `proof.py` are given the SASes alone, `proof.py` in its environment.
+
+A run that fails part-way deletes the group. One that succeeds leaves the storage account alone in
+it until `nyc-blob.sh --delete --run <BLOB_RUN>`, which deletes the group `<BLOB_RUN>/group`
+names and shows it gone. `--dry-run` prints every command and runs none.
+
+**Written 2026-11-18 and not run against Azure.** Every `az` option it uses was checked without a
+cloud: each appears in the help of its command in Azure CLI 2.92.0, the version on the project's
+Mac, with no command sent to Azure; its tests (`kernel/node/tools/test_nyc_blob.py`) run it against
+a stand-in for `az`. The run command's shape (version 2, the key a protected parameter read from
+its file) is the one `bench/node/run.py` used on a real machine (6.2b). What Azure answers is the
+PM's run to find.
 
 ## 1. Node config
 
@@ -121,6 +192,24 @@ printf '{"moruna":1,"api":{"token_keys":["%s"]}}\n' "$(cat <RUN>/token-key.pub)"
 It carries no secret. A token key is a public key, and with no `tls` the node makes its own key
 and certificate at boot (1D). Anyone who can read the server's instance data learns nothing
 that lets them call the node.
+
+**With `--proof`,** a function key pair too, made as the token key is: node config's one function
+key (3E), whose private half signs the gate tasks `proof.py` registers. Node config then holds
+both public keys, in place of the one above:
+
+```
+openssl genpkey -algorithm ed25519 -out <RUN>/function-key.pem
+```
+
+```
+openssl pkey -in <RUN>/function-key.pem -pubout -outform DER | tail -c 32 | base64 \
+  > <RUN>/function-key.pub
+```
+
+```
+printf '{"moruna":1,"api":{"token_keys":["%s"]},"functions":{"keys":["%s"]}}\n' \
+  "$(cat <RUN>/token-key.pub)" "$(cat <RUN>/function-key.pub)" > <RUN>/node-config.json
+```
 
 ## 2. The name is new
 
@@ -287,6 +376,18 @@ Either path creates the server the same way otherwise:
 perl -e 'alarm shift; exec @ARGV; exit 127' 120 openstack --os-cloud servercore \
   --os-region-name <REGION> server create --image "$(cat <RUN>/image.id)" \
   --flavor BL1.1-2048-16 --network "$(cat <RUN>/network.id)" \
+  --security-group "$(cat <RUN>/group.id)" --user-data <RUN>/node-config.json \
+  -f value -c id <NAME> > <RUN>/server.id && date -u +%s > <RUN>/created.at
+```
+
+**With `--proof`,** on `SL1.4-16384-128` in its place: 4 vCPUs and 16 GiB, as Azure's
+Standard_D4s_v4 where the proof's Azure half ran, with a 128 GB disk of its own, so the proof
+boots from the image only:
+
+```
+perl -e 'alarm shift; exec @ARGV; exit 127' 120 openstack --os-cloud servercore \
+  --os-region-name <REGION> server create --image "$(cat <RUN>/image.id)" \
+  --flavor SL1.4-16384-128 --network "$(cat <RUN>/network.id)" \
   --security-group "$(cat <RUN>/group.id)" --user-data <RUN>/node-config.json \
   -f value -c id <NAME> > <RUN>/server.id && date -u +%s > <RUN>/created.at
 ```
@@ -468,6 +569,88 @@ The server runs, with nobody having logged in:
   --os-region-name <REGION> server show "$(cat <RUN>/server.id)" -f value -c status)" = ACTIVE ]
 ```
 
+The certificate's fingerprint the console printed, `moruna: tls sha256=<fingerprint>` (2B), and
+the instance ID: every call to the API from here on is pinned to the one, and its tokens name the
+other as their `aud` (2C):
+
+```
+tr -d '\r' < <RUN>/console.log | grep -a -o 'moruna: tls sha256=[0-9a-f]*' | head -1 \
+  | cut -d= -f2 > <RUN>/console.pin && [ -s <RUN>/console.pin ]
+```
+
+```
+tr -d '\r' < <RUN>/console.log | grep -a -o 'moruna: cloud openstack instance [^ ]*' \
+  | head -1 | cut -d' ' -f5 > <RUN>/instance && [ -s <RUN>/instance ]
+```
+
+### With `--proof`: the proof
+
+The four NYC taxi jobs through the API, Score, Occupancy, Enrich and Audit, on January 2024 and
+then on all of 2024, one at a time (work items 3.8 and 3.8b; `bench/node/proof.py`). `proof.py`:
+
+- registers each gate task at `https://<ACCOUNT>.blob.core.windows.net/functions/gate-JOB?<SAS>`,
+  `functions`' read-only SAS, signed with the run's function key (3E);
+- makes its own tokens for each scope with the run's token key, for the instance above, and pins
+  the certificate the console printed;
+- runs each job from and to Blob: its inputs `az://data/nyc/…`, its output under
+  `az://data/proof/<stamp>/…`. `data`'s SAS reaches the node by secret name, as 3B says a
+  credential does: the document names `{"secret": "blob-sas"}` in `object_store.azure.sas_token`,
+  and the job's body carries `"secrets": {"blob-sas": <SAS>}` beside it, which `api` passes to the
+  engine outside the document and redacts everywhere. The node reaches Central India from
+  Servercore over the internet;
+- follows each job's events to its report, reads its output back from Blob with the same SAS
+  (List Blobs and Get Blob), and checks its rows and canonical hashes against 0.6.6's references
+  in `<NYC>`, with `<GATE_CANON>` for the year;
+- writes each run's record and the summary, `proof.json`, to `<RUN>/proof`, and prints a table.
+  It exits 0 only when all eight runs pass.
+
+Both SASes reach it in the environment, read from `<BLOB_RUN>/blob`, never on a command line, and
+it never prints or writes either: an address it shows, and a node's message that quotes one,
+name them `<FUNCTIONS_SAS>` and `<BENCH_SAS>`. A proof that fails fails the run, after the API's
+checks below:
+
+```
+BENCH_SAS="$(sed -n 's/^data_sas=//p' <BLOB_RUN>/blob)" \
+  FUNCTIONS_SAS="$(sed -n 's/^functions_sas=//p' <BLOB_RUN>/blob)" \
+  MORUNA_BENCH_OPENSSL=openssl python3 -I <REPO>/bench/node/proof.py \
+  --url "https://$(cat <RUN>/address):443" --pin "$(cat <RUN>/console.pin)" \
+  --token-key <RUN>/token-key.pem --instance "$(cat <RUN>/instance)" \
+  --function-key <RUN>/function-key.pem --functions <TASKS> \
+  --function-base https://<ACCOUNT>.blob.core.windows.net/functions --data blob \
+  --blob-account <ACCOUNT> --blob-container data --periods 2024-01,2024 --references <NYC> \
+  --gate-canon <GATE_CANON> --results <RUN>/proof --work <RUN>/proof-work
+```
+
+A month's run may take at most an hour and the year's six (`proof.py`'s `--timeout-s` and
+`--year-timeout-s`); one past its time is cancelled and fails. The SASes last 6 hours from
+`nyc-blob.sh`'s end (`<BLOB_RUN>/blob`'s `expires`), so start the run well inside them.
+
+### The API's checks
+
+Last, on every run, after the proof when there is one, whether or not it passed: the API's proof
+from outside the cloud (work item 2.6, `kernel/node/tools/api-checks.py`). Every connection is
+pinned to `<RUN>/console.pin` before anything is sent. It checks, in order:
+
+- `GET /v1/health` with no token answers `{"status":"ok"}`;
+- `GET /v1/node` with an `observe` token of the run's key answers the node document, its `cloud`
+  `openstack` and its `instance` the console's;
+- over MCP (`POST /mcp`, the same token): `initialize` answers as server `moruna`; `tools/list`
+  names `moruna_health`, `moruna_node` and `moruna_node_audit`; `tools/call` of `moruna_node`
+  answers the same node document;
+- a token signed by another key, made for the check and thrown away, and one of the run's key
+  for another instance are each refused with `401 unauthorized`, on `/v1/node` and on `/mcp`.
+
+Its results are kept in `<RUN>/api-checks.json`, its tokens nowhere. The rest of 2.6, `api` killed
+and the node still answering, cannot be done on a cloud node, which has no way in but its API;
+item 2.2c's booted test covers it.
+
+```
+python3 -I <REPO>/kernel/node/tools/api-checks.py --url "https://$(cat <RUN>/address):443" \
+  --pin "$(cat <RUN>/console.pin)" --token-key <RUN>/token-key.pem \
+  --instance "$(cat <RUN>/instance)" --openssl openssl --results <RUN>/api-checks.json \
+  --cloud openstack
+```
+
 ## 11. Delete everything
 
 In the reverse of the order things were made: the floating IP, the server, the volume once the
@@ -569,5 +752,7 @@ ids="$(perl -e 'alarm shift; exec @ARGV; exit 127' 120 openstack --os-cloud serv
   && ! printf '%s\n' "$ids" | grep -q -x -e "$(cat <RUN>/fip.id)"
 ```
 
-Keep `<RUN>` with the report: it holds the console log, its errors and the two times. Its
-`token-key.pem` is the run's private key, and is never committed.
+Keep `<RUN>` with the report: it holds the console log, its errors and the two times, and the API's
+checks' results. Its `token-key.pem` is the run's private key, and is never committed. With
+`--proof` it also holds the proof's results, `<RUN>/proof`, and `function-key.pem`, a private key
+too, never committed. The proof's data stays in Blob until `nyc-blob.sh --delete`.

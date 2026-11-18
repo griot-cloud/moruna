@@ -74,12 +74,13 @@ printf '%s.%s' "$(cat RUNDIR/token.header)" "$(cat RUNDIR/token.claims)" > RUNDI
 openssl pkeyutl -sign -inkey RUNDIR/token-key.pem -rawin -in RUNDIR/token.signed | openssl base64 -A | tr '/+' '_-' | tr -d '=' > RUNDIR/token.signature
 printf '%s.%s\\n' "$(cat RUNDIR/token.signed)" "$(cat RUNDIR/token.signature)" > RUNDIR/token
 curl -sS -k --max-time 10 -H "Authorization: Bearer $(cat RUNDIR/token)" "https://$(cat RUNDIR/address)/v1/node" > RUNDIR/node.json && grep -q '"cloud":"azure"' RUNDIR/node.json && cat RUNDIR/node.json
+python3 -I REPO/kernel/node/tools/api-checks.py --url "https://$(cat RUNDIR/address):443" --pin "$(cat RUNDIR/console.pin)" --token-key RUNDIR/token-key.pem --instance "$(cat RUNDIR/instance)" --openssl openssl --results RUNDIR/api-checks.json --cloud azure
 az vm boot-diagnostics get-boot-log -n moruna-node -g moruna-node-name --subscription griot-dev > RUNDIR/console.log
 az group delete -n moruna-node-name --yes --subscription griot-dev
 az group exists -n moruna-node-name --subscription griot-dev
 az group list --subscription griot-dev --query "[?starts_with(name, 'moruna-node-')].name" -o tsv
 az network watcher list --subscription griot-dev -o table
-""".splitlines()
+""".replace("REPO/", f"{TOOLS.parents[2]}/").splitlines()
 
 DATA_DISK = ("az disk create -n moruna-node-data -g moruna-node-name -l centralindia --zone 3 --size-gb 4 "
              "--sku StandardSSD_LRS --subscription griot-dev -o none")
@@ -196,18 +197,26 @@ exit 0
 """
 # A container SAS as `az` prints one, every value fake.
 SAS = "se=2026-11-18T18%3A00Z&sp=r&spr=https&sv=2022-11-02&sr=c&sig=FAKEfakeFAKEfake%2Bfake%2Ffake%3D"
-# A stand-in for python3: proof.py is recorded with the secrets its environment gave it, and
-# writes a summary into its results; anything else is the real Python (the SAS's expiry).
+# A stand-in for python3: proof.py and api-checks.py are recorded with the secrets their
+# environment gave them, and write their results; anything else is the real Python (the SAS's
+# expiry).
 PYTHON = f"""#!/bin/sh
 case "$2" in
-  */bench/node/proof.py)
+  */bench/node/proof.py | */kernel/node/tools/api-checks.py)
     {{ printf 'python3'; for a in "$@"; do printf ' %s' "$a"; done
        printf ' |key=%s|sas=%s|openssl=%s\\n' "${{BENCH_KEY:-}}" "${{FUNCTIONS_SAS:-}}" "${{MORUNA_BENCH_OPENSSL:-}}"; }} >> "$STUB_LOG"
     results=""; previous=""
     for a in "$@"; do [ "$previous" = --results ] && results="$a"; previous="$a"; done
-    mkdir -p "$results" && printf '{{"ok":%s}}' "${{STUB_PROOF_OK:-true}}" > "$results/proof.json"
-    echo "proof: score-2024-01 pass"
-    exit "${{STUB_PROOF_EXIT:-0}}" ;;
+    case "$2" in
+      */proof.py)
+        mkdir -p "$results" && printf '{{"ok":%s}}' "${{STUB_PROOF_OK:-true}}" > "$results/proof.json"
+        echo "proof: score-2024-01 pass"
+        exit "${{STUB_PROOF_EXIT:-0}}" ;;
+      *)
+        printf '{{"ok":%s}}' "${{STUB_CHECKS_OK:-true}}" > "$results"
+        echo "api-checks: all 9 checks pass"
+        exit "${{STUB_CHECKS_EXIT:-0}}" ;;
+    esac ;;
 esac
 exec {sys.executable} "$@"
 """
@@ -282,6 +291,8 @@ class AzureUp(unittest.TestCase):
         self.log.touch()
 
     def stubs(self, **scripts):
+        # python3 is the stand-in unless a test names another: no test reaches a node.
+        scripts.setdefault("python3", PYTHON)
         for name, text in scripts.items():
             path = self.bin / name
             path.write_text(text)
@@ -512,6 +523,26 @@ class AzureUp(unittest.TestCase):
                          ["nc -vz -w 5 203.0.113.7 443", "nc -vz -w 5 203.0.113.7 22"])
         self.assertEqual((run / "instance").read_text().strip(), INSTANCE)
         self.assertEqual((run / "served.pin").read_text(), (run / "console.pin").read_text())
+        # The API's checks (2.6), last, pinned to the console's certificate, for its instance,
+        # given no secret; then the group is deleted.
+        python = [call for call in calls if call.startswith("python3 ")]
+        self.assertEqual(python, [
+            f"python3 -I {REPO}/kernel/node/tools/api-checks.py --url https://203.0.113.7:443 --pin {PIN} "
+            f"--token-key RUNDIR/token-key.pem --instance {INSTANCE} --openssl openssl "
+            "--results RUNDIR/api-checks.json --cloud azure |key=|sas=|openssl="])
+        self.assertGreater(calls.index(python[0]), calls.index(node[0]))
+        self.assertLess(calls.index(python[0]),
+                        next(i for i, call in enumerate(calls) if call.startswith(f"az group delete -n {GROUP}")))
+        self.assertEqual(json.loads((run / "api-checks.json").read_text()), {"ok": True})
+        self.assertIn("api-checks: all 9 checks pass\n", done.stdout)
+
+    def test_the_api_checks_failing_fail_the_run_and_delete_the_group(self):
+        self.stubs(az=AZ, openssl=OPENSSL, curl=CURL, nc=NC)
+        done = self.run_script(*self.arguments(), extra={"STUB_CHECKS_EXIT": "1", "STUB_CHECKS_OK": "false"})
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertNotIn("create-to-ready", done.stdout)
+        self.assertTrue(any(call.startswith(f"az group delete -n {GROUP} --yes") for call in self.calls()))
+        self.assertEqual(json.loads((self.root / "RUNDIR/api-checks.json").read_text()), {"ok": False})
 
     def test_a_data_disk_is_made_and_taken_at_lun_0(self):
         self.stubs(az=AZ, openssl=OPENSSL, curl=CURL, nc=NC)
@@ -622,9 +653,13 @@ class AzureUp(unittest.TestCase):
         self.assertLess(az.index(sas), az.index(vm))
         self.assertEqual((run / "functions.sas").read_text().strip(), SAS)
         self.assertEqual(stat.S_IMODE((run / "functions.sas").stat().st_mode), 0o600)
-        # proof.py: once, after the node's checks, the key and the SAS in its environment only.
-        proof = [call for call in calls if call.startswith("python3 ")]
-        self.assertEqual(len(proof), 1)
+        # proof.py: once, after the node's checks, the key and the SAS in its environment only;
+        # then the API's checks, given neither.
+        python = [call for call in calls if call.startswith("python3 ")]
+        self.assertEqual(len(python), 2)
+        proof, checks = python[:1], python[1]
+        self.assertIn("/kernel/node/tools/api-checks.py ", checks)
+        self.assertTrue(checks.endswith(" --cloud azure |key=|sas=|openssl="), checks)
         argv, env = proof[0].split(" |key=")
         self.assertEqual(env, f"the-account-key|sas={SAS}|openssl=openssl")
         self.assertEqual(argv, (
@@ -657,6 +692,12 @@ class AzureUp(unittest.TestCase):
         proof = next(i for i, call in enumerate(calls) if call.startswith("python3 "))
         self.assertTrue(any(call.startswith(f"az group delete -n {GROUP} --yes") for call in calls[proof:]))
         self.assertEqual(json.loads((self.root / "RUNDIR/proof/proof.json").read_text()), {"ok": False})
+        # The API's checks still run, after the proof and before the group is deleted.
+        python = [call for call in calls if call.startswith("python3 ")]
+        self.assertEqual([call.split()[2].rsplit("/", 1)[1] for call in python], ["proof.py", "api-checks.py"])
+        delete = next(i for i, call in enumerate(calls) if call.startswith(f"az group delete -n {GROUP} --yes"))
+        self.assertLess(calls.index(python[1]), delete)
+        self.assertEqual(json.loads((self.root / "RUNDIR/api-checks.json").read_text()), {"ok": True})
 
 
 if __name__ == "__main__":

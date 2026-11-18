@@ -18,10 +18,21 @@ it travels to a run in the environment (`BENCH_ACCOUNT`, `BENCH_KEY`, `BENCH_CON
 The Python function's output, for the engines that run it batch by batch (DuckDB, Polars), is
 written by pyarrow's Parquet writer, as bench/vm's runner wrote it, onto pyarrow's
 `AzureFileSystem`. The Rust pool has no Blob reader: it gets a local copy, timed apart.
+
+A store may hold a container SAS in place of the key (work item 3.8b: the proof on Servercore,
+whose data is in nyc-blob.sh's Blob container, read and written with that container's SAS; the
+account key stays with nyc-blob.sh). Such a store only downloads (`download`), by Blob's REST API
+on the standard library: List Blobs and Get Blob, each with the SAS as its query, which a
+container SAS with read and list allows.
 """
 import dataclasses
+import http.client
 import os
+import shutil
+import time
 import urllib.parse
+import urllib.request
+from xml.etree import ElementTree
 
 # Azurite's well-known development account (not a secret: it is in Azurite's documentation).
 AZURITE_ACCOUNT = "devstoreaccount1"
@@ -34,6 +45,7 @@ class Store:
     key: str
     container: str
     endpoint: str = ""      # http://127.0.0.1:10000/devstoreaccount1 for Azurite; "" is Azure
+    sas: str = ""           # a container SAS (Azure's query string, without its `?`) in place of the key
 
     @classmethod
     def from_env(cls, env=None):
@@ -116,6 +128,8 @@ class Store:
 
     def download(self, prefix, dest):
         """Every blob under `prefix` into `dest`; the bytes copied."""
+        if self.sas:
+            return self.sas_download(prefix, dest)
         import pyarrow.fs as pafs
         fs = self.pyarrow_fs()
         total = 0
@@ -133,6 +147,53 @@ class Store:
             os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
             pafs.copy_files(info.path, dst, source_filesystem=fs)
             total += info.size or 0
+        return total
+
+    # A store with a SAS: Blob's REST API, the SAS as each request's query -----------------------
+    def sas_url(self, path, query=""):
+        """`path` in the container, with `query` and the SAS; the SAS is the last of the query."""
+        url = f"{self.blob_endpoint}/{self.container}" + (f"/{urllib.parse.quote(path)}" if path else "")
+        return f"{url}?{query + '&' if query else ''}{self.sas.lstrip('?')}"
+
+    def sas_names(self, prefix, opener=urllib.request.urlopen):
+        """The names of the blobs under `prefix` (List Blobs, page by page)."""
+        names, marker = [], ""
+        while True:
+            query = f"restype=container&comp=list&prefix={urllib.parse.quote(prefix, safe='')}"
+            if marker:
+                query += f"&marker={urllib.parse.quote(marker, safe='')}"
+            with opener(self.sas_url("", query), timeout=120) as r:
+                body = r.read()
+            root = ElementTree.fromstring(body.removeprefix(b"\xef\xbb\xbf"))
+            names += [b.findtext("Name") for b in root.iter("Blob") if b.findtext("Name")]
+            marker = root.findtext("NextMarker") or ""
+            if not marker:
+                return names
+
+    def sas_download(self, prefix, dest, opener=urllib.request.urlopen, tries=3, wait_s=5.0):
+        """`download` with the SAS: each blob under `prefix` (Get Blob), tried `tries` times."""
+        total = 0
+        base = prefix.rstrip("/")
+        for name in self.sas_names(prefix, opener):
+            if name.endswith("/"):
+                continue
+            rel = os.path.basename(name) if name == base else os.path.relpath(name, base)
+            dst = os.path.join(dest, rel)
+            os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+            for attempt in range(tries):
+                try:
+                    with opener(self.sas_url(name), timeout=120) as r, open(dst, "wb") as f:
+                        shutil.copyfileobj(r, f, 1 << 20)
+                        length, got = r.headers.get("Content-Length"), f.tell()
+                    # A connection that ends early ends the copy too: the length tells.
+                    if length is not None and int(length) != got:
+                        raise OSError(f"{name}: {got} of its {length} bytes came")
+                    break
+                except (OSError, http.client.HTTPException):
+                    if attempt == tries - 1:
+                        raise
+                    time.sleep(wait_s * (attempt + 1))
+            total += os.path.getsize(dst)
         return total
 
     def create(self):

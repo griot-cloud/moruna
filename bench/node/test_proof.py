@@ -710,3 +710,184 @@ def test_a_pinned_tls_stream_that_drops_is_resumed(tmp_path):
         list(node.t.stream("GET", "/v1/jobs/none/events?from=0", "O"))
     th.join()
     srv.server_close()
+
+
+# --- Blob with a container SAS (work item 3.8b: the proof on Servercore) -------------------------
+
+# The data container's SAS, as nyc-blob.sh makes it: read, add, create, write and list.
+DATA_SIG = "DATAdataDATAdata%2Bdata%2Fdata%3D"
+DATA_SAS = f"se=2026-11-18T20%3A00Z&sp=racwl&spr=https&sv=2022-11-02&sr=c&sig={DATA_SIG}"
+
+
+def data_secret_parts():
+    return [DATA_SAS, DATA_SIG, "DATAdataDATAdata+data/data="]
+
+
+class FakeBlob:
+    """Blob's REST API as a container SAS reaches it, over plain HTTP on the loopback (as an
+    emulator's endpoint is): List Blobs a page of `page` names at a time, and Get Blob, each only
+    with the SAS as its query, else 403. The container's blobs are the files under `root`, by
+    their paths from it. `fail_once` names a blob whose first Get is cut short."""
+
+    def __init__(self, root, container="data", page=1, fail_once=None):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import urllib.parse as up
+        self.root, self.container, self.page, self.fail_once = str(root), container, page, fail_once
+        self.requests = []
+        fake = self
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                path, _, query = self.path.partition("?")
+                fake.requests.append(self.path)
+                q = dict(up.parse_qsl(query, keep_blank_values=True))
+                if q.get("sig") != up.unquote(DATA_SIG) or q.get("sp") != "racwl":
+                    return self.send(403, b"<Error><Code>AuthenticationFailed</Code></Error>")
+                head = f"/acct/{fake.container}"
+                if path == head and q.get("comp") == "list":
+                    return self.send(200, fake.listing(q.get("prefix", ""), q.get("marker", "")))
+                name = up.unquote(path[len(head) + 1:])
+                file = os.path.join(fake.root, name)
+                if not path.startswith(head + "/") or not os.path.isfile(file):
+                    return self.send(404, b"<Error><Code>BlobNotFound</Code></Error>")
+                if name == fake.fail_once:
+                    fake.fail_once = None
+                    self.send_response(200)
+                    self.send_header("Content-Length", "1000")
+                    self.end_headers()
+                    self.wfile.write(b"cut")
+                    return
+                with open(file, "rb") as f:
+                    self.send(200, f.read())
+
+            def send(self, status, body):
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.endpoint = f"http://127.0.0.1:{self.server.server_address[1]}/acct"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def listing(self, prefix, marker):
+        names = sorted(os.path.relpath(os.path.join(d, f), self.root)
+                       for d, _, fs in os.walk(self.root) for f in fs)
+        names = [n for n in names if n.startswith(prefix) and n > marker]
+        page, rest = names[:self.page], names[self.page:]
+        blobs = "".join(f"<Blob><Name>{n}</Name><Properties><Content-Length>1</Content-Length></Properties></Blob>"
+                        for n in page)
+        nxt = f"<NextMarker>{page[-1]}</NextMarker>" if rest else "<NextMarker />"
+        return ("﻿<?xml version=\"1.0\" encoding=\"utf-8\"?><EnumerationResults ContainerName=\"data\">"
+                f"<Prefix>{prefix}</Prefix><Blobs>{blobs}</Blobs>{nxt}</EnumerationResults>").encode()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def test_a_blob_store_with_a_sas_names_it_by_secret_in_the_document():
+    run = {"job": "score", "period": "2024-01", "id": "score-2024-01"}
+    blob = proof.Blob(store.Store("acct", "", "data", "", DATA_SAS), "nyc/", "proof/x/")
+    doc, secrets = proof.document(run, blob, 4, 3 * GiB)
+    assert doc["object_store"] == {"azure": {"account": "acct", "container": "data",
+                                             "sas_token": {"secret": "blob-sas"}}}
+    assert secrets == {"blob-sas": DATA_SAS}
+    for part in data_secret_parts():
+        assert part not in json.dumps(doc)
+
+
+def test_blob_takes_the_key_or_the_sas_from_the_environment_not_both(tmp_path, monkeypatch):
+    a = proof.parse(args(tmp_path))
+    a.data, a.blob_account, a.blob_container = "blob", "acct", "data"
+    monkeypatch.delenv("BENCH_KEY", raising=False)
+    monkeypatch.delenv("BENCH_SAS", raising=False)
+    with pytest.raises(SystemExit, match="BENCH_KEY or BENCH_SAS in the environment"):
+        proof.data_of(a)
+    monkeypatch.setenv("BENCH_SAS", f" ?{DATA_SAS}\n")
+    data = proof.data_of(a)
+    assert (data.store.key, data.store.sas, data.store.container) == ("", DATA_SAS, "data")
+    monkeypatch.setenv("BENCH_KEY", "fake-key==")
+    with pytest.raises(SystemExit, match="not both"):
+        proof.data_of(a)
+    monkeypatch.delenv("BENCH_SAS")
+    data = proof.data_of(a)
+    assert (data.store.key, data.store.sas) == ("fake-key==", "")
+
+
+def test_the_data_sas_and_its_signature_alone_are_redacted():
+    r = proof.Redact({"BENCH_SAS": DATA_SAS, "FUNCTIONS_SAS": SAS})
+    assert r(f"GET /acct/data?{DATA_SAS}") == "GET /acct/data?<BENCH_SAS>"
+    assert r(f"sig={DATA_SIG}") == "sig=<BENCH_SAS>"
+    assert r("decoded DATAdataDATAdata+data/data= here") == "decoded <BENCH_SAS> here"
+    assert r(f"{SAS} {DATA_SAS}") == "<FUNCTIONS_SAS> <BENCH_SAS>"
+
+
+def test_a_sas_store_downloads_by_list_and_get_page_by_page_and_tries_again(tmp_path):
+    root = tmp_path / "container"
+    for name, data in (("proof/p/score-2024/part-0.parquet", b"zero"),
+                       ("proof/p/score-2024/sub/part-1.parquet", b"one"),
+                       ("proof/p/score-2024-01/part-0.parquet", b"other"), ("nyc/a.parquet", b"input")):
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_bytes(data)
+    blob = FakeBlob(root, fail_once="proof/p/score-2024/sub/part-1.parquet")
+    try:
+        s = store.Store("acct", "", "data", blob.endpoint, f"?{DATA_SAS}")
+        assert s.sas_url("proof/a b.parquet", "x=1") == f"{blob.endpoint}/data/proof/a%20b.parquet?x=1&{DATA_SAS}"
+        dest = tmp_path / "out"
+        got = s.sas_download("proof/p/score-2024/", str(dest), wait_s=0)
+        assert got == len(b"zero") + len(b"one")
+        assert sorted(os.path.relpath(os.path.join(d, f), dest) for d, _, fs in os.walk(dest) for f in fs) == \
+            ["part-0.parquet", "sub/part-1.parquet"]
+        assert (dest / "sub/part-1.parquet").read_bytes() == b"one"
+        lists = [r for r in blob.requests if "comp=list" in r]
+        assert len(lists) == 2, "a page of one name, then the next from its marker"
+        assert all(r.endswith(DATA_SAS) for r in blob.requests), "the SAS is every request's query"
+        assert sum("part-1.parquet" in r for r in blob.requests) == 2, "the cut-short Get is tried again"
+        # A blob alone, by its own name.
+        single = tmp_path / "single"
+        assert store.Store("acct", "", "data", blob.endpoint, DATA_SAS).download("nyc/a.parquet", str(single)) == 5
+        assert (single / "a.parquet").read_bytes() == b"input"
+        # A SAS the store refuses: the download fails with the store's answer.
+        with pytest.raises(OSError, match="403"):
+            store.Store("acct", "", "data", blob.endpoint, "sp=racwl&sig=wrong").download("nyc/", str(tmp_path / "x"))
+    finally:
+        blob.close()
+
+
+def test_a_whole_proof_from_and_to_blob_with_the_data_sas(world, monkeypatch):
+    """As openstack-up.sh --proof runs it: the jobs read and write the data container with its
+    SAS by secret name, the outputs are fetched with it, and it is never said or written."""
+    container = world / "container"
+    node = FakeNode(str(container), {"score": expected("score"), "enrich": expected("enrich")})
+    blob = FakeBlob(container, page=5)
+    try:
+        monkeypatch.delenv("BENCH_KEY", raising=False)
+        monkeypatch.setenv("BENCH_SAS", DATA_SAS)
+        monkeypatch.setenv("FUNCTIONS_SAS", SAS)
+        argv = args(world)
+        at = argv.index("--data")
+        argv[at:at + 10] = ["--data", "blob", "--blob-account", "acct", "--blob-container", "data",
+                            "--blob-endpoint", blob.endpoint, "--blob-outputs", "proof/"]
+        argv[argv.index("--function-base") + 1] = BLOB_BASE
+        said = []
+        rc = proof.main(argv, transport=node, sign=lambda d: f"SIG-{d[:8]}", log=said.append,
+                        sleep=lambda s: None, clock=lambda: 0.0)
+    finally:
+        blob.close()
+    assert rc == 0, said
+    for job in node.jobs.values():
+        body = job["doc"]
+        assert body["v1"]["object_store"]["azure"]["sas_token"] == {"secret": "blob-sas"}
+        assert "access_key" not in body["v1"]["object_store"]["azure"]
+        assert body["secrets"] == {"blob-sas": DATA_SAS}
+        assert body["v1"]["source"]["url"][0].startswith("az://data/nyc/")
+        assert body["v1"]["sink"]["url"] == f"az://data/proof/{job['run']}/"
+    for job in ("score", "enrich"):
+        assert result(world, f"{job}-2024-01")["output_check"]["verdict"] == "bit for bit"
+    assert any("comp=list&prefix=proof%2Fenrich-2024-01%2F" in r for r in blob.requests)
+    for part in data_secret_parts() + secret_parts():
+        assert part not in "\n".join(said) and part not in written(world)
