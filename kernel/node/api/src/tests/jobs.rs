@@ -276,8 +276,9 @@ fn a_job_runs_in_a_fresh_engine_from_spec_to_its_end() {
     assert_eq!(got.len(), 17 + PIECE);
     host.send(b"{\"type\":\"cancel\"}\n").unwrap();
     assert_eq!(messages(&engine).concat(), b"{\"type\":\"cancel\"}\n");
-    // A second job while one runs is not the node's to start.
-    assert_eq!(host.start(SPEC, &sound()), Err(HostError::Unavailable));
+    // While it runs, tending it changes nothing.
+    host.0.borrow_mut().tend();
+    assert_eq!(host.0.borrow().waits().len(), 1);
 
     // The engine ends, then its channel closes.
     admission.end(1);
@@ -291,13 +292,57 @@ fn a_job_runs_in_a_fresh_engine_from_spec_to_its_end() {
         );
     }
     assert!(host.0.borrow().waits().is_empty());
-    assert_eq!(host.receive(&mut buf), Err(HostError::WouldBlock));
+    assert_eq!(
+        host.receive(&mut buf),
+        Ok(0),
+        "no engine: its channel has ended"
+    );
     assert_eq!(host.send(b"{}\n"), Err(HostError::Unavailable));
     // The account is free again: the next job starts.
     host.start(SPEC, &sound()).unwrap();
     // And a check beside it.
     host.check(b"{}", &[]).unwrap();
     assert_eq!(host.checked(), None);
+
+    // The server ends a job on its `exit` line and reads no more: the process's loop lets the
+    // engine go once its channel has ended, so its closed channel is not waited on.
+    let second = admission.engine(1);
+    second
+        .write_with(b"{\"type\":\"exit\",\"code\":0}\n", &mut [])
+        .unwrap();
+    assert!(host.receive(&mut buf).unwrap() > 0);
+    admission.end(2);
+    drop(second);
+    host.0.borrow_mut().tend();
+    assert_eq!(
+        host.0.borrow().waits().len(),
+        1,
+        "the check's channel alone"
+    );
+    assert!(admission.book.lock().unwrap().released.contains(&2));
+
+    // A start with an engine still here (its `exit` heard, its end not yet tended) lets it go
+    // first.
+    let answered = admission.engine(2);
+    let _ = messages(&answered);
+    answered
+        .write_with(
+            b"{\"type\":\"checked\",\"ok\":true,\"memory_bytes\":1073741824}\n",
+            &mut [],
+        )
+        .unwrap();
+    assert!(matches!(host.checked(), Some(Ok(_))));
+    admission.end(3);
+    host.start(SPEC, &sound()).unwrap();
+    let third = admission.book.lock().unwrap().started.len() - 1;
+    let last = admission.engine(third);
+    let id = admission.book.lock().unwrap().started[third].id;
+    last.write_with(b"{\"type\":\"exit\",\"code\":0}\n", &mut [])
+        .unwrap();
+    assert!(host.receive(&mut buf).unwrap() > 0);
+    admission.end(id);
+    host.start(SPEC, &sound()).unwrap();
+    assert!(admission.book.lock().unwrap().released.contains(&id));
 }
 
 /// What the node's admission refuses, and what no engine can be started for.

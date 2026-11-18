@@ -309,10 +309,15 @@ pub fn run(
         if let Some(ms) = server.deadline() {
             deadline = deadline.min(ms.saturating_mul(1_000_000));
         }
-        let engines = host
-            .as_ref()
-            .map(|host| host.borrow().waits())
-            .unwrap_or_default();
+        // An engine whose channel has ended is let go here, so its closed channel is not waited
+        // on again and its account is free.
+        let engines = match &host {
+            Some(host) => {
+                host.borrow_mut().tend();
+                host.borrow().waits()
+            }
+            None => Vec::new(),
+        };
         network.borrow_mut().wait(deadline, &engines)?;
     }
 }

@@ -18,8 +18,9 @@
 //!   ways: `api` writes `check`, `spec` and `cancel` in such pieces, and reads the engine's
 //!   bytes, the check's `checked` line among them.
 //! - **An engine that has ended** is released at `node-admission` once its process has ended, so
-//!   its account is free for the next: a check before the next check starts, a job before its
-//!   end is reported.
+//!   its account is free for the next: a check before the next check starts; a job as soon as its
+//!   channel has ended with nothing left to read ([`Host::tend`]), which the server has then
+//!   heard its `exit` on, and at the latest before the next job starts.
 
 use alloc::{collections::VecDeque, format, rc::Rc, string::String, vec, vec::Vec};
 use core::cell::RefCell;
@@ -277,6 +278,20 @@ impl Host {
         self.bound
     }
 
+    /// Lets go of the job's engine once its channel has ended and everything it sent has been
+    /// read, so its account is free and its closed channel is no longer waited on. The process's
+    /// loop calls it each turn.
+    pub fn tend(&mut self) {
+        let Some(run) = self.job.as_mut() else {
+            return;
+        };
+        if run.read == run.inbox.len() && !run.fill() && run.ended {
+            let id = run.id;
+            self.job = None;
+            self.finish(id);
+        }
+    }
+
     /// The channels of the engines under way, and what to wait for on each.
     pub fn waits(&self) -> Vec<(Rc<Channel>, Signals)> {
         self.check
@@ -385,8 +400,10 @@ impl EngineHost for Host {
     }
 
     fn start(&mut self, spec: &[u8], verdict: &Verdict) -> Result<(), HostError> {
-        if self.job.is_some() {
-            return Err(HostError::Unavailable);
+        // The server starts a job only when none is in flight: an engine still here has said its
+        // `exit`, and it is let go before the next is started.
+        if let Some(run) = self.job.take() {
+            self.finish(run.id);
         }
         let budget = verdict
             .memory_bytes
@@ -430,7 +447,10 @@ impl EngineHost for Host {
     }
 
     fn receive(&mut self, buf: &mut [u8]) -> Result<usize, HostError> {
-        let run = self.job.as_mut().ok_or(HostError::WouldBlock)?;
+        // No engine: its channel has ended, and it was let go ([`Host::tend`]).
+        let Some(run) = self.job.as_mut() else {
+            return Ok(0);
+        };
         run.flush();
         if run.read == run.inbox.len() && !run.fill() && run.ended {
             let id = run.id;
