@@ -20,6 +20,9 @@ Boot evidence is kept in `~/moruna-data/boots/` (chain logs, scripts, run report
 
 ## The PM's, in order
 
+All six first kernels are merged (4.1–4.6): expr, filter, take, group_aggregate, interval_coverage_count, mlp_forward. What is left of them is measurement (4G.1–4G.4) and their use by the gate functions (functions built on kernels).
+
+
 Benchmark run 5 is ready (`~/moruna-data/chain-bench5.sh <commit>`): the node image at feature's tip and every engine. Running: the image build took the VM lock at 21:52Z, at b11c1342. Run 4's Linux engines never installed because PyPI timed out; fixed in 0b3ac5bc (uv waits 5 minutes a download and retries 5 times).
 
 
@@ -38,7 +41,7 @@ Benchmark run 5 is ready (`~/moruna-data/chain-bench5.sh <commit>`): the node im
 | 10 | 6.3f a Linux image runs one instance per CPU | `work/6.3f-linux-image-runs-alone` 48267e9e (WIP) | none | After 6.3g: a VM turn, the image-kind suite and the table |
 | 11 | 4.6 mlp_forward | MERGED (`work/4.6-mlp-forward` 151e1a39) | none | Left: the 20-minute one-core measurement in moruna-arm (`kernel_mlp.py measure`, `score BIN numpy`) |
 | 12 | 4.1 + 4.3 catalogue runner, filter, take | MERGED 5577f6d7 (3b4bd4a5) | none | Done: the runner runs every listed implementation over its corpus (filter, take, mlp_forward, interval_coverage_count all pass); coverage 95–96%. Left: the Enrich month check (tests/enrich_month.rs, ignored, needs MORUNA_ENRICH_DIR) and dropping 4.5's stand-in corpus test |
-| 13 | 4.2 expr | `work/4.2-expr` f2e046ad | patch plus tgz (uncompiled) | Compile, test, then 4G.3 |
+| 13 | 4.2 expr | MERGED 0108239a (58793368) | none | Done: binder, fused evaluator, exact round, temporal parts, legacy filter; 41 cases pass the runner; coverage 95.7%. Fixed: add(duration, timestamp) cast order, and the Audit tree's null minutes (skip_nulls false). Left: the 4G.3 measurement |
 | 14 | 4.4 group_aggregate | MERGED 8a4b6ed4 (bba7bb70) | none | Done: hash and dense paths, exact float sums (the superaccumulator's top-digit overflow fixed), 29 cases pass the runner, coverage 94.4%. Left: the 4G.4 counts and the float-sum cost (exact, binned, plain) on a month and on the year |
 | 15 | 4.5 interval_coverage_count | MERGED (`work/4.5-interval-coverage-count` a70e3416) | scratch in wip | Done: year compute 53.3 s in Python against 0.85 s; peak 1,217 MiB against 89 MiB; bit for bit. Left: drop its stand-in corpus test once 4.1's runner lands |
 | 16 | S.1 dependency advisories | `work/S.1-dependency-advisories` 9b045426 | patch | Read the patch, then build |
