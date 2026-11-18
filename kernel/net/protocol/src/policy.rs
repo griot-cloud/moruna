@@ -124,7 +124,7 @@ impl Policy {
         }
     }
 
-    /// The sockets one remote address may hold through the policy's listeners.
+    /// The live connections one remote address may hold through the policy's listeners.
     pub fn per_peer(&self) -> u32 {
         self.per_peer.unwrap_or(PER_PEER_DEFAULT)
     }

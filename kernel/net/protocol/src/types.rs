@@ -264,8 +264,8 @@ pub struct Policy {
     pub rx: Option<u32>,
     /// Bytes of each socket's send buffer, likewise (`tx=`).
     pub tx: Option<u32>,
-    /// The most sockets one remote address may hold through the grant's listeners,
-    /// closing ones included (`per-peer=`).
+    /// The most live connections (half-open or established, not closing) one remote
+    /// address may hold through the grant's listeners (`per-peer=`).
     pub per_peer: Option<u32>,
     /// Milliseconds a socket closed by its client, or left by a connection that went,
     /// may take to finish its close before it is reset (`linger=`).

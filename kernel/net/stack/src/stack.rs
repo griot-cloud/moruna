@@ -316,10 +316,10 @@ struct Orphan {
     iface: usize,
     handle: SocketHandle,
     local: Endpoint,
-    /// The grant it counts against until it is freed, and the peer, for a connection a
-    /// listener took; it counts no longer once its client has gone.
+    /// The grant it counts against until it is freed (no longer once its client has
+    /// gone). A closing connection is not its peer's: a peer's bound counts its live
+    /// connections only.
     grant: Rc<Grant>,
-    peer: Option<Addr>,
     counted: bool,
     /// The client connection whose socket it was.
     conn: u64,
@@ -622,7 +622,6 @@ impl Stack {
                 .entry(Rc::as_ptr(&o.grant))
                 .or_insert((0, BTreeMap::new(), &o.grant));
             e.0 += 1;
-            peer(e, o.peer);
         }
         for (n, peers, g) in held.values() {
             assert_eq!(*n, g.held(), "a grant's count is not its sockets'");
@@ -1256,9 +1255,6 @@ impl Stack {
             }
             o.counted = false;
             o.grant.give(1);
-            if let Some(p) = o.peer {
-                o.grant.peer_give(&p);
-            }
             if reset {
                 o.deadline = self.now;
                 o.sent = false;
@@ -1493,6 +1489,8 @@ impl Stack {
                     .map(|h| (h.handle, h.peer))
                     .chain(l.queue)
                 {
+                    // Closing, it is no longer its peer's.
+                    grant.peer_give(&peer);
                     self.ifaces[l.iface].set.get_mut::<tcp::Socket>(h).abort();
                     *self.tcp_local.entry(l.at).or_insert(0) += 1;
                     self.orphans.push(Orphan {
@@ -1500,7 +1498,6 @@ impl Stack {
                         handle: h,
                         local: l.at,
                         grant: grant.clone(),
-                        peer: Some(peer),
                         counted: true,
                         conn,
                         deadline: self.now,
@@ -1531,6 +1528,10 @@ impl Stack {
         peer: Option<Addr>,
     ) {
         let deadline = self.now.saturating_add(self.linger_ns(grant));
+        // Closing, it is no longer its peer's: the grant's bound holds it from now on.
+        if let Some(p) = peer {
+            grant.peer_give(&p);
+        }
         let s = self.ifaces[iface].set.get_mut::<tcp::Socket>(handle);
         if s.recv_queue() > 0 {
             s.abort();
@@ -1542,7 +1543,6 @@ impl Stack {
             handle,
             local,
             grant: grant.clone(),
-            peer,
             counted: true,
             conn,
             deadline,
@@ -2463,7 +2463,6 @@ impl Stack {
                             handle: h,
                             local: l.at,
                             grant: c.grant.clone(),
-                            peer: None,
                             counted: true,
                             conn: *cid,
                             deadline: now,
@@ -2480,12 +2479,12 @@ impl Stack {
                             // A handshake not done in time: reset, and freed.
                             s.abort();
                             l.half.swap_remove(k);
+                            c.grant.peer_give(&half.peer);
                             reset.push(Orphan {
                                 iface: l.iface,
                                 handle: half.handle,
                                 local: l.at,
                                 grant: c.grant.clone(),
-                                peer: Some(half.peer),
                                 counted: true,
                                 conn: *cid,
                                 deadline: now,
@@ -2688,7 +2687,6 @@ impl Stack {
                     handle: t.handle,
                     local,
                     grant,
-                    peer: None,
                     counted: true,
                     conn: cid,
                     deadline: now,
@@ -2726,9 +2724,6 @@ impl Stack {
                     self.unbind_tcp(&o.local);
                     if o.counted {
                         o.grant.give(1);
-                        if let Some(p) = o.peer {
-                            o.grant.peer_give(&p);
-                        }
                     }
                     continue;
                 }

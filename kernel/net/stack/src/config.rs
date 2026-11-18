@@ -17,8 +17,8 @@
 //! policy. `sockets` bounds the sockets every connection through the slot holds
 //! between them ([`crate::grant`]). Work item 1.3b's bounds on their memory: `rx` and
 //! `tx` are the receive and send buffers of each of their sockets (TCP's, and UDP's
-//! payload buffers), `per-peer` the most connections one remote address may hold
-//! through the slot's listeners (8 when not given), and `linger` how long, in
+//! payload buffers), `per-peer` the most live connections (not those closing) one
+//! remote address may hold through the slot's listeners (8 when not given), and `linger` how long, in
 //! milliseconds, a closed socket may take to finish its close; not given, the settings
 //! hold (`tcp-receive-buffer` and `udp-receive-bytes`, `tcp-send-buffer` and
 //! `udp-send-bytes`, `tcp-linger-ms`). `#` begins a comment. Anything else, and every

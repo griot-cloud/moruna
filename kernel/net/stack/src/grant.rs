@@ -15,9 +15,12 @@
 //! answered with a reset, so a connection refused for the bound is refused at accept and
 //! the peer is told.
 //!
-//! The connections its listeners take are also counted by the peer's address, closing
-//! ones included, and a peer already holding the policy's `per_peer` of them has its
-//! next connection reset at once. Each socket has the policy's buffers and its linger,
+//! The live connections its listeners take (half-open, established and not yet closed
+//! by the client) are also counted by the peer's address, and a peer already holding the
+//! policy's `per_peer` of them has its next connection reset at once. A connection being
+//! closed is no longer its peer's, so a peer that connects again and again, closing each
+//! connection, never meets its bound while its closed ones linger; the grant's
+//! `sockets` bound, which counts them until they are freed, is what bounds memory. Each socket has the policy's buffers and its linger,
 //! the server's settings where the policy leaves them.
 //!
 //! When a bound is hit (the grant's, or a peer's) the server says so on its console, at

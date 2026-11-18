@@ -60,7 +60,7 @@ pub const PING_MAX: u32 = 1024;
 /// `Policy::tx`).
 pub const BUFFER_MIN: u32 = 1024;
 pub const BUFFER_MAX: u32 = 16 << 20;
-/// The sockets one remote address may hold through a grant's listeners when its
+/// The live connections one remote address may hold through a grant's listeners when its
 /// policy says nothing (`Policy::per_peer`), and the most a policy may say.
 pub const PER_PEER_DEFAULT: u32 = 8;
 pub const PER_PEER_MAX: u32 = 65536;
