@@ -4,6 +4,17 @@
 //! `directory` slot, when the node links one) it knows the node's disks by serial. Every check
 //! is given them as data ([`node_protocol::VOLUMES_SLOT`]), so `validate` refuses a volume no
 //! disk has, and the boot disk; `launch` resolves a job's volumes again, `Invalid` for either.
+//!
+//! Functions (system design 3E, item 3.6): `api` sends node config's `functions.cache_bytes`
+//! once (`functions`), and the server carves the function cache's account of that size from
+//! its own, which the job bound then counts. At `launch`, each function the job uses, as `api`
+//! registered it, is fetched over HTTPS through a channel minted for its host (item 3.4),
+//! within `FETCH_NS`, unless the cache keeps it; checked against its SHA-256; kept in a memory
+//! object of the cache's account; and given the engine read only as `function.N`, with the
+//! `functions` index (`node_functions::handover_of`). A refusal says why, naming the function.
+//! The fetches run on a thread of their own, one at a time (`node_functions::worker`): the
+//! dispatcher answers checks, `bound` and the rest meanwhile, and the launch's answer is sent
+//! when the job's functions are ready.
 #![no_std]
 #![no_main]
 #![forbid(unsafe_code)]
@@ -13,15 +24,27 @@ use alloc::{boxed::Box, collections::BTreeMap, rc::Rc, string::String, vec::Vec}
 use core::cell::RefCell;
 use devices_protocol::{Block, directory};
 use moruna_svc::{
-    Channel, Completions, Context, Decoder, Dispatcher, Handle, Handler, Outcome, Pending,
+    Channel, Completions, Context, Decoder, Dispatcher, Encoder, Handle, Handler, Outcome, Pending,
     ProtocolId, Signals, Status, Watch, Wire,
+    frame::{self, Kind},
 };
-use moruna_sys::{Account, Console, ObjectType, Process, Rights, println, start};
+use moruna_sys::{
+    Account, Console, Memory, ObjectType, Process, RawHandle, Rights, Thread, map, println, start,
+};
 use netstack_protocol::net;
-use node_protocol::{CANCELLED, CHECK_BYTES, MAX_JOBS, Needs, RUNNING, TERMINATED, admission};
+use node_functions::{https::HttpsFetch, worker::Fetcher};
+use node_protocol::{
+    CANCELLED, CHECK_BYTES, FETCH_NS, Launched, MAX_JOBS, Needs, RUNNING, Refusal, Registered,
+    TERMINATED, admission,
+};
 
 /// The account of admission's client of the network server (item 3.4), carved from its own.
 const NETWORK_BYTES: u64 = 4 << 20;
+/// The account of the fetch worker's client of the network server, which each fetch of a
+/// function's file binds its client to too (item 3.6): the memory it lends the network server.
+const FETCH_BYTES: u64 = 4 << 20;
+/// The fetch worker's stack.
+const FETCH_STACK: u64 = 512 << 10;
 
 /// How long the device manager's directory has to list the node's disks.
 const DIRECTORY_NS: u64 = 10_000_000_000;
@@ -67,6 +90,217 @@ struct Shared {
     /// The device manager's directory, through which the node's disks are listed (item 3.3):
     /// `None` on a node that links none, which then has no volumes.
     directory: Option<Channel>,
+    /// The function cache's account (item 3.6), carved from the server's own once `api` has
+    /// sent its size: `None` until then, when a job that uses a function is refused.
+    cache: Option<Account>,
+    /// The fetch worker (item 3.6), which holds the cache: `None` with no network.
+    fetcher: Option<Fetcher>,
+    /// The launch whose functions the worker is fetching: one at a time.
+    fetching: Option<Fetching>,
+}
+
+/// A job's launch while the fetch worker gets its functions (item 3.6).
+struct Fetching {
+    owner: u64,
+    /// The deferred answer and the launch, until the caller goes.
+    waiting: Option<(Pending, Launch)>,
+    functions: Vec<node_functions::Registered>,
+}
+
+/// The fetch worker's answer, which the dispatcher waits for beside its connections: the
+/// launch it was for then starts its engine, or is refused, and is answered.
+struct Fetched {
+    shared: Rc<RefCell<Shared>>,
+    handle: Handle,
+}
+
+impl Watch for Fetched {
+    fn handle(&self) -> &Handle {
+        &self.handle
+    }
+    fn signals(&self) -> Signals {
+        Signals::READABLE | Signals::PEER_CLOSED
+    }
+    fn signaled(&mut self, _: Signals, done: &mut Completions) -> bool {
+        let answer = match self
+            .shared
+            .borrow()
+            .fetcher
+            .as_ref()
+            .and_then(Fetcher::answer)
+        {
+            Some(answer) => answer,
+            None => return true,
+        };
+        let Some(fetching) = self.shared.borrow_mut().fetching.take() else {
+            return false;
+        };
+        // A caller that has gone: its answer is dropped, and the images' handles with it.
+        let Some((pending, launch)) = fetching.waiting else {
+            return false;
+        };
+        let launched = match with_functions(
+            &self.shared,
+            fetching.owner,
+            launch,
+            &fetching.functions,
+            answer,
+        ) {
+            Ok(id) => Launched::Started(id),
+            Err(refusal) => Launched::Refused(refusal),
+        };
+        done.complete(pending, Outcome::reply(launched));
+        false
+    }
+}
+
+/// The launch of a job whose functions the worker has answered: refused in its words, or
+/// started with each image as `function.N`, the index, and the process resource a native
+/// function's program is started from (stream P), as the initial job's `root.process` is.
+fn with_functions(
+    shared: &Rc<RefCell<Shared>>,
+    owner: u64,
+    mut launch: Launch,
+    functions: &[node_functions::Registered],
+    answer: Result<Vec<(u64, Handle)>, String>,
+) -> Result<u64, Refusal> {
+    let images = answer.map_err(|why| Refusal::new(admission::Error::Refused, why))?;
+    let mut grants = node_functions::handover_of(functions, images)
+        .map_err(|why| Refusal::new(admission::Error::Unavailable, why))?;
+    let process = shared
+        .borrow()
+        .root
+        .duplicate(Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER)
+        .map_err(|_| {
+            Refusal::new(
+                admission::Error::Unavailable,
+                "node-admission has no process resource to give the job",
+            )
+        })?;
+    grants.push((String::from("process"), process));
+    launch.functions = grants;
+    launch_job(shared, owner, launch)
+}
+
+/// A launch whose job uses functions (item 3.6): asked of the fetch worker, one at a time, and
+/// answered when they are ready, while the dispatcher answers everything else.
+fn launch_with_functions(
+    shared: &Rc<RefCell<Shared>>,
+    cx: &mut Context<'_>,
+    owner: u64,
+    launch: Launch,
+    functions: Vec<node_functions::Registered>,
+) -> Outcome {
+    let refused = |error: admission::Error, why: &str| {
+        Outcome::reply(Launched::Refused(Refusal::new(error, why)))
+    };
+    let mut state = shared.borrow_mut();
+    if state.cache.is_none() {
+        return refused(
+            admission::Error::Unavailable,
+            "the node's function cache is not set up: api has not sent its size",
+        );
+    }
+    if state.fetching.is_some() {
+        return refused(
+            admission::Error::Limit,
+            "node-admission is fetching another job's functions",
+        );
+    }
+    let Some(fetcher) = state.fetcher.as_ref() else {
+        return refused(
+            admission::Error::Unavailable,
+            "node-admission has no network to fetch the job's functions over",
+        );
+    };
+    let Ok(handle) = fetcher.channel().0.duplicate(Rights::WAIT) else {
+        return refused(
+            admission::Error::Unavailable,
+            "the fetch worker cannot be waited on",
+        );
+    };
+    let Some(permit) = state
+        .watch_capacity
+        .as_ref()
+        .and_then(|capacity| capacity.reserve().ok())
+    else {
+        return refused(
+            admission::Error::Limit,
+            "node-admission waits on all it may",
+        );
+    };
+    if let Err(why) = fetcher.images(&functions) {
+        return refused(admission::Error::Unavailable, &why);
+    }
+    state.watches.push((
+        Box::new(Fetched {
+            shared: shared.clone(),
+            handle,
+        }),
+        permit,
+    ));
+    state.fetching = Some(Fetching {
+        owner,
+        waiting: Some((cx.defer(), launch)),
+        functions,
+    });
+    Outcome::Deferred
+}
+
+/// The fetch worker (item 3.6) on a thread of its own: it is sent its own connection to the
+/// network server, its account and the console, and serves the cache and the jobs' functions
+/// (`node_functions::worker`). `None` when any of it cannot be made.
+fn spawn_fetcher(listener: &Channel, own: &Account, console: &Console) -> Option<Fetcher> {
+    let connection = moruna_svc::connect(listener).ok()?;
+    let account = own.carve_from(FETCH_BYTES, "fetch").ok()?;
+    let console = console.0.duplicate(Rights::WRITE | Rights::TRANSFER).ok()?;
+    let (ours, theirs) = Channel::create().ok()?;
+    let mut setup = Encoder::new();
+    (connection.0, account.0, console).encode(&mut setup).ok()?;
+    frame::send(&ours, Kind::Event, 0, 0, setup).ok()?;
+    let stack = Memory::create(FETCH_STACK).ok()?;
+    let mapping = stack.map_detached(0, FETCH_STACK, map::WRITE).ok()?;
+    let top = mapping.end();
+    // The stack stays mapped for good: the thread lives as long as the server.
+    core::mem::forget(mapping);
+    core::mem::forget(stack);
+    Thread::spawn(fetch_worker, top, u64::from(theirs.0.into_raw())).ok()?;
+    Some(Fetcher::new(ours))
+}
+
+/// The fetch worker's thread: its channel's raw handle is its argument, and its first message
+/// its connection to the network server, its account and the console.
+extern "C" fn fetch_worker(channel: u64) -> ! {
+    let channel = Channel(Handle::from_raw(channel as RawHandle));
+    if let Some((mut client, account, console)) = fetch_setup(&channel) {
+        let mut fetch = HttpsFetch::new(&mut client, &account, FETCH_NS);
+        node_functions::worker::serve(&channel, &mut fetch, &mut |line| {
+            println!(console, "{}", line)
+        });
+    }
+    moruna_sys::thread_exit()
+}
+
+/// The fetch worker's first message, read: its client of the network server, bound to its
+/// account, the account, and the console.
+fn fetch_setup(channel: &Channel) -> Option<(net::Client, Account, Console)> {
+    let mut frame = frame::recv(channel).ok()??;
+    let mut d = frame.decoder();
+    let (connection, account, console) = <(Handle, Handle, Handle)>::decode(&mut d).ok()?;
+    d.finish().ok()?;
+    let account = Account(account);
+    let binding = account
+        .0
+        .info()
+        .and_then(|(_, rights)| account.0.duplicate(rights))
+        .ok()?;
+    let client = net::Client::connect(
+        Channel(connection),
+        moruna_svc::deadline_in(30_000_000_000),
+        Account(binding),
+    )
+    .ok()?;
+    Some((client, account, Console(console)))
 }
 
 /// The node's disks, as the device manager's directory lists them; none without a directory.
@@ -137,12 +371,22 @@ struct Launch {
     grants: Vec<Handle>,
     services: Vec<String>,
     needs: Needs,
+    /// What the engine is given for the job's functions (item 3.6), once the fetch worker
+    /// has them: not services, and counted against no grant bound but the start page's.
+    functions: Vec<(String, Handle)>,
 }
-fn launch_job(
-    shared: &Rc<RefCell<Shared>>,
-    owner: u64,
-    launch: Launch,
-) -> Result<u64, admission::Error> {
+
+/// The job's functions as `api` registered them, against the names its check answered: refused
+/// as `Invalid`, with why, when they are not one for each (`node_functions::registrations`).
+fn registrations(
+    names: &[String],
+    registered: &[Registered],
+) -> Result<Vec<node_functions::Registered>, Refusal> {
+    node_functions::registrations(names, registered)
+        .map_err(|why| Refusal::new(admission::Error::Invalid, why))
+}
+
+fn launch_job(shared: &Rc<RefCell<Shared>>, owner: u64, launch: Launch) -> Result<u64, Refusal> {
     let Launch {
         account,
         budget,
@@ -151,23 +395,24 @@ fn launch_job(
         mut grants,
         services,
         needs,
+        functions: function_grants,
     } = launch;
     if !node_protocol::valid_needs(&needs) {
-        return Err(admission::Error::Invalid);
+        return Err(admission::Error::Invalid.into());
     }
     if !needs.1.is_empty() {
         // A job's volumes, resolved again: a serial no disk has, the boot disk, or a sink's
         // volume served read only is refused, as the check refused it.
         if shared.borrow().directory.is_none() {
-            return Err(admission::Error::Unavailable);
+            return Err(admission::Error::Unavailable.into());
         }
         let blocks = node_blocks(shared)?;
         if node_protocol::resolve(&needs.1, &blocks).is_err() {
-            return Err(admission::Error::Invalid);
+            return Err(admission::Error::Invalid.into());
         }
     }
     if services.len() > node_protocol::MAX_GRANTS {
-        return Err(admission::Error::Invalid);
+        return Err(admission::Error::Invalid.into());
     }
     {
         let state = shared.borrow();
@@ -204,22 +449,25 @@ fn launch_job(
         grants.push(channel.0);
     }
     if !node_protocol::valid_grants(&names, grants.len()) || budget == 0 || budget % 4096 != 0 {
-        return Err(admission::Error::Invalid);
+        return Err(admission::Error::Invalid.into());
     }
     if account.info().ok().map(|i| i.0) != Some(ObjectType::Account)
         || config.info().ok().map(|i| i.0) != Some(ObjectType::Memory)
     {
-        return Err(admission::Error::Invalid);
+        return Err(admission::Error::Invalid.into());
+    }
+    {
+        let state = shared.borrow();
+        if state.closing {
+            return Err(admission::Error::Unavailable.into());
+        }
+        if state.jobs.len() >= MAX_JOBS {
+            return Err(admission::Error::Limit.into());
+        }
     }
     let mut state = shared.borrow_mut();
-    if state.closing {
-        return Err(admission::Error::Unavailable);
-    }
-    if state.jobs.len() >= MAX_JOBS {
-        return Err(admission::Error::Limit);
-    }
     let Some(id) = state.next.checked_add(1) else {
-        return Err(admission::Error::Limit);
+        return Err(admission::Error::Limit.into());
     };
     let watch_permit = state
         .watch_capacity
@@ -229,23 +477,23 @@ fn launch_job(
         .map_err(|_| admission::Error::Limit)?;
     let account = match Account(account).carve_from(budget, "job") {
         Ok(a) => a,
-        Err(_) => return Err(admission::Error::Quota),
+        Err(_) => return Err(admission::Error::Quota.into()),
     };
     let process = match Process::create_in(&state.root, "engine", &account.0) {
         Ok(p) => p,
-        Err(_) => return Err(admission::Error::Unavailable),
+        Err(_) => return Err(admission::Error::Unavailable.into()),
     };
     let entry = match process.map_image(&state.image) {
         Ok(e) => e,
-        Err(_) => return Err(admission::Error::Unavailable),
+        Err(_) => return Err(admission::Error::Unavailable.into()),
     };
     let console = match state.console.0.duplicate(Rights::WRITE | Rights::TRANSFER) {
         Ok(h) => h,
-        Err(_) => return Err(admission::Error::Unavailable),
+        Err(_) => return Err(admission::Error::Unavailable.into()),
     };
     let account_grant = match account.0.info().and_then(|(_, r)| account.0.duplicate(r)) {
         Ok(h) => h,
-        Err(_) => return Err(admission::Error::Unavailable),
+        Err(_) => return Err(admission::Error::Unavailable.into()),
     };
     let mut handles = alloc::vec![
         (Some(console), "console"),
@@ -255,20 +503,25 @@ fn launch_job(
     for (name, handle) in names.iter().zip(grants) {
         handles.push((Some(handle), name.as_str()));
     }
+    let (function_names, function_handles): (Vec<String>, Vec<Handle>) =
+        function_grants.into_iter().unzip();
+    for (name, handle) in function_names.iter().zip(function_handles) {
+        handles.push((Some(handle), name.as_str()));
+    }
     let watch_handle = match process.0.duplicate(Rights::WAIT) {
         Ok(h) => h,
-        Err(_) => return Err(admission::Error::Unavailable),
+        Err(_) => return Err(admission::Error::Unavailable.into()),
     };
     state.next = id;
     let escrow = match state.guardian.publish(&process) {
         Ok(id) => id,
-        Err(_) => return Err(admission::Error::Unavailable),
+        Err(_) => return Err(admission::Error::Unavailable.into()),
     };
     if process.start_with(entry, &mut handles).is_err() {
         if state.guardian.retract(escrow).is_err() {
             state.fault = true;
         }
-        return Err(admission::Error::Unavailable);
+        return Err(admission::Error::Unavailable.into());
     }
     state.jobs.insert(
         id,
@@ -299,18 +552,29 @@ impl Handler for Session {
     fn handle(&mut self, cx: &mut Context<'_>, ordinal: u16, d: &mut Decoder<'_>) -> Outcome {
         let owner = cx.connection();
         self.owner = Some(owner);
-        if !(1..=7).contains(&ordinal) {
+        if !(1..=8).contains(&ordinal) {
             return Outcome::Status(Status::UnknownMethod);
+        }
+        if ordinal == 8 {
+            let Some(cache_bytes) = args::<u64>(d) else {
+                return Outcome::Status(Status::BadMessage);
+            };
+            return match set_up_functions(&self.shared, cache_bytes) {
+                Ok(()) => Outcome::reply(()),
+                Err(e) => failure(e),
+            };
         }
         if ordinal == 7 {
             if args::<()>(d).is_none() {
                 return Outcome::Status(Status::BadMessage);
             }
-            // The job bound (system design 3A): this server's account less the check account
-            // and its own.
+            // The job bound (system design 3A): this server's account less the check account,
+            // its own and the function cache's (item 3.6).
             let state = self.shared.borrow();
             return match state.own.as_ref().and_then(|own| own.usage().ok()) {
-                Some(usage) => Outcome::reply(node_protocol::budget_max(usage.limit)),
+                Some(usage) => {
+                    Outcome::reply(node_protocol::budget_max(jobs_account(&state, usage.limit)))
+                }
                 None => failure(admission::Error::Unavailable),
             };
         }
@@ -326,10 +590,19 @@ impl Handler for Session {
             };
         }
         if ordinal == 1 {
-            let Some((budget, config, names, grants, services, needs)) =
-                args::<(u64, Handle, Vec<String>, Vec<Handle>, Vec<String>, Needs)>(d)
+            // The arguments in order: the first six, then the job's functions (1.3).
+            let Some(((budget, config, names, grants, services, needs), registered)) =
+                args::<(
+                    (u64, Handle, Vec<String>, Vec<Handle>, Vec<String>, Needs),
+                    Vec<Registered>,
+                )>(d)
             else {
                 return Outcome::Status(Status::BadMessage);
+            };
+            // The job's functions, one for each its check named (item 3.6).
+            let functions = match registrations(&needs.2, &registered) {
+                Ok(functions) => functions,
+                Err(refusal) => return Outcome::reply(Launched::Refused(refusal)),
             };
             // The job's account is carved from this server's own (system design 3A), and its
             // budget is at most that account less the check account and its own overhead.
@@ -339,29 +612,30 @@ impl Handler for Session {
                     return failure(admission::Error::Unavailable);
                 };
                 let limit = own.usage().map(|u| u.limit).unwrap_or(0);
-                if let Err(e) = node_protocol::admits(budget, limit) {
-                    return failure(e);
+                if let Err(e) = node_protocol::admits(budget, jobs_account(&state, limit)) {
+                    return Outcome::reply(Launched::Refused(e.into()));
                 }
                 match duplicate(own) {
                     Ok(handle) => handle,
                     Err(e) => return failure(e),
                 }
             };
-            return match launch_job(
-                &self.shared,
-                owner,
-                Launch {
-                    account,
-                    budget,
-                    config,
-                    names,
-                    grants,
-                    services,
-                    needs,
-                },
-            ) {
-                Ok(id) => Outcome::reply(id),
-                Err(e) => failure(e),
+            let launch = Launch {
+                account,
+                budget,
+                config,
+                names,
+                grants,
+                services,
+                needs,
+                functions: Vec::new(),
+            };
+            if !functions.is_empty() {
+                return launch_with_functions(&self.shared, cx, owner, launch, functions);
+            }
+            return match launch_job(&self.shared, owner, launch) {
+                Ok(id) => Outcome::reply(Launched::Started(id)),
+                Err(refusal) => Outcome::reply(Launched::Refused(refusal)),
             };
         }
         let Some(id) = args::<u64>(d) else {
@@ -405,6 +679,13 @@ impl Handler for Session {
     fn closed(&mut self) {
         let mut shared = self.shared.borrow_mut();
         if let Some(owner) = self.owner {
+            // A launch still fetching for the connection is answered to no one: the worker's
+            // answer, when it comes, is dropped.
+            if let Some(fetching) = shared.fetching.as_mut()
+                && fetching.owner == owner
+            {
+                fetching.waiting = None;
+            }
             shared.jobs.retain(|_, job| {
                 if job.owner != owner {
                     return true;
@@ -454,8 +735,10 @@ fn check_job(
             grants,
             services,
             needs: Default::default(),
+            functions: Vec::new(),
         },
-    )?;
+    )
+    .map_err(code)?;
     shared.borrow_mut().check = Some(id);
     Ok(id)
 }
@@ -603,8 +886,72 @@ fn initial_job(
             grants,
             services,
             needs: Default::default(),
+            functions: Vec::new(),
         },
     )
+    .map_err(code)
+}
+
+/// A refusal as the bare code the requests other than `launch` answer.
+fn code(refusal: Refusal) -> admission::Error {
+    refusal.error().unwrap_or(admission::Error::Unavailable)
+}
+
+/// What of the server's account of `limit` bytes jobs are carved from: less the function
+/// cache's account, once there is one (item 3.6).
+fn jobs_account(state: &Shared, limit: u64) -> u64 {
+    let cache = state
+        .cache
+        .as_ref()
+        .and_then(|cache| cache.usage().ok())
+        .map_or(0, |usage| usage.limit);
+    node_protocol::jobs_account(limit, cache)
+}
+
+/// `functions` (method 8): the function cache's account, of `cache_bytes` in whole pages,
+/// carved from the server's own once; the same again changes nothing, another size is
+/// `Invalid` (item 3.6).
+fn set_up_functions(
+    shared: &Rc<RefCell<Shared>>,
+    cache_bytes: u64,
+) -> Result<(), admission::Error> {
+    let bytes = node_protocol::cache_account(cache_bytes);
+    let mut state = shared.borrow_mut();
+    if let Some(cache) = &state.cache {
+        let limit = cache
+            .usage()
+            .map_err(|_| admission::Error::Unavailable)?
+            .limit;
+        return if limit == bytes {
+            Ok(())
+        } else {
+            Err(admission::Error::Invalid)
+        };
+    }
+    if bytes == 0 {
+        return Err(admission::Error::Invalid);
+    }
+    let own = state.own.as_ref().ok_or(admission::Error::Unavailable)?;
+    let account = own
+        .carve_from(bytes, "functions")
+        .map_err(|_| admission::Error::Quota)?;
+    // The worker keeps the images in it; the server keeps it too, so the bound counts it.
+    if let Some(fetcher) = &state.fetcher {
+        let handle = account
+            .0
+            .info()
+            .and_then(|(_, rights)| account.0.duplicate(rights))
+            .map_err(|_| admission::Error::Unavailable)?;
+        fetcher
+            .cache(bytes, handle)
+            .map_err(|_| admission::Error::Unavailable)?;
+    }
+    println!(
+        state.console,
+        "node-admission: function cache: {} bytes, carved from its own", bytes
+    );
+    state.cache = Some(account);
+    Ok(())
 }
 
 fn run() -> i64 {
@@ -632,11 +979,18 @@ fn run() -> i64 {
     let own = start::take("account").map(Account);
     // The job network's client (item 3.4), on its own small account: the memory it lends the
     // network server, and the clients of the channels it mints.
-    let network = start::take("network").map(Channel).and_then(|listener| {
+    let network_listener = start::take("network").map(Channel);
+    let network = network_listener.as_ref().and_then(|listener| {
         let account = own.as_ref()?.carve_from(NETWORK_BYTES, "network").ok()?;
-        let channel = moruna_svc::connect(&listener).ok()?;
+        let channel = moruna_svc::connect(listener).ok()?;
         net::Client::connect(channel, moruna_svc::deadline_in(30_000_000_000), account).ok()
     });
+    // The fetch worker (item 3.6), on its own connection to the network server.
+    let fetcher = match (&network, &network_listener, &own) {
+        (Some(_), Some(listener), Some(own)) => spawn_fetcher(listener, own, &console),
+        _ => None,
+    };
+    drop(network_listener);
     // The check account, set aside when the server serves `api` and runs no initial job: a
     // check runs beside a job (system design 3A).
     let check_account = if listener.is_some() && initial.is_none() {
@@ -676,6 +1030,9 @@ fn run() -> i64 {
         check: None,
         network,
         directory: start::take("directory").map(Channel),
+        cache: None,
+        fetcher,
+        fetching: None,
     }));
     // API mode: the server serves `api` and runs no initial job (system design 3A). The
     // service it lends each job's engine is its `linux` slot (each job's network is minted for

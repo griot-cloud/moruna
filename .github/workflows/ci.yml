@@ -360,7 +360,7 @@ jobs:
             -p moruna-storvsc -p moruna-storvsc-server -p storvsc-check -p block-protocol -p devices -p devices-protocol
             -p moruna-netvsc -p moruna-netvsc-server
             -p moruna-mmio -p moruna-pci -p moruna-virtio -p moruna-disk -p moruna-driver-table -p moruna-imagefs
-            -p moruna-linux -p linux-protocol -p moruna-nvme -p moruna-gve -p net-protocol
+            -p moruna-linux -p linux-protocol -p imagefs-protocol -p moruna-nvme -p moruna-gve -p net-protocol
             -p moruna-datapath -p moruna-sys -p moruna-node -p node-protocol -p moruna-netstack -p netstack-protocol -p node-functions -p moruna-node-http -p moruna-net-session -p moruna-api-server -p moruna-ostd-adaptation)
           cargo clippy --locked --target "$host" --all-targets "${packages[@]}" --features moruna-abi/manifest -- -D warnings
           cargo test --locked --target "$host" "${packages[@]}" --features moruna-abi/manifest

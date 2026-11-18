@@ -76,13 +76,13 @@ The functions. Each entry has a `kind`.
 {"kind": "std", "name": "select", "args": {"columns": ["review_id", "score"]}}
 ```
 
-**`function`**: `function` is the name a node's functions are registered under (`POST /v1/functions`), and the task runs that function:
+**`function`**: `function` is the name a node's functions are registered under (`POST /v1/functions`), and the task runs that function; `params` is its data, given to its process as `MORUNA_PARAMS` (a native function takes none):
 
 ```json
-{"kind": "function", "function": "taxi.clean"}
+{"kind": "function", "function": "taxi.score", "params": {"threshold": 0.5}}
 ```
 
-In version 2 it is a function task of kind `function` whose settings are `{"function": "<registered name>"}`. A node fetches each registered function a job names before the job starts, and refuses a name that is not registered at `validate`.
+In version 2 it is a function task of kind `function` whose settings are `{"function": "<registered name>"}` and its `params`. A node fetches each registered function a job names before the job starts, and refuses a name that is not registered at `validate`. The file's content decides how it runs: a native program of the Moruna kernel's user target runs on the data plane's rings, and a Moruna image archive runs its command on its own files, its batches as Arrow IPC. It runs only on a Moruna node.
 
 A `package` entry can set `fingerprint`, as printed by `moruna check`. Moruna then refuses to run the job if the loaded function's fingerprint differs, so a document cannot run a function that has changed since it was checked.
 

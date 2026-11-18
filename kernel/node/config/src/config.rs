@@ -20,7 +20,7 @@ pub const KEYS_MAX: usize = 8;
 /// One MiB: `functions.cache_bytes` is a whole number of them.
 pub const MIB: u64 = 1 << 20;
 /// `functions.cache_bytes` when node config does not give it: 1 GiB (system design 1D and 3E), or
-/// half the node's memory when that is less, the most a config may give.
+/// an eighth of the node's memory when that is less.
 pub const CACHE_BYTES_DEFAULT: u64 = 1 << 30;
 /// The least `functions.cache_bytes` may be: 64 MiB.
 pub const CACHE_BYTES_MIN: u64 = 64 * MIB;
@@ -245,7 +245,7 @@ impl NodeConfig {
     /// `node_memory_bytes` is the node's memory: the machine account's limit, which every
     /// service and job is carved from, as the supervisor reads it (PM, 2026-11-18). It bounds
     /// `functions.cache_bytes` at its half. A config that leaves `cache_bytes` out takes 1 GiB
-    /// or that half, whichever is less, and is never refused for it: a default is not the
+    /// or an eighth of it, whichever is less, and is never refused for it: a default is not the
     /// operator's choice.
     pub fn validate(user_data: &[u8], node_memory_bytes: u64) -> Result<NodeConfig, Refusal> {
         if user_data.iter().all(u8::is_ascii_whitespace) {
@@ -385,11 +385,14 @@ fn tls(tls: &Json) -> Result<Tls, Refusal> {
 }
 
 /// `functions.cache_bytes` when node config does not give it: 1 GiB (system design 1D and 3E),
-/// capped at half the node's memory, the most a config may give (PM, 2026-11-18). Never refused,
-/// and never held to a whole MiB or to 64 MiB: it is not the operator's choice. Only
+/// or an eighth of the node's memory when that is less: 256 MiB on a 2 GiB node, 1 GiB from 8 GiB
+/// up (PM, item 3.6). `node-admission` carves the cache's account of exactly this size from its
+/// own, so the job bound is what remains: a default of half the memory would leave a small node no
+/// job at all. Never refused, and never held to a whole MiB or to 64 MiB: it is not the
+/// operator's choice, whose value is held to half the memory instead ([`cache_bytes`]). Only
 /// [`NodeConfig::read`] derives it.
 fn default_cache_bytes(node_memory_bytes: u64) -> u64 {
-    CACHE_BYTES_DEFAULT.min(node_memory_bytes / 2)
+    CACHE_BYTES_DEFAULT.min(node_memory_bytes / 8)
 }
 
 /// `functions.cache_bytes` as node config gives it: a whole number of MiB, from 64 MiB to half

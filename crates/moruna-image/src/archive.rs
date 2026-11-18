@@ -30,7 +30,13 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use moruna_imagefs::format::{Header, PAGE};
+use moruna_imagefs::attached::{self, AttachedDisk};
+use moruna_imagefs::cache::Cache;
+use moruna_imagefs::format::{Header, Node, PAGE};
+use moruna_imagefs::fs::{Place, Tree};
+use moruna_imagefs::overlay::{Found, Overlay};
+use moruna_imagefs::scratch::Scratch;
+use moruna_imagefs::volume::Pages as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -374,6 +380,92 @@ fn write_with(
         size: writer.size,
         image,
     })
+}
+
+/// The cache an archive's files are read through: 256 KiB.
+const FILES_SLOTS: u32 = 64;
+
+/// An archive's files, read in place with the image filesystem's own reader
+/// (`moruna_imagefs::attached`): each layer mounted where it lies and refused unless sealed as
+/// the index says, each page checked against its hash as it is read. What the engine looks an
+/// image function's command up in before its task starts on the archive as its root (item
+/// 3.6); nothing is copied but the pages read.
+pub struct Files<'a> {
+    cache: Cache<AttachedDisk<&'a [u8]>>,
+    overlay: Overlay,
+    scratch: Scratch,
+}
+
+impl std::fmt::Debug for Files<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Files")
+            .field("layers", &self.overlay.layers().len())
+            .finish()
+    }
+}
+
+impl Archive {
+    /// The files of the archive that is `bytes`, the bytes [`Archive::parse`] read this from.
+    pub fn files<'a>(&self, bytes: &'a [u8]) -> Result<Files<'a>> {
+        let spans = self
+            .layers
+            .iter()
+            .map(|l| attached::Span {
+                offset: l.span.offset,
+                pages: l.span.pages,
+                seal: l.seal,
+            })
+            .collect();
+        let (cache, overlay) = attached::attach(bytes, spans, FILES_SLOTS)
+            .map_err(|e| refuse(format!("the archive's layers: {e:?}")))?;
+        Ok(Files {
+            cache,
+            overlay,
+            scratch: Scratch::new(),
+        })
+    }
+}
+
+impl Files<'_> {
+    fn resolve(&mut self, path: &str) -> Result<(usize, Node)> {
+        let tree = Tree {
+            overlay: &self.overlay,
+            scratch: &self.scratch,
+        };
+        match tree.resolve(&mut self.cache, path.as_bytes(), true) {
+            Ok(Place::Image(Found::File { layer, node, .. })) => Ok((layer, node)),
+            Ok(_) => Err(refuse(format!("{path} is not a file of the image"))),
+            Err(moruna_imagefs::Error::NotFound) => {
+                Err(refuse(format!("{path} is not in the image")))
+            }
+            Err(e) => Err(refuse(format!("{path}: {e:?}"))),
+        }
+    }
+
+    /// Whether `path`, absolute, is a file of the image, every link on the way followed.
+    pub fn is_file(&mut self, path: &str) -> bool {
+        self.resolve(path).is_ok()
+    }
+
+    /// The first `most` bytes of the file at `path`, or all of it when it is shorter.
+    pub fn head(&mut self, path: &str, most: usize) -> Result<Vec<u8>> {
+        let (layer, node) = self.resolve(path)?;
+        let map = self
+            .overlay
+            .file(&mut self.cache, layer, &node)
+            .map_err(|e| refuse(format!("{path}: {e:?}")))?;
+        let len = map.size.min(most as u64) as usize;
+        let mut out = vec![0u8; len];
+        for (i, chunk) in out.chunks_mut(PAGE).enumerate() {
+            // A hole reads as zeros.
+            if let Some(Some(page)) = map.layer_page(i as u64) {
+                self.cache
+                    .read(layer, page, 0, chunk)
+                    .map_err(|e| refuse(format!("{path}: {e:?}")))?;
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

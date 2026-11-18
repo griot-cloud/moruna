@@ -22,6 +22,11 @@
 //! grant engine channel engine           # slot `engine`: the channel the supervisor starts with
 //!                                      # under `engine`, handed to the program as it is
 //!                                      # (`moruna serve --listen channel:engine`; runs 1 only)
+//! grant functions functions           # `grant SLOT functions [FROM]`: slot `functions`, the
+//!                                      # index (FROM, `functions` by default) of the job's
+//!                                      # registered functions, and each one's file as
+//!                                      # `function.N`, as node-admission gives them
+//!                                      # (`node_protocol::functions`; system design 3E, 5C)
 //! runs 3                              # how many times it is started, one after another
 //! ```
 //!
@@ -67,6 +72,11 @@ pub enum Source {
     /// it is: on a node, the channel whose other end is `api`'s (system design 3A). A channel
     /// has one end here, so a configuration with one runs once.
     Channel(String),
+    /// The index of the job's registered functions, a data handle the supervisor starts with
+    /// under this slot name, handed on read-only under the grant's slot, and each function's
+    /// file it lists, handed on read-only as `function.N` (`node_protocol::functions`). A
+    /// supervisor given no index hands on none: the job uses no function.
+    Functions(String),
 }
 
 /// One handle the engine starts with.
@@ -122,6 +132,7 @@ fn source_roles(source: &Source) -> Vec<(&str, u8)> {
         // stream P
         Source::Process(name) => alloc::vec![(name.as_str(), 3)],
         Source::Channel(name) => alloc::vec![(name.as_str(), 4)],
+        Source::Functions(name) => alloc::vec![(name.as_str(), 5)],
         _ => Vec::new(),
     }
 }
@@ -213,6 +224,11 @@ impl Config {
                     if grants.iter().any(|g| g.slot == slot) {
                         return Err(refuse("the slot is granted twice"));
                     }
+                    if slot.starts_with("function.") {
+                        return Err(refuse(
+                            "`function.N` slots are the functions' a functions grant hands on",
+                        ));
+                    }
                     let kind = words.next();
                     let first = words.next();
                     let second = words.next();
@@ -259,6 +275,22 @@ impl Config {
                             }
                             Source::Channel(String::from(from))
                         }
+                        // `grant SLOT functions [FROM]`: the index the supervisor was given as
+                        // `FROM`, `functions` by default, as node-admission names it.
+                        (Some("functions"), from, None)
+                            if from.is_none_or(|from| {
+                                slot_ok(from) && from != "account" && !from.starts_with("function.")
+                            }) =>
+                        {
+                            let from = from.unwrap_or(node_protocol::functions::INDEX_SLOT);
+                            if grants
+                                .iter()
+                                .any(|g| matches!(g.source, Source::Functions(_)))
+                            {
+                                return Err(refuse("the functions are granted once"));
+                            }
+                            Source::Functions(String::from(from))
+                        }
                         (Some("disk"), Some(device), None)
                             if slot.starts_with("disk.") && slot_ok(device) =>
                         {
@@ -275,6 +307,7 @@ impl Config {
                                 "a grant is `grant SLOT lookup SERVICE`, `grant SLOT personality` \
                                  or `grant SLOT data SLOT` or `grant SLOT service SLOT` or \
                                  `grant SLOT process SLOT` or `grant SLOT channel SLOT` or \
+                                 `grant SLOT functions [SLOT]` or \
                                  `grant disk.SLOT disk DEVICE`",
                             ));
                         }
@@ -325,6 +358,16 @@ impl Config {
             runs,
         })
     }
+}
+
+/// The slots a `grant SLOT functions FROM` hands on besides `SLOT`, for the index `text` the
+/// supervisor was given: `function.0` onward, one a function it lists.
+pub fn function_slots(text: &str) -> Result<Vec<String>, String> {
+    let entries = node_protocol::functions::parse(text)
+        .map_err(|e| format!("the functions' index is refused: {e:?}"))?;
+    Ok((0..entries.len())
+        .map(node_protocol::functions::slot)
+        .collect())
 }
 
 #[cfg(test)]
@@ -642,5 +685,54 @@ mod tests {
                 "{text:?}: {got}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod functions_tests {
+    use super::*;
+
+    const BASE: &str = "program /moruna/bin/moruna\nmemory 4096\nscratch 4096\n";
+
+    #[test]
+    fn a_job_s_functions_are_handed_on_by_one_grant() {
+        let config = Config::parse(&format!("{BASE}grant functions functions\n")).unwrap();
+        assert_eq!(
+            config.grants,
+            [Grant {
+                slot: "functions".into(),
+                source: Source::Functions("functions".into()),
+            }]
+        );
+        for (text, why) in [
+            (
+                "grant functions functions\ngrant more functions\n",
+                "granted once",
+            ),
+            ("grant function.0 data x\n", "`function.N` slots"),
+            ("grant functions functions function.0\n", "a grant is"),
+            ("grant functions functions a b\n", "a grant is"),
+            ("grant functions functions account\n", "a grant is"),
+            (
+                "grant functions functions\ngrant i data functions\n",
+                "roles",
+            ),
+        ] {
+            let got = Config::parse(&format!("{BASE}{text}")).unwrap_err();
+            assert!(got.contains(why), "{text:?}: {got}");
+        }
+    }
+
+    #[test]
+    fn the_slots_handed_on_are_the_index_s_functions() {
+        let sha = "ab".repeat(32);
+        let index = format!("0 gate-score {sha} 4096\n1 add-one {sha} 10\n");
+        assert_eq!(
+            function_slots(&index).unwrap(),
+            ["function.0", "function.1"]
+        );
+        assert_eq!(function_slots("").unwrap(), Vec::<String>::new());
+        let refused = function_slots("0 Gate x 1\n").unwrap_err();
+        assert!(refused.contains("index is refused"), "{refused}");
     }
 }

@@ -3,7 +3,8 @@
 //! services, its budget and needs, and the engine's end of its channel, which the test then
 //! plays the engine on), and answers as `kernel/node/admission` does: the job bound, a check at
 //! a time, a state until the test ends the engine, and a connection's engines ended when the
-//! connection closes (its `Session::closed`).
+//! connection closes (its `Session::closed`). It keeps the function cache's size `api` sends
+//! (item 3.6) and the order of `api`'s first questions, and answers a launch as `Launched`.
 
 use std::{
     collections::BTreeMap,
@@ -12,7 +13,9 @@ use std::{
 };
 
 use moruna_svc::{Context, Decoder, Dispatcher, Handler, Memory, Outcome, ProtocolId, map};
-use node_protocol::{CANCELLED, Needs, RUNNING, TERMINATED, admission};
+use node_protocol::{
+    CANCELLED, Launched, Needs, RUNNING, Refusal, Registered, TERMINATED, admission,
+};
 
 use super::*;
 
@@ -28,6 +31,8 @@ pub struct Started {
     pub names: Vec<String>,
     pub services: Vec<String>,
     pub needs: Needs,
+    /// The job's functions as `api` registered them (item 3.6).
+    pub functions: Vec<Registered>,
     /// The engine's end of its channel to `api`, until the test takes it.
     pub channel: Option<Channel>,
 }
@@ -45,6 +50,11 @@ pub struct Book {
     pub closed: Vec<u64>,
     /// What the next start answers instead of starting.
     pub refuse: Option<admission::Error>,
+    /// What the next launch answers instead of starting, with its sentence (item 3.6).
+    pub refuse_with: Option<Refusal>,
+    /// The function cache's size `api` sent, and the order of its questions (item 3.6).
+    pub cache: Option<u64>,
+    pub asked: Vec<&'static str>,
     /// The check that holds the check account, until it is released.
     check: Option<u64>,
     next: u64,
@@ -160,6 +170,7 @@ fn text(config: Handle) -> String {
 }
 
 impl Fake {
+    #[allow(clippy::too_many_arguments)]
     fn started(
         &mut self,
         budget: Option<u64>,
@@ -168,6 +179,7 @@ impl Fake {
         mut grants: Vec<Handle>,
         services: Vec<String>,
         needs: Needs,
+        functions: Vec<Registered>,
     ) -> Result<u64, admission::Error> {
         let mut book = self.book.lock().unwrap();
         if let Some(refusal) = book.refuse.take() {
@@ -194,6 +206,7 @@ impl Fake {
             names,
             services,
             needs,
+            functions,
             channel: Some(Channel(grants.remove(0))),
         });
         Ok(id)
@@ -221,13 +234,31 @@ impl admission::Server for Fake {
         grants: Vec<Handle>,
         services: Vec<String>,
         needs: Needs,
-    ) -> Result<u64, admission::Error> {
+        functions: Vec<Registered>,
+    ) -> Result<Launched, admission::Error> {
+        if let Some(refusal) = self.book.lock().unwrap().refuse_with.take() {
+            return Ok(Launched::Refused(refusal));
+        }
         // As node-admission's (item 3.4): a job that names hosts gets its network as `network`.
         let mut names = names;
         if !needs.0.is_empty() {
             names.push("network".into());
         }
-        self.started(Some(budget), config, names, grants, services, needs)
+        // A refusal travels in the answer, with its sentence (item 3.6).
+        Ok(
+            match self.started(
+                Some(budget),
+                config,
+                names,
+                grants,
+                services,
+                needs,
+                functions,
+            ) {
+                Ok(id) => Launched::Started(id),
+                Err(error) => Launched::Refused(error.into()),
+            },
+        )
     }
 
     fn status(&mut self, _: &mut Context<'_>, job: u64) -> Result<u32, admission::Error> {
@@ -267,10 +298,27 @@ impl admission::Server for Fake {
         // As node-admission's (item 3.3): the node's volumes, as data, beside the channel.
         let mut names = names;
         names.push(node_protocol::VOLUMES_SLOT.into());
-        self.started(None, config, names, grants, services, Default::default())
+        self.started(
+            None,
+            config,
+            names,
+            grants,
+            services,
+            Default::default(),
+            Vec::new(),
+        )
     }
 
     fn bound(&mut self, _: &mut Context<'_>) -> Result<u64, admission::Error> {
-        Ok(self.book.lock().unwrap().bound)
+        let mut book = self.book.lock().unwrap();
+        book.asked.push("bound");
+        Ok(book.bound)
+    }
+
+    fn functions(&mut self, _: &mut Context<'_>, cache_bytes: u64) -> Result<(), admission::Error> {
+        let mut book = self.book.lock().unwrap();
+        book.asked.push("functions");
+        book.cache = Some(cache_bytes);
+        Ok(())
     }
 }

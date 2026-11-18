@@ -432,6 +432,7 @@ dependencies = [
  "moruna-storage-format",
  "moruna-storage-service",
  "moruna-svc",
+ "node-protocol",
 ]
 
 [[package]]
@@ -1331,6 +1332,7 @@ dependencies = [
  "moruna-svc",
  "moruna-sys",
  "netstack-protocol",
+ "node-functions",
  "node-protocol",
 ]
 
@@ -1344,6 +1346,7 @@ dependencies = [
  "moruna-node-http",
  "moruna-svc",
  "netstack-protocol",
+ "node-protocol",
  "rcgen",
  "rustls",
 ]

@@ -7,6 +7,13 @@
 //! `abi: moruna` names a program of the kernel's own user target instead: the engine checks
 //! its ELF against the declaration and starts it itself, a process of the kernel with its plane
 //! attached, never through the personality, and the task says its exit code on its rings.
+//!
+//! A registered function (item 3.6) is a task of either kind, by its file's content: a native
+//! program, which the kernel loads from the function's memory object where it lies
+//! ([`ImageTask::with_native_function`]), or a Moruna image archive, which the image filesystem
+//! attaches in place as the task's root ([`ImageTask::with_root`]; `run_plane`'s `root`,
+//! `moruna.linux` 4.0) so the personality runs its command on its own files.
+//!
 //! Its batches cross in one of two ways:
 //!
 //! - **ring mode** (`architecture/data-os.md` §5), for an image that declares
@@ -57,6 +64,7 @@ use moruna_svc::{
     Account, Channel, ClientCore, Encoder, Error as KernelError, Rights, Signals, Usage, Wire, map,
 };
 
+use crate::functions::Function;
 use crate::layout::{self, PAGE};
 use crate::ring::{LogRing, Stream};
 use crate::rings::{self, Released};
@@ -204,6 +212,70 @@ fn open_ring_plane(budget: u64, cpu: Option<u32>) -> OpenedPlane {
     Ok((plane, task, port))
 }
 
+/// The native program a stage starts itself: an image's ELF, read from its file (`abi:
+/// moruna`), or a registered function's memory object, which the kernel reads where it lies.
+#[derive(Clone)]
+enum Native {
+    Elf(Arc<[u8]>),
+    Function(Arc<Function>),
+}
+
+impl Native {
+    fn bytes(&self) -> usize {
+        match self {
+            Native::Elf(elf) => elf.len(),
+            Native::Function(f) => f.bytes().len(),
+        }
+    }
+
+    /// Loads it into `process`; its entry point.
+    fn load(&self, process: &moruna_svc::Process) -> std::result::Result<u64, KernelError> {
+        match self {
+            Native::Elf(elf) => load_native(process, elf),
+            // No copy of the engine's: the kernel reads the function's own object.
+            Native::Function(f) => process.map_image(f.memory()),
+        }
+    }
+}
+
+/// A registered image function's root (item 3.6): its Moruna image archive's memory object and
+/// its layers' spans, which the image filesystem attaches in place afresh for each task.
+pub struct Root {
+    function: Arc<Function>,
+    layers: Vec<imagefs_protocol::Attached>,
+}
+
+impl Root {
+    /// The archive `function`, whose layer files lie at `layers`: each its offset and length in
+    /// pages, and its header's seal, lowest first (`moruna_image::archive::Archive`'s).
+    pub fn new(
+        function: Arc<Function>,
+        layers: impl IntoIterator<Item = (u64, u64, [u8; 32])>,
+    ) -> Root {
+        Root {
+            function,
+            layers: layers
+                .into_iter()
+                .map(|(offset, pages, seal)| imagefs_protocol::Attached {
+                    offset,
+                    pages,
+                    seal: imagefs_protocol::Bytes(seal.to_vec()),
+                })
+                .collect(),
+        }
+    }
+
+    /// A task's root: an unconnected connection to the archive, attached.
+    fn attach(&self) -> std::result::Result<Channel, String> {
+        let image = moruna_svc::Memory(
+            self.function
+                .handle(Rights::READ | Rights::MAP | Rights::TRANSFER)?,
+        );
+        crate::filesystem::attach(image, self.layers.clone())
+            .map_err(|why| format!("the function `{}`: {why}", self.function.entry.name))
+    }
+}
+
 fn load_native(process: &moruna_svc::Process, elf: &[u8]) -> std::result::Result<u64, KernelError> {
     let bytes = layout::pages(elf.len() as u64).ok_or(KernelError::OutOfRange)?;
     let memory = moruna_svc::Memory::create(bytes)?;
@@ -296,8 +368,11 @@ pub struct ImageTask {
     assets_path: Option<std::path::PathBuf>,
     /// The image declares the ring protocol (`MORUNA_PLANE=rings`).
     rings: bool,
-    /// The native program the stage starts itself (`abi: moruna`): its ELF.
-    native: Option<Arc<[u8]>>,
+    /// The native program the stage starts itself: its ELF (`abi: moruna`), or a registered
+    /// function's memory object.
+    native: Option<Native>,
+    /// A registered image function's archive, each task's root.
+    root: Option<Arc<Root>>,
     /// What the stage's tasks share: how many hold a batch, their answers' schema, and what
     /// each did, for the run's report.
     busy: Arc<Busy>,
@@ -420,6 +495,7 @@ impl ImageTask {
             assets_path: None,
             rings,
             native: None,
+            root: None,
             busy: Arc::new(Busy {
                 figures: Mutex::new(vec![None; processes]),
                 ..Busy::default()
@@ -451,8 +527,24 @@ impl ImageTask {
     /// The entry declares `abi: moruna`: the command is a native program of the kernel's user
     /// target, `elf` ([`program`] checked it), which the stage starts itself on the rings.
     pub fn with_native(mut self, elf: Vec<u8>) -> Self {
-        self.native = Some(Arc::from(elf));
+        self.native = Some(Native::Elf(Arc::from(elf)));
         self.rings = true;
+        self
+    }
+
+    /// The stage is a registered function whose file is a native program of the kernel's user
+    /// target (item 3.6): the kernel loads it from the function's memory object, and the stage
+    /// starts it itself on the rings, as [`ImageTask::with_native`]'s.
+    pub fn with_native_function(mut self, function: Arc<Function>) -> Self {
+        self.native = Some(Native::Function(function));
+        self.rings = true;
+        self
+    }
+
+    /// The stage is a registered image function (item 3.6): each of its tasks runs on `root`,
+    /// the function's archive attached in place, instead of the boot image.
+    pub fn with_root(mut self, root: Root) -> Self {
+        self.root = Some(Arc::new(root));
         self
     }
 
@@ -675,9 +767,9 @@ impl ImageTask {
         })?;
         let ring = LogRing::new(RING_BYTES)
             .map_err(|e| kernel_error(format!("image `{name}`: its log ring: {e}")))?;
-        if let Some(elf) = &self.native {
+        if let Some(native) = &self.native {
             drop((input, output));
-            return self.start_native(ctx, memory, plane, task, port, ring, ceiling, elf);
+            return self.start_native(ctx, memory, plane, task, port, ring, ceiling, native);
         }
         let listener = personality().map_err(|e| kernel_error(format!("image `{name}`: {e}")))?;
         let channel = moruna_svc::connect(listener).map_err(|e| {
@@ -696,6 +788,12 @@ impl ImageTask {
         let (account, kept, limit) = self.carve(ceiling, false)?;
         let mut body = Encoder::new();
         let plane_arg = LinuxPlane {
+            root: self
+                .root
+                .as_deref()
+                .map(Root::attach)
+                .transpose()
+                .map_err(|why| kernel_error(format!("image `{name}`: {why}")))?,
             assets: self
                 .assets_path
                 .as_deref()
@@ -792,7 +890,7 @@ impl ImageTask {
         port: Option<Channel>,
         ring: LogRing,
         ceiling: u64,
-        elf: &[u8],
+        native: &Native,
     ) -> Result<TaskState> {
         let name = &self.name;
         let fail = |what: &str, e: KernelError| {
@@ -804,7 +902,9 @@ impl ImageTask {
         let process =
             moruna_svc::Process::create_in(resource, &layout::account_name(name), &account.0)
                 .map_err(|e| fail("making its process", e))?;
-        let entry = load_native(&process, elf).map_err(|e| fail("loading its program", e))?;
+        let entry = native
+            .load(&process)
+            .map_err(|e| fail("loading its program", e))?;
         let slots = plane
             .ring_slots(task)
             .map_err(|e| plane_error(name, "its slots", e))?;
@@ -818,7 +918,7 @@ impl ImageTask {
             .map_err(|e| fail("starting its process", e))?;
         drop(account);
         *lock(&memory.account) = Some((kept, limit));
-        tracing::info!(target: "micro", image = %name, command = ?self.command, bytes = elf.len(), "native task started");
+        tracing::info!(target: "micro", image = %name, command = ?self.command, bytes = native.bytes(), "native task started");
         Ok(self.state(ctx, memory, plane, task, ring, None, Some(process)))
     }
 
