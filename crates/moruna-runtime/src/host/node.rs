@@ -122,6 +122,18 @@ fn disk_serial(text: &str) -> Option<&str> {
     (!serial.is_empty()).then_some(serial)
 }
 
+/// Whether `value` holds an `s3://` URL, in any case of the scheme.
+fn names_s3(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text
+            .get(..5)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("s3://")),
+        Value::Array(items) => items.iter().any(names_s3),
+        Value::Object(map) => map.values().any(names_s3),
+        _ => false,
+    }
+}
+
 /// Every `disk://` serial in `value`.
 fn disk_serials<'a>(value: &'a Value, found: &mut Vec<&'a str>) {
     match value {
@@ -213,10 +225,19 @@ pub fn refusals(job: &Job, node: &Node) -> Vec<SpecError> {
             ),
         ));
     }
-    if let Some(s3) = &job.object_store.s3
-        && s3.endpoint.is_none()
-        && s3.region.is_none()
-    {
+    // AWS's own S3 is its region's host: one with neither endpoint nor region, or `s3://`
+    // URLs with no `object_store.s3` at all, would leave a host the node cannot name.
+    let unnamed = match &job.object_store.s3 {
+        Some(s3) => s3.endpoint.is_none() && s3.region.is_none(),
+        None => job.tasks.iter().any(|task| {
+            let mut found = false;
+            for value in task.settings.values() {
+                found |= names_s3(value);
+            }
+            found
+        }),
+    };
+    if unnamed {
         refused.push(SpecError::new(
             "object_store.s3.region",
             "a job on a node that uses AWS's own S3 names its region: the node lets the job \

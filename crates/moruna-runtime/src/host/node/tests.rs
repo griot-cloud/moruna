@@ -103,6 +103,14 @@ fn what_a_node_refuses_is_refused_by_its_field() {
         with(&|d| d["object_store"]["s3"] = json!({"bucket": "b"})),
         ["object_store.s3.region"]
     );
+    // Nor is it with s3:// URLs and no object_store.s3 at all.
+    assert_eq!(
+        with(&|d| {
+            d["object_store"] = json!({});
+            d["sink"]["url"] = json!("S3://bucket/out/");
+        }),
+        ["object_store.s3.region"]
+    );
     // Every one at once, in the order the document is read; the first is what admit refuses.
     let mut all = sound();
     all["source"]["url"] = json!("file:///in");
