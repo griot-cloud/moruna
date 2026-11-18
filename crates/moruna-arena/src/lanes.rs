@@ -17,6 +17,14 @@
 //! (`Inner::alloc_host_buffer`); a shrink flushes every lane of the regions it drains before it
 //! retires any, and a thread's lanes are flushed when it ends.
 //!
+//! The counters are the lane's too (AR-I5). A region counts a cached slot as in use from the
+//! refill that takes it to the flush that puts it back, so an allocation or a release through the
+//! cache writes no shared count; the lane counts what its cache holds and what it allocated, and
+//! the arena sums the lanes when it is read: in use is the regions' count less what the caches
+//! hold, exact when read. The high-water mark moves where the regions' count does, at a refill and
+//! a flush, so it is never below the most in use at once and at most what the caches held above
+//! it: threads × [`REFILL_QUANTUM`].
+//!
 //! A lane is kept by the arena's registry and found through a weak reference in the thread, so
 //! nothing a thread keeps outlives the arena: dropping the `Arena` empties and closes the
 //! registry, and the lanes then live only as long as the buffers that hold them. A thread's lanes
@@ -53,6 +61,7 @@ pub(crate) fn cached_class(bytes: u64) -> Option<usize> {
 
 /// A thread's way into one arena: its cache of free slots, and the handle its buffers of no
 /// host region hold.
+#[repr(align(128))]
 pub(crate) struct Lane {
     inner: Arc<Inner>,
     /// Free slots this thread keeps, by region and class. Its lock is the thread's own but when
@@ -60,22 +69,85 @@ pub(crate) struct Lane {
     cache: Mutex<Cache>,
     /// The bytes `cache` holds, written under its lock and read without it.
     cached: AtomicU64,
+    /// Allocations this thread made in the arena, written by it alone.
+    allocations: AtomicU64,
 }
 
 /// The slots a lane keeps, by the region they are in.
 #[derive(Default)]
 struct Cache {
     regions: Vec<Held>,
+    /// Where a refill's slots land before they are sorted into an entry; kept, so a refill
+    /// allocates nothing.
+    taken: Vec<u64>,
 }
 
 /// One region's free slots in a lane's cache, and the handle the lane's buffers in it hold.
+///
+/// Everything a thread writes per allocation and release (this entry, its [`Lane`] and its
+/// [`RegionLane`]) sits on cache lines of its own, 128 bytes on the machines Moruna runs on and
+/// the pair of 64-byte lines x86 fetches together: two threads' small heap objects on one line
+/// cost eight threads as much as one shared counter.
+#[repr(align(128))]
 struct Held {
     handle: Arc<RegionLane>,
-    slots: [Vec<u64>; CACHED],
+    slots: [Slots; CACHED],
+}
+
+/// The most slots of one class a cache holds in one region: a quantum of the smallest class.
+const SLOTS: usize = (REFILL_QUANTUM / GRANULE) as usize;
+
+/// Free slots of one class in one region's entry, held inline: a cache never holds more than a
+/// quantum, so never more than [`SLOTS`] of a class.
+struct Slots {
+    len: usize,
+    at: [u64; SLOTS],
+}
+
+impl Default for Slots {
+    fn default() -> Slots {
+        Slots {
+            len: 0,
+            at: [0; SLOTS],
+        }
+    }
+}
+
+impl Slots {
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn pop(&mut self) -> Option<u64> {
+        self.len = self.len.checked_sub(1)?;
+        Some(self.at[self.len])
+    }
+
+    /// False when the slots are full, which a cache within its quantum never is.
+    fn push(&mut self, off: u64) -> bool {
+        if self.len == SLOTS {
+            return false;
+        }
+        self.at[self.len] = off;
+        self.len += 1;
+        true
+    }
+
+    /// Takes the last `n` slots out, or all when there are fewer.
+    fn split_off(&mut self, n: usize) -> &[u64] {
+        let n = n.min(self.len);
+        self.len -= n;
+        &self.at[self.len..self.len + n]
+    }
 }
 
 /// What a host buffer holds to find its way home (contracts d.3): the thread that allocated it,
 /// as the arena's, and the region it is in.
+#[repr(align(128))]
 pub(crate) struct RegionLane {
     inner: Arc<Inner>,
     region: Arc<HostRegion>,
@@ -107,7 +179,15 @@ impl Lane {
             inner: Arc::clone(inner),
             cache: Mutex::new(Cache::default()),
             cached: AtomicU64::new(0),
+            allocations: AtomicU64::new(0),
         }
+    }
+
+    /// Counts one allocation. Only the lane's own thread allocates through it, so a load and a
+    /// store do, and no other thread's core is asked for the word.
+    pub(crate) fn count(&self) {
+        let n = self.allocations.load(Ordering::Relaxed);
+        self.allocations.store(n + 1, Ordering::Relaxed);
     }
 
     fn cache(&self) -> MutexGuard<'_, Cache> {
@@ -125,7 +205,7 @@ impl Lane {
         let mut cache = self.cache();
         let held = cache.regions.iter_mut().find(|h| !h.slots[c].is_empty())?;
         let off = held.slots[c].pop()?;
-        let ptr = held.handle.region.space.hand_out(off, requested, c);
+        let ptr = held.handle.region.space.hand_out(off, requested);
         let handle = Arc::clone(&held.handle);
         self.cached
             .store(self.cached() - class_size(c), Ordering::Relaxed);
@@ -149,14 +229,23 @@ impl Lane {
             .saturating_sub(cached)
             .min(REFILL_QUANTUM / 2);
         let want = (room / size) as usize + 1;
-        let held = cache.entry(&self.inner, region);
-        region.space.take(c, want, &mut held.slots[c]);
-        let off = held.slots[c].pop()?;
-        let ptr = region.space.hand_out(off, requested, c);
-        let handle = Arc::clone(&held.handle);
-        let kept = held.slots[c].len() as u64 * size;
-        self.cached.store(cached + kept, Ordering::Relaxed);
-        Some((ptr, handle))
+        let mut taken = std::mem::take(&mut cache.taken);
+        taken.clear();
+        region.space.take(c, want, &mut taken);
+        let served = taken.pop().map(|off| {
+            let held = cache.entry(&self.inner, region);
+            let ptr = region.space.hand_out(off, requested);
+            let fit = taken.len().min(SLOTS - held.slots[c].len());
+            for &slot in &taken[..fit] {
+                held.slots[c].push(slot);
+            }
+            region.space.put_back(c, taken[fit..].iter().copied());
+            self.cached
+                .store(cached + fit as u64 * size, Ordering::Relaxed);
+            (ptr, Arc::clone(&held.handle))
+        });
+        cache.taken = taken;
+        served
     }
 
     /// Keep the free class `c` slot at `off` in `region` for this thread's next allocations.
@@ -174,9 +263,12 @@ impl Lane {
         if cached + size > REFILL_QUANTUM {
             cached -= cache.shed(cached, (REFILL_QUANTUM / 2).saturating_sub(size), c);
         }
-        cache.entry(&self.inner, region).slots[c].push(off);
-        self.cached.store(cached + size, Ordering::Relaxed);
-        true
+        let kept = cache.entry(&self.inner, region).slots[c].push(off);
+        if kept {
+            cached += size;
+        }
+        self.cached.store(cached, Ordering::Relaxed);
+        kept
     }
 
     /// The handle a buffer cut from `region` holds. A draining region's is the buffer's own, so
@@ -230,18 +322,16 @@ impl Cache {
     fn shed(&mut self, cached: u64, target: u64, keep: usize) -> u64 {
         let mut left = cached;
         for others in [true, false] {
-            for held in &mut self.regions {
+            for Held { handle, slots } in &mut self.regions {
                 for c in (0..CACHED).filter(|&c| (c != keep) == others) {
                     if left <= target {
                         return cached - left;
                     }
                     let size = class_size(c);
-                    let slots = &mut held.slots[c];
-                    let n = ((left - target).div_ceil(size) as usize).min(slots.len());
-                    if n > 0 {
-                        let at = slots.len() - n;
-                        held.handle.region.space.put_back(c, slots.drain(at..));
-                        left -= n as u64 * size;
+                    let out = slots[c].split_off((left - target).div_ceil(size) as usize);
+                    if !out.is_empty() {
+                        left -= out.len() as u64 * size;
+                        handle.region.space.put_back(c, out.iter().copied());
                     }
                 }
             }
@@ -253,14 +343,15 @@ impl Cache {
     /// Returns the bytes put back.
     fn flush(&mut self, which: &dyn Fn(&HostRegion) -> bool, forget: bool) -> u64 {
         let mut flushed = 0;
-        for held in self.regions.iter_mut() {
-            if !which(&held.handle.region) {
+        for Held { handle, slots } in self.regions.iter_mut() {
+            if !which(&handle.region) {
                 continue;
             }
-            for (c, slots) in held.slots.iter_mut().enumerate() {
-                if !slots.is_empty() {
-                    flushed += slots.len() as u64 * class_size(c);
-                    held.handle.region.space.put_back(c, slots.drain(..));
+            for (c, slots) in slots.iter_mut().enumerate() {
+                let out = slots.split_off(SLOTS);
+                if !out.is_empty() {
+                    flushed += out.len() as u64 * class_size(c);
+                    handle.region.space.put_back(c, out.iter().copied());
                 }
             }
         }
@@ -283,6 +374,8 @@ struct Lanes {
     /// in a cycle through it.
     closed: bool,
     list: Vec<Arc<Lane>>,
+    /// Allocations counted by lanes that have left, with their threads.
+    departed: u64,
 }
 
 impl Registry {
@@ -320,6 +413,17 @@ impl Registry {
         self.lock().list.iter().map(|lane| lane.cached()).sum()
     }
 
+    /// Allocations every lane has counted, those that have left included.
+    pub(crate) fn allocations(&self) -> u64 {
+        let lanes = self.lock();
+        let live: u64 = lanes
+            .list
+            .iter()
+            .map(|lane| lane.allocations.load(Ordering::Relaxed))
+            .sum();
+        lanes.departed + live
+    }
+
     fn register(&self, lane: &Arc<Lane>) -> bool {
         let mut lanes = self.lock();
         if lanes.closed {
@@ -329,8 +433,14 @@ impl Registry {
         true
     }
 
+    /// Takes `lane` out, keeping what it counted. Its thread is ending, so it counts no more.
     fn remove(&self, lane: &Arc<Lane>) {
-        self.lock().list.retain(|l| !Arc::ptr_eq(l, lane));
+        let mut lanes = self.lock();
+        let before = lanes.list.len();
+        lanes.list.retain(|l| !Arc::ptr_eq(l, lane));
+        if lanes.list.len() < before {
+            lanes.departed += lane.allocations.load(Ordering::Relaxed);
+        }
     }
 }
 

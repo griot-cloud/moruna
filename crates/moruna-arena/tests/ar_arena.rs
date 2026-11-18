@@ -9,9 +9,10 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
-use moruna_arena::{Arena, ArenaConfig};
+use moruna_arena::{Arena, ArenaConfig, REFILL_QUANTUM};
 use moruna_kernel::{
     ALIGNMENT, Allocator, Buffer, BufferView, Guarantee, MorunaError, Tier, TierKind,
 };
@@ -93,46 +94,131 @@ fn ar_t2_budget_enforced() {
 }
 
 // AR-T5 stats_exact (02 k): a random alloc/release sequence against a model; `AllocStats`
-// equals the model at every step. AR-I5.
+// equals the model at every step, and the peak is the model's to within one quantum. Then four
+// threads at once, in lockstep rounds: after every round `AllocStats` equals the sum of their
+// models, and the peak lies between the most they held together at a round's end and the most
+// they can have held within a round, plus a quantum a thread. AR-I5.
+
+/// One thread's model of what it holds and has allocated.
+struct Model {
+    rng: common::Rng,
+    live: Vec<(Buffer, u64)>,
+    in_use: u64,
+    allocations: u64,
+}
+
+impl Model {
+    fn new(seed: u64) -> Model {
+        Model {
+            rng: common::Rng::new(seed),
+            live: Vec::new(),
+            in_use: 0,
+            allocations: 0,
+        }
+    }
+
+    /// Allocates up to 2 MiB, so classes a cache keeps and some it does not, or releases a live
+    /// buffer.
+    fn step(&mut self, arena: &Arena) {
+        let take = self.live.is_empty() || !self.rng.next().is_multiple_of(3);
+        if take {
+            let bytes = self.rng.upto(2 << 20);
+            // A refusal changes nothing: AR-I5 is about live buffers.
+            if let Ok(b) = arena.alloc(bytes as usize, Tier::Host) {
+                self.in_use += common::charged(bytes);
+                self.allocations += 1;
+                self.live.push((b, common::charged(bytes)));
+            }
+        } else {
+            let i = (self.rng.next() % self.live.len() as u64) as usize;
+            let (b, charged) = self.live.swap_remove(i);
+            drop(b);
+            self.in_use -= charged;
+        }
+    }
+}
 
 #[test]
 fn ar_t5_stats_exact() {
     let arena = common::host_arena(256 << 20);
-    let mut rng = common::Rng::new(0x5_7A75);
-    let mut live: Vec<(Buffer, u64)> = Vec::new();
-    let mut model_in_use = 0u64;
-    let mut model_allocations = 0u64;
-
+    let mut model = Model::new(0x5_7A75);
+    let mut model_peak = 0u64;
     for step in 0..5_000u32 {
-        let take = live.is_empty() || !rng.next().is_multiple_of(3);
-        if take {
-            let bytes = rng.upto(512 << 10);
-            match arena.alloc(bytes as usize, Tier::Host) {
-                Ok(b) => {
-                    model_in_use += common::charged(bytes);
-                    model_allocations += 1;
-                    live.push((b, common::charged(bytes)));
-                }
-                Err(_) => {
-                    // A refusal changes nothing: AR-I5 is about live buffers.
-                }
-            }
-        } else {
-            let i = (rng.next() % live.len() as u64) as usize;
-            let (b, charged) = live.swap_remove(i);
-            drop(b);
-            model_in_use -= charged;
-        }
+        model.step(&arena);
+        model_peak = model_peak.max(model.in_use);
         let stats = arena.stats();
-        assert_eq!(stats.host_in_use, model_in_use, "step {step}");
+        assert_eq!(stats.host_in_use, model.in_use, "step {step}");
         assert_eq!(stats.pinned_in_use, 0, "step {step}");
         assert_eq!(stats.device_in_use, [0u64; 8], "step {step}");
-        assert_eq!(stats.allocations_total, model_allocations, "step {step}");
+        assert_eq!(stats.allocations_total, model.allocations, "step {step}");
         assert_eq!(stats.payload_copies_total, 0, "step {step}");
         assert_eq!(stats.boundary_copies_total, 0, "step {step}");
+        let peak = arena.host_peak();
+        assert!(
+            model_peak <= peak && peak <= model_peak + REFILL_QUANTUM,
+            "step {step}: peak {peak}, the model's {model_peak}"
+        );
     }
+    drop(model);
+    assert_eq!(arena.stats().host_in_use, 0);
+    assert_eq!(arena.arena_stats().double_release, 0);
+}
 
-    drop(live);
+#[test]
+fn ar_t5_stats_exact_with_threads() {
+    const THREADS: usize = 4;
+    const ROUNDS: u32 = 1_000;
+    let arena = common::host_arena(256 << 20);
+    let round = Arc::new(Barrier::new(THREADS + 1));
+    // Each thread's in use and allocations, as of its last step.
+    let held: Arc<Vec<(AtomicU64, AtomicU64)>> = Arc::new(
+        (0..THREADS)
+            .map(|_| (AtomicU64::new(0), AtomicU64::new(0)))
+            .collect(),
+    );
+    let workers: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let (arena, round, held) = (Arc::clone(&arena), Arc::clone(&round), Arc::clone(&held));
+            std::thread::spawn(move || {
+                let mut model = Model::new(0xA_75 + t as u64);
+                for _ in 0..ROUNDS {
+                    round.wait();
+                    model.step(&arena);
+                    held[t].0.store(model.in_use, Ordering::SeqCst);
+                    held[t].1.store(model.allocations, Ordering::SeqCst);
+                    round.wait();
+                }
+                // Released once the last round is checked.
+                round.wait();
+                drop(model);
+            })
+        })
+        .collect();
+    let (mut before, mut least, mut most) = ([0u64; THREADS], 0u64, 0u64);
+    for r in 0..ROUNDS {
+        round.wait();
+        round.wait();
+        // Every thread is between rounds: nothing is in flight.
+        let now: [u64; THREADS] = std::array::from_fn(|t| held[t].0.load(Ordering::SeqCst));
+        let allocations: u64 = held.iter().map(|h| h.1.load(Ordering::SeqCst)).sum();
+        let stats = arena.stats();
+        assert_eq!(stats.host_in_use, now.iter().sum::<u64>(), "round {r}");
+        assert_eq!(stats.allocations_total, allocations, "round {r}");
+        // The threads held `now` together at the round's end, and within the round, one step
+        // each, never more than each one's larger figure.
+        least = least.max(now.iter().sum());
+        most = most.max((0..THREADS).map(|t| before[t].max(now[t])).sum());
+        before = now;
+        let peak = arena.host_peak();
+        assert!(
+            least <= peak && peak <= most + THREADS as u64 * REFILL_QUANTUM,
+            "round {r}: peak {peak}, between {least} and {most} plus a quantum a thread"
+        );
+    }
+    round.wait();
+    for w in workers {
+        w.join().expect("a worker");
+    }
     assert_eq!(arena.stats().host_in_use, 0);
     assert_eq!(arena.arena_stats().double_release, 0);
 }

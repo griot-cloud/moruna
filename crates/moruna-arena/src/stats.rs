@@ -41,8 +41,11 @@ impl Inner {
     /// The contract's per-tier accounting (AR-I5). `payload_copies_total` and
     /// `boundary_copies_total` are the copy counters other components own; the arena has no
     /// interface through which they can be raised and therefore always reports zero.
+    ///
+    /// In use is what the regions count less what the threads' caches hold, and the allocations
+    /// are each lane's count summed: exact when read, though no allocation writes a shared word.
     pub(crate) fn alloc_stats(&self) -> AllocStats {
-        let host: u64 = self.read_host().iter().map(|r| r.space.in_use()).sum();
+        let host = self.held(&self.read_host());
         let mut device_in_use = [0u64; 8];
         for region in &self.devices {
             device_in_use[region.index] = region.space.in_use();
@@ -51,7 +54,8 @@ impl Inner {
             host_in_use: if self.pinned { 0 } else { host },
             pinned_in_use: if self.pinned { host } else { 0 },
             device_in_use,
-            allocations_total: self.allocations.load(std::sync::atomic::Ordering::Relaxed),
+            allocations_total: self.allocations.load(std::sync::atomic::Ordering::Relaxed)
+                + self.lanes.allocations(),
             payload_copies_total: self
                 .payload_copies
                 .load(std::sync::atomic::Ordering::Relaxed),

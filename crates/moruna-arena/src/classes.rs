@@ -243,7 +243,10 @@ impl Space {
         self.bytes
     }
 
-    /// Charged bytes currently held by live buffers (AR-I5).
+    /// Charged bytes currently held by live buffers and by the threads' caches (f.3): a slot is
+    /// charged when a cache takes it and released when it is put back, so the arena subtracts
+    /// what the caches hold when it reads (AR-I5). A draining region is in no cache, so its count
+    /// is its buffers' alone.
     pub(crate) fn in_use(&self) -> u64 {
         self.in_use.load(Ordering::Relaxed)
     }
@@ -380,7 +383,9 @@ impl Space {
     /// the region has room for one, taken as an allocation takes its slot: the class list first,
     /// then a fresh slab or a larger class's slot, then merged buddies. The slots are free and on
     /// no list, so no allocation and no merge sees them until [`Space::hand_out`] gives one to a
-    /// buffer or [`Space::put_back`] returns it. The class lock is taken once.
+    /// buffer or [`Space::put_back`] returns it. They are charged now, all at once, and the
+    /// high-water mark with them: this is where the peak moves (AR-I5). The class lock is taken
+    /// once.
     pub(crate) fn take(&self, c: usize, want: usize, out: &mut Vec<u64>) {
         let before = out.len();
         {
@@ -403,21 +408,36 @@ impl Space {
         {
             out.push(off);
         }
+        let charged = (out.len() - before) as u64 * class_size(c);
+        if charged > 0 {
+            self.in_use.fetch_add(charged, Ordering::Relaxed);
+            self.watermark.charge(charged);
+        }
     }
 
-    /// Give a slot [`Space::take`] took to a buffer of `requested` bytes: what `alloc` does once
-    /// it has its slot. Returns the slot's address.
-    pub(crate) fn hand_out(&self, off: u64, requested: u64, c: usize) -> *mut u8 {
-        self.activate(off, requested, class_size(c));
+    /// Give a slot [`Space::take`] took, and charged, to a buffer of `requested` bytes. Returns
+    /// the slot's address. Nothing shared is written but the slot's own count.
+    pub(crate) fn hand_out(&self, off: u64, requested: u64) -> *mut u8 {
+        self.outstanding[(off / GRANULE) as usize].store(requested, Ordering::Release);
         // SAFETY: `off` is a class slot `take` cut from this region, so it is below `bytes`
         // and the address is inside the mapping this `Space` owns (AR-I2).
         unsafe { self.base.add(off as usize) }
     }
 
-    /// Put free class `c` slots back on their list: a thread's cache flushing, or a slot whose
-    /// last bytes came back that no cache keeps.
+    /// Put free class `c` slots back on their list and release their charge: a thread's cache
+    /// flushing, or a slot whose last bytes came back that no cache keeps.
     pub(crate) fn put_back(&self, c: usize, slots: impl IntoIterator<Item = u64>) {
-        self.lock_free(c).extend(slots);
+        let put = {
+            let mut fl = self.lock_free(c);
+            let before = fl.len();
+            fl.extend(slots);
+            fl.len() - before
+        };
+        let released = put as u64 * class_size(c);
+        if released > 0 {
+            self.in_use.fetch_sub(released, Ordering::Relaxed);
+            self.watermark.release(released);
+        }
     }
 
     /// Serve class `c` from what the free lists hold once free buddies are merged (f.5).
@@ -578,7 +598,8 @@ impl Space {
     }
 
     /// [`Space::release`], except that a class slot whose last bytes came back is handed to the
-    /// caller, free and on no list, instead of going back on its class list.
+    /// caller, free, on no list and still charged, instead of going back on its class list: a
+    /// cache keeps it as it is, and [`Space::put_back`] releases the charge.
     pub(crate) fn give_back(&self, ptr: *mut u8, len: u64) -> Returned {
         if len == 0 {
             return Returned::Done(Release::Partial);
@@ -615,8 +636,6 @@ impl Space {
             if next > 0 {
                 return Returned::Done(Release::Partial);
             }
-            self.in_use.fetch_sub(size, Ordering::Relaxed);
-            self.watermark.release(size);
             return Returned::Slot {
                 class: c,
                 offset: slot,
@@ -786,6 +805,45 @@ mod tests {
         assert_eq!(h.space.alloc(2 * GRANULE).map(|(_, c)| c), Ok(2 * GRANULE));
         assert_eq!(h.space.release(big, 8 * MIB), Release::Freed);
         assert_eq!(h.space.double_releases(), 0);
+    }
+
+    /// A cache's slots are charged, and raise the mark, when they are taken, and released when
+    /// they are put back; handing one out and giving it back writes only the slot's own count.
+    #[test]
+    fn a_cached_slot_is_charged_from_take_to_put_back() {
+        let h = heap(4 * MIB, true);
+        let mut slots = Vec::new();
+        h.space.take(0, 4, &mut slots);
+        assert_eq!(slots.len(), 4);
+        assert_eq!(h.space.in_use(), 4 * GRANULE);
+        assert_eq!(h.space.watermark.peak(), 4 * GRANULE);
+        let off = slots.pop().expect("a slot");
+        let ptr = h.space.hand_out(off, 100);
+        assert_eq!(h.space.in_use(), 4 * GRANULE, "charged when taken");
+        assert_eq!(
+            h.space.give_back(ptr, 100),
+            Returned::Slot {
+                class: 0,
+                offset: off
+            }
+        );
+        assert_eq!(h.space.in_use(), 4 * GRANULE, "still the cache's");
+        assert_eq!(h.space.give_back(ptr, 100), Returned::Done(Release::Double));
+        slots.push(off);
+        h.space.put_back(0, slots);
+        assert_eq!(h.space.in_use(), 0);
+        assert_eq!(h.space.watermark.live(), 0);
+        assert_eq!(h.space.watermark.peak(), 4 * GRANULE);
+        // A full region gives a cache nothing, and charges nothing.
+        let mut all = Vec::new();
+        h.space.take(6, 2, &mut all);
+        assert_eq!(all.len(), 1, "the one 4 MiB block");
+        let mut none = Vec::new();
+        h.space.take(0, 4, &mut none);
+        assert!(none.is_empty());
+        assert_eq!(h.space.in_use(), 4 * MIB);
+        h.space.put_back(6, all);
+        assert_eq!(h.space.in_use(), 0);
     }
 
     #[test]
