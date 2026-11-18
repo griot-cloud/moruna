@@ -40,7 +40,7 @@ tokio = { workspace = true, features = ["time"] }
 default = []
 s3 = ["object_store/aws"]
 gcs = ["object_store/gcp"]
-native = ["dep:moruna-micro", "dep:moruna-sys", "dep:moruna-svc", "dep:moruna-storage-service"]
+native = ["dep:moruna-micro", "dep:moruna-sys", "dep:moruna-svc", "dep:moruna-storage-service", "dep:moruna-net-session"]
 
 # The real Linux personality on the Moruna kernel, never the SDK host simulator.
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
@@ -48,3 +48,5 @@ moruna-micro = { workspace = true, optional = true }
 moruna-sys = { workspace = true, optional = true }
 moruna-svc = { workspace = true, features = ["native"], optional = true }
 moruna-storage-service = { workspace = true, optional = true }
+# The job's network on a node (item 3.4): a session a socket, through moruna.net.
+moruna-net-session = { workspace = true, optional = true }

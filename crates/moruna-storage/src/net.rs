@@ -502,6 +502,11 @@ impl Drop for PooledBody {
     }
 }
 
+/// The job's network on a node: `moruna-net-session`'s sockets as a [`Network`], and the
+/// install from the engine's start handles.
+#[cfg(all(feature = "native", target_os = "linux", target_arch = "x86_64"))]
+pub mod native;
+
 #[cfg(test)]
 mod tests {
     use super::*;
