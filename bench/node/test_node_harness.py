@@ -119,8 +119,8 @@ def test_names_and_the_guard():
     every = [azure.group_create(c), *azure.storage(c), azure.storage_key(c), *azure.containers(c, "K"),
              azure.upload(c, "K", "data", "f", "/f"), azure.sas(c, "K", "data", "r", "2026-11-18T00:00Z"),
              azure.blob_url(c, "K", "vhds", "node.vhd"), azure.node_disk(c, "u", "i"), azure.account_id(c),
-             *azure.nsgs(c), azure.node_vm(c, "/cfg"), *azure.boot_diagnostics(c), azure.boot_log(c),
-             azure.public_ip(c, azure.NODE), azure.linux_vm(c, "/k.pub"), azure.image_version(c),
+             *azure.nsgs(c, "203.0.113.9"), azure.node_ip(c), azure.node_vm(c, "/cfg"), azure.boot_log(c),
+             azure.node_address(c), azure.linux_vm(c, "/k.pub"), azure.image_version(c),
              azure.run_command(c, "true", ["A=1"]), azure.group_delete(c), azure.group_exists(c)]
     for cmd in every:
         azure.guard(c, cmd)
@@ -148,11 +148,19 @@ def test_commands_are_well_formed():
     assert rc.index("--parameters") < rc.index("--query") and rc[rc.index("--parameters") + 1] == "SAS=a=b&c"
     assert "--parameters" not in azure.run_command(c, "true")
     node = azure.node_vm(c, "/cfg")
+    # AZURE.md, step 6: boot diagnostics into the run's account from power-on, never restarted.
     for flag, value in (("--security-type", "Standard"), ("--accelerated-networking", "false"), ("--zone", "3"),
-                        ("--size", "Standard_D4s_v4"), ("--user-data", "/cfg")):
+                        ("--size", "Standard_D4s_v4"), ("--user-data", "/cfg"), ("--public-ip-address", "moruna-node-ip"),
+                        ("--boot-diagnostics-storage", c.account)):
         assert node[node.index(flag) + 1] == value
-    rule = azure.nsgs(c)[1]
+    assert "--no-wait" in node and "--public-ip-sku" not in node
+    # Step 5: TCP 443 from the operator's address alone.
+    rule = azure.nsgs(c, "203.0.113.9")[1]
     assert rule[rule.index("--destination-port-ranges") + 1] == "443"
+    assert rule[rule.index("--source-address-prefixes") + 1] == "203.0.113.9/32"
+    ip = azure.node_ip(c)
+    assert ip[ip.index("--allocation-method") + 1] == "Static" and ip[ip.index("--zone") + 1] == "3"
+    assert "functions" in azure.CONTAINERS
     assert azure.redact(["az", "x", "--account-key", "secret"], {"storage-key": "secret"}) == \
         "az x --account-key <storage-key>"
 
@@ -181,19 +189,99 @@ def test_the_dry_run_lists_every_command_and_creates_nothing(tmp_path):
     assert [a.split("--id ")[1].split()[0] for a in measured] == [r["id"] for r in linux]
     assert sum("measure.py check" in a for a in azs) == len(node)
     assert sum(" POST https://<node-address>/v1/jobs " in line for line in steps) == len(node)
-    assert sum("/v1/functions" in line for line in steps) == 4
+    # Each job followed over SSE to its exit, as proof.py follows one.
+    assert sum("/events?from=0 (Server-Sent Events" in line for line in steps) == len(node)
+    # The proof's registration: each task at its SAS address.
+    assert sum(" POST https://<node-address>/v1/functions " in line for line in steps) == 4
+    assert any('"address":"https://mrnb202611180900.blob.core.windows.net/functions/gate-score?<FUNCTIONS_SAS>"'
+               in line for line in steps)
+    assert sum("blob upload -c functions -n gate-" in a for a in azs) == 4
+    assert any("generate-sas -n functions --permissions r " in a for a in azs)
     assert any("setup-linux.sh" in a for a in azs) and any("--make-reference /data/ref/score.dump" in a for a in azs)
     # Every engine reads and writes the one container; the key reaches the machine redacted here.
     assert all("'BENCH_KEY=<storage-key>'" in a and "BENCH_CONTAINER=data" in a for a in measured)
     assert sum("blob upload -c data -n nyc/yellow_tripdata_2024-" in a for a in azs) == 12
-    assert any('"url":"https://mrnb202611180900.blob.core.windows.net/data/out/score-moruna-node-r1/"' in line
-               for line in steps)
+    # The proof's job document: the function by name, Blob by `az://`, the key by secret name.
+    job = next(line for line in steps if " POST https://<node-address>/v1/jobs " in line and "score-moruna-node-r1" in line)
+    assert '"kernels":[{"kind":"function","function":"gate-score"}]' in job
+    assert '"url":"az://data/out/score-moruna-node-r1/"' in job and '"az://data/nyc/yellow_tripdata_2024-12.parquet"' in job
+    assert '"access_key":{"secret":"blob-key"}' in job and '"secrets":{"blob-key":"<storage-key>"}' in job
+    assert '"budget":{"memory_bytes":"<job-memory-bytes>","cpu":4}' in job
+    # AZURE.md's node: never restarted, 443 from the operator alone.
+    assert not any("vm restart" in a or "boot-diagnostics enable" in a for a in azs)
+    assert any("--source-address-prefixes '<operator-address>/32'" in a for a in azs)
     assert not (tmp_path / "results").exists()
+
+
+def fake_inputs(tmp_path, disk_mib=2, disk_type=2, cookie=b"conectix", machine=62):
+    """A fixed VHD of `disk_mib` MiB and the four gate tasks, as x86_64 ELF headers."""
+    vhd = tmp_path / "node.vhd"
+    footer = bytearray(512)
+    footer[:8] = cookie
+    footer[48:56] = (disk_mib << 20).to_bytes(8, "big")
+    footer[60:64] = disk_type.to_bytes(4, "big")
+    vhd.write_bytes(b"\0" * (disk_mib << 20) + bytes(footer))
+    tasks = tmp_path / "tasks"
+    tasks.mkdir(exist_ok=True)
+    for job in plans.JOBS:
+        (tasks / f"gate-{job}").write_bytes(b"\x7fELF" + b"\0" * 14 + machine.to_bytes(2, "little") + b"rest")
+    return str(vhd), str(tasks)
+
+
+def test_the_dry_run_checks_the_image_the_tasks_and_the_address(tmp_path):
+    vhd, tasks = fake_inputs(tmp_path)
+    lines = dry(tmp_path, "--vhd", vhd, "--tasks", tasks, "--from", "203.0.113.9")
+    notes = "\n".join(line for line in lines if line.startswith("      # "))
+    assert f"node image: {vhd}, {(2 << 20) + 512} bytes, a fixed VHD of 2 MiB, sha256 " in notes
+    assert f"gate tasks: {tasks}: gate-score " in notes and "TCP 443 from 203.0.113.9/32 alone" in notes
+    assert "2 machines of Standard_D4s_v4 at once, 8 vCPUs" in notes and "12 files from" in notes
+    steps = [line for line in lines if line.startswith("[")]
+    # With the tasks given, proof.py registers them: the node's list first, then each by its SHA-256.
+    assert any(" GET https://<node-address>/v1/functions" in line for line in steps)
+    digest = run.sha256_of(os.path.join(tasks, "gate-score"))
+    assert any('"name":"gate-score"' in line and f'"sha256":"{digest}"' in line for line in steps)
+    assert any(f"blob upload -c vhds -n node.vhd -f {vhd} --type page" in line for line in steps)
+    assert any("--source-address-prefixes 203.0.113.9/32" in line for line in steps)
+
+
+@pytest.mark.parametrize("kw,extra,message", [
+    ({"cookie": b"notavhd!"}, [], "not a VHD"),
+    ({"disk_type": 3}, [], "not a fixed VHD"),
+    ({"machine": 183}, [], "not an x86_64 ELF"),
+    ({}, ["--from", "203.0.113"], "not an IPv4 address"),
+])
+def test_the_dry_run_refuses_wrong_inputs(tmp_path, kw, extra, message):
+    vhd, tasks = fake_inputs(tmp_path, **kw)
+    with pytest.raises(SystemExit, match=message):
+        dry(tmp_path, "--vhd", vhd, "--tasks", tasks, *extra)
+
+
+def test_wrong_inputs_are_refused_before_anything_runs(tmp_path):
+    vhd, tasks = fake_inputs(tmp_path)
+    os.remove(os.path.join(tasks, "gate-audit"))
+    with pytest.raises(SystemExit, match="no gate task at .*gate-audit"):
+        dry(tmp_path, "--tasks", tasks)
+    with pytest.raises(SystemExit, match="no VHD at"):
+        dry(tmp_path, "--vhd", str(tmp_path / "none.vhd"))
+    odd = tmp_path / "odd.vhd"
+    footer = bytearray(open(vhd, "rb").read()[-512:])
+    odd.write_bytes(b"\0" * 1000 + bytes(footer))
+    with pytest.raises(SystemExit, match="not the file less its footer"):
+        dry(tmp_path, "--vhd", str(odd))
+    plan = nyc_plan()
+    plan["dataset"]["source_dir"] = str(tmp_path / "nodata")
+    path = tmp_path / "p.json"
+    path.write_text(json.dumps(plan))
+    with pytest.raises(SystemExit, match="the plan's data is not all in"):
+        run.main(["--plan", str(path), "--dry-run", "--results", str(tmp_path / "r")], out=io.StringIO())
 
 
 def test_real_mode_needs_its_inputs(tmp_path):
     with pytest.raises(SystemExit):
         run.main(["--plan", "nyc-2024", "--go", "--results", str(tmp_path)])
+    vhd, tasks = fake_inputs(tmp_path)
+    with pytest.raises(SystemExit, match="needs --vhd, --tasks and --from"):
+        run.main(["--plan", "nyc-2024", "--go", "--vhd", vhd, "--tasks", tasks, "--results", str(tmp_path)])
     with pytest.raises(SystemExit):
         run.main(["--plan", "nyc-2024", "--local"])
 
@@ -203,36 +291,59 @@ def test_real_mode_needs_its_inputs(tmp_path):
 PIN = "ab" * 32
 
 
+# A schema 3.1 report, as the node's engine writes it (docs/run-report.md): reads and decodes on
+# the source's task, encodes and writes on the sink's, the function's busy time and waits.
+REPORT = {"schema_version": "3.1", "wall_ms": 3000.0, "peak_anon_bytes": 3 << 30,
+          "resources": {"cpu_core_s": 20.0, "peak_memory_bytes": 3 << 30},
+          "budget": {"memory_bytes": 13 << 30}, "object_io": {"room_bytes": 1 << 30, "requests": 64},
+          "exit": {"code": 0, "status": "completed", "diagnostic": None},
+          "tasks": [{"key": "src", "role": "source", "read_ms": 700.0, "decode_ms": 300.0},
+                    {"key": "fn", "role": "function", "busy_ms": 4000.0, "input_wait_ms": 10.0, "output_wait_ms": 20.0},
+                    {"key": "out", "role": "sink", "encode_ms": 200.0, "write_ms": 300.0}]}
+
+
 class FakeNode:
-    def __init__(self):
-        self.calls, self.jobs = [], 0
+    """The node's API: the calls kept; each job completes, its events streamed to the exit."""
+
+    def __init__(self, refuse=(), fail=()):
+        self.calls, self.jobs, self.bodies, self.refuse, self.fail = [], 0, [], refuse, fail
 
     def __call__(self, method, path, body=None, token=None):
         self.calls.append((method, path, token))
         if path == "/v1/node":
-            return 200, json.dumps({"memory_bytes": 16 << 30}).encode()
+            return 200, json.dumps({"memory_bytes": 16 << 30, "job_memory_bytes": 13 << 30, "instance": "i-1",
+                                    "version": "0.1.0"}).encode()
         if path == "/v1/functions":
-            return 201, b"{}"
+            return (200, b'{"functions": []}') if method == "GET" else (201, b"{}")
         if path == "/v1/jobs":
             self.jobs += 1
+            self.bodies.append(body)
+            if self.jobs in self.refuse:
+                return 422, b'{"error":{"code":"invalid","message":"no"}}'
             return 201, json.dumps({"id": f"j{self.jobs}"}).encode()
-        if path.endswith("/events?from=0"):
-            return 200, (b'data: {"type":"heartbeat","t_ms":500,"rows_out":0}\n\n'
-                         b'data: {"type":"event","kind":"task_started","task":"sink","t_us":1000000}\n\n')
-        if path.endswith("/report"):
-            return 200, json.dumps({"cpu_s": 20.0, "peak_anon_bytes": 3 << 30, "exit": "completed",
-                                    "tasks": [{"role": "source", "busy_ms": 1000}, {"role": "function", "busy_ms": 4000,
-                                               "input_wait_ms": 10, "output_wait_ms": 20},
-                                              {"role": "sink", "busy_ms": 500}]}).encode()
-        return 200, json.dumps({"state": "completed", "times": {"accepted": 101.0, "ended": 104.0}}).encode()
+        if path.endswith("/cancel"):
+            return 200, b"{}"
+        return 200, json.dumps({"id": path.split("/")[3], "state": "completed", "submitted": 101, "started": 102,
+                                "ended": 105, "exit_code": 0}).encode()
+
+    def stream(self, method, path, token=None):
+        self.calls.append((method, path, token))
+        n = int(path.split("/")[3][1:])
+        if n in self.fail:
+            raise node_api.ApiError(f"{method} {path}: 404 b'no'")
+        yield from ["id: 1", "event: event", 'data: {"type":"heartbeat","t_ms":500,"rows_out":0}', "",
+                    "id: 2", "event: event", 'data: {"type":"event","kind":"task_started","task":"sink","t_us":1000000}',
+                    "", "event: report", "data: " + json.dumps({"type": "report", "report": REPORT, "plan": None}), "",
+                    "event: exit", 'data: {"type":"exit","code":0,"diagnostic":null}', ""]
 
 
 class Fake(run.DryRun):
     """A run's executor whose cloud is a dictionary: what a real run would learn, made up."""
 
-    def __init__(self, results, fail_on=None):
+    def __init__(self, results, fail_on=None, node=None, console_after=0):
         super().__init__(io.StringIO())
-        self.results, self.fail_on, self.azs, self.node = results, fail_on, [], FakeNode()
+        self.results, self.fail_on, self.azs, self.node = results, fail_on, [], node or FakeNode()
+        self.console_after = console_after
 
     def az(self, cmd, out=None, secrets=None):
         azure.guard(azure.Cloud("202611180900"), cmd)
@@ -245,9 +356,12 @@ class Fake(run.DryRun):
         if "generate-sas" in text:
             return "sv=1&sig=x"
         if "get-boot-log" in text:
+            # Made with --no-wait: the first looks may find no machine yet.
+            if sum("get-boot-log" in a for a in self.azs) <= self.console_after:
+                raise RuntimeError("az: (ResourceNotFound) the machine is not there yet")
             return (f"moruna: cloud azure instance i-1\nmoruna: tls sha256={PIN}\n"
                     "moruna: ready api=10.0.0.4:443 boot_ms=2140\n")
-        if "publicIps" in text:
+        if "public-ip show" in text:
             return "203.0.113.9"
         if "group exists" in text:
             return "false"
@@ -285,46 +399,66 @@ class Fake(run.DryRun):
 
     def connect(self, url, pin):
         assert (url, pin) == ("https://203.0.113.9", PIN)
+        self.transport = self.node
 
     def http(self, method, path, body=None, token=None):
         return self.node(method, path, body, token)
 
     def poll(self, what, every_s, at_most_s, fn):
-        return fn()
+        for _ in range(5):
+            got = fn()
+            if got is not None:
+                return got
+        return None
 
     def save(self, path, obj):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         json.dump(obj, open(path, "w"), default=str)
 
-    def finish(self, plan, results, meta):
-        self.summary = run.finish(plan, results, meta, log=os.path.join(results, "benchmark-log.md"))
+    def finish(self, plan, results, meta, log=True):
+        self.logged = log
+        self.summary = run.finish(plan, results, meta, log=os.path.join(results, "benchmark-log.md") if log else None)
 
 
 class Args:
-    vhd, tasks, ref066 = "/node.vhd", "/tasks", "fix/adaptive-runtime"
+    vhd, tasks, ref066, operator = "/node.vhd", "/tasks", "fix/adaptive-runtime", "203.0.113.9"
 
 
 def test_a_whole_run_against_fakes(tmp_path):
     p = nyc_plan()
     results = str(tmp_path)
-    x = Fake(results)
-    run.Bench(p, x, azure.Cloud("202611180900"), Args(), results, "/secrets").go()
+    _, tasks = fake_inputs(tmp_path)
+    args = Args()
+    args.tasks = tasks
+    x = Fake(results, console_after=2)
+    run.Bench(p, x, azure.Cloud("202611180900"), args, results, "/secrets").go()
     assert x.azs[-2].startswith("az group delete") and x.azs[-1].startswith("az group exists")
     assert ("POST", "/v1/jobs", "t-submit") in x.node.calls and ("GET", "/v1/node", "t-observe") in x.node.calls
-    assert ("POST", "/v1/functions", "t-admin") in x.node.calls
+    assert ("POST", "/v1/functions", "t-admin") in x.node.calls and ("GET", "/v1/functions", "t-observe") in x.node.calls
+    # The console was looked at again while the machine was not there yet.
+    assert sum("get-boot-log" in a for a in x.azs) == 3
     node_rec = json.load(open(tmp_path / "node" / "score-moruna-node-r1.json"))
-    # Accepted at 101 s, the output written at 104 s by the node's clock: 3 s of operational time;
-    # the boot is start-up; the node's memory less 768 MiB is what it was given.
-    assert (node_rec["operational_s"], node_rec["startup_s"], node_rec["ok"]) == (3.0, 2.14, True)
-    assert node_rec["operational_by"] == "the node's clock" and node_rec["marks"]["first_rows_s"] == 1.0
-    assert node_rec["memory_gib"] == 15.25 and node_rec["data"] == "blob"
-    assert node_rec["split"]["function_s"] == 4.0 and node_rec["output_check"]["ok"]
+    # Operational time is the engine's own wall, its report's 3,000 ms; start-up is the job record's
+    # submitted (101 s) to started (102 s), within 1 s; the node's job bound (13 GiB) is each
+    # job's budget. The end-to-end time by this machine's clock is kept, and the boot.
+    assert (node_rec["operational_s"], node_rec["startup_s"], node_rec["ok"]) == (3.0, 1, True)
+    assert node_rec["operational_by"] == "the engine's report, wall_ms" and node_rec["startup_within_s"] == 1
+    assert node_rec["marks"]["first_rows_s"] == 1.0 and node_rec["marks"]["wall_ms"] == 3000.0
+    assert node_rec["marks"]["end_to_end_s"] >= 0 and node_rec["boot_ms"] == 2140
+    assert node_rec["memory_gib"] == 13.0 and node_rec["data"] == "blob" and node_rec["cpu_s"] == 20.0
+    assert node_rec["split"] == {"read_s": 0.7, "decode_s": 0.3, "function_s": 4.0, "encode_s": 0.2, "write_s": 0.3,
+                                 "wait_s": 0.03}
+    assert node_rec["output_check"]["ok"] and node_rec["object_io"]["requests"] == 64
+    doc = x.node.bodies[0]["v1"]
+    assert doc["budget"]["memory_bytes"] == 13 << 30 and doc["kernels"] == [{"kind": "function", "function": "gate-score"}]
+    assert x.node.bodies[0]["secrets"] == {"blob-key": "KEY"}
     s = x.summary["jobs"]["score"]["engines"]
     assert s["moruna-node"]["operational_s"] == 3.0 and s["moruna-node"]["runs"] == 5
     assert s["duckdb"]["operational_s"] == 12.0 and s["duckdb"]["output"] == "bit for bit"
     assert "duckdb-sql" not in s and "duckdb-sql" in x.summary["jobs"]["enrich"]["engines"]
     table_text = open(tmp_path / "table.md").read()
-    assert "| Moruna 0.7, the node | rust | 3.0 | 2.14 | 20.0 | 3.00 | 15.25 | blob |" in table_text
+    assert ("| Moruna 0.7, the node | rust | 3.0 | 1.00 (±1 s) | 20.0 | 3.00 | 13.00 | blob | 0.7 | 0.3 | 4.0 | 0.2 | 0.3 | "
+            "0.0 | bit for bit | 5/5 |") in table_text
     assert "| the plain Rust pool | rust | 4.5 | 0.50 | 30.0 | 2.00 | 14.00 | local copy, 3.0 s apart |" in table_text
     log = open(tmp_path / "benchmark-log.md").read()
     assert log.startswith("# The benchmark log") and "## 202611180900: plan nyc-2024" in log
@@ -334,12 +468,138 @@ def test_a_whole_run_against_fakes(tmp_path):
     assert json.load(open(tmp_path / "setup.json"))["wheel_066"] == "built"
 
 
+def test_each_run_lands_as_it_finishes_and_the_table_reads_them_so_far(tmp_path):
+    """While the plan runs: Moruna's records and the Linux machine's live ones are on this machine
+    run by run, and `--table` makes the table of those so far; the full records replace them."""
+    _, tasks = fake_inputs(tmp_path)
+    args = Args()
+    args.tasks = tasks
+    results = tmp_path / "results"
+    x = Fake(str(results), fail_on="--id occupancy-moruna066-r0 ")
+    with pytest.raises(RuntimeError):
+        run.Bench(nyc_plan(), x, azure.Cloud("202611180900"), args, str(results), "/s").go()
+    live = sorted(os.listdir(results / "live"))
+    assert "score-duckdb-r1.json" in live and "score-noise-p2b.json" in live and len(live) == 9 * 6 - 6 + 4
+    rec = json.load(open(results / "live" / "score-duckdb-r1.json"))
+    assert rec["live"] and rec["spec"]["id"] == "score-duckdb-r1" and rec["ok"] and rec["memory_gib"] == 14
+    # The full records (here written by the fake machine) replace the live ones: one record a run.
+    assert len([r for r in collect.load(str(results)) if r["spec"]["job"] == "score"]) == 9 * 6 + 4
+    out = io.StringIO()
+    assert run.main(["--plan", "nyc-2024", "--table", str(results)], out=out) == 0
+    text = out.getvalue()
+    assert text.startswith(f"# {9 * 6 + 4} of 250 runs recorded in {results}")
+    assert "| DuckDB | python | 12.0 |" in text and "### occupancy" in text
+    assert (results / "summary.json").exists() and (results / "table.md").exists()
+    with pytest.raises(SystemExit):
+        run.main(["--plan", "nyc-2024", "--table", str(tmp_path / "none")], out=io.StringIO())
+
+
+def test_a_live_record_from_the_summary_line(tmp_path):
+    spec = {"id": "score-duckdb-r1", "job": "score", "engine": "duckdb", "repeat": 1, "mem_gib": 14}
+    got = {"id": "score-duckdb-r1", "ok": True, "operational_s": 12.5, "startup_s": 0.4, "cpu_s": 40.0,
+           "peak_bytes": 1 << 30, "data": "blob", "copy_in_s": None,
+           "check": {"ok": True, "hash_all": True, "verdict": "bit for bit"}}
+    rec = run.live_record(spec, got)
+    assert rec["live"] and rec["ok"] and rec["operational_s"] == 12.5 and "copy_in_s" not in rec
+    assert rec["output_check"] == got["check"] and rec["memory_gib"] == 14
+    lost = run.live_record(spec, None)
+    assert not lost["ok"] and lost["error"] == "no summary line in the run's output"
+    # An older summary line, with the verdict alone.
+    assert run.live_record(spec, {"ok": True, "output": "DIFFERS"})["output_check"] == {"verdict": "DIFFERS"}
+    # measure.py's summary line carries what the live record needs.
+    rec = {"spec": spec, "ok": True, "operational_s": 1.0, "memory_gib": 14, "data": "local copy", "copy_in_s": 2.0,
+           "output_check": {"ok": True, "hash_all": False, "max_abs": 1e-7, "verdict": "within tolerance", "rows": True}}
+    import contextlib
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        measure.record(spec, "score-duckdb-r1", str(tmp_path), rec)
+    line = run.measured(printed.getvalue())
+    assert line["check"] == {"ok": True, "hash_all": False, "max_abs": 1e-7, "verdict": "within tolerance"}
+    assert (line["data"], line["copy_in_s"], line["memory_gib"], line["output"]) == ("local copy", 2.0, 14,
+                                                                                     "within tolerance")
+    assert len(printed.getvalue()) < 1024
+
+
+def test_a_job_the_node_refuses_or_loses_is_a_failed_run(tmp_path):
+    """The run goes on: a refused job, and one whose events are not followed, are failed runs."""
+    _, tasks = fake_inputs(tmp_path)
+    args = Args()
+    args.tasks = tasks
+    x = Fake(str(tmp_path), node=FakeNode(refuse=(1,), fail=(2,)))
+    run.Bench(nyc_plan(), x, azure.Cloud("202611180900"), args, str(tmp_path), "/s").go()
+    r0 = json.load(open(tmp_path / "node" / "score-moruna-node-r0.json"))
+    r1 = json.load(open(tmp_path / "node" / "score-moruna-node-r1.json"))
+    assert (r0["ok"], r0["state"]) == (False, "refused") and "422" in r0["error"]
+    assert (r1["ok"], r1["state"]) == (False, "not followed") and "404" in r1["error"]
+    assert x.summary["jobs"]["score"]["engines"]["moruna-node"]["runs"] == 5
+    assert x.summary["jobs"]["score"]["engines"]["moruna-node"]["ok"] == 4
+
+
+def test_a_job_that_fails_or_times_out(tmp_path, monkeypatch):
+    class Failing(FakeNode):
+        def stream(self, method, path, token=None):
+            self.calls.append((method, path, token))
+            yield from ["event: exit", 'data: {"type":"exit","code":3,"diagnostic":"the function failed"}', ""]
+
+        def __call__(self, method, path, body=None, token=None):
+            if path.startswith("/v1/jobs/j") and method == "GET":
+                return 200, b'{"state": "failed", "submitted": 1, "ended": 2}'
+            return super().__call__(method, path, body, token)
+
+    b = run.Bench(nyc_plan(), Fake(str(tmp_path), node=Failing()), azure.Cloud("202611180900"), Args(), str(tmp_path), "/s")
+    b.prepare()
+    b.provision()
+    b.node_ready()
+    spec = next(r for r in b.runs if r["where"] == "node")
+    rec = b.moruna(spec)
+    assert (rec["ok"], rec["state"], rec["diagnostic"]) == (False, "failed", "the function failed")
+    assert "output_check" not in rec and not any("measure.py check" in a for a in b.x.azs)
+
+    class Silent(FakeNode):
+        def stream(self, method, path, token=None):
+            self.calls.append((method, path, token))
+            yield from ["id: 1", "event: event", 'data: {"type":"heartbeat"}', ""]
+
+    # The run's deadline by a clock stopped at 0: proof.py's follower, on the real one, finds it passed.
+    monkeypatch.setattr(run.time, "time", lambda: 0.0)
+    b.x.node = b.node.t = Silent()
+    rec = b.moruna(spec)
+    assert (rec["ok"], rec["state"]) == (False, "timed out")
+    assert ("POST", "/v1/jobs/j1/cancel", "t-submit") in b.node.t.calls
+
+
 def test_the_group_is_deleted_when_a_step_fails(tmp_path):
     x = Fake(str(tmp_path), fail_on="vm create -n moruna-node")
     with pytest.raises(RuntimeError, match="failed"):
         run.Bench(nyc_plan(), x, azure.Cloud("202611180900"), Args(), str(tmp_path), "/s").go()
     assert x.azs[-2].startswith("az group delete") and x.azs[-1].startswith("az group exists")
     assert not any("run-command" in a for a in x.azs)
+
+
+def test_what_the_linux_machine_holds_is_collected_when_a_later_step_fails(tmp_path):
+    """Hours of runs are not lost with the group: a failure after the setup still collects."""
+    x = Fake(str(tmp_path), fail_on="--id score-duckdb-r1 ")
+    with pytest.raises(RuntimeError, match="failed"):
+        run.Bench(nyc_plan(), x, azure.Cloud("202611180900"), Args(), str(tmp_path), "/s").go()
+    assert any("results/linux.tgz" in a for a in x.azs) and x.logged is False
+    assert x.azs[-2].startswith("az group delete") and x.azs[-1].startswith("az group exists")
+    assert (tmp_path / "summary.json").exists() and not (tmp_path / "benchmark-log.md").exists()
+    assert x.summary["jobs"]["score"]["engines"]["moruna066"]["runs"] == 1
+
+
+def test_a_failed_collection_does_not_hide_the_failure(tmp_path):
+    x = Fake(str(tmp_path), fail_on="--id score-duckdb-r1 ")
+    real_az = x.az
+
+    def az(cmd, out=None, secrets=None):
+        if "linux.tgz" in " ".join(cmd):
+            raise RuntimeError("the collection failed too")
+        return real_az(cmd, out, secrets)
+    x.az = az
+    with pytest.raises(RuntimeError, match="failed: --id score-duckdb-r1"):
+        run.Bench(nyc_plan(), x, azure.Cloud("202611180900"), Args(), str(tmp_path), "/s").go()
+    assert "the partial results were not collected: the collection failed too" in x.out.getvalue()
+    assert x.azs[-1].startswith("az group exists")
 
 
 def test_real_checks_every_az_command_before_it_runs(tmp_path, monkeypatch):
@@ -382,7 +642,8 @@ def test_measured_reads_the_last_summary_line():
 # --- Collector, table, root causes -------------------------------------------------------------
 
 def rec(engine, repeat, ops, cpu=30.0, job="score", ok=True, check=None, noise=None, split=None):
-    spec = {"id": f"{job}-{engine}-r{repeat}", "job": job, "engine": engine, "repeat": repeat}
+    rid = f"{job}-noise-{noise}" if noise else f"{job}-{engine}-r{repeat}"
+    spec = {"id": rid, "job": job, "engine": engine, "repeat": repeat}
     if noise:
         spec["noise"] = noise
     return {"spec": spec, "ok": ok, "operational_s": ops, "startup_s": 0.4, "cpu_s": cpu, "peak_bytes": 1 << 30,
@@ -427,7 +688,13 @@ def test_the_table_and_its_verdicts():
             rec("moruna066-rust", 1, 6.0), rec("duckdb", 1, 3.5, cpu=12.0)]
     s = summary_of(recs)
     text = table.render(s)
-    assert "| Moruna 0.7, the node | rust | 2.0 | 0.40 | 10.0 | 1.00 |  |  | 2.0 | 5.0 | 1.0 | 0.5 | bit for bit | 1/1 |" in text
+    # runner_split.py's joined stages stand in the read and write columns, named.
+    assert ("| Moruna 0.7, the node | rust | 2.0 | 0.40 | 10.0 | 1.00 |  |  | 2.0 (read and decode) |  | 5.0 |  | "
+            "1.0 (encode and write) | 0.5 | bit for bit | 1/1 |") in text
+    six = {"read_s": 0.7, "decode_s": 0.3, "function_s": 4.0, "encode_s": 0.2, "write_s": 0.3, "wait_s": 0.5}
+    text6 = table.render(summary_of([rec("moruna-node", 1, 2.0, split=six), rec("moruna066", 1, 9.0)]))
+    assert "| blob |" not in text6 and "|  | 0.7 | 0.3 | 4.0 | 0.2 | 0.3 | 0.5 | bit for bit | 1/1 |" in text6
+    assert text6.splitlines()[2].count("|") == text6.splitlines()[3].count("|") == 17
     assert "**PASS** no regression" in text
     # DuckDB's 3.5 s is 1.75x Moruna's 2.0 s, and Moruna's CPU is the least: the bar holds.
     assert "**PASS** the bar: 1.75x" in text
@@ -435,7 +702,13 @@ def test_the_table_and_its_verdicts():
                        rec("moruna066-rust", 1, 6.0), rec("duckdb", 1, 3.5)])
     vs = table.verdicts(slow["jobs"]["score"]["engines"])
     assert [v["passed"] for v in vs] == [False, False, None]
-    assert vs[2]["text"] == "the stage that loses most: the function, 5.0 s"
+    assert vs[2]["text"] == ("the stage that loses most: the function, 5.0 s, of the split: read and decode 2.0 s, "
+                             "the function 5.0 s, encode and write 1.0 s, waits 0.5 s")
+    slow6 = summary_of([rec("moruna-node", 1, 7.0, cpu=40.0, split=six), rec("moruna066", 1, 9.0),
+                        rec("moruna066-rust", 1, 6.0), rec("duckdb", 1, 3.5)])
+    assert table.verdicts(slow6["jobs"]["score"]["engines"])[2]["text"] == (
+        "the stage that loses most: the function, 4.0 s, of the split: read 0.7 s, decode 0.3 s, the function 4.0 s, "
+        "encode 0.2 s, write 0.3 s, waits 0.5 s")
     assert table.verdicts({})[0]["passed"] is None
     lonely = summary_of([rec("moruna-node", 1, 2.0)])["jobs"]["score"]["engines"]
     vs = table.verdicts(lonely)
@@ -451,10 +724,11 @@ def test_the_log_entry_and_the_root_cause_format(tmp_path):
                     rec("moruna066-rust", 1, 6.0), rec("duckdb", 1, 3.5)])
     ms = rootcause.misses(s)
     assert [(m["job"], m["step"]) for m in ms] == [("score", "no regression"), ("score", "bar")]
-    assert ms[0]["stage"] == "read and decode, 6.0 s"
+    stage = "read and decode, 6.0 s, of the split: read and decode 6.0 s, the function 1.0 s"
+    assert ms[0]["stage"] == stage
     text = "\n".join(rootcause.entry(m, "202611180900, plan nyc-2024") for m in ms)
     entries = rootcause.parse(text)
-    assert len(entries) == 2 and entries[0]["fields"]["Stage"] == "read and decode, 6.0 s"
+    assert len(entries) == 2 and entries[0]["fields"]["Stage"] == stage
     assert "Profile: TODO" in rootcause.problems(entries[0]) and "Defect: TODO" in rootcause.problems(entries[0])
     done = rootcause.entry(ms[1], "r", profile="perf of the source: arrow decode in moruna-sources/src/parquet.rs",
                            defect="pages decoded twice", beyond_the_benchmark="every Parquet read",
@@ -530,11 +804,36 @@ def test_tokens_are_made_again_before_they_expire():
     assert t.get("submit") == "submit2" and t.get("observe") == "observe3" and made == ["submit", "submit", "observe"]
 
 
-def test_the_job_document_is_the_gates():
-    doc = node_api.job_document("score", ["https://a/data/f.parquet"], "https://a/results/node/x/",
-                                {"location": "https://a/code/gate-score"}, 4, 14)
-    k = doc["kernels"][0]
-    assert (k["command"], k["abi"], doc["budget"]) == (["/gate-score"], "moruna", {"memory_bytes": 14 << 30, "cpu": 4})
+def test_the_report_split():
+    assert collect.report_split(REPORT) == {"read_s": 0.7, "decode_s": 0.3, "function_s": 4.0, "encode_s": 0.2,
+                                            "write_s": 0.3, "wait_s": 0.03}
+    # A decode done in the read's call has no decode_ms; a measured zero is kept.
+    fused = {"tasks": [{"role": "source", "read_ms": 900.0}, {"role": "function", "busy_ms": 0.0},
+                       {"role": "sink", "write_ms": 100.0}, {"role": "source", "read_ms": 100.0}]}
+    assert collect.report_split(fused) == {"read_s": 1.0, "function_s": 0.0, "write_s": 0.1}
+    assert collect.report_split({}) == {} and collect.report_split(None) == {}
+
+
+def test_real_redacts_every_secret_it_holds(tmp_path, monkeypatch):
+    """The functions' SAS, by its whole value and by its signature alone, and the storage key."""
+    monkeypatch.setattr(run.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, 1, "", "AuthenticationFailed: sig=AbCdEfGhIjKlMnOp%2B and KEYKEYKEY"))
+    out = io.StringIO()
+    x = run.Real(cloud(), str(tmp_path / "commands.log"), out)
+    sas = "sv=2024&sr=c&sp=r&sig=AbCdEfGhIjKlMnOp%2B"
+    x.secrets.update({"storage-key": "KEYKEYKEY", proof_sas(): sas})
+    x.say(f"fetched from https://a/functions/gate-score?{sas}")
+    x.save(str(tmp_path / "r.json"), {"address": f"https://a?{sas}", "said": "AbCdEfGhIjKlMnOp+", "key": "KEYKEYKEY"})
+    with pytest.raises(RuntimeError) as e:
+        x.az(azure.containers(cloud(), "KEYKEYKEY")[0])
+    every = out.getvalue() + (tmp_path / "r.json").read_text() + (tmp_path / "commands.log").read_text() + str(e.value)
+    for secret in ("KEYKEYKEY", "AbCdEfGhIjKlMnOp", sas):
+        assert secret not in every
+    assert "<FUNCTIONS_SAS>" in out.getvalue() and "<storage-key>" in (tmp_path / "commands.log").read_text()
+
+
+def proof_sas():
+    return run.proof.SAS_ENV
 
 
 @pytest.mark.skipif(not OPENSSL or "LibreSSL" in subprocess.run([OPENSSL or "true", "version"], capture_output=True,

@@ -1,7 +1,7 @@
 {
  "plan": 1,
  "name": "nyc-2024",
- "notes": "System design 6B's first jobs: the four NYC taxi jobs on 2024 (41,169,720 rows), every engine of 6A and the native-expression rows (DuckDB SQL for Enrich and Occupancy, Polars expressions for Enrich), the median of 5 runs, the learning run and the noise pairs kept (the PM, 2026-11-18). The files are bench/vm/normalize.py's (one schema, 1M-row row groups). Every engine reads and writes the run's Blob container with its own reader. Memory is what each platform leaves on the same machine: 14 GiB for the Linux engines (16 GiB less 2 for the OS, as gate_plan.py's d4 machine keeps 2), the node's memory less 768 MiB for Moruna.",
+ "notes": "System design 6B's first jobs: the four NYC taxi jobs on 2024 (41,169,720 rows), every engine of 6A and the native-expression rows (DuckDB SQL for Enrich and Occupancy, Polars expressions for Enrich), the median of 5 runs, the learning run and the noise pairs kept (the PM, 2026-11-18). The files are bench/vm/normalize.py's (one schema, 1M-row row groups). Every engine reads and writes the run's Blob container with its own reader. Memory is what each platform leaves on the same machine: 14 GiB for the Linux engines (16 GiB less 2 for the OS, as gate_plan.py's d4 machine keeps 2), the node's job bound for Moruna (job_memory_bytes, 3A: the most a node takes).",
  "dataset": {
   "name": "nyc-yellow-2024",
   "source_dir": "~/moruna-data/nyc/norm",

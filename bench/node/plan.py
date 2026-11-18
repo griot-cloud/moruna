@@ -12,7 +12,8 @@ A plan is a JSON file (`plans/nyc-2024.json`). `load` checks it and refuses an u
 0.6.6 keeps a profile store across a job's runs, emptied before its learning run, and stages to
 disk, as gate_plan.py's runs did. Every engine has the machine's CPUs. Memory is what each
 platform leaves on the same machine (the PM, 2026-11-18): the plan's `machine.mem_gib` on Linux,
-the node's memory less 768 MiB on Moruna (run.py reads it from the node).
+the node's job bound on Moruna (`job_memory_bytes`, 3A: the most a node takes; run.py reads it
+from the node).
 
 **Data** (`linux_data`): `blob`, every engine reads its inputs (`inputs`, blob names under
 `nyc/`) from and writes its output (`output`, under `out/<run id>`) to the run's one container,
