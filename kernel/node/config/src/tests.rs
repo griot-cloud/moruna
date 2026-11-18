@@ -11,8 +11,8 @@ use std::{
 };
 
 use crate::{
-    Api, CACHE_BYTES_DEFAULT, Cloud, Functions, Handover, HandoverError, MESSAGE_MAX, NodeConfig,
-    PublicKey, READY, Refusal, Tls, base64, cloud_name, instance_valid,
+    Api, CACHE_BYTES_DEFAULT, Cloud, Functions, Handover, HandoverError, MESSAGE_MAX, MIB,
+    NodeConfig, PublicKey, READY, Refusal, Tls, base64, cloud_name, instance_valid,
     pem::{self, PemError},
 };
 
@@ -180,6 +180,7 @@ fn the_design_s_example_is_taken() {
             functions: Functions {
                 keys: vec![PublicKey([3; 32])],
                 cache_bytes: 1 << 30,
+                cache_bytes_given: true,
             },
         })
     );
@@ -201,7 +202,9 @@ fn what_is_optional_takes_its_default() {
     );
     let sized = validate(&with(r#","functions":{"cache_bytes":67108864}"#)).unwrap();
     assert_eq!(sized.functions.cache_bytes, 64 << 20);
+    assert!(sized.functions.cache_bytes_given);
     assert!(sized.functions.keys.is_empty());
+    assert!(!least.functions.cache_bytes_given);
     // White space around the document is JSON's.
     assert_eq!(validate(&format!("\n {} \n", with(""))), Ok(least));
 }
@@ -735,6 +738,7 @@ fn handover() -> Handover {
             functions: Functions {
                 keys: vec![PublicKey([9; 32])],
                 cache_bytes: 256 << 20,
+                cache_bytes_given: true,
             },
         },
         instance: "0d6b3a3c-7b1f-4f0e-9d39-2f6c1a9e5b77".to_string(),
@@ -766,6 +770,7 @@ fn a_hand_over_survives_the_round_trip() {
             functions: Functions {
                 keys: Vec::new(),
                 cache_bytes: 1 << 40,
+                cache_bytes_given: true,
             },
             ..full.config.clone()
         },
@@ -823,7 +828,127 @@ fn a_hand_over_is_one_json_object_with_node_config_written_out() {
     };
     let json: serde_json::Value = serde_json::from_slice(&plain.encode().unwrap()).unwrap();
     assert_eq!(json["config"]["api"].as_object().unwrap().len(), 1);
+    // Nor are the defaults written: the operator set no `functions`.
+    assert_eq!(json["config"].as_object().unwrap().len(), 2);
+    assert!(json["config"].get("functions").is_none());
+}
+
+/// A node of 2 GiB, as QEMU's machine gives the supervisor: its machine account, the node's
+/// memory, is 2 032 979 968 bytes, and half of it is not a whole number of MiB.
+const QEMU_2_GIB: u64 = 2_032_979_968;
+
+/// Item 1.4's booted check found `api` refusing such a node's hand-over: the default cache went
+/// into it as if the operator had given it, and was judged as theirs (PM, 2026-11-18).
+#[test]
+fn a_config_with_no_functions_passes_on_a_2_gib_node() {
+    let config = NodeConfig::validate(with("").as_bytes(), QEMU_2_GIB).expect("valid");
+    assert_eq!(config.functions.cache_bytes, QEMU_2_GIB / 2);
+    assert_ne!(config.functions.cache_bytes % MIB, 0);
+    assert!(!config.functions.cache_bytes_given);
+    let handed = Handover {
+        config,
+        memory_bytes: QEMU_2_GIB,
+        ..handover()
+    };
+    let message = handed.encode().unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&message).unwrap();
+    assert!(json["config"].get("functions").is_none(), "{json}");
+    // `api` takes it, and derives the same default.
+    assert_eq!(Handover::decode(&message), Ok(handed));
+}
+
+/// What the hand-over carries is what the operator set, and `api` derives the rest as
+/// `platform` did: on every node, whatever its memory.
+#[test]
+fn the_hand_over_carries_what_the_operator_set_and_the_defaults_come_out_the_same() {
+    let configs = [
+        with(""),
+        with(r#","functions":{}"#),
+        with(r#","functions":{"keys":[]}"#),
+        with(&format!(r#","functions":{{"keys":["{}"]}}"#, key(9))),
+        with(r#","functions":{"cache_bytes":67108864}"#),
+        with(&format!(
+            r#","functions":{{"keys":["{}"],"cache_bytes":134217728}}"#,
+            key(9)
+        )),
+    ];
+    let memories = [
+        QEMU_2_GIB,
+        2 << 30,
+        (2 << 30) + 1,
+        24_526_286_848,
+        MEMORY,
+        (1 << 30) - 4096,
+        300 << 20,
+        129 << 20,
+        1,
+    ];
+    let mut handed_over = 0;
+    for text in &configs {
+        for memory in memories {
+            // `platform`'s validation, on this node.
+            let Ok(config) = NodeConfig::validate(text.as_bytes(), memory) else {
+                // A given cache over half a small node's memory: refused by both alike.
+                assert!(
+                    text.contains("cache_bytes") && memory / 2 < 128 << 20,
+                    "{text} {memory}"
+                );
+                continue;
+            };
+            let handed = Handover {
+                config: config.clone(),
+                memory_bytes: memory,
+                ..handover()
+            };
+            let message = handed.encode().unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&message).unwrap();
+            let carried = &json["config"];
+            // Only what the operator set.
+            assert_eq!(
+                carried["functions"].get("cache_bytes").is_some(),
+                text.contains("cache_bytes"),
+                "{text}: {carried}"
+            );
+            assert_eq!(
+                carried.get("functions").is_some(),
+                text.contains("cache_bytes") || text.contains(&key(9)),
+                "{text}: {carried}"
+            );
+            // `api` comes out with exactly `platform`'s config, the default included.
+            let taken =
+                Handover::decode(&message).unwrap_or_else(|e| panic!("{text} {memory}: {e}"));
+            assert_eq!(taken, handed, "{text} {memory}");
+            assert_eq!(
+                taken.config.functions.cache_bytes,
+                config.functions.cache_bytes
+            );
+            handed_over += 1;
+        }
+    }
+    assert!(handed_over > 40, "{handed_over}");
+}
+
+/// A cache the operator gives is carried even when it is the default's value, and judged again
+/// as theirs.
+#[test]
+fn a_given_cache_is_carried_even_at_the_default_s_value() {
+    let given = NodeConfig::validate(
+        with(r#","functions":{"cache_bytes":1073741824}"#).as_bytes(),
+        MEMORY,
+    )
+    .unwrap();
+    let left_out = NodeConfig::validate(with("").as_bytes(), MEMORY).unwrap();
+    assert_eq!(given.functions.cache_bytes, left_out.functions.cache_bytes);
+    assert_ne!(given, left_out);
+    let message = Handover {
+        config: given.clone(),
+        ..handover()
+    }
+    .encode()
+    .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&message).unwrap();
     assert_eq!(json["config"]["functions"]["cache_bytes"], 1 << 30);
+    assert_eq!(Handover::decode(&message).unwrap().config, given);
 }
 
 #[test]
