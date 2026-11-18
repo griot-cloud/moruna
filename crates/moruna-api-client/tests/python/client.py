@@ -119,7 +119,7 @@ class AgainstTheNode(unittest.TestCase):
         with self.assertRaises(api.ApiError) as caught:
             api.jobs_cancel(admin, run)
         self.assertEqual(caught.exception.code, api.ErrorCode.CONFLICT)
-        replay = list(api.jobs_events(observe, run, from_=2))
+        replay = list(api.jobs_events(observe, run, from_=1))
         self.assertEqual([e.event for e in replay], ["event", "heartbeat", "report", "exit"])
         self.assertEqual((replay[0].id, replay[3].data["code"]), (2, 130))
         self.assertEqual(observe.jobs_report(run), {"rows_out": 3})

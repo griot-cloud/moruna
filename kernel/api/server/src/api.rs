@@ -4,6 +4,7 @@
 
 use crate::{
     audit::{AUDIT_ANSWER_LIMIT, AuditLog},
+    body::{Body, Text},
     engine::EngineHost,
     http::{Authorization, Request},
     jobs::{Jobs, Stream},
@@ -13,7 +14,7 @@ use crate::{
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 use moruna_api::{
     Cloud, ErrorBody, ErrorCode, Executor, Health, HealthStatus, Method, Node, NodeHealth,
-    OPERATIONS, Operation, Request as Body, Response,
+    OPERATIONS, Operation, Request as Takes, Response,
 };
 use serde_json::Value;
 
@@ -61,34 +62,34 @@ impl NodeFacts {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Answer {
     pub status: u16,
-    pub body: Vec<u8>,
+    pub body: Body,
     pub close: bool,
     /// The methods a `405` names in its `Allow` header.
     pub allow: Option<&'static str>,
 }
 
 impl Answer {
+    /// An answer with this status and body.
+    pub(crate) fn with(status: u16, body: Body) -> Self {
+        Self {
+            status,
+            body,
+            close: false,
+            allow: None,
+        }
+    }
+
     /// A `200` with `written`, a value written as JSON, as its body.
     pub(crate) fn ok(written: serde_json::Result<Vec<u8>>) -> Self {
         match written {
-            Ok(body) => Self {
-                status: 200,
-                body,
-                close: false,
-                allow: None,
-            },
+            Ok(body) => Self::with(200, Body::json(body)),
             Err(_) => Self::error(ErrorCode::Internal, "the answer could not be written"),
         }
     }
 
     /// The error `code`, with its status and 2A's error body.
     pub(crate) fn error(code: ErrorCode, message: &str) -> Self {
-        Self {
-            status: code.status(),
-            body: error_body(code, message),
-            close: false,
-            allow: None,
-        }
+        Self::with(code.status(), Body::json(error_body(code, message)))
     }
 }
 
@@ -131,7 +132,8 @@ pub(crate) enum Call {
 pub(crate) struct Inputs<'a> {
     /// The run's ID in the path.
     pub id: Option<&'a str>,
-    /// The record a stream of events starts from.
+    /// The record a stream of events, or the events' tool's page, comes after: the last one
+    /// the reader has.
     pub from: Option<u64>,
     /// The body.
     pub body: &'a [u8],
@@ -254,11 +256,11 @@ impl Api {
             }
         };
         match operation.request {
-            Body::None if body > 0 => {
+            Takes::None if body > 0 => {
                 let why = "this operation takes no body";
                 refuse(self, grant.as_ref(), ErrorCode::Invalid, why)
             }
-            Body::None => {
+            Takes::None => {
                 let inputs = Inputs {
                     id,
                     from,
@@ -266,10 +268,10 @@ impl Api {
                 };
                 Admission::Now(self.invoke(operation, grant, inputs, Shape::Plain, now))
             }
-            Body::Job if operation.response == Response::Submitted && self.jobs.busy() => {
+            Takes::Job if operation.response == Response::Submitted && self.jobs.busy() => {
                 refuse(self, grant.as_ref(), ErrorCode::Busy, "a job is running")
             }
-            Body::Job => Admission::Body(Call::Operation(operation, grant)),
+            Takes::Job => Admission::Body(Call::Operation(operation, grant)),
         }
     }
 
@@ -352,6 +354,13 @@ impl Api {
                 None => Answer::error(ErrorCode::NotFound, "no job has this ID"),
             },
             Response::Report => self.jobs.report(id),
+            // The tool answers a page of the stream, after its record `from` (item 3.7).
+            Response::Events if matches!(shape, Shape::Tool(_)) => {
+                match self.jobs.page(id, inputs.from.unwrap_or(0)) {
+                    Some(page) => Answer::with(200, Body::of(Text::Owned(page))),
+                    None => Answer::error(ErrorCode::NotFound, "no job has this ID"),
+                }
+            }
             Response::Events => match self.jobs.stream(id, inputs.from) {
                 Some(stream) => {
                     self.record(now, grant.as_ref(), operation, operation.status);
@@ -401,7 +410,7 @@ impl Api {
             );
             let answer = match pending.shape {
                 Shape::Plain => answer,
-                Shape::Tool(id) => mcp::tool_answer(&id, &answer),
+                Shape::Tool(id) => mcp::tool_answer(&id, answer),
             };
             self.ready.insert(ticket, answer);
         }

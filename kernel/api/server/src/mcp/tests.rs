@@ -7,7 +7,7 @@ use crate::{
     signer::Signer,
     token::TokenKey,
 };
-use alloc::{format, string::ToString, vec};
+use alloc::{format, string::ToString, sync::Arc, vec, vec::Vec};
 use moruna_api::{Cloud, Executor, ExecutorKind, NodeHealth};
 
 const NOW: u64 = 1_794_931_200;
@@ -51,7 +51,7 @@ fn send(api: &mut Api, token: Option<&str>, body: &str) -> Answer {
 
 fn json_of(answer: &Answer) -> Value {
     assert_eq!(answer.status, 200);
-    serde_json::from_slice(&answer.body).unwrap()
+    serde_json::from_slice(&answer.body.bytes()).unwrap()
 }
 
 #[test]
@@ -93,7 +93,7 @@ fn initialize_ping_and_list_answer() {
     assert_eq!(json_of(&answer)["result"], expected);
     assert_eq!(
         expected["tools"].as_array().unwrap().len(),
-        OPERATIONS.iter().filter(|op| op.has_tool()).count()
+        OPERATIONS.len()
     );
     assert_eq!(
         api.recorded(),
@@ -115,7 +115,7 @@ fn notifications_and_responses_are_accepted_without_a_body() {
     ] {
         let answer = send(&mut api, Some(&token), body);
         assert_eq!(answer.status, 202, "{body}");
-        assert!(answer.body.is_empty());
+        assert!(answer.body.bytes().is_empty());
     }
 }
 
@@ -292,7 +292,7 @@ fn only_post_is_served_on_mcp() {
     let answer = api.answer(&get, &[], NOW);
     assert_eq!(answer.status, 405);
     assert_eq!(answer.allow, Some("POST"));
-    assert!(answer.body.is_empty());
+    assert!(answer.body.bytes().is_empty());
     let mut delete = post(None);
     delete.method = "DELETE".to_string();
     assert_eq!(api.answer(&delete, &[], NOW).status, 400);
@@ -306,13 +306,190 @@ fn only_post_is_served_on_mcp() {
 #[test]
 fn the_tool_list_parses_and_a_bad_body_still_answers() {
     assert!(tools()["tools"].is_array());
-    let failed = Answer::error(ErrorCode::Internal, "x");
-    assert_eq!(tool_result(&failed)["isError"], true);
-    let odd = Answer {
-        status: 200,
-        body: b"not json".to_vec(),
-        close: false,
-        allow: None,
+    let result = |answer: Answer| -> Value {
+        let reply = json_of(&tool_answer(&json!("x"), answer));
+        assert_eq!(
+            (&reply["jsonrpc"], &reply["id"]),
+            (&json!("2.0"), &json!("x"))
+        );
+        reply["result"].clone()
     };
-    assert_eq!(tool_result(&odd)["structuredContent"], Value::Null);
+    let written = result(Answer::error(ErrorCode::Internal, "x"));
+    assert_eq!(written["isError"], true);
+    assert!(written.get("structuredContent").is_none());
+    let error: Value =
+        serde_json::from_str(written["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(error["error"]["code"], "internal");
+    let written = result(Answer::with(200, Body::of(Text::Static("not \"json\"\n"))));
+    assert!(written.get("structuredContent").is_none());
+    assert!(written.get("isError").is_none());
+    assert_eq!(written["content"][0]["text"], "not \"json\"\n");
+    // The answer's JSON is written as it came, its spacing and order kept, and shared, not
+    // copied: the reply holds the one text, twice.
+    let spaced: Arc<str> = Arc::from(r#"{ "b": 1,  "a": [2] }"#);
+    let reply = tool_answer(
+        &json!(9),
+        Answer::with(201, Body::of(Text::Shared(spaced.clone()))),
+    );
+    assert_eq!(Arc::strong_count(&spaced), 2);
+    let text = String::from_utf8(reply.body.bytes()).unwrap();
+    assert!(
+        text.contains(r#""structuredContent":{ "b": 1,  "a": [2] }"#),
+        "{text}"
+    );
+    assert!(
+        text.contains(r#""text":"{ \"b\": 1,  \"a\": [2] }""#),
+        "{text}"
+    );
+    assert_eq!(reply.status, 200);
+    // The tool list is the checked-in file, as it is.
+    let call = r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#;
+    let signer = Signer::new();
+    let token = signer.token("i-1", NOW + 60, &["observe"]);
+    let listed = send(&mut api(&signer), Some(&token), call).body.bytes();
+    let listed = String::from_utf8(listed).unwrap();
+    assert!(
+        listed.ends_with(&format!(r#""result":{TOOLS}}}"#)),
+        "{listed}"
+    );
+}
+
+/// A job whose engine has told `records` records, its first then log records, and has ended
+/// when `ended`, on an API whose engine is the tests' own; and an observer's token.
+fn api_with_job(signer: &Signer, records: usize, ended: bool) -> (Api, String) {
+    let engine = crate::fake::Engine::new();
+    let mut api = Api::new(
+        api(signer).facts.clone(),
+        vec![TokenKey::new(signer.public())],
+        alloc::boxed::Box::new(engine.clone()),
+    );
+    let submit = signer.token("i-1", NOW + 60, &["submit"]);
+    let job = r#"{"v1":{"moruna_spec":1}}"#;
+    let mut request = post(Some(&submit));
+    request.path = "/v1/jobs".to_string();
+    let outcome = match api.admit(&request, job.len(), NOW) {
+        crate::api::Admission::Body(call) => api.complete(call, job.as_bytes(), NOW),
+        other => panic!("{other:?}"),
+    };
+    let crate::api::Outcome::Wait(ticket) = outcome else {
+        panic!("the submit waits for the engine");
+    };
+    engine.attempt_started();
+    for n in 1..records {
+        engine.log("source", &format!("line {n}"));
+    }
+    if ended {
+        engine.finish(r#"{"rows_out":3}"#, 0, None);
+    }
+    api.pump(NOW);
+    assert_eq!(api.ready(ticket).unwrap().status, 201);
+    (api, signer.token("i-1", NOW + 60, &["observe"]))
+}
+
+/// The events' tool called with `arguments`: its result.
+fn events(api: &mut Api, token: &str, arguments: &str) -> Value {
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"moruna_jobs_events","arguments":{arguments}}}}}"#
+    );
+    json_of(&send(api, Some(token), &call))["result"].clone()
+}
+
+#[test]
+fn the_events_tool_answers_a_page_after_from() {
+    let signer = Signer::new();
+    let (mut api, observe) = api_with_job(&signer, 3, true);
+    let run = crate::fake::RUN;
+    let whole = events(&mut api, &observe, &format!(r#"{{"id":"{run}"}}"#));
+    let page = &whole["structuredContent"];
+    let names: Vec<&str> = page["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["event", "event", "event", "report", "exit"]);
+    assert_eq!(page["next"], 3);
+    let text: Value = serde_json::from_str(whole["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(&text, page);
+    // After the second record: the third, then the end.
+    let rest = events(&mut api, &observe, &format!(r#"{{"id":"{run}","from":2}}"#));
+    let records = rest["structuredContent"]["records"].as_array().unwrap();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0]["id"], 3);
+    assert_eq!(records[0]["data"]["text"], "line 2");
+    // No such job: the operation's not_found.
+    let missing = events(&mut api, &observe, r#"{"id":"ffff","from":0}"#);
+    assert_eq!(missing["isError"], true);
+    assert!(
+        missing["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(r#""code":"not_found""#)
+    );
+    // Each call is one record of jobs_events.
+    let seen: Vec<(String, u16)> = api
+        .records()
+        .iter()
+        .map(|r| (r.operation.clone(), r.status))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("jobs_events".to_string(), 404),
+            ("jobs_events".to_string(), 200),
+            ("jobs_events".to_string(), 200),
+            ("jobs_submit".to_string(), 201)
+        ]
+    );
+}
+
+#[test]
+fn the_events_tool_takes_the_run_id_and_from_and_nothing_else() {
+    let signer = Signer::new();
+    let (mut api, observe) = api_with_job(&signer, 1, false);
+    let run = crate::fake::RUN;
+    for arguments in [
+        "{}".to_string(),
+        r#"{"from":0}"#.to_string(),
+        r#"{"id":7}"#.to_string(),
+        format!(r#"{{"id":"{run}","from":-1}}"#),
+        format!(r#"{{"id":"{run}","from":1.5}}"#),
+        format!(r#"{{"id":"{run}","from":"1"}}"#),
+        format!(r#"{{"id":"{run}","from":null}}"#),
+        format!(r#"{{"id":"{run}","to":3}}"#),
+    ] {
+        let refused = events(&mut api, &observe, &arguments);
+        assert_eq!(refused["isError"], true, "{arguments}");
+        let error: Value =
+            serde_json::from_str(refused["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(error["error"]["code"], "invalid", "{arguments}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("from, a record's number"),
+            "{arguments}"
+        );
+    }
+    // The largest from is taken, and gives what a job still running has after it: nothing.
+    let far = events(
+        &mut api,
+        &observe,
+        &format!(r#"{{"id":"{run}","from":{}}}"#, u64::MAX),
+    );
+    assert_eq!(
+        far["structuredContent"],
+        json!({ "records": [], "next": u64::MAX })
+    );
+    // Only the events' tool takes from.
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"moruna_jobs_get","arguments":{{"id":"{run}","from":1}}}}}}"#
+    );
+    let refused = &json_of(&send(&mut api, Some(&observe), &call))["result"];
+    assert!(
+        refused["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("the run's id, and nothing else")
+    );
 }

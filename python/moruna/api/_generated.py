@@ -808,7 +808,8 @@ def jobs_cancel(client: Caller, id: str) -> JobStatus:
 
 def jobs_events(client: Caller, id: str, *, from_: int | None = None) -> Iterator[ServerSentEvent]:
     """A job's events as Server-Sent Events: each event and log record as its JSON line, heartbeats,
-    then the report and the exit. `from` replays from that record of the node's buffer.
+    then the report and the exit. `from` is the last record already read, as Server-Sent Events'
+    Last-Event-ID: the node's buffer is replayed after it.
 
     ``GET /v1/jobs/{id}/events``, a token with scope ``observe``.
     """
@@ -900,8 +901,8 @@ class Operations(Caller):
 
     def jobs_events(self, id: str, *, from_: int | None = None) -> Iterator[ServerSentEvent]:
         """A job's events as Server-Sent Events: each event and log record as its JSON line,
-        heartbeats, then the report and the exit. `from` replays from that record of the node's
-        buffer.
+        heartbeats, then the report and the exit. `from` is the last record already read, as
+        Server-Sent Events' Last-Event-ID: the node's buffer is replayed after it.
 
         ``GET /v1/jobs/{id}/events``, a token with scope ``observe``. The function
         ``jobs_events(self, id, from_=from_)``.

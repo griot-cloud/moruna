@@ -326,15 +326,15 @@ fn cancel(state: &State, id: &str) -> Result<String, (ErrorCode, String)> {
 }
 
 /// A job's stream of events: two records, a heartbeat, and for an ended job its report and
-/// exit; `from=<n>` leaves out the records before the `n`th.
+/// exit; `from=<n>` leaves out the records up to the `n`th, as the node does.
 fn events(job: &JobStatus, query: &str) -> String {
     let from: u64 = query
         .strip_prefix("from=")
         .and_then(|n| n.parse().ok())
-        .unwrap_or(1);
+        .unwrap_or(0);
     let mut stream = String::new();
     for (id, kind) in [(1, "attempt_started"), (2, "task_started")] {
-        if id >= from {
+        if id > from {
             stream.push_str(&format!(
                 "id: {id}\nevent: event\ndata: {{\"type\":\"event\",\"v\":7,\"seq\":{id},\"kind\":\"{kind}\"}}\n\n"
             ));

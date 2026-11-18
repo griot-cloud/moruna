@@ -5,8 +5,8 @@
 //! order a JSON map keeps, and each file ends in one newline.
 
 use crate::{
-    Audit, ErrorBody, Health, Job, JobStatus, Jobs, Node, OPERATIONS, Operation, Request, Response,
-    Submitted, Validation,
+    Audit, ErrorBody, FROM, Health, Job, JobEvents, JobStatus, Jobs, Node, OPERATIONS, Operation,
+    Request, Response, Submitted, Validation,
 };
 use alloc::{string::String, vec::Vec};
 use schemars::{JsonSchema, Schema, SchemaGenerator, generate::SchemaSettings};
@@ -92,6 +92,7 @@ pub fn openapi(operations: &[Operation]) -> Value {
                 "name": name,
                 "in": "query",
                 "required": false,
+                "description": FROM,
                 "schema": { "type": "integer", "minimum": 0 }
             }));
         }
@@ -152,11 +153,13 @@ pub fn openapi(operations: &[Operation]) -> Value {
     })
 }
 
-/// The MCP tool list for `operations`, as MCP's `tools/list` result: one tool per operation
-/// that has one ([`Operation::has_tool`]), named `moruna_<id>`. A tool's input is the
-/// operation's request: its body's fields, the run's `id` when its path carries one, and
-/// nothing else, so an operation that takes neither has an empty object that refuses unknown
-/// fields. Its output schema is the operation's response, with every subschema inlined.
+/// The MCP tool list for `operations`, as MCP's `tools/list` result: one tool per operation,
+/// named as [`Operation::tool_name`] says and described as [`Operation::tool_summary`] says. A
+/// tool's input is the operation's request: its body's fields, the run's `id` when its path
+/// carries one, its query's parameters, each optional, and nothing else, so an operation that
+/// takes none of them has an empty object that refuses unknown fields. Its output schema is the
+/// operation's response, with every subschema inlined; for the stream of events, the page of it
+/// the tool answers ([`JobEvents`]).
 pub fn mcp_tools(operations: &[Operation]) -> Value {
     let mut generator = SchemaSettings::draft2020_12()
         .with(|settings| {
@@ -167,7 +170,6 @@ pub fn mcp_tools(operations: &[Operation]) -> Value {
         .into_generator();
     let tools: Vec<Value> = operations
         .iter()
-        .filter(|operation| operation.has_tool())
         .map(|operation| {
             let output = match operation.response {
                 Response::Health => generator.root_schema_for::<Health>().to_value(),
@@ -177,7 +179,10 @@ pub fn mcp_tools(operations: &[Operation]) -> Value {
                 Response::Submitted => generator.root_schema_for::<Submitted>().to_value(),
                 Response::Jobs => generator.root_schema_for::<Jobs>().to_value(),
                 Response::JobStatus => generator.root_schema_for::<JobStatus>().to_value(),
-                Response::Events | Response::Report => json!({ "type": "object" }),
+                Response::Events => generator
+                    .root_schema_for::<JobEvents<Map<String, Value>>>()
+                    .to_value(),
+                Response::Report => json!({ "type": "object" }),
             };
             let mut input = match operation.request {
                 Request::Job => generator
@@ -194,9 +199,16 @@ pub fn mcp_tools(operations: &[Operation]) -> Value {
                     json!({ "type": "string", "description": "The run's ID." });
                 input["required"] = json!(["id"]);
             }
+            for name in operation.query {
+                input["properties"][*name] = json!({
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": FROM
+                });
+            }
             json!({
                 "name": operation.tool_name(),
-                "description": operation.summary,
+                "description": operation.tool_summary(),
                 "inputSchema": input,
                 "outputSchema": output
             })
