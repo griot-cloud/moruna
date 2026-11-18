@@ -14,7 +14,7 @@
   then a Mac slot, and hold both until the turn's build and boot are done (2026-11-18: an
   image build beside cargo builds filled the disk). With 20 GB or more free, the VM lock alone.
   Never take them in the other order.
-- **Mac builds and tests take a Mac slot:** `~/.mac-build-lock` or `~/.mac-build-lock-2`, by
+- **Mac builds and tests take a Mac slot:** `~/.mac-build-lock`, `~/.mac-build-lock-2` or `~/.mac-build-lock-4`, by
   `mkdir`, with an `owner` file naming your agent id, item and UTC time. Remove it the moment you
   stop building. If `~/.mac-build-lock-next` names someone else, they take the next free slot
   first. When it is empty, write your name there while you wait, and clear it once you hold a slot.
