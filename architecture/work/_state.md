@@ -13,7 +13,7 @@ uncommitted work is saved under `~/moruna-data/wip/<branch>/`:
 
 | Item | Branch | State |
 |---|---|---|
-| 6.3d the Parquet writers' memory | `work/6.3d-writer-heap`, rebased on 56cc2040 (old tip kept as backup/6.3d-before-rebase) | The claim order and the wide read's arena least are built; the 768-column test is no longer ignored. The five crates' suites are running; then commit, the release table and pairs once the load drops, and coverage |
+| 6.3d the Parquet writers' memory | `work/6.3d-writer-heap`, rebased on 56cc2040, fix committed at 114ec8c5 (old tip kept as backup/6.3d-before-rebase) | The claim order and the wide read's arena least are built; the 768-column test is no longer ignored. The five crates' suites are running; then commit, the release table and pairs once the load drops, and coverage |
 | 6.3g a function's memory measured | phases 1–2 merged (081e145c); phase 3 on `work/6.3g-function-memory-measured` | Rule 1 (the per-instance morsel cap plus the kernel's cut), rule 2 (profiles scaled by count), 6.3i's refused-charge commit, the gate's two Python fixes; then a booted turn |
 
 ## The PM's, in order
@@ -22,7 +22,7 @@ uncommitted work is saved under `~/moruna-data/wip/<branch>/`:
 |---|---|---|---|---|
 | 1 | 6.3s a Completed run lost a row group | MERGED 56cc2040 (`work/6.3s-rows`) | none | Done: SC-T50, SC-T51; a source closes only when no read waits to be retried and every read taken from its cursor was pushed. 6.3d's 768-column test passes with it |
 | 2 | 6.3n push into a closed stage | MERGED with 6.3s (its test is SC-T51) | none | Done: the same root as 6.3s |
-| 3 | 6.3r several instances fail on the node | `pm/boot-6.3` (feature plus the 6.3h stack) | `sc_t52` (a race ruled out) | Booted 4-CPU repro running (build.sh under way at 22:42; the Mac's load reached 65). Ruled out: the slot reuse race (`running` covers it), plane event order, and the RB5 retry moving instance. Failure 3 follows failure 2 (the retirement cannot be certified after a task dies mid-stream) |
+| 3 | 6.3r several instances fail on the node | `pm/boot-6.3` (feature plus the 6.3h stack) | `sc_t52` (a race ruled out) | Booted 4-CPU repro running: the image built in 49 min, the four stacks are built (23:12), and the Score and Enrich months at 4 CPUs come next. Ruled out: the slot reuse race (`running` covers it), plane event order, and the RB5 retry moving instance. Failure 3 follows failure 2 (the retirement cannot be certified after a task dies mid-stream) |
 | 4 | 6.3h, j, k, m bytes out in place (the stack) | `work/6.3j-probe-first-piece` 92541183 | scratch in wip | Its booted check runs in the same boot as 6.3r (`pm/boot-6.3`) |
 | 5 | 6.3i the node reports job CPU | `work/6.3i-node-job-cpu` c85452f9 (the last commit is WIP, untested) | none | Mac slot ~4 min: kernel host tests; then the booted turn |
 | 5b | 6.3t the drive's fetches run one at a time | MERGED 4c7eb964 (`work/6.3t-concurrent-fetch`) | none | Done on the host: an object's range is cut at column-chunk starts into requests of at most 8 MiB, all issued before any is waited for (SO-T49). Left: measure on the node (Occupancy and Audit from Blob); then make the drive's fetch truly asynchronous, so one group's wait does not hold the next |
