@@ -18,7 +18,7 @@ arrow-buffer = { version = "=59.3.0", default-features = false }
 arrow-ipc = { version = "=59.3.0", default-features = false }
 arrow-schema = { version = "=59.3.0", default-features = false }
 arrow-select = { version = "=59.3.0", default-features = false }
-moruna-function = { path = "." }
+moruna-function = { path = ".", version = "=0.1.0" }
 
 [package]
 name = "moruna-function"
@@ -35,19 +35,21 @@ arrow-ipc.workspace = true
 arrow-schema.workspace = true
 # The engine's own record check, run on every record before arrow-ipc reads it, and the page
 # layout of a record (contracts e.7).
-moruna-ipc-check = { path = "../../plane/check" }
+moruna-ipc-check = { path = "../../plane/check", version = "=0.1.0" }
 
 [dev-dependencies]
 arrow-select.workspace = true
 
-# On the core: the task's plane and its rings. Its log is std's: the std layer (5A0, item 5.0) owns
-# the log slot and sends standard error to it.
-[target.'cfg(any(target_os = "moruna", moruna_function_sys))'.dependencies]
-moruna-sys = { path = "../../sys" }
+# On the core: the task's plane and its rings, through std's own copy of moruna-sys
+# (std::os::moruna::moruna_sys), which holds the start page std's start read and the slots it took
+# (its log): a second copy would have none of them (system design 5B). Only the host type-check of
+# the core's adapter (`moruna_function_sys`, README) takes the crate itself.
+[target.'cfg(all(moruna_function_sys, not(target_os = "moruna")))'.dependencies]
+moruna-sys = { path = "../../sys", version = "=0.1.0" }
 
 # On a host: the ring protocol, for the data plane in memory (`moruna_function::host`).
 [target.'cfg(not(any(target_os = "moruna", moruna_function_sys)))'.dependencies]
-moruna-plane = { path = "../../plane/core" }
+moruna-plane = { path = "../../plane/core", version = "=0.1.0" }
 
 [lints.rust]
 # `moruna_function_sys` type-checks the core's adapter on a host (README, "Working on the SDK").
