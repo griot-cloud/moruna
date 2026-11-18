@@ -1332,6 +1332,7 @@ dependencies = [
  "moruna-svc",
  "moruna-sys",
  "netstack-protocol",
+ "node-functions",
  "node-protocol",
 ]
 

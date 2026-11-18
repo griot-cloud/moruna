@@ -44,6 +44,9 @@ pub struct State {
     pub needs: (Option<u64>, Needs),
     /// What the next start answers, when it is not to start.
     pub refuse_start: Option<HostError>,
+    /// What the next read answers, once: the engine lost before it said anything, as a node
+    /// that refuses a job's launch after it was asked (item 3.6).
+    pub lose_with: Option<HostError>,
     /// The lines sent to the engine after its `spec`.
     pub sent: Vec<String>,
     /// What the engine has sent that the server has not read.
@@ -194,6 +197,7 @@ impl EngineHost for Engine {
                     refusals,
                     memory_bytes,
                     needs,
+                    registered: Vec::new(),
                 }),
         )
     }
@@ -231,6 +235,9 @@ impl EngineHost for Engine {
 
     fn receive(&mut self, buf: &mut [u8]) -> Result<usize, HostError> {
         let mut state = self.0.borrow_mut();
+        if let Some(error) = state.lose_with.take() {
+            return Err(error);
+        }
         if state.outbox.is_empty() {
             return if state.ended {
                 Ok(0)

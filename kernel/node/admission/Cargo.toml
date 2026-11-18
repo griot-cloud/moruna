@@ -16,6 +16,8 @@ moruna-sys.workspace = true
 node-protocol = { path = "../protocol", version = "=0.1.0" }
 # A job's network (item 3.4): admission's client of the network server.
 netstack-protocol = { path = "../../net/protocol", version = "=0.1.0" }
+# A job's functions (item 3.6): fetched, checked, kept and handed to the engine.
+node-functions = { path = "../functions", version = "=0.1.0" }
 
 moruna-node = { path = "../core", version = "=0.1.0" }
 

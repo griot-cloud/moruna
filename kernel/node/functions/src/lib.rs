@@ -72,6 +72,40 @@ impl Registered {
     }
 }
 
+/// The functions a job uses as `api` registered them, `registered` (each its name, address and
+/// SHA-256 in hex), against `names`, those the job's check answered (item 3.6): one for each, in
+/// that order, each a registration's (64 lowercase hex digits); otherwise why not.
+pub fn registrations(
+    names: &[String],
+    registered: &[(String, String, String)],
+) -> Result<Vec<Registered>, String> {
+    if names.len() != registered.len() {
+        return Err(format!(
+            "the job uses {} functions, and {} registrations came with it",
+            names.len(),
+            registered.len()
+        ));
+    }
+    names
+        .iter()
+        .zip(registered)
+        .map(|(name, (given, address, sha256))| {
+            if name != given {
+                return Err(format!(
+                    "the job uses the function `{name}`, and the registration that came for it \
+                     is `{given}`'s"
+                ));
+            }
+            Registered::new(given, address, sha256).ok_or_else(|| {
+                format!(
+                    "the function `{given}`'s registration has no SHA-256 of 64 lowercase hex \
+                     digits"
+                )
+            })
+        })
+        .collect()
+}
+
 /// Why a fetch brought no image.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FetchError {

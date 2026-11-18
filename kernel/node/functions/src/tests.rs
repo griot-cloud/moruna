@@ -323,3 +323,36 @@ fn a_registered_sha256_is_64_lowercase_hex_digits() {
     assert!(Registered::new("a", "https://x/a", &digest[..62]).is_none());
     assert!(Registered::new("a", "https://x/a", &format!("{}zz", &digest[..62])).is_none());
 }
+
+#[test]
+fn a_jobs_registrations_are_one_for_each_function_it_uses_in_order() {
+    let digest = hex(&sha256::digest(SCORE));
+    let entry = |name: &str, sha: &str| {
+        (
+            name.to_string(),
+            format!("https://x/{name}"),
+            sha.to_string(),
+        )
+    };
+    let names = vec!["gate-score".to_string(), "gate-enrich".to_string()];
+    let both = [entry("gate-score", &digest), entry("gate-enrich", &digest)];
+    let taken = registrations(&names, &both).unwrap();
+    assert_eq!(taken.len(), 2);
+    assert_eq!(
+        (taken[1].name.as_str(), taken[1].address.as_str()),
+        ("gate-enrich", "https://x/gate-enrich")
+    );
+    assert!(registrations(&[], &[]).unwrap().is_empty());
+    let fewer = registrations(&names, &both[..1]).unwrap_err();
+    assert!(
+        fewer.contains("uses 2 functions, and 1 registrations"),
+        "{fewer}"
+    );
+    let swapped = registrations(&names, &[both[1].clone(), both[0].clone()]).unwrap_err();
+    assert!(
+        swapped.contains("`gate-score`, and the registration"),
+        "{swapped}"
+    );
+    let bad = registrations(&names[..1], &[entry("gate-score", "XYZ")]).unwrap_err();
+    assert!(bad.contains("no SHA-256"), "{bad}");
+}

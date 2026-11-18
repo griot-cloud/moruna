@@ -1037,6 +1037,8 @@ fn a_submit_is_checked_and_started_with_the_checks_budget_and_needs() {
             refusals: Vec::new(),
             memory_bytes: Some(1 << 30),
             needs,
+            // As registered, for the node to fetch and check it against (item 3.6).
+            registered: vec![registry.get("taxi.clean").unwrap().clone()],
         }]
     );
     engine.attempt_started();
@@ -1046,4 +1048,34 @@ fn a_submit_is_checked_and_started_with_the_checks_budget_and_needs() {
         serde_json::to_value(jobs.list()).unwrap()["jobs"][0]["id"],
         json!(RUN)
     );
+}
+
+/// A job the node refuses once its launch was asked (item 3.6: a function changed since it was
+/// registered, which the node finds only when it fetches it) answers its waiting submit with
+/// the node's words, and leaves no job behind; a failure of the node's says so too.
+#[test]
+fn a_launch_the_node_refuses_answers_the_submit_with_why() {
+    let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
+    let ticket = submit(&mut jobs, &mut engine, V1.as_bytes()).unwrap();
+    let why = "the function `taxi.clean`'s image has changed since it was registered";
+    engine.0.borrow_mut().lose_with = Some(HostError::Refused(why.into()));
+    jobs.pump(&mut engine, &Registry::default(), NOW);
+    let answer = resolved(&mut jobs, ticket);
+    assert_eq!(body(&answer)["error"]["code"], "invalid");
+    assert!(
+        body(&answer)["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(why),
+        "{}",
+        body(&answer)
+    );
+    assert!(!jobs.busy() && jobs.list().jobs.is_empty());
+    // The node's own failure is the submit's `internal`, in its words.
+    let ticket = submit(&mut jobs, &mut engine, V1.as_bytes()).unwrap();
+    engine.0.borrow_mut().lose_with = Some(HostError::Failed("node-admission went".into()));
+    jobs.pump(&mut engine, &Registry::default(), NOW);
+    let answer = resolved(&mut jobs, ticket);
+    assert_eq!(body(&answer)["error"]["code"], "internal");
+    assert!(!jobs.busy());
 }

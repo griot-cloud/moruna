@@ -21,15 +21,24 @@
 //!   its account is free for the next: a check before the next check starts; a job as soon as its
 //!   channel has ended with nothing left to read ([`Host::tend`]), which the server has then
 //!   heard its `exit` on, and at the latest before the next job starts.
+//! - **Functions** (system design 3E, item 3.6): at each start `api` sends `node-admission` node
+//!   config's `functions.cache_bytes` before it asks the job bound, which then counts the cache
+//!   ([`Host::set_up`]). Every job's engine is configured `grant functions functions`, and its
+//!   launch carries the job's functions as registered, which `node-admission` fetches and checks
+//!   before it starts the engine: `api` asks without waiting, and looks for the answer as it
+//!   serves, for up to [`LAUNCH_NS`], since a fetch takes as long as it takes within
+//!   `node-admission`'s own bound ([`node_protocol::FETCH_NS`] an image). A refusal's sentence,
+//!   which names the function that is the cause, is what the job's submit is answered with.
 
 use alloc::{collections::VecDeque, format, rc::Rc, string::String, vec, vec::Vec};
 use core::cell::RefCell;
 
 use moruna_api_server::{EngineHost, HostError, Verdict, check_line, verdict};
+use moruna_svc::Wire;
 use moruna_svc::{CallError, Channel, Handle, Memory, Rights, Signals, limits, map};
 use node_protocol::{
-    CHECK_BYTES, CHECK_CHANNEL, ENGINE_CHANNEL, RUNNING, VOLUMES_SLOT, admission, check_args,
-    serve_args,
+    CHECK_BYTES, CHECK_CHANNEL, ENGINE_CHANNEL, Launched, RUNNING, Refusal, Registered,
+    VOLUMES_SLOT, admission, check_args, serve_args,
 };
 
 /// The engine, a Linux program in the node's image.
@@ -49,6 +58,24 @@ pub const PIECE: usize = limits::CHANNEL_MAX_BYTES;
 /// How long a call to `node-admission` may take, and how long an engine whose channel has ended
 /// is waited for before it is killed.
 pub const CALL_NS: u64 = 30 * 1_000_000_000;
+
+/// How long `api` waits for `node-admission` to answer a job's launch: ten minutes, a backstop
+/// (PM, item 3.6), since `node-admission` fetches each of the job's functions within its own
+/// bound and answers when they are fetched or refused.
+pub const LAUNCH_NS: u64 = 600 * 1_000_000_000;
+
+/// How often `api` looks for a launch's answer while it waits for one.
+pub const LAUNCH_POLL_NS: u64 = 50_000_000;
+
+/// What every job's engine supervisor is given beside its channel: the job's functions, which
+/// `node-admission` gives it as `function.N` and the `functions` index (item 3.6). A job that
+/// uses none is given no index, and the grant hands on nothing.
+pub const FUNCTIONS_GRANT: &str = "grant functions functions\n";
+
+/// What a job's engine supervisor is given when the job uses a function: the process resource
+/// `node-admission` grants it as `process`, from which the engine starts a native function's
+/// program itself (stream P; item 3.6). A job that uses none is given none.
+pub const PROCESS_GRANT: &str = "grant process process process\n";
 
 /// What the engine's supervisor carves from a job's account for the program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,13 +101,15 @@ pub fn sizes(budget: u64, staging: bool) -> Sizes {
 
 /// The engine supervisor's configuration for a job of `budget` bytes on a node whose job bound
 /// is `bound`, `staging` when it stages on a volume, `network` when it names hosts (its network,
-/// which `node-admission` mints and grants it as `network`); refused when the budget leaves the
-/// program no memory past the engine's own.
+/// which `node-admission` mints and grants it as `network`), `functions` when it uses a
+/// registered function (the process resource a native one is started from, item 3.6); refused
+/// when the budget leaves the program no memory past the engine's own.
 pub fn job_config(
     bound: u64,
     budget: u64,
     staging: bool,
     network: bool,
+    functions: bool,
 ) -> Result<String, HostError> {
     let Sizes { memory, scratch } = sizes(budget, staging);
     if memory == 0 || memory % 4096 != 0 {
@@ -90,17 +119,20 @@ pub fn job_config(
             ENGINE_OVERHEAD >> 20
         )));
     }
-    let more = if network {
-        "grant network service network\n"
-    } else {
-        ""
-    };
+    let mut more = String::new();
+    if network {
+        more.push_str("grant network service network\n");
+    }
+    more.push_str(FUNCTIONS_GRANT);
+    if functions {
+        more.push_str(PROCESS_GRANT);
+    }
     Ok(config(
         &serve_args(bound),
         memory,
         scratch,
         ENGINE_CHANNEL,
-        more,
+        &more,
     ))
 }
 
@@ -127,6 +159,28 @@ fn config(args: &[String], memory: u64, scratch: u64, channel: &str, more: &str)
          grant {channel} channel {channel}\n{more}runs 1\n"
     ));
     text
+}
+
+/// What a refusal of a job's launch means for the submit that asked: its sentence, as the job's
+/// refusal for the node's refusals of it (its budget, its volumes, a function that is not what
+/// was registered), as the node's failure otherwise.
+fn refused(refusal: Refusal) -> HostError {
+    match refusal.error() {
+        Some(admission::Error::Quota | admission::Error::Invalid | admission::Error::Refused) => {
+            HostError::Refused(refusal.message)
+        }
+        Some(admission::Error::Limit) => HostError::Unavailable,
+        _ => HostError::Failed(format!("node-admission: {}", refusal.message)),
+    }
+}
+
+/// A job's launch asked of `node-admission`, not yet answered: its request, until when it is
+/// waited for, and the job's channel and `spec`, for the engine once it starts.
+struct Launching {
+    txid: u32,
+    by: u64,
+    channel: Channel,
+    spec: Vec<u8>,
 }
 
 /// What the node's admission failing means for the call that asked.
@@ -254,23 +308,105 @@ pub struct Host {
     bound: u64,
     check: Option<Run>,
     job: Option<Run>,
+    /// The job's launch, while `node-admission` has not answered it.
+    launching: Option<Launching>,
     /// Checks that have answered, to be released before the next starts.
     answered: Vec<u64>,
 }
 
 impl Host {
-    /// The host over `admission`, a connection to `node-admission`: it asks the node's job
-    /// bound first, which the node document reports and every engine is started with.
-    pub fn new(mut admission: admission::Client) -> Result<Host, CallError<admission::Error>> {
+    /// The host over `admission`, a connection to `node-admission`, whose first questions are
+    /// [`Host::set_up`]'s.
+    pub fn new(mut admission: admission::Client) -> Host {
         admission.core().set_timeout(CALL_NS);
-        let bound = admission.bound()?;
-        Ok(Host {
+        Host {
             admission,
-            bound,
+            bound: 0,
             check: None,
             job: None,
+            launching: None,
             answered: Vec::new(),
-        })
+        }
+    }
+
+    /// Sends `node-admission` the function cache's size, node config's `functions.cache_bytes`
+    /// (item 3.6), then asks the node's job bound, which counts the cache, and which the node
+    /// document reports and every engine is started with.
+    pub fn set_up(&mut self, cache_bytes: u64) -> Result<u64, CallError<admission::Error>> {
+        self.admission.functions(cache_bytes)?;
+        self.bound = self.admission.bound()?;
+        Ok(self.bound)
+    }
+
+    /// Whether a job's launch waits for `node-admission`'s answer.
+    pub fn launching(&self) -> bool {
+        self.launching.is_some()
+    }
+
+    /// When the process's loop is to look again for a launch's answer: `Some` while one is
+    /// awaited, since the answer comes on `node-admission`'s connection, which it does not wait
+    /// on.
+    pub fn look_at(&self) -> Option<u64> {
+        self.launching
+            .as_ref()
+            .map(|_| moruna_svc::now().saturating_add(LAUNCH_POLL_NS))
+    }
+
+    /// Takes the launch's answer, if it has come: the job's engine, which is then sent its
+    /// `spec`; `WouldBlock` while it is still to come; the refusal's sentence or the failure
+    /// otherwise, and after [`LAUNCH_NS`].
+    fn launched(&mut self) -> Result<(), HostError> {
+        let Some(txid) = self.launching.as_ref().map(|l| l.txid) else {
+            return Ok(());
+        };
+        let what = "starting the job's engine";
+        let mut answer = self.admission.core().take_reply(txid);
+        if answer.is_none() {
+            match self.admission.core().file(moruna_svc::now()) {
+                Ok(()) | Err(CallError::TimedOut) => {}
+                Err(error) => {
+                    self.launching = None;
+                    return Err(admission_error(what, error.typed()));
+                }
+            }
+            answer = self.admission.core().take_reply(txid);
+        }
+        let Some(answer) = answer else {
+            if self
+                .launching
+                .as_ref()
+                .is_some_and(|l| moruna_svc::now() > l.by)
+            {
+                self.launching = None;
+                return Err(HostError::Failed(format!(
+                    "node-admission did not answer the job's start within {} minutes",
+                    LAUNCH_NS / 60_000_000_000
+                )));
+            }
+            return Err(HostError::WouldBlock);
+        };
+        let Some(launching) = self.launching.take() else {
+            return Ok(());
+        };
+        let mut frame = answer.map_err(|error| admission_error(what, error.typed()))?;
+        let mut d = frame.decoder();
+        let launched = Launched::decode(&mut d)
+            .ok()
+            .filter(|_| d.finish().is_ok())
+            .ok_or_else(|| {
+                HostError::Failed(String::from(
+                    "node-admission answered the job's start with something else",
+                ))
+            })?;
+        match launched {
+            Launched::Started(id) => {
+                let mut run = Run::new(id, launching.channel, launching.spec);
+                run.flush();
+                self.job = Some(run);
+                Ok(())
+            }
+            Launched::Refused(refusal) => Err(refused(refusal)),
+        }
     }
 
     /// The most memory a job may have, as `node-admission` answered it.
@@ -405,12 +541,18 @@ impl EngineHost for Host {
         if let Some(run) = self.job.take() {
             self.finish(run.id);
         }
+        if self.launching.is_some() {
+            return Err(HostError::Unavailable);
+        }
         let budget = verdict
             .memory_bytes
             .ok_or_else(|| HostError::Failed(String::from("the engine's check named no budget")))?;
         let staging = verdict.needs.volumes.iter().any(|v| v.staging);
         let network = !verdict.needs.hosts.is_empty();
-        let config = config_memory(&job_config(self.bound, budget, staging, network)?)?;
+        let functions = !verdict.needs.functions.is_empty();
+        let config = config_memory(&job_config(
+            self.bound, budget, staging, network, functions,
+        )?)?;
         let (ours, theirs) = Host::channel()?;
         let needs = &verdict.needs;
         let needs: node_protocol::Needs = (
@@ -422,20 +564,41 @@ impl EngineHost for Host {
                 .collect(),
             needs.functions.clone(),
         );
-        let id = self
-            .admission
-            .launch(
+        let functions: Vec<Registered> = verdict
+            .registered
+            .iter()
+            .map(|f| (f.name.clone(), f.address.clone(), f.sha256.clone()))
+            .collect();
+        // The launch is asked, not waited for: `node-admission` answers once it has fetched and
+        // checked the job's functions (item 3.6), which `receive` looks for.
+        let mut body = moruna_svc::Encoder::new();
+        (
+            (
                 budget,
                 config,
                 vec![String::from(ENGINE_CHANNEL)],
                 vec![theirs],
-                SERVICES.iter().map(|s| String::from(*s)).collect(),
+                SERVICES
+                    .iter()
+                    .map(|s| String::from(*s))
+                    .collect::<Vec<String>>(),
                 needs,
-            )
-            .map_err(|e| admission_error("starting the job's engine", e))?;
-        let mut run = Run::new(id, ours, spec.to_vec());
-        run.flush();
-        self.job = Some(run);
+            ),
+            functions,
+        )
+            .encode(&mut body)
+            .map_err(|e| HostError::Failed(format!("the job's launch: {e:?}")))?;
+        let txid = self
+            .admission
+            .core()
+            .send(1, body)
+            .map_err(|e| admission_error("starting the job's engine", e.typed()))?;
+        self.launching = Some(Launching {
+            txid,
+            by: moruna_svc::now().saturating_add(LAUNCH_NS),
+            channel: ours,
+            spec: spec.to_vec(),
+        });
         Ok(())
     }
 
@@ -447,6 +610,8 @@ impl EngineHost for Host {
     }
 
     fn receive(&mut self, buf: &mut [u8]) -> Result<usize, HostError> {
+        // The job's launch, until `node-admission` answers it.
+        self.launched()?;
         // No engine: its channel has ended, and it was let go ([`Host::tend`]).
         let Some(run) = self.job.as_mut() else {
             return Ok(0);

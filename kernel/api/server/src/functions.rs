@@ -198,6 +198,15 @@ impl Registry {
         self.entries.get(name)
     }
 
+    /// The registration of each of `names`, the functions a job uses, in that order: those
+    /// registered, which are all of them for a job the server starts (item 3.6).
+    pub(crate) fn registered(&self, names: &[String]) -> Vec<Function> {
+        names
+            .iter()
+            .filter_map(|name| self.entries.get(name.as_str()).cloned())
+            .collect()
+    }
+
     /// A refusal for each of `names`, the functions a job uses, that is not registered.
     pub(crate) fn refusals(&self, names: &[String]) -> Vec<Refusal> {
         names
