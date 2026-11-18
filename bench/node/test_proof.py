@@ -276,6 +276,117 @@ def test_a_whole_proof_passes(world):
     assert "bit for bit" in said[-1] and not os.listdir(world / "work")
 
 
+# A container SAS as Azure writes one, every value fake; its `sig` is the secret part.
+SIG = "FAKEfakeFAKEfake%2Bfake%2Ffake%3D"
+SAS = f"sv=2022-11-02&sr=c&sp=r&se=2026-11-18T12%3A00Z&spr=https&sig={SIG}"
+BLOB_BASE = "https://acct.blob.core.windows.net/functions"
+
+
+def sas_run(tmp_path, node, monkeypatch, sas=SAS, jobs="score,enrich"):
+    """proof.py with the functions in a private Blob container, its SAS in the environment."""
+    monkeypatch.setenv("FUNCTIONS_SAS", sas)
+    argv = args(tmp_path, jobs=jobs)
+    argv[argv.index("--function-base") + 1] = BLOB_BASE
+    said = []
+    rc = proof.main(argv, transport=node, sign=lambda d: f"SIG-{d[:8]}", log=said.append, sleep=lambda s: None,
+                    clock=lambda: 0.0)
+    return rc, said
+
+
+def written(tmp_path):
+    """Everything proof.py wrote: its results and what is left of its work."""
+    return "".join(open(os.path.join(d, f), errors="replace").read()
+                   for root in ("res", "work") for d, _, fs in os.walk(tmp_path / root) for f in fs)
+
+
+def secret_parts(sas=SAS):
+    return [sas, SIG, "FAKEfakeFAKEfake+fake/fake="]
+
+
+def test_each_function_is_registered_at_its_blob_address_with_the_sas(world, monkeypatch):
+    node = FakeNode(str(world / "vol"), {"score": expected("score"), "enrich": expected("enrich")})
+    rc, said = sas_run(world, node, monkeypatch)
+    assert rc == 0, said
+    for job in ("score", "enrich"):
+        assert node.registered[f"gate-{job}"]["address"] == f"{BLOB_BASE}/gate-{job}?{SAS}"
+    # The address is shown with the SAS named, never with it; nothing written holds it.
+    assert "gate-score: registered" in "\n".join(said)
+    assert any(s.endswith(f"fetched from {BLOB_BASE}/gate-score?<FUNCTIONS_SAS>") for s in said), said
+    for part in secret_parts():
+        assert part not in "\n".join(said) and part not in written(world)
+    # Azure's query string may be given with its `?`: the address is the same.
+    again = FakeNode(str(world / "vol"), {"score": expected("score")})
+    rc, _ = sas_run(world, again, monkeypatch, sas=f"?{SAS}\n", jobs="score")
+    assert rc == 0 and again.registered["gate-score"]["address"] == f"{BLOB_BASE}/gate-score?{SAS}"
+
+
+def test_without_a_sas_the_address_is_the_base_and_the_name(monkeypatch):
+    monkeypatch.delenv("FUNCTIONS_SAS", raising=False)
+    assert proof.sas_of() == ""
+    assert proof.address("https://code.example/fn", "gate-audit", proof.sas_of()) == "https://code.example/fn/gate-audit"
+    assert proof.sas_of({"FUNCTIONS_SAS": f" ?{SAS} "}) == SAS
+    assert proof.address(BLOB_BASE, "gate-audit", SAS) == f"{BLOB_BASE}/gate-audit?{SAS}"
+
+
+def test_a_node_diagnostic_that_quotes_the_sas_is_redacted_in_the_logs_and_the_results(world, monkeypatch):
+    """The node's fetch failure names the address it fetched (kernel/node/functions' https.rs:
+    `{address}: {why}`), the SAS with it; proof.py keeps the failure and not the SAS."""
+    node = FakeNode(str(world / "vol"), {"score": expected("score"), "enrich": expected("enrich")},
+                    fail={"score-2024-01"})
+    real = node.start
+
+    def start(body):
+        jid = real(body)
+        if node.jobs[jid]["run"] == "score-2024-01":
+            node.jobs[jid]["exit"]["diagnostic"] = (
+                f"function gate-score: {BLOB_BASE}/gate-score?{SAS}: 403 (signature "
+                f"{secret_parts()[2]} did not match)")
+            node.jobs[jid]["report"]["report"]["error"] = f"fetching {BLOB_BASE}/gate-score?{SAS}"
+        return jid
+    node.start = start
+    monkeypatch.setenv("BENCH_KEY", "fake-account-key-0123456789")
+    rc, said = sas_run(world, node, monkeypatch)
+    assert rc == 1
+    r = result(world, "score-2024-01")
+    assert r["diagnostic"] == (f"function gate-score: {BLOB_BASE}/gate-score?<FUNCTIONS_SAS>: 403 "
+                               "(signature <FUNCTIONS_SAS> did not match)")
+    assert r["exit"]["diagnostic"] == r["diagnostic"]
+    assert any("FAIL: function gate-score: " in s and "?<FUNCTIONS_SAS>: 403" in s for s in said), said
+    for part in secret_parts():
+        assert part not in "\n".join(said) and part not in written(world)
+    assert result(world, "enrich-2024-01")["ok"]
+
+
+def test_a_refused_registration_says_why_without_the_sas(world, monkeypatch):
+    node = FakeNode(str(world / "vol"), {"score": expected("score")})
+    real = node.__call__
+
+    def t(method, path, body=None, token=None):
+        if path == "/v1/functions" and method == "POST":
+            return 400, json.dumps({"error": {"code": "invalid", "message": f"{body['address']}: too long"}}).encode()
+        return real(method, path, body, token)
+    with pytest.raises(SystemExit) as stop:
+        sas_run(world, t, monkeypatch, jobs="score")
+    why = str(stop.value)
+    assert why.startswith("proof.py: a function was not registered: POST /v1/functions: 400")
+    assert "gate-score?<FUNCTIONS_SAS>: too long" in why
+    for part in secret_parts():
+        assert part not in why
+
+
+def test_redact_names_each_secret_and_a_sas_s_signature_alone():
+    r = proof.Redact({"FUNCTIONS_SAS": SAS, "BENCH_KEY": "fake-key==", "EMPTY": ""})
+    assert r(f"a {SAS} b") == "a <FUNCTIONS_SAS> b"
+    assert r(f"sig={SIG}&x") == "sig=<FUNCTIONS_SAS>&x"
+    assert r("decoded FAKEfakeFAKEfake+fake/fake= here") == "decoded <FUNCTIONS_SAS> here"
+    assert r("key fake-key==") == "key <BENCH_KEY>"
+    assert r(42) == "42" and r("") == ""
+    # A signature too short to be one is not looked for alone: it would hide ordinary text.
+    short = proof.Redact({"FUNCTIONS_SAS": "sp=r&sig=ab"})
+    assert short("ab sp=r&sig=ab") == "ab <FUNCTIONS_SAS>"
+    assert proof.Redact({})("nothing") == "nothing"
+
+
 def test_a_function_the_node_lists_already_is_not_registered_again(world):
     digest = hashlib.sha256(b"a static program for score").hexdigest()
     node = FakeNode(str(world / "vol"), {"score": expected("score")}, listed={"gate-score": digest},

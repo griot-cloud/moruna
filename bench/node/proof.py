@@ -13,7 +13,10 @@ Against one node, in order:
 1. **Registers the jobs' functions** (3E): each gate task `DIR/gate-JOB`, served at
    `--function-base/gate-JOB`, by its SHA-256 and an Ed25519 signature over it made with the
    test function key whose public half is in the node's config. One the node already lists with
-   the same SHA-256 is left as it is.
+   the same SHA-256 is left as it is. A private store's tasks are given by a SAS (3E: `https://`
+   only, a pre-signed or SAS URL; admission holds no store credentials): with `FUNCTIONS_SAS` in
+   the environment, each address is `--function-base/gate-JOB?SAS`, for Blob
+   `https://ACCOUNT.blob.core.windows.net/CONTAINER/gate-JOB?SAS`.
 2. **Runs Score, Occupancy, Enrich and Audit** (bench/vm/workloads.py) on January 2024, then on
    all of 2024, one job at a time (3A: a node runs one), each as gate_jobs.py's document with
    its function the registered task, `{"kind": "function", "function": "gate-JOB"}` (3.6): the
@@ -33,16 +36,22 @@ Against one node, in order:
 Every run's record is written to `RESULTS/JOB-PERIOD.json`, the summary to `RESULTS/proof.json`,
 and a table is printed. The exit code is 0 only when all of them pass.
 
-The Blob account key is read from the environment (`BENCH_KEY`), never from the command line.
+The Blob account key (`BENCH_KEY`) and the functions' SAS (`FUNCTIONS_SAS`, the query string
+Azure gives, with or without its `?`) are read from the environment, never from the command line,
+and never printed or written: wherever either would show (an address, a node's diagnostic that
+quotes one, an error), the logs and the results name it instead, `<FUNCTIONS_SAS>` or
+`<BENCH_KEY>`.
 """
 import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -63,6 +72,49 @@ MiB = 1 << 20
 # What a node keeps from a job's budget (3A): 512 MiB for its services, 256 MiB for a check.
 NODE_KEEPS = 768 * MiB
 BLOB_SECRET = "blob-key"
+# The environment's secrets: the Blob account key, and the SAS each function's address carries.
+BLOB_KEY_ENV = "BENCH_KEY"
+SAS_ENV = "FUNCTIONS_SAS"
+# A SAS's signature is looked for alone only when it is this long: a real one is 44 characters of
+# base64, and a shorter piece would hide ordinary text.
+SIG_LEAST = 8
+
+
+def sas_of(env=None):
+    """The functions' SAS from the environment: Azure's query string without its `?`, or ""."""
+    env = os.environ if env is None else env
+    return env.get(SAS_ENV, "").strip().lstrip("?")
+
+
+def address(function_base, name, sas=""):
+    """Where the node fetches function `name`: `function_base/name`, with the SAS when given."""
+    return f"{function_base}/{name}" + (f"?{sas}" if sas else "")
+
+
+class Redact:
+    """Text with each secret's value replaced by its name in angle brackets. A SAS is also
+    found by its signature alone (`sig`, the only part of it that is secret), as given or
+    decoded, so a message that quotes it decoded or cut is still redacted."""
+
+    def __init__(self, secrets):
+        pairs = {}
+        for name, value in secrets.items():
+            if not value:
+                continue
+            pairs[value] = f"<{name}>"
+            if name == SAS_ENV:
+                for sig in re.findall(r"(?:^|&)sig=([^&]*)", value):
+                    for piece in {sig, urllib.parse.unquote(sig)}:
+                        if len(piece) >= SIG_LEAST:
+                            pairs[piece] = f"<{name}>"
+        # The longest first, so that a whole SAS goes before its signature.
+        self.pairs = sorted(pairs.items(), key=lambda p: -len(p[0]))
+
+    def __call__(self, text):
+        text = str(text)
+        for value, name in self.pairs:
+            text = text.replace(value, name)
+        return text
 
 
 def files(period):
@@ -146,8 +198,9 @@ def document(run, data, cpus, memory_bytes):
     return doc, secrets
 
 
-def register(node, jobs, functions_dir, function_base, sign, log):
-    """Each job's gate task as a function (3E); one listed already with its SHA-256 stays."""
+def register(node, jobs, functions_dir, function_base, sign, log, sas=""):
+    """Each job's gate task as a function (3E), at `address`; one listed already with its
+    SHA-256 stays. `log` is main's, which redacts the SAS in the address it shows."""
     listed = {}
     try:
         answer = node.json("GET", "/v1/functions")
@@ -163,8 +216,9 @@ def register(node, jobs, functions_dir, function_base, sign, log):
         if listed.get(name) == digest:
             log(f"{name}: registered already ({digest[:12]})")
             continue
-        node.register(name, f"{function_base}/{name}", digest, sign(digest))
-        log(f"{name}: registered ({digest[:12]})")
+        where = address(function_base, name, sas)
+        node.register(name, where, digest, sign(digest))
+        log(f"{name}: registered ({digest[:12]}), fetched from {where}")
         done.append(name)
     return done
 
@@ -452,7 +506,8 @@ def parse(argv):
     p.add_argument("--instance", default=None, help="and the node's instance ID, the tokens' `aud`")
     p.add_argument("--function-key", required=True, help="the test function key (its public half in node config)")
     p.add_argument("--functions", required=True, help="the directory of the gate tasks, gate-JOB")
-    p.add_argument("--function-base", required=True, help="where the node fetches them from, URL/gate-JOB")
+    p.add_argument("--function-base", required=True,
+                   help="where the node fetches them from, URL/gate-JOB (?FUNCTIONS_SAS from the environment)")
     p.add_argument("--data", choices=("volume", "blob"), required=True)
     p.add_argument("--source-serial", default=None)
     p.add_argument("--sink-serial", default=None)
@@ -491,6 +546,16 @@ def parse(argv):
 
 def main(argv=None, transport=None, sign=None, log=print, sleep=time.sleep, clock=time.time):
     a = parse(argv)
+    sas = sas_of()
+    # Every line said and every record written goes through it: no secret is shown or kept.
+    redact = Redact({SAS_ENV: sas, BLOB_KEY_ENV: os.environ.get(BLOB_KEY_ENV, "")})
+    say = log
+    log = lambda line: say(redact(line))  # noqa: E731
+
+    def write(path, obj):
+        with open(path, "w") as f:
+            f.write(redact(json.dumps(obj, indent=1, default=str)))
+
     node = node_api.Node(transport or node_api.Https(a.url, a.pin), tokens_of(a))
     data = data_of(a)
     sign = sign or (lambda digest: node_api.sign_digest(a.function_key, digest))
@@ -502,21 +567,22 @@ def main(argv=None, transport=None, sign=None, log=print, sleep=time.sleep, cloc
     log(f"proof: node {facts.get('instance')} on {facts.get('cloud')}, version {facts.get('version')}; "
         f"budget {a.memory_bytes / (1 << 30):.2f} GiB, {a.cpus} CPUs; data from {a.data}; events by {a.events}")
     jobs = a.jobs.split(",")
-    register(node, jobs, a.functions, a.function_base, sign, log)
+    try:
+        register(node, jobs, a.functions, a.function_base, sign, log, sas)
+    except node_api.ApiError as e:
+        raise SystemExit(f"proof.py: a function was not registered: {redact(e)}") from None
     follow = follow_sse if a.events == "sse" else follow_mcp
     records = []
     for run in plan(jobs, a.periods.split(",")):
         rec = run_one(node, run, data, a, follow, log=log, sleep=sleep, clock=clock)
-        with open(os.path.join(a.results, f"{run['id']}.json"), "w") as f:
-            json.dump(rec, f, indent=1, default=str)
+        write(os.path.join(a.results, f"{run['id']}.json"), rec)
         log(f"   {run['id']}: {'pass' if rec.get('ok') else 'FAIL'}: {outcome(rec)}")
         records.append(rec)
     summary = {"node": facts, "data": a.data, "events": a.events, "ok": all(r.get("ok") for r in records),
                "runs": [{"id": r["run"]["id"], "ok": r.get("ok"), "state": r.get("state"),
                          "seconds": r.get("seconds"), "verdict": (r.get("output_check") or {}).get("verdict")}
                         for r in records]}
-    with open(os.path.join(a.results, "proof.json"), "w") as f:
-        json.dump(summary, f, indent=1, default=str)
+    write(os.path.join(a.results, "proof.json"), summary)
     log(table(records))
     return 0 if summary["ok"] else 1
 
