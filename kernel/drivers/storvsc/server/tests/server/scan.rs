@@ -128,14 +128,14 @@ fn a_controller_that_refuses_its_initialisation_or_never_answers_ends_the_scan()
     host.borrow_mut().stalled = true;
     let page = Page(host.clone());
     let silent = scan::start(link, &page).err().unwrap();
-    assert_eq!(silent, "the initialisation was not answered within 10 s");
+    assert_eq!(silent, "no answer to the initialisation within 4 s");
 
     let (link, host) = controller(&[(0, 512, 64)]);
     let page = Page(host.clone());
     let mut device: Storvsc<_> = scan::start(link, &page).unwrap();
     host.borrow_mut().stalled = true;
     let late = scan::scan(&mut device, &page).err().unwrap();
-    assert_eq!(late, "REPORT LUNS was not answered within 10 s");
+    assert_eq!(late, "no answer to REPORT LUNS within 4 s");
     host.borrow_mut().rescind = true;
     let gone = scan::scan(&mut device, &page).err().unwrap();
     assert!(gone.starts_with("REPORT LUNS: "), "{gone}");
