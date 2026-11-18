@@ -2101,8 +2101,13 @@ impl TaskState {
             Some(Event::Ended { .. }) => {
                 Err(self.failed("it ended while the engine offered a batch"))
             }
-            // An answer to a batch in flight, taken in its turn.
-            Some(Event::Put { batch, .. }) if !self.in_flight.is_empty() => {
+            // An answer to a batch in flight, taken in its turn. A batch whose answer is being
+            // taken ([`Self::taking`]) is still in flight: `wait_for_room` moves the oldest
+            // batch there while it waits, and a release seen as one with nothing in flight was
+            // dropped, so the task's later answers were taken for the wrong batches until one
+            // came to its release with no record ("it said a batch was done without a record",
+            // 6.2 run 5, Audit at 4 instances; item 6.3r).
+            Some(Event::Put { batch, .. }) if self.outstanding() > 0 => {
                 self.window = None;
                 self.early.push_back(Seen::Put(batch));
                 Ok(true)
@@ -2111,7 +2116,7 @@ impl TaskState {
                 let _ = self.plane.drop_batch(batch);
                 Err(self.failed("it put a record before it was offered a batch"))
             }
-            Some(Event::Released { batch, .. }) if !self.in_flight.is_empty() => {
+            Some(Event::Released { batch, .. }) if self.outstanding() > 0 => {
                 self.early.push_back(Seen::Released(batch));
                 Ok(true)
             }
@@ -2545,7 +2550,7 @@ impl TaskState {
                 .drop_batch(taking.offered)
                 .map_err(|e| plane_error(&self.name, "the engine's hold", e))?;
         }
-        self.count_busy(!self.in_flight.is_empty());
+        self.count_busy(self.outstanding() > 0);
         if let (None, Payload::Table(batch, _)) = (&self.schema, &answer) {
             let schema = batch.schema();
             lock(&self.busy.schema).get_or_insert_with(|| Arc::clone(&schema));
@@ -2746,7 +2751,7 @@ impl TaskState {
             &self.name,
             self.instance,
             waited,
-            (self.in_flight.len(), self.queued.len(), self.held),
+            (self.outstanding(), self.queued.len(), self.held),
             windows.as_deref(),
         );
         tracing::warn!(target: "micro", stage = self.stage, "{line}");
