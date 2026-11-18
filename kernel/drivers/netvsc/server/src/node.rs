@@ -247,8 +247,13 @@ impl Watch for Woken {
     }
 
     fn signaled(&mut self, _: Signals, done: &mut Completions) -> bool {
-        let closed = drain(&self.wake);
         let mut driver = self.driver.borrow_mut();
+        // A diagnosis build notes the wake (work item 1.11d).
+        #[cfg(feature = "trace-first-frames")]
+        if let Some(trace) = driver.card().trace() {
+            trace.woken();
+        }
+        let closed = drain(&self.wake);
         driver.service();
         for (pending, outcome) in driver.take_ready() {
             done.complete(pending, outcome);
@@ -356,6 +361,13 @@ fn card(steps: &Steps<'_>, vmbus_listener: &Channel) -> Result<Netvsc<Opening, M
     #[cfg(feature = "trace-first-frames")]
     let card = {
         let started = steps.started;
+        // The clock's start on the node's, which `vmbus`'s trace reads (work item 1.11d).
+        println!(
+            console,
+            "netvsc: trace: 0 ms on netvsc's clock is {}.{:03} ms on the node's",
+            started / 1_000_000,
+            started / 1_000 % 1_000
+        );
         let clock = Box::new(move || now().saturating_sub(started));
         Netvsc::start_traced(
             channel,
@@ -439,6 +451,12 @@ fn serve(console: &Console, started: u64) -> Result<(), String> {
             }
             if let Some(why) = driver.failed() {
                 return Err(String::from(why));
+            }
+            // A diagnosis build notes when the wait begins, after the console's lines (work
+            // item 1.11d).
+            #[cfg(feature = "trace-first-frames")]
+            if let Some(trace) = driver.card().trace() {
+                trace.waiting();
             }
         }
         if gone.get() {

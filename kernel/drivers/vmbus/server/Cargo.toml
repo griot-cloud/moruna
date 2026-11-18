@@ -17,6 +17,13 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[features]
+# Work item 1.11d, for diagnosis only: when the host's signals of the network card's channel
+# reached the process, on the node's clock, said on the console sixteen at a time. A node's
+# normal image never turns it on; `package.py --feature moruna-vmbus-server/trace-first-frames`
+# builds the image that does, beside netvsc's own feature of the same name.
+trace-first-frames = []
+
 [dependencies]
 moruna-svc.workspace = true
 moruna-vmbus = { path = "../core", version = "=0.1.0" }

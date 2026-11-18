@@ -9,6 +9,8 @@
 //!   against two cards whose hosts are joined, each frame out of one in at the other.
 //! - `trace`: with the feature `trace-first-frames` only, the card's trace on the console's
 //!   lines (work item 1.11c).
+//! - `latency`: with the same feature, why that trace read completions late on Azure: its own
+//!   console lines before the wait (work item 1.11d).
 //!
 //! The world is the process's loop on the host: each turn the host's queued packets go on
 //! the ring (on a node the host writes them and `vmbus` wakes the driver), the driver
@@ -20,6 +22,8 @@
 #[path = "../../../core/tests/netvsc/fake.rs"]
 mod fake;
 
+#[cfg(feature = "trace-first-frames")]
+mod latency;
 mod serve;
 mod suites;
 #[cfg(feature = "trace-first-frames")]
