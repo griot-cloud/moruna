@@ -104,8 +104,6 @@ fn the_cloud_configuration_is_read_as_written() {
             }
         )]
     );
-    // No TLS in the network server until step 3 (system design 3D).
-    assert_eq!(config.settings.tls_unix_seconds, 0);
 }
 
 #[test]

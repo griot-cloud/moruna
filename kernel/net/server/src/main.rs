@@ -36,14 +36,14 @@ use core::cell::RefCell;
 
 use devices_protocol::directory;
 use moruna_netstack::{
-    Card, ClockSession, Config, Shared, Stack, after_turn,
+    Card, Config, Shared, Stack, after_turn,
     boot::{NO_LEASE, fatal},
     factory, parse,
 };
 use moruna_svc::{
-    CallError, Channel, ClientCore, Completions, Console, DEADLINE_INFINITE, Decoder, Encoder,
-    Handle, Memory, Rights, Signals, Timer, Watch, Wire, deadline_in, limits, now, println, random,
-    start,
+    CallError, Channel, ClientCore, ClockPage, Completions, Console, DEADLINE_INFINITE, Decoder,
+    Encoder, Handle, Memory, Rights, Signals, Timer, Watch, Wire, deadline_in, limits, now,
+    println, random, start,
 };
 use net_protocol::{Frame, Link, SEND_FRAMES_MAX, net as card};
 
@@ -423,37 +423,15 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
         )?
     };
     let mut stack = Stack::new(&config, &cards, u64::from_le_bytes(seed), now())?;
-    // TLS's UTC anchor comes from the boot (`tls-unix-seconds`) or, on a cloud node, from
-    // `platform` over the clock link once it has the wall clock (system design 3D): until
-    // then the roots are installed and `start_tls` is refused `TlsUnavailable`.
-    let clock = start::take("clock").map(Channel);
-    let valid_ns = config.settings.tls_time_valid_ms * 1_000_000;
-    match (
-        start::take("tls-roots"),
-        config.settings.tls_unix_seconds,
-        clock.is_some(),
-    ) {
-        (None, 0, _) => {}
-        (Some(roots), seconds, _) if seconds > 0 => {
-            let time = moruna_netstack::tls::TrustedTime::new(seconds, now(), valid_ns)
-                .ok_or("invalid trusted TLS clock anchor")?;
-            let trust = moruna_netstack::tls::Trust::new(read_tls_roots(roots)?, time)
-                .map_err(String::from)?;
-            stack.install_tls(trust)?;
-        }
-        (Some(roots), 0, true) => {
-            let time = moruna_netstack::tls::TrustedTime::unanchored(valid_ns, now())
-                .ok_or("invalid TLS clock validity")?;
-            let trust = moruna_netstack::tls::Trust::new(read_tls_roots(roots)?, time)
-                .map_err(String::from)?;
-            stack.install_tls(trust)?;
-        }
-        _ => {
-            return Err(String::from(
-                "TLS needs both the tls-roots capability and a trusted UTC anchor: \
-                 tls-unix-seconds, or the clock link",
-            ));
-        }
+    // TLS's time is the node's one wall clock, the core's clock page (system design 3D): set at
+    // boot from the machine's clock, and by `platform` from its cloud's `Date`. While it is
+    // unset, `start_tls` is refused `TlsUnavailable`. With no roots there is no TLS at all.
+    if let Some(roots) = start::take("tls-roots") {
+        let page = ClockPage::map().map_err(|e| format!("the clock page: {}", e.name()))?;
+        let time = moruna_netstack::tls::TrustedTime::new(move || page.realtime());
+        let trust =
+            moruna_netstack::tls::Trust::new(read_tls_roots(roots)?, time).map_err(String::from)?;
+        stack.install_tls(trust)?;
     }
     let in_flight = stack.settings.card_sends_in_flight;
     let mut up = format!(
@@ -494,10 +472,6 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
     for (channel, policy) in listeners {
         d.listen(channel, factory(shared.clone(), policy))
             .map_err(|e| format!("listening: {}", e.name()))?;
-    }
-    if let Some(clock) = clock {
-        d.serve(clock, Box::new(ClockSession::new(shared.clone(), now)))
-            .map_err(|e| format!("serving the clock link: {}", e.name()))?;
     }
     let watches: Vec<Handle> = links
         .iter_mut()

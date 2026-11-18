@@ -26,7 +26,6 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import time
 
 MIB = 1024 * 1024
 PORT = 5100
@@ -188,8 +187,8 @@ def main():
     (out / "profile.json").write_text(json.dumps(profile) + "\n")
     (out / "storage.conf").write_text("moruna-storage 1\ntimeout-ns 5000000000\nbody-limit 1048576\nsession-limit 4\n"
                                       "provider single-node-home\nblock-service nvme0\nalignment 4096\n")
-    (out / "network.conf").write_text(f"moruna-netstack 1\nsetting tls-unix-seconds {int(time.time())}\n"
-                                      "setting tls-time-valid-ms 3600000\n"
+    # TLS's time is the core's wall clock, which QEMU's -rtc sets at boot (system design 3D).
+    (out / "network.conf").write_text("moruna-netstack 1\n"
                                       "grant listen-engine rights=connect remote=127.0.0.0/8 local=127.0.0.0/8 sockets=8\n")
     command(["python3", "-I", tools / "configure.py", "--profile", out / "profile.json", "--out", out / "assets",
              "--image-record", linux / "image.record", "--layers", linux / "stack.layers", "--network", out / "network.conf",

@@ -10,7 +10,6 @@ regenerate OUT's initramfs from OUT/ke2/boot.image, and boot/check it normally.
 TLS keys, CA and the UTC anchor are proof inputs, never production defaults.
 """
 import argparse
-import datetime
 import json
 import os
 from pathlib import Path
@@ -18,7 +17,6 @@ import socket
 import ssl
 import struct
 import subprocess
-import time
 
 
 def output_root(value):
@@ -60,10 +58,8 @@ def prepare(args):
     der = (directory / "root.der").read_bytes()
     payload = struct.pack("<II", 1, len(der)) + der
     (directory / "roots").write_bytes(struct.pack("<I", len(payload)) + payload)
-    utc = int(time.time())
+    # TLS's time is the core's wall clock, which QEMU's -rtc sets at boot (system design 3D).
     config = f"""moruna-netstack 1
-setting tls-unix-seconds {utc}
-setting tls-time-valid-ms 3600000
 setting tcp-receive-buffer 131072
 setting tcp-send-buffer 131072
 interface wan card={args.card} dhcp
@@ -94,7 +90,7 @@ process netstack-test
 link netstack-test.server netstack.listen-test
 """
     (directory / "boot.image").write_text(description)
-    (directory / "inputs.json").write_text(json.dumps({"utc_anchor": utc, "utc_anchor_iso": datetime.datetime.fromtimestamp(utc, datetime.timezone.utc).isoformat(), "valid_seconds": 3600, "host_peer": f"127.0.0.1:{args.port}", "guest_endpoint": "10.0.2.100:47012", "public_network_required": False}, indent=2) + "\n")
+    (directory / "inputs.json").write_text(json.dumps({"host_peer": f"127.0.0.1:{args.port}", "guest_endpoint": "10.0.2.100:47012", "public_network_required": False}, indent=2) + "\n")
     print("Prepared controlled KE2 inputs; no image regenerated or VM started.")
 
 

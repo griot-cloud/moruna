@@ -137,7 +137,8 @@ mod transport {
                 /// A socket's state, endpoints and queues.
                 15 => fn status(socket: u32) -> SocketStatus;
                 /// Upgrades a pristine established outbound TCP socket to verified TLS
-                /// 1.3 under the boot's trust roots and UTC clock. No plaintext fallback.
+                /// 1.3 under the boot's trust roots and the node's wall clock (refused
+                /// `TlsUnavailable` while it is unset). No plaintext fallback.
                 16 => fn start_tls(socket:u32,server_name:String) -> ();
                 /// One actual immutable Account binding before any network operation.
                 17 => fn bind_account(account:Handle) -> ();
@@ -383,32 +384,6 @@ pub mod net {
             socket: u32,
         ) -> Result<Option<Vec<u8>>, moruna_svc::CallError<Error>> {
             self.transport.tls_alpn(socket)
-        }
-    }
-}
-
-moruna_svc::protocol! {
-    /// `moruna.net.clock` 1.0 (system design 3D): the one link on which the node's
-    /// `platform` gives the network server the wall clock. TLS needs a trusted time, and
-    /// the network server has no clock source of its own that works on every cloud, so
-    /// it takes `platform`'s, set from the instance data's `Date` (1D), never a
-    /// build-time clock. Until it has it, `start_tls` is refused `TlsUnavailable`.
-    pub protocol clock {
-        name = "moruna.net.clock";
-        major = 1;
-        minor = 0;
-        requests {
-            /// UTC now, in seconds since the Unix epoch: the anchor of TLS's clock. Once.
-            1 => fn set_utc(unix_seconds: u64) -> ();
-        }
-        events {}
-        errors {
-            /// The clock has its anchor already: it is given once.
-            1 => Already;
-            /// The network server has no TLS roots, so no TLS whose clock to anchor.
-            2 => NoTls;
-            /// Not a time: zero, or past the last second of year 9999.
-            3 => BadTime;
         }
     }
 }

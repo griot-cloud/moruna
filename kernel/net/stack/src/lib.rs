@@ -17,5 +17,5 @@ pub mod tls;
 
 pub use config::{Config, ConfigError, Settings, parse};
 pub use device::Port;
-pub use session::{ClockSession, Session, Shared, after_turn, factory};
+pub use session::{Session, Shared, after_turn, factory};
 pub use stack::{Card, Iface, Stack};

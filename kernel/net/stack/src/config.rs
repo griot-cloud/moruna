@@ -88,9 +88,6 @@ pub struct Settings {
     /// Per TLS socket buffer bound and total incoming handshake bytes.
     pub tls_buffer_bytes: usize,
     pub tls_handshake_timeout_ms: u64,
-    /// Explicit trusted boot UTC anchor; zero disables TLS.
-    pub tls_unix_seconds: u64,
-    pub tls_time_valid_ms: u64,
 }
 
 /// A TCP congestion control smoltcp provides.
@@ -128,8 +125,6 @@ impl Default for Settings {
             tls_sockets_max: 16,
             tls_buffer_bytes: 65536,
             tls_handshake_timeout_ms: 30_000,
-            tls_unix_seconds: 0,
-            tls_time_valid_ms: 3_600_000,
         }
     }
 }
@@ -328,12 +323,6 @@ impl Settings {
                 self.tls_buffer_bytes = number(line, name, value, 16640..=1 << 20)? as usize
             }
             "tls-handshake-timeout-ms" => self.tls_handshake_timeout_ms = positive_ms(value)?,
-            "tls-unix-seconds" => {
-                self.tls_unix_seconds = number(line, name, value, 1..=253_402_300_799)?
-            }
-            "tls-time-valid-ms" => {
-                self.tls_time_valid_ms = number(line, name, value, 1..=86_400_000)?
-            }
             _ => return err(line, format!("no setting is called `{name}`")),
         }
         Ok(())
@@ -625,12 +614,17 @@ grant listen-any rights=connect,listen,udp,ping,resolve,grant remote=any local=a
                 2,
                 "16640",
             ),
+            // TLS's time is the node's one wall clock (system design 3D): no setting gives it.
             (
-                "moruna-netstack 1\nsetting tls-time-valid-ms 86400001\n",
+                "moruna-netstack 1\nsetting tls-unix-seconds 1800000000\n",
                 2,
-                "86400000",
+                "no setting is called `tls-unix-seconds`",
             ),
-            ("moruna-netstack 1\nsetting tls-unix-seconds 0\n", 2, "1 to"),
+            (
+                "moruna-netstack 1\nsetting tls-time-valid-ms 3600000\n",
+                2,
+                "no setting is called `tls-time-valid-ms`",
+            ),
             (
                 "moruna-netstack 1\nsetting tcp-nagle maybe\n",
                 2,

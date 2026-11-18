@@ -28,7 +28,7 @@ use core::net::{IpAddr, Ipv6Addr};
 use moruna_svc::{Context, Outcome, Pending, ProtocolError};
 use netstack_protocol::{
     Addr, BACKLOG_MAX, Cidr, Endpoint, Info, Interface as IfaceInfo, Opened, PING_MAX, Policy,
-    RECEIVE_MAX, SEND_MAX, SocketState, SocketStatus, Target, clock, net, normalise_name, rights,
+    RECEIVE_MAX, SEND_MAX, SocketState, SocketStatus, Target, net, normalise_name, rights,
 };
 use smoltcp::{
     iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet},
@@ -592,9 +592,6 @@ impl Stack {
     /// Takes the frames delivered, answers what can be answered, and sends.
     pub fn poll(&mut self, now: u64) {
         self.now = now;
-        if let Some(trust) = &self.trust {
-            trust.time.update(now);
-        }
         self.expire_server_identities();
         let t = instant(now);
         for _ in 0..LOOPBACK_ROUNDS {
@@ -1563,22 +1560,6 @@ impl Stack {
         }
         self.trust = Some(trust);
         Ok(())
-    }
-
-    /// Anchors TLS's clock at `unix_seconds`, UTC at the monotonic time `now`: what the
-    /// clock link (`moruna.net.clock`) carries from `platform` (system design 3D). The
-    /// roots stay as the boot gave them; only the time is set, and only once.
-    pub fn anchor_tls(&mut self, unix_seconds: u64, now: u64) -> Result<(), clock::Error> {
-        let Some(trust) = &self.trust else {
-            return Err(clock::Error::NoTls);
-        };
-        trust
-            .time
-            .anchor(unix_seconds, now)
-            .map_err(|refused| match refused {
-                crate::tls::Anchor::Already => clock::Error::Already,
-                crate::tls::Anchor::BadTime => clock::Error::BadTime,
-            })
     }
 
     pub fn start_tls(

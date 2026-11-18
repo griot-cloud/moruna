@@ -511,10 +511,9 @@ fn run(mut args: Vec<String>) -> Result<(), String> {
             return Err(format!("admission {slot} must bind exact {source}"));
         }
     }
-    let network = network_config(assets, &node)?;
-    if network.settings.tls_unix_seconds == 0 {
-        return Err("standalone TLS requires an explicitly injected trusted UTC anchor".into());
-    }
+    // TLS's time is the core's wall clock, which the machine's clock sets at boot (QEMU's
+    // `-rtc`): network.conf carries none (system design 3D).
+    network_config(assets, &node)?;
     storage_assets(assets, &node)?;
     let initial = moruna_node::InitialJob::parse(&page(assets, "initial.job")?)
         .map_err(|e| format!("initial job: {e:?}"))?;

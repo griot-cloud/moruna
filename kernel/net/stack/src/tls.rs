@@ -1,10 +1,7 @@
 //! Server-owned client and accepted-socket TLS (SDD 31). The crypto, chain/name verification and
 //! protocol state machine are rustls/ring; this module only bounds and moves bytes.
-use alloc::{sync::Arc, vec::Vec};
-use core::{
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    time::Duration,
-};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use core::time::Duration;
 use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
     client::{ClientConnectionData, UnbufferedClientConnection},
@@ -30,94 +27,47 @@ fn secure_random(bytes: &mut [u8]) -> Result<(), getrandom::Error> {
 #[cfg(target_os = "none")]
 getrandom::register_custom_getrandom!(secure_random);
 
-/// A trusted UTC anchor: given at boot (`tls-unix-seconds`), or later, once, by the
-/// node's `platform` over the clock link (system design 3D). Monotonic time is only
-/// elapsed duration; it never becomes an invented Unix timestamp. An unanchored clock,
-/// expiry and rollback all fail closed: no time, so no TLS.
-#[derive(Debug)]
+/// The node's one wall clock, as TLS reads it (system design 3D): on a node, the core's clock
+/// page, which the core sets at boot from the machine's clock and `platform` from its cloud's
+/// `Date`, before `ready` and every hour. TLS keeps no time of its own: no anchor, no build-time
+/// clock, no expiry. While the clock is unset there is no time, so no certificate is judged:
+/// `start_tls` is refused and no TLS server is made.
 pub struct TrustedTime {
-    /// Zero until the clock is anchored.
-    unix_seconds: AtomicU64,
-    monotonic_start: AtomicU64,
-    valid_ns: u64,
-    monotonic_now: AtomicU64,
-    invalid: AtomicBool,
+    /// The wall clock now, in nanoseconds since 1970 (UTC); `None` while it is unset.
+    wall: Box<dyn Fn() -> Option<u64> + Send + Sync>,
 }
-
-/// Why an anchor was refused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Anchor {
-    /// The clock has its anchor already: it is given once.
-    Already,
-    /// Not a time: zero, or past the last second of year 9999.
-    BadTime,
-}
-
-/// The last second of year 9999, the latest anchor taken, as the configuration's.
-const LATEST: u64 = 253_402_300_799;
 
 impl TrustedTime {
-    pub fn new(unix_seconds: u64, monotonic_start: u64, valid_ns: u64) -> Option<Self> {
-        let time = Self::unanchored(valid_ns, monotonic_start)?;
-        time.anchor(unix_seconds, monotonic_start).ok()?;
-        Some(time)
-    }
-    /// A clock with no anchor yet, valid for `valid_ns` once it has one: until
-    /// [`TrustedTime::anchor`], it gives no time.
-    pub fn unanchored(valid_ns: u64, monotonic_now: u64) -> Option<Self> {
-        (valid_ns > 0 && valid_ns <= 86_400_000_000_000).then_some(Self {
-            unix_seconds: AtomicU64::new(0),
-            monotonic_start: AtomicU64::new(monotonic_now),
-            valid_ns,
-            monotonic_now: AtomicU64::new(monotonic_now),
-            invalid: AtomicBool::new(false),
-        })
-    }
-    /// Anchors the clock: `unix_seconds` is UTC at the monotonic time `now`. Once.
-    pub fn anchor(&self, unix_seconds: u64, now: u64) -> Result<(), Anchor> {
-        if unix_seconds == 0 || unix_seconds > LATEST {
-            return Err(Anchor::BadTime);
+    /// TLS's time from `wall`, which says the wall clock now in nanoseconds since 1970 (UTC), or
+    /// `None` while it is unset: on a node, the clock page's realtime.
+    pub fn new(wall: impl Fn() -> Option<u64> + Send + Sync + 'static) -> TrustedTime {
+        TrustedTime {
+            wall: Box::new(wall),
         }
-        if self.anchored() {
-            return Err(Anchor::Already);
-        }
-        self.update(now);
-        self.monotonic_start.store(
-            self.monotonic_now.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        self.unix_seconds.store(unix_seconds, Ordering::Release);
-        Ok(())
     }
-    /// Whether the clock has its anchor.
-    pub fn anchored(&self) -> bool {
-        self.unix_seconds.load(Ordering::Acquire) != 0
+    /// Whether the wall clock is set now.
+    pub fn is_set(&self) -> bool {
+        self.current_time().is_some()
     }
-    pub fn update(&self, now: u64) {
-        let previous = self.monotonic_now.fetch_max(now, Ordering::Relaxed);
-        if now < previous {
-            self.invalid.store(true, Ordering::Relaxed);
-        }
+}
+impl core::fmt::Debug for TrustedTime {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TrustedTime")
+            .field("set", &self.is_set())
+            .finish()
     }
 }
 impl TimeProvider for TrustedTime {
     fn current_time(&self) -> Option<UnixTime> {
-        let unix_seconds = self.unix_seconds.load(Ordering::Acquire);
-        if unix_seconds == 0 || self.invalid.load(Ordering::Relaxed) {
-            return None;
-        }
-        let elapsed = self
-            .monotonic_now
-            .load(Ordering::Relaxed)
-            .checked_sub(self.monotonic_start.load(Ordering::Relaxed))?;
-        if elapsed >= self.valid_ns {
-            return None;
-        }
-        Some(UnixTime::since_unix_epoch(Duration::from_secs(
-            unix_seconds.checked_add(elapsed / 1_000_000_000)?,
-        )))
+        (self.wall)()
+            .filter(|ns| *ns > 0)
+            .map(|ns| UnixTime::since_unix_epoch(Duration::from_nanos(ns)))
     }
 }
+
+/// The most trust roots a server takes: Mozilla's set, as curl published it on 2026-11-05 (the
+/// cloud profile's roots), has 118.
+pub const ROOTS_MAX: usize = 256;
 
 pub struct Trust {
     pub time: Arc<TrustedTime>,
@@ -127,7 +77,7 @@ impl Trust {
     /// DER roots come only from the boot-granted trust capability, never a caller.
     pub fn new(roots: Vec<Vec<u8>>, time: TrustedTime) -> Result<Self, &'static str> {
         if roots.is_empty()
-            || roots.len() > 64
+            || roots.len() > ROOTS_MAX
             || roots.iter().map(Vec::len).sum::<usize>() > 1 << 20
         {
             return Err("TLS trust roots exceed their bound or are absent");
@@ -535,7 +485,6 @@ impl<C: Connection> State<C> {
             return;
         }
         self.work = false;
-        self.time.update(now);
         let result = if !self.ready && self.time.current_time().is_none() {
             Err(Error::Unavailable)
         } else {
@@ -692,72 +641,47 @@ mod tests {
         assert_eq!(buffer.bytes.capacity(), allocated);
     }
     #[test]
-    fn an_unanchored_clock_gives_no_time_until_its_one_anchor() {
-        assert!(TrustedTime::unanchored(0, 0).is_none());
-        assert!(TrustedTime::unanchored(86_400_000_000_001, 0).is_none());
-        let clock = TrustedTime::unanchored(10_000_000_000, 50).unwrap();
-        assert!(!clock.anchored());
-        assert!(clock.current_time().is_none());
-        clock.update(1_000_000_050);
-        assert!(clock.current_time().is_none());
-        // Not a time.
-        assert_eq!(clock.anchor(0, 1_000_000_050), Err(Anchor::BadTime));
-        assert_eq!(
-            clock.anchor(LATEST + 1, 1_000_000_050),
-            Err(Anchor::BadTime)
-        );
-        assert!(!clock.anchored());
-        // The anchor counts from the monotonic time it was given at.
-        assert_eq!(clock.anchor(1_800_000_000, 2_000_000_050), Ok(()));
-        assert!(clock.anchored());
-        assert_eq!(clock.current_time().unwrap().as_secs(), 1_800_000_000);
-        clock.update(5_000_000_050);
-        assert_eq!(clock.current_time().unwrap().as_secs(), 1_800_000_003);
-        // Once.
-        assert_eq!(
-            clock.anchor(1_900_000_000, 5_000_000_050),
-            Err(Anchor::Already)
-        );
-        assert_eq!(clock.current_time().unwrap().as_secs(), 1_800_000_003);
-        // Valid for its span from the anchor, not from the clock's making.
-        clock.update(12_000_000_050);
-        assert!(clock.current_time().is_none());
-        // An anchor given at a time before the latest seen is a rollback: no time.
-        let clock = TrustedTime::unanchored(10_000_000_000, 100).unwrap();
-        clock.update(500);
-        assert_eq!(clock.anchor(1_800_000_000, 400), Ok(()));
-        assert!(clock.current_time().is_none());
-        // A boot anchor is an anchor: the clock link's is refused after it.
-        let clock = TrustedTime::new(1_800_000_000, 0, 10).unwrap();
-        assert_eq!(clock.anchor(1_800_000_000, 1), Err(Anchor::Already));
-        assert!(TrustedTime::new(LATEST + 1, 0, 10).is_none());
+    fn tls_has_the_wall_clock_while_it_is_set_and_no_time_while_it_is_not() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        // The clock page's realtime, as a test sets it: zero is unset.
+        let page = Arc::new(AtomicU64::new(0));
+        let wall = page.clone();
+        let time = TrustedTime::new(move || match wall.load(Ordering::Relaxed) {
+            0 => None,
+            ns => Some(ns),
+        });
+        assert!(!time.is_set());
+        assert!(time.current_time().is_none());
+        assert_eq!(alloc::format!("{time:?}"), "TrustedTime { set: false }");
+        // Set at boot from the machine's clock, or by platform: TLS reads it as it is.
+        page.store(1_800_000_000_500_000_000, Ordering::Relaxed);
+        assert!(time.is_set());
+        assert_eq!(time.current_time().unwrap().as_secs(), 1_800_000_000);
+        // Set again, earlier or later, as platform does every hour: TLS follows it, with no
+        // expiry and no rollback of its own.
+        page.store(1_799_999_990_000_000_000, Ordering::Relaxed);
+        assert_eq!(time.current_time().unwrap().as_secs(), 1_799_999_990);
+        page.store(1_900_000_000_000_000_000, Ordering::Relaxed);
+        assert_eq!(time.current_time().unwrap().as_secs(), 1_900_000_000);
+        // A clock that says 1970 itself is no time.
+        let zero = TrustedTime::new(|| Some(0));
+        assert!(!zero.is_set());
     }
 
     #[test]
-    fn trusted_clock_failure_cannot_be_undone_by_rewinding() {
-        let clock = TrustedTime::new(1_700_000_000, 10, 100).unwrap();
-        clock.update(110);
-        assert!(clock.current_time().is_none());
-        clock.update(10);
-        clock.update(20);
-        assert!(clock.current_time().is_none());
-        let clock = TrustedTime::new(1_700_000_000, 10, 100).unwrap();
-        clock.update(20);
-        clock.update(19);
-        clock.update(21);
-        assert!(clock.current_time().is_none());
-    }
-
-    #[test]
-    fn trusted_clock_expires_and_never_invents_utc_on_rollback() {
-        assert!(TrustedTime::new(0, 0, 100).is_none());
-        let clock = TrustedTime::new(1_700_000_000, 100, 2_000_000_000).unwrap();
-        assert_eq!(clock.current_time().unwrap().as_secs(), 1_700_000_000);
-        clock.update(1_000_000_100);
-        assert_eq!(clock.current_time().unwrap().as_secs(), 1_700_000_001);
-        clock.update(2_000_000_100);
-        assert!(clock.current_time().is_none());
-        clock.update(99);
-        assert!(clock.current_time().is_none());
+    fn roots_are_bounded_in_number_and_bytes() {
+        let time = || TrustedTime::new(|| Some(1_800_000_000_000_000_000));
+        assert!(Trust::new(Vec::new(), time()).is_err());
+        let too_many = alloc::vec![alloc::vec![0u8; 8]; ROOTS_MAX + 1];
+        assert_eq!(
+            Trust::new(too_many, time()).err(),
+            Some("TLS trust roots exceed their bound or are absent")
+        );
+        let too_large = alloc::vec![alloc::vec![0u8; 1 << 16]; 17];
+        assert!(Trust::new(too_large, time()).is_err());
+        assert_eq!(
+            Trust::new(alloc::vec![alloc::vec![1u8, 2, 3]], time()).err(),
+            Some("invalid TLS root DER")
+        );
     }
 }
