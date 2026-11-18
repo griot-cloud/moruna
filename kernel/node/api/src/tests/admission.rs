@@ -222,6 +222,11 @@ impl admission::Server for Fake {
         services: Vec<String>,
         needs: Needs,
     ) -> Result<u64, admission::Error> {
+        // As node-admission's (item 3.4): a job that names hosts gets its network as `network`.
+        let mut names = names;
+        if !needs.0.is_empty() {
+            names.push("network".into());
+        }
         self.started(Some(budget), config, names, grants, services, needs)
     }
 

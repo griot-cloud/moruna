@@ -91,9 +91,11 @@ fn the_engine_s_configurations_are_its_supervisor_s() {
             assert_eq!(memory + scratch + 128 * MIB, budget);
         }
     }
-    let staged = EngineConfig::parse(&job_config(BOUND, GIB, true).unwrap()).expect("it parses");
+    let staged =
+        EngineConfig::parse(&job_config(BOUND, GIB, true, false).unwrap()).expect("it parses");
     assert_eq!((staged.memory, staged.scratch), (896 * MIB, 0));
-    let job = EngineConfig::parse(&job_config(BOUND, GIB, false).unwrap()).expect("it parses");
+    let job =
+        EngineConfig::parse(&job_config(BOUND, GIB, false, true).unwrap()).expect("it parses");
     assert_eq!(job.program, "/moruna/bin/moruna");
     assert_eq!(job.args, serve_args(BOUND));
     assert_eq!(job.env, ["HOME=/tmp"]);
@@ -110,10 +112,14 @@ fn the_engine_s_configurations_are_its_supervisor_s() {
         grants,
         [
             ("linux", &Source::Personality),
-            ("network", &Source::Service("network".into())),
             ("engine", &Source::Channel("engine".into())),
+            ("network", &Source::Service("network".into())),
         ]
     );
+    // A job that names no host has no network (item 3.4).
+    let local =
+        EngineConfig::parse(&job_config(BOUND, GIB, false, false).unwrap()).expect("it parses");
+    assert!(local.grants.iter().all(|g| g.slot != "network"));
     // A check: 256 MiB less the engine's own, no scratch, its own channel, and the node's
     // volumes node-admission grants it (item 3.3).
     let check = EngineConfig::parse(&check_config(BOUND)).expect("it parses");
@@ -122,12 +128,12 @@ fn the_engine_s_configurations_are_its_supervisor_s() {
     let grants: Vec<(&str, &Source)> = check
         .grants
         .iter()
-        .skip(2)
         .map(|g| (g.slot.as_str(), &g.source))
         .collect();
     assert_eq!(
         grants,
         [
+            ("linux", &Source::Personality),
             ("check", &Source::Channel("check".into())),
             ("volumes", &Source::Data("volumes".into())),
         ]
@@ -135,11 +141,11 @@ fn the_engine_s_configurations_are_its_supervisor_s() {
     // A budget that leaves the program nothing is refused by its field.
     for budget in [0, 64 * MIB, 128 * MIB] {
         assert!(
-            matches!(job_config(BOUND, budget, false), Err(HostError::Refused(why)) if why.starts_with("budget.memory_bytes")),
+            matches!(job_config(BOUND, budget, false, false), Err(HostError::Refused(why)) if why.starts_with("budget.memory_bytes")),
             "{budget}"
         );
     }
-    assert!(job_config(BOUND, 128 * MIB + 4096, false).is_ok());
+    assert!(job_config(BOUND, 128 * MIB + 4096, false, false).is_ok());
 }
 
 /// A check: the host asks the bound first, starts the check with its configuration, the Linux
@@ -166,7 +172,7 @@ fn a_check_runs_in_an_engine_of_its_own_and_answers_its_verdict() {
         assert_eq!(started.budget, None);
         // The check's channel, and the node's volumes, as node-admission adds them.
         assert_eq!(started.names, ["check", "volumes"]);
-        assert_eq!(started.services, ["linux", "network"]);
+        assert_eq!(started.services, ["linux"]);
     }
     assert_eq!(admission.config(0), check_config(BOUND));
     let engine = admission.engine(0);
@@ -228,8 +234,9 @@ fn a_job_runs_in_a_fresh_engine_from_spec_to_its_end() {
         let book = admission.book.lock().unwrap();
         let started = &book.started[0];
         assert_eq!(started.budget, Some(GIB));
-        assert_eq!(started.names, ["engine"]);
-        assert_eq!(started.services, ["linux", "network"]);
+        // The job's network, as node-admission mints it for the hosts its check named.
+        assert_eq!(started.names, ["engine", "network"]);
+        assert_eq!(started.services, ["linux"]);
         assert_eq!(
             started.needs,
             (
@@ -239,7 +246,10 @@ fn a_job_runs_in_a_fresh_engine_from_spec_to_its_end() {
             )
         );
     }
-    assert_eq!(admission.config(0), job_config(BOUND, GIB, false).unwrap());
+    assert_eq!(
+        admission.config(0),
+        job_config(BOUND, GIB, false, true).unwrap()
+    );
     let engine = admission.engine(0);
     assert_eq!(messages(&engine).concat(), SPEC);
     assert_eq!(host.0.borrow().waits().len(), 1);

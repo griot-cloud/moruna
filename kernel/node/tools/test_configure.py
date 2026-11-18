@@ -32,7 +32,8 @@ def render(root, value):
         path.write_text("x")
         inputs += [f"--{name}", str(path)]
     out = root / "assets"
-    done = subprocess.run([sys.executable, "-I", str(TOOL), "--profile", str(root / "profile.json"), "--out", str(out), *inputs],
+    done = subprocess.run([sys.executable, "-I", str(TOOL), "--profile", str(root / "profile.json"), "--out", str(out),
+                           "--profile-out", str(root / "configured-profile.json"), *inputs],
                           capture_output=True, text=True)
     return done, out
 
@@ -48,7 +49,10 @@ class DataDisks(unittest.TestCase):
             self.assertIn("grant disk.out disk data2", engine)
             self.assertIn("link devices control.engine admission initial.handover", (out / "node.conf").read_text().splitlines())
             self.assertIn("grant handover initial.handover", (out / "initial.job").read_text().splitlines())
-            self.assertEqual(json.loads((out / "profile.json").read_text())["data_disks"]["inputs"], ["nyc", "zones"])
+            # The validated profile goes beside the assets, never among them: they hold what ships.
+            configured = json.loads((Path(tmp) / "configured-profile.json").read_text())
+            self.assertEqual(configured["data_disks"]["inputs"], ["nyc", "zones"])
+            self.assertFalse((out / "profile.json").exists())
 
     def test_without_data_disks_nothing_is_linked_or_granted(self):
         with tempfile.TemporaryDirectory() as tmp:

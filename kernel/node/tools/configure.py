@@ -4,6 +4,10 @@
 The profile is operator input. Canonical Rust parsers validate the generated files
 again during package.py. No boot or hardware success is asserted by rendering.
 
+`--out` receives the assets, exactly what the image ships. The profile, validated, goes to
+`--profile-out`, beside them and never inside: package.py reads it (`--profile-json`) to render
+the node's description, and the image does not carry it.
+
 An optional profile field `data_disks` ({"inputs": [NAME, ...], "output_bytes": N}) declares
 the engine's data disks (stream D, `crates/moruna-micro/src/devices.rs`): input i is the
 device manager's `datai` (a transitional virtio-blk the device table starts no driver for),
@@ -22,6 +26,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--profile-out", type=Path, required=True,
+                        help="where the validated profile goes, outside --out (package.py's --profile-json)")
     for name in ("image-record", "layers", "network", "tls-roots", "engine-bindings", "storage-config", "storage-grants", "storage-admission"):
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--kd3-conformance-proof", type=Path,
@@ -93,6 +99,8 @@ def main():
         parser.error("engine_program must be one exact absolute guest path")
     if args.out.exists():
         parser.error("output must be a new directory")
+    if args.profile_out.exists() or args.out.resolve() in args.profile_out.resolve().parents:
+        parser.error("the profile goes to a new file outside the assets")
     sources = [(args.image_record, "image.record"), (args.layers, "linux.layers"), (args.network, "network.conf"), (args.tls_roots, "tls.roots"), (args.engine_bindings, "engine.bindings"), (args.storage_config, "storage.conf"), (args.storage_grants, "storage.grants"), (args.storage_admission, "storage.admission")]
     if args.maintenance_config is not None:
         sources.append((args.maintenance_config, "maintenance.conf"))
@@ -195,7 +203,7 @@ def main():
             "env PYTHONHOME=/opt/python-std", "env LD_LIBRARY_PATH=/opt/python-std/lib", *lines]) + "\n")
     with (args.out / "initial.job").open("a") as output: output.write("\n".join(extra_initial) + ("\n" if extra_initial else ""))
     with (args.out / "engine.conf").open("a") as output: output.write("\n".join(extra_engine) + ("\n" if extra_engine else ""))
-    (args.out / "profile.json").write_text(json.dumps(profile, indent=2) + "\n")
+    args.profile_out.write_text(json.dumps(profile, indent=2) + "\n")
 
 
 DATA_NAME = re.compile(r"[a-z0-9._-]{1,24}")

@@ -34,7 +34,7 @@ SPEC.loader.exec_module(package)
 
 MIB = 1024 * 1024
 BASE = ["--description", "d.image", "--assets", "assets", "--out", "out", "--node-memory", str(2 << 30)]
-STANDALONE = [*BASE, "--agent-port", "5100", "--cpus", "2"]
+STANDALONE = [*BASE, "--agent-port", "5100", "--cpus", "2", "--profile-json", "profile.json"]
 CLOUD = ["--profile", "cloud", *BASE]
 # The VHD footer's fields (Microsoft's Virtual Hard Disk Image Format Specification, "Hard Disk
 # Footer Format"): 512 bytes, big-endian, at the end of the file.

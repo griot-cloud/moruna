@@ -152,7 +152,12 @@ impl std::fmt::Display for SocketError {
 
 impl std::error::Error for SocketError {}
 
-fn failed(kind: HttpErrorKind, target: &SocketTarget, what: impl std::fmt::Display) -> HttpError {
+/// A failure of kind `kind` naming `target`, the peer it happened with.
+pub(crate) fn failed(
+    kind: HttpErrorKind,
+    target: &dyn std::fmt::Display,
+    what: impl std::fmt::Display,
+) -> HttpError {
     HttpError::new(kind, SocketError(format!("{target}: {what}")))
 }
 
@@ -163,17 +168,29 @@ async fn exchange(
     let stream = dial(&target)
         .await
         .map_err(|e| failed(HttpErrorKind::Connect, &target, e))?;
-    let (mut sender, connection) =
-        hyper::client::conn::http1::handshake(TokioIo::new(Peer(stream)))
-            .await
-            .map_err(|e| failed(HttpErrorKind::Connect, &target, e))?;
+    exchange_on(Peer(stream), Arc::from(target.to_string()), req).await
+}
+
+/// One HTTP/1.1 exchange of `req` over `stream`, which is this request's alone; `label`
+/// names the peer in every error. The response's body drives the connection to its end.
+async fn exchange_on<S>(
+    stream: S,
+    label: Arc<str>,
+    req: HttpRequest,
+) -> std::result::Result<HttpResponse, HttpError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(|e| failed(HttpErrorKind::Connect, &label, e))?;
     let driver = tokio::spawn(connection);
     let req = origin_form(req);
     let response = match sender.send_request(req).await {
         Ok(response) => response,
         Err(e) => {
             driver.abort(); // The failed request owns this connection; cancel its driver.
-            return Err(failed(HttpErrorKind::Request, &target, e));
+            return Err(failed(HttpErrorKind::Request, &label, e));
         }
     };
     drop(sender);
@@ -183,7 +200,7 @@ async fn exchange(
         HttpResponseBody::new(DrivenBody {
             body,
             driver: Some(driver),
-            target,
+            target: label,
             ended: false,
         }),
     ))
@@ -194,7 +211,8 @@ async fn exchange(
 struct DrivenBody {
     body: Incoming,
     driver: Option<tokio::task::JoinHandle<std::result::Result<(), hyper::Error>>>,
-    target: Arc<SocketTarget>,
+    /// Names the peer in errors.
+    target: Arc<str>,
     ended: bool,
 }
 impl Body for DrivenBody {
@@ -248,8 +266,9 @@ impl Drop for DrivenBody {
 }
 
 /// The request line in origin form (`/bucket/key?query`) with the authority moved to `Host`,
-/// which is what an HTTP/1.1 server expects from a client that is not talking to a proxy.
-fn origin_form(req: HttpRequest) -> HttpRequest {
+/// which is what an HTTP/1.1 server expects from a client that is not talking to a proxy
+/// (the network server's connector, `crate::net`, sends the same).
+pub(crate) fn origin_form(req: HttpRequest) -> HttpRequest {
     let (mut parts, body) = req.into_parts();
     if !parts.headers.contains_key(http::header::HOST)
         && let Some(authority) = parts.uri.authority()

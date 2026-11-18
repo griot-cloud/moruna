@@ -7,11 +7,14 @@
 //! - `network`: a listener of the network server, granted outbound connections to instance data
 //!   and to Azure's WireServer, for the ready report;
 //! - `supervisor`: its `platform` bootstrap, whose end the supervisor keeps: first the node's
-//!   memory, then, at each start of `api`, `api-started` with the channel to that start.
+//!   memory, then, at each start of `api`, `api-started` with the channel to that start;
+//! - `clock`: `root.clock`, the right to set the node's one wall clock (system design 3D).
 //!
 //! On a fatal error it prints the line and exits with failure, which stops the node. Once the
 //! node is ready it stays, holding the hand-over, and gives it again to each new start of `api`
-//! (system design 2B).
+//! (system design 2B). Every hour it sets the wall clock again from its cloud's `Date`: a re-read
+//! that fails prints `platform: wall clock not refreshed: <reason>` once, and the next that
+//! succeeds `platform: wall clock refreshed`; the clock runs on either way.
 
 #![no_std]
 #![no_main]
@@ -24,12 +27,22 @@ use alloc::{format, string::String};
 use moruna_node_platform::{
     boot::{self, Fatal, Inputs, Stage},
     instance,
+    machine::WallClock,
     svc::{ChannelControl, Monotonic, Wan},
 };
-use moruna_svc::{Account, Channel, Console, now, println, start};
+use moruna_svc::{Account, Channel, Console, Handle, now, println, start};
 use netstack_protocol::net;
 
 moruna_svc::main!(run);
+
+/// The core's wall clock, through `root.clock`, which the supervisor gives `platform` alone.
+struct CoreClock(Handle);
+
+impl WallClock for CoreClock {
+    fn set(&mut self, utc_ns: u64) -> Result<(), String> {
+        moruna_svc::clock_set_realtime(&self.0, utc_ns).map_err(|error| String::from(error.name()))
+    }
+}
 
 /// Boots the node's platform and then serves each new start of `api`; returns only the reason it
 /// cannot go on.
@@ -53,6 +66,9 @@ fn serve(console: &Console, started_ns: u64) -> Result<core::convert::Infallible
     let mut control = start::take("supervisor")
         .map(|handle| ChannelControl(Channel(handle)))
         .ok_or_else(|| own("platform was started without its bootstrap"))?;
+    let mut wall = start::take("clock")
+        .map(CoreClock)
+        .ok_or_else(|| own("platform was started without root.clock"))?;
     // The supervisor queues the message before it starts `platform`, so it is not waited for.
     let memory_bytes = control
         .memory(now())
@@ -78,6 +94,7 @@ fn serve(console: &Console, started_ns: u64) -> Result<core::convert::Infallible
     let handover = boot::run(
         &mut network,
         &mut clock,
+        &mut wall,
         &mut control,
         &mut |line: &str| println!(console, "{}", line),
         Inputs {
@@ -85,7 +102,14 @@ fn serve(console: &Console, started_ns: u64) -> Result<core::convert::Infallible
             memory_bytes,
         },
     )?;
-    Err(boot::serve(&mut clock, &mut control, &handover))
+    Err(boot::serve(
+        &mut network,
+        &mut clock,
+        &mut wall,
+        &mut control,
+        &handover,
+        &mut |line: &str| println!(console, "{}", line),
+    ))
 }
 
 fn run() -> i64 {

@@ -309,7 +309,7 @@ stages:
                 -p moruna-netvsc -p moruna-netvsc-server
                 -p moruna-mmio -p moruna-pci -p moruna-virtio -p moruna-disk -p moruna-driver-table -p moruna-imagefs
                 -p moruna-linux -p linux-protocol -p moruna-nvme -p moruna-gve -p net-protocol
-                -p moruna-node -p node-protocol -p node-functions -p moruna-api-server -p moruna-ostd-adaptation)
+                -p moruna-node -p node-protocol -p moruna-netstack -p netstack-protocol -p node-functions -p moruna-node-http -p moruna-net-session -p moruna-api-server -p moruna-ostd-adaptation)
               cargo clippy --locked --target "$host" --all-targets "${packages[@]}" --features moruna-abi/manifest -- -D warnings
               cargo test --locked --target "$host" "${packages[@]}" --features moruna-abi/manifest
             displayName: Format and host tests of ABI, loaders, handles, quotas, SDK, image and device libraries

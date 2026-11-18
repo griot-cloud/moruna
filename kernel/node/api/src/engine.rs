@@ -6,8 +6,9 @@
 //!   `kernel/node/tools/configure.py` writes the standalone node's `engine.conf`, less its vsock
 //!   and launcher pieces: the program `/moruna/bin/moruna` with the arguments of
 //!   [`node_protocol::serve_args`] or [`node_protocol::check_args`], `HOME=/tmp`, the Linux
-//!   personality, a fresh connection to the network server, the channel to `api` handed over as
-//!   it is, and one run ([`job_config`], [`check_config`]).
+//!   personality, the channel to `api` handed over as it is, and one run ([`job_config`],
+//!   [`check_config`]); and for a job that names hosts, a fresh connection through the network
+//!   `node-admission` mints it for them (system design 3D, item 3.4).
 //! - **Memory:** a job's budget is its whole account; the engine's supervisor carves the
 //!   program's memory and scratch from it as the engine sizes itself ([`sizes`]), with no
 //!   scratch when the check's needs mark a staging volume (item 3.3). A check runs in a
@@ -37,9 +38,9 @@ pub const PROGRAM: &str = "/moruna/bin/moruna";
 /// (system design 3A; `moruna-runtime`'s `host::node::ENGINE_OVERHEAD`).
 pub const ENGINE_OVERHEAD: u64 = 128 << 20;
 
-/// The services `node-admission` lends each engine: the Linux personality, and the network
-/// server, which the engine reaches object storage through.
-pub const SERVICES: [&str; 2] = ["linux", "network"];
+/// The services `node-admission` lends each engine: the Linux personality. A job's network is
+/// minted for it from the hosts its check named (item 3.4), not lent.
+pub const SERVICES: [&str; 1] = ["linux"];
 
 /// The largest piece of the host protocol's stream a channel message carries.
 pub const PIECE: usize = limits::CHANNEL_MAX_BYTES;
@@ -71,9 +72,15 @@ pub fn sizes(budget: u64, staging: bool) -> Sizes {
 }
 
 /// The engine supervisor's configuration for a job of `budget` bytes on a node whose job bound
-/// is `bound`, `staging` when it stages on a volume; refused when the budget leaves the program
-/// no memory past the engine's own.
-pub fn job_config(bound: u64, budget: u64, staging: bool) -> Result<String, HostError> {
+/// is `bound`, `staging` when it stages on a volume, `network` when it names hosts (its network,
+/// which `node-admission` mints and grants it as `network`); refused when the budget leaves the
+/// program no memory past the engine's own.
+pub fn job_config(
+    bound: u64,
+    budget: u64,
+    staging: bool,
+    network: bool,
+) -> Result<String, HostError> {
     let Sizes { memory, scratch } = sizes(budget, staging);
     if memory == 0 || memory % 4096 != 0 {
         return Err(HostError::Refused(format!(
@@ -82,12 +89,17 @@ pub fn job_config(bound: u64, budget: u64, staging: bool) -> Result<String, Host
             ENGINE_OVERHEAD >> 20
         )));
     }
+    let more = if network {
+        "grant network service network\n"
+    } else {
+        ""
+    };
     Ok(config(
         &serve_args(bound),
         memory,
         scratch,
         ENGINE_CHANNEL,
-        "",
+        more,
     ))
 }
 
@@ -111,7 +123,7 @@ fn config(args: &[String], memory: u64, scratch: u64, channel: &str, more: &str)
     }
     text.push_str(&format!(
         "env HOME=/tmp\nmemory {memory}\nscratch {scratch}\ngrant linux personality\n\
-         grant network service network\ngrant {channel} channel {channel}\n{more}runs 1\n"
+         grant {channel} channel {channel}\n{more}runs 1\n"
     ));
     text
 }
@@ -380,7 +392,8 @@ impl EngineHost for Host {
             .memory_bytes
             .ok_or_else(|| HostError::Failed(String::from("the engine's check named no budget")))?;
         let staging = verdict.needs.volumes.iter().any(|v| v.staging);
-        let config = config_memory(&job_config(self.bound, budget, staging)?)?;
+        let network = !verdict.needs.hosts.is_empty();
+        let config = config_memory(&job_config(self.bound, budget, staging, network)?)?;
         let (ours, theirs) = Host::channel()?;
         let needs = &verdict.needs;
         let needs: node_protocol::Needs = (

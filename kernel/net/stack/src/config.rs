@@ -12,7 +12,8 @@
 //! ```
 //!
 //! A rule is `ADDR/PREFIX` with an optional `@PORT` or `@FIRST-LAST` (every port
-//! without), or `any` for every IPv4 and IPv6 address. A grant's `SLOT` names a
+//! without), or `any` for every IPv4 and IPv6 address. A name pattern is a name,
+//! `*.domain` for every name below it, or `*` for every name. A grant's `SLOT` names a
 //! listener slot of the server's (`listen*`); every connection through it holds that
 //! policy. `sockets` bounds the sockets every connection through the slot holds
 //! between them ([`crate::grant`]). Work item 1.3b's bounds on their memory: `rx` and
@@ -100,9 +101,6 @@ pub struct Settings {
     /// Per TLS socket buffer bound and total incoming handshake bytes.
     pub tls_buffer_bytes: usize,
     pub tls_handshake_timeout_ms: u64,
-    /// Explicit trusted boot UTC anchor; zero disables TLS.
-    pub tls_unix_seconds: u64,
-    pub tls_time_valid_ms: u64,
 }
 
 /// A TCP congestion control smoltcp provides.
@@ -141,8 +139,6 @@ impl Default for Settings {
             tls_sockets_max: 16,
             tls_buffer_bytes: 65536,
             tls_handshake_timeout_ms: 30_000,
-            tls_unix_seconds: 0,
-            tls_time_valid_ms: 3_600_000,
         }
     }
 }
@@ -342,12 +338,6 @@ impl Settings {
                 self.tls_buffer_bytes = number(line, name, value, 16640..=1 << 20)? as usize
             }
             "tls-handshake-timeout-ms" => self.tls_handshake_timeout_ms = positive_ms(value)?,
-            "tls-unix-seconds" => {
-                self.tls_unix_seconds = number(line, name, value, 1..=253_402_300_799)?
-            }
-            "tls-time-valid-ms" => {
-                self.tls_time_valid_ms = number(line, name, value, 1..=86_400_000)?
-            }
             _ => return err(line, format!("no setting is called `{name}`")),
         }
         Ok(())
@@ -614,6 +604,27 @@ grant listen-any rights=connect,listen,udp,ping,resolve,grant remote=any local=a
     }
 
     #[test]
+    fn the_rule_star_is_every_name_at_its_ports() {
+        let c = parse(
+            "moruna-netstack 1\n\
+             grant listen-admission rights=grant,connect local=any names=*@443 sockets=64\n",
+        )
+        .expect("parses");
+        let (_, a) = &c.grants[0];
+        assert_eq!(a.rights, rights::GRANT | rights::CONNECT);
+        let rule = &a.names[0];
+        assert_eq!(
+            (rule.pattern.as_str(), rule.first, rule.last),
+            ("*", 443, 443)
+        );
+        for bad in ["*.*", "**", "a.*", "*a.test"] {
+            let text =
+                alloc::format!("moruna-netstack 1\ngrant listen rights=connect names={bad}@443\n");
+            assert!(parse(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn a_grant_sets_its_bounds_and_others_keep_the_settings() {
         let c = parse(
             "moruna-netstack 1
@@ -664,12 +675,17 @@ grant listen-plain rights=connect,grant
                 2,
                 "16640",
             ),
+            // TLS's time is the node's one wall clock (system design 3D): no setting gives it.
             (
-                "moruna-netstack 1\nsetting tls-time-valid-ms 86400001\n",
+                "moruna-netstack 1\nsetting tls-unix-seconds 1800000000\n",
                 2,
-                "86400000",
+                "no setting is called `tls-unix-seconds`",
             ),
-            ("moruna-netstack 1\nsetting tls-unix-seconds 0\n", 2, "1 to"),
+            (
+                "moruna-netstack 1\nsetting tls-time-valid-ms 3600000\n",
+                2,
+                "no setting is called `tls-time-valid-ms`",
+            ),
             (
                 "moruna-netstack 1\nsetting tcp-nagle maybe\n",
                 2,

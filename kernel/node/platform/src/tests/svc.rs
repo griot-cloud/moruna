@@ -746,9 +746,11 @@ fn the_hand_over_crosses_a_channel_to_each_start_of_api() {
     let mut clock = FakeClock::default();
     let mut network = FakeNetwork::serving(&clock, |_, sent| openstack(sent));
     let mut lines = Vec::new();
+    let mut wall = super::FakeWall::default();
     let handed = boot::run(
         &mut network,
         &mut clock,
+        &mut wall,
         &mut control,
         &mut |line: &str| lines.push(line.to_string()),
         Inputs {
@@ -780,7 +782,14 @@ fn the_hand_over_crosses_a_channel_to_each_start_of_api() {
     // supervisor's end then closes.
     let starts = [start(&supervisor), start(&supervisor)];
     drop(supervisor);
-    let fatal = boot::serve(&mut Monotonic::new().unwrap(), &mut control, &handed);
+    let fatal = boot::serve(
+        &mut network,
+        &mut Monotonic::new().unwrap(),
+        &mut wall,
+        &mut control,
+        &handed,
+        &mut |line: &str| panic!("serve said {line}"),
+    );
     for started in starts {
         assert_eq!(started.join().unwrap(), handed);
     }

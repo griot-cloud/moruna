@@ -17,10 +17,12 @@
 - Free disk as you go: build with `CARGO_INCREMENTAL=0`; delete every `target` folder you made
   in your worktree whenever you stop or hand back, and your folders in `moruna-arm`'s `/tmp`. Never
   delete another agent's.
-- **Inside `moruna-arm`, build into the shared target:** `export CARGO_TARGET_DIR=/root/target-shared`
-  and pass `build.sh` its fourth argument as `/root/target-shared/host`. It lives on the container's
-  own disk (faster than the mounted worktree) and keeps the dependencies built between lock turns,
-  so a turn's build takes minutes, not most of an hour. Never delete it; the PM cleans it.
+- **Inside `moruna-arm`, build into your own target on the container's disk:**
+  `export CARGO_TARGET_DIR=/root/target/<your agent id>` and pass `build.sh` its fourth argument as
+  `/root/target/<your agent id>/host`. Never share one target between worktrees: Cargo gives the same
+  workspace crate the same artifact name in every worktree, so a shared target can link another
+  branch's build (it did, 2026-11-18). Keep yours between your own turns; delete it when your item
+  is done.
 - Create nothing in any cloud, and spend nothing.
 - Where your work item and the system design leave a choice open, ask the PM. Do not choose.
 - Scratch files go only in your own folder, `<scratchpad>/<your agent id>/`. Delete only there,

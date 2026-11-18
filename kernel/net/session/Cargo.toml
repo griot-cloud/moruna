@@ -1,0 +1,18 @@
+[package]
+name = "moruna-net-session"
+description = "moruna.net for a program's threads: a session a socket, its one reader thread filing each reply, any thread sending, receiving and closing at once"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+netstack-protocol = { path = "../protocol", version = "=0.1.0" }
+
+[dev-dependencies]
+# The real network server on a host, with TLS, and the test's own peers.
+moruna-netstack = { path = "../stack", version = "=0.1.0" }
+moruna-node-http = { path = "../../node/http", version = "=0.1.0" }
+rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "crypto"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }

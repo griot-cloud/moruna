@@ -56,6 +56,11 @@ pub use moruna_sys::{
     ResourceInfo, ResourceKind, Timer, Usage, dma_release, exit, main, map, println, random, start,
 };
 
+/// The node's one wall clock (ABI 2.8, system design 3D): the clock page a program reads it
+/// from, and the call `platform`, the holder of `root.clock`, sets it with.
+#[cfg(target_os = "none")]
+pub use moruna_sys::{clock_set_realtime, datapath::ClockPage};
+
 /// What a Linux program granted handles on the kernel (SDD 30) needs besides the SDK: the
 /// objects and calls above, without the entry and the exit its own runtime has.
 #[cfg(all(feature = "native", not(target_os = "none")))]

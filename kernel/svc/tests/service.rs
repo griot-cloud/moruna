@@ -292,6 +292,58 @@ fn sv_t4_replies_match_their_requests_out_of_order() {
 }
 
 #[test]
+fn sv_t4_a_shared_client_files_replies_and_any_caller_takes_its_own() {
+    // As a client shared by threads uses it (item 3.4): requests sent at once, one reader that
+    // files whatever arrives, and each caller taking its own reply, in any order, without
+    // waiting.
+    let (listener, join) = calc_server();
+    let channel = client::connect(&listener).expect("connect");
+    let mut core =
+        moruna_svc::ClientCore::connect(channel, calc::ID, DEADLINE_INFINITE).expect("hello");
+    let mut ids = Vec::new();
+    for (a, b) in [(1u64, 2u64), (3, 4), (5, 0)] {
+        let mut e = Encoder::new();
+        a.encode(&mut e).expect("a");
+        b.encode(&mut e).expect("b");
+        // add, add, and a division by zero, which the server refuses.
+        ids.push(core.send(if b == 0 { 2 } else { 1 }, e).expect("send"));
+    }
+    // Nothing filed yet: still to come, not an error.
+    assert!(core.take_reply(ids[0]).is_none());
+    // The reader files every frame there is, then finds nothing more.
+    let mut filed = 0;
+    while filed < ids.len() {
+        core.file(deadline_in(1_000_000_000)).expect("a frame");
+        filed += 1;
+    }
+    assert_eq!(core.file(moruna_svc::now()), Err(CallError::TimedOut));
+    // Each caller takes its own, whichever order they come in.
+    let refused = core.take_reply(ids[2]).expect("filed");
+    assert_eq!(
+        refused.map(|_| ()),
+        Err(CallError::Remote(calc::Error::DivideByZero.code()))
+    );
+    for (txid, want) in [(ids[1], 7u64), (ids[0], 3)] {
+        let mut reply = core.take_reply(txid).expect("filed").expect("a reply");
+        let mut d = reply.decoder();
+        assert_eq!(u64::decode(&mut d), Ok(want));
+        d.finish().expect("finish");
+    }
+    // Taken once; a request never sent is no request.
+    assert_eq!(
+        core.take_reply(ids[0]).map(|r| r.map(|_| ())),
+        Some(Err(CallError::Malformed))
+    );
+    assert_eq!(
+        core.take_reply(99).map(|r| r.map(|_| ())),
+        Some(Err(CallError::Malformed))
+    );
+    let channel = core.into_channel();
+    drop((channel, listener));
+    join.join().expect("server").expect("run");
+}
+
+#[test]
 fn sv_t3_minor_versions_are_negotiated() {
     // An old server: a new client may not send what the server lacks.
     let (listener, theirs) = Channel::create().expect("channel");

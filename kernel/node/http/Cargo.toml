@@ -1,0 +1,17 @@
+[package]
+name = "moruna-node-http"
+description = "The node's minimal HTTP/1.1 client over a byte stream, and the stream through the network server's sockets: plain to instance data (platform), HTTPS with the server's TLS (node-admission's function images)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+netstack-protocol = { path = "../../net/protocol", version = "=0.1.0" }
+
+[dev-dependencies]
+# The real network server on a host, with TLS, for the stream through its sockets.
+moruna-netstack = { path = "../../net/stack", version = "=0.1.0" }
+rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "crypto"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }

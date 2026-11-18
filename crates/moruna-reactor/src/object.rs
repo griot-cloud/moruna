@@ -12,6 +12,7 @@
 //! five calls d.2 names, the adapter over the real store is the only implementation that
 //! ships, and the test wrapper of section k implements the same seam.
 
+use moruna_storage::net::NetConnector;
 use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Range;
@@ -230,22 +231,50 @@ impl ObjectLayer {
     }
 
     fn resolve_for(&self, url: &str, native: bool) -> Result<(Arc<dyn ObjectBackend>, OsPath)> {
+        let network = if native {
+            moruna_storage::net::installed()
+        } else {
+            None
+        };
+        self.resolve_through(url, native, network)
+    }
+
+    /// As [`ObjectLayer::resolve`], `native` saying whether the engine runs on a node and
+    /// `network` the job's network there, if it has one (system design 3D).
+    fn resolve_through(
+        &self,
+        url: &str,
+        native: bool,
+        network: Option<NetConnector>,
+    ) -> Result<(Arc<dyn ObjectBackend>, OsPath)> {
         let located = self.parse(url)?;
         if let Some(backend) = &self.override_backend {
             return Ok((Arc::clone(backend), located.path));
         }
         // An injected backend already owns its transport; never replace its capability.
-        // The personality has no OS socket/connect calls for the generic cloud clients.
+        // The personality has no OS socket/connect calls for the generic cloud clients: on a
+        // node, S3 and Azure Blob are reached through the job's network, and nothing else is.
         if native && located.scheme != Scheme::File {
-            return Err(config(
-                "native object URL requires a granted SDK backend; Linux socket transport is unavailable",
-            ));
+            match (&network, located.scheme) {
+                (Some(_), Scheme::S3 | Scheme::Azure) => {}
+                (None, _) => {
+                    return Err(config(
+                        "on a node an object URL is reached through the job's network, and this \
+                         job has none: its check named no host",
+                    ));
+                }
+                (Some(_), _) => {
+                    return Err(config(
+                        "on a node the job's network reaches S3 and Azure Blob only, not gs://",
+                    ));
+                }
+            }
         }
         let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(client) = clients.get(&located.client_key) {
             return Ok((Arc::clone(client), located.path));
         }
-        let client = self.build(&located)?;
+        let client = self.build(&located, network.as_ref())?;
         clients.insert(located.client_key.clone(), Arc::clone(&client));
         Ok((client, located.path))
     }
@@ -307,7 +336,11 @@ impl ObjectLayer {
         }
     }
 
-    fn build(&self, located: &Located) -> Result<Arc<dyn ObjectBackend>> {
+    fn build(
+        &self,
+        located: &Located,
+        network: Option<&NetConnector>,
+    ) -> Result<Arc<dyn ObjectBackend>> {
         // Each client is built once and held twice: as the `ObjectStore` every operation uses
         // and, where the backend has multipart uploads, as the `MultipartStore` that
         // `abort_multipart` needs. The local filesystem has no second face.
@@ -321,7 +354,12 @@ impl ObjectLayer {
                     .s3
                     .as_ref()
                     .ok_or_else(|| config("no s3 configuration"))?;
-                let client = Arc::new(build_s3(s3, &located.container, self.cfg.allow_http)?);
+                let client = Arc::new(build_s3(
+                    s3,
+                    &located.container,
+                    self.cfg.allow_http,
+                    network,
+                )?);
                 (Arc::clone(&client) as Arc<dyn ObjectStore>, Some(client))
             }
             Scheme::Gcs => {
@@ -339,7 +377,12 @@ impl ObjectLayer {
                     .azure
                     .as_ref()
                     .ok_or_else(|| config("no azure configuration"))?;
-                let client = Arc::new(build_azure(azure, &located.container, self.cfg.allow_http)?);
+                let client = Arc::new(build_azure(
+                    azure,
+                    &located.container,
+                    self.cfg.allow_http,
+                    network,
+                )?);
                 (Arc::clone(&client) as Arc<dyn ObjectStore>, Some(client))
             }
             Scheme::File => {
@@ -355,15 +398,32 @@ impl ObjectLayer {
     }
 }
 
-fn build_s3(cfg: &S3Config, bucket: &str, allow_http: bool) -> Result<object_store::aws::AmazonS3> {
+/// An S3 client for `bucket`; on a node, over `network`, the job's (system design 3D).
+fn build_s3(
+    cfg: &S3Config,
+    bucket: &str,
+    allow_http: bool,
+    network: Option<&NetConnector>,
+) -> Result<object_store::aws::AmazonS3> {
     let mut b = object_store::aws::AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
         .with_allow_http(allow_http);
+    if let Some(network) = network {
+        // The network server carries HTTPS to host names only: the connector refuses anything
+        // else at its first request, naming it.
+        b = b.with_http_connector(network.clone());
+    }
     if let Some(v) = &cfg.endpoint {
         // MH 4.6: a `unix://` or `vsock://` endpoint is a socket the host proxies; the client
         // speaks plain HTTP/1.1 over it, path-style, whatever `allow_http` says, because the
-        // socket never leaves the machine.
+        // socket never leaves the machine. A node has no such socket.
         match crate::socket::parse_endpoint(v).map_err(|error| *error)? {
+            Some(_) if network.is_some() => {
+                return Err(config(
+                    "s3.endpoint: on a node object storage is reached through the job's network, \
+                     not a socket",
+                ));
+            }
             Some(target) => {
                 b = b
                     .with_endpoint(crate::socket::SOCKET_ENDPOINT)
@@ -403,14 +463,19 @@ fn build_gcs(cfg: &GcsConfig, bucket: &str) -> Result<object_store::gcp::GoogleC
     b.build().map_err(|e| config(&format!("gcs: {e}")))
 }
 
+/// An Azure Blob client for `container`; on a node, over `network`, the job's (system design 3D).
 fn build_azure(
     cfg: &AzureConfig,
     container: &str,
     allow_http: bool,
+    network: Option<&NetConnector>,
 ) -> Result<object_store::azure::MicrosoftAzure> {
     let mut b = object_store::azure::MicrosoftAzureBuilder::from_env()
         .with_container_name(container)
         .with_allow_http(allow_http);
+    if let Some(network) = network {
+        b = b.with_http_connector(network.clone());
+    }
     if let Some(v) = &cfg.account {
         b = b.with_account(v);
     }
@@ -663,6 +728,103 @@ mod tests {
             both.resolve("gs://b/k"),
             Err(MorunaError::Config { .. })
         ));
+    }
+
+    /// The job's network as a node's engine has it, for tests: every connection it is asked
+    /// for is refused, naming the host and port, as the network server refuses one its policy
+    /// does not hold.
+    #[derive(Debug, Default)]
+    struct Refusing {
+        asked: std::sync::Mutex<Vec<(String, u16)>>,
+    }
+
+    impl moruna_storage::net::Network for Refusing {
+        fn open(
+            &self,
+            host: &str,
+            port: u16,
+        ) -> std::io::Result<Box<dyn moruna_storage::net::NetSocket>> {
+            self.asked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((host.to_string(), port));
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{host}:{port} is not in this job's network"),
+            ))
+        }
+    }
+
+    fn node_layer(endpoint: Option<&str>) -> ObjectLayer {
+        ObjectLayer::new(
+            ObjectStoreConfig {
+                s3: Some(S3Config {
+                    bucket: None,
+                    endpoint: endpoint.map(String::from),
+                    region: Some("us-east-1".into()),
+                    access_key_id: Some("k".into()),
+                    secret_access_key: Some("s".into()),
+                    session_token: None,
+                }),
+                azure: Some(AzureConfig {
+                    account: Some("acct".into()),
+                    access_key: Some("a2V5".into()),
+                    ..AzureConfig::default()
+                }),
+                gcs: Some(GcsConfig::default()),
+                ..ObjectStoreConfig::default()
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn on_a_node_s3_and_azure_go_through_the_job_s_network_and_nothing_else_does() {
+        let network = Arc::new(Refusing::default());
+        let connector = NetConnector::new(network.clone());
+        let l = node_layer(Some("https://objects.example.test"));
+        // S3: built over the network, and its requests go there, by the endpoint's name.
+        let (s3, path) = l
+            .resolve_through("s3://bucket/data/a.bin", true, Some(connector.clone()))
+            .expect("an S3 client over the job's network");
+        let refused = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(s3.head(&path))
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("not in this job's network"), "{refused}");
+        assert_eq!(
+            network.asked.lock().unwrap().as_slice(),
+            [("objects.example.test".to_string(), 443)]
+        );
+        // Azure Blob too; gs:// is not reached from a node.
+        l.resolve_through("az://container/x", true, Some(connector.clone()))
+            .expect("an Azure client over the job's network");
+        let gcs = l
+            .resolve_through("gs://bucket/x", true, Some(connector.clone()))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(gcs.contains("S3 and Azure Blob only"), "{gcs}");
+        // No network: the job's check named no host.
+        let none = l
+            .resolve_through("s3://bucket/x", true, None)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(none.contains("its check named no host"), "{none}");
+        // A host's socket endpoint is not a node's.
+        let socket = node_layer(Some("unix:///run/s3.sock"))
+            .resolve_through("s3://bucket/x", true, Some(connector))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(socket.contains("not a socket"), "{socket}");
+        // Off a node, nothing changes: no network, clients as before.
+        l.resolve_through("gs://bucket/x", false, None)
+            .expect("a host's own GCS client");
     }
 
     #[test]

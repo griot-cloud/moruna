@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 
 extern crate alloc;
+/// A job's network: the policy of the engine's channel to the network server (3D).
+pub mod egress;
 use alloc::{string::String, vec::Vec};
 
 pub mod restart;

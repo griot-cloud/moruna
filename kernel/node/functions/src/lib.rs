@@ -299,5 +299,7 @@ impl Cache {
     }
 }
 
+pub mod https;
+
 #[cfg(test)]
 mod tests;
