@@ -15,11 +15,12 @@ use core::{
 
 use moruna_netvsc::{Buffer, Netvsc, Shared};
 use moruna_netvsc_server::{
-    Driver, NAME, OUTGOING_PAGES, RECEIVE_BUFFER, RING_PAGES, SEND_BUFFER, describe, factory,
+    Driver, NAME, OUTGOING_PAGES, RECEIVE_BUFFER, RING_PAGES, SEND_BUFFER, START_NS, describe,
+    factory, late, not_started,
 };
 use moruna_svc::{
     CallError, Channel, Completions, DEADLINE_INFINITE, Dispatcher, Handle, Signals, Watch,
-    connect, deadline_in, now, wait_one,
+    connect, now, wait_one,
 };
 use moruna_sys::{Console, Mapping, Memory, hyperv::HvSignal, map, println, start};
 use moruna_vmbus::{ChannelError, GpadlId, MemoryId, Wait};
@@ -30,11 +31,18 @@ use zerocopy::FromBytes;
 /// A page, as memory objects count them.
 const PAGE: u64 = 4096;
 
-/// How long `vmbus` and the device manager may take to answer.
-const ANSWER_NS: u64 = 30_000_000_000;
+/// The nanoseconds left until `deadline`, at least one: the timeout of the next call.
+fn left(deadline: u64) -> u64 {
+    deadline.saturating_sub(now()).max(1)
+}
 
-/// How long the card's start may take: NVSP and RNDIS, a few of the host's answers.
-const START_NS: u64 = 60_000_000_000;
+/// A call's failure, by what it was for: past the deadline it is [`late`].
+fn failed<E: fmt::Debug>(what: &str, e: CallError<E>) -> String {
+    match e {
+        CallError::TimedOut => late(what),
+        other => format!("{what}: {other:?}"),
+    }
+}
 
 /// A ring's memory: a control page and its data, in the rings `vmbus` made.
 type Ring = SingleMappedRingMem<&'static [AtomicU8]>;
@@ -59,9 +67,15 @@ impl Shared for Mapped {
     }
 }
 
+/// What the card knows its receive buffer by.
+const RECEIVE: MemoryId = MemoryId(1);
+
+/// What the card knows its send buffer by.
+const SEND: MemoryId = MemoryId(2);
+
 /// A buffer of `bytes`, DMA memory `vmbus` can pin, mapped: the card's view of it, and the
 /// handle `share` hands to `vmbus`.
-fn buffer(id: u64, bytes: usize) -> Result<(Buffer<Mapped>, Handle), String> {
+fn buffer(id: MemoryId, bytes: usize) -> Result<(Buffer<Mapped>, Handle), String> {
     let memory = Memory::create_dma(bytes as u64).map_err(|e| format!("a buffer: {}", e.name()))?;
     let mapping = memory
         .map_detached(0, bytes as u64, map::READ | map::WRITE)
@@ -69,7 +83,7 @@ fn buffer(id: u64, bytes: usize) -> Result<(Buffer<Mapped>, Handle), String> {
     let mapping: &'static Mapping<'static> = Box::leak(Box::new(mapping));
     Ok((
         Buffer {
-            id: MemoryId(id),
+            id,
             memory: Mapped(mapping),
         },
         memory.0,
@@ -89,6 +103,10 @@ struct Opening {
     channel: u32,
     /// The buffers not yet shared, by the ID the card names them by.
     unshared: Vec<(MemoryId, Handle)>,
+    /// When the start must have ended, which bounds each share.
+    deadline: u64,
+    /// The share that ran past the deadline, for the fatal line.
+    late: Rc<Cell<Option<&'static str>>>,
 }
 
 impl Opening {
@@ -97,6 +115,8 @@ impl Opening {
         vmbus: vmbus::Client,
         channel: u32,
         unshared: Vec<(MemoryId, Handle)>,
+        deadline: u64,
+        late: Rc<Cell<Option<&'static str>>>,
     ) -> Result<Opening, String> {
         let memory = Memory(opened.rings);
         let bytes = u64::from(RING_PAGES) * PAGE;
@@ -120,6 +140,8 @@ impl Opening {
             vmbus,
             channel,
             unshared,
+            deadline,
+            late,
         })
     }
 
@@ -187,8 +209,17 @@ impl moruna_vmbus::Channel for Opening {
             .position(|(id, _)| *id == memory)
             .ok_or(ChannelError::NotShared)?;
         let (_, handle) = self.unshared.swap_remove(at);
+        self.vmbus.core().set_timeout(left(self.deadline));
         match self.vmbus.share(self.channel, handle) {
             Ok(gpadl) => Ok(GpadlId(gpadl)),
+            Err(CallError::TimedOut) => {
+                self.late.set(Some(if memory == RECEIVE {
+                    "the receive buffer's GPADL"
+                } else {
+                    "the send buffer's GPADL"
+                }));
+                Err(ChannelError::NotShared)
+            }
             Err(CallError::Remote(vmbus::Error::NoSuchChannel | vmbus::Error::NotOpen))
             | Err(CallError::PeerClosed) => Err(ChannelError::Closed),
             Err(_) => Err(ChannelError::NotShared),
@@ -238,6 +269,8 @@ fn take(name: &str) -> Result<Handle, String> {
 struct Steps<'a> {
     console: &'a Console,
     started: u64,
+    /// When the start must have ended: [`START_NS`] after the process started.
+    deadline: u64,
 }
 
 impl Steps<'_> {
@@ -251,13 +284,14 @@ impl Steps<'_> {
 fn card(steps: &Steps<'_>, vmbus_listener: &Channel) -> Result<Netvsc<Opening, Mapped>, String> {
     let console = steps.console;
     steps.say(format_args!("asking vmbus for the synthetic network cards"));
+    let deadline = steps.deadline;
     let channel = connect(vmbus_listener).map_err(|e| format!("vmbus: {e:?}"))?;
-    let mut vmbus = vmbus::Client::connect(channel, deadline_in(ANSWER_NS))
-        .map_err(|e| format!("vmbus: {e:?}"))?;
-    vmbus.core().set_timeout(ANSWER_NS);
+    let mut vmbus =
+        vmbus::Client::connect(channel, deadline).map_err(|e| failed("vmbus's welcome", e))?;
+    vmbus.core().set_timeout(left(deadline));
     let offers = vmbus
         .offers(Class::Net.interface())
-        .map_err(|e| format!("vmbus's offers: {e:?}"))?;
+        .map_err(|e| failed("vmbus's offers", e))?;
     steps.say(format_args!(
         "contact: vmbus offers {} channels of synthetic network cards",
         offers.len()
@@ -277,40 +311,51 @@ fn card(steps: &Steps<'_>, vmbus_listener: &Channel) -> Result<Netvsc<Opening, M
         "card {instance}: opening channel {} on {RING_PAGES} pages of rings",
         offer.channel
     ));
+    vmbus.core().set_timeout(left(deadline));
     let opened = vmbus
         .open(offer.channel, RING_PAGES, OUTGOING_PAGES)
-        .map_err(|e| format!("card {instance}: open: {e:?}"))?;
+        .map_err(|e| failed(&format!("the opening of channel {}", offer.channel), e))?;
     steps.say(format_args!("card {instance}: channel opened"));
-    let (receive, receive_memory) = buffer(1, RECEIVE_BUFFER)?;
-    let (send, send_memory) = buffer(2, SEND_BUFFER)?;
+    let (receive, receive_memory) = buffer(RECEIVE, RECEIVE_BUFFER)?;
+    let (send, send_memory) = buffer(SEND, SEND_BUFFER)?;
     let unshared = vec![(receive.id, receive_memory), (send.id, send_memory)];
-    let channel = Opening::new(opened, vmbus, offer.channel, unshared)
-        .map_err(|e| format!("card {instance}: {e}"))?;
+    let late_share = Rc::new(Cell::new(None));
+    let channel = Opening::new(
+        opened,
+        vmbus,
+        offer.channel,
+        unshared,
+        deadline,
+        late_share.clone(),
+    )
+    .map_err(|e| format!("card {instance}: {e}"))?;
     steps.say(format_args!(
         "card {instance}: buffers made; starting the card"
     ));
-    let card = Netvsc::start_saying(
-        channel,
-        receive,
-        send,
-        Some(deadline_in(START_NS)),
-        &mut |line| steps.say(line),
-    )
-    .map_err(|e| format!("card {instance}: {e}"))?;
+    let card = Netvsc::start_saying(channel, receive, send, Some(deadline), &mut |line| {
+        steps.say(line)
+    })
+    .map_err(|e| match late_share.get() {
+        Some(what) => late(what),
+        None => not_started(instance, e),
+    })?;
     println!(console, "netvsc: card {instance}: {}", describe(&card));
     Ok(card)
 }
 
 fn serve(console: &Console, started: u64) -> Result<(), String> {
-    let steps = Steps { console, started };
+    let steps = Steps {
+        console,
+        started,
+        deadline: started.saturating_add(START_NS),
+    };
     let vmbus_listener = Channel(take("vmbus")?);
     // The registrar's connection first, before the card is up. The device manager holds
     // the network server's lookup of `net0` until this connection closes, after the card
     // is registered.
     let devices = Channel(take("devices")?);
-    let mut directory = devices_protocol::open_directory(devices, deadline_in(ANSWER_NS))
-        .map_err(|e| format!("the device manager: {e:?}"))?;
-    directory.core().set_timeout(ANSWER_NS);
+    let mut directory = devices_protocol::open_directory(devices, steps.deadline)
+        .map_err(|e| failed("the device manager", e))?;
     steps.say(format_args!(
         "connected to the device manager's register-netvsc"
     ));
@@ -336,6 +381,7 @@ fn serve(console: &Console, started: u64) -> Result<(), String> {
         .map_err(|e| format!("the card's listener: {}", e.name()))?;
     // Registered once it is served: a lookup of the name connects at once. The connection
     // closes when registering is done, which the device manager's waiting lookups hear.
+    directory.core().set_timeout(left(steps.deadline));
     match directory.register_net(String::from(NAME), theirs) {
         Ok(()) => steps.say(format_args!("served as {NAME}")),
         Err(e) => println!(

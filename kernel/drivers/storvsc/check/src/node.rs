@@ -15,7 +15,8 @@ use storvsc_check::{FIRST, Gpt, OFFSET, SECTORS, pattern};
 
 const SECONDS: u64 = 1_000_000_000;
 
-/// How long storvsc may take to register the disks: its scan's steps, at 10 s each.
+/// How long a lookup may wait for storvsc to register the disks: its whole start takes at
+/// most 4 s (`moruna_storvsc_server::scan::START_NS`), so this is generous.
 const FOUND_NS: u64 = 120 * SECONDS;
 
 /// How long a disk may take to answer.

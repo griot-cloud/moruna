@@ -4,7 +4,8 @@
 //! CAPACITY instead (the PM's decision for 1.10b). Disks attached while the node runs are
 //! not found: a known limit.
 //!
-//! Every step waits with a deadline, and one that passes ends the scan with a reason.
+//! Every step waits until the start's deadline ([`Scratch::deadline`]), and one that runs
+//! past it ends the scan with a reason that names it: `no answer to REPORT LUNS within 4 s`.
 
 use alloc::{format, string::String, vec, vec::Vec};
 
@@ -13,8 +14,11 @@ use moruna_storvsc::{
     scsi::LUNS_BYTES,
 };
 
-/// How long each step of the scan may take: the initialisation, and each command.
-pub const STEP_NS: u64 = 10_000_000_000;
+/// How long a VMBus driver's whole start may take: the node's services start within 5 s
+/// (1B), and a start that stops must give the first fatal line itself, naming the step it
+/// stopped at, before another service's deadline speaks. On the node the scan of every
+/// controller counts against it, from the process's start.
+pub const START_NS: u64 = 4_000_000_000;
 
 /// The target scanned on each controller: Hyper-V puts every disk at path 0, target 0, its
 /// LUN its place on the controller.
@@ -38,6 +42,13 @@ pub trait Scratch {
 
     /// Now, in nanoseconds on the node's monotonic clock.
     fn now(&self) -> u64;
+
+    /// When the start must have ended, on the same clock. The node's process gives
+    /// [`START_NS`] after its own start, for the whole scan; by default a step gets
+    /// [`START_NS`] from when it begins.
+    fn deadline(&self) -> u64 {
+        self.now().saturating_add(START_NS)
+    }
 }
 
 /// What the scan of one controller found, and what it says of what it did not serve.
@@ -66,7 +77,7 @@ pub fn no_device(srb: SrbStatus) -> bool {
 /// The device on `channel`, once its initialisation has finished, by the deadline.
 pub fn start<C: Channel, S: Scratch>(channel: C, scratch: &S) -> Result<Storvsc<C>, String> {
     let mut device = Storvsc::new(channel).map_err(|e| format!("the initialisation: {e}"))?;
-    let deadline = scratch.now().saturating_add(STEP_NS);
+    let deadline = scratch.deadline();
     loop {
         match device.poll() {
             Ok(Some(Event::Ready)) => return Ok(device),
@@ -79,7 +90,7 @@ pub fn start<C: Channel, S: Scratch>(channel: C, scratch: &S) -> Result<Storvsc<
 fn wait<C: Channel>(device: &mut Storvsc<C>, deadline: u64, what: &str) -> Result<(), String> {
     match device.wait(Some(deadline)) {
         Ok(Wait::Signalled) => Ok(()),
-        Ok(Wait::TimedOut) => Err(format!("{what} was not answered within 10 s")),
+        Ok(Wait::TimedOut) => Err(format!("no answer to {what} within 4 s")),
         Err(e) => Err(format!("{what}: {e}")),
     }
 }
@@ -92,7 +103,7 @@ fn call<C: Channel, S: Scratch>(
     send: impl FnOnce(&mut Storvsc<C>) -> Result<u64, Error>,
 ) -> Result<Result<u32, Failure>, String> {
     let id = send(device).map_err(|e| format!("{what}: {e}"))?;
-    let deadline = scratch.now().saturating_add(STEP_NS);
+    let deadline = scratch.deadline();
     loop {
         match device.poll() {
             Ok(Some(Event::Completed(Completion { id: done, result }))) if done == id => {
