@@ -81,7 +81,7 @@ fn serve(config: &str, cards: &[Card]) -> (BTreeMap<String, Channel>, thread::Jo
     (ours, server)
 }
 
-fn client(listener: &Channel) -> net::Client {
+pub(super) fn client(listener: &Channel) -> net::Client {
     let mut client = net::Client::connect(
         moruna_svc::connect(listener).expect("a connection"),
         deadline_in(5 * SECOND),
@@ -93,7 +93,7 @@ fn client(listener: &Channel) -> net::Client {
 }
 
 /// The bytes of one receive on the fake cloud's side of a connection.
-fn receive(server: &mut net::Client, socket: u32) -> Vec<u8> {
+pub(super) fn receive(server: &mut net::Client, socket: u32) -> Vec<u8> {
     let memory = Memory::create_in(65536, &server.account().0).expect("memory");
     let loan = Memory(
         memory
@@ -113,7 +113,7 @@ fn receive(server: &mut net::Client, socket: u32) -> Vec<u8> {
 }
 
 /// Sends all of `bytes` from the fake cloud's side of a connection.
-fn send(server: &mut net::Client, socket: u32, bytes: &[u8]) {
+pub(super) fn send(server: &mut net::Client, socket: u32, bytes: &[u8]) {
     for piece in bytes.chunks(60_000) {
         let memory = Memory::create_in(65536, &server.account().0).expect("memory");
         memory
@@ -265,7 +265,7 @@ fn requests_go_through_the_network_server_s_sockets() {
     assert_eq!(
         wan.address(soon()),
         Err(StreamError::Other(
-            "the interface wan has no IPv4 address".to_string()
+            "the network server has no interface wan that takes an IPv4 address".to_string()
         ))
     );
 
@@ -284,7 +284,7 @@ fn requests_go_through_the_network_server_s_sockets() {
 const NETWORK_CONF: &str = include_str!("../../../cloud/network.conf");
 const NODE_CONF: &str = include_str!("../../../cloud/node.conf");
 /// `platform`'s grant, with the local rule a connection needs to leave at all (PM, 2026-11-18).
-const PLATFORM_GRANT: &str = "grant listen-platform rights=connect \
+pub(super) const PLATFORM_GRANT: &str = "grant listen-platform rights=connect \
      remote=169.254.169.254/32@80,168.63.129.16/32@80 local=0.0.0.0/0 sockets=4\n";
 
 #[test]
@@ -453,7 +453,7 @@ fn the_node_s_address_is_its_wan_interface_s_ipv4_address() {
 }
 
 #[test]
-fn a_node_that_dhcp_has_not_yet_answered_has_no_route_and_no_address() {
+fn a_node_that_dhcp_has_not_yet_answered_has_no_route_and_waits_for_its_address() {
     // The cloud profile's interface, on a card where no DHCP server answers.
     let (slots, server) = serve(NETWORK_CONF, &[CARD]);
     let mut wan = Wan::new(client(&slots["listen-platform"])).unwrap();
@@ -462,12 +462,13 @@ fn a_node_that_dhcp_has_not_yet_answered_has_no_route_and_no_address() {
         wan.connect(instance::ADDRESS, instance::PORT, soon).err(),
         Some(StreamError::Unreachable)
     );
+    // The address is waited for, to the caller's deadline.
+    let asked = now();
     assert_eq!(
-        wan.address(soon),
-        Err(StreamError::Other(
-            "the interface wan has no IPv4 address".to_string()
-        ))
+        wan.address(deadline_in(300 * MS)),
+        Err(StreamError::Deadline)
     );
+    assert!(now() - asked >= 300 * MS);
     drop(wan);
     drop(slots);
     server.join().unwrap();

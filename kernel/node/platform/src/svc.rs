@@ -97,20 +97,25 @@ impl Network for Wan {
         })
     }
 
+    /// The network server's `address` (`moruna.net` 3.3), which waits for the interface's
+    /// address as `accept` waits for a connection, within this call's deadline.
     fn address(&mut self, deadline: u64) -> Result<Ipv4Addr, StreamError> {
         self.arm(deadline)?;
-        let info = self.client.info().map_err(failure)?;
-        info.interfaces
-            .iter()
-            .filter(|interface| interface.name == INTERFACE)
-            .flat_map(|interface| interface.addrs.iter())
-            .find_map(|cidr| match cidr.addr.0 {
-                IpAddr::V4(address) => Some(address),
-                IpAddr::V6(_) => None,
-            })
-            .ok_or_else(|| {
-                StreamError::Other(format!("the interface {INTERFACE} has no IPv4 address"))
-            })
+        let cidr = self
+            .client
+            .address(INTERFACE.into())
+            .map_err(|error| match error {
+                CallError::Remote(net::Error::NotFound) => StreamError::Other(format!(
+                    "the network server has no interface {INTERFACE} that takes an IPv4 address"
+                )),
+                error => failure(error),
+            })?;
+        match cidr.addr.0 {
+            IpAddr::V4(address) => Ok(address),
+            IpAddr::V6(_) => Err(StreamError::Other(format!(
+                "the network server gave {INTERFACE} an IPv6 address for its IPv4 one"
+            ))),
+        }
     }
 }
 

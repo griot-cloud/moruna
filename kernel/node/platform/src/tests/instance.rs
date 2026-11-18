@@ -259,12 +259,40 @@ fn a_refused_connection_is_tried_again_every_second() {
 }
 
 #[test]
-fn a_node_without_an_address_yet_tries_again_every_second() {
+fn a_request_that_cannot_begin_for_lack_of_an_address_begins_as_soon_as_it_is_bound() {
+    // Work item 1.11f, boot 1875 on Azure: the first request began 8 ms before the lease, had
+    // no route, and the next began a whole second after it. For a lease early and late: the
+    // request that could not begin is made again when the address is bound, not a second after
+    // it began.
+    for (lease, fails_in) in [(8 * MS, 0), (2 * SECOND + 500 * MS, 10 * MS)] {
+        let mut clock = FakeClock::default();
+        let mut network =
+            FakeNetwork::serving(&clock, |_, sent| azure(sent)).connecting(move |now| {
+                if now < lease {
+                    Err((StreamError::Unreachable, fails_in))
+                } else {
+                    Ok(())
+                }
+            });
+        network.address_at = lease;
+        let found = find(&mut network, &mut clock, 0).unwrap();
+        assert_eq!(found.cloud, Cloud::Azure);
+        assert_eq!(network.attempts, [0, lease]);
+        // The address was waited for once, within instance data's limit.
+        assert_eq!(network.address_asked, [(fails_in, instance::LIMIT_NS)]);
+        assert_eq!(found.read_at_ns, lease);
+    }
+}
+
+#[test]
+fn with_an_address_a_request_with_no_route_is_asked_again_a_second_later() {
+    // The node has its address, but no route to instance data until 2 s: the address is asked
+    // once, answered at once, and from then on the request waits out the second as a refused
+    // one does.
     let mut clock = FakeClock::default();
     let mut network = FakeNetwork::serving(&clock, |_, sent| azure(sent)).connecting(|now| {
         if now < 2 * SECOND {
-            // Each attempt takes a moment to fail.
-            Err((StreamError::Unreachable, 10 * MS))
+            Err((StreamError::Unreachable, 0))
         } else {
             Ok(())
         }
@@ -273,8 +301,49 @@ fn a_node_without_an_address_yet_tries_again_every_second() {
         find(&mut network, &mut clock, 0).unwrap().cloud,
         Cloud::Azure
     );
-    // A second after each attempt began, not after it failed.
+    assert_eq!(network.attempts, [0, 0, SECOND, 2 * SECOND]);
+    assert_eq!(network.address_asked, [(0, instance::LIMIT_NS)]);
+}
+
+#[test]
+fn an_address_that_cannot_be_had_leaves_the_request_to_the_second() {
+    // The network server cannot say the address: the request is asked again a second after it
+    // began, and the address with it.
+    let mut clock = FakeClock::default();
+    let mut network = FakeNetwork::serving(&clock, |_, sent| azure(sent)).connecting(|now| {
+        if now < 2 * SECOND {
+            Err((StreamError::Unreachable, 10 * MS))
+        } else {
+            Ok(())
+        }
+    });
+    network.address = Err(StreamError::Other("the network server has gone".into()));
+    assert_eq!(
+        find(&mut network, &mut clock, 0).unwrap().cloud,
+        Cloud::Azure
+    );
     assert_eq!(network.attempts, [0, SECOND, 2 * SECOND]);
+    assert_eq!(network.address_asked.len(), 2);
+}
+
+#[test]
+fn no_address_by_90_s_is_fatal_and_says_so() {
+    let mut clock = FakeClock::default();
+    let mut network = FakeNetwork::serving(&clock, |_, _| panic!("no route"))
+        .connecting(|_| Err((StreamError::Unreachable, 0)));
+    network.address_at = u64::MAX;
+    let line = fatal(find(&mut network, &mut clock, 0));
+    assert_eq!(
+        line,
+        format!(
+            "moruna: fatal instance-data: nothing by 90 s: GET {AZURE}: no route to the address, \
+             and the node's address: the deadline passed"
+        )
+    );
+    // One request, then the wait for the address, to the limit.
+    assert_eq!(network.attempts, [0]);
+    assert_eq!(network.address_asked, [(0, instance::LIMIT_NS)]);
+    assert_eq!(clock.now(), instance::LIMIT_NS);
 }
 
 #[test]

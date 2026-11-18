@@ -30,3 +30,7 @@ serde_json = { version = "=1.0.154", default-features = false, features = ["allo
 # The real network server on a host, for the test of the sockets' wiring and of the profile line
 # this item adds to its configuration.
 moruna-netstack = { path = "../../net/stack", version = "=0.1.0" }
+# The network server's own test harness (its DHCP server on the wire) and the frames it reads,
+# for item 1.11f's test of a request made before the lease, at the network server's versions.
+smoltcp = { version = "=0.13.1", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-dhcpv4"] }
+heapless = { version = "=0.9.3", default-features = false }
