@@ -267,10 +267,22 @@ pub(crate) fn configure<C: Channel>(
     say(format_args!(
         "NDIS configuration sent: frames of {FRAME} bytes"
     ));
+    let capabilities = protocol::NdisConfigCapabilities::new();
+    // A traced card states 802.1Q and teaming, as Linux's hv_netvsc does from NVSP 5
+    // (`negotiate_nvsp_ver`: "Teaming bit is needed to receive link speed updates"), to see
+    // whether Azure's host then indicates more (work item 1.11c). Never SR-IOV, which would
+    // offer a virtual function the node does not use (1F), nor RSC.
+    #[cfg(feature = "trace-first-frames")]
+    let capabilities = if wire.trace.is_some() {
+        say(format_args!("NDIS capabilities stated: 802.1Q and teaming"));
+        capabilities.with_ieee_8021_q(true).with_teaming(true)
+    } else {
+        capabilities
+    };
     let config = protocol::Message2SendNdisConfig {
         mtu: FRAME,
         reserved: 0,
-        capabilities: protocol::NdisConfigCapabilities::new(),
+        capabilities,
     };
     request(
         wire,

@@ -22,11 +22,15 @@ fn the_traces_lines_come_with_the_drivers_lines() {
     )
     .unwrap_or_else(|e| panic!("the card did not start: {e}"));
     let mut driver = Driver::new(card);
+    // An ARP request: a frame of the boot's network path, which the trace follows.
     let frame = [
-        &[0x02, 0, 0, 0, 0, 1][..],
+        &[0xff; 6][..],
         &MAC[..],
-        &[0x88, 0xb5],
-        &[0; 46],
+        &[0x08, 0x06, 0, 1, 8, 0, 6, 4, 0, 1],
+        &MAC[..],
+        &[10, 0, 0, 4],
+        &[0; 6],
+        &[10, 0, 0, 1],
     ]
     .concat();
     assert!(driver.card().send(&frame).unwrap());
@@ -38,7 +42,7 @@ fn the_traces_lines_come_with_the_drivers_lines() {
     assert_eq!(
         driver.take_lines(),
         [
-            "netvsc: 1.234 ms: trace: out 1: 60 bytes in section 0, to 02:00:00:00:00:01, EtherType 0x88b5",
+            "netvsc: 1.234 ms: trace: out 1: 42 bytes in section 0, to ff:ff:ff:ff:ff:ff, ARP who has 10.0.0.1 tell 10.0.0.4",
             "netvsc: 1.234 ms: trace: out 1 committed; the host signalled",
             "netvsc: 1.234 ms: trace: out 1 completed: status 1 (success)",
             "netvsc: 1.234 ms: trace: indication 0x4001000c (media disconnect): the link goes down",

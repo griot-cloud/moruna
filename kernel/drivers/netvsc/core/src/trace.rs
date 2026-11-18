@@ -1,15 +1,16 @@
-//! The first frames each way, with their times, for diagnosis only (work item 1.11c): a
-//! build with the feature `trace-first-frames`, which a node's normal image never turns on.
+//! The boot's network path, frame by frame, with times, for diagnosis only (work item 1.11c):
+//! a build with the feature `trace-first-frames`, which a node's normal image never turns on.
 //!
-//! The item asks whether the node's first DHCP DISCOVER left the guest and whether an OFFER
-//! came back. So for the first [`FIRST`] frames out, a line when each is put on the ring to
-//! the host (its section, its length, where it goes and whether it is DHCP), a line when the
-//! commit that hands it to the host is made (and whether the host was signalled, by VMBus's
-//! rule), and a line when the host completes it (with the host's status). For the first
-//! [`FIRST`] frames in, a line when each is read. And for the first [`FIRST`] indications
-//! the host sends, a line with its status and what it did to the link: the card takes the
-//! link to be up from its start, so an indication that the link came up later is otherwise
-//! passed over unseen.
+//! Azure drops what the guest sends for a while after its card starts. The trace shows each
+//! boot's window, and which message it took: of the frames the boot's network path is made
+//! of ([`traced`]: DHCP, ARP, and TCP's SYN and RST), the first [`FIRST`] out each get a line
+//! when put on the ring to the host (its section, its length, its addresses and what it is),
+//! a line when the commit that hands it to the host is made (and whether the host was
+//! signalled, by VMBus's rule), and a line when the host completes it (with the host's
+//! status); the first [`FIRST`] in, a line when each is read. Other frames are not traced, so
+//! the console stays light. The first [`FIRST`] indications the host sends each get a line
+//! with their status and what they did to the link: the card takes the link to be up from
+//! its start, so an indication that the link came up later is otherwise passed over unseen.
 //!
 //! Every line starts with the time on the clock the caller gives, in milliseconds to the
 //! microsecond: for the node's netvsc, its own clock, since its process started, the clock
@@ -20,7 +21,7 @@ use alloc::{boxed::Box, format, string::String, vec::Vec};
 use netvsp_protocol::rndisprot;
 
 /// How many frames are traced each way, and how many indications.
-pub const FIRST: u32 = 20;
+pub const FIRST: u32 = 40;
 
 /// The trace of a card's first frames: what the card noted, as lines for the console.
 pub struct Trace {
@@ -71,7 +72,7 @@ impl Trace {
     /// A frame written to the ring to the host under `transaction`, in send section
     /// `section`, not yet committed.
     pub(crate) fn sent(&mut self, transaction: u64, section: u32, frame: &[u8]) {
-        if self.out >= FIRST {
+        if self.out >= FIRST || !traced(frame) {
             return;
         }
         self.out += 1;
@@ -118,7 +119,7 @@ impl Trace {
 
     /// A frame read from the receive buffer.
     pub(crate) fn received(&mut self, frame: &[u8]) {
-        if self.into >= FIRST {
+        if self.into >= FIRST || !traced(frame) {
             return;
         }
         self.into += 1;
@@ -155,49 +156,131 @@ impl Trace {
     }
 }
 
-/// A frame as the trace says it: its destination, what it carries, and for DHCP its
-/// ports, its message type and its transaction ID.
+/// Whether the trace follows `frame`: it is one the boot's network path is made of, DHCP
+/// (UDP between ports 67 and 68), ARP, or TCP opening or refusing a connection (SYN or RST
+/// set).
+pub fn traced(frame: &[u8]) -> bool {
+    match ethertype(frame) {
+        Some(ARP) => true,
+        Some(IPV4) => match transport(&frame[14..]) {
+            Some((UDP, segment)) => ports(segment).is_some_and(|(from, to)| dhcp_ports(from, to)),
+            Some((TCP, segment)) => segment
+                .get(13)
+                .is_some_and(|flags| flags & (SYN | RST) != 0),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+const IPV4: u16 = 0x0800;
+const ARP: u16 = 0x0806;
+const UDP: u8 = 17;
+const TCP: u8 = 6;
+const FIN: u8 = 0x01;
+const SYN: u8 = 0x02;
+const RST: u8 = 0x04;
+const ACK: u8 = 0x10;
+
+/// The frame's EtherType, if it has an Ethernet header.
+fn ethertype(frame: &[u8]) -> Option<u16> {
+    frame.get(12..14).map(|t| u16::from_be_bytes([t[0], t[1]]))
+}
+
+/// An IPv4 packet's protocol, and what follows its header.
+fn transport(packet: &[u8]) -> Option<(u8, &[u8])> {
+    let header = usize::from(packet.first()? & 0x0f) * 4;
+    let protocol = *packet.get(9)?;
+    Some((protocol, packet.get(header..)?))
+}
+
+/// The source and destination ports of a UDP or TCP segment.
+fn ports(segment: &[u8]) -> Option<(u16, u16)> {
+    let p = segment.get(..4)?;
+    Some((
+        u16::from_be_bytes([p[0], p[1]]),
+        u16::from_be_bytes([p[2], p[3]]),
+    ))
+}
+
+fn dhcp_ports(from: u16, to: u16) -> bool {
+    matches!(from, 67 | 68) && matches!(to, 67 | 68)
+}
+
+fn ip(a: &[u8]) -> String {
+    format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3])
+}
+
+fn mac(m: &[u8]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        m[0], m[1], m[2], m[3], m[4], m[5]
+    )
+}
+
+/// A frame as the trace says it: its destination, what it carries, the addresses and ports
+/// of IPv4, TCP's flags, ARP's question or answer, and for DHCP its message type and its
+/// transaction ID.
 pub fn describe(frame: &[u8]) -> String {
-    let Some(header) = frame.get(..14) else {
+    let Some(kind) = ethertype(frame) else {
         return String::from("shorter than an Ethernet header");
     };
-    let d = &header[..6];
-    let to = format!(
-        "to {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        d[0], d[1], d[2], d[3], d[4], d[5]
-    );
-    let kind = u16::from_be_bytes([header[12], header[13]]);
     let what = match kind {
-        0x0800 => ipv4(&frame[14..]),
-        0x0806 => String::from("ARP"),
+        IPV4 => ipv4(&frame[14..]),
+        ARP => arp(&frame[14..]),
         0x86dd => String::from("IPv6"),
         other => format!("EtherType {other:#06x}"),
     };
-    format!("{to}, {what}")
+    format!("to {}, {what}", mac(&frame[..6]))
 }
 
-/// An IPv4 packet: UDP's ports, and DHCP's message when the ports are 67 and 68.
+/// An ARP packet for IPv4 over Ethernet: a request asks who has the target's address; a
+/// reply says the sender's address is at the sender's MAC.
+fn arp(packet: &[u8]) -> String {
+    let Some(p) = packet.get(..28) else {
+        return String::from("ARP, truncated");
+    };
+    match u16::from_be_bytes([p[6], p[7]]) {
+        1 => format!("ARP who has {} tell {}", ip(&p[24..28]), ip(&p[14..18])),
+        2 => format!("ARP {} is at {}", ip(&p[14..18]), mac(&p[8..14])),
+        op => format!("ARP operation {op}"),
+    }
+}
+
+/// An IPv4 packet: its addresses, UDP's ports and DHCP's message when the ports are 67 and
+/// 68, TCP's ports and flags.
 fn ipv4(packet: &[u8]) -> String {
-    let Some(&first) = packet.first() else {
+    let (Some(addresses), Some((protocol, segment))) = (packet.get(12..20), transport(packet))
+    else {
         return String::from("IPv4, truncated");
     };
-    let header = usize::from(first & 0x0f) * 4;
-    let Some(&protocol) = packet.get(9) else {
-        return String::from("IPv4, truncated");
+    let ips = format!("IPv4 {}>{}", ip(&addresses[..4]), ip(&addresses[4..]));
+    let name = match protocol {
+        UDP => "UDP",
+        TCP => "TCP",
+        other => return format!("{ips} protocol {other}"),
     };
-    if protocol != 17 {
-        return format!("IPv4 protocol {protocol}");
-    }
-    let Some(udp) = packet.get(header..).filter(|udp| udp.len() >= 8) else {
-        return String::from("IPv4 UDP, truncated");
+    let Some((from, to)) = ports(segment) else {
+        return format!("{ips} {name}, truncated");
     };
-    let from = u16::from_be_bytes([udp[0], udp[1]]);
-    let to = u16::from_be_bytes([udp[2], udp[3]]);
-    let ports = format!("IPv4 UDP {from}>{to}");
-    if !matches!(from, 67 | 68) || !matches!(to, 67 | 68) {
-        return ports;
+    let said = format!("{ips} {name} {from}>{to}");
+    match protocol {
+        UDP if dhcp_ports(from, to) => {
+            format!("{said}, DHCP {}", dhcp(segment.get(8..).unwrap_or(&[])))
+        }
+        TCP => match segment.get(13) {
+            Some(&flags) => {
+                let names: Vec<&str> = [(SYN, "SYN"), (ACK, "ACK"), (RST, "RST"), (FIN, "FIN")]
+                    .into_iter()
+                    .filter(|(bit, _)| flags & bit != 0)
+                    .map(|(_, name)| name)
+                    .collect();
+                format!("{said} [{}]", names.join(" "))
+            }
+            None => format!("{said}, truncated"),
+        },
+        _ => said,
     }
-    format!("{ports}, DHCP {}", dhcp(&udp[8..]))
 }
 
 /// A DHCP message (RFC 2131): its type, from option 53, and its transaction ID.

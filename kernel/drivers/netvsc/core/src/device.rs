@@ -219,16 +219,59 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
                 section: card.send.size,
             });
         }
+        // A traced card asks the host whether the medium is connected before the filter is
+        // set, as Linux's hv_netvsc does at probe, and after it (work item 1.11c).
+        #[cfg(feature = "trace-first-frames")]
+        let traced = card.wire.trace.is_some();
+        #[cfg(feature = "trace-first-frames")]
+        if traced {
+            card.say_media("before the packet filter", say)?;
+        }
         say(format_args!("packet filter {FILTER:#x} sent"));
         card.filter()?;
         card.wire.flush()?;
         table(card.take_table(), say);
         say(format_args!("packet filter set"));
+        #[cfg(feature = "trace-first-frames")]
+        if traced {
+            card.say_media("after the packet filter", say)?;
+        }
         say(format_args!(
             "link {}",
             if card.link { "up" } else { "down" }
         ));
         Ok(card)
+    }
+
+    /// Asks the host for OID_GEN_MEDIA_CONNECT_STATUS and says its answer, `when`: 0 is
+    /// connected, 1 disconnected (Microsoft, OID_GEN_MEDIA_CONNECT_STATUS; Linux's
+    /// `rndis_set_link_state` takes anything but 0 for down). A refusal, or an answer that is
+    /// not four bytes, is said and the start goes on; only a channel, ring or deadline error
+    /// ends it. A diagnosis build's only (work item 1.11c).
+    #[cfg(feature = "trace-first-frames")]
+    fn say_media(
+        &mut self,
+        when: &str,
+        say: &mut dyn FnMut(fmt::Arguments<'_>),
+    ) -> Result<(), NetvscError> {
+        let step = "the query of its media connect status";
+        let answer = match self.query(Oid::OID_GEN_MEDIA_CONNECT_STATUS, step) {
+            Ok(at) => match <[u8; 4]>::try_from(&self.frame[at.clone()]) {
+                Ok(bytes) => match u32::from_le_bytes(bytes) {
+                    0 => String::from("0, connected"),
+                    1 => String::from("1, disconnected"),
+                    other => format!("{other}, which NDIS does not name"),
+                },
+                Err(_) => format!("an answer of {} bytes", at.len()),
+            },
+            Err(e @ (NetvscError::Refused { .. } | NetvscError::Malformed(_))) => {
+                format!("not answered: {e}")
+            }
+            Err(e) => return Err(e),
+        };
+        table(self.take_table(), say);
+        say(format_args!("media connect status {when}: {answer}"));
+        Ok(())
     }
 
     /// The card's address.
