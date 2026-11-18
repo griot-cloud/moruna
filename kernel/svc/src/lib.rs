@@ -44,7 +44,7 @@ pub use server::{
     Watch, WatchCapacity, WatchPermit,
 };
 #[cfg(not(any(target_os = "none", feature = "native")))]
-pub use sim::{Account, Mapping, Memory};
+pub use sim::{Account, Mapping, Memory, Usage};
 pub use wire::{Decoder, Encoder, Wire, WireError};
 
 /// What a program on the kernel needs besides the SDK: its entry, its console, its

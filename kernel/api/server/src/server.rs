@@ -22,7 +22,10 @@ pub const CONNECTION_LIMIT: usize = 64;
 /// The most connections open at once, those being refused and those still in their handshake
 /// included. A connection accepted beyond them is closed at once, with no answer.
 pub const OPEN_LIMIT: usize = 80;
-/// How long a connection may move no bytes before it is closed, in milliseconds.
+/// How long a connection may wait on its client, moving no bytes, before it is closed, in
+/// milliseconds: for a request, for the rest of one, or for the client to take an answer. A
+/// connection whose request is being answered, with nothing for the client to take, is not idle
+/// (system design 2's Limits).
 pub const IDLE_LIMIT_MS: u64 = 60_000;
 /// How long a connection's TLS handshake may take before the connection is closed, in
 /// milliseconds.
@@ -151,6 +154,12 @@ impl<T: Transport> Connection<T> {
         }
         if self.tls.handshaking() && now_ms.saturating_sub(self.accepted) >= HANDSHAKE_LIMIT_MS {
             return Keep::Close;
+        }
+        // Idle is the client's (system design 2's Limits): while its request is being answered
+        // and nothing waits for it to take, the server is the one to move, so the clock starts
+        // again from when it has. The request's own bounds end it (a fetch's, a launch's).
+        if self.session.answering() && self.tls.pending().is_empty() {
+            self.active = now_ms;
         }
         if now_ms.saturating_sub(self.active) >= IDLE_LIMIT_MS {
             return Keep::Close;

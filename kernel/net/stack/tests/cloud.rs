@@ -169,6 +169,55 @@ fn no_lease_is_due_thirty_seconds_after_the_server_s_start() {
     assert_eq!(bound(&stack), 0);
 }
 
+/// A wire that loses everything the card sends until a lease's first DISCOVER has gone, then
+/// is `then`: a cloud's network still being set up at boot.
+fn losing_the_first_discover(mut then: Wire) -> Wire {
+    let mut lost = false;
+    Box::new(move |stack: &mut Stack, rng: &mut Rng| {
+        if !lost && !stack.card_mut(0).port.tx.is_empty() {
+            stack.card_mut(0).port.tx.clear();
+            lost = true;
+            return;
+        }
+        then(stack, rng)
+    })
+}
+
+/// RFC 2131 4.1: a DISCOVER with no answer is sent again after 4 s, not smoltcp's 10 s, so one
+/// answer lost at boot costs the node 4 s (found on Azure, run 8: the lease came 10 s late). The
+/// lease's line says when it came, and no lease is said lost before one was held.
+#[test]
+fn a_lost_first_discover_is_sent_again_after_four_seconds() {
+    let started = 2 * SECOND;
+    let mut stack = cloud_stack(started);
+    let mut wire = losing_the_first_discover(dhcp_server(true));
+    let mut t = started;
+    let leased = drive(&mut stack, &mut wire, &mut t, 30 * SECOND, |s| {
+        bound(s) == 1
+    });
+    assert!(leased, "no lease in 30 s: {:?}", stack.notes);
+    let after = t - started;
+    assert!(
+        (4 * SECOND..5 * SECOND).contains(&after),
+        "the lease came {} ms after the start",
+        after / MS
+    );
+    let line = stack
+        .notes
+        .iter()
+        .find(|n| n.contains("DHCP bound"))
+        .unwrap();
+    assert!(
+        line.ends_with(&format!(", {} ms after the server started", after / MS)),
+        "{line}"
+    );
+    assert!(
+        !stack.notes.iter().any(|n| n.contains("lease lost")),
+        "{:?}",
+        stack.notes
+    );
+}
+
 #[test]
 fn a_lease_with_no_router_says_gateway_none() {
     let mut stack = cloud_stack(0);
@@ -182,7 +231,7 @@ fn a_lease_with_no_router_says_gateway_none() {
         stack
             .notes
             .iter()
-            .any(|n| n == "wan: DHCP bound 10.0.2.15/24, router none, dns 10.0.2.3"),
+            .any(|n| n.starts_with("wan: DHCP bound 10.0.2.15/24, router none, dns 10.0.2.3, ")),
         "{:?}",
         stack.notes
     );

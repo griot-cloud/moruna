@@ -70,9 +70,9 @@ fn query(protocol: ProtocolId, reply: Reply) -> (Result<Vec<[u8; 32]>, String>, 
     (result, requests.load(Ordering::SeqCst))
 }
 #[test]
-fn shipping_query_accepts_three_zero_minor_zero_and_ordered_seals() {
+fn shipping_query_accepts_four_zero_and_ordered_seals() {
     let (result, requests) = query(
-        ProtocolId::new("moruna.linux", 3, 0),
+        ProtocolId::new("moruna.linux", 4, 0),
         Reply::Seals(vec![Bytes(vec![7; 32]), Bytes(vec![9; 32])]),
     );
     assert_eq!(result.unwrap(), vec![[7; 32], [9; 32]]);
@@ -80,13 +80,13 @@ fn shipping_query_accepts_three_zero_minor_zero_and_ordered_seals() {
 }
 #[test]
 fn shipping_query_refuses_no_image_instead_of_returning_empty_seals() {
-    let (result, requests) = query(ProtocolId::new("moruna.linux", 3, 0), Reply::NoImage);
+    let (result, requests) = query(ProtocolId::new("moruna.linux", 4, 0), Reply::NoImage);
     assert!(result.unwrap_err().contains("NoImage"));
     assert_eq!(requests, 1);
 }
 #[test]
 fn shipping_query_refuses_a_corrupt_layer_response() {
-    let (result, requests) = query(ProtocolId::new("moruna.linux", 3, 0), Reply::CorruptWire);
+    let (result, requests) = query(ProtocolId::new("moruna.linux", 4, 0), Reply::CorruptWire);
     let error = result.unwrap_err();
     assert!(error.starts_with("the personality's layers:"), "{error}");
     assert_eq!(requests, 1);
@@ -95,7 +95,7 @@ fn shipping_query_refuses_a_corrupt_layer_response() {
 fn shipping_query_refuses_both_short_and_oversized_seals() {
     for length in [31, 33] {
         let (result, requests) = query(
-            ProtocolId::new("moruna.linux", 3, 0),
+            ProtocolId::new("moruna.linux", 4, 0),
             Reply::Seals(vec![Bytes(vec![7; 32]), Bytes(vec![9; length])]),
         );
         let error = result.unwrap_err();

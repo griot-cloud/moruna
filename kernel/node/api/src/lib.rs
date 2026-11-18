@@ -246,11 +246,12 @@ pub fn ready(platform: &Channel) -> Result<(), Error> {
 }
 
 /// The engine host over `admission`, a connection to `node-admission`, waited for as long as
-/// it takes to answer: the node's job bound is its first question.
+/// it takes to answer: its first questions, once the hand-over has come, are the function
+/// cache's size and the node's job bound ([`engine::Host::set_up`]).
 pub fn jobs(admission: Channel) -> Result<engine::Host, Error> {
     let client = node_protocol::admission::Client::connect(admission, DEADLINE_INFINITE)
         .map_err(|error| Error::Admission("hello", error))?;
-    engine::Host::new(client).map_err(|error| Error::Admission("the job bound", error))
+    Ok(engine::Host::new(client))
 }
 
 /// The whole process, on its connection to the network server and its link to
@@ -266,7 +267,14 @@ pub fn run(
     say: &mut dyn FnMut(&str),
 ) -> Result<Infallible, Error> {
     let handover = handover(platform)?;
-    let bound = jobs.as_ref().map_or(0, engine::Host::bound);
+    // The function cache first, then the job bound, which counts it (item 3.6).
+    let mut jobs = jobs;
+    let bound = match jobs.as_mut() {
+        Some(host) => host
+            .set_up(handover.config.functions.cache_bytes)
+            .map_err(|error| Error::Admission("the function cache and the job bound", error))?,
+        None => 0,
+    };
     let config = node::config(&handover, cores, bound, now())?;
     say(&format!(
         "moruna: tls sha256={}",
@@ -314,6 +322,10 @@ pub fn run(
         let engines = match &host {
             Some(host) => {
                 host.borrow_mut().tend();
+                // A job's launch is looked for again soon (item 3.6).
+                if let Some(at) = host.borrow().look_at() {
+                    deadline = deadline.min(at);
+                }
                 host.borrow().waits()
             }
             None => Vec::new(),

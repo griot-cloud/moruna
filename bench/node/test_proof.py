@@ -1,6 +1,7 @@
-"""proof.py's tests (work item 3.8, phase 1): the whole proof against a fake node, through the
-same calls a node answers (functions, jobs, events over SSE and MCP, reports), its outputs the
-gate's fixtures written where the sink volume's files are read back; a hash that differs, a job
+"""proof.py's tests (work item 3.8): the whole proof against a fake node, through the same
+calls a node answers (functions, jobs, events over SSE and MCP, reports), its outputs the gate's
+fixtures written as the sink volume's only layer and read back by a stand-in for `moruna-engine
+volume unpack`; a hash that differs, a job
 that fails, a lost connection resumed after its last record, a job past its time, a busy node;
 and a real TLS stream that drops. Nothing here reaches a node or a cloud.
 
@@ -43,13 +44,15 @@ def record_lines(rid, data):
 
 class FakeNode:
     """A node's API as proof.py calls it. A job "runs" at once: its output, `outputs[job]`, is written
-    where the sink volume's files are read back (`out_root/proof/RUN/`), and its stream holds five
-    records, its report and its exit."""
+    to the sink volume, `out_root` (a directory standing for its image), as its only layer: the
+    last run's output is gone (`out_root/proof/RUN/`). Its stream holds five records, its report
+    and its exit. `job_memory` is what GET /v1/node answers as job_memory_bytes, when given."""
 
     def __init__(self, out_root, outputs, fail=(), drop_after=None, busy=0, hang=(), listed=None, page=2,
-                 mcp_errors=0):
+                 mcp_errors=0, job_memory=None):
         self.out_root, self.outputs, self.fail, self.drop_after = out_root, outputs, set(fail), drop_after
         self.busy, self.hang, self.listed, self.page, self.mcp_errors = busy, set(hang), listed or {}, page, mcp_errors
+        self.job_memory = job_memory
         self.calls, self.streams, self.jobs, self.registered, self.cancelled = [], [], {}, {}, []
 
     # The transport: (method, path, body, token) -> (status, bytes).
@@ -57,7 +60,10 @@ class FakeNode:
         self.calls.append((method, path, body, token))
         ok = lambda obj, status=200: (status, json.dumps(obj).encode())  # noqa: E731
         if path == "/v1/node":
-            return ok({"memory_bytes": 4 * GiB, "instance": "i-1", "cloud": "none", "version": "0.7.0"})
+            facts = {"memory_bytes": 4 * GiB, "instance": "i-1", "cloud": "none", "version": "0.7.0"}
+            if self.job_memory:
+                facts["job_memory_bytes"] = self.job_memory
+            return ok(facts)
         if path == "/v1/functions" and method == "GET":
             return ok({"functions": [{"name": n, "sha256": s} for n, s in self.listed.items()]})
         if path == "/v1/functions":
@@ -86,6 +92,8 @@ class FakeNode:
         job = run.split("-")[0]
         jid = f"j{len(self.jobs) + 1}"
         failed = run in self.fail
+        shutil.rmtree(self.out_root, ignore_errors=True)
+        os.makedirs(self.out_root)
         if not failed:
             out = os.path.join(self.out_root, "proof", run)
             os.makedirs(out, exist_ok=True)
@@ -150,11 +158,33 @@ def functions(root, jobs=("score", "enrich")):
         (root / f"gate-{job}").write_bytes(f"a static program for {job}".encode())
 
 
+UNPACK = f"""#!{sys.executable}
+# A stand-in for `moruna-engine volume unpack IMAGE DIR`: IMAGE is a directory standing for the
+# volume's layer; DIR must not be there yet.
+import os, shutil, sys
+verb, sub, image, dest = sys.argv[1:5]
+assert (verb, sub) == ("volume", "unpack")
+if os.path.exists(dest):
+    sys.exit(f"{{dest}} exists")
+if not os.path.isdir(image):
+    sys.exit(f"no layer at the start of {{image}}")
+shutil.copytree(image, dest)
+"""
+
+
+def unpacker(root):
+    path = root / "unpack"
+    path.write_text(UNPACK)
+    path.chmod(0o755)
+    return str(path)
+
+
 def args(tmp_path, *extra, jobs="score,enrich"):
     return ["--url", "https://node:443", "--pin", "ab" * 32, "--token", "T", "--function-key", "/k.pem",
             "--functions", str(tmp_path / "fn"), "--function-base", "https://code.example/fn",
             "--data", "volume", "--source-serial", "nyc-in", "--sink-serial", "nyc-out",
-            "--volume-out", str(tmp_path / "vol"), "--jobs", jobs, "--periods", "2024-01",
+            "--volume-image", str(tmp_path / "vol"), "--unpacker", str(tmp_path / "unpack"),
+            "--jobs", jobs, "--periods", "2024-01",
             "--references", str(tmp_path / "ref"), "--results", str(tmp_path / "res"),
             "--work", str(tmp_path / "work")] + list(extra)
 
@@ -165,6 +195,7 @@ def world(tmp_path):
         (tmp_path / d).mkdir()
     functions(tmp_path / "fn")
     references(tmp_path / "ref")
+    unpacker(tmp_path)
     return tmp_path
 
 
@@ -187,13 +218,13 @@ def test_the_runs_and_their_documents():
     assert proof.files("2024-01") == ["yellow_tripdata_2024-01.parquet"]
     assert len(proof.files("2024")) == 12 and proof.files("2024")[-1] == "yellow_tripdata_2024-12.parquet"
     run = {"job": "occupancy", "period": "2024", "id": "occupancy-2024"}
-    doc, secrets = proof.document(run, proof.Volumes("in-1", "out-1", "/x"), "https://f", 4, 3 * GiB)
+    doc, secrets = proof.document(run, proof.Volumes("in-1", "out-1", "/x"), 4, 3 * GiB)
     assert doc["source"]["url"][0] == "disk://in-1/yellow_tripdata_2024-01.parquet" and len(doc["source"]["url"]) == 12
     assert doc["sink"]["url"] == "disk://out-1/proof/occupancy-2024/" and secrets == {}
-    assert doc["kernels"][0]["image"]["location"] == "https://f/gate-occupancy"
+    assert doc["kernels"] == [{"kind": "function", "function": "gate-occupancy"}]
     assert doc["budget"] == {"memory_bytes": 3 * GiB, "cpu": 4} and "object_store" not in doc
     blob = proof.Blob(store.Store("acct", "KEY", "data", "http://127.0.0.1:10000/acct"), "nyc/", "proof/x/")
-    doc, secrets = proof.document(run, blob, "https://f", 4, 3 * GiB)
+    doc, secrets = proof.document(run, blob, 4, 3 * GiB)
     assert doc["source"]["url"][1] == "az://data/nyc/yellow_tripdata_2024-02.parquet"
     assert doc["sink"]["url"] == "az://data/proof/x/occupancy-2024/"
     assert doc["object_store"] == {"azure": {"account": "acct", "container": "data", "allow_http": True,
@@ -236,9 +267,10 @@ def test_a_whole_proof_passes(world):
     digest = hashlib.sha256(b"a static program for score").hexdigest()
     assert node.registered["gate-score"] == {"name": "gate-score", "address": "https://code.example/fn/gate-score",
                                              "sha256": digest, "signature": f"SIG-{digest[:8]}"}
-    # The budget is the most the node takes: its memory less 768 MiB.
+    # The budget is the most the node takes: with no job_memory_bytes, its memory less 768 MiB.
     doc = node.jobs["j1"]["doc"]["v1"]
     assert doc["budget"]["memory_bytes"] == 4 * GiB - 768 * (1 << 20)
+    assert doc["kernels"] == [{"kind": "function", "function": "gate-score"}]
     assert doc["source"]["url"] == ["disk://nyc-in/yellow_tripdata_2024-01.parquet"]
     assert node.streams == ["/v1/jobs/j1/events?from=0", "/v1/jobs/j2/events?from=0"]
     assert "bit for bit" in said[-1] and not os.listdir(world / "work")
@@ -246,9 +278,12 @@ def test_a_whole_proof_passes(world):
 
 def test_a_function_the_node_lists_already_is_not_registered_again(world):
     digest = hashlib.sha256(b"a static program for score").hexdigest()
-    node = FakeNode(str(world / "vol"), {"score": expected("score")}, listed={"gate-score": digest})
+    node = FakeNode(str(world / "vol"), {"score": expected("score")}, listed={"gate-score": digest},
+                    job_memory=3 * GiB)
     rc, said = proof_run(world, node, jobs="score")
     assert rc == 0 and node.registered == {} and any("registered already" in s for s in said)
+    # The budget is the node's job_memory_bytes when it answers one.
+    assert node.jobs["j1"]["doc"]["v1"]["budget"]["memory_bytes"] == 3 * GiB
 
 
 def test_a_hash_that_differs_fails_the_proof(world):
@@ -378,8 +413,8 @@ def test_server_sent_events_are_read_with_their_numbers():
     assert f.events() == [{"n": 1}, {"n": 2}] and f.last == 2 and f.report == {"r": 1} and f.exit is None
 
 
-def test_comparisons_that_cannot_be_made(tmp_path):
-    ref = {"rows": 3, "hash_exact": "a", "hash_all": "b"}
+def test_comparisons_that_cannot_be_made(tmp_path, monkeypatch):
+    ref = {"rows": 3, "hash_exact": "a", "hash_all": "b", "tolerant": ["predicted_tip"]}
     assert proof.compare("score", {"error": "x"}, ref, "/r")["verdict"] == "no canonical form: x"
     c = proof.compare("score", {"rows": 3, "hash_exact": "a", "hash_all": "c", "by": "gate-canon"}, ref, "/r")
     assert not c["ok"] and c["verdict"].startswith("not compared: no tolerant rows")
@@ -388,12 +423,49 @@ def test_comparisons_that_cannot_be_made(tmp_path):
     assert proof.canonical("score", str(tmp_path))["error"] == "no output files"
     bad = proof.canonical("score", str(tmp_path), gate_canon=sys.executable)
     assert bad["error"]
+    # A reference with no tolerant columns: hashes that differ differ.
+    c = proof.compare("audit", {"rows": 3, "hash_exact": "a", "hash_all": "c"}, dict(ref, tolerant=[]), "/r")
+    assert not c["ok"] and c["verdict"] == "DIFFERS"
+    # Where there is no pyarrow, canon.py hashes nothing and compares no tolerant rows.
+    monkeypatch.setattr(proof, "canon", None)
+    assert proof.canonical("score", str(tmp_path))["error"].startswith(proof.NO_CANON)
+    c = proof.compare("score", {"rows": 3, "hash_exact": "a", "hash_all": "c", "tolerant_rows": []},
+                      dict(ref, tolerant_rows=[]), "/r")
+    assert not c["ok"] and c["verdict"] == f"not compared: the tolerant values differ and {proof.NO_CANON}"
+
+
+def test_proof_loads_where_there_is_no_pyarrow(monkeypatch):
+    """Where proof.py runs beside a node under QEMU there may be no pyarrow: it loads, and
+    gate-canon hashes."""
+    import importlib
+    monkeypatch.setitem(sys.modules, "canon", None)
+    try:
+        importlib.reload(proof)
+        assert proof.canon is None
+    finally:
+        monkeypatch.undo()
+        importlib.reload(proof)
+    assert proof.canon is canon
 
 
 def test_the_volume_fetch_and_the_blob_fetch(tmp_path):
-    v = proof.Volumes("in", "out", str(tmp_path))
-    with pytest.raises(FileNotFoundError):
-        v.fetch({"id": "score-2024-01"}, str(tmp_path / "d"))
+    image = tmp_path / "image"
+    v = proof.Volumes("in", "out", str(image), unpacker(tmp_path))
+    run = {"id": "score-2024-01"}
+    # No layer on the volume: the unpacker's refusal, said.
+    with pytest.raises(RuntimeError, match="volume unpack: no layer"):
+        v.fetch(run, str(tmp_path / "d"))
+    # A layer without the run's output: what it holds, said.
+    (image / "proof" / "audit-2024-01").mkdir(parents=True)
+    (image / "proof" / "audit-2024-01" / "p.parquet").write_bytes(b"x")
+    with pytest.raises(FileNotFoundError, match="audit-2024-01/p.parquet"):
+        v.fetch(run, str(tmp_path / "d"))
+    # The run's output: its files, and nothing else of the volume's left behind.
+    (image / "proof" / "score-2024-01").mkdir()
+    (image / "proof" / "score-2024-01" / "part-0.parquet").write_bytes(b"rows")
+    (tmp_path / "d").mkdir()
+    v.fetch(run, str(tmp_path / "d"))
+    assert os.listdir(tmp_path / "d") == ["part-0.parquet"] and not (tmp_path / "d.volume").exists()
 
     class Store:
         def download(self, prefix, dest):

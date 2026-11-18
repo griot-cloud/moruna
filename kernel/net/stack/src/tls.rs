@@ -464,9 +464,10 @@ impl<C: Connection> State<C> {
         max: usize,
         write: impl FnOnce(&[u8]) -> Result<(), E>,
     ) -> Option<Result<Result<u32, E>, Error>> {
-        if let Some(error) = self.failure {
-            return Some(Err(error));
-        }
+        // Plaintext already decrypted came in records each authenticated on its own: it is
+        // delivered whole, and a failure behind it (a FIN with no close_notify, a bad record) is
+        // reported on the read past its last byte. An HTTPS server that omits close_notify after
+        // a Content-Length body is read to the body's end.
         if !self.plain_in.is_empty() {
             let count = max.min(self.plain_in.len());
             if let Err(error) = write(&self.plain_in[..count]) {
@@ -477,6 +478,9 @@ impl<C: Connection> State<C> {
             }
             self.work = true;
             return Some(Ok(Ok(count as u32)));
+        }
+        if let Some(error) = self.failure {
+            return Some(Err(error));
         }
         self.peer_closed.then(|| Ok(Ok(0)))
     }

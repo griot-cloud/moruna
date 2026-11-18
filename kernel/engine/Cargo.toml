@@ -11,6 +11,8 @@ moruna-svc.workspace = true
 linux-protocol = { path = "../linux/protocol", version = "=0.1.0" }
 devices-protocol = { path = "../devices/protocol", version = "=0.1.0" }
 moruna-linux = { path = "../linux/core", version = "=0.1.0" }
+# The functions a job uses, as node-admission gives them (system design 3E, item 3.6).
+node-protocol = { path = "../node/protocol", version = "=0.1.0" }
 
 moruna-storage-service = { path = "../storage", version = "=0.1.0" }
 moruna-storage-format = { path = "../../crates/moruna-storage-format", version = "=0.6.6", default-features = false, features = ["pure"] }
