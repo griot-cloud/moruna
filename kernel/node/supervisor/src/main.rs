@@ -238,6 +238,17 @@ fn prepare(console: &Console) -> Result<Prepared, String> {
             .handles
             .push((Some(child.0), "control".into()));
         control = Some(parent);
+        // The node's memory, as the platform bootstrap carries it (item 1.4): the machine
+        // account's limit, which a job's budget is measured against (system design 3A, item
+        // 3.2). This end closes here; the message stays queued for admission.
+        let (sender, receiver) =
+            Channel::create().map_err(|e| format!("memory channel: {}", e.name()))?;
+        sender
+            .write_with(&Bootstrap::platform_message(usage.limit), &mut [])
+            .map_err(|e| format!("memory transfer: {}", e.name()))?;
+        children[index]
+            .handles
+            .push((Some(receiver.0), "supervisor".into()));
     }
     // The service at each guardian's place, so that a closed one names its service.
     let owners = config

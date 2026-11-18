@@ -180,6 +180,8 @@ impl Config {
         if let Some(service) = &admission {
             destinations.push((service, "guardian"));
             destinations.push((service, "control"));
+            // The node's memory, as the platform bootstrap carries it (item 3.2).
+            destinations.push((service, "supervisor"));
         }
         for (_, service) in &bootstraps {
             destinations.push((service, "supervisor"));
@@ -926,6 +928,19 @@ mod boot_tests {
         // Its slot is `supervisor`, which no grant or link may also fill.
         let aliased = b"moruna-node 1\nservice platform image.platform 16777216\nbootstrap platform platform\ngrant platform supervisor spare\n";
         assert_eq!(Config::parse(aliased, 1 << 30), Err(ConfigError::Duplicate));
+    }
+    #[test]
+    fn admission_is_told_the_nodes_memory_on_a_slot_of_its_own() {
+        let config = b"moruna-node 1\nservice admission image.admission 16777216\nbootstrap admission admission\n";
+        assert!(Config::parse(config, 1 << 30).is_ok());
+        // `supervisor` is admission's: no grant, link or bootstrap may also fill it.
+        let granted = b"moruna-node 1\nservice admission image.admission 16777216\nbootstrap admission admission\ngrant admission supervisor spare\n";
+        assert_eq!(Config::parse(granted, 1 << 30), Err(ConfigError::Duplicate));
+        let bootstrapped = b"moruna-node 1\nservice admission image.admission 16777216\nbootstrap admission admission\nbootstrap platform admission\n";
+        assert_eq!(
+            Config::parse(bootstrapped, 1 << 30),
+            Err(ConfigError::Duplicate)
+        );
     }
     #[test]
     fn bootstrap_and_grants_cannot_alias_child_slots() {
