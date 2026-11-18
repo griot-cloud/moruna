@@ -38,7 +38,11 @@ impl Fetch for Served {
         match self.objects.get(address) {
             Some(bytes) if bytes.len() as u64 > limit => Err(FetchError::TooLarge),
             Some(bytes) => Ok(bytes.clone()),
-            None => Err(FetchError::Failed(format!("{address}: 404"))),
+            // As the node's fetch names it (https.rs): never its query.
+            None => Err(FetchError::Failed(format!(
+                "{}: 404",
+                moruna_api::address_shown(address)
+            ))),
         }
     }
 }
@@ -313,6 +317,29 @@ fn the_engine_is_given_each_image_under_its_slot_and_the_index_of_them() {
         .collect();
     let copies: Vec<Rc<MemoryImage>> = many.iter().map(|_| images[0].clone()).collect();
     assert!(handover(&many, &copies).unwrap_err().contains("TooMany"));
+}
+
+#[test]
+fn a_sas_address_is_fetched_whole_and_shown_without_its_query() {
+    let address = "https://acct.blob.core.windows.net/functions/gate-score?sp=r&sig=FAKEfake%3D";
+    let score = registered("gate-score", address, SCORE);
+    // The fetch is given the whole address; the job's refusal names it without its query.
+    let mut served = Served::default();
+    let refused = Cache::new(1 << 20).image(&score, &mut served).unwrap_err();
+    assert_eq!(served.asked, [(address.to_string(), 1 << 20)]);
+    assert_eq!(
+        refused.to_string(),
+        "the function `gate-score`'s image could not be fetched: \
+         https://acct.blob.core.windows.net/functions/gate-score?…: 404"
+    );
+    // A registration's Debug shows it the same.
+    let debug = format!("{score:?}");
+    assert!(debug.contains("functions/gate-score?…"), "{debug}");
+    assert!(
+        !debug.contains("sig=") && !debug.contains("FAKEfake"),
+        "{debug}"
+    );
+    assert_eq!(score.address, address, "kept whole to fetch");
 }
 
 #[test]

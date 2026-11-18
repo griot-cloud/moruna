@@ -7,7 +7,10 @@
 //!   verify under one of node config's `functions.keys` ([`FunctionKey`]); then the entry is kept
 //!   in `api`'s memory, at most [`FUNCTIONS_LIMIT`] of them. Nothing is fetched. Registering a
 //!   name again replaces its entry.
-//! - **The list** (`GET /v1/functions`, observe): every entry, by name.
+//! - **The list** (`GET /v1/functions`, observe): every entry, by name. An address's query is a
+//!   credential (a SAS, a pre-signed URL's signature): the list and the registration's answer
+//!   show each address as [`moruna_api::address_shown`] does, `?…` in its place, and only
+//!   `node-admission`'s fetch is given it whole.
 //! - **A job names a function** by its registered name: in version 1 a `kernels` entry
 //!   `{"kind": "function", "function": "<name>"}`, in version 2 a task of kind `function` whose
 //!   settings name it. The engine's check answers those names only (its `functions`; the
@@ -108,11 +111,13 @@ impl Registry {
         }
     }
 
-    /// `POST /v1/functions` with `body` at `now`: the entry, answered `201`, or why not.
+    /// `POST /v1/functions` with `body` at `now`: the entry, answered `201` with its address as
+    /// the node shows it ([`moruna_api::address_shown`]), or why not. The entry keeps the whole
+    /// address, which only `node-admission`'s fetch is given ([`Registry::registered`]).
     pub(crate) fn register(&mut self, body: &[u8], now: u64) -> Answer {
         match self.registration(body, now) {
             Ok(function) => {
-                let mut answer = Answer::ok(serde_json::to_vec(&function));
+                let mut answer = Answer::ok(serde_json::to_vec(&function.shown()));
                 if answer.status == 200 {
                     answer.status = 201;
                 }
@@ -185,10 +190,11 @@ impl Registry {
         })
     }
 
-    /// `GET /v1/functions`.
+    /// `GET /v1/functions`: each entry with its address as the node shows it
+    /// ([`moruna_api::address_shown`]), never its query (3E).
     pub(crate) fn list(&self) -> Functions {
         Functions {
-            functions: self.entries.values().cloned().collect(),
+            functions: self.entries.values().map(Function::shown).collect(),
         }
     }
 

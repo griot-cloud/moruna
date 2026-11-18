@@ -513,3 +513,100 @@ fn a_function_and_its_registration_round_trip_3e() {
     let none: Functions = round_trip(r#"{"functions":[]}"#);
     assert!(none.functions.is_empty());
 }
+
+/// A container SAS as Azure writes one, every value fake: its `sig` is the credential.
+const SAS: &str = "sv=2022-11-02&sr=c&sp=r&se=2026-11-18T18%3A00Z&spr=https&sig=FAKEfake%2Bfake%3D";
+
+#[test]
+fn an_address_is_shown_without_its_query_3e() {
+    let sas = format!("https://acct.blob.core.windows.net/functions/gate-score?{SAS}");
+    assert_eq!(
+        address_shown(&sas),
+        "https://acct.blob.core.windows.net/functions/gate-score?…"
+    );
+    // An address with no query is shown as it is.
+    for plain in [
+        "https://images.example.com/gate-score",
+        "https://images.example.com:443/a/b.wasm",
+        "https://images.example.com",
+        "https://images.example.com/",
+    ] {
+        assert_eq!(address_shown(plain), plain);
+    }
+    for (address, shown) in [
+        // A query with no path, an empty one, and one with a fragment after it.
+        (
+            "https://store.example.test?sv=1&sig=x",
+            "https://store.example.test?…",
+        ),
+        (
+            "https://store.example.test/a?",
+            "https://store.example.test/a?…",
+        ),
+        (
+            "https://store.example.test/a?sig=x#part",
+            "https://store.example.test/a?…",
+        ),
+        // A fragment is never sent, and is not shown; a `?` in it is not a query.
+        (
+            "https://store.example.test/a#part?x",
+            "https://store.example.test/a",
+        ),
+        // Credentials before the host are neither scheme, host nor path.
+        (
+            "https://user:pass@store.example.test/a?sig=x",
+            "https://store.example.test/a?…",
+        ),
+        (
+            "https://user@store.example.test/a",
+            "https://store.example.test/a",
+        ),
+        // Not a URL: its query, if it has one, still goes.
+        ("store.example.test/a?sig=x", "store.example.test/a?…"),
+        ("", ""),
+    ] {
+        assert_eq!(address_shown(address), shown, "{address}");
+    }
+}
+
+#[test]
+fn a_function_is_shown_and_debugged_without_its_query_3e() {
+    let function = Function {
+        name: "gate-score".to_string(),
+        address: format!("https://acct.blob.core.windows.net/functions/gate-score?{SAS}"),
+        sha256: "ab".to_string(),
+        key: "0123456789abcdef".to_string(),
+        registered: 1794931200,
+    };
+    let shown = function.shown();
+    assert_eq!(
+        shown.address,
+        "https://acct.blob.core.windows.net/functions/gate-score?…"
+    );
+    assert_eq!(
+        Function {
+            address: function.address.clone(),
+            ..shown
+        },
+        function,
+        "only the address changes"
+    );
+    let debug = format!("{function:?}");
+    assert!(debug.contains("functions/gate-score?…"), "{debug}");
+    assert!(
+        !debug.contains("sig=") && !debug.contains("FAKEfake"),
+        "{debug}"
+    );
+    let registration = FunctionRegistration {
+        name: "gate-score".to_string(),
+        address: function.address.clone(),
+        sha256: "ab".to_string(),
+        signature: "c2ln".to_string(),
+    };
+    let debug = format!("{registration:?}");
+    assert!(
+        debug.contains("functions/gate-score?…") && debug.contains("c2ln"),
+        "{debug}"
+    );
+    assert!(!debug.contains("FAKEfake"), "{debug}");
+}

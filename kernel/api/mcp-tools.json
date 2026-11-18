@@ -962,7 +962,7 @@
         "description": "A registered function, as `GET /v1/functions` lists it.",
         "properties": {
           "address": {
-            "description": "Where its image is fetched from.",
+            "description": "Where its image is fetched from, as the node shows it: its scheme, host and path, with\nany query (a SAS or a pre-signed URL's signature) replaced by `?…`.",
             "type": "string"
           },
           "key": {
@@ -996,7 +996,7 @@
       }
     },
     {
-      "description": "Every registered function: its name, address, SHA-256, the key that signed it and when it was registered.",
+      "description": "Every registered function: its name, its address with any query shown as ?…, SHA-256, the key that signed it and when it was registered.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {},
@@ -1012,7 +1012,7 @@
               "description": "A registered function, as `GET /v1/functions` lists it.",
               "properties": {
                 "address": {
-                  "description": "Where its image is fetched from.",
+                  "description": "Where its image is fetched from, as the node shows it: its scheme, host and path, with\nany query (a SAS or a pre-signed URL's signature) replaced by `?…`.",
                   "type": "string"
                 },
                 "key": {

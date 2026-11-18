@@ -11,6 +11,7 @@ use alloc::{
     vec::Vec,
 };
 
+use moruna_api::address_shown;
 use moruna_node::egress;
 use moruna_node_http::{HttpError, Request, exchange_within, net::NetStream};
 use moruna_svc::{Account, deadline_in};
@@ -83,7 +84,9 @@ impl<'a> HttpsFetch<'a> {
 
 impl Fetch for HttpsFetch<'_> {
     fn fetch(&mut self, address: &str, limit: u64) -> Result<Vec<u8>, FetchError> {
-        let failed = |why: String| FetchError::Failed(format!("{address}: {why}"));
+        // The failure names the address as the node shows it: its query is a credential (3E),
+        // and the failure reaches the job's events, the console and the logs.
+        let failed = |why: String| FetchError::Failed(format!("{}: {why}", address_shown(address)));
         let (host, path) = target(address).map_err(|why| failed(why.into()))?;
         let deadline = deadline_in(self.timeout);
         // One connection, to the address's host at 443, and nothing else.

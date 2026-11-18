@@ -217,6 +217,7 @@ fn an_image_is_fetched_over_https_through_a_channel_minted_for_its_host() {
             (200, image.clone()),
             (200, image.clone()),
             (404, b"not here".to_vec()),
+            (403, b"AuthenticationFailed".to_vec()),
         ],
     );
 
@@ -236,11 +237,22 @@ fn an_image_is_fetched_over_https_through_a_channel_minted_for_its_host() {
         fetch.fetch("https://fn.example.test/f/image.wasm", 1000),
         Err(FetchError::TooLarge)
     );
-    // Not there: the address and the answer.
+    // Not there: the address and the answer. An address with no query is named as it is.
     assert_eq!(
         fetch.fetch("https://fn.example.test/gone", 1 << 20),
         Err(FetchError::Failed(
             "https://fn.example.test/gone: answered 404".into()
+        ))
+    );
+    // A SAS address refused by its store: the failure names the address without its query,
+    // a credential (3E), though the request carried it.
+    assert_eq!(
+        fetch.fetch(
+            "https://fn.example.test/functions/gate-score?sp=r&sig=FAKEfake%3D",
+            1 << 20
+        ),
+        Err(FetchError::Failed(
+            "https://fn.example.test/functions/gate-score?…: answered 403".into()
         ))
     );
     let requests = served.join().unwrap();
@@ -250,6 +262,18 @@ fn an_image_is_fetched_over_https_through_a_channel_minted_for_its_host() {
         ),
         "{}",
         requests[0]
+    );
+    assert!(
+        requests[3].starts_with("GET /functions/gate-score?sp=r&sig=FAKEfake%3D HTTP/1.1\r\n"),
+        "the fetch itself sends the whole address: {}",
+        requests[3]
+    );
+    // An address refused before any connection: named without its query too.
+    assert_eq!(
+        fetch.fetch("https://fn.example.test:8443/f?sig=FAKEfake", 1 << 20),
+        Err(FetchError::Failed(
+            "https://fn.example.test:8443/f?…: the address names a port other than 443".into()
+        ))
     );
     // A host with no server: the address and the failure, and nothing else reached.
     let refused = fetch.fetch("https://other.example.test/f", 1 << 20);
