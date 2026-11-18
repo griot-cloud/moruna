@@ -31,6 +31,9 @@ pub struct Volume {
     pub serial: String,
     /// Whether the job writes it: a sink's.
     pub write: bool,
+    /// Whether the job stages on it (`staging.dir` names it, item 3.3): the node then sizes the
+    /// job's memory with no scratch for its staging.
+    pub staging: bool,
 }
 
 /// What a job needs of the node beyond its budget, as the engine's check answers it: what
@@ -104,6 +107,8 @@ struct CheckedLine {
 struct VolumeLine {
     serial: String,
     write: bool,
+    #[serde(default)]
+    staging: bool,
 }
 
 /// The verdict the engine's check answers in its `checked` line (its line break taken off or
@@ -137,6 +142,7 @@ pub fn verdict(line: &[u8]) -> Result<Verdict, HostError> {
                 .map(|v| Volume {
                     serial: v.serial,
                     write: v.write,
+                    staging: v.staging,
                 })
                 .collect(),
             functions: checked.functions,

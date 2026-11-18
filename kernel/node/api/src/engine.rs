@@ -9,8 +9,10 @@
 //!   personality, a fresh connection to the network server, the channel to `api` handed over as
 //!   it is, and one run ([`job_config`], [`check_config`]).
 //! - **Memory:** a job's budget is its whole account; the engine's supervisor carves the
-//!   program's memory and scratch from it as the engine sizes itself ([`sizes`]). A check runs
-//!   in a [`CHECK_BYTES`] account with no scratch.
+//!   program's memory and scratch from it as the engine sizes itself ([`sizes`]), with no
+//!   scratch when the check's needs mark a staging volume (item 3.3). A check runs in a
+//!   [`CHECK_BYTES`] account with no scratch, and reads the node's volumes from the data
+//!   `node-admission` grants it ([`node_protocol::VOLUMES_SLOT`]).
 //! - **The channel** carries the host protocol's bytes in messages of at most 64 KiB each, both
 //!   ways: `api` writes `check`, `spec` and `cancel` in such pieces, and reads the engine's
 //!   bytes, the check's `checked` line among them.
@@ -24,7 +26,8 @@ use core::cell::RefCell;
 use moruna_api_server::{EngineHost, HostError, Verdict, check_line, verdict};
 use moruna_svc::{CallError, Channel, Handle, Memory, Rights, Signals, limits, map};
 use node_protocol::{
-    CHECK_BYTES, CHECK_CHANNEL, ENGINE_CHANNEL, RUNNING, admission, check_args, serve_args,
+    CHECK_BYTES, CHECK_CHANNEL, ENGINE_CHANNEL, RUNNING, VOLUMES_SLOT, admission, check_args,
+    serve_args,
 };
 
 /// The engine, a Linux program in the node's image.
@@ -56,11 +59,11 @@ pub struct Sizes {
 
 /// The split of a job's budget of `budget` bytes, as the engine makes it in node mode (system
 /// design 3A, `moruna-runtime`'s `host::node::sizes`): [`ENGINE_OVERHEAD`] for the engine's own,
-/// scratch a quarter of the rest in whole pages, and the program's memory what remains. A job
-/// does not name a staging volume yet (item 3.3 carries that), so it always has scratch.
-pub fn sizes(budget: u64) -> Sizes {
+/// scratch a quarter of the rest in whole pages (none when the job stages on a volume,
+/// `staging`), and the program's memory what remains.
+pub fn sizes(budget: u64, staging: bool) -> Sizes {
     let rest = budget.saturating_sub(ENGINE_OVERHEAD);
-    let scratch = (rest / 4) & !4095;
+    let scratch = if staging { 0 } else { (rest / 4) & !4095 };
     Sizes {
         memory: rest - scratch,
         scratch,
@@ -68,9 +71,10 @@ pub fn sizes(budget: u64) -> Sizes {
 }
 
 /// The engine supervisor's configuration for a job of `budget` bytes on a node whose job bound
-/// is `bound`; refused when the budget leaves the program no memory past the engine's own.
-pub fn job_config(bound: u64, budget: u64) -> Result<String, HostError> {
-    let Sizes { memory, scratch } = sizes(budget);
+/// is `bound`, `staging` when it stages on a volume; refused when the budget leaves the program
+/// no memory past the engine's own.
+pub fn job_config(bound: u64, budget: u64, staging: bool) -> Result<String, HostError> {
+    let Sizes { memory, scratch } = sizes(budget, staging);
     if memory == 0 || memory % 4096 != 0 {
         return Err(HostError::Refused(format!(
             "budget.memory_bytes: {budget} bytes leave the engine nothing past its own {} MiB: \
@@ -78,28 +82,36 @@ pub fn job_config(bound: u64, budget: u64) -> Result<String, HostError> {
             ENGINE_OVERHEAD >> 20
         )));
     }
-    Ok(config(&serve_args(bound), memory, scratch, ENGINE_CHANNEL))
+    Ok(config(
+        &serve_args(bound),
+        memory,
+        scratch,
+        ENGINE_CHANNEL,
+        "",
+    ))
 }
 
 /// The engine supervisor's configuration for a check on a node whose job bound is `bound`: the
-/// [`CHECK_BYTES`] account less the engine's own, and no scratch.
+/// [`CHECK_BYTES`] account less the engine's own, no scratch, and the node's volumes, which
+/// `node-admission` grants every check, handed to the program as they are given.
 pub fn check_config(bound: u64) -> String {
     config(
         &check_args(bound),
         CHECK_BYTES - ENGINE_OVERHEAD,
         0,
         CHECK_CHANNEL,
+        &format!("grant {VOLUMES_SLOT} data {VOLUMES_SLOT}\n"),
     )
 }
 
-fn config(args: &[String], memory: u64, scratch: u64, channel: &str) -> String {
+fn config(args: &[String], memory: u64, scratch: u64, channel: &str, more: &str) -> String {
     let mut text = format!("program {PROGRAM}\n");
     for arg in args {
         text.push_str(&format!("arg {arg}\n"));
     }
     text.push_str(&format!(
         "env HOME=/tmp\nmemory {memory}\nscratch {scratch}\ngrant linux personality\n\
-         grant network service network\ngrant {channel} channel {channel}\nruns 1\n"
+         grant network service network\ngrant {channel} channel {channel}\n{more}runs 1\n"
     ));
     text
 }
@@ -367,7 +379,8 @@ impl EngineHost for Host {
         let budget = verdict
             .memory_bytes
             .ok_or_else(|| HostError::Failed(String::from("the engine's check named no budget")))?;
-        let config = config_memory(&job_config(self.bound, budget)?)?;
+        let staging = verdict.needs.volumes.iter().any(|v| v.staging);
+        let config = config_memory(&job_config(self.bound, budget, staging)?)?;
         let (ours, theirs) = Host::channel()?;
         let needs = &verdict.needs;
         let needs: node_protocol::Needs = (

@@ -259,6 +259,9 @@ impl admission::Server for Fake {
         grants: Vec<Handle>,
         services: Vec<String>,
     ) -> Result<u64, admission::Error> {
+        // As node-admission's (item 3.3): the node's volumes, as data, beside the channel.
+        let mut names = names;
+        names.push(node_protocol::VOLUMES_SLOT.into());
         self.started(None, config, names, grants, services, Default::default())
     }
 

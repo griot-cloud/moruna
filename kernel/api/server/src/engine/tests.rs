@@ -147,7 +147,7 @@ fn a_check_is_one_line_of_the_document_and_its_secrets_names() {
 #[test]
 fn the_checked_line_is_the_verdict() {
     let sound = verdict(
-        br#"{"type":"checked","ok":true,"refusals":[],"memory_bytes":1073741824,"hosts":["s3.eu-west-1.amazonaws.com"],"volumes":[{"serial":"vol-in","write":false},{"serial":"vol-out","write":true}],"functions":["taxi.clean"]}
+        br#"{"type":"checked","ok":true,"refusals":[],"memory_bytes":1073741824,"hosts":["s3.eu-west-1.amazonaws.com"],"volumes":[{"serial":"vol-in","write":false},{"serial":"vol-out","write":true},{"serial":"vol-s","write":true,"staging":true}],"functions":["taxi.clean"]}
 "#,
     )
     .unwrap();
@@ -161,11 +161,18 @@ fn the_checked_line_is_the_verdict() {
                 volumes: vec![
                     Volume {
                         serial: "vol-in".into(),
-                        write: false
+                        write: false,
+                        staging: false
                     },
                     Volume {
                         serial: "vol-out".into(),
-                        write: true
+                        write: true,
+                        staging: false
+                    },
+                    Volume {
+                        serial: "vol-s".into(),
+                        write: true,
+                        staging: true
                     }
                 ],
                 functions: vec!["taxi.clean".into()],

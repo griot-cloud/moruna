@@ -996,6 +996,7 @@ fn a_submit_is_checked_and_started_with_the_checks_budget_and_needs() {
         volumes: vec![crate::Volume {
             serial: "vol-out".into(),
             write: true,
+            staging: false,
         }],
         functions: vec!["taxi.clean".into()],
     };
