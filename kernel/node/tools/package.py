@@ -32,7 +32,8 @@ PROGRAMS = {
 }
 # The flags only a launcher's node takes, refused for a cloud image.
 LAUNCHER_FLAGS = (("agent_port", "--agent-port"), ("cpus", "--cpus"), ("layer", "--layer"),
-                  ("writable_home", "--writable-home"), ("user_network", "--user-network"), ("cid", "--cid"))
+                  ("writable_home", "--writable-home"), ("user_network", "--user-network"), ("cid", "--cid"),
+                  ("profile_json", "--profile-json"))
 # The C of a user program (`ring`, which the network server brings in) is compiled as
 # kernel/tools/build.sh compiles it: by clang, freestanding, for the bare x86_64 ELF target.
 USER_CC = "CC_x86_64_moruna_user"
@@ -122,6 +123,8 @@ def arguments(argv=None):
     parser.add_argument("--assets", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--package", action="append", default=[])
+    parser.add_argument("--profile-json", type=Path,
+                        help="configure.py's validated profile (its --profile-out), which renders a launcher's node's description")
     parser.add_argument("--layer", action="append", type=Path, default=[])
     parser.add_argument("--writable-home", action="append", type=Path, default=[])
     parser.add_argument("--user-network", action="store_true")
@@ -137,7 +140,8 @@ def arguments(argv=None):
         if given:
             parser.error(f"the cloud profile takes no {', '.join(given)}")
         return parser, args
-    missing = [flag for name, flag in (("agent_port", "--agent-port"), ("cpus", "--cpus")) if getattr(args, name) is None]
+    missing = [flag for name, flag in (("agent_port", "--agent-port"), ("cpus", "--cpus"), ("profile_json", "--profile-json"))
+               if getattr(args, name) is None]
     if missing:
         parser.error(f"the following arguments are required: {', '.join(missing)}")
     if args.cid is None:
@@ -172,9 +176,10 @@ def main():
         if item.is_file():
             present[item.relative_to(assets).as_posix()] = item
     # configure.py's rendering profile is the standalone node's; a cloud image has none.
-    if not cloud and "profile.json" not in present:
-        parser.error("a launcher's node needs configure.py's profile.json among its assets")
-    profile = {} if cloud else json.loads(present["profile.json"].read_text())
+    try:
+        profile = {} if cloud else json.loads(args.profile_json.read_text())
+    except (OSError, ValueError) as error:
+        parser.error(f"the profile {args.profile_json}: {error}")
     additions=[]
     if profile.get("storage_provider") == "bucket": additions.append("  handle data:storage.credential storage.credential")
     if profile.get("storage_provider")=="local-single-node-home":
@@ -189,11 +194,9 @@ def main():
     if additions:
         text += "\n".join(additions) + "\n"
     # The assets hold exactly what ships: what the description binds, and a launcher's node's
-    # layers. The one other file is configure.py's profile.json, which package.py reads above to
-    # render a launcher's node's description and does not ship. Anything else is refused by name,
-    # so nothing is left out unseen.
+    # layers. Anything else is refused by name, so nothing is left out unseen.
     wanted = bound(text) | {name.as_posix() for name in args.layer}
-    unbound = sorted(present.keys() - wanted - ({"profile.json"} if not cloud else set()))
+    unbound = sorted(present.keys() - wanted)
     if unbound:
         parser.error(f"assets the description does not bind: {', '.join(unbound)}")
     missing = sorted(bound(text) - present.keys())

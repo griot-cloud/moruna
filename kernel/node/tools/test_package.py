@@ -20,7 +20,7 @@ package = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(package)
 
 BASE = ["--description", "d.image", "--assets", "assets", "--out", "out", "--node-memory", str(2 << 30)]
-STANDALONE = [*BASE, "--agent-port", "5100", "--cpus", "2"]
+STANDALONE = [*BASE, "--agent-port", "5100", "--cpus", "2", "--profile-json", "profile.json"]
 
 
 def refused(argv):
@@ -50,13 +50,15 @@ class Profiles(unittest.TestCase):
     def test_standalone_still_needs_its_agent_port_and_cpus(self):
         code, message = refused(BASE)
         self.assertEqual(code, 2)
-        self.assertIn("the following arguments are required: --agent-port, --cpus", message)
-        code, message = refused([*BASE, "--cpus", "2"])
+        self.assertIn("the following arguments are required: --agent-port, --cpus, --profile-json", message)
+        code, message = refused([*BASE, "--cpus", "2", "--profile-json", "p.json"])
         self.assertIn("required: --agent-port", message)
+        code, message = refused([*BASE, "--cpus", "2", "--agent-port", "5100"])
+        self.assertIn("required: --profile-json", message)
 
     def test_standalone_refuses_what_it_refused(self):
         for extra in (["--cid", "2"], ["--cid", str(1 << 32)], ["--agent-port", "0"]):
-            argv = [*BASE, "--agent-port", "5100", "--cpus", "2", *extra]
+            argv = [*STANDALONE, *extra]
             code, message = refused(argv)
             self.assertEqual(code, 2)
             self.assertIn("invalid guest CID or layer count", message)
@@ -71,7 +73,7 @@ class Profiles(unittest.TestCase):
 
     def test_cloud_refuses_every_launcher_flag(self):
         for extra in (["--agent-port", "5100"], ["--cpus", "2"], ["--layer", "l.img"],
-                      ["--writable-home", "h.raw"], ["--user-network"], ["--cid", "3"]):
+                      ["--writable-home", "h.raw"], ["--user-network"], ["--cid", "3"], ["--profile-json", "p.json"]):
             code, message = refused(["--profile", "cloud", *BASE, *extra])
             self.assertEqual(code, 2, extra)
             self.assertIn(f"the cloud profile takes no {extra[0]}", message)
@@ -184,14 +186,15 @@ class Profiles(unittest.TestCase):
             (assets / "layers").mkdir(parents=True)
             for name in ("node.conf", "storage.credential", "layers/layer-1.img"):
                 (assets / name).write_text("x\n")
-            # The bucket provider binds the credential (package.py's rendering of configure.py's profile).
-            (assets / "profile.json").write_text('{"storage_provider": "bucket"}\n')
+            # The bucket provider binds the credential (package.py's rendering of configure.py's profile,
+            # which is kept beside the assets).
+            (Path(tmp) / "profile.json").write_text('{"storage_provider": "bucket"}\n')
             description = Path(tmp) / "node.image"
             description.write_text("moruna-image 1\nprocess node-supervisor\n  handle data:node.conf config\n")
             files, rendered = self.payload_of(
                 ["--description", str(description), "--assets", str(assets), "--out", str(Path(tmp) / "out"),
                  "--node-memory", str(2 << 30), "--agent-port", "5100", "--cpus", "2",
-                 "--layer", "layers/layer-1.img"])
+                 "--profile-json", str(Path(tmp) / "profile.json"), "--layer", "layers/layer-1.img"])
         self.assertEqual(files, ["layers/layer-1.img", "node.conf", "storage.credential"])
         self.assertIn("  handle data:storage.credential storage.credential\n", rendered)
 
@@ -200,19 +203,19 @@ class Profiles(unittest.TestCase):
         is built, whether it is a stray file, an unnamed layer or a config with no recipient."""
         with tempfile.TemporaryDirectory() as tmp:
             for profile, extra in (("cloud", ["cacert.pem", "tls-roots.txt"]),
-                                   ("standalone", ["layers/other.img", "maintenance.conf"])):
+                                   ("standalone", ["layers/other.img", "maintenance.conf", "profile.json"])):
                 assets = Path(tmp) / profile / "assets"
                 (assets / "layers").mkdir(parents=True)
                 for name in ("node.conf", *extra):
                     (assets / name).write_text("x\n")
-                if profile == "standalone":
-                    (assets / "profile.json").write_text("{}\n")
+                (Path(tmp) / profile / "profile.json").write_text("{}\n")
                 description = Path(tmp) / profile / "node.image"
                 description.write_text("moruna-image 1\nprocess node-supervisor\n  handle data:node.conf config\n")
                 out = Path(tmp) / profile / "out"
                 argv = ["package.py", "--description", str(description), "--assets", str(assets), "--out", str(out),
                         "--node-memory", str(2 << 30)]
-                argv += ["--profile", "cloud"] if profile == "cloud" else ["--agent-port", "5100", "--cpus", "2"]
+                argv += ["--profile", "cloud"] if profile == "cloud" else [
+                    "--agent-port", "5100", "--cpus", "2", "--profile-json", str(Path(tmp) / profile / "profile.json")]
                 built = []
                 error = io.StringIO()
                 with mock.patch.object(package, "command", lambda *a, **k: built.append(a)), \
@@ -224,7 +227,7 @@ class Profiles(unittest.TestCase):
                 self.assertEqual(built, [])
                 self.assertFalse(out.exists())
 
-    def test_a_launcher_s_node_without_its_profile_is_refused(self):
+    def test_a_launcher_s_node_whose_profile_cannot_be_read_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets = Path(tmp) / "assets"
             assets.mkdir()
@@ -232,13 +235,15 @@ class Profiles(unittest.TestCase):
             description.write_text("moruna-image 1\n")
             out = Path(tmp) / "out"
             argv = ["package.py", "--description", str(description), "--assets", str(assets), "--out", str(out),
-                    "--node-memory", str(2 << 30), "--agent-port", "5100", "--cpus", "2"]
+                    "--node-memory", str(2 << 30), "--agent-port", "5100", "--cpus", "2",
+                    "--profile-json", str(Path(tmp) / "none.json")]
             error = io.StringIO()
             with mock.patch.object(package.shutil, "which", lambda tool: f"/usr/bin/{tool}"), \
                     mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(error), \
                     self.assertRaises(SystemExit):
                 package.main()
-            self.assertIn("needs configure.py's profile.json", error.getvalue())
+            self.assertIn("the profile ", error.getvalue())
+            self.assertIn("none.json", error.getvalue())
             self.assertFalse(out.exists())
 
     def test_data_the_description_binds_and_the_assets_lack_is_refused_before_anything(self):

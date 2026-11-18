@@ -191,6 +191,7 @@ def main():
     (out / "network.conf").write_text("moruna-netstack 1\n"
                                       "grant listen-engine rights=connect remote=127.0.0.0/8 local=127.0.0.0/8 sockets=8\n")
     command(["python3", "-I", tools / "configure.py", "--profile", out / "profile.json", "--out", out / "assets",
+             "--profile-out", out / "configured-profile.json",
              "--image-record", linux / "image.record", "--layers", linux / "stack.layers", "--network", out / "network.conf",
              "--tls-roots", tls_roots, "--engine-bindings", out / "canonical/engine.bindings",
              "--storage-config", out / "storage.conf", "--storage-grants", out / "canonical/storage.grants",

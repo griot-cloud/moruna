@@ -276,6 +276,7 @@ def main():
             elif args.kd3_case:
                 raise ValueError("Python library command must not receive Rust case grant")
         command(["python3", tools / "configure.py", "--profile", out / "profile.json", "--out", out / "assets",
+                 "--profile-out", out / "configured-profile.json",
                  "--image-record", args.image_record, "--layers", args.linux_layers, "--network", out / "network.conf",
                  "--tls-roots", args.io_net / "roots" if args.io_phase else args.tls_roots, "--engine-bindings", out / "canonical/engine.bindings",
                  "--storage-config", out / "storage.conf", "--storage-grants", out / "canonical/storage.grants",
