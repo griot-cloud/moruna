@@ -32,9 +32,56 @@ use std::{
     vec::Vec,
 };
 
-use crate::machine::{Clock, Network, Stream, StreamError, WallClock};
+use crate::machine::{Clock, EngineLayer, LinkError, Network, Stream, StreamError, WallClock};
 
 pub(crate) const SECOND: u64 = 1_000_000_000;
+
+/// What the fake image filesystem puts among the events when it says the layer is mounted.
+pub(crate) const MOUNTED: &str = "imagefs: the engine's layer mounted";
+
+/// The image filesystem as the tests play it (item 1.6e): asked whether the engine's layer is
+/// mounted, it says so `takes` later on the tests' clock, or answers `answer` (and a `TimedOut`
+/// at the deadline).
+pub(crate) struct FakeLayer {
+    clock: FakeClock,
+    events: Rc<RefCell<Vec<String>>>,
+    pub(crate) answer: Result<(), LinkError>,
+    pub(crate) takes: u64,
+    /// The deadline of every time it was asked.
+    pub(crate) deadlines: Vec<u64>,
+    /// When it said the layer was mounted.
+    pub(crate) mounted_at: Option<u64>,
+}
+
+impl FakeLayer {
+    /// One that has mounted the layer, and says so at once, putting [`MOUNTED`] among `events`.
+    pub(crate) fn new(clock: &FakeClock, events: &Rc<RefCell<Vec<String>>>) -> FakeLayer {
+        FakeLayer {
+            clock: clock.clone(),
+            events: events.clone(),
+            answer: Ok(()),
+            takes: 0,
+            deadlines: Vec::new(),
+            mounted_at: None,
+        }
+    }
+}
+
+impl EngineLayer for FakeLayer {
+    fn mounted(&mut self, deadline: u64) -> Result<(), LinkError> {
+        self.deadlines.push(deadline);
+        if self.answer == Err(LinkError::TimedOut) {
+            self.clock.sleep_until(deadline);
+        } else {
+            self.clock.advance(self.takes);
+        }
+        if self.answer.is_ok() {
+            self.mounted_at = Some(self.clock.now());
+            self.events.borrow_mut().push(MOUNTED.to_string());
+        }
+        self.answer.clone()
+    }
+}
 
 /// A clock the tests hold: it moves only when something sleeps on it or a fake takes time.
 #[derive(Clone, Default)]

@@ -16,7 +16,7 @@ use moruna_node_config::{Cloud, Handover, NodeConfig, READY, cloud_name};
 
 use crate::{
     date, instance,
-    machine::{Clock, Control, Link, LinkError, Network, WallClock},
+    machine::{Clock, Control, EngineLayer, Link, LinkError, Network, WallClock},
     wireserver,
 };
 
@@ -36,6 +36,10 @@ pub enum Stage {
     Config,
     /// Handing `api` its config and hearing that it is ready: `platform`'s own stage.
     Platform,
+    /// Hearing that `imagefs` has mounted the engine's layer. The stage names the service that
+    /// failed, so that the first fatal line names it whether `platform`'s or the supervisor's
+    /// comes first (PM, item 1.6e).
+    Imagefs,
 }
 
 impl Stage {
@@ -45,6 +49,7 @@ impl Stage {
             Stage::InstanceData => "instance-data",
             Stage::Config => "config",
             Stage::Platform => "platform",
+            Stage::Imagefs => "imagefs",
         }
     }
 }
@@ -128,11 +133,12 @@ fn set_wall_clock<C: Clock, W: WallClock>(
 /// Boots: returns the hand-over `api` took, with the node's `boot_ms` from the ready line for
 /// `api`'s later starts, having set the wall clock through `wall` and printed the `cloud` and
 /// `ready` lines through `console`, or the reason the node must stop.
-pub fn run<N: Network, C: Clock, W: WallClock, K: Control>(
+pub fn run<N: Network, C: Clock, W: WallClock, K: Control, E: EngineLayer>(
     network: &mut N,
     clock: &mut C,
     wall: &mut W,
     control: &mut K,
+    _layer: &mut E,
     console: &mut dyn FnMut(&str),
     inputs: Inputs,
 ) -> Result<Handover, Fatal> {

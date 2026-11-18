@@ -4,6 +4,7 @@
 
 use core::net::Ipv4Addr;
 use std::{
+    boxed::Box,
     collections::BTreeMap,
     format,
     rc::Rc,
@@ -14,12 +15,13 @@ use std::{
     vec::Vec,
 };
 
+use imagefs_protocol::imagefs;
 use moruna_netstack::{Card, Shared, Stack, after_turn, factory, parse};
 use moruna_node::{Bootstrap, restart::API_STARTED};
 use moruna_node_config::{Handover, MESSAGE_MAX, READY};
 use moruna_svc::{
-    Account, Channel, DEADLINE_INFINITE, Dispatcher, Memory, Rights, Turn, deadline_in, limits,
-    map, now,
+    Account, Channel, Context, DEADLINE_INFINITE, Decoder, Dispatcher, Encoder, Handler, Kind,
+    Memory, Outcome, ProtocolId, Rights, Status, Turn, Wire, deadline_in, frame, limits, map, now,
 };
 use netstack_protocol::{Addr, Endpoint, net, rights};
 
@@ -28,8 +30,8 @@ use crate::{
     boot::{self, Inputs},
     http::{self, Request},
     instance,
-    machine::{Clock, Control, Link, LinkError, Network, Stream, StreamError},
-    svc::{ChannelControl, ChannelLink, Monotonic, Wan},
+    machine::{Clock, Control, EngineLayer, Link, LinkError, Network, Stream, StreamError},
+    svc::{ChannelControl, ChannelLink, ImageFs, Monotonic, Wan},
 };
 
 const MS: u64 = 1_000_000;
@@ -338,6 +340,9 @@ fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
         })
     };
     assert!(link("network", "listen-platform", "platform", "network"));
+    // imagefs's listener, whose answer to platform's Hello says the engine's layer is mounted
+    // (item 1.6e): imagefs serves it as it serves every `listen*` slot, once it has mounted.
+    assert!(link("imagefs", "listen-platform", "platform", "imagefs"));
     // No link reaches api: every start of it, the first included, gets its listener, its
     // channel to platform (item 2.2c) and its connection to node-admission (item 3.2) afresh
     // from the supervisor.
@@ -747,11 +752,16 @@ fn the_hand_over_crosses_a_channel_to_each_start_of_api() {
     let mut network = FakeNetwork::serving(&clock, |_, sent| openstack(sent));
     let mut lines = Vec::new();
     let mut wall = super::FakeWall::default();
+    // imagefs, which has mounted the engine's layer by the time it serves (item 1.6e).
+    let (theirs, ours) = imagefs_link();
+    let mut layer = ImageFs::hello(ours);
+    let imagefs = mounting(theirs, imagefs::ID, Duration::from_millis(20));
     let handed = boot::run(
         &mut network,
         &mut clock,
         &mut wall,
         &mut control,
+        &mut layer,
         &mut |line: &str| lines.push(line.to_string()),
         Inputs {
             started_ns: 0,
@@ -797,4 +807,166 @@ fn the_hand_over_crosses_a_channel_to_each_start_of_api() {
         fatal.to_string(),
         "moruna: fatal platform: the supervisor's channel: the supervisor closed its channel"
     );
+    // imagefs answered platform's Hello before the ready line.
+    assert_eq!(layer.mounted(now()), Ok(()));
+    drop(layer);
+    imagefs.join().unwrap();
+}
+
+/// A connection's handler that serves `id`'s handshake and no request: imagefs, as far as
+/// platform's `Hello` goes.
+struct Serves(ProtocolId);
+
+impl Handler for Serves {
+    fn protocol(&self) -> ProtocolId {
+        self.0
+    }
+
+    fn handle(&mut self, _: &mut Context<'_>, _: u16, _: &mut Decoder<'_>) -> Outcome {
+        Outcome::Status(Status::UnknownMethod)
+    }
+}
+
+/// imagefs on a thread, as its program serves its `listen*` slots once it has mounted every
+/// layer: it serves `listener` as `id` from `after` on, until every client has gone.
+fn mounting(listener: Channel, id: ProtocolId, after: Duration) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        thread::sleep(after);
+        let mut dispatcher = Dispatcher::new();
+        let factory = Box::new(move || Box::new(Serves(id)) as Box<dyn Handler>);
+        dispatcher.listen(listener, factory).unwrap();
+        dispatcher.run().unwrap();
+    })
+}
+
+/// node.conf's `link imagefs listen-platform platform imagefs`: imagefs's end, and platform's.
+fn imagefs_link() -> (Channel, Channel) {
+    Channel::create().unwrap()
+}
+
+#[test]
+fn imagefs_s_welcome_says_the_engine_s_layer_is_mounted() {
+    // The Hello is said as platform starts; imagefs answers it only once it serves, after it
+    // has mounted its layers (1.6d's register-late: some 10 s later). Until then platform hears
+    // nothing, and a wait that ends first leaves the Hello standing.
+    let (theirs, ours) = imagefs_link();
+    let mut layer = ImageFs::hello(ours);
+    assert_eq!(
+        layer.mounted(deadline_in(30 * MS)),
+        Err(LinkError::TimedOut)
+    );
+    let imagefs = mounting(theirs, imagefs::ID, Duration::from_millis(50));
+    assert_eq!(layer.mounted(deadline_in(10 * SECOND)), Ok(()));
+    // Heard once, it stays heard; platform has let the connection and the listener go, so
+    // imagefs, which serves until every client has gone, sees them go.
+    assert_eq!(layer.mounted(now()), Ok(()));
+    imagefs.join().unwrap();
+}
+
+#[test]
+fn an_answer_that_came_while_platform_was_busy_is_heard_whatever_the_deadline() {
+    // imagefs mounted long before platform looks: instance data may have taken most of its
+    // 90 s, so the limit has passed by then, and the answer is there.
+    let (theirs, ours) = imagefs_link();
+    let mut layer = ImageFs::hello(ours);
+    // imagefs takes the connection and welcomes the Hello on it, as its dispatcher does.
+    let connection = accepted(&theirs);
+    let welcome = encoded((imagefs::ID.major, imagefs::ID.minor));
+    frame::send(&connection, Kind::Welcome, 0, 0, welcome).unwrap();
+    assert_eq!(layer.mounted(1), Ok(()));
+}
+
+#[test]
+fn imagefs_that_ends_before_it_serves_has_closed_its_end() {
+    // It ends before it mounts (its lookup of `system` failed, say): the Hello's connection,
+    // queued on its listener, goes with it.
+    let (theirs, ours) = imagefs_link();
+    let mut layer = ImageFs::hello(ours);
+    drop(theirs);
+    assert_eq!(
+        layer.mounted(deadline_in(10 * SECOND)),
+        Err(LinkError::Closed)
+    );
+    assert_eq!(layer.mounted(now()), Err(LinkError::Closed));
+    // Or it has ended before platform starts: the Hello cannot be said.
+    let (theirs, ours) = imagefs_link();
+    drop(theirs);
+    let mut layer = ImageFs::hello(ours);
+    assert_eq!(
+        layer.mounted(deadline_in(10 * SECOND)),
+        Err(LinkError::Closed)
+    );
+}
+
+#[test]
+fn a_server_that_is_not_imagefs_is_no_word_of_the_layer() {
+    // Another protocol, or another major of imagefs's, is refused at the handshake.
+    for id in [
+        ProtocolId {
+            name: "moruna.other",
+            ..imagefs::ID
+        },
+        ProtocolId {
+            major: imagefs::ID.major + 1,
+            ..imagefs::ID
+        },
+    ] {
+        let (theirs, ours) = imagefs_link();
+        let mut layer = ImageFs::hello(ours);
+        let server = mounting(theirs, id, Duration::ZERO);
+        let Err(LinkError::Other(why)) = layer.mounted(deadline_in(10 * SECOND)) else {
+            panic!("{id:?} is not imagefs");
+        };
+        assert!(why.starts_with("it refused the Hello: "), "{why}");
+        server.join().unwrap();
+    }
+    // A Welcome in another major, or another frame, is no answer to imagefs's Hello.
+    let answers: [(Kind, Encoder); 3] = [
+        (Kind::Welcome, encoded((imagefs::ID.major + 1, 0u16))),
+        (Kind::Welcome, Encoder::new()),
+        (Kind::Event, Encoder::new()),
+    ];
+    let said = [
+        "it welcomed a version of moruna.imagefs other than 3",
+        "it welcomed a version of moruna.imagefs other than 3",
+        "it answered the Hello with a Event frame",
+    ];
+    for ((kind, body), said) in answers.into_iter().zip(said) {
+        let (theirs, ours) = imagefs_link();
+        let mut layer = ImageFs::hello(ours);
+        let connection = accepted(&theirs);
+        frame::send(&connection, kind, 0, 0, body).unwrap();
+        assert_eq!(
+            layer.mounted(deadline_in(10 * SECOND)),
+            Err(LinkError::Other(String::from(said)))
+        );
+    }
+    // A Refuse whose body is not one says so without its reason.
+    let (theirs, ours) = imagefs_link();
+    let mut layer = ImageFs::hello(ours);
+    frame::send(&accepted(&theirs), Kind::Refuse, 0, 0, Encoder::new()).unwrap();
+    assert_eq!(
+        layer.mounted(deadline_in(10 * SECOND)),
+        Err(LinkError::Other(String::from("it refused the Hello")))
+    );
+}
+
+/// `value` on the wire.
+fn encoded(value: impl Wire) -> Encoder {
+    let mut body = Encoder::new();
+    value.encode(&mut body).unwrap();
+    body
+}
+
+/// The connection a client sent through `listener`, read as a server's dispatcher reads it.
+fn accepted(listener: &Channel) -> Channel {
+    // A Connect frame is a header with no body, and the one handle it carries.
+    let mut header = [0u8; frame::HEADER];
+    let mut handles = [None];
+    assert_eq!(
+        listener.read(&mut header, &mut handles),
+        Ok((frame::HEADER, 1))
+    );
+    assert_eq!(header[0], Kind::Connect as u8);
+    Channel(handles[0].take().expect("its channel"))
 }

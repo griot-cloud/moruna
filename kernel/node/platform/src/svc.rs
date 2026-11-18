@@ -1,6 +1,7 @@
 //! The machine's traits on the node itself: connections through the network server's sockets
-//! (`moruna.net`), the core's monotonic clock, and the supervisor's channel to `platform`, which
-//! gives the node's memory and then the channel to each start of `api`.
+//! (`moruna.net`), the core's monotonic clock, the supervisor's channel to `platform`, which
+//! gives the node's memory and then the channel to each start of `api`, and the image
+//! filesystem's listener linked to `platform`, whose answer says the engine's layer is mounted.
 //!
 //! They are written on `moruna-svc`, which on a host is a model of the same kernel calls, so they
 //! are tested there too: the sockets against the real network server over its loopback.
@@ -8,14 +9,17 @@
 use alloc::{format, string::String, vec, vec::Vec};
 use core::net::{IpAddr, Ipv4Addr};
 
+use imagefs_protocol::imagefs;
 use moruna_node::{Bootstrap, restart::api_started};
 use moruna_svc::{
-    CallError, Channel, DEADLINE_INFINITE, Error, Handle, Memory, ObjectType, Rights, Signals, map,
-    now, wait_one,
+    CallError, Channel, DEADLINE_INFINITE, Encoder, Error, Handle, Kind, Memory, ObjectType,
+    Refused, Rights, Signals, Transport, Wire,
+    frame::{self, Frame},
+    map, now, wait_one,
 };
 use netstack_protocol::{Addr, Endpoint, Target, net};
 
-use crate::machine::{Clock, Control, Link, LinkError, Network, Stream, StreamError};
+use crate::machine::{Clock, Control, EngineLayer, Link, LinkError, Network, Stream, StreamError};
 
 /// The interface the node's address is read from.
 pub const INTERFACE: &str = "wan";
@@ -304,5 +308,124 @@ impl Link for ChannelLink {
             )));
         }
         Ok(message)
+    }
+}
+
+/// The image filesystem's word that it has mounted the engine's layer (system design 1B; PM,
+/// item 1.6e): `platform`'s slot `imagefs`, the client end of node.conf's
+/// `link imagefs listen-platform platform imagefs`. imagefs serves its listeners only once it has
+/// mounted every layer, so its `Welcome` to a `Hello` said through one says the engine's layer is
+/// mounted, as [`moruna_svc::ready`] hears that a linked server has started. No new message: the
+/// handshake is the protocol's own, and imagefs is unchanged.
+///
+/// The `Hello` is said when `platform` starts ([`ImageFs::hello`]), so that an answer which came
+/// while it found its cloud and handed `api` its config is there when it looks, whatever its
+/// deadline. Once it has heard, it lets the connection and the listener go, and holds no
+/// filesystem.
+pub struct ImageFs(Said);
+
+/// Where the `Hello` to imagefs stands.
+enum Said {
+    /// Said on the connection, through the listener; no answer read yet.
+    Waiting {
+        _listener: Channel,
+        connection: Channel,
+    },
+    /// imagefs has answered: the engine's layer is mounted.
+    Mounted,
+    /// It will not answer, and why.
+    Failed(LinkError),
+}
+
+impl ImageFs {
+    /// Says `Hello` to imagefs through `listener`, its `listen-platform` listener; the answer is
+    /// read by [`EngineLayer::mounted`], which also says why it could not be said.
+    pub fn hello(listener: Channel) -> ImageFs {
+        let said = moruna_svc::connect(&listener)
+            .map_err(|error| match error {
+                CallError::PeerClosed => LinkError::Closed,
+                error => LinkError::Other(format!("its listener: {error:?}")),
+            })
+            .and_then(|connection| {
+                let mut hello = Encoder::new();
+                imagefs::ID
+                    .hello()
+                    .encode(&mut hello)
+                    .map_err(|error| LinkError::Other(format!("the Hello: {error:?}")))?;
+                frame::send(&connection, Kind::Hello, 0, 0, hello).map_err(transport)?;
+                Ok(Said::Waiting {
+                    _listener: listener,
+                    connection,
+                })
+            });
+        ImageFs(said.unwrap_or_else(Said::Failed))
+    }
+}
+
+/// A frame that did not cross the connection to imagefs.
+fn transport(error: Transport) -> LinkError {
+    match error {
+        Transport::PeerClosed => LinkError::Closed,
+        error => LinkError::Other(format!("the connection: {error:?}")),
+    }
+}
+
+/// imagefs's answer to the `Hello`: a `Welcome` in its protocol's major version.
+fn welcomed(mut answer: Frame) -> Result<(), LinkError> {
+    let kind = answer.kind;
+    let mut d = answer.decoder();
+    match kind {
+        Kind::Welcome => match u16::decode(&mut d) {
+            Ok(major) if major == imagefs::ID.major => Ok(()),
+            _ => Err(LinkError::Other(format!(
+                "it welcomed a version of {} other than {}",
+                imagefs::ID.name,
+                imagefs::ID.major
+            ))),
+        },
+        Kind::Refuse => Err(LinkError::Other(match Refused::decode(&mut d) {
+            Ok(refused) => format!("it refused the Hello: {:?}", refused.reason),
+            Err(_) => String::from("it refused the Hello"),
+        })),
+        kind => Err(LinkError::Other(format!(
+            "it answered the Hello with a {kind:?} frame"
+        ))),
+    }
+}
+
+/// The first frame on `connection`, waited for until `deadline`.
+fn answer(connection: &Channel, deadline: u64) -> Result<Frame, LinkError> {
+    let mut closed = false;
+    loop {
+        match frame::recv(connection).map_err(transport)? {
+            Some(answer) => return Ok(answer),
+            None if closed => return Err(LinkError::Closed),
+            None => {
+                let seen = wait(
+                    connection,
+                    Signals::READABLE | Signals::PEER_CLOSED,
+                    deadline,
+                )?;
+                closed = seen.contains(Signals::PEER_CLOSED);
+            }
+        }
+    }
+}
+
+impl EngineLayer for ImageFs {
+    fn mounted(&mut self, deadline: u64) -> Result<(), LinkError> {
+        let heard = match &self.0 {
+            Said::Mounted => return Ok(()),
+            Said::Failed(error) => return Err(error.clone()),
+            Said::Waiting { connection, .. } => answer(connection, deadline).and_then(welcomed),
+        };
+        match &heard {
+            // Not yet: the Hello stands, and a later call may hear the answer.
+            Err(LinkError::TimedOut) => {}
+            // Heard: the connection and the listener go with what was waiting.
+            Ok(()) => self.0 = Said::Mounted,
+            Err(error) => self.0 = Said::Failed(error.clone()),
+        }
+        heard
     }
 }

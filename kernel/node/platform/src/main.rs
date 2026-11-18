@@ -8,7 +8,9 @@
 //!   and to Azure's WireServer, for the ready report;
 //! - `supervisor`: its `platform` bootstrap, whose end the supervisor keeps: first the node's
 //!   memory, then, at each start of `api`, `api-started` with the channel to that start;
-//! - `clock`: `root.clock`, the right to set the node's one wall clock (system design 3D).
+//! - `clock`: `root.clock`, the right to set the node's one wall clock (system design 3D);
+//! - `imagefs`: a listener of the image filesystem, whose answer to the `Hello` said through it
+//!   at start says the engine's layer is mounted (system design 1B, item 1.6e).
 //!
 //! On a fatal error it prints the line and exits with failure, which stops the node. Once the
 //! node is ready it stays, holding the hand-over, and gives it again to each new start of `api`
@@ -28,7 +30,7 @@ use moruna_node_platform::{
     boot::{self, Fatal, Inputs, Stage},
     instance,
     machine::WallClock,
-    svc::{ChannelControl, Monotonic, Wan},
+    svc::{ChannelControl, ImageFs, Monotonic, Wan},
 };
 use moruna_svc::{Account, Channel, Console, Handle, now, println, start};
 use netstack_protocol::net;
@@ -69,6 +71,11 @@ fn serve(console: &Console, started_ns: u64) -> Result<core::convert::Infallible
     let mut wall = start::take("clock")
         .map(CoreClock)
         .ok_or_else(|| own("platform was started without root.clock"))?;
+    // The Hello to imagefs is said now, so that its answer, which says the engine's layer is
+    // mounted, is there when the boot looks after api's ready (item 1.6e).
+    let mut layer = start::take("imagefs")
+        .map(|handle| ImageFs::hello(Channel(handle)))
+        .ok_or_else(|| own("platform was started without its link to imagefs"))?;
     // The supervisor queues the message before it starts `platform`, so it is not waited for.
     let memory_bytes = control
         .memory(now())
@@ -96,6 +103,7 @@ fn serve(console: &Console, started_ns: u64) -> Result<core::convert::Infallible
         &mut clock,
         &mut wall,
         &mut control,
+        &mut layer,
         &mut |line: &str| println!(console, "{}", line),
         Inputs {
             started_ns,
