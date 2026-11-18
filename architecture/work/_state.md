@@ -37,7 +37,7 @@ Benchmark run 5 is ready (`~/moruna-data/chain-bench5.sh <commit>`): the node im
 | 9 | 6.3o the cost model is dormant on the node | `work/6.3o-cost-model-dormant-on-node` f56429ff | `untracked.tgz` (node_learns.rs) | Harness; measure the policies |
 | 10 | 6.3f a Linux image runs one instance per CPU | `work/6.3f-linux-image-runs-alone` 48267e9e (WIP) | none | After 6.3g: a VM turn, the image-kind suite and the table |
 | 11 | 4.6 mlp_forward | MERGED (`work/4.6-mlp-forward` 151e1a39) | none | Left: the 20-minute one-core measurement in moruna-arm (`kernel_mlp.py measure`, `score BIN numpy`) |
-| 12 | 4.1 + 4.3 catalogue runner, filter, take | `work/4.1-kernel-catalogue` f2e046ad | patch plus tgz (uncompiled) | Compile, test, then the Enrich month |
+| 12 | 4.1 + 4.3 catalogue runner, filter, take | MERGED 5577f6d7 (3b4bd4a5) | none | Done: the runner runs every listed implementation over its corpus (filter, take, mlp_forward, interval_coverage_count all pass); coverage 95–96%. Left: the Enrich month check (tests/enrich_month.rs, ignored, needs MORUNA_ENRICH_DIR) and dropping 4.5's stand-in corpus test |
 | 13 | 4.2 expr | `work/4.2-expr` f2e046ad | patch plus tgz (uncompiled) | Compile, test, then 4G.3 |
 | 14 | 4.4 group_aggregate | `work/4.4-group-aggregate` f2e046ad | patch plus tgz (uncompiled) | Compile, test, then 4G.4 |
 | 15 | 4.5 interval_coverage_count | MERGED (`work/4.5-interval-coverage-count` a70e3416) | scratch in wip | Done: year compute 53.3 s in Python against 0.85 s; peak 1,217 MiB against 89 MiB; bit for bit. Left: drop its stand-in corpus test once 4.1's runner lands |
