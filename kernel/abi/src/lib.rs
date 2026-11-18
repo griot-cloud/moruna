@@ -229,7 +229,9 @@ pub mod nr {
     pub const HYPERV_MAP_EVENTS: u64 = BASE + 67;
     /// `hyperv_interrupt(root) -> handle`: an interrupt object for SINT 2, raised for each
     /// message or event flag Hyper-V gives it, and waited on and acknowledged
-    /// (`interrupt_ack`) as a device's is.
+    /// (`interrupt_ack`) as a device's is. In `rdx`, the VP index of CPU 0, where SINT 2
+    /// arrives (`HV_X64_MSR_VP_INDEX`, read as the SynIC was enabled): the target a VMBus
+    /// client names for its contact and every channel, which is not always 0.
     pub const HYPERV_INTERRUPT: u64 = BASE + 68;
     /// `hyperv_signal_create(root, connection) -> handle`: an `HvSignal` that signals that
     /// one connection ID and nothing else, to give to that channel's driver.

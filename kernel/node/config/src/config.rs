@@ -19,8 +19,8 @@ pub const VERSION: u64 = 1;
 pub const KEYS_MAX: usize = 8;
 /// One MiB: `functions.cache_bytes` is a whole number of them.
 pub const MIB: u64 = 1 << 20;
-/// `functions.cache_bytes` when node config does not give it: 1 GiB, or half the node's memory
-/// when that is less.
+/// `functions.cache_bytes` when node config does not give it: 1 GiB (system design 1D and 3E), or
+/// half the node's memory when that is less, the most a config may give.
 pub const CACHE_BYTES_DEFAULT: u64 = 1 << 30;
 /// The least `functions.cache_bytes` may be: 64 MiB.
 pub const CACHE_BYTES_MIN: u64 = 64 * MIB;
@@ -42,7 +42,13 @@ impl PublicKey {
     }
 }
 
-/// A validated node config.
+/// A validated node config, its defaults applied.
+///
+/// `platform` and `api` both make one with `NodeConfig::read` (through [`NodeConfig::validate`]
+/// and [`crate::Handover::decode`]), the one place a default is derived. The hand-over carries
+/// only what the operator set (`NodeConfig::document`), so `api` derives each default from the
+/// hand-over's own `memory_bytes` exactly as `platform` did, and never judges a default as if the
+/// operator had given it (PM, 2026-11-18).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeConfig {
     /// What `api` needs.
@@ -86,8 +92,11 @@ impl fmt::Debug for Tls {
 pub struct Functions {
     /// The keys that may sign function images: 0 to 8.
     pub keys: Vec<PublicKey>,
-    /// The bytes of memory the function cache may hold.
+    /// The bytes of memory the function cache may hold: what node config gives, or the default.
     pub cache_bytes: u64,
+    /// Whether node config gives `cache_bytes`. Only then does the hand-over carry it, to be
+    /// judged again as the operator's; otherwise `api` derives the default as `platform` did.
+    pub cache_bytes_given: bool,
 }
 
 impl Default for Functions {
@@ -95,6 +104,7 @@ impl Default for Functions {
         Functions {
             keys: Vec::new(),
             cache_bytes: CACHE_BYTES_DEFAULT,
+            cache_bytes_given: false,
         }
     }
 }
@@ -244,7 +254,9 @@ impl NodeConfig {
         NodeConfig::read(&json::parse(user_data)?, node_memory_bytes)
     }
 
-    /// Reads a node config from its JSON, on a node of `node_memory_bytes`.
+    /// Reads a node config from its JSON, on a node of `node_memory_bytes`: its validation and
+    /// its defaults, the same for `platform`, which reads the instance's user-data, and for `api`,
+    /// which reads what the hand-over carries of it.
     pub(crate) fn read(json: &Json, node_memory_bytes: u64) -> Result<NodeConfig, Refusal> {
         let root = json.object("node config")?;
         // The version first: a later version may have fields this one does not know.
@@ -268,22 +280,25 @@ impl NodeConfig {
             None => Functions {
                 keys: Vec::new(),
                 cache_bytes: default_cache_bytes(node_memory_bytes),
+                cache_bytes_given: false,
             },
             Some(functions) => {
                 let functions = functions.object("functions")?;
                 functions.only(&["keys", "cache_bytes"])?;
+                let given = functions.get("cache_bytes");
                 Functions {
                     keys: match functions.get("keys") {
                         None => Vec::new(),
                         Some(list) => keys(list, "functions.keys", 0)?,
                     },
-                    cache_bytes: match functions.get("cache_bytes") {
+                    cache_bytes: match given {
                         None => default_cache_bytes(node_memory_bytes),
                         Some(given) => cache_bytes(
                             given.unsigned("functions.cache_bytes")?,
                             node_memory_bytes,
                         )?,
                     },
+                    cache_bytes_given: given.is_some(),
                 }
             }
         };
@@ -293,7 +308,10 @@ impl NodeConfig {
         })
     }
 
-    /// The config as the JSON of node config version 1, every default written out.
+    /// The config as the JSON of node config version 1, holding only what the operator set:
+    /// `api.tls` when given, `functions.keys` when there are any (an empty list means the same as
+    /// none), `functions.cache_bytes` when given, and `functions` when either is there. Read
+    /// again with [`NodeConfig::read`] on the same node, it is this config.
     pub(crate) fn document(&self) -> serde_json::Value {
         let written =
             |keys: &[PublicKey]| keys.iter().map(PublicKey::to_base64).collect::<Vec<_>>();
@@ -301,14 +319,18 @@ impl NodeConfig {
         if let Some(tls) = &self.api.tls {
             api["tls"] = serde_json::json!({ "certificate": tls.certificate, "key": tls.key });
         }
-        serde_json::json!({
-            "moruna": VERSION,
-            "api": api,
-            "functions": {
-                "keys": written(&self.functions.keys),
-                "cache_bytes": self.functions.cache_bytes,
-            },
-        })
+        let mut document = serde_json::json!({ "moruna": VERSION, "api": api });
+        let mut functions = serde_json::Map::new();
+        if !self.functions.keys.is_empty() {
+            functions.insert("keys".into(), written(&self.functions.keys).into());
+        }
+        if self.functions.cache_bytes_given {
+            functions.insert("cache_bytes".into(), self.functions.cache_bytes.into());
+        }
+        if !functions.is_empty() {
+            document["functions"] = functions.into();
+        }
+        document
     }
 }
 
@@ -362,8 +384,10 @@ fn tls(tls: &Json) -> Result<Tls, Refusal> {
     })
 }
 
-/// `functions.cache_bytes` when node config does not give it: 1 GiB, or half the node's memory
-/// when that is less (PM, 2026-11-18). Never refused, even under 64 MiB.
+/// `functions.cache_bytes` when node config does not give it: 1 GiB (system design 1D and 3E),
+/// capped at half the node's memory, the most a config may give (PM, 2026-11-18). Never refused,
+/// and never held to a whole MiB or to 64 MiB: it is not the operator's choice. Only
+/// [`NodeConfig::read`] derives it.
 fn default_cache_bytes(node_memory_bytes: u64) -> u64 {
     CACHE_BYTES_DEFAULT.min(node_memory_bytes / 2)
 }

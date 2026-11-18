@@ -104,17 +104,18 @@ It also adds what the core needs on Hyper-V (`architecture/moruna-os-system.md`,
 - **CPU 0's SynIC and the two hypercalls of VMBus** (`src/arch/x86/kernel/hyperv.rs`; work
   item 1.9c, section 1F, "VMBus, split by the microkernel rule"), on Hyper-V once the
   hypercall page is in place and when the partition may use the SynIC MSRs, post messages
-  and signal events (leaf `0x40000003` EAX bits 5 and 2, EBX bits 4 and 5). On the boot
-  processor, CPU 0, before the other CPUs start, it places the message page (SIMP) and
-  the event-flags page (SIEFP) on two zeroed frames of its own, sets SINT 2 unmasked at
-  the vector of an IRQ line it allocates (no auto-EOI: the local APIC's EOI, as every IRQ
-  line has), and enables the SynIC, each MSR's reserved bits kept; no other SINT is
-  touched, and no other CPU's SynIC. `kernel::hyperv::synic` is then public, for the
-  core's `hyperv_*` calls (ABI 2.7): `HvCallPostMessage` from a third frame of its own,
-  `HvCallSignalEvent` as a fast call, SINT 2's message copied out of its slot with the slot
-  emptied and `HV_X64_MSR_EOM` written on CPU 0 (by an inter-processor call from any other
-  CPU) when another message waits, the event-flags frame, and a clone of the IRQ line.
-  Hypercalls go through the hypercall page in inline assembly (`call` with the control
+  and signal events (leaf `0x40000003` EAX bits 5 and 2, EBX bits 4 and 5), and may read
+  its VP index (EAX bit 6). On the boot processor, CPU 0, before the other CPUs start, it
+  reads CPU 0's VP index from `HV_X64_MSR_VP_INDEX` (never assumed to be 0), places the
+  message page (SIMP) and the event-flags page (SIEFP) on two zeroed frames of its own,
+  sets SINT 2 unmasked at the vector of an IRQ line it allocates (no auto-EOI: the local
+  APIC's EOI, as every IRQ line has), and enables the SynIC, each MSR's reserved bits kept;
+  no other SINT is touched, and no other CPU's SynIC. `kernel::hyperv::synic` is then
+  public, for the core's `hyperv_*` calls (ABI 2.7): `HvCallPostMessage` from a third frame
+  of its own, `HvCallSignalEvent` as a fast call, SINT 2's message copied out of its slot
+  with the slot emptied and `HV_X64_MSR_EOM` written on CPU 0 (by an inter-processor call
+  from any other CPU) when another message waits, the event-flags frame, a clone of the
+  IRQ line, and CPU 0's VP index, which VMBus targets. Hypercalls go through the hypercall page in inline assembly (`call` with the control
   value in RCX, the input in RDX and R8, the status in RAX), which `hypercall_page` no
   longer leaves unused. Anything that stops the SynIC is logged, and the boot goes on
   without VMBus. The module is now `pub` in `src/arch/x86/kernel/mod.rs`; its boot items

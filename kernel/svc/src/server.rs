@@ -28,7 +28,7 @@ use alloc::{
 
 use core::cell::Cell;
 
-use moruna_abi::{DEADLINE_INFINITE, Error, ObjectType, Signals, limits};
+use moruna_abi::{DEADLINE_INFINITE, Error, ObjectType, Rights, Signals, limits};
 
 use crate::{
     frame::{self, Frame, Kind, Transport},
@@ -121,6 +121,13 @@ impl Context<'_> {
     /// The minor version the client said `Hello` with.
     pub fn client_minor(&self) -> u16 {
         self.client_minor
+    }
+
+    /// A handle to this connection's channel that can only be waited on. A server that
+    /// keeps it can tell that the client has gone (`PEER_CLOSED`) before the
+    /// dispatcher's next turn does, and free what the client held at once.
+    pub fn peer_watch(&self) -> Result<Handle, Error> {
+        self.channel.0.duplicate(Rights::WAIT)
     }
 
     /// Sends event `ordinal`, which arrived in minor version `since`, with `body` on

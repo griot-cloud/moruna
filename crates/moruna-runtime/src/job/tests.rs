@@ -884,6 +884,17 @@ fn every_sink_kind_builds() {
         "{}",
         refused.reason
     );
+    // A run given no secrets refuses the first reference by its field, with its own reason.
+    let refused = crate::job::build::refuse_secret_refs(&doc, "locally, give credentials")
+        .expect_err("a reference");
+    assert_eq!(
+        (refused.field.as_str(), refused.reason.as_str()),
+        (
+            "object_store.s3.secret_access_key",
+            "locally, give credentials"
+        )
+    );
+    assert!(crate::job::build::refuse_secret_refs(&ObjectStoreDoc::default(), "x").is_ok());
     let mut none = moruna_reactor::ObjectStoreConfig::default();
     crate::job::build::with_secrets(&mut none, &ObjectStoreDoc::default(), &Default::default())
         .expect("no reference needs no secret");

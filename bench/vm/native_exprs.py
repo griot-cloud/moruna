@@ -45,18 +45,23 @@ def run(engine: str, workload: str, files, out: str, threads: int, memory_mib: i
                     f"ROW_GROUP_SIZE {output['row_group_rows']})")
         return duckdb.__version__
     import polars as pl
+    (polars_enrich(pl.scan_parquet(list(files)))
+       .sink_parquet(f"{out}/part.parquet", compression="zstd", compression_level=output["zstd_level"],
+                     row_group_size=output["row_group_rows"], engine="streaming"))
+    return pl.__version__
+
+
+def polars_enrich(scan):
+    """Enrich as Polars expressions over `scan`, a LazyFrame of the job's input."""
+    import polars as pl
     dist, fare = pl.col("trip_distance"), pl.col("fare_amount")
     # Polars divides by a scalar as a multiplication by its reciprocal (3501695176 / 1e6 comes
     # out 3501.6951759999997), which is not the IEEE division pyarrow and NumPy do. Dividing by
     # a column divides, so each divisor is a column of the constant, which costs one column.
     one = pl.col("pickup_at").is_null().cast(pl.Float64) * 0.0 + 1.0
     dur = (pl.col("dropoff_at").cast(pl.Int64) - pl.col("pickup_at").cast(pl.Int64)) / (one * 1_000_000.0)
-    (pl.scan_parquet(list(files))
-       .with_columns(duration_s=dur)
-       .filter((pl.col("duration_s") >= 60.0) & (pl.col("duration_s") <= 14400.0) & (dist > 0.0)
-               & (dist < 100.0) & dist.is_nan().not_() & (fare > 0.0) & fare.is_nan().not_())
-       .with_columns(mph=dist / (pl.col("duration_s") / (one * 3600.0)), fare_per_mile=fare / dist,
-                     tip_share=pl.col("tip_amount") / fare)
-       .sink_parquet(f"{out}/part.parquet", compression="zstd", compression_level=output["zstd_level"],
-                     row_group_size=output["row_group_rows"], engine="streaming"))
-    return pl.__version__
+    return (scan.with_columns(duration_s=dur)
+              .filter((pl.col("duration_s") >= 60.0) & (pl.col("duration_s") <= 14400.0) & (dist > 0.0)
+                      & (dist < 100.0) & dist.is_nan().not_() & (fare > 0.0) & fare.is_nan().not_())
+              .with_columns(mph=dist / (pl.col("duration_s") / (one * 3600.0)), fare_per_mile=fare / dist,
+                            tip_share=pl.col("tip_amount") / fare))

@@ -289,8 +289,10 @@ fn receive_some(host: &mut net::Client, socket: u32) -> Vec<u8> {
     receive(host, socket, status.receive_queued).expect("received")
 }
 
-/// More connections, one after another, than the grant's 64 sockets: each close frees
-/// its socket, so none is refused.
+/// Seventy connections one after another from one host, as an agent polling with a new
+/// connection each time makes them: each close holds its socket only until the close is
+/// done (the grant's linger of 5 s at most), and none is its peer's any more once
+/// closing (work item 1.3b), so none is refused.
 #[test]
 fn seventy_connections_one_after_another_each_free_their_socket() {
     let mut node = Node::start(true);
@@ -312,14 +314,17 @@ fn seventy_connections_one_after_another_each_free_their_socket() {
     node.end();
 }
 
-/// When every socket of the grant is held, the network server refuses an accept: no more
-/// is asked until a connection has closed, and then the waiting one is accepted.
+/// When every socket of the grant is held, a further connection is reset at accept
+/// (work item 1.3b: the network server gives its listener no socket for it), and the loop
+/// does not spin asking; once a connection has closed and its close is done, the next is
+/// accepted.
 #[test]
 fn with_every_socket_of_the_grant_held_accepting_waits_for_one_to_close() {
-    // Three sockets: the listener and two connections.
+    // Three sockets: the listener and two connections; a close done in a tenth of a
+    // second.
     let small = NODE.replace(
-        "local=0.0.0.0/0@443 sockets=64",
-        "local=0.0.0.0/0@443 sockets=3",
+        "local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000",
+        "local=0.0.0.0/0@443 sockets=3 linger=100",
     );
     assert_ne!(small, NODE);
     let mut node = Node::configured(&small, true);
@@ -334,9 +339,12 @@ fn with_every_socket_of_the_grant_held_accepting_waits_for_one_to_close() {
         host.open(Target::Endpoint(at), None).expect("connected");
         conns.push(Conn::new(network.clone(), accept(&network)));
     }
-    // A third connects, and waits in the listener's backlog: it is not accepted, and the
-    // loop does not spin asking.
-    let third = host.open(Target::Endpoint(at), None).expect("connected");
+    // A third is reset, and the loop does not spin asking.
+    assert_eq!(
+        host.open(Target::Endpoint(at), None).map(|_| ()),
+        Err(CallError::Remote(net::Error::Refused)),
+        "a connection past the grant's sockets"
+    );
     let mut asked = 0;
     let started = Instant::now();
     while started.elapsed() < Duration::from_millis(500) {
@@ -348,6 +356,18 @@ fn with_every_socket_of_the_grant_held_accepting_waits_for_one_to_close() {
     assert_eq!(network.borrow().connections(), 2);
     // One closes: the third is accepted.
     conns.remove(0).close();
+    // Once its close is done (in the grant's linger of a tenth of a second at most), a
+    // third connects and is accepted.
+    let started = Instant::now();
+    let third = loop {
+        let _ = turn(&network).expect("a turn");
+        match host.open(Target::Endpoint(at), None) {
+            Ok(opened) => break opened,
+            Err(CallError::Remote(net::Error::Refused))
+                if started.elapsed() < Duration::from_secs(5) => {}
+            other => panic!("a third connection once one closed: {other:?}"),
+        }
+    };
     let socket = accept(&network);
     let mut conn = Conn::new(network.clone(), socket);
     common::send(&mut host, third.socket, b"third").expect("sent");

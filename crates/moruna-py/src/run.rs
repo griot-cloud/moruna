@@ -49,6 +49,10 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 /// How often the main thread wakes to check for a signal (f.5).
 const SIGNAL_POLL: Duration = Duration::from_millis(100);
 
+/// Why `moruna.run` refuses a document that refers to one of the job's secrets.
+const LOCAL_SECRET_REF: &str = "a secret reference needs the node's secrets; locally, give \
+                                credentials with `storage=` or the environment";
+
 /// The flag's holder; dropping it lets the next run start.
 pub(crate) struct RunningGuard;
 
@@ -824,6 +828,14 @@ pub fn run(
             served,
             needs,
         ),
+    )?;
+    // A reference to one of the job's secrets is resolved with the secrets a node is given
+    // beside the document (system design 3B); a run here is given none, so it is refused, as a
+    // reference without its secret is everywhere.
+    map(
+        py,
+        moruna_runtime::job::build::refuse_secret_refs(&job.object_store, LOCAL_SECRET_REF)
+            .map_err(refusal),
     )?;
     // A run starts from its plan (SDD 26 f.5): the default planner's, as `moruna run` does.
     let plan = map(py, moruna_runtime::job::plan::default_plan(&job))?;
