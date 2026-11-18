@@ -262,6 +262,27 @@ pub fn holds_worker(queued: usize) -> bool {
     queued > QUEUED_MAX
 }
 
+/// Whether a unit answers its whole morsel before it returns: the stage's first, the one that
+/// begins before any of the stage's tasks has answered, so before its answers' schema is known.
+///
+/// The controller measures a stage with a probe, one morsel through one unit, and sizes the
+/// stage from what that unit took and gave: its bytes out over its bytes in, its time and its
+/// peak. The probe is the stage's first unit. A unit that returns with the answers that have
+/// come gives the answers to `max(1, n - IN_FLIGHT)` of its morsel's `n` pieces, so the
+/// controller read a part of a function's output as the whole: half, for 6.2 run 3's 16 MiB
+/// probe in pieces of 16 MiB (6.3j). Every later unit returns with what has come, as before:
+/// one engine worker keeps every task of the stage busy.
+pub fn answers_whole(schema_known: bool) -> bool {
+    !schema_known
+}
+
+/// Whether a unit waits for its task's oldest answer before it goes on: while it has pieces
+/// queued ([`holds_worker`]), and, when it answers its whole morsel ([`answers_whole`]), while
+/// any piece is in flight.
+pub fn waits_for_answer(queued: usize, in_flight: usize, whole: bool) -> bool {
+    holds_worker(queued) || (whole && in_flight > 0)
+}
+
 /// The largest piece: the region and windows it makes are what a task holds in flight, never a
 /// share of the budget. Budget shares made each task's plane up to 512 MiB, all of it zeroed
 /// when it was made and charged to the engine (the NYC gate, 2026-11-17).
@@ -844,6 +865,55 @@ mod tests {
         // One task, all the work: nothing is lost.
         let (one, _, _) = deal(1, 10, 3, (1, 5), true);
         assert_eq!(one, deal(1, 10, 3, (1, 5), false).0);
+    }
+
+    /// How many of a morsel's `pieces` its unit answers before it returns, over a task that
+    /// answers a piece when it is waited for and not before: `TaskState::pipelined`'s steps.
+    /// `schema_known` is whether any of the stage's tasks has answered before this unit.
+    fn answered(pieces: usize, schema_known: bool) -> usize {
+        let whole = answers_whole(schema_known);
+        let (mut queued, mut in_flight, mut answered) = (pieces, 0usize, 0usize);
+        let feed = |queued: &mut usize, in_flight: &mut usize| {
+            let post = to_post(*in_flight, *queued);
+            *queued -= post;
+            *in_flight += post;
+        };
+        feed(&mut queued, &mut in_flight);
+        if !schema_known {
+            // The task's first answer, whose schema stands for the rest.
+            in_flight -= 1;
+            answered += 1;
+            feed(&mut queued, &mut in_flight);
+        }
+        while waits_for_answer(queued, in_flight, whole) {
+            in_flight -= 1;
+            answered += 1;
+            feed(&mut queued, &mut in_flight);
+        }
+        assert_eq!(queued, 0, "a unit leaves no piece queued");
+        answered
+    }
+
+    #[test]
+    fn p_the_stage_s_first_unit_answers_its_whole_morsel() {
+        assert!(answers_whole(false) && !answers_whole(true));
+        assert!(waits_for_answer(0, 1, true) && !waits_for_answer(0, 0, true));
+        assert!(waits_for_answer(1, 0, false) && !waits_for_answer(0, 3, false));
+        // The stage's first unit, which a probe is: every piece's answer, however many pieces
+        // its morsel is. It gave the answers to max(1, n - IN_FLIGHT) of n: half of 6.2 run
+        // 3's probe, a morsel of two pieces.
+        for pieces in 1..=12 {
+            assert_eq!(answered(pieces, false), pieces, "{pieces} pieces");
+        }
+        // Every later unit returns with what has come: none here, where the task answers only
+        // what is waited for, but the answers it takes to post its queued pieces.
+        for pieces in 1..=12 {
+            assert_eq!(
+                answered(pieces, true),
+                pieces.saturating_sub(IN_FLIGHT as usize),
+                "{pieces} pieces"
+            );
+        }
     }
 
     #[test]
