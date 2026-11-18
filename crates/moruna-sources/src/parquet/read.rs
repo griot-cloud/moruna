@@ -17,6 +17,15 @@ use crate::util::{oversized, page_ceil, page_floor, resolve_range, source_err};
 /// Projected column chunks closer together than this are fetched as one range (f.3).
 const COALESCE_GAP: u64 = 1024 * 1024;
 
+/// The most one request of an object's range asks for (f.3, item 6.3t): a range is fetched in
+/// requests of at most this many bytes, cut where a column chunk starts so no page is split, and
+/// every request of a fetch is issued before any is waited for, so the reactor runs them at once
+/// (up to `reactor.object_concurrency`). One request per range read a node's year of taxi trips
+/// from Blob at about 43 MB/s, one row group after another (6.2 run 3). It is the scale of the
+/// least part a store takes for a write (5 MiB, `S3_PART_MIN_BYTES`), so a request's latency is
+/// paid on a few megabytes, not on a byte or a whole group.
+const OBJECT_REQUEST_MAX: u64 = 8 * 1024 * 1024;
+
 /// Read a split, or a row range of it, into arena buffers of `tier`, when the future is polled.
 ///
 /// The future borrows the allocator for `'a` (contracts d.6), so the read happens when the drive
@@ -96,10 +105,16 @@ fn fetch_now(
         spans.push(span);
     }
     spans.sort_unstable();
-    let ranges = coalesce(&spans, page, file_len);
+    let mut ranges = coalesce(&spans, page, file_len);
+    if file.object {
+        ranges = requests(&ranges, &spans, OBJECT_REQUEST_MAX);
+    }
 
-    let mut fetched: Vec<(u64, Bytes)> = Vec::with_capacity(ranges.len());
-    for (start, end) in ranges {
+    // Every request is issued before any is waited for, so they are in flight together (6.3t);
+    // a range that cannot be laid out in the arena ends the fetch, and the requests already
+    // issued are dropped with their buffers.
+    let mut issued = Vec::with_capacity(ranges.len());
+    for &(start, end) in &ranges {
         let length = usize::try_from(end - start).map_err(|_| {
             source_err(
                 split.id,
@@ -110,16 +125,24 @@ fn fetch_now(
         // An object's range is clipped to the length the store reported at plan time, so the
         // read is exact; a local file may be read short at its end (f.3).
         let read = if file.object {
-            source
-                .reactor()
-                .read_object(&file.url, start, buffer)
-                .wait()
-                .map(|buffer| (buffer, length))
+            Issued::Object(
+                source.reactor().read_object(&file.url, start, buffer),
+                length,
+            )
         } else {
-            source
-                .reactor()
-                .read_file_opt(&file.path, start, buffer, true)
-                .wait()
+            Issued::File(
+                source
+                    .reactor()
+                    .read_file_opt(&file.path, start, buffer, true),
+            )
+        };
+        issued.push((start, end, read));
+    }
+    let mut fetched: Vec<(u64, Bytes)> = Vec::with_capacity(issued.len());
+    for (start, end, read) in issued {
+        let read = match read {
+            Issued::Object(completion, length) => completion.wait().map(|b| (b, length)),
+            Issued::File(completion) => completion.wait(),
         };
         let (buffer, filled) = read.map_err(|e| {
             source_err(
@@ -350,6 +373,38 @@ fn page_rows(indexed: &ParquetMetaData, projected: &[usize]) -> Option<u64> {
         .min()
 }
 
+/// A request of a fetch, issued and not yet waited for.
+enum Issued {
+    /// An object's bytes, and the length asked for (an object's read is exact).
+    Object(moruna_kernel::Completion<moruna_kernel::Buffer>, usize),
+    /// A file's bytes and how many came.
+    File(moruna_kernel::Completion<(moruna_kernel::Buffer, usize)>),
+}
+
+/// `ranges` cut into requests of at most `most` bytes (6.3t). A cut falls only where one of
+/// `spans` (the projected column chunks) starts, so every page lies inside one request and
+/// the requests' bytes are the ranges' bytes, ascending and non-overlapping. A column chunk
+/// longer than `most` is one request of its own.
+fn requests(ranges: &[(u64, u64)], spans: &[(u64, u64)], most: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::with_capacity(ranges.len());
+    for &(start, end) in ranges {
+        let mut from = start;
+        for &(span_start, span_end) in spans {
+            // Only a span that starts inside the request, past its start, is a place to cut.
+            if span_start <= from || span_start >= end {
+                continue;
+            }
+            // Cut before this span when taking it would carry the request past `most`.
+            if span_end.min(end) - from > most {
+                out.push((from, span_start));
+                from = span_start;
+            }
+        }
+        out.push((from, end));
+    }
+    out
+}
+
 /// Merge spans whose gap is under `COALESCE_GAP`, then round each outward to page boundaries
 /// and clip to the file (f.3). The result is ascending and non-overlapping.
 fn coalesce(spans: &[(u64, u64)], page: u64, file_len: u64) -> Vec<(u64, u64)> {
@@ -397,6 +452,57 @@ fn concat(
 
 #[cfg(test)]
 mod tests {
+    use super::requests;
+
+    /// 6.3t: a range is cut into requests of at most `most` bytes, only where a column chunk
+    /// starts, so each chunk (and every page in it) lies in one request, and the requests cover
+    /// the range exactly, in order.
+    #[test]
+    fn a_range_is_cut_into_requests_at_chunk_starts() {
+        let mb = 1u64 << 20;
+        // Six chunks of 3 MiB, one range over them (page-rounded at its two ends).
+        let spans: Vec<(u64, u64)> = (0..6)
+            .map(|i| (100 + i * 3 * mb, 100 + (i + 1) * 3 * mb))
+            .collect();
+        let range = (0, 100 + 18 * mb + 4000);
+        let out = requests(&[range], &spans, 8 * mb);
+        assert_eq!(out.first().map(|r| r.0), Some(range.0));
+        assert_eq!(out.last().map(|r| r.1), Some(range.1));
+        for pair in out.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "contiguous: {out:?}");
+        }
+        for (start, end) in &out {
+            assert!(
+                end - start <= 8 * mb + 4000,
+                "at most the cap, past the rounding: {out:?}"
+            );
+            assert!(
+                *start == range.0 || spans.iter().any(|s| s.0 == *start),
+                "a cut is a chunk's start: {out:?}"
+            );
+        }
+        for (s, e) in &spans {
+            assert!(
+                out.iter().any(|(a, b)| a <= s && e <= b),
+                "chunk {s}..{e} in one request: {out:?}"
+            );
+        }
+        assert_eq!(out.len(), 3, "18 MiB in requests of at most 8 MiB: {out:?}");
+    }
+
+    /// A chunk longer than the cap is one request of its own, and a range under the cap stays
+    /// one request.
+    #[test]
+    fn a_long_chunk_is_one_request_and_a_short_range_stays_whole() {
+        let mb = 1u64 << 20;
+        let spans = vec![(0, 20 * mb), (20 * mb, 21 * mb), (21 * mb, 22 * mb)];
+        let out = requests(&[(0, 22 * mb)], &spans, 8 * mb);
+        assert_eq!(out, vec![(0, 20 * mb), (20 * mb, 22 * mb)]);
+        let short = requests(&[(0, 3 * mb)], &[(0, mb), (mb, 3 * mb)], 8 * mb);
+        assert_eq!(short, vec![(0, 3 * mb)]);
+        assert!(requests(&[], &spans, 8 * mb).is_empty());
+    }
+
     use super::*;
 
     #[test]
