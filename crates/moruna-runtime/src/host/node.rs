@@ -202,9 +202,10 @@ fn file_urls(field: &str, value: &Value, found: &mut Vec<String>) {
 /// `node-admission` keeps with the job (system design 3A, 3C, 3D, 3E).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NodeNeeds {
-    /// The hosts it reaches from its object-store settings: the S3 endpoint's host,
-    /// `<account>.blob.core.windows.net` for Azure, `storage.googleapis.com` for GCS. Each once,
-    /// sorted.
+    /// The hosts it reaches from its object-store settings, and nothing else (system design 3D,
+    /// item 3.5): the S3 endpoint's host (`s3.<region>.amazonaws.com` with none), and
+    /// `<account>.blob.core.windows.net` for Azure Blob. Each once, sorted. A job on a node
+    /// reaches no other store.
     pub hosts: Vec<String>,
     /// Each `disk://<serial>` it names, written by a sink and only read otherwise; a serial
     /// both read and written is written; the one `staging.dir` names is written, and its
@@ -310,16 +311,33 @@ fn disk_serial(text: &str) -> Option<&str> {
     (!serial.is_empty()).then_some(serial)
 }
 
-/// Whether `value` holds an `s3://` URL, in any case of the scheme.
-fn names_s3(value: &Value) -> bool {
+/// Whether `value` holds a URL of one of `schemes` (each with its `://`), in any case.
+fn names_scheme(value: &Value, schemes: &[&str]) -> bool {
     match value {
-        Value::String(text) => text
-            .get(..5)
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("s3://")),
-        Value::Array(items) => items.iter().any(names_s3),
-        Value::Object(map) => map.values().any(names_s3),
+        Value::String(text) => schemes.iter().any(|scheme| {
+            text.get(..scheme.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(scheme))
+        }),
+        Value::Array(items) => items.iter().any(|item| names_scheme(item, schemes)),
+        Value::Object(map) => map.values().any(|item| names_scheme(item, schemes)),
         _ => false,
     }
+}
+
+/// Whether any of `job`'s tasks names a URL of one of `schemes`.
+fn tasks_name(job: &Job, schemes: &[&str]) -> bool {
+    job.tasks
+        .iter()
+        .any(|task| task.settings.values().any(|v| names_scheme(v, schemes)))
+}
+
+/// Whether `account` is an Azure storage account's name: 3 to 24 lowercase letters and digits,
+/// so that `<account>.blob.core.windows.net` is the one host it names.
+fn is_storage_account(account: &str) -> bool {
+    (3..=24).contains(&account.len())
+        && account
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 /// Every `disk://` URL's serial in `value`, with its place under `field`.
@@ -433,9 +451,6 @@ pub fn needs(job: &Job) -> NodeNeeds {
             account.to_ascii_lowercase()
         ));
     }
-    if store.gcs.is_some() {
-        hosts.push("storage.googleapis.com".to_string());
-    }
     hosts.sort();
     hosts.dedup();
     // Each serial: whether the job writes it, and whether it stages there.
@@ -508,13 +523,7 @@ pub fn refusals(job: &Job, node: &Node) -> Vec<SpecError> {
     // URLs with no `object_store.s3` at all, would leave a host the node cannot name.
     let unnamed = match &job.object_store.s3 {
         Some(s3) => s3.endpoint.is_none() && s3.region.is_none(),
-        None => job.tasks.iter().any(|task| {
-            let mut found = false;
-            for value in task.settings.values() {
-                found |= names_s3(value);
-            }
-            found
-        }),
+        None => tasks_name(job, &["s3://"]),
     };
     if unnamed {
         refused.push(SpecError::new(
@@ -522,6 +531,31 @@ pub fn refusals(job: &Job, node: &Node) -> Vec<SpecError> {
             "a job on a node that uses AWS's own S3 names its region: the node lets the job \
              reach s3.<region>.amazonaws.com and nothing else",
         ));
+    }
+    // Azure Blob is its account's host (item 3.5): a job that uses it names the account, and
+    // the account is one Azure could have, so that the host is that and nothing else.
+    match job
+        .object_store
+        .azure
+        .as_ref()
+        .and_then(|a| a.account.as_deref())
+    {
+        Some(account) if !is_storage_account(account) => refused.push(SpecError::new(
+            "object_store.azure.account",
+            "an Azure storage account's name is 3 to 24 lowercase letters and digits: the node \
+             lets the job reach <account>.blob.core.windows.net and nothing else",
+        )),
+        Some(_) => {}
+        None if job.object_store.azure.is_some()
+            || tasks_name(job, &["az://", "abfs://", "azure://"]) =>
+        {
+            refused.push(SpecError::new(
+                "object_store.azure.account",
+                "a job on a node that uses Azure Blob names its storage account: the node lets \
+                 the job reach <account>.blob.core.windows.net and nothing else",
+            ))
+        }
+        None => {}
     }
     if let Some(attached) = &node.volumes {
         volume_refusals(job, attached, &mut refused);

@@ -337,6 +337,11 @@ pub struct S3Doc {
     /// The session token, a reference to one of the job's secrets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_token: Option<SecretRef>,
+    /// Virtual-host requests: `endpoint` is the bucket's own host (`https://<bucket>.<host>`)
+    /// and a request names the key alone, as `object_store`'s `virtual_hosted_style_request`.
+    /// Off, the default, a request names the bucket in its path (path-style).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub virtual_hosted_style_request: bool,
 }
 
 /// `object_store.gcs`.
@@ -361,9 +366,13 @@ pub struct AzureDoc {
     /// Default container.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
-    /// The access key, a reference to one of the job's secrets.
+    /// The account key, a reference to one of the job's secrets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access_key: Option<SecretRef>,
+    /// A shared access signature (SAS) token, the query string Azure gives, a reference to one
+    /// of the job's secrets: in place of the account key, never beside it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sas_token: Option<SecretRef>,
 }
 
 impl ObjectStoreDoc {
@@ -394,12 +403,44 @@ impl ObjectStoreDoc {
                 "object_store.azure.access_key",
                 azure.and_then(|a| a.access_key.as_ref()),
             ),
+            (
+                "object_store.azure.sas_token",
+                azure.and_then(|a| a.sas_token.as_ref()),
+            ),
         ]
         .into_iter()
         .filter_map(|(field, reference)| reference.map(|r| (field, r)))
         .collect()
     }
+
+    /// What the section refuses beyond each field's own form, as `(field, reason)`: virtual-host
+    /// requests with no endpoint to be the bucket's host, and Azure Blob's account key and SAS
+    /// token together.
+    pub fn refusal(&self) -> Option<(&'static str, &'static str)> {
+        if let Some(s3) = &self.s3
+            && s3.virtual_hosted_style_request
+            && s3.endpoint.is_none()
+        {
+            return Some((
+                "object_store.s3.virtual_hosted_style_request",
+                VIRTUAL_HOST_ENDPOINT,
+            ));
+        }
+        let azure = self.azure.as_ref()?;
+        (azure.access_key.is_some() && azure.sas_token.is_some())
+            .then_some(("object_store.azure.sas_token", BOTH_AZURE_CREDENTIALS))
+    }
 }
+
+/// What virtual-host requests with no endpoint are refused with.
+const VIRTUAL_HOST_ENDPOINT: &str = "virtual-host requests go to the bucket's own host, which \
+                                     the endpoint names: give it as https://<bucket>.<host>, or \
+                                     leave this out for path-style requests";
+
+/// What a section with both of Azure Blob's credentials is refused with.
+const BOTH_AZURE_CREDENTIALS: &str = "Azure Blob takes an account key or a SAS token, not \
+                                      both: refer to one of the job's secrets in access_key or \
+                                      in sas_token";
 
 /// `checkpoint` (MH 4.1).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -767,12 +808,13 @@ impl JobSpec {
 
 /// Read one top-level section into its type, so a refusal names the section.
 /// The places in `object_store` where a credential belongs, as `(store, field)`.
-const SECRET_FIELDS: [(&str, &str); 5] = [
+const SECRET_FIELDS: [(&str, &str); 6] = [
     ("s3", "access_key_id"),
     ("s3", "secret_access_key"),
     ("s3", "session_token"),
     ("gcs", "service_account_json"),
     ("azure", "access_key"),
+    ("azure", "sas_token"),
 ];
 
 /// Each place in an `object_store` section where a credential belongs holds a reference to one
@@ -804,7 +846,12 @@ fn check_section(key: &str, section: &serde_json::Value) -> Result<(), SpecError
         "staging" => read::<StagingDoc>(key, section),
         "object_store" => {
             check_secret_refs(section)?;
-            read::<ObjectStoreDoc>(key, section)
+            let doc = serde_json::from_value::<ObjectStoreDoc>(section.clone())
+                .map_err(|e| SpecError::new(key, e.to_string()))?;
+            match doc.refusal() {
+                Some((field, reason)) => Err(SpecError::new(field, reason)),
+                None => Ok(()),
+            }
         }
         "checkpoint" => read::<CheckpointDoc>(key, section),
         "error_policy" => read::<ErrorPolicyDoc>(key, section),

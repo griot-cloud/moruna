@@ -499,6 +499,7 @@ fn read_object_store(o: fb::ObjectStore<'_>) -> Result<ObjectStoreDoc, JobError>
             access_key_id: read_secret(s.access_key_id_ref()),
             secret_access_key: read_secret(s.secret_access_key_ref()),
             session_token: read_secret(s.session_token_ref()),
+            virtual_hosted_style_request: s.virtual_hosted_style_request(),
         }),
         gcs: o.gcs().map(|g| GcsDoc {
             bucket: g.bucket().map(str::to_string),
@@ -508,6 +509,7 @@ fn read_object_store(o: fb::ObjectStore<'_>) -> Result<ObjectStoreDoc, JobError>
             account: a.account().map(str::to_string),
             container: a.container().map(str::to_string),
             access_key: read_secret(a.access_key_ref()),
+            sas_token: read_secret(a.sas_token_ref()),
         }),
         local_root: o.local_root().map(str::to_string),
         allow_http: o.allow_http(),
@@ -519,6 +521,9 @@ fn read_object_store(o: fb::ObjectStore<'_>) -> Result<ObjectStoreDoc, JobError>
                 format!("`{}` is not a secret's name", reference.secret),
             ));
         }
+    }
+    if let Some((field, reason)) = doc.refusal() {
+        return Err(JobError::field(field, reason));
     }
     Ok(doc)
 }
@@ -554,6 +559,7 @@ fn write_object_store<'b>(
                 access_key_id_ref,
                 secret_access_key_ref,
                 session_token_ref,
+                virtual_hosted_style_request: s.virtual_hosted_style_request,
             },
         )
     });
@@ -572,12 +578,14 @@ fn write_object_store<'b>(
         let account = opt_str(b, &a.account);
         let container = opt_str(b, &a.container);
         let access_key_ref = write_secret(b, &a.access_key);
+        let sas_token_ref = write_secret(b, &a.sas_token);
         fb::Azure::create(
             b,
             &fb::AzureArgs {
                 account,
                 container,
                 access_key_ref,
+                sas_token_ref,
             },
         )
     });

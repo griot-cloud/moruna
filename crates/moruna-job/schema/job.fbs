@@ -107,6 +107,8 @@ table S3 {
   access_key_id_ref: SecretRef;
   secret_access_key_ref: SecretRef;
   session_token_ref: SecretRef;
+  // The endpoint is the bucket's own host, and a request names the key alone.
+  virtual_hosted_style_request: bool;
 }
 
 table Gcs {
@@ -121,6 +123,8 @@ table Azure {
   access_key: string (deprecated);
   container: string;
   access_key_ref: SecretRef;
+  // A SAS token, in place of the account key.
+  sas_token_ref: SecretRef;
 }
 
 table ObjectStore {

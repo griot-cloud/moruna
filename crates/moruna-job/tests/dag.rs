@@ -82,6 +82,7 @@ fn every_section() -> Job {
             access_key_id: Some(SecretRef::new("aws.id")),
             secret_access_key: Some(SecretRef::new("aws.key")),
             session_token: Some(SecretRef::new("aws:token")),
+            virtual_hosted_style_request: true,
         }),
         gcs: Some(moruna_job::GcsDoc {
             bucket: Some("g".into()),
@@ -91,6 +92,7 @@ fn every_section() -> Job {
             account: Some("a".into()),
             container: Some("c".into()),
             access_key: Some(SecretRef::new("azure-key_1")),
+            sas_token: None,
         }),
         local_root: Some("/root".into()),
         allow_http: true,

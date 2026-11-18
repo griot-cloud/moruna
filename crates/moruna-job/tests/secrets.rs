@@ -157,3 +157,88 @@ fn version_2_refuses_a_reference_that_is_not_a_secrets_name() {
         other => panic!("refused by its field, not {other:?}"),
     }
 }
+
+/// Azure Blob's credential is an account key or a SAS token (item 3.5), each a reference to one
+/// of the job's secrets, kept through version 2; both at once are refused by the token's field,
+/// in either version, and a literal token as any literal credential is.
+#[test]
+fn a_blob_sas_token_is_a_reference_in_place_of_the_account_key() {
+    let sas = json!({"azure": {"account": "acct", "sas_token": {"secret": "blob-sas"}}});
+    let job = Job::from_v1(&JobSpec::from_json(&document(sas)).expect("a SAS token is taken"));
+    let refs: Vec<(&str, &str)> = job
+        .object_store
+        .secret_refs()
+        .into_iter()
+        .map(|(field, r)| (field, r.secret.as_str()))
+        .collect();
+    assert_eq!(refs, [("object_store.azure.sas_token", "blob-sas")]);
+    let back = Job::from_flatbuffer(&job.to_flatbuffer().expect("encodes")).expect("reads");
+    assert_eq!(back.object_store, job.object_store);
+    assert_eq!(check_secrets(&job, &["blob-sas"]), Ok(()));
+    assert_eq!(
+        check_secrets(&job, &[]).unwrap_err()[0].field,
+        "object_store.azure.sas_token"
+    );
+
+    let both = json!({"azure": {"account": "acct", "access_key": {"secret": "blob-key"},
+                                "sas_token": {"secret": "blob-sas"}}});
+    let refused = JobSpec::from_json(&document(both)).expect_err("both are refused");
+    assert_eq!(refused.field, "object_store.azure.sas_token");
+    assert!(refused.reason.contains("not both"), "{}", refused.reason);
+    let mut job = Job::from_v1(&JobSpec::from_json(&document(json!({}))).unwrap());
+    job.object_store.azure = Some(moruna_job::AzureDoc {
+        access_key: Some(SecretRef::new("blob-key")),
+        sas_token: Some(SecretRef::new("blob-sas")),
+        ..Default::default()
+    });
+    match Job::from_flatbuffer(&job.to_flatbuffer().expect("encodes")) {
+        Err(JobError::Field { field, reason }) => {
+            assert_eq!(field, "object_store.azure.sas_token");
+            assert!(reason.contains("not both"), "{reason}");
+        }
+        other => panic!("refused by its field, not {other:?}"),
+    }
+
+    let literal = json!({"azure": {"sas_token": "sv=2024-11-04&sig=c2VjcmV0"}});
+    let refused = JobSpec::from_json(&document(literal)).expect_err("a literal token");
+    assert_eq!(refused.field, "object_store.azure.sas_token");
+    assert!(refused.reason.contains(LITERAL_CREDENTIAL));
+    assert!(!refused.reason.contains("c2VjcmV0"));
+}
+
+/// An S3 endpoint is path-style unless the document says it is the bucket's own host: the
+/// setting is written only when it is on, and kept through version 2.
+#[test]
+fn an_s3_endpoint_is_path_style_unless_it_is_the_buckets_own_host() {
+    let path = json!({"s3": {"endpoint": "https://objects.example.com", "region": "r"}});
+    let job = Job::from_v1(&JobSpec::from_json(&document(path)).unwrap());
+    let s3 = job.object_store.s3.as_ref().expect("s3");
+    assert!(!s3.virtual_hosted_style_request);
+    assert!(
+        serde_json::to_value(s3)
+            .unwrap()
+            .get("virtual_hosted_style_request")
+            .is_none(),
+        "off is not written"
+    );
+    let host = json!({"s3": {"endpoint": "https://in.objects.example.com", "region": "r",
+                             "virtual_hosted_style_request": true}});
+    let job = Job::from_v1(&JobSpec::from_json(&document(host)).unwrap());
+    assert!(
+        job.object_store
+            .s3
+            .as_ref()
+            .unwrap()
+            .virtual_hosted_style_request
+    );
+    let back = Job::from_flatbuffer(&job.to_flatbuffer().expect("encodes")).expect("reads");
+    assert_eq!(back.object_store, job.object_store);
+    // With no endpoint there is no bucket's host to name: refused by the setting's field.
+    let nowhere = json!({"s3": {"region": "r", "virtual_hosted_style_request": true}});
+    let refused = JobSpec::from_json(&document(nowhere)).expect_err("no endpoint");
+    assert_eq!(
+        refused.field,
+        "object_store.s3.virtual_hosted_style_request"
+    );
+    assert!(refused.reason.contains("endpoint"), "{}", refused.reason);
+}
