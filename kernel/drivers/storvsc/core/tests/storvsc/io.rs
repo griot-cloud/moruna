@@ -1,11 +1,12 @@
 //! The operations a block driver needs: capacity and block size, reads and writes of a block
-//! range by guest page numbers, flush, the serial, and requests in flight together.
+//! range by guest page numbers, flush, the serial, a target's LUNs, and requests in flight
+//! together.
 
 use std::collections::BTreeMap;
 
 use moruna_storvsc::{
-    Address, ChannelError, Disk, Error, Event, Malformed, Operation, PAGE, Storvsc, Wait,
-    scsi::SERIAL_BYTES, serial,
+    AdditionalSenseCode, Address, ChannelError, Disk, Error, Event, Failure, Malformed, Operation,
+    PAGE, SenseKey, SrbStatus, Storvsc, Wait, luns, scsi::SERIAL_BYTES, serial,
 };
 
 use crate::{
@@ -154,6 +155,157 @@ fn flush() {
     let id = device.flush(DISK).unwrap();
     assert_eq!(moved(&mut device, id), 0);
     assert_eq!(flushes(&host), 2);
+}
+
+#[test]
+fn a_transfer_starts_at_a_byte_offset_in_its_first_page() {
+    let (mut device, host) = device();
+    let disk = disk(&mut device, &host, 0);
+    let data = pattern(7, 3 * 512);
+    // Written from byte 1000 of page 10, so across pages 10 and 11.
+    host.borrow_mut()
+        .memory
+        .write_at(&[10, 11], 1000, &data)
+        .unwrap();
+    let id = device.write_offset(&disk, 4, 3, 1000, &[10, 11]).unwrap();
+    assert_eq!(moved(&mut device, id), 1536);
+    // Read back into byte 3000 of page 20, across pages 20 and 21; nothing before it moves.
+    let id = device
+        .read_offset(&disk, 4, 3, 3000, &[20, 21, 22])
+        .unwrap();
+    assert_eq!(moved(&mut device, id), 1536);
+    let memory = &host.borrow().memory;
+    assert_eq!(memory.read_from(&[20, 21], 3000, 1536).unwrap(), data);
+    assert_eq!(memory.read(&[20], 3000).unwrap(), vec![0; 3000]);
+    assert_eq!(memory.read(&[22], PAGE).unwrap(), vec![0; PAGE]);
+}
+
+#[test]
+fn an_offset_is_within_the_first_page_and_its_pages_cover_the_transfer() {
+    let (mut device, host) = device();
+    let disk = disk(&mut device, &host, 0);
+    assert!(matches!(
+        device.read_offset(&disk, 0, 1, PAGE, &[1, 2]),
+        Err(Error::Offset)
+    ));
+    // 512 bytes from byte 3700 reach into a second page.
+    assert!(matches!(
+        device.write_offset(&disk, 0, 1, 3700, &[1]),
+        Err(Error::ShortBuffer)
+    ));
+    assert_eq!(device.in_flight(), 0);
+
+    // A ring of one page names fewer pages than the host would move: the largest transfer
+    // is the ring's, and an offset would make it name one page more.
+    let (link, host) = pair_sized(PAGE);
+    host.borrow_mut().max_transfer_bytes = 0x40_0000;
+    host.borrow_mut().disks.insert(
+        (DISK.path, DISK.target, DISK.lun),
+        FakeDisk::new(512, 16384, b""),
+    );
+    let mut device = Storvsc::new(link).unwrap();
+    ready(&mut device);
+    let disk = crate::disk(&mut device, &host, 0);
+    let count = device.max_transfer_bytes() / disk.block_size();
+    let pages: Vec<u64> = (0..=count as u64).collect();
+    assert!(matches!(
+        device.read_offset(&disk, 0, count, 512, &pages),
+        Err(Error::TooLarge)
+    ));
+    assert_eq!(device.in_flight(), 0);
+}
+
+#[test]
+fn report_luns_lists_the_disks_of_a_target() {
+    let (mut device, host) = device();
+    {
+        let mut host = host.borrow_mut();
+        host.disks
+            .insert((0, 0, 0), FakeDisk::new(512, 64, b"root"));
+        host.disks.insert((0, 1, 5), FakeDisk::new(512, 64, b""));
+    }
+    let listed = |device: &mut Storvsc<_>, target: u8| {
+        let id = device
+            .report_luns(
+                Address {
+                    path: 0,
+                    target,
+                    lun: 9,
+                },
+                4,
+            )
+            .unwrap();
+        let completion = next(device);
+        assert_eq!(completion.id, id);
+        completion.result.map(|n| {
+            let answer = host.borrow().memory.read(&[4], n as usize).unwrap();
+            luns(&answer).unwrap()
+        })
+    };
+    // Sent to LUN 0 of the target whatever the address says, which the fake checks.
+    assert_eq!(listed(&mut device, 0), Ok(vec![0, DISK.lun]));
+    assert_eq!(listed(&mut device, 1), Ok(vec![5]));
+    // A target with no disk is not there.
+    let Err(Failure::Scsi(none)) = listed(&mut device, 2) else {
+        panic!("a target with no disk answered");
+    };
+    assert_eq!(none.srb, SrbStatus::INVALID_TARGET_ID);
+    // A device that does not know the command refuses it.
+    host.borrow_mut().refuse_report_luns = true;
+    let Err(Failure::Scsi(refused)) = listed(&mut device, 0) else {
+        panic!("a refused REPORT LUNS answered");
+    };
+    assert_eq!(
+        refused.sense.map(|s| (s.key, s.code)),
+        Some((
+            SenseKey::ILLEGAL_REQUEST,
+            AdditionalSenseCode::ILLEGAL_COMMAND
+        ))
+    );
+}
+
+#[test]
+fn a_lun_list_is_checked_and_holds_what_a_request_can_name() {
+    let list = |entries: &[[u8; 8]]| {
+        let mut bytes = ((entries.len() * 8) as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(&[0; 4]);
+        for entry in entries {
+            bytes.extend_from_slice(entry);
+        }
+        bytes
+    };
+    assert_eq!(luns(&list(&[])).unwrap(), Vec::<u8>::new());
+    let named = luns(&list(&[
+        [0, 3, 0, 0, 0, 0, 0, 0],
+        // Flat addressing.
+        [0x40, 7, 0, 0, 0, 0, 0, 0],
+        // Again: once.
+        [0, 3, 0, 0, 0, 0, 0, 0],
+        // Flat, above 255.
+        [0x41, 0, 0, 0, 0, 0, 0, 0],
+        // On bus 1.
+        [0x01, 2, 0, 0, 0, 0, 0, 0],
+        // Two levels.
+        [0, 1, 0, 2, 0, 0, 0, 0],
+        // Logical unit addressing.
+        [0x80, 1, 0, 0, 0, 0, 0, 0],
+    ]))
+    .unwrap();
+    assert_eq!(named, [3, 7]);
+    // A list cut short at the bytes asked for: what arrived is used.
+    let mut short = list(&[[0, 1, 0, 0, 0, 0, 0, 0], [0, 2, 0, 0, 0, 0, 0, 0]]);
+    short[3] = 64;
+    assert_eq!(luns(&short).unwrap(), [1, 2]);
+    assert_eq!(
+        luns(&[0; 7]),
+        Err(Malformed("a LUN list shorter than its header"))
+    );
+    let mut ragged = list(&[[0, 1, 0, 0, 0, 0, 0, 0]]);
+    ragged[3] = 9;
+    assert_eq!(
+        luns(&ragged),
+        Err(Malformed("a LUN list whose length is not whole entries"))
+    );
 }
 
 #[test]
@@ -442,6 +594,32 @@ fn a_wait_returns_at_once_when_a_packet_is_there() {
 }
 
 #[test]
+fn arm_leaves_the_hosts_signal_on_and_says_when_there_is_work() {
+    let (mut device, host) = device();
+    // Nothing to read and nothing refused: nothing to do, and nothing slept.
+    let idles = host.borrow().idles;
+    assert!(!device.arm().unwrap());
+    assert_eq!(host.borrow().idles, idles);
+    // With the signal on, the host signals as it answers.
+    let id = device.flush(DISK).unwrap();
+    assert!(device.arm().unwrap(), "the answer is in the ring");
+    assert_eq!(next(&mut device).id, id);
+    assert!(matches!(device.poll(), Ok(None)));
+    assert!(!device.arm().unwrap());
+    assert_eq!(
+        device.wait(Some(0)).unwrap(),
+        Wait::Signalled,
+        "the host's signal, which the channel kept"
+    );
+    // A wait turns the signal off again: the next answer comes unsignalled.
+    let id = device.flush(DISK).unwrap();
+    assert_eq!(next(&mut device).id, id);
+    assert_eq!(device.wait(Some(0)).unwrap(), Wait::TimedOut);
+    // The channel the driver waits on is the device's.
+    assert_eq!(device.channel().host_signals(), host.borrow().signals);
+}
+
+#[test]
 fn a_closed_channel_is_an_error_to_the_caller() {
     let (mut device, host) = device();
     // The host takes the channel away; the guest learns of it at its next call on it.
@@ -586,6 +764,10 @@ fn every_error_says_what_it_is() {
         (
             Error::ShortBuffer,
             "the pages given do not cover the transfer",
+        ),
+        (
+            Error::Offset,
+            "a byte offset that is not within the first page",
         ),
     ];
     for (error, text) in errors {

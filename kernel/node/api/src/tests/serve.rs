@@ -126,19 +126,9 @@ impl Https {
 
     /// `GET path`, with `token` when given: the answer.
     fn get(&mut self, path: &str, token: Option<&str>) -> Answer {
-        let authorization =
-            token.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
-        let request = format!("GET {path} HTTP/1.1\r\nHost: node\r\n{authorization}\r\n");
-        self.tls.writer().write_all(request.as_bytes()).unwrap();
+        self.send(path, token);
         loop {
-            while self.tls.wants_write() {
-                let mut out = Vec::new();
-                self.tls.write_tls(&mut out).unwrap();
-                let mut at = 0;
-                while at < out.len() {
-                    at += send(&mut self.host, self.socket, &out[at..]).expect("sent") as usize;
-                }
-            }
+            self.flush();
             if let Some(answer) = self.answer() {
                 return answer;
             }
@@ -152,6 +142,27 @@ impl Https {
                     break;
                 }
                 self.received.extend_from_slice(&plain[..count]);
+            }
+        }
+    }
+
+    /// Sends `GET path`, with `token` when given, and waits for no answer.
+    fn send(&mut self, path: &str, token: Option<&str>) {
+        let authorization =
+            token.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
+        let request = format!("GET {path} HTTP/1.1\r\nHost: node\r\n{authorization}\r\n");
+        self.tls.writer().write_all(request.as_bytes()).unwrap();
+        self.flush();
+    }
+
+    /// Sends what TLS has to send.
+    fn flush(&mut self) {
+        while self.tls.wants_write() {
+            let mut out = Vec::new();
+            self.tls.write_tls(&mut out).unwrap();
+            let mut at = 0;
+            while at < out.len() {
+                at += send(&mut self.host, self.socket, &out[at..]).expect("sent") as usize;
             }
         }
     }
@@ -261,6 +272,9 @@ fn the_node_serves_its_api_over_https_on_the_leased_address() {
     let health = https.get("/v1/health", None);
     assert_eq!(health.status, 200);
     assert_eq!(health.body, serde_json::json!({"status": "ok"}));
+    // The release build has no test route (work item 2.2c).
+    #[cfg(not(feature = "test-exit"))]
+    assert_eq!(https.get("/v1/test/exit", None).status, 404);
 
     let observe = signer.token(INSTANCE, WALL_CLOCK + 1_800, &["observe"]);
     let document = https.get("/v1/node", Some(&observe));
@@ -344,6 +358,47 @@ fn the_node_serves_its_api_over_https_on_the_leased_address() {
     node.end();
 }
 
+/// A start after the node's first ready (item 2.2c) is handed the node's `boot_ms`, and its
+/// node document says that, not when this start answered `ready`.
+#[test]
+fn a_later_start_s_node_document_says_the_node_s_boot_ms() {
+    let mut node = Node::start(true);
+    let outside = node.slot("listen-host");
+    let mut api = start_api(&mut node);
+    let signer = Signer::new();
+    let handover = Handover {
+        boot_ms: Some(1_234),
+        ..handover_of(&user_data(&[signer.public()], None))
+    };
+    api.platform
+        .send(
+            &handover.encode().expect("encoded"),
+            deadline_in(5 * SECOND),
+        )
+        .expect("the hand-over");
+    assert_eq!(
+        api.platform.receive(deadline_in(30 * SECOND)),
+        Ok(READY.to_vec())
+    );
+    let fingerprint = api.lines.lock().unwrap()[0]
+        .strip_prefix("moruna: tls sha256=")
+        .expect("the identity's line")
+        .to_string();
+    let mut https = Https::open(&outside, Endpoint::new(NODE_ADDRESS, 443), &fingerprint);
+    let observe = signer.token(INSTANCE, WALL_CLOCK + 1_800, &["observe"]);
+    let document = https.get("/v1/node", Some(&observe));
+    assert_eq!(document.status, 200, "{:?}", document.body);
+    assert_eq!(document.body["boot_ms"], 1_234);
+    node.stop.store(true, Ordering::SeqCst);
+    let error = api.thread.join().expect("api");
+    assert!(
+        matches!(error, Error::Network(_, CallError::PeerClosed)),
+        "{error:?}"
+    );
+    drop((https, outside, api.slot, api.platform));
+    node.end();
+}
+
 /// A hand-over that is refused stops the process before it makes an identity or listens.
 #[test]
 fn a_refused_hand_over_stops_the_process_before_it_listens() {
@@ -373,5 +428,38 @@ fn a_refused_hand_over_stops_the_process_before_it_listens() {
         thread::sleep(Duration::from_millis(50));
     }
     drop((other, api.slot, api.platform));
+    node.end();
+}
+
+/// A `cloud-test` build (work item 2.2c) ends on a request to its test route, having served
+/// before it: the process returns [`Error::TestExit`], for which `main` prints no fatal line.
+#[cfg(feature = "test-exit")]
+#[test]
+fn a_cloud_test_build_ends_on_a_request_to_its_test_route() {
+    let mut node = Node::start(true);
+    let outside = node.slot("listen-host");
+    let mut api = start_api(&mut node);
+    let signer = Signer::new();
+    let handover = handover_of(&user_data(&[signer.public()], None));
+    api.platform
+        .send(
+            &handover.encode().expect("encoded"),
+            deadline_in(5 * SECOND),
+        )
+        .expect("the hand-over");
+    assert_eq!(
+        api.platform.receive(deadline_in(30 * SECOND)),
+        Ok(READY.to_vec())
+    );
+    let fingerprint = api.lines.lock().unwrap()[0]
+        .strip_prefix("moruna: tls sha256=")
+        .expect("the identity's line")
+        .to_string();
+    let mut https = Https::open(&outside, Endpoint::new(NODE_ADDRESS, 443), &fingerprint);
+    assert_eq!(https.get("/v1/health", None).status, 200);
+    https.send(moruna_api_server::TEST_EXIT_PATH, None);
+    let error = api.thread.join().expect("api");
+    assert_eq!(error, Error::TestExit);
+    drop((https, outside, api.slot, api.platform));
     node.end();
 }

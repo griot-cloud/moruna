@@ -1,0 +1,37 @@
+# libmoruna_function.a, the C library of native functions (architecture/moruna-os-system.md, 5B):
+# the calls of moruna_function.h over moruna-function (5A), batches crossing by the Arrow C Data
+# Interface. Its own workspace, as kernel/function/rust is: arrow-rs's FFI is needed here only.
+# The kernel's toolchain (kernel/rust-toolchain.toml) is the one it builds with.
+[workspace]
+resolver = "3"
+
+[package]
+name = "moruna-function-c"
+description = "The C header of native Moruna functions over moruna-function, batches by the Arrow C Data Interface (system design 5B)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+# The archive C programs link: libmoruna_function.a.
+name = "moruna_function"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# moruna-function's own pins, so the batches are the arrow-rs types it reads and writes.
+arrow-array = { version = "=59.3.0", default-features = false, features = ["ffi"] }
+arrow-data = { version = "=59.3.0", default-features = false, features = ["ffi"] }
+arrow-schema = { version = "=59.3.0", default-features = false, features = ["ffi"] }
+# Renamed: this library is `moruna_function` to C, as the archive's name.
+sdk = { package = "moruna-function", path = "../rust" }
+
+[dev-dependencies]
+arrow-buffer = { version = "=59.3.0", default-features = false }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+debug = 1

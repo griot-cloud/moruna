@@ -1,6 +1,6 @@
 //! The machine's traits on the node itself: connections through the network server's sockets
-//! (`moruna.net`), the core's monotonic clock, and the channel the supervisor links to `api`; and
-//! the node's memory, from the supervisor's start message.
+//! (`moruna.net`), the core's monotonic clock, and the supervisor's channel to `platform`, which
+//! gives the node's memory and then the channel to each start of `api`.
 //!
 //! They are written on `moruna-svc`, which on a host is a model of the same kernel calls, so they
 //! are tested there too: the sockets against the real network server over its loopback.
@@ -8,14 +8,14 @@
 use alloc::{format, string::String, vec, vec::Vec};
 use core::net::{IpAddr, Ipv4Addr};
 
-use moruna_node::Bootstrap;
+use moruna_node::{Bootstrap, restart::api_started};
 use moruna_svc::{
-    CallError, Channel, DEADLINE_INFINITE, Error, Handle, Memory, Rights, Signals, map, now,
-    wait_one,
+    CallError, Channel, DEADLINE_INFINITE, Error, Handle, Memory, ObjectType, Rights, Signals, map,
+    now, wait_one,
 };
 use netstack_protocol::{Addr, Endpoint, Target, net};
 
-use crate::machine::{Clock, Link, LinkError, Network, Stream, StreamError};
+use crate::machine::{Clock, Control, Link, LinkError, Network, Stream, StreamError};
 
 /// The interface the node's address is read from.
 pub const INTERFACE: &str = "wan";
@@ -195,33 +195,82 @@ impl Clock for Monotonic {
     }
 }
 
-/// A channel as whole messages that carry no handle: the link to `api` (the hand-over, and its
-/// answer), and the supervisor's start message.
+/// A channel as whole messages that carry no handle: the link to one start of `api` (the
+/// hand-over, and its answer).
 pub struct ChannelLink(pub Channel);
 
-/// The node's memory, from the message the supervisor queues on `platform`'s `supervisor` slot
-/// before it starts `platform` (its `platform` bootstrap): the machine account's limit, which
-/// every service and job is carved from (item 1.4, PM 2026-11-18). The message is read by
-/// `deadline`, and anything but that bootstrap is refused.
-pub fn node_memory(supervisor: Channel, deadline: u64) -> Result<u64, String> {
-    let message = ChannelLink(supervisor)
-        .receive(deadline)
-        .map_err(|error| match error {
+/// `platform`'s bootstrap channel, its `supervisor` slot, whose end the supervisor keeps (PM,
+/// item 2.2c). Its first message is the node's memory: the machine account's limit, which every
+/// service and job is carved from (item 1.4, PM 2026-11-18). Then each start of `api`, the
+/// first included, sends [`moruna_node::restart::API_STARTED`] with that start's channel.
+pub struct ChannelControl(pub Channel);
+
+impl ChannelControl {
+    /// The node's memory, the first message, read by `deadline`; anything but `platform`'s
+    /// bootstrap is refused.
+    pub fn memory(&mut self, deadline: u64) -> Result<u64, String> {
+        let (message, handles) = receive(&self.0, deadline).map_err(|error| match error {
             LinkError::Closed => String::from("the supervisor closed its end and sent none"),
             error => format!("the supervisor's message: {error}"),
         })?;
-    Bootstrap::platform_memory(&message, 0)
-        .ok_or_else(|| String::from("the supervisor's message is not platform's bootstrap"))
+        Bootstrap::platform_memory(&message, handles.len())
+            .ok_or_else(|| String::from("the supervisor's message is not platform's bootstrap"))
+    }
 }
 
-impl ChannelLink {
-    /// Waits for any of `signals` until `deadline`, and says which were seen.
-    fn wait(&self, signals: Signals, deadline: u64) -> Result<Signals, LinkError> {
-        match wait_one(&self.0.0, signals, deadline) {
-            Ok(seen) => Ok(seen),
-            Err(Error::TimedOut) => Err(LinkError::TimedOut),
+impl Control for ChannelControl {
+    type Api = ChannelLink;
+
+    fn next_api(&mut self, deadline: u64) -> Result<ChannelLink, LinkError> {
+        let (message, mut handles) = receive(&self.0, deadline)?;
+        if !api_started(&message, handles.len()) {
+            return Err(LinkError::Other(String::from(
+                "the supervisor sent something other than api-started",
+            )));
+        }
+        let handle = handles
+            .pop()
+            .flatten()
+            .ok_or_else(|| LinkError::Other(String::from("api-started carries no handle")))?;
+        match handle.info() {
+            Ok((ObjectType::Channel, _)) => Ok(ChannelLink(Channel(handle))),
+            Ok(_) => Err(LinkError::Other(String::from(
+                "api-started carries something other than a channel",
+            ))),
             Err(error) => Err(refused(error)),
         }
+    }
+}
+
+/// Waits on `channel` for any of `signals` until `deadline`, and says which were seen.
+fn wait(channel: &Channel, signals: Signals, deadline: u64) -> Result<Signals, LinkError> {
+    match wait_one(&channel.0, signals, deadline) {
+        Ok(seen) => Ok(seen),
+        Err(Error::TimedOut) => Err(LinkError::TimedOut),
+        Err(error) => Err(refused(error)),
+    }
+}
+
+/// The next whole message on `channel` and the handles it carries, waited for until `deadline`.
+fn receive(channel: &Channel, deadline: u64) -> Result<(Vec<u8>, Vec<Option<Handle>>), LinkError> {
+    let mut closed = false;
+    loop {
+        let (bytes, handles) = match channel.needed().map_err(refused)? {
+            Some(sizes) => sizes,
+            None if closed => return Err(LinkError::Closed),
+            None => {
+                let seen = wait(channel, Signals::READABLE | Signals::PEER_CLOSED, deadline)?;
+                closed = seen.contains(Signals::PEER_CLOSED);
+                continue;
+            }
+        };
+        let mut message = vec![0; bytes];
+        let mut carried: Vec<Option<Handle>> = Vec::new();
+        carried.resize_with(handles, || None);
+        if bytes != 0 || handles != 0 {
+            channel.read(&mut message, &mut carried).map_err(refused)?;
+        }
+        return Ok((message, carried));
     }
 }
 
@@ -239,7 +288,7 @@ impl Link for ChannelLink {
                 Ok(()) => return Ok(()),
                 // The peer's queue is full: wait for it to read.
                 Err(Error::ShouldWait) => {
-                    self.wait(Signals::WRITABLE | Signals::PEER_CLOSED, deadline)?;
+                    wait(&self.0, Signals::WRITABLE | Signals::PEER_CLOSED, deadline)?;
                 }
                 Err(error) => return Err(refused(error)),
             }
@@ -247,30 +296,13 @@ impl Link for ChannelLink {
     }
 
     fn receive(&mut self, deadline: u64) -> Result<Vec<u8>, LinkError> {
-        let mut closed = false;
-        loop {
-            let (bytes, handles) = match self.0.needed().map_err(refused)? {
-                Some(sizes) => sizes,
-                None if closed => return Err(LinkError::Closed),
-                None => {
-                    let seen = self.wait(Signals::READABLE | Signals::PEER_CLOSED, deadline)?;
-                    closed = seen.contains(Signals::PEER_CLOSED);
-                    continue;
-                }
-            };
-            let mut message = vec![0; bytes];
-            let mut carried: Vec<Option<Handle>> = Vec::new();
-            carried.resize_with(handles, || None);
-            if bytes != 0 || handles != 0 {
-                self.0.read(&mut message, &mut carried).map_err(refused)?;
-            }
-            if handles != 0 {
-                // Neither message of the hand-over carries a handle. These close as they drop.
-                return Err(LinkError::Other(String::from(
-                    "a message on the link carries handles",
-                )));
-            }
-            return Ok(message);
+        let (message, handles) = receive(&self.0, deadline)?;
+        if !handles.is_empty() {
+            // Neither message of the hand-over carries a handle. These close as they drop.
+            return Err(LinkError::Other(String::from(
+                "a message on the link carries handles",
+            )));
         }
+        Ok(message)
     }
 }

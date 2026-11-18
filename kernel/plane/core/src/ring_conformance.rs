@@ -170,6 +170,14 @@ pub fn run_all(f: &Fixtures) -> Results {
         ));
         r.push((
             if protect {
+                "p_an_answer_of_none_after_the_releases_protect"
+            } else {
+                "p_an_answer_of_none_after_the_releases_unmap"
+            },
+            answer_of_none_after_the_releases(f, protect),
+        ));
+        r.push((
+            if protect {
                 "dp_i3_checked_unwritable_protect"
             } else {
                 "dp_i3_checked_unwritable_unmap"
@@ -509,6 +517,60 @@ pub fn answers_in_order(f: &Fixtures, protect: bool) -> Result<(), String> {
         same(order, want, &format!("{parts} records a batch, in order"))?;
     }
     Ok(())
+}
+
+/// Stream P with a record answering no input: an aggregate releases its batches with no record,
+/// then, holding none, posts its total (moruna-function's cookie `u64::MAX`). Whatever one look
+/// finds, the engine gives the record after every release the task made before it. It used to
+/// give it before the releases of the same look, and a stage that takes a batch's records up
+/// to its release took the total as the last batch's.
+pub fn answer_of_none_after_the_releases(f: &Fixtures, protect: bool) -> Result<(), String> {
+    let mut p = plane(protect);
+    let (task, mut t) = open(&mut p, shape(8), Behave::Aggregate(2))?;
+    let region = p.region_of(task).ok_or("no region")?;
+    drive(&mut p, &mut [&mut t])?;
+    let mut offered = Vec::new();
+    for i in 0..2 {
+        let b = load(&mut p, region, f)?;
+        p.offer(task, 0, b)
+            .map_err(|e| format!("offer {i}: {e:?}"))?;
+        p.drop_batch(b).map_err(|e| format!("drop {i}: {e:?}"))?;
+        offered.push(b);
+    }
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        for e in drive(&mut p, &mut [&mut t])? {
+            if let Event::Put { batch, .. } = &e {
+                same(bytes_of(&p, *batch)?, f.good.clone(), "the total")?;
+                p.drop_batch(*batch)
+                    .map_err(|e| format!("drop out: {e:?}"))?;
+            }
+            seen.push(e);
+        }
+        if count(&seen, |e| matches!(e, Event::Put { .. })) == 1 {
+            break;
+        }
+    }
+    let order: Vec<String> = seen
+        .iter()
+        .filter_map(|e| match e {
+            Event::Put { .. } => Some(String::from("put")),
+            Event::Released { batch, .. } => Some(format!(
+                "released {}",
+                offered.iter().position(|b| b == batch).unwrap_or(9)
+            )),
+            _ => None,
+        })
+        .collect();
+    same(
+        order,
+        vec![
+            String::from("released 0"),
+            String::from("released 1"),
+            String::from("put"),
+        ],
+        "the releases, then the record answering none",
+    )
 }
 
 /// DP-I1 with batches in flight: the engine posts `n` before the task runs. A group is every

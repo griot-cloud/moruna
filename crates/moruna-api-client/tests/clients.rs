@@ -97,7 +97,44 @@ fn rust_client_calls_every_operation_of_the_table() {
     }
     let audit = admin.node_audit().unwrap();
     let called: Vec<_> = audit.records.iter().map(|r| r.operation.as_str()).collect();
-    assert_eq!(called, ["jobs_list", "node_audit", "node", "health"]);
+    assert_eq!(
+        called,
+        [
+            "functions_list",
+            "jobs_list",
+            "node_audit",
+            "node",
+            "health"
+        ]
+    );
+}
+
+#[test]
+fn rust_client_registers_and_lists_functions() {
+    let node = TestNode::start();
+    let admin = client(&node, Scope::Admin);
+    let registration = moruna_api::FunctionRegistration {
+        name: "gate-score".to_string(),
+        address: "https://images.example.com/gate-score".to_string(),
+        sha256: "ab".repeat(32),
+        signature: "c2lnbmVk".to_string(),
+    };
+    let function = admin.functions_register(&registration).unwrap();
+    assert_eq!(
+        (function.name.as_str(), function.sha256.as_str()),
+        ("gate-score", registration.sha256.as_str())
+    );
+    let listed = client(&node, Scope::Observe).functions_list().unwrap();
+    assert_eq!(listed.functions, [function]);
+    let bad = moruna_api::FunctionRegistration {
+        signature: "bad".to_string(),
+        ..registration
+    };
+    let Err(Error::Api { status, error, .. }) = admin.functions_register(&bad) else {
+        panic!("a registration that does not verify is refused");
+    };
+    assert_eq!((status, error.code), (400, ErrorCode::Invalid));
+    assert!(error.message.contains("does not verify"));
 }
 
 #[test]
@@ -164,9 +201,9 @@ fn rust_client_runs_a_job_through_to_its_report() {
         submit.jobs_cancel(&id),
         Err(Error::Api { status: 409, .. })
     ));
-    // The ended job's events from its second record, to its exit; then its report.
+    // The ended job's events after its first record, to its exit; then its report.
     let ended: Vec<Event> = observe
-        .jobs_events(&id, Some(2))
+        .jobs_events(&id, Some(1))
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();

@@ -31,6 +31,7 @@
 
 mod classes;
 mod handle;
+mod index;
 mod large;
 pub mod region;
 mod stats;
@@ -43,6 +44,7 @@ use moruna_kernel::{
 };
 
 use crate::classes::{GRANULE, SMALL_BUDGET_BYTES, Space, Watermark};
+use crate::index::RangeIndex;
 use crate::region::Mapping;
 
 pub use crate::region::{Granted, HostBacking};
@@ -148,12 +150,49 @@ struct RegionAlloc {
     index: usize,
 }
 
+/// The most host regions the lookup index holds; with more, `tier_of` asks the region list
+/// under its lock. A run's regions are its first, its budget's steps of 16 MiB or more, what it
+/// grew by, and its live side regions: a few hundred at most on a node.
+const HOST_INDEX_REGIONS: usize = 4096;
+
+/// The host regions held for writing ([`Inner::write_host`]): when it is let go, the lookup
+/// index is published from the list first, while the write lock still keeps every reader of
+/// the list and every allocation out.
+struct HostWriter<'a> {
+    guard: RwLockWriteGuard<'a, Vec<Arc<HostRegion>>>,
+    index: &'a RangeIndex,
+}
+
+impl std::ops::Deref for HostWriter<'_> {
+    type Target = Vec<Arc<HostRegion>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for HostWriter<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for HostWriter<'_> {
+    fn drop(&mut self) {
+        self.index
+            .publish(self.guard.iter().map(|region| region.space.range()));
+    }
+}
+
 /// Everything a `Buffer` needs to find its way home. `Buffer`s hold an `Arc` of this, so
 /// the regions outlive every buffer cut from them.
 struct Inner {
     /// The host regions, oldest first. Read-locked on every allocation and release, and
     /// write-locked only by `grow`, `shrink` and the release that retires a drained region.
     host: RwLock<Vec<Arc<HostRegion>>>,
+    /// The host regions' bounds for `tier_of`, which reads them with no lock; published from
+    /// `host` each time its write lock is let go (`write_host`).
+    host_index: RangeIndex,
     /// Every host region's charges together, and their high-water mark.
     host_watermark: Arc<Watermark>,
     devices: Vec<RegionAlloc>,
@@ -347,9 +386,12 @@ impl Arena {
             devices = devices.len(),
             "arena reserved"
         );
+        let host_index = RangeIndex::new(HOST_INDEX_REGIONS);
+        host_index.publish(host_allocs.iter().map(|r| r.space.range()));
         Ok(Arc::new(Arena {
             inner: Arc::new(Inner {
                 host: RwLock::new(host_allocs),
+                host_index,
                 host_watermark,
                 devices,
                 host_tier,
@@ -768,9 +810,13 @@ impl Inner {
         self.host.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The host regions, for `grow`, `shrink` and retiring.
-    fn write_host(&self) -> RwLockWriteGuard<'_, Vec<Arc<HostRegion>>> {
-        self.host.write().unwrap_or_else(|e| e.into_inner())
+    /// The host regions, for `grow`, `shrink` and retiring. When the guard is let go, the
+    /// lookup index is published from the list before its lock is.
+    fn write_host(&self) -> HostWriter<'_> {
+        HostWriter {
+            guard: self.host.write().unwrap_or_else(|e| e.into_inner()),
+            index: &self.host_index,
+        }
     }
 
     /// Unmap every draining region that holds no live buffer. Called with the write
@@ -800,9 +846,14 @@ impl Inner {
         });
     }
 
-    /// The tier of the region holding `ptr` (f.7).
+    /// The tier of the region holding `ptr` (f.7). The host regions are asked through their
+    /// index, with no lock, and through their list only when the index holds too few.
     fn tier_of(&self, ptr: *const u8) -> Option<Tier> {
-        if self.read_host().iter().any(|r| r.space.contains(ptr)) {
+        let in_host = match self.host_index.contains(ptr) {
+            Some(inside) => inside,
+            None => self.read_host().iter().any(|r| r.space.contains(ptr)),
+        };
+        if in_host {
             return Some(self.host_tier);
         }
         self.devices

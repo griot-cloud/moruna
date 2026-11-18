@@ -305,11 +305,11 @@ stages:
                 -p moruna-vmbus -p vmbus-protocol -p moruna-vmbus-server
                 -p hvdef -p x86defs -p vmbus_core -p vmbus_ring -p netvsp_protocol -p storvsp_protocol
                 -p scsi_defs -p open_enum -p guid -p guestmem_core -p safeatomic -p net_backend_core
-                -p moruna-storvsc
+                -p moruna-storvsc -p moruna-storvsc-server -p storvsc-check -p block-protocol -p devices -p devices-protocol
                 -p moruna-netvsc
                 -p moruna-mmio -p moruna-pci -p moruna-virtio -p moruna-driver-table -p moruna-imagefs
                 -p moruna-linux -p linux-protocol -p moruna-nvme -p moruna-gve -p net-protocol
-                -p moruna-node -p moruna-ostd-adaptation)
+                -p moruna-node -p node-functions -p moruna-api-server -p moruna-ostd-adaptation)
               cargo clippy --locked --target "$host" --all-targets "${packages[@]}" --features moruna-abi/manifest -- -D warnings
               cargo test --locked --target "$host" "${packages[@]}" --features moruna-abi/manifest
             displayName: Format and host tests of ABI, loaders, handles, quotas, SDK, image and device libraries

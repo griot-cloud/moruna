@@ -10,11 +10,13 @@
 //! implements [`Host`] over the core's calls.
 //!
 //! It makes contact as it starts, and says each offer on the console as it comes. A
-//! driver then asks for the offers of its interface, opens a channel (the process makes
-//! the rings, pins them, shares them as the channel's GPADL, and gives the driver the
-//! rings, the channel's signal handle and a wake word), shares more memory, and closes.
-//! Packets never pass through the process: the driver signals the host itself, and the
-//! process only bumps the wake word of each channel the host signals.
+//! driver, connected through the listener of its class of device, then asks for the
+//! offers of its interface, opens a channel (the process makes the rings, pins them,
+//! shares them as the channel's GPADL, and gives the driver the rings, the channel's
+//! signal handle and a wake channel), shares more memory, and closes. Packets never pass
+//! through the process: the driver signals the host itself, and the process only writes
+//! an empty message to the wake channel of each channel the host signals, and closes it
+//! when the channel is gone.
 //!
 //! A refusal of a post by Hyper-V, or contact the host refuses, is [`Fatal`]: the process
 //! ends, and the supervisor stops the node with the reason on the console.
@@ -36,15 +38,15 @@ use hvdef::{
     HV_MESSAGE_PAYLOAD_SIZE, HV_MESSAGE_SIZE, HvMessageFlags, HvMessageHeader, HvMessageType,
 };
 use moruna_svc::{
-    ConnectionId, Context, Decoder, Factory, Handle, Handler, Outcome, Pending, ProtocolError,
-    ProtocolId, Status, Wire,
+    Channel as Wake, ConnectionId, Context, Decoder, Factory, Handle, Handler, Outcome, Pending,
+    ProtocolError, ProtocolId, Status, Wire,
 };
 use moruna_vmbus::{
     ChannelId, Client, ConnectError, Event, GpadlId, HostError, Hv, HvError, HvMessage, MemoryId,
     PostError, RingPair,
 };
 use vmbus_protocol::{
-    Id, Offer, Opened, rings_fit,
+    Class, Id, Offer, Opened, rings_fit,
     vmbus::{self, Error},
 };
 
@@ -68,23 +70,9 @@ pub trait Host: Hv {
     /// A handle that signals `connection_id` and nothing else, for a channel's driver.
     fn signal(&mut self, connection_id: u32) -> Result<Handle, Error>;
 
-    /// A wake word for a channel: the driver's handle to it, and its ID here.
-    fn wake(&mut self) -> Result<(Handle, WakeId), Error>;
-
-    /// Increments the wake word's counter and wakes its waiters; with `gone`, first marks
-    /// the channel gone (`vmbus_protocol::wake`).
-    fn bump(&mut self, wake: WakeId, gone: bool);
-
-    /// The process lets go of a wake word.
-    fn drop_wake(&mut self, wake: WakeId);
-
     /// Writes a line on the node's console.
     fn say(&mut self, line: fmt::Arguments<'_>);
 }
-
-/// A wake word, as the [`Host`] that made it knows it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct WakeId(pub u64);
 
 /// Why the process cannot go on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,11 +105,19 @@ struct Channel {
     owner: ConnectionId,
     phase: Phase,
     rings: MemoryId,
-    wake: WakeId,
+    /// The process's end of the wake channel, until the channel is gone: dropping it
+    /// closes it, which tells the driver.
+    wake: Option<Wake>,
     /// What the driver is given once the host has opened the channel.
     given: Option<Opened>,
     /// The host has rescinded the offer.
     gone: bool,
+}
+
+/// Tells a driver the host signalled its channel: an empty message on its wake channel.
+/// A full channel already holds one, and a closed one has no driver to tell.
+fn wake(end: &Wake) {
+    let _ = end.write_with(&[], &mut []);
 }
 
 /// Where a channel stands; each request's answer waits in it, `None` once its connection
@@ -146,8 +142,8 @@ pub struct Vmbus<H: Host> {
     host: H,
     client: Client,
     contact: Contact,
-    /// `offers` asked before contact was made.
-    waiting: Vec<(Pending, Id)>,
+    /// `offers` asked before contact was made, and the class of the connection asking.
+    waiting: Vec<(Pending, Class, Id)>,
     channels: BTreeMap<ChannelId, Channel>,
     shares: BTreeMap<GpadlId, Share>,
     done: VecDeque<(Pending, Outcome)>,
@@ -206,12 +202,12 @@ impl<H: Host> Vmbus<H> {
         }
     }
 
-    /// SINT 2's interrupt: the channels the host signalled have their wake words bumped,
-    /// and the host's messages are taken.
+    /// SINT 2's interrupt: the drivers of the channels the host signalled are woken, and
+    /// the host's messages are taken.
     pub fn interrupted(&mut self) {
         for channel in self.client.take_signals(&mut self.host) {
-            if let Some(entry) = self.channels.get(&channel) {
-                self.host.bump(entry.wake, false);
+            if let Some(end) = self.channels.get(&channel).and_then(|e| e.wake.as_ref()) {
+                wake(end);
             }
         }
         self.pump();
@@ -291,16 +287,16 @@ impl<H: Host> Vmbus<H> {
             self.fatal = Some(fatal);
             self.host.say(format_args!("vmbus: {fatal}"));
         }
-        for (pending, _) in core::mem::take(&mut self.waiting) {
+        for (pending, _, _) in core::mem::take(&mut self.waiting) {
             self.done.push_back((pending, failure(Error::NotConnected)));
         }
     }
 
-    /// The offers of `interface` that stand.
-    fn list(&self, interface: Id) -> Vec<Offer> {
+    /// The offers of `interface` that stand, none unless it is `class`'s.
+    fn list(&self, class: Class, interface: Id) -> Vec<Offer> {
         self.client
             .offers()
-            .filter(|offer| offer.interface == interface.0)
+            .filter(|offer| offer.interface == interface.0 && interface == class.interface())
             .map(|offer| Offer {
                 channel: offer.channel.0,
                 instance: Id(offer.instance),
@@ -322,8 +318,8 @@ impl<H: Host> Vmbus<H> {
                     version.version,
                     self.client.target_vp()
                 ));
-                for (pending, interface) in core::mem::take(&mut self.waiting) {
-                    let offers = self.list(interface);
+                for (pending, class, interface) in core::mem::take(&mut self.waiting) {
+                    let offers = self.list(class, interface);
                     self.done.push_back((pending, Outcome::reply(offers)));
                 }
             }
@@ -353,9 +349,9 @@ impl<H: Host> Vmbus<H> {
             }
             Event::Opened { channel } => self.opened(channel),
             Event::OpenFailed { channel, status } => {
+                // The wake channel goes with the entry.
                 if let Some(entry) = self.channels.remove(&channel) {
                     self.host.release(entry.rings);
-                    self.host.drop_wake(entry.wake);
                     self.host.say(format_args!(
                         "vmbus: the host refused to open channel {}: status {status:#x}",
                         channel.0
@@ -366,10 +362,9 @@ impl<H: Host> Vmbus<H> {
                 }
             }
             Event::Closed { channel } => {
+                // The wake channel goes with the entry, which tells the driver.
                 if let Some(entry) = self.channels.remove(&channel) {
                     self.host.release(entry.rings);
-                    self.host.bump(entry.wake, true);
-                    self.host.drop_wake(entry.wake);
                     match entry.phase {
                         Phase::Closing(Some(pending)) => {
                             self.done.push_back((pending, Outcome::reply(())));
@@ -388,7 +383,8 @@ impl<H: Host> Vmbus<H> {
                     .say(format_args!("vmbus: channel {} rescinded", channel.0));
                 if let Some(entry) = self.channels.get_mut(&channel) {
                     entry.gone = true;
-                    self.host.bump(entry.wake, true);
+                    // Closing the wake channel tells the driver the device is gone.
+                    entry.wake = None;
                 }
             }
             Event::Unloaded => {}
@@ -459,22 +455,23 @@ impl<H: Host> Vmbus<H> {
         self.client.close(channel)
     }
 
-    /// `offers`.
-    pub fn offers(&mut self, cx: &mut Context<'_>, interface: Id) -> Outcome {
+    /// `offers`, for a connection of `class`.
+    pub fn offers(&mut self, cx: &mut Context<'_>, class: Class, interface: Id) -> Outcome {
         match self.contact {
-            Contact::Connected => Outcome::reply(self.list(interface)),
+            Contact::Connected => Outcome::reply(self.list(class, interface)),
             Contact::Connecting => {
-                self.waiting.push((cx.defer(), interface));
+                self.waiting.push((cx.defer(), class, interface));
                 Outcome::Deferred
             }
             Contact::Failed => failure(Error::NotConnected),
         }
     }
 
-    /// `open`.
+    /// `open`, for a connection of `class`: only an offer of the class's interface.
     pub fn open(
         &mut self,
         cx: &mut Context<'_>,
+        class: Class,
         channel: u32,
         pages: u32,
         outgoing: u32,
@@ -483,7 +480,12 @@ impl<H: Host> Vmbus<H> {
         if self.contact != Contact::Connected {
             return failure(Error::NotConnected);
         }
-        if !self.client.offers().any(|offer| offer.channel == id) {
+        let interface = class.interface().0;
+        if !self
+            .client
+            .offers()
+            .any(|offer| offer.channel == id && offer.interface == interface)
+        {
             return failure(Error::NoSuchChannel);
         }
         if self.channels.contains_key(&id) {
@@ -506,12 +508,9 @@ impl<H: Host> Vmbus<H> {
                 return failure(error);
             }
         };
-        let (wake_handle, wake) = match self.host.wake() {
-            Ok(wake) => wake,
-            Err(error) => {
-                self.host.release(memory);
-                return failure(error);
-            }
+        let Ok((wake, driver_wake)) = Wake::create() else {
+            self.host.release(memory);
+            return failure(Error::NoResources);
         };
         let ring = RingPair {
             memory,
@@ -519,7 +518,6 @@ impl<H: Host> Vmbus<H> {
         };
         if let Err(error) = self.client.open(&mut self.host, id, ring) {
             self.host.release(memory);
-            self.host.drop_wake(wake);
             return failure(refusal(error));
         }
         self.channels.insert(
@@ -528,11 +526,11 @@ impl<H: Host> Vmbus<H> {
                 owner: cx.connection(),
                 phase: Phase::Opening(Some(cx.defer())),
                 rings: memory,
-                wake,
+                wake: Some(wake),
                 given: Some(Opened {
                     rings,
                     signal,
-                    wake: wake_handle,
+                    wake: driver_wake.0,
                 }),
                 gone: false,
             },
@@ -605,7 +603,7 @@ impl<H: Host> Vmbus<H> {
     /// A driver's connection has gone: its channels are closed, and nothing waits for it.
     pub fn disconnected(&mut self, connection: ConnectionId) {
         self.waiting
-            .retain(|(pending, _)| pending.connection() != connection);
+            .retain(|(pending, _, _)| pending.connection() != connection);
         for share in self.shares.values_mut() {
             if share.owner == connection {
                 share.pending = None;
@@ -635,17 +633,21 @@ impl<H: Host> Vmbus<H> {
     }
 }
 
-/// One driver's connection: it serves `moruna.driver.vmbus` from the process's state.
+/// One driver's connection: it serves `moruna.driver.vmbus` from the process's state, for
+/// the offers of its class.
 pub struct Connection<H: Host> {
     vmbus: Rc<RefCell<Vmbus<H>>>,
+    class: Class,
     id: Option<ConnectionId>,
 }
 
-/// The listener's factory: each driver that connects is served from `vmbus`.
-pub fn factory<H: Host + 'static>(vmbus: Rc<RefCell<Vmbus<H>>>) -> Factory {
+/// The factory of `class`'s listener: each driver that connects there is served from
+/// `vmbus`, and reaches the offers of that class only.
+pub fn factory<H: Host + 'static>(vmbus: Rc<RefCell<Vmbus<H>>>, class: Class) -> Factory {
     Box::new(move || {
         Box::new(Connection {
             vmbus: vmbus.clone(),
+            class,
             id: None,
         }) as Box<dyn Handler>
     })
@@ -666,10 +668,11 @@ impl<H: Host> Handler for Connection<H> {
     fn handle(&mut self, cx: &mut Context<'_>, ordinal: u16, body: &mut Decoder<'_>) -> Outcome {
         self.id = Some(cx.connection());
         let mut vmbus = self.vmbus.borrow_mut();
+        let class = self.class;
         let outcome = match ordinal {
-            1 => arguments(body).map(|interface| vmbus.offers(cx, interface)),
+            1 => arguments(body).map(|interface| vmbus.offers(cx, class, interface)),
             2 => arguments(body)
-                .map(|(channel, pages, outgoing)| vmbus.open(cx, channel, pages, outgoing)),
+                .map(|(channel, pages, outgoing)| vmbus.open(cx, class, channel, pages, outgoing)),
             3 => arguments(body).map(|(channel, memory)| vmbus.share(cx, channel, memory)),
             4 => arguments(body).map(|channel| vmbus.close(cx, channel)),
             _ => Some(Outcome::Status(Status::UnknownMethod)),
