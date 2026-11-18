@@ -978,6 +978,8 @@ fn shimless(e: &mut Engine, client: &mut linux::Client, input: &[u8]) -> Result<
         log: ring.give()?,
         log_bytes: ring.bytes,
         account: account.0,
+        // The boot image's files, as every task's before item 3.6.
+        root: None,
     };
     let ended = client
         .run_plane(
@@ -1031,6 +1033,8 @@ fn shimless(e: &mut Engine, client: &mut linux::Client, input: &[u8]) -> Result<
         account: Account::carve(SHIMLESS_LIMIT, "plane-hello")
             .map_err(kernel_error("account_create"))?
             .0,
+        // The boot image's files, as every task's before item 3.6.
+        root: None,
     };
     let ended = client
         .run_plane(
