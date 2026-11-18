@@ -47,7 +47,7 @@ pub mod view;
 pub use arrow;
 pub use dlpark;
 
-pub use buffer::{AllocStats, Allocator, ArenaHandle, Buffer};
+pub use buffer::{AllocStats, Allocator, ArenaHandle, Buffer, Tally};
 pub use catalog::{
     BatchView, BufferId, CatalogEvent, CatalogFloor, CatalogObserver, CatalogSnapshot, ClaimHolder,
     DEFAULT_PROMOTION_WINDOW, Future, Head, Location, Reservation, Reserve, Residency,

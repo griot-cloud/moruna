@@ -376,6 +376,109 @@ pub trait Allocator: Send + Sync {
     fn is_pinned(&self) -> bool;
 }
 
+/// An allocator over another that keeps count of the bytes its buffers still hold: what one
+/// read in flight has taken from the arena, its fetch and the buffers its decode reserved
+/// (system design 3A, item 6.3c). Every other call is the inner allocator's.
+///
+/// **The invariant it serves:** a read in flight is counted at `max(charge, held)`, never at
+/// `charge + held`. The source drive charges a read its estimate before it takes anything, and
+/// the arena's in-use already counts what it has taken, so admission counts only what the read
+/// may still take, `charge - held`. A read that holds more than its charge (an estimate that came
+/// in short) may still take nothing: that is 0, never negative, and the arena's in-use carries
+/// the excess.
+///
+/// The count moves once per buffer, when it is allocated and when it is released (once per half
+/// after a `split_at`), never per byte or per row: a Parquet read's decode moves it a few times a
+/// column, for the buffers it reserves, whatever its batches.
+pub struct Tally {
+    inner: Arc<dyn Allocator>,
+    held: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Tally {
+    /// A tally of the buffers allocated through it from `inner`, holding nothing yet.
+    pub fn new(inner: Arc<dyn Allocator>) -> Tally {
+        Tally {
+            inner,
+            held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// The bytes the buffers allocated through this tally still hold.
+    pub fn held(&self) -> u64 {
+        self.held.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// The arena token of a buffer a `Tally` handed out: its release takes the bytes off the
+/// tally's count and hands them to the arena it came from.
+struct Tallied {
+    inner: Arc<dyn ArenaHandle>,
+    held: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ArenaHandle for Tallied {
+    fn release(&self, ptr: *mut u8, len: usize, tier: Tier) {
+        self.held
+            .fetch_sub(len as u64, std::sync::atomic::Ordering::SeqCst);
+        self.inner.release(ptr, len, tier);
+    }
+}
+
+impl Allocator for Tally {
+    fn alloc(&self, bytes: usize, tier: Tier) -> crate::Result<Buffer> {
+        let buffer = ManuallyDrop::new(self.inner.alloc(bytes, tier)?);
+        // As in `split_at`: the original is never dropped, so its token moves under the tally's
+        // instead of being cloned beside a field nothing will release.
+        // SAFETY: `buffer` is `ManuallyDrop` and is never dropped, and the field is not read
+        // again after this point, so the value is moved out exactly once.
+        let arena = unsafe { std::ptr::read(&buffer.arena) };
+        self.held
+            .fetch_add(buffer.len as u64, std::sync::atomic::Ordering::SeqCst);
+        Ok(Buffer {
+            ptr: buffer.ptr,
+            len: buffer.len,
+            tier: buffer.tier,
+            arena: Arc::new(Tallied {
+                inner: arena,
+                held: Arc::clone(&self.held),
+            }),
+        })
+    }
+
+    fn page_bytes(&self) -> usize {
+        self.inner.page_bytes()
+    }
+
+    fn stats(&self) -> AllocStats {
+        self.inner.stats()
+    }
+
+    fn available(&self, tier: Tier) -> Option<u64> {
+        self.inner.available(tier)
+    }
+
+    fn contains(&self, ptr: *const u8) -> bool {
+        self.inner.contains(ptr)
+    }
+
+    fn tier_of(&self, ptr: *const u8) -> Option<Tier> {
+        self.inner.tier_of(ptr)
+    }
+
+    fn note_payload_copy(&self, bytes: u64) {
+        self.inner.note_payload_copy(bytes);
+    }
+
+    fn note_boundary_copy(&self, bytes: u64) {
+        self.inner.note_boundary_copy(bytes);
+    }
+
+    fn is_pinned(&self) -> bool {
+        self.inner.is_pinned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +519,69 @@ mod tests {
         let handle: Arc<dyn ArenaHandle> = Arc::clone(arena) as Arc<dyn ArenaHandle>;
         // SAFETY: test-only; the leaked Vec's bytes stay valid for the test.
         (unsafe { Buffer::from_raw(ptr, len, tier, handle) }, ptr)
+    }
+
+    /// An allocator of heap buffers released to one `CountingArena`, with a budget it reports.
+    struct HeapAlloc(Arc<CountingArena>);
+    impl Allocator for HeapAlloc {
+        fn alloc(&self, bytes: usize, tier: Tier) -> crate::Result<Buffer> {
+            Ok(heap(bytes, tier, &self.0).0)
+        }
+        fn page_bytes(&self) -> usize {
+            16384
+        }
+        fn stats(&self) -> AllocStats {
+            AllocStats {
+                allocations_total: 9,
+                ..AllocStats::default()
+            }
+        }
+        fn available(&self, _tier: Tier) -> Option<u64> {
+            Some(77)
+        }
+        fn contains(&self, _ptr: *const u8) -> bool {
+            true
+        }
+        fn tier_of(&self, _ptr: *const u8) -> Option<Tier> {
+            Some(Tier::Host)
+        }
+        fn is_pinned(&self) -> bool {
+            true
+        }
+    }
+
+    /// 6.3c: a tally counts what the buffers it handed out still hold, whether they are split,
+    /// handed to Arrow or dropped, and returns every byte to the arena they came from.
+    #[test]
+    fn a_tally_counts_what_its_buffers_still_hold() {
+        let arena = Arc::new(CountingArena(AtomicUsize::new(0)));
+        let tally = Tally::new(Arc::new(HeapAlloc(Arc::clone(&arena))));
+        assert_eq!(tally.held(), 0);
+        let whole = tally.alloc(10, Tier::Host).expect("ten");
+        let other = tally.alloc(6, Tier::Host).expect("six");
+        assert_eq!(tally.held(), 16);
+        let (head, tail) = whole.split_at(4);
+        drop(tail);
+        assert_eq!(tally.held(), 10, "the tail's six bytes went back");
+        let arrow = head.into_arrow_buffer().expect("arrow");
+        assert_eq!(tally.held(), 10, "Arrow holds the head now");
+        drop(arrow);
+        drop(other);
+        assert_eq!(tally.held(), 0);
+        assert_eq!(
+            arena.0.load(Ordering::SeqCst),
+            16,
+            "every byte back to its arena"
+        );
+        // Everything but the allocation is the inner allocator's.
+        assert_eq!(tally.page_bytes(), 16384);
+        assert_eq!(tally.stats().allocations_total, 9);
+        assert_eq!(tally.available(Tier::Host), Some(77));
+        assert!(tally.contains(std::ptr::null()));
+        assert_eq!(tally.tier_of(std::ptr::null()), Some(Tier::Host));
+        assert!(tally.is_pinned());
+        tally.note_payload_copy(1);
+        tally.note_boundary_copy(1);
     }
 
     #[test]

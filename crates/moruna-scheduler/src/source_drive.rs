@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 use crossbeam::channel::{Receiver, Sender};
 use crossbeam::sync::{Parker, Unparker};
 use moruna_kernel::{
-    BoxFuture, Morsel, MorunaError, Origin, Payload, Result, RowRange, Seq, Split, StageId, Tier,
+    Allocator, BoxFuture, Morsel, MorunaError, Origin, Payload, Result, RowRange, Seq, Split,
+    StageId, Tally, Tier,
 };
 
 use crate::shared::{Cursor, DRIVE_DRIVING, DRIVE_STOP, HelperRequest, Shared, SourceEnd};
@@ -67,6 +68,9 @@ struct InFlight<'a> {
     kind: ReadKind,
     /// What the arena may charge for this read, as admission counted it (f.5).
     charge: u64,
+    /// What this read has taken from the arena so far: its fetch and the buffers its decode
+    /// reserved, which the arena's in-use already counts (6.3c).
+    taken: Arc<Tally>,
     /// How many times this read has already met a full arena (RB5).
     attempts: u32,
 }
@@ -246,10 +250,20 @@ fn arena_admits(shared: &Shared, inflight: &[InFlight<'_>], charge: u64) -> bool
 
 /// What the arena has room to charge a read beside what the reads in flight may still be
 /// charged (f.5); `None` when the allocator has no budget for the tier, which bounds nothing.
+///
+/// A read in flight counts at the larger of its charge and what it has taken (6.3c): the
+/// arena's free room already lacks what it has taken, so only the rest of its charge is still
+/// to come. Counting both, a whole row group's read was charged its estimate twice over beside
+/// the buffers its decode had reserved, and a second read found no room until the first landed.
 fn room(shared: &Shared, inflight: &[InFlight<'_>]) -> Option<u64> {
     let available = shared.alloc.available(tier0(shared))?;
-    let pending: u64 = inflight.iter().map(|entry| entry.charge).sum();
+    let pending: u64 = inflight.iter().map(still_to_take).sum();
     Some(available.saturating_sub(pending))
+}
+
+/// What a read in flight may still take from the arena: its charge less what it has taken.
+fn still_to_take(entry: &InFlight<'_>) -> u64 {
+    entry.charge.saturating_sub(entry.taken.held())
 }
 
 /// Nothing the run holds is on its way to being released: no read in flight, no write in
@@ -536,10 +550,13 @@ fn issue_reads<'a>(
         if let Some(room) = room(shared, inflight)
             && whole_charge > room
         {
+            // What the reads in flight hold is theirs, not the queues' (6.3c): the read fits the
+            // arena as it stands when it fits beside the queues' bytes alone.
+            let held: u64 = inflight.iter().map(|entry| entry.taken.held()).sum();
             let kept_out_by_reads = shared
                 .alloc
                 .available(tier0(shared))
-                .is_some_and(|available| whole_charge <= available);
+                .is_some_and(|available| whole_charge <= available.saturating_add(held));
             most_rows = kept_out_by_reads
                 .then(|| cut_to_room(shared, source, split, rows, room, learned))
                 .flatten();
@@ -656,16 +673,20 @@ fn submit<'a>(
     let tier = tier0(shared);
     let times = Arc::clone(&source.out.times);
     let issued = Instant::now();
+    // 6.3c: a read that decodes on workers allocates through a tally of its own, its fetch on
+    // the drive and its decode on a worker, so admission knows what it has taken.
+    let taken = Arc::new(Tally::new(Arc::clone(&shared.alloc)));
+    let tally = Arc::clone(&taken);
     let future: BoxFuture<'a, Result<Payload>> = if source.source.decodes_on_workers() {
         // RB1: the drive fetches the bytes and any worker decodes them; each half is timed.
         let decoder = Arc::clone(&source.source);
-        let alloc = Arc::clone(&shared.alloc);
+        let alloc: Arc<dyn Allocator> = Arc::clone(&tally) as Arc<dyn Allocator>;
         let owned = split.clone();
         let worker_times = Arc::clone(&shared.times);
         Box::pin(async move {
             let fetched = source
                 .source
-                .fetch(split, range, shared.alloc.as_ref(), tier)
+                .fetch(split, range, tally.as_ref(), tier)
                 .await;
             times.io(issued);
             let fetched = match fetched {
@@ -695,6 +716,8 @@ fn submit<'a>(
             decoded
         })
     } else {
+        // A source that reads on the drive is called as the read is issued, which a borrowed
+        // tally cannot outlive; its read is counted at its charge, as it was.
         let read = source
             .source
             .read(split, range, shared.alloc.as_ref(), tier);
@@ -714,6 +737,7 @@ fn submit<'a>(
         rows,
         kind,
         charge,
+        taken,
         attempts: 0,
     });
     let charged = inflight
@@ -1266,4 +1290,51 @@ pub(crate) fn cursor(source: &SourceEnd) -> (moruna_kernel::SourceCursor, Vec<(S
             .map(|(seq, origin)| (*seq, origin.clone()))
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(charge: u64, taken: &Arc<Tally>) -> InFlight<'static> {
+        InFlight {
+            future: Box::pin(async { Err(MorunaError::Cancelled) }),
+            seq: 0,
+            origin: Origin {
+                split: 0,
+                row_start: 0,
+                row_end: 1,
+                node: moruna_kernel::LOCAL_NODE,
+            },
+            split: 0,
+            rows: RowRange { start: 0, end: 1 },
+            kind: ReadKind::Fresh,
+            charge,
+            taken: Arc::clone(taken),
+            attempts: 0,
+        }
+    }
+
+    /// 6.3c: a read in flight counts at max(charge, held). What it may still take is its charge
+    /// less what it holds, and nothing, never less, once it holds more than its charge (an
+    /// estimate that came in short): the arena's in-use carries that excess.
+    #[test]
+    fn a_read_is_counted_at_the_larger_of_its_charge_and_what_it_holds() {
+        let alloc: Arc<dyn moruna_kernel::Allocator> =
+            Arc::new(moruna_testkit::FakeAllocator::new());
+        let taken = Arc::new(Tally::new(alloc));
+        let read = entry(200, &taken);
+        assert_eq!(still_to_take(&read), 200, "nothing taken yet");
+        let some = taken.alloc(50, Tier::Host).expect("fifty");
+        assert_eq!(still_to_take(&read), 150);
+        let more = taken.alloc(250, Tier::Host).expect("two hundred and fifty");
+        assert_eq!(taken.held(), 300);
+        assert_eq!(still_to_take(&read), 0, "it holds more than its charge");
+        drop((some, more));
+        assert_eq!(
+            still_to_take(&read),
+            200,
+            "what it gave back it may take again"
+        );
+    }
 }
