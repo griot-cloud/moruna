@@ -376,7 +376,16 @@
               "description": "One job in the list: its ID, its state and its times.",
               "properties": {
                 "ended": {
-                  "description": "When it ended, in Unix seconds; absent until it has.",
+                  "description": "When it ended, in Unix seconds: `ended_ms` divided by 1,000; absent until it has.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "ended_ms": {
+                  "description": "When it ended, in Unix milliseconds on the node's wall clock; absent until it has.",
                   "format": "uint64",
                   "minimum": 0,
                   "type": [
@@ -389,7 +398,16 @@
                   "type": "string"
                 },
                 "started": {
-                  "description": "When it began to run, in Unix seconds; absent until it has.",
+                  "description": "When it began to run, in Unix seconds: `started_ms` divided by 1,000; absent until it\nhas.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "started_ms": {
+                  "description": "When it began to run, in Unix milliseconds on the node's wall clock; absent until it has.",
                   "format": "uint64",
                   "minimum": 0,
                   "type": [
@@ -428,7 +446,13 @@
                   ]
                 },
                 "submitted": {
-                  "description": "When the node took the job, in Unix seconds.",
+                  "description": "When the node took the job, in Unix seconds: `submitted_ms` divided by 1,000.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "submitted_ms": {
+                  "description": "When the node took the job, in Unix milliseconds on the node's wall clock.",
                   "format": "uint64",
                   "minimum": 0,
                   "type": "integer"
@@ -437,7 +461,8 @@
               "required": [
                 "id",
                 "state",
-                "submitted"
+                "submitted",
+                "submitted_ms"
               ],
               "type": "object"
             },
@@ -471,7 +496,16 @@
         "description": "The answer to `GET /v1/jobs/{id}` and to `POST /v1/jobs/{id}/cancel`.",
         "properties": {
           "ended": {
-            "description": "When it ended, in Unix seconds; absent until it has.",
+            "description": "When it ended, in Unix seconds: `ended_ms` divided by 1,000; absent until it has.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ended_ms": {
+            "description": "When it ended, in Unix milliseconds on the node's wall clock; absent until it has.",
             "format": "uint64",
             "minimum": 0,
             "type": [
@@ -578,7 +612,16 @@
             "type": "string"
           },
           "started": {
-            "description": "When it began to run, in Unix seconds; absent until it has.",
+            "description": "When it began to run, in Unix seconds: `started_ms` divided by 1,000; absent until it\nhas.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "started_ms": {
+            "description": "When it began to run, in Unix milliseconds on the node's wall clock; absent until it has.",
             "format": "uint64",
             "minimum": 0,
             "type": [
@@ -617,7 +660,13 @@
             ]
           },
           "submitted": {
-            "description": "When the node took the job, in Unix seconds.",
+            "description": "When the node took the job, in Unix seconds: `submitted_ms` divided by 1,000.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "submitted_ms": {
+            "description": "When the node took the job, in Unix milliseconds on the node's wall clock.",
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
@@ -626,7 +675,8 @@
         "required": [
           "id",
           "state",
-          "submitted"
+          "submitted",
+          "submitted_ms"
         ],
         "title": "JobStatus",
         "type": "object"
@@ -652,7 +702,16 @@
         "description": "The answer to `GET /v1/jobs/{id}` and to `POST /v1/jobs/{id}/cancel`.",
         "properties": {
           "ended": {
-            "description": "When it ended, in Unix seconds; absent until it has.",
+            "description": "When it ended, in Unix seconds: `ended_ms` divided by 1,000; absent until it has.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ended_ms": {
+            "description": "When it ended, in Unix milliseconds on the node's wall clock; absent until it has.",
             "format": "uint64",
             "minimum": 0,
             "type": [
@@ -759,7 +818,16 @@
             "type": "string"
           },
           "started": {
-            "description": "When it began to run, in Unix seconds; absent until it has.",
+            "description": "When it began to run, in Unix seconds: `started_ms` divided by 1,000; absent until it\nhas.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "started_ms": {
+            "description": "When it began to run, in Unix milliseconds on the node's wall clock; absent until it has.",
             "format": "uint64",
             "minimum": 0,
             "type": [
@@ -798,7 +866,13 @@
             ]
           },
           "submitted": {
-            "description": "When the node took the job, in Unix seconds.",
+            "description": "When the node took the job, in Unix seconds: `submitted_ms` divided by 1,000.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "submitted_ms": {
+            "description": "When the node took the job, in Unix milliseconds on the node's wall clock.",
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
@@ -807,7 +881,8 @@
         "required": [
           "id",
           "state",
-          "submitted"
+          "submitted",
+          "submitted_ms"
         ],
         "title": "JobStatus",
         "type": "object"

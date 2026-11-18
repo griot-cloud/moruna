@@ -206,7 +206,19 @@ fn rust_client_runs_a_job_through_to_its_report() {
     let status = observe.jobs_get(&id).unwrap();
     assert_eq!(status.state, JobState::Running);
     assert_eq!(status.heartbeat.unwrap().rows_out, 3);
-    assert_eq!(observe.jobs_list().unwrap().jobs[0].id, id);
+    // The times to the millisecond beside their seconds (item 2.4).
+    let started_ms = status.started_ms.expect("it runs");
+    assert!(status.submitted_ms <= started_ms && status.ended_ms.is_none());
+    assert_eq!(
+        (status.submitted, status.started),
+        (status.submitted_ms / 1_000, Some(started_ms / 1_000))
+    );
+    let listed = observe.jobs_list().unwrap().jobs.remove(0);
+    assert_eq!(listed.id, id);
+    assert_eq!(
+        (listed.submitted_ms, listed.started_ms),
+        (status.submitted_ms, status.started_ms)
+    );
     assert!(matches!(
         observe.jobs_report(&id),
         Err(Error::Api { status: 409, error, .. }) if error.code == ErrorCode::Conflict
@@ -230,6 +242,9 @@ fn rust_client_runs_a_job_through_to_its_report() {
         (status.state, status.exit_code),
         (JobState::Cancelled, Some(130))
     );
+    let ended_ms = status.ended_ms.expect("it has ended");
+    assert!(status.started_ms <= Some(ended_ms));
+    assert_eq!(status.ended, Some(ended_ms / 1_000));
     assert!(matches!(
         submit.jobs_cancel(&id),
         Err(Error::Api { status: 409, .. })

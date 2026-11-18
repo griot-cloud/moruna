@@ -622,6 +622,9 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
   no link for it, never a build-time clock. TLS accepts the clock once it is set by the machine's
   CMOS at boot or by `platform`; test machines set it with QEMU's `-rtc`, so `tls-unix-seconds` is
   gone everywhere.
+- **`api` reads the same clock** from the clock page for all it times (tokens, the audit record,
+  the node document's `time`, its own certificate, a job's times to the millisecond: item 2.4), and
+  carries the hand-over's wall clock forward only while the page says it is unset.
 - **Trusted roots:** the cloud profile's `tls.roots` is Mozilla's set as curl publishes it
   (`cacert.pem`, MPL-2.0), a pinned dated release checked against curl's SHA-256, converted to the
   server's DER list in `kernel/node/cloud/`.

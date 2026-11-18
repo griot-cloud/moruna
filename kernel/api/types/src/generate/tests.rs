@@ -342,7 +342,16 @@ fn openapi_schemas_carry_the_design_names_and_no_others() {
     assert_eq!(properties(&document, "Jobs"), strings(&["jobs"]));
     assert_eq!(
         properties(&document, "JobSummary"),
-        strings(&["id", "state", "submitted", "started", "ended"])
+        strings(&[
+            "id",
+            "state",
+            "submitted",
+            "submitted_ms",
+            "started",
+            "started_ms",
+            "ended",
+            "ended_ms"
+        ])
     );
     assert_eq!(
         properties(&document, "JobStatus"),
@@ -350,8 +359,11 @@ fn openapi_schemas_carry_the_design_names_and_no_others() {
             "id",
             "state",
             "submitted",
+            "submitted_ms",
             "started",
+            "started_ms",
             "ended",
+            "ended_ms",
             "heartbeat",
             "exit_code"
         ])

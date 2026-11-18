@@ -28,7 +28,7 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde_json::Value;
 
 use super::cert::Identity;
-use super::{now, token};
+use super::{now, now_ms, token};
 
 /// What the stand-in serves: the node's instance ID and document, its token keys and its TLS
 /// identity. These are what node config and `platform` give the real server.
@@ -323,8 +323,11 @@ fn summary(job: &JobStatus) -> JobSummary {
         id: job.id.clone(),
         state: job.state,
         submitted: job.submitted,
+        submitted_ms: job.submitted_ms,
         started: job.started,
+        started_ms: job.started_ms,
         ended: job.ended,
+        ended_ms: job.ended_ms,
     }
 }
 
@@ -357,12 +360,16 @@ fn submit(state: &State, body: &[u8]) -> Result<String, (ErrorCode, String)> {
         return Err((ErrorCode::Busy, "a job is running".to_string()));
     }
     let id = format!("{:032x}", jobs.len() + 1);
+    let at = now_ms();
     jobs.push(JobStatus {
         id: id.clone(),
         state: JobState::Running,
-        submitted: now(),
-        started: Some(now()),
+        submitted: at / 1_000,
+        submitted_ms: at,
+        started: Some(at / 1_000),
+        started_ms: Some(at),
         ended: None,
+        ended_ms: None,
         heartbeat: Some(moruna_api::Heartbeat {
             t_ms: 1500,
             rows_out: 3,
@@ -396,7 +403,9 @@ fn cancel(state: &State, id: &str) -> Result<String, (ErrorCode, String)> {
     }
     let before = json(job);
     job.state = JobState::Cancelled;
-    job.ended = Some(now());
+    let at = now_ms();
+    job.ended = Some(at / 1_000);
+    job.ended_ms = Some(at);
     job.exit_code = Some(130);
     Ok(before)
 }

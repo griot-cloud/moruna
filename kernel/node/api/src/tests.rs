@@ -369,22 +369,65 @@ fn the_process_says_when_it_listens_and_when_it_stops() {
     );
 }
 
-/// The wall clock is the hand-over's, carried forward by the monotonic time since
-/// `platform` read it, a whole second at a time.
+/// The wall clock is the node's one, the core's (system design 3D), to the millisecond: what
+/// the clock page reads, whatever the hand-over said, once `platform` has set it.
 #[test]
-fn the_wall_clock_is_carried_forward_from_the_hand_over() {
+fn the_wall_clock_is_the_core_s_to_the_millisecond() {
+    const MS: u64 = 1_000_000;
     let mut handover = handed();
     handover.read_at_ns = 50 * SECOND;
-    let clock = node::NodeClock::new(&handover);
-    assert_eq!(clock.unix_seconds_at(50 * SECOND), WALL_CLOCK);
-    assert_eq!(clock.unix_seconds_at(51 * SECOND - 1), WALL_CLOCK);
-    assert_eq!(clock.unix_seconds_at(51 * SECOND), WALL_CLOCK + 1);
-    assert_eq!(clock.unix_seconds_at(3_650 * SECOND), WALL_CLOCK + 3_600);
+    let clock = node::NodeClock::new(&handover).expect("a clock");
+    // The page's nanoseconds since 1970, in milliseconds: never the hand-over's.
+    let set = (WALL_CLOCK + 7) * SECOND + 123 * MS + 999_999;
+    assert_eq!(
+        clock.unix_ms_at(Some(set), 50 * SECOND),
+        (WALL_CLOCK + 7) * 1_000 + 123
+    );
+    assert_eq!(
+        clock.unix_ms_at(Some(set), 0),
+        (WALL_CLOCK + 7) * 1_000 + 123
+    );
+    // `platform` sets it back an hour on: it reads as set, even before the hand-over's.
+    let back = (WALL_CLOCK + 3_599) * SECOND + 400 * MS;
+    assert_eq!(
+        clock.unix_ms_at(Some(back), 3_650 * SECOND),
+        (WALL_CLOCK + 3_599) * 1_000 + 400
+    );
+    assert_eq!(clock.unix_ms_at(Some(0), 0), 0);
+    assert_eq!(clock.unix_ms_at(Some(u64::MAX), 0), u64::MAX / MS);
+}
+
+/// While the clock page says the wall clock is unset, it is the hand-over's, carried forward
+/// by the monotonic time since `platform` read it, a millisecond at a time; and in seconds, it
+/// divided by 1,000.
+#[test]
+fn an_unset_wall_clock_is_the_hand_over_s_carried_forward() {
+    const MS: u64 = 1_000_000;
+    let mut handover = handed();
+    handover.read_at_ns = 50 * SECOND;
+    let clock = node::NodeClock::new(&handover).expect("a clock");
+    let wall = WALL_CLOCK * 1_000;
+    assert_eq!(clock.unix_ms_at(None, 50 * SECOND), wall);
+    assert_eq!(clock.unix_ms_at(None, 50 * SECOND + MS - 1), wall);
+    assert_eq!(clock.unix_ms_at(None, 50 * SECOND + MS), wall + 1);
+    assert_eq!(clock.unix_ms_at(None, 51 * SECOND - 1), wall + 999);
+    assert_eq!(clock.unix_ms_at(None, 51 * SECOND), wall + 1_000);
+    assert_eq!(
+        clock.unix_ms_at(None, 3_650 * SECOND + 250 * MS),
+        wall + 3_600_250
+    );
     // A monotonic time before the reading is the reading's.
-    assert_eq!(clock.unix_seconds_at(0), WALL_CLOCK);
-    // Now, on the core's clocks.
-    let now_clock = node::NodeClock::new(&handed());
-    assert!((WALL_CLOCK..WALL_CLOCK + 2).contains(&now_clock.unix_seconds()));
+    assert_eq!(clock.unix_ms_at(None, 0), wall);
+    // A wall clock past what milliseconds hold stops at the last.
+    handover.wall_clock = u64::MAX / 999;
+    let last = node::NodeClock::new(&handover).expect("a clock");
+    assert_eq!(last.unix_ms_at(None, u64::MAX), u64::MAX);
+    // Now, on the core's clocks: a host has no clock page, so the hand-over's, read just now.
+    let now_clock = node::NodeClock::new(&handed()).expect("a clock");
+    let ms = now_clock.unix_ms();
+    assert!((wall..wall + 2_000).contains(&ms), "{ms}");
+    let seconds = now_clock.unix_seconds();
+    assert!((ms / 1_000..ms / 1_000 + 2).contains(&seconds));
     let ms = now_clock.monotonic_ms();
     assert!((ms..ms + 1_000).contains(&(now() / 1_000_000)));
 }
@@ -397,7 +440,7 @@ fn the_function_keys_come_from_node_config() {
         r#"{{"moruna":1,"api":{{"token_keys":["{}"]}},"functions":{{"keys":["{key}"]}}}}"#,
         base64::encode(&[7; 32])
     );
-    let config = node::config(&handover_of(&user_data), 1, 0, now()).expect("a config");
+    let config = node::config(&handover_of(&user_data), 1, 0, WALL_CLOCK).expect("a config");
     assert_eq!(
         config.function_keys,
         [moruna_api_server::FunctionKey::new([5; 32])]
@@ -409,7 +452,7 @@ fn the_function_keys_come_from_node_config() {
 fn the_server_s_config_comes_from_the_hand_over() {
     let keys = [[7; 32], [9; 32]];
     let handover = handover_of(&user_data(&keys, None));
-    let config = node::config(&handover, 3, 6_849_298_432, now()).expect("a config");
+    let config = node::config(&handover, 3, 6_849_298_432, WALL_CLOCK).expect("a config");
     let facts = &config.facts;
     // The job bound node-admission answered (system design 3A).
     assert_eq!(facts.job_memory_bytes, 6_849_298_432);
@@ -439,7 +482,7 @@ fn the_server_s_config_comes_from_the_hand_over() {
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
     );
-    let again = node::config(&handover, 3, 0, now()).expect("a config");
+    let again = node::config(&handover, 3, 0, WALL_CLOCK).expect("a config");
     assert_ne!(again.identity.fingerprint(), fingerprint);
 }
 
@@ -447,7 +490,7 @@ fn the_server_s_config_comes_from_the_hand_over() {
 fn the_operator_s_tls_is_the_identity_when_node_config_has_one() {
     let (certificate, key, der) = operator("node.example");
     let handover = handover_of(&user_data(&[[7; 32]], Some((&certificate, &key))));
-    let config = node::config(&handover, 1, 0, now()).expect("a config");
+    let config = node::config(&handover, 1, 0, WALL_CLOCK).expect("a config");
     assert_eq!(config.identity.certificate(), der.as_slice());
     let digest = ring::digest::digest(&ring::digest::SHA256, &der);
     assert_eq!(config.identity.fingerprint(), hex(digest.as_ref()));
@@ -456,7 +499,7 @@ fn the_operator_s_tls_is_the_identity_when_node_config_has_one() {
     let (_, other_key, _) = operator("other.example");
     let handover = handover_of(&user_data(&[[7; 32]], Some((&certificate, &other_key))));
     assert_eq!(
-        node::config(&handover, 1, 0, now()).err(),
+        node::config(&handover, 1, 0, WALL_CLOCK).err(),
         Some(Error::Identity(true, IdentityError::Mismatch))
     );
 }

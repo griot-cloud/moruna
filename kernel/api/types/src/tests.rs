@@ -441,14 +441,22 @@ fn the_job_answers_round_trip_3b() {
     assert_eq!(submitted.id.len(), 32);
     let jobs: Jobs = round_trip(
         r#"{"jobs":[
-            {"id":"b","state":"running","submitted":1794931260,"started":1794931261},
-            {"id":"a","state":"completed","submitted":1794931200,"started":1794931201,"ended":1794931230}
+            {"id":"b","state":"running","submitted":1794931260,"submitted_ms":1794931260125,
+                "started":1794931261,"started_ms":1794931261003},
+            {"id":"a","state":"completed","submitted":1794931200,"submitted_ms":1794931200999,
+                "started":1794931201,"started_ms":1794931201000,
+                "ended":1794931230,"ended_ms":1794931230487}
         ]}"#,
     );
     assert_eq!(jobs.jobs[0].state, JobState::Running);
-    assert_eq!(jobs.jobs[0].ended, None);
+    assert_eq!((jobs.jobs[0].ended, jobs.jobs[0].ended_ms), (None, None));
+    assert_eq!(
+        (jobs.jobs[1].submitted_ms, jobs.jobs[1].ended_ms),
+        (1_794_931_200_999, Some(1_794_931_230_487))
+    );
     let status: JobStatus = round_trip(
-        r#"{"id":"a","state":"cancelled","submitted":1,"started":2,"ended":3,
+        r#"{"id":"a","state":"cancelled","submitted":1,"submitted_ms":1500,
+            "started":2,"started_ms":2000,"ended":3,"ended_ms":3999,
             "heartbeat":{"t_ms":1500,"committed_seq":4,"rows_out":10,"bytes_out":80,
                 "active_workers":2,"ceiling_bytes":1024,"anon_bytes":512,"bottleneck":"sink",
                 "staging_bytes":0},
@@ -456,11 +464,26 @@ fn the_job_answers_round_trip_3b() {
     );
     assert_eq!(status.exit_code, Some(130));
     assert_eq!(
+        (status.submitted_ms, status.started_ms, status.ended_ms),
+        (1500, Some(2000), Some(3999))
+    );
+    assert_eq!(
         status.heartbeat.as_ref().unwrap().bottleneck.as_deref(),
         Some("sink")
     );
-    let starting: JobStatus = round_trip(r#"{"id":"a","state":"starting","submitted":1}"#);
+    let starting: JobStatus =
+        round_trip(r#"{"id":"a","state":"starting","submitted":1,"submitted_ms":1001}"#);
     assert!(starting.heartbeat.is_none() && starting.exit_code.is_none());
+    assert_eq!((starting.started_ms, starting.ended_ms), (None, None));
+    // The milliseconds are the node's, beside the seconds: a record without them is not one.
+    assert!(
+        refused::<JobStatus>(r#"{"id":"a","state":"starting","submitted":1}"#)
+            .contains("submitted_ms")
+    );
+    assert!(
+        refused::<JobSummary>(r#"{"id":"a","state":"starting","submitted":1}"#)
+            .contains("submitted_ms")
+    );
     // The engine's heartbeat reads whatever fields it leaves out or nulls, and others it adds.
     let heartbeat: Heartbeat = serde_json::from_str(
         r#"{"type":"heartbeat","t_ms":7,"committed_seq":null,"rows_out":1,"later":true}"#,

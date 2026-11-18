@@ -376,14 +376,23 @@ pub struct JobSummary {
     pub id: String,
     /// Where the job is in its life.
     pub state: JobState,
-    /// When the node took the job, in Unix seconds.
+    /// When the node took the job, in Unix seconds: `submitted_ms` divided by 1,000.
     pub submitted: u64,
-    /// When it began to run, in Unix seconds; absent until it has.
+    /// When the node took the job, in Unix milliseconds on the node's wall clock.
+    pub submitted_ms: u64,
+    /// When it began to run, in Unix seconds: `started_ms` divided by 1,000; absent until it
+    /// has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started: Option<u64>,
-    /// When it ended, in Unix seconds; absent until it has.
+    /// When it began to run, in Unix milliseconds on the node's wall clock; absent until it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_ms: Option<u64>,
+    /// When it ended, in Unix seconds: `ended_ms` divided by 1,000; absent until it has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<u64>,
+    /// When it ended, in Unix milliseconds on the node's wall clock; absent until it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_ms: Option<u64>,
 }
 
 /// The answer to `GET /v1/jobs/{id}` and to `POST /v1/jobs/{id}/cancel`.
@@ -394,14 +403,23 @@ pub struct JobStatus {
     pub id: String,
     /// Where the job is in its life.
     pub state: JobState,
-    /// When the node took the job, in Unix seconds.
+    /// When the node took the job, in Unix seconds: `submitted_ms` divided by 1,000.
     pub submitted: u64,
-    /// When it began to run, in Unix seconds; absent until it has.
+    /// When the node took the job, in Unix milliseconds on the node's wall clock.
+    pub submitted_ms: u64,
+    /// When it began to run, in Unix seconds: `started_ms` divided by 1,000; absent until it
+    /// has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started: Option<u64>,
-    /// When it ended, in Unix seconds; absent until it has.
+    /// When it began to run, in Unix milliseconds on the node's wall clock; absent until it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_ms: Option<u64>,
+    /// When it ended, in Unix seconds: `ended_ms` divided by 1,000; absent until it has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<u64>,
+    /// When it ended, in Unix milliseconds on the node's wall clock; absent until it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_ms: Option<u64>,
     /// The engine's latest heartbeat; absent until it has sent one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat: Option<Heartbeat>,
