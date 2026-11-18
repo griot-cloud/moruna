@@ -562,7 +562,36 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
   instances follow from that. A function with no measurement yet is warmed up on the job's first
   small batches before the run is sized. No default factor stands in for a measurement (6.3g, found
   2026-11-18: the node sized the room from a fixed factor of 4.0, because registration carried no
-  warm-up).
+  warm-up). Decided for 6.3g (PM, 2026-11-18):
+  - **A measurement is a line:** the bytes one instance holds outside its batch whatever the batch,
+    the bytes it holds per byte of input, and the bytes it gives per byte it takes, with the count
+    of units it was fitted from and the range of input they covered. Fitted facts travel; the
+    observations stay with the client.
+  - **The margin is the measured spread:** 1.645 times the root mean square of the units'
+    departures from the line (the 95th percentile of a normal spread). No fixed safety factor; a
+    function that is exactly a line has no margin.
+  - **Whose measurement stands:** the node's own readings override a registration's (3E). A native
+    function has no client warm-up: its first job on a node warms it up.
+  - **Where it is kept:** `api`'s registry, by function image (not admission's cache, which
+    evicts), shown by `GET /v1/functions` and returned in the job's report, so a client keeps it
+    past the node's life and sends it with the next registration.
+  - **Every run refines it:** each instance's account peak with the largest piece it was given, a
+    pair a run, and the line fitted again over the pairs. No new core call.
+  - **The warm-up on the job's first batches is skipped** when the facts rest on 32 units or more,
+    the controller's rule for a profile; the run still records and refines.
+  - **When the job's CPUs do not all fit, the piece shrinks first,** down to the least piece, and
+    only then do fewer instances run: memory bounds the unit of work, never the workers.
+  - **The fixed leasts** (an account of 16 MiB, a share of 29 MiB) are only where a function with no
+    measurement yet starts; a measured function gets its measured fixed term.
+  - **A function that passes its room** is given a larger one, started again, and has its
+    unanswered pieces posted again, and the measurement is recorded. One that keeps state restarts
+    from its last checkpoint; with none the job fails, naming the function, with the measurement
+    recorded so the next run is sized right.
+  - **Off the node** (the library, `moruna run`) the run finds what `moruna check` measured in its
+    observation store, by the function and its declared input, and sizes its arena from that before
+    any source is built. A measurement stands over what the function declares; a function measured
+    to hold less than the controller's least (half a byte per byte in flight) is sized at that
+    least, which the controller holds back whatever it measures.
 - **Memory on a node is computed, never a constant.** Each service has a fixed account in node.conf
   except `node-admission`, which takes `rest`: node memory less every other account and the kernel's
   share. Jobs and checks are carved from it. The job bound is admission's account less the 256 MiB
@@ -671,6 +700,9 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
     `function_keys` (added to 1D's schema, 0 to 8 keys).
   - The node checks the signature and stores the entry. `GET /v1/functions` (observe) lists them.
     Nothing is fetched at registration.
+  - An optional `measured` member carries the function's memory facts as its warm-up fitted them
+    (3A). It is outside the signature: it describes behaviour, not identity, and the node's own
+    readings override it. `GET /v1/functions` shows each function's facts and whose they are.
 - **At job start,** `node-admission` fetches each function the job names: it mints itself a channel
   limited to the address's host on 443, fetches over HTTPS with the network server's TLS, checks the
   SHA-256, and hands the engine the image as a read-only memory object, with no copy. The node
