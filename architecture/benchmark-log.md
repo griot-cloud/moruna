@@ -204,3 +204,33 @@ speed comparison is a miss.
 - **The node's CPU column is 0.0:** the node does not report a job's CPU. Item 6.3i is in progress.
 - **The node ran without its cost model** (policy `admission`, nothing predicted). Item 6.3o is in
   progress.
+
+
+## Run 202611181759 (6.2 run 4, PM, 2026-11-18)
+
+- **Image:** cdb5a7a1, which is 6.3e merged (a function runs one instance per CPU of the job). The
+  node was an Azure D4s_v4 in griot-dev with a job budget of 4 CPUs and 12.98 GiB, reading from and
+  writing to Blob. The run's resource group is deleted.
+- **The other engines did not run.** The Linux machine's setup timed out downloading wheels from
+  PyPI (pyarrow, msgpack, pyyaml for Ray). This is a network fault in the harness's setup, not
+  Moruna. Their figures stay those of run 3, which also did not run them.
+- **Node, medians of the passing runs:**
+
+  | Job | Run 3 | Run 4 | Runs ok |
+  |---|---:|---:|---|
+  | Score | 93.2 s | 53.0 s | 3 of 5 |
+  | Occupancy | 19.2 s | 18.6 s | 5 of 5 |
+  | Enrich | 62.3 s | none | 0 of 5 |
+  | Audit | 20.2 s | 20.1 s | 5 of 5 |
+
+- **6.3e's gain is real.** Score is 1.76 times faster with 4 instances.
+- **6.3e brought three failures.** Item 6.3r (architecture/work/6.3r-instances-fail-on-the-node.md):
+  - **Score, 2 of 5 runs:** "a record of 14884864 bytes does not fit its input region, which has
+    13586432 bytes free and nothing to release".
+  - **Enrich, every run:** "it said a batch was done without a record for it".
+  - **Enrich, once:** "previous task account has no certified retirement".
+
+  A fixed count of instances is refused as the fix. The outputs of the passing runs were not
+  checked against 0.6.6 in this run: there was no 0.6.6 row to compare with.
+- **Occupancy and Audit are unchanged.** They are bound by reading, and 6.3e does not touch that.
+- **Next:** rerun the node and the four engines once 6.3r, 6.3g, 6.3d and 6.3h are merged.
