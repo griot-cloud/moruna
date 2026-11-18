@@ -413,12 +413,14 @@ def provenance(code: Code) -> Provenance:
 
 
 def build_key(
-    code: Code, entry: str, *, lock: str | None, runtime: str, shim: str, platform: str
+    code: Code, entry: str, *, lock: str | None, runtime: str, shim: str, platform: str,
+    processes: int | None = None,
 ) -> str:
     """``sha256:`` over what an image is made of: each file of the closure (its stripped syntax
     tree, or a data file's bytes) by its path, the lock's digest, the runtime image, the shim,
-    the platform and the entry. Docstrings, comments and formatting are not part of it."""
-    document = {
+    the platform and the entry, and the ``MORUNA_PROCESSES`` its config declares when it declares
+    one (system design 3E). Docstrings, comments and formatting are not part of it."""
+    document: dict[str, Any] = {
         "moruna_build_key": KEY_VERSION,
         "entry": entry,
         "files": code.digests(),
@@ -427,5 +429,7 @@ def build_key(
         "shim": shim,
         "platform": platform,
     }
+    if processes is not None:
+        document["processes"] = processes
     data = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
     return "sha256:" + hashlib.sha256(data).hexdigest()

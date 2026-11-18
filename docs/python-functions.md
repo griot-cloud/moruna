@@ -18,7 +18,7 @@ Use `@moruna.function`, `@moruna.function(...)`, or `moruna.function(obj, ...)`.
 | --- | --- | --- |
 | `fn` | callable or object, optional | Function to wrap, or stateful object when `stateful=True`. |
 | `stateful` | `bool = False` | Call `setup(ctx)` and `__call__(state, batch)` on the object. |
-| `instances` | `int = 1` | Independent copies of state; at least 1. |
+| `instances` | `int = 1` | With `stateful=True`, the most instances a job runs, each with its own state; at least 1. |
 | `device_memory` | `bool = False` | Declare device memory use. |
 | `accepts` | `str = "table"` | `"table"`, `"tensor"`, or `"either"`. |
 | `tier` | `str = "host"` | `"host"`, `"device"`, or `"any"`. |
@@ -33,6 +33,10 @@ Use `@moruna.function`, `@moruna.function(...)`, or `moruna.function(obj, ...)`.
 | `memory_guard` | `bool = True` | Refuse an allocation that crosses the process memory ceiling. |
 
 Schema mappings accept Arrow types, their string spellings, and Python `int`, `float`, `str` and `bool`. A stateful object supplies `setup(self, ctx) -> state` and `__call__(self, state, batch) -> batch`; `ctx` has `instance` and `device`. It may supply `footprint(self, state)`, and `finish(self, state) -> batch | None`, which is called once per instance when the function's input has ended, after its last `__call__`. A batch `finish` returns goes downstream like any other; `None` gives nothing; an exception ends the run with a `FunctionError` naming the function. A function that must see the whole run before giving its result (one that collects every batch) gives it from `finish` and takes `instances=1`: with more instances, each instance's `finish` gives what that instance saw. On resume, a `resume="reinit"` function's `finish` sees only the batches after the checkpoint, so a whole-run function that must survive a resume uses `resume="checkpoint"`. With `resume="checkpoint"`, it must also implement `checkpoint(self, state) -> bytes` and `restore(self, ctx, data) -> state`. Invalid declarations or options raise `TypeError` or `ValueError` at decoration time.
+
+### How many instances run
+
+A job runs a function one instance per CPU of the job (its `budget.cpu`, or the node's CPUs), each a process of its own, and gives each a share of the batches. A plain `@moruna.function` declares nothing and runs on every CPU. A stateful one (`stateful=True`) runs at most its `instances`, 1 unless it says more, which its image declares as `MORUNA_PROCESSES` when it is built. A `moruna.Function` subclass runs one instance, as its contract says. The declaration is a ceiling, never a count: a job of fewer CPUs runs fewer.
 
 ## A decorated `moruna.Function`
 

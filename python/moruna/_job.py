@@ -335,6 +335,8 @@ def function(
         )
         # What its definition says it takes and gives, when it declares exact schemas.
         made.__dict__["_moruna_declared"] = (input_schema, output_schema)
+        # How many instances of it a job may run, which its image declares (system design 3E).
+        made.__dict__["_moruna_instances"] = instances
         return made
 
     if fn is None:
@@ -901,6 +903,7 @@ def _image_task(
     build_key = _closure.build_key(
         closure, entry, lock=lowering.lock(closure.root), runtime=target.runtime,
         shim=_build.shim_digest(), platform=target.platform,
+        processes=_build.declared_processes(task, role),
     )  # fmt: skip
     digest, location = built.get(build_key, (None, None))
     settings = {
@@ -930,6 +933,7 @@ def _image_build_task(task: Any, role: str, key: str, target: Target, lowering: 
         distributions=_closure.distributions(code.imports),
         provenance=definition.get("provenance", {}),
         definition=definition,
+        processes=_build.declared_processes(task, role),
     )  # fmt: skip
 
 
