@@ -80,6 +80,9 @@ implements `moruna_function::Function`: `batch` answers each batch as `serve`'s 
 fields, which both reach. `main` serves it:
 
 ```rust
+// Its total is the whole input's only if one instance sees every batch (below).
+moruna_function::processes!(1);
+
 #[derive(Default)]
 struct Rows(i64);
 
@@ -103,6 +106,22 @@ fn main() -> ExitCode {
 What `end` writes answers no input batch. `end` is called after every batch was answered and
 released and the engine posts no more, with no input too; an error from it ends the task as one
 from `batch` does. Unless a function implements it, `end` writes nothing.
+
+## How many instances run
+
+A job runs a function one instance per CPU of the job (its `budget.cpu`, or the node's CPUs), each
+a process of its own, and deals the batches among them. A function that keeps state across
+batches, as `Rows` does, declares the most instances it can run, 1 to 64, once at the top level of
+its program:
+
+```rust
+moruna_function::processes!(1);
+```
+
+It is a ceiling, never a count: a job of fewer CPUs runs fewer. With more than one instance, each
+`end` writes what its own instance saw. The declaration is the program's ELF note
+(`.note.moruna`, owner `Moruna`, `MORUNA_PROCESSES=N`), which the engine reads before it starts
+the function; on a host it declares nothing. A function that declares nothing runs on every CPU.
 
 ## Params and arguments
 

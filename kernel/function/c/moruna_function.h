@@ -175,4 +175,24 @@ const char *moruna_params(void);
 }
 #endif
 
+/*
+ * A job runs a function one instance per CPU of the job, each a process of its own. A function
+ * that keeps state across batches (a running total) declares the most instances it can run, 1 to
+ * 64, once at file scope:
+ *
+ *     MORUNA_PROCESSES(1);
+ *
+ * A ceiling, never a count. It is the program's ELF note (.note.moruna, owner "Moruna", type 1,
+ * "MORUNA_PROCESSES=N"), which the engine reads before it starts the function. Off ELF (a host's
+ * Mach-O build) it declares nothing.
+ */
+#if defined(__ELF__)
+#define MORUNA_PROCESSES(n)                                                                      \
+  __asm__(".pushsection .note.moruna,\"a\",@note\n.balign 4\n.long 7\n.long 2f - 1f\n.long 1\n"  \
+          ".asciz \"Moruna\"\n.balign 4\n1: .ascii \"MORUNA_PROCESSES=" #n "\"\n2: .balign 4\n" \
+          ".popsection")
+#else
+#define MORUNA_PROCESSES(n) extern int moruna_processes_declared_
+#endif
+
 #endif /* MORUNA_FUNCTION_H */

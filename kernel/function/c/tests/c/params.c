@@ -15,6 +15,10 @@
 
 #include "support.h"
 
+/* Its one record answers no batch, so each instance would write its own: it runs alone (system
+   design 3E). */
+MORUNA_PROCESSES(1);
+
 /* The variable name's value, or "(none)". */
 static const char *variable(const char *name) {
   const char *value = getenv(name);

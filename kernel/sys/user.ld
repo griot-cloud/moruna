@@ -1,6 +1,7 @@
 /* A static user program for the Moruna microkernel (every userland crate, linked by
    kernel/tools/build.sh): one segment per permission, each on its own pages, as the
-   kernel's loader requires (SDD 20 f.2). */
+   kernel's loader requires (SDD 20 f.2). A function's `.note.moruna` (system design 3E) is
+   kept in the read-only segment and its own PT_NOTE; every other note is dropped. */
 ENTRY(_start)
 
 PHDRS
@@ -8,6 +9,7 @@ PHDRS
     text PT_LOAD FLAGS(5);
     rodata PT_LOAD FLAGS(4);
     data PT_LOAD FLAGS(6);
+    note PT_NOTE FLAGS(4);
 }
 
 SECTIONS
@@ -20,6 +22,7 @@ SECTIONS
     .eh_frame_hdr : { *(.eh_frame_hdr) } :rodata
     .eh_frame : { KEEP(*(.eh_frame)) } :rodata
     .gcc_except_table : { *(.gcc_except_table*) } :rodata
+    .note.moruna : { KEEP(*(.note.moruna)) } :rodata :note
 
     . = ALIGN(4096);
     .data : { *(.data .data.*) } :data
