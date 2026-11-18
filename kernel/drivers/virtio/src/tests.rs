@@ -952,10 +952,12 @@ fn nt_t6_segmentation_and_unusable_checksum_offsets_are_refused() {
 
 /// NT-T6, item 1.6f: the refusals are counted by reason (a length out of bounds, each
 /// flags value, each GSO type) and the frames taken by their flags, for the driver's
-/// last line; the first refusal is told once, with the bytes written and its header.
+/// last line; the first refusal and the first frame taken with flags are each told
+/// once, with the bytes written and the header, so a boot that runs on still says
+/// what the card sends.
 #[test]
 fn nt_t6_refusals_are_counted_by_reason_and_the_first_is_told() {
-    use crate::net::{First, NetError, Reason, RxCounts, header};
+    use crate::net::{First, NetError, Reason, RxCounts, Seen, header};
     use alloc::string::ToString;
     assert_eq!(Reason::of(&NetError::BadLength(5)), Some(Reason::Length));
     let checksum = NetError::Checksum {
@@ -977,16 +979,34 @@ fn nt_t6_refusals_are_counted_by_reason_and_the_first_is_told() {
     let mut counts = RxCounts::default();
     let nothing = "0 malformed from the card, 0 taken with flags";
     assert_eq!(counts.to_string(), nothing);
-    assert_eq!(counts.first_to_print(), None);
-    counts.take(0);
+    assert_eq!(counts.to_print(), None);
+    counts.take(0, 72, [0; 12]);
     assert_eq!(counts.to_string(), nothing);
-    for flags in [2, 2, 1, 2] {
-        counts.take(flags);
+    assert_eq!(counts.to_print(), None);
+    let valid = [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+    counts.take(2, 86, valid);
+    for flags in [2, 1, 2] {
+        counts.take(flags, 72, [flags; 12]);
     }
     assert_eq!(
         counts.to_string(),
         "0 malformed from the card, 4 taken with flags (0x01: 1, 0x02: 3)"
     );
+    let told = counts.to_print().expect("the first taken");
+    assert_eq!(
+        told,
+        First {
+            seen: Seen::Taken(2),
+            used: 86,
+            header: valid
+        }
+    );
+    assert_eq!(
+        told.to_string(),
+        "the first frame taken with flags from the card: flags 0x02, 86 bytes written, \
+         header 02 00 00 00 00 00 00 00 00 00 01 00"
+    );
+    assert_eq!(counts.to_print(), None);
 
     let page = Fake::new(64);
     page.poke(0, &[0x05, 0, 0, 0, 0, 0, 0x22, 0, 0x10, 0, 1, 0]);
@@ -1003,11 +1023,11 @@ fn nt_t6_refusals_are_counted_by_reason_and_the_first_is_told() {
         "4 malformed from the card (length: 1, flags 0x05: 1, gso 0x01: 2), \
          4 taken with flags (0x01: 1, 0x02: 3)"
     );
-    let told = counts.first_to_print().expect("the first");
+    let told = counts.to_print().expect("the first refused");
     assert_eq!(
         told,
         First {
-            reason: Reason::Flags(5),
+            seen: Seen::Refused(Reason::Flags(5)),
             used: 74,
             header: first
         }
@@ -1017,11 +1037,31 @@ fn nt_t6_refusals_are_counted_by_reason_and_the_first_is_told() {
         "the first malformed buffer from the card: flags 0x05, 74 bytes written, \
          header 05 00 00 00 00 00 22 00 10 00 01 00"
     );
-    // Told once: later refusals are counted, not told.
-    assert_eq!(counts.first_to_print(), None);
+    // Told once each: later ones are counted, not told.
+    assert_eq!(counts.to_print(), None);
     counts.refuse(Reason::Length, 3, [0; 12]);
-    assert_eq!(counts.first_to_print(), None);
+    counts.take(1, 72, [1; 12]);
+    assert_eq!(counts.to_print(), None);
     assert_eq!(counts.refused(), 5);
+    // Both firsts in one service pass are told in the order they came.
+    let mut both = RxCounts::default();
+    both.refuse(Reason::Gso(4), 1526, [0; 12]);
+    both.take(2, 72, valid);
+    assert!(matches!(
+        both.to_print(),
+        Some(First {
+            seen: Seen::Refused(Reason::Gso(4)),
+            ..
+        })
+    ));
+    assert!(matches!(
+        both.to_print(),
+        Some(First {
+            seen: Seen::Taken(2),
+            ..
+        })
+    ));
+    assert_eq!(both.to_print(), None);
     assert_eq!(Reason::Length.to_string(), "length");
     assert_eq!(Reason::Gso(0x81).to_string(), "gso 0x81");
 }

@@ -11,7 +11,7 @@
 //! 5.1.6.4.2); a GSO type, which needs a feature never offered, is refused.
 //! [`RxCounts`] counts the frames taken with flags and the buffers refused, by reason.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use core::{fmt, ops::Range};
 
 use moruna_abi::Error;
@@ -324,55 +324,77 @@ impl fmt::Display for Reason {
     }
 }
 
-/// The first buffer a driver refused: why, the bytes the device wrote, and its header.
+/// What a first buffer was: refused, and why; or a frame taken whose header had flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seen {
+    Refused(Reason),
+    Taken(u8),
+}
+
+/// The first buffer a driver refused, or the first frame it took with flags: what it
+/// was, the bytes the device wrote, and its header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct First {
-    pub reason: Reason,
+    pub seen: Seen,
     pub used: u32,
     pub header: [u8; HEADER],
 }
 
 impl fmt::Display for First {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "the first malformed buffer from the card: {}, {} bytes written, header",
-            self.reason, self.used
-        )?;
+        match self.seen {
+            Seen::Refused(reason) => {
+                write!(f, "the first malformed buffer from the card: {reason}")
+            }
+            Seen::Taken(flags) => write!(
+                f,
+                "the first frame taken with flags from the card: flags {flags:#04x}"
+            ),
+        }?;
+        write!(f, ", {} bytes written, header", self.used)?;
         self.header.iter().try_for_each(|b| write!(f, " {b:02x}"))
     }
 }
 
 /// What a driver counts of the buffers its device returned: those refused, by
-/// reason; the frames taken whose header had flags, by flags; and the first refusal,
-/// held until it is printed. Shown at the end of the driver's last line, so a boot
-/// that drops frames says why.
+/// reason, and the frames taken whose header had flags, by flags. The first of each
+/// kind is held until it is printed, so a boot that runs on says what the card sends;
+/// the counts end the driver's last line, so a boot that drops frames says why.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RxCounts {
     refused: BTreeMap<Reason, u64>,
     taken: BTreeMap<u8, u64>,
-    first: Option<First>,
-    told: bool,
+    /// The firsts not yet printed, at most one of each kind.
+    untold: VecDeque<First>,
 }
 
 impl RxCounts {
     /// Counts a buffer refused for `reason`: `used` bytes written, and its header.
     pub fn refuse(&mut self, reason: Reason, used: u32, header: [u8; HEADER]) {
-        *self.refused.entry(reason).or_default() += 1;
-        if !self.told && self.first.is_none() {
-            self.first = Some(First {
-                reason,
+        if self.refused.is_empty() {
+            self.untold.push_back(First {
+                seen: Seen::Refused(reason),
                 used,
                 header,
             });
         }
+        *self.refused.entry(reason).or_default() += 1;
     }
 
-    /// Counts a frame taken, when its header had flags.
-    pub fn take(&mut self, flags: u8) {
-        if flags != 0 {
-            *self.taken.entry(flags).or_default() += 1;
+    /// Counts a frame taken whose header had `flags`, `used` bytes written; a frame
+    /// with none is not counted.
+    pub fn take(&mut self, flags: u8, used: u32, header: [u8; HEADER]) {
+        if flags == 0 {
+            return;
         }
+        if self.taken.is_empty() {
+            self.untold.push_back(First {
+                seen: Seen::Taken(flags),
+                used,
+                header,
+            });
+        }
+        *self.taken.entry(flags).or_default() += 1;
     }
 
     /// The buffers refused.
@@ -380,11 +402,9 @@ impl RxCounts {
         self.refused.values().sum()
     }
 
-    /// The first refusal, once, for its line on the console.
-    pub fn first_to_print(&mut self) -> Option<First> {
-        let first = self.first.take()?;
-        self.told = true;
-        Some(first)
+    /// The next first not yet printed, once each, for its line on the console.
+    pub fn to_print(&mut self) -> Option<First> {
+        self.untold.pop_front()
     }
 }
 

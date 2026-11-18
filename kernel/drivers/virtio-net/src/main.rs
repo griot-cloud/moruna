@@ -17,7 +17,8 @@
 //! the buffer is posted again. The header's flags are taken as Linux takes them,
 //! though none was negotiated (item 1.6f): `DATA_VALID` is taken, `NEEDS_CSUM`'s
 //! partial checksum is completed, a GSO type is refused. A refused buffer is counted
-//! by reason; the first is printed with its header, and the last line names them all.
+//! by reason and a frame taken with flags by its flags; the first of each is printed
+//! with its header, and the last line names them all.
 //! A link change (the configuration interrupt) answers the connections waiting for
 //! one. When every client has gone the driver resets the card and ends.
 
@@ -176,9 +177,13 @@ impl Net {
                         got.complete(&mut frame)?;
                         Ok((got.flags, frame))
                     });
+                let header =
+                    || net::header(map, at).map_err(|e| format!("receive page: {}", e.name()));
                 match taken {
                     Ok((flags, frame)) => {
-                        rx.take(flags);
+                        if flags != 0 {
+                            rx.take(flags, used.len, header()?);
+                        }
                         server.hub.deliver(&frame);
                     }
                     // A malformed buffer is the card's error: counted by reason, and
@@ -187,9 +192,7 @@ impl Net {
                         let Some(reason) = net::Reason::of(&e) else {
                             return Err(format!("receive page: {e:?}"));
                         };
-                        let header = net::header(map, at)
-                            .map_err(|e| format!("receive page: {}", e.name()))?;
-                        rx.refuse(reason, used.len, header);
+                        rx.refuse(reason, used.len, header()?);
                         server.hub.rx_errors += 1;
                     }
                 }
@@ -462,7 +465,7 @@ fn run() -> i64 {
                 println!(out, "KE1 {}: FAIL: the card: {}", name, e);
                 return 1;
             }
-            if let Some(first) = n.rx.first_to_print() {
+            while let Some(first) = n.rx.to_print() {
                 println!(out, "KE1 {}: {}", name, first);
             }
             for (pending, outcome) in core::mem::take(&mut n.server.ready) {
