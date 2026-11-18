@@ -709,7 +709,18 @@ There are two kinds:
   5A has the same, an end hook).
 - **C needs a libc, and it is relibc** (Redox's, MIT, in Rust) with a Moruna platform layer over
   `moruna-sys` and std, vendored at a pinned commit like OSTD. A minimal runtime breaks on the first
-  real C library; musl would need an in-process Linux syscall layer. Item 5.2b.
+  real C library; musl would need an in-process Linux syscall layer. Item 5.2b. **One runtime, not
+  two:**
+  - std, the SDK and relibc build as one crate graph: one allocator, one `moruna-sys`; relibc's
+    `malloc` is std's global allocator, and relibc drops its own panic and alloc-error items.
+  - **ELF TLS** (x86_64 variant II, FS:0 the thread control block's self pointer) for std and relibc
+    alike; 5.0's key table goes. One control block type holds both runtimes' per-thread state.
+  - **One thread path:** `std::thread::spawn` and `pthread_create` both go through it.
+  - **One `_start`:** sets up TLS, takes the log slot (std owns it; C's fd 1 and 2 write through
+    std's writer), runs relibc's static init when it is linked, then `main`.
+  - Unsupported POSIX (fork, exec, signals, sockets, paths) answers `ENOSYS`/`ENOENT`, as 5A0 says.
+  - C++ (libc++, libc++abi, libunwind over relibc) follows once relibc runs; exceptions never cross
+    a `moruna_*` call.
 - **C, C++ and Zig** link the library into a static native function. Go and others follow when
   someone needs them; nothing in the header is tied to C.
 
