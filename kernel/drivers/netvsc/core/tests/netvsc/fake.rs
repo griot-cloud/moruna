@@ -219,21 +219,26 @@ impl Parts {
 #[cfg(feature = "trace-first-frames")]
 impl Parts {
     /// Starts the card as [`Parts::start`] does, with `trace` noting its first frames from
-    /// the start on (work item 1.11c).
-    pub fn start_traced(mut self, trace: moruna_netvsc::trace::Trace) -> Result<Card, NetvscError> {
+    /// the start on (work item 1.11c), and the lines the start said.
+    pub fn start_traced(
+        mut self,
+        trace: moruna_netvsc::trace::Trace,
+    ) -> Result<(Card, Vec<String>), NetvscError> {
         self.host.borrow_mut().flush(self.channel.host());
+        let mut said = Vec::new();
         let driver = Netvsc::start_traced(
             self.channel,
             self.receive,
             self.send,
             Some(DEADLINE),
-            &mut |_| {},
+            &mut |line| said.push(line.to_string()),
             trace,
         )?;
-        Ok(Card {
+        let card = Card {
             driver,
             host: self.host,
-        })
+        };
+        Ok((card, said))
     }
 }
 
@@ -504,6 +509,9 @@ pub struct Host {
     pub versions: Vec<u32>,
     /// What the MTU query answers, instead of the NDIS configuration's less a header.
     pub mtu: Option<u32>,
+    /// What OID_GEN_MEDIA_CONNECT_STATUS answers: 0, connected, unless a test says
+    /// otherwise; `None` refuses the query.
+    pub media: Option<Vec<u8>>,
     /// Bytes of a send section.
     pub send_section: u32,
     /// Bytes of a receive section, instead of netvsp's for the MTU.
@@ -662,6 +670,7 @@ impl Host {
                 Version::V61 as u32,
             ],
             mtu: None,
+            media: Some(0u32.to_le_bytes().to_vec()),
             send_section: 6144,
             receive_section: None,
             paused: false,
@@ -1221,6 +1230,7 @@ impl Host {
                         let mtu = self.mtu.unwrap_or(self.config.unwrap().mtu - 14);
                         Some(mtu.to_le_bytes().to_vec())
                     }
+                    Oid::OID_GEN_MEDIA_CONNECT_STATUS => self.media.clone(),
                     _ => None,
                 };
                 let status = match value {

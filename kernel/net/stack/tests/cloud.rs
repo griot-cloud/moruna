@@ -294,10 +294,10 @@ fn unanswered_discovers_back_off_from_a_second_to_a_minute_and_start_over_at_lin
     assert_eq!(bound(&stack), 0);
 }
 
-/// A REQUEST, which follows an OFFER over a path that works, is sent again after 4 s as
-/// before; only DISCOVERs start at a second.
+/// A REQUEST, which follows an OFFER, is sent again as a DISCOVER is: RFC 2131 4.1 has one
+/// rule for both, so a lost one costs about a second too.
 #[test]
-fn a_lost_request_is_sent_again_after_four_seconds() {
+fn a_lost_request_is_sent_again_after_a_second() {
     let started = SECOND;
     let mut stack = cloud_stack(started);
     let mut server = dhcp_server(true);
@@ -321,10 +321,50 @@ fn a_lost_request_is_sent_again_after_four_seconds() {
     assert!(leased, "no lease in 30 s: {:?}", stack.notes);
     let after = t - started;
     assert!(
-        (4 * SECOND..4 * SECOND + 100 * MS).contains(&after),
+        (900 * MS..1200 * MS).contains(&after),
         "the lease came {} ms after the start",
         after / MS
     );
+}
+
+/// A server that offers and never acknowledges: the client's REQUESTs go 1, 2, 4, 8 and 16 s
+/// apart, each within a tenth, then, smoltcp's five REQUESTs spent, it discovers again and its
+/// REQUESTs start over at a second.
+#[test]
+fn unanswered_requests_back_off_from_a_second_then_the_client_discovers_again() {
+    let mut t = SECOND;
+    let mut stack = cloud_stack(t);
+    let requests: Times = Arc::default();
+    let discovers: Times = Arc::default();
+    let (r, d) = (requests.clone(), discovers.clone());
+    let mut offering = move |stack: &mut Stack, now: u64| {
+        for f in std::mem::take(&mut stack.card_mut(0).port.tx) {
+            match dhcp_request(&f).map(|(_, _, kind)| kind) {
+                Some(DhcpMessageType::Discover) => {
+                    d.lock().unwrap().push(now);
+                    if let Some(offer) = common::dhcp_answer(&f, true) {
+                        stack.card_mut(0).port.deliver(offer);
+                    }
+                }
+                Some(DhcpMessageType::Request) => r.lock().unwrap().push(now),
+                _ => {}
+            }
+        }
+    };
+    drive_timed(&mut stack, &mut offering, &mut t, 40 * SECOND);
+    let sent = requests.lock().unwrap().clone();
+    let again = discovers.lock().unwrap()[1];
+    let (first, then): (Vec<u64>, Vec<u64>) = sent.iter().partition(|at| **at < again);
+    let gaps =
+        |times: &[u64]| -> Vec<u64> { times.windows(2).map(|w| (w[1] - w[0]) / MS).collect() };
+    assert_eq!(first.len(), 5, "{sent:?}");
+    assert_backoff(&gaps(&first), &[1, 2, 4, 8]);
+    // The fifth REQUEST's wait, then a DISCOVER, answered at once, and REQUESTs from a second.
+    let waited = (again - first[4]) / MS;
+    assert!((14_400..=17_630).contains(&waited), "{waited} ms");
+    assert!(then.len() >= 2, "{sent:?}");
+    assert_backoff(&gaps(&then[..2]), &[1]);
+    assert_eq!(bound(&stack), 0);
 }
 
 /// A lease taken, then lost with its link, starts the DISCOVERs over at a second, however many
