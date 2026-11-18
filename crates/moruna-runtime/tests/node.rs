@@ -498,7 +498,9 @@ fn a_nodes_budget_is_the_most_a_job_may_have_and_its_default() {
         .iter()
         .find(|m| m["type"] == "report")
         .expect("a report");
-    assert_eq!(report["report"]["host"]["memory_limit_bytes"], json!(max));
+    // The engine ran within the arena's share of its whole budget, never the whole.
+    let arena = moruna_runtime::host::node::sizes(max, false).arena;
+    assert_eq!(report["report"]["host"]["memory_limit_bytes"], json!(arena));
 }
 
 /// The check a node runs for `validate`, over a channel (`moruna check-job --listen`): one

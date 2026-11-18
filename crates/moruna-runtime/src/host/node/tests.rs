@@ -145,7 +145,8 @@ fn a_nodes_budget_bounds_the_jobs_and_fills_it_in() {
     let mut at = with_budget(1 << 30);
     assert!(refusals(&at, &bounded).is_empty());
     admit(&mut at, &bounded, || Some("0".repeat(32))).unwrap();
-    assert_eq!(at.budget.memory_bytes, Some(1 << 30));
+    // The engine sizes itself to the arena's share of the whole.
+    assert_eq!(at.budget.memory_bytes, Some(sizes(1 << 30, false).arena));
     // Over it, refused by its field, saying what the node allows.
     let over = with_budget((1 << 30) + 4096);
     let refused = refusals(&over, &bounded);
@@ -160,7 +161,7 @@ fn a_nodes_budget_bounds_the_jobs_and_fills_it_in() {
     let mut none = job(sound());
     assert_eq!(budget(&none, &bounded), Some(1 << 30));
     admit(&mut none, &bounded, || Some("0".repeat(32))).unwrap();
-    assert_eq!(none.budget.memory_bytes, Some(1 << 30));
+    assert_eq!(none.budget.memory_bytes, Some(sizes(1 << 30, false).arena));
     // With no bound, the document's own, or none.
     assert_eq!(budget(&job(sound()), &node()), None);
     assert_eq!(budget(&with_budget(4096), &node()), Some(4096));
@@ -254,6 +255,43 @@ fn a_urls_host_is_its_authoritys_name() {
     assert_eq!(disk_serial("disk://serial-1/a/b"), Some("serial-1"));
     assert_eq!(disk_serial("disk:///a"), None);
     assert_eq!(disk_serial("file:///a"), None);
+}
+
+/// A job's whole memory is its account: the engine's 128 MiB, a quarter of the rest as
+/// scratch unless it names a staging volume, and the arena the rest, so that a job at its
+/// budget never needs more than its account.
+#[test]
+fn a_jobs_budget_is_spent_on_the_engine_its_scratch_and_its_arena() {
+    let mib = 1u64 << 20;
+    let at = sizes(1 << 30, false);
+    assert_eq!(
+        at,
+        Sizes {
+            overhead: 128 * mib,
+            scratch: 224 * mib,
+            arena: 672 * mib
+        }
+    );
+    assert_eq!(at.overhead + at.scratch + at.arena, 1 << 30);
+    let volume = sizes(1 << 30, true);
+    assert_eq!((volume.scratch, volume.arena), (0, 896 * mib));
+    // Pages, and a budget smaller than the overhead leaves nothing else.
+    let odd = sizes((1 << 30) + 4096, false);
+    assert_eq!(odd.overhead + odd.scratch + odd.arena, (1 << 30) + 4096);
+    assert_eq!(odd.scratch % 4096, 0);
+    assert_eq!(
+        sizes(64 * mib, false),
+        Sizes {
+            overhead: 64 * mib,
+            scratch: 0,
+            arena: 0
+        }
+    );
+    // A disk:// staging URL is a volume; a directory is not.
+    let mut staged = sound();
+    staged["staging"] = json!({"url": "disk://vol-s/spill/"});
+    assert!(names_staging_volume(&job(staged)));
+    assert!(!names_staging_volume(&job(sound())));
 }
 
 #[test]

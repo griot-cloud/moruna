@@ -42,6 +42,46 @@ impl Node {
     }
 }
 
+/// What the engine keeps of a job's account for itself: the supervisor and the Linux
+/// personality's process (system design 3A).
+pub const ENGINE_OVERHEAD: u64 = 128 << 20;
+
+/// How a job's whole memory, its account, is spent on a node (system design 3A).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sizes {
+    /// The engine's own: [`ENGINE_OVERHEAD`], or all of a budget smaller than it.
+    pub overhead: u64,
+    /// In-memory scratch: a quarter of what is left, none when the job names a staging volume.
+    pub scratch: u64,
+    /// The rest: what `moruna` sizes itself to.
+    pub arena: u64,
+}
+
+/// [`Sizes`] of a budget of `whole` bytes, in whole pages; `staging_volume` when the job names
+/// one, so that it needs no in-memory scratch.
+pub fn sizes(whole: u64, staging_volume: bool) -> Sizes {
+    let overhead = ENGINE_OVERHEAD.min(whole);
+    let rest = whole - overhead;
+    let scratch = if staging_volume {
+        0
+    } else {
+        (rest / 4) & !4095
+    };
+    Sizes {
+        overhead,
+        scratch,
+        arena: rest - scratch,
+    }
+}
+
+/// Whether `job` names a staging volume: a `disk://` staging URL.
+pub fn names_staging_volume(job: &Job) -> bool {
+    job.staging
+        .url
+        .as_deref()
+        .is_some_and(|url| disk_serial(url).is_some())
+}
+
 /// The budget `job` runs with on `node`: the document's, or, when it names none, the most the
 /// node allows.
 pub fn budget(job: &Job, node: &Node) -> Option<u64> {
@@ -298,7 +338,11 @@ pub fn admit(
         return Err(refusal);
     }
     job.report.socket = Some(node.channel.clone());
-    job.budget.memory_bytes = budget(job, node);
+    // The budget is the job's whole memory, its account exactly (system design 3A): the
+    // engine sizes itself to the arena's share of it, never the whole.
+    if let Some(whole) = budget(job, node) {
+        job.budget.memory_bytes = Some(sizes(whole, names_staging_volume(job)).arena);
+    }
     if job.id.is_none() {
         job.id = Some(mint().ok_or_else(|| SpecError::new("run_id", "no run ID could be made"))?);
     }
