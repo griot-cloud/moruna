@@ -259,9 +259,31 @@ impl Config {
             sources.push(&grant.source);
             destinations.push((&grant.service, &grant.slot));
         }
+        // The supervisor's own link: the client of one server's listener, which it connects
+        // through for each start of the service that restarts, on the slot the record names
+        // (item 3.2). Its end is the supervisor's, so it fills no service's slot.
+        let supervised: Vec<&Link> = links
+            .iter()
+            .filter(|link| link.right == restart::SUPERVISOR)
+            .collect();
+        let connect = restart
+            .as_ref()
+            .and_then(|record| record.connect.as_deref());
+        match (supervised.as_slice(), connect) {
+            ([], None) => {}
+            ([link], Some(slot)) if link.right_slot == slot => {}
+            _ => return Err(ConfigError::Syntax),
+        }
+        if services.iter().any(|s| s.name == restart::SUPERVISOR)
+            || links.iter().any(|link| link.left == restart::SUPERVISOR)
+        {
+            return Err(ConfigError::Syntax);
+        }
         for link in &links {
             destinations.push((&link.left, &link.left_slot));
-            destinations.push((&link.right, &link.right_slot));
+            if link.right != restart::SUPERVISOR {
+                destinations.push((&link.right, &link.right_slot));
+            }
         }
         if let Some(record) = &restart {
             // A service started again has only what a start makes afresh: no grant, link
@@ -274,6 +296,9 @@ impl Config {
             }
             destinations.push((&record.service, &record.slot));
             destinations.push((&record.server, &record.granting));
+            if let Some(connect) = &record.connect {
+                destinations.push((&record.service, connect));
+            }
             if bootstraps
                 .iter()
                 .any(|(kind, _)| *kind == Bootstrap::Platform)
