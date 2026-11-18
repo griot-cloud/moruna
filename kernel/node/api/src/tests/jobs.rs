@@ -92,10 +92,10 @@ fn the_engine_s_configurations_are_its_supervisor_s() {
         }
     }
     let staged =
-        EngineConfig::parse(&job_config(BOUND, GIB, true, false).unwrap()).expect("it parses");
+        EngineConfig::parse(&job_config(BOUND, GIB, true, false, 0).unwrap()).expect("it parses");
     assert_eq!((staged.memory, staged.scratch), (896 * MIB, 0));
     let job =
-        EngineConfig::parse(&job_config(BOUND, GIB, false, true).unwrap()).expect("it parses");
+        EngineConfig::parse(&job_config(BOUND, GIB, false, true, 0).unwrap()).expect("it parses");
     assert_eq!(job.program, "/moruna/bin/moruna");
     assert_eq!(job.args, serve_args(BOUND));
     assert_eq!(job.env, ["HOME=/tmp"]);
@@ -116,9 +116,28 @@ fn the_engine_s_configurations_are_its_supervisor_s() {
             ("network", &Source::Service("network".into())),
         ]
     );
+    // A job's volumes (item 3.3): each its driver's connection as node-admission grants it, and
+    // their list, handed to the program as they are given.
+    let with =
+        EngineConfig::parse(&job_config(BOUND, GIB, false, false, 2).unwrap()).expect("it parses");
+    let grants: Vec<(&str, &Source)> = with
+        .grants
+        .iter()
+        .map(|g| (g.slot.as_str(), &g.source))
+        .collect();
+    assert_eq!(
+        grants,
+        [
+            ("linux", &Source::Personality),
+            ("engine", &Source::Channel("engine".into())),
+            ("volume.0", &Source::Channel("volume.0".into())),
+            ("volume.1", &Source::Channel("volume.1".into())),
+            ("volumes", &Source::Data("volumes".into())),
+        ]
+    );
     // A job that names no host has no network (item 3.4).
     let local =
-        EngineConfig::parse(&job_config(BOUND, GIB, false, false).unwrap()).expect("it parses");
+        EngineConfig::parse(&job_config(BOUND, GIB, false, false, 0).unwrap()).expect("it parses");
     assert!(local.grants.iter().all(|g| g.slot != "network"));
     // A check: 256 MiB less the engine's own, no scratch, its own channel, and the node's
     // volumes node-admission grants it (item 3.3).
@@ -141,11 +160,11 @@ fn the_engine_s_configurations_are_its_supervisor_s() {
     // A budget that leaves the program nothing is refused by its field.
     for budget in [0, 64 * MIB, 128 * MIB] {
         assert!(
-            matches!(job_config(BOUND, budget, false, false), Err(HostError::Refused(why)) if why.starts_with("budget.memory_bytes")),
+            matches!(job_config(BOUND, budget, false, false, 0), Err(HostError::Refused(why)) if why.starts_with("budget.memory_bytes")),
             "{budget}"
         );
     }
-    assert!(job_config(BOUND, 128 * MIB + 4096, false, false).is_ok());
+    assert!(job_config(BOUND, 128 * MIB + 4096, false, false, 0).is_ok());
 }
 
 /// A check: the host asks the bound first, starts the check with its configuration, the Linux
@@ -246,9 +265,10 @@ fn a_job_runs_in_a_fresh_engine_from_spec_to_its_end() {
             )
         );
     }
+    // Its one volume, vol-out, as node-admission grants it (item 3.3).
     assert_eq!(
         admission.config(0),
-        job_config(BOUND, GIB, false, true).unwrap()
+        job_config(BOUND, GIB, false, true, 1).unwrap()
     );
     let engine = admission.engine(0);
     assert_eq!(messages(&engine).concat(), SPEC);
