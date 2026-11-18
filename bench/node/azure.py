@@ -177,15 +177,64 @@ def image_version(c: Cloud):
     return c.az("vm", "show", "-n", LINUX, "--query", "storageProfile.imageReference.exactVersion", "-o", "tsv")
 
 
-def run_command(c: Cloud, script: str, params=()):
-    """`script` run as root on the Linux machine; `script` is a command, or `@FILE` for a file's text.
-    `params` are `NAME=value`: RunShellScript sets each named one as an environment variable, which
-    keeps a SAS's own `=` and `&` out of the shell's words. Its output comes back in the answer's
-    `value[0].message` (Azure keeps the last 4,096 bytes)."""
-    args = ["vm", "run-command", "invoke", "-n", LINUX, "--command-id", "RunShellScript", "--scripts", script]
-    if params:
-        args += ["--parameters", *params]
-    return c.az(*args, "--query", "value[0].message", "-o", "tsv")
+def run_command(c: Cloud, script: str):
+    """`script` run as root on the Linux machine by the action run command (v1, RunShellScript);
+    its output in the answer's `value[0].message` (Azure keeps the last 4,096 bytes).
+
+    It is given no parameters, and so carries no value: the v1 handler (run-command-extension-linux,
+    main/cmds.go writeTempScript) writes script.sh as the platform hands it, and the platform puts
+    named parameters ahead of the script unquoted, `export N1=V1 N2=V2 ...` then `set -- V1 V2 ...`
+    (measured on Ubuntu 24.04, 2026-11-18), run by /bin/sh: a value with `&` (every SAS) is cut
+    there and lost, and every value sits in clear in script.sh. A value a script needs is read on
+    the machine (a batch's env file), or given through `run_command_create`."""
+    no_file_prefix(script)
+    return c.az("vm", "run-command", "invoke", "-n", LINUX, "--command-id", "RunShellScript", "--scripts", script,
+                "--query", "value[0].message", "-o", "tsv")
+
+
+def run_command_create(c: Cloud, name: str, script: str, protected: dict, timeout_s: int = 600):
+    """`script` run once as root on the Linux machine by the managed run command (v2) `name`; az
+    returns when it has ended (`--async-execution false`). `protected` maps each variable's name
+    to a local file holding its value (mode 600); no plain `--parameters`. Measured by the PM on a
+    real machine (2026-11-18): script.sh holds the script alone, each value arrives whole as an
+    environment variable. az names the command by `--run-command-name` (it takes no `-n` here).
+
+    - No value is on a command line: `NAME=@FILE` is read by az itself (azure-cli's
+      `_expand_file_prefixed_files`: the file's text, its last line end stripped), and sent as a
+      protected parameter: encrypted to the machine, never returned by the API, out of the run
+      command's visible settings.
+    - No shell reads a value: the v2 handler (run-command-handler-linux, internal/exec/exec.go
+      `SetEnvironmentVariables`) sets each named parameter with `os.Setenv` in the environment the
+      script inherits, so `/`, `+`, `=`, `&`, `%` and `?` arrive as given. It saves the script as
+      script.sh verbatim (internal/files `SaveScriptFile`) and runs `/bin/bash -c <script.sh>`.
+    Its output is read with `run_command_view`."""
+    no_file_prefix(script)
+    args = ["vm", "run-command", "create", "--run-command-name", name, "--vm-name", LINUX, "--location", c.location,
+            "--script", script, "--async-execution", "false", "--timeout-in-seconds", str(timeout_s)]
+    if protected:
+        args += ["--protected-parameters", *(f"{k}=@{path}" for k, path in protected.items())]
+    return c.az(*args, "-o", "none")
+
+
+def run_command_view(c: Cloud, name: str):
+    """The managed run command's instance view, as JSON: `executionState`, `exitCode`, `output`
+    and `error` (the script's stdout and stderr)."""
+    return c.az("vm", "run-command", "show", "--run-command-name", name, "--vm-name", LINUX, "--instance-view",
+                "--query", "instanceView", "-o", "json")
+
+
+def run_command_delete(c: Cloud, name: str):
+    """The managed run command removed from the machine's model once read, so it does not linger
+    there (what it started, a systemd unit, is not its child and goes on)."""
+    return c.az("vm", "run-command", "delete", "--run-command-name", name, "--vm-name", LINUX, "--yes")
+
+
+def no_file_prefix(script: str) -> None:
+    """az reads any argument that starts with `@`, or whose text after its first `=` does, as a
+    file's name (azure-cli core, `_expand_file_prefixed_files`): a script must not look like one."""
+    _, eq, rest = script.partition("=")
+    if script.startswith("@") or (eq and rest.startswith("@")):
+        raise ValueError(f"az would read this script as a file's name: {script[:80]!r}")
 
 
 def group_delete(c: Cloud):
@@ -198,9 +247,13 @@ def group_exists(c: Cloud):
 
 def guard(c: Cloud, cmd) -> None:
     """Refuses an `az` command that could act outside the run: every one names subscription
-    griot-dev, and every one that names a resource group names the run's."""
+    griot-dev, and every one that names a resource group names the run's. Refuses too any value
+    given to a run command in the clear: v1's parameters (written unquoted into its script, see
+    run_command) and v2's plain ones (kept in the machine's visible model)."""
     if not cmd or cmd[0] != "az":
         return
+    if cmd[1:3] == ["vm", "run-command"] and "--parameters" in cmd:
+        raise ValueError(f"refused, a run command's value in the clear: {cmd[3]} --parameters")
     if "--subscription" in cmd:
         if cmd[cmd.index("--subscription") + 1] != SUBSCRIPTION:
             raise ValueError(f"refused, not subscription {SUBSCRIPTION}: {shlex.join(cmd)}")
