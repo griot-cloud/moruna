@@ -310,6 +310,42 @@ fn a_job_on_a_channel_runs_in_node_mode_with_its_secrets() {
     assert!(served.largest > 0 && served.largest <= CHANNEL_MESSAGE_BYTES);
 }
 
+/// A job of the standard `rows` source and `count` sink needs nothing of a node but its budget:
+/// it runs in node mode with no file, volume or object store, and its report counts the rows.
+#[test]
+fn a_rows_to_count_job_runs_in_node_mode_with_nothing_attached() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("node_rows_count");
+    let served = serve_bounded(
+        &scratch,
+        json!({"spec": {
+            "moruna_spec": 1,
+            "source": {"kind": "rows", "rows": 3_000_000},
+            "sink": {"kind": "count"},
+            "budget": {"memory_bytes": 1u64 << 30},
+            "report": {"file": scratch.path().join("report-<run_id>.json").to_string_lossy(),
+                       "logs": scratch.path().join("logs-<run_id>").to_string_lossy()},
+        }}),
+        Some(1 << 30),
+    );
+    assert_eq!(
+        served.outcome.code,
+        exit::COMPLETED,
+        "{:?}",
+        served.outcome.diagnostic
+    );
+    assert_eq!(exit_of(&served)["code"], 0);
+    let report = served
+        .messages
+        .iter()
+        .find(|m| m["type"] == "report")
+        .expect("a report");
+    let sinks = report["report"]["sinks"].as_array().expect("its sinks");
+    assert_eq!(sinks.len(), 1);
+    assert_eq!(sinks[0]["rows"], 3_000_000);
+    assert_eq!(sinks[0]["files"], json!([]));
+}
+
 /// What node mode refuses is the run's refusal, exit 2, by its field, before anything runs.
 #[test]
 fn what_a_node_refuses_exits_2_by_its_field() {

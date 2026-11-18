@@ -94,12 +94,12 @@ fn jb_t2_embedded_catalogues() {
     let standard = Catalogue::standard().expect("the standard catalogue");
     assert_eq!(
         names(&standard, Role::Source),
-        ["arrow_ipc", "image", "parquet", "tensor"]
+        ["arrow_ipc", "image", "parquet", "rows", "tensor"]
     );
     assert_eq!(names(&standard, Role::Kernel), ["image", "package", "std"]);
     assert_eq!(
         names(&standard, Role::Sink),
-        ["arrow_ipc", "image", "parquet", "tensor"]
+        ["arrow_ipc", "count", "image", "parquet", "tensor"]
     );
     for role in [Role::Source, Role::Kernel, Role::Sink] {
         for declared in standard.declarations(role) {
