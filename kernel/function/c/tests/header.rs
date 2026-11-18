@@ -368,6 +368,20 @@ fn double_passes_every_other_type_through() {
     assert_eq!(outcome.batches(), want);
 }
 
+/// The C library's own: malloc, a thread from pthread_create with its own thread_local, and
+/// fprintf to stderr, each batch answered from that thread.
+#[test]
+fn a_function_with_threads_memory_and_thread_locals_answers_each_batch() {
+    let inputs = vec![ints(0, 5), ints(5, 0), ints(5, 300)];
+    let outcome = Plane::new()
+        .named("runtime")
+        .run(inputs.clone(), || exit(unsafe { moruna_test_runtime() }))
+        .unwrap();
+    ended(&outcome, code::DONE);
+    assert_eq!(outcome.batches(), inputs);
+    assert!(outcome.answers.iter().all(|a| a.released));
+}
+
 #[test]
 fn an_overflow_refuses_the_batch_and_a_null_slot_never_does() {
     let outcome = Plane::new()
@@ -401,7 +415,8 @@ fn an_overflow_refuses_the_batch_and_a_null_slot_never_does() {
 
 #[test]
 fn the_structures_are_the_same_in_c_cplusplus_and_rust() {
-    use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+    use arrow_data::ffi::FFI_ArrowArray;
+    use arrow_schema::ffi::FFI_ArrowSchema;
     let (array, schema) = (size_of::<FFI_ArrowArray>(), size_of::<FFI_ArrowSchema>());
     unsafe {
         assert_eq!(moruna_test_array_size(), array);

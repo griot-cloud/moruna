@@ -189,11 +189,17 @@ caches are warm):
 
 ```
 export PATH=/opt/qemu/bin:$HOME/.cargo/bin:$PATH CARGO_INCREMENTAL=0
+kernel/node/tools/system-layer.sh ENGINE.layer
 python3 kernel/node/tools/package.py --profile cloud --description kernel/node/cloud.image \
-  --assets kernel/node/cloud --out OUT --node-memory 2147483648
+  --assets kernel/node/cloud --out OUT --node-memory 2147483648 --system-layer ENGINE.layer
 ```
 
-`OUT` must not exist yet. It gets `moruna-node.raw` (the GPT disk: GRUB as
+`system-layer.sh` makes the engine's layer (items 3.2, 3.3): `moruna-engine` built as
+`kernel/tools/build.sh` builds it, at `/moruna/bin/moruna` beside an empty `/tmp`, packed by
+`moruna-layer pack` built for this machine (the engine is x86_64 and `moruna-arm` runs no x86_64
+program; the packer packs as the engine's `volume pack` does). `package.py` writes it into the
+disk's `moruna-system` partition.
+`ENGINE.layer` and `OUT` must not exist yet. `OUT` gets `moruna-node.raw` (the GPT disk: GRUB as
 `EFI/BOOT/BOOTX64.EFI`, `boot/moruna-kernel.elf`, `boot/initramfs.cpio`), the payload it was
 made from, and `inputs-and-artifacts.json` with every input's and output's digest.
 

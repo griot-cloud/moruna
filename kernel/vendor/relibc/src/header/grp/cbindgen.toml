@@ -1,0 +1,20 @@
+# POSIX header spec: https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/grp.h.html
+#
+# Spec quotations relating to includes:
+# - "The <grp.h> header shall define the gid_t and size_t types as described in <sys/types.h>."
+after_includes = """
+#include <bits/gid-t.h>  // for gid_t from sys/types.h
+#include <bits/size-t.h> // for size_t from sys/types.h
+"""
+include_guard = "_RELIBC_GRP_H"
+language = "C"
+style = "Tag"
+usize_is_size_t = true
+no_includes = true
+cpp_compat = true
+
+[enum]
+prefix_with_name = true
+
+[export]
+include = ["group"]

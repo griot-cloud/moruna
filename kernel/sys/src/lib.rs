@@ -784,6 +784,28 @@ impl Drop for Mapping<'_> {
     }
 }
 
+/// Unmaps whole pages of the caller's own mappings, `len` bytes from `addr`
+/// (`memory_unmap`, ABI 2.0): a C library's `munmap`, over mappings it made with
+/// [`Memory::map_detached`] and forgot.
+///
+/// # Safety
+///
+/// Nothing in the process uses the range again, and no [`Mapping`] over it is dropped.
+pub unsafe fn unmap(addr: u64, len: u64) -> Result<()> {
+    check(raw::call2(nr::MEMORY_UNMAP, addr, len).0).map(|_| ())
+}
+
+/// Sets the protection of whole pages of the caller's own mappings, `len` bytes from
+/// `addr`, to `flags` ([`map`]'s protection bits; none is no access): a C library's
+/// `mprotect` (`memory_protect`, ABI 2.0).
+///
+/// # Safety
+///
+/// Nothing in the process relies on an access the range loses.
+pub unsafe fn protect(addr: u64, len: u64, flags: u64) -> Result<()> {
+    check(raw::memory_protect(addr, len, flags)).map(|_| ())
+}
+
 /// The start entries (`moruna_abi::start_entry`) naming `handles`, and how many.
 fn start_entries(
     handles: &[(Option<Handle>, &str)],

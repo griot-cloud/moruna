@@ -1,0 +1,42 @@
+#ifndef _RELIBC_BITS_ARPAINET_H
+#define _RELIBC_BITS_ARPAINET_H
+
+#include <inttypes.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
+
+/**
+ * See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/htonl.html>.
+ *
+ * Converts `hostlong` from host byte order to network byte order.
+ */
+uint32_t htonl(uint32_t hostlong);
+
+/**
+ * See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/htonl.html>.
+ *
+ * Converts `hostshort` from host byte order to network byte order.
+ */
+uint16_t htons(uint16_t hostshort);
+
+/**
+ * See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/htonl.html>.
+ *
+ * Converts `netlong` from network byte order to host byte order.
+ */
+uint32_t ntohl(uint32_t netlong);
+
+/**
+ * See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/htonl.html>.
+ *
+ * Converts `netshort` from network byte order to host byte order.
+ */
+uint16_t ntohs(uint16_t netshort);
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif  // __cplusplus
+
+#endif  /* _RELIBC_BITS_ARPAINET_H */

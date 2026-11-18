@@ -449,6 +449,56 @@ process rings
   exits 0
 link supervisor.rings rings.supervisor
 
+# Item 5.2b (system design 5B): C functions on the core, each one static program of C on relibc
+# and std with the C SDK, built and stripped by kernel/function/c/build-core.sh. An engine on
+# RingPlane runs them as tasks over the plane, with batches of one Int64 column of known values,
+# and judges every row: c-double's twice its input's; c-runtime's a copy made on a thread of its
+# own (pthread_create, malloc, a thread_local), with its fprintf lines in the task's log; and
+# c-sum's -1 first and its total after the input's end. The supervisor gives it a process
+# resource.
+process functions
+  handle console console
+  handle program:c-double double-image
+  handle program:c-runtime runtime-image
+  handle program:c-sum sum-image
+  handle data:plane/mib.fixture mib
+  expect FN c-double: ok:
+  expect FN c-runtime: ok:
+  expect FN c-sum: ok:
+  expect FN functions: ok:
+  exits 0
+link supervisor.functions functions.supervisor
+
+# Item 5.2b: one thread path for std and the C library (kernel/function/c/tests/threads.rs, built
+# by build-core.sh): std's thread-locals' destructors on pthread_create's threads, on return and
+# on pthread_exit; the C library's key destructors on std's threads; joins, and detaches before
+# and after a thread's end. It has no log slot, so std writes its lines on the console.
+process c-threads
+  memory 64MiB
+  handle console console
+  expect threads: ok
+  exits 0
+
+# Item 5.2b: relibc's own C tests that need only what Moruna has (kernel/vendor/relibc/tests,
+# built by build-core.sh, its step 5) in one static program on relibc and std, which runs each in
+# turn and says its end. constructor and destructor run the init and fini arrays in priority
+# order, as their expected output (tests/expected/bins_static) says.
+process libc-tests
+  memory 64MiB
+  handle console console
+  expect constructor (101)
+  expect constructor (104)
+  expect constructor (no priority)
+  expect libc-tests: constructor: ok
+  expect libc-tests: math: ok
+  expect libc-tests: stdio/printf: ok
+  expect libc-tests: pthread/timedwait: ok
+  expect libc-tests: ok: 31 tests
+  expect destructor (no priority)
+  expect destructor (104)
+  expect destructor (101)
+  exits 0
+
 # stream B1 (data-os-streams.md, kernel-is-the-machine.md 4.1): the personality's four
 # mechanisms in the core, with no personality present. A sleeping thread is interrupted;
 # a snapshot and a clone copy on write; a pager serves one fault and refuses another,

@@ -20,7 +20,8 @@ written beside it.
 layer, with `/moruna/bin/moruna`): the disk gains a second GPT partition, `moruna-system`,
 holding it whole (system design 1A, item 3.3), which the boot disk's driver serves as the read
 only disk `system`, and the payload gains `linux.layers`, the image filesystem's list naming it
-by its seal (`moruna-layers 1`, then `layer system <seal>`), for the profile to grant.
+by its seal (`moruna-layers 1`, then `layer system <seal>`), for the profile to grant. The
+engine's layer is made by `kernel/node/tools/system-layer.sh OUT`, and only so.
 
 All inputs are explicit local files. This command does not fetch layers, install
 host tools, acquire credentials, upload an image or start a virtual machine.
@@ -253,7 +254,8 @@ def arguments(argv=None):
     parser.add_argument("--node-memory", type=int, required=True)
     parser.add_argument("--cpus", type=int)
     parser.add_argument("--system-layer", type=Path,
-                        help="a layer file (the engine's) for the boot disk's moruna-system partition")
+                        help="the engine's layer file, as kernel/node/tools/system-layer.sh makes it, "
+                             "for the boot disk's moruna-system partition")
     parser.add_argument("--formats", nargs="+", choices=FORMATS, default=["raw"], metavar="FORMAT",
                         help="the disk's formats, each written beside the raw disk: raw (the default), qcow2, vhd")
     args = parser.parse_args(argv)
@@ -285,7 +287,8 @@ def main():
     if out.exists():
         parser.error("output must be a new directory; existing artifacts are never removed")
     if binds(description.read_text(), LINUX_LAYERS) and not args.system_layer:
-        parser.error(f"this description binds {LINUX_LAYERS}: pass --system-layer")
+        parser.error(f"this description binds {LINUX_LAYERS}: pass --system-layer "
+                     "(kernel/node/tools/system-layer.sh makes the engine's)")
     layer = None
     if args.system_layer:
         layer = args.system_layer.absolute()

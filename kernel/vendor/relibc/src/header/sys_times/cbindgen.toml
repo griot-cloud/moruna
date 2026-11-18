@@ -1,0 +1,18 @@
+# POSIX header spec: https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/sys_times.h.html
+#
+# Spec quotations relating to includes:
+# - "The <sys/times.h> header shall define the clock_t type as described in <sys/types.h>."
+after_includes = """
+#include <bits/clock-t.h> // for clock_t from sys/types.h
+"""
+include_guard = "_RELIBC_SYS_TIMES_H"
+language = "C"
+style = "Tag"
+no_includes = true
+cpp_compat = true
+
+[enum]
+prefix_with_name = true
+
+[export]
+include = ["tms"]

@@ -603,7 +603,7 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
   names, its volumes (3C) and its functions (3E). `node-admission` grants exactly those. For the
   network it holds a client with `grant,connect` on the name rule `*` at port 443 (every name, held
   by admission alone, which never connects itself), and mints each job's channel with `connect`
-  limited to that job's host names, on port 443. Nothing else is reachable from a job.
+  limited to that job's host names, on port 443. Nothing else is reachable from a job; an object-store endpoint on any port but 443 is refused at `validate`, by its field.
 - **Connections are reused:** the connector keeps an HTTP/1.1 keep-alive pool per host, bounded by
   the job's socket budget (64), so a range read never pays a new TCP and TLS handshake.
 - **Object stores, in order:** the S3 API (any endpoint), then Azure Blob.

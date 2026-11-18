@@ -710,7 +710,8 @@ fn node_volumes(from: &str) -> Result<Vec<super::node::NodeVolume>, String> {
 /// `moruna volume pack <dir> <out>`: the tree of `dir` (its directories, regular files and
 /// symbolic links, each with its permission bits) as one layer in `moruna_imagefs`'s format,
 /// the output disk's, written to the new file `out`. A job then reads its files as
-/// `disk://<serial>/<path>` from the volume that holds it.
+/// `disk://<serial>/<path>` from the volume that holds it. It packs as `moruna-layer pack` does
+/// (`moruna_image::layerfile::pack`), so either writes the same layer.
 pub fn volume_pack(dir: &Path, out: &Path) -> Result<String, String> {
     if out.symlink_metadata().is_ok() {
         return Err(format!(
@@ -718,8 +719,7 @@ pub fn volume_pack(dir: &Path, out: &Path) -> Result<String, String> {
             out.display()
         ));
     }
-    let root = moruna_image::layerfile::tree(dir).map_err(|e| e.to_string())?;
-    let layer = moruna_image::layerfile::write(&root, out).map_err(|e| e.to_string())?;
+    let layer = moruna_image::layerfile::pack(dir, out).map_err(|e| e.to_string())?;
     Ok(format!(
         "{}: a layer of {} pages ({} bytes), seal {}: attach it as a volume's disk, or write it \
          onto one from its first byte",

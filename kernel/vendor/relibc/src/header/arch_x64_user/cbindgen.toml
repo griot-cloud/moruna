@@ -1,0 +1,17 @@
+sys_includes = []
+include_guard = "_X64_USER_H"
+language = "C"
+style = "Tag"
+
+[enum]
+prefix_with_name = true
+
+[export]
+include = [
+  "user_fpregs_struct",
+  "user_regs_struct",
+  "user",
+  "elf_gregset_t",
+  "elf_greg_t",
+  "elf_fpregset_t"
+]

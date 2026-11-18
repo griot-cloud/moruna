@@ -1,0 +1,15 @@
+[package]
+name = "relibc-moruna"
+description = "relibc's platform on Moruna: what a C library's system calls are on the core, over moruna-sys (system design 5B)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# No dependencies: on the core it reaches the kernel through std's own copy of moruna-sys
+# (std::os::moruna::moruna_sys), the copy std's runtime keeps its state in (system design 5B);
+# on a host it runs on stand-ins (src/os.rs), so its logic is tested where moruna-sys cannot
+# build.
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("moruna"))'] }

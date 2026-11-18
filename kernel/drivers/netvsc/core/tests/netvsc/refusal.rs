@@ -138,19 +138,8 @@ fn a_completion_that_says_something_else_frees_its_section_and_is_refused() {
 
 #[test]
 fn a_message_the_card_never_asked_for_is_refused() {
-    // The table of sub-channels to send on: only a guest that asked for sub-channels
-    // is sent one.
-    refused(
-        |host| {
-            let table = protocol::Message5SendIndirectionTable {
-                table_entry_count: 16,
-                table_offset: 12,
-            };
-            let payload = host.nvsp(protocol::MESSAGE5_TYPE_SEND_INDIRECTION_TABLE, &table);
-            host.raw_message(None, payload);
-        },
-        "NVSP message 134 for a message of its own, where message 128 is due",
-    );
+    // (The send indirection table is no longer among these: it is taken and ignored, see
+    // traffic::the_send_indirection_table_is_taken_and_ignored_during_the_start_and_after.)
     // That the data path is the synthetic one again: only a guest that moved it is told.
     refused(
         |host| {

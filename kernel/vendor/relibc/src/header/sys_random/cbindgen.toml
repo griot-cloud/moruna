@@ -1,0 +1,11 @@
+after_includes = """
+#include <bits/size-t.h>  // for size_t from sys/types.h
+#include <bits/ssize-t.h> // for ssize_t from sys/types.h
+"""
+include_guard = "_RELIBC_SYS_RANDOM_H"
+language = "C"
+no_includes = true
+cpp_compat = true
+
+[enum]
+prefix_with_name = true

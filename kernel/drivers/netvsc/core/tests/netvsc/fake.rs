@@ -528,6 +528,9 @@ pub struct Host {
     /// What the host ignored, as Hyper-V does: packets that asked for a completion under
     /// transaction ID 0, and queries whose input offset lies inside their fields.
     pub ignored: usize,
+    /// Send indirection tables sent asking for a completion, by transaction, until the
+    /// guest acknowledges them.
+    pub tables_asked: Vec<u64>,
 
     // What happened.
     /// Every version the guest offered, in order.
@@ -657,6 +660,7 @@ impl Host {
             filter: 0,
             receive_id: None,
             ignored: 0,
+            tables_asked: Vec::new(),
             offers: Vec::new(),
             messages: Vec::new(),
             frames: Vec::new(),
@@ -1264,10 +1268,14 @@ impl Host {
         }
         let start = packet.data_offset as usize;
         let end = start + packet.data_length as usize;
+        // Laid out as Linux's netvsc_xmit lays out a frame with no per-packet information,
+        // the layout Azure's host carries at scale: the data right after the fields, and
+        // the (empty) per-packet information there too, never inside the fields (as Azure
+        // refused an RNDIS query's empty input inside its fields).
         let plain_frame = packet.oob_data_offset == 0
             && packet.oob_data_length == 0
             && packet.num_oob_data_elements == 0
-            && packet.per_packet_info_offset == 0
+            && packet.per_packet_info_offset as usize == size_of::<rndisprot::Packet>()
             && packet.per_packet_info_length == 0
             && packet.vc_handle == 0
             && packet.reserved == 0;
@@ -1301,6 +1309,13 @@ impl Host {
     /// A completion from the guest: it gives receive sections back, or acknowledges what
     /// the host said of a virtual function.
     fn completed(&mut self, transaction: u64, payload: &[u8]) {
+        if let Some(at) = self.tables_asked.iter().position(|t| *t == transaction) {
+            self.tables_asked.remove(at);
+            if !payload.is_empty() {
+                self.violation("an acknowledgement of the table with a payload".into());
+            }
+            return;
+        }
         if transaction == VF_TRANSACTION {
             self.vf_acknowledged += 1;
             if !payload.is_empty() {
@@ -1397,6 +1412,32 @@ impl Host {
         self.emit(Out::InBand(Some(VF_TRANSACTION), message));
     }
 
+    /// Sends the send indirection table, as netvsp's `guest_send_indirection_table`
+    /// does: sixteen entries after the message's fields, in a packet that asks for no
+    /// completion; or, with `transaction`, one that asks for one under it.
+    pub fn send_table(&mut self, transaction: Option<u64>) {
+        let entries = 16u32;
+        let offset = (size_of::<protocol::MessageHeader>()
+            + size_of::<protocol::Message5SendIndirectionTable>()) as u32;
+        let mut message = [
+            protocol::MESSAGE5_TYPE_SEND_INDIRECTION_TABLE.as_bytes(),
+            protocol::Message5SendIndirectionTable {
+                table_entry_count: entries,
+                table_offset: offset,
+            }
+            .as_bytes(),
+        ]
+        .concat();
+        // Every flow on channel 0: one channel is open.
+        for _ in 0..entries {
+            message.extend_from_slice(&0u32.to_le_bytes());
+        }
+        if let Some(transaction) = transaction {
+            self.tables_asked.push(transaction);
+        }
+        self.emit(Out::InBand(transaction, message));
+    }
+
     /// Delivers a frame to the guest once the filter lets it through and a section is
     /// free.
     pub fn inject(&mut self, frame: &[u8]) {
@@ -1422,6 +1463,29 @@ impl Host {
             // it.
             ranges.push(TransferPageRange {
                 byte_count: receive.section as u32,
+                byte_offset: at as u32,
+            });
+        }
+        let transaction = u64::from(sections[0]);
+        self.lent.insert(transaction, sections);
+        let payload = self.rndis_packet(protocol::DATA_CHANNEL_TYPE);
+        self.emit(Out::Transfer(transaction, set, payload, ranges));
+    }
+
+    /// Delivers whole RNDIS messages in one receive, a section each, each range as long
+    /// as its message, as a host that names only the bytes it wrote does.
+    pub fn deliver_messages(&mut self, messages: &[Vec<u8>]) {
+        let receive = self.receive.as_mut().unwrap();
+        let set = receive.id;
+        let mut sections = Vec::new();
+        let mut ranges = Vec::new();
+        for message in messages {
+            let section = receive.data.pop_front().expect("a free receive section");
+            let at = section as usize * receive.section;
+            receive.memory.write(at, message);
+            sections.push(section);
+            ranges.push(TransferPageRange {
+                byte_count: message.len() as u32,
                 byte_offset: at as u32,
             });
         }

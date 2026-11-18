@@ -8,6 +8,7 @@ use netvsp_protocol::{
     protocol::{self, Status},
     rndisprot,
 };
+use zerocopy::IntoBytes;
 
 use crate::fake::{
     Card, Got, PAGE, ROOMY, Random, SMALL, Settings, assert_clean, down, drain, poll, start_on,
@@ -375,6 +376,127 @@ fn a_virtual_function_offered_is_acknowledged_and_ignored_and_traffic_continues(
     // In all of it the card never asked for the data path to move.
     assert!(!host.borrow().messages.contains(&SWITCH_DATA_PATH));
     assert_eq!(host.borrow().frames.len(), 30);
+    assert_clean(&host);
+}
+
+#[test]
+fn the_send_indirection_table_is_taken_and_ignored_during_the_start_and_after() {
+    // Hyper-V sends the table from NVSP 5 (Linux and FreeBSD both take it); the card sends
+    // on one channel, so the table has nothing to steer. The host sends one before the
+    // receive buffer's completion, another with RNDIS initialisation's answer, asking for
+    // an acknowledgement, and a third once the card runs.
+    let mut parts = crate::fake::parts(16 * PAGE, 16 * PAGE, ROOMY);
+    let host = parts.host.clone();
+    host.borrow_mut().mangle = Some(Box::new(|host, step, _| {
+        match step {
+            crate::fake::Step::Answer(protocol::MESSAGE1_TYPE_SEND_RECEIVE_BUFFER) => {
+                host.send_table(None)
+            }
+            crate::fake::Step::Rndis(rndisprot::MESSAGE_TYPE_INITIALIZE_CMPLT) => {
+                host.send_table(Some(0x7ab1e))
+            }
+            _ => {}
+        }
+        crate::fake::Fate::Send
+    }));
+    host.borrow_mut().flush(parts.channel.host());
+    let mut lines = Vec::new();
+    let mut card = moruna_netvsc::Netvsc::start_saying(
+        parts.channel,
+        parts.receive,
+        parts.send,
+        Some(crate::fake::DEADLINE),
+        &mut |line| lines.push(line.to_string()),
+    )
+    .unwrap_or_else(|e| panic!("the card did not start: {e}"));
+    // One line, the first time, whatever came after.
+    let told: Vec<&String> = lines.iter().filter(|l| l.contains("indirection")).collect();
+    assert_eq!(
+        told,
+        ["send indirection table of 16 entries ignored: one channel is served"]
+    );
+    assert!(
+        host.borrow().tables_asked.is_empty(),
+        "the table that asked for an acknowledgement got one"
+    );
+    // After the start: ignored, and not said again.
+    host.borrow_mut().send_table(None);
+    host.borrow_mut().flush(card.channel().host());
+    assert!(matches!(card.poll(), Ok(None)));
+    assert_eq!(card.take_table(), None);
+    let frame = Random(0x7ab).frame(200);
+    assert!(card.send(&frame).unwrap());
+    card.flush().unwrap();
+    assert_eq!(host.borrow().frames, [frame]);
+    assert_clean(&host);
+}
+
+/// A frame as Azure's host delivers one: REMOTE_NDIS_PACKET_MSG with per-packet
+/// information before the data, as Linux's receive path reads it (`rndis_filter.c`,
+/// `rndis_get_ppi`): a checksum result, a VLAN tag of 0 and a hash value, then the frame
+/// right after them, the message as long as its bytes.
+fn azure_frame(frame: &[u8]) -> Vec<u8> {
+    let ppi = |typ: u32, value: u32| {
+        let info = rndisprot::PerPacketInfo {
+            size: 16,
+            typ,
+            per_packet_information_offset: 12,
+        };
+        [info.as_bytes(), value.as_bytes()].concat()
+    };
+    let infos = [
+        ppi(rndisprot::PPI_TCP_IP_CHECKSUM, 0x0000_0001),
+        ppi(rndisprot::PPI_VLAN, 0),
+        ppi(8, 0x1234_5678),
+    ]
+    .concat();
+    let fields = size_of::<rndisprot::Packet>();
+    let packet = rndisprot::Packet {
+        data_offset: (fields + infos.len()) as u32,
+        data_length: frame.len() as u32,
+        oob_data_offset: 0,
+        oob_data_length: 0,
+        num_oob_data_elements: 0,
+        per_packet_info_offset: fields as u32,
+        per_packet_info_length: infos.len() as u32,
+        vc_handle: 0,
+        reserved: 0,
+    };
+    let length = size_of::<rndisprot::MessageHeader>() + fields + infos.len() + frame.len();
+    let header = rndisprot::MessageHeader {
+        message_type: rndisprot::MESSAGE_TYPE_PACKET_MSG,
+        message_length: length as u32,
+    };
+    [header.as_bytes(), packet.as_bytes(), &infos, frame].concat()
+}
+
+#[test]
+fn frames_out_are_laid_out_as_linuxs_and_frames_in_carry_azures_per_packet_information() {
+    // DHCP is the first data on the wire, so these are the frames that make the lease.
+    let (mut card, host) = started(ROOMY);
+    let mut random = Random(0xd4c9);
+    // Out: an ARP request's 42 bytes unpadded, the shortest Ethernet frame, a DHCP
+    // DISCOVER's size and the largest. The fake takes only Linux's layout: the data and
+    // the empty per-packet information both right after the fields.
+    let out: Vec<Vec<u8>> = [42, 60, 342, 1514]
+        .iter()
+        .map(|&n| random.frame(n))
+        .collect();
+    for frame in &out {
+        assert!(card.send(frame).unwrap());
+    }
+    assert_eq!(drain(&mut card), []);
+    assert!(host.borrow().frames == out, "a frame changed or was lost");
+    // In: the same sizes, each with per-packet information before it, in one receive.
+    let back: Vec<Vec<u8>> = [42, 60, 342, 1514]
+        .iter()
+        .map(|&n| random.frame(n))
+        .collect();
+    let messages: Vec<Vec<u8>> = back.iter().map(|frame| azure_frame(frame)).collect();
+    host.borrow_mut().deliver_messages(&messages);
+    let got = drain(&mut card);
+    assert_eq!(got, back.into_iter().map(Got::Frame).collect::<Vec<_>>());
+    assert_eq!(host.borrow().lent(), 0, "the receive was completed");
     assert_clean(&host);
 }
 

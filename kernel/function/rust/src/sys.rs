@@ -6,6 +6,9 @@
 use std::io::Write;
 use std::ptr::NonNull;
 
+#[cfg(target_os = "moruna")]
+use std::os::moruna::moruna_sys;
+
 use moruna_sys::plane::{Plane, Rings};
 
 use crate::code;

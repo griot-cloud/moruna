@@ -101,8 +101,13 @@ RUSTFLAGS="$flags$usage_flags -Zunstable-options -C link-arg=-T$kernel/sys/user.
   rustup run nightly-2026-07-21 cargo build --release --locked --target "$user_target" \
   -Zunstable-options -Zjson-target-spec "${build_std[@]}" --workspace \
   --features "$user_features" \
-  --exclude moruna-microkernel --exclude moruna-microkernel-boot --exclude moruna-image --exclude moruna-node-image
+  --exclude moruna-microkernel --exclude moruna-microkernel-boot --exclude moruna-image --exclude moruna-node-image \
+  --exclude relibc-moruna --exclude moruna-net-session
 set +x
+# relibc-moruna runs on std's own moruna-sys, so it builds only in the C library's crate graph
+# with std (build-core.sh, below), never in this one of core and alloc.
+# moruna-net-session is a std library too: only moruna-storage's native connector, in the root
+# workspace's engine build, uses it.
 
 bin="${CARGO_TARGET_DIR:-$kernel/target}/$user_target_name/release"
 kernel_bin="${CARGO_TARGET_DIR:-$kernel/target}/$target/release"
@@ -112,6 +117,18 @@ kernel_bin="${CARGO_TARGET_DIR:-$kernel/target}/$target/release"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$kernel/target}" \
   "$kernel/tools/build-std.sh" "$kernel/examples/std-arrow/Cargo.toml"
 cp "${CARGO_TARGET_DIR:-$kernel/target}/x86_64-moruna/release/std-arrow" "$bin/std-arrow"
+# Item 5.2b: the C SDK on the core, by kernel/function/c/build-core.sh with the user target's
+# clang (relibc's headers are committed, kernel/vendor/relibc/include-generated): the C
+# functions double, runtime and sum, which the boot's `functions` test runs as tasks, and
+# threads, a program of its own, each linked static on relibc and std and stripped. Their debug
+# info stays in TARGET/core/debug.
+CC="$user_cc" CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$kernel/target}" \
+  "$kernel/function/c/build-core.sh"
+for name in double runtime sum threads; do
+  cp "${CARGO_TARGET_DIR:-$kernel/target}/core/bin/$name" "$bin/c-$name"
+done
+# And relibc's own C tests, one process of the boot (libc-tests).
+cp "${CARGO_TARGET_DIR:-$kernel/target}/core/bin/libc-tests" "$bin/libc-tests"
 rm -rf "$out"
 mkdir -p "$out"
 cp "$bin/deadline" "$out/deadline"

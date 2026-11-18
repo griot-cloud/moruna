@@ -39,8 +39,15 @@ pub(crate) fn control<T: IntoBytes + Immutable>(
 
 /// What goes before a frame of `frame` bytes: REMOTE_NDIS_PACKET_MSG with the frame
 /// right after its fields. The data's offset counts from the DataOffset field; the
-/// out-of-band and per-packet fields are zero when a message carries neither; the
-/// handle and the reserved field are zero (Microsoft, REMOTE_NDIS_PACKET_MSG).
+/// out-of-band fields are zero, the per-packet information is empty and lies right after
+/// the fields too, and the handle and the reserved field are zero: exactly as Linux's
+/// netvsc_xmit lays out a frame with no per-packet information
+/// (`drivers/net/hyperv/netvsc_drv.c`: `data_offset` and `per_pkt_info_offset` both
+/// `sizeof(struct rndis_packet)`), the layout Azure's host carries for every Linux guest.
+/// An empty input's offset inside a message's fields is what Azure's host would not
+/// answer in an RNDIS query (console 2026-11-18T0250); a frame gives it no such place.
+/// (Microsoft's UEFI netvsc gives the per-packet information offset 0; Linux's is the
+/// layout used here.)
 pub(crate) fn data(frame: usize) -> [u8; DATA] {
     let header = rndisprot::MessageHeader {
         message_type: rndisprot::MESSAGE_TYPE_PACKET_MSG,
@@ -52,7 +59,7 @@ pub(crate) fn data(frame: usize) -> [u8; DATA] {
         oob_data_offset: 0,
         oob_data_length: 0,
         num_oob_data_elements: 0,
-        per_packet_info_offset: 0,
+        per_packet_info_offset: size_of::<rndisprot::Packet>() as u32,
         per_packet_info_length: 0,
         vc_handle: 0,
         reserved: 0,

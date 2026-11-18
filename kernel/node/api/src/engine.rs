@@ -7,8 +7,9 @@
 //!   and launcher pieces: the program `/moruna/bin/moruna` with the arguments of
 //!   [`node_protocol::serve_args`] or [`node_protocol::check_args`], `HOME=/tmp`, the Linux
 //!   personality, the channel to `api` handed over as it is, and one run ([`job_config`],
-//!   [`check_config`]); and for a job that names hosts, a fresh connection through the network
-//!   `node-admission` mints it for them (system design 3D, item 3.4).
+//!   [`check_config`]); and for a job that names hosts, the network channel `node-admission`
+//!   mints it for them, handed over as it is, on which the engine opens a session a socket
+//!   (system design 3D, item 3.4).
 //! - **Memory:** a job's budget is its whole account; the engine's supervisor carves the
 //!   program's memory and scratch from it as the engine sizes itself ([`sizes`]), with no
 //!   scratch when the check's needs mark a staging volume (item 3.3). A check runs in a
@@ -124,7 +125,7 @@ pub fn job_config(
     }
     let mut more = String::new();
     if network {
-        more.push_str("grant network service network\n");
+        more.push_str("grant network channel network\n");
     }
     for n in 0..volumes {
         let slot = node_protocol::volume_slot(n);

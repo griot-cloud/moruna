@@ -1,0 +1,2020 @@
+use core::{
+    cell::Cell,
+    convert::TryFrom,
+    mem::{self, size_of},
+    num::NonZeroU64,
+    ptr, slice,
+};
+use object::bytes_of_slice_mut;
+use redox_path::{RedoxReference, RedoxStr};
+use redox_protocols::protocol::{Rlimit, WaitFlags, wifstopped};
+use redox_rt::{
+    RtTcb,
+    signal::tmp_disable_signals,
+    sys::{Resugid, WaitpidTarget},
+};
+use syscall::{
+    self, ESRCH, EXDEV, Error, MODE_PERM, StdFsCallKind, StdFsCallMeta,
+    data::{Map, TimeSpec as redox_timespec},
+    dirent::DirentHeader,
+};
+
+use self::{
+    exec::Executable,
+    path::{FileLock, openat2, openat2_path},
+};
+use super::{Pal, Read, types::*};
+use crate::{
+    c_str::CStr,
+    error::{Errno, Result},
+    fs::File,
+    header::{
+        bits_sigset_t::sigset_t,
+        errno::{
+            EBADF, EBADFD, EFAULT, EFBIG, EINTR, EINVAL, EIO, EMFILE, ENAMETOOLONG, ENOENT,
+            ENOEXEC, ENOMEM, ENOSYS, EOPNOTSUPP,
+        },
+        fcntl::{
+            self, AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, F_GETLK,
+            F_OFD_GETLK, F_OFD_SETLK, F_RDLCK, F_SETLK, F_SETLKW, F_UNLCK, F_WRLCK, flock,
+        },
+        limits::{self},
+        poll::pollfd,
+        signal::{NSIG, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD, SIGRTMIN, sigevent},
+        stdio::RENAME_NOREPLACE,
+        sys_file,
+        sys_mman::{MAP_ANONYMOUS, PROT_READ, PROT_WRITE},
+        sys_random,
+        sys_resource::{PRIO_PROCESS, RLIMIT_NLIMITS, rlimit, rusage, setpriority},
+        sys_select::timeval,
+        sys_stat::{S_ISGID, S_ISUID, S_ISVTX, stat},
+        sys_statvfs::statvfs,
+        sys_time::timezone,
+        sys_uio::{gather, iovec, scatter},
+        sys_utsname::{UTSLENGTH, utsname},
+        time::{CLOCK_MONOTONIC, CLOCK_REALTIME, TIMER_ABSTIME, itimerspec, timespec},
+        unistd::{F_OK, R_OK, SEEK_CUR, SEEK_SET, W_OK, X_OK},
+    },
+    io::{self, BufReader, prelude::*},
+    iter::NulTerminated,
+    ld_so::tcb::OsSpecific,
+    out::Out,
+    platform::{
+        ERRNO,
+        sys::{
+            path::{CwdPath, to_cwd_path},
+            timer::{RlctTimer, TIMERS, timer_routine, timer_update_wake_time},
+        },
+    },
+    pthread,
+    sync::rwlock::RwLock,
+};
+
+pub use redox_rt::proc::FdGuard;
+
+mod epoll;
+mod event;
+pub(crate) mod exec;
+mod extra;
+mod libcscheme;
+mod libredox;
+pub(crate) mod path;
+mod poll;
+mod ptrace;
+pub mod ring;
+pub(crate) mod signal;
+mod socket;
+mod timer;
+
+static mut BRK_CUR: *mut c_void = ptr::null_mut();
+static mut BRK_END: *mut c_void = ptr::null_mut();
+
+const PAGE_SIZE: usize = 4096;
+fn round_up_to_page_size(val: usize) -> Option<usize> {
+    val.checked_add(PAGE_SIZE)
+        .map(|val| (val - 1) / PAGE_SIZE * PAGE_SIZE)
+}
+
+fn cvt_uid(id: c_int) -> Result<Option<u32>> {
+    if id == -1 {
+        return Ok(None);
+    }
+    Ok(Some(id.try_into().map_err(|_| Errno(EINVAL))?))
+}
+
+static CLONE_LOCK: RwLock<()> = RwLock::new(());
+
+// TODO: close on thread exit?
+#[thread_local]
+static CACHED_RANDOM_FD: Cell<Option<[usize; 2]>> = Cell::new(None);
+
+/// Redox syscall implementation of [`Pal`].
+pub struct Sys;
+
+impl Pal for Sys {
+    fn faccessat(fd: c_int, path: CStr, mode: c_int, flags: c_int) -> Result<()> {
+        let fd = FdGuard::new(Sys::openat(fd, path, fcntl::O_PATH | fcntl::O_CLOEXEC, 0)? as usize);
+
+        if (flags & !(AT_EACCESS)) != 0 {
+            return Err(Errno(EINVAL));
+        }
+
+        if mode == F_OK {
+            return Ok(());
+        }
+
+        let mut stat = syscall::Stat::default();
+
+        fd.fstat(&mut stat)?;
+
+        let Resugid {
+            ruid,
+            rgid,
+            euid,
+            egid,
+            ..
+        } = redox_rt::sys::posix_getresugid();
+        let (uid, gid) = if (flags & AT_EACCESS) == AT_EACCESS {
+            (euid, egid)
+        } else {
+            (ruid, rgid)
+        };
+
+        let perms = (if stat.st_uid == uid {
+            stat.st_mode >> (3 * 2)
+        } else if stat.st_gid == gid {
+            stat.st_mode >> 3
+        } else {
+            stat.st_mode
+        }) & 0o7;
+        if (mode & R_OK == R_OK && perms & 0o4 != 0o4)
+            || (mode & W_OK == W_OK && perms & 0o2 != 0o2)
+            || (mode & X_OK == X_OK && perms & 0o1 != 0o1)
+        {
+            return Err(Errno(EINVAL));
+        }
+
+        Ok(())
+    }
+
+    unsafe fn brk(addr: *mut c_void) -> Result<*mut c_void> {
+        // On first invocation, allocate a buffer for brk
+        if unsafe { BRK_CUR }.is_null() {
+            // 4 megabytes of RAM ought to be enough for anybody
+            const BRK_MAX_SIZE: usize = 4 * 1024 * 1024;
+
+            let allocated = unsafe {
+                Self::mmap(
+                    ptr::null_mut(),
+                    BRK_MAX_SIZE,
+                    PROT_READ | PROT_WRITE,
+                    MAP_ANONYMOUS,
+                    0,
+                    0,
+                )
+            }?;
+
+            unsafe {
+                BRK_CUR = allocated;
+                BRK_END = allocated.cast::<u8>().add(BRK_MAX_SIZE).cast::<c_void>()
+            };
+        }
+
+        if addr.is_null() {
+            // Lookup what previous brk() invocations have set the address to
+            Ok(unsafe { BRK_CUR })
+        } else if unsafe { BRK_CUR } <= addr && addr < unsafe { BRK_END } {
+            // It's inside buffer, return
+            unsafe { BRK_CUR = addr };
+            Ok(addr)
+        } else {
+            // It was outside of valid range
+            Err(Errno(ENOMEM))
+        }
+    }
+
+    fn chdir(path: CStr) -> Result<()> {
+        let path = RedoxStr::new_from_c(path.to_cstr()).ok_or(Errno(EINVAL))?;
+        path::chdir(path)?;
+        Ok(())
+    }
+
+    fn chmod(path: CStr, mode: mode_t) -> Result<()> {
+        let file = File::open(path, fcntl::O_PATH | fcntl::O_CLOEXEC)?;
+        Self::fchmod(*file, mode)
+    }
+
+    fn chown(path: CStr, owner: uid_t, group: gid_t) -> Result<()> {
+        let file = File::open(path, fcntl::O_PATH | fcntl::O_CLOEXEC)?;
+        Self::fchown(*file, owner, group)
+    }
+
+    fn clock_getres(clk_id: clockid_t, res: Option<Out<timespec>>) -> Result<()> {
+        let path = match clk_id {
+            CLOCK_REALTIME => "/scheme/time/1/getres",
+            CLOCK_MONOTONIC => "/scheme/time/4/getres",
+            _ => return Err(Errno(EINVAL)),
+        };
+        let timerfd = FdGuard::open_into_upper(path, syscall::O_RDONLY)?;
+        let mut redox_res = syscall::TimeSpec::default();
+        let buffer_len = mem::size_of::<syscall::TimeSpec>();
+        let buffer =
+            unsafe { slice::from_raw_parts_mut((&raw mut redox_res).cast::<u8>(), buffer_len) };
+
+        let bytes_read = redox_rt::sys::posix_read(timerfd.as_raw_fd(), buffer)?;
+
+        if bytes_read < buffer_len {
+            return Err(Errno(EIO));
+        }
+
+        if let Some(mut res) = res {
+            res.write((&redox_res).into());
+        }
+
+        Ok(())
+    }
+
+    fn clock_gettime(clk_id: clockid_t, tp: Out<timespec>) -> Result<()> {
+        libredox::clock_gettime(clk_id as usize, tp)?;
+        Ok(())
+    }
+
+    unsafe fn clock_settime(clk_id: clockid_t, tp: *const timespec) -> Result<()> {
+        todo_skip!(0, "clock_settime({}, {:p}): not implemented", clk_id, tp);
+        Err(Errno(ENOSYS))
+    }
+
+    fn close(fd: c_int) -> Result<()> {
+        let r = redox_rt::sys::close(fd as usize).map(|_| ());
+        trace_log!("close({fd}) = {:?}", r);
+        r.map_err(Errno::from)
+    }
+
+    fn dup2(fd1: c_int, fd2: c_int) -> Result<c_int> {
+        let r = redox_rt::sys::dup2(fd1 as usize, fd2 as usize);
+        trace_log!("dup2({fd1}, {fd2}) = {:?}", r);
+        Ok(r? as c_int)
+    }
+
+    fn exit(status: c_int) -> ! {
+        redox_rt::sys::posix_exit(status)
+    }
+
+    unsafe fn execve(path: CStr, argv: *const *mut c_char, envp: *const *mut c_char) -> Result<()> {
+        self::exec::execve(
+            Executable::AtPath(path),
+            self::exec::ArgEnv::C { argv, envp },
+            None,
+        )?;
+        unreachable!()
+    }
+    unsafe fn fexecve(
+        fildes: c_int,
+        argv: *const *mut c_char,
+        envp: *const *mut c_char,
+    ) -> Result<()> {
+        let _siglock = tmp_disable_signals();
+        self::exec::execve(
+            Executable::InFd {
+                file: File::new(fildes),
+                arg0: unsafe { CStr::from_ptr(argv.read()) }.to_bytes(),
+            },
+            self::exec::ArgEnv::C { argv, envp },
+            None,
+        )?;
+        unreachable!()
+    }
+
+    fn fchdir(fd: c_int) -> Result<()> {
+        path::fchdir(fd)?;
+        Ok(())
+    }
+
+    fn fchmodat(dirfd: c_int, path: Option<CStr>, mode: mode_t, flags: c_int) -> Result<()> {
+        let _siglock = tmp_disable_signals();
+        const MASK: c_int = !(fcntl::AT_SYMLINK_NOFOLLOW | fcntl::AT_EMPTY_PATH);
+        if MASK & flags != 0 {
+            return Err(Errno(EINVAL));
+        }
+        let mut path = path.ok_or(Errno(ENOENT))?;
+
+        if path.is_empty() {
+            if flags & AT_EMPTY_PATH == AT_EMPTY_PATH {
+                if dirfd == AT_FDCWD {
+                    path = c".".into();
+                } else {
+                    return Ok(libredox::fchmod(dirfd as usize, mode as u16)?);
+                }
+            } else {
+                // If the path is empty but `AT_EMPTY_PATH` is **not** set, bail out.
+                return Err(Errno(ENOENT));
+            }
+        }
+
+        let file = openat2(dirfd, path, flags, 0)?;
+        libredox::fchmod(*file as usize, mode as u16)?;
+        Ok(())
+    }
+
+    fn fchownat(fildes: c_int, path: CStr, owner: uid_t, group: gid_t, flags: c_int) -> Result<()> {
+        let _siglock = tmp_disable_signals();
+        const MASK: c_int = !(fcntl::AT_SYMLINK_NOFOLLOW | fcntl::AT_EMPTY_PATH);
+        if MASK & flags != 0 {
+            return Err(Errno(EINVAL));
+        }
+        let mut path = path;
+        if path.is_empty() {
+            if flags & AT_EMPTY_PATH == AT_EMPTY_PATH {
+                if fildes == AT_FDCWD {
+                    path = c".".into();
+                } else {
+                    return Ok(libredox::fchown(fildes as usize, owner as _, group as _)?);
+                }
+            } else {
+                // If the path is empty but `AT_EMPTY_PATH` is **not** set, bail out.
+                return Err(Errno(ENOENT));
+            }
+        }
+        let file = openat2(fildes, path, flags, 0)?;
+        libredox::fchown(*file as usize, owner as _, group as _)?;
+        Ok(())
+    }
+
+    fn fcntl(fd: c_int, cmd: c_int, args: c_ulonglong) -> Result<c_int> {
+        match cmd {
+            F_SETLK | F_OFD_SETLK => {
+                let is_ofd = cmd == F_OFD_SETLK;
+                let flock = unsafe { &mut *(args as *mut flock) };
+
+                let (start, len) = Self::relative_to_absolute_foffset(
+                    fd as usize,
+                    flock.l_whence,
+                    flock.l_start,
+                    flock.l_len,
+                )?;
+
+                let start = start as u64 | if is_ofd { 1 << 63 } else { 0 };
+                let len = len as u64;
+
+                match i32::from(flock.l_type) {
+                    F_UNLCK => {
+                        let meta = StdFsCallMeta::new(StdFsCallKind::Unlock, start, len);
+                        let r = syscall::std_fs_call(fd as usize, &mut [], &meta);
+                        trace_log!(
+                            "fcntl({fd}, {} | F_UNLCK, [{start:x}:{:x}]#{}) = {r:?}",
+                            if is_ofd { "F_OFD_SETLK" } else { "F_SETLK" },
+                            len + start,
+                            flock.l_pid
+                        );
+                        return r.map(|_| 0).map_err(Errno::from);
+                    }
+
+                    F_RDLCK | F_WRLCK => {
+                        let is_wrclk = i32::from(flock.l_type) == F_WRLCK;
+                        let meta = StdFsCallMeta::new(
+                            StdFsCallKind::Lock,
+                            start,
+                            len | if is_wrclk { 1 << 63 } else { 0 },
+                        );
+                        let r = syscall::std_fs_call(fd as usize, &mut [], &meta);
+                        trace_log!(
+                            "fcntl({fd}, {} | {}, [{start:x}:{:x}]#{}) = {r:?}",
+                            if is_ofd { "F_OFD_SETLK" } else { "F_SETLK" },
+                            if is_wrclk { "F_WRLCK" } else { "F_RDLCK" },
+                            len + start,
+                            flock.l_pid
+                        );
+                        return r.map(|_| 0).map_err(Errno::from);
+                    }
+
+                    _ => return Err(Errno(EINVAL)),
+                };
+            }
+
+            F_GETLK | F_OFD_GETLK => {
+                let is_ofd = cmd == F_OFD_GETLK;
+                let flock = unsafe { &mut *(args as *mut flock) };
+
+                if is_ofd && flock.l_pid != 0 {
+                    log::warn!("POSIX requires `l_pid` to be 0 on input for `F_OFD_GETLK`");
+                    return Err(Errno(EINVAL));
+                }
+
+                let (start, len) = Self::relative_to_absolute_foffset(
+                    fd as usize,
+                    flock.l_whence,
+                    flock.l_start,
+                    flock.l_len,
+                )?;
+
+                let mut start = start as u64;
+                if is_ofd {
+                    start |= 1 << 63;
+                }
+
+                let mut len = len as u64;
+                if i32::from(flock.l_type) == F_WRLCK {
+                    len |= 1 << 63;
+                }
+
+                let meta = StdFsCallMeta::new(StdFsCallKind::GetLock, 0, 0);
+                let payload = &mut [start, len];
+                // `pid` if traditional POSIX otherwise 0
+                let val =
+                    match syscall::std_fs_call(fd as usize, bytes_of_slice_mut(payload), &meta) {
+                        // According to POSIX Issue 8:
+                        // > If no lock is found that would prevent this lock from being created, then
+                        // > the structure shall be left unchanged except for the lock type in `l_type`
+                        // > which shall be set to F_UNLCK.
+                        Err(err) if err.errno == ESRCH => {
+                            flock.l_type = F_UNLCK as i16;
+                            return Ok(0);
+                        }
+
+                        Ok(val) => val,
+                        Err(err) => return Err(Errno(err.errno)),
+                    };
+
+                debug_assert_ne!(payload[0] & (1 << 63), 1 << 63);
+
+                if is_ofd {
+                    flock.l_pid = -1;
+                } else {
+                    flock.l_pid = val as i32;
+                }
+
+                let len = payload[1] & !(1 << 63);
+                if payload[1] & (1 << 63) == (1 << 63) {
+                    flock.l_type = F_WRLCK as i16;
+                } else {
+                    flock.l_type = F_RDLCK as i16;
+                }
+
+                flock.l_whence = SEEK_SET as _;
+                flock.l_start = start as i64;
+                flock.l_len = len as i64;
+                return Ok(0);
+            }
+
+            F_SETLKW => log::warn!("F_SETLKW: not yet implemented"),
+
+            _ => {}
+        }
+
+        Ok(redox_rt::sys::fcntl(fd as usize, cmd as usize, args as usize)? as c_int)
+    }
+
+    fn fdatasync(fd: c_int) -> Result<()> {
+        // TODO: "Needs" syscall update
+        syscall::fsync(fd as usize)?;
+        Ok(())
+    }
+
+    fn flock(_fd: c_int, _operation: c_int) -> Result<()> {
+        // TODO: Redox does not have file locking yet
+        Ok(())
+    }
+
+    unsafe fn fork() -> Result<pid_t> {
+        // TODO: Find way to avoid lock.
+        let _guard = CLONE_LOCK.write();
+
+        let r = redox_rt::proc::fork_impl(&redox_rt::proc::ForkArgs::Managed);
+
+        #[cfg(not(feature = "no_trace"))]
+        if !matches!(r, Ok(0)) {
+            trace_log!("fork() = {r:?}");
+        }
+
+        Ok(r? as pid_t)
+    }
+
+    fn fstatat(dirfd: c_int, path: Option<CStr>, buf: Out<stat>, flags: c_int) -> Result<()> {
+        let _siglock = tmp_disable_signals();
+        // `path` should be non-null.
+        let mut path = path.ok_or(Errno(EFAULT))?;
+
+        if path.is_empty() {
+            if flags & AT_EMPTY_PATH == AT_EMPTY_PATH {
+                if dirfd == AT_FDCWD {
+                    path = c".".into();
+                } else {
+                    return Ok(libredox::fstat(dirfd as usize, Some(buf))?);
+                }
+            } else {
+                // If the path is empty but `AT_EMPTY_PATH` is **not** set, bail out.
+                return Err(Errno(ENOENT));
+            }
+        }
+
+        let file = openat2(dirfd, path, flags, fcntl::O_PATH)?;
+        libredox::fstat(*file as usize, Some(buf))?;
+        Ok(())
+    }
+
+    fn fstatvfs(fildes: c_int, buf: Out<statvfs>) -> Result<()> {
+        libredox::fstatvfs(fildes as usize, Some(buf))?;
+        Ok(())
+    }
+
+    fn fsync(fd: c_int) -> Result<()> {
+        libredox::fsync(fd as usize)?;
+        Ok(())
+    }
+
+    fn ftruncate(fd: c_int, len: off_t) -> Result<()> {
+        libredox::ftruncate(fd as usize, len as usize)?;
+        Ok(())
+    }
+
+    #[inline]
+    unsafe fn futex_wait(addr: *mut u32, val: u32, deadline: Option<&timespec>) -> Result<()> {
+        let deadline = deadline.map(syscall::TimeSpec::from);
+        (unsafe { redox_rt::sys::sys_futex_wait(addr, val, deadline.as_ref()) })?;
+        Ok(())
+    }
+    #[inline]
+    unsafe fn futex_wake(addr: *mut u32, num: u32) -> Result<u32> {
+        Ok(unsafe { redox_rt::sys::sys_futex_wake(addr, num) }?)
+    }
+
+    fn utimensat(
+        dirfd: c_int,
+        path: CStr,
+        times: Option<&[timespec; 2]>,
+        flag: c_int,
+    ) -> Result<()> {
+        let _siglock = tmp_disable_signals();
+        let mut path = path;
+        if path.is_empty() {
+            if flag & AT_EMPTY_PATH == AT_EMPTY_PATH {
+                if dirfd == AT_FDCWD {
+                    path = c".".into();
+                } else {
+                    return Ok(libredox::futimens(dirfd as usize, times)?);
+                }
+            } else {
+                // If the path is empty but `AT_EMPTY_PATH` is **not** set, bail out.
+                return Err(Errno(ENOENT));
+            }
+        }
+
+        let file = openat2(dirfd, path, flag, fcntl::O_PATH | fcntl::O_CLOEXEC)?;
+        Ok(libredox::futimens(*file as usize, times)?)
+    }
+
+    fn getcwd(buf: Out<[u8]>) -> Result<()> {
+        path::getcwd(buf)?;
+        Ok(())
+    }
+
+    fn getdents(fd: c_int, buf: &mut [u8], opaque: u64) -> Result<usize> {
+        Ok(libredox::getdents(fd as usize, buf, opaque)?)
+    }
+
+    fn dir_seek(_fd: c_int, _off: u64) -> Result<()> {
+        // Redox getdents takes an explicit (opaque) offset, so this is a no-op.
+        Ok(())
+    }
+    // NOTE: fn is unsafe, but this just means we can assume more things. impl is safe
+    // FIXME use offset or remove it
+    unsafe fn dent_reclen_offset(this_dent: &[u8], _offset: usize) -> Option<(u16, u64)> {
+        let mut header = DirentHeader::default();
+        header.copy_from_slice(this_dent.get(..size_of::<DirentHeader>())?);
+
+        // If scheme does not send a NUL byte, this shouldn't be able to cause UB for the caller.
+        if this_dent.get(usize::from(header.record_len) - 1) != Some(&b'\0') {
+            return None;
+        }
+
+        Some((header.record_len, header.next_opaque_id))
+    }
+
+    fn getegid() -> gid_t {
+        redox_rt::sys::posix_getresugid().egid as gid_t
+    }
+
+    fn geteuid() -> uid_t {
+        redox_rt::sys::posix_getresugid().euid as uid_t
+    }
+
+    fn getgid() -> gid_t {
+        redox_rt::sys::posix_getresugid().rgid as gid_t
+    }
+
+    fn getgroups(mut list: Out<[gid_t]>) -> Result<c_int> {
+        // FIXME: this operation doesn't scale when group/passwd file grows
+
+        let uid = Self::geteuid();
+        let pwd = crate::header::pwd::getpwuid(uid);
+
+        if pwd.is_null() {
+            return Err(Errno(ENOENT));
+        }
+
+        let username = unsafe { CStr::from_ptr((*pwd).pw_name) };
+        let username = username.to_bytes_with_nul();
+        let mut count = 0;
+
+        unsafe {
+            use crate::header::grp;
+            grp::setgrent();
+
+            while let Some(grp) = grp::getgrent().as_ref() {
+                let mut i = 0;
+                let mut found = false;
+
+                while !(*grp.gr_mem.offset(i)).is_null() {
+                    let member = CStr::from_ptr(*grp.gr_mem.offset(i));
+                    if member.to_bytes_with_nul() == username {
+                        found = true;
+                        break;
+                    }
+                    i += 1;
+                }
+
+                if found {
+                    if !list.is_empty() && count < list.len() {
+                        list.index(count).write(grp.gr_gid);
+                    }
+                    count += 1;
+                }
+            }
+            grp::endgrent();
+        }
+
+        if !list.is_empty() && count > list.len() {
+            return Err(Errno(EINVAL));
+        }
+
+        Ok(count as i32)
+    }
+
+    fn getpagesize() -> usize {
+        PAGE_SIZE
+    }
+
+    fn getpgid(pid: pid_t) -> Result<pid_t> {
+        Ok(redox_rt::sys::posix_getpgid(pid as usize)? as pid_t)
+    }
+
+    fn getpid() -> pid_t {
+        redox_rt::sys::posix_getpid() as pid_t
+    }
+
+    fn getppid() -> pid_t {
+        redox_rt::sys::posix_getppid() as pid_t
+    }
+
+    fn getpriority(which: c_int, who: id_t) -> Result<c_int> {
+        match redox_rt::sys::posix_getpriority(which, who) {
+            Ok(kernel_prio) => {
+                let posix_prio = -(kernel_prio as i32) + 40_i32;
+                Ok(posix_prio)
+            }
+            Err(e) => Err(Errno(e.errno)),
+        }
+    }
+
+    fn getrandom(buf: &mut [u8], flags: c_uint) -> Result<usize> {
+        let rnd_fd = match CACHED_RANDOM_FD.get() {
+            Some(fd) => fd,
+            None => {
+                let path = if flags & sys_random::GRND_RANDOM != 0 {
+                    //TODO: /dev/random equivalent
+                    "/scheme/rand"
+                } else {
+                    "/scheme/rand"
+                };
+                let open_flags1 = syscall::O_RDONLY | redox_protocols::protocol::O_CLOEXEC;
+                let open_flags2 = open_flags1 | syscall::O_NONBLOCK;
+                let ep = [
+                    redox_rt::sys::open_into_upper(path, open_flags1)?,
+                    redox_rt::sys::open_into_upper(path, open_flags2)?,
+                ];
+                //TODO: different fd to save if /dev/random equivalent is used
+                CACHED_RANDOM_FD.set(Some(ep.clone()));
+                ep
+            }
+        };
+
+        let rnd_fd = if flags & sys_random::GRND_NONBLOCK != 0 {
+            rnd_fd[1]
+        } else {
+            rnd_fd[0]
+        };
+
+        match syscall::read(rnd_fd, buf) {
+            Ok(b) => Ok(b),
+            Err(err) => {
+                if err.errno == EBADF {
+                    CACHED_RANDOM_FD.set(None);
+                }
+                return Err(Errno(err.errno));
+            }
+        }
+    }
+
+    fn getresgid(
+        rgid_out: Option<Out<gid_t>>,
+        egid_out: Option<Out<gid_t>>,
+        sgid_out: Option<Out<gid_t>>,
+    ) -> Result<()> {
+        let Resugid {
+            rgid, egid, sgid, ..
+        } = redox_rt::sys::posix_getresugid();
+        if let Some(mut rgid_out) = rgid_out {
+            rgid_out.write(rgid as _);
+        }
+        if let Some(mut egid_out) = egid_out {
+            egid_out.write(egid as _);
+        }
+        if let Some(mut sgid_out) = sgid_out {
+            sgid_out.write(sgid as _);
+        }
+        Ok(())
+    }
+    fn getresuid(
+        ruid_out: Option<Out<uid_t>>,
+        euid_out: Option<Out<uid_t>>,
+        suid_out: Option<Out<uid_t>>,
+    ) -> Result<()> {
+        let Resugid {
+            ruid, euid, suid, ..
+        } = redox_rt::sys::posix_getresugid();
+        if let Some(mut ruid_out) = ruid_out {
+            ruid_out.write(ruid as _);
+        }
+        if let Some(mut euid_out) = euid_out {
+            euid_out.write(euid as _);
+        }
+        if let Some(mut suid_out) = suid_out {
+            suid_out.write(suid as _);
+        }
+        Ok(())
+    }
+
+    fn getrlimit(resource: c_int, mut rlim: Out<rlimit>) -> Result<()> {
+        if !(0..RLIMIT_NLIMITS).contains(&resource) {
+            return Err(Errno(EINVAL));
+        }
+        let mut redox_rlimit = Rlimit::const_default();
+        let out = match redox_rt::sys::posix_getrlimit(resource as usize, &mut redox_rlimit) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.into()),
+        };
+        rlim.write(rlimit {
+            rlim_cur: redox_rlimit.rlim_cur,
+            rlim_max: redox_rlimit.rlim_max,
+        });
+        out
+    }
+
+    unsafe fn setrlimit(resource: c_int, rlim: *const rlimit) -> Result<()> {
+        if !(0..RLIMIT_NLIMITS).contains(&resource) {
+            return Err(Errno(EINVAL));
+        }
+
+        let Some(rlim) = (unsafe { rlim.as_ref() }) else {
+            return Err(Errno(EINVAL));
+        };
+        let rlim = &Rlimit {
+            rlim_cur: rlim.rlim_cur,
+            rlim_max: rlim.rlim_max,
+        };
+
+        match redox_rt::sys::posix_setrlimit(resource as usize, rlim) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn getrusage(who: c_int, r_usage: Out<rusage>) -> Result<()> {
+        todo_skip!(0, "getrusage({}, {:p}): not implemented", who, r_usage);
+        Ok(())
+    }
+
+    fn getsid(pid: pid_t) -> Result<pid_t> {
+        Ok(redox_rt::sys::posix_getsid(pid as usize)? as _)
+    }
+
+    fn gettid() -> pid_t {
+        // This is used by pthread mutexes for reentrant checks and must be nonzero
+        // and unique for each thread in the same process (but not cross-process)
+        let thread_fd = Self::current_os_tid().thread_fd;
+        (thread_fd & !syscall::UPPER_FDTBL_TAG)
+            .checked_add(1)
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
+
+    fn gettimeofday(mut tp: Out<timeval>, tzp: Option<Out<timezone>>) -> Result<()> {
+        let mut redox_tp = redox_timespec::default();
+        syscall::clock_gettime(syscall::CLOCK_REALTIME, &mut redox_tp)?;
+        tp.write(timeval {
+            tv_sec: redox_tp.tv_sec as time_t,
+            tv_usec: (redox_tp.tv_nsec / 1000) as suseconds_t,
+        });
+
+        if let Some(mut tzp) = tzp {
+            tzp.write(timezone {
+                tz_minuteswest: 0,
+                tz_dsttime: 0,
+            });
+        }
+        Ok(())
+    }
+
+    fn getuid() -> uid_t {
+        redox_rt::sys::posix_getresugid().ruid as uid_t
+    }
+
+    fn linkat(fd1: c_int, oldpath: CStr, fd2: c_int, newpath: CStr, flags: c_int) -> Result<()> {
+        let _siglock = tmp_disable_signals();
+        // make sure the flags passed are valid.
+        // valid states: AT_SYMLINK_FOLLOW, or 0.
+        if (flags & !(AT_SYMLINK_FOLLOW)) != 0 {
+            return Err(Errno(EINVAL));
+        }
+
+        // By default, we don't follow the symlink if there is one.
+        // We only follow it if AT_SYMLINK_FOLLOW is passed in flags.
+        // We represent this by setting O_NOFOLLOW by default, and clearing it
+        // if AT_SYMLINK_FOLLOW is present.
+        let mut oflags = fcntl::O_PATH | fcntl::O_CLOEXEC | fcntl::O_NOFOLLOW;
+        if (flags & AT_SYMLINK_FOLLOW) == AT_SYMLINK_FOLLOW {
+            oflags &= !fcntl::O_NOFOLLOW;
+        }
+
+        let file = File::openat(fd1, oldpath, oflags)?;
+
+        let new_path = RedoxStr::new_from_c(newpath.to_cstr()).ok_or(Error::new(EINVAL))?;
+        let (new_dfd, new_target) = path::resolve_open_to_dir(fd2, &new_path)?;
+
+        let r = redox_rt::sys::flinkat(
+            *file as usize,
+            new_dfd.as_raw_fd(),
+            new_target.as_ref(),
+            flags as u32,
+        );
+
+        trace_log!(
+            "flinkat({fd1}, {oldpath:?}, {fd2}, {newpath:?}, {flags:x}) = [{:?}] {:?}",
+            new_target.as_ref(),
+            r
+        );
+
+        r.map_err(Into::into)
+    }
+
+    fn lseek(fd: c_int, offset: off_t, whence: c_int) -> Result<off_t> {
+        Ok(syscall::lseek(fd as usize, offset as isize, whence as usize)? as off_t)
+    }
+
+    fn mkdirat(dir_fd: c_int, path_name: CStr, mode: mode_t) -> Result<()> {
+        File::createat(
+            dir_fd,
+            path_name,
+            fcntl::O_DIRECTORY | fcntl::O_EXCL | fcntl::O_CLOEXEC,
+            mode,
+        )?;
+        Ok(())
+    }
+
+    fn mkfifoat(dir_fd: c_int, path_name: CStr, mode: mode_t) -> Result<()> {
+        Sys::mknodat(
+            dir_fd,
+            path_name,
+            syscall::MODE_FIFO as mode_t | (mode & 0o777),
+            0,
+        )
+    }
+
+    fn mknodat(dir_fd: c_int, path_name: CStr, mode: mode_t, _dev: dev_t) -> Result<()> {
+        File::createat(dir_fd, path_name, fcntl::O_CREAT | fcntl::O_CLOEXEC, mode)?;
+        Ok(())
+    }
+
+    #[expect(unused_variables, reason = "Redox never swaps")]
+    unsafe fn mlock(addr: *const c_void, len: usize) -> Result<()> {
+        Ok(())
+    }
+
+    #[expect(unused_variables, reason = "Redox never swaps")]
+    unsafe fn mlockall(flags: c_int) -> Result<()> {
+        Ok(())
+    }
+
+    unsafe fn mmap(
+        addr: *mut c_void,
+        len: usize,
+        prot: c_int,
+        flags: c_int,
+        fildes: c_int,
+        off: off_t,
+    ) -> Result<*mut c_void> {
+        // 0 is invalid per spec
+        if len == 0 {
+            return Err(Errno(EINVAL));
+        }
+        let Some(size) = round_up_to_page_size(len) else {
+            return Err(Errno(ENOMEM));
+        };
+
+        let map = Map {
+            offset: off as usize,
+            size,
+            flags: syscall::MapFlags::from_bits_truncate(
+                ((prot as usize) << 16) | ((flags as usize) & 0xFFFF),
+            ),
+            address: addr as usize,
+        };
+
+        Ok(if flags & MAP_ANONYMOUS == MAP_ANONYMOUS {
+            (unsafe { syscall::fmap(!0, &map) })?
+        } else {
+            (unsafe { syscall::fmap(fildes as usize, &map) })?
+        } as *mut c_void)
+    }
+
+    #[expect(unused_variables, reason = "function not yet implemented")]
+    unsafe fn mremap(
+        addr: *mut c_void,
+        len: usize,
+        new_len: usize,
+        flags: c_int,
+        args: *mut c_void,
+    ) -> Result<*mut c_void> {
+        Err(Errno(ENOSYS))
+    }
+
+    unsafe fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> Result<()> {
+        let Some(len) = round_up_to_page_size(len) else {
+            return Err(Errno(ENOMEM));
+        };
+        let Some(prot) = syscall::MapFlags::from_bits((prot as usize) << 16) else {
+            return Err(Errno(EINVAL));
+        };
+        (unsafe { syscall::mprotect(addr as usize, len, prot) })?;
+        Ok(())
+    }
+
+    unsafe fn msync(addr: *mut c_void, len: usize, flags: c_int) -> Result<()> {
+        todo_skip!(
+            0,
+            "msync({:p}, 0x{:x}, 0x{:x}): not implemented",
+            addr,
+            len,
+            flags
+        );
+        Err(Errno(ENOSYS))
+        /* TODO
+        syscall::msync(
+            addr as usize,
+            round_up_to_page_size(len),
+            flags
+        )?;
+        */
+    }
+
+    #[expect(unused_variables, reason = "Redox never swaps")]
+    unsafe fn munlock(addr: *const c_void, len: usize) -> Result<()> {
+        Ok(())
+    }
+
+    unsafe fn munlockall() -> Result<()> {
+        // Redox never swaps
+        Ok(())
+    }
+
+    unsafe fn munmap(addr: *mut c_void, len: usize) -> Result<()> {
+        // 0 is invalid per spec
+        if len == 0 {
+            return Err(Errno(EINVAL));
+        }
+        let Some(len) = round_up_to_page_size(len) else {
+            return Err(Errno(ENOMEM));
+        };
+        (unsafe { syscall::funmap(addr as usize, len) })?;
+        Ok(())
+    }
+
+    unsafe fn madvise(addr: *mut c_void, len: usize, flags: c_int) -> Result<()> {
+        todo_skip!(
+            0,
+            "madvise({:p}, 0x{:x}, 0x{:x}): not implemented",
+            addr,
+            len,
+            flags
+        );
+        Ok(())
+    }
+
+    fn nanosleep(rqtp: &timespec, rmtp: Option<Out<timespec>>) -> Result<()> {
+        let redox_rqtp = rqtp.into();
+        let mut redox_rmtp = syscall::TimeSpec::default();
+        match redox_rt::sys::posix_nanosleep(&redox_rqtp, &mut redox_rmtp) {
+            Ok(()) => Ok(()),
+            Err(Error { errno: EINTR }) => {
+                if let Some(mut rmtp) = rmtp {
+                    rmtp.write((&redox_rmtp).into());
+                }
+                Err(Errno(EINTR))
+            }
+            Err(Error { errno: e }) => Err(Errno(e)),
+        }
+    }
+
+    fn openat(dirfd: c_int, path: CStr, oflag: c_int, mode: mode_t) -> Result<c_int> {
+        let path = RedoxStr::new_from_c(path.to_cstr()).ok_or(Errno(EINVAL))?;
+
+        // POSIX states that umask should affect the following:
+        //
+        // open, openat, creat, mkdir, mkdirat,
+        // mkfifo, mkfifoat, mknod, mknodat,
+        // mq_open, and sem_open,
+        //
+        // all of which (the ones that exist thus far) currently call this function.
+        let effective_mode = mode & !(redox_rt::sys::get_umask() as mode_t);
+
+        Ok(libredox::openat(dirfd, path, oflag, effective_mode)? as c_int)
+    }
+
+    fn pipe2(mut fds: Out<[c_int; 2]>, flags: c_int) -> Result<()> {
+        let _siglock = tmp_disable_signals();
+        let r = extra::pipe2(flags as usize);
+        trace_log!("pipe2({flags:x}) = {:?}", r);
+        fds.write(r?);
+        Ok(())
+    }
+
+    fn poll(fds: &mut [pollfd], timeout: c_int) -> Result<c_int> {
+        Self::redox_poll(fds, timeout, None)
+    }
+
+    fn ppoll(
+        fds: &mut [pollfd],
+        tmo_opt: Option<&timespec>,
+        sigmask: Option<&sigset_t>,
+    ) -> Result<c_int> {
+        let timeout = match tmo_opt {
+            Some(tmo) => {
+                if tmo.tv_sec > (c_int::MAX / 1000).into() {
+                    c_int::MAX
+                } else {
+                    #[cfg(target_pointer_width = "64")]
+                    let tv_nsec = c_int::try_from(tmo.tv_nsec).unwrap_or(c_int::MAX);
+                    #[cfg(target_pointer_width = "32")]
+                    let tv_nsec = tmo.tv_nsec;
+                    (c_int::try_from(tmo.tv_sec).expect("within bounds") * 1000)
+                        + (tv_nsec / 1000000)
+                }
+            }
+            None => -1,
+        };
+        Self::redox_poll(fds, timeout, sigmask)
+    }
+
+    fn posix_fallocate(fd: c_int, offset: u64, length: NonZeroU64) -> Result<()> {
+        // Redox doesn't actually have flock yet but presumably the file will need to be locked to
+        // avoid accidentally truncating it if the length changes.
+        let _guard = FileLock::lock(fd, sys_file::LOCK_EX)?;
+
+        // posix_fallocate is less nuanced than the Linux syscall fallocate.
+        // If the byte range is already allocated, posix_fallocate doesn't do any extra work.
+        // If the byte range is unallocated; free, uninitialized bytes are reserved.
+        // posix_fallocate does not shrink files.
+        //
+        // The main purpose of it is to ensure subsequent writes to a byte range don't fail.
+        let length = length.get();
+        let total_offset = offset.checked_add(length).ok_or(Errno(EFBIG))?;
+
+        let mut stat: stat = stat::default();
+        libredox::fstat(fd as usize, Some(Out::from_mut(&mut stat)))?;
+        let st_size = stat.st_size as u64;
+        // The difference between total_offset and the file size is the number of bytes to
+        // allocate. So, if it's negative then the file is already large enough and we don't
+        // need to do any extra work.
+        if let Some(total_len) = total_offset
+            .checked_sub(st_size)
+            .and_then(|diff| st_size.checked_add(diff))
+        {
+            let total_len: usize = total_len.try_into().map_err(|_| Errno(EFBIG))?;
+            libredox::ftruncate(fd as usize, total_len)?;
+        }
+
+        Ok(())
+    }
+
+    fn posix_getdents(fildes: c_int, buf: &mut [u8]) -> Result<usize> {
+        let current_offset = Self::lseek(fildes, 0, SEEK_CUR)? as u64;
+        let bytes_read = Self::getdents(fildes, buf, current_offset)?;
+        if bytes_read == 0 {
+            return Ok(0);
+        }
+        let mut bytes_processed = 0;
+        let mut next_offset = current_offset;
+
+        while bytes_processed < bytes_read {
+            let remaining_slice = &buf[bytes_processed..];
+            let (reclen, opaque_next) =
+                unsafe { Self::dent_reclen_offset(remaining_slice, bytes_processed) }
+                    .ok_or(Errno(EIO))?;
+            if reclen == 0 {
+                return Err(Errno(EIO));
+            }
+
+            bytes_processed += reclen as usize;
+            next_offset = opaque_next;
+        }
+
+        Self::lseek(fildes, next_offset as off_t, SEEK_SET)?;
+        Ok(bytes_read)
+    }
+
+    unsafe fn rlct_clone(
+        stack: *mut usize,
+        os_specific: &mut OsSpecific,
+    ) -> Result<crate::pthread::OsTid> {
+        let _guard = CLONE_LOCK.read();
+        let res = unsafe { redox_rt::thread::rlct_clone_impl(stack, os_specific) };
+
+        res.map(|thread_fd| crate::pthread::OsTid { thread_fd })
+            .map_err(|error| Errno(error.errno))
+    }
+
+    unsafe fn rlct_kill(os_tid: crate::pthread::OsTid, signal: usize) -> Result<()> {
+        redox_rt::sys::posix_kill_thread(os_tid.thread_fd, signal as u32)?;
+        Ok(())
+    }
+    fn current_os_tid() -> crate::pthread::OsTid {
+        crate::pthread::OsTid {
+            thread_fd: RtTcb::current().thread_fd().as_raw_fd(),
+        }
+    }
+
+    fn read(fd: c_int, buf: &mut [u8]) -> Result<usize> {
+        let fd = usize::try_from(fd).map_err(|_| Errno(EBADF))?;
+        Ok(redox_rt::sys::posix_read(fd, buf)?)
+    }
+
+    fn pread(fd: c_int, buf: &mut [u8], offset: off_t) -> Result<usize> {
+        unsafe {
+            Ok(syscall::syscall5(
+                syscall::SYS_READ2,
+                fd as usize,
+                buf.as_mut_ptr() as usize,
+                buf.len(),
+                offset as usize,
+                !0,
+            )?)
+        }
+    }
+
+    unsafe fn readv(fildes: c_int, iov: *const iovec, iovcnt: c_int) -> Result<usize> {
+        let iovs = unsafe {
+            slice::from_raw_parts(iov, usize::try_from(iovcnt).expect("iovcnt is positive"))
+        };
+        let mut vec = unsafe { gather(iovs) };
+
+        let n = Self::read(fildes, &mut vec)?;
+
+        unsafe { scatter(iovs, &vec) };
+
+        Ok(n)
+    }
+
+    fn fpath(fildes: c_int, out: &mut [u8]) -> Result<usize> {
+        // Since this is used by realpath, it converts from the old format to the new one for
+        // compatibility reasons
+        let mut buf = [0; limits::PATH_MAX];
+        let redox_path = path::standard_fpath(fildes as usize, &mut buf)?;
+
+        let mut cursor = io::Cursor::new(out);
+        match write!(cursor, "{}", redox_path.as_ref()) {
+            Ok(()) => Ok(cursor.position() as usize),
+            Err(err) => {
+                log::warn!(
+                    "fpath is too long for buffer: {:?} {:?}",
+                    redox_path.as_ref(),
+                    err
+                );
+                Err(Errno(ENAMETOOLONG))
+            }
+        }
+    }
+
+    fn readlinkat(dirfd: c_int, path: CStr, out: &mut [u8]) -> Result<usize> {
+        let _siglock = tmp_disable_signals();
+        let file = openat2(
+            dirfd,
+            path,
+            0,
+            fcntl::O_RDONLY | fcntl::O_SYMLINK | fcntl::O_CLOEXEC,
+        )?;
+        Sys::read(*file, out)
+    }
+
+    fn renameat2(
+        old_dir: c_int,
+        old_path: CStr,
+        new_dir: c_int,
+        new_path: CStr,
+        flags: c_uint,
+    ) -> Result<()> {
+        let _siglock = tmp_disable_signals();
+        const MASK: c_uint = !RENAME_NOREPLACE;
+        if MASK & flags != 0 {
+            return Err(Errno(EOPNOTSUPP));
+        }
+
+        let oldpath = RedoxStr::new_from_c(old_path.to_cstr()).ok_or(Error::new(EINVAL))?;
+        let newpath = RedoxStr::new_from_c(new_path.to_cstr()).ok_or(Error::new(EINVAL))?;
+        let (old_dfd, old_target) = path::resolve_open_to_dir(old_dir, &oldpath)?;
+        let (new_dfd, new_target) = path::resolve_open_to_dir(new_dir, &newpath)?;
+
+        let r = redox_rt::sys::frenameat(
+            old_dfd.as_raw_fd(),
+            old_target.as_ref(),
+            new_dfd.as_raw_fd(),
+            new_target.as_ref(),
+            flags,
+        );
+
+        trace_log!(
+            "frenameat({old_dir}, {old_path:?}, {new_dir}, {new_path:?}, {flags:x}) = [{:?}] {:?}",
+            new_target.as_ref(),
+            r
+        );
+
+        r.map_err(Into::into)
+    }
+
+    fn sched_yield() -> Result<()> {
+        syscall::sched_yield()?;
+        Ok(())
+    }
+
+    unsafe fn setgroups(size: size_t, list: *const gid_t) -> Result<()> {
+        // TODO
+        todo_skip!(0, "setgroups({}, {:p}): not implemented", size, list);
+        Err(Errno(ENOSYS))
+    }
+
+    fn setpgid(pid: pid_t, pgid: pid_t) -> Result<()> {
+        redox_rt::sys::posix_setpgid(pid as usize, pgid as usize)?;
+        Ok(())
+    }
+
+    fn setpriority(which: c_int, who: id_t, prio: c_int) -> Result<()> {
+        let clamped_prio = prio.clamp(-20, 19);
+        let kernel_prio = (20 + clamped_prio) as u32;
+
+        match redox_rt::sys::posix_setpriority(which, who, kernel_prio) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(Errno(e.errno)),
+        }
+    }
+
+    fn setsid() -> Result<c_int> {
+        Ok(redox_rt::sys::posix_setsid()? as c_int)
+    }
+
+    fn setresgid(rgid: gid_t, egid: gid_t, sgid: gid_t) -> Result<()> {
+        redox_rt::sys::posix_setresugid(
+            &Resugid {
+                ruid: None,
+                euid: None,
+                suid: None,
+                rgid: cvt_uid(rgid)?,
+                egid: cvt_uid(egid)?,
+                sgid: cvt_uid(sgid)?,
+            },
+            None,
+        )?;
+        Ok(())
+    }
+
+    fn setresuid(ruid: uid_t, euid: uid_t, suid: uid_t) -> Result<()> {
+        redox_rt::sys::posix_setresugid(
+            &Resugid {
+                ruid: cvt_uid(ruid)?,
+                euid: cvt_uid(euid)?,
+                suid: cvt_uid(suid)?,
+                rgid: None,
+                egid: None,
+                sgid: None,
+            },
+            None,
+        )?;
+        Ok(())
+    }
+
+    unsafe fn spawn(
+        program: CStr,
+        fac: Option<&crate::header::spawn::posix_spawn_file_actions_t>,
+        fat: Option<&crate::header::spawn::posix_spawnattr_t>,
+        argv: NulTerminated<*mut c_char>,
+        envp: Option<NulTerminated<*mut c_char>>,
+    ) -> Result<pid_t> {
+        use crate::header::spawn::Flags;
+        let child = redox_rt::proc::new_child_process(&redox_rt::proc::ForkArgs::Managed)?;
+        let mut cwd = path::clone_cwd().unwrap_or_default();
+        let mut cwd_fd = FdGuard::open_into_upper(cwd.as_str(), syscall::O_STAT)?;
+        let proc_fd = child.proc_fd.unwrap();
+        let _curr_proc_fd = redox_rt::current_proc_fd(); // TODO use this variable?
+        let cur_filetable_fd = RtTcb::current().thread_fd().dup_into_upper(b"filetable")?;
+        let file_table = cur_filetable_fd.dup_into_upper(b"copy")?;
+
+        {
+            let new_file_table = child.thr_fd.dup_into_upper(b"current-filetable")?;
+            new_file_table.write(&file_table.as_raw_fd().to_ne_bytes())?;
+        }
+
+        let mut args = Vec::new();
+        let mut envs = Vec::new();
+
+        for arg in argv {
+            args.push(unsafe { CStr::from_ptr(*arg).to_chars() });
+        }
+
+        if let Some(envp) = envp {
+            for env in envp {
+                envs.push(unsafe { CStr::from_ptr(*env).to_chars() });
+            }
+        }
+
+        args[0] = program.to_bytes();
+
+        let new_file_table = child.thr_fd.dup_into_upper(b"filetable-binary")?;
+
+        if let Some(fac) = fac {
+            for action in fac {
+                match action {
+                    crate::header::spawn::Action::Open {
+                        fd,
+                        path,
+                        flag,
+                        mode,
+                    } => {
+                        let dirfd = {
+                            // TODO: Cannot use cwd_fd (being an upper fd), also
+                            // cannot set cwd_fd as regular fd then call to_upper later
+                            FdGuard::open(cwd.as_str(), syscall::O_STAT)?
+                        };
+                        let src_fd = Sys::openat(
+                            dirfd.as_c_fd().ok_or(Errno(EMFILE))?,
+                            CStr::borrow(&path),
+                            flag,
+                            mode,
+                        )? as usize;
+                        new_file_table.call_wo(
+                            &src_fd.to_ne_bytes(),
+                            syscall::CallFlags::FD,
+                            &[u64::try_from(fd).map_err(|_| Errno(EBADFD))?],
+                        )?;
+                    }
+                    crate::header::spawn::Action::Close(fd) => {
+                        new_file_table.call_wo(
+                            &(fd as usize).to_ne_bytes(),
+                            syscall::CallFlags::empty(),
+                            &[syscall::flag::FileTableVerb::Close as u64],
+                        )?;
+                    }
+                    crate::header::spawn::Action::Chdir(path) => {
+                        let cwd_str =
+                            core::str::from_utf8(path.as_bytes()).map_err(|_| Errno(EINVAL))?;
+                        cwd = to_cwd_path(cwd_str)?;
+                        let fd = FdGuard::open_into_upper(cwd.as_str(), syscall::O_STAT)?;
+                        cwd_fd = fd;
+                    }
+                    crate::header::spawn::Action::FChdir(fd) => {
+                        let mut buf = CwdPath::zero_filled();
+                        unsafe {
+                            // SAFETY: Sys::fpath is using str::from_utf8 already
+                            let res = Sys::fpath(fd, buf.as_bytes_mut())?;
+                            buf.set_len(res);
+                        }
+                        cwd = buf;
+                        let fd = FdGuard::open_into_upper(cwd.as_str(), syscall::O_STAT)?;
+                        cwd_fd = fd;
+                    }
+                    crate::header::spawn::Action::Dup2(old, new) => {
+                        new_file_table.call_wo(
+                            [(old as usize).to_ne_bytes(), (new as usize).to_ne_bytes()]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<u8>>()
+                                .as_slice(),
+                            syscall::CallFlags::empty(),
+                            &[syscall::flag::FileTableVerb::Dup2 as u64],
+                        )?;
+                    }
+                }
+            }
+        }
+
+        let dirfd = {
+            // TODO: Cannot use cwd_fd (being an upper fd), also
+            // cannot set cwd_fd as regular fd then call to_upper later
+            FdGuard::open(cwd.as_str(), syscall::O_STAT)?
+        };
+
+        let executable = Sys::openat(
+            dirfd.as_c_fd().ok_or(Errno(EMFILE))?,
+            program,
+            fcntl::O_RDONLY,
+            0,
+        )?;
+        let executable = FdGuard::new(executable as usize).to_upper()?;
+        let mut executable_stat = syscall::Stat::default();
+        executable.fstat(&mut executable_stat)?;
+        drop(dirfd);
+
+        // println!(
+        //     "RELIBC: spawn {:?} at {:?}",
+        //     args.iter()
+        //         .map(|s| str::from_utf8(s).unwrap_or("???"))
+        //         .collect::<Vec<_>>()
+        //         .as_slice(),
+        //     cwd.as_str()
+        // );
+
+        new_file_table.call_wo(
+            &new_file_table.as_raw_fd().to_ne_bytes(),
+            syscall::CallFlags::FD | syscall::CallFlags::FD_CLONE,
+            &[new_file_table.as_raw_fd() as u64],
+        )?;
+
+        {
+            let fds_to_close = {
+                let guard = redox_rt::current_filetable().inner.lock();
+                let mut fds = alloc::vec::Vec::new();
+                for (fd, flags) in guard.iter() {
+                    if flags & redox_protocols::protocol::O_CLOEXEC
+                        == redox_protocols::protocol::O_CLOEXEC
+                        || fd == executable.as_raw_fd()
+                    {
+                        fds.push(fd);
+                    }
+                }
+
+                fds.push(cur_filetable_fd.as_raw_fd());
+
+                fds
+            };
+
+            let fds_to_close_bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    fds_to_close.as_ptr() as *mut u8,
+                    fds_to_close.len() * core::mem::size_of::<usize>(),
+                )
+            };
+
+            let _ = new_file_table.call_wo(
+                fds_to_close_bytes,
+                syscall::CallFlags::empty(),
+                &[syscall::FileTableVerb::Close as u64],
+            );
+        }
+
+        new_file_table.call_wo(
+            &cwd_fd.as_raw_fd().to_ne_bytes(),
+            syscall::CallFlags::FD | syscall::CallFlags::FD_CLONE,
+            &[cwd_fd.as_raw_fd() as u64],
+        )?;
+
+        let extra_info = redox_rt::proc::ExtraInfo {
+            cwd: Some(cwd.as_bytes()),
+            // Signals set to be ignored by the calling process
+            // must also be ignored by the child process
+            sigignmask: redox_rt::signal::get_sigignmask_to_inherit(),
+            sigprocmask: if let Some(fat) = fat
+                && Flags::from_bits(fat.flags)
+                    .unwrap()
+                    .contains(Flags::POSIX_SPAWN_SETSIGMASK)
+            {
+                fat.sigmask
+            } else {
+                redox_rt::signal::get_sigmask().unwrap()
+            },
+            umask: redox_rt::sys::get_umask(),
+            thr_fd: child.thr_fd.as_raw_fd(),
+            proc_fd: proc_fd.as_raw_fd(),
+            ns_fd: redox_rt::current_namespace_fd().ok(),
+            cwd_fd: Some(cwd_fd.as_raw_fd()),
+            filetable_fd: Some(new_file_table.as_raw_fd()),
+            same_process: false,
+        };
+
+        if let Some(attr) = fat {
+            let flags = Flags::from_bits(attr.flags).ok_or(Errno(EINVAL))?;
+
+            if flags.contains(Flags::POSIX_SPAWN_SETPGROUP) && attr.pgroup != 0 {
+                redox_rt::sys::posix_setpgid(
+                    proc_fd.as_raw_fd(),
+                    usize::try_from(attr.pgroup).map_err(|_| Errno(EINVAL))?,
+                )?;
+            }
+
+            let set_schedparam = || -> Result<()> {
+                if setpriority(
+                    PRIO_PROCESS,
+                    proc_fd.as_raw_fd() as id_t,
+                    attr.param.sched_priority,
+                ) as usize
+                    != 0
+                {
+                    Err(Errno(ERRNO.get()))
+                } else {
+                    Ok(())
+                }
+            };
+            let set_scheduler = || -> Result<()> { todo!() };
+
+            // scheduling paramters must be set regardless of whether the flag POSIX_SPAWN_SETSCHEDPARAM is set
+            if flags.contains(Flags::POSIX_SPAWN_SETSCHEDULER) {
+                set_schedparam()?;
+                set_scheduler()?;
+            } else if flags.contains(Flags::POSIX_SPAWN_SETSCHEDPARAM) {
+                set_schedparam()?;
+            }
+
+            let parent_resugid = redox_rt::sys::posix_getresugid();
+
+            redox_rt::sys::posix_setresugid(
+                &Resugid {
+                    ruid: None,
+                    euid: Some(if executable_stat.st_mode as mode_t & S_ISUID == S_ISUID {
+                        executable_stat.st_uid
+                    } else if flags.contains(Flags::POSIX_SPAWN_RESETIDS) {
+                        parent_resugid.ruid
+                    } else {
+                        parent_resugid.euid
+                    }),
+                    suid: None,
+                    rgid: None,
+                    egid: Some(if executable_stat.st_mode as mode_t & S_ISGID == S_ISGID {
+                        executable_stat.st_gid
+                    } else if flags.contains(Flags::POSIX_SPAWN_RESETIDS) {
+                        parent_resugid.rgid
+                    } else {
+                        parent_resugid.egid
+                    }),
+                    sgid: None,
+                },
+                Some(proc_fd.as_raw_fd()),
+            )?;
+
+            // if POSIX_SPAWN_SETSIGDEF flag is set, the signals specified in
+            // sigdefault must have default actions
+        }
+
+        let program = program.to_bytes();
+
+        if let Some(redox_rt::proc::FexecResult::Interp {
+            path: interp_path,
+            interp_override,
+        }) = redox_rt::proc::fexec_impl(
+            executable,
+            &child.thr_fd,
+            &proc_fd,
+            program,
+            args.as_slice(),
+            envs.as_slice(),
+            &extra_info,
+            None,
+        )? {
+            let interp_path =
+                CStr::from_bytes_with_nul(&interp_path).map_err(|_| Errno(ENOEXEC))?;
+            let interp_path =
+                RedoxReference::new_from_c(interp_path.to_cstr()).ok_or(Errno(ENOEXEC))?;
+            let interpreter = FdGuard::open_into_upper(interp_path.as_ref(), syscall::O_RDONLY)?;
+
+            redox_rt::proc::fexec_impl(
+                interpreter,
+                &child.thr_fd,
+                &proc_fd,
+                program,
+                args.as_slice(),
+                envs.as_slice(),
+                &extra_info,
+                Some(interp_override),
+            )
+            .unwrap();
+        }
+
+        let start_fd = child.thr_fd.dup_into_upper(b"start")?;
+        start_fd.write(&[0])?;
+
+        Ok(pid_t::try_from(child.pid).unwrap())
+    }
+
+    fn symlinkat(path1: CStr, fd: c_int, path2: CStr) -> Result<()> {
+        let _siglock = tmp_disable_signals();
+        let mut file = File::createat(
+            fd,
+            path2,
+            fcntl::O_WRONLY
+                | fcntl::O_CLOEXEC
+                | fcntl::O_SYMLINK // create a symlink
+                | fcntl::O_NOFOLLOW // do not follow symlink
+                | fcntl::O_EXCL // throw EEXIST if already exist
+                | fcntl::O_PATH, // do not throw ELOOP because of O_NOFOLLOW
+            0o777,
+        )?;
+
+        file.write(path1.to_bytes())
+            .map_err(|err| Errno(err.raw_os_error().unwrap_or(EIO)))?;
+
+        Ok(())
+    }
+
+    fn sync() -> Result<()> {
+        Ok(())
+    }
+
+    fn timer_create(clock_id: clockid_t, evp: &sigevent) -> Result<timer_t> {
+        if evp.sigev_notify == SIGEV_THREAD {
+            if evp.sigev_notify_function.is_none() {
+                return Err(Errno(EINVAL));
+            }
+        } else if evp.sigev_notify == SIGEV_SIGNAL {
+            const N_SIG: i32 = NSIG as i32;
+            const RT_MIN: i32 = SIGRTMIN as i32;
+            const RT_MAX: i32 = SIGRTMIN as i32;
+            match evp.sigev_signo {
+                0..N_SIG => {}
+                RT_MIN..=RT_MAX => {}
+                _ => {
+                    return Err(Errno(EINVAL));
+                }
+            }
+        }
+
+        let path = match clock_id {
+            CLOCK_REALTIME => "/scheme/time/1",
+            CLOCK_MONOTONIC => "/scheme/time/4",
+            _ => return Err(Errno(EINVAL)),
+        };
+        let timerfd = FdGuard::open_into_upper(path, syscall::O_RDWR)?;
+        let eventfd = FdGuard::new(event::queue_create(0)?).to_upper()?;
+
+        Ok(RlctTimer::create(clock_id, evp, timerfd, eventfd))
+    }
+
+    fn timer_delete(timerid: timer_t) -> Result<()> {
+        let mut timers = TIMERS.lock();
+        let Some(timer_st) = timers.remove(&timerid.addr()) else {
+            return Err(Errno(EINVAL));
+        };
+        if !timer_st.thread.is_null()
+            && let Err(e) = unsafe { pthread::cancel(&*timer_st.thread.cast()) }
+        {
+            log::warn!("timer_delete: failed to cancel pthread: {e:?}");
+        }
+        Ok(())
+    }
+
+    fn timer_gettime(timerid: timer_t) -> Result<itimerspec> {
+        let mut timers = TIMERS.lock();
+        let Some(timer_st) = timers.get_mut(&timerid.addr()) else {
+            return Err(Errno(EINVAL));
+        };
+        let mut now = timespec::default();
+        Self::clock_gettime(timer_st.clockid, Out::from_mut(&mut now))?;
+        if timer_st.evp.sigev_notify == SIGEV_NONE
+            && timespec::subtract(&timer_st.next_wake_time.it_value, &now).is_none()
+        {
+            // error here means the timer is disarmed
+            let _ = timer_update_wake_time(timer_st);
+        }
+        let remaining = &timer_st.next_wake_time.it_value;
+        if remaining.is_zero() {
+            // disarmed
+            return Ok(itimerspec::default());
+        }
+        Ok(itimerspec {
+            it_interval: timer_st.next_wake_time.it_interval.clone(),
+            it_value: timespec::subtract(remaining, &now).unwrap_or_default(),
+        })
+    }
+
+    #[expect(clippy::not_unsafe_ptr_arg_deref)]
+    fn timer_settime(
+        timerid: timer_t,
+        flags: c_int,
+        value: &itimerspec,
+        ovalue: Option<Out<itimerspec>>,
+    ) -> Result<()> {
+        if let Some(mut ovalue) = ovalue {
+            ovalue.write(Self::timer_gettime(timerid)?);
+        }
+
+        let mut timers = TIMERS.lock();
+        let Some(timer_st) = timers.get_mut(&timerid.addr()) else {
+            return Err(Errno(EINVAL));
+        };
+
+        if value.it_value.is_zero() {
+            timer_st.next_wake_version += 1;
+            return Ok(());
+        }
+
+        timer_st.next_wake_time = {
+            let mut val = value.clone();
+            if flags & TIMER_ABSTIME == 0 {
+                let mut now = timespec::default();
+                Self::clock_gettime(timer_st.clockid, Out::from_mut(&mut now))?;
+                val.it_value = timespec::add(&now, &val.it_value).ok_or(Errno(EINVAL))?;
+            }
+            val
+        };
+
+        event::queue_ctl(
+            timer_st.eventfd.as_raw_fd(),
+            timer_st.timerfd.as_raw_fd(),
+            1,
+            0,
+        )?;
+
+        let buf_to_write = syscall::TimeSpec::from(&timer_st.next_wake_time.it_value);
+        let bytes_written = timer_st.timerfd.write(&buf_to_write)?;
+        if bytes_written < mem::size_of::<timespec>() {
+            return Err(Errno(EIO));
+        }
+
+        if timer_st.thread.is_null() {
+            timer_st.thread = match timer_st.evp.sigev_notify {
+                SIGEV_THREAD | SIGEV_SIGNAL => unsafe {
+                    pthread::create(None, timer_routine, timerid)?
+                },
+                SIGEV_NONE => ptr::null_mut(),
+                _ => {
+                    return Err(Errno(EINVAL));
+                }
+            };
+        }
+
+        Ok(())
+    }
+
+    fn umask(mask: mode_t) -> mode_t {
+        let new_effective_mask = mask & mode_t::from(MODE_PERM) & !S_ISVTX;
+        (redox_rt::sys::swap_umask(new_effective_mask as u32) as mode_t) & !S_ISVTX
+    }
+
+    fn uname(mut utsname: Out<utsname>) -> Result<(), Errno> {
+        let _siglock = tmp_disable_signals();
+        fn gethostname(mut name: Out<[u8]>) -> io::Result<()> {
+            if name.is_empty() {
+                return Ok(());
+            }
+
+            let mut file = File::open(c"/etc/hostname".into(), fcntl::O_RDONLY | fcntl::O_CLOEXEC)?;
+
+            let mut read = 0;
+            let name_len = name.len();
+            loop {
+                match file.read_out(name.subslice(read, name_len - 1))? {
+                    0 => break,
+                    n => read += n,
+                }
+            }
+            name.index(read).write(0);
+            Ok(())
+        }
+        out_project! {
+            let utsname {
+                nodename: [c_char; UTSLENGTH],
+                sysname: [c_char; UTSLENGTH],
+                release: [c_char; UTSLENGTH],
+                machine: [c_char; UTSLENGTH],
+                version: [c_char; UTSLENGTH],
+                domainname: [c_char; UTSLENGTH],
+            } = utsname;
+        }
+
+        match gethostname(nodename.as_slice_mut().cast_slice_to::<u8>()) {
+            Ok(()) => (),
+            Err(_) => return Err(Errno(EIO)),
+        }
+
+        let file_path = c"/scheme/sys/uname".into();
+        let Ok(mut file) = File::open(file_path, fcntl::O_RDONLY | fcntl::O_CLOEXEC) else {
+            return Err(Errno(EIO));
+        };
+        let mut lines = BufReader::new(&mut file).lines();
+
+        let mut read_line = |mut dst: Out<[u8]>| {
+            let Some(Ok(mut line)) = lines.next() else {
+                return Err(Errno(EIO));
+            };
+            line.push('\0');
+            let line_slice: &[u8] = line.as_bytes();
+            if line_slice.len() > UTSLENGTH {
+                return Err(Errno(EIO));
+            }
+
+            dst.copy_common_length_from_slice(line_slice);
+            Ok(())
+        };
+
+        // The file format is currently as follows:
+        // <sysname>\n e.g. "Redox"
+        // <release>\n e.g. "0.9.0"
+        // <machine>\n e.g. "x86_64"
+        // <version>\n e.g. "<commit hash of kernel>
+
+        // A future file format might add the domainname.
+
+        // nodename is handled above with /etc/hostname, and the domainname is
+        // currently zeroed out.
+
+        read_line(sysname.as_slice_mut().cast_slice_to::<u8>())?;
+        read_line(release.as_slice_mut().cast_slice_to::<u8>())?;
+        read_line(machine.as_slice_mut().cast_slice_to::<u8>())?;
+        read_line(version.as_slice_mut().cast_slice_to::<u8>())?;
+
+        // Redox doesn't provide domainname in uname scheme
+        //read_line(domainname.as_slice_mut().cast_slice_to::<u8>())?;
+        domainname.as_slice_mut().zero();
+
+        Ok(())
+    }
+
+    fn unlinkat(fd: c_int, path: CStr, flags: c_int) -> Result<()> {
+        let _siglock = tmp_disable_signals();
+        if (flags & !AT_REMOVEDIR) != 0 {
+            return Err(Errno(EINVAL));
+        }
+        let target = RedoxStr::new_from_c(path.to_cstr()).ok_or(Errno(EINVAL))?;
+        let target = openat2_path(fd, target, 0)?.to_standard();
+        let flags = flags.try_into().map_err(|_| Errno(EINVAL))?;
+        let r = redox_rt::sys::unlink(target.as_ref(), flags).map(|_| ());
+
+        if matches!(r, Err(Error { errno: EXDEV })) {
+            // slower path to make this work across scheme
+            let target: RedoxStr<'_> = target.into();
+            let (new_dfd, new_target) = path::resolve_open_to_dir(fd, &target)?;
+            let mut buf = [0; redox_path::PATH_MAX];
+            let target =
+                path::standard_fpath(new_dfd.as_raw_fd(), &mut buf)?.join_checked(new_target);
+            let r = redox_rt::sys::unlink(&target, flags).map(|_| ());
+            trace_log!(
+                "unlinkat ({fd}, {:?}, {:x}): [{}] {:?}",
+                path,
+                flags,
+                &target,
+                r
+            );
+            r?
+        } else {
+            trace_log!(
+                "unlinkat ({fd}, {:?}, {:x}): [{}] {:?}",
+                path,
+                flags,
+                &target,
+                r
+            );
+            r?
+        };
+
+        Ok(())
+    }
+
+    #[expect(clippy::unnecessary_literal_unwrap, reason = "res needs refactoring")]
+    fn waitpid(pid: pid_t, stat_loc: Option<Out<'_, c_int>>, options: c_int) -> Result<pid_t> {
+        let res = None;
+        let mut status = 0;
+
+        let options = usize::try_from(options)
+            .ok()
+            .and_then(WaitFlags::from_bits)
+            .ok_or(Errno(EINVAL))?;
+
+        let inner = |status: &mut usize, flags| {
+            redox_rt::sys::sys_waitpid(WaitpidTarget::from_posix_arg(pid as isize), status, flags)
+        };
+
+        // First, allow ptrace to handle waitpid
+        // TODO: Handle special PIDs here (such as -1)
+        let _state = ptrace::init_state();
+        // TODO: Fix ptrace deadlock seen during openposixtestsuite signals tests
+        // let mut sessions = state.sessions.lock();
+        // if let Ok(session) = ptrace::get_session(&mut sessions, pid) {
+        //     if !options.contains(WaitFlags::WNOHANG) {
+        //         let mut _event = PtraceEvent::default();
+        //         let _ = (&mut &session.tracer).read(&mut _event);
+
+        //         res = Some(inner(
+        //             &mut status,
+        //             options | WaitFlags::WNOHANG | WaitFlags::WUNTRACED,
+        //         ));
+        //         if res == Some(Ok(0)) {
+        //             // WNOHANG, just pretend ptrace SIGSTOP:ped this
+        //             status = (redox_rt::protocol::SIGSTOP << 8) | 0x7f;
+        //             assert!(wifstopped(status));
+        //             assert_eq!(wstopsig(status), redox_rt::protocol::SIGSTOP);
+        //             res = Some(Ok(pid as usize));
+        //         }
+        //     }
+        // }
+
+        // If ptrace didn't impact this waitpid, proceed *almost* as
+        // normal: We still need to add WUNTRACED, but we only return
+        // it if (and only if) a ptrace traceme was activated during
+        // the wait.
+        let res = res.unwrap_or_else(|| {
+            loop {
+                let res = inner(&mut status, options | WaitFlags::WUNTRACED);
+
+                // TODO: Also handle special PIDs here
+                if !wifstopped(status)
+                    || options.contains(WaitFlags::WUNTRACED)
+                    || ptrace::is_traceme(pid)
+                {
+                    break res;
+                }
+            }
+        });
+
+        // If stat_loc is non-null, set that and the return
+        if let Some(mut stat_loc) = stat_loc {
+            stat_loc.write(status as c_int);
+        }
+
+        Ok(res? as pid_t)
+    }
+
+    fn write(fd: c_int, buf: &[u8]) -> Result<usize> {
+        let fd = usize::try_from(fd).map_err(|_| Errno(EBADFD))?;
+        Ok(redox_rt::sys::posix_write(fd, buf)?)
+    }
+    fn pwrite(fd: c_int, buf: &[u8], offset: off_t) -> Result<usize> {
+        unsafe {
+            Ok(syscall::syscall5(
+                syscall::SYS_WRITE2,
+                fd as usize,
+                buf.as_ptr() as usize,
+                buf.len(),
+                offset as usize,
+                !0,
+            )?)
+        }
+    }
+
+    unsafe fn writev(fildes: c_int, iov: *const iovec, iovcnt: c_int) -> Result<usize> {
+        let iovs = unsafe {
+            slice::from_raw_parts(iov, usize::try_from(iovcnt).expect("iovcnt is positive"))
+        };
+        let vec = unsafe { gather(iovs) };
+
+        Self::write(fildes, &vec)
+    }
+
+    fn verify() -> bool {
+        // YIELD on Redox is 20, which is SYS_ARCH_PRCTL on Linux
+        (unsafe { syscall::syscall5(syscall::number::SYS_YIELD, !0, !0, !0, !0, !0) }).is_ok()
+    }
+
+    unsafe fn exit_thread(stack_base: *mut (), stack_size: usize) -> ! {
+        unsafe { redox_rt::thread::exit_this_thread(stack_base, stack_size) }
+    }
+}
+
+impl Sys {
+    #[expect(unused_variables, reason = "unfinished implementation")]
+    fn relative_to_absolute_foffset(
+        fd: usize,
+        whence: c_short,
+        start: off_t,
+        len: off_t,
+    ) -> Result<(off_t, off_t)> {
+        // let file_off = Self::lseek(fd, 0, SEEK_SET)?;
+        match i32::from(whence) {
+            SEEK_SET => {
+                let (start, len) = if len < 0 {
+                    (start + len, -len)
+                } else {
+                    (start, len)
+                };
+
+                if start < 0 {
+                    return Err(Errno(EINVAL));
+                }
+
+                assert!(len >= 0);
+                Ok((start, len))
+            }
+            // FIXME: andypython: SEEK_CUR, SEEK_END
+            _ => {
+                log::warn!(
+                    "Sys::relative_to_absolute_foffset: whence={whence} not yet implemented"
+                );
+                Ok((0, 0))
+            }
+        }
+    }
+}

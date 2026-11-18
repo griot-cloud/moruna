@@ -215,6 +215,23 @@ pub(crate) fn release_current() {
     }
 }
 
+/// Frees a thread's block once nothing uses it: the C library's (item 5.2b), whose joinable
+/// thread ends with its block kept, since its `pthread_t` lies in it, and whose join or detach
+/// frees it then. The calling thread's own is freed as [`release_current`] frees it.
+///
+/// # Safety
+///
+/// `control` is null or a block the thread path made and installed, for a thread that has
+/// ended or is the caller, which reads none of its thread-locals after.
+pub unsafe fn release(control: *mut Control) {
+    if control == current() {
+        release_current();
+    } else if !control.is_null() {
+        // SAFETY: the caller's contract: a block of a thread that ended, freed once.
+        unsafe { free(control) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -342,6 +359,38 @@ mod tests {
             assert!(install_main());
             assert!(!current().is_null());
             release_current();
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// The C library's joinable thread ends with its block kept, and its join frees it.
+    #[test]
+    fn a_block_kept_past_its_threads_end_is_freed_by_another() {
+        let kept = std::thread::spawn(|| {
+            let block = Block::new(&os::template()).unwrap();
+            let control = block.control();
+            block.install();
+            // The thread ends without releasing it.
+            control as usize
+        })
+        .join()
+        .unwrap();
+        std::thread::spawn(move || {
+            let control = kept as *mut Control;
+            // SAFETY: the block of a thread that ended, which nothing uses.
+            unsafe {
+                assert_eq!((*control).tcb_ptr, control);
+                release(control);
+                release(ptr::null_mut());
+            }
+            // The caller's own goes as at its end.
+            let block = Block::new(&os::template()).unwrap();
+            let control = block.control();
+            block.install();
+            // SAFETY: the caller's own block; it reads no thread-local after.
+            unsafe { release(control) };
+            assert!(current().is_null());
         })
         .join()
         .unwrap();

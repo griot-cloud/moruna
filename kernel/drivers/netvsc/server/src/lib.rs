@@ -205,6 +205,11 @@ impl<C: Channel, S: Shared> Driver<C, S> {
                 return;
             }
             self.poll();
+            if let Some(entries) = self.card.take_table() {
+                self.lines.push(format!(
+                    "netvsc: send indirection table of {entries} entries ignored: one channel is served"
+                ));
+            }
             self.server.delivered();
             if self.server.failed.is_some() {
                 return;

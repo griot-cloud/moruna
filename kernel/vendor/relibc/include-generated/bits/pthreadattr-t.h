@@ -1,0 +1,12 @@
+#ifndef _RELIBC_BITS_PTHREADATTR_T_H
+#define _RELIBC_BITS_PTHREADATTR_T_H
+
+/**
+ * Used to identify a thread attribute object.
+ */
+typedef union pthread_attr_t {
+  unsigned char __relibc_internal_size[32];
+  size_t __relibc_internal_align;
+} pthread_attr_t;
+
+#endif  /* _RELIBC_BITS_PTHREADATTR_T_H */

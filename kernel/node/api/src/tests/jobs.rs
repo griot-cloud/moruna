@@ -18,7 +18,7 @@ use node_protocol::{Refusal, admission::Error as Refused};
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 /// An 8 GiB node's job bound (the cloud profile's, item 3.2).
-const BOUND: u64 = 6_580 * MIB;
+const BOUND: u64 = 6_564 * MIB;
 
 /// The function cache's size node config gives (item 3.6).
 const CACHE: u64 = 256 * MIB;
@@ -156,7 +156,7 @@ fn the_engine_s_configurations_are_its_supervisor_s() {
         [
             ("linux", &Source::Personality),
             ("engine", &Source::Channel("engine".into())),
-            ("network", &Source::Service("network".into())),
+            ("network", &Source::Channel("network".into())),
             ("functions", &Source::Functions("functions".into())),
             // A job that uses a function: the process resource a native one starts from.
             ("process", &Source::Process("process".into())),

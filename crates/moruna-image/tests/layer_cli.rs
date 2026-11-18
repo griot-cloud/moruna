@@ -37,6 +37,8 @@ fn usage_is_refused_with_exit_two() {
         &["convert"][..],
         &["derive", "a", "b", "c", "d", "e"][..],
         &["nope", "x"][..],
+        &["pack", "dir"][..],
+        &["pack", "dir", "out", "more"][..],
     ] {
         let out = layer(args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
@@ -151,6 +153,58 @@ fn derive_adds_a_layer_and_prints_the_new_manifest_digest() {
     ]);
     assert!(converted.status.success(), "{}", text(&converted.stderr));
     assert_eq!(text(&converted.stdout).lines().count(), 2);
+}
+
+/// `pack` writes a directory's tree as one layer, the one `moruna volume pack` writes: what
+/// the cloud image's engine layer is packed with on any machine (item 3.2).
+#[test]
+fn pack_writes_a_tree_as_one_new_layer() {
+    use moruna_image::layerfile::{self, Item};
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = Scratch::new("layer-cli");
+    let tree = scratch.path().join("tree");
+    std::fs::create_dir_all(tree.join("moruna/bin")).unwrap();
+    std::fs::create_dir_all(tree.join("tmp")).unwrap();
+    std::fs::write(tree.join("moruna/bin/moruna"), b"\x7fELF engine").unwrap();
+    std::fs::set_permissions(
+        tree.join("moruna/bin/moruna"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let out = scratch.path().join("engine.layer");
+    let packed = layer(&["pack", tree.to_str().unwrap(), out.to_str().unwrap()]);
+    assert!(packed.status.success(), "{}", text(&packed.stderr));
+    let said = text(&packed.stdout);
+    assert!(
+        said.starts_with(&format!("{}: a layer of ", out.display())) && said.contains(", seal "),
+        "{said}"
+    );
+    // The same tree packed by the library, as `moruna volume pack` packs it, is the same layer.
+    let again = scratch.path().join("again.layer");
+    let library = layerfile::pack(&tree, &again).unwrap();
+    assert!(said.contains(&library.id.to_string()), "{said}");
+    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&again).unwrap());
+    let read = layerfile::read(std::slice::from_ref(&out)).unwrap();
+    assert_eq!(
+        read.get("/moruna/bin/moruna"),
+        Some(&Item::File(0o755, b"\x7fELF engine".to_vec()))
+    );
+    // A file already there is refused and left as it was; so is a tree that is not a directory.
+    let refused = layer(&["pack", tree.to_str().unwrap(), out.to_str().unwrap()]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        text(&refused.stderr).contains("exists; a layer is written to a new file"),
+        "{}",
+        text(&refused.stderr)
+    );
+    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&again).unwrap());
+    let file = tree.join("moruna/bin/moruna");
+    let other = scratch.path().join("other.layer");
+    let not_dir = layer(&["pack", file.to_str().unwrap(), other.to_str().unwrap()]);
+    assert_eq!(not_dir.status.code(), Some(1));
+    assert!(text(&not_dir.stderr).contains("is not a directory"));
+    assert!(!other.exists());
 }
 
 #[test]
