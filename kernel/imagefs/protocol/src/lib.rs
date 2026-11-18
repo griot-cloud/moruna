@@ -816,7 +816,7 @@ mod account_protocol_version_tests {
     fn kb5_previous_unaccounted_major_is_refused_before_requests() {
         use moruna_svc::protocol::{ProtocolId, Refusal};
         let current = super::imagefs::ID;
-        assert_eq!((current.major, current.minor), (3, 0));
+        assert_eq!((current.major, current.minor), (3, 1));
         let old = ProtocolId::new(current.name, 2, 0);
         assert_eq!(current.accepts(&old.hello()), Err(Refusal::MajorMismatch));
         assert_eq!(old.accepts(&current.hello()), Err(Refusal::MajorMismatch));
@@ -830,5 +830,35 @@ mod account_protocol_version_tests {
             Err(Refusal::MajorMismatch)
         );
         assert_eq!(current.accepts(&current.hello()), Ok(()));
+        // 3.1 (item 3.6) adds `attach`: a 3.0 peer is still one of the same major.
+        let three_zero = ProtocolId::new(current.name, 3, 0);
+        assert_eq!(current.accepts(&three_zero.hello()), Ok(()));
+    }
+
+    #[test]
+    fn an_attached_layer_crosses_the_wire_as_it_was_sent() {
+        use moruna_svc::{Decoder, Encoder, Wire};
+        let layers = alloc::vec![
+            super::Attached {
+                offset: 4096,
+                pages: 3,
+                seal: super::Bytes(alloc::vec![7; 32]),
+            },
+            super::Attached {
+                offset: 4 * 4096,
+                pages: 1,
+                seal: super::Bytes(alloc::vec![9; 32]),
+            },
+        ];
+        let mut e = Encoder::new();
+        layers.clone().encode(&mut e).unwrap();
+        let bytes = e.into_control_bytes().unwrap();
+        let mut d = Decoder::new(&bytes, &mut []);
+        assert_eq!(
+            alloc::vec::Vec::<super::Attached>::decode(&mut d).unwrap(),
+            layers
+        );
+        assert_eq!(d.finish(), Ok(()));
+        assert!(super::imagefs::REQUESTS.contains(&19));
     }
 }

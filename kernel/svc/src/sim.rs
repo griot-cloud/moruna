@@ -13,13 +13,16 @@
 //!
 //! Channel handles carry the channel's full rights. Memory objects additionally
 //! model shared backing, subset rights and mapping bounds. Numeric handle values,
-//! real kernel quota charging and DMA are not modeled. Explicit Account objects
-//! model only immutable charged-owner identity and rights, never native proof; inert
-//! handles exist only for wrong-object tests.
+//! the kernel's enforcement of an account's limit and DMA are not modeled. Explicit
+//! Account objects model charged-owner identity and rights, and count what is charged
+//! to them: a memory object created in an account is charged its whole pages until its
+//! last handle closes, which `Account::usage` reports as the kernel's `account_info`
+//! does. That is never native proof; inert handles exist only for wrong-object tests.
 
 extern crate std;
 
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::{
     sync::{Condvar, Mutex, MutexGuard, OnceLock},
     time::Instant,
@@ -103,10 +106,33 @@ impl Drop for Endpoint {
     }
 }
 
-struct AccountIdentity;
+/// An account: its limit, and what memory objects created in it hold now and held at most.
+struct AccountIdentity {
+    limit: u64,
+    used: AtomicU64,
+    peak: AtomicU64,
+}
+
+impl AccountIdentity {
+    fn charge(&self, bytes: u64) {
+        let used = self.used.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        self.peak.fetch_max(used, Ordering::Relaxed);
+    }
+}
+
 struct MemoryState {
     bytes: Mutex<Vec<u8>>,
     owner: Option<Arc<AccountIdentity>>,
+}
+
+/// A memory object's last handle closed: its account is charged its pages no longer.
+impl Drop for MemoryState {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.owner {
+            let size = self.bytes.get_mut().map_or(0, |b| b.len()) as u64;
+            owner.used.fetch_sub(size, Ordering::Relaxed);
+        }
+    }
 }
 enum Object {
     Endpoint(Arc<Endpoint>),
@@ -407,9 +433,30 @@ impl Account {
             return Err(Error::InvalidArgs);
         }
         Ok(Self(Handle(Object::Account(
-            Arc::new(AccountIdentity),
+            Arc::new(AccountIdentity {
+                limit,
+                used: AtomicU64::new(0),
+                peak: AtomicU64::new(0),
+            }),
             Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
         ))))
+    }
+
+    /// Its figures, as `moruna_sys::Account::usage` reads them: its limit, what the memory
+    /// objects created in it hold now and held at most at once. Its handle needs `READ`.
+    pub fn usage(&self) -> Result<Usage> {
+        let Object::Account(account, rights) = &self.0.0 else {
+            return Err(Error::WrongType);
+        };
+        if !rights.contains(Rights::READ) {
+            return Err(Error::AccessDenied);
+        }
+        Ok(Usage {
+            limit: account.limit,
+            used: account.used.load(Ordering::Relaxed),
+            peak: account.peak.load(Ordering::Relaxed),
+            reserved: 0,
+        })
     }
     pub fn matches(&self, other: &Handle) -> Result<bool> {
         let Object::Account(account, rights) = &self.0.0 else {
@@ -426,6 +473,29 @@ impl Account {
                 .is_some_and(|owner| Arc::ptr_eq(account, owner))),
             _ => Err(Error::WrongType),
         }
+    }
+}
+
+/// An account's figures (host model of `moruna_sys::Usage`). No account is carved out of
+/// another here, so none is reserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Usage {
+    /// Its limit.
+    pub limit: u64,
+    /// Charged to it now.
+    pub used: u64,
+    /// The most ever charged to it at once.
+    pub peak: u64,
+    /// Held for the accounts carved out of it: none here.
+    pub reserved: u64,
+}
+
+impl Usage {
+    /// What may still be charged to it.
+    pub fn room(&self) -> u64 {
+        self.limit
+            .saturating_sub(self.used)
+            .saturating_sub(self.reserved)
     }
 }
 
@@ -464,6 +534,9 @@ impl Memory {
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(size).map_err(|_| Error::NoMemory)?;
         bytes.resize(size, 0);
+        if let Some(owner) = &owner {
+            owner.charge(size as u64);
+        }
         Ok(Self(Handle(Object::Memory(
             Arc::new(MemoryState {
                 bytes: Mutex::new(bytes),
@@ -560,5 +633,41 @@ mod account_memory_model_tests {
             Memory::create_in(4096, &readonly),
             Err(Error::AccessDenied)
         ));
+    }
+
+    #[test]
+    fn an_account_is_charged_its_memory_objects_pages_until_their_last_handle_closes() {
+        let account = Account::carve(8 << 20, "charged").unwrap();
+        let fresh = account.usage().unwrap();
+        assert_eq!(
+            (fresh.limit, fresh.used, fresh.peak, fresh.reserved),
+            (8 << 20, 0, 0, 0)
+        );
+        assert_eq!(fresh.room(), 8 << 20);
+        // Whole pages, however few bytes were asked for.
+        let one = Memory::create_in(10, &account.0).unwrap();
+        let two = Memory::create_in(3 * 4096, &account.0).unwrap();
+        assert_eq!(account.usage().unwrap().used, 4 * 4096);
+        // Another account's objects, and unowned ones, are not this one's.
+        let other = Account::carve(4096, "other").unwrap();
+        let theirs = Memory::create_in(4096, &other.0).unwrap();
+        let unowned = Memory::create(4096).unwrap();
+        assert_eq!(account.usage().unwrap().used, 4 * 4096);
+        assert_eq!(other.usage().unwrap().used, 4096);
+        // A duplicate keeps the object, and its charge, until it closes too.
+        let loan = two.0.duplicate(Rights::READ | Rights::MAP).unwrap();
+        drop(two);
+        assert_eq!(account.usage().unwrap().used, 4 * 4096);
+        drop(loan);
+        let after = account.usage().unwrap();
+        assert_eq!((after.used, after.peak), (4096, 4 * 4096));
+        assert_eq!(after.room(), (8 << 20) - 4096);
+        drop((one, theirs, unowned));
+        assert_eq!(account.usage().unwrap().used, 0);
+        // Reading the figures needs READ; only an account has them.
+        let write_only = Account(account.0.duplicate(Rights::WRITE).unwrap());
+        assert_eq!(write_only.usage(), Err(Error::AccessDenied));
+        let memory = Account(Memory::create(4096).unwrap().0);
+        assert_eq!(memory.usage(), Err(Error::WrongType));
     }
 }
