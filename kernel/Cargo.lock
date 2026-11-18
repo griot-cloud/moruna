@@ -895,6 +895,7 @@ dependencies = [
  "moruna-handles",
  "moruna-loader",
  "moruna-quota",
+ "moruna-sched",
  "osdk-frame-allocator",
  "ostd",
 ]
@@ -1124,6 +1125,10 @@ dependencies = [
  "rustc-std-workspace-alloc",
  "rustc-std-workspace-core",
 ]
+
+[[package]]
+name = "moruna-sched"
+version = "0.1.0"
 
 [[package]]
 name = "moruna-storage-format"

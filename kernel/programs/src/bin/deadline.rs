@@ -2,8 +2,9 @@
 //! nothing satisfies ends at its deadline with timed out.
 //!
 //! The tolerance is the scheduler's, not the clock's: the timer fires on the 1 ms tick, and
-//! the woken thread then waits its turn behind the runnable threads on its CPU, each for up
-//! to a 10 ms slice. Under KVM the bound is 50 ms. Under QEMU's TCG every instruction is
+//! the woken thread then takes its CPU once the running thread has run 500 us, behind any
+//! thread woken before it (SDD 20 f.11; before item 1.11e it waited its turn behind every
+//! runnable thread on its CPU, each for up to a 10 ms slice). Under KVM the bound is 50 ms. Under QEMU's TCG every instruction is
 //! emulated, so the work ahead of the waiter takes longer, and the bound is the KVM one times
 //! the emulation factor SDD 20 k measured. Either bound is far below the waiter's own 5 s
 //! deadline, so a lost wake still fails: that wait ends `TimedOut`, not `SIGNALED`.

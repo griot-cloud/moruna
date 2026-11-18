@@ -1,18 +1,31 @@
 //! The scheduler (SDD 20, f.11): one run queue per CPU, an idle task per CPU, and a
-//! time slice, injected into OSTD before any task runs.
+//! time slice, injected into OSTD before any task runs. Its policy is `moruna-sched`'s,
+//! tested on the host; this is its adapter to OSTD: a [`moruna_sched::Queue`] per CPU
+//! under that CPU's lock, the kernel's clock passed in, and each answer turned into
+//! OSTD's calls.
 //!
 //! OSTD's default scheduler queues every task on the boot processor, so a kernel that
 //! wants its other CPUs must bring its own. This one places a new task on the CPU with
 //! the fewest runnable tasks, preferring the current one on a tie; retains that CPU
 //! across waits and wakes. OSTD dequeues a parking task before its old context has
 //! finished switching out, so migrating it at that point could select a task still
-//! in the foreground on another CPU. New tasks still spread across all CPUs. It runs each
-//! CPU's queue first in, first out; preempts a task that has run for a
-//! slice while another waits on its CPU; and gives each CPU an idle task that halts
-//! until an interrupt, so a CPU with nothing to run sleeps instead of spinning. A wake
-//! that queues a task on a CPU running its idle task asks that CPU to reschedule. A
-//! CPU's boot context is never preempted (the boot processor's runs the whole boot);
-//! it moves to a task when it yields at the end of its entry.
+//! in the foreground on another CPU. New tasks still spread across all CPUs. Each CPU
+//! runs the tasks woken from a wait before the ones a slice or a wake preempted and the
+//! new ones, at most [`moruna_sched::WOKEN_IN_A_ROW`] woken in a row while another waits;
+//! preempts a task that has run for a slice while another waits on its CPU; and gives
+//! each CPU an idle task that halts until an interrupt, so a CPU with nothing to run
+//! sleeps instead of spinning. A CPU's boot context is never preempted (the boot
+//! processor's runs the whole boot); it moves to a task when it yields at the end of its
+//! entry.
+//!
+//! A wake (item 1.11e) takes the CPU from the running task once that task has run
+//! [`moruna_sched::WAKE_MIN_NS`] since it was picked, on every CPU, the boot processor's
+//! included: the wake asks the CPU to reschedule at once (OSTD's inter-processor
+//! interrupt, then its preemption check on the way back to user mode); a task that has
+//! run less gives way at the first tick past the minimum. A wake onto a CPU running its
+//! idle task asks it to reschedule, as before. A woken thread used to wait out the rest
+//! of the running thread's 10 ms slice, on the boot processor always and elsewhere
+//! whenever its CPU had a second runnable thread.
 //!
 //! It also records which CPUs ran process threads (the post-schedule hook calls
 //! [`ran_process_thread`]), so a boot can show the processes ran across every CPU.
@@ -25,21 +38,22 @@
 //! places it as it places a new thread.
 //!
 //! A CPU other than the boot processor that runs one thread, or none, stretches its tick
-//! to [`STRETCH`] timer periods (C5, measured: each tick costs a pinned CPU about 19 us
-//! under KVM): nothing on it needs the tick then, since only the boot processor's tick
-//! serves the deadline queue. A thread queued on a stretched CPU asks it to reschedule
-//! at once, which brings its tick back to every period. Grace periods do not wait for
-//! the tick: a CPU passes a quiescent state each time it goes back to user mode and each
-//! time its idle task wakes (OSTD, `ostd-adaptation/NOTICE.md`).
+//! to [`moruna_sched::STRETCH`] timer periods (C5, measured: each tick costs a pinned CPU
+//! about 19 us under KVM): nothing on it needs the tick then, since only the boot
+//! processor's tick serves the deadline queue. A thread queued on a stretched CPU asks it
+//! to reschedule at once, which brings its tick back to every period. Grace periods do
+//! not wait for the tick: a CPU passes a quiescent state each time it goes back to user
+//! mode and each time its idle task wakes (OSTD, `ostd-adaptation/NOTICE.md`).
 
 use alloc::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     sync::{Arc, Weak},
     vec::Vec,
 };
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use moruna_abi::Error;
+use moruna_sched::Queue;
 use ostd::{
     cpu::{CpuId, PinCurrentCpu, num_cpus},
     sync::{LocalIrqDisabled, SpinLock, Waiter},
@@ -54,15 +68,6 @@ use ostd::{
 };
 
 use crate::process::Thread;
-
-/// Timer ticks (1 ms each) a task runs before another task waiting on its CPU may
-/// take the CPU from it.
-const SLICE_TICKS: u32 = 10;
-
-/// The timer periods (1 ms each) a CPU waits between ticks while it runs one thread or
-/// none: what bounds a grace period, and a thread's wait for a stretched CPU that is in
-/// user mode with no other way into the kernel.
-const STRETCH: u32 = 100;
 
 /// The most CPUs whose use [`ran_process_thread`] records.
 pub const CPUS_MAX: usize = 64;
@@ -86,93 +91,62 @@ static PINS: SpinLock<BTreeMap<u64, (Weak<Thread>, Place)>, LocalIrqDisabled> =
 /// How many pins wait, read without the lock by every enqueue.
 static PENDING: AtomicUsize = AtomicUsize::new(0);
 
+/// One CPU's run queue: the policy's queue, and its count of runnable tasks published.
 struct RunQueue {
-    current: Option<Arc<Task>>,
-    queue: VecDeque<Arc<Task>>,
-    idle: Arc<Task>,
-    ticks: u32,
+    queue: Queue<Task>,
     /// Runnable tasks on this CPU other than its idle task, read without the lock by
     /// [`Cpus::select`].
     load: Arc<AtomicUsize>,
-    /// The boot processor, which never stretches its tick: it serves the deadline queue.
-    boot: bool,
-    /// Whether this CPU's tick is stretched now.
-    stretched: bool,
 }
 
 impl RunQueue {
-    fn is_idle(&self, task: &Arc<Task>) -> bool {
-        Arc::ptr_eq(task, &self.idle)
-    }
-
-    /// Whether `task` is this CPU's current task or waits in its queue.
-    fn holds(&self, task: &Arc<Task>) -> bool {
-        self.current.as_ref().is_some_and(|c| Arc::ptr_eq(c, task))
-            || self.queue.iter().any(|queued| Arc::ptr_eq(queued, task))
-    }
-
     fn publish(&self) {
-        let busy = self.current.as_ref().is_some_and(|c| !self.is_idle(c));
-        self.load
-            .store(self.queue.len() + usize::from(busy), Ordering::Relaxed);
+        self.load.store(self.queue.load(), Ordering::Relaxed);
     }
 
     /// Stretches this CPU's tick while nothing waits on it, and brings it back when
     /// something does. Called on the CPU itself, with its queue's lock held.
     fn retick(&mut self) {
-        let stretch = !self.boot && self.current.is_some() && self.queue.is_empty();
-        if stretch != self.stretched {
-            self.stretched = stretch;
-            ostd::timer::set_tick_stretch(if stretch { STRETCH } else { 1 });
+        if let Some(periods) = self.queue.retick() {
+            ostd::timer::set_tick_stretch(periods);
         }
     }
 }
 
 impl LocalRunQueue for RunQueue {
     fn current(&self) -> Option<&Arc<Task>> {
-        self.current.as_ref()
+        self.queue.current()
     }
 
     fn update_current(&mut self, flags: UpdateFlags) -> bool {
-        let waiting = !self.queue.is_empty();
         match flags {
             // The boot context (no current task) is never preempted: it leaves for a
             // task only when it yields, once the boot is done.
             UpdateFlags::Tick => {
-                self.ticks = self.ticks.saturating_add(1);
+                let preempt = self.queue.tick(crate::clock::now());
                 self.retick();
-                match &self.current {
-                    None => false,
-                    Some(c) => waiting && (self.is_idle(c) || self.ticks >= SLICE_TICKS),
-                }
+                preempt
             }
-            // The current task is leaving its CPU: the next one is the head of the
-            // queue, or the idle task.
+            // The current task is leaving its CPU: the next one is the policy's, or the
+            // idle task.
             UpdateFlags::Wait | UpdateFlags::Exit => true,
             // A yield from the boot context (no current task) moves to a task.
-            UpdateFlags::Yield => waiting || self.current.is_none(),
+            UpdateFlags::Yield => self.queue.yield_now(),
         }
     }
 
     fn try_pick_next(&mut self) -> Option<&Arc<Task>> {
-        let next = match self.queue.pop_front() {
-            Some(task) => task,
-            None if self.current.is_none() => self.idle.clone(),
-            None => return None,
-        };
-        self.ticks = 0;
-        if let Some(previous) = self.current.replace(next)
-            && !self.is_idle(&previous)
-        {
-            self.queue.push_back(previous);
-        }
+        // OSTD asks after a tick or a request to reschedule (the policy decides whether
+        // the running task gives way), and after a yield, a wait or an exit (it does).
+        let switched = self.queue.pick(crate::clock::now());
         self.publish();
+        // A refusal still brings the tick back: a woken task waits for the minimum.
         self.retick();
-        self.current.as_ref()
+        if switched { self.queue.current() } else { None }
     }
 
     fn dequeue_current(&mut self) -> Option<Arc<Task>> {
-        let current = self.current.take();
+        let current = self.queue.leave();
         // Preserve the task's assigned CPU even while it is absent from the
         // runnable queue. OSTD has not switched away from this context yet;
         // publishing cpu=None here would permit a concurrent wake to migrate
@@ -189,26 +163,15 @@ struct Cpus {
 }
 
 impl Cpus {
-    /// Where a task that names no CPU goes: a woken one to this CPU if at most its
-    /// waker is runnable here, else (and a new one always) the CPU with the fewest
-    /// runnable tasks, this one on a tie.
+    /// Where a task that names no CPU goes ([`moruna_sched::select`]).
     fn select(&self, flags: EnqueueFlags) -> CpuId {
         let here = disable_preempt().current_cpu();
-        let count = self.loads.len();
-        let start = here.as_usize();
-        if flags == EnqueueFlags::Wake && self.loads[start].load(Ordering::Relaxed) <= 1 {
-            return here;
-        }
-        let mut best = start;
-        let mut best_load = self.loads[start].load(Ordering::Relaxed);
-        for step in 1..count {
-            let cpu = (start + step) % count;
-            let load = self.loads[cpu].load(Ordering::Relaxed);
-            if load < best_load {
-                best = cpu;
-                best_load = load;
-            }
-        }
+        let best = moruna_sched::select(
+            here.as_usize(),
+            self.loads.len(),
+            flags == EnqueueFlags::Wake,
+            |cpu| self.loads[cpu].load(Ordering::Relaxed),
+        );
         CpuId::try_from(best).unwrap_or(here)
     }
 }
@@ -230,7 +193,7 @@ impl Cpus {
         // Under its old queue's lock, so no enqueue queues it there meanwhile: one that
         // read the old CPU finds it changed once it has the lock, and retries.
         let rq = self.queues[old.as_usize()].disable_irq().lock();
-        if rq.holds(task) {
+        if rq.queue.holds(task) {
             return false;
         }
         match place {
@@ -264,16 +227,16 @@ impl Scheduler for Cpus {
                 break (target, rq);
             }
         };
-        if rq.holds(&runnable) {
+        if rq.queue.holds(&runnable) {
             return None;
         }
-        // A CPU running its idle task, or one with its tick stretched, is asked to
-        // reschedule; one still in its boot context takes the task when it yields.
-        let idle = rq.current.as_ref().is_some_and(|c| rq.is_idle(c));
-        let kick = idle || rq.stretched;
-        rq.queue.push_back(runnable);
+        // The policy says whether the CPU is asked to reschedule: one running its idle
+        // task or with its tick stretched, and one whose task has run the minimum when
+        // this is a wake; one still in its boot context takes the task when it yields.
+        let woken = flags == EnqueueFlags::Wake;
+        let ask = rq.queue.push(runnable, woken, crate::clock::now());
         rq.publish();
-        kick.then_some(target)
+        ask.then_some(target)
     }
 
     fn local_rq_with(&self, f: &mut dyn FnMut(&dyn LocalRunQueue)) {
@@ -318,13 +281,8 @@ pub fn init() -> Result<(), &'static str> {
         let load = Arc::new(AtomicUsize::new(0));
         loads.push(load.clone());
         queues.push(SpinLock::new(RunQueue {
-            current: None,
-            queue: VecDeque::new(),
-            idle: Arc::new(task),
-            ticks: 0,
+            queue: Queue::new(Arc::new(task), cpu == 0),
             load,
-            boot: cpu == 0,
-            stretched: false,
         }));
     }
     let cpus: &'static Cpus =
