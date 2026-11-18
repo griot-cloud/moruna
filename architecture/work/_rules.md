@@ -20,7 +20,8 @@
   first. When it is empty, write your name there while you wait, and clear it once you hold a slot.
   Poll every 30 s. A third slot, `~/.mac-build-lock-3`, is for commit hooks alone (a commit's
   clippy run, minutes at most): take it only around `git commit`, never for a build or a test run.
-- Host tests of single crates (`cargo test -p …`, `cargo llvm-cov -p …`) don't need the lock. Run
+- Host tests of single crates (`cargo test -p …`, `cargo llvm-cov -p …`) don't need the VM lock,
+  but like every cargo build or test on the Mac they take a Mac slot (above). Run
   every cargo command with `-j 2`, and tests with `RUST_TEST_THREADS=2`: up to nine agents and a
   boot share this Mac's 10 cores and 16 GB.
 - An item with booted checks is done in two phases: everything that needs no boot first, then a
