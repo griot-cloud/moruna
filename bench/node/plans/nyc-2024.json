@@ -1,7 +1,7 @@
 {
  "plan": 1,
  "name": "nyc-2024",
- "notes": "System design 6B's first jobs: the four NYC taxi jobs on 2024 (41.2M rows), every engine of 6A, the median of 5 runs. The files are bench/vm/normalize.py's (one schema, 1M-row row groups). The Linux engines' memory is the machine's 16 GiB less 2 GiB for the OS, as bench/vm/gate_plan.py's d4 machine keeps 2 GiB.",
+ "notes": "System design 6B's first jobs: the four NYC taxi jobs on 2024 (41,169,720 rows), every engine of 6A and the native-expression rows (DuckDB SQL for Enrich and Occupancy, Polars expressions for Enrich), the median of 5 runs, the learning run and the noise pairs kept (the PM, 2026-11-18). The files are bench/vm/normalize.py's (one schema, 1M-row row groups). Every engine reads and writes the run's Blob container with its own reader. Memory is what each platform leaves on the same machine: 14 GiB for the Linux engines (16 GiB less 2 for the OS, as gate_plan.py's d4 machine keeps 2), the node's memory less 768 MiB for Moruna.",
  "dataset": {
   "name": "nyc-yellow-2024",
   "source_dir": "~/moruna-data/nyc/norm",
@@ -10,15 +10,17 @@
    "yellow_tripdata_2024-04.parquet", "yellow_tripdata_2024-05.parquet", "yellow_tripdata_2024-06.parquet",
    "yellow_tripdata_2024-07.parquet", "yellow_tripdata_2024-08.parquet", "yellow_tripdata_2024-09.parquet",
    "yellow_tripdata_2024-10.parquet", "yellow_tripdata_2024-11.parquet", "yellow_tripdata_2024-12.parquet"
-  ]
+  ],
+  "rows": 41169720
  },
  "jobs": ["score", "occupancy", "enrich", "audit"],
- "engines": ["moruna-node", "moruna066", "moruna066-rust", "rust-pool", "duckdb", "polars", "ray", "spark", "dask"],
+ "engines": ["moruna-node", "moruna066", "moruna066-rust", "rust-pool", "duckdb", "duckdb-sql", "polars", "polars-expr",
+             "ray", "spark", "dask"],
  "repeats": 5,
  "learning_run": true,
  "noise_pairs": 2,
  "machine": {"size": "Standard_D4s_v4", "zone": "3", "cpus": 4, "mem_gib": 14,
              "image": "Canonical:ubuntu-24_04-lts:server:latest", "os_disk_gib": 128},
- "linux_data": "local-copy",
+ "linux_data": "blob",
  "timeout_s": 1800
 }

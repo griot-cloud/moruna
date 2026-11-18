@@ -46,24 +46,32 @@ def test_the_nyc_plan_expands_in_interleaved_order():
     p = nyc_plan()
     runs = plans.runs(p)
     ids = [r["id"] for r in runs]
-    assert len(ids) == len(set(ids)) == 4 * (9 + 9 * 5 + 4)
+    # 9 engines on Score and Audit, 10 on Occupancy (DuckDB SQL), 11 on Enrich (and Polars
+    # expressions): a learning run and 5 repeats each, and 4 noise runs a job.
+    assert len(ids) == len(set(ids)) == (9 + 10 + 11 + 9) * 6 + 4 * 4
     score = [r for r in runs if r["job"] == "score"]
+    plain = [e for e in p["engines"] if e not in ("duckdb-sql", "polars-expr")]
     assert [r["engine"] for r in score if r["repeat"] == 0][0] == plans.REFERENCE
-    assert [r["engine"] for r in score if r["repeat"] == 1] == p["engines"]
-    assert [r["engine"] for r in score if r["repeat"] == 2] == p["engines"][::-1]
+    assert [r["engine"] for r in score if r["repeat"] == 1] == plain
+    assert [r["engine"] for r in score if r["repeat"] == 2] == plain[::-1]
+    enrich = [r["engine"] for r in runs if r["job"] == "enrich" and r["repeat"] == 1]
+    occupancy = [r["engine"] for r in runs if r["job"] == "occupancy" and r["repeat"] == 1]
+    assert enrich == p["engines"] and "duckdb-sql" in occupancy and "polars-expr" not in occupancy
     assert sum(1 for r in score if r.get("noise")) == 4
     first = next(r for r in score if r["engine"] == "moruna066" and r["repeat"] == 0)
     assert first["fresh_profiles"] and first["profiles"] == "/data/profiles/score-moruna066"
     assert not next(r for r in score if r["engine"] == "moruna066" and r["repeat"] == 1).get("fresh_profiles")
-    assert all(r["cpus"] == 4 and r["mem_gib"] == 14 for r in runs)
-    assert runs[0]["files"][0] == "/data/nyc/yellow_tripdata_2024-01.parquet" and len(runs[0]["files"]) == 12
+    assert all(r["cpus"] == 4 and r["mem_gib"] == 14 and r["data"] == "blob" for r in runs)
+    assert runs[0]["inputs"][0] == "nyc/yellow_tripdata_2024-01.parquet" and len(runs[0]["inputs"]) == 12
+    assert runs[0]["output"] == f"out/{runs[0]['id']}"
     assert {r["where"] for r in runs if r["engine"] == "moruna-node"} == {"node"}
 
 
 def test_the_month_plan():
     p = plans.load(plans.default_plan_path("nyc-month-mac"))
     runs = plans.runs(p)
-    assert [r["engine"] for r in runs] == p["engines"] and all(r["repeat"] == 1 for r in runs)
+    assert all(r["repeat"] == 1 for r in runs)
+    assert [r["engine"] for r in runs if r["job"] == "enrich"] == p["engines"]
 
 
 @pytest.mark.parametrize("change,message", [
@@ -82,7 +90,7 @@ def test_the_month_plan():
     (lambda p: p.update(noise_pairs=-1), "noise_pairs"),
     (lambda p: p["machine"].update(cpus=0), "machine"),
     (lambda p: p.update(machine=[]), "an object"),
-    (lambda p: p.update(linux_data="blob"), "linux_data"),
+    (lambda p: p.update(linux_data="nfs"), "linux_data"),
 ])
 def test_a_bad_plan_is_refused(change, message):
     p = nyc_plan()
@@ -175,6 +183,11 @@ def test_the_dry_run_lists_every_command_and_creates_nothing(tmp_path):
     assert sum(" POST https://<node-address>/v1/jobs " in line for line in steps) == len(node)
     assert sum("/v1/functions" in line for line in steps) == 4
     assert any("setup-linux.sh" in a for a in azs) and any("--make-reference /data/ref/score.dump" in a for a in azs)
+    # Every engine reads and writes the one container; the key reaches the machine redacted here.
+    assert all("'BENCH_KEY=<storage-key>'" in a and "BENCH_CONTAINER=data" in a for a in measured)
+    assert sum("blob upload -c data -n nyc/yellow_tripdata_2024-" in a for a in azs) == 12
+    assert any('"url":"https://mrnb202611180900.blob.core.windows.net/data/out/score-moruna-node-r1/"' in line
+               for line in steps)
     assert not (tmp_path / "results").exists()
 
 
@@ -211,7 +224,7 @@ class FakeNode:
                                     "tasks": [{"role": "source", "busy_ms": 1000}, {"role": "function", "busy_ms": 4000,
                                                "input_wait_ms": 10, "output_wait_ms": 20},
                                               {"role": "sink", "busy_ms": 500}]}).encode()
-        return 200, json.dumps({"state": "completed", "times": {"started": 100.0, "ended": 104.0}}).encode()
+        return 200, json.dumps({"state": "completed", "times": {"accepted": 101.0, "ended": 104.0}}).encode()
 
 
 class Fake(run.DryRun):
@@ -239,13 +252,17 @@ class Fake(run.DryRun):
         if "group exists" in text:
             return "false"
         if "setup-linux.sh" in text:
-            return 'SETUP {"copy_bytes": 10, "copy_s": 1.5}'
+            return 'SETUP {"installed": {"duckdb": true}, "wheel_066": "built", "wheel_066_s": 1800}'
         if "measure.py run" in text:
+            assert "BENCH_KEY=KEY" in text and "BENCH_ACCOUNT=mrnb202611180900" in text
             rid = text.split("--id ")[1].split()[0]
             spec = next(r for r in plans.runs(nyc_plan(), run.DATA) if r["id"] == rid)
             fast = {"moruna066": 9.0, "moruna066-rust": 6.0, "rust-pool": 4.5}.get(spec["engine"], 12.0)
+            copy = {"data": "local copy", "copy_in_s": 2.0, "copy_out_s": 1.0} if spec["engine"] == "rust-pool" else \
+                {"data": "blob"}
             rec = {"spec": spec, "ok": True, "startup_s": 0.5, "operational_s": fast, "cpu_s": 30.0,
-                   "peak_bytes": 2 << 30, "output_check": {"ok": True, "hash_all": True, "verdict": "bit for bit"}}
+                   "peak_bytes": 2 << 30, "memory_gib": spec["mem_gib"], **copy,
+                   "output_check": {"ok": True, "hash_all": True, "verdict": "bit for bit"}}
             os.makedirs(os.path.join(self.results, "results"), exist_ok=True)
             json.dump(rec, open(os.path.join(self.results, "results", f"{rid}.json"), "w"))
             return "MEASURED " + json.dumps({"id": rid, "ok": True, "output": "bit for bit"})
@@ -296,18 +313,25 @@ def test_a_whole_run_against_fakes(tmp_path):
     assert ("POST", "/v1/jobs", "t-submit") in x.node.calls and ("GET", "/v1/node", "t-observe") in x.node.calls
     assert ("POST", "/v1/functions", "t-admin") in x.node.calls
     node_rec = json.load(open(tmp_path / "node" / "score-moruna-node-r1.json"))
-    # 4 s from start to end, the first rows at 1 s: 3 s of operational time; the boot is start-up.
+    # Accepted at 101 s, the output written at 104 s by the node's clock: 3 s of operational time;
+    # the boot is start-up; the node's memory less 768 MiB is what it was given.
     assert (node_rec["operational_s"], node_rec["startup_s"], node_rec["ok"]) == (3.0, 2.14, True)
+    assert node_rec["operational_by"] == "the node's clock" and node_rec["marks"]["first_rows_s"] == 1.0
+    assert node_rec["memory_gib"] == 15.25 and node_rec["data"] == "blob"
     assert node_rec["split"]["function_s"] == 4.0 and node_rec["output_check"]["ok"]
     s = x.summary["jobs"]["score"]["engines"]
     assert s["moruna-node"]["operational_s"] == 3.0 and s["moruna-node"]["runs"] == 5
     assert s["duckdb"]["operational_s"] == 12.0 and s["duckdb"]["output"] == "bit for bit"
+    assert "duckdb-sql" not in s and "duckdb-sql" in x.summary["jobs"]["enrich"]["engines"]
+    table_text = open(tmp_path / "table.md").read()
+    assert "| Moruna 0.7, the node | rust | 3.0 | 2.14 | 20.0 | 3.00 | 15.25 | blob |" in table_text
+    assert "| the plain Rust pool | rust | 4.5 | 0.50 | 30.0 | 2.00 | 14.00 | local copy, 3.0 s apart |" in table_text
     log = open(tmp_path / "benchmark-log.md").read()
     assert log.startswith("# The benchmark log") and "## 202611180900: plan nyc-2024" in log
     # 3.0 s against the Rust pool's 4.5 s is 1.5x: the bar's time holds; its CPU (20 s) is the least.
     assert "**PASS** no regression" in log and "**PASS** the bar: 1.50x" in log
     assert "#### Miss" not in log
-    assert json.load(open(tmp_path / "setup.json"))["copy_s"] == 1.5
+    assert json.load(open(tmp_path / "setup.json"))["wheel_066"] == "built"
 
 
 def test_the_group_is_deleted_when_a_step_fails(tmp_path):
@@ -403,7 +427,7 @@ def test_the_table_and_its_verdicts():
             rec("moruna066-rust", 1, 6.0), rec("duckdb", 1, 3.5, cpu=12.0)]
     s = summary_of(recs)
     text = table.render(s)
-    assert "| Moruna 0.7, the node | rust | 2.0 | 0.40 | 10.0 | 1.00 | 2.0 | 5.0 | 1.0 | 0.5 | bit for bit | 1/1 |" in text
+    assert "| Moruna 0.7, the node | rust | 2.0 | 0.40 | 10.0 | 1.00 |  |  | 2.0 | 5.0 | 1.0 | 0.5 | bit for bit | 1/1 |" in text
     assert "**PASS** no regression" in text
     # DuckDB's 3.5 s is 1.75x Moruna's 2.0 s, and Moruna's CPU is the least: the bar holds.
     assert "**PASS** the bar: 1.75x" in text
@@ -594,34 +618,108 @@ def reference_json(tmp_path):
     return ref
 
 
-@pytest.mark.parametrize("engine", ["duckdb", "polars"])
-def test_engine_py_gives_the_python_functions_rows(tmp_path, engine):
-    pytest.importorskip(engine)
+@pytest.mark.parametrize("engine,job", [("duckdb", "score"), ("polars", "score"), ("duckdb-sql", "enrich"),
+                                        ("polars-expr", "enrich"), ("duckdb-sql", "occupancy")])
+def test_engine_py_gives_the_python_functions_rows(tmp_path, monkeypatch, engine, job):
+    pytest.importorskip(engine.split("-")[0])
+    for k in ("BENCH_ACCOUNT", "BENCH_KEY", "BENCH_CONTAINER", "BENCH_ENDPOINT"):
+        monkeypatch.delenv(k, raising=False)
     import canon
     import engine as eng
     src = fixture_parquet(tmp_path)
     flist = tmp_path / "files"
     flist.write_text(str(src))
     out = tmp_path / "out"
-    assert eng.main(["--engine", engine, "--workload", "score", "--files", str(flist), "--out", str(out), "--cpus", "2",
+    assert eng.main(["--engine", engine, "--workload", job, "--inputs", str(flist), "--out", str(out), "--cpus", "2",
                      "--mem-gib", "1", "--tmp", str(tmp_path / "tmp")]) == 0
-    c = canon.canonical("score", canon.read_output([str(out)]))
-    want = json.load(open(os.path.join(FIX, "manifest.json")))["jobs"]["score"]["main"]
+    c = canon.canonical(job, canon.read_output([str(out)]))
+    want = json.load(open(os.path.join(FIX, "manifest.json")))["jobs"][job]["main"]
     assert (c["rows"], c["hash_exact"]) == (want["rows"], want["hash_exact"])
     # predicted_tip is NumPy's on this machine: the oracle's to within Score's tolerance.
-    ref = canon.canonical("score", ipc.open_file(os.path.join(FIX, "score", "main.expected.arrow")).read_all())
-    assert canon.compare("score", ref, c)["ok"]
+    ref = canon.canonical(job, ipc.open_file(os.path.join(FIX, job, "main.expected.arrow")).read_all())
+    assert canon.compare(job, ref, c)["ok"]
 
 
-def test_engine_py_reports_a_failed_run(tmp_path, capsys):
+def test_engine_py_reports_a_failed_run(tmp_path, capsys, monkeypatch):
     pytest.importorskip("duckdb")
+    monkeypatch.delenv("BENCH_ACCOUNT", raising=False)
     import engine as eng
     flist = tmp_path / "files"
     flist.write_text(str(tmp_path / "missing.parquet"))
-    assert eng.main(["--engine", "duckdb", "--workload", "score", "--files", str(flist), "--out", str(tmp_path / "o"),
+    assert eng.main(["--engine", "duckdb", "--workload", "score", "--inputs", str(flist), "--out", str(tmp_path / "o"),
                      "--cpus", "1", "--mem-gib", "1", "--tmp", str(tmp_path / "t")]) == 1
     res = json.loads(capsys.readouterr().out.split("RESULT ", 1)[1])
-    assert res["error"] and res["marks"]["main"] and res["settings"]["threads"] == 1
+    assert res["error"] and res["marks"]["main"] and res["settings"]["threads"] == 1 and res["data"] == "local"
+    assert eng.main(["--engine", "polars-expr", "--workload", "score", "--inputs", str(flist), "--out",
+                     str(tmp_path / "o2"), "--cpus", "1", "--mem-gib", "1", "--tmp", str(tmp_path / "t")]) == 1
+    assert "no native form of score" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("job", ["score", "occupancy", "enrich", "audit"])
+def test_sparks_output_schemas_are_the_python_functions(job):
+    """Spark is told each job's output schema; it must be the Python function's own (the gate's
+    fixtures are its output), Enrich's timestamps included."""
+    import engine as eng
+    schema = ipc.open_file(os.path.join(FIX, job, "main.expected.arrow")).schema
+    assert eng.spark_ddl(schema) == eng.SPARK_SCHEMA[job]
+    with pytest.raises(TypeError):
+        eng.spark_ddl(pa.schema([("d", pa.date32())]))
+    assert eng.spark_ddl(pa.schema([("t", pa.timestamp("us", tz="UTC")), ("i", pa.int32())])) == "t timestamp, i int"
+
+
+def test_the_store_names_each_engines_blobs():
+    import store as stores
+    azure_store = stores.Store("acct", "KEY", "data")
+    assert azure_store.blob_endpoint == "https://acct.blob.core.windows.net"
+    assert azure_store.az("nyc/f.parquet") == "az://data/nyc/f.parquet"
+    assert azure_store.abfs("out/x") == "abfs://data/out/x" and azure_store.path("out/x") == "data/out/x"
+    assert azure_store.wasbs("nyc/f") == "wasbs://data@acct.blob.core.windows.net/nyc/f"
+    assert azure_store.moruna_storage() == {"account": "acct", "access_key": "KEY"} and azure_store.moruna_env() == {}
+    assert azure_store.polars_options() == {"account_name": "acct", "account_key": "KEY"}
+    assert azure_store.adlfs_options() == {"account_name": "acct", "account_key": "KEY"}
+    assert azure_store.spark_conf() == {"spark.hadoop.fs.azure.account.key.acct.blob.core.windows.net": "KEY"}
+    assert "AccountKey=KEY;BlobEndpoint=https://acct.blob.core.windows.net;" in azure_store.duckdb_secret()
+    local = stores.Store(stores.AZURITE_ACCOUNT, stores.AZURITE_KEY, "data", "http://127.0.0.1:10000/devstoreaccount1")
+    assert local.moruna_storage()["allow_http"] and local.moruna_env() == {"AZURE_STORAGE_USE_EMULATOR": "true"}
+    assert local.polars_options()["use_emulator"] == "true" and "connection_string" in local.adlfs_options()
+    assert local.connection_string().startswith("DefaultEndpointsProtocol=http;")
+    assert stores.Store.from_env(local.env()) == local and stores.Store.from_env({}) is None
+    assert "BENCH_ENDPOINT" not in azure_store.env()
+
+
+AZURITE = os.environ.get("BENCH_AZURITE", "")
+
+
+@pytest.mark.skipif(not AZURITE, reason="BENCH_AZURITE names a running Azurite's blob endpoint")
+@pytest.mark.parametrize("engine,job", [("duckdb", "score"), ("polars", "score"), ("duckdb-sql", "enrich"),
+                                        ("polars-expr", "enrich"), ("rust-pool", "score"), ("dask", "score"),
+                                        ("moruna066", "score"), ("moruna066-rust", "score")])
+def test_engines_read_and_write_blob(tmp_path, monkeypatch, engine, job):
+    """Against Azurite: the engine reads its input from the container and writes its output there,
+    and its rows are the Python function's. BENCH_ENGINES names install.py's root."""
+    import canon
+    import store as stores
+    root = os.environ["BENCH_ENGINES"]
+    store = stores.Store(stores.AZURITE_ACCOUNT, stores.AZURITE_KEY, "test", AZURITE)
+    store.create()
+    store.upload(str(fixture_parquet(tmp_path)), "nyc/in.parquet")
+    for k, v in store.env().items():
+        monkeypatch.setenv(k, v)
+    spec = {"id": f"{job}-{engine}-azurite", "job": job, "workload": job, "engine": engine, "repeat": 1, "cpus": 2,
+            "mem_gib": 2, "files": [], "inputs": ["nyc/in.parquet"], "output": f"out/{job}-{engine}-{os.getpid()}"}
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    ref = tmp_path / "ref.json"
+    json.dump(canon.canonical(job, ipc.open_file(os.path.join(FIX, job, "main.expected.arrow")).read_all()), open(ref, "w"))
+    rc = measure.main(["run", "--spec", str(tmp_path / "spec.json"), "--root", root, "--results", str(tmp_path / "r"),
+                       "--work", str(tmp_path / "w"), "--reference-json", str(ref)])
+    r = json.load(open(tmp_path / "r" / f"{spec['id']}.json"))
+    assert r["data"] == ("local copy" if engine == "rust-pool" else "blob")
+    if engine == "dask":
+        # Dask's pandas round trip makes an integer column with a null a float column: the
+        # fixtures have such nulls (2024's integer columns have none), so only the rows compare.
+        assert r["ok"] and r["output_check"]["rows"], r
+    else:
+        assert rc == 0 and r["output_check"]["ok"], r
 
 
 def test_measure_runs_and_checks_against_a_reference(tmp_path, monkeypatch):
@@ -677,7 +775,7 @@ def test_measure_compares_within_the_tolerance_and_finds_a_difference(tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
     assert measure.canonical("score", str(empty), "/none") == {"error": "no output files"}
-    assert canon.SPECS["score"]["tolerant"]["predicted_tip"] == (1e-6, 0.0)
+    assert canon.SPECS["score"]["tolerant"]["predicted_tip"] == (1.1e-6, 0.0)  # gate-canon's (canon.rs)
 
 
 @pytest.mark.skipif(not os.environ.get("GATE_CANON"), reason="GATE_CANON names a built gate-canon")
@@ -699,6 +797,66 @@ def test_measure_with_gate_canon_dumps(tmp_path):
     assert c["ok"] and c["verdict"] == "bit for bit"
 
 
+NYC = os.path.expanduser(os.environ.get("BENCH_NYC", "~/moruna-data/nyc"))
+
+
+@pytest.mark.skipif(not (os.environ.get("GATE_CANON") and os.path.isdir(os.path.join(NYC, "out066"))),
+                    reason="GATE_CANON and 0.6.6's January outputs (references.py --keep-output) under BENCH_NYC")
+@pytest.mark.parametrize("job", ["score", "occupancy", "enrich", "audit"])
+def test_canon_py_and_gate_canon_agree_on_the_january_references(job):
+    """gate-canon governs; canon.py must give the same canonical form of 0.6.6's January outputs,
+    and both must be the references written from them."""
+    import canon
+    out = os.path.join(NYC, "out066", f"{job}-2024-01")
+    ref = json.load(open(os.path.join(NYC, f"reference-{job}-2024-01.json")))
+    p = subprocess.run([os.environ["GATE_CANON"], "digest", job, out], capture_output=True, text=True, check=True)
+    g = json.loads(p.stdout)
+    c = canon.canonical(job, canon.read_output([out]))
+    for k in ("rows", "hash_exact", "hash_all"):
+        assert c[k] == g[k] == ref[k], k
+    assert canon.compare(job, ref, c)["ok"]
+
+
+@pytest.mark.skipif(not os.environ.get("GATE_CANON"), reason="GATE_CANON names a built gate-canon")
+def test_references_from_a_stand_in_066(tmp_path, monkeypatch, capsys):
+    """references.py's path with a stand-in for 0.6.6 that writes the gate's expected output: a
+    month by canon.py and gate-canon together, an existing reference compared and kept, the year
+    with its tolerant rows in a dump."""
+    import types
+    import references
+    fake = types.ModuleType("moruna")
+    fake.__version__ = "0.6.6"
+    fake.ParquetSource = fake.ParquetSink = lambda x: x
+    fake.function = lambda fn: fn
+
+    def run_(source, fns, sink, **kw):
+        job = fns[0].__name__
+        os.makedirs(sink)
+        pq.write_table(ipc.open_file(os.path.join(FIX, job, "main.expected.arrow")).read_all(), f"{sink}/p.parquet")
+        return types.SimpleNamespace(to_dict=lambda: {"exit": "completed"})
+    fake.run = run_
+    monkeypatch.setitem(sys.modules, "moruna", fake)
+    data = tmp_path / "data"
+    (data / "norm").mkdir(parents=True)
+    for m in ("01", "02"):
+        (data / "norm" / f"yellow_tripdata_2099-{m}.parquet").write_text("x")
+    args = ["--data", str(data), "--gate-canon", os.environ["GATE_CANON"], "--work", str(tmp_path / "w"),
+            "--jobs", "score,enrich"]
+    assert references.main(args + ["--period", "2099-01", "--keep-output", str(tmp_path / "keep")]) == 0
+    ref = json.load(open(data / "reference-score-2099-01.json"))
+    assert ref["canon"] == "canon.py and gate-canon agree" and len(ref["tolerant_rows"]) == ref["rows"] == 4000
+    assert ref["schema"][-1] == "predicted_tip:double" and (tmp_path / "keep" / "enrich-2099-01").is_dir()
+    capsys.readouterr()
+    assert references.main(args + ["--period", "2099-01"]) == 0
+    again = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert all(r["written"] is None and r["same_as_existing"] for r in again) and again[0]["tolerant_within"]
+    assert references.main(args + ["--period", "2099"]) == 0
+    year = json.load(open(data / "reference-score-2099.json"))
+    assert year["canon"] == "gate-canon" and (data / year["dump"]).exists() and "tolerant_rows" not in year
+    with pytest.raises(SystemExit):
+        references.main(args + ["--period", "1999"])
+
+
 def test_measure_commands_and_phases():
     spec = {"id": "x", "engine": "rust-pool", "workload": "score", "cpus": 4, "mem_gib": 14}
     cmd = measure.command(spec, "/eng", "/out", "/list", "/tmp", "/r")
@@ -709,49 +867,81 @@ def test_measure_commands_and_phases():
         measure.command(dict(spec, engine="nope"), "/e", "/o", "/l", "/t", "/r")
     env = measure.environment(dict(spec, env={"X": "1"}), "/tmp")
     assert env["OPENBLAS_NUM_THREADS"] == "1" and env["POLARS_MAX_THREADS"] == "4" and env["X"] == "1"
-    marks = {"main": 10.2, "imported": 11.0, "ready": 12.0, "done": 20.0}
+    marks = {"main": 10.2, "imported": 11.0, "ready": 12.0, "start": 12.5, "done": 20.0}
     ph = measure.phases({"marks": marks}, 10.0, 21.0)
-    assert (ph["startup_s"], ph["operational_s"], ph["imports_s"], ph["session_s"], ph["shutdown_s"]) == (2.0, 8.0, 0.8, 1.0, 1.0)
+    # The session is start-up; operational time starts when the job is handed over.
+    assert (ph["startup_s"], ph["operational_s"], ph["imports_s"], ph["session_s"], ph["handover_s"],
+            ph["shutdown_s"]) == (2.5, 7.5, 0.8, 1.0, 0.5, 1.0)
+    assert py[py.index("--inputs") + 1] == "/l" and py[py.index("--root") + 1] == "/eng"
     assert measure.phases({"engine": "rust-pool", "wall_s": 3.0}, 0.0, 3.25) == {"startup_s": 0.25, "operational_s": 3.0}
     assert measure.phases(None, 0, 1) == {"startup_s": None, "operational_s": None}
     assert measure.verdict({"error": "e"}).startswith("not compared")
 
 
-def test_measure_fetches_the_nodes_output_from_blob(tmp_path):
-    """Blob's List Blobs answer, two pages, and each blob: from a local HTTP server."""
-    import threading
-    import urllib.parse
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-    pages = {"": ("<EnumerationResults><Blobs><Blob><Name>node/x/a.parquet</Name></Blob></Blobs>"
-                  "<NextMarker>m2</NextMarker></EnumerationResults>"),
-             "m2": ("<EnumerationResults><Blobs><Blob><Name>node/x/sub/b.parquet</Name></Blob></Blobs>"
-                    "<NextMarker/></EnumerationResults>")}
-    seen = []
+class LocalStore:
+    """A store whose container is a local directory: store.py's own transfers, on pyarrow's local
+    filesystem instead of Azure's."""
 
-    class H(BaseHTTPRequestHandler):
-        def do_GET(self):
-            u = urllib.parse.urlsplit(self.path)
-            q = dict(urllib.parse.parse_qsl(u.query))
-            seen.append((u.path, q.get("sig")))
-            body = pages[q.get("marker", "")].encode() if q.get("comp") == "list" else u.path.encode()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+    def __new__(cls, root):
+        import pyarrow.fs as pafs
+        import store as stores
 
-        def log_message(self, *a):
-            pass
+        class S(stores.Store):
+            def pyarrow_fs(self):
+                return pafs.SubTreeFileSystem(str(root), pafs.LocalFileSystem())
+        s = S("acct", "KEY", "data")
+        os.makedirs(root / "data", exist_ok=True)
+        return s
 
-    srv = HTTPServer(("127.0.0.1", 0), H)
-    th = threading.Thread(target=srv.serve_forever)
-    th.start()
-    try:
-        names = measure.fetch(f"http://127.0.0.1:{srv.server_address[1]}", "results", "node/x/", "sig=s", str(tmp_path))
-    finally:
-        srv.shutdown()
-        th.join()
-    assert names == ["node/x/a.parquet", "node/x/sub/b.parquet"] and all(s == "s" for _, s in seen)
-    assert (tmp_path / "sub" / "b.parquet").read_text() == "/results/node/x/sub/b.parquet"
+
+def stand_in(src, to_blob):
+    """An engine that writes the fixture's expected output, to the store's container (as an
+    engine with a Blob reader does) or to its local output directory."""
+    target = "os.environ['BLOBROOT'] + '/data/' + out" if to_blob else "out"
+    return ("import os, sys, time, json, pyarrow.ipc as i, pyarrow.parquet as pq\n"
+            "t0 = time.time(); out = sys.argv[1]; d = " + target + "\nos.makedirs(d, exist_ok=True)\n"
+            f"pq.write_table(i.open_file({src!r}).read_all(), d + '/part.parquet')\n"
+            "print('RESULT ' + json.dumps({'engine': 'x', 'marks': {'main': t0, 'ready': t0, 'start': t0, "
+            "'done': time.time()}}))\n")
+
+
+@pytest.mark.parametrize("engine", ["duckdb", "rust-pool"])
+def test_measure_with_a_store(tmp_path, monkeypatch, engine):
+    """With a store, an engine with a Blob reader is given blob names and fetched from Blob for the
+    check; the Rust pool gets a local copy each way, timed apart."""
+    import store as stores
+    blob = tmp_path / "blob"
+    st = LocalStore(blob)
+    src = os.path.join(FIX, "score", "main.expected.arrow")
+    st.upload(str(fixture_parquet(tmp_path)), "nyc/in.parquet")
+    monkeypatch.setattr(stores.Store, "from_env", classmethod(lambda cls, env=None: st))
+    monkeypatch.setenv("BLOBROOT", str(blob))
+    seen = {}
+
+    def command(spec, root, out, flist, tmp, report):
+        seen["out"], seen["inputs"] = out, open(flist).read().split()
+        return [sys.executable, "-c", stand_in(src, engine != "rust-pool"), out]
+    monkeypatch.setattr(measure, "command", command)
+    spec = {"id": f"score-{engine}-r1", "engine": engine, "workload": "score", "files": [], "cpus": 1, "mem_gib": 1,
+            "inputs": ["nyc/in.parquet"], "output": f"out/score-{engine}-r1", "env": {"BLOBROOT": str(blob)}}
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    assert measure.main(["run", "--spec", str(tmp_path / "spec.json"), "--root", str(tmp_path / "eng"), "--results",
+                         str(tmp_path / "r"), "--work", str(tmp_path / "w"),
+                         "--reference-json", str(reference_json(tmp_path))]) == 0
+    r = json.load(open(tmp_path / "r" / f"score-{engine}-r1.json"))
+    assert r["ok"] and r["output_check"]["verdict"] == "bit for bit" and r["memory_gib"] == 1
+    assert (blob / "data" / "out" / f"score-{engine}-r1" / "part.parquet").exists()
+    if engine == "rust-pool":
+        assert r["data"] == "local copy" and r["copy_in_s"] >= 0 and r["copy_out_s"] >= 0
+        assert seen["inputs"][0].endswith("in/score-rust-pool-r1/in.parquet") and seen["out"].startswith(str(tmp_path))
+    else:
+        assert r["data"] == "blob" and "fetch_s" in r
+        assert (seen["inputs"], seen["out"]) == (["nyc/in.parquet"], "out/score-duckdb-r1")
+    # The node's output, checked from the container.
+    assert measure.main(["check", "--workload", "score", "--out", str(tmp_path / "nodeout"), "--id", "n1", "--root",
+                         str(tmp_path / "eng"), "--results", str(tmp_path / "r"), "--blob-prefix",
+                         f"out/score-{engine}-r1", "--reference-json", str(reference_json(tmp_path))]) == 0
+    assert st.download("nyc/in.parquet", str(tmp_path / "again")) > 0
 
 
 def test_measure_kills_a_run_at_its_timeout(tmp_path):
@@ -814,19 +1004,27 @@ def test_install_runs_commands_and_reads_versions(tmp_path):
 
 def test_local_runs_the_linux_runs_here(tmp_path, monkeypatch):
     p = small_plan()
-    seen = []
+    p["linux_data"] = "local"
+    seen, refs = [], []
+    (tmp_path / "ref-score.json").write_text("{}")
 
     def fake_run(cmd, **kw):
         spec = json.load(open(cmd[cmd.index("--spec") + 1]))
         seen.append(spec)
+        refs.append(cmd[cmd.index("--reference-json") + 1] if "--reference-json" in cmd else None)
         return subprocess.CompletedProcess(cmd, 0, 'MEASURED {"id": "%s"}\n' % spec["id"], "")
 
     monkeypatch.setattr(run.subprocess, "run", fake_run)
 
     class A:
-        results, engines_root, reference_json = str(tmp_path / "r"), str(tmp_path / "e"), "~/ref.json"
+        results, engines_root, store_endpoint = str(tmp_path / "r"), str(tmp_path / "e"), ""
+        reference_json = str(tmp_path / "ref-{job}.json")
     out = io.StringIO()
     assert run.local(p, A, out) == 0
     assert [s["engine"] for s in seen if s["repeat"] == 1] == ["moruna066", "moruna066-rust", "duckdb"]
     assert "not run here" in out.getvalue() and seen[0]["files"][0].endswith("yellow_tripdata_2024-01.parquet")
     assert seen[0]["profiles"].startswith(str(tmp_path / "r" / "work"))
+    assert set(refs) == {str(tmp_path / "ref-score.json")}
+    p["linux_data"] = "blob"
+    with pytest.raises(SystemExit, match="store-endpoint"):
+        run.local(p, A, out)

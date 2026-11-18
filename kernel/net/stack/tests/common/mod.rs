@@ -14,7 +14,7 @@ use std::{
     thread,
 };
 
-use moruna_netstack::{Card, Shared, Stack, after_turn, factory, parse};
+use moruna_netstack::{Card, Grant, Shared, Stack, after_turn, granted, parse};
 use moruna_svc::{Channel, Dispatcher, Turn, now};
 use smoltcp::wire::{
     DhcpMessageType, DhcpPacket, DhcpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
@@ -142,7 +142,7 @@ pub fn serve_until(
     for (slot, policy) in &config.grants {
         let (o, t) = Channel::create().expect("a channel");
         ours.insert(slot.clone(), o);
-        theirs.push((t, policy.clone()));
+        theirs.push((t, Grant::new(slot.clone(), policy.clone())));
     }
     let cards: Vec<Card> = macs
         .iter()
@@ -161,8 +161,8 @@ pub fn serve_until(
         }
         let shared = Shared::new(stack);
         let mut d = Dispatcher::new();
-        for (listener, policy) in theirs {
-            d.listen(listener, factory(Rc::clone(&shared), policy))
+        for (listener, grant) in theirs {
+            d.listen(listener, granted(Rc::clone(&shared), grant))
                 .expect("listen");
         }
         loop {

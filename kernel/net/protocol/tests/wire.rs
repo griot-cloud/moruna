@@ -52,6 +52,10 @@ fn kn_t1_values_round_trip() {
             last: 443,
         }],
         sockets: 9,
+        rx: Some(65536),
+        tx: Some(4096),
+        per_peer: Some(8),
+        linger_ms: Some(5000),
     };
     round(policy.clone());
     round(Target::Endpoint(Endpoint::new(a4, 80)));
@@ -120,6 +124,7 @@ fn caller_owned_ingress_major_explicitly_refuses_legacy_payload_protocol() {
         netstack_protocol::net::ID.accepts(&hello),
         Err(moruna_svc::Refusal::MajorMismatch)
     );
+    // 3.1 (work item 1.3b): a policy's bounds on memory; 3.2 (item 3.4): the name rule `*`.
     assert_eq!(netstack_protocol::net::ID.major, 3);
     assert_eq!(netstack_protocol::net::ID.minor, 2);
 }

@@ -36,9 +36,9 @@ use core::cell::RefCell;
 
 use devices_protocol::directory;
 use moruna_netstack::{
-    Card, Config, Shared, Stack, after_turn,
+    Card, Config, Grant, Shared, Stack, after_turn,
     boot::{NO_LEASE, fatal},
-    factory, parse,
+    granted, parse,
 };
 use moruna_svc::{
     CallError, Channel, ClientCore, ClockPage, Completions, Console, DEADLINE_INFINITE, Decoder,
@@ -401,12 +401,13 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
             return Err(format!("grant {slot} names a slot the boot did not give"));
         }
     }
-    let mut granted = Vec::new();
+    // Each slot's grant, its listener taken once the server has started.
+    let mut pending = Vec::new();
     for slot in slots {
         let Some((_, policy)) = config.grants.iter().find(|(s, _)| *s == slot) else {
             return Err(format!("slot {slot} has no grant"));
         };
-        granted.push((slot, policy.clone()));
+        pending.push((slot.clone(), Grant::new(slot, policy.clone())));
     }
     let (mut links, cards) = if config.interfaces.is_empty() {
         (Vec::new(), Vec::new())
@@ -461,16 +462,16 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
     // ends holding none, so its clients see it go when its process ends, after its fatal
     // line, and the console names the cause first (system design 1B).
     let mut listeners = Vec::new();
-    for (slot, policy) in granted {
+    for (slot, grant) in pending {
         let channel = start::take(&slot)
             .map(Channel)
             .ok_or_else(|| format!("slot {slot} was taken"))?;
-        listeners.push((channel, policy));
+        listeners.push((channel, grant));
     }
     let shared = Shared::new(stack);
     let mut d = moruna_svc::Dispatcher::new();
-    for (channel, policy) in listeners {
-        d.listen(channel, factory(shared.clone(), policy))
+    for (channel, grant) in listeners {
+        d.listen(channel, granted(shared.clone(), grant))
             .map_err(|e| format!("listening: {}", e.name()))?;
     }
     let watches: Vec<Handle> = links
@@ -505,6 +506,10 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
         }
         // The boot's lines, exactly as the stack wrote them.
         for line in core::mem::take(&mut shared.stack.borrow_mut().boot) {
+            println!(out, "{}", line);
+        }
+        // A grant at its bound, at most once a minute a grant (work item 1.3b).
+        for line in core::mem::take(&mut shared.stack.borrow_mut().bounds) {
             println!(out, "{}", line);
         }
         if shared.stack.borrow().lease_overdue(started, now()) {

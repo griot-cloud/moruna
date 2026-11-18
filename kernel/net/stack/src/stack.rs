@@ -19,13 +19,14 @@
 use alloc::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     format,
+    rc::Rc,
     string::String,
     vec,
     vec::Vec,
 };
 use core::net::{IpAddr, Ipv6Addr};
 
-use moruna_svc::{Context, Outcome, Pending, ProtocolError};
+use moruna_svc::{Context, Handle, Outcome, Pending, ProtocolError, Signals};
 use netstack_protocol::{
     Addr, BACKLOG_MAX, Cidr, Endpoint, Info, Interface as IfaceInfo, Opened, PING_MAX, Policy,
     RECEIVE_MAX, SEND_MAX, SocketState, SocketStatus, Target, net, normalise_name, rights,
@@ -44,6 +45,7 @@ use crate::{
     boot::{LEASE_WITHIN_NS, network_line},
     config::{Config, Congestion, Settings},
     device::Port,
+    grant::Grant,
 };
 
 /// The first port a connect or a port-0 listener may be given (RFC 6335).
@@ -214,6 +216,18 @@ struct Tcp {
     shut: bool,
     established: bool,
     saw_fin: bool,
+    /// The remote address a connection a listener took counts against, under its
+    /// grant's bound per peer; none for a connect.
+    peer: Option<Addr>,
+}
+
+/// A connection a listener took a SYN for, not yet established: its socket, the peer
+/// it counts against, and when its handshake must be done (`handshake-timeout-ms`).
+#[derive(Clone, Copy)]
+struct Half {
+    handle: SocketHandle,
+    peer: Addr,
+    deadline: u64,
 }
 
 struct Listener {
@@ -223,9 +237,9 @@ struct Listener {
     /// The one socket listening, when there is room for another connection.
     listening: Option<SocketHandle>,
     /// Sockets that took a SYN and are not yet established.
-    half: Vec<SocketHandle>,
-    /// Established, waiting for an accept.
-    queue: VecDeque<SocketHandle>,
+    half: Vec<Half>,
+    /// Established, waiting for an accept, each with its peer.
+    queue: VecDeque<(SocketHandle, Addr)>,
     accept: Option<Pending>,
 }
 
@@ -252,20 +266,20 @@ struct ServerContext {
     expires: u64,
 }
 struct Conn {
-    policy: Policy,
+    /// The grant of the listener the connection came through: its policy, and the
+    /// bound its sockets count against with every other connection's through it.
+    grant: Rc<Grant>,
     account: Option<moruna_svc::Account>,
     identities: BTreeMap<u32, ServerContext>,
     next_identity: u32,
     next: u32,
     sockets: BTreeMap<u32, Sock>,
-    /// Connects by name still resolving, which count against the policy's bound.
+    /// Connects by name still resolving, which count against the grant's bound.
     resolving: u32,
-}
-
-impl Conn {
-    fn held(&self) -> u32 {
-        self.sockets.len() as u32 + self.resolving
-    }
+    /// A handle to the client's channel that can only be waited on: the client has
+    /// gone when it says `PEER_CLOSED`, which the stack can see before the dispatcher's
+    /// next turn does.
+    watch: Option<Handle>,
 }
 
 enum Purpose {
@@ -302,6 +316,13 @@ struct Orphan {
     iface: usize,
     handle: SocketHandle,
     local: Endpoint,
+    /// The grant it counts against until it is freed (no longer once its client has
+    /// gone). A closing connection is not its peer's: a peer's bound counts its live
+    /// connections only.
+    grant: Rc<Grant>,
+    counted: bool,
+    /// The client connection whose socket it was.
+    conn: u64,
     deadline: u64,
     /// Whether an egress has run since it was closed or reset: a reset smoltcp owes
     /// the peer goes out with the next egress, and only while the socket is in its
@@ -328,13 +349,17 @@ pub struct Stack {
     tcp_local: BTreeMap<Endpoint, usize>,
     /// Answers ready to send, for the server's loop.
     pub ready: Vec<(Pending, Outcome)>,
-    /// Grants to make: a listener for each policy, its endpoint the answer.
-    pub grants: Vec<(Pending, Policy)>,
+    /// Grants to make: a listener for each policy, its endpoint the answer, and the
+    /// grant's name.
+    pub grants: Vec<(Pending, Policy, String)>,
     /// What changed that the server's log should say: a lease taken or lost.
     pub notes: Vec<String>,
     /// The boot's lines (system design 1B), for the server's console exactly as they
     /// are: the network line, when the first DHCP lease is taken.
     pub boot: Vec<String>,
+    /// Lines for the console exactly as they are, for operators: a grant at its bound,
+    /// at most once a minute a grant (work item 1.3b).
+    pub bounds: Vec<String>,
     /// Whether an interface has taken a DHCP lease since the stack was made.
     leased: bool,
     now: u64,
@@ -475,6 +500,7 @@ impl Stack {
             grants: Vec::new(),
             notes: Vec::new(),
             boot: Vec::new(),
+            bounds: Vec::new(),
             leased: false,
             now,
             next_port: EPHEMERAL_FIRST + (seed % 16384) as u16,
@@ -537,6 +563,81 @@ impl Stack {
         self.smol
     }
 
+    /// Bytes of buffers those sockets hold, TCP's receive and send buffers and UDP's
+    /// payload buffers: with the sockets, what a grant's bound bounds (work item 1.3b).
+    pub fn buffered(&self) -> usize {
+        self.ifaces
+            .iter()
+            .flat_map(|x| x.set.iter())
+            .map(|(_, s)| match s {
+                smoltcp::socket::Socket::Tcp(t) => t.recv_capacity() + t.send_capacity(),
+                smoltcp::socket::Socket::Udp(u) => {
+                    u.payload_recv_capacity() + u.payload_send_capacity()
+                }
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Every grant's count worked out again from the sockets themselves, in a debug
+    /// build: what a grant holds is what its connections and orphans hold, and never
+    /// more than its bound.
+    #[cfg(debug_assertions)]
+    fn recount(&self) {
+        type Count<'a> = (u32, BTreeMap<Addr, u32>, &'a Rc<Grant>);
+        let mut held: BTreeMap<*const Grant, Count<'_>> = BTreeMap::new();
+        let peer = |e: &mut Count<'_>, p: Option<Addr>| {
+            if let Some(p) = p {
+                *e.1.entry(p).or_insert(0) += 1;
+            }
+        };
+        for c in self.conns.values() {
+            let e = held
+                .entry(Rc::as_ptr(&c.grant))
+                .or_insert((0, BTreeMap::new(), &c.grant));
+            e.0 += c.resolving;
+            for s in c.sockets.values() {
+                match s {
+                    Sock::Tcp(t) => {
+                        e.0 += 1;
+                        peer(e, t.peer);
+                    }
+                    Sock::Udp(_) => e.0 += 1,
+                    Sock::Listener(l) => {
+                        e.0 += 1 + u32::from(l.listening.is_some());
+                        for h in &l.half {
+                            e.0 += 1;
+                            peer(e, Some(h.peer));
+                        }
+                        for (_, p) in &l.queue {
+                            e.0 += 1;
+                            peer(e, Some(*p));
+                        }
+                    }
+                }
+            }
+        }
+        for o in self.orphans.iter().filter(|o| o.counted) {
+            let e = held
+                .entry(Rc::as_ptr(&o.grant))
+                .or_insert((0, BTreeMap::new(), &o.grant));
+            e.0 += 1;
+        }
+        for (n, peers, g) in held.values() {
+            assert_eq!(*n, g.held(), "a grant's count is not its sockets'");
+            assert!(*n <= g.policy().sockets, "a grant holds past its bound");
+            assert_eq!(
+                peers.len(),
+                g.peers(),
+                "a grant's peers are not its sockets'"
+            );
+            for (p, k) in peers {
+                assert_eq!(*k, g.peer_held(p), "a peer's count is not its sockets'");
+                assert!(*k <= g.policy().per_peer(), "a peer holds past its bound");
+            }
+        }
+    }
+
     /// When the stack must next be polled, on the clock `poll` is given.
     pub fn poll_at(&mut self) -> Option<u64> {
         let t = instant(self.now);
@@ -574,6 +675,11 @@ impl Stack {
                 }) = s
                 {
                     soon(*d);
+                }
+                if let Sock::Listener(l) = s {
+                    for h in &l.half {
+                        soon(h.deadline);
+                    }
                 }
             }
         }
@@ -632,6 +738,38 @@ impl Stack {
                 lo.deliver(f);
             }
         }
+        self.say_bounds();
+        #[cfg(debug_assertions)]
+        self.recount();
+    }
+
+    /// The line of each grant that hit a bound, unless it said one less than a minute
+    /// ago.
+    fn say_bounds(&mut self) {
+        let mut seen = BTreeSet::new();
+        let grants: Vec<Rc<Grant>> = self
+            .conns
+            .values()
+            .map(|c| &c.grant)
+            .chain(self.orphans.iter().map(|o| &o.grant))
+            .filter(|g| seen.insert(Rc::as_ptr(g)))
+            .cloned()
+            .collect();
+        for g in grants {
+            if let Some(line) = g.line(self.now) {
+                self.bounds.push(line);
+            }
+        }
+    }
+
+    /// How long a socket of `grant`'s may take to finish its close: its policy's
+    /// linger, else the setting's.
+    fn linger_ns(&self, grant: &Grant) -> u64 {
+        grant
+            .policy()
+            .linger_ms
+            .map_or(self.settings.tcp_linger_ms, u64::from)
+            .saturating_mul(1_000_000)
     }
 
     // ---- interfaces: DHCP, the resolver's servers, routes ----
@@ -801,17 +939,49 @@ impl Stack {
         self.conns.get_mut(&id)
     }
 
-    /// Registers connection `id` holding `policy`, if it is not yet.
-    pub fn connection(&mut self, id: u64, policy: &Policy) {
+    /// Registers connection `id` under `grant`, if it is not yet, with the handle
+    /// `watch` gives to wait on the client's channel.
+    pub fn connection(
+        &mut self,
+        id: u64,
+        grant: &Rc<Grant>,
+        watch: impl FnOnce() -> Option<Handle>,
+    ) {
         self.conns.entry(id).or_insert_with(|| Conn {
-            policy: policy.clone(),
+            grant: grant.clone(),
             account: None,
             identities: BTreeMap::new(),
             next_identity: 1,
             next: 1,
             sockets: BTreeMap::new(),
             resolving: 0,
+            watch: watch(),
         });
+    }
+
+    /// Every client but `except` whose channel has closed, gone at once as
+    /// [`Stack::connection_closed`] says, its connections reset, before the dispatcher's
+    /// next turn would tell: a dead client never holds a port or a budget, and what is
+    /// refused for one is decided without it. Whether any had gone.
+    pub fn reap(&mut self, except: u64) -> bool {
+        let gone: Vec<u64> = self
+            .conns
+            .iter()
+            .filter(|(id, c)| {
+                **id != except
+                    && c.watch.as_ref().is_some_and(|h| {
+                        // A deadline already past: the channel's signals, now.
+                        moruna_svc::wait_one(h, Signals::PEER_CLOSED, 0).is_ok()
+                    })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &gone {
+            // What is refused while it lingers is a reason to free it: its
+            // connections are reset at once.
+            self.gone(*id, true);
+        }
+        !gone.is_empty()
     }
 
     pub fn account_bound(&self, conn: u64) -> bool {
@@ -1055,14 +1225,41 @@ impl Stack {
         Outcome::Deferred
     }
 
-    /// Connection `id` has gone: its sockets close as their client's close would, its
-    /// waiting requests go with it.
+    /// Connection `id` has gone: its listeners close and free their ports, its
+    /// waiting requests go with it, and its TCP connections close as its own close
+    /// would (a FIN after what is queued, or a reset when bytes it never read remain).
+    /// None of them, nor those it had closed and left finishing their close, counts
+    /// against its grant any more: a dead client holds no port and no budget.
     pub fn connection_closed(&mut self, id: u64) {
+        self.gone(id, false);
+    }
+
+    /// Connection `id` has gone, as [`Stack::connection_closed`] says; with `reset`,
+    /// every TCP connection it held is reset at once too.
+    fn gone(&mut self, id: u64, reset: bool) {
         let Some(c) = self.conns.remove(&id) else {
             return;
         };
+        // Its connects by name still resolving are cancelled with it.
+        c.grant.give(c.resolving);
         for (_, s) in c.sockets {
-            self.retire(s, None);
+            self.retire(s, id, &c.grant, None);
+        }
+        for k in 0..self.orphans.len() {
+            let o = &mut self.orphans[k];
+            if o.conn != id || !o.counted {
+                continue;
+            }
+            o.counted = false;
+            o.grant.give(1);
+            if reset {
+                o.deadline = self.now;
+                o.sent = false;
+                self.ifaces[o.iface]
+                    .set
+                    .get_mut::<tcp::Socket>(o.handle)
+                    .abort();
+            }
         }
         // Its queries are cancelled, so their slots are free for others.
         let ifaces = &mut self.ifaces;
@@ -1082,11 +1279,14 @@ impl Stack {
         self.pings.retain(|p| p.conn != id);
     }
 
-    fn new_tcp(&self) -> tcp::Socket<'static> {
+    /// A TCP socket with `policy`'s buffers, the settings' where it gives none.
+    fn new_tcp(&self, policy: &Policy) -> tcp::Socket<'static> {
         let s = &self.settings;
+        let rx = policy.rx.map_or(s.tcp_receive_buffer, |b| b as usize);
+        let tx = policy.tx.map_or(s.tcp_send_buffer, |b| b as usize);
         let mut t = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; s.tcp_receive_buffer]),
-            tcp::SocketBuffer::new(vec![0; s.tcp_send_buffer]),
+            tcp::SocketBuffer::new(vec![0; rx]),
+            tcp::SocketBuffer::new(vec![0; tx]),
         );
         t.set_nagle_enabled(s.tcp_nagle);
         t.set_ack_delay(ms(s.tcp_ack_delay_ms));
@@ -1184,11 +1384,16 @@ impl Stack {
         to: Endpoint,
         pending: Pending,
     ) -> Result<(), net::Error> {
-        self.room()?;
+        self.fits(conn)?;
+        let grant = self
+            .conns
+            .get(&conn)
+            .map(|c| c.grant.clone())
+            .ok_or(net::Error::NoSocket)?;
         let port = self
             .free_port(&src, false, None)
             .ok_or(net::Error::TooMany)?;
-        let mut sock = self.new_tcp();
+        let mut sock = self.new_tcp(grant.policy());
         let x = &mut self.ifaces[iface];
         sock.connect(
             x.iface.context(),
@@ -1201,6 +1406,7 @@ impl Stack {
         .map_err(|_| net::Error::BadAddress)?;
         let handle = x.set.add(sock);
         self.smol += 1;
+        grant.take();
         let local = Endpoint::new(src, port);
         *self.tcp_local.entry(local).or_insert(0) += 1;
         let deadline = self
@@ -1226,14 +1432,22 @@ impl Stack {
                 shut: false,
                 established: false,
                 saw_fin: false,
+                peer: None,
             }),
         );
         Ok(())
     }
 
     /// A socket its client closed, or whose connection went: requests waiting on it are
-    /// answered `Closed` (when `ready` is given), and its smoltcp sockets close.
-    fn retire(&mut self, sock: Sock, mut ready: Option<&mut Vec<(Pending, Outcome)>>) {
+    /// answered `Closed` (when `ready` is given), and its smoltcp sockets close. Its
+    /// TCP connections count against `grant` until they are freed.
+    fn retire(
+        &mut self,
+        sock: Sock,
+        conn: u64,
+        grant: &Rc<Grant>,
+        mut ready: Option<&mut Vec<(Pending, Outcome)>>,
+    ) {
         let mut answer = |p: Pending| {
             if let Some(r) = ready.as_mut() {
                 r.push((p, fail(net::Error::Closed)));
@@ -1253,23 +1467,36 @@ impl Stack {
                 {
                     answer(p);
                 }
-                self.orphan(t.iface, t.handle, t.local);
+                self.orphan(t.iface, t.handle, t.local, conn, grant, t.peer);
             }
             Sock::Listener(l) => {
                 if let Some(p) = l.accept {
                     answer(p);
                 }
                 self.listening.remove(&l.at);
+                // The listener, and its listening socket.
+                grant.give(1);
                 if let Some(h) = l.listening {
                     self.remove_socket(l.iface, h);
+                    grant.give(1);
                 }
-                for h in l.half.into_iter().chain(l.queue) {
+                for (h, peer) in l
+                    .half
+                    .into_iter()
+                    .map(|h| (h.handle, h.peer))
+                    .chain(l.queue)
+                {
+                    // Closing, it is no longer its peer's.
+                    grant.peer_give(&peer);
                     self.ifaces[l.iface].set.get_mut::<tcp::Socket>(h).abort();
                     *self.tcp_local.entry(l.at).or_insert(0) += 1;
                     self.orphans.push(Orphan {
                         iface: l.iface,
                         handle: h,
                         local: l.at,
+                        grant: grant.clone(),
+                        counted: true,
+                        conn,
                         deadline: self.now,
                         sent: false,
                     });
@@ -1281,13 +1508,27 @@ impl Stack {
                 }
                 self.udp_bound.remove(&u.at);
                 self.remove_socket(u.iface, u.handle);
+                grant.give(1);
             }
         }
     }
 
     /// A TCP socket that finishes its close on its own: with its FIN after what it
     /// has queued, or at once with a reset when bytes it received were never read.
-    fn orphan(&mut self, iface: usize, handle: SocketHandle, local: Endpoint) {
+    fn orphan(
+        &mut self,
+        iface: usize,
+        handle: SocketHandle,
+        local: Endpoint,
+        conn: u64,
+        grant: &Rc<Grant>,
+        peer: Option<Addr>,
+    ) {
+        let deadline = self.now.saturating_add(self.linger_ns(grant));
+        // Closing, it is no longer its peer's: the grant's bound holds it from now on.
+        if let Some(p) = peer {
+            grant.peer_give(&p);
+        }
         let s = self.ifaces[iface].set.get_mut::<tcp::Socket>(handle);
         if s.recv_queue() > 0 {
             s.abort();
@@ -1298,9 +1539,10 @@ impl Stack {
             iface,
             handle,
             local,
-            deadline: self
-                .now
-                .saturating_add(self.settings.tcp_linger_ms * 1_000_000),
+            grant: grant.clone(),
+            counted: true,
+            conn,
+            deadline,
             sent: false,
         });
     }
@@ -1310,16 +1552,27 @@ impl Stack {
     fn policy(&self, conn: u64) -> Policy {
         self.conns
             .get(&conn)
-            .map(|c| c.policy.clone())
+            .map(|c| c.grant.policy().clone())
             .unwrap_or_default()
     }
 
+    /// `TooMany` unless one more socket fits the bound of connection `conn`'s grant.
     fn held(&self, conn: u64) -> Result<(), net::Error> {
         let c = self.conns.get(&conn).ok_or(net::Error::NoSocket)?;
-        if c.held() >= c.policy.sockets {
+        if !c.grant.room() {
             return Err(net::Error::TooMany);
         }
         Ok(())
+    }
+
+    /// As [`Stack::held`] and then the server's own bound, but before refusing for
+    /// either, every client that has gone is reaped and the question asked again.
+    fn fits(&mut self, conn: u64) -> Result<(), net::Error> {
+        let fits = |s: &Stack| s.held(conn).and_then(|()| s.room());
+        match fits(self) {
+            Err(net::Error::TooMany) if self.reap(conn) => fits(self),
+            other => other,
+        }
     }
 
     pub fn info(&mut self, conn: u64) -> Outcome {
@@ -1365,7 +1618,7 @@ impl Stack {
                             Err(net::Error::NotPermitted)
                         }
                     })
-                    .and_then(|()| self.held(conn))
+                    .and_then(|()| self.fits(conn))
                     .and_then(|()| self.route(&ep.addr, from.as_ref(), &policy));
                 match route {
                     Ok((iface, src)) => {
@@ -1396,13 +1649,14 @@ impl Stack {
                 {
                     return fail(e);
                 }
-                if let Err(e) = self.held(conn) {
+                if let Err(e) = self.fits(conn) {
                     return fail(e);
                 }
                 match self.start_resolve(conn, &name) {
                     Ok((iface, queries)) => {
                         if let Some(c) = self.conn(conn) {
                             c.resolving += 1;
+                            c.grant.take();
                         }
                         self.resolves.push(Resolve {
                             conn,
@@ -1444,11 +1698,17 @@ impl Stack {
         let Some(iface) = self.iface_of(&at.addr) else {
             return fail(net::Error::BadAddress);
         };
-        if let Err(e) = self.held(conn).and_then(|()| self.room()) {
+        if let Err(e) = self.fits(conn) {
             return fail(e);
         }
+        // A port a client that has gone still holds is reaped before the answer is
+        // `AddressInUse`.
         let port = if at.port == 0 {
-            match self.free_port(&at.addr, false, Some(&policy)) {
+            let mut port = self.free_port(&at.addr, false, Some(&policy));
+            if port.is_none() && self.reap(conn) {
+                port = self.free_port(&at.addr, false, Some(&policy));
+            }
+            match port {
                 Some(p) => p,
                 None => return fail(net::Error::AddressInUse),
             }
@@ -1457,11 +1717,26 @@ impl Stack {
         };
         let at = Endpoint::new(at.addr, port);
         if self.listening.contains(&at) {
-            return fail(net::Error::AddressInUse);
+            self.reap(conn);
+            if self.listening.contains(&at) {
+                return fail(net::Error::AddressInUse);
+            }
         }
-        let Some(h) = self.listening_socket(iface, &at) else {
-            return fail(net::Error::BadAddress);
+        let Some(grant) = self.conns.get(&conn).map(|c| c.grant.clone()) else {
+            return fail(net::Error::NoSocket);
         };
+        // The listener counts against the grant, and so does its listening socket, the
+        // next connection: it has one while the grant has room for both.
+        let h = if grant.held() + 2 <= grant.policy().sockets {
+            let Some(h) = self.listening_socket(iface, &at, grant.policy()) else {
+                return fail(net::Error::BadAddress);
+            };
+            grant.take();
+            Some(h)
+        } else {
+            None
+        };
+        grant.take();
         self.listening.insert(at);
         let id = self.insert(
             conn,
@@ -1469,7 +1744,7 @@ impl Stack {
                 iface,
                 at,
                 backlog: backlog as usize,
-                listening: Some(h),
+                listening: h,
                 half: Vec::new(),
                 queue: VecDeque::new(),
                 accept: None,
@@ -1478,8 +1753,13 @@ impl Stack {
         Outcome::reply((id, at))
     }
 
-    fn listening_socket(&mut self, iface: usize, at: &Endpoint) -> Option<SocketHandle> {
-        let mut s = self.new_tcp();
+    fn listening_socket(
+        &mut self,
+        iface: usize,
+        at: &Endpoint,
+        policy: &Policy,
+    ) -> Option<SocketHandle> {
+        let mut s = self.new_tcp(policy);
         s.listen(IpListenEndpoint {
             addr: Some(ip(&at.addr)),
             port: at.port,
@@ -1489,8 +1769,9 @@ impl Stack {
         Some(self.ifaces[iface].set.add(s))
     }
 
+    /// A listener's next connection. It has counted against the grant since its SYN,
+    /// so accepting it takes nothing more.
     pub fn accept(&mut self, cx: &mut Context<'_>, conn: u64, listener: u32) -> Outcome {
-        let full = self.held(conn).is_err();
         let Some(c) = self.conns.get_mut(&conn) else {
             return fail(net::Error::NoSocket);
         };
@@ -1502,13 +1783,10 @@ impl Stack {
         if l.accept.is_some() {
             return fail(net::Error::InUse);
         }
-        if full {
-            return fail(net::Error::TooMany);
-        }
         match l.queue.pop_front() {
-            Some(h) => {
+            Some((h, peer)) => {
                 let iface = l.iface;
-                Outcome::reply(self.accepted(conn, iface, h))
+                Outcome::reply(self.accepted(conn, iface, h, peer))
             }
             None => {
                 l.accept = Some(cx.defer());
@@ -1518,7 +1796,7 @@ impl Stack {
     }
 
     /// An established socket from a listener's queue, as a connection's socket.
-    fn accepted(&mut self, conn: u64, iface: usize, h: SocketHandle) -> Opened {
+    fn accepted(&mut self, conn: u64, iface: usize, h: SocketHandle, peer: Addr) -> Opened {
         let s = self.ifaces[iface].set.get::<tcp::Socket>(h);
         let unset = Endpoint::new(Addr::v4(0, 0, 0, 0), 0);
         let local = s.local_endpoint().map(endpoint).unwrap_or(unset);
@@ -1544,6 +1822,7 @@ impl Stack {
                 shut: false,
                 established: true,
                 saw_fin: false,
+                peer: Some(peer),
             }),
         );
         Opened {
@@ -1725,7 +2004,13 @@ impl Stack {
 
     pub fn shutdown(&mut self, cx: &mut Context<'_>, conn: u64, socket: u32) -> Outcome {
         let now = self.now;
-        let close_deadline = now.saturating_add(self.settings.tcp_linger_ms * 1_000_000);
+        let linger = self
+            .conns
+            .get(&conn)
+            .map_or(self.settings.tcp_linger_ms * 1_000_000, |c| {
+                self.linger_ns(&c.grant)
+            });
+        let close_deadline = now.saturating_add(linger);
         let Stack {
             conns,
             ifaces,
@@ -1772,11 +2057,14 @@ impl Stack {
     }
 
     pub fn close(&mut self, conn: u64, socket: u32) -> Outcome {
-        let Some(sock) = self.conn(conn).and_then(|c| c.sockets.remove(&socket)) else {
+        let Some((sock, grant)) = self
+            .conn(conn)
+            .and_then(|c| Some((c.sockets.remove(&socket)?, c.grant.clone())))
+        else {
             return fail(net::Error::NoSocket);
         };
         let mut ready = core::mem::take(&mut self.ready);
-        self.retire(sock, Some(&mut ready));
+        self.retire(sock, conn, &grant, Some(&mut ready));
         self.ready = ready;
         Outcome::reply(())
     }
@@ -1795,11 +2083,17 @@ impl Stack {
         let Some(iface) = self.iface_of(&at.addr) else {
             return fail(net::Error::BadAddress);
         };
-        if let Err(e) = self.held(conn).and_then(|()| self.room()) {
+        if let Err(e) = self.fits(conn) {
             return fail(e);
         }
+        // A port a client that has gone still holds is reaped before the answer is
+        // `AddressInUse`.
         let port = if at.port == 0 {
-            match self.free_port(&at.addr, true, Some(&policy)) {
+            let mut port = self.free_port(&at.addr, true, Some(&policy));
+            if port.is_none() && self.reap(conn) {
+                port = self.free_port(&at.addr, true, Some(&policy));
+            }
+            match port {
                 Some(p) => p,
                 None => return fail(net::Error::AddressInUse),
             }
@@ -1808,17 +2102,23 @@ impl Stack {
         };
         let at = Endpoint::new(at.addr, port);
         if self.udp_bound.contains(&at) {
-            return fail(net::Error::AddressInUse);
+            self.reap(conn);
+            if self.udp_bound.contains(&at) {
+                return fail(net::Error::AddressInUse);
+            }
         }
+        // The policy's buffers, as payload bytes; the settings' where it gives none.
         let s = &self.settings;
+        let rx = policy.rx.map_or(s.udp_receive_bytes, |b| b as usize);
+        let tx = policy.tx.map_or(s.udp_send_bytes, |b| b as usize);
         let mut u = udp::Socket::new(
             udp::PacketBuffer::new(
                 vec![udp::PacketMetadata::EMPTY; s.udp_receive_packets],
-                vec![0; s.udp_receive_bytes],
+                vec![0; rx],
             ),
             udp::PacketBuffer::new(
                 vec![udp::PacketMetadata::EMPTY; s.udp_send_packets],
-                vec![0; s.udp_send_bytes],
+                vec![0; tx],
             ),
         );
         if u.bind(IpListenEndpoint {
@@ -1831,6 +2131,9 @@ impl Stack {
         }
         let handle = self.ifaces[iface].set.add(u);
         self.smol += 1;
+        if let Some(c) = self.conns.get(&conn) {
+            c.grant.take();
+        }
         self.udp_bound.insert(at);
         let id = self.insert(
             conn,
@@ -1871,7 +2174,10 @@ impl Stack {
         }
         let header = if to.addr.is_v4() { 28 } else { 48 };
         let largest = (self.ifaces[iface].ip_mtu() - header).min(netstack_protocol::DATAGRAM_MAX);
-        if bytes.len() > largest || bytes.len() > self.settings.udp_send_bytes {
+        let room = policy
+            .tx
+            .map_or(self.settings.udp_send_bytes, |b| b as usize);
+        if bytes.len() > largest || bytes.len() > room {
             return fail(net::Error::TooLarge);
         }
         if !self.reaches(iface, &to.addr) {
@@ -2055,7 +2361,12 @@ impl Stack {
         if !policy.covers(&child) {
             return fail(net::Error::NotPermitted);
         }
-        self.grants.push((cx.defer(), child));
+        let name = self
+            .conns
+            .get(&conn)
+            .map(|c| format!("{}/granted", c.grant.name()))
+            .unwrap_or_default();
+        self.grants.push((cx.defer(), child, name));
         Outcome::Deferred
     }
 
@@ -2112,8 +2423,13 @@ impl Stack {
     /// interface's listeners.
     fn tend_listeners(&mut self, iface: Option<usize>) {
         let room = self.settings.sockets_max.saturating_sub(self.smol);
+        let now = self.now;
+        let handshake = self.settings.handshake_timeout_ms.saturating_mul(1_000_000);
         let mut wanted: Vec<(u64, u32, usize, Endpoint)> = Vec::new();
-        let mut removed: Vec<(usize, SocketHandle)> = Vec::new();
+        let mut removed: Vec<(usize, SocketHandle, Rc<Grant>, Addr)> = Vec::new();
+        // Connections reset here, past their handshake's deadline or past their peer's
+        // bound, which finish as orphans once the reset has gone.
+        let mut reset: Vec<Orphan> = Vec::new();
         let Stack { conns, ifaces, .. } = self;
         for (cid, c) in conns.iter_mut() {
             for (sid, sock) in c.sockets.iter_mut() {
@@ -2125,28 +2441,68 @@ impl Stack {
                 if let Some(h) = l.listening
                     && set.get::<tcp::Socket>(h).state() != tcp::State::Listen
                 {
-                    l.half.push(h);
                     l.listening = None;
+                    let s = set.get_mut::<tcp::Socket>(h);
+                    let peer = s
+                        .remote_endpoint()
+                        .map_or(Addr::v4(0, 0, 0, 0), |e| addr(e.addr));
+                    if c.grant.peer_take(peer) {
+                        l.half.push(Half {
+                            handle: h,
+                            peer,
+                            deadline: now.saturating_add(handshake),
+                        });
+                    } else {
+                        // The peer holds its bound already: reset at once.
+                        s.abort();
+                        reset.push(Orphan {
+                            iface: l.iface,
+                            handle: h,
+                            local: l.at,
+                            grant: c.grant.clone(),
+                            counted: true,
+                            conn: *cid,
+                            deadline: now,
+                            sent: false,
+                        });
+                    }
                 }
                 let mut k = 0;
                 while k < l.half.len() {
-                    let h = l.half[k];
-                    match set.get::<tcp::Socket>(h).state() {
+                    let half = l.half[k];
+                    let s = set.get_mut::<tcp::Socket>(half.handle);
+                    match s.state() {
+                        tcp::State::SynReceived if now >= half.deadline => {
+                            // A handshake not done in time: reset, and freed.
+                            s.abort();
+                            l.half.swap_remove(k);
+                            c.grant.peer_give(&half.peer);
+                            reset.push(Orphan {
+                                iface: l.iface,
+                                handle: half.handle,
+                                local: l.at,
+                                grant: c.grant.clone(),
+                                counted: true,
+                                conn: *cid,
+                                deadline: now,
+                                sent: false,
+                            });
+                        }
                         tcp::State::SynReceived => k += 1,
                         tcp::State::Closed | tcp::State::Listen => {
-                            removed.push((l.iface, h));
+                            removed.push((l.iface, half.handle, c.grant.clone(), half.peer));
                             l.half.swap_remove(k);
                         }
                         _ => {
-                            l.queue.push_back(h);
+                            l.queue.push_back((half.handle, half.peer));
                             l.half.swap_remove(k);
                         }
                     }
                 }
-                l.queue.retain(|&h| {
+                l.queue.retain(|&(h, peer)| {
                     let closed = set.get::<tcp::Socket>(h).state() == tcp::State::Closed;
                     if closed {
-                        removed.push((l.iface, h));
+                        removed.push((l.iface, h, c.grant.clone(), peer));
                     }
                     !closed
                 });
@@ -2155,13 +2511,33 @@ impl Stack {
                 }
             }
         }
-        for (i, h) in removed {
-            self.remove_socket(i, h);
+        for o in reset {
+            *self.tcp_local.entry(o.local).or_insert(0) += 1;
+            self.orphans.push(o);
         }
+        for (i, h, grant, peer) in removed {
+            self.remove_socket(i, h);
+            grant.give(1);
+            grant.peer_give(&peer);
+        }
+        let mut reaped = false;
         for (cid, sid, i, at) in wanted.into_iter().take(room) {
-            let Some(h) = self.listening_socket(i, &at) else {
+            // The next connection, while the grant has room for it; a client that has
+            // gone is reaped first, once a tending.
+            let Some(grant) = self.conns.get(&cid).map(|c| c.grant.clone()) else {
                 continue;
             };
+            if !grant.room() && !reaped {
+                reaped = true;
+                self.reap(cid);
+            }
+            if !grant.room() {
+                continue;
+            }
+            let Some(h) = self.listening_socket(i, &at, grant.policy()) else {
+                continue;
+            };
+            grant.take();
             if let Some(Sock::Listener(l)) = self
                 .conns
                 .get_mut(&cid)
@@ -2170,6 +2546,7 @@ impl Stack {
                 l.listening = Some(h);
             } else {
                 self.remove_socket(i, h);
+                grant.give(1);
             }
         }
     }
@@ -2295,35 +2672,36 @@ impl Stack {
             }
         }
         for (cid, sid) in failed_opens {
-            if let Some(Sock::Tcp(t)) = self.conn(cid).and_then(|c| c.sockets.remove(&sid)) {
+            if let Some((Sock::Tcp(t), grant)) = self
+                .conn(cid)
+                .and_then(|c| Some((c.sockets.remove(&sid)?, c.grant.clone())))
+            {
                 // Closed, or just aborted: the reset goes out with the next egress, so
-                // the socket finishes as an orphan.
+                // the socket finishes as an orphan, counted against the grant until then.
                 let local = t.local;
                 self.orphans.push(Orphan {
                     iface: t.iface,
                     handle: t.handle,
                     local,
+                    grant,
+                    counted: true,
+                    conn: cid,
                     deadline: now,
                     sent: false,
                 });
             }
         }
         for (cid, sid) in accepts {
-            let full = self.held(cid).is_err();
             let Some(Sock::Listener(l)) = self.conn(cid).and_then(|c| c.sockets.get_mut(&sid))
             else {
                 continue;
             };
             let Some(p) = l.accept.take() else { continue };
-            if full {
-                self.ready.push((p, fail(net::Error::TooMany)));
-                continue;
-            }
-            let Some(h) = l.queue.pop_front() else {
+            let Some((h, peer)) = l.queue.pop_front() else {
                 continue;
             };
             let iface = l.iface;
-            let opened = self.accepted(cid, iface, h);
+            let opened = self.accepted(cid, iface, h, peer);
             self.ready.push((p, Outcome::reply(opened)));
         }
         self.service_resolves();
@@ -2341,6 +2719,9 @@ impl Stack {
                     let o = self.orphans.swap_remove(k);
                     self.remove_socket(o.iface, o.handle);
                     self.unbind_tcp(&o.local);
+                    if o.counted {
+                        o.grant.give(1);
+                    }
                     continue;
                 }
             } else if now >= o.deadline {
@@ -2406,6 +2787,7 @@ impl Stack {
             } => {
                 if let Some(c) = self.conn(r.conn) {
                     c.resolving = c.resolving.saturating_sub(1);
+                    c.grant.give(1);
                 }
                 let policy = self.policy(r.conn);
                 let mut why = failed.unwrap_or(net::Error::NotFound);
@@ -2428,9 +2810,9 @@ impl Stack {
                     }
                 }
                 let result = match chosen {
-                    Some((iface, src, ep)) => self
-                        .held(r.conn)
-                        .and_then(|()| self.start_tcp(r.conn, iface, src, ep, pending.clone())),
+                    Some((iface, src, ep)) => {
+                        self.start_tcp(r.conn, iface, src, ep, pending.clone())
+                    }
                     None => Err(why),
                 };
                 if let Err(e) = result {

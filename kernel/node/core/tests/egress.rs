@@ -223,6 +223,10 @@ fn admission_mints_a_jobs_channel_and_the_job_reaches_its_host_only() {
             local: Vec::new(),
             names: Vec::new(),
             sockets: 1,
+            rx: None,
+            tx: None,
+            per_peer: None,
+            linger_ms: None,
         })),
         net::Error::NotPermitted
     );

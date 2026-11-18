@@ -14,10 +14,29 @@
 //! least as many sockets, and every rule of the other lies inside one rule of its own.
 //! This is deliberately the simple test: a rule that only the union of two rules
 //! covers is refused, which errs towards refusing a grant, never towards widening one.
+//!
+//! Its bounds on memory (3.1) are covered the same way: the other's buffers and linger
+//! are at most its own, both given, or both left to the server's settings, which a
+//! policy cannot see (so a policy that leaves one to the server covers no policy that
+//! names it, nor the other way); and the other's sockets per peer are at most its own,
+//! [`crate::PER_PEER_DEFAULT`] where either says nothing.
 
 use alloc::string::String;
 
-use crate::{Addr, Endpoint, NAME_MAX, NameRule, Policy, RULES_MAX, Rule, net, rights};
+use crate::{
+    Addr, BUFFER_MAX, BUFFER_MIN, Endpoint, LINGER_MAX_MS, NAME_MAX, NameRule, PER_PEER_DEFAULT,
+    PER_PEER_MAX, Policy, RULES_MAX, Rule, net, rights,
+};
+
+/// Whether a bound the child gives is within the parent's: both given and the child's
+/// no larger, or both left to the server.
+fn within(parent: Option<u32>, child: Option<u32>) -> bool {
+    match (parent, child) {
+        (Some(p), Some(c)) => c <= p,
+        (None, None) => true,
+        _ => false,
+    }
+}
 
 /// `name` lowercased, without one trailing dot, if it is a host name: 1 to 253 bytes of
 /// labels of 1 to 63 letters, digits, hyphens and underscores, no label starting or
@@ -115,11 +134,19 @@ impl Policy {
             local: alloc::vec![any4, any6],
             names: alloc::vec![],
             sockets,
+            ..Policy::default()
         }
     }
 
+    /// The live connections one remote address may hold through the policy's listeners.
+    pub fn per_peer(&self) -> u32 {
+        self.per_peer.unwrap_or(PER_PEER_DEFAULT)
+    }
+
     /// `BadPolicy` unless every right is known, every rule's port range is in order,
-    /// every pattern is a name and no list is longer than [`RULES_MAX`]. (A prefix
+    /// every pattern is a name, no list is longer than [`RULES_MAX`], and each bound it
+    /// gives is in its range: buffers [`BUFFER_MIN`] to [`BUFFER_MAX`] bytes, 1 to
+    /// [`PER_PEER_MAX`] sockets a peer, a linger of 1 to [`LINGER_MAX_MS`] ms. (A prefix
     /// past its family's bits does not decode.)
     pub fn validate(&self) -> Result<(), net::Error> {
         let rules_ok = |rules: &[Rule]| {
@@ -132,10 +159,18 @@ impl Policy {
             && self.names.iter().all(|n| {
                 n.first <= n.last && n.pattern.len() <= NAME_MAX && pattern_valid(&n.pattern)
             });
+        let in_range = |v: Option<u32>, range: core::ops::RangeInclusive<u32>| {
+            v.is_none_or(|v| range.contains(&v))
+        };
+        let bounds_ok = in_range(self.rx, BUFFER_MIN..=BUFFER_MAX)
+            && in_range(self.tx, BUFFER_MIN..=BUFFER_MAX)
+            && in_range(self.per_peer, 1..=PER_PEER_MAX)
+            && in_range(self.linger_ms, 1..=LINGER_MAX_MS);
         if self.rights & !rights::ALL != 0
             || !rules_ok(&self.remote)
             || !rules_ok(&self.local)
             || !names_ok
+            || !bounds_ok
         {
             return Err(net::Error::BadPolicy);
         }
@@ -200,6 +235,10 @@ impl Policy {
     pub fn covers(&self, child: &Policy) -> bool {
         child.rights & !self.rights == 0
             && child.sockets <= self.sockets
+            && within(self.rx, child.rx)
+            && within(self.tx, child.tx)
+            && within(self.linger_ms, child.linger_ms)
+            && child.per_peer() <= self.per_peer()
             && child
                 .remote
                 .iter()
@@ -241,6 +280,7 @@ mod tests {
             local: vec![Rule::any_port(net4([0, 0, 0, 0], 0))],
             names: vec![],
             sockets: 4,
+            ..Policy::default()
         }
     }
 
@@ -336,6 +376,7 @@ mod tests {
             local: vec![],
             names: vec![star(443, 443)],
             sockets: 64,
+            ..Policy::default()
         };
         assert_eq!(admission.validate(), Ok(()));
         assert!(admission.may_connect_name("store.example.test", 443));
@@ -348,6 +389,7 @@ mod tests {
             local: vec![],
             names,
             sockets: 64,
+            ..Policy::default()
         };
         assert!(admission.covers(&job(vec![name("a.test", 443, 443), name("b.c", 443, 443)])));
         assert!(admission.covers(&job(vec![name("*.example.com", 443, 443)])));
@@ -362,6 +404,7 @@ mod tests {
             local: vec![],
             names,
             sockets: 64,
+            ..Policy::default()
         };
         assert!(!narrow(vec![name("*.com", 0, 65535)]).covers(&job(vec![star(443, 443)])));
         assert!(!narrow(vec![name("a.test", 0, 65535)]).covers(&job(vec![star(443, 443)])));
@@ -379,6 +422,7 @@ mod tests {
                 last: 443,
             }],
             sockets: 8,
+            ..Policy::default()
         };
         assert!(p.validate().is_ok());
         assert!(p.may_resolve("storage.googleapis.com"));
@@ -418,6 +462,91 @@ mod tests {
     }
 
     #[test]
+    fn a_policy_s_memory_bounds_are_in_range_and_never_widened() {
+        let p = Policy {
+            rights: rights::LISTEN | rights::GRANT,
+            sockets: 81,
+            rx: Some(65536),
+            tx: Some(65536),
+            per_peer: Some(8),
+            linger_ms: Some(5000),
+            ..Policy::default()
+        };
+        assert!(p.validate().is_ok());
+        assert_eq!(p.per_peer(), 8);
+        assert_eq!(Policy::default().per_peer(), crate::PER_PEER_DEFAULT);
+        for bad in [
+            Policy {
+                rx: Some(crate::BUFFER_MIN - 1),
+                ..p.clone()
+            },
+            Policy {
+                tx: Some(crate::BUFFER_MAX + 1),
+                ..p.clone()
+            },
+            Policy {
+                per_peer: Some(0),
+                ..p.clone()
+            },
+            Policy {
+                per_peer: Some(crate::PER_PEER_MAX + 1),
+                ..p.clone()
+            },
+            Policy {
+                linger_ms: Some(0),
+                ..p.clone()
+            },
+            Policy {
+                linger_ms: Some(crate::LINGER_MAX_MS + 1),
+                ..p.clone()
+            },
+        ] {
+            assert_eq!(bad.validate(), Err(net::Error::BadPolicy), "{bad:?}");
+        }
+        assert!(p.covers(&p));
+        let narrower = Policy {
+            rx: Some(4096),
+            tx: Some(65535),
+            per_peer: Some(1),
+            linger_ms: Some(1),
+            ..p.clone()
+        };
+        assert!(p.covers(&narrower));
+        assert!(!narrower.covers(&p));
+        let widen = |f: &dyn Fn(&mut Policy)| {
+            let mut c = p.clone();
+            f(&mut c);
+            p.covers(&c)
+        };
+        assert!(!widen(&|c| c.rx = Some(65537)));
+        assert!(!widen(&|c| c.tx = Some(65537)));
+        assert!(!widen(&|c| c.linger_ms = Some(5001)));
+        assert!(!widen(&|c| c.per_peer = Some(9)));
+        // Left to the server, a bound is not known to be within one given, nor the
+        // other way.
+        assert!(!widen(&|c| c.rx = None));
+        assert!(!widen(&|c| c.linger_ms = None));
+        let server = Policy {
+            rx: None,
+            tx: None,
+            per_peer: None,
+            linger_ms: None,
+            ..p.clone()
+        };
+        assert!(server.covers(&server));
+        assert!(!server.covers(&p));
+        // Unsaid, a peer's bound is the default of 8: a policy that says 8 is covered.
+        assert!(server.covers(&Policy {
+            per_peer: Some(8),
+            ..server.clone()
+        }));
+        assert!(!server.covers(&Policy {
+            per_peer: Some(9),
+            ..server.clone()
+        }));
+    }
+
+    #[test]
     fn ke2_a_policy_covers_only_what_it_permits_itself() {
         let parent = Policy {
             rights: rights::CONNECT | rights::GRANT | rights::UDP,
@@ -433,6 +562,7 @@ mod tests {
                 last: 65535,
             }],
             sockets: 8,
+            ..Policy::default()
         };
         let narrow = Policy {
             rights: rights::CONNECT,
@@ -459,6 +589,7 @@ mod tests {
                 },
             ],
             sockets: 8,
+            ..Policy::default()
         };
         assert!(parent.covers(&narrow));
         assert!(parent.covers(&parent));

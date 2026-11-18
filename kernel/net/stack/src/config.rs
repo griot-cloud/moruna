@@ -8,15 +8,22 @@
 //!                [gateway6=ADDR] [dhcp]
 //! dns ADDR...                             # the resolver's servers, before DHCP's
 //! grant SLOT rights=R,... [remote=RULE,...] [local=RULE,...] [names=PATTERN[@PORTS],...]
-//!            [sockets=N]
+//!            [sockets=N] [rx=BYTES] [tx=BYTES] [per-peer=N] [linger=MS]
 //! ```
 //!
 //! A rule is `ADDR/PREFIX` with an optional `@PORT` or `@FIRST-LAST` (every port
 //! without), or `any` for every IPv4 and IPv6 address. A name pattern is a name,
 //! `*.domain` for every name below it, or `*` for every name. A grant's `SLOT` names a
 //! listener slot of the server's (`listen*`); every connection through it holds that
-//! policy. `#` begins a comment. Anything else, and every value out of range, is
-//! refused with its line.
+//! policy. `sockets` bounds the sockets every connection through the slot holds
+//! between them ([`crate::grant`]). Work item 1.3b's bounds on their memory: `rx` and
+//! `tx` are the receive and send buffers of each of their sockets (TCP's, and UDP's
+//! payload buffers), `per-peer` the most live connections (not those closing) one
+//! remote address may hold through the slot's listeners (8 when not given), and `linger` how long, in
+//! milliseconds, a closed socket may take to finish its close; not given, the settings
+//! hold (`tcp-receive-buffer` and `udp-receive-bytes`, `tcp-send-buffer` and
+//! `udp-send-bytes`, `tcp-linger-ms`). `#` begins a comment. Anything else, and every
+//! value out of range, is refused with its line.
 
 use alloc::{
     format,
@@ -25,7 +32,7 @@ use alloc::{
 };
 use core::net::IpAddr;
 
-use netstack_protocol::{Addr, Cidr, NameRule, Policy, Rule, rights};
+use netstack_protocol::{Addr, Cidr, LINGER_MAX_MS, NameRule, PER_PEER_MAX, Policy, Rule, rights};
 
 /// The first line of the configuration.
 pub const HEADER: &str = "moruna-netstack 1";
@@ -36,6 +43,9 @@ pub const INTERFACES_MAX: usize = 8;
 pub const ADDRS_MAX: usize = 6;
 /// The most resolver servers, smoltcp's `dns-max-server-count-4`.
 pub const DNS_MAX: usize = 4;
+/// The smallest and largest socket buffer, in bytes, a setting or a grant gives.
+pub const BUFFER_MIN: usize = netstack_protocol::BUFFER_MIN as usize;
+pub const BUFFER_MAX: usize = netstack_protocol::BUFFER_MAX as usize;
 
 /// The tuning of the server (SDD 31, i): every buffer and bound that is not the
 /// protocol's. The defaults are this table's; the configuration's `setting` lines
@@ -73,6 +83,9 @@ pub struct Settings {
     /// How long a socket closed by its client, or left by a connection that went, may
     /// take to finish its close before it is reset.
     pub tcp_linger_ms: u64,
+    /// How long a connection a listener took a SYN for may take to finish its
+    /// handshake; past it the socket is reset and freed (work item 1.3b).
+    pub handshake_timeout_ms: u64,
     /// Frames asked of a card at once, and the most frames received and not yet
     /// taken by the stack; more are dropped and counted.
     pub card_receive_frames: usize,
@@ -117,6 +130,7 @@ impl Default for Settings {
             tcp_nagle: true,
             tcp_congestion: Congestion::Reno,
             tcp_linger_ms: 30_000,
+            handshake_timeout_ms: 10_000,
             card_receive_frames: 256,
             card_queue_frames: 2048,
             card_sends_in_flight: 4,
@@ -273,8 +287,8 @@ fn number(
 
 impl Settings {
     fn set(&mut self, line: usize, name: &str, value: &str) -> Result<(), ConfigError> {
-        const MIB16: u64 = 16 << 20;
-        let bytes = |v| number(line, name, v, 1024..=MIB16).map(|n| n as usize);
+        let bytes =
+            |v| number(line, name, v, BUFFER_MIN as u64..=BUFFER_MAX as u64).map(|n| n as usize);
         let count = |v, most| number(line, name, v, 1..=most).map(|n| n as usize);
         let ms = |v| number(line, name, v, 0..=3_600_000);
         let positive_ms = |v| number(line, name, v, 1..=3_600_000);
@@ -313,6 +327,7 @@ impl Settings {
                 }
             }
             "tcp-linger-ms" => self.tcp_linger_ms = positive_ms(value)?,
+            "handshake-timeout-ms" => self.handshake_timeout_ms = positive_ms(value)?,
             "card-receive-frames" => self.card_receive_frames = count(value, 1024)?,
             "card-queue-frames" => self.card_queue_frames = count(value, 65536)?,
             "card-sends-in-flight" => self.card_sends_in_flight = count(value, 32)?,
@@ -474,6 +489,9 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
                     ..Policy::default()
                 };
                 let mut had_rights = false;
+                let number = |value: &str, range: core::ops::RangeInclusive<u32>| {
+                    value.parse().ok().filter(|v| range.contains(v))
+                };
                 for w in words {
                     let (key, value) = w.split_once('=').unwrap_or((w, ""));
                     let parsed = match key {
@@ -489,12 +507,20 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
                             .ok()
                             .filter(|s| (1..=65536).contains(s))
                             .map(|s| p.sockets = s),
+                        "rx" => number(value, BUFFER_MIN as u32..=BUFFER_MAX as u32)
+                            .map(|b| p.rx = Some(b)),
+                        "tx" => number(value, BUFFER_MIN as u32..=BUFFER_MAX as u32)
+                            .map(|b| p.tx = Some(b)),
+                        "per-peer" => number(value, 1..=PER_PEER_MAX).map(|v| p.per_peer = Some(v)),
+                        "linger" => number(value, 1..=LINGER_MAX_MS).map(|v| p.linger_ms = Some(v)),
                         _ => None,
                     };
                     if parsed.is_none() {
                         return err(
                             n,
-                            format!("`{w}` is not a grant's rights, rules, names or socket bound"),
+                            format!(
+                                "`{w}` is not a grant's rights, rules, names, socket bound, buffers ({BUFFER_MIN} to {BUFFER_MAX} bytes), per-peer bound (1 to {PER_PEER_MAX}) or linger (1 to {LINGER_MAX_MS} ms)"
+                            ),
                         );
                     }
                 }
@@ -596,6 +622,41 @@ grant listen-any rights=connect,listen,udp,ping,resolve,grant remote=any local=a
                 alloc::format!("moruna-netstack 1\ngrant listen rights=connect names={bad}@443\n");
             assert!(parse(&text).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_grant_sets_its_bounds_and_others_keep_the_settings() {
+        let c = parse(
+            "moruna-netstack 1
+setting handshake-timeout-ms 500
+grant listen-api rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000
+grant listen-rx rights=listen,grant rx=1024 per-peer=65536 linger=3600000
+grant listen-tx rights=connect tx=16777216 rx=16777216 tx=4096 per-peer=1 linger=1
+grant listen-plain rights=connect,grant
+",
+        )
+        .expect("parses");
+        assert_eq!(c.settings.handshake_timeout_ms, 500);
+        assert_eq!(Settings::default().handshake_timeout_ms, 10_000);
+        let bounds = |k: usize| {
+            let p = &c.grants[k].1;
+            (p.sockets, p.rx, p.tx, p.per_peer, p.linger_ms)
+        };
+        assert_eq!(
+            bounds(0),
+            (81, Some(65536), Some(65536), Some(8), Some(5000))
+        );
+        assert_eq!(
+            bounds(1),
+            (64, Some(1024), None, Some(65536), Some(3_600_000))
+        );
+        // The last of a key said twice holds.
+        assert_eq!(
+            bounds(2),
+            (64, Some(16 << 20), Some(4096), Some(1), Some(1))
+        );
+        assert_eq!(bounds(3), (64, None, None, None, None));
+        assert_eq!(c.grants[3].1.per_peer(), 8);
     }
 
     #[test]
@@ -726,6 +787,46 @@ grant listen-any rights=connect,listen,udp,ping,resolve,grant remote=any local=a
                 "moruna-netstack 1\ngrant listen rights=connect sockets=0\n",
                 2,
                 "socket bound",
+            ),
+            (
+                "moruna-netstack 1\ngrant listen rights=listen rx=1023\n",
+                2,
+                "buffers (1024 to",
+            ),
+            (
+                "moruna-netstack 1\ngrant listen rights=listen tx=16777217\n",
+                2,
+                "buffers",
+            ),
+            (
+                "moruna-netstack 1\ngrant listen rights=listen rx=\n",
+                2,
+                "buffers",
+            ),
+            (
+                "moruna-netstack 1\ngrant listen rights=listen per-peer=0\n",
+                2,
+                "per-peer bound (1 to 65536)",
+            ),
+            (
+                "moruna-netstack 1\ngrant listen rights=listen per-peer=65537\n",
+                2,
+                "per-peer",
+            ),
+            (
+                "moruna-netstack 1\ngrant listen rights=listen linger=0\n",
+                2,
+                "linger (1 to 3600000 ms)",
+            ),
+            (
+                "moruna-netstack 1\ngrant listen rights=listen linger=3600001\n",
+                2,
+                "linger",
+            ),
+            (
+                "moruna-netstack 1\nsetting handshake-timeout-ms 0\n",
+                2,
+                "1 to 3600000",
             ),
             ("moruna-netstack 1\nroute 10.0.0.0/8\n", 2, "not setting"),
             ("moruna-netstack 1\n", 0, "no grant"),

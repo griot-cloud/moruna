@@ -40,7 +40,8 @@ pub enum EgressError {
 }
 
 /// The policy of a job's channel: `connect` to each of `hosts` (lowercased, a trailing
-/// dot removed, each once) at port 443, holding at most `sockets` sockets at a time.
+/// dot removed, each once) at port 443, holding at most `sockets` sockets at a time, with
+/// the server's settings for their buffers, peers and linger.
 pub fn policy(hosts: &[String], sockets: u32) -> Result<Policy, EgressError> {
     if sockets == 0 {
         return Err(EgressError::NoSockets);
@@ -76,6 +77,13 @@ pub fn policy(hosts: &[String], sockets: u32) -> Result<Policy, EgressError> {
             })
             .collect(),
         sockets,
+        // Its sockets' buffers, the connections one peer holds and the linger are the network
+        // server's settings (moruna.net 3.1, item 1.3b), as admission's own `*` grant leaves
+        // them: a bound given here would not be covered by one left to the server.
+        rx: None,
+        tx: None,
+        per_peer: None,
+        linger_ms: None,
     })
 }
 

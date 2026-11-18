@@ -11,11 +11,13 @@ extern crate alloc;
 pub mod boot;
 pub mod config;
 pub mod device;
+pub mod grant;
 mod session;
 mod stack;
 pub mod tls;
 
 pub use config::{Config, ConfigError, Settings, parse};
 pub use device::Port;
-pub use session::{Session, Shared, after_turn, factory};
+pub use grant::Grant;
+pub use session::{Session, Shared, after_turn, factory, granted};
 pub use stack::{Card, Iface, Stack};

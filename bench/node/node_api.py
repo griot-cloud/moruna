@@ -224,9 +224,10 @@ def first_rows_s(events):
     return beat
 
 
-PENDING = ("the source and sink URLs are Blob's as item 3.5 will read them, and the native task is "
-           "named as bench/vm/gate_jobs.py names it: how a job names a registered function (3E) is "
-           "item 3.6's, and this document follows it when 3.5 and 3.6 merge")
+PENDING = ("the source and sink URLs are Blob's as item 3.5 will read them, the native task is named "
+           "as bench/vm/gate_jobs.py names it (how a job names a registered function, 3E, is item "
+           "3.6's), and the job record's times are read as `accepted` and `ended` (item 3.2 names "
+           "them): this follows them when 3.2, 3.5 and 3.6 merge")
 
 
 def job_document(workload, data_urls, out_url, image, cpus, mem_gib):

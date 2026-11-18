@@ -167,9 +167,13 @@ fn cloud(
     })
 }
 
+/// The stand-in cloud's grant and platform's, over loopback. A grant's sockets count its
+/// closing ones until they are freed, TIME-WAIT's 10 s included (work item 1.3b), and the
+/// test makes five connections in a row: so 16 each, where the cloud profile's platform
+/// grant has 4.
 const LOOPBACK: &str = "moruna-netstack 1
-grant listen-cloud rights=listen local=127.0.0.1/32@8080 sockets=4
-grant listen-platform rights=connect remote=127.0.0.1/32@8080-8081 local=127.0.0.1/32 sockets=4
+grant listen-cloud rights=listen local=127.0.0.1/32@8080 sockets=16
+grant listen-platform rights=connect remote=127.0.0.1/32@8080-8081 local=127.0.0.1/32 sockets=16
 ";
 
 #[test]
