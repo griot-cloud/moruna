@@ -106,7 +106,8 @@ def test_observations_aggregate_across_runs_in_the_store(
 ) -> None:  # noqa: ANN001
     """A task's observation carries its full cost key, the same in every run of the same code;
     with an observation store, its recommendation draws on every run the store holds and says
-    how many; without one, on this run only."""
+    how many; with none (``cost=False``; a run given no ``cost`` has the default store, 6.3g),
+    on this run only."""
     src_url, out_url, _ = dataset
     cost = moruna.CostSession(str(scratch / "observations"))
 
@@ -114,7 +115,9 @@ def test_observations_aggregate_across_runs_in_the_store(
         return next(t for t in report.to_dict()["tasks"] if t["role"] == "function")
 
     alone = function_task(
-        moruna.run(moruna.ParquetSource(src_url), identity, small_sink(out_url), **staging)
+        moruna.run(
+            moruna.ParquetSource(src_url), identity, small_sink(out_url), cost=False, **staging
+        )
     )
     assert alone["recommendation"]["cpu"]["basis"]["source"] == "this_run"
     assert alone["recommendation"]["cpu"]["basis"]["runs"] == 1
