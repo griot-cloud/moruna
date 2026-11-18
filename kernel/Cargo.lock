@@ -939,7 +939,10 @@ name = "moruna-node"
 version = "0.1.0"
 dependencies = [
  "moruna-abi",
+ "moruna-netstack",
+ "moruna-svc",
  "moruna-sys",
+ "netstack-protocol",
 ]
 
 [[package]]
@@ -1009,7 +1012,9 @@ name = "moruna-node-supervisor"
 version = "0.1.0"
 dependencies = [
  "moruna-node",
+ "moruna-svc",
  "moruna-sys",
+ "netstack-protocol",
  "node-protocol",
 ]
 

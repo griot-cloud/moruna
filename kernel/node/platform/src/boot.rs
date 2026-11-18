@@ -1,7 +1,7 @@
 //! `platform`'s boot, in the order of the system design's section 1D: find the cloud, set the
-//! wall clock, validate node config, hand `api` its config, and print the `cloud` and `ready`
-//! lines. Every way it cannot go on is one [`Fatal`], which prints as section 1B's
-//! `moruna: fatal <stage>: <reason>` line.
+//! wall clock, validate node config, report ready to Azure on Azure (section 1F), hand `api` its
+//! config, and print the `cloud` and `ready` lines. Every way it cannot go on is one [`Fatal`],
+//! which prints as section 1B's `moruna: fatal <stage>: <reason>` line.
 
 use alloc::{
     format,
@@ -16,7 +16,8 @@ use moruna_node_config::{Cloud, Handover, NodeConfig, READY, cloud_name};
 
 use crate::{
     date, instance,
-    machine::{Clock, Link, LinkError, Network},
+    machine::{Clock, Control, FOREVER, Link, LinkError, Network},
+    wireserver,
 };
 
 /// The port `api` listens on.
@@ -106,10 +107,10 @@ pub struct Inputs {
 
 /// Boots: returns the hand-over `api` took, having printed the `cloud` and `ready` lines through
 /// `console`, or the reason the node must stop.
-pub fn run<N: Network, C: Clock, L: Link>(
+pub fn run<N: Network, C: Clock, K: Control>(
     network: &mut N,
     clock: &mut C,
-    link: &mut L,
+    control: &mut K,
     console: &mut dyn FnMut(&str),
     inputs: Inputs,
 ) -> Result<Handover, Fatal> {
@@ -144,33 +145,101 @@ pub fn run<N: Network, C: Clock, L: Link>(
     // `api` prints once it has its config.
     console(&cloud_line(handover.cloud, &handover.instance));
 
+    // On Azure, the ready report, now that node config is valid (section 1F); without it Azure
+    // reboots the machine. Other clouds want none.
+    if handover.cloud == Cloud::Azure {
+        wireserver::report(network, clock)?;
+    }
+
     // 4. The hand-over, and `api`'s answer, within the limit. The address the ready line
     // names is asked first: the network server answers it at once, and asking it after `api`
     // has answered could find the limit all but spent.
-    let fatal = |reason: String| Fatal::new(Stage::Platform, reason);
     let deadline = clock.now().saturating_add(READY_LIMIT_NS);
-    let address = network
-        .address(deadline)
-        .map_err(|error| fatal(format!("the node's address is not known: {error}")))?;
-    link.send(&message, deadline)
-        .map_err(|error| fatal(format!("the hand-over was not sent to api: {error}")))?;
-    match link.receive(deadline) {
-        Ok(answer) if answer == READY => {}
-        Ok(_) => {
-            return Err(fatal(
-                "api answered the hand-over with something else".into(),
-            ));
-        }
-        Err(LinkError::TimedOut) => {
-            let seconds = READY_LIMIT_NS / instance::SECOND;
-            return Err(fatal(format!(
-                "api did not answer ready within {seconds} s"
-            )));
-        }
-        Err(error) => return Err(fatal(format!("api did not answer: {error}"))),
-    }
+    let address = network.address(deadline).map_err(|error| {
+        Fatal::new(
+            Stage::Platform,
+            format!("the node's address is not known: {error}"),
+        )
+    })?;
+    hand_over(control, &message, deadline)?;
 
     // 5. Ready.
     console(&ready_line(address, clock.now() / 1_000_000));
     Ok(handover)
+}
+
+/// Hands `message`, the encoded hand-over, to the next start of `api`, whose channel the
+/// supervisor sends on `control`, and hears `api` answer `ready`, all by `deadline`.
+fn hand_over<K: Control>(control: &mut K, message: &[u8], deadline: u64) -> Result<(), Fatal> {
+    let mut link = control.next_api(deadline).map_err(|error| {
+        Fatal::new(
+            Stage::Platform,
+            format!(
+                "the supervisor sent no channel to api: {}",
+                control_error(error)
+            ),
+        )
+    })?;
+    exchange(&mut link, message, deadline)
+}
+
+/// A failure of the supervisor's channel, in words: its closing is the supervisor's, not `api`'s.
+fn control_error(error: LinkError) -> String {
+    match error {
+        LinkError::Closed => "the supervisor closed its channel".into(),
+        error => error.to_string(),
+    }
+}
+
+/// Sends `message` on `link` and hears `api` answer `ready`, by `deadline`.
+fn exchange<L: Link>(link: &mut L, message: &[u8], deadline: u64) -> Result<(), Fatal> {
+    let fatal = |reason: String| Fatal::new(Stage::Platform, reason);
+    link.send(message, deadline)
+        .map_err(|error| fatal(format!("the hand-over was not sent to api: {error}")))?;
+    match link.receive(deadline) {
+        Ok(answer) if answer == READY => Ok(()),
+        Ok(_) => Err(fatal(
+            "api answered the hand-over with something else".into(),
+        )),
+        Err(LinkError::TimedOut) => {
+            let seconds = READY_LIMIT_NS / instance::SECOND;
+            Err(fatal(format!(
+                "api did not answer ready within {seconds} s"
+            )))
+        }
+        Err(error) => Err(fatal(format!("api did not answer: {error}"))),
+    }
+}
+
+/// After the boot, hands `handover` again to each new start of `api`, as the supervisor sends
+/// that start's channel (system design 2B; PM, item 2.2c), with 1D's 10 s for `ready` each
+/// time, counted from when the channel arrives. Nothing reaches the console: the supervisor's
+/// restart line and `api`'s new `tls` line say what happened. Returns only the reason it cannot
+/// go on.
+pub fn serve<C: Clock, K: Control>(clock: &mut C, control: &mut K, handover: &Handover) -> Fatal {
+    let message = match handover.encode() {
+        Ok(message) => message,
+        Err(error) => {
+            return Fatal::new(
+                Stage::Platform,
+                format!("node config is too large: {error}"),
+            );
+        }
+    };
+    loop {
+        // The wait for a start has no deadline: `api` may never die.
+        let mut link = match control.next_api(FOREVER) {
+            Ok(link) => link,
+            Err(error) => {
+                return Fatal::new(
+                    Stage::Platform,
+                    format!("the supervisor's channel: {}", control_error(error)),
+                );
+            }
+        };
+        let deadline = clock.now().saturating_add(READY_LIMIT_NS);
+        if let Err(fatal) = exchange(&mut link, &message, deadline) {
+            return fatal;
+        }
+    }
 }
