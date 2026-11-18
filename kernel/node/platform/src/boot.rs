@@ -16,7 +16,7 @@ use moruna_node_config::{Cloud, Handover, NodeConfig, READY, cloud_name};
 
 use crate::{
     date, instance,
-    machine::{Clock, Link, LinkError, Network},
+    machine::{Clock, Link, LinkError, Network, WallClock},
 };
 
 /// The port `api` listens on.
@@ -104,11 +104,27 @@ pub struct Inputs {
     pub memory_bytes: u64,
 }
 
-/// Boots: returns the hand-over `api` took, having printed the `cloud` and `ready` lines through
-/// `console`, or the reason the node must stop.
-pub fn run<N: Network, C: Clock, L: Link>(
+/// Sets the node's wall clock to `unix_seconds` as of `read_at_ns` on the monotonic clock: what it
+/// reads now is that time and the time since.
+fn set_wall_clock<C: Clock, W: WallClock>(
+    wall: &mut W,
+    clock: &C,
+    unix_seconds: u64,
+    read_at_ns: u64,
+) -> Result<(), String> {
+    let utc_ns = unix_seconds
+        .checked_mul(instance::SECOND)
+        .ok_or_else(|| String::from("the time is past what the clock holds"))?
+        .saturating_add(clock.now().saturating_sub(read_at_ns));
+    wall.set(utc_ns)
+}
+
+/// Boots: returns the hand-over `api` took, having set the wall clock through `wall` and printed
+/// the `cloud` and `ready` lines through `console`, or the reason the node must stop.
+pub fn run<N: Network, C: Clock, W: WallClock, L: Link>(
     network: &mut N,
     clock: &mut C,
+    wall: &mut W,
     link: &mut L,
     console: &mut dyn FnMut(&str),
     inputs: Inputs,
@@ -123,6 +139,13 @@ pub fn run<N: Network, C: Clock, L: Link>(
             .ok_or("the Date header of the answer that named the cloud is not an IMF-fixdate"),
     }
     .map_err(|reason| Fatal::new(Stage::InstanceData, reason))?;
+    // It is the node's one wall clock (system design 3D): the network server's TLS reads it.
+    set_wall_clock(wall, clock, wall_clock, found.read_at_ns).map_err(|reason| {
+        Fatal::new(
+            Stage::InstanceData,
+            format!("the wall clock was not set from the Date header: {reason}"),
+        )
+    })?;
 
     // 3. Node config: the instance's user-data.
     let config = found
@@ -173,4 +196,28 @@ pub fn run<N: Network, C: Clock, L: Link>(
     // 5. Ready.
     console(&ready_line(address, clock.now() / 1_000_000));
     Ok(handover)
+}
+
+/// How often `platform` sets the wall clock again once the node is ready (system design 3D): S3
+/// and Blob sign requests with it, and refuse any more than 15 minutes from their own.
+pub const RETIME_NS: u64 = 3600 * instance::SECOND;
+
+/// How long the request that reads the `Date` again may take.
+pub const RETIME_LIMIT_NS: u64 = 10 * instance::SECOND;
+
+/// Sets the wall clock again from the `Date` of `cloud`'s instance document: one request, within
+/// [`RETIME_LIMIT_NS`]; returns the Unix seconds it was set to. When it cannot, the clock runs on
+/// as it was last set and the reason is returned: the node goes on either way.
+pub fn retime<N: Network, C: Clock, W: WallClock>(
+    network: &mut N,
+    clock: &mut C,
+    wall: &mut W,
+    cloud: Cloud,
+) -> Result<u64, String> {
+    let deadline = clock.now().saturating_add(RETIME_LIMIT_NS);
+    let (date, read_at_ns) = instance::date_of(network, clock, cloud, deadline)?;
+    let unix_seconds =
+        date::parse(&date).ok_or_else(|| String::from("the Date header is not an IMF-fixdate"))?;
+    set_wall_clock(wall, clock, unix_seconds, read_at_ns)?;
+    Ok(unix_seconds)
 }

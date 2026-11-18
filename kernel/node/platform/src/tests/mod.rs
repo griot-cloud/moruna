@@ -8,6 +8,7 @@
 //! Azure's Instance Metadata Service), not captured from a machine in either cloud.
 
 mod boot;
+mod clock;
 mod date;
 mod http;
 mod instance;
@@ -16,14 +17,14 @@ mod svc;
 use core::net::Ipv4Addr;
 use std::{
     boxed::Box,
-    cell::Cell,
+    cell::{Cell, RefCell},
     format,
     rc::Rc,
     string::{String, ToString},
     vec::Vec,
 };
 
-use crate::machine::{Clock, Network, Stream, StreamError};
+use crate::machine::{Clock, Network, Stream, StreamError, WallClock};
 
 pub(crate) const SECOND: u64 = 1_000_000_000;
 
@@ -44,6 +45,31 @@ impl Clock for FakeClock {
 
     fn sleep_until(&mut self, at: u64) {
         self.0.set(self.0.get().max(at));
+    }
+}
+
+/// The node's wall clock as the tests hold it: every time it was set to, or the core's refusal.
+#[derive(Clone, Default)]
+pub(crate) struct FakeWall {
+    times: Rc<RefCell<Vec<u64>>>,
+    /// The core refuses every time, with this reason.
+    pub(crate) refuses: Option<String>,
+}
+
+impl FakeWall {
+    /// The times it was set to, in nanoseconds since 1970, in order.
+    pub(crate) fn times(&self) -> Vec<u64> {
+        self.times.borrow().clone()
+    }
+}
+
+impl WallClock for FakeWall {
+    fn set(&mut self, utc_ns: u64) -> Result<(), String> {
+        if let Some(reason) = &self.refuses {
+            return Err(reason.clone());
+        }
+        self.times.borrow_mut().push(utc_ns);
+        Ok(())
     }
 }
 

@@ -618,9 +618,11 @@ fn the_hand_over_crosses_a_channel_to_api_s_half() {
     let mut clock = FakeClock::default();
     let mut network = FakeNetwork::serving(&clock, |_, sent| openstack(sent));
     let mut lines = Vec::new();
+    let mut wall = super::FakeWall::default();
     let handed = boot::run(
         &mut network,
         &mut clock,
+        &mut wall,
         &mut ChannelLink(ours),
         &mut |line: &str| lines.push(line.to_string()),
         Inputs {

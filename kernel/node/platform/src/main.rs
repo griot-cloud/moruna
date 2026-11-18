@@ -5,10 +5,12 @@
 //! - `account`: its own account, which the network server charges its sockets to;
 //! - `network`: a listener of the network server, granted outbound connections to instance data;
 //! - `api`: the channel the supervisor links to `api`, for the hand-over;
-//! - `supervisor`: its `platform` bootstrap, the one message that gives the node's memory.
+//! - `supervisor`: its `platform` bootstrap, the one message that gives the node's memory;
+//! - `clock`: `root.clock`, the right to set the node's one wall clock (system design 3D).
 //!
 //! On a fatal error it prints the line and exits with failure, which stops the node. Once the
-//! node is ready it stays, idle and holding the hand-over: a service that ends stops the node.
+//! node is ready it stays, holding the hand-over, and sets the wall clock again from its cloud's
+//! `Date` every hour: a service that ends stops the node.
 
 #![no_std]
 #![no_main]
@@ -18,21 +20,39 @@ extern crate alloc;
 
 use alloc::{format, string::String};
 
-use moruna_node_config::Handover;
+use moruna_node_config::{Cloud, Handover};
 use moruna_node_platform::{
-    boot::{self, Fatal, Inputs, Stage},
+    boot::{self, Fatal, Inputs, RETIME_NS, Stage},
     instance,
+    machine::{Clock, WallClock},
     svc::{self, ChannelLink, Monotonic, Wan},
 };
-use moruna_svc::{
-    Account, Channel, Console, DEADLINE_INFINITE, Signals, now, println, start, wait_one,
-};
+use moruna_svc::{Account, Channel, Console, Handle, now, println, start};
 use netstack_protocol::net;
 
 moruna_svc::main!(run);
 
-/// Boots the node's platform; returns the hand-over `api` took.
-fn boot(console: &Console, started_ns: u64) -> Result<Handover, Fatal> {
+/// The core's wall clock, through `root.clock`, which the supervisor gives `platform` alone.
+struct CoreClock(Handle);
+
+impl WallClock for CoreClock {
+    fn set(&mut self, utc_ns: u64) -> Result<(), String> {
+        moruna_svc::clock_set_realtime(&self.0, utc_ns).map_err(|error| String::from(error.name()))
+    }
+}
+
+/// What `platform` holds once the node is ready.
+struct Ready {
+    /// The hand-over `api` took.
+    _handover: Handover,
+    cloud: Cloud,
+    network: Wan,
+    clock: Monotonic,
+    wall: CoreClock,
+}
+
+/// Boots the node's platform; returns what it holds once the node is ready.
+fn boot(console: &Console, started_ns: u64) -> Result<Ready, Fatal> {
     let instance_data = |reason: String| Fatal::new(Stage::InstanceData, reason);
     // Every start handle first, so an image that lacks one says so before anything is asked.
     let account = start::take("account")
@@ -48,6 +68,9 @@ fn boot(console: &Console, started_ns: u64) -> Result<Handover, Fatal> {
     let supervisor = start::take("supervisor")
         .map(Channel)
         .ok_or_else(|| own("platform was started without its bootstrap"))?;
+    let mut wall = start::take("clock")
+        .map(CoreClock)
+        .ok_or_else(|| own("platform was started without root.clock"))?;
     // The supervisor queues the message before it starts `platform`, so it is not waited for.
     let memory_bytes = svc::node_memory(supervisor, now())
         .map_err(|error| own(&format!("the node's memory is not known: {error}")))?;
@@ -69,16 +92,24 @@ fn boot(console: &Console, started_ns: u64) -> Result<Handover, Fatal> {
         ))
     })?;
 
-    boot::run(
+    let handover = boot::run(
         &mut network,
         &mut clock,
+        &mut wall,
         &mut ChannelLink(api),
         &mut |line: &str| println!(console, "{}", line),
         Inputs {
             started_ns,
             memory_bytes,
         },
-    )
+    )?;
+    Ok(Ready {
+        cloud: handover.cloud,
+        _handover: handover,
+        network,
+        clock,
+        wall,
+    })
 }
 
 fn run() -> i64 {
@@ -86,17 +117,24 @@ fn run() -> i64 {
     let Some(console) = start::take("console").map(Console) else {
         return 1;
     };
-    let _handover = match boot(&console, started_ns) {
-        Ok(handover) => handover,
+    let mut ready = match boot(&console, started_ns) {
+        Ok(ready) => ready,
         Err(fatal) => {
             println!(console, "{}", fatal);
             return 1;
         }
     };
-    // Idle: both ends of this channel are held and neither is written, so the wait does not end.
-    // If it ever does, `platform` ends with failure and the supervisor stops the node.
-    if let Ok(quiet) = Channel::create() {
-        let _ = wait_one(&quiet.0.0, Signals::READABLE, DEADLINE_INFINITE);
+    // Every hour, the wall clock again from the cloud's `Date`. One that cannot be read leaves
+    // the clock running as it was set, and the next hour tries again.
+    let mut next = ready.clock.now().saturating_add(RETIME_NS);
+    loop {
+        ready.clock.sleep_until(next);
+        let _ = boot::retime(
+            &mut ready.network,
+            &mut ready.clock,
+            &mut ready.wall,
+            ready.cloud,
+        );
+        next = next.saturating_add(RETIME_NS);
     }
-    1
 }

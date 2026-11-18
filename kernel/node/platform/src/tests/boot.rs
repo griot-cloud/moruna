@@ -13,7 +13,7 @@ use std::{
 use moruna_node_config::{Cloud, Handover, HandoverError, NodeConfig, base64};
 
 use super::{
-    FakeClock, FakeNetwork, RECORDED_AZURE_ID, RECORDED_CONFIG, RECORDED_OPENSTACK_ID,
+    FakeClock, FakeNetwork, FakeWall, RECORDED_AZURE_ID, RECORDED_CONFIG, RECORDED_OPENSTACK_ID,
     RECORDED_OPENSTACK_TIME, Reply, SECOND, Sent, answer, azure, openstack,
 };
 use crate::{
@@ -69,6 +69,7 @@ struct Booted {
     events: Vec<String>,
     api: FakeApi,
     clock: FakeClock,
+    wall: FakeWall,
 }
 
 impl Booted {
@@ -108,9 +109,11 @@ fn boot_with(
     };
     prepare(&mut api);
     let console = events.clone();
+    let mut wall = FakeWall::default();
     let result = run(
         &mut network,
         &mut clock,
+        &mut wall,
         &mut api,
         &mut |line: &str| console.borrow_mut().push(line.to_string()),
         inputs,
@@ -121,6 +124,7 @@ fn boot_with(
         events,
         api,
         clock,
+        wall,
     }
 }
 
@@ -182,6 +186,12 @@ fn a_node_on_openstack_hands_over_and_says_it_is_ready() {
             "the hand-over".to_string(),
             "moruna: ready api=10.0.2.15:443 boot_ms=46".to_string(),
         ]
+    );
+    // The node's wall clock was set once, before the hand-over: to that Date as of when its
+    // answer arrived, 2 ms before (system design 3D).
+    assert_eq!(
+        booted.wall.times(),
+        [RECORDED_OPENSTACK_TIME * SECOND + 2 * MS]
     );
     // What api got is the hand-over, as its half of the crate reads it.
     assert_eq!(booted.api.sent, [handover.encode().unwrap()]);

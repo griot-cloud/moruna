@@ -1,6 +1,7 @@
 //! What `platform` needs of the machine, as traits: outbound connections as byte streams, the
-//! core's monotonic clock, and the channel to `api`. The logic is written against these, so every
-//! rule is tested on a host; [`crate::svc`] gives the node's own.
+//! core's monotonic clock, the node's wall clock, and the channel to `api`. The logic is written
+//! against these, so every rule is tested on a host; [`crate::svc`] gives the node's own (and the
+//! program, `src/main.rs`, the wall clock).
 
 use alloc::{string::String, vec::Vec};
 use core::{fmt, net::Ipv4Addr};
@@ -72,6 +73,13 @@ pub trait Clock {
 
     /// Returns once the clock reads `at` or later.
     fn sleep_until(&mut self, at: u64);
+}
+
+/// The node's one wall clock, the core's (system design 3D), which `platform` alone may set:
+/// `clock_set_realtime` on `root.clock`.
+pub trait WallClock {
+    /// The wall clock reads `utc_ns`, nanoseconds since 1970 (UTC), now; or why the core refused.
+    fn set(&mut self, utc_ns: u64) -> Result<(), String>;
 }
 
 /// Why a message did not cross the link to `api`.

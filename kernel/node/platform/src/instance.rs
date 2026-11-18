@@ -294,3 +294,28 @@ pub fn find<N: Network, C: Clock>(
         };
     }
 }
+
+/// The `Date` of `cloud`'s instance document now, and the monotonic clock when it arrived: one
+/// request, which must be answered `200` with exactly one `Date` header before `deadline`. For
+/// setting the wall clock again once the node is ready (system design 3D).
+pub fn date_of<N: Network, C: Clock>(
+    network: &mut N,
+    clock: &C,
+    cloud: Cloud,
+    deadline: u64,
+) -> Result<(String, u64), String> {
+    let request = match cloud {
+        Cloud::Azure => AZURE,
+        Cloud::OpenStack => OPENSTACK,
+        Cloud::None => return Err("a node with no cloud has no instance data".into()),
+    };
+    let asked = |what: String| format!("{} {}: {what}", request.method(), request.path());
+    let response = ask(network, &request, deadline).map_err(|error| asked(error.to_string()))?;
+    let arrived = clock.now();
+    if response.status != 200 {
+        return Err(asked(format!("answered {}", response.status)));
+    }
+    let date =
+        date(&response).ok_or_else(|| asked("its answer has no single Date header".into()))?;
+    Ok((date, arrived))
+}
