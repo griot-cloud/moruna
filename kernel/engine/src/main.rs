@@ -371,6 +371,20 @@ fn grants(
                 .ok_or_else(|| format!("no process resource `{from}`"))?
                 .duplicate(Rights::WRITE | Rights::TRANSFER)
                 .map_err(|e| format!("duplicating the process resource `{from}`: {}", e.name()))?,
+            // The configuration runs once (`Config::parse`): the channel moves to the program
+            // as it is, taken from the start page here.
+            Source::Channel(from) => {
+                let channel = start::take(from).ok_or_else(|| {
+                    format!(
+                        "`grant {} channel {from}` names a channel the supervisor was not given",
+                        g.slot
+                    )
+                })?;
+                match channel.info() {
+                    Ok((moruna_svc::ObjectType::Channel, _)) => channel,
+                    _ => return Err(format!("`{from}` is not a channel")),
+                }
+            }
         };
         out.push((b(&g.slot), handle));
     }

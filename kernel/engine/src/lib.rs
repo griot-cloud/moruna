@@ -19,6 +19,9 @@
 //! grant process process process         # slot `process`: the supervisor's process resource
 //!                                      # `process`, from which the engine starts an image's
 //!                                      # native program (stream P)
+//! grant engine channel engine           # slot `engine`: the channel the supervisor starts with
+//!                                      # under `engine`, handed to the program as it is
+//!                                      # (`moruna serve --listen channel:engine`; runs 1 only)
 //! runs 3                              # how many times it is started, one after another
 //! ```
 //!
@@ -60,6 +63,10 @@ pub enum Source {
     /// A duplicate of a process resource the supervisor starts with, under this slot name:
     /// the engine makes the process of an image's native program (`abi: moruna`) from it.
     Process(String),
+    /// A channel the supervisor starts with, under this slot name, handed to the program as
+    /// it is: on a node, the channel whose other end is `api`'s (system design 3A). A channel
+    /// has one end here, so a configuration with one runs once.
+    Channel(String),
 }
 
 /// One handle the engine starts with.
@@ -114,6 +121,7 @@ fn source_roles(source: &Source) -> Vec<(&str, u8)> {
         }
         // stream P
         Source::Process(name) => alloc::vec![(name.as_str(), 3)],
+        Source::Channel(name) => alloc::vec![(name.as_str(), 4)],
         _ => Vec::new(),
     }
 }
@@ -239,6 +247,17 @@ impl Config {
                         {
                             Source::Process(String::from(from))
                         }
+                        (Some("channel"), Some(from), None)
+                            if slot_ok(from) && from != "account" =>
+                        {
+                            if grants
+                                .iter()
+                                .any(|g| g.source == Source::Channel(from.into()))
+                            {
+                                return Err(refuse("a channel is granted to one slot"));
+                            }
+                            Source::Channel(String::from(from))
+                        }
                         (Some("disk"), Some(device), None)
                             if slot.starts_with("disk.") && slot_ok(device) =>
                         {
@@ -254,7 +273,8 @@ impl Config {
                             return Err(refuse(
                                 "a grant is `grant SLOT lookup SERVICE`, `grant SLOT personality` \
                                  or `grant SLOT data SLOT` or `grant SLOT service SLOT` or \
-                                 `grant SLOT process SLOT` or `grant disk.SLOT disk DEVICE`",
+                                 `grant SLOT process SLOT` or `grant SLOT channel SLOT` or \
+                                 `grant disk.SLOT disk DEVICE`",
                             ));
                         }
                     };
@@ -280,6 +300,17 @@ impl Config {
                 _ => return Err(refuse("not a key this configuration has")),
             }
         }
+        let runs = runs.unwrap_or(1);
+        if runs != 1
+            && grants
+                .iter()
+                .any(|g| matches!(g.source, Source::Channel(_)))
+        {
+            return Err(String::from(
+                "a channel is handed to the program as it is, once: a configuration with \
+                 `grant SLOT channel SLOT` runs 1",
+            ));
+        }
         Ok(Config {
             program: program.ok_or_else(|| String::from("no `program` line"))?,
             args,
@@ -289,8 +320,53 @@ impl Config {
                 String::from("no `scratch` line: an explicit scratch account is required")
             })?,
             grants,
-            runs: runs.unwrap_or(1),
+            runs,
         })
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+
+    #[test]
+    fn a_channel_is_handed_over_once_to_one_slot() {
+        let config = Config::parse(
+            "program /moruna/bin/moruna\narg serve\narg --listen\narg channel:engine\n\
+             memory 4096\nscratch 4096\ngrant linux personality\ngrant engine channel engine\n\
+             runs 1\n",
+        )
+        .expect("a node's job");
+        assert_eq!(
+            config.grants[1],
+            Grant {
+                slot: "engine".into(),
+                source: Source::Channel("engine".into()),
+            }
+        );
+        for (text, why) in [
+            (
+                "program /e\nmemory 4096\nscratch 4096\ngrant engine channel engine\nruns 2\n",
+                "runs 1",
+            ),
+            (
+                "program /e\nmemory 4096\nscratch 4096\ngrant a channel engine\n\
+                 grant b channel engine\n",
+                "one slot",
+            ),
+            (
+                "program /e\nmemory 4096\nscratch 4096\ngrant a channel account\n",
+                "a grant is",
+            ),
+            (
+                "program /e\nmemory 4096\nscratch 4096\ngrant a data engine\n\
+                 grant b channel engine\n",
+                "different data/listener/admission roles",
+            ),
+        ] {
+            let refused = Config::parse(text).expect_err(why);
+            assert!(refused.contains(why), "{text}: {refused}");
+        }
     }
 }
 
