@@ -2,18 +2,21 @@
 
     bench/node/run.py --plan PLAN --dry-run [--vhd F] [--tasks DIR] [--ref066 REF] [--stamp yyyymmddHHMM]
     bench/node/run.py --plan PLAN --go --vhd F --tasks DIR [--ref066 REF]
-    bench/node/run.py --plan PLAN --local --engines-root DIR --results DIR [--reference-json F]
+    bench/node/run.py --plan PLAN --local --engines-root DIR --results DIR [--store-endpoint URL]
+                      [--reference-json F]
 
 One run, in order, every step on the run's resource group in `griot-dev` (azure.py):
 
-1. **Provision:** the group; a storage account with containers for the node's disk, the data,
-   the code and the results; the plan's data uploaded; the Moruna node from its VHD (item 1.13's
-   steps) and one Linux machine (Ubuntu 24.04) for the other engines, each the plan's size in its
-   zone. The node is read from its console until `ready`; the Linux machine installs every engine
-   (engines/setup-linux.sh) and copies the data to its disk, timed apart.
+1. **Provision:** the group; a storage account with containers for the node's disk, the data
+   (the one container every engine reads its inputs from and writes its output to), the code and
+   the results; the plan's data uploaded; the Moruna node from its VHD (item 1.13's steps) and one
+   Linux machine (Ubuntu 24.04) for the other engines, each the plan's size in its zone. The node
+   is read from its console until `ready`; the Linux machine builds 0.6.6's wheel once and keeps
+   it in the container, and installs every engine with its Blob reader (engines/setup-linux.sh).
 2. **Run** the plan's runs one at a time, in its order (plan.py): Moruna's through its API
-   (node_api.py), every other engine's over `az vm run-command` (engines/measure.py). Each output
-   is checked against 0.6.6's on the Linux machine.
+   (node_api.py), every other engine's over `az vm run-command` (engines/measure.py), the
+   container's account and key given to it as environment variables. Each output is checked
+   against 0.6.6's on the Linux machine.
 3. **Collect** the records into `bench/node/results/<stamp>/`, the table into its `table.md`, and
    the run's entry, with a root-cause entry for each miss (rootcause.py), into
    `architecture/benchmark-log.md`.
@@ -25,7 +28,8 @@ the node's address) are printed as `<names>`. Creating resources needs the PM's 
 time (1E), so a real run needs `--go`, which says it was given.
 
 `--local` runs the plan's Linux runs on this machine with measure.py, with no cloud: the engines'
-check on the Mac (work item 6.1, phase 1). Moruna's runs are skipped there.
+check on the Mac (work item 6.1, phase 1), each engine reading and writing a local Blob emulator's
+container (`--store-endpoint`, Azurite) as it would Azure's. Moruna's runs are skipped there.
 """
 import argparse
 import datetime
@@ -42,6 +46,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 sys.path.insert(1, os.path.join(HERE, "..", "vm"))
+sys.path.insert(2, os.path.join(HERE, "engines"))
 import azure  # noqa: E402
 import collect  # noqa: E402
 import node_api  # noqa: E402
@@ -235,12 +240,14 @@ class Bench:
             x.az(cmd, secrets=s)
         src = os.path.expanduser(self.plan["dataset"]["source_dir"])
         for f in self.plan["dataset"]["files"]:
-            x.az(azure.upload(c, key, "data", f, os.path.join(src, f)), secrets=s)
+            # The one container every engine reads from and writes to (store.py): inputs under nyc/.
+            x.az(azure.upload(c, key, "data", f"nyc/{f}", os.path.join(src, f)), secrets=s)
         for name in ("harness.tar.gz", "moruna-066.tar.gz", "runs.json"):
             x.az(azure.upload(c, key, "code", name, f"{sec}/{name}"), secrets=s)
-        # Long enough for the slowest plan; the account goes with the group at the end.
+        # Long enough for the slowest plan; the account goes with the group at the end. `code` is
+        # written once, by the setup's 0.6.6 wheel.
         expiry = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=48)).strftime("%Y-%m-%dT%H:%MZ")
-        for container, perms in (("code", "r"), ("data", "r"), ("results", "racwl")):
+        for container, perms in (("code", "racw"), ("results", "racwl")):
             s[f"sas-{container}"] = x.az(azure.sas(c, key, container, perms, expiry), out=f"sas-{container}", secrets=s)
         for cmd in azure.nsgs(c):
             x.az(cmd)
@@ -276,8 +283,7 @@ class Bench:
 
     def setup_linux(self):
         x, s = self.x, self.secrets
-        params = [f"BASE={self.base()}", f"SAS_CODE={s['sas-code']}", f"SAS_DATA={s['sas-data']}",
-                  "FILES=" + " ".join(self.plan["dataset"]["files"])]
+        params = [f"BASE={self.base()}", f"SAS_CODE={s['sas-code']}"]
         out = x.az(azure.run_command(self.c, "@" + os.path.join(HERE, "engines", "setup-linux.sh"), params),
                    out="setup", secrets=s)
         x.az(azure.run_command(self.c, f'curl -sSf -o {DATA}/runs.json "$BASE/code/runs.json?$SAS_CODE"',
@@ -302,48 +308,61 @@ class Bench:
             return ["--make-reference", ref]
         return ["--reference-dump", ref]
 
+    def store_params(self):
+        """The run's container, as measure.py and the engines read it (store.py), for run-command."""
+        return [f"BENCH_ACCOUNT={self.c.account}", f"BENCH_KEY={self.secrets['storage-key']}", "BENCH_CONTAINER=data"]
+
     def linux(self, spec):
         cmd = MEASURE + ["run", "--spec", f"{DATA}/runs.json", "--id", spec["id"], "--root", ENG, "--results",
                          f"{DATA}/results", "--work", f"{DATA}/work"] + self.reference_args(spec)
-        out = self.x.az(azure.run_command(self.c, f"{JAVA} {shlex.join(cmd)}"), out=f"measured {spec['id']}")
+        params = self.store_params() if self.plan["linux_data"] == "blob" else []
+        out = self.x.az(azure.run_command(self.c, f"{JAVA} {shlex.join(cmd)}", params), out=f"measured {spec['id']}",
+                        secrets=self.secrets)
         got = measured(out)
         if got:
             self.x.say(f"      {json.dumps(got)}")
         return got
 
     def moruna(self, spec):
+        """One job on the node. Operational time runs from `POST /v1/jobs` answered (the job handed
+        to the ready engine) to the output durably written, which is the job's end: by the node's
+        own clock where its job record has both times, else by this machine's, the job read every
+        half second. Every mark is kept, the first rows at the sink among them."""
         x, s = self.x, self.secrets
-        urls = [f"{self.base()}/data/{f}" for f in self.plan["dataset"]["files"]]
-        doc = node_api.job_document(spec["job"], urls, f"{self.base()}/results/node/{spec['id']}/",
-                                    {"location": f"{self.base()}/code/gate-{spec['job']}"}, spec["cpus"],
-                                    self.budget_gib or self.plan["machine"]["mem_gib"])
+        urls = [f"{self.base()}/data/{n}" for n in spec["inputs"]]
+        budget = self.budget_gib or self.plan["machine"]["mem_gib"]
+        doc = node_api.job_document(spec["job"], urls, f"{self.base()}/data/{spec['output']}/",
+                                    {"location": f"{self.base()}/code/gate-{spec['job']}"}, spec["cpus"], budget)
         x.note(node_api.PENDING)
-        t_submit = time.time()
+        t_sent = time.time()
         jid = self.node.submit(doc)
+        t_answered = time.time()
 
         def ended():
             j = self.node.job(jid)
             return j if j.get("state") in node_api.ENDED else None
 
-        j = x.poll("the job has ended", 2, spec["timeout_s"], ended)
+        j = x.poll("the job has ended", 0.5, spec["timeout_s"], ended)
+        t_seen = time.time()
         if j is None:
             self.node.call("POST", f"/v1/jobs/{jid}/cancel", None, "submit")
             j = {"state": "timed out"}
         events, report = self.node.events(jid), self.node.report(jid)
-        first = node_api.first_rows_s(events)
         times = j.get("times") or {}
-        job_s = times["ended"] - times["started"] if times.get("ended") and times.get("started") else None
+        node_s = times["ended"] - times["accepted"] if times.get("ended") and times.get("accepted") else None
         rec = {"spec": spec, "job_id": jid, "state": j.get("state"), "ok": j.get("state") == "completed",
                "startup_s": self.boot_ms / 1e3 if self.boot_ms else None, "boot_ms": self.boot_ms,
-               "engine_start_s": first, "job_s": job_s,
-               "operational_s": job_s - first if job_s is not None and first is not None else None,
-               "submit_to_end_s": round(time.time() - t_submit, 3),
+               "operational_s": node_s if node_s is not None else round(t_seen - t_answered, 3),
+               "operational_by": "the node's clock" if node_s is not None else "this machine's clock, read every 0.5 s",
+               "marks": {"sent": t_sent, "answered": t_answered, "end_seen": t_seen, "node_times": times,
+                         "first_rows_s": node_api.first_rows_s(events)},
+               "memory_gib": budget, "data": "blob",
                "cpu_s": report.get("cpu_s"), "peak_bytes": report.get("peak_anon_bytes"),
                "split": runner_split.split(report)["split"]}
         check = MEASURE + ["check", "--workload", spec["job"], "--out", f"{DATA}/work/node-{spec['id']}", "--id",
                            spec["id"], "--root", ENG, "--results", f"{DATA}/results", "--blob-prefix",
-                           f"node/{spec['id']}/"] + self.reference_args(spec)
-        out = x.az(azure.run_command(self.c, shlex.join(check), [f"BASE={self.base()}", f"SAS_RESULTS={s['sas-results']}"]),
+                           spec["output"]] + self.reference_args(spec)
+        out = x.az(azure.run_command(self.c, shlex.join(check), self.store_params()),
                    out=f"checked {spec['id']}", secrets=s)
         rec["output_check"] = {"verdict": (measured(out) or {}).get("output")}
         rec["output_check"]["ok"] = (rec["output_check"]["verdict"] or "").startswith(("bit for bit", "within"))
@@ -368,7 +387,8 @@ class Bench:
         return {"date": self.c.stamp, "commit": commit, "node_image": self.a.vhd,
                 "machines": f"{self.c.size}, zone {self.c.zone}, {self.c.location}, subscription {self.c.subscription}",
                 "linux_image": setup.get("linux_image"),
-                "data": f"{setup.get('copy_bytes')} bytes copied to the Linux machine in {setup.get('copy_s')} s",
+                "data": f"read and written in Blob container `data`; 0.6.6's wheel {setup.get('wheel_066')} "
+                        f"in {setup.get('wheel_066_s')} s, outside every timing",
                 "results": os.path.relpath(self.results, REPO)}
 
     # 4. Tear down ----------------------------------------------------------------------------------
@@ -419,11 +439,23 @@ def finish(plan, results, meta, log=LOG):
 
 
 def local(plan, args, out=sys.stdout, python=sys.executable):
-    """The plan's Linux runs on this machine, measured by measure.py (the Mac's check)."""
+    """The plan's Linux runs on this machine, measured by measure.py (the Mac's check). A `blob`
+    plan needs a local emulator (`--store-endpoint`, Azurite): the inputs go into its container
+    first, outside every timing, and each engine then reads and writes it with its own reader."""
+    import store as stores
     results = os.path.abspath(args.results)
     work = os.path.join(results, "work")
     os.makedirs(work, exist_ok=True)
     src = os.path.expanduser(plan["dataset"]["source_dir"])
+    env = dict(os.environ)
+    if plan["linux_data"] == "blob":
+        if not getattr(args, "store_endpoint", ""):
+            raise SystemExit("a blob plan here needs --store-endpoint, a local emulator's (Azurite's)")
+        store = stores.Store(stores.AZURITE_ACCOUNT, stores.AZURITE_KEY, "data", args.store_endpoint)
+        store.create()
+        for f in plan["dataset"]["files"]:
+            store.upload(os.path.join(src, f), f"nyc/{f}")
+        env.update(store.env())
     every = plans.runs(plan, DATA)
     skipped = [r["id"] for r in every if r["where"] != "linux"]
     if skipped:
@@ -435,10 +467,11 @@ def local(plan, args, out=sys.stdout, python=sys.executable):
                 r[k] = r[k].replace(DATA, work, 1)
         spec = os.path.join(work, f"{r['id']}.spec.json")
         json.dump(r, open(spec, "w"))
-        ref = ["--reference-json", os.path.expanduser(args.reference_json)] if args.reference_json else []
+        reference = os.path.expanduser(args.reference_json.format(job=r["job"])) if args.reference_json else ""
+        ref = ["--reference-json", reference] if reference and os.path.exists(reference) else []
         cmd = [python, os.path.join(HERE, "engines", "measure.py"), "run", "--spec", spec, "--root",
                os.path.abspath(args.engines_root), "--results", results, "--work", work] + ref
-        p = subprocess.run(cmd, capture_output=True, text=True)
+        p = subprocess.run(cmd, capture_output=True, text=True, env=env)
         line = measured(p.stdout)
         out.write((json.dumps(line) if line else f"{r['id']}: no result: {p.stderr[-500:]}") + "\n")
         out.flush()
@@ -459,7 +492,9 @@ def main(argv=None, out=sys.stdout):
                    help="0.6.6's commit, built on the Linux machine")
     p.add_argument("--stamp", default="", help="yyyymmddHHMM; now, in UTC, by default")
     p.add_argument("--engines-root", default="", help="--local: install.py's root")
-    p.add_argument("--reference-json", default="", help="--local: a canon.py reference to check outputs against")
+    p.add_argument("--reference-json", default="",
+                   help="--local: a canon.py reference to check outputs against; `{job}` names the job")
+    p.add_argument("--store-endpoint", default="", help="--local: a local Blob emulator's endpoint (Azurite)")
     p.add_argument("--results", default="")
     a = p.parse_args(argv)
     path = a.plan if os.path.exists(a.plan) else plans.default_plan_path(a.plan)

@@ -57,14 +57,20 @@ def summarise(records, plan: dict) -> dict:
     for job in plan["jobs"]:
         mine = [r for r in records if r["spec"].get("job", r["spec"].get("workload")) == job]
         table = {}
-        for engine in plan["engines"]:
+        for engine in plans.engines_for(plan, job):
             runs = [r for r in mine if r["spec"]["engine"] == engine and not r["spec"].get("noise")
                     and (r["spec"].get("repeat") or 0) >= 1]
             ok = [r for r in runs if r.get("ok")]
             splits = [r.get("split") or {} for r in ok]
+            data = sorted({r.get("data") for r in runs if r.get("data")})
             table[engine] = {
                 "label": plans.ENGINES[engine]["label"], "function": plans.ENGINES[engine]["function"],
                 "runs": len(runs), "ok": len(ok),
+                # What the engine was given (the PM: each platform's own on the same machine), and
+                # how it reached the data: its own Blob reader, or a local copy timed apart.
+                "memory_gib": med([r.get("memory_gib") for r in runs]),
+                "data": ", ".join(data) or None,
+                "copy_s": med([(r.get("copy_in_s") or 0) + (r.get("copy_out_s") or 0) or None for r in ok]),
                 "operational_s": med([r.get("operational_s") for r in ok]),
                 "startup_s": med([r.get("startup_s") for r in ok]),
                 "cpu_s": med([r.get("cpu_s") for r in ok]),
