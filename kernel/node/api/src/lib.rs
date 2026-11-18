@@ -17,7 +17,8 @@
 //!   listener closes and one opens at the next ([`network::Network`]).
 //! - **`ready`:** once the listener first opens, the process answers `platform` with
 //!   [`moruna_node_config::READY`], once, and the node document's `boot_ms` is the core's
-//!   monotonic clock then.
+//!   monotonic clock then; or, for a start after the node's first ready (item 2.2c), the
+//!   node's `boot_ms` the hand-over carries, so that it says the node's boot, not this start's.
 //! - **Serving:** each accepted socket is one server connection, its bytes moved by
 //!   requests the process sends to the network server without waiting on them
 //!   ([`network::Conn`]). One thread: a loop takes the network server's answers, polls the
@@ -88,6 +89,10 @@ pub enum Error {
     Identity(bool, IdentityError),
     /// The server could not be made from its config.
     Server(String),
+    /// A request to [`TEST_EXIT_PATH`](moruna_api_server::TEST_EXIT_PATH) came: the
+    /// `cloud-test` image's way to end the process, which is no failure (work item 2.2c).
+    #[cfg(feature = "test-exit")]
+    TestExit,
 }
 
 impl fmt::Display for Error {
@@ -105,6 +110,8 @@ impl fmt::Display for Error {
             Error::Identity(true, error) => write!(f, "node config's tls: {error}"),
             Error::Identity(false, error) => write!(f, "the node's own TLS identity: {error}"),
             Error::Server(why) => write!(f, "the API server: {why}"),
+            #[cfg(feature = "test-exit")]
+            Error::TestExit => write!(f, "a request to {}", moruna_api_server::TEST_EXIT_PATH),
         }
     }
 }
@@ -258,14 +265,21 @@ pub fn run(
         if let Some(event) = network.borrow_mut().tend(at)? {
             say(&event.line());
             if !answered && matches!(event, Event::Listening(_)) {
-                // System design 1B: from the core's first instruction to ready.
-                server.facts_mut().boot_ms = at / 1_000_000;
+                // System design 1B: from the core's first instruction to the node's ready,
+                // which a restarted api is handed (item 2.2c).
+                server.facts_mut().boot_ms = handover.boot_ms.unwrap_or(at / 1_000_000);
                 ready(platform)?;
                 answered = true;
             }
         }
         server.poll();
         network.borrow_mut().flush()?;
+        // `cloud-test` only (work item 2.2c): the answer to the request is sent; the process
+        // ends.
+        #[cfg(feature = "test-exit")]
+        if server.exit_requested() {
+            return Err(Error::TestExit);
+        }
         let mut deadline = network.borrow().look_at();
         if let Some(ms) = server.deadline() {
             deadline = deadline.min(ms.saturating_mul(1_000_000));

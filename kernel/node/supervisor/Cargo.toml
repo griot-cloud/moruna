@@ -17,3 +17,7 @@ moruna-node = { path = "../core", version = "=0.1.0" }
 moruna-sys = { workspace = true, features = ["heap"] }
 
 node-protocol = { path = "../protocol", version = "=0.1.0" }
+# The network server's client, with which the supervisor mints a restarted service's listener
+# (item 2.2c).
+moruna-svc.workspace = true
+netstack-protocol = { path = "../../net/protocol", version = "=0.1.0" }

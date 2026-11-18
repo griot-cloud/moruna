@@ -10,6 +10,8 @@ moruna-node = { path = "../core", version = "=0.1.0" }
 moruna-image = { path = "../../tools/image", version = "=0.1.0" }
 engine = { path = "../../engine", version = "=0.1.0" }
 moruna-netstack = { path = "../../net/stack", version = "=0.1.0" }
+# The `grant` right a restart record's granting slot must hold (item 2.2c).
+netstack-protocol = { path = "../../net/protocol", version = "=0.1.0" }
 
 moruna-storage-format = { path = "../../../crates/moruna-storage-format", version = "=0.6.6", default-features = false, features = ["pure", "crypto"] }
 

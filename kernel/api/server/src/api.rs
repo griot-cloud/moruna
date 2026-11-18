@@ -99,6 +99,11 @@ pub(crate) fn error_body(code: ErrorCode, message: &str) -> Vec<u8> {
     serde_json::to_vec(&ErrorBody::new(code, message)).unwrap_or_default()
 }
 
+/// The path that ends `api` in a `cloud-test` image (work item 2.2c), with feature `test-exit`
+/// only: any method, no token. A release build has no such route.
+#[cfg(feature = "test-exit")]
+pub const TEST_EXIT_PATH: &str = "/v1/test/exit";
+
 /// What the head of a request decides.
 #[derive(Debug)]
 pub(crate) enum Admission {
@@ -169,6 +174,9 @@ pub(crate) struct Api {
     /// The calls whose answers come later, by ticket, and the answers that have come.
     pending: BTreeMap<u64, Pending>,
     ready: BTreeMap<u64, Answer>,
+    /// A request to [`TEST_EXIT_PATH`] has come.
+    #[cfg(feature = "test-exit")]
+    pub exit: bool,
 }
 
 impl core::fmt::Debug for Api {
@@ -201,6 +209,8 @@ impl Api {
             host,
             pending: BTreeMap::new(),
             ready: BTreeMap::new(),
+            #[cfg(feature = "test-exit")]
+            exit: false,
         }
     }
 
@@ -212,6 +222,14 @@ impl Api {
     /// only for an operation that takes one, and a submit is `busy` on its head while a job
     /// runs. Each call of an operation but `health` is recorded.
     pub(crate) fn admit(&mut self, request: &Request, body: usize, now: u64) -> Admission {
+        // `cloud-test` only: the caller ends once this answer is on its way.
+        #[cfg(feature = "test-exit")]
+        if request.path == TEST_EXIT_PATH {
+            self.exit = true;
+            let mut answer = Answer::ok(Ok(br#"{"status":"exiting"}"#.to_vec()));
+            answer.close = true;
+            return Admission::Now(Outcome::Answer(answer));
+        }
         if request.path == MCP_PATH {
             return self.admit_mcp(request, now);
         }

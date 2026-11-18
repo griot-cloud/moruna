@@ -137,6 +137,48 @@ fn what_no_operation_takes_is_refused() {
     assert_eq!(api.recorded(), 3);
 }
 
+/// A release build, without feature `test-exit`, has no test route (work item 2.2c): the path
+/// `cloud-test` ends `api` on is in no operation, whatever the method.
+#[cfg(not(feature = "test-exit"))]
+#[test]
+fn a_release_build_has_no_test_exit_route() {
+    let signer = Signer::new();
+    let mut api = api(&signer);
+    let admin = signer.token("i-1", NOW + 60, &["admin"]);
+    for (method, token) in [
+        ("GET", None),
+        ("POST", None),
+        ("POST", Some(admin.as_str())),
+    ] {
+        let mut request = get("/v1/test/exit", token);
+        request.method = method.to_string();
+        let answer = api.answer(&request, &[], NOW);
+        assert_eq!(answer.status, 404, "{method}");
+        assert_eq!(body(&answer)["error"]["code"], "not_found");
+        assert!(!answer.close);
+    }
+}
+
+/// A `cloud-test` build answers a request to its test route, closes the connection, and asks
+/// its caller to end (work item 2.2c).
+#[cfg(feature = "test-exit")]
+#[test]
+fn a_cloud_test_build_asks_its_caller_to_end_on_test_exit() {
+    let signer = Signer::new();
+    let mut api = api(&signer);
+    assert_eq!(api.answer(&get("/v1/health", None), &[], NOW).status, 200);
+    assert!(!api.exit, "no other request ends the server");
+    let answer = api.answer(&get(TEST_EXIT_PATH, None), &[], NOW);
+    assert_eq!((answer.status, answer.close), (200, true));
+    assert_eq!(body(&answer), json!({"status": "exiting"}));
+    assert!(api.exit);
+    assert_eq!(
+        api.recorded(),
+        0,
+        "an operation's record is never made for it"
+    );
+}
+
 #[test]
 fn a_token_is_needed_and_its_scope_must_cover_the_operation() {
     let signer = Signer::new();

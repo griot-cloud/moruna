@@ -197,6 +197,7 @@ fn handover_of(user_data: &str) -> Handover {
         wall_clock: WALL_CLOCK,
         read_at_ns: now(),
         memory_bytes: MEMORY_BYTES,
+        boot_ms: None,
     }
 }
 
