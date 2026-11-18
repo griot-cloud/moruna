@@ -14,9 +14,13 @@
 //! page of the queue its flow hashes to, and sends wait, in order, for pages. A buffer
 //! the card returns on a receive queue is checked (its length, its header) before its
 //! frame is handed to the hub, which queues it for every subscribed connection, and
-//! the buffer is posted again. A link change (the configuration interrupt) answers the
-//! connections waiting for one. When every client has gone the driver resets the
-//! card and ends.
+//! the buffer is posted again. The header's flags are taken as Linux takes them,
+//! though none was negotiated (item 1.6f): `DATA_VALID` is taken, `NEEDS_CSUM`'s
+//! partial checksum is completed, a GSO type is refused. A refused buffer is counted
+//! by reason and a frame taken with flags by its flags; the first of each is printed
+//! with its header, and the last line names them all.
+//! A link change (the configuration interrupt) answers the connections waiting for
+//! one. When every client has gone the driver resets the card and ends.
 
 #![no_std]
 #![no_main]
@@ -36,7 +40,7 @@ use moruna_virtio::{
     Buffer,
     device::{Device, VECTOR, VirtQueue},
     kind,
-    net::{self, NetConfig, feature},
+    net::{self, NetConfig, RxCounts, feature},
 };
 use net_protocol::{Info, Ring, Server, flow_hash, net as proto};
 
@@ -133,13 +137,15 @@ impl Ring for Card {
 struct Net {
     card: Card,
     server: Server,
+    /// The receive buffers refused, by reason, and the frames taken with flags.
+    rx: RxCounts,
 }
 
 impl Net {
     /// Takes everything the card has returned: the link, frames received, transmit
     /// pages done; then puts waiting frames on the pages freed.
     fn service(&mut self) -> Result<(), String> {
-        let Net { card, server } = self;
+        let Net { card, server, rx } = self;
         if card.status {
             let up = card
                 .device
@@ -157,23 +163,38 @@ impl Net {
                     .pop_used()
                     .map_err(|e| format!("receive queue {pair}: {e:?}"))?;
                 let Some(used) = used else { break };
-                let rx = &mut card.rx[pair];
-                let buffer = rx
+                let queue = &mut card.rx[pair];
+                let buffer = queue
                     .heads
                     .remove(&used.head)
                     .ok_or("the card returned a receive chain not in flight")?;
                 let at = buffer * PAGE;
-                match net::received(&rx.memory.map, at, PAGE, used.len, card.max_frame) {
-                    Ok(range) => {
-                        let mut frame = alloc::vec![0u8; range.len()];
-                        rx.memory
-                            .map
-                            .read(range.start, &mut frame)
-                            .map_err(|e| format!("receive page: {}", e.name()))?;
+                let map = &queue.memory.map;
+                let taken =
+                    net::received(map, at, PAGE, used.len, card.max_frame).and_then(|got| {
+                        let mut frame = alloc::vec![0u8; got.frame.len()];
+                        map.read(got.frame.start, &mut frame)?;
+                        got.complete(&mut frame)?;
+                        Ok((got.flags, frame))
+                    });
+                let header =
+                    || net::header(map, at).map_err(|e| format!("receive page: {}", e.name()));
+                match taken {
+                    Ok((flags, frame)) => {
+                        if flags != 0 {
+                            rx.take(flags, used.len, header()?);
+                        }
                         server.hub.deliver(&frame);
                     }
-                    // A malformed buffer is the card's error: counted, and dropped.
-                    Err(_) => server.hub.rx_errors += 1,
+                    // A malformed buffer is the card's error: counted by reason, and
+                    // dropped.
+                    Err(e) => {
+                        let Some(reason) = net::Reason::of(&e) else {
+                            return Err(format!("receive page: {e:?}"));
+                        };
+                        rx.refuse(reason, used.len, header()?);
+                        server.hub.rx_errors += 1;
+                    }
                 }
                 card.post_rx(pair, buffer)?;
                 reposted = true;
@@ -217,7 +238,7 @@ impl Handler for Connection {
         self.id = Some(cx.connection());
         let net = self.net.clone();
         let mut n = net.borrow_mut();
-        let Net { card, server } = &mut *n;
+        let Net { card, server, .. } = &mut *n;
         server.handle(card, cx, ordinal, d)
     }
 
@@ -377,6 +398,7 @@ fn open() -> Result<(Net, Interrupt), String> {
     let card = Net {
         card,
         server: Server::new(info, config.link_up, 0),
+        rx: RxCounts::default(),
     };
     Ok((card, line))
 }
@@ -443,6 +465,9 @@ fn run() -> i64 {
                 println!(out, "KE1 {}: FAIL: the card: {}", name, e);
                 return 1;
             }
+            while let Some(first) = n.rx.to_print() {
+                println!(out, "KE1 {}: {}", name, first);
+            }
             for (pending, outcome) in core::mem::take(&mut n.server.ready) {
                 // An answer whose client has gone is dropped.
                 let _ = dispatcher.complete(pending, outcome);
@@ -465,13 +490,13 @@ fn run() -> i64 {
     let s = n.server.hub.stats(u64::MAX);
     println!(
         out,
-        "KE1 {}: served until every client left: {} frames out ({} bytes), {} in ({} bytes), {} malformed from the card",
+        "KE1 {}: served until every client left: {} frames out ({} bytes), {} in ({} bytes), {}",
         name,
         s.tx_frames,
         s.tx_bytes,
         s.rx_frames,
         s.rx_bytes,
-        s.rx_errors
+        n.rx
     );
     0
 }

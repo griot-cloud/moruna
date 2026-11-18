@@ -2,8 +2,17 @@
 //! the device configuration, the header before every frame, and the control queue's
 //! command that sets how many queue pairs the device uses. Every value the device
 //! gives is checked here before a driver believes it.
+//!
+//! A received header's flags are taken as Linux's virtio_net takes them, whatever was
+//! negotiated: hosts set them without `GUEST_CSUM` (Linux's tun writes `DATA_VALID` on
+//! every frame whose checksum the host trusts; item 1.6f). `DATA_VALID` is taken, and
+//! the stack checks the checksum itself; `NEEDS_CSUM`'s partial checksum is completed
+//! here, so the stack checks a whole one; a bit not known is ignored (virtio 1.2,
+//! 5.1.6.4.2); a GSO type, which needs a feature never offered, is refused.
+//! [`RxCounts`] counts the frames taken with flags and the buffers refused, by reason.
 
-use core::ops::Range;
+use alloc::collections::{BTreeMap, VecDeque};
+use core::{fmt, ops::Range};
 
 use moruna_abi::Error;
 use moruna_mmio::Region;
@@ -35,6 +44,22 @@ pub mod config {
 /// The header before every frame with `VERSION_1`: flags, GSO type, header length,
 /// GSO size, checksum start and offset, and the buffer count.
 pub const HEADER: usize = 12;
+
+/// The flags of a received header (virtio 1.2, 5.1.6).
+pub mod flag {
+    /// The checksum at `csum_offset` from `csum_start` is partial: it holds the
+    /// pseudo-header's sum, and the ones' complement sum from `csum_start` to the end
+    /// of the frame completes it.
+    pub const NEEDS_CSUM: u8 = 1;
+    /// The device validated the frame's checksum.
+    pub const DATA_VALID: u8 = 2;
+    /// `csum_start` and `csum_offset` count coalesced segments (`RSC_EXT`): they are
+    /// not offsets.
+    pub const RSC_INFO: u8 = 4;
+}
+
+/// The GSO type of a frame that asks for no segmentation.
+pub const GSO_NONE: u8 = 0;
 /// The most queue pairs the specification lets a device have.
 pub const PAIRS_MAX: u16 = 0x8000;
 /// The MTU a device without `MTU` is taken to have.
@@ -65,10 +90,16 @@ pub enum NetError {
     /// The device returned a buffer shorter than a header and a frame header, or
     /// longer than the buffer or the largest frame.
     BadLength(u32),
-    /// The device's header asks for an offload this driver did not negotiate.
-    Offload {
+    /// The header asks for segmentation, which needs a `GUEST_TSO` or `GUEST_UFO`
+    /// feature this driver never offers: its GSO type.
+    Gso(u8),
+    /// The header asks for a partial checksum to be completed (`NEEDS_CSUM`) where it
+    /// cannot be: its field past the frame's end, or offsets that are counts
+    /// (`RSC_INFO`).
+    Checksum {
         flags: u8,
-        gso: u8,
+        start: u16,
+        offset: u16,
     },
 }
 
@@ -148,25 +179,255 @@ pub fn write_header<R: Region + ?Sized>(r: &R, at: usize) -> Result<(), Error> {
     r.write32(at + 8, 0)
 }
 
+/// A frame a device returned, checked: where it is, its header's flags, and the
+/// partial checksum to complete before the frame is believed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Received {
+    /// The frame, after the header.
+    pub frame: Range<usize>,
+    pub flags: u8,
+    /// Set with `NEEDS_CSUM`.
+    pub partial: Option<Partial>,
+}
+
+/// A partial checksum: summing starts at `start` and the checksum goes at
+/// `start + offset`, both from the frame's first byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Partial {
+    pub start: u16,
+    pub offset: u16,
+}
+
+impl Received {
+    /// Completes the partial checksum, if the frame has one, in `frame`, the frame's
+    /// bytes: the ones' complement of the sum from `start` to the end (the field holds
+    /// the pseudo-header's sum), stored big-endian. A zero is stored as `0xffff`, as
+    /// Linux stores it, since UDP's zero says there is no checksum. Refused when the
+    /// field is not inside `frame`.
+    pub fn complete(&self, frame: &mut [u8]) -> Result<(), NetError> {
+        let Some(Partial { start, offset }) = self.partial else {
+            return Ok(());
+        };
+        let field = start as usize + offset as usize;
+        if field + 2 > frame.len() {
+            return Err(NetError::Checksum {
+                flags: self.flags,
+                start,
+                offset,
+            });
+        }
+        let checksum = match !ones_sum(&frame[start as usize..]) {
+            0 => 0xffff,
+            c => c,
+        };
+        frame[field..field + 2].copy_from_slice(&checksum.to_be_bytes());
+        Ok(())
+    }
+}
+
+/// The 16-bit ones' complement sum of `bytes` as big-endian words, an odd last byte
+/// padded with a zero (RFC 1071), folded to 16 bits.
+pub fn ones_sum(bytes: &[u8]) -> u16 {
+    let (words, rest) = bytes.as_chunks::<2>();
+    let mut sum: u64 = words.iter().map(|w| u16::from_be_bytes(*w) as u64).sum();
+    if let [last] = rest {
+        sum += (*last as u64) << 8;
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum as u16
+}
+
 /// The frame in a receive buffer at `at` of `buffer` bytes the device returned with
-/// `used` bytes written: its range, after the header. A buffer whose length is out
-/// of bounds, or whose header asks for an offload, is refused.
+/// `used` bytes written: its range after the header, its flags and its partial
+/// checksum. A buffer is refused whose length is out of bounds, whose header asks for
+/// segmentation, or whose partial checksum's field is past the frame's end or whose
+/// offsets are `RSC_INFO`'s counts. `DATA_VALID` and bits not known are taken: the
+/// stack checks every checksum itself.
 pub fn received<R: Region + ?Sized>(
     r: &R,
     at: usize,
     buffer: usize,
     used: u32,
     max_frame: usize,
-) -> Result<Range<usize>, NetError> {
+) -> Result<Received, NetError> {
     let len = used as usize;
     if len < HEADER + 14 || len > buffer || len - HEADER > max_frame {
         return Err(NetError::BadLength(used));
     }
     let (flags, gso) = (r.read8(at)?, r.read8(at + 1)?);
-    if flags != 0 || gso != 0 {
-        return Err(NetError::Offload { flags, gso });
+    if gso != GSO_NONE {
+        return Err(NetError::Gso(gso));
     }
-    Ok(at + HEADER..at + len)
+    let partial = if flags & flag::NEEDS_CSUM != 0 {
+        let (start, offset) = (r.read16(at + 6)?, r.read16(at + 8)?);
+        if flags & flag::RSC_INFO != 0 || start as usize + offset as usize + 2 > len - HEADER {
+            return Err(NetError::Checksum {
+                flags,
+                start,
+                offset,
+            });
+        }
+        Some(Partial { start, offset })
+    } else {
+        None
+    };
+    Ok(Received {
+        frame: at + HEADER..at + len,
+        flags,
+        partial,
+    })
+}
+
+/// The header of the buffer at `at`, as the device wrote it.
+pub fn header<R: Region + ?Sized>(r: &R, at: usize) -> Result<[u8; HEADER], Error> {
+    let mut bytes = [0u8; HEADER];
+    r.read_bytes(at, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Why a buffer the device returned was refused, as a driver counts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Reason {
+    /// Its length was out of bounds.
+    Length,
+    /// Its flags asked for a partial checksum that cannot be completed: the flags.
+    Flags(u8),
+    /// Its header asked for segmentation: the GSO type.
+    Gso(u8),
+}
+
+impl Reason {
+    /// What a buffer refused with `e` is counted under; `None` for an error that is
+    /// not the buffer's (the kernel's, or the configuration's).
+    pub fn of(e: &NetError) -> Option<Reason> {
+        match *e {
+            NetError::BadLength(_) => Some(Reason::Length),
+            NetError::Checksum { flags, .. } => Some(Reason::Flags(flags)),
+            NetError::Gso(gso) => Some(Reason::Gso(gso)),
+            NetError::Kernel(_)
+            | NetError::BadAddress(_)
+            | NetError::BadPairs(_)
+            | NetError::BadMtu(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for Reason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Reason::Length => f.write_str("length"),
+            Reason::Flags(flags) => write!(f, "flags {flags:#04x}"),
+            Reason::Gso(gso) => write!(f, "gso {gso:#04x}"),
+        }
+    }
+}
+
+/// What a first buffer was: refused, and why; or a frame taken whose header had flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seen {
+    Refused(Reason),
+    Taken(u8),
+}
+
+/// The first buffer a driver refused, or the first frame it took with flags: what it
+/// was, the bytes the device wrote, and its header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct First {
+    pub seen: Seen,
+    pub used: u32,
+    pub header: [u8; HEADER],
+}
+
+impl fmt::Display for First {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.seen {
+            Seen::Refused(reason) => {
+                write!(f, "the first malformed buffer from the card: {reason}")
+            }
+            Seen::Taken(flags) => write!(
+                f,
+                "the first frame taken with flags from the card: flags {flags:#04x}"
+            ),
+        }?;
+        write!(f, ", {} bytes written, header", self.used)?;
+        self.header.iter().try_for_each(|b| write!(f, " {b:02x}"))
+    }
+}
+
+/// What a driver counts of the buffers its device returned: those refused, by
+/// reason, and the frames taken whose header had flags, by flags. The first of each
+/// kind is held until it is printed, so a boot that runs on says what the card sends;
+/// the counts end the driver's last line, so a boot that drops frames says why.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RxCounts {
+    refused: BTreeMap<Reason, u64>,
+    taken: BTreeMap<u8, u64>,
+    /// The firsts not yet printed, at most one of each kind.
+    untold: VecDeque<First>,
+}
+
+impl RxCounts {
+    /// Counts a buffer refused for `reason`: `used` bytes written, and its header.
+    pub fn refuse(&mut self, reason: Reason, used: u32, header: [u8; HEADER]) {
+        if self.refused.is_empty() {
+            self.untold.push_back(First {
+                seen: Seen::Refused(reason),
+                used,
+                header,
+            });
+        }
+        *self.refused.entry(reason).or_default() += 1;
+    }
+
+    /// Counts a frame taken whose header had `flags`, `used` bytes written; a frame
+    /// with none is not counted.
+    pub fn take(&mut self, flags: u8, used: u32, header: [u8; HEADER]) {
+        if flags == 0 {
+            return;
+        }
+        if self.taken.is_empty() {
+            self.untold.push_back(First {
+                seen: Seen::Taken(flags),
+                used,
+                header,
+            });
+        }
+        *self.taken.entry(flags).or_default() += 1;
+    }
+
+    /// The buffers refused.
+    pub fn refused(&self) -> u64 {
+        self.refused.values().sum()
+    }
+
+    /// The next first not yet printed, once each, for its line on the console.
+    pub fn to_print(&mut self) -> Option<First> {
+        self.untold.pop_front()
+    }
+}
+
+impl fmt::Display for RxCounts {
+    /// `3 malformed from the card (length: 1, flags 0x05: 1, gso 0x01: 1), 46 taken
+    /// with flags (0x02: 46)`, an empty list left out.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} malformed from the card", self.refused())?;
+        for (i, (reason, n)) in self.refused.iter().enumerate() {
+            write!(f, "{}{reason}: {n}", if i == 0 { " (" } else { ", " })?;
+        }
+        if !self.refused.is_empty() {
+            f.write_str(")")?;
+        }
+        write!(f, ", {} taken with flags", self.taken.values().sum::<u64>())?;
+        for (i, (flags, n)) in self.taken.iter().enumerate() {
+            write!(f, "{}{flags:#04x}: {n}", if i == 0 { " (" } else { ", " })?;
+        }
+        if !self.taken.is_empty() {
+            f.write_str(")")?;
+        }
+        Ok(())
+    }
 }
 
 /// The control queue's command classes and commands (virtio 1.2, 5.1.6.5).
