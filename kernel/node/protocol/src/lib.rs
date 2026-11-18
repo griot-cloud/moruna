@@ -11,13 +11,13 @@ pub const RUNNING: u32 = 0;
 pub const TERMINATED: u32 = 1;
 pub const CANCELLED: u32 = 2;
 
-/// What a node keeps of its memory for its services (system design 3A).
-pub const SERVICES_BYTES: u64 = 512 << 20;
 /// A check's account: the engine's `check` on one document, which runs beside a job
 /// (system design 3A).
 pub const CHECK_BYTES: u64 = 256 << 20;
-/// What no job may have of the node's memory: its services' and a check's, 768 MiB.
-pub const RESERVED_BYTES: u64 = SERVICES_BYTES + CHECK_BYTES;
+/// What node-admission keeps of its own account for itself.
+pub const ADMISSION_BYTES: u64 = 128 << 20;
+/// What no job may have of node-admission's account: the check account and admission's own.
+pub const RESERVED_BYTES: u64 = CHECK_BYTES + ADMISSION_BYTES;
 /// The slot of the engine's channel to `api` for a job (`moruna serve --listen channel:engine`).
 pub const ENGINE_CHANNEL: &str = "engine";
 /// The slot of the engine's channel to `api` for a check (`moruna check-job --listen
@@ -61,41 +61,42 @@ pub fn valid_needs(needs: &Needs) -> bool {
         && once(&functions)
 }
 
-/// The most a job's budget may be on a node of `node_memory` bytes (the machine account's
-/// limit): its memory less [`RESERVED_BYTES`], in whole pages. A job whose document names no
-/// budget has all of it: a node runs one job.
-pub fn budget_max(node_memory: u64) -> u64 {
-    node_memory.saturating_sub(RESERVED_BYTES) & !4095
+/// The most a job's budget may be (system design 3A): node-admission's account, which node.conf
+/// gives the rest of the node's memory, less [`RESERVED_BYTES`], in whole pages. A job whose
+/// document names no budget has all of it: a node runs one job.
+pub fn budget_max(admission_account: u64) -> u64 {
+    admission_account.saturating_sub(RESERVED_BYTES) & !4095
 }
 
-/// Whether `launch` takes a job of `budget` bytes on a node of `node_memory` bytes: `Invalid`
-/// for no budget or one that is not whole pages, `Quota` for more than [`budget_max`].
-pub fn admits(budget: u64, node_memory: u64) -> Result<(), admission::Error> {
+/// Whether `launch` takes a job of `budget` bytes beside admission's account of
+/// `admission_account` bytes: `Invalid` for no budget or one that is not whole pages, `Quota`
+/// for more than [`budget_max`].
+pub fn admits(budget: u64, admission_account: u64) -> Result<(), admission::Error> {
     if budget == 0 || !budget.is_multiple_of(4096) {
         return Err(admission::Error::Invalid);
     }
-    if budget > budget_max(node_memory) {
+    if budget > budget_max(admission_account) {
         return Err(admission::Error::Quota);
     }
     Ok(())
 }
 
-/// The engine's arguments for a job on a node of `node_memory` bytes:
-/// `serve --listen channel:engine --budget-max N`, node mode with the node's bound.
-pub fn serve_args(node_memory: u64) -> Vec<String> {
+/// The engine's arguments for a job on a node whose job bound is `bound` bytes
+/// ([`budget_max`]): `serve --listen channel:engine --budget-max N`.
+pub fn serve_args(bound: u64) -> Vec<String> {
     alloc::vec![
         "serve".into(),
         "--listen".into(),
         alloc::format!("channel:{ENGINE_CHANNEL}"),
         "--budget-max".into(),
-        alloc::format!("{}", budget_max(node_memory)),
+        alloc::format!("{bound}"),
     ]
 }
 
-/// The engine's arguments for a check on a node of `node_memory` bytes:
+/// The engine's arguments for a check on a node whose job bound is `bound` bytes:
 /// `check-job --listen channel:check --node channel:engine --budget-max N`, which reads the
 /// document and its secrets' names from the channel and answers the refusals and the budget.
-pub fn check_args(node_memory: u64) -> Vec<String> {
+pub fn check_args(bound: u64) -> Vec<String> {
     alloc::vec![
         "check-job".into(),
         "--listen".into(),
@@ -103,7 +104,7 @@ pub fn check_args(node_memory: u64) -> Vec<String> {
         "--node".into(),
         alloc::format!("channel:{ENGINE_CHANNEL}"),
         "--budget-max".into(),
-        alloc::format!("{}", budget_max(node_memory)),
+        alloc::format!("{bound}"),
     ]
 }
 
@@ -121,8 +122,9 @@ moruna_svc::protocol! {
             /// console/account/config slots. Linux/directory are explicit grants.
             /// `needs` are the job's as its check answered them (`Needs`), kept with
             /// the job for the grants of items 3.3, 3.4 and 3.6; `Invalid` when they
-            /// are not `valid_needs`.
-            1 => fn launch(account: Handle, budget: u64, config: Handle, names: Vec<String>, grants: Vec<Handle>, services: Vec<String>, needs: Needs) -> u64;
+            /// are not `valid_needs`. The job's account of `budget` bytes is carved from
+            /// the server's own; a budget past `budget_max` of it is `Quota`.
+            1 => fn launch(budget: u64, config: Handle, names: Vec<String>, grants: Vec<Handle>, services: Vec<String>, needs: Needs) -> u64;
             /// Actual process state; termination does not claim a successful exit.
             2 => fn status(job: u64) -> u32;
             /// Kill the caller's job. A returned success means kill was accepted;
@@ -167,22 +169,22 @@ pub fn valid_grants(names: &[String], count: usize) -> bool {
 mod tests {
     use super::*;
     #[test]
-    fn a_jobs_budget_is_the_nodes_memory_less_768_mib() {
-        assert_eq!(RESERVED_BYTES, 768 << 20);
-        let node = 8u64 << 30;
-        assert_eq!(budget_max(node), (8 << 30) - (768 << 20));
-        // Whole pages, and nothing for a node smaller than what it keeps.
+    fn a_jobs_budget_is_admissions_account_less_384_mib() {
+        assert_eq!(RESERVED_BYTES, 384 << 20);
+        let account = 8u64 << 30;
+        assert_eq!(budget_max(account), (8 << 30) - (384 << 20));
+        // Whole pages, and nothing for an account smaller than what it keeps.
         assert_eq!(budget_max(RESERVED_BYTES + 4096 + 100), 4096);
         assert_eq!(budget_max(RESERVED_BYTES), 0);
         assert_eq!(budget_max(1 << 20), 0);
-        assert_eq!(admits(budget_max(node), node), Ok(()));
-        assert_eq!(admits(4096, node), Ok(()));
+        assert_eq!(admits(budget_max(account), account), Ok(()));
+        assert_eq!(admits(4096, account), Ok(()));
         assert_eq!(
-            admits(budget_max(node) + 4096, node),
+            admits(budget_max(account) + 4096, account),
             Err(admission::Error::Quota)
         );
-        assert_eq!(admits(0, node), Err(admission::Error::Invalid));
-        assert_eq!(admits(4097, node), Err(admission::Error::Invalid));
+        assert_eq!(admits(0, account), Err(admission::Error::Invalid));
+        assert_eq!(admits(4097, account), Err(admission::Error::Invalid));
         assert_eq!(admits(4096, RESERVED_BYTES), Err(admission::Error::Quota));
     }
 
@@ -225,7 +227,7 @@ mod tests {
     #[test]
     fn the_engine_serves_and_checks_on_its_channels_with_the_nodes_bound() {
         let node = 4u64 << 30;
-        let max = alloc::format!("{}", budget_max(node));
+        let max = alloc::format!("{node}");
         assert_eq!(
             serve_args(node),
             [

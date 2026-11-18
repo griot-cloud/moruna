@@ -39,9 +39,9 @@ struct Shared {
     shutdown_done: bool,
     shutdown: Option<Pending>,
     backends: BTreeMap<String, Channel>,
-    /// The node's memory, the machine account's limit, which the supervisor sends at start
-    /// (item 1.4): a job's budget is at most this less 768 MiB (system design 3A).
-    node_memory: u64,
+
+    /// The server's own account: every job's is carved from it (system design 3A).
+    own: Option<Account>,
     /// Where each check's account is carved from: `CHECK_BYTES` of the server's own account,
     /// set aside at start when it serves `api`. `None`: checks are unavailable.
     check_account: Option<Account>,
@@ -256,20 +256,27 @@ impl Handler for Session {
             };
         }
         if ordinal == 1 {
-            // The arguments in order: the first six, then the job's needs.
-            let Some(((account, budget, config, names, grants, services), needs)) =
-                args::<(
-                    (Handle, u64, Handle, Vec<String>, Vec<Handle>, Vec<String>),
-                    Needs,
-                )>(d)
+            let Some((budget, config, names, grants, services, needs)) =
+                args::<(u64, Handle, Vec<String>, Vec<Handle>, Vec<String>, Needs)>(d)
             else {
                 return Outcome::Status(Status::BadMessage);
             };
-            // A job's budget is at most the node's memory less 768 MiB (system design 3A).
-            let node_memory = self.shared.borrow().node_memory;
-            if let Err(e) = node_protocol::admits(budget, node_memory) {
-                return failure(e);
-            }
+            // The job's account is carved from this server's own (system design 3A), and its
+            // budget is at most that account less the check account and its own overhead.
+            let account = {
+                let state = self.shared.borrow();
+                let Some(own) = state.own.as_ref() else {
+                    return failure(admission::Error::Unavailable);
+                };
+                let limit = own.usage().map(|u| u.limit).unwrap_or(0);
+                if let Err(e) = node_protocol::admits(budget, limit) {
+                    return failure(e);
+                }
+                match duplicate(own) {
+                    Ok(handle) => handle,
+                    Err(e) => return failure(e),
+                }
+            };
             return match launch_job(
                 &self.shared,
                 owner,
@@ -359,11 +366,7 @@ fn check_job(
             .check_account
             .as_ref()
             .ok_or(admission::Error::Unavailable)?;
-        let rights = check.0.info().map_err(|_| admission::Error::Unavailable)?.1;
-        check
-            .0
-            .duplicate(rights)
-            .map_err(|_| admission::Error::Unavailable)?
+        duplicate(check)?
     };
     let id = launch_job(
         shared,
@@ -382,12 +385,17 @@ fn check_job(
     Ok(id)
 }
 
-/// The node's memory, as the supervisor's message on `supervisor` carries it.
-fn read_node_memory(supervisor: Handle) -> Option<u64> {
-    let mut bytes = [0u8; 16];
-    let mut handles = [None];
-    let (count, carried) = Channel(supervisor).read(&mut bytes, &mut handles).ok()?;
-    moruna_node::Bootstrap::platform_memory(&bytes[..count], carried)
+/// A handle to `account` with its rights, for a carve.
+fn duplicate(account: &Account) -> Result<Handle, admission::Error> {
+    let rights = account
+        .0
+        .info()
+        .map_err(|_| admission::Error::Unavailable)?
+        .1;
+    account
+        .0
+        .duplicate(rights)
+        .map_err(|_| admission::Error::Unavailable)
 }
 
 struct ControlSession(Rc<RefCell<Shared>>, Rc<authority::Authority>);
@@ -465,7 +473,10 @@ fn initial_job(
         .ok_or(admission::Error::Invalid)?;
     let initial =
         moruna_node::InitialJob::parse(&bytes[..end]).map_err(|_| admission::Error::Invalid)?;
-    let account = start::take("account").ok_or(admission::Error::Unavailable)?;
+    let account = {
+        let state = shared.borrow();
+        duplicate(state.own.as_ref().ok_or(admission::Error::Unavailable)?)?
+    };
     let config = start::take("initial-config").ok_or(admission::Error::Unavailable)?;
     let mut names = Vec::new();
     let mut grants = Vec::new();
@@ -538,18 +549,14 @@ fn run() -> i64 {
     let Some(control) = start::take("control").map(Channel) else {
         return 1;
     };
-    let Some(node_memory) = start::take("supervisor").and_then(read_node_memory) else {
-        println!(
-            console,
-            "moruna: fatal node-admission: the node's memory is not known: the supervisor sent \
-             none on `supervisor`"
-        );
-        return 1;
-    };
+
     // The check account, set aside when the server serves `api` and runs no initial job: a
     // check runs beside a job (system design 3A).
+    // Its own account: what every job, and the check account, is carved from (system design
+    // 3A; node.conf gives it the rest of the node's memory).
+    let own = start::take("account").map(Account);
     let check_account = if listener.is_some() && initial.is_none() {
-        match start::take("account").map(|own| Account(own).carve_from(CHECK_BYTES, "check")) {
+        match own.as_ref().map(|own| own.carve_from(CHECK_BYTES, "check")) {
             Some(Ok(account)) => Some(account),
             Some(Err(e)) => {
                 println!(
@@ -580,7 +587,7 @@ fn run() -> i64 {
         shutdown_done: false,
         shutdown: None,
         backends: BTreeMap::new(),
-        node_memory,
+        own,
         check_account,
         check: None,
     }));
