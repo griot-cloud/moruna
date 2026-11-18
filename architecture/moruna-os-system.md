@@ -609,6 +609,15 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
 - **AWS's own S3** (no endpoint) is reached with path-style requests, so its host is
   `s3.<region>.amazonaws.com`, known without the bucket; the region is required.
 
+### Known costs, scheduled after the OS path
+
+- **Window copies at IPC sinks and spills:** a batch held in a plane window is copied when an Arrow
+  IPC sink or a staging spill writes it, because the plane's memory is a second pool the arena does
+  not own. The fix is one pool: the plane draws its memory objects from the run's arena, under one
+  budget, so windows are arena memory a disk already reaches. Parquet sinks are unaffected.
+- **Page per buffer in records** (SDD 01 e.7): under 1% at 64Ki rows; revisited only if a time split
+  points at it.
+
 ### 3F. The full-year hang
 
 Item 3.1 reproduces it, finds the cause, and proposes a fix for the PM's approval. Nothing in 3A to
