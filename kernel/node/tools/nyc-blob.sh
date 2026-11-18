@@ -247,7 +247,7 @@ step "az vm delete -n $VM -g $G --yes $S -o none"
 step "az network public-ip delete -n $VM-ip -g $G $S"
 step "az network vnet delete -n $VM-vnet -g $G $S"
 step "az network nsg delete -n $VM-nsg -g $G $S"
-step "[ \"\$(az resource list -g $G --query '[].type' -o tsv $S)\" = Microsoft.Storage/storageAccounts ]"
+step "for _ in \$(seq 12); do az resource list -g $G --query '[].type' -o tsv $S > $R/left; [ \"\$(cat $R/left)\" = Microsoft.Storage/storageAccounts ] && break; sleep 10; done; cat $R/left; [ \"\$(cat $R/left)\" = Microsoft.Storage/storageAccounts ]"
 
 # 8. The two SASes, made here from the key, and RUN/blob for openstack-up.sh --proof.
 say "the SASes"

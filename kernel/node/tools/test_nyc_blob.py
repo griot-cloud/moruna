@@ -95,8 +95,9 @@ DRY_RUN = [
     f"az network public-ip delete -n nyc-data-ip -g {GROUP} --subscription griot-dev",
     f"az network vnet delete -n nyc-data-vnet -g {GROUP} --subscription griot-dev",
     f"az network nsg delete -n nyc-data-nsg -g {GROUP} --subscription griot-dev",
-    f"[ \"$(az resource list -g {GROUP} --query '[].type' -o tsv --subscription griot-dev)\" = "
-    "Microsoft.Storage/storageAccounts ]",
+    f"for _ in $(seq 12); do az resource list -g {GROUP} --query '[].type' -o tsv --subscription griot-dev "
+    "> RUNDIR/left; [ \"$(cat RUNDIR/left)\" = Microsoft.Storage/storageAccounts ] && break; sleep 10; done; "
+    "cat RUNDIR/left; [ \"$(cat RUNDIR/left)\" = Microsoft.Storage/storageAccounts ]",
     "python3 -I -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) + d.timedelta(hours=6))"
     ".strftime(\"%Y-%m-%dT%H:%MZ\"))' > RUNDIR/expires",
     f"(umask 077 && {KEYED}container generate-sas -n data --permissions racwl --expiry \"$(cat RUNDIR/expires)\" "
@@ -144,7 +145,13 @@ elif cmd.startswith("storage blob list "):
     n = 11 if env("STUB_FEW") else 12
     print("\\n".join(["nyc/yellow_tripdata_2024-%02d.parquet" % m for m in range(1, n + 1)] + ["nyc/other.txt"]))
 elif cmd.startswith("resource list "):
+    # The machine's disk lingers for STUB_LINGER reads after its deletion.
+    path = os.path.join(state, "left")
+    n = int(open(path).read()) + 1 if os.path.exists(path) else 1
+    open(path, "w").write(str(n))
     print("Microsoft.Storage/storageAccounts")
+    if n <= int(env("STUB_LINGER") or 0):
+        print("Microsoft.Compute/disks")
 elif cmd.startswith("storage container generate-sas -n data "):
     print({DATA_SAS!r})
 elif cmd.startswith("storage container generate-sas -n functions "):
@@ -186,7 +193,7 @@ class NycBlob(unittest.TestCase):
             python.chmod(0o755)
 
     def live(self):
-        self.stubs(az=AZ, **{"ssh-keygen": SSH_KEYGEN})
+        self.stubs(az=AZ, sleep="#!/bin/sh\nexit 0\n", **{"ssh-keygen": SSH_KEYGEN})
 
     def calls(self):
         return self.log.read_text().splitlines()
@@ -376,6 +383,26 @@ class NycBlob(unittest.TestCase):
             self.assertEqual(az[-3:], [GONE[0], f"az group exists -n {GROUP} --subscription griot-dev",
                                        "az group list --subscription griot-dev --query "
                                        "[?starts_with(name, 'moruna-nyc-')].name -o tsv"])
+
+    def test_what_the_machine_leaves_is_waited_for_and_if_it_stays_the_run_fails(self):
+        # A disk that is gone by the third read: waited for, and the run goes on.
+        self.live()
+        done = self.run_script(*self.arguments(), extra={"STUB_LINGER": "2"})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(sum(call.startswith("az resource list ") for call in self.az()), 3)
+        self.assertTrue((self.root / "RUNDIR/blob").exists())
+        # One that stays through all twelve reads fails the run, which deletes the group.
+        for path in [*sorted((self.root / "RUNDIR").iterdir()), *sorted(self.state.iterdir())]:
+            path.unlink()
+        (self.root / "RUNDIR").rmdir()
+        self.log.write_text("")
+        done = self.run_script(*self.arguments(), extra={"STUB_LINGER": "12"})
+        self.assertEqual(done.returncode, 1, done.stderr)
+        az = self.az()
+        self.assertEqual(sum(call.startswith("az resource list ") for call in az), 12)
+        self.assertFalse(any(" generate-sas " in call for call in az))
+        self.assertEqual(az[-3], GONE[0])
+        self.assertIn("Microsoft.Compute/disks", done.stderr + done.stdout)
 
     def test_a_failure_after_the_group_is_made_deletes_it(self):
         self.live()
