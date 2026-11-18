@@ -39,6 +39,12 @@ relibc = { path = "../../vendor/relibc", version = "=0.2.5", default-features = 
 # random_read (item 5.0).
 moruna-getrandom = { path = "../../getrandom", version = "=0.1.0" }
 
+# A program of its own, run by `cargo test` on the host and linked for the core by build-core.sh
+# (bin/threads): one thread path for std's thread-locals and the C library's.
+[[test]]
+name = "threads"
+harness = false
+
 [profile.dev]
 panic = "abort"
 

@@ -13,11 +13,15 @@
 #   bin/double                examples/double.c
 #   bin/sum                   the aggregate test (tests/c/scenarios.c, moruna_test_sum)
 #   bin/runtime               tests/c/runtime.c: malloc, pthread_create, a thread_local, stderr
+#   bin/threads               tests/threads.rs: std's thread-locals on the C library's threads
+#                             and the C library's on std's
+#   debug/NAME.debug          each program's debug info, which bin/NAME names (its
+#                             .gnu_debuglink): the programs are stripped
 #
 # The archive is built as kernel/tools/build-std.sh builds a program with std (the kernel's
-# nightly, std from kernel/vendor/rust-std/library, offline); the C is compiled to ELF by the
-# host's clang (CC) for x86_64-unknown-none-elf, with __moruna__ defined, against those headers
-# only; the programs are linked by rust-lld with kernel/targets/x86_64-moruna.ld, static.
+# nightly, std from kernel/vendor/rust-std/library, offline, its flags); the C is compiled to ELF
+# by the host's clang (CC) for x86_64-unknown-none-elf, with __moruna__ defined, against those
+# headers only; the programs are linked by rust-lld with kernel/targets/x86_64-moruna.ld, static.
 # cbindgen (CBINDGEN, else on PATH) writes relibc's headers, as relibc's own build does.
 set -euo pipefail
 
@@ -28,7 +32,8 @@ library="$kernel/vendor/rust-std/library"
 target="$kernel/targets/x86_64-moruna.json"
 script="$kernel/targets/x86_64-moruna.ld"
 toolchain=nightly-2026-07-21
-out="${CARGO_TARGET_DIR:-$here/target}/core"
+cargo_target="${CARGO_TARGET_DIR:-$here/target}"
+out="$cargo_target/core"
 cc="${CC:-cc}"
 cbindgen="${CBINDGEN:-cbindgen}"
 
@@ -41,6 +46,7 @@ host="$(rustup run "$toolchain" rustc -vV | sed -n 's/^host: //p')"
 tools="$sysroot/lib/rustlib/$host/bin"
 ar="$tools/llvm-ar"
 lld="$tools/rust-lld"
+objcopy="$tools/llvm-objcopy"
 resource="$("$cc" -print-resource-dir)/include"
 
 # The C side of the user target: x86_64 ELF, SysV ABI, no red zone, static and not PIC, TLS by
@@ -50,19 +56,49 @@ cflags=(--target=x86_64-unknown-none-elf -D__moruna__ -mno-red-zone -fno-stack-p
 # Against the C library's headers, then the compiler's own (float.h, stdarg.h and the like).
 includes=(-nostdinc -isystem "$out/include" -isystem "$resource")
 
-mkdir -p "$out/lib" "$out/include" "$out/bin" "$out/obj"
+mkdir -p "$out/lib" "$out/include" "$out/bin" "$out/obj" "$out/debug"
 
-# 1. The archive: std, the SDK and relibc, with std's _start.
+# 1. The archive: std, the SDK and relibc, with std's _start; and tests/threads.rs, a Rust
+# program on them. build-std.sh's flags, its digest of std's sources included, so a target
+# directory that is kept (a shared one) rebuilds std when they change.
 flags="-C relocation-model=static -C relro-level=off -C force-unwind-tables=yes -C no-redzone=y"
-flags="$flags -Zunstable-options --cfg getrandom_backend=\"custom\""
+flags="$flags -Zunstable-options -C link-arg=-T$script -C link-arg=-static"
+flags="$flags --cfg getrandom_backend=\"custom\""
+# std's _start names the C library's start and end weakly, which takes no archive member: each
+# program on the C library names them outright (`undefined`, below for the C ones).
+flags="$flags -C link-arg=--undefined=moruna_libc_init -C link-arg=--undefined=moruna_libc_exit"
+inputs="$(python3 - "$kernel/.." <<'PY'
+import hashlib, os, sys
+root = sys.argv[1]
+digest = hashlib.sha256()
+for top in ("kernel/vendor/rust-std/library", "kernel/sys", "kernel/abi", "crates/moruna-record", "kernel/targets"):
+    for here, dirs, files in os.walk(os.path.join(root, top)):
+        dirs[:] = sorted(d for d in dirs if d != "target")
+        for name in sorted(files):
+            path = os.path.join(here, name)
+            digest.update(os.path.relpath(path, root).encode() + b"\0")
+            with open(path, "rb") as f:
+                digest.update(hashlib.sha256(f.read()).digest())
+print(digest.hexdigest()[:16])
+PY
+)"
+flags="$flags -C metadata=moruna-std-$inputs"
 unset CARGO_ENCODED_RUSTFLAGS
 CC_x86_64_moruna="$cc" AR_x86_64_moruna="$ar" CFLAGS_x86_64_moruna="${cflags[*]}" \
 __CARGO_TESTS_ONLY_SRC_ROOT="$library" RUSTFLAGS="$flags" \
-  rustup run "$toolchain" cargo rustc --release --locked --offline \
-  --manifest-path "$here/Cargo.toml" --lib --crate-type staticlib \
+  rustup run "$toolchain" cargo build --release --locked --offline \
+  --manifest-path "$here/Cargo.toml" --lib --test threads \
   --target "$target" -Zunstable-options -Zjson-target-spec \
-  -Zbuild-std=std,panic_abort -Zbuild-std-features=compiler-builtins-mem
-cp "${CARGO_TARGET_DIR:-$here/target}/x86_64-moruna/release/libmoruna_function.a" "$out/lib/"
+  -Zbuild-std=std,panic_abort -Zbuild-std-features=compiler-builtins-mem \
+  --message-format=json-render-diagnostics >"$out/obj/cargo.json"
+cp "$cargo_target/x86_64-moruna/release/libmoruna_function.a" "$out/lib/"
+threads="$(python3 -c '
+import json, sys
+for line in open(sys.argv[1]):
+    m = json.loads(line)
+    if m.get("reason") == "compiler-artifact" and m["target"]["name"] == "threads" and m.get("executable"):
+        print(m["executable"])
+' "$out/obj/cargo.json")"
 
 # 2. The headers: relibc's own, openlibm's, cbindgen's from each of relibc's header modules (not
 # its Rust math, which openlibm's replaces), and the SDK's.
@@ -99,9 +135,26 @@ link() {
   local name="$1"
   shift
   "$lld" -flavor gnu -static -no-pie -z norelro --gc-sections -T "$script" \
-    -o "$out/bin/$name" "$@" "$out/lib/libmoruna_function.a" "$out/lib/libopenlibm.a"
+    --undefined=moruna_libc_init --undefined=moruna_libc_exit \
+    -o "$out/obj/$name" "$@" "$out/lib/libmoruna_function.a" "$out/lib/libopenlibm.a"
+}
+# A program as a node fetches and registers it: stripped. Its debug info is kept beside the
+# build, in debug/, which the program names. A program without the C library's start is refused.
+strip_program() {
+  local name="$1"
+  "$tools/llvm-nm" "$out/obj/$name" | grep ' T moruna_libc_init$' >/dev/null || {
+    echo "build-core.sh: $name has no moruna_libc_init: the C library would not start" >&2
+    exit 1
+  }
+  "$objcopy" --only-keep-debug "$out/obj/$name" "$out/debug/$name.debug"
+  (cd "$out/debug" && "$objcopy" --strip-all --add-gnu-debuglink="$name.debug" \
+    "$out/obj/$name" "$out/bin/$name")
 }
 link double "$(compile examples/double.c)"
 link sum "$(compile tests/c/sum.c)" "$(compile tests/c/scenarios.c)" "$(compile tests/c/support.c)"
 link runtime "$(compile tests/c/runtime.c)"
-ls -l "$out/bin"
+cp "$threads" "$out/obj/threads"
+for name in double sum runtime threads; do
+  strip_program "$name"
+done
+ls -l "$out/bin" "$out/debug"
