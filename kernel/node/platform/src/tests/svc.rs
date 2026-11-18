@@ -740,15 +740,27 @@ fn the_hand_over_crosses_a_channel_to_each_start_of_api() {
         },
     )
     .unwrap();
-    // `api` has the node's memory the supervisor gave, and the config judged on it.
+    // `api` has the node's memory the supervisor gave, and the config judged on it; the node
+    // was not yet ready, so no boot_ms.
     let taken = first.join().unwrap();
-    assert_eq!(taken, handed);
+    assert_eq!(
+        taken,
+        Handover {
+            boot_ms: None,
+            ..handed.clone()
+        }
+    );
     assert_eq!(taken.memory_bytes, 24_526_286_848);
     assert_eq!(taken.config.functions.cache_bytes, 1 << 30);
     assert_eq!(lines.len(), 2);
-    assert!(lines[1].starts_with("moruna: ready api=10.0.2.15:443 boot_ms="));
+    let boot_ms = handed.boot_ms.expect("the node's boot_ms");
+    assert_eq!(
+        lines[1],
+        format!("moruna: ready api=10.0.2.15:443 boot_ms={boot_ms}")
+    );
 
-    // Two restarts: each start is handed the same, and the supervisor's end then closes.
+    // Two restarts: each start is handed the same with the ready line's boot_ms, and the
+    // supervisor's end then closes.
     let starts = [start(&supervisor), start(&supervisor)];
     drop(supervisor);
     let fatal = boot::serve(&mut Monotonic::new().unwrap(), &mut control, &handed);

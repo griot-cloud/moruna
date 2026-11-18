@@ -105,8 +105,9 @@ pub struct Inputs {
     pub memory_bytes: u64,
 }
 
-/// Boots: returns the hand-over `api` took, having printed the `cloud` and `ready` lines through
-/// `console`, or the reason the node must stop.
+/// Boots: returns the hand-over `api` took, with the node's `boot_ms` from the ready line for
+/// `api`'s later starts, having printed the `cloud` and `ready` lines through `console`, or the
+/// reason the node must stop.
 pub fn run<N: Network, C: Clock, K: Control>(
     network: &mut N,
     clock: &mut C,
@@ -137,6 +138,8 @@ pub fn run<N: Network, C: Clock, K: Control>(
         wall_clock,
         read_at_ns: found.read_at_ns,
         memory_bytes: inputs.memory_bytes,
+        // None until the node has been ready: this first start of api makes its own.
+        boot_ms: None,
     };
     let message = handover
         .encode()
@@ -163,9 +166,14 @@ pub fn run<N: Network, C: Clock, K: Control>(
     })?;
     hand_over(control, &message, deadline)?;
 
-    // 5. Ready.
-    console(&ready_line(address, clock.now() / 1_000_000));
-    Ok(handover)
+    // 5. Ready. The line's boot_ms is the node's, and every later start of api is handed it
+    // (PM, item 2.2c).
+    let boot_ms = clock.now() / 1_000_000;
+    console(&ready_line(address, boot_ms));
+    Ok(Handover {
+        boot_ms: Some(boot_ms),
+        ..handover
+    })
 }
 
 /// Hands `message`, the encoded hand-over, to the next start of `api`, whose channel the

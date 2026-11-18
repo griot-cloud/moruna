@@ -358,6 +358,47 @@ fn the_node_serves_its_api_over_https_on_the_leased_address() {
     node.end();
 }
 
+/// A start after the node's first ready (item 2.2c) is handed the node's `boot_ms`, and its
+/// node document says that, not when this start answered `ready`.
+#[test]
+fn a_later_start_s_node_document_says_the_node_s_boot_ms() {
+    let mut node = Node::start(true);
+    let outside = node.slot("listen-host");
+    let mut api = start_api(&mut node);
+    let signer = Signer::new();
+    let handover = Handover {
+        boot_ms: Some(1_234),
+        ..handover_of(&user_data(&[signer.public()], None))
+    };
+    api.platform
+        .send(
+            &handover.encode().expect("encoded"),
+            deadline_in(5 * SECOND),
+        )
+        .expect("the hand-over");
+    assert_eq!(
+        api.platform.receive(deadline_in(30 * SECOND)),
+        Ok(READY.to_vec())
+    );
+    let fingerprint = api.lines.lock().unwrap()[0]
+        .strip_prefix("moruna: tls sha256=")
+        .expect("the identity's line")
+        .to_string();
+    let mut https = Https::open(&outside, Endpoint::new(NODE_ADDRESS, 443), &fingerprint);
+    let observe = signer.token(INSTANCE, WALL_CLOCK + 1_800, &["observe"]);
+    let document = https.get("/v1/node", Some(&observe));
+    assert_eq!(document.status, 200, "{:?}", document.body);
+    assert_eq!(document.body["boot_ms"], 1_234);
+    node.stop.store(true, Ordering::SeqCst);
+    let error = api.thread.join().expect("api");
+    assert!(
+        matches!(error, Error::Network(_, CallError::PeerClosed)),
+        "{error:?}"
+    );
+    drop((https, outside, api.slot, api.platform));
+    node.end();
+}
+
 /// A hand-over that is refused stops the process before it makes an identity or listens.
 #[test]
 fn a_refused_hand_over_stops_the_process_before_it_listens() {

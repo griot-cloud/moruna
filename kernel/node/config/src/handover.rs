@@ -55,6 +55,12 @@ pub struct Handover {
     /// The node's memory: the machine account's limit, which every service and job is carved
     /// from, as the supervisor gave it to `platform`. The node document's `memory_bytes`.
     pub memory_bytes: u64,
+    /// The node's `boot_ms` (system design 1B), as `platform`'s ready line said it: the core's
+    /// monotonic clock, in milliseconds, when the first start of `api` answered ready. Absent
+    /// from that first start's hand-over, which comes before it, and given to every later
+    /// start's, so that a restarted `api`'s node document says the node's boot, not its own
+    /// (PM, item 2.2c).
+    pub boot_ms: Option<u64>,
 }
 
 /// Why a hand-over is not sent or not taken.
@@ -95,16 +101,18 @@ impl Handover {
     /// The message `platform` sends: the hand-over as JSON, its node config only what the
     /// operator set (PM, 2026-11-18).
     pub fn encode(&self) -> Result<Vec<u8>, HandoverError> {
-        let message = serde_json::json!({
+        let mut message = serde_json::json!({
             "cloud": cloud_name(self.cloud),
             "instance": self.instance,
             "wall_clock": self.wall_clock,
             "read_at_ns": self.read_at_ns,
             "memory_bytes": self.memory_bytes,
             "config": self.config.document(),
-        })
-        .to_string()
-        .into_bytes();
+        });
+        if let Some(boot_ms) = self.boot_ms {
+            message["boot_ms"] = boot_ms.into();
+        }
+        let message = message.to_string().into_bytes();
         if message.len() > MESSAGE_MAX {
             return Err(HandoverError::TooLarge(message.len()));
         }
@@ -129,8 +137,14 @@ impl Handover {
                 "read_at_ns",
                 "memory_bytes",
                 "config",
+                "boot_ms",
             ])?;
+            let boot_ms = fields
+                .get("boot_ms")
+                .map(|value| value.unsigned("boot_ms"))
+                .transpose()?;
             Ok((
+                boot_ms,
                 fields.need("cloud", "cloud")?.string("cloud")?,
                 fields.need("instance", "instance")?.string("instance")?,
                 fields
@@ -145,7 +159,7 @@ impl Handover {
                 fields.need("config", "config")?,
             ))
         };
-        let (cloud, instance, wall_clock, read_at_ns, memory_bytes, config) =
+        let (boot_ms, cloud, instance, wall_clock, read_at_ns, memory_bytes, config) =
             read().map_err(HandoverError::Shape)?;
         let cloud = [Cloud::OpenStack, Cloud::Azure, Cloud::None]
             .into_iter()
@@ -161,6 +175,7 @@ impl Handover {
             wall_clock,
             read_at_ns,
             memory_bytes,
+            boot_ms,
         })
     }
 

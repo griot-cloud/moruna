@@ -232,6 +232,8 @@ fn a_node_on_openstack_hands_over_and_says_it_is_ready() {
             read_at_ns: 4 * MS,
             // The node's memory the supervisor gave.
             memory_bytes: MEMORY,
+            // The ready line's, for api's later starts (item 2.2c).
+            boot_ms: Some(46),
         }
     );
     // The cloud's line, then the hand-over, then, once api has answered, the ready line: three
@@ -244,9 +246,14 @@ fn a_node_on_openstack_hands_over_and_says_it_is_ready() {
             "moruna: ready api=10.0.2.15:443 boot_ms=46".to_string(),
         ]
     );
-    // What api got is the hand-over, as its half of the crate reads it.
-    assert_eq!(booted.api.sent, [handover.encode().unwrap()]);
-    assert_eq!(Handover::decode(&booted.api.sent[0]), Ok(handover));
+    // What api got is the hand-over, as its half of the crate reads it: before the node was
+    // ready, so with no boot_ms.
+    let first = Handover {
+        boot_ms: None,
+        ..handover
+    };
+    assert_eq!(booted.api.sent, [first.encode().unwrap()]);
+    assert_eq!(Handover::decode(&booted.api.sent[0]), Ok(first));
     // api had 10 s from the cloud's line, after the three requests' 6 ms.
     assert_eq!(booted.api.deadlines, [6 * MS + 10 * SECOND; 2]);
 }
@@ -359,7 +366,15 @@ fn a_node_on_azure_hands_over_and_says_it_is_ready() {
             "moruna: ready api=10.0.2.15:443 boot_ms=40".to_string(),
         ]
     );
-    assert_eq!(Handover::decode(&booted.api.sent[0]), Ok(handover));
+    // api had it before the node was ready, so with no boot_ms; later starts get the line's.
+    assert_eq!(handover.boot_ms, Some(40));
+    assert_eq!(
+        Handover::decode(&booted.api.sent[0]),
+        Ok(Handover {
+            boot_ms: None,
+            ..handover
+        })
+    );
 }
 
 #[test]
@@ -510,6 +525,7 @@ fn a_config_too_large_to_hand_over_is_fatal() {
         wall_clock: RECORDED_OPENSTACK_TIME,
         read_at_ns: 0,
         memory_bytes: MEMORY,
+        boot_ms: None,
     })
     .encode() else {
         panic!("the hand-over fits");
@@ -759,9 +775,13 @@ fn served(prepare: impl FnOnce(&mut FakeApi)) -> (Fatal, Handover, FakeApi) {
 #[test]
 fn each_later_start_of_api_gets_the_same_hand_over() {
     let (fatal, handover, api) = served(|api| api.starts = 3);
-    // Three later starts, each handed what the first had, each with 1D's 10 s from when its
-    // channel arrived: 40 ms apart, api's answers.
+    // Three later starts, each handed what the first had and the node's boot_ms, the boot's
+    // ready line's, each with 1D's 10 s from when its channel arrived: 40 ms apart, api's
+    // answers.
     assert_eq!(api.sent, vec![handover.encode().unwrap(); 3]);
+    let later = Handover::decode(&api.sent[0]).unwrap();
+    assert_eq!(later.boot_ms, Some(40), "the boot's api answered 40 ms in");
+    assert_eq!(later, handover);
     let t = 1000 * SECOND;
     assert_eq!(
         api.deadlines,
