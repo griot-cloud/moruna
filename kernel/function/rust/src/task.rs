@@ -16,8 +16,9 @@
 //!   waits for anything, so a batch the function writes after letting go of its input still
 //!   answers that input, as a record posted before a release answers the batch released.
 //! - **A batch written answers the oldest batch held**, taken and not yet given back: a task
-//!   answers its batches in turn (`moruna_plane::ring`). With none held there is nothing for it
-//!   to answer, and it is refused.
+//!   answers its batches in turn (`moruna_plane::ring`). One written with none held (before the
+//!   first batch, or after the engine's end, as an aggregate writes) answers no input, as
+//!   [`crate::Function::end`]'s do.
 //! - **A failure ends the task**, as in `serve`: its line goes to the log at once, every later
 //!   call returns its code, no batch is given back after it, and [`Task::finish`] says the code.
 //! - **[`Task::finish`] says [`code::DONE`]** only as `serve` does: every batch answered and given
@@ -32,13 +33,9 @@ use arrow_array::RecordBatch;
 
 use crate::code;
 use crate::error::FunctionError;
-use crate::lane::{Lane, Mapped, Posted};
+use crate::lane::{Lane, Mapped, NO_INPUT, Posted};
 use crate::platform;
 use crate::record::{self, Lease};
-
-/// What a batch written with no batch held is told.
-pub const NONE_HELD: &str = "a batch written answers the oldest batch the function holds from \
-    moruna_next, and the function holds none";
 
 /// What a task that ended before the engine's end is told.
 pub const BEFORE_THE_END: &str =
@@ -144,15 +141,14 @@ impl Task {
         }
     }
 
-    /// Writes `batch` into windows as the answer to the oldest batch held; `Err` with the exit
-    /// code once the task has failed, this write's failure included.
+    /// Writes `batch` into windows as the answer to the oldest batch held, or to none when none
+    /// is held; `Err` with the exit code once the task has failed, this write's failure
+    /// included.
     pub fn emit(&mut self, batch: &RecordBatch) -> Result<(), i64> {
         if let Some(code) = self.failed {
             return Err(code);
         }
-        let Some(cookie) = self.held.front().map(|h| h.cookie) else {
-            return Err(self.fail(&FunctionError::new(NONE_HELD)));
-        };
+        let cookie = self.held.front().map_or(NO_INPUT, |h| h.cookie);
         match record::write(&mut *self.lane, batch, cookie) {
             Ok(_) => Ok(()),
             Err(e) => Err(self.fail(&e)),
@@ -307,20 +303,31 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_written_with_none_held_ends_the_task() {
+    fn a_batch_written_with_none_held_answers_no_input() {
         let outcome = Plane::new()
-            .named("early")
-            .run([ints(0, 1)], || {
+            .named("sum")
+            .run([ints(0, 3), ints(3, 2)], || {
                 let mut t = Task::open().unwrap();
-                assert_eq!(t.emit(&ints(0, 1)), Err(code::REFUSED));
-                assert_eq!(t.next_batch().map(|b| b.is_some()), Err(code::REFUSED));
-                assert_eq!(t.emit(&ints(0, 1)), Err(code::REFUSED));
+                t.emit(&ints(-1, 1)).unwrap();
+                let mut sum = 0;
+                while let Some(b) = t.next_batch().unwrap() {
+                    let a = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                    sum += a.values().iter().sum::<i64>();
+                }
+                t.emit(&ints(sum, 1)).unwrap();
                 exit(t.finish())
             })
             .unwrap();
-        assert_eq!(outcome.said, Some(code::REFUSED));
-        assert_eq!(outcome.log, [format!("early: {NONE_HELD}")]);
-        assert!(!outcome.answers[0].released);
+        assert_eq!(outcome.said, Some(code::DONE));
+        assert!(
+            outcome
+                .answers
+                .iter()
+                .all(|a| a.released && a.records.is_empty())
+        );
+        assert_eq!(outcome.unheld.batches, [ints(-1, 1), ints(10, 1)]);
+        assert!(!outcome.unheld.released);
+        assert_eq!(outcome.log, ["sum: answered 2 batches"]);
     }
 
     #[test]

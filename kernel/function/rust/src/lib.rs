@@ -5,7 +5,8 @@
 //! arrow-ipc over buffers that are slices of the record, no copy), and hands it to the function
 //! with an [`Emit`]; [`Emit::batch`] writes an output batch into a window, and may be called any
 //! number of times. A returned [`FunctionError`] ends the task with its message in the task's log,
-//! and [`log`] writes a line there.
+//! and [`log`] writes a line there. A function with something to write once the input has ended
+//! (an aggregate) is a [`Function`], whose [`Function::end`] is called after the last batch.
 //!
 //! ```no_run
 //! use std::process::ExitCode;
@@ -53,7 +54,7 @@ use sys as platform;
 pub use arrow_array::RecordBatch;
 pub use emit::Emit;
 pub use error::FunctionError;
-pub use serve::serve;
+pub use serve::{Function, serve};
 
 /// A task's exit codes, the ones the gate's tasks have always ended with. [`serve`] says the code
 /// on the task's rings, where the engine reads it, and returns it for `main` to return.
