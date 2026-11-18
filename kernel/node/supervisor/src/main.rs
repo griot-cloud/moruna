@@ -160,9 +160,38 @@ fn prepare(console: &Console) -> Result<Prepared, String> {
     // Reuse only the explicitly granted immutable ELF; each instance gets a fresh
     // actual Process, Account and separately configured service channel graph.
     let mut images = BTreeMap::new();
-    for service in &config.services {
-        let account = Account::carve(service.account_bytes, &service.name)
+    // Every fixed account first, then the `rest` account, from what this account actually has
+    // free then, less the supervisor's reserve: a service listed after the one that takes the
+    // rest still gets its account.
+    let mut accounts: Vec<Option<Account>> = config.services.iter().map(|_| None).collect();
+    let rest = config
+        .rest
+        .as_ref()
+        .and_then(|name| config.services.iter().position(|s| &s.name == name));
+    for index in config.carving_order() {
+        let service = &config.services[index];
+        let bytes = if Some(index) == rest {
+            let free = Usage::own()
+                .map_err(|e| format!("node usage: {}", e.name()))?
+                .room();
+            moruna_node::rest_bytes(free).ok_or_else(|| {
+                format!(
+                    "{} account: {free} bytes left for the rest, less the supervisor's {} MiB, \
+                     is under {} MiB",
+                    service.name,
+                    moruna_node::SUPERVISOR_RESERVE >> 20,
+                    moruna_node::REST_LEAST >> 20
+                )
+            })?
+        } else {
+            service.account_bytes
+        };
+        let account = Account::carve(bytes, &service.name)
             .map_err(|e| format!("{} account: {}", service.name, e.name()))?;
+        accounts[index] = Some(account);
+    }
+    for (service, account) in config.services.iter().zip(accounts) {
+        let account = account.ok_or("an account was not carved")?;
         let process = Process::create_in(&process_root, &service.name, &account.0)
             .map_err(|e| format!("{} process: {}", service.name, e.name()))?;
         if let alloc::collections::btree_map::Entry::Vacant(entry) =
