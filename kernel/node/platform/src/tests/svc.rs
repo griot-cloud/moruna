@@ -287,20 +287,22 @@ const PLATFORM_GRANT: &str = "grant listen-platform rights=connect \
 
 #[test]
 fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
-    // node.conf: on a machine that is not Hyper-V, which runs no `vmbus`, the supervisor starts
-    // `platform` after `network` and `api`, with a 16 MiB account and a network listener, and
-    // then step 3's services (item 3.2), node-admission taking the rest of a 2 GiB node.
+    // node.conf: on a machine that is not Hyper-V, which runs no `vmbus` and none of its clients
+    // (`storvsc`, `netvsc`), the supervisor starts `platform` after `network` and `api`, with a
+    // 16 MiB account and a network listener, and then step 3's services (item 3.2),
+    // node-admission taking the rest of a 2 GiB node.
     let node = moruna_node::Config::parse(NODE_CONF.as_bytes(), 2 << 30).expect("node.conf");
     let names: Vec<&str> = node.services.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(
         names,
         [
             "devices",
+            "vmbus",
+            "storvsc",
+            "netvsc",
             "network",
             "api",
             "platform",
-            "vmbus",
-            "storvsc",
             "imagefs",
             "linux",
             "node-admission"

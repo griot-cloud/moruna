@@ -20,7 +20,8 @@ use alloc::{
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use moruna_abi::{
-    ABI_VERSION, Error, PAGE_SIZE, RawHandle, Signals, charge, limits, map, start_page, valid_name,
+    ABI_VERSION, Error, PAGE_SIZE, RawHandle, Signals, charge, limits, map, process_end::End,
+    start_page, valid_name,
 };
 use moruna_handles::HandleTable;
 use moruna_loader::elf;
@@ -107,6 +108,8 @@ pub struct Process {
     /// The code the last thread to end by a fast `exit` gave: a process whose last
     /// thread ends that way ends with it.
     last_code: AtomicI64,
+    /// How it ended (`moruna_abi::process_end`), set as it ends: zero before (ABI 2.7).
+    ended: AtomicU64,
     /// Its record, charged to its own account.
     _record: Charge,
 }
@@ -229,6 +232,7 @@ impl Process {
             granted: AtomicBool::new(false),
             cpu_ns: AtomicU64::new(0),
             last_code: AtomicI64::new(0),
+            ended: AtomicU64::new(0),
             _record: record,
         });
         process.handles.join(&process);
@@ -686,6 +690,12 @@ impl Process {
     }
 
     /// Records why the process is ending (the first reason wins) and stops its threads.
+    /// How the process ended (`moruna_abi::process_end`), once it is `TERMINATED`: what
+    /// `handle_info` gives in `rdx` (ABI 2.7). Zero before it ends.
+    pub fn ended(&self) -> u64 {
+        self.ended.load(Ordering::Acquire)
+    }
+
     pub fn end(&self, exit: Exit) {
         let threads: Vec<Arc<Thread>> = {
             let mut state = self.state.lock();
@@ -777,6 +787,13 @@ impl Process {
         }
         drop(plane);
         self.space.clear();
+        let end = match &exit {
+            Exit::Code(code) => End::Code(*code),
+            Exit::Fault(_) => End::Faulted,
+            Exit::Killed => End::Killed,
+        };
+        // Stored before the signal, so a waiter that sees `TERMINATED` reads how it ended.
+        self.ended.store(end.encode(), Ordering::Release);
         self.signaller.update(Signals::NONE, Signals::TERMINATED);
         if self.supervisor && failed {
             SUPERVISOR_FAILED.store(true, Ordering::Release);

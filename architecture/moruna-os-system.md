@@ -53,11 +53,13 @@ Implements the OS design, section 1, OpenStack column.
   |---|---|
   | 1 | `node-supervisor`, `devices`, `netstack`, `platform`, `api`; drivers `virtio-blk`, `virtio-net`, `nvme`, `gve`. Item 1.1 boots the supervisor, `devices` and the drivers alone; `netstack` joins with `api` in 1.3, because the network server refuses a config with no listener grant |
   | 2 | The same; `api` gains TLS and its operations |
-  | 3 | Adds `storage`, `imagefs`, `linux`, `node-admission`, `engine` |
+  | 3 | Adds `imagefs`, `linux`, `node-admission`, `engine` (no `storage`: cloud jobs reach data through volumes, 3C, and object stores, 3D) |
 
 - **Layout:** a GPT disk with one partition, the EFI system partition (FAT32). It holds
   `EFI/BOOT/BOOTX64.EFI` (GRUB), `boot/moruna-kernel.elf` and `boot/initramfs.cpio`. A second
-  partition, `moruna-system`, is reserved for step 3's function images.
+  partition, `moruna-system`, holds step 3's engine layer (and later cached function images): the
+  boot disk's driver registers it in `devices`' directory as the read-only block device `system`,
+  a slice at the partition's bounds, and `imagefs` takes its layers from it.
 - **Boot chain:** UEFI firmware, GRUB with no menu and no wait, the core by multiboot2 with the
   initramfs as its module, then `node-supervisor`. This is what `package.py` builds today.
 - **UEFI only.** Secure Boot comes later. A BIOS boot is added only if a cloud cannot do UEFI.
@@ -394,6 +396,9 @@ Implements the OS design, section 2.
     `listen`, but the supervisor never listens itself. At each start it mints `api`'s listener from
     it (`Client::grant`). `node.conf`'s one record says it all:
     `restart api network network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000`,
+    and a fresh connection to `node-admission` at every start (the supervisor holds a client of
+    admission's listener and connects anew; a dead api's connection closes, and admission ends its
+    jobs),
     giving the service, its listener slot, the network server's service, its granting slot, and
     the policy. `network.conf`
     has no `listen-api` grant.
@@ -513,7 +518,7 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
   share. Jobs and checks are carved from it. The job bound is admission's account less the 256 MiB
   check account (no scratch) and admission's own 128 MiB; `GET /v1/node` reports it as
   `job_memory_bytes`, and a larger budget is refused. One image serves any node size. The cloud
-  profile's step-3 services are imagefs 256 MiB (a cache), linux 256 MiB, storage 128 MiB. The engine
+  profile's step-3 services are imagefs 256 MiB (a cache) and linux 256 MiB. The engine
   receives its channel as it is (`grant <slot> channel <from>`, only with `runs 1`).
 - **Validation is the engine's.** `api` does not link `moruna-job`, which needs std. A document is
   checked by the engine itself:
@@ -760,8 +765,14 @@ There are two kinds:
 - **The SDK** keeps `@moruna.source`, `@moruna.function` and `@moruna.sink` (SDD 12). It gains
   `moruna.register(fn, client)`: build the image, sign it with the operator's key, upload it to
   object storage the node can read, and register it through `moruna.api` (2E).
-- **What registration takes for an image function:** the image as one file, the existing layer
-  archive, named by the address and SHA-256 of 3E.
+- **What registration takes for an image function:** one file, a **Moruna image archive** that
+  `moruna.register` makes on the client: an index (manifest, config, digests, each layer's offset,
+  length and seal) and Moruna's own sealed layer files at page-aligned offsets. The node converts
+  nothing: `node-admission` hands the engine the archive as a read-only memory object, and `imagefs`
+  attaches its layers in place (memory-backed, seals checked at mount); the task runs on that view
+  as its root (`run_plane`'s `root`). A native function's file is its ELF, mapped in place. Which
+  it is, is decided by content; anything else is refused. The engine's slots are `function.N` plus
+  a `functions` index (`N NAME SHA256 SIZE`), at most 16 per job.
 
 ### Work items
 

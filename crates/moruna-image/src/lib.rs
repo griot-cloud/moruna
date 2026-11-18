@@ -10,11 +10,13 @@
 //! filesystem serves (SDD 27): one read-only, page-aligned file per layer; [`record`] is
 //! what the engine on the kernel checks those layers' identity against (SDD 30 f.12). A
 //! [`Launch`] is what an image's config and an entry's settings make of its process, on a
-//! Linux node and on the kernel alike.
+//! Linux node and on the kernel alike. [`archive`] is an image as the one file a node
+//! registers and runs in place: its layer files after a small index (system design 3E, 5C).
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod archive;
 pub mod derive;
 mod digest;
 mod error;

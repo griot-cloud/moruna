@@ -7,7 +7,9 @@
 //! caller has exactly what `moruna.driver.net` needs: [`Netvsc::mac`], [`Netvsc::mtu`],
 //! [`Netvsc::link_up`], [`Netvsc::send`] for a frame out, and [`Netvsc::poll`] for the
 //! frames and link changes the host has sent. Nothing waits after `start`: the caller
-//! waits for the host's signal on its channel and then polls.
+//! polls until `None`, which may find what came with the start's last answer, then
+//! [`Netvsc::arm`]s (or flushes) and waits for the host's signal on its channel, and
+//! polls again.
 //!
 //! # Where each step comes from
 //!

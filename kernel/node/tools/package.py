@@ -43,7 +43,7 @@ PROGRAMS = {
                    "virtio-blk", "virtio-vsock", "virtio-net", "nvme", "gve"],
     "cloud": ["moruna-node-supervisor", "devices", "netstack", "moruna-node-api", "moruna-node-platform",
               "virtio-blk", "virtio-net", "nvme", "gve", "moruna-vmbus-server", "moruna-storvsc-server",
-              "imagefs", "linux", "node-admission", "engine"],
+              "moruna-netvsc-server", "imagefs", "linux", "node-admission", "engine"],
 }
 # For tests only, never the release image: the cloud's programs, `api` with its test route.
 PROGRAMS["cloud-test"] = PROGRAMS["cloud"]

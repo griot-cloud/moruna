@@ -8,9 +8,15 @@
 //! to it, whose connections may register and do nothing else ([`REGISTER_SLOTS`]); the
 //! device is then found as any other, by its serial (`lun-0`, `boot`), so there is one way
 //! to find a disk whatever drives it (`architecture/moruna-os-system.md`, section 3C).
-//! The device manager's own block drivers (virtio-blk) register theirs the same way, through
-//! a `register` listener it gives each, and `blocks` lists every disk registered (minor 2),
-//! which is what a node grants a job's volumes from.
+//! From minor 2 such a driver registers a network card the same way, by name (`netvsc`'s
+//! `net0`), so the network server finds Azure's card as it finds a virtio-net one (1C).
+//! A lookup of a name nothing has yet waits while a driver linked to a `register*` listener
+//! has not finished registering, which it says by closing its connection: so a client that
+//! starts before that driver, as the network server starts before `netvsc`, finds what it
+//! registers.
+//! The device manager's own block drivers (virtio-blk) register their disks the same way,
+//! through a `register` listener it gives each, and `blocks` lists every disk registered
+//! (minor 3), which is what a node grants a job's volumes from (item 3.3).
 //! `moruna.devices.control`
 //! is for the processes the boot description links to it, and no other: it restarts a
 //! driver, and hands out the resources a driver of a device holds (without its DMA
@@ -50,8 +56,15 @@ pub fn hand_over_names(bars: &[usize]) -> String {
 /// a `directory*` slot may look up and list, and not register.
 pub const REGISTER_SLOTS: &str = "register";
 
-/// The longest serial a block device is registered under.
+/// The longest name a device is registered under: a block device's serial, or a network
+/// card's name.
 pub const SERIAL_MAX: usize = 64;
+
+/// Whether `name` is one the directory registers a device under: 1 to [`SERIAL_MAX`]
+/// visible ASCII characters.
+pub fn valid_name(name: &str) -> bool {
+    (1..=SERIAL_MAX).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_graphic())
+}
 
 /// One published service: its name, the device's `vendor << 16 | device`, the driver
 /// program, and how many times the driver has been started.
@@ -79,8 +92,7 @@ impl Block {
     /// visible ASCII characters, sectors of 512 bytes or a larger power of two, and at
     /// least one of them.
     pub fn valid(&self) -> bool {
-        (1..=SERIAL_MAX).contains(&self.serial.len())
-            && self.serial.bytes().all(|b| b.is_ascii_graphic())
+        valid_name(&self.serial)
             && self.sector_size >= 512
             && self.sector_size.is_power_of_two()
             && self.sectors > 0
@@ -115,10 +127,13 @@ moruna_svc::protocol! {
     pub protocol directory {
         name = "moruna.devices.directory";
         major = 1;
-        minor = 2;
+        minor = 3;
         requests {
-            /// A new connection to the service published as `name`, or to the block
-            /// device registered under that serial; answered once its driver is running.
+            /// A new connection to the service published as `name`, or to the device
+            /// registered under that name; answered once its driver is running. A name
+            /// nothing has is answered once every driver linked to a [`REGISTER_SLOTS`]
+            /// listener has finished registering: [`directory::Error::NotFound`] if none
+            /// registered it.
             1 => fn lookup(name: String) -> Channel;
             /// Every service the device manager's drivers publish.
             2 => fn list() -> Vec<Entry>;
@@ -128,9 +143,15 @@ moruna_svc::protocol! {
             /// driver has let go of its listener is registered again: a driver started again
             /// registers its disk again.
             3 => fn register(block: Block, listener: Channel) -> ();
-            /// Minor 2: every block device registered, in the order they were: its serial,
+            /// Minor 2: registers a network card, which the caller serves as
+            /// `moruna.driver.net` on `listener`, under `name` ([`valid_name`]): a lookup
+            /// of `name` connects through `listener`. Only through a [`REGISTER_SLOTS`]
+            /// listener.
+            4 => fn register_net(name: String, listener: Channel) -> ();
+            /// Minor 3: every block device registered, in the order they were: its serial,
             /// its size, and whether it is the disk the node booted from (system design 3C).
-            4 since 2 => fn blocks() -> Vec<Block>;
+            /// Only through a `directory*` listener.
+            5 since 3 => fn blocks() -> Vec<Block>;
         }
         events {}
         errors {
@@ -140,9 +161,11 @@ moruna_svc::protocol! {
             2 => Unavailable;
             /// Minor 1: a request this connection's listener does not allow.
             3 => Refused;
-            /// Minor 1: the serial is a name published already.
+            /// Minor 1: the serial is a name published or registered already; minor 2: or
+            /// the network card's name is.
             4 => Exists;
-            /// Minor 1: a block device that is not [`Block::valid`].
+            /// Minor 1: a block device that is not [`Block::valid`]; minor 2: or a network
+            /// card's name that is not [`valid_name`].
             5 => Invalid;
         }
     }
@@ -224,8 +247,8 @@ mod tests {
 
     #[test]
     fn a_block_device_travels_whole() {
-        assert_eq!(directory::REQUESTS, &[1, 2, 3, 4]);
-        assert_eq!((directory::ID.major, directory::ID.minor), (1, 2));
+        assert_eq!(directory::REQUESTS, &[1, 2, 3, 4, 5]);
+        assert_eq!((directory::ID.major, directory::ID.minor), (1, 3));
         let boot = Block {
             read_only: true,
             boot: true,
@@ -271,5 +294,10 @@ mod tests {
             }
             .valid()
         );
+        // A network card's name follows a serial's rule.
+        assert!(valid_name("net0"));
+        assert!(!valid_name(""));
+        assert!(!valid_name("net 0"));
+        assert!(!valid_name(&"n".repeat(SERIAL_MAX + 1)));
     }
 }

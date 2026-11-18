@@ -49,7 +49,7 @@ built yet.
 | --- | --- | --- |
 | Linux | Tens of millions of lines, with every driver | Over 350 system calls, plus every driver's `ioctl` |
 | Asterinas, whole | OSTD (about 49,000 lines) plus its Linux layer (about 137,000) plus its components (about 42,000) | 245 Linux calls |
-| The data OS | OSTD (about 49,000) plus Moruna's core (10,216 lines on 2026-11-18, with §2's mechanisms of A, B1 and P merged, Hyper-V's mechanism for VMBus, and 5.0's wall clock and yield) | Moruna's 79 native calls, six of them only on Hyper-V |
+| The data OS | OSTD (about 49,000) plus Moruna's core (10,239 lines on 2026-11-18, with §2's mechanisms of A, B1 and P merged, Hyper-V's mechanism for VMBus, 5.0's wall clock and yield, and an ended process's exit code) | Moruna's 79 native calls, six of them only on Hyper-V |
 
 How the figures are measured, so each merge updates them the same way: kernel-mode lines are
 `wc -l` over `kernel/core/src` (tests included); native calls are the call numbers the
@@ -60,7 +60,8 @@ path (slots, windows, clock page), B1's personality mechanisms
 (personality entry, snapshots and clones, the pager, thread state) and P's plane calls.
 2026-11-18, on `work/1.9c-vmbus-core` (items 1.8 and 1.9c): 10,147 lines and 77 calls, 9,903
 and 71 before item 1.9c; 10,166 lines once `feature/arrow-core-0.7` at `173167eb` (items 1.3,
-1.4 and 2.2b) is merged into it. Item 1.9c adds 244 lines and the six `hyperv_*` calls of ABI 2.7
+1.4 and 2.2b) is merged into it, and 10,189 with an ended process's exit code in
+`handle_info` (ABI 2.7, no new call). Item 1.9c adds 244 lines and the six `hyperv_*` calls of ABI 2.7
 (`kernel/core/src/hyperv.rs`, 158 lines, and the object, interrupt, mapping and boot hooks
 around it); the calls answer only the holder of `root.hyperv`, which the core makes only on
 Hyper-V. It also adds about 400 lines to OSTD (`ostd-adaptation/NOTICE.md`): CPU 0's SynIC,

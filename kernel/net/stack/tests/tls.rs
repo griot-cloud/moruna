@@ -707,3 +707,72 @@ fn net3_refuses_old_majors_and_unbound_or_rebound_accounts() {
     drop(slots);
     join.join().unwrap();
 }
+
+#[test]
+fn a_long_answer_closed_by_its_peer_is_read_whole_however_slowly() {
+    // The peer answers 300 KiB, sends its close_notify and its FIN at once, as an HTTP server
+    // does after a `Connection: close` answer, while the client has not read: the records
+    // behind the full buffer, the close_notify among them, are still read, and the end is
+    // the authenticated one.
+    let (ca, config) = credentials();
+    let (mut slots, server) = serve_with_tls(CONFIG, &[], no_external_cards(), Some(trust(&ca)));
+    let listener = slots.remove("listen").unwrap();
+    let mut a = client(moruna_svc::connect(&listener).unwrap());
+    let mut b = client(moruna_svc::connect(&listener).unwrap());
+    let (listening, address) = b
+        .listen(Endpoint::new(Addr::v4(127, 0, 0, 1), 0), 1)
+        .unwrap();
+    let opened = a.open(Target::Endpoint(address), None).unwrap();
+    let body: Vec<u8> = (0..300 * 1024u32).map(|i| (i % 253) as u8).collect();
+    let answer = body.clone();
+    let peer = thread::spawn(move || {
+        let accepted = b.accept(listening).unwrap();
+        let mut tls = ServerConnection::new(config).unwrap();
+        tls.set_buffer_limit(None);
+        let mut answered = false;
+        loop {
+            let mut output = Vec::new();
+            tls.write_tls(&mut output).unwrap();
+            if !output.is_empty() && !send(&mut b, accepted.socket, &output) {
+                break;
+            }
+            if answered {
+                b.shutdown(accepted.socket).unwrap();
+                break;
+            }
+            let bytes = match common::receive(&mut b, accepted.socket, 4096) {
+                Ok(bytes) if !bytes.is_empty() => bytes,
+                _ => break,
+            };
+            tls.read_tls(&mut Cursor::new(bytes)).unwrap();
+            tls.process_new_packets().unwrap();
+            let mut request = [0u8; 64];
+            if let Ok(n) = tls.reader().read(&mut request)
+                && n > 0
+            {
+                tls.writer().write_all(&answer).unwrap();
+                tls.send_close_notify();
+                answered = true;
+            }
+        }
+        drop(b);
+    });
+    a.start_tls(opened.socket, "peer.ke2.test".into()).unwrap();
+    assert!(send(&mut a, opened.socket, b"get"));
+    // Asleep while the whole answer, its close_notify and the FIN arrive.
+    thread::sleep(std::time::Duration::from_millis(500));
+    let mut read = Vec::new();
+    loop {
+        let bytes = common::receive(&mut a, opened.socket, 4096).unwrap();
+        if bytes.is_empty() {
+            break;
+        }
+        read.extend(bytes);
+    }
+    assert!(read == body, "{} bytes of {}", read.len(), body.len());
+    drop(a);
+    peer.join().unwrap();
+    drop(listener);
+    drop(slots);
+    server.join().unwrap();
+}

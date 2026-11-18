@@ -111,30 +111,63 @@ fn rust_client_calls_every_operation_of_the_table() {
 
 #[test]
 fn rust_client_registers_and_lists_functions() {
+    use base64::Engine;
     let node = TestNode::start();
     let admin = client(&node, Scope::Admin);
+    // 3E: Ed25519 over the 32 bytes of the image's SHA-256, by one of node config's keys.
+    let signed = |key: &support::token::Key| {
+        base64::engine::general_purpose::STANDARD.encode(key.sign(&[0xab; 32]))
+    };
     let registration = moruna_api::FunctionRegistration {
         name: "gate-score".to_string(),
         address: "https://images.example.com/gate-score".to_string(),
         sha256: "ab".repeat(32),
-        signature: "c2lnbmVk".to_string(),
+        signature: signed(&node.function_key),
     };
     let function = admin.functions_register(&registration).unwrap();
     assert_eq!(
-        (function.name.as_str(), function.sha256.as_str()),
-        ("gate-score", registration.sha256.as_str())
+        (
+            function.name.as_str(),
+            function.sha256.as_str(),
+            function.key.as_str()
+        ),
+        (
+            "gate-score",
+            registration.sha256.as_str(),
+            support::fake::key_id(&node.function_key.public()).as_str()
+        )
     );
     let listed = client(&node, Scope::Observe).functions_list().unwrap();
     assert_eq!(listed.functions, [function]);
-    let bad = moruna_api::FunctionRegistration {
-        signature: "bad".to_string(),
+    // Signed by a key node config does not hold, garbled, or of another image: refused.
+    for signature in [
+        signed(&support::token::Key::generate()),
+        "c2lnbmVk".to_string(),
+        "not base64!".to_string(),
+    ] {
+        let bad = moruna_api::FunctionRegistration {
+            signature,
+            ..registration.clone()
+        };
+        let Err(Error::Api { status, error, .. }) = admin.functions_register(&bad) else {
+            panic!("a registration that does not verify is refused");
+        };
+        assert_eq!((status, error.code), (400, ErrorCode::Invalid));
+        assert!(error.message.contains("does not verify"));
+    }
+    let other_image = moruna_api::FunctionRegistration {
+        sha256: "cd".repeat(32),
+        ..registration.clone()
+    };
+    assert!(admin.functions_register(&other_image).is_err());
+    let plain = moruna_api::FunctionRegistration {
+        address: "http://images.example.com/gate-score".to_string(),
         ..registration
     };
-    let Err(Error::Api { status, error, .. }) = admin.functions_register(&bad) else {
-        panic!("a registration that does not verify is refused");
+    let Err(Error::Api { error, .. }) = admin.functions_register(&plain) else {
+        panic!("an address that is not https:// is refused");
     };
-    assert_eq!((status, error.code), (400, ErrorCode::Invalid));
-    assert!(error.message.contains("does not verify"));
+    assert!(error.message.contains("https://"));
 }
 
 #[test]
@@ -391,6 +424,45 @@ fn python_client_against_the_node() {
         String::from_utf8_lossy(&output.stderr)
     );
     // unittest ends its report on stderr with OK only when every test passed.
+    let report = String::from_utf8_lossy(&output.stderr);
+    assert!(report.contains("\nOK"), "{report}");
+}
+
+/// `moruna.register`'s signing, upload and registration (work item 5.4) against this node,
+/// which checks each signature under its one function key, and a fake store over HTTPS.
+#[test]
+fn python_register_against_the_node() {
+    let node = TestNode::start();
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest.join("../..");
+    let python = std::env::var("MORUNA_API_TEST_PYTHON").unwrap_or_else(|_| "python3".into());
+    let key: String = node
+        .function_key
+        .pkcs8()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let output = Command::new(&python)
+        .arg(manifest.join("tests/python/register.py"))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("MORUNA_TEST_PYTHON_ROOT", root.join("python"))
+        .env("MORUNA_TEST_URL", &node.url)
+        .env("MORUNA_TEST_PIN", &node.fingerprint)
+        .env("MORUNA_TEST_OBSERVE", node.token(Scope::Observe))
+        .env("MORUNA_TEST_ADMIN", node.token(Scope::Admin))
+        .env("MORUNA_TEST_FUNCTION_KEY", key)
+        .env(
+            "MORUNA_TEST_FUNCTION_KEY_ID",
+            support::fake::key_id(&node.function_key.public()),
+        )
+        .output()
+        .unwrap_or_else(|error| panic!("{python} runs the registration's tests: {error}"));
+    assert!(
+        output.status.success(),
+        "the registration's tests failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let report = String::from_utf8_lossy(&output.stderr);
     assert!(report.contains("\nOK"), "{report}");
 }

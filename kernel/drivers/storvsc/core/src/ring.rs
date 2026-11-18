@@ -1,6 +1,11 @@
 //! The channel's two rings as storvsc uses them: one storvsp packet out, one packet in, and
 //! the wait between them.
 //!
+//! Requests are batched: each is written to the ring at once, and the ones written since the
+//! last [`Rings::commit`] are committed together there, so the host is signalled at most once
+//! for all of them, and only by VMBus's rule (the ring was empty before the commit and the
+//! host has not masked its interrupt). An arm and a wait commit first.
+//!
 //! Every packet either side sends is a `storvsp_protocol::Packet` header followed by the
 //! largest SCSI request the protocol defines, zero padded: "storvsp limits the size of the
 //! completion packet to the size of the request packet, so we need to pad the payload to the
@@ -79,6 +84,8 @@ pub(crate) struct Rings {
     write: OutgoingOffset,
     /// Bytes of the outgoing ring a packet needed and did not find; 0 when none is waiting.
     wanted: usize,
+    /// Whether packets were written since the last commit, which the host does not see yet.
+    uncommitted: bool,
 }
 
 impl Rings {
@@ -87,6 +94,7 @@ impl Rings {
             read: channel.incoming().incoming()?,
             write: channel.outgoing().outgoing()?,
             wanted: 0,
+            uncommitted: false,
         })
     }
 
@@ -116,8 +124,10 @@ impl Rings {
         (channel.outgoing().mem().len() / largest).clamp(1, 256)
     }
 
-    /// Sends one packet that asks for a completion under `id`: `operation`, then `body`, zero
-    /// padded (`storvsc:591-628`). With `data` it is a GPA direct packet naming those pages
+    /// Writes one packet that asks for a completion under `id`, for the next
+    /// [`commit`](Rings::commit): `operation`, then `body`, zero padded (`storvsc:591-628`).
+    /// When the ring has no room for it, what was written before is committed, so the host
+    /// can make room, and the packet tried once more. With `data` it is a GPA direct packet naming those pages
     /// (`storvsc:563-588`); without, an in-band one (`storvsc:542-560`).
     pub(crate) fn send<C: Channel>(
         &mut self,
@@ -148,11 +158,15 @@ impl Rings {
             size: PACKET,
             typ,
         };
-        let signal = {
+        loop {
             let ring = channel.outgoing();
             let mut next = self.write.clone();
             let range = match ring.write(&mut next, &packet) {
                 Ok(range) => range,
+                Err(WriteError::Full(_)) if self.uncommitted => {
+                    self.commit(channel)?;
+                    continue;
+                }
                 Err(WriteError::Full(size)) => {
                     self.wanted = size;
                     return Err(Error::Full);
@@ -163,9 +177,24 @@ impl Rings {
                 return Err(Error::Ring(vmbus_ring::Error::InvalidMessageLength));
             }
             self.write = next;
-            ring.commit_write(&mut self.write)
-        };
-        if signal {
+            self.uncommitted = true;
+            return Ok(());
+        }
+    }
+
+    /// Whether packets were written since the last commit.
+    pub(crate) fn uncommitted(&self) -> bool {
+        self.uncommitted
+    }
+
+    /// Commits every packet written since the last commit, and signals the host if VMBus's
+    /// rule says it needs it: once for all of them.
+    pub(crate) fn commit<C: Channel>(&mut self, channel: &mut C) -> Result<(), Error> {
+        if !self.uncommitted {
+            return Ok(());
+        }
+        self.uncommitted = false;
+        if channel.outgoing().commit_write(&mut self.write) {
             channel.signal_host().map_err(Error::Channel)?;
         }
         Ok(())
@@ -211,7 +240,8 @@ impl Rings {
     /// and the host's signal stays unmasked: a driver that waits elsewhere (the `vmbus` wake
     /// channel, among its clients') hears of the next packet through it. The order is
     /// [`Rings::wait`]'s: ask for the signal first, then look at the ring again.
-    pub(crate) fn arm<C: Channel>(&mut self, channel: &C) -> Result<bool, Error> {
+    pub(crate) fn arm<C: Channel>(&mut self, channel: &mut C) -> Result<bool, Error> {
+        self.commit(channel)?;
         let incoming = channel.incoming();
         incoming.set_interrupt_mask(false);
         let mut ready = incoming.can_read(&mut self.read).map_err(Error::Ring)?;

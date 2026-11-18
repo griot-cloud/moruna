@@ -1,15 +1,16 @@
 # The cloud profile, step 3 (system design 1A): the one disk image for every cloud.
 # Only the node supervisor starts in the initial manifest; it starts the services node.conf
 # names: `devices`, the network server (`netstack`, configured by network.conf), `api` and
-# `platform` (items 1.1, 1.3 and 1.4), on Hyper-V `vmbus` (item 1.9c) and its client
-# `storvsc` (item 1.10b), and `imagefs`, `linux` and `node-admission` (item 3.2). It starts `api` again when it dies, minting its listener from the
-# network server's `listen-supervisor` (item 2.2c, node.conf's `restart` record). package.py
-# --profile cloud --assets kernel/node/cloud validates node.conf and network.conf with their
-# actual parsers. Driver table data and driver images are emitted by moruna-image. package.py
-# writes disk.guid, the GPT disk GUID of the image's own disk, which `devices` passes to its
-# drivers so the boot disk is never a volume (system design 3C, item 3.3); the supervisor holds
-# it twice, as `disk.guid.storvsc` too, since no slot of it is granted to two services, for
-# `storvsc` to check Azure's OS disk by.
+# `platform` (items 1.1, 1.3 and 1.4), on Hyper-V `vmbus` (item 1.9c) and its clients
+# `storvsc` (item 1.10b) and `netvsc` (item 1.11b), and `imagefs`, `linux` and
+# `node-admission` (item 3.2). It starts `api` again when it dies,
+# minting its listener from the network server's `listen-supervisor` (item 2.2c, node.conf's
+# `restart` record). package.py --profile cloud --assets kernel/node/cloud validates
+# node.conf and network.conf with their actual parsers. Driver table data and driver images
+# are emitted by moruna-image. package.py writes disk.guid, the GPT disk GUID of the image's
+# own disk, which `devices` passes to its drivers so the boot disk is never a volume (system
+# design 3C, item 3.3); the supervisor holds it twice, as `disk.guid.storvsc` too, since no
+# slot of it is granted to two services, for `storvsc` to check Azure's OS disk by.
 moruna-image 1
 process node-supervisor
   handle console console
@@ -35,6 +36,10 @@ process node-supervisor
   # program. The supervisor starts it where it starts vmbus, whose client it is.
   handle root.dma dma.storvsc
   handle program:storvsc image.storvsc
+  # netvsc (item 1.11b), Azure's network card, which the device manager's directory gives
+  # the network server as net0: its program, and no DMA grant, since vmbus pins the buffers
+  # it shares (1F). The supervisor starts it where it starts vmbus, whose client it is.
+  handle program:netvsc image.netvsc
   # Step 3 (item 3.2): the image filesystem, the Linux personality, node-admission and the
   # engine's supervisor, which node-admission starts for each job and each check; and the
   # image filesystem's layer list, which package.py --system-layer writes (item 3.3).

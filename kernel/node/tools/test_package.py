@@ -124,7 +124,7 @@ class Profiles(unittest.TestCase):
         # supervisor. No storage, no vsock.
         self.assertEqual(cloud, ["moruna-node-supervisor", "devices", "netstack", "moruna-node-api",
                                  "moruna-node-platform", "virtio-blk", "virtio-net", "nvme", "gve",
-                                 "moruna-vmbus-server", "moruna-storvsc-server",
+                                 "moruna-vmbus-server", "moruna-storvsc-server", "moruna-netvsc-server",
                                  "imagefs", "linux", "node-admission", "engine"])
         for absent in ("virtio-vsock", "moruna-storage-service", "storvsc-check"):
             self.assertNotIn(absent, cloud)

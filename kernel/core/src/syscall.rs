@@ -279,7 +279,13 @@ fn handle_duplicate(p: &Process, value: u64, rights: u64) -> Ret {
 
 fn handle_info(p: &Process, value: u64) -> Ret {
     let handle = lookup(p, value, Rights::NONE)?;
-    one(((handle.object.kind() as u64) << 32) | handle.rights.bits() as u64)
+    let info = ((handle.object.kind() as u64) << 32) | handle.rights.bits() as u64;
+    // ABI 2.7: how a process ended, once it has (`moruna_abi::process_end`).
+    let ended = match &handle.object {
+        Object::Process(process) => process.ended(),
+        _ => 0,
+    };
+    Ok((info, ended))
 }
 
 fn channel_create(p: &Process) -> Ret {

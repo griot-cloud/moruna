@@ -1,0 +1,44 @@
+[package]
+name = "moruna-netvsc-server"
+description = "The netvsc process: Azure's synthetic network card, which vmbus opens for it, driven with moruna-netvsc and served as moruna.driver.net, registered with the device manager as net0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+bench = false
+
+# The process itself, for the kernel's user target only: on a host it is an empty program,
+# and the library above is what the host tests run.
+[[bin]]
+name = "netvsc"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+moruna-svc.workspace = true
+moruna-netvsc = { path = "../core", version = "=0.1.0" }
+moruna-vmbus = { path = "../../vmbus/core", version = "=0.1.0" }
+net-protocol = { path = "../../net-protocol", version = "=0.1.0" }
+
+[target.'cfg(target_os = "none")'.dependencies]
+moruna-sys.workspace = true
+# The node's console line for a service that cannot go on (system design, section 1B).
+moruna-abi.workspace = true
+vmbus-protocol = { path = "../../vmbus/protocol", version = "=0.1.0" }
+devices-protocol = { path = "../../../devices/protocol", version = "=0.1.0" }
+# The channel's two rings over the memory vmbus maps for it, and a safe view of that memory
+# as atomic bytes.
+vmbus_ring = { path = "../../../vendor/openvmm/vmbus_ring", version = "=0.0.0" }
+zerocopy = { version = "=0.8.63", features = ["derive"] }
+
+[dev-dependencies]
+# The fake netvsp of moruna-netvsc's own tests (`../core/tests/netvsc/fake.rs`), behind
+# moruna-vmbus's in-memory channel, which the server's tests drive the server against.
+moruna-vmbus = { path = "../../vmbus/core", version = "=0.1.0", features = ["testing"] }
+netvsp_protocol = { path = "../../../vendor/openvmm/netvsp_protocol", version = "=0.0.0" }
+vmbus_ring = { path = "../../../vendor/openvmm/vmbus_ring", version = "=0.0.0" }
+guestmem_core = { path = "../../../vendor/openvmm/guestmem_core", version = "=0.0.0" }
+zerocopy = { version = "=0.8.63", features = ["derive"] }
