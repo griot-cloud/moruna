@@ -672,6 +672,12 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
   to node config's `functions.cache_bytes` (default the smaller of 1 GiB and an eighth of the node's memory; an operator's value at most half of it), until the node stops. The cache is an account `node-admission` carves from its own, so the job bound it reports already leaves it out.
 - **A job names a function** by its registered name, as a function task's `"function": "<name>"`;
   the check's `needs.functions` lists them. An unregistered name is refused at `validate`.
+- **A function runs one instance per CPU of the job** (the job's `budget.cpu`, or the node's CPUs),
+  each a process of its own, on the batches each engine worker hands it. A function that keeps
+  state across batches, such as a running total, declares how many instances it can run: one, or
+  a number, in its image (`MORUNA_PROCESSES`, a ceiling, not a count). Its SDK says how (5A, 5B,
+  5C). Parallelism follows the job, never a value fixed when the image was packaged (6.3e, found by
+  6.2 run 3: Score's function ran as one process on a 4-CPU node, 82 s of 93 s).
 - **AWS's own S3** (no endpoint) is reached with path-style requests, so its host is
   `s3.<region>.amazonaws.com`, known without the bucket; the region is required.
 
