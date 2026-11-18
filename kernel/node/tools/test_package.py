@@ -146,6 +146,98 @@ class Profiles(unittest.TestCase):
                          "--target=x86_64-unknown-none -ffreestanding -mno-red-zone -fno-stack-protector -O1")
         self.assertIn("-C link-arg=-static", user_env["RUSTFLAGS"])
 
+    def payload_of(self, argv):
+        """main(), stopped at its first build: the files it put in the payload, by relative path,
+        and the description it rendered, if it rendered one."""
+        class Stop(Exception):
+            pass
+
+        def stop(args, cwd, env=None):
+            raise Stop
+
+        out = Path(argv[argv.index("--out") + 1])
+        with mock.patch.object(package, "command", stop), \
+                mock.patch.object(package.shutil, "which", lambda tool: f"/usr/bin/{tool}"), \
+                mock.patch.object(sys, "argv", ["package.py", *argv]):
+            with self.assertRaises(Stop):
+                package.main()
+        payload = out / "payload"
+        files = sorted(p.relative_to(payload).as_posix() for p in payload.rglob("*") if p.is_file())
+        rendered = out / "standalone.image"
+        return files, rendered.read_text() if rendered.exists() else None
+
+    def test_a_cloud_image_carries_only_the_files_its_description_binds(self):
+        """The committed cloud profile: kernel/node/cloud/ also holds cacert.pem and tls-roots.txt,
+        the source and record of tls.roots, which cloud.image does not bind; they stay out."""
+        kernel = TOOL.parents[2]
+        assets = kernel / "node/cloud"
+        self.assertTrue((assets / "cacert.pem").is_file() and (assets / "tls-roots.txt").is_file())
+        with tempfile.TemporaryDirectory() as tmp:
+            files, rendered = self.payload_of(
+                ["--profile", "cloud", "--description", str(kernel / "node/cloud.image"), "--assets", str(assets),
+                 "--out", str(Path(tmp) / "out"), "--node-memory", str(2 << 30)])
+        self.assertEqual(files, ["network.conf", "node.conf", "tls.roots"])
+        self.assertIsNone(rendered)
+
+    def test_a_launcher_s_node_carries_its_bound_files_its_rendered_ones_and_its_layers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp) / "assets"
+            (assets / "layers").mkdir(parents=True)
+            for name in ("node.conf", "storage.credential", "unbound.txt", "layers/layer-1.img", "layers/other.img"):
+                (assets / name).write_text("x\n")
+            # The bucket provider binds the credential (package.py's rendering of configure.py's profile).
+            (assets / "profile.json").write_text('{"storage_provider": "bucket"}\n')
+            description = Path(tmp) / "node.image"
+            description.write_text("moruna-image 1\nprocess node-supervisor\n  handle data:node.conf config\n")
+            files, rendered = self.payload_of(
+                ["--description", str(description), "--assets", str(assets), "--out", str(Path(tmp) / "out"),
+                 "--node-memory", str(2 << 30), "--agent-port", "5100", "--cpus", "2",
+                 "--layer", "layers/layer-1.img"])
+        self.assertEqual(files, ["layers/layer-1.img", "node.conf", "storage.credential"])
+        self.assertIn("  handle data:storage.credential storage.credential\n", rendered)
+
+    def test_a_launcher_s_node_without_its_profile_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp) / "assets"
+            assets.mkdir()
+            description = Path(tmp) / "node.image"
+            description.write_text("moruna-image 1\n")
+            out = Path(tmp) / "out"
+            argv = ["package.py", "--description", str(description), "--assets", str(assets), "--out", str(out),
+                    "--node-memory", str(2 << 30), "--agent-port", "5100", "--cpus", "2"]
+            error = io.StringIO()
+            with mock.patch.object(package.shutil, "which", lambda tool: f"/usr/bin/{tool}"), \
+                    mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(error), \
+                    self.assertRaises(SystemExit):
+                package.main()
+            self.assertIn("needs configure.py's profile.json", error.getvalue())
+            self.assertFalse(out.exists())
+
+    def test_data_the_description_binds_and_the_assets_lack_is_refused_before_anything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp) / "assets"
+            assets.mkdir()
+            (assets / "node.conf").write_text("moruna-node 1\n")
+            description = Path(tmp) / "cloud.image"
+            description.write_text("moruna-image 1\nprocess node-supervisor\n  handle data:node.conf config\n"
+                                   "  handle data:tls.roots tls.roots\n")
+            out = Path(tmp) / "out"
+            argv = ["package.py", "--profile", "cloud", "--description", str(description), "--assets", str(assets),
+                    "--out", str(out), "--node-memory", str(2 << 30)]
+            built = []
+            error = io.StringIO()
+            with mock.patch.object(package, "command", lambda *a, **k: built.append(a)), \
+                    mock.patch.object(package.shutil, "which", lambda tool: f"/usr/bin/{tool}"), \
+                    mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(error), \
+                    self.assertRaises(SystemExit):
+                package.main()
+            self.assertIn("the description binds data the assets do not hold: tls.roots", error.getvalue())
+            self.assertEqual(built, [])
+            self.assertFalse(out.exists())
+        self.assertEqual(package.bound("moruna-image 1\n  handle data:a.conf x\n  handle program:b image.b\n"
+                                       "  handle data:ke2/roots tls-roots\n  # handle data:c.conf y\n"),
+                         {"a.conf", "ke2/roots"})
+
     def test_the_command_refuses_before_building_anything(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
