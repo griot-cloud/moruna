@@ -422,6 +422,11 @@ pub fn serve(address: &Address, kinds: &Registry, opts: &HostOptions<'_>) -> Out
 /// `moruna serve --listen channel:<slot> [--budget-max BYTES]`: [`serve`] in node mode on
 /// `node`'s channel.
 pub fn serve_channel(node: &Node, kinds: &Registry, opts: &HostOptions<'_>) -> Outcome {
+    // The job's network, before its document is read: what its object stores are built over.
+    // One it cannot use is said, and the run goes on to refuse the first URL it reaches.
+    if let Err(why) = super::node::install_network() {
+        eprintln!("moruna: {why}");
+    }
     match Address::parse(&node.channel) {
         Ok(address @ Address::Channel(_)) => serve_at(&address, Some(node), kinds, opts),
         _ => {

@@ -60,7 +60,9 @@ impl NetSocket for Socket {
 /// it on [`SLOT`], its sockets charged to `account`, the engine's own. `false` when the engine
 /// was given no network (its job's check named no host), or one is installed already.
 pub fn install_from_start(account: Account) -> bool {
-    let Some(listener) = moruna_svc::start::take(SLOT) else {
+    // Through `moruna-micro`, which reads the start page from the auxiliary vector the Linux
+    // personality starts the engine with, before any slot is taken.
+    let Some(listener) = moruna_micro::start::take(SLOT) else {
         return false;
     };
     super::install(Arc::new(MorunaNet::new(Channel(listener), account)))
