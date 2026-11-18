@@ -127,9 +127,46 @@ pub(crate) struct StageEntry {
     /// How many batches the stage's `finish` gave, once it has finished (f.6, d.16); 0 from the
     /// start for a stateless stage, which has no `finish` to call.
     pub(crate) finished: std::sync::OnceLock<Seq>,
+    /// What its output came to over its input, at the most, as `f64` bits; 0 until its first
+    /// morsel, when the kernel's declared amplification stands for it, or 1 (6.3b).
+    pub(crate) growth: AtomicU64,
+    /// The growth before its first morsel: the kernel's declared amplification, or 1.
+    pub(crate) declared_growth: f64,
 }
 
 impl StageEntry {
+    /// What its output comes to over its input (6.3b): the most it has come to so far, or before
+    /// its first morsel, what its kernel declared, else 1.
+    pub(crate) fn growth(&self) -> f64 {
+        match self.growth.load(Ordering::SeqCst) {
+            0 => self.declared_growth,
+            bits => f64::from_bits(bits),
+        }
+    }
+
+    /// One morsel's growth, `bytes_out` over `bytes_in`, learned: the stage keeps the most.
+    pub(crate) fn learn_growth(&self, bytes_in: u64, bytes_out: u64) {
+        if bytes_in == 0 {
+            return;
+        }
+        let seen = bytes_out as f64 / bytes_in as f64;
+        let mut now = self.growth.load(Ordering::SeqCst);
+        loop {
+            if now != 0 && f64::from_bits(now) >= seen {
+                return;
+            }
+            match self.growth.compare_exchange(
+                now,
+                seen.to_bits(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(current) => now = current,
+            }
+        }
+    }
+
     /// What the stage did so far.
     pub(crate) fn counters(&self) -> StageCounters {
         StageCounters {
@@ -426,6 +463,9 @@ pub(crate) struct Shared {
     pub(crate) scratch: Vec<Mutex<crate::decide::Scratch>>,
     /// Pushes waiting for room (f.20); the stall detector leaves the run alone while one waits.
     pub(crate) pushes_waiting: AtomicU64,
+    /// Pushes of a morsel larger than its tier's whole budget, waiting while another holds the
+    /// tier over its budget (6.3b): while there is one, the drives read nothing new into the tier.
+    pub(crate) oversize_waiting: AtomicU64,
     /// What the stall detector saw at its last check, while the run was quiescent (f.21).
     pub(crate) stall: Mutex<Option<Vec<u64>>>,
 
@@ -594,6 +634,12 @@ impl Shared {
                         KernelKind::Stateless => std::sync::OnceLock::from(0),
                         KernelKind::Stateful { .. } => std::sync::OnceLock::new(),
                     },
+                    growth: AtomicU64::new(0),
+                    declared_growth: kernel
+                        .hints()
+                        .expected_amplification
+                        .filter(|a| a.is_finite() && *a > 0.0)
+                        .unwrap_or(1.0),
                 }
             })
             .collect();
@@ -752,6 +798,7 @@ impl Shared {
                 .collect(),
             learning: std::sync::OnceLock::new(),
             pushes_waiting: AtomicU64::new(0),
+            oversize_waiting: AtomicU64::new(0),
             stall: Mutex::new(None),
             reads_in_flight: AtomicU16::new(0),
             writes_in_flight: AtomicU16::new(0),

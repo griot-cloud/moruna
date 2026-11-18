@@ -59,18 +59,29 @@ fn sc_t35_a_budget_under_the_floor_is_refused() {
 
 #[test]
 fn sc_t35_a_push_with_no_room_and_no_disk_ends_the_run_naming_it() {
-    // Every claim is refused (a budget smaller than one batch) and there is no disk to write
-    // to, so the first read waits for room that cannot come. The stepped clock makes the
-    // thirty seconds pass at once.
+    // The budget holds one batch and not two, and the kernel holds the first for longer than the
+    // run's clock waits; there is no disk to write to, so the next read waits for room that does
+    // not come in time. The stepped clock makes the thirty seconds pass at once. (A batch larger
+    // than the whole budget is not this case: no room could ever come for it, and it is admitted
+    // alone once the tier holds nothing else, SC-T48.)
     let clock = Arc::new(Stepped::default());
     let rig = RigBuilder::new()
         .cfg({
             let clock = Arc::clone(&clock);
-            move |cfg| cfg.clock = clock
+            move |cfg| {
+                cfg.clock = clock;
+                cfg.initial_morsel_target = 1 << 20;
+            }
         })
-        .source(FakeSource::new().splits(3, 16, 128).sub_splittable(false))
-        .placement(FakePlacement::new().with_budget(16).without_disk())
-        .kernel(Arc::new(FakeKernel::new()))
+        .source(
+            FakeSource::new()
+                .splits(3, 4096, 32768)
+                .sub_splittable(false),
+        )
+        .placement(FakePlacement::new().with_budget(49_152).without_disk())
+        .kernel(Arc::new(
+            FakeKernel::new().latency(Duration::from_millis(1500)),
+        ))
         .go();
     let started = Instant::now();
     let message = diagnostic(rig.scheduler.run(CancelToken::new()));
@@ -78,7 +89,7 @@ fn sc_t35_a_push_with_no_room_and_no_disk_ends_the_run_naming_it() {
         started.elapsed() < Duration::from_secs(10),
         "the clock, not the wall, waited"
     );
-    assert!(message.contains("morsel 0"), "names the morsel: {message}");
+    assert!(message.contains("morsel "), "names the morsel: {message}");
     assert!(
         message.contains(&format!("waited {} s", PUSH_STALL.as_secs())),
         "{message}"

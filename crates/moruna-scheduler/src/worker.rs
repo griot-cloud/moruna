@@ -631,6 +631,8 @@ pub(crate) fn run_task(
             rows_out = out.rows();
             bytes_out = out.bytes();
             tier_out = out.tier().index() as u8;
+            // 6.3b: learned before the push, so the reads after it are sized by it.
+            entry.learn_growth(bytes_in, bytes_out);
             let out_morsel = Morsel::new(seq, stage, out, origin);
             // One push into every queue the stage gives to: the batch is shared, never copied
             // (contracts d.16).

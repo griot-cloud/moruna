@@ -168,6 +168,9 @@ pub struct PolicyReport {
     pub overflow_spills: u64,
     /// Pushes that waited for room.
     pub push_waits: u64,
+    /// Morsels larger than their tier's whole budget, admitted as the one morsel over it (6.3b):
+    /// when the sizing failed to keep a morsel inside the tiers it went to.
+    pub oversize_admissions: u64,
     /// Decisions the policy made with a shallower procedure to keep to its budget (lookahead
     /// falling to greedy).
     pub shallower: u64,
@@ -274,6 +277,7 @@ impl PolicyReport {
             unused_ready_byte_s: stats.unused_ready_byte_ns as f64 / 1e9,
             overflow_spills: stats.overflow_spills,
             push_waits: stats.push_waits,
+            oversize_admissions: stats.oversize_admissions,
             shallower: stats.counters.shallower,
             simulations: stats.counters.simulations,
             simulation_errors: stats.counters.simulation_errors,

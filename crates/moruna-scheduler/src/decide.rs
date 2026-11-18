@@ -766,6 +766,8 @@ fn admit_push_as(
     let mut waited = false;
     let mut refused_since: Option<Duration> = None;
     let _waiting = Waiting::enter(shared);
+    let mut oversize: Option<Oversize<'_>> = None;
+    let mut spill_tried = false;
     loop {
         if claim.bytes() >= bytes {
             return shared.placement.push_reserved(stages, morsel, claim);
@@ -778,6 +780,61 @@ fn admit_push_as(
                 continue;
             }
             Reserve::Pending { need } => format!("{need} bytes are on their way out"),
+            // 3A (6.3b): no room can ever make a morsel larger than its tier's whole budget
+            // fit. It goes to disk at once when the run has one, as a refused push does after
+            // `SPILL_AFTER`; with none, it is admitted as the one morsel over the budget (`alone`)
+            // rather than waited on. The process bound (the controller's) stays the real memory
+            // limit.
+            Reserve::Refused { budget, .. } if bytes > budget => {
+                if !spill_tried {
+                    spill_tried = true;
+                    let copy = Morsel {
+                        seq: morsel.seq,
+                        stage: morsel.stage,
+                        payload: morsel.payload.share(),
+                        bytes: morsel.bytes,
+                        origin: morsel.origin.clone(),
+                        features: morsel.features.clone(),
+                    };
+                    if shared.placement.push_spilled(stages, copy).is_ok() {
+                        let mut decider = shared.decider.lock().unwrap_or_else(|e| e.into_inner());
+                        decider.stats.overflow_spills += 1;
+                        return Ok(());
+                    }
+                }
+                oversize.get_or_insert_with(|| Oversize::enter(shared));
+                let none = match shared.placement.reserve(tier, 0)? {
+                    Reserve::Granted(none) => none,
+                    Reserve::Pending { .. } | Reserve::Refused { .. } => {
+                        return Err(MorunaError::Staging(
+                            "a claim of no bytes was not granted".into(),
+                        ));
+                    }
+                };
+                let mine = std::mem::replace(&mut claim, none);
+                match alone(shared, tier, budget, mine)? {
+                    Ok(whole) => {
+                        {
+                            let mut decider =
+                                shared.decider.lock().unwrap_or_else(|e| e.into_inner());
+                            decider.stats.oversize_admissions += 1;
+                        }
+                        tracing::warn!(
+                            target: "sched.oversize",
+                            seq = morsel.seq,
+                            bytes,
+                            budget,
+                            "a morsel larger than its tier's whole budget was admitted alone",
+                        );
+                        return shared.placement.push_reserved(stages, morsel, whole);
+                    }
+                    Err(mine) => claim = mine,
+                }
+                format!(
+                    "{bytes} bytes are more than the {budget} byte budget of their tier; \
+                     waiting for no other morsel to hold it over that budget"
+                )
+            }
             Reserve::Refused { need, budget }
                 if helper && let Some(job) = shared.offload.take() =>
             {
@@ -828,6 +885,34 @@ fn admit_push_as(
         }
         clock.pause(PUSH_PARK);
     }
+}
+
+/// The claim a morsel larger than its tier's whole `budget` is pushed under (6.3b): `claim`,
+/// topped up to every byte of the tier still free, so the morsel's excess over the budget is the
+/// tier's one overrun; `None` while another morsel already holds the tier over its budget.
+///
+/// Alone means the one morsel over the budget, not an empty tier: a tier that had to empty
+/// first would wait for ever on batches only the worker pushing this morsel would take (one
+/// worker, or every worker pushing such a morsel), the deadlock SC-T48 found.
+fn alone(
+    shared: &Shared,
+    tier: moruna_kernel::Tier,
+    budget: u64,
+    claim: Reservation,
+) -> Result<core::result::Result<Reservation, Reservation>> {
+    let held = {
+        let stats = shared.placement.stats().catalog;
+        let slot = tier.index();
+        stats.resident_by_tier[slot].saturating_add(stats.reserved_by_tier[slot])
+    };
+    if held > budget {
+        return Ok(Err(claim));
+    }
+    let mut claim = claim;
+    if let Reserve::Granted(top) = shared.placement.reserve(tier, budget - held)? {
+        claim.join(top)?;
+    }
+    Ok(Ok(claim))
 }
 
 /// `replace` of an evicted batch under a claim, waiting for room as `admit_push` does (a
@@ -884,6 +969,24 @@ impl<'a> Waiting<'a> {
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
         self.0.pushes_waiting.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A push of a morsel larger than its tier's whole budget, counted while it waits for no other
+/// morsel to hold the tier over its budget, so the drives read nothing new into the tier
+/// meanwhile (6.3b).
+struct Oversize<'a>(&'a Shared);
+
+impl<'a> Oversize<'a> {
+    fn enter(shared: &'a Shared) -> Oversize<'a> {
+        shared.oversize_waiting.fetch_add(1, Ordering::SeqCst);
+        Oversize(shared)
+    }
+}
+
+impl Drop for Oversize<'_> {
+    fn drop(&mut self) {
+        self.0.oversize_waiting.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

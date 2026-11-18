@@ -359,6 +359,10 @@ pub struct PolicyStats {
     pub overflow_spills: u64,
     /// Pushes that waited for room to be claimed.
     pub push_waits: u64,
+    /// Morsels larger than their tier's whole budget, admitted as the one morsel over it, with no
+    /// disk to go to (system design 3A, item 6.3b): each one is a morsel the sizing failed to keep
+    /// inside the tiers it went to.
+    pub oversize_admissions: u64,
     /// What the policy counted of its own decisions.
     pub counters: PolicyCounters,
     /// Units whose prediction came from the cost model, and from measured ratios.

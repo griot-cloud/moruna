@@ -4,59 +4,46 @@
 //! Found by 3.8's proof: Enrich on a 4 GiB node ended after 30 s with "staging: morsel 0
 //! (235894392 bytes) waited 30 s for room in [1] and none came: 235894392 bytes more than a
 //! budget of 223379456 holds ... the run has no disk tier". A morsel larger than its queue's
-//! whole host budget can never be placed. Today the push loop waits for room anyway
-//! (`decide::admit_push_as`: `SPILL_AFTER`, the refused spill, then `PUSH_STALL`), and nothing
-//! upstream keeps a morsel inside the budget it is headed for:
+//! whole host budget can never be placed, and the push loop waited for room anyway, while
+//! nothing upstream kept a morsel inside the budget it was headed for:
 //!
-//! - the drive sizes a read by its stage's morsel target and admits it against the arena's free
-//!   room at twice its estimate, never against the destination queue's budget, which is half
-//!   the arena less the sinks' file buffers (`source_drive::issue_reads`, `range_end`);
-//! - a function that grows its morsel (Enrich adds four columns) pushes its output whole into
-//!   the next queue, whatever that queue's budget (`decide::admit_push_on_worker`).
+//! - the drive sized a read by its stage's morsel target and admitted it against the arena's
+//!   free room, never against the destination tier's budget; it now cuts a read by rows so its
+//!   charge, grown by what the stages it feeds grow a morsel to, fits that budget
+//!   (`source_drive::tier_cap`, `grown`);
+//! - a function that grows its morsel pushed its output whole into the next queue; each stage
+//!   now learns its growth, which sizes the reads after its first morsel, and a morsel that is
+//!   still larger than its tier's whole budget is admitted as the one morsel over it, counted
+//!   as an oversize admission, rather than waited on (`decide::admit_push_as`).
 //!
-//! Both cases below fail today, ending at `PUSH_STALL` on a clock the test steps. Both split
-//! sizes are sub-splittable, so the rows could have been cut.
+//! The cases below ended at `PUSH_STALL`, 30 s after the morsel's first refusal, before the
+//! fix. They run on the run's own clock: a stepped one would also pass the 30 s while the sink
+//! drains the room the reads after an oversize morsel wait for.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use moruna_kernel::arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
 use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
 use moruna_kernel::{
     CancelToken, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, MorunaError,
-    NoState, Payload, PayloadKind, PayloadSpec, Result, SourceSchema, TierPref,
+    NoState, Payload, PayloadKind, PayloadSpec, Placement, Result, SourceSchema, TierKind,
+    TierPref,
 };
 use moruna_testkit::{FakeKernel, FakePlacement, FakeSource};
 
 use super::common::RigBuilder;
-use crate::decide::Clock;
 
-/// Rows of a split, eight bytes each.
-const ROWS: u64 = 16;
+/// Rows of a split, eight bytes each: enough that a morsel's own bytes, not Arrow's few hundred
+/// bytes of array headers, are what is counted.
+const ROWS: u64 = 4096;
 /// A split's bytes.
 const SPLIT: u64 = ROWS * 8;
 /// The host tier's budget: less than a split, more than half of one.
 const BUDGET: u64 = SPLIT * 3 / 4;
 
-/// A clock that moves only when it is waited on, so `PUSH_STALL` passes at once.
-#[derive(Debug, Default)]
-struct Stepped(AtomicU64);
-
-impl Clock for Stepped {
-    fn now(&self) -> Duration {
-        Duration::from_nanos(self.0.load(Ordering::SeqCst))
-    }
-
-    fn pause(&self, pause: Duration) {
-        self.0.fetch_add(pause.as_nanos() as u64, Ordering::SeqCst);
-        std::thread::yield_now();
-    }
-}
-
-/// A test-local stateless `Kernel` (k) that grows each morsel as Enrich does: it adds a column,
-/// here a copy of the first, so its output holds twice its input's bytes.
-struct Widening;
+/// A test-local stateless `Kernel` (k) that grows each morsel as Enrich does: it adds columns,
+/// here `.0` copies of the first, so its output holds `.0 + 1` times its input's bytes.
+struct Widening(usize);
 
 impl Kernel for Widening {
     fn fingerprint(&self) -> Fingerprint {
@@ -83,7 +70,9 @@ impl Kernel for Widening {
             return Err(MorunaError::Plan("a table".into()));
         };
         let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-        fields.push(Field::new("copy", DataType::Int64, false));
+        for copy in 0..self.0 {
+            fields.push(Field::new(format!("copy_{copy}"), DataType::Int64, false));
+        }
         Ok(SourceSchema::Table(Arc::new(Schema::new(fields))))
     }
 
@@ -100,9 +89,10 @@ impl Kernel for Widening {
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| MorunaError::Plan("an int64 column".into()))?;
-        let copy: ArrayRef = Arc::new(Int64Array::from(first.values().to_vec()));
         let mut columns = batch.columns().to_vec();
-        columns.push(copy);
+        for _ in 0..self.0 {
+            columns.push(Arc::new(Int64Array::from(first.values().to_vec())) as ArrayRef);
+        }
         let SourceSchema::Table(schema) =
             self.output_schema(&SourceSchema::Table(batch.schema()))?
         else {
@@ -114,36 +104,54 @@ impl Kernel for Widening {
     }
 }
 
-/// Runs the rig to its end and says how: the rows the sink was given, or the diagnostic.
-fn ended(rig: super::common::Rig) -> core::result::Result<u64, String> {
-    match rig.scheduler.run(CancelToken::new()) {
-        Ok(crate::RunOutcome::Completed { sinks }) => Ok(sinks[0].rows),
+/// Runs the rig to its end and says how: the rows the sink was given and the morsels admitted
+/// over their tier's budget, or the diagnostic.
+fn ended(rig: super::common::Rig) -> core::result::Result<(u64, u64), String> {
+    let outcome = rig.scheduler.run(CancelToken::new());
+    let oversize = rig
+        .scheduler
+        .shared()
+        .decider
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .stats()
+        .oversize_admissions;
+    match outcome {
+        Ok(crate::RunOutcome::Completed { sinks }) => Ok((sinks[0].rows, oversize)),
         Ok(crate::RunOutcome::Terminated { diagnostic, .. }) => Err(diagnostic.to_string()),
         other => Err(format!("{other:?}")),
     }
 }
 
+/// A rig of `splits` splits through `kernel`, reading `target` bytes at a time, into a host tier
+/// of `budget` bytes with no disk. The reads' queue stops taking more at a quarter of the tier,
+/// as the controller's high waters keep a queue from holding the room its consumer's output
+/// needs; with none, small reads after a growing stage's first morsel filled the tier and no
+/// unit's output could be claimed.
+fn rig(splits: u32, target: u64, budget: u64, kernel: Arc<dyn Kernel>) -> super::common::Rig {
+    let placement = FakePlacement::new().with_budget(budget).without_disk();
+    Placement::set_water(&placement, 0, TierKind::Host, 0, budget / 4);
+    RigBuilder::new()
+        .cfg(move |cfg| {
+            cfg.initial_morsel_target = target;
+            cfg.morsel_min = 8;
+        })
+        .source(FakeSource::new().splits(splits, ROWS, SPLIT))
+        .placement(placement)
+        .kernel(kernel)
+        .go()
+}
+
 #[test]
 fn sc_t48_a_read_is_never_larger_than_the_queue_it_goes_to() {
-    // The stage's target is larger than a split, so the drive reads each split whole, and a
-    // whole split is larger than the host tier's whole budget. The rows could be read in parts
-    // that fit; a read is never larger than the budget of the queue it is pushed to.
-    let clock = Arc::new(Stepped::default());
-    let rig = RigBuilder::new()
-        .cfg({
-            let clock = Arc::clone(&clock);
-            move |cfg| {
-                cfg.clock = clock;
-                cfg.initial_morsel_target = 1 << 20;
-                cfg.morsel_min = 8;
-            }
-        })
-        .source(FakeSource::new().splits(3, ROWS, SPLIT))
-        .placement(FakePlacement::new().with_budget(BUDGET).without_disk())
-        .kernel(Arc::new(FakeKernel::new()))
-        .go();
-    match ended(rig) {
-        Ok(rows) => assert_eq!(rows, 3 * ROWS, "every row, once"),
+    // The stage's target is larger than a split, so the drive would read each split whole, and
+    // a whole split is larger than the host tier's whole budget. The rows are read in parts that
+    // fit: a read is never larger than the budget of the queue it is pushed to.
+    match ended(rig(3, 1 << 20, BUDGET, Arc::new(FakeKernel::new()))) {
+        Ok((rows, oversize)) => {
+            assert_eq!(rows, 3 * ROWS, "every row, once");
+            assert_eq!(oversize, 0, "no read was larger than its tier");
+        }
         Err(diagnostic) => panic!(
             "a split of {SPLIT} bytes was read whole into a queue whose tier holds {BUDGET}, \
              and the run ended waiting for room that could not come (6.3b): {diagnostic}"
@@ -152,30 +160,37 @@ fn sc_t48_a_read_is_never_larger_than_the_queue_it_goes_to() {
 }
 
 #[test]
-fn sc_t48_a_function_that_grows_a_morsel_cuts_it_by_rows() {
-    // Each read is half a split, inside the budget; the function doubles it, past the budget of
-    // the sink's queue. Its output is cut by rows into parts that fit, not stalled.
-    let clock = Arc::new(Stepped::default());
-    let rig = RigBuilder::new()
-        .cfg({
-            let clock = Arc::clone(&clock);
-            move |cfg| {
-                cfg.clock = clock;
-                cfg.initial_morsel_target = SPLIT / 2;
-                cfg.morsel_min = 8;
-            }
-        })
-        .source(FakeSource::new().splits(3, ROWS, SPLIT))
-        .placement(FakePlacement::new().with_budget(BUDGET).without_disk())
-        .kernel(Arc::new(Widening))
-        .go();
-    match ended(rig) {
-        Ok(rows) => assert_eq!(rows, 3 * ROWS, "every row, once"),
+fn sc_t48_a_function_that_grows_a_morsel_past_its_tier_is_admitted_alone() {
+    // The first read fits the tier (cut to half its budget, at its charge); the function makes
+    // four times what it is given, past the budget of the tier. That morsel is admitted alone,
+    // not stalled; the reads after it are sized by the growth the stage has shown.
+    match ended(rig(3, SPLIT / 2, BUDGET, Arc::new(Widening(3)))) {
+        Ok((rows, oversize)) => {
+            assert_eq!(rows, 3 * ROWS, "every row, once");
+            assert!(oversize >= 1, "the first output was admitted alone");
+        }
         Err(diagnostic) => panic!(
-            "a function grew a morsel of {} bytes to {SPLIT}, past the {BUDGET} its next queue's \
-             tier holds, and the run ended waiting for room that could not come (6.3b): \
-             {diagnostic}",
-            SPLIT / 2
+            "a function grew its morsels fourfold, past the {BUDGET} bytes their tier holds, and \
+             the run ended waiting for room that could not come (6.3b): {diagnostic}"
         ),
+    }
+}
+
+#[test]
+fn sc_t48_after_its_first_morsel_a_growing_function_places_none_over_its_tier() {
+    // The stage learns from its first morsel that it makes eight times what it is given, and
+    // every read after it is cut so its output fits the tier, beside the reads behind it: of
+    // twelve whole splits, only the morsels the drive read before it had learned are admitted
+    // over the budget of four splits.
+    match ended(rig(12, 2 * SPLIT, 4 * SPLIT, Arc::new(Widening(7)))) {
+        Ok((rows, oversize)) => {
+            assert_eq!(rows, 12 * ROWS, "every row, once");
+            assert!(
+                oversize <= 2,
+                "{oversize} morsels went over the tier: more than the reads in flight when the \
+                 stage first grew one"
+            );
+        }
+        Err(diagnostic) => panic!("{diagnostic}"),
     }
 }
