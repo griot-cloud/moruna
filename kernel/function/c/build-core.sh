@@ -16,7 +16,8 @@
 #   bin/runtime               tests/c/runtime.c: malloc, pthread_create, a thread_local, stderr
 #   bin/threads               tests/threads.rs: std's thread-locals on the C library's threads
 #                             and the C library's on std's
-#   debug/NAME.debug          each program's debug info, which bin/NAME names (its
+#   bin/libc-tests            relibc's own C tests that need only what Moruna has (step 5)
+#   debug/NAME.debug         each program's debug info, which bin/NAME names (its
 #                             .gnu_debuglink): the programs are stripped
 #
 # The archive is built as kernel/tools/build-std.sh builds a program with std (the kernel's
@@ -149,4 +150,55 @@ cp "$threads" "$out/obj/threads"
 for name in double sum runtime threads; do
   strip_program "$name"
 done
+
+# 5. relibc's own C tests that need only what Moruna has (no files, processes, signals or
+# sockets; not pthread/barrier, which takes an atomic clang refuses, nor pthread/exit and
+# stdlib/div, which end their process themselves), as one static program, bin/libc-tests, the
+# boot's (kernel/initramfs/boot.image): each test's `main` renamed and its other symbols made its
+# own, called in turn by a runner that says each one's end and stops at the first that fails.
+# Compiled with relibc's test flags (tests/Makefile), less clang's -Wstrict-prototypes, which its
+# sources predate.
+libc_tests=(constructor destructor tls ctype alloca endian math
+  string/mem string/strchr string/strcat string/stpcpy
+  stdlib/strtol stdlib/strtoul stdlib/atoi stdlib/atof stdlib/qsort stdlib/a64l
+  stdlib/alloc stdlib/rand48
+  stdio/printf stdio/sprintf stdio/printf_neg_pad stdio/printf_space_pad
+  pthread/once pthread/mutex_recursive pthread/cleanup pthread/tls pthread/extjoin
+  pthread/rwlock_trylock pthread/timeout pthread/timedwait)
+runner="$out/obj/libc-tests.c"
+objects=()
+{
+  echo '#include <stdio.h>'
+  for i in "${!libc_tests[@]}"; do echo "int libc_test_$i(void);"; done
+  echo 'static const struct { const char *name; int (*main)(void); } tests[] = {'
+  for i in "${!libc_tests[@]}"; do echo "  {\"${libc_tests[$i]}\", libc_test_$i},"; done
+  echo '};'
+  echo 'int main(void) {'
+  echo '  for (size_t i = 0; i < sizeof tests / sizeof tests[0]; i++) {'
+  echo '    fflush(stdout);'
+  echo '    int code = tests[i].main();'
+  echo '    if (code != 0) {'
+  echo '      printf("libc-tests: FAIL: %s returned %d\n", tests[i].name, code);'
+  echo '      return 1;'
+  echo '    }'
+  echo '    printf("libc-tests: %s: ok\n", tests[i].name);'
+  echo '  }'
+  echo '  printf("libc-tests: ok: %zu tests\n", sizeof tests / sizeof tests[0]);'
+  echo '  return 0;'
+  echo '}'
+} >"$runner"
+for i in "${!libc_tests[@]}"; do
+  object="$out/obj/libc-test-$i.o"
+  "$cc" "${cflags[@]}" "${includes[@]}" -fno-builtin -Wall -Wextra -Werror \
+    -Wno-deprecated-declarations -Wno-strict-prototypes -pedantic -I"$relibc/tests" \
+    -c "$relibc/tests/${libc_tests[$i]}.c" -o "$object"
+  # Renamed once compiled, so a `main` that ends without `return` still returns 0, as C says.
+  "$objcopy" --redefine-sym "main=libc_test_$i" "$object"
+  "$objcopy" --keep-global-symbol="libc_test_$i" "$object"
+  objects+=("$object")
+done
+"$cc" "${cflags[@]}" "${includes[@]}" -std=c11 -Wall -Wextra -Werror -c "$runner" \
+  -o "$out/obj/libc-tests-runner.o"
+link libc-tests "$out/obj/libc-tests-runner.o" "${objects[@]}"
+strip_program libc-tests
 ls -l "$out/bin" "$out/debug"
