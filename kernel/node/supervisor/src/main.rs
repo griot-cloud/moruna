@@ -49,6 +49,8 @@ struct Child {
 /// The service that is started again when it dies, and what each of its starts needs.
 struct Restarting {
     index: usize,
+    /// The network server's service.
+    server: usize,
     record: Restart,
     /// Its program, kept for each new start.
     image: Handle,
@@ -298,6 +300,7 @@ fn prepare(console: &Console) -> Result<Prepared, String> {
             .ok_or("missing retained image")?;
         restarting = Some(Restarting {
             index,
+            server,
             record: record.clone(),
             image,
             granting: ours,
@@ -366,6 +369,33 @@ fn renew(child: &mut Child, kept: &mut Kept, console: &Console) -> Result<(), St
     child.entry = entry;
     child.handles = handles;
     Ok(())
+}
+
+/// `node: account <name>: <used> bytes held, peak <peak>, limit <limit> (<when>)`: what the
+/// accounts of the service that restarts and of the network server hold at each of its starts,
+/// before the start, and at each of its deaths, so that a restart is seen to leave nothing
+/// behind in either (item 2.2c).
+fn account_lines(console: &Console, children: &[Child], restarting: &Restarting, when: &str) {
+    for child in [&children[restarting.index], &children[restarting.server]] {
+        match child.account.usage() {
+            Ok(usage) => println!(
+                console,
+                "node: account {}: {} bytes held, peak {}, limit {} ({})",
+                child.name,
+                usage.used,
+                usage.peak,
+                usage.limit,
+                when
+            ),
+            Err(e) => println!(
+                console,
+                "node: account {}: {} ({})",
+                child.name,
+                e.name(),
+                when
+            ),
+        }
+    }
 }
 
 /// Starts `child` with its handles.
@@ -581,6 +611,8 @@ fn run() -> i64 {
         {
             let handles = fresh(restarting, kept.platform.as_ref()).map_err(Unstarted::Fresh)?;
             children[index].handles.extend(handles);
+            let when = format!("{} starting", restarting.record.service);
+            account_lines(&console, &children, restarting, &when);
         }
         launch(&mut children[index]).map_err(Unstarted::Refused)?;
         println!(console, "node: service {} started", index);
@@ -726,6 +758,7 @@ fn run() -> i64 {
             };
             // System design 2B: started again, at most 5 times in 10 minutes.
             let service = restarting.record.service.clone();
+            account_lines(&console, &children, restarting, &format!("{service} ended"));
             let n = match restarting.deaths.died(now()) {
                 Verdict::Restart(n) => n,
                 Verdict::Fatal => {
@@ -745,6 +778,14 @@ fn run() -> i64 {
             let started = renew(&mut children[index], &mut kept, &console).and_then(|()| {
                 // Before the start, so the line comes before any line the new start prints.
                 println!(console, "{}", restart::restarted_line(&service, n));
+                if let Some(restarting) = kept.restarting.as_ref() {
+                    account_lines(
+                        &console,
+                        &children,
+                        restarting,
+                        &format!("{service} starting"),
+                    );
+                }
                 launch(&mut children[index])
             });
             if let Err(e) = started {
