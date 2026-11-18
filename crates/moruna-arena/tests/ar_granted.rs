@@ -308,19 +308,37 @@ fn a_ceiling_below_the_budget_makes_nothing_past_it() {
     assert_eq!(arena.host_capacity(), 16 * MIB);
 }
 
+/// A grant the backing refuses during the run refuses the allocation that needed it, and the
+/// arena goes on: freed room serves, and once the backing grants again the region is made.
+///
+/// The backing refuses from the first allocation on. The first region is made with the arena,
+/// and the next would be made ahead of need, on a thread of its own, as soon as an allocation
+/// finds the free bytes below `GRANTED_AHEAD_BELOW` (here at once). Refused only once the first
+/// region was full, the backing raced that thread: half the runs found the next region made
+/// already, and the allocation served (2026-11-18).
 #[test]
 fn a_grant_refused_during_the_run_refuses_the_allocation_and_the_arena_goes_on() {
     let heap = Heap::new(4 * MIB);
     let arena = Arena::with_backing(config(8 * MIB), heap.clone()).expect("a granted arena");
     let chunk = 4 * MIB;
-    let first: Vec<_> = (0..chunk / GRANULE as u64)
-        .map(|_| arena.alloc(GRANULE, Tier::Host).expect("room"))
-        .collect();
     heap.refuse.store(true, Ordering::SeqCst);
+    let first: Vec<_> = (0..chunk / GRANULE as u64)
+        .map(|_| {
+            arena
+                .alloc(GRANULE, Tier::Host)
+                .expect("the first region, made already")
+        })
+        .collect();
     assert!(matches!(
         arena.alloc(GRANULE, Tier::Host),
         Err(MorunaError::Alloc { .. })
     ));
+    arena.settle();
+    assert_eq!(
+        arena.regions_made_ahead(),
+        0,
+        "the region ahead was refused too"
+    );
     assert_eq!(
         arena.uncommitted_bytes(),
         8 * MIB - chunk,
@@ -333,7 +351,9 @@ fn a_grant_refused_during_the_run_refuses_the_allocation_and_the_arena_goes_on()
     let held: Vec<_> = (0..chunk / GRANULE as u64 + 1)
         .map(|_| arena.alloc(GRANULE, Tier::Host).expect("room"))
         .collect();
+    arena.settle();
     assert_eq!(heap.given().len(), 2);
+    assert_eq!(arena.uncommitted_bytes(), 0);
     drop(held);
 }
 
@@ -341,10 +361,14 @@ fn a_grant_refused_during_the_run_refuses_the_allocation_and_the_arena_goes_on()
 fn the_largest_free_counts_the_next_region_to_be_made() {
     let heap = Heap::new(4 * MIB);
     let arena = Arena::with_backing(config(10 * MIB), heap.clone()).expect("a granted arena");
+    // Nothing more is granted, so the region the arena would make ahead of need, on a thread of
+    // its own, is not made while the test counts the regions (as `a_grant_refused...` says).
+    heap.refuse.store(true, Ordering::SeqCst);
     let chunk = 4 * MIB;
     let held: Vec<_> = (0..chunk / GRANULE as u64)
         .map(|_| arena.alloc(GRANULE, Tier::Host).expect("room"))
         .collect();
+    arena.settle();
     // The made region is full; the next one would hold a chunk.
     assert_eq!(arena.largest_free(Tier::Host), chunk);
     assert_eq!(arena.arena_stats().largest_free, chunk);
@@ -482,12 +506,16 @@ fn a_page_locked_run_takes_granted_memory_as_locked() {
 fn an_aligned_grant_is_used_whole_so_two_halves_share_one_region() {
     let heap = Heap::new(4 * MIB);
     let arena = Arena::with_backing(config(16 * MIB), heap.clone()).expect("a granted arena");
+    // Nothing more is granted: the region the arena would make ahead of need once the first
+    // half lands is not made while the test counts the grants (as `a_grant_refused...` says).
+    heap.refuse.store(true, Ordering::SeqCst);
     let a = arena
         .alloc(2 * MIB as usize, Tier::Host)
         .expect("first half");
     let b = arena
         .alloc(2 * MIB as usize, Tier::Host)
         .expect("second half");
+    arena.settle();
     assert_eq!(heap.given(), vec![4 * MIB], "one grant holds both");
     assert_eq!(arena.uncommitted_bytes(), 12 * MIB);
     assert_eq!(heap.released.load(Ordering::SeqCst), 0);

@@ -21,6 +21,12 @@ cudarc = { workspace = true, optional = true }
 name = "tier_of"
 harness = false
 
+# What a buffer costs, allocated and released, with one thread and with eight at once
+# (02 f.3). `cargo bench -p moruna-arena --bench alloc_release`.
+[[bench]]
+name = "alloc_release"
+harness = false
+
 [features]
 # `test-shim` is the counting shim AR-T3 reads (section k). It is on by default so that
 # AR-T3 runs in the `cargo test --workspace` gate the preamble's section 6.7 requires; it

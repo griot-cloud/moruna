@@ -60,7 +60,7 @@ impl ArenaHandle for Inner {
 impl Inner {
     /// A release the arena cannot honour: a pointer outside every region, or a tier it
     /// never hands out. Counted in `ArenaStats::double_release` and logged (h, section j).
-    fn foreign(&self, tier: Tier) {
+    pub(crate) fn foreign(&self, tier: Tier) {
         self.foreign.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(target: "arena.release_foreign", tier = ?tier, "release of a pointer this arena did not hand out");
     }
