@@ -18,7 +18,8 @@
   `mkdir`, with an `owner` file naming your agent id, item and UTC time. Remove it the moment you
   stop building. If `~/.mac-build-lock-next` names someone else, they take the next free slot
   first. When it is empty, write your name there while you wait, and clear it once you hold a slot.
-  Poll every 30 s.
+  Poll every 30 s. A third slot, `~/.mac-build-lock-3`, is for commit hooks alone (a commit's
+  clippy run, minutes at most): take it only around `git commit`, never for a build or a test run.
 - Host tests of single crates (`cargo test -p …`, `cargo llvm-cov -p …`) don't need the lock. Run
   every cargo command with `-j 2`, and tests with `RUST_TEST_THREADS=2`: up to nine agents and a
   boot share this Mac's 10 cores and 16 GB.
