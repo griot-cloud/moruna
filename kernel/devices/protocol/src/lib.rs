@@ -18,7 +18,8 @@
 //! (or by letting the listener go, or ending, without having connected): so a client that
 //! starts before that driver, as the network server starts before `netvsc` and the image
 //! filesystem before the boot disk's virtio-blk registers `system` (item 1.6d), finds what it
-//! registers.
+//! registers. `blocks` waits the same way, so a list asked while such a driver is still
+//! registering includes what it registers (item 1.6e).
 //! `moruna.devices.control`
 //! is for the processes the boot description links to it, and no other: it restarts a
 //! driver, and hands out the resources a driver of a device holds (without its DMA
@@ -154,7 +155,9 @@ moruna_svc::protocol! {
             4 => fn register_net(name: String, listener: Channel) -> ();
             /// Minor 3: every block device registered, in the order they were: its serial,
             /// its size, and whether it is the disk the node booted from (system design 3C).
-            /// Only through a `directory*` listener.
+            /// Answered once every driver given a [`REGISTER_SLOTS`] listener has finished
+            /// registering, as a lookup of a name nothing has (item 1.6e). Only through a
+            /// `directory*` listener.
             5 since 3 => fn blocks() -> Vec<Block>;
         }
         events {}
