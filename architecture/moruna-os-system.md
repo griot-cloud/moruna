@@ -963,7 +963,7 @@ each call runs, and says where it ran.
 | `filter` | The rows a Boolean array selects | A batch and a Boolean array | The compacted batch, or a UInt32 selection array | None |
 | `take` | Rows gathered by position | An index array and a values array (any type) | An array as long as the index | None; the values may be fixed at configure |
 | `group_aggregate` | Count, sum, min, max and mean per group of keys, with a dense path for a small declared key domain | Key arrays and value arrays | Key arrays and one array per aggregate | Accumulate, merge, finish |
-| `interval_coverage_count` | For each group and grid bucket, how many intervals cover it (add at start, subtract past end, running sum) | group Int32, start Int64, length Int64; the grid's step and size | (group, bucket, count UInt64) for non-zero cells, in key order | None per batch; partial results merge by addition |
+| `interval_coverage_count` | For each group and grid bucket, how many intervals cover it (add at start, subtract past end, running sum) | group Int32, start Int64, length Int64; the grid's step and size | (group, bucket, count Int64) for non-zero cells, in key order | None per batch; partial results merge by addition |
 | `mlp_forward` | Dense layers (multiply, bias, activation) over a fixed-width feature vector per row | k Float columns, or one `FixedSizeList<Float>` | Float, or `FixedSizeList<Float>` | None per batch; the model is fixed at configure |
 
 - **`expr`'s vocabulary** is Arrow compute's elementwise functions: arithmetic (wrapping and
@@ -976,6 +976,9 @@ each call runs, and says where it ran.
   on which is faster and the answer depends on how many rows survive.
 - **`group_aggregate` declares its state size** from its key domain and aggregates, because that
   one number decides whether a device helps.
+  Its float sums and means are reproducible: the same bits however rows are split across instances
+  or devices. A key outside a declared dense range sends that instance to the hash path, with a note
+  in the report, never an error. Counts are Int64, in this kernel and in `interval_coverage_count`.
 - **`interval_coverage_count`** is new to analytics engines. It replaces "expand each interval to
   one row per bucket, then count", whose working set is many times its input.
 
