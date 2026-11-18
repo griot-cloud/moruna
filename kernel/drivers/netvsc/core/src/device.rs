@@ -178,6 +178,11 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         self.mtu
     }
 
+    /// The NVSP version the host accepted, as NVSP numbers it: `0x60001` is 6.1.
+    pub fn nvsp_version(&self) -> u32 {
+        self.wire.version().unwrap_or_default()
+    }
+
     /// Whether the link is up, as the host last indicated.
     pub fn link_up(&self) -> bool {
         self.link
@@ -653,6 +658,7 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
             status => Err(NetvscError::Refused {
                 step,
                 status: status.unwrap_or_default(),
+                nvsp: self.wire.version(),
             }),
         }
     }

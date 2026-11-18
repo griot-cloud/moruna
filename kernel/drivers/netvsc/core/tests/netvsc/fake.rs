@@ -11,6 +11,12 @@
 //! It can also misbehave on demand: [`Host::mangle`] alters its answers, and the `raw`
 //! methods put any packet at all on the ring to the guest.
 //!
+//! Where Azure's host (Hyper-V's vmswitch) is known to be stricter than netvsp, the fake is
+//! too: it refuses a receive buffer whose ID is 0 with `FAILURE`, as Azure did on the first
+//! boot of netvsc (`moruna: fatal netvsc: ... the host refused the receive buffer with
+//! status 0x00000002`, console 2026-11-18T0146, image 4ba46ef5), where netvsp takes any
+//! ID. Every guest that works there gives a receive buffer an ID that is not 0.
+//!
 //! A test holds the fake as `Rc<RefCell<Host>>` and the card as a [`Card`]. What a test
 //! has the host send is queued, and goes on the ring the next time the card does
 //! anything, or the host runs.
@@ -46,8 +52,9 @@ pub const CONTROL_SECTIONS: u32 = 16;
 pub const FRAME_AT: usize = 256;
 /// netvsp's transaction for what it says of a virtual function.
 pub const VF_TRANSACTION: u64 = 0x8000_0000_0000_0000;
-/// The receive buffer's ID, as the guest names it and the host echoes it.
-pub const RECEIVE_SET: u16 = 0;
+/// The receive buffer's ID, as the guest names it and the host echoes it: Linux's
+/// `NETVSC_RECEIVE_BUFFER_ID`.
+pub const RECEIVE_SET: u16 = 0xcafe;
 /// The address the fake card has.
 pub const MAC: [u8; 6] = [0x00, 0x15, 0x5d, 0x01, 0x02, 0x03];
 /// The deadline every test gives the card: on the test channel, any deadline has
@@ -247,6 +254,10 @@ impl Card {
         self.driver.mtu()
     }
 
+    pub fn nvsp_version(&self) -> u32 {
+        self.driver.nvsp_version()
+    }
+
     pub fn link_up(&self) -> bool {
         self.driver.link_up()
     }
@@ -435,6 +446,8 @@ enum Out {
 }
 
 struct ReceiveBuffer {
+    /// The ID the guest gave it, which names it in every receive.
+    id: u16,
     memory: Memory,
     section: usize,
     control: Vec<u32>,
@@ -494,6 +507,8 @@ pub struct Host {
     initialized: bool,
     /// The packet filter the guest set.
     pub filter: u32,
+    /// The ID the guest gave its receive buffer.
+    pub receive_id: Option<u16>,
 
     // What happened.
     /// Every version the guest offered, in order.
@@ -619,6 +634,7 @@ impl Host {
             send: None,
             initialized: false,
             filter: 0,
+            receive_id: None,
             offers: Vec::new(),
             messages: Vec::new(),
             frames: Vec::new(),
@@ -982,9 +998,7 @@ impl Host {
         let Some(config) = self.config else {
             return self.violation("the receive buffer before the NDIS configuration".into());
         };
-        if message.id != RECEIVE_SET {
-            self.violation(format!("receive buffer ID {}", message.id));
-        }
+        self.receive_id = Some(message.id);
         let section = self
             .receive_section
             .unwrap_or(FRAME_AT as u32 + config.mtu + 36);
@@ -996,8 +1010,12 @@ impl Host {
                 0
             }
         };
-        let status = if count > CONTROL_SECTIONS {
+        // Azure's host refuses a receive buffer whose ID is 0 (see the module's docs).
+        let status = if message.id == 0 {
+            Status::FAILURE
+        } else if count > CONTROL_SECTIONS {
             self.receive = Some(ReceiveBuffer {
+                id: message.id,
                 memory: memory.unwrap(),
                 section: section as usize,
                 control: (0..CONTROL_SECTIONS).rev().collect(),
@@ -1277,6 +1295,7 @@ impl Host {
     /// Sends an RNDIS control message as it is.
     fn control_as_is(&mut self, message: Vec<u8>) {
         let receive = self.receive.as_mut().unwrap();
+        let set = receive.id;
         let section = receive.control.pop().expect("a free control section");
         let at = section as usize * receive.section;
         receive.memory.write(at, &message);
@@ -1286,12 +1305,7 @@ impl Host {
         };
         self.lent.insert(section.into(), vec![section]);
         let payload = self.rndis_packet(protocol::CONTROL_CHANNEL_TYPE);
-        self.emit(Out::Transfer(
-            section.into(),
-            RECEIVE_SET,
-            payload,
-            vec![range],
-        ));
+        self.emit(Out::Transfer(section.into(), set, payload, vec![range]));
     }
 
     /// Indicates the link's state, as netvsp's `indicate_status` does.
@@ -1340,6 +1354,7 @@ impl Host {
     /// test's to see that the sections are free.
     pub fn deliver(&mut self, frames: &[&[u8]]) {
         let receive = self.receive.as_mut().unwrap();
+        let set = receive.id;
         let mut sections = Vec::new();
         let mut ranges = Vec::new();
         for frame in frames {
@@ -1359,7 +1374,7 @@ impl Host {
         let transaction = u64::from(sections[0]);
         self.lent.insert(transaction, sections);
         let payload = self.rndis_packet(protocol::DATA_CHANNEL_TYPE);
-        self.emit(Out::Transfer(transaction, RECEIVE_SET, payload, ranges));
+        self.emit(Out::Transfer(transaction, set, payload, ranges));
     }
 
     // What no well-behaved host does.

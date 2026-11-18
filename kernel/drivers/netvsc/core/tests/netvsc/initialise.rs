@@ -374,15 +374,31 @@ fn a_receive_buffer_the_host_cannot_use_is_refused_by_name() {
             e,
             NetvscError::Refused {
                 step: "the receive buffer",
-                status: 2
+                status: 2,
+                nvsp: Some(0x60001)
             }
         ),
         "{e}"
     );
+    // The refusal says the versions in use, for the console.
     assert_eq!(
         e.to_string(),
-        "the host refused the receive buffer with status 0x00000002"
+        "the host refused the receive buffer with status 0x00000002 (NVSP 6.1, NDIS 6.30)"
     );
+    assert_clean(&host);
+}
+
+#[test]
+fn the_receive_buffer_has_an_id_azures_host_takes_and_every_receive_names_it() {
+    // Azure's host refused a receive buffer whose ID was 0 with FAILURE (console
+    // 2026-11-18T0146), and the fake refuses one so too: the card gives Linux's 0xcafe.
+    let (mut card, host) = started(SMALL);
+    assert_eq!(host.borrow().receive_id, Some(0xcafe));
+    assert_eq!(card.nvsp_version(), 0x60001);
+    assert_eq!(moruna_netvsc::Nvsp(card.nvsp_version()).to_string(), "6.1");
+    // The host names the buffer by that ID in each receive, and the card takes them.
+    host.borrow_mut().inject(&[9; 60]);
+    assert_eq!(drain(&mut card), [Got::Frame(vec![9; 60])]);
     assert_clean(&host);
 }
 

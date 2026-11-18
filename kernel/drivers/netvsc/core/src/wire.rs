@@ -66,6 +66,8 @@ pub(crate) struct Wire<C: Channel> {
     /// Where the packets written since the last flush end: they are not yet committed,
     /// so the host does not see them.
     pending: Option<OutgoingOffset>,
+    /// The NVSP version in use, once negotiated.
+    version: Option<u32>,
     /// When every wait gives up: a time on the node's monotonic clock, in nanoseconds,
     /// as the channel counts it; `None` for never.
     deadline: Option<u64>,
@@ -95,6 +97,7 @@ impl<C: Channel> Wire<C> {
             crowded: false,
             wanted: 0,
             pending: None,
+            version: None,
             deadline,
         }
     }
@@ -102,6 +105,12 @@ impl<C: Channel> Wire<C> {
     /// From now on messages have the packet size of `version`.
     pub fn negotiated(&mut self, version: Version) {
         self.message = packet_size(Some(version));
+        self.version = Some(version as u32);
+    }
+
+    /// The NVSP version in use, once negotiated.
+    pub fn version(&self) -> Option<u32> {
+        self.version
     }
 
     /// Asks the host to signal when there is something to do, without waiting: true when
