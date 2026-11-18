@@ -23,7 +23,10 @@
 //! its connection through the slot ([`Registry::finished`]), or by letting the slot go, or
 //! ending, without having connected through it (a virtio-blk disk with nothing to register).
 //! The lookup is answered when the name is registered, or with `NotFound` once every held
-//! slot's driver has finished. A slot not handed out holds nothing (the supervisor links
+//! slot's driver has finished. The list of disks (`blocks`) waits the same way, and is
+//! answered once every held slot's driver has finished, with what they registered: a job's
+//! check or launch right after `ready` finds a volume whose driver was still registering
+//! (item 1.6e). A slot not handed out holds nothing (the supervisor links
 //! storvsc's and netvsc's only on Hyper-V: elsewhere the link goes with the driver), and a
 //! name a driver of the device manager publishes (`net0` of virtio-net) is answered at once
 //! whatever waits. The wait cannot hang the node: a driver that ends finishes its slot (the
@@ -110,6 +113,8 @@ pub struct Registry {
     finished: Vec<bool>,
     /// Lookups of a name nothing has, while a held slot's driver has not finished.
     waiting: Vec<(String, Pending)>,
+    /// Lists of the disks asked while a held slot's driver has not finished (item 1.6e).
+    listing: Vec<Pending>,
     /// Answers to lookups that waited, for the device manager's loop to send.
     ready: Vec<(Pending, Outcome)>,
 }
@@ -239,7 +244,7 @@ impl Registry {
 
     /// The driver of held slot `number` has finished registering: a connection through the
     /// slot has closed. Once every held slot's driver has, the lookups still waiting are
-    /// answered `NotFound`.
+    /// answered `NotFound`, and the lists of the disks with every disk registered.
     pub fn finished(&mut self, number: usize) {
         if let Some(finished) = self.finished.get_mut(number) {
             *finished = true;
@@ -248,6 +253,13 @@ impl Registry {
             for (_, pending) in core::mem::take(&mut self.waiting) {
                 self.ready
                     .push((pending, Outcome::Failure(directory::Error::NotFound.code())));
+            }
+            let listing = core::mem::take(&mut self.listing);
+            if !listing.is_empty() {
+                let blocks: Vec<Block> = self.blocks().cloned().collect();
+                for pending in listing {
+                    self.ready.push((pending, Outcome::reply(blocks.clone())));
+                }
             }
         }
     }
@@ -258,9 +270,9 @@ impl Registry {
         self.finished.iter().any(|finished| !finished)
     }
 
-    /// Lookups waiting for a name.
+    /// Requests waiting for a held slot's driver: lookups of a name, and lists of the disks.
     pub fn waiting(&self) -> usize {
-        self.waiting.len()
+        self.waiting.len() + self.listing.len()
     }
 
     /// The answers of lookups that waited and now have one, to send.
@@ -411,7 +423,14 @@ impl<D: Drivers> Handler for Directory<D> {
             },
             (5, Access::Lookup) => match d.finish() {
                 Ok(()) => {
-                    let blocks: Vec<Block> = self.registry.borrow().blocks().cloned().collect();
+                    let mut registry = self.registry.borrow_mut();
+                    // A disk whose driver is still registering is listed once it has
+                    // finished, as a lookup of its serial waits for it (item 1.6e).
+                    if registry.awaited() {
+                        registry.listing.push(cx.defer());
+                        return Outcome::Deferred;
+                    }
+                    let blocks: Vec<Block> = registry.blocks().cloned().collect();
                     Outcome::reply(blocks)
                 }
                 Err(_) => bad,

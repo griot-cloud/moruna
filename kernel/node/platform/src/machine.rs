@@ -1,5 +1,6 @@
 //! What `platform` needs of the machine, as traits: outbound connections as byte streams, the
-//! core's monotonic clock, the node's wall clock, and the channel to `api`. The logic is written
+//! core's monotonic clock, the node's wall clock, the channel to `api`, and the image
+//! filesystem's word that it has mounted the engine's layer. The logic is written
 //! against these, so every rule is tested on a host; [`crate::svc`] gives the node's own (and the
 //! program, `src/main.rs`, the wall clock).
 
@@ -85,4 +86,13 @@ pub trait Control {
     /// The channel to the next start of `api`, waiting for it until `deadline` ([`FOREVER`]
     /// for no deadline).
     fn next_api(&mut self, deadline: u64) -> Result<Self::Api, LinkError>;
+}
+
+/// The image filesystem, as `platform` hears from it (system design 1B; item 1.6e): the node is
+/// ready only once `imagefs` has mounted the engine's layer from `system`.
+pub trait EngineLayer {
+    /// Returns once `imagefs` has mounted the engine's layer, waiting for it until `deadline`:
+    /// [`LinkError::Closed`] if `imagefs` ended first, [`LinkError::TimedOut`] if the deadline
+    /// passed first.
+    fn mounted(&mut self, deadline: u64) -> Result<(), LinkError>;
 }

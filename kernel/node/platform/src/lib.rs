@@ -1,6 +1,7 @@
 //! `platform` (system design, section 1D; work item 1.4): the process that finds the node's cloud
 //! from instance data, sets the wall clock from that answer's `Date` header, validates node
-//! config, hands `api` its config, and prints the `cloud` and `ready` lines.
+//! config, hands `api` its config, hears that `imagefs` has mounted the engine's layer (item
+//! 1.6e), and prints the `cloud` and `ready` lines.
 //!
 //! This library is the logic, written against the traits of [`machine`] so every rule is tested
 //! on a host: [`http`] is the minimal HTTP/1.1 client, [`instance`] finds the cloud with its

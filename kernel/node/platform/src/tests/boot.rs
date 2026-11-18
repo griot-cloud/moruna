@@ -14,9 +14,9 @@ use std::{
 use moruna_node_config::{Cloud, Handover, HandoverError, NodeConfig, base64};
 
 use super::{
-    FakeClock, FakeNetwork, FakeWall, RECORDED_AZURE_ID, RECORDED_CONFIG, RECORDED_OPENSTACK_ID,
-    RECORDED_OPENSTACK_TIME, Reply, SECOND, Sent, answer, azure, openstack, recorded_health,
-    wire_server,
+    FakeClock, FakeLayer, FakeNetwork, FakeWall, MOUNTED, RECORDED_AZURE_ID, RECORDED_CONFIG,
+    RECORDED_OPENSTACK_ID, RECORDED_OPENSTACK_TIME, Reply, SECOND, Sent, answer, azure, openstack,
+    recorded_health, wire_server,
 };
 use crate::{
     boot::{Fatal, Inputs, READY_LIMIT_NS, RETIME_NS, Stage, cloud_line, ready_line, run, serve},
@@ -119,11 +119,13 @@ impl Link for FakeApi {
     }
 }
 
-/// One boot: what it returned, what reached the console and the link, and `api`'s end.
+/// One boot: what it returned, what reached the console and the link, `api`'s end, and the
+/// image filesystem.
 struct Booted {
     result: Result<Handover, Fatal>,
     events: Vec<String>,
     api: FakeApi,
+    layer: FakeLayer,
     clock: FakeClock,
     /// Each request a server saw, and when its connection was made.
     requests: Vec<(u64, Sent)>,
@@ -149,16 +151,25 @@ const INPUTS: Inputs = Inputs {
 };
 
 /// Boots against `network`, with `api` changed by `prepare` from one that answers `ready`.
-fn boot_with(
+fn boot_with(network: FakeNetwork, inputs: Inputs, prepare: impl FnOnce(&mut FakeApi)) -> Booted {
+    boot_layered(network, inputs, prepare, |_| {})
+}
+
+/// The same, with the image filesystem changed by `layer` from one that has mounted the
+/// engine's layer.
+fn boot_layered(
     mut network: FakeNetwork,
     inputs: Inputs,
     prepare: impl FnOnce(&mut FakeApi),
+    layer: impl FnOnce(&mut FakeLayer),
 ) -> Booted {
     let mut clock = network.clock.clone();
     let events = Events::default();
     let mut api = FakeApi::new(&clock, &events);
     prepare(&mut api);
     let api = Rc::new(RefCell::new(api));
+    let mut fs = FakeLayer::new(&clock, &events);
+    layer(&mut fs);
     let console = events.clone();
     let mut wall = FakeWall::default();
     let result = run(
@@ -166,6 +177,7 @@ fn boot_with(
         &mut clock,
         &mut wall,
         &mut FakeControl(api.clone()),
+        &mut fs,
         &mut |line: &str| console.borrow_mut().push(line.to_string()),
         inputs,
     );
@@ -178,6 +190,7 @@ fn boot_with(
         result,
         events,
         api,
+        layer: fs,
         clock,
         requests: network.requests,
         wall,
@@ -240,16 +253,20 @@ fn a_node_on_openstack_hands_over_and_says_it_is_ready() {
             boot_ms: Some(46),
         }
     );
-    // The cloud's line, then the hand-over, then, once api has answered, the ready line: three
-    // requests of 2 ms and api's 40 ms after the core's clock began.
+    // The cloud's line, then the hand-over, then, once api has answered and imagefs has
+    // mounted the engine's layer, the ready line: three requests of 2 ms and api's 40 ms after
+    // the core's clock began.
     assert_eq!(
         booted.events,
         [
             format!("moruna: cloud openstack instance {RECORDED_OPENSTACK_ID}"),
             "the hand-over".to_string(),
+            MOUNTED.to_string(),
             "moruna: ready api=10.0.2.15:443 boot_ms=46".to_string(),
         ]
     );
+    // imagefs was asked with instance data's limit: 90 s from platform's start (1B).
+    assert_eq!(booted.layer.deadlines, [90 * SECOND]);
     // The node's wall clock was set once, before the hand-over: to that Date as of when its
     // answer arrived, 2 ms before (system design 3D).
     assert_eq!(
@@ -281,7 +298,7 @@ const IMDS: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
 const AZURE_INSTANCE: &str = "/metadata/instance?api-version=2021-02-01";
 
 #[test]
-fn a_node_on_azure_reports_ready_once_its_config_is_valid() {
+fn a_node_on_azure_reports_ready_once_api_answers_and_the_engine_s_layer_is_mounted() {
     let clock = FakeClock::default();
     let latency = clock.clone();
     let network = FakeNetwork::serving(&clock, move |_, sent| {
@@ -300,13 +317,18 @@ fn a_node_on_azure_reports_ready_once_its_config_is_valid() {
         ]
     );
     assert_eq!(booted.requests[2].1.body, recorded_health().as_bytes());
-    // The report came before the hand-over: api's 10 s count from after its 4 ms.
-    assert_eq!(booted.api.deadlines, [6 * MS + 10 * SECOND; 2]);
+    // The report comes after api's answer and imagefs's (1B, amended for item 1.6e): api's 10 s
+    // count from instance data's 2 ms, and the WireServer is asked once both have answered,
+    // 40 ms later.
+    assert_eq!(booted.api.deadlines, [2 * MS + 10 * SECOND; 2]);
+    assert_eq!(booted.layer.mounted_at, Some(42 * MS));
+    assert_eq!(booted.requests[1].0, 42 * MS);
     assert_eq!(
         booted.events,
         [
             format!("moruna: cloud azure instance {RECORDED_AZURE_ID}"),
             "the hand-over".to_string(),
+            MOUNTED.to_string(),
             "moruna: ready api=10.0.2.15:443 boot_ms=46".to_string(),
         ]
     );
@@ -346,14 +368,18 @@ fn a_ready_report_azure_does_not_take_is_fatal_after_2_minutes() {
         "moruna: fatal platform: Azure did not take the ready report within 120 s: GET \
          /machine?comp=goalstate: answered 503"
     );
-    // The cloud was named; api was never handed its config, and the node never said it was
-    // ready.
+    // The cloud was named, api answered and imagefs mounted the engine's layer, and the report
+    // was tried for 2 minutes from then (api's 40 ms); the node never said it was ready.
     assert_eq!(
         booted.events,
-        [format!("moruna: cloud azure instance {RECORDED_AZURE_ID}")]
+        [
+            format!("moruna: cloud azure instance {RECORDED_AZURE_ID}"),
+            "the hand-over".to_string(),
+            MOUNTED.to_string(),
+        ]
     );
-    assert!(booted.api.sent.is_empty());
-    assert_eq!(booted.clock.now(), 120 * SECOND);
+    assert_eq!(booted.api.sent.len(), 1);
+    assert_eq!(booted.clock.now(), 40 * MS + 120 * SECOND);
     assert_eq!(booted.requests.len(), 1 + 24);
 }
 
@@ -373,6 +399,7 @@ fn a_node_on_azure_hands_over_and_says_it_is_ready() {
         [
             format!("moruna: cloud azure instance {RECORDED_AZURE_ID}"),
             "the hand-over".to_string(),
+            MOUNTED.to_string(),
             "moruna: ready api=10.0.2.15:443 boot_ms=40".to_string(),
         ]
     );
@@ -673,9 +700,9 @@ fn an_api_that_does_not_answer_ready_is_fatal() {
     assert_eq!(READY_LIMIT_NS, 10 * SECOND);
     // And one that answers within them is ready.
     let booted = boot_with(network(), INPUTS, |api| api.takes = 10 * SECOND - 1);
-    assert_eq!(booted.events.len(), 3);
+    assert_eq!(booted.events.len(), 4);
     assert_eq!(
-        booted.events[2],
+        booted.events[3],
         format!("moruna: ready api=10.0.2.15:443 boot_ms={}", 10_000 - 1)
     );
     assert!(booted.result.is_ok());
@@ -696,6 +723,129 @@ fn a_node_whose_address_is_not_known_does_not_say_it_is_ready() {
     // The address is asked before the hand-over, so api was never handed it.
     assert_eq!(booted.events.len(), 1);
     assert!(booted.api.sent.is_empty());
+}
+
+/// The OpenStack boot of 1.6d's diagnosis image (`register-late`): imagefs mounts the engine's
+/// layer 10 s after it is asked, once virtio-blk has registered `system`.
+fn late(layer: &mut FakeLayer) {
+    layer.takes = 10 * SECOND;
+}
+
+#[test]
+fn ready_waits_until_imagefs_has_mounted_the_engine_s_layer() {
+    // Found by 1.6d's booted check: `ready` came 10 s before imagefs's `up` line. The node is
+    // ready only once api answers and imagefs has mounted the engine's layer (1B), and boot_ms
+    // counts the wait.
+    let network = FakeNetwork::serving(&FakeClock::default(), |_, sent| openstack(sent));
+    let booted = boot_layered(network, INPUTS, |_| {}, late);
+    assert_eq!(
+        booted.events,
+        [
+            format!("moruna: cloud openstack instance {RECORDED_OPENSTACK_ID}"),
+            "the hand-over".to_string(),
+            MOUNTED.to_string(),
+            "moruna: ready api=10.0.2.15:443 boot_ms=10040".to_string(),
+        ]
+    );
+    assert_eq!(booted.result.unwrap().boot_ms, Some(10_040));
+    assert_eq!(booted.layer.mounted_at, Some(10 * SECOND + 40 * MS));
+    // Its limit is instance data's, from platform's start, not from when it is asked.
+    let network = FakeNetwork::serving(&FakeClock::default(), |_, sent| openstack(sent));
+    let inputs = Inputs {
+        started_ns: 3 * SECOND,
+        ..INPUTS
+    };
+    let booted = boot_layered(network, inputs, |_| {}, late);
+    assert!(booted.result.is_ok());
+    assert_eq!(booted.layer.deadlines, [93 * SECOND]);
+}
+
+#[test]
+fn on_azure_the_ready_report_waits_until_imagefs_has_mounted_the_engine_s_layer() {
+    let clock = FakeClock::default();
+    let latency = clock.clone();
+    let network = FakeNetwork::serving(&clock, move |_, sent| {
+        latency.advance(2 * MS);
+        azure(sent)
+    });
+    let booted = boot_layered(network, INPUTS, |_| {}, late);
+    assert!(booted.result.is_ok());
+    // Without the report Azure reboots the machine; with it, Azure takes the node as ready, so
+    // it is sent only once the node is: after imagefs's 10 s.
+    let mounted = booted.layer.mounted_at.expect("imagefs was asked");
+    assert_eq!(mounted, 10 * SECOND + 42 * MS);
+    assert_eq!(
+        asked(&booted),
+        [
+            (IMDS, "GET", AZURE_INSTANCE),
+            (wireserver::ADDRESS, "GET", "/machine?comp=goalstate"),
+            (wireserver::ADDRESS, "POST", "/machine?comp=health"),
+        ]
+    );
+    assert!(booted.requests[1..].iter().all(|(at, _)| *at >= mounted));
+    assert_eq!(
+        booted.events.last().map(String::as_str),
+        Some("moruna: ready api=10.0.2.15:443 boot_ms=10046")
+    );
+}
+
+#[test]
+fn an_engine_s_layer_not_mounted_is_fatal_and_names_imagefs() {
+    // Whether platform's line or the supervisor's (`moruna: fatal imagefs: ended with code 1`)
+    // comes first, the first fatal line names imagefs (PM, item 1.6e). Neither ready nor
+    // Azure's report comes.
+    let cases = [
+        (
+            LinkError::TimedOut,
+            "moruna: fatal imagefs: did not mount the engine's layer within 90 s",
+        ),
+        (
+            LinkError::Closed,
+            "moruna: fatal imagefs: ended before it mounted the engine's layer",
+        ),
+        (
+            LinkError::Other("the kernel refused: bad handle".to_string()),
+            "moruna: fatal imagefs: did not say it mounted the engine's layer: the kernel \
+             refused: bad handle",
+        ),
+    ];
+    for (error, line) in cases {
+        for on_azure in [false, true] {
+            let network = FakeNetwork::serving(&FakeClock::default(), move |_, sent| {
+                if on_azure {
+                    azure(sent)
+                } else {
+                    openstack(sent)
+                }
+            });
+            let answer = error.clone();
+            let booted = boot_layered(
+                network,
+                INPUTS,
+                |_| {},
+                |layer| {
+                    layer.answer = Err(answer);
+                },
+            );
+            assert_eq!(booted.line(), line);
+            assert_eq!(booted.result.as_ref().unwrap_err().stage, Stage::Imagefs);
+            // api was handed its config and answered; the node never said it was ready.
+            assert_eq!(booted.events.len(), 2, "{:?}", booted.events);
+            assert_eq!(booted.events[1], "the hand-over");
+            assert!(
+                booted
+                    .requests
+                    .iter()
+                    .all(|(_, sent)| sent.to.0 != wireserver::ADDRESS),
+                "no ready report"
+            );
+            assert_eq!(booted.layer.deadlines, [90 * SECOND]);
+            if error == LinkError::TimedOut {
+                // At instance data's limit, from platform's start.
+                assert_eq!(booted.clock.now(), 90 * SECOND);
+            }
+        }
+    }
 }
 
 #[test]
@@ -727,6 +877,10 @@ fn the_lines_are_the_design_s() {
     assert_eq!(
         Fatal::new(Stage::Platform, "a reason").to_string(),
         "moruna: fatal platform: a reason"
+    );
+    assert_eq!(
+        Fatal::new(Stage::Imagefs, "a reason").to_string(),
+        "moruna: fatal imagefs: a reason"
     );
     // A reason is one printable line that fits the console's buffer, whatever it quotes.
     let quoted = format!("line\nbreak, caf\u{e9}, bell\u{7}, {}", "x".repeat(600));

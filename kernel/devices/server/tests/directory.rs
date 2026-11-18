@@ -747,3 +747,69 @@ fn blocks_lists_every_registered_disk_through_a_directory_listener_only() {
     );
     assert_eq!((directory::ID.major, directory::ID.minor), (1, 3));
 }
+
+#[test]
+fn blocks_asked_before_a_held_slots_driver_has_finished_waits_and_lists_what_it_registered() {
+    // A job's check or launch right after `ready` asks the disk list while a volume's
+    // driver is still registering (item 1.6e): the list waits for it as a lookup does, and
+    // is answered once every held slot's driver has finished, with what it registered.
+    let mut world = World::new();
+    let boot = world.hand_out();
+    let volume = world.hand_out();
+    let early = world.connection(Access::Lookup);
+    let (system, _system_driver) = Channel::create().unwrap();
+    let (vol, _vol_driver) = Channel::create().unwrap();
+    let (waited, still, registering, listed) = world.serve(thread::spawn(move || {
+        let listed = thread::spawn(move || client(early).blocks());
+        thread::sleep(Duration::from_millis(100));
+        let waited = !listed.is_finished();
+        // The boot disk's driver registers `system` and finishes; the volume's is slower.
+        let mut r = client(moruna_svc::connect(&boot).unwrap());
+        r.register(disk("system"), system).unwrap();
+        drop((r, boot));
+        thread::sleep(Duration::from_millis(100));
+        let still = !listed.is_finished();
+        // The volume's driver connects and registers its disk, and has not finished yet.
+        let mut r = client(moruna_svc::connect(&volume).unwrap());
+        drop(volume);
+        r.register(disk("vol-a"), vol).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let registering = !listed.is_finished();
+        drop(r);
+        (waited, still, registering, listed.join().unwrap())
+    }));
+    assert!(waited, "neither driver has finished");
+    assert!(still, "the volume's driver has not finished");
+    assert!(registering, "the volume's driver is still registering");
+    let serials: Vec<_> = listed
+        .expect("the list is answered once both have finished")
+        .into_iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(serials, ["system", "vol-a"]);
+    let registry = world.registry.borrow();
+    assert!(!registry.awaited());
+    assert_eq!(registry.waiting(), 0);
+}
+
+#[test]
+fn blocks_asked_while_a_driver_holds_its_slot_is_answered_when_it_lets_the_slot_go() {
+    // virtio-blk with nothing to register lets its slot go: the list waits until then, and
+    // is answered with what the others registered. With no slot held it answers at once.
+    let mut world = World::new();
+    let nothing = world.hand_out();
+    let lookup = world.connection(Access::Lookup);
+    let later = world.connection(Access::Lookup);
+    let (waited, listed, again) = world.serve(thread::spawn(move || {
+        let listed = thread::spawn(move || client(lookup).blocks());
+        thread::sleep(Duration::from_millis(100));
+        let waited = !listed.is_finished();
+        drop(nothing);
+        let listed = listed.join().unwrap();
+        (waited, listed, client(later).blocks())
+    }));
+    assert!(waited, "the slot is held");
+    assert_eq!(listed, Ok(Vec::new()));
+    assert_eq!(again, Ok(Vec::new()), "nothing is held: answered at once");
+    assert_eq!(world.registry.borrow().waiting(), 0);
+}

@@ -13,8 +13,8 @@ use std::{
 use moruna_node_config::Cloud;
 
 use super::{
-    FakeClock, FakeNetwork, FakeWall, RECORDED_OPENSTACK_TIME, Reply, SECOND, Sent, answer, azure,
-    openstack,
+    FakeClock, FakeLayer, FakeNetwork, FakeWall, RECORDED_OPENSTACK_TIME, Reply, SECOND, Sent,
+    answer, azure, openstack,
 };
 use crate::{
     boot::{Inputs, REFRESHED, RETIME_LIMIT_NS, RETIME_NS, Refresh, retime, run, serve},
@@ -100,6 +100,7 @@ fn the_clock_reads_the_date_as_of_when_its_answer_arrived() {
         &mut clock.clone(),
         &mut wall,
         &mut one_start(&clock),
+        &mut FakeLayer::new(&clock, &Default::default()),
         &mut |line: &str| lines.push(line.to_string()),
         INPUTS,
     )
@@ -125,6 +126,7 @@ fn a_time_the_core_refuses_is_fatal_before_the_cloud_line() {
         &mut clock.clone(),
         &mut wall,
         &mut one_start(&clock),
+        &mut FakeLayer::new(&clock, &Default::default()),
         &mut |line: &str| lines.push(line.to_string()),
         INPUTS,
     )

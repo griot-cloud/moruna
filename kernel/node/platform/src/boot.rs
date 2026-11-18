@@ -1,6 +1,7 @@
 //! `platform`'s boot, in the order of the system design's section 1D: find the cloud, set the
-//! wall clock, validate node config, report ready to Azure on Azure (section 1F), hand `api` its
-//! config, and print the `cloud` and `ready` lines. Every way it cannot go on is one [`Fatal`],
+//! wall clock, validate node config, hand `api` its config, hear that `imagefs` has mounted the
+//! engine's layer, report ready to Azure on Azure (section 1F), and print the `cloud` and `ready`
+//! lines: `ready` means the node can run a job (1B). Every way it cannot go on is one [`Fatal`],
 //! which prints as section 1B's `moruna: fatal <stage>: <reason>` line.
 
 use alloc::{
@@ -16,7 +17,7 @@ use moruna_node_config::{Cloud, Handover, NodeConfig, READY, cloud_name};
 
 use crate::{
     date, instance,
-    machine::{Clock, Control, Link, LinkError, Network, WallClock},
+    machine::{Clock, Control, EngineLayer, Link, LinkError, Network, WallClock},
     wireserver,
 };
 
@@ -36,6 +37,10 @@ pub enum Stage {
     Config,
     /// Handing `api` its config and hearing that it is ready: `platform`'s own stage.
     Platform,
+    /// Hearing that `imagefs` has mounted the engine's layer. The stage names the service that
+    /// failed, so that the first fatal line names it whether `platform`'s or the supervisor's
+    /// comes first (PM, item 1.6e).
+    Imagefs,
 }
 
 impl Stage {
@@ -45,6 +50,7 @@ impl Stage {
             Stage::InstanceData => "instance-data",
             Stage::Config => "config",
             Stage::Platform => "platform",
+            Stage::Imagefs => "imagefs",
         }
     }
 }
@@ -126,13 +132,15 @@ fn set_wall_clock<C: Clock, W: WallClock>(
 }
 
 /// Boots: returns the hand-over `api` took, with the node's `boot_ms` from the ready line for
-/// `api`'s later starts, having set the wall clock through `wall` and printed the `cloud` and
-/// `ready` lines through `console`, or the reason the node must stop.
-pub fn run<N: Network, C: Clock, W: WallClock, K: Control>(
+/// `api`'s later starts, having set the wall clock through `wall`, heard from `layer` that
+/// `imagefs` has mounted the engine's layer, and printed the `cloud` and `ready` lines through
+/// `console`, or the reason the node must stop.
+pub fn run<N: Network, C: Clock, W: WallClock, K: Control, E: EngineLayer>(
     network: &mut N,
     clock: &mut C,
     wall: &mut W,
     control: &mut K,
+    layer: &mut E,
     console: &mut dyn FnMut(&str),
     inputs: Inputs,
 ) -> Result<Handover, Fatal> {
@@ -176,12 +184,6 @@ pub fn run<N: Network, C: Clock, W: WallClock, K: Control>(
     // `api` prints once it has its config.
     console(&cloud_line(handover.cloud, &handover.instance));
 
-    // On Azure, the ready report, now that node config is valid (section 1F); without it Azure
-    // reboots the machine. Other clouds want none.
-    if handover.cloud == Cloud::Azure {
-        wireserver::report(network, clock)?;
-    }
-
     // 4. The hand-over, and `api`'s answer, within the limit. The address the ready line
     // names is asked first: the network server answers it at once, and asking it after `api`
     // has answered could find the limit all but spent.
@@ -194,7 +196,19 @@ pub fn run<N: Network, C: Clock, W: WallClock, K: Control>(
     })?;
     hand_over(control, &message, deadline)?;
 
-    // 5. Ready. The line's boot_ms is the node's, and every later start of api is handed it
+    // 5. The engine's layer, mounted by imagefs, within instance data's limit from platform's
+    // start (1B; PM, item 1.6e): a node is ready only once it can run a job, so it never says it
+    // is and then fails on its own boot (1.6d's finding). api is handed its config first, so its
+    // start goes on meanwhile.
+    mounted(layer, inputs.started_ns.saturating_add(instance::LIMIT_NS))?;
+
+    // 6. On Azure, the ready report, now that the node is ready (1B, 1F); without it Azure
+    // reboots the machine. Other clouds want none.
+    if handover.cloud == Cloud::Azure {
+        wireserver::report(network, clock)?;
+    }
+
+    // 7. Ready. The line's boot_ms is the node's, and every later start of api is handed it
     // (PM, item 2.2c).
     let boot_ms = clock.now() / 1_000_000;
     console(&ready_line(address, boot_ms));
@@ -217,6 +231,23 @@ fn hand_over<K: Control>(control: &mut K, message: &[u8], deadline: u64) -> Resu
         )
     })?;
     exchange(&mut link, message, deadline)
+}
+
+/// Hears from `layer` that imagefs has mounted the engine's layer, by `deadline`. The fatal
+/// lines name imagefs, the service that failed, so the first fatal line names it whether this
+/// one or the supervisor's for imagefs's end comes first (PM, item 1.6e).
+fn mounted<E: EngineLayer>(layer: &mut E, deadline: u64) -> Result<(), Fatal> {
+    let fatal = |reason: String| Fatal::new(Stage::Imagefs, reason);
+    layer.mounted(deadline).map_err(|error| match error {
+        LinkError::TimedOut => {
+            let seconds = instance::LIMIT_NS / instance::SECOND;
+            fatal(format!(
+                "did not mount the engine's layer within {seconds} s"
+            ))
+        }
+        LinkError::Closed => fatal("ended before it mounted the engine's layer".into()),
+        LinkError::Other(why) => fatal(format!("did not say it mounted the engine's layer: {why}")),
+    })
 }
 
 /// A failure of the supervisor's channel, in words: its closing is the supervisor's, not `api`'s.

@@ -341,7 +341,8 @@ if it does, this section changes first.
 ### `platform` on Azure
 
 - Instance data as 1D says.
-- **The "ready" report,** once node config is valid: `GET http://168.63.129.16/machine?comp=goalstate`,
+- **The "ready" report,** once the node is ready (1B: `api` answers and `imagefs` has mounted the
+  engine's layer), before the `ready` line: `GET http://168.63.129.16/machine?comp=goalstate`,
   then `POST /machine?comp=health` with the `Health` XML document, both with the header
   `x-ms-version: 2012-11-30`. The POST also sends `Content-Type: text/xml;charset=utf-8` and
   `x-ms-agent-name: moruna`. Without the report, Azure reboots the machine.

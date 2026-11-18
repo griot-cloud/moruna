@@ -1043,6 +1043,7 @@ dependencies = [
 name = "moruna-node-platform"
 version = "0.1.0"
 dependencies = [
+ "imagefs-protocol",
  "moruna-netstack",
  "moruna-node",
  "moruna-node-config",
