@@ -35,7 +35,7 @@ struct State {
     end: usize,
 }
 
-struct Heap {
+pub(crate) struct Heap {
     locked: AtomicBool,
     state: UnsafeCell<State>,
 }
@@ -44,8 +44,10 @@ struct Heap {
 // release (`Heap::with`), so one thread at a time touches it.
 unsafe impl Sync for Heap {}
 
-#[global_allocator]
-static HEAP: Heap = Heap {
+/// The process's heap: the global allocator of a program without std. Under std (feature `rt`,
+/// item 5.0) std's `System` is the global allocator, and allocates here (`rt::memory`).
+#[cfg_attr(not(feature = "rt"), global_allocator)]
+pub(crate) static HEAP: Heap = Heap {
     locked: AtomicBool::new(false),
     state: UnsafeCell::new(State {
         free: [0; CLASSES.len()],

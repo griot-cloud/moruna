@@ -70,6 +70,38 @@ fn main() -> ExitCode {
 Use the arrow-rs version above (59.3.0, the engine's): `RecordBatch` is arrow-rs's own type, and
 another version is another type.
 
+## A function with an end
+
+A function that writes something once the input has ended, an aggregate say, is a type that
+implements `moruna_function::Function`: `batch` answers each batch as `serve`'s closure does, and
+`end` is called once more after the last batch, with an `Emit` of its own. Its state is its own
+fields, which both reach. `main` serves it:
+
+```rust
+#[derive(Default)]
+struct Rows(i64);
+
+impl Function for Rows {
+    fn batch(&mut self, batch: RecordBatch, _out: &mut Emit) -> Result<(), FunctionError> {
+        self.0 += batch.num_rows() as i64;
+        Ok(())
+    }
+
+    fn end(&mut self, out: &mut Emit) -> Result<(), FunctionError> {
+        let rows: ArrayRef = Arc::new(Int64Array::from(vec![self.0]));
+        out.batch(&RecordBatch::try_from_iter([("rows", rows)])?)
+    }
+}
+
+fn main() -> ExitCode {
+    Rows::default().serve()
+}
+```
+
+What `end` writes answers no input batch. `end` is called after every batch was answered and
+released and the engine posts no more, with no input too; an error from it ends the task as one
+from `batch` does. Unless a function implements it, `end` writes nothing.
+
 ## What `serve` promises, and what it asks
 
 - **A batch is the function's only during its call.** Its buffers are the engine's memory, which
@@ -113,7 +145,9 @@ fn doubles() {
 }
 ```
 
-`examples/double/src/main.rs` has the whole test. `cargo test` runs it.
+`examples/double/src/main.rs` has the whole test. `cargo test` runs it. `outcome.answers` holds
+each input's answer and whether it was released; what a `Function`'s `end` wrote is
+`outcome.unheld`, and `outcome.batches()` lists it after the answers.
 
 ## Build it
 

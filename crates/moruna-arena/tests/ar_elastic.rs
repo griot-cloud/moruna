@@ -234,3 +234,79 @@ fn grown_regions_keep_the_one_host_tier() {
     }
     let _ = Arc::strong_count(&pinned);
 }
+
+/// `tier_of` answers with no lock (02 f.7) while the region list changes under it: readers ask
+/// about a buffer of the first region, about a buffer in a region that comes and goes, and about
+/// memory the arena never had, while a writer grows the arena by a region, allocates in it,
+/// lets the readers ask about that buffer, takes it back and shrinks the region away, over and
+/// over. A region present throughout is always found, memory outside never is, and a buffer is
+/// found for as long as it lives.
+#[test]
+fn tier_of_answers_while_regions_come_and_go() {
+    use std::sync::RwLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _gate = gate();
+    let arena = common::host_arena(2 * MIB);
+    let base = arena
+        .alloc((2 * MIB) as usize, Tier::Host)
+        .expect("the first region, full");
+    let first = base.host_ptr().expect("host") as usize;
+    let outside = Box::new([0u8; 64]);
+    let never = outside.as_ptr() as usize;
+    // The live buffer of the grown region, 0 for none. The test's own lock keeps the buffer
+    // alive while a reader asks about it; the arena's lookup takes none.
+    let current = Arc::new(RwLock::new(0usize));
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (arena, current, stop) = (Arc::clone(&arena), Arc::clone(&current), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let mut rounds = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                arena.grow(2 * MIB).expect("grow");
+                let buffer = arena
+                    .alloc(MIB as usize, Tier::Host)
+                    .expect("the grown region");
+                *current.write().expect("the test's lock") =
+                    buffer.host_ptr().expect("host") as usize;
+                std::thread::yield_now();
+                *current.write().expect("the test's lock") = 0;
+                drop(buffer);
+                assert_eq!(arena.shrink(2 * MIB), 2 * MIB, "the empty region goes");
+                rounds += 1;
+            }
+            rounds
+        })
+    };
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let (arena, current) = (Arc::clone(&arena), Arc::clone(&current));
+            std::thread::spawn(move || {
+                let mut seen = 0u64;
+                for i in 0..100_000usize {
+                    let p = (first + (i * 64) % (2 * MIB as usize)) as *const u8;
+                    assert_eq!(arena.tier_of(p), Some(Tier::Host), "the first region");
+                    assert_eq!(arena.tier_of(never as *const u8), None, "never the arena's");
+                    let grown = current.read().expect("the test's lock");
+                    if *grown != 0 {
+                        assert_eq!(arena.tier_of(*grown as *const u8), Some(Tier::Host));
+                        seen += 1;
+                    }
+                }
+                seen
+            })
+        })
+        .collect();
+    let seen: u64 = readers
+        .into_iter()
+        .map(|r| r.join().expect("a reader"))
+        .sum();
+    stop.store(true, Ordering::Relaxed);
+    let rounds = writer.join().expect("the writer");
+    assert!(rounds > 0, "the region list changed");
+    assert!(
+        seen > 0,
+        "a grown region's buffer was asked about while it lived"
+    );
+    assert_eq!(arena.arena_stats().host_regions, 1);
+    drop(base);
+}

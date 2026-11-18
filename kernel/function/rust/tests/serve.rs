@@ -12,7 +12,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field};
 use moruna_function::host::{HostError, Input, Plane, record};
-use moruna_function::{Emit, FunctionError, code, log, serve};
+use moruna_function::{Emit, Function, FunctionError, code, log, serve};
 
 fn ints(from: i64, n: i64) -> RecordBatch {
     let a: ArrayRef = Arc::new(Int64Array::from_iter_values(from..from + n));
@@ -359,4 +359,78 @@ fn a_dictionary_output_is_refused_by_name() {
         "{:?}",
         outcome.log
     );
+}
+
+/// The sum of column "a" over every batch, written once at the end, and the batches passed
+/// through as they come.
+#[derive(Default)]
+struct Sum(i64);
+
+impl Function for Sum {
+    fn batch(&mut self, b: RecordBatch, out: &mut Emit) -> Result<(), FunctionError> {
+        let a = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        self.0 += a.values().iter().sum::<i64>();
+        out.batch(&b)
+    }
+
+    fn end(&mut self, out: &mut Emit) -> Result<(), FunctionError> {
+        if self.0 < 0 {
+            return Err(FunctionError::new("a negative sum"));
+        }
+        out.batch(&ints(self.0, 1))
+    }
+}
+
+fn answers_of(outcome: &moruna_function::host::Outcome) -> Vec<Vec<RecordBatch>> {
+    outcome.answers.iter().map(|a| a.batches.clone()).collect()
+}
+
+#[test]
+fn a_function_with_an_end_writes_once_the_input_has_ended() {
+    let outcome = Plane::new()
+        .named("sum")
+        .run([ints(0, 3), ints(3, 4)], || Sum::default().serve())
+        .unwrap();
+    assert_eq!(outcome.said, Some(code::DONE));
+    assert_eq!(answers_of(&outcome), [vec![ints(0, 3)], vec![ints(3, 4)]]);
+    assert!(outcome.answers.iter().all(|a| a.released));
+    assert_eq!(outcome.unheld.batches, [ints(21, 1)]);
+    assert_eq!(
+        outcome.batches(),
+        [ints(0, 3), ints(3, 4), ints(21, 1)],
+        "the answers, then what answers none"
+    );
+    assert_eq!(outcome.log, ["sum: answered 2 batches"]);
+    // No input: the end alone.
+    let none: [RecordBatch; 0] = [];
+    let outcome = Plane::new().run(none, || Sum::default().serve()).unwrap();
+    assert_eq!(outcome.said, Some(code::DONE));
+    assert_eq!(outcome.batches(), [ints(0, 1)]);
+}
+
+#[test]
+fn an_end_that_fails_ends_the_task() {
+    let outcome = Plane::new()
+        .named("sum")
+        .run([ints(-5, 2)], || Sum::default().serve())
+        .unwrap();
+    assert_eq!(outcome.said, Some(code::REFUSED));
+    assert_eq!(outcome.returned, ExitCode::from(7));
+    assert!(outcome.answers[0].released, "answered before the end");
+    assert!(outcome.unheld.records.is_empty());
+    assert_eq!(outcome.log, ["sum: a negative sum"]);
+    let outcome = Plane::new()
+        .windows(1, 4096)
+        .run([ints(0, 0)], || Sum::default().serve())
+        .unwrap();
+    assert_eq!(outcome.said, Some(code::WINDOW_SMALL));
+    // A function served twice in one task finds no plane the second time.
+    let outcome = Plane::new()
+        .run([ints(0, 1)], || {
+            let first = Sum::default().serve();
+            assert_eq!(Sum::default().serve(), ExitCode::from(2));
+            first
+        })
+        .unwrap();
+    assert_eq!(outcome.said, Some(code::DONE));
 }

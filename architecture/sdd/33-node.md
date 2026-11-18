@@ -37,8 +37,11 @@ link devices directory.net net directory
 
 `service NAME IMAGE_SLOT ACCOUNT_BYTES` declares launch order and a child account.
 `grant SERVICE CHILD_SLOT BOOT_SLOT` moves one boot capability exactly once.
-`link SERVICE SLOT SERVICE SLOT` makes a fresh channel pair and moves each end
-once. Every service receives its own account handle and a write-only console.
+`link SERVER SLOT CLIENT SLOT` makes a fresh channel pair and moves each end
+once: the left service serves on its end and the right one is its client. A service
+that is not on a machine takes its clients with it (system design 1F: off Hyper-V,
+`vmbus` and its clients, such as `storvsc`, are not started); a server is never left
+out for losing a client. Every service receives its own account handle and a write-only console.
 No service implicitly receives the process root or another service's account.
 Trusted roots/time for KE2 TLS are explicit boot capabilities; no wall clock,
 certificate bypass, or generated production trust anchor is synthesized here.

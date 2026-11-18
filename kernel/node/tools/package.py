@@ -6,6 +6,12 @@ starts, with its engine, layers and launcher descriptor; or `cloud` (system desi
 one disk image for every cloud, which holds only what kernel/node/cloud.image lists and takes
 no agent port, CPU count, layers, writable homes, user network or guest CID.
 
+`cloud-test` is the cloud profile built for tests only, and never the release image (work item
+2.2c): the same description, assets and programs, with `api` built with its feature `test-exit`,
+so that it exits on a request to `/v1/test/exit` and says at each start that it is this build.
+That is the tests' one way to kill `api` from outside the node's design. `cloud` never builds
+it.
+
 `--formats` names the disk's formats (system design 1A, work item 1.5): `raw`, the disk every
 build writes, `qcow2` for OpenStack and `vhd` for Azure, each made from that one raw disk and
 written beside it.
@@ -22,14 +28,20 @@ from pathlib import Path
 import shutil
 import subprocess
 
-PROFILES = ("standalone", "cloud")
+PROFILES = ("standalone", "cloud", "cloud-test")
+# The profiles of the one cloud disk image: they take the same arguments and are checked alike.
+CLOUD_PROFILES = ("cloud", "cloud-test")
 # The user programs each profile's image starts; `--package` adds to them.
 PROGRAMS = {
     "standalone": ["moruna-node-supervisor", "node-admission", "moruna-storage-service", "devices", "imagefs", "linux", "netstack", "engine",
                    "virtio-blk", "virtio-vsock", "virtio-net", "nvme", "gve"],
     "cloud": ["moruna-node-supervisor", "devices", "netstack", "moruna-node-api", "moruna-node-platform",
-              "virtio-blk", "virtio-net", "nvme", "gve", "moruna-vmbus-server"],
+              "virtio-blk", "virtio-net", "nvme", "gve", "moruna-vmbus-server", "moruna-storvsc-server"],
 }
+# For tests only, never the release image: the cloud's programs, `api` with its test route.
+PROGRAMS["cloud-test"] = PROGRAMS["cloud"]
+# The features each profile's user build turns on, beyond each program's defaults.
+FEATURES = {"standalone": [], "cloud": [], "cloud-test": ["moruna-node-api/test-exit"]}
 # The flags only a launcher's node takes, refused for a cloud image.
 LAUNCHER_FLAGS = (("agent_port", "--agent-port"), ("cpus", "--cpus"), ("layer", "--layer"),
                   ("writable_home", "--writable-home"), ("user_network", "--user-network"), ("cid", "--cid"))
@@ -122,10 +134,10 @@ def arguments(argv=None):
     parser.add_argument("--formats", nargs="+", choices=FORMATS, default=["raw"], metavar="FORMAT",
                         help="the disk's formats, each written beside the raw disk: raw (the default), qcow2, vhd")
     args = parser.parse_args(argv)
-    if args.profile == "cloud":
+    if args.profile in CLOUD_PROFILES:
         given = [flag for name, flag in LAUNCHER_FLAGS if getattr(args, name) not in (None, False, [])]
         if given:
-            parser.error(f"the cloud profile takes no {', '.join(given)}")
+            parser.error(f"the {args.profile} profile takes no {', '.join(given)}")
         return parser, args
     missing = [flag for name, flag in (("agent_port", "--agent-port"), ("cpus", "--cpus")) if getattr(args, name) is None]
     if missing:
@@ -139,7 +151,7 @@ def arguments(argv=None):
 
 def main():
     parser, args = arguments()
-    cloud = args.profile == "cloud"
+    cloud = args.profile in CLOUD_PROFILES
     kernel = Path(__file__).resolve().parents[2]
     description = args.description.resolve(strict=True)
     assets = args.assets.resolve(strict=True)
@@ -201,7 +213,8 @@ def main():
     package_args = [word for package in packages for word in ("-p", package)]
     user_common = ["--locked", "--offline", "--release", "--target", user_target, *std]
     # The storage service's feature names a package only the standalone node builds.
-    features = [] if "moruna-storage-service" not in packages else ["--features", "moruna-storage-service/service"]
+    named = [*FEATURES[args.profile], *(["moruna-storage-service/service"] if "moruna-storage-service" in packages else [])]
+    features = ["--features", ",".join(named)] if named else []
     # The JSON target's -Z flags follow `build`, as in kernel/tools/build.sh: this nightly
     # refuses them before the subcommand.
     command([*cargo, "build", "-Zunstable-options", "-Zjson-target-spec", *user_common, *package_args, *features], kernel, env)
@@ -273,6 +286,10 @@ def main():
     if cloud:
         # No launcher descriptor, resources contract or writable inputs: a cloud boots the disk.
         (out / "inputs-and-artifacts.json").write_text(json.dumps(evidence, indent=2) + "\n")
+        if args.profile == "cloud-test":
+            print(f"Packaged {disk} (cloud-test profile: for tests only, never a release image; "
+                  "api exits on /v1/test/exit).")
+            return
         print(f"Packaged {disk} (cloud profile); boot and hardware validation remain required.")
         return
     def artifact(path):

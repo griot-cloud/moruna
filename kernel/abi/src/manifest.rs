@@ -16,7 +16,8 @@
 //! charged to the machine's account itself (SDD 20 f.18).
 //!
 //! `SOURCE` is `console`, `root.process`, `root.device`, `root.interrupt`,
-//! `root.ecam`, `root.msi`, `root.dma`, `channel:NAME.0`, `channel:NAME.1` or
+//! `root.ecam`, `root.msi`, `root.dma`, `root.hyperv`, `root.clock`, `channel:NAME.0`,
+//! `channel:NAME.1` or
 //! `file:PATH`. A `handle` line gives a handle to
 //! the process named by the `process` line above it. The first process is the
 //! supervisor: it alone may take a `root.*` source. Every endpoint of every declared
@@ -65,6 +66,8 @@ pub enum Source {
     /// Hyper-V's mechanism, `root.hyperv` (ABI 2.7): made only on Hyper-V; on another
     /// machine the handle is left out, so the supervisor finds no such slot.
     RootHyperv,
+    /// The resource for `clock_set_realtime` (ABI 2.8): the right to set the wall clock.
+    RootClock,
     /// One endpoint (0 or 1) of the channel declared at `channel` (an index into
     /// [`Manifest::channels`]).
     ChannelEnd { channel: usize, end: u8 },
@@ -84,6 +87,7 @@ impl Source {
                 | Source::RootMsi
                 | Source::RootDma
                 | Source::RootHyperv
+                | Source::RootClock
         )
     }
 }
@@ -232,7 +236,8 @@ pub fn source_rights(source: &Source) -> Rights {
         | Source::RootEcam
         | Source::RootMsi
         | Source::RootDma
-        | Source::RootHyperv => Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
+        | Source::RootHyperv
+        | Source::RootClock => Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
         Source::ChannelEnd { .. } => {
             Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER | Rights::WAIT
         }
@@ -360,6 +365,7 @@ impl Manifest {
                         "root.msi" => Source::RootMsi,
                         "root.dma" => Source::RootDma,
                         "root.hyperv" => Source::RootHyperv,
+                        "root.clock" => Source::RootClock,
                         other => {
                             if let Some(end) = other.strip_prefix("channel:") {
                                 let (name, which) = match end.rsplit_once('.') {
@@ -465,6 +471,7 @@ impl fmt::Display for Manifest {
                     Source::RootMsi => f.write_str("root.msi")?,
                     Source::RootDma => f.write_str("root.dma")?,
                     Source::RootHyperv => f.write_str("root.hyperv")?,
+                    Source::RootClock => f.write_str("root.clock")?,
                     Source::ChannelEnd { channel, end } => {
                         let name = self.channels.get(*channel).ok_or(fmt::Error)?;
                         write!(f, "channel:{name}.{end}")?;
@@ -794,12 +801,17 @@ handle channel:pp.1 peer
 
     #[test]
     fn dr_t2_manifest_driver_roots() {
-        let text = "moruna-manifest 1\nprocess s bin/s\nhandle root.ecam e\nhandle root.msi m\nhandle root.dma d rights=write,duplicate\n";
+        let text = "moruna-manifest 1\nprocess s bin/s\nhandle root.ecam e\nhandle root.msi m\nhandle root.dma d rights=write,duplicate\nhandle root.clock c\n";
         let m = Manifest::parse(text.as_bytes()).expect("parses");
         let sources: Vec<&Source> = m.processes[0].handles.iter().map(|h| &h.source).collect();
         assert_eq!(
             sources,
-            [&Source::RootEcam, &Source::RootMsi, &Source::RootDma]
+            [
+                &Source::RootEcam,
+                &Source::RootMsi,
+                &Source::RootDma,
+                &Source::RootClock
+            ]
         );
         for source in sources {
             assert!(source.is_root());
@@ -812,8 +824,9 @@ handle channel:pp.1 peer
         assert!(out.contains("handle root.ecam e\n"));
         assert!(out.contains("handle root.msi m\n"));
         assert!(out.contains("handle root.dma d rights=write,duplicate\n"));
+        assert!(out.contains("handle root.clock c\n"));
         assert_eq!(Manifest::parse(out.as_bytes()), Ok(m));
-        for root in ["root.ecam", "root.msi", "root.dma"] {
+        for root in ["root.ecam", "root.msi", "root.dma", "root.clock"] {
             assert_eq!(
                 reason(&format!(
                     "moruna-manifest 1\nprocess a bin/a\nprocess b bin/b\nhandle {root} r\n"

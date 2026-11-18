@@ -1,6 +1,7 @@
 //! The job operations end to end, over TLS, against the tests' engine (item 3.2, phase 1): a
 //! job validated, submitted, followed over Server-Sent Events and reported; busy, cancel and
-//! the engine's refusals; `?from=`; the scopes; MCP; and a credential that appears nowhere.
+//! the engine's refusals; `?from=`, after which a stream replays; the scopes; MCP, the events'
+//! page polled to the end; and a credential that appears nowhere.
 mod common;
 
 use common::{Harness, Response, WALL, engine::RUN};
@@ -242,6 +243,44 @@ fn a_second_submit_while_a_job_runs_is_busy() {
 }
 
 #[test]
+fn a_large_report_goes_in_pieces_whole_over_http_and_mcp_then_the_connection_closes() {
+    let mut harness = Harness::new();
+    submit(&mut harness);
+    // A report of 300 KiB with characters JSON escapes: many pieces of an answer.
+    let report = format!(r#"{{"pad":"{}"}}"#, r#"q\"\n"#.repeat(60 * 1024));
+    harness.engine.finish(&report, 0, None);
+    harness.settle();
+    let observer = harness.token(&["observe"]);
+    let client = harness.connect();
+    let request = format!(
+        "GET /v1/jobs/{RUN}/report HTTP/1.1\r\nHost: node\r\n{}Connection: close\r\n\r\n",
+        Harness::bearer(&observer)
+    );
+    let response = harness.exchange(client, request.as_bytes());
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, report.as_bytes());
+    assert_eq!(response.header("connection"), Some("close"));
+    assert!(harness.clients[client].server_closed());
+    // Over MCP: the same report as the text, escaped, and as the structured content.
+    let client = harness.connect();
+    let call = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                       "params": { "name": "moruna_jobs_report", "arguments": { "id": RUN } } });
+    let response = harness.exchange(client, &Harness::post("/mcp", &observer, &call.to_string()));
+    let result = result(&response);
+    let expected: Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(result["structuredContent"], expected);
+    assert_eq!(result["content"][0]["text"], report.as_str());
+    assert_eq!(
+        response.body.len(),
+        response
+            .header("content-length")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()
+    );
+}
+
+#[test]
 fn a_long_job_is_cancelled() {
     let mut harness = Harness::new();
     let client = submit(&mut harness);
@@ -378,25 +417,38 @@ fn the_job_operations_need_their_scopes() {
 }
 
 #[test]
-fn from_replays_from_that_record_and_nothing_else_is_a_query() {
+fn from_replays_after_that_record_and_nothing_else_is_a_query() {
     let mut harness = Harness::new();
     submit(&mut harness);
     for n in 0..4 {
         harness.engine.log("source", &format!("line {n}"));
     }
     harness.settle();
-    let stream = follow(&mut harness, "?from=4");
+    // `from` is the last record the reader has, as Last-Event-ID is: the stream goes on after it.
+    let stream = follow(&mut harness, "?from=3");
     let replayed = events(&received(&mut harness, stream));
     let ids: Vec<Option<u64>> = replayed.iter().map(|event| event.0).collect();
     assert_eq!(ids, [Some(4), Some(5)]);
     assert_eq!(replayed[0].2["text"], "line 2");
-    // An ended job replays to its end.
+    // An ended job replays to its end; from 0, all of it, as with no from.
     harness.engine.finish("{}", 0, None);
     harness.settle();
     let whole = follow(&mut harness, "");
     let all = events(&received(&mut harness, whole));
     assert_eq!(all.len(), 7, "five records, the report and the exit");
     assert!(harness.clients[whole].server_closed());
+    let zero = follow(&mut harness, "?from=0");
+    assert_eq!(events(&received(&mut harness, zero)), all);
+    let last = follow(&mut harness, "?from=5");
+    let end: Vec<String> = events(&received(&mut harness, last))
+        .into_iter()
+        .map(|event| event.1)
+        .collect();
+    assert_eq!(
+        end,
+        ["report", "exit"],
+        "after the last record, only the end"
+    );
     let observer = Harness::bearer(&harness.token(&["observe"]));
     let client = harness.connect();
     for query in ["?from=", "?from=x", "?from=-1", "?to=3", "?from=1&x=2", "?"] {
@@ -592,13 +644,14 @@ fn an_mcp_client_runs_a_job_through_the_tools() {
         json!({ "id": RUN }),
     );
     assert_eq!(report["structuredContent"], json!({ "rows_out": 3 }));
-    // What a tool does not take is its operation's `invalid`; the stream of events is no tool.
+    // What a tool does not take is its operation's `invalid`.
     for (name, arguments) in [
         ("moruna_jobs_get", json!({})),
         ("moruna_jobs_get", json!({ "id": 7 })),
         ("moruna_jobs_get", json!({ "id": RUN, "from": 1 })),
         ("moruna_jobs_list", json!({ "id": RUN })),
         ("moruna_jobs_validate", json!({ "v3": {} })),
+        ("moruna_jobs_events", json!({ "from": 1 })),
     ] {
         let refused = tool(&mut harness, client, &token, name, arguments);
         assert_eq!(refused["isError"], true, "{name}");
@@ -609,8 +662,9 @@ fn an_mcp_client_runs_a_job_through_the_tools() {
                 .contains(r#""code":"invalid""#)
         );
     }
+    // A tool no operation has is JSON-RPC's invalid params.
     let call = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call",
-                       "params": { "name": "moruna_jobs_events", "arguments": { "id": RUN } } });
+                       "params": { "name": "moruna_job_events", "arguments": { "id": RUN } } });
     let response = harness.exchange(client, &Harness::post("/mcp", &token, &call.to_string()));
     assert_eq!(response.json()["error"]["code"], -32_602);
     // observe lists and reads, and does not submit: a tool error with forbidden.
@@ -651,6 +705,153 @@ fn an_mcp_client_runs_a_job_through_the_tools() {
             "jobs_report"
         ]
     );
+}
+
+/// One poll of the events' tool on client `index`, after the record `from`: the page's events
+/// and its `next`.
+fn poll(harness: &mut Harness, index: usize, token: &str, from: u64) -> (Vec<Value>, u64) {
+    let result = tool(
+        harness,
+        index,
+        token,
+        "moruna_jobs_events",
+        json!({ "id": RUN, "from": from }),
+    );
+    assert!(result.get("isError").is_none(), "{result}");
+    let page = &result["structuredContent"];
+    let text: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(&text, page, "the text and the structured content agree");
+    (
+        page["records"].as_array().unwrap().clone(),
+        page["next"].as_u64().unwrap(),
+    )
+}
+
+/// Each event's name, and its number when it has one.
+fn names(events: &[Value]) -> Vec<(String, Option<u64>)> {
+    events
+        .iter()
+        .map(|event| {
+            (
+                event["event"].as_str().unwrap().to_string(),
+                event["id"].as_u64(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn an_mcp_client_follows_a_job_to_its_report_by_polling_its_events() {
+    let mut harness = Harness::new();
+    let submitter = harness.token(&["submit"]);
+    let observer = harness.token(&["observe"]);
+    let client = harness.connect();
+    // The tool is listed, with what it takes.
+    let list = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/list" });
+    let listed = harness.exchange(client, &Harness::post("/mcp", &observer, &list.to_string()));
+    let events_tool = listed.json()["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "moruna_jobs_events")
+        .cloned()
+        .expect("the events' tool is listed");
+    assert_eq!(events_tool["inputSchema"]["required"], json!(["id"]));
+    assert!(events_tool["inputSchema"]["properties"]["from"].is_object());
+    // Submit over MCP; the engine takes the job and tells its first record.
+    let job: Value = serde_json::from_str(JOB).unwrap();
+    assert_eq!(
+        tool(&mut harness, client, &submitter, "moruna_jobs_submit", job),
+        Value::Null
+    );
+    harness.engine.attempt_started();
+    harness.settle();
+    let submitted = result(&harness.clients[client].response().unwrap());
+    assert_eq!(submitted["structuredContent"], json!({ "id": RUN }));
+    // Poll from the start: the first record, numbered 1, and where to go on.
+    let mut seen = Vec::new();
+    let (events, mut next) = poll(&mut harness, client, &observer, 0);
+    assert_eq!(names(&events), [("event".to_string(), Some(1))]);
+    assert_eq!(events[0]["data"]["kind"], "attempt_started");
+    assert_eq!(next, 1);
+    seen.extend(events);
+    // The engine works; each poll from `next` gives what came since, and nothing twice.
+    harness.clock.advance(2_000);
+    harness.engine.heartbeat(500);
+    harness.engine.log("source", "made 500 rows");
+    harness.settle();
+    let (events, after) = poll(&mut harness, client, &observer, next);
+    assert_eq!(names(&events), [("event".to_string(), Some(2))]);
+    assert_eq!(events[0]["data"]["text"], "made 500 rows");
+    (next, seen) = (after, [seen, events].concat());
+    let (events, after) = poll(&mut harness, client, &observer, next);
+    assert!(events.is_empty(), "nothing new");
+    assert_eq!(after, next);
+    for n in 0..3 {
+        harness.engine.log("sink", &format!("counted batch {n}"));
+    }
+    harness.engine.heartbeat(1000);
+    harness.engine.finish(
+        r#"{"rows_out":1000,"stages":[{"name":"count","rows":1000}]}"#,
+        0,
+        None,
+    );
+    harness.settle();
+    // Poll until the exit: the rest of the records, then the report and the exit.
+    loop {
+        let (events, after) = poll(&mut harness, client, &observer, next);
+        let done = events.iter().any(|event| event["event"] == "exit");
+        (next, seen) = (after, [seen, events].concat());
+        if done {
+            break;
+        }
+    }
+    assert_eq!(
+        names(&seen),
+        [
+            ("event".to_string(), Some(1)),
+            ("event".to_string(), Some(2)),
+            ("event".to_string(), Some(3)),
+            ("event".to_string(), Some(4)),
+            ("event".to_string(), Some(5)),
+            ("report".to_string(), None),
+            ("exit".to_string(), None),
+        ]
+    );
+    assert_eq!(next, 5);
+    assert_eq!(seen[5]["data"]["report"]["rows_out"], 1000);
+    assert_eq!(
+        seen[6]["data"],
+        json!({ "type": "exit", "code": 0, "diagnostic": null })
+    );
+    // Read the report.
+    let report = tool(
+        &mut harness,
+        client,
+        &observer,
+        "moruna_jobs_report",
+        json!({ "id": RUN }),
+    );
+    assert_eq!(
+        report["structuredContent"],
+        json!({ "rows_out": 1000, "stages": [{ "name": "count", "rows": 1000 }] })
+    );
+    assert_eq!(report["structuredContent"], seen[5]["data"]["report"]);
+    // Resume on a new connection from where an agent left off: the same events from there.
+    let again = harness.connect();
+    let (events, after) = poll(&mut harness, again, &observer, 3);
+    assert_eq!(events, seen[3..]);
+    assert_eq!(after, 5);
+    // Each poll left one record, as the events' operation.
+    let admin = Harness::bearer(&harness.token(&["admin"]));
+    let audit = harness.get(client, "/v1/node/audit", &admin).json();
+    let polls = audit["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| record["operation"] == "jobs_events")
+        .count();
+    assert_eq!(polls, 5);
 }
 
 #[test]

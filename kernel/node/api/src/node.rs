@@ -5,6 +5,8 @@
 //!   one; otherwise the node's own, made now ([`Identity::generate`], system design 2B).
 //! - **The token keys and the instance ID** (2C): node config's `token_keys`, and the
 //!   hand-over's instance, which every token's `aud` must be.
+//! - **The function keys** (3E): node config's `functions.keys`, which a function image's
+//!   signature must verify under; none when it has none.
 //! - **The node document** (2A): this crate's version, the node's cores, its memory, the
 //!   instance, the cloud, the CPU executor with a slot a core, and health `ok`. `boot_ms`
 //!   is set when the process answers `ready` ([`crate::run`]).
@@ -14,7 +16,7 @@
 use alloc::{string::String, vec, vec::Vec};
 
 use moruna_api::{Executor, ExecutorKind, NodeHealth};
-use moruna_api_server::{Clock, Config, Identity, NodeFacts, TokenKey};
+use moruna_api_server::{Clock, Config, FunctionKey, Identity, NodeFacts, TokenKey};
 use moruna_node_config::Handover;
 
 use crate::Error;
@@ -40,6 +42,13 @@ pub fn config(handover: &Handover, cores: u32, now: u64) -> Result<Config, Error
             .token_keys
             .iter()
             .map(|key| TokenKey::new(key.0))
+            .collect::<Vec<_>>(),
+        function_keys: handover
+            .config
+            .functions
+            .keys
+            .iter()
+            .map(|key| FunctionKey::new(key.0))
             .collect::<Vec<_>>(),
     })
 }

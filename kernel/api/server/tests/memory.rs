@@ -1,19 +1,25 @@
 //! The server's memory under the limits: 80 connections, each sending a full 1 MiB body with no
 //! token, then one valid `node` call; then 80 sending 1 MiB bodies with a valid token, half of
-//! each at first, so that eight hold the whole body budget at once. A counting allocator
-//! measures what the server alone holds at its peak; it must stay under 32 MiB, half of `api`'s
-//! 64 MiB account.
+//! each at first, so that eight hold the whole body budget at once; then a job's records filling
+//! the buffer, with a stalled reader, documents waiting, and a page of them polled over MCP;
+//! then a job of large records, a page of them, and its report of 900 KiB read over HTTP, over
+//! MCP and at the end of a stream. A counting allocator measures what the server alone holds at
+//! its peak; it must stay under 32 MiB, half of `api`'s 64 MiB account, and a large answer may
+//! cost at most twice its size: it is written as it is sent, never copied whole.
 //!
 //! The test is alone in its own binary, so that nothing else allocates while it measures.
 mod common;
 
 use common::{
-    Client, End, Harness, INSTANCE, Pipe, TestClock,
+    Client, End, Harness, INSTANCE, Pipe, Response, TestClock,
     engine::{Engine, RUN},
     facts, pinned,
     signer::Signer,
 };
-use moruna_api_server::{BODY_BUDGET, BODY_LIMIT, Config, Identity, OPEN_LIMIT, Server, TokenKey};
+use moruna_api::EVENTS_PAGE_BYTES;
+use moruna_api_server::{
+    BODY_BUDGET, BODY_LIMIT, Config, FunctionKey, Identity, OPEN_LIMIT, Server, TokenKey,
+};
 use rustls::{ClientConnection, pki_types::ServerName};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -157,6 +163,7 @@ fn eighty_connections_with_1_mib_bodies_and_no_token_stay_under_32_mib() {
                 identity,
                 facts: facts(),
                 token_keys: vec![TokenKey::new(signer.public())],
+                function_keys: vec![FunctionKey::new(signer.public())],
             },
             clock.clone(),
             Box::new(engine.clone()),
@@ -315,15 +322,27 @@ fn eighty_connections_with_1_mib_bodies_and_no_token_stay_under_32_mib() {
     );
     assert!(peak < 32 * 1024 * 1024, "peak {peak} bytes");
 
-    // The documents are checked, the job ends, and the reader, reading again, is sent the rest
-    // from the oldest record the buffer still holds, then the report and the exit.
+    // The documents are checked. With the buffer still full and the reader still stopped, an
+    // agent polls the events over MCP: a page of 1,000 records.
     harness.engine.0.borrow_mut().hold_checks = false;
-    harness.engine.finish(r#"{"rows_out":60000}"#, 0, None);
-    harness.clients[reader].pipe.borrow_mut().capacity = None;
-    settle(&mut harness);
+    settle_but(&mut harness, reader);
     for &client in &waiting {
         assert_eq!(harness.clients[client].response().unwrap().status, 200);
     }
+    let (response, before, peak) = measured(&mut harness, &events_call(&token, RUN), reader);
+    let page = &response.json()["result"]["structuredContent"];
+    assert_eq!(page["records"].as_array().unwrap().len(), 1_000);
+    costs(
+        "the buffer full, a reader that stopped, an MCP page of 1,000 records",
+        (before, peak),
+        page.to_string().len(),
+    );
+
+    // The job ends, and the reader, reading again, is sent the rest from the oldest record the
+    // buffer still holds, then the report and the exit.
+    harness.engine.finish(r#"{"rows_out":60000}"#, 0, None);
+    harness.clients[reader].pipe.borrow_mut().capacity = None;
+    settle(&mut harness);
     let stream = String::from_utf8(std::mem::take(&mut harness.clients[reader].received)).unwrap();
     assert!(
         stream.ends_with("\"diagnostic\":null}\n\n"),
@@ -341,6 +360,151 @@ fn eighty_connections_with_1_mib_bodies_and_no_token_stay_under_32_mib() {
         "with a gap where it fell behind"
     );
     assert!(harness.clients[reader].server_closed());
+    // The reader's connection is gone. Its pipe, written while the server ran, stands for the
+    // network server's buffer of the connection, not the server's: let it go, as the network
+    // server would.
+    harness.clients[reader].pipe = Rc::new(RefCell::new(Pipe::default()));
+
+    // A second job tells records of 12 KiB until they fill the buffer: 1,000 of them would be
+    // all of its 12 MiB. Polled over MCP, a page stops at 1 MiB, and the server stays under
+    // 32 MiB.
+    let second = "22222222222222222222222222222222";
+    harness.engine.run_as(second);
+    let submitter = connect(&mut harness);
+    harness.clients[submitter].send(&Harness::post("/v1/jobs", &submit, job));
+    settle(&mut harness);
+    harness.engine.attempt_started();
+    settle(&mut harness);
+    assert_eq!(harness.clients[submitter].response().unwrap().status, 201);
+    let large = "x".repeat(12 * 1024);
+    for _ in 0..1_100 {
+        harness.engine.log("source", &large);
+    }
+    settle(&mut harness);
+    let (response, before, peak) = measured(&mut harness, &events_call(&token, second), usize::MAX);
+    let page = &response.json()["result"]["structuredContent"];
+    let records = page["records"].as_array().unwrap();
+    let bytes: usize = records
+        .iter()
+        .map(|record| record["data"].to_string().len())
+        .sum();
+    assert!(
+        bytes <= EVENTS_PAGE_BYTES && bytes > EVENTS_PAGE_BYTES - 13 * 1024,
+        "{bytes}"
+    );
+    assert!((80..90).contains(&records.len()), "{}", records.len());
+    costs(
+        "the buffer full of records of 12 KiB, an MCP page of them",
+        (before, peak),
+        page.to_string().len(),
+    );
+
+    // The job ends with a report of 900 KiB. Read over HTTP, over MCP, and at the end of a
+    // stream of its events, it is never held whole twice.
+    let report = format!(r#"{{"pad":"{}"}}"#, "r".repeat(900 * 1024));
+    harness.engine.finish(&report, 0, None);
+    settle(&mut harness);
+    let (response, before, peak) = measured(
+        &mut harness,
+        format!(
+            "GET /v1/jobs/{second}/report HTTP/1.1\r\nHost: node\r\n{}\r\n",
+            Harness::bearer(&token)
+        )
+        .as_bytes(),
+        usize::MAX,
+    );
+    assert_eq!(response.body, report.as_bytes());
+    costs(
+        "a report of 900 KiB over HTTP",
+        (before, peak),
+        report.len(),
+    );
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"moruna_jobs_report","arguments":{{"id":"{second}"}}}}}}"#
+    );
+    let (response, before, peak) = measured(
+        &mut harness,
+        &Harness::post("/mcp", &token, &call),
+        usize::MAX,
+    );
+    assert_eq!(
+        response.json()["result"]["structuredContent"]["pad"]
+            .as_str()
+            .map(str::len),
+        Some(900 * 1024)
+    );
+    costs("a report of 900 KiB over MCP", (before, peak), report.len());
+    let last = 1 + 1_100;
+    let (stream, before, peak) = measured_stream(
+        &mut harness,
+        format!(
+            "GET /v1/jobs/{second}/events?from={last} HTTP/1.1\r\nHost: node\r\n{}\r\n",
+            Harness::bearer(&token)
+        )
+        .as_bytes(),
+    );
+    assert!(stream.contains("event: report\n") && stream.ends_with("\"diagnostic\":null}\n\n"));
+    costs(
+        "a report of 900 KiB at the end of a stream",
+        (before, peak),
+        report.len(),
+    );
+}
+
+/// What a socket's buffer holds for a client that reads as it goes: the most bytes the test's
+/// pipe takes from the server before the client reads them. A pipe that held a whole answer
+/// would count the network's buffer as the server's memory.
+const SOCKET: usize = 64 * 1024;
+
+/// The MCP call that polls the events of the run `run` from its first record.
+fn events_call(token: &str, run: &str) -> Vec<u8> {
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"moruna_jobs_events","arguments":{{"id":"{run}","from":0}}}}}}"#
+    );
+    Harness::post("/mcp", token, &call)
+}
+
+/// Sends `request` on a new connection whose pipe holds [`SOCKET`], and settles while
+/// `stalled` reads nothing: the answer, what the server held before, and its peak meanwhile.
+fn measured(harness: &mut Harness, request: &[u8], stalled: usize) -> (Response, usize, usize) {
+    let before = LIVE.load(Ordering::Relaxed);
+    PEAK.store(before, Ordering::Relaxed);
+    let client = connect(harness);
+    harness.clients[client].pipe.borrow_mut().capacity = Some(SOCKET);
+    harness.clients[client].send(request);
+    settle_but(harness, stalled);
+    let response = harness.clients[client].response().expect("an answer");
+    (response, before, PEAK.load(Ordering::Relaxed))
+}
+
+/// As [`measured`], for a stream of events: all it sent, as text, after its head.
+fn measured_stream(harness: &mut Harness, request: &[u8]) -> (String, usize, usize) {
+    let before = LIVE.load(Ordering::Relaxed);
+    PEAK.store(before, Ordering::Relaxed);
+    let client = connect(harness);
+    harness.clients[client].pipe.borrow_mut().capacity = Some(SOCKET);
+    harness.clients[client].send(request);
+    settle(harness);
+    assert!(harness.clients[client].server_closed());
+    let text = String::from_utf8(std::mem::take(&mut harness.clients[client].received)).unwrap();
+    let (_, stream) = text.split_once("\r\n\r\n").expect("a head");
+    (stream.to_string(), before, PEAK.load(Ordering::Relaxed))
+}
+
+/// Reports what the server held at its peak while it answered with `size` bytes of JSON, from
+/// what it held `before`, and checks the peak is under 32 MiB and that the answer cost at most
+/// twice its size.
+fn costs(case: &str, (before, peak): (usize, usize), size: usize) {
+    let cost = peak - before;
+    eprintln!(
+        "{case}: peak held by the server {peak} bytes ({:.2} MiB), {cost} bytes ({:.2} MiB) for \
+         the answer, {:.2} times its {size} bytes",
+        peak as f64 / (1024.0 * 1024.0),
+        cost as f64 / (1024.0 * 1024.0),
+        cost as f64 / size as f64
+    );
+    assert!(peak < 32 * 1024 * 1024, "{case}: peak {peak} bytes");
+    assert!(cost <= 2 * size, "{case}: {cost} bytes for {size}");
 }
 
 fn report(case: &str, peak: usize) {

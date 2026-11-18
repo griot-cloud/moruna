@@ -39,10 +39,13 @@ pub mod manifest;
 /// [`ResourceKind::Hyperv`]), the object [`ObjectType::HvSignal`], and the six calls of
 /// [`hyperv`], numbered `nr::HYPERV_POST` to `nr::HYPERV_SIGNAL`. It also has
 /// `handle_info` give, in `rdx`, how a process that has ended ended ([`process_end`]), so
-/// that the supervisor names an ended service's exit code (1B).
+/// that the supervisor names an ended service's exit code (1B). ABI 2.8 (item 5.0, Rust's
+/// std on Moruna) adds the node's wall clock and a yield: the clock page's `REALTIME_BASE`
+/// and `REALTIME_SOURCE`, the boot capability `root.clock` (`ResourceKind::Clock`) and its
+/// `clock_set_realtime`, and `thread_yield`, after 2.7's six calls.
 pub const ABI_MAJOR: u16 = 2;
 /// See [`ABI_MAJOR`].
-pub const ABI_MINOR: u16 = 7;
+pub const ABI_MINOR: u16 = 8;
 /// The packed version `abi_version` returns.
 pub const ABI_VERSION: u64 = ((ABI_MAJOR as u64) << 16) | ABI_MINOR as u64;
 
@@ -243,8 +246,18 @@ pub mod nr {
     /// `hyperv_signal(signal) -> status`: `HvSignalEvent` on the signal's connection ID,
     /// event flag 0; answers Hyper-V's status. Needs `WRITE` on the signal.
     pub const HYPERV_SIGNAL: u64 = BASE + 70;
+    /// ABI 2.8 (item 5.0): `clock_set_realtime(clock, utc_ns)`: the wall clock reads
+    /// `utc_ns` now. Takes a `ResourceKind::Clock` resource with `WRITE` (`root.clock`, which
+    /// the supervisor gives `platform` alone). The core keeps the realtime base, `utc_ns`
+    /// less the monotonic clock now, and publishes it on the clock page
+    /// (`clock_page::REALTIME_BASE`). `InvalidArgs` for a time at or before the monotonic
+    /// clock's own start.
+    pub const CLOCK_SET_REALTIME: u64 = BASE + 71;
+    /// ABI 2.8 (item 5.0): `thread_yield()`: the calling thread gives its CPU to another
+    /// ready thread, if there is one, and runs again after it.
+    pub const THREAD_YIELD: u64 = BASE + 72;
     /// One past the highest call of the table.
-    pub const COUNT: u64 = 71;
+    pub const COUNT: u64 = 73;
     /// The data plane's calls (SDD 29): native numbers a task makes on its own plane,
     /// or a personality server on a task's. The rest of the range is reserved.
     pub const DATA_PLANE: core::ops::Range<u64> = BASE + 0x100..BASE + 0x110;
@@ -589,16 +602,20 @@ pub enum ResourceKind {
     /// `hyperv_interrupt`, `hyperv_signal_create`): `root.hyperv`, which the core makes
     /// only on Hyper-V. It has no range and is never narrowed.
     Hyperv = 6,
+    /// (2.8) `clock_set_realtime`: the right to set the wall clock. No range; never
+    /// narrowed.
+    Clock = 7,
 }
 
 impl ResourceKind {
-    pub const ALL: [ResourceKind; 6] = [
+    pub const ALL: [ResourceKind; 7] = [
         ResourceKind::Process,
         ResourceKind::DeviceMemory,
         ResourceKind::Interrupt,
         ResourceKind::Msi,
         ResourceKind::Dma,
         ResourceKind::Hyperv,
+        ResourceKind::Clock,
     ];
 
     pub fn from_raw(raw: u32) -> Option<ResourceKind> {
@@ -934,6 +951,12 @@ pub mod cpu {
 /// monotonic nanoseconds, the clock every deadline in this ABI is measured on. A reader reads `SEQUENCE`,
 /// then the fields, then `SEQUENCE` again, and retries if it changed or was odd. Time in
 /// nanoseconds is `BASE_NS + ((tsc - BASE_TSC) * MULTIPLIER) >> SHIFT`.
+///
+/// Since ABI 2.8 the page is also the node's one wall clock: once `REALTIME_SOURCE` says it is
+/// set, the wall clock in nanoseconds since 1970 (UTC) is `REALTIME_BASE` plus that time. Both
+/// change together under the sequence, at boot and at each `clock_set_realtime`, which may come
+/// at any time: a reader that reads them with the scale under one steady sequence sees one
+/// wall clock, never half of a change.
 pub mod clock_page {
     /// Byte offset of the `u64` sequence, odd while the kernel writes the page.
     pub const SEQUENCE: usize = 0;
@@ -945,6 +968,24 @@ pub mod clock_page {
     pub const MULTIPLIER: usize = 24;
     /// Byte offset of the `u32` shift applied after the multiplier.
     pub const SHIFT: usize = 32;
+    /// Byte offset of the `u64` realtime base (ABI 2.8): UTC nanoseconds since 1970 at the
+    /// monotonic clock's zero. Zero while the wall clock is unset.
+    pub const REALTIME_BASE: usize = 40;
+    /// Byte offset of the `u64` that says where the realtime base came from (ABI 2.8), one of
+    /// [`realtime`]: whether the wall clock has been set, so a reader can refuse an unset one.
+    pub const REALTIME_SOURCE: usize = 48;
+
+    /// The values of `REALTIME_SOURCE` (ABI 2.8).
+    pub mod realtime {
+        /// The wall clock has not been set: the base is zero, and a reader that needs the
+        /// time of day has none.
+        pub const UNSET: u64 = 0;
+        /// The base is the machine's own clock (its CMOS clock), read once at boot.
+        pub const MACHINE: u64 = 1;
+        /// The base was given by `clock_set_realtime`, by `platform` from its cloud's answer
+        /// (system design 1D); each call replaces it.
+        pub const SET: u64 = 2;
+    }
     /// The page's length.
     pub const LEN: usize = 4096;
 }
@@ -1466,7 +1507,9 @@ mod tests {
         }
         assert_eq!(ResourceKind::from_raw(0), None);
         assert_eq!(ResourceKind::from_raw(6), Some(ResourceKind::Hyperv));
-        assert_eq!(ResourceKind::from_raw(7), None);
+        // ABI 2.8: the clock.
+        assert_eq!(ResourceKind::from_raw(7), Some(ResourceKind::Clock));
+        assert_eq!(ResourceKind::from_raw(8), None);
     }
 
     #[test]
@@ -1485,9 +1528,13 @@ mod tests {
         assert!(!valid_name(b""));
         assert!(!valid_name(b"Upper"));
         assert!(!valid_name(&[b'a'; 33]));
-        assert_eq!(ABI_VERSION, 0x2_0007);
-        assert_eq!(nr::HYPERV_SIGNAL + 1, nr::BASE + nr::COUNT);
+        assert_eq!(ABI_VERSION, 0x2_0008);
         assert_eq!(nr::HYPERV_POST, nr::THREAD_INTERRUPT + 1);
+        // ABI 2.8's two calls follow 2.7's six.
+        assert_eq!(nr::CLOCK_SET_REALTIME, nr::HYPERV_SIGNAL + 1);
+        assert_eq!(nr::THREAD_YIELD, nr::CLOCK_SET_REALTIME + 1);
+        assert_eq!(nr::THREAD_YIELD + 1, nr::BASE + nr::COUNT);
+        assert!(nr::is_native(nr::CLOCK_SET_REALTIME) && nr::is_native(nr::THREAD_YIELD));
         assert_eq!(nr::THREAD_SET_CPU, nr::ACCOUNT_MATCHES + 1);
         assert_eq!(nr::PERSONALITY_SET, nr::WINDOWS_PROTECT + 1);
         assert!(nr::is_native(nr::THREAD_SET_CPU) && nr::is_native(nr::THREAD_INTERRUPT));
@@ -1496,7 +1543,18 @@ mod tests {
             map::HUGE | map::POPULATE
         );
         assert_eq!(personality::LEN, 8 + 16 * 8 + 7 * 8);
-        const { assert!(clock_page::SHIFT + 4 <= clock_page::LEN) };
+        const { assert!(clock_page::SHIFT + 4 <= clock_page::REALTIME_BASE) };
+        const { assert!(clock_page::REALTIME_BASE.is_multiple_of(8)) };
+        const { assert!(clock_page::REALTIME_BASE + 8 == clock_page::REALTIME_SOURCE) };
+        const { assert!(clock_page::REALTIME_SOURCE + 8 <= clock_page::LEN) };
+        assert_eq!(
+            [
+                clock_page::realtime::UNSET,
+                clock_page::realtime::MACHINE,
+                clock_page::realtime::SET
+            ],
+            [0, 1, 2]
+        );
         assert_eq!(nr::ACCOUNT_MATCHES, nr::ACCOUNT_INFO + 1);
         assert_eq!(nr::ACCOUNT_CREATE, nr::PROCESS_GRANT + 1);
         assert!(nr::is_native(nr::BATCH_GET) && nr::is_native(nr::PLANE_PROBE));
@@ -1555,7 +1613,8 @@ mod tests {
             assert_eq!(*call, nr::BASE + 65 + i as u64);
             assert!(nr::is_native(*call));
         }
-        assert_eq!(ABI_MINOR, 7);
+        // ABI 2.7 added them; 2.8 (item 5.0) follows.
+        const { assert!(ABI_MINOR >= 7) };
     }
 
     #[test]

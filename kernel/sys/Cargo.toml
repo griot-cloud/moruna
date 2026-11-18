@@ -17,6 +17,20 @@ log = ["dep:moruna-record"]
 # `-C instrument-coverage`): a program prints its coverage counters on its console when idle
 # and at exit (src/usage.rs). Off in every other build.
 usage = ["dep:moruna-usage"]
+# Item 5.0 (system design 5A0): `rt`, the runtime Rust's std calls for `target_os = "moruna"`
+# (kernel/vendor/rust-std): the entry, threads and their thread-local keys, the futex calls with
+# timeouts, the clock, stdout and stderr as lines of the task's log. The heap is the process's
+# memory, but not the global allocator: std's `System` allocates from it.
+rt = ["heap", "log"]
+# Item 5.0: built as a dependency of std, whose `core` and `alloc` are the ones being built
+# beside it (kernel/vendor/rust-std/library/std/Cargo.toml).
+rustc-dep-of-std = [
+    "rt",
+    "dep:core",
+    "dep:alloc",
+    "moruna-abi/rustc-dep-of-std",
+    "moruna-record/rustc-dep-of-std",
+]
 
 [dependencies]
 moruna-abi.workspace = true
@@ -24,3 +38,6 @@ moruna-abi.workspace = true
 moruna-usage = { path = "../usage", version = "=0.1.0", optional = true }
 # stream P: `plane::Log`'s records (feature `log`).
 moruna-record = { path = "../../crates/moruna-record", version = "=0.6.6", default-features = false, optional = true }
+# Item 5.0: only when built as a dependency of std (feature `rustc-dep-of-std`).
+core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core" }
+alloc = { version = "1.0.0", optional = true, package = "rustc-std-workspace-alloc" }
