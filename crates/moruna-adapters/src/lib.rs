@@ -21,6 +21,7 @@
 pub use moruna_kernel::GilState;
 
 pub mod guard;
+pub mod instances;
 pub mod land;
 
 use moruna_kernel::{Seq, StageId};

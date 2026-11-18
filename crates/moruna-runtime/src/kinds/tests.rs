@@ -606,6 +606,18 @@ fn kd_t11_fusion_through_the_port() {
     );
 }
 
+/// A stage of processes runs one per CPU of the job (system design 3E, 6.3e): its `budget.cpu`
+/// rounded up, or the node's when it names none.
+#[test]
+fn a_context_gives_the_job_s_cpus_or_the_node_s() {
+    let cx = Context::new(Arc::new(Standalone));
+    assert_eq!(cx.cpus(8), 8, "no budget.cpu: the node's");
+    let cx = Context::new(Arc::new(Standalone)).job_cpu(Some(2.5));
+    assert_eq!(cx.cpus(8), 3);
+    let cx = Context::new(Arc::new(Standalone)).job_cpu(Some(4.0));
+    assert_eq!(cx.cpus(1), 4);
+}
+
 /// The context's shared values are one per build and per type.
 #[test]
 fn a_context_shares_one_value_per_type() {

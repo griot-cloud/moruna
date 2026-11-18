@@ -61,6 +61,8 @@ impl NativePex {
             command,
             Vec::new(),
             Vec::new(),
+            // A PEX's one process (its kind's one instance): its manifest, not the job's CPUs.
+            1,
         )
         .map_err(fail)?
         .managed_windows();

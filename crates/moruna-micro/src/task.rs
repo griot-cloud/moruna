@@ -358,10 +358,16 @@ pub struct ImageTask {
     cancel: OnceLock<CancelToken>,
     /// The stage's ceiling, which bounds its plane's arena and its task's account.
     ceiling: Mutex<Option<u64>>,
-    /// Each process's account, once it has started: one a process of the stage.
+    /// Each process's account, once it has started: one a process the stage may run
+    /// (`moruna_adapters::instances::count`, system design 3E).
     memory: Vec<Arc<TaskMemory>>,
     /// The memory all of them hold outside the engine's process.
     outside: Arc<TaskMemories>,
+    /// The job's CPUs, one process each (system design 3E).
+    cpus: usize,
+    /// The processes the run's memory funds, at most `memory.len()` ([`ImageTask::fund`]): the
+    /// instances the stage runs.
+    funded: std::sync::atomic::AtomicUsize,
     /// Native PEX controls reserve each reply explicitly; ordinary image behavior is unchanged.
     managed_windows: bool,
     /// Source path is only resolved through the actual filesystem capability at start.
@@ -446,7 +452,9 @@ impl std::fmt::Debug for ImageTask {
 
 impl ImageTask {
     /// The stage `name` runs the program at `path` (absolute, in the image) with `command` as
-    /// its arguments and `env` as its whole environment, and may call `port_names`.
+    /// its arguments and `env` as its whole environment, and may call `port_names`: one process
+    /// per CPU of the job's `cpus`, at most the ceiling `env` declares (system design 3E,
+    /// `moruna_adapters::instances`), until the run funds fewer ([`ImageTask::fund`]).
     pub fn new(
         name: &str,
         identity: &str,
@@ -454,6 +462,7 @@ impl ImageTask {
         command: Vec<String>,
         env: Vec<String>,
         mut port_names: Vec<String>,
+        cpus: usize,
     ) -> std::result::Result<ImageTask, String> {
         if !path.starts_with('/') {
             return Err(format!(
@@ -473,10 +482,8 @@ impl ImageTask {
         }
         personality()?;
         let rings = layout::declares_rings(&env);
-        let processes = layout::processes(&env)?;
-        let memory: Vec<Arc<TaskMemory>> = (0..processes)
-            .map(|_| Arc::new(TaskMemory::default()))
-            .collect();
+        let declared = moruna_adapters::instances::declared(&env)?;
+        let processes = moruna_adapters::instances::count(cpus, declared);
         port_names.sort();
         port_names.dedup();
         Ok(ImageTask {
@@ -489,19 +496,65 @@ impl ImageTask {
             ports: OnceLock::new(),
             cancel: OnceLock::new(),
             ceiling: Mutex::new(None),
-            outside: Arc::new(TaskMemories(memory.clone())),
-            memory,
+            outside: Arc::new(TaskMemories(Vec::new())),
+            memory: Vec::new(),
+            cpus,
+            funded: std::sync::atomic::AtomicUsize::new(0),
             managed_windows: false,
             assets_path: None,
             rings,
             native: None,
             root: None,
-            busy: Arc::new(Busy {
-                figures: Mutex::new(vec![None; processes]),
-                ..Busy::default()
-            }),
+            busy: Arc::new(Busy::default()),
             ahead: layout::Ahead::default(),
-        })
+        }
+        .with_processes(processes))
+    }
+
+    /// The stage runs at most `processes` processes: an account and the figures of each.
+    fn with_processes(mut self, processes: usize) -> Self {
+        let processes = processes.max(1);
+        self.memory = (0..processes)
+            .map(|_| Arc::new(TaskMemory::default()))
+            .collect();
+        self.outside = Arc::new(TaskMemories(self.memory.clone()));
+        self.funded = std::sync::atomic::AtomicUsize::new(processes);
+        self.busy = Arc::new(Busy {
+            figures: Mutex::new(vec![None; processes]),
+            ..Busy::default()
+        });
+        self
+    }
+
+    /// A native program declares its ceiling in its ELF note as well (`.note.moruna`, system
+    /// design 3E, 5A, 5B): the stage runs one process per CPU of the job, at most the least of
+    /// the two ceilings. A note that is not one is refused, naming the stage.
+    fn with_note(self, elf: &[u8]) -> std::result::Result<Self, String> {
+        let ceiling = moruna_adapters::instances::ceiling(&self.env, Some(elf))
+            .map_err(|why| format!("the program of `{}`: {why}", self.name))?;
+        let processes = moruna_adapters::instances::count(self.cpus, ceiling);
+        Ok(self.with_processes(processes))
+    }
+
+    /// The run's memory funds `instances` of the stage's processes (system design 3E, PM
+    /// 2026-11-18): the stage runs that many, at least one and at most those it may run.
+    pub fn fund(&self, instances: usize) {
+        self.funded.store(
+            instances.clamp(1, self.memory.len().max(1)),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// The processes the stage runs: those the run funds.
+    pub fn instances(&self) -> usize {
+        self.funded
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .clamp(1, self.memory.len().max(1))
+    }
+
+    /// The stage's name, as the run's notes say it.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Request a real READ-only source-directory capability for this task.
@@ -525,20 +578,26 @@ impl ImageTask {
     }
 
     /// The entry declares `abi: moruna`: the command is a native program of the kernel's user
-    /// target, `elf` ([`program`] checked it), which the stage starts itself on the rings.
-    pub fn with_native(mut self, elf: Vec<u8>) -> Self {
-        self.native = Some(Native::Elf(Arc::from(elf)));
+    /// target, `elf` ([`program`] checked it), which the stage starts itself on the rings, at
+    /// most the ceiling its ELF note declares.
+    pub fn with_native(mut self, elf: Vec<u8>) -> std::result::Result<Self, String> {
+        let elf: Arc<[u8]> = Arc::from(elf);
+        self.native = Some(Native::Elf(Arc::clone(&elf)));
         self.rings = true;
-        self
+        self.with_note(&elf)
     }
 
     /// The stage is a registered function whose file is a native program of the kernel's user
     /// target (item 3.6): the kernel loads it from the function's memory object, and the stage
-    /// starts it itself on the rings, as [`ImageTask::with_native`]'s.
-    pub fn with_native_function(mut self, function: Arc<Function>) -> Self {
-        self.native = Some(Native::Function(function));
+    /// starts it itself on the rings, as [`ImageTask::with_native`]'s, at most the ceiling its
+    /// ELF note declares.
+    pub fn with_native_function(
+        mut self,
+        function: Arc<Function>,
+    ) -> std::result::Result<Self, String> {
+        self.native = Some(Native::Function(Arc::clone(&function)));
         self.rings = true;
-        self
+        self.with_note(function.bytes())
     }
 
     /// The stage is a registered image function (item 3.6): each of its tasks runs on `root`,
@@ -653,7 +712,7 @@ impl ImageTask {
                 "{}; its workers in the stage: cutting {:.2} s, laying out {:.2} s, waiting for room {:.2} s, waiting for answers {:.2} s, taking answers {:.2} s, polling {:.2} s",
                 layout::stage_note(
                     &self.name,
-                    &lock(&self.busy.figures),
+                    &lock(&self.busy.figures)[..self.instances()],
                     self.busy.peak.load(std::sync::atomic::Ordering::Relaxed),
                 ),
                 s(&f.cut),
@@ -729,8 +788,9 @@ impl ImageTask {
             // Every task's plane is made ahead, together, as the first task starts: the kernel
             // zeroes each and the host faults its pages in on CPUs of their own, not one task
             // after another. A task restarted later makes its own now.
-            let cpus: Vec<Option<u32>> = (0..self.memory.len()).map(|i| self.cpu_of(i)).collect();
-            self.ahead.start(self.memory.len(), move |i| {
+            let instances = self.instances();
+            let cpus: Vec<Option<u32>> = (0..instances).map(|i| self.cpu_of(i)).collect();
+            self.ahead.start(instances, move |i| {
                 open_ring_plane(budget, cpus.get(i).copied().flatten())
             });
             let opened = match self.ahead.take(ctx.instance) {
@@ -2174,10 +2234,11 @@ impl Kernel for ImageTask {
         self.fingerprint
     }
 
-    /// One task process per instance: one, or the `MORUNA_PROCESSES` the image declares.
+    /// One task process per instance: one per CPU of the job, at most the `MORUNA_PROCESSES`
+    /// the image declares, as many as the run's memory funds (system design 3E).
     fn kind(&self) -> KernelKind {
         KernelKind::Stateful {
-            max_instances: core::num::NonZeroUsize::new(self.memory.len())
+            max_instances: core::num::NonZeroUsize::new(self.instances())
                 .unwrap_or(core::num::NonZeroUsize::MIN),
         }
     }

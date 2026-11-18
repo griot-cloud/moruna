@@ -1159,3 +1159,50 @@ def test_registry_upgrades_a_pull_token_when_upload_requests_push_scope(tmp_path
     registry.push_blob("sha256:" + hashlib.sha256(blob.read_bytes()).hexdigest(), blob)
     assert scopes == ["repository:team/p:pull", "repository:team/p:pull,push"]
     assert uploaded == [b"callable-layer"]
+
+
+def test_an_image_declares_the_ceiling_of_a_function_that_keeps_state() -> None:
+    """Item 6.3e (system design 3E, 5C): a job runs a function one instance per CPU of the job
+    unless its image declares fewer. A plain decorated function declares nothing; a stateful
+    one its ``instances``, 1 unless it says otherwise; a ``moruna.Function`` subclass 1, its
+    contract being one instance; a source or a sink nothing."""
+
+    class Handle:
+        def __init__(self, stateful: bool) -> None:
+            self.stateful = stateful
+
+    def decorated(stateful: bool, **extra: Any) -> Any:
+        task = types.SimpleNamespace(_handle=Handle(stateful))
+        vars(task).update(extra)
+        return task
+
+    class Subclass:
+        def __call__(self, batch: Any) -> Any:
+            return batch
+
+    assert build.declared_processes(decorated(False), "function") is None
+    assert build.declared_processes(decorated(True), "function") == 1
+    assert build.declared_processes(decorated(True, _moruna_instances=3), "function") == 3
+    assert build.declared_processes(decorated(False, _moruna_instances=3), "function") is None
+    assert build.declared_processes(Subclass(), "function") == 1
+    assert build.declared_processes(Subclass(), "sink") is None
+    assert build.declared_processes(decorated(True), "source") is None
+
+    runtime = types.SimpleNamespace(
+        config={"config": {"Env": ["PATH=/usr/bin", "MORUNA_PROCESSES=9"]}},
+        name="python",
+        digest="d",
+    )
+    options = types.SimpleNamespace(platform=build.parse_platform("linux/aarch64"), version=None)
+
+    def declared(processes: int | None) -> list[str]:
+        task = build.Task(
+            name="t", entry="m:f", code=None, key="sha256:" + "0" * 64, distributions=(),
+            provenance={}, processes=processes,
+        )  # fmt: skip
+        env = build.image_config(runtime, task, [], options)["config"]["Env"]
+        return [e for e in env if e.startswith("MORUNA_PROCESSES=")]
+
+    assert declared(1) == ["MORUNA_PROCESSES=1"]
+    # Nothing declared: the runtime's own entry stands as it was, and Moruna adds none.
+    assert declared(None) == ["MORUNA_PROCESSES=9"]

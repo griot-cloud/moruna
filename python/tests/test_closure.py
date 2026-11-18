@@ -178,3 +178,17 @@ def test_provenance_comes_from_git_with_no_credential(project: Path) -> None:
     assert closure.provenance(found).dirty is True
     (project / "notes" / "readme.txt").write_text("changed\n")
     assert closure.stripped_tree('"""d"""\nx = 1\n', "t") == closure.stripped_tree("x=1", "t")
+
+
+def test_a_declared_ceiling_is_part_of_the_key_and_none_keeps_it(project: Path) -> None:
+    """Item 6.3e: an image whose config declares ``MORUNA_PROCESSES`` is another image, so its
+    key names the ceiling; a function that declares none keeps the key it had."""
+    found = code(project)
+    options = {
+        "lock": "sha256:" + "1" * 64, "runtime": "r", "shim": "s", "platform": "linux/aarch64",
+    }  # fmt: skip
+    base = key(found)
+    assert closure.build_key(found, "pipeline.tasks:Enrich", **options, processes=None) == base
+    one = closure.build_key(found, "pipeline.tasks:Enrich", **options, processes=1)
+    two = closure.build_key(found, "pipeline.tasks:Enrich", **options, processes=2)
+    assert len({base, one, two}) == 3

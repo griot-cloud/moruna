@@ -14,6 +14,10 @@ use arrow_schema::{DataType, Field};
 use moruna_function::host::{HostError, Input, Plane, record};
 use moruna_function::{Emit, Function, FunctionError, code, log, serve};
 
+// The aggregates below see the whole input only in one instance (system design 3E): the
+// declaration a program makes, which on a host declares nothing and must still build.
+moruna_function::processes!(1);
+
 fn ints(from: i64, n: i64) -> RecordBatch {
     let a: ArrayRef = Arc::new(Int64Array::from_iter_values(from..from + n));
     RecordBatch::try_from_iter([("a", a)]).unwrap()

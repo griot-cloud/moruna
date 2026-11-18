@@ -266,7 +266,8 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
         .packages(opts.packages)
         .host_ports(opts.host_ports)
         .pulled(opts.pulled_images)
-        .run_args(args);
+        .run_args(args)
+        .job_cpu(job.budget.cpu);
 
     // The sources, in document order.
     let source_tasks: Vec<usize> = (0..job.tasks.len())

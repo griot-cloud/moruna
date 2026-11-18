@@ -64,6 +64,42 @@ pub use error::FunctionError;
 pub use params::{args, params};
 pub use serve::{Function, serve};
 
+/// Declares the most instances of this function a job runs (system design 3E). A job runs a
+/// function one instance per CPU of the job, each a process of its own; a function that keeps
+/// state across batches (a running total) declares how many it can run, 1 to 64, once at the top
+/// level of its program:
+///
+/// ```ignore
+/// moruna_function::processes!(1);
+/// ```
+///
+/// A ceiling, never a count. It is the program's ELF note (`.note.moruna`, owner `Moruna`, type 1,
+/// `MORUNA_PROCESSES=N`), which the engine reads before it starts the function. On a host it
+/// declares nothing.
+#[macro_export]
+macro_rules! processes {
+    ($n:literal) => {
+        const _: () = assert!(
+            $n >= 1 && $n <= 64,
+            "moruna_function::processes! takes 1 to 64"
+        );
+        #[cfg(target_os = "moruna")]
+        ::core::arch::global_asm!(
+            ".pushsection .note.moruna,\"a\",@note",
+            ".balign 4",
+            ".long 7",
+            ".long 2f - 1f",
+            ".long 1",
+            ".asciz \"Moruna\"",
+            ".balign 4",
+            concat!("1: .ascii \"MORUNA_PROCESSES=", stringify!($n), "\""),
+            "2: .balign 4",
+            ".popsection",
+            options(att_syntax)
+        );
+    };
+}
+
 /// A task's exit codes, the ones the gate's tasks have always ended with. [`serve`] says the code
 /// on the task's rings, where the engine reads it, and returns it for `main` to return.
 pub mod code {

@@ -294,6 +294,8 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
         name: "function",
         msg: format!("{reference}: {why}"),
     };
+    // One process per CPU of the job, or of the node when the job names none (system design 3E).
+    let cpus = cx.cpus(moruna_micro::start::kernel().map_or(1, |kernel| kernel.cpus));
     let (task, what) =
         match content(name, function.bytes()).map_err(|why| entry.refuse("function", why))? {
             Content::Native => {
@@ -308,9 +310,11 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
                     vec![name.clone()],
                     env,
                     Vec::new(),
+                    cpus,
                 )
                 .map_err(made)?
-                .with_native_function(Arc::clone(&function));
+                .with_native_function(Arc::clone(&function))
+                .map_err(|why| entry.refuse("function", why))?;
                 (task, String::from("a native program"))
             }
             Content::Image(archive) => {
@@ -330,6 +334,7 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
                     program.launch.command,
                     env,
                     Vec::new(),
+                    cpus,
                 )
                 .map_err(made)?
                 .with_root(Root::new(Arc::clone(&function), program.layers));
@@ -340,8 +345,9 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
             }
         };
     cx.notes().push(format!(
-        "function {name}: {what}, sha256:{sha256}, {} bytes, as the node gave it",
-        function.entry.size
+        "function {name}: {what}, sha256:{sha256}, {} bytes, as the node gave it; {}",
+        function.entry.size,
+        moruna_adapters::instances::count_note(task.instances(), cpus),
     ));
     let task = Arc::new(task);
     let mut stage = Stage::of(task.clone());

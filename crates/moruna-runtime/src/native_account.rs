@@ -116,67 +116,24 @@ pub(crate) fn sampler(
     Ok(Arc::new(NativeAccount::new(read, limits, now)?))
 }
 
-/// The native children of a run's native stages: each live instance of a stage is a child of its
-/// own (an image's MORUNA_PROCESSES, one task process each), so a stage of N instances is N
-/// children, each funded with one share and carving its account within it. A stage that is not
+/// The instances each of a run's native stages asks for: each live instance of a stage is a
+/// child of its own (one task process each, as many as `moruna_adapters::instances` gives the
+/// stage), each funded with one share and carving its account within it. A stage that is not
 /// stateful has no instance count and is refused.
-pub(crate) fn native_children(
+pub(crate) fn native_instances(
     kinds: impl IntoIterator<Item = moruna_kernel::KernelKind>,
-) -> AccountingResult<usize> {
-    let mut count = 0usize;
-    for kind in kinds {
-        match kind {
-            moruna_kernel::KernelKind::Stateful { max_instances } => {
-                count = count.saturating_add(max_instances.get())
+) -> AccountingResult<Vec<usize>> {
+    kinds
+        .into_iter()
+        .map(|kind| match kind {
+            moruna_kernel::KernelKind::Stateful { max_instances } => Ok(max_instances.get()),
+            moruna_kernel::KernelKind::Stateless => Err(MorunaError::Config {
+                name: "budget.native_children",
+                msg: "a native child's stage must be stateful, its instances its children".into(),
             }
-            _ => {
-                return Err(MorunaError::Config {
-                    name: "budget.native_children",
-                    msg: "a native child's stage must be stateful, its instances its children"
-                        .into(),
-                }
-                .into());
-            }
-        }
-    }
-    Ok(count)
-}
-
-/// Equal singleton child reservations funded only from the existing run allowance.
-/// The caller supplies canonical native task geometry; parent room is checked at carve.
-pub(crate) fn child_share(
-    allowance: u64,
-    arena: u64,
-    engines: u64,
-    children: usize,
-    page: u64,
-    minimum: u64,
-) -> AccountingResult<Option<u64>> {
-    if children == 0 {
-        return Ok(None);
-    }
-    let count = u64::try_from(children).map_err(|_| MorunaError::Config {
-        name: "budget.native_children",
-        msg: "native child count exceeds u64".into(),
-    })?;
-    if !page.is_power_of_two() || minimum == 0 {
-        return Err(MorunaError::Config {
-            name: "budget.native_children",
-            msg: "invalid native task reservation geometry".into(),
-        }
-        .into());
-    }
-    let remaining = allowance.saturating_sub(arena).saturating_sub(engines);
-    let share = (remaining / count) & !(page - 1);
-    if share < minimum {
-        return Err(MorunaError::Config {
-            name: "budget.native_children",
-            msg: format!(
-                "{children} native singleton children have {remaining} bytes after funded allocations; each needs at least {minimum} bytes"
-            ),
-        }.into());
-    }
-    Ok(Some(share))
+            .into()),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -320,94 +277,23 @@ mod tests {
 
 #[cfg(test)]
 mod child_share_tests {
-    fn child_share(
-        allowance: u64,
-        arena: u64,
-        engines: u64,
-        children: usize,
-    ) -> super::AccountingResult<Option<u64>> {
-        super::child_share(allowance, arena, engines, children, 4096, 16 << 20)
-    }
-
-    #[test]
-    fn measured_run_funds_two_children_without_reusing_the_full_ceiling() {
-        let allowance = 352361673;
-        let arena = 117440512;
-        let share = child_share(allowance, arena, 0, 2).unwrap().unwrap();
-        assert_eq!(share, 117456896);
-        assert_eq!(share % 4096, 0);
-        assert!(arena + 2 * share <= allowance);
-    }
-
-    #[test]
-    fn authoritative_controller_pool_is_consumed_without_reexpansion() {
-        let pool = 114780240;
-        let share = child_share(pool, 0, 0, 2).unwrap().unwrap();
-        assert_eq!(share, 57389056);
-        assert!(2 * share <= pool);
-        // Exhausted or sub-minimum controller pools must never become a task ceiling.
-        assert!(child_share(0, 0, 0, 2).is_err());
-        assert!(child_share((32 << 20) - 1, 0, 0, 2).is_err());
-    }
-
-    #[test]
-    fn funded_engines_and_page_remainder_are_not_spent_twice() {
-        let share = child_share(128 << 20, 32 << 20, 16 << 20, 3)
-            .unwrap()
-            .unwrap();
-        assert_eq!(share, 27959296);
-        assert!((32 << 20) + (16 << 20) + 3 * share <= 128 << 20);
-        assert_eq!(child_share(0, u64::MAX, u64::MAX, 0).unwrap(), None);
-    }
-
-    /// A page that is not a power of two, or a zero minimum, is not a reservation geometry.
-    #[test]
-    fn an_invalid_reservation_geometry_is_refused() {
-        for (page, minimum) in [(3000, 16 << 20), (4096, 0)] {
-            let refused = super::child_share(1 << 30, 0, 0, 2, page, minimum)
-                .unwrap_err()
-                .to_string();
-            assert!(refused.contains("reservation geometry"), "{refused}");
-        }
-    }
-
     fn stateful(n: usize) -> moruna_kernel::KernelKind {
         moruna_kernel::KernelKind::Stateful {
             max_instances: core::num::NonZeroUsize::new(n).unwrap(),
         }
     }
 
-    /// Stages of several instances: each instance is a child, every share fits the allowance
-    /// together, and an allowance too small for that many children is refused.
+    /// Each instance of a native stage is a child: a stage asks for its instances, and a stage
+    /// that is not stateful has none (the shares are `moruna_adapters::instances::fund`'s, 6.3e).
     #[test]
     fn every_instance_of_a_native_stage_is_a_child() {
-        let n = super::native_children([stateful(4), stateful(3)]).unwrap();
-        assert_eq!(n, 7);
-        let allowance = 8u64 << 30;
-        let share = child_share(allowance, 1 << 30, 0, n).unwrap().unwrap();
-        assert_eq!(share % 4096, 0);
-        assert!((1u64 << 30) + 7 * share <= allowance);
-        assert!(share >= 16 << 20);
-        // Eight instances of 16 MiB each need 128 MiB past the arena.
-        let n = super::native_children([stateful(8)]).unwrap();
-        assert!(child_share((1 << 30) + (127 << 20), 1 << 30, 0, n).is_err());
-        assert!(
-            child_share((1 << 30) + (128 << 20), 1 << 30, 0, n)
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(super::native_children([stateful(1)]).unwrap(), 1);
-        assert_eq!(super::native_children([]).unwrap(), 0);
-        let refused = super::native_children([stateful(2), moruna_kernel::KernelKind::Stateless])
+        let wanted = super::native_instances([stateful(4), stateful(3)]).unwrap();
+        assert_eq!(wanted, vec![4, 3]);
+        assert_eq!(super::native_instances([stateful(1)]).unwrap(), vec![1]);
+        assert!(super::native_instances([]).unwrap().is_empty());
+        let refused = super::native_instances([stateful(2), moruna_kernel::KernelKind::Stateless])
             .unwrap_err()
             .to_string();
         assert!(refused.contains("must be stateful"), "{refused}");
-    }
-
-    #[test]
-    fn insufficient_or_overfunded_allowance_refuses_before_dispatch() {
-        assert!(child_share(32 << 20, 4096, 0, 2).is_err());
-        assert!(child_share(1, 2, 3, 1).is_err());
-        assert_eq!(child_share(32 << 20, 0, 0, 2).unwrap(), Some(16 << 20));
     }
 }

@@ -2378,6 +2378,7 @@ version = "0.6.6"
 dependencies = [
  "crossbeam",
  "libc",
+ "moruna-adapters",
  "moruna-cost",
  "moruna-job",
  "moruna-kernel",

@@ -49,6 +49,27 @@ impl Packaged {
         false
     }
 
+    /// The run's memory funds `instances` of a native stage's processes (system design 3E, PM
+    /// 2026-11-18): an image's task runs that many; a stage of one process is as it is. The
+    /// stage's name, for the run's notes.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn fund(&self, instances: usize) -> String {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        match self {
+            Self::Task(k) => {
+                k.fund(instances);
+                return k.name().to_string();
+            }
+            Self::NativePex(k) => return k.package().manifest.name.clone(),
+            _ => {}
+        }
+        let _ = instances;
+        self.kind().to_string()
+    }
+
     /// The kernel, as a run uses it.
     pub fn kernel(&self) -> Arc<dyn Kernel> {
         match self {

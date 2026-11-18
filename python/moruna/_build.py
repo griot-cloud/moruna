@@ -1125,6 +1125,25 @@ class Task:
     distributions: tuple[str, ...]
     provenance: dict[str, Any]
     definition: dict[str, Any] | None = None
+    #: The most instances of the function a job runs, which its config declares as
+    #: ``MORUNA_PROCESSES`` (``declared_processes``); ``None`` declares nothing.
+    processes: int | None = None
+
+
+def declared_processes(task: Any, role: str) -> int | None:
+    """The ceiling an image declares for its function (system design 3E, 5C): a job runs a
+    function one instance per CPU of the job unless it declares fewer. A plain decorated function
+    declares nothing; a stateful one (``@moruna.function(stateful=True)``) declares its
+    ``instances``, 1 unless it says otherwise; a ``moruna.Function`` subclass declares 1, as its
+    contract is one instance. Sources and sinks declare nothing."""
+    if role != "function":
+        return None
+    handle = vars(task).get("_handle") if hasattr(task, "__dict__") else None
+    if handle is None:
+        return 1
+    if not getattr(handle, "stateful", False):
+        return None
+    return int(vars(task).get("_moruna_instances", 1))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1198,6 +1217,8 @@ def image_config(
         **IMAGE_ENV,
         "MORUNA_ENTRY": task.entry,
     }
+    if task.processes is not None:
+        ours["MORUNA_PROCESSES"] = str(task.processes)
     env = [
         e for e in runtime.config.get("config", {}).get("Env", []) if e.split("=", 1)[0] not in ours
     ]
