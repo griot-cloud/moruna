@@ -392,7 +392,7 @@ Implements the OS design, section 2.
     `rights=grant,listen local=0.0.0.0/0@443`. A grant can hand out only what it holds, so it holds
     `listen`, but the supervisor never listens itself. At each start it mints `api`'s listener from
     it (`Client::grant`). `node.conf`'s one record says it all:
-    `restart api network network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=64`,
+    `restart api network network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=81 rx=65536 tx=65536 per-peer=8 linger=5000`,
     giving the service, its listener slot, the network server's service, its granting slot, and
     the policy. `network.conf`
     has no `listen-api` grant.
@@ -504,13 +504,16 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
 - **`api` is the engine's host.** The host protocol runs unchanged over a channel between `api` and
   the engine, instead of a socket: `api` sends `spec` and `cancel`, and reads `hello`, `heartbeat`,
   event records, `report` and `exit`.
-- **The budget** is the job document's `budget.memory_bytes`, at most the node's memory less 768 MiB:
-  512 MiB kept for the node's services and 256 MiB for a check running beside a job. A larger one
-  is refused. Jobs and checks are carved from `node-admission`'s account, which node config sizes
-  at the job bound plus the check account plus its own overhead. A job's budget splits 3/4 arena
-  and 1/4 in-memory scratch unless its document names a staging volume (or the standalone node's
-  split, where one exists); a check gets 256 MiB and no scratch. The engine receives its channel
-  as it is (`grant <slot> channel <from>`, only with `runs 1`).
+- **The budget** is the job document's `budget.memory_bytes`: the job's whole memory, and its
+  account is exactly that. In node mode the engine sizes itself from it: 128 MiB of engine overhead,
+  scratch at 1/4 of the remainder (unless the document names a staging volume), the arena the rest.
+- **Memory on a node is computed, never a constant.** Each service has a fixed account in node.conf
+  except `node-admission`, which takes `rest`: node memory less every other account and the kernel's
+  share. Jobs and checks are carved from it. The job bound is admission's account less the 256 MiB
+  check account (no scratch) and admission's own 128 MiB; `GET /v1/node` reports it as
+  `job_memory_bytes`, and a larger budget is refused. One image serves any node size. The cloud
+  profile's step-3 services are imagefs 256 MiB (a cache), linux 256 MiB, storage 128 MiB. The engine
+  receives its channel as it is (`grant <slot> channel <from>`, only with `runs 1`).
 - **Validation is the engine's.** `api` does not link `moruna-job`, which needs std. A document is
   checked by the engine itself:
   - `validate`: `node-admission` runs the engine's `check` on the document in a short-lived
