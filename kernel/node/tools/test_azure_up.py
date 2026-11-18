@@ -21,9 +21,11 @@ import base64
 import json
 import os
 from pathlib import Path
+import datetime
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -111,24 +113,70 @@ JOB = [
 ]
 
 
-def with_options(data_disk: bool, job: bool):
-    """The dry run's commands with `--data-disk` or `--job`: the base list with theirs put in."""
+# The repository whose bench/node/proof.py --proof runs, as the script names it.
+REPO = str(TOOLS.parents[2])
+PROOF_ARGS = ("--proof", "--tasks", "TASKS", "--nyc", "NYCDIR", "--gate-canon", "GATECANON")
+# With --proof: the function key and node config with it, in place of the base node config.
+PROOF_KEYS = [
+    "openssl genpkey -algorithm ed25519 -out RUNDIR/function-key.pem",
+    "openssl pkey -in RUNDIR/function-key.pem -pubout -outform DER | tail -c 32 | base64 > RUNDIR/function-key.pub",
+    "printf '{\"moruna\":1,\"api\":{\"token_keys\":[\"%s\"]},\"functions\":{\"keys\":[\"%s\"]}}\\n' "
+    "\"$(cat RUNDIR/token-key.pub)\" \"$(cat RUNDIR/function-key.pub)\" > RUNDIR/node-config.json",
+]
+KEYED = 'AZURE_STORAGE_KEY="$(cat RUNDIR/account.key)" az storage '
+ON_ACCOUNT = "--account-name mrnnodename --auth-mode key --subscription griot-dev"
+# With --proof, after the account's ID: the containers, the data, the tasks and the SAS.
+PROOF_STORAGE = [
+    f"{KEYED}container create -n data {ON_ACCOUNT} -o none",
+    f"{KEYED}container create -n functions {ON_ACCOUNT} -o none",
+    f"{KEYED}blob upload-batch -d data --destination-path nyc -s NYCDIR/norm --pattern "
+    f"'yellow_tripdata_2024-*.parquet' {ON_ACCOUNT} -o none",
+] + [f"{KEYED}blob upload -c functions -n gate-{j} -f TASKS/gate-{j} {ON_ACCOUNT} -o none"
+     for j in ("score", "occupancy", "enrich", "audit")] + [
+    f"(umask 077 && {KEYED}container generate-sas -n functions --permissions r --expiry \"$(python3 -I -c "
+    "'import datetime as d; print((d.datetime.now(d.timezone.utc) + d.timedelta(hours=6))"
+    ".strftime(\"%Y-%m-%dT%H:%MZ\"))')\" --https-only " + ON_ACCOUNT + " -o tsv > RUNDIR/functions.sas)",
+]
+# With --proof, after the node's checks (and --job's): the proof itself.
+PROOF = (
+    "BENCH_KEY=\"$(cat RUNDIR/account.key)\" FUNCTIONS_SAS=\"$(cat RUNDIR/functions.sas)\" "
+    f"MORUNA_BENCH_OPENSSL=openssl python3 -I {REPO}/bench/node/proof.py "
+    "--url \"https://$(cat RUNDIR/address):443\" --pin \"$(cat RUNDIR/console.pin)\" "
+    "--token-key RUNDIR/token-key.pem --instance \"$(cat RUNDIR/instance)\" --function-key RUNDIR/function-key.pem "
+    "--functions TASKS --function-base https://mrnnodename.blob.core.windows.net/functions --data blob "
+    "--blob-account mrnnodename --blob-container data --periods 2024-01,2024 --references NYCDIR "
+    "--gate-canon GATECANON --results RUNDIR/proof --work RUNDIR/proof-work")
+
+
+def with_options(data_disk: bool, job: bool, proof: bool = False):
+    """The dry run's commands with `--data-disk`, `--job` or `--proof`: the base list with theirs
+    put in."""
     lines = []
     for line in DRY_RUN:
         if data_disk and line.startswith("az vm create "):
             line = line.replace("--user-data RUNDIR/node-config.json --no-wait",
                                 "--user-data RUNDIR/node-config.json --attach-data-disks moruna-node-data --no-wait")
+        if proof and line.startswith("az vm create "):
+            line = line.replace("--size Standard_D2s_v4 ", "--size Standard_D4s_v4 ")
+        if proof and line.startswith("printf '{\"moruna\":1,"):
+            lines += PROOF_KEYS
+            continue
         lines.append(line)
         if data_disk and line.startswith("az disk create -n moruna-node-os "):
             lines.append(DATA_DISK)
+        if proof and line.startswith("az storage account show "):
+            lines += PROOF_STORAGE
         if job and "/v1/node\"" in line:
             lines += JOB
+        if proof and "/v1/node\"" in line:
+            lines.append(PROOF)
         if data_disk and line.startswith("az vm boot-diagnostics get-boot-log ") and "for _ in" not in line:
             lines.append(DATA_DISK_LINES)
     return lines
 
 
 DRY_RUN_OPTIONS = with_options(True, True)
+DRY_RUN_PROOF = with_options(False, True, proof=True)
 
 # The stand-ins. Each records its call in STUB_LOG, the storage key it was given beside `az`'s.
 AZ = r"""#!/bin/sh
@@ -142,8 +190,26 @@ case " $* " in
   *" public-ip show "*) echo 203.0.113.7 ;;
   *" get-boot-log "*) printf 'BdsDxe: loading\r\nmoruna: core 0.7.0 cpus=2 memory=8589934592\r\nmoruna: services started\r\nmoruna: network wan 10.0.0.4/24 gateway 10.0.0.1\r\nmoruna: cloud azure instance %s\r\nmoruna: tls sha256=%s\r\nmoruna: ready api=10.0.0.4:443 boot_ms=2140\r\n' "$STUB_INSTANCE" "$STUB_PIN" ;;
   *" get-instance-view "*) echo "VM running" ;;
+  *" generate-sas "*) echo "${STUB_SAS:-}" ;;
 esac
 exit 0
+"""
+# A container SAS as `az` prints one, every value fake.
+SAS = "se=2026-11-18T18%3A00Z&sp=r&spr=https&sv=2022-11-02&sr=c&sig=FAKEfakeFAKEfake%2Bfake%2Ffake%3D"
+# A stand-in for python3: proof.py is recorded with the secrets its environment gave it, and
+# writes a summary into its results; anything else is the real Python (the SAS's expiry).
+PYTHON = f"""#!/bin/sh
+case "$2" in
+  */bench/node/proof.py)
+    {{ printf 'python3'; for a in "$@"; do printf ' %s' "$a"; done
+       printf ' |key=%s|sas=%s|openssl=%s\\n' "${{BENCH_KEY:-}}" "${{FUNCTIONS_SAS:-}}" "${{MORUNA_BENCH_OPENSSL:-}}"; }} >> "$STUB_LOG"
+    results=""; previous=""
+    for a in "$@"; do [ "$previous" = --results ] && results="$a"; previous="$a"; done
+    mkdir -p "$results" && printf '{{"ok":%s}}' "${{STUB_PROOF_OK:-true}}" > "$results/proof.json"
+    echo "proof: score-2024-01 pass"
+    exit "${{STUB_PROOF_EXIT:-0}}" ;;
+esac
+exec {sys.executable} "$@"
 """
 OPENSSL = r"""#!/bin/sh
 echo "openssl $*" >> "$STUB_LOG"
@@ -198,6 +264,18 @@ class AzureUp(unittest.TestCase):
         self.root = Path(tmp.name).resolve()
         (self.root / "OUTDIR").mkdir()
         (self.root / "OUTDIR/moruna-node.vhd").write_bytes(b"\0" * 1024)
+        # The proof's inputs: the four tasks, the twelve months and the eight references, and
+        # gate-canon.
+        (self.root / "TASKS").mkdir()
+        (self.root / "NYCDIR/norm").mkdir(parents=True)
+        for job in ("score", "occupancy", "enrich", "audit"):
+            (self.root / f"TASKS/gate-{job}").write_bytes(b"\x7fELF a task")
+            for period in ("2024-01", "2024"):
+                (self.root / f"NYCDIR/reference-{job}-{period}.json").write_text("{}")
+        for month in range(1, 13):
+            (self.root / f"NYCDIR/norm/yellow_tripdata_2024-{month:02d}.parquet").write_bytes(b"PAR1")
+        (self.root / "GATECANON").write_text("#!/bin/sh\n")
+        (self.root / "GATECANON").chmod(0o755)
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.log = self.root / "calls"
@@ -241,8 +319,21 @@ class AzureUp(unittest.TestCase):
             done = self.run_script(*self.arguments(option, "--dry-run"))
             self.assertEqual(done.stdout.splitlines(), expected, option)
 
+    def test_a_dry_run_of_the_proof_prints_its_commands_and_runs_none(self):
+        self.stubs(az=NEVER, openssl=NEVER, curl=NEVER, nc=NEVER, python3=NEVER)
+        done = self.run_script(*self.arguments(*PROOF_ARGS, "--job", "--dry-run"))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.splitlines(), DRY_RUN_PROOF)
+        done = self.run_script(*self.arguments(*PROOF_ARGS, "--dry-run"))
+        self.assertEqual(done.stdout.splitlines(), with_options(False, False, proof=True))
+        self.assertEqual(self.calls(), [], "a dry run runs nothing")
+        self.assertFalse((self.root / "RUNDIR").exists())
+        # The proof's machine is a D4s_v4, and only the proof's.
+        self.assertEqual(sum(" --size Standard_D4s_v4 " in line for line in DRY_RUN_PROOF), 1)
+        self.assertFalse(any("Standard_D4s_v4" in line for line in DRY_RUN_OPTIONS))
+
     def test_every_az_command_names_the_subscription_and_the_run_group(self):
-        for line in DRY_RUN_OPTIONS:
+        for line in DRY_RUN_OPTIONS + DRY_RUN_PROOF:
             # As many subscriptions as `az` commands on the line, each griot-dev.
             self.assertEqual(len(re.findall(r"(?:^|[\s(])az ", line)), line.count("--subscription griot-dev"), line)
             self.assertEqual(line.count("--subscription"), line.count("--subscription griot-dev"), line)
@@ -254,20 +345,25 @@ class AzureUp(unittest.TestCase):
 
     def test_the_recipe_holds_every_command_the_script_runs_and_no_other(self):
         recipe = commands(RECIPE.read_text())
-        placeholders = [("RUNDIR", "<RUN>"), ("OUTDIR/", "<OUT>/"), (GROUP, "<NAME>"), ("mrnnodename", "<ACCOUNT>"),
-                        ("192.0.2.1", "<FROM>")]
+        placeholders = [(REPO, "<REPO>"), ("RUNDIR", "<RUN>"), ("OUTDIR/", "<OUT>/"), (GROUP, "<NAME>"),
+                        ("mrnnodename", "<ACCOUNT>"), ("192.0.2.1", "<FROM>"), ("TASKS", "<TASKS>"),
+                        ("NYCDIR", "<NYC>"), ("GATECANON", "<GATE_CANON>")]
         script = []
-        for line in DRY_RUN + [line for line in DRY_RUN_OPTIONS if line not in DRY_RUN]:
+        for line in DRY_RUN + [line for line in DRY_RUN_OPTIONS + DRY_RUN_PROOF if line not in DRY_RUN]:
             for value, placeholder in placeholders:
                 line = line.replace(value, placeholder)
-            script.append(line)
+            if line not in script:
+                script.append(line)
         for line in script:
             self.assertIn(line, recipe)
         only_in_recipe = [line for line in recipe if line not in script]
         self.assertEqual(only_in_recipe, [
             "kernel/node/tools/azure-up.sh --vhd <OUT>/moruna-node.vhd --run <RUN> --from <FROM> --group <NAME> "
             "2>&1 | tee <RUN>.log",
+            "kernel/node/tools/azure-up.sh --vhd <OUT>/moruna-node.vhd --run <RUN> --from <FROM> --group <NAME> "
+            "--proof --tasks <TASKS> --nyc <NYC> --gate-canon <GATE_CANON> 2>&1 | tee <RUN>.log",
             "az account show --subscription griot-dev --query name -o tsv",
+            "python3 -I -c 'import pyarrow.fs; print(pyarrow.__version__, pyarrow.fs.AzureFileSystem)'",
         ])
 
     def test_the_guard_refuses_before_anything_runs(self):
@@ -313,6 +409,42 @@ class AzureUp(unittest.TestCase):
         self.assertEqual(done.returncode, 2)
         self.assertIn("must be new", done.stderr)
         self.assertEqual(self.calls(), [])
+
+    def test_the_proof_is_refused_without_its_inputs_before_anything_runs(self):
+        self.stubs(az=NEVER, openssl=NEVER, curl=NEVER, nc=NEVER, python3=NEVER)
+        for arguments, reason in [
+            (["--proof"], "--proof needs --tasks, --nyc and --gate-canon"),
+            (["--proof", "--tasks", "TASKS", "--nyc", "NYCDIR"], "--proof needs --tasks, --nyc and --gate-canon"),
+            ([*PROOF_ARGS, "--data-disk"], "--proof takes no --data-disk"),
+            (["--tasks", "TASKS"], "--tasks, --nyc and --gate-canon go with --proof"),
+            (["--gate-canon", "GATECANON"], "--tasks, --nyc and --gate-canon go with --proof"),
+        ]:
+            for dry in ([], ["--dry-run"]):
+                done = self.run_script(*self.arguments(*arguments, *dry))
+                self.assertEqual(done.returncode, 2, (arguments, done.stderr))
+                self.assertIn(reason, done.stderr)
+                self.assertEqual(done.stdout, "")
+        for missing, reason in [
+            ("TASKS/gate-audit", "no gate task at TASKS/gate-audit"),
+            ("NYCDIR/norm/yellow_tripdata_2024-07.parquet", "no input at NYCDIR/norm/yellow_tripdata_2024-07.parquet"),
+            ("NYCDIR/reference-score-2024.json", "no reference at NYCDIR/reference-score-2024.json"),
+            ("GATECANON", "no gate-canon program at GATECANON"),
+        ]:
+            path = self.root / missing
+            kept = path.read_bytes()
+            path.unlink()
+            try:
+                done = self.run_script(*self.arguments(*PROOF_ARGS, "--dry-run"))
+                self.assertEqual(done.returncode, 2, missing)
+                self.assertIn(reason, done.stderr)
+            finally:
+                path.write_bytes(kept)
+        # gate-canon must be a program, not only a file.
+        (self.root / "GATECANON").chmod(0o644)
+        done = self.run_script(*self.arguments(*PROOF_ARGS))
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("no gate-canon program", done.stderr)
+        self.assertEqual(self.calls(), [], "a refusal runs nothing")
 
     def test_a_group_that_exists_already_is_neither_used_nor_deleted(self):
         self.stubs(az=AZ, openssl=OPENSSL, curl=NEVER, nc=NEVER)
@@ -445,6 +577,86 @@ class AzureUp(unittest.TestCase):
         self.assertEqual(done.returncode, 1, done.stderr)
         self.assertTrue(any(call.startswith(f"az group delete -n {GROUP} --yes") for call in self.calls()))
         self.assertFalse(any("/v1/node" in call for call in self.calls()), "no token is sent to a node not pinned")
+
+    def test_a_proof_runs_on_a_d4s_v4_from_blob_with_its_functions_by_sas(self):
+        self.stubs(az=AZ, openssl=OPENSSL, curl=CURL, nc=NC, python3=PYTHON)
+        started = datetime.datetime.now(datetime.timezone.utc)
+        done = self.run_script(*self.arguments(*PROOF_ARGS), extra={"STUB_SAS": SAS})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("proof: score-2024-01 pass\n", done.stdout)
+        self.assertRegex(done.stdout, r"create-to-ready \d+ s, boot_ms 2140\n$")
+        calls = self.calls()
+        az = [call.split(" |key=")[0] for call in calls if call.startswith("az ")]
+        vm = next(call for call in az if call.startswith("az vm create"))
+        self.assertIn(" --size Standard_D4s_v4 ", vm)
+        self.assertNotIn("--attach-data-disks", vm)
+        # Node config: the token key and the run's function key (3E).
+        run = self.root / "RUNDIR"
+        config = json.loads((run / "node-config.json").read_text())
+        key = base64.b64encode(b"0" * 32).decode()
+        self.assertEqual(config, {"moruna": 1, "api": {"token_keys": [key]}, "functions": {"keys": [key]}})
+        self.assertTrue((run / "function-key.pem").exists())
+        # The data and the four tasks in their containers, with the account's key in the
+        # environment alone, and the SAS made from it, before the machine.
+        storage = [call for call in calls if call.startswith(("az storage container", "az storage blob"))]
+        self.assertEqual([" ".join(call.split()[1:5]) for call in storage], [
+            "storage container create -n", "storage blob upload -c", "storage blob url -c",
+            "storage container create -n", "storage container create -n", "storage blob upload-batch -d",
+            "storage blob upload -c", "storage blob upload -c", "storage blob upload -c", "storage blob upload -c",
+            "storage container generate-sas -n"])
+        for call in storage:
+            self.assertTrue(call.endswith(" |key=the-account-key"), call)
+        batch = next(call for call in az if " upload-batch " in call)
+        self.assertIn(" -d data --destination-path nyc -s NYCDIR/norm --pattern yellow_tripdata_2024-*.parquet ", batch)
+        tasks = [call for call in az if call.startswith("az storage blob upload -c functions")]
+        self.assertEqual([call.split(" -f ")[1].split()[0] for call in tasks],
+                         [f"TASKS/gate-{job}" for job in ("score", "occupancy", "enrich", "audit")])
+        sas = next(call for call in az if " generate-sas " in call)
+        self.assertIn(" -n functions --permissions r ", sas)
+        self.assertIn(" --https-only ", sas)
+        expiry = datetime.datetime.strptime(re.search(r" --expiry (\S+) ", sas).group(1), "%Y-%m-%dT%H:%MZ")
+        expiry = expiry.replace(tzinfo=datetime.timezone.utc)
+        hours = datetime.timedelta(hours=6)
+        self.assertTrue(started + hours - datetime.timedelta(minutes=2) <= expiry
+                        <= datetime.datetime.now(datetime.timezone.utc) + hours, expiry)
+        self.assertLess(az.index(sas), az.index(vm))
+        self.assertEqual((run / "functions.sas").read_text().strip(), SAS)
+        self.assertEqual(stat.S_IMODE((run / "functions.sas").stat().st_mode), 0o600)
+        # proof.py: once, after the node's checks, the key and the SAS in its environment only.
+        proof = [call for call in calls if call.startswith("python3 ")]
+        self.assertEqual(len(proof), 1)
+        argv, env = proof[0].split(" |key=")
+        self.assertEqual(env, f"the-account-key|sas={SAS}|openssl=openssl")
+        self.assertEqual(argv, (
+            f"python3 -I {REPO}/bench/node/proof.py --url https://203.0.113.7:443 --pin {PIN} "
+            f"--token-key RUNDIR/token-key.pem --instance {INSTANCE} --function-key RUNDIR/function-key.pem "
+            "--functions TASKS --function-base https://mrnnodename.blob.core.windows.net/functions --data blob "
+            "--blob-account mrnnodename --blob-container data --periods 2024-01,2024 --references NYCDIR "
+            "--gate-canon GATECANON --results RUNDIR/proof --work RUNDIR/proof-work"))
+        node = next(i for i, call in enumerate(calls) if "/v1/node" in call)
+        delete = next(i for i, call in enumerate(calls) if call.startswith(f"az group delete -n {GROUP} --yes"))
+        self.assertLess(node, calls.index(proof[0]))
+        self.assertLess(calls.index(proof[0]), delete)
+        self.assertEqual(json.loads((run / "proof/proof.json").read_text()), {"ok": True})
+        # Neither secret is on any command line, nor in what the script said.
+        for call in calls:
+            line = call.split(" |key=")[0]
+            self.assertNotIn("the-account-key", line)
+            self.assertNotIn("FAKEfakeFAKEfake", line)
+        for said in (done.stdout, done.stderr):
+            self.assertNotIn("the-account-key", said)
+            self.assertNotIn("FAKEfakeFAKEfake", said)
+
+    def test_a_proof_that_fails_fails_the_run_keeps_its_results_and_deletes_the_group(self):
+        self.stubs(az=AZ, openssl=OPENSSL, curl=CURL, nc=NC, python3=PYTHON)
+        done = self.run_script(*self.arguments(*PROOF_ARGS),
+                               extra={"STUB_SAS": SAS, "STUB_PROOF_EXIT": "1", "STUB_PROOF_OK": "false"})
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertNotIn("create-to-ready", done.stdout)
+        calls = self.calls()
+        proof = next(i for i, call in enumerate(calls) if call.startswith("python3 "))
+        self.assertTrue(any(call.startswith(f"az group delete -n {GROUP} --yes") for call in calls[proof:]))
+        self.assertEqual(json.loads((self.root / "RUNDIR/proof/proof.json").read_text()), {"ok": False})
 
 
 if __name__ == "__main__":
