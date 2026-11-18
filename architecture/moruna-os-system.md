@@ -104,9 +104,11 @@ Implements the OS design, section 1, OpenStack column.
 - **One interface, `wan`,** on the first network card, set by DHCP: address, mask, gateway, DNS.
   DHCP keeps RFC 2131 4.1's MUST, a randomized exponential backoff: a DISCOVER with no answer
   is sent again after 1 s, then after 2, 4, 8, 16 and 32 s, then every 64 s, each delay moved by
-  up to a tenth either way (RFC 8415's way); the schedule starts over when the link comes up or
-  a lease is taken. A REQUEST, which follows an OFFER over a path that works, is sent again
-  after 4 s. Why not RFC 2131's 4 s, which is its example for a 10 Mb/s Ethernet: a cloud may
+  up to a tenth either way (RFC 8415's way); a REQUEST that follows an OFFER the same, its
+  schedule starting over with each DISCOVER (RFC 2131 has one rule for both; smoltcp discovers
+  again after five). Both start over when the link comes up or a lease is taken; a REQUEST
+  that renews a lease keeps smoltcp's renewal timing. Why not RFC 2131's 4 s, which is its
+  example for a 10 Mb/s Ethernet: a cloud may
   drop what the guest sends for a while after its card starts, and the guest has no signal
   when the path opens. On Azure (item 1.11c's trace) the host completed the first DISCOVER with
   success and dropped it, sent no indication, and the first frame came in 2.7 s later; its
