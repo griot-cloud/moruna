@@ -5,7 +5,7 @@
 //! of its ring mode, step for step: `pipelined`, `feed`, `take_oldest`, `answers`, `part`,
 //! `output`, `land`, `join`, `join_ready`, `gather`, `step`, `wait_any` and `finish`, on the
 //! stage's own layout (`moruna_micro::layout`: `IN_FLIGHT`, `WINDOWS`, `QUEUED_MAX`, `cut`,
-//! `to_post`, `holds_worker`, `keep_in_place`).
+//! `to_post`, `answers_whole`, `waits_for_answer`, `keep_in_place`).
 //!
 //! Its tasks are threads, as `images/gate/tasks` runs on `moruna_sys::plane::Rings`: a region of
 //! `IN_FLIGHT + 1` pieces and `WINDOWS` windows; each batch answered in turn with its records,
@@ -369,6 +369,8 @@ struct Ring {
     in_flight: VecDeque<u64>,
     queued: VecDeque<RecordBatch>,
     applying: bool,
+    /// The unit under way answers its whole morsel: the stage's first (6.3j).
+    whole: bool,
     ready: VecDeque<Payload>,
     taking: Option<Taking>,
     early: VecDeque<Seen>,
@@ -569,6 +571,7 @@ impl Ring {
             let pieces = self.pieces(batch)?;
             self.queued.extend(pieces);
             self.applying = true;
+            self.whole = layout::answers_whole(self.schema.is_some());
         }
         if self.taking.is_some() {
             let answer = self.take_oldest()?;
@@ -594,7 +597,7 @@ impl Ring {
                 came = true;
             }
             self.feed()?;
-            if layout::holds_worker(self.queued.len()) {
+            if layout::waits_for_answer(self.queued.len(), self.in_flight.len(), self.whole) {
                 let answer = self.take_oldest()?;
                 self.ready.push_back(answer);
                 self.feed()?;
@@ -617,6 +620,7 @@ impl Ring {
             _ => self.join_ready()?,
         };
         self.applying = false;
+        self.whole = false;
         Ok(answer)
     }
 
@@ -819,6 +823,7 @@ impl Kernel for NativeStage {
             in_flight: VecDeque::new(),
             queued: VecDeque::new(),
             applying: false,
+            whole: false,
             ready: VecDeque::new(),
             taking: None,
             early: VecDeque::new(),
