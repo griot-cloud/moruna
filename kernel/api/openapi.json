@@ -190,6 +190,28 @@
             "description": "The first 16 hex characters of the SHA-256 of the public bytes of the key whose signature\nverified, as the audit record names a token key.",
             "type": "string"
           },
+          "measured": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Measured"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Its memory as it was measured, when it has been (system design 3A): what a job that\nuses it is sized from."
+          },
+          "measured_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MeasuredBy"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whose that measurement is; absent with it."
+          },
           "name": {
             "description": "The name a job names it by.",
             "type": "string"
@@ -221,6 +243,17 @@
           "address": {
             "description": "Where the image file is fetched from at job start: an `https://` URL. An object store's\nprivate object is given as a pre-signed or SAS URL.",
             "type": "string"
+          },
+          "measured": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Measured"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The function's memory as its client measured it (`moruna check`'s warm-up), when it did\n(system design 3A). It is outside the signature: it says how the function behaves, not\nwhat it is, and the node's own readings replace it."
           },
           "name": {
             "description": "The name a job names the function by (a version 1 `kernels` entry\n`{\"kind\": \"function\", \"function\": \"<name>\"}`, a version 2 task of kind `function`): 1 to 64\ncharacters, a lowercase letter first, then lowercase letters, digits, `_`, `-` and `.`.",
@@ -594,6 +627,77 @@
           "jobs"
         ],
         "type": "object"
+      },
+      "Measured": {
+        "additionalProperties": false,
+        "description": "A function's own memory as it was measured (system design 3A): what one instance holds\noutside its batch, as a line over the batch's bytes, and what it gives per byte it takes,\nwith the units and the range of input the line was fitted from. `moruna check`'s warm-up\nfits it, a registration may carry it, and the node's own readings replace it. A job that\nuses the function is sized from it; the function's account still bounds what it may hold.\nUnknown fields are refused.",
+        "properties": {
+          "fixed_bytes": {
+            "description": "Bytes held whatever the batch: the line's value at no input.",
+            "format": "double",
+            "type": "number"
+          },
+          "input_bytes_max": {
+            "description": "The largest.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "input_bytes_min": {
+            "description": "The smallest input among them, in bytes.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_per_input_byte": {
+            "description": "Bytes out per byte in, the median over the units; absent when no unit said.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "per_input_byte": {
+            "description": "Bytes held beside each byte of the input batch: the line's slope.",
+            "format": "double",
+            "type": "number"
+          },
+          "spread": {
+            "description": "The spread of the units about the line: the root mean square of each unit's departure,\nits measured bytes over the line's value there, less one. The margin a job is sized\nwith is 1.645 times it.",
+            "format": "double",
+            "type": "number"
+          },
+          "units": {
+            "description": "Units the line was fitted from.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "fixed_bytes",
+          "per_input_byte",
+          "spread",
+          "units",
+          "input_bytes_min",
+          "input_bytes_max"
+        ],
+        "type": "object"
+      },
+      "MeasuredBy": {
+        "description": "Whose a function's measured memory is.",
+        "oneOf": [
+          {
+            "const": "registration",
+            "description": "The registration's: what its client measured before registering.",
+            "type": "string"
+          },
+          {
+            "const": "node",
+            "description": "The node's own reading, from jobs that ran the function here. It replaces a\nregistration's.",
+            "type": "string"
+          }
+        ]
       },
       "Node": {
         "description": "The node document, the answer to `GET /v1/node`.",

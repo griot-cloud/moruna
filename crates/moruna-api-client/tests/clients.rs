@@ -123,6 +123,7 @@ fn rust_client_registers_and_lists_functions() {
         address: "https://images.example.com/gate-score".to_string(),
         sha256: "ab".repeat(32),
         signature: signed(&node.function_key),
+        measured: None,
     };
     let function = admin.functions_register(&registration).unwrap();
     assert_eq!(
@@ -160,6 +161,29 @@ fn rust_client_registers_and_lists_functions() {
         ..registration.clone()
     };
     assert!(admin.functions_register(&other_image).is_err());
+    // 3A: a registration may carry the function's measured memory; the node answers with it
+    // and whose it is, and lists it.
+    let measured = moruna_api::Measured {
+        fixed_bytes: 1_310_720.0,
+        per_input_byte: 0.054,
+        output_per_input_byte: Some(0.21),
+        spread: 0.02,
+        units: 21,
+        input_bytes_min: 149_000,
+        input_bytes_max: 33_525_000,
+    };
+    let with = moruna_api::FunctionRegistration {
+        measured: Some(measured.clone()),
+        ..registration.clone()
+    };
+    let function = admin.functions_register(&with).unwrap();
+    assert_eq!(function.measured.as_ref(), Some(&measured));
+    assert_eq!(
+        function.measured_by,
+        Some(moruna_api::MeasuredBy::Registration)
+    );
+    let listed = client(&node, Scope::Observe).functions_list().unwrap();
+    assert_eq!(listed.functions, [function]);
     let plain = moruna_api::FunctionRegistration {
         address: "http://images.example.com/gate-score".to_string(),
         ..registration

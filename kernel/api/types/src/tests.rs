@@ -535,6 +535,54 @@ fn a_function_and_its_registration_round_trip_3e() {
     assert_eq!(functions.functions[0].registered, 1794931200);
     let none: Functions = round_trip(r#"{"functions":[]}"#);
     assert!(none.functions.is_empty());
+    assert_eq!(
+        (registration.measured, &functions.functions[0].measured),
+        (None, &None),
+        "a function nothing was measured of carries none"
+    );
+}
+
+/// System design 3A, 3E (6.3g): a registration may carry the function's measured memory, and a
+/// listed function shows it and whose it is.
+#[test]
+fn a_function_s_measured_memory_round_trips_and_is_checked_3a() {
+    let measured = r#"{"fixed_bytes":1310720.0,"per_input_byte":0.054,"output_per_input_byte":0.21,"spread":0.02,"units":21,"input_bytes_min":149000,"input_bytes_max":33525000}"#;
+    let registration: FunctionRegistration = round_trip(&format!(
+        r#"{{"name":"gate-score","address":"https://example.com/gate-score","sha256":"ab","signature":"c2ln","measured":{measured}}}"#
+    ));
+    let carried = registration.measured.expect("carried");
+    assert_eq!((carried.per_input_byte, carried.units), (0.054, 21));
+    assert_eq!(carried.refusal(), None);
+    let functions: Functions = round_trip(&format!(
+        r#"{{"functions":[{{"name":"gate-score","address":"https://images.example.com/gate-score","sha256":"ab","key":"0123456789abcdef","registered":1794931200,"measured":{measured},"measured_by":"node"}}]}}"#
+    ));
+    assert_eq!(functions.functions[0].measured_by, Some(MeasuredBy::Node));
+    assert_eq!(functions.functions[0].measured.as_ref(), Some(&carried));
+    let by: MeasuredBy = round_trip(r#""registration""#);
+    assert_eq!(by, MeasuredBy::Registration);
+    // No output said: the member is absent, and a term left out or added is refused.
+    let quiet: Measured = round_trip(
+        r#"{"fixed_bytes":0.0,"per_input_byte":0.0,"spread":0.0,"units":1,"input_bytes_min":1,"input_bytes_max":1}"#,
+    );
+    assert_eq!(quiet.output_per_input_byte, None);
+    assert!(refused::<Measured>(r#"{"fixed_bytes":1.0}"#).contains("per_input_byte"));
+    assert!(
+        refused::<Measured>(&measured.replace("\"units\"", "\"runs\":1,\"units\""))
+            .contains("runs")
+    );
+    // What is not a measurement of memory says why.
+    let not = |change: fn(&mut Measured)| {
+        let mut measured = carried.clone();
+        change(&mut measured);
+        measured.refusal().expect("refused")
+    };
+    assert!(not(|m| m.fixed_bytes = -1.0).contains("finite"));
+    assert!(not(|m| m.per_input_byte = f64::NAN).contains("finite"));
+    assert!(not(|m| m.spread = f64::INFINITY).contains("finite"));
+    assert!(not(|m| m.output_per_input_byte = Some(-0.5)).contains("finite"));
+    assert!(not(|m| m.units = 0).contains("units"));
+    assert!(not(|m| m.input_bytes_min = 0).contains("range"));
+    assert!(not(|m| m.input_bytes_max = 1).contains("range"));
 }
 
 /// A container SAS as Azure writes one, every value fake: its `sig` is the credential.
@@ -600,6 +648,8 @@ fn a_function_is_shown_and_debugged_without_its_query_3e() {
         sha256: "ab".to_string(),
         key: "0123456789abcdef".to_string(),
         registered: 1794931200,
+        measured: None,
+        measured_by: None,
     };
     let shown = function.shown();
     assert_eq!(
@@ -625,6 +675,7 @@ fn a_function_is_shown_and_debugged_without_its_query_3e() {
         address: function.address.clone(),
         sha256: "ab".to_string(),
         signature: "c2ln".to_string(),
+        measured: None,
     };
     let debug = format!("{registration:?}");
     assert!(

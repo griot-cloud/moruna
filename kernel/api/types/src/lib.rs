@@ -484,9 +484,79 @@ pub fn address_shown(address: &str) -> String {
     format!("{scheme}{host}{path}{query}")
 }
 
+/// A function's own memory as it was measured (system design 3A): what one instance holds
+/// outside its batch, as a line over the batch's bytes, and what it gives per byte it takes,
+/// with the units and the range of input the line was fitted from. `moruna check`'s warm-up
+/// fits it, a registration may carry it, and the node's own readings replace it. A job that
+/// uses the function is sized from it; the function's account still bounds what it may hold.
+/// Unknown fields are refused.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Measured {
+    /// Bytes held whatever the batch: the line's value at no input.
+    pub fixed_bytes: f64,
+    /// Bytes held beside each byte of the input batch: the line's slope.
+    pub per_input_byte: f64,
+    /// Bytes out per byte in, the median over the units; absent when no unit said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_per_input_byte: Option<f64>,
+    /// The spread of the units about the line: the root mean square of each unit's departure,
+    /// its measured bytes over the line's value there, less one. The margin a job is sized
+    /// with is 1.645 times it.
+    pub spread: f64,
+    /// Units the line was fitted from.
+    pub units: u64,
+    /// The smallest input among them, in bytes.
+    pub input_bytes_min: u64,
+    /// The largest.
+    pub input_bytes_max: u64,
+}
+
+impl Measured {
+    /// Why this is not a measurement of memory, when it is not one: an amount or a rate that
+    /// is negative or not finite, no units, or a range of input that is not one.
+    pub fn refusal(&self) -> Option<&'static str> {
+        let amounts = [
+            self.fixed_bytes,
+            self.per_input_byte,
+            self.spread,
+            self.output_per_input_byte.unwrap_or(0.0),
+        ];
+        if amounts.iter().any(|a| !a.is_finite() || *a < 0.0) {
+            return Some(
+                "fixed_bytes, per_input_byte, output_per_input_byte and spread are finite \
+                 amounts of zero or more",
+            );
+        }
+        if self.units == 0 {
+            return Some("units is how many measured units the line was fitted from, at least 1");
+        }
+        if self.input_bytes_min == 0 || self.input_bytes_min > self.input_bytes_max {
+            return Some(
+                "input_bytes_min and input_bytes_max are the range of input the units covered, \
+                 from 1 byte up",
+            );
+        }
+        None
+    }
+}
+
+/// Whose a function's measured memory is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MeasuredBy {
+    /// The registration's: what its client measured before registering.
+    Registration,
+    /// The node's own reading, from jobs that ran the function here. It replaces a
+    /// registration's.
+    Node,
+}
+
 /// A function image to register, the body of `POST /v1/functions` (system design 3E). Unknown
 /// fields are refused.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct FunctionRegistration {
@@ -502,6 +572,11 @@ pub struct FunctionRegistration {
     /// An Ed25519 signature over the 32 bytes of that SHA-256, by one of node config's
     /// `functions.keys`, in standard base64.
     pub signature: String,
+    /// The function's memory as its client measured it (`moruna check`'s warm-up), when it did
+    /// (system design 3A). It is outside the signature: it says how the function behaves, not
+    /// what it is, and the node's own readings replace it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured: Option<Measured>,
 }
 
 impl fmt::Debug for FunctionRegistration {
@@ -512,12 +587,13 @@ impl fmt::Debug for FunctionRegistration {
             .field("address", &address_shown(&self.address))
             .field("sha256", &self.sha256)
             .field("signature", &self.signature)
+            .field("measured", &self.measured)
             .finish()
     }
 }
 
 /// A registered function, as `GET /v1/functions` lists it.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
 pub struct Function {
     /// The name a job names it by.
@@ -532,6 +608,13 @@ pub struct Function {
     pub key: String,
     /// When it was registered, in Unix seconds.
     pub registered: u64,
+    /// Its memory as it was measured, when it has been (system design 3A): what a job that
+    /// uses it is sized from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured: Option<Measured>,
+    /// Whose that measurement is; absent with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_by: Option<MeasuredBy>,
 }
 
 impl Function {
@@ -553,12 +636,14 @@ impl fmt::Debug for Function {
             .field("sha256", &self.sha256)
             .field("key", &self.key)
             .field("registered", &self.registered)
+            .field("measured", &self.measured)
+            .field("measured_by", &self.measured_by)
             .finish()
     }
 }
 
 /// The answer to `GET /v1/functions`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
 pub struct Functions {
     /// Every registered function, by name.

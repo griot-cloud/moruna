@@ -71,6 +71,12 @@ def _int(value: Any, where: str, low: int | None, high: int | None) -> int:
     return value
 
 
+def _float(value: Any, where: str) -> float:
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        raise ValueError(f"{where}: expected a number, found {type(value).__name__}")
+    return float(value)
+
+
 def _strings(value: Any, where: str) -> dict[str, str]:
     return {key: _str(item, f"{where}.{key}") for key, item in _object(value, where).items()}
 
@@ -319,6 +325,14 @@ class Function:
     registered: int
     """When it was registered, in Unix seconds."""
 
+    measured: Measured | None = None
+    """Its memory as it was measured, when it has been (system design 3A): what a job that uses it
+    is sized from.
+    """
+
+    measured_by: MeasuredBy | None = None
+    """Whose that measurement is; absent with it."""
+
     @classmethod
     def from_json(cls, value: Any, where: str = "Function") -> Function:
         """Read an answer's JSON value; a ``ValueError`` says where it is wrong."""
@@ -329,17 +343,24 @@ class Function:
             sha256=_str(*_at(data, "sha256", where)),
             key=_str(*_at(data, "key", where)),
             registered=_int(*_at(data, "registered", where), 0, None),
+            measured=_maybe(data, "measured", where, lambda at: Measured.from_json(*at)),
+            measured_by=_maybe(data, "measured_by", where, lambda at: _enum(MeasuredBy, *at)),
         )
 
     def to_json(self) -> dict[str, Any]:
         """The JSON value, as the node writes it."""
-        return {
+        data: dict[str, Any] = {
             "name": self.name,
             "address": self.address,
             "sha256": self.sha256,
             "key": self.key,
             "registered": self.registered,
         }
+        if self.measured is not None:
+            data["measured"] = self.measured.to_json()
+        if self.measured_by is not None:
+            data["measured_by"] = self.measured_by.value
+        return data
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,6 +388,12 @@ class FunctionRegistration:
     `functions.keys`, in standard base64.
     """
 
+    measured: Measured | None = None
+    """The function's memory as its client measured it (`moruna check`'s warm-up), when it did
+    (system design 3A). It is outside the signature: it says how the function behaves, not what
+    it is, and the node's own readings replace it.
+    """
+
     @classmethod
     def from_json(cls, value: Any, where: str = "FunctionRegistration") -> FunctionRegistration:
         """Read an answer's JSON value; a ``ValueError`` says where it is wrong."""
@@ -376,16 +403,20 @@ class FunctionRegistration:
             address=_str(*_at(data, "address", where)),
             sha256=_str(*_at(data, "sha256", where)),
             signature=_str(*_at(data, "signature", where)),
+            measured=_maybe(data, "measured", where, lambda at: Measured.from_json(*at)),
         )
 
     def to_json(self) -> dict[str, Any]:
         """The JSON value, as the node writes it."""
-        return {
+        data: dict[str, Any] = {
             "name": self.name,
             "address": self.address,
             "sha256": self.sha256,
             "signature": self.signature,
         }
+        if self.measured is not None:
+            data["measured"] = self.measured.to_json()
+        return data
 
 
 @dataclass(frozen=True, slots=True)
@@ -724,6 +755,85 @@ class Jobs:
         return {
             "jobs": [item.to_json() for item in self.jobs],
         }
+
+
+@dataclass(frozen=True, slots=True)
+class Measured:
+    """A function's own memory as it was measured (system design 3A): what one instance holds
+    outside its batch, as a line over the batch's bytes, and what it gives per byte it takes,
+    with the units and the range of input the line was fitted from. `moruna check`'s warm-up fits
+    it, a registration may carry it, and the node's own readings replace it. A job that uses the
+    function is sized from it; the function's account still bounds what it may hold. Unknown
+    fields are refused.
+    """
+
+    fixed_bytes: float
+    """Bytes held whatever the batch: the line's value at no input."""
+
+    per_input_byte: float
+    """Bytes held beside each byte of the input batch: the line's slope."""
+
+    spread: float
+    """The spread of the units about the line: the root mean square of each unit's departure, its
+    measured bytes over the line's value there, less one. The margin a job is sized with is 1.645
+    times it.
+    """
+
+    units: int
+    """Units the line was fitted from."""
+
+    input_bytes_min: int
+    """The smallest input among them, in bytes."""
+
+    input_bytes_max: int
+    """The largest."""
+
+    output_per_input_byte: float | None = None
+    """Bytes out per byte in, the median over the units; absent when no unit said."""
+
+    @classmethod
+    def from_json(cls, value: Any, where: str = "Measured") -> Measured:
+        """Read an answer's JSON value; a ``ValueError`` says where it is wrong."""
+        data = _object(value, where)
+        return cls(
+            fixed_bytes=_float(*_at(data, "fixed_bytes", where)),
+            per_input_byte=_float(*_at(data, "per_input_byte", where)),
+            spread=_float(*_at(data, "spread", where)),
+            units=_int(*_at(data, "units", where), 0, None),
+            input_bytes_min=_int(*_at(data, "input_bytes_min", where), 0, None),
+            input_bytes_max=_int(*_at(data, "input_bytes_max", where), 0, None),
+            output_per_input_byte=_maybe(
+                data,
+                "output_per_input_byte",
+                where,
+                lambda at: _float(*at),
+            ),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        """The JSON value, as the node writes it."""
+        data: dict[str, Any] = {
+            "fixed_bytes": self.fixed_bytes,
+            "per_input_byte": self.per_input_byte,
+            "spread": self.spread,
+            "units": self.units,
+            "input_bytes_min": self.input_bytes_min,
+            "input_bytes_max": self.input_bytes_max,
+        }
+        if self.output_per_input_byte is not None:
+            data["output_per_input_byte"] = self.output_per_input_byte
+        return data
+
+
+class MeasuredBy(StrEnum):
+    """Whose a function's measured memory is."""
+
+    REGISTRATION = "registration"
+    """The registration's: what its client measured before registering."""
+
+    NODE = "node"
+    """The node's own reading, from jobs that ran the function here. It replaces a registration's.
+    """
 
 
 @dataclass(frozen=True, slots=True)

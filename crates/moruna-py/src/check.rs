@@ -147,10 +147,9 @@ pub fn check_kernel(
                 cost_settings,
             )?;
             if let Some(warm) = &mut opts.warm_up {
-                warm.settings = moruna_runtime::cost::registration_settings(
-                    opts.kind,
-                    &serde_json::Value::Null,
-                );
+                // The identity a run that holds this function costs it under, so the run finds
+                // what this check measures (system design 3A).
+                warm.settings = moruna_runtime::cost::held_function(opts.kind, None).settings;
             }
             check(target, opts)
         })

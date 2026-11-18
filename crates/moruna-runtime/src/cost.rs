@@ -288,6 +288,54 @@ pub fn declared_schema(kernel: &dyn moruna_kernel::Kernel) -> Option<moruna_cost
     ))
 }
 
+/// The identity a function this process holds is costed under (system design 3A; item 6.3g):
+/// its kind, the kernel's own fingerprint (`fingerprint: None`), and no settings but its
+/// params, when it has any. It is what `moruna check` keeps a function's warm-up against, so a
+/// run that holds the function finds what its check measured. An image task's build key, digest
+/// and location say where the function is packaged, not what it is, and a check knows none.
+pub fn held_function(
+    kind: &str,
+    params: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> StageCost {
+    let settings = match params.filter(|params| !params.is_empty()) {
+        Some(params) => serde_json::json!({ "params": params }),
+        None => serde_json::Value::Null,
+    };
+    StageCost {
+        kind: kind.to_string(),
+        settings: registration_settings(kind, &settings),
+        fingerprint: None,
+    }
+}
+
+/// [`stage_identities`], with each stage whose function this process holds (`held[stage]`: a
+/// library run's Python function, the object itself and not an image of it) kept as
+/// [`held_function`] keeps it. A stage of several tasks fused into one is its own work and
+/// keeps the stage's identity.
+pub fn identities_holding(
+    job: &moruna_job::Job,
+    parts: &crate::job::Parts,
+    held: &[bool],
+) -> Result<Vec<StageCost>> {
+    let mut stages = stage_identities(job, parts)?;
+    for (at, members) in parts.stages.iter().enumerate() {
+        if held.get(at) != Some(&true) {
+            continue;
+        }
+        if let [task] = members.as_slice()
+            && let Some(task) = job.tasks.get(*task)
+        {
+            stages[at] = held_function(
+                &task.kind,
+                task.settings
+                    .get("params")
+                    .and_then(serde_json::Value::as_object),
+            );
+        }
+    }
+    Ok(stages)
+}
+
 /// One live model/store authority and the stages whose real measurements teach it.
 #[derive(Clone)]
 pub struct RunLearning {
@@ -694,6 +742,75 @@ mod measured_tests {
         // The stages are the kernels', or it is refused.
         assert!(learning(identity(2, None)).measured(&[]).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A function this process holds is costed as its check keeps it: by its kind and its
+    /// own fingerprint, with its params when it has any, whatever its image task's settings
+    /// say of where it is packaged.
+    #[test]
+    fn a_function_this_process_holds_is_costed_as_its_check_keeps_it() {
+        use moruna_job::{Edge, Job, KindDoc, Task};
+        let settings = |value: serde_json::Value| match value {
+            serde_json::Value::Object(map) => map,
+            _ => panic!("an object"),
+        };
+        let image = |params: serde_json::Value| {
+            let mut doc = settings(serde_json::json!({
+                "image": {"build_key": format!("sha256:{}", "ab".repeat(32)),
+                          "digest": null, "location": null},
+                "entry": "jobs:score",
+            }));
+            if !params.is_null() {
+                doc.insert("params".into(), params);
+            }
+            KindDoc::new("image", doc)
+        };
+        let job = Job::new(
+            vec![
+                Task::source("rows", KindDoc::new("parquet", serde_json::Map::new())),
+                Task::kernel("score", image(serde_json::Value::Null)),
+                Task::kernel("scale", image(serde_json::json!({"by": 2}))),
+                Task::sink("out", KindDoc::new("parquet", serde_json::Map::new())),
+            ],
+            vec![
+                Edge::new("rows", "out", "score", "in"),
+                Edge::new("score", "out", "scale", "in"),
+                Edge::new("scale", "out", "out", "in"),
+            ],
+        );
+        let parts = crate::job::Parts {
+            sources: vec![0],
+            stages: vec![vec![1], vec![2]],
+            sinks: vec![3],
+        };
+        let by_job = stage_identities(&job, &parts).expect("the job's");
+        assert!(by_job[0].fingerprint.is_some(), "the image's build key");
+
+        // What a check of the function keeps it against: its kind, no settings.
+        let checked = registration_settings("image", &serde_json::Value::Null);
+        let held = identities_holding(&job, &parts, &[true, true]).expect("held");
+        assert_eq!(held[0].kind, "image");
+        assert_eq!(held[0].settings, checked);
+        assert_eq!(held[0].fingerprint, None, "the kernel's own stands");
+        assert_eq!(held[0].settings, held_function("image", None).settings);
+        // Params are part of what the function is; other settings are not.
+        assert_ne!(held[1].settings, checked);
+        assert_ne!(held[1].settings, by_job[1].settings);
+
+        // A stage the process does not hold keeps the job's identity, and so does a fused one.
+        let some = identities_holding(&job, &parts, &[false, true]).expect("held");
+        assert_eq!(some[0].settings, by_job[0].settings);
+        assert_eq!(some[0].fingerprint, by_job[0].fingerprint);
+        let fused = crate::job::Parts {
+            stages: vec![vec![1, 2]],
+            ..parts.clone()
+        };
+        let one = identities_holding(&job, &fused, &[true]).expect("held");
+        assert_eq!(one[0].kind, "fused");
+        assert_eq!(
+            identities_holding(&job, &parts, &[]).expect("none held")[1].settings,
+            by_job[1].settings
+        );
     }
 
     /// A store that keeps one history, as it is, or cannot be read.

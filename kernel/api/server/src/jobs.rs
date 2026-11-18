@@ -14,10 +14,18 @@ use crate::{
     json::{Secrets, compact, is_object},
     token::base64,
 };
-use alloc::{boxed::Box, collections::VecDeque, format, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::{BTreeMap, VecDeque},
+    format,
+    string::String,
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
 use moruna_api::{
-    EVENTS_PAGE, EVENTS_PAGE_BYTES, ErrorCode, Heartbeat, Job, JobState, JobStatus, JobSummary,
-    Jobs as JobList, Refusal, Submitted, Validation,
+    EVENTS_PAGE, EVENTS_PAGE_BYTES, ErrorCode, Function, Heartbeat, Job, JobState, JobStatus,
+    JobSummary, Jobs as JobList, Measured, Refusal, Submitted, Validation,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -205,6 +213,23 @@ impl Parsed {
             Some(rest) => base64(rest.trim_end_matches('"').as_bytes()).unwrap_or_default(),
             None => self.spec.clone().into_bytes(),
         }
+    }
+}
+
+/// The `spec` message `spec` with the measured memory of the functions the job uses beside the
+/// document, by each one's registered name: its `measured` member, for those of `registered`
+/// the registry holds a measurement of (system design 3A, 3E). The engine sizes the job from
+/// it. A job none of whose functions was measured is sent as it is.
+fn with_measured(spec: &str, registered: &[Function]) -> String {
+    let measured: BTreeMap<&str, &Measured> = registered
+        .iter()
+        .filter_map(|function| Some((function.name.as_str(), function.measured.as_ref()?)))
+        .collect();
+    match (spec.strip_suffix("}\n"), serde_json::to_string(&measured)) {
+        (Some(head), Ok(named)) if !measured.is_empty() => {
+            format!("{head},\"measured\":{named}}}\n")
+        }
+        _ => String::from(spec),
     }
 }
 
@@ -412,6 +437,7 @@ impl Jobs {
         let Some(spec) = check.spec.as_deref() else {
             return;
         };
+        let spec = with_measured(spec, &verdict.registered);
         let started = host.start(spec.as_bytes(), verdict);
         let ticket = check.wanted.then_some(check.ticket);
         if let Err(error) = started {

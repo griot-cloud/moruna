@@ -591,7 +591,10 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
     observation store, by the function and its declared input, and sizes its arena from that before
     any source is built. A measurement stands over what the function declares; a function measured
     to hold less than the controller's least (half a byte per byte in flight) is sized at that
-    least, which the controller holds back whatever it measures.
+    least, which the controller holds back whatever it measures. A Python function a run holds
+    (`moruna.run` given the function itself) is costed under the function's own fingerprint, as
+    its check keeps it, not under its image task's build key and settings: the run finds its
+    check's measurement, and one history serves both (6.3g phase 2: they never met before).
 - **Memory on a node is computed, never a constant.** Each service has a fixed account in node.conf
   except `node-admission`, which takes `rest`: node memory less every other account and the kernel's
   share. Jobs and checks are carved from it. The job bound is admission's account less the 256 MiB
@@ -701,8 +704,17 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
   - The node checks the signature and stores the entry. `GET /v1/functions` (observe) lists them.
     Nothing is fetched at registration.
   - An optional `measured` member carries the function's memory facts as its warm-up fitted them
-    (3A). It is outside the signature: it describes behaviour, not identity, and the node's own
-    readings override it. `GET /v1/functions` shows each function's facts and whose they are.
+    (3A): `fixed_bytes`, `per_input_byte`, `output_per_input_byte`, `spread`, `units`,
+    `input_bytes_min` and `input_bytes_max`. It is outside the signature: it describes behaviour,
+    not identity, and the node's own readings override it. What is not a measurement (a negative
+    or non-finite amount, no units, no range) is refused. `GET /v1/functions` shows each
+    function's `measured` and `measured_by` (`registration` or `node`). A measurement is of the
+    image: the same image registered again with none keeps it, another image starts without.
+  - **To the engine and back** (PM, 2026-11-18): at job start `api` sends the measured memory of
+    the functions the job uses in the `spec` message's `measured` member, by registered name,
+    beside `secrets` and like them outside the document and its digest. The engine sizes its
+    arena from it (3A) and returns it in the report, on the function's task. The node protocol
+    and `node-admission` are unchanged.
 - **At job start,** `node-admission` fetches each function the job names: it mints itself a channel
   limited to the address's host on 443, fetches over HTTPS with the network server's TLS, checks the
   SHA-256, and hands the engine the image as a read-only memory object, with no copy. The node

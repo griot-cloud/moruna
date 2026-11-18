@@ -934,6 +934,7 @@ mod tests {
                 spec: serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap(),
                 plan: None,
                 secrets: Default::default(),
+                measured: Default::default(),
             }
         }
         fn fail_start(&self, admission: Admission<'_>, prepared: PreparedLaunch) -> StartError {
@@ -991,6 +992,7 @@ mod tests {
             ),
             plan: None,
             secrets: Default::default(),
+            measured: Default::default(),
         };
         let authority = run_authority(&key, &v2);
         assert_eq!(
@@ -1003,12 +1005,14 @@ mod tests {
             spec: serde_json::json!({"moruna_spec": 1}),
             plan: None,
             secrets: Default::default(),
+            measured: Default::default(),
         };
         assert_eq!(run_authority(&key, &v1).job_digest, "");
         let garbled = Inbound::Spec {
             spec: serde_json::Value::String("not base64!".into()),
             plan: None,
             secrets: Default::default(),
+            measured: Default::default(),
         };
         assert_eq!(run_authority(&key, &garbled).job_digest, "");
     }

@@ -1112,6 +1112,81 @@ fn a_submit_is_checked_and_started_with_the_checks_budget_and_needs() {
         serde_json::to_value(jobs.list()).unwrap()["jobs"][0]["id"],
         json!(RUN)
     );
+    // Nothing was measured of the function: the document is sent as it came.
+    let sent = engine.0.borrow().started.last().cloned().unwrap();
+    assert!(!sent.contains("measured"), "{sent}");
+}
+
+/// System design 3A, 3E (6.3g): the measured memory of the functions a job uses goes to the
+/// engine in the `spec` message, beside the document and the secrets, by registered name.
+#[test]
+fn the_spec_carries_the_measured_memory_of_the_functions_the_job_uses() {
+    let measured = |units: u64| {
+        json!({"fixed_bytes": 1310720.0, "per_input_byte": 0.054, "spread": 0.02,
+               "units": units, "input_bytes_min": 149000, "input_bytes_max": 33525000})
+    };
+    let signer = crate::signer::Signer::new();
+    let mut registry = Registry::new(vec![crate::FunctionKey::new(signer.public())]);
+    let mut register = |name: &str, measured: Option<Value>| {
+        let image = alloc::format!("\x7fELF {name}");
+        let address = alloc::format!("https://images.example.com/{name}");
+        let mut body: Value = serde_json::from_str(&crate::signer::registration(
+            name,
+            &address,
+            image.as_bytes(),
+            &signer,
+        ))
+        .unwrap();
+        if let Some(measured) = measured {
+            body["measured"] = measured;
+        }
+        assert_eq!(
+            registry
+                .register(body.to_string().as_bytes(), NOW / 1_000)
+                .status,
+            201
+        );
+    };
+    register("taxi.clean", Some(measured(21)));
+    register("taxi.score", None);
+    register("taxi.audit", Some(measured(40)));
+
+    let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
+    engine.0.borrow_mut().needs.1.functions = vec!["taxi.score".into(), "taxi.clean".into()];
+    jobs.submit(
+        br#"{"v1": {"moruna_spec": 1, "source": {"kind": "rows", "rows": 1000},
+            "sink": {"kind": "count"}}, "secrets": {"aws.key": "hunter2"}}"#,
+    )
+    .unwrap();
+    jobs.pump(&mut engine, &registry, NOW);
+    jobs.pump(&mut engine, &registry, NOW);
+    let sent = engine.0.borrow().started.last().cloned().expect("started");
+    assert!(
+        sent.ends_with("}\n") && !sent[..sent.len() - 1].contains('\n'),
+        "one line"
+    );
+    let message: Value = serde_json::from_str(&sent).expect("JSON");
+    assert_eq!(message["type"], "spec");
+    assert_eq!(message["spec"]["moruna_spec"], 1);
+    assert_eq!(message["secrets"], json!({"aws.key": "hunter2"}));
+    // The function the job uses that was measured, and no other: not the one it uses that was
+    // not, nor the one that was and that it does not use.
+    assert_eq!(message["measured"], json!({"taxi.clean": measured(21)}));
+
+    // The helper alone: every measured function of the job's, and a message left as it is.
+    let both = registry.registered(&["taxi.clean".to_string(), "taxi.audit".to_string()]);
+    let line = with_measured("{\"type\":\"spec\",\"spec\":{}}\n", &both);
+    let message: Value = serde_json::from_str(&line).expect("JSON");
+    assert_eq!(
+        message["measured"],
+        json!({"taxi.audit": measured(40), "taxi.clean": measured(21)})
+    );
+    let none = registry.registered(&["taxi.score".to_string()]);
+    assert_eq!(
+        with_measured("{\"type\":\"spec\",\"spec\":{}}\n", &none),
+        "{\"type\":\"spec\",\"spec\":{}}\n"
+    );
+    assert_eq!(with_measured("not a spec line", &both), "not a spec line");
 }
 
 /// A job the node refuses once its launch was asked (item 3.6: a function changed since it was

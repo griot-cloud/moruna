@@ -2063,6 +2063,7 @@ fn run_vm(
                 spec,
                 plan,
                 secrets: Default::default(),
+                measured: Default::default(),
             },
             deadline,
             &devices,

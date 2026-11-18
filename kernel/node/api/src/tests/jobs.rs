@@ -100,6 +100,8 @@ fn taxi_clean() -> Function {
         sha256: "ab".repeat(32),
         key: "0123456789abcdef".into(),
         registered: 0,
+        measured: None,
+        measured_by: None,
     }
 }
 

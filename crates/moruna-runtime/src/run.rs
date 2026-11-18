@@ -132,6 +132,7 @@ fn drive(
         checkpoint_keep,
         resume,
         resume_auto,
+        measured: carried,
         notes: spec_notes,
         spec_digest,
     } = spec;
@@ -377,7 +378,7 @@ fn drive(
     // check kept it against, which is known before any source is built, so the room above the
     // arena is sized from it here. A store that cannot be read sizes nothing: the run says so
     // and goes on as for functions nothing is known of.
-    let measured = match &components.learning {
+    let found = match &components.learning {
         Some(learning) => learning.measured(&kernels).unwrap_or_else(|error| {
             notes.push(format!(
                 "the functions' measured memory could not be read ({error}), so the run is \
@@ -387,6 +388,9 @@ fn drive(
         }),
         None => vec![None; kernels.len()],
     };
+    // What the job came with stands first (on a node, the registry's, in the `spec` message:
+    // system design 3E); the run's own store answers for a stage that came with none.
+    let measured = with_carried(carried, found, &mut notes);
     let outside = out_of_arena(&kernels, &measured, workers_start, &mut notes);
     let kernel_state = expected_kernel_state(&kernels).saturating_add(outside.fixed_bytes);
     let sizing = Sizing {
@@ -1685,6 +1689,36 @@ fn expected_out_of_arena_amplification(kernels: &[Arc<dyn moruna_kernel::Kernel>
 /// the arena two thirds of what the shares leave.
 const COPY_OUT_OF_ARENA_AMPLIFICATION: f64 = 1.0;
 
+/// Each stage's measured memory: what the job came with (`carried`, one a stage or none at
+/// all), and for a stage that came with none, what the run's own store holds (`found`). The
+/// stages sized from what the job came with are said in `notes`.
+fn with_carried(
+    carried: Vec<Option<moruna_cost::Memory>>,
+    found: Vec<Option<moruna_cost::Memory>>,
+    notes: &mut Vec<String>,
+) -> Vec<Option<moruna_cost::Memory>> {
+    let mut carried = carried.into_iter();
+    let mut stages = Vec::new();
+    let measured: Vec<Option<moruna_cost::Memory>> = found
+        .into_iter()
+        .enumerate()
+        .map(|(at, found)| match carried.next().flatten() {
+            Some(memory) => {
+                stages.push((at + 1).to_string());
+                Some(memory)
+            }
+            None => found,
+        })
+        .collect();
+    if !stages.is_empty() {
+        notes.push(format!(
+            "the measured memory of the function of stage {} came with the job",
+            stages.join(", ")
+        ));
+    }
+    measured
+}
+
 /// What a chain holds outside the arena, as the run knows it before it sizes anything.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct OutOfArena {
@@ -2264,6 +2298,35 @@ mod tests {
         );
         assert_eq!(out_of_arena(&[], &[], 4, &mut notes).per_byte, 1.0);
         assert!(notes.is_empty());
+
+        // What a job came with stands before what the run's store holds, stage by stage.
+        let line =
+            |rate: f64| moruna_cost::Memory::fit(&[(1e6, rate * 1e6), (2e6, rate * 2e6)], None);
+        let rates = |measured: Vec<Option<moruna_cost::Memory>>| -> Vec<Option<f64>> {
+            measured
+                .iter()
+                .map(|m| m.as_ref().map(|m| m.per_input_byte))
+                .collect()
+        };
+        let mut said = Vec::new();
+        assert_eq!(
+            rates(with_carried(
+                vec![line(3.0), None],
+                vec![line(5.0), line(7.0), None],
+                &mut said
+            )),
+            vec![Some(3.0), Some(7.0), None]
+        );
+        assert_eq!(
+            said,
+            vec!["the measured memory of the function of stage 1 came with the job"]
+        );
+        let mut said = Vec::new();
+        assert_eq!(
+            rates(with_carried(Vec::new(), vec![line(5.0), None], &mut said)),
+            vec![Some(5.0), None]
+        );
+        assert!(said.is_empty());
 
         // Beside a measured stage, a stage nothing is known of still starts at the default.
         let one = moruna_cost::Memory::fit(&[(1e6, 2e6), (2e6, 3e6)], None).expect("fitted");

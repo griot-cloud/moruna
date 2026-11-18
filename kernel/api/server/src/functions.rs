@@ -19,7 +19,9 @@
 
 use crate::{api::Answer, identity::hex, token::base64};
 use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
-use moruna_api::{ErrorCode, Function, FunctionRegistration, Functions, Refusal};
+use moruna_api::{
+    ErrorCode, Function, FunctionRegistration, Functions, Measured, MeasuredBy, Refusal,
+};
 use ring::{
     digest,
     signature::{ED25519, UnparsedPublicKey},
@@ -175,18 +177,38 @@ impl Registry {
                      is made over the 32 bytes of the image's SHA-256",
                 )
             })?;
+        if let Some(why) = given.measured.as_ref().and_then(Measured::refusal) {
+            return Err((
+                ErrorCode::Invalid,
+                format!("measured is not a measurement of the function's memory: {why}"),
+            ));
+        }
         if !self.entries.contains_key(&given.name) && self.entries.len() >= FUNCTIONS_LIMIT {
             return Err((
                 ErrorCode::Conflict,
                 format!("the node holds {FUNCTIONS_LIMIT} functions, the most it keeps"),
             ));
         }
+        // A measurement is of the image (system design 3A): the same image registered again
+        // with none keeps the one it had, and another image starts with what it brings.
+        let (measured, measured_by) = match given.measured {
+            Some(measured) => (Some(measured), Some(MeasuredBy::Registration)),
+            None => self
+                .entries
+                .get(&given.name)
+                .filter(|kept| kept.sha256 == given.sha256)
+                .map_or((None, None), |kept| {
+                    (kept.measured.clone(), kept.measured_by)
+                }),
+        };
         Ok(Function {
             name: given.name,
             address: given.address,
             sha256: given.sha256,
             key: String::from(key.id()),
             registered: now,
+            measured,
+            measured_by,
         })
     }
 

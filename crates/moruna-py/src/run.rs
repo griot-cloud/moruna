@@ -810,6 +810,12 @@ pub fn run(
         .collect();
     let needs = served.unwrap_or_default();
     let served = served_of(py, &assembled.stages);
+    // The kernel tasks whose function this process holds, in the job's order.
+    let held_functions: Vec<bool> = assembled
+        .stages
+        .iter()
+        .map(|stage| matches!(stage, Some(Stage::Py(_))))
+        .collect();
     let given_kernels: Vec<Option<Arc<moruna_adapters::PyKernel>>> = assembled
         .stages
         .iter()
@@ -858,12 +864,35 @@ pub fn run(
         ),
     )?;
     credentials.apply(&mut built.spec.object_store);
+    // A function this process holds is costed as `moruna check` keeps it, by its own
+    // fingerprint and not by its image task's settings, so the run finds what its check
+    // measured (system design 3A, item 6.3g): the learner's keys and the report's alike.
+    let held: Vec<bool> = built
+        .parts
+        .stages
+        .iter()
+        .map(|members| match members.as_slice() {
+            [task] => {
+                let nth = job.tasks[..*task]
+                    .iter()
+                    .filter(|t| t.role == Role::Kernel)
+                    .count();
+                held_functions.get(nth).copied().unwrap_or(false)
+            }
+            _ => false,
+        })
+        .collect();
+    let identities = map(
+        py,
+        moruna_runtime::cost::identities_holding(&job, &built.parts, &held),
+    )?;
     let mut context = Report {
         job_digest,
         context: ReportContext {
             plan: explain.then(|| plan.to_value()),
             trace_path,
             args: run_args.into_iter().collect(),
+            stages: Some(identities.clone()),
             ..ReportContext::of(&job, &built)
         },
     };
@@ -901,6 +930,9 @@ pub fn run(
             ));
         }
         components.learning = Some(learning);
+    }
+    if let Some(learning) = components.learning.as_mut() {
+        learning.stages = identities;
     }
     context.context.store = components
         .learning

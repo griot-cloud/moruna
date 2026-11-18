@@ -73,6 +73,15 @@ pub struct ReportContext {
     /// The observation store the run's learner wrote to, when one is configured: each task's
     /// recommendation draws on every run of its key the store holds.
     pub store: Option<std::sync::Arc<dyn moruna_cost::ObservationStore>>,
+    /// What each stage's function was measured to hold outside its batch, as the job came with
+    /// it, one a stage (system design 3A, 3E): the report returns it on the function's task,
+    /// so a client keeps it past the node's life and sends it with the next registration.
+    pub measured: Vec<Option<moruna_cost::Memory>>,
+    /// The stages' cost identities, when the surface that built the run keeps some otherwise
+    /// than the job's tasks say: a function this process holds, kept as its check keeps it
+    /// ([`crate::cost::identities_holding`]). `None`: the job's own
+    /// ([`crate::cost::stage_identities`]).
+    pub stages: Option<Vec<crate::cost::StageCost>>,
 }
 
 impl ReportContext {
@@ -89,6 +98,8 @@ impl ReportContext {
             task_ports: built.task_ports.clone(),
             identities: built.identities.clone(),
             store: None,
+            measured: built.spec.measured.clone(),
+            stages: None,
         }
     }
 }
@@ -693,10 +704,13 @@ fn tasks(
     notes: &mut Vec<String>,
 ) -> Vec<Value> {
     let job = &context.job;
-    let stages = crate::cost::stage_identities(job, &context.parts).unwrap_or_else(|e| {
-        notes.push(format!("the run's stages have no cost keys: {e}"));
-        Vec::new()
-    });
+    let stages = match &context.stages {
+        Some(stages) => stages.clone(),
+        None => crate::cost::stage_identities(job, &context.parts).unwrap_or_else(|e| {
+            notes.push(format!("the run's stages have no cost keys: {e}"));
+            Vec::new()
+        }),
+    };
     let sink_outcome = |i: usize| {
         let ordinal = context.parts.sinks.iter().position(|&t| t == i)?;
         report.sinks.iter().find(|s| s.sink == ordinal)
@@ -765,7 +779,20 @@ fn tasks(
                         errors = s.errors;
                         ran = s.morsels > 0;
                     }
-                    let _ = stage;
+                    // The function's measured memory as the job came with it (system design
+                    // 3A), on the task that leads its stage.
+                    if members.first() == Some(&i)
+                        && let Some(memory) = context
+                            .measured
+                            .get(usize::from(stage) - 1)
+                            .and_then(Option::as_ref)
+                    {
+                        put(
+                            &mut entry,
+                            "measured",
+                            serde_json::to_value(memory).unwrap_or(Value::Null),
+                        );
+                    }
                 }
             }
             Role::Sink => {
@@ -1041,7 +1068,48 @@ mod tests {
             task_ports: Vec::new(),
             identities: (0..5).map(|i| moruna_cost::Digest([10 + i; 32])).collect(),
             store: None,
+            measured: Vec::new(),
+            stages: None,
         }
+    }
+
+    /// System design 3A, 3E (6.3g): the report returns the measured memory a job came with on
+    /// the task that leads the function's stage, and keys a stage as the surface that built
+    /// the run keeps it.
+    #[test]
+    fn a_function_s_measured_memory_and_its_identity_are_the_report_s() {
+        let r = report(1, 0);
+        let plain = doc(&r, None, &context());
+        assert!(plain["tasks"][1].get("measured").is_none());
+        let job_key = plain["tasks"][1]["observation"]["key"].clone();
+        assert_eq!(job_key["kind"], "fused");
+
+        let memory = moruna_cost::Memory::fit(&[(1e6, 3e6), (2e6, 6e6)], Some(0.5)).expect("fit");
+        let held = crate::cost::StageCost {
+            kind: "image".into(),
+            settings: moruna_cost::Digest([7; 32]),
+            fingerprint: None,
+        };
+        let context = ReportContext {
+            measured: vec![Some(memory.clone())],
+            stages: Some(vec![held]),
+            ..context()
+        };
+        let value = doc(&r, None, &context);
+        assert_eq!(
+            value["tasks"][1]["measured"],
+            serde_json::to_value(&memory).expect("written")
+        );
+        assert_eq!(value["tasks"][1]["measured"]["per_input_byte"], 3.0);
+        assert!(
+            value["tasks"][2].get("measured").is_none(),
+            "only the task that leads the stage"
+        );
+        let key = &value["tasks"][1]["observation"]["key"];
+        assert_eq!(key["kind"], "image");
+        assert_eq!(key["settings"], moruna_cost::Digest([7; 32]).to_hex());
+        // The kernel's own fingerprint, as the run saw it, where the identity names none.
+        assert_eq!(key["fingerprint"], moruna_cost::Digest([3; 32]).to_hex());
     }
 
     /// The report a run returns names its job's digest, its exit as a code, every task by its

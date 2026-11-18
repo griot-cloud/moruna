@@ -215,6 +215,12 @@ impl std::fmt::Debug for Secrets {
     }
 }
 
+/// The measured memory of the functions a job uses, by each one's registered name, as the
+/// `spec` message carries it beside the document (system design 3A, 3E): on a node, what the
+/// registry holds of each, a registration's or the node's own reading. Like the secrets, it is
+/// no part of the document or its digest.
+pub type Measured = std::collections::BTreeMap<String, moruna_cost::Memory>;
+
 /// A message from the peer to Moruna (MH 4.3).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -231,6 +237,10 @@ pub enum Inbound {
         /// (`{"secret": "<name>"}`) resolve to.
         #[serde(default, skip_serializing_if = "is_empty")]
         secrets: Secrets,
+        /// The measured memory of the functions the job uses, by registered name; a function
+        /// with none is absent, and the run sizes it as one nothing is known of.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        measured: Measured,
     },
     /// Cancel the run: the manifest is written and the process exits 130.
     Cancel,
@@ -705,6 +715,7 @@ mod tests {
                 spec: serde_json::json!({"a": 1}),
                 plan: None,
                 secrets: Default::default(),
+                measured: Default::default(),
             })
         );
         // The job's secrets, by name, beside the document; what prints them prints their names.
@@ -728,20 +739,47 @@ mod tests {
             Inbound::parse(r#"{"type":"spec","spec":{},"secrets":{"k":1}}"#).is_err(),
             "a secret is a string"
         );
+        // The measured memory of the job's functions, by registered name, beside the document.
+        let with = Inbound::parse(
+            r#"{"type":"spec","spec":{},"measured":{"gate-score":{"fixed_bytes":1310720.0,
+                "per_input_byte":0.054,"output_per_input_byte":0.21,"spread":0.02,"units":21,
+                "input_bytes_min":149000,"input_bytes_max":33525000}}}"#,
+        )
+        .expect("a spec with measured memory");
+        let Inbound::Spec { measured, .. } = &with else {
+            panic!("a spec")
+        };
+        let score = measured.get("gate-score").expect("by name");
+        assert_eq!((score.per_input_byte, score.units), (0.054, 21));
+        assert_eq!(
+            Inbound::parse(&serde_json::to_string(&with).expect("written")),
+            Ok(with.clone()),
+            "it is written as it is read"
+        );
+        assert!(
+            Inbound::parse(r#"{"type":"spec","spec":{},"measured":{"f":{"fixed_bytes":1.0}}}"#)
+                .is_err(),
+            "a measurement has every term"
+        );
         // None is no member at all, as a peer before 3.2 writes it.
         let none = serde_json::to_string(&Inbound::Spec {
             spec: serde_json::json!({}),
             plan: None,
             secrets: Default::default(),
+            measured: Default::default(),
         })
         .unwrap();
-        assert!(!none.contains("secrets"), "{none}");
+        assert!(
+            !none.contains("secrets") && !none.contains("measured"),
+            "{none}"
+        );
         assert_eq!(
             Inbound::parse("{\"type\":\"spec\",\"spec\":{},\"plan\":\"TVBMMQ==\"}"),
             Ok(Inbound::Spec {
                 spec: serde_json::json!({}),
                 plan: Some("TVBMMQ==".into()),
                 secrets: Default::default(),
+                measured: Default::default(),
             })
         );
         assert!(Inbound::parse("{\"type\":\"resize\",\"memory\":1}").is_err());

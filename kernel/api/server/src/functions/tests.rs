@@ -66,6 +66,128 @@ fn a_signed_image_is_registered_listed_and_replaced() {
     assert_eq!(list.functions[1].registered, NOW + 5);
 }
 
+/// The registration of [`registration`] with the function's measured memory beside it.
+fn measured_registration(name: &str, image: &[u8], signer: &Signer, measured: Value) -> String {
+    let address = "https://images.example.com/measured";
+    let mut body: Value =
+        serde_json::from_str(&registration(name, address, image, signer)).unwrap();
+    body["measured"] = measured;
+    body.to_string()
+}
+
+fn measured() -> Value {
+    serde_json::json!({"fixed_bytes": 1310720.0, "per_input_byte": 0.054,
+                       "output_per_input_byte": 0.21, "spread": 0.02, "units": 21,
+                       "input_bytes_min": 149000, "input_bytes_max": 33525000})
+}
+
+/// System design 3A, 3E (6.3g): a registration may carry the function's measured memory. The
+/// node keeps it with the function's image, shows it and whose it is, and hands it to a job
+/// that uses the function; what is not a measurement is refused.
+#[test]
+fn a_registration_s_measured_memory_is_kept_shown_and_handed_to_a_job() {
+    let signer = Signer::new();
+    let mut registry = Registry::new(vec![FunctionKey::new(signer.public())]);
+    let body_of = |measured| measured_registration("gate-score", IMAGE, &signer, measured);
+    let answer = registry.register(body_of(measured()).as_bytes(), NOW);
+    assert_eq!(answer.status, 201, "{answer:?}");
+    let function = body(&answer);
+    assert_eq!(function["measured"], measured());
+    assert_eq!(function["measured_by"], "registration");
+    let listed = serde_json::to_value(registry.list()).unwrap();
+    assert_eq!(listed["functions"][0]["measured"], measured());
+    assert_eq!(listed["functions"][0]["measured_by"], "registration");
+    let handed = registry.registered(&["gate-score".to_string()]);
+    assert_eq!(
+        handed[0]
+            .measured
+            .as_ref()
+            .map(|m| (m.per_input_byte, m.units)),
+        Some((0.054, 21))
+    );
+
+    // The same image registered again with nothing measured keeps what was measured of it.
+    let plain = registration(
+        "gate-score",
+        "https://images.example.com/again",
+        IMAGE,
+        &signer,
+    );
+    assert_eq!(registry.register(plain.as_bytes(), NOW + 1).status, 201);
+    let kept = registry.get("gate-score").unwrap();
+    assert_eq!(kept.registered, NOW + 1);
+    assert_eq!(kept.measured_by, Some(MeasuredBy::Registration));
+    assert_eq!(kept.measured.as_ref().map(|m| m.units), Some(21));
+    // A newer measurement of it replaces the one kept.
+    let mut newer = measured();
+    newer["units"] = serde_json::json!(40);
+    assert_eq!(
+        registry.register(body_of(newer).as_bytes(), NOW + 2).status,
+        201
+    );
+    assert_eq!(
+        registry
+            .get("gate-score")
+            .unwrap()
+            .measured
+            .as_ref()
+            .map(|m| m.units),
+        Some(40)
+    );
+    // Another image under the name is another function: nothing measured of it yet.
+    let other = registration(
+        "gate-score",
+        "https://images.example.com/next",
+        b"\x7fELF the next build",
+        &signer,
+    );
+    assert_eq!(registry.register(other.as_bytes(), NOW + 3).status, 201);
+    let next = registry.get("gate-score").unwrap();
+    assert_eq!((next.measured.clone(), next.measured_by), (None, None));
+    assert!(
+        body(&registry.register(other.as_bytes(), NOW + 4))
+            .get("measured")
+            .is_none()
+    );
+
+    // What is not a measurement is refused, and so is a term it does not have.
+    for (change, why) in [
+        (
+            ("per_input_byte", serde_json::json!(-1.0)),
+            "finite amounts of zero or more",
+        ),
+        (("units", serde_json::json!(0)), "at least 1"),
+        (
+            ("input_bytes_min", serde_json::json!(0)),
+            "the range of input",
+        ),
+    ] {
+        let mut wrong = measured();
+        wrong[change.0] = change.1;
+        let refused = registry.register(body_of(wrong).as_bytes(), NOW + 5);
+        assert_eq!(refused.status, 400, "{refused:?}");
+        let said = message(&refused);
+        assert!(
+            said.contains("measured is not a measurement of the function's memory")
+                && said.contains(why),
+            "{said}"
+        );
+    }
+    let mut unknown = measured();
+    unknown["runs"] = serde_json::json!(3);
+    assert_eq!(
+        registry
+            .register(body_of(unknown).as_bytes(), NOW + 6)
+            .status,
+        400
+    );
+    assert_eq!(
+        registry.get("gate-score").unwrap().registered,
+        NOW + 4,
+        "none replaced it"
+    );
+}
+
 #[test]
 fn a_bad_signature_or_an_unknown_key_is_refused() {
     let signer = Signer::new();
