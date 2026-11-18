@@ -22,7 +22,8 @@ extern crate std;
 
 pub mod boot;
 pub mod date;
-pub mod http;
+/// The minimal HTTP/1.1 client, shared with `node-admission` (`moruna-node-http`).
+pub use moruna_node_http as http;
 pub mod instance;
 pub mod machine;
 pub mod svc;

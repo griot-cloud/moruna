@@ -6,46 +6,7 @@
 use alloc::{string::String, vec::Vec};
 use core::{fmt, net::Ipv4Addr};
 
-/// Why a connection was not made, or broke.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StreamError {
-    /// The peer refused the connection.
-    Refused,
-    /// The connection was not established in time, as the network server judges it.
-    TimedOut,
-    /// No interface reaches the address: the node has no address yet.
-    Unreachable,
-    /// The peer reset the connection.
-    Reset,
-    /// The caller's deadline passed first.
-    Deadline,
-    /// Anything else, in words.
-    Other(String),
-}
-
-impl fmt::Display for StreamError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StreamError::Refused => f.write_str("connection refused"),
-            StreamError::TimedOut => f.write_str("connection timed out"),
-            StreamError::Unreachable => f.write_str("no route to the address"),
-            StreamError::Reset => f.write_str("connection reset"),
-            StreamError::Deadline => f.write_str("the deadline passed"),
-            StreamError::Other(why) => f.write_str(why),
-        }
-    }
-}
-
-/// One TCP connection, as bytes. Dropping it closes it.
-pub trait Stream {
-    /// Sends some of `bytes`, waiting for room until `deadline` (the monotonic clock, in
-    /// nanoseconds): how many were taken, at least one.
-    fn write(&mut self, bytes: &[u8], deadline: u64) -> Result<usize, StreamError>;
-
-    /// Receives into `buffer`, waiting for bytes until `deadline`: how many arrived, and 0 once
-    /// the peer has finished sending.
-    fn read(&mut self, buffer: &mut [u8], deadline: u64) -> Result<usize, StreamError>;
-}
+pub use moruna_node_http::{Stream, StreamError};
 
 /// The node's network, as far as `platform` uses it.
 pub trait Network {

@@ -978,6 +978,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-node-http"
+version = "0.1.0"
+dependencies = [
+ "moruna-netstack",
+ "moruna-svc",
+ "netstack-protocol",
+ "rcgen",
+ "rustls",
+]
+
+[[package]]
 name = "moruna-node-image"
 version = "0.1.0"
 dependencies = [
@@ -996,6 +1007,7 @@ dependencies = [
  "moruna-netstack",
  "moruna-node",
  "moruna-node-config",
+ "moruna-node-http",
  "moruna-svc",
  "netstack-protocol",
  "serde_json",
