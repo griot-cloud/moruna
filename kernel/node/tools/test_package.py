@@ -86,9 +86,11 @@ class Profiles(unittest.TestCase):
     def test_cloud_builds_only_its_programs(self):
         cloud = package.PROGRAMS["cloud"]
         # Step 1's processes (system design 1A): the network server, api and platform beside
-        # the supervisor, the device manager and its drivers (items 1.1, 1.3 and 1.4).
+        # the supervisor, the device manager and its drivers (items 1.1, 1.3 and 1.4), and
+        # `vmbus`, which the supervisor starts on Hyper-V only (item 1.9c).
         self.assertEqual(cloud, ["moruna-node-supervisor", "devices", "netstack", "moruna-node-api",
-                                 "moruna-node-platform", "virtio-blk", "virtio-net", "nvme", "gve"])
+                                 "moruna-node-platform", "virtio-blk", "virtio-net", "nvme", "gve",
+                                 "moruna-vmbus-server"])
         for absent in ("virtio-vsock", "imagefs", "linux", "node-admission", "moruna-storage-service", "engine"):
             self.assertNotIn(absent, cloud)
 

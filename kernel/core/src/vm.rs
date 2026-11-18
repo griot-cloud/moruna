@@ -1466,10 +1466,26 @@ impl Space {
     /// Maps `memory`'s first page read only where the kernel chooses, unless an area
     /// already maps just that page so: the clock page, once a process. Returns where.
     pub fn map_page_once(&self, memory: &Arc<MemoryObject>) -> Result<u64, Error> {
+        self.map_once(memory, false)
+    }
+
+    /// Maps `memory`'s first page readable and writable, once a process, as
+    /// [`map_page_once`](Self::map_page_once) maps a page read only: CPU 0's event-flags
+    /// page, whose flags the `vmbus` process tests and clears (ABI 2.7).
+    pub fn map_page_once_writable(&self, memory: &Arc<MemoryObject>) -> Result<u64, Error> {
+        self.map_once(memory, true)
+    }
+
+    fn map_once(&self, memory: &Arc<MemoryObject>, writable: bool) -> Result<u64, Error> {
+        let prot = if writable {
+            map::READ | map::WRITE
+        } else {
+            map::READ
+        };
         let mut inner = self.inner.lock();
         let found = inner.areas.iter().find(|(start, a)| {
             a.end - **start == PAGE_SIZE
-                && a.prot == map::READ
+                && a.prot == prot
                 && matches!(&a.backing, Backing::Object { memory: m, first: 0, .. } if Arc::ptr_eq(m, memory))
         });
         if let Some((start, _)) = found {
@@ -1479,11 +1495,11 @@ impl Space {
         let area = Area {
             end: va + PAGE_SIZE,
             kind: Kind::Mapping,
-            prot: map::READ,
+            prot,
             backing: Backing::Object {
                 memory: memory.clone(),
                 first: 0,
-                writable: false,
+                writable,
             },
         };
         let result = self.insert_area(&mut inner, va, area, 0);

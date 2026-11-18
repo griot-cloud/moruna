@@ -28,7 +28,7 @@ PROGRAMS = {
     "standalone": ["moruna-node-supervisor", "node-admission", "moruna-storage-service", "devices", "imagefs", "linux", "netstack", "engine",
                    "virtio-blk", "virtio-vsock", "virtio-net", "nvme", "gve"],
     "cloud": ["moruna-node-supervisor", "devices", "netstack", "moruna-node-api", "moruna-node-platform",
-              "virtio-blk", "virtio-net", "nvme", "gve"],
+              "virtio-blk", "virtio-net", "nvme", "gve", "moruna-vmbus-server"],
 }
 # The flags only a launcher's node takes, refused for a cloud image.
 LAUNCHER_FLAGS = (("agent_port", "--agent-port"), ("cpus", "--cpus"), ("layer", "--layer"),

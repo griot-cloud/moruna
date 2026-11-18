@@ -1,0 +1,12 @@
+[package]
+name = "vmbus-protocol"
+description = "moruna.driver.vmbus: the protocol the vmbus process serves VMBus drivers, to list the host's offers, open a channel, share memory with the host and close"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+moruna-svc.workspace = true
+# The interface and instance IDs of the host's offers, as VMBus carries them.
+guid = { path = "../../../vendor/openvmm/guid", version = "=0.0.0" }

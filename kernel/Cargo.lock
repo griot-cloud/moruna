@@ -1025,6 +1025,7 @@ dependencies = [
 name = "moruna-ostd-adaptation"
 version = "0.1.0"
 dependencies = [
+ "hvdef",
  "moruna-abi",
 ]
 
@@ -1133,6 +1134,20 @@ dependencies = [
  "guid",
  "hvdef",
  "moruna-vmbus",
+ "vmbus_core",
+ "vmbus_ring",
+]
+
+[[package]]
+name = "moruna-vmbus-server"
+version = "0.1.0"
+dependencies = [
+ "guid",
+ "hvdef",
+ "moruna-svc",
+ "moruna-sys",
+ "moruna-vmbus",
+ "vmbus-protocol",
  "vmbus_core",
  "vmbus_ring",
 ]
@@ -1322,6 +1337,7 @@ dependencies = [
  "bitvec",
  "fdt",
  "gimli 0.28.1",
+ "hvdef",
  "id-alloc",
  "inherit-methods-macro",
  "int-to-c-enum",
@@ -2047,6 +2063,14 @@ dependencies = [
  "moruna-svc",
  "moruna-virtio",
  "vsock-protocol",
+]
+
+[[package]]
+name = "vmbus-protocol"
+version = "0.1.0"
+dependencies = [
+ "guid",
+ "moruna-svc",
 ]
 
 [[package]]

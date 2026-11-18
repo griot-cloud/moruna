@@ -114,6 +114,24 @@ impl MemoryObject {
         })
     }
 
+    /// One page the kernel holds for good, as an object a process may map: CPU 0's
+    /// event-flags page, which Hyper-V writes (`hyperv_map_events`, ABI 2.7). Its record is
+    /// charged to `account`; the page is the kernel's.
+    pub fn of_frame(frame: UFrame, account: &Arc<Account>) -> Result<MemoryObject, Error> {
+        let charge = Charge::new(account, charge::memory(1))?;
+        let mut frames = Vec::new();
+        frames.try_reserve_exact(1).map_err(|_| Error::NoMemory)?;
+        frames.push(frame);
+        Ok(MemoryObject {
+            frames,
+            size: PAGE_SIZE,
+            dma: false,
+            run: None,
+            _charge: charge,
+            lazy: None,
+        })
+    }
+
     /// Whether this memory is still charged to exactly this original Account.
     pub fn charged_to(&self, account: &Arc<Account>) -> bool {
         self._charge.matches(account)

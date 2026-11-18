@@ -29,6 +29,7 @@ extern crate alloc;
 pub mod datapath;
 #[cfg(feature = "heap")]
 mod heap;
+pub mod hyperv;
 pub mod personality;
 pub mod plane;
 mod private_memory;
@@ -684,6 +685,19 @@ impl Mapping<'_> {
         // the mapping lives, which the borrow of `self` outlives. The caller's contract,
         // as this method's says, is that nothing writes them meanwhile.
         unsafe { core::slice::from_raw_parts(self.addr as *const u8, self.len as usize) }
+    }
+
+    /// The 32-bit word at `offset`, aligned to 4, as an atomic: a word shared with other
+    /// processes that every one of them reads and writes only atomically, such as a word
+    /// a futex waits on (ABI 2.0) or the wake word `vmbus` gives a driver (ABI 2.7). The
+    /// word of a read-only mapping is only ever loaded: a store to it faults the process.
+    pub fn atomic32(&self, offset: usize) -> Result<&core::sync::atomic::AtomicU32> {
+        let at = self.aligned(offset, 4)?;
+        // SAFETY: the kernel keeps the word mapped at `at`, inside the mapping and aligned
+        // to 4, for as long as the mapping lives, which the borrow of `self` outlives. Other
+        // processes may map it too; the caller's protocol accesses it only as an atomic, as
+        // this method's contract says.
+        Ok(unsafe { core::sync::atomic::AtomicU32::from_ptr(at as *mut u32) })
     }
 
     pub fn read_u32(&self, offset: usize) -> Result<u32> {
