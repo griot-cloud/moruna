@@ -935,6 +935,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-netvsc-server"
+version = "0.1.0"
+dependencies = [
+ "devices-protocol",
+ "guestmem_core",
+ "moruna-abi",
+ "moruna-netvsc",
+ "moruna-svc",
+ "moruna-sys",
+ "moruna-vmbus",
+ "net-protocol",
+ "netvsp_protocol",
+ "vmbus-protocol",
+ "vmbus_ring",
+ "zerocopy",
+]
+
+[[package]]
 name = "moruna-node"
 version = "0.1.0"
 dependencies = [

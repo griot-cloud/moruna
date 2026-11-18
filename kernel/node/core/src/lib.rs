@@ -710,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cloud_profile_starts_vmbus_and_storvsc_on_hyper_v_only() {
+    fn the_cloud_profile_starts_the_vmbus_processes_on_hyper_v_only() {
         let profiles: [&[u8]; 2] = [
             include_bytes!("../../cloud/node.conf"),
             include_bytes!("../../cloud-check/node.conf"),
@@ -720,12 +720,14 @@ mod tests {
             let names =
                 |c: &Config| -> Vec<String> { c.services.iter().map(|s| s.name.clone()).collect() };
             let all = names(&config);
-            assert!(all.iter().any(|n| n == "vmbus") && all.iter().any(|n| n == "storvsc"));
+            // vmbus, and its clients storvsc (item 1.10b) and netvsc (item 1.11b).
+            let hyperv = ["vmbus", "storvsc", "netvsc"];
+            assert!(hyperv.iter().all(|h| all.iter().any(|n| n == h)));
             assert_eq!(config.clone().on_machine(true), config);
             let elsewhere = config.on_machine(false);
             let left: Vec<String> = all
                 .iter()
-                .filter(|n| *n != "vmbus" && *n != "storvsc")
+                .filter(|n| !hyperv.contains(&n.as_str()))
                 .cloned()
                 .collect();
             assert_eq!(
@@ -733,13 +735,15 @@ mod tests {
                 left,
                 "devices, its clients and the rest stay"
             );
+            assert!(elsewhere.links.iter().all(|l| {
+                !hyperv.contains(&l.left.as_str()) && !hyperv.contains(&l.right.as_str())
+            }));
             assert!(
                 elsewhere
-                    .links
+                    .grants
                     .iter()
-                    .all(|l| l.left != "storvsc" && l.right != "storvsc")
+                    .all(|g| g.source != "dma.storvsc" && g.source != "dma.netvsc")
             );
-            assert!(elsewhere.grants.iter().all(|g| g.source != "dma.storvsc"));
         }
     }
 
