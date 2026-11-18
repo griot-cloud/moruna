@@ -80,9 +80,9 @@ expect "vsock-peer: ok: connected to the guest's port 5001 and it answered 'hell
 # hog(), and its post-hog hello; plus plane/test shimless()'s two run_plane requests. The removed bare
 # engine contributed5engine processes+6image tasks; all5strict assertions now
 # remain mandatory on each CPU profile in check-node-fixtures.py (15boots).
-# linux-test starts ten programs; the plane regression additionally starts
-# arrow_echo and hello through the same actual personality.
-expect "linux: served: 12 programs run"
+# linux-test starts eleven programs (the pyarrow probe, item 5.3, is the eleventh); the plane
+# regression additionally starts arrow_echo and hello through the same actual personality.
+expect "linux: served: 13 programs run"
 if grep -qF -- "FAIL:" "$peer"; then
   echo "FOUND FAILURE in actual vsock peer log:"
   grep -F -- "FAIL:" "$peer"
