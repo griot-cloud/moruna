@@ -85,8 +85,11 @@ class Profiles(unittest.TestCase):
 
     def test_cloud_builds_only_its_programs(self):
         cloud = package.PROGRAMS["cloud"]
-        self.assertEqual(cloud, ["moruna-node-supervisor", "devices", "virtio-blk", "virtio-net", "nvme", "gve"])
-        for absent in ("virtio-vsock", "imagefs", "linux", "node-admission", "moruna-storage-service", "engine", "netstack"):
+        # Step 1's processes (system design 1A): the network server, api and platform beside
+        # the supervisor, the device manager and its drivers (items 1.1, 1.3 and 1.4).
+        self.assertEqual(cloud, ["moruna-node-supervisor", "devices", "netstack", "moruna-node-api",
+                                 "moruna-node-platform", "virtio-blk", "virtio-net", "nvme", "gve"])
+        for absent in ("virtio-vsock", "imagefs", "linux", "node-admission", "moruna-storage-service", "engine"):
             self.assertNotIn(absent, cloud)
 
     def test_the_user_build_compiles_c_as_build_sh_does(self):

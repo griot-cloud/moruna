@@ -4,7 +4,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     arch::{
-        kernel::apic::{self, Apic, DivideConfig},
+        kernel::{
+            apic::{self, Apic, DivideConfig},
+            tsc::boot_wait,
+        },
         timer::pit::OperatingMode,
         trap::TrapFrame,
         tsc_freq,
@@ -124,16 +127,22 @@ fn init_periodic_mode_config() {
     apic.set_timer_init_count(0xFFFF_FFFF);
 
     // Wait until `CONFIG` is ready
-    loop {
-        crate::arch::irq::enable_local_and_halt();
-
-        // Disable local IRQs so they won't come after checking `CONFIG`
-        // but before halting the CPU.
-        crate::arch::irq::disable_local();
-
-        if CONFIG.is_completed() {
-            break;
-        }
+    //
+    // moruna: the wait has a deadline (Moruna's system design, section 1B), as the TSC's
+    // calibration has (`kernel/tsc.rs`): it pauses with local IRQs enabled where upstream
+    // halted until the next interrupt, and ends with local IRQs disabled.
+    let measured = boot_wait::wait(
+        crate::arch::read_tsc,
+        || {
+            crate::arch::irq::enable_local();
+            core::hint::spin_loop();
+            crate::arch::irq::disable_local();
+        },
+        || CONFIG.is_completed(),
+    );
+    if !measured {
+        crate::early_println!("{}", boot_wait::APIC_TIMER_TIMED_OUT);
+        crate::power::poweroff(crate::power::ExitCode::Failure);
     }
 
     // Disable PIT

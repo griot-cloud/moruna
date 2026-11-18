@@ -331,6 +331,7 @@ name = "devices"
 version = "0.1.0"
 dependencies = [
  "devices-protocol",
+ "moruna-abi",
  "moruna-driver-table",
  "moruna-mmio",
  "moruna-node",
@@ -937,6 +938,7 @@ dependencies = [
 name = "moruna-node"
 version = "0.1.0"
 dependencies = [
+ "moruna-abi",
  "moruna-sys",
 ]
 
@@ -1017,6 +1019,13 @@ version = "0.1.0"
 dependencies = [
  "moruna-abi",
  "moruna-mmio",
+]
+
+[[package]]
+name = "moruna-ostd-adaptation"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
 ]
 
 [[package]]

@@ -6,6 +6,10 @@
 //! resources. Any refusal powers the machine off with the reason on the console:
 //! a kernel that cannot start what it was told to start does not run half of it.
 //!
+//! The node's console (`architecture/moruna-os-system.md`, section 1B) has the core's line,
+//! `moruna: core <version> cpus=<n> memory=<bytes>`, once every CPU is online, and
+//! `moruna: fatal core: <reason>` for a refused boot or a panic, each before the power-off.
+//!
 //! Before anything is made the kernel sizes the machine's account (SDD 20 f.18): the
 //! free memory its frame allocator holds, less the kernel's own reserve. A manifest
 //! process with a `memory` line gets an account of its own carved out of it; every other
@@ -19,12 +23,16 @@ use alloc::{
     vec::Vec,
 };
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use moruna_abi::{
     ABI_MAJOR, ABI_MINOR, ResourceKind,
+    boot_line::{self, Core, Fatal, Panic},
     manifest::{Manifest, Source, source_rights},
 };
 use moruna_loader::cpio;
 use ostd::{
+    boot::memory_region::MemoryRegionType,
     early_println,
     power::{ExitCode, poweroff},
 };
@@ -51,9 +59,47 @@ pub fn boot() {
         }
         Err(reason) => {
             early_println!("kk: boot refused: {}", reason);
+            early_println!(
+                "{}",
+                Fatal {
+                    stage: boot_line::CORE,
+                    reason: &reason
+                }
+            );
             poweroff(ExitCode::Failure);
         }
     }
+}
+
+/// A panic in kernel mode is a fatal error of the core: its line, before OSTD's handler
+/// prints the panic whole and powers the machine off. It is said once, whichever CPU
+/// panics first and whatever panics after it, the writing of this line included.
+pub fn panicked(info: &core::panic::PanicInfo) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if SAID.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    early_println!(
+        "{}",
+        Fatal {
+            stage: boot_line::CORE,
+            reason: Panic {
+                location: info.location().map(|at| (at.file(), at.line())),
+                message: info.message(),
+            }
+        }
+    );
+}
+
+/// The usable RAM in the boot memory map: the bytes of every region OSTD's map of the
+/// bootloader's gives the type `Usable`.
+fn usable_memory() -> u64 {
+    ostd::boot::boot_info()
+        .memory_regions
+        .iter()
+        .filter(|region| region.typ() == MemoryRegionType::Usable)
+        .map(|region| region.len() as u64)
+        .sum()
 }
 
 fn start() -> Result<usize, String> {
@@ -77,6 +123,14 @@ fn start() -> Result<usize, String> {
     // once more. With no handler OSTD panics.
     ostd::mm::fault::inject_user_page_fault_handler(|_| Err(()));
     early_println!("kk: {} CPUs online", ostd::cpu::num_cpus());
+    early_println!(
+        "{}",
+        Core {
+            version: env!("CARGO_PKG_VERSION"),
+            cpus: ostd::cpu::num_cpus(),
+            memory: usable_memory(),
+        }
+    );
     #[cfg(feature = "probe")]
     osdk_frame_allocator::probe_shared_pool();
     let machine = machine_account()?;

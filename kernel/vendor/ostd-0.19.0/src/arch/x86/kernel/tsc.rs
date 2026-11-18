@@ -12,6 +12,11 @@ use crate::{
     timer::TIMER_FREQ,
 };
 
+// moruna: the deadline of the boot waits (Moruna's system design, section 1B); this wait,
+// the APIC timer's (`timer/apic.rs`) and the wait for the other CPUs to start
+// (`boot/smp.rs`) use it, and the power-off after it.
+pub(crate) mod boot_wait;
+
 /// The frequency in Hz of the Time Stamp Counter (TSC).
 pub(in crate::arch) static TSC_FREQ: AtomicU64 = AtomicU64::new(0);
 
@@ -43,16 +48,23 @@ pub(super) fn determine_tsc_freq_via_pit() -> u64 {
     static FREQUENCY: AtomicU64 = AtomicU64::new(0);
 
     // Wait until `FREQUENCY` is ready
-    loop {
-        crate::arch::irq::enable_local_and_halt();
-
-        // Disable local IRQs so they won't come after checking `IS_FINISH`
-        // but before halting the CPU.
-        crate::arch::irq::disable_local();
-
-        if IS_FINISH.load(Ordering::Acquire) {
-            break;
-        }
+    //
+    // moruna: the wait has a deadline (Moruna's system design, section 1B). Upstream halted
+    // until the next interrupt, which never comes on a machine with no PIT; a halted CPU
+    // could not look at a deadline, so the wait pauses with local IRQs enabled instead. It
+    // ends, as upstream's did, with local IRQs disabled.
+    let measured = boot_wait::wait(
+        crate::arch::read_tsc,
+        || {
+            crate::arch::irq::enable_local();
+            core::hint::spin_loop();
+            crate::arch::irq::disable_local();
+        },
+        || IS_FINISH.load(Ordering::Acquire),
+    );
+    if !measured {
+        crate::early_println!("{}", boot_wait::PIT_TIMED_OUT);
+        crate::power::poweroff(crate::power::ExitCode::Failure);
     }
 
     // Disable PIT

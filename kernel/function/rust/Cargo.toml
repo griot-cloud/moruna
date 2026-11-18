@@ -1,0 +1,61 @@
+# moruna-function, the Rust SDK for native functions (architecture/moruna-os-system.md, 5A). Its own
+# workspace, as images/gate/tasks is: it builds on arrow-rs, which the kernel workspace's lock stays
+# free of. The kernel's toolchain (kernel/rust-toolchain.toml) is the one it builds with.
+[workspace]
+resolver = "3"
+members = [".", "examples/double"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# The root workspace's pins (Cargo.toml), so a function runs on the arrow-rs the engine runs on.
+arrow-array = { version = "=59.3.0", default-features = false }
+arrow-buffer = { version = "=59.3.0", default-features = false }
+arrow-ipc = { version = "=59.3.0", default-features = false }
+arrow-schema = { version = "=59.3.0", default-features = false }
+arrow-select = { version = "=59.3.0", default-features = false }
+moruna-function = { path = "." }
+
+[package]
+name = "moruna-function"
+description = "A native Moruna function in Rust: Arrow batches from the data plane, read in place, and batches written back into windows (system design 5A)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+# The engine's own record check, run on every record before arrow-ipc reads it, and the page
+# layout of a record (contracts e.7).
+moruna-ipc-check = { path = "../../plane/check" }
+
+[dev-dependencies]
+arrow-select.workspace = true
+
+# On the core: the task's plane and its rings. Its log is std's: the std layer (5A0, item 5.0) owns
+# the log slot and sends standard error to it.
+[target.'cfg(any(target_os = "moruna", moruna_function_sys))'.dependencies]
+moruna-sys = { path = "../../sys" }
+
+# On a host: the ring protocol, for the data plane in memory (`moruna_function::host`).
+[target.'cfg(not(any(target_os = "moruna", moruna_function_sys)))'.dependencies]
+moruna-plane = { path = "../../plane/core" }
+
+[lints.rust]
+# `moruna_function_sys` type-checks the core's adapter on a host (README, "Working on the SDK").
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(moruna_function_sys)', 'cfg(target_os, values("moruna"))'] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+debug = 1

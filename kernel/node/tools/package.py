@@ -27,14 +27,12 @@ PROFILES = ("standalone", "cloud")
 PROGRAMS = {
     "standalone": ["moruna-node-supervisor", "node-admission", "moruna-storage-service", "devices", "imagefs", "linux", "netstack", "engine",
                    "virtio-blk", "virtio-vsock", "virtio-net", "nvme", "gve"],
-    "cloud": ["moruna-node-supervisor", "devices", "virtio-blk", "virtio-net", "nvme", "gve"],
+    "cloud": ["moruna-node-supervisor", "devices", "netstack", "moruna-node-api", "moruna-node-platform",
+              "virtio-blk", "virtio-net", "nvme", "gve"],
 }
 # The flags only a launcher's node takes, refused for a cloud image.
 LAUNCHER_FLAGS = (("agent_port", "--agent-port"), ("cpus", "--cpus"), ("layer", "--layer"),
                   ("writable_home", "--writable-home"), ("user_network", "--user-network"), ("cid", "--cid"))
-# The disk's formats. `raw` is the disk itself; each other one is a file beside it.
-FORMATS = ("raw", "qcow2", "vhd")
-MIB = 1024 * 1024
 # The C of a user program (`ring`, which the network server brings in) is compiled as
 # kernel/tools/build.sh compiles it: by clang, freestanding, for the bare x86_64 ELF target.
 USER_CC = "CC_x86_64_moruna_user"
@@ -48,6 +46,10 @@ def user_c(environment):
     target, so no host tool and no kernel build reads them."""
     flags = " ".join(part for part in (USER_C_FLAGS, environment.get(USER_CFLAGS, "").strip()) if part)
     return {USER_CC: environment.get(USER_CC) or "clang", USER_CFLAGS: flags}
+
+# The disk's formats. `raw` is the disk itself; each other one is a file beside it.
+FORMATS = ("raw", "qcow2", "vhd")
+MIB = 1024 * 1024
 
 
 def command(args, cwd, env=None):
@@ -234,7 +236,11 @@ def main():
         raise RuntimeError("kernel output is not ELF")
     shutil.copyfile(elf, payload / "moruna-kernel.elf")
     config = out / "grub.cfg"
-    config.write_text("set timeout=0\nset default=0\nmenuentry 'Moruna' {\n search --file --set=root /boot/moruna-kernel.elf\n multiboot2 /boot/moruna-kernel.elf\n module2 /boot/initramfs.cpio\n boot\n}\n")
+    # A node has no screen, and the core's multiboot2 header asks for no framebuffer. GRUB's EFI
+    # build has no text console to hand over instead, so at `boot` it still tries a video mode
+    # ("auto") and prints "error: no suitable video mode found" where the firmware offers none
+    # (QEMU with no display, Hyper-V Generation 2). `gfxpayload=text` has it try none.
+    config.write_text("set timeout=0\nset default=0\nmenuentry 'Moruna' {\n search --file --set=root /boot/moruna-kernel.elf\n multiboot2 /boot/moruna-kernel.elf\n module2 /boot/initramfs.cpio\n set gfxpayload=text\n boot\n}\n")
     boot = out / "BOOTX64.EFI"
     # GRUB reads the boot files from the GPT disk's FAT32 system partition: its partition and
     # filesystem modules are loaded with it, or `search` finds no device holding the kernel.

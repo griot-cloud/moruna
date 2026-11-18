@@ -1,11 +1,9 @@
-//! The gate's `enrich` as a native task (images/gate/README.md).
+//! The gate's `enrich` as a native function (images/gate/README.md).
 
-#![no_std]
-#![no_main]
 #![forbid(unsafe_code)]
 
-moruna_sys::main!(run);
+use std::process::ExitCode;
 
-fn run() -> i64 {
-    moruna_gate_tasks::run(moruna_gate_record::Job::Enrich)
+fn main() -> ExitCode {
+    moruna_gate_tasks::serve(moruna_gate_functions::batch::enrich)
 }

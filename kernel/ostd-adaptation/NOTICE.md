@@ -34,10 +34,43 @@ One more, marked `moruna:` (item 1.4, the system design's section 1B):
   time-stamp counter first thing, and `boot::entry_tsc` gives it. The core's clock counts
   from it, so `boot_ms` includes OSTD's own start-up.
 
+It also adds what a node needs to stop on every machine (`architecture/moruna-os-system.md`,
+section 1B; work item 1.2). Each patch is marked with a `moruna:` comment:
+
+- **ACPI S5 power-off** (`src/arch/x86/power.rs`). OSTD powered off only through QEMU's
+  test exit device, which no cloud has. `try_poweroff` now tries that device first, as
+  before, and then ACPI S5: SLP_TYPa from the DSDT's `\_S5` package, written with SLP_EN to
+  the FADT's PM1a control register (an I/O port). After the write it waits, within the
+  boot waits' deadline below, for a hypervisor that acts on it a moment later. If neither
+  powers the machine off it returns, and OSTD halts every CPU as it did. A power-off before
+  `power::init` has run (a boot wait whose deadline passed) writes the test exit device's
+  port too, when the CPU reports QEMU. S5 is not tried before the IRQ chip is up: until
+  then a panic may come from reading the ACPI tables, which must not be entered twice.
+- **Deadlines on the two calibration waits** (`src/arch/x86/kernel/tsc.rs`,
+  `src/arch/x86/timer/apic.rs`). The PIT calibration of the TSC and of the APIC timer each
+  halted until the next PIT interrupt, for ever on a machine with no PIT. Each now pauses
+  with local IRQs enabled instead, and gives up once the TSC has counted more than 2^33
+  from where the wait began (about 2 s at any rate a cloud CPU runs, counted without the
+  rate the wait is there to measure). It then prints
+  `moruna: fatal core: PIT calibration timed out` or
+  `moruna: fatal core: APIC timer calibration timed out` and powers the machine off.
+- **The same deadline on the wait for the other CPUs to start** (`src/boot/smp.rs`, on
+  x86). The boot processor waited without end for every other CPU to report in. It now
+  gives up at the same count, prints `moruna: fatal core: CPU start timed out` and powers
+  the machine off. `src/arch/x86/mod.rs` gives the deadline's module the name
+  `arch::boot_wait`, by which code outside `arch` reaches it.
+
+Their arithmetic is in two added files that name nothing of OSTD:
+`src/arch/x86/power/acpi_s5.rs` (the scan of a DSDT for `_S5_`, the package's first
+element, the PM1a value) and `src/arch/x86/kernel/tsc/boot_wait.rs` (the wait, its
+deadline and the three waits' lines). This directory is also the crate `moruna-ostd-adaptation`, which compiles
+those same two files for the host and tests them (`cargo test -p moruna-ostd-adaptation`).
+They carry `SPDX-License-Identifier: MPL-2.0`, as the files beside them do.
+
 Three of its comments lose their em dashes (`src/log/logger.rs`, `src/log/macros.rs`,
 `src/task/scheduler/mod.rs`), which the repository's quality check refuses in every
 tracked file; their code is unchanged.
 
 `upstream-files.json` records every file of the unmodified crate. `provenance.json`
-records the archive's checksum and the changed files' checksums. No dependency, kernel
-mapping, frame allocation or metadata changes.
+records the archive's checksum, the changed files' checksums and the added files'. No
+dependency, kernel mapping, frame allocation or metadata changes.

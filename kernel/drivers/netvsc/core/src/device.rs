@@ -151,6 +151,17 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         card.mac = card.address()?;
         card.mtu = card.frame_size()?;
         card.longest = card.mtu as usize + ETHERNET_HEADER;
+        // The largest frame and its RNDIS fields must fit one send section, or some
+        // frames could never be sent: the card would not be one. Checked before the
+        // filter is set, so a card that fails here never starts taking frames (the PM's
+        // decision on item 1.11a's question 1).
+        let message = rndis::DATA + card.longest;
+        if message > card.send.size {
+            return Err(NetvscError::Unfit {
+                message,
+                section: card.send.size,
+            });
+        }
         card.filter()?;
         Ok(card)
     }
@@ -194,13 +205,10 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         }
         let message = rndis::DATA + frame.len();
         if message > self.send.size {
-            // moruna: an open question of item 1.11a, in its report. The work item sends
-            // a frame that fits no section "by guest page numbers". A channel shares
-            // memory by an ID and tells its driver no page number, and the documents do
-            // not say whether the caller is to give them, with each frame or for a
-            // buffer of its own. Until the PM settles that, such a frame is refused. A
-            // Hyper-V host's sections are 6,144 bytes (netvsp: `section_size: 6144`), so
-            // a frame of the 1,514 bytes this driver configures always fits one.
+            // A frame that fits no section is refused, not sent by guest page numbers
+            // (the PM's decision on item 1.11a's question 1). `start` has checked that
+            // the largest frame fits, so on a started card this never happens. A
+            // Hyper-V host's sections are 6,144 bytes (netvsp: `section_size: 6144`).
             return Err(NetvscError::Unfit {
                 message,
                 section: self.send.size,

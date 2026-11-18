@@ -17,6 +17,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     unsafe extern "Rust" {
         fn __ostd_panic_handler(info: &core::panic::PanicInfo) -> !;
     }
+    // The core's fatal line first (the system design, section 1B).
+    moruna_microkernel::panicked(info);
     // SAFETY: OSTD defines `__ostd_panic_handler` with exactly this signature; it prints
     // the panic and a backtrace and powers the machine off, so it never returns.
     unsafe { __ostd_panic_handler(info) }
