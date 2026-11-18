@@ -1,23 +1,24 @@
 //! The process on the node: [`Host`] and [`Hv`] over the core's calls, and the loop.
 //!
 //! Its start handles: `console`; `root.hyperv`, which the supervisor grants only on
-//! Hyper-V; `dma`, the DMA grant it pins memory with; and, when a driver is to reach it,
-//! `listener`, where drivers' connections arrive.
+//! Hyper-V; `dma`, the DMA grant it pins memory with; and, for each class of device whose
+//! driver is to reach it, that class's listener (`scsi`, `net`), where the driver's
+//! connections arrive.
 
 use alloc::{boxed::Box, collections::BTreeMap, format, rc::Rc, string::String, vec, vec::Vec};
-use core::{cell::RefCell, fmt, sync::atomic::Ordering};
+use core::{cell::RefCell, fmt};
 
 use moruna_svc::{
     Channel, Completions, DEADLINE_INFINITE, Dispatcher, Handle, Signals, Watch, now,
 };
 use moruna_sys::{
-    Console, Interrupt, Mapping, Memory, Pin, Rights, dma_release, futex_wake,
+    Console, Interrupt, Memory, Pin, Rights, dma_release,
     hyperv::{EventFlags, HvSignal, Hyperv, MESSAGE_SIZE},
-    map, println, start,
+    println, start,
 };
 use moruna_vmbus::{Hv, HvError, HvMessage, MemoryId, PostError};
-use moruna_vmbus_server::{Host, Vmbus, WakeId, factory, message, page_numbers, post_result};
-use vmbus_protocol::{PAGES_MAX, vmbus::Error, wake};
+use moruna_vmbus_server::{Host, Vmbus, factory, message, page_numbers, post_result};
+use vmbus_protocol::{Class, PAGES_MAX, vmbus::Error};
 
 /// How long the process waits before it posts again to a host that had no room.
 const RETRY_NS: u64 = 1_000_000;
@@ -35,8 +36,6 @@ struct Node {
     signals: BTreeMap<u32, HvSignal>,
     /// Pinned memory: its pin, and its page numbers.
     pinned: BTreeMap<u64, (Pin, Vec<u64>)>,
-    /// Wake words: the memory, kept mapped to be written.
-    wakes: BTreeMap<u64, (Memory, Mapping<'static>)>,
     next: u64,
 }
 
@@ -132,38 +131,6 @@ impl Host for Node {
             .map_err(|_| Error::NoResources)
     }
 
-    fn wake(&mut self) -> Result<(Handle, WakeId), Error> {
-        let memory = Memory::create(wake::SIZE).map_err(|_| Error::NoResources)?;
-        let mapping = memory
-            .map_detached(0, wake::SIZE, map::READ | map::WRITE)
-            .map_err(|_| Error::NoResources)?;
-        // The driver reads the word; only this process writes it.
-        let driver = memory
-            .0
-            .duplicate(Rights::READ | Rights::MAP | Rights::DUPLICATE | Rights::TRANSFER)
-            .map_err(|_| Error::NoResources)?;
-        let id = self.id();
-        self.wakes.insert(id, (memory, mapping));
-        Ok((driver, WakeId(id)))
-    }
-
-    fn bump(&mut self, wake: WakeId, gone: bool) {
-        let Some((_, mapping)) = self.wakes.get(&wake.0) else {
-            return;
-        };
-        if gone && let Ok(state) = mapping.atomic32(wake::STATE) {
-            state.store(wake::GONE, Ordering::Release);
-        }
-        if let Ok(counter) = mapping.atomic32(wake::COUNTER) {
-            counter.fetch_add(1, Ordering::Release);
-            let _ = futex_wake(counter, u32::MAX);
-        }
-    }
-
-    fn drop_wake(&mut self, wake: WakeId) {
-        self.wakes.remove(&wake.0);
-    }
-
     fn say(&mut self, line: fmt::Arguments<'_>) {
         println!(self.console, "{}", line);
     }
@@ -221,7 +188,6 @@ fn serve(console: &Console) -> Result<(), String> {
         dma,
         signals: BTreeMap::new(),
         pinned: BTreeMap::new(),
-        wakes: BTreeMap::new(),
         next: 0,
     };
     let vmbus = Rc::new(RefCell::new(Vmbus::new(node, sint.vp_index)));
@@ -232,10 +198,12 @@ fn serve(console: &Console) -> Result<(), String> {
             vmbus: vmbus.clone(),
         }))
         .map_err(|e| format!("watch: {}", e.name()))?;
-    if let Some(listener) = start::take("listener") {
-        dispatcher
-            .listen(Channel(listener), factory(vmbus.clone()))
-            .map_err(|e| format!("listener: {}", e.name()))?;
+    for class in Class::ALL {
+        if let Some(listener) = start::take(class.slot()) {
+            dispatcher
+                .listen(Channel(listener), factory(vmbus.clone(), class))
+                .map_err(|e| format!("listener {}: {}", class.slot(), e.name()))?;
+        }
     }
     vmbus.borrow_mut().start();
     loop {

@@ -206,6 +206,34 @@ impl Rings {
         Ok(Some(received))
     }
 
+    /// Asks the host to signal when there is something to do, and says whether there is
+    /// already: a packet to read, or room for the packet that was refused. Nothing sleeps,
+    /// and the host's signal stays unmasked: a driver that waits elsewhere (the `vmbus` wake
+    /// channel, among its clients') hears of the next packet through it. The order is
+    /// [`Rings::wait`]'s: ask for the signal first, then look at the ring again.
+    pub(crate) fn arm<C: Channel>(&mut self, channel: &C) -> Result<bool, Error> {
+        let incoming = channel.incoming();
+        incoming.set_interrupt_mask(false);
+        let mut ready = incoming.can_read(&mut self.read).map_err(Error::Ring)?;
+        if self.wanted != 0 {
+            let outgoing = channel.outgoing();
+            outgoing
+                .set_pending_send_size(self.wanted)
+                .map_err(Error::Ring)?;
+            if outgoing
+                .can_write(&mut self.write, self.wanted)
+                .map_err(Error::Ring)?
+            {
+                // The room is there: the refused packet may be sent again, and the host
+                // need not say so.
+                self.wanted = 0;
+                outgoing.set_pending_send_size(0).map_err(Error::Ring)?;
+                ready = true;
+            }
+        }
+        Ok(ready)
+    }
+
     /// Sleeps until the host signals or `deadline` passes, unless there is already something
     /// to do: a packet to read, or room for the packet that was refused. The order is the
     /// ring's rule for not missing a signal, as OpenVMM's `vmbus_async` keeps it
@@ -217,21 +245,7 @@ impl Rings {
         channel: &mut C,
         deadline: Option<u64>,
     ) -> Result<Wait, Error> {
-        let ready = {
-            let incoming = channel.incoming();
-            incoming.set_interrupt_mask(false);
-            let mut ready = incoming.can_read(&mut self.read).map_err(Error::Ring)?;
-            if self.wanted != 0 {
-                let outgoing = channel.outgoing();
-                outgoing
-                    .set_pending_send_size(self.wanted)
-                    .map_err(Error::Ring)?;
-                ready |= outgoing
-                    .can_write(&mut self.write, self.wanted)
-                    .map_err(Error::Ring)?;
-            }
-            ready
-        };
+        let ready = self.arm(channel)?;
         let waited = if ready {
             Ok(Wait::Signalled)
         } else {

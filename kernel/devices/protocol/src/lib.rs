@@ -2,7 +2,13 @@
 //!
 //! `moruna.devices.directory` is how a client finds a driver: by the name its service
 //! was published under (`block0`), never by the device. A lookup answers with a fresh
-//! connection to the driver, whose handshake is the client's. `moruna.devices.control`
+//! connection to the driver, whose handshake is the client's. A driver the node's
+//! supervisor starts rather than the device manager, such as `storvsc` on Azure, registers
+//! each block device it serves ([`Block`]) through the listener the boot description links
+//! to it, whose connections may register and do nothing else ([`REGISTER_SLOTS`]); the
+//! device is then found as any other, by its serial (`lun-0`, `boot`), so there is one way
+//! to find a disk whatever drives it (`architecture/moruna-os-system.md`, section 3C).
+//! `moruna.devices.control`
 //! is for the processes the boot description links to it, and no other: it restarts a
 //! driver, and hands out the resources a driver of a device holds (without its DMA
 //! right) and the device's physical windows, for tests of a driver's confinement. Through
@@ -19,7 +25,7 @@ use alloc::{string::String, vec::Vec};
 
 use alloc::format;
 
-use moruna_svc::{CallError, Channel, Handle};
+use moruna_svc::{CallError, Channel, Decoder, Encoder, Handle, Wire, WireError};
 
 /// The device manager's listener slot whose connections alone may call `hand_over`: the
 /// boot description links it to the engine's supervisor and to nothing else.
@@ -35,9 +41,67 @@ pub fn hand_over_names(bars: &[usize]) -> String {
     names
 }
 
+/// The prefix of the device manager's listener slots whose connections may `register` a
+/// block device and do nothing else: the boot description links one to each driver the
+/// node's supervisor starts (`register-storvsc`), and to nothing else. Connections through
+/// a `directory*` slot may look up and list, and not register.
+pub const REGISTER_SLOTS: &str = "register";
+
+/// The longest serial a block device is registered under.
+pub const SERIAL_MAX: usize = 64;
+
 /// One published service: its name, the device's `vendor << 16 | device`, the driver
 /// program, and how many times the driver has been started.
 pub type Entry = (String, u32, String, u32);
+
+/// A block device a driver registers: the serial it is found by, its size, and how it may
+/// be used. Its driver serves `moruna.driver.block` for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Block {
+    /// The name a lookup finds it by: the serial the cloud gives the disk (`lun-<n>` on
+    /// Azure), or `boot` for the disk the node booted from.
+    pub serial: String,
+    /// Bytes in a sector: 512 or a larger power of two.
+    pub sector_size: u32,
+    /// The device's capacity, in sectors.
+    pub sectors: u64,
+    /// Its driver refuses every write.
+    pub read_only: bool,
+    /// The disk the node booted from, which is never a job's volume.
+    pub boot: bool,
+}
+
+impl Block {
+    /// Whether the device is one the directory takes: a serial of 1 to [`SERIAL_MAX`]
+    /// visible ASCII characters, sectors of 512 bytes or a larger power of two, and at
+    /// least one of them.
+    pub fn valid(&self) -> bool {
+        (1..=SERIAL_MAX).contains(&self.serial.len())
+            && self.serial.bytes().all(|b| b.is_ascii_graphic())
+            && self.sector_size >= 512
+            && self.sector_size.is_power_of_two()
+            && self.sectors > 0
+    }
+}
+
+impl Wire for Block {
+    fn encode(self, e: &mut Encoder) -> Result<(), WireError> {
+        (self.serial, self.sector_size, self.sectors).encode(e)?;
+        (self.read_only, self.boot).encode(e)
+    }
+
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        let (serial, sector_size, sectors) = Wire::decode(d)?;
+        let (read_only, boot) = Wire::decode(d)?;
+        Ok(Block {
+            serial,
+            sector_size,
+            sectors,
+            read_only,
+            boot,
+        })
+    }
+}
 
 /// A device's windows: its configuration space's physical address, and each memory
 /// BAR's index, physical address and length.
@@ -48,20 +112,30 @@ moruna_svc::protocol! {
     pub protocol directory {
         name = "moruna.devices.directory";
         major = 1;
-        minor = 0;
+        minor = 1;
         requests {
-            /// A new connection to the service published as `name`; answered once its
-            /// driver is running.
+            /// A new connection to the service published as `name`, or to the block
+            /// device registered under that serial; answered once its driver is running.
             1 => fn lookup(name: String) -> Channel;
-            /// Every published service.
+            /// Every service the device manager's drivers publish.
             2 => fn list() -> Vec<Entry>;
+            /// Minor 1: registers `block`, which the caller serves on `listener`: a lookup
+            /// of its serial connects through `listener`. Only through a
+            /// [`REGISTER_SLOTS`] listener, which may make no other request.
+            3 => fn register(block: Block, listener: Channel) -> ();
         }
         events {}
         errors {
             /// No service is published under the name.
             1 => NotFound;
-            /// The service's driver could not be started.
+            /// The service's driver could not be started, or has gone.
             2 => Unavailable;
+            /// Minor 1: a request this connection's listener does not allow.
+            3 => Refused;
+            /// Minor 1: the serial is a name published already.
+            4 => Exists;
+            /// Minor 1: a block device that is not [`Block::valid`].
+            5 => Invalid;
         }
     }
 }
@@ -128,5 +202,66 @@ mod tests {
         assert_eq!(hand_over_names(&[]), "config msi dma");
         assert_eq!(hand_over_names(&[4, 1]), "config msi dma bar4 bar1");
         assert_eq!(control::REQUESTS, &[1, 2, 3, 4]);
+    }
+
+    fn disk(serial: &str) -> Block {
+        Block {
+            serial: String::from(serial),
+            sector_size: 512,
+            sectors: 2048,
+            read_only: false,
+            boot: false,
+        }
+    }
+
+    #[test]
+    fn a_block_device_travels_whole() {
+        assert_eq!(directory::REQUESTS, &[1, 2, 3]);
+        assert_eq!((directory::ID.major, directory::ID.minor), (1, 1));
+        let boot = Block {
+            read_only: true,
+            boot: true,
+            sector_size: 4096,
+            ..disk("boot")
+        };
+        let mut e = Encoder::new();
+        boot.clone().encode(&mut e).unwrap();
+        let bytes = e.into_control_bytes().unwrap();
+        let mut d = Decoder::new(&bytes, &mut []);
+        assert_eq!(Block::decode(&mut d).unwrap(), boot);
+        d.finish().unwrap();
+        let mut d = Decoder::new(&bytes[..bytes.len() - 1], &mut []);
+        assert!(Block::decode(&mut d).is_err(), "a byte short");
+    }
+
+    #[test]
+    fn a_block_device_has_a_serial_a_sector_size_and_sectors() {
+        assert!(disk("lun-0").valid());
+        assert!(disk(&"x".repeat(SERIAL_MAX)).valid());
+        assert!(!disk("").valid());
+        assert!(!disk(&"x".repeat(SERIAL_MAX + 1)).valid());
+        assert!(!disk("lun 0").valid(), "a space");
+        assert!(!disk("lün-0").valid(), "not ASCII");
+        assert!(
+            !Block {
+                sector_size: 256,
+                ..disk("a")
+            }
+            .valid()
+        );
+        assert!(
+            !Block {
+                sector_size: 1000,
+                ..disk("a")
+            }
+            .valid()
+        );
+        assert!(
+            !Block {
+                sectors: 0,
+                ..disk("a")
+            }
+            .valid()
+        );
     }
 }
