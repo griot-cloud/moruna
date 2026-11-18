@@ -53,11 +53,13 @@ Implements the OS design, section 1, OpenStack column.
   |---|---|
   | 1 | `node-supervisor`, `devices`, `netstack`, `platform`, `api`; drivers `virtio-blk`, `virtio-net`, `nvme`, `gve`. Item 1.1 boots the supervisor, `devices` and the drivers alone; `netstack` joins with `api` in 1.3, because the network server refuses a config with no listener grant |
   | 2 | The same; `api` gains TLS and its operations |
-  | 3 | Adds `storage`, `imagefs`, `linux`, `node-admission`, `engine` |
+  | 3 | Adds `imagefs`, `linux`, `node-admission`, `engine` (no `storage`: cloud jobs reach data through volumes, 3C, and object stores, 3D) |
 
 - **Layout:** a GPT disk with one partition, the EFI system partition (FAT32). It holds
   `EFI/BOOT/BOOTX64.EFI` (GRUB), `boot/moruna-kernel.elf` and `boot/initramfs.cpio`. A second
-  partition, `moruna-system`, is reserved for step 3's function images.
+  partition, `moruna-system`, holds step 3's engine layer (and later cached function images): the
+  boot disk's driver registers it in `devices`' directory as the read-only block device `system`,
+  a slice at the partition's bounds, and `imagefs` takes its layers from it.
 - **Boot chain:** UEFI firmware, GRUB with no menu and no wait, the core by multiboot2 with the
   initramfs as its module, then `node-supervisor`. This is what `package.py` builds today.
 - **UEFI only.** Secure Boot comes later. A BIOS boot is added only if a cloud cannot do UEFI.
@@ -513,7 +515,7 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
   share. Jobs and checks are carved from it. The job bound is admission's account less the 256 MiB
   check account (no scratch) and admission's own 128 MiB; `GET /v1/node` reports it as
   `job_memory_bytes`, and a larger budget is refused. One image serves any node size. The cloud
-  profile's step-3 services are imagefs 256 MiB (a cache), linux 256 MiB, storage 128 MiB. The engine
+  profile's step-3 services are imagefs 256 MiB (a cache) and linux 256 MiB. The engine
   receives its channel as it is (`grant <slot> channel <from>`, only with `runs 1`).
 - **Validation is the engine's.** `api` does not link `moruna-job`, which needs std. A document is
   checked by the engine itself:
