@@ -138,6 +138,9 @@ static PEAK: AtomicI64 = AtomicI64::new(0);
 pub struct CountingAllocator;
 
 fn counted(delta: i64) {
+    // 6.3d: the heap a thread allocates while it has entered a `Held` moves that count: what a
+    // Parquet sink's writer holds is measured, never estimated.
+    moruna_kernel::held::heap_counted(delta);
     if ARMED.load(Ordering::Relaxed) {
         let live = LIVE.fetch_add(delta, Ordering::AcqRel) + delta;
         if delta > 0 {

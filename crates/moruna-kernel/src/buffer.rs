@@ -392,7 +392,8 @@ pub trait Allocator: Send + Sync {
 /// column, for the buffers it reserves, whatever its batches.
 pub struct Tally {
     inner: Arc<dyn Allocator>,
-    held: Arc<std::sync::atomic::AtomicU64>,
+    /// The count, the one kind the run measures with (`crate::held`).
+    held: crate::held::Held,
 }
 
 impl Tally {
@@ -400,13 +401,13 @@ impl Tally {
     pub fn new(inner: Arc<dyn Allocator>) -> Tally {
         Tally {
             inner,
-            held: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            held: crate::held::Held::new(),
         }
     }
 
     /// The bytes the buffers allocated through this tally still hold.
     pub fn held(&self) -> u64 {
-        self.held.load(std::sync::atomic::Ordering::SeqCst)
+        self.held.held()
     }
 }
 
@@ -414,13 +415,12 @@ impl Tally {
 /// tally's count and hands them to the arena it came from.
 struct Tallied {
     inner: Arc<dyn ArenaHandle>,
-    held: Arc<std::sync::atomic::AtomicU64>,
+    held: crate::held::Held,
 }
 
 impl ArenaHandle for Tallied {
     fn release(&self, ptr: *mut u8, len: usize, tier: Tier) {
-        self.held
-            .fetch_sub(len as u64, std::sync::atomic::Ordering::SeqCst);
+        self.held.sub(len as u64);
         self.inner.release(ptr, len, tier);
     }
 }
@@ -433,15 +433,14 @@ impl Allocator for Tally {
         // SAFETY: `buffer` is `ManuallyDrop` and is never dropped, and the field is not read
         // again after this point, so the value is moved out exactly once.
         let arena = unsafe { std::ptr::read(&buffer.arena) };
-        self.held
-            .fetch_add(buffer.len as u64, std::sync::atomic::Ordering::SeqCst);
+        self.held.add(buffer.len as u64);
         Ok(Buffer {
             ptr: buffer.ptr,
             len: buffer.len,
             tier: buffer.tier,
             arena: Arc::new(Tallied {
                 inner: arena,
-                held: Arc::clone(&self.held),
+                held: self.held.clone(),
             }),
         })
     }

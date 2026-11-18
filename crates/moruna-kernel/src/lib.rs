@@ -19,6 +19,7 @@ pub mod declare;
 pub mod error;
 pub mod fingerprint;
 pub mod graph;
+pub mod held;
 pub mod ids;
 pub mod ipc;
 pub mod kernel;
@@ -57,6 +58,7 @@ pub use declare::{ABI_VERSION, ColumnDecl, Declared, SchemaDecl, TypeDecl};
 pub use error::{ConvertError, MorunaError};
 pub use fingerprint::Fingerprint;
 pub use graph::{Affine, Consumer, Link, MAX_PATHS, Produced, Producer, Topology};
+pub use held::Held;
 pub use ids::{ALIGNMENT, DeviceId, LOCAL_NODE, NodeId, RunId, Seq, SplitId, StageId};
 pub use kernel::{
     AllocCounts, GilState, InitCtx, Kernel, KernelAlloc, KernelHints, KernelKind, KernelState,
