@@ -24,6 +24,7 @@ pub const USAGE: &str = "usage: moruna run <spec.json> [--arg NAME=VALUE]... [--
        moruna kinds [--kinds <kinds.json>]...
        moruna check-job <spec.json> [--secret NAME]... [--node channel:SLOT] [--kinds <kinds.json>]...
        moruna explain <spec.json> [--planner <name>] [--out <plan.mplan>] [--kinds <kinds.json>]...
+       moruna volume pack <dir> <out>
        moruna --version
 
 --kinds names a file of the kinds the program running Moruna serves: a JSON array of
@@ -190,6 +191,15 @@ pub enum Command {
         planner: Option<String>,
         /// Where the plan document goes.
         out: Option<PathBuf>,
+    },
+    /// `moruna volume pack <dir> <out>` (system design 3C, item 3.3): the tree of `dir` as the
+    /// layer a source's volume holds, written to `out`, a new file: the whole disk of a volume
+    /// to attach, or the bytes to write onto one from its first.
+    VolumePack {
+        /// The directory whose tree the volume holds.
+        dir: PathBuf,
+        /// The layer file, which must not exist yet.
+        out: PathBuf,
     },
     /// `moruna --version`.
     Version,
@@ -567,11 +577,41 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             let spec = spec.ok_or_else(|| "moruna explain: which document?".to_string())?;
             Ok(Command::Explain { spec, planner, out })
         }
+        Some("volume") => match (rest.next(), rest.next(), rest.next(), rest.next()) {
+            (Some("pack"), Some(dir), Some(out), None) => Ok(Command::VolumePack {
+                dir: PathBuf::from(dir),
+                out: PathBuf::from(out),
+            }),
+            _ => Err("moruna volume: `moruna volume pack <dir> <out>`".to_string()),
+        },
         Some("--version" | "-V" | "version") => Ok(Command::Version),
         Some("--help" | "-h" | "help") => Ok(Command::Help),
         Some(other) => Err(format!("moruna: unknown command `{other}`")),
         None => Err("moruna: which command?".to_string()),
     }
+}
+
+/// `moruna volume pack <dir> <out>`: the tree of `dir` (its directories, regular files and
+/// symbolic links, each with its permission bits) as one layer in `moruna_imagefs`'s format,
+/// the output disk's, written to the new file `out`. A job then reads its files as
+/// `disk://<serial>/<path>` from the volume that holds it.
+pub fn volume_pack(dir: &Path, out: &Path) -> Result<String, String> {
+    if out.symlink_metadata().is_ok() {
+        return Err(format!(
+            "{} exists; a volume's layer is written to a new file",
+            out.display()
+        ));
+    }
+    let root = moruna_image::layerfile::tree(dir).map_err(|e| e.to_string())?;
+    let layer = moruna_image::layerfile::write(&root, out).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "{}: a layer of {} pages ({} bytes), seal {}: attach it as a volume's disk, or write it \
+         onto one from its first byte",
+        out.display(),
+        layer.pages,
+        layer.pages * 4096,
+        layer.id
+    ))
 }
 
 /// `--sandbox-python <path>` and `--sandbox-cgroup <dir>` (17 e.6): true when `arg` was one.
@@ -800,6 +840,18 @@ fn main_as(
         Command::Kinds => {
             println!("{}", kinds.listing().to_json());
             return exit::COMPLETED;
+        }
+        Command::VolumePack { dir, out } => {
+            return match volume_pack(&dir, &out) {
+                Ok(summary) => {
+                    println!("{summary}");
+                    exit::COMPLETED
+                }
+                Err(reason) => {
+                    eprintln!("moruna volume pack: {reason}");
+                    exit::FAILED
+                }
+            };
         }
         Command::CheckJob {
             spec,
@@ -2690,6 +2742,83 @@ mod tests {
             summary(&outcome),
             "moruna: exit 2: spec refused: x: y; no report file"
         );
+    }
+}
+
+#[cfg(test)]
+mod volume_pack_tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn volume_pack_takes_a_directory_and_a_new_file() {
+        assert_eq!(
+            parse(&args(&["volume", "pack", "data", "nyc.layer"])),
+            Ok(Command::VolumePack {
+                dir: "data".into(),
+                out: "nyc.layer".into(),
+            })
+        );
+        for bad in [
+            &["volume"][..],
+            &["volume", "pack", "data"],
+            &["volume", "unpack", "a", "b"],
+            &["volume", "pack", "a", "b", "c"],
+        ] {
+            assert_eq!(
+                parse(&args(bad)),
+                Err("moruna volume: `moruna volume pack <dir> <out>`".to_string()),
+                "{bad:?}"
+            );
+        }
+        assert!(USAGE.contains("moruna volume pack <dir> <out>"));
+    }
+
+    #[test]
+    fn volume_pack_writes_the_tree_as_a_layer_read_back_whole() {
+        let root = std::env::temp_dir().join(format!("moruna-volume-pack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("data");
+        std::fs::create_dir_all(dir.join("nyc")).unwrap();
+        let month: Vec<u8> = (0..70_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        std::fs::write(dir.join("nyc").join("2024-01.parquet"), &month).unwrap();
+        std::fs::write(dir.join("readme.txt"), b"one month").unwrap();
+        let out = root.join("nyc.layer");
+        let summary = volume_pack(&dir, &out).unwrap();
+        assert!(summary.contains("a layer of"), "{summary}");
+        let items = moruna_image::layerfile::read(std::slice::from_ref(&out)).unwrap();
+        match items.get("/nyc/2024-01.parquet") {
+            Some(moruna_image::layerfile::Item::File(_, bytes)) => assert_eq!(bytes, &month),
+            other => panic!("{other:?}"),
+        }
+        assert!(items.contains_key("/readme.txt"));
+        // Never over a file that is there, and never from what is not a directory.
+        let again = volume_pack(&dir, &out).unwrap_err();
+        assert!(again.contains("exists"), "{again}");
+        assert!(volume_pack(&dir.join("readme.txt"), &root.join("x.layer")).is_err());
+        let run = |a: &[&str]| {
+            let env = |_: &str| None;
+            main_with(
+                &args(a),
+                &Registry::standard(),
+                CancelToken::new(),
+                &env,
+                HEARTBEAT,
+            )
+        };
+        let (d, o) = (dir.to_str().unwrap(), out.to_str().unwrap());
+        assert_eq!(run(&["volume", "pack", d, o]), exit::FAILED);
+        let fresh = root.join("again.layer");
+        assert_eq!(
+            run(&["volume", "pack", d, fresh.to_str().unwrap()]),
+            exit::COMPLETED
+        );
+        assert_eq!(std::fs::read(&fresh).unwrap(), std::fs::read(&out).unwrap());
+        assert_eq!(run(&["volume", "pack", d]), exit::SPEC_REFUSED);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
 

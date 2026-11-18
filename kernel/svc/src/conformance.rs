@@ -113,6 +113,8 @@ impl Answer {
 /// whatever a check asks, well formed or not.
 pub struct Probe {
     channel: Channel,
+    /// The minor version the server's welcome announced.
+    server_minor: u16,
     next_txid: u32,
     events: VecDeque<Frame>,
     timeout: u64,
@@ -125,6 +127,12 @@ impl Probe {
     /// The raw channel.
     pub fn channel(&self) -> &Channel {
         &self.channel
+    }
+
+    /// The minor version the server announced in its welcome: a case of a request a later
+    /// minor added checks it only on a server that announced that minor.
+    pub fn server_minor(&self) -> u16 {
+        self.server_minor
     }
 
     /// Sends any frame as it is.
@@ -635,12 +643,13 @@ fn handshake(connector: &mut dyn Connector, id: ProtocolId, timeout: u64) -> Res
     }
     let mut d = answer.decoder();
     let (major, minor) = (u16::decode(&mut d), u16::decode(&mut d));
-    match (major, minor, d.finish()) {
-        (Ok(major), Ok(minor), Ok(())) if major == id.major && minor >= id.minor => {}
+    let server_minor = match (major, minor, d.finish()) {
+        (Ok(major), Ok(minor), Ok(())) if major == id.major && minor >= id.minor => minor,
         _ => return Err("the welcome does not carry the protocol's version".to_string()),
-    }
+    };
     Ok(Probe {
         channel,
+        server_minor,
         next_txid: 1,
         events: VecDeque::new(),
         timeout,

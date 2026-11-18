@@ -16,7 +16,7 @@
 //! hand the device some of those pages and pin nothing. Each transfer holds the
 //! registration while it is in flight, so a registration ended (or a connection
 //! closed) under a transfer keeps its pin until the device returns the chain, and
-//! only then does the pin go to the quarantine. `read_to` and `write_from` (protocol 2.1)
+//! only then does the pin go to the quarantine. `read_to` and `write_from` (protocol 2.2)
 //! start a transfer at any byte of a registration.
 //!
 //! At start the driver asks the device its serial (`GET_ID`) and reads its GPT header: the

@@ -16,6 +16,10 @@
 //!
 //! A file the run left under the output root in its scratch (a sink or task that wrote
 //! locally) joins the layer at the end, copied once onto the disk.
+//!
+//! The same layer is written onto a sink's volume (item 3.3, [`Target::Volume`]): its files
+//! under `disk://<serial>/`, its writes whole pages through the volume's driver, from the
+//! sink's own memory (`write_from`), in the format a source volume is read in.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
@@ -28,7 +32,8 @@ use moruna_kernel::{Allocator, Buffer, BufferView, Completion, Dispatch, MorunaE
 use sha2::{Digest as _, Sha256};
 
 use super::disk::Disk;
-use super::engine::{Kind as OpKind, Op};
+use super::engine::{Done, Kind as OpKind, Op};
+use crate::volume::io::Volume;
 
 /// The URL prefix a sink writes the output layer's files under: `disk://out/<path>`.
 pub const URL: &str = "disk://out/";
@@ -83,9 +88,75 @@ struct State {
     pending: u64,
 }
 
-/// The output layer of one run on `disk.out`.
+/// What an output layer is written onto.
+#[derive(Clone, Debug)]
+pub enum Target {
+    /// The run's `disk.out`, which the engine drives itself (stream C).
+    Disk(Disk),
+    /// A sink's volume, which its driver serves (item 3.3).
+    Volume(Volume),
+}
+
+impl Target {
+    /// Its name: the disk's start-page name, or the volume's serial.
+    pub fn name(&self) -> &str {
+        match self {
+            Target::Disk(d) => d.name(),
+            Target::Volume(v) => v.serial(),
+        }
+    }
+
+    /// Its bytes.
+    pub fn capacity(&self) -> u64 {
+        match self {
+            Target::Disk(d) => d.capacity(),
+            Target::Volume(v) => v.capacity(),
+        }
+    }
+
+    /// The URL prefix its files are written under.
+    pub fn url(&self) -> String {
+        match self {
+            Target::Disk(_) => URL.to_string(),
+            Target::Volume(v) => format!("{}{}/", crate::volume::SCHEME, v.serial()),
+        }
+    }
+
+    /// Writes the `len` bytes at `addr` (whole pages) at byte `offset`; `done` told on any
+    /// thread.
+    fn write(&self, offset: u64, addr: u64, len: u64, done: Done) {
+        match self {
+            Target::Disk(d) => d.submit(Op {
+                kind: OpKind::Write,
+                offset,
+                addr,
+                len,
+                done,
+            }),
+            Target::Volume(v) => v.write(offset, addr, len, done),
+        }
+    }
+
+    /// Puts every write so far on stable storage, and waits.
+    fn flush(&self) -> Result<(), String> {
+        match self {
+            Target::Disk(d) => d.run(Op {
+                kind: OpKind::Flush,
+                offset: 0,
+                addr: 0,
+                len: 0,
+                done: Box::new(|_| {}),
+            }),
+            Target::Volume(v) => v.wait(|done| v.flush(done)),
+        }
+    }
+}
+
+/// The output layer of one run on `disk.out`, or on a sink's volume.
 pub struct Output {
-    disk: Disk,
+    disk: Target,
+    /// The URL prefix its files are written under.
+    url: String,
     /// The bytes before the data: [`RESERVE`].
     reserve: u64,
     alloc: Arc<dyn Allocator>,
@@ -146,6 +217,16 @@ impl Output {
         Output::with_reserve(disk, alloc, tier, dispatch, RESERVE)
     }
 
+    /// The output layer of a run on a sink's `volume` (item 3.3), as [`Output::new`] on a disk.
+    pub fn on_volume(
+        volume: Volume,
+        alloc: Arc<dyn Allocator>,
+        tier: Tier,
+        dispatch: Dispatch,
+    ) -> Arc<Output> {
+        Output::on(Target::Volume(volume), alloc, tier, dispatch, RESERVE)
+    }
+
     /// As [`Output::new`], with `reserve` bytes (whole pages) before the data.
     pub(crate) fn with_reserve(
         disk: Disk,
@@ -154,7 +235,18 @@ impl Output {
         dispatch: Dispatch,
         reserve: u64,
     ) -> Arc<Output> {
+        Output::on(Target::Disk(disk), alloc, tier, dispatch, reserve)
+    }
+
+    fn on(
+        disk: Target,
+        alloc: Arc<dyn Allocator>,
+        tier: Tier,
+        dispatch: Dispatch,
+        reserve: u64,
+    ) -> Arc<Output> {
         Arc::new(Output {
+            url: disk.url(),
             disk,
             reserve,
             alloc,
@@ -173,8 +265,8 @@ impl Output {
         })
     }
 
-    /// The disk it writes.
-    pub fn disk(&self) -> &Disk {
+    /// What it writes: the disk, or the volume.
+    pub fn target(&self) -> &Target {
         &self.disk
     }
 
@@ -238,7 +330,7 @@ impl Output {
     /// Commits `src` as the file at `path` (under [`URL`]): resolved when its bytes are on the
     /// disk. A path written again is the later file.
     pub fn put(self: &Arc<Self>, path: &str, src: BufferView) -> Completion<()> {
-        let target = format!("{URL}{path}");
+        let target = format!("{}{path}", self.url);
         let fail = |why: String| {
             Completion::resolved_on(Err(io("write_object", &target, why)), self.dispatch.clone())
         };
@@ -321,16 +413,15 @@ impl Output {
 
     fn submit(&self, piece: Piece, join: Join) {
         let keep = piece.keep;
-        self.disk.submit(Op {
-            kind: OpKind::Write,
-            offset: piece.offset,
-            addr: piece.addr,
-            len: piece.len,
-            done: Box::new(move |r| {
+        self.disk.write(
+            piece.offset,
+            piece.addr,
+            piece.len,
+            Box::new(move |r| {
                 drop(keep);
                 join.one(r);
             }),
-        });
+        );
     }
 
     /// Commits the file at `path` on the host, under `name`: read in pieces through the arena
@@ -576,16 +667,15 @@ impl Output {
             buffer.copy_from_slice(&bytes[at..at + n]);
             let (tx, rx) = mpsc::channel();
             let addr = buffer.as_ptr() as u64;
-            self.disk.submit(Op {
-                kind: OpKind::Write,
-                offset: offset + at as u64,
+            self.disk.write(
+                offset + at as u64,
                 addr,
-                len: n as u64,
-                done: Box::new(move |r| {
+                n as u64,
+                Box::new(move |r| {
                     drop(buffer);
                     let _ = tx.send(r);
                 }),
-            });
+            );
             pending.push_back(rx);
             at += n;
         }
@@ -598,13 +688,7 @@ impl Output {
     }
 
     fn flush(&self) -> Result<(), String> {
-        self.disk.run(Op {
-            kind: OpKind::Flush,
-            offset: 0,
-            addr: 0,
-            len: 0,
-            done: Box::new(|_| {}),
-        })
+        self.disk.flush()
     }
 }
 

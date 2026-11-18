@@ -7,11 +7,13 @@
 //! move sectors to and from any of its pages (`read_at`, `write_at`) with no pin per
 //! request: the image filesystem's page cache works so (SDD 27, f.5).
 //!
-//! Minor 1 places a transfer at any byte of a registration (`read_to`, `write_from`), so a
+//! Minor 2 places a transfer at any byte of a registration (`read_to`, `write_from`), so a
 //! client reading a byte range of the disk into memory it did not choose lands the whole
 //! sectors in place, and only the sectors at the range's edges pass through a buffer of its
 //! own (`architecture/moruna-os-system.md` 3C, item 3.3). A driver whose device cannot place
 //! data at that byte answers `BadBuffer`, and the client moves that one transfer another way.
+//! The suite checks them only on a driver that announces minor 2 at its welcome, and that the
+//! rest answer them `UnknownMethod`.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -23,7 +25,7 @@ mod placed;
 use alloc::{format, string::ToString, vec, vec::Vec};
 
 use moruna_svc::{
-    Decoder, Encoder, Memory, ProtocolError, Rights, Wire, WireError,
+    Decoder, Encoder, Memory, ProtocolError, ProtocolId, Rights, Wire, WireError,
     conformance::{Case, Fail, Probe, Suite},
     map,
 };
@@ -63,7 +65,7 @@ moruna_svc::protocol! {
     pub protocol block {
         name = "moruna.driver.block";
         major = 2;
-        minor = 1;
+        minor = 2;
         requests {
             /// The device's sector size, capacity and largest transfer.
             1 => fn info() -> Info;
@@ -92,10 +94,10 @@ moruna_svc::protocol! {
             10 => fn release_write(lease:u64) -> ();
             /// Reads `count` sectors from `sector` into registered buffer `id`, the first
             /// byte at its byte `offset`, which need not start a page or a sector.
-            11 since 1 => fn read_to(id: u32, offset: u64, sector: u64, count: u32) -> ();
+            11 since 2 => fn read_to(id: u32, offset: u64, sector: u64, count: u32) -> ();
             /// Writes `count` sectors at `sector` from registered buffer `id`, from its byte
             /// `offset`.
-            12 since 1 => fn write_from(lease: u64, id: u32, offset: u64, sector: u64, count: u32) -> ();
+            12 since 2 => fn write_from(lease: u64, id: u32, offset: u64, sector: u64, count: u32) -> ();
         }
         events {}
         errors {
@@ -104,7 +106,7 @@ moruna_svc::protocol! {
             /// A count of zero, or above `max_sectors`.
             2 => BadCount;
             /// The buffer is not a DMA memory object, is smaller than the transfer, or
-            /// lacks a right the transfer needs; or (minor 1) the driver cannot place the
+            /// lacks a right the transfer needs; or (minor 2) the driver cannot place the
             /// transfer at the byte asked for.
             3 => BadBuffer;
             /// A write to a read-only device.
@@ -583,24 +585,31 @@ const CASES: &[Case] = &[
         check: registration_bound,
     },
     Case {
-        name: "read_to: sectors land at any byte of a registration and nowhere else, or BadBuffer",
+        name: "read_to (2.2): sectors land at any byte of a registration and nowhere else, or BadBuffer; UnknownMethod before 2.2",
         check: placed::read_to,
     },
     Case {
-        name: "read_to, write_from: every refusal",
+        name: "read_to, write_from (2.2): every refusal, and a body that is not theirs",
         check: placed::placed_refusals,
     },
     Case {
-        name: "write_from: a sector written from any byte reads back, or BadBuffer",
+        name: "write_from (2.2): a sector written from any byte reads back, or BadBuffer; UnknownMethod before 2.2",
         check: placed::write_from,
     },
 ];
 
+/// The version every driver of the protocol serves, which the suite's handshake asks for: a
+/// driver of any minor is checked.
+const BASE: ProtocolId = ProtocolId::new("moruna.driver.block", 2, 0);
+/// The requests of [`BASE`], which the suite's generic checks send to every driver; minor 2's
+/// are checked by its own cases.
+const BASE_REQUESTS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
 /// The protocol's conformance suite.
 pub fn suite() -> Suite {
     Suite {
-        id: block::ID,
-        requests: block::REQUESTS,
+        id: BASE,
+        requests: BASE_REQUESTS,
         cases: CASES,
         timeout: 30_000_000_000,
     }

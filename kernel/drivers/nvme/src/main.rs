@@ -645,7 +645,7 @@ impl Handler for Connection {
                 };
                 // A command's data starts a page here (its PRP list), so a placed transfer
                 // that starts inside one is one this driver cannot make: the client moves it
-                // another way (protocol 2.1).
+                // another way (protocol 2.2).
                 let page = (offset % 4096 == 0)
                     .then(|| u32::try_from(offset / 4096).ok())
                     .flatten();

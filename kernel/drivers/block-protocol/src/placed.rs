@@ -1,10 +1,11 @@
-//! The suite's cases for minor 1's placed transfers (`read_to`, `write_from`): sectors land at
+//! The suite's cases for minor 2's placed transfers (`read_to`, `write_from`): sectors land at
 //! any byte of a registration and nowhere else, or the driver says it cannot place them there
-//! (`BadBuffer`), which a client then moves another way.
+//! (`BadBuffer`), which a client then moves another way. A driver that announces an older
+//! minor at its welcome does not serve them: it answers them `UnknownMethod`.
 
 use alloc::{format, string::ToString, vec, vec::Vec};
 
-use moruna_svc::{Encoder, Memory, ProtocolError, Rights, Wire, conformance::Answer, map};
+use moruna_svc::{Encoder, Memory, ProtocolError, Rights, Status, Wire, conformance::Answer, map};
 
 use super::{
     Fail, Probe, block, bytes, claim, dma, empty_reply, info_of, register, release, token_body,
@@ -15,6 +16,21 @@ use super::{
 pub const OFFSET: u64 = 4096 + 100;
 /// What a registration holds where no transfer has written.
 const FILL: u8 = 0x5a;
+/// The minor that added the placed transfers.
+pub const SINCE: u16 = 2;
+
+/// Whether the driver announced the placed transfers; if not, that it answers both
+/// `UnknownMethod`, well-formed as they are.
+fn announced(p: &mut Probe) -> Result<bool, Fail> {
+    if p.server_minor() >= SINCE {
+        return Ok(true);
+    }
+    p.request(11, to(1, 0, 0, 1)?)?
+        .status(Status::UnknownMethod)?;
+    p.request(12, from(0, 1, 0, 0, 1)?)?
+        .status(Status::UnknownMethod)?;
+    Ok(false)
+}
 
 pub(crate) fn to(id: u32, offset: u64, sector: u64, count: u32) -> Result<Encoder, Fail> {
     let mut e = Encoder::new();
@@ -72,6 +88,9 @@ fn contents(view: &Memory, pages: u64) -> Result<Vec<u8>, Fail> {
 /// `read_to` puts at [`OFFSET`] what `read` gives, across a page's end, and leaves every other
 /// byte of the registration as it was; or the driver answers `BadBuffer`.
 pub(crate) fn read_to(p: &mut Probe) -> Result<(), Fail> {
+    if !announced(p)? {
+        return Ok(());
+    }
     let i = info_of(p)?;
     let count = (2 * 4096 / i.sector_size).min(i.max_sectors);
     let n = bytes(&i, count) as usize;
@@ -96,7 +115,17 @@ pub(crate) fn read_to(p: &mut Probe) -> Result<(), Fail> {
 /// A placed transfer that reaches past its registration is `BadBuffer`, one past the disk
 /// `OutOfRange`, a count of zero `BadCount`, an unknown registration `NoRegistration`.
 pub(crate) fn placed_refusals(p: &mut Probe) -> Result<(), Fail> {
+    if !announced(p)? {
+        return Ok(());
+    }
     let i = info_of(p)?;
+    // A body that is not the request's arguments: one field short.
+    let mut short = Encoder::new();
+    1u32.encode(&mut short).map_err(wire)?;
+    p.request(11, short)?.status(Status::BadMessage)?;
+    let mut short = Encoder::new();
+    0u64.encode(&mut short).map_err(wire)?;
+    p.request(12, short)?.status(Status::BadMessage)?;
     let one = (4096 / i.sector_size).min(i.max_sectors);
     let (id, _) = register(p, dma(2 * 4096)?)?;
     p.request(11, to(id + 1000, 0, 0, one)?)?
@@ -117,6 +146,9 @@ pub(crate) fn placed_refusals(p: &mut Probe) -> Result<(), Fail> {
 /// A sector written from [`OFFSET`] reads back, and the disk is restored; or the driver
 /// answers `BadBuffer`.
 pub(crate) fn write_from(p: &mut Probe) -> Result<(), Fail> {
+    if !announced(p)? {
+        return Ok(());
+    }
     let i = info_of(p)?;
     if i.read_only {
         return Ok(());

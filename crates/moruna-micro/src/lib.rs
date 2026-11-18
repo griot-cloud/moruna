@@ -59,6 +59,9 @@ pub mod task;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod vsock;
 
+// Item 3.3: volumes by serial, on every host; their driver's client on the kernel only.
+pub mod volume;
+
 /// Whether this process runs on the Moruna kernel, started with a start page (SDD 30 d.2).
 pub fn on_kernel() -> bool {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

@@ -102,7 +102,7 @@ impl Objects {
 
     /// The region holding `addr`: its id, base and length. A region's id is never another's,
     /// though a later region may be mapped where a released one was.
-    fn find(&self, addr: u64) -> Option<(u64, u64, u64)> {
+    pub(crate) fn find(&self, addr: u64) -> Option<(u64, u64, u64)> {
         let regions = lock(&self.regions);
         let i = regions.partition_point(|r| r.base <= addr).checked_sub(1)?;
         let r = &regions[i];
@@ -110,7 +110,7 @@ impl Objects {
     }
 
     /// The memory object of region `id` and its bytes, while the arena holds it.
-    fn memory(&self, id: u64) -> Option<(Arc<Memory>, u64)> {
+    pub(crate) fn memory(&self, id: u64) -> Option<(Arc<Memory>, u64)> {
         lock(&self.regions)
             .iter()
             .find(|r| r.id == id)
@@ -118,7 +118,7 @@ impl Objects {
     }
 
     /// Whether the arena still holds region `id`.
-    fn holds(&self, id: u64) -> bool {
+    pub(crate) fn holds(&self, id: u64) -> bool {
         lock(&self.regions).iter().any(|r| r.id == id)
     }
 }
