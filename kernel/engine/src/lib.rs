@@ -8,7 +8,7 @@
 //! arg serve                           # each argument after argv[0], in order
 //! env HOME=/tmp                       # each environment entry, in order
 //! memory 1073741824                   # the budget its machine has, in bytes
-//! scratch 268435456                   # its scratch directory's quota, in bytes
+//! scratch 268435456                   # its scratch directory's quota, in bytes; 0 for none
 //! grant vsock lookup vsock0           # slot `vsock`: a connection to a directory service
 //! grant linux personality             # slot `linux`: the personality's listener, to start tasks
 //! grant network service network      # fresh connection from explicitly granted listener
@@ -187,8 +187,9 @@ impl Config {
                 "scratch" => {
                     once(scratch.is_some())?;
                     let bytes = number(rest)?;
-                    if bytes == 0 || bytes % 4096 != 0 {
-                        return Err(refuse("scratch must be positive whole pages"));
+                    // 0: no scratch account at all, as a node's check runs (system design 3A).
+                    if bytes % 4096 != 0 {
+                        return Err(refuse("scratch must be whole pages, or 0 for none"));
                     }
                     scratch = Some(bytes);
                 }
@@ -301,6 +302,7 @@ impl Config {
             }
         }
         let runs = runs.unwrap_or(1);
+        // A scratch line is required, so that no configuration has none by leaving it out.
         if runs != 1
             && grants
                 .iter()
@@ -358,6 +360,7 @@ mod channel_tests {
                 "program /e\nmemory 4096\nscratch 4096\ngrant a channel account\n",
                 "a grant is",
             ),
+            ("program /e\nmemory 4096\nscratch 100\n", "whole pages"),
             (
                 "program /e\nmemory 4096\nscratch 4096\ngrant a data engine\n\
                  grant b channel engine\n",
@@ -367,6 +370,9 @@ mod channel_tests {
             let refused = Config::parse(text).expect_err(why);
             assert!(refused.contains(why), "{text}: {refused}");
         }
+        // A check's engine: no scratch account.
+        let check = Config::parse("program /e\nmemory 4096\nscratch 0\n").expect("no scratch");
+        assert_eq!(check.scratch, 0);
     }
 }
 
@@ -551,10 +557,15 @@ mod tests {
                 .unwrap_err()
                 .contains("scratch")
         );
+        // `scratch 0` says there is none (a node's check, item 3.2), as explicitly as a figure.
+        assert_eq!(
+            Config::parse("program /e\nmemory 4096\nscratch 0\n").map(|c| c.scratch),
+            Ok(0)
+        );
         assert!(
-            Config::parse("program /e\nmemory 4096\nscratch 0\n")
+            Config::parse("program /e\nmemory 4096\nscratch 4095\n")
                 .unwrap_err()
-                .contains("positive whole pages")
+                .contains("whole pages")
         );
         assert!(
             Config::parse("program /e\nmemory 1\nscratch 4096\n")
