@@ -78,7 +78,9 @@ arm beside Motor's.
   `log`); with no log, lines on its console (start slot `console`), each in one write; with
   neither, dropped. stdin is empty.
 - **env and args:** from the start page: the arguments are the process's name, and the
-  environment is empty; setting a variable is unsupported.
+  environment is the start slot `env` (item 5.5: entries `NAME=VALUE`, each ending in a zero
+  byte, in a read-only memory object), which the start reads once (`moruna_sys::rt::env`); a
+  process given no `env` has none. Setting a variable is unsupported.
 - **fs, net, process, pipe:** std's unsupported implementations: every call answers
   `Unsupported`.
 - **`std::os::moruna`:** `moruna_sys`, std's own copy, re-exported as Hermit's std re-exports
@@ -110,7 +112,7 @@ used.
 | `std/src/sys/args/mod.rs` | 71 | +7 -0 | `555d13de7285b38f85c22c162a3e6a34bbdbdc3d5161185d93f7c5339fe366e9` | `3fb4a68bc12be14c5c7a4f9acba8f13cd07919bf6e74cfeda4f2ce5b70f6a426` |
 | `std/src/sys/args/moruna.rs` | 9 | +9 -0 | new | `e546896dda0da8e6585afe135fc99fb7813de171e316dceeae31c81123cb57ca` |
 | `std/src/sys/env/mod.rs` | 69 | +7 -0 | `289b1cbe20f832c77397b87d996dbb17944ec96f48228f7bfd2a09a6cc9601c4` | `ec91605682920bd2a6c2276904fe470de18f3ddfa6b9e769c67c241f9d3224f6` |
-| `std/src/sys/env/moruna.rs` | 22 | +22 -0 | new | `0096ec86aa09f611f544197ef7d0f70679e451f6e1803ab5e4a69d72f18e4feb` |
+| `std/src/sys/env/moruna.rs` | 35 | +35 -0 | new | `0e6976dde9777888ea15a0e8ffe2defd75af64b65e78e0eb2e9ed79e7d96d5a9` |
 | `std/src/sys/exit.rs` | 166 | +4 -0 | `86fb31659a64ab6b5830e57b6ae506d9c3c5f424b585f4f90bb1f364cb64de04` | `6562bd174272860254af743889842a213c4eef10d2db5ff9e6a2e90d56182210` |
 | `std/src/sys/io/error/mod.rs` | 48 | +5 -0 | `1b591042fe82bc290244f6099db38bdb233578cdbcb2d927eab1181f035389d7` | `ad87700d9467fc5c6d9bf978ded0380d9bd15436fd99c40711999359e884f22c` |
 | `std/src/sys/io/error/moruna.rs` | 43 | +43 -0 | new | `21cbf255f65ed305d6f9e32708fea40deb7ac67e484252e17df769d204d08948` |

@@ -19,6 +19,8 @@ arrow-ipc = { version = "=59.3.0", default-features = false }
 arrow-schema = { version = "=59.3.0", default-features = false }
 arrow-select = { version = "=59.3.0", default-features = false }
 moruna-function = { path = ".", version = "=0.1.0" }
+# The root workspace's pin, as the engine and the gate's tasks have it.
+serde_json = { version = "=1.0.151" }
 
 [package]
 name = "moruna-function"
@@ -36,6 +38,8 @@ arrow-schema.workspace = true
 # The engine's own record check, run on every record before arrow-ipc reads it, and the page
 # layout of a record (contracts e.7).
 moruna-ipc-check = { path = "../../plane/check", version = "=0.1.0" }
+# A function's params and the run's arguments, JSON objects (`params`, `args`; item 5.5).
+serde_json.workspace = true
 
 [dev-dependencies]
 arrow-select.workspace = true

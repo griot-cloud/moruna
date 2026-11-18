@@ -76,7 +76,7 @@ The functions. Each entry has a `kind`.
 {"kind": "std", "name": "select", "args": {"columns": ["review_id", "score"]}}
 ```
 
-**`function`**: `function` is the name a node's functions are registered under (`POST /v1/functions`), and the task runs that function; `params` is its data, given to its process as `MORUNA_PARAMS` (a native function takes none):
+**`function`**: `function` is the name a node's functions are registered under (`POST /v1/functions`), and the task runs that function; `params` is its data, given to its process as `MORUNA_PARAMS`, native or image (with `MORUNA_ENTRY`, `MORUNA_ROLE` and `MORUNA_ARGS`, as [Images and ports](images.md) says; a native function's entry is its registered name):
 
 ```json
 {"kind": "function", "function": "taxi.score", "params": {"threshold": 0.5}}

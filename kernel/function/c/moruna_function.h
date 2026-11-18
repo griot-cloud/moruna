@@ -3,8 +3,9 @@
  * (architecture/moruna-os-system.md, 5B).
  *
  * A function is a program the data plane feeds Arrow batches. It links libmoruna_function.a,
- * which is moruna-function (kernel/function/rust, 5A) under these six calls, into one static
- * program for the core. Batches cross by the Arrow C Data Interface
+ * which is moruna-function (kernel/function/rust, 5A) under these six calls and moruna_params
+ * (its params, item 5.5), into one static program for the core. Batches cross by the Arrow C
+ * Data Interface
  * (https://arrow.apache.org/docs/format/CDataInterface.html): a batch is a struct array whose
  * children are its columns, and its schema a struct schema whose children are its fields.
  *
@@ -160,6 +161,15 @@ void moruna_error(struct moruna_task *task, const char *message);
  * released.
  */
 int  moruna_finish(struct moruna_task *task);
+
+/*
+ * The function's params, the JSON object its task was given, as text: MORUNA_PARAMS, which every
+ * function's process is given, native or image, as {"threshold":0.5}; "{}" when it was given
+ * none, or when the program runs outside a job. Needs no task. The text is read once and lives as
+ * long as the program: never free it. getenv("MORUNA_PARAMS") reads the same, and
+ * getenv("MORUNA_ARGS") the run's arguments.
+ */
+const char *moruna_params(void);
 
 #ifdef __cplusplus
 }

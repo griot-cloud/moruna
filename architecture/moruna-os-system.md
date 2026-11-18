@@ -723,7 +723,8 @@ There are two kinds:
   - the monotonic clock from the clock page;
   - randomness from the core;
   - stdout and stderr to the task's log;
-  - arguments and environment from the start page.
+  - arguments and environment from the start page: a native process's environment is its `env`
+    start slot (item 5.5).
   - Files, sockets and processes answer "unsupported" until a function needs them. A function's
     data comes through the plane, not through files.
 - **Decisions from item 5.0:**
@@ -799,6 +800,10 @@ There are two kinds:
   returns, section 0): CPython with pyarrow in a layered image, the batch exchanged as Arrow IPC.
   That is today's 0.6 path (`moruna.function`, the image builder of `python/moruna/_build.py`)
   and needs no new interface.
+- **Params (item 5.5):** a Python function reads its params as every function does, native or
+  image: `moruna.params()`, the task's `MORUNA_PARAMS`. The shim gives a decorated function the
+  job's params like any other and refuses none; a class task is still constructed with them, and
+  can read them through `moruna.params()` too.
 - **The SDK** keeps `@moruna.source`, `@moruna.function` and `@moruna.sink` (SDD 12). It gains
   `moruna.register(fn, client)`: build the image, sign it with the operator's key, upload it to
   object storage the node can read, and register it through `moruna.api` (2E).

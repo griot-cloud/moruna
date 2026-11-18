@@ -134,6 +134,11 @@ mod core_os {
         sys::start::process_name()
     }
 
+    /// std's environment, which its start read from the slot `env` (item 5.5).
+    pub fn environment() -> impl Iterator<Item = *const u8> {
+        sys::rt::env::c_entries()
+    }
+
     pub fn abi_version() -> u64 {
         sys::abi_version()
     }
@@ -404,6 +409,11 @@ mod host {
 
     pub fn name() -> &'static str {
         "host"
+    }
+
+    /// The host stands in one entry, as a task's environment holds them.
+    pub fn environment() -> impl Iterator<Item = *const u8> {
+        [c"MORUNA_ROLE=function".as_ptr().cast::<u8>()].into_iter()
     }
 
     pub fn abi_version() -> u64 {

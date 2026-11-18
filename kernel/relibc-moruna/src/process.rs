@@ -13,6 +13,12 @@ pub fn name() -> &'static str {
     os::name()
 }
 
+/// The process's environment, std's (its start slot `env`, item 5.5): each entry `NAME=VALUE` as
+/// a C string, valid for the process's life, which `environ` is built from.
+pub fn environment() -> impl Iterator<Item = *const u8> {
+    os::environment()
+}
+
 /// The process id every task has, as the first process of a system has on Linux.
 pub const PID: i32 = 1;
 
@@ -96,6 +102,15 @@ mod tests {
             [&b"Moruna"[..], b"host", b"2.8", b"moruna-sys", b"x86_64"]
         );
         assert_eq!(name(), "host");
+    }
+
+    #[test]
+    fn the_environment_is_each_entry_as_a_c_string() {
+        let entries: std::vec::Vec<&[u8]> = environment()
+            // SAFETY: each is a NUL-terminated entry the process keeps.
+            .map(|p| unsafe { core::ffi::CStr::from_ptr(p.cast()) }.to_bytes())
+            .collect();
+        assert_eq!(entries, [&b"MORUNA_ROLE=function"[..]]);
     }
 
     #[test]

@@ -64,6 +64,7 @@ from moruna._kinds import DeclaredKind, KindCall, kind, kinds
 from moruna._ports import BytesWriter, FileWriter, Ports, Resolver, Writer
 from moruna._register import Refused as RegisterRefused
 from moruna._report import RunReport
+from moruna._standin import params  # item 5.5: the same inside an image, where it is the stand-in
 
 __version__: str = _core.__version__
 
@@ -109,6 +110,7 @@ __all__ = [
     "kind",
     "kinds",
     "load",
+    "params",
     "read_events",
     "register",
     "run",

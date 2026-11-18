@@ -27,7 +27,7 @@ use serde_json::{Map, Value, json};
 
 use moruna_job::{Declaration, Fact, Flow, Isolation, Needs, Role, settings_schema};
 
-use super::image::{ARGS_ENV, PARAMS_ENV, ROLE_ENV};
+use super::image::{ARGS_ENV, ENTRY_ENV, PARAMS_ENV, ROLE_ENV};
 use super::{Context, Entry, RunnableKind, Stage};
 
 /// The `function` kind: a function task.
@@ -45,16 +45,10 @@ pub struct Settings {
     /// digits, `_`, `-` and `.`, a letter first. The node refuses a name it has not registered.
     pub function: String,
     /// The function's params, data only, given to its process as `MORUNA_PARAMS`, as an
-    /// `image` task's are.
+    /// `image` task's are, whether the function is native or an image.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub params: Map<String, Value>,
 }
-
-/// Why a native function is refused params: its program is started with no environment.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const NATIVE_TAKES_NO_PARAMS: &str = "a native function is started with no environment, and \
-                                      `moruna-function` (5A) has no way to read params: \
-                                      give a native function none";
 
 /// Why a function task is refused anywhere but on a Moruna node.
 const ON_A_NODE_ONLY: &str = "a registered function runs on a Moruna node, whose admission gives \
@@ -155,6 +149,24 @@ pub(crate) fn runner_env(
             moruna_job::canonical_json(&Value::Object(args.clone())),
         ),
     ])
+}
+
+/// The whole environment of the native function `name`'s process (item 5.5), as an image
+/// function's process gets the same four variables: its entry, which is its registered name,
+/// and the runner's ([`runner_env`]). Each `NAME=VALUE`, in name order; the kernel gives them as
+/// the process's start slot `env`.
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+pub(crate) fn native_env(
+    name: &str,
+    params: &Map<String, Value>,
+    args: &Map<String, Value>,
+) -> Vec<String> {
+    let mut env = runner_env(params, args);
+    env.insert(ENTRY_ENV.to_string(), name.to_string());
+    env.into_iter().map(|(k, v)| format!("{k}={v}")).collect()
 }
 
 /// The process of the image function `name` whose archive `archive` is the file `bytes`: its
@@ -285,16 +297,16 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
     let (task, what) =
         match content(name, function.bytes()).map_err(|why| entry.refuse("function", why))? {
             Content::Native => {
-                if !settings.params.is_empty() {
-                    return Err(entry.refuse("params", NATIVE_TAKES_NO_PARAMS));
-                }
-                let identity = json!({"function": name, "sha256": sha256, "abi": "moruna"});
+                let env = native_env(name, &settings.params, cx.args());
+                let identity = json!({
+                    "function": name, "sha256": sha256, "abi": "moruna", "env": env,
+                });
                 let task = ImageTask::new(
                     &reference,
                     &identity.to_string(),
                     format!("/{}", function.slot),
                     vec![name.clone()],
-                    Vec::new(),
+                    env,
                     Vec::new(),
                 )
                 .map_err(made)?

@@ -7,13 +7,16 @@ The build copies this file into the shim's layer as ``/opt/moruna/moruna/__init_
 module uses, and they behave as the engine's do for the shim: a task reads its ports as
 ``self.ports[name]`` (each a client of the port protocol) and the run's arguments as
 ``self.args``; a decorated function carries the ``wrapped`` callable and ``stateful`` flag the
-shim reads. The declarations (schemas, memory, tier and the rest) are how the engine plans and
-checks a task; in an image the shim checks ``takes`` and ``gives`` on every batch and reads
-nothing else. Every other name of ``moruna`` is refused when it is used, saying so.
+shim reads; ``moruna.params()`` reads the task's params, as it does outside an image (the
+package's is this one). The declarations (schemas, memory, tier and the rest) are how the engine
+plans and checks a task; in an image the shim checks ``takes`` and ``gives`` on every batch and
+reads nothing else. Every other name of ``moruna`` is refused when it is used, saying so.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import types
 from typing import Any
 
@@ -80,8 +83,25 @@ def function(fn: Any = None, *, stateful: bool = False, **declarations: Any) -> 
     return decorate(fn)
 
 
+def params() -> dict[str, Any]:
+    """The task's params: ``MORUNA_PARAMS``, the JSON object its task was given (item 5.5).
+
+    Every function's process is given it, native or image, so a function reads its params the
+    same way wherever it runs. ``{}`` when it was given none, or when the process runs outside a
+    job. A value that is not a JSON object raises ``ValueError`` naming the variable.
+    """
+    text = os.environ.get("MORUNA_PARAMS") or "{}"
+    try:
+        value = json.loads(text)
+    except ValueError as exc:
+        raise ValueError(f"MORUNA_PARAMS is not JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"MORUNA_PARAMS is a JSON object, not {type(value).__name__}")
+    return value
+
+
 def __getattr__(name: str) -> Any:
     raise AttributeError(
         f"moruna.{name}: inside an image Moruna builds the moruna module holds only Task, "
-        "Source, Function, Sink, Split and function; the engine is not in the image"
+        "Source, Function, Sink, Split, function and params; the engine is not in the image"
     )

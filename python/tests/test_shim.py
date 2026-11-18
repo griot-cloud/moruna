@@ -276,7 +276,7 @@ def test_bd_t5_the_stand_in_refuses_the_rest_of_moruna(image: Path) -> None:
     assert done.returncode == 1
     assert (
         "moruna.run" in done.stderr.decode()
-        and "holds only Task, Source, Function, Sink, Split and function"
+        and "holds only Task, Source, Function, Sink, Split, function and params"
         in done.stderr.decode()
     )
 
@@ -603,6 +603,67 @@ def test_a_function_has_its_params_arguments_ports_and_finish(image: Path) -> No
     out = [b.column("id").to_pylist() for b in read_all(done.stdout)]
     assert out == [[1102, 1103], [1104], [-3]], "one batch per batch in, then finish's"
     assert calls == [("warehouse.read", b"orders")] * 2
+
+
+PARAMS = """
+    import moruna
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    @moruna.function
+    def scale(batch):
+        by = moruna.params()["by"]
+        return pa.RecordBatch.from_arrays([pc.multiply(batch.column("id"), by)], names=["id"])
+
+    class Total:
+        def setup(self, ctx):
+            return {"by": moruna.params()["by"], "rows": 0}
+
+        def __call__(self, state, batch):
+            state["rows"] += batch.num_rows
+            return batch
+
+        def finish(self, state):
+            return pa.RecordBatch.from_arrays(
+                [pa.array([state["rows"] * state["by"]], pa.int64())], names=["id"]
+            )
+
+    total = moruna.function(Total(), stateful=True)
+
+    class Shift(moruna.Function):
+        def __init__(self, by):
+            assert moruna.params() == {"by": by}, "the constructor's params are moruna.params()"
+            self.by = by
+
+        def __call__(self, batch):
+            return pa.RecordBatch.from_arrays(
+                [pc.add(batch.column("id"), self.by)], names=["id"]
+            )
+"""
+
+
+def test_a_decorated_function_given_params_reads_them(image: Path) -> None:
+    """Item 5.5: a function reads its params one way, native or image. A decorated function given
+    params reads them through moruna.params(), stateless or stateful, and nothing refuses them; a
+    class task is still constructed with them, and reads the same through moruna.params()."""
+    module = kernel_module(image, "params_fns", PARAMS)
+    done = run_shim(
+        image, module + ":scale", stream(batch(1, 2), batch(3)), MORUNA_PARAMS='{"by": 10}'
+    )
+    assert done.returncode == 0, done.stderr.decode()
+    assert [b.column("id").to_pylist() for b in read_all(done.stdout)] == [[10, 20], [30]]
+    done = run_shim(
+        image, module + ":total", stream(batch(1, 2), batch(3)), MORUNA_PARAMS='{"by": 7}'
+    )
+    assert done.returncode == 0, done.stderr.decode()
+    assert [b.column("id").to_pylist() for b in read_all(done.stdout)] == [[1, 2], [3], [21]]
+    done = run_shim(image, module + ":Shift", stream(batch(1, 2)), MORUNA_PARAMS='{"by": 5}')
+    assert done.returncode == 0, done.stderr.decode()
+    assert [b.column("id").to_pylist() for b in read_all(done.stdout)] == [[6, 7]]
+    # Given none, a function reads {}: the decorated one that needs "by" says so itself.
+    bare = run_shim(image, module + ":scale", stream(batch(1)))
+    assert bare.returncode == 1 and b"KeyError" in bare.stderr, bare.stderr.decode()
+    assert b"takes no params" not in bare.stderr
 
 
 def test_a_port_that_refuses_and_a_task_without_a_socket(image: Path) -> None:

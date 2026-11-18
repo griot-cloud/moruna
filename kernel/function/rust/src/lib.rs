@@ -7,6 +7,8 @@
 //! number of times. A returned [`FunctionError`] ends the task with its message in the task's log,
 //! and [`log`] writes a line there. A function with something to write once the input has ended
 //! (an aggregate) is a [`Function`], whose [`Function::end`] is called after the last batch.
+//! [`params`] gives the function's params, the JSON object its task was given, and [`args`] the
+//! run's arguments, the same way whether the function is native or an image.
 //!
 //! ```no_run
 //! use std::process::ExitCode;
@@ -37,6 +39,7 @@
 mod emit;
 mod error;
 mod lane;
+mod params;
 mod record;
 mod serve;
 /// The task a call at a time, which the C library (`kernel/function/c`, system design 5B) is
@@ -58,6 +61,7 @@ use sys as platform;
 pub use arrow_array::RecordBatch;
 pub use emit::Emit;
 pub use error::FunctionError;
+pub use params::{args, params};
 pub use serve::{Function, serve};
 
 /// A task's exit codes, the ones the gate's tasks have always ended with. [`serve`] says the code

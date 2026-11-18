@@ -1,5 +1,5 @@
 //! libmoruna_function: the six calls of `moruna_function.h` (architecture/moruna-os-system.md,
-//! 5B), over moruna-function (5A).
+//! 5B), over moruna-function (5A), and `moruna_params` (item 5.5).
 //!
 //! Each call is a call of the SDK's task driven a call at a time (`moruna_function::task`),
 //! which keeps the ring protocol, the record check and the exit codes as `serve` does. Batches
@@ -22,9 +22,9 @@ extern crate relibc;
 #[cfg(target_os = "moruna")]
 use moruna_getrandom as _;
 
-use std::ffi::{CStr, c_char, c_int};
+use std::ffi::{CStr, CString, OsString, c_char, c_int};
 use std::marker::{PhantomData, PhantomPinned};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::{Array, RecordBatch, RecordBatchOptions, StructArray};
 use arrow_data::ffi::FFI_ArrowArray;
@@ -421,11 +421,41 @@ pub unsafe extern "C" fn moruna_finish(task: *mut moruna_task) -> c_int {
     exit_code(task.finish())
 }
 
+/// The function's params as JSON text (item 5.5): `MORUNA_PARAMS`, which every function's
+/// process is given, native or image (on the core std read it from the start slot `env`); `{}`
+/// when the process was given none. Read once; the text lives as long as the program.
+#[unsafe(no_mangle)]
+pub extern "C" fn moruna_params() -> *const c_char {
+    static PARAMS: OnceLock<CString> = OnceLock::new();
+    PARAMS
+        .get_or_init(|| params_text(std::env::var_os(PARAMS_ENV)))
+        .as_ptr()
+}
+
+/// The variable that holds a function's params.
+const PARAMS_ENV: &str = "MORUNA_PARAMS";
+
+/// The variable's `value` as the C string `moruna_params` gives: `{}` when it is unset. An
+/// environment's value holds no zero byte.
+fn params_text(value: Option<OsString>) -> CString {
+    value
+        .and_then(|v| CString::new(v.into_encoded_bytes()).ok())
+        .unwrap_or_else(|| c"{}".to_owned())
+}
+
 /// The checks against structures arrow-rs made and then damaged; the calls themselves are
 /// driven from C in tests/header.rs.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_params_are_the_variables_text_or_an_empty_object() {
+        assert_eq!(params_text(None).as_c_str(), c"{}");
+        let given = OsString::from(r#"{"threshold":0.5}"#);
+        assert_eq!(params_text(Some(given)).as_c_str(), c"{\"threshold\":0.5}");
+        assert_eq!(params_text(Some(OsString::new())).as_c_str(), c"");
+    }
     use arrow_array::types::Int32Type;
     use arrow_array::{ArrayRef, Int32Array, ListArray};
     use arrow_buffer::OffsetBuffer;

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Each source, its compiler, and its own flags.
-const SOURCES: [(&str, &str, &[&str]); 5] = [
+const SOURCES: [(&str, &str, &[&str]); 6] = [
     (
         "examples/double.c",
         "CC",
@@ -20,6 +20,11 @@ const SOURCES: [(&str, &str, &[&str]); 5] = [
         "tests/c/runtime.c",
         "CC",
         &["-std=c11", "-Dmain=moruna_test_runtime"],
+    ),
+    (
+        "tests/c/params.c",
+        "CC",
+        &["-std=c11", "-Dmain=moruna_test_params"],
     ),
     ("tests/c/support.c", "CC", &["-std=c11"]),
     ("tests/c/scenarios.c", "CC", &["-std=c11"]),

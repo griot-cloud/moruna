@@ -27,6 +27,8 @@
 extern crate alloc;
 
 pub mod datapath;
+// Item 5.5: a native process's environment, its start slot `env`.
+pub mod env;
 #[cfg(feature = "heap")]
 mod heap;
 pub mod hyperv;

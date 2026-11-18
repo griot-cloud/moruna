@@ -151,6 +151,48 @@ fn an_image_functions_command_is_found_in_its_own_files() {
 }
 
 #[test]
+fn a_native_function_gets_the_four_variables_an_image_function_gets() {
+    let params = Map::from_iter([("threshold".to_string(), json!(0.5))]);
+    let args = Map::from_iter([("year".to_string(), json!(2024))]);
+    let native = native_env("taxi.score", &params, &args);
+    assert_eq!(
+        native,
+        [
+            "MORUNA_ARGS={\"year\":2024}",
+            "MORUNA_ENTRY=taxi.score",
+            "MORUNA_PARAMS={\"threshold\":0.5}",
+            "MORUNA_ROLE=function",
+        ],
+        "its entry is its registered name"
+    );
+    // The same names as an image function's process has, whose entry its image's config gives.
+    let scratch = Scratch::new("function_native_env");
+    let bytes = archive_of(&scratch, "score", config(&["score"]), &linux());
+    let archive = Archive::parse(&bytes).unwrap();
+    let program =
+        image_program("taxi.score", &bytes, &archive, &runner_env(&params, &args)).unwrap();
+    let names = |env: &[String]| -> Vec<String> {
+        let mut names: Vec<String> = env
+            .iter()
+            .filter_map(|e| e.split_once('=').map(|(n, _)| n.to_string()))
+            .filter(|n| n.starts_with("MORUNA_"))
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names(&program.launch.env_entries()), names(&native));
+    let image_params = program
+        .launch
+        .env_entries()
+        .into_iter()
+        .find(|e| e.starts_with("MORUNA_PARAMS="));
+    assert_eq!(image_params.as_deref(), Some(native[2].as_str()));
+    // A function given no params has `{}`, native or image.
+    let none = native_env("taxi.clean", &Map::new(), &Map::new());
+    assert!(none.iter().any(|e| e == "MORUNA_PARAMS={}"), "{none:?}");
+}
+
+#[test]
 fn an_image_function_the_personality_cannot_run_is_refused() {
     let scratch = Scratch::new("function_refusals");
     let env = runner_env(&Map::new(), &Map::new());

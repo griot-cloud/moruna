@@ -185,7 +185,7 @@
     },
     "src/start.rs": {
       "upstream_sha256": "a5c46a5191151a37b7d3f94f19e5d0133846a41d738e12e4f7eaeee9d475d27f",
-      "patched_sha256": "afa3b7d1b214cd104946990941b2655a288a137fb69fcae2b0831822ac379658"
+      "patched_sha256": "7a1bdccd0f5cd3a313e8889f5f6e47591e770568316f2a3ecb7f8ec13f5420a3"
     },
     "src/sync/mod.rs": {
       "upstream_sha256": "ab27e6ab289cf59cd8934a60618fee2d561e5b6faa8f5e004188e3d723b9c222",

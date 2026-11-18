@@ -21,7 +21,8 @@ Any failure is a message on standard error and exit status 1, with no end-of-str
 the runner sees the process end and says why. The shim imports only the standard library and
 ``pyarrow``; ``import moruna`` inside an image finds the stand-in (``_standin.py``). The code is
 found by what the engine's tasks and the stand-in's both have: a class is constructed with the
-params; a decorated function has a ``wrapped`` callable and a ``stateful`` flag.
+params; a decorated function has a ``wrapped`` callable and a ``stateful`` flag, and reads its
+params through ``moruna.params()``, as a class may too.
 """
 
 from __future__ import annotations
@@ -184,7 +185,8 @@ def _target(entry: str) -> Any:
 
 def make(entry: str, params: dict[str, Any], args: dict[str, Any], ports: dict[str, Port]) -> Any:
     """The task ``entry`` names: a class constructed with ``params``, given its ports and the
-    run's arguments; or a decorated (or plain) function, which takes no params."""
+    run's arguments; or a decorated (or plain) function, which reads its params itself through
+    ``moruna.params()``, as every function does, native or image (item 5.5)."""
     target = _target(entry)
     if inspect.isclass(target):
         try:
@@ -196,8 +198,6 @@ def make(entry: str, params: dict[str, Any], args: dict[str, Any], ports: dict[s
         task.__dict__["_moruna_ports"] = types.MappingProxyType(dict(ports))
         task.__dict__["_moruna_run_args"] = types.MappingProxyType(dict(args))
         return task
-    if params:
-        raise ShimError(f"entry {entry!r} is a function, and takes no params ({sorted(params)})")
     if not callable(getattr(target, "wrapped", target)):
         raise ShimError(f"entry {entry!r} is a {type(target).__name__}, which is not callable")
     return target
