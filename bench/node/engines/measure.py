@@ -319,6 +319,8 @@ def record(spec, rid, results, rec):
                                      "oom_kills", "memory_gib", "data", "copy_in_s", "copy_out_s")}
     if rec.get("error_lines"):
         brief["error_lines"] = rec["error_lines"]
+    if rec.get("python"):
+        brief["python"], brief["gil"] = rec["python"], rec.get("gil")
     check = rec.get("output_check") or {}
     brief["output"] = check.get("verdict")
     brief["check"] = {k: check[k] for k in ("ok", "hash_all", "max_abs", "verdict") if k in check}
@@ -370,6 +372,10 @@ def run(a):
            "memory_gib": spec.get("mem_gib"), **data, **totals, **phases(result, t0, t1)}
     if dropped:
         rec["markers_dropped"] = dropped
+    if (result or {}).get("python"):
+        # The engine's interpreter and whether it has the GIL, for the table's Python column:
+        # engines differ (install.py puts each on the newest CPython it installs on).
+        rec["python"], rec["gil"] = result["python"], result.get("gil")
     rec["ok"] = code == 0 and result is not None and not result.get("error")
     if not rec["ok"]:
         rec["stderr"] = stderr

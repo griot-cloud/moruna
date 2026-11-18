@@ -1,6 +1,7 @@
 """The table of system design 6B, and the run's entry in architecture/benchmark-log.md.
 
-Per job, a row per engine: the medians of operational time, start-up, CPU-seconds and peak
+Per job, a row per engine: its interpreter (the CPython version and whether it has the GIL: the
+engines differ), the medians of operational time, start-up, CPU-seconds and peak
 memory, the time split where the engine reports one, whether its output is 0.6.6's, and how many
 runs passed, with each failed run's own error (the last line of its engine's stderr). Under it,
 the bar's two steps for Moruna, judged on operational time as bench/vm/report.py judges 0.7:
@@ -149,9 +150,9 @@ def render(summary: dict) -> str:
         out += [wheel_line(summary["wheel_066"]), ""]
     for job, j in summary["jobs"].items():
         out.append(f"### {job}\n")
-        out.append("| Engine | Function | Operational s | Start-up s | CPU s | Peak GiB | Memory given GiB | Data | "
-                   + " | ".join(c[0] for c in COLUMNS) + " | Output against 0.6.6 | Runs ok |")
-        out.append("|" + " --- |" * (10 + len(COLUMNS)))
+        out.append("| Engine | Function | Python | Operational s | Start-up s | CPU s | Peak GiB | Memory given GiB | "
+                   "Data | " + " | ".join(c[0] for c in COLUMNS) + " | Output against 0.6.6 | Runs ok |")
+        out.append("|" + " --- |" * (11 + len(COLUMNS)))
         for r in j["engines"].values():
             s = r.get("split") or {}
             data = r.get("data") or ""
@@ -160,8 +161,9 @@ def render(summary: dict) -> str:
             startup = fmt(r["startup_s"], 2)
             if startup and r.get("startup_within_s"):
                 startup += f" (±{r['startup_within_s']} s)"
-            out.append(f"| {r['label']} | {r['function']} | {fmt(r['operational_s'])} | {startup} | "
-                       f"{fmt(r['cpu_s'])} | {fmt(r['peak_gib'], 2)} | {fmt(r.get('memory_gib'), 2)} | {data} | "
+            out.append(f"| {r['label']} | {r['function']} | {r.get('python') or ''} | {fmt(r['operational_s'])} | "
+                       f"{startup} | {fmt(r['cpu_s'])} | {fmt(r['peak_gib'], 2)} | {fmt(r.get('memory_gib'), 2)} | "
+                       f"{data} | "
                        + " | ".join(split_cell(s, k, joint) for _, k, joint in COLUMNS)
                        + f" | {r['output']} | {runs_cell(r)} |")
         out.append("")
@@ -179,7 +181,10 @@ def render(summary: dict) -> str:
                "reads and writes the run's one Blob container with its own reader inside operational time; a "
                "row marked `local copy` has no Blob reader, and its copies are timed apart. Memory given is "
                "what each platform leaves a job on the same machine: the node's job bound (`job_memory_bytes`, "
-               "3A) for Moruna, the plan's figure on Linux. CPU s is blank where it was not measured: Moruna's "
+               "3A) for Moruna, the plan's figure on Linux. Python is the interpreter each engine's runs "
+               "recorded and whether it has the GIL: each engine runs on the newest CPython it installs on, "
+               "0.6.6 on its wheel's (free-threaded), and `none` runs no Python. "
+               "CPU s is blank where it was not measured: Moruna's "
                "is its report's `resources.cpu_core_s` when the report says `usage_measured`. Medians of the "
                "measured repeats; the learning run and the noise pairs are left out. A failed run's own error, "
                "the last line of its engine's stderr, follows its row's count of runs.")

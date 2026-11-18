@@ -720,7 +720,8 @@ class Fake(run.DryRun):
             if self.fail_on and self.fail_on in argv:
                 return {"name": name, "state": "failed", "steps": ended, "error": f"failed: {self.fail_on}"}
             failed = st["id"] == "setup" and self.not_installed
-            ended.append({"id": st["id"], "exit": 1 if failed else 0, "stdout": self.step_out(st, argv)})
+            ended.append({"id": st["id"], "exit": 1 if failed else 0, "stdout": self.step_out(st, argv),
+                          "stderr": "Downloading cpython-3.14.3-linux-x86_64-gnu (download)\n" if failed else ""})
         return {"name": name, "state": "done", "steps": ended}
 
     def step_out(self, st, text):
@@ -734,9 +735,13 @@ class Fake(run.DryRun):
         if st["id"] == "setup":
             # setup-linux.sh's line: each engine run.py named (ENGINES), and why one did not install.
             names = st["env"]["ENGINES"].split(",")
+            why = "uv pip install... exited 1: no wheel for this interpreter"
             return "SETUP " + json.dumps({"installed": {e: e not in self.not_installed for e in names},
-                                          "errors": {e: f"{e} installs and imports on none of CPython 3.14+gil"
+                                          "errors": {e: "installs and imports on none of CPython 3.14+gil, 3.13+gil"
                                                      for e in self.not_installed},
+                                          "tried": {e: [{"python": "3.14+gil", "error": why},
+                                                        {"python": "3.13+gil", "error": why}]
+                                                    for e in self.not_installed},
                                           "wheel_066": self.wheel, "wheel_066_s": 1800,
                                           "wheel_066_name": "moruna-0.6.6-cp314-cp314t-linux_x86_64.whl",
                                           "wheel_066_sha256": WHEEL_SHA})
@@ -747,12 +752,15 @@ class Fake(run.DryRun):
             fast = {"moruna066": 9.0, "moruna066-rust": 6.0, "rust-pool": 4.5}.get(spec["engine"], 12.0)
             copy = {"data": "local copy", "copy_in_s": 2.0, "copy_out_s": 1.0} if spec["engine"] == "rust-pool" else \
                 {"data": "blob"}
+            # Each engine's interpreter, as measure.py records it: 0.6.6 free-threaded, the Rust pool none.
+            python = {} if spec["engine"] == "rust-pool" else {
+                "python": "3.14.3", "gil": spec["engine"] not in ("moruna066", "moruna066-rust")}
             rec = {"spec": spec, "ok": True, "startup_s": 0.5, "operational_s": fast, "cpu_s": 30.0,
-                   "peak_bytes": 2 << 30, "memory_gib": spec["mem_gib"], **copy,
+                   "peak_bytes": 2 << 30, "memory_gib": spec["mem_gib"], **copy, **python,
                    "output_check": {"ok": True, "hash_all": True, "verdict": "bit for bit"}}
             os.makedirs(os.path.join(self.results, "results"), exist_ok=True)
             json.dump(rec, open(os.path.join(self.results, "results", f"{rid}.json"), "w"))
-            return "MEASURED " + json.dumps({"id": rid, "ok": True, "output": "bit for bit"})
+            return "MEASURED " + json.dumps({"id": rid, "ok": True, "output": "bit for bit", **python})
         if "measure.py check" in text:
             return 'MEASURED {"ok": true, "output": "bit for bit"}'
         return ""
@@ -896,9 +904,14 @@ def test_a_whole_run_against_fakes(tmp_path):
     assert s["duckdb"]["operational_s"] == 12.0 and s["duckdb"]["output"] == "bit for bit"
     assert "duckdb-sql" not in s and "duckdb-sql" in x.summary["jobs"]["enrich"]["engines"]
     table_text = open(tmp_path / "table.md").read()
-    assert ("| Moruna 0.7, the node | rust | 3.0 | 0.75 | 20.0 | 3.00 | 13.00 | blob | 0.7 | 0.3 | 4.0 | 0.2 | 0.3 | "
-            "0.0 | bit for bit | 5/5 |") in table_text
-    assert "| the plain Rust pool | rust | 4.5 | 0.50 | 30.0 | 2.00 | 14.00 | local copy, 3.0 s apart |" in table_text
+    assert ("| Moruna 0.7, the node | rust | none | 3.0 | 0.75 | 20.0 | 3.00 | 13.00 | blob | 0.7 | 0.3 | 4.0 | 0.2 | "
+            "0.3 | 0.0 | bit for bit | 5/5 |") in table_text
+    assert ("| the plain Rust pool | rust | none | 4.5 | 0.50 | 30.0 | 2.00 | 14.00 | local copy, 3.0 s apart |"
+            in table_text)
+    # The Python column: each engine's interpreter and its GIL, as its runs recorded them.
+    assert "| 0.6.6, Python function | python | 3.14.3, free-threaded | 9.0 |" in table_text
+    assert "| 0.6.6, Rust function | rust | 3.14.3, free-threaded | 6.0 |" in table_text
+    assert "| Ray | python | 3.14.3, GIL | 12.0 |" in table_text
     log = open(tmp_path / "benchmark-log.md").read()
     assert log.startswith("# The benchmark log") and "## 202611180900: plan nyc-2024" in log
     # 3.0 s against the Rust pool's 4.5 s is 1.5x: the bar's time holds; its CPU (20 s) is the least.
@@ -978,7 +991,7 @@ def test_each_run_lands_as_it_finishes_and_the_table_reads_them_so_far(tmp_path)
     assert run.main(["--plan", "nyc-2024", "--table", str(results)], out=out) == 0
     text = out.getvalue()
     assert text.startswith(f"# {9 * 6 - 6 + 4} of 250 runs recorded in {results}")
-    assert "| DuckDB | python | 12.0 |" in text and "### occupancy" in text
+    assert "| DuckDB | python | 3.14.3, GIL | 12.0 |" in text and "### occupancy" in text
     assert (results / "summary.json").exists() and (results / "table.md").exists()
     with pytest.raises(SystemExit):
         run.main(["--plan", "nyc-2024", "--table", str(tmp_path / "none")], out=io.StringIO())
@@ -1057,7 +1070,7 @@ def test_a_failed_setup_step_stops_the_run(tmp_path, ended, message):
     # record kept; before, the runs failed one by one.
     with pytest.raises(RuntimeError, match="the setup did not install harness, moruna066.*: harness: no record"):
         b.setup_done({"id": "setup"}, {"id": "setup", "exit": 1, "stdout": "", "stderr": "boom"})
-    assert b.setup == {"linux_image": "<linux-image-version>"}
+    assert b.setup == {"linux_image": "<linux-image-version>", "exit": 1, "stderr": "boom"}
     with pytest.raises(RuntimeError, match="the setup did not install every engine.*exit 1: boom"):
         b.setup_done({"id": "setup"}, {"id": "setup", "exit": 1, "stderr": "boom", "stdout": "SETUP " + json.dumps(
             {"installed": {e: True for e in b.installs()}})})
@@ -1420,12 +1433,12 @@ def test_the_table_and_its_verdicts():
     s = summary_of(recs)
     text = table.render(s)
     # runner_split.py's joined stages stand in the read and write columns, named.
-    assert ("| Moruna 0.7, the node | rust | 2.0 | 0.40 | 10.0 | 1.00 |  |  | 2.0 (read and decode) |  | 5.0 |  | "
+    assert ("| Moruna 0.7, the node | rust | none | 2.0 | 0.40 | 10.0 | 1.00 |  |  | 2.0 (read and decode) |  | 5.0 |  | "
             "1.0 (encode and write) | 0.5 | bit for bit | 1/1 |") in text
     six = {"read_s": 0.7, "decode_s": 0.3, "function_s": 4.0, "encode_s": 0.2, "write_s": 0.3, "wait_s": 0.5}
     text6 = table.render(summary_of([rec("moruna-node", 1, 2.0, split=six), rec("moruna066", 1, 9.0)]))
     assert "| blob |" not in text6 and "|  | 0.7 | 0.3 | 4.0 | 0.2 | 0.3 | 0.5 | bit for bit | 1/1 |" in text6
-    assert text6.splitlines()[2].count("|") == text6.splitlines()[3].count("|") == 17
+    assert text6.splitlines()[2].count("|") == text6.splitlines()[3].count("|") == 18
     assert "**PASS** no regression" in text
     # DuckDB's 3.5 s is 1.75x Moruna's 2.0 s, and Moruna's CPU is the least: the bar holds.
     assert "**PASS** the bar: 1.75x" in text
@@ -2316,14 +2329,18 @@ def fake_uv(tmp_path, refuse):
 
 
 def test_each_engine_lands_on_the_newest_cpython_it_installs_and_imports_on(tmp_path, monkeypatch):
-    """Ray on 3.14 and 3.13 installs but `ray.data` does not import (2026-11-18: typing_extensions,
-    which only a dependency below 3.13 brings); on 3.12 it does. Each interpreter tried before is
-    kept with why, and leaves no environment behind."""
+    """An engine that installs on 3.14 and 3.13 but whose module does not import there, as Ray
+    2.60.0 did as published (2026-11-18: `ray.data` imports typing_extensions, which only a
+    dependency below 3.13 brings): it lands on 3.12. Each interpreter tried before is kept with
+    why, and leaves no environment behind. Ray itself now gets typing-extensions beside it, the
+    dependency it omits, and so its best configuration, the newest CPython."""
     seen, sh, versions = fake_uv(tmp_path, lambda i: "ModuleNotFoundError" if i[:4] in ("3.14", "3.13") else None)
     monkeypatch.setattr(install, "sh", sh)
     monkeypatch.setattr(install, "versions", versions)
     root = tmp_path / "root"
     assert install.main(["--root", str(root), "--gate-src", str(tmp_path), "--engines", "ray"]) == 0
+    assert install.PIP["ray"][1] == ["ray[data]", "typing-extensions", "pyarrow", "pandas", "numpy"]
+    assert all(c[-5:] == install.PIP["ray"][1] for c in seen if c[:3] == ["uv", "pip", "install"])
     ray = json.load(open(root / "installed.json"))["ray"]
     assert (ray["ok"], ray["interpreter"], ray["python"], ray["gil"]) == (True, "3.12+gil", "3.12.3", True)
     assert ray["tried"] == [{"python": "3.14+gil", "error": "did not import: ray.data (missing: ModuleNotFoundError)"},
@@ -2339,6 +2356,10 @@ def test_each_engine_lands_on_the_newest_cpython_it_installs_and_imports_on(tmp_
     dask = json.load(open(tmp_path / "r2" / "installed.json"))["dask"]
     assert not dask["ok"] and "dask installs and imports on none of CPython 3.14+gil, 3.13+gil" in dask["error"]
     assert "3.10+gil: uv pip install... exited 1" in dask["error"] and not (tmp_path / "r2" / "venv-dask").exists()
+    # Each interpreter's own error is kept whole, not only the end of them all: the setup's line
+    # and setup.json carry it, so a setup that refuses says why (run 3's did not).
+    assert [t["python"] for t in dask["tried"]] == list(install.GIL)
+    assert all(t["error"] == "uv pip install... exited 1: no wheel for this interpreter" for t in dask["tried"])
     # An interpreter that does not answer at all.
     monkeypatch.setattr(install, "versions", lambda python, modules: {"error": "Segmentation fault"})
     with pytest.raises(RuntimeError, match="the interpreter did not answer: Segmentation fault"):
@@ -2551,11 +2572,24 @@ def test_the_setup_refuses_to_go_on_when_an_engine_did_not_install(tmp_path):
     args.engines = ["ray", "duckdb"]
     x = Fake(str(tmp_path), not_installed=("ray",))
     with pytest.raises(RuntimeError, match="the setup did not install ray, so the run stops before any measured run: "
-                                           "ray: ray installs and imports on none of CPython"):
+                                           r"ray: on CPython 3.14\+gil: uv pip install... exited 1: no wheel for this "
+                                           r"interpreter; on CPython 3.13\+gil: uv pip install"):
         run.Bench(nyc_plan(), x, azure.Cloud("202611180900"), args, str(tmp_path), "/s").go()
     assert x.started == ["setup"] and not (tmp_path / "live").exists()
-    assert json.load(open(tmp_path / "setup.json"))["installed"]["ray"] is False
+    # setup.json explains the refusal by itself: each interpreter tried and its install's error
+    # lines, the step's exit code and what the batch kept of its stderr.
+    kept = json.load(open(tmp_path / "setup.json"))
+    assert kept["installed"]["ray"] is False and kept["installed"]["duckdb"] is True
+    assert kept["tried"]["ray"][0] == {"python": "3.14+gil",
+                                       "error": "uv pip install... exited 1: no wheel for this interpreter"}
+    assert kept["errors"]["ray"].startswith("installs and imports on none of CPython 3.14+gil")
+    assert kept["exit"] == 1 and kept["stderr"].startswith("Downloading cpython-3.14.3")
     assert x.azs[-2].startswith("az group delete") and x.logged is False
+    # A setup with no line at all (it died before install.py): the step's own stderr is the why.
+    b = run.Bench(nyc_plan(), Fake(str(tmp_path / "b")), cloud(), Args(), str(tmp_path / "b"), "/s")
+    with pytest.raises(RuntimeError, match="no record"):
+        b.setup_done({"id": "setup"}, {"id": "setup", "exit": 100, "stdout": "", "stderr": "E: Unable to locate"})
+    assert json.load(open(tmp_path / "b" / "setup.json"))["stderr"] == "E: Unable to locate"
 
 
 def test_a_rerun_writes_its_stamp_and_engines(tmp_path, monkeypatch):
@@ -2594,10 +2628,12 @@ def results_dir(path, records, stamp=None, setup=None):
 def test_the_table_merges_results_directories_newest_per_run(tmp_path):
     """Run 3, then a rerun of DuckDB: the rerun's records replace run 3's for the same runs, the
     others stay; the directories ordered by their stamps whatever order they are given in."""
+    # Run 3's full records hold the interpreter in the engine's RESULT; newer ones beside it too.
     old = results_dir(tmp_path / "202611181311", [rec("moruna066", 1, 9.0), rec("duckdb", 1, None, ok=False),
-                                                  rec("polars", 1, 15.0)],
+                                                  dict(rec("polars", 1, 15.0), result={"python": "3.14.2", "gil": True})],
                       setup={"wheel_066": "built", "wheel_066_name": "w.whl", "wheel_066_sha256": WHEEL_SHA})
-    new = results_dir(tmp_path / "rerun", [rec("duckdb", 1, 12.0), rec("moruna066", 0, 9.5)], stamp="202611190800")
+    new = results_dir(tmp_path / "rerun", [dict(rec("duckdb", 1, 12.0), python="3.14.3", gil=True),
+                                           rec("moruna066", 0, 9.5)], stamp="202611190800")
     p = nyc_plan()
     out = io.StringIO()
     assert run.main(["--plan", "nyc-2024", "--table", new, old, "--results", str(tmp_path / "merged")], out=out) == 0
@@ -2606,7 +2642,7 @@ def test_the_table_merges_results_directories_newest_per_run(tmp_path):
                            f"written to {tmp_path / 'merged'}")
     assert "the directories by their stamps, oldest first:" in text
     assert text.index(f"`{old}` (202611181311): 2 runs; 0.6.6's wheel: built") < text.index(f"`{new}` (202611190800): 2 runs")
-    assert "| DuckDB | python | 12.0 |" in text and "| Polars | python | 15.0 |" in text
+    assert "| DuckDB | python | 3.14.3, GIL | 12.0 |" in text and "| Polars | python | 3.14.2, GIL | 15.0 |" in text
     merged = json.load(open(tmp_path / "merged" / "merged.json"))
     assert merged["dirs"] == [old, new] and merged["runs"]["score-duckdb-r1"] == new
     assert merged["runs"]["score-polars-r1"] == old
@@ -2620,7 +2656,7 @@ def test_the_table_merges_results_directories_newest_per_run(tmp_path):
     assert next(r for r in records if r["spec"]["id"] == "score-duckdb-r1")["from"] == old
     out = io.StringIO()
     assert run.main(["--plan", "nyc-2024", "--table", old, loose], out=out) == 0
-    assert "a directory has no stamp, so in the order given" in out.getvalue() and "| DuckDB | python | 30.0 |" in out.getvalue()
+    assert "a directory has no stamp, so in the order given" in out.getvalue() and "| DuckDB | python |  | 30.0 |" in out.getvalue()
     assert not (tmp_path / "loose" / "summary.json").exists()
     (tmp_path / "bad").mkdir()
     (tmp_path / "bad" / "run.json").write_text("[1]")
@@ -2657,7 +2693,7 @@ def test_the_nodes_cpu_is_not_a_zero_it_did_not_measure(tmp_path):
     node_rec = json.load(open(tmp_path / "node" / "score-moruna-node-r1.json"))
     assert node_rec["cpu_s"] is None and node_rec["cpu_by"].startswith("not measured: the report's resources")
     text = open(tmp_path / "table.md").read()
-    assert "| Moruna 0.7, the node | rust | 3.0 | 0.75 |  | 3.00 |" in text
+    assert "| Moruna 0.7, the node | rust | none | 3.0 | 0.75 |  | 3.00 |" in text
     assert "- the bar: unchecked: 1.50x the best engine's operational time" in text
     assert "Moruna's CPU-seconds were not measured" in text
     # A measured run keeps its figure, and one slower than the bar misses whatever its CPU.
@@ -2828,3 +2864,89 @@ def test_measure_drops_a_marker_above_its_output_first(tmp_path, monkeypatch):
                          "--reference-json", str(reference_json(tmp_path))]) == 0
     r = json.load(open(tmp_path / "r" / "score-ray-r1.json"))
     assert r["ok"] and r["markers_dropped"] == ["data/out"] and (blob / "data" / "out" / "score-ray-r1").is_dir()
+
+
+def test_the_tables_python_column_names_each_engines_interpreter_and_gil(tmp_path, monkeypatch, capsys):
+    """The engines differ now: each row says the CPython its runs recorded and whether it has the
+    GIL. measure.py lifts both from the engine's RESULT into its record and its summary line."""
+    gil = dict(rec("duckdb", 1, 3.0), python="3.14.3", gil=True)
+    free = dict(rec("moruna066", 1, 9.0), python="3.14.3", gil=False)
+    old = dict(rec("moruna066-rust", 1, 6.0), result={"python": "3.14.2", "gil": False})  # a full record of run 3
+    assert collect.interpreter([gil], "duckdb") == "3.14.3, GIL"
+    assert collect.interpreter([free, free], "moruna066") == "3.14.3, free-threaded"
+    assert collect.interpreter([old], "moruna066-rust") == "3.14.2, free-threaded"
+    assert collect.interpreter([rec("ray", 1, 1.0)], "ray") == "" and collect.interpreter([], "ray") == ""
+    assert collect.interpreter([gil], "rust-pool") == "none" and collect.interpreter([], "moruna-node") == "none"
+    # Runs of two setups, in a merged table: each distinct interpreter. No GIL recorded reads as GIL.
+    two = [dict(rec("ray", 1, 1.0), python="3.12.13", gil=True), dict(rec("ray", 2, 1.0), python="3.14.3")]
+    assert collect.interpreter(two, "ray") == "3.12.13, GIL; 3.14.3, GIL"
+    text = table.render(summary_of([gil, free, old, rec("moruna-node", 1, 2.0)]))
+    head = next(line for line in text.splitlines() if line.startswith("| Engine"))
+    assert head.startswith("| Engine | Function | Python | Operational s |")
+    rule = text.splitlines()[text.splitlines().index(head) + 1]
+    assert rule.count("---") == head.count("|") - 1 == 17
+    assert "| DuckDB | python | 3.14.3, GIL | 3.0 |" in text
+    assert "| 0.6.6, Python function | python | 3.14.3, free-threaded | 9.0 |" in text
+    assert "| 0.6.6, Rust function | rust | 3.14.2, free-threaded | 6.0 |" in text
+    assert "| Moruna 0.7, the node | rust | none | 2.0 |" in text
+    # measure.py: the engine's RESULT says its interpreter; the record and the summary line keep it.
+    engine = ("import json, time\nt = time.time()\nprint('RESULT ' + json.dumps({'engine': 'x', 'python': '3.14.3', "
+              "'gil': False, 'marks': {'main': t, 'ready': t, 'start': t, 'done': t}}))\n")
+    monkeypatch.setattr(measure, "command", lambda *a: [sys.executable, "-c", engine])
+    monkeypatch.delenv("BENCH_ACCOUNT", raising=False)
+    spec = {"id": "score-moruna066-r1", "job": "score", "engine": "moruna066", "workload": "score", "repeat": 1,
+            "files": [], "cpus": 1, "mem_gib": 1}
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    measure.main(["run", "--spec", str(tmp_path / "spec.json"), "--root", str(tmp_path), "--results",
+                  str(tmp_path / "r"), "--work", str(tmp_path / "w")])
+    brief = run.measured(capsys.readouterr().out)
+    full = json.load(open(tmp_path / "r" / "score-moruna066-r1.json"))
+    assert (brief["python"], brief["gil"]) == (full["python"], full["gil"]) == ("3.14.3", False)
+    live = run.live_record(spec, brief)
+    assert collect.interpreter([live], "moruna066") == "3.14.3, free-threaded"
+
+
+def setup_line(tmp_path, installed):
+    """setup-linux.sh's last step, run as the script runs it: the Python between its `<<'EOF'` and
+    `EOF`, given installed.json; the JSON of its SETUP line and the line's size in bytes."""
+    script = open(os.path.join(HERE, "engines", "setup-linux.sh")).read()
+    code = script.split("<<'EOF'\n", 1)[1].split("\nEOF\n", 1)[0]
+    (tmp_path / "installed.json").write_text(json.dumps(installed))
+    wheel = tmp_path / "moruna-0.6.6-cp314-cp314t-linux_x86_64.whl"
+    wheel.write_bytes(b"wheel")
+    p = subprocess.run([sys.executable, "-I", "-c", code, str(tmp_path / "installed.json"), "container", "3",
+                        "openjdk 17", str(wheel)], capture_output=True, text=True)
+    assert p.returncode == 0 and p.stdout.startswith("SETUP ") and p.stdout.count("\n") == 1, p.stderr
+    return json.loads(p.stdout[len("SETUP "):]), len(p.stdout.encode())
+
+
+def test_the_setups_line_says_why_each_engine_did_not_install(tmp_path):
+    """Run 3's setup.json said `"ray": false` and no more. The setup's line now carries, for an
+    engine that did not install, its error's last lines and each interpreter's own, and stays
+    inside the 8 KiB of output the batch keeps however many failed."""
+    uv = "  × No solution found when resolving dependencies:\n  ╰─▶ Because ray has no wheels with a matching ABI tag\n"
+    tried = [{"python": f"{v}+gil", "error": f"uv pip install... exited 1: on {v}\n" + uv * 4} for v in install.PYTHONS]
+    ok = {"ok": True, "python": "3.14.3", "gil": True, "tried": []}
+    installed = {"harness": ok, "ray": {"ok": False, "error": "ray installs and imports on none of CPython", "tried": tried},
+                 "duckdb": {"ok": False, "error": "x" * 900 + "IO Error: the extension has no valid signature"},
+                 "dask": dict(ok, python="3.13.9", tried=[{"python": "3.14+gil", "error": "did not import: adlfs"}])}
+    got, size = setup_line(tmp_path, installed)
+    assert got["installed"] == {"harness": True, "ray": False, "duckdb": False, "dask": True}
+    assert got["errors"]["ray"] == "installs and imports on none of CPython " + ", ".join(install.GIL)
+    assert [t["python"] for t in got["tried"]["ray"]] == list(install.GIL)
+    assert all("No solution found" in t["error"] and "ray has no wheels" in t["error"] for t in got["tried"]["ray"])
+    assert got["errors"]["duckdb"].endswith("IO Error: the extension has no valid signature") and "duckdb" not in got["tried"]
+    assert got["interpreters"]["dask"] == {"python": "3.13.9", "gil": True, "tried": ["3.14+gil"]}
+    assert got["wheel_066"] == "container" and got["wheel_066_sha256"] == run.sha256_of(
+        str(tmp_path / "moruna-0.6.6-cp314-cp314t-linux_x86_64.whl")) and size <= 6000
+    # Every Python engine failing on every interpreter: each error is cut, and the line still fits.
+    many = {e: {"ok": False, "error": "none", "tried": tried} for e in install.PIP}
+    got, size = setup_line(tmp_path, many)
+    assert size <= 6000 and set(got["tried"]) == set(install.PIP) and len(got["tried"]["polars"]) == 5
+    assert all(t["error"] for t in got["tried"]["ray"])
+    # run.py reads the same line: the refusal names each interpreter and its error.
+    b = run.Bench(nyc_plan(), Fake(str(tmp_path / "b")), cloud(), Args(), str(tmp_path / "b"), "/s")
+    line = "SETUP " + json.dumps(got)
+    with pytest.raises(RuntimeError, match=r"(?s)ray: on CPython 3.14\+gil: .*; on CPython 3.10\+gil: "):
+        b.setup_done({"id": "setup"}, {"id": "setup", "exit": 1, "stdout": line, "stderr": ""})
+    assert json.load(open(tmp_path / "b" / "setup.json"))["tried"]["ray"] == got["tried"]["ray"]

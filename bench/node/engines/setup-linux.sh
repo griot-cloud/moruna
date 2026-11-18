@@ -77,19 +77,38 @@ python3 "$CODE/bench/node/engines/install.py" --root "$ENG" --gate-src "$CODE/im
   ${wheel:+--moruna066 "$wheel"} --engines "$ENGINES" --jobs "$(nproc)" > "$ENG/install.out" 2>&1 || status=$?
 
 # Each engine's interpreter (its version, its GIL, those tried before it) and, for one that did not
-# install, the end of why: the run's setup.json keeps them, and run.py stops on the first.
+# install, why: the end of its install's error, and for one tried on several interpreters each
+# one's own last lines (install.py's `tried`). The run's setup.json keeps them, and run.py stops on
+# the first, so a setup that fails explains itself (run 3's Ray and Dask did not).
 python3 - "$ENG/installed.json" "$wheel_from" "$wheel_s" "$(java -version 2>&1 | head -1)" "$wheel" <<'EOF'
 import hashlib, json, os, sys
 done = json.load(open(sys.argv[1])) if os.path.exists(sys.argv[1]) else {}
-installed = {e: r.get("ok") for e, r in done.items()}
-errors = {e: str(r.get("error"))[-300:] for e, r in done.items() if not r.get("ok")}
-interpreters = {e: {"python": r.get("python"), "gil": r.get("gil"), "tried": [t["python"] for t in r.get("tried", [])]}
-                for e, r in done.items() if r.get("python")}
 wheel = sys.argv[5]
-print("SETUP " + json.dumps({"installed": installed, "errors": errors, "interpreters": interpreters,
-                             "wheel_066": sys.argv[2] if wheel else None, "wheel_066_s": int(sys.argv[3]),
-                             "wheel_066_name": os.path.basename(wheel) if wheel else None,
-                             "wheel_066_sha256": hashlib.sha256(open(wheel, "rb").read()).hexdigest() if wheel else None,
-                             "java": sys.argv[4]}))
+facts = {"installed": {e: r.get("ok") for e, r in done.items()},
+         "interpreters": {e: {"python": r.get("python"), "gil": r.get("gil"),
+                              "tried": [t["python"] for t in r.get("tried", [])]}
+                          for e, r in done.items() if r.get("python")},
+         "wheel_066": sys.argv[2] if wheel else None, "wheel_066_s": int(sys.argv[3]),
+         "wheel_066_name": os.path.basename(wheel) if wheel else None,
+         "wheel_066_sha256": hashlib.sha256(open(wheel, "rb").read()).hexdigest() if wheel else None,
+         "java": sys.argv[4]}
+failed = {e: r for e, r in done.items() if not r.get("ok")}
+
+
+def line(limit):
+    errors = {e: ("installs and imports on none of CPython " + ", ".join(t["python"] for t in r["tried"])
+                  if r.get("tried") else str(r.get("error"))[-limit:]) for e, r in failed.items()}
+    tried = {e: [{"python": t["python"], "error": str(t["error"])[-limit:]} for t in r["tried"]]
+             for e, r in failed.items() if r.get("tried")}
+    return "SETUP " + json.dumps(dict(facts, errors=errors, tried=tried), ensure_ascii=False)
+
+
+# The batch keeps the last 8 KiB of this script's output: each error is cut until the line is well
+# inside that, so the line always reaches setup.json whole.
+for limit in (500, 300, 200, 120, 60, 20):
+    text = line(limit)
+    if len(text.encode()) <= 6000:
+        break
+print(text)
 EOF
 exit "$status"

@@ -9,7 +9,7 @@ in installed.json with why it failed. 0.6.6 has one interpreter, its wheel's.
 | Engine | Interpreter | Packages |
 | --- | --- | --- |
 | `moruna066`, `moruna066-rust` | CPython 3.14t, free-threaded | 0.6.6's wheel, pyarrow, numpy; and `moruna_gate` (images/gate/py066) |
-| `ray` | the newest of CPython 3.14, 3.13, 3.12, 3.11, 3.10 it installs on, with the GIL | ray[data], pyarrow, pandas, numpy |
+| `ray` | the newest of CPython 3.14, 3.13, 3.12, 3.11, 3.10 it installs on, with the GIL | ray[data], typing-extensions, pyarrow, pandas, numpy |
 | `spark` | the same | pyspark, pyarrow, pandas, numpy; a JVM (setup-linux.sh installs openjdk-17-jre-headless) |
 | `dask` | the same | dask[distributed,dataframe], adlfs, pyarrow, pandas, numpy |
 | `duckdb` | the same | duckdb, pyarrow, numpy |
@@ -17,10 +17,17 @@ in installed.json with why it failed. 0.6.6 has one interpreter, its wheel's.
 | `rust-pool` | none | `gate-baseline` and `gate-canon` from images/gate, `cargo build --release` |
 | `harness` | the same | pyarrow, numpy: measure.py's own environment, for bench/vm/canon.py |
 
-On 2026-11-18 (Ubuntu 24.04 on x86_64, uv 0.10.9) Dask 2026.8.0, DuckDB 2.0.0 and PySpark 4.3.0
-installed and imported on CPython 3.14.3 with the GIL, the first tried. Ray 2.60.0 installed on
-3.14 and 3.13, but `ray.data` did not import there: it imports `typing_extensions` without
-depending on it, and only a dependency below 3.13 brings it in. Ray took CPython 3.12.13.
+On 2026-11-18 (Ubuntu 24.04, uv 0.10.9) Ray 2.60.0, Dask 2026.8.0, DuckDB 2.0.0 and PySpark 4.3.0
+installed and imported on CPython 3.14.3 with the GIL, the first tried.
+
+**Ray omits a dependency it imports.** Ray 2.60.0's `ray.data` imports `typing_extensions`, which
+Ray does not declare, and which only a dependency of its own brings in below CPython 3.13. As
+published, Ray therefore imports on 3.12 and not on 3.13 or 3.14. `typing-extensions` is
+installed beside it, so Ray runs on the newest CPython: every engine gets its best configuration
+(the PM, 2026-11-18).
+
+An engine that did not install keeps, in installed.json, each interpreter tried and the end of
+its error (`tried`), so a setup that refuses to go on says why (setup-linux.sh, run.py).
 
 Packages are not pinned, as bench/vm's were not: each run records its engine's version. Each
 engine's Blob reader comes with it (store.py), installed here, outside every timing: Dask's adlfs,
@@ -54,7 +61,8 @@ PYTHONS = ("3.14", "3.13", "3.12", "3.11", "3.10")
 GIL = tuple(f"{v}+gil" for v in PYTHONS)
 PIP = {
     "moruna066": (("3.14t",), ["{wheel}", "pyarrow", "numpy"]),
-    "ray": (GIL, ["ray[data]", "pyarrow", "pandas", "numpy"]),
+    # typing-extensions: `ray.data` imports it and Ray does not declare it (see the module's note).
+    "ray": (GIL, ["ray[data]", "typing-extensions", "pyarrow", "pandas", "numpy"]),
     "spark": (GIL, ["pyspark", "pyarrow", "pandas", "numpy"]),
     "dask": (GIL, ["dask[distributed,dataframe]", "adlfs", "pyarrow", "pandas", "numpy"]),
     "duckdb": (GIL, ["duckdb", "pyarrow", "numpy"]),
@@ -115,6 +123,14 @@ def make_venv(root, name, python, packages, log):
     return venv
 
 
+class NotInstalled(RuntimeError):
+    """An engine that held on none of its interpreters: `tried` is each one and why it failed."""
+
+    def __init__(self, message, tried):
+        super().__init__(message)
+        self.tried = tried
+
+
 def imported(python, modules):
     """`versions` of `modules` in `python`, or a RuntimeError naming what did not import."""
     got = versions(python, modules)
@@ -146,8 +162,8 @@ def newest(engine, a, log, packages):
             shutil.rmtree(venv, ignore_errors=True)
             continue
         return dict(got, interpreter=interp, tried=tried)
-    raise RuntimeError(f"{engine} installs and imports on none of CPython {', '.join(PIP[engine][0])}: "
-                       + "; ".join(f"{t['python']}: {t['error'][-200:]}" for t in tried))
+    raise NotInstalled(f"{engine} installs and imports on none of CPython {', '.join(PIP[engine][0])}: "
+                       + "; ".join(f"{t['python']}: {t['error'][-200:]}" for t in tried), tried)
 
 
 def versions(python, modules):
@@ -266,6 +282,8 @@ def main(argv=None):
             rec["ok"] = "error" not in rec
         except Exception as e:  # an engine that does not install is a result, as a failed run is
             rec = {"engine": engine, "ok": False, "error": str(e)[-800:]}
+            if getattr(e, "tried", None):
+                rec["tried"] = e.tried  # each interpreter's own error: the whole of why
         done[engine] = rec
         json.dump(done, open(path, "w"), indent=1)
         print(json.dumps(rec), flush=True)

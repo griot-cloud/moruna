@@ -838,6 +838,11 @@ class Bench:
         elif step["id"] == "setup":
             image = x.az(azure.image_version(self.c), out="linux-image-version")
             self.setup = dict(tagged(ended.get("stdout"), "SETUP ") or {}, linux_image=image)
+            if x.answers and ended.get("exit") != 0:
+                # A setup that failed keeps what the batch saw of it, beside each engine's own
+                # error (the SETUP line's `errors` and `tried`): setup.json then says why.
+                self.setup.update(exit=ended.get("exit"),
+                                  stderr=(ended.get("stderr") or ended.get("error") or "")[-1500:])
             x.save(os.path.join(self.results, "setup.json"), self.setup)
             if x.answers:
                 self.refuse_setup(ended)
@@ -847,14 +852,21 @@ class Bench:
 
     def refuse_setup(self, ended):
         """The run goes on only when every engine it runs installed (work item 6.2c): one that did
-        not stops it before any measured run, with why each failed (setup-linux.sh's SETUP line
-        carries each one's error), rather than failing every one of its runs."""
-        installed = (self.setup or {}).get("installed") or {}
+        not stops it before any measured run, with why each failed, rather than failing every one
+        of its runs. The why is setup-linux.sh's SETUP line, already in setup.json: each engine's
+        error and, for one tried on several interpreters, each interpreter's own last lines."""
+        setup = self.setup or {}
+        installed = setup.get("installed") or {}
         missing = [e for e in self.installs() if not installed.get(e)]
         if not missing and ended.get("exit") == 0:
             return
-        errors = (self.setup or {}).get("errors") or {}
-        why = "; ".join(f"{e}: {errors.get(e) or 'no record'}" for e in missing) or (
+        errors, tried = setup.get("errors") or {}, setup.get("tried") or {}
+
+        def said(engine):
+            # The message has the end of each; setup.json has all the setup's line kept.
+            each = "; ".join(f"on CPython {t['python']}: {str(t['error'])[-200:]}" for t in tried.get(engine) or ())
+            return each or errors.get(engine) or "no record"
+        why = "; ".join(f"{e}: {said(e)}" for e in missing) or (
             f"exit {ended.get('exit')}: {(ended.get('stderr') or ended.get('error') or '')[-300:]}")
         raise RuntimeError(f"the setup did not install {', '.join(missing) or 'every engine'}, so the run stops "
                            f"before any measured run: {why}")
@@ -1105,7 +1117,7 @@ def live_record(spec, got, detail=None):
     got = got or {}
     rec = {"spec": spec, "live": True, "ok": bool(got.get("ok")), "memory_gib": spec.get("mem_gib")}
     for k in ("startup_s", "operational_s", "cpu_s", "peak_bytes", "oom_kills", "data", "copy_in_s", "copy_out_s",
-              "exit_code", "error_lines"):
+              "exit_code", "error_lines", "python", "gil"):
         if got.get(k) is not None:
             rec[k] = got[k]
     rec["output_check"] = got.get("check") or {"verdict": got.get("output")}
