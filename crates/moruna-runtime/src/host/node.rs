@@ -7,10 +7,12 @@
 //!   run's ID.
 //! - It refuses, each by its field and with a sentence that says what to change: a host socket
 //!   (`report.socket` naming anything but the channel, an object store's endpoint on `unix://` or
-//!   `vsock://`), a `file://` path outside the job's volumes, and `resume`. A job on a node reads
-//!   and writes the volumes the cloud attaches (`disk://`, item 3.3) and object storage; it has
-//!   no file system of its own, so in this release every `file://` path is outside its volumes,
-//!   and so is a root for them (`object_store.local_root`).
+//!   `vsock://`), an object store's endpoint that is not exactly `https://<host name>[:443]` (an
+//!   `http://` one, an address, another port, a path, a credential, or no URL), since the job's
+//!   network reaches its hosts over TLS, by name, at 443 alone (system design 3D), a `file://`
+//!   path outside the job's volumes, and `resume`. A job on a node reads and writes the volumes the cloud attaches (`disk://`,
+//!   item 3.3) and object storage; it has no file system of its own, so in this release every
+//!   `file://` path is outside its volumes, and so is a root for them (`object_store.local_root`).
 //! - Its budget (system design 3A): given the most a job on the node may have (`--budget-max`,
 //!   the node's memory less 768 MiB, which `node-admission` knows), a larger
 //!   `budget.memory_bytes` is refused, and a document that names none is given all of it: a node
@@ -227,6 +229,75 @@ fn url_host(url: &str) -> Option<String> {
         None => host.split(':').next().unwrap_or_default(),
     };
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// What the job's network reaches, which an object store's endpoint on a node is held to
+/// (system design 3D): HTTPS, to a host by its name, at port 443.
+const REACHED: &str = "a job on a node reaches object storage over HTTPS, by host name, at port \
+                       443 and nothing else: name the endpoint as https://<host name>";
+
+/// Why a node refuses `endpoint`, an object store's that is not a host socket: anything but
+/// exactly `https://<host name>` or `https://<host name>:443`. `None` when it is one. The
+/// endpoint itself is never said back, since its authority may hold a credential.
+fn endpoint_refusal(endpoint: &str) -> Option<String> {
+    let why = match endpoint.split_once("://") {
+        None => "the endpoint is not a URL".to_string(),
+        Some((scheme, _)) if scheme.eq_ignore_ascii_case("http") => {
+            "the endpoint is plain http, and the job's network speaks only TLS".to_string()
+        }
+        Some((scheme, _)) if !scheme.eq_ignore_ascii_case("https") => {
+            "the endpoint is not an https:// URL".to_string()
+        }
+        Some((_, authority)) if authority.contains(['/', '?', '#', '@']) => {
+            "the endpoint names more than a host and its port (a path, a query or a credential)"
+                .to_string()
+        }
+        Some((_, authority)) if authority.starts_with('[') => {
+            "the endpoint names an address, and the job's network reaches hosts by name".to_string()
+        }
+        Some((_, authority)) => {
+            let (host, port) = match authority.rsplit_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (authority, None),
+            };
+            match port.map(str::parse::<u16>) {
+                Some(Ok(443)) | None => {}
+                Some(Ok(port)) => {
+                    return Some(format!("the endpoint is at port {port}: {REACHED}"));
+                }
+                Some(Err(_)) => {
+                    return Some(format!("the endpoint names no port number: {REACHED}"));
+                }
+            }
+            if host.parse::<std::net::IpAddr>().is_ok() {
+                "the endpoint names an address, and the job's network reaches hosts by name"
+                    .to_string()
+            } else if !is_host_name(host) {
+                "the endpoint names no host name".to_string()
+            } else {
+                return None;
+            }
+        }
+    };
+    Some(format!("{why}: {REACHED}"))
+}
+
+/// Whether `host` is a DNS host name: 1 to 253 bytes of labels of 1 to 63 letters, digits and
+/// `-`, none starting or ending with `-`, the last not all digits (so no address passes).
+fn is_host_name(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    (1..=253).contains(&host.len())
+        && labels.iter().all(|label| {
+            (1..=63).contains(&label.len())
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+        && labels
+            .last()
+            .is_some_and(|last| !last.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The serial of a `disk://<serial>/...` URL, in any case of the scheme.
@@ -470,12 +541,17 @@ pub fn refusals(job: &Job, node: &Node) -> Vec<SpecError> {
             .and_then(|s| s.endpoint.as_deref()),
     )];
     for (field, endpoint) in endpoints {
-        if endpoint.is_some_and(is_host_socket) {
+        let Some(endpoint) = endpoint else { continue };
+        if is_host_socket(endpoint) {
             refused.push(SpecError::new(
                 field,
                 "a host socket is not reachable from a node: name the object store's endpoint by \
                  its URL",
             ));
+        } else if let Some(why) = endpoint_refusal(endpoint) {
+            // The job's network reaches its hosts over HTTPS, by name, at 443 alone (system
+            // design 3D): any other endpoint would pass here and fail at its first request.
+            refused.push(SpecError::new(field, why));
         }
     }
     if let Some(socket) = &job.report.socket

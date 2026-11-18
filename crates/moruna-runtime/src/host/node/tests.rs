@@ -129,6 +129,107 @@ fn what_a_node_refuses_is_refused_by_its_field() {
     );
 }
 
+/// The job's network reaches object storage over TLS, by host name, at port 443 alone (system
+/// design 3D, item 3.4): an endpoint that is not exactly `https://<host name>[:443]` is refused
+/// at validate, by its field, not at its first request, and is never said back.
+#[test]
+fn an_endpoint_not_https_to_a_host_name_at_443_is_refused_by_its_field() {
+    let with = |endpoint: &str| {
+        let mut document = sound();
+        document["object_store"]["s3"]["endpoint"] = json!(endpoint);
+        refusals(&job(document), &node())
+    };
+    for endpoint in [
+        "https://objects.test",
+        "https://objects.test:443",
+        "HTTPS://Objects.Test:443",
+        "https://s3.eu-west-1.amazonaws.com",
+        "https://localhost",
+        "https://1a.example",
+    ] {
+        assert!(
+            with(endpoint).is_empty(),
+            "{endpoint}: {:?}",
+            with(endpoint)
+        );
+    }
+    for (endpoint, why) in [
+        // Another port, or none that is a number.
+        ("https://objects.test:8443", "the endpoint is at port 8443"),
+        ("https://objects.test:", "the endpoint names no port number"),
+        (
+            "https://objects.test:x443",
+            "the endpoint names no port number",
+        ),
+        (
+            "https://objects.test:70000",
+            "the endpoint names no port number",
+        ),
+        // Plain http, at any port: the job's network speaks only TLS.
+        ("http://objects.test", "the endpoint is plain http"),
+        ("http://objects.test:443", "the endpoint is plain http"),
+        ("HTTP://objects.test", "the endpoint is plain http"),
+        // An address: egress rules are by name.
+        ("https://10.0.0.5", "the endpoint names an address"),
+        ("https://10.0.0.5:443", "the endpoint names an address"),
+        ("https://[2001:db8::1]", "the endpoint names an address"),
+        ("https://[2001:db8::1]:443", "the endpoint names an address"),
+        // More than a host and its port.
+        (
+            "https://objects.test/",
+            "the endpoint names more than a host",
+        ),
+        (
+            "https://objects.test/bucket",
+            "the endpoint names more than a host",
+        ),
+        (
+            "https://objects.test?x=1",
+            "the endpoint names more than a host",
+        ),
+        (
+            "https://key:secret@objects.test",
+            "the endpoint names more than a host",
+        ),
+        // No URL, another scheme, or no host name.
+        ("objects.test", "the endpoint is not a URL"),
+        ("objects.test:443", "the endpoint is not a URL"),
+        ("ftp://objects.test", "the endpoint is not an https:// URL"),
+        ("https://", "the endpoint names no host name"),
+        ("https://objects_test", "the endpoint names no host name"),
+        ("https://-objects.test", "the endpoint names no host name"),
+        ("https://objects..test", "the endpoint names no host name"),
+        ("https://objects.test.", "the endpoint names no host name"),
+        ("https://1.2.3", "the endpoint names no host name"),
+    ] {
+        let refused = with(endpoint);
+        assert_eq!(refused.len(), 1, "{endpoint}: {refused:?}");
+        assert_eq!(refused[0].field, "object_store.s3.endpoint");
+        let reason = &refused[0].reason;
+        assert!(reason.starts_with(why), "{endpoint}: {reason}");
+        assert!(
+            reason.ends_with(
+                "a job on a node reaches object storage over HTTPS, by host name, at port 443 \
+                 and nothing else: name the endpoint as https://<host name>"
+            ),
+            "{endpoint}: {reason}"
+        );
+        // The endpoint is not said back: its authority may hold a credential.
+        assert!(
+            !reason.contains("objects.test") && !reason.contains("secret"),
+            "{endpoint}: {reason}"
+        );
+    }
+    let long = format!("https://{}.test", "a".repeat(64));
+    assert_eq!(with(&long).len(), 1, "a label of 64 bytes");
+    let longest = format!("https://{}.test", vec!["a".repeat(63); 4].join("."));
+    assert_eq!(with(&longest).len(), 1, "a host of more than 253 bytes");
+    // A host socket is refused as one, once.
+    let socket = with("unix:///run/egress.sock");
+    assert_eq!(socket.len(), 1);
+    assert!(socket[0].reason.contains("host socket"), "{socket:?}");
+}
+
 /// Given the most a job may have on the node, a larger budget is refused and none is all of it.
 #[test]
 fn a_nodes_budget_bounds_the_jobs_and_fills_it_in() {
