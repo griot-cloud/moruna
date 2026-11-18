@@ -32,6 +32,7 @@ use alloc::{
 };
 use core::net::IpAddr;
 
+use moruna_abi::boot_line::Fatal;
 use netstack_protocol::{
     Addr, BUFFER_MAX, BUFFER_MIN, Cidr, LINGER_MAX_MS, NameRule, PER_PEER_MAX, Policy, Rule, rights,
 };
@@ -257,17 +258,26 @@ pub fn restarted_line(service: &str, n: usize) -> String {
     format!("moruna: service {service} restarted ({n} of {RESTARTS_MAX})")
 }
 
-/// The fatal line of a death too many: `moruna: fatal service <service>: ended 6 times in 10
-/// minutes` (work item 2.2c).
+/// The fatal line of a death too many: `moruna: fatal <service>: ended 6 times in 10 minutes`
+/// (work item 2.2c), its stage the service's name as 1B's every line is.
 pub fn ended_line(service: &str) -> String {
-    format!(
-        "moruna: fatal service {service}: ended {} times in {} minutes",
-        RESTARTS_MAX + 1,
-        WINDOW_NS / 60_000_000_000
-    )
+    Fatal {
+        stage: service,
+        reason: format_args!(
+            "ended {} times in {} minutes",
+            RESTARTS_MAX + 1,
+            WINDOW_NS / 60_000_000_000
+        ),
+    }
+    .to_string()
 }
 
-/// A fatal line of the service that restarts, for what stops it being started at all.
+/// A fatal line of the service that restarts, for what stops it being started at all:
+/// `moruna: fatal <service>: <reason>`.
 pub fn fatal_line(service: &str, reason: &str) -> String {
-    format!("moruna: fatal service {service}: {reason}")
+    Fatal {
+        stage: service,
+        reason,
+    }
+    .to_string()
 }

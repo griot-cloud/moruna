@@ -300,11 +300,33 @@ fn the_lines_are_the_item_s() {
     );
     assert_eq!(
         ended_line("api"),
-        "moruna: fatal service api: ended 6 times in 10 minutes"
+        "moruna: fatal api: ended 6 times in 10 minutes"
     );
     assert_eq!(
         fatal_line("api", "its listener was not granted: NotPermitted"),
-        "moruna: fatal service api: its listener was not granted: NotPermitted"
+        "moruna: fatal api: its listener was not granted: NotPermitted"
+    );
+    // 1B's form, as every other service's line: the stage is the service's name.
+    assert_eq!(
+        ended_line("api"),
+        format!(
+            "{}",
+            moruna_abi::boot_line::Fatal {
+                stage: "api",
+                reason: "ended 6 times in 10 minutes"
+            }
+        )
+    );
+    // One line, whatever the reason holds.
+    assert_eq!(
+        fatal_line("api", "a\nb"),
+        format!(
+            "{}",
+            moruna_abi::boot_line::Fatal {
+                stage: "api",
+                reason: "a\nb"
+            }
+        )
     );
 }
 

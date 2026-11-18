@@ -17,7 +17,7 @@
 //! network server through the granting slot it keeps the end of, and makes it a fresh channel to
 //! `platform`, whose other end it sends `platform` as `api-started` on `platform`'s bootstrap
 //! channel, which it keeps for that. Its sixth death in 10 minutes is
-//! `moruna: fatal service <name>: ended 6 times in 10 minutes`; every other death stops the node.
+//! `moruna: fatal <name>: ended 6 times in 10 minutes`; every other death stops the node.
 #![no_std]
 #![no_main]
 #![forbid(unsafe_code)]
