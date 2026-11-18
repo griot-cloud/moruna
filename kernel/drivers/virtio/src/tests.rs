@@ -704,25 +704,12 @@ fn nt_t6_virtio_net_configuration_frames_and_commands() {
     write_header(&page, 0).expect("header");
     assert_eq!(page.peek(0, 12), [0; 12]);
     // A received buffer: header, then the frame.
-    assert_eq!(received(&page, 0, 4096, 12 + 60, 1514), Ok(12..72));
-    assert_eq!(received(&page, 0, 4096, 12 + 1514, 1514), Ok(12..1526));
+    let frame = |used| received(&page, 0, 4096, used, 1514).map(|r| r.frame);
+    assert_eq!(frame(12 + 60), Ok(12..72));
+    assert_eq!(frame(12 + 1514), Ok(12..1526));
     for bad in [0, 11, 12 + 13, 12 + 1515, 4097] {
-        assert_eq!(
-            received(&page, 0, 4096, bad, 1514),
-            Err(NetError::BadLength(bad)),
-            "{bad}"
-        );
+        assert_eq!(frame(bad), Err(NetError::BadLength(bad)), "{bad}");
     }
-    page.poke(0, &[1]);
-    assert_eq!(
-        received(&page, 0, 4096, 100, 1514),
-        Err(NetError::Offload { flags: 1, gso: 0 })
-    );
-    page.poke(0, &[0, 3]);
-    assert_eq!(
-        received(&page, 0, 4096, 100, 1514),
-        Err(NetError::Offload { flags: 0, gso: 3 })
-    );
     write_pairs_command(&page, 64, 3).expect("command");
     assert_eq!(page.peek(64, 4), [4, 0, 3, 0]);
     assert_eq!(
@@ -733,14 +720,308 @@ fn nt_t6_virtio_net_configuration_frames_and_commands() {
     assert_eq!(ctrl_queue(1, false), 2);
 }
 
+/// A frame as a host sends it: Ethernet, IPv4 from `src` to 192.168.77.119 with
+/// protocol `proto`, then `l4`. The IPv4 header's checksum is left zero: completing a
+/// partial checksum touches only the transport's.
+fn ipv4_frame(src: [u8; 4], proto: u8, l4: &[u8]) -> Vec<u8> {
+    let total = (20 + l4.len()) as u16;
+    let mut f = vec![
+        0xfa, 0x16, 0x3e, 0xd8, 0x73, 0xdc, 0xfa, 0x16, 0x3e, 0x00, 0x00, 0x01, 0x08, 0x00,
+    ];
+    f.extend([0x45, 0]);
+    f.extend(total.to_be_bytes());
+    f.extend([0x12, 0x34, 0x40, 0x00, 64, proto, 0, 0]);
+    f.extend(src);
+    f.extend([192, 168, 77, 119]);
+    f.extend(l4);
+    f
+}
+
+/// The pseudo-header's sum, folded, as Linux's TCP and UDP leave it in the checksum
+/// field of a frame whose checksum is partial (`~csum_tcpudp_magic`).
+fn pseudo_sum(src: [u8; 4], proto: u8, l4_len: usize) -> u16 {
+    let mut p = Vec::from(src);
+    p.extend([192, 168, 77, 119, 0, proto]);
+    p.extend((l4_len as u16).to_be_bytes());
+    crate::net::ones_sum(&p)
+}
+
+/// Puts a receive buffer at 0 in `page`: a header with `flags`, `gso`, `csum_start`
+/// and `csum_offset`, then `frame`; says the bytes the device wrote.
+fn put_buffer(page: &Fake, flags: u8, gso: u8, start: u16, offset: u16, frame: &[u8]) -> u32 {
+    let mut header = [0u8; 12];
+    header[0] = flags;
+    header[1] = gso;
+    header[6..8].copy_from_slice(&start.to_le_bytes());
+    header[8..10].copy_from_slice(&offset.to_le_bytes());
+    header[10] = 1;
+    page.poke(0, &header);
+    page.poke(12, frame);
+    (12 + frame.len()) as u32
+}
+
 /// NT-T6, item 1.6f (Servercore run 9: 46 buffers refused against 23 frames taken, and
-/// the metadata service never answered): a frame whose header has `DATA_VALID` (2) is
-/// delivered. Linux's tun writes `DATA_VALID` on every frame whose checksum the host
-/// trusts, whatever the guest negotiated, and Linux's virtio_net takes it.
+/// the metadata service never answered): a frame whose header has `DATA_VALID` is
+/// delivered as it came. Linux's tun writes `DATA_VALID` on every frame whose checksum
+/// the host trusts, whatever the guest negotiated (`virtio_net_hdr_from_skb` with
+/// `has_data_valid`), and Linux's virtio_net takes it; the stack still checks the
+/// checksum itself. Bits the driver does not know, `RSC_INFO` without `NEEDS_CSUM`
+/// among them, are ignored, as virtio 1.2, 5.1.6.4.2 says a driver must.
 #[test]
 fn nt_t6_a_frame_with_data_valid_is_delivered() {
-    use crate::net::received;
+    use crate::net::{Received, flag, received};
+    let segment = [
+        0, 80, 0xc0, 0x00, 0, 0, 0, 1, 0, 0, 0, 2, 0x50, 0x18, 0xff, 0xff, 0xcd, 0x85, 0, 0,
+    ];
+    let frame = ipv4_frame([169, 254, 169, 254], 6, &segment);
     let page = Fake::new(4096);
-    page.poke(0, &[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
-    assert_eq!(received(&page, 0, 4096, 12 + 60, 1514), Ok(12..72));
+    for flags in [
+        flag::DATA_VALID,
+        flag::RSC_INFO,
+        flag::DATA_VALID | flag::RSC_INFO,
+        0x08,
+        0x80,
+        0xfa,
+    ] {
+        let used = put_buffer(&page, flags, 0, 0, 0, &frame);
+        let got = received(&page, 0, 4096, used, 1514).expect("delivered");
+        assert_eq!(
+            got,
+            Received {
+                frame: 12..12 + frame.len(),
+                flags,
+                partial: None
+            },
+            "{flags:#x}"
+        );
+        let mut bytes = page.peek(12, frame.len());
+        got.complete(&mut bytes).expect("nothing to complete");
+        assert_eq!(bytes, frame, "{flags:#x}: as it came");
+    }
+}
+
+/// NT-T6, item 1.6f: a frame whose checksum is partial (`NEEDS_CSUM`), which a device
+/// should not send without `GUEST_CSUM` but Linux's virtio_net takes whatever was
+/// negotiated, has its checksum completed from `csum_start` and `csum_offset`, so the
+/// stack checks a whole one. The expected checksums were computed apart, by RFC 1071.
+#[test]
+fn nt_t6_a_partial_checksum_is_completed() {
+    use crate::net::{Partial, Received, flag, ones_sum, received};
+    // RFC 1071, section 3's example.
+    assert_eq!(
+        ones_sum(&[0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7]),
+        0xddf2
+    );
+    assert_eq!(ones_sum(&[]), 0);
+    assert_eq!(ones_sum(&[0xab]), 0xab00);
+    let page = Fake::new(4096);
+
+    // TCP from the metadata service, of an odd length: an answer's first line.
+    let src = [169, 254, 169, 254];
+    let mut segment = vec![
+        0, 80, 0xc0, 0x00, 0, 0, 0, 1, 0, 0, 0, 2, 0x50, 0x18, 0xff, 0xff, 0, 0, 0, 0,
+    ];
+    segment.extend(b"HTTP/1.1 200 OK\r\n");
+    let partial = pseudo_sum(src, 6, segment.len());
+    assert_eq!(partial, 0x6248);
+    segment[16..18].copy_from_slice(&partial.to_be_bytes());
+    let frame = ipv4_frame(src, 6, &segment);
+    for flags in [flag::NEEDS_CSUM, flag::NEEDS_CSUM | flag::DATA_VALID] {
+        let used = put_buffer(&page, flags, 0, 34, 16, &frame);
+        let got = received(&page, 0, 4096, used, 1514).expect("taken");
+        assert_eq!(
+            got,
+            Received {
+                frame: 12..12 + frame.len(),
+                flags,
+                partial: Some(Partial {
+                    start: 34,
+                    offset: 16
+                })
+            }
+        );
+        let mut bytes = page.peek(12, frame.len());
+        got.complete(&mut bytes).expect("completed");
+        assert_eq!(bytes[50..52], [0xcd, 0x85]);
+        assert_eq!(bytes[..50], frame[..50]);
+        assert_eq!(bytes[52..], frame[52..]);
+        // What the stack checks: the pseudo-header and the segment sum to all ones.
+        let mut whole = Vec::from(src);
+        whole.extend([192, 168, 77, 119, 0, 6, 0, segment.len() as u8]);
+        whole.extend(&bytes[34..]);
+        assert_eq!(ones_sum(&whole), 0xffff);
+    }
+
+    // UDP from the router, its checksum six bytes in.
+    let src = [192, 168, 77, 1];
+    let mut datagram = vec![0, 53, 0x9c, 0x40, 0, 14];
+    let partial = pseudo_sum(src, 17, 14);
+    assert_eq!(partial, 0x1be9);
+    datagram.extend(partial.to_be_bytes());
+    datagram.extend(b"moruna");
+    let frame = ipv4_frame(src, 17, &datagram);
+    let used = put_buffer(&page, flag::NEEDS_CSUM, 0, 34, 6, &frame);
+    let got = received(&page, 0, 4096, used, 1514).expect("taken");
+    let mut bytes = page.peek(12, frame.len());
+    got.complete(&mut bytes).expect("completed");
+    assert_eq!(bytes[40..42], [0xf9, 0x4c]);
+
+    // A sum that complements to zero is stored as 0xffff, which UDP needs.
+    let zero = Received {
+        frame: 0..18,
+        flags: flag::NEEDS_CSUM,
+        partial: Some(Partial {
+            start: 14,
+            offset: 2,
+        }),
+    };
+    let mut bytes = [0u8; 18];
+    bytes[14..16].copy_from_slice(&[0xff, 0xff]);
+    zero.complete(&mut bytes).expect("completed");
+    assert_eq!(bytes[16..], [0xff, 0xff]);
+}
+
+/// NT-T6, item 1.6f: what is refused, and why. A GSO type, which needs a feature this
+/// driver never offers, is refused whatever the flags; a partial checksum whose field
+/// lies past the frame's end, or whose offsets are `RSC_INFO`'s counts, is refused,
+/// since it cannot be completed.
+#[test]
+fn nt_t6_segmentation_and_unusable_checksum_offsets_are_refused() {
+    use crate::net::{NetError, Partial, Received, flag, received};
+    let page = Fake::new(4096);
+    let frame = [0u8; 60];
+    for gso in [1, 3, 4, 5, 0x80, 0x81, 0xff] {
+        for flags in [0, flag::NEEDS_CSUM, flag::DATA_VALID] {
+            let used = put_buffer(&page, flags, gso, 34, 16, &frame);
+            assert_eq!(
+                received(&page, 0, 4096, used, 1514),
+                Err(NetError::Gso(gso)),
+                "{gso:#x} {flags:#x}"
+            );
+        }
+    }
+    // The field's last byte is the frame's last: taken; one further: refused.
+    let used = put_buffer(&page, flag::NEEDS_CSUM, 0, 34, 24, &frame);
+    assert!(received(&page, 0, 4096, used, 1514).is_ok());
+    for (start, offset) in [(34, 25), (59, 0), (60, 0), (0, 59), (0xffff, 0xffff)] {
+        let used = put_buffer(&page, flag::NEEDS_CSUM, 0, start, offset, &frame);
+        assert_eq!(
+            received(&page, 0, 4096, used, 1514),
+            Err(NetError::Checksum {
+                flags: flag::NEEDS_CSUM,
+                start,
+                offset
+            }),
+            "{start} {offset}"
+        );
+    }
+    let flags = flag::NEEDS_CSUM | flag::RSC_INFO;
+    let used = put_buffer(&page, flags, 0, 34, 16, &frame);
+    assert_eq!(
+        received(&page, 0, 4096, used, 1514),
+        Err(NetError::Checksum {
+            flags,
+            start: 34,
+            offset: 16
+        })
+    );
+    // Completing in fewer bytes than the offsets were checked against is refused.
+    let got = Received {
+        frame: 12..72,
+        flags: 3,
+        partial: Some(Partial {
+            start: 34,
+            offset: 16,
+        }),
+    };
+    assert_eq!(
+        got.complete(&mut [0u8; 51]),
+        Err(NetError::Checksum {
+            flags: 3,
+            start: 34,
+            offset: 16
+        })
+    );
+    assert_eq!(got.complete(&mut [0u8; 52]), Ok(()));
+    // A header the driver cannot read is the kernel's error, not the buffer's.
+    assert_eq!(
+        received(&Fake::new(1), 0, 4096, 100, 1514),
+        Err(NetError::Kernel(Error::OutOfRange))
+    );
+}
+
+/// NT-T6, item 1.6f: the refusals are counted by reason (a length out of bounds, each
+/// flags value, each GSO type) and the frames taken by their flags, for the driver's
+/// last line; the first refusal is told once, with the bytes written and its header.
+#[test]
+fn nt_t6_refusals_are_counted_by_reason_and_the_first_is_told() {
+    use crate::net::{First, NetError, Reason, RxCounts, header};
+    use alloc::string::ToString;
+    assert_eq!(Reason::of(&NetError::BadLength(5)), Some(Reason::Length));
+    let checksum = NetError::Checksum {
+        flags: 5,
+        start: 1,
+        offset: 2,
+    };
+    assert_eq!(Reason::of(&checksum), Some(Reason::Flags(5)));
+    assert_eq!(Reason::of(&NetError::Gso(4)), Some(Reason::Gso(4)));
+    for not_the_buffer in [
+        NetError::Kernel(Error::OutOfRange),
+        NetError::BadAddress(0),
+        NetError::BadPairs(0),
+        NetError::BadMtu(0),
+    ] {
+        assert_eq!(Reason::of(&not_the_buffer), None);
+    }
+
+    let mut counts = RxCounts::default();
+    let nothing = "0 malformed from the card, 0 taken with flags";
+    assert_eq!(counts.to_string(), nothing);
+    assert_eq!(counts.first_to_print(), None);
+    counts.take(0);
+    assert_eq!(counts.to_string(), nothing);
+    for flags in [2, 2, 1, 2] {
+        counts.take(flags);
+    }
+    assert_eq!(
+        counts.to_string(),
+        "0 malformed from the card, 4 taken with flags (0x01: 1, 0x02: 3)"
+    );
+
+    let page = Fake::new(64);
+    page.poke(0, &[0x05, 0, 0, 0, 0, 0, 0x22, 0, 0x10, 0, 1, 0]);
+    let first = header(&page, 0).expect("header");
+    assert_eq!(first, [0x05, 0, 0, 0, 0, 0, 0x22, 0, 0x10, 0, 1, 0]);
+    assert_eq!(header(&page, 60), Err(Error::OutOfRange));
+    counts.refuse(Reason::Flags(5), 74, first);
+    counts.refuse(Reason::Gso(1), 1526, [0; 12]);
+    counts.refuse(Reason::Length, 4097, [0; 12]);
+    counts.refuse(Reason::Gso(1), 1526, [0; 12]);
+    assert_eq!(counts.refused(), 4);
+    assert_eq!(
+        counts.to_string(),
+        "4 malformed from the card (length: 1, flags 0x05: 1, gso 0x01: 2), \
+         4 taken with flags (0x01: 1, 0x02: 3)"
+    );
+    let told = counts.first_to_print().expect("the first");
+    assert_eq!(
+        told,
+        First {
+            reason: Reason::Flags(5),
+            used: 74,
+            header: first
+        }
+    );
+    assert_eq!(
+        told.to_string(),
+        "the first malformed buffer from the card: flags 0x05, 74 bytes written, \
+         header 05 00 00 00 00 00 22 00 10 00 01 00"
+    );
+    // Told once: later refusals are counted, not told.
+    assert_eq!(counts.first_to_print(), None);
+    counts.refuse(Reason::Length, 3, [0; 12]);
+    assert_eq!(counts.first_to_print(), None);
+    assert_eq!(counts.refused(), 5);
+    assert_eq!(Reason::Length.to_string(), "length");
+    assert_eq!(Reason::Gso(0x81).to_string(), "gso 0x81");
 }
