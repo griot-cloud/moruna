@@ -29,7 +29,8 @@ pub struct MorselFeatures {
     pub rows: u64,
     /// Payload bytes (CT-I3).
     pub bytes: u64,
-    /// Bytes per column, in schema order; empty for tensors.
+    /// Bytes per column, in schema order: what the column's own buffers cover (f.2); empty for
+    /// tensors.
     pub column_bytes: Vec<u64>,
     /// Mean string length over every `Utf8` and `LargeUtf8` column; `None` when there are none.
     pub mean_string_len: Option<f32>,
@@ -55,10 +56,10 @@ impl MorselFeatures {
                 let mut nulls = 0u64;
                 let mut cells = 0u64;
                 for column in batch.columns() {
-                    column_bytes.push(column.get_array_memory_size() as u64);
+                    let data = column.to_data();
+                    column_bytes.push(covered(&data));
                     nulls += column.null_count() as u64;
                     cells += column.len() as u64;
-                    let data = column.to_data();
                     if let Some((total, values)) = string_totals(&data) {
                         string_bytes += total;
                         string_values += values;
@@ -101,6 +102,17 @@ impl MorselFeatures {
             },
         }
     }
+}
+
+/// The bytes a column's own buffers cover: the lengths of its validity, its buffers and its
+/// children's (f.2). A column's share of what its batch holds, whatever allocation its buffers
+/// are part of: the columns of a record decoded where it lies, which are slices of the one
+/// record, sum to about the record, where Arrow's count of each column
+/// (`get_array_memory_size`) is the whole record for each of its buffers (6.3k).
+fn covered(data: &ArrayData) -> u64 {
+    data.nulls().map_or(0, |nulls| nulls.buffer().len() as u64)
+        + data.buffers().iter().map(|b| b.len() as u64).sum::<u64>()
+        + data.child_data().iter().map(covered).sum::<u64>()
 }
 
 fn has_string_column(batch: &arrow::record_batch::RecordBatch) -> bool {

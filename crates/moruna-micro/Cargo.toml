@@ -49,3 +49,5 @@ moruna-plane = { workspace = true }
 # Stream C: the output layer read back with the host's own reader; item 3.3: the layers the
 # volumes' tests read, written by it.
 moruna-image = { workspace = true }
+# 6.3h: an arena for the records and the landing copies of the byte-count test.
+moruna-testkit = { workspace = true }

@@ -1035,6 +1035,7 @@ impl ImageTask {
             in_flight: VecDeque::new(),
             queued: VecDeque::new(),
             applying: false,
+            whole: false,
             ready: VecDeque::new(),
             taking: None,
             counted: false,
@@ -1102,6 +1103,10 @@ pub struct TaskState {
     /// finds this set goes on from where the refusal stopped it: its batch is not cut and
     /// posted twice (item 3.1: rows came out twice, or not at all).
     applying: bool,
+    /// Ring mode: the unit under way answers its whole morsel before it returns: the stage's
+    /// first, which a probe is ([`layout::answers_whole`]). Kept across a refused unit, as
+    /// `applying` is.
+    whole: bool,
     /// Ring mode: answers the unit under way has taken and not yet given, oldest first: kept
     /// across a refused unit, given with the unit that completes.
     ready: VecDeque<Payload>,
@@ -1830,6 +1835,11 @@ impl TaskState {
     /// batch, or at the stage's end. A morsel of [`layout::IN_FLIGHT`] pieces is posted at
     /// once, so one engine worker keeps every task of the stage busy.
     ///
+    /// The stage's first unit is the exception: it answers its whole morsel
+    /// ([`layout::answers_whole`]). The controller's probe is that unit, and what it took and
+    /// gave is what the controller sizes the stage from (6.3j: the first of a probe's two
+    /// pieces was read as the function's whole output).
+    ///
     /// A unit the run's arena refused is applied again with the same batch (RB5): it goes on
     /// from where it stopped ([`TaskState::applying`]), with the answers it had taken
     /// ([`TaskState::ready`]) and the one it was taking ([`TaskState::taking`]).
@@ -1849,6 +1859,7 @@ impl TaskState {
             self.timed[CUT] += moruna_svc::now().saturating_sub(started);
             self.queued.extend(pieces);
             self.applying = true;
+            self.whole = layout::answers_whole(self.schema.is_some());
         }
         if self.taking.is_some() {
             let answer = self.take_oldest(ports, names)?;
@@ -1878,7 +1889,8 @@ impl TaskState {
             self.feed(ports, names)?;
             // Nothing stays queued past this unit: a queued piece holds its morsel's memory,
             // and under memory pressure no unit may come to post it ([`layout::QUEUED_MAX`]).
-            if layout::holds_worker(self.queued.len()) {
+            // And the stage's first unit leaves nothing in flight: it answers its whole morsel.
+            if layout::waits_for_answer(self.queued.len(), self.in_flight.len(), self.whole) {
                 let answer = self.take_oldest(ports, names)?;
                 self.ready.push_back(answer);
                 self.feed(ports, names)?;
@@ -1905,6 +1917,7 @@ impl TaskState {
             _ => self.join_ready()?,
         };
         self.applying = false;
+        self.whole = false;
         Ok(answer)
     }
 

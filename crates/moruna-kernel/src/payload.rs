@@ -354,11 +354,14 @@ impl Payload {
         }
     }
 
-    /// CT-I3 accounting: `get_array_memory_size` for a table, `element_count × item_size`
-    /// for a tensor (f.1).
+    /// CT-I3 accounting (f.1). For a table, the bytes of the allocations it holds, each counted
+    /// once however many of the batch's buffers are slices of it, and Arrow's own bookkeeping:
+    /// `get_array_memory_size`, which a batch whose buffers each have an allocation of their own
+    /// counts exactly, less every repeat of an allocation. For a tensor,
+    /// `element_count × item_size`.
     pub fn bytes(&self) -> u64 {
         match self {
-            Payload::Table(batch, _) => batch.get_array_memory_size() as u64,
+            Payload::Table(batch, _) => table_bytes(batch),
             Payload::Tensor(t, _) => t.byte_len(),
         }
     }
@@ -563,6 +566,36 @@ impl std::fmt::Debug for Payload {
 /// Keeps a tensor alive behind an Arrow buffer built over its bytes (f.4).
 struct TensorOwner(#[allow(dead_code)] ManagedTensor);
 impl std::panic::RefUnwindSafe for TensorOwner {}
+
+/// f.1 for a table: what the batch holds, each allocation once.
+///
+/// Arrow counts a buffer as the whole allocation it is a slice of (`Buffer::capacity`), once for
+/// each buffer. That is what a batch holds when every buffer has an allocation of its own, and
+/// `k` times it for a batch whose `k` buffers are slices of one: a record decoded where it lies,
+/// which is a task's answer kept in its window, a table read back from staging and a block of an
+/// Arrow IPC file read in place (6.3h, 6.3k: 6.2 run 3's Enrich said 14.8 to 18.7 bytes out per
+/// byte in for an output 1.17 times its input). An allocation is held once however many buffers
+/// slice it, and held whole however small the slice, so each is counted once at its whole size;
+/// of allocations that start at one address, the largest stands. O(buffers), never O(rows).
+fn table_bytes(batch: &RecordBatch) -> u64 {
+    let counted = batch.get_array_memory_size() as u64;
+    // Every buffer's allocation: where it starts and its size.
+    let mut allocations: Vec<(usize, usize)> = Vec::new();
+    for column in batch.columns() {
+        // The closure never fails, so neither does the walk.
+        let _ = walk_buffers(&column.to_data(), &mut |buffer| {
+            allocations.push((buffer.data_ptr().as_ptr() as usize, buffer.capacity()));
+            Ok(())
+        });
+    }
+    allocations.sort_unstable();
+    let repeated: u64 = allocations
+        .windows(2)
+        .filter(|pair| pair[0].0 == pair[1].0)
+        .map(|pair| pair[0].1 as u64)
+        .sum();
+    counted.saturating_sub(repeated)
+}
 
 /// The tier of every buffer of every column (recursively), which must agree; a buffer with
 /// no known provenance is `Host` (e.2). Mixed tiers are a `Plan` error.
