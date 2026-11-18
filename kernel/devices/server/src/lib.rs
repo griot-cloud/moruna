@@ -10,13 +10,15 @@
 //! driver the supervisor starts (`storvsc`, item 1.10b; `netvsc`, item 1.11b), so no client
 //! can put a name in the directory, and that driver can learn nothing from it.
 //!
-//! Such a driver starts beside the directory's clients, not before them: the network server
-//! looks `net0` up as soon as it starts, and `netvsc` registers it only once Azure's card is
-//! up. So a lookup of a name nothing has waits while a driver linked to a `register*`
-//! listener ([`Registry::expect`]) has not finished registering, which it says by closing
-//! its connection ([`Registry::finished`]); it is answered when the name is registered, or
-//! with `NotFound` once every such driver has finished. Off Hyper-V the supervisor links no
-//! such driver, and nothing waits.
+//! Such a driver starts beside the directory's clients: the network server looks `net0` up as
+//! soon as it starts, and `netvsc` registers it only once Azure's card is up. So a driver
+//! connects through its `register*` listener first thing, and a lookup of a name nothing has
+//! waits while such a connection is open: it is answered when the name is registered, or
+//! with `NotFound` once every registrar's connection has closed, which is how a driver says
+//! it has finished registering. A `register*` listener holds nothing by itself: one whose
+//! driver is not on this machine (off Hyper-V the supervisor links none) or never connects
+//! holds no lookup, and a name a driver of the device manager publishes (`net0` of
+//! virtio-net) is answered at once whatever is open.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -85,16 +87,17 @@ struct Registered {
 #[derive(Default)]
 pub struct Registry {
     entries: Vec<Registered>,
-    /// For each `register*` listener whose driver will register: whether it has finished.
-    finished: Vec<bool>,
-    /// Lookups of a name nothing has, while a driver has not finished registering.
+    /// Connections open through `register*` listeners: while one is, its driver has not
+    /// finished registering.
+    registrars: usize,
+    /// Lookups of a name nothing has, while a registrar's connection is open.
     waiting: Vec<(String, Pending)>,
     /// Answers to lookups that waited, for the device manager's loop to send.
     ready: Vec<(Pending, Outcome)>,
 }
 
 impl Registry {
-    /// No device registered, and no driver expected to.
+    /// No device registered, and no registrar connected.
     pub fn new() -> Registry {
         Registry::default()
     }
@@ -195,19 +198,15 @@ impl Registry {
             .map(|registered| registered.name.as_str())
     }
 
-    /// A `register*` listener whose driver will register: lookups of a name nothing has
-    /// wait until it has [`finished`](Registry::finished). Its number, for that.
-    pub fn expect(&mut self) -> usize {
-        self.finished.push(false);
-        self.finished.len() - 1
+    /// A registrar's connection has opened.
+    fn registrar_opened(&mut self) {
+        self.registrars += 1;
     }
 
-    /// The driver of listener `number` has finished registering. Once every one has, the
-    /// lookups still waiting are answered `NotFound`.
-    pub fn finished(&mut self, number: usize) {
-        if let Some(finished) = self.finished.get_mut(number) {
-            *finished = true;
-        }
+    /// A registrar's connection has closed: its driver has finished. Once none is open,
+    /// the lookups still waiting are answered `NotFound`.
+    fn registrar_closed(&mut self) {
+        self.registrars = self.registrars.saturating_sub(1);
         if !self.awaited() {
             for (_, pending) in core::mem::take(&mut self.waiting) {
                 self.ready
@@ -216,9 +215,9 @@ impl Registry {
         }
     }
 
-    /// Whether a driver has yet to finish registering.
+    /// Whether a registrar's connection is open, so a lookup of a name nothing has waits.
     pub fn awaited(&self) -> bool {
-        self.finished.iter().any(|finished| !finished)
+        self.registrars > 0
     }
 
     /// Lookups waiting for a name.
@@ -246,27 +245,26 @@ pub struct Directory<D: Drivers> {
     drivers: D,
     registry: Rc<RefCell<Registry>>,
     access: Access,
-    /// The number of the `register*` listener it came through, as [`Registry::expect`]
-    /// gave it: its close says the driver has finished registering.
-    registrar: Option<usize>,
+    /// Whether it is a registrar's connection that has not closed: until it does, lookups
+    /// of a name nothing has wait.
+    registering: bool,
 }
 
 impl<D: Drivers> Directory<D> {
-    /// A connection through a listener of `access`, served from `drivers` and `registry`.
+    /// A connection through a listener of `access`, served from `drivers` and `registry`:
+    /// made as the connection is accepted. A [`Access::Register`] connection holds lookups
+    /// of a name nothing has until it closes.
     pub fn new(drivers: D, registry: Rc<RefCell<Registry>>, access: Access) -> Directory<D> {
+        let registering = access == Access::Register;
+        if registering {
+            registry.borrow_mut().registrar_opened();
+        }
         Directory {
             drivers,
             registry,
             access,
-            registrar: None,
+            registering,
         }
-    }
-
-    /// The connection came through `register*` listener `number`
-    /// ([`Registry::expect`]): when it closes, that listener's driver has finished.
-    pub fn registrar(mut self, number: usize) -> Directory<D> {
-        self.registrar = Some(number);
-        self
     }
 
     /// Sends the answers of lookups that waited, through this request's context.
@@ -356,10 +354,11 @@ impl<D: Drivers> Handler for Directory<D> {
     /// have left waiting are answered by the device manager's loop
     /// ([`Registry::take_ready`]).
     fn closed(&mut self) {
-        if let Some(number) = self.registrar
+        if self.registering
             && let Ok(mut registry) = self.registry.try_borrow_mut()
         {
-            registry.finished(number);
+            self.registering = false;
+            registry.registrar_closed();
         }
     }
 }
