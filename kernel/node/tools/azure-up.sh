@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Brings the node up on Azure, checks it, and deletes everything (work item 1.13; system design
-# 1E and 1F): the steps of kernel/node/AZURE.md, in order, each the same command.
+# 1E and 1F): the steps of kernel/node/AZURE.md, in order, each the same command. With --proof it
+# runs the proof on the node too (work item 3.8).
 #
 #   kernel/node/tools/azure-up.sh --vhd OUT/moruna-node.vhd --run RUN --from ADDRESS
-#       [--group moruna-node-NAME] [--subscription griot-dev] [--data-disk] [--job] [--dry-run]
+#       [--group moruna-node-NAME] [--subscription griot-dev] [--data-disk] [--job]
+#       [--proof --tasks DIR --nyc DIR --gate-canon BIN] [--dry-run]
 #
 # - --vhd: package.py's fixed-size VHD (system design 1A).
 # - --run: a new directory for the run's files (the token key pair, node config, the IDs, the
@@ -20,6 +22,22 @@
 #   10,000,000 rows into a `count` sink, with a token for `submit`. It validates the job, submits
 #   it, follows its events over SSE to its `exit`, and checks the exit code 0 and the report's
 #   `sinks[0].rows` 10,000,000, and prints the job's wall time from the report.
+# - --proof: the four NYC jobs through the node's API (work item 3.8), on a Standard_D4s_v4 in
+#   place of the D2s_v4. Node config also holds a function key the run makes (system design 3E).
+#   The storage account also gets two private containers: `data` takes the twelve normalised
+#   months of 2024 under `nyc/`, `functions` the four gate tasks, and a read-only SAS for
+#   `functions`, expiring in 6 hours, is made from the account's key on this machine. Once the
+#   node is ready, bench/node/proof.py registers each task at its SAS address, runs Score,
+#   Occupancy, Enrich and Audit on 2024-01 and on all of 2024 reading and writing Blob (the
+#   account key reaches the node by secret name, in each job's `secrets`, 3B), and checks every
+#   output against 0.6.6's references. Its results are kept in RUN/proof. The key and the SAS
+#   reach proof.py in its environment only. It needs:
+#   - --tasks: the gate tasks built for the core (images/gate/tasks/build.sh's core/bin), at least
+#     gate-score, gate-occupancy, gate-enrich and gate-audit;
+#   - --nyc: the directory holding norm/yellow_tripdata_2024-MM.parquet for the twelve months and
+#     0.6.6's references, reference-JOB-PERIOD.json (~/moruna-data/nyc);
+#   - --gate-canon: gate-canon built for this machine (images/gate), which checks the year.
+#   It takes no --data-disk.
 # - --dry-run: prints every command, one to a line, and runs none of them.
 #
 # A guard refuses, before anything runs, any subscription but griot-dev and any group not named
@@ -29,9 +47,9 @@
 # It exits 0 when every check of 1E passes on Azure: the node answers on 443 within 10 minutes,
 # its console shows `moruna: ready` and `moruna: cloud azure`, 443 accepts and 22 does not, the
 # served certificate is the one the console printed, and GET /v1/node answers; with --job, the job
-# ends with exit 0 and counts its 10,000,000 rows. It prints create-to-ready and boot_ms, and with
-# --job the job's wall_ms. Any failure exits 1, after the console log is read into RUN and the
-# group deleted; a refusal exits 2.
+# ends with exit 0 and counts its 10,000,000 rows; with --proof, all eight runs of the proof pass.
+# It prints create-to-ready and boot_ms, and with --job the job's wall_ms. Any failure exits 1,
+# after the console log is read into RUN and the group deleted; a refusal exits 2.
 set -euo pipefail
 
 subscription=griot-dev
@@ -43,6 +61,12 @@ from=""
 dry=0
 data_disk=0
 job=0
+proof=0
+tasks=""
+nyc=""
+gate_canon=""
+# The repository this script is in, whose bench/node/proof.py --proof runs.
+repo="$(cd "$(dirname "$0")/../../.." && pwd)"
 openssl="${MORUNA_OPENSSL:-}"
 if [ -z "$openssl" ]; then
   # macOS's own openssl is LibreSSL, which has no Ed25519 (kernel/node/OPENSTACK.md, step 1).
@@ -55,7 +79,7 @@ refuse() {
 }
 
 usage() {
-  echo "usage: azure-up.sh --vhd VHD --run RUN --from ADDRESS [--group moruna-node-NAME] [--subscription griot-dev] [--data-disk] [--job] [--dry-run]" >&2
+  echo "usage: azure-up.sh --vhd VHD --run RUN --from ADDRESS [--group moruna-node-NAME] [--subscription griot-dev] [--data-disk] [--job] [--proof --tasks DIR --nyc DIR --gate-canon BIN] [--dry-run]" >&2
   exit 2
 }
 
@@ -68,6 +92,10 @@ while [ "$#" -gt 0 ]; do
     --subscription) [ "$#" -ge 2 ] || usage; subscription="$2"; shift 2 ;;
     --data-disk) data_disk=1; shift ;;
     --job) job=1; shift ;;
+    --proof) proof=1; shift ;;
+    --tasks) [ "$#" -ge 2 ] || usage; tasks="$2"; shift 2 ;;
+    --nyc) [ "$#" -ge 2 ] || usage; nyc="$2"; shift 2 ;;
+    --gate-canon) [ "$#" -ge 2 ] || usage; gate_canon="$2"; shift 2 ;;
     --dry-run) dry=1; shift ;;
     *) usage ;;
   esac
@@ -106,6 +134,28 @@ done
 [ -z "$extra" ] || refuse "--from '$from' is not an IPv4 address"
 
 [ -f "$vhd" ] || refuse "no VHD at $vhd"
+
+# The proof's inputs, every one there before anything runs, not even in a dry run.
+size=Standard_D2s_v4
+jobs="score occupancy enrich audit"
+if [ "$proof" -eq 1 ]; then
+  size=Standard_D4s_v4
+  [ "$data_disk" -eq 0 ] || refuse "--proof takes no --data-disk: the proof reads and writes Blob"
+  { [ -n "$tasks" ] && [ -n "$nyc" ] && [ -n "$gate_canon" ]; } || refuse "--proof needs --tasks, --nyc and --gate-canon"
+  for j in $jobs; do
+    [ -f "$tasks/gate-$j" ] || refuse "no gate task at $tasks/gate-$j"
+    for period in 2024-01 2024; do
+      [ -f "$nyc/reference-$j-$period.json" ] || refuse "no reference at $nyc/reference-$j-$period.json"
+    done
+  done
+  for m in 01 02 03 04 05 06 07 08 09 10 11 12; do
+    [ -f "$nyc/norm/yellow_tripdata_2024-$m.parquet" ] || refuse "no input at $nyc/norm/yellow_tripdata_2024-$m.parquet"
+  done
+  { [ -f "$gate_canon" ] && [ -x "$gate_canon" ]; } || refuse "no gate-canon program at $gate_canon"
+elif [ -n "$tasks$nyc$gate_canon" ]; then
+  refuse "--tasks, --nyc and --gate-canon go with --proof"
+fi
+
 if [ "$dry" -eq 0 ] && [ -e "$run" ]; then
   refuse "$run exists: the run's directory must be new"
 fi
@@ -121,6 +171,10 @@ q() {
 R="$(q "$run")"
 V="$(q "$vhd")"
 O="$(q "$openssl")"
+T="$(q "$tasks")"
+N="$(q "$nyc")"
+C="$(q "$gate_canon")"
+PROOF="$(q "$repo/bench/node/proof.py")"
 S="--subscription $subscription"
 G="$group"
 A="$account"
@@ -157,7 +211,15 @@ say "node config"
 step "mkdir -m 700 $R"
 step "$O genpkey -algorithm ed25519 -out $R/token-key.pem"
 step "$O pkey -in $R/token-key.pem -pubout -outform DER | tail -c 32 | base64 > $R/token-key.pub"
-step "printf '{\"moruna\":1,\"api\":{\"token_keys\":[\"%s\"]}}\\n' \"\$(cat $R/token-key.pub)\" > $R/node-config.json"
+if [ "$proof" -eq 1 ]; then
+  # With --proof, a function key pair too: node config's one function key (3E), whose private
+  # half signs the gate tasks proof.py registers.
+  step "$O genpkey -algorithm ed25519 -out $R/function-key.pem"
+  step "$O pkey -in $R/function-key.pem -pubout -outform DER | tail -c 32 | base64 > $R/function-key.pub"
+  step "printf '{\"moruna\":1,\"api\":{\"token_keys\":[\"%s\"]},\"functions\":{\"keys\":[\"%s\"]}}\\n' \"\$(cat $R/token-key.pub)\" \"\$(cat $R/function-key.pub)\" > $R/node-config.json"
+else
+  step "printf '{\"moruna\":1,\"api\":{\"token_keys\":[\"%s\"]}}\\n' \"\$(cat $R/token-key.pub)\" > $R/node-config.json"
+fi
 
 # 2. The group, which must be new: from here on, whatever happens, it is deleted at the end.
 say "group $G"
@@ -203,6 +265,19 @@ step "$KEY az storage container create -n vhds --account-name $A --auth-mode key
 step "$KEY az storage blob upload -c vhds -n moruna-node.vhd -f $V --type page --account-name $A --auth-mode key $S -o none"
 step "$KEY az storage blob url -c vhds -n moruna-node.vhd --account-name $A --auth-mode key $S -o tsv > $R/vhd.url"
 step "az storage account show -n $A -g $G --query id -o tsv $S > $R/account.id"
+# With --proof, the proof's data and its functions, in two containers of the same account, private
+# as the account allows no public blob access, and a read-only SAS for the functions, made on this
+# machine from the account's key: the node fetches each function by its address alone (3E).
+if [ "$proof" -eq 1 ]; then
+  say "the proof's data and functions"
+  step "$KEY az storage container create -n data --account-name $A --auth-mode key $S -o none"
+  step "$KEY az storage container create -n functions --account-name $A --auth-mode key $S -o none"
+  step "$KEY az storage blob upload-batch -d data --destination-path nyc -s $N/norm --pattern 'yellow_tripdata_2024-*.parquet' --account-name $A --auth-mode key $S -o none"
+  for j in $jobs; do
+    step "$KEY az storage blob upload -c functions -n gate-$j -f $T/gate-$j --account-name $A --auth-mode key $S -o none"
+  done
+  step "(umask 077 && $KEY az storage container generate-sas -n functions --permissions r --expiry \"\$(python3 -I -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) + d.timedelta(hours=6)).strftime(\"%Y-%m-%dT%H:%MZ\"))')\" --https-only --account-name $A --auth-mode key $S -o tsv > $R/functions.sas)"
+fi
 
 # 4. A Generation 2 managed disk from it, in zone 3.
 say "disk"
@@ -223,9 +298,10 @@ step "az network nsg create -n moruna-node-nsg -g $G -l $location $S -o none"
 step "az network nsg rule create --nsg-name moruna-node-nsg -n https-from-operator -g $G --priority 100 --direction Inbound --access Allow --protocol Tcp --source-address-prefixes $from/32 --source-port-ranges '*' --destination-address-prefixes '*' --destination-port-ranges 443 $S -o none"
 step "az network nsg rule list --nsg-name moruna-node-nsg -g $G --include-default -o table $S"
 
-# 6. The machine. The clock starts when Azure has taken the request.
+# 6. The machine, a Standard_D2s_v4, or with --proof a Standard_D4s_v4. The clock starts when
+# Azure has taken the request.
 say "machine"
-step "az vm create -n moruna-node -g $G -l $location --zone 3 --size Standard_D2s_v4 --attach-os-disk moruna-node-os --os-type linux --security-type Standard --accelerated-networking false --public-ip-address moruna-node-ip --nsg moruna-node-nsg --boot-diagnostics-storage $A --user-data $R/node-config.json$data --no-wait $S -o none && date -u +%s > $R/created.at"
+step "az vm create -n moruna-node -g $G -l $location --zone 3 --size $size --attach-os-disk moruna-node-os --os-type linux --security-type Standard --accelerated-networking false --public-ip-address moruna-node-ip --nsg moruna-node-nsg --boot-diagnostics-storage $A --user-data $R/node-config.json$data --no-wait $S -o none && date -u +%s > $R/created.at"
 
 # 7. Ready: the node answers GET /v1/health on 443, which needs no token; at most 10 minutes.
 say "waiting for the node to answer on 443"
@@ -268,4 +344,13 @@ if [ "$job" -eq 1 ]; then
   step "curl -sS -k -N --max-time 600 $AUTH \"https://\$(cat $R/address)/v1/jobs/\$(cat $R/job.id)/events\" > $R/job-events.txt; grep -a '^data: ' $R/job-events.txt | grep -a '\"type\":\"exit\"' | tail -1 | cut -c7- > $R/job-exit.json && cat $R/job-exit.json && grep -q '\"code\":0[,}]' $R/job-exit.json"
   step "curl -sS -k --max-time 60 $AUTH \"https://\$(cat $R/address)/v1/jobs/\$(cat $R/job.id)/report\" > $R/job-report.json && python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"sinks\"][0][\"rows\"])' $R/job-report.json > $R/job.rows && [ \"\$(cat $R/job.rows)\" = 10000000 ]"
   step "python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"wall_ms\"])' $R/job-report.json > $R/job.wall && [ -s $R/job.wall ] && printf 'job: %s rows counted, wall_ms %s\\n' \"\$(cat $R/job.rows)\" \"\$(cat $R/job.wall)\""
+fi
+
+# 9, with --proof: the four NYC jobs through the API (work item 3.8) on 2024-01 and on all of 2024,
+# from and to Blob, each output checked against 0.6.6's reference; the results in RUN/proof. The
+# account key and the SAS reach proof.py in its environment, never on a command line, and it
+# redacts both wherever it would show them.
+if [ "$proof" -eq 1 ]; then
+  say "proof"
+  step "BENCH_KEY=\"\$(cat $R/account.key)\" FUNCTIONS_SAS=\"\$(cat $R/functions.sas)\" MORUNA_BENCH_OPENSSL=$O python3 -I $PROOF --url \"https://\$(cat $R/address):443\" --pin \"\$(cat $R/console.pin)\" --token-key $R/token-key.pem --instance \"\$(cat $R/instance)\" --function-key $R/function-key.pem --functions $T --function-base https://$A.blob.core.windows.net/functions --data blob --blob-account $A --blob-container data --periods 2024-01,2024 --references $N --gate-canon $C --results $R/proof --work $R/proof-work"
 fi

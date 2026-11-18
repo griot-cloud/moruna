@@ -26,13 +26,22 @@ It is written for subscription `griot-dev`, region Central India (`centralindia`
   group not named `moruna-node-*`, and a group that already exists. Its tests
   (`kernel/node/tools/test_azure_up.py`) check that this file holds every command it runs. It
   prints each command with the time before running it, so its output is the run's transcript.
-  Two options add steps, each marked below: `--data-disk` attaches an empty 4 GiB data disk at
-  LUN 0 (steps 4, 6 and 10), and `--job` runs a job through the API once the node is ready
-  (step 9); either goes after `--group` below. A run:
+  Three options add steps, each marked below: `--data-disk` attaches an empty 4 GiB data disk at
+  LUN 0 (steps 4, 6 and 10), `--job` runs a job through the API once the node is ready
+  (step 9), and `--proof` runs the proof of work item 3.8 on a `Standard_D4s_v4` (steps 1, 3, 6
+  and 9); each goes after `--group` below, and `--proof` takes no `--data-disk`. A run:
 
   ```
   kernel/node/tools/azure-up.sh --vhd <OUT>/moruna-node.vhd --run <RUN> --from <FROM> \
     --group <NAME> 2>&1 | tee <RUN>.log
+  ```
+
+  The proof's run, with its three inputs:
+
+  ```
+  kernel/node/tools/azure-up.sh --vhd <OUT>/moruna-node.vhd --run <RUN> --from <FROM> \
+    --group <NAME> --proof --tasks <TASKS> --nyc <NYC> --gate-canon <GATE_CANON> \
+    2>&1 | tee <RUN>.log
   ```
 
 ## The values the operator fills in
@@ -43,10 +52,14 @@ a command changes.
 | Value | What it is | Where it comes from |
 | --- | --- | --- |
 | `<OUT>` | The directory `package.py` wrote, holding `moruna-node.vhd` | The build, below |
-| `<RUN>` | A new directory for this run's files: node config, the IDs, the console log, the times. Outside the repository, since a private key and the storage account's key are kept there | The operator chooses it. Step 1 makes it |
+| `<RUN>` | A new directory for this run's files: node config, the IDs, the console log, the times, and with `--proof` its results. Outside the repository, since a private key and the storage account's key are kept there (with `--proof`, the function key and the SAS too) | The operator chooses it. Step 1 makes it |
 | `<NAME>` | The run's resource group: `moruna-node-` and then lowercase letters, digits and inner dashes, for example `moruna-node-202611181530` | The operator chooses it. No group of the subscription has it yet (step 2) |
 | `<ACCOUNT>` | The run's storage account: `mrnnode` and `<NAME>`'s part after `moruna-node-` without its dashes, at most 24 characters, for example `mrnnode202611181530` | Made from `<NAME>`. A storage account's name is unique in all of Azure, so a taken one stops the run at step 3 |
 | `<FROM>` | The operator's public IPv4 address: the only one the machine admits, on port 443 | Where the operator's traffic leaves for the internet, as a "what is my IP" service shows it |
+| `<TASKS>` | With `--proof`: the directory of the gate tasks built for the core, holding at least `gate-score`, `gate-occupancy`, `gate-enrich` and `gate-audit` | `images/gate/tasks/build.sh`, which writes them to its target's `core/bin` |
+| `<NYC>` | With `--proof`: the directory holding the twelve normalised months of 2024, `norm/yellow_tripdata_2024-MM.parquet` (about 800 MB), and 0.6.6's references, `reference-JOB-PERIOD.json` and `reference-score-2024.dump` | `~/moruna-data/nyc` on the project's Mac (`bench/node/references.py`) |
+| `<GATE_CANON>` | With `--proof`: `gate-canon` built for the operator's machine, which hashes the outputs and checks the year | `images/gate`: `cargo build --release -p moruna-gate-baseline --bin gate-canon` |
+| `<REPO>` | With `--proof`: the repository's root, whose `bench/node/proof.py` runs the proof | The checkout `azure-up.sh` is in; it names its own |
 
 The machine's own address and its instance ID are read from Azure and from its console into
 `<RUN>`, and the commands read them from there.
@@ -70,6 +83,21 @@ The machine's own address and its instance ID are read from Azure and from its c
   path.
 - **Quota** for one `Standard_D2s_v4` (the DSv4 family) in Central India, zone 3. `griot-dev` has
   no quota for any v5 family there (1F).
+- **With `--proof`,** also:
+  - quota for one `Standard_D4s_v4` (4 vCPUs of the DSv4 family) in its place; it has 16 GiB, so
+    the image's `--node-memory` is 17179869184 or less;
+  - `<TASKS>`, `<NYC>` and `<GATE_CANON>` (the values above), which the script checks are there
+    before anything runs;
+  - Python 3 with pyarrow and its `AzureFileSystem`, as `python3` (`bench/node/proof.py` reads
+    the outputs back from Blob with it, and hashes the month with `bench/vm/canon.py`). This shows
+    it, and only reads:
+
+    ```
+    python3 -I -c 'import pyarrow.fs; print(pyarrow.__version__, pyarrow.fs.AzureFileSystem)'
+    ```
+
+  - room on the operator's disk for the year's outputs, read back one at a time, and Score's
+    year dump (about 1 GB), which stays in `<RUN>/proof-work`.
 
 ## 1. Node config
 
@@ -102,6 +130,28 @@ printf '{"moruna":1,"api":{"token_keys":["%s"]}}\n' "$(cat <RUN>/token-key.pub)"
 
 It carries no secret. A token key is a public key, and with no `tls` the node makes its own key
 and certificate at boot (1D).
+
+**With `--proof`:** a second key pair, the run's function key, whose private half signs the gate
+tasks the proof registers (3E), made as the token key is:
+
+```
+openssl genpkey -algorithm ed25519 -out <RUN>/function-key.pem
+```
+
+```
+openssl pkey -in <RUN>/function-key.pem -pubout -outform DER | tail -c 32 | base64 \
+  > <RUN>/function-key.pub
+```
+
+Node config then names it as its one function key, in `functions.keys` (1D, 3E's
+`function_keys`), in place of the node config above:
+
+```
+printf '{"moruna":1,"api":{"token_keys":["%s"]},"functions":{"keys":["%s"]}}\n' \
+  "$(cat <RUN>/token-key.pub)" "$(cat <RUN>/function-key.pub)" > <RUN>/node-config.json
+```
+
+A function key is a public key too: node config still carries no secret.
 
 ## 2. The resource group
 
@@ -161,6 +211,70 @@ AZURE_STORAGE_KEY="$(cat <RUN>/account.key)" az storage blob url -c vhds -n moru
 az storage account show -n <ACCOUNT> -g <NAME> --query id -o tsv --subscription griot-dev \
   > <RUN>/account.id
 ```
+
+**With `--proof`:** two more containers in the same account, private, since the account allows no
+public blob access: `data`, which the proof's jobs read from and write to (3.5), and `functions`,
+which holds the gate tasks the node fetches (3E):
+
+```
+AZURE_STORAGE_KEY="$(cat <RUN>/account.key)" az storage container create -n data \
+  --account-name <ACCOUNT> --auth-mode key --subscription griot-dev -o none
+```
+
+```
+AZURE_STORAGE_KEY="$(cat <RUN>/account.key)" az storage container create -n functions \
+  --account-name <ACCOUNT> --auth-mode key --subscription griot-dev -o none
+```
+
+The twelve normalised months of 2024, about 800 MB, under `nyc/`, where the proof's documents
+name them (`az://data/nyc/yellow_tripdata_2024-MM.parquet`):
+
+```
+AZURE_STORAGE_KEY="$(cat <RUN>/account.key)" az storage blob upload-batch -d data \
+  --destination-path nyc -s <NYC>/norm --pattern 'yellow_tripdata_2024-*.parquet' \
+  --account-name <ACCOUNT> --auth-mode key --subscription griot-dev -o none
+```
+
+The four gate tasks, each under its function's name:
+
+```
+AZURE_STORAGE_KEY="$(cat <RUN>/account.key)" az storage blob upload -c functions -n gate-score \
+  -f <TASKS>/gate-score --account-name <ACCOUNT> --auth-mode key --subscription griot-dev -o none
+```
+
+```
+AZURE_STORAGE_KEY="$(cat <RUN>/account.key)" az storage blob upload -c functions \
+  -n gate-occupancy -f <TASKS>/gate-occupancy --account-name <ACCOUNT> --auth-mode key \
+  --subscription griot-dev -o none
+```
+
+```
+AZURE_STORAGE_KEY="$(cat <RUN>/account.key)" az storage blob upload -c functions -n gate-enrich \
+  -f <TASKS>/gate-enrich --account-name <ACCOUNT> --auth-mode key --subscription griot-dev -o none
+```
+
+```
+AZURE_STORAGE_KEY="$(cat <RUN>/account.key)" az storage blob upload -c functions -n gate-audit \
+  -f <TASKS>/gate-audit --account-name <ACCOUNT> --auth-mode key --subscription griot-dev -o none
+```
+
+A read-only SAS for `functions`, HTTPS only, expiring 6 hours from now. `az` signs it here with
+the account's key and sends nothing to Azure. The node fetches each task by its address alone,
+`https://<ACCOUNT>.blob.core.windows.net/functions/gate-JOB?<SAS>`: an address is `https://` only,
+and `node-admission` holds no store credentials (3E). The SAS is kept in `<RUN>`, readable by the
+operator alone, and reaches `proof.py` in the environment (step 9):
+
+```
+(umask 077 && AZURE_STORAGE_KEY="$(cat <RUN>/account.key)" az storage container generate-sas \
+  -n functions --permissions r --expiry "$(python3 -I -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) + d.timedelta(hours=6)).strftime("%Y-%m-%dT%H:%MZ"))')" \
+  --https-only --account-name <ACCOUNT> --auth-mode key --subscription griot-dev -o tsv \
+  > <RUN>/functions.sas)
+```
+
+- **6 hours** covers the month's four runs, where each function is first fetched; the node then
+  keeps each image in its function cache until it stops (3E), so the year's runs fetch nothing.
+- The SAS opens `functions` only, to read; the data and its outputs are reached with the account
+  key, by secret name (step 9).
 
 ## 4. The managed disk, Generation 2
 
@@ -265,6 +379,17 @@ az vm create -n moruna-node -g <NAME> -l centralindia --zone 3 --size Standard_D
   --boot-diagnostics-storage <ACCOUNT> --user-data <RUN>/node-config.json \
   --attach-data-disks moruna-node-data --no-wait --subscription griot-dev -o none \
   && date -u +%s > <RUN>/created.at
+```
+
+**With `--proof`,** the machine is a `Standard_D4s_v4`, 4 vCPUs and 16 GiB (work item 3.8), and
+nothing else changes:
+
+```
+az vm create -n moruna-node -g <NAME> -l centralindia --zone 3 --size Standard_D4s_v4 \
+  --attach-os-disk moruna-node-os --os-type linux --security-type Standard \
+  --accelerated-networking false --public-ip-address moruna-node-ip --nsg moruna-node-nsg \
+  --boot-diagnostics-storage <ACCOUNT> --user-data <RUN>/node-config.json --no-wait \
+  --subscription griot-dev -o none && date -u +%s > <RUN>/created.at
 ```
 
 ## 7. Ready
@@ -463,12 +588,53 @@ python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["wall_ms"])' 
   && printf 'job: %s rows counted, wall_ms %s\n' "$(cat <RUN>/job.rows)" "$(cat <RUN>/job.wall)"
 ```
 
+### With `--proof`: the proof
+
+The four NYC taxi jobs through the API, Score, Occupancy, Enrich and Audit, on January 2024 and
+then on all of 2024, one at a time (work item 3.8; `bench/node/proof.py`). After `--job`'s steps
+when both are given. `proof.py`:
+
+- registers each gate task at `https://<ACCOUNT>.blob.core.windows.net/functions/gate-JOB?<SAS>`,
+  signed with the run's function key (3E);
+- makes its own tokens for each scope with the run's token key, for the instance of step 8, and
+  pins the certificate the console printed;
+- runs each job from and to Blob: its inputs `az://data/nyc/…`, its output under
+  `az://data/proof/…`. The account key reaches the node by secret name, as 3B says a credential
+  does: the document names `{"secret": "blob-key"}` in `object_store.azure.access_key`, and the
+  job's body carries `"secrets": {"blob-key": <key>}` beside it, which `api` passes to the engine
+  outside the document and redacts everywhere;
+- follows each job's events to its report, reads its output back, and checks its rows and
+  canonical hashes against 0.6.6's references in `<NYC>`, with `<GATE_CANON>` for the year;
+- writes each run's record and the summary, `proof.json`, to `<RUN>/proof`, and prints a table.
+  It exits 0 only when all eight runs pass.
+
+The account key and the SAS reach it in the environment, never on a command line, and it never
+prints or writes either: an address it shows, and a node's message that quotes one, name the SAS
+`<FUNCTIONS_SAS>`. `MORUNA_BENCH_OPENSSL` names the OpenSSL that signs (step 1's):
+
+```
+BENCH_KEY="$(cat <RUN>/account.key)" FUNCTIONS_SAS="$(cat <RUN>/functions.sas)" \
+  MORUNA_BENCH_OPENSSL=openssl python3 -I <REPO>/bench/node/proof.py \
+  --url "https://$(cat <RUN>/address):443" --pin "$(cat <RUN>/console.pin)" \
+  --token-key <RUN>/token-key.pem --instance "$(cat <RUN>/instance)" \
+  --function-key <RUN>/function-key.pem --functions <TASKS> \
+  --function-base https://<ACCOUNT>.blob.core.windows.net/functions --data blob \
+  --blob-account <ACCOUNT> --blob-container data --periods 2024-01,2024 --references <NYC> \
+  --gate-canon <GATE_CANON> --results <RUN>/proof --work <RUN>/proof-work
+```
+
+A month's run may take at most an hour and the year's six (`proof.py`'s `--timeout-s` and
+`--year-timeout-s`); one past its time is cancelled and fails. Step 10 deletes the data, the
+outputs and the functions with the account.
+
 ## 10. Delete everything
 
 Read the console one last time, then delete the group. That deletes everything this recipe made,
 all of it in the group: the machine, its OS disk, its network card and virtual network, the
 public address, the security group and the storage account with the VHD, the boot diagnostics and
-the key. `--yes` asks no question; the command returns when Azure has deleted it all.
+the key (with `--proof`, also the data, the proof's outputs and the functions, and with the key
+the SAS signed by it is void). `--yes` asks no question; the command returns when Azure has
+deleted it all.
 
 ```
 az vm boot-diagnostics get-boot-log -n moruna-node -g <NAME> --subscription griot-dev \
@@ -507,4 +673,6 @@ az network watcher list --subscription griot-dev -o table
 
 Keep `<RUN>` with the report: it holds the console log and the two times. Its `token-key.pem` is
 the run's private key, and is never committed; its `account.key` opened an account that no longer
+exists. With `--proof` it also holds the proof's results, `<RUN>/proof`; its `function-key.pem`
+is a private key too, never committed, and its `functions.sas` opened a container that no longer
 exists.
