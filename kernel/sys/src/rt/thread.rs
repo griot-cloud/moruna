@@ -1,11 +1,13 @@
-//! Threads (std's `sys::thread`): spawn, join, sleep and yield.
+//! Threads: the one thread path (system design 5B), which std's `thread::spawn` and the C
+//! library's `pthread_create` both take, and sleep and yield.
 //!
-//! A thread std spawns gets a stack of its own (a memory object, with a guard page below it)
-//! and a table of thread-local keys, which its FS base points at before std's code runs on it.
-//! When std's code returns, the thread gives its keys' values to their destructors, frees its
-//! table and ends. A joined thread's stack is unmapped by the join; a thread std detaches (drops
-//! without joining) is kept on a list, and its stack is unmapped by the next spawn after it has
-//! ended.
+//! A thread gets a stack of its own (a memory object, with a guard page below it) and its block
+//! of ELF TLS with its control block ([`super::tls`]), which its FS base points at before its
+//! runtime's code runs on it. That code (std's thread start, or the C library's) runs its own
+//! thread-local destructors before it returns; then the thread frees its block and ends, or
+//! [`exit`] does so from anywhere in it. A joined thread's stack is unmapped by the join; a
+//! thread dropped without a join is kept on a list, and its stack is unmapped by the next spawn
+//! after it has ended.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -22,11 +24,11 @@ use crate::Result;
 /// arrow-rs and query engines recurse deeply (PM, 2026-11-18). A guard page lies below it.
 pub const DEFAULT_MIN_STACK_SIZE: usize = 2 << 20;
 
-/// What a started thread runs, boxed by [`spawn`] and freed by the thread.
+/// What a started thread runs, boxed by [`spawn`] and taken apart by the thread.
 struct Start {
     main: extern "C" fn(usize),
     arg: usize,
-    table: tls::Table,
+    block: tls::Block,
 }
 
 /// A started thread's handle and stack.
@@ -55,15 +57,13 @@ pub(crate) fn stack_bytes(size: usize) -> Option<usize> {
     (total <= os::STACK_MAX).then_some(total)
 }
 
-/// Starts a thread that runs `main(arg)` on a stack of at least `stack` bytes.
+/// Starts a thread that runs `main(arg)` on a stack of at least `stack` bytes, with its own
+/// thread-locals and control block.
 pub fn spawn(stack: usize, main: extern "C" fn(usize), arg: usize) -> Result<Thread> {
     reap();
     let stack = os::Stack::map(stack_bytes(stack).ok_or(Error::NoMemory)?)?;
-    let start = Box::into_raw(Box::new(Start {
-        main,
-        arg,
-        table: tls::Table::new(),
-    }));
+    let block = tls::Block::new(&os::template()).ok_or(Error::NoMemory)?;
+    let start = Box::into_raw(Box::new(Start { main, arg, block }));
     match os::spawn(&stack, start.expose_provenance() as u64) {
         Ok(handle) => Ok(Thread {
             running: Some(Running {
@@ -88,8 +88,7 @@ pub(super) extern "C" fn trampoline(start: u64) -> ! {
     os::thread_exit()
 }
 
-/// A started thread's life: its table installed, std's code run, its keys' destructors run,
-/// its table removed and freed.
+/// A started thread's life: its block installed, its runtime's code run, its block freed.
 ///
 /// # Safety
 ///
@@ -98,11 +97,19 @@ pub(super) unsafe fn run(start: u64) {
     // SAFETY: the caller's contract.
     let start: Box<Start> =
         unsafe { Box::from_raw(core::ptr::with_exposed_provenance_mut(start as usize)) };
-    tls::install(&start.table);
-    (start.main)(start.arg);
-    tls::run_dtors();
-    tls::uninstall();
-    drop(start);
+    let Start { main, arg, block } = *start;
+    block.install();
+    main(arg);
+    tls::release_current();
+}
+
+/// Ends the calling thread from anywhere in its code, as `pthread_exit` does: its block is
+/// freed, so its runtime has run its thread-local destructors first. Its stack goes with its
+/// join, or after it as for any detached thread.
+#[cfg(not(test))]
+pub fn exit() -> ! {
+    tls::release_current();
+    os::thread_exit()
 }
 
 impl Thread {
@@ -194,13 +201,16 @@ mod tests {
     static RAN: AtomicUsize = AtomicUsize::new(0);
 
     extern "C" fn record(arg: usize) {
-        // The thread has its table before std's code runs.
-        assert!(!os::table().is_null());
-        let key = tls::create(None);
-        // SAFETY: this thread has a table and the key is a created one.
-        unsafe { tls::set(key, core::ptr::without_provenance_mut(arg)) };
-        // SAFETY: as above.
-        assert_eq!(unsafe { tls::get(key) }.addr(), arg);
+        // The thread has its block before its runtime's code runs, the template's image in
+        // its TLS just below its control block.
+        let control = tls::current();
+        assert!(!control.is_null());
+        // SAFETY: the thread's own block, whose TLS ends at its control block.
+        let tls = unsafe {
+            let c = &*control;
+            core::slice::from_raw_parts(control.cast::<u8>().sub(c.tls_len), c.tls_len)
+        };
+        assert_eq!(&tls[..8], b"host tls");
         RAN.fetch_add(arg, Ordering::SeqCst);
     }
 
