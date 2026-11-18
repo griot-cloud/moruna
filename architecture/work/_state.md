@@ -16,11 +16,11 @@ Boot evidence is kept in `~/moruna-data/boots/` (chain logs, scripts, run report
 | Item | Branch | State |
 |---|---|---|
 | 6.3d the Parquet writers' memory | `work/6.3d-writer-heap` 114ec8c5 on 56cc2040, plus the three decisions in its tree (the tight test passes 10 of 10; the sink's lane race fixed; a decode batch never below MORSEL_MIN) | PM decided: the writers' extra comes only from what the arena's working size (sized with the claims) leaves, never from the arena: a tight run was terminated at the arena's least. Don't relax si_lane_heap; isolate it. A decode batch is never 0 bytes. Then the 672 MiB table and its report | The claim order and the wide read's arena least are built; the 768-column test is no longer ignored. The five crates' suites are running; then commit, the release table and pairs once the load drops, and coverage |
-| 6.3g a function's memory measured | phases 1–2 merged (081e145c); phase 3 at 8af13d2c (host side, the gate's Python fixes, 6.3i's two commits); its booted turn holds the VM lock from 21:09Z | Rule 1 (the per-instance morsel cap plus the kernel's cut), rule 2 (profiles scaled by count), 6.3i's refused-charge commit, the gate's two Python fixes; then a booted turn |
+| 6.3g a function's memory measured | phases 1–2 merged (081e145c); phase 3 at 8af13d2c plus the warm-up (uncommitted) | Booted (21:09–21:52Z): 6.3i's KB5 accounts, quota and cpu lines pass; the warm-up works on Score (6.8 s of a 106 s month, other tasks sized from it). Enrich was terminated by staging on its base without 6.3h, 6.3k and 6.3j; it rebases and boots the pair again after run 5's image build, then builds the restart | Rule 1 (the per-instance morsel cap plus the kernel's cut), rule 2 (profiles scaled by count), 6.3i's refused-charge commit, the gate's two Python fixes; then a booted turn |
 
 ## The PM's, in order
 
-Benchmark run 5 is ready (`~/moruna-data/chain-bench5.sh <commit>`): the node image at feature's tip and every engine. 6.3r passed; it starts when 6.3g's booted turn (about 2.5 h from 21:09Z) frees the VM lock, at feature's tip then. Run 4's Linux engines never installed because PyPI timed out; fixed in 0b3ac5bc (uv waits 5 minutes a download and retries 5 times).
+Benchmark run 5 is ready (`~/moruna-data/chain-bench5.sh <commit>`): the node image at feature's tip and every engine. Running: the image build took the VM lock at 21:52Z, at b11c1342. Run 4's Linux engines never installed because PyPI timed out; fixed in 0b3ac5bc (uv waits 5 minutes a download and retries 5 times).
 
 
 | # | Item | Branch, tip | Saved work | Next |
@@ -39,7 +39,7 @@ Benchmark run 5 is ready (`~/moruna-data/chain-bench5.sh <commit>`): the node im
 | 11 | 4.6 mlp_forward | MERGED (`work/4.6-mlp-forward` 151e1a39) | none | Left: the 20-minute one-core measurement in moruna-arm (`kernel_mlp.py measure`, `score BIN numpy`) |
 | 12 | 4.1 + 4.3 catalogue runner, filter, take | MERGED 5577f6d7 (3b4bd4a5) | none | Done: the runner runs every listed implementation over its corpus (filter, take, mlp_forward, interval_coverage_count all pass); coverage 95–96%. Left: the Enrich month check (tests/enrich_month.rs, ignored, needs MORUNA_ENRICH_DIR) and dropping 4.5's stand-in corpus test |
 | 13 | 4.2 expr | `work/4.2-expr` f2e046ad | patch plus tgz (uncompiled) | Compile, test, then 4G.3 |
-| 14 | 4.4 group_aggregate | `work/4.4-group-aggregate` f2e046ad | patch plus tgz (uncompiled) | Compile, test, then 4G.4 |
+| 14 | 4.4 group_aggregate | MERGED 8a4b6ed4 (bba7bb70) | none | Done: hash and dense paths, exact float sums (the superaccumulator's top-digit overflow fixed), 29 cases pass the runner, coverage 94.4%. Left: the 4G.4 counts and the float-sum cost (exact, binned, plain) on a month and on the year |
 | 15 | 4.5 interval_coverage_count | MERGED (`work/4.5-interval-coverage-count` a70e3416) | scratch in wip | Done: year compute 53.3 s in Python against 0.85 s; peak 1,217 MiB against 89 MiB; bit for bit. Left: drop its stand-in corpus test once 4.1's runner lands |
 | 16 | S.1 dependency advisories | `work/S.1-dependency-advisories` 9b045426 | patch | Read the patch, then build |
 
