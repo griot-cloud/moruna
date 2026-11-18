@@ -983,6 +983,7 @@ dependencies = [
  "moruna-netstack",
  "moruna-node",
  "moruna-storage-format",
+ "netstack-protocol",
 ]
 
 [[package]]
