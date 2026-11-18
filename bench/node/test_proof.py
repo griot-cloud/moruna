@@ -1045,8 +1045,178 @@ def test_a_whole_proof_from_and_to_blob_with_the_data_sas(world, monkeypatch):
         assert body["v1"]["source"]["url"][0].startswith("az://data/nyc/")
         assert body["v1"]["sink"]["url"] == f"az://data/proof/{job['run']}/"
     for job in ("score", "enrich"):
-        assert result(world, f"{job}-2024-01")["output_check"]["verdict"] == "bit for bit"
+        r = result(world, f"{job}-2024-01")
+        assert r["output_check"]["verdict"] == "bit for bit"
+        # A run's record names where its output is: what --check-only is given to check it again.
+        assert r["output"] == f"az://data/proof/{job}-2024-01/" and "check_only" not in r
+    assert json.load(open(world / "res" / "proof.json"))["check_only"] is False
     assert any("comp=list&prefix=proof%2Fenrich-2024-01%2F" in r for r in blob.requests)
     for part in data_secret_parts() + secret_parts():
         assert part not in "\n".join(said) and part not in written(world)
 
+
+# --- --check-only: the outputs a proof's jobs wrote already (work item 3.8c) --------------------
+
+def outputs(container, tables, prefix="proof/p/"):
+    """Each run's output in the container, where its job wrote it: PREFIX and the run's name."""
+    for run, table in tables.items():
+        out = container / prefix / run
+        out.mkdir(parents=True)
+        pq.write_table(table, out / "part-0.parquet")
+
+
+def check_only(world, blob, monkeypatch, *extra, jobs="score,enrich", sas=DATA_SAS):
+    """proof.py --check-only over the fake Blob, with the data's SAS in the environment. There is
+    no node: one asked, a signature made or a wait fails the test."""
+    def no_node(*a, **k):
+        raise AssertionError("--check-only asked a node")
+    monkeypatch.delenv("BENCH_KEY", raising=False)
+    monkeypatch.delenv("FUNCTIONS_SAS", raising=False)
+    monkeypatch.setenv("BENCH_SAS", sas)
+    argv = ["--check-only", "--data", "blob", "--blob-account", "acct", "--blob-container", "data",
+            "--blob-endpoint", blob.endpoint, "--blob-outputs", "proof/p/", "--jobs", jobs, "--periods", "2024-01",
+            "--references", str(world / "ref"), "--results", str(world / "res"),
+            "--work", str(world / "work")] + list(extra)
+    said = []
+    rc = proof.main(argv, transport=no_node, sign=no_node, log=said.append, sleep=no_node, clock=lambda: 0.0)
+    return rc, said
+
+
+def test_check_only_passes_on_the_outputs_a_proof_wrote(world, monkeypatch):
+    container = world / "container"
+    outputs(container, {"score-2024-01": expected("score"), "enrich-2024-01": expected("enrich")})
+    # Another proof's outputs, under another prefix, are not these.
+    outputs(container, {"score-2024-01": expected("enrich")}, prefix="proof/q/")
+    blob = FakeBlob(container, page=5)
+    try:
+        rc, said = check_only(world, blob, monkeypatch)
+    finally:
+        blob.close()
+    assert rc == 0, said
+    for job in ("score", "enrich"):
+        r = result(world, f"{job}-2024-01")
+        assert r["ok"] and r["output_check"]["verdict"] == "bit for bit"
+        assert r["output_check"]["rows_mine"] == expected(job).num_rows and r["canon"]["by"] == "canon.py"
+        # Where a run of the proof named its output, and nothing of a job: none ran.
+        assert r["output"] == f"az://data/proof/p/{job}-2024-01/" and r["check_only"] and r["data"] == "blob"
+        assert not {"job_id", "state", "exit", "times", "events_by"} & set(r)
+    s = json.load(open(world / "res" / "proof.json"))
+    assert s["ok"] and s["check_only"] and s["node"] is None and s["events"] is None
+    assert [(x["id"], x["ok"], x["verdict"]) for x in s["runs"]] == [
+        ("score-2024-01", True, "bit for bit"), ("enrich-2024-01", True, "bit for bit")]
+    # Each output is fetched as a run fetches it: List Blobs under PREFIX and RUN/, then its blob.
+    lists = [r for r in blob.requests if "comp=list" in r]
+    assert [r.split("prefix=")[1].split("&")[0] for r in lists] == ["proof%2Fp%2Fscore-2024-01%2F",
+                                                                   "proof%2Fp%2Fenrich-2024-01%2F"]
+    assert len(blob.requests) == 4 and not any("proof/q/" in r for r in blob.requests)
+    assert said[0].startswith("proof: check only: the outputs under az://data/proof/p/ against the references in ")
+    assert "score-2024-01: pass: bit for bit" in said[1] and "bit for bit" in said[-1]
+    assert not os.listdir(world / "work")
+    for part in data_secret_parts():
+        assert part not in "\n".join(said) and part not in written(world)
+
+
+def test_check_only_fails_when_an_output_is_missing(world, monkeypatch):
+    container = world / "container"
+    outputs(container, {"score-2024-01": expected("score")})
+    blob = FakeBlob(container, page=5)
+    try:
+        rc, said = check_only(world, blob, monkeypatch)
+    finally:
+        blob.close()
+    assert rc == 1
+    assert result(world, "score-2024-01")["ok"]
+    r = result(world, "enrich-2024-01")
+    assert not r["ok"] and r["output_check"] == {"ok": False, "verdict": "no canonical form: no output files"}
+    s = json.load(open(world / "res" / "proof.json"))
+    assert not s["ok"] and [x["ok"] for x in s["runs"]] == [True, False]
+    assert any("enrich-2024-01: FAIL: no canonical form: no output files" in line for line in said)
+
+
+def test_check_only_fails_when_an_output_is_wrong(world, monkeypatch):
+    t = expected("enrich")
+    changed = t.set_column(t.schema.get_field_index("tip_share"), "tip_share",
+                           pa.array([None if v is None else v + 1.0 for v in t["tip_share"].to_pylist()]))
+    container = world / "container"
+    outputs(container, {"score-2024-01": expected("score"), "enrich-2024-01": changed})
+    blob = FakeBlob(container, page=5)
+    try:
+        rc, said = check_only(world, blob, monkeypatch, "--keep-output")
+    finally:
+        blob.close()
+    assert rc == 1
+    assert result(world, "score-2024-01")["ok"]
+    r = result(world, "enrich-2024-01")
+    assert not r["ok"] and r["output_check"]["verdict"] == "DIFFERS" and r["output_check"]["rows"]
+    assert not json.load(open(world / "res" / "proof.json"))["ok"]
+    assert any("enrich-2024-01: FAIL: DIFFERS" in line for line in said)
+    # The output that differs is kept where it was fetched to, as a run keeps it.
+    assert os.listdir(world / "work" / "enrich-2024-01") == ["part-0.parquet"]
+
+
+def test_check_only_with_an_output_that_cannot_be_fetched_fails_and_says_why(world, monkeypatch):
+    """A store that refuses the SAS (one past its time, say) fails the run, without the SAS."""
+    container = world / "container"
+    outputs(container, {"score-2024-01": expected("score")})
+    blob = FakeBlob(container, page=5)
+    refused = DATA_SAS.replace("sp=racwl", "sp=r")
+    try:
+        rc, said = check_only(world, blob, monkeypatch, jobs="score", sas=refused)
+    finally:
+        blob.close()
+    r = result(world, "score-2024-01")
+    assert rc == 1 and not r["ok"] and r["output_check"]["verdict"].startswith("output not fetched: ")
+    assert "403" in r["output_check"]["verdict"]
+    for part in (refused, DATA_SIG, "DATAdataDATAdata+data/data="):
+        assert part not in "\n".join(said) and part not in written(world)
+
+
+@pytest.mark.skipif(not (GATE and os.path.isdir(os.path.join(NYC, "out066"))),
+                    reason="GATE_CANON and 0.6.6's January outputs (references.py --keep-output) under BENCH_NYC")
+def test_check_only_with_gate_canon_passes_on_0_6_6_s_own_january_outputs(tmp_path, monkeypatch):
+    """As the PM runs it after a proof: the four jobs' outputs fetched from Blob with the SAS and
+    checked by gate-canon against 0.6.6's references. The container here is the references'
+    directory, its `out066/` standing for the proof's prefix."""
+    blob = FakeBlob(NYC, page=3)
+    monkeypatch.delenv("BENCH_KEY", raising=False)
+    monkeypatch.setenv("BENCH_SAS", DATA_SAS)
+    said = []
+    try:
+        rc = proof.main(["--check-only", "--data", "blob", "--blob-account", "acct", "--blob-container", "data",
+                         "--blob-endpoint", blob.endpoint, "--blob-outputs", "out066/", "--periods", "2024-01",
+                         "--references", NYC, "--gate-canon", GATE, "--results", str(tmp_path / "res"),
+                         "--work", str(tmp_path / "work")], log=said.append)
+    finally:
+        blob.close()
+    assert rc == 0, said
+    s = json.load(open(tmp_path / "res" / "proof.json"))
+    assert [(x["id"], x["verdict"]) for x in s["runs"]] == [(f"{job}-2024-01", "bit for bit") for job in proof.JOBS]
+    assert result(tmp_path, "score-2024-01")["canon"]["by"] == "gate-canon"
+
+
+def test_what_check_only_needs_and_what_a_proof_against_a_node_needs(tmp_path):
+    only = ["--check-only", "--data", "blob", "--blob-account", "acct", "--blob-container", "data",
+            "--jobs", "score", "--periods", "2024-01"]
+    # The prefix the outputs are under: a time of now names none.
+    with pytest.raises(SystemExit, match="--check-only needs --data blob and --blob-outputs"):
+        proof.parse(only)
+    # A sink volume holds its last run's output alone.
+    with pytest.raises(SystemExit, match="--check-only needs --data blob and --blob-outputs"):
+        proof.parse(["--check-only", "--data", "volume", "--blob-outputs", "proof/p/"])
+    a = proof.parse(only + ["--blob-outputs", "proof/p/"])
+    assert a.check_only and a.blob_outputs == "proof/p/" and (a.url, a.pin, a.function_key) == (None, None, None)
+    # The year's check needs gate-canon, as in a proof.
+    with pytest.raises(SystemExit, match="needs --gate-canon"):
+        proof.parse(only + ["--blob-outputs", "proof/p/", "--periods", "2024"])
+    # A proof against a node still needs the node and the functions, each named when it is missing.
+    argv = args(tmp_path)
+    for name in ("--url", "--function-base"):
+        at = argv.index(name)
+        with pytest.raises(SystemExit, match=f"proof.py: {name} must be given"):
+            proof.parse(argv[:at] + argv[at + 2:])
+    with pytest.raises(SystemExit, match="--url, --pin, --function-key, --functions, --function-base must be given"):
+        proof.parse(["--data", "blob"])
+    # Its outputs go under proof/ and the time it started, when no prefix is given.
+    a = proof.parse(argv)
+    assert not a.check_only and a.blob_outputs.startswith("proof/2") and a.blob_outputs.endswith("/")
+    assert proof.parse(argv + ["--blob-outputs", "proof/mine/"]).blob_outputs == "proof/mine/"
