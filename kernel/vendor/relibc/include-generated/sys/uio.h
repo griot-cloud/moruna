@@ -1,0 +1,43 @@
+#ifndef _RELIBC_SYS_UIO_H
+#define _RELIBC_SYS_UIO_H
+
+#include <bits/ssize-t.h> // for ssize_t from sys/types.h
+#include <bits/iovec.h>   // for iovec
+
+#if defined(_BSD_SOURCE) || defined(_DEFAULT_SOURCE) || defined(_GNU_SOURCE)
+#include <bits/uio.h>     // for Non-POSIX functions preadv and pwritev
+#endif
+
+
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
+
+/**
+ * See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/readv.html>.
+ *
+ * Equivalent to `read()` but places the input data into the `iovcnt` buffers
+ * specified by the members of the `iov` array.
+ *
+ * When successful, returns a non-negative number indicating the number of
+ * bytes actually read. Upon failure, returns `-1`.
+ */
+ssize_t readv(int fd, const struct iovec *iov, int iovcnt);
+
+/**
+ * See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/writev.html>.
+ *
+ * Equivalent to `write()` but shall gather output data from the `iovcnt`
+ * buffers specified by the members of the `iov` array.
+ *
+ * When successful, returns a non-negative number indicating the number of
+ * bytes actually written to the file associated with `fildes`. Upon failure,
+ * returns `-1`.
+ */
+ssize_t writev(int fd, const struct iovec *iov, int iovcnt);
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif  // __cplusplus
+
+#endif  /* _RELIBC_SYS_UIO_H */

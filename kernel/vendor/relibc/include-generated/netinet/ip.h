@@ -1,0 +1,4 @@
+#ifndef _RELIBC_NETINET_IP_H
+#define _RELIBC_NETINET_IP_H
+
+#endif  /* _RELIBC_NETINET_IP_H */

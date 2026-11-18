@@ -88,8 +88,14 @@ branches from.
 
 `kernel/function/c/build-core.sh` builds it for the core's user target, in the C library's
 crate graph with std (`kernel/targets/x86_64-moruna.json`, std from
-`kernel/vendor/rust-std/library`): `libmoruna_function.a`, relibc's headers (written by
-`cbindgen`, as upstream's build writes them, from each `src/header/*/cbindgen.toml` and
-`cbindgen.globdefs.toml`), openlibm's `libopenlibm.a` from a copy of `openlibm/`, and the C
-functions linked as static native programs. The one C file of relibc (`src/c/stdlib.c`) is
-compiled by the host's clang for `x86_64-unknown-none-elf`.
+`kernel/vendor/rust-std/library`): `libmoruna_function.a`, relibc's headers, openlibm's
+`libopenlibm.a` from a copy of `openlibm/`, and the C functions linked as static native
+programs. The one C file of relibc (`src/c/stdlib.c`) is compiled by the host's clang for
+`x86_64-unknown-none-elf`.
+
+The headers upstream's build writes with `cbindgen` (from each `src/header/*/cbindgen.toml` and
+`cbindgen.globdefs.toml`) are committed in `include-generated/`, so a build needs no tool of its
+own; `include-generated/provenance.json` records cbindgen's version (0.29.4), the relibc commit
+and each header's SHA-256. `regen-headers.sh` (with `CBINDGEN` naming cbindgen 0.29.4) makes
+them again and fails if they differ from what is committed; `--write` replaces them. It is run
+when relibc's pin moves or Moruna's changes reach a header.

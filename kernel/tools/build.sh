@@ -112,11 +112,11 @@ kernel_bin="${CARGO_TARGET_DIR:-$kernel/target}/$target/release"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$kernel/target}" \
   "$kernel/tools/build-std.sh" "$kernel/examples/std-arrow/Cargo.toml"
 cp "${CARGO_TARGET_DIR:-$kernel/target}/x86_64-moruna/release/std-arrow" "$bin/std-arrow"
-# Item 5.2b: the C SDK on the core, by kernel/function/c/build-core.sh (with the user target's
-# clang, and cbindgen for relibc's headers: CBINDGEN, or on PATH): the C functions double,
-# runtime and sum, which the boot's `functions` test runs as tasks, and threads, a program of
-# its own, each linked static on relibc and std and stripped. Their debug info stays in
-# TARGET/core/debug.
+# Item 5.2b: the C SDK on the core, by kernel/function/c/build-core.sh with the user target's
+# clang (relibc's headers are committed, kernel/vendor/relibc/include-generated): the C
+# functions double, runtime and sum, which the boot's `functions` test runs as tasks, and
+# threads, a program of its own, each linked static on relibc and std and stripped. Their debug
+# info stays in TARGET/core/debug.
 CC="$user_cc" CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$kernel/target}" \
   "$kernel/function/c/build-core.sh"
 for name in double runtime sum threads; do
