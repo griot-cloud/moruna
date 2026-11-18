@@ -38,14 +38,14 @@ use devices_protocol::directory;
 use moruna_netstack::{
     Card, Config, Grant, Shared, Stack, after_turn,
     boot::{NO_LEASE, fatal},
+    card::CardLink,
     granted, parse,
 };
 use moruna_svc::{
-    CallError, Channel, ClientCore, ClockPage, Completions, Console, DEADLINE_INFINITE, Decoder,
-    Encoder, Handle, Memory, Rights, Signals, Timer, Watch, Wire, deadline_in, limits, now,
-    println, random, start,
+    Channel, ClockPage, Completions, Console, DEADLINE_INFINITE, Decoder, Handle, Memory, Rights,
+    Signals, Timer, Watch, Wire, deadline_in, now, println, random, start,
 };
-use net_protocol::{Frame, Link, SEND_FRAMES_MAX, net as card};
+use net_protocol::net as card;
 
 moruna_svc::main!(run);
 
@@ -53,142 +53,8 @@ const SECOND: u64 = 1_000_000_000;
 const PAGE: u64 = 4096;
 /// The longest configuration.
 const CONFIG_MAX: u64 = 64 << 10;
-/// What one send to a card carries besides its frames: the frame header, the count,
-/// each frame's length.
-const SEND_OVERHEAD: usize = 64;
 /// How long the server lets sockets still closing finish once its clients have gone.
 const LINGER_NS: u64 = SECOND;
-
-/// One card's connection and the requests outstanding on it.
-struct CardLink {
-    service: String,
-    core: ClientCore,
-    receive: Option<u32>,
-    link: Option<u32>,
-    generation: u32,
-    /// The sends outstanding: each request's id, and the frames it carries.
-    sends: Vec<(u32, u32)>,
-    batch: u32,
-    failed: Option<String>,
-}
-
-impl CardLink {
-    /// Takes every answer the card has sent, without waiting.
-    fn pump(&mut self, index: usize, shared: &Shared) -> Result<(), String> {
-        if let Some(t) = self.receive {
-            match self.core.reply(t, 0) {
-                Ok(mut f) => {
-                    let mut d = f.decoder();
-                    let frames = Vec::<Frame>::decode(&mut d)
-                        .map_err(|e| format!("a receive's frames: {e:?}"))?;
-                    d.finish()
-                        .map_err(|e| format!("a receive's frames: {e:?}"))?;
-                    let mut st = shared.stack.borrow_mut();
-                    let port = &mut st.card_mut(index).port;
-                    for frame in frames {
-                        port.deliver(frame.0);
-                    }
-                    self.receive = None;
-                }
-                Err(CallError::TimedOut) => {}
-                Err(e) => return Err(format!("receive: {e:?}")),
-            }
-        }
-        if let Some(t) = self.link {
-            match self.core.reply(t, 0) {
-                Ok(mut f) => {
-                    let mut d = f.decoder();
-                    let link = Link::decode(&mut d).map_err(|e| format!("a link: {e:?}"))?;
-                    d.finish().map_err(|e| format!("a link trailer: {e:?}"))?;
-                    self.generation = link.generation;
-                    shared.stack.borrow_mut().set_link(index, link.up);
-                    self.link = None;
-                }
-                Err(CallError::TimedOut) => {}
-                Err(e) => return Err(format!("link_changed: {e:?}")),
-            }
-        }
-        let mut k = 0;
-        while k < self.sends.len() {
-            let (id, frames) = self.sends[k];
-            match self.core.reply(id, 0) {
-                Ok(mut f) => {
-                    // moruna.driver.net's `send` answers the frames' count once every one is
-                    // on the device's ring, and refuses a batch whole.
-                    let mut decoder = f.decoder();
-                    let taken =
-                        u32::decode(&mut decoder).map_err(|e| format!("send answer: {e:?}"))?;
-                    decoder
-                        .finish()
-                        .map_err(|e| format!("send answer trailer: {e:?}"))?;
-                    if taken != frames {
-                        return Err(format!("a send of {frames} frames was answered {taken}"));
-                    }
-                    self.sends.swap_remove(k);
-                }
-                Err(CallError::TimedOut) => k += 1,
-                Err(e) => return Err(format!("send: {e:?}")),
-            }
-        }
-        self.ask()
-    }
-
-    /// Keeps one receive and one wait for the link outstanding.
-    fn ask(&mut self) -> Result<(), String> {
-        if self.receive.is_none() {
-            let mut e = Encoder::new();
-            self.batch.encode(&mut e).map_err(|e| format!("{e:?}"))?;
-            self.receive = Some(
-                self.core
-                    .send(6, e)
-                    .map_err(|e| format!("receive: {e:?}"))?,
-            );
-        }
-        if self.link.is_none() {
-            let mut e = Encoder::new();
-            self.generation
-                .encode(&mut e)
-                .map_err(|e| format!("{e:?}"))?;
-            self.link = Some(
-                self.core
-                    .send(3, e)
-                    .map_err(|e| format!("link_changed: {e:?}"))?,
-            );
-        }
-        Ok(())
-    }
-
-    /// Sends the frames the stack made for this card, in batches that fit a message,
-    /// while fewer than `in_flight` sends are outstanding.
-    fn flush(&mut self, index: usize, shared: &Shared, in_flight: usize) -> Result<(), String> {
-        loop {
-            if self.sends.len() >= in_flight {
-                return Ok(());
-            }
-            let batch: Vec<Frame> = {
-                let mut st = shared.stack.borrow_mut();
-                let tx = &mut st.card_mut(index).port.tx;
-                let (mut n, mut bytes) = (0, SEND_OVERHEAD);
-                while n < tx.len()
-                    && n < SEND_FRAMES_MAX
-                    && bytes + 4 + tx[n].len() <= limits::CHANNEL_MAX_BYTES
-                {
-                    bytes += 4 + tx[n].len();
-                    n += 1;
-                }
-                tx.drain(..n).map(Frame).collect()
-            };
-            if batch.is_empty() {
-                return Ok(());
-            }
-            let frames = batch.len() as u32;
-            let mut e = Encoder::new();
-            batch.encode(&mut e).map_err(|e| format!("{e:?}"))?;
-            let id = self.core.send(4, e).map_err(|e| format!("send: {e:?}"))?;
-            self.sends.push((id, frames));
-        }
-    }
-}
 
 type Cards = Rc<RefCell<Vec<CardLink>>>;
 
@@ -210,13 +76,27 @@ impl Watch for CardWatch {
     fn signaled(&mut self, _: Signals, _: &mut Completions) -> bool {
         let mut cards = self.cards.borrow_mut();
         let c = &mut cards[self.index];
-        if let Err(e) = c.pump(self.index, &self.shared) {
-            c.failed.get_or_insert(e);
-            // The interface is down from now on; the loop says why.
-            self.shared.stack.borrow_mut().set_link(self.index, false);
-            return false;
+        // Everything the card has answered: the channel read to its end, then each reply
+        // taken (work item 1.3c, moruna_netstack::card).
+        match c.pump() {
+            Ok(taken) => {
+                let mut st = self.shared.stack.borrow_mut();
+                let port = &mut st.card_mut(self.index).port;
+                for frame in taken.frames {
+                    port.deliver(frame);
+                }
+                if let Some(up) = taken.link {
+                    st.set_link(self.index, up);
+                }
+                true
+            }
+            Err(e) => {
+                c.failed.get_or_insert(e);
+                // The interface is down from now on; the loop says why.
+                self.shared.stack.borrow_mut().set_link(self.index, false);
+                false
+            }
         }
-        true
     }
 }
 
@@ -341,16 +221,12 @@ fn open_cards(
             mtu: info.mtu,
             up: link.up,
         });
-        let mut core_link = CardLink {
-            service: iface.card.clone(),
-            core: client.into_core(),
-            receive: None,
-            link: None,
-            generation: link.generation,
-            sends: Vec::new(),
+        let mut core_link = CardLink::new(
+            iface.card.clone(),
+            client.into_core(),
+            link.generation,
             batch,
-            failed: None,
-        };
+        );
         core_link.ask()?;
         links.push(core_link);
     }
@@ -524,10 +400,11 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
         {
             let mut links = cards.borrow_mut();
             for (index, l) in links.iter_mut().enumerate() {
-                if l.failed.is_none()
-                    && let Err(e) = l.flush(index, &shared, in_flight)
-                {
-                    l.failed = Some(e);
+                if l.failed.is_none() {
+                    let mut st = shared.stack.borrow_mut();
+                    if let Err(e) = l.flush(&mut st.card_mut(index).port.tx, in_flight) {
+                        l.failed = Some(e);
+                    }
                 }
                 if let (Some(why), false) = (&l.failed, reported[index]) {
                     // The interface is down; loopback and the other cards serve on.
