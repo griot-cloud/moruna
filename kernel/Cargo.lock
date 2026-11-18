@@ -1264,6 +1264,7 @@ dependencies = [
 name = "node-admission"
 version = "0.1.0"
 dependencies = [
+ "devices-protocol",
  "moruna-node",
  "moruna-storage-format",
  "moruna-storage-service",
@@ -1276,6 +1277,7 @@ dependencies = [
 name = "node-protocol"
 version = "0.1.0"
 dependencies = [
+ "devices-protocol",
  "moruna-node",
  "moruna-svc",
 ]
@@ -2059,6 +2061,7 @@ name = "virtio-blk"
 version = "0.1.0"
 dependencies = [
  "block-protocol",
+ "devices-protocol",
  "moruna-disk",
  "moruna-mmio",
  "moruna-pci",

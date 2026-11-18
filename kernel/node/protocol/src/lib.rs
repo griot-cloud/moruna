@@ -2,7 +2,8 @@
 #![no_std]
 #![forbid(unsafe_code)]
 extern crate alloc;
-use alloc::{string::String, vec::Vec};
+use alloc::{format, string::String, vec::Vec};
+use devices_protocol::Block;
 use moruna_svc::Handle;
 
 pub const MAX_JOBS: usize = 64;
@@ -93,8 +94,10 @@ pub fn serve_args(node_memory: u64) -> Vec<String> {
 }
 
 /// The engine's arguments for a check on a node of `node_memory` bytes:
-/// `check-job --listen channel:check --node channel:engine --budget-max N`, which reads the
-/// document and its secrets' names from the channel and answers the refusals and the budget.
+/// `check-job --listen channel:check --node channel:engine --budget-max N --volumes
+/// slot:volumes`, which reads the document and its secrets' names from the channel, the node's
+/// volumes from the data `node-admission` grants every check ([`VOLUMES_SLOT`]), and answers the
+/// refusals, the budget and the needs.
 pub fn check_args(node_memory: u64) -> Vec<String> {
     alloc::vec![
         "check-job".into(),
@@ -104,7 +107,66 @@ pub fn check_args(node_memory: u64) -> Vec<String> {
         alloc::format!("channel:{ENGINE_CHANNEL}"),
         "--budget-max".into(),
         alloc::format!("{}", budget_max(node_memory)),
+        "--volumes".into(),
+        alloc::format!("slot:{VOLUMES_SLOT}"),
     ]
+}
+
+/// The slot of the data `node-admission` grants every check: the node's volumes, as
+/// [`volume_lines`] writes them (system design 3C, item 3.3).
+pub const VOLUMES_SLOT: &str = "volumes";
+
+/// The node's volumes as a check reads them: a line for each disk the device manager's
+/// directory lists, `<serial> <bytes> <ro|rw> <boot|data>`, in its order. A serial holds no
+/// space (`Block::valid`).
+pub fn volume_lines(blocks: &[Block]) -> String {
+    let mut text = String::new();
+    for b in blocks {
+        text.push_str(&format!(
+            "{} {} {} {}\n",
+            b.serial,
+            u64::from(b.sector_size) * b.sectors,
+            if b.read_only { "ro" } else { "rw" },
+            if b.boot { "boot" } else { "data" },
+        ));
+    }
+    text
+}
+
+/// Why a job's volume is not one the node grants it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VolumeRefusal {
+    /// No disk of the node has the serial.
+    Unknown(String),
+    /// The serial is the disk the node booted from, which is never a volume.
+    Boot(String),
+    /// A sink's volume that its driver serves read only.
+    ReadOnly(String),
+}
+
+/// A job's volumes, each `(serial, written)` as its needs name it, resolved to the node's disks
+/// (`blocks`, the directory's list), in order; refused at the first that names no disk, the boot
+/// disk, or, for a sink's, a disk served read only.
+pub fn resolve<'a>(
+    volumes: &[(String, bool)],
+    blocks: &'a [Block],
+) -> Result<Vec<(&'a Block, bool)>, VolumeRefusal> {
+    volumes
+        .iter()
+        .map(|(serial, write)| {
+            let block = blocks
+                .iter()
+                .find(|b| b.serial == *serial)
+                .ok_or_else(|| VolumeRefusal::Unknown(serial.clone()))?;
+            if block.boot {
+                return Err(VolumeRefusal::Boot(serial.clone()));
+            }
+            if *write && block.read_only {
+                return Err(VolumeRefusal::ReadOnly(serial.clone()));
+            }
+            Ok((block, *write))
+        })
+        .collect()
 }
 
 moruna_svc::protocol! {
@@ -245,8 +307,74 @@ mod tests {
                 "--node",
                 "channel:engine",
                 "--budget-max",
-                max.as_str()
+                max.as_str(),
+                "--volumes",
+                "slot:volumes"
             ]
+        );
+    }
+
+    fn disk(serial: &str, read_only: bool, boot: bool) -> Block {
+        Block {
+            serial: serial.into(),
+            sector_size: 512,
+            sectors: 2048,
+            read_only,
+            boot,
+        }
+    }
+
+    #[test]
+    fn a_check_reads_the_nodes_volumes_one_line_a_disk() {
+        let blocks = [
+            disk("vol-a", false, false),
+            Block {
+                sector_size: 4096,
+                ..disk("lun-0", true, false)
+            },
+            disk("boot", true, true),
+        ];
+        assert_eq!(
+            volume_lines(&blocks),
+            "vol-a 1048576 rw data\nlun-0 8388608 ro data\nboot 1048576 ro boot\n"
+        );
+        assert_eq!(volume_lines(&[]), "");
+    }
+
+    #[test]
+    fn a_jobs_volumes_are_the_nodes_disks_never_its_boot_disk() {
+        let blocks = [
+            disk("vol-in", true, false),
+            disk("vol-out", false, false),
+            disk("boot", true, true),
+        ];
+        let v = |serial: &str, write: bool| (String::from(serial), write);
+        let resolved = resolve(&[v("vol-in", false), v("vol-out", true)], &blocks).unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(
+            (resolved[0].0.serial.as_str(), resolved[0].1),
+            ("vol-in", false)
+        );
+        assert_eq!(
+            (resolved[1].0.serial.as_str(), resolved[1].1),
+            ("vol-out", true)
+        );
+        assert_eq!(resolve(&[], &blocks), Ok(alloc::vec![]));
+        assert_eq!(
+            resolve(&[v("vol-in", false), v("vol-x", false)], &blocks),
+            Err(VolumeRefusal::Unknown("vol-x".into()))
+        );
+        assert_eq!(
+            resolve(&[v("boot", false)], &blocks),
+            Err(VolumeRefusal::Boot("boot".into()))
+        );
+        assert_eq!(
+            resolve(&[v("vol-in", true)], &blocks),
+            Err(VolumeRefusal::ReadOnly("vol-in".into()))
+        );
+        assert_eq!(
+            resolve(&[v("vol-in", false)], &[]),
+            Err(VolumeRefusal::Unknown("vol-in".into()))
         );
     }
 

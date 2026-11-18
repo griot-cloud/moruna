@@ -19,3 +19,4 @@ moruna-node = { path = "../core", version = "=0.1.0" }
 
 moruna-storage-service = { path = "../../storage", version = "=0.1.0" }
 moruna-storage-format = { path = "../../../crates/moruna-storage-format", version = "=0.6.6", default-features = false, features = ["pure"] }
+devices-protocol = { path = "../../devices/protocol", version = "=0.1.0" }

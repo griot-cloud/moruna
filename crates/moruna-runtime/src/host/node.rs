@@ -15,6 +15,9 @@
 //!   the node's memory less 768 MiB, which `node-admission` knows), a larger
 //!   `budget.memory_bytes` is refused, and a document that names none is given all of it: a node
 //!   runs one job.
+//! - Its volumes (system design 3C): given the node's disks (`--volumes`, which
+//!   `node-admission` grants every check), a `disk://<serial>` no disk has is refused, and so is
+//!   the disk the node booted from, which is never a volume, and a sink's volume served read only.
 
 use moruna_job::{Job, SpecError};
 use serde_json::Value;
@@ -30,16 +33,62 @@ pub struct Node {
     /// The most a job's budget may be on this node, in bytes: the node's memory less 768 MiB
     /// (system design 3A). `None`: no bound, and a document that names no budget keeps none.
     pub budget_max: Option<u64>,
+    /// The node's disks (system design 3C). `None`: not known, and no volume is refused.
+    pub volumes: Option<Vec<NodeVolume>>,
 }
 
 impl Node {
-    /// Node mode on `channel`, with no bound on the budget.
+    /// Node mode on `channel`, with no bound on the budget and its disks not known.
     pub fn on(channel: impl Into<String>) -> Node {
         Node {
             channel: channel.into(),
             budget_max: None,
+            volumes: None,
         }
     }
+}
+
+/// One of the node's disks, as `node-admission` grants a check them: its serial, its bytes,
+/// whether its driver serves it read only, and whether the node booted from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeVolume {
+    /// The serial the cloud gives it, which a job names it by.
+    pub serial: String,
+    /// Its bytes.
+    pub bytes: u64,
+    /// Its driver refuses every write.
+    pub read_only: bool,
+    /// The disk the node booted from, which is never a volume.
+    pub boot: bool,
+}
+
+/// The node's disks from `node-admission`'s list: a line each, `<serial> <bytes> <ro|rw>
+/// <boot|data>` (`node_protocol::volume_lines`).
+pub fn parse_volumes(text: &str) -> Result<Vec<NodeVolume>, String> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+        .map(|(i, line)| {
+            let bad = || format!("the node's volumes, line {}: `{line}`", i + 1);
+            match line.split_ascii_whitespace().collect::<Vec<_>>().as_slice() {
+                [serial, bytes, access, kind] => Ok(NodeVolume {
+                    serial: (*serial).to_string(),
+                    bytes: bytes.parse().map_err(|_| bad())?,
+                    read_only: match *access {
+                        "ro" => true,
+                        "rw" => false,
+                        _ => return Err(bad()),
+                    },
+                    boot: match *kind {
+                        "boot" => true,
+                        "data" => false,
+                        _ => return Err(bad()),
+                    },
+                }),
+                _ => Err(bad()),
+            }
+        })
+        .collect()
 }
 
 /// The budget `job` runs with on `node`: the document's, or, when it names none, the most the
@@ -120,6 +169,68 @@ fn disk_serial(text: &str) -> Option<&str> {
         .map(|_| &text[7..])?;
     let serial = rest.split('/').next().unwrap_or_default();
     (!serial.is_empty()).then_some(serial)
+}
+
+/// Every `disk://` URL's serial in `value`, with its place under `field`.
+fn disk_urls(field: &str, value: &Value, found: &mut Vec<(String, String)>) {
+    match value {
+        Value::String(text) => {
+            if let Some(serial) = disk_serial(text) {
+                found.push((field.to_string(), serial.to_string()));
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                disk_urls(&format!("{field}[{i}]"), item, found);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                disk_urls(&format!("{field}.{key}"), item, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What the node's disks refuse of `job`'s volumes, each by its field: a serial no disk has,
+/// the boot disk, a sink's volume served read only.
+fn volume_refusals(job: &Job, attached: &[NodeVolume], refused: &mut Vec<SpecError>) {
+    let named: Vec<&str> = attached
+        .iter()
+        .filter(|v| !v.boot)
+        .map(|v| v.serial.as_str())
+        .collect();
+    let has = if named.is_empty() {
+        "it has none".to_string()
+    } else {
+        format!("its volumes are {}", named.join(", "))
+    };
+    for (i, task) in job.tasks.iter().enumerate() {
+        let write = task.role == moruna_job::Role::Sink;
+        let mut found = Vec::new();
+        for (key, value) in &task.settings {
+            disk_urls(&format!("{}.{key}", job.field(i)), value, &mut found);
+        }
+        for (field, serial) in found {
+            let reason = match attached.iter().find(|v| v.serial == serial) {
+                None => format!(
+                    "volume `{serial}` is not attached to this node: {has}; attach a disk with \
+                     that serial, or name one of them"
+                ),
+                Some(v) if v.boot => format!(
+                    "volume `{serial}` is the disk this node booted from, which is never a job's \
+                     volume: {has}"
+                ),
+                Some(v) if write && v.read_only => format!(
+                    "volume `{serial}` is read only on this node: a sink writes a volume the \
+                     node can write"
+                ),
+                Some(_) => continue,
+            };
+            refused.push(SpecError::new(field, reason));
+        }
+    }
 }
 
 /// Every `disk://` serial in `value`.
@@ -207,6 +318,9 @@ pub fn refusals(job: &Job, node: &Node) -> Vec<SpecError> {
                  or leave it out for all of it"
             ),
         ));
+    }
+    if let Some(attached) = &node.volumes {
+        volume_refusals(job, attached, &mut refused);
     }
     if job.object_store.local_root.is_some() {
         refused.push(SpecError::new(

@@ -26,8 +26,8 @@ pub const USAGE: &str = "usage: moruna run <spec.json> [--arg NAME=VALUE]... [--
        moruna run --vm <spec.json> [--image <node-image.json>] [the options above]
        moruna serve --listen <unix:///path | vsock://CID:PORT | channel:SLOT> [--budget-max BYTES] [--no-strict] [--cost-store <dir>] [--cost-model <name>] [--sandbox-python <path>] [--sandbox-cgroup <dir>] [--kinds <kinds.json>]...
        moruna kinds [--kinds <kinds.json>]...
-       moruna check-job <spec.json> [--secret NAME]... [--node channel:SLOT [--budget-max BYTES]] [--kinds <kinds.json>]...
-       moruna check-job --listen <address> [--node channel:SLOT [--budget-max BYTES]] [--kinds <kinds.json>]...
+       moruna check-job <spec.json> [--secret NAME]... [--node channel:SLOT [--budget-max BYTES] [--volumes <file | slot:NAME>]] [--kinds <kinds.json>]...
+       moruna check-job --listen <address> [--node channel:SLOT [--budget-max BYTES] [--volumes <file | slot:NAME>]] [--kinds <kinds.json>]...
        moruna explain <spec.json> [--planner <name>] [--out <plan.mplan>] [--kinds <kinds.json>]...
        moruna volume pack <dir> <out>
        moruna --version
@@ -191,6 +191,9 @@ pub enum Command {
         node: Option<String>,
         /// `--budget-max BYTES`, with `--node`: the most a job's budget may be on the node.
         budget_max: Option<u64>,
+        /// `--volumes <file | slot:NAME>`, with `--node`: the node's disks, as `node-admission`
+        /// lists them (system design 3C), from a file or, on the kernel, a granted data slot.
+        volumes: Option<String>,
     },
     /// `moruna check-job --listen <address>` (system design 3A): the check a node runs for
     /// `validate`, reading the document and its secrets' names from the peer
@@ -203,6 +206,8 @@ pub enum Command {
         node: Option<String>,
         /// `--budget-max BYTES`, with `--node`.
         budget_max: Option<u64>,
+        /// `--volumes <file | slot:NAME>`, with `--node`.
+        volumes: Option<String>,
     },
     /// `moruna explain <spec.json> [--planner <name>] [--out <plan.mplan>]` (SDD 26 d.5): the
     /// document's plan, as JSON on standard output, and as the plan document at `out`.
@@ -532,8 +537,15 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             let mut node = None;
             let mut listen = None;
             let mut budget_max = None;
+            let mut volumes = None;
             while let Some(arg) = rest.next() {
                 match arg {
+                    "--volumes" => {
+                        let from = rest.next().ok_or_else(|| {
+                            "moruna check-job: --volumes needs a file, or slot:NAME".to_string()
+                        })?;
+                        volumes = Some(from.to_string());
+                    }
                     "--listen" => {
                         let text = rest.next().ok_or_else(|| {
                             "moruna check-job: --listen needs an address".to_string()
@@ -588,6 +600,11 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                         .to_string(),
                 );
             }
+            if volumes.is_some() && node.is_none() {
+                return Err(
+                    "moruna check-job: --volumes is a node's, with --node channel:SLOT".to_string(),
+                );
+            }
             if let Some(listen) = listen {
                 if spec.is_some() || !secrets.is_empty() {
                     return Err(
@@ -600,6 +617,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                     listen,
                     node,
                     budget_max,
+                    volumes,
                 });
             }
             let spec = spec.ok_or_else(|| "moruna check-job: which document?".to_string())?;
@@ -608,6 +626,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                 secrets,
                 node,
                 budget_max,
+                volumes,
             })
         }
         Some("explain") => {
@@ -654,6 +673,20 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         Some(other) => Err(format!("moruna: unknown command `{other}`")),
         None => Err("moruna: which command?".to_string()),
     }
+}
+
+/// The node's disks from `--volumes`: the file at the path, or, as `slot:NAME`, the data the
+/// engine was granted under `NAME` on the kernel (`node-admission` grants every check its
+/// node's, system design 3C).
+fn node_volumes(from: &str) -> Result<Vec<super::node::NodeVolume>, String> {
+    let text = match from.strip_prefix("slot:") {
+        Some(slot) => {
+            let bytes = moruna_micro::granted_data(slot)?;
+            String::from_utf8(bytes).map_err(|_| format!("--volumes {from} is not UTF-8"))?
+        }
+        None => std::fs::read_to_string(from).map_err(|e| format!("--volumes {from}: {e}"))?,
+    };
+    super::node::parse_volumes(&text)
 }
 
 /// `moruna volume pack <dir> <out>`: the tree of `dir` (its directories, regular files and
@@ -923,11 +956,20 @@ fn main_as(
             secrets,
             node,
             budget_max,
+            volumes,
         } => {
             let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
+            let volumes = match volumes.as_deref().map(node_volumes).transpose() {
+                Ok(volumes) => volumes,
+                Err(reason) => {
+                    eprintln!("moruna check-job: {reason}");
+                    return exit::FAILED;
+                }
+            };
             let node = node.map(|channel| Node {
                 channel,
                 budget_max,
+                volumes,
             });
             return check_job_with(
                 Path::new(&spec),
@@ -941,10 +983,19 @@ fn main_as(
             listen,
             node,
             budget_max,
+            volumes,
         } => {
+            let volumes = match volumes.as_deref().map(node_volumes).transpose() {
+                Ok(volumes) => volumes,
+                Err(reason) => {
+                    eprintln!("moruna check-job: {reason}");
+                    return exit::FAILED;
+                }
+            };
             let node = node.map(|channel| Node {
                 channel,
                 budget_max,
+                volumes,
             });
             let conn = transport::listen(&listen).and_then(|listener| listener.accept());
             return match conn {
@@ -1046,6 +1097,7 @@ fn main_as(
                     &Node {
                         channel: listen.to_string(),
                         budget_max,
+                        volumes: None,
                     },
                     kinds,
                     &opts,
@@ -2383,8 +2435,38 @@ mod tests {
                 listen: Address::Channel("check".into()),
                 node: Some("channel:engine".into()),
                 budget_max: Some(4096),
+                volumes: None,
             })
         );
+        assert_eq!(
+            parse(&args(&[
+                "check-job",
+                "--listen",
+                "channel:check",
+                "--node",
+                "channel:engine",
+                "--volumes",
+                "slot:volumes"
+            ])),
+            Ok(Command::CheckOn {
+                listen: Address::Channel("check".into()),
+                node: Some("channel:engine".into()),
+                budget_max: None,
+                volumes: Some("slot:volumes".into()),
+            })
+        );
+        for bad in [
+            &["check-job", "job.json", "--volumes", "v.txt"][..],
+            &[
+                "check-job",
+                "--node",
+                "channel:engine",
+                "job.json",
+                "--volumes",
+            ],
+        ] {
+            assert!(parse(&args(bad)).is_err(), "{bad:?}");
+        }
         for bad in [
             &["check-job", "--listen", "channel:check", "job.json"][..],
             &["check-job", "--listen", "channel:check", "--secret", "k"],
@@ -2400,6 +2482,7 @@ mod tests {
                 listen: Address::Unix("/run/check.sock".into()),
                 node: None,
                 budget_max: None,
+                volumes: None,
             })
         );
         // 17 e.6: the sandbox's interpreter and cgroup, on run and serve, and not on run --vm.
@@ -3359,6 +3442,77 @@ mod run_vm_refusals {
                         || e.path().metadata().is_ok()
                 ),
             "no run directory is left behind for a refused spec"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod node_volumes_tests {
+    use super::*;
+
+    #[test]
+    fn a_checks_volumes_come_from_a_file_or_a_granted_slot() {
+        let path = std::env::temp_dir().join(format!("moruna-volumes-{}", std::process::id()));
+        std::fs::write(&path, "vol-1 4096 rw data\nboot 8192 ro boot\n").unwrap();
+        let volumes = node_volumes(path.to_str().unwrap()).unwrap();
+        assert_eq!(volumes.len(), 2);
+        assert!(volumes[1].boot);
+        std::fs::write(&path, "vol-1 4096 sideways data\n").unwrap();
+        assert!(node_volumes(path.to_str().unwrap()).is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(node_volumes("/no/such/moruna/volumes").is_err());
+        // Off the kernel no slot is granted.
+        assert!(
+            node_volumes("slot:volumes")
+                .unwrap_err()
+                .contains("volumes")
+        );
+    }
+
+    #[test]
+    fn check_job_refuses_a_volume_its_node_has_no_disk_for() {
+        let dir = std::env::temp_dir().join(format!("moruna-check-volumes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = dir.join("job.json");
+        std::fs::write(
+            &spec,
+            serde_json::json!({
+                "moruna_spec": 1,
+                "source": {"kind": "parquet", "url": "disk://vol-9/in/"},
+                "sink": {"kind": "parquet", "url": "disk://vol-out/out/"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let volumes = dir.join("volumes");
+        std::fs::write(&volumes, "vol-out 4096 rw data\n").unwrap();
+        let run = |extra: &[&str]| {
+            let mut a = vec![
+                "check-job",
+                spec.to_str().unwrap(),
+                "--node",
+                "channel:engine",
+            ];
+            a.extend_from_slice(extra);
+            let env = |_: &str| None;
+            main_with(
+                &a.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                &Registry::standard(),
+                CancelToken::new(),
+                &env,
+                HEARTBEAT,
+            )
+        };
+        assert_eq!(
+            run(&["--volumes", volumes.to_str().unwrap()]),
+            exit::SPEC_REFUSED
+        );
+        assert_eq!(run(&["--volumes", "/no/such/moruna/volumes"]), exit::FAILED);
+        std::fs::write(&volumes, "vol-9 4096 rw data\nvol-out 4096 rw data\n").unwrap();
+        assert_eq!(
+            run(&["--volumes", volumes.to_str().unwrap()]),
+            exit::COMPLETED
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

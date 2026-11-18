@@ -22,7 +22,10 @@
 //! At start the driver asks the device its serial (`GET_ID`) and reads its GPT header: the
 //! disk whose header names the GUID of the node's image (`disk.guid`, which the device
 //! manager passes on from the boot payload) is the disk the node booted from, never a
-//! volume (`architecture/moruna-os-system.md` 3C, item 3.3).
+//! volume (`architecture/moruna-os-system.md` 3C, item 3.3). On a node, where the device
+//! manager gives it a `register` listener of its directory, a disk that states a serial is
+//! registered under it (`moruna.devices.directory` 1.2): a lookup of the serial connects
+//! through a listener of the driver's own, as a lookup of its service does.
 
 #![no_std]
 #![no_main]
@@ -79,6 +82,8 @@ const MAX_BYTES: u64 = 1 << 20;
 const SECTOR: u64 = 512;
 /// How long the device has to answer the requests made at start.
 const START_NS: u64 = 30_000_000_000;
+/// How long the device manager's directory has to take the disk's registration.
+const REGISTER_NS: u64 = 60_000_000_000;
 
 enum Op {
     Read,
@@ -949,6 +954,21 @@ fn open(image: Option<&Guid>) -> Result<(Block, Interrupt), String> {
     ))
 }
 
+/// Registers the disk as `block` with the device manager's directory through `register`, the
+/// listener it gave this driver: the listener a lookup of the serial connects through, which
+/// the driver then serves.
+fn register(register: Handle, block: devices_protocol::Block) -> Result<Channel, String> {
+    let (connect, served) =
+        Channel::create().map_err(|e| format!("channel_create: {}", e.name()))?;
+    let mut directory =
+        devices_protocol::open_directory(Channel(register), deadline_in(REGISTER_NS))
+            .map_err(|e| format!("the directory: {e:?}"))?;
+    directory
+        .register(block, connect)
+        .map_err(|e| format!("the directory refused it: {e:?}"))?;
+    Ok(served)
+}
+
 /// The GUID of the node's image's disk, from the boot payload's `disk.guid`, which the device
 /// manager passes on when the boot gave it one.
 fn image_guid() -> Result<Option<Guid>, String> {
@@ -988,8 +1008,27 @@ fn run() -> i64 {
         None => String::from(", no serial"),
     };
     let boot = if block.boot { ", the boot disk" } else { "" };
+    let disk = block.serial.clone().map(|serial| devices_protocol::Block {
+        serial,
+        sector_size: info.sector_size,
+        sectors: info.sectors,
+        read_only: info.read_only,
+        boot: block.boot,
+    });
     let block = Rc::new(RefCell::new(block));
     let mut dispatcher = Dispatcher::new();
+    let connection = {
+        let (block, closed) = (block.clone(), block.borrow().closed.clone());
+        move || {
+            Box::new(Connection {
+                block: block.clone(),
+                registrations: BTreeMap::new(),
+                next: 1,
+                connection: None,
+                closed: closed.clone(),
+            }) as Box<dyn Handler>
+        }
+    };
     let shared = block.clone();
     let closed = block.borrow().closed.clone();
     let factory: moruna_svc::Factory = Box::new(move || {
@@ -1022,6 +1061,18 @@ fn run() -> i64 {
         serial,
         boot
     );
+    if let (Some(slot), Some(disk)) = (start::take(devices_protocol::REGISTER_SLOTS), disk) {
+        let serial = disk.serial.clone();
+        let registered = register(slot, disk).and_then(|served| {
+            dispatcher
+                .listen(served, Box::new(connection.clone()))
+                .map_err(|e| format!("listening: {}", e.name()))
+        });
+        match registered {
+            Ok(()) => println!(out, "KB3 {}: registered as {}", name, serial),
+            Err(e) => println!(out, "KB3 {}: not registered as {}: {}", name, serial, e),
+        }
+    }
     loop {
         let (busy, ready, failure) = {
             let mut block = block.borrow_mut();

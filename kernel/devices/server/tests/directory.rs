@@ -178,7 +178,13 @@ fn a_serial_taken_or_a_device_that_is_no_disk_is_refused() {
     let register = world.connection(Access::Register);
     let answers = world.serve(thread::spawn(move || {
         let mut r = client(register);
-        let one = || Channel::create().unwrap().0;
+        // Each listener's driver end is kept: a serial whose driver has gone is free again.
+        let kept = std::cell::RefCell::new(Vec::new());
+        let one = || {
+            let (listener, driver) = Channel::create().unwrap();
+            kept.borrow_mut().push(driver);
+            listener
+        };
         [
             r.register(disk("lun-0"), one()),
             r.register(disk("lun-0"), one()),
@@ -277,4 +283,72 @@ fn a_slot_gives_its_listener_its_access() {
     assert_eq!(Access::of("register-storvsc"), Some(Access::Register));
     assert_eq!(Access::of("control"), None);
     assert_eq!(Access::of("supervisor"), None);
+}
+
+#[test]
+fn a_driver_started_again_registers_its_disk_again() {
+    let mut world = World::new();
+    let register = world.connection(Access::Register);
+    let lookup = world.connection(Access::Lookup);
+    let (first, gone) = Channel::create().unwrap();
+    let (second, driver_end) = Channel::create().unwrap();
+    let (answers, found) = world.serve(thread::spawn(move || {
+        let mut r = client(register);
+        let before = r.register(disk("vol-a"), first);
+        drop(gone);
+        let again = r.register(
+            Block {
+                sectors: 4096,
+                ..disk("vol-a")
+            },
+            second,
+        );
+        (
+            (before, again),
+            client(lookup).lookup("vol-a".into()).unwrap(),
+        )
+    }));
+    assert_eq!(answers, (Ok(()), Ok(())));
+    assert!(
+        arrived(&driver_end, &found),
+        "the lookup reaches the new driver"
+    );
+    let registry = world.registry.borrow();
+    assert_eq!(registry.blocks().count(), 1);
+    assert_eq!(registry.find("vol-a").unwrap().sectors, 4096);
+}
+
+#[test]
+fn blocks_lists_every_registered_disk_through_a_directory_listener_only() {
+    let mut world = World::new();
+    let register = world.connection(Access::Register);
+    let lookup = world.connection(Access::Lookup);
+    let (a, a_driver) = Channel::create().unwrap();
+    let (b, b_driver) = Channel::create().unwrap();
+    let (listed, refused) = world.serve(thread::spawn(move || {
+        let mut r = client(register);
+        r.register(disk("vol-b"), a).unwrap();
+        let boot = Block {
+            boot: true,
+            read_only: true,
+            ..disk("boot")
+        };
+        r.register(boot, b).unwrap();
+        (client(lookup).blocks().unwrap(), r.blocks().map(|_| ()))
+    }));
+    drop((a_driver, b_driver));
+    assert_eq!(
+        listed
+            .iter()
+            .map(|b| (b.serial.as_str(), b.boot))
+            .collect::<Vec<_>>(),
+        [("vol-b", false), ("boot", true)]
+    );
+    assert_eq!(listed[0], disk("vol-b"));
+    assert_eq!(
+        refused,
+        Err(CallError::Remote(directory::Error::Refused)),
+        "a register listener may not list"
+    );
+    assert_eq!((directory::ID.major, directory::ID.minor), (1, 2));
 }

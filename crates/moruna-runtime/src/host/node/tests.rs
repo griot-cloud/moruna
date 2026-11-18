@@ -240,3 +240,91 @@ fn schemes_are_read_without_regard_to_case_and_only_at_the_start() {
     assert!(is_host_socket("unix:/x") && is_host_socket("VSOCK://2:1"));
     assert!(!is_host_socket("https://unix.example.com") && !is_host_socket("uni"));
 }
+
+fn attached() -> Vec<NodeVolume> {
+    parse_volumes("vol-1 1073741824 ro data\nvol-out 2147483648 rw data\nboot 4294967296 ro boot\n")
+        .expect("the node's volumes")
+}
+
+/// The node's disks as `node-admission` writes them, and every line it does not.
+#[test]
+fn the_nodes_volumes_are_a_line_a_disk() {
+    let volumes = attached();
+    assert_eq!(
+        volumes[0],
+        NodeVolume {
+            serial: "vol-1".into(),
+            bytes: 1 << 30,
+            read_only: true,
+            boot: false,
+        }
+    );
+    assert!(volumes[2].boot && !volumes[1].read_only);
+    assert_eq!(parse_volumes("").unwrap(), Vec::new());
+    assert_eq!(parse_volumes("\n  \n").unwrap(), Vec::new());
+    for bad in [
+        "vol-1 12 ro",
+        "vol-1 twelve ro data",
+        "vol-1 12 rx data",
+        "vol-1 12 ro root",
+        "vol-1 12 ro data extra",
+    ] {
+        assert!(parse_volumes(bad).unwrap_err().contains("line 1"), "{bad}");
+    }
+}
+
+/// Given the node's disks, a job's volumes are refused by their field: a serial no disk has,
+/// the boot disk, a sink's volume served read only; a node whose disks are not known refuses none.
+#[test]
+fn a_volume_no_disk_has_or_the_boot_disk_is_refused_by_its_field() {
+    let on = Node {
+        volumes: Some(attached()),
+        ..node()
+    };
+    assert!(refusals(&job(sound()), &on).is_empty(), "vol-1 is attached");
+    let with = |source: &str, sink: &str| {
+        let mut document = sound();
+        document["source"]["url"] = json!(source);
+        document["sink"]["url"] = json!(sink);
+        job(document)
+    };
+    let fields = |job: &Job, node: &Node| -> Vec<(String, String)> {
+        refusals(job, node)
+            .into_iter()
+            .map(|r| (r.field, r.reason))
+            .collect()
+    };
+    let unknown = fields(&with("disk://vol-9/in/", "disk://vol-out/out/"), &on);
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+    assert!(
+        unknown[0].1.contains("volume `vol-9` is not attached"),
+        "{unknown:?}"
+    );
+    assert!(
+        unknown[0].1.contains("its volumes are vol-1, vol-out"),
+        "{unknown:?}"
+    );
+    let boot = fields(&with("disk://boot/in/", "s3://bucket/out/"), &on);
+    assert_eq!(boot.len(), 1, "{boot:?}");
+    assert!(
+        boot[0].1.contains("the disk this node booted from"),
+        "{boot:?}"
+    );
+    assert_eq!(boot[0].0, unknown[0].0, "the source's url both times");
+    let read_only = fields(&with("disk://vol-out/in/", "disk://vol-1/out/"), &on);
+    assert_eq!(read_only.len(), 1, "{read_only:?}");
+    assert!(
+        read_only[0].1.contains("read only on this node"),
+        "{read_only:?}"
+    );
+    let none = Node {
+        volumes: Some(Vec::new()),
+        ..node()
+    };
+    let nothing = fields(&job(sound()), &none);
+    assert!(nothing[0].1.contains("it has none"), "{nothing:?}");
+    assert!(
+        refusals(&with("disk://vol-9/in/", "disk://boot/out/"), &node()).is_empty(),
+        "disks not known: nothing refused"
+    );
+}
