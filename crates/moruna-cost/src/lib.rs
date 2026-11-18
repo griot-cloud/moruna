@@ -13,6 +13,8 @@
 //! - [`LogLinear`]: the default model (section 5.3) and its fallbacks (section 5.4).
 //! - [`ObservationStore`]: the raw history, and [`LocalStore`], its local-directory adapter
 //!   (section 7).
+//! - [`Memory`]: what one call of a function holds outside its batch, measured and fitted as a
+//!   line, which a run sizes the room above its arena from (system design 3A).
 //! - [`Online`]: the models a run uses, learning from every unit it finishes, judging drift and
 //!   writing what it learned to the store off the run's hot path (section 9.6).
 //! - [`sim`]: the discrete-event simulator a job's finish and the resources it holds are found
@@ -27,6 +29,7 @@ mod exact;
 mod inputs;
 mod key;
 pub mod loglinear;
+mod memory;
 mod model;
 pub mod morsel;
 pub mod online;
@@ -40,6 +43,7 @@ pub use estimate::{Basis, Estimate, Origin, Outcome, Target, Unit, UnitCost};
 pub use inputs::{Capacity, Column, Data, INPUTS_VERSION, Inputs, Job, Kernel, Layout, Resources};
 pub use key::{CostKey, Digest};
 pub use loglinear::{Defaults, LogLinear, LogLinearAdapter};
+pub use memory::{GRAIN_BYTES, Memory};
 pub use model::{CostModel, FitReport, Line, Marginal, ModelId};
 pub use morsel::{Bound, Morsel, morsel};
 pub use online::{Drift, DriftEvent, LearningReport, Online};

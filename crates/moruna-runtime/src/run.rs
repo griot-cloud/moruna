@@ -372,11 +372,27 @@ fn drive(
     // 11 f.1): the arena touches every page at `new`, so a sample taken after it contains the
     // arena and subtracting it later would charge the arena twice.
     let baseline_bytes = sampler.sample()?.anon_bytes;
-    let kernel_state = expected_kernel_state(&kernels);
+    // System design 3A: a function's memory is measured, never assumed. What `moruna check`
+    // measured of each stage's function is in the store the run learns from, under the key the
+    // check kept it against, which is known before any source is built, so the room above the
+    // arena is sized from it here. A store that cannot be read sizes nothing: the run says so
+    // and goes on as for functions nothing is known of.
+    let measured = match &components.learning {
+        Some(learning) => learning.measured(&kernels).unwrap_or_else(|error| {
+            notes.push(format!(
+                "the functions' measured memory could not be read ({error}), so the run is \
+                 sized as for functions nothing is known of"
+            ));
+            vec![None; kernels.len()]
+        }),
+        None => vec![None; kernels.len()],
+    };
+    let outside = out_of_arena(&kernels, &measured, workers_start, &mut notes);
+    let kernel_state = expected_kernel_state(&kernels).saturating_add(outside.fixed_bytes);
     let sizing = Sizing {
         baseline: baseline_bytes,
         kernel_state,
-        out_of_arena: expected_out_of_arena_amplification(&kernels),
+        out_of_arena: outside.per_byte,
         page_bytes: limits.page_bytes,
         queues: u64::from(topology.queue_count()),
     };
@@ -1395,6 +1411,8 @@ fn gil_states(
 #[derive(Clone, Copy, Debug)]
 struct Sizing {
     baseline: u64,
+    /// Held outside the arena whatever the morsel: the stateful kernels' declared state, and
+    /// what the functions were measured to hold whatever their batch (system design 3A).
     kernel_state: u64,
     out_of_arena: f64,
     page_bytes: usize,
@@ -1446,7 +1464,7 @@ impl Sizing {
         ));
         if self.kernel_state > 0 {
             terms.push(format!(
-                "{} bytes of declared kernel state",
+                "{} bytes of declared kernel state and measured function memory",
                 self.kernel_state
             ));
         }
@@ -1550,7 +1568,7 @@ fn arena_host_bytes(
         "arena sized at {arena} bytes: {share:.2} of the {allowance} byte allowance, which is \
          the ceiling {ceiling} less the {baseline} bytes the process held before the arena \
          existed, the {reserve} byte reserve and the {kernel_state} bytes held outside it for \
-         the stateful kernels' declared state and a plan's operators; the share is set by the {a_anon:.2} bytes the chain is expected to allocate \
+         the stateful kernels' declared state, what the functions were measured to hold whatever their batch, and a plan's operators; the share is set by the {a_anon:.2} bytes the chain is expected to allocate \
          outside the arena per byte in flight, and {headroom} bytes are left above the arena for \
          it"
     ));
@@ -1666,6 +1684,93 @@ fn expected_out_of_arena_amplification(kernels: &[Arc<dyn moruna_kernel::Kernel>
 /// `expected_out_of_arena_amplification`): one byte beside each byte in flight, which leaves
 /// the arena two thirds of what the shares leave.
 const COPY_OUT_OF_ARENA_AMPLIFICATION: f64 = 1.0;
+
+/// What a chain holds outside the arena, as the run knows it before it sizes anything.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OutOfArena {
+    /// Bytes per byte in flight: the largest of the stages'.
+    per_byte: f64,
+    /// Bytes its measured functions hold whatever their batch, for every call that can be at
+    /// work at once. Held outside the arena like declared kernel state, so the arena is not
+    /// sized over them.
+    fixed_bytes: u64,
+}
+
+/// The chain's out-of-arena cost with each stage's measurement in place of what it declares,
+/// and of the default (system design 3A: a function's memory is measured, never assumed; item
+/// 6.3g). `measured` is one entry a stage, what `moruna check`'s warm-up fitted of the stage's
+/// function ([`moruna_cost::Memory`]), `None` for a stage with no warm-up; `workers` is the
+/// run's.
+///
+/// A measured stage costs what it was measured to hold outside its batch:
+///
+/// - per byte in flight, its line's slope widened by its margin (`Memory::margin`: the units'
+///   spread, nothing fixed), and never less than `moruna_controller::MIN_AMPLIFICATION`, the
+///   least the controller plans a morsel at whatever a kernel measures, so the arena is not
+///   sized over room the controller holds back;
+/// - its line's fixed term, widened likewise, once for every call that can be at work at once:
+///   its instances, or the run's workers for a stateless function.
+///
+/// A stage with no measurement is counted as `expected_out_of_arena_amplification` counts it,
+/// by what it declares or `DEFAULT_OUT_OF_ARENA_AMPLIFICATION`, which is where a function
+/// nothing is known of starts and not a measurement of anything. The chain's cost per byte is
+/// the largest of its stages', for that function's reason. Each measured stage is said in
+/// `notes`, with the units and the range of input its line was fitted from.
+fn out_of_arena(
+    kernels: &[Arc<dyn moruna_kernel::Kernel>],
+    measured: &[Option<moruna_cost::Memory>],
+    workers: u16,
+    notes: &mut Vec<String>,
+) -> OutOfArena {
+    if measured.iter().all(Option::is_none) {
+        return OutOfArena {
+            per_byte: expected_out_of_arena_amplification(kernels),
+            fixed_bytes: 0,
+        };
+    }
+    let mut chain = OutOfArena {
+        per_byte: 0.0,
+        fixed_bytes: 0,
+    };
+    for (at, kernel) in kernels.iter().enumerate() {
+        let Some(memory) = measured.get(at).and_then(Option::as_ref) else {
+            chain.per_byte =
+                chain
+                    .per_byte
+                    .max(expected_out_of_arena_amplification(std::slice::from_ref(
+                        kernel,
+                    )));
+            continue;
+        };
+        let margin = memory.margin();
+        let per_byte =
+            (memory.per_input_byte * (1.0 + margin)).max(moruna_controller::MIN_AMPLIFICATION);
+        let at_once = match kernel.kind() {
+            moruna_kernel::KernelKind::Stateful { max_instances } => max_instances.get() as u64,
+            moruna_kernel::KernelKind::Stateless => u64::from(workers.max(1)),
+        };
+        let fixed = ((memory.fixed_bytes * (1.0 + margin)).ceil() as u64).saturating_mul(at_once);
+        chain.per_byte = chain.per_byte.max(per_byte);
+        chain.fixed_bytes = chain.fixed_bytes.saturating_add(fixed);
+        notes.push(format!(
+            "stage {}: its function's memory was measured, not assumed: {:.0} bytes whatever its \
+             batch plus {:.2} bytes a byte of input, outside the batch, from {} units of {} to \
+             {} bytes of input, with a margin of {:.2} (the 95th percentile of the units' \
+             spread about that line, {:.3} x {:.3}); the run sets aside {per_byte:.2} bytes a \
+             byte in flight and {fixed} bytes for the {at_once} calls that can be at work at once",
+            at + 1,
+            memory.fixed_bytes,
+            memory.per_input_byte,
+            memory.units,
+            memory.input_bytes_min,
+            memory.input_bytes_max,
+            margin,
+            moruna_cost::Z95,
+            memory.spread,
+        ));
+    }
+    chain
+}
 
 /// The smallest region granularity 02 e.1 rounds the arena down to.
 const GRANULE_BYTES: u64 = 64 << 10;
@@ -2147,6 +2252,123 @@ mod tests {
             Arc::new(FakeKernel::new().amplification(6.0)),
         ];
         assert_eq!(expected_out_of_arena_amplification(&mixed), 6.0);
+
+        // With nothing measured, that is the whole of it, and nothing is said.
+        let mut notes = Vec::new();
+        assert_eq!(
+            out_of_arena(&mixed, &[None, None], 4, &mut notes),
+            OutOfArena {
+                per_byte: 6.0,
+                fixed_bytes: 0
+            }
+        );
+        assert_eq!(out_of_arena(&[], &[], 4, &mut notes).per_byte, 1.0);
+        assert!(notes.is_empty());
+
+        // Beside a measured stage, a stage nothing is known of still starts at the default.
+        let one = moruna_cost::Memory::fit(&[(1e6, 2e6), (2e6, 3e6)], None).expect("fitted");
+        let beside: Vec<Arc<dyn Kernel>> = vec![Arc::new(FakeKernel::new()), Arc::new(Silent)];
+        assert_eq!(
+            out_of_arena(&beside, &[Some(one), None], 4, &mut notes).per_byte,
+            DEFAULT_OUT_OF_ARENA_AMPLIFICATION
+        );
+    }
+
+    /// System design 3A, item 6.3g: a function's memory is measured, never assumed. A stage
+    /// whose function was measured is sized by its line and its margin, whatever it declares;
+    /// one with no measurement keeps what it declares, or the start default.
+    #[test]
+    fn a_measured_function_is_sized_by_its_measurement() {
+        use moruna_cost::Memory;
+        use moruna_kernel::Kernel;
+        use moruna_testkit::FakeKernel;
+
+        const MIB: f64 = 1_048_576.0;
+        // Twelve bytes a byte of input and 3 MiB whatever the batch, exactly: no margin.
+        let hungry = Memory::fit(
+            &[
+                (MIB, 15.0 * MIB),
+                (4.0 * MIB, 51.0 * MIB),
+                (16.0 * MIB, 195.0 * MIB),
+            ],
+            Some(1.0),
+        )
+        .expect("fitted");
+        assert!(hungry.margin() < 1e-9);
+        // Nothing of its own.
+        let lean = Memory::fit(&[(MIB, 0.0), (16.0 * MIB, 0.0)], Some(1.0)).expect("fitted");
+        // Ten bytes a byte, a tenth either side of it: a margin of 1.645 tenths.
+        let noisy = Memory::fit(
+            &[
+                (MIB, 11.0 * MIB),
+                (MIB, 9.0 * MIB),
+                (16.0 * MIB, 176.0 * MIB),
+                (16.0 * MIB, 144.0 * MIB),
+            ],
+            None,
+        )
+        .expect("fitted");
+
+        // A stateless function that declares 0.5: its measurement stands, not its
+        // declaration, and its fixed term is held by each of the run's four workers.
+        let declares: Vec<Arc<dyn Kernel>> = vec![Arc::new(FakeKernel::new().amplification(0.5))];
+        let mut notes = Vec::new();
+        let sized = out_of_arena(&declares, &[Some(hungry.clone())], 4, &mut notes);
+        assert!((sized.per_byte - 12.0).abs() < 1e-6, "{sized:?}");
+        assert!(
+            sized.fixed_bytes.abs_diff(4 * 3 * (1 << 20)) <= 4,
+            "{sized:?}"
+        );
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].starts_with("stage 1: its function's memory was measured, not assumed")
+                && notes[0].contains("12.00 bytes a byte of input")
+                && notes[0].contains("from 3 units of 1048576 to 16777216 bytes of input")
+                && notes[0].contains("the 4 calls that can be at work at once"),
+            "{}",
+            notes[0]
+        );
+
+        // A function measured to hold nothing is sized at the least the controller plans a
+        // morsel at, which leaves the arena four fifths of the allowance, not a third.
+        let mut notes = Vec::new();
+        let sized = out_of_arena(&declares, &[Some(lean)], 4, &mut notes);
+        assert_eq!(
+            sized,
+            OutOfArena {
+                per_byte: moruna_controller::MIN_AMPLIFICATION,
+                fixed_bytes: 0
+            }
+        );
+        let allowance = 1u64 << 30;
+        let arena = arena_host_bytes(allowance, 0, 0.0, 0, sized.per_byte, 4096, &mut notes);
+        assert!(
+            (arena as f64 / allowance as f64 - 0.8).abs() < 0.001,
+            "{arena}"
+        );
+
+        // The margin is the measured spread: the slope widened by 1.645 times it.
+        let mut notes = Vec::new();
+        let sized = out_of_arena(&declares, &[Some(noisy.clone())], 1, &mut notes);
+        let widened = noisy.per_input_byte * (1.0 + moruna_cost::Z95 * noisy.spread);
+        assert!((sized.per_byte - widened).abs() < 1e-9, "{sized:?}");
+        assert!(sized.per_byte > 11.0 && sized.per_byte < 12.5, "{sized:?}");
+
+        // A chain: the largest of its stages', the unmeasured one by what it declares (6.0),
+        // and a stateful function's fixed term by its instances, not the run's workers.
+        let chain: Vec<Arc<dyn Kernel>> = vec![
+            Arc::new(FakeKernel::new().amplification(6.0)),
+            Arc::new(FakeKernel::new().stateful(3, 0)),
+        ];
+        let mut notes = Vec::new();
+        let small = Memory::fit(&[(MIB, 2.0 * MIB), (2.0 * MIB, 3.0 * MIB)], None).expect("fit");
+        let sized = out_of_arena(&chain, &[None, Some(small)], 8, &mut notes);
+        assert_eq!(sized.per_byte, 6.0, "the declared stage's is the larger");
+        assert!(
+            sized.fixed_bytes.abs_diff(3 * (1 << 20)) <= 3,
+            "1 MiB for each of 3 instances: {sized:?}"
+        );
+        assert!(notes[0].starts_with("stage 2:"), "{}", notes[0]);
     }
 
     /// What a job's budget lets the object stores have in flight (3A, 3.5b), derived from the

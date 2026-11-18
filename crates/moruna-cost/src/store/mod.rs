@@ -19,6 +19,7 @@ use crate::error::Result;
 use crate::estimate::{Outcome, Target, UnitCost};
 use crate::inputs::{INPUTS_VERSION, Inputs};
 use crate::key::CostKey;
+use crate::memory::Memory;
 use crate::model::ModelId;
 
 /// Records kept per key before the older ones are summarised (section 7).
@@ -100,6 +101,11 @@ impl Observation {
         if !moruna_job::is_kind_name(&self.key.kind) {
             return Err(format!("`{}` is not a kind's name", self.key.kind));
         }
+        if let Some(memory) = &self.inputs.kernel.memory {
+            memory
+                .check()
+                .map_err(|why| format!("the function's measured memory: {why}"))?;
+        }
         self.outcome.check()
     }
 }
@@ -160,6 +166,10 @@ pub struct Summary {
     pub rows: Moments,
     /// Each measured target.
     pub targets: BTreeMap<Target, Moments>,
+    /// The function's measured memory as the newest of the summarised records carried it
+    /// (system design 3A), so a measurement outlives the records that brought it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Memory>,
 }
 
 impl Summary {
@@ -172,6 +182,7 @@ impl Summary {
             last_at_ms: 0,
             rows: Moments::default(),
             targets: BTreeMap::new(),
+            memory: None,
         }
     }
 
@@ -192,6 +203,10 @@ impl Summary {
             if let Some(value) = observation.outcome.get(target) {
                 self.targets.entry(target).or_default().push(value);
             }
+        }
+        // Records are folded oldest first, so the last to carry one is the newest.
+        if let Some(memory) = &observation.inputs.kernel.memory {
+            self.memory = Some(memory.clone());
         }
     }
 }
@@ -221,6 +236,16 @@ impl History {
         runs.sort_unstable();
         runs.dedup();
         runs.len() as u64
+    }
+
+    /// The function's measured memory (system design 3A): what the newest kept record that
+    /// carries one says, else what the summary kept of the records before them.
+    pub fn memory(&self) -> Option<&Memory> {
+        self.observations
+            .iter()
+            .rev()
+            .find_map(|o| o.inputs.kernel.memory.as_ref())
+            .or_else(|| self.summary.as_ref().and_then(|s| s.memory.as_ref()))
     }
 }
 
@@ -305,5 +330,82 @@ mod tests {
         bad.outcome.set(Target::Duration, f64::INFINITY);
         assert!(bad.check().is_err());
         assert_eq!(Retention::default().per_key, RETENTION_PER_KEY);
+    }
+
+    /// A record that carries the function's measured memory, fitted through `rate` bytes a byte.
+    fn measured(rate: f64, at_ms: u64) -> Observation {
+        let mut inputs = Inputs::batch(10, 100);
+        inputs.kernel.memory = Memory::fit(&[(1e6, rate * 1e6), (2e6, rate * 2e6)], None);
+        Observation::new(key(), inputs, Outcome::new(Origin::WarmUp), at_ms)
+    }
+
+    fn rate(memory: Option<&Memory>) -> Option<f64> {
+        memory.map(|m| m.per_input_byte)
+    }
+
+    #[test]
+    fn a_function_s_measured_memory_outlives_the_records_that_brought_it() {
+        let plain = |at_ms| {
+            Observation::new(
+                key(),
+                Inputs::batch(10, 100),
+                Outcome::new(Origin::Run),
+                at_ms,
+            )
+        };
+        let mut history = History {
+            key: key(),
+            summary: None,
+            observations: vec![plain(1)],
+            torn: 0,
+        };
+        assert_eq!(history.memory(), None, "no record carries one");
+
+        // The newest kept record that carries one answers, whatever follows it.
+        history.observations = vec![measured(2.0, 1), measured(3.0, 2), plain(3)];
+        assert_eq!(rate(history.memory()), Some(3.0));
+
+        // Folded into the summary, the newest folded stands, and a summary with none keeps none.
+        let mut summary = Summary::new(key());
+        summary.fold(&plain(1));
+        assert_eq!(summary.memory, None);
+        summary.fold(&measured(2.0, 2));
+        summary.fold(&measured(5.0, 3));
+        summary.fold(&plain(4));
+        assert_eq!(rate(summary.memory.as_ref()), Some(5.0));
+        history.observations = vec![plain(5)];
+        history.summary = Some(summary.clone());
+        assert_eq!(rate(history.memory()), Some(5.0), "from the summary");
+        history.observations = vec![plain(5), measured(7.0, 6)];
+        assert_eq!(rate(history.memory()), Some(7.0), "a kept record is newer");
+
+        // The summary is written and read with it, and one written before it reads as none.
+        let text = serde_json::to_string(&summary).expect("serialises");
+        assert_eq!(
+            serde_json::from_str::<Summary>(&text).expect("reads"),
+            summary
+        );
+        let before = serde_json::to_string(&Summary::new(key())).expect("serialises");
+        assert!(!before.contains("memory"), "{before}");
+        assert_eq!(
+            serde_json::from_str::<Summary>(&before)
+                .expect("reads")
+                .memory,
+            None
+        );
+    }
+
+    #[test]
+    fn a_record_whose_measured_memory_is_not_one_is_refused() {
+        let mut bad = measured(2.0, 1);
+        assert!(bad.check().is_ok());
+        if let Some(memory) = bad.inputs.kernel.memory.as_mut() {
+            memory.per_input_byte = f64::NAN;
+        }
+        let why = bad.check().unwrap_err();
+        assert!(
+            why.contains("measured memory") && why.contains("per_input_byte"),
+            "{why}"
+        );
     }
 }

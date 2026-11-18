@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use common::{Rng, batch, key, took};
 use moruna_cost::{
-    Capacity, Column, CostModel, Defaults, Inputs, Job, Kernel, Layout, LogLinear, Origin,
+    Capacity, Column, CostModel, Defaults, Inputs, Job, Kernel, Layout, LogLinear, Memory, Origin,
     Resources,
 };
 
@@ -81,6 +81,15 @@ fn cm_t2_inputs_are_a_versioned_record() {
             worker_seconds_per_second: Some(1.0),
             speedup_2: Some(1.9),
             speedup_4: Some(3.5),
+            memory: Some(Memory {
+                fixed_bytes: 4096.0,
+                per_input_byte: 1.25,
+                output_per_input_byte: Some(1.17),
+                spread: 0.05,
+                units: 12,
+                input_bytes_min: 16_000,
+                input_bytes_max: 16_000_000,
+            }),
         },
         resources: Resources {
             workers: Some(2),

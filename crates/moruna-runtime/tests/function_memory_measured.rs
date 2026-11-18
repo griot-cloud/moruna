@@ -1,18 +1,19 @@
-//! 6.3g: the room a function gets is a default, not its measured memory (system design 3A, "A
+//! 6.3g: the room a function gets is its measured memory, not a default (system design 3A, "A
 //! function's memory is measured, never assumed").
 //!
 //! A run's budget has two parts: the arena, which holds the batches in flight, and the room
 //! above it, where a function keeps its own working memory. `moruna check` measures that
-//! memory: warm-up runs the function on small batches and writes every unit's peak to the
-//! observation store, under the function's cost key. A run opened on the same store has the
-//! measurement, under the same key, before it sizes anything.
+//! memory: warm-up runs the function on small batches, fits what a call holds outside its
+//! batch as a line, and writes it with every unit to the observation store, under the
+//! function's cost key. A run opened on the same store has the measurement, under the same
+//! key, before it sizes anything, and divides its budget from it.
 //!
-//! The defect: the run divides its budget without it. The arena's share comes from the
-//! function's declared `expected_amplification`, or, for a function that declares nothing,
-//! from a fixed factor of 4.0 (`run.rs`: `arena_host_bytes`, `expected_out_of_arena_amplification`,
-//! `DEFAULT_OUT_OF_ARENA_AMPLIFICATION`), so every undeclared function leaves two thirds of its
-//! allowance above the arena, whether it uses none of it or needs more. On the node (6.2 run 3)
-//! the four gate functions each held 3 to 21 MiB in an instance, beside 6.9 GiB set aside.
+//! The defect this was written against (it failed until 6.3g's build): the run divided its
+//! budget without the measurement. The arena's share came from the function's declared
+//! `expected_amplification`, or, for a function that declares nothing, from a fixed factor of
+//! 4.0, so every undeclared function left two thirds of its allowance above the arena, whether
+//! it used none of it or needed more. On the node (6.2 run 3) the four gate functions each held
+//! 3 to 21 MiB in an instance, beside 6.9 GiB set aside.
 //!
 //! Two functions that declare nothing, one measured far below the default and one far above,
 //! each warmed up and then run on the store its warm-up wrote: each gets a room sized by its
@@ -278,9 +279,31 @@ fn a_function_gets_the_room_its_warm_up_measured() {
         hungry_peak >= 12.0,
         "hungry's peak per input byte: {hungry_peak}"
     );
+    // And what each holds outside its batch, as a line over the batch's bytes: next to
+    // nothing, and twelve bytes a byte, fitted from every unit of the sizes.
+    let lean_own = lean_warm.kernel.memory.as_ref().expect("lean's own memory");
+    let hungry_own = hungry_warm
+        .kernel
+        .memory
+        .as_ref()
+        .expect("hungry's own memory");
+    assert!(
+        lean_own.per_input_byte < 1.0,
+        "lean's own memory: {lean_own:?}"
+    );
+    assert!(
+        (hungry_own.per_input_byte - 12.0).abs() < 1.0 && hungry_own.units >= 3,
+        "hungry's own memory: {hungry_own:?}"
+    );
 
     let lean_room = run_room(&lean, &lean_warm, &lean_scratch);
     let hungry_room = run_room(&hungry, &hungry_warm, &hungry_scratch);
+    eprintln!(
+        "room above the arena, as a share of the allowance: {lean_room:.3} for the function \
+         measured at {:.3} bytes a byte of input outside its batch, {hungry_room:.3} for the one \
+         measured at {:.3}; {DEFAULT_ROOM:.3} is what a function nothing is known of is left",
+        lean_own.per_input_byte, hungry_own.per_input_byte
+    );
 
     // Every departure is said, not only the first: both functions are the defect.
     let mut departures = Vec::new();
