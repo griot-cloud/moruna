@@ -18,6 +18,10 @@
 //!                                             one file a node registers (system design 3E,
 //!                                             5C); prints its SHA-256, its length and the
 //!                                             image's digest
+//! moruna-layer pack DIR OUT                   DIR's tree as one layer, the new file OUT,
+//!                                             as `moruna volume pack` writes it (the
+//!                                             cloud image's engine layer, item 3.2); prints
+//!                                             its pages and its seal
 //! moruna-layer fixture OUT                    the CI boot's two layers, their list
 //!                                             and the check list (feature `testing`)
 //! ```
@@ -39,11 +43,12 @@ fn main() -> ExitCode {
         }
         [_, "stack", layout, reference, out, first] => stack(layout, reference, out, first),
         [_, "archive", layout, reference, out] => archive(layout, reference, out),
+        [_, "pack", dir, out] => pack(dir, out),
         #[cfg(feature = "testing")]
         [_, "fixture", out] => fixture(out),
         _ => {
             eprintln!(
-                "usage: moruna-layer convert LAYOUT REFERENCE OUT | derive LAYOUT REFERENCE DIR NAME OUT CMD... | stack LAYOUT REFERENCE OUT FIRST | archive LAYOUT REFERENCE OUT | fixture OUT"
+                "usage: moruna-layer convert LAYOUT REFERENCE OUT | derive LAYOUT REFERENCE DIR NAME OUT CMD... | stack LAYOUT REFERENCE OUT FIRST | archive LAYOUT REFERENCE OUT | pack DIR OUT | fixture OUT"
             );
             return ExitCode::from(2);
         }
@@ -166,6 +171,17 @@ fn archive(layout: &str, reference: &str, out: &str) -> Result<String, moruna_im
         written.sha256_hex(),
         written.size,
         written.image
+    ))
+}
+
+/// DIR's tree as one layer, the new file OUT: `OUT: a layer of N pages (B bytes), seal S`.
+fn pack(dir: &str, out: &str) -> Result<String, moruna_image::Error> {
+    let layer = moruna_image::layerfile::pack(Path::new(dir), Path::new(out))?;
+    Ok(format!(
+        "{out}: a layer of {} pages ({} bytes), seal {}",
+        layer.pages,
+        layer.pages * 4096,
+        layer.id
     ))
 }
 
