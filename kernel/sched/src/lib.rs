@@ -8,11 +8,18 @@
 //!   woken tasks run in a row while another waits, so a task that never sleeps still runs.
 //! - **The slice.** A task that has run [`SLICE_TICKS`] ticks gives way to any task waiting on
 //!   its CPU.
-//! - **A wake.** A task woken from a wait takes its CPU from the running task once that task
-//!   has run [`WAKE_MIN_NS`] since it was picked, on every CPU, the boot processor's included.
-//!   The CPU is asked to reschedule at once ([`Queue::push`] says so); a task that has run less
-//!   gives way at the first tick after it reaches the minimum (1.11e: a woken thread used to
-//!   wait out the rest of the running thread's 10 ms slice).
+//! - **A wake.** A task woken from a wait by an interrupt or by a task on another CPU
+//!   ([`Why::Woken`]) takes its CPU from the running task once that task has run
+//!   [`WAKE_MIN_NS`] since it was picked, on every CPU, the boot processor's included. The CPU
+//!   is asked to reschedule at once ([`Queue::push`] says so); a task that has run less gives
+//!   way at the first tick after it reaches the minimum (1.11e: a woken thread used to wait
+//!   out the rest of the running thread's 10 ms slice). These are a network completion's and
+//!   a worker's wakes, which must run while every CPU computes.
+//! - **A wake by the running task** ([`Why::WokenByCurrent`]: the waker is the task running on
+//!   the woken task's CPU) does not preempt it: the woken task runs first at the next pick,
+//!   within [`WOKEN_IN_A_ROW`], and the slice still applies. A producer that wakes its own
+//!   consumer on its CPU keeps that CPU, so the two batch (the ring plane's engine fills a group
+//!   of batches before its task drains them) instead of switching once a batch.
 //! - **The idle task** gives way to anything, at once.
 //! - **The tick** of a CPU other than the boot processor is stretched to [`STRETCH`] periods
 //!   while it runs one task or none, and comes back when a task is queued there: such a CPU
@@ -46,12 +53,24 @@ pub const WOKEN_IN_A_ROW: u32 = 4;
 /// CPU when it is in user mode with no other way into the kernel.
 pub const STRETCH: u32 = 100;
 
+/// Why a task is queued on a CPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Why {
+    /// New, or moved there.
+    New,
+    /// Woken from a wait by an interrupt, or by a task on another CPU.
+    Woken,
+    /// Woken from a wait by the task running on that CPU.
+    WokenByCurrent,
+}
+
 /// One CPU's run queue. `T` is the task; tasks are told apart by their `Arc`'s address.
 pub struct Queue<T> {
     /// The running task: a task, the idle task, or `None` for the CPU's boot context.
     current: Option<Arc<T>>,
-    /// Tasks woken from a wait, taken first.
-    woken: VecDeque<Arc<T>>,
+    /// Tasks woken from a wait, taken first, each with whether it may take the CPU from the
+    /// running task at the minimum (not when the running task woke it).
+    woken: VecDeque<(Arc<T>, bool)>,
     /// Tasks a slice or a wake preempted, and new tasks.
     rest: VecDeque<Arc<T>>,
     /// Woken tasks run in a row while `rest` waited.
@@ -102,7 +121,7 @@ impl<T> Queue<T> {
     /// Whether `task` is this CPU's current task or waits in its queue.
     pub fn holds(&self, task: &Arc<T>) -> bool {
         self.current.as_ref().is_some_and(|c| Arc::ptr_eq(c, task))
-            || self.woken.iter().any(|t| Arc::ptr_eq(t, task))
+            || self.woken.iter().any(|(t, _)| Arc::ptr_eq(t, task))
             || self.rest.iter().any(|t| Arc::ptr_eq(t, task))
     }
 
@@ -127,38 +146,41 @@ impl<T> Queue<T> {
     }
 
     /// Whether the running task gives way at `now`: the idle task to any task; a task to a
-    /// woken one once it has run [`WAKE_MIN_NS`], and to any once it has run a slice. The boot
-    /// context never does: it leaves when it yields.
+    /// task woken by an interrupt or another CPU once it has run [`WAKE_MIN_NS`], and to any
+    /// once it has run a slice. The boot context never does: it leaves when it yields.
     fn gives_way(&self, now: u64) -> bool {
         match &self.current {
             None => false,
             Some(c) if self.is_idle(c) => self.waiting(),
             Some(_) => {
-                (!self.woken.is_empty() && self.ran(now) >= WAKE_MIN_NS)
+                (self.woken.iter().any(|&(_, preempts)| preempts) && self.ran(now) >= WAKE_MIN_NS)
                     || (self.waiting() && self.ticks >= SLICE_TICKS)
             }
         }
     }
 
-    /// Queues `task` here at `now`, woken from a wait or not (new, or moved here). Returns
-    /// whether this CPU is to be asked to reschedule now: one running its idle task, or whose
-    /// tick is stretched; and one whose task has run [`WAKE_MIN_NS`] when `task` was woken.
-    /// One in its boot context takes the task when it yields.
-    pub fn push(&mut self, task: Arc<T>, woken: bool, now: u64) -> bool {
+    /// Queues `task` here at `now`, for `why`. Returns whether this CPU is to be asked to
+    /// reschedule now: one running its idle task, or whose tick is stretched; and one whose task
+    /// has run [`WAKE_MIN_NS`] when an interrupt or another CPU woke `task`. One in its boot
+    /// context takes the task when it yields.
+    pub fn push(&mut self, task: Arc<T>, why: Why, now: u64) -> bool {
         let (ask, at_once) = match &self.current {
             None => (self.stretched, false),
             Some(c) if self.is_idle(c) => (true, true),
-            // A task woken past the minimum takes the CPU at once.
-            Some(_) if woken && self.ran(now) >= WAKE_MIN_NS => (true, true),
-            // A woken task before it: the tick comes back and gives it the CPU at the minimum.
-            Some(_) if woken => (self.stretched, false),
-            // A new task takes a stretched CPU at once, as it always has.
-            Some(_) => (self.stretched, self.stretched),
+            Some(_) => match why {
+                // Woken elsewhere past the minimum: it takes the CPU at once.
+                Why::Woken if self.ran(now) >= WAKE_MIN_NS => (true, true),
+                // Woken elsewhere before it: the tick comes back and gives it the CPU at the
+                // minimum. Woken by the running task: the tick comes back for the slice.
+                Why::Woken | Why::WokenByCurrent => (self.stretched, false),
+                // A new task takes a stretched CPU at once, as it always has.
+                Why::New => (self.stretched, self.stretched),
+            },
         };
-        if woken {
-            self.woken.push_back(task);
-        } else {
-            self.rest.push_back(task);
+        match why {
+            Why::New => self.rest.push_back(task),
+            Why::Woken => self.woken.push_back((task, true)),
+            Why::WokenByCurrent => self.woken.push_back((task, false)),
         }
         self.kicked |= at_once;
         ask
@@ -221,7 +243,7 @@ impl<T> Queue<T> {
             } else {
                 self.woken_run + 1
             };
-            self.woken.pop_front()
+            self.woken.pop_front().map(|(task, _)| task)
         } else {
             self.woken_run = 0;
             self.rest.pop_front()
@@ -282,7 +304,7 @@ mod tests {
     /// The CPU's first task, picked from the boot context (which yields) at `now`.
     fn start(q: &mut Queue<u32>, task: &Arc<u32>, now: u64) {
         assert!(
-            !q.push(task.clone(), false, now),
+            !q.push(task.clone(), Why::New, now),
             "the boot context is not asked"
         );
         assert!(q.yield_now());
@@ -296,7 +318,7 @@ mod tests {
         assert!(q.current().is_none());
         assert!(!q.tick(0));
         assert!(
-            !q.push(t[0].clone(), true, 0),
+            !q.push(t[0].clone(), Why::Woken, 0),
             "a wake does not ask it to reschedule"
         );
         assert!(!q.tick(50 * MS), "nor does the tick, after any time");
@@ -319,8 +341,8 @@ mod tests {
     fn new_tasks_run_first_in_first_out_a_slice_each() {
         let (mut q, t) = queue(true);
         start(&mut q, &t[0], 0);
-        assert!(!q.push(t[1].clone(), false, 0));
-        assert!(!q.push(t[2].clone(), false, 0));
+        assert!(!q.push(t[1].clone(), Why::New, 0));
+        assert!(!q.push(t[2].clone(), Why::New, 0));
         for tick in 1..SLICE_TICKS {
             assert!(!q.tick(u64::from(tick) * MS), "tick {tick}");
         }
@@ -361,7 +383,7 @@ mod tests {
         start(&mut q, &t[0], 0);
         let now = WAKE_MIN_NS;
         assert!(
-            q.push(t[1].clone(), true, now),
+            q.push(t[1].clone(), Why::Woken, now),
             "the CPU is asked to reschedule"
         );
         assert!(q.pick(now), "and the woken task takes it");
@@ -378,7 +400,7 @@ mod tests {
         start(&mut q, &t[0], 0);
         assert_eq!(q.retick(), Some(STRETCH));
         // Back to every period while something waits; then a task picked at 1 ms.
-        q.push(t[1].clone(), false, 0);
+        q.push(t[1].clone(), Why::New, 0);
         assert_eq!(q.retick(), Some(1));
         for tick in 1..=SLICE_TICKS {
             q.tick(u64::from(tick) * MS);
@@ -386,7 +408,7 @@ mod tests {
         assert!(q.pick(10 * MS));
         assert_eq!(running(&q), 2);
         // Woken 0.1 ms after the pick: not yet.
-        assert!(!q.push(t[2].clone(), true, 10 * MS + 100_000));
+        assert!(!q.push(t[2].clone(), Why::Woken, 10 * MS + 100_000));
         assert!(!q.pick(10 * MS + 100_000));
         assert!(!q.tick(10 * MS + 400_000), "still under the minimum");
         assert!(q.tick(10 * MS + WAKE_MIN_NS), "at the minimum");
@@ -405,7 +427,7 @@ mod tests {
         assert_eq!(q.retick(), Some(STRETCH));
         assert!(q.stretched());
         assert!(
-            q.push(t[1].clone(), true, 100_000),
+            q.push(t[1].clone(), Why::Woken, 100_000),
             "asked, so its tick comes back"
         );
         assert!(
@@ -424,7 +446,7 @@ mod tests {
         let (mut q, t) = queue(false);
         start(&mut q, &t[0], 0);
         q.retick();
-        assert!(q.push(t[1].clone(), false, 100_000));
+        assert!(q.push(t[1].clone(), Why::New, 100_000));
         assert!(q.tick(100_000), "the request holds until the pick");
         assert!(q.pick(100_000));
         assert_eq!(running(&q), 2);
@@ -436,7 +458,7 @@ mod tests {
         let (mut q, t) = queue(true);
         start(&mut q, &t[0], 0);
         assert!(
-            !q.push(t[1].clone(), false, 50 * MS),
+            !q.push(t[1].clone(), Why::New, 50 * MS),
             "not asked, even long after the pick"
         );
         assert!(!q.pick(50 * MS));
@@ -453,7 +475,7 @@ mod tests {
         assert!(q.pick(0));
         assert!(!q.tick(MS), "with nothing to run it stays");
         assert!(!q.pick(MS));
-        assert!(q.push(t[0].clone(), false, 2 * MS));
+        assert!(q.push(t[0].clone(), Why::New, 2 * MS));
         assert!(q.pick(2 * MS));
         assert_eq!(running(&q), 1);
         assert_eq!(q.load(), 1, "the idle task is not queued behind it");
@@ -461,7 +483,7 @@ mod tests {
         assert!(q.pick(3 * MS));
         assert!(q.is_idle(q.current().unwrap()));
         assert!(
-            q.push(t[1].clone(), true, 3 * MS + 1),
+            q.push(t[1].clone(), Why::Woken, 3 * MS + 1),
             "woken onto an idle CPU"
         );
         assert!(
@@ -474,7 +496,7 @@ mod tests {
     fn a_request_to_switch_made_stale_by_a_pick_is_dropped() {
         let (mut q, t) = queue(true);
         start(&mut q, &t[0], 0);
-        assert!(q.push(t[1].clone(), true, MS));
+        assert!(q.push(t[1].clone(), Why::Woken, MS));
         // Task 1 waits before the request arrives: the woken task is picked anyway.
         q.leave();
         assert!(q.pick(MS));
@@ -489,15 +511,15 @@ mod tests {
         let (mut q, t) = queue(true);
         start(&mut q, &t[0], 0);
         // Task 2 is preempted work waiting; tasks 3 to 6 and then task 1 are woken.
-        q.push(t[1].clone(), false, 0);
+        q.push(t[1].clone(), Why::New, 0);
         let mut order = vec![];
         let mut now = 0;
         for task in &t[2..] {
-            q.push(task.clone(), true, now);
+            q.push(task.clone(), Why::Woken, now);
         }
         // Each woken task runs and waits again; task 1 (the first) leaves too.
         q.leave();
-        q.push(t[0].clone(), true, now);
+        q.push(t[0].clone(), Why::Woken, now);
         while q.load() > 0 {
             now += MS;
             assert!(q.pick(now) || q.current().is_some());
@@ -513,7 +535,7 @@ mod tests {
         let (mut q, t) = queue(true);
         start(&mut q, &t[0], 0);
         for task in &t[1..] {
-            q.push(task.clone(), true, 0);
+            q.push(task.clone(), Why::Woken, 0);
         }
         let mut order = vec![];
         q.leave();
@@ -529,13 +551,13 @@ mod tests {
     fn a_task_preempted_by_a_wake_waits_behind_the_preempted_ones() {
         let (mut q, t) = queue(true);
         start(&mut q, &t[0], 0);
-        q.push(t[1].clone(), false, 0);
+        q.push(t[1].clone(), Why::New, 0);
         for tick in 1..=SLICE_TICKS {
             q.tick(u64::from(tick) * MS);
         }
         assert!(q.pick(10 * MS));
         assert_eq!(running(&q), 2);
-        assert!(q.push(t[2].clone(), true, 11 * MS));
+        assert!(q.push(t[2].clone(), Why::Woken, 11 * MS));
         assert!(q.pick(11 * MS));
         assert_eq!(running(&q), 3);
         q.leave();
@@ -565,7 +587,7 @@ mod tests {
         start(&mut q, &t[0], 0);
         assert_eq!(q.retick(), Some(STRETCH));
         assert_eq!(q.retick(), None, "no change, no call");
-        q.push(t[1].clone(), false, 0);
+        q.push(t[1].clone(), Why::New, 0);
         assert_eq!(q.retick(), Some(1));
         q.leave();
         q.pick(MS);
@@ -583,7 +605,7 @@ mod tests {
     fn a_yield_moves_to_a_waiting_task_and_the_yielder_waits_behind_it() {
         let (mut q, t) = queue(true);
         start(&mut q, &t[0], 0);
-        q.push(t[1].clone(), false, 0);
+        q.push(t[1].clone(), Why::New, 0);
         assert!(q.yield_now());
         assert!(q.pick(MS), "a yield switches though the slice is not over");
         assert_eq!(running(&q), 2);
@@ -595,8 +617,92 @@ mod tests {
         let (mut q, t) = queue(true);
         start(&mut q, &t[0], 0);
         // A clock that reads zero (not started) or earlier than the pick: no minimum reached.
-        assert!(!q.push(t[1].clone(), true, 0));
+        assert!(!q.push(t[1].clone(), Why::Woken, 0));
         assert!(!q.tick(0));
+    }
+
+    #[test]
+    fn a_wake_by_the_running_task_keeps_its_cpu_to_the_slice_then_runs_first() {
+        let (mut q, t) = queue(true);
+        start(&mut q, &t[0], 0);
+        q.push(t[1].clone(), Why::New, 0);
+        // Task 1, long past the minimum, wakes task 3 on its own CPU: it keeps the CPU.
+        assert!(
+            !q.push(t[2].clone(), Why::WokenByCurrent, 5 * MS),
+            "not asked"
+        );
+        assert!(!q.pick(5 * MS));
+        for tick in 1..SLICE_TICKS {
+            assert!(!q.tick(5 * MS + u64::from(tick) * 100_000), "tick {tick}");
+        }
+        assert!(q.tick(6 * MS), "the slice still applies");
+        assert!(q.pick(6 * MS));
+        assert_eq!(
+            running(&q),
+            3,
+            "and the woken task goes first, before task 2"
+        );
+    }
+
+    #[test]
+    fn a_wake_by_the_running_task_runs_first_when_it_waits() {
+        let (mut q, t) = queue(true);
+        start(&mut q, &t[0], 0);
+        q.push(t[1].clone(), Why::New, 0);
+        for task in &t[2..4] {
+            assert!(!q.push(task.clone(), Why::WokenByCurrent, 5 * MS));
+        }
+        assert!(!q.tick(5 * MS));
+        q.leave();
+        let mut order = vec![];
+        for step in 1..=3u64 {
+            assert!(q.pick(5 * MS + step));
+            order.push(running(&q));
+            q.leave();
+        }
+        assert_eq!(
+            order,
+            vec![3, 4, 2],
+            "the woken in order, then the preempted one"
+        );
+    }
+
+    #[test]
+    fn a_wake_by_the_running_task_brings_a_stretched_tick_back_without_a_switch() {
+        let (mut q, t) = queue(false);
+        start(&mut q, &t[0], 0);
+        assert_eq!(q.retick(), Some(STRETCH));
+        assert!(
+            q.push(t[1].clone(), Why::WokenByCurrent, 5 * MS),
+            "asked, for the tick"
+        );
+        assert!(!q.pick(5 * MS), "but no switch");
+        assert_eq!(q.retick(), Some(1));
+        assert_eq!(running(&q), 1);
+    }
+
+    #[test]
+    fn a_wake_from_elsewhere_still_preempts_beside_one_by_the_running_task() {
+        let (mut q, t) = queue(true);
+        start(&mut q, &t[0], 0);
+        q.push(t[1].clone(), Why::WokenByCurrent, MS);
+        assert!(
+            q.push(t[2].clone(), Why::Woken, MS),
+            "an interrupt's wake asks at once"
+        );
+        assert!(q.pick(MS));
+        assert_eq!(
+            running(&q),
+            2,
+            "the woken tasks in the order they were woken"
+        );
+        // Task 3, woken elsewhere, takes the CPU from task 2 at the minimum.
+        assert!(!q.tick(MS + 100_000));
+        assert!(q.tick(MS + WAKE_MIN_NS));
+        assert!(q.pick(MS + WAKE_MIN_NS));
+        assert_eq!(running(&q), 3);
+        // Task 1 waits behind them; nothing woken is left to preempt task 3 early.
+        assert!(!q.tick(MS + 2 * WAKE_MIN_NS));
     }
 
     #[test]

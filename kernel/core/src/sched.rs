@@ -18,14 +18,20 @@
 //! processor's runs the whole boot); it moves to a task when it yields at the end of its
 //! entry.
 //!
-//! A wake (item 1.11e) takes the CPU from the running task once that task has run
-//! [`moruna_sched::WAKE_MIN_NS`] since it was picked, on every CPU, the boot processor's
-//! included: the wake asks the CPU to reschedule at once (OSTD's inter-processor
-//! interrupt, then its preemption check on the way back to user mode); a task that has
-//! run less gives way at the first tick past the minimum. A wake onto a CPU running its
-//! idle task asks it to reschedule, as before. A woken thread used to wait out the rest
-//! of the running thread's 10 ms slice, on the boot processor always and elsewhere
-//! whenever its CPU had a second runnable thread.
+//! A wake by an interrupt or from another CPU (item 1.11e) takes the CPU from the running
+//! task once that task has run [`moruna_sched::WAKE_MIN_NS`] since it was picked, on every
+//! CPU, the boot processor's included: the wake asks the CPU to reschedule at once (OSTD's
+//! inter-processor interrupt, then its preemption check on the way back to user mode); a
+//! task that has run less gives way at the first tick past the minimum. A wake onto a CPU
+//! running its idle task asks it to reschedule, as before. A woken thread used to wait out
+//! the rest of the running thread's 10 ms slice, on the boot processor always and
+//! elsewhere whenever its CPU had a second runnable thread.
+//!
+//! A wake made by the task running on the woken task's CPU (in task context, on that CPU)
+//! does not preempt it: the woken task runs first at the next pick, and the slice still
+//! applies. A producer that wakes its own consumer keeps its CPU, so the two batch: the
+//! ring plane's engine fills a group of batches before its task drains them, where a
+//! switch at each bell cost a call a batch on one CPU.
 //!
 //! It also records which CPUs ran process threads (the post-schedule hook calls
 //! [`ran_process_thread`]), so a boot can show the processes ran across every CPU.
@@ -53,9 +59,10 @@ use alloc::{
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use moruna_abi::Error;
-use moruna_sched::Queue;
+use moruna_sched::{Queue, Why};
 use ostd::{
     cpu::{CpuId, PinCurrentCpu, num_cpus},
+    irq::InterruptLevel,
     sync::{LocalIrqDisabled, SpinLock, Waiter},
     task::{
         Task, TaskOptions, disable_preempt, halt_cpu,
@@ -232,9 +239,20 @@ impl Scheduler for Cpus {
         }
         // The policy says whether the CPU is asked to reschedule: one running its idle
         // task or with its tick stretched, and one whose task has run the minimum when
-        // this is a wake; one still in its boot context takes the task when it yields.
-        let woken = flags == EnqueueFlags::Wake;
-        let ask = rq.queue.push(runnable, woken, crate::clock::now());
+        // an interrupt or another CPU woke this one; one still in its boot context takes
+        // the task when it yields. Task code running on the target CPU is its current
+        // task: that wake is the running task's own, and does not preempt it.
+        let why = match flags {
+            EnqueueFlags::Spawn => Why::New,
+            EnqueueFlags::Wake
+                if InterruptLevel::current().is_task_context()
+                    && disable_preempt().current_cpu() == target =>
+            {
+                Why::WokenByCurrent
+            }
+            EnqueueFlags::Wake => Why::Woken,
+        };
+        let ask = rq.queue.push(runnable, why, crate::clock::now());
         rq.publish();
         ask.then_some(target)
     }

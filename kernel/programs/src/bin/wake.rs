@@ -9,6 +9,10 @@
 //! is timed from the deadline or from the `futex_wake` to the woken thread's run. At least
 //! [`WITHIN`]% of the wakes must run within the bound: the rest allow for the host's stalls
 //! of a virtual CPU, which a wake on a quiet CPU shows too (1.11e's report).
+//!
+//! On one CPU only the timer's wake is judged: the waking thread can only be the thread
+//! computing on the woken one's CPU, and a wake by the running thread does not preempt it
+//! (SDD 20 f.11: a producer that wakes its own consumer keeps its CPU, so the two batch).
 
 #![no_std]
 #![no_main]
@@ -56,7 +60,13 @@ fn run() -> i64 {
     let mut worst = 0;
     for &(sleeper, waker) in &places {
         let busy = move |_home: u32| -> Vec<u32> { (0..cpus).filter(|&c| c != waker).collect() };
-        for by in [By::Timer, By::Thread] {
+        // On one CPU the waker is the woken thread's CPU's running thread: the timer alone.
+        let kinds: &[By] = if cpus > 1 {
+            &[By::Timer, By::Thread]
+        } else {
+            &[By::Timer]
+        };
+        for &by in kinds {
             let run = Run {
                 spinners: &busy,
                 sleeper: Some(sleeper),
@@ -120,7 +130,12 @@ fn run() -> i64 {
     }
     println!(
         out,
-        "wake: ok: a thread woken by its timer and by a thread, {} times each on CPU 0{}, every CPU computing, ran within {} us at the {}th percentile (at most {} us)",
+        "wake: ok: a thread woken by {}, {} times each on CPU 0{}, every CPU computing, ran within {} us at the {}th percentile (at most {} us)",
+        if cpus > 1 {
+            "its timer and by a thread"
+        } else {
+            "its timer (one CPU: no thread to wake it from elsewhere)"
+        },
         ROUNDS,
         if cpus > 1 { " and on the last CPU" } else { "" },
         BOUND_US,
