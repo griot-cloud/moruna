@@ -176,5 +176,25 @@ def runs(plan: dict, root: str = "/data") -> list:
     return out
 
 
+def select(plan: dict, all_runs: list, engines) -> tuple:
+    """The runs of `engines` alone (`run.py --engines`), in the plan's order, and the reference's
+    runs added for them: an engine's output is checked against 0.6.6's (6B), so when 0.6.6 is not
+    among `engines`, its learning runs (`r0`, which no median counts) run first in each job, on the
+    new machine, and make the reference again. `engines` None is the whole plan. Returns (runs,
+    the reference's run ids added)."""
+    if engines is None:
+        return list(all_runs), []
+    unknown = [e for e in engines if e not in plan["engines"]]
+    if unknown or not engines:
+        raise PlanError(f"--engines: {', '.join(unknown) or 'none named'}; the plan's engines are "
+                        f"{', '.join(plan['engines'])}")
+    chosen = set(engines)
+    added = []
+    if REFERENCE not in chosen:
+        added = [r["id"] for r in all_runs if r["engine"] == REFERENCE and r["repeat"] == 0 and not r.get("noise")]
+    keep = set(added)
+    return [r for r in all_runs if r["engine"] in chosen or r["id"] in keep], added
+
+
 def default_plan_path(name: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "plans", f"{name}.json")

@@ -27,7 +27,13 @@ own `wall_s` and start-up the rest of the process's life before it.
 `output` a blob prefix, and the engine reads and writes them itself. An engine with no Blob
 reader (`LOCAL_COPY`: the Rust pool) gets a local copy, timed apart: its inputs are downloaded
 before it starts (`copy_in_s`) and its output uploaded after it ends (`copy_out_s`), and its
-record says `data: local copy`. Without a store, everything is local.
+record says `data: local copy`. Without a store, everything is local. Before a run starts, the empty
+directory markers an earlier run's driver left above its output (Spark's ABFS) are deleted
+(store.drop_markers), outside every timing.
+
+**A failed run's own error** (work item 6.2c): the last lines of the engine's stderr (`error_lines`,
+else the error its RESULT gave) are in its record, in its summary line, which the batch keeps in
+its state (runs.json), and on this process's own stderr, which the batch keeps too.
 
 The output is reduced to its canonical form (gate-canon/1: `gate-canon` when it is built, else
 bench/vm/canon.py), after it is fetched from Blob outside every timing, and compared with the
@@ -57,6 +63,9 @@ VENV = {"moruna066": "moruna066", "moruna066-rust": "moruna066", "ray": "ray", "
 PYTHON_ENGINES = tuple(VENV)
 # Engines with no Blob reader of their own: a local copy, timed apart (the PM, 2026-11-18).
 LOCAL_COPY = ("rust-pool",)
+# A failed run's own error, as the summary line carries it to the batch's state and the table:
+# the last lines of the engine's stderr, at most this many and this many characters.
+ERROR_LINES, ERROR_BYTES = 12, 1500
 
 
 def wr(path, value):
@@ -286,15 +295,30 @@ def dump_path(a, tmp):
     return os.path.join(tmp, "canon.dump") if a.reference_dump else None
 
 
+def error_lines(stderr, result=None, code=None, lines=ERROR_LINES, limit=ERROR_BYTES):
+    """A failed run's own error: the last `lines` lines of the engine's stderr (each line at most
+    300 characters, at most `limit` in all, the last kept), else the error its RESULT line gave,
+    else its exit code."""
+    kept = [line.rstrip()[:300] for line in (stderr or "").splitlines() if line.strip()][-lines:]
+    text = "\n".join(kept)[-limit:]
+    if text:
+        return text
+    if (result or {}).get("error"):
+        return str(result["error"])[-limit:]
+    return f"no output on stderr; exit {code}"
+
+
 def record(spec, rid, results, rec):
     os.makedirs(results, exist_ok=True)
     rec["id"] = rid
     rec["host"] = {"platform": sys.platform, "cpus": os.cpu_count()}
     json.dump(rec, open(os.path.join(results, f"{rid}.json"), "w"), default=str, indent=1)
-    # What the table needs (run.py keeps it as the run's live record): a few hundred bytes, inside
-    # the 4 KiB of output run-command returns.
+    # What the table needs (run.py keeps it as the run's live record): with a failed run's last
+    # lines at most ERROR_BYTES, about 2 KiB, inside the 8 KiB of output the batch keeps.
     brief = {k: rec.get(k) for k in ("id", "ok", "exit_code", "startup_s", "operational_s", "cpu_s", "peak_bytes",
                                      "oom_kills", "memory_gib", "data", "copy_in_s", "copy_out_s")}
+    if rec.get("error_lines"):
+        brief["error_lines"] = rec["error_lines"]
     check = rec.get("output_check") or {}
     brief["output"] = check.get("verdict")
     brief["check"] = {k: check[k] for k in ("ok", "hash_all", "max_abs", "verdict") if k in check}
@@ -320,6 +344,9 @@ def run(a):
         os.makedirs(spec["staging"], exist_ok=True)
     store = stores.Store.from_env()
     data = {"data": "local"}
+    # Outside every timing: the directory markers an earlier run's driver left above this run's
+    # output (Spark's ABFS), which would fail a directory made under them.
+    dropped = store.drop_markers(spec["output"]) if store else []
     inputs, target = spec.get("files", []), out
     if store and spec["engine"] in LOCAL_COPY:
         # No Blob reader: the inputs come to the local disk before the engine starts, timed apart.
@@ -341,9 +368,16 @@ def run(a):
     result = next((json.loads(line[7:]) for line in stdout.splitlines() if line.startswith("RESULT ")), None)
     rec = {"spec": spec, "command": cmd, "exit_code": code, "wall_s": round(t1 - t0, 3), "result": result,
            "memory_gib": spec.get("mem_gib"), **data, **totals, **phases(result, t0, t1)}
+    if dropped:
+        rec["markers_dropped"] = dropped
     rec["ok"] = code == 0 and result is not None and not result.get("error")
     if not rec["ok"]:
         rec["stderr"] = stderr
+        rec["error_lines"] = error_lines(stderr, result, code)
+        # The batch keeps this process's stderr in the run's state (runs.json): the engine's own
+        # error reaches it, not only the record left on the machine.
+        sys.stderr.write(f"{rid}: exit {code}: the engine's last lines:\n{rec['error_lines']}\n")
+        sys.stderr.flush()
     if rec["ok"] and store and data["data"] == "local copy":
         t = time.time()
         for d, _, fs in os.walk(out):

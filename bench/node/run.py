@@ -1,12 +1,22 @@
 """The node benchmark from one command on the Mac (system design 6, work items 6.1, 6.2 and 6.2b).
 
     bench/node/run.py --plan PLAN --dry-run [--vhd F] [--tasks DIR] [--from ADDRESS] [--ref066 REF]
-                      [--wheel066 WHEEL] [--data-from-mac] [--stamp yyyymmddHHMM]
+                      [--wheel066 WHEEL] [--data-from-mac] [--stamp yyyymmddHHMM] [--engines a,b,...]
     bench/node/run.py --plan PLAN --go --vhd F --tasks DIR --from ADDRESS [--ref066 REF] [--wheel066 WHEEL]
-                      [--data-from-mac]
+                      [--data-from-mac] [--engines a,b,...]
     bench/node/run.py --plan PLAN --local --engines-root DIR --results DIR [--store-endpoint URL]
-                      [--reference-json F]
-    bench/node/run.py --plan PLAN --table bench/node/results/<stamp>
+                      [--reference-json F] [--engines a,b,...]
+    bench/node/run.py --plan PLAN --table bench/node/results/<stamp> [bench/node/results/<stamp> ...]
+                      [--results DIR]
+
+`--engines a,b,...` runs only those engines' runs of the plan, into a new results directory, so a
+rerun after a fix, or of the node with a new image, repeats nothing else (work item 6.2c); when
+0.6.6 is not one of them, its learning runs come too, since they make on the new machine the
+reference every output is checked against, and no median counts them. The Linux machine installs
+only what those runs need, and the run stops before any measured run when one does not install.
+Without `moruna-node` among them, no node is made and --vhd, --tasks and --from are not needed.
+`--table A B ...` then merges the directories, the newest record of each run (by each directory's
+stamp, its run.json or its name), printed and, with `--results`, written there.
 
 Each run's record lands in `bench/node/results/<stamp>/` as the run finishes (`node/` for Moruna's,
 `live/` for the Linux machine's, from measure.py's summary line), so `--table` gives the table of
@@ -100,6 +110,18 @@ import rootcause  # noqa: E402
 import store as stores  # noqa: E402, engines/store.py: the run's Blob container
 import table  # noqa: E402
 
+
+def _engines_install():
+    """engines/install.py, by its path: bench/vm has an install.py of its own, ahead on the path."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("engines_install", os.path.join(HERE, "engines", "install.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+install = _engines_install()
+
 ENG, CODE, DATA = "/opt/engines", "/opt/bench", "/data"
 MEASURE = [f"{ENG}/venv-harness/bin/python", f"{CODE}/bench/node/engines/measure.py"]
 JAVA_HOME = "/usr/lib/jvm/java-17-openjdk-amd64"
@@ -127,6 +149,8 @@ DATA_BOUND_S, SETUP_BOUND_S, FETCH_BOUND_S, CHECK_BOUND_S = 1800, 3 * 3600, 300,
 STALL_S = 600
 # How often each batch's state is read from the container.
 POLL_S = {"setup": 30, "runs": 30, "checks": 20}
+# The install.py engine a plan's engine runs in, where the names differ.
+INSTALL_OF = {"duckdb-sql": "duckdb", "polars-expr": "polars"}
 
 
 class DryRun:
@@ -445,9 +469,15 @@ class Bench:
     def __init__(self, plan, x, cloud, args, results, secrets_dir):
         self.plan, self.x, self.c, self.a = plan, x, cloud, args
         self.results, self.sec = results, secrets_dir
-        self.runs = plans.runs(plan, DATA)
+        # `--engines`: those engines' runs alone, and 0.6.6's learning runs when the reference
+        # must be made again (plan.select).
+        self.engines = getattr(args, "engines", None)
+        self.runs, self.reference_added = plans.select(plan, plans.runs(plan, DATA), self.engines)
         self.by_id = {r["id"]: r for r in self.runs}
-        self.with_node = "moruna-node" in plan["engines"]
+        self.with_node = any(r["where"] == "node" for r in self.runs)
+        # The run's own table and log entry show the engines it was asked for (0.6.6's learning runs
+        # count in no row); --table merges it with the run it completes.
+        self.table_plan = dict(plan, engines=[e for e in plan["engines"] if not self.engines or e in self.engines])
         self.from_mac = bool(getattr(args, "data_from_mac", False))
         self.wheel066 = getattr(args, "wheel066", "") or ""
         # Every secret the run learns, by name: the executor redacts them wherever they would show.
@@ -484,6 +514,14 @@ class Bench:
             side += (f"; the node's {len(self.where('node'))} alongside, one at a time, once the data is in "
                      "the container")
         x.note(side)
+        if self.engines:
+            x.note(f"--engines {','.join(self.engines)}: those engines' runs of the plan alone, into a new results "
+                   f"directory; run.py --table merges it with the run it completes")
+        if self.reference_added:
+            x.note(f"and 0.6.6's learning runs, which make again the reference every output is checked against "
+                   f"(no median counts them): {', '.join(self.reference_added)}")
+        x.note(f"the Linux machine installs {', '.join(self.installs())}; the run stops before any measured run "
+               "if one does not install")
         for line in getattr(self.a, "checked", ()):
             x.note(line)
         token_key = x.keygen(f"{sec}/token-key.pem")
@@ -750,6 +788,17 @@ class Bench:
         if not self.stop.is_set():
             self.batch("runs", self.linux_steps(), self.linux_done, after_start=self.keep_wheel)
 
+    def installs(self):
+        """What the Linux machine installs, in install.py's order: measure.py's own environment
+        and the Rust pool's `gate-canon`, which makes and compares every check's canonical form,
+        then the engine of each of the run's Linux runs (0.6.6's Rust function runs in 0.6.6's
+        environment)."""
+        need = {"harness", "rust-pool"}
+        need.update(INSTALL_OF.get(r["engine"], r["engine"]) for r in self.runs if r["where"] == "linux")
+        if "moruna066-rust" in need:
+            need.add("moruna066")
+        return [e for e in install.ENGINES if e in need]
+
     def setup_steps(self):
         """The data (unless it came from the Mac), then the engines (setup-linux.sh), then the
         plan's runs.json: every one outside every timing."""
@@ -760,7 +809,8 @@ class Bench:
             st.append({"id": "data", "argv": ["bash", f"{CODE}/bench/node/engines/data-linux.sh", d["pyarrow"],
                                               json.dumps(spec, separators=(",", ":"))],
                        "env": self.store_env(), "secrets": ["BENCH_KEY"], "timeout_s": DATA_BOUND_S})
-        env = {"BASE": self.base(), "V066": getattr(self.a, "version066", "") or "0.6.6"}
+        env = {"BASE": self.base(), "V066": getattr(self.a, "version066", "") or "0.6.6",
+               "ENGINES": ",".join(self.installs())}
         if self.wheel066:
             env["WHEEL066"] = os.path.basename(self.wheel066)
         st.append({"id": "setup", "argv": ["bash", f"{CODE}/bench/node/engines/setup-linux.sh"], "env": env,
@@ -789,9 +839,25 @@ class Bench:
             image = x.az(azure.image_version(self.c), out="linux-image-version")
             self.setup = dict(tagged(ended.get("stdout"), "SETUP ") or {}, linux_image=image)
             x.save(os.path.join(self.results, "setup.json"), self.setup)
+            if x.answers:
+                self.refuse_setup(ended)
         elif x.answers and ended.get("exit") != 0:
             raise RuntimeError(f"the setup's step {step['id']} failed: exit {ended.get('exit')}: "
                                f"{(ended.get('stderr') or ended.get('error') or '')[-300:]}")
+
+    def refuse_setup(self, ended):
+        """The run goes on only when every engine it runs installed (work item 6.2c): one that did
+        not stops it before any measured run, with why each failed (setup-linux.sh's SETUP line
+        carries each one's error), rather than failing every one of its runs."""
+        installed = (self.setup or {}).get("installed") or {}
+        missing = [e for e in self.installs() if not installed.get(e)]
+        if not missing and ended.get("exit") == 0:
+            return
+        errors = (self.setup or {}).get("errors") or {}
+        why = "; ".join(f"{e}: {errors.get(e) or 'no record'}" for e in missing) or (
+            f"exit {ended.get('exit')}: {(ended.get('stderr') or ended.get('error') or '')[-300:]}")
+        raise RuntimeError(f"the setup did not install {', '.join(missing) or 'every engine'}, so the run stops "
+                           f"before any measured run: {why}")
 
     def keep_wheel(self):
         """0.6.6's wheel, when the Linux machine built it, kept beside the results for the next
@@ -912,7 +978,12 @@ class Bench:
                       "node_times": times,
                       "wall_ms": wall_ms, "first_rows_s": node_api.first_rows_s(got.events()),
                       "resumed": got.resumed},
-            "cpu_s": resources.get("cpu_core_s"),
+            # The node's CPU-seconds for the job are its report's `resources.cpu_core_s`, when the
+            # report says it measured them; run 3's node said `usage_measured: false` with 0.0,
+            # which is no measurement (docs/run-report.md: a measurement not made is absent).
+            "cpu_s": resources.get("cpu_core_s") if resources.get("usage_measured", True) else None,
+            "cpu_by": ("the engine's report, resources.cpu_core_s" if resources.get("usage_measured", True) else
+                       "not measured: the report's resources.usage_measured is false"),
             "peak_bytes": report.get("peak_anon_bytes") or resources.get("peak_memory_bytes"),
             "split": collect.report_split(report),
             "report_budget": report.get("budget"), "object_io": report.get("object_io")})
@@ -972,7 +1043,7 @@ class Bench:
              secrets=s)
         x.local(["tar", "-xzf", f"{self.results}/linux.tgz", "-C", self.results])
         self.collected = True
-        x.finish(self.plan, self.results, self.meta(), log=log)
+        x.finish(self.table_plan, self.results, self.meta(), log=log)
 
     def meta(self):
         commit = subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -984,11 +1055,16 @@ class Bench:
         made = ("uploaded from this machine" if self.from_mac else
                 f"made in Azure from {self.plan['dataset'].get('source_url')}, each file the plan's SHA-256")
         # 0.6.6's wheel (source, name, SHA-256) is in the table itself (summary.json, table.md).
-        return {"date": self.c.stamp, "commit": commit, "node_image": node_image,
+        meta = {"date": self.c.stamp, "commit": commit, "node_image": node_image if self.with_node else None,
                 "machines": f"{self.c.size}, zone {self.c.zone}, {self.c.location}, subscription {self.c.subscription}",
                 "linux_image": setup.get("linux_image"),
                 "data": f"read and written in Blob container `data`, {made}",
                 "results": os.path.relpath(self.results, REPO)}
+        if self.engines:
+            added = " and 0.6.6's learning runs, the reference" if self.reference_added else ""
+            meta["engines"] = (f"{', '.join(self.engines)} alone (--engines){added}; run.py --table merges these runs "
+                               "with the run they complete")
+        return meta
 
     # 5. Tear down ----------------------------------------------------------------------------------
     def teardown(self):
@@ -1028,7 +1104,8 @@ def live_record(spec, got, detail=None):
     replace. A run with no summary line is a failed run; `detail` says what the batch saw."""
     got = got or {}
     rec = {"spec": spec, "live": True, "ok": bool(got.get("ok")), "memory_gib": spec.get("mem_gib")}
-    for k in ("startup_s", "operational_s", "cpu_s", "peak_bytes", "oom_kills", "data", "copy_in_s", "copy_out_s"):
+    for k in ("startup_s", "operational_s", "cpu_s", "peak_bytes", "oom_kills", "data", "copy_in_s", "copy_out_s",
+              "exit_code", "error_lines"):
         if got.get(k) is not None:
             rec[k] = got[k]
     rec["output_check"] = got.get("check") or {"verdict": got.get("output")}
@@ -1066,6 +1143,26 @@ def finish(plan, results, meta, log=LOG):
     return summary
 
 
+def merged(plan, dirs, out_dir=None):
+    """The table of several results directories as one (work item 6.2c): the newest record of each
+    run (collect.merge), with where each came from. With `out_dir`, its summary.json and table.md
+    are written there, and merged.json, the directory each run's record came from; no directory
+    given is written to. Returns (the summary, the table's text)."""
+    records, order, _ = collect.merge(dirs)
+    summary = collect.summarise(records, plan)
+    summary["sources"] = [{"dir": d, "stamp": collect.stamp_of(d), "runs": sum(r["from"] == d for r in records),
+                           "wheel_066": wheel_066(d)} for d in order]
+    text = table.render(summary)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        collect.write(out_dir, summary)
+        with open(os.path.join(out_dir, "table.md"), "w") as f:
+            f.write(text + "\n")
+        with open(os.path.join(out_dir, "merged.json"), "w") as f:
+            json.dump({"dirs": order, "runs": {r["spec"]["id"]: r["from"] for r in records}}, f, indent=1)
+    return summary, text
+
+
 def wheel_066(results):
     """0.6.6's wheel as the Linux machine's setup recorded it (`setup.json`): where it came from
     (`container`: given with --wheel066; `pypi`; `built` on the machine), its name, its SHA-256 and
@@ -1099,7 +1196,7 @@ def local(plan, args, out=sys.stdout, python=sys.executable):
         for f in plan["dataset"]["files"]:
             store.upload(os.path.join(src, f), f"nyc/{f}")
         env.update(store.env())
-    every = plans.runs(plan, DATA)
+    every, _ = plans.select(plan, plans.runs(plan, DATA), getattr(args, "engines", None))
     skipped = [r["id"] for r in every if r["where"] != "linux"]
     if skipped:
         out.write(f"# not run here, Moruna's runs need the node: {', '.join(skipped)}\n")
@@ -1195,7 +1292,7 @@ def check_inputs(plan, a, real):
     when one is given, and with the node the image, the gate tasks and the operator's address
     (TCP 443 is admitted from it alone, AZURE.md). A real run needs them all; a dry run checks
     those it is given. Returns the lines the run notes first; a SystemExit says what is wrong."""
-    lines, with_node = [], "moruna-node" in plan["engines"]
+    lines, with_node = [], "moruna-node" in (getattr(a, "engines", None) or plan["engines"])
     if real and with_node and not (a.vhd and a.tasks and a.operator):
         raise SystemExit("run.py: a real run needs --vhd, --tasks and --from")
     lines.append(data_facts(plan, getattr(a, "data_from_mac", False)))
@@ -1235,9 +1332,13 @@ def main(argv=None, out=sys.stdout):
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--go", action="store_true", help="create the run's resources: the PM's go-ahead was given")
     mode.add_argument("--local", action="store_true")
-    mode.add_argument("--table", metavar="RESULTS", default="",
+    mode.add_argument("--table", metavar="RESULTS", nargs="+", default=None,
                       help="the table of what a run's results directory holds so far (summary.json, table.md, "
-                           "and printed); no log entry. Safe while the run goes on")
+                           "and printed); no log entry. Safe while the run goes on. Several directories are merged, "
+                           "the newest record of each run, and printed, and written to --results when given")
+    p.add_argument("--engines", default="",
+                   help="a,b,...: only those engines' runs of the plan (and 0.6.6's learning runs, the reference, "
+                        "when 0.6.6 is not one of them), into a new results directory")
     p.add_argument("--vhd", default="", help="the node's fixed VHD (package.py --formats vhd)")
     p.add_argument("--tasks", default="", help="the gate's native tasks (images/gate/tasks/build.sh)")
     p.add_argument("--from", dest="operator", default="",
@@ -1263,13 +1364,28 @@ def main(argv=None, out=sys.stdout):
     plan = plans.load(path)
     stamp = a.stamp or datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M")
     if a.table:
-        if not os.path.isdir(a.table):
-            p.error(f"--table: no results directory {a.table}")
-        summary = finish(plan, a.table, None, log=None)
-        done = sum(1 for _ in collect.load(a.table))
-        out.write(f"# {done} of {len(plans.runs(plan, DATA))} runs recorded in {a.table}\n\n")
-        out.write(table.render(summary) + "\n")
+        for d in a.table:
+            if not os.path.isdir(d):
+                p.error(f"--table: no results directory {d}")
+        if len(a.table) == 1:
+            summary = finish(plan, a.table[0], None, log=None)
+            done = sum(1 for _ in collect.load(a.table[0]))
+            out.write(f"# {done} of {len(plans.runs(plan, DATA))} runs recorded in {a.table[0]}\n\n")
+            out.write(table.render(summary) + "\n")
+            return 0
+        if a.results and os.path.abspath(a.results) in {os.path.abspath(d) for d in a.table}:
+            p.error("--results: a directory of its own, not one the table merges (its table.md is that run's)")
+        summary, text = merged(plan, a.table, a.results or None)
+        done = sum(s["runs"] for s in summary["sources"])
+        where = f"; written to {a.results}" if a.results else ""
+        out.write(f"# {done} of {len(plans.runs(plan, DATA))} runs, the newest of each from {len(a.table)} results "
+                  f"directories{where}\n\n{text}\n")
         return 0
+    a.engines = [e for e in a.engines.split(",") if e] or None
+    try:
+        plans.select(plan, [], a.engines)
+    except plans.PlanError as e:
+        p.error(str(e))
     if a.local:
         if not a.engines_root or not a.results:
             p.error("--local needs --engines-root and --results")
@@ -1284,6 +1400,9 @@ def main(argv=None, out=sys.stdout):
         return 0
     os.makedirs(results, exist_ok=True)
     shutil.copy(path, os.path.join(results, "plan.json"))
+    # The run's stamp, which orders results directories when --table merges them, and its engines.
+    with open(os.path.join(results, "run.json"), "w") as f:
+        json.dump({"stamp": stamp, "plan": plan["name"], "engines": a.engines or "all"}, f, indent=1)
     secrets = tempfile.mkdtemp(prefix="moruna-bench-")
     try:
         Bench(plan, Real(cloud, os.path.join(results, "commands.log"), out), cloud, a, results, secrets).go()

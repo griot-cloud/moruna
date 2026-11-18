@@ -393,7 +393,8 @@ def test_a_wheel_of_0_6_6_given_to_the_run(tmp_path):
     args.wheel066 = str(wheel)
     b = run.Bench(nyc_plan(), run.DryRun(io.StringIO()), cloud(), args, str(tmp_path), "/s")
     setup = next(s for s in b.setup_steps() if s["id"] == "setup")
-    assert setup["env"] == {"BASE": b.base(), "V066": "0.6.6", "WHEEL066": wheel.name}
+    assert setup["env"] == {"BASE": b.base(), "V066": "0.6.6", "WHEEL066": wheel.name,
+                            "ENGINES": "harness,moruna066,moruna066-rust,rust-pool,duckdb,polars,ray,spark,dask"}
     assert setup["secrets"] == ["SAS_CODE"] and setup["argv"] == ["bash", "/opt/bench/bench/node/engines/setup-linux.sh"]
     bad = tmp_path / "moruna-0.6.6-cp314-cp314-linux_x86_64.whl"
     bad.write_bytes(b"gil")
@@ -682,9 +683,10 @@ class Fake(run.DryRun):
     answers = True
 
     def __init__(self, results, fail_on=None, node=None, console_after=0, reveal=None, data_ok=True,
-                 wheel="built", health_after=0, served=PIN, vm_id="i-1", console_text=None):
+                 wheel="built", health_after=0, served=PIN, vm_id="i-1", console_text=None, not_installed=()):
         super().__init__(io.StringIO())
         self.results, self.fail_on, self.azs, self.node = results, fail_on, [], node or FakeNode()
+        self.not_installed = not_installed  # the engines the setup does not install
         self.console_after, self.reveal, self.data_ok, self.wheel = console_after, reveal, data_ok, wheel
         self.files, self.uploaded, self.states, self.shown, self.started = {}, {}, {}, {}, []
         self.health_after, self.served, self.vm_id, self.healths = health_after, served, vm_id, 0
@@ -717,7 +719,8 @@ class Fake(run.DryRun):
             argv = " ".join(st["argv"]) + " "
             if self.fail_on and self.fail_on in argv:
                 return {"name": name, "state": "failed", "steps": ended, "error": f"failed: {self.fail_on}"}
-            ended.append({"id": st["id"], "exit": 0, "stdout": self.step_out(st, argv)})
+            failed = st["id"] == "setup" and self.not_installed
+            ended.append({"id": st["id"], "exit": 1 if failed else 0, "stdout": self.step_out(st, argv)})
         return {"name": name, "state": "done", "steps": ended}
 
     def step_out(self, st, text):
@@ -729,7 +732,12 @@ class Fake(run.DryRun):
                 rec["error"] = f"12 of 12 files differ from the plan's SHA-256: {', '.join(files)}"
             return "normalized rows 41169720\nDATA " + json.dumps(rec)
         if st["id"] == "setup":
-            return "SETUP " + json.dumps({"installed": {"duckdb": True}, "wheel_066": self.wheel, "wheel_066_s": 1800,
+            # setup-linux.sh's line: each engine run.py named (ENGINES), and why one did not install.
+            names = st["env"]["ENGINES"].split(",")
+            return "SETUP " + json.dumps({"installed": {e: e not in self.not_installed for e in names},
+                                          "errors": {e: f"{e} installs and imports on none of CPython 3.14+gil"
+                                                     for e in self.not_installed},
+                                          "wheel_066": self.wheel, "wheel_066_s": 1800,
                                           "wheel_066_name": "moruna-0.6.6-cp314-cp314t-linux_x86_64.whl",
                                           "wheel_066_sha256": WHEEL_SHA})
         if "measure.py run" in text:
@@ -1045,9 +1053,14 @@ def test_a_failed_setup_step_stops_the_run(tmp_path, ended, message):
     with pytest.raises(RuntimeError, match=message):
         b.setup_done({"id": ended["id"]}, ended)
     assert not b.data_ready.is_set()
-    # The engines' setup is a result even when it fails: the runs then fail one by one, recorded.
-    b.setup_done({"id": "setup"}, {"id": "setup", "exit": 1, "stdout": "", "stderr": "boom"})
+    # An engines' setup that fails stops the run before any measured run (work item 6.2c), its
+    # record kept; before, the runs failed one by one.
+    with pytest.raises(RuntimeError, match="the setup did not install harness, moruna066.*: harness: no record"):
+        b.setup_done({"id": "setup"}, {"id": "setup", "exit": 1, "stdout": "", "stderr": "boom"})
     assert b.setup == {"linux_image": "<linux-image-version>"}
+    with pytest.raises(RuntimeError, match="the setup did not install every engine.*exit 1: boom"):
+        b.setup_done({"id": "setup"}, {"id": "setup", "exit": 1, "stderr": "boom", "stdout": "SETUP " + json.dumps(
+            {"installed": {e: True for e in b.installs()}})})
 
 
 def started_bench(tmp_path, x, name="runs"):
@@ -1682,8 +1695,11 @@ def test_engine_py_reports_a_failed_run(tmp_path, capsys, monkeypatch):
     flist.write_text(str(tmp_path / "missing.parquet"))
     assert eng.main(["--engine", "duckdb", "--workload", "score", "--inputs", str(flist), "--out", str(tmp_path / "o"),
                      "--cpus", "1", "--mem-gib", "1", "--tmp", str(tmp_path / "t")]) == 1
-    res = json.loads(capsys.readouterr().out.split("RESULT ", 1)[1])
+    got = capsys.readouterr()
+    res = json.loads(got.out.split("RESULT ", 1)[1])
     assert res["error"] and res["marks"]["main"] and res["settings"]["threads"] == 1 and res["data"] == "local"
+    # Its traceback is on stderr, whose last lines measure.py keeps (work item 6.2c).
+    assert got.err.startswith("Traceback") and res["error"].split(":")[0] in got.err.splitlines()[-1]
     assert eng.main(["--engine", "polars-expr", "--workload", "score", "--inputs", str(flist), "--out",
                      str(tmp_path / "o2"), "--cpus", "1", "--mem-gib", "1", "--tmp", str(tmp_path / "t")]) == 1
     assert "no native form of score" in capsys.readouterr().out
@@ -1707,11 +1723,23 @@ def test_the_store_names_each_engines_blobs():
     assert azure_store.blob_endpoint == "https://acct.blob.core.windows.net"
     assert azure_store.az("nyc/f.parquet") == "az://data/nyc/f.parquet"
     assert azure_store.abfs("out/x") == "abfs://data/out/x" and azure_store.path("out/x") == "data/out/x"
-    assert azure_store.wasbs("nyc/f") == "wasbs://data@acct.blob.core.windows.net/nyc/f"
+    # Spark's ABFS (Hadoop 3.5 refuses wasbs://), over the Blob API on an account without a
+    # hierarchical namespace; an emulator by its address, over its own scheme.
+    assert azure_store.abfss("nyc/f") == "abfss://data@acct.dfs.core.windows.net/nyc/f"
     assert azure_store.moruna_storage() == {"account": "acct", "access_key": "KEY"} and azure_store.moruna_env() == {}
     assert azure_store.polars_options() == {"account_name": "acct", "account_key": "KEY"}
     assert azure_store.adlfs_options() == {"account_name": "acct", "account_key": "KEY"}
-    assert azure_store.spark_conf() == {"spark.hadoop.fs.azure.account.key.acct.blob.core.windows.net": "KEY"}
+    assert azure_store.spark_conf() == {"spark.hadoop.fs.azure.account.key.acct.dfs.core.windows.net": "KEY",
+                                        "spark.hadoop.fs.azure.account.key.acct.blob.core.windows.net": "KEY",
+                                        "spark.hadoop.fs.azure.account.hns.enabled": "false",
+                                        "spark.hadoop.fs.azure.fns.account.service.type": "BLOB"}
+    tls = stores.Store("devstoreaccount1", "K", "data", "https://192.168.64.1:10111/devstoreaccount1")
+    assert tls.abfss("x") == "abfss://data@devstoreaccount1.dfs.core.windows.net/x"
+    assert tls.spark_conf()["spark.hadoop.fs.azure.abfs.endpoint"] == "192.168.64.1:10111"
+    assert tls.spark_conf()["spark.hadoop.fs.azure.always.use.https"] == "true"
+    plain = stores.Store("devstoreaccount1", "K", "data", "http://127.0.0.1:10000/devstoreaccount1")
+    assert plain.abfss("x") == "abfs://data@devstoreaccount1.dfs.core.windows.net/x"
+    assert plain.spark_conf()["spark.hadoop.fs.azure.always.use.https"] == "false"
     assert "AccountKey=KEY;BlobEndpoint=https://acct.blob.core.windows.net;" in azure_store.duckdb_secret()
     local = stores.Store(stores.AZURITE_ACCOUNT, stores.AZURITE_KEY, "data", "http://127.0.0.1:10000/devstoreaccount1")
     assert local.moruna_storage()["allow_http"] and local.moruna_env() == {"AZURE_STORAGE_USE_EMULATOR": "true"}
@@ -2006,15 +2034,17 @@ def test_install_records_each_engine(tmp_path, monkeypatch):
     root = str(tmp_path / "root")
     src = tmp_path / "src066"
     src.mkdir()
+    # Spark with no JVM did not install: a run could not start its session.
     assert install.main(["--root", root, "--gate-src", str(tmp_path), "--engines", "rust-pool,spark,moruna066",
-                         "--moruna066", str(src), "--jobs", "3"]) == 0
+                         "--moruna066", str(src), "--jobs", "3"]) == 1
     done = json.load(open(os.path.join(root, "installed.json")))
-    assert done["spark"]["note"].startswith("no JVM") and done["rust-pool"]["ok"]
+    assert done["spark"]["error"].startswith("no JVM") and not done["spark"]["ok"] and done["rust-pool"]["ok"]
+    assert done["moruna066"]["interpreter"] == "3.14t" and done["moruna066"]["tried"] == []
     assert ["cargo", "build", "--release", "-j", "3", "-p", "moruna-gate-baseline", "--bins"] in [c[0] for c in cmds]
     assert any(c[0][:2] == ["uv", "build"] and c[2] == "3" for c in cmds)
     assert any(c[0][-3:] == [os.path.join(root, "wheels", "moruna-0.6.6-cp314-cp314t-x.whl"), "pyarrow", "numpy"]
                for c in cmds)
-    assert any(c[0][:2] == ["uv", "venv"] and "3.14+gil" in c[0] for c in cmds)
+    assert any(c[0][:4] == ["uv", "venv", "-q", "--managed-python"] and "3.14+gil" in c[0] for c in cmds)
     # 0.6.6's Rust function needs 0.6.6's environment, and 0.6.6 needs its wheel or tree.
     assert install.main(["--root", str(tmp_path / "r2"), "--gate-src", str(tmp_path), "--engines", "moruna066-rust"]) == 1
     assert "install moruna066 first" in json.load(open(tmp_path / "r2" / "installed.json"))["moruna066-rust"]["error"]
@@ -2258,3 +2288,543 @@ def test_tlcs_january_normalises_to_the_plans_digest(tmp_path):
             "sha256": {jan: nyc_plan()["dataset"]["sha256"][jan]}, "normalize": NORMALIZE}
     rec = dataprep.prepare(spec, str(tmp_path), upload=lambda p, n: None)
     assert rec["ok"], rec
+
+
+# --- Work item 6.2c: the engines that did not run, the node's CPU, a run repeated in part -------
+
+def fake_uv(tmp_path, refuse):
+    """install.sh as uv would run it: `uv venv` makes the interpreter; `refuse(interp)` says which
+    interpreter's environment cannot import what."""
+    seen = []
+
+    def sh(cmd, log, env=None, cwd=None):
+        seen.append(cmd)
+        if cmd[:2] == ["uv", "venv"]:
+            py = os.path.join(cmd[-1], "bin", "python")
+            os.makedirs(os.path.dirname(py), exist_ok=True)
+            open(py, "w").write(cmd[cmd.index("-p") + 1])
+        if cmd[:3] == ["uv", "pip", "install"] and refuse(open(cmd[cmd.index("--python") + 1]).read()) == "install":
+            raise RuntimeError("uv pip install... exited 1: no wheel for this interpreter")
+
+    def versions(python, modules):
+        interp = open(python).read()
+        bad = refuse(interp)
+        return {"python": interp.split("+")[0] + ".3", "gil": True,
+                "modules": {m: (f"missing: {bad}" if m == "ray.data" and bad not in (None, "install") else "2.60")
+                            for m in modules}}
+    return seen, sh, versions
+
+
+def test_each_engine_lands_on_the_newest_cpython_it_installs_and_imports_on(tmp_path, monkeypatch):
+    """Ray on 3.14 and 3.13 installs but `ray.data` does not import (2026-11-18: typing_extensions,
+    which only a dependency below 3.13 brings); on 3.12 it does. Each interpreter tried before is
+    kept with why, and leaves no environment behind."""
+    seen, sh, versions = fake_uv(tmp_path, lambda i: "ModuleNotFoundError" if i[:4] in ("3.14", "3.13") else None)
+    monkeypatch.setattr(install, "sh", sh)
+    monkeypatch.setattr(install, "versions", versions)
+    root = tmp_path / "root"
+    assert install.main(["--root", str(root), "--gate-src", str(tmp_path), "--engines", "ray"]) == 0
+    ray = json.load(open(root / "installed.json"))["ray"]
+    assert (ray["ok"], ray["interpreter"], ray["python"], ray["gil"]) == (True, "3.12+gil", "3.12.3", True)
+    assert ray["tried"] == [{"python": "3.14+gil", "error": "did not import: ray.data (missing: ModuleNotFoundError)"},
+                            {"python": "3.13+gil", "error": "did not import: ray.data (missing: ModuleNotFoundError)"}]
+    venvs = [c[-1] for c in seen if c[:2] == ["uv", "venv"]]
+    assert venvs == [str(root / "venv-ray")] * 3 and open(root / "venv-ray" / "bin" / "python").read() == "3.12+gil"
+    assert all("--managed-python" in c for c in seen if c[:2] == ["uv", "venv"])
+    # None that holds: the engine did not install, and each interpreter's failure is said.
+    seen, sh, versions = fake_uv(tmp_path, lambda i: "install")
+    monkeypatch.setattr(install, "sh", sh)
+    monkeypatch.setattr(install, "versions", versions)
+    assert install.main(["--root", str(tmp_path / "r2"), "--gate-src", str(tmp_path), "--engines", "dask"]) == 1
+    dask = json.load(open(tmp_path / "r2" / "installed.json"))["dask"]
+    assert not dask["ok"] and "dask installs and imports on none of CPython 3.14+gil, 3.13+gil" in dask["error"]
+    assert "3.10+gil: uv pip install... exited 1" in dask["error"] and not (tmp_path / "r2" / "venv-dask").exists()
+    # An interpreter that does not answer at all.
+    monkeypatch.setattr(install, "versions", lambda python, modules: {"error": "Segmentation fault"})
+    with pytest.raises(RuntimeError, match="the interpreter did not answer: Segmentation fault"):
+        install.imported("/py", ["ray"])
+
+
+def test_spark_and_duckdb_get_their_blob_readers_ahead(tmp_path, monkeypatch):
+    """hadoop-azure resolved into ROOT/ivy at setup, its jars recorded; DuckDB's azure extension
+    installed into ROOT/duckdb-ext and loaded there."""
+    jar = "/v/pyspark/jars/hadoop-client-api-3.5.0.jar"
+    monkeypatch.setattr(install.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, jar + "\n", ""))
+    made = []
+
+    def sh(cmd, log, env=None, cwd=None):
+        made.append(cmd)
+        jars = tmp_path / "ivy" / "jars"
+        jars.mkdir(parents=True, exist_ok=True)
+        for j in ("org.apache.hadoop_hadoop-azure-3.5.0.jar", "com.microsoft.azure_azure-storage-7.0.1.jar"):
+            (jars / j).write_text("jar")
+    monkeypatch.setattr(install, "sh", sh)
+    out = install.spark_azure(str(tmp_path), str(tmp_path / "log"), "openjdk 17")
+    assert out["packages"] == "org.apache.hadoop:hadoop-azure:3.5.0" and out["ivy"] == str(tmp_path / "ivy")
+    assert out["jars"] == [str(tmp_path / "ivy" / "jars" / "com.microsoft.azure_azure-storage-7.0.1.jar"),
+                           str(tmp_path / "ivy" / "jars" / "org.apache.hadoop_hadoop-azure-3.5.0.jar")]
+    assert "spark.jars.packages" in made[0][3]
+    monkeypatch.setattr(install, "sh", lambda *a, **k: None)
+    shutil.rmtree(tmp_path / "ivy")
+    with pytest.raises(RuntimeError, match="hadoop-azure:3.5.0 was not resolved"):
+        install.spark_azure(str(tmp_path), str(tmp_path / "log"), "openjdk 17")
+    assert install.spark_azure(str(tmp_path), "", None)["azure_note"] == "hadoop-azure not resolved: no JVM"
+    monkeypatch.setattr(install.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))
+    assert install.spark_azure(str(tmp_path), "", "openjdk 17")["azure_note"] == "pyspark carries no Hadoop client jar"
+    # A run's session is given the jars as they are, and resolves nothing; before, by coordinate.
+    import engine as eng
+    import store as stores
+
+    class A:
+        mem_gib, tmp, root = 2, str(tmp_path / "t"), str(tmp_path)
+    (tmp_path / "installed.json").write_text(json.dumps({"spark": {"jars": out["jars"], "packages": out["packages"]}}))
+    st = stores.Store("acct", "KEY", "data")
+    conf = eng.spark_settings(A, st)
+    assert conf["spark.jars"] == ",".join(out["jars"]) and "spark.jars.packages" not in conf
+    assert "KEY" not in json.dumps(conf)
+    (tmp_path / "installed.json").write_text(json.dumps({"spark": {"packages": "p:q:1", "ivy": "/ivy"}}))
+    assert eng.spark_settings(A, st)["spark.jars.packages"] == "p:q:1" and "spark.jars" not in eng.spark_settings(A, st)
+    assert "spark.jars" not in eng.spark_settings(A, None) and "spark.jars.packages" not in eng.spark_settings(A, None)
+
+
+def test_duckdb_reads_azure_through_its_curl_transport_and_installs_nothing(monkeypatch):
+    """Run 3's DuckDB runs: the Azure SDK's own transport finds no CA certificates on Ubuntu, so
+    every read failed ("Problem with the SSL CA cert"). The extension comes from ROOT/duckdb-ext,
+    nothing is installed in the run, and its curl transport reads with the system's."""
+    duckdb = pytest.importorskip("duckdb")
+    import engine as eng
+    import store as stores
+    said = []
+
+    class Con:
+        def execute(self, sql):
+            said.append(sql)
+    monkeypatch.setattr(duckdb, "connect", lambda: Con())
+
+    class A:
+        mem_gib, cpus, root, inputs = 2, 2, "/opt/engines", ["nyc/a.parquet"]
+    res = {}
+    con, src = eng.duckdb_session(A, res, stores.Store("acct", "KEY", "data"))
+    assert said[2:] == ["SET extension_directory='/opt/engines/duckdb-ext'", "SET autoinstall_known_extensions=false",
+                        "LOAD azure", "SET azure_transport_option_type='curl'",
+                        stores.Store("acct", "KEY", "data").duckdb_secret()]
+    assert src == "read_parquet(['az://data/nyc/a.parquet'])" and "curl transport" in res["settings"]["azure"]
+
+
+def failing_engine(lines):
+    """An engine that prints `lines` on stderr, a RESULT with its error, and exits 1."""
+    return ("import json, sys\n" + "".join(f"sys.stderr.write({line!r} + '\\n')\n" for line in lines)
+            + "print('RESULT ' + json.dumps({'engine': 'x', 'error': 'IOException: the read failed'}))\nsys.exit(1)\n")
+
+
+def test_a_failed_runs_own_error_reaches_the_batch_state_and_the_table(tmp_path, monkeypatch, capsys):
+    """Run 3 kept no cause: the engine's stderr stayed in its record on the machine. Now its last
+    lines are in the summary line the batch keeps (runs.json) and on measure.py's own stderr, which
+    the batch keeps too, and the table's row shows the last of them."""
+    lines = [f"line {i}" for i in range(20)] + ["x" * 400, "_duckdb.IOException: IO Error: Problem with the SSL CA cert"]
+    monkeypatch.setattr(measure, "command", lambda *a: [sys.executable, "-c", failing_engine(lines)])
+    monkeypatch.delenv("BENCH_ACCOUNT", raising=False)
+    spec = {"id": "score-duckdb-r1", "job": "score", "engine": "duckdb", "workload": "score", "repeat": 1, "files": [],
+            "cpus": 1, "mem_gib": 1}
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    assert measure.main(["run", "--spec", str(tmp_path / "spec.json"), "--root", str(tmp_path), "--results",
+                         str(tmp_path / "r"), "--work", str(tmp_path / "w")]) == 1
+    got = capsys.readouterr()
+    brief = run.measured(got.out)
+    kept = brief["error_lines"].splitlines()
+    assert len(kept) == measure.ERROR_LINES and kept[-1].endswith("Problem with the SSL CA cert")
+    assert kept[-2] == "x" * 300 and kept[0] == "line 10"
+    assert "score-duckdb-r1: exit 1: the engine's last lines:" in got.err and kept[-1] in got.err
+    assert len(got.out) < 4096 and brief["exit_code"] == 1
+    full = json.load(open(tmp_path / "r" / "score-duckdb-r1.json"))
+    assert full["error_lines"] == brief["error_lines"] and "line 0" in full["stderr"]
+    # The live record keeps them, and the table's row shows the last line.
+    live = run.live_record(spec, brief)
+    assert live["error_lines"] == brief["error_lines"] and not live["ok"]
+    s = summary_of([live, rec("moruna066", 1, 9.0)])
+    assert s["jobs"]["score"]["engines"]["duckdb"]["failures"] == [
+        {"error": "_duckdb.IOException: IO Error: Problem with the SSL CA cert", "runs": ["score-duckdb-r1"]}]
+    assert "| no run passed | 0/1: _duckdb.IOException: IO Error: Problem with the SSL CA cert |" in table.render(s)
+    # With nothing on stderr: the RESULT's error, else the exit code.
+    assert measure.error_lines("", {"error": "E: x"}, 1) == "E: x"
+    assert measure.error_lines("\n\n", None, -9) == "no output on stderr; exit -9"
+    assert len(measure.error_lines("y" * 299 + "\n" + ("z" * 299 + "\n") * 10, None, 1)) <= measure.ERROR_BYTES
+
+
+def test_each_failed_runs_error_in_one_line_on_its_row():
+    one = {"spec": {"id": "a"}, "ok": False, "error_lines": "Traceback\n  File x\nValueError: no | pipe\n\n"}
+    two = {"spec": {"id": "b"}, "ok": False, "result": {"error": "Unsupported\n  WASB"}}
+    three = {"spec": {"id": "c"}, "ok": False, "exit_code": 1}
+    four = {"spec": {"id": "d"}, "ok": False, "diagnostic": "the job stopped"}
+    five = {"spec": {"id": "e"}, "ok": False}
+    assert [collect.error_line(r) for r in (one, two, three, four, five)] == [
+        "ValueError: no | pipe", "Unsupported WASB", "exit 1", "the job stopped", "no error recorded"]
+    fails = collect.failures([one, dict(one, spec={"id": "a2"}), two, {"spec": {"id": "ok"}, "ok": True}])
+    assert fails == [{"error": "ValueError: no | pipe", "runs": ["a", "a2"]}, {"error": "Unsupported WASB", "runs": ["b"]}]
+    row = {"ok": 1, "runs": 4, "failures": fails}
+    assert table.runs_cell(row) == "1/4: ValueError: no \\| pipe (2 of 4); Unsupported WASB (1 of 4)"
+    assert table.runs_cell({"ok": 2, "runs": 2, "failures": []}) == "2/2"
+    assert table.cell("a  b\nc" + "d" * 300, 20) == "a b c" + "d" * 12 + "..."
+
+
+def test_runs_of_some_engines_alone_with_the_reference_made_again():
+    p = nyc_plan()
+    every = plans.runs(p, run.DATA)
+    assert plans.select(p, every, None) == (every, [])
+    four, added = plans.select(p, every, ["ray", "dask", "duckdb", "spark"])
+    assert added == [f"{j}-moruna066-r0" for j in p["jobs"]]
+    assert {r["engine"] for r in four} == {"ray", "dask", "duckdb", "spark", "moruna066"}
+    assert len(four) == 4 * 4 * 6 + 4 and [r["id"] for r in four] == [r["id"] for r in every if r in four]
+    # Each job's reference run comes first in it, before any run checked against it.
+    for job in p["jobs"]:
+        assert next(r for r in four if r["job"] == job)["id"] == f"{job}-moruna066-r0"
+    node, added = plans.select(p, every, ["moruna-node"])
+    assert {r["engine"] for r in node} == {"moruna-node", "moruna066"} and len(node) == 24 + 4
+    # 0.6.6 among them: its own runs, the noise pairs too, and nothing added.
+    six, added = plans.select(p, every, ["moruna066"])
+    assert added == [] and len(six) == 4 * 6 + 4 * 4
+    for bad in (["nope"], []):
+        with pytest.raises(plans.PlanError, match="--engines"):
+            plans.select(p, every, bad)
+
+
+def dry_engines(tmp_path, engines, *extra):
+    return dry(tmp_path, "--engines", engines, *extra)
+
+
+def test_the_dry_run_of_the_four_linux_engines(tmp_path):
+    """`--engines ray,dask,duckdb,spark`: no node, no image; the Linux machine installs those four
+    and what every check needs, makes 0.6.6's reference again, and runs those engines' runs."""
+    lines = dry_engines(tmp_path, "ray,dask,duckdb,spark")
+    text = "\n".join(lines)
+    steps = [line for line in lines if line.startswith("[")]
+    assert "-n node.vhd" not in text and "vm create -n moruna-node" not in text and "/v1/" not in text
+    assert "1 machines of Standard_D4s_v4 at once, 4 vCPUs" in text
+    assert "--engines ray,dask,duckdb,spark: those engines' runs of the plan alone" in text
+    assert "0.6.6's learning runs, which make again the reference" in text and "score-moruna066-r0" in text
+    assert "the Linux machine installs harness, moruna066, rust-pool, duckdb, ray, spark, dask" in text
+    live = [line.rsplit("/live/", 1)[1][:-len(".json")] for line in steps if "/live/" in line]
+    four, _ = plans.select(nyc_plan(), plans.runs(nyc_plan()), ["ray", "dask", "duckdb", "spark"])
+    assert live == [r["id"] for r in four] and len(live) == 100
+    starts = [s for s in steps if "run-command create" in s and "batch.py --name" in s]
+    assert [s.split("batch.py --name ")[1].split()[0] for s in starts] == ["setup", "runs"]
+    assert not (tmp_path / "results").exists()
+
+
+def test_the_dry_run_of_the_node_alone(tmp_path):
+    """`--engines moruna-node`, a new image: the node's runs, 0.6.6's reference made again on the
+    Linux machine, and the node's outputs checked against it; no other engine runs."""
+    vhd, tasks = fake_inputs(tmp_path)
+    lines = dry_engines(tmp_path, "moruna-node", "--vhd", vhd, "--tasks", tasks, "--from", "203.0.113.9")
+    text = "\n".join(lines)
+    steps = [line for line in lines if line.startswith("[")]
+    assert "the Linux machine installs harness, moruna066, rust-pool;" in text
+    live = [line.rsplit("/live/", 1)[1][:-len(".json")] for line in steps if "/live/" in line]
+    assert live == [f"{j}-moruna066-r0" for j in nyc_plan()["jobs"]]
+    assert sum(" POST https://<node-address>/v1/jobs " in line for line in steps) == 24
+    starts = [s for s in steps if "run-command create" in s and "batch.py --name" in s]
+    assert [s.split("batch.py --name ")[1].split()[0] for s in starts] == ["setup", "runs", "checks"]
+    with pytest.raises(SystemExit):
+        dry_engines(tmp_path, "nope")
+
+
+def test_a_whole_run_of_some_engines_and_its_table(tmp_path):
+    """The rerun of the four Linux engines against fakes: only their runs and the reference's;
+    its own table has their rows alone."""
+    args = Args()
+    args.engines = ["ray", "dask", "duckdb", "spark"]
+    x = Fake(str(tmp_path))
+    run.Bench(nyc_plan(), x, azure.Cloud("202611180900"), args, str(tmp_path), "/s").go()
+    assert x.started == ["setup", "runs"] and x.node.jobs == 0
+    assert x.uploaded["setup"][1]["env"]["ENGINES"] == "harness,moruna066,rust-pool,duckdb,ray,spark,dask"
+    assert {s["id"].rsplit("-r", 1)[0].split("-", 1)[1] for s in x.uploaded["runs"]} == {
+        "moruna066", "ray", "dask", "duckdb", "spark"}
+    rows = x.summary["jobs"]["score"]["engines"]
+    assert list(rows) == ["duckdb", "ray", "spark", "dask"] and rows["ray"]["runs"] == 5
+    log = open(tmp_path / "benchmark-log.md").read()
+    assert "- Engines: ray, dask, duckdb, spark alone (--engines) and 0.6.6's learning runs, the reference" in log
+    assert "Node image" not in log
+
+
+def test_the_setup_refuses_to_go_on_when_an_engine_did_not_install(tmp_path):
+    args = Args()
+    args.engines = ["ray", "duckdb"]
+    x = Fake(str(tmp_path), not_installed=("ray",))
+    with pytest.raises(RuntimeError, match="the setup did not install ray, so the run stops before any measured run: "
+                                           "ray: ray installs and imports on none of CPython"):
+        run.Bench(nyc_plan(), x, azure.Cloud("202611180900"), args, str(tmp_path), "/s").go()
+    assert x.started == ["setup"] and not (tmp_path / "live").exists()
+    assert json.load(open(tmp_path / "setup.json"))["installed"]["ray"] is False
+    assert x.azs[-2].startswith("az group delete") and x.logged is False
+
+
+def test_a_rerun_writes_its_stamp_and_engines(tmp_path, monkeypatch):
+    """A real run's directory holds run.json, which orders it when --table merges; a run without
+    the node needs no image, tasks or address."""
+    made = []
+
+    class Stub:
+        def __init__(self, plan, x, cloud, a, results, secrets):
+            made.append((a.engines, results))
+
+        def go(self):
+            pass
+    monkeypatch.setattr(run, "Bench", Stub)
+    out = io.StringIO()
+    assert run.main(["--plan", "nyc-2024", "--go", "--engines", "ray,dask", "--stamp", "202611190800", "--results",
+                     str(tmp_path / "rerun")], out=out) == 0
+    assert made == [(["ray", "dask"], str(tmp_path / "rerun"))]
+    assert json.load(open(tmp_path / "rerun" / "run.json")) == {"stamp": "202611190800", "plan": "nyc-2024",
+                                                                "engines": ["ray", "dask"]}
+    with pytest.raises(SystemExit, match="a real run needs --vhd"):
+        run.main(["--plan", "nyc-2024", "--go", "--engines", "moruna-node", "--results", str(tmp_path / "n")], out=out)
+
+
+def results_dir(path, records, stamp=None, setup=None):
+    os.makedirs(path / "live", exist_ok=True)
+    for r in records:
+        json.dump(r, open(path / "live" / f"{r['spec']['id']}.json", "w"))
+    if stamp:
+        (path / "run.json").write_text(json.dumps({"stamp": stamp}))
+    if setup:
+        (path / "setup.json").write_text(json.dumps(setup))
+    return str(path)
+
+
+def test_the_table_merges_results_directories_newest_per_run(tmp_path):
+    """Run 3, then a rerun of DuckDB: the rerun's records replace run 3's for the same runs, the
+    others stay; the directories ordered by their stamps whatever order they are given in."""
+    old = results_dir(tmp_path / "202611181311", [rec("moruna066", 1, 9.0), rec("duckdb", 1, None, ok=False),
+                                                  rec("polars", 1, 15.0)],
+                      setup={"wheel_066": "built", "wheel_066_name": "w.whl", "wheel_066_sha256": WHEEL_SHA})
+    new = results_dir(tmp_path / "rerun", [rec("duckdb", 1, 12.0), rec("moruna066", 0, 9.5)], stamp="202611190800")
+    p = nyc_plan()
+    out = io.StringIO()
+    assert run.main(["--plan", "nyc-2024", "--table", new, old, "--results", str(tmp_path / "merged")], out=out) == 0
+    text = out.getvalue()
+    assert text.startswith(f"# 4 of {len(plans.runs(p))} runs, the newest of each from 2 results directories; "
+                           f"written to {tmp_path / 'merged'}")
+    assert "the directories by their stamps, oldest first:" in text
+    assert text.index(f"`{old}` (202611181311): 2 runs; 0.6.6's wheel: built") < text.index(f"`{new}` (202611190800): 2 runs")
+    assert "| DuckDB | python | 12.0 |" in text and "| Polars | python | 15.0 |" in text
+    merged = json.load(open(tmp_path / "merged" / "merged.json"))
+    assert merged["dirs"] == [old, new] and merged["runs"]["score-duckdb-r1"] == new
+    assert merged["runs"]["score-polars-r1"] == old
+    assert (tmp_path / "merged" / "table.md").read_text() == text.split("\n\n", 1)[1]
+    assert json.load(open(tmp_path / "merged" / "summary.json"))["sources"][1]["stamp"] == "202611190800"
+    assert not (tmp_path / "202611181311" / "table.md").exists()
+    # A directory with no stamp: the order given, oldest first, and said so.
+    loose = results_dir(tmp_path / "loose", [rec("duckdb", 1, 30.0)])
+    records, order, by_stamp = collect.merge([loose, old])
+    assert (order, by_stamp) == ([loose, old], False)
+    assert next(r for r in records if r["spec"]["id"] == "score-duckdb-r1")["from"] == old
+    out = io.StringIO()
+    assert run.main(["--plan", "nyc-2024", "--table", old, loose], out=out) == 0
+    assert "a directory has no stamp, so in the order given" in out.getvalue() and "| DuckDB | python | 30.0 |" in out.getvalue()
+    assert not (tmp_path / "loose" / "summary.json").exists()
+    (tmp_path / "bad").mkdir()
+    (tmp_path / "bad" / "run.json").write_text("[1]")
+    assert collect.stamp_of(str(tmp_path / "bad")) is None
+    with pytest.raises(SystemExit):
+        run.main(["--plan", "nyc-2024", "--table", old, str(tmp_path / "none")], out=io.StringIO())
+    # The merged table never goes into a directory it merges: that run's own table.md stays.
+    with pytest.raises(SystemExit):
+        run.main(["--plan", "nyc-2024", "--table", old, new, "--results", old], out=io.StringIO())
+    assert not (tmp_path / "202611181311" / "table.md").exists()
+
+
+class Unmeasured(FakeNode):
+    """A node whose report did not measure the job's CPU (run 3's: usage_measured false, 0.0)."""
+
+    def stream(self, method, path, token=None):
+        for line in super().stream(method, path, token):
+            if line.startswith("data: ") and '"type": "report"' in line:
+                body = json.loads(line[6:])
+                body["report"] = dict(body["report"], resources={"cpu_core_s": 0.0, "usage_measured": False})
+                line = "data: " + json.dumps(body)
+            yield line
+
+
+def test_the_nodes_cpu_is_not_a_zero_it_did_not_measure(tmp_path):
+    """The node's CPU-seconds are its report's resources.cpu_core_s when it measured them; run 3's
+    0.0 with usage_measured false is no measurement: blank in the table, and the bar's CPU half
+    unchecked rather than passed."""
+    _, tasks = fake_inputs(tmp_path)
+    args = Args()
+    args.tasks = tasks
+    x = Fake(str(tmp_path), node=Unmeasured())
+    run.Bench(nyc_plan(), x, azure.Cloud("202611180900"), args, str(tmp_path), "/s").go()
+    node_rec = json.load(open(tmp_path / "node" / "score-moruna-node-r1.json"))
+    assert node_rec["cpu_s"] is None and node_rec["cpu_by"].startswith("not measured: the report's resources")
+    text = open(tmp_path / "table.md").read()
+    assert "| Moruna 0.7, the node | rust | 3.0 | 0.75 |  | 3.00 |" in text
+    assert "- the bar: unchecked: 1.50x the best engine's operational time" in text
+    assert "Moruna's CPU-seconds were not measured" in text
+    # A measured run keeps its figure, and one slower than the bar misses whatever its CPU.
+    assert json.load(open(tmp_path / "node" / "score-moruna-node-r1.json"))["cpu_by"] != "the engine's report"
+    s = summary_of([rec("moruna-node", 1, 9.0, cpu=None), rec("moruna066", 1, 9.5), rec("moruna066-rust", 1, 9.6),
+                    rec("duckdb", 1, 3.0)])
+    bar = next(v for v in table.verdicts(s["jobs"]["score"]["engines"]) if v["step"] == "bar")
+    assert bar["passed"] is False and "CPU not measured against the least of any row" in bar["text"]
+
+
+def test_a_directory_markers_blob_is_not_the_output(tmp_path):
+    """ABFS over the Blob API leaves an empty blob at Spark's output prefix beside the files under
+    it: the download takes the files, and a prefix that names one blob takes that blob."""
+    import pyarrow.fs as pafs
+    import store as stores
+
+    class Info:
+        def __init__(self, path, kind, size=0):
+            self.path, self.type, self.size = path, kind, size
+
+    class FS:
+        def __init__(self, files, marker):
+            self.files, self.marker = files, marker
+
+        def get_file_info(self, what):
+            if isinstance(what, pafs.FileSelector):
+                if what.base_dir in self.files:
+                    raise NotADirectoryError(what.base_dir)
+                return [Info(p, pafs.FileType.File, 5) for p in self.files if p.startswith(what.base_dir + "/")]
+            kind = pafs.FileType.File if what in self.files or what == self.marker else pafs.FileType.NotFound
+            return Info(what, kind, 0 if what == self.marker else 5)
+
+    copied = []
+
+    class S(stores.Store):
+        def pyarrow_fs(self):
+            return fs
+    import unittest.mock as mock
+    st = S("acct", "KEY", "data")
+    d = str(tmp_path / "d")
+    fs = FS(["data/out/x/_SUCCESS", "data/out/x/part-0.parquet"], marker="data/out/x")
+    with mock.patch.object(pafs, "copy_files", lambda src, dst, source_filesystem: copied.append((src, dst))):
+        assert st.download("out/x", d) == 10
+        assert copied == [("data/out/x/_SUCCESS", f"{d}/_SUCCESS"), ("data/out/x/part-0.parquet", f"{d}/part-0.parquet")]
+        copied.clear()
+        fs = FS(["data/nyc/a.parquet"], marker=None)
+        assert st.download("nyc/a.parquet", d) == 5 and copied == [("data/nyc/a.parquet", f"{d}/a.parquet")]
+        copied.clear()
+        assert st.download("nyc/none", d) == 0 and copied == []
+    # The markers above a run's output are deleted before it starts: pyarrow's Azure filesystem
+    # takes them for files, and Ray's writer and the Rust pool's upload fail under one
+    # ("Not a directory: 'data/out'", the emulator, 2026-11-18).
+    fs = FS(["data/out/x/part-0.parquet", "data/out/y/z"], marker="data/out")
+    deleted = []
+    fs.delete_file = deleted.append
+    assert st.drop_markers("out/new-run") == ["data/out"] and deleted == ["data/out"]
+    fs = FS(["data/out/x/part-0.parquet", "data/out/y/z"], marker=None)
+    fs.delete_file = deleted.append
+    assert st.drop_markers("out/y/z/run") == [] and deleted == ["data/out"]
+
+
+def test_spark_reads_and_writes_through_abfs(tmp_path, monkeypatch):
+    """Spark's session as engine.py builds it, against a stand-in pyspark: the recorded jars, the
+    account key in the session's configuration but not in the record, and abfss:// both ways."""
+    import types
+    import engine as eng
+    import store as stores
+    calls = []
+
+    class Chain:
+        def __getattr__(self, name):
+            def step(*a, **k):
+                calls.append((name, a))
+                return self
+            return step
+
+        @property
+        def builder(self):
+            return self
+
+        @property
+        def sparkContext(self):  # noqa: N802 (pyspark's name)
+            return self
+
+        @property
+        def read(self):
+            return self
+
+        @property
+        def write(self):
+            return self
+
+    chain = Chain()
+    sql = types.ModuleType("pyspark.sql")
+    sql.SparkSession = chain
+    pyspark = types.ModuleType("pyspark")
+    pyspark.__version__, pyspark.sql = "4.3.0", sql
+    monkeypatch.setitem(sys.modules, "pyspark", pyspark)
+    monkeypatch.setitem(sys.modules, "pyspark.sql", sql)
+    for k in ("PYSPARK_PYTHON", "PYSPARK_DRIVER_PYTHON"):  # spark() sets them; restored after
+        monkeypatch.setenv(k, "")
+    (tmp_path / "installed.json").write_text(json.dumps({"spark": {"jars": ["/ivy/jars/hadoop-azure.jar"]}}))
+
+    class A:
+        mem_gib, cpus, tmp, root, workload = 2, 2, str(tmp_path / "t"), str(tmp_path), "score"
+        inputs, out = ["nyc/a.parquet"], "out/score-spark-r1"
+    marks, res = {}, {}
+    eng.spark(A, lambda b: b, marks, res, stores.Store("acct", "KEY", "data"))
+    configs = dict(a for name, a in calls if name == "config")
+    assert configs["spark.jars"] == "/ivy/jars/hadoop-azure.jar"
+    assert configs["spark.hadoop.fs.azure.account.key.acct.dfs.core.windows.net"] == "KEY"
+    assert configs["spark.hadoop.fs.azure.fns.account.service.type"] == "BLOB"
+    assert ("parquet", ("abfss://data@acct.dfs.core.windows.net/nyc/a.parquet",)) in calls
+    assert ("parquet", ("abfss://data@acct.dfs.core.windows.net/out/score-spark-r1",)) in calls
+    assert "KEY" not in json.dumps(res) and res["version"] == "4.3.0" and marks["done"] >= marks["start"]
+
+
+def test_a_failed_0_6_6_run_prints_its_traceback(tmp_path, monkeypatch, capsys):
+    import types
+    import engine as eng
+    fake = types.ModuleType("moruna")
+    fake.__version__ = "0.6.6"
+    fake.ParquetSource = fake.ParquetSink = fake.function = lambda *a, **k: None
+
+    def run(*a, **k):
+        raise RuntimeError("the job stopped")
+    fake.run = run
+    monkeypatch.setitem(sys.modules, "moruna", fake)
+
+    class A:
+        staging = profiles = report = ""
+        cpus, inputs, out = 1, ["/in.parquet"], str(tmp_path / "o")
+    res = {}
+    eng.moruna(A, None, {}, res, None)
+    assert res["error"] == "RuntimeError: the job stopped"
+    assert capsys.readouterr().err.splitlines()[-1] == "RuntimeError: the job stopped"
+
+
+def test_0_6_6s_rust_function_is_installed_and_imported_in_0_6_6s_environment(tmp_path, monkeypatch):
+    py = tmp_path / "venv-moruna066" / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_text("")
+    monkeypatch.setattr(install, "sh", lambda *a, **k: None)
+    monkeypatch.setattr(install, "versions", lambda python, modules: {
+        "python": "3.14.3", "gil": False, "modules": {m: "1" for m in modules}})
+    assert install.main(["--root", str(tmp_path), "--gate-src", str(tmp_path), "--engines", "moruna066-rust"]) == 0
+    got = json.load(open(tmp_path / "installed.json"))["moruna066-rust"]
+    assert got["ok"] and got["gil"] is False and set(got["modules"]) == {"moruna_gate", "pyarrow", "numpy"}
+
+
+def test_measure_drops_a_marker_above_its_output_first(tmp_path, monkeypatch):
+    """An empty blob where a run's output prefix has a directory goes before the run, outside
+    every timing, and the record says so."""
+    import store as stores
+    blob = tmp_path / "blob"
+    st = LocalStore(blob)
+    st.upload(str(fixture_parquet(tmp_path)), "nyc/in.parquet")
+    (blob / "data" / "out").write_bytes(b"")
+    monkeypatch.setattr(stores.Store, "from_env", classmethod(lambda cls, env=None: st))
+    src = os.path.join(FIX, "score", "main.expected.arrow")
+    monkeypatch.setattr(measure, "command", lambda spec, root, out, flist, tmp, report: [
+        sys.executable, "-c", stand_in(src, True), out])
+    spec = {"id": "score-ray-r1", "engine": "ray", "workload": "score", "files": [], "cpus": 1, "mem_gib": 1,
+            "inputs": ["nyc/in.parquet"], "output": "out/score-ray-r1", "env": {"BLOBROOT": str(blob)}}
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    assert measure.main(["run", "--spec", str(tmp_path / "spec.json"), "--root", str(tmp_path / "eng"), "--results",
+                         str(tmp_path / "r"), "--work", str(tmp_path / "w"),
+                         "--reference-json", str(reference_json(tmp_path))]) == 0
+    r = json.load(open(tmp_path / "r" / "score-ray-r1.json"))
+    assert r["ok"] and r["markers_dropped"] == ["data/out"] and (blob / "data" / "out" / "score-ray-r1").is_dir()

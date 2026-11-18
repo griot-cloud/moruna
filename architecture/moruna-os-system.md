@@ -876,6 +876,14 @@ workload. Nothing is tuned for a benchmark.
   - the output's canonical hash, checked against 0.6.6's.
 - **Jobs:** the four NYC taxi jobs on 2024 (41.2M rows) first. FineWeb and Overture follow when
   NYC holds.
+- **Interpreters:** each Python engine runs on the newest CPython it supports, found by trying it:
+  the newest on which its packages install and its modules import. Its version and GIL state are
+  kept with its results. One interpreter for all could not hold. 0.6.6's wheel is built for
+  CPython 3.14t alone, which is free-threaded. The others' newest supported versions differ. On
+  2026-11-18, Ray 2.60.0's `ray.data` imported `typing_extensions` without depending on it. Only
+  a dependency below CPython 3.13 brought it in, so Ray did not import on 3.13 or 3.14 and runs on
+  3.12. DuckDB, Polars, Spark and Dask install and import on 3.14. Run 3 put every engine on 3.14,
+  and Ray and Dask did not install.
 - **The bar:** first faster than 0.6.6 on every job, then at least 1.5x the best engine on
   operational time, with CPU-seconds no worse.
 
