@@ -438,8 +438,9 @@ tr -d '\r' < <RUN>/console.log | grep -a -q 'moruna: cloud openstack instance '
   `192.168.77.0/24`: the floating IP is the router's, outside the server.
 - **Create-to-ready time** (1E) is `seen.at` less `created.at`, in seconds, to within a round of
   the loop. `boot_ms` is on the `ready` line.
-- **`moruna: fatal <stage>: <reason>`** is the node refusing to run. It then powers off, and the
-  server shows `SHUTOFF`.
+- **`moruna: fatal <stage>: <reason>`** is the node refusing to run. It stays halted for 60 s so
+  the console can still be read (Nova serves it only while the server runs), then powers off, and
+  the server shows `SHUTOFF` about 15 s after that.
 - **`root.ecam: the firmware describes no PCI configuration space (ACPI MCFG)`** is the core on
   a machine that is not q35 (`kernel/core/src/boot.rs`): Servercore ignored `hw_machine_type`.
   Stop and report (1E).

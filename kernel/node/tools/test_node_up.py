@@ -30,7 +30,7 @@ for argument in "$@"; do
   case "$argument" in file:*) printf '%s\\n' "$STANDIN_LINE" > "${argument#file:}" ;; esac
 done
 if [ -n "${STANDIN_EXIT:-}" ]; then exit 0; fi
-exec sleep 60
+exec sleep 120
 """
 
 
@@ -76,7 +76,7 @@ class NodeUp(unittest.TestCase):
     def run_script(self, script, *arguments, line="", extra=None):
         env = {"PATH": f"{self.root / 'bin'}:/usr/bin:/bin", "STANDIN_LINE": line, **(extra or {})}
         return subprocess.run([self.bash, str(script), *arguments], capture_output=True, text=True,
-                              env=env, timeout=90, check=False)
+                              env=env, timeout=150, check=False)
 
     def up(self, *arguments, line="moruna: network wan 169.254.169.15/24 gateway 169.254.169.254", extra=None):
         return self.run_script(UP, str(self.out), *arguments, line=line, extra=extra)
@@ -141,8 +141,8 @@ class NodeUp(unittest.TestCase):
         started = time.monotonic()
         result = self.up("1", line="moruna: fatal network: no DHCP lease within 30 s")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("did not power off within 30 s", result.stderr)
-        self.assertGreaterEqual(time.monotonic() - started, 29)
+        self.assertIn("did not power off within 90 s", result.stderr)
+        self.assertGreaterEqual(time.monotonic() - started, 89)
         self.assertFalse((self.out / "qemu.pid").exists())
 
     def test_qemu_ending_first_is_a_failure(self):
