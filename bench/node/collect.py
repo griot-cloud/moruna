@@ -9,8 +9,9 @@ as one and encode and write as one.
 
 `summarise` takes, per job and engine, the median over the measured repeats (`repeat` 1 or more;
 the learning run and the noise pairs left out) of operational time, start-up, CPU-seconds and peak
-memory; whether every output matched; each failed run's own error (`failures`: the last line of
-its engine's stderr); and the session's noise, 0.6.6 against itself.
+memory; its interpreter (`python`: the CPython version and GIL state its runs recorded); whether
+every output matched; each failed run's own error (`failures`: the last line of its engine's
+stderr); and the session's noise, 0.6.6 against itself.
 
 `merge` reads several results directories as one (work item 6.2c: a rerun of some engines, or of
 the node with a new image, beside the run it completes): the newest record of each run.
@@ -24,6 +25,9 @@ import plan as plans
 
 # The split's stages (6C): the report's six, then runner_split.py's two joined ones.
 SPLIT = ("read_s", "decode_s", "function_s", "encode_s", "write_s", "wait_s", "read_decode_s", "encode_write_s")
+# The engines that run no Python interpreter: the node's function is a native program, the Rust
+# pool a binary.
+NO_PYTHON = ("moruna-node", "rust-pool")
 
 
 def report_split(report: dict) -> dict:
@@ -103,6 +107,27 @@ def error_line(rec: dict) -> str:
     return f"exit {rec['exit_code']}" if rec.get("exit_code") is not None else "no error recorded"
 
 
+def interpreter(runs: list, engine: str) -> str:
+    """An engine's interpreter for the table's Python column: its CPython version and whether it
+    has the GIL, as its runs recorded them (`3.14.3, GIL`; `3.14.3, free-threaded` for 0.6.6);
+    `none` for an engine that runs no Python; empty when no run told. Engines differ: each runs on
+    the newest CPython it installs on (install.py). Runs of two setups, in a merged table, give
+    each distinct one."""
+    if engine in NO_PYTHON:
+        return "none"
+    seen = []
+    for r in runs:
+        result = r.get("result") or {}
+        version = r.get("python") or result.get("python")
+        if not version:
+            continue
+        gil = r["gil"] if r.get("gil") is not None else result.get("gil")
+        text = f"{version}, {'free-threaded' if gil is False else 'GIL'}"
+        if text not in seen:
+            seen.append(text)
+    return "; ".join(seen)
+
+
 def failures(runs: list) -> list:
     """The failed runs' errors, each distinct line once with the runs that gave it."""
     out = {}
@@ -146,6 +171,7 @@ def summarise(records, plan: dict) -> dict:
             data = sorted({r.get("data") for r in runs if r.get("data")})
             table[engine] = {
                 "label": plans.ENGINES[engine]["label"], "function": plans.ENGINES[engine]["function"],
+                "python": interpreter(runs, engine),
                 "runs": len(runs), "ok": len(ok),
                 # What the engine was given (the PM: each platform's own on the same machine), and
                 # how it reached the data: its own Blob reader, or a local copy timed apart.
