@@ -157,7 +157,7 @@ fn kd_t2_rust_is_not_registered() {
         e.to_string(),
         refusal(SpecError::new(
             "kernels[0].kind",
-            "no function kind `rust` is registered; this build runs image, package, std",
+            "no function kind `rust` is registered; this build runs function, image, package, std",
         ))
         .to_string()
     );
@@ -388,7 +388,10 @@ fn kd_t6_listing() {
     assert_eq!(listing.moruna, env!("CARGO_PKG_VERSION"));
     let names =
         |list: &[Declaration]| -> Vec<String> { list.iter().map(|d| d.name.clone()).collect() };
-    assert_eq!(names(&listing.kernels), ["image", "package", "std"]);
+    assert_eq!(
+        names(&listing.kernels),
+        ["function", "image", "package", "std"]
+    );
     let sinks = ["arrow_ipc", "image", "parquet", "tensor"];
     let sources = ["arrow_ipc", "image", "parquet", "tensor"];
     assert_eq!(names(&listing.sinks), sinks);

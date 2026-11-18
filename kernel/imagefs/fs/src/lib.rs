@@ -6,6 +6,8 @@
 //! - [`volume`]: one layer's nodes, names and extents, read through verified pages;
 //! - [`overlay`]: the layers merged, whiteouts and opaque directories applied;
 //! - [`fs`]: paths resolved over the merged image and a task's scratch directory;
+//! - [`attached`]: an image's layer files mounted where they lie in one read-only region, a
+//!   Moruna image archive's memory object (item 3.6);
 //! - [`cache`]: the bounded page cache that reads a page only when it is touched and
 //!   believes it only once it matches its hash;
 //! - [`map`]: how a mapping of a file's pages is filled;
@@ -18,6 +20,7 @@
 
 extern crate alloc;
 
+pub mod attached;
 pub mod cache;
 pub mod chunks;
 pub mod error;

@@ -169,12 +169,40 @@ impl Wire for Stats {
 /// One directory entry: its name, its kind and its inode number.
 pub type Dirent = (Bytes, u8, u64);
 
+/// (3.1, item 3.6) One layer of an image `attach` mounts in place: where its layer file lies in
+/// the image's memory object (a whole number of pages from its first byte), its length in pages,
+/// and the seal its header must have, 32 bytes: a Moruna image archive's span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attached {
+    pub offset: u64,
+    pub pages: u64,
+    pub seal: Bytes,
+}
+
+impl Wire for Attached {
+    fn encode(self, e: &mut Encoder) -> Result<(), WireError> {
+        self.offset.encode(e)?;
+        self.pages.encode(e)?;
+        self.seal.encode(e)
+    }
+    fn decode(d: &mut Decoder<'_>) -> Result<Self, WireError> {
+        Ok(Attached {
+            offset: u64::decode(d)?,
+            pages: u64::decode(d)?,
+            seal: Bytes::decode(d)?,
+        })
+    }
+}
+
+/// The most layers one `attach` mounts.
+pub const ATTACH_LAYERS_MAX: usize = 64;
+
 moruna_svc::protocol! {
     /// A task's root filesystem: the image, read only, and its scratch directory.
     pub protocol imagefs {
         name = "moruna.imagefs";
         major = 3;
-        minor = 0;
+        minor = 1;
         requests {
             /// Opens `path` (absolute) with `open` flags; `mode` is a new file's. The
             /// file's number on this connection and what it is.
@@ -223,6 +251,15 @@ moruna_svc::protocol! {
             /// Returned channel is unconnected; its protocol is imagefs3 and writes
             /// are refused independently by the serving readonly session.
             18 => fn export_directory(path: Bytes) -> moruna_svc::Channel;
+            /// (3.1, item 3.6) A root over an image attached in place: `image`, a read-only
+            /// memory object holding the image's layer files, each where `layers` says, lowest
+            /// first (a Moruna image archive and its spans). Each is mounted where it lies and
+            /// refused, with nothing mounted, when its header is not sealed as given; a page is
+            /// read only when something touches it and believed only once it matches its hash.
+            /// The returned channel is unconnected; its protocol is imagefs3, and it is a task's
+            /// connection to that image, with a scratch directory at `/tmp` of its own. The
+            /// image lives until the last connection to it closes.
+            19 => fn attach(image: Memory, layers: Vec<Attached>) -> moruna_svc::Channel;
         }
         events {}
         errors {
@@ -779,7 +816,7 @@ mod account_protocol_version_tests {
     fn kb5_previous_unaccounted_major_is_refused_before_requests() {
         use moruna_svc::protocol::{ProtocolId, Refusal};
         let current = super::imagefs::ID;
-        assert_eq!((current.major, current.minor), (3, 0));
+        assert_eq!((current.major, current.minor), (3, 1));
         let old = ProtocolId::new(current.name, 2, 0);
         assert_eq!(current.accepts(&old.hello()), Err(Refusal::MajorMismatch));
         assert_eq!(old.accepts(&current.hello()), Err(Refusal::MajorMismatch));
@@ -793,5 +830,35 @@ mod account_protocol_version_tests {
             Err(Refusal::MajorMismatch)
         );
         assert_eq!(current.accepts(&current.hello()), Ok(()));
+        // 3.1 (item 3.6) adds `attach`: a 3.0 peer is still one of the same major.
+        let three_zero = ProtocolId::new(current.name, 3, 0);
+        assert_eq!(current.accepts(&three_zero.hello()), Ok(()));
+    }
+
+    #[test]
+    fn an_attached_layer_crosses_the_wire_as_it_was_sent() {
+        use moruna_svc::{Decoder, Encoder, Wire};
+        let layers = alloc::vec![
+            super::Attached {
+                offset: 4096,
+                pages: 3,
+                seal: super::Bytes(alloc::vec![7; 32]),
+            },
+            super::Attached {
+                offset: 4 * 4096,
+                pages: 1,
+                seal: super::Bytes(alloc::vec![9; 32]),
+            },
+        ];
+        let mut e = Encoder::new();
+        layers.clone().encode(&mut e).unwrap();
+        let bytes = e.into_control_bytes().unwrap();
+        let mut d = Decoder::new(&bytes, &mut []);
+        assert_eq!(
+            alloc::vec::Vec::<super::Attached>::decode(&mut d).unwrap(),
+            layers
+        );
+        assert_eq!(d.finish(), Ok(()));
+        assert!(super::imagefs::REQUESTS.contains(&19));
     }
 }

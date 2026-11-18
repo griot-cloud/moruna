@@ -164,6 +164,8 @@ impl Task {
     ) -> Result<(Task, Channel, Handle), linux::Error> {
         let name = process_name(exe);
         let assets = plane.as_mut().and_then(|p| p.assets.take());
+        // Its own root, an image attached in place (4.0, item 3.6), or the boot image's.
+        let root = plane.as_mut().and_then(|p| p.root.take());
         // The account its starter carved for it: the kernel charges its process and
         // everything the process causes to exist to it (SDD 20 f.18).
         let (grant, plane, account) = match (grant, plane) {
@@ -194,13 +196,16 @@ impl Task {
         };
         let (mut fs, process) = {
             let s = shared.borrow();
-            let channel = moruna_svc::connect(&s.fs).map_err(|e| {
-                println!(
-                    s.out,
-                    "linux: FAIL: connecting to the image filesystem: {e:?}"
-                );
-                linux::Error::NoProcess
-            })?;
+            let channel = match root {
+                Some(channel) => channel,
+                None => moruna_svc::connect(&s.fs).map_err(|e| {
+                    println!(
+                        s.out,
+                        "linux: FAIL: connecting to the image filesystem: {e:?}"
+                    );
+                    linux::Error::NoProcess
+                })?,
+            };
             let mut fs =
                 imagefs::Client::connect(channel, deadline_in(300 * SECONDS)).map_err(|e| {
                     println!(s.out, "linux: FAIL: hello to the image filesystem: {e:?}");

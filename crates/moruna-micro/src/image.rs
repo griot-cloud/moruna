@@ -1,7 +1,7 @@
 //! The image an `image` stage runs on, as the kernel attached it (SDD 30 f.12): the record the
 //! launcher wrote beside its layers, which the engine is granted as the data handle `image`,
 //! and the seals of the layers the personality's image filesystem mounted, which the
-//! personality's `layers` (`moruna.linux` 3.0) says. `moruna_image::record::Record::verify`
+//! personality's `layers` (`moruna.linux` 4.0) says. `moruna_image::record::Record::verify`
 //! checks one against the other and against the entry's reference; this module only fetches
 //! them, once a process.
 

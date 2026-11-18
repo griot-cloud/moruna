@@ -5,6 +5,8 @@ extern crate alloc;
 use alloc::{string::String, vec::Vec};
 use moruna_svc::Handle;
 
+pub mod functions;
+
 pub const MAX_JOBS: usize = 64;
 pub use moruna_node::MAX_JOB_GRANTS as MAX_GRANTS;
 pub const RUNNING: u32 = 0;

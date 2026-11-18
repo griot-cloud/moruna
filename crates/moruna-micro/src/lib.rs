@@ -4,7 +4,7 @@
 //! On the kernel the engine is a Linux program: the root workspace's `moruna`, built static for
 //! musl, which the Linux personality runs unmodified (SDD 28). Its starter (the engine's
 //! supervisor, from the boot manifest) asks the personality to run it with `run_granted`
-//! (`moruna.linux` 3.0), so the process holds the handles the manifest names, on a start page
+//! (`moruna.linux` 4.0), so the process holds the handles the manifest names, on a start page
 //! whose address its auxiliary vector carries, and is told its machine has the memory budget the
 //! manifest names. Everything a Linux program does (threads, files, clocks, its event loop) goes
 //! through the personality as for any program; what only the kernel has, the engine reaches with
@@ -21,7 +21,10 @@
 //! - [`task`]: an `image` stage as a task of the data plane: a process the personality starts
 //!   with `run_plane`, whose batches move through [`moruna_plane::KernelPlane`] as pages, whose
 //!   port calls go to the stage's ports (the embedder's, over the host protocol), and whose end,
-//!   refusals and cancellation are the stage's, as on Linux.
+//!   refusals and cancellation are the stage's, as on Linux;
+//! - [`functions`]: the registered functions a job uses (item 3.6), each a read-only memory
+//!   object `node-admission` gave the engine, read in place: a native program the stage maps,
+//!   or a Moruna image archive the image filesystem attaches as its task's root.
 //!
 //! The kernel's calls exist only there, for x86-64 programs: on every other target the crate
 //! says so ([`on_kernel`] is `false`) and has nothing else.
@@ -33,6 +36,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod devices;
+pub mod functions;
 pub mod layout;
 
 // The data OS's engine-side modules (`architecture/data-os-streams.md`): each is written by

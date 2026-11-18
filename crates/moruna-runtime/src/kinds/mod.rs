@@ -22,6 +22,7 @@ use serde::de::DeserializeOwned;
 
 pub mod arrow_ipc;
 pub mod conformance;
+pub mod function;
 pub mod gives;
 pub mod image;
 pub mod package;
@@ -429,8 +430,9 @@ impl Registry {
     }
 
     /// Every kind this build of the runtime has (f.1): the Arrow IPC, Parquet and tensor sources;
-    /// the Parquet, tensor and Arrow IPC sinks; the standard kernels and function
-    /// packages. No `rust` kind is among them (KD-I7). A program adds its own with the `register_` calls.
+    /// the Parquet, tensor and Arrow IPC sinks; the standard kernels, function packages, images
+    /// and functions registered on a node. No `rust` kind is among them (KD-I7). A program adds
+    /// its own with the `register_` calls.
     pub fn standard() -> Registry {
         let mut kinds = Registry::empty();
         kinds.put_source(Arc::new(arrow_ipc::ArrowIpc));
@@ -440,6 +442,8 @@ impl Registry {
         kinds.put_kernel(Arc::new(standard::Std));
         kinds.put_kernel(Arc::new(package::Package));
         kinds.put_kernel(Arc::new(image::Image));
+        // Item 3.6: a function registered on the node, by its name.
+        kinds.put_kernel(Arc::new(function::Function));
         kinds.put_sink(Arc::new(parquet::Parquet));
         kinds.put_sink(Arc::new(tensor::Tensor));
         kinds.put_sink(Arc::new(arrow_ipc::ArrowIpc));

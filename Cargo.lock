@@ -2115,6 +2115,7 @@ dependencies = [
  "moruna-svc",
  "moruna-sys",
  "moruna-virtio",
+ "node-protocol",
  "sha2 0.11.0",
  "tracing",
  "vsock-protocol",
@@ -2133,6 +2134,16 @@ name = "moruna-net-session"
 version = "0.1.0"
 dependencies = [
  "moruna-svc",
+ "netstack-protocol",
+]
+
+[[package]]
+name = "moruna-node"
+version = "0.1.0"
+dependencies = [
+ "moruna-abi",
+ "moruna-svc",
+ "moruna-sys",
  "netstack-protocol",
 ]
 
@@ -2604,6 +2615,14 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+]
+
+[[package]]
+name = "node-protocol"
+version = "0.1.0"
+dependencies = [
+ "moruna-node",
+ "moruna-svc",
 ]
 
 [[package]]

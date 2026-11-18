@@ -11,8 +11,8 @@ pub(super) fn query(
         .map_err(|e| format!("connecting to the personality for its layers: {e:?}"))?;
     let mut client = linux::Client::connect(channel, deadline)
         .map_err(|e| format!("hello to the personality for its layers: {e:?}"))?;
-    // The canonical moruna.linux 3.0 handshake guarantees ordinal 4 in the
-    // baseline. The obsolete 1.3 minor gate would reject a valid 3.0 peer here.
+    // The canonical moruna.linux 4.0 handshake guarantees ordinal 4 in the
+    // baseline. The obsolete 1.3 minor gate would reject a valid 4.0 peer here.
     let seals = client
         .layers()
         .map_err(|e| format!("the personality's layers: {e:?}"))?;

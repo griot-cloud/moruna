@@ -212,8 +212,8 @@ fn jb_t41_extended_catalogue() {
         .add(served("judge", None, None))
         .expect("a served kind");
     let kernels: Vec<&str> = extended.names(Role::Kernel).collect();
-    assert_eq!(kernels, ["image", "judge", "package", "std"]);
-    for builtin in ["std", "package", "image"] {
+    assert_eq!(kernels, ["function", "image", "judge", "package", "std"]);
+    for builtin in ["std", "package", "image", "function"] {
         let mut taken = extended.clone();
         assert_eq!(
             taken.add(served(builtin, None, None)),
@@ -268,13 +268,13 @@ fn jb_t42_check_against_an_extended_catalogue() {
     assert_eq!(
         said(&refused),
         [
-            "tasks[2].kind: no function kind `judge` is declared; this catalogue runs image, \
-          package, std"
+            "tasks[2].kind: no function kind `judge` is declared; this catalogue runs \
+          function, image, package, std"
         ]
     );
     assert!(matches!(
         &refused[0].code,
-        RefusalCode::UnknownKind { role: Role::Kernel, known } if known == &["image", "package", "std"]
+        RefusalCode::UnknownKind { role: Role::Kernel, known } if known == &["function", "image", "package", "std"]
     ));
 
     let bad = chain(vec![json!({"kind": "judge", "limit": 0, "tone": "polite"})]);
