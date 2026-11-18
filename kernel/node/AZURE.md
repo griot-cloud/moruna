@@ -25,7 +25,10 @@ It is written for subscription `griot-dev`, region Central India (`centralindia`
   however it ends, and it refuses, before anything runs, any subscription but `griot-dev`, any
   group not named `moruna-node-*`, and a group that already exists. Its tests
   (`kernel/node/tools/test_azure_up.py`) check that this file holds every command it runs. It
-  prints each command with the time before running it, so its output is the run's transcript:
+  prints each command with the time before running it, so its output is the run's transcript.
+  Two options add steps, each marked below: `--data-disk` attaches an empty 4 GiB data disk at
+  LUN 0 (steps 4, 6 and 10), and `--job` runs a job through the API once the node is ready
+  (step 9); either goes after `--group` below. A run:
 
   ```
   kernel/node/tools/azure-up.sh --vhd <OUT>/moruna-node.vhd --run <RUN> --from <FROM> \
@@ -172,6 +175,15 @@ az disk create -n moruna-node-os -g <NAME> -l centralindia --zone 3 \
 - **`--os-type Linux`** is what Azure asks of an OS disk. It changes nothing in the node.
 - **Zone 3,** the machine's zone: a managed disk is attached only in its own zone.
 
+**With `--data-disk`:** an empty data disk, 4 GiB of StandardSSD, in the same zone. The machine
+takes it at LUN 0 (step 6), and the node serves it as `lun-0` (storvsc's names, 1F): a check
+image's `storvsc-check` reads it, writes it, restores it and runs the block suite on it.
+
+```
+az disk create -n moruna-node-data -g <NAME> -l centralindia --zone 3 --size-gb 4 \
+  --sku StandardSSD_LRS --subscription griot-dev -o none
+```
+
 ## 5. The address and the network security group
 
 A static public address in zone 3, read into `<RUN>`:
@@ -242,6 +254,18 @@ az vm create -n moruna-node -g <NAME> -l centralindia --zone 3 --size Standard_D
   logs in.
 - **`--no-wait`:** the command returns when Azure has taken the request, and `created.at` is that
   time, for step 7.
+
+**With `--data-disk`,** the same command attaches the data disk of step 4. The first data disk
+named takes LUN 0:
+
+```
+az vm create -n moruna-node -g <NAME> -l centralindia --zone 3 --size Standard_D2s_v4 \
+  --attach-os-disk moruna-node-os --os-type linux --security-type Standard \
+  --accelerated-networking false --public-ip-address moruna-node-ip --nsg moruna-node-nsg \
+  --boot-diagnostics-storage <ACCOUNT> --user-data <RUN>/node-config.json \
+  --attach-data-disks moruna-node-data --no-wait --subscription griot-dev -o none \
+  && date -u +%s > <RUN>/created.at
+```
 
 ## 7. Ready
 
@@ -362,6 +386,83 @@ curl -sS -k --max-time 10 -H "Authorization: Bearer $(cat <RUN>/token)" \
   && grep -q '"cloud":"azure"' <RUN>/node.json && cat <RUN>/node.json
 ```
 
+### With `--job`: a job
+
+A job through the API (3.2's kinds, 3B): a `rows` source of 10,000,000 rows into a `count` sink.
+It needs a token for `submit`, which covers `observe` (2C); it is made as the one above, with
+that scope and 30 minutes:
+
+```
+printf '%s' '{"v1":{"moruna_spec":1,"source":{"kind":"rows","rows":10000000},"sink":{"kind":"count"}}}' \
+  > <RUN>/job.json
+```
+
+```
+printf '{"aud":"%s","exp":%s,"scope":["submit"]}' "$(cat <RUN>/instance)" \
+  "$(( $(date -u +%s) + 1800 ))" | openssl base64 -A | tr '/+' '_-' | tr -d '=' \
+  > <RUN>/job-token.claims
+```
+
+```
+printf '%s.%s' "$(cat <RUN>/token.header)" "$(cat <RUN>/job-token.claims)" \
+  > <RUN>/job-token.signed
+```
+
+```
+openssl pkeyutl -sign -inkey <RUN>/token-key.pem -rawin -in <RUN>/job-token.signed \
+  | openssl base64 -A | tr '/+' '_-' | tr -d '=' > <RUN>/job-token.signature
+```
+
+```
+printf '%s.%s\n' "$(cat <RUN>/job-token.signed)" "$(cat <RUN>/job-token.signature)" \
+  > <RUN>/job-token
+```
+
+The engine checks the document first (`POST /v1/jobs/validate`, `{"ok":true}`), then runs it
+(`POST /v1/jobs`, `201` with the run's `id`):
+
+```
+curl -sS -k --max-time 60 -H "Authorization: Bearer $(cat <RUN>/job-token)" \
+  -H 'Content-Type: application/json' --data-binary @<RUN>/job.json \
+  "https://$(cat <RUN>/address)/v1/jobs/validate" > <RUN>/job-validate.json \
+  && cat <RUN>/job-validate.json && grep -q '"ok":true' <RUN>/job-validate.json
+```
+
+```
+curl -sS -k --max-time 60 -o <RUN>/job-submit.json -w '%{http_code}' \
+  -H "Authorization: Bearer $(cat <RUN>/job-token)" -H 'Content-Type: application/json' \
+  --data-binary @<RUN>/job.json "https://$(cat <RUN>/address)/v1/jobs" > <RUN>/job-submit.code \
+  && [ "$(cat <RUN>/job-submit.code)" = 201 ] \
+  && grep -o '"id":"[^"]*"' <RUN>/job-submit.json | head -1 | cut -d'"' -f4 > <RUN>/job.id \
+  && [ -s <RUN>/job.id ]
+```
+
+Its events over Server-Sent Events, kept in `<RUN>`, until the node closes the stream after the
+`exit` event (at most 10 minutes); the exit code must be 0:
+
+```
+curl -sS -k -N --max-time 600 -H "Authorization: Bearer $(cat <RUN>/job-token)" \
+  "https://$(cat <RUN>/address)/v1/jobs/$(cat <RUN>/job.id)/events" > <RUN>/job-events.txt; \
+  grep -a '^data: ' <RUN>/job-events.txt | grep -a '"type":"exit"' | tail -1 | cut -c7- \
+  > <RUN>/job-exit.json && cat <RUN>/job-exit.json && grep -q '"code":0[,}]' <RUN>/job-exit.json
+```
+
+The report: its one sink wrote 10,000,000 rows, and its `wall_ms` is the job's wall time, read
+from the report as JSON:
+
+```
+curl -sS -k --max-time 60 -H "Authorization: Bearer $(cat <RUN>/job-token)" \
+  "https://$(cat <RUN>/address)/v1/jobs/$(cat <RUN>/job.id)/report" > <RUN>/job-report.json \
+  && python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["sinks"][0]["rows"])' \
+  <RUN>/job-report.json > <RUN>/job.rows && [ "$(cat <RUN>/job.rows)" = 10000000 ]
+```
+
+```
+python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["wall_ms"])' \
+  <RUN>/job-report.json > <RUN>/job.wall && [ -s <RUN>/job.wall ] \
+  && printf 'job: %s rows counted, wall_ms %s\n' "$(cat <RUN>/job.rows)" "$(cat <RUN>/job.wall)"
+```
+
 ## 10. Delete everything
 
 Read the console one last time, then delete the group. That deletes everything this recipe made,
@@ -372,6 +473,13 @@ the key. `--yes` asks no question; the command returns when Azure has deleted it
 ```
 az vm boot-diagnostics get-boot-log -n moruna-node -g <NAME> --subscription griot-dev \
   > <RUN>/console.log
+```
+
+**With `--data-disk`,** its storvsc lines: the disks served, and `storvsc-check`'s steps on
+`lun-0` with how many passed, by now complete:
+
+```
+tr -d '\r' < <RUN>/console.log | grep -a -e 'storvsc: ' -e 'storvsc-check: '
 ```
 
 ```

@@ -426,7 +426,11 @@ Implements the OS design, section 2.
 - **HTTP/1.1 only,** with keep-alive and Server-Sent Events. No HTTP/2, compression, cookies or
   cross-origin headers.
 - **Limits:** 16 KiB of headers, 1 MiB of body, 64 open connections, 60 s idle. Over a limit, the
-  answer is `invalid` or `busy`, never a crash.
+  answer is `invalid` or `busy`, never a crash. Idle is the client's: the idle clock runs only
+  while the server waits on the client for a request or for bytes. A connection whose request is
+  being answered is not idle; that request's own bounds end it, such as admission's 5-minute fetch
+  and the API's 10-minute launch backstop (3E). Found by 3.6's boot: a submit waiting on a fetch
+  was closed at 60 s.
 - **Memory is bounded before any token is checked:**
   - at most 80 connections open, handshakes included; past that, a connection is closed with no
     answer;
