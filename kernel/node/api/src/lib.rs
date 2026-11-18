@@ -88,6 +88,10 @@ pub enum Error {
     Identity(bool, IdentityError),
     /// The server could not be made from its config.
     Server(String),
+    /// A request to [`TEST_EXIT_PATH`](moruna_api_server::TEST_EXIT_PATH) came: the
+    /// `cloud-test` image's way to end the process, which is no failure (work item 2.2c).
+    #[cfg(feature = "test-exit")]
+    TestExit,
 }
 
 impl fmt::Display for Error {
@@ -105,6 +109,8 @@ impl fmt::Display for Error {
             Error::Identity(true, error) => write!(f, "node config's tls: {error}"),
             Error::Identity(false, error) => write!(f, "the node's own TLS identity: {error}"),
             Error::Server(why) => write!(f, "the API server: {why}"),
+            #[cfg(feature = "test-exit")]
+            Error::TestExit => write!(f, "a request to {}", moruna_api_server::TEST_EXIT_PATH),
         }
     }
 }
@@ -266,6 +272,12 @@ pub fn run(
         }
         server.poll();
         network.borrow_mut().flush()?;
+        // `cloud-test` only (work item 2.2c): the answer to the request is sent; the process
+        // ends.
+        #[cfg(feature = "test-exit")]
+        if server.exit_requested() {
+            return Err(Error::TestExit);
+        }
         let mut deadline = network.borrow().look_at();
         if let Some(ms) = server.deadline() {
             deadline = deadline.min(ms.saturating_mul(1_000_000));

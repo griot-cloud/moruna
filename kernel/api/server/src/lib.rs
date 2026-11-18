@@ -71,6 +71,8 @@ mod token;
 mod transport;
 
 pub use api::NodeFacts;
+#[cfg(feature = "test-exit")]
+pub use api::TEST_EXIT_PATH;
 pub use audit::{AUDIT_ANSWER_LIMIT, AUDIT_LIMIT};
 pub use engine::{ENGINE_LINE_LIMIT, EngineHost, HostError, NoEngine};
 pub use http::{BODY_BUDGET, BODY_LIMIT, HEADER_LIMIT};

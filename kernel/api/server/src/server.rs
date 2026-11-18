@@ -268,4 +268,11 @@ impl<T: Transport, C: Clock> Server<T, C> {
     pub fn facts_mut(&mut self) -> &mut NodeFacts {
         &mut self.api.facts
     }
+
+    /// Whether a request to [`TEST_EXIT_PATH`](crate::TEST_EXIT_PATH) has come: the caller then
+    /// ends (feature `test-exit`, the `cloud-test` image only; work item 2.2c).
+    #[cfg(feature = "test-exit")]
+    pub fn exit_requested(&self) -> bool {
+        self.api.exit
+    }
 }

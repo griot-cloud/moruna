@@ -22,6 +22,12 @@ moruna-node-config = { path = "../config", version = "=0.1.0" }
 moruna-api-server = { path = "../../api/server", version = "=0.1.0" }
 moruna-api = { path = "../../api/types", version = "=0.1.0" }
 
+[features]
+# For the `cloud-test` image profile only, never a release image (work item 2.2c): `api` exits
+# on a request to `/v1/test/exit`, so that a test can kill it from outside the node's design.
+# kernel/node/tools/package.py turns it on for `--profile cloud-test` and for no other profile.
+test-exit = ["moruna-api-server/test-exit"]
+
 # The host tests run the library against the network server's own stack, with a DHCP
 # server and a second card on its wire (kernel/net/stack/tests/common).
 [dev-dependencies]
