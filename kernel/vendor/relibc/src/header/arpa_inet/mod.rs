@@ -1,0 +1,389 @@
+//! `arpa/inet.h` implementation.
+//!
+//! See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/arpa_inet.h.html>.
+
+use core::{
+    ptr, slice,
+    str::{self, FromStr},
+};
+
+use crate::{
+    c_str::CStr,
+    header::{
+        bits_arpainet::ntohl,
+        errno::{EAFNOSUPPORT, ENOSPC},
+        netinet_in::{INADDR_NONE, in_addr, in_addr_t, in6_addr},
+        sys_socket::{
+            constants::{AF_INET, AF_INET6},
+            socklen_t,
+        },
+    },
+    io::Write,
+    platform::{
+        self,
+        types::{c_char, c_int, c_void},
+    },
+    raw_cell::RawCell,
+};
+
+/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/inet_addr.html>.
+///
+/// Converts the string pointed to by `cp`, in the standard IPv4 dotted
+/// decimal notation, to an integer value suitable for use as an Internet
+/// address.
+///
+/// # Deprecated
+/// The `inet_addr()` function was marked obsolescent in the Open Group Base
+/// Specifications Issue 8.
+///
+/// Applications should prefer `inet_pton()` over `inet_addr()` for the
+/// following reasons:
+/// - The return value from `inet_addr()` when converting 255.255.255.255 is
+///   indistinguishable from an error.
+/// - The `inet_pton()` function supports multiple address families.
+/// - The alternative textual representations supported by `inet_addr()` (but
+///   not `inet_pton()`) are often used maliciously to confuse or mislead
+///   users (e.g, for phishing).
+#[deprecated]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn inet_addr(cp: *const c_char) -> in_addr_t {
+    let mut val: in_addr = in_addr { s_addr: 0 };
+
+    if unsafe { inet_aton(cp, &raw mut val) } > 0 {
+        val.s_addr
+    } else {
+        INADDR_NONE
+    }
+}
+
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/inet_aton.3.html>.
+///
+/// Converts the Internet host address `cp` from the IPv4 numbers-and-dots
+/// notation into binary form (in network byte order) and stores it in the
+/// structure that `inp` points to.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn inet_aton(cp: *const c_char, inp: *mut in_addr) -> c_int {
+    let cp_cstr = unsafe { CStr::from_ptr(cp) };
+    let Ok(result) = inet_aton_inner(cp_cstr.to_bytes()) else {
+        return 0;
+    };
+    unsafe { (*inp.cast::<in_addr>()).s_addr = result };
+    1
+}
+
+/// Parses IPv4 address (NUL excluded) to big-endian integer representation
+pub(crate) fn inet_aton_inner(parts: &[u8]) -> Result<u32, ()> {
+    let Ok(parts) = str::from_utf8(parts) else {
+        return Err(());
+    };
+    let parts = parts.split('.');
+    let count = parts.clone().count();
+    if count > 4 {
+        return Err(());
+    }
+    let mut result = 0;
+    let mut parts_iter = parts.peekable();
+    let mut index = 0u32;
+    while index < 4
+        && let Some(part) = parts_iter.next()
+    {
+        if let Ok(parsed_value) = {
+            if let Some(hex_or_oct) = part.strip_prefix('0')
+                && part.len() > 1
+            {
+                match hex_or_oct.bytes().next() {
+                    Some(b'x' | b'X') => u32::from_str_radix(&hex_or_oct[1..], 16),
+                    // While it is true that C2Y accepts 0o and 0O as octal prefixes, C17 doesn't
+                    // The POSIX spec defers to C17
+                    // see https://pubs.opengroup.org/onlinepubs/9799919799/functions/inet_addr.html
+                    _ => u32::from_str_radix(hex_or_oct, 8),
+                }
+            } else {
+                part.parse::<u32>()
+            }
+        } {
+            if parts_iter.peek().is_some() {
+                // this is not the last part
+                if parsed_value > 0xff {
+                    return Err(());
+                }
+                result += parsed_value << (24 - index * 8);
+            } else {
+                // this is the last part
+                if index > 0 && parsed_value >= 1 << (32 - index * 8) {
+                    return Err(());
+                } else {
+                    result += parsed_value;
+                }
+            }
+        } else {
+            return Err(());
+        }
+        index += 1;
+    }
+    Ok(result.to_be())
+}
+
+/// See <https://pubs.opengroup.org/onlinepubs/7908799/xns/inet_lnaof.html>.
+///
+/// Takes an Internet host address specified by `in` and extracts the local
+/// network address part, in host byte order.
+///
+/// # Deprecation
+/// The `inet_lnaof()` function was specified in Networking Services Issue 5,
+/// but not in the Open Group Base Specifications Issue 6 and later.
+#[deprecated]
+#[unsafe(no_mangle)]
+pub extern "C" fn inet_lnaof(r#in: in_addr) -> in_addr_t {
+    if r#in.s_addr >> 24 < 128 {
+        r#in.s_addr & 0xff_ffff
+    } else if r#in.s_addr >> 24 < 192 {
+        r#in.s_addr & 0xffff
+    } else {
+        r#in.s_addr & 0xff
+    }
+}
+
+/// See <https://pubs.opengroup.org/onlinepubs/7908799/xns/inet_makeaddr.html>.
+///
+/// Takes the Internet network number specified by `net` and the local network
+/// address specified by `lna`, both in host byte order, and constructs an
+/// Internet address from them.
+///
+/// # Deprecation
+/// The `inet_makeaddr()` function was specified in Networking Services Issue
+/// 5, but not in the Open Group Base Specifications Issue 6 and later.
+#[deprecated]
+#[unsafe(no_mangle)]
+pub extern "C" fn inet_makeaddr(net: in_addr_t, lna: in_addr_t) -> in_addr {
+    let mut output: in_addr = in_addr { s_addr: 0 };
+
+    if net < 256 {
+        output.s_addr = lna | net << 24;
+    } else if net < 65536 {
+        output.s_addr = lna | net << 16;
+    } else {
+        output.s_addr = lna | net << 8;
+    }
+
+    output
+}
+
+/// See <https://pubs.opengroup.org/onlinepubs/7908799/xns/inet_netof.html>.
+///
+/// Takes an Internet host address specified by `in` and extracts the network
+/// number part, in host byte order.
+///
+/// # Deprecation
+/// The `inet_netof()` function was specified in Networking Services Issue 5,
+/// but not in the Open Group Base Specifications Issue 6 and later.
+#[deprecated]
+#[unsafe(no_mangle)]
+pub extern "C" fn inet_netof(r#in: in_addr) -> in_addr_t {
+    if r#in.s_addr >> 24 < 128 {
+        r#in.s_addr & 0xff_ffff
+    } else if r#in.s_addr >> 24 < 192 {
+        r#in.s_addr & 0xffff
+    } else {
+        r#in.s_addr & 0xff
+    }
+}
+
+/// See <https://pubs.opengroup.org/onlinepubs/7908799/xns/inet_network.html>.
+///
+/// Converts the string pointed to by `cp`, in the Internet standard dot
+/// notation, to an integer value suitable for use as an Internet network
+/// number.
+///
+/// # Deprecation
+/// The `inet_network()` function was specified in Networking Services Issue 5,
+/// but not in the Open Group Base Specifications Issue 6 and later.
+#[deprecated]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn inet_network(cp: *const c_char) -> in_addr_t {
+    ntohl(unsafe {
+        #[expect(deprecated)]
+        inet_addr(cp)
+    })
+}
+
+/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/inet_addr.html>.
+///
+/// Converts the Internet host address specified by `in` to a string in the
+/// Internet standard dot notation.
+///
+/// # Deprecation
+/// The `inet_ntoa()` function was marked obsolescent in the Open Group Base
+/// Specifications Issue 8.
+///
+/// Applications should prefer `inet_ntop()` over `inet_ntoa()` as it supports
+/// multiple address families and is thread-safe.
+#[deprecated]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn inet_ntoa(r#in: in_addr) -> *mut c_char {
+    static NTOA_ADDR: RawCell<[c_char; 16]> = RawCell::new([0; 16]);
+
+    unsafe {
+        let ptr = inet_ntop(
+            AF_INET,
+            ptr::from_ref::<in_addr>(&r#in).cast::<c_void>(),
+            NTOA_ADDR.unsafe_mut().as_mut_ptr(),
+            socklen_t::try_from(NTOA_ADDR.unsafe_ref().len()).expect("len within bounds"),
+        );
+        // Mutable pointer is required, inet_ntop returns destination as const pointer
+        ptr.cast_mut()
+    }
+}
+
+/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/inet_ntop.html>.
+///
+/// Converts a numeric address into a text string suitable for presentation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn inet_ntop(
+    af: c_int,
+    src: *const c_void,
+    dst: *mut c_char,
+    size: socklen_t,
+) -> *const c_char {
+    if af != AF_INET {
+        platform::ERRNO.set(EAFNOSUPPORT);
+        ptr::null()
+    } else if size < 16 {
+        platform::ERRNO.set(ENOSPC);
+        ptr::null()
+    } else {
+        let s_addr = unsafe {
+            slice::from_raw_parts(
+                ptr::from_ref(&(*(src.cast::<in_addr>())).s_addr).cast::<u8>(),
+                4,
+            )
+        };
+        let mut w = platform::StringWriter(dst, size as usize);
+        let _ = write!(
+            w,
+            "{}.{}.{}.{}\0",
+            s_addr[0], s_addr[1], s_addr[2], s_addr[3]
+        );
+        dst
+    }
+}
+
+/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/inet_ntop.html>.
+///
+/// Converts an address in its standard text presentation form into its
+/// numeric binary form.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn inet_pton(af: c_int, src: *const c_char, dst: *mut c_void) -> c_int {
+    if af == AF_INET {
+        let s_addr = unsafe {
+            slice::from_raw_parts_mut(
+                ptr::from_mut(&mut (*dst.cast::<in_addr>()).s_addr).cast::<u8>(),
+                4,
+            )
+        };
+        let src_cstr = unsafe { CStr::from_ptr(src) };
+        let mut octets = unsafe { str::from_utf8_unchecked(src_cstr.to_bytes()).split('.') };
+        for part in s_addr.iter_mut().take(4) {
+            if let Some(n) = octets
+                .next()
+                .filter(|x| x.len() <= 3)
+                .and_then(|x| u8::from_str(x).ok())
+            {
+                *part = n;
+            } else {
+                return 0;
+            }
+        }
+        if octets.next().is_none() {
+            1 // Success
+        } else {
+            0
+        }
+    } else if af == AF_INET6 {
+        let src_str = unsafe { str::from_utf8_unchecked(CStr::from_ptr(src).to_bytes()) };
+        let mut chunks = vec![src_str];
+        let colons = src_str.bytes().filter(|&c| c == b':').count();
+        if !(2..=7).contains(&colons) {
+            return 0;
+        }
+        let dots = src_str.bytes().filter(|&c| c == b'.').count();
+        if dots != 0 && dots != 3 {
+            return 0;
+        }
+        let double_colon = src_str.find("::");
+        if colons < 2
+            || double_colon.is_some() && ((dots == 0 && colons > 7) || (dots == 3 && colons > 6))
+            || double_colon.is_none() && ((dots == 0 && colons != 7) || (dots == 3 && colons != 6))
+        {
+            return 0;
+        }
+        if dots == 3
+            && let Some(first_dot) = src_str.find('.')
+            && let Some(last_colon) = src_str.find(':')
+            && last_colon > first_dot
+        {
+            return 0;
+        }
+        if let Some(first) = src_str.find("::")
+            && let Some(last) = src_str.rfind("::")
+        {
+            // :: is allowed only once
+            if first != last {
+                return 0;
+            }
+            chunks = vec![&src_str[..first], &src_str[(first + 2)..]]
+        }
+
+        let s6_addr = unsafe {
+            slice::from_raw_parts_mut(
+                ptr::from_mut(&mut (*dst.cast::<in6_addr>()).s6_addr).cast::<u16>(),
+                8,
+            )
+        };
+        s6_addr.iter_mut().for_each(|w| *w = 0);
+
+        for (count, &chunk) in chunks
+            .iter()
+            .enumerate()
+            .filter(|&(_, &chunk)| !chunk.is_empty())
+        {
+            let mut parts = s6_addr
+                .iter_mut()
+                .skip(count * (8 - chunk.split(':').count() - dots / 3));
+            let mut words = chunk.split(':');
+            while let Some(word) = words.next()
+                && let Some(part) = parts.next()
+            {
+                if word.is_empty() {
+                    break;
+                } else if word.len() <= 4
+                    && let Some(n) = u16::from_str_radix(word, 16).ok()
+                {
+                    *part = n.to_be();
+                } else if word.contains('.') {
+                    let bytes =
+                        unsafe { slice::from_raw_parts_mut(ptr::from_mut(part).cast::<u8>(), 4) };
+                    let mut octets = word.split('.');
+                    for byte in bytes {
+                        if let Some(octet) = octets.next() {
+                            if octet.len() > 1 && octet.starts_with('0') {
+                                return 0;
+                            }
+                            if let Ok(value) = u8::from_str(octet) {
+                                *byte = value
+                            } else {
+                                return 0;
+                            }
+                        }
+                    }
+                } else {
+                    return 0;
+                }
+            }
+        }
+        1 // Success
+    } else {
+        platform::ERRNO.set(EAFNOSUPPORT);
+        -1
+    }
+}

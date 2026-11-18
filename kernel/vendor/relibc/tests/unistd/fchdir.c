@@ -1,0 +1,26 @@
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <limits.h>
+
+#include "test_helpers.h"
+
+int main(void) {
+    int fd = open("/usr", O_DIRECTORY);
+    ERROR_IF(open, fd, == -1);
+    UNEXP_IF(open, fd, < 0);
+
+    int status = fchdir(fd);
+    ERROR_IF(fchdir, status, == -1);
+    UNEXP_IF(fchdir, status, != 0);
+
+    int c = close(fd);
+    ERROR_IF(close, c, == -1);
+    UNEXP_IF(close, c, != 0);
+
+    char cwd[PATH_MAX];
+    char* cw = getcwd(cwd, sizeof(cwd));
+    ERROR_IF(getcwd, cw, == NULL);
+    printf("getcwd: %s\n", cwd);
+}

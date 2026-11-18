@@ -1,0 +1,155 @@
+[package]
+name = "relibc"
+version = "0.2.5"
+authors = ["Jeremy Soller <jackpot51@gmail.com>"]
+edition = "2024"
+
+[lib]
+name = "relibc"
+crate-type = ["staticlib"]
+
+[workspace]
+members = [
+    "src/crt0",
+    "src/crti",
+    "src/crtn",
+    "redox-rt",
+    "ld_so",
+    "generic-rt",
+]
+exclude = ["tests", "dlmalloc-rs"]
+
+[workspace.lints.clippy]
+borrow_as_ptr = "deny"
+cast_lossless = "deny"
+cast_possible_truncation = "allow" # TODO review occurrences
+cast_possible_wrap = "allow" # TODO review occurrences
+cast_precision_loss = "deny"
+cast_ptr_alignment = "allow" # TODO review occurrences
+cast_sign_loss = "allow" # TODO review occurrences
+from_raw_with_void_ptr = "deny"
+ignored_unit_patterns = "deny"
+implicit_clone = "deny"
+manual_let_else = "deny"
+missing_errors_doc = "allow" # TODO review occurrences
+missing_panics_doc = "allow" # TODO review occurrences
+missing_safety_doc = "allow" # TODO review occurrences
+mut_from_ref = "deny"
+precedence = "deny"
+ptr_as_ptr = "deny"
+ptr_cast_constness = "deny"
+ptr_offset_by_literal = "deny"
+ref_as_ptr = "deny"
+zero_ptr = "deny" # must allow on public constants due to cbindgen issue
+
+[workspace.lints.rust]
+dangling_pointers_from_temporaries = "deny"
+dead_code = "allow" # TODO review occuurences
+deprecated = "deny"
+improper_ctypes_definitions = "deny"
+internal_features = "allow" # core_intrinsics and lang_items
+irrefutable_let_patterns = "deny"
+mismatched_lifetime_syntaxes = "deny"
+non_camel_case_types = "allow" # needed for most POSIX type names
+non_snake_case = "deny"
+non_upper_case_globals = "allow" # TODO review occurences
+unexpected_cfgs = "deny"
+unpredictable_function_pointer_comparisons = "deny"
+unreachable_code = "allow" # TODO review occuurences
+unsafe_op_in_unsafe_fn = "deny"
+unused_imports = "deny"
+unused_must_use = "deny"
+unused_mut = "deny"
+unused_unsafe = "deny"
+unused_variables = "deny"
+
+[lints]
+workspace = true
+
+[workspace.dependencies]
+bitflags = "2"
+ioslice = { version = "0.6", default-features = false }
+plain = "0.2"
+redox-path = "0.4.1"
+redox_protocols = { package = "libredox", version = "0.1.25", default-features = false, features = ["protocol"] }
+redox_syscall = "0.9.5"
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
+bitflags.workspace = true
+arrayvec = { version = "0.7.6", default-features = false }
+cbitset = "0.2"
+posix-regex = { version = "0.1.4", features = ["no_std"] }
+
+rand = { version = "0.10", default-features = false }
+rand_xorshift = "0.5"
+rand_jitter = "0.6"
+
+memchr = { version = "2.2.0", default-features = false }
+plain.workspace = true
+unicode-width = "0.1"
+__libc_only_for_layout_checks = { package = "libc", version = "0.2.149", optional = true }
+md5-crypto = { package = "md-5", version = "0.10.6", default-features = false }
+sha-crypt = { version = "0.5", default-features = false }
+base64ct = { version = "1.6", default-features = false, features = ["alloc"] }
+bcrypt-pbkdf = { version = "0.10", default-features = false, features = [
+    "alloc",
+] }
+scrypt = { version = "0.11", default-features = false, features = ["simple"] }
+pbkdf2 = { version = "0.12", features = ["sha2"] }
+sha2 = { version = "0.10", default-features = false }
+generic-rt = { path = "generic-rt" }
+chrono-tz = { version = "0.10", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+libm = "0.2"
+log = "0.4"
+spin = "0.9.8"
+argon2 = "0.5.3"
+redox-rings = { git = "https://gitlab.redox-os.org/redox-os/redox-rings.git", default-features = false, features = ["sync"] }
+redox-buffer-pool = { git = "https://gitlab.redox-os.org/redox-os/redox-buffer-pool.git", default-features = false, features = ["redox", "spinning"]}
+
+zerocopy = { version = "0.8.55", features = ["derive"] }
+
+[dependencies.dlmalloc]
+path = "dlmalloc-rs"
+default-features = false
+features = ["c_api"]
+
+[dependencies.object]
+version = "0.36.7"
+git = "https://gitlab.redox-os.org/andypython/object"
+branch = "new"
+default-features = false
+features = ["elf", "read_core"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sc = "0.2.7"
+
+[target.'cfg(target_os = "redox")'.dependencies]
+redox_syscall.workspace = true
+redox-rt = { path = "redox-rt" }
+redox-path.workspace = true
+redox_event = { version = "0.4.8", default-features = false, features = ["redox_syscall"] }
+ioslice.workspace = true
+redox-ioctl = { path = "redox-ioctl" }
+redox_protocols.workspace = true
+
+[features]
+# to enable trace level, take out this `no_trace`
+default = ["check_against_libc_crate", "no_trace"]
+check_against_libc_crate = ["__libc_only_for_layout_checks"]
+math_libm = []
+no_trace = ["log/release_max_level_debug"]
+# for very verbose activity beyond trace level
+trace_tls = []
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[patch.crates-io]
+redox_syscall = {git = "https://gitlab.redox-os.org/redox-os/kernel/"}

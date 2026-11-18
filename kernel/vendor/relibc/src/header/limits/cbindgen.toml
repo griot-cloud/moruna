@@ -1,0 +1,28 @@
+# POSIX header spec: https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/limits.h.html
+#
+# There are no spec quotations relating to includes
+include_guard = "_RELIBC_LIMITS_H"
+after_includes = """
+#include <bits/limits/ptdi.h> // for PTHREAD_DESTRUCTOR_ITERATIONS
+
+#if defined(__ILP32__)
+#define LONG_MAX 2147483647l
+#endif
+#if defined(__LP64__)
+#define LONG_MAX 9223372036854775807l
+#endif
+#define SSIZE_MAX LONG_MAX
+#if defined(__ILP32__)
+#define ULONG_MAX 4294967295ul
+#endif
+#if defined(__LP64__)
+#define ULONG_MAX 18446744073709551615ul
+#endif
+#define LONG_MIN (-LONG_MAX - 1)
+"""
+language = "C"
+no_includes = true
+cpp_compat = true
+
+[enum]
+prefix_with_name = true

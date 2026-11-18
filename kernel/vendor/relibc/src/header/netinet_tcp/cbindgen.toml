@@ -1,0 +1,10 @@
+# POSIX header spec: https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/netinet_tcp.h.html
+#
+# There are no spec quotations relating to includes
+include_guard = "_RELIBC_NETINET_TCP_H"
+language = "C"
+no_includes = true
+cpp_compat = true
+
+[enum]
+prefix_with_name = true
