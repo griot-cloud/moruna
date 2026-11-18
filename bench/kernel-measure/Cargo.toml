@@ -1,0 +1,28 @@
+# The kernels' measurements (system design 4G): a kernel against the code it replaces, on real
+# data. It links the engine's kernels (crates/moruna-kernels) and the gate's Rust functions
+# (images/gate/functions), which are two workspaces, so it is a workspace of its own, as the gate's
+# tasks are: nothing in either workspace builds it, and neither's lock file changes for it.
+[package]
+name = "moruna-kernel-measure"
+version = "0.7.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+publish = false
+description = "Measurements of Moruna's kernels against the code they replace (4G)"
+
+[workspace]
+
+[[bin]]
+name = "occupancy-coverage"
+path = "src/occupancy_coverage.rs"
+
+[dependencies]
+moruna-kernel = { path = "../../crates/moruna-kernel" }
+moruna-kernels = { path = "../../crates/moruna-kernels" }
+moruna-gate-functions = { path = "../../images/gate/functions", features = ["arrow"] }
+# The root workspace's pins: the engine's arrow-rs, and its Parquet reader with only the codecs the
+# NYC files and this tool's outputs use.
+arrow = { version = "=59.3.0", default-features = false }
+parquet = { version = "=59.3.0", default-features = false, features = ["arrow", "snap", "zstd"] }
+serde_json = { version = "=1.0.151" }
