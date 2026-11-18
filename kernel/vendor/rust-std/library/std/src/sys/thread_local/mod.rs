@@ -118,6 +118,8 @@ pub(crate) mod guard {
         any(
             target_os = "hermit",
             target_os = "xous",
+            // moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
+            target_os = "moruna",
         ) => {
             // `std` is the only runtime, so it just calls the destructor functions
             // itself when the time comes.
@@ -186,15 +188,6 @@ pub(crate) mod key {
             pub(crate) use xous::destroy_tls;
             pub(super) use xous::{Key, get, set};
             use xous::{create, destroy};
-        }
-        // moruna: Moruna's native programs (kernel/vendor/rust-std/README.md).
-        target_os = "moruna" => {
-            mod racy;
-            #[cfg(test)]
-            mod tests;
-            pub(super) use racy::LazyKey;
-            pub(super) use moruna_sys::rt::tls::{Key, get, set};
-            use moruna_sys::rt::tls::{create, destroy};
         }
         target_os = "motor" => {
             mod racy;

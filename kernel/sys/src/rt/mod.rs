@@ -9,8 +9,9 @@
 //!   thread parking are built on.
 //! - [`time`]: `Instant` from the clock page, and `SystemTime` from the realtime base it carries
 //!   (ABI 2.8); 1970 plus the monotonic clock while that is unset.
-//! - [`tls`]: thread-local keys, in a table each thread's FS base points at.
-//! - [`thread`]: spawn, join, sleep and yield (`thread_yield`, ABI 2.8).
+//! - [`tls`]: ELF TLS and each thread's control block, at the thread pointer (system design 5B).
+//! - [`thread`]: the one thread path, for std's threads and the C library's; join, sleep and
+//!   yield (`thread_yield`, ABI 2.8).
 //! - `stdio` and `memory` (feature `rt`): stdout and stderr as lines of the task's log
 //!   ([`crate::plane::Log`]), or of its console when it has no log, and std's allocator over
 //!   the process's heap.
@@ -33,10 +34,13 @@ pub mod tls;
 pub const ABORT_CODE: i32 = 101;
 
 /// The program's start, before `main`: records the start page the kernel passed the first
-/// thread (`rdi`), and gives that thread its table of thread-local keys.
+/// thread (`rdi`), and gives that thread its thread-locals and control block. A program with no
+/// memory for them cannot run its first line: it ends with [`ABORT_CODE`].
 pub fn start(start_page: u64) {
     crate::start::init(start_page);
-    tls::install_main();
+    if !tls::install_main() {
+        crate::exit(i64::from(ABORT_CODE));
+    }
 }
 
 /// Ends the process with `code`, once stdout's and stderr's last line is in the log.
@@ -59,11 +63,14 @@ mod tests {
     extern crate std;
 
     #[test]
-    fn the_start_gives_the_first_thread_its_table() {
+    fn the_start_gives_the_first_thread_its_block() {
         std::thread::spawn(|| {
             super::start(0);
-            assert!(!super::os::table().is_null());
-            super::tls::uninstall();
+            let control = super::tls::current();
+            assert!(!control.is_null());
+            // SAFETY: the thread's own control block, which the start made.
+            assert_eq!(unsafe { (*control).tcb_ptr }, control);
+            super::tls::release_current();
         })
         .join()
         .unwrap();
