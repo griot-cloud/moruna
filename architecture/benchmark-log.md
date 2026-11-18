@@ -234,3 +234,22 @@ speed comparison is a miss.
   checked against 0.6.6 in this run: there was no 0.6.6 row to compare with.
 - **Occupancy and Audit are unchanged.** They are bound by reading, and 6.3e does not touch that.
 - **Next:** rerun the node and the four engines once 6.3r, 6.3g, 6.3d and 6.3h are merged.
+
+
+## Host measurement: 6.3l, a row group's parts share its dictionary pages (PM, 2026-11-19)
+
+The NYC 2024 year, 4 workers, on the Mac (load about 10). Feature at 0698ea2a^1 against 6.3l on it,
+interleaved run by run, medians of 3. Every run completed. The raw table is
+`~/moruna-data/measurements/6.3l-year-table.txt`.
+
+| Sink, budget | Decode ms | Wall ms | CPU s |
+|---|---:|---:|---:|
+| Parquet, 384 MiB | 5504 -> 2800 | 5511 -> 4631 | 18.4 -> 15.6 |
+| Parquet, 448 MiB | 3498 -> 2574 | 4622 -> 4578 | 15.7 -> 15.1 |
+| Parquet, none | 2438 -> 1983 | 4700 -> 4299 | 14.8 -> 14.2 |
+| count, 384 MiB | 1932 -> 1752 | 1303 -> 1272 | 1.96 -> 1.78 |
+| count, 448 MiB | 2028 -> 1866 | 1381 -> 1272 | 1.98 -> 1.83 |
+| count, none | 2000 -> 1799 | 1270 -> 1165 | 1.85 -> 1.79 |
+
+The gain is largest where the arena cuts the most parts. On the node, 6.3l's own analysis found
+that Occupancy and Audit were bound by the drive's one-at-a-time fetch (6.3t), not by decode.
