@@ -603,7 +603,7 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
     Nothing is fetched at registration.
 - **At job start,** `node-admission` has the engine fetch each function the job names, through its
   job network (3D). The node refuses the job if a SHA-256 differs. Images are cached in memory, up
-  to node config's `function_cache_bytes` (default 1 GiB), until the node stops.
+  to node config's `functions.cache_bytes` (default 1 GiB, at most half the node's memory), until the node stops.
 - **A job names a function** by its registered name. An unregistered name is refused at `validate`.
 
 ### 3F. The full-year hang
