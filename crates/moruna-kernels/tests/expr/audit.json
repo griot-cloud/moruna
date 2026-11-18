@@ -1,0 +1,942 @@
+{
+ "outputs": [
+  {
+   "name": "vendor_id",
+   "expr": {
+    "column": "vendor_id"
+   }
+  },
+  {
+   "name": "pu_location_id",
+   "expr": {
+    "column": "pu_location_id"
+   }
+  },
+  {
+   "name": "fare_amount",
+   "expr": {
+    "column": "fare_amount"
+   }
+  },
+  {
+   "name": "expected_fare",
+   "expr": {
+    "call": "round",
+    "args": [
+     {
+      "if": [
+       {
+        "when": {
+         "call": "equal",
+         "args": [
+          {
+           "column": "ratecode_id"
+          },
+          {
+           "literal": 2.0
+          }
+         ]
+        },
+        "then": {
+         "literal": 70.0
+        }
+       }
+      ],
+      "else": {
+       "call": "if_else",
+       "args": [
+        {
+         "call": "and",
+         "args": [
+          {
+           "call": "greater_equal",
+           "args": [
+            {
+             "call": "hour",
+             "args": [
+              {
+               "column": "pickup_at"
+              }
+             ]
+            },
+            {
+             "literal": 16
+            }
+           ]
+          },
+          {
+           "call": "less",
+           "args": [
+            {
+             "call": "hour",
+             "args": [
+              {
+               "column": "pickup_at"
+              }
+             ]
+            },
+            {
+             "literal": 20
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "call": "add",
+         "args": [
+          {
+           "call": "add",
+           "args": [
+            {
+             "call": "add",
+             "args": [
+              {
+               "literal": 3.0
+              },
+              {
+               "call": "multiply",
+               "args": [
+                {
+                 "literal": 3.5
+                },
+                {
+                 "call": "coalesce",
+                 "args": [
+                  {
+                   "column": "trip_distance"
+                  },
+                  {
+                   "literal": 0.0
+                  }
+                 ]
+                }
+               ]
+              }
+             ]
+            },
+            {
+             "call": "multiply",
+             "args": [
+              {
+               "literal": 0.35
+              },
+              {
+               "call": "max_element_wise",
+               "args": [
+                {
+                 "call": "subtract",
+                 "args": [
+                  {
+                   "call": "max_element_wise",
+                   "args": [
+                    {
+                     "call": "divide",
+                     "args": [
+                      {
+                       "cast": {
+                        "call": "subtract",
+                        "args": [
+                         {
+                          "column": "dropoff_at"
+                         },
+                         {
+                          "column": "pickup_at"
+                         }
+                        ]
+                       },
+                       "to": "int64"
+                      },
+                      {
+                       "literal": 60000000.0
+                      }
+                     ]
+                    },
+                    {
+                     "literal": 0.0
+                    }
+                   ],
+                   "options": {
+                    "skip_nulls": false
+                   }
+                  },
+                  {
+                   "call": "multiply",
+                   "args": [
+                    {
+                     "call": "coalesce",
+                     "args": [
+                      {
+                       "column": "trip_distance"
+                      },
+                      {
+                       "literal": 0.0
+                      }
+                     ]
+                    },
+                    {
+                     "literal": 2.0
+                    }
+                   ]
+                  }
+                 ]
+                },
+                {
+                 "literal": 0.0
+                }
+               ],
+               "options": {
+                "skip_nulls": false
+               }
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "literal": 2.5
+          }
+         ]
+        },
+        {
+         "call": "add",
+         "args": [
+          {
+           "call": "add",
+           "args": [
+            {
+             "literal": 3.0
+            },
+            {
+             "call": "multiply",
+             "args": [
+              {
+               "literal": 3.5
+              },
+              {
+               "call": "coalesce",
+               "args": [
+                {
+                 "column": "trip_distance"
+                },
+                {
+                 "literal": 0.0
+                }
+               ]
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "call": "multiply",
+           "args": [
+            {
+             "literal": 0.35
+            },
+            {
+             "call": "max_element_wise",
+             "args": [
+              {
+               "call": "subtract",
+               "args": [
+                {
+                 "call": "max_element_wise",
+                 "args": [
+                  {
+                   "call": "divide",
+                   "args": [
+                    {
+                     "cast": {
+                      "call": "subtract",
+                      "args": [
+                       {
+                        "column": "dropoff_at"
+                       },
+                       {
+                        "column": "pickup_at"
+                       }
+                      ]
+                     },
+                     "to": "int64"
+                    },
+                    {
+                     "literal": 60000000.0
+                    }
+                   ]
+                  },
+                  {
+                   "literal": 0.0
+                  }
+                 ],
+                 "options": {
+                  "skip_nulls": false
+                 }
+                },
+                {
+                 "call": "multiply",
+                 "args": [
+                  {
+                   "call": "coalesce",
+                   "args": [
+                    {
+                     "column": "trip_distance"
+                    },
+                    {
+                     "literal": 0.0
+                    }
+                   ]
+                  },
+                  {
+                   "literal": 2.0
+                  }
+                 ]
+                }
+               ]
+              },
+              {
+               "literal": 0.0
+              }
+             ],
+             "options": {
+              "skip_nulls": false
+             }
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    ],
+    "options": {
+     "ndigits": 2,
+     "round_mode": "half_to_even"
+    }
+   }
+  },
+  {
+   "name": "flagged",
+   "expr": {
+    "call": "and_kleene",
+    "args": [
+     {
+      "call": "is_valid",
+      "args": [
+       {
+        "column": "fare_amount"
+       }
+      ]
+     },
+     {
+      "call": "greater",
+      "args": [
+       {
+        "call": "abs",
+        "args": [
+         {
+          "call": "subtract",
+          "args": [
+           {
+            "column": "fare_amount"
+           },
+           {
+            "if": [
+             {
+              "when": {
+               "call": "equal",
+               "args": [
+                {
+                 "column": "ratecode_id"
+                },
+                {
+                 "literal": 2.0
+                }
+               ]
+              },
+              "then": {
+               "literal": 70.0
+              }
+             }
+            ],
+            "else": {
+             "call": "if_else",
+             "args": [
+              {
+               "call": "and",
+               "args": [
+                {
+                 "call": "greater_equal",
+                 "args": [
+                  {
+                   "call": "hour",
+                   "args": [
+                    {
+                     "column": "pickup_at"
+                    }
+                   ]
+                  },
+                  {
+                   "literal": 16
+                  }
+                 ]
+                },
+                {
+                 "call": "less",
+                 "args": [
+                  {
+                   "call": "hour",
+                   "args": [
+                    {
+                     "column": "pickup_at"
+                    }
+                   ]
+                  },
+                  {
+                   "literal": 20
+                  }
+                 ]
+                }
+               ]
+              },
+              {
+               "call": "add",
+               "args": [
+                {
+                 "call": "add",
+                 "args": [
+                  {
+                   "call": "add",
+                   "args": [
+                    {
+                     "literal": 3.0
+                    },
+                    {
+                     "call": "multiply",
+                     "args": [
+                      {
+                       "literal": 3.5
+                      },
+                      {
+                       "call": "coalesce",
+                       "args": [
+                        {
+                         "column": "trip_distance"
+                        },
+                        {
+                         "literal": 0.0
+                        }
+                       ]
+                      }
+                     ]
+                    }
+                   ]
+                  },
+                  {
+                   "call": "multiply",
+                   "args": [
+                    {
+                     "literal": 0.35
+                    },
+                    {
+                     "call": "max_element_wise",
+                     "args": [
+                      {
+                       "call": "subtract",
+                       "args": [
+                        {
+                         "call": "max_element_wise",
+                         "args": [
+                          {
+                           "call": "divide",
+                           "args": [
+                            {
+                             "cast": {
+                              "call": "subtract",
+                              "args": [
+                               {
+                                "column": "dropoff_at"
+                               },
+                               {
+                                "column": "pickup_at"
+                               }
+                              ]
+                             },
+                             "to": "int64"
+                            },
+                            {
+                             "literal": 60000000.0
+                            }
+                           ]
+                          },
+                          {
+                           "literal": 0.0
+                          }
+                         ],
+                         "options": {
+                          "skip_nulls": false
+                         }
+                        },
+                        {
+                         "call": "multiply",
+                         "args": [
+                          {
+                           "call": "coalesce",
+                           "args": [
+                            {
+                             "column": "trip_distance"
+                            },
+                            {
+                             "literal": 0.0
+                            }
+                           ]
+                          },
+                          {
+                           "literal": 2.0
+                          }
+                         ]
+                        }
+                       ]
+                      },
+                      {
+                       "literal": 0.0
+                      }
+                     ],
+                     "options": {
+                      "skip_nulls": false
+                     }
+                    }
+                   ]
+                  }
+                 ]
+                },
+                {
+                 "literal": 2.5
+                }
+               ]
+              },
+              {
+               "call": "add",
+               "args": [
+                {
+                 "call": "add",
+                 "args": [
+                  {
+                   "literal": 3.0
+                  },
+                  {
+                   "call": "multiply",
+                   "args": [
+                    {
+                     "literal": 3.5
+                    },
+                    {
+                     "call": "coalesce",
+                     "args": [
+                      {
+                       "column": "trip_distance"
+                      },
+                      {
+                       "literal": 0.0
+                      }
+                     ]
+                    }
+                   ]
+                  }
+                 ]
+                },
+                {
+                 "call": "multiply",
+                 "args": [
+                  {
+                   "literal": 0.35
+                  },
+                  {
+                   "call": "max_element_wise",
+                   "args": [
+                    {
+                     "call": "subtract",
+                     "args": [
+                      {
+                       "call": "max_element_wise",
+                       "args": [
+                        {
+                         "call": "divide",
+                         "args": [
+                          {
+                           "cast": {
+                            "call": "subtract",
+                            "args": [
+                             {
+                              "column": "dropoff_at"
+                             },
+                             {
+                              "column": "pickup_at"
+                             }
+                            ]
+                           },
+                           "to": "int64"
+                          },
+                          {
+                           "literal": 60000000.0
+                          }
+                         ]
+                        },
+                        {
+                         "literal": 0.0
+                        }
+                       ],
+                       "options": {
+                        "skip_nulls": false
+                       }
+                      },
+                      {
+                       "call": "multiply",
+                       "args": [
+                        {
+                         "call": "coalesce",
+                         "args": [
+                          {
+                           "column": "trip_distance"
+                          },
+                          {
+                           "literal": 0.0
+                          }
+                         ]
+                        },
+                        {
+                         "literal": 2.0
+                        }
+                       ]
+                      }
+                     ]
+                    },
+                    {
+                     "literal": 0.0
+                    }
+                   ],
+                   "options": {
+                    "skip_nulls": false
+                   }
+                  }
+                 ]
+                }
+               ]
+              }
+             ]
+            }
+           }
+          ]
+         }
+        ]
+       },
+       {
+        "call": "max_element_wise",
+        "args": [
+         {
+          "literal": 5.0
+         },
+         {
+          "call": "multiply",
+          "args": [
+           {
+            "literal": 0.25
+           },
+           {
+            "if": [
+             {
+              "when": {
+               "call": "equal",
+               "args": [
+                {
+                 "column": "ratecode_id"
+                },
+                {
+                 "literal": 2.0
+                }
+               ]
+              },
+              "then": {
+               "literal": 70.0
+              }
+             }
+            ],
+            "else": {
+             "call": "if_else",
+             "args": [
+              {
+               "call": "and",
+               "args": [
+                {
+                 "call": "greater_equal",
+                 "args": [
+                  {
+                   "call": "hour",
+                   "args": [
+                    {
+                     "column": "pickup_at"
+                    }
+                   ]
+                  },
+                  {
+                   "literal": 16
+                  }
+                 ]
+                },
+                {
+                 "call": "less",
+                 "args": [
+                  {
+                   "call": "hour",
+                   "args": [
+                    {
+                     "column": "pickup_at"
+                    }
+                   ]
+                  },
+                  {
+                   "literal": 20
+                  }
+                 ]
+                }
+               ]
+              },
+              {
+               "call": "add",
+               "args": [
+                {
+                 "call": "add",
+                 "args": [
+                  {
+                   "call": "add",
+                   "args": [
+                    {
+                     "literal": 3.0
+                    },
+                    {
+                     "call": "multiply",
+                     "args": [
+                      {
+                       "literal": 3.5
+                      },
+                      {
+                       "call": "coalesce",
+                       "args": [
+                        {
+                         "column": "trip_distance"
+                        },
+                        {
+                         "literal": 0.0
+                        }
+                       ]
+                      }
+                     ]
+                    }
+                   ]
+                  },
+                  {
+                   "call": "multiply",
+                   "args": [
+                    {
+                     "literal": 0.35
+                    },
+                    {
+                     "call": "max_element_wise",
+                     "args": [
+                      {
+                       "call": "subtract",
+                       "args": [
+                        {
+                         "call": "max_element_wise",
+                         "args": [
+                          {
+                           "call": "divide",
+                           "args": [
+                            {
+                             "cast": {
+                              "call": "subtract",
+                              "args": [
+                               {
+                                "column": "dropoff_at"
+                               },
+                               {
+                                "column": "pickup_at"
+                               }
+                              ]
+                             },
+                             "to": "int64"
+                            },
+                            {
+                             "literal": 60000000.0
+                            }
+                           ]
+                          },
+                          {
+                           "literal": 0.0
+                          }
+                         ],
+                         "options": {
+                          "skip_nulls": false
+                         }
+                        },
+                        {
+                         "call": "multiply",
+                         "args": [
+                          {
+                           "call": "coalesce",
+                           "args": [
+                            {
+                             "column": "trip_distance"
+                            },
+                            {
+                             "literal": 0.0
+                            }
+                           ]
+                          },
+                          {
+                           "literal": 2.0
+                          }
+                         ]
+                        }
+                       ]
+                      },
+                      {
+                       "literal": 0.0
+                      }
+                     ],
+                     "options": {
+                      "skip_nulls": false
+                     }
+                    }
+                   ]
+                  }
+                 ]
+                },
+                {
+                 "literal": 2.5
+                }
+               ]
+              },
+              {
+               "call": "add",
+               "args": [
+                {
+                 "call": "add",
+                 "args": [
+                  {
+                   "literal": 3.0
+                  },
+                  {
+                   "call": "multiply",
+                   "args": [
+                    {
+                     "literal": 3.5
+                    },
+                    {
+                     "call": "coalesce",
+                     "args": [
+                      {
+                       "column": "trip_distance"
+                      },
+                      {
+                       "literal": 0.0
+                      }
+                     ]
+                    }
+                   ]
+                  }
+                 ]
+                },
+                {
+                 "call": "multiply",
+                 "args": [
+                  {
+                   "literal": 0.35
+                  },
+                  {
+                   "call": "max_element_wise",
+                   "args": [
+                    {
+                     "call": "subtract",
+                     "args": [
+                      {
+                       "call": "max_element_wise",
+                       "args": [
+                        {
+                         "call": "divide",
+                         "args": [
+                          {
+                           "cast": {
+                            "call": "subtract",
+                            "args": [
+                             {
+                              "column": "dropoff_at"
+                             },
+                             {
+                              "column": "pickup_at"
+                             }
+                            ]
+                           },
+                           "to": "int64"
+                          },
+                          {
+                           "literal": 60000000.0
+                          }
+                         ]
+                        },
+                        {
+                         "literal": 0.0
+                        }
+                       ],
+                       "options": {
+                        "skip_nulls": false
+                       }
+                      },
+                      {
+                       "call": "multiply",
+                       "args": [
+                        {
+                         "call": "coalesce",
+                         "args": [
+                          {
+                           "column": "trip_distance"
+                          },
+                          {
+                           "literal": 0.0
+                          }
+                         ]
+                        },
+                        {
+                         "literal": 2.0
+                        }
+                       ]
+                      }
+                     ]
+                    },
+                    {
+                     "literal": 0.0
+                    }
+                   ],
+                   "options": {
+                    "skip_nulls": false
+                   }
+                  }
+                 ]
+                }
+               ]
+              }
+             ]
+            }
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}

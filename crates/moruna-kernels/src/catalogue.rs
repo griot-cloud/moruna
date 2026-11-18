@@ -142,6 +142,12 @@ pub const IMPLEMENTATIONS: &[Implementation] = &[
     crate::group_aggregate::CPU_REFERENCE,
     crate::interval_coverage_count::CPU,
     Implementation {
+        kernel: "moruna.expr",
+        implementation: CPU_REFERENCE,
+        versions: &[1],
+        configure: configure_expr,
+    },
+    Implementation {
         kernel: "moruna.mlp_forward",
         implementation: CPU_REFERENCE,
         versions: crate::mlp::VERSIONS,
@@ -160,6 +166,22 @@ pub const IMPLEMENTATIONS: &[Implementation] = &[
         configure: crate::selection::configure_take,
     },
 ];
+
+/// `moruna.expr@1`'s CPU reference: the `expr` standard kernel, its tree the JSON parameters
+/// (spec/expr.md).
+fn configure_expr(version: u32, params: &Params) -> Result<Arc<dyn Kernel>> {
+    if version != 1 {
+        return Err(MorunaError::Plan(format!(
+            "moruna.expr has no version {version}"
+        )));
+    }
+    if !params.arrays.is_empty() {
+        return Err(MorunaError::Plan(
+            "moruna.expr@1 takes no Arrow parameters".into(),
+        ));
+    }
+    Ok(Arc::new(crate::StdKernel::new("expr", &params.json)?))
+}
 
 /// Every implementation this build has.
 pub fn implementations() -> &'static [Implementation] {

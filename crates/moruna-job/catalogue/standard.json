@@ -904,7 +904,8 @@
               "concat_str",
               "date_trunc",
               "union",
-              "join"
+              "join",
+              "expr"
             ]
           },
           "args": {
