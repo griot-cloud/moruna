@@ -148,6 +148,54 @@ fn the_ring_to_the_host_fills_and_recovers() {
 }
 
 #[test]
+fn arm_says_when_there_is_work_and_leaves_the_hosts_signal_on() {
+    // The ring to the host is one page, so it is the ring that runs out.
+    let settings = Settings {
+        receive_buffer: 8 * PAGE,
+        send_buffer: 64 * PAGE,
+    };
+    let (card, host) = start_on(PAGE, 16 * PAGE, settings, |host| host.send_section = 2048);
+    let mut card = up(card);
+    assert_eq!(card.wait(), Ok(Wait::Signalled));
+    assert_eq!(drain(&mut card), []);
+    // Nothing to read and nothing refused: nothing to do.
+    assert!(!card.arm().unwrap());
+    // A frame comes: there is work, and the host signalled as it delivered.
+    let mut random = Random(0xa4);
+    let frame = random.frame(200);
+    host.borrow_mut().deliver(&[&frame]);
+    assert!(card.arm().unwrap(), "the frame is in the ring");
+    assert_eq!(drain(&mut card), [Got::Frame(frame)]);
+    assert!(!card.arm().unwrap());
+    assert_eq!(card.wait(), Ok(Wait::Signalled), "the host's signal, kept");
+    // The host stops reading and keeps its completions: the ring to it fills, and a
+    // frame is refused. Nothing to read and no room: nothing to do yet.
+    let frames: Vec<Vec<u8>> = (0..70).map(|i| random.frame(100 + i)).collect();
+    host.borrow_mut().paused = true;
+    host.borrow_mut().hold = true;
+    let mut sent = 0;
+    while card.send(&frames[sent]).unwrap() {
+        sent += 1;
+    }
+    assert!(!card.arm().unwrap());
+    // The host reads again and answers nothing: the room alone is work.
+    host.borrow_mut().paused = false;
+    card.run_host();
+    assert!(card.arm().unwrap(), "the ring to the host has room");
+    for frame in &frames[sent..] {
+        assert!(card.send(frame).unwrap());
+    }
+    assert!(!card.arm().unwrap(), "the room was used and nothing came");
+    host.borrow_mut().release();
+    assert_eq!(drain(&mut card), []);
+    assert_clean(&host);
+    assert!(
+        host.borrow().frames == frames,
+        "a frame changed or was lost"
+    );
+}
+
+#[test]
 fn the_ring_to_the_guest_fills_and_the_host_is_told_when_it_has_room() {
     // The ring to the guest is one page: 51 receives of one frame. The host has a
     // hundred to deliver, asks to be signalled when the ring has room, and sends the

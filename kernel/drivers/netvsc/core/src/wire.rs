@@ -55,6 +55,8 @@ pub(crate) struct Wire<C: Channel> {
     message: usize,
     /// Whether the host was asked to signal once the ring to it has room.
     crowded: bool,
+    /// The bytes the host was asked to signal for, while `crowded`.
+    wanted: usize,
     /// When every wait gives up: a time on the node's monotonic clock, in nanoseconds,
     /// as the channel counts it; `None` for never.
     deadline: Option<u64>,
@@ -82,6 +84,7 @@ impl<C: Channel> Wire<C> {
             channel,
             message: packet_size(None),
             crowded: false,
+            wanted: 0,
             deadline,
         }
     }
@@ -89,6 +92,27 @@ impl<C: Channel> Wire<C> {
     /// From now on messages have the packet size of `version`.
     pub fn negotiated(&mut self, version: Version) {
         self.message = packet_size(Some(version));
+    }
+
+    /// Asks the host to signal when there is something to do, without waiting: true when
+    /// there is already, a packet to read or, after a packet the ring to the host had no
+    /// room for, that room. The incoming ring's signal is never masked once the wire is
+    /// made, and a full outgoing ring has asked for one (`put`): this only looks again,
+    /// after the caller has read everything, so that a packet that came meanwhile is not
+    /// left waiting for a signal already given.
+    pub fn arm(&mut self) -> Result<bool, NetvscError> {
+        let incoming = self.channel.incoming();
+        incoming.set_interrupt_mask(false);
+        let mut at = incoming.incoming()?;
+        if incoming.can_read(&mut at)? {
+            return Ok(true);
+        }
+        if self.crowded {
+            let outgoing = self.channel.outgoing();
+            let mut at = outgoing.outgoing()?;
+            return Ok(outgoing.can_write(&mut at, self.wanted)?);
+        }
+        Ok(false)
     }
 
     /// Waits for the host's signal, while initialisation waits for `step`. A wait that
@@ -194,6 +218,7 @@ impl<C: Channel> Wire<C> {
                     // between the write and this request, so the write is tried once more.
                     outgoing.set_pending_send_size(bytes)?;
                     self.crowded = true;
+                    self.wanted = bytes;
                     asked = true;
                 }
             }

@@ -182,6 +182,16 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         self.link
     }
 
+    /// Asks the host to signal when there is something to do, without waiting: true when
+    /// there is already, a packet to [`poll`](Netvsc::poll), or room for a frame
+    /// [`send`](Netvsc::send) found none for. A driver that waits on handles (its clients'
+    /// and, on a node, its channel's wake channel) polls until `None`, sends what waits,
+    /// then arms, and waits only when this answers false: the host's next packet, or the
+    /// room, signals the channel. As `moruna_storvsc::Storvsc::arm`.
+    pub fn arm(&mut self) -> Result<bool, NetvscError> {
+        self.wire.arm()
+    }
+
     /// The channel, for the caller to wait on between polls.
     pub fn channel(&mut self) -> &mut C {
         &mut self.wire.channel

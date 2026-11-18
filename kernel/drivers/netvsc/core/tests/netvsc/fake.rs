@@ -244,6 +244,12 @@ impl Card {
         self.driver.channel().wait(Some(DEADLINE))
     }
 
+    /// Asks the host to signal when there is something to do: whether there is already.
+    pub fn arm(&mut self) -> Result<bool, NetvscError> {
+        self.flush();
+        self.driver.arm()
+    }
+
     /// Has the host read everything the card has sent, and answer.
     pub fn run_host(&mut self) {
         self.host.borrow_mut().run(self.driver.channel().host());
