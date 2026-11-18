@@ -11,12 +11,15 @@
 //!   ([`Refused::Altered`]), and never kept.
 //! - **Kept** in memory for the next job ([`Cache`]), up to node config's `functions.cache_bytes`,
 //!   the least recently used evicted first, until the node stops. An image is kept once by its
-//!   SHA-256, whatever name or names it is registered under.
+//!   SHA-256, whatever name or names it is registered under. On a node it is kept in a memory
+//!   object of its own ([`MemoryImage`]), made once when it is fetched, in the cache's account of
+//!   exactly `functions.cache_bytes` (PM, item 3.6), so the job bound is honest.
 //!
-//! What a job's start is handed ([`Cache::images`]) is each image's bytes, shared, in the order
-//! the job names them, for `node-admission` to give the engine as a read-only memory object, the
-//! image stage's image with no copy: an image evicted while a job still holds it lives until the
-//! job lets go. `no_std`, with `alloc`, for `node-admission`.
+//! What a job's start is handed ([`Cache::images_kept`]) is each kept image, in the order the job
+//! names them; [`handover`] makes of them the handles `node-admission` gives the engine (PM, item
+//! 3.6): each image read only under `function.N`, with no copy, and the index of them under
+//! `functions`. An image evicted while a job still holds it lives until the job lets go.
+//! `no_std`, with `alloc`, for `node-admission`.
 #![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -112,6 +115,14 @@ pub enum Refused {
         /// Why, as the fetch said.
         why: String,
     },
+    /// The image was verified, and could not be kept: no memory for it in the cache's account,
+    /// which images a running job still holds keep charged after they are evicted.
+    Unkept {
+        /// The function's name.
+        name: String,
+        /// Why.
+        why: String,
+    },
 }
 
 /// `bytes` as lowercase hexadecimal digits.
@@ -145,15 +156,34 @@ impl fmt::Display for Refused {
                     "the function `{name}`'s image could not be fetched: {why}"
                 )
             }
+            Refused::Unkept { name, why } => {
+                write!(f, "the function `{name}`'s image could not be kept: {why}")
+            }
         }
+    }
+}
+
+/// What the cache keeps of a verified image, and hands to each job that uses it: its bytes, or on
+/// a node a memory object holding them ([`MemoryImage`]).
+pub trait Kept: Clone {
+    /// What an image of `len` bytes takes of the cache: its bytes, or the whole pages of the
+    /// memory object it is kept in.
+    fn charge(len: u64) -> u64;
+}
+
+impl Kept for Arc<[u8]> {
+    fn charge(len: u64) -> u64 {
+        len
     }
 }
 
 /// One kept image.
 #[derive(Debug)]
-struct Entry {
+struct Entry<K> {
     sha256: [u8; 32],
-    bytes: Arc<[u8]>,
+    kept: K,
+    /// What it takes of the cache.
+    charge: u64,
     /// When it was last handed to a job, on the cache's own count.
     used_at: u64,
 }
@@ -161,10 +191,10 @@ struct Entry {
 /// The images kept between jobs: at most `capacity` bytes of them, the least recently used
 /// evicted first.
 #[derive(Debug)]
-pub struct Cache {
+pub struct Cache<K = Arc<[u8]>> {
     capacity: u64,
     held: u64,
-    entries: Vec<Entry>,
+    entries: Vec<Entry<K>>,
     /// Counts each image handed to a job, to order them by use.
     clock: u64,
     fetches: u64,
@@ -172,8 +202,35 @@ pub struct Cache {
 }
 
 impl Cache {
-    /// An empty cache of `capacity` bytes: node config's `functions.cache_bytes`.
+    /// An empty cache of `capacity` bytes that keeps each image's bytes.
     pub fn new(capacity: u64) -> Self {
+        Self::keeping(capacity)
+    }
+
+    /// The verified image of `function`, its bytes: the kept one when the cache holds its
+    /// SHA-256, otherwise fetched through `fetch`, checked, and kept.
+    pub fn image(
+        &mut self,
+        function: &Registered,
+        fetch: &mut dyn Fetch,
+    ) -> Result<Arc<[u8]>, Refused> {
+        self.image_kept(function, fetch, &mut |bytes| Ok(Arc::from(bytes)))
+    }
+
+    /// The verified images of every function a job uses, in the order it names them; the first
+    /// that is refused refuses the job.
+    pub fn images(
+        &mut self,
+        functions: &[Registered],
+        fetch: &mut dyn Fetch,
+    ) -> Result<Vec<Arc<[u8]>>, Refused> {
+        self.images_kept(functions, fetch, &mut |bytes| Ok(Arc::from(bytes)))
+    }
+}
+
+impl<K: Kept> Cache<K> {
+    /// An empty cache of `capacity` bytes: node config's `functions.cache_bytes`.
+    pub fn keeping(capacity: u64) -> Self {
         Self {
             capacity,
             held: 0,
@@ -189,7 +246,7 @@ impl Cache {
         self.capacity
     }
 
-    /// The bytes of the images it keeps.
+    /// The bytes the images it keeps take of it.
     pub fn held(&self) -> u64 {
         self.held
     }
@@ -215,12 +272,14 @@ impl Cache {
     }
 
     /// The verified image of `function`: the kept one when the cache holds its SHA-256,
-    /// otherwise fetched through `fetch`, checked, and kept.
-    pub fn image(
+    /// otherwise fetched through `fetch`, checked, and kept as `keep` makes it of the bytes,
+    /// once the least recently used images have made room for it.
+    pub fn image_kept(
         &mut self,
         function: &Registered,
         fetch: &mut dyn Fetch,
-    ) -> Result<Arc<[u8]>, Refused> {
+        keep: &mut dyn FnMut(Vec<u8>) -> Result<K, String>,
+    ) -> Result<K, Refused> {
         self.clock += 1;
         if let Some(entry) = self
             .entries
@@ -229,7 +288,7 @@ impl Cache {
         {
             entry.used_at = self.clock;
             self.hits += 1;
-            return Ok(entry.bytes.clone());
+            return Ok(entry.kept.clone());
         }
         let too_large = || Refused::TooLarge {
             name: function.name.clone(),
@@ -246,7 +305,8 @@ impl Cache {
                 });
             }
         };
-        if bytes.len() as u64 > self.capacity {
+        let charge = K::charge(bytes.len() as u64);
+        if charge > self.capacity {
             return Err(too_large());
         }
         let found = sha256::digest(&bytes);
@@ -257,28 +317,38 @@ impl Cache {
                 found,
             });
         }
-        let bytes: Arc<[u8]> = Arc::from(bytes);
-        self.keep(function.sha256, bytes.clone());
-        Ok(bytes)
+        self.make_room(charge);
+        let kept = keep(bytes).map_err(|why| Refused::Unkept {
+            name: function.name.clone(),
+            why,
+        })?;
+        self.held += charge;
+        self.entries.push(Entry {
+            sha256: function.sha256,
+            kept: kept.clone(),
+            charge,
+            used_at: self.clock,
+        });
+        Ok(kept)
     }
 
-    /// The verified images of every function a job uses, in the order it names them; the first
-    /// that is refused refuses the job.
-    pub fn images(
+    /// The verified images of every function a job uses, in the order it names them, each kept
+    /// as `keep` makes it; the first that is refused refuses the job.
+    pub fn images_kept(
         &mut self,
         functions: &[Registered],
         fetch: &mut dyn Fetch,
-    ) -> Result<Vec<Arc<[u8]>>, Refused> {
+        keep: &mut dyn FnMut(Vec<u8>) -> Result<K, String>,
+    ) -> Result<Vec<K>, Refused> {
         functions
             .iter()
-            .map(|function| self.image(function, fetch))
+            .map(|function| self.image_kept(function, fetch, keep))
             .collect()
     }
 
-    /// Keeps `bytes` under `sha256`, evicting the least recently used until they fit.
-    fn keep(&mut self, sha256: [u8; 32], bytes: Arc<[u8]>) {
-        let size = bytes.len() as u64;
-        while self.held + size > self.capacity {
+    /// Evicts the least recently used images until `charge` more bytes fit.
+    fn make_room(&mut self, charge: u64) {
+        while self.held + charge > self.capacity {
             let Some((oldest, _)) = self
                 .entries
                 .iter()
@@ -288,16 +358,13 @@ impl Cache {
                 break;
             };
             let evicted = self.entries.swap_remove(oldest);
-            self.held -= evicted.bytes.len() as u64;
+            self.held -= evicted.charge;
         }
-        self.held += size;
-        self.entries.push(Entry {
-            sha256,
-            bytes,
-            used_at: self.clock,
-        });
     }
 }
+
+mod handover;
+pub use handover::{MemoryImage, handover};
 
 pub mod https;
 

@@ -179,6 +179,142 @@ fn an_image_larger_than_the_cache_or_unreachable_is_refused() {
     assert!(cache.is_empty());
 }
 
+/// The cache's account, of `limit` bytes.
+fn account(limit: u64) -> moruna_svc::Account {
+    moruna_svc::Account::carve(limit, "functions").unwrap()
+}
+
+/// What a test reads of a granted memory object: its first `len` bytes.
+fn read(handle: &moruna_svc::Handle, len: usize) -> Vec<u8> {
+    let memory = moruna_svc::Memory(handle.duplicate(Rights::READ | Rights::MAP).unwrap());
+    let view = memory
+        .map(0, (len as u64).div_ceil(4096) * 4096, moruna_svc::map::READ)
+        .unwrap();
+    let mut out = vec![0; len];
+    view.read(0, &mut out).unwrap();
+    out
+}
+
+use alloc::rc::Rc;
+use moruna_svc::Rights;
+
+#[test]
+fn on_a_node_an_image_is_kept_once_in_a_memory_object_of_the_caches_account() {
+    let cache_account = account(64 << 10);
+    let mut keep = |bytes: Vec<u8>| MemoryImage::new(&bytes, &cache_account.0).map(Rc::new);
+    let mut served = Served::with(&[
+        ("https://x/gate-score", SCORE),
+        ("https://x/gate-enrich", ENRICH),
+    ]);
+    let mut cache: Cache<Rc<MemoryImage>> = Cache::keeping(64 << 10);
+    let score = registered("gate-score", "https://x/gate-score", SCORE);
+    let enrich = registered("gate-enrich", "https://x/gate-enrich", ENRICH);
+    let images = cache
+        .images_kept(&[score.clone(), enrich.clone()], &mut served, &mut keep)
+        .unwrap();
+    assert_eq!(
+        (images[0].len(), images[1].len()),
+        (SCORE.len() as u64, ENRICH.len() as u64)
+    );
+    assert!(!images[0].is_empty());
+    // Whole pages of the cache and of its account.
+    assert_eq!(cache.held(), 2 * 4096);
+    assert_eq!(cache_account.usage().unwrap().used, 2 * 4096);
+    // The second job is handed the same object, with no fetch and no new memory.
+    let again = cache.image_kept(&score, &mut served, &mut keep).unwrap();
+    assert!(Rc::ptr_eq(&again, &images[0]));
+    assert_eq!(served.asked.len(), 2);
+    assert_eq!(cache_account.usage().unwrap().used, 2 * 4096);
+    // A job's handle reads the image and cannot write it.
+    let granted = again.grant().unwrap();
+    assert_eq!(read(&granted, SCORE.len()), SCORE);
+    let (_, rights) = granted.info().unwrap();
+    assert_eq!(rights, handover::GRANTED);
+    assert!(!rights.contains(Rights::WRITE));
+    // An image verified and then not kept (here, an account it may not charge) is refused as
+    // unkept, and the cache keeps nothing of it.
+    let readonly = moruna_svc::Account(
+        cache_account
+            .0
+            .duplicate(Rights::READ | Rights::TRANSFER)
+            .unwrap(),
+    );
+    let mut refuse = |bytes: Vec<u8>| MemoryImage::new(&bytes, &readonly.0).map(Rc::new);
+    let mut roomy: Cache<Rc<MemoryImage>> = Cache::keeping(1 << 20);
+    let refused = roomy
+        .image_kept(&enrich, &mut served, &mut refuse)
+        .unwrap_err();
+    assert!(matches!(refused, Refused::Unkept { .. }), "{refused:?}");
+    assert!(
+        refused
+            .to_string()
+            .starts_with("the function `gate-enrich`'s image could not be kept: no memory object"),
+        "{refused}"
+    );
+    assert!(roomy.is_empty());
+    assert!(MemoryImage::new(b"", &cache_account.0).is_err());
+}
+
+#[test]
+fn the_engine_is_given_each_image_under_its_slot_and_the_index_of_them() {
+    let cache_account = account(1 << 20);
+    let score = registered("gate-score", "https://x/gate-score", SCORE);
+    let enrich = registered("gate-enrich", "https://x/gate-enrich", ENRICH);
+    let images =
+        [SCORE, ENRICH].map(|bytes| Rc::new(MemoryImage::new(bytes, &cache_account.0).unwrap()));
+    let given = handover(&[score.clone(), enrich.clone()], &images).unwrap();
+    let names: Vec<&str> = given.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["function.0", "function.1", "functions"]);
+    for (_, handle) in &given {
+        let (kind, rights) = handle.info().unwrap();
+        assert_eq!(
+            (kind, rights),
+            (moruna_svc::ObjectType::Memory, handover::GRANTED)
+        );
+    }
+    assert_eq!(read(&given[0].1, SCORE.len()), SCORE);
+    assert_eq!(read(&given[1].1, ENRICH.len()), ENRICH);
+    // The index the engine reads: its text, then a zero byte.
+    let index = read(&given[2].1, 4096);
+    let end = index.iter().position(|b| *b == 0).unwrap();
+    let entries =
+        node_protocol::functions::parse(core::str::from_utf8(&index[..end]).unwrap()).unwrap();
+    assert_eq!(
+        entries,
+        [
+            node_protocol::functions::Entry {
+                name: "gate-score".into(),
+                sha256: score.sha256,
+                size: SCORE.len() as u64,
+            },
+            node_protocol::functions::Entry {
+                name: "gate-enrich".into(),
+                sha256: enrich.sha256,
+                size: ENRICH.len() as u64,
+            },
+        ]
+    );
+    // A job that uses no function is given nothing; a mismatch or a name that is not a
+    // registered function's is refused.
+    assert!(handover(&[], &[]).unwrap().is_empty());
+    assert!(
+        handover(core::slice::from_ref(&score), &images)
+            .unwrap_err()
+            .contains("1 functions and 2")
+    );
+    let upper = registered("Gate", "https://x/gate", SCORE);
+    assert!(
+        handover(&[upper], &images[..1])
+            .unwrap_err()
+            .contains("index")
+    );
+    let many: Vec<Registered> = (0..=node_protocol::functions::MAX)
+        .map(|n| registered(&format!("f{n}"), "https://x/f", SCORE))
+        .collect();
+    let copies: Vec<Rc<MemoryImage>> = many.iter().map(|_| images[0].clone()).collect();
+    assert!(handover(&many, &copies).unwrap_err().contains("TooMany"));
+}
+
 #[test]
 fn a_registered_sha256_is_64_lowercase_hex_digits() {
     let digest = hex(&sha256::digest(SCORE));

@@ -1337,6 +1337,7 @@ dependencies = [
  "moruna-node-http",
  "moruna-svc",
  "netstack-protocol",
+ "node-protocol",
  "rcgen",
  "rustls",
 ]
