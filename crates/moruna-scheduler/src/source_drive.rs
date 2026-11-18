@@ -293,6 +293,19 @@ fn cut_to_room(
     if !split.sub_splittable || !source.source.range_reads_own_rows(split) {
         return None;
     }
+    let fits = rows_within(split, rows, room, learned)?;
+    let cut = RowRange {
+        start: rows.start,
+        end: rows.start + fits,
+    };
+    let decoded = estimated_bytes(split, cut) as f64 * source.decoded.ratio();
+    (fits > 0 && decoded >= shared.cfg.morsel_min as f64).then_some(fits)
+}
+
+/// The most rows from `rows.start`, within `rows`, a read of `split` may take to be charged no
+/// more than `cap`; `None` when all of `rows` fits, and 0 when not even one row does. The charge
+/// only grows with the rows, so it is found by halving.
+fn rows_within(split: &Split, rows: RowRange, cap: u64, learned: f64) -> Option<u64> {
     let charge = |most: u64| {
         read_charge(
             split,
@@ -303,25 +316,69 @@ fn cut_to_room(
             learned,
         )
     };
-    // The charge only grows with the rows, so the most rows that fit is found by halving.
     let (mut fits, mut over) = (0u64, rows.end.saturating_sub(rows.start));
-    if over == 0 || charge(over) <= room {
+    if over == 0 || charge(over) <= cap {
         return None;
     }
     while over - fits > 1 {
         let mid = fits + (over - fits) / 2;
-        if charge(mid) <= room {
+        if charge(mid) <= cap {
             fits = mid;
         } else {
             over = mid;
         }
     }
-    let cut = RowRange {
-        start: rows.start,
-        end: rows.start + fits,
-    };
-    let decoded = estimated_bytes(split, cut) as f64 * source.decoded.ratio();
-    (fits > 0 && decoded >= shared.cfg.morsel_min as f64).then_some(fits)
+    Some(fits)
+}
+
+/// 3A (6.3b): the most rows from `rows.start` a read of `split` may take so that no morsel made
+/// of it is larger than the budget of the tier it is placed in: its charge, grown by the most
+/// any path of stages from the source grows a morsel (`grown`), fits that budget. At least one
+/// row. `None` when the read fits as it is, or its split cannot be cut, which a morsel larger
+/// than its tier then answers by being admitted alone (`decide`).
+fn tier_cap(
+    shared: &Shared,
+    source: &SourceEnd,
+    split: &Split,
+    rows: RowRange,
+    learned: f64,
+) -> Option<u64> {
+    if !split.sub_splittable {
+        return None;
+    }
+    let budget = shared.placement.floor(tier0(shared), 0).budget;
+    let cap = (budget as f64 / grown(shared, &source.outputs)) as u64;
+    rows_within(split, rows, cap, learned).map(|rows| rows.max(1))
+}
+
+/// What a morsel read into `queues` comes to at the most, over its own bytes, along every path
+/// of stages it feeds: each stage's growth (`StageEntry::growth`) multiplied along the way, and
+/// never under 1, its size in the queue it is read into.
+fn grown(shared: &Shared, queues: &[StageId]) -> f64 {
+    fn walk(shared: &Shared, queue: StageId, at: f64, depth: usize) -> f64 {
+        // A queue a sink takes ends the path; a path is never longer than there are stages.
+        if depth > shared.stages.len() {
+            return at;
+        }
+        let Some(moruna_kernel::Consumer::Kernel { stage, .. }) =
+            shared.topology.link(queue).map(|link| link.to)
+        else {
+            return at;
+        };
+        let Some(entry) = shared.stages.iter().find(|entry| entry.stage == stage) else {
+            return at;
+        };
+        let here = at * entry.growth();
+        entry
+            .outputs
+            .iter()
+            .map(|&next| walk(shared, next, here, depth + 1))
+            .fold(at.max(here), f64::max)
+    }
+    queues
+        .iter()
+        .map(|&queue| walk(shared, queue, 1.0, 0))
+        .fold(1.0, f64::max)
 }
 
 /// A read recorded by `take_next_range` (or by a resume's recompute list) has reached the
@@ -535,10 +592,20 @@ fn issue_reads<'a>(
         {
             break;
         }
-        let Some((index, rows)) = peek_next_range(shared, source) else {
+        // 6.3b: a morsel larger than its tier's whole budget waits while another holds the tier
+        // over its budget; a fresh read now would only add to what it waits on.
+        if shared.oversize_waiting.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        let Some((index, mut rows)) = peek_next_range(shared, source) else {
             break;
         };
         let split = &source.plan[index];
+        // 3A (6.3b): no read comes to more than the budget of the tier it is placed in.
+        let tier_rows = tier_cap(shared, source, split, rows, learned);
+        if let Some(most) = tier_rows {
+            rows.end = rows.start + most;
+        }
         let whole_charge = read_charge(split, rows, learned);
         // 3A (6.3a): a read that does not fit beside those in flight, though it fits the arena as
         // the arena stands, is cut to the room left, from a split that can be cut: it is the
@@ -564,6 +631,10 @@ fn issue_reads<'a>(
                 break;
             }
         }
+        let most_rows = match (tier_rows, most_rows) {
+            (Some(tier), Some(room)) => Some(tier.min(room)),
+            (tier, room) => tier.or(room),
+        };
         let Some((index, rows, seq, whole)) = take_next_range(shared, source, None, most_rows)
         else {
             break;

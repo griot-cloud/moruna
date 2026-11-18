@@ -44,6 +44,8 @@ mod sc_t46_a_stuck_sink_is_flushed;
 // Item 6.3a: a budget bounds how far reading runs ahead, not how many workers decode.
 mod sc_t47_a_budget_bounds_reads_not_decoders;
 mod sc_t47_b_parquet_groups_cut_by_their_pages;
+// Item 6.3b: no morsel is larger than the smallest budget of the tiers it must be placed in.
+mod sc_t48_a_morsel_fits_its_tiers;
 // Item 6.3c: a read in flight is counted once by the arena's admission.
 mod sc_t49_a_read_in_flight_is_counted_once;
 mod sc_t4_one_record_per_morsel_stage;
