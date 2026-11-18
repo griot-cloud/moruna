@@ -86,7 +86,9 @@ Implements the OS design, section 1, OpenStack column.
 - **`boot_ms`** counts from the core's first instruction to ready. Firmware and GRUB time is
   measured from outside, at bring-up, as create-to-ready.
 - **Limits:** services started within 5 s; an address within 30 s; instance data within 90 s.
-- **Failure:** the line `moruna: fatal <stage>: <reason>`, then the machine powers off. The first
+- **Failure:** the line `moruna: fatal <stage>: <reason>`, then the machine stays halted for 60 s and powers off. The
+  60 s hold is so the console can still be read: OpenStack serves a guest's console log only while it runs and shows
+  SHUTOFF 15 s late, so a node that powers off at once leaves no readable cause (1.6b). The first
   fatal line is the cause, and tools read only it; consequence lines may follow. The stage
   is `core`, or the name of the service that can't go on, unless this document names another. A node
   never hangs silently, never restarts itself in a loop, and never offers a prompt. A service that
