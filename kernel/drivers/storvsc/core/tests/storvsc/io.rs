@@ -158,6 +158,64 @@ fn flush() {
 }
 
 #[test]
+fn a_transfer_starts_at_a_byte_offset_in_its_first_page() {
+    let (mut device, host) = device();
+    let disk = disk(&mut device, &host, 0);
+    let data = pattern(7, 3 * 512);
+    // Written from byte 1000 of page 10, so across pages 10 and 11.
+    host.borrow_mut()
+        .memory
+        .write_at(&[10, 11], 1000, &data)
+        .unwrap();
+    let id = device.write_offset(&disk, 4, 3, 1000, &[10, 11]).unwrap();
+    assert_eq!(moved(&mut device, id), 1536);
+    // Read back into byte 3000 of page 20, across pages 20 and 21; nothing before it moves.
+    let id = device
+        .read_offset(&disk, 4, 3, 3000, &[20, 21, 22])
+        .unwrap();
+    assert_eq!(moved(&mut device, id), 1536);
+    let memory = &host.borrow().memory;
+    assert_eq!(memory.read_from(&[20, 21], 3000, 1536).unwrap(), data);
+    assert_eq!(memory.read(&[20], 3000).unwrap(), vec![0; 3000]);
+    assert_eq!(memory.read(&[22], PAGE).unwrap(), vec![0; PAGE]);
+}
+
+#[test]
+fn an_offset_is_within_the_first_page_and_its_pages_cover_the_transfer() {
+    let (mut device, host) = device();
+    let disk = disk(&mut device, &host, 0);
+    assert!(matches!(
+        device.read_offset(&disk, 0, 1, PAGE, &[1, 2]),
+        Err(Error::Offset)
+    ));
+    // 512 bytes from byte 3700 reach into a second page.
+    assert!(matches!(
+        device.write_offset(&disk, 0, 1, 3700, &[1]),
+        Err(Error::ShortBuffer)
+    ));
+    assert_eq!(device.in_flight(), 0);
+
+    // A ring of one page names fewer pages than the host would move: the largest transfer
+    // is the ring's, and an offset would make it name one page more.
+    let (link, host) = pair_sized(PAGE);
+    host.borrow_mut().max_transfer_bytes = 0x40_0000;
+    host.borrow_mut().disks.insert(
+        (DISK.path, DISK.target, DISK.lun),
+        FakeDisk::new(512, 16384, b""),
+    );
+    let mut device = Storvsc::new(link).unwrap();
+    ready(&mut device);
+    let disk = crate::disk(&mut device, &host, 0);
+    let count = device.max_transfer_bytes() / disk.block_size();
+    let pages: Vec<u64> = (0..=count as u64).collect();
+    assert!(matches!(
+        device.read_offset(&disk, 0, count, 512, &pages),
+        Err(Error::TooLarge)
+    ));
+    assert_eq!(device.in_flight(), 0);
+}
+
+#[test]
 fn report_luns_lists_the_disks_of_a_target() {
     let (mut device, host) = device();
     {
@@ -706,6 +764,10 @@ fn every_error_says_what_it_is() {
         (
             Error::ShortBuffer,
             "the pages given do not cover the transfer",
+        ),
+        (
+            Error::Offset,
+            "a byte offset that is not within the first page",
         ),
     ];
     for (error, text) in errors {

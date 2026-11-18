@@ -82,6 +82,8 @@ pub struct Storvsc<C: Channel> {
     pending: BTreeMap<u64, Pending>,
     version: Option<u16>,
     max_transfer: u32,
+    /// The most pages one request's packet can name; 0 until ready.
+    max_pages: usize,
 }
 
 impl<C: Channel> Storvsc<C> {
@@ -98,6 +100,7 @@ impl<C: Channel> Storvsc<C> {
             pending: BTreeMap::new(),
             version: None,
             max_transfer: 0,
+            max_pages: 0,
         };
         device.start(Step::Begin)?;
         Ok(device)
@@ -136,6 +139,7 @@ impl<C: Channel> Storvsc<C> {
             address,
             scsi::read_capacity16(),
             Disk::CAPACITY_BYTES,
+            0,
             &[page],
         )
     }
@@ -144,7 +148,7 @@ impl<C: Channel> Storvsc<C> {
     /// writes its answer at the start of the guest page `page`; once the request completes,
     /// give the bytes it reports to [`serial`](crate::serial).
     pub fn read_serial(&mut self, address: Address, page: u64) -> Result<u64, Error> {
-        self.request(address, scsi::inquiry_serial(), SERIAL_BYTES, &[page])
+        self.request(address, scsi::inquiry_serial(), SERIAL_BYTES, 0, &[page])
     }
 
     /// Asks the target of `address` for its logical units (REPORT LUNS), at its LUN 0 as
@@ -153,7 +157,7 @@ impl<C: Channel> Storvsc<C> {
     /// [`luns`](crate::luns). A device that does not know the command fails it.
     pub fn report_luns(&mut self, address: Address, page: u64) -> Result<u64, Error> {
         let target = Address { lun: 0, ..address };
-        self.request(target, scsi::report_luns(), scsi::LUNS_BYTES, &[page])
+        self.request(target, scsi::report_luns(), scsi::LUNS_BYTES, 0, &[page])
     }
 
     /// Reads `count` blocks from `block` into the guest pages `pages`, from the first page's
@@ -165,8 +169,23 @@ impl<C: Channel> Storvsc<C> {
         count: u32,
         pages: &[u64],
     ) -> Result<u64, Error> {
+        self.read_offset(disk, block, count, 0, pages)
+    }
+
+    /// Reads `count` blocks from `block` into the guest pages `pages`, from byte `offset` of
+    /// the first page, which is below [`PAGE`]: the GPA direct range's own byte offset, so a
+    /// transfer lands anywhere in the caller's memory with no copy (READ 16).
+    pub fn read_offset(
+        &mut self,
+        disk: &Disk,
+        block: u64,
+        count: u32,
+        offset: usize,
+        pages: &[u64],
+    ) -> Result<u64, Error> {
         let bytes = span(disk, block, count)?;
-        self.request(disk.address(), scsi::read16(block, count), bytes, pages)
+        let command = scsi::read16(block, count);
+        self.request(disk.address(), command, bytes, offset, pages)
     }
 
     /// Writes `count` blocks at `block` from the guest pages `pages`, from the first page's
@@ -178,14 +197,28 @@ impl<C: Channel> Storvsc<C> {
         count: u32,
         pages: &[u64],
     ) -> Result<u64, Error> {
+        self.write_offset(disk, block, count, 0, pages)
+    }
+
+    /// Writes `count` blocks at `block` from the guest pages `pages`, from byte `offset` of
+    /// the first page, which is below [`PAGE`] (WRITE 16).
+    pub fn write_offset(
+        &mut self,
+        disk: &Disk,
+        block: u64,
+        count: u32,
+        offset: usize,
+        pages: &[u64],
+    ) -> Result<u64, Error> {
         let bytes = span(disk, block, count)?;
-        self.request(disk.address(), scsi::write16(block, count), bytes, pages)
+        let command = scsi::write16(block, count);
+        self.request(disk.address(), command, bytes, offset, pages)
     }
 
     /// Asks the disk at `address` to put every write it has answered on stable storage
     /// (SYNCHRONIZE CACHE).
     pub fn flush(&mut self, address: Address) -> Result<u64, Error> {
-        self.request(address, scsi::synchronize_cache(), 0, &[])
+        self.request(address, scsi::synchronize_cache(), 0, 0, &[])
     }
 
     /// Reads what the host has sent: one step of the initialisation, or one completion.
@@ -351,7 +384,8 @@ impl<C: Channel> Storvsc<C> {
                 let properties: ChannelProperties = field(body).ok_or(Error::Malformed(
                     Malformed("a properties answer shorter than the properties"),
                 ))?;
-                let named = Rings::max_pages(&self.channel) as u64 * PAGE as u64;
+                self.max_pages = Rings::max_pages(&self.channel);
+                let named = self.max_pages as u64 * PAGE as u64;
                 self.max_transfer = named.min(properties.max_transfer_bytes as u64) as u32;
                 // The largest request names the pages of the largest transfer.
                 let pages = (self.max_transfer as usize).div_ceil(PAGE);
@@ -399,13 +433,14 @@ impl<C: Channel> Storvsc<C> {
         }
     }
 
-    /// Sends one SCSI command for `bytes` of data in the first pages of `pages`, and returns
-    /// its transaction ID.
+    /// Sends one SCSI command for `bytes` of data in the first pages of `pages`, from byte
+    /// `offset` of the first, and returns its transaction ID.
     fn request(
         &mut self,
         address: Address,
         command: Command,
         bytes: u32,
+        offset: usize,
         pages: &[u64],
     ) -> Result<u64, Error> {
         match self.state {
@@ -413,12 +448,18 @@ impl<C: Channel> Storvsc<C> {
             State::Ready => {}
             State::Failed => return Err(Error::Failed),
         }
-        if bytes > self.max_transfer {
+        if offset >= PAGE {
+            return Err(Error::Offset);
+        }
+        // An offset can make the transfer span one page more than the largest names.
+        let named = match bytes {
+            0 => 0,
+            _ => (offset + bytes as usize).div_ceil(PAGE),
+        };
+        if bytes > self.max_transfer || named > self.max_pages {
             return Err(Error::TooLarge);
         }
-        let pages = pages
-            .get(..(bytes as usize).div_ceil(PAGE))
-            .ok_or(Error::ShortBuffer)?;
+        let pages = pages.get(..named).ok_or(Error::ShortBuffer)?;
         if self.pending.len() >= self.limit {
             return Err(Error::Full);
         }
@@ -427,7 +468,7 @@ impl<C: Channel> Storvsc<C> {
         // ring refuses one that names none.
         let data = match bytes {
             0 => None,
-            _ => Some(PagedRange::new(0, bytes as usize, pages).ok_or(Error::ShortBuffer)?),
+            _ => Some(PagedRange::new(offset, bytes as usize, pages).ok_or(Error::ShortBuffer)?),
         };
         let request = scsi::request(address, &command, bytes);
         let id = self.take_id();

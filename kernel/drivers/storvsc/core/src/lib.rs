@@ -109,6 +109,8 @@ pub enum Error {
     TooLarge,
     /// The pages given do not cover the transfer.
     ShortBuffer,
+    /// A byte offset that is not within the first page.
+    Offset,
 }
 
 impl fmt::Display for Error {
@@ -140,6 +142,7 @@ impl fmt::Display for Error {
             Error::OutOfRange => f.write_str("the blocks reach past the disk's end"),
             Error::TooLarge => f.write_str("more bytes than one request may carry"),
             Error::ShortBuffer => f.write_str("the pages given do not cover the transfer"),
+            Error::Offset => f.write_str("a byte offset that is not within the first page"),
         }
     }
 }
