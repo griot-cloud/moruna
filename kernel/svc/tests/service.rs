@@ -926,6 +926,33 @@ fn sv_t7_a_lax_server_fails_the_checks_of_unknown_and_malformed_requests() {
     );
 }
 
+/// A server that answers like [`Lax`] and speaks calc at a newer minor than the suite's.
+struct Newer;
+
+impl Handler for Newer {
+    fn protocol(&self) -> ProtocolId {
+        ProtocolId {
+            minor: calc::ID.minor + 1,
+            ..calc::ID
+        }
+    }
+    fn handle(&mut self, _: &mut Context<'_>, _: u16, _: &mut Decoder<'_>) -> Outcome {
+        Outcome::Reply(Encoder::new())
+    }
+}
+
+/// A driver checked by its protocol's older suite (`moruna.driver.block` 2.2 by the suite of
+/// 2.0, found on Azure) names its own, newer minor when it refuses: the handshake checks
+/// accept it, as the welcome check does.
+#[test]
+fn sv_t7_a_server_of_a_newer_minor_passes_the_handshake_checks() {
+    let failed = broken(|| Box::new(Newer));
+    assert!(
+        !failed.iter().any(|n| n.starts_with("handshake")),
+        "{failed:?}"
+    );
+}
+
 #[test]
 fn sv_t7_a_server_that_keeps_handles_fails_the_handle_check() {
     let failed = broken(|| Box::new(Hoarder(Vec::new())));

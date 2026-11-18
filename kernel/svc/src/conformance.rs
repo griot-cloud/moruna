@@ -314,9 +314,8 @@ impl Runner<'_> {
         let mut d = answer.decoder();
         match Refused::decode(&mut d) {
             Ok(r)
-                if r.reason == reason
-                    && r.server == self.suite.id.hello()
-                    && d.finish().is_ok() => {}
+                if r.reason == reason && speaks(self.suite.id, &r.server) && d.finish().is_ok() => {
+            }
             Ok(r) => return Err(format!("refused for {:?} naming {:?}", r.reason, r.server)),
             Err(e) => return Err(format!("a refusal that does not decode: {e:?}")),
         }
@@ -701,4 +700,11 @@ pub fn run_pair(
 /// A typed client's error, for a case that calls through a `Client`.
 pub fn call_error<E: core::fmt::Debug>(e: CallError<E>) -> Fail {
     format!("{e:?}")
+}
+
+/// Whether `server`, the version a refusal names as the server's own, is the suite's protocol
+/// at its major and at its minor or a newer one: the versions the welcome check accepts. A
+/// driver of `moruna.driver.block` 2.2 is checked by the suite of 2.0, and names 2.2.
+fn speaks(id: ProtocolId, server: &Hello) -> bool {
+    server.name == id.name && server.major == id.major && server.minor >= id.minor
 }
