@@ -252,8 +252,10 @@ impl Pal for Sys {
         moruna::process::exit(status)
     }
 
-    unsafe fn exit_thread(stack_base: *mut (), stack_size: usize) -> ! {
-        unsafe { moruna::thread::exit(stack_base as usize, stack_size) }
+    /// The runtime unmaps the thread's stack after its end, and its block is freed by its join
+    /// or its detach (`pthread::dealloc_thread`): the thread only ends.
+    unsafe fn exit_thread(_stack_base: *mut (), _stack_size: usize) -> ! {
+        moruna::thread::exit()
     }
 
     fn fchdir(_fildes: c_int) -> Result<()> {
@@ -615,13 +617,13 @@ impl Pal for Sys {
         Err(Errno(EBADF))
     }
 
+    /// Not taken on Moruna: `pthread_create` starts its threads on the runtime's one thread
+    /// path (`pthread::create_moruna`, system design 5B).
     unsafe fn rlct_clone(
-        stack: *mut usize,
-        os_specific: &mut ThreadId,
+        _stack: *mut usize,
+        _os_specific: &mut ThreadId,
     ) -> Result<pthread::OsTid, Errno> {
-        let id = os_specific.get();
-        unsafe { moruna::thread::spawn(stack) }.map_err(errno)?;
-        Ok(pthread::OsTid { thread_id: id })
+        nosys()
     }
 
     unsafe fn rlct_kill(_os_tid: pthread::OsTid, _signal: usize) -> Result<()> {

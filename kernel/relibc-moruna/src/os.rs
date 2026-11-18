@@ -17,11 +17,14 @@ pub use core_os::*;
 #[cfg(not(target_os = "moruna"))]
 pub use host::*;
 
+/// The core's calls, through std's own copy of moruna-sys (`std::os::moruna::moruna_sys`), so
+/// relibc shares std's runtime: its start page, its log, its threads and their control blocks
+/// (system design 5B). A second copy of the crate would have none of them.
 #[cfg(target_os = "moruna")]
 mod core_os {
     use core::sync::atomic::AtomicU32;
 
-    use moruna_sys as sys;
+    use std::os::moruna::moruna_sys as sys;
 
     use super::Access;
 
@@ -86,10 +89,12 @@ mod core_os {
         sys::now()
     }
 
-    /// The wall clock: 1970 plus the monotonic clock, as std's is while the clock page carries
-    /// no realtime base (ABI 2.8, item 5.0, which this takes when it lands).
+    /// The wall clock, std's: the clock page's realtime base plus the monotonic clock, or 1970
+    /// plus the monotonic clock while the base is unset (ABI 2.8).
     pub fn realtime_ns() -> u64 {
-        sys::now()
+        let now = sys::rt::time::SystemTime::now();
+        now.sub_time(&sys::rt::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
     }
 
     pub fn futex_wait(word: &AtomicU32, expected: u32, deadline: u64) -> Result<(), u32> {
@@ -108,30 +113,20 @@ mod core_os {
         sys::set_fs(base as u64).map_err(code)
     }
 
-    /// The calling thread's FS base, zero before one is set. The core runs only on CPUs with
-    /// FSGSBASE, which it enables for every process (SDD 20, f.15).
+    /// The calling thread's control block, which its FS base and FS:0 hold: zero before the
+    /// runtime gives it one.
     pub fn fs_base() -> usize {
-        let base: usize;
-        // SAFETY: `rdfsbase` reads the FS base register and touches no memory.
-        unsafe {
-            core::arch::asm!("rdfsbase {}", out(reg) base, options(nomem, nostack, preserves_flags));
-        }
-        base
+        sys::rt::tls::current() as usize
     }
 
-    /// Standard output and error, a line of the task's console. Item 5.0's change gives them
-    /// std's writer, the task's log, which this calls once it lands (system design 5B).
+    /// Standard output and error: std's writer, lines of the task's log (system design 5B).
     pub fn write_out(bytes: &[u8]) -> usize {
-        if let Some(console) = sys::start::peek("console") {
-            for chunk in bytes.chunks(sys::limits::DEBUG_WRITE_MAX) {
-                let _ = sys::raw::debug_write(console, chunk);
-            }
-        }
-        bytes.len()
+        sys::rt::stdio::write(bytes)
     }
 
+    /// The process's end, once std's writer has given the log its last line.
     pub fn exit(code: i32) -> ! {
-        sys::exit(i64::from(code))
+        sys::rt::exit(code)
     }
 
     pub fn name() -> &'static str {
@@ -142,41 +137,42 @@ mod core_os {
         sys::abi_version()
     }
 
-    /// Starts a thread at `entry(arg)` on a stack whose top is `stack_top`.
-    pub fn spawn(entry: extern "C" fn(u64) -> !, stack_top: usize, arg: usize) -> Result<(), u32> {
-        // The thread runs on: its handle is not needed to join it (relibc waits on a futex).
-        sys::Thread::spawn(entry, stack_top as u64, arg as u64)
+    /// `thread_yield` (ABI 2.8).
+    pub fn yield_now() {
+        sys::rt::thread::yield_now();
+    }
+
+    /// Starts a thread on the one thread path, std's and the C library's (system design 5B): a
+    /// stack of `stack` bytes at least with a guard page, and the thread's block of TLS with its
+    /// control block, installed before `main(arg)` runs. The thread is not joined through the
+    /// runtime: its stack is unmapped after it ends, and relibc waits on its own futex.
+    pub fn spawn(stack: usize, main: extern "C" fn(usize), arg: usize) -> Result<(), u32> {
+        sys::rt::thread::spawn(stack, main, arg)
             .map(drop)
             .map_err(code)
     }
 
-    /// Unmaps the calling thread's stack and ends the thread, touching the stack no more once
-    /// the unmap is asked for.
+    /// Ends the calling thread and keeps its block, which its `pthread_t` lies in, for the
+    /// join or the detach that frees it ([`release`]).
+    pub fn thread_exit() -> ! {
+        sys::thread_exit()
+    }
+
+    /// Frees a thread's block: one that ended, or the caller's own.
     ///
     /// # Safety
     ///
-    /// The range is the calling thread's own stack, or empty, and nothing else uses it.
-    pub unsafe fn exit_thread(stack: usize, len: usize) -> ! {
-        // SAFETY: two system calls with their arguments in registers, the second of which does
-        // not return; neither reads the stack.
-        unsafe {
-            core::arch::asm!(
-                "test rsi, rsi",
-                "jz 2f",
-                "mov rax, {unmap}",
-                "syscall",
-                "2:",
-                "mov rax, {exit}",
-                "syscall",
-                "ud2",
-                unmap = const moruna_abi::nr::MEMORY_UNMAP,
-                exit = const moruna_abi::nr::THREAD_EXIT,
-                in("rdi") stack,
-                in("rsi") len,
-                options(noreturn, nostack),
-            )
-        }
+    /// `control` is a block the thread path made, for a thread that has ended or is the caller,
+    /// which reads none of its thread-locals after.
+    pub unsafe fn release(control: usize) {
+        // SAFETY: the caller's contract.
+        unsafe { sys::rt::tls::release(control as *mut sys::rt::tls::Control) }
     }
+
+    /// Where the bytes the control block keeps for the C library end: a C library's own
+    /// per-thread state fits below it.
+    pub const LIBC_END: usize =
+        core::mem::offset_of!(sys::rt::tls::Control, libc) + sys::rt::tls::LIBC_AREA;
 }
 
 /// Stand-ins over the host, for tests: memory from the host's allocator, its clock, a futex
@@ -340,6 +336,10 @@ mod host {
     /// A test cannot end its process: the end is a panic it can catch.
     pub fn exit(code: i32) -> ! {
         std::panic::panic_any(code)
+    }
+
+    pub fn yield_now() {
+        std::thread::yield_now();
     }
 
     pub fn name() -> &'static str {

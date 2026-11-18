@@ -44,9 +44,12 @@ arm beside Motor's.
   In order: the first thread's thread-locals and control block from the start page's process;
   std's log, which stdout and stderr (and the C library's descriptors 1 and 2) write to; the C
   library's own initialization when one is linked (it defines `moruna_libc_init`, a weak symbol
-  here); then `main`, with the process's name as its one argument (`argc` 1). After `main`, the
-  first thread's thread-local destructors, and the exit with its code once the last line of
-  stdout and stderr is out. `abort_internal`, where a panic ends, exits with code 101, a
+  here); the program's `.preinit_array` and `.init_array`, which `kernel/targets/x86_64-moruna.ld`
+  bounds (item 5.2b); then `main`, with the process's name as its one argument (`argc` 1). After
+  `main`, the first thread's thread-local destructors, then the C library's `exit` when one is
+  linked (`moruna_libc_exit`: its `atexit` functions, the fini array, its streams flushed), or
+  else the fini array here, and the exit with its code once the last line of stdout and stderr
+  is out. `abort_internal`, where a panic ends, exits with code 101, a
   panicking program's code on Moruna.
 - **alloc:** the process's heap, `moruna_sys`'s, which std's `System` allocates from.
 - **thread:** the one thread path, `moruna_sys::rt::thread`, which the C library's

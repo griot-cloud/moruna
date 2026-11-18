@@ -53,11 +53,15 @@
   "modified_upstream_files": {
     "Cargo.lock": {
       "upstream_sha256": "790d5cb8807db73793dbd43fc09b88beaa50e3c0886dc7c40d5adaf8fad82283",
-      "patched_sha256": "d0d414402f3bfbf9ac07596807279ef7e9555720e6348ddf8f3c5ce2ee165a2e"
+      "patched_sha256": "2b6a55206d798075d72ac3b8c71de8e0a561a24df648c7a6badc70475c27395c"
     },
     "Cargo.toml": {
       "upstream_sha256": "ff73ed1f29e24e4f145d5cf373154cc55dce89771c035725035a0fe7fcf0cca5",
       "patched_sha256": "f8e417bd610a03e8f40b1ad2b7cdfe5512ebdb0412d16392e9589ba967dd4535"
+    },
+    "cbindgen.globdefs.toml": {
+      "upstream_sha256": "fb48cccd4df3da134a45990c14f5b103c2d9cc252b45e57023b3a3cd2b0ed9e7",
+      "patched_sha256": "c4b1f5bf85422cc6eb5458b0c568cc170d34b4d26b0dead80e61e23f2cb536c3"
     },
     "dlmalloc-rs/Cargo.toml": {
       "upstream_sha256": "a677a6d15fe3552065fa0fd72fe4df6233c9d0ffa0e3c4b88cbaecc50eaeb40f",
@@ -157,11 +161,11 @@
     },
     "src/ld_so/mod.rs": {
       "upstream_sha256": "b95199804a4b1550104163d2479073ef408181be7c1570c2131a9b317d25cc16",
-      "patched_sha256": "8436e50f1acf2d5179ff450c9da7e1e7851ceb074259600cef5a901ea5591e29"
+      "patched_sha256": "6d36276ffba3fa576639cad103ecc36e0e879c6c9f8dc1836e2878e0c5386727"
     },
     "src/ld_so/tcb.rs": {
       "upstream_sha256": "e7478c1ef9908aba0848cfc4bd9b49c3a0540874f2151049a64bc5e00ed94d07",
-      "patched_sha256": "07857231f39ae37b3916acc1acf00ac0d83febe4120970e68ccd98b5f9051479"
+      "patched_sha256": "ec2c16144c70de5265e9cc3c53aa0cd7e5d013d82e063b8ed308f564141fc80b"
     },
     "src/lib.rs": {
       "upstream_sha256": "ab4a48771ea8a0b3780bc9a7ec2d02cb4be62c5c342827977485cc3d4d944847",
@@ -177,7 +181,11 @@
     },
     "src/pthread/mod.rs": {
       "upstream_sha256": "e7f3e47a4dbd46cf3c9ffc442cd3dd006fff64c43cb1625f4b23774955eb6d31",
-      "patched_sha256": "a108f666b5cbd913c348af90247a164aae7354492605154b1609db381d0c5fba"
+      "patched_sha256": "c7ce33cdb0b354d08f2401faa5c142f5df02afc4f795180a3f4f5f3ed438c6c8"
+    },
+    "src/start.rs": {
+      "upstream_sha256": "a5c46a5191151a37b7d3f94f19e5d0133846a41d738e12e4f7eaeee9d475d27f",
+      "patched_sha256": "7b66be439e4bfbeb597a98719c02cd3b80e592459f2ff4a1115afec3c3b214ef"
     },
     "src/sync/mod.rs": {
       "upstream_sha256": "ab27e6ab289cf59cd8934a60618fee2d561e5b6faa8f5e004188e3d723b9c222",
@@ -191,7 +199,7 @@
     },
     {
       "path": "src/platform/moruna/mod.rs",
-      "sha256": "bfa7c9f1fcd2936a02deac36cd0f8c73f19cc1c54001587471a16c89ba15c990"
+      "sha256": "397bab69a3facb8d999e0cdc3006b98f21b6a954f3e536629984e40d613e9bb6"
     },
     {
       "path": "src/platform/moruna/ptrace.rs",

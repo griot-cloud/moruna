@@ -276,3 +276,52 @@ pub unsafe extern "C" fn relibc_start_v1(
 
     unreachable!();
 }
+
+/// Moruna: the C library's start (system design 5B). The one `_start`, std's, calls it after the
+/// first thread's block of TLS and control block and std's log, and before the init arrays and
+/// `main`: what `relibc_start_v1` does but for those, the program's arguments the process's name
+/// and its environment empty, as `main` gets them.
+#[cfg(target_os = "moruna")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moruna_libc_init() {
+    use crate::header::sys_auxv::AT_NULL;
+
+    let name = relibc_moruna::process::name();
+    let mut arg0 = Vec::with_capacity(name.len() + 1);
+    arg0.extend_from_slice(name.as_bytes());
+    arg0.push(0);
+    let arg0 = Box::leak(arg0.into_boxed_slice()).as_ptr();
+    // A start's stack as Linux lays one out: argc, argv and its null, envp's null, and an
+    // auxiliary vector with nothing in it.
+    let words: &'static mut [usize; 6] = Box::leak(Box::new([1, arg0 as usize, 0, 0, AT_NULL, 0]));
+    let sp: &'static Stack = unsafe { &*words.as_ptr().cast::<Stack>() };
+
+    unsafe { relibc_verify_host() };
+    // The control block std's start made, an FS base already set: relibc's Tcb from here.
+    unsafe { ld_so::init(sp) };
+
+    let argv = sp.argv_with_last_null();
+    unsafe { platform::inner_argv.unsafe_set(copy_string_array(argv)) };
+    unsafe { platform::argv = platform::inner_argv.unsafe_mut().as_mut_ptr() };
+    if let Some(arg) = unsafe { platform::inner_argv.unsafe_ref() }.first() {
+        unsafe { platform::program_invocation_name = *arg };
+        unsafe { platform::program_invocation_short_name = libgen::basename(*arg) };
+    }
+    if unsafe { platform::environ }.is_null() {
+        unsafe { platform::OUR_ENVIRON.unsafe_set(copy_string_array(sp.envp_with_last_null())) };
+        unsafe { platform::environ = platform::OUR_ENVIRON.unsafe_mut().as_mut_ptr() };
+    }
+    init_array();
+    if unsafe { crate::platform::logger::init().is_err() } {
+        log::error!("Logger has already been initialised");
+    }
+}
+
+/// Moruna: the C library's end of a program whose `main` returned, which the one `_start` calls
+/// with `main`'s code: `exit`'s, the `atexit` functions, the fini arrays and the streams flushed,
+/// then the process's end through std's.
+#[cfg(target_os = "moruna")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moruna_libc_exit(code: c_int) -> ! {
+    unsafe { stdlib::exit(code) }
+}

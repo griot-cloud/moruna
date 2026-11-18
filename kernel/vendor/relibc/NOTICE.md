@@ -39,24 +39,40 @@ branches from.
 
 ## Changes
 
-- **`Cargo.toml`:** an rlib, in one crate graph with std (`cargo rustc --crate-type staticlib
-  --features runtime` makes the archive a program without std links); the dependencies above
-  removed, `object` from crates.io, `relibc-moruna` for `target_os = "moruna"`, versions on
-  the path dependencies; the feature `runtime` for the panic, unwind and allocation-error items,
-  which std has in its graph (5B); `check_against_libc_crate` kept empty (the `libc` crate it
+- **`Cargo.toml`:** an rlib, in one crate graph with std, the SDK and the C library
+  (`kernel/function/c`, system design 5B); the dependencies above removed, `object` from
+  crates.io, `relibc-moruna` for `target_os = "moruna"`, versions on the path dependencies; the
+  feature `runtime` for the panic, unwind and allocation-error items, which std has in the graph
+  and which Moruna's build leaves off; `check_against_libc_crate` kept empty (the `libc` crate it
   compares layouts with knows no Moruna). `Cargo.lock` pruned to match, every other version as
   upstream locked it. `generic-rt` gains its licence field; dlmalloc-rs's manifest loses its
   fuzzer.
 - **`src/platform/moruna/`,** added: `Sys`, relibc's `Pal`, `PalSignal`, `PalSocket`,
-  `PalEpoll` and `PalPtrace` for Moruna. Memory, threads, futexes, clocks, randomness, exit and
-  descriptors 0 to 2 are `relibc-moruna`'s; paths answer `ENOENT`; processes, sockets, epoll,
-  ptrace and timers `ENOSYS`; signals stay within the process.
+  `PalEpoll` and `PalPtrace` for Moruna, over `relibc-moruna`, which reaches the core through
+  std's own copy of `moruna-sys`: memory, futexes, the clocks (the realtime base and
+  `thread_yield` of ABI 2.8), randomness, exit through std's, descriptors 1 and 2 through std's
+  writer (the task's log), 0 empty; paths answer `ENOENT`; processes, sockets, epoll, ptrace and
+  timers `ENOSYS`; signals stay within the process.
+- **One runtime with std (5B):**
+  - `src/ld_so/tcb.rs`: relibc's `Tcb` is the start of each thread's one control block, std's
+    runtime's (`moruna_sys::rt::tls::Control`), checked at compile time to begin with its
+    `GenericTcb` and to fit the bytes the block keeps for the C library; `Tcb::adopt_current`
+    writes relibc's own fields into a block the runtime made. A thread's id is kept there
+    (`OsSpecific`), which no system call gives.
+  - `src/ld_so/mod.rs`: an FS base already set, the control block std's `_start` made, is
+    adopted rather than a TLS block made.
+  - `src/start.rs`: `moruna_libc_init`, which std's `_start` calls after the first thread's block
+    and the log and before the init arrays and `main` (relibc's start without those, argv the
+    process's name, no environment), and `moruna_libc_exit`, `exit` for a `main` that returned.
+  - `src/pthread/mod.rs`: `pthread_create` takes the runtime's one thread path (its stack, its
+    block of TLS, made from the program's template); a thread ends keeping its block, in which its
+    `pthread_t` lies, and its join or its detach frees it.
 - **The `target_os` sites:** 59 `target_os = "linux"` conditions outside Linux's platform also
   take `target_os = "moruna"`, so Moruna has Linux's ABI constants (errno, flags, modes, signal
   numbers, the layouts of `stat` and the others). Not the four that make Linux system calls:
-  `extern crate sc`, `unistd::syscall`, and FS's set and get, which Moruna does with
-  `THREAD_SET_FS` and `rdfsbase` (`src/ld_so/tcb.rs`, `src/ld_so/mod.rs`). A Moruna thread's
-  control block keeps its id (`OsSpecific`), which no system call gives.
+  `extern crate sc`, `unistd::syscall`, and FS's set and get. `cbindgen.globdefs.toml` maps
+  `target_os = "moruna"` to `__moruna__`, which the C compiler defines, so the headers take the
+  same constants.
 - **`src/ld_so/dso.rs`:** no object is loaded at run time on Moruna, whose functions are each
   one static program; the lookups in a loaded object's hash tables, which take the fork's
   private fields, are left out of its build.
@@ -64,21 +80,10 @@ branches from.
 
 ## Building
 
-For the core's user target with std (`kernel/targets/x86_64-moruna.json`), on the kernel's
-toolchain, the one C file (`src/c/stdlib.c`) compiled to ELF:
-
-```sh
-cd kernel/vendor/relibc
-CC_x86_64_moruna=cc AR_x86_64_moruna="$(rustc --print sysroot)/lib/rustlib/<host>/bin/llvm-ar" \
-CFLAGS_x86_64_moruna="--target=x86_64-unknown-none-elf -mno-red-zone -fno-stack-protector -fPIE" \
-  cargo build --target ../../targets/x86_64-moruna.json -Zunstable-options -Zjson-target-spec \
-  -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
-```
-
-## Not yet
-
-What 5B's one runtime needs from std (item 5.0's change: ELF TLS with one control block, one
-thread path, one `_start`, std's writer for descriptors 1 and 2, the realtime clock and
-`thread_yield`) is used when it lands; until then descriptors 1 and 2 write to the task's
-console, the wall clock is the monotonic clock, and `sched_yield` returns at once. The headers,
-`libmoruna_function.a` for the user target and openlibm's build are step 4.
+`kernel/function/c/build-core.sh` builds it for the core's user target, in the C library's
+crate graph with std (`kernel/targets/x86_64-moruna.json`, std from
+`kernel/vendor/rust-std/library`): `libmoruna_function.a`, relibc's headers (written by
+`cbindgen`, as upstream's build writes them, from each `src/header/*/cbindgen.toml` and
+`cbindgen.globdefs.toml`), openlibm's `libopenlibm.a` from a copy of `openlibm/`, and the C
+functions linked as static native programs. The one C file of relibc (`src/c/stdlib.c`) is
+compiled by the host's clang for `x86_64-unknown-none-elf`.

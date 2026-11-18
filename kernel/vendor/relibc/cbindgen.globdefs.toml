@@ -3,6 +3,8 @@
 [defines]
 "target_os=redox" = "__redox__"
 "target_os=linux" = "__linux__"
+# Moruna (item 5.2b): its C compiler defines __moruna__, and its headers take Linux's constants.
+"target_os=moruna" = "__moruna__"
 "target_pointer_width=64" = "__LP64__"
 "target_pointer_width=32" = "__ILP32__"
 "target_arch=x86" = "__i386__"

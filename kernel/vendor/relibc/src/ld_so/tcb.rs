@@ -76,7 +76,58 @@ const _: () = {
     }
 };
 
+// Moruna: the Tcb is the start of each thread's one control block, std's runtime's
+// (`moruna_sys::rt::tls::Control`, system design 5B): its GenericTcb where the control block has
+// its own, and the rest in the bytes the block keeps for the C library.
+#[cfg(target_os = "moruna")]
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(Tcb, generic) == 0);
+    assert!(offset_of!(GenericTcb<OsSpecific>, tls_end) == 0);
+    assert!(offset_of!(GenericTcb<OsSpecific>, tls_len) == 0x08);
+    assert!(offset_of!(GenericTcb<OsSpecific>, tcb_ptr) == 0x10);
+    assert!(offset_of!(GenericTcb<OsSpecific>, tcb_len) == 0x18);
+    assert!(offset_of!(GenericTcb<OsSpecific>, os_specific) == 0x20);
+    assert!(
+        mem::size_of::<Tcb>() <= relibc_moruna::thread::LIBC_END,
+        "relibc's Tcb is larger than the control block keeps for it: raise LIBC_AREA in moruna_sys::rt::tls"
+    );
+};
+
 impl Tcb {
+    /// Moruna: makes the calling thread's control block, which std's runtime made and installed
+    /// (its TLS from the program's template, its GenericTcb set, the rest zeroed), relibc's Tcb:
+    /// relibc's own fields written as `Tcb::new` writes them.
+    #[cfg(target_os = "moruna")]
+    pub unsafe fn adopt_current() -> &'static mut Self {
+        let tcb = relibc_moruna::thread::thread_pointer() as *mut Self;
+        assert!(
+            !tcb.is_null(),
+            "no control block: the runtime's start makes one"
+        );
+        unsafe {
+            ptr::addr_of_mut!((*tcb).generic.os_specific).write(OsSpecific::default());
+            ptr::addr_of_mut!((*tcb).masters_ptr).write(ptr::null_mut());
+            ptr::addr_of_mut!((*tcb).masters_len).write(0);
+            ptr::addr_of_mut!((*tcb).num_copied_masters).write(0);
+            ptr::addr_of_mut!((*tcb).linker_ptr).write(ptr::null());
+            ptr::addr_of_mut!((*tcb).pthread).write(Pthread {
+                waitval: Waitval::new(),
+                flags: Default::default(),
+                has_enabled_cancelation: AtomicBool::new(true),
+                has_queued_cancelation: AtomicBool::new(false),
+                has_async_cancelation: AtomicBool::new(false),
+                stack_base: core::ptr::null_mut(),
+                stack_size: 0,
+                os_tid: UnsafeCell::new(OsTid::default()),
+                tcb_selfref: UnsafeCell::new(tcb),
+            });
+            ptr::addr_of_mut!((*tcb).dtv_ptr).write(ptr::null_mut());
+            ptr::addr_of_mut!((*tcb).dtv_len).write(0);
+            &mut *tcb
+        }
+    }
+
     /// Create a new TCB
     ///
     /// `size` is the size of the TLS in bytes.

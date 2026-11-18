@@ -4,7 +4,9 @@
 //!
 //! Everything here speaks Linux's ABI: its errno values, `mmap` flags, clock ids and file
 //! modes, which relibc's headers give a C program on Moruna (the `target_os` sites take Linux's
-//! constants). What Moruna has is mapped onto the kernel's calls through `moruna-sys`:
+//! constants). What Moruna has is mapped onto the kernel's calls and std's runtime through std's
+//! own copy of `moruna-sys` (`std::os::moruna::moruna_sys`), the one the program's `_start`, its
+//! log and its threads are std's through (system design 5B):
 //!
 //! - anonymous `mmap`, `munmap` and `mprotect`, over memory objects ([`memory`]);
 //! - the FS base (ELF TLS, x86_64 variant II), futexes, threads and their end ([`thread`]);
@@ -21,8 +23,11 @@
 //! stand-ins over the host's own memory, clock and threads.
 
 #![no_std]
+// std's own moruna-sys is unstable to its users (`rustc_private`), as Hermit's `hermit_abi` is.
+#![cfg_attr(target_os = "moruna", feature(rustc_private))]
 
-#[cfg(test)]
+// On the core, std's: its copy of moruna-sys and its runtime are the program's one (5B).
+#[cfg(any(test, target_os = "moruna"))]
 extern crate std;
 
 pub mod errno;

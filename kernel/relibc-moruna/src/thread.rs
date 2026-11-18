@@ -1,6 +1,6 @@
 //! Threads: the thread pointer (ELF TLS, x86_64 variant II: FS points at the thread's control
-//! block, whose first word is its own address), futexes, a new thread on a stack its creator
-//! prepared, and a thread's end.
+//! block, whose first word is its own address), futexes, and threads on the runtime's one thread
+//! path, std's and the C library's (system design 5B).
 
 use core::sync::atomic::AtomicU32;
 
@@ -34,62 +34,44 @@ pub fn futex_wake(word: &AtomicU32, count: u32) -> Result<u32> {
     os::futex_wake(word, count).map_err(from_kernel)
 }
 
-/// `sched_yield`: the core's scheduler has no yield on this ABI (item 5.0 adds
-/// `thread_yield`), so it returns at once, as POSIX allows.
+/// `sched_yield`: `thread_yield` (ABI 2.8), which gives the CPU to another ready thread.
 pub fn yield_now() -> Result<()> {
+    os::yield_now();
     Ok(())
 }
 
-/// Starts a thread on `stack`, which its creator prepared as relibc does for Linux's `clone`:
-/// the entry, then six arguments, popped into `rax`, `rdi`, `rsi`, `rdx`, `rcx`, `r8` and `r9`
-/// before `call rax`. A thread whose entry returns ends.
-///
-/// # Safety
-///
-/// `stack` holds those seven words, below a 16-byte aligned end, and is the new thread's alone.
+/// Starts a thread on the one thread path (system design 5B): its stack (`stack` bytes at
+/// least, with a guard page) and its block of TLS and control block are the runtime's, installed
+/// before `main(arg)` runs. relibc's own part of the control block is zeroed; the thread makes it
+/// relibc's `Tcb` first.
 #[cfg(target_os = "moruna")]
-pub unsafe fn spawn(stack: *mut usize) -> Result<()> {
-    // The kernel starts the thread "as if called" below `stack_top`, where nothing is kept;
-    // the entry then moves to the prepared stack.
-    let top = (stack as usize) & !15;
-    os::spawn(core_os::thread_start, top, stack as usize).map_err(from_kernel)
+pub fn spawn(stack: usize, main: extern "C" fn(usize), arg: usize) -> Result<()> {
+    os::spawn(stack, main, arg).map_err(from_kernel)
 }
 
-/// Unmaps the calling thread's stack (`len` bytes from `stack`; none when `len` is zero) and
-/// ends the thread.
+/// Ends the calling thread, its block kept for whoever frees it with [`release`].
+#[cfg(target_os = "moruna")]
+pub fn exit() -> ! {
+    os::thread_exit()
+}
+
+/// Frees a thread's block once nothing uses it: the joiner's, or a detached thread's own at its
+/// end.
 ///
 /// # Safety
 ///
-/// The range is the calling thread's own stack, or empty, and nothing else uses it.
+/// `control` is a block the thread path made, for a thread that has ended or is the caller,
+/// which reads none of its thread-locals after.
 #[cfg(target_os = "moruna")]
-pub unsafe fn exit(stack: usize, len: usize) -> ! {
+pub unsafe fn release(control: usize) {
     // SAFETY: the caller's contract.
-    unsafe { os::exit_thread(stack, len) }
+    unsafe { os::release(control) }
 }
 
+/// Where the bytes a thread's control block keeps for the C library end, from the block's
+/// start: relibc's `Tcb` fits below it.
 #[cfg(target_os = "moruna")]
-mod core_os {
-    /// A new thread's first code: the stack its creator prepared, its seven words popped, then
-    /// the entry called, and the thread's end if it returns.
-    #[unsafe(naked)]
-    pub extern "C" fn thread_start(_stack: u64) -> ! {
-        core::arch::naked_asm!(
-            "mov rsp, rdi",
-            "pop rax",
-            "pop rdi",
-            "pop rsi",
-            "pop rdx",
-            "pop rcx",
-            "pop r8",
-            "pop r9",
-            "call rax",
-            "mov rax, {exit}",
-            "syscall",
-            "ud2",
-            exit = const moruna_abi::nr::THREAD_EXIT,
-        )
-    }
-}
+pub const LIBC_END: usize = os::LIBC_END;
 
 #[cfg(test)]
 mod tests {

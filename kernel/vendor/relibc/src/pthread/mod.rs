@@ -122,6 +122,10 @@ pub(crate) unsafe fn create(
 ) -> Result<pthread_t, Errno> {
     let attrs = attrs.cloned().unwrap_or_default();
 
+    // Moruna: the runtime's one thread path, std's and the C library's (system design 5B).
+    #[cfg(target_os = "moruna")]
+    return unsafe { create_moruna(&attrs, start_routine, arg) };
+
     #[cfg(not(target_os = "redox"))]
     let current_sigmask = 0_u64;
     #[cfg(target_os = "redox")]
@@ -355,7 +359,93 @@ unsafe fn dealloc_thread(thread: &Pthread) {
             }
         }
     }
+    // Moruna: the thread's block, kept past its end since its pthread_t lies in it, is freed
+    // now: by the join, or by a detached thread at its own end, which reads no thread-local
+    // after (system design 5B). Every block, the first thread's too, is the runtime's to free.
+    #[cfg(target_os = "moruna")]
+    unsafe {
+        let tcb = thread.tcb_selfref.get().read();
+        if !tcb.is_null() {
+            relibc_moruna::thread::release(tcb as usize);
+        }
+    }
 }
+
+/// Moruna: what a thread `create_moruna` starts is given.
+#[cfg(target_os = "moruna")]
+struct MorunaStart {
+    routine: extern "C" fn(arg: *mut c_void) -> *mut c_void,
+    arg: *mut c_void,
+    flags: PthreadFlags,
+    stack_size: usize,
+    /// The new thread's Tcb, which its creator reads once `mutex` is unlocked.
+    created: *const core::sync::atomic::AtomicPtr<Tcb>,
+    mutex: *const Mutex<u64>,
+}
+
+/// Moruna: a thread on the runtime's one thread path (system design 5B). The runtime maps its
+/// stack and makes its block of TLS and control block; the thread makes the control block its
+/// Tcb, says where it is, and runs `start_routine`. A stack the caller gives is not taken.
+#[cfg(target_os = "moruna")]
+unsafe fn create_moruna(
+    attrs: &header::RlctAttr,
+    start_routine: extern "C" fn(arg: *mut c_void) -> *mut c_void,
+    arg: *mut c_void,
+) -> Result<pthread_t, Errno> {
+    use core::sync::atomic::AtomicPtr;
+
+    if attrs.stack != 0 {
+        return Err(Errno(EINVAL));
+    }
+    let mut flags = PthreadFlags::empty();
+    match i32::from(attrs.detachstate) {
+        header::PTHREAD_CREATE_DETACHED => flags |= PthreadFlags::DETACHED,
+        header::PTHREAD_CREATE_JOINABLE => (),
+        other => unreachable!("unknown detachstate {}", other),
+    }
+    let synchronization_mutex = unsafe { Mutex::locked(0) };
+    let created = AtomicPtr::<Tcb>::new(ptr::null_mut());
+    let start = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(MorunaStart {
+        routine: start_routine,
+        arg,
+        flags,
+        stack_size: attrs.stacksize,
+        created: &raw const created,
+        mutex: &raw const synchronization_mutex,
+    }));
+    if relibc_moruna::thread::spawn(attrs.stacksize, moruna_thread_start, start as usize).is_err() {
+        // SAFETY: no thread started, so the start is still this function's.
+        drop(unsafe { alloc::boxed::Box::from_raw(start) });
+        return Err(Errno(EAGAIN));
+    }
+    let _ = synchronization_mutex.lock();
+    // SAFETY: the new thread stored its Tcb before it unlocked the mutex.
+    let new_tcb = unsafe { &mut *created.load(Ordering::Acquire) };
+    let os_tid = unsafe { new_tcb.pthread.os_tid.get().read() };
+    OS_TID_TO_PTHREAD
+        .lock()
+        .insert(os_tid, ForceSendSync(new_tcb));
+    Ok(&raw const new_tcb.pthread as *mut _)
+}
+
+/// Moruna: a new thread's first code, its block installed by the runtime.
+#[cfg(target_os = "moruna")]
+extern "C" fn moruna_thread_start(start: usize) {
+    // SAFETY: the start `create_moruna` boxed for this thread, given once.
+    let start = unsafe { alloc::boxed::Box::from_raw(start as *mut MorunaStart) };
+    let tcb = unsafe { Tcb::adopt_current() };
+    tcb.pthread.flags = start.flags.bits().into();
+    tcb.pthread.stack_size = start.stack_size;
+    unsafe { tcb.pthread.os_tid.get().write(Sys::current_os_tid()) };
+    // SAFETY: the creator waits on the mutex, so both still live.
+    unsafe {
+        (*start.created).store(tcb, Ordering::Release);
+        (*start.mutex).manual_unlock();
+    }
+    let retval = (start.routine)(start.arg);
+    unsafe { exit_current_thread(Retval(retval)) }
+}
+
 pub const SIGRT_RLCT_CANCEL: usize = 33;
 pub const SIGRT_RLCT_TIMER: usize = 34;
 

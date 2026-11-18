@@ -199,6 +199,13 @@ pub unsafe fn init(
         // The thread fd must already be present in the already existing TCB. Don't close it.
         #[cfg(target_os = "redox")]
         core::mem::forget(thr_fd);
+        // Moruna: an FS base already set is the control block std's start made for the first
+        // thread, its TLS already made from the program's template (system design 5B): relibc's
+        // part of it is zeroed, and relibc makes it its Tcb.
+        #[cfg(target_os = "moruna")]
+        unsafe {
+            Tcb::adopt_current();
+        }
     }
 }
 
