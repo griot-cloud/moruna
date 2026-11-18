@@ -986,6 +986,7 @@ dependencies = [
  "moruna-netstack",
  "moruna-node",
  "moruna-storage-format",
+ "netstack-protocol",
 ]
 
 [[package]]
@@ -1015,7 +1016,9 @@ name = "moruna-node-supervisor"
 version = "0.1.0"
 dependencies = [
  "moruna-node",
+ "moruna-svc",
  "moruna-sys",
+ "netstack-protocol",
  "node-protocol",
 ]
 
@@ -1031,6 +1034,7 @@ dependencies = [
 name = "moruna-ostd-adaptation"
 version = "0.1.0"
 dependencies = [
+ "hvdef",
  "moruna-abi",
 ]
 
@@ -1105,6 +1109,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "moruna-storvsc-server"
+version = "0.1.0"
+dependencies = [
+ "block-protocol",
+ "devices-protocol",
+ "guestmem_core",
+ "moruna-abi",
+ "moruna-storvsc",
+ "moruna-svc",
+ "moruna-sys",
+ "moruna-vmbus",
+ "scsi_defs",
+ "storvsp_protocol",
+ "vmbus-protocol",
+ "vmbus_ring",
+ "zerocopy",
+]
+
+[[package]]
 name = "moruna-svc"
 version = "0.1.0"
 dependencies = [
@@ -1145,6 +1168,20 @@ dependencies = [
  "guid",
  "hvdef",
  "moruna-vmbus",
+ "vmbus_core",
+ "vmbus_ring",
+]
+
+[[package]]
+name = "moruna-vmbus-server"
+version = "0.1.0"
+dependencies = [
+ "guid",
+ "hvdef",
+ "moruna-svc",
+ "moruna-sys",
+ "moruna-vmbus",
+ "vmbus-protocol",
  "vmbus_core",
  "vmbus_ring",
 ]
@@ -1247,6 +1284,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "node-functions"
+version = "0.1.0"
+dependencies = [
+ "moruna-imagefs",
+]
+
+[[package]]
 name = "node-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1334,6 +1378,7 @@ dependencies = [
  "bitvec",
  "fdt",
  "gimli 0.28.1",
+ "hvdef",
  "id-alloc",
  "inherit-methods-macro",
  "int-to-c-enum",
@@ -1848,6 +1893,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "storvsc-check"
+version = "0.1.0"
+dependencies = [
+ "block-protocol",
+ "devices-protocol",
+ "moruna-svc",
+]
+
+[[package]]
 name = "storvsp_protocol"
 version = "0.0.0"
 dependencies = [
@@ -2071,6 +2125,14 @@ dependencies = [
  "moruna-svc",
  "moruna-virtio",
  "vsock-protocol",
+]
+
+[[package]]
+name = "vmbus-protocol"
+version = "0.1.0"
+dependencies = [
+ "guid",
+ "moruna-svc",
 ]
 
 [[package]]

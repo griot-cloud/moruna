@@ -1,6 +1,7 @@
 //! The whole boot against the fake clouds: the lines in their order, the hand-over `api` gets,
 //! and every fatal line.
 
+use core::net::Ipv4Addr;
 use std::{
     cell::RefCell,
     format,
@@ -14,11 +15,13 @@ use moruna_node_config::{Cloud, Handover, HandoverError, NodeConfig, base64};
 
 use super::{
     FakeClock, FakeNetwork, FakeWall, RECORDED_AZURE_ID, RECORDED_CONFIG, RECORDED_OPENSTACK_ID,
-    RECORDED_OPENSTACK_TIME, Reply, SECOND, Sent, answer, azure, openstack,
+    RECORDED_OPENSTACK_TIME, Reply, SECOND, Sent, answer, azure, openstack, recorded_health,
+    wire_server,
 };
 use crate::{
-    boot::{Fatal, Inputs, READY_LIMIT_NS, Stage, cloud_line, ready_line, run},
-    machine::{Clock, Link, LinkError, StreamError},
+    boot::{Fatal, Inputs, READY_LIMIT_NS, RETIME_NS, Stage, cloud_line, ready_line, run, serve},
+    machine::{Clock, Control, Link, LinkError, StreamError},
+    wireserver,
 };
 
 const MS: u64 = 1_000_000;
@@ -41,6 +44,59 @@ struct FakeApi {
     sent: Vec<Vec<u8>>,
     /// The deadline of every call.
     deadlines: Vec<u64>,
+    /// How many starts of `api` the supervisor's channel brings, and what it meets after.
+    starts: usize,
+    then: LinkError,
+    /// The deadline of every wait for a start's channel.
+    channels: Vec<u64>,
+}
+
+impl FakeApi {
+    fn new(clock: &FakeClock, events: &Events) -> FakeApi {
+        FakeApi {
+            clock: clock.clone(),
+            events: events.clone(),
+            send: Ok(()),
+            answer: Ok(b"ready".to_vec()),
+            takes: 40 * MS,
+            sent: Vec::new(),
+            deadlines: Vec::new(),
+            starts: usize::MAX,
+            then: LinkError::Closed,
+            channels: Vec::new(),
+        }
+    }
+}
+
+/// The supervisor's channel to `platform`, played by the test: each start of `api` it sends is
+/// the one fake `api`.
+struct FakeControl(Rc<RefCell<FakeApi>>);
+
+/// One start's channel to the fake `api`.
+struct ApiEnd(Rc<RefCell<FakeApi>>);
+
+impl Link for ApiEnd {
+    fn send(&mut self, message: &[u8], deadline: u64) -> Result<(), LinkError> {
+        self.0.borrow_mut().send(message, deadline)
+    }
+
+    fn receive(&mut self, deadline: u64) -> Result<Vec<u8>, LinkError> {
+        self.0.borrow_mut().receive(deadline)
+    }
+}
+
+impl Control for FakeControl {
+    type Api = ApiEnd;
+
+    fn next_api(&mut self, deadline: u64) -> Result<ApiEnd, LinkError> {
+        let mut api = self.0.borrow_mut();
+        api.channels.push(deadline);
+        if api.starts == 0 {
+            return Err(api.then.clone());
+        }
+        api.starts -= 1;
+        Ok(ApiEnd(self.0.clone()))
+    }
 }
 
 impl Link for FakeApi {
@@ -69,6 +125,8 @@ struct Booted {
     events: Vec<String>,
     api: FakeApi,
     clock: FakeClock,
+    /// Each request a server saw, and when its connection was made.
+    requests: Vec<(u64, Sent)>,
     wall: FakeWall,
 }
 
@@ -98,32 +156,30 @@ fn boot_with(
 ) -> Booted {
     let mut clock = network.clock.clone();
     let events = Events::default();
-    let mut api = FakeApi {
-        clock: clock.clone(),
-        events: events.clone(),
-        send: Ok(()),
-        answer: Ok(b"ready".to_vec()),
-        takes: 40 * MS,
-        sent: Vec::new(),
-        deadlines: Vec::new(),
-    };
+    let mut api = FakeApi::new(&clock, &events);
     prepare(&mut api);
+    let api = Rc::new(RefCell::new(api));
     let console = events.clone();
     let mut wall = FakeWall::default();
     let result = run(
         &mut network,
         &mut clock,
         &mut wall,
-        &mut api,
+        &mut FakeControl(api.clone()),
         &mut |line: &str| console.borrow_mut().push(line.to_string()),
         inputs,
     );
     let events = events.borrow().clone();
+    let api = Rc::try_unwrap(api)
+        .ok()
+        .expect("no channel to api outlives the boot")
+        .into_inner();
     Booted {
         result,
         events,
         api,
         clock,
+        requests: network.requests,
         wall,
     }
 }
@@ -151,7 +207,12 @@ fn azure_with(user_data: &[u8]) -> impl FnMut(u64, &Sent) -> Reply + 'static {
         r#"{{"compute":{{"userData":"{}","vmId":"{RECORDED_AZURE_ID}"}},"network":{{}}}}"#,
         base64::encode(user_data)
     );
-    move |_, _| Reply::Answer(answer("200 OK", document.as_bytes()))
+    move |_, sent| {
+        if sent.to.0 == crate::wireserver::ADDRESS {
+            return wire_server(sent);
+        }
+        Reply::Answer(answer("200 OK", document.as_bytes()))
+    }
 }
 
 #[test]
@@ -175,6 +236,8 @@ fn a_node_on_openstack_hands_over_and_says_it_is_ready() {
             read_at_ns: 4 * MS,
             // The node's memory the supervisor gave.
             memory_bytes: MEMORY,
+            // The ready line's, for api's later starts (item 2.2c).
+            boot_ms: Some(46),
         }
     );
     // The cloud's line, then the hand-over, then, once api has answered, the ready line: three
@@ -193,11 +256,105 @@ fn a_node_on_openstack_hands_over_and_says_it_is_ready() {
         booted.wall.times(),
         [RECORDED_OPENSTACK_TIME * SECOND + 2 * MS]
     );
-    // What api got is the hand-over, as its half of the crate reads it.
-    assert_eq!(booted.api.sent, [handover.encode().unwrap()]);
-    assert_eq!(Handover::decode(&booted.api.sent[0]), Ok(handover));
+    // What api got is the hand-over, as its half of the crate reads it: before the node was
+    // ready, so with no boot_ms.
+    let first = Handover {
+        boot_ms: None,
+        ..handover
+    };
+    assert_eq!(booted.api.sent, [first.encode().unwrap()]);
+    assert_eq!(Handover::decode(&booted.api.sent[0]), Ok(first));
     // api had 10 s from the cloud's line, after the three requests' 6 ms.
     assert_eq!(booted.api.deadlines, [6 * MS + 10 * SECOND; 2]);
+}
+
+/// Who was asked what, in order: the address, the method and the path.
+fn asked(booted: &Booted) -> Vec<(Ipv4Addr, &str, &str)> {
+    booted
+        .requests
+        .iter()
+        .map(|(_, sent)| (sent.to.0, sent.method.as_str(), sent.path.as_str()))
+        .collect()
+}
+
+const IMDS: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
+const AZURE_INSTANCE: &str = "/metadata/instance?api-version=2021-02-01";
+
+#[test]
+fn a_node_on_azure_reports_ready_once_its_config_is_valid() {
+    let clock = FakeClock::default();
+    let latency = clock.clone();
+    let network = FakeNetwork::serving(&clock, move |_, sent| {
+        latency.advance(2 * MS);
+        azure(sent)
+    });
+    let booted = boot_with(network, INPUTS, |_| {});
+    assert!(booted.result.is_ok());
+    // Instance data, then the goal state and the Health document from the WireServer.
+    assert_eq!(
+        asked(&booted),
+        [
+            (IMDS, "GET", AZURE_INSTANCE),
+            (wireserver::ADDRESS, "GET", "/machine?comp=goalstate"),
+            (wireserver::ADDRESS, "POST", "/machine?comp=health"),
+        ]
+    );
+    assert_eq!(booted.requests[2].1.body, recorded_health().as_bytes());
+    // The report came before the hand-over: api's 10 s count from after its 4 ms.
+    assert_eq!(booted.api.deadlines, [6 * MS + 10 * SECOND; 2]);
+    assert_eq!(
+        booted.events,
+        [
+            format!("moruna: cloud azure instance {RECORDED_AZURE_ID}"),
+            "the hand-over".to_string(),
+            "moruna: ready api=10.0.2.15:443 boot_ms=46".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn a_node_on_openstack_makes_no_ready_report() {
+    let booted = boot(|_, sent| {
+        assert_ne!(
+            sent.to.0,
+            wireserver::ADDRESS,
+            "OpenStack has no WireServer"
+        );
+        openstack(sent)
+    });
+    assert!(booted.result.is_ok());
+    assert!(booted.requests.iter().all(|(_, sent)| sent.to.0 == IMDS));
+}
+
+#[test]
+fn a_node_on_azure_with_an_invalid_config_makes_no_ready_report() {
+    let booted = boot(azure_with(br#"{"moruna":2}"#));
+    assert_eq!(asked(&booted), [(IMDS, "GET", AZURE_INSTANCE)]);
+    assert_eq!(booted.result.unwrap_err().stage, Stage::Config);
+}
+
+#[test]
+fn a_ready_report_azure_does_not_take_is_fatal_after_2_minutes() {
+    let booted = boot(|_, sent| {
+        if sent.to.0 == wireserver::ADDRESS {
+            return Reply::Answer(answer("503 Service Unavailable", b""));
+        }
+        azure(sent)
+    });
+    assert_eq!(
+        booted.line(),
+        "moruna: fatal platform: Azure did not take the ready report within 120 s: GET \
+         /machine?comp=goalstate: answered 503"
+    );
+    // The cloud was named; api was never handed its config, and the node never said it was
+    // ready.
+    assert_eq!(
+        booted.events,
+        [format!("moruna: cloud azure instance {RECORDED_AZURE_ID}")]
+    );
+    assert!(booted.api.sent.is_empty());
+    assert_eq!(booted.clock.now(), 120 * SECOND);
+    assert_eq!(booted.requests.len(), 1 + 24);
 }
 
 #[test]
@@ -219,7 +376,15 @@ fn a_node_on_azure_hands_over_and_says_it_is_ready() {
             "moruna: ready api=10.0.2.15:443 boot_ms=40".to_string(),
         ]
     );
-    assert_eq!(Handover::decode(&booted.api.sent[0]), Ok(handover));
+    // api had it before the node was ready, so with no boot_ms; later starts get the line's.
+    assert_eq!(handover.boot_ms, Some(40));
+    assert_eq!(
+        Handover::decode(&booted.api.sent[0]),
+        Ok(Handover {
+            boot_ms: None,
+            ..handover
+        })
+    );
 }
 
 #[test]
@@ -370,6 +535,7 @@ fn a_config_too_large_to_hand_over_is_fatal() {
         wall_clock: RECORDED_OPENSTACK_TIME,
         read_at_ns: 0,
         memory_bytes: MEMORY,
+        boot_ms: None,
     })
     .encode() else {
         panic!("the hand-over fits");
@@ -567,4 +733,130 @@ fn the_lines_are_the_design_s() {
     assert!(line.starts_with("moruna: fatal config: line?break, caf?, bell?, xxx"));
     assert_eq!(line.len(), "moruna: fatal config: ".len() + 300);
     assert!(line.chars().all(|c| c == ' ' || c.is_ascii_graphic()));
+}
+
+#[test]
+fn the_hand_over_waits_for_the_supervisor_s_channel_to_api() {
+    // Each start of api, the first included, comes as a channel on the supervisor's channel
+    // (PM, item 2.2c). Asked with api's 10 s, after the cloud's line.
+    let network = || FakeNetwork::serving(&FakeClock::default(), |_, sent| openstack(sent));
+    let cloud = format!("moruna: cloud openstack instance {RECORDED_OPENSTACK_ID}");
+    let booted = boot_with(network(), INPUTS, |_| {});
+    assert!(booted.result.is_ok());
+    assert_eq!(booted.api.channels, [10 * SECOND]);
+    for (error, said) in [
+        (LinkError::TimedOut, "the deadline passed"),
+        (LinkError::Closed, "the supervisor closed its channel"),
+        (
+            LinkError::Other("the supervisor sent something other than api-started".into()),
+            "the supervisor sent something other than api-started",
+        ),
+    ] {
+        let booted = boot_with(network(), INPUTS, |api| {
+            api.starts = 0;
+            api.then = error.clone();
+        });
+        assert_eq!(
+            booted.line(),
+            format!("moruna: fatal platform: the supervisor sent no channel to api: {said}")
+        );
+        assert_eq!(booted.result.unwrap_err().stage, Stage::Platform);
+        assert_eq!(booted.events, std::slice::from_ref(&cloud));
+        assert!(booted.api.sent.is_empty());
+        assert_eq!(booted.api.channels, [10 * SECOND]);
+    }
+}
+
+/// `serve` after a boot on OpenStack: the boot's hand-over, and `api`'s later starts as `prepare`
+/// makes them, from a clock at 1000 s.
+fn served(prepare: impl FnOnce(&mut FakeApi)) -> (Fatal, Handover, FakeApi) {
+    let handover = boot(|_, sent| openstack(sent)).result.unwrap();
+    let mut clock = FakeClock::default();
+    clock.advance(1000 * SECOND);
+    let events = Events::default();
+    let mut api = FakeApi::new(&clock, &events);
+    prepare(&mut api);
+    let api = Rc::new(RefCell::new(api));
+    let mut network = FakeNetwork::serving(&clock, |_, sent| openstack(sent));
+    let fatal = serve(
+        &mut network,
+        &mut clock,
+        &mut FakeWall::default(),
+        &mut FakeControl(api.clone()),
+        &handover,
+        &mut |line: &str| panic!("serve said {line}"),
+    );
+    let api = Rc::try_unwrap(api).ok().unwrap().into_inner();
+    (fatal, handover, api)
+}
+
+#[test]
+fn each_later_start_of_api_gets_the_same_hand_over() {
+    let (fatal, handover, api) = served(|api| api.starts = 3);
+    // Three later starts, each handed what the first had and the node's boot_ms, the boot's
+    // ready line's, each with 1D's 10 s from when its channel arrived: 40 ms apart, api's
+    // answers.
+    assert_eq!(api.sent, vec![handover.encode().unwrap(); 3]);
+    let later = Handover::decode(&api.sent[0]).unwrap();
+    assert_eq!(later.boot_ms, Some(40), "the boot's api answered 40 ms in");
+    assert_eq!(later, handover);
+    let t = 1000 * SECOND;
+    assert_eq!(
+        api.deadlines,
+        [
+            t + 10 * SECOND,
+            t + 10 * SECOND,
+            t + 40 * MS + 10 * SECOND,
+            t + 40 * MS + 10 * SECOND,
+            t + 80 * MS + 10 * SECOND,
+            t + 80 * MS + 10 * SECOND,
+        ]
+    );
+    // A start is waited for until the hour's re-read of the wall clock (none came here).
+    assert_eq!(api.channels, [t + RETIME_NS; 4]);
+    // When the supervisor's channel ends, so does platform, with the reason.
+    assert_eq!(
+        fatal.to_string(),
+        "moruna: fatal platform: the supervisor's channel: the supervisor closed its channel"
+    );
+    assert_eq!(fatal.stage, Stage::Platform);
+    // Nothing reaches the console: the supervisor's and api's own lines say what happened.
+    assert_eq!(api.events.borrow().len(), 3);
+    assert!(
+        api.events
+            .borrow()
+            .iter()
+            .all(|event| event == "the hand-over")
+    );
+}
+
+#[test]
+fn a_later_start_of_api_has_1d_s_10_s_too() {
+    let (fatal, _, api) = served(|api| api.answer = Err(LinkError::TimedOut));
+    assert_eq!(
+        fatal.to_string(),
+        "moruna: fatal platform: api did not answer ready within 10 s"
+    );
+    assert_eq!(api.deadlines, [1010 * SECOND; 2]);
+    let (fatal, _, _) = served(|api| api.answer = Ok(b"READY".to_vec()));
+    assert_eq!(
+        fatal.to_string(),
+        "moruna: fatal platform: api answered the hand-over with something else"
+    );
+    let (fatal, _, _) = served(|api| api.send = Err(LinkError::Closed));
+    assert_eq!(
+        fatal.to_string(),
+        "moruna: fatal platform: the hand-over was not sent to api: api closed its end of the \
+         link"
+    );
+    let (fatal, _, api) = served(|api| {
+        api.starts = 1;
+        api.then = LinkError::Other("the supervisor sent something other than api-started".into());
+    });
+    assert_eq!(
+        fatal.to_string(),
+        "moruna: fatal platform: the supervisor's channel: the supervisor sent something other \
+         than api-started"
+    );
+    assert_eq!(api.sent.len(), 1);
 }

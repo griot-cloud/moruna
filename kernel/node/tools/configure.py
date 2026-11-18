@@ -129,11 +129,11 @@ def main():
         "grant admission initial.storage-binding storage.admission",
         "grant storage storage.config storage.config",
         "link storage storage.admission admission initial.storage-admission",
-        "link devices directory-fs imagefs directory", "link linux fs imagefs listen-linux",
+        "link devices directory-fs imagefs directory", "link imagefs listen-linux linux fs",
         "link devices directory-net network directory", "link devices directory-engine admission initial.directory",
         "link linux listen-engine admission initial.linux", "link network listen-engine admission initial.network",
     ]
-    node += [f"link storage storage.authority admission {'local-home.authority' if unified else 'storage.authority'}"]
+    node += [f"link admission {'local-home.authority' if unified else 'storage.authority'} storage storage.authority"]
     data_inputs = data_disks["inputs"]
     data_output = data_disks["output_bytes"] > 0
     if data_inputs or data_output:
@@ -160,7 +160,7 @@ def main():
     if "local" in services:
         node += ["grant local storage.config local.config", "grant local storage.key cache.key",
                  "grant admission initial.checkpoint-binding checkpoint.admission", "grant admission initial.cache-binding cache.admission",
-                 "link local storage.authority admission local.authority", "link local storage.admission admission initial.local-admission",
+                 "link admission local.authority local storage.authority", "link local storage.admission admission initial.local-admission",
                  "link devices directory-local local storage.block-directory"]
         extra_initial += ["service local.admission initial.local-admission", "grant checkpoint.binding initial.checkpoint-binding", "grant cache.binding initial.cache-binding"]
         extra_engine += ["grant checkpoint admission local.admission checkpoint.binding", "grant cache admission local.admission cache.binding"]

@@ -17,8 +17,8 @@ use super::{
     openstack,
 };
 use crate::{
-    boot::{Inputs, REFRESHED, RETIME_LIMIT_NS, RETIME_NS, Refresh, retime, run},
-    machine::{Clock, Link, LinkError},
+    boot::{Inputs, REFRESHED, RETIME_LIMIT_NS, RETIME_NS, Refresh, retime, run, serve},
+    machine::{Clock, Control, Link, LinkError},
 };
 
 const META: &str = "/openstack/latest/meta_data.json";
@@ -34,6 +34,44 @@ impl Link for Ready {
 
     fn receive(&mut self, _: u64) -> Result<Vec<u8>, LinkError> {
         Ok(b"ready".to_vec())
+    }
+}
+
+/// The supervisor's channel: each wait for a start of `api` meets the next of `waits`, a start
+/// (`Ok`) or an error; one that times out first takes the clock to its deadline. After the last,
+/// the channel is closed.
+struct Starts {
+    clock: FakeClock,
+    waits: Vec<Result<(), LinkError>>,
+    /// The deadline of each wait.
+    deadlines: Vec<u64>,
+}
+
+impl Control for Starts {
+    type Api = Ready;
+
+    fn next_api(&mut self, deadline: u64) -> Result<Ready, LinkError> {
+        self.deadlines.push(deadline);
+        if self.waits.is_empty() {
+            return Err(LinkError::Closed);
+        }
+        match self.waits.remove(0) {
+            Ok(()) => Ok(Ready),
+            Err(LinkError::TimedOut) => {
+                self.clock.sleep_until(deadline);
+                Err(LinkError::TimedOut)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// A channel on which the boot's one start of `api` comes at once.
+fn one_start(clock: &FakeClock) -> Starts {
+    Starts {
+        clock: clock.clone(),
+        waits: vec![Ok(())],
+        deadlines: Vec::new(),
     }
 }
 
@@ -61,7 +99,7 @@ fn the_clock_reads_the_date_as_of_when_its_answer_arrived() {
         &mut network,
         &mut clock.clone(),
         &mut wall,
-        &mut Ready,
+        &mut one_start(&clock),
         &mut |line: &str| lines.push(line.to_string()),
         INPUTS,
     )
@@ -86,7 +124,7 @@ fn a_time_the_core_refuses_is_fatal_before_the_cloud_line() {
         &mut network,
         &mut clock.clone(),
         &mut wall,
-        &mut Ready,
+        &mut one_start(&clock),
         &mut |line: &str| lines.push(line.to_string()),
         INPUTS,
     )
@@ -251,5 +289,82 @@ fn a_failed_re_read_is_said_once_and_its_recovery_once() {
     assert_eq!(
         crate::boot::not_refreshed_line("a\tb\u{e9}"),
         "platform: wall clock not refreshed: a?b?"
+    );
+}
+
+#[test]
+fn between_starts_of_api_the_clock_is_re_read_every_hour() {
+    // After the boot: no start of api for two hours, then one, then an hour of nothing; the
+    // instance document answers the first re-read, fails the second, answers the third.
+    let clock = FakeClock::default();
+    clock.advance(1000 * SECOND);
+    let mut asked = 0;
+    let mut network = FakeNetwork::serving(&clock, move |_, sent| {
+        asked += 1;
+        if asked == 2 {
+            Reply::Answer(answer("503 Service Unavailable", b""))
+        } else {
+            openstack(sent)
+        }
+    });
+    let mut control = Starts {
+        clock: clock.clone(),
+        waits: vec![
+            Err(LinkError::TimedOut),
+            Err(LinkError::TimedOut),
+            Ok(()),
+            Err(LinkError::TimedOut),
+        ],
+        deadlines: Vec::new(),
+    };
+    let handover = moruna_node_config::Handover {
+        config: moruna_node_config::NodeConfig::validate(
+            super::RECORDED_CONFIG.as_bytes(),
+            8 << 30,
+        )
+        .unwrap(),
+        instance: super::RECORDED_OPENSTACK_ID.into(),
+        cloud: Cloud::OpenStack,
+        wall_clock: RECORDED_OPENSTACK_TIME,
+        read_at_ns: 0,
+        memory_bytes: 8 << 30,
+        boot_ms: Some(46),
+    };
+    let mut wall = FakeWall::default();
+    let mut lines = Vec::new();
+    let fatal = serve(
+        &mut network,
+        &mut clock.clone(),
+        &mut wall,
+        &mut control,
+        &handover,
+        &mut |line: &str| lines.push(line.to_string()),
+    );
+    // Each wait lasts until the hour's re-read; the start of api does not move the hour.
+    let hour = 1000 * SECOND + RETIME_NS;
+    assert_eq!(
+        control.deadlines,
+        [
+            hour,
+            hour + RETIME_NS,
+            hour + 2 * RETIME_NS,
+            hour + 2 * RETIME_NS,
+            hour + 3 * RETIME_NS
+        ]
+    );
+    // The first re-read set the clock; the second failed and said so; the third set it again
+    // and said that too.
+    assert_eq!(
+        lines,
+        [
+            format!("platform: wall clock not refreshed: GET {META}: answered 503"),
+            REFRESHED.to_string()
+        ]
+    );
+    assert_eq!(wall.times(), [RECORDED_OPENSTACK_TIME * SECOND; 2]);
+    // When the supervisor's channel ends, so does platform, with the reason.
+    assert_eq!(
+        fatal.to_string(),
+        "moruna: fatal platform: the supervisor's channel: the supervisor closed its channel"
     );
 }

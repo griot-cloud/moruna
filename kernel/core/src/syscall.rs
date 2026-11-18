@@ -21,7 +21,7 @@ use crate::{
     clock::{self, Timer},
     datapath,
     foreign::{self, Forward},
-    futex,
+    futex, hyperv,
     interrupt::Interrupt,
     memory::{self, DeviceMemory, MemoryObject, Pin},
     object::{Console, Handle, Object, Resource},
@@ -141,6 +141,13 @@ pub fn dispatch(thread: &Arc<Thread>, ctx: &mut UserContext) -> Flow {
         nr::THREAD_STATE_READ => personality::thread_state_read(p, a).map_err(Into::into),
         nr::THREAD_STATE_WRITE => personality::thread_state_write(p, a).map_err(Into::into),
         nr::THREAD_INTERRUPT => personality::thread_interrupt(p, a).map_err(Into::into),
+        // ABI 2.7: Hyper-V's mechanism for VMBus, on `root.hyperv` and its signals.
+        nr::HYPERV_POST => hyperv::hyperv_post(p, a).map_err(Into::into),
+        nr::HYPERV_TAKE => hyperv::hyperv_take(p, a).map_err(Into::into),
+        nr::HYPERV_MAP_EVENTS => hyperv::hyperv_map_events(p, a).map_err(Into::into),
+        nr::HYPERV_INTERRUPT => hyperv::hyperv_interrupt(p, a).map_err(Into::into),
+        nr::HYPERV_SIGNAL_CREATE => hyperv::hyperv_signal_create(p, a).map_err(Into::into),
+        nr::HYPERV_SIGNAL => hyperv::hyperv_signal(p, a).map_err(Into::into),
         // ABI 2.8 (item 5.0): the wall clock, and a yield.
         nr::CLOCK_SET_REALTIME => clock_set_realtime(p, a[0], a[1]),
         nr::THREAD_YIELD => {
@@ -214,7 +221,7 @@ fn as_memory(h: &Handle) -> Result<Arc<MemoryObject>, Error> {
 }
 
 /// A resource of `kind`: the type is checked first, then that it grants this.
-fn as_resource(h: &Handle, kind: ResourceKind) -> Result<Arc<Resource>, Error> {
+pub(crate) fn as_resource(h: &Handle, kind: ResourceKind) -> Result<Arc<Resource>, Error> {
     match &h.object {
         Object::Resource(r) if r.kind == kind => Ok(r.clone()),
         Object::Resource(_) => Err(Error::AccessDenied),
@@ -223,7 +230,7 @@ fn as_resource(h: &Handle, kind: ResourceKind) -> Result<Arc<Resource>, Error> {
 }
 
 /// Looks up a handle and checks its type before its rights, as every call does.
-fn typed<T>(
+pub(crate) fn typed<T>(
     p: &Process,
     value: u64,
     rights: Rights,
@@ -806,7 +813,8 @@ fn device_memory_create(p: &Process, resource: u64, paddr: u64, len: u64) -> Ret
 
 /// `resource_narrow` (SDD 20, f.10): a new handle to a resource of the same kind over
 /// `base .. base + len`, which must lie inside the source's range. The new handle
-/// carries the source handle's rights. A process resource has no range to narrow.
+/// carries the source handle's rights. A process resource, and `root.hyperv`, have no
+/// range to narrow.
 fn resource_narrow(p: &Process, value: u64, base: u64, len: u64) -> Ret {
     let handle = lookup(p, value, Rights::NONE)?;
     let source = match &handle.object {
@@ -817,7 +825,9 @@ fn resource_narrow(p: &Process, value: u64, base: u64, len: u64) -> Ret {
         return Err(Error::AccessDenied.into());
     }
     let aligned = match source.kind {
-        ResourceKind::Process | ResourceKind::Clock => return Err(Error::InvalidArgs.into()),
+        ResourceKind::Process | ResourceKind::Hyperv | ResourceKind::Clock => {
+            return Err(Error::InvalidArgs.into());
+        }
         ResourceKind::DeviceMemory => {
             base.is_multiple_of(PAGE_SIZE) && len.is_multiple_of(PAGE_SIZE)
         }

@@ -1,18 +1,20 @@
-//! The `platform` process (system design, section 1D; work item 1.4). It takes its start handles,
-//! wires the library to the network server and to `api`, and runs the boot:
+//! The `platform` process (system design, sections 1D and 2B; work items 1.4 and 2.2c). It takes
+//! its start handles, wires the library to the network server and to the supervisor, and runs
+//! the boot:
 //!
 //! - `console`: where its lines go;
 //! - `account`: its own account, which the network server charges its sockets to;
-//! - `network`: a listener of the network server, granted outbound connections to instance data;
-//! - `api`: the channel the supervisor links to `api`, for the hand-over;
-//! - `supervisor`: its `platform` bootstrap, the one message that gives the node's memory;
+//! - `network`: a listener of the network server, granted outbound connections to instance data
+//!   and to Azure's WireServer, for the ready report;
+//! - `supervisor`: its `platform` bootstrap, whose end the supervisor keeps: first the node's
+//!   memory, then, at each start of `api`, `api-started` with the channel to that start;
 //! - `clock`: `root.clock`, the right to set the node's one wall clock (system design 3D).
 //!
 //! On a fatal error it prints the line and exits with failure, which stops the node. Once the
-//! node is ready it stays, holding the hand-over, and sets the wall clock again from its cloud's
-//! `Date` every hour: a service that ends stops the node. A re-read that fails prints
-//! `platform: wall clock not refreshed: <reason>` once, and the next that succeeds
-//! `platform: wall clock refreshed`; the clock runs on either way.
+//! node is ready it stays, holding the hand-over, and gives it again to each new start of `api`
+//! (system design 2B). Every hour it sets the wall clock again from its cloud's `Date`: a re-read
+//! that fails prints `platform: wall clock not refreshed: <reason>` once, and the next that
+//! succeeds `platform: wall clock refreshed`; the clock runs on either way.
 
 #![no_std]
 #![no_main]
@@ -22,12 +24,11 @@ extern crate alloc;
 
 use alloc::{format, string::String};
 
-use moruna_node_config::{Cloud, Handover};
 use moruna_node_platform::{
-    boot::{self, Fatal, Inputs, RETIME_NS, Refresh, Stage},
+    boot::{self, Fatal, Inputs, Stage},
     instance,
-    machine::{Clock, WallClock},
-    svc::{self, ChannelLink, Monotonic, Wan},
+    machine::WallClock,
+    svc::{ChannelControl, Monotonic, Wan},
 };
 use moruna_svc::{Account, Channel, Console, Handle, now, println, start};
 use netstack_protocol::net;
@@ -43,18 +44,16 @@ impl WallClock for CoreClock {
     }
 }
 
-/// What `platform` holds once the node is ready.
-struct Ready {
-    /// The hand-over `api` took.
-    _handover: Handover,
-    cloud: Cloud,
-    network: Wan,
-    clock: Monotonic,
-    wall: CoreClock,
+/// Boots the node's platform and then serves each new start of `api`; returns only the reason it
+/// cannot go on.
+fn boot(console: &Console, started_ns: u64) -> Fatal {
+    match serve(console, started_ns) {
+        Ok(never) => match never {},
+        Err(fatal) => fatal,
+    }
 }
 
-/// Boots the node's platform; returns what it holds once the node is ready.
-fn boot(console: &Console, started_ns: u64) -> Result<Ready, Fatal> {
+fn serve(console: &Console, started_ns: u64) -> Result<core::convert::Infallible, Fatal> {
     let instance_data = |reason: String| Fatal::new(Stage::InstanceData, reason);
     // Every start handle first, so an image that lacks one says so before anything is asked.
     let account = start::take("account")
@@ -64,17 +63,15 @@ fn boot(console: &Console, started_ns: u64) -> Result<Ready, Fatal> {
         .map(Channel)
         .ok_or_else(|| instance_data("platform was started without its network channel".into()))?;
     let own = |reason: &str| Fatal::new(Stage::Platform, reason);
-    let api = start::take("api")
-        .map(Channel)
-        .ok_or_else(|| own("platform was started without its channel to api"))?;
-    let supervisor = start::take("supervisor")
-        .map(Channel)
+    let mut control = start::take("supervisor")
+        .map(|handle| ChannelControl(Channel(handle)))
         .ok_or_else(|| own("platform was started without its bootstrap"))?;
     let mut wall = start::take("clock")
         .map(CoreClock)
         .ok_or_else(|| own("platform was started without root.clock"))?;
     // The supervisor queues the message before it starts `platform`, so it is not waited for.
-    let memory_bytes = svc::node_memory(supervisor, now())
+    let memory_bytes = control
+        .memory(now())
         .map_err(|error| own(&format!("the node's memory is not known: {error}")))?;
 
     // The network server, within instance data's limit.
@@ -98,20 +95,21 @@ fn boot(console: &Console, started_ns: u64) -> Result<Ready, Fatal> {
         &mut network,
         &mut clock,
         &mut wall,
-        &mut ChannelLink(api),
+        &mut control,
         &mut |line: &str| println!(console, "{}", line),
         Inputs {
             started_ns,
             memory_bytes,
         },
     )?;
-    Ok(Ready {
-        cloud: handover.cloud,
-        _handover: handover,
-        network,
-        clock,
-        wall,
-    })
+    Err(boot::serve(
+        &mut network,
+        &mut clock,
+        &mut wall,
+        &mut control,
+        &handover,
+        &mut |line: &str| println!(console, "{}", line),
+    ))
 }
 
 fn run() -> i64 {
@@ -119,26 +117,6 @@ fn run() -> i64 {
     let Some(console) = start::take("console").map(Console) else {
         return 1;
     };
-    let mut ready = match boot(&console, started_ns) {
-        Ok(ready) => ready,
-        Err(fatal) => {
-            println!(console, "{}", fatal);
-            return 1;
-        }
-    };
-    // Every hour, the wall clock again from the cloud's `Date`. One that cannot be read leaves
-    // the clock running as it was set, and the next hour tries again.
-    let mut refresh = Refresh::default();
-    let mut next = ready.clock.now().saturating_add(RETIME_NS);
-    loop {
-        ready.clock.sleep_until(next);
-        refresh.run(
-            &mut ready.network,
-            &mut ready.clock,
-            &mut ready.wall,
-            ready.cloud,
-            &mut |line: &str| println!(console, "{}", line),
-        );
-        next = next.saturating_add(RETIME_NS);
-    }
+    println!(console, "{}", boot(&console, started_ns));
+    1
 }

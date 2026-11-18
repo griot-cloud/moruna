@@ -110,11 +110,10 @@ fn pl_t3_no_cpu_bytes() {
 
 #[test]
 fn pl_t3_table_pieces_are_the_batch_buffers() {
-    // For a table the record's pieces are two metadata pages and the batch's own buffers,
-    // with one exception the engine declares: arrow's IPC encoder allocates its own validity
-    // bitmap, which has no arena provenance and so cannot become a `BufferView` (contracts
-    // d.3); those bytes are brought into the arena once per record and declared through
-    // `Allocator::note_payload_copy`. Reported as a finding against 09 e.3.
+    // For a table the record's pieces are two metadata pages and the batch's own buffers. The
+    // validity bitmap of all ones arrow's IPC encoder makes for a column with no nulls (no
+    // arena provenance, so once copied into the arena) is left out of the record
+    // (`moruna_ipc_check::valid`), so nothing of this batch is copied.
     let scratch = common::Scratch::new("t3b");
     let alloc = FakeAllocator::new();
     let reactor = FakeReactor::new();
@@ -146,17 +145,15 @@ fn pl_t3_table_pieces_are_the_batch_buffers() {
         .collect();
     assert_eq!(
         writes.len() as u64,
-        demotions * 4,
-        "a record is the header page, the framing page, the encoder's bitmap and the data"
+        demotions * 3,
+        "a record is the header page, the framing page and the data"
     );
     let page = common::PAGE as u64;
-    let bitmap = rows.div_ceil(8) as u64;
     let data = rows as u64 * 4;
-    for record in writes.chunks(4) {
+    for record in writes.chunks(3) {
         assert_eq!(record[0].len, page, "the header is one page");
         assert_eq!(record[1].len, page, "the framing is page rounded");
-        assert_eq!(record[2].len, bitmap, "the encoder's validity bitmap");
-        assert_eq!(record[3].len, data, "the batch's own data buffer, as is");
+        assert_eq!(record[2].len, data, "the batch's own data buffer, as is");
         for piece in record {
             assert_eq!(piece.offset % page, 0, "every piece is page aligned (e.3)");
         }

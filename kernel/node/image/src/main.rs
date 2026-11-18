@@ -381,7 +381,9 @@ fn supervisor_only(
 }
 
 /// network.conf through the network server's parser, its listener grants matching the node's
-/// actual channel bindings.
+/// actual channel bindings: node.conf's links to the network server, and the granting slot of
+/// its `restart` record, whose grant must hold `grant` and cover the listener the supervisor
+/// mints from it at each start of the service that restarts (item 2.2c).
 fn network_config(
     assets: &Path,
     node: &moruna_node::Config,
@@ -405,6 +407,13 @@ fn network_config(
             linked.push(link.right_slot.as_str());
         }
     }
+    let restart = node
+        .restart
+        .as_ref()
+        .filter(|record| record.server == service.name);
+    if let Some(record) = restart {
+        linked.push(record.granting.as_str());
+    }
     if network
         .grants
         .iter()
@@ -414,6 +423,18 @@ fn network_config(
             .any(|slot| !network.grants.iter().any(|(s, _)| s.as_str() == *slot))
     {
         return Err("network listener grants must match actual node channel bindings".into());
+    }
+    if let Some(record) = restart
+        && !network.grants.iter().any(|(slot, granting)| {
+            *slot == record.granting
+                && granting.rights & netstack_protocol::rights::GRANT != 0
+                && granting.covers(&record.policy)
+        })
+    {
+        return Err(format!(
+            "the restart record's listener is not one {} can grant",
+            record.granting
+        ));
     }
     Ok(network)
 }
@@ -861,7 +882,7 @@ mod profile_tests {
                 (
                     "node.conf",
                     &format!(
-                        "{NETWORKED}service api image.devices 4096\nlink api server network listen-api\n"
+                        "{NETWORKED}service api image.devices 4096\nlink network listen-api api server\n"
                     ),
                 ),
                 ("cloud.image", BOUND),
@@ -907,6 +928,62 @@ mod profile_tests {
             unserved.cloud(RAM).unwrap_err(),
             "network listener grants must match actual node channel bindings"
         );
+    }
+
+    /// The network server's grant for a `restart` record's granting slot (item 2.2c).
+    #[test]
+    fn cloud_binds_the_restart_record_s_granting_slot() {
+        let node = format!(
+            "{NETWORKED}service api image.devices 4096\nrestart api network network listen-supervisor rights=listen local=0.0.0.0/0@443 sockets=64\n"
+        );
+        let network =
+            |grant: &str| format!("moruna-netstack 1\ninterface wan card=net0 dhcp\n{grant}\n");
+        let granting = network("grant listen-supervisor rights=grant,listen local=0.0.0.0/0@443");
+        // The record binds the supervisor's grant, with no link.
+        let granted = Assets::new(
+            "granted",
+            &[
+                ("node.conf", &node),
+                ("cloud.image", BOUND),
+                ("network.conf", &granting),
+            ],
+        );
+        granted.cloud(RAM).unwrap();
+        // Without the record, the same grant is bound to nothing.
+        let unbound = Assets::new(
+            "ungranted",
+            &[
+                ("node.conf", NETWORKED),
+                ("cloud.image", BOUND),
+                ("network.conf", &granting),
+            ],
+        );
+        assert_eq!(
+            unbound.cloud(RAM).unwrap_err(),
+            "network listener grants must match actual node channel bindings"
+        );
+        // A grant without the `grant` right, or narrower than the listener the record mints,
+        // could not mint it at the first start.
+        for grant in [
+            "grant listen-supervisor rights=listen local=0.0.0.0/0@443",
+            "grant listen-supervisor rights=grant local=0.0.0.0/0@443",
+            "grant listen-supervisor rights=grant,listen local=0.0.0.0/0@8443",
+            "grant listen-supervisor rights=grant,listen local=0.0.0.0/0@443 sockets=16",
+        ] {
+            let refused = Assets::new(
+                "narrow",
+                &[
+                    ("node.conf", &node),
+                    ("cloud.image", BOUND),
+                    ("network.conf", &network(grant)),
+                ],
+            );
+            assert_eq!(
+                refused.cloud(RAM).unwrap_err(),
+                "the restart record's listener is not one listen-supervisor can grant",
+                "{grant}"
+            );
+        }
     }
 
     #[test]

@@ -6,6 +6,7 @@
 use crate::{
     api::{Api, NodeFacts},
     engine::{EngineHost, NoEngine},
+    functions::FunctionKey,
     http::{BODY_BUDGET, Budget, Session},
     identity::Identity,
     tls::{self, Tls, WallClock},
@@ -43,6 +44,9 @@ pub struct Config {
     pub facts: NodeFacts,
     /// The keys a token's signature is checked against: node config's `token_keys`.
     pub token_keys: Vec<TokenKey>,
+    /// The keys a function image's signature is checked against: node config's
+    /// `functions.keys`, none when it has none (system design 3E).
+    pub function_keys: Vec<FunctionKey>,
 }
 
 /// The API server over connections of type `T`, with time from `C`.
@@ -185,7 +189,12 @@ impl<T: Transport, C: Clock> Server<T, C> {
             tls: tls::config(&config.identity, wall.clone())?,
             wall,
             clock,
-            api: Api::new(config.facts, config.token_keys, engine),
+            api: Api::new(
+                config.facts,
+                config.token_keys,
+                config.function_keys,
+                engine,
+            ),
             connections: Vec::new(),
             budget: Budget::new(BODY_BUDGET),
             scratch: vec![0; READ_CHUNK],
@@ -267,5 +276,12 @@ impl<T: Transport, C: Clock> Server<T, C> {
     /// What the node document says, for the caller to change (its health, say).
     pub fn facts_mut(&mut self) -> &mut NodeFacts {
         &mut self.api.facts
+    }
+
+    /// Whether a request to [`TEST_EXIT_PATH`](crate::TEST_EXIT_PATH) has come: the caller then
+    /// ends (feature `test-exit`, the `cloud-test` image only; work item 2.2c).
+    #[cfg(feature = "test-exit")]
+    pub fn exit_requested(&self) -> bool {
+        self.api.exit
     }
 }

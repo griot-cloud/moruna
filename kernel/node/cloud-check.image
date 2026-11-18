@@ -1,0 +1,44 @@
+# The cloud profile's check variant (item 1.10b): the cloud profile, and `storvsc-check`, which
+# says on the console whether storvsc serves Azure's disks: the OS disk's GPT header, a data
+# disk at LUN 0 written, read back and restored, and the block conformance suite. It is built
+# only for the PM's Azure check, never shipped:
+#   package.py --profile cloud --description kernel/node/cloud-check.image \
+#     --assets kernel/node/cloud-check --package storvsc-check --formats vhd ...
+# kernel/node/cloud-check holds the cloud profile's node.conf and network.conf with the check's
+# lines added; test_package.py keeps the two profiles the same but for them.
+moruna-image 1
+process node-supervisor
+  handle console console
+  handle root.process root.process
+  handle root.device root.device
+  handle root.ecam root.ecam
+  handle root.msi root.msi
+  handle root.dma root.dma
+  # ABI 2.8 (item 5.0): the right to set the wall clock, which node.conf grants `platform`
+  # alone (`grant platform clock root.clock`, with item 1.4's platform service).
+  handle root.clock root.clock
+  handle program:devices image.devices
+  handle program:netstack image.netstack
+  handle program:api image.api
+  handle program:platform image.platform
+  # VMBus (item 1.9c): Hyper-V's mechanism, which the core makes only on Hyper-V, the DMA
+  # grant `vmbus` pins the memory it shares with the host with, and its program. On any
+  # other machine the supervisor starts no `vmbus` and these stay unused.
+  handle root.hyperv root.hyperv
+  handle root.dma dma.vmbus
+  handle program:vmbus image.vmbus
+  # storvsc (item 1.10b), Azure's disks: its own whole DMA grant, as vmbus's (1F), and its
+  # program. The supervisor starts it where it starts vmbus, whose client it is.
+  handle root.dma dma.storvsc
+  handle program:storvsc image.storvsc
+  # The check (item 1.10b).
+  handle program:storvsc-check image.storvsc-check
+  handle data:node.conf config
+  handle data:network.conf network.config
+  # Mozilla's roots, as the cloud profile's (system design 3D): a copy of kernel/node/cloud's,
+  # which test_package.py keeps the same.
+  handle data:tls.roots tls.roots
+  driver 1af4:1042 virtio-blk block
+  driver 1af4:1041 virtio-net net
+  driver 1b36:0010 nvme nvme
+  driver 1ae0:0042 gve net

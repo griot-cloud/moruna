@@ -17,12 +17,9 @@ use arrow_ipc::convert::fb_to_schema;
 use arrow_ipc::reader::read_record_batch;
 use arrow_ipc::writer::StreamEncoder;
 use arrow_schema::{DataType, Schema};
-use moruna_ipc_check::fb::Table;
-use moruna_ipc_check::format;
-use moruna_ipc_check::frame::{self, CONTINUATION};
+use moruna_ipc_check::frame::CONTINUATION;
 use moruna_ipc_check::record::{Need, check_record, framing_need, reframe, stream_parts};
-use moruna_ipc_check::schema::check_schema;
-use moruna_ipc_check::walk::{Body, Plan, Rule, Span, walk};
+use moruna_ipc_check::valid;
 
 use crate::error::FunctionError;
 use crate::lane::{Lane, Mapped, Posted};
@@ -213,7 +210,12 @@ pub(crate) fn encode(batch: &RecordBatch) -> Result<Encoded, FunctionError> {
     let at = schema.len();
     let mut batch_message = chunks.message(at)?;
     let body_at = at + batch_message.len();
-    leave_out_all_valid(&schema, &mut batch_message, &chunks, body_at)?;
+    // arrow-ipc's bitmaps of all ones are left out, as every writer of records leaves them out
+    // (`moruna_ipc_check::valid`): each would take a page of its own.
+    valid::leave_out_all_valid(&schema, &mut batch_message, &mut |offset, out| {
+        chunks.copy(body_at + offset as usize, out)
+    })
+    .map_err(output)?;
     let laid = reframe(&schema, &batch_message).map_err(output)?;
     check_record(&laid.framing, laid.record_len).map_err(output)?;
     Ok(Encoded {
@@ -223,84 +225,6 @@ pub(crate) fn encode(batch: &RecordBatch) -> Result<Encoded, FunctionError> {
         record_len: laid.record_len,
         moves: laid.moves,
     })
-}
-
-/// The root table of the whole message `bytes` (its marker and length, then the flatbuffer).
-fn message_table(bytes: &[u8]) -> Result<Table<'_>, String> {
-    let len = frame::message_len(bytes)?;
-    Table::root(&bytes[8..8 + len])
-}
-
-/// The header table of the whole message `bytes`, which must be of header type `want`.
-fn header_table(bytes: &[u8], want: u8) -> Result<Table<'_>, String> {
-    let message = message_table(bytes)?;
-    if message.u8(format::message::HEADER_TYPE, format::header::NONE)? != want {
-        return Err(String::from("a message of another type"));
-    }
-    message
-        .table(format::message::HEADER)?
-        .ok_or_else(|| String::from("a message without its header"))
-}
-
-/// Every buffer the check's walk reaches, numbered in entry order, and of the validity bitmaps
-/// among them, the entry and the bits it covers.
-#[derive(Default)]
-struct Bitmaps {
-    next: usize,
-    found: Vec<(usize, Span, usize)>,
-}
-
-impl Plan for Bitmaps {
-    fn take(&mut self, _: &str, _: &'static str, span: Span, rule: Rule) -> Result<Span, String> {
-        if let Rule::Validity(bits) = rule {
-            self.found.push((self.next, span, bits));
-        }
-        self.next += 1;
-        Ok(span)
-    }
-}
-
-/// Whether the first `bits` bits of the bitmap at `at` are all set (least significant first).
-fn all_set(chunks: &Chunks, at: usize, bits: usize) -> bool {
-    let Some(bytes) = chunks.bytes(at, bits.div_ceil(8)) else {
-        return false;
-    };
-    let (whole, rest) = (bits / 8, bits % 8);
-    let mask = (1u8 << rest).wrapping_sub(1);
-    bytes[..whole].iter().all(|b| *b == 0xff) && (rest == 0 || bytes[whole] & mask == mask)
-}
-
-/// Leaves out every validity bitmap with no bit clear: arrow-ipc writes one for each column and
-/// list child, all ones when nothing is null, and in a record each takes a page of its own. A
-/// zero-length bitmap is how the format says "no nulls", and its node already counts none, so
-/// the batch read back is the same; this is what the gate's own encoder wrote. The bitmaps are
-/// found by the engine's own walk (`moruna_ipc_check::walk`), the order arrow-ipc reads them in.
-fn leave_out_all_valid(
-    schema: &[u8],
-    batch_message: &mut [u8],
-    chunks: &Chunks,
-    body_at: usize,
-) -> Result<(), FunctionError> {
-    let fields = header_table(schema, format::header::SCHEMA)
-        .and_then(check_schema)
-        .map_err(output)?;
-    let body = Body {
-        len: usize::try_from(frame::body_length(batch_message).map_err(output)?)
-            .map_err(|_| output("a negative body length"))?,
-        addr: 0,
-    };
-    let version = message_table(batch_message)
-        .and_then(|m| m.i16(format::message::VERSION, format::version::V1))
-        .map_err(output)?;
-    let mut bitmaps = Bitmaps::default();
-    let record_batch = header_table(batch_message, format::header::RECORD_BATCH).map_err(output)?;
-    walk(record_batch, body, version, &fields, Some(&mut bitmaps)).map_err(output)?;
-    for (entry, span, bits) in bitmaps.found {
-        if span.len > 0 && all_set(chunks, body_at + span.offset, bits) {
-            frame::write_entry(batch_message, entry, span.offset as i64, 0).map_err(output)?;
-        }
-    }
-    Ok(())
 }
 
 impl Encoded {
@@ -505,21 +429,6 @@ mod tests {
             arrow_schema::UnionMode::Dense,
         );
         assert!(has_dictionary(&union));
-    }
-
-    #[test]
-    fn all_set_reads_only_the_bits_it_covers() {
-        let c = Chunks::new(vec![Buffer::from_vec(vec![0xffu8, 0x07, 0x00])]);
-        assert!(all_set(&c, 0, 0));
-        assert!(all_set(&c, 0, 8));
-        assert!(
-            all_set(&c, 0, 11),
-            "the eleventh bit is the third of the second byte"
-        );
-        assert!(!all_set(&c, 0, 12));
-        assert!(all_set(&c, 1, 3));
-        assert!(!all_set(&c, 2, 1));
-        assert!(!all_set(&c, 3, 1), "past the bytes");
     }
 
     /// The non-empty buffers of a record, and the record read back.

@@ -291,7 +291,7 @@ fn ten_thousand_random_host_messages_never_panic_the_client() {
         refused: 0,
     };
     let mut random = Random(0x9e37_79b9_7f4a_7c15);
-    let mut client = Client::new();
+    let mut client = Client::new(0);
     let mut gpadls = Gpadls::default();
 
     let (mut taken, mut refused) = (0u32, 0u32);

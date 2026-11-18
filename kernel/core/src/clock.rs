@@ -36,7 +36,8 @@ use crate::{
 
 static MULTIPLIER: AtomicU64 = AtomicU64::new(0);
 /// The realtime base: the wall clock, in nanoseconds since 1970, at the monotonic clock's
-/// zero. The CMOS clock's reading at boot, then each `clock_set_realtime`'s; zero while unset.
+/// zero. The CMOS clock's reading at boot, then each `clock_set_realtime`'s; zero, unset, on a
+/// machine with no CMOS clock until `clock_set_realtime`.
 static REALTIME_AT_BOOT: AtomicU64 = AtomicU64::new(0);
 /// The clock page's sequence, kept here, where its one writer (`set_base`) reads it; its lock
 /// is what makes that writer one.
@@ -94,8 +95,15 @@ pub fn init() -> Result<(), &'static str> {
     make_page(origin, multiplier)?;
     // The CMOS clock is read now, after the clock's zero: the realtime at the zero is that
     // reading less the time since, so `realtime` and a realtime deadline agree with it.
-    let cmos = rtc::read()?;
-    set_base(cmos.saturating_sub(now()), clock_page::realtime::MACHINE);
+    match rtc::read()? {
+        Some(cmos) => set_base(cmos.saturating_sub(now()), clock_page::realtime::MACHINE),
+        // No CMOS clock answered by its deadline: the realtime base stays unset, zero, its
+        // source `UNSET`, and the boot goes on. The node's wall clock comes from instance
+        // data, which `platform` reads and sets (`clock_set_realtime`, the system design,
+        // section 1D). Nothing in the core takes a zero base for an error: `realtime()` then
+        // counts from 1970, as the Linux layer's realtime clocks do (`foreign.rs`).
+        None => early_println!("{}", moruna_abi::boot_line::NO_CMOS_CLOCK),
+    }
     early_println!(
         "kk: clock: started {} ms after the core's first instruction",
         scale::scale(here - origin, multiplier) / 1_000_000
@@ -146,7 +154,8 @@ pub fn realtime_at_boot() -> u64 {
 }
 
 /// The realtime clock now, in nanoseconds since 1970: the realtime base (the CMOS clock at
-/// boot, or the last `clock_set_realtime`) advanced by the monotonic clock.
+/// boot, or the last `clock_set_realtime`) advanced by the monotonic clock. Unset, it counts
+/// from 1970.
 pub fn realtime() -> u64 {
     realtime_at_boot().saturating_add(now())
 }
@@ -154,6 +163,7 @@ pub fn realtime() -> u64 {
 /// The CMOS real-time clock, read once at boot (the node's time, as the machine's
 /// firmware keeps it, in UTC).
 mod rtc {
+    use moruna_datapath::clock as scale;
     use ostd::{arch::device::io_port::ReadWriteAccess, io::IoPort};
 
     const INDEX: u16 = 0x70;
@@ -186,11 +196,13 @@ mod rtc {
         century: u8,
     }
 
-    fn sample(cmos: &Cmos, century: Option<u8>) -> Reading {
-        while cmos.updating() {
-            core::hint::spin_loop();
+    /// One reading of the clock, once it is not updating; `None` if it is still updating
+    /// at `deadline`, as ports with no CMOS clock behind them read.
+    fn sample(cmos: &Cmos, century: Option<u8>, deadline: u64) -> Option<Reading> {
+        if !scale::wait_until(super::now, deadline, || !cmos.updating()) {
+            return None;
         }
-        Reading {
+        Some(Reading {
             second: cmos.get(0x00),
             minute: cmos.get(0x02),
             hour: cmos.get(0x04),
@@ -198,7 +210,7 @@ mod rtc {
             month: cmos.get(0x08),
             year: cmos.get(0x09),
             century: century.map(|r| cmos.get(r)).unwrap_or(0),
-        }
+        })
     }
 
     fn same(a: &Reading, b: &Reading) -> bool {
@@ -224,7 +236,10 @@ mod rtc {
         era * 146_097 + doe - 719_468
     }
 
-    pub fn read() -> Result<u64, &'static str> {
+    /// The clock, in nanoseconds since 1970; `None` when it has not answered and held
+    /// still within `CMOS_WAIT_NS`, as on a machine with no CMOS clock (the system design,
+    /// section 1B: no wait without a deadline in boot code).
+    pub fn read() -> Result<Option<u64>, &'static str> {
         let index = IoPort::acquire(INDEX).map_err(|_| "the CMOS clock's index port is taken")?;
         let data = IoPort::acquire(DATA).map_err(|_| "the CMOS clock's data port is taken")?;
         let cmos = Cmos { index, data };
@@ -232,10 +247,15 @@ mod rtc {
             .get()
             .and_then(|info| info.century_register)
             .map(|r| r.get());
+        let deadline = super::now().saturating_add(scale::CMOS_WAIT_NS);
         // Read until two readings agree, so an update between registers is not mixed in.
-        let mut last = sample(&cmos, century);
+        let Some(mut last) = sample(&cmos, century, deadline) else {
+            return Ok(None);
+        };
         let reading = loop {
-            let next = sample(&cmos, century);
+            let Some(next) = sample(&cmos, century, deadline) else {
+                return Ok(None);
+            };
             if same(&last, &next) {
                 break next;
             }
@@ -267,7 +287,7 @@ mod rtc {
             + decode(reading.minute) as i64 * 60
             + decode(reading.second) as i64;
         u64::try_from(seconds)
-            .map(|s| s * 1_000_000_000)
+            .map(|s| Some(s * 1_000_000_000))
             .map_err(|_| "the CMOS clock is before 1970")
     }
 }

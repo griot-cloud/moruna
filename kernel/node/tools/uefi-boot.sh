@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # Boots the node's disk image, OUT/moruna-node.raw (package.py --profile cloud), from UEFI
-# firmware in QEMU: the machine of system design 1A and work item 1.1. A q35 machine, one
-# read-only virtio disk (the node never writes its boot disk), one virtio network card, and the
-# first serial port written to OUT/console.log. No direct kernel load, no vsock, no host socket.
+# firmware in QEMU: the machine of system design 1A and work item 1.1. A q35 machine (MACHINE
+# below), one read-only virtio disk (the node never writes its boot disk), one virtio network
+# card, and the first serial port written to OUT/console.log. No direct kernel load, no vsock,
+# no host socket.
 #
-#   kernel/node/tools/uefi-boot.sh OUT CPUS [FORMAT]
+#   [MACHINE=pc] kernel/node/tools/uefi-boot.sh OUT CPUS [FORMAT]
+#
+# MACHINE is QEMU's machine type: `q35`, the default and 1A's machine, or `pc` (i440FX), which
+# has no MCFG and so no PCI Express configuration space: work item 1.8's boot without MCFG.
 #
 # FORMAT is the boot disk's format (work item 1.5), one that package.py --formats wrote: raw
 # (the default), qcow2 (OUT/moruna-node.qcow2) or vhd (OUT/moruna-node.vhd). A fixed VHD is the
@@ -28,6 +32,11 @@ out="$(cd "$1" && pwd)"
 cpus="$2"
 case "$cpus" in
   '' | *[!0-9]* | 0*) echo "uefi-boot.sh: CPUS must be a positive number: $cpus" >&2; exit 2 ;;
+esac
+machine="${MACHINE:-q35}"
+case "$machine" in
+  q35 | pc) ;;
+  *) echo "uefi-boot.sh: MACHINE must be q35 or pc: $machine" >&2; exit 2 ;;
 esac
 format="${3:-raw}"
 case "$format" in
@@ -67,11 +76,11 @@ cp "$vars_template" "$vars"
 if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
   accel=(-accel kvm -cpu host)
   seconds=120
-  echo "uefi-boot: KVM, $cpus CPUs, $seconds s" >&2
+  echo "uefi-boot: KVM, $machine, $cpus CPUs, $seconds s" >&2
 else
   accel=(-accel tcg -cpu max)
   seconds=900
-  echo "uefi-boot: TCG (no usable /dev/kvm), $cpus CPUs, $seconds s" >&2
+  echo "uefi-boot: TCG (no usable /dev/kvm), $machine, $cpus CPUs, $seconds s" >&2
 fi
 echo "uefi-boot: boot disk $disk, read as $drive" >&2
 
@@ -98,7 +107,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 start="$EPOCHREALTIME"
-qemu-system-x86_64 -machine q35 -smp "$cpus" -m 2G -rtc base=utc -nodefaults -no-reboot -display none \
+qemu-system-x86_64 -machine "$machine" -smp "$cpus" -m 2G -rtc base=utc -nodefaults -no-reboot -display none \
   "${accel[@]}" \
   -drive "if=pflash,format=raw,readonly=on,file=$code" \
   -drive "if=pflash,format=raw,file=$vars" \

@@ -161,12 +161,13 @@ fn what_this_server_does_not_read_is_refused() {
 }
 
 fn answer(status: u16, body: &[u8]) -> Answer {
-    Answer {
-        status,
-        body: body.to_vec(),
-        close: false,
-        allow: None,
-    }
+    Answer::with(status, Body::json(body.to_vec()))
+}
+
+/// `answer` as HTTP/1.1 writes it: its head, then its body.
+fn write(answer: &Answer, close: bool, out: &mut Vec<u8>) {
+    head(answer, close, out);
+    out.extend_from_slice(&answer.body.bytes());
 }
 
 #[test]
@@ -191,6 +192,13 @@ fn answers_are_written_as_http_1_1() {
         out,
         b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nAllow: POST\r\n\r\n"
     );
+    // The length is the body's as written, an escaped text's included.
+    let mut escaped = Body::default();
+    let at = escaped.add(crate::body::Text::Static("a\"b\n"));
+    escaped.write(at, crate::body::Form::Escaped);
+    let mut out = Vec::new();
+    write(&Answer::with(200, escaped), false, &mut out);
+    assert!(out.ends_with(b"Content-Length: 6\r\n\r\na\\\"b\\n"));
     for status in [202, 400, 403, 404, 409, 500, 503] {
         assert!(!reason(status).is_empty());
     }
@@ -215,6 +223,7 @@ fn api(signer: &Signer) -> (Api, Budget) {
         Api::new(
             facts(),
             vec![TokenKey::new(signer.public())],
+            Vec::new(),
             alloc::boxed::Box::new(crate::NoEngine),
         ),
         Budget::new(BODY_BUDGET),

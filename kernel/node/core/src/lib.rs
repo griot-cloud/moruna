@@ -7,9 +7,17 @@ extern crate alloc;
 pub mod egress;
 use alloc::{string::String, vec::Vec};
 
+pub mod restart;
+pub use restart::Restart;
+
 pub const MAX_CONFIG: usize = 4096;
 pub const MAX_SERVICES: usize = 16;
 pub const MAX_JOB_GRANTS: usize = 24;
+
+/// The boot capability the core makes only on Hyper-V (ABI 2.7; system design 1F): a
+/// service granted it runs only on a machine where the supervisor holds it
+/// ([`Config::on_machine`]), which is how `vmbus` is started on Azure and nowhere else.
+pub const HYPERV: &str = "root.hyperv";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Service {
@@ -25,12 +33,43 @@ pub struct Grant {
     pub source: String,
 }
 
+/// `link LEFT LEFT_SLOT RIGHT RIGHT_SLOT`: a fresh channel pair, one end to each. The left
+/// service serves on its end and the right one is its client, so a service that is not on
+/// a machine takes its clients with it ([`Config::on_machine`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
+    /// The service that serves.
     pub left: String,
     pub left_slot: String,
+    /// Its client.
     pub right: String,
     pub right_slot: String,
+}
+
+/// The services that run only on Hyper-V: each granted [`HYPERV`], and each client of one
+/// of those, and so on (the right side of a link whose left side is one).
+fn hyperv_only(grants: &[Grant], links: &[Link]) -> Vec<String> {
+    let mut only: Vec<String> = grants
+        .iter()
+        .filter(|grant| grant.source == HYPERV)
+        .map(|grant| grant.service.clone())
+        .collect();
+    // Every pass adds at least one client, or ends.
+    loop {
+        let clients: Vec<String> = links
+            .iter()
+            .filter(|link| only.contains(&link.left) && !only.contains(&link.right))
+            .map(|link| link.right.clone())
+            .collect();
+        if clients.is_empty() {
+            return only;
+        }
+        for client in clients {
+            if !only.contains(&client) {
+                only.push(client);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +79,8 @@ pub struct Config {
     pub links: Vec<Link>,
     pub bootstraps: Vec<(Bootstrap, String)>,
     pub admission: Option<String>,
+    /// The one service the supervisor starts again when it dies (`restart`, item 2.2c).
+    pub restart: Option<Restart>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +94,7 @@ pub enum ConfigError {
     Empty,
 }
 
-fn identifier(s: &str) -> bool {
+pub(crate) fn identifier(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 32
         && s.bytes().all(|b| {
@@ -63,7 +104,9 @@ fn identifier(s: &str) -> bool {
 
 impl Config {
     /// A deliberately bounded, versioned boot format. Every non-comment record is
-    /// `service NAME IMAGE_HANDLE ACCOUNT_BYTES`; unknown records fail closed.
+    /// `service NAME IMAGE_HANDLE ACCOUNT_BYTES`, `grant SERVICE SLOT SOURCE`,
+    /// `link SERVER SLOT CLIENT SLOT` (the left side serves, [`Link`]), or a `bootstrap`;
+    /// unknown records fail closed.
     pub fn parse(bytes: &[u8], available: u64) -> Result<Self, ConfigError> {
         if bytes.len() > MAX_CONFIG {
             return Err(ConfigError::TooLarge);
@@ -82,9 +125,16 @@ impl Config {
         let mut links = Vec::new();
         let mut bootstraps: Vec<(Bootstrap, String)> = Vec::new();
         let mut admission: Option<String> = None;
+        let mut restart: Option<Restart> = None;
         for line in lines {
             let words: Vec<_> = line.split_ascii_whitespace().collect();
             match words.as_slice() {
+                ["restart", record @ ..] => {
+                    if restart.replace(Restart::parse(record)?).is_some() {
+                        return Err(ConfigError::Duplicate);
+                    }
+                    continue;
+                }
                 ["bootstrap", "admission", service] if identifier(service) => {
                     if admission.replace((*service).into()).is_some() {
                         return Err(ConfigError::Duplicate);
@@ -177,6 +227,8 @@ impl Config {
         if let Some(service) = &admission {
             destinations.push((service, "guardian"));
             destinations.push((service, "control"));
+            // The node's memory, as the platform bootstrap carries it (item 3.2).
+            destinations.push((service, "supervisor"));
         }
         for (_, service) in &bootstraps {
             destinations.push((service, "supervisor"));
@@ -191,6 +243,37 @@ impl Config {
         for link in &links {
             destinations.push((&link.left, &link.left_slot));
             destinations.push((&link.right, &link.right_slot));
+        }
+        if let Some(record) = &restart {
+            // A service started again has only what a start makes afresh: no grant, link
+            // or bootstrap of node.conf's could be given to it a second time.
+            if destinations
+                .iter()
+                .any(|(service, _)| *service == record.service)
+            {
+                return Err(ConfigError::Syntax);
+            }
+            destinations.push((&record.service, &record.slot));
+            destinations.push((&record.server, &record.granting));
+            if bootstraps
+                .iter()
+                .any(|(kind, _)| *kind == Bootstrap::Platform)
+            {
+                destinations.push((&record.service, restart::PLATFORM_SLOT));
+            }
+        }
+        // A service that runs only on Hyper-V (granted root.hyperv, or a client of one) is never one
+        // the node cannot run without, nor the one restarted or the server it mints from (item 2.2c).
+        let only = hyperv_only(&grants, &links);
+        if admission
+            .as_ref()
+            .is_some_and(|service| only.contains(service))
+            || bootstraps.iter().any(|(_, service)| only.contains(service))
+            || restart.as_ref().is_some_and(|record| {
+                only.contains(&record.service) || only.contains(&record.server)
+            })
+        {
+            return Err(ConfigError::Syntax);
         }
         for (index, (service, slot)) in destinations.iter().enumerate() {
             if !services.iter().any(|s| s.name == *service)
@@ -212,7 +295,29 @@ impl Config {
             links,
             bootstraps,
             admission,
+            restart,
         })
+    }
+
+    /// The node as this machine runs it. With `hyperv` (the supervisor holds [`HYPERV`]),
+    /// all of it; without, every service granted [`HYPERV`] is left out, and so is each of
+    /// its clients, and theirs: a service whose server is not on this machine is not on it
+    /// either (`storvsc`, a client of `vmbus`). A server is never left out for losing a
+    /// client: its end of the link simply has none (`devices`, which `storvsc` registers
+    /// with). Each service left out goes with its grants and its links, and the boot
+    /// capabilities it would have taken are not taken. No such service is the admission
+    /// service or a bootstrap's (`parse` refuses it).
+    pub fn on_machine(mut self, hyperv: bool) -> Config {
+        if hyperv {
+            return self;
+        }
+        let left_out = hyperv_only(&self.grants, &self.links);
+        let kept = |name: &String| !left_out.contains(name);
+        self.services.retain(|service| kept(&service.name));
+        self.grants.retain(|grant| kept(&grant.service));
+        self.links
+            .retain(|link| kept(&link.left) && kept(&link.right));
+        self
     }
 }
 
@@ -242,6 +347,15 @@ impl Lifecycle {
             return false;
         }
         self.states[index] = State::Running;
+        true
+    }
+    /// The service at `index`, which has died, is to be started again: back to pending, and
+    /// the node not failed. Only a running service is.
+    pub fn restarting(&mut self, index: usize) -> bool {
+        if self.failed || self.states.get(index) != Some(&State::Running) {
+            return false;
+        }
+        self.states[index] = State::Pending;
         true
     }
     pub fn terminated(&mut self, index: usize) -> bool {
@@ -338,17 +452,71 @@ pub mod line {
         }
     }
 
-    /// `moruna: fatal service <name>: ended`: a service ended, which stops the node.
-    pub struct Ended<'a>(pub &'a str);
+    /// A service has gone, which stops the node: its own name is the stage (1B: "the name
+    /// of the service that can't go on"). `moruna: fatal <name>: ended`, or `ended with code
+    /// <n>` when the supervisor knows the code; `moruna: fatal <name>: closed its channel to
+    /// the supervisor` when it did so with its process still running.
+    pub struct Gone<'a>(pub &'a str, pub super::Gone);
 
-    impl Display for Ended<'_> {
+    impl Display for Gone<'_> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            Fatal {
-                stage: format_args!("service {}", self.0),
-                reason: "ended",
+            match self.1 {
+                super::Gone::Ended(None) => Fatal {
+                    stage: self.0,
+                    reason: "ended",
+                }
+                .fmt(f),
+                super::Gone::Ended(Some(code)) => Fatal {
+                    stage: self.0,
+                    reason: format_args!("ended with code {code}"),
+                }
+                .fmt(f),
+                super::Gone::LeftSupervision => Fatal {
+                    stage: self.0,
+                    reason: "closed its channel to the supervisor",
+                }
+                .fmt(f),
             }
-            .fmt(f)
         }
+    }
+}
+
+/// How one of the node's services went: each stops the node (1B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gone {
+    /// Its process ended, with its code when the supervisor knows it.
+    Ended(Option<i64>),
+    /// It closed its channel to the supervisor (a bootstrap's, or admission's guardian)
+    /// while its process still runs: the supervisor can no longer watch over it.
+    LeftSupervision,
+}
+
+impl Gone {
+    /// What a service's closed channel to the supervisor means. A service that ends closes
+    /// its channels a moment before its process is seen to have ended, so the supervisor
+    /// looks for its process's end first: `terminated` says whether it saw it. Either way
+    /// the line names the service, never the channel.
+    pub fn closed_channel(terminated: bool) -> Gone {
+        if terminated {
+            Gone::Ended(None)
+        } else {
+            Gone::LeftSupervision
+        }
+    }
+}
+
+impl Config {
+    /// The services that hold a channel to the supervisor it watches, in the order the
+    /// supervisor makes those channels: each bootstrap's but `platform`'s, which makes no
+    /// process, then the admission service's guardian. When one closes, the service at its
+    /// place has gone.
+    pub fn guardians(&self) -> Vec<&str> {
+        let bootstraps = self
+            .bootstraps
+            .iter()
+            .filter(|(kind, _)| *kind != Bootstrap::Platform)
+            .map(|(_, service)| service.as_str());
+        bootstraps.chain(self.admission.as_deref()).collect()
     }
 }
 
@@ -479,8 +647,20 @@ mod start_tests {
     #[test]
     fn the_supervisors_failure_lines_are_exactly_the_system_designs() {
         assert_eq!(
-            format!("{}", line::Ended("devices")),
-            "moruna: fatal service devices: ended"
+            format!("{}", line::Gone("devices", Gone::Ended(Some(0)))),
+            "moruna: fatal devices: ended with code 0"
+        );
+        assert_eq!(
+            format!("{}", line::Gone("devices", Gone::Ended(None))),
+            "moruna: fatal devices: ended"
+        );
+        assert_eq!(
+            format!("{}", line::Gone("vmbus", Gone::Ended(Some(-3)))),
+            "moruna: fatal vmbus: ended with code -3"
+        );
+        assert_eq!(
+            format!("{}", line::Gone("admission", Gone::LeftSupervision)),
+            "moruna: fatal admission: closed its channel to the supervisor"
         );
         assert_eq!(
             format!("{}", line::Late("netstack")),
@@ -502,6 +682,8 @@ mod start_tests {
 
 #[cfg(test)]
 mod tests {
+    use alloc::format;
+
     use super::*;
     #[test]
     fn separate_instances_share_only_immutable_program_not_account_or_slots() {
@@ -532,6 +714,127 @@ mod tests {
             Err(ConfigError::Budget)
         );
     }
+    // A link's left side serves and its right side is the client: `vmbus` serves `storvsc`,
+    // which serves `probe`; `devices` serves `storvsc` (its registrations) and `other`; and
+    // `other` serves `vmbus`.
+    const CLOUD: &[u8] = b"moruna-node 1\nservice devices image.devices 4096\nservice vmbus image.vmbus 4096\nservice storvsc image.storvsc 4096\nservice probe image.probe 4096\nservice other image.other 4096\nbootstrap devices devices\ngrant devices drivers drivers\ngrant vmbus root.hyperv root.hyperv\ngrant vmbus dma dma.vmbus\ngrant storvsc dma dma.storvsc\nlink vmbus scsi storvsc vmbus\nlink devices register-storvsc storvsc devices\nlink storvsc check probe storvsc\nlink devices directory other directory\nlink other feed vmbus other\n";
+
+    #[test]
+    fn a_service_granted_root_hyperv_runs_only_where_the_core_made_it() {
+        let config = Config::parse(CLOUD, 32768).unwrap();
+        // On Hyper-V the node is as written.
+        assert_eq!(config.clone().on_machine(true), config);
+        // Elsewhere `vmbus` is left out, and so are its clients, and theirs: `storvsc`,
+        // then `probe`. A server stays though it loses a client: `devices` loses `storvsc`,
+        // and `other` loses `vmbus`.
+        let elsewhere = config.on_machine(false);
+        let names: Vec<_> = elsewhere.services.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["devices", "other"]);
+        assert_eq!(elsewhere.grants.len(), 1);
+        assert_eq!(elsewhere.grants[0].source, "drivers");
+        assert_eq!(elsewhere.links.len(), 1);
+        assert_eq!(
+            (
+                elsewhere.links[0].left.as_str(),
+                elsewhere.links[0].right.as_str()
+            ),
+            ("devices", "other")
+        );
+        assert_eq!(elsewhere.bootstraps.len(), 1);
+        // The admission service stays when what it serves goes.
+        let admission = b"moruna-node 1\nservice gate image.admission 4096\nservice vmbus image.vmbus 4096\nbootstrap admission gate\ngrant vmbus root.hyperv root.hyperv\nlink gate vmbus vmbus gate\n";
+        let gate = Config::parse(admission, 8192).unwrap().on_machine(false);
+        let names: Vec<_> = gate.services.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["gate"]);
+        assert!(gate.links.is_empty());
+        assert_eq!(gate.admission.as_deref(), Some("gate"));
+        // A node with no Hyper-V service is the same on every machine.
+        let plain = Config::parse(b"moruna-node 1\nservice a b 4096\n", 8192).unwrap();
+        assert_eq!(plain.clone().on_machine(false), plain);
+        assert_eq!(HYPERV, "root.hyperv");
+    }
+
+    #[test]
+    fn the_cloud_profile_starts_vmbus_and_storvsc_on_hyper_v_only() {
+        let profiles: [&[u8]; 2] = [
+            include_bytes!("../../cloud/node.conf"),
+            include_bytes!("../../cloud-check/node.conf"),
+        ];
+        for text in profiles {
+            let config = Config::parse(text, 1 << 30).unwrap();
+            let names =
+                |c: &Config| -> Vec<String> { c.services.iter().map(|s| s.name.clone()).collect() };
+            let all = names(&config);
+            assert!(all.iter().any(|n| n == "vmbus") && all.iter().any(|n| n == "storvsc"));
+            assert_eq!(config.clone().on_machine(true), config);
+            let elsewhere = config.on_machine(false);
+            let left: Vec<String> = all
+                .iter()
+                .filter(|n| *n != "vmbus" && *n != "storvsc")
+                .cloned()
+                .collect();
+            assert_eq!(
+                names(&elsewhere),
+                left,
+                "devices, its clients and the rest stay"
+            );
+            assert!(
+                elsewhere
+                    .links
+                    .iter()
+                    .all(|l| l.left != "storvsc" && l.right != "storvsc")
+            );
+            assert!(elsewhere.grants.iter().all(|g| g.source != "dma.storvsc"));
+        }
+    }
+
+    #[test]
+    fn a_service_the_node_cannot_run_without_is_never_hyper_v_only() {
+        let bootstrap = b"moruna-node 1\nservice devices image.devices 4096\nbootstrap devices devices\ngrant devices root.hyperv root.hyperv\n";
+        assert_eq!(Config::parse(bootstrap, 8192), Err(ConfigError::Syntax));
+        let admission = b"moruna-node 1\nservice gate image.admission 4096\nbootstrap admission gate\ngrant gate root.hyperv root.hyperv\n";
+        assert_eq!(Config::parse(admission, 8192), Err(ConfigError::Syntax));
+        // Nor a client of a service that is, however far down.
+        let client = b"moruna-node 1\nservice vmbus image.vmbus 4096\nservice disk image.disk 4096\nservice devices image.devices 4096\nbootstrap devices devices\ngrant vmbus root.hyperv root.hyperv\nlink vmbus scsi disk vmbus\nlink disk block devices disk\n";
+        assert_eq!(Config::parse(client, 16384), Err(ConfigError::Syntax));
+        let gate = b"moruna-node 1\nservice vmbus image.vmbus 4096\nservice gate image.admission 4096\nbootstrap admission gate\ngrant vmbus root.hyperv root.hyperv\nlink vmbus feed gate vmbus\n";
+        assert_eq!(Config::parse(gate, 8192), Err(ConfigError::Syntax));
+        // root.hyperv has one owner, as every boot capability does.
+        let twice = b"moruna-node 1\nservice a b 4096\nservice c d 4096\ngrant a root.hyperv root.hyperv\ngrant c root.hyperv root.hyperv\n";
+        assert_eq!(Config::parse(twice, 8192), Err(ConfigError::Duplicate));
+    }
+
+    #[test]
+    fn a_closed_supervisor_channel_names_the_service_that_held_it() {
+        // Devices' bootstrap channel is a guardian, platform's is not, and a service with no
+        // bootstrap has none. An admission service's guardian comes after every bootstrap's.
+        let node = concat!(
+            "moruna-node 1\n",
+            "service devices image.devices 4096\n",
+            "service platform image.platform 4096\n",
+            "service gate image.admission 4096\n",
+            "service linux image.linux 4096\n",
+            "service vmbus image.vmbus 4096\n",
+            "bootstrap platform platform\n",
+            "bootstrap devices devices until-stopped\n",
+            "bootstrap admission gate\n",
+            "bootstrap linux linux\n",
+        );
+        let config = Config::parse(node.as_bytes(), 32768).unwrap();
+        assert_eq!(config.guardians(), ["devices", "linux", "gate"]);
+        let plain = Config::parse(b"moruna-node 1\nservice a b 4096\n", 8192).unwrap();
+        assert!(plain.guardians().is_empty());
+        // Whether its process has been seen to end decides the line; it is never the
+        // channel's error.
+        assert_eq!(Gone::closed_channel(true), Gone::Ended(None));
+        assert_eq!(Gone::closed_channel(false), Gone::LeftSupervision);
+        for gone in [Gone::closed_channel(true), Gone::closed_channel(false)] {
+            let text = format!("{}", line::Gone("devices", gone));
+            assert!(text.starts_with("moruna: fatal devices: "), "{text}");
+            assert!(!text.contains("guardian") && !text.contains("peer closed"));
+        }
+    }
+
     #[test]
     fn unexpected_death_prevents_later_launch() {
         let mut l = Lifecycle::new(2);
@@ -759,6 +1062,19 @@ mod boot_tests {
         // Its slot is `supervisor`, which no grant or link may also fill.
         let aliased = b"moruna-node 1\nservice platform image.platform 16777216\nbootstrap platform platform\ngrant platform supervisor spare\n";
         assert_eq!(Config::parse(aliased, 1 << 30), Err(ConfigError::Duplicate));
+    }
+    #[test]
+    fn admission_is_told_the_nodes_memory_on_a_slot_of_its_own() {
+        let config = b"moruna-node 1\nservice admission image.admission 16777216\nbootstrap admission admission\n";
+        assert!(Config::parse(config, 1 << 30).is_ok());
+        // `supervisor` is admission's: no grant, link or bootstrap may also fill it.
+        let granted = b"moruna-node 1\nservice admission image.admission 16777216\nbootstrap admission admission\ngrant admission supervisor spare\n";
+        assert_eq!(Config::parse(granted, 1 << 30), Err(ConfigError::Duplicate));
+        let bootstrapped = b"moruna-node 1\nservice admission image.admission 16777216\nbootstrap admission admission\nbootstrap platform admission\n";
+        assert_eq!(
+            Config::parse(bootstrapped, 1 << 30),
+            Err(ConfigError::Duplicate)
+        );
     }
     #[test]
     fn bootstrap_and_grants_cannot_alias_child_slots() {

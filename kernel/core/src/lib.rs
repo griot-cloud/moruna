@@ -18,6 +18,7 @@ mod clock;
 mod datapath;
 mod foreign;
 mod futex;
+mod hyperv;
 mod interrupt;
 mod memory;
 mod object;

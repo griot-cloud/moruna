@@ -11,7 +11,7 @@ mod support;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use moruna_kernel::CancelToken;
@@ -29,13 +29,18 @@ use support::{Scratch, one_run_at_a_time, read_back_rows, write_parquet};
 /// What the job's secret is; it must appear in nothing the engine says.
 const SECRET: &str = "wJalrXUtnFEMI-K7MDENG-bPxRfiCY-NODE-SECRET";
 
-/// One end of a socket pair as a channel's: each message a `u32` length and its bytes.
+/// One end of a socket pair as a channel's: each message a `u32` length and its bytes, and an
+/// empty frame, which no message is, for the end: what a channel's peer sees when this end
+/// closes. (On macOS a socket pair's `shutdown` does not always wake the other end's blocked
+/// read, so the end is said in the stream, then the sockets are shut down.)
 struct Framed {
     reading: Mutex<UnixStream>,
     writing: Mutex<UnixStream>,
     closer: UnixStream,
     /// The largest message sent from this end.
     largest: AtomicUsize,
+    /// Whether this end was closed.
+    closed: AtomicBool,
 }
 
 impl Framed {
@@ -47,6 +52,7 @@ impl Framed {
                 writing: Mutex::new(stream.try_clone().expect("clone")),
                 closer: stream,
                 largest: AtomicUsize::new(0),
+                closed: AtomicBool::new(false),
             })
         };
         (end(a), end(b))
@@ -75,11 +81,18 @@ impl Messages for Framed {
             Err(e) => return Err(e),
         }
         let length = u32::from_le_bytes(length) as usize;
+        if length == 0 {
+            return Ok(0);
+        }
         reading.read_exact(&mut buf[..length])?;
         Ok(length)
     }
 
     fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        if let Ok(mut writing) = self.writing.lock() {
+            let _ = writing.write_all(&0u32.to_le_bytes());
+        }
         let _ = self.closer.shutdown(std::net::Shutdown::Both);
     }
 }
@@ -162,6 +175,11 @@ struct Served {
 /// Serves `spec` (the `spec` message's members beside its `type`) in node mode on the channel
 /// `channel:engine`, as the node's `api` would send it, and reads until the engine has gone.
 fn serve(scratch: &Scratch, spec: Value) -> Served {
+    serve_bounded(scratch, spec, None)
+}
+
+/// [`serve`] on a node whose jobs may have at most `budget_max` bytes.
+fn serve_bounded(scratch: &Scratch, spec: Value, budget_max: Option<u64>) -> Served {
     let input = scratch.path().join("in.parquet");
     let out = scratch.path().join("out");
     let kinds = kinds(&input, &out);
@@ -186,6 +204,7 @@ fn serve(scratch: &Scratch, spec: Value) -> Served {
     });
     let node = Node {
         channel: "channel:engine".to_string(),
+        budget_max,
     };
     let outcome = session::serve_node(
         over_messages(engine.clone()),
@@ -204,6 +223,18 @@ fn serve(scratch: &Scratch, spec: Value) -> Served {
             pulled_images: None,
         },
     );
+    // The engine has returned: its end is closed, and the peer reads to the end at once. A
+    // peer still reading after a while is a failure that says how the engine closed, not a hang.
+    let waited = std::time::Instant::now();
+    while !peer.is_finished() {
+        assert!(
+            waited.elapsed() < std::time::Duration::from_secs(30),
+            "the peer never read to the end: the engine closed its end: {}, the outcome {:?}",
+            engine.closed.load(Ordering::Relaxed),
+            (outcome.code, &outcome.diagnostic),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let bytes = peer.join().expect("the peer");
     let messages = protocol::json_messages(&bytes).expect("every message reads");
     Served {
@@ -373,6 +404,8 @@ fn check_job_refuses_what_a_node_would() {
     std::fs::write(&path, doc.to_string()).expect("the document");
     let kinds = kinds(Path::new("/in.parquet"), Path::new("/out"));
     let check = |secrets: &[&str], node: Option<&str>| {
+        let node = node.map(Node::on);
+        let node = node.as_ref();
         let mut said = Vec::new();
         let code =
             moruna_runtime::host::cli::check_job_with(&path, &kinds, secrets, node, &mut said);
@@ -423,6 +456,179 @@ fn check_job_refuses_what_a_node_would() {
     let code =
         moruna_runtime::host::cli::main_with(&argv, &kinds, CancelToken::new(), &no_env, HEARTBEAT);
     assert_eq!(code, exit::SPEC_REFUSED, "sink.url and resume");
+}
+
+/// A node bounds a job's budget: more than the node allows is refused by its field before
+/// anything runs, and a document that names none runs with all of it.
+#[test]
+fn a_nodes_budget_is_the_most_a_job_may_have_and_its_default() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("node_budget");
+    write_parquet(&scratch.path().join("in.parquet"), 4_000, 2);
+    std::fs::create_dir_all(scratch.path().join("out")).expect("out");
+    let max = 1u64 << 30;
+    let mut over = document(scratch.path());
+    over["budget"]["memory_bytes"] = json!(max + 4096);
+    let served = serve_bounded(
+        &scratch,
+        json!({"spec": over, "secrets": secrets()}),
+        Some(max),
+    );
+    assert_eq!(served.outcome.code, exit::SPEC_REFUSED);
+    let diagnostic = exit_of(&served)["diagnostic"].as_str().unwrap_or_default();
+    assert!(
+        diagnostic.contains(": budget.memory_bytes: "),
+        "{diagnostic}"
+    );
+    let mut none = document(scratch.path());
+    none["budget"] = json!({"cpu": 2.0});
+    let served = serve_bounded(
+        &scratch,
+        json!({"spec": none, "secrets": secrets()}),
+        Some(max),
+    );
+    assert_eq!(
+        served.outcome.code,
+        exit::COMPLETED,
+        "{:?}",
+        served.outcome.diagnostic
+    );
+    let report = served
+        .messages
+        .iter()
+        .find(|m| m["type"] == "report")
+        .expect("a report");
+    assert_eq!(report["report"]["host"]["memory_limit_bytes"], json!(max));
+}
+
+/// The check a node runs for `validate`, over a channel (`moruna check-job --listen`): one
+/// `check` line in, the document and its secrets' names; one `checked` line out, every refusal
+/// by field and the budget the job would run with; exit 0 or 2.
+#[test]
+fn a_check_on_a_channel_answers_its_refusals_and_the_budget() {
+    let scratch = Scratch::new("node_check_on");
+    let kinds = kinds(Path::new("/in.parquet"), Path::new("/out"));
+    let max = 1u64 << 30;
+    let node = Node {
+        channel: "channel:engine".to_string(),
+        budget_max: Some(max),
+    };
+    let check = |line: String| {
+        let (engine, api) = Framed::pair();
+        let peer = std::thread::spawn(move || {
+            let Conn {
+                mut reader,
+                mut writer,
+                ..
+            } = over_messages(api);
+            writer
+                .write_all(line.as_bytes())
+                .expect("the check is sent");
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).expect("read to the end");
+            bytes
+        });
+        let code =
+            moruna_runtime::host::cli::check_conn(over_messages(engine), &kinds, Some(&node));
+        let bytes = peer.join().expect("the peer");
+        let text = String::from_utf8(bytes).expect("text");
+        assert_eq!(text.lines().count(), 1, "one answer: {text}");
+        let answer: Value = serde_json::from_str(text.trim_end()).expect("JSON");
+        (code, answer)
+    };
+    let request = |document: Value, secrets: Value| {
+        format!(
+            "{}\n",
+            json!({"type": "check", "spec": document, "secrets": secrets})
+        )
+    };
+    // Sound, with every secret named: ok, and the document's own budget.
+    let (code, answer) = check(request(
+        document(scratch.path()),
+        json!(["aws.id", "aws.key"]),
+    ));
+    assert_eq!(code, exit::COMPLETED);
+    assert_eq!(
+        answer,
+        json!({"type": "checked", "ok": true, "refusals": [], "memory_bytes": max,
+               "hosts": ["s3.example.com"], "volumes": [], "functions": ["std"]})
+    );
+    // A document's volumes and hosts, as the check answers them for node-admission to keep.
+    let mut disks = document(scratch.path());
+    disks["source"] = json!({"kind": "parquet", "url": "disk://vol-in/taxi/"});
+    disks["sink"] = json!({"kind": "parquet", "url": "disk://vol-out/rows/"});
+    disks["object_store"]["azure"] = json!({"account": "acct"});
+    let (code, answer) = check(request(disks, json!(["aws.id", "aws.key"])));
+    assert_eq!(code, exit::COMPLETED, "{answer}");
+    assert_eq!(
+        answer["hosts"],
+        json!(["acct.blob.core.windows.net", "s3.example.com"])
+    );
+    assert_eq!(
+        answer["volumes"],
+        json!([{"serial": "vol-in", "write": false}, {"serial": "vol-out", "write": true}])
+    );
+    // No budget: all the node allows.
+    let mut none = document(scratch.path());
+    none["budget"] = json!({"cpu": 2.0});
+    let (code, answer) = check(request(none, json!(["aws.id", "aws.key"])));
+    assert_eq!(
+        (code, &answer["memory_bytes"]),
+        (exit::COMPLETED, &json!(max))
+    );
+    // Too much budget, a secret not named and a `file://` sink: every refusal, by field.
+    let mut bad = document(scratch.path());
+    bad["budget"]["memory_bytes"] = json!(max * 2);
+    bad["sink"] = json!({"kind": "parquet", "url": "file:///out/"});
+    let (code, answer) = check(request(bad, json!(["aws.id"])));
+    assert_eq!(code, exit::SPEC_REFUSED);
+    assert_eq!(answer["ok"], json!(false));
+    let fields: Vec<&str> = answer["refusals"]
+        .as_array()
+        .expect("refusals")
+        .iter()
+        .map(|r| r["field"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            "object_store.s3.secret_access_key",
+            "sink.url",
+            "budget.memory_bytes"
+        ]
+    );
+    assert_eq!(answer["memory_bytes"], json!(max * 2));
+    // A version 2 document, as base64.
+    let job = moruna_job::Job::from_v1(
+        &moruna_job::JobSpec::from_value(document(scratch.path())).expect("a document"),
+    );
+    let encoded = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(job.to_flatbuffer().expect("encodes"))
+    };
+    let (code, answer) = check(request(json!(encoded), json!(["aws.id", "aws.key"])));
+    assert_eq!((code, &answer["ok"]), (exit::COMPLETED, &json!(true)));
+    // What is not a check, and a document that is not one, are refused by `spec`.
+    for line in [
+        "{\"type\":\"spec\",\"spec\":{}}\n".to_string(),
+        "not json\n".to_string(),
+        request(json!({"moruna_spec": 1}), json!([])),
+        request(json!("!!"), json!([])),
+    ] {
+        let (code, answer) = check(line.clone());
+        assert_eq!(code, exit::SPEC_REFUSED, "{line}");
+        assert_eq!(answer["ok"], json!(false));
+        assert_eq!(answer["memory_bytes"], Value::Null);
+        assert_eq!(
+            (&answer["hosts"], &answer["volumes"], &answer["functions"]),
+            (&json!([]), &json!([]), &json!([]))
+        );
+    }
+    let (code, answer) = check(request(document(scratch.path()), json!(["-bad"])));
+    assert_eq!(
+        (code, &answer["refusals"][0]["field"]),
+        (exit::SPEC_REFUSED, &json!("secrets"))
+    );
 }
 
 /// `moruna run` reads its document from a file and is given no secrets: a reference in it is

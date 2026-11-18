@@ -20,6 +20,14 @@ base64; the node runs one at a time::
             print(event.event, event.data)
         report = client.jobs_report(run)
 
+A function (system design 3E) is registered by name, with its image's address, the image's
+SHA-256 and an Ed25519 signature over that SHA-256 by one of node config's ``functions.keys``::
+
+    client.functions_register(api.FunctionRegistration(
+        name="gate-score", address="https://...", sha256="<64 hex digits>",
+        signature="<base64>"))                   # an admin token
+    client.functions_list()                       # an observe token
+
 **Pinning.** With ``pin``, the SHA-256 of the server's certificate in hex (what the node prints
 on its console as ``moruna: tls sha256=<hex>``), the client connects without verifying the
 certificate, then refuses the connection, before anything is sent, unless the certificate's
@@ -49,6 +57,9 @@ from moruna.api._generated import (
     ErrorDetail,
     Executor,
     ExecutorKind,
+    Function,
+    FunctionRegistration,
+    Functions,
     Health,
     HealthStatus,
     Heartbeat,
@@ -65,6 +76,8 @@ from moruna.api._generated import (
     ServerSentEvent,
     Submitted,
     Validation,
+    functions_list,
+    functions_register,
     health,
     jobs_cancel,
     jobs_events,
@@ -90,6 +103,9 @@ __all__ = [
     "ErrorDetail",
     "Executor",
     "ExecutorKind",
+    "Function",
+    "FunctionRegistration",
+    "Functions",
     "Health",
     "HealthStatus",
     "Heartbeat",
@@ -107,6 +123,8 @@ __all__ = [
     "ServerSentEvent",
     "Submitted",
     "Validation",
+    "functions_list",
+    "functions_register",
     "health",
     "jobs_cancel",
     "jobs_events",

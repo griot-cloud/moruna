@@ -12,7 +12,8 @@
 //! - [`schema`]: a schema message checked, and the model of its fields;
 //! - [`walk`]: a record batch walked against that model, as arrow's decoder walks it;
 //! - [`frame`]: the page-aligned record's framing (contracts e.7), read and rewritten in place;
-//! - [`record`]: the data plane's record, checked, and turned into and out of a stream.
+//! - [`record`]: the data plane's record, checked, and turned into and out of a stream;
+//! - [`valid`]: validity bitmaps of all ones, left out of a record by every writer of one.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -24,6 +25,7 @@ pub mod format;
 pub mod frame;
 pub mod record;
 pub mod schema;
+pub mod valid;
 pub mod walk;
 
 #[cfg(test)]

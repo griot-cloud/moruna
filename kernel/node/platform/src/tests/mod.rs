@@ -6,6 +6,13 @@
 //! lines ending in LF in the file and in CRLF on the wire. They are written from what each
 //! cloud's service is documented to answer (nova's metadata API behind neutron's proxy, and
 //! Azure's Instance Metadata Service), not captured from a machine in either cloud.
+//!
+//! Azure's WireServer (item 1.12) is documented only as far as Microsoft's "Create Linux images
+//! without a provisioning agent" shows it: a `200` to each request, and the three paths its
+//! Python reads in the goal state. The recorded goal state has those, with the values in the
+//! shape that page's output shows; the rest of it (the root's name, `Version`, `Machine`, `State`,
+//! `Configuration` with its escaped URLs) is an illustration of what a reader must step over, not
+//! a documented form.
 
 mod boot;
 mod clock;
@@ -13,6 +20,7 @@ mod date;
 mod http;
 mod instance;
 mod svc;
+mod wireserver;
 
 use core::net::Ipv4Addr;
 use std::{
@@ -130,6 +138,33 @@ pub(crate) mod recorded {
     pub(crate) fn azure_unknown_path() -> Vec<u8> {
         wire(include_str!("../../fixtures/azure/openstack-path-404.http"))
     }
+
+    /// The WireServer's goal state.
+    pub(crate) fn goal_state() -> Vec<u8> {
+        wire(include_str!("../../fixtures/azure/goalstate.http"))
+    }
+
+    /// The WireServer's answer to a `Health` document it takes.
+    pub(crate) fn health_taken() -> Vec<u8> {
+        wire(include_str!("../../fixtures/azure/health.http"))
+    }
+}
+
+/// What the recorded goal state names: its incarnation, container and role instance.
+pub(crate) const RECORDED_INCARNATION: &str = "1";
+pub(crate) const RECORDED_CONTAINER: &str = "0d3f6c58-1b2e-4c8a-9f61-2a7e5b9c4d10";
+pub(crate) const RECORDED_ROLE_INSTANCE: &str =
+    "a41f2c7e-93b5-4d0a-8e6c-1f7b2d9e3c58._moruna-node-1";
+
+/// The `Health` document that reports the recorded goal state ready, as Microsoft's Python
+/// writes it.
+pub(crate) fn recorded_health() -> String {
+    format!(
+        "<Health><GoalStateIncarnation>{RECORDED_INCARNATION}</GoalStateIncarnation><Container>\
+         <ContainerId>{RECORDED_CONTAINER}</ContainerId><RoleInstanceList><Role><InstanceId>\
+         {RECORDED_ROLE_INSTANCE}</InstanceId><Health><State>Ready</State></Health></Role>\
+         </RoleInstanceList></Container></Health>"
+    )
 }
 
 /// The node config the recorded answers carry.
@@ -351,8 +386,67 @@ pub(crate) fn openstack(sent: &Sent) -> Reply {
     })
 }
 
-/// Azure's Instance Metadata Service, from the recorded answers.
+/// Azure's WireServer, strict about what it is sent: the goal state to a `GET` with the header
+/// `x-ms-version: 2012-11-30`, and its taking of the recorded goal state's `Health` document to a
+/// `POST` with the same header, the document's type and this agent's name. Anything else is a
+/// `400`, which is this fake's, not a documented answer.
+pub(crate) fn wire_server(sent: &Sent) -> Reply {
+    assert_eq!(
+        sent.to,
+        (crate::wireserver::ADDRESS, crate::wireserver::PORT)
+    );
+    let versioned = sent.header("x-ms-version") == Some("2012-11-30");
+    let host = sent.header("Host") == Some("168.63.129.16");
+    let posted = sent.header("Content-Type") == Some("text/xml;charset=utf-8")
+        && sent.header("x-ms-agent-name") == Some("moruna");
+    Reply::Answer(match (sent.method.as_str(), sent.path.as_str()) {
+        ("GET", "/machine?comp=goalstate") if versioned && host && sent.body.is_empty() => {
+            recorded::goal_state()
+        }
+        ("POST", "/machine?comp=health")
+            if versioned && host && posted && sent.body == recorded_health().as_bytes() =>
+        {
+            recorded::health_taken()
+        }
+        _ => answer("400 Bad Request", b""),
+    })
+}
+
+/// `wire`, an answer with a `Content-Length`, as the same answer in chunks of `size` bytes: the
+/// length's header swapped for `Transfer-Encoding: chunked`, each chunk's size in lowercase hex,
+/// the last chunk, and no trailers.
+pub(crate) fn chunked(wire: &[u8], size: usize) -> Vec<u8> {
+    let at = wire
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("a head");
+    let head = core::str::from_utf8(&wire[..at]).expect("an ASCII head");
+    let mut out = String::new();
+    for line in head.split("\r\n") {
+        let length = line
+            .split_once(':')
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("content-length"));
+        if !length {
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+    }
+    out.push_str("Transfer-Encoding: chunked\r\n\r\n");
+    let mut out = out.into_bytes();
+    for piece in wire[at + 4..].chunks(size) {
+        out.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+        out.extend_from_slice(piece);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"0\r\n\r\n");
+    out
+}
+
+/// Azure's Instance Metadata Service, from the recorded answers, and its WireServer.
 pub(crate) fn azure(sent: &Sent) -> Reply {
+    if sent.to.0 == crate::wireserver::ADDRESS {
+        return wire_server(sent);
+    }
     Reply::Answer(match (sent.header("Metadata"), sent.path.as_str()) {
         (Some("true"), "/metadata/instance?api-version=2021-02-01") => recorded::azure_instance(),
         (Some("true"), _) => recorded::azure_unknown_path(),

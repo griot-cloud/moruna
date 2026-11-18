@@ -31,6 +31,37 @@ def refused(argv):
     return stop.exception.code, error.getvalue()
 
 
+def first_builds(test, profile):
+    """main() for `profile`, run up to its second build with nothing built: the kernel's build
+    and the user programs' build, each as its arguments and environment."""
+    class Stop(Exception):
+        pass
+
+    builds = []
+
+    def record(args, cwd, env=None):
+        builds.append(([str(a) for a in args], dict(env)))
+        if len(builds) == 2:
+            raise Stop
+
+    with tempfile.TemporaryDirectory() as tmp:
+        assets = Path(tmp) / "assets"
+        assets.mkdir()
+        (assets / "node.conf").write_text("moruna-node 1\n")
+        description = Path(tmp) / "cloud.image"
+        description.write_text("moruna-image 1\nprocess node-supervisor\n  handle data:node.conf config\n")
+        argv = ["package.py", "--profile", profile, "--description", str(description), "--assets", str(assets),
+                "--out", str(Path(tmp) / "out"), "--node-memory", str(2 << 30)]
+        with mock.patch.object(package, "command", record), \
+                mock.patch.object(package.shutil, "which", lambda tool: f"/usr/bin/{tool}"), \
+                mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ):
+            os.environ.pop("CC_x86_64_moruna_user", None)
+            os.environ["CFLAGS_x86_64_moruna_user"] = "-O1"
+            with test.assertRaises(Stop):
+                package.main()
+    return builds
+
+
 class Profiles(unittest.TestCase):
     def test_an_unknown_profile_is_refused(self):
         code, message = refused(["--profile", "azure", *STANDALONE])
@@ -88,11 +119,36 @@ class Profiles(unittest.TestCase):
     def test_cloud_builds_only_its_programs(self):
         cloud = package.PROGRAMS["cloud"]
         # Step 1's processes (system design 1A): the network server, api and platform beside
-        # the supervisor, the device manager and its drivers (items 1.1, 1.3 and 1.4).
+        # the supervisor, the device manager and its drivers (items 1.1, 1.3 and 1.4), and the
+        # VMBus processes, which the supervisor starts on Hyper-V only (1F).
         self.assertEqual(cloud, ["moruna-node-supervisor", "devices", "netstack", "moruna-node-api",
-                                 "moruna-node-platform", "virtio-blk", "virtio-net", "nvme", "gve"])
-        for absent in ("virtio-vsock", "imagefs", "linux", "node-admission", "moruna-storage-service", "engine"):
+                                 "moruna-node-platform", "virtio-blk", "virtio-net", "nvme", "gve",
+                                 "moruna-vmbus-server", "moruna-storvsc-server"])
+        for absent in ("virtio-vsock", "imagefs", "linux", "node-admission", "moruna-storage-service", "engine",
+                       "storvsc-check"):
             self.assertNotIn(absent, cloud)
+
+    def test_the_check_variant_is_the_cloud_profile_and_the_check_alone(self):
+        """Item 1.10b's Azure check: the cloud profile's description and assets, with
+        `storvsc-check`'s program, service and directory link added and nothing else."""
+        node = TOOL.parents[1]
+
+        def records(path):
+            return [line for line in (node / path).read_text().splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")]
+
+        check = records("cloud-check.image")
+        self.assertEqual([line for line in check if "storvsc-check" not in line], records("cloud.image"))
+        self.assertIn("  handle program:storvsc-check image.storvsc-check", check)
+        self.assertEqual(records("cloud-check/node.conf"),
+                         [*records("cloud/node.conf"), "service storvsc-check image.storvsc-check 33554432",
+                          "link devices directory-check storvsc-check directory"])
+        # Its assets are the cloud profile's but for node.conf: the same roots, byte for byte.
+        self.assertEqual(sorted(p.name for p in (node / "cloud-check").iterdir()),
+                         sorted(p.name for p in (node / "cloud").iterdir()))
+        self.assertEqual((node / "cloud-check/tls.roots").read_bytes(), (node / "cloud/tls.roots").read_bytes())
+        self.assertEqual((node / "cloud-check/network.conf").read_bytes(), (node / "cloud/network.conf").read_bytes())
+        self.assertEqual((node / "cloud-check/network.conf").read_text(), (node / "cloud/network.conf").read_text())
 
     def test_the_user_build_compiles_c_as_build_sh_does(self):
         flags = "--target=x86_64-unknown-none -ffreestanding -mno-red-zone -fno-stack-protector"
@@ -112,32 +168,7 @@ class Profiles(unittest.TestCase):
     def test_the_user_build_alone_gets_the_c_compiler(self):
         """main(), run up to its second build with nothing built: the kernel's build has no C
         compiler set, and the user programs' build has build.sh's."""
-        class Stop(Exception):
-            pass
-
-        builds = []
-
-        def record(args, cwd, env=None):
-            builds.append(([str(a) for a in args], dict(env)))
-            if len(builds) == 2:
-                raise Stop
-
-        with tempfile.TemporaryDirectory() as tmp:
-            assets = Path(tmp) / "assets"
-            assets.mkdir()
-            (assets / "node.conf").write_text("moruna-node 1\n")
-            description = Path(tmp) / "cloud.image"
-            description.write_text("moruna-image 1\nprocess node-supervisor\n  handle data:node.conf config\n")
-            argv = ["package.py", "--profile", "cloud", "--description", str(description), "--assets", str(assets),
-                    "--out", str(Path(tmp) / "out"), "--node-memory", str(2 << 30)]
-            with mock.patch.object(package, "command", record), \
-                    mock.patch.object(package.shutil, "which", lambda tool: f"/usr/bin/{tool}"), \
-                    mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ):
-                os.environ.pop("CC_x86_64_moruna_user", None)
-                os.environ["CFLAGS_x86_64_moruna_user"] = "-O1"
-                with self.assertRaises(Stop):
-                    package.main()
-        (kernel_args, kernel_env), (user_args, user_env) = builds
+        (kernel_args, kernel_env), (user_args, user_env) = first_builds(self, "cloud")
         self.assertIn("moruna-microkernel-boot", kernel_args)
         self.assertNotIn("CC_x86_64_moruna_user", kernel_env)
         self.assertEqual(kernel_env["CFLAGS_x86_64_moruna_user"], "-O1")
@@ -270,6 +301,28 @@ class Profiles(unittest.TestCase):
         self.assertEqual(package.bound("moruna-image 1\n  handle data:a.conf x\n  handle program:b image.b\n"
                                        "  handle data:ke2/roots tls-roots\n  # handle data:c.conf y\n"),
                          {"a.conf", "ke2/roots"})
+
+    def test_cloud_test_is_the_cloud_profile_for_tests_only(self):
+        """Work item 2.2c: the cloud's arguments and programs, its refusals named for it."""
+        _, args = package.arguments(["--profile", "cloud-test", *BASE])
+        self.assertEqual(args.profile, "cloud-test")
+        self.assertEqual(package.PROGRAMS["cloud-test"], package.PROGRAMS["cloud"])
+        for extra in (["--agent-port", "5100"], ["--cpus", "2"], ["--layer", "l.img"]):
+            code, message = refused(["--profile", "cloud-test", *BASE, *extra])
+            self.assertEqual(code, 2, extra)
+            self.assertIn(f"the cloud-test profile takes no {extra[0]}", message)
+
+    def test_the_release_cloud_profile_builds_api_without_its_test_route(self):
+        """Work item 2.2c: api's feature `test-exit`, its route to /v1/test/exit, is turned on
+        by cloud-test's user build alone; cloud's turns on no feature at all."""
+        self.assertEqual([profile for profile, named in package.FEATURES.items()
+                          if any("test-exit" in feature for feature in named)], ["cloud-test"])
+        _, (release, _) = first_builds(self, "cloud")
+        self.assertNotIn("--features", release)
+        self.assertFalse(any("test-exit" in word for word in release), release)
+        _, (test, _) = first_builds(self, "cloud-test")
+        self.assertEqual(test[test.index("--features") + 1], "moruna-node-api/test-exit")
+        self.assertEqual([test[i + 1] for i, word in enumerate(test) if word == "-p"], package.PROGRAMS["cloud"])
 
     def test_the_command_refuses_before_building_anything(self):
         with tempfile.TemporaryDirectory() as tmp:

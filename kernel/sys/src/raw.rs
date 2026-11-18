@@ -68,6 +68,8 @@ fn plain(n: u64, a: [u64; 6]) -> (u64, u64) {
             | nr::PORT_CALL
             | nr::ACCOUNT_CREATE
             | nr::ACCOUNT_INFO
+            | nr::HYPERV_POST
+            | nr::HYPERV_TAKE
     ));
     // SAFETY: only calls that read no memory through their arguments reach here: the
     // crate's own wrappers call `plain` with those numbers and no other.
@@ -460,6 +462,30 @@ pub fn thread_state_write(thread: RawHandle, frame: &[u8]) -> u64 {
     ];
     // SAFETY: the kernel reads `frame.len()` bytes from `frame`.
     unsafe { syscall(nr::THREAD_STATE_WRITE, a) }.0
+}
+
+// ABI 2.7: Hyper-V's mechanism for VMBus, the two of its calls that pass memory.
+
+/// `hyperv_post` (ABI 2.7): `payload` as a message of `message_type` to `connection`;
+/// Hyper-V's status in `rax`.
+pub fn hyperv_post(root: RawHandle, connection: u32, message_type: u32, payload: &[u8]) -> u64 {
+    let a = [
+        root as u64,
+        connection as u64,
+        message_type as u64,
+        payload.as_ptr() as u64,
+        payload.len() as u64,
+        0,
+    ];
+    // SAFETY: the kernel reads at most `payload.len()` bytes from `payload`.
+    unsafe { syscall(nr::HYPERV_POST, a) }.0
+}
+
+/// `hyperv_take` (ABI 2.7): SINT 2's message into `out`; 1 if one was taken, 0 if none.
+pub fn hyperv_take(root: RawHandle, out: &mut [u8; moruna_abi::hyperv::MESSAGE_SIZE]) -> u64 {
+    let a = [root as u64, out.as_mut_ptr() as u64, 0, 0, 0, 0];
+    // SAFETY: the kernel writes exactly `hyperv::MESSAGE_SIZE` bytes into `out`.
+    unsafe { syscall(nr::HYPERV_TAKE, a) }.0
 }
 
 /// `batch_get` (ABI 2.1): an address and a length, or an error in `rax`. Safe: it adds a

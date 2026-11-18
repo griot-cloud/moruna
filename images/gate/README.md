@@ -152,7 +152,8 @@ before; the exit codes are the ones the tasks always had (`moruna_function::code
 every fixture case and finds its rows bit for bit those of the record path the tasks ran on
 before 5.1 (`record/`), and the oracle's `hash_exact`, and each record the bytes the record path's
 took: arrow-ipc writes a validity bitmap of all ones for a column with no nulls, a page of its own
-in a record, and `moruna-function` leaves it out as the record path did.
+in a record, and `moruna-function` leaves it out as the record path did, through the function the
+engine's own `encode_framing` uses for its records too (`moruna_ipc_check::valid`).
 
 `tasks/build.sh` builds `gate-JOB` for the seven jobs as Rust programs with std for the core
 (system design 5A0, item 5.0): the kernel's nightly, std from Moruna's copy of Rust's library, the

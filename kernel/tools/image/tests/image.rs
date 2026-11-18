@@ -104,7 +104,7 @@ fn sv_t9_a_description_renders_the_manifest_the_kernel_parses() {
     assert!(text.contains("handle channel:ping.peer.1 peer rights=read,write,wait"));
     let expect = d.expectations();
     assert_eq!(expect[0], "kk: 1 CPUs online");
-    // The ABI's own version, not a number that goes stale with each minor (it said 2.5 at 2.6).
+    // The ABI's own version, which the core says at boot: a bump of the ABI moves it.
     assert!(expect.contains(&format!(
         "kk: moruna microkernel, abi {ABI_MAJOR}.{ABI_MINOR}: started 3 processes from the manifest"
     )));

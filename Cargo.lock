@@ -2160,6 +2160,7 @@ dependencies = [
  "crossbeam",
  "cudarc",
  "hostname",
+ "moruna-ipc-check",
  "moruna-kernel",
  "moruna-testkit",
  "serde",

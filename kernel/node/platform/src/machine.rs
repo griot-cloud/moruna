@@ -103,11 +103,25 @@ impl fmt::Display for LinkError {
     }
 }
 
-/// The channel the supervisor links between `platform` and `api`, as whole messages.
+/// A channel between `platform` and one start of `api`, as whole messages.
 pub trait Link {
     /// Sends one message, waiting for room until `deadline`.
     fn send(&mut self, message: &[u8], deadline: u64) -> Result<(), LinkError>;
 
     /// The next message, waiting for one until `deadline`.
     fn receive(&mut self, deadline: u64) -> Result<Vec<u8>, LinkError>;
+}
+
+/// No deadline: a wait that ends only with what it waits for.
+pub const FOREVER: u64 = u64::MAX;
+
+/// The supervisor's channel to `platform` after the node's memory (PM, item 2.2c): at each
+/// start of `api`, the first included, the supervisor sends the channel to that start.
+pub trait Control {
+    /// The channel to one start of `api`.
+    type Api: Link;
+
+    /// The channel to the next start of `api`, waiting for it until `deadline` ([`FOREVER`]
+    /// for no deadline).
+    fn next_api(&mut self, deadline: u64) -> Result<Self::Api, LinkError>;
 }

@@ -15,7 +15,7 @@ use std::{
 };
 
 use moruna_netstack::{Card, Shared, Stack, after_turn, factory, parse};
-use moruna_node::Bootstrap;
+use moruna_node::{Bootstrap, restart::API_STARTED};
 use moruna_node_config::{Handover, MESSAGE_MAX, READY};
 use moruna_svc::{
     Account, Channel, DEADLINE_INFINITE, Dispatcher, Memory, Rights, Turn, deadline_in, limits,
@@ -28,8 +28,8 @@ use crate::{
     boot::{self, Inputs},
     http::{self, Request},
     instance,
-    machine::{Clock, Link, LinkError, Network, Stream, StreamError},
-    svc::{ChannelLink, Monotonic, Wan, node_memory},
+    machine::{Clock, Control, Link, LinkError, Network, Stream, StreamError},
+    svc::{ChannelControl, ChannelLink, Monotonic, Wan},
 };
 
 const MS: u64 = 1_000_000;
@@ -277,42 +277,26 @@ fn requests_go_through_the_network_server_s_sockets() {
     server.join().unwrap();
 }
 
-/// The cloud profile's `network.conf` as item 1.3 writes it, and the line item 1.4 adds.
-const NETWORK_CONF: &str = "moruna-netstack 1
-interface wan card=net0 dhcp
-grant listen-api rights=listen local=0.0.0.0/0@443 sockets=64
-";
+/// The cloud profile's `network.conf` and `node.conf` as committed (items 1.1, 1.3, 1.3b, 1.4,
+/// 1.9c and 2.2c), read from the files themselves so that no copy here can go stale.
+const NETWORK_CONF: &str = include_str!("../../../cloud/network.conf");
+const NODE_CONF: &str = include_str!("../../../cloud/node.conf");
 /// `platform`'s grant, with the local rule a connection needs to leave at all (PM, 2026-11-18).
 const PLATFORM_GRANT: &str = "grant listen-platform rights=connect \
      remote=169.254.169.254/32@80,168.63.129.16/32@80 local=0.0.0.0/0 sockets=4\n";
 
-/// The cloud profile's `node.conf` as items 1.1 and 1.3 write it, and the lines item 1.4 adds.
-const NODE_CONF: &str = "moruna-node 1
-service devices image.devices 67108864
-bootstrap devices devices
-grant devices drivers drivers
-grant devices driver.virtio-blk driver.virtio-blk
-grant devices driver.virtio-net driver.virtio-net
-grant devices driver.nvme driver.nvme
-grant devices driver.gve driver.gve
-service network image.netstack 67108864
-service api image.api 67108864
-grant network config network.config
-link devices directory-net network directory
-link network listen-api api network
-";
-const PLATFORM_LINES: &str = "service platform image.platform 16777216
-bootstrap platform platform
-link network listen-platform platform network
-link platform api api platform
-";
-
 #[test]
 fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
-    // node.conf: `platform` is the last service, so the supervisor starts it after `network` and
-    // `api`, with a 16 MiB account, a network listener and its link to `api`.
-    let text = format!("{NODE_CONF}{PLATFORM_LINES}");
-    let node = moruna_node::Config::parse(text.as_bytes(), 1 << 30).expect("node.conf");
+    // node.conf: on a machine that is not Hyper-V, which runs no `vmbus`, `platform` is the last
+    // service, so the supervisor starts it after `network` and `api`, with a 16 MiB account
+    // and a network listener.
+    let node = moruna_node::Config::parse(NODE_CONF.as_bytes(), 1 << 30).expect("node.conf");
+    let names: Vec<&str> = node.services.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["devices", "network", "api", "platform", "vmbus", "storvsc"]
+    );
+    let node = node.on_machine(false);
     let names: Vec<&str> = node.services.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, ["devices", "network", "api", "platform"]);
     let platform = node.services.last().unwrap();
@@ -331,7 +315,23 @@ fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
         })
     };
     assert!(link("network", "listen-platform", "platform", "network"));
-    assert!(link("platform", "api", "api", "platform"));
+    // No link reaches api: every start of it, the first included, gets its listener and its
+    // channel to platform afresh from the supervisor (item 2.2c).
+    assert!(
+        node.links
+            .iter()
+            .all(|l| l.left != "api" && l.right != "api")
+    );
+    let restart = node.restart.as_ref().expect("api's restart record");
+    assert_eq!(
+        (
+            restart.service.as_str(),
+            restart.slot.as_str(),
+            restart.server.as_str(),
+            restart.granting.as_str()
+        ),
+        ("api", "network", "network", "listen-supervisor")
+    );
     // Its bootstrap: the supervisor's message with the node's memory, on its `supervisor` slot.
     assert!(
         node.bootstraps
@@ -339,17 +339,40 @@ fn the_profile_lines_this_item_adds_are_read_by_their_parsers() {
             .any(|(kind, service)| *kind == Bootstrap::Platform && service == "platform")
     );
 
-    // network.conf: the grant is taken as written, with connect as its only right, to the two
-    // addresses on port 80 and nowhere else, from any of the node's addresses, and four
+    // network.conf: the supervisor's grant covers the listener the record mints, and no more
+    // than listening on 443 and granting that, with item 1.3b's bounds for api's listener.
+    let config = parse(NETWORK_CONF).expect("network.conf");
+    let (_, supervisor) = config
+        .grants
+        .iter()
+        .find(|(slot, _)| slot == "listen-supervisor")
+        .expect("the supervisor's grant");
+    assert_eq!(supervisor.rights, rights::GRANT | rights::LISTEN);
+    assert!(supervisor.covers(&restart.policy));
+    assert!(config.grants.iter().all(|(slot, _)| slot != "listen-api"));
+    for policy in [supervisor, &restart.policy] {
+        assert_eq!(
+            (
+                policy.sockets,
+                policy.rx,
+                policy.tx,
+                policy.per_peer,
+                policy.linger_ms
+            ),
+            (81, Some(65536), Some(65536), Some(8), Some(5000))
+        );
+    }
+
+    // platform's grant is taken as written, with connect as its only right, to the two
+    // addresses on port 80 and nowhere else, from any of the node's addresses, and sixteen
     // sockets.
-    let config = parse(&format!("{NETWORK_CONF}{PLATFORM_GRANT}")).expect("network.conf");
     let (_, policy) = config
         .grants
         .iter()
         .find(|(slot, _)| slot == "listen-platform")
         .expect("platform's grant");
     assert_eq!(policy.rights, rights::CONNECT);
-    assert_eq!(policy.sockets, 4);
+    assert_eq!(policy.sockets, 16);
     let to = |a, b, c, d, port| Endpoint::new(Addr::v4(a, b, c, d), port);
     assert!(policy.may_connect(&to(169, 254, 169, 254, 80)));
     assert!(policy.may_connect(&to(168, 63, 129, 16, 80)));
@@ -401,7 +424,7 @@ fn the_node_s_address_is_its_wan_interface_s_ipv4_address() {
 #[test]
 fn a_node_that_dhcp_has_not_yet_answered_has_no_route_and_no_address() {
     // The cloud profile's interface, on a card where no DHCP server answers.
-    let (slots, server) = serve(&format!("{NETWORK_CONF}{PLATFORM_GRANT}"), &[CARD]);
+    let (slots, server) = serve(NETWORK_CONF, &[CARD]);
     let mut wan = Wan::new(client(&slots["listen-platform"])).unwrap();
     let soon = deadline_in(5 * SECOND);
     assert_eq!(
@@ -554,41 +577,37 @@ fn the_link_carries_whole_messages() {
 }
 
 #[test]
-fn the_node_s_memory_is_the_supervisor_s_bootstrap_message() {
-    // As the supervisor does it: the message queued, then its end closed, before `platform` runs.
+fn the_node_s_memory_is_the_supervisor_s_first_message() {
+    // As the supervisor does it: the message queued before `platform` runs, its end kept.
     let queued = |message: &[u8], handles: &mut [Option<moruna_svc::Handle>]| {
         let (supervisor, platform) = Channel::create().unwrap();
         supervisor.write_with(message, handles).unwrap();
-        drop(supervisor);
-        platform
+        (supervisor, ChannelControl(platform))
     };
     let memory = 24_526_286_848;
     let message = Bootstrap::platform_message(memory);
-    assert_eq!(node_memory(queued(&message, &mut []), now()), Ok(memory));
+    let (_kept, mut control) = queued(&message, &mut []);
+    assert_eq!(control.memory(now()), Ok(memory));
     // Anything but that bootstrap is refused, and nothing queued is not waited for past the
     // deadline.
     let not_it = Err(String::from(
         "the supervisor's message is not platform's bootstrap",
     ));
-    assert_eq!(
-        node_memory(queued(Bootstrap::Linux.header(), &mut []), now()),
-        not_it
-    );
-    assert_eq!(
-        node_memory(queued(&Bootstrap::platform_message(0), &mut []), now()),
-        not_it
-    );
-    assert_eq!(node_memory(queued(&message[..12], &mut []), now()), not_it);
     let (extra, _kept) = Channel::create().unwrap();
-    assert_eq!(
-        node_memory(queued(&message, &mut [Some(extra.0)]), now()),
-        Err(String::from(
-            "the supervisor's message: a message on the link carries handles"
-        ))
-    );
+    for (bytes, handles) in [
+        (Bootstrap::Linux.header().to_vec(), vec![]),
+        (Bootstrap::platform_message(0).to_vec(), vec![]),
+        (message[..12].to_vec(), vec![]),
+        (API_STARTED.to_vec(), vec![]),
+        (message.to_vec(), vec![Some(extra.0)]),
+    ] {
+        let mut handles = handles;
+        let (_kept, mut control) = queued(&bytes, &mut handles);
+        assert_eq!(control.memory(now()), not_it, "{bytes:?}");
+    }
     let (_supervisor, platform) = Channel::create().unwrap();
     assert_eq!(
-        node_memory(platform, deadline_in(20 * MS)),
+        ChannelControl(platform).memory(deadline_in(20 * MS)),
         Err(String::from(
             "the supervisor's message: the deadline passed"
         ))
@@ -596,29 +615,108 @@ fn the_node_s_memory_is_the_supervisor_s_bootstrap_message() {
     let (supervisor, platform) = Channel::create().unwrap();
     drop(supervisor);
     assert_eq!(
-        node_memory(platform, now()),
+        ChannelControl(platform).memory(now()),
         Err(String::from("the supervisor closed its end and sent none"))
     );
 }
 
 #[test]
-fn the_hand_over_crosses_a_channel_to_api_s_half() {
-    let (ours, theirs) = Channel::create().unwrap();
-    // `api`'s half, as its program will do it: read one message, decode it, answer `ready`.
-    let api = thread::spawn(move || {
-        let mut link = ChannelLink(theirs);
-        let message = link.receive(deadline_in(5 * SECOND)).unwrap();
-        let handover = Handover::decode(&message).unwrap();
-        link.send(READY, deadline_in(5 * SECOND)).unwrap();
-        handover
+fn each_start_of_api_comes_as_api_started_and_its_channel() {
+    let (supervisor, platform) = Channel::create().unwrap();
+    let mut control = ChannelControl(platform);
+    let soon = || deadline_in(5 * SECOND);
+    // The supervisor's message at a start: `api-started`, and the other end of api's channel.
+    let start = |supervisor: &Channel| {
+        let (api, ours) = Channel::create().unwrap();
+        supervisor
+            .write_with(API_STARTED, &mut [Some(ours.0)])
+            .unwrap();
+        api
+    };
+    for n in 0..3 {
+        let api = start(&supervisor);
+        let mut link = control.next_api(soon()).unwrap();
+        link.send(b"the hand-over", soon()).unwrap();
+        let mut bytes = [0; 64];
+        let (count, _) = api.read(&mut bytes, &mut []).unwrap();
+        assert_eq!(&bytes[..count], b"the hand-over", "start {n}");
+        api.write_with(READY, &mut []).unwrap();
+        assert_eq!(link.receive(soon()).unwrap(), READY);
+    }
+    // A start that has not come is waited for until the deadline, and one that comes while
+    // waiting is taken.
+    assert_eq!(
+        control.next_api(deadline_in(20 * MS)).map(drop),
+        Err(LinkError::TimedOut)
+    );
+    let late = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(30));
+        let api = start(&supervisor);
+        (supervisor, api)
     });
-    // The node's memory, from the supervisor's message, as the program reads it.
+    assert!(control.next_api(soon()).is_ok());
+    let (supervisor, _api) = late.join().unwrap();
+
+    // Anything else is refused: another message, no channel, two handles, or a handle that is
+    // not a channel.
+    let other = Err(LinkError::Other(String::from(
+        "the supervisor sent something other than api-started",
+    )));
+    let (spare, _kept) = Channel::create().unwrap();
+    let (more, _kept2) = Channel::create().unwrap();
+    supervisor
+        .write_with(b"api-restarted", &mut [Some(spare.0)])
+        .unwrap();
+    assert_eq!(control.next_api(soon()).map(drop), other);
+    supervisor.write_with(API_STARTED, &mut []).unwrap();
+    assert_eq!(control.next_api(soon()).map(drop), other);
+    let (one, _k1) = Channel::create().unwrap();
+    supervisor
+        .write_with(API_STARTED, &mut [Some(one.0), Some(more.0)])
+        .unwrap();
+    assert_eq!(control.next_api(soon()).map(drop), other);
+    let memory = Memory::create(4096).unwrap();
+    supervisor
+        .write_with(API_STARTED, &mut [Some(memory.0)])
+        .unwrap();
+    assert_eq!(
+        control.next_api(soon()).map(drop),
+        Err(LinkError::Other(String::from(
+            "api-started carries something other than a channel"
+        )))
+    );
+    // The supervisor gone, the channel says so.
+    drop(supervisor);
+    assert_eq!(control.next_api(soon()).map(drop), Err(LinkError::Closed));
+}
+
+#[test]
+fn the_hand_over_crosses_a_channel_to_each_start_of_api() {
+    // `api`'s half, as its program does it: read one message, decode it, answer `ready`.
+    let api = |theirs: Channel| {
+        thread::spawn(move || {
+            let mut link = ChannelLink(theirs);
+            let message = link.receive(deadline_in(5 * SECOND)).unwrap();
+            let handover = Handover::decode(&message).unwrap();
+            link.send(READY, deadline_in(5 * SECOND)).unwrap();
+            handover
+        })
+    };
+    // The supervisor's side, as it does it: the node's memory, then each start's channel.
     let (supervisor, slot) = Channel::create().unwrap();
     supervisor
         .write_with(&Bootstrap::platform_message(24_526_286_848), &mut [])
         .unwrap();
-    drop(supervisor);
-    let memory_bytes = node_memory(slot, now()).unwrap();
+    let start = |supervisor: &Channel| {
+        let (theirs, ours) = Channel::create().unwrap();
+        supervisor
+            .write_with(API_STARTED, &mut [Some(ours.0)])
+            .unwrap();
+        api(theirs)
+    };
+    let first = start(&supervisor);
+    let mut control = ChannelControl(slot);
+    let memory_bytes = control.memory(now()).unwrap();
     let mut clock = FakeClock::default();
     let mut network = FakeNetwork::serving(&clock, |_, sent| openstack(sent));
     let mut lines = Vec::new();
@@ -627,7 +725,7 @@ fn the_hand_over_crosses_a_channel_to_api_s_half() {
         &mut network,
         &mut clock,
         &mut wall,
-        &mut ChannelLink(ours),
+        &mut control,
         &mut |line: &str| lines.push(line.to_string()),
         Inputs {
             started_ns: 0,
@@ -635,11 +733,42 @@ fn the_hand_over_crosses_a_channel_to_api_s_half() {
         },
     )
     .unwrap();
-    // `api` has the node's memory the supervisor gave, and the config judged on it.
-    let taken = api.join().unwrap();
-    assert_eq!(taken, handed);
+    // `api` has the node's memory the supervisor gave, and the config judged on it; the node
+    // was not yet ready, so no boot_ms.
+    let taken = first.join().unwrap();
+    assert_eq!(
+        taken,
+        Handover {
+            boot_ms: None,
+            ..handed.clone()
+        }
+    );
     assert_eq!(taken.memory_bytes, 24_526_286_848);
     assert_eq!(taken.config.functions.cache_bytes, 1 << 30);
     assert_eq!(lines.len(), 2);
-    assert!(lines[1].starts_with("moruna: ready api=10.0.2.15:443 boot_ms="));
+    let boot_ms = handed.boot_ms.expect("the node's boot_ms");
+    assert_eq!(
+        lines[1],
+        format!("moruna: ready api=10.0.2.15:443 boot_ms={boot_ms}")
+    );
+
+    // Two restarts: each start is handed the same with the ready line's boot_ms, and the
+    // supervisor's end then closes.
+    let starts = [start(&supervisor), start(&supervisor)];
+    drop(supervisor);
+    let fatal = boot::serve(
+        &mut network,
+        &mut Monotonic::new().unwrap(),
+        &mut wall,
+        &mut control,
+        &handed,
+        &mut |line: &str| panic!("serve said {line}"),
+    );
+    for started in starts {
+        assert_eq!(started.join().unwrap(), handed);
+    }
+    assert_eq!(
+        fatal.to_string(),
+        "moruna: fatal platform: the supervisor's channel: the supervisor closed its channel"
+    );
 }
