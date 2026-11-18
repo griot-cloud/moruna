@@ -452,6 +452,8 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
         identity["abi"] = json!("moruna");
     }
     let reference = verified.digest.to_string();
+    // One process per CPU of the job, or of the node when the job names none (system design 3E).
+    let cpus = cx.cpus(moruna_micro::start::kernel().map_or(1, |kernel| kernel.cpus));
     let task = moruna_micro::task::ImageTask::new(
         &reference,
         &identity.to_string(),
@@ -459,6 +461,7 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
         launch.command,
         env,
         names,
+        cpus,
     )
     .map_err(|why| moruna_kernel::MorunaError::Config {
         name: "image",
@@ -468,13 +471,16 @@ fn on_kernel(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
     .with_plane(settings.plane);
     // stream P: a native program, which the stage starts itself.
     let task = match elf {
-        Some(elf) => task.with_native(elf),
+        Some(elf) => task
+            .with_native(elf)
+            .map_err(|why| entry.refuse("command", why))?,
         None => task,
     };
     cx.notes().push(format!(
-        "image {}: verified on the Moruna kernel against the {} layers it attached",
+        "image {}: verified on the Moruna kernel against the {} layers it attached; {}",
         verified.digest,
         attached.seals.len(),
+        moruna_adapters::instances::count_note(task.instances(), cpus),
     ));
     let task = Arc::new(task);
     let mut stage = Stage::of(task.clone());

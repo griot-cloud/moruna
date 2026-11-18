@@ -261,6 +261,22 @@ pub fn short_note(stage: &str, funded: usize, asked: usize) -> Option<String> {
         .then(|| format!("{stage}: {funded} of {asked} instances: the share funds {funded}"))
 }
 
+/// What the build says of a stage's count ([`count`]): `instances` for the job's `cpus`, and
+/// why it is fewer when it is.
+pub fn count_note(instances: usize, cpus: usize) -> String {
+    let counted = match instances {
+        1 => String::from("1 instance"),
+        n => format!("{n} instances"),
+    };
+    if instances >= cpus {
+        format!("{counted}, one per CPU of the job")
+    } else if instances == MAX {
+        format!("{counted}, the most a stage runs, for the job's {cpus} CPUs")
+    } else {
+        format!("{counted} for the job's {cpus} CPUs: the function declares at most {instances}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +494,19 @@ mod tests {
         let refused = fund(29 * MIB - 1, &[16], PAGE, 29 * MIB).unwrap_err();
         assert!(refused.contains("one a stage"), "{refused}");
         assert!(refused.contains(&(29 * MIB - 1).to_string()), "{refused}");
+    }
+
+    #[test]
+    fn the_build_says_why_a_stage_runs_fewer_than_the_job_s_cpus() {
+        assert_eq!(count_note(4, 4), "4 instances, one per CPU of the job");
+        assert_eq!(
+            count_note(1, 4),
+            "1 instance for the job's 4 CPUs: the function declares at most 1"
+        );
+        assert_eq!(
+            count_note(MAX, 100),
+            "64 instances, the most a stage runs, for the job's 100 CPUs"
+        );
     }
 
     /// The shares the run gave stages of one process each before 6.3e (`child_share`) are the

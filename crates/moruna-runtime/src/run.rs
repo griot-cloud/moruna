@@ -626,7 +626,11 @@ fn drive(
         topology: topology.clone(),
     };
     let schemas = moruna_scheduler::validate_graph(&pipeline)?;
-    let kernel_infos: Vec<KernelInfo> = kernels
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(unused_mut)
+    )]
+    let mut kernel_infos: Vec<KernelInfo> = kernels
         .iter()
         .enumerate()
         .map(|(at, kernel)| {
@@ -646,17 +650,18 @@ fn drive(
     // minimum-morsel work funded, before any child is started.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if let Some(gate) = &gate {
-        // Each live instance of a stage is a child of its own (an image's MORUNA_PROCESSES, one
-        // task process each): the share is a child's, and each instance carves its account
-        // within it (stream E, for the gate's native tasks on every core).
-        let count = crate::native_account::native_children(
-            packaged
-                .iter()
-                .filter(|stage| stage.native_singleton())
-                .map(|stage| stage.kernel().kind()),
-        )
-        .map_err(|error| *error)?;
-        if count > 0 {
+        // Each live instance of a stage is a child of its own (one task process each, one per
+        // CPU of the job unless its function declares fewer, system design 3E): the share is a
+        // child's, and each instance carves its account within it (stream E, for the gate's
+        // native tasks on every core).
+        let stages: Vec<&crate::packaged::Packaged> = packaged
+            .iter()
+            .filter(|stage| stage.native_singleton())
+            .collect();
+        let wanted =
+            crate::native_account::native_instances(stages.iter().map(|s| s.kernel().kind()))
+                .map_err(|error| *error)?;
+        if !wanted.is_empty() {
             let planning = moruna_controller::fixed_commitment_budget(
                 &moruna_controller::FixedCommitmentInput {
                     ceiling_bytes: limits.memory_ceiling,
@@ -670,25 +675,36 @@ fn drive(
             let physical = sizing
                 .allowance(limits.memory_ceiling)
                 .saturating_sub(arena_bytes);
-            let share = crate::native_account::child_share(
+            // Memory bounds the instances and never fails a job that ran before (PM,
+            // 2026-11-18): as many as the room funds at their least, at least one a stage.
+            let funded = moruna_adapters::instances::fund(
                 physical.min(planning),
-                0,
-                0,
-                count,
+                &wanted,
                 moruna_micro::layout::PAGE,
                 // stream P: a native task's account at its least beside its plane at its least.
                 moruna_micro::layout::NATIVE_CHILD_MIN,
             )
-            .map_err(|error| *error)?;
-            for stage in packaged.iter().filter(|stage| stage.native_singleton()) {
-                let share = share.ok_or_else(|| MorunaError::Config {
-                    name: "budget.native_children",
-                    msg: "native singleton has no admitted child share".into(),
-                })?;
+            .map_err(|msg| MorunaError::Config {
+                name: "budget.native_children",
+                msg,
+            })?
+            .ok_or_else(|| MorunaError::Config {
+                name: "budget.native_children",
+                msg: "native singleton has no admitted child share".into(),
+            })?;
+            for ((stage, &asked), &instances) in stages.iter().zip(&wanted).zip(&funded.counts) {
+                let name = stage.fund(instances);
+                notes.extend(moruna_adapters::instances::short_note(
+                    &name, instances, asked,
+                ));
                 // stream P: a native task stands for what it holds (its account and its plane
                 // at their largest), not for its whole share: the rest stays the run's.
-                let share = share.min(moruna_micro::layout::NATIVE_CHILD_MAX);
+                let share = funded.share.min(moruna_micro::layout::NATIVE_CHILD_MAX);
                 stage.bind(gate, &sampler, share);
+            }
+            // The controller sees the instances the run starts.
+            for (info, kernel) in kernel_infos.iter_mut().zip(&kernels) {
+                info.kind = kernel.kind();
             }
         }
     }

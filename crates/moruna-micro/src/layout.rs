@@ -464,28 +464,13 @@ pub fn declares_rings(env: &[String]) -> bool {
     env.iter().any(|e| e == "MORUNA_PLANE=rings")
 }
 
-/// The most processes one image stage runs.
-pub const PROCESSES_MAX: usize = 64;
-
-/// How many processes an image's stage runs, one interpreter each: the `MORUNA_PROCESSES` its
-/// environment declares, or one.
-pub fn processes(env: &[String]) -> Result<usize, String> {
-    match env.iter().find_map(|e| e.strip_prefix("MORUNA_PROCESSES=")) {
-        None => Ok(1),
-        Some(v) => match v.parse::<usize>() {
-            Ok(n) if (1..=PROCESSES_MAX).contains(&n) => Ok(n),
-            _ => Err(format!(
-                "MORUNA_PROCESSES={v}: a stage runs 1 to {PROCESSES_MAX} processes"
-            )),
-        },
-    }
-}
-
 /// Where the user target's linker script (`kernel/sys/user.ld`) puts a native program's first
 /// segment, its text.
 pub const NATIVE_BASE: u64 = 0x40_0000;
 
 const PT_LOAD: u32 = 1;
+/// A note segment's program header: a native function's `.note.moruna` (system design 3E).
+const PT_NOTE: u32 = 4;
 /// A thread-local storage template's program header.
 const PT_TLS: u32 = 7;
 const PF_X: u32 = 1;
@@ -508,10 +493,11 @@ fn u64_at(b: &[u8], at: usize) -> Option<u64> {
 /// the Moruna kernel's user target (`x86_64-moruna-user`), as an image entry declaring
 /// `abi: moruna` says its command is: a static x86-64 executable laid out by the user linker
 /// script, whose program headers are its loaded segments, read and execute first at 0x400000,
-/// then read only, then read and write, and at most one thread-local storage template, read
-/// only, as a program with std has (`kernel/targets/x86_64-moruna.ld`, item 5.0), which the
-/// kernel's loader takes. A Linux program has a stack header (and a static musl one its notes),
-/// so none passes. `Err` says what does not match.
+/// then read only, then read and write, at most one thread-local storage template, read only, as
+/// a program with std has (`kernel/targets/x86_64-moruna.ld`, item 5.0), and at most one note
+/// segment, read only, where a function declares its ceiling (`.note.moruna`, system design 3E),
+/// which the kernel's loader takes. A Linux program has a stack header, so none passes. `Err`
+/// says what does not match.
 pub fn native_elf(elf: &[u8]) -> Result<(), String> {
     if elf.get(..4) != Some(b"\x7fELF".as_slice()) {
         return Err("it is not an ELF program".into());
@@ -539,15 +525,16 @@ pub fn native_elf(elf: &[u8]) -> Result<(), String> {
         u16_at(elf, 54).ok_or_else(short)?,
         u16_at(elf, 56).ok_or_else(short)?,
     );
-    if size != 56 || !(1..=4).contains(&count) {
+    if size != 56 || !(1..=5).contains(&count) {
         return Err(format!(
             "it has {count} program headers of {size} bytes, where the user target's linker \
-             script writes one to three of 56 (its loaded segments) and, with std, its \
-             thread-local storage"
+             script writes one to three of 56 (its loaded segments), its note and, with std, \
+             its thread-local storage"
         ));
     }
     let mut flags = Vec::new();
     let mut tls = false;
+    let mut note = false;
     for i in 0..u64::from(count) {
         let at = usize::try_from(phoff + i * 56)
             .map_err(|_| String::from("its program headers lie past its bytes"))?;
@@ -557,6 +544,12 @@ pub fn native_elf(elf: &[u8]) -> Result<(), String> {
         // segment.
         if ty == PT_TLS && i > 0 && !tls && u32_at(elf, at + 4).unwrap_or(0) & (PF_W | PF_X) == 0 {
             tls = true;
+            continue;
+        }
+        // Its note segment (6.3e): one, read only, after the first segment.
+        if ty == PT_NOTE && i > 0 && !note && u32_at(elf, at + 4).unwrap_or(0) & (PF_W | PF_X) == 0
+        {
+            note = true;
             continue;
         }
         if ty != PT_LOAD {
@@ -650,7 +643,22 @@ mod tests {
         );
         refused(
             elf(2, 62, &[user[0], user[1], user[2], tls, tls]),
-            "5 program headers",
+            "type 0x7",
+        );
+        // A function's note segment (6.3e, `.note.moruna`): one, read only, beside its segments
+        // and its thread-local storage; never first, writable or a second.
+        let note = (4, 4, 0);
+        assert_eq!(
+            native_elf(&elf(2, 62, &[user[0], user[1], user[2], tls, note])),
+            Ok(())
+        );
+        assert_eq!(native_elf(&elf(2, 62, &[user[0], note])), Ok(()));
+        refused(elf(2, 62, &[note, user[0]]), "type 0x4");
+        refused(elf(2, 62, &[user[0], note, note]), "type 0x4");
+        refused(elf(2, 62, &[user[0], (4, 6, 0)]), "type 0x4");
+        refused(
+            elf(2, 62, &[user[0], user[1], user[2], tls, note, note]),
+            "6 program headers",
         );
         // A static musl program: its stack header.
         refused(
@@ -1096,16 +1104,6 @@ mod tests {
         assert!(keep_in_place(2, 4));
         assert!(!keep_in_place(3, 4));
         assert!(!keep_in_place(0, 1));
-    }
-
-    #[test]
-    fn p_an_image_declares_its_processes_in_its_environment() {
-        let env = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(processes(&env(&[])), Ok(1));
-        assert_eq!(processes(&env(&["MORUNA_PROCESSES=8"])), Ok(8));
-        assert!(processes(&env(&["MORUNA_PROCESSES=0"])).is_err());
-        assert!(processes(&env(&["MORUNA_PROCESSES=65"])).is_err());
-        assert!(processes(&env(&["MORUNA_PROCESSES=x"])).is_err());
     }
 
     #[test]
