@@ -16,7 +16,7 @@ use moruna_svc::{
     Channel, Completions, Context, Decoder, Dispatcher, Handle, Handler, Outcome, Pending,
     ProtocolId, Signals, Status, Watch, Wire,
 };
-use moruna_sys::{Account, Console, Memory, ObjectType, Process, Rights, map, println, start};
+use moruna_sys::{Account, Console, ObjectType, Process, Rights, println, start};
 use netstack_protocol::net;
 use node_protocol::{CANCELLED, CHECK_BYTES, MAX_JOBS, Needs, RUNNING, TERMINATED, admission};
 
@@ -82,20 +82,6 @@ fn node_blocks(shared: &Rc<RefCell<Shared>>) -> Result<Vec<Block>, admission::Er
     client.blocks().map_err(|_| admission::Error::Unavailable)
 }
 
-/// The node's volumes as data a check is granted: [`node_protocol::volume_lines`], read only.
-fn volumes_data(blocks: &[Block]) -> Result<Handle, admission::Error> {
-    let text = node_protocol::volume_lines(blocks);
-    let pages = (text.len() as u64 + 1).div_ceil(4096) * 4096;
-    let memory = Memory::create(pages).map_err(|_| admission::Error::Unavailable)?;
-    memory
-        .map(0, pages, map::READ | map::WRITE)
-        .and_then(|m| m.write(0, text.as_bytes()))
-        .map_err(|_| admission::Error::Unavailable)?;
-    memory
-        .0
-        .duplicate(Rights::READ | Rights::MAP | Rights::TRANSFER)
-        .map_err(|_| admission::Error::Unavailable)
-}
 struct End {
     shared: Rc<RefCell<Shared>>,
     job: u64,
@@ -442,7 +428,8 @@ fn check_job(
     services: Vec<String>,
 ) -> Result<u64, admission::Error> {
     // The node's volumes, which the check refuses a job's against (item 3.3).
-    let volumes = volumes_data(&node_blocks(shared)?)?;
+    let volumes = node_protocol::volumes_data(&node_blocks(shared)?)
+        .map_err(|_| admission::Error::Unavailable)?;
     names.push(node_protocol::VOLUMES_SLOT.into());
     grants.push(volumes);
     let account = {

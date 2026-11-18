@@ -4,7 +4,7 @@
 extern crate alloc;
 use alloc::{format, string::String, vec::Vec};
 use devices_protocol::Block;
-use moruna_svc::Handle;
+use moruna_svc::{Handle, Memory, Rights, map};
 
 pub const MAX_JOBS: usize = 64;
 pub use moruna_node::MAX_JOB_GRANTS as MAX_GRANTS;
@@ -132,6 +132,26 @@ pub fn volume_lines(blocks: &[Block]) -> String {
         ));
     }
     text
+}
+
+/// The rights of the node's volumes as data a check is granted: read-only, and duplicable,
+/// since the engine's supervisor hands each run a read-only duplicate of every data handle it
+/// grants, as of the boot's own files.
+pub const VOLUMES_RIGHTS: Rights = Rights::READ
+    .union(Rights::MAP)
+    .union(Rights::TRANSFER)
+    .union(Rights::DUPLICATE);
+
+/// The node's volumes as the data a check is granted ([`VOLUMES_SLOT`]): [`volume_lines`] in a
+/// memory object of whole pages, the text then zeros, with [`VOLUMES_RIGHTS`].
+pub fn volumes_data(blocks: &[Block]) -> Result<Handle, moruna_svc::Error> {
+    let text = volume_lines(blocks);
+    let pages = (text.len() as u64 + 1).div_ceil(4096) * 4096;
+    let memory = Memory::create(pages)?;
+    memory
+        .map(0, pages, map::READ | map::WRITE)
+        .and_then(|m| m.write(0, text.as_bytes()))?;
+    memory.0.duplicate(VOLUMES_RIGHTS)
 }
 
 /// Why a job's volume is not one the node grants it.
@@ -345,6 +365,38 @@ mod tests {
             "vol-a 1048576 rw data\nlun-0 8388608 ro data\nboot 1048576 ro boot\n"
         );
         assert_eq!(volume_lines(&[]), "");
+    }
+
+    /// The data a check is granted holds the lines, is read-only, and can be duplicated
+    /// read-only, as the engine's supervisor duplicates it for its run (a boot found the
+    /// duplicate refused without DUPLICATE, item 3.2).
+    #[test]
+    fn a_checks_volumes_are_read_only_data_its_supervisor_can_duplicate() {
+        let blocks = [disk("vol-a", false, false), disk("boot", true, true)];
+        let handle = volumes_data(&blocks).expect("the data");
+        let (kind, rights) = handle.info().expect("its info");
+        assert_eq!(kind, moruna_svc::ObjectType::Memory);
+        assert_eq!(rights, VOLUMES_RIGHTS);
+        assert!(!rights.contains(Rights::WRITE));
+        let run = handle
+            .duplicate(Rights::READ | Rights::MAP | Rights::TRANSFER)
+            .expect("the supervisor's duplicate for its run");
+        let memory = Memory(run);
+        let mapping = memory.map(0, 4096, map::READ).expect("it maps");
+        let mut bytes = alloc::vec![0u8; 4096];
+        mapping.read(0, &mut bytes).expect("it reads");
+        let end = bytes
+            .iter()
+            .position(|b| *b == 0)
+            .expect("zeros after the text");
+        assert_eq!(&bytes[..end], volume_lines(&blocks).as_bytes());
+        // No disk: one page of zeros.
+        let none = Memory(volumes_data(&[]).expect("no volumes"));
+        let mut first = [1u8; 1];
+        none.map(0, 4096, map::READ)
+            .and_then(|m| m.read(0, &mut first))
+            .expect("it reads");
+        assert_eq!(first, [0]);
     }
 
     #[test]
