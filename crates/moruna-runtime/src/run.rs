@@ -680,6 +680,9 @@ fn drive(
         })
         .collect();
 
+    // The room a stage's warm-up finds its other tasks do not need (system design 3A): the
+    // limits watcher hands it to the arena, through the arena's arithmetic.
+    let freed_room = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Native singleton commitments must also leave the controller's initial
     // minimum-morsel work funded, before any child is started.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -796,6 +799,25 @@ fn drive(
                             "{name}: pieces of at most {piece} bytes, what an instance's account of \
                              {} bytes holds by its function's measured memory",
                             moruna_micro::layout::native_split(share).1
+                        ));
+                    }
+                }
+                // A function the node has no readings of, and none resting on enough units to
+                // stand for a warm-up, warms up on the job's first pieces on its first task, and
+                // its others start once that sizes them (system design 3A; PM, 2026-11-18).
+                let line = stage_of(stage).and_then(|at| measured.get(at).cloned().flatten());
+                if warms_up(line.as_ref(), instances) {
+                    let freed = Arc::clone(&freed_room);
+                    let warms = stage.warm_up(
+                        line.as_ref(),
+                        Box::new(move |bytes| {
+                            freed.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+                        }),
+                    );
+                    if warms {
+                        notes.push(format!(
+                            "{name}: warms up on its first task before its other {} start",
+                            instances - 1
                         ));
                     }
                 }
@@ -1125,7 +1147,14 @@ fn drive(
                 arena,
                 controller: controller.clone(),
                 scheduler: scheduler.clone(),
-                sizing: Box::new(move |ceiling| sizing.divide(ceiling, &mut Vec::new())),
+                sizing: {
+                    let freed = Arc::clone(&freed_room);
+                    Box::new(move |ceiling| {
+                        sizing
+                            .divide(ceiling, &mut Vec::new())
+                            .saturating_add(freed.load(std::sync::atomic::Ordering::Relaxed))
+                    })
+                },
                 start_ns,
                 workers_max,
                 tick: std::time::Duration::from_millis(config::TICK_MS),
@@ -1779,6 +1808,22 @@ fn instance_piece(memory: &moruna_cost::Memory, share: u64) -> u64 {
     } else {
         u64::MAX
     }
+}
+
+/// The units a function's measurement rests on past which a stage does not warm up on the
+/// job's first pieces (system design 3A): the controller's rule for a profile it trusts.
+const WARM_UP_SKIPPED_AT: u64 = 32;
+
+/// Whether a stage of `instances` tasks whose function the node has no readings of warms up on
+/// its first task (system design 3A; PM, 2026-11-18): when what it carries (`line`, a
+/// registration's or the store's) rests on fewer than [`WARM_UP_SKIPPED_AT`] units, or there is
+/// none, and it has other tasks to size.
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+fn warms_up(line: Option<&moruna_cost::Memory>, instances: usize) -> bool {
+    instances > 1 && line.is_none_or(|m| m.units < WARM_UP_SKIPPED_AT)
 }
 
 /// What the run sizes a measured stage's instances at (system design 3A).
@@ -2571,6 +2616,26 @@ mod tests {
 
     /// System design 3A (6.3g phase 3): a stage the node measured is sized from its readings,
     /// the piece shrinking before its instances do; another is left to today's rule.
+    #[test]
+    fn a_stage_warms_up_unless_its_facts_rest_on_enough_units_or_it_has_one_task() {
+        let line = |units: u64| moruna_cost::Memory {
+            fixed_bytes: 1.0,
+            per_input_byte: 1.0,
+            output_per_input_byte: None,
+            spread: 0.0,
+            units,
+            input_bytes_min: 1,
+            input_bytes_max: 2,
+        };
+        assert!(warms_up(None, 4), "nothing measured it");
+        assert!(warms_up(Some(&line(6)), 4), "a check's six units");
+        assert!(
+            !warms_up(Some(&line(WARM_UP_SKIPPED_AT)), 4),
+            "enough units"
+        );
+        assert!(!warms_up(None, 1), "no other task to size");
+    }
+
     #[test]
     fn an_instance_s_pieces_are_what_its_account_holds_by_the_measured_line() {
         const MIB: u64 = 1 << 20;

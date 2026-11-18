@@ -387,6 +387,9 @@ pub struct ImageTask {
     busy: Arc<Busy>,
     /// Ring mode: every task's plane, made ahead as the first task starts.
     ahead: layout::Ahead<OpenedPlane>,
+    /// Told the bytes of the stage's room its other tasks did not need, once a warm-up sized
+    /// them (system design 3A): the run's arena takes them.
+    on_sized: OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
 }
 
 /// Where a ring stage's workers' time inside the stage goes, in nanoseconds: cutting batches
@@ -432,6 +435,26 @@ struct Busy {
     /// The largest piece the function's measured line says one task's account holds (system
     /// design 3A: piece <= (account - fixed) / per-byte); 0 when nothing measured it.
     piece_cap: std::sync::atomic::AtomicU64,
+    /// While the stage warms up on its first task (system design 3A): only that task is given
+    /// work, one piece at a time, and its readings size the others.
+    warming: std::sync::atomic::AtomicBool,
+    /// The warm-up's readings and what it found.
+    warm: Mutex<Warm>,
+}
+
+/// A stage's warm-up on its first task (system design 3A; PM, 2026-11-18).
+#[derive(Debug, Default)]
+struct Warm {
+    /// The registration's measurement, whose slope the fit keeps.
+    client: Option<moruna_api::Measured>,
+    /// `(bytes laid out, the task's account's peak)`, one a piece, the smallest first.
+    readings: Vec<(u64, u64)>,
+    /// The bytes of the piece whose answer is being taken, for a take the arena refused.
+    laid: Option<u64>,
+    /// When its first piece was laid out, nanoseconds.
+    started: u64,
+    /// What it found and did, for the stage's note.
+    said: Option<String>,
 }
 
 impl Busy {
@@ -514,6 +537,7 @@ impl ImageTask {
             root: None,
             busy: Arc::new(Busy::default()),
             ahead: layout::Ahead::default(),
+            on_sized: OnceLock::new(),
         }
         .with_processes(processes))
     }
@@ -673,6 +697,9 @@ impl ImageTask {
                 .map_err(|e| plane_error(&self.name, "granting explicit reply window", e))?;
             st.window = Some(bytes);
         }
+        if st.rings && st.instance == 0 && self.warming() {
+            return self.warm(st, &batch);
+        }
         if st.rings {
             return st.pipelined(&batch, self.ports.get(), &self.port_names);
         }
@@ -728,7 +755,11 @@ impl ImageTask {
                 s(&f.wait),
                 s(&f.take),
                 s(&f.poll)
-            )
+            ) + &lock(&self.busy.warm)
+                .said
+                .as_ref()
+                .map(|said| format!("; {said}"))
+                .unwrap_or_default()
         })
     }
 
@@ -780,6 +811,223 @@ impl ImageTask {
         *lock(&self.measured) = Some((piece, account));
     }
 
+    /// Warm the stage up on its first task before its others start (system design 3A; PM,
+    /// 2026-11-18): the node has no readings of its function, and `client` is what its
+    /// registration measured, if anything (its slope stands; its fixed term holds no
+    /// interpreter of the function's). A stage on descriptors is not warmed up.
+    pub fn warm_up(&self, client: Option<layout::Line>) {
+        if !self.rings {
+            return;
+        }
+        lock(&self.busy.warm).client = client.map(|line| moruna_api::Measured {
+            fixed_bytes: line.fixed_bytes,
+            per_input_byte: line.per_input_byte,
+            output_per_input_byte: None,
+            spread: line.spread,
+            units: line.units,
+            input_bytes_min: line.input_bytes_min,
+            input_bytes_max: line.input_bytes_max,
+        });
+        self.busy
+            .warming
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `f` is told the bytes of the stage's room its other tasks do not need, once its
+    /// warm-up has sized them.
+    pub fn on_sized(&self, f: Box<dyn Fn(u64) + Send + Sync>) {
+        let _ = self.on_sized.set(f);
+    }
+
+    /// Whether the stage is warming up on its first task.
+    fn warming(&self) -> bool {
+        self.busy.warming.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The warm-up's unit on the first task: `batch` in pieces of the warm-up's sizes, the
+    /// smallest first ([`layout::WARM_PIECES`], none past its plane's piece), each laid out and
+    /// its answer taken before the next, so the account's peak after each answer is that
+    /// piece's. A unit the run's arena refused goes on where it stopped, as a ring unit does.
+    fn warm(
+        &self,
+        st: &mut TaskState,
+        batch: &moruna_kernel::arrow::record_batch::RecordBatch,
+    ) -> Result<Payload> {
+        let (ports, names) = (self.ports.get(), &self.port_names);
+        let plane = layout::ring_sizes(st.plane.residency().budget).piece;
+        if st.schema.is_none() {
+            st.schema = lock(&self.busy.schema).clone();
+        }
+        if !st.applying {
+            let rows = batch.num_rows();
+            let per_row = (st.record_len(batch)? / rows.max(1) as u64).max(1);
+            let mut next = lock(&self.busy.warm).readings.len();
+            let mut at = 0;
+            while at < rows {
+                let size = layout::WARM_PIECES
+                    .get(next)
+                    .copied()
+                    .unwrap_or(layout::PIECE_MAX)
+                    .min(plane);
+                let take = usize::try_from(size / per_row)
+                    .unwrap_or(usize::MAX)
+                    .clamp(1, rows - at);
+                let pieces = st.pieces(&batch.slice(at, take), plane)?;
+                st.queued.extend(pieces);
+                at += take;
+                next += 1;
+            }
+            st.applying = true;
+        }
+        if st.taking.is_some() {
+            let answer = st.take_oldest(ports, names)?;
+            st.ready.push_back(answer);
+            let laid = lock(&self.busy.warm).laid.take();
+            if let Some(laid) = laid {
+                self.reading(st, laid);
+            }
+        }
+        while let Some(part) = st.queued.pop_front() {
+            let (laid, id) = match st.offer(&part, ports, names) {
+                Ok(offered) => offered,
+                Err(e) => {
+                    st.queued.push_front(part);
+                    return Err(e);
+                }
+            };
+            drop(part);
+            st.sent += 1;
+            st.count_busy(true);
+            st.in_flight.push_back(id);
+            {
+                let mut warm = lock(&self.busy.warm);
+                if warm.started == 0 {
+                    warm.started = moruna_svc::now();
+                }
+                warm.laid = Some(laid);
+            }
+            let answer = st.take_oldest(ports, names)?;
+            st.ready.push_back(answer);
+            lock(&self.busy.warm).laid = None;
+            self.reading(st, laid);
+        }
+        st.applying = false;
+        match st.ready.len() {
+            0 => {
+                let schema = st.schema.clone().ok_or_else(|| {
+                    kernel_error(format!("image `{}`: no answer's schema yet", self.name))
+                })?;
+                Ok(Payload::Table(
+                    moruna_kernel::arrow::record_batch::RecordBatch::new_empty(schema),
+                    moruna_kernel::Tier::Host,
+                ))
+            }
+            1 => st
+                .ready
+                .pop_front()
+                .ok_or_else(|| kernel_error(format!("image `{}`: no answer", self.name))),
+            _ => st.join_ready(),
+        }
+    }
+
+    /// One warm-up reading: the first task's account's peak after the answer to a piece of
+    /// `laid` bytes. The last of [`layout::WARM_PIECES`] ends the warm-up.
+    fn reading(&self, st: &TaskState, laid: u64) {
+        if !self.warming() {
+            return;
+        }
+        let Some(Ok(usage)) = st.memory.usage() else {
+            return;
+        };
+        let done = {
+            let mut warm = lock(&self.busy.warm);
+            warm.readings.push((laid, usage.peak));
+            warm.readings.len() >= layout::WARM_PIECES.len()
+        };
+        if done {
+            self.warmed();
+        }
+    }
+
+    /// The warm-up's end (system design 3A): the readings fitted, the client's slope kept where
+    /// it gave one; the other tasks sized from the fit in the room the run gave them
+    /// (`moruna_adapters::instances::fund_measured`: the piece shrinks first, then the count);
+    /// the room they do not need handed back; and then they start.
+    fn warmed(&self) {
+        let (readings, client, started) = {
+            let warm = lock(&self.busy.warm);
+            (warm.readings.clone(), warm.client.clone(), warm.started)
+        };
+        let took = moruna_svc::now().saturating_sub(started) / 1_000_000;
+        let laid: Vec<String> = readings
+            .iter()
+            .map(|(laid, peak)| format!("{laid} bytes to a peak of {peak}"))
+            .collect();
+        let mut said = format!(
+            "warmed up on its first task over {} pieces in {took} ms ({})",
+            readings.len(),
+            laid.join(", ")
+        );
+        let fit = moruna_api::Measured::from_readings(&readings, client.as_ref());
+        let share = *lock(&self.ceiling);
+        let others = self.instances().saturating_sub(1);
+        if let (Some(fit), Some(share)) = (fit, share) {
+            said.push_str(&format!(
+                ": {:.0} bytes of its own and {:.3} bytes a byte{}",
+                fit.fixed_bytes,
+                fit.per_input_byte,
+                if client.is_some() {
+                    " (the registration's slope)"
+                } else {
+                    ""
+                }
+            ));
+            let margin = moruna_api::Z95 * fit.spread;
+            let account = |piece: u64| {
+                layout::line_account(
+                    fit.fixed_bytes,
+                    fit.per_input_byte,
+                    margin,
+                    fit.input_bytes_max,
+                    piece,
+                )
+            };
+            let costs: Vec<u64> = layout::PIECES
+                .iter()
+                .map(|&piece| layout::plane_for(piece).1 + account(piece))
+                .collect();
+            let room = share.saturating_mul(others as u64);
+            if others > 0 {
+                match moruna_adapters::instances::fund_measured(room, &[(others, costs.clone())]) {
+                    Ok((at, counts)) => {
+                        let piece = layout::PIECES[at];
+                        let count = counts.first().copied().unwrap_or(0);
+                        self.size_measured(piece, account(piece));
+                        self.cap_pieces(piece);
+                        self.fund(1 + count);
+                        said.push_str(&format!(
+                            "; its other {count} tasks at pieces of {piece} bytes and accounts of \
+                             {} bytes",
+                            account(piece)
+                        ));
+                        let freed = room.saturating_sub(costs[at].saturating_mul(count as u64));
+                        if let Some(f) = self.on_sized.get() {
+                            f(freed);
+                        }
+                    }
+                    Err(why) => {
+                        said.push_str(&format!("; its other tasks keep the share's rule ({why})"))
+                    }
+                }
+            }
+        }
+        tracing::info!(target: "micro", image = %self.name, "{said}");
+        lock(&self.busy.warm).said = Some(said);
+        self.busy
+            .warming
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The largest piece one task's account holds by the function's measured line (system design
     /// 3A), which the stage's morsels and its tasks' pieces are held to beside its plane's piece
     /// ([`layout::piece_cap`]); at least one byte.
@@ -826,7 +1074,9 @@ impl ImageTask {
             // Every task's plane is made ahead, together, as the first task starts: the kernel
             // zeroes each and the host faults its pages in on CPUs of their own, not one task
             // after another. A task restarted later makes its own now.
-            let instances = self.instances();
+            // While the stage warms up, only its first task's: the others are made for the
+            // pieces the warm-up sizes them for (system design 3A).
+            let instances = if self.warming() { 1 } else { self.instances() };
             let cpus: Vec<Option<u32>> = (0..instances).map(|i| self.cpu_of(i)).collect();
             self.ahead.start(instances, move |i| {
                 open_ring_plane(budget, cpus.get(i).copied().flatten())
@@ -2387,6 +2637,12 @@ impl Kernel for ImageTask {
     /// batches in turn and one worker keeps every task busy.
     fn deals_instances(&self) -> bool {
         self.rings
+    }
+
+    /// Its first task alone while the stage warms up on it, then the tasks the warm-up sized
+    /// (system design 3A).
+    fn instances_ready(&self) -> usize {
+        if self.warming() { 1 } else { self.instances() }
     }
 
     /// The largest piece one of the stage's tasks takes (system design 3A; PM, 2026-11-18): its

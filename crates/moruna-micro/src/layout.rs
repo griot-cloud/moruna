@@ -101,6 +101,43 @@ pub fn measured_task_limit(account: u64, room: u64) -> Option<u64> {
     (limit >= PAGE).then_some(limit)
 }
 
+/// A function's measured line as the run carried it (system design 3A): what a stage's warm-up
+/// keeps the slope of when a registration measured it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Line {
+    /// Bytes one process holds whatever its batch.
+    pub fixed_bytes: f64,
+    /// Bytes it holds per byte of input.
+    pub per_input_byte: f64,
+    /// The root mean square of the units' departures from the line.
+    pub spread: f64,
+    /// The units it was fitted from.
+    pub units: u64,
+    /// The least input bytes they covered.
+    pub input_bytes_min: u64,
+    /// The most input bytes they covered.
+    pub input_bytes_max: u64,
+}
+
+/// The pieces a stage's first task warms up on, the smallest first (system design 3A; PM,
+/// 2026-11-18): one at a time, each answer's account peak read against the bytes laid out. In
+/// ascending order the peak, the account's high-water mark, is the last piece's.
+pub const WARM_PIECES: [u64; 5] = [1 << 20, 2 << 20, 4 << 20, 8 << 20, 16 << 20];
+
+/// The account one process of a function needs at pieces of `piece` bytes by its measured line
+/// (system design 3A), in whole pages: `fixed + per_byte x piece`, or for a line with no slope
+/// the fixed term scaled in proportion past the top of its range, `top`; widened by `margin`
+/// (as `moruna_cost::Memory::account`, which the engine sizes a node's readings with).
+pub fn line_account(fixed: f64, per_byte: f64, margin: f64, top: u64, piece: u64) -> u64 {
+    let piece = piece as f64;
+    let at = if per_byte == 0.0 && top > 0 && piece > top as f64 {
+        fixed * piece / top as f64
+    } else {
+        fixed + per_byte * piece
+    };
+    ((at * (1.0 + margin)).max(0.0).ceil() as u64).next_multiple_of(PAGE)
+}
+
 /// The least share a native task runs in: its account at [`TASK_MIN`] beside its plane at its
 /// least (pieces of [`RING_MIN`]).
 pub const NATIVE_CHILD_MIN: u64 = TASK_MIN + PLANE_HALF_PIECES * RING_MIN / 2;
@@ -1070,6 +1107,56 @@ mod tests {
         assert_eq!(task_cpu(8, 8), 1, "more tasks than CPUs go round again");
         assert_eq!(task_cpu(0, 1), 0);
         assert_eq!(task_cpu(3, 0), 0, "no CPU count: the first");
+    }
+
+    #[test]
+    fn a_line_s_account_is_its_need_at_a_piece_in_whole_pages() {
+        const MIB: u64 = 1 << 20;
+        assert!(
+            WARM_PIECES.windows(2).all(|w| w[0] < w[1]),
+            "the smallest first"
+        );
+        assert_eq!(WARM_PIECES[4], PIECE_MAX, "up to the largest piece");
+        // 30 MiB and six bytes a byte, at 4 MiB pieces: 54 MiB.
+        assert_eq!(
+            line_account(30.0 * MIB as f64, 6.0, 0.0, 16 * MIB, 4 * MIB),
+            54 * MIB
+        );
+        // Widened by the margin, in whole pages.
+        let widened = line_account(30.0 * MIB as f64, 6.0, 0.1, 16 * MIB, 4 * MIB);
+        assert_eq!(widened % PAGE, 0);
+        assert!(widened >= (54.0 * 1.1 * MIB as f64) as u64 && widened < 60 * MIB);
+        // No slope: as it is within the range, in proportion past it.
+        assert_eq!(
+            line_account(4.0 * MIB as f64, 0.0, 0.0, 16 * MIB, MIB),
+            4 * MIB
+        );
+        assert_eq!(
+            line_account(4.0 * MIB as f64, 0.0, 0.0, 16 * MIB, 32 * MIB),
+            8 * MIB
+        );
+        // Nothing measured holds nothing.
+        assert_eq!(line_account(0.0, 0.0, 0.0, 0, 16 * MIB), 0);
+        // A carried line's figures, as a stage's warm-up is given them.
+        let line = Line {
+            fixed_bytes: 30.0 * MIB as f64,
+            per_input_byte: 6.0,
+            spread: 0.0,
+            units: 6,
+            input_bytes_min: MIB,
+            input_bytes_max: 16 * MIB,
+        };
+        assert_eq!(
+            line_account(
+                line.fixed_bytes,
+                line.per_input_byte,
+                line.spread,
+                line.input_bytes_max,
+                4 * MIB
+            ),
+            54 * MIB
+        );
+        assert!(line.units > 0 && line.input_bytes_min < line.input_bytes_max);
     }
 
     #[test]

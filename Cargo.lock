@@ -2106,6 +2106,7 @@ dependencies = [
  "linux-protocol",
  "moruna-abi",
  "moruna-adapters",
+ "moruna-api",
  "moruna-arena",
  "moruna-image",
  "moruna-imagefs",

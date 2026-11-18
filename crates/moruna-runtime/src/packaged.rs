@@ -237,6 +237,31 @@ impl Packaged {
         }
     }
 
+    /// The stage warms up on its first task before its others start (system design 3A): the
+    /// node has no readings of its function. `client` is what its registration measured, whose
+    /// slope the fit keeps; `freed` is told the room the others did not need. Whether it
+    /// does: a stage of the data plane's tasks only.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn warm_up(
+        &self,
+        client: Option<&moruna_cost::Memory>,
+        freed: Box<dyn Fn(u64) + Send + Sync>,
+    ) -> bool {
+        let Packaged::Task(k) = self else {
+            return false;
+        };
+        k.on_sized(freed);
+        k.warm_up(client.map(|m| moruna_micro::layout::Line {
+            fixed_bytes: m.fixed_bytes,
+            per_input_byte: m.per_input_byte,
+            spread: m.spread,
+            units: m.units,
+            input_bytes_min: m.input_bytes_min,
+            input_bytes_max: m.input_bytes_max,
+        }));
+        true
+    }
+
     /// What each instance of the stage's tasks held (system design 3A): its account's peak and
     /// limit and the largest piece it was given; `None` for a stage that is not one of the
     /// data plane's tasks.

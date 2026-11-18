@@ -35,6 +35,8 @@ moruna-record = { workspace = true }
 # the virtio, PCI and register code Moruna's driver processes use.
 moruna-arena = { workspace = true }
 moruna-abi = { workspace = true }
+# 6.3g: the warm-up fits a function's readings as api's registry does.
+moruna-api = { workspace = true }
 moruna-mmio = { path = "../../kernel/drivers/mmio", version = "=0.1.0" }
 moruna-pci = { path = "../../kernel/drivers/pci", version = "=0.1.0" }
 moruna-virtio = { path = "../../kernel/drivers/virtio", version = "=0.1.0" }
