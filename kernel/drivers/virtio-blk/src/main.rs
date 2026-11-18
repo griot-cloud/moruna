@@ -25,7 +25,10 @@
 //! volume (`architecture/moruna-os-system.md` 3C, item 3.3). On a node, where the device
 //! manager gives it a `register` listener of its directory, a disk that states a serial is
 //! registered under it (`moruna.devices.directory` 1.2): a lookup of the serial connects
-//! through a listener of the driver's own, as a lookup of its service does.
+//! through a listener of the driver's own, as a lookup of its service does. The boot disk's
+//! `moruna-system` partition, which holds the node's engine layer (system design 1A), is
+//! registered as a disk of its own, `system`: a window of the boot disk at the partition's
+//! sectors, read only, which no request reaches past, and never a volume.
 
 #![no_std]
 #![no_main]
@@ -45,7 +48,7 @@ use alloc::{
 use core::cell::RefCell;
 
 use block_protocol::{Info, block, lease};
-use moruna_disk::Guid;
+use moruna_disk::{Guid, Slice};
 use moruna_mmio::Region;
 use moruna_pci::dma::DmaBuffer;
 use moruna_svc::{
@@ -161,6 +164,8 @@ struct Block {
     serial: Option<String>,
     /// Whether it is the disk the node booted from.
     boot: bool,
+    /// On the boot disk, its `moruna-system` partition, in the device's sectors.
+    system: Option<Slice>,
 }
 
 impl Block {
@@ -545,6 +550,26 @@ struct Connection {
     next: u32,
     connection: Option<u64>,
     closed: Rc<RefCell<Vec<u64>>>,
+    /// The window of the disk this connection is served, read only: the `system` partition's.
+    /// `None`: the whole disk.
+    slice: Option<Slice>,
+}
+
+impl Connection {
+    /// The device's sector of a transfer of `count` sectors from the connection's `sector`: on
+    /// a window, `BadCount` as the disk says it, and `OutOfRange` for one the window does not
+    /// hold whole.
+    fn place(&self, b: &Block, sector: u64, count: u32) -> Result<u64, block::Error> {
+        let Some(slice) = self.slice else {
+            return Ok(sector);
+        };
+        if count == 0 || count > b.info.max_sectors {
+            return Err(block::Error::BadCount);
+        }
+        slice
+            .map(sector, u64::from(count))
+            .ok_or(block::Error::OutOfRange)
+    }
 }
 
 fn decode<T: Wire>(d: &mut Decoder<'_>) -> Option<T> {
@@ -562,7 +587,14 @@ impl Handler for Connection {
         let mut b = block.borrow_mut();
         match ordinal {
             1 => match d.finish() {
-                Ok(()) => Outcome::reply(b.info),
+                Ok(()) => Outcome::reply(match self.slice {
+                    Some(slice) => Info {
+                        sectors: slice.sectors,
+                        read_only: true,
+                        ..b.info
+                    },
+                    None => b.info,
+                }),
                 Err(_) => Outcome::Status(Status::BadMessage),
             },
             2 | 3 => {
@@ -583,6 +615,13 @@ impl Handler for Connection {
                     return Outcome::Status(Status::BadMessage);
                 }
                 let op = if ordinal == 2 { Op::Read } else { Op::Write };
+                if self.slice.is_some() && matches!(op, Op::Write) {
+                    return Outcome::Failure(block::Error::ReadOnly.code());
+                }
+                let sector = match self.place(&b, sector, count) {
+                    Ok(sector) => sector,
+                    Err(e) => return Outcome::Failure(e.code()),
+                };
                 b.transfer(cx, op, token, sector, count, buffer)
             }
             4 => {
@@ -658,6 +697,13 @@ impl Handler for Connection {
                     return Outcome::Failure(block::Error::NoRegistration.code());
                 };
                 let op = if ordinal == 6 { Op::Read } else { Op::Write };
+                if self.slice.is_some() && matches!(op, Op::Write) {
+                    return Outcome::Failure(block::Error::ReadOnly.code());
+                }
+                let sector = match self.place(&b, sector, count) {
+                    Ok(sector) => sector,
+                    Err(e) => return Outcome::Failure(e.code()),
+                };
                 let offset = u64::from(page) * 4096;
                 b.transfer_at(cx, op, token, registration, offset, sector, count)
             }
@@ -685,6 +731,13 @@ impl Handler for Connection {
                     return Outcome::Failure(block::Error::NoRegistration.code());
                 };
                 let op = if ordinal == 11 { Op::Read } else { Op::Write };
+                if self.slice.is_some() && matches!(op, Op::Write) {
+                    return Outcome::Failure(block::Error::ReadOnly.code());
+                }
+                let sector = match self.place(&b, sector, count) {
+                    Ok(sector) => sector,
+                    Err(e) => return Outcome::Failure(e.code()),
+                };
                 b.transfer_at(cx, op, token, registration, offset, sector, count)
             }
             8 => {
@@ -707,7 +760,7 @@ impl Handler for Connection {
                 if d.finish().is_err() {
                     return Outcome::Status(Status::BadMessage);
                 }
-                if b.info.read_only {
+                if b.info.read_only || self.slice.is_some() {
                     return Outcome::Failure(block::Error::ReadOnly.code());
                 }
                 match b.writer.claim(cx.connection()) {
@@ -847,7 +900,7 @@ fn identify(
     block: u64,
     sectors: u64,
     image: Option<&Guid>,
-) -> Result<(Option<String>, bool), String> {
+) -> Result<(Option<String>, bool, Option<Slice>), String> {
     let probe = DmaBuffer::new(&device.dma, 2 * 4096)?;
     let serial = if ask(
         device,
@@ -871,6 +924,7 @@ fn identify(
     };
     let header_sector = block / SECTOR;
     let mut boot = false;
+    let mut system = None;
     if let Some(image) = image
         && block <= 4096
         && sectors >= 2 * header_sector
@@ -892,8 +946,54 @@ fn identify(
             .read(4096, &mut header)
             .map_err(|e| format!("the GPT header: {}", e.name()))?;
         boot = moruna_disk::is_boot(&header, image);
+        if boot && let Some(entries) = moruna_disk::entries(&header) {
+            system = partition(
+                device, queue, line, headers, &probe, block, sectors, &entries,
+            )?;
+        }
     }
-    Ok((serial, boot))
+    Ok((serial, boot, system))
+}
+
+/// The boot disk's `moruna-system` partition, from the GPT's partition entries `entries`
+/// (logical blocks of `block` bytes, read a page at a time into `probe`'s second page), as
+/// the device's sectors: `None` when the entries are not whole and checked, or none is it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The requests made at start take the device, its queue, its line and its headers"
+)]
+fn partition(
+    device: &Device,
+    queue: &mut VirtQueue,
+    line: &Interrupt,
+    headers: &DmaBuffer,
+    probe: &DmaBuffer,
+    block: u64,
+    sectors: u64,
+    entries: &moruna_disk::Entries,
+) -> Result<Option<Slice>, String> {
+    let mut bytes = Vec::new();
+    let first = entries.lba * (block / SECTOR);
+    let pages = entries.bytes().div_ceil(4096);
+    for page in 0..pages {
+        let sector = first + page * (4096 / SECTOR);
+        if sector + 4096 / SECTOR > sectors {
+            return Ok(None);
+        }
+        if !ask(
+            device, queue, line, headers, T_IN, sector, probe, 4096, 4096,
+        )? {
+            return Ok(None);
+        }
+        let mut read = vec![0u8; 4096];
+        probe
+            .map
+            .read(4096, &mut read)
+            .map_err(|e| format!("the partition entries: {}", e.name()))?;
+        bytes.extend_from_slice(&read);
+    }
+    Ok(moruna_disk::find(&bytes, entries, moruna_disk::SYSTEM)
+        .and_then(|p| Slice::of(&p, block, SECTOR, sectors)))
 }
 
 fn open(image: Option<&Guid>) -> Result<(Block, Interrupt), String> {
@@ -922,7 +1022,8 @@ fn open(image: Option<&Guid>) -> Result<(Block, Interrupt), String> {
     let headers = DmaBuffer::new(&device.dma, 4096)?;
     let slots = SLOTS.min(queue.queue.size() as usize);
     device.ready()?;
-    let (serial, boot) = identify(&device, &mut queue, &line, &headers, block, sectors, image)?;
+    let (serial, boot, system) =
+        identify(&device, &mut queue, &line, &headers, block, sectors, image)?;
     Ok((
         Block {
             device,
@@ -949,6 +1050,7 @@ fn open(image: Option<&Guid>) -> Result<(Block, Interrupt), String> {
             failed: None,
             serial,
             boot,
+            system,
         },
         line,
     ))
@@ -957,12 +1059,12 @@ fn open(image: Option<&Guid>) -> Result<(Block, Interrupt), String> {
 /// Registers the disk as `block` with the device manager's directory through `register`, the
 /// listener it gave this driver: the listener a lookup of the serial connects through, which
 /// the driver then serves.
-fn register(register: Handle, block: devices_protocol::Block) -> Result<Channel, String> {
+fn register(
+    directory: &mut devices_protocol::directory::Client,
+    block: devices_protocol::Block,
+) -> Result<Channel, String> {
     let (connect, served) =
         Channel::create().map_err(|e| format!("channel_create: {}", e.name()))?;
-    let mut directory =
-        devices_protocol::open_directory(Channel(register), deadline_in(REGISTER_NS))
-            .map_err(|e| format!("the directory: {e:?}"))?;
     directory
         .register(block, connect)
         .map_err(|e| format!("the directory refused it: {e:?}"))?;
@@ -1008,16 +1110,41 @@ fn run() -> i64 {
         None => String::from(", no serial"),
     };
     let boot = if block.boot { ", the boot disk" } else { "" };
-    let disk = block.serial.clone().map(|serial| devices_protocol::Block {
-        serial,
-        sector_size: info.sector_size,
-        sectors: info.sectors,
-        read_only: info.read_only,
-        boot: block.boot,
-    });
+    // What the directory is told: the disk by its serial, and the boot disk's system
+    // partition as `system`, read only and never a volume; each with the window it serves.
+    let mut disks = Vec::new();
+    if let Some(serial) = block.serial.clone() {
+        let disk = devices_protocol::Block {
+            serial,
+            sector_size: info.sector_size,
+            sectors: info.sectors,
+            read_only: info.read_only,
+            boot: block.boot,
+        };
+        disks.push((disk, None));
+    }
+    if let Some(slice) = block.system {
+        let system = devices_protocol::Block {
+            serial: String::from(moruna_disk::SYSTEM_SERIAL),
+            sector_size: info.sector_size,
+            sectors: slice.sectors,
+            read_only: true,
+            boot: true,
+        };
+        disks.push((system, Some(slice)));
+    }
+    let system = match block.system {
+        Some(slice) => format!(
+            ", its {} partition {} sectors from sector {}",
+            moruna_disk::SYSTEM,
+            slice.sectors,
+            slice.first
+        ),
+        None => String::new(),
+    };
     let block = Rc::new(RefCell::new(block));
     let mut dispatcher = Dispatcher::new();
-    let connection = {
+    let connection = |slice: Option<Slice>| {
         let (block, closed) = (block.clone(), block.borrow().closed.clone());
         move || {
             Box::new(Connection {
@@ -1026,6 +1153,7 @@ fn run() -> i64 {
                 next: 1,
                 connection: None,
                 closed: closed.clone(),
+                slice,
             }) as Box<dyn Handler>
         }
     };
@@ -1038,6 +1166,7 @@ fn run() -> i64 {
             next: 1,
             connection: None,
             closed: closed.clone(),
+            slice: None,
         }) as Box<dyn Handler>
     });
     let setup = dispatcher.listen(listener, factory).and_then(|()| {
@@ -1052,25 +1181,37 @@ fn run() -> i64 {
     }
     println!(
         out,
-        "KB3 {}: virtio-blk up: {} sectors of {} bytes, {} sectors a transfer{}{}{}",
+        "KB3 {}: virtio-blk up: {} sectors of {} bytes, {} sectors a transfer{}{}{}{}",
         name,
         info.sectors,
         info.sector_size,
         info.max_sectors,
         if info.read_only { ", read only" } else { "" },
         serial,
-        boot
+        boot,
+        system
     );
-    if let (Some(slot), Some(disk)) = (start::take(devices_protocol::REGISTER_SLOTS), disk) {
-        let serial = disk.serial.clone();
-        let registered = register(slot, disk).and_then(|served| {
-            dispatcher
-                .listen(served, Box::new(connection.clone()))
-                .map_err(|e| format!("listening: {}", e.name()))
-        });
-        match registered {
-            Ok(()) => println!(out, "KB3 {}: registered as {}", name, serial),
-            Err(e) => println!(out, "KB3 {}: not registered as {}: {}", name, serial, e),
+    if let Some(slot) = start::take(devices_protocol::REGISTER_SLOTS)
+        && !disks.is_empty()
+    {
+        match devices_protocol::open_directory(Channel(slot), deadline_in(REGISTER_NS)) {
+            Ok(mut directory) => {
+                for (disk, slice) in disks {
+                    let serial = disk.serial.clone();
+                    let registered = register(&mut directory, disk).and_then(|served| {
+                        dispatcher
+                            .listen(served, Box::new(connection(slice)))
+                            .map_err(|e| format!("listening: {}", e.name()))
+                    });
+                    match registered {
+                        Ok(()) => println!(out, "KB3 {}: registered as {}", name, serial),
+                        Err(e) => {
+                            println!(out, "KB3 {}: not registered as {}: {}", name, serial, e)
+                        }
+                    }
+                }
+            }
+            Err(e) => println!(out, "KB3 {}: not registered: the directory: {:?}", name, e),
         }
     }
     loop {

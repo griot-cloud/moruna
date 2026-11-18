@@ -15,7 +15,10 @@
 //!    the OS disk, every disk is served read-only, and it says why ([`plan`]).
 //! 3. It serves each disk as `moruna.driver.block` on a listener of its own ([`serve`]),
 //!    and registers it with the device manager under its serial, through the link that
-//!    carries only that right, so a client finds it as any other disk.
+//!    carries only that right, so a client finds it as any other disk. The boot disk's
+//!    `moruna-system` partition, which holds the node's engine layer (system design 1A), is
+//!    served and registered as a disk of its own, `system`: a window of the boot disk, read
+//!    only, never a volume ([`scan::system`], [`system`]; item 3.3).
 //!
 //! Data moves by the guest page numbers of the client's memory, named in each request, with
 //! no copy. Everything it needs of the node is behind [`serve::Node`] and [`scan::Scratch`],
@@ -93,6 +96,7 @@ pub fn plan(controllers: &[Controller<'_>]) -> Plan {
                     controller: index,
                     disk: *disk,
                     name,
+                    window: None,
                 }),
                 None => plan.lines.push(format!(
                     "{}, no Azure name: not served",
@@ -127,4 +131,31 @@ pub fn plan(controllers: &[Controller<'_>]) -> Plan {
         plan.served.len()
     ));
     plan
+}
+
+/// The boot disk's `moruna-system` partition, `window` of its blocks, served as a disk of its
+/// own: `system`, read only, and, as the boot disk is, never a volume.
+pub fn system(boot: &Served, window: moruna_disk::Slice) -> Served {
+    Served {
+        controller: boot.controller,
+        disk: boot.disk,
+        name: naming::Name {
+            serial: String::from(moruna_disk::SYSTEM_SERIAL),
+            read_only: true,
+            boot: true,
+        },
+        window: Some(window),
+    }
+}
+
+/// What the device manager is told of a disk served: its serial, its blocks (its window's),
+/// and how it is served.
+pub fn block(served: &Served) -> devices_protocol::Block {
+    devices_protocol::Block {
+        serial: served.name.serial.clone(),
+        sector_size: served.disk.block_size(),
+        sectors: served.blocks(),
+        read_only: served.name.read_only,
+        boot: served.name.boot,
+    }
 }

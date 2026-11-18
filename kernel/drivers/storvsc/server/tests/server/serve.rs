@@ -20,7 +20,9 @@ use moruna_svc::{
 use vmbus_protocol::Guid;
 use vmbus_ring::RingMem;
 
-use crate::{FakeNode, controller, fake::Fault, fake::Host, fake::Link, plan_of, scanned};
+use crate::{
+    FakeNode, Page, controller, fake::Fault, fake::Host, fake::Link, gpt, plan_of, scanned,
+};
 
 const SECONDS: u64 = 1_000_000_000;
 
@@ -520,5 +522,89 @@ fn requests_that_are_no_requests_are_refused() {
             bad(),
             bad()
         ]
+    );
+}
+
+#[test]
+fn the_system_partition_is_a_read_only_window_of_the_boot_disk() {
+    let (link, host) = controller(&[(0, 512, 4096)]);
+    let data = pattern(0x33, 64 * 512);
+    {
+        let mut h = host.borrow_mut();
+        let disk = &mut h.disks.get_mut(&(0, 0, 0)).unwrap().bytes;
+        gpt(disk, &[("EFI system", 40, 99), ("moruna-system", 100, 163)]);
+        disk[100 * 512..164 * 512].copy_from_slice(&data);
+    }
+    let page = Page(host.clone());
+    let (mut device, scan) = scanned(link, &host);
+    let window = moruna_storvsc_server::scan::system(&mut device, &page, &scan.disks[0])
+        .unwrap()
+        .unwrap();
+    let mut served = plan_of(ROOT, &scan).served;
+    let system = moruna_storvsc_server::system(&served[0], window);
+    served.push(system.clone());
+    let node = FakeNode::new(host.clone());
+    let mut world = World {
+        driver: Rc::new(RefCell::new(Driver::new(node, vec![device], served))),
+        host,
+        dispatcher: Dispatcher::new(),
+    };
+    let end = world.client(1);
+    let one = || Memory::create(PAGE as u64).unwrap();
+    let (info, first, last, answers) = world.serve(
+        thread::spawn(move || {
+            let mut disk = open(end);
+            let first = disk.read(0, 2, one()).map(|m| bytes(&m, 0, 1024));
+            let last = disk.read(63, 1, one()).map(|m| bytes(&m, 0, 512));
+            (
+                disk.info().unwrap(),
+                first,
+                last,
+                (
+                    disk.read(64, 1, one()).map(|_| ()),
+                    disk.read(63, 2, one()).map(|_| ()),
+                    disk.acquire_write(),
+                    disk.write(0, 0, 1, filled(1, &[1; 512])).map(|_| ()),
+                ),
+            )
+        }),
+        |_| {},
+    );
+    assert_eq!((info.sectors, info.read_only), (64, true));
+    assert_eq!(
+        first.unwrap(),
+        data[..1024],
+        "its block 0 is the partition's first"
+    );
+    assert_eq!(
+        last.unwrap(),
+        data[63 * 512..],
+        "and its last, the partition's last"
+    );
+    assert_eq!(
+        answers,
+        (
+            remote(block::Error::OutOfRange),
+            remote(block::Error::OutOfRange),
+            remote(block::Error::ReadOnly),
+            remote(block::Error::NotWriter),
+        ),
+        "a read past its end, one that runs past it, and every write are refused"
+    );
+    // The device manager is told it as `system`: its blocks, read only, never a volume.
+    assert_eq!(
+        moruna_storvsc_server::block(&system),
+        devices_protocol::Block {
+            serial: "system".into(),
+            sector_size: 512,
+            sectors: 64,
+            read_only: true,
+            boot: true,
+        }
+    );
+    assert_eq!(
+        moruna_storvsc_server::block(&world.driver.borrow().disks().next().unwrap().clone())
+            .sectors,
+        4096
     );
 }

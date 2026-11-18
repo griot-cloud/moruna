@@ -1107,6 +1107,7 @@ dependencies = [
  "devices-protocol",
  "guestmem_core",
  "moruna-abi",
+ "moruna-disk",
  "moruna-storvsc",
  "moruna-svc",
  "moruna-sys",

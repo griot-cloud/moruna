@@ -13,7 +13,6 @@ use core::{
     sync::atomic::AtomicU8,
 };
 
-use devices_protocol::Block;
 use moruna_storvsc::{ChannelError, Storvsc, Wait};
 use moruna_storvsc_server::{
     Controller, Driver, Node, OUTGOING_PAGES, RING_PAGES, factory, plan,
@@ -281,8 +280,7 @@ fn serve(console: &Console) -> Result<(), String> {
     let vmbus_listener = Channel(take("vmbus")?);
     let devices = Channel(take("devices")?);
     let scratch = Page::new(&dma)?;
-    let (_vmbus, found) = controllers(&vmbus_listener, &scratch)?;
-    drop(scratch);
+    let (_vmbus, mut found) = controllers(&vmbus_listener, &scratch)?;
     let scans: Vec<Controller<'_>> = found
         .iter()
         .map(|(instance, _, scan)| Controller {
@@ -291,9 +289,35 @@ fn serve(console: &Console) -> Result<(), String> {
         })
         .collect();
     let plan = plan(&scans);
+    drop(scans);
     for line in &plan.lines {
         println!(console, "{}", line);
     }
+    let mut served = plan.served;
+    // The boot disk's `moruna-system` partition, served as `system` (item 3.3).
+    if let Some(boot) = served.iter().find(|s| s.name.boot).cloned() {
+        let device = &mut found[boot.controller].1;
+        match scan::system(device, &scratch, &boot.disk) {
+            Ok(Some(window)) => {
+                println!(
+                    console,
+                    "storvsc: the boot disk's {} partition, {} blocks from block {}: {}, read-only",
+                    moruna_disk::SYSTEM,
+                    window.sectors,
+                    window.first,
+                    moruna_disk::SYSTEM_SERIAL
+                );
+                served.push(moruna_storvsc_server::system(&boot, window));
+            }
+            Ok(None) => println!(
+                console,
+                "storvsc: the boot disk has no {} partition",
+                moruna_disk::SYSTEM
+            ),
+            Err(e) => println!(console, "storvsc: the boot disk's partition table: {}", e),
+        }
+    }
+    drop(scratch);
     let mut wakes = Vec::new();
     let mut devices_found = Vec::new();
     for (_, device, _) in found {
@@ -308,7 +332,7 @@ fn serve(console: &Console) -> Result<(), String> {
         console: Console(said),
         dma,
     };
-    let driver: Shared = Rc::new(RefCell::new(Driver::new(os, devices_found, plan.served)));
+    let driver: Shared = Rc::new(RefCell::new(Driver::new(os, devices_found, served)));
     let mut dispatcher = Dispatcher::new();
     let gone = Rc::new(Cell::new(false));
     for wake in wakes {
@@ -330,14 +354,7 @@ fn serve(console: &Console) -> Result<(), String> {
         dispatcher
             .listen(ours, factory(driver.clone(), index))
             .map_err(|e| format!("a disk's listener: {}", e.name()))?;
-        let block = Block {
-            serial: disk.name.serial.clone(),
-            sector_size: disk.disk.block_size(),
-            sectors: disk.disk.blocks(),
-            read_only: disk.name.read_only,
-            boot: disk.name.boot,
-        };
-        if let Err(e) = directory.register(block, theirs) {
+        if let Err(e) = directory.register(moruna_storvsc_server::block(&disk), theirs) {
             println!(
                 console,
                 "storvsc: {}: the device manager did not register it: {:?}", disk.name.serial, e

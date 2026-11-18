@@ -9,7 +9,7 @@ use moruna_storvsc_server::{
 };
 use vmbus_protocol::Guid;
 
-use crate::{Page, at, controller, fake::Fault, plan_of, scanned};
+use crate::{Page, at, controller, fake::Fault, gpt, plan_of, scanned};
 
 /// An instance of no Azure controller.
 const OTHER: Guid = Guid {
@@ -278,5 +278,49 @@ fn with_no_os_disk_every_disk_is_served_read_only_and_the_console_says_why() {
     assert_eq!(
         plan.lines[0],
         format!("storvsc: controller {ROOT}: REPORT LUNS was refused")
+    );
+}
+
+#[test]
+fn the_boot_disks_system_partition_is_found_in_its_checked_gpt() {
+    let (link, host) = controller(&[(0, 512, 4096), (1, 512, 4096), (2, 512, 4096)]);
+    {
+        let mut h = host.borrow_mut();
+        let parts = [("EFI system", 40, 99), ("moruna-system", 100, 163)];
+        gpt(&mut h.disks.get_mut(&(0, 0, 0)).unwrap().bytes, &parts);
+        gpt(&mut h.disks.get_mut(&(0, 0, 2)).unwrap().bytes, &parts);
+        // Disk 2's entries no longer match their CRC.
+        h.disks.get_mut(&(0, 0, 2)).unwrap().bytes[1024 + 40] ^= 1;
+    }
+    let page = Page(host.clone());
+    let (mut device, scan) = scanned(link, &host);
+    assert_eq!(
+        scan::system(&mut device, &page, &scan.disks[0]).unwrap(),
+        Some(moruna_disk::Slice {
+            first: 100,
+            sectors: 64
+        })
+    );
+    assert_eq!(
+        scan::system(&mut device, &page, &scan.disks[1]).unwrap(),
+        None,
+        "no partition table"
+    );
+    assert_eq!(
+        scan::system(&mut device, &page, &scan.disks[2]).unwrap(),
+        None,
+        "entries that fail their CRC"
+    );
+    // A boot disk whose system partition reaches past its end has none.
+    let (link, host) = controller(&[(0, 512, 4096)]);
+    gpt(
+        &mut host.borrow_mut().disks.get_mut(&(0, 0, 0)).unwrap().bytes,
+        &[("moruna-system", 4000, 4200)],
+    );
+    let page = Page(host.clone());
+    let (mut device, scan) = scanned(link, &host);
+    assert_eq!(
+        scan::system(&mut device, &page, &scan.disks[0]).unwrap(),
+        None
     );
 }

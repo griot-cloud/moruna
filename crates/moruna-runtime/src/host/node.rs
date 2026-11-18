@@ -138,7 +138,8 @@ pub struct NodeNeeds {
     /// sorted.
     pub hosts: Vec<String>,
     /// Each `disk://<serial>` it names, written by a sink and only read otherwise; a serial
-    /// both read and written is written. By serial.
+    /// both read and written is written; the one `staging.dir` names is written, and its
+    /// staging volume. By serial.
     pub volumes: Vec<VolumeNeed>,
     /// The kinds of its function tasks, each once, in the order the document names them: a
     /// function by its registered name (3E).
@@ -231,6 +232,24 @@ fn volume_refusals(job: &Job, attached: &[NodeVolume], refused: &mut Vec<SpecErr
             refused.push(SpecError::new(field, reason));
         }
     }
+    if let Some(serial) = job.staging.dir.as_deref().and_then(disk_serial) {
+        let reason = match attached.iter().find(|v| v.serial == serial) {
+            None => Some(format!(
+                "staging volume `{serial}` is not attached to this node: {has}; attach a disk \
+                 with that serial, or name one of them"
+            )),
+            Some(v) if v.boot => Some(format!(
+                "staging volume `{serial}` is the disk this node booted from, which is never a \
+                 job's volume: {has}"
+            )),
+            Some(v) if v.read_only => Some(format!(
+                "staging volume `{serial}` is read only on this node: a job stages on a volume \
+                 the node can write"
+            )),
+            Some(_) => None,
+        };
+        refused.extend(reason.map(|reason| SpecError::new("staging.dir", reason)));
+    }
 }
 
 /// Every `disk://` serial in `value`.
@@ -266,7 +285,11 @@ pub fn needs(job: &Job) -> NodeNeeds {
     }
     hosts.sort();
     hosts.dedup();
-    let mut volumes: std::collections::BTreeMap<String, bool> = Default::default();
+    // Each serial: whether the job writes it, and whether it stages there.
+    let mut volumes: std::collections::BTreeMap<String, (bool, bool)> = Default::default();
+    if let Some(serial) = job.staging.dir.as_deref().and_then(disk_serial) {
+        volumes.insert(serial.to_string(), (true, true));
+    }
     let mut functions: Vec<String> = Vec::new();
     for task in &job.tasks {
         let write = task.role == moruna_job::Role::Sink;
@@ -275,7 +298,10 @@ pub fn needs(job: &Job) -> NodeNeeds {
             disk_serials(value, &mut found);
         }
         for serial in found {
-            *volumes.entry(serial.to_string()).or_insert(write) |= write;
+            volumes
+                .entry(serial.to_string())
+                .or_insert((write, false))
+                .0 |= write;
         }
         if task.role == moruna_job::Role::Kernel && !functions.contains(&task.kind) {
             functions.push(task.kind.clone());
@@ -285,7 +311,11 @@ pub fn needs(job: &Job) -> NodeNeeds {
         hosts,
         volumes: volumes
             .into_iter()
-            .map(|(serial, write)| VolumeNeed { serial, write })
+            .map(|(serial, (write, staging))| VolumeNeed {
+                serial,
+                write,
+                staging,
+            })
             .collect(),
         functions,
     }
