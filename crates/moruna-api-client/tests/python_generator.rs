@@ -269,10 +269,11 @@ fn a_shape_the_generator_does_not_read_stops_it_by_name() {
         (
             |d| {
                 let node = &mut d["components"]["schemas"]["Node"];
-                node["properties"]["load"] = json!({"type": "number"});
+                node["properties"]["load"] =
+                    json!({"type": "object", "properties": {"one": {"type": "number"}}});
                 node["required"].as_array_mut().unwrap().push(json!("load"));
             },
-            "Node.load: a field schema of type 'number'",
+            "Node.load: a field schema of type 'object'",
         ),
         (
             |d| {
@@ -331,6 +332,9 @@ fn an_optional_field_and_a_query_are_generated_and_read() {
         let node = &mut d["components"]["schemas"]["Node"];
         node["properties"]["region"] = json!({"type": ["string", "null"]});
         node["properties"]["ready"] = json!({"type": "boolean"});
+        // A number, as a function's measured memory has (6.3g): a float, and an integer read
+        // as one.
+        node["properties"]["load"] = json!({"type": "number", "format": "double"});
         d["paths"]["/v1/node"]["get"]["parameters"] =
             json!([{"name": "from", "in": "query", "schema": {"type": "integer", "minimum": 0}}]);
     });
@@ -348,6 +352,8 @@ fn an_optional_field_and_a_query_are_generated_and_read() {
         "    ready: bool | None = None\n",
         "region=_maybe(data, \"region\", where, lambda at: _str(*at)),",
         "ready=_maybe(data, \"ready\", where, lambda at: _bool(*at)),",
+        "    load: float | None = None\n",
+        "load=_maybe(data, \"load\", where, lambda at: _float(*at)),",
         "        if self.region is not None:\n            data[\"region\"] = self.region\n",
         "def node(client: Caller, *, from_: int | None = None) -> Node:\n",
         "    answer = client.call(\"node\", \"GET\", \"/v1/node\" + _query(from_=from_), token=True)\n",
@@ -362,10 +368,12 @@ fn an_optional_field_and_a_query_are_generated_and_read() {
         n = m['Node'].from_json(d)\n\
         assert n.region is None and n.ready is None and n.to_json() == d, n\n\
         assert m['Node'].from_json({**d, 'region': None}).to_json() == d\n\
-        full = {**d, 'region': 'eu', 'ready': True}\n\
+        full = {**d, 'region': 'eu', 'ready': True, 'load': 0.054}\n\
         n = m['Node'].from_json(full)\n\
-        assert (n.region, n.ready) == ('eu', True) and n.to_json() == full, n\n\
-        for bad in ({**d, 'ready': 1}, {**d, 'region': 7}):\n\
+        assert (n.region, n.ready, n.load) == ('eu', True, 0.054) and n.to_json() == full, n\n\
+        whole = m['Node'].from_json({**d, 'load': 3}).load\n\
+        assert whole == 3.0 and isinstance(whole, float), whole\n\
+        for bad in ({**d, 'ready': 1}, {**d, 'region': 7}, {**d, 'load': True}, {**d, 'load': '1'}):\n\
         \x20   try:\n\
         \x20       m['Node'].from_json(bad)\n\
         \x20   except ValueError:\n\

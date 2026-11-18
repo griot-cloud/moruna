@@ -50,7 +50,7 @@ pub struct Needs {
 
 /// The engine's check of a document: its refusals, none when it would run, and what the job
 /// would take of the node.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Verdict {
     /// Every refusal, by field.
     pub refusals: Vec<Refusal>,

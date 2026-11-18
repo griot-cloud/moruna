@@ -234,6 +234,11 @@ pub struct RunSpec {
     /// it; with none, start fresh and say so in `notes`. This is what a host that restarts a
     /// destroyed machine with the same job sets.
     pub resume_auto: bool,
+    /// What each stage's function was measured to hold outside its batch, as the job came
+    /// with it (system design 3A, 3E: on a node, what the registry holds of each function the
+    /// job uses, in the `spec` message), one a stage; empty, or `None` for a stage, where it
+    /// came with none. The run sizes itself from it before what its own store holds.
+    pub measured: Vec<Option<moruna_cost::Memory>>,
     /// Clamps and translations the surface reports (12 f.3).
     pub notes: Vec<String>,
     /// The job document's content address (MH 4.1), when the run was built from one. Recorded
@@ -295,6 +300,7 @@ impl RunSpec {
             checkpoint_keep: false,
             resume: None,
             resume_auto: false,
+            measured: Vec::new(),
             notes: Vec::new(),
             spec_digest: None,
         }

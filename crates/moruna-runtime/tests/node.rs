@@ -192,7 +192,11 @@ fn serve_bounded(scratch: &Scratch, spec: Value, budget_max: Option<u64>) -> Ser
 fn serve_on(scratch: &Scratch, spec: Value, node: Option<Node>) -> Served {
     let input = scratch.path().join("in.parquet");
     let out = scratch.path().join("out");
-    let kinds = kinds(&input, &out);
+    serve_kinds(spec, node, kinds(&input, &out))
+}
+
+/// [`serve_on`] with the kinds the engine has.
+fn serve_kinds(spec: Value, node: Option<Node>, kinds: moruna_runtime::kinds::Registry) -> Served {
     let (engine, api) = Framed::pair();
     let peer = std::thread::spawn({
         let api = api.clone();
@@ -248,6 +252,204 @@ fn serve_on(scratch: &Scratch, spec: Value, node: Option<Node>) -> Served {
         bytes,
         largest: engine.largest.load(Ordering::Relaxed),
     }
+}
+
+/// A function that declares nothing about its memory and gives back what it is given: what a
+/// registered function is to the engine before anything is measured of it.
+struct Silent;
+
+impl moruna_kernel::Kernel for Silent {
+    fn fingerprint(&self) -> moruna_kernel::Fingerprint {
+        moruna_kernel::Fingerprint::compute("moruna-runtime::tests::node::Silent", b"v1")
+    }
+    fn kind(&self) -> moruna_kernel::KernelKind {
+        moruna_kernel::KernelKind::Stateless
+    }
+    fn accepts(&self) -> moruna_kernel::PayloadSpec {
+        moruna_kernel::PayloadSpec {
+            kind: moruna_kernel::PayloadKind::Table,
+            tier: moruna_kernel::TierPref::Host,
+        }
+    }
+    fn output_schema(
+        &self,
+        input: &moruna_kernel::SourceSchema,
+    ) -> moruna_kernel::Result<moruna_kernel::SourceSchema> {
+        Ok(input.clone())
+    }
+    fn init(
+        &self,
+        _ctx: &moruna_kernel::InitCtx,
+    ) -> moruna_kernel::Result<Box<dyn moruna_kernel::KernelState>> {
+        Ok(Box::new(moruna_kernel::NoState))
+    }
+    fn apply(
+        &self,
+        _state: &mut dyn moruna_kernel::KernelState,
+        input: moruna_kernel::Payload,
+    ) -> moruna_kernel::Result<moruna_kernel::Payload> {
+        Ok(input)
+    }
+}
+
+/// The `function` kind on the host, for the test: a function task, `{"function": NAME}`, runs
+/// [`Silent`]. On a node the kind runs the registered file; here only the engine's own part is
+/// under test: what it does with the facts that came with the job for the function's name.
+struct HostFunction;
+
+impl moruna_runtime::kinds::RunnableKind for HostFunction {
+    /// The node's own declaration: the test's kind stands in for it, declared the same.
+    fn declaration(&self) -> moruna_job::Declaration {
+        moruna_runtime::kinds::RunnableKind::declaration(&moruna_runtime::kinds::function::Function)
+    }
+
+    fn stage(
+        &self,
+        entry: &moruna_runtime::kinds::Entry<'_>,
+        _cx: &mut moruna_runtime::kinds::Context,
+    ) -> moruna_kernel::Result<moruna_runtime::kinds::Stage> {
+        let settings: moruna_runtime::kinds::function::Settings = entry.settings()?;
+        assert!(!settings.function.is_empty());
+        Ok(moruna_runtime::kinds::Stage::of(Arc::new(Silent)))
+    }
+}
+
+/// The share of its allowance a run left above the arena, from the report's own account of how
+/// it sized the arena (`arena sized at A bytes: S of the B byte allowance`).
+fn room_share(notes: &[Value]) -> f64 {
+    let note = notes
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|note| note.starts_with("arena sized at "))
+        .unwrap_or_else(|| panic!("the run says how it sized its arena: {notes:?}"));
+    let number_after = |marker: &str| -> f64 {
+        let rest = &note[note.find(marker).expect("the note's wording") + marker.len()..];
+        rest.split(' ')
+            .next()
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("a byte count after `{marker}` in: {note}")) as f64
+    };
+    1.0 - number_after("arena sized at ") / number_after(" of the ")
+}
+
+/// System design 3A, 3E (6.3g): on a node the measured memory of a job's functions comes with
+/// the job, in the `spec` message beside its secrets, by each function's registered name. The
+/// engine sizes its arena from it, where it sized every registered function from a fixed 4.0
+/// before; and its report returns the facts on the function's task.
+#[test]
+fn a_function_s_measured_memory_comes_with_the_job_and_sizes_the_engine() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("node_measured");
+    write_parquet(&scratch.path().join("in.parquet"), 200_000, 4);
+    let document = |function: &str| {
+        json!({
+            "moruna_spec": 1,
+            "source": {"kind": "test.rows"},
+            "kernels": [{"kind": "function", "function": function}],
+            "sink": {"kind": "test.out"},
+            "budget": {"memory_bytes": 2u64 << 30, "cpu": 2.0},
+            "report": {"file": scratch.path().join("report-<run_id>.json").to_string_lossy(),
+                       "logs": scratch.path().join("logs-<run_id>").to_string_lossy()},
+        })
+    };
+    // What the node's registry holds of two functions: one measured to hold twelve bytes of its
+    // own per byte of input and a mebibyte whatever its batch, one to hold nothing.
+    let hungry = json!({"fixed_bytes": 1048576.0, "per_input_byte": 12.0,
+                        "output_per_input_byte": 1.0, "spread": 0.0, "units": 21,
+                        "input_bytes_min": 16000, "input_bytes_max": 16000000});
+    let lean = json!({"fixed_bytes": 0.0, "per_input_byte": 0.0, "spread": 0.0, "units": 21,
+                      "input_bytes_min": 16000, "input_bytes_max": 16000000});
+    let ran = |run: &str, function: &str, measured: Option<Value>| {
+        let out = scratch.path().join(format!("out-{run}"));
+        std::fs::create_dir_all(&out).expect("out");
+        let mut kinds = kinds(&scratch.path().join("in.parquet"), &out);
+        if let Err(e) = kinds.replace_kernel(Arc::new(HostFunction)) {
+            panic!("the test's function kind stands in for the node's: {e}");
+        }
+        let mut message = json!({"spec": document(function)});
+        if let Some(measured) = measured {
+            message["measured"] = measured;
+        }
+        let node = Node {
+            channel: "channel:engine".to_string(),
+            budget_max: None,
+            volumes: None,
+        };
+        let served = serve_kinds(message, Some(node), kinds);
+        assert_eq!(
+            served.outcome.code,
+            exit::COMPLETED,
+            "{:?}",
+            served.outcome.diagnostic
+        );
+        assert_eq!(read_back_rows(&out), 200_000);
+        let report = served
+            .messages
+            .iter()
+            .find(|m| m["type"] == "report")
+            .expect("a report")["report"]
+            .clone();
+        let notes = report["notes"].as_array().expect("notes").clone();
+        let task = report["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .find(|t| t["kind"] == "function")
+            .expect("the function's task")
+            .clone();
+        (room_share(&notes), notes, task)
+    };
+    let said = |notes: &[Value], what: &str| {
+        notes
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|note| note.contains(what))
+    };
+
+    // Nothing came with the job: the function starts where one nothing is known of starts, two
+    // thirds of the allowance above the arena.
+    let (unknown, notes, task) = ran("unknown", "hungry", None);
+    assert!((unknown - 2.0 / 3.0).abs() < 0.02, "{unknown}");
+    assert!(!said(&notes, "came with the job") && task.get("measured").is_none());
+
+    // The facts came with the job, by the function's name, beside others' it does not use.
+    let both = json!({"hungry": hungry.clone(), "lean": lean.clone(), "other": lean.clone()});
+    let (room, notes, task) = ran("hungry", "hungry", Some(both.clone()));
+    assert!(
+        room > 0.8,
+        "sized for twelve bytes a byte in flight: {room}"
+    );
+    assert!(said(
+        &notes,
+        "the measured memory of the function of stage 1 came with the job"
+    ));
+    assert!(
+        said(
+            &notes,
+            "stage 1: its function's memory was measured, not assumed"
+        ) && said(&notes, "12.00 bytes a byte of input"),
+        "{notes:?}"
+    );
+    // The report returns them on the function's task.
+    assert_eq!(task["measured"], hungry);
+
+    let (room, _, task) = ran("lean", "lean", Some(both));
+    assert!(
+        room < 0.3,
+        "a function measured to hold nothing leaves the arena the room: {room}"
+    );
+    assert_eq!(task["measured"]["per_input_byte"], 0.0);
+
+    // What is not a measurement sizes nothing, and the run says so.
+    let mut wrong = hungry.clone();
+    wrong["per_input_byte"] = json!(-1.0);
+    let (room, notes, task) = ran("wrong", "hungry", Some(json!({"hungry": wrong})));
+    assert!((room - unknown).abs() < 0.02, "{room}");
+    assert!(
+        said(&notes, "for the function `hungry` is not a measurement"),
+        "{notes:?}"
+    );
+    assert!(task.get("measured").is_none());
 }
 
 fn exit_of(served: &Served) -> &Value {

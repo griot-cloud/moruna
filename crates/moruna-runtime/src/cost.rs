@@ -277,6 +277,65 @@ pub fn stage_identities(
     Ok(stages)
 }
 
+/// The schema `moruna check` keeps a function's cost against: its declared input's, as the
+/// check generates batches for it (MH 4.9). A run knows it before any source is built, so it is
+/// what a run finds a function's warm-up by when it sizes itself. `None` for a function that
+/// declares no input it can be checked on, which has no warm-up.
+pub fn declared_schema(kernel: &dyn moruna_kernel::Kernel) -> Option<moruna_cost::Digest> {
+    let schema = kernel.declared().input?.synthetic_schema().ok()?;
+    Some(moruna_cost::Digest(
+        moruna_kernel::SourceSchema::Table(schema).hash(),
+    ))
+}
+
+/// The identity a function this process holds is costed under (system design 3A; item 6.3g):
+/// its kind, the kernel's own fingerprint (`fingerprint: None`), and no settings but its
+/// params, when it has any. It is what `moruna check` keeps a function's warm-up against, so a
+/// run that holds the function finds what its check measured. An image task's build key, digest
+/// and location say where the function is packaged, not what it is, and a check knows none.
+pub fn held_function(
+    kind: &str,
+    params: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> StageCost {
+    let settings = match params.filter(|params| !params.is_empty()) {
+        Some(params) => serde_json::json!({ "params": params }),
+        None => serde_json::Value::Null,
+    };
+    StageCost {
+        kind: kind.to_string(),
+        settings: registration_settings(kind, &settings),
+        fingerprint: None,
+    }
+}
+
+/// [`stage_identities`], with each stage whose function this process holds (`held[stage]`: a
+/// library run's Python function, the object itself and not an image of it) kept as
+/// [`held_function`] keeps it. A stage of several tasks fused into one is its own work and
+/// keeps the stage's identity.
+pub fn identities_holding(
+    job: &moruna_job::Job,
+    parts: &crate::job::Parts,
+    held: &[bool],
+) -> Result<Vec<StageCost>> {
+    let mut stages = stage_identities(job, parts)?;
+    for (at, members) in parts.stages.iter().enumerate() {
+        if held.get(at) != Some(&true) {
+            continue;
+        }
+        if let [task] = members.as_slice()
+            && let Some(task) = job.tasks.get(*task)
+        {
+            stages[at] = held_function(
+                &task.kind,
+                task.settings
+                    .get("params")
+                    .and_then(serde_json::Value::as_object),
+            );
+        }
+    }
+    Ok(stages)
+}
+
 /// One live model/store authority and the stages whose real measurements teach it.
 #[derive(Clone)]
 pub struct RunLearning {
@@ -315,6 +374,57 @@ impl RunLearning {
             stages: stage_identities(job, parts)?,
         })
     }
+    /// What each stage's function was measured to hold outside its batch (system design 3A:
+    /// a function's memory is measured, never assumed): the memory its history carries under
+    /// the key `moruna check` kept its warm-up against ([`declared_schema`]), the newest
+    /// record's. A run asks before it sizes anything, when no source is built and no real
+    /// schema is known. `None` for a stage with no measurement: a function that declares no
+    /// input, one never checked into this store, or one whose record is not a measurement.
+    /// Refused when the stages are not the kernels', or the store cannot be read.
+    pub fn measured(
+        &self,
+        kernels: &[Arc<dyn moruna_kernel::Kernel>],
+    ) -> Result<Vec<Option<moruna_cost::Memory>>> {
+        if self.stages.len() != kernels.len() {
+            return Err(MorunaError::Plan(
+                "cost identities must match executable kernel stages".into(),
+            ));
+        }
+        self.stages
+            .iter()
+            .zip(kernels)
+            .map(|(identity, kernel)| {
+                let Some(schema) = declared_schema(kernel.as_ref()) else {
+                    return Ok(None);
+                };
+                let key = moruna_cost::CostKey {
+                    role: moruna_job::Role::Kernel,
+                    kind: identity.kind.clone(),
+                    fingerprint: identity
+                        .fingerprint
+                        .unwrap_or(moruna_cost::Digest(kernel.fingerprint().0)),
+                    settings: identity.settings,
+                    schema,
+                };
+                let history =
+                    self.online
+                        .store()
+                        .scan(&key)
+                        .map_err(|error| MorunaError::Config {
+                            name: "cost",
+                            msg: format!(
+                                "the observation store could not be read for a function's measured \
+                             memory: {error}"
+                            ),
+                        })?;
+                Ok(history
+                    .memory()
+                    .filter(|memory| memory.check().is_ok())
+                    .cloned())
+            })
+            .collect()
+    }
+
     /// Actual executable keys installed in the live scheduler; registration conformance uses
     /// this same entry point, not a second reconstruction of fingerprints/schema/settings.
     pub fn keys(
@@ -504,6 +614,276 @@ mod tests {
             Some(0.01)
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod measured_tests {
+    use super::*;
+    use moruna_cost::{
+        CostKey, Digest, History, Inputs, Memory, Observation, ObservationSource, Origin, Outcome,
+    };
+    use moruna_kernel::arrow::datatypes::{DataType, Field, Schema};
+    use moruna_kernel::declare::{Declared, SchemaDecl};
+    use moruna_kernel::{
+        Fingerprint, InitCtx, Kernel, KernelKind, KernelState, NoState, Payload, PayloadKind,
+        PayloadSpec, SourceSchema, TierPref,
+    };
+
+    /// A function that declares the one-column input it takes, or declares nothing.
+    struct Function {
+        declares: bool,
+    }
+
+    impl Kernel for Function {
+        fn fingerprint(&self) -> Fingerprint {
+            Fingerprint::compute("moruna-runtime::cost::measured_tests::Function", b"v1")
+        }
+        fn kind(&self) -> KernelKind {
+            KernelKind::Stateless
+        }
+        fn declared(&self) -> Declared {
+            let schema = Schema::new(vec![Field::new("value", DataType::Int64, false)]);
+            Declared {
+                input: self.declares.then(|| SchemaDecl::from_schema(&schema)),
+                output: None,
+            }
+        }
+        fn accepts(&self) -> PayloadSpec {
+            PayloadSpec {
+                kind: PayloadKind::Table,
+                tier: TierPref::Host,
+            }
+        }
+        fn output_schema(&self, input: &SourceSchema) -> Result<SourceSchema> {
+            Ok(input.clone())
+        }
+        fn init(&self, _ctx: &InitCtx) -> Result<Box<dyn KernelState>> {
+            Ok(Box::new(NoState))
+        }
+        fn apply(&self, _state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
+            Ok(input)
+        }
+    }
+
+    fn identity(settings: u8, fingerprint: Option<Digest>) -> StageCost {
+        StageCost {
+            kind: "rust".into(),
+            settings: Digest([settings; 32]),
+            fingerprint,
+        }
+    }
+
+    /// A warm-up record of `kernel` under `settings`, carrying a line of `rate` bytes a byte.
+    fn warmed(kernel: &dyn Kernel, settings: u8, rate: f64, at_ms: u64) -> Observation {
+        let key = CostKey {
+            role: moruna_job::Role::Kernel,
+            kind: "rust".into(),
+            fingerprint: Digest(kernel.fingerprint().0),
+            settings: Digest([settings; 32]),
+            schema: declared_schema(kernel).expect("it declares its input"),
+        };
+        let mut inputs = Inputs::batch(10, 100);
+        inputs.kernel.memory = Memory::fit(&[(1e6, rate * 1e6), (2e6, rate * 2e6)], Some(0.5));
+        Observation::new(key, inputs, Outcome::new(Origin::WarmUp), at_ms)
+    }
+
+    #[test]
+    fn a_run_reads_a_function_s_measured_memory_by_the_key_its_check_kept() {
+        let dir = std::env::temp_dir().join(format!("moruna-cost-measured-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cost = CostSettings::directory(&dir).open().expect("opens");
+        let store = cost.store().clone();
+        let online = cost.into_online();
+        let function: Arc<dyn Kernel> = Arc::new(Function { declares: true });
+        let learning = |stage: StageCost| RunLearning {
+            online: online.clone(),
+            stages: vec![stage],
+        };
+        let rate = |learning: &RunLearning| -> Vec<Option<f64>> {
+            learning
+                .measured(std::slice::from_ref(&function))
+                .expect("read")
+                .iter()
+                .map(|m| m.as_ref().map(|m| m.per_input_byte))
+                .collect()
+        };
+
+        // Never checked into this store: no measurement.
+        assert_eq!(rate(&learning(identity(2, None))), vec![None]);
+
+        // Checked twice: the newer warm-up's line answers.
+        store
+            .append(&warmed(function.as_ref(), 2, 3.0, 1))
+            .expect("kept");
+        store
+            .append(&warmed(function.as_ref(), 2, 5.0, 2))
+            .expect("kept");
+        assert_eq!(rate(&learning(identity(2, None))), vec![Some(5.0)]);
+        // The identity's own fingerprint is the key's, when the job names one.
+        let named = Digest(function.fingerprint().0);
+        assert_eq!(rate(&learning(identity(2, Some(named)))), vec![Some(5.0)]);
+        assert_eq!(
+            rate(&learning(identity(2, Some(Digest([7; 32]))))),
+            vec![None]
+        );
+        // Other settings are other work.
+        assert_eq!(rate(&learning(identity(9, None))), vec![None]);
+
+        // A function that declares no input was never checked, whatever the store holds.
+        let undeclared: Arc<dyn Kernel> = Arc::new(Function { declares: false });
+        assert_eq!(declared_schema(undeclared.as_ref()), None);
+        assert_eq!(
+            learning(identity(2, None))
+                .measured(&[undeclared])
+                .expect("read"),
+            vec![None]
+        );
+        // The stages are the kernels', or it is refused.
+        assert!(learning(identity(2, None)).measured(&[]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A function this process holds is costed as its check keeps it: by its kind and its
+    /// own fingerprint, with its params when it has any, whatever its image task's settings
+    /// say of where it is packaged.
+    #[test]
+    fn a_function_this_process_holds_is_costed_as_its_check_keeps_it() {
+        use moruna_job::{Edge, Job, KindDoc, Task};
+        let settings = |value: serde_json::Value| match value {
+            serde_json::Value::Object(map) => map,
+            _ => panic!("an object"),
+        };
+        let image = |params: serde_json::Value| {
+            let mut doc = settings(serde_json::json!({
+                "image": {"build_key": format!("sha256:{}", "ab".repeat(32)),
+                          "digest": null, "location": null},
+                "entry": "jobs:score",
+            }));
+            if !params.is_null() {
+                doc.insert("params".into(), params);
+            }
+            KindDoc::new("image", doc)
+        };
+        let job = Job::new(
+            vec![
+                Task::source("rows", KindDoc::new("parquet", serde_json::Map::new())),
+                Task::kernel("score", image(serde_json::Value::Null)),
+                Task::kernel("scale", image(serde_json::json!({"by": 2}))),
+                Task::sink("out", KindDoc::new("parquet", serde_json::Map::new())),
+            ],
+            vec![
+                Edge::new("rows", "out", "score", "in"),
+                Edge::new("score", "out", "scale", "in"),
+                Edge::new("scale", "out", "out", "in"),
+            ],
+        );
+        let parts = crate::job::Parts {
+            sources: vec![0],
+            stages: vec![vec![1], vec![2]],
+            sinks: vec![3],
+        };
+        let by_job = stage_identities(&job, &parts).expect("the job's");
+        assert!(by_job[0].fingerprint.is_some(), "the image's build key");
+
+        // What a check of the function keeps it against: its kind, no settings.
+        let checked = registration_settings("image", &serde_json::Value::Null);
+        let held = identities_holding(&job, &parts, &[true, true]).expect("held");
+        assert_eq!(held[0].kind, "image");
+        assert_eq!(held[0].settings, checked);
+        assert_eq!(held[0].fingerprint, None, "the kernel's own stands");
+        assert_eq!(held[0].settings, held_function("image", None).settings);
+        // Params are part of what the function is; other settings are not.
+        assert_ne!(held[1].settings, checked);
+        assert_ne!(held[1].settings, by_job[1].settings);
+
+        // A stage the process does not hold keeps the job's identity, and so does a fused one.
+        let some = identities_holding(&job, &parts, &[false, true]).expect("held");
+        assert_eq!(some[0].settings, by_job[0].settings);
+        assert_eq!(some[0].fingerprint, by_job[0].fingerprint);
+        let fused = crate::job::Parts {
+            stages: vec![vec![1, 2]],
+            ..parts.clone()
+        };
+        let one = identities_holding(&job, &fused, &[true]).expect("held");
+        assert_eq!(one[0].kind, "fused");
+        assert_eq!(
+            identities_holding(&job, &parts, &[]).expect("none held")[1].settings,
+            by_job[1].settings
+        );
+    }
+
+    /// A store that keeps one history, as it is, or cannot be read.
+    struct Fixed(Option<History>);
+
+    impl ObservationSource for Fixed {
+        fn scan(&self, key: &CostKey) -> moruna_cost::Result<History> {
+            match &self.0 {
+                Some(history) => Ok(History {
+                    key: key.clone(),
+                    ..history.clone()
+                }),
+                None => Err(CostError::Invalid("the store is away".into())),
+            }
+        }
+        fn scan_all(
+            &self,
+            _each: &mut dyn FnMut(History) -> moruna_cost::Result<()>,
+        ) -> moruna_cost::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ObservationStore for Fixed {
+        fn append(&self, _observation: &Observation) -> moruna_cost::Result<()> {
+            Ok(())
+        }
+        fn save_state(&self, _model: &ModelId, _state: &[u8]) -> moruna_cost::Result<()> {
+            Ok(())
+        }
+        fn load_state(&self, _model: &ModelId) -> moruna_cost::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+    }
+
+    fn over(store: Fixed) -> RunLearning {
+        RunLearning {
+            online: CostSettings::embedder(Arc::new(store))
+                .open_online()
+                .expect("opens"),
+            stages: vec![identity(2, None)],
+        }
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_read_or_holds_no_measurement_gives_none() {
+        let function: Arc<dyn Kernel> = Arc::new(Function { declares: true });
+        let away = over(Fixed(None))
+            .measured(std::slice::from_ref(&function))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            away.contains("could not be read") && away.contains("the store is away"),
+            "{away}"
+        );
+
+        // A record whose memory is not a measurement (a store written by hand) is not one.
+        let mut wrong = warmed(function.as_ref(), 2, 3.0, 1);
+        if let Some(memory) = wrong.inputs.kernel.memory.as_mut() {
+            memory.per_input_byte = -1.0;
+        }
+        let history = History {
+            key: wrong.key.clone(),
+            summary: None,
+            observations: vec![wrong],
+            torn: 0,
+        };
+        assert_eq!(
+            over(Fixed(Some(history)))
+                .measured(std::slice::from_ref(&function))
+                .expect("read"),
+            vec![None]
+        );
     }
 }
 

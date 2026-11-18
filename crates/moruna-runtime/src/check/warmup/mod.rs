@@ -8,7 +8,9 @@
 //! 1. **data** ([`data`]): batches from the input schema, honouring the embedder's table
 //!    statistics, key columns uniform and skewed, byte-exact from the seed;
 //! 2. **sizes**: [`SIZES`] rows, [`REPETITIONS`] each, stopping when the model's residual is
-//!    small or the budget is spent;
+//!    small or the budget is spent; from them the function's own memory outside its batch, as
+//!    a line over the batch's bytes with its margin (system design 3A: a function's memory is
+//!    measured, never assumed), which a run sizes the room above its arena from;
 //! 3. **start-up**: the first invocation of a freshly made kernel, cold, and a second, warm;
 //! 4. **scaling**: the largest size measured, at each of [`WORKERS`];
 //! 5. **state**: a stateful kind at increasing distinct counts, and once with a checkpoint;
@@ -536,6 +538,8 @@ struct Unit {
     workers: u32,
     inputs: Inputs,
     outcome: Outcome,
+    /// What its peak held outside the arena: the function's own memory, beside its batch.
+    outside: Option<u64>,
     predicted: UnitCost,
     at_ms: u64,
 }
@@ -919,6 +923,7 @@ impl Run<'_> {
             workers: measured.workers,
             inputs,
             outcome: measured.outcome,
+            outside: measured.outside,
             predicted,
             at_ms: now_ms(),
         });
@@ -958,6 +963,35 @@ impl Run<'_> {
             };
             self.facts.peak_per_byte = per_byte(Target::PeakMemory);
             self.facts.retained_per_byte = per_byte(Target::RetainedMemory);
+        }
+        // What one call holds outside its batch (system design 3A): a line through every unit
+        // of the sizes, one worker each, uniform keys and skewed alike, since the room a run
+        // sets aside must hold either; and what the function gives per byte it takes.
+        let every_size: Vec<&Unit> = self
+            .units
+            .iter()
+            .filter(|u| u.phase == Phase::Sizes)
+            .collect();
+        let held: Vec<(f64, f64)> = every_size
+            .iter()
+            .filter_map(|u| Some((u.inputs.data.bytes? as f64, u.outside? as f64)))
+            .collect();
+        let given = median(
+            every_size
+                .iter()
+                .filter_map(|u| {
+                    let bytes = u.inputs.data.bytes? as f64;
+                    (bytes > 0.0).then(|| u.outcome.get(Target::BytesOut).map(|out| out / bytes))?
+                })
+                .collect(),
+        );
+        self.facts.memory = moruna_cost::Memory::fit(&held, given);
+        if self.facts.memory.is_none() && !every_size.is_empty() {
+            self.notes.push(
+                "no unit's memory outside its batch was measured, so the function has no \
+                 measured room: a run sizes it as a function nothing is known of"
+                    .into(),
+            );
         }
         let scaling = |workers: u32| {
             median(
@@ -1242,6 +1276,18 @@ pub(super) fn summary(report: &WarmUpReport) -> String {
     if let Some(b) = k.state_per_key_bytes {
         facts.push(format!("state {b:.1} bytes per key"));
     }
+    if let Some(m) = &k.memory {
+        facts.push(format!(
+            "its own memory {} plus {:.2} bytes a byte of input, margin {:.0}% ({} units of {} \
+             to {} of input)",
+            bytes(m.fixed_bytes),
+            m.per_input_byte,
+            m.margin() * 100.0,
+            m.units,
+            bytes(m.input_bytes_min as f64),
+            bytes(m.input_bytes_max as f64),
+        ));
+    }
     if let (Some(s), Some(b)) = (k.checkpoint_seconds, k.checkpoint_bytes) {
         facts.push(format!("checkpoint {} in {}", bytes(b), seconds(s)));
     }
@@ -1419,6 +1465,9 @@ mod tests {
         state_per_key: Option<f64>,
         starts: [f64; 2],
         fail_from: Option<u64>,
+        /// What a call holds outside its batch: bytes whatever the batch, and bytes per byte
+        /// of it. `None`: the bench could not measure it.
+        own: Option<(u64, f64)>,
     }
 
     impl Truth {
@@ -1430,6 +1479,7 @@ mod tests {
                 state_per_key: None,
                 starts: [0.05, 0.01],
                 fail_from: None,
+                own: Some((0, 1.0)),
             }
         }
 
@@ -1508,6 +1558,10 @@ mod tests {
                 },
                 workers,
                 outcome,
+                outside: self
+                    .truth
+                    .own
+                    .map(|(fixed, per_byte)| fixed + (per_byte * bytes as f64) as u64),
                 checkpoint: checkpoint.then_some((0.002, distinct * 8)),
             })
         }
@@ -1802,6 +1856,82 @@ mod tests {
         assert!(report.kernel.per_batch_seconds.expect("fixed").abs() < 1e-12);
         assert_eq!(report.kernel.peak_per_byte, Some(2.0));
         assert_eq!(report.kernel.retained_per_byte, Some(1.0));
+    }
+
+    /// System design 3A, item 6.3g: the function's own memory is the line through the sizes'
+    /// units, with the units and the range it was fitted from, and it is in every record.
+    #[test]
+    fn cm_t69_the_function_s_own_memory_is_a_line_over_the_sizes() {
+        let mut truth = Truth::linear(1e-6);
+        truth.own = Some((3 << 20, 12.0));
+        let (mut warm, dir) = warm(truth, 1.0, 600.0);
+        let plan = Plan {
+            sizes: SIZES.iter().map(|&r| (r, true)).collect(),
+            bytes_per_row: BYTES_PER_ROW as f64,
+            has_keys: true,
+            notes: Vec::new(),
+        };
+        let fake = Fake {
+            truth,
+            clock: 0.0,
+            units: std::rc::Rc::default(),
+        };
+        let mut run = Run::new(
+            plan,
+            kind(false, usize::MAX),
+            &mut warm,
+            Box::new(fake),
+            key(),
+            7,
+        );
+        run.start();
+        let report = ok(run.complete());
+        let memory = report.kernel.memory.clone().expect("measured");
+        assert!(
+            (memory.fixed_bytes - f64::from(3 << 20)).abs() < 1.0,
+            "{memory:?}"
+        );
+        assert!((memory.per_input_byte - 12.0).abs() < 1e-9, "{memory:?}");
+        assert_eq!(memory.output_per_input_byte, Some(1.0));
+        assert!(memory.margin() < 1e-9, "a line has no margin: {memory:?}");
+        // The sizes stopped on the residual after 100,000 rows: three sizes, three times,
+        // uniform and skewed, and none of the scaling's units.
+        assert_eq!(memory.units, 18);
+        assert_eq!(
+            (memory.input_bytes_min, memory.input_bytes_max),
+            (1_000 * BYTES_PER_ROW, 100_000 * BYTES_PER_ROW)
+        );
+        assert!(summary(&report).contains(
+            "its own memory 3.0 MiB plus 12.00 bytes a byte of input, margin 0% (18 units of \
+             15.6 KiB to 1.5 MiB of input)"
+        ));
+        // Every stored record carries it, so a run that opens the store reads it by the key.
+        let store = moruna_cost::LocalStore::open(&dir).expect("store");
+        let history = store.scan(&key()).expect("scans");
+        assert_eq!(history.observations.len() as u64, report.observations);
+        assert!(
+            history
+                .observations
+                .iter()
+                .all(|o| o.inputs.kernel.memory.as_ref() == Some(&memory))
+        );
+        assert_eq!(history.memory(), Some(&memory));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cm_t69_a_function_whose_memory_was_not_measured_has_no_measured_room() {
+        let mut truth = Truth::linear(1e-6);
+        truth.own = None;
+        let (report, _) = warmed(truth, 1.0, 600.0, kind(false, usize::MAX));
+        let report = ok(report);
+        assert_eq!(report.kernel.memory, None);
+        assert!(
+            report.notes.iter().any(|n| n.contains("no measured room")),
+            "{:?}",
+            report.notes
+        );
+        assert!(!summary(&report).contains("its own memory"));
     }
 
     #[test]

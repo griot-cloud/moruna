@@ -266,6 +266,46 @@ def test_publish_signs_uploads_and_registers(tmp_path: Path, store: Any, operato
         base64.b64decode(registration.signature), bytes.fromhex(image.sha256)
     )
     assert store.objects[object_path] == b"an image of add-one"
+    assert registration.measured is None, "nothing was measured of it"
+
+
+def test_what_a_check_measured_is_what_a_registration_carries(
+    tmp_path: Path, store: Any, operator: Any
+) -> None:
+    """System design 3A, 3E (6.3g): the memory a check's warm-up fitted, read from the check's
+    report of the function, goes with the registration, outside what is signed."""
+    memory = {
+        "fixed_bytes": 1310720.0, "per_input_byte": 0.054, "output_per_input_byte": 0.21,
+        "spread": 0.02, "units": 21, "input_bytes_min": 149000, "input_bytes_max": 33525000,
+    }  # fmt: skip
+    measured = register.measured({"verdict": "agreed", "warm_up": {"kernel": {"memory": memory}}})
+    assert measured is not None
+    assert (measured.fixed_bytes, measured.per_input_byte, measured.units) == (1310720.0, 0.054, 21)
+    assert (measured.input_bytes_min, measured.input_bytes_max) == (149000, 33525000)
+    assert measured.output_per_input_byte == 0.21 and measured.spread == 0.02
+    # No output said by any unit: the member is absent.
+    quiet = {k: v for k, v in memory.items() if k != "output_per_input_byte"}
+    assert register.measured({"warm_up": {"kernel": {"memory": quiet}}}).output_per_input_byte is None
+    # A check that measured nothing carries nothing: not checked, stopped, or failed.
+    for report in (
+        {"verdict": "not_checkable"},
+        {"verdict": "agreed", "warm_up": {"error": "the store refused a record"}},
+        {"verdict": "agreed", "warm_up": {"kernel": {"peak_per_byte": 2.0}}},
+    ):
+        assert register.measured(report) is None
+
+    image = archive(tmp_path, b"an image of add-one")
+    node = Node()
+    register.publish(
+        image, node, name="add-one", store=f"{store.url}/functions?{SAS}", key=pkcs8(operator),
+        context=store.context(), measured=measured,
+    )  # fmt: skip
+    (registration,) = node.registered
+    assert registration.measured is measured
+    # The signature is over the image's SHA-256 alone, with or without a measurement.
+    operator.public_key().verify(
+        base64.b64decode(registration.signature), bytes.fromhex(image.sha256)
+    )
 
 
 def test_nothing_is_uploaded_when_the_name_or_the_key_is_refused(

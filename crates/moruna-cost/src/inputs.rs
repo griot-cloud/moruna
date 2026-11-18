@@ -223,6 +223,11 @@ pub struct Kernel {
     /// Speed-up at 4 workers over 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speedup_4: Option<f64>,
+    /// What one call holds outside its batch, measured (system design 3A): a line over the
+    /// batch's bytes, with the units and the range it was fitted from. A run sizes the room
+    /// above its arena from it; `peak_per_byte` is the whole peak, the batch included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<crate::memory::Memory>,
 }
 
 /// Section 3.3: what the run is given and what is free.

@@ -39,6 +39,22 @@ def add_one(batch):
     return batch
 
 
+@moruna.function(
+    input_schema=pa.schema([pa.field("value", pa.int64(), nullable=False)]),
+    output_schema={"adds": {}},
+)
+def keep(batch):
+    return batch
+
+
+@moruna.function(
+    input_schema=pa.schema([pa.field("value", pa.int64(), nullable=False)]),
+    output_schema=pa.schema([pa.field("other", pa.int64(), nullable=False)]),
+)
+def wrong(batch):
+    return batch
+
+
 class Scored(moruna.Function):
     """Scores rows."""
 
@@ -129,6 +145,72 @@ def test_a_decorated_function_is_registered_by_its_name(project, tmp_path: Path)
         assert hashlib.sha256(header).hexdigest() == layer["seal"]
         at += span["pages"] * PAGE
     assert at == len(uploaded)
+
+
+def _pem() -> bytes:
+    return ed25519.Ed25519PrivateKey.generate().private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    )
+
+
+def test_a_function_is_registered_with_what_was_measured_of_it(project, tmp_path: Path) -> None:
+    """System design 3A, 3E (6.3g): a function a check can check is warmed up as ``moruna check``
+    does it, and what its warm-up fitted of its memory goes with the registration."""
+    _, wheels, runtime, scoring, store = project
+    node = Node()
+    cost = moruna.CostSession(str(tmp_path / "observations"))
+    moruna.register(
+        scoring.keep, node, store=f"{store.url}/f", key=_pem(), budget=20.0, cost=cost,
+        **options(wheels, runtime, tmp_path),
+    )  # fmt: skip
+    (registration,) = node.registered
+    measured = registration.measured
+    assert isinstance(measured, moruna.api.Measured)
+    assert measured.units >= 3 and measured.input_bytes_min < measured.input_bytes_max
+    assert measured.fixed_bytes >= 0 and 0 <= measured.per_input_byte < 1
+    assert measured.spread >= 0 and measured.output_per_input_byte is not None
+    # Its warm-up's units went to the store the registration was given.
+    assert any((tmp_path / "observations").rglob("*.seg"))
+
+    # A measurement given is sent as it is, and no warm-up runs; `warm_up=False` sends none.
+    given = moruna.api.Measured(
+        fixed_bytes=1310720.0, per_input_byte=0.054, output_per_input_byte=0.21, spread=0.02,
+        units=21, input_bytes_min=149000, input_bytes_max=33525000,
+    )  # fmt: skip
+    moruna.register(
+        scoring.keep, node, store=f"{store.url}/f", key=_pem(), measured=given,
+        **options(wheels, runtime, tmp_path),
+    )  # fmt: skip
+    assert node.registered[-1].measured is given
+    moruna.register(
+        scoring.keep, node, store=f"{store.url}/f", key=_pem(), warm_up=False,
+        **options(wheels, runtime, tmp_path),
+    )  # fmt: skip
+    assert node.registered[-1].measured is None
+
+
+def test_a_function_a_check_cannot_measure_is_registered_with_nothing_measured(
+    project, tmp_path: Path, recwarn: pytest.WarningsRecorder
+) -> None:
+    """A function that declares no schemas is not checked, nor is a class's instance: each is
+    registered as before, with nothing said. One whose check does not agree is registered too,
+    with a warning that says why nothing was measured of it."""
+    _, wheels, runtime, scoring, store = project
+    node = Node()
+    for function, name in ((scoring.add_one, "add_one"), (scoring.Scored(), "scored")):
+        moruna.register(
+            function, node, store=f"{store.url}/f", key=_pem(), name=name,
+            **options(wheels, runtime, tmp_path),
+        )  # fmt: skip
+        assert node.registered[-1].measured is None
+    assert not [w for w in recwarn.list if "moruna.register" in str(w.message)]
+
+    with pytest.warns(RuntimeWarning, match="nothing was measured of 'wrong'"):
+        moruna.register(
+            scoring.wrong, node, store=f"{store.url}/f", key=_pem(),
+            **options(wheels, runtime, tmp_path),
+        )  # fmt: skip
+    assert node.registered[-1].name == "wrong" and node.registered[-1].measured is None
 
 
 def test_a_function_class_is_registered_under_the_name_given(project, tmp_path: Path) -> None:

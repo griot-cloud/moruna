@@ -75,8 +75,11 @@ pub(crate) const FREEZE_MEAN_OVER: usize = 10;
 pub(crate) const SAMPLER_STALL_TICKS: u32 = 100;
 /// The highest safety multiplier a breach may raise a stage to (RC-I4).
 pub(crate) const SAFETY_CAP: f32 = 3.0;
-/// The lowest amplification the controller will believe (h, edge cases).
-pub(crate) const MIN_AMPLIFICATION: f64 = 0.5;
+/// The lowest amplification the controller will believe (h, edge cases). Public so the facade
+/// sizes its arena against it: a function measured to hold less outside the arena is still
+/// planned at this, so an arena sized over that room is one the controller cannot fill (system
+/// design 3A, item 6.3g).
+pub const MIN_AMPLIFICATION: f64 = 0.5;
 
 /// Readings f.3's two-term fit needs before it believes a slope rather than the probe's seed.
 ///

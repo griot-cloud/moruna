@@ -952,9 +952,28 @@ def register(  # noqa: PLR0913, the build's keywords as ``job.build`` takes them
     index_url: str | None = None,
     find_links: Sequence[str] = (),
     no_index: bool = False,
+    warm_up: bool = True,
+    budget: float = 60.0,
+    statistics: Any = None,
+    seed: int = 0,
+    cost: Any = None,
+    measured: Any = None,
 ) -> Any:
     """Register the function ``fn`` on the node ``client`` (a ``moruna.api.Client`` with an admin
     token) by name, for a job to run there (system design 3E and 5C, work item 5.4).
+
+    The function's memory goes with it, measured and never assumed (system design 3A): a
+    function ``moruna check`` can check (one that declares the schemas it takes and gives) is
+    checked and warmed up here first, as ``moruna.check`` does it (``budget`` seconds at most,
+    ``statistics`` the input table's, ``seed`` the generated batches', ``cost`` the
+    ``moruna.CostSession`` its observations go to, else the default store), and what its
+    warm-up fitted of the memory one call holds outside its batch is sent with the
+    registration. The node sizes a job that uses the function from it, until its own readings
+    replace it. ``measured`` gives that measurement instead (a ``moruna.api.Measured``, as an
+    earlier job's report returned it); ``warm_up=False`` sends none. A function with none, as
+    one that declares no schemas has none, is measured by the node on the first job that runs
+    it. A check that does not agree, or a warm-up that fails, is said in a ``RuntimeWarning``
+    and the function is registered with nothing measured.
 
     Its image is built as ``job.build`` builds one, for ``platform`` (the node's,
     ``linux/x86_64``, by default) into the OCI layout ``out``; converted here into the layer
@@ -1001,10 +1020,48 @@ def register(  # noqa: PLR0913, the build's keywords as ``job.build`` takes them
         built = _build.build_images([task], options)[0]
     except (ValueError, _closure.Unresolved, _build.Refused) as exc:
         raise _config_error(f"register refused: {exc}") from exc
+    if measured is None and warm_up:
+        measured = _measured(fn, name, seed=seed, budget=budget, statistics=statistics, cost=cost)
     with tempfile.TemporaryDirectory(prefix="moruna-register-") as work:
         return _register.register_built(
-            built, client, name=name, store=store, key=key, work=Path(work)
+            built, client, name=name, store=store, key=key, work=Path(work), measured=measured
         )
+
+
+def _measured(
+    fn: Any, name: str, *, seed: int, budget: float, statistics: Any, cost: Any
+) -> Any:
+    """What ``moruna check`` measures of the memory ``fn`` holds outside its batch, as a
+    registration carries it (system design 3A); ``None`` for a function a check cannot run (a
+    class's instance, or a function that declares no schemas), and, with a warning that says
+    why, for one whose check does not agree or whose warm-up measured nothing."""
+    import warnings  # noqa: PLC0415
+
+    from moruna import _check, _register  # noqa: PLC0415
+
+    if not (isinstance(fn, _Handle) and isinstance(fn._handle, _core.KernelSpec)):
+        return None
+    # First without warm-up, which opens no observation store: a function that declares no
+    # schemas is not checked, and is registered as it always was.
+    plain = _check._warm_up(False, None, budget, None, None, None)
+    report = _check.check_one(name, fn._handle, seed, plain)
+    if report.get("verdict") == "agreed":
+        warm = _check._warm_up(True, None, budget, statistics, None, cost)
+        report = _check.check_one(name, fn._handle, seed, warm)
+    found = _register.measured(report)
+    if found is None and report.get("verdict") != "not_checkable":
+        why = (
+            report.get("reason")
+            or (report.get("warm_up") or {}).get("error")
+            or "its warm-up measured no memory"
+        )
+        warnings.warn(
+            f"moruna.register: nothing was measured of {name!r} ({why}); it is registered "
+            "with no measured memory, and the node measures it on the first job that runs it",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return found
 
 
 # ---------------------------------------------------------------------------------------------

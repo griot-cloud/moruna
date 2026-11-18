@@ -88,6 +88,7 @@ Each task's `key` is exactly its name in the spec: a host joins a report to the 
 | `input_wait_ms`, `output_wait_ms` | Between two of its morsels, the time its instances waited for the next input to be ready, and the time they waited with it ready (held back by memory admission or a full queue downstream), summed over instances. |
 | `needs` | Per need: `calls`, `bytes_in`, `bytes_out` and `time_ms`. A task this process ran is measured through the object the resolver supplied; an image task at its port. |
 | `planned` | With a plan: its `step`, the plan's prediction per morsel (`duration_ms` and `memory_bytes`, each `p50`, `p95`, `basis` and `observations`), and what was observed per morsel beside it. |
+| `measured` | For a function a node registered: the memory measured of it that came with the job, as the node's registry holds it (`fixed_bytes`, `per_input_byte`, `output_per_input_byte`, `spread`, `units`, `input_bytes_min`, `input_bytes_max`), which the run was sized from. Keep it, and send it with the function's next registration. Absent when nothing measured came with the job. |
 | `observation` | Its measurement in the form the cost model stores (`moruna-cost`); see below. |
 | `recommendation` | For the next run: `memory` (`value_bytes`), `cpu` (`value_cores`), `instances` (`value`) and `morsel_duration_ms` (`p50`, `p95`), each with its `basis` as data; see below. |
 
@@ -95,7 +96,7 @@ Each task's `key` is exactly its name in the spec: a host joins a report to the 
 
 A task's `observation` is what the cost model keeps of it, under its full cost key, so the observations of one task from different runs aggregate:
 
-- `key`: `role`, `kind`, `fingerprint` (the code it runs: an image task's build key, or its manifest's digest for an image Moruna did not build; a built-in function's kernel fingerprint, its program; a built-in source's or sink's, the digest of its kind's declaration in the catalogue), `settings` (the digest of its settings, as registration digests them) and `schema` (the hash of the schema it takes in; a source's, the schema it gives). A function fused with others is observed as its stage, kind `fused`, on the stage's first task; the others have none.
+- `key`: `role`, `kind`, `fingerprint` (the code it runs: a Python function the run holds, the function's own fingerprint, as `moruna check` keeps it, with no settings but its params; an image task's build key, or its manifest's digest for an image Moruna did not build; a built-in function's kernel fingerprint, its program; a built-in source's or sink's, the digest of its kind's declaration in the catalogue), `settings` (the digest of its settings, as registration digests them) and `schema` (the hash of the schema it takes in; a source's, the schema it gives). A function fused with others is observed as its stage, kind `fused`, on the stage's first task; the others have none.
 - `run`: the run that measured it.
 - `unit` and `outcome`: a function's unit is one morsel (`"morsel"`), and `outcome` is the mean of its `units` morsels: `origin`, `duration` and `worker_time` in seconds, `rows_out`, `bytes_out` and `state_growth`, as the store keeps a unit. A morsel's memory is not measured in a shared process, so it has none. A source's or a sink's unit is the run (`"run"`): the rows and bytes it gave or wrote.
 

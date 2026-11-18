@@ -278,6 +278,11 @@ fn register(state: &State, body: &[u8]) -> Result<String, (ErrorCode, String)> {
         sha256: given.sha256,
         key: key_id(key),
         registered: now(),
+        measured_by: given
+            .measured
+            .as_ref()
+            .map(|_| moruna_api::MeasuredBy::Registration),
+        measured: given.measured,
     };
     let mut functions = state.functions.lock().expect("the functions");
     functions.retain(|kept| kept.name != function.name);

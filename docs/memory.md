@@ -31,7 +31,7 @@ Moruna learns what a function costs by running it, so the budget must leave room
 
 - **Read fewer columns.** `columns=` on a Parquet source keeps unused columns out of memory entirely.
 - **Avoid building Python objects.** A function that uses `pyarrow.compute`, Polars or NumPy on whole columns uses much less memory than one that converts each value to a Python object, so it gets larger morsels and more workers.
-- **Tell Moruna what to expect.** If the first morsel is not typical of the data, set `expected_amplification` on the function. For a stateful function with a large state, such as a model, set `state_bytes`.
+- **Tell Moruna what to expect.** If the first morsel is not typical of the data, set `expected_amplification` on the function. For a stateful function with a large state, such as a model, set `state_bytes`. What `moruna check` measured of the function stands over what it declares, when the run is given the store the check wrote to.
 - **Start from a clean process.** Create input data in a separate process, or release library memory with `pyarrow.default_memory_pool().release_unused()` before the job.
 
 Next: [Checkpoints and resume](resume.md).

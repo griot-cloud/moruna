@@ -545,6 +545,44 @@ pub fn build(job: &Job, plan: &Plan, kinds: &Registry, opts: BuildOptions<'_>) -
     })
 }
 
+/// Each stage's measured memory as the job came with it: `by_function` is what came beside the
+/// document, by a function's registered name (system design 3A, 3E), and a stage is a
+/// registered function's when it is one task of the kind `function` that names it. One entry a
+/// stage, `None` for a stage that is no registered function or came with nothing. What is not
+/// a measurement of memory sizes nothing, and is said in `notes`: the function is then sized
+/// as one nothing is known of.
+pub fn carried_memory(
+    job: &Job,
+    parts: &Parts,
+    by_function: &std::collections::BTreeMap<String, moruna_cost::Memory>,
+    notes: &mut Vec<String>,
+) -> Vec<Option<moruna_cost::Memory>> {
+    if by_function.is_empty() {
+        return Vec::new();
+    }
+    parts
+        .stages
+        .iter()
+        .map(|members| {
+            let [task] = members.as_slice() else {
+                return None;
+            };
+            let name = job.tasks.get(*task)?.function_name()?;
+            let memory = by_function.get(name)?;
+            match memory.check() {
+                Ok(()) => Some(memory.clone()),
+                Err(why) => {
+                    notes.push(format!(
+                        "the measured memory the job came with for the function `{name}` is \
+                         not a measurement ({why}), so it sizes nothing"
+                    ));
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 /// The stage kernel task `i` may join (MH 4.9): the stage of the kernel its one input comes from,
 /// when that kernel's one output goes to it alone.
 /// What task `i` declares it gives: its inline definition's, else its kind's; `None` when

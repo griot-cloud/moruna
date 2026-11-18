@@ -27,6 +27,9 @@ pub(in crate::check) struct Measured {
     pub(super) workers: u32,
     /// What it measured.
     pub(super) outcome: Outcome,
+    /// What its peak held outside the arena, where its batch lies: the function's own working
+    /// memory (system design 3A). `None` when the peak is unmeasured.
+    pub(super) outside: Option<u64>,
     /// The first instance's checkpoint, seconds and bytes, when one was asked for.
     pub(super) checkpoint: Option<(f64, u64)>,
 }
@@ -397,11 +400,19 @@ impl Bench for Harnessed<'_> {
         // process's and the child's are what the call added. They are disjoint memories (the
         // arena is pre-faulted, so its use never moves the process's mark), so their sum bounds
         // the call's peak from above; the pools are a view of the same bytes, taken when larger.
-        let peak = if interval.finish()? {
-            extra.map(|extra| extra.max(bytes_in + pooled.unwrap_or(0)))
+        // What the peak holds past the arena's mark is the function's own (system design 3A):
+        // its heap and its child, or what its pools held past the arena, when more.
+        let (peak, own) = if interval.finish()? {
+            match extra {
+                Some((arena, beside)) => {
+                    let peak = (arena + beside).max(bytes_in + pooled.unwrap_or(0));
+                    (Some(peak), Some(peak - arena))
+                }
+                None => (None, None),
+            }
         } else {
             self.say("overlapping warm-ups invalidated process-wide marks; unit PeakMemory is unmeasured".into());
-            None
+            (None, None)
         };
         let retained = outside + arena_after.saturating_sub(arena_base + bytes_in);
         let mut outcome = Outcome::new(Origin::WarmUp);
@@ -438,6 +449,7 @@ impl Bench for Harnessed<'_> {
             },
             workers: n as u32,
             outcome,
+            outside: own,
             checkpoint: taken,
         })
     }
@@ -490,9 +502,10 @@ impl Bench for Harnessed<'_> {
 }
 
 impl Harnessed<'_> {
-    /// The call's peak from its marks: the arena's above its base (the input with it), plus the
-    /// process's and the child's above theirs.
-    fn extra(&mut self, marks: &Marks) -> Option<u64> {
+    /// The call's peak from its marks, in its two parts: the arena's above its base (the input
+    /// with it), and beside it the process's and the child's above theirs. `None` when a mark
+    /// cannot be read, or the parts do not sum.
+    fn extra(&mut self, marks: &Marks) -> Option<(u64, u64)> {
         let arena = self
             .harness
             .arena
@@ -531,8 +544,11 @@ impl Harnessed<'_> {
             (Some(_), None) => None,
             (None, _) => Some(0),
         };
-        os.zip(child)
-            .and_then(|(os, child)| arena.checked_add(os.max(counting))?.checked_add(child))
+        os.zip(child).and_then(|(os, child)| {
+            let beside = os.max(counting).checked_add(child)?;
+            arena.checked_add(beside)?;
+            Some((arena, beside))
+        })
     }
 }
 
@@ -606,6 +622,55 @@ mod tests {
         }
     }
 
+    /// A child whose mark reads `peak` over the `held` it had when the mark was reset.
+    struct MeasuredChild {
+        held: u64,
+        peak: u64,
+    }
+
+    impl OutsideMemory for MeasuredChild {
+        fn in_use(&self) -> moruna_kernel::Result<u64> {
+            Ok(self.held)
+        }
+        fn reset_peak(&self) -> moruna_kernel::Result<bool> {
+            Ok(true)
+        }
+        fn peak(&self) -> moruna_kernel::Result<Option<u64>> {
+            Ok(Some(self.peak))
+        }
+    }
+
+    /// System design 3A, item 6.3g: what a unit's peak holds outside the arena is the
+    /// function's own memory, the process's growth and its child's, and the rest of the peak
+    /// is the arena's, where its batch lies.
+    #[test]
+    fn cm_t69_a_unit_s_peak_is_the_arena_s_part_and_the_function_s_own() {
+        const MIB: u64 = 1 << 20;
+        let _serial = peak::TEST_MARK_LOCK.lock().expect("marker fixture lock");
+        let harness = Harness::start(&[], 1 << 20).expect("real harness");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let generator = Generator::new(&schema, None, 45).expect("generator");
+        let kernel: Arc<dyn Kernel> = Arc::new(FakeKernel::new());
+        let child: Arc<dyn OutsideMemory> = Arc::new(MeasuredChild {
+            held: MIB,
+            peak: 4 * MIB,
+        });
+        let mut bench = Harnessed::new(&kernel, &harness, generator, None, Some(child), false);
+        // The process grew 64 MiB over the call, past anything this test's own heap does.
+        bench.process = Ok(Process::Controlled {
+            reset: Ok(100 * MIB),
+            peak: Ok(164 * MIB),
+        });
+        let measured = bench.unit(&spec(), 1, false).expect("measured");
+        // 64 MiB of the process's and 3 MiB of the child's.
+        assert_eq!(measured.outside, Some(67 * MIB));
+        let peak = measured.outcome.get(Target::PeakMemory).expect("a peak") as u64;
+        assert!(
+            peak > 67 * MIB,
+            "the rest of the peak is the arena's, where the batch lies: {peak}"
+        );
+    }
+
     #[test]
     fn cm_t68_an_unavailable_process_mark_does_not_train_sampled_peak() {
         let _serial = peak::TEST_MARK_LOCK.lock().expect("marker fixture lock");
@@ -645,6 +710,7 @@ mod tests {
                 None,
                 "a sampler/arena reading must not become a total per-unit peak"
             );
+            assert_eq!(measured.outside, None, "nor the function's own memory");
             assert!(bench.notes().iter().any(|n| n.contains(reason)));
         }
     }
@@ -684,6 +750,7 @@ mod tests {
                 None,
                 "a parent-only measurement cannot stand in for the child (reset={reset})"
             );
+            assert_eq!(measured.outside, None, "nor for the function's own memory");
             assert_eq!(counted.resets.load(Ordering::Relaxed), 1);
             assert_eq!(
                 counted.reads.load(Ordering::Relaxed),

@@ -212,7 +212,32 @@ fn openapi_has_every_operation_with_its_security_and_the_error_body() {
     assert!(list.get("requestBody").is_none());
     assert_eq!(
         properties(&document, "FunctionRegistration"),
-        ["address", "name", "sha256", "signature"]
+        ["address", "measured", "name", "sha256", "signature"]
+    );
+    // 3A: a function's measured memory, on a registration and on a listed function.
+    assert_eq!(
+        properties(&document, "Measured"),
+        [
+            "fixed_bytes",
+            "input_bytes_max",
+            "input_bytes_min",
+            "output_per_input_byte",
+            "per_input_byte",
+            "spread",
+            "units"
+        ]
+    );
+    assert_eq!(
+        properties(&document, "Function"),
+        [
+            "address",
+            "key",
+            "measured",
+            "measured_by",
+            "name",
+            "registered",
+            "sha256"
+        ]
     );
     let total: usize = document["paths"]
         .as_object()
@@ -431,11 +456,11 @@ fn mcp_has_one_tool_per_operation_with_its_input_and_output() {
         match input {
             Some(input) => assert_eq!(&tool["inputSchema"], input, "{name}"),
             // A job: its document in one version, and nothing else; or a function's
-            // registration, its four fields.
+            // registration, its four fields and the memory measured of it.
             None => {
                 let input = &tool["inputSchema"];
                 let (title, fields) = match operation.request {
-                    Request::Function => ("FunctionRegistration", 4),
+                    Request::Function => ("FunctionRegistration", 5),
                     _ => ("Job", 3),
                 };
                 assert_eq!(input["title"], title, "{name}");

@@ -20,7 +20,10 @@ Registration is four steps, each here:
    is given that object's name and returns its two URLs, the one to ``PUT`` it to and the one the
    node fetches it from (an S3 bucket's pair of pre-signed URLs).
 4. **The registration** through ``moruna.api``: ``POST /v1/functions`` with the name, the
-   address, the SHA-256 and the signature (``client.functions_register``).
+   address, the SHA-256 and the signature (``client.functions_register``), and with them the
+   function's memory as it was measured (:func:`measured`), when it was: what ``moruna check``'s
+   warm-up fitted of what one call holds outside its batch (system design 3A). The node sizes a
+   job that uses the function from it, until its own readings replace it.
 
 A URL's query is never put in a message: a SAS or a pre-signed URL's query is its credential.
 Only the first step needs the engine; the others are the standard library and ``cryptography``.
@@ -41,7 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from . import _build
-from .api import Function, FunctionRegistration
+from .api import Function, FunctionRegistration, Measured
 
 #: A store: an ``https://`` prefix, or a callable from an object's name to its ``PUT`` URL and
 #: the URL the node fetches it from.
@@ -213,6 +216,29 @@ def upload(archive: Archive, url: str, *, context: ssl.SSLContext | None = None)
         raise Refused(f"the upload to {shown(url)} was refused: HTTP {status}")
 
 
+def measured(report: dict[str, Any]) -> Measured | None:
+    """The function's memory as a check measured it: the ``memory`` its warm-up fitted, from the
+    check's report of the function (``moruna.check(...)["functions"][i]``), as a registration
+    carries it; ``None`` when the check measured none (a function that declares no schemas is
+    not checked, and a warm-up that was stopped measures nothing)."""
+    memory = ((report.get("warm_up") or {}).get("kernel") or {}).get("memory")
+    if not isinstance(memory, dict):
+        return None
+    return Measured(
+        fixed_bytes=float(memory["fixed_bytes"]),
+        per_input_byte=float(memory["per_input_byte"]),
+        output_per_input_byte=(
+            None
+            if memory.get("output_per_input_byte") is None
+            else float(memory["output_per_input_byte"])
+        ),
+        spread=float(memory["spread"]),
+        units=int(memory["units"]),
+        input_bytes_min=int(memory["input_bytes_min"]),
+        input_bytes_max=int(memory["input_bytes_max"]),
+    )
+
+
 def publish(  # noqa: PLR0913, keyword-only past the archive and the client
     archive: Archive,
     client: Any,
@@ -221,11 +247,13 @@ def publish(  # noqa: PLR0913, keyword-only past the archive and the client
     store: Store,
     key: bytes | str | os.PathLike[str],
     context: ssl.SSLContext | None = None,
+    measured: Measured | None = None,
 ) -> Function:
     """``archive`` signed with ``key``, uploaded to ``store`` and registered as ``name`` through
-    ``client`` (a ``moruna.api.Client`` with an admin token): the registration the node answers.
-    Nothing is uploaded when the name or the key is refused, and nothing registered when the
-    upload fails. The node's own refusal is ``moruna.api.ApiError``."""
+    ``client`` (a ``moruna.api.Client`` with an admin token), with the function's ``measured``
+    memory when it has been measured: the registration the node answers. Nothing is uploaded
+    when the name or the key is refused, and nothing registered when the upload fails. The
+    node's own refusal is ``moruna.api.ApiError``."""
     if not _NAME.match(name):
         raise Refused(
             f"{name!r} is not a function's name: 1 to 64 characters, a lowercase letter first, "
@@ -235,7 +263,13 @@ def publish(  # noqa: PLR0913, keyword-only past the archive and the client
     put, address = destination(store, name, archive.sha256)
     upload(archive, put, context=context)
     return client.functions_register(
-        FunctionRegistration(name=name, address=address, sha256=archive.sha256, signature=signed)
+        FunctionRegistration(
+            name=name,
+            address=address,
+            sha256=archive.sha256,
+            signature=signed,
+            measured=measured,
+        )
     )
 
 
@@ -249,8 +283,11 @@ def register_built(  # noqa: PLR0913, publish's and where to pack
     work: Path,
     context: ssl.SSLContext | None = None,
     writer: Writer | None = None,
+    measured: Measured | None = None,
 ) -> Function:
     """``built``'s image packed into ``work`` (by ``writer``, as :func:`pack` takes it) and
-    published as ``name``."""
+    published as ``name``, with its ``measured`` memory when it has been measured."""
     archive = pack(built, work, writer=writer)
-    return publish(archive, client, name=name, store=store, key=key, context=context)
+    return publish(
+        archive, client, name=name, store=store, key=key, context=context, measured=measured
+    )

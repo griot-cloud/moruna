@@ -115,6 +115,12 @@ def _int(value: Any, where: str, low: int | None, high: int | None) -> int:
     return value
 
 
+def _float(value: Any, where: str) -> float:
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        raise ValueError(f"{where}: expected a number, found {type(value).__name__}")
+    return float(value)
+
+
 def _strings(value: Any, where: str) -> dict[str, str]:
     return {key: _str(item, f"{where}.{key}") for key, item in _object(value, where).items()}
 
@@ -226,6 +232,8 @@ class Generator:
             return "str"
         if kind == "integer":
             return "int"
+        if kind == "number":
+            return "float"
         if kind == "boolean":
             return "bool"
         if kind == "object" and schema.get("additionalProperties") == {"type": "string"}:
@@ -248,6 +256,8 @@ class Generator:
         kind = schema.get("type")
         if kind == "string":
             return f"_str(*{value})"
+        if kind == "number":
+            return f"_float(*{value})"
         if kind == "boolean":
             return f"_bool(*{value})"
         if kind == "object" and schema.get("additionalProperties") == {"type": "string"}:

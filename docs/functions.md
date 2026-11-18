@@ -62,6 +62,8 @@ score (python): refused
 
 The command exits with 0 when every function agrees and 2 when any is refused, so you can run it in continuous integration. A function that agrees is then warmed up: it runs on generated data of growing size, at more than one worker, and with skewed as well as even keys, and the cost model learns from every measurement. The report gives what the function costs per 10,000 rows, how much faster it is with more workers, how much skew slows it, and what the warm-up itself took. The measurements are kept (by default in `~/.moruna/observations`), so what is learned here is what a plan of a job uses. The **fingerprint** identifies this exact function; a job document can require it, so that a changed function is not run by mistake. Pass `--json` for a machine-readable report and `--function NAME` to check one function in a module.
 
+The warm-up also measures the memory one call of the function holds outside its batch, as a fixed amount plus an amount per byte of input. A run that is given the same store (`moruna.run(..., cost=moruna.CostSession(store))`, or `moruna run --cost-store`) divides its budget from that measurement rather than from a default, and `moruna.register` sends it to the node with the function.
+
 ## Any library that reads Arrow
 
 A function gets its batch as a `pyarrow.RecordBatch`, which any library that reads Arrow takes without a copy, and may return any Arrow batch or single-chunk table. With Polars, for example:
