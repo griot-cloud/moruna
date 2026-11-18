@@ -124,7 +124,19 @@ pub(crate) fn tick(ctl: &Inner) {
         for stage_stats in &stats.per_stage {
             if let Some(ctl_stage) = state.stage_mut(stage_stats.stage) {
                 ctl_stage.instances_live = stage_stats.instances_live;
+                ctl_stage.morsel_cap = stage_stats.morsel_bytes_max;
             }
+        }
+        // A stage whose instances can now take less than its target (a warm-up measured its
+        // function, system design 3A) is brought down to it at once, whatever else this tick
+        // decides.
+        if state.phase == Phase::Running
+            && (0..state.stages.len()).any(|at| state.stages[at].target > state.target_max(at))
+        {
+            let targets: Vec<u64> = (0..state.stages.len())
+                .map(|at| state.stages[at].target.min(state.target_max(at)))
+                .collect();
+            crate::apply::commit_targets(&mut state, &targets, &mut actions);
         }
 
         // The limits of this moment, before anything is decided against them. The ceiling

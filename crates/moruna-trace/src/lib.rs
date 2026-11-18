@@ -23,9 +23,9 @@ pub mod writer;
 
 pub use alloc::{SourceAlloc, StageAlloc};
 pub use report::{
-    BufferReport, DeviceSummary, DrainSummary, DriftReport, ExitReason, IoReport, LearningReport,
-    LimitsSummary, ObjectIoReport, OverheadReport, PartDigests, PolicyReport, RunMeta, RunReport,
-    SinkIo, SinkOutcome, SourceIo, StageReport,
+    BufferReport, DeviceSummary, DrainSummary, DriftReport, ExitReason, InstanceMemory, IoReport,
+    LearningReport, LimitsSummary, ObjectIoReport, OverheadReport, PartDigests, PolicyReport,
+    RunMeta, RunReport, SinkIo, SinkOutcome, SourceIo, StageReport,
 };
 pub use view::TraceView;
 pub use writer::{TraceConfig, TraceWriter};

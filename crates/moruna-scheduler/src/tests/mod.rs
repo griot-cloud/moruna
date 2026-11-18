@@ -54,6 +54,7 @@ mod sc_t50_a_waiting_read_is_never_dropped;
 mod sc_p_a_function_runs_per_cpu;
 // stream P: a native stage's instances fed in turn.
 mod sc_p_dealt_instances;
+mod sc_p_instances_wait_for_a_warm_up;
 // Item 3.1: a native stage of eight ring tasks under a memory bound.
 mod sc_p_native_stage_memory;
 mod sc_t5_knobs_immediate;

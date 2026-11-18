@@ -432,6 +432,11 @@ impl Api {
     pub(crate) fn pump(&mut self, wall_ms: u64) {
         let now = wall_ms / 1_000;
         self.jobs.pump(self.host.as_mut(), &self.functions, wall_ms);
+        // What the reports read of the functions their jobs used refines each one's measured
+        // memory (system design 3A).
+        for (name, sha256, pairs) in self.jobs.readings() {
+            self.functions.observe(&name, &sha256, &pairs);
+        }
         for (ticket, answer) in self.jobs.resolved() {
             let Some(pending) = self.pending.remove(&ticket) else {
                 continue;

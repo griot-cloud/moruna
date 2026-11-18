@@ -39,6 +39,7 @@ fn rc_t16_state_growth() {
             errors: 0,
             skipped: 0,
             instances_live: 2,
+            morsel_bytes_max: None,
         }],
         workers_active: 4,
         workers_busy: 4,

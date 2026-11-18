@@ -97,6 +97,43 @@ impl Memory {
         (self.fixed_bytes + self.per_input_byte * input_bytes) * (1.0 + self.margin())
     }
 
+    /// The bytes one process of the function holds at a piece of `piece` bytes, when this is the
+    /// node's own reading of the process's account (system design 3A; PM, 2026-11-18): its whole
+    /// memory, its interpreter or program included, widened by the margin. Within the measured
+    /// range, and past it for a line with a slope, the line; past it for a line with none (the
+    /// node's readings of one size, which say nothing of how the need grows), the line's value
+    /// at the top of the range scaled up in proportion to the piece.
+    pub fn account(&self, piece: f64) -> f64 {
+        let top = self.input_bytes_max as f64;
+        let at = if piece > top && self.per_input_byte == 0.0 && top > 0.0 {
+            self.fixed_bytes * piece / top
+        } else {
+            self.fixed_bytes + self.per_input_byte * piece
+        };
+        at * (1.0 + self.margin())
+    }
+
+    /// The largest piece one process of the function takes inside an account of `account`
+    /// bytes, by [`Memory::account`]: piece <= (account / (1 + margin) - fixed) / per-byte, zero
+    /// when the fixed term alone does not fit, and unbounded for a line that does not grow
+    /// (system design 3A; PM, 2026-11-18). A line with no slope grows past the top of its range
+    /// in proportion, as `account` says it does.
+    pub fn piece_within(&self, account: f64) -> f64 {
+        let held = account / (1.0 + self.margin());
+        if held < self.fixed_bytes {
+            return 0.0;
+        }
+        if self.per_input_byte > 0.0 {
+            return (held - self.fixed_bytes) / self.per_input_byte;
+        }
+        let top = self.input_bytes_max as f64;
+        if self.fixed_bytes > 0.0 && top > 0.0 {
+            held * top / self.fixed_bytes
+        } else {
+            f64::INFINITY
+        }
+    }
+
     /// Refuse what is not a measurement of memory: an amount or a rate that is negative or not
     /// finite, no units, or a range that is not one.
     pub fn check(&self) -> Result<(), String> {
@@ -229,6 +266,75 @@ mod tests {
             Memory::fit(&[(MIB, 0.0), (4.0 * MIB, 4096.0), (16.0 * MIB, 0.0)], None).expect("fit");
         assert!(nothing.room(64.0 * MIB) < GRAIN_BYTES, "{nothing:?}");
         assert!(nothing.spread < 0.1, "{nothing:?}");
+    }
+
+    #[test]
+    fn an_account_follows_the_line_and_past_a_line_of_one_size_scales_in_proportion() {
+        // The node's readings of one size: 4.5 MiB at 16 MiB pieces, no slope.
+        let one = Memory {
+            fixed_bytes: 4.5 * MIB,
+            per_input_byte: 0.0,
+            output_per_input_byte: None,
+            spread: 0.0,
+            units: 4,
+            input_bytes_min: 16 * MIB as u64,
+            input_bytes_max: 16 * MIB as u64,
+        };
+        // At or below the range, the largest peak; above it, in proportion.
+        assert_eq!(one.account(MIB), 4.5 * MIB);
+        assert_eq!(one.account(16.0 * MIB), 4.5 * MIB);
+        assert_eq!(one.account(32.0 * MIB), 9.0 * MIB);
+        // With the client's slope, the line, inside the range and past it.
+        let sloped = Memory {
+            fixed_bytes: 3.6 * MIB,
+            per_input_byte: 0.054,
+            ..one.clone()
+        };
+        assert!((sloped.account(32.0 * MIB) - (3.6 + 0.054 * 32.0) * MIB).abs() < 1.0);
+        // Widened by the margin.
+        let spread = Memory {
+            spread: 0.1,
+            ..one.clone()
+        };
+        assert!((spread.account(MIB) - 4.5 * MIB * (1.0 + Z95 * 0.1)).abs() < 1.0);
+    }
+
+    #[test]
+    fn the_piece_an_account_holds_is_the_line_s_inverse() {
+        let line = Memory {
+            fixed_bytes: 30.0 * MIB,
+            per_input_byte: 6.0,
+            output_per_input_byte: None,
+            spread: 0.0,
+            units: 6,
+            input_bytes_min: MIB as u64,
+            input_bytes_max: 16 * MIB as u64,
+        };
+        // A Python function's 30 MiB and six bytes a byte: an instance of 128 MiB takes pieces
+        // of (128 - 30) / 6 MiB, and one of 30 MiB none.
+        assert!((line.piece_within(128.0 * MIB) - 98.0 / 6.0 * MIB).abs() < 1.0);
+        assert_eq!(line.piece_within(29.0 * MIB), 0.0);
+        assert!((line.account(line.piece_within(128.0 * MIB)) - 128.0 * MIB).abs() < 1.0);
+        // Widened by the margin, as the account is.
+        let spread = Memory {
+            spread: 0.1,
+            ..line.clone()
+        };
+        assert!(spread.piece_within(128.0 * MIB) < line.piece_within(128.0 * MIB));
+        assert!((spread.account(spread.piece_within(128.0 * MIB)) - 128.0 * MIB).abs() < 1.0);
+        // A line of one size grows in proportion past its range; one that holds nothing, never.
+        let one = Memory {
+            fixed_bytes: 4.0 * MIB,
+            per_input_byte: 0.0,
+            ..line.clone()
+        };
+        assert!((one.piece_within(8.0 * MIB) - 32.0 * MIB).abs() < 1.0);
+        let nothing = Memory {
+            fixed_bytes: 0.0,
+            per_input_byte: 0.0,
+            ..line
+        };
+        assert!(nothing.piece_within(MIB).is_infinite());
     }
 
     #[test]

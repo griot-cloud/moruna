@@ -19,6 +19,57 @@ use std::sync::Arc;
 pub struct PyCostSession {
     pub(crate) session: Arc<moruna_runtime::cost::Session>,
 }
+/// What `moruna.run`'s `cost` says: the session given, none at all (`cost=False`), or the
+/// default store's (`cost=None` or `cost=True`).
+pub(crate) enum CostArg {
+    /// `cost=<a CostSession>`.
+    Given(Arc<moruna_runtime::cost::Session>),
+    /// `cost=False`: the run reads no store and writes none.
+    Off,
+    /// No `cost`: the default store, `~/.moruna/observations`, where `moruna check` keeps what
+    /// it measured (system design 3A).
+    Default,
+}
+
+impl CostArg {
+    /// `cost` as `moruna.run` was given it; anything else is a `TypeError`.
+    pub(crate) fn of(value: Option<&Bound<'_, PyAny>>) -> PyResult<CostArg> {
+        let Some(value) = value.filter(|value| !value.is_none()) else {
+            return Ok(CostArg::Default);
+        };
+        if let Ok(session) = value.cast::<PyCostSession>() {
+            return Ok(CostArg::Given(Arc::clone(&session.get().session)));
+        }
+        match value.extract::<bool>() {
+            Ok(true) => Ok(CostArg::Default),
+            Ok(false) => Ok(CostArg::Off),
+            Err(_) => Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "cost is a moruna.CostSession, True or None for the default observation store, \
+                 or False for none, not {}",
+                crate::sources::type_name(value)
+            ))),
+        }
+    }
+}
+
+/// The default store's session, one a directory in this process, so its model is made ready
+/// once (system design 3A): `None` on a host with no home.
+pub(crate) fn default_session() -> Option<Arc<moruna_runtime::cost::Session>> {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    static SESSIONS: Mutex<BTreeMap<std::path::PathBuf, Arc<moruna_runtime::cost::Session>>> =
+        Mutex::new(BTreeMap::new());
+    let dir = moruna_runtime::cost::default_store_dir()?;
+    let mut sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    Some(Arc::clone(sessions.entry(dir.clone()).or_insert_with(
+        || {
+            Arc::new(moruna_runtime::cost::Session::new(CostSettings::directory(
+                dir,
+            )))
+        },
+    )))
+}
+
 impl PyCostSession {
     /// Expose the same native session created from actual granted service authority.
     pub fn from_native(session: Arc<moruna_runtime::cost::Session>) -> Self {

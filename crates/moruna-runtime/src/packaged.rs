@@ -219,6 +219,35 @@ impl Packaged {
         }
     }
 
+    /// Each of the stage's tasks sized from the node's readings of its function (system design
+    /// 3A): a plane for pieces of `piece` bytes and an account of `account` bytes.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn size_measured(&self, piece: u64, account: u64) {
+        if let Packaged::Task(k) = self {
+            k.size_measured(piece, account);
+        }
+    }
+
+    /// Each of the stage's tasks takes pieces of at most `bytes`, what its account holds by the
+    /// function's measured line (system design 3A).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn cap_pieces(&self, bytes: u64) {
+        if let Packaged::Task(k) = self {
+            k.cap_pieces(bytes);
+        }
+    }
+
+    /// What each instance of the stage's tasks held (system design 3A): its account's peak and
+    /// limit and the largest piece it was given; `None` for a stage that is not one of the
+    /// data plane's tasks.
+    pub fn task_figures(&self) -> Option<Vec<Option<moruna_micro::layout::TaskFigures>>> {
+        match self {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            Packaged::Task(k) => Some(k.figures()),
+            _ => None,
+        }
+    }
+
     // stream P: what a native stage's tasks did, in the run's report.
     /// The report's note of what the stage's tasks did (an image stage on the rings): each
     /// task's batches, CPU and account, and the most that held a batch at once.

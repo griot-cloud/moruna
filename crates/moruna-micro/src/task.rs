@@ -358,6 +358,9 @@ pub struct ImageTask {
     cancel: OnceLock<CancelToken>,
     /// The stage's ceiling, which bounds its plane's arena and its task's account.
     ceiling: Mutex<Option<u64>>,
+    /// The piece and the account the run sized each task for from the node's readings of the
+    /// function (system design 3A); `None`, the plane and the account by the share's rule.
+    measured: Mutex<Option<(u64, u64)>>,
     /// Each process's account, once it has started: one a process the stage may run
     /// (`moruna_adapters::instances::count`, system design 3E).
     memory: Vec<Arc<TaskMemory>>,
@@ -426,6 +429,9 @@ struct Busy {
     cancel: OnceLock<CancelToken>,
     /// What each task did, by instance, summed over the tasks an instance had.
     figures: Mutex<Vec<Option<layout::TaskFigures>>>,
+    /// The largest piece the function's measured line says one task's account holds (system
+    /// design 3A: piece <= (account - fixed) / per-byte); 0 when nothing measured it.
+    piece_cap: std::sync::atomic::AtomicU64,
 }
 
 impl Busy {
@@ -496,6 +502,7 @@ impl ImageTask {
             ports: OnceLock::new(),
             cancel: OnceLock::new(),
             ceiling: Mutex::new(None),
+            measured: Mutex::new(None),
             outside: Arc::new(TaskMemories(Vec::new())),
             memory: Vec::new(),
             cpus,
@@ -725,6 +732,13 @@ impl ImageTask {
         })
     }
 
+    /// What each of the stage's instances did, by instance (system design 3A): its account's
+    /// peak and limit and the largest piece it was given, summed over the tasks it had; `None`
+    /// for an instance whose task has not ended.
+    pub fn figures(&self) -> Vec<Option<layout::TaskFigures>> {
+        lock(&self.busy.figures).clone()
+    }
+
     /// The CPU the stage places its task `instance` on (ring mode): one task to a CPU.
     fn cpu_of(&self, instance: usize) -> Option<u32> {
         self.rings.then(|| {
@@ -759,6 +773,33 @@ impl ImageTask {
         *lock(&self.ceiling) = Some(ceiling);
     }
 
+    /// Each task's plane for pieces of `piece` bytes and its account at `account` bytes, as the
+    /// node's readings of the function size them (system design 3A), in place of the share's
+    /// rule.
+    pub fn size_measured(&self, piece: u64, account: u64) {
+        *lock(&self.measured) = Some((piece, account));
+    }
+
+    /// The largest piece one task's account holds by the function's measured line (system design
+    /// 3A), which the stage's morsels and its tasks' pieces are held to beside its plane's piece
+    /// ([`layout::piece_cap`]); at least one byte.
+    pub fn cap_pieces(&self, bytes: u64) {
+        self.busy
+            .piece_cap
+            .store(bytes.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The plane budget of each of the stage's tasks under its `ceiling`: for the piece the run
+    /// sized it for from the node's readings (system design 3A), else out of a native task's
+    /// share at its real size, else the ceiling up to the most a plane has.
+    fn plane_budget(&self, ceiling: u64) -> u64 {
+        match *lock(&self.measured) {
+            Some((piece, _)) => layout::plane_for(piece).0,
+            None if self.native.is_some() => layout::native_split(ceiling).0,
+            None => ceiling.min(PLANE_BUDGET_MAX),
+        }
+    }
+
     fn start(&self, ctx: &InitCtx) -> Result<TaskState> {
         let name = &self.name;
         let memory = self.memory.get(ctx.instance).ok_or_else(|| {
@@ -778,12 +819,9 @@ impl ImageTask {
                 "image `{name}`: the stage has no ceiling; the run binds it before the task starts"
             ))
         })?;
-        // A native task's plane comes out of its share at its real size, beside its account.
-        let budget = if self.native.is_some() {
-            layout::native_split(ceiling).0
-        } else {
-            ceiling.min(PLANE_BUDGET_MAX)
-        };
+        // A native task's plane comes out of its share at its real size, beside its account; a
+        // measured task's is for the piece the run sized it for (system design 3A).
+        let budget = self.plane_budget(ceiling);
         let (plane, task, port) = if self.rings {
             // Every task's plane is made ahead, together, as the first task starts: the kernel
             // zeroes each and the host faults its pages in on CPUs of their own, not one task
@@ -907,10 +945,10 @@ impl ImageTask {
                 ))
             })?
             .room();
-        let limit = if native {
-            layout::native_task_limit(ceiling, room)
-        } else {
-            layout::task_limit(ceiling, room)
+        let limit = match *lock(&self.measured) {
+            Some((_, account)) => layout::measured_task_limit(account, room),
+            None if native => layout::native_task_limit(ceiling, room),
+            None => layout::task_limit(ceiling, room),
         };
         let limit = limit.ok_or_else(|| {
             kernel_error(format!(
@@ -1020,6 +1058,7 @@ impl ImageTask {
             tail: VecDeque::new(),
             alloc: Arc::clone(&ctx.alloc),
             sent: 0,
+            largest: 0,
             received: 0,
             answered: 0,
             joined: 0,
@@ -1072,6 +1111,8 @@ pub struct TaskState {
     tail: VecDeque<String>,
     alloc: Arc<dyn Allocator>,
     sent: u64,
+    /// The largest piece it was given, the bytes of the batch's buffers (system design 3A).
+    largest: u64,
     /// Records the task put, and batches it said it was done with.
     received: u64,
     answered: u64,
@@ -1247,6 +1288,7 @@ impl TaskState {
             f.deferred += self.deferred;
             f.cpu = self.cpu;
             f.peak = f.peak.max(peak);
+            f.largest = f.largest.max(self.largest);
             let feeder = &self.busy.feeder;
             for (at, ns) in [
                 &feeder.cut,
@@ -1455,6 +1497,7 @@ impl TaskState {
         let len = layout::record_len(framing.len() as u64, &pieces)
             .ok_or_else(|| kernel_error(format!("image `{}`: a record past u64", self.name)))?;
         let body: u64 = pieces.iter().map(|(_, n)| n).sum();
+        self.largest = self.largest.max(body);
         let id = if self.rings {
             let region = self
                 .plane
@@ -1918,7 +1961,14 @@ impl TaskState {
         ports: Option<&Arc<StagePorts>>,
         names: &[String],
     ) -> Result<Payload> {
-        let piece = layout::ring_sizes(self.plane.residency().budget).piece;
+        // At most its plane's piece, and no more than its account holds by the function's
+        // measured line (system design 3A).
+        let piece = layout::piece_cap(
+            layout::ring_sizes(self.plane.residency().budget).piece,
+            self.busy
+                .piece_cap
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         if self.schema.is_none() {
             self.schema = lock(&self.busy.schema).clone();
         }
@@ -2337,6 +2387,22 @@ impl Kernel for ImageTask {
     /// batches in turn and one worker keeps every task busy.
     fn deals_instances(&self) -> bool {
         self.rings
+    }
+
+    /// The largest piece one of the stage's tasks takes (system design 3A; PM, 2026-11-18): its
+    /// plane's piece, or less where its account holds less by the function's measured line. A
+    /// stage not yet bound to the run's ceiling says nothing.
+    fn morsel_bytes_max(&self) -> Option<u64> {
+        let measured = self
+            .busy
+            .piece_cap
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if !self.rings {
+            return (measured > 0).then_some(measured);
+        }
+        let ceiling = (*lock(&self.ceiling))?;
+        let plane = layout::ring_sizes(self.plane_budget(ceiling)).piece;
+        Some(layout::piece_cap(plane, measured))
     }
 
     fn accepts(&self) -> PayloadSpec {

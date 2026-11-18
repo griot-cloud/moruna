@@ -638,11 +638,12 @@ pub fn run(
     checkpoint_interval: f64,
     keep_checkpoint: bool,
     resume: Option<String>,
-    cost: Option<PyRef<'_, crate::engine::PyCostSession>>,
+    cost: Option<&Bound<'_, PyAny>>,
     engine_ports: Option<PyRef<'_, crate::engine::PyEnginePorts>>,
     sandbox_python: Option<String>,
     sandbox_cgroup: Option<String>,
 ) -> PyResult<String> {
+    let cost = crate::engine::CostArg::of(cost)?;
     let _guard = map(py, RunningGuard::acquire())?;
     let tasks = given(tasks)?;
     let assembled = assemble(py, Some(name), None, &arg_types, &tasks)?;
@@ -911,10 +912,35 @@ pub fn run(
             None => moruna_runtime::Components::default(),
         },
     };
-    if let Some(cost) = cost {
-        let cost = &*cost;
+    // What `moruna check` measured is used by default (system design 3A): with no `cost`, a run
+    // the host has given no store of its own reads and writes the default store. A default
+    // store that cannot be opened is a note, never a failure: the run is then sized as for
+    // functions nothing is known of, and keeps nothing.
+    let session = match cost {
+        crate::engine::CostArg::Given(session) => Some(session),
+        crate::engine::CostArg::Off => None,
+        crate::engine::CostArg::Default if components.learning.is_none() => {
+            match crate::engine::default_session() {
+                Some(session) => match py.detach(|| session.online()) {
+                    Ok(_) => Some(session),
+                    Err(error) => {
+                        built.spec.notes.push(format!(
+                            "the default observation store could not be opened ({error}): \
+                             nothing measured is read, and the run keeps nothing"
+                        ));
+                        None
+                    }
+                },
+                None => None,
+            }
+        }
+        crate::engine::CostArg::Default => None,
+    };
+    if let Some(session) = session {
         let learning = py
-            .detach(|| cost.learning(&job, &built.parts))
+            .detach(|| {
+                moruna_runtime::cost::RunLearning::for_job(session.online()?, &job, &built.parts)
+            })
             .map_err(|e| map_err(py, &e))?;
         if components
             .learning

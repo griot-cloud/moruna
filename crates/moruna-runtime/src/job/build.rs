@@ -583,6 +583,33 @@ pub fn carried_memory(
         .collect()
 }
 
+/// Whether each stage's carried measurement is the node's own reading (system design 3A): the
+/// stage is one task of the kind `function`, and `by` names its function the node's. One entry
+/// a stage; empty when `by` names none.
+pub fn carried_by_node(
+    job: &Job,
+    parts: &Parts,
+    by: &std::collections::BTreeMap<String, crate::host::protocol::MeasuredBy>,
+) -> Vec<bool> {
+    if by.is_empty() {
+        return Vec::new();
+    }
+    parts
+        .stages
+        .iter()
+        .map(|members| match members.as_slice() {
+            [task] => {
+                job.tasks
+                    .get(*task)
+                    .and_then(|task| task.function_name())
+                    .and_then(|name| by.get(name))
+                    == Some(&crate::host::protocol::MeasuredBy::Node)
+            }
+            _ => false,
+        })
+        .collect()
+}
+
 /// The stage kernel task `i` may join (MH 4.9): the stage of the kernel its one input comes from,
 /// when that kernel's one output goes to it alone.
 /// What task `i` declares it gives: its inline definition's, else its kind's; `None` when

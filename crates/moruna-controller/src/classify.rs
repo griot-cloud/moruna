@@ -291,7 +291,7 @@ pub(crate) fn memory_pressure(state: &mut ControllerState, actions: &mut Actions
         .max_by_key(|(_, ctl)| ctl.target)
         .map(|(at, _)| at);
     if let Some(at) = largest {
-        let morsel_min = state.cfg.morsel_min;
+        let morsel_min = state.target_min(at);
         let ctl = &mut state.stages[at];
         let bytes = (ctl.target / 2).max(morsel_min);
         if bytes != ctl.target {

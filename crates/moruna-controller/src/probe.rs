@@ -179,6 +179,26 @@ fn load_profiles(state: &mut crate::ControllerState) {
                          schema {schema}: no row matches this run's input schema"
                     ));
                 }
+                // Remembered at another instance count, it is used at this one (3A).
+                let now = state.max_instances(stage);
+                let found = match found.at_count(now) {
+                    Some(scaled) => {
+                        state.note(format!(
+                            "profile for stage {stage} was written at {} instances and this run \
+                             has {now}: its fixed term scaled to {} bytes, its settled target \
+                             not used{}",
+                            found.written_at(),
+                            scaled.c_anon,
+                            if scaled.uncounted {
+                                ", and probed, since the file does not say its count"
+                            } else {
+                                ""
+                            }
+                        ));
+                        scaled
+                    }
+                    None => found,
+                };
                 state.stages[at].profile_exact = other_schema.is_none();
                 state.stages[at].profile = Some(found);
             }
@@ -262,7 +282,8 @@ fn probe_bytes(state: &crate::ControllerState, at: usize, upstream: Option<&Prob
         }
         _ => state.cfg.probe_bytes,
     };
-    bytes.clamp(state.cfg.morsel_min, state.cfg.morsel_max)
+    // Held to what one of the stage's instances can take, as every target is (3A).
+    state.clamp_target(at, bytes)
 }
 
 /// Bytes per row: the plan's own ratio for stage 1, and the upstream probe's for a later

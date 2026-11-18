@@ -125,6 +125,8 @@ pub struct Wire {
     /// The measured memory of the job's functions, by registered name, as the `spec` message
     /// gave it beside the document (system design 3A, 3E): taken when the job is built.
     measured: Mutex<protocol::Measured>,
+    /// Whose each of those is, by registered name.
+    measured_by: Mutex<std::collections::BTreeMap<String, protocol::MeasuredBy>>,
     /// In node mode, the job's whole memory budget, as node mode took it before carving the
     /// engine's share from it: what the report says the job ran with (system design 3A).
     budget: Mutex<Option<u64>>,
@@ -143,6 +145,7 @@ impl Wire {
             document_digest: Mutex::new(None),
             secrets: Mutex::new(std::collections::BTreeMap::new()),
             measured: Mutex::new(protocol::Measured::new()),
+            measured_by: Mutex::new(std::collections::BTreeMap::new()),
             budget: Mutex::new(None),
         })
     }
@@ -168,14 +171,28 @@ impl Wire {
         std::mem::take(&mut *self.secrets.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// Keep the measured memory of the job's functions until the job is built.
-    pub fn set_measured(&self, measured: protocol::Measured) {
+    /// Keep the measured memory of the job's functions, and whose each is, until the job is
+    /// built.
+    pub fn set_measured(
+        &self,
+        measured: protocol::Measured,
+        by: std::collections::BTreeMap<String, protocol::MeasuredBy>,
+    ) {
         *self.measured.lock().unwrap_or_else(|e| e.into_inner()) = measured;
+        *self.measured_by.lock().unwrap_or_else(|e| e.into_inner()) = by;
     }
 
-    /// The measured memory of the job's functions, taken.
-    pub fn take_measured(&self) -> protocol::Measured {
-        std::mem::take(&mut *self.measured.lock().unwrap_or_else(|e| e.into_inner()))
+    /// The measured memory of the job's functions, and whose each is, taken.
+    pub fn take_measured(
+        &self,
+    ) -> (
+        protocol::Measured,
+        std::collections::BTreeMap<String, protocol::MeasuredBy>,
+    ) {
+        (
+            std::mem::take(&mut *self.measured.lock().unwrap_or_else(|e| e.into_inner())),
+            std::mem::take(&mut *self.measured_by.lock().unwrap_or_else(|e| e.into_inner())),
+        )
     }
 
     /// Record the exact bytes of the document this run was given, by their public digest.
@@ -551,6 +568,7 @@ fn serve_on(conn: Conn, node: Option<&Node>, kinds: &Registry, opts: &HostOption
                 plan,
                 secrets,
                 measured,
+                measured_by,
             }) => {
                 let raw = spec.clone();
                 // Version 1 is the document as JSON; version 2 is its FlatBuffers, as base64.
@@ -594,7 +612,7 @@ fn serve_on(conn: Conn, node: Option<&Node>, kinds: &Registry, opts: &HostOption
                             None => {}
                         }
                         wire.set_secrets(secrets.0);
-                        wire.set_measured(measured);
+                        wire.set_measured(measured, measured_by);
                         let mode = if node.is_some() {
                             Mode::Node
                         } else {
@@ -797,12 +815,11 @@ fn run_planned(
             // What the peer gave of the functions' measured memory, each at its stage: the run
             // is sized from it (system design 3A).
             let mut said = Vec::new();
-            built.spec.measured = crate::job::build::carried_memory(
-                &job,
-                &built.parts,
-                &wire.take_measured(),
-                &mut said,
-            );
+            let (measured, by) = wire.take_measured();
+            built.spec.measured =
+                crate::job::build::carried_memory(&job, &built.parts, &measured, &mut said);
+            built.spec.measured_by_node =
+                crate::job::build::carried_by_node(&job, &built.parts, &by);
             built.spec.notes.extend(said);
             Ok(built)
         }) {

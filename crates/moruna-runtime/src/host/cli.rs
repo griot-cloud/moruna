@@ -2064,6 +2064,7 @@ fn run_vm(
                 plan,
                 secrets: Default::default(),
                 measured: Default::default(),
+                measured_by: Default::default(),
             },
             deadline,
             &devices,

@@ -32,7 +32,10 @@ pub(crate) fn assert_consistent(state: &ControllerState) {
     debug_assert!(
         {
             let targets: Vec<u64> = state.stages.iter().map(|s| s.target).collect();
-            let at_floor = targets.iter().all(|target| *target <= state.cfg.morsel_min);
+            let at_floor = targets
+                .iter()
+                .enumerate()
+                .all(|(at, target)| *target <= state.target_min(at));
             let arena = model::fits_arena(state, &targets) || (at_floor && state.high_water == 0);
             let anon = model::fits_anon(state, &targets) || at_floor;
             targets.is_empty() || (arena && anon)
@@ -205,9 +208,10 @@ pub(crate) fn apply_proposal(
 /// RC-I5. Freeze the target at the geometric mean of the last ten, for `freeze_morsels`
 /// completions of that stage, and say so.
 fn freeze(state: &mut ControllerState, at: usize, actions: &mut Actions) {
-    let mean = geometric_mean(&state.stages[at].recent_targets)
-        .unwrap_or(state.stages[at].target)
-        .clamp(state.cfg.morsel_min, state.cfg.morsel_max);
+    let mean = state.clamp_target(
+        at,
+        geometric_mean(&state.stages[at].recent_targets).unwrap_or(state.stages[at].target),
+    );
     let until = state.stages[at]
         .completions
         .saturating_add(u64::from(state.cfg.freeze_morsels));

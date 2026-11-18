@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{GIB, MIB, Scratch, config, kernel, probe, record, steady};
+use common::{GIB, MIB, Scratch, config, kernel, probe, record, stateful_kernel, steady};
 use moruna_kernel::{Fingerprint, KernelHints, SchedulerStats, StageStats};
 use moruna_testkit::{FakeKnobs, FakeSampler};
 use serde_json::Value;
@@ -426,4 +426,102 @@ fn rc_t24_a_repeat_run_starts_at_the_settled_target() {
     assert_eq!(first, 6 * MIB, "the settled target, not the memory rule's");
     assert!(rig.prober.calls().is_empty(), "and not probed");
     rig.controller.stop();
+}
+
+/// The first target and the probes of a run of stage 1 at `instances` over the store at `dir`,
+/// and the run's notes.
+fn started_at(dir: &std::path::Path, instances: usize) -> (u64, Vec<(u16, u64)>, Vec<String>) {
+    let mut cfg = config(8 * GIB, 2);
+    cfg.profiles_dir = Some(dir.to_path_buf());
+    let probe_bytes = cfg.probe_bytes;
+    let rig = common::Rig::new(
+        cfg,
+        vec![stateful_kernel(1, instances, KernelHints::default())],
+        FakeKnobs::new()
+            .probe_result(1, probe(probe_bytes, 4.0))
+            .stats(exhausted()),
+        FakeSampler::new().scripted(steady(400 * MIB, 64)),
+    );
+    rig.run_up();
+    let first = common::morsel_targets(&rig.writes())
+        .first()
+        .map(|(_, bytes)| *bytes)
+        .expect("a target at start");
+    let probes = rig.prober.calls();
+    let summary = rig.controller.stop();
+    (first, probes, summary.notes)
+}
+
+/// RC-T26 (6.3g, RC-I12; 6.3f's evidence): a profile written at one instance is not applied
+/// unscaled at four. Its settled target is not the first target, its fixed term is four times,
+/// it still stands in for the probe, and the note names both counts; at the count it was
+/// written at, it stands as it is.
+#[test]
+fn rc_t26_a_profile_from_one_instance_is_scaled_at_four() {
+    let scratch = Scratch::new("profile-count");
+    complete_run_seen(scratch.path(), 4.0, 40);
+    let file = profile_path(scratch.path(), 1);
+    let mut stored: Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).expect("written")).expect("json");
+    assert_eq!(stored["instances"], 1, "written at the count it ran at");
+    stored["best_target"] = (6 * MIB).into();
+    stored["c_anon"] = (10 * MIB).into();
+    std::fs::write(&file, serde_json::to_string(&stored).expect("json")).expect("write");
+
+    let (first, probes, notes) = started_at(scratch.path(), 4);
+    assert_ne!(
+        first,
+        6 * MIB,
+        "a settled target searched at one instance is not used at four"
+    );
+    assert!(probes.is_empty(), "still trusted in place of the probe");
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("written at 1 instances and this run has 4")
+                && n.contains(&format!("{} bytes", 40 * MIB))),
+        "the note names both counts and the scaled fixed term: {notes:?}"
+    );
+
+    // At the count it was written at, as it stands (the file as it was: the run at four wrote
+    // its own).
+    std::fs::write(&file, serde_json::to_string(&stored).expect("json")).expect("write");
+    let (first, probes, notes) = started_at(scratch.path(), 1);
+    assert_eq!(first, 6 * MIB, "the settled target at its own count");
+    assert!(probes.is_empty());
+    assert!(
+        !notes
+            .iter()
+            .any(|n| n.contains("instances and this run has")),
+        "{notes:?}"
+    );
+}
+
+/// RC-T26 (RC-I12): a file that does not say its count is not trusted for a stage of more than
+/// one instance: the stage is probed, and its settled target is not used.
+#[test]
+fn rc_t26_a_profile_without_a_count_is_probed_at_four() {
+    let scratch = Scratch::new("profile-uncounted");
+    complete_run_seen(scratch.path(), 4.0, 40);
+    let file = profile_path(scratch.path(), 1);
+    let mut stored: Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).expect("written")).expect("json");
+    stored
+        .as_object_mut()
+        .expect("an object")
+        .remove("instances");
+    stored["best_target"] = (6 * MIB).into();
+    std::fs::write(&file, serde_json::to_string(&stored).expect("json")).expect("write");
+
+    let (_, probes, notes) = started_at(scratch.path(), 4);
+    assert_eq!(probes.len(), 1, "probed: the file does not say its count");
+    assert!(
+        notes.iter().any(|n| n.contains("does not say its count")),
+        "{notes:?}"
+    );
+    // At one instance, an older file is applied as it always was.
+    std::fs::write(&file, serde_json::to_string(&stored).expect("json")).expect("write");
+    let (first, probes, _) = started_at(scratch.path(), 1);
+    assert_eq!(first, 6 * MIB);
+    assert!(probes.is_empty());
 }

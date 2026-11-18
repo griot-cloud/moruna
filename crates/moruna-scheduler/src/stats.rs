@@ -40,6 +40,7 @@ pub(crate) fn scheduler_stats(shared: &Shared) -> SchedulerStats {
             errors: entry.errors.load(Ordering::SeqCst),
             skipped: entry.skipped.load(Ordering::SeqCst),
             instances_live: instances::live(shared, index),
+            morsel_bytes_max: entry.kernel.morsel_bytes_max(),
         })
         .collect();
     let (stages_waiting, calls_waiting) = shared.waiting();

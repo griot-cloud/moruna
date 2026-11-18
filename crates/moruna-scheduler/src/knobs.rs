@@ -165,6 +165,19 @@ fn upsert_water(
     }
 }
 
+/// The morsel range of `stage`: `morsel_min..=morsel_max`, held below the largest morsel one of
+/// its instances can take where its kernel says one (system design 3A), and below `morsel_min`
+/// too when that is less (PM, 2026-11-18).
+pub(crate) fn morsel_range(shared: &Shared, stage: StageId, min: u64, max: u64) -> (u64, u64) {
+    let cap = shared
+        .stages
+        .iter()
+        .find(|entry| entry.stage == stage)
+        .and_then(|entry| entry.kernel.morsel_bytes_max());
+    let max = cap.map_or(max, |cap| cap.clamp(1, max.max(1)));
+    (min.min(max), max)
+}
+
 /// `Knobs::set` (f.15). Clamps, counts, stores or forwards. A set after the run has exited is a
 /// no-op (RC h).
 pub(crate) fn set(shared: &Shared, knob: Knob) {
@@ -177,7 +190,8 @@ pub(crate) fn set(shared: &Shared, knob: Knob) {
     }
     match knob {
         Knob::MorselTarget { stage, bytes } => {
-            let clamped = bytes.clamp(state.morsel_min, state.morsel_max);
+            let (min, max) = morsel_range(shared, stage, state.morsel_min, state.morsel_max);
+            let clamped = bytes.clamp(min, max);
             if clamped != bytes {
                 state.clamped(0, "morsel_target", bytes, clamped);
             }

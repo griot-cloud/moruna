@@ -542,6 +542,121 @@ impl Measured {
     }
 }
 
+/// The least the marks an account's peak is read from tell apart: one granule of 64 KiB (as
+/// `moruna_cost::GRAIN_BYTES`). A reading's departure from the line is taken above it.
+pub const GRAIN_BYTES: f64 = 65_536.0;
+
+/// The standard normal's 95th percentile (as `moruna_cost::Z95`): a margin is this many times
+/// the spread.
+pub const Z95: f64 = 1.644_853_626_951_472;
+
+/// `x`'s square root, for the spread (`api` has no `libm`): Newton's method from above, to the
+/// last bit it settles on.
+fn sqrt(x: f64) -> f64 {
+    if x.is_nan() || x <= 0.0 || x.is_infinite() {
+        return 0.0;
+    }
+    let mut root = if x > 1.0 { x } else { 1.0 };
+    for _ in 0..128 {
+        let next = 0.5 * (root + x / root);
+        if next >= root {
+            break;
+        }
+        root = next;
+    }
+    root
+}
+
+/// A function's memory as the node measured it (system design 3A, PM 2026-11-18), from its
+/// readings: each instance's account peak `y` beside the largest piece `x` it was given. An
+/// account holds the function's whole process, so the peak is the function's need at that
+/// piece, its interpreter and libraries included.
+///
+/// - **With the client's measurement** (`client`): bytes per input byte are portable between
+///   the check's process and the node, so the slope is the client's; the fixed term is not (the
+///   check's process holds no interpreter of the function's own), so it is the node's: the
+///   largest of `peak - slope x piece` over the readings.
+/// - **Without one:** readings whose pieces span less than twice their least are one size, so
+///   they say nothing of a slope: the fixed term is the largest peak and the slope zero. A run
+///   that gives a piece above the range scales that up in proportion (the engine's sizing,
+///   `moruna_cost::Memory::account`). Over a wider span, the least-squares line, through the
+///   origin when it would hold less than nothing at no input and flat at the mean when it
+///   falls, as `moruna_cost::Memory::fit` reads one.
+///
+/// Shared by `api`'s registry, which refines a function from every run, and the engine's warm-up
+/// on a job's first pieces.
+///
+/// The spread is the root mean square of each reading's peak over the line's value there, less
+/// one, both taken above a granule. The output per input byte is the client's: the node does not
+/// read it (its bytes out are not yet trusted on the kernel, item 6.3h). `None` with no reading.
+impl Measured {
+    /// See the function's doc above: a function's memory as the node measures it.
+    pub fn from_readings(pairs: &[(u64, u64)], client: Option<&Measured>) -> Option<Measured> {
+        readings_measured(pairs, client)
+    }
+}
+
+fn readings_measured(pairs: &[(u64, u64)], client: Option<&Measured>) -> Option<Measured> {
+    let points: Vec<(f64, f64)> = pairs
+        .iter()
+        .filter(|(x, _)| *x > 0)
+        .map(|&(x, y)| (x as f64, y as f64))
+        .collect();
+    let first = points.first()?;
+    let (least, most) = points
+        .iter()
+        .fold((first.0, first.0), |(least, most), (x, _)| {
+            (least.min(*x), most.max(*x))
+        });
+    let (fixed, slope) = match client {
+        Some(client) => {
+            let slope = client.per_input_byte;
+            let fixed = points
+                .iter()
+                .map(|(x, y)| y - slope * x)
+                .fold(0.0f64, f64::max);
+            (fixed, slope)
+        }
+        None if most < 2.0 * least => (points.iter().map(|p| p.1).fold(0.0, f64::max), 0.0),
+        None => {
+            let n = points.len() as f64;
+            let (mx, my) = (
+                points.iter().map(|p| p.0).sum::<f64>() / n,
+                points.iter().map(|p| p.1).sum::<f64>() / n,
+            );
+            let sxx: f64 = points.iter().map(|p| (p.0 - mx) * (p.0 - mx)).sum();
+            let sxy: f64 = points.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+            let b = sxy / sxx;
+            let a = my - b * mx;
+            if b < 0.0 {
+                (my, 0.0)
+            } else if a < 0.0 {
+                let rate = points.iter().map(|p| p.0 * p.1).sum::<f64>()
+                    / points.iter().map(|p| p.0 * p.0).sum::<f64>();
+                (0.0, rate)
+            } else {
+                (a, b)
+            }
+        }
+    };
+    let departures: f64 = points
+        .iter()
+        .map(|(x, y)| {
+            let departure = (y + GRAIN_BYTES) / (fixed + slope * x + GRAIN_BYTES) - 1.0;
+            departure * departure
+        })
+        .sum();
+    Some(Measured {
+        fixed_bytes: fixed,
+        per_input_byte: slope,
+        output_per_input_byte: client.and_then(|c| c.output_per_input_byte),
+        spread: sqrt(departures / points.len() as f64),
+        units: points.len() as u64,
+        input_bytes_min: least as u64,
+        input_bytes_max: most as u64,
+    })
+}
+
 /// Whose a function's measured memory is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]

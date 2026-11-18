@@ -54,13 +54,24 @@ fn dealt_home(
     ((before + instance) % workers.max(1)) as u16
 }
 
+/// The instances of stage `stage_ix` that may be given work now: the first
+/// `Kernel::instances_ready` of its pool of `max` (system design 3A).
+fn ready(shared: &Shared, stage_ix: usize, max: usize) -> usize {
+    shared.stages[stage_ix]
+        .kernel
+        .instances_ready()
+        .clamp(1, max.max(1))
+}
+
 fn init_all(shared: &Shared) -> Result<()> {
     for index in 0..shared.stages.len() {
         let Some(max) = shared.stages[index].pool.as_ref().map(|pool| pool.max) else {
             continue;
         };
         let started = std::time::Instant::now();
-        for instance in 0..max {
+        // An instance not yet ready is made when its first work comes, by `acquire` (system
+        // design 3A: it is sized from what the stage's first instance finds).
+        for instance in 0..ready(shared, index, max) {
             let worker = home(shared, index, instance);
             shared.run_on_worker(
                 worker,
@@ -329,12 +340,14 @@ pub(crate) fn admissible(shared: &Shared, stage_ix: usize, worker: u16) -> bool 
         return true;
     };
     let slots = pool.slots.lock().unwrap_or_else(|e| e.into_inner());
+    let ready = ready(shared, stage_ix, slots.len());
     // stream P: a kernel that deals its instances takes any free one.
     if shared.stages[stage_ix].kernel.deals_instances() {
-        return slots.iter().any(|slot| !slot.in_use);
+        return slots.iter().take(ready).any(|slot| !slot.in_use);
     }
     slots
         .iter()
+        .take(ready)
         .any(|slot| !slot.in_use && (slot.owner == Some(worker) || borrowable(shared, slot.owner)))
 }
 
@@ -351,11 +364,13 @@ pub(crate) fn acquire(shared: &Shared, stage_ix: usize, worker: u16) -> Result<O
         return Ok(None);
     };
     let mut slots = pool.slots.lock().unwrap_or_else(|e| e.into_inner());
+    // Only the instances that may be given work now (system design 3A).
+    let ready = ready(shared, stage_ix, slots.len());
     // stream P: a kernel that deals its instances gets the next free one after the last dealt,
     // so one worker keeps every instance busy (an image's task processes).
     let dealt = if shared.stages[stage_ix].kernel.deals_instances() {
         let from = pool.dealt.load(Ordering::Relaxed);
-        let n = slots.len();
+        let n = ready;
         let next = (0..n).map(|k| (from + k) % n).find(|&at| !slots[at].in_use);
         if let Some(at) = next {
             pool.dealt.store(at + 1, Ordering::Relaxed);
@@ -367,6 +382,7 @@ pub(crate) fn acquire(shared: &Shared, stage_ix: usize, worker: u16) -> Result<O
     // f.4: prefer the instance this worker last held; else one whose home cannot come for it.
     let mine = slots
         .iter()
+        .take(ready)
         .position(|slot| !slot.in_use && slot.owner == Some(worker));
     let chosen = match (dealt, mine) {
         (Some(Some(index)), _) => index,
@@ -375,6 +391,7 @@ pub(crate) fn acquire(shared: &Shared, stage_ix: usize, worker: u16) -> Result<O
             Some(index) => index,
             None => match slots
                 .iter()
+                .take(ready)
                 .position(|slot| !slot.in_use && borrowable(shared, slot.owner))
             {
                 Some(index) => index,

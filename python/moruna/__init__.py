@@ -143,7 +143,7 @@ def run(
     checkpoint_interval: float = 5.0,
     keep_checkpoint: bool = False,
     resume: str | None = None,
-    cost: CostSession | None = None,
+    cost: CostSession | bool | None = None,
     engine_ports: EnginePorts | None = None,
     sandbox_python: str | None = None,
     sandbox_cgroup: str | None = None,
@@ -179,7 +179,11 @@ def run(
     ``resume`` takes ``"auto"``, a run id (32 hexadecimal characters) or a path to a
     ``manifest.json``, and is the only parameter a user meets after a failure (f.7).
 
-    ``cost`` shares the same configured observation store/model as registration warm-up.
+    ``cost`` is the observation store and model the run learns from and keeps what it measures
+    in (a ``moruna.CostSession``), the one ``moruna check`` warmed the functions up into. With no
+    ``cost`` the run uses the default store, ``~/.moruna/observations``, where ``moruna check``
+    keeps what it measures by default: what a check measured of a function's memory sizes the
+    run (system design 3A). ``cost=False`` reads no store and writes none.
     ``engine_ports`` is supplied by a native host with actual scoped retention/checkpoint
     authority; missing capabilities refuse explicitly.
 

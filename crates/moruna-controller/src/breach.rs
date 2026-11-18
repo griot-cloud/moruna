@@ -80,7 +80,7 @@ fn floor_footprint(state: &ControllerState) -> u64 {
     let mut footprint = state.state_total.saturating_add(model::anon_fixed(state));
     for at in 0..state.stages.len() {
         footprint =
-            footprint.saturating_add(model::anon_allowance(state, at, state.cfg.morsel_min));
+            footprint.saturating_add(model::anon_allowance(state, at, state.target_min(at)));
     }
     footprint
 }
@@ -115,7 +115,8 @@ pub(crate) fn check(state: &mut ControllerState, r: &TraceRecord, actions: &mut 
     if host_breach {
         refit_anon(state, at, r);
     }
-    let morsel_min = state.cfg.morsel_min;
+    // The stage's own floor: below `morsel_min` where its instances can take no more (3A).
+    let morsel_min = state.target_min(at);
     let at_floor = state.stages[at].target <= morsel_min;
     let (target_before, workers_before) = (state.stages[at].target, state.active_workers);
     {

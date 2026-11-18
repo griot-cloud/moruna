@@ -98,11 +98,27 @@ fn sha256_of(text: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// The most readings the node keeps of a function's image: its newest.
+pub const READINGS_KEPT: usize = 64;
+
+/// What the node keeps of a function's image beside its entry (system design 3A): its client's
+/// measurement, as the registration carried it, and the node's own readings, each instance's
+/// account peak beside the largest piece it was given, newest last.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Readings {
+    /// The image's SHA-256, as the entry has it: readings are of an image, not of a name.
+    sha256: String,
+    client: Option<Measured>,
+    /// `(largest piece, account peak)`, in bytes, at most [`READINGS_KEPT`].
+    pairs: Vec<(u64, u64)>,
+}
+
 /// The registered functions, and the keys a registration's signature is checked against.
 #[derive(Debug, Default)]
 pub(crate) struct Registry {
     keys: Vec<FunctionKey>,
     entries: BTreeMap<String, Function>,
+    readings: BTreeMap<String, Readings>,
 }
 
 impl Registry {
@@ -110,6 +126,7 @@ impl Registry {
         Self {
             keys,
             entries: BTreeMap::new(),
+            readings: BTreeMap::new(),
         }
     }
 
@@ -118,7 +135,25 @@ impl Registry {
     /// address, which only `node-admission`'s fetch is given ([`Registry::registered`]).
     pub(crate) fn register(&mut self, body: &[u8], now: u64) -> Answer {
         match self.registration(body, now) {
-            Ok(function) => {
+            Ok(mut function) => {
+                // What the node read of the image stays with it; a client's newer measurement
+                // gives the readings its slope (system design 3A).
+                let readings = self.readings.entry(function.name.clone()).or_default();
+                if readings.sha256 != function.sha256 {
+                    *readings = Readings {
+                        sha256: function.sha256.clone(),
+                        ..Readings::default()
+                    };
+                }
+                if function.measured_by == Some(MeasuredBy::Registration) {
+                    readings.client = function.measured.clone();
+                }
+                if let Some(node) =
+                    Measured::from_readings(&readings.pairs, readings.client.as_ref())
+                {
+                    function.measured = Some(node);
+                    function.measured_by = Some(MeasuredBy::Node);
+                }
                 let mut answer = Answer::ok(serde_json::to_vec(&function.shown()));
                 if answer.status == 200 {
                     answer.status = 201;
@@ -233,6 +268,31 @@ impl Registry {
             .iter()
             .filter_map(|name| self.entries.get(name.as_str()).cloned())
             .collect()
+    }
+
+    /// What a job's run read of the function `name` whose image was `sha256` when the job
+    /// started (system design 3A): each instance's largest piece and account peak. The node
+    /// keeps the newest [`READINGS_KEPT`] of the image's readings and measures the function
+    /// from them ([`Measured::from_readings`]), its measurement then the node's. Readings of an image the
+    /// name no longer has, or of a name no longer registered, are of nothing kept.
+    pub(crate) fn observe(&mut self, name: &str, sha256: &str, pairs: &[(u64, u64)]) {
+        let (Some(function), Some(readings)) =
+            (self.entries.get_mut(name), self.readings.get_mut(name))
+        else {
+            return;
+        };
+        if function.sha256 != sha256 || readings.sha256 != sha256 || pairs.is_empty() {
+            return;
+        }
+        readings
+            .pairs
+            .extend(pairs.iter().copied().filter(|(x, _)| *x > 0));
+        let excess = readings.pairs.len().saturating_sub(READINGS_KEPT);
+        readings.pairs.drain(..excess);
+        if let Some(node) = Measured::from_readings(&readings.pairs, readings.client.as_ref()) {
+            function.measured = Some(node);
+            function.measured_by = Some(MeasuredBy::Node);
+        }
     }
 
     /// A refusal for each of `names`, the functions a job uses, that is not registered.

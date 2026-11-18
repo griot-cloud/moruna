@@ -50,9 +50,55 @@ pub fn native_split(share: u64) -> (u64, u64) {
     (budget, account)
 }
 
+/// The largest piece one task of a stage takes (system design 3A; PM, 2026-11-18): its plane's
+/// piece, or `account`, the piece its account holds by the function's measured line, where that
+/// is less; `account` is 0 when nothing measured the function. A batch is cut at it, so none is
+/// past what its task's account holds, nor its plane's input region.
+pub fn piece_cap(plane: u64, account: u64) -> u64 {
+    if account == 0 {
+        plane
+    } else {
+        plane.min(account)
+    }
+}
+
 /// [`task_limit`] for a native task, out of its `share` ([`native_split`]).
 pub fn native_task_limit(share: u64, room: u64) -> Option<u64> {
     task_limit(native_split(share).1, room)
+}
+
+/// The pieces a measured function's instances are sized for, the largest first (system design
+/// 3A): from [`PIECE_MAX`] down to [`RING_MIN`], halving. When the job's instances do not all
+/// fit, the piece shrinks first, down to the least, and only then do fewer instances run (PM,
+/// 2026-11-18): memory bounds the unit of work, never the workers.
+pub const PIECES: [u64; 5] = [
+    PIECE_MAX,
+    PIECE_MAX / 2,
+    PIECE_MAX / 4,
+    PIECE_MAX / 8,
+    RING_MIN,
+];
+
+const _: () = assert!(PIECE_MAX / 16 == RING_MIN);
+
+/// The plane a task gets for pieces of `piece` bytes: the plane budget that makes its pieces
+/// that size ([`ring_sizes`]) and the bytes the plane then is (its region and its two rings
+/// objects of windows).
+pub fn plane_for(piece: u64) -> (u64, u64) {
+    let budget = piece.clamp(RING_MIN, PIECE_MAX) / 2 * PLANE_HALF_PIECES;
+    let s = ring_sizes(budget);
+    (budget, s.region + 2 * s.windows * s.window)
+}
+
+/// The account a measured task is carved at (system design 3A): `account` bytes, what the
+/// node's readings of the function say one of its processes holds at its piece, in whole pages,
+/// and never more than half of what is left in the engine's account (`room`), as
+/// [`task_limit`] keeps it. The least [`TASK_MIN`] is not applied: it is where a function with
+/// no measurement starts, and a measured function gets its measured need (PM, 2026-11-18).
+/// `None` when not a page is left.
+pub fn measured_task_limit(account: u64, room: u64) -> Option<u64> {
+    let limit = account.next_multiple_of(PAGE).min(room / 2) & !(PAGE - 1);
+    (limit >= PAGE).then_some(limit)
 }
 
 /// The least share a native task runs in: its account at [`TASK_MIN`] beside its plane at its
@@ -83,6 +129,10 @@ pub struct TaskFigures {
     pub peak: u64,
     /// Its account's limit, in bytes.
     pub limit: u64,
+    /// The largest piece it was given: the bytes of the batch's buffers, without the record's
+    /// framing. With `peak`, the pair a run refines the function's measured memory from
+    /// (system design 3A).
+    pub largest: u64,
 }
 
 /// The run report's note of a ring stage's tasks: each one's batches, CPU and account, and
@@ -96,13 +146,14 @@ pub fn stage_note(stage: &str, tasks: &[Option<TaskFigures>], busy_peak: usize) 
     for (i, t) in tasks.iter().enumerate() {
         match t {
             Some(t) => note.push_str(&format!(
-                "; task {i}: {} batches, {} records, {} deferred, cpu {}, account peak {} of {} bytes{}",
+                "; task {i}: {} batches, {} records, {} deferred, cpu {}, account peak {} of {} bytes, largest piece {} bytes{}",
                 t.batches,
                 t.records,
                 t.deferred,
                 t.cpu.map_or_else(|| "any".to_string(), |c| c.to_string()),
                 t.peak,
                 t.limit,
+                t.largest,
                 if t.states > 1 {
                     format!(", {} tasks in turn", t.states)
                 } else {
@@ -1022,6 +1073,47 @@ mod tests {
     }
 
     #[test]
+    fn a_task_s_piece_is_its_plane_s_or_less_where_its_account_holds_less() {
+        let plane = ring_sizes(native_split(256 << 20).0).piece;
+        assert_eq!(
+            piece_cap(plane, 0),
+            plane,
+            "nothing measured: the plane's piece"
+        );
+        assert_eq!(
+            piece_cap(plane, plane / 4),
+            plane / 4,
+            "the account holds less"
+        );
+        assert_eq!(
+            piece_cap(plane, plane * 4),
+            plane,
+            "never past the input region"
+        );
+    }
+
+    #[test]
+    fn a_measured_task_s_plane_is_for_its_piece_and_its_account_its_need() {
+        for piece in PIECES {
+            let (budget, bytes) = plane_for(piece);
+            let s = ring_sizes(budget);
+            assert_eq!(s.piece, piece, "the plane is for pieces of {piece} bytes");
+            assert_eq!(bytes, s.region + 2 * s.windows * s.window);
+            assert!(bytes <= OBJECT_MAX * 2);
+        }
+        // Out of the pieces' range, the nearest end.
+        assert_eq!(plane_for(1), plane_for(RING_MIN));
+        assert_eq!(plane_for(u64::MAX), plane_for(PIECE_MAX));
+        // Pieces of 16 MiB: 208 MiB of plane, as a share of 832 MiB makes.
+        assert_eq!(plane_for(PIECE_MAX).1, NATIVE_CHILD_MAX / 4);
+        // The account in whole pages, under half the room, and no least.
+        assert_eq!(measured_task_limit(4_758_480, 1 << 30), Some(4_759_552));
+        assert_eq!(measured_task_limit(64 << 20, 64 << 20), Some(32 << 20));
+        assert_eq!(measured_task_limit(1, 1 << 30), Some(PAGE));
+        assert_eq!(measured_task_limit(1 << 20, PAGE), None);
+    }
+
+    #[test]
     fn p_the_report_says_each_task_s_batches_cpu_and_account() {
         let t = TaskFigures {
             states: 1,
@@ -1031,6 +1123,7 @@ mod tests {
             cpu: Some(3),
             peak: 40 << 20,
             limit: 128 << 20,
+            largest: 16 << 20,
         };
         let note = stage_note("score", &[Some(t), None, Some(TaskFigures::default())], 2);
         assert!(
@@ -1039,7 +1132,7 @@ mod tests {
         );
         assert!(
             note.contains(
-                "task 0: 12 batches, 13 records, 2 deferred, cpu 3, account peak 41943040 of 134217728 bytes;"
+                "task 0: 12 batches, 13 records, 2 deferred, cpu 3, account peak 41943040 of 134217728 bytes, largest piece 16777216 bytes;"
             ),
             "{note}"
         );

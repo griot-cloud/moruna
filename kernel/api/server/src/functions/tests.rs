@@ -188,6 +188,89 @@ fn a_registration_s_measured_memory_is_kept_shown_and_handed_to_a_job() {
     );
 }
 
+/// System design 3A (6.3g phase 3): the node keeps a function's readings with its image and
+/// measures it from them; a registration's measurement gives them its slope; another image
+/// starts again.
+#[test]
+fn the_node_s_readings_of_an_image_refine_its_measurement() {
+    const MIB: u64 = 1 << 20;
+    let signer = Signer::new();
+    let mut registry = Registry::new(vec![FunctionKey::new(signer.public())]);
+    let sha = sha256_hex(IMAGE);
+    let plain = registration("gate-score", "https://images.example.com/s", IMAGE, &signer);
+    assert_eq!(registry.register(plain.as_bytes(), NOW).status, 201);
+    assert_eq!(registry.get("gate-score").unwrap().measured, None);
+
+    // A run's readings: the node's measurement, from them alone.
+    registry.observe(
+        "gate-score",
+        &sha,
+        &[(16 * MIB, 4 * MIB), (16 * MIB, 5 * MIB)],
+    );
+    let kept = registry.get("gate-score").unwrap();
+    assert_eq!(kept.measured_by, Some(MeasuredBy::Node));
+    assert_eq!(
+        kept.measured.as_ref().map(|m| m.fixed_bytes),
+        Some((5 * MIB) as f64)
+    );
+    let listed = serde_json::to_value(registry.list()).unwrap();
+    assert_eq!(listed["functions"][0]["measured_by"], "node");
+
+    // Readings of another image, of a name not registered, or of nothing change nothing.
+    registry.observe("gate-score", &"cd".repeat(32), &[(16 * MIB, 90 * MIB)]);
+    registry.observe("nobody", &sha, &[(16 * MIB, 90 * MIB)]);
+    registry.observe("gate-score", &sha, &[]);
+    registry.observe("gate-score", &sha, &[(0, 90 * MIB)]);
+    assert_eq!(
+        registry
+            .get("gate-score")
+            .unwrap()
+            .measured
+            .as_ref()
+            .map(|m| (m.fixed_bytes, m.units)),
+        Some(((5 * MIB) as f64, 2))
+    );
+
+    // The same image registered with its client's measurement: the client's slope, the node's
+    // fixed term, the node's measurement still.
+    let body = measured_registration("gate-score", IMAGE, &signer, measured());
+    assert_eq!(registry.register(body.as_bytes(), NOW + 1).status, 201);
+    let refined = registry.get("gate-score").unwrap();
+    assert_eq!(refined.measured_by, Some(MeasuredBy::Node));
+    let m = refined.measured.clone().unwrap();
+    assert_eq!(m.per_input_byte, 0.054);
+    assert!((m.fixed_bytes - ((5 * MIB) as f64 - 0.054 * (16 * MIB) as f64)).abs() < 1e-6);
+
+    // The newest READINGS_KEPT are kept.
+    for _ in 0..READINGS_KEPT {
+        registry.observe("gate-score", &sha, &[(16 * MIB, 3 * MIB)]);
+    }
+    let newest = registry
+        .get("gate-score")
+        .unwrap()
+        .measured
+        .clone()
+        .unwrap();
+    assert_eq!(newest.units, READINGS_KEPT as u64);
+    assert!((newest.fixed_bytes - ((3 * MIB) as f64 - 0.054 * (16 * MIB) as f64)).abs() < 1e-6);
+
+    // Another image under the name starts again: its client's measurement, the registration's.
+    let next = measured_registration("gate-score", b"\x7fELF the next build", &signer, measured());
+    assert_eq!(registry.register(next.as_bytes(), NOW + 2).status, 201);
+    let fresh = registry.get("gate-score").unwrap();
+    assert_eq!(fresh.measured_by, Some(MeasuredBy::Registration));
+    assert_eq!(fresh.measured.as_ref().map(|m| m.units), Some(21));
+    // And a plain registration of a new image carries nothing measured.
+    let other = registration(
+        "gate-score",
+        "https://images.example.com/o",
+        b"\x7fELF o",
+        &signer,
+    );
+    assert_eq!(registry.register(other.as_bytes(), NOW + 3).status, 201);
+    assert_eq!(registry.get("gate-score").unwrap().measured, None);
+}
+
 #[test]
 fn a_bad_signature_or_an_unknown_key_is_refused() {
     let signer = Signer::new();

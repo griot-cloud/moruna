@@ -24,6 +24,9 @@ const DEVICE_QUEUE_SHARE: f64 = 0.6;
 pub(crate) fn prepare(ctl: &Inner) -> Result<Budgets> {
     // Sampling is a call into another component, so it happens with no lock held (RC-I10).
     let sample = ctl.peers().sampler.sample()?;
+    // So is reading what each stage's instances can take (system design 3A), which the probe's
+    // size is held to before any tick has read it.
+    let stats = ctl.peers().stats.scheduler_stats();
 
     let (budgets, tier_budgets) = {
         let mut state = ctl.held();
@@ -108,6 +111,11 @@ pub(crate) fn prepare(ctl: &Inner) -> Result<Budgets> {
         for stage in stages {
             let mut sizer_ctl = crate::StageCtl::new(stage, &cfg, factory(stage));
             sizer_ctl.instances_live = state.max_instances(stage);
+            sizer_ctl.morsel_cap = stats
+                .per_stage
+                .iter()
+                .find(|counters| counters.stage == stage)
+                .and_then(|counters| counters.morsel_bytes_max);
             state.stages.push(sizer_ctl);
         }
         (budgets, tier_budgets)

@@ -16,14 +16,14 @@ struct State {
 
 struct Inner {
     state: Mutex<State>,
-    stats: SchedulerStats,
+    stats: Mutex<SchedulerStats>,
     probe_results: BTreeMap<StageId, ProbeResult>,
 }
 
 /// The scheduler's side of the controller's interface as a test sees it: it records every knob
 /// the controller writes and answers probes from a script.
 ///
-/// Knobs: `stats(SchedulerStats)`, `probe_result(stage, ProbeResult)`.
+/// Knobs: `stats(SchedulerStats)`, `set_stats(SchedulerStats)`, `probe_result(stage, ProbeResult)`.
 /// Observables: `writes()`, `terminated()`, and `snapshot()` through the `Knobs` trait.
 #[derive(Clone)]
 pub struct FakeKnobs {
@@ -42,7 +42,7 @@ impl FakeKnobs {
         FakeKnobs {
             inner: Arc::new(Inner {
                 state: Mutex::new(State::default()),
-                stats: SchedulerStats::default(),
+                stats: Mutex::new(SchedulerStats::default()),
                 probe_results: BTreeMap::new(),
             }),
         }
@@ -51,6 +51,12 @@ impl FakeKnobs {
     /// Knob: what `scheduler_stats()` reports.
     pub fn stats(self, stats: SchedulerStats) -> FakeKnobs {
         self.rebuild(|b| b.stats = stats)
+    }
+
+    /// Knob: what `scheduler_stats()` reports from now on, for a test whose scheduler's
+    /// counters change while the controller runs.
+    pub fn set_stats(&self, stats: SchedulerStats) {
+        *self.inner.stats.lock().unwrap_or_else(|e| e.into_inner()) = stats;
     }
 
     /// Knob: what `probe(stage, bytes)` returns for this stage.
@@ -76,7 +82,12 @@ impl FakeKnobs {
 
     fn rebuild(self, f: impl FnOnce(&mut Builder)) -> FakeKnobs {
         let mut builder = Builder {
-            stats: self.inner.stats.clone(),
+            stats: self
+                .inner
+                .stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
             probe_results: self.inner.probe_results.clone(),
         };
         f(&mut builder);
@@ -84,7 +95,7 @@ impl FakeKnobs {
         FakeKnobs {
             inner: Arc::new(Inner {
                 state: Mutex::new(state),
-                stats: builder.stats,
+                stats: Mutex::new(builder.stats),
                 probe_results: builder.probe_results,
             }),
         }
@@ -154,7 +165,11 @@ fn upsert_water(
 
 impl StatsSource for FakeKnobs {
     fn scheduler_stats(&self) -> SchedulerStats {
-        self.inner.stats.clone()
+        self.inner
+            .stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
