@@ -15,6 +15,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // The C library is linked with the SDK: relibc on the core.
 use moruna_function as _;
 
+// On the core, std's `_start` names the C library's start and end weakly, which takes no member
+// of an archive: this program names them outright, as build-core.sh's link does for the C ones.
+#[cfg(target_os = "moruna")]
+unsafe extern "C" {
+    fn moruna_libc_init();
+    fn moruna_libc_exit(code: c_int) -> !;
+}
+#[cfg(target_os = "moruna")]
+#[used]
+static C_LIBRARY: (unsafe extern "C" fn(), unsafe extern "C" fn(c_int) -> !) =
+    (moruna_libc_init, moruna_libc_exit);
+
 /// `pthread_t`, a word on each C library this runs against.
 type Pthread = usize;
 

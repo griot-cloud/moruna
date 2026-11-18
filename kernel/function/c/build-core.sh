@@ -59,14 +59,12 @@ includes=(-nostdinc -isystem "$out/include" -isystem "$resource")
 mkdir -p "$out/lib" "$out/include" "$out/bin" "$out/obj" "$out/debug"
 
 # 1. The archive: std, the SDK and relibc, with std's _start; and tests/threads.rs, a Rust
-# program on them. build-std.sh's flags, its digest of std's sources included, so a target
-# directory that is kept (a shared one) rebuilds std when they change.
+# program on them. build-std.sh's flags exactly, its digest of std's sources included, so a
+# target directory that is kept (a shared one, or build.sh's, where build-std.sh builds too)
+# rebuilds std when they change, and only then.
 flags="-C relocation-model=static -C relro-level=off -C force-unwind-tables=yes -C no-redzone=y"
 flags="$flags -Zunstable-options -C link-arg=-T$script -C link-arg=-static"
 flags="$flags --cfg getrandom_backend=\"custom\""
-# std's _start names the C library's start and end weakly, which takes no archive member: each
-# program on the C library names them outright (`undefined`, below for the C ones).
-flags="$flags -C link-arg=--undefined=moruna_libc_init -C link-arg=--undefined=moruna_libc_exit"
 inputs="$(python3 - "$kernel/.." <<'PY'
 import hashlib, os, sys
 root = sys.argv[1]
@@ -84,6 +82,8 @@ PY
 )"
 flags="$flags -C metadata=moruna-std-$inputs"
 unset CARGO_ENCODED_RUSTFLAGS
+# The SDK's crates are fetched first; the build then runs --offline, as build-std.sh's does.
+rustup run "$toolchain" cargo fetch --locked --manifest-path "$here/Cargo.toml"
 CC_x86_64_moruna="$cc" AR_x86_64_moruna="$ar" CFLAGS_x86_64_moruna="${cflags[*]}" \
 __CARGO_TESTS_ONLY_SRC_ROOT="$library" RUSTFLAGS="$flags" \
   rustup run "$toolchain" cargo build --release --locked --offline \
@@ -126,7 +126,8 @@ cp "$out/openlibm/libopenlibm.a" "$out/lib/"
 
 # 4. The C functions: each a static native program, its entry std's _start.
 compile() {
-  local object="$out/obj/$(basename "$1" .c).o"
+  local object
+  object="$out/obj/$(basename "$1" .c).o"
   "$cc" "${cflags[@]}" "${includes[@]}" -std=c11 -Wall -Wextra -Werror -I"$here" \
     -c "$here/$1" -o "$object"
   echo "$object"
@@ -134,6 +135,8 @@ compile() {
 link() {
   local name="$1"
   shift
+  # std's _start names the C library's start and end weakly, which takes no member of an
+  # archive: a program on the C library names them outright (tests/threads.rs in its source).
   "$lld" -flavor gnu -static -no-pie -z norelro --gc-sections -T "$script" \
     --undefined=moruna_libc_init --undefined=moruna_libc_exit \
     -o "$out/obj/$name" "$@" "$out/lib/libmoruna_function.a" "$out/lib/libopenlibm.a"
