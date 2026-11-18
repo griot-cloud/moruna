@@ -1,0 +1,328 @@
+{
+ "outputs": [
+  {
+   "name": "vendor_id",
+   "expr": {
+    "column": "vendor_id"
+   }
+  },
+  {
+   "name": "pickup_at",
+   "expr": {
+    "column": "pickup_at"
+   }
+  },
+  {
+   "name": "dropoff_at",
+   "expr": {
+    "column": "dropoff_at"
+   }
+  },
+  {
+   "name": "passenger_count",
+   "expr": {
+    "column": "passenger_count"
+   }
+  },
+  {
+   "name": "trip_distance",
+   "expr": {
+    "column": "trip_distance"
+   }
+  },
+  {
+   "name": "ratecode_id",
+   "expr": {
+    "column": "ratecode_id"
+   }
+  },
+  {
+   "name": "store_and_fwd_flag",
+   "expr": {
+    "column": "store_and_fwd_flag"
+   }
+  },
+  {
+   "name": "pu_location_id",
+   "expr": {
+    "column": "pu_location_id"
+   }
+  },
+  {
+   "name": "do_location_id",
+   "expr": {
+    "column": "do_location_id"
+   }
+  },
+  {
+   "name": "payment_type",
+   "expr": {
+    "column": "payment_type"
+   }
+  },
+  {
+   "name": "fare_amount",
+   "expr": {
+    "column": "fare_amount"
+   }
+  },
+  {
+   "name": "extra",
+   "expr": {
+    "column": "extra"
+   }
+  },
+  {
+   "name": "mta_tax",
+   "expr": {
+    "column": "mta_tax"
+   }
+  },
+  {
+   "name": "tip_amount",
+   "expr": {
+    "column": "tip_amount"
+   }
+  },
+  {
+   "name": "tolls_amount",
+   "expr": {
+    "column": "tolls_amount"
+   }
+  },
+  {
+   "name": "improvement_surcharge",
+   "expr": {
+    "column": "improvement_surcharge"
+   }
+  },
+  {
+   "name": "total_amount",
+   "expr": {
+    "column": "total_amount"
+   }
+  },
+  {
+   "name": "congestion_surcharge",
+   "expr": {
+    "column": "congestion_surcharge"
+   }
+  },
+  {
+   "name": "airport_fee",
+   "expr": {
+    "column": "airport_fee"
+   }
+  },
+  {
+   "name": "duration_s",
+   "expr": {
+    "call": "divide",
+    "args": [
+     {
+      "cast": {
+       "call": "subtract",
+       "args": [
+        {
+         "column": "dropoff_at"
+        },
+        {
+         "column": "pickup_at"
+        }
+       ]
+      },
+      "to": "int64"
+     },
+     {
+      "literal": 1000000.0
+     }
+    ]
+   }
+  },
+  {
+   "name": "mph",
+   "expr": {
+    "call": "divide",
+    "args": [
+     {
+      "column": "trip_distance"
+     },
+     {
+      "call": "divide",
+      "args": [
+       {
+        "call": "divide",
+        "args": [
+         {
+          "cast": {
+           "call": "subtract",
+           "args": [
+            {
+             "column": "dropoff_at"
+            },
+            {
+             "column": "pickup_at"
+            }
+           ]
+          },
+          "to": "int64"
+         },
+         {
+          "literal": 1000000.0
+         }
+        ]
+       },
+       {
+        "literal": 3600.0
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "fare_per_mile",
+   "expr": {
+    "call": "divide",
+    "args": [
+     {
+      "column": "fare_amount"
+     },
+     {
+      "column": "trip_distance"
+     }
+    ]
+   }
+  },
+  {
+   "name": "tip_share",
+   "expr": {
+    "call": "divide",
+    "args": [
+     {
+      "column": "tip_amount"
+     },
+     {
+      "column": "fare_amount"
+     }
+    ]
+   }
+  },
+  {
+   "name": "keep",
+   "expr": {
+    "call": "and",
+    "args": [
+     {
+      "call": "and",
+      "args": [
+       {
+        "call": "greater_equal",
+        "args": [
+         {
+          "call": "divide",
+          "args": [
+           {
+            "cast": {
+             "call": "subtract",
+             "args": [
+              {
+               "column": "dropoff_at"
+              },
+              {
+               "column": "pickup_at"
+              }
+             ]
+            },
+            "to": "int64"
+           },
+           {
+            "literal": 1000000.0
+           }
+          ]
+         },
+         {
+          "literal": 60.0
+         }
+        ]
+       },
+       {
+        "call": "less_equal",
+        "args": [
+         {
+          "call": "divide",
+          "args": [
+           {
+            "cast": {
+             "call": "subtract",
+             "args": [
+              {
+               "column": "dropoff_at"
+              },
+              {
+               "column": "pickup_at"
+              }
+             ]
+            },
+            "to": "int64"
+           },
+           {
+            "literal": 1000000.0
+           }
+          ]
+         },
+         {
+          "literal": 14400.0
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "call": "and",
+      "args": [
+       {
+        "call": "and",
+        "args": [
+         {
+          "call": "greater",
+          "args": [
+           {
+            "column": "trip_distance"
+           },
+           {
+            "literal": 0.0
+           }
+          ]
+         },
+         {
+          "call": "less",
+          "args": [
+           {
+            "column": "trip_distance"
+           },
+           {
+            "literal": 100.0
+           }
+          ]
+         }
+        ]
+       },
+       {
+        "call": "greater",
+        "args": [
+         {
+          "column": "fare_amount"
+         },
+         {
+          "literal": 0.0
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}

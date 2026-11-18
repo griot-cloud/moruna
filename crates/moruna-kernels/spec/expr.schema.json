@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:moruna:kernel:moruna.expr@1:arguments",
+  "title": "moruna.expr@1 arguments",
+  "description": "The `expr` kernel's arguments: named outputs, each a tree of Substrait's shape over Arrow compute's elementwise functions (spec/expr.md). The types and functions are checked against the input schema when the kernel is configured.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["outputs"],
+  "properties": {
+    "outputs": {
+      "description": "The output batch's columns, in order.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "expr"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "expr": { "$ref": "#/$defs/node" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "type": {
+      "description": "A type's spelling: bool, int8 to int64, uint8 to uint64, float, double, string, large_string, date32, timestamp[s|ms|us|ns] or timestamp[unit, tz=ZONE], duration[s|ms|us|ns]; any other Arrow type `moruna check` spells, for literals compared with a column of it.",
+      "type": "string",
+      "minLength": 1
+    },
+    "node": {
+      "oneOf": [
+        { "$ref": "#/$defs/column" },
+        { "$ref": "#/$defs/literal" },
+        { "$ref": "#/$defs/cast" },
+        { "$ref": "#/$defs/if" },
+        { "$ref": "#/$defs/switch" },
+        { "$ref": "#/$defs/call" }
+      ]
+    },
+    "column": {
+      "description": "An input column by name.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["column"],
+      "properties": { "column": { "type": "string" } }
+    },
+    "literal": {
+      "description": "A value: its JSON kind's type (boolean, int64, double, string) unless `type` names one. A null needs a type. A float may be \"NaN\", \"Infinity\" or \"-Infinity\".",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["literal"],
+      "properties": {
+        "literal": { "type": ["number", "string", "boolean", "null"] },
+        "type": { "$ref": "#/$defs/type" }
+      },
+      "if": { "properties": { "literal": { "type": "null" } } },
+      "then": { "required": ["literal", "type"] }
+    },
+    "cast": {
+      "description": "A conversion to another type. `safe` (the default) refuses a value that does not convert exactly.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cast", "to"],
+      "properties": {
+        "cast": { "$ref": "#/$defs/node" },
+        "to": { "$ref": "#/$defs/type" },
+        "safe": { "type": "boolean", "default": true }
+      }
+    },
+    "if": {
+      "description": "Arrow's case_when: the value of the first clause whose condition is true (a null condition counts as false), else `else`, else null.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["if"],
+      "properties": {
+        "if": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["when", "then"],
+            "properties": {
+              "when": { "$ref": "#/$defs/node" },
+              "then": { "$ref": "#/$defs/node" }
+            }
+          }
+        },
+        "else": { "$ref": "#/$defs/node" }
+      }
+    },
+    "switch": {
+      "description": "The value of the first case whose literal equals the argument (a null argument matches none), else `else`, else null.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["switch", "cases"],
+      "properties": {
+        "switch": { "$ref": "#/$defs/node" },
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["match", "then"],
+            "properties": {
+              "match": { "$ref": "#/$defs/literal" },
+              "then": { "$ref": "#/$defs/node" }
+            }
+          }
+        },
+        "else": { "$ref": "#/$defs/node" }
+      }
+    },
+    "call": {
+      "description": "A function of the vocabulary, by its Arrow compute name, with its arguments and options.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["call"],
+      "properties": {
+        "call": {
+          "enum": [
+            "add", "add_checked", "subtract", "subtract_checked", "multiply", "multiply_checked",
+            "divide", "divide_checked", "power", "power_checked", "negate", "negate_checked",
+            "abs", "abs_checked", "sign",
+            "sqrt", "sqrt_checked", "exp", "ln", "ln_checked", "log10", "log10_checked", "log2",
+            "log2_checked", "log1p", "log1p_checked", "sin", "sin_checked", "cos", "cos_checked",
+            "tan", "tan_checked", "asin", "asin_checked", "acos", "acos_checked", "atan", "atan2",
+            "round", "floor", "ceil", "trunc",
+            "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
+            "and", "and_kleene", "or", "or_kleene", "xor", "and_not", "and_not_kleene", "invert",
+            "is_null", "is_valid", "is_nan", "is_finite", "is_inf", "if_else", "coalesce",
+            "fill_null", "min_element_wise", "max_element_wise",
+            "year", "quarter", "month", "day", "day_of_week", "day_of_year", "iso_year",
+            "iso_week", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond"
+          ]
+        },
+        "args": { "type": "array", "items": { "$ref": "#/$defs/node" } },
+        "options": {
+          "type": "object",
+          "properties": {
+            "ndigits": { "type": "integer" },
+            "round_mode": {
+              "enum": [
+                "down", "up", "towards_zero", "towards_infinity", "half_down", "half_up",
+                "half_towards_zero", "half_towards_infinity", "half_to_even", "half_to_odd"
+              ]
+            },
+            "order": { "enum": ["ieee", "total"] },
+            "nan_is_null": { "type": "boolean" },
+            "skip_nulls": { "type": "boolean" },
+            "count_from_zero": { "type": "boolean" },
+            "week_start": { "type": "integer", "minimum": 1, "maximum": 7 }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  }
+}

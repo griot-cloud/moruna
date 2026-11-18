@@ -19,9 +19,9 @@
 use std::sync::Arc;
 
 use moruna_kernel::arrow::array::{
-    Array, ArrayRef, BooleanArray, Datum, Float64Array, Int64Array, Scalar, StringArray,
+    ArrayRef, BooleanArray, Float64Array, Int64Array, Scalar, StringArray,
 };
-use moruna_kernel::arrow::compute::kernels::{boolean, cast, cmp};
+use moruna_kernel::arrow::compute::kernels::cast;
 use moruna_kernel::arrow::datatypes::{DataType, Schema};
 use moruna_kernel::arrow::record_batch::RecordBatch;
 use moruna_kernel::declare::{ColumnDecl, TypeDecl};
@@ -421,33 +421,11 @@ impl Expr {
         }
     }
 
-    /// Evaluate over `batch`; null where SQL's three-valued logic says so.
+    /// Evaluate over `batch`; null where SQL's three-valued logic says so. The predicate is
+    /// evaluated as its `expr` translation (`crate::tree::legacy`), which replaces this
+    /// language's own evaluator.
     pub fn eval(&self, batch: &RecordBatch) -> Result<BooleanArray> {
-        let err = |e: moruna_kernel::arrow::error::ArrowError| {
-            MorunaError::Plan(format!("moruna.std.filter: {e}"))
-        };
-        Ok(match self {
-            Expr::Cmp(l, op, r) => {
-                let (left, right) = (datum(batch, l, r)?, datum(batch, r, l)?);
-                let (left, right): (&dyn Datum, &dyn Datum) = (left.as_ref(), right.as_ref());
-                match op {
-                    Op::Eq => cmp::eq(left, right),
-                    Op::Ne => cmp::neq(left, right),
-                    Op::Lt => cmp::lt(left, right),
-                    Op::Le => cmp::lt_eq(left, right),
-                    Op::Gt => cmp::gt(left, right),
-                    Op::Ge => cmp::gt_eq(left, right),
-                }
-                .map_err(err)?
-            }
-            Expr::IsNull(c) => boolean::is_null(column(batch, c)?.as_ref()).map_err(err)?,
-            Expr::IsNotNull(c) => boolean::is_not_null(column(batch, c)?.as_ref()).map_err(err)?,
-            Expr::And(a, b) => {
-                boolean::and_kleene(&a.eval(batch)?, &b.eval(batch)?).map_err(err)?
-            }
-            Expr::Or(a, b) => boolean::or_kleene(&a.eval(batch)?, &b.eval(batch)?).map_err(err)?,
-            Expr::Not(a) => boolean::not(&a.eval(batch)?).map_err(err)?,
-        })
+        crate::tree::legacy::Legacy::new(self.clone()).mask(batch)
     }
 }
 
@@ -456,30 +434,6 @@ fn column_type(schema: &Schema, name: &str) -> Result<DataType> {
         .field_with_name(name)
         .map(|f| f.data_type().clone())
         .map_err(|_| MorunaError::Plan(format!("moruna.std.filter: no column `{name}`")))
-}
-
-fn column(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
-    batch
-        .column_by_name(name)
-        .cloned()
-        .ok_or_else(|| MorunaError::Plan(format!("moruna.std.filter: no column `{name}`")))
-}
-
-/// One side of a comparison as a datum: a column as it is, a literal as a scalar of the other
-/// side's column type.
-fn datum(batch: &RecordBatch, this: &Operand, other: &Operand) -> Result<Box<dyn Datum>> {
-    match this {
-        Operand::Column(c) => Ok(Box::new(column(batch, c)?)),
-        Operand::Literal(lit) => {
-            let Operand::Column(c) = other else {
-                return Err(MorunaError::Plan(
-                    "moruna.std.filter: a comparison needs at least one column".into(),
-                ));
-            };
-            let ty = column(batch, c)?.data_type().clone();
-            Ok(Box::new(lit.scalar_of(&ty)?))
-        }
-    }
 }
 
 #[cfg(test)]

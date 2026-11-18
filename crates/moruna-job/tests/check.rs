@@ -253,7 +253,7 @@ fn jb_t8_settings_refusals() {
         name[0]
     );
     assert!(
-        name[0].message.ends_with("\"date_trunc\" and 2 more"),
+        name[0].message.ends_with("\"date_trunc\" and 3 more"),
         "{}",
         name[0]
     );

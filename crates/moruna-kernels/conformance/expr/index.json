@@ -1,0 +1,8213 @@
+{
+ "format": "moruna-kernel-corpus/1",
+ "kernel": "moruna.expr",
+ "cases": [
+  {
+   "name": "integer_arithmetic_wraps",
+   "version": 1,
+   "tests": [
+    "nulls",
+    "overflow"
+   ],
+   "about": "Integer add, subtract, multiply, power, negate and abs wrap at the result type's width, the minimum divided by -1 is 0, mixed widths take Arrow's common type, and a null gives null.",
+   "params": {
+    "outputs": [
+     {
+      "name": "add",
+      "expr": {
+       "call": "add",
+       "args": [
+        {
+         "column": "i"
+        },
+        {
+         "column": "j"
+        }
+       ]
+      }
+     },
+     {
+      "name": "subtract",
+      "expr": {
+       "call": "subtract",
+       "args": [
+        {
+         "column": "i"
+        },
+        {
+         "column": "j"
+        }
+       ]
+      }
+     },
+     {
+      "name": "multiply",
+      "expr": {
+       "call": "multiply",
+       "args": [
+        {
+         "column": "i"
+        },
+        {
+         "column": "j"
+        }
+       ]
+      }
+     },
+     {
+      "name": "divide",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "column": "i"
+        },
+        {
+         "column": "j"
+        }
+       ]
+      }
+     },
+     {
+      "name": "add_int32",
+      "expr": {
+       "call": "add",
+       "args": [
+        {
+         "column": "a"
+        },
+        {
+         "column": "a"
+        }
+       ]
+      }
+     },
+     {
+      "name": "add_uint8_int8",
+      "expr": {
+       "call": "add",
+       "args": [
+        {
+         "column": "u"
+        },
+        {
+         "column": "v"
+        }
+       ]
+      }
+     },
+     {
+      "name": "subtract_uint8",
+      "expr": {
+       "call": "subtract",
+       "args": [
+        {
+         "column": "u"
+        },
+        {
+         "literal": 2,
+         "type": "uint8"
+        }
+       ]
+      }
+     },
+     {
+      "name": "multiply_int8",
+      "expr": {
+       "call": "multiply",
+       "args": [
+        {
+         "column": "v"
+        },
+        {
+         "literal": 3,
+         "type": "int8"
+        }
+       ]
+      }
+     },
+     {
+      "name": "power",
+      "expr": {
+       "call": "power",
+       "args": [
+        {
+         "column": "j"
+        },
+        {
+         "literal": 63
+        }
+       ]
+      }
+     },
+     {
+      "name": "negate",
+      "expr": {
+       "call": "negate",
+       "args": [
+        {
+         "column": "i"
+        }
+       ]
+      }
+     },
+     {
+      "name": "negate_uint8",
+      "expr": {
+       "call": "negate",
+       "args": [
+        {
+         "column": "u"
+        }
+       ]
+      }
+     },
+     {
+      "name": "abs_int8",
+      "expr": {
+       "call": "abs",
+       "args": [
+        {
+         "column": "v"
+        }
+       ]
+      }
+     },
+     {
+      "name": "sign",
+      "expr": {
+       "call": "sign",
+       "args": [
+        {
+         "column": "i"
+        }
+       ]
+      }
+     },
+     {
+      "name": "sign_uint8",
+      "expr": {
+       "call": "sign",
+       "args": [
+        {
+         "column": "u"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "ints.in.arrow"
+    }
+   ],
+   "expected": "ints.expected.arrow"
+  },
+  {
+   "name": "checked_add_refuses_overflow",
+   "version": 1,
+   "tests": [
+    "overflow",
+    "error"
+   ],
+   "about": "add_checked of int64's maximum and 1 refuses the batch.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "call": "add_checked",
+       "args": [
+        {
+         "column": "i"
+        },
+        {
+         "column": "j"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "ints.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "apply",
+    "contains": "add_checked: overflow"
+   }
+  },
+  {
+   "name": "checked_divide_refuses_min_over_minus_one",
+   "version": 1,
+   "tests": [
+    "overflow",
+    "error"
+   ],
+   "about": "divide_checked of int64's minimum by -1 refuses the batch.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "call": "divide_checked",
+       "args": [
+        {
+         "column": "i"
+        },
+        {
+         "column": "j"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "ints.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "apply",
+    "contains": "overflow"
+   }
+  },
+  {
+   "name": "integer_divide_by_zero_refused",
+   "version": 1,
+   "tests": [
+    "error"
+   ],
+   "about": "An integer divided by zero refuses the batch in the unchecked form too.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "column": "j"
+        },
+        {
+         "call": "subtract",
+         "args": [
+          {
+           "column": "j"
+          },
+          {
+           "column": "j"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "ints.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "apply",
+    "contains": "divide by zero"
+   }
+  },
+  {
+   "name": "negative_integer_power_refused",
+   "version": 1,
+   "tests": [
+    "error"
+   ],
+   "about": "An integer to a negative integer power refuses the batch.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "call": "power",
+       "args": [
+        {
+         "column": "j"
+        },
+        {
+         "column": "v"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "ints.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "apply",
+    "contains": "negative integer powers"
+   }
+  },
+  {
+   "name": "errors_only_on_valid_rows",
+   "version": 1,
+   "tests": [
+    "nulls",
+    "overflow"
+   ],
+   "about": "An overflow or a zero divisor under a null row is no error: the row is null.",
+   "params": {
+    "outputs": [
+     {
+      "name": "multiply_checked",
+      "expr": {
+       "call": "multiply_checked",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ]
+      }
+     },
+     {
+      "name": "divide",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "column": "y"
+        },
+        {
+         "column": "z"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "quiet.in.arrow"
+    }
+   ],
+   "expected": "quiet.expected.arrow"
+  },
+  {
+   "name": "float_arithmetic_is_ieee",
+   "version": 1,
+   "tests": [
+    "nulls"
+   ],
+   "about": "Doubles and singles follow IEEE 754: x/0 is an infinity or NaN, overflow is an infinity the checked forms do not refuse, a single stays a single, an int with a double is a double.",
+   "params": {
+    "outputs": [
+     {
+      "name": "add",
+      "expr": {
+       "call": "add",
+       "args": [
+        {
+         "column": "f"
+        },
+        {
+         "column": "g"
+        }
+       ]
+      }
+     },
+     {
+      "name": "subtract",
+      "expr": {
+       "call": "subtract",
+       "args": [
+        {
+         "column": "f"
+        },
+        {
+         "column": "g"
+        }
+       ]
+      }
+     },
+     {
+      "name": "multiply",
+      "expr": {
+       "call": "multiply",
+       "args": [
+        {
+         "column": "f"
+        },
+        {
+         "column": "g"
+        }
+       ]
+      }
+     },
+     {
+      "name": "divide",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "column": "f"
+        },
+        {
+         "column": "g"
+        }
+       ]
+      }
+     },
+     {
+      "name": "add_checked",
+      "expr": {
+       "call": "add_checked",
+       "args": [
+        {
+         "column": "f"
+        },
+        {
+         "column": "f"
+        }
+       ]
+      }
+     },
+     {
+      "name": "multiply_checked",
+      "expr": {
+       "call": "multiply_checked",
+       "args": [
+        {
+         "column": "f"
+        },
+        {
+         "literal": 10.0
+        }
+       ]
+      }
+     },
+     {
+      "name": "float32",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "column": "h"
+        },
+        {
+         "literal": 3
+        }
+       ]
+      }
+     },
+     {
+      "name": "float32_times",
+      "expr": {
+       "call": "multiply",
+       "args": [
+        {
+         "column": "h"
+        },
+        {
+         "column": "h"
+        }
+       ]
+      }
+     },
+     {
+      "name": "int_and_double",
+      "expr": {
+       "call": "add",
+       "args": [
+        {
+         "column": "j"
+        },
+        {
+         "column": "f"
+        }
+       ]
+      }
+     },
+     {
+      "name": "power",
+      "expr": {
+       "call": "power",
+       "args": [
+        {
+         "column": "g"
+        },
+        {
+         "literal": 2.0
+        }
+       ]
+      }
+     },
+     {
+      "name": "negate",
+      "expr": {
+       "call": "negate",
+       "args": [
+        {
+         "column": "f"
+        }
+       ]
+      }
+     },
+     {
+      "name": "abs",
+      "expr": {
+       "call": "abs",
+       "args": [
+        {
+         "column": "f"
+        }
+       ]
+      }
+     },
+     {
+      "name": "sign",
+      "expr": {
+       "call": "sign",
+       "args": [
+        {
+         "column": "f"
+        }
+       ]
+      }
+     },
+     {
+      "name": "sign_float32",
+      "expr": {
+       "call": "sign",
+       "args": [
+        {
+         "column": "h"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "floats.in.arrow"
+    }
+   ],
+   "expected": "floats.expected.arrow"
+  },
+  {
+   "name": "divide_checked_refuses_zero",
+   "version": 1,
+   "tests": [
+    "error"
+   ],
+   "about": "divide_checked of a double by 0.0 refuses the batch.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "call": "divide_checked",
+       "args": [
+        {
+         "column": "f"
+        },
+        {
+         "column": "g"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "floats.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "apply",
+    "contains": "divide by zero"
+   }
+  },
+  {
+   "name": "comparisons_in_ieee_order",
+   "version": 1,
+   "tests": [
+    "nulls",
+    "ordering"
+   ],
+   "about": "Each comparison of doubles and of singles in IEEE order (the default): NaN compares false but not_equal, -0.0 equals 0.0.",
+   "params": {
+    "outputs": [
+     {
+      "name": "equal_x",
+      "expr": {
+       "call": "equal",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ]
+      }
+     },
+     {
+      "name": "equal_p",
+      "expr": {
+       "call": "equal",
+       "args": [
+        {
+         "column": "p"
+        },
+        {
+         "column": "q"
+        }
+       ]
+      }
+     },
+     {
+      "name": "not_equal_x",
+      "expr": {
+       "call": "not_equal",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ]
+      }
+     },
+     {
+      "name": "not_equal_p",
+      "expr": {
+       "call": "not_equal",
+       "args": [
+        {
+         "column": "p"
+        },
+        {
+         "column": "q"
+        }
+       ]
+      }
+     },
+     {
+      "name": "less_x",
+      "expr": {
+       "call": "less",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ]
+      }
+     },
+     {
+      "name": "less_p",
+      "expr": {
+       "call": "less",
+       "args": [
+        {
+         "column": "p"
+        },
+        {
+         "column": "q"
+        }
+       ]
+      }
+     },
+     {
+      "name": "less_equal_x",
+      "expr": {
+       "call": "less_equal",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ]
+      }
+     },
+     {
+      "name": "less_equal_p",
+      "expr": {
+       "call": "less_equal",
+       "args": [
+        {
+         "column": "p"
+        },
+        {
+         "column": "q"
+        }
+       ]
+      }
+     },
+     {
+      "name": "greater_x",
+      "expr": {
+       "call": "greater",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ]
+      }
+     },
+     {
+      "name": "greater_p",
+      "expr": {
+       "call": "greater",
+       "args": [
+        {
+         "column": "p"
+        },
+        {
+         "column": "q"
+        }
+       ]
+      }
+     },
+     {
+      "name": "greater_equal_x",
+      "expr": {
+       "call": "greater_equal",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ]
+      }
+     },
+     {
+      "name": "greater_equal_p",
+      "expr": {
+       "call": "greater_equal",
+       "args": [
+        {
+         "column": "p"
+        },
+        {
+         "column": "q"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "compare.in.arrow"
+    }
+   ],
+   "expected": "compare_ieee.expected.arrow"
+  },
+  {
+   "name": "comparisons_in_total_order",
+   "version": 1,
+   "tests": [
+    "nulls",
+    "ordering",
+    "params"
+   ],
+   "about": "Each comparison of doubles and of singles with \"order\": \"total\": NaN equals NaN and is above every number, -0.0 is below 0.0.",
+   "params": {
+    "outputs": [
+     {
+      "name": "equal_x",
+      "expr": {
+       "call": "equal",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ],
+       "options": {
+        "order": "total"
+       }
+      }
+     },
+     {
+      "name": "equal_p",
+      "expr": {
+       "call": "equal",
+       "args": [
+        {
+         "column": "p"
+        },
+        {
+         "column": "q"
+        }
+       ],
+       "options": {
+        "order": "total"
+       }
+      }
+     },
+     {
+      "name": "not_equal_x",
+      "expr": {
+       "call": "not_equal",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ],
+       "options": {
+        "order": "total"
+       }
+      }
+     },
+     {
+      "name": "not_equal_p",
+      "expr": {
+       "call": "not_equal",
+       "args": [
+        {
+         "column": "p"
+        },
+        {
+         "column": "q"
+        }
+       ],
+       "options": {
+        "order": "total"
+       }
+      }
+     },
+     {
+      "name": "less_x",
+      "expr": {
+       "call": "less",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ],
+       "options": {
+        "order": "total"
+       }
+      }
+     },
+     {
+      "name": "less_p",
+      "expr": {
+       "call": "less",
+       "args": [
+        {
+         "column": "p"
+        },
+        {
+         "column": "q"
+        }
+       ],
+       "options": {
+        "order": "total"
+       }
+      }
+     },
+     {
+      "name": "less_equal_x",
+      "expr": {
+       "call": "less_equal",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ],
+       "options": {
+        "order": "total"
+       }
+      }
+     },
+     {
+      "name": "less_equal_p",
+      "expr": {
+       "call": "less_equal",
+       "args": [
+        {
+         "column": "p"
+        },
+        {
+         "column": "q"
+        }
+       ],
+       "options": {
+        "order": "total"
+       }
+      }
+     },
+     {
+      "name": "greater_x",
+      "expr": {
+       "call": "greater",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ],
+       "options": {
+        "order": "total"
+       }
+      }
+     },
+     {
+      "name": "greater_p",
+      "expr": {
+       "call": "greater",
+       "args": [
+        {
+         "column": "p"
+        },
+        {
+         "column": "q"
+        }
+       ],
+       "options": {
+        "order": "total"
+       }
+      }
+     },
+     {
+      "name": "greater_equal_x",
+      "expr": {
+       "call": "greater_equal",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ],
+       "options": {
+        "order": "total"
+       }
+      }
+     },
+     {
+      "name": "greater_equal_p",
+      "expr": {
+       "call": "greater_equal",
+       "args": [
+        {
+         "column": "p"
+        },
+        {
+         "column": "q"
+        }
+       ],
+       "options": {
+        "order": "total"
+       }
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "compare.in.arrow"
+    }
+   ],
+   "expected": "compare_total.expected.arrow"
+  },
+  {
+   "name": "comparisons_of_other_types",
+   "version": 1,
+   "tests": [
+    "nulls",
+    "ordering"
+   ],
+   "about": "Strings by their bytes (string with large_string), false before true, mixed integers and an int with a double by Arrow's common type, timestamps of two units as instants, dates, durations, and a decimal (an opaque type) through Arrow's kernels.",
+   "params": {
+    "outputs": [
+     {
+      "name": "strings",
+      "expr": {
+       "call": "less",
+       "args": [
+        {
+         "column": "s"
+        },
+        {
+         "column": "l"
+        }
+       ]
+      }
+     },
+     {
+      "name": "string_literal",
+      "expr": {
+       "call": "equal",
+       "args": [
+        {
+         "column": "s"
+        },
+        {
+         "literal": "B"
+        }
+       ]
+      }
+     },
+     {
+      "name": "bools",
+      "expr": {
+       "call": "less",
+       "args": [
+        {
+         "column": "b"
+        },
+        {
+         "column": "c"
+        }
+       ]
+      }
+     },
+     {
+      "name": "int32_uint16",
+      "expr": {
+       "call": "greater_equal",
+       "args": [
+        {
+         "column": "i"
+        },
+        {
+         "column": "u"
+        }
+       ]
+      }
+     },
+     {
+      "name": "int_double",
+      "expr": {
+       "call": "equal",
+       "args": [
+        {
+         "column": "i"
+        },
+        {
+         "literal": 2.0
+        }
+       ]
+      }
+     },
+     {
+      "name": "timestamps",
+      "expr": {
+       "call": "less",
+       "args": [
+        {
+         "column": "ts"
+        },
+        {
+         "column": "tu"
+        }
+       ]
+      }
+     },
+     {
+      "name": "dates",
+      "expr": {
+       "call": "less_equal",
+       "args": [
+        {
+         "column": "d"
+        },
+        {
+         "column": "e"
+        }
+       ]
+      }
+     },
+     {
+      "name": "durations",
+      "expr": {
+       "call": "less",
+       "args": [
+        {
+         "column": "k"
+        },
+        {
+         "literal": 0,
+         "type": "duration[s]"
+        }
+       ]
+      }
+     },
+     {
+      "name": "decimals",
+      "expr": {
+       "call": "equal",
+       "args": [
+        {
+         "column": "m"
+        },
+        {
+         "literal": "1.25",
+         "type": "decimal128(10, 2)"
+        }
+       ]
+      }
+     },
+     {
+      "name": "decimals_less",
+      "expr": {
+       "call": "less",
+       "args": [
+        {
+         "column": "m"
+        },
+        {
+         "literal": "1.00",
+         "type": "decimal128(10, 2)"
+        }
+       ]
+      }
+     },
+     {
+      "name": "decimal_valid",
+      "expr": {
+       "call": "is_valid",
+       "args": [
+        {
+         "column": "m"
+        }
+       ]
+      }
+     },
+     {
+      "name": "decimal_column",
+      "expr": {
+       "column": "m"
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "compare_types.in.arrow"
+    }
+   ],
+   "expected": "compare_types.expected.arrow"
+  },
+  {
+   "name": "boolean_logic_with_nulls",
+   "version": 1,
+   "tests": [
+    "nulls"
+   ],
+   "about": "Every pair of true, false and null through each Boolean function; the Kleene forms decide a row by a known operand.",
+   "params": {
+    "outputs": [
+     {
+      "name": "and",
+      "expr": {
+       "call": "and",
+       "args": [
+        {
+         "column": "l"
+        },
+        {
+         "column": "r"
+        }
+       ]
+      }
+     },
+     {
+      "name": "and_kleene",
+      "expr": {
+       "call": "and_kleene",
+       "args": [
+        {
+         "column": "l"
+        },
+        {
+         "column": "r"
+        }
+       ]
+      }
+     },
+     {
+      "name": "or",
+      "expr": {
+       "call": "or",
+       "args": [
+        {
+         "column": "l"
+        },
+        {
+         "column": "r"
+        }
+       ]
+      }
+     },
+     {
+      "name": "or_kleene",
+      "expr": {
+       "call": "or_kleene",
+       "args": [
+        {
+         "column": "l"
+        },
+        {
+         "column": "r"
+        }
+       ]
+      }
+     },
+     {
+      "name": "xor",
+      "expr": {
+       "call": "xor",
+       "args": [
+        {
+         "column": "l"
+        },
+        {
+         "column": "r"
+        }
+       ]
+      }
+     },
+     {
+      "name": "and_not",
+      "expr": {
+       "call": "and_not",
+       "args": [
+        {
+         "column": "l"
+        },
+        {
+         "column": "r"
+        }
+       ]
+      }
+     },
+     {
+      "name": "and_not_kleene",
+      "expr": {
+       "call": "and_not_kleene",
+       "args": [
+        {
+         "column": "l"
+        },
+        {
+         "column": "r"
+        }
+       ]
+      }
+     },
+     {
+      "name": "invert",
+      "expr": {
+       "call": "invert",
+       "args": [
+        {
+         "column": "l"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "logic.in.arrow"
+    }
+   ],
+   "expected": "logic.expected.arrow"
+  },
+  {
+   "name": "null_tests_and_selection",
+   "version": 1,
+   "tests": [
+    "nulls"
+   ],
+   "about": "is_null (with and without nan_is_null), is_valid, is_nan, is_finite and is_inf; if_else (a null condition is null), an if (a null condition counts as false), a switch (a null argument matches nothing), coalesce and fill_null, in Arrow's common types.",
+   "params": {
+    "outputs": [
+     {
+      "name": "is_null",
+      "expr": {
+       "call": "is_null",
+       "args": [
+        {
+         "column": "f"
+        }
+       ]
+      }
+     },
+     {
+      "name": "is_null_nan",
+      "expr": {
+       "call": "is_null",
+       "args": [
+        {
+         "column": "f"
+        }
+       ],
+       "options": {
+        "nan_is_null": true
+       }
+      }
+     },
+     {
+      "name": "is_valid",
+      "expr": {
+       "call": "is_valid",
+       "args": [
+        {
+         "column": "s"
+        }
+       ]
+      }
+     },
+     {
+      "name": "is_nan",
+      "expr": {
+       "call": "is_nan",
+       "args": [
+        {
+         "column": "f"
+        }
+       ]
+      }
+     },
+     {
+      "name": "is_finite",
+      "expr": {
+       "call": "is_finite",
+       "args": [
+        {
+         "column": "f"
+        }
+       ]
+      }
+     },
+     {
+      "name": "is_inf",
+      "expr": {
+       "call": "is_inf",
+       "args": [
+        {
+         "call": "divide",
+         "args": [
+          {
+           "column": "f"
+          },
+          {
+           "literal": 0.0
+          }
+         ]
+        }
+       ]
+      }
+     },
+     {
+      "name": "is_nan_int",
+      "expr": {
+       "call": "is_nan",
+       "args": [
+        {
+         "column": "i"
+        }
+       ]
+      }
+     },
+     {
+      "name": "is_finite_int",
+      "expr": {
+       "call": "is_finite",
+       "args": [
+        {
+         "column": "i"
+        }
+       ]
+      }
+     },
+     {
+      "name": "if_else",
+      "expr": {
+       "call": "if_else",
+       "args": [
+        {
+         "column": "b"
+        },
+        {
+         "column": "i"
+        },
+        {
+         "column": "f"
+        }
+       ]
+      }
+     },
+     {
+      "name": "coalesce",
+      "expr": {
+       "call": "coalesce",
+       "args": [
+        {
+         "column": "f"
+        },
+        {
+         "column": "i"
+        },
+        {
+         "literal": 9.5
+        }
+       ]
+      }
+     },
+     {
+      "name": "coalesce_strings",
+      "expr": {
+       "call": "coalesce",
+       "args": [
+        {
+         "column": "s"
+        },
+        {
+         "literal": "?",
+         "type": "large_string"
+        }
+       ]
+      }
+     },
+     {
+      "name": "fill_null",
+      "expr": {
+       "call": "fill_null",
+       "args": [
+        {
+         "column": "s"
+        },
+        {
+         "literal": "-"
+        }
+       ]
+      }
+     },
+     {
+      "name": "fill_null_time",
+      "expr": {
+       "call": "fill_null",
+       "args": [
+        {
+         "column": "t"
+        },
+        {
+         "literal": 5,
+         "type": "timestamp[s]"
+        }
+       ]
+      }
+     },
+     {
+      "name": "if",
+      "expr": {
+       "if": [
+        {
+         "when": {
+          "column": "b"
+         },
+         "then": {
+          "column": "i"
+         }
+        },
+        {
+         "when": {
+          "call": "is_null",
+          "args": [
+           {
+            "column": "b"
+           }
+          ]
+         },
+         "then": {
+          "literal": 9
+         }
+        }
+       ],
+       "else": {
+        "literal": 0
+       }
+      }
+     },
+     {
+      "name": "if_no_else",
+      "expr": {
+       "if": [
+        {
+         "when": {
+          "column": "b"
+         },
+         "then": {
+          "column": "i"
+         }
+        }
+       ]
+      }
+     },
+     {
+      "name": "switch",
+      "expr": {
+       "switch": {
+        "column": "n"
+       },
+       "cases": [
+        {
+         "match": {
+          "literal": 1
+         },
+         "then": {
+          "literal": "one"
+         }
+        },
+        {
+         "match": {
+          "literal": 2
+         },
+         "then": {
+          "column": "s"
+         }
+        }
+       ],
+       "else": {
+        "literal": "other"
+       }
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "select.in.arrow"
+    }
+   ],
+   "expected": "select.expected.arrow"
+  },
+  {
+   "name": "element_wise_extremes",
+   "version": 1,
+   "tests": [
+    "nulls"
+   ],
+   "about": "min and max element-wise ignore NaN unless all are NaN, put 0.0 above -0.0, skip nulls unless told not to, and compare an int with a double, and timestamps of two units.",
+   "params": {
+    "outputs": [
+     {
+      "name": "max",
+      "expr": {
+       "call": "max_element_wise",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ]
+      }
+     },
+     {
+      "name": "min",
+      "expr": {
+       "call": "min_element_wise",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ]
+      }
+     },
+     {
+      "name": "max_strict",
+      "expr": {
+       "call": "max_element_wise",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ],
+       "options": {
+        "skip_nulls": false
+       }
+      }
+     },
+     {
+      "name": "max_int_double",
+      "expr": {
+       "call": "max_element_wise",
+       "args": [
+        {
+         "column": "i"
+        },
+        {
+         "literal": 2.5
+        }
+       ]
+      }
+     },
+     {
+      "name": "min_ints",
+      "expr": {
+       "call": "min_element_wise",
+       "args": [
+        {
+         "column": "i"
+        },
+        {
+         "literal": 2
+        }
+       ]
+      }
+     },
+     {
+      "name": "max_times",
+      "expr": {
+       "call": "max_element_wise",
+       "args": [
+        {
+         "column": "t"
+        },
+        {
+         "column": "s"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "extremes.in.arrow"
+    }
+   ],
+   "expected": "extremes.expected.arrow"
+  },
+  {
+   "name": "casts",
+   "version": 1,
+   "tests": [
+    "nulls",
+    "overflow",
+    "params"
+   ],
+   "about": "The table of casts: numbers, booleans, timestamps by unit, zone and date (a zoned timestamp's local date), dates, durations and strings; unsafe casts wrap integers, truncate times toward zero and hold an out-of-range float at the target's ends.",
+   "params": {
+    "outputs": [
+     {
+      "name": "double_to_int32",
+      "expr": {
+       "cast": {
+        "column": "f"
+       },
+       "to": "int32",
+       "safe": false
+      }
+     },
+     {
+      "name": "int_to_int8_unsafe",
+      "expr": {
+       "cast": {
+        "column": "i"
+       },
+       "to": "int8",
+       "safe": false
+      }
+     },
+     {
+      "name": "int_to_double",
+      "expr": {
+       "cast": {
+        "column": "i"
+       },
+       "to": "double"
+      }
+     },
+     {
+      "name": "uint_to_int_unsafe",
+      "expr": {
+       "cast": {
+        "column": "u"
+       },
+       "to": "int64",
+       "safe": false
+      }
+     },
+     {
+      "name": "uint_to_double",
+      "expr": {
+       "cast": {
+        "column": "u"
+       },
+       "to": "double",
+       "safe": false
+      }
+     },
+     {
+      "name": "bool_to_double",
+      "expr": {
+       "cast": {
+        "column": "b"
+       },
+       "to": "double"
+      }
+     },
+     {
+      "name": "bool_to_int8",
+      "expr": {
+       "cast": {
+        "column": "b"
+       },
+       "to": "int8"
+      }
+     },
+     {
+      "name": "double_to_bool",
+      "expr": {
+       "cast": {
+        "column": "f"
+       },
+       "to": "bool"
+      }
+     },
+     {
+      "name": "int_to_bool",
+      "expr": {
+       "cast": {
+        "column": "i"
+       },
+       "to": "bool"
+      }
+     },
+     {
+      "name": "single_to_double",
+      "expr": {
+       "cast": {
+        "column": "g"
+       },
+       "to": "double"
+      }
+     },
+     {
+      "name": "double_to_single",
+      "expr": {
+       "cast": {
+        "column": "f"
+       },
+       "to": "float"
+      }
+     },
+     {
+      "name": "us_to_s_unsafe",
+      "expr": {
+       "cast": {
+        "column": "t"
+       },
+       "to": "timestamp[s]",
+       "safe": false
+      }
+     },
+     {
+      "name": "us_to_ns",
+      "expr": {
+       "cast": {
+        "column": "t"
+       },
+       "to": "timestamp[ns]"
+      }
+     },
+     {
+      "name": "timestamp_to_int",
+      "expr": {
+       "cast": {
+        "column": "t"
+       },
+       "to": "int64"
+      }
+     },
+     {
+      "name": "int_to_timestamp",
+      "expr": {
+       "cast": {
+        "column": "i"
+       },
+       "to": "timestamp[ms]"
+      }
+     },
+     {
+      "name": "timestamp_to_date",
+      "expr": {
+       "cast": {
+        "column": "t"
+       },
+       "to": "date32"
+      }
+     },
+     {
+      "name": "zoned_to_date",
+      "expr": {
+       "cast": {
+        "column": "z"
+       },
+       "to": "date32"
+      }
+     },
+     {
+      "name": "zone_change",
+      "expr": {
+       "cast": {
+        "column": "t"
+       },
+       "to": "timestamp[us, tz=UTC]"
+      }
+     },
+     {
+      "name": "date_to_timestamp",
+      "expr": {
+       "cast": {
+        "column": "d"
+       },
+       "to": "timestamp[ms]"
+      }
+     },
+     {
+      "name": "date_to_int32",
+      "expr": {
+       "cast": {
+        "column": "d"
+       },
+       "to": "int32"
+      }
+     },
+     {
+      "name": "int_to_duration",
+      "expr": {
+       "cast": {
+        "column": "i"
+       },
+       "to": "duration[s]"
+      }
+     },
+     {
+      "name": "string_to_large",
+      "expr": {
+       "cast": {
+        "column": "s"
+       },
+       "to": "large_string"
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "casts.in.arrow"
+    }
+   ],
+   "expected": "casts.expected.arrow"
+  },
+  {
+   "name": "safe_cast_refuses_a_fraction",
+   "version": 1,
+   "tests": [
+    "error"
+   ],
+   "about": "A safe cast of 2.5 to int64 refuses the batch.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "cast": {
+        "call": "add",
+        "args": [
+         {
+          "column": "f"
+         },
+         {
+          "literal": 0.5
+         }
+        ]
+       },
+       "to": "int64"
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "casts.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "apply",
+    "contains": "was truncated"
+   }
+  },
+  {
+   "name": "safe_cast_refuses_out_of_range",
+   "version": 1,
+   "tests": [
+    "overflow",
+    "error"
+   ],
+   "about": "A safe cast of 300 to int8 refuses the batch.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "cast": {
+        "column": "i"
+       },
+       "to": "int8"
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "casts.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "apply",
+    "contains": "not in range"
+   }
+  },
+  {
+   "name": "safe_cast_refuses_lost_time",
+   "version": 1,
+   "tests": [
+    "error"
+   ],
+   "about": "A safe cast of 1.5 seconds in microseconds to seconds refuses the batch.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "cast": {
+        "column": "t"
+       },
+       "to": "timestamp[s]"
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "casts.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "apply",
+    "contains": "would lose data"
+   }
+  },
+  {
+   "name": "implicit_cast_refuses_int_past_2_53",
+   "version": 1,
+   "tests": [
+    "overflow",
+    "error"
+   ],
+   "about": "A uint64 of 2^64-1 added to a double does not become a double: the batch is refused.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "call": "add",
+       "args": [
+        {
+         "column": "u"
+        },
+        {
+         "literal": 1.0
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "casts.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "apply",
+    "contains": "not in range"
+   }
+  },
+  {
+   "name": "temporal_parts",
+   "version": 1,
+   "tests": [
+    "nulls"
+   ],
+   "about": "Every temporal part of timestamps of each unit, before and after 1970, in New York (across both 2024 clock changes) and at +05:30, and the date parts of date32.",
+   "params": {
+    "outputs": [
+     {
+      "name": "year_t",
+      "expr": {
+       "call": "year",
+       "args": [
+        {
+         "column": "t"
+        }
+       ]
+      }
+     },
+     {
+      "name": "quarter_t",
+      "expr": {
+       "call": "quarter",
+       "args": [
+        {
+         "column": "t"
+        }
+       ]
+      }
+     },
+     {
+      "name": "month_t",
+      "expr": {
+       "call": "month",
+       "args": [
+        {
+         "column": "t"
+        }
+       ]
+      }
+     },
+     {
+      "name": "day_t",
+      "expr": {
+       "call": "day",
+       "args": [
+        {
+         "column": "t"
+        }
+       ]
+      }
+     },
+     {
+      "name": "day_of_week_t",
+      "expr": {
+       "call": "day_of_week",
+       "args": [
+        {
+         "column": "t"
+        }
+       ]
+      }
+     },
+     {
+      "name": "day_of_year_t",
+      "expr": {
+       "call": "day_of_year",
+       "args": [
+        {
+         "column": "t"
+        }
+       ]
+      }
+     },
+     {
+      "name": "iso_year_t",
+      "expr": {
+       "call": "iso_year",
+       "args": [
+        {
+         "column": "t"
+        }
+       ]
+      }
+     },
+     {
+      "name": "iso_week_t",
+      "expr": {
+       "call": "iso_week",
+       "args": [
+        {
+         "column": "t"
+        }
+       ]
+      }
+     },
+     {
+      "name": "hour_t",
+      "expr": {
+       "call": "hour",
+       "args": [
+        {
+         "column": "t"
+        }
+       ]
+      }
+     },
+     {
+      "name": "minute_t",
+      "expr": {
+       "call": "minute",
+       "args": [
+        {
+         "column": "t"
+        }
+       ]
+      }
+     },
+     {
+      "name": "second_t",
+      "expr": {
+       "call": "second",
+       "args": [
+        {
+         "column": "t"
+        }
+       ]
+      }
+     },
+     {
+      "name": "millisecond_t",
+      "expr": {
+       "call": "millisecond",
+       "args": [
+        {
+         "column": "t"
+        }
+       ]
+      }
+     },
+     {
+      "name": "microsecond_t",
+      "expr": {
+       "call": "microsecond",
+       "args": [
+        {
+         "column": "t"
+        }
+       ]
+      }
+     },
+     {
+      "name": "nanosecond_t",
+      "expr": {
+       "call": "nanosecond",
+       "args": [
+        {
+         "column": "t"
+        }
+       ]
+      }
+     },
+     {
+      "name": "year_z",
+      "expr": {
+       "call": "year",
+       "args": [
+        {
+         "column": "z"
+        }
+       ]
+      }
+     },
+     {
+      "name": "quarter_z",
+      "expr": {
+       "call": "quarter",
+       "args": [
+        {
+         "column": "z"
+        }
+       ]
+      }
+     },
+     {
+      "name": "month_z",
+      "expr": {
+       "call": "month",
+       "args": [
+        {
+         "column": "z"
+        }
+       ]
+      }
+     },
+     {
+      "name": "day_z",
+      "expr": {
+       "call": "day",
+       "args": [
+        {
+         "column": "z"
+        }
+       ]
+      }
+     },
+     {
+      "name": "day_of_week_z",
+      "expr": {
+       "call": "day_of_week",
+       "args": [
+        {
+         "column": "z"
+        }
+       ]
+      }
+     },
+     {
+      "name": "day_of_year_z",
+      "expr": {
+       "call": "day_of_year",
+       "args": [
+        {
+         "column": "z"
+        }
+       ]
+      }
+     },
+     {
+      "name": "iso_year_z",
+      "expr": {
+       "call": "iso_year",
+       "args": [
+        {
+         "column": "z"
+        }
+       ]
+      }
+     },
+     {
+      "name": "iso_week_z",
+      "expr": {
+       "call": "iso_week",
+       "args": [
+        {
+         "column": "z"
+        }
+       ]
+      }
+     },
+     {
+      "name": "hour_z",
+      "expr": {
+       "call": "hour",
+       "args": [
+        {
+         "column": "z"
+        }
+       ]
+      }
+     },
+     {
+      "name": "minute_z",
+      "expr": {
+       "call": "minute",
+       "args": [
+        {
+         "column": "z"
+        }
+       ]
+      }
+     },
+     {
+      "name": "second_z",
+      "expr": {
+       "call": "second",
+       "args": [
+        {
+         "column": "z"
+        }
+       ]
+      }
+     },
+     {
+      "name": "millisecond_z",
+      "expr": {
+       "call": "millisecond",
+       "args": [
+        {
+         "column": "z"
+        }
+       ]
+      }
+     },
+     {
+      "name": "microsecond_z",
+      "expr": {
+       "call": "microsecond",
+       "args": [
+        {
+         "column": "z"
+        }
+       ]
+      }
+     },
+     {
+      "name": "nanosecond_z",
+      "expr": {
+       "call": "nanosecond",
+       "args": [
+        {
+         "column": "z"
+        }
+       ]
+      }
+     },
+     {
+      "name": "year_o",
+      "expr": {
+       "call": "year",
+       "args": [
+        {
+         "column": "o"
+        }
+       ]
+      }
+     },
+     {
+      "name": "quarter_o",
+      "expr": {
+       "call": "quarter",
+       "args": [
+        {
+         "column": "o"
+        }
+       ]
+      }
+     },
+     {
+      "name": "month_o",
+      "expr": {
+       "call": "month",
+       "args": [
+        {
+         "column": "o"
+        }
+       ]
+      }
+     },
+     {
+      "name": "day_o",
+      "expr": {
+       "call": "day",
+       "args": [
+        {
+         "column": "o"
+        }
+       ]
+      }
+     },
+     {
+      "name": "day_of_week_o",
+      "expr": {
+       "call": "day_of_week",
+       "args": [
+        {
+         "column": "o"
+        }
+       ]
+      }
+     },
+     {
+      "name": "day_of_year_o",
+      "expr": {
+       "call": "day_of_year",
+       "args": [
+        {
+         "column": "o"
+        }
+       ]
+      }
+     },
+     {
+      "name": "iso_year_o",
+      "expr": {
+       "call": "iso_year",
+       "args": [
+        {
+         "column": "o"
+        }
+       ]
+      }
+     },
+     {
+      "name": "iso_week_o",
+      "expr": {
+       "call": "iso_week",
+       "args": [
+        {
+         "column": "o"
+        }
+       ]
+      }
+     },
+     {
+      "name": "hour_o",
+      "expr": {
+       "call": "hour",
+       "args": [
+        {
+         "column": "o"
+        }
+       ]
+      }
+     },
+     {
+      "name": "minute_o",
+      "expr": {
+       "call": "minute",
+       "args": [
+        {
+         "column": "o"
+        }
+       ]
+      }
+     },
+     {
+      "name": "second_o",
+      "expr": {
+       "call": "second",
+       "args": [
+        {
+         "column": "o"
+        }
+       ]
+      }
+     },
+     {
+      "name": "millisecond_o",
+      "expr": {
+       "call": "millisecond",
+       "args": [
+        {
+         "column": "o"
+        }
+       ]
+      }
+     },
+     {
+      "name": "microsecond_o",
+      "expr": {
+       "call": "microsecond",
+       "args": [
+        {
+         "column": "o"
+        }
+       ]
+      }
+     },
+     {
+      "name": "nanosecond_o",
+      "expr": {
+       "call": "nanosecond",
+       "args": [
+        {
+         "column": "o"
+        }
+       ]
+      }
+     },
+     {
+      "name": "year_n",
+      "expr": {
+       "call": "year",
+       "args": [
+        {
+         "column": "n"
+        }
+       ]
+      }
+     },
+     {
+      "name": "quarter_n",
+      "expr": {
+       "call": "quarter",
+       "args": [
+        {
+         "column": "n"
+        }
+       ]
+      }
+     },
+     {
+      "name": "month_n",
+      "expr": {
+       "call": "month",
+       "args": [
+        {
+         "column": "n"
+        }
+       ]
+      }
+     },
+     {
+      "name": "day_n",
+      "expr": {
+       "call": "day",
+       "args": [
+        {
+         "column": "n"
+        }
+       ]
+      }
+     },
+     {
+      "name": "day_of_week_n",
+      "expr": {
+       "call": "day_of_week",
+       "args": [
+        {
+         "column": "n"
+        }
+       ]
+      }
+     },
+     {
+      "name": "day_of_year_n",
+      "expr": {
+       "call": "day_of_year",
+       "args": [
+        {
+         "column": "n"
+        }
+       ]
+      }
+     },
+     {
+      "name": "iso_year_n",
+      "expr": {
+       "call": "iso_year",
+       "args": [
+        {
+         "column": "n"
+        }
+       ]
+      }
+     },
+     {
+      "name": "iso_week_n",
+      "expr": {
+       "call": "iso_week",
+       "args": [
+        {
+         "column": "n"
+        }
+       ]
+      }
+     },
+     {
+      "name": "hour_n",
+      "expr": {
+       "call": "hour",
+       "args": [
+        {
+         "column": "n"
+        }
+       ]
+      }
+     },
+     {
+      "name": "minute_n",
+      "expr": {
+       "call": "minute",
+       "args": [
+        {
+         "column": "n"
+        }
+       ]
+      }
+     },
+     {
+      "name": "second_n",
+      "expr": {
+       "call": "second",
+       "args": [
+        {
+         "column": "n"
+        }
+       ]
+      }
+     },
+     {
+      "name": "millisecond_n",
+      "expr": {
+       "call": "millisecond",
+       "args": [
+        {
+         "column": "n"
+        }
+       ]
+      }
+     },
+     {
+      "name": "microsecond_n",
+      "expr": {
+       "call": "microsecond",
+       "args": [
+        {
+         "column": "n"
+        }
+       ]
+      }
+     },
+     {
+      "name": "nanosecond_n",
+      "expr": {
+       "call": "nanosecond",
+       "args": [
+        {
+         "column": "n"
+        }
+       ]
+      }
+     },
+     {
+      "name": "year_d",
+      "expr": {
+       "call": "year",
+       "args": [
+        {
+         "column": "d"
+        }
+       ]
+      }
+     },
+     {
+      "name": "quarter_d",
+      "expr": {
+       "call": "quarter",
+       "args": [
+        {
+         "column": "d"
+        }
+       ]
+      }
+     },
+     {
+      "name": "month_d",
+      "expr": {
+       "call": "month",
+       "args": [
+        {
+         "column": "d"
+        }
+       ]
+      }
+     },
+     {
+      "name": "day_d",
+      "expr": {
+       "call": "day",
+       "args": [
+        {
+         "column": "d"
+        }
+       ]
+      }
+     },
+     {
+      "name": "day_of_week_d",
+      "expr": {
+       "call": "day_of_week",
+       "args": [
+        {
+         "column": "d"
+        }
+       ]
+      }
+     },
+     {
+      "name": "day_of_year_d",
+      "expr": {
+       "call": "day_of_year",
+       "args": [
+        {
+         "column": "d"
+        }
+       ]
+      }
+     },
+     {
+      "name": "iso_year_d",
+      "expr": {
+       "call": "iso_year",
+       "args": [
+        {
+         "column": "d"
+        }
+       ]
+      }
+     },
+     {
+      "name": "iso_week_d",
+      "expr": {
+       "call": "iso_week",
+       "args": [
+        {
+         "column": "d"
+        }
+       ]
+      }
+     },
+     {
+      "name": "day_of_week_sunday1",
+      "expr": {
+       "call": "day_of_week",
+       "args": [
+        {
+         "column": "t"
+        }
+       ],
+       "options": {
+        "count_from_zero": false,
+        "week_start": 7
+       }
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "temporal.in.arrow"
+    }
+   ],
+   "expected": "temporal.expected.arrow"
+  },
+  {
+   "name": "time_parts_of_a_date_refused",
+   "version": 1,
+   "tests": [
+    "error"
+   ],
+   "about": "hour of a date32 has no kernel: refused at plan.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "call": "hour",
+       "args": [
+        {
+         "column": "d"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "temporal.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "schema",
+    "contains": "no kernel"
+   }
+  },
+  {
+   "name": "temporal_arithmetic",
+   "version": 1,
+   "tests": [
+    "nulls"
+   ],
+   "about": "Timestamps minus timestamps of two units, plus and minus durations, dates minus dates (in seconds) and durations times integers, as Arrow types them.",
+   "params": {
+    "outputs": [
+     {
+      "name": "ts_minus_ts",
+      "expr": {
+       "call": "subtract",
+       "args": [
+        {
+         "column": "a"
+        },
+        {
+         "column": "s"
+        }
+       ]
+      }
+     },
+     {
+      "name": "ts_plus_duration",
+      "expr": {
+       "call": "add",
+       "args": [
+        {
+         "column": "s"
+        },
+        {
+         "column": "k"
+        }
+       ]
+      }
+     },
+     {
+      "name": "duration_plus_ts",
+      "expr": {
+       "call": "add",
+       "args": [
+        {
+         "column": "k"
+        },
+        {
+         "column": "a"
+        }
+       ]
+      }
+     },
+     {
+      "name": "ts_minus_duration",
+      "expr": {
+       "call": "subtract",
+       "args": [
+        {
+         "column": "a"
+        },
+        {
+         "column": "k"
+        }
+       ]
+      }
+     },
+     {
+      "name": "durations",
+      "expr": {
+       "call": "add",
+       "args": [
+        {
+         "column": "k"
+        },
+        {
+         "column": "k"
+        }
+       ]
+      }
+     },
+     {
+      "name": "days",
+      "expr": {
+       "call": "subtract",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "column": "y"
+        }
+       ]
+      }
+     },
+     {
+      "name": "times_three",
+      "expr": {
+       "call": "multiply",
+       "args": [
+        {
+         "column": "k"
+        },
+        {
+         "literal": 3
+        }
+       ]
+      }
+     },
+     {
+      "name": "as_int",
+      "expr": {
+       "cast": {
+        "call": "subtract",
+        "args": [
+         {
+          "column": "a"
+         },
+         {
+          "column": "s"
+         }
+        ]
+       },
+       "to": "int64"
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "temporal_arithmetic.in.arrow"
+    }
+   ],
+   "expected": "temporal_arithmetic.expected.arrow"
+  },
+  {
+   "name": "checked_time_overflow_refused",
+   "version": 1,
+   "tests": [
+    "overflow",
+    "error"
+   ],
+   "about": "add_checked past the last microsecond timestamp refuses the batch.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "call": "add_checked",
+       "args": [
+        {
+         "column": "m"
+        },
+        {
+         "column": "k"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "temporal_arithmetic.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "apply",
+    "contains": "overflow"
+   }
+  },
+  {
+   "name": "round_every_mode",
+   "version": 1,
+   "tests": [
+    "rounding",
+    "nulls"
+   ],
+   "about": "round in each of the ten modes at 0, 2 and -2 digits, on the exact binary value (7.095 is 7.09 at two digits), a zero keeping its sign; integers to tens; singles; floor, ceil, trunc.",
+   "params": {
+    "outputs": [
+     {
+      "name": "down_0",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 0,
+        "round_mode": "down"
+       }
+      }
+     },
+     {
+      "name": "down_2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 2,
+        "round_mode": "down"
+       }
+      }
+     },
+     {
+      "name": "down_m2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": -2,
+        "round_mode": "down"
+       }
+      }
+     },
+     {
+      "name": "down_int",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "i"
+        }
+       ],
+       "options": {
+        "ndigits": -1,
+        "round_mode": "down"
+       }
+      }
+     },
+     {
+      "name": "up_0",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 0,
+        "round_mode": "up"
+       }
+      }
+     },
+     {
+      "name": "up_2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 2,
+        "round_mode": "up"
+       }
+      }
+     },
+     {
+      "name": "up_m2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": -2,
+        "round_mode": "up"
+       }
+      }
+     },
+     {
+      "name": "up_int",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "i"
+        }
+       ],
+       "options": {
+        "ndigits": -1,
+        "round_mode": "up"
+       }
+      }
+     },
+     {
+      "name": "towards_zero_0",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 0,
+        "round_mode": "towards_zero"
+       }
+      }
+     },
+     {
+      "name": "towards_zero_2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 2,
+        "round_mode": "towards_zero"
+       }
+      }
+     },
+     {
+      "name": "towards_zero_m2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": -2,
+        "round_mode": "towards_zero"
+       }
+      }
+     },
+     {
+      "name": "towards_zero_int",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "i"
+        }
+       ],
+       "options": {
+        "ndigits": -1,
+        "round_mode": "towards_zero"
+       }
+      }
+     },
+     {
+      "name": "towards_infinity_0",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 0,
+        "round_mode": "towards_infinity"
+       }
+      }
+     },
+     {
+      "name": "towards_infinity_2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 2,
+        "round_mode": "towards_infinity"
+       }
+      }
+     },
+     {
+      "name": "towards_infinity_m2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": -2,
+        "round_mode": "towards_infinity"
+       }
+      }
+     },
+     {
+      "name": "towards_infinity_int",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "i"
+        }
+       ],
+       "options": {
+        "ndigits": -1,
+        "round_mode": "towards_infinity"
+       }
+      }
+     },
+     {
+      "name": "half_down_0",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 0,
+        "round_mode": "half_down"
+       }
+      }
+     },
+     {
+      "name": "half_down_2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 2,
+        "round_mode": "half_down"
+       }
+      }
+     },
+     {
+      "name": "half_down_m2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": -2,
+        "round_mode": "half_down"
+       }
+      }
+     },
+     {
+      "name": "half_down_int",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "i"
+        }
+       ],
+       "options": {
+        "ndigits": -1,
+        "round_mode": "half_down"
+       }
+      }
+     },
+     {
+      "name": "half_up_0",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 0,
+        "round_mode": "half_up"
+       }
+      }
+     },
+     {
+      "name": "half_up_2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 2,
+        "round_mode": "half_up"
+       }
+      }
+     },
+     {
+      "name": "half_up_m2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": -2,
+        "round_mode": "half_up"
+       }
+      }
+     },
+     {
+      "name": "half_up_int",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "i"
+        }
+       ],
+       "options": {
+        "ndigits": -1,
+        "round_mode": "half_up"
+       }
+      }
+     },
+     {
+      "name": "half_towards_zero_0",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 0,
+        "round_mode": "half_towards_zero"
+       }
+      }
+     },
+     {
+      "name": "half_towards_zero_2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 2,
+        "round_mode": "half_towards_zero"
+       }
+      }
+     },
+     {
+      "name": "half_towards_zero_m2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": -2,
+        "round_mode": "half_towards_zero"
+       }
+      }
+     },
+     {
+      "name": "half_towards_zero_int",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "i"
+        }
+       ],
+       "options": {
+        "ndigits": -1,
+        "round_mode": "half_towards_zero"
+       }
+      }
+     },
+     {
+      "name": "half_towards_infinity_0",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 0,
+        "round_mode": "half_towards_infinity"
+       }
+      }
+     },
+     {
+      "name": "half_towards_infinity_2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 2,
+        "round_mode": "half_towards_infinity"
+       }
+      }
+     },
+     {
+      "name": "half_towards_infinity_m2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": -2,
+        "round_mode": "half_towards_infinity"
+       }
+      }
+     },
+     {
+      "name": "half_towards_infinity_int",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "i"
+        }
+       ],
+       "options": {
+        "ndigits": -1,
+        "round_mode": "half_towards_infinity"
+       }
+      }
+     },
+     {
+      "name": "half_to_even_0",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 0,
+        "round_mode": "half_to_even"
+       }
+      }
+     },
+     {
+      "name": "half_to_even_2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 2,
+        "round_mode": "half_to_even"
+       }
+      }
+     },
+     {
+      "name": "half_to_even_m2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": -2,
+        "round_mode": "half_to_even"
+       }
+      }
+     },
+     {
+      "name": "half_to_even_int",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "i"
+        }
+       ],
+       "options": {
+        "ndigits": -1,
+        "round_mode": "half_to_even"
+       }
+      }
+     },
+     {
+      "name": "half_to_odd_0",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 0,
+        "round_mode": "half_to_odd"
+       }
+      }
+     },
+     {
+      "name": "half_to_odd_2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": 2,
+        "round_mode": "half_to_odd"
+       }
+      }
+     },
+     {
+      "name": "half_to_odd_m2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "x"
+        }
+       ],
+       "options": {
+        "ndigits": -2,
+        "round_mode": "half_to_odd"
+       }
+      }
+     },
+     {
+      "name": "half_to_odd_int",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "i"
+        }
+       ],
+       "options": {
+        "ndigits": -1,
+        "round_mode": "half_to_odd"
+       }
+      }
+     },
+     {
+      "name": "single_2",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "g"
+        }
+       ],
+       "options": {
+        "ndigits": 2
+       }
+      }
+     },
+     {
+      "name": "floor",
+      "expr": {
+       "call": "floor",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     },
+     {
+      "name": "ceil",
+      "expr": {
+       "call": "ceil",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     },
+     {
+      "name": "trunc",
+      "expr": {
+       "call": "trunc",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     },
+     {
+      "name": "floor_int",
+      "expr": {
+       "call": "floor",
+       "args": [
+        {
+         "column": "i"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "round.in.arrow"
+    }
+   ],
+   "expected": "round.expected.arrow"
+  },
+  {
+   "name": "round_int_overflow_refused",
+   "version": 1,
+   "tests": [
+    "overflow",
+    "error"
+   ],
+   "about": "Rounding int8's 127 up to tens refuses the batch.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "literal": 127,
+         "type": "int8"
+        }
+       ],
+       "options": {
+        "ndigits": -1,
+        "round_mode": "up"
+       }
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "round.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "apply",
+    "contains": "would overflow"
+   }
+  },
+  {
+   "name": "round_python_cases",
+   "version": 1,
+   "tests": [
+    "rounding"
+   ],
+   "about": "The 53,698 Audit fares of 2024-01 that pyarrow 24 rounds otherwise give Python's round(e, 2): half to even on the exact binary value.",
+   "params": {
+    "outputs": [
+     {
+      "name": "expected_fare",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "column": "e"
+        }
+       ],
+       "options": {
+        "ndigits": 2,
+        "round_mode": "half_to_even"
+       }
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "round_python.in.arrow"
+    }
+   ],
+   "expected": "round_python.expected.arrow"
+  },
+  {
+   "name": "unary_maths",
+   "version": 1,
+   "tests": [
+    "nulls"
+   ],
+   "about": "Each transcendental function within two units in the last place of pyarrow's; sqrt exact; an integer argument as a double, a single as a single.",
+   "params": {
+    "outputs": [
+     {
+      "name": "exp",
+      "expr": {
+       "call": "exp",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     },
+     {
+      "name": "ln",
+      "expr": {
+       "call": "ln",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     },
+     {
+      "name": "log10",
+      "expr": {
+       "call": "log10",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     },
+     {
+      "name": "log2",
+      "expr": {
+       "call": "log2",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     },
+     {
+      "name": "log1p",
+      "expr": {
+       "call": "log1p",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     },
+     {
+      "name": "sin",
+      "expr": {
+       "call": "sin",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     },
+     {
+      "name": "cos",
+      "expr": {
+       "call": "cos",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     },
+     {
+      "name": "tan",
+      "expr": {
+       "call": "tan",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     },
+     {
+      "name": "asin",
+      "expr": {
+       "call": "asin",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     },
+     {
+      "name": "acos",
+      "expr": {
+       "call": "acos",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     },
+     {
+      "name": "atan",
+      "expr": {
+       "call": "atan",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     },
+     {
+      "name": "atan2",
+      "expr": {
+       "call": "atan2",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "literal": 2
+        }
+       ]
+      }
+     },
+     {
+      "name": "power",
+      "expr": {
+       "call": "power",
+       "args": [
+        {
+         "column": "x"
+        },
+        {
+         "literal": 0.5
+        }
+       ]
+      }
+     },
+     {
+      "name": "sin_single",
+      "expr": {
+       "call": "sin",
+       "args": [
+        {
+         "column": "g"
+        }
+       ]
+      }
+     },
+     {
+      "name": "sqrt",
+      "expr": {
+       "call": "sqrt",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     },
+     {
+      "name": "sqrt_int",
+      "expr": {
+       "call": "sqrt",
+       "args": [
+        {
+         "column": "i"
+        }
+       ]
+      }
+     },
+     {
+      "name": "ln_checked",
+      "expr": {
+       "call": "ln_checked",
+       "args": [
+        {
+         "call": "if_else",
+         "args": [
+          {
+           "call": "equal",
+           "args": [
+            {
+             "column": "i"
+            },
+            {
+             "literal": 0
+            }
+           ]
+          },
+          {
+           "literal": null,
+           "type": "int32"
+          },
+          {
+           "column": "i"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "maths.in.arrow"
+    }
+   ],
+   "expected": "maths.expected.arrow",
+   "allowed": {
+    "exp": {
+     "file": "maths.exp.allowed.arrow"
+    },
+    "ln": {
+     "file": "maths.ln.allowed.arrow"
+    },
+    "log10": {
+     "file": "maths.log10.allowed.arrow"
+    },
+    "log2": {
+     "file": "maths.log2.allowed.arrow"
+    },
+    "log1p": {
+     "file": "maths.log1p.allowed.arrow"
+    },
+    "sin": {
+     "file": "maths.sin.allowed.arrow"
+    },
+    "cos": {
+     "file": "maths.cos.allowed.arrow"
+    },
+    "tan": {
+     "file": "maths.tan.allowed.arrow"
+    },
+    "asin": {
+     "file": "maths.asin.allowed.arrow"
+    },
+    "acos": {
+     "file": "maths.acos.allowed.arrow"
+    },
+    "atan": {
+     "file": "maths.atan.allowed.arrow"
+    },
+    "atan2": {
+     "file": "maths.atan2.allowed.arrow"
+    },
+    "power": {
+     "file": "maths.power.allowed.arrow"
+    },
+    "sin_single": {
+     "file": "maths.sin_single.allowed.arrow"
+    },
+    "ln_checked": {
+     "file": "maths.ln_checked.allowed.arrow"
+    }
+   }
+  },
+  {
+   "name": "ln_checked_refuses_negative",
+   "version": 1,
+   "tests": [
+    "error"
+   ],
+   "about": "ln_checked of -1.0 refuses the batch.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "call": "ln_checked",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "maths.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "apply",
+    "contains": "logarithm of negative number"
+   }
+  },
+  {
+   "name": "sqrt_checked_refuses_negative",
+   "version": 1,
+   "tests": [
+    "error"
+   ],
+   "about": "sqrt_checked of -1.0 refuses the batch.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "call": "sqrt_checked",
+       "args": [
+        {
+         "column": "x"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "maths.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "apply",
+    "contains": "square root of negative number"
+   }
+  },
+  {
+   "name": "audit_rule",
+   "version": 1,
+   "tests": [
+    "nulls",
+    "rounding"
+   ],
+   "about": "Audit's rule as one tree gives bench/vm/workloads.py's audit rows: a null distance counts as zero, a null rate code takes the standard branch, a null fare is never flagged, and the flag reads the unrounded fare while the output is rounded half to even at two decimals.",
+   "params": {
+    "outputs": [
+     {
+      "name": "vendor_id",
+      "expr": {
+       "column": "vendor_id"
+      }
+     },
+     {
+      "name": "pu_location_id",
+      "expr": {
+       "column": "pu_location_id"
+      }
+     },
+     {
+      "name": "fare_amount",
+      "expr": {
+       "column": "fare_amount"
+      }
+     },
+     {
+      "name": "expected_fare",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "if": [
+          {
+           "when": {
+            "call": "equal",
+            "args": [
+             {
+              "column": "ratecode_id"
+             },
+             {
+              "literal": 2.0
+             }
+            ]
+           },
+           "then": {
+            "literal": 70.0
+           }
+          }
+         ],
+         "else": {
+          "call": "if_else",
+          "args": [
+           {
+            "call": "and",
+            "args": [
+             {
+              "call": "greater_equal",
+              "args": [
+               {
+                "call": "hour",
+                "args": [
+                 {
+                  "column": "pickup_at"
+                 }
+                ]
+               },
+               {
+                "literal": 16
+               }
+              ]
+             },
+             {
+              "call": "less",
+              "args": [
+               {
+                "call": "hour",
+                "args": [
+                 {
+                  "column": "pickup_at"
+                 }
+                ]
+               },
+               {
+                "literal": 20
+               }
+              ]
+             }
+            ]
+           },
+           {
+            "call": "add",
+            "args": [
+             {
+              "call": "add",
+              "args": [
+               {
+                "call": "add",
+                "args": [
+                 {
+                  "literal": 3.0
+                 },
+                 {
+                  "call": "multiply",
+                  "args": [
+                   {
+                    "literal": 3.5
+                   },
+                   {
+                    "call": "coalesce",
+                    "args": [
+                     {
+                      "column": "trip_distance"
+                     },
+                     {
+                      "literal": 0.0
+                     }
+                    ]
+                   }
+                  ]
+                 }
+                ]
+               },
+               {
+                "call": "multiply",
+                "args": [
+                 {
+                  "literal": 0.35
+                 },
+                 {
+                  "call": "max_element_wise",
+                  "args": [
+                   {
+                    "call": "subtract",
+                    "args": [
+                     {
+                      "call": "max_element_wise",
+                      "args": [
+                       {
+                        "call": "divide",
+                        "args": [
+                         {
+                          "cast": {
+                           "call": "subtract",
+                           "args": [
+                            {
+                             "column": "dropoff_at"
+                            },
+                            {
+                             "column": "pickup_at"
+                            }
+                           ]
+                          },
+                          "to": "int64"
+                         },
+                         {
+                          "literal": 60000000.0
+                         }
+                        ]
+                       },
+                       {
+                        "literal": 0.0
+                       }
+                      ],
+                      "options": {
+                       "skip_nulls": false
+                      }
+                     },
+                     {
+                      "call": "multiply",
+                      "args": [
+                       {
+                        "call": "coalesce",
+                        "args": [
+                         {
+                          "column": "trip_distance"
+                         },
+                         {
+                          "literal": 0.0
+                         }
+                        ]
+                       },
+                       {
+                        "literal": 2.0
+                       }
+                      ]
+                     }
+                    ]
+                   },
+                   {
+                    "literal": 0.0
+                   }
+                  ],
+                  "options": {
+                   "skip_nulls": false
+                  }
+                 }
+                ]
+               }
+              ]
+             },
+             {
+              "literal": 2.5
+             }
+            ]
+           },
+           {
+            "call": "add",
+            "args": [
+             {
+              "call": "add",
+              "args": [
+               {
+                "literal": 3.0
+               },
+               {
+                "call": "multiply",
+                "args": [
+                 {
+                  "literal": 3.5
+                 },
+                 {
+                  "call": "coalesce",
+                  "args": [
+                   {
+                    "column": "trip_distance"
+                   },
+                   {
+                    "literal": 0.0
+                   }
+                  ]
+                 }
+                ]
+               }
+              ]
+             },
+             {
+              "call": "multiply",
+              "args": [
+               {
+                "literal": 0.35
+               },
+               {
+                "call": "max_element_wise",
+                "args": [
+                 {
+                  "call": "subtract",
+                  "args": [
+                   {
+                    "call": "max_element_wise",
+                    "args": [
+                     {
+                      "call": "divide",
+                      "args": [
+                       {
+                        "cast": {
+                         "call": "subtract",
+                         "args": [
+                          {
+                           "column": "dropoff_at"
+                          },
+                          {
+                           "column": "pickup_at"
+                          }
+                         ]
+                        },
+                        "to": "int64"
+                       },
+                       {
+                        "literal": 60000000.0
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 0.0
+                     }
+                    ],
+                    "options": {
+                     "skip_nulls": false
+                    }
+                   },
+                   {
+                    "call": "multiply",
+                    "args": [
+                     {
+                      "call": "coalesce",
+                      "args": [
+                       {
+                        "column": "trip_distance"
+                       },
+                       {
+                        "literal": 0.0
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 2.0
+                     }
+                    ]
+                   }
+                  ]
+                 },
+                 {
+                  "literal": 0.0
+                 }
+                ],
+                "options": {
+                 "skip_nulls": false
+                }
+               }
+              ]
+             }
+            ]
+           }
+          ]
+         }
+        }
+       ],
+       "options": {
+        "ndigits": 2,
+        "round_mode": "half_to_even"
+       }
+      }
+     },
+     {
+      "name": "flagged",
+      "expr": {
+       "call": "and_kleene",
+       "args": [
+        {
+         "call": "is_valid",
+         "args": [
+          {
+           "column": "fare_amount"
+          }
+         ]
+        },
+        {
+         "call": "greater",
+         "args": [
+          {
+           "call": "abs",
+           "args": [
+            {
+             "call": "subtract",
+             "args": [
+              {
+               "column": "fare_amount"
+              },
+              {
+               "if": [
+                {
+                 "when": {
+                  "call": "equal",
+                  "args": [
+                   {
+                    "column": "ratecode_id"
+                   },
+                   {
+                    "literal": 2.0
+                   }
+                  ]
+                 },
+                 "then": {
+                  "literal": 70.0
+                 }
+                }
+               ],
+               "else": {
+                "call": "if_else",
+                "args": [
+                 {
+                  "call": "and",
+                  "args": [
+                   {
+                    "call": "greater_equal",
+                    "args": [
+                     {
+                      "call": "hour",
+                      "args": [
+                       {
+                        "column": "pickup_at"
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 16
+                     }
+                    ]
+                   },
+                   {
+                    "call": "less",
+                    "args": [
+                     {
+                      "call": "hour",
+                      "args": [
+                       {
+                        "column": "pickup_at"
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 20
+                     }
+                    ]
+                   }
+                  ]
+                 },
+                 {
+                  "call": "add",
+                  "args": [
+                   {
+                    "call": "add",
+                    "args": [
+                     {
+                      "call": "add",
+                      "args": [
+                       {
+                        "literal": 3.0
+                       },
+                       {
+                        "call": "multiply",
+                        "args": [
+                         {
+                          "literal": 3.5
+                         },
+                         {
+                          "call": "coalesce",
+                          "args": [
+                           {
+                            "column": "trip_distance"
+                           },
+                           {
+                            "literal": 0.0
+                           }
+                          ]
+                         }
+                        ]
+                       }
+                      ]
+                     },
+                     {
+                      "call": "multiply",
+                      "args": [
+                       {
+                        "literal": 0.35
+                       },
+                       {
+                        "call": "max_element_wise",
+                        "args": [
+                         {
+                          "call": "subtract",
+                          "args": [
+                           {
+                            "call": "max_element_wise",
+                            "args": [
+                             {
+                              "call": "divide",
+                              "args": [
+                               {
+                                "cast": {
+                                 "call": "subtract",
+                                 "args": [
+                                  {
+                                   "column": "dropoff_at"
+                                  },
+                                  {
+                                   "column": "pickup_at"
+                                  }
+                                 ]
+                                },
+                                "to": "int64"
+                               },
+                               {
+                                "literal": 60000000.0
+                               }
+                              ]
+                             },
+                             {
+                              "literal": 0.0
+                             }
+                            ],
+                            "options": {
+                             "skip_nulls": false
+                            }
+                           },
+                           {
+                            "call": "multiply",
+                            "args": [
+                             {
+                              "call": "coalesce",
+                              "args": [
+                               {
+                                "column": "trip_distance"
+                               },
+                               {
+                                "literal": 0.0
+                               }
+                              ]
+                             },
+                             {
+                              "literal": 2.0
+                             }
+                            ]
+                           }
+                          ]
+                         },
+                         {
+                          "literal": 0.0
+                         }
+                        ],
+                        "options": {
+                         "skip_nulls": false
+                        }
+                       }
+                      ]
+                     }
+                    ]
+                   },
+                   {
+                    "literal": 2.5
+                   }
+                  ]
+                 },
+                 {
+                  "call": "add",
+                  "args": [
+                   {
+                    "call": "add",
+                    "args": [
+                     {
+                      "literal": 3.0
+                     },
+                     {
+                      "call": "multiply",
+                      "args": [
+                       {
+                        "literal": 3.5
+                       },
+                       {
+                        "call": "coalesce",
+                        "args": [
+                         {
+                          "column": "trip_distance"
+                         },
+                         {
+                          "literal": 0.0
+                         }
+                        ]
+                       }
+                      ]
+                     }
+                    ]
+                   },
+                   {
+                    "call": "multiply",
+                    "args": [
+                     {
+                      "literal": 0.35
+                     },
+                     {
+                      "call": "max_element_wise",
+                      "args": [
+                       {
+                        "call": "subtract",
+                        "args": [
+                         {
+                          "call": "max_element_wise",
+                          "args": [
+                           {
+                            "call": "divide",
+                            "args": [
+                             {
+                              "cast": {
+                               "call": "subtract",
+                               "args": [
+                                {
+                                 "column": "dropoff_at"
+                                },
+                                {
+                                 "column": "pickup_at"
+                                }
+                               ]
+                              },
+                              "to": "int64"
+                             },
+                             {
+                              "literal": 60000000.0
+                             }
+                            ]
+                           },
+                           {
+                            "literal": 0.0
+                           }
+                          ],
+                          "options": {
+                           "skip_nulls": false
+                          }
+                         },
+                         {
+                          "call": "multiply",
+                          "args": [
+                           {
+                            "call": "coalesce",
+                            "args": [
+                             {
+                              "column": "trip_distance"
+                             },
+                             {
+                              "literal": 0.0
+                             }
+                            ]
+                           },
+                           {
+                            "literal": 2.0
+                           }
+                          ]
+                         }
+                        ]
+                       },
+                       {
+                        "literal": 0.0
+                       }
+                      ],
+                      "options": {
+                       "skip_nulls": false
+                      }
+                     }
+                    ]
+                   }
+                  ]
+                 }
+                ]
+               }
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "call": "max_element_wise",
+           "args": [
+            {
+             "literal": 5.0
+            },
+            {
+             "call": "multiply",
+             "args": [
+              {
+               "literal": 0.25
+              },
+              {
+               "if": [
+                {
+                 "when": {
+                  "call": "equal",
+                  "args": [
+                   {
+                    "column": "ratecode_id"
+                   },
+                   {
+                    "literal": 2.0
+                   }
+                  ]
+                 },
+                 "then": {
+                  "literal": 70.0
+                 }
+                }
+               ],
+               "else": {
+                "call": "if_else",
+                "args": [
+                 {
+                  "call": "and",
+                  "args": [
+                   {
+                    "call": "greater_equal",
+                    "args": [
+                     {
+                      "call": "hour",
+                      "args": [
+                       {
+                        "column": "pickup_at"
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 16
+                     }
+                    ]
+                   },
+                   {
+                    "call": "less",
+                    "args": [
+                     {
+                      "call": "hour",
+                      "args": [
+                       {
+                        "column": "pickup_at"
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 20
+                     }
+                    ]
+                   }
+                  ]
+                 },
+                 {
+                  "call": "add",
+                  "args": [
+                   {
+                    "call": "add",
+                    "args": [
+                     {
+                      "call": "add",
+                      "args": [
+                       {
+                        "literal": 3.0
+                       },
+                       {
+                        "call": "multiply",
+                        "args": [
+                         {
+                          "literal": 3.5
+                         },
+                         {
+                          "call": "coalesce",
+                          "args": [
+                           {
+                            "column": "trip_distance"
+                           },
+                           {
+                            "literal": 0.0
+                           }
+                          ]
+                         }
+                        ]
+                       }
+                      ]
+                     },
+                     {
+                      "call": "multiply",
+                      "args": [
+                       {
+                        "literal": 0.35
+                       },
+                       {
+                        "call": "max_element_wise",
+                        "args": [
+                         {
+                          "call": "subtract",
+                          "args": [
+                           {
+                            "call": "max_element_wise",
+                            "args": [
+                             {
+                              "call": "divide",
+                              "args": [
+                               {
+                                "cast": {
+                                 "call": "subtract",
+                                 "args": [
+                                  {
+                                   "column": "dropoff_at"
+                                  },
+                                  {
+                                   "column": "pickup_at"
+                                  }
+                                 ]
+                                },
+                                "to": "int64"
+                               },
+                               {
+                                "literal": 60000000.0
+                               }
+                              ]
+                             },
+                             {
+                              "literal": 0.0
+                             }
+                            ],
+                            "options": {
+                             "skip_nulls": false
+                            }
+                           },
+                           {
+                            "call": "multiply",
+                            "args": [
+                             {
+                              "call": "coalesce",
+                              "args": [
+                               {
+                                "column": "trip_distance"
+                               },
+                               {
+                                "literal": 0.0
+                               }
+                              ]
+                             },
+                             {
+                              "literal": 2.0
+                             }
+                            ]
+                           }
+                          ]
+                         },
+                         {
+                          "literal": 0.0
+                         }
+                        ],
+                        "options": {
+                         "skip_nulls": false
+                        }
+                       }
+                      ]
+                     }
+                    ]
+                   },
+                   {
+                    "literal": 2.5
+                   }
+                  ]
+                 },
+                 {
+                  "call": "add",
+                  "args": [
+                   {
+                    "call": "add",
+                    "args": [
+                     {
+                      "literal": 3.0
+                     },
+                     {
+                      "call": "multiply",
+                      "args": [
+                       {
+                        "literal": 3.5
+                       },
+                       {
+                        "call": "coalesce",
+                        "args": [
+                         {
+                          "column": "trip_distance"
+                         },
+                         {
+                          "literal": 0.0
+                         }
+                        ]
+                       }
+                      ]
+                     }
+                    ]
+                   },
+                   {
+                    "call": "multiply",
+                    "args": [
+                     {
+                      "literal": 0.35
+                     },
+                     {
+                      "call": "max_element_wise",
+                      "args": [
+                       {
+                        "call": "subtract",
+                        "args": [
+                         {
+                          "call": "max_element_wise",
+                          "args": [
+                           {
+                            "call": "divide",
+                            "args": [
+                             {
+                              "cast": {
+                               "call": "subtract",
+                               "args": [
+                                {
+                                 "column": "dropoff_at"
+                                },
+                                {
+                                 "column": "pickup_at"
+                                }
+                               ]
+                              },
+                              "to": "int64"
+                             },
+                             {
+                              "literal": 60000000.0
+                             }
+                            ]
+                           },
+                           {
+                            "literal": 0.0
+                           }
+                          ],
+                          "options": {
+                           "skip_nulls": false
+                          }
+                         },
+                         {
+                          "call": "multiply",
+                          "args": [
+                           {
+                            "call": "coalesce",
+                            "args": [
+                             {
+                              "column": "trip_distance"
+                             },
+                             {
+                              "literal": 0.0
+                             }
+                            ]
+                           },
+                           {
+                            "literal": 2.0
+                           }
+                          ]
+                         }
+                        ]
+                       },
+                       {
+                        "literal": 0.0
+                       }
+                      ],
+                      "options": {
+                       "skip_nulls": false
+                      }
+                     }
+                    ]
+                   }
+                  ]
+                 }
+                ]
+               }
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "audit.in.arrow"
+    }
+   ],
+   "expected": "audit.expected.arrow"
+  },
+  {
+   "name": "audit_rule_sliced",
+   "version": 1,
+   "tests": [
+    "sliced",
+    "nulls"
+   ],
+   "about": "Audit's rule on rows 5 to 11 of a batch, given at an offset, gives those rows' audit.",
+   "params": {
+    "outputs": [
+     {
+      "name": "vendor_id",
+      "expr": {
+       "column": "vendor_id"
+      }
+     },
+     {
+      "name": "pu_location_id",
+      "expr": {
+       "column": "pu_location_id"
+      }
+     },
+     {
+      "name": "fare_amount",
+      "expr": {
+       "column": "fare_amount"
+      }
+     },
+     {
+      "name": "expected_fare",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "if": [
+          {
+           "when": {
+            "call": "equal",
+            "args": [
+             {
+              "column": "ratecode_id"
+             },
+             {
+              "literal": 2.0
+             }
+            ]
+           },
+           "then": {
+            "literal": 70.0
+           }
+          }
+         ],
+         "else": {
+          "call": "if_else",
+          "args": [
+           {
+            "call": "and",
+            "args": [
+             {
+              "call": "greater_equal",
+              "args": [
+               {
+                "call": "hour",
+                "args": [
+                 {
+                  "column": "pickup_at"
+                 }
+                ]
+               },
+               {
+                "literal": 16
+               }
+              ]
+             },
+             {
+              "call": "less",
+              "args": [
+               {
+                "call": "hour",
+                "args": [
+                 {
+                  "column": "pickup_at"
+                 }
+                ]
+               },
+               {
+                "literal": 20
+               }
+              ]
+             }
+            ]
+           },
+           {
+            "call": "add",
+            "args": [
+             {
+              "call": "add",
+              "args": [
+               {
+                "call": "add",
+                "args": [
+                 {
+                  "literal": 3.0
+                 },
+                 {
+                  "call": "multiply",
+                  "args": [
+                   {
+                    "literal": 3.5
+                   },
+                   {
+                    "call": "coalesce",
+                    "args": [
+                     {
+                      "column": "trip_distance"
+                     },
+                     {
+                      "literal": 0.0
+                     }
+                    ]
+                   }
+                  ]
+                 }
+                ]
+               },
+               {
+                "call": "multiply",
+                "args": [
+                 {
+                  "literal": 0.35
+                 },
+                 {
+                  "call": "max_element_wise",
+                  "args": [
+                   {
+                    "call": "subtract",
+                    "args": [
+                     {
+                      "call": "max_element_wise",
+                      "args": [
+                       {
+                        "call": "divide",
+                        "args": [
+                         {
+                          "cast": {
+                           "call": "subtract",
+                           "args": [
+                            {
+                             "column": "dropoff_at"
+                            },
+                            {
+                             "column": "pickup_at"
+                            }
+                           ]
+                          },
+                          "to": "int64"
+                         },
+                         {
+                          "literal": 60000000.0
+                         }
+                        ]
+                       },
+                       {
+                        "literal": 0.0
+                       }
+                      ],
+                      "options": {
+                       "skip_nulls": false
+                      }
+                     },
+                     {
+                      "call": "multiply",
+                      "args": [
+                       {
+                        "call": "coalesce",
+                        "args": [
+                         {
+                          "column": "trip_distance"
+                         },
+                         {
+                          "literal": 0.0
+                         }
+                        ]
+                       },
+                       {
+                        "literal": 2.0
+                       }
+                      ]
+                     }
+                    ]
+                   },
+                   {
+                    "literal": 0.0
+                   }
+                  ],
+                  "options": {
+                   "skip_nulls": false
+                  }
+                 }
+                ]
+               }
+              ]
+             },
+             {
+              "literal": 2.5
+             }
+            ]
+           },
+           {
+            "call": "add",
+            "args": [
+             {
+              "call": "add",
+              "args": [
+               {
+                "literal": 3.0
+               },
+               {
+                "call": "multiply",
+                "args": [
+                 {
+                  "literal": 3.5
+                 },
+                 {
+                  "call": "coalesce",
+                  "args": [
+                   {
+                    "column": "trip_distance"
+                   },
+                   {
+                    "literal": 0.0
+                   }
+                  ]
+                 }
+                ]
+               }
+              ]
+             },
+             {
+              "call": "multiply",
+              "args": [
+               {
+                "literal": 0.35
+               },
+               {
+                "call": "max_element_wise",
+                "args": [
+                 {
+                  "call": "subtract",
+                  "args": [
+                   {
+                    "call": "max_element_wise",
+                    "args": [
+                     {
+                      "call": "divide",
+                      "args": [
+                       {
+                        "cast": {
+                         "call": "subtract",
+                         "args": [
+                          {
+                           "column": "dropoff_at"
+                          },
+                          {
+                           "column": "pickup_at"
+                          }
+                         ]
+                        },
+                        "to": "int64"
+                       },
+                       {
+                        "literal": 60000000.0
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 0.0
+                     }
+                    ],
+                    "options": {
+                     "skip_nulls": false
+                    }
+                   },
+                   {
+                    "call": "multiply",
+                    "args": [
+                     {
+                      "call": "coalesce",
+                      "args": [
+                       {
+                        "column": "trip_distance"
+                       },
+                       {
+                        "literal": 0.0
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 2.0
+                     }
+                    ]
+                   }
+                  ]
+                 },
+                 {
+                  "literal": 0.0
+                 }
+                ],
+                "options": {
+                 "skip_nulls": false
+                }
+               }
+              ]
+             }
+            ]
+           }
+          ]
+         }
+        }
+       ],
+       "options": {
+        "ndigits": 2,
+        "round_mode": "half_to_even"
+       }
+      }
+     },
+     {
+      "name": "flagged",
+      "expr": {
+       "call": "and_kleene",
+       "args": [
+        {
+         "call": "is_valid",
+         "args": [
+          {
+           "column": "fare_amount"
+          }
+         ]
+        },
+        {
+         "call": "greater",
+         "args": [
+          {
+           "call": "abs",
+           "args": [
+            {
+             "call": "subtract",
+             "args": [
+              {
+               "column": "fare_amount"
+              },
+              {
+               "if": [
+                {
+                 "when": {
+                  "call": "equal",
+                  "args": [
+                   {
+                    "column": "ratecode_id"
+                   },
+                   {
+                    "literal": 2.0
+                   }
+                  ]
+                 },
+                 "then": {
+                  "literal": 70.0
+                 }
+                }
+               ],
+               "else": {
+                "call": "if_else",
+                "args": [
+                 {
+                  "call": "and",
+                  "args": [
+                   {
+                    "call": "greater_equal",
+                    "args": [
+                     {
+                      "call": "hour",
+                      "args": [
+                       {
+                        "column": "pickup_at"
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 16
+                     }
+                    ]
+                   },
+                   {
+                    "call": "less",
+                    "args": [
+                     {
+                      "call": "hour",
+                      "args": [
+                       {
+                        "column": "pickup_at"
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 20
+                     }
+                    ]
+                   }
+                  ]
+                 },
+                 {
+                  "call": "add",
+                  "args": [
+                   {
+                    "call": "add",
+                    "args": [
+                     {
+                      "call": "add",
+                      "args": [
+                       {
+                        "literal": 3.0
+                       },
+                       {
+                        "call": "multiply",
+                        "args": [
+                         {
+                          "literal": 3.5
+                         },
+                         {
+                          "call": "coalesce",
+                          "args": [
+                           {
+                            "column": "trip_distance"
+                           },
+                           {
+                            "literal": 0.0
+                           }
+                          ]
+                         }
+                        ]
+                       }
+                      ]
+                     },
+                     {
+                      "call": "multiply",
+                      "args": [
+                       {
+                        "literal": 0.35
+                       },
+                       {
+                        "call": "max_element_wise",
+                        "args": [
+                         {
+                          "call": "subtract",
+                          "args": [
+                           {
+                            "call": "max_element_wise",
+                            "args": [
+                             {
+                              "call": "divide",
+                              "args": [
+                               {
+                                "cast": {
+                                 "call": "subtract",
+                                 "args": [
+                                  {
+                                   "column": "dropoff_at"
+                                  },
+                                  {
+                                   "column": "pickup_at"
+                                  }
+                                 ]
+                                },
+                                "to": "int64"
+                               },
+                               {
+                                "literal": 60000000.0
+                               }
+                              ]
+                             },
+                             {
+                              "literal": 0.0
+                             }
+                            ],
+                            "options": {
+                             "skip_nulls": false
+                            }
+                           },
+                           {
+                            "call": "multiply",
+                            "args": [
+                             {
+                              "call": "coalesce",
+                              "args": [
+                               {
+                                "column": "trip_distance"
+                               },
+                               {
+                                "literal": 0.0
+                               }
+                              ]
+                             },
+                             {
+                              "literal": 2.0
+                             }
+                            ]
+                           }
+                          ]
+                         },
+                         {
+                          "literal": 0.0
+                         }
+                        ],
+                        "options": {
+                         "skip_nulls": false
+                        }
+                       }
+                      ]
+                     }
+                    ]
+                   },
+                   {
+                    "literal": 2.5
+                   }
+                  ]
+                 },
+                 {
+                  "call": "add",
+                  "args": [
+                   {
+                    "call": "add",
+                    "args": [
+                     {
+                      "literal": 3.0
+                     },
+                     {
+                      "call": "multiply",
+                      "args": [
+                       {
+                        "literal": 3.5
+                       },
+                       {
+                        "call": "coalesce",
+                        "args": [
+                         {
+                          "column": "trip_distance"
+                         },
+                         {
+                          "literal": 0.0
+                         }
+                        ]
+                       }
+                      ]
+                     }
+                    ]
+                   },
+                   {
+                    "call": "multiply",
+                    "args": [
+                     {
+                      "literal": 0.35
+                     },
+                     {
+                      "call": "max_element_wise",
+                      "args": [
+                       {
+                        "call": "subtract",
+                        "args": [
+                         {
+                          "call": "max_element_wise",
+                          "args": [
+                           {
+                            "call": "divide",
+                            "args": [
+                             {
+                              "cast": {
+                               "call": "subtract",
+                               "args": [
+                                {
+                                 "column": "dropoff_at"
+                                },
+                                {
+                                 "column": "pickup_at"
+                                }
+                               ]
+                              },
+                              "to": "int64"
+                             },
+                             {
+                              "literal": 60000000.0
+                             }
+                            ]
+                           },
+                           {
+                            "literal": 0.0
+                           }
+                          ],
+                          "options": {
+                           "skip_nulls": false
+                          }
+                         },
+                         {
+                          "call": "multiply",
+                          "args": [
+                           {
+                            "call": "coalesce",
+                            "args": [
+                             {
+                              "column": "trip_distance"
+                             },
+                             {
+                              "literal": 0.0
+                             }
+                            ]
+                           },
+                           {
+                            "literal": 2.0
+                           }
+                          ]
+                         }
+                        ]
+                       },
+                       {
+                        "literal": 0.0
+                       }
+                      ],
+                      "options": {
+                       "skip_nulls": false
+                      }
+                     }
+                    ]
+                   }
+                  ]
+                 }
+                ]
+               }
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "call": "max_element_wise",
+           "args": [
+            {
+             "literal": 5.0
+            },
+            {
+             "call": "multiply",
+             "args": [
+              {
+               "literal": 0.25
+              },
+              {
+               "if": [
+                {
+                 "when": {
+                  "call": "equal",
+                  "args": [
+                   {
+                    "column": "ratecode_id"
+                   },
+                   {
+                    "literal": 2.0
+                   }
+                  ]
+                 },
+                 "then": {
+                  "literal": 70.0
+                 }
+                }
+               ],
+               "else": {
+                "call": "if_else",
+                "args": [
+                 {
+                  "call": "and",
+                  "args": [
+                   {
+                    "call": "greater_equal",
+                    "args": [
+                     {
+                      "call": "hour",
+                      "args": [
+                       {
+                        "column": "pickup_at"
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 16
+                     }
+                    ]
+                   },
+                   {
+                    "call": "less",
+                    "args": [
+                     {
+                      "call": "hour",
+                      "args": [
+                       {
+                        "column": "pickup_at"
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 20
+                     }
+                    ]
+                   }
+                  ]
+                 },
+                 {
+                  "call": "add",
+                  "args": [
+                   {
+                    "call": "add",
+                    "args": [
+                     {
+                      "call": "add",
+                      "args": [
+                       {
+                        "literal": 3.0
+                       },
+                       {
+                        "call": "multiply",
+                        "args": [
+                         {
+                          "literal": 3.5
+                         },
+                         {
+                          "call": "coalesce",
+                          "args": [
+                           {
+                            "column": "trip_distance"
+                           },
+                           {
+                            "literal": 0.0
+                           }
+                          ]
+                         }
+                        ]
+                       }
+                      ]
+                     },
+                     {
+                      "call": "multiply",
+                      "args": [
+                       {
+                        "literal": 0.35
+                       },
+                       {
+                        "call": "max_element_wise",
+                        "args": [
+                         {
+                          "call": "subtract",
+                          "args": [
+                           {
+                            "call": "max_element_wise",
+                            "args": [
+                             {
+                              "call": "divide",
+                              "args": [
+                               {
+                                "cast": {
+                                 "call": "subtract",
+                                 "args": [
+                                  {
+                                   "column": "dropoff_at"
+                                  },
+                                  {
+                                   "column": "pickup_at"
+                                  }
+                                 ]
+                                },
+                                "to": "int64"
+                               },
+                               {
+                                "literal": 60000000.0
+                               }
+                              ]
+                             },
+                             {
+                              "literal": 0.0
+                             }
+                            ],
+                            "options": {
+                             "skip_nulls": false
+                            }
+                           },
+                           {
+                            "call": "multiply",
+                            "args": [
+                             {
+                              "call": "coalesce",
+                              "args": [
+                               {
+                                "column": "trip_distance"
+                               },
+                               {
+                                "literal": 0.0
+                               }
+                              ]
+                             },
+                             {
+                              "literal": 2.0
+                             }
+                            ]
+                           }
+                          ]
+                         },
+                         {
+                          "literal": 0.0
+                         }
+                        ],
+                        "options": {
+                         "skip_nulls": false
+                        }
+                       }
+                      ]
+                     }
+                    ]
+                   },
+                   {
+                    "literal": 2.5
+                   }
+                  ]
+                 },
+                 {
+                  "call": "add",
+                  "args": [
+                   {
+                    "call": "add",
+                    "args": [
+                     {
+                      "literal": 3.0
+                     },
+                     {
+                      "call": "multiply",
+                      "args": [
+                       {
+                        "literal": 3.5
+                       },
+                       {
+                        "call": "coalesce",
+                        "args": [
+                         {
+                          "column": "trip_distance"
+                         },
+                         {
+                          "literal": 0.0
+                         }
+                        ]
+                       }
+                      ]
+                     }
+                    ]
+                   },
+                   {
+                    "call": "multiply",
+                    "args": [
+                     {
+                      "literal": 0.35
+                     },
+                     {
+                      "call": "max_element_wise",
+                      "args": [
+                       {
+                        "call": "subtract",
+                        "args": [
+                         {
+                          "call": "max_element_wise",
+                          "args": [
+                           {
+                            "call": "divide",
+                            "args": [
+                             {
+                              "cast": {
+                               "call": "subtract",
+                               "args": [
+                                {
+                                 "column": "dropoff_at"
+                                },
+                                {
+                                 "column": "pickup_at"
+                                }
+                               ]
+                              },
+                              "to": "int64"
+                             },
+                             {
+                              "literal": 60000000.0
+                             }
+                            ]
+                           },
+                           {
+                            "literal": 0.0
+                           }
+                          ],
+                          "options": {
+                           "skip_nulls": false
+                          }
+                         },
+                         {
+                          "call": "multiply",
+                          "args": [
+                           {
+                            "call": "coalesce",
+                            "args": [
+                             {
+                              "column": "trip_distance"
+                             },
+                             {
+                              "literal": 0.0
+                             }
+                            ]
+                           },
+                           {
+                            "literal": 2.0
+                           }
+                          ]
+                         }
+                        ]
+                       },
+                       {
+                        "literal": 0.0
+                       }
+                      ],
+                      "options": {
+                       "skip_nulls": false
+                      }
+                     }
+                    ]
+                   }
+                  ]
+                 }
+                ]
+               }
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "audit.in.arrow",
+     "slice": [
+      5,
+      7
+     ]
+    }
+   ],
+   "expected": "audit_sliced.expected.arrow"
+  },
+  {
+   "name": "audit_rule_null_times",
+   "version": 1,
+   "tests": [
+    "nulls"
+   ],
+   "about": "Where a pickup or dropoff is null (Audit's Python loop raises there) the fare is null and the flag null, or false where the fare is null too.",
+   "params": {
+    "outputs": [
+     {
+      "name": "vendor_id",
+      "expr": {
+       "column": "vendor_id"
+      }
+     },
+     {
+      "name": "pu_location_id",
+      "expr": {
+       "column": "pu_location_id"
+      }
+     },
+     {
+      "name": "fare_amount",
+      "expr": {
+       "column": "fare_amount"
+      }
+     },
+     {
+      "name": "expected_fare",
+      "expr": {
+       "call": "round",
+       "args": [
+        {
+         "if": [
+          {
+           "when": {
+            "call": "equal",
+            "args": [
+             {
+              "column": "ratecode_id"
+             },
+             {
+              "literal": 2.0
+             }
+            ]
+           },
+           "then": {
+            "literal": 70.0
+           }
+          }
+         ],
+         "else": {
+          "call": "if_else",
+          "args": [
+           {
+            "call": "and",
+            "args": [
+             {
+              "call": "greater_equal",
+              "args": [
+               {
+                "call": "hour",
+                "args": [
+                 {
+                  "column": "pickup_at"
+                 }
+                ]
+               },
+               {
+                "literal": 16
+               }
+              ]
+             },
+             {
+              "call": "less",
+              "args": [
+               {
+                "call": "hour",
+                "args": [
+                 {
+                  "column": "pickup_at"
+                 }
+                ]
+               },
+               {
+                "literal": 20
+               }
+              ]
+             }
+            ]
+           },
+           {
+            "call": "add",
+            "args": [
+             {
+              "call": "add",
+              "args": [
+               {
+                "call": "add",
+                "args": [
+                 {
+                  "literal": 3.0
+                 },
+                 {
+                  "call": "multiply",
+                  "args": [
+                   {
+                    "literal": 3.5
+                   },
+                   {
+                    "call": "coalesce",
+                    "args": [
+                     {
+                      "column": "trip_distance"
+                     },
+                     {
+                      "literal": 0.0
+                     }
+                    ]
+                   }
+                  ]
+                 }
+                ]
+               },
+               {
+                "call": "multiply",
+                "args": [
+                 {
+                  "literal": 0.35
+                 },
+                 {
+                  "call": "max_element_wise",
+                  "args": [
+                   {
+                    "call": "subtract",
+                    "args": [
+                     {
+                      "call": "max_element_wise",
+                      "args": [
+                       {
+                        "call": "divide",
+                        "args": [
+                         {
+                          "cast": {
+                           "call": "subtract",
+                           "args": [
+                            {
+                             "column": "dropoff_at"
+                            },
+                            {
+                             "column": "pickup_at"
+                            }
+                           ]
+                          },
+                          "to": "int64"
+                         },
+                         {
+                          "literal": 60000000.0
+                         }
+                        ]
+                       },
+                       {
+                        "literal": 0.0
+                       }
+                      ],
+                      "options": {
+                       "skip_nulls": false
+                      }
+                     },
+                     {
+                      "call": "multiply",
+                      "args": [
+                       {
+                        "call": "coalesce",
+                        "args": [
+                         {
+                          "column": "trip_distance"
+                         },
+                         {
+                          "literal": 0.0
+                         }
+                        ]
+                       },
+                       {
+                        "literal": 2.0
+                       }
+                      ]
+                     }
+                    ]
+                   },
+                   {
+                    "literal": 0.0
+                   }
+                  ],
+                  "options": {
+                   "skip_nulls": false
+                  }
+                 }
+                ]
+               }
+              ]
+             },
+             {
+              "literal": 2.5
+             }
+            ]
+           },
+           {
+            "call": "add",
+            "args": [
+             {
+              "call": "add",
+              "args": [
+               {
+                "literal": 3.0
+               },
+               {
+                "call": "multiply",
+                "args": [
+                 {
+                  "literal": 3.5
+                 },
+                 {
+                  "call": "coalesce",
+                  "args": [
+                   {
+                    "column": "trip_distance"
+                   },
+                   {
+                    "literal": 0.0
+                   }
+                  ]
+                 }
+                ]
+               }
+              ]
+             },
+             {
+              "call": "multiply",
+              "args": [
+               {
+                "literal": 0.35
+               },
+               {
+                "call": "max_element_wise",
+                "args": [
+                 {
+                  "call": "subtract",
+                  "args": [
+                   {
+                    "call": "max_element_wise",
+                    "args": [
+                     {
+                      "call": "divide",
+                      "args": [
+                       {
+                        "cast": {
+                         "call": "subtract",
+                         "args": [
+                          {
+                           "column": "dropoff_at"
+                          },
+                          {
+                           "column": "pickup_at"
+                          }
+                         ]
+                        },
+                        "to": "int64"
+                       },
+                       {
+                        "literal": 60000000.0
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 0.0
+                     }
+                    ],
+                    "options": {
+                     "skip_nulls": false
+                    }
+                   },
+                   {
+                    "call": "multiply",
+                    "args": [
+                     {
+                      "call": "coalesce",
+                      "args": [
+                       {
+                        "column": "trip_distance"
+                       },
+                       {
+                        "literal": 0.0
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 2.0
+                     }
+                    ]
+                   }
+                  ]
+                 },
+                 {
+                  "literal": 0.0
+                 }
+                ],
+                "options": {
+                 "skip_nulls": false
+                }
+               }
+              ]
+             }
+            ]
+           }
+          ]
+         }
+        }
+       ],
+       "options": {
+        "ndigits": 2,
+        "round_mode": "half_to_even"
+       }
+      }
+     },
+     {
+      "name": "flagged",
+      "expr": {
+       "call": "and_kleene",
+       "args": [
+        {
+         "call": "is_valid",
+         "args": [
+          {
+           "column": "fare_amount"
+          }
+         ]
+        },
+        {
+         "call": "greater",
+         "args": [
+          {
+           "call": "abs",
+           "args": [
+            {
+             "call": "subtract",
+             "args": [
+              {
+               "column": "fare_amount"
+              },
+              {
+               "if": [
+                {
+                 "when": {
+                  "call": "equal",
+                  "args": [
+                   {
+                    "column": "ratecode_id"
+                   },
+                   {
+                    "literal": 2.0
+                   }
+                  ]
+                 },
+                 "then": {
+                  "literal": 70.0
+                 }
+                }
+               ],
+               "else": {
+                "call": "if_else",
+                "args": [
+                 {
+                  "call": "and",
+                  "args": [
+                   {
+                    "call": "greater_equal",
+                    "args": [
+                     {
+                      "call": "hour",
+                      "args": [
+                       {
+                        "column": "pickup_at"
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 16
+                     }
+                    ]
+                   },
+                   {
+                    "call": "less",
+                    "args": [
+                     {
+                      "call": "hour",
+                      "args": [
+                       {
+                        "column": "pickup_at"
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 20
+                     }
+                    ]
+                   }
+                  ]
+                 },
+                 {
+                  "call": "add",
+                  "args": [
+                   {
+                    "call": "add",
+                    "args": [
+                     {
+                      "call": "add",
+                      "args": [
+                       {
+                        "literal": 3.0
+                       },
+                       {
+                        "call": "multiply",
+                        "args": [
+                         {
+                          "literal": 3.5
+                         },
+                         {
+                          "call": "coalesce",
+                          "args": [
+                           {
+                            "column": "trip_distance"
+                           },
+                           {
+                            "literal": 0.0
+                           }
+                          ]
+                         }
+                        ]
+                       }
+                      ]
+                     },
+                     {
+                      "call": "multiply",
+                      "args": [
+                       {
+                        "literal": 0.35
+                       },
+                       {
+                        "call": "max_element_wise",
+                        "args": [
+                         {
+                          "call": "subtract",
+                          "args": [
+                           {
+                            "call": "max_element_wise",
+                            "args": [
+                             {
+                              "call": "divide",
+                              "args": [
+                               {
+                                "cast": {
+                                 "call": "subtract",
+                                 "args": [
+                                  {
+                                   "column": "dropoff_at"
+                                  },
+                                  {
+                                   "column": "pickup_at"
+                                  }
+                                 ]
+                                },
+                                "to": "int64"
+                               },
+                               {
+                                "literal": 60000000.0
+                               }
+                              ]
+                             },
+                             {
+                              "literal": 0.0
+                             }
+                            ],
+                            "options": {
+                             "skip_nulls": false
+                            }
+                           },
+                           {
+                            "call": "multiply",
+                            "args": [
+                             {
+                              "call": "coalesce",
+                              "args": [
+                               {
+                                "column": "trip_distance"
+                               },
+                               {
+                                "literal": 0.0
+                               }
+                              ]
+                             },
+                             {
+                              "literal": 2.0
+                             }
+                            ]
+                           }
+                          ]
+                         },
+                         {
+                          "literal": 0.0
+                         }
+                        ],
+                        "options": {
+                         "skip_nulls": false
+                        }
+                       }
+                      ]
+                     }
+                    ]
+                   },
+                   {
+                    "literal": 2.5
+                   }
+                  ]
+                 },
+                 {
+                  "call": "add",
+                  "args": [
+                   {
+                    "call": "add",
+                    "args": [
+                     {
+                      "literal": 3.0
+                     },
+                     {
+                      "call": "multiply",
+                      "args": [
+                       {
+                        "literal": 3.5
+                       },
+                       {
+                        "call": "coalesce",
+                        "args": [
+                         {
+                          "column": "trip_distance"
+                         },
+                         {
+                          "literal": 0.0
+                         }
+                        ]
+                       }
+                      ]
+                     }
+                    ]
+                   },
+                   {
+                    "call": "multiply",
+                    "args": [
+                     {
+                      "literal": 0.35
+                     },
+                     {
+                      "call": "max_element_wise",
+                      "args": [
+                       {
+                        "call": "subtract",
+                        "args": [
+                         {
+                          "call": "max_element_wise",
+                          "args": [
+                           {
+                            "call": "divide",
+                            "args": [
+                             {
+                              "cast": {
+                               "call": "subtract",
+                               "args": [
+                                {
+                                 "column": "dropoff_at"
+                                },
+                                {
+                                 "column": "pickup_at"
+                                }
+                               ]
+                              },
+                              "to": "int64"
+                             },
+                             {
+                              "literal": 60000000.0
+                             }
+                            ]
+                           },
+                           {
+                            "literal": 0.0
+                           }
+                          ],
+                          "options": {
+                           "skip_nulls": false
+                          }
+                         },
+                         {
+                          "call": "multiply",
+                          "args": [
+                           {
+                            "call": "coalesce",
+                            "args": [
+                             {
+                              "column": "trip_distance"
+                             },
+                             {
+                              "literal": 0.0
+                             }
+                            ]
+                           },
+                           {
+                            "literal": 2.0
+                           }
+                          ]
+                         }
+                        ]
+                       },
+                       {
+                        "literal": 0.0
+                       }
+                      ],
+                      "options": {
+                       "skip_nulls": false
+                      }
+                     }
+                    ]
+                   }
+                  ]
+                 }
+                ]
+               }
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "call": "max_element_wise",
+           "args": [
+            {
+             "literal": 5.0
+            },
+            {
+             "call": "multiply",
+             "args": [
+              {
+               "literal": 0.25
+              },
+              {
+               "if": [
+                {
+                 "when": {
+                  "call": "equal",
+                  "args": [
+                   {
+                    "column": "ratecode_id"
+                   },
+                   {
+                    "literal": 2.0
+                   }
+                  ]
+                 },
+                 "then": {
+                  "literal": 70.0
+                 }
+                }
+               ],
+               "else": {
+                "call": "if_else",
+                "args": [
+                 {
+                  "call": "and",
+                  "args": [
+                   {
+                    "call": "greater_equal",
+                    "args": [
+                     {
+                      "call": "hour",
+                      "args": [
+                       {
+                        "column": "pickup_at"
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 16
+                     }
+                    ]
+                   },
+                   {
+                    "call": "less",
+                    "args": [
+                     {
+                      "call": "hour",
+                      "args": [
+                       {
+                        "column": "pickup_at"
+                       }
+                      ]
+                     },
+                     {
+                      "literal": 20
+                     }
+                    ]
+                   }
+                  ]
+                 },
+                 {
+                  "call": "add",
+                  "args": [
+                   {
+                    "call": "add",
+                    "args": [
+                     {
+                      "call": "add",
+                      "args": [
+                       {
+                        "literal": 3.0
+                       },
+                       {
+                        "call": "multiply",
+                        "args": [
+                         {
+                          "literal": 3.5
+                         },
+                         {
+                          "call": "coalesce",
+                          "args": [
+                           {
+                            "column": "trip_distance"
+                           },
+                           {
+                            "literal": 0.0
+                           }
+                          ]
+                         }
+                        ]
+                       }
+                      ]
+                     },
+                     {
+                      "call": "multiply",
+                      "args": [
+                       {
+                        "literal": 0.35
+                       },
+                       {
+                        "call": "max_element_wise",
+                        "args": [
+                         {
+                          "call": "subtract",
+                          "args": [
+                           {
+                            "call": "max_element_wise",
+                            "args": [
+                             {
+                              "call": "divide",
+                              "args": [
+                               {
+                                "cast": {
+                                 "call": "subtract",
+                                 "args": [
+                                  {
+                                   "column": "dropoff_at"
+                                  },
+                                  {
+                                   "column": "pickup_at"
+                                  }
+                                 ]
+                                },
+                                "to": "int64"
+                               },
+                               {
+                                "literal": 60000000.0
+                               }
+                              ]
+                             },
+                             {
+                              "literal": 0.0
+                             }
+                            ],
+                            "options": {
+                             "skip_nulls": false
+                            }
+                           },
+                           {
+                            "call": "multiply",
+                            "args": [
+                             {
+                              "call": "coalesce",
+                              "args": [
+                               {
+                                "column": "trip_distance"
+                               },
+                               {
+                                "literal": 0.0
+                               }
+                              ]
+                             },
+                             {
+                              "literal": 2.0
+                             }
+                            ]
+                           }
+                          ]
+                         },
+                         {
+                          "literal": 0.0
+                         }
+                        ],
+                        "options": {
+                         "skip_nulls": false
+                        }
+                       }
+                      ]
+                     }
+                    ]
+                   },
+                   {
+                    "literal": 2.5
+                   }
+                  ]
+                 },
+                 {
+                  "call": "add",
+                  "args": [
+                   {
+                    "call": "add",
+                    "args": [
+                     {
+                      "literal": 3.0
+                     },
+                     {
+                      "call": "multiply",
+                      "args": [
+                       {
+                        "literal": 3.5
+                       },
+                       {
+                        "call": "coalesce",
+                        "args": [
+                         {
+                          "column": "trip_distance"
+                         },
+                         {
+                          "literal": 0.0
+                         }
+                        ]
+                       }
+                      ]
+                     }
+                    ]
+                   },
+                   {
+                    "call": "multiply",
+                    "args": [
+                     {
+                      "literal": 0.35
+                     },
+                     {
+                      "call": "max_element_wise",
+                      "args": [
+                       {
+                        "call": "subtract",
+                        "args": [
+                         {
+                          "call": "max_element_wise",
+                          "args": [
+                           {
+                            "call": "divide",
+                            "args": [
+                             {
+                              "cast": {
+                               "call": "subtract",
+                               "args": [
+                                {
+                                 "column": "dropoff_at"
+                                },
+                                {
+                                 "column": "pickup_at"
+                                }
+                               ]
+                              },
+                              "to": "int64"
+                             },
+                             {
+                              "literal": 60000000.0
+                             }
+                            ]
+                           },
+                           {
+                            "literal": 0.0
+                           }
+                          ],
+                          "options": {
+                           "skip_nulls": false
+                          }
+                         },
+                         {
+                          "call": "multiply",
+                          "args": [
+                           {
+                            "call": "coalesce",
+                            "args": [
+                             {
+                              "column": "trip_distance"
+                             },
+                             {
+                              "literal": 0.0
+                             }
+                            ]
+                           },
+                           {
+                            "literal": 2.0
+                           }
+                          ]
+                         }
+                        ]
+                       },
+                       {
+                        "literal": 0.0
+                       }
+                      ],
+                      "options": {
+                       "skip_nulls": false
+                      }
+                     }
+                    ]
+                   }
+                  ]
+                 }
+                ]
+               }
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "audit_null_times.in.arrow"
+    }
+   ],
+   "expected": "audit_null_times.expected.arrow"
+  },
+  {
+   "name": "enrich_columns",
+   "version": 1,
+   "tests": [
+    "nulls"
+   ],
+   "about": "Enrich's derived columns and its filter's mask as one tree give workloads.enrich's sixteen calls; the input columns pass through.",
+   "params": {
+    "outputs": [
+     {
+      "name": "vendor_id",
+      "expr": {
+       "column": "vendor_id"
+      }
+     },
+     {
+      "name": "pickup_at",
+      "expr": {
+       "column": "pickup_at"
+      }
+     },
+     {
+      "name": "dropoff_at",
+      "expr": {
+       "column": "dropoff_at"
+      }
+     },
+     {
+      "name": "passenger_count",
+      "expr": {
+       "column": "passenger_count"
+      }
+     },
+     {
+      "name": "trip_distance",
+      "expr": {
+       "column": "trip_distance"
+      }
+     },
+     {
+      "name": "ratecode_id",
+      "expr": {
+       "column": "ratecode_id"
+      }
+     },
+     {
+      "name": "store_and_fwd_flag",
+      "expr": {
+       "column": "store_and_fwd_flag"
+      }
+     },
+     {
+      "name": "pu_location_id",
+      "expr": {
+       "column": "pu_location_id"
+      }
+     },
+     {
+      "name": "do_location_id",
+      "expr": {
+       "column": "do_location_id"
+      }
+     },
+     {
+      "name": "payment_type",
+      "expr": {
+       "column": "payment_type"
+      }
+     },
+     {
+      "name": "fare_amount",
+      "expr": {
+       "column": "fare_amount"
+      }
+     },
+     {
+      "name": "extra",
+      "expr": {
+       "column": "extra"
+      }
+     },
+     {
+      "name": "mta_tax",
+      "expr": {
+       "column": "mta_tax"
+      }
+     },
+     {
+      "name": "tip_amount",
+      "expr": {
+       "column": "tip_amount"
+      }
+     },
+     {
+      "name": "tolls_amount",
+      "expr": {
+       "column": "tolls_amount"
+      }
+     },
+     {
+      "name": "improvement_surcharge",
+      "expr": {
+       "column": "improvement_surcharge"
+      }
+     },
+     {
+      "name": "total_amount",
+      "expr": {
+       "column": "total_amount"
+      }
+     },
+     {
+      "name": "congestion_surcharge",
+      "expr": {
+       "column": "congestion_surcharge"
+      }
+     },
+     {
+      "name": "airport_fee",
+      "expr": {
+       "column": "airport_fee"
+      }
+     },
+     {
+      "name": "duration_s",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "cast": {
+          "call": "subtract",
+          "args": [
+           {
+            "column": "dropoff_at"
+           },
+           {
+            "column": "pickup_at"
+           }
+          ]
+         },
+         "to": "int64"
+        },
+        {
+         "literal": 1000000.0
+        }
+       ]
+      }
+     },
+     {
+      "name": "mph",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "column": "trip_distance"
+        },
+        {
+         "call": "divide",
+         "args": [
+          {
+           "call": "divide",
+           "args": [
+            {
+             "cast": {
+              "call": "subtract",
+              "args": [
+               {
+                "column": "dropoff_at"
+               },
+               {
+                "column": "pickup_at"
+               }
+              ]
+             },
+             "to": "int64"
+            },
+            {
+             "literal": 1000000.0
+            }
+           ]
+          },
+          {
+           "literal": 3600.0
+          }
+         ]
+        }
+       ]
+      }
+     },
+     {
+      "name": "fare_per_mile",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "column": "fare_amount"
+        },
+        {
+         "column": "trip_distance"
+        }
+       ]
+      }
+     },
+     {
+      "name": "tip_share",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "column": "tip_amount"
+        },
+        {
+         "column": "fare_amount"
+        }
+       ]
+      }
+     },
+     {
+      "name": "keep",
+      "expr": {
+       "call": "and",
+       "args": [
+        {
+         "call": "and",
+         "args": [
+          {
+           "call": "greater_equal",
+           "args": [
+            {
+             "call": "divide",
+             "args": [
+              {
+               "cast": {
+                "call": "subtract",
+                "args": [
+                 {
+                  "column": "dropoff_at"
+                 },
+                 {
+                  "column": "pickup_at"
+                 }
+                ]
+               },
+               "to": "int64"
+              },
+              {
+               "literal": 1000000.0
+              }
+             ]
+            },
+            {
+             "literal": 60.0
+            }
+           ]
+          },
+          {
+           "call": "less_equal",
+           "args": [
+            {
+             "call": "divide",
+             "args": [
+              {
+               "cast": {
+                "call": "subtract",
+                "args": [
+                 {
+                  "column": "dropoff_at"
+                 },
+                 {
+                  "column": "pickup_at"
+                 }
+                ]
+               },
+               "to": "int64"
+              },
+              {
+               "literal": 1000000.0
+              }
+             ]
+            },
+            {
+             "literal": 14400.0
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "call": "and",
+         "args": [
+          {
+           "call": "and",
+           "args": [
+            {
+             "call": "greater",
+             "args": [
+              {
+               "column": "trip_distance"
+              },
+              {
+               "literal": 0.0
+              }
+             ]
+            },
+            {
+             "call": "less",
+             "args": [
+              {
+               "column": "trip_distance"
+              },
+              {
+               "literal": 100.0
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "call": "greater",
+           "args": [
+            {
+             "column": "fare_amount"
+            },
+            {
+             "literal": 0.0
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "enrich.in.arrow"
+    }
+   ],
+   "expected": "enrich.expected.arrow"
+  },
+  {
+   "name": "enrich_empty",
+   "version": 1,
+   "tests": [
+    "empty"
+   ],
+   "about": "A batch of zero rows gives zero rows of Enrich's output schema.",
+   "params": {
+    "outputs": [
+     {
+      "name": "vendor_id",
+      "expr": {
+       "column": "vendor_id"
+      }
+     },
+     {
+      "name": "pickup_at",
+      "expr": {
+       "column": "pickup_at"
+      }
+     },
+     {
+      "name": "dropoff_at",
+      "expr": {
+       "column": "dropoff_at"
+      }
+     },
+     {
+      "name": "passenger_count",
+      "expr": {
+       "column": "passenger_count"
+      }
+     },
+     {
+      "name": "trip_distance",
+      "expr": {
+       "column": "trip_distance"
+      }
+     },
+     {
+      "name": "ratecode_id",
+      "expr": {
+       "column": "ratecode_id"
+      }
+     },
+     {
+      "name": "store_and_fwd_flag",
+      "expr": {
+       "column": "store_and_fwd_flag"
+      }
+     },
+     {
+      "name": "pu_location_id",
+      "expr": {
+       "column": "pu_location_id"
+      }
+     },
+     {
+      "name": "do_location_id",
+      "expr": {
+       "column": "do_location_id"
+      }
+     },
+     {
+      "name": "payment_type",
+      "expr": {
+       "column": "payment_type"
+      }
+     },
+     {
+      "name": "fare_amount",
+      "expr": {
+       "column": "fare_amount"
+      }
+     },
+     {
+      "name": "extra",
+      "expr": {
+       "column": "extra"
+      }
+     },
+     {
+      "name": "mta_tax",
+      "expr": {
+       "column": "mta_tax"
+      }
+     },
+     {
+      "name": "tip_amount",
+      "expr": {
+       "column": "tip_amount"
+      }
+     },
+     {
+      "name": "tolls_amount",
+      "expr": {
+       "column": "tolls_amount"
+      }
+     },
+     {
+      "name": "improvement_surcharge",
+      "expr": {
+       "column": "improvement_surcharge"
+      }
+     },
+     {
+      "name": "total_amount",
+      "expr": {
+       "column": "total_amount"
+      }
+     },
+     {
+      "name": "congestion_surcharge",
+      "expr": {
+       "column": "congestion_surcharge"
+      }
+     },
+     {
+      "name": "airport_fee",
+      "expr": {
+       "column": "airport_fee"
+      }
+     },
+     {
+      "name": "duration_s",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "cast": {
+          "call": "subtract",
+          "args": [
+           {
+            "column": "dropoff_at"
+           },
+           {
+            "column": "pickup_at"
+           }
+          ]
+         },
+         "to": "int64"
+        },
+        {
+         "literal": 1000000.0
+        }
+       ]
+      }
+     },
+     {
+      "name": "mph",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "column": "trip_distance"
+        },
+        {
+         "call": "divide",
+         "args": [
+          {
+           "call": "divide",
+           "args": [
+            {
+             "cast": {
+              "call": "subtract",
+              "args": [
+               {
+                "column": "dropoff_at"
+               },
+               {
+                "column": "pickup_at"
+               }
+              ]
+             },
+             "to": "int64"
+            },
+            {
+             "literal": 1000000.0
+            }
+           ]
+          },
+          {
+           "literal": 3600.0
+          }
+         ]
+        }
+       ]
+      }
+     },
+     {
+      "name": "fare_per_mile",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "column": "fare_amount"
+        },
+        {
+         "column": "trip_distance"
+        }
+       ]
+      }
+     },
+     {
+      "name": "tip_share",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "column": "tip_amount"
+        },
+        {
+         "column": "fare_amount"
+        }
+       ]
+      }
+     },
+     {
+      "name": "keep",
+      "expr": {
+       "call": "and",
+       "args": [
+        {
+         "call": "and",
+         "args": [
+          {
+           "call": "greater_equal",
+           "args": [
+            {
+             "call": "divide",
+             "args": [
+              {
+               "cast": {
+                "call": "subtract",
+                "args": [
+                 {
+                  "column": "dropoff_at"
+                 },
+                 {
+                  "column": "pickup_at"
+                 }
+                ]
+               },
+               "to": "int64"
+              },
+              {
+               "literal": 1000000.0
+              }
+             ]
+            },
+            {
+             "literal": 60.0
+            }
+           ]
+          },
+          {
+           "call": "less_equal",
+           "args": [
+            {
+             "call": "divide",
+             "args": [
+              {
+               "cast": {
+                "call": "subtract",
+                "args": [
+                 {
+                  "column": "dropoff_at"
+                 },
+                 {
+                  "column": "pickup_at"
+                 }
+                ]
+               },
+               "to": "int64"
+              },
+              {
+               "literal": 1000000.0
+              }
+             ]
+            },
+            {
+             "literal": 14400.0
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "call": "and",
+         "args": [
+          {
+           "call": "and",
+           "args": [
+            {
+             "call": "greater",
+             "args": [
+              {
+               "column": "trip_distance"
+              },
+              {
+               "literal": 0.0
+              }
+             ]
+            },
+            {
+             "call": "less",
+             "args": [
+              {
+               "column": "trip_distance"
+              },
+              {
+               "literal": 100.0
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "call": "greater",
+           "args": [
+            {
+             "column": "fare_amount"
+            },
+            {
+             "literal": 0.0
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "enrich_empty.in.arrow"
+    }
+   ],
+   "expected": "enrich_empty.expected.arrow"
+  },
+  {
+   "name": "enrich_two_batches",
+   "version": 1,
+   "tests": [
+    "multi_batch"
+   ],
+   "about": "Each of two batches gives its own rows' columns, in order.",
+   "params": {
+    "outputs": [
+     {
+      "name": "vendor_id",
+      "expr": {
+       "column": "vendor_id"
+      }
+     },
+     {
+      "name": "pickup_at",
+      "expr": {
+       "column": "pickup_at"
+      }
+     },
+     {
+      "name": "dropoff_at",
+      "expr": {
+       "column": "dropoff_at"
+      }
+     },
+     {
+      "name": "passenger_count",
+      "expr": {
+       "column": "passenger_count"
+      }
+     },
+     {
+      "name": "trip_distance",
+      "expr": {
+       "column": "trip_distance"
+      }
+     },
+     {
+      "name": "ratecode_id",
+      "expr": {
+       "column": "ratecode_id"
+      }
+     },
+     {
+      "name": "store_and_fwd_flag",
+      "expr": {
+       "column": "store_and_fwd_flag"
+      }
+     },
+     {
+      "name": "pu_location_id",
+      "expr": {
+       "column": "pu_location_id"
+      }
+     },
+     {
+      "name": "do_location_id",
+      "expr": {
+       "column": "do_location_id"
+      }
+     },
+     {
+      "name": "payment_type",
+      "expr": {
+       "column": "payment_type"
+      }
+     },
+     {
+      "name": "fare_amount",
+      "expr": {
+       "column": "fare_amount"
+      }
+     },
+     {
+      "name": "extra",
+      "expr": {
+       "column": "extra"
+      }
+     },
+     {
+      "name": "mta_tax",
+      "expr": {
+       "column": "mta_tax"
+      }
+     },
+     {
+      "name": "tip_amount",
+      "expr": {
+       "column": "tip_amount"
+      }
+     },
+     {
+      "name": "tolls_amount",
+      "expr": {
+       "column": "tolls_amount"
+      }
+     },
+     {
+      "name": "improvement_surcharge",
+      "expr": {
+       "column": "improvement_surcharge"
+      }
+     },
+     {
+      "name": "total_amount",
+      "expr": {
+       "column": "total_amount"
+      }
+     },
+     {
+      "name": "congestion_surcharge",
+      "expr": {
+       "column": "congestion_surcharge"
+      }
+     },
+     {
+      "name": "airport_fee",
+      "expr": {
+       "column": "airport_fee"
+      }
+     },
+     {
+      "name": "duration_s",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "cast": {
+          "call": "subtract",
+          "args": [
+           {
+            "column": "dropoff_at"
+           },
+           {
+            "column": "pickup_at"
+           }
+          ]
+         },
+         "to": "int64"
+        },
+        {
+         "literal": 1000000.0
+        }
+       ]
+      }
+     },
+     {
+      "name": "mph",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "column": "trip_distance"
+        },
+        {
+         "call": "divide",
+         "args": [
+          {
+           "call": "divide",
+           "args": [
+            {
+             "cast": {
+              "call": "subtract",
+              "args": [
+               {
+                "column": "dropoff_at"
+               },
+               {
+                "column": "pickup_at"
+               }
+              ]
+             },
+             "to": "int64"
+            },
+            {
+             "literal": 1000000.0
+            }
+           ]
+          },
+          {
+           "literal": 3600.0
+          }
+         ]
+        }
+       ]
+      }
+     },
+     {
+      "name": "fare_per_mile",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "column": "fare_amount"
+        },
+        {
+         "column": "trip_distance"
+        }
+       ]
+      }
+     },
+     {
+      "name": "tip_share",
+      "expr": {
+       "call": "divide",
+       "args": [
+        {
+         "column": "tip_amount"
+        },
+        {
+         "column": "fare_amount"
+        }
+       ]
+      }
+     },
+     {
+      "name": "keep",
+      "expr": {
+       "call": "and",
+       "args": [
+        {
+         "call": "and",
+         "args": [
+          {
+           "call": "greater_equal",
+           "args": [
+            {
+             "call": "divide",
+             "args": [
+              {
+               "cast": {
+                "call": "subtract",
+                "args": [
+                 {
+                  "column": "dropoff_at"
+                 },
+                 {
+                  "column": "pickup_at"
+                 }
+                ]
+               },
+               "to": "int64"
+              },
+              {
+               "literal": 1000000.0
+              }
+             ]
+            },
+            {
+             "literal": 60.0
+            }
+           ]
+          },
+          {
+           "call": "less_equal",
+           "args": [
+            {
+             "call": "divide",
+             "args": [
+              {
+               "cast": {
+                "call": "subtract",
+                "args": [
+                 {
+                  "column": "dropoff_at"
+                 },
+                 {
+                  "column": "pickup_at"
+                 }
+                ]
+               },
+               "to": "int64"
+              },
+              {
+               "literal": 1000000.0
+              }
+             ]
+            },
+            {
+             "literal": 14400.0
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "call": "and",
+         "args": [
+          {
+           "call": "and",
+           "args": [
+            {
+             "call": "greater",
+             "args": [
+              {
+               "column": "trip_distance"
+              },
+              {
+               "literal": 0.0
+              }
+             ]
+            },
+            {
+             "call": "less",
+             "args": [
+              {
+               "column": "trip_distance"
+              },
+              {
+               "literal": 100.0
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "call": "greater",
+           "args": [
+            {
+             "column": "fare_amount"
+            },
+            {
+             "literal": 0.0
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "enrich_two.in.arrow"
+    }
+   ],
+   "expected": "enrich.expected.arrow"
+  },
+  {
+   "name": "constant_error_only_with_rows",
+   "version": 1,
+   "tests": [
+    "empty"
+   ],
+   "about": "A constant subtree that would refuse (1.0 / 0.0 checked) is not evaluated on zero rows.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "call": "divide_checked",
+       "args": [
+        {
+         "literal": 1.0
+        },
+        {
+         "literal": 0.0
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "enrich_empty.in.arrow"
+    }
+   ],
+   "expected": "constant_empty.expected.arrow"
+  },
+  {
+   "name": "constant_error_with_rows",
+   "version": 1,
+   "tests": [
+    "error"
+   ],
+   "about": "The same constant subtree refuses a batch that has rows.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "call": "divide_checked",
+       "args": [
+        {
+         "literal": 1.0
+        },
+        {
+         "literal": 0.0
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "enrich.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "apply",
+    "contains": "divide by zero"
+   }
+  },
+  {
+   "name": "malformed_tree_refused",
+   "version": 1,
+   "tests": [
+    "params",
+    "error"
+   ],
+   "about": "A node with an unknown key is refused at configure.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "column": "fare_amount",
+       "as": "y"
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "enrich.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "configure",
+    "contains": "unknown key"
+   }
+  },
+  {
+   "name": "unknown_column_refused",
+   "version": 1,
+   "tests": [
+    "error"
+   ],
+   "about": "A column the input does not have is refused at plan.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "column": "fare"
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "enrich.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "schema",
+    "contains": "no column `fare`"
+   }
+  },
+  {
+   "name": "no_kernel_refused",
+   "version": 1,
+   "tests": [
+    "error"
+   ],
+   "about": "add of a string and a number is refused at plan.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "call": "add",
+       "args": [
+        {
+         "column": "store_and_fwd_flag"
+        },
+        {
+         "literal": 1
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "enrich.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "schema",
+    "contains": "no kernel"
+   }
+  },
+  {
+   "name": "unknown_function_refused",
+   "version": 1,
+   "tests": [
+    "error"
+   ],
+   "about": "A function outside the vocabulary is refused at plan.",
+   "params": {
+    "outputs": [
+     {
+      "name": "x",
+      "expr": {
+       "call": "modulo",
+       "args": [
+        {
+         "column": "fare_amount"
+        },
+        {
+         "literal": 2.0
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "inputs": [
+    {
+     "file": "enrich.in.arrow"
+    }
+   ],
+   "error": {
+    "at": "schema",
+    "contains": "no function `modulo`"
+   }
+  }
+ ]
+}

@@ -33,6 +33,7 @@ pub mod interval_coverage_count;
 pub mod mlp;
 pub mod ops;
 pub mod selection;
+pub mod tree;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -50,12 +51,14 @@ use sha2::Digest;
 use crate::args::{bad, canonical};
 use crate::expr::{Expr, Literal};
 use crate::ops::{Algo, MaskMode, Step, TruncUnit};
+use crate::tree::legacy::Legacy;
+use crate::tree::{Compiled, Tree};
 
 /// This crate's version, which is part of every standard kernel's fingerprint.
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Every standard kernel's name, in the order of MH 4.9.
-pub const NAMES: [&str; 14] = [
+/// Every standard kernel's name, in the order of MH 4.9, then `expr` (design 4B).
+pub const NAMES: [&str; 15] = [
     "cast",
     "rename",
     "select",
@@ -70,6 +73,7 @@ pub const NAMES: [&str; 14] = [
     "date_trunc",
     "union",
     "join",
+    "expr",
 ];
 
 /// What a standard kernel does.
@@ -77,12 +81,14 @@ pub const NAMES: [&str; 14] = [
 enum Op {
     /// `cast`, `rename`, `select`, `drop`, and any fused chain of them.
     Project(Vec<Step>),
-    /// `filter`.
-    Filter(Expr),
+    /// `filter`, its predicate evaluated as its `expr` translation.
+    Filter(Legacy),
     /// `fill_null`.
     Fill(Vec<(String, Literal)>),
     /// `fill_null` then `filter`, fused.
-    FillFilter(Vec<(String, Literal)>, Expr),
+    FillFilter(Vec<(String, Literal)>, Legacy),
+    /// `expr`: a tree of elementwise operations, its outputs the output batch (spec/expr.md).
+    Expr(Compiled),
     /// `dedupe`: stateful, one instance.
     Dedupe(Vec<String>),
     /// `hash`.
@@ -276,14 +282,27 @@ impl StdKernel {
             "filter" => {
                 args::only(name, args, &["expr"])?;
                 let expr = Expr::parse(&args::string(name, args, "expr")?)?;
+                let columns = expr.columns();
                 (
-                    Op::Filter(expr.clone()),
+                    Op::Filter(Legacy::new(expr)),
                     Declared {
-                        input: subset(expr.columns()),
+                        input: subset(columns),
                         output: unchanged(),
                     },
                     1.0,
                 )
+            }
+            "expr" => {
+                let tree = Tree::from_json(args)?;
+                let outputs: Vec<String> = tree.outputs.iter().map(|o| o.name.clone()).collect();
+                // The tree's types are checked against the real input schema at plan
+                // (`output_schema`); it does not say its columns' types, so it declares no input
+                // a synthetic batch could be made from (`moruna check`: not checkable).
+                let declared = Declared {
+                    input: None,
+                    output: Some(SchemaDecl::Exact(anys(&outputs))),
+                };
+                (Op::Expr(Compiled::new(tree)), declared, 1.0)
             }
             "fill_null" => {
                 args::only(name, args, &["values"])?;
@@ -527,19 +546,20 @@ impl StdKernel {
     fn table_output(&self, input: &Schema) -> Result<SchemaRef> {
         match &self.op {
             Op::Project(steps) => ops::projection_schema(steps, input),
-            Op::Filter(expr) => {
-                expr.validate(input)?;
+            Op::Filter(filter) => {
+                filter.expr.validate(input)?;
                 Ok(Arc::new(input.clone()))
             }
             Op::Fill(values) => {
                 ops::fill_check(values, input)?;
                 Ok(Arc::new(input.clone()))
             }
-            Op::FillFilter(values, expr) => {
+            Op::FillFilter(values, filter) => {
                 ops::fill_check(values, input)?;
-                expr.validate(input)?;
+                filter.expr.validate(input)?;
                 Ok(Arc::new(input.clone()))
             }
+            Op::Expr(compiled) => Ok(compiled.program(&Arc::new(input.clone()))?.schema()),
             Op::Dedupe(keys) => {
                 ops::dedupe_check(keys, input)?;
                 Ok(Arc::new(input.clone()))
@@ -568,7 +588,7 @@ pub fn fuse(first: &StdKernel, second: &StdKernel) -> Option<StdKernel> {
             steps.extend(b.iter().cloned());
             Op::Project(steps)
         }
-        (Op::Fill(values), Op::Filter(expr)) => Op::FillFilter(values.clone(), expr.clone()),
+        (Op::Fill(values), Op::Filter(filter)) => Op::FillFilter(values.clone(), filter.clone()),
         _ => return None,
     };
     let mut stages = first.parts();
@@ -928,7 +948,8 @@ impl Kernel for StdKernel {
                 )?,
                 None => ops::project(steps, batch)?,
             },
-            Op::Filter(expr) => ops::filter(expr, batch)?,
+            Op::Filter(filter) => ops::filter(filter, batch)?,
+            Op::Expr(compiled) => compiled.eval(batch)?,
             Op::Fill(values) => ops::fill(values, batch)?,
             Op::FillFilter(values, expr) => {
                 if let Some(capture) = &self.capture

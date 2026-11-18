@@ -17,7 +17,8 @@ use moruna_kernel::arrow::row::{RowConverter, SortField};
 use moruna_kernel::{MorunaError, Result};
 use sha2::Digest;
 
-use crate::expr::{Expr, Literal};
+use crate::expr::Literal;
+use crate::tree::legacy::Legacy;
 
 pub(crate) fn plan(kernel: &str, msg: impl core::fmt::Display) -> MorunaError {
     MorunaError::Plan(format!("moruna.std.{kernel}: {msg}"))
@@ -274,8 +275,8 @@ pub(crate) fn fill(values: &[(String, Literal)], batch: &RecordBatch) -> Result<
 }
 
 /// `filter`: the rows where the predicate is true.
-pub(crate) fn filter(expr: &Expr, batch: &RecordBatch) -> Result<RecordBatch> {
-    let mask = expr.eval(batch)?;
+pub(crate) fn filter(predicate: &Legacy, batch: &RecordBatch) -> Result<RecordBatch> {
+    let mask = predicate.mask(batch)?;
     filter::filter_record_batch(batch, &mask).map_err(arrow("filter"))
 }
 
@@ -283,19 +284,24 @@ pub(crate) fn filter(expr: &Expr, batch: &RecordBatch) -> Result<RecordBatch> {
 /// columns it names, the rows are filtered, and only the surviving rows are filled.
 pub(crate) fn fill_then_filter(
     values: &[(String, Literal)],
-    expr: &Expr,
+    predicate: &Legacy,
     batch: &RecordBatch,
 ) -> Result<RecordBatch> {
-    let read: Vec<String> = expr.columns().into_iter().map(|c| c.name).collect();
+    let read: Vec<String> = predicate
+        .expr
+        .columns()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
     let needed: Vec<(String, Literal)> = values
         .iter()
         .filter(|(name, _)| read.contains(name))
         .cloned()
         .collect();
     let mask = if needed.is_empty() {
-        expr.eval(batch)?
+        predicate.mask(batch)?
     } else {
-        expr.eval(&fill(&needed, batch)?)?
+        predicate.mask(&fill(&needed, batch)?)?
     };
     let kept = filter::filter_record_batch(batch, &mask).map_err(arrow("filter"))?;
     fill(values, &kept)
