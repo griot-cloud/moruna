@@ -32,6 +32,10 @@ apt-get -o DPkg::Lock::Timeout=600 install -y -q openjdk-17-jre-headless build-e
   curl >/dev/null
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 
+# uv's downloads wait up to 5 minutes and are tried 5 times: at uv's 30 s a large wheel from
+# PyPI (pyarrow for Ray, Dask, DuckDB and Spark) timed out from Central India, and none of the
+# four engines ran (6.2 run 4, 2026-11-18). This is the harness's network, not an engine's time.
+export UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5
 # uv from PyPI, pinned to the version the harness was checked with on the Mac.
 python3 -m venv /opt/uv && /opt/uv/bin/pip install -q uv==0.10.9 && ln -sf /opt/uv/bin/uv /usr/local/bin/uv
 # Rust, for the Rust pool, 0.6.6's wheel and its Rust function: the repository's pinned toolchain.
