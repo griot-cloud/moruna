@@ -171,10 +171,13 @@ mod tests {
             "moruna: fatal core: the bootloader passed no initramfs"
         );
         let line = Fatal {
-            stage: format_args!("service {}", "devices"),
-            reason: "ended",
+            stage: "devices",
+            reason: format_args!("ended with code {}", 0),
         };
-        assert_eq!(format!("{line}"), "moruna: fatal service devices: ended");
+        assert_eq!(
+            format!("{line}"),
+            "moruna: fatal devices: ended with code 0"
+        );
         let line = Fatal {
             stage: SERVICES,
             reason: format_args!("{} did not start within 5 s", "api"),

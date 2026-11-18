@@ -374,17 +374,71 @@ pub mod line {
         }
     }
 
-    /// `moruna: fatal service <name>: ended`: a service ended, which stops the node.
-    pub struct Ended<'a>(pub &'a str);
+    /// A service has gone, which stops the node: its own name is the stage (1B: "the name
+    /// of the service that can't go on"). `moruna: fatal <name>: ended`, or `ended with code
+    /// <n>` when the supervisor knows the code; `moruna: fatal <name>: closed its channel to
+    /// the supervisor` when it did so with its process still running.
+    pub struct Gone<'a>(pub &'a str, pub super::Gone);
 
-    impl Display for Ended<'_> {
+    impl Display for Gone<'_> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            Fatal {
-                stage: format_args!("service {}", self.0),
-                reason: "ended",
+            match self.1 {
+                super::Gone::Ended(None) => Fatal {
+                    stage: self.0,
+                    reason: "ended",
+                }
+                .fmt(f),
+                super::Gone::Ended(Some(code)) => Fatal {
+                    stage: self.0,
+                    reason: format_args!("ended with code {code}"),
+                }
+                .fmt(f),
+                super::Gone::LeftSupervision => Fatal {
+                    stage: self.0,
+                    reason: "closed its channel to the supervisor",
+                }
+                .fmt(f),
             }
-            .fmt(f)
         }
+    }
+}
+
+/// How one of the node's services went: each stops the node (1B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gone {
+    /// Its process ended, with its code when the supervisor knows it.
+    Ended(Option<i64>),
+    /// It closed its channel to the supervisor (a bootstrap's, or admission's guardian)
+    /// while its process still runs: the supervisor can no longer watch over it.
+    LeftSupervision,
+}
+
+impl Gone {
+    /// What a service's closed channel to the supervisor means. A service that ends closes
+    /// its channels a moment before its process is seen to have ended, so the supervisor
+    /// looks for its process's end first: `terminated` says whether it saw it. Either way
+    /// the line names the service, never the channel.
+    pub fn closed_channel(terminated: bool) -> Gone {
+        if terminated {
+            Gone::Ended(None)
+        } else {
+            Gone::LeftSupervision
+        }
+    }
+}
+
+impl Config {
+    /// The services that hold a channel to the supervisor it watches, in the order the
+    /// supervisor makes those channels: each bootstrap's but `platform`'s, which makes no
+    /// process, then the admission service's guardian. When one closes, the service at its
+    /// place has gone.
+    pub fn guardians(&self) -> Vec<&str> {
+        let bootstraps = self
+            .bootstraps
+            .iter()
+            .filter(|(kind, _)| *kind != Bootstrap::Platform)
+            .map(|(_, service)| service.as_str());
+        bootstraps.chain(self.admission.as_deref()).collect()
     }
 }
 
@@ -515,8 +569,20 @@ mod start_tests {
     #[test]
     fn the_supervisors_failure_lines_are_exactly_the_system_designs() {
         assert_eq!(
-            format!("{}", line::Ended("devices")),
-            "moruna: fatal service devices: ended"
+            format!("{}", line::Gone("devices", Gone::Ended(Some(0)))),
+            "moruna: fatal devices: ended with code 0"
+        );
+        assert_eq!(
+            format!("{}", line::Gone("devices", Gone::Ended(None))),
+            "moruna: fatal devices: ended"
+        );
+        assert_eq!(
+            format!("{}", line::Gone("vmbus", Gone::Ended(Some(-3)))),
+            "moruna: fatal vmbus: ended with code -3"
+        );
+        assert_eq!(
+            format!("{}", line::Gone("admission", Gone::LeftSupervision)),
+            "moruna: fatal admission: closed its channel to the supervisor"
         );
         assert_eq!(
             format!("{}", line::Late("netstack")),
@@ -538,6 +604,8 @@ mod start_tests {
 
 #[cfg(test)]
 mod tests {
+    use alloc::format;
+
     use super::*;
     #[test]
     fn separate_instances_share_only_immutable_program_not_account_or_slots() {
@@ -598,6 +666,37 @@ mod tests {
         // root.hyperv has one owner, as every boot capability does.
         let twice = b"moruna-node 1\nservice a b 4096\nservice c d 4096\ngrant a root.hyperv root.hyperv\ngrant c root.hyperv root.hyperv\n";
         assert_eq!(Config::parse(twice, 8192), Err(ConfigError::Duplicate));
+    }
+
+    #[test]
+    fn a_closed_supervisor_channel_names_the_service_that_held_it() {
+        // Devices' bootstrap channel is a guardian, platform's is not, and a service with no
+        // bootstrap has none. An admission service's guardian comes after every bootstrap's.
+        let node = concat!(
+            "moruna-node 1\n",
+            "service devices image.devices 4096\n",
+            "service platform image.platform 4096\n",
+            "service gate image.admission 4096\n",
+            "service linux image.linux 4096\n",
+            "service vmbus image.vmbus 4096\n",
+            "bootstrap platform platform\n",
+            "bootstrap devices devices until-stopped\n",
+            "bootstrap admission gate\n",
+            "bootstrap linux linux\n",
+        );
+        let config = Config::parse(node.as_bytes(), 32768).unwrap();
+        assert_eq!(config.guardians(), ["devices", "linux", "gate"]);
+        let plain = Config::parse(b"moruna-node 1\nservice a b 4096\n", 8192).unwrap();
+        assert!(plain.guardians().is_empty());
+        // Whether its process has been seen to end decides the line; it is never the
+        // channel's error.
+        assert_eq!(Gone::closed_channel(true), Gone::Ended(None));
+        assert_eq!(Gone::closed_channel(false), Gone::LeftSupervision);
+        for gone in [Gone::closed_channel(true), Gone::closed_channel(false)] {
+            let text = format!("{}", line::Gone("devices", gone));
+            assert!(text.starts_with("moruna: fatal devices: "), "{text}");
+            assert!(!text.contains("guardian") && !text.contains("peer closed"));
+        }
     }
 
     #[test]
