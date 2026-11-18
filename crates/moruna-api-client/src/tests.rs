@@ -83,7 +83,7 @@ fn a_client_is_built_with_and_without_a_pin() {
 #[test]
 fn a_success_is_read_as_the_operation_document() {
     let body = br#"{"version":"0.7.0","instance":"i","cloud":"azure","cores":2,
-        "memory_bytes":1,"executors":[],"boot_ms":3,"time":4,"health":"degraded"}"#;
+        "memory_bytes":1,"job_memory_bytes":1,"executors":[],"boot_ms":3,"time":4,"health":"degraded"}"#;
     let node: Node = answer("node", 200, body).unwrap();
     assert_eq!((node.cores, node.instance.as_str()), (2, "i"));
 }

@@ -6,7 +6,7 @@
 //! and when. The crate's unit tests and its end-to-end tests both use it.
 
 use moruna_api::Refusal;
-use moruna_api_server::{Checked, EngineHost, HostError};
+use moruna_api_server::{EngineHost, HostError, Needs, Verdict};
 use moruna_event::{Encoder, Event, LogStream, Stamp};
 use std::{
     cell::RefCell,
@@ -31,13 +31,17 @@ pub struct State {
     /// The verdicts the next checks give, in order; a check with none finds the document sound.
     pub verdicts: VecDeque<Result<Vec<Refusal>, HostError>>,
     /// The functions the next checks answer the job uses (its `needs.functions`), in order; a
-    /// check with none answers none.
+    /// check with none answers those of `needs`.
     pub functions: VecDeque<Vec<String>>,
     /// While set, a check under way gives no verdict.
     pub hold_checks: bool,
     checking: bool,
     /// The `spec` line of each engine started.
     pub started: Vec<String>,
+    /// The verdict each engine was started with.
+    pub started_with: Vec<Verdict>,
+    /// The budget and needs a sound check answers.
+    pub needs: (Option<u64>, Needs),
     /// What the next start answers, when it is not to start.
     pub refuse_start: Option<HostError>,
     /// The lines sent to the engine after its `spec`.
@@ -171,25 +175,36 @@ impl EngineHost for Engine {
         Ok(())
     }
 
-    fn checked(&mut self) -> Option<Result<Checked, HostError>> {
+    fn checked(&mut self) -> Option<Result<Verdict, HostError>> {
         let mut state = self.0.borrow_mut();
         if !state.checking || state.hold_checks {
             return None;
         }
         state.checking = false;
-        let functions = state.functions.pop_front().unwrap_or_default();
-        let verdict = state.verdicts.pop_front().unwrap_or(Ok(Vec::new()));
-        Some(verdict.map(|refusals| Checked {
-            refusals,
-            functions,
-        }))
+        let (memory_bytes, mut needs) = state.needs.clone();
+        if let Some(functions) = state.functions.pop_front() {
+            needs.functions = functions;
+        }
+        Some(
+            state
+                .verdicts
+                .pop_front()
+                .unwrap_or(Ok(Vec::new()))
+                .map(|refusals| Verdict {
+                    refusals,
+                    memory_bytes,
+                    needs,
+                }),
+        )
     }
 
-    fn start(&mut self, spec: &[u8]) -> Result<(), HostError> {
+    fn start(&mut self, spec: &[u8], verdict: &Verdict) -> Result<(), HostError> {
         let mut state = self.0.borrow_mut();
+        assert!(verdict.refusals.is_empty(), "only a sound job starts");
         if let Some(refusal) = state.refuse_start.take() {
             return Err(refusal);
         }
+        state.started_with.push(verdict.clone());
         assert!(
             spec.ends_with(b"\n") && !spec[..spec.len() - 1].contains(&b'\n'),
             "one line"

@@ -4,12 +4,14 @@
 use alloc::{format, string::ToString, vec, vec::Vec};
 
 use moruna_svc::{
-    Encoder, Memory, ProtocolError, Rights, Wire,
+    Encoder, Memory, ProtocolError, ProtocolId, Rights, Wire,
     conformance::{Case, Fail, Probe, Suite},
     map,
 };
 
 use crate::{Info, REGISTRATIONS_MAX, block, bytes};
+
+mod placed;
 
 fn wire<E: core::fmt::Debug>(e: E) -> Fail {
     format!("{e:?}")
@@ -458,13 +460,32 @@ const CASES: &[Case] = &[
         name: "register: a connection's registrations are bounded",
         check: registration_bound,
     },
+    Case {
+        name: "read_to (2.2): sectors land at any byte of a registration and nowhere else, or BadBuffer; UnknownMethod before 2.2",
+        check: placed::read_to,
+    },
+    Case {
+        name: "read_to, write_from (2.2): every refusal, and a body that is not theirs",
+        check: placed::placed_refusals,
+    },
+    Case {
+        name: "write_from (2.2): a sector written from any byte reads back, or BadBuffer; UnknownMethod before 2.2",
+        check: placed::write_from,
+    },
 ];
+
+/// The version every driver of the protocol serves, which the suite's handshake asks for: a
+/// driver of any minor is checked.
+const BASE: ProtocolId = ProtocolId::new("moruna.driver.block", 2, 0);
+/// The requests of [`BASE`], which the suite's generic checks send to every driver; minor 2's
+/// are checked by its own cases.
+const BASE_REQUESTS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
 /// The protocol's conformance suite.
 pub fn suite() -> Suite {
     Suite {
-        id: block::ID,
-        requests: block::REQUESTS,
+        id: BASE,
+        requests: BASE_REQUESTS,
         cases: CASES,
         timeout: 30_000_000_000,
     }

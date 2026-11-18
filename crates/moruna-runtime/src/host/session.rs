@@ -555,11 +555,16 @@ fn serve_on(conn: Conn, node: Option<&Node>, kinds: &Registry, opts: &HostOption
                             None => {}
                         }
                         wire.set_secrets(secrets.0);
+                        let mode = if node.is_some() {
+                            Mode::Node
+                        } else {
+                            Mode::Serve
+                        };
                         break match plan {
                             Some(plan) => {
-                                run_plan(plan, job, kinds, opts, &wire, Some(reader), Mode::Serve)
+                                run_plan(plan, job, kinds, opts, &wire, Some(reader), mode)
                             }
-                            None => run_job(job, kinds, opts, &wire, Some(reader), Mode::Serve),
+                            None => run_job(job, kinds, opts, &wire, Some(reader), mode),
                         };
                     }
                     Err(refusal) => break refused_without_document(Some(&raw), &refusal, &wire),
@@ -601,6 +606,19 @@ pub enum Mode {
     Run,
     /// `moruna serve`: the document came from the peer.
     Serve,
+    /// `moruna serve` in node mode (system design 3A): the document came from the node's `api`
+    /// on a channel. A node's job has no storage of its own, so it takes no native guest
+    /// ([`takes_native_guest`]).
+    Node,
+}
+
+/// Whether a run takes the native guest, the standalone node's storage bindings
+/// (`engine.bindings`), on the Moruna kernel: every run there but a node's. A node's job reaches
+/// its data through volumes and the network (system design 3A, 3C, 3D); its run's id is the
+/// document's or the one node mode minted, and its history and checkpoints are the embedding's.
+/// A node refuses `resume` already.
+pub(crate) fn takes_native_guest(mode: Mode, on_kernel: bool) -> bool {
+    on_kernel && mode != Mode::Node
 }
 
 /// Run one document to its exit code (MH 4.3) from the default planner's plan of it
@@ -636,12 +654,18 @@ pub fn run_plan(
     run_planned(Ok(plan), job, kinds, opts, wire, reader, mode)
 }
 
-fn native_guest() -> moruna_kernel::Result<Option<Arc<crate::bootstrap::Guest>>> {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    if moruna_micro::on_kernel() {
-        return crate::bootstrap::Guest::from_start().map(Some);
+fn native_guest(mode: Mode) -> moruna_kernel::Result<Option<Arc<crate::bootstrap::Guest>>> {
+    if !takes_native_guest(mode, moruna_micro::on_kernel()) {
+        return Ok(None);
     }
-    Ok(None)
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        crate::bootstrap::Guest::from_start().map(Some)
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        Ok(None)
+    }
 }
 
 fn run_planned(
@@ -655,7 +679,7 @@ fn run_planned(
 ) -> Outcome {
     // Actual native startup authority is mandatory. A missing grant cannot fall
     // back to empty host components or invent another run identity.
-    let guest = match native_guest() {
+    let guest = match native_guest(mode) {
         Ok(guest) => guest,
         Err(error) => {
             return finish(
@@ -1259,7 +1283,9 @@ fn listen_to_peer(mut reader: Box<dyn BufRead + Send>, peer: &Peer<'_>, mode: Mo
                 )),
             },
             Ok(Inbound::Spec { .. }) => wire.note(match mode {
-                Mode::Serve => "a second spec was refused: one job per process".to_string(),
+                Mode::Serve | Mode::Node => {
+                    "a second spec was refused: one job per process".to_string()
+                }
                 Mode::Run => {
                     "a spec on the socket was refused: this run's document came from a file"
                         .to_string()
@@ -1395,6 +1421,26 @@ mod logs_path_tests {
                 logs_path_from(Some("/out/<run_id>.logs"), Some("/stage"), id, on_kernel),
                 PathBuf::from(format!("/out/{id}.logs"))
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_guest_tests {
+    use super::*;
+
+    /// A node's run takes no native guest (item 3.2): on the Moruna kernel every other run
+    /// starts from the standalone node's `engine.bindings`, and a node-mode run starts with none,
+    /// as a cloud node has no storage to bind. Off the kernel no run takes one.
+    #[test]
+    fn a_node_mode_run_starts_with_no_engine_bindings() {
+        assert!(!takes_native_guest(Mode::Node, true));
+        assert!(takes_native_guest(Mode::Serve, true));
+        assert!(takes_native_guest(Mode::Run, true));
+        for mode in [Mode::Node, Mode::Serve, Mode::Run] {
+            assert!(!takes_native_guest(mode, false), "{mode:?}");
+            // Off the kernel, as on this host, the guest is none and nothing is refused.
+            assert!(matches!(native_guest(mode), Ok(None)));
         }
     }
 }

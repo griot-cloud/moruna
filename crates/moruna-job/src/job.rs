@@ -114,7 +114,21 @@ pub struct Task {
     pub definition: Option<crate::Declaration>,
 }
 
+/// The kind of a function task that names a registered function (system design 3E): its
+/// settings are `{"function": "<registered name>"}`; in version 1, a `kernels` entry
+/// `{"kind": "function", "function": "<registered name>"}`.
+pub const FUNCTION_KIND: &str = "function";
+
 impl Task {
+    /// The registered function this task names: its `function` setting, for a function task
+    /// of kind [`FUNCTION_KIND`].
+    pub fn function_name(&self) -> Option<&str> {
+        if self.role != Role::Kernel || self.kind != FUNCTION_KIND {
+            return None;
+        }
+        self.settings.get("function").and_then(Value::as_str)
+    }
+
     /// A source of kind `kind` with one output port, [`OUT`].
     pub fn source(id: impl Into<String>, entry: KindDoc) -> Task {
         Task::of(id, Role::Source, entry, Vec::new(), vec![OUT.to_string()])

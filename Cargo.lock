@@ -2099,6 +2099,7 @@ dependencies = [
 name = "moruna-micro"
 version = "0.6.6"
 dependencies = [
+ "block-protocol",
  "imagefs-protocol",
  "libc",
  "linux-protocol",

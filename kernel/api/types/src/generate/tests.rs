@@ -271,6 +271,7 @@ fn openapi_schemas_carry_the_design_names_and_no_others() {
             "cloud",
             "cores",
             "memory_bytes",
+            "job_memory_bytes",
             "executors",
             "boot_ms",
             "time",

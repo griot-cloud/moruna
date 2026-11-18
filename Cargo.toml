@@ -167,6 +167,7 @@ moruna-abi = { path = "kernel/abi", version = "=0.1.0" }
 # kernel's own calls through these crates of the kernel workspace, each built for the
 # engine's Linux target with its `native` feature.
 vsock-protocol = { path = "kernel/drivers/vsock-protocol", version = "=0.1.0" }
+block-protocol = { path = "kernel/drivers/block-protocol", version = "=0.1.0" }
 linux-protocol = { path = "kernel/linux/protocol", version = "=0.1.0" }
 imagefs-protocol = { path = "kernel/imagefs/protocol", version = "=0.1.0" }
 

@@ -104,7 +104,103 @@ fn a_node_with_no_engine_runs_no_jobs() {
     let mut none = NoEngine;
     assert_eq!(none.check(b"{}", &[]), Err(HostError::Unavailable));
     assert_eq!(none.checked(), None);
-    assert_eq!(none.start(b"{}\n"), Err(HostError::Unavailable));
+    assert_eq!(
+        none.start(b"{}\n", &Verdict::default()),
+        Err(HostError::Unavailable)
+    );
     assert_eq!(none.send(b"{}\n"), Err(HostError::Unavailable));
     assert_eq!(none.receive(&mut [0; 8]), Err(HostError::WouldBlock));
+}
+
+/// The `check` message carries a version 1 document as its JSON and a version 2 document's
+/// bytes as their base64, with the secrets' names and never their values.
+#[test]
+fn a_check_is_one_line_of_the_document_and_its_secrets_names() {
+    let v1 = check_line(br#"{"moruna_spec":1}"#, &["s3.key".into(), "other".into()]);
+    assert_eq!(
+        v1,
+        b"{\"type\":\"check\",\"spec\":{\"moruna_spec\":1},\"secrets\":[\"s3.key\",\"other\"]}\n"
+    );
+    let line: serde_json::Value = serde_json::from_slice(&v1).unwrap();
+    assert_eq!(line["spec"]["moruna_spec"], 1);
+    for (bytes, base64) in [
+        (&b"MJB2"[..], "TUpCMg=="),
+        (b"MJB2x", "TUpCMng="),
+        (b"MJB2xy", "TUpCMnh5"),
+        (b"\x00\xff\x10", "AP8Q"),
+    ] {
+        let line = check_line(bytes, &[]);
+        let expected =
+            alloc::format!("{{\"type\":\"check\",\"spec\":\"{base64}\",\"secrets\":[]}}\n");
+        assert_eq!(String::from_utf8(line).unwrap(), expected);
+        assert_eq!(
+            crate::token::base64(base64.as_bytes()).unwrap(),
+            bytes,
+            "{base64}"
+        );
+    }
+    assert_eq!(crate::token::to_base64(b""), "");
+}
+
+/// The `checked` line's refusals, budget and needs are the verdict; anything else is the
+/// check's failure.
+#[test]
+fn the_checked_line_is_the_verdict() {
+    let sound = verdict(
+        br#"{"type":"checked","ok":true,"refusals":[],"memory_bytes":1073741824,"hosts":["s3.eu-west-1.amazonaws.com"],"volumes":[{"serial":"vol-in","write":false},{"serial":"vol-out","write":true},{"serial":"vol-s","write":true,"staging":true}],"functions":["taxi.clean"]}
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        sound,
+        Verdict {
+            refusals: Vec::new(),
+            memory_bytes: Some(1 << 30),
+            needs: Needs {
+                hosts: vec!["s3.eu-west-1.amazonaws.com".into()],
+                volumes: vec![
+                    Volume {
+                        serial: "vol-in".into(),
+                        write: false,
+                        staging: false
+                    },
+                    Volume {
+                        serial: "vol-out".into(),
+                        write: true,
+                        staging: false
+                    },
+                    Volume {
+                        serial: "vol-s".into(),
+                        write: true,
+                        staging: true
+                    }
+                ],
+                functions: vec!["taxi.clean".into()],
+            },
+        }
+    );
+    let refused = verdict(
+        br#"{"type":"checked","ok":false,"refusals":[{"field":"sink.kind","message":"no such kind"}],"memory_bytes":null,"hosts":[],"volumes":[],"functions":[]}"#,
+    )
+    .unwrap();
+    assert_eq!(refused.refusals.len(), 1);
+    assert_eq!(refused.refusals[0].field, "sink.kind");
+    assert_eq!(refused.memory_bytes, None);
+    // The members a check of an unreadable document leaves empty may be absent.
+    assert_eq!(
+        verdict(br#"{"type":"checked","ok":true}"#).unwrap(),
+        Verdict::default()
+    );
+    for line in [
+        &b"not json"[..],
+        br#"{"type":"hello","ok":true}"#,
+        br#"{"type":"checked","ok":false,"refusals":[]}"#,
+        br#"{"type":"checked"}"#,
+    ] {
+        assert!(
+            matches!(verdict(line), Err(HostError::Failed(_))),
+            "{}",
+            String::from_utf8_lossy(line)
+        );
+    }
 }

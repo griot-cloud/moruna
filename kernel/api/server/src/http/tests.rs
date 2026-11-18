@@ -15,6 +15,7 @@ fn facts() -> NodeFacts {
         cloud: Cloud::OpenStack,
         cores: 4,
         memory_bytes: 8 << 30,
+        job_memory_bytes: 6_532 << 20,
         executors: vec![Executor {
             kind: ExecutorKind::Cpu,
             slots: 4,

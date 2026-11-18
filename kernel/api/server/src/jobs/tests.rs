@@ -39,9 +39,23 @@ fn sent(jobs: &Jobs, stream: &mut Stream) -> (String, bool) {
     }
 }
 
+/// A submit as the server makes it: the job queued for the engine's check, then the node pumped
+/// once, so that the check answers and a sound job's engine starts. What the node refused at
+/// once (the check's refusals, or the start) is the answer, as a submit's answer is.
+fn submit(jobs: &mut Jobs, engine: &mut Engine, body: &[u8]) -> Result<u64, Answer> {
+    let ticket = jobs.submit(body)?;
+    // The first pump hands the engine the check; the next takes its verdict.
+    jobs.pump(engine, &Registry::default(), NOW);
+    jobs.pump(engine, &Registry::default(), NOW);
+    match jobs.resolved.iter().position(|(t, _)| *t == ticket) {
+        Some(at) if jobs.resolved[at].1.status != 201 => Err(jobs.resolved.remove(at).1),
+        _ => Ok(ticket),
+    }
+}
+
 /// A job submitted and taken by the engine: its ID is [`RUN`].
 fn running(jobs: &mut Jobs, engine: &mut Engine, job: &str) {
-    let ticket = jobs.submit(engine, job.as_bytes(), NOW).unwrap();
+    let ticket = submit(jobs, engine, job.as_bytes()).unwrap();
     engine.attempt_started();
     jobs.pump(engine, &Registry::default(), NOW);
     let answer = resolved(jobs, ticket);
@@ -52,7 +66,7 @@ fn running(jobs: &mut Jobs, engine: &mut Engine, job: &str) {
 #[test]
 fn a_job_goes_from_spec_to_exit() {
     let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
-    let ticket = jobs.submit(&mut engine, V1.as_bytes(), NOW).unwrap();
+    let ticket = submit(&mut jobs, &mut engine, V1.as_bytes()).unwrap();
     // The engine is sent the document as one line, as the client wrote it.
     assert_eq!(
         engine.0.borrow().started,
@@ -114,8 +128,7 @@ fn a_job_goes_from_spec_to_exit() {
 #[test]
 fn a_version_2_document_goes_to_the_engine_as_its_base64() {
     let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
-    jobs.submit(&mut engine, br#"{"v2":"TUpCMg=="}"#, NOW)
-        .unwrap();
+    submit(&mut jobs, &mut engine, br#"{"v2":"TUpCMg=="}"#).unwrap();
     assert_eq!(engine.spec(), json!({ "type": "spec", "spec": "TUpCMg==" }));
     // The check reads its bytes.
     let mut checks = Jobs::default();
@@ -124,9 +137,11 @@ fn a_version_2_document_goes_to_the_engine_as_its_base64() {
     checks.pump(&mut engine, &Registry::default(), NOW);
     checks.pump(&mut engine, &Registry::default(), NOW);
     checks.pump(&mut engine, &Registry::default(), NOW);
+    // The submit's own check first, then the two validations'.
     let checked = engine.0.borrow().checked.clone();
     assert_eq!(checked[0], b"MJB2");
-    assert!(checked[1].starts_with(br#"{"moruna_spec":1,"#));
+    assert_eq!(checked[1], b"MJB2");
+    assert!(checked[2].starts_with(br#"{"moruna_spec":1,"#));
 }
 
 #[test]
@@ -148,7 +163,7 @@ fn what_is_not_a_job_is_invalid_and_starts_nothing() {
         r#"{"v1":{},"secrets":{"a key":"v"}}"#,
         r#"{"v1":{},"secrets":{"k":7}}"#,
     ] {
-        let answer = jobs.submit(&mut engine, bad.as_bytes(), NOW).unwrap_err();
+        let answer = submit(&mut jobs, &mut engine, bad.as_bytes()).unwrap_err();
         assert_eq!(answer.status, 400, "{bad}");
         assert_eq!(body(&answer)["error"]["code"], "invalid", "{bad}");
         assert_eq!(
@@ -164,7 +179,7 @@ fn what_is_not_a_job_is_invalid_and_starts_nothing() {
 fn the_engine_refusal_answers_the_submit_and_leaves_no_job() {
     let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
     // Exit code 2, with the refusal: invalid, with the engine's words.
-    let ticket = jobs.submit(&mut engine, V1.as_bytes(), NOW).unwrap();
+    let ticket = submit(&mut jobs, &mut engine, V1.as_bytes()).unwrap();
     engine.finish(
         r#"{"exit":{"code":2}}"#,
         2,
@@ -180,7 +195,7 @@ fn the_engine_refusal_answers_the_submit_and_leaves_no_job() {
     );
     assert!(!jobs.busy() && jobs.list().jobs.is_empty());
     // Any other end before the job began is the node's failure.
-    let ticket = jobs.submit(&mut engine, V1.as_bytes(), NOW).unwrap();
+    let ticket = submit(&mut jobs, &mut engine, V1.as_bytes()).unwrap();
     engine.exit(3, Some("the budget does not fit"));
     jobs.pump(&mut engine, &Registry::default(), NOW);
     let answer = resolved(&mut jobs, ticket);
@@ -191,7 +206,7 @@ fn the_engine_refusal_answers_the_submit_and_leaves_no_job() {
             .unwrap()
             .contains("code 3")
     );
-    let ticket = jobs.submit(&mut engine, V1.as_bytes(), NOW).unwrap();
+    let ticket = submit(&mut jobs, &mut engine, V1.as_bytes()).unwrap();
     engine.0.borrow_mut().ended = true;
     jobs.pump(&mut engine, &Registry::default(), NOW);
     assert_eq!(resolved(&mut jobs, ticket).status, 500);
@@ -202,7 +217,7 @@ fn the_engine_refusal_answers_the_submit_and_leaves_no_job() {
 fn a_submit_while_a_job_runs_is_busy_and_the_host_can_refuse_one() {
     let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
     running(&mut jobs, &mut engine, V1);
-    let answer = jobs.submit(&mut engine, V1.as_bytes(), NOW).unwrap_err();
+    let answer = submit(&mut jobs, &mut engine, V1.as_bytes()).unwrap_err();
     assert_eq!(
         (answer.status, body(&answer)["error"]["code"].as_str()),
         (503, Some("busy"))
@@ -220,7 +235,7 @@ fn a_submit_while_a_job_runs_is_busy_and_the_host_can_refuse_one() {
         (HostError::WouldBlock, 503),
     ] {
         engine.0.borrow_mut().refuse_start = Some(refusal);
-        let answer = jobs.submit(&mut engine, V1.as_bytes(), NOW).unwrap_err();
+        let answer = submit(&mut jobs, &mut engine, V1.as_bytes()).unwrap_err();
         assert_eq!(answer.status, status);
         assert!(!jobs.busy());
     }
@@ -285,7 +300,7 @@ fn a_job_ends_failed_on_any_other_code_or_when_the_engine_is_lost() {
 
 /// As [`running`], for a job whose ID is `run`.
 fn running_as(jobs: &mut Jobs, engine: &mut Engine, run: &str) {
-    let ticket = jobs.submit(engine, V1.as_bytes(), NOW).unwrap();
+    let ticket = submit(jobs, engine, V1.as_bytes()).unwrap();
     engine.attempt_started();
     jobs.pump(engine, &Registry::default(), NOW);
     assert_eq!(body(&resolved(jobs, ticket)), json!({ "id": run }));
@@ -294,7 +309,7 @@ fn running_as(jobs: &mut Jobs, engine: &mut Engine, run: &str) {
 #[test]
 fn what_the_engine_says_before_the_run_id_is_kept_for_the_job() {
     let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
-    let ticket = jobs.submit(&mut engine, V1.as_bytes(), NOW).unwrap();
+    let ticket = submit(&mut jobs, &mut engine, V1.as_bytes()).unwrap();
     engine.heartbeat(7);
     engine.say(r#"{"type":"report","report":{"early":true},"plan":null}"#);
     engine.say("not json");
@@ -384,7 +399,7 @@ fn an_answer_nobody_waits_for_is_let_go() {
     jobs.pump(&mut engine, &Registry::default(), NOW);
     jobs.abandon(late);
     assert!(jobs.resolved().is_empty());
-    let submit = jobs.submit(&mut engine, V1.as_bytes(), NOW).unwrap();
+    let submit = submit(&mut jobs, &mut engine, V1.as_bytes()).unwrap();
     jobs.abandon(submit);
     engine.attempt_started();
     jobs.pump(&mut engine, &Registry::default(), NOW);
@@ -847,7 +862,7 @@ fn what_follows_the_records_goes_a_batch_at_a_time_and_the_stream_goes_on() {
 #[test]
 fn a_line_skipped_before_the_run_id_is_counted_for_the_job() {
     let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
-    let ticket = jobs.submit(&mut engine, V1.as_bytes(), NOW).unwrap();
+    let ticket = submit(&mut jobs, &mut engine, V1.as_bytes()).unwrap();
     engine.say(&"x".repeat(ENGINE_LINE_LIMIT + 1));
     engine.say(&"y".repeat(ENGINE_LINE_LIMIT + 1));
     jobs.pump(&mut engine, &Registry::default(), NOW);
@@ -917,7 +932,7 @@ fn a_secret_appears_in_nothing_the_node_keeps_or_answers() {
         Some("[redacted]")
     );
     // The engine's refusal of a submit, and of a check.
-    let ticket = jobs.submit(&mut engine, job.as_bytes(), NOW).unwrap();
+    let ticket = submit(&mut jobs, &mut engine, job.as_bytes()).unwrap();
     engine.exit(2, Some(&format!("source.key: {SECRET} is not a key")));
     jobs.pump(&mut engine, &Registry::default(), NOW);
     let refused = String::from_utf8(resolved(&mut jobs, ticket).body.bytes()).unwrap();
@@ -942,10 +957,93 @@ fn a_secret_appears_in_nothing_the_node_keeps_or_answers() {
     );
     // The host's own refusal.
     engine.0.borrow_mut().refuse_start = Some(HostError::Refused(format!("no volume {SECRET}")));
-    let refused = jobs.submit(&mut engine, job.as_bytes(), NOW).unwrap_err();
+    let refused = submit(&mut jobs, &mut engine, job.as_bytes()).unwrap_err();
     assert!(
         !String::from_utf8(refused.body.bytes())
             .unwrap()
             .contains(SECRET)
+    );
+}
+
+/// A submit is the engine's check first (system design 3A): a refused document answers
+/// `invalid` with each refusal by its field and starts nothing; a sound one starts an engine
+/// with the check's budget and needs; the node is busy from the submit on; and a submit whose
+/// call has gone still becomes the job.
+#[test]
+fn a_submit_is_checked_and_started_with_the_checks_budget_and_needs() {
+    let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
+    engine.0.borrow_mut().verdicts.push_back(Ok(vec![Refusal {
+        field: "budget.memory_bytes".into(),
+        message: "more than a job on this node may have".into(),
+    }]));
+    let refused = submit(&mut jobs, &mut engine, V1.as_bytes()).unwrap_err();
+    assert_eq!(
+        (refused.status, body(&refused)["error"]["code"].as_str()),
+        (400, Some("invalid"))
+    );
+    assert!(
+        body(&refused)["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("budget.memory_bytes: more than a job on this node may have"),
+        "{}",
+        body(&refused)
+    );
+    assert!(engine.0.borrow().started.is_empty() && !jobs.busy());
+
+    let needs = crate::Needs {
+        hosts: vec!["s3.eu-west-1.amazonaws.com".into()],
+        volumes: vec![crate::Volume {
+            serial: "vol-out".into(),
+            write: true,
+            staging: false,
+        }],
+        functions: vec!["taxi.clean".into()],
+    };
+    engine.0.borrow_mut().needs = (Some(1 << 30), needs.clone());
+    // A function the job uses that is not registered refuses the submit too (3E).
+    let refused = submit(&mut jobs, &mut engine, V1.as_bytes()).unwrap_err();
+    assert!(
+        body(&refused)["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("functions: the function `taxi.clean` is not registered"),
+        "{}",
+        body(&refused)
+    );
+    assert!(engine.0.borrow().started.is_empty() && !jobs.busy());
+
+    let signer = crate::signer::Signer::new();
+    let mut registry = Registry::new(vec![crate::FunctionKey::new(signer.public())]);
+    let image = b"\x7fELF taxi.clean";
+    let address = "https://images.example.com/taxi.clean";
+    let registration = crate::signer::registration("taxi.clean", address, image, &signer);
+    assert_eq!(registry.register(registration.as_bytes(), NOW).status, 201);
+    engine.0.borrow_mut().hold_checks = true;
+    let ticket = jobs.submit(V1.as_bytes()).unwrap();
+    jobs.pump(&mut engine, &registry, NOW);
+    // Being checked, the job is starting: a second submit is busy.
+    assert!(jobs.busy());
+    let busy = jobs.submit(V1.as_bytes()).unwrap_err();
+    assert_eq!(busy.status, 503);
+    // The call goes; the job goes on.
+    jobs.abandon(ticket);
+    engine.0.borrow_mut().hold_checks = false;
+    jobs.pump(&mut engine, &registry, NOW);
+    let started = engine.0.borrow().started_with.clone();
+    assert_eq!(
+        started,
+        [Verdict {
+            refusals: Vec::new(),
+            memory_bytes: Some(1 << 30),
+            needs,
+        }]
+    );
+    engine.attempt_started();
+    jobs.pump(&mut engine, &Registry::default(), NOW);
+    assert!(jobs.resolved().is_empty(), "nobody waits for its id");
+    assert_eq!(
+        serde_json::to_value(jobs.list()).unwrap()["jobs"][0]["id"],
+        json!(RUN)
     );
 }

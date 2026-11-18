@@ -205,6 +205,7 @@ fn serve_bounded(scratch: &Scratch, spec: Value, budget_max: Option<u64>) -> Ser
     let node = Node {
         channel: "channel:engine".to_string(),
         budget_max,
+        volumes: None,
     };
     let outcome = session::serve_node(
         over_messages(engine.clone()),
@@ -307,6 +308,42 @@ fn a_job_on_a_channel_runs_in_node_mode_with_its_secrets() {
         .expect("the report file");
     assert!(!file.contains(SECRET));
     assert!(served.largest > 0 && served.largest <= CHANNEL_MESSAGE_BYTES);
+}
+
+/// A job of the standard `rows` source and `count` sink needs nothing of a node but its budget:
+/// it runs in node mode with no file, volume or object store, and its report counts the rows.
+#[test]
+fn a_rows_to_count_job_runs_in_node_mode_with_nothing_attached() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("node_rows_count");
+    let served = serve_bounded(
+        &scratch,
+        json!({"spec": {
+            "moruna_spec": 1,
+            "source": {"kind": "rows", "rows": 3_000_000},
+            "sink": {"kind": "count"},
+            "budget": {"memory_bytes": 1u64 << 30},
+            "report": {"file": scratch.path().join("report-<run_id>.json").to_string_lossy(),
+                       "logs": scratch.path().join("logs-<run_id>").to_string_lossy()},
+        }}),
+        Some(1 << 30),
+    );
+    assert_eq!(
+        served.outcome.code,
+        exit::COMPLETED,
+        "{:?}",
+        served.outcome.diagnostic
+    );
+    assert_eq!(exit_of(&served)["code"], 0);
+    let report = served
+        .messages
+        .iter()
+        .find(|m| m["type"] == "report")
+        .expect("a report");
+    let sinks = report["report"]["sinks"].as_array().expect("its sinks");
+    assert_eq!(sinks.len(), 1);
+    assert_eq!(sinks[0]["rows"], 3_000_000);
+    assert_eq!(sinks[0]["files"], json!([]));
 }
 
 /// What node mode refuses is the run's refusal, exit 2, by its field, before anything runs.
@@ -498,7 +535,9 @@ fn a_nodes_budget_is_the_most_a_job_may_have_and_its_default() {
         .iter()
         .find(|m| m["type"] == "report")
         .expect("a report");
-    assert_eq!(report["report"]["host"]["memory_limit_bytes"], json!(max));
+    // The engine ran within the arena's share of its whole budget, never the whole.
+    let arena = moruna_runtime::host::node::sizes(max, false).arena;
+    assert_eq!(report["report"]["host"]["memory_limit_bytes"], json!(arena));
 }
 
 /// The check a node runs for `validate`, over a channel (`moruna check-job --listen`): one
@@ -512,6 +551,7 @@ fn a_check_on_a_channel_answers_its_refusals_and_the_budget() {
     let node = Node {
         channel: "channel:engine".to_string(),
         budget_max: Some(max),
+        volumes: None,
     };
     let check = |line: String| {
         let (engine, api) = Framed::pair();
@@ -551,7 +591,7 @@ fn a_check_on_a_channel_answers_its_refusals_and_the_budget() {
     assert_eq!(
         answer,
         json!({"type": "checked", "ok": true, "refusals": [], "memory_bytes": max,
-               "hosts": ["s3.example.com"], "volumes": [], "functions": ["std"]})
+               "hosts": ["s3.example.com"], "volumes": [], "functions": []})
     );
     // A document's volumes and hosts, as the check answers them for node-admission to keep.
     let mut disks = document(scratch.path());

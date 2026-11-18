@@ -129,7 +129,7 @@ FUNCTION = {'name': 'gate-score', 'address': 'https://x/gate-score', 'sha256': '
             'key': '0123456789abcdef', 'registered': 1}
 ANSWERS = {
     'node': {'version': '0.7.0', 'instance': 'i', 'cloud': 'none', 'cores': 1,
-             'memory_bytes': 1, 'executors': [], 'boot_ms': 1, 'time': 1, 'health': 'ok'},
+             'memory_bytes': 1, 'job_memory_bytes': 1, 'executors': [], 'boot_ms': 1, 'time': 1, 'health': 'ok'},
     'jobs_validate': {'ok': True}, 'jobs_submit': {'id': 'run-1'}, 'jobs_list': {'jobs': [JOB]},
     'jobs_get': JOB, 'jobs_cancel': JOB, 'jobs_report': {'rows_out': 1},
     'functions_register': FUNCTION, 'functions_list': {'functions': [FUNCTION]}}
@@ -358,7 +358,7 @@ fn an_optional_field_and_a_query_are_generated_and_read() {
     let check = "import sys, runpy\n\
         m = runpy.run_path(sys.argv[1])\n\
         d = {'version': '0.7.0', 'instance': 'i', 'cloud': 'none', 'cores': 1,\n\
-             'memory_bytes': 1, 'executors': [], 'boot_ms': 1, 'time': 1, 'health': 'ok'}\n\
+             'memory_bytes': 1, 'job_memory_bytes': 1, 'executors': [], 'boot_ms': 1, 'time': 1, 'health': 'ok'}\n\
         n = m['Node'].from_json(d)\n\
         assert n.region is None and n.ready is None and n.to_json() == d, n\n\
         assert m['Node'].from_json({**d, 'region': None}).to_json() == d\n\
@@ -420,7 +420,7 @@ fn names_and_descriptions_are_made_safe_for_python() {
     let check = "import sys, runpy\n\
         m = runpy.run_path(sys.argv[1])\n\
         d = {'version': '0.7.0', 'instance': 'i', 'cloud': 'none', 'cores': 1,\n\
-             'memory_bytes': 1, 'executors': [], 'boot_ms': 1, 'time': 1, 'health': 'ok',\n\
+             'memory_bytes': 1, 'job_memory_bytes': 1, 'executors': [], 'boot_ms': 1, 'time': 1, 'health': 'ok',\n\
              'factors': ['2fa']}\n\
         n = m['Node'].from_json(d)\n\
         assert n.factors == [m['Factor']._2FA] and n.to_json() == d, n\n\

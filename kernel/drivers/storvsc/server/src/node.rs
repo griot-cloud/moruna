@@ -13,7 +13,6 @@ use core::{
     sync::atomic::AtomicU8,
 };
 
-use devices_protocol::Block;
 use moruna_storvsc::{ChannelError, Storvsc, Wait};
 use moruna_storvsc_server::{
     Controller, Driver, Node, OUTGOING_PAGES, RING_PAGES, factory, plan,
@@ -257,6 +256,25 @@ impl Watch for Woken {
     }
 }
 
+/// The GUID of the image's own disk, from the boot payload's `disk.guid`, which the supervisor
+/// grants under `disk.guid` (a binding of its own, since a slot is granted to one service).
+fn image_guid(console: &Console) -> Option<moruna_disk::Guid> {
+    let handle = start::take("disk.guid")?;
+    let mut page = [0u8; PAGE as usize];
+    let read = Memory(handle)
+        .map(0, PAGE, map::READ)
+        .and_then(|m| m.read(0, &mut page));
+    if let Err(e) = read {
+        println!(console, "storvsc: reading disk.guid: {}", e.name());
+        return None;
+    }
+    let guid = moruna_disk::Guid::from_file(&page);
+    if guid.is_none() {
+        println!(console, "storvsc: disk.guid holds no GUID");
+    }
+    guid
+}
+
 fn take(name: &str) -> Result<Handle, String> {
     start::take(name).ok_or_else(|| format!("no start handle {name}"))
 }
@@ -311,8 +329,7 @@ fn serve(console: &Console, started: u64) -> Result<(), String> {
     let mut directory = devices_protocol::open_directory(devices, deadline)
         .map_err(|e| failed("the device manager", e))?;
     let scratch = Page::new(&dma, deadline)?;
-    let (_vmbus, found) = controllers(&vmbus_listener, &scratch)?;
-    drop(scratch);
+    let (_vmbus, mut found) = controllers(&vmbus_listener, &scratch)?;
     let scans: Vec<Controller<'_>> = found
         .iter()
         .map(|(instance, _, scan)| Controller {
@@ -321,9 +338,29 @@ fn serve(console: &Console, started: u64) -> Result<(), String> {
         })
         .collect();
     let plan = plan(&scans);
+    drop(scans);
     for line in &plan.lines {
         println!(console, "{}", line);
     }
+    let mut served = plan.served;
+    // The boot disk's `moruna-system` partition, served as `system` when the disk is the one
+    // this image wrote (item 3.3).
+    if let Some(boot) = served.iter().find(|s| s.name.boot).cloned() {
+        let image = image_guid(console);
+        let device = &mut found[boot.controller].1;
+        match scan::boot_table(device, &scratch, &boot.disk) {
+            Ok(table) => {
+                let (window, line) =
+                    moruna_storvsc_server::boot_system(table.as_ref(), image.as_ref());
+                println!(console, "{}", line);
+                if let Some(window) = window {
+                    served.push(moruna_storvsc_server::system(&boot, window));
+                }
+            }
+            Err(e) => println!(console, "storvsc: the boot disk's partition table: {}", e),
+        }
+    }
+    drop(scratch);
     let mut wakes = Vec::new();
     let mut devices_found = Vec::new();
     for (_, device, _) in found {
@@ -338,7 +375,7 @@ fn serve(console: &Console, started: u64) -> Result<(), String> {
         console: Console(said),
         dma,
     };
-    let driver: Shared = Rc::new(RefCell::new(Driver::new(os, devices_found, plan.served)));
+    let driver: Shared = Rc::new(RefCell::new(Driver::new(os, devices_found, served)));
     let mut dispatcher = Dispatcher::new();
     let gone = Rc::new(Cell::new(false));
     for wake in wakes {
@@ -357,15 +394,8 @@ fn serve(console: &Console, started: u64) -> Result<(), String> {
         dispatcher
             .listen(ours, factory(driver.clone(), index))
             .map_err(|e| format!("a disk's listener: {}", e.name()))?;
-        let block = Block {
-            serial: disk.name.serial.clone(),
-            sector_size: disk.disk.block_size(),
-            sectors: disk.disk.blocks(),
-            read_only: disk.name.read_only,
-            boot: disk.name.boot,
-        };
         directory.core().set_timeout(left(deadline));
-        if let Err(e) = directory.register(block, theirs) {
+        if let Err(e) = directory.register(moruna_storvsc_server::block(&disk), theirs) {
             println!(
                 console,
                 "storvsc: {}: the device manager did not register it: {:?}", disk.name.serial, e

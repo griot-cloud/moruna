@@ -26,7 +26,9 @@ use alloc::{
 use core::cell::RefCell;
 
 use moruna_api_server::{Transport, TransportError};
-use moruna_svc::{CallError, Encoder, Memory, Rights, Signals, Wire, frame::Frame, map, wait_one};
+use moruna_svc::{
+    CallError, Channel, Encoder, Memory, Rights, Signals, WaitItem, Wire, frame::Frame, map, wait,
+};
 use netstack_protocol::{Endpoint, Opened, net};
 
 use crate::{ADDRESS_POLL_NS, BACKLOG, Error, Event, LEASE_POLL_NS, PORT, address, asked};
@@ -379,11 +381,20 @@ impl Network {
         )
     }
 
-    /// Waits until an answer comes, or the network server goes, or `deadline`, on the
-    /// core's monotonic clock, passes.
-    pub fn wait(&mut self, deadline: u64) -> Result<(), Error> {
+    /// Waits until an answer comes, or the network server goes, or one of `also` raises a
+    /// signal waited for on it (an engine's channel, item 3.2), or `deadline`, on the core's
+    /// monotonic clock, passes.
+    pub fn wait(&mut self, deadline: u64, also: &[(Rc<Channel>, Signals)]) -> Result<(), Error> {
         let channel = &self.client.core().channel().0;
-        match wait_one(channel, Signals::READABLE | Signals::PEER_CLOSED, deadline) {
+        let mut items = Vec::with_capacity(1 + also.len());
+        items.push(WaitItem::new(
+            channel,
+            Signals::READABLE | Signals::PEER_CLOSED,
+        ));
+        for (other, signals) in also {
+            items.push(WaitItem::new(&other.0, *signals));
+        }
+        match wait(&mut items, deadline) {
             Ok(_) | Err(moruna_svc::Error::TimedOut) => Ok(()),
             Err(e) => Err(Error::Kernel("waiting for the network server", e)),
         }

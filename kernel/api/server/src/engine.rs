@@ -24,16 +24,130 @@ pub enum HostError {
     Unavailable,
 }
 
-/// The engine's check of a document: its refusals, none when the document is sound, and what the
-/// job needs of the node that `api` judges itself. The check answers these in its `checked` line
-/// (`moruna-hosted-engine.md`, `check-job`); the node's host passes them on.
+/// A volume a job names, by its serial, and whether the job writes it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Checked {
-    /// The engine's refusals.
-    pub refusals: Vec<Refusal>,
-    /// The functions the job uses, by the names they are registered under (system design 3E):
-    /// its `needs.functions`. Each that is not registered is refused at `validate`.
+pub struct Volume {
+    /// The serial the cloud gives the disk (`disk://<serial>/...`).
+    pub serial: String,
+    /// Whether the job writes it: a sink's.
+    pub write: bool,
+    /// Whether the job stages on it (`staging.dir` names it, item 3.3): the node then sizes the
+    /// job's memory with no scratch for its staging.
+    pub staging: bool,
+}
+
+/// What a job needs of the node beyond its budget, as the engine's check answers it: what
+/// `node-admission` keeps with the job for its grants (items 3.3, 3.4 and 3.6).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Needs {
+    /// The hosts it reaches.
+    pub hosts: Vec<String>,
+    /// The volumes it names.
+    pub volumes: Vec<Volume>,
+    /// The registered functions it uses.
     pub functions: Vec<String>,
+}
+
+/// The engine's check of a document: its refusals, none when it would run, and what the job
+/// would take of the node.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Verdict {
+    /// Every refusal, by field.
+    pub refusals: Vec<Refusal>,
+    /// The budget the job runs with, in bytes: the document's, or the node's most when it
+    /// names none.
+    pub memory_bytes: Option<u64>,
+    /// What else it needs of the node.
+    pub needs: Needs,
+}
+
+/// The host protocol's `check` message (`moruna-hosted-engine.md`, `check-job --listen`) for
+/// `document`, as [`EngineHost::check`] is given it, with the names of the job's secrets: one
+/// line, its line break included. A version 1 document is its JSON; a version 2 document's
+/// bytes go as their standard base64, as `spec` carries them.
+pub fn check_line(document: &[u8], secrets: &[String]) -> Vec<u8> {
+    let mut line = Vec::with_capacity(document.len() * 4 / 3 + 64);
+    line.extend_from_slice(b"{\"type\":\"check\",\"spec\":");
+    if document.first() == Some(&b'{') {
+        line.extend_from_slice(document);
+    } else {
+        line.push(b'"');
+        line.extend_from_slice(crate::token::to_base64(document).as_bytes());
+        line.push(b'"');
+    }
+    line.extend_from_slice(b",\"secrets\":");
+    line.extend_from_slice(
+        serde_json::to_string(secrets)
+            .unwrap_or_else(|_| String::from("[]"))
+            .as_bytes(),
+    );
+    line.extend_from_slice(b"}\n");
+    line
+}
+
+/// The `checked` line, as the engine's check answers it.
+#[derive(serde::Deserialize)]
+struct CheckedLine {
+    #[serde(rename = "type")]
+    kind: String,
+    ok: bool,
+    #[serde(default)]
+    refusals: Vec<Refusal>,
+    #[serde(default)]
+    memory_bytes: Option<u64>,
+    #[serde(default)]
+    hosts: Vec<String>,
+    #[serde(default)]
+    volumes: Vec<VolumeLine>,
+    #[serde(default)]
+    functions: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct VolumeLine {
+    serial: String,
+    write: bool,
+    #[serde(default)]
+    staging: bool,
+}
+
+/// The verdict the engine's check answers in its `checked` line (its line break taken off or
+/// not): its refusals, the job's budget and its needs. A line that is not a `checked` message,
+/// or that refuses the document without saying why, is the check's failure.
+pub fn verdict(line: &[u8]) -> Result<Verdict, HostError> {
+    let checked: CheckedLine = serde_json::from_slice(line.trim_ascii()).map_err(|_| {
+        HostError::Failed(String::from(
+            "the engine's check answered a line that is not its `checked` message",
+        ))
+    })?;
+    if checked.kind != "checked" {
+        return Err(HostError::Failed(alloc::format!(
+            "the engine's check answered `{}`, not `checked`",
+            checked.kind
+        )));
+    }
+    if !checked.ok && checked.refusals.is_empty() {
+        return Err(HostError::Failed(String::from(
+            "the engine's check refused the document without saying why",
+        )));
+    }
+    Ok(Verdict {
+        refusals: checked.refusals,
+        memory_bytes: checked.memory_bytes,
+        needs: Needs {
+            hosts: checked.hosts,
+            volumes: checked
+                .volumes
+                .into_iter()
+                .map(|v| Volume {
+                    serial: v.serial,
+                    write: v.write,
+                    staging: v.staging,
+                })
+                .collect(),
+            functions: checked.functions,
+        },
+    })
 }
 
 /// What the server asks of the node to run jobs: the engine's check of a document, a fresh
@@ -50,13 +164,14 @@ pub trait EngineHost {
     fn check(&mut self, document: &[u8], secrets: &[String]) -> Result<(), HostError>;
 
     /// The verdict of the check under way, once it has one: the engine's refusals, none when
-    /// the document is sound, and the functions the job uses.
-    fn checked(&mut self) -> Option<Result<Checked, HostError>>;
+    /// the document is sound, and the budget and needs of the job it would be.
+    fn checked(&mut self) -> Option<Result<Verdict, HostError>>;
 
     /// Starts a fresh engine for one job and sends it `spec`, the host protocol's `spec`
     /// message: one line, its line break included, with the job's secrets in its `secrets`
-    /// member.
-    fn start(&mut self, spec: &[u8]) -> Result<(), HostError>;
+    /// member. `verdict` is the engine's check of the same document, sound: the job's budget
+    /// and needs, which the node starts the engine with.
+    fn start(&mut self, spec: &[u8], verdict: &Verdict) -> Result<(), HostError>;
 
     /// Sends the engine one line of the host protocol, its line break included: `cancel`.
     fn send(&mut self, line: &[u8]) -> Result<(), HostError>;
@@ -75,11 +190,11 @@ impl EngineHost for NoEngine {
         Err(HostError::Unavailable)
     }
 
-    fn checked(&mut self) -> Option<Result<Checked, HostError>> {
+    fn checked(&mut self) -> Option<Result<Verdict, HostError>> {
         None
     }
 
-    fn start(&mut self, _spec: &[u8]) -> Result<(), HostError> {
+    fn start(&mut self, _spec: &[u8], _verdict: &Verdict) -> Result<(), HostError> {
         Err(HostError::Unavailable)
     }
 

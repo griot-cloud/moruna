@@ -789,6 +789,10 @@ fn calc_suite() -> conformance::Suite {
         }
     }
     fn version(p: &mut conformance::Probe) -> Result<(), conformance::Fail> {
+        // Version arrived in 1.1: a case asks it of a server that announced 1.1.
+        if p.server_minor() != calc::ID.minor {
+            return Err(format!("the probe says minor {}", p.server_minor()));
+        }
         p.request(5, Encoder::new())?.reply().map(drop)
     }
     const CASES: &[conformance::Case] = &[

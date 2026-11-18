@@ -22,11 +22,13 @@ use serde::de::DeserializeOwned;
 
 pub mod arrow_ipc;
 pub mod conformance;
+pub mod count;
 pub mod gives;
 pub mod image;
 pub mod package;
 pub mod parquet;
 pub mod ports;
+pub mod rows;
 pub mod served;
 pub mod standard;
 pub mod tensor;
@@ -437,6 +439,7 @@ impl Registry {
         kinds.put_source(Arc::new(parquet::Parquet));
         kinds.put_source(Arc::new(tensor::Tensor));
         kinds.put_source(Arc::new(image::Image));
+        kinds.put_source(Arc::new(rows::Rows));
         kinds.put_kernel(Arc::new(standard::Std));
         kinds.put_kernel(Arc::new(package::Package));
         kinds.put_kernel(Arc::new(image::Image));
@@ -444,6 +447,7 @@ impl Registry {
         kinds.put_sink(Arc::new(tensor::Tensor));
         kinds.put_sink(Arc::new(arrow_ipc::ArrowIpc));
         kinds.put_sink(Arc::new(image::Image));
+        kinds.put_sink(Arc::new(count::Count));
         kinds
     }
 
