@@ -50,6 +50,8 @@
 extern crate alloc;
 
 mod device;
+#[cfg(feature = "trace-first-frames")]
+pub mod latency;
 mod nvsp;
 mod rndis;
 #[cfg(feature = "trace-first-frames")]

@@ -160,6 +160,13 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
             .unwrap_or_default()
     }
 
+    /// The trace, for the process to note when it waits for the host and when the host's
+    /// signal wakes it: a diagnosis build's only (work item 1.11d).
+    #[cfg(feature = "trace-first-frames")]
+    pub fn trace(&mut self) -> Option<&mut crate::trace::Trace> {
+        self.wire.trace.as_mut()
+    }
+
     /// The start's steps on a wire made over the channel, its buffers checked.
     fn begin(
         mut wire: Wire<C>,
@@ -328,6 +335,7 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         #[cfg(feature = "trace-first-frames")]
         if sent && let Some(trace) = self.wire.trace.as_mut() {
             trace.sent(nvsp::transaction(section), section, frame);
+            trace.timed(nvsp::transaction(section), frame.len());
         }
         Ok(sent)
     }

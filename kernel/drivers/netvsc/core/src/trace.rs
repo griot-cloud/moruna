@@ -38,6 +38,9 @@ pub struct Trace {
     uncommitted: Vec<u32>,
     /// The lines not yet taken.
     lines: Vec<String>,
+    /// The first frames out, each timed from its commit to its completion's read (work item
+    /// 1.11d).
+    latency: crate::latency::Latency,
 }
 
 impl Trace {
@@ -51,12 +54,35 @@ impl Trace {
             flying: Vec::new(),
             uncommitted: Vec::new(),
             lines: Vec::new(),
+            latency: crate::latency::Latency::default(),
         }
     }
 
-    /// The lines noted since the last take, oldest first.
+    /// The lines noted since the last take, oldest first; and once every timed frame out
+    /// is complete, their timings (`latency`), said together.
     pub fn take(&mut self) -> Vec<String> {
+        for line in self.latency.finished().unwrap_or_default() {
+            self.say(line);
+        }
         core::mem::take(&mut self.lines)
+    }
+
+    /// netvsc begins to wait for the host's signal (work item 1.11d).
+    pub fn waiting(&mut self) {
+        let at = (self.clock)();
+        self.latency.waiting(at);
+    }
+
+    /// The host's signal woke netvsc (work item 1.11d).
+    pub fn woken(&mut self) {
+        let at = (self.clock)();
+        self.latency.woken(at);
+    }
+
+    /// A frame of `bytes` written to the ring to the host under `transaction`, which the
+    /// timings follow whether or not the trace says it (work item 1.11d).
+    pub(crate) fn timed(&mut self, transaction: u64, bytes: usize) {
+        self.latency.sent(transaction, bytes);
     }
 
     fn say(&mut self, what: String) {
@@ -88,6 +114,8 @@ impl Trace {
     /// The ring to the host committed: the host now sees what was written to it. The host
     /// was signalled, or by VMBus's rule did not need to be.
     pub(crate) fn committed(&mut self, signalled: bool) {
+        let at = (self.clock)();
+        self.latency.committed(at, signalled);
         if self.uncommitted.is_empty() {
             return;
         }
@@ -102,6 +130,8 @@ impl Trace {
 
     /// The host's completion of the frame sent under `transaction`, with its NVSP status.
     pub(crate) fn completed(&mut self, transaction: u64, status: u32) {
+        let read = (self.clock)();
+        self.latency.completed(read, transaction);
         let Some(at) = self.flying.iter().position(|(t, _)| *t == transaction) else {
             return;
         };

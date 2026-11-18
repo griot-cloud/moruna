@@ -191,6 +191,12 @@ fn serve(console: &Console) -> Result<(), String> {
         next: 0,
     };
     let vmbus = Rc::new(RefCell::new(Vmbus::new(node, sint.vp_index)));
+    // A diagnosis build times the host's signals of the network card's channel, on the
+    // node's clock (work item 1.11d).
+    #[cfg(feature = "trace-first-frames")]
+    vmbus
+        .borrow_mut()
+        .trace_interrupts(moruna_vmbus_server::trace::Interrupts::new(Box::new(now)));
     let mut dispatcher = Dispatcher::new();
     dispatcher
         .watch(Box::new(Sint {

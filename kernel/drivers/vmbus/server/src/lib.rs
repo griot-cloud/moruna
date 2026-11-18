@@ -26,6 +26,9 @@
 
 extern crate alloc;
 
+#[cfg(feature = "trace-first-frames")]
+pub mod trace;
+
 use alloc::{
     boxed::Box,
     collections::{BTreeMap, VecDeque},
@@ -149,6 +152,10 @@ pub struct Vmbus<H: Host> {
     done: VecDeque<(Pending, Outcome)>,
     fatal: Option<Fatal>,
     refused: u64,
+    /// When the host's signals of the network cards' channels reached the process, in a
+    /// diagnosis build that asks (work item 1.11d).
+    #[cfg(feature = "trace-first-frames")]
+    trace: Option<trace::Interrupts>,
 }
 
 fn failure(error: Error) -> Outcome {
@@ -182,7 +189,16 @@ impl<H: Host> Vmbus<H> {
             done: VecDeque::new(),
             fatal: None,
             refused: 0,
+            #[cfg(feature = "trace-first-frames")]
+            trace: None,
         }
+    }
+
+    /// Times the host's signals of the network cards' channels opened from now on, with
+    /// `trace`, and says them on the console (work item 1.11d).
+    #[cfg(feature = "trace-first-frames")]
+    pub fn trace_interrupts(&mut self, trace: trace::Interrupts) {
+        self.trace = Some(trace);
     }
 
     /// The node the process runs on.
@@ -206,9 +222,17 @@ impl<H: Host> Vmbus<H> {
     /// the host's messages are taken.
     pub fn interrupted(&mut self) {
         for channel in self.client.take_signals(&mut self.host) {
+            #[cfg(feature = "trace-first-frames")]
+            if let Some(trace) = self.trace.as_mut() {
+                trace.signalled(channel);
+            }
             if let Some(end) = self.channels.get(&channel).and_then(|e| e.wake.as_ref()) {
                 wake(end);
             }
+        }
+        #[cfg(feature = "trace-first-frames")]
+        if let Some(line) = self.trace.as_mut().and_then(trace::Interrupts::take) {
+            self.host.say(format_args!("{line}"));
         }
         self.pump();
     }
@@ -519,6 +543,12 @@ impl<H: Host> Vmbus<H> {
         if let Err(error) = self.client.open(&mut self.host, id, ring) {
             self.host.release(memory);
             return failure(refusal(error));
+        }
+        #[cfg(feature = "trace-first-frames")]
+        if class == Class::Net
+            && let Some(trace) = self.trace.as_mut()
+        {
+            trace.follow(id);
         }
         self.channels.insert(
             id,

@@ -9,10 +9,14 @@
 //! - `fuzz`: ten thousand random host packets, from a fixed seed.
 //! - `trace`: with the feature `trace-first-frames` only, the first frames each way and the
 //!   host's indications, said with their times (work item 1.11c).
+//! - `latency`: with the same feature, the first frames out timed from their commits to their
+//!   completions' reads (work item 1.11d).
 
 mod fake;
 mod fuzz;
 mod initialise;
+#[cfg(feature = "trace-first-frames")]
+mod latency;
 mod refusal;
 #[cfg(feature = "trace-first-frames")]
 mod trace;

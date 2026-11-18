@@ -898,3 +898,102 @@ fn pinned_addresses_are_page_numbers() {
     assert_eq!(page_numbers(&[]), Some(vec![]));
     assert_eq!(page_numbers(&[0x1000, 0x1008]), None);
 }
+
+/// Work item 1.11d, with the feature `trace-first-frames` only: when the host's signals of a
+/// network card's channel reached the process, on the node's clock, said sixteen to a line.
+#[cfg(feature = "trace-first-frames")]
+mod trace {
+    use std::cell::Cell;
+
+    use moruna_vmbus_server::trace::{Interrupts, PER_LINE, TIMED};
+
+    use super::*;
+
+    /// The trace's lines on the node's console.
+    fn said(v: &Vmbus<Node>) -> Vec<String> {
+        v.host()
+            .console
+            .iter()
+            .filter(|line| line.starts_with("vmbus: trace: "))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn the_signals_of_a_network_cards_channel_are_timed_and_said_sixteen_to_a_line() {
+        let vmbus = connected();
+        let clock = Rc::new(Cell::new(0));
+        let time = clock.clone();
+        vmbus
+            .borrow_mut()
+            .trace_interrupts(Interrupts::new(Box::new(move || time.get())));
+        let mut d = Dispatcher::new();
+        let disks = driver(&vmbus, &mut d);
+        let nics = driver_of(&vmbus, &mut d, Class::Net);
+        let ends = serve(
+            &vmbus,
+            &mut d,
+            thread::spawn(move || {
+                let mut c = client(disks);
+                let mut n = client(nics);
+                c.open(2, 8, 4).unwrap();
+                n.open(1, 4, 2).unwrap();
+                [c.into_core().into_channel(), n.into_core().into_channel()]
+            }),
+            |_| {},
+        );
+        let mut v = vmbus.borrow_mut();
+        // The disk's channel is not timed; the card's is, each time it is signalled.
+        for n in 1..=PER_LINE as u64 {
+            clock.set(n * 1_000_000 + 250_000);
+            v.host_mut().hv.signal_guest(ChannelId(2));
+            v.host_mut().hv.signal_guest(ChannelId(1));
+            v.interrupted();
+            assert_eq!(said(&v).is_empty(), n < PER_LINE as u64, "signal {n}");
+        }
+        let times: Vec<String> = (1..=PER_LINE).map(|n| format!("{n}.250")).collect();
+        assert_eq!(
+            said(&v),
+            [format!(
+                "vmbus: trace: a network card's channel signalled, its signals 1 to 16 of 256, at (ms on the node's clock): {}",
+                times.join(" ")
+            )]
+        );
+        // The rest, to the last timed: then no more.
+        for _ in PER_LINE..TIMED + PER_LINE {
+            v.host_mut().hv.signal_guest(ChannelId(1));
+            v.interrupted();
+        }
+        let lines = said(&v);
+        assert_eq!(lines.len(), TIMED / PER_LINE);
+        assert!(lines[lines.len() - 1].contains("its signals 241 to 256 of 256, at"));
+        assert_eq!(v.fatal(), None);
+        drop(v);
+        drop(ends);
+    }
+
+    #[test]
+    fn a_process_that_is_not_traced_says_nothing_of_its_signals() {
+        let vmbus = connected();
+        let mut d = Dispatcher::new();
+        let nics = driver_of(&vmbus, &mut d, Class::Net);
+        let end = serve(
+            &vmbus,
+            &mut d,
+            thread::spawn(move || {
+                let mut n = client(nics);
+                n.open(1, 4, 2).unwrap();
+                n.into_core().into_channel()
+            }),
+            |_| {},
+        );
+        let mut v = vmbus.borrow_mut();
+        for _ in 0..PER_LINE {
+            v.host_mut().hv.signal_guest(ChannelId(1));
+            v.interrupted();
+        }
+        assert!(said(&v).is_empty());
+        drop(v);
+        drop(end);
+    }
+}
