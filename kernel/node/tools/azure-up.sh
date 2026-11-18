@@ -3,7 +3,7 @@
 # 1E and 1F): the steps of kernel/node/AZURE.md, in order, each the same command.
 #
 #   kernel/node/tools/azure-up.sh --vhd OUT/moruna-node.vhd --run RUN --from ADDRESS
-#       [--group moruna-node-NAME] [--subscription griot-dev] [--dry-run]
+#       [--group moruna-node-NAME] [--subscription griot-dev] [--data-disk] [--job] [--dry-run]
 #
 # - --vhd: package.py's fixed-size VHD (system design 1A).
 # - --run: a new directory for the run's files (the token key pair, node config, the IDs, the
@@ -13,6 +13,13 @@
 #   nothing else.
 # - --group: the resource group, `moruna-node-<yyyymmddHHMM>` when not given. Everything is made
 #   in it, and it is deleted when the script ends, however it ends.
+# - --data-disk: attaches an empty 4 GiB StandardSSD disk at LUN 0 when the machine is made, so
+#   the node serves it as `lun-0` (a check image's storvsc-check reads, writes and tests it), and
+#   prints the console's storvsc lines at the end.
+# - --job: once the node is ready, runs a job through the API (3.2's kinds): a `rows` source of
+#   10,000,000 rows into a `count` sink, with a token for `submit`. It validates the job, submits
+#   it, follows its events over SSE to its `exit`, and checks the exit code 0 and the report's
+#   `sinks[0].rows` 10,000,000, and prints the job's wall time from the report.
 # - --dry-run: prints every command, one to a line, and runs none of them.
 #
 # A guard refuses, before anything runs, any subscription but griot-dev and any group not named
@@ -21,8 +28,9 @@
 #
 # It exits 0 when every check of 1E passes on Azure: the node answers on 443 within 10 minutes,
 # its console shows `moruna: ready` and `moruna: cloud azure`, 443 accepts and 22 does not, the
-# served certificate is the one the console printed, and GET /v1/node answers. It prints
-# create-to-ready and boot_ms. Any failure exits 1, after the console log is read into RUN and the
+# served certificate is the one the console printed, and GET /v1/node answers; with --job, the job
+# ends with exit 0 and counts its 10,000,000 rows. It prints create-to-ready and boot_ms, and with
+# --job the job's wall_s. Any failure exits 1, after the console log is read into RUN and the
 # group deleted; a refusal exits 2.
 set -euo pipefail
 
@@ -33,6 +41,8 @@ vhd=""
 run=""
 from=""
 dry=0
+data_disk=0
+job=0
 openssl="${MORUNA_OPENSSL:-}"
 if [ -z "$openssl" ]; then
   # macOS's own openssl is LibreSSL, which has no Ed25519 (kernel/node/OPENSTACK.md, step 1).
@@ -45,7 +55,7 @@ refuse() {
 }
 
 usage() {
-  echo "usage: azure-up.sh --vhd VHD --run RUN --from ADDRESS [--group moruna-node-NAME] [--subscription griot-dev] [--dry-run]" >&2
+  echo "usage: azure-up.sh --vhd VHD --run RUN --from ADDRESS [--group moruna-node-NAME] [--subscription griot-dev] [--data-disk] [--job] [--dry-run]" >&2
   exit 2
 }
 
@@ -56,6 +66,8 @@ while [ "$#" -gt 0 ]; do
     --from) [ "$#" -ge 2 ] || usage; from="$2"; shift 2 ;;
     --group) [ "$#" -ge 2 ] || usage; group="$2"; shift 2 ;;
     --subscription) [ "$#" -ge 2 ] || usage; subscription="$2"; shift 2 ;;
+    --data-disk) data_disk=1; shift ;;
+    --job) job=1; shift ;;
     --dry-run) dry=1; shift ;;
     *) usage ;;
   esac
@@ -160,15 +172,22 @@ finish() {
   say "deleting group $G"
   if [ "$dry" -eq 1 ] || [ -d "$run" ]; then
     step "az vm boot-diagnostics get-boot-log -n moruna-node -g $G $S > $R/console.log"
+    if [ "$data_disk" -eq 1 ]; then
+      step "tr -d '\\r' < $R/console.log | grep -a -e 'storvsc: ' -e 'storvsc-check: '"
+    fi
   fi
   step "az group delete -n $G --yes $S"
   step "az group exists -n $G $S"
   step "az group list $S --query \"[?starts_with(name, 'moruna-node-')].name\" -o tsv"
   step "az network watcher list $S -o table"
   if [ "$dry" -eq 0 ] && [ "$status" -eq 0 ]; then
-    printf 'create-to-ready %s s, boot_ms %s\n' \
+    printf 'create-to-ready %s s, boot_ms %s' \
       "$(( $(cat "$run/ready.at") - $(cat "$run/created.at") ))" \
       "$(tr -d '\r' < "$run/console.log" | grep -a -o 'moruna: ready .*boot_ms=[0-9]*' | head -1 | sed 's/.*boot_ms=//')"
+    if [ -s "$run/job.wall" ]; then
+      printf ', job wall_s %s' "$(cat "$run/job.wall")"
+    fi
+    printf '\n'
   fi
   exit "$status"
 }
@@ -188,6 +207,13 @@ step "az storage account show -n $A -g $G --query id -o tsv $S > $R/account.id"
 # 4. A Generation 2 managed disk from it, in zone 3.
 say "disk"
 step "az disk create -n moruna-node-os -g $G -l $location --zone 3 --source \"\$(cat $R/vhd.url)\" --source-storage-account-id \"\$(cat $R/account.id)\" --hyper-v-generation V2 --os-type Linux --sku Standard_LRS $S -o none"
+# With --data-disk, an empty data disk in the same zone, which the machine takes at LUN 0.
+data=""
+if [ "$data_disk" -eq 1 ]; then
+  say "data disk"
+  step "az disk create -n moruna-node-data -g $G -l $location --zone 3 --size-gb 4 --sku StandardSSD_LRS $S -o none"
+  data=" --attach-data-disks moruna-node-data"
+fi
 
 # 5. The address, and the network security group: TCP 443 from the operator only.
 say "address and network security group"
@@ -199,7 +225,7 @@ step "az network nsg rule list --nsg-name moruna-node-nsg -g $G --include-defaul
 
 # 6. The machine. The clock starts when Azure has taken the request.
 say "machine"
-step "az vm create -n moruna-node -g $G -l $location --zone 3 --size Standard_D2s_v4 --attach-os-disk moruna-node-os --os-type linux --security-type Standard --accelerated-networking false --public-ip-address moruna-node-ip --nsg moruna-node-nsg --boot-diagnostics-storage $A --user-data $R/node-config.json --no-wait $S -o none && date -u +%s > $R/created.at"
+step "az vm create -n moruna-node -g $G -l $location --zone 3 --size Standard_D2s_v4 --attach-os-disk moruna-node-os --os-type linux --security-type Standard --accelerated-networking false --public-ip-address moruna-node-ip --nsg moruna-node-nsg --boot-diagnostics-storage $A --user-data $R/node-config.json$data --no-wait $S -o none && date -u +%s > $R/created.at"
 
 # 7. Ready: the node answers GET /v1/health on 443, which needs no token; at most 10 minutes.
 say "waiting for the node to answer on 443"
@@ -225,3 +251,21 @@ step "printf '%s.%s' \"\$(cat $R/token.header)\" \"\$(cat $R/token.claims)\" > $
 step "$O pkeyutl -sign -inkey $R/token-key.pem -rawin -in $R/token.signed | $B64URL > $R/token.signature"
 step "printf '%s.%s\\n' \"\$(cat $R/token.signed)\" \"\$(cat $R/token.signature)\" > $R/token"
 step "curl -sS -k --max-time 10 -H \"Authorization: Bearer \$(cat $R/token)\" \"https://\$(cat $R/address)/v1/node\" > $R/node.json && grep -q '\"cloud\":\"azure\"' $R/node.json && cat $R/node.json"
+
+# 9, with --job: a job through the API (3.2), 10,000,000 rows into a count, with a token for
+# submit: validated, submitted, followed over SSE to its exit, and its report checked.
+if [ "$job" -eq 1 ]; then
+  say "job"
+  step "printf '%s' '{\"v1\":{\"moruna_spec\":1,\"source\":{\"kind\":\"rows\",\"rows\":10000000},\"sink\":{\"kind\":\"count\"}}}' > $R/job.json"
+  step "printf '{\"aud\":\"%s\",\"exp\":%s,\"scope\":[\"submit\"]}' \"\$(cat $R/instance)\" \"\$(( \$(date -u +%s) + 1800 ))\" | $B64URL > $R/job-token.claims"
+  step "printf '%s.%s' \"\$(cat $R/token.header)\" \"\$(cat $R/job-token.claims)\" > $R/job-token.signed"
+  step "$O pkeyutl -sign -inkey $R/token-key.pem -rawin -in $R/job-token.signed | $B64URL > $R/job-token.signature"
+  step "printf '%s.%s\\n' \"\$(cat $R/job-token.signed)\" \"\$(cat $R/job-token.signature)\" > $R/job-token"
+  AUTH="-H \"Authorization: Bearer \$(cat $R/job-token)\""
+  JSON="-H 'Content-Type: application/json' --data-binary @$R/job.json"
+  step "curl -sS -k --max-time 60 $AUTH $JSON \"https://\$(cat $R/address)/v1/jobs/validate\" > $R/job-validate.json && cat $R/job-validate.json && grep -q '\"ok\":true' $R/job-validate.json"
+  step "curl -sS -k --max-time 60 -o $R/job-submit.json -w '%{http_code}' $AUTH $JSON \"https://\$(cat $R/address)/v1/jobs\" > $R/job-submit.code && [ \"\$(cat $R/job-submit.code)\" = 201 ] && grep -o '\"id\":\"[^\"]*\"' $R/job-submit.json | head -1 | cut -d'\"' -f4 > $R/job.id && [ -s $R/job.id ]"
+  step "curl -sS -k -N --max-time 600 $AUTH \"https://\$(cat $R/address)/v1/jobs/\$(cat $R/job.id)/events\" > $R/job-events.txt; grep -a '^data: ' $R/job-events.txt | grep -a '\"type\":\"exit\"' | tail -1 | cut -c7- > $R/job-exit.json && cat $R/job-exit.json && grep -q '\"code\":0[,}]' $R/job-exit.json"
+  step "curl -sS -k --max-time 60 $AUTH \"https://\$(cat $R/address)/v1/jobs/\$(cat $R/job.id)/report\" > $R/job-report.json && grep -o '\"sinks\":\\[{[^]]*' $R/job-report.json | grep -o '\"rows\":[0-9]*' | head -1 | cut -d: -f2 > $R/job.rows && [ \"\$(cat $R/job.rows)\" = 10000000 ]"
+  step "grep -o '\"wall_s\":[0-9.eE+-]*' $R/job-report.json | head -1 | cut -d: -f2 > $R/job.wall && [ -s $R/job.wall ] && printf 'job: %s rows counted, wall_s %s\\n' \"\$(cat $R/job.rows)\" \"\$(cat $R/job.wall)\""
+fi
