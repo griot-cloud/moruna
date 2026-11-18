@@ -727,7 +727,7 @@ struct TaskLook {
 
 /// `ImageTask` in ring mode with `tasks` processes (`MORUNA_PROCESSES`), whose tasks answer each
 /// batch with `parts` records.
-struct NativeStage {
+pub(super) struct NativeStage {
     tasks: usize,
     piece: u64,
     work: Duration,
@@ -740,6 +740,16 @@ struct NativeStage {
 }
 
 impl NativeStage {
+    /// A stage of `tasks` tasks whose function takes `work` a piece and answers it with one
+    /// record of the same rows (item 6.3m).
+    pub(super) fn of(tasks: usize, piece: u64, work: Duration) -> NativeStage {
+        NativeStage {
+            tasks,
+            work,
+            ..NativeStage::new(piece, 1, Faults::default())
+        }
+    }
+
     fn new(piece: u64, parts: usize, faults: Faults) -> NativeStage {
         NativeStage {
             tasks: 8,
