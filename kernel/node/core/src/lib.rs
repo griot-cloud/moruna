@@ -781,12 +781,17 @@ mod tests {
             assert!(elsewhere.links.iter().all(|l| {
                 !hyperv.contains(&l.left.as_str()) && !hyperv.contains(&l.right.as_str())
             }));
+            assert!(elsewhere.grants.iter().all(|g| g.source != "dma.storvsc"));
+            // The device manager gets no register listener there: none holds a lookup.
             assert!(
                 elsewhere
-                    .grants
+                    .links
                     .iter()
-                    .all(|g| g.source != "dma.storvsc" && g.source != "dma.netvsc")
+                    .all(|l| !l.left_slot.starts_with("register"))
             );
+            // netvsc pins nothing, so it has no DMA grant anywhere (1F).
+            let on_hyperv = Config::parse(text, 1 << 30).unwrap();
+            assert!(on_hyperv.grants.iter().all(|g| g.service != "netvsc"));
         }
     }
 

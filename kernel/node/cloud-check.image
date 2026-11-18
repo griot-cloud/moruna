@@ -32,9 +32,8 @@ process node-supervisor
   handle root.dma dma.storvsc
   handle program:storvsc image.storvsc
   # netvsc (item 1.11b), Azure's network card, which the device manager's directory gives
-  # the network server as net0: its own whole DMA grant, as vmbus's (1F), and its program.
-  # The supervisor starts it where it starts vmbus, whose client it is.
-  handle root.dma dma.netvsc
+  # the network server as net0: its program, and no DMA grant, since vmbus pins the buffers
+  # it shares (1F). The supervisor starts it where it starts vmbus, whose client it is.
   handle program:netvsc image.netvsc
   # The check (item 1.10b).
   handle program:storvsc-check image.storvsc-check

@@ -15,7 +15,9 @@
 //!    the OS disk, every disk is served read-only, and it says why ([`plan`]).
 //! 3. It serves each disk as `moruna.driver.block` on a listener of its own ([`serve`]),
 //!    and registers it with the device manager under its serial, through the link that
-//!    carries only that right, so a client finds it as any other disk.
+//!    carries only that right, so a client finds it as any other disk. It connects through
+//!    that link before the scan, so a lookup of a disk not yet registered waits for it, and
+//!    closes the connection once the last disk is registered.
 //!
 //! Data moves by the guest page numbers of the client's memory, named in each request, with
 //! no copy. Everything it needs of the node is behind [`serve::Node`] and [`scan::Scratch`],

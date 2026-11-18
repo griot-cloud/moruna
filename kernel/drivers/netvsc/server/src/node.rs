@@ -1,12 +1,10 @@
 //! The process on the node: the library over the core's calls, `vmbus` and the device
 //! manager, and the loop.
 //!
-//! Its start handles: `console`; `dma`, its own DMA grant, a copy of `root.dma` (1F's
-//! Hyper-V rule), which it holds and does not use today: its two buffers are shared with
-//! the host through `vmbus`, which pins them with its own grant, and a frame is copied into
-//! a send section, so no client memory is pinned; `vmbus`, its end of `vmbus`'s `net`
-//! listener, whose server it is a client of; and `devices`, its end of the device manager's
-//! `register-netvsc` listener, which lets it register the card and nothing else.
+//! Its start handles: `console`; `vmbus`, its end of `vmbus`'s `net` listener, whose server
+//! it is a client of; and `devices`, its end of the device manager's `register-netvsc`
+//! listener, which lets it register the card and nothing else. No DMA grant: its two buffers
+//! are shared with the host through `vmbus`, which pins them with its own.
 
 use alloc::{boxed::Box, format, rc::Rc, string::String, vec, vec::Vec};
 use core::{
@@ -269,10 +267,13 @@ fn card(console: &Console, vmbus_listener: &Channel) -> Result<Netvsc<Opening, M
 }
 
 fn serve(console: &Console) -> Result<(), String> {
-    // Held for the life of the process and not used: see the module's docs.
-    let _dma = take("dma")?;
     let vmbus_listener = Channel(take("vmbus")?);
+    // The registrar's connection first, before the card is up: while it is open, the
+    // network server's lookup of `net0` waits for the card rather than finding nothing.
     let devices = Channel(take("devices")?);
+    let mut directory = devices_protocol::open_directory(devices, deadline_in(ANSWER_NS))
+        .map_err(|e| format!("the device manager: {e:?}"))?;
+    directory.core().set_timeout(ANSWER_NS);
     let mut card = card(console, &vmbus_listener)?;
     let wake = card
         .channel()
@@ -295,9 +296,6 @@ fn serve(console: &Console) -> Result<(), String> {
         .map_err(|e| format!("the card's listener: {}", e.name()))?;
     // Registered once it is served: a lookup of the name connects at once. The connection
     // closes when registering is done, which the device manager's waiting lookups hear.
-    let mut directory = devices_protocol::open_directory(devices, deadline_in(ANSWER_NS))
-        .map_err(|e| format!("the device manager: {e:?}"))?;
-    directory.core().set_timeout(ANSWER_NS);
     match directory.register_net(String::from(NAME), theirs) {
         Ok(()) => println!(console, "netvsc: served as {}", NAME),
         Err(e) => println!(
