@@ -22,6 +22,7 @@ use moruna_api::{
     Submitted, Validation,
 };
 use ring::digest::{SHA256, digest};
+use ring::signature::{ED25519, UnparsedPublicKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde_json::Value;
@@ -35,6 +36,8 @@ pub struct Config {
     pub instance: String,
     pub document: Node,
     pub token_keys: Vec<Vec<u8>>,
+    /// Node config's `functions.keys`: a registration's signature must verify under one.
+    pub function_keys: Vec<Vec<u8>>,
     pub identity: Identity,
 }
 
@@ -48,8 +51,8 @@ struct State {
     audit: Mutex<Vec<AuditRecord>>,
     /// The jobs submitted, oldest first.
     jobs: Mutex<Vec<JobStatus>>,
-    /// The functions registered (3E), by name. The stand-in checks no signature: a
-    /// registration whose signature is `bad` is refused, as one that does not verify is.
+    /// The functions registered (3E), by name. A registration's signature is checked as the
+    /// node checks it: Ed25519 over the 32 bytes of its SHA-256, under one of `function_keys`.
     functions: Mutex<Vec<Function>>,
 }
 
@@ -248,7 +251,8 @@ fn answer(state: &State, head: &str, body: &[u8]) -> (u16, String) {
     }
 }
 
-/// `POST /v1/functions`: the registration kept by name, or refused when its signature is `bad`.
+/// `POST /v1/functions`: the registration kept by name, replacing one of the same name, or
+/// refused when its address is not `https://` or its signature does not verify (3E).
 fn register(state: &State, body: &[u8]) -> Result<String, (ErrorCode, String)> {
     let given: FunctionRegistration = serde_json::from_slice(body).map_err(|_| {
         (
@@ -256,17 +260,23 @@ fn register(state: &State, body: &[u8]) -> Result<String, (ErrorCode, String)> {
             "not a function's registration".to_string(),
         )
     })?;
-    if given.signature == "bad" {
+    if !given.address.starts_with("https://") {
+        return Err((
+            ErrorCode::Invalid,
+            "the address is not an https:// URL".to_string(),
+        ));
+    }
+    let Some(key) = signed_by(&given, &state.config.function_keys) else {
         return Err((
             ErrorCode::Invalid,
             "the signature does not verify under any of node config's functions.keys".to_string(),
         ));
-    }
+    };
     let function = Function {
         name: given.name,
         address: given.address,
         sha256: given.sha256,
-        key: "stand-in".to_string(),
+        key: key_id(key),
         registered: now(),
     };
     let mut functions = state.functions.lock().expect("the functions");
@@ -274,6 +284,34 @@ fn register(state: &State, body: &[u8]) -> Result<String, (ErrorCode, String)> {
     functions.push(function.clone());
     functions.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(json(&function))
+}
+
+/// The key of `keys` a registration's signature verifies under: Ed25519, over the 32 bytes its
+/// `sha256` names in lowercase hex, its signature in standard base64.
+fn signed_by<'a>(given: &FunctionRegistration, keys: &'a [Vec<u8>]) -> Option<&'a [u8]> {
+    use base64::Engine;
+    let hex = given.sha256.as_bytes();
+    if hex.len() != 64
+        || !hex
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    {
+        return None;
+    }
+    let digest: Vec<u8> = hex
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect::<Option<_>>()?;
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(&given.signature)
+        .ok()?;
+    keys.iter()
+        .find(|key| {
+            UnparsedPublicKey::new(&ED25519, key.as_slice())
+                .verify(&digest, &signature)
+                .is_ok()
+        })
+        .map(Vec::as_slice)
 }
 
 fn json(value: &impl serde::Serialize) -> String {
