@@ -2,8 +2,6 @@
 //! item 1.3c): an answer that comes while the answers are read is never left filed with the
 //! channel empty, where nothing would wake the process for it.
 
-use core::cell::Cell;
-
 use moruna_svc::{Account, CallError, Channel, Encoder, Kind, Wire, deadline_in, frame};
 use netstack_protocol::net;
 
@@ -60,16 +58,13 @@ fn an_answer_that_comes_while_the_answers_are_read_is_never_left_behind() {
     let a = receive(&mut network, &theirs, 10);
     let _b = receive(&mut network, &theirs, 11);
     let c = receive(&mut network, &theirs, 12);
-    // `c`'s answer has come; `b`'s has not; `a`'s comes while the answers are read, once
-    // a read has found the channel empty. Each says its connection has ended: no bytes.
+    // `c`'s answer has come; `b`'s has not; `a`'s comes while the answers are taken, once
+    // the channel was read to its end. Each says its connection has ended: no bytes.
     frame::send(&theirs, Kind::Reply, 0, c, body(0u32)).expect("c's answer");
-    let late = Cell::new(true);
     let accepted = network
         .take_reading(|core| {
-            let read = core.file(0);
-            if matches!(read, Err(CallError::TimedOut)) && late.replace(false) {
-                frame::send(&theirs, Kind::Reply, 0, a, body(0u32)).expect("a's answer");
-            }
+            let read = core.file_all();
+            frame::send(&theirs, Kind::Reply, 0, a, body(0u32)).expect("a's answer");
             read
         })
         .expect("take");

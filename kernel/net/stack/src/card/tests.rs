@@ -18,7 +18,7 @@ const SECOND: u64 = 1_000_000_000;
 /// An answer the card sends: its kind, request and body.
 type Answer = (Kind, u32, Encoder);
 
-/// A client core whose card sends `late` just after a read finds the channel empty: an
+/// A client core whose card sends `late` just after the channel was read to its end: an
 /// answer that comes while the link is taking the others.
 struct Late {
     core: ClientCore,
@@ -30,12 +30,10 @@ impl Answers for Late {
     fn send(&mut self, ordinal: u16, body: Encoder) -> Result<u32, CallError<u32>> {
         self.core.send(ordinal, body)
     }
-    fn file_one(&mut self) -> Result<(), CallError<u32>> {
-        let read = self.core.file(0);
-        if matches!(read, Err(CallError::TimedOut)) {
-            for (kind, txid, body) in self.late.borrow_mut().drain(..) {
-                frame::send(&self.card, kind, 0, txid, body).expect("the late answer");
-            }
+    fn file_all(&mut self) -> Result<usize, CallError<u32>> {
+        let read = self.core.file_all();
+        for (kind, txid, body) in self.late.borrow_mut().drain(..) {
+            frame::send(&self.card, kind, 0, txid, body).expect("the late answer");
         }
         read
     }

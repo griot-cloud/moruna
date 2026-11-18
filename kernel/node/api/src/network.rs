@@ -23,7 +23,8 @@
 //! read while a later id's is looked for stays filed, untaken, with the channel empty:
 //! [`Network::wait`] is not woken for it, and its connection waits until something else
 //! comes. Filing first leaves none behind: one that comes after the channel was read to its
-//! end keeps it readable, and the next turn takes it.
+//! end keeps it readable, and the next turn takes it. The rule's one implementation is
+//! `ClientCore::file_all`.
 
 use alloc::{
     collections::{BTreeMap, VecDeque},
@@ -176,22 +177,17 @@ impl Network {
     /// a new connection for the server. The channel is read to its end first, then each
     /// reply taken (see the module's rule).
     pub fn take(&mut self) -> Result<Vec<u32>, Error> {
-        self.take_reading(|core| core.file(0))
+        self.take_reading(ClientCore::file_all)
     }
 
-    /// [`Network::take`], reading each answer there is with `read`: a client core's
-    /// `file(0)`, or a test's, which sends one more while the answers are read.
+    /// [`Network::take`], reading every answer there is with `read`: a client core's
+    /// `file_all`, or a test's, which sends one more once the answers are read.
     fn take_reading(
         &mut self,
-        mut read: impl FnMut(&mut ClientCore) -> Result<(), CallError<u32>>,
+        read: impl FnOnce(&mut ClientCore) -> Result<usize, CallError<u32>>,
     ) -> Result<Vec<u32>, Error> {
-        loop {
-            match read(self.client.core()) {
-                Ok(()) => {}
-                Err(CallError::TimedOut) => break,
-                Err(error) => return Err(Error::Network("answers", CallError::typed(error))),
-            }
-        }
+        read(self.client.core())
+            .map_err(|error| Error::Network("answers", CallError::typed(error)))?;
         let mut accepted = Vec::new();
         let ids: Vec<u32> = self.requests.keys().copied().collect();
         for id in ids {
