@@ -571,6 +571,13 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
   factor: its writers' need is a fixed amount per lane, not per byte in flight, so a chain whose
   kernels declare nothing outside the arena gets exactly the writers' claim above it. The writers'
   heap is measured by the counting allocator, and each lane flushes its row group by it. The
+  writers' claim is their floor, not their ceiling: they are granted, up to their room, what their
+  row groups need to reach the sink's own row-group target, so an ample budget writes the groups
+  the sink asks for. That extra comes only from what the arena's working size (the arena sized
+  with the claims) leaves above it, never from the arena, so on a tight or free chain there may be
+  none: the arena's least is a floor, not a working size (6.3d: an arena cut to its least by the
+  writers' extra failed to allocate). The decoders' least batches, one of the least morsel per
+  worker, are claimed with their fixed need, so a decode always has a batch. The
   fixed claims compose as one sum held outside the arena before its share is taken: the stateful
   kernels' declared state, the functions' measured fixed bytes (below), the decoders' fixed need
   and the writers' need.

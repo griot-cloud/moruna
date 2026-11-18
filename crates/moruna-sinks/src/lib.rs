@@ -37,13 +37,13 @@ mod stats;
 mod stream;
 mod tensor_sink;
 
-pub use file_buf::LANE_MAX_BYTES;
+pub use file_buf::{LANE_MAX_BYTES, lane_file_bytes};
 pub use handle::SinkHandle;
 pub use ipc_sink::{ArrowIpcSink, ArrowIpcSinkConfig};
 pub use lane_heap::{
     CLAIM_PAGE_BYTES, FALLBACK_FACTOR, Leaves, WriterFit, WriterLanes, codec_bytes, fit_writers,
-    lane_bytes_for_page, lane_codec_bytes, lane_page_bytes, least_lane_bytes, leaves_of,
-    writer_lanes,
+    lane_bytes_for_page, lane_bytes_for_target, lane_codec_bytes, lane_page_bytes,
+    least_lane_bytes, leaves_of, writer_lanes,
 };
 pub use parquet_sink::{ParquetSink, ParquetSinkConfig, WriterGrant};
 #[cfg(feature = "python")]

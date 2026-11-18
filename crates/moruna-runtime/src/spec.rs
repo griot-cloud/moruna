@@ -53,11 +53,16 @@ pub struct BuildCtx {
 }
 
 /// One sink's claim on the room above the arena (6.3d): the codec its columns keep state for,
-/// and the grant the facade sets once it knows the sink's schema.
+/// its own row group and file targets, and the grant the facade sets once it knows the sink's
+/// schema.
 #[derive(Clone, Debug)]
 pub(crate) struct WriterClaim {
     /// The codec the sink compresses its columns with.
     pub compression: parquet::basic::Compression,
+    /// The sink's row group target, encoded bytes (`ParquetSinkConfig::row_group_bytes`).
+    pub row_group_bytes: u64,
+    /// The sink's file target (`ParquetSinkConfig::file_bytes`), before the arena bounds it.
+    pub file_bytes: u64,
     /// What the run grants the sink.
     pub grant: moruna_sinks::WriterGrant,
 }
@@ -120,9 +125,15 @@ impl BuildCtx {
     /// the arena takes the rest ([`moruna_sinks::fit_writers`]), and the file buffers' share of
     /// the arena that leaves. A run whose sink cannot hold one lane is refused before it starts,
     /// with the least budget that holds it.
+    ///
+    /// `row_group_bytes` and `file_bytes` are the sink's own targets: where the budget leaves
+    /// room, the writers are granted above their claim what their row groups need to reach the
+    /// row group target, so an ample budget writes the groups the sink asks for.
     pub fn claim_writer_heap(
         &self,
         compression: parquet::basic::Compression,
+        row_group_bytes: u64,
+        file_bytes: u64,
     ) -> moruna_sinks::WriterGrant {
         let grant = moruna_sinks::WriterGrant::new();
         self.writer_claims
@@ -130,6 +141,8 @@ impl BuildCtx {
             .unwrap_or_else(|e| e.into_inner())
             .push(WriterClaim {
                 compression,
+                row_group_bytes,
+                file_bytes,
                 grant: grant.clone(),
             });
         grant
@@ -533,11 +546,15 @@ mod tests {
         };
         let zstd = parquet::basic::Compression::ZSTD(Default::default());
         assert!(two.writer_claims().is_empty());
-        let grant = two.claim_writer_heap(zstd);
+        let grant = two.claim_writer_heap(zstd, 128 << 20, 1 << 30);
         assert_eq!((grant.writers(), grant.file_buffers()), (None, None));
         let claims = two.writer_claims();
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].compression, zstd);
+        assert_eq!(
+            (claims[0].row_group_bytes, claims[0].file_bytes),
+            (128 << 20, 1 << 30)
+        );
         claims[0].grant.grant(Some(100 << 20), 32 << 20);
         assert_eq!(
             grant.writers(),

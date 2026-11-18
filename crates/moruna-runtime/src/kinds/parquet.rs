@@ -249,7 +249,7 @@ impl SinkKind for Parquet {
                     .with_lanes(usize::from(ctx.workers.max(1)))
                     // 3A (6.3d): the writers claim their need above the arena, granted once
                     // the run knows the sink's schema, with the file buffers' bytes.
-                    .with_grant(ctx.claim_writer_heap(compression));
+                    .with_grant(ctx.claim_writer_heap(compression, row_group_bytes, file_bytes));
                 Ok(Box::new(sink) as Box<dyn moruna_kernel::Sink>)
             })),
             target,

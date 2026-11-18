@@ -570,24 +570,38 @@ impl ParquetSink {
             }
         }
         let fresh;
+        let busy;
         let mut lane = match taken {
             Some(guard) => guard,
-            None if lanes.len() < self.max_lanes => {
-                fresh = Arc::new(Mutex::new(Lane::default()));
-                self.lanes
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(Arc::clone(&fresh));
-                fresh.lock().unwrap_or_else(|e| e.into_inner())
-            }
-            // Every lane is busy and there are as many as workers may encode: wait for one,
-            // round robin, which is no longer than one encode.
             None => {
-                let at = self
-                    .next_lane
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                    % lanes.len();
-                lanes[at].lock().unwrap_or_else(|e| e.into_inner())
+                // The count and the push under one lock (6.3d): two encoders that find every
+                // lane busy at once open one lane between them, never more than the sink's
+                // lanes. Before, both could see room for one and push two, and a third lane held
+                // a writer's heap beyond the writers' share (si_lane_heap's lane cap, under load).
+                let opened = {
+                    let mut all = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+                    (all.len() < self.max_lanes).then(|| {
+                        let lane = Arc::new(Mutex::new(Lane::default()));
+                        all.push(Arc::clone(&lane));
+                        lane
+                    })
+                };
+                match opened {
+                    Some(lane) => {
+                        fresh = lane;
+                        fresh.lock().unwrap_or_else(|e| e.into_inner())
+                    }
+                    // Every lane is busy and there are as many as workers may encode: wait for
+                    // one, round robin, which is no longer than one encode.
+                    None => {
+                        busy = self.lanes();
+                        let at = self
+                            .next_lane
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            % busy.len();
+                        busy[at].lock().unwrap_or_else(|e| e.into_inner())
+                    }
+                }
             }
         };
         // Validation is done: from here a failure is the encoder's or the store's, and it moves

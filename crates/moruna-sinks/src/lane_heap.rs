@@ -81,6 +81,12 @@ const SNAPPY_BYTES: u64 = 2 * (1 << 10) + 2 * (1 << 14);
 /// empty.
 const EMPTY_FIXED_DICTIONARY: u64 = 73_792;
 
+/// What a dictionary holds on the heap per byte of its dictionary page, at the most (M2: per
+/// distinct value, four-byte strings 57.4 bytes for 8 bytes of page, Int16 and Int32 24.6 for 4,
+/// Int64, Float64 and timestamps 31.2 for 8, 32-byte strings 103.3 for 36): its values and its
+/// hash index. A dictionary page is bounded by the lane's page, so a full one bounds it.
+const DICTIONARY_HEAP_PER_PAGE_BYTE: f64 = 57.4 / 8.0;
+
 /// What an open page holds per value at the most while dictionary encoded: a `u64` index in a
 /// buffer that doubles (M3, every kind measured). The least lane counts it.
 const OPEN_PAGE_BYTES_PER_VALUE: u64 = 16;
@@ -257,6 +263,37 @@ pub fn lane_page_bytes(lane: u64, leaves: &Leaves, compression: Compression, def
 /// over, and at least [`least_lane_bytes`].
 pub fn lane_bytes_for_page(leaves: &Leaves, compression: Compression, page: u64) -> u64 {
     (2 * lane_codecs(leaves, compression, page)).max(least_lane_bytes(leaves, compression))
+}
+
+/// What a lane needs to flush its row groups at `target` encoded bytes, the sink's own target,
+/// rather than at its heap, at a page of `page` bytes (system design 3A, 6.3d): its codecs, and a
+/// writer whose flush point ([`Bounds::flush_at`]) holds the row group's encoded pages twice over
+/// (their buffers grow by doubling, M3), every column's open page (M3, M8) and every column's
+/// dictionary full (M2), beside a slice's transients and a flush's two pages. Never less than the lane's need at that page
+/// ([`lane_bytes_for_page`]). What the run grants a lane above its claim, up to its room, is
+/// what this asks.
+pub fn lane_bytes_for_target(
+    leaves: &Leaves,
+    compression: Compression,
+    page: u64,
+    target: u64,
+) -> u64 {
+    let open = leaves.count().saturating_mul(page_input(page));
+    // Each column's dictionary, full: its page at most (the lane's) and its hash index (M2).
+    let dictionaries = leaves.count().saturating_mul(
+        EMPTY_FIXED_DICTIONARY + (page as f64 * DICTIONARY_HEAP_PER_PAGE_BYTE) as u64,
+    );
+    // A flush point of `held`: the writer less its transients, a slice's (an eighth of it at
+    // most) and a flush's, so the writer is the point and those over seven eighths.
+    let held = target
+        .saturating_mul(2)
+        .saturating_add(open)
+        .saturating_add(dictionaries)
+        .saturating_add(page / SLICE_PAGE_SHARE + FLUSH_PAGES * page);
+    let writer = held.saturating_mul(SLICE_SHARE).div_ceil(SLICE_SHARE - 1);
+    lane_codecs(leaves, compression, page)
+        .saturating_add(writer)
+        .max(lane_bytes_for_page(leaves, compression, page))
 }
 
 /// The page a lane writes when the budget holds it (system design 3A, 6.3d): the smallest page
@@ -902,5 +939,33 @@ mod tests {
         assert_eq!(pages.first(), Some(&CLAIM_PAGE_BYTES));
         assert_eq!(pages.last(), Some(&LEAST_PAGE_BYTES));
         assert!(pages.windows(2).all(|w| w[0] > w[1]), "{pages:?}");
+    }
+    /// A lane granted its row group target's need flushes at the target and not at its heap: its
+    /// flush point holds the target's pages twice over, every open page and every dictionary
+    /// full; it never needs less than its page's need.
+    #[test]
+    fn a_lane_granted_its_target_flushes_at_the_target() {
+        let taxi = taxi();
+        let page = CLAIM_PAGE_BYTES;
+        assert!(
+            lane_bytes_for_target(&taxi, zstd(), page, 0)
+                >= lane_bytes_for_page(&taxi, zstd(), page)
+        );
+        let target = 16u64 << 20;
+        let lane = lane_bytes_for_target(&taxi, zstd(), page, target);
+        // As the sink asks: parquet's limits, the page lowered to the claim's.
+        let b = bounds(lane, &taxi, zstd(), ROWS, page as usize, MIB, 1024);
+        assert_eq!(b.page_bytes as u64, page, "the claim's page");
+        assert!(
+            b.flush_at >= 2 * target + 19 * page_input(page) + 19 * 7 * page,
+            "{b:?}"
+        );
+        assert!(
+            lane < lane_codecs(&taxi, zstd(), page) + 3 * target + 19 * 10 * page,
+            "{lane}"
+        );
+        assert_eq!(crate::lane_file_bytes(1 << 30, 4), crate::LANE_MAX_BYTES);
+        assert_eq!(crate::lane_file_bytes(32 << 20, 4), 16 << 20);
+        assert_eq!(crate::lane_file_bytes(0, 4), 64 << 10);
     }
 }

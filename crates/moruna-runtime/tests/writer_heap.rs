@@ -452,10 +452,10 @@ fn refused_then_held(name: &str, columns: usize, rows: i64) {
     apart::within(&outcome, "a copy at the least budget named", budget);
     let held = outcome["sink"]["held_peak"].as_i64().expect("measured");
     let (writers, _, _, fixed) = claim(&outcome).expect("the claims");
-    assert_eq!(
-        (writers, fixed),
-        (least, decoders),
-        "one lane at the least page"
+    assert_eq!(fixed, decoders);
+    assert!(
+        writers >= least && writers < 2 * least,
+        "one lane at the least page, and its room: {writers} for {least}"
     );
     assert!(held <= writers as i64, "{held} over {writers}");
     assert!(
@@ -525,19 +525,158 @@ fn a_chain_declaring_nothing_outside_the_arena_leaves_its_writers_their_claim() 
     let (writers, _, decoders, fixed) = claim(&outcome).expect("the writers claimed their need");
     let three =
         moruna_sinks::lane_bytes_for_page(&leaves_of(3), zstd(), moruna_sinks::CLAIM_PAGE_BYTES);
-    assert_eq!(
-        writers,
-        2 * three,
-        "two lanes of three columns at the claim's page"
+    assert!(
+        writers >= 2 * three,
+        "two lanes of three columns at the claim's page at the least: {writers}"
     );
     assert_eq!(
         fixed,
         2 * 8 * moruna_sources::FIXED_COLUMN_DECODE_BYTES,
         "the source's eight columns, one decode per worker"
     );
+    // Their least batches beside their fixed need: the least morsel, four times over, a worker.
+    let least_batches = 2 * 4 * (4u64 << 20);
     assert!(
-        decoders - fixed < 64 << 10,
-        "only the claims are above the arena: {decoders} for {fixed}"
+        decoders - fixed - least_batches < 64 << 10,
+        "only the claims are above the arena: {decoders} for {fixed} and {least_batches}"
+    );
+    assert_eq!(support::read_back_rows(&out), (GROUPS * ROWS) as u64);
+}
+
+/// The encoded bytes of every row group the copy under `out` wrote, file by file, each file's
+/// last group apart (it ends where the file rolls or the input ends).
+fn row_groups(out: &Path) -> (Vec<i64>, Vec<i64>) {
+    use parquet::file::reader::FileReader;
+    let (mut whole, mut last) = (Vec::new(), Vec::new());
+    for entry in std::fs::read_dir(out).expect("the output") {
+        let path = entry.expect("an entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
+            continue;
+        }
+        let file = std::fs::File::open(&path).expect("a file");
+        let reader = parquet::file::reader::SerializedFileReader::new(file).expect("a reader");
+        let groups: Vec<i64> = reader
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|g| g.compressed_size())
+            .collect();
+        if let Some((end, rest)) = groups.split_last() {
+            whole.extend_from_slice(rest);
+            last.push(*end);
+        }
+    }
+    (whole, last)
+}
+
+/// Rows of `columns` Int64 columns of scattered values, which encode to about their decoded
+/// size.
+fn scattered(columns: usize) -> impl Fn(i64, i64) -> RecordBatch {
+    move |from, rows| {
+        let columns: Vec<(String, arrow::array::ArrayRef)> = (0..columns)
+            .map(|c| {
+                let values = (from..from + rows).map(|r| {
+                    (r.wrapping_mul(2_654_435_761) ^ (c as i64).wrapping_mul(40_503)) & 0xffff_ffff
+                });
+                (
+                    format!("c{c}"),
+                    Arc::new(arrow::array::Int64Array::from_iter_values(values))
+                        as arrow::array::ArrayRef,
+                )
+            })
+            .collect();
+        RecordBatch::try_from_iter(columns).expect("a group")
+    }
+}
+
+/// A copy of `file` into a Parquet sink with a row group target of `row_group_bytes`.
+fn copy_with_target(
+    scratch: &Scratch,
+    file: &Path,
+    out: &Path,
+    budget: u64,
+    row_group_bytes: u64,
+) -> serde_json::Value {
+    apart::run(
+        "child_run",
+        &json!({
+            "moruna_spec": 1,
+            "source": {"kind": "parquet", "url": file},
+            "sink": {"kind": "parquet", "url": out,
+                     "options": {"row_group_bytes": row_group_bytes}},
+            "budget": {"memory_bytes": budget, "cpu": 2.0},
+            "profiles_dir": scratch.path().join("profiles"),
+        }),
+    )
+}
+
+/// 3A, 6.3d (PM, 2026-11-18): the writers are granted up to their room, their claim the floor.
+/// At an ample budget their row groups reach the sink's own target (16 MiB here) before their
+/// heap, as before 6.3d; the report says what they were granted above their claim.
+#[test]
+fn at_an_ample_budget_the_row_groups_reach_the_sinks_target() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("writer_heap_ample");
+    let file = scratch.path().join("in.parquet");
+    grouped(&file, 6, 50_000, scattered(32));
+    let out = scratch.path().join("out");
+    let target: i64 = 16 << 20;
+    let outcome = copy_with_target(&scratch, &file, &out, BUDGETS[1], target as u64);
+    apart::within(&outcome, "an ample copy", BUDGETS[1]);
+    let held = outcome["sink"]["held_peak"].as_i64().expect("measured");
+    let (writers, _, _, _) = claim(&outcome).expect("the claims");
+    assert!(held <= writers as i64, "{held} over {writers}");
+    assert!(
+        notes(&outcome)
+            .iter()
+            .any(|n| n.contains("above their claim") && n.contains(&format!("target of {target}"))),
+        "the report says the writers were granted their row groups: {:?}",
+        notes(&outcome)
+    );
+    let (whole, _) = row_groups(&out);
+    assert!(!whole.is_empty(), "several groups a file");
+    for size in &whole {
+        assert!(
+            *size >= target * 3 / 4,
+            "a group of {size} bytes stopped short of the {target} byte target: {whole:?}"
+        );
+    }
+    assert_eq!(support::read_back_rows(&out), 6 * 50_000);
+}
+
+/// 3A, 6.3d: at 672 MiB a table whose writers' room is their claim (384 one-byte columns)
+/// gets no more than its room: its row groups stop at the writers' heap, short of the sink's
+/// target, and the run stays under its ceiling.
+#[test]
+fn at_a_tight_budget_the_writers_keep_to_their_room() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("writer_heap_tight");
+    let file = scratch.path().join("in.parquet");
+    grouped(&file, GROUPS, ROWS, categorical(384));
+    let out = scratch.path().join("out");
+    let budget = 672u64 << 20;
+    let target: i64 = 16 << 20;
+    let outcome = copy_with_target(&scratch, &file, &out, budget, target as u64);
+    apart::within(&outcome, "a tight copy", budget);
+    let held = outcome["sink"]["held_peak"].as_i64().expect("measured");
+    let (writers, _, _, _) = claim(&outcome).expect("the claims");
+    assert!(held <= writers as i64, "{held} over {writers}");
+    let notes = notes(&outcome);
+    let page = notes
+        .iter()
+        .find(|n| n.contains("writes pages of at most"))
+        .expect("the page is cut: the room is the claim");
+    let room: u64 = page
+        .split('(')
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .expect("the room is said");
+    assert!(writers <= room, "{writers} over the room {room}");
+    let (whole, last) = row_groups(&out);
+    assert!(
+        whole.iter().chain(&last).all(|size| *size < target),
+        "every group stops at the heap, short of the target: {whole:?} {last:?}"
     );
     assert_eq!(support::read_back_rows(&out), (GROUPS * ROWS) as u64);
 }
