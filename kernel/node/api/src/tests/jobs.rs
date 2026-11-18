@@ -443,6 +443,43 @@ fn a_job_runs_in_a_fresh_engine_from_spec_to_its_end() {
     assert_eq!(host.start(SPEC, &sound()), Err(HostError::Unavailable));
 }
 
+/// A job whose document names no budget (system design 3A, item 3.2c): the engine's check
+/// answers the node's job bound for it (`moruna-runtime`'s `tests/node.rs` pins that), and the
+/// job is launched with all of it, its engine carved from the whole bound as from any budget.
+#[test]
+fn a_job_with_no_budget_is_launched_with_the_node_s_job_bound() {
+    let admission = Admission::start(BOUND);
+    let mut host = Shared(Rc::new(RefCell::new(host(&admission))));
+    let shared = host.0.clone();
+    let is_launching = move || shared.borrow().launching();
+    let unbudgeted = Verdict {
+        refusals: Vec::new(),
+        memory_bytes: Some(BOUND),
+        needs: Needs::default(),
+        registered: Vec::new(),
+    };
+    host.start(SPEC, &unbudgeted).unwrap();
+    launched(&mut host, &is_launching);
+    assert_eq!(
+        admission.book.lock().unwrap().started[0].budget,
+        Some(BOUND)
+    );
+    assert_eq!(
+        admission.config(0),
+        job_config(BOUND, BOUND, false, false, 0, false).unwrap()
+    );
+    let job = EngineConfig::parse(&admission.config(0)).expect("it parses");
+    assert_eq!(job.args, serve_args(BOUND));
+    assert_eq!(job.memory + job.scratch + 128 * MIB, BOUND);
+    assert_eq!(
+        Sizes {
+            memory: job.memory,
+            scratch: job.scratch
+        },
+        sizes(BOUND, false)
+    );
+}
+
 /// What the node's admission refuses, and what no engine can be started for.
 #[test]
 fn what_admission_refuses_is_the_call_s_answer() {

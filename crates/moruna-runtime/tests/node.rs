@@ -544,6 +544,100 @@ fn a_nodes_budget_is_the_most_a_job_may_have_and_its_default() {
     assert_eq!(report["report"]["host"]["memory_limit_bytes"], json!(arena));
 }
 
+/// A job with no budget gets the node's job bound (system design 3A, item 3.2c): the check
+/// answers the bound and the job runs exactly as one whose budget is the bound, its report
+/// saying the same memory, the arena's share of it (1.3c's 326 MiB of a 2 GiB node's bound). A
+/// document's own budget is kept, and one larger than the bound is refused by its field.
+#[test]
+fn a_job_with_no_budget_runs_with_the_nodes_job_bound() {
+    let _serial = one_run_at_a_time();
+    let scratch = Scratch::new("node_default_budget");
+    write_parquet(&scratch.path().join("in.parquet"), 4_000, 2);
+    std::fs::create_dir_all(scratch.path().join("out")).expect("out");
+    let bound = 590_229_504u64; // a 2 GiB node's job bound, as 1.3c measured it
+    let node = Node {
+        channel: "channel:engine".to_string(),
+        budget_max: Some(bound),
+        volumes: None,
+    };
+    let kinds = kinds(Path::new("/in.parquet"), Path::new("/out"));
+    let checked = |document: Value| {
+        let (engine, api) = Framed::pair();
+        let line = format!(
+            "{}\n",
+            json!({"type": "check", "spec": document, "secrets": ["aws.id", "aws.key"]})
+        );
+        let peer = std::thread::spawn(move || {
+            let Conn {
+                mut reader,
+                mut writer,
+                ..
+            } = over_messages(api);
+            writer
+                .write_all(line.as_bytes())
+                .expect("the check is sent");
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).expect("read to the end");
+            bytes
+        });
+        let code =
+            moruna_runtime::host::cli::check_conn(over_messages(engine), &kinds, Some(&node));
+        let text = String::from_utf8(peer.join().expect("the peer")).expect("text");
+        let answer: Value = serde_json::from_str(text.trim_end()).expect("JSON");
+        (code, answer["memory_bytes"].clone())
+    };
+    let ran = |document: Value| {
+        let served = serve_bounded(
+            &scratch,
+            json!({"spec": document, "secrets": secrets()}),
+            Some(bound),
+        );
+        assert_eq!(
+            served.outcome.code,
+            exit::COMPLETED,
+            "{:?}",
+            served.outcome.diagnostic
+        );
+        let report = served
+            .messages
+            .iter()
+            .find(|m| m["type"] == "report")
+            .expect("a report");
+        report["report"]["host"]["memory_limit_bytes"].clone()
+    };
+    let with_budget = |memory: Option<u64>| {
+        let mut document = document(scratch.path());
+        document["budget"] = match memory {
+            Some(bytes) => json!({"memory_bytes": bytes, "cpu": 2.0}),
+            None => json!({"cpu": 2.0}),
+        };
+        document
+    };
+    let arena = |whole: u64| json!(moruna_runtime::host::node::sizes(whole, false).arena);
+    // No budget: the bound, checked and run as a budget of the bound is.
+    assert_eq!(checked(with_budget(None)), (exit::COMPLETED, json!(bound)));
+    assert_eq!(
+        checked(with_budget(Some(bound))),
+        (exit::COMPLETED, json!(bound))
+    );
+    let none = ran(with_budget(None));
+    assert_eq!(none, arena(bound));
+    assert_eq!(none, ran(with_budget(Some(bound))));
+    // 1.3c's figures: 326 MiB of arena and 108 MiB of scratch beside the engine's own 128 MiB.
+    let sizes = moruna_runtime::host::node::sizes(bound, false);
+    assert_eq!((sizes.arena >> 20, sizes.scratch >> 20), (326, 108));
+    // A document's own budget is kept.
+    let own = 512u64 << 20;
+    assert_eq!(
+        checked(with_budget(Some(own))),
+        (exit::COMPLETED, json!(own))
+    );
+    assert_eq!(ran(with_budget(Some(own))), arena(own));
+    // One larger than the bound is refused by its field.
+    let (code, _) = checked(with_budget(Some(bound + 4096)));
+    assert_eq!(code, exit::SPEC_REFUSED);
+}
+
 /// The check a node runs for `validate`, over a channel (`moruna check-job --listen`): one
 /// `check` line in, the document and its secrets' names; one `checked` line out, every refusal
 /// by field and the budget the job would run with; exit 0 or 2.
