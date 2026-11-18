@@ -139,10 +139,11 @@ fn range_end(
     let end = (start + rows).min(split.rows);
     // A remainder under half a read is taken with this one, not read on its own: a read pays
     // for its split's fetch and its buffers' fixed cost whatever its rows (RB3).
-    // But not past the largest morsel the consumer may have: what one of its instances can
-    // take, where its kernel says it (system design 3A).
+    // But not past what one of the consumer's instances can take, where its kernel says it
+    // (system design 3A); a consumer that says nothing reads as it always did.
+    let capped = max < shared.cfg.morsel_max;
     let most = rows_for(split, ((max as f64) / ratio).max(1.0) as u64);
-    if split.rows - end < rows / 2 && split.rows - start <= most {
+    if split.rows - end < rows / 2 && (!capped || split.rows - start <= most) {
         split.rows
     } else {
         end
