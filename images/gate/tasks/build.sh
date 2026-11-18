@@ -6,7 +6,14 @@
 #
 #   images/gate/tasks/build.sh [CARGO_ARGS...]
 #
-# The binaries land in target/x86_64-moruna/release (CARGO_TARGET_DIR to build elsewhere).
+# Into TARGET (CARGO_TARGET_DIR, or images/gate/tasks/target), as kernel/function/c/build-core.sh
+# writes its programs:
+#   core/bin/gate-JOB          each task as a node fetches and caches it: stripped (the
+#                              release profile keeps debug info: gate-enrich is 76 MB with
+#                              it and 2 MB without)
+#   core/debug/gate-JOB.debug  its debug info, which core/bin/gate-JOB names (its
+#                              .gnu_debuglink)
+# cargo's own build is in TARGET/x86_64-moruna/release. The script prints TARGET/core/bin.
 #
 # It needs item 5.0's target (kernel/targets/x86_64-moruna.json), its link script
 # (kernel/targets/x86_64-moruna.ld) and its std (kernel/vendor/rust-std/library, Rust's library/
@@ -43,8 +50,22 @@ CARGO_TARGET_X86_64_MORUNA_RUSTFLAGS="$flags -Zunstable-options -C link-arg=-T$l
   rustup run "$toolchain" cargo build --release --target "$target" \
   -Zunstable-options -Zjson-target-spec \
   -Zbuild-std=std,panic_abort -Zbuild-std-features=compiler-builtins-mem "$@"
-bin="${CARGO_TARGET_DIR:-$here/target}/x86_64-moruna/release"
+cargo_target="${CARGO_TARGET_DIR:-$here/target}"
+case "$cargo_target" in
+  /*) ;;
+  *) cargo_target="$here/$cargo_target" ;;
+esac
+release="$cargo_target/x86_64-moruna/release"
+out="$cargo_target/core"
+# The toolchain's own objcopy, as build-core.sh's.
+sysroot="$(rustup run "$toolchain" rustc --print sysroot)"
+host="$(rustup run "$toolchain" rustc -vV | sed -n 's/^host: //p')"
+objcopy="$sysroot/lib/rustlib/$host/bin/llvm-objcopy"
+mkdir -p "$out/bin" "$out/debug"
 for t in enrich audit occupancy score fw_minhash ov_shape ov_attrs; do
-  test -f "$bin/gate-$t" || { echo "build.sh: gate-$t was not built" >&2; exit 1; }
+  test -f "$release/gate-$t" || { echo "build.sh: gate-$t was not built" >&2; exit 1; }
+  "$objcopy" --only-keep-debug "$release/gate-$t" "$out/debug/gate-$t.debug"
+  (cd "$out/debug" && "$objcopy" --strip-all --add-gnu-debuglink="gate-$t.debug" \
+    "$release/gate-$t" "$out/bin/gate-$t")
 done
-echo "$bin"
+echo "$out/bin"
