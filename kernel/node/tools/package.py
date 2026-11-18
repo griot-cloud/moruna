@@ -89,6 +89,16 @@ def system_layer(path):
     return hashlib.sha256(header).hexdigest()
 
 
+def binds(description, path):
+    """Whether the boot description's text binds the payload file `path` (`handle data:PATH
+    SLOT`)."""
+    for line in description.splitlines():
+        words = line.split()
+        if len(words) >= 3 and words[0] == "handle" and words[1] == f"data:{path}":
+            return True
+    return False
+
+
 def linux_layers(seal):
     """The image filesystem's `layers` text naming the system layer by its seal."""
     return f"moruna-layers 1\nlayer system {seal}\n"
@@ -247,6 +257,8 @@ def main():
         parser.error("output must not be inside the input asset tree")
     if out.exists():
         parser.error("output must be a new directory; existing artifacts are never removed")
+    if binds(description.read_text(), LINUX_LAYERS) and not args.system_layer:
+        parser.error(f"this description binds {LINUX_LAYERS}: pass --system-layer")
     layer = None
     if args.system_layer:
         layer = args.system_layer.absolute()

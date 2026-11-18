@@ -206,12 +206,16 @@ class DiskGuid(unittest.TestCase):
             guid = package.disk_guid(self.files(tmp, b"x"))
         self.assertRegex(guid, r"^[0-9A-F]{8}-[0-9A-F]{4}-8[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$")
 
-    def test_the_payload_names_it_and_the_cloud_supervisor_passes_it_to_devices(self):
+    def test_the_payload_names_it_and_the_cloud_supervisor_passes_it_to_devices_and_storvsc(self):
         node = TOOL.parents[1]
-        image = (node / "cloud.image").read_text()
-        self.assertIn(f"  handle data:{package.DISK_GUID} disk.guid\n", image)
-        conf = (node / "cloud" / "node.conf").read_text()
-        self.assertIn("grant devices disk.guid disk.guid\n", conf)
+        for profile in ("cloud", "cloud-check"):
+            image = (node / f"{profile}.image").read_text()
+            self.assertIn(f"  handle data:{package.DISK_GUID} disk.guid\n", image)
+            # A slot is granted to one service: storvsc's is a second binding of the same file.
+            self.assertIn(f"  handle data:{package.DISK_GUID} disk.guid.storvsc\n", image)
+            conf = (node / profile / "node.conf").read_text()
+            self.assertIn("grant devices disk.guid disk.guid\n", conf)
+            self.assertIn("grant storvsc disk.guid disk.guid.storvsc\n", conf)
 
 
 
@@ -315,6 +319,24 @@ class SystemPartition(unittest.TestCase):
             self.assertEqual(first, planned["system_sector"])
             self.assertEqual(last - first + 1, planned["system_mib"] * 2048)
             self.assertEqual(data[first * 512:first * 512 + layer.stat().st_size], layer.read_bytes())
+
+    def test_a_description_that_binds_linux_layers_needs_the_flag_before_anything_is_built(self):
+        self.assertTrue(package.binds("process x\n  handle data:linux.layers layers\n", "linux.layers"))
+        self.assertFalse(package.binds("process x\n  handle data:linux.layers.old layers\n", "linux.layers"))
+        self.assertFalse(package.binds("# handle data:linux.layers layers\n", "linux.layers"))
+        with tempfile.TemporaryDirectory() as tmp:
+            description = Path(tmp) / "d.image"
+            description.write_text("moruna-image 1\nprocess node-supervisor\n"
+                                   "  handle data:linux.layers linux.layers\n")
+            (Path(tmp) / "assets").mkdir()
+            out = Path(tmp) / "out"
+            argv = ["--profile", "cloud", "--description", str(description), "--assets", "assets",
+                    "--out", str(out), "--node-memory", str(2 << 30)]
+            result = subprocess.run([sys.executable, "-I", str(TOOL), *argv], capture_output=True, text=True,
+                                    cwd=tmp)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("this description binds linux.layers: pass --system-layer", result.stderr)
+            self.assertFalse(out.exists(), "refused before anything is built")
 
     def test_the_command_takes_a_system_layer(self):
         _, args = package.arguments(["--profile", "cloud", *BASE, "--system-layer", "engine.layer"])

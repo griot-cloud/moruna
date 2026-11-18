@@ -6,8 +6,9 @@
 //!
 //! Every step waits with a deadline, and one that passes ends the scan with a reason.
 //!
-//! The boot disk's GPT is read too ([`system`]): its `moruna-system` partition, which holds the
-//! node's engine layer, is served as a window of it (item 3.3).
+//! The boot disk's GPT is read too ([`boot_table`]): its disk GUID, which the image's must be,
+//! and its `moruna-system` partition, which holds the node's engine layer and is served as a
+//! window of it (item 3.3).
 
 use alloc::{format, string::String, vec, vec::Vec};
 
@@ -184,15 +185,24 @@ fn read_page<C: Channel, S: Scratch>(
     }
 }
 
-/// The `moruna-system` partition of `disk`, the boot disk, as a window of its blocks: from its
-/// GPT, the primary header at block 1 and the entries it names, read a page at a time into the
-/// scratch page and checked (`moruna_disk`). `None` when the disk has no such partition, or a
-/// table that is not whole.
-pub fn system<C: Channel, S: Scratch>(
+/// What the boot disk's GPT says: the disk GUID its checked header names, and its
+/// `moruna-system` partition as a window of its blocks, when it has one its entries hold whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Table {
+    /// The header's disk GUID.
+    pub guid: moruna_disk::Guid,
+    /// The `moruna-system` partition.
+    pub system: Option<moruna_disk::Slice>,
+}
+
+/// The GPT of `disk`, the boot disk: the primary header at block 1, checked, and the entries it
+/// names, read a page at a time into the scratch page and checked (`moruna_disk`). `None` when
+/// the disk has no header GPT checks.
+pub fn boot_table<C: Channel, S: Scratch>(
     device: &mut Storvsc<C>,
     scratch: &S,
     disk: &Disk,
-) -> Result<Option<moruna_disk::Slice>, String> {
+) -> Result<Option<Table>, String> {
     let size = u64::from(disk.block_size());
     if size > PAGE_BYTES || disk.blocks() < 2 {
         return Ok(None);
@@ -200,7 +210,25 @@ pub fn system<C: Channel, S: Scratch>(
     let Some(header) = read_page(device, scratch, disk, 1, 1)? else {
         return Ok(None);
     };
-    let Some(entries) = moruna_disk::entries(&header) else {
+    let Some(guid) = moruna_disk::disk_guid(&header) else {
+        return Ok(None);
+    };
+    Ok(Some(Table {
+        guid,
+        system: system(device, scratch, disk, &header)?,
+    }))
+}
+
+/// The `moruna-system` partition the checked header `header` of `disk` names, as a window of
+/// its blocks: `None` when its entries are not whole and checked, or none is it.
+fn system<C: Channel, S: Scratch>(
+    device: &mut Storvsc<C>,
+    scratch: &S,
+    disk: &Disk,
+    header: &[u8],
+) -> Result<Option<moruna_disk::Slice>, String> {
+    let size = u64::from(disk.block_size());
+    let Some(entries) = moruna_disk::entries(header) else {
         return Ok(None);
     };
     let per_page = PAGE_BYTES / size;

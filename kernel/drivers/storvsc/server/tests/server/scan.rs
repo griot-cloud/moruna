@@ -294,22 +294,29 @@ fn the_boot_disks_system_partition_is_found_in_its_checked_gpt() {
     }
     let page = Page(host.clone());
     let (mut device, scan) = scanned(link, &host);
+    let window = moruna_disk::Slice {
+        first: 100,
+        sectors: 64,
+    };
     assert_eq!(
-        scan::system(&mut device, &page, &scan.disks[0]).unwrap(),
-        Some(moruna_disk::Slice {
-            first: 100,
-            sectors: 64
+        scan::boot_table(&mut device, &page, &scan.disks[0]).unwrap(),
+        Some(scan::Table {
+            guid: moruna_disk::Guid([0x42; 16]),
+            system: Some(window),
         })
     );
     assert_eq!(
-        scan::system(&mut device, &page, &scan.disks[1]).unwrap(),
+        scan::boot_table(&mut device, &page, &scan.disks[1]).unwrap(),
         None,
         "no partition table"
     );
     assert_eq!(
-        scan::system(&mut device, &page, &scan.disks[2]).unwrap(),
-        None,
-        "entries that fail their CRC"
+        scan::boot_table(&mut device, &page, &scan.disks[2]).unwrap(),
+        Some(scan::Table {
+            guid: moruna_disk::Guid([0x42; 16]),
+            system: None,
+        }),
+        "entries that fail their CRC hold no partition"
     );
     // A boot disk whose system partition reaches past its end has none.
     let (link, host) = controller(&[(0, 512, 4096)]);
@@ -319,8 +326,53 @@ fn the_boot_disks_system_partition_is_found_in_its_checked_gpt() {
     );
     let page = Page(host.clone());
     let (mut device, scan) = scanned(link, &host);
-    assert_eq!(
-        scan::system(&mut device, &page, &scan.disks[0]).unwrap(),
-        None
+    let table = scan::boot_table(&mut device, &page, &scan.disks[0])
+        .unwrap()
+        .unwrap();
+    assert_eq!(table.system, None);
+}
+
+#[test]
+fn the_system_partition_is_served_only_on_a_disk_with_the_images_guid() {
+    use moruna_storvsc_server::boot_system;
+    let image = moruna_disk::Guid([0x42; 16]);
+    let window = moruna_disk::Slice {
+        first: 100,
+        sectors: 64,
+    };
+    let table = scan::Table {
+        guid: image,
+        system: Some(window),
+    };
+    let (served, said) = boot_system(Some(&table), Some(&image));
+    assert_eq!(served, Some(window));
+    assert!(
+        said.contains("64 blocks from block 100: system, read-only"),
+        "{said}"
     );
+    // Microsoft's rule and another GUID: no system partition, and the line says why.
+    let other = scan::Table {
+        guid: moruna_disk::Guid([0x24; 16]),
+        ..table
+    };
+    let (served, said) = boot_system(Some(&other), Some(&image));
+    assert_eq!(served, None);
+    assert!(said.contains("is not the image's"), "{said}");
+    assert!(
+        said.contains("served read-only as boot, with no system partition"),
+        "{said}"
+    );
+    let (served, said) = boot_system(None, Some(&image));
+    assert_eq!(served, None);
+    assert!(said.contains("no GPT the image wrote"), "{said}");
+    let (served, said) = boot_system(Some(&table), None);
+    assert_eq!(served, None);
+    assert!(said.contains("no disk.guid was given"), "{said}");
+    let none = scan::Table {
+        system: None,
+        ..table
+    };
+    let (served, said) = boot_system(Some(&none), Some(&image));
+    assert_eq!(served, None);
+    assert!(said.contains("has no moruna-system partition"), "{said}");
 }

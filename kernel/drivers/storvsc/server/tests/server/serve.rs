@@ -537,8 +537,12 @@ fn the_system_partition_is_a_read_only_window_of_the_boot_disk() {
     }
     let page = Page(host.clone());
     let (mut device, scan) = scanned(link, &host);
-    let window = moruna_storvsc_server::scan::system(&mut device, &page, &scan.disks[0])
+    let table = moruna_storvsc_server::scan::boot_table(&mut device, &page, &scan.disks[0])
         .unwrap()
+        .unwrap();
+    let image = moruna_disk::Guid([0x42; 16]);
+    let window = moruna_storvsc_server::boot_system(Some(&table), Some(&image))
+        .0
         .unwrap();
     let mut served = plan_of(ROOT, &scan).served;
     let system = moruna_storvsc_server::system(&served[0], window);

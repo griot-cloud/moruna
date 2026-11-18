@@ -6,7 +6,8 @@
 # node.conf and network.conf with their actual parsers. Driver table data and driver images
 # are emitted by moruna-image. package.py writes disk.guid, the GPT disk GUID of the image's
 # own disk, which `devices` passes to its drivers so the boot disk is never a volume (system
-# design 3C, item 3.3).
+# design 3C, item 3.3); the supervisor holds it twice, as `disk.guid.storvsc` too, since no
+# slot of it is granted to two services, for `storvsc` to check Azure's OS disk by.
 moruna-image 1
 process node-supervisor
   handle console console
@@ -32,6 +33,7 @@ process node-supervisor
   handle data:node.conf config
   handle data:network.conf network.config
   handle data:disk.guid disk.guid
+  handle data:disk.guid disk.guid.storvsc
   driver 1af4:1042 virtio-blk block
   driver 1af4:1041 virtio-net net
   driver 1b36:0010 nvme nvme

@@ -238,6 +238,25 @@ impl Watch for Woken {
     }
 }
 
+/// The GUID of the image's own disk, from the boot payload's `disk.guid`, which the supervisor
+/// grants under `disk.guid` (a binding of its own, since a slot is granted to one service).
+fn image_guid(console: &Console) -> Option<moruna_disk::Guid> {
+    let handle = start::take("disk.guid")?;
+    let mut page = [0u8; PAGE as usize];
+    let read = Memory(handle)
+        .map(0, PAGE, map::READ)
+        .and_then(|m| m.read(0, &mut page));
+    if let Err(e) = read {
+        println!(console, "storvsc: reading disk.guid: {}", e.name());
+        return None;
+    }
+    let guid = moruna_disk::Guid::from_file(&page);
+    if guid.is_none() {
+        println!(console, "storvsc: disk.guid holds no GUID");
+    }
+    guid
+}
+
 fn take(name: &str) -> Result<Handle, String> {
     start::take(name).ok_or_else(|| format!("no start handle {name}"))
 }
@@ -294,26 +313,20 @@ fn serve(console: &Console) -> Result<(), String> {
         println!(console, "{}", line);
     }
     let mut served = plan.served;
-    // The boot disk's `moruna-system` partition, served as `system` (item 3.3).
+    // The boot disk's `moruna-system` partition, served as `system` when the disk is the one
+    // this image wrote (item 3.3).
     if let Some(boot) = served.iter().find(|s| s.name.boot).cloned() {
+        let image = image_guid(console);
         let device = &mut found[boot.controller].1;
-        match scan::system(device, &scratch, &boot.disk) {
-            Ok(Some(window)) => {
-                println!(
-                    console,
-                    "storvsc: the boot disk's {} partition, {} blocks from block {}: {}, read-only",
-                    moruna_disk::SYSTEM,
-                    window.sectors,
-                    window.first,
-                    moruna_disk::SYSTEM_SERIAL
-                );
-                served.push(moruna_storvsc_server::system(&boot, window));
+        match scan::boot_table(device, &scratch, &boot.disk) {
+            Ok(table) => {
+                let (window, line) =
+                    moruna_storvsc_server::boot_system(table.as_ref(), image.as_ref());
+                println!(console, "{}", line);
+                if let Some(window) = window {
+                    served.push(moruna_storvsc_server::system(&boot, window));
+                }
             }
-            Ok(None) => println!(
-                console,
-                "storvsc: the boot disk has no {} partition",
-                moruna_disk::SYSTEM
-            ),
             Err(e) => println!(console, "storvsc: the boot disk's partition table: {}", e),
         }
     }

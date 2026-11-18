@@ -133,6 +133,60 @@ pub fn plan(controllers: &[Controller<'_>]) -> Plan {
     plan
 }
 
+/// The boot disk's `moruna-system` partition, when the process serves it, and the console's
+/// line about it. Microsoft's rule names the OS disk; the image's GUID (`disk.guid`, which
+/// `package.py` gave the disk it wrote) proves it is the disk this image booted from. A disk that
+/// matches the rule and not the GUID, or has no table, or a node that gave no GUID, is still
+/// served read only as `boot`, and its partitions are not served.
+pub fn boot_system(
+    table: Option<&scan::Table>,
+    image: Option<&moruna_disk::Guid>,
+) -> (Option<moruna_disk::Slice>, String) {
+    let unchecked = "served read-only as boot, with no system partition";
+    let Some(image) = image else {
+        return (
+            None,
+            format!(
+                "storvsc: no disk.guid was given: the boot disk's GUID is not checked; {unchecked}"
+            ),
+        );
+    };
+    let Some(table) = table else {
+        return (
+            None,
+            format!("storvsc: the boot disk has no GPT the image wrote; {unchecked}"),
+        );
+    };
+    if table.guid != *image {
+        return (
+            None,
+            format!(
+                "storvsc: the boot disk's GPT disk GUID {} is not the image's {image}; {unchecked}",
+                table.guid
+            ),
+        );
+    }
+    match table.system {
+        Some(window) => (
+            Some(window),
+            format!(
+                "storvsc: the boot disk's {} partition, {} blocks from block {}: {}, read-only",
+                moruna_disk::SYSTEM,
+                window.sectors,
+                window.first,
+                moruna_disk::SYSTEM_SERIAL
+            ),
+        ),
+        None => (
+            None,
+            format!(
+                "storvsc: the boot disk has no {} partition",
+                moruna_disk::SYSTEM
+            ),
+        ),
+    }
+}
+
 /// The boot disk's `moruna-system` partition, `window` of its blocks, served as a disk of its
 /// own: `system`, read only, and, as the boot disk is, never a volume.
 pub fn system(boot: &Served, window: moruna_disk::Slice) -> Served {
