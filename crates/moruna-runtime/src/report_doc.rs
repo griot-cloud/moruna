@@ -29,8 +29,9 @@ use serde_json::{Map, Value, json};
 /// interface. 3 (0.7): a sink's `excluded_rows` is gone, with the peQL sink that set it; `io`
 /// gives each source's reads apart from its decodes and each sink's encodes apart from its
 /// writes, and a source's or a sink's task carries its own (`read_ms`, `decode_ms`, `encode_ms`,
-/// `write_ms`; a half done in the same call is absent).
-pub const SCHEMA_VERSION: &str = "3.0";
+/// `write_ms`; a half done in the same call is absent). 3.1 adds, to 3.0: `budget`, the job's
+/// whole memory budget (system design 3A, item 3.2c).
+pub const SCHEMA_VERSION: &str = "3.1";
 
 /// The public digest of a job document (0.6.6): `sha256:` and the hex of SHA-256 over its exact
 /// bytes, as Python's `JobSpec.digest()` computes it. The normalized execution fingerprint,
@@ -60,6 +61,10 @@ pub struct ReportContext {
     pub trace_path: Option<std::path::PathBuf>,
     /// The run's argument values, by name.
     pub args: Map<String, Value>,
+    /// The job's whole memory budget, in bytes: the document's `budget.memory_bytes`, or on a
+    /// node the node's job bound when the document names none (system design 3A). Node mode
+    /// runs the engine within the arena's share of it, which the job's own budget then says.
+    pub budget_bytes: Option<u64>,
     /// The ports each task calls, by its place in the job.
     pub task_ports: Vec<(usize, std::sync::Arc<moruna_kernel::StagePorts>)>,
     /// What identifies each task's code, by its place in the job ([`crate::job::Built::identities`]).
@@ -79,6 +84,7 @@ impl ReportContext {
             plan: None,
             trace_path: None,
             args: Map::new(),
+            budget_bytes: job.budget.memory_bytes,
             task_ports: built.task_ports.clone(),
             identities: built.identities.clone(),
             store: None,
@@ -217,6 +223,10 @@ pub fn document(
     if let Some(report) = report {
         object.insert("host".into(), host(report));
     }
+    object.insert(
+        "budget".into(),
+        json!({"memory_bytes": context.and_then(|c| c.budget_bytes)}),
+    );
     let plan = context.and_then(|c| c.plan.clone());
     object.insert(
         "plan_steps".into(),
@@ -1025,6 +1035,7 @@ mod tests {
             plan: None,
             trace_path: None,
             args: serde_json::Map::from_iter([("start".to_string(), json!("2026-11-01"))]),
+            budget_bytes: Some(10 << 30),
             task_ports: Vec::new(),
             identities: (0..5).map(|i| moruna_cost::Digest([10 + i; 32])).collect(),
             store: None,
@@ -1066,6 +1077,8 @@ mod tests {
                 .is_some_and(|p| p.contains('/'))
         );
         assert_eq!(value["host"]["memory_limit_bytes"], 8u64 << 30);
+        // The job's whole budget, beside the limit the run started with (3.1).
+        assert_eq!(value["budget"], json!({"memory_bytes": 10u64 << 30}));
         assert!(value.get("stages").is_none(), "tasks hold what stages did");
         assert!(value.get("moruna_report").is_none() && value.get("cpu_ns").is_none());
         assert_eq!(value["job_digest"], "sha256:ab");
@@ -1294,6 +1307,11 @@ mod tests {
         };
         let value = document(("ab", None), None, &exit, Some(&context()));
         assert_eq!(value["schema_version"], SCHEMA_VERSION);
+        assert_eq!(value["budget"]["memory_bytes"], 10u64 << 30);
+        assert_eq!(
+            document(("ab", None), None, &exit, None)["budget"],
+            json!({"memory_bytes": null})
+        );
         assert_eq!(value["exit"]["status"], "refused");
         assert_eq!(value["job_digest"], Value::Null);
         assert_eq!(value["tasks"][3]["status"], "skipped");

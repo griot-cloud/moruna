@@ -122,6 +122,9 @@ pub struct Wire {
     /// The job's secrets, by name, as the `spec` message gave them beside the document (system
     /// design 3B): taken when the job's object stores are built, and never written anywhere.
     secrets: Mutex<std::collections::BTreeMap<String, String>>,
+    /// In node mode, the job's whole memory budget, as node mode took it before carving the
+    /// engine's share from it: what the report says the job ran with (system design 3A).
+    budget: Mutex<Option<u64>>,
 }
 
 impl Wire {
@@ -136,7 +139,19 @@ impl Wire {
             frame: Mutex::new(Vec::new()),
             document_digest: Mutex::new(None),
             secrets: Mutex::new(std::collections::BTreeMap::new()),
+            budget: Mutex::new(None),
         })
+    }
+
+    /// Record the job's whole memory budget, in node mode, before the engine's share of it
+    /// replaces the document's.
+    pub fn set_budget(&self, bytes: Option<u64>) {
+        *self.budget.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
+    }
+
+    /// The job's whole memory budget, when node mode recorded one.
+    pub fn budget(&self) -> Option<u64> {
+        *self.budget.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Keep the job's secrets until its object stores are built.
@@ -548,9 +563,13 @@ fn serve_on(conn: Conn, node: Option<&Node>, kinds: &Registry, opts: &HostOption
                         match node {
                             Some(node) => {
                                 let mint = || crate::run::mint_run_id().ok().map(|id| id.to_hex());
+                                // The whole budget, the document's or the node's bound, before
+                                // node mode gives the job the arena's share of it.
+                                let whole = super::node::budget(&job, node);
                                 if let Err(refusal) = super::node::admit(&mut job, node, mint) {
                                     break refused_without_document(Some(&raw), &refusal, &wire);
                                 }
+                                wire.set_budget(whole);
                             }
                             None if job.report.socket.is_some() => wire.note(
                                 "report.socket is ignored under moruna serve: the peer that sent \
@@ -810,6 +829,8 @@ fn run_planned(
         plan: Some(plan.to_value()),
         trace_path: job.trace.as_deref().map(PathBuf::from),
         args: run_args.into_iter().collect(),
+        // On a node, the whole budget node mode took; elsewhere, the document's own.
+        budget_bytes: wire.budget().or(job.budget.memory_bytes),
         ..crate::report_doc::ReportContext::of(&job, &built)
     };
     // One task per stage: fused standard kernels are one group (MH 4.9).

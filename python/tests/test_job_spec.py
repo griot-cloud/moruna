@@ -415,7 +415,7 @@ def test_the_report(tasks, tmp_path: Path) -> None:
     assert by_key["kept"]["needs"]["store"]["calls"] > 0, "measured through the resolver's object"
     assert by_key["kept"]["needs"]["store"]["bytes_in"] > 0
     assert report.resources["cpu_core_s"] >= 0 and report.resources["peak_memory_bytes"] > 0
-    assert report.schema_version == "3.0" and report.moruna == moruna.__version__
+    assert report.schema_version == "3.1" and report.moruna == moruna.__version__
     assert "stages" not in report.to_dict()
     sinks = {s["task"]: s for s in report.sinks}
     assert sinks["kept"]["snapshot_id"] == str(41 + len(store))

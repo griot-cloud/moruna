@@ -6,10 +6,15 @@
 
 A report is one JSON document with one canonical form. `report.bytes()` is that document as UTF-8 JSON with its keys sorted at every level and no whitespace between tokens, so the same report always gives the same bytes; `report.digest()` is `"sha256:"` and the hex of SHA-256 over exactly those bytes; `report.to_json()` is the same text, and `moruna.RunReport.from_bytes(data)` reads the bytes (or a file of them) back, refusing bytes that are not a report in that form with `ValueError`. A host that forwards the bytes unchanged can certify them by that digest, beside the spec's. `moruna.run(..., spec_to=target)` writes them through its writer after the run.
 
+Schema `3.1` adds, to `3.0`:
+
+- `budget`, the job's whole memory budget.
+
 | Attribute | Type | Meaning |
 | --- | --- | --- |
-| `schema_version`, `moruna` | `str`, `str` | The document's schema, `"MAJOR.MINOR"` (`"2.1"`; a reader refuses an unknown major), and the Moruna that wrote it. |
+| `schema_version`, `moruna` | `str`, `str` | The document's schema, `"MAJOR.MINOR"` (`"3.1"`; a reader refuses an unknown major), and the Moruna that wrote it. |
 | `host`, `args` | `dict`, `dict` | Where it ran (platform, CPUs, memory limit, CPU quota, devices) and the run's argument values. |
+| `budget` | `dict` | `memory_bytes`, the job's whole memory budget: the spec's, or on a node the node's job bound when the spec names none; `None` when there is none. |
 | `run_id` | `str` | The run's id, 32 hex characters. |
 | `job_digest` | `str \| None` | The spec's public digest, SHA-256 of its exact bytes (`JobSpec.digest()`), the same from `moruna.run` and `moruna run`; `None` for a job that holds a task a spec cannot hold. |
 | `execution_fingerprint` | `str \| None` | The normalized execution fingerprint the planner and recovery use. It differs from `job_digest` and is not a document identity; `None` for a run refused before its job was built. |

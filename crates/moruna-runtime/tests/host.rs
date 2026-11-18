@@ -211,7 +211,7 @@ fn ho_t5_file_run_equals_library_run() {
     spec.profiles_dir = Some(scratch.path().join("profiles"));
     let direct = Runtime::run(spec, CancelToken::new()).expect("the library run");
     let direct = serde_json::to_value(&direct).expect("json");
-    assert_eq!(from_file["schema_version"], "3.0");
+    assert_eq!(from_file["schema_version"], "3.1");
     assert_eq!(document_projection(&from_file), trace_projection(&direct));
     assert_eq!(read_back_rows(&out2), rows);
 }
@@ -838,7 +838,7 @@ fn ho_t13_report_file_placement() {
         .join(format!("moruna-{RUN_ID}.report.json"));
     assert_eq!(outcome.report_file.as_deref(), Some(expected.as_path()));
     let on_disk = read_report_file(&expected).expect("the default report file");
-    assert_eq!(on_disk["schema_version"], "3.0");
+    assert_eq!(on_disk["schema_version"], "3.1");
     assert!(
         outcome
             .notes
