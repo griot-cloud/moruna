@@ -8,7 +8,7 @@ pub mod signer;
 
 use moruna_api::{Cloud, Executor, ExecutorKind, NodeHealth};
 use moruna_api_server::{
-    Clock, Config, Identity, NodeFacts, Server, TokenKey, Transport, TransportError,
+    Clock, Config, FunctionKey, Identity, NodeFacts, Server, TokenKey, Transport, TransportError,
 };
 use ring::digest;
 use rustls::{
@@ -397,6 +397,7 @@ impl Harness {
                 identity,
                 facts: facts(),
                 token_keys,
+                function_keys: vec![FunctionKey::new(signer.public())],
             },
             clock.clone(),
             Box::new(engine.clone()),
@@ -422,6 +423,7 @@ impl Harness {
                 identity,
                 facts: facts(),
                 token_keys: vec![TokenKey::new(harness.signer.public())],
+                function_keys: vec![FunctionKey::new(harness.signer.public())],
             },
             harness.clock.clone(),
         )

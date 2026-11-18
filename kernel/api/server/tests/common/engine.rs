@@ -6,7 +6,7 @@
 //! and when. The crate's unit tests and its end-to-end tests both use it.
 
 use moruna_api::Refusal;
-use moruna_api_server::{EngineHost, HostError};
+use moruna_api_server::{Checked, EngineHost, HostError};
 use moruna_event::{Encoder, Event, LogStream, Stamp};
 use std::{
     cell::RefCell,
@@ -30,6 +30,9 @@ pub struct State {
     pub checked_names: Vec<Vec<String>>,
     /// The verdicts the next checks give, in order; a check with none finds the document sound.
     pub verdicts: VecDeque<Result<Vec<Refusal>, HostError>>,
+    /// The functions the next checks answer the job uses (its `needs.functions`), in order; a
+    /// check with none answers none.
+    pub functions: VecDeque<Vec<String>>,
     /// While set, a check under way gives no verdict.
     pub hold_checks: bool,
     checking: bool,
@@ -168,13 +171,18 @@ impl EngineHost for Engine {
         Ok(())
     }
 
-    fn checked(&mut self) -> Option<Result<Vec<Refusal>, HostError>> {
+    fn checked(&mut self) -> Option<Result<Checked, HostError>> {
         let mut state = self.0.borrow_mut();
         if !state.checking || state.hold_checks {
             return None;
         }
         state.checking = false;
-        Some(state.verdicts.pop_front().unwrap_or(Ok(Vec::new())))
+        let functions = state.functions.pop_front().unwrap_or_default();
+        let verdict = state.verdicts.pop_front().unwrap_or(Ok(Vec::new()));
+        Some(verdict.map(|refusals| Checked {
+            refusals,
+            functions,
+        }))
     }
 
     fn start(&mut self, spec: &[u8]) -> Result<(), HostError> {

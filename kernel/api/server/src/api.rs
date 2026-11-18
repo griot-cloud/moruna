@@ -6,6 +6,7 @@ use crate::{
     audit::{AUDIT_ANSWER_LIMIT, AuditLog},
     body::{Body, Text},
     engine::EngineHost,
+    functions::{FunctionKey, Registry},
     http::{Authorization, Request},
     jobs::{Jobs, Stream},
     mcp::{self, MCP_PATH},
@@ -98,6 +99,11 @@ pub(crate) fn error_body(code: ErrorCode, message: &str) -> Vec<u8> {
     serde_json::to_vec(&ErrorBody::new(code, message)).unwrap_or_default()
 }
 
+/// The path that ends `api` in a `cloud-test` image (work item 2.2c), with feature `test-exit`
+/// only: any method, no token. A release build has no such route.
+#[cfg(feature = "test-exit")]
+pub const TEST_EXIT_PATH: &str = "/v1/test/exit";
+
 /// What the head of a request decides.
 #[derive(Debug)]
 pub(crate) enum Admission {
@@ -157,16 +163,20 @@ struct Pending {
 }
 
 /// The operations' state: what the node says about itself, the keys its tokens are checked
-/// against, the audit record, the jobs, and the engine's host.
+/// against, the audit record, the jobs, the registered functions, and the engine's host.
 pub(crate) struct Api {
     pub facts: NodeFacts,
     verifier: Verifier,
     audit: AuditLog,
     jobs: Jobs,
+    functions: Registry,
     host: Box<dyn EngineHost>,
     /// The calls whose answers come later, by ticket, and the answers that have come.
     pending: BTreeMap<u64, Pending>,
     ready: BTreeMap<u64, Answer>,
+    /// A request to [`TEST_EXIT_PATH`] has come.
+    #[cfg(feature = "test-exit")]
+    pub exit: bool,
 }
 
 impl core::fmt::Debug for Api {
@@ -184,15 +194,23 @@ fn from_of(query: &str) -> Option<u64> {
 }
 
 impl Api {
-    pub(crate) fn new(facts: NodeFacts, keys: Vec<TokenKey>, host: Box<dyn EngineHost>) -> Self {
+    pub(crate) fn new(
+        facts: NodeFacts,
+        keys: Vec<TokenKey>,
+        function_keys: Vec<FunctionKey>,
+        host: Box<dyn EngineHost>,
+    ) -> Self {
         Self {
             facts,
             verifier: Verifier::new(keys),
             audit: AuditLog::default(),
             jobs: Jobs::default(),
+            functions: Registry::new(function_keys),
             host,
             pending: BTreeMap::new(),
             ready: BTreeMap::new(),
+            #[cfg(feature = "test-exit")]
+            exit: false,
         }
     }
 
@@ -204,6 +222,14 @@ impl Api {
     /// only for an operation that takes one, and a submit is `busy` on its head while a job
     /// runs. Each call of an operation but `health` is recorded.
     pub(crate) fn admit(&mut self, request: &Request, body: usize, now: u64) -> Admission {
+        // `cloud-test` only: the caller ends once this answer is on its way.
+        #[cfg(feature = "test-exit")]
+        if request.path == TEST_EXIT_PATH {
+            self.exit = true;
+            let mut answer = Answer::ok(Ok(br#"{"status":"exiting"}"#.to_vec()));
+            answer.close = true;
+            return Admission::Now(Outcome::Answer(answer));
+        }
         if request.path == MCP_PATH {
             return self.admit_mcp(request, now);
         }
@@ -271,7 +297,7 @@ impl Api {
             Takes::Job if operation.response == Response::Submitted && self.jobs.busy() => {
                 refuse(self, grant.as_ref(), ErrorCode::Busy, "a job is running")
             }
-            Takes::Job => Admission::Body(Call::Operation(operation, grant)),
+            Takes::Job | Takes::Function => Admission::Body(Call::Operation(operation, grant)),
         }
     }
 
@@ -346,6 +372,8 @@ impl Api {
                 Answer::ok(serde_json::to_vec(&self.audit.audit(AUDIT_ANSWER_LIMIT)))
             }
             Response::Jobs => Answer::ok(serde_json::to_vec(&self.jobs.list())),
+            Response::Function => self.functions.register(inputs.body, now),
+            Response::Functions => Answer::ok(serde_json::to_vec(&self.functions.list())),
             Response::JobStatus if operation.method == Method::Post => {
                 self.jobs.cancel(self.host.as_mut(), id)
             }
@@ -397,7 +425,7 @@ impl Api {
     /// Moves the jobs as far as they go now: the engine's messages and the checks. An answer
     /// that has come is recorded, and kept for the call that waits for it.
     pub(crate) fn pump(&mut self, now: u64) {
-        self.jobs.pump(self.host.as_mut(), now);
+        self.jobs.pump(self.host.as_mut(), &self.functions, now);
         for (ticket, answer) in self.jobs.resolved() {
             let Some(pending) = self.pending.remove(&ticket) else {
                 continue;

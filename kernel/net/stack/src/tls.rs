@@ -543,6 +543,9 @@ impl<C: Connection> State<C> {
             let status = self.conn.records(&mut self.incoming);
             let mut discard = status.discard;
             let mut wait = false;
+            // Waiting only because the caller has not read what is decrypted: the records
+            // behind it, a close_notify among them, are still to come.
+            let mut held_back = false;
             match status.state.map_err(|_| Error::Protocol)? {
                 ConnectionState::EncodeTlsData(mut encode) => {
                     self.outgoing.resize(self.limit)?;
@@ -556,6 +559,7 @@ impl<C: Connection> State<C> {
                     while let Some(size) = read.peek_len() {
                         if self.plain_in.len() + size.get() > self.limit {
                             wait = true;
+                            held_back = true;
                             break;
                         }
                         let record = read
@@ -609,7 +613,10 @@ impl<C: Connection> State<C> {
                 socket.close();
             }
             if wait {
-                if !socket.may_recv() && !self.peer_closed {
+                // The peer's FIN with no close_notify before it is a truncated stream, but only
+                // once every record it sent has been read: while some wait behind a full buffer,
+                // the close_notify may be among them.
+                if !socket.may_recv() && !self.peer_closed && !held_back {
                     return Err(Error::Protocol);
                 }
                 if socket.can_recv()

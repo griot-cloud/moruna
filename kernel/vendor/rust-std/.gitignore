@@ -1,0 +1,4 @@
+# Rust's library/ as the toolchain's rust-src ships it: a `target` or `build` directory in it
+# is source (cc's target tables, object's ELF builder), not a build output.
+!target/
+!build/

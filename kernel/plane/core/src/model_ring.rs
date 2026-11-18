@@ -174,7 +174,15 @@ pub enum Behave {
     /// Answers each batch with this many records, each the record it was given in a window of
     /// its own, then releases the batch.
     Split(u8),
+    /// An aggregate of this many batches: releases each with no record, then, holding none,
+    /// posts the last record it was given answering no input (cookie [`NO_INPUT`]), as a
+    /// function's end does.
+    Aggregate(u8),
 }
+
+/// The cookie of a record answering no input: moruna-function's, for what a function writes
+/// holding no batch.
+pub const NO_INPUT: u64 = u64::MAX;
 
 /// A task of the model that speaks the ring protocol.
 pub struct RingTaskModel {
@@ -419,8 +427,8 @@ impl RingTaskModel {
             let Some(ring) = self.ring.as_mut() else {
                 return did;
             };
-            let (entry, out) = match self.pending.take() {
-                Some(p) => p,
+            let (mut entry, out, fresh) = match self.pending.take() {
+                Some((e, out)) => (e, out, false),
                 None => match ring.next(&view) {
                     Err(_) => {
                         self.end(Ending::Faulted);
@@ -458,12 +466,25 @@ impl RingTaskModel {
                             Behave::Garbage => vec![0x5a; record.len()],
                             _ => record,
                         };
-                        (e, out)
+                        (e, out, true)
                     }
                 },
             };
             did = true;
             let ring = self.ring.as_mut().expect("attached");
+            if let (Behave::Aggregate(n), true) = (self.behave, fresh) {
+                // Released with no record; the last batch's record then answers none.
+                ring.release(&view);
+                if ring.ring(&view) {
+                    self.engine_wakes += 1;
+                }
+                self.parts += 1;
+                if self.parts < n {
+                    continue;
+                }
+                self.parts = 0;
+                entry.cookie = NO_INPUT;
+            }
             let w = match ring.window(&view) {
                 Ok(Some(w)) => w,
                 Ok(None) => {
@@ -520,7 +541,9 @@ impl RingTaskModel {
                 }
                 self.parts = 0;
             }
-            ring.release(&view);
+            if !matches!(self.behave, Behave::Aggregate(_)) {
+                ring.release(&view);
+            }
             // The engine's bell: a wake only when it sleeps on it. A task that waits on port
             // 0 rings it too; the engine answers its waits there.
             if ring.ring(&view) {

@@ -28,6 +28,7 @@ fn api(signer: &Signer) -> Api {
             health: NodeHealth::Ok,
         },
         vec![TokenKey::new(signer.public())],
+        vec![crate::FunctionKey::new(signer.public())],
         alloc::boxed::Box::new(crate::NoEngine),
     )
 }
@@ -361,6 +362,7 @@ fn api_with_job(signer: &Signer, records: usize, ended: bool) -> (Api, String) {
     let mut api = Api::new(
         api(signer).facts.clone(),
         vec![TokenKey::new(signer.public())],
+        Vec::new(),
         alloc::boxed::Box::new(engine.clone()),
     );
     let submit = signer.token("i-1", NOW + 60, &["submit"]);

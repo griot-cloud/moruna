@@ -1,0 +1,30 @@
+HTTP/1.1 200 OK
+Content-Type: text/xml; charset=utf-8
+Date: Tue, 17 Nov 2026 09:30:03 GMT
+Content-Length: 1379
+
+<?xml version="1.0" encoding="utf-8"?>
+<GoalState xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="goalstate10.xsd">
+  <Version>2012-11-30</Version>
+  <Incarnation>1</Incarnation>
+  <Machine>
+    <ExpectedState>Started</ExpectedState>
+    <StopRolesDeadlineHint>300000</StopRolesDeadlineHint>
+    <ExpectHealthReport>FALSE</ExpectHealthReport>
+  </Machine>
+  <Container>
+    <ContainerId>0d3f6c58-1b2e-4c8a-9f61-2a7e5b9c4d10</ContainerId>
+    <RoleInstanceList>
+      <RoleInstance>
+        <InstanceId>a41f2c7e-93b5-4d0a-8e6c-1f7b2d9e3c58._moruna-node-1</InstanceId>
+        <State>Started</State>
+        <Configuration>
+          <HostingEnvironmentConfig>http://168.63.129.16:80/machine/0d3f6c58-1b2e-4c8a-9f61-2a7e5b9c4d10/a41f2c7e%2D93b5%2D4d0a%2D8e6c%2D1f7b2d9e3c58.%5Fmoruna%2Dnode%2D1?comp=config&amp;type=hostingEnvironmentConfig&amp;incarnation=1</HostingEnvironmentConfig>
+          <SharedConfig>http://168.63.129.16:80/machine/0d3f6c58-1b2e-4c8a-9f61-2a7e5b9c4d10/a41f2c7e%2D93b5%2D4d0a%2D8e6c%2D1f7b2d9e3c58.%5Fmoruna%2Dnode%2D1?comp=config&amp;type=sharedConfig&amp;incarnation=1</SharedConfig>
+          <ConfigName>a41f2c7e-93b5-4d0a-8e6c-1f7b2d9e3c58.0.a41f2c7e-93b5-4d0a-8e6c-1f7b2d9e3c58.1.moruna-node-1.1.xml</ConfigName>
+        </Configuration>
+      </RoleInstance>
+    </RoleInstanceList>
+  </Container>
+</GoalState>
+

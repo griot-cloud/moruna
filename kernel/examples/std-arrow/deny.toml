@@ -1,0 +1,46 @@
+# Supply-chain policy for item 5.0's proof program, its own Cargo workspace: the root
+# deny.toml's rules (licences, one arrow, crates.io only). Its target,
+# kernel/targets/x86_64-moruna.json, is not one cargo-deny knows; x86_64-unknown-none stands for
+# it: x86_64, neither unix nor windows nor wasm, so the graph is the one the build compiles.
+#
+#   cargo deny --manifest-path kernel/examples/std-arrow/Cargo.toml check
+#
+# The std it is built with is Rust's library/ (kernel/vendor/rust-std), outside this graph.
+
+[graph]
+all-features = true
+targets = ["x86_64-unknown-none"]
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
+[licenses]
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[[bans.deny]]
+crate = "arrow"
+deny-multiple-versions = true
+
+[[bans.deny]]
+crate = "arrow-array"
+deny-multiple-versions = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

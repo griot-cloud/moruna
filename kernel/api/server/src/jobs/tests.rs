@@ -43,7 +43,7 @@ fn sent(jobs: &Jobs, stream: &mut Stream) -> (String, bool) {
 fn running(jobs: &mut Jobs, engine: &mut Engine, job: &str) {
     let ticket = jobs.submit(engine, job.as_bytes(), NOW).unwrap();
     engine.attempt_started();
-    jobs.pump(engine, NOW);
+    jobs.pump(engine, &Registry::default(), NOW);
     let answer = resolved(jobs, ticket);
     assert_eq!(answer.status, 201);
     assert_eq!(body(&answer), json!({ "id": RUN }));
@@ -60,10 +60,10 @@ fn a_job_goes_from_spec_to_exit() {
     );
     assert!(jobs.busy());
     // Until the engine tells the run's ID, the submit waits and the node lists no job.
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     assert!(jobs.resolved().is_empty() && jobs.list().jobs.is_empty());
     engine.attempt_started();
-    jobs.pump(&mut engine, NOW + 1);
+    jobs.pump(&mut engine, &Registry::default(), NOW + 1);
     assert_eq!(body(&resolved(&mut jobs, ticket)), json!({ "id": RUN }));
     let status = jobs.status(RUN).unwrap();
     assert_eq!(
@@ -73,7 +73,7 @@ fn a_job_goes_from_spec_to_exit() {
     // The first heartbeat says it runs.
     engine.heartbeat(100);
     engine.log("source", "made 100 rows");
-    jobs.pump(&mut engine, NOW + 2);
+    jobs.pump(&mut engine, &Registry::default(), NOW + 2);
     let status = jobs.status(RUN).unwrap();
     assert_eq!(
         (status.state, status.started),
@@ -88,7 +88,7 @@ fn a_job_goes_from_spec_to_exit() {
     assert_eq!(jobs.report(RUN).status, 409, "not before it has ended");
     engine.heartbeat(1000);
     engine.finish(r#"{"rows_out": 1000, "exit": {"code": 0}}"#, 0, None);
-    jobs.pump(&mut engine, NOW + 9);
+    jobs.pump(&mut engine, &Registry::default(), NOW + 9);
     assert!(!jobs.busy());
     let status = jobs.status(RUN).unwrap();
     assert_eq!(
@@ -121,9 +121,9 @@ fn a_version_2_document_goes_to_the_engine_as_its_base64() {
     let mut checks = Jobs::default();
     checks.validate(br#"{"v2":"TUpCMg=="}"#).unwrap();
     checks.validate(V1.as_bytes()).unwrap();
-    checks.pump(&mut engine, NOW);
-    checks.pump(&mut engine, NOW);
-    checks.pump(&mut engine, NOW);
+    checks.pump(&mut engine, &Registry::default(), NOW);
+    checks.pump(&mut engine, &Registry::default(), NOW);
+    checks.pump(&mut engine, &Registry::default(), NOW);
     let checked = engine.0.borrow().checked.clone();
     assert_eq!(checked[0], b"MJB2");
     assert!(checked[1].starts_with(br#"{"moruna_spec":1,"#));
@@ -170,7 +170,7 @@ fn the_engine_refusal_answers_the_submit_and_leaves_no_job() {
         2,
         Some("source.kind: no source kind is named `rows`"),
     );
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     let answer = resolved(&mut jobs, ticket);
     assert_eq!(answer.status, 400);
     assert_eq!(
@@ -182,7 +182,7 @@ fn the_engine_refusal_answers_the_submit_and_leaves_no_job() {
     // Any other end before the job began is the node's failure.
     let ticket = jobs.submit(&mut engine, V1.as_bytes(), NOW).unwrap();
     engine.exit(3, Some("the budget does not fit"));
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     let answer = resolved(&mut jobs, ticket);
     assert_eq!(answer.status, 500);
     assert!(
@@ -193,7 +193,7 @@ fn the_engine_refusal_answers_the_submit_and_leaves_no_job() {
     );
     let ticket = jobs.submit(&mut engine, V1.as_bytes(), NOW).unwrap();
     engine.0.borrow_mut().ended = true;
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     assert_eq!(resolved(&mut jobs, ticket).status, 500);
     assert!(!jobs.busy());
 }
@@ -209,7 +209,7 @@ fn a_submit_while_a_job_runs_is_busy_and_the_host_can_refuse_one() {
     );
     assert_eq!(engine.0.borrow().started.len(), 1);
     engine.exit(0, None);
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     for (refusal, status) in [
         (
             HostError::Refused("the budget is past what the node gives a job".into()),
@@ -236,7 +236,7 @@ fn cancel_tells_the_engine_and_a_cancelled_job_says_so() {
     assert_eq!(body(&answer)["state"], "starting", "the job as it stands");
     assert_eq!(engine.0.borrow().sent, ["{\"type\":\"cancel\"}\n"]);
     engine.exit(130, Some("cancelled"));
-    jobs.pump(&mut engine, NOW + 3);
+    jobs.pump(&mut engine, &Registry::default(), NOW + 3);
     let status = jobs.status(RUN).unwrap();
     assert_eq!(
         (status.state, status.exit_code),
@@ -258,7 +258,7 @@ fn a_job_ends_failed_on_any_other_code_or_when_the_engine_is_lost() {
     let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
     running(&mut jobs, &mut engine, V1);
     engine.exit(4, Some("kernel error"));
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     let status = jobs.status(RUN).unwrap();
     assert_eq!(
         (status.state, status.exit_code),
@@ -268,7 +268,7 @@ fn a_job_ends_failed_on_any_other_code_or_when_the_engine_is_lost() {
     engine.run_as("11111111111111111111111111111111");
     running_as(&mut jobs, &mut engine, "11111111111111111111111111111111");
     engine.0.borrow_mut().ended = true;
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     let status = jobs.status("11111111111111111111111111111111").unwrap();
     assert_eq!((status.state, status.exit_code), (JobState::Failed, None));
     // Bytes that are not the protocol's.
@@ -276,7 +276,7 @@ fn a_job_ends_failed_on_any_other_code_or_when_the_engine_is_lost() {
     running_as(&mut jobs, &mut engine, "22222222222222222222222222222222");
     engine.bytes(&[0, 1, 0, 0, 0]);
     engine.heartbeat(5);
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     let status = jobs.status("22222222222222222222222222222222").unwrap();
     assert_eq!(status.state, JobState::Failed);
     assert!(status.heartbeat.is_none() && !jobs.busy());
@@ -287,7 +287,7 @@ fn a_job_ends_failed_on_any_other_code_or_when_the_engine_is_lost() {
 fn running_as(jobs: &mut Jobs, engine: &mut Engine, run: &str) {
     let ticket = jobs.submit(engine, V1.as_bytes(), NOW).unwrap();
     engine.attempt_started();
-    jobs.pump(engine, NOW);
+    jobs.pump(engine, &Registry::default(), NOW);
     assert_eq!(body(&resolved(jobs, ticket)), json!({ "id": run }));
 }
 
@@ -300,16 +300,16 @@ fn what_the_engine_says_before_the_run_id_is_kept_for_the_job() {
     engine.say("not json");
     engine.say(r#"{"type":"limits_changed","reason":"memory"}"#);
     engine.bytes(b"\xff\xfe\n");
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     assert!(jobs.resolved().is_empty());
     engine.attempt_started();
-    jobs.pump(&mut engine, NOW + 1);
+    jobs.pump(&mut engine, &Registry::default(), NOW + 1);
     assert_eq!(resolved(&mut jobs, ticket).status, 201);
     let status = jobs.status(RUN).unwrap();
     assert_eq!(status.state, JobState::Running);
     assert_eq!(status.heartbeat.unwrap().rows_out, 7);
     engine.exit(0, None);
-    jobs.pump(&mut engine, NOW + 2);
+    jobs.pump(&mut engine, &Registry::default(), NOW + 2);
     assert_eq!(jobs.report(RUN).body.bytes(), br#"{"early":true}"#);
 }
 
@@ -328,12 +328,12 @@ fn checks_run_one_at_a_time_in_order() {
     let first = jobs.validate(V1.as_bytes()).unwrap();
     let second = jobs.validate(br#"{"v1":{"n":2}}"#).unwrap();
     let third = jobs.validate(br#"{"v1":{"n":3}}"#).unwrap();
-    jobs.pump(&mut engine, NOW);
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     assert_eq!(engine.0.borrow().checked.len(), 1, "one at a time");
     assert!(jobs.resolved().is_empty());
     engine.0.borrow_mut().hold_checks = false;
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     let answer = resolved(&mut jobs, first);
     assert_eq!(answer.status, 200);
     assert_eq!(
@@ -341,16 +341,16 @@ fn checks_run_one_at_a_time_in_order() {
         json!({ "ok": false, "refusals": [{ "field": "source.kind",
                                              "message": "no source kind is named `rows`" }] })
     );
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     assert_eq!(body(&resolved(&mut jobs, second)), json!({ "ok": true }));
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     assert_eq!(resolved(&mut jobs, third).status, 500);
     assert_eq!(engine.0.borrow().checked[1], br#"{"n":2}"#);
     // A check also runs while a job does.
     running(&mut jobs, &mut engine, V1);
     let beside = jobs.validate(V1.as_bytes()).unwrap();
-    jobs.pump(&mut engine, NOW);
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     assert_eq!(body(&resolved(&mut jobs, beside)), json!({ "ok": true }));
 }
 
@@ -361,17 +361,17 @@ fn an_answer_nobody_waits_for_is_let_go() {
     let first = jobs.validate(V1.as_bytes()).unwrap();
     let second = jobs.validate(V1.as_bytes()).unwrap();
     let third = jobs.validate(V1.as_bytes()).unwrap();
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     // The one being checked, and one still waiting.
     jobs.abandon(first);
     jobs.abandon(second);
     engine.0.borrow_mut().hold_checks = false;
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     assert!(
         jobs.resolved().is_empty(),
         "the first verdict is not wanted"
     );
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     assert_eq!(resolved(&mut jobs, third).status, 200);
     assert_eq!(
         engine.0.borrow().checked.len(),
@@ -380,14 +380,14 @@ fn an_answer_nobody_waits_for_is_let_go() {
     );
     // An answer that had come, and a submit's.
     let late = jobs.validate(V1.as_bytes()).unwrap();
-    jobs.pump(&mut engine, NOW);
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     jobs.abandon(late);
     assert!(jobs.resolved().is_empty());
     let submit = jobs.submit(&mut engine, V1.as_bytes(), NOW).unwrap();
     jobs.abandon(submit);
     engine.attempt_started();
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     assert!(jobs.resolved().is_empty());
     assert_eq!(
         jobs.status(RUN).unwrap().state,
@@ -399,7 +399,7 @@ fn an_answer_nobody_waits_for_is_let_go() {
     let ticket = Jobs::default().validate(V1.as_bytes()).map(|ticket| {
         let mut jobs = Jobs::default();
         let waiting = jobs.validate(V1.as_bytes()).unwrap();
-        jobs.pump(&mut none, NOW);
+        jobs.pump(&mut none, &Registry::default(), NOW);
         (ticket, resolved(&mut jobs, waiting).status)
     });
     assert_eq!(ticket.unwrap().1, 503);
@@ -410,7 +410,7 @@ fn a_stream_sends_records_heartbeats_then_the_report_and_the_exit() {
     let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
     running(&mut jobs, &mut engine, V1);
     engine.log("source", "one");
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     let mut stream = jobs.stream(RUN, None).unwrap();
     let (text, ended) = sent(&jobs, &mut stream);
     assert!(!ended);
@@ -430,7 +430,7 @@ fn a_stream_sends_records_heartbeats_then_the_report_and_the_exit() {
     engine.heartbeat(10);
     engine.heartbeat(20);
     engine.log("source", "two");
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     let (text, _) = sent(&jobs, &mut stream);
     let events: Vec<&str> = text.split("\n\n").filter(|e| !e.is_empty()).collect();
     assert_eq!(
@@ -443,7 +443,7 @@ fn a_stream_sends_records_heartbeats_then_the_report_and_the_exit() {
     assert!(events[1].contains("\"rows_out\":20"));
     // The end: the report, then the exit, and the stream is over.
     engine.finish(r#"{"rows_out":20}"#, 0, None);
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     let (text, ended) = sent(&jobs, &mut stream);
     assert!(ended);
     assert_eq!(
@@ -514,7 +514,7 @@ fn a_page_holds_the_records_after_from_then_the_end_and_where_to_go_on() {
     // until the next one comes: the job's latest is `jobs_get`'s.
     engine.heartbeat(10);
     engine.log("source", "two");
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     let second = page(&jobs, 1);
     assert_eq!(shape(&second), [record(2)]);
     assert_eq!(second["records"][0]["data"]["text"], "two");
@@ -522,7 +522,7 @@ fn a_page_holds_the_records_after_from_then_the_end_and_where_to_go_on() {
     // It ends: after the last record, the report and the exit, with no number; the page says
     // to go on from where it was, and polled again it says the same.
     engine.finish(r#"{"rows_out":20}"#, 0, None);
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     let end = page(&jobs, 2);
     assert_eq!(shape(&end), [named("report"), named("exit")]);
     assert_eq!(
@@ -570,7 +570,7 @@ fn a_page_holds_at_most_1_000_events_and_its_end_whole() {
     }
     // One line too long to read: the end will carry a note of it.
     engine.say(&"x".repeat(ENGINE_LINE_LIMIT + 1));
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     let first = page(&jobs, 0);
     let ids: Vec<u64> = shape(&first).iter().map(|event| event.1.unwrap()).collect();
     assert_eq!(ids, (1..=1_000).collect::<Vec<u64>>());
@@ -584,7 +584,7 @@ fn a_page_holds_at_most_1_000_events_and_its_end_whole() {
     assert_eq!(rest["records"][500]["data"]["skipped_lines"], 1);
     assert_eq!(rest["next"], 1_500);
     engine.finish("{}", 0, None);
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     // The end is three events: with 997 records it fits, with 998 it waits for the next page.
     let fits = shape(&page(&jobs, 503));
     assert_eq!(fits.len(), 1_000);
@@ -625,7 +625,7 @@ fn a_page_holds_at_most_1_mib_of_events_but_always_one() {
     }
     // A record whose JSON alone is over 1 MiB: each byte under 0x20 is written `\u00XX`.
     engine.log("source", &"\u{1}".repeat(200 * 1024));
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     let ids = |page: &Value| -> Vec<u64> {
         shape(page)
             .iter()
@@ -650,7 +650,7 @@ fn a_page_holds_at_most_1_mib_of_events_but_always_one() {
         0,
         None,
     );
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     assert_eq!(ids(&page(&jobs, 21)), [22]);
     let end = page(&jobs, 22);
     assert_eq!(shape(&end), [named("report"), named("exit")]);
@@ -666,7 +666,7 @@ fn a_page_passes_over_what_the_buffer_has_let_go() {
     let line = "x".repeat(512 * 1024);
     for _ in 0..40 {
         engine.log("source", &line);
-        jobs.pump(&mut engine, NOW);
+        jobs.pump(&mut engine, &Registry::default(), NOW);
     }
     // Followed from the start, the pages begin at the oldest record kept, and their numbers show
     // the gap. Records of 512 KiB come one to a page: two are over 1 MiB.
@@ -686,12 +686,12 @@ fn a_page_passes_over_what_the_buffer_has_let_go() {
     );
     // A job whose records have all gone gives the page its end alone.
     engine.finish("{}", 0, None);
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     engine.run_as("11111111111111111111111111111111");
     running_as(&mut jobs, &mut engine, "11111111111111111111111111111111");
     for _ in 0..40 {
         engine.log("source", &line);
-        jobs.pump(&mut engine, NOW);
+        jobs.pump(&mut engine, &Registry::default(), NOW);
     }
     assert_eq!(
         shape(&page(&jobs, 0)),
@@ -710,7 +710,7 @@ fn the_buffer_keeps_the_last_records_within_its_bytes_and_a_stream_passes_the_ga
     let line = "x".repeat(512 * 1024);
     for _ in 0..40 {
         engine.log("source", &line);
-        jobs.pump(&mut engine, NOW);
+        jobs.pump(&mut engine, &Registry::default(), NOW);
     }
     let (bytes, records) = jobs.buffered();
     assert!(bytes <= EVENT_BUFFER_BYTES && bytes > EVENT_BUFFER_BYTES - 1024 * 1024);
@@ -740,7 +740,7 @@ fn the_buffer_keeps_at_most_100_000_records() {
                 plan: None,
             });
         }
-        jobs.pump(&mut engine, NOW);
+        jobs.pump(&mut engine, &Registry::default(), NOW);
         assert!(jobs.buffered().1 <= EVENTS_KEPT, "{batch}");
     }
     let (bytes, records) = jobs.buffered();
@@ -760,7 +760,7 @@ fn the_last_100_jobs_are_kept_and_their_reports_within_their_bytes() {
         engine.run_as(&run);
         running_as(&mut jobs, &mut engine, &run);
         engine.finish(&report, 0, None);
-        jobs.pump(&mut engine, NOW + n as u64);
+        jobs.pump(&mut engine, &Registry::default(), NOW + n as u64);
     }
     let list = jobs.list().jobs;
     assert_eq!(list.len(), JOBS_KEPT);
@@ -791,7 +791,7 @@ fn the_last_100_jobs_are_kept_and_their_reports_within_their_bytes() {
         0,
         None,
     );
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     assert_eq!(jobs.status(RUN).unwrap().state, JobState::Completed);
     assert_eq!(jobs.report(RUN).status, 404);
     let (text, ended) = sent(&jobs, &mut jobs.stream(RUN, None).unwrap());
@@ -819,7 +819,7 @@ fn what_follows_the_records_goes_a_batch_at_a_time_and_the_stream_goes_on() {
     engine.say(&format!(
         r#"{{"type":"heartbeat","t_ms":1,"rows_out":1,"bottleneck":"{bottleneck}"}}"#
     ));
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     // Each fill as the session makes it: into an output TLS has emptied.
     let (mut first, mut second) = (Vec::new(), Vec::new());
     assert!(!jobs.fill(&mut stream, &mut first));
@@ -834,7 +834,7 @@ fn what_follows_the_records_goes_a_batch_at_a_time_and_the_stream_goes_on() {
     engine.log("source", "after");
     engine.say(r#"{"type":"report","report":{"rows_out":1}}"#);
     engine.exit(0, None);
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     let (text, ended) = sent(&jobs, &mut stream);
     assert!(ended);
     assert!(text.starts_with("id: 2\nevent: event\n"), "{text}");
@@ -850,9 +850,9 @@ fn a_line_skipped_before_the_run_id_is_counted_for_the_job() {
     let ticket = jobs.submit(&mut engine, V1.as_bytes(), NOW).unwrap();
     engine.say(&"x".repeat(ENGINE_LINE_LIMIT + 1));
     engine.say(&"y".repeat(ENGINE_LINE_LIMIT + 1));
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     engine.attempt_started();
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     assert_eq!(resolved(&mut jobs, ticket).status, 201);
     let mut stream = jobs.stream(RUN, None).unwrap();
     let (text, _) = sent(&jobs, &mut stream);
@@ -860,7 +860,7 @@ fn a_line_skipped_before_the_run_id_is_counted_for_the_job() {
     // Told once; told again when more are skipped.
     assert_eq!(sent(&jobs, &mut stream).0, "");
     engine.say(&"z".repeat(ENGINE_LINE_LIMIT + 1));
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     assert!(sent(&jobs, &mut stream).0.contains("\"skipped_lines\":3"));
 }
 
@@ -893,7 +893,7 @@ fn a_secret_appears_in_nothing_the_node_keeps_or_answers() {
         4,
         Some(&format!("source failed with key {SECRET}")),
     );
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     let mut all = String::new();
     let (events, ended) = sent(&jobs, &mut jobs.stream(RUN, None).unwrap());
     assert!(ended);
@@ -919,7 +919,7 @@ fn a_secret_appears_in_nothing_the_node_keeps_or_answers() {
     // The engine's refusal of a submit, and of a check.
     let ticket = jobs.submit(&mut engine, job.as_bytes(), NOW).unwrap();
     engine.exit(2, Some(&format!("source.key: {SECRET} is not a key")));
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     let refused = String::from_utf8(resolved(&mut jobs, ticket).body.bytes()).unwrap();
     assert!(
         !refused.contains(SECRET) && refused.contains("[redacted] is not a key"),
@@ -930,8 +930,8 @@ fn a_secret_appears_in_nothing_the_node_keeps_or_answers() {
         message: format!("{SECRET} is not a key"),
     }]));
     let ticket = jobs.validate(job.as_bytes()).unwrap();
-    jobs.pump(&mut engine, NOW);
-    jobs.pump(&mut engine, NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
     // The check is told the secrets' names, and never their values.
     let names = engine.0.borrow().checked_names.last().unwrap().clone();
     assert_eq!(names, ["other", "s3.key"]);

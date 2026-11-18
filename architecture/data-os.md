@@ -49,7 +49,7 @@ built yet.
 | --- | --- | --- |
 | Linux | Tens of millions of lines, with every driver | Over 350 system calls, plus every driver's `ioctl` |
 | Asterinas, whole | OSTD (about 49,000 lines) plus its Linux layer (about 137,000) plus its components (about 42,000) | 245 Linux calls |
-| The data OS | OSTD (about 49,000) plus Moruna's core (10,166 lines on 2026-11-18, with §2's mechanisms of A, B1 and P merged, and Hyper-V's mechanism for VMBus) | Moruna's 77 native calls, six of them only on Hyper-V |
+| The data OS | OSTD (about 49,000) plus Moruna's core (10,239 lines on 2026-11-18, with §2's mechanisms of A, B1 and P merged, Hyper-V's mechanism for VMBus, 5.0's wall clock and yield, and an ended process's exit code) | Moruna's 79 native calls, six of them only on Hyper-V |
 
 How the figures are measured, so each merge updates them the same way: kernel-mode lines are
 `wc -l` over `kernel/core/src` (tests included); native calls are the call numbers the
@@ -60,13 +60,16 @@ path (slots, windows, clock page), B1's personality mechanisms
 (personality entry, snapshots and clones, the pager, thread state) and P's plane calls.
 2026-11-18, on `work/1.9c-vmbus-core` (items 1.8 and 1.9c): 10,147 lines and 77 calls, 9,903
 and 71 before item 1.9c; 10,166 lines once `feature/arrow-core-0.7` at `173167eb` (items 1.3,
-1.4 and 2.2b) is merged into it. Item 1.9c adds 244 lines and the six `hyperv_*` calls of ABI 2.7
+1.4 and 2.2b) is merged into it, and 10,189 with an ended process's exit code in
+`handle_info` (ABI 2.7, no new call). Item 1.9c adds 244 lines and the six `hyperv_*` calls of ABI 2.7
 (`kernel/core/src/hyperv.rs`, 158 lines, and the object, interrupt, mapping and boot hooks
 around it); the calls answer only the holder of `root.hyperv`, which the core makes only on
 Hyper-V. It also adds about 400 lines to OSTD (`ostd-adaptation/NOTICE.md`): CPU 0's SynIC,
 its VP index and the two hypercalls, about 245 lines in `src/arch/x86/kernel/hyperv.rs` and
 about 155 of values and layouts in `src/arch/x86/cpu/hypervisor.rs`, which the host tests
-check. Every
+check. Then item 5.0 (ABI 2.8, `work/5.0-rust-std` merged with `feature/arrow-core-0.7`):
+10,216 lines and 79 calls, the node's wall clock on the clock page with `clock_set_realtime`,
+and `thread_yield`, 50 lines and two calls. Every
 call that is reachable but no gate job uses is a removal candidate on stream U's list. The
 exceptions are the device and DMA calls, which are kept for the accelerator path.
 
@@ -344,6 +347,8 @@ budget.
 | Futex wait and wake | Exists (`FUTEX_WAIT`, `FUTEX_WAKE`) | A call per batch: waits happen only when a ring is empty | None new |
 | No timer ticks or device interrupts on worker cores (C5) | New | Preemption jitter and cache disturbance on a pinned worker | Changes to OSTD's timer and interrupt routing. Built only if C5's measurement shows a gain, and counted under §0. |
 | A clock readable without a call | New: a read-only page the kernel updates | `clock_gettime` calls on every timed batch | One page and its update. Small. |
+| The node's one wall clock on that page | New (ABI 2.8, item 5.0): a realtime base and where it came from, written under the page's sequence at boot (the CMOS clock) and at each `clock_set_realtime`, which only the holder of `root.clock` (`platform`) may make | A wall clock in each service: the network server's TLS time and std's `SystemTime` read the page | One call and two words of the page: 50 lines with the yield below |
+| Yield the CPU | New (ABI 2.8, item 5.0): `thread_yield` | A spin-then-yield loop (std's, a library's) holding its CPU until the tick | One call, a call into OSTD's scheduler |
 | Revoke a task's write access to a set of windows | Partly exists (`PROCESS_PROTECT`, `batch_put`'s unmap) | The record check's need for bytes no task can write (DP1), paid once per group of batches, not per batch (§5) | A call that takes a list. Small. |
 | The personality entry, copy-on-write clones, a user pager, thread state and interruption | New (`kernel-is-the-machine.md` §4.1) | Running Linux programs with no Linux code in kernel mode (§4) | The largest addition: four mechanisms, each tested in the core's own suite. Size to be measured against the table in §0. |
 | Hyper-V's mechanism for VMBus: post, take, the event flags, SINT 2's interrupt, signal handles | New (ABI 2.7, `moruna-os-system.md` §1F, item 1.9c) | VMBus's protocol in kernel mode: it is the `vmbus` process's, and each driver signals the host itself | Six calls, made only on Hyper-V, and CPU 0's SynIC in OSTD: 244 lines of the core and about 400 of OSTD (§0). |

@@ -917,6 +917,92 @@ def _image_task(
     return settings, _definition(task, role, key, code, build_key, provenance, strict=strict)
 
 
+def _image_build_task(task: Any, role: str, key: str, target: Target, lowering: _Lowering) -> Any:
+    """What the build makes of one image task of the user's code, ``key`` in its job: its entry,
+    its closure, its build key and the distributions it imports. Raises what ``_image_task``
+    raises when the task cannot be built."""
+    from moruna import _build, _closure  # noqa: PLC0415
+
+    settings, definition = _image_task(task, role, key, target, {}, lowering, strict=True)
+    entry, _, code = _code_of(task, key, target, lowering)
+    return _build.Task(
+        name=key, entry=entry, code=code, key=settings["image"]["build_key"],
+        distributions=_closure.distributions(code.imports),
+        provenance=definition.get("provenance", {}),
+        definition=definition,
+    )  # fmt: skip
+
+
+def register(  # noqa: PLR0913, the build's keywords as ``job.build`` takes them
+    fn: Any,
+    client: Any,
+    *,
+    store: Any,
+    key: bytes | str | os.PathLike[str],
+    name: str | None = None,
+    platform: str = "linux/x86_64",
+    runtime: tuple[str, str] | None = None,
+    lock: str | os.PathLike[str] | None = None,
+    out: str | os.PathLike[str] = "moruna-images",
+    cache: str | os.PathLike[str] | None = None,
+    index_url: str | None = None,
+    find_links: Sequence[str] = (),
+    no_index: bool = False,
+) -> Any:
+    """Register the function ``fn`` on the node ``client`` (a ``moruna.api.Client`` with an admin
+    token) by name, for a job to run there (system design 3E and 5C, work item 5.4).
+
+    Its image is built as ``job.build`` builds one, for ``platform`` (the node's,
+    ``linux/x86_64``, by default) into the OCI layout ``out``; converted here into the layer
+    files Moruna's image filesystem serves and packed as one Moruna image archive, which the
+    node runs in place; signed with ``key``, the operator's Ed25519 private
+    key in PKCS#8 (PEM or DER, its bytes, its text or its file's path), whose public half is one
+    of node config's ``functions.keys``; uploaded to ``store``, object storage the node reads
+    over HTTPS (an ``https://`` prefix, which may carry an Azure SAS, or a callable from the
+    object's name to its upload URL and the URL the node fetches it from); and registered as
+    ``name`` (by default the function's: a decorated callable's ``__name__``, a class's name in
+    snake case). Returns the node's ``moruna.api.Function``.
+
+    Signing needs the extra ``moruna[register]`` (the ``cryptography`` package). A build that is
+    refused raises ``moruna.ConfigError``; a key, a store or an upload that is refused raises
+    ``moruna.RegisterRefused``, and nothing is registered; the node's own refusal raises
+    ``moruna.api.ApiError``.
+    """
+    import tempfile  # noqa: PLC0415
+
+    from moruna import _build, _closure, _register  # noqa: PLC0415
+
+    if not isinstance(fn, Task) and callable(fn):
+        fn = function(fn)
+    if isinstance(fn, _core.KernelSpec):
+        fn = _wrap(fn)
+    if not isinstance(fn, Function) or (
+        isinstance(fn, _Handle) and not isinstance(fn._handle, _core.KernelSpec)
+    ):
+        raise TypeError(
+            "moruna.register takes a function of your code: a @moruna.function, or an instance "
+            f"of a moruna.Function subclass, not {fn!r}"
+        )
+    if name is None:
+        name = _default_name(fn)
+    job = Job(name, platform=platform, runtime=runtime, lock=lock)
+    try:
+        task = _image_build_task(fn, "function", name, job._target, _Lowering(job._target))
+        options = _build.options(
+            out=out, platform=job._target.platform, lock=job._target.lock,
+            runtime_layout=job._target.runtime_layout,
+            runtime_reference=job._target.runtime_reference, cache=cache, index_url=index_url,
+            find_links=find_links, no_index=no_index, version=_core.__version__,
+        )  # fmt: skip
+        built = _build.build_images([task], options)[0]
+    except (ValueError, _closure.Unresolved, _build.Refused) as exc:
+        raise _config_error(f"register refused: {exc}") from exc
+    with tempfile.TemporaryDirectory(prefix="moruna-register-") as work:
+        return _register.register_built(
+            built, client, name=name, store=store, key=key, work=Path(work)
+        )
+
+
 # ---------------------------------------------------------------------------------------------
 # Needs: supplied by the resolver, measured per task
 
@@ -1442,22 +1528,11 @@ class Job:
             ):
                 continue
             try:
-                settings, definition = _image_task(
-                    task, e.role, e.key, self._target, {}, lowering, strict=True
-                )
-                entry, _, code = _code_of(task, e.key, self._target, lowering)
+                built = _image_build_task(task, e.role, e.key, self._target, lowering)
             except (ValueError, _closure.Unresolved) as exc:
                 refusals.append(f"job[{e.key!r}]: {exc}")
                 continue
-            key = settings["image"]["build_key"]
-            if key in tasks:
-                continue
-            tasks[key] = _build.Task(
-                name=e.key, entry=entry, code=code, key=key,
-                distributions=_closure.distributions(code.imports),
-                provenance=definition.get("provenance", {}),
-                definition=definition,
-            )  # fmt: skip
+            tasks.setdefault(built.key, built)
         if refusals:
             raise _build.Refused("; ".join(refusals))
         return list(tasks.values())

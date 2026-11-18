@@ -1053,9 +1053,12 @@ impl Log {
 }
 
 #[cfg(feature = "log")]
-impl core::fmt::Write for Log {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        for &b in s.as_bytes() {
+impl Log {
+    /// Writes `bytes` as `writeln!` does: each newline ends a line, kept or dropped as
+    /// [`Log::line`] says, and what follows the last waits for the next write or
+    /// [`Log::finish`]. Bytes need not be UTF-8: std's stdout and stderr write here (item 5.0).
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
             if b == b'\n' {
                 let n = core::mem::take(&mut self.pending_len);
                 self.writer.line(&self.pending[..n]);
@@ -1064,6 +1067,13 @@ impl core::fmt::Write for Log {
                 self.pending_len += 1;
             }
         }
+    }
+}
+
+#[cfg(feature = "log")]
+impl core::fmt::Write for Log {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.write_bytes(s.as_bytes());
         Ok(())
     }
 }
@@ -1262,6 +1272,21 @@ mod log_tests {
         for (stream, subject, _) in &lines {
             assert_eq!((stream.as_str(), *subject), ("stderr", 2));
         }
+    }
+
+    #[test]
+    fn p_bytes_written_in_pieces_are_lines_at_their_newlines_utf8_or_not() {
+        // std's stdout and stderr (item 5.0) write bytes, a line in several writes or several
+        // lines in one, and need not write UTF-8.
+        let (mut memory, mut log) = log(64 << 10);
+        log.write_bytes(b"sum = ");
+        log.write_bytes(b"55\nfilter kept ");
+        log.write_bytes(b"3\n\xff\xfe raw\n");
+        drop(log);
+        let lines = drain(&mut memory);
+        assert_eq!(texts(&lines)[..2], ["sum = 55", "filter kept 3"]);
+        assert_eq!(lines[2].2.as_bytes()[..6], *"\u{fffd}\u{fffd}".as_bytes());
+        assert_eq!(lines.len(), 3);
     }
 
     #[test]

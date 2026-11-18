@@ -1,4 +1,4 @@
-//! [`serve`]: a task's whole life on its rings.
+//! [`serve`]: a task's whole life on its rings; and [`Function`], a function with an end.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use arrow_array::RecordBatch;
 use crate::code;
 use crate::emit::Emit;
 use crate::error::FunctionError;
-use crate::lane::{Lane, Posted};
+use crate::lane::{Lane, NO_INPUT, Posted};
 use crate::platform;
 use crate::record::{self, Lease};
 
@@ -25,19 +25,86 @@ use crate::record::{self, Lease};
 /// - the rings broke: [`code::RINGS`].
 ///
 /// A batch that ended the task is never released. `serve` attaches to the task's plane once; a
-/// second call in the same task finds none ([`code::NO_PLANE`]).
+/// second call in the same task finds none ([`code::NO_PLANE`]). A function with something to
+/// write once the input has ended is a [`Function`].
 pub fn serve<F>(f: F) -> ExitCode
 where
     F: FnMut(RecordBatch, &mut Emit<'_>) -> Result<(), FunctionError>,
 {
-    let code = match platform::attach() {
-        Ok(mut lane) => run(&mut lane, f),
-        Err(unattached) => {
-            platform::log_line(&unattached.line);
-            unattached.code
-        }
-    };
-    ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX))
+    Each(f).serve()
+}
+
+/// A function with an end: [`Function::batch`] answers each batch as [`serve`]'s function does,
+/// and [`Function::end`] is called once more after the last, to write what answers no batch
+/// alone, an aggregate's total say. Its state is its own fields, which both calls reach.
+///
+/// ```no_run
+/// use std::process::ExitCode;
+/// use std::sync::Arc;
+///
+/// use arrow_array::{ArrayRef, Int64Array};
+/// use moruna_function::{Emit, Function, FunctionError, RecordBatch};
+///
+/// /// The number of rows of every batch together.
+/// #[derive(Default)]
+/// struct Rows(i64);
+///
+/// impl Function for Rows {
+///     fn batch(&mut self, batch: RecordBatch, _out: &mut Emit) -> Result<(), FunctionError> {
+///         self.0 += batch.num_rows() as i64;
+///         Ok(())
+///     }
+///
+///     fn end(&mut self, out: &mut Emit) -> Result<(), FunctionError> {
+///         let rows: ArrayRef = Arc::new(Int64Array::from(vec![self.0]));
+///         out.batch(&RecordBatch::try_from_iter([("rows", rows)])?)
+///     }
+/// }
+///
+/// fn main() -> ExitCode {
+///     Rows::default().serve()
+/// }
+/// ```
+pub trait Function {
+    /// Answers `batch`, as [`serve`]'s function does, under the same rules: the batch is the
+    /// function's only during the call.
+    fn batch(&mut self, batch: RecordBatch, out: &mut Emit<'_>) -> Result<(), FunctionError>;
+
+    /// Called once, after every batch was answered and released and the engine posts no more.
+    /// What it writes answers no batch. An error ends the task as one from [`Function::batch`]
+    /// does. Unless a function says otherwise, it writes nothing.
+    fn end(&mut self, out: &mut Emit<'_>) -> Result<(), FunctionError> {
+        let _ = out;
+        Ok(())
+    }
+
+    /// Runs the function on the task's batches, as [`serve`] runs a closure, then its
+    /// [`Function::end`], and returns the task's exit code for `main` to return.
+    fn serve(mut self) -> ExitCode
+    where
+        Self: Sized,
+    {
+        let code = match platform::attach() {
+            Ok(mut lane) => run_function(&mut lane, &mut self),
+            Err(unattached) => {
+                platform::log_line(&unattached.line);
+                unattached.code
+            }
+        };
+        ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX))
+    }
+}
+
+/// A closure as a [`Function`] with no end.
+struct Each<F>(F);
+
+impl<F> Function for Each<F>
+where
+    F: FnMut(RecordBatch, &mut Emit<'_>) -> Result<(), FunctionError>,
+{
+    fn batch(&mut self, batch: RecordBatch, out: &mut Emit<'_>) -> Result<(), FunctionError> {
+        (self.0)(batch, out)
+    }
 }
 
 /// Says `what` in the task's log, after its name.
@@ -52,11 +119,17 @@ fn end(lane: &mut dyn Lane, e: &FunctionError) -> i64 {
     lane.exit(e.code())
 }
 
-/// The task's loop over its rings: the exit code it said.
-pub(crate) fn run<F>(lane: &mut dyn Lane, mut f: F) -> i64
+/// The task's loop over its rings, for a closure: the exit code it said.
+#[cfg(test)]
+pub(crate) fn run<F>(lane: &mut dyn Lane, f: F) -> i64
 where
     F: FnMut(RecordBatch, &mut Emit<'_>) -> Result<(), FunctionError>,
 {
+    run_function(lane, &mut Each(f))
+}
+
+/// The task's loop over its rings: the exit code it said.
+pub(crate) fn run_function<F: Function>(lane: &mut dyn Lane, f: &mut F) -> i64 {
     let mut batches = 0u64;
     loop {
         let posted = match lane.batch() {
@@ -68,11 +141,17 @@ where
             }
             Err(e) => return end(lane, &FunctionError::rings(e)),
         };
-        if let Err(e) = answer(lane, posted, &mut f) {
+        if let Err(e) = answer(lane, posted, f) {
             return end(lane, &e);
         }
         lane.release();
         batches += 1;
+    }
+    let mut out = Emit::new(lane, NO_INPUT);
+    let returned = f.end(&mut out);
+    let emitted = out.finish();
+    if let Err(e) = returned.and(emitted.map(|_| ())) {
+        return end(lane, &e);
     }
     say(lane, &format!("answered {batches} batches"));
     lane.exit(code::DONE)
@@ -84,14 +163,15 @@ pub(crate) const KEPT: &str = "the function kept its input batch (or a column or
     call, so a function copies what it keeps";
 
 /// Calls `f` on the batch `posted` holds; `Ok` when the batch can be released.
-fn answer<F>(lane: &mut dyn Lane, posted: Posted, f: &mut F) -> Result<(), FunctionError>
-where
-    F: FnMut(RecordBatch, &mut Emit<'_>) -> Result<(), FunctionError>,
-{
+fn answer<F: Function>(
+    lane: &mut dyn Lane,
+    posted: Posted,
+    f: &mut F,
+) -> Result<(), FunctionError> {
     let lease = Lease::new(posted.keep.clone());
     let batch = record::read(&posted, &lease)?;
     let mut out = Emit::new(lane, posted.cookie);
-    let returned = f(batch, &mut out);
+    let returned = f.batch(batch, &mut out);
     let emitted = out.finish();
     returned?;
     emitted?;
@@ -489,5 +569,78 @@ mod tests {
             lane.posted.iter().all(|p| p.0 == 0),
             "one window, given back each time"
         );
+    }
+
+    /// Counts rows, writes their number at the end, or fails there as told.
+    struct Rows {
+        rows: i64,
+        fail: bool,
+    }
+
+    impl Function for Rows {
+        fn batch(&mut self, b: RecordBatch, _out: &mut Emit<'_>) -> Result<(), FunctionError> {
+            self.rows += b.num_rows() as i64;
+            Ok(())
+        }
+
+        fn end(&mut self, out: &mut Emit<'_>) -> Result<(), FunctionError> {
+            out.batch(&ints(self.rows))?;
+            if self.fail {
+                return Err(FunctionError::new("no total"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_end_is_called_once_after_every_batch_and_answers_no_input() {
+        let mut lane = Fake::new(&[ints(3), ints(4)], 1, 1 << 16);
+        let mut f = Rows {
+            rows: 0,
+            fail: false,
+        };
+        assert_eq!(run_function(&mut lane, &mut f), code::DONE);
+        assert_eq!(lane.released, 2);
+        assert_eq!(lane.posted.len(), 1);
+        assert_eq!(lane.posted[0].2, NO_INPUT, "it answers no input");
+        assert_eq!(lane.log, ["fake: answered 2 batches"]);
+        // With no input at all, the end still comes.
+        let mut lane = Fake::new(&[], 1, 1 << 16);
+        let mut f = Rows {
+            rows: 0,
+            fail: false,
+        };
+        assert_eq!(run_function(&mut lane, &mut f), code::DONE);
+        assert_eq!(lane.posted.len(), 1);
+    }
+
+    #[test]
+    fn a_failing_end_ends_the_task() {
+        let mut lane = Fake::new(&[ints(3)], 1, 1 << 16);
+        let mut f = Rows {
+            rows: 0,
+            fail: true,
+        };
+        assert_eq!(run_function(&mut lane, &mut f), code::REFUSED);
+        assert_eq!(lane.log, ["fake: no total"]);
+        assert_eq!(lane.released, 1, "the batches were answered before the end");
+        // A write the end cannot make ends the task with its own code.
+        let mut lane = Fake::new(&[ints(3)], 1, 4096);
+        let mut f = Rows {
+            rows: 0,
+            fail: false,
+        };
+        assert_eq!(run_function(&mut lane, &mut f), code::WINDOW_SMALL);
+        assert!(lane.log[0].starts_with("fake: the output record takes "));
+    }
+
+    #[test]
+    fn a_closure_has_no_end() {
+        let mut lane = Fake::new(&[ints(2)], 1, 1 << 16);
+        assert_eq!(run(&mut lane, echo), code::DONE);
+        assert!(lane.posted.iter().all(|p| p.2 != NO_INPUT));
+        let mut out = Emit::new(&mut lane, NO_INPUT);
+        assert_eq!(Each(echo).end(&mut out), Ok(()));
+        assert_eq!(out.finish(), Ok(0));
     }
 }

@@ -15,10 +15,13 @@
 //!    the OS disk, every disk is served read-only, and it says why ([`plan`]).
 //! 3. It serves each disk as `moruna.driver.block` on a listener of its own ([`serve`]),
 //!    and registers it with the device manager under its serial, through the link that
-//!    carries only that right, so a client finds it as any other disk. The boot disk's
-//!    `moruna-system` partition, which holds the node's engine layer (system design 1A), is
-//!    served and registered as a disk of its own, `system`: a window of the boot disk, read
-//!    only, never a volume ([`scan::system`], [`system`]; item 3.3).
+//!    carries only that right, so a client finds it as any other disk. A lookup of a disk
+//!    not yet registered waits until storvsc has finished: it connects through that link
+//!    before the scan, and closes the connection once the last disk is registered. The boot
+//!    disk's `moruna-system` partition, which holds the node's engine layer (system design
+//!    1A), is served and registered as a disk of its own, `system`: a window of the boot
+//!    disk, read only, never a volume, and only when the disk's GPT GUID is the image's
+//!    ([`scan::boot_table`], [`boot_system`], [`system`]; item 3.3).
 //!
 //! Data moves by the guest page numbers of the client's memory, named in each request, with
 //! no copy. Everything it needs of the node is behind [`serve::Node`] and [`scan::Scratch`],

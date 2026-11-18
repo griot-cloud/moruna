@@ -12,7 +12,8 @@
 //! A test fails when either file differs from what the types and the table generate.
 //!
 //! Paths start `/v1` and bodies are JSON. Step 2's operations take no request body; step 3's job
-//! operations (3B) take a [`Job`], a run's ID in the path, or both. The crate is `no_std` with
+//! operations (3B) take a [`Job`], a run's ID in the path, or both, and registering a function
+//! (3E) takes a [`FunctionRegistration`]. The crate is `no_std` with
 //! `alloc`, because the node's `api` process uses it; the `schema` feature, for the host only,
 //! adds the generator.
 #![no_std]
@@ -433,6 +434,51 @@ pub struct Heartbeat {
     pub staging_bytes: u64,
 }
 
+/// A function image to register, the body of `POST /v1/functions` (system design 3E). Unknown
+/// fields are refused.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct FunctionRegistration {
+    /// The name a job names the function by (a version 1 `kernels` entry
+    /// `{"kind": "function", "function": "<name>"}`, a version 2 task of kind `function`): 1 to 64
+    /// characters, a lowercase letter first, then lowercase letters, digits, `_`, `-` and `.`.
+    pub name: String,
+    /// Where the image file is fetched from at job start: an `https://` URL. An object store's
+    /// private object is given as a pre-signed or SAS URL.
+    pub address: String,
+    /// The SHA-256 of the image file, as 64 lowercase hexadecimal digits.
+    pub sha256: String,
+    /// An Ed25519 signature over the 32 bytes of that SHA-256, by one of node config's
+    /// `functions.keys`, in standard base64.
+    pub signature: String,
+}
+
+/// A registered function, as `GET /v1/functions` lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
+pub struct Function {
+    /// The name a job names it by.
+    pub name: String,
+    /// Where its image is fetched from.
+    pub address: String,
+    /// The SHA-256 of its image, as 64 lowercase hexadecimal digits.
+    pub sha256: String,
+    /// The first 16 hex characters of the SHA-256 of the public bytes of the key whose signature
+    /// verified, as the audit record names a token key.
+    pub key: String,
+    /// When it was registered, in Unix seconds.
+    pub registered: u64,
+}
+
+/// The answer to `GET /v1/functions`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "schema"), derive(schemars::JsonSchema))]
+pub struct Functions {
+    /// Every registered function, by name.
+    pub functions: Vec<Function>,
+}
+
 /// The most events one answer of the MCP tool `moruna_jobs_events` holds (item 3.7): MCP stays
 /// stateless, so the tool answers a page of what `GET /v1/jobs/{id}/events` streams, and an
 /// agent polls.
@@ -522,6 +568,8 @@ pub enum Request {
     None,
     /// A [`Job`].
     Job,
+    /// A [`FunctionRegistration`].
+    Function,
 }
 
 /// The type an operation answers with on success.
@@ -546,6 +594,10 @@ pub enum Response {
     Events,
     /// The engine's `RunReport`: a JSON object, as the engine wrote it.
     Report,
+    /// [`Function`].
+    Function,
+    /// [`Functions`].
+    Functions,
 }
 
 /// The name of a run's ID in a path: `{id}`.
@@ -730,6 +782,28 @@ pub const OPERATIONS: &[Operation] = &[
         response: Response::Report,
         status: 200,
         summary: "A job's report, the engine's RunReport, once the job has ended.",
+    },
+    Operation {
+        id: "functions_register",
+        method: Method::Post,
+        path: "/v1/functions",
+        scope: Some(Scope::Admin),
+        request: Request::Function,
+        query: &[],
+        response: Response::Function,
+        status: 201,
+        summary: "Register a function image by name: its https:// address, its SHA-256, and an Ed25519 signature over that SHA-256 by one of node config's functions.keys. Nothing is fetched until a job names it; registering a name again replaces it.",
+    },
+    Operation {
+        id: "functions_list",
+        method: Method::Get,
+        path: "/v1/functions",
+        scope: Some(Scope::Observe),
+        request: Request::None,
+        query: &[],
+        response: Response::Functions,
+        status: 200,
+        summary: "Every registered function: its name, address, SHA-256, the key that signed it and when it was registered.",
     },
 ];
 

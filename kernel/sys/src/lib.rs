@@ -23,7 +23,7 @@
 // attribute a program needs; the macro carries it so the program can forbid unsafe code.
 #![cfg_attr(target_os = "none", expect(internal_features))]
 
-#[cfg(feature = "heap")]
+#[cfg(any(feature = "heap", test))]
 extern crate alloc;
 
 pub mod datapath;
@@ -35,6 +35,9 @@ pub mod plane;
 mod private_memory;
 pub use private_memory::PrivateMemory;
 pub mod raw;
+// Item 5.0: the runtime of Rust's std on Moruna (feature `rt`), and its host tests.
+#[cfg(any(feature = "rt", test))]
+pub mod rt;
 pub mod start;
 
 #[cfg(target_os = "none")]
@@ -46,7 +49,7 @@ use core::{
 
 pub use moruna_abi::{
     ABI_VERSION, DEADLINE_INFINITE, Error, ObjectType, PAGE_SIZE, RawHandle, ResourceKind, Rights,
-    Signals, charge, forward, limits, map, memory_flags, pin_flags,
+    Signals, charge, forward, limits, map, memory_flags, pin_flags, process_end,
 };
 use moruna_abi::{msi, nr, start_entry, wait_item};
 
@@ -110,9 +113,22 @@ pub fn random(buf: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-/// Sets the calling thread's FS base (ABI 2.0); this crate keeps nothing there.
+/// Sets the calling thread's FS base (ABI 2.0); this crate keeps nothing there, but its
+/// `rt` (std's runtime) keeps each thread's table of thread-local keys there.
 pub fn set_fs(base: u64) -> Result<()> {
     check(raw::thread_set_fs(base)).map(|_| ())
+}
+
+/// Gives the calling thread's CPU to another ready thread, if there is one (ABI 2.8).
+pub fn thread_yield() {
+    raw::call0(nr::THREAD_YIELD);
+}
+
+/// The wall clock reads `utc_ns`, nanoseconds since 1970 (UTC), now (ABI 2.8). `clock` is
+/// `root.clock`, which the supervisor gives `platform` alone; the clock page carries the new
+/// realtime base. `InvalidArgs` for a time at or before the monotonic clock's start.
+pub fn clock_set_realtime(clock: &Handle, utc_ns: u64) -> Result<()> {
+    check(raw::call2(nr::CLOCK_SET_REALTIME, clock.raw() as u64, utc_ns).0).map(|_| ())
 }
 
 /// An owned handle. Dropping it closes it.
@@ -800,6 +816,14 @@ fn forget_moved(handles: &mut [(Option<Handle>, &str)]) {
 pub struct Process(pub Handle);
 
 impl Process {
+    /// How the process ended (`handle_info`, ABI 2.7): its exit code, or that it faulted or
+    /// was killed. Only once it is `TERMINATED`; before, it reads as exit code 0.
+    pub fn end(&self) -> Result<moruna_abi::process_end::End> {
+        let (packed, ended) = raw::call1(nr::HANDLE_INFO, u64::from(self.0.raw()));
+        check(packed)?;
+        Ok(moruna_abi::process_end::End::decode(ended))
+    }
+
     /// Creates an empty process from the process root resource, charged to the caller's
     /// own account: it and everything it causes to exist.
     pub fn create(resource: &Handle, name: &str) -> Result<Process> {

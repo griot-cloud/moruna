@@ -1,0 +1,20 @@
+[package]
+name = "moruna-getrandom"
+description = "The getrandom crate's custom backend on Moruna: the core's random_read, through std::os::moruna (item 5.0)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Its own workspace: it builds for kernel/targets/x86_64-moruna.json, as a dependency of a program
+# kernel/tools/build-std.sh builds, and on a host only for its tests; never with the kernel's.
+[workspace]
+
+[dependencies]
+# getrandom 0.3, which arrow-rs's hasher (ahash) and much of the ecosystem reach. build-std.sh
+# selects its custom backend (`--cfg getrandom_backend="custom"`), which this crate defines.
+getrandom = { version = "0.3.4", default-features = false }
+
+# Moruna is a target_os rustc learns from kernel/targets/x86_64-moruna.json, not one it knows.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("moruna"))'] }
