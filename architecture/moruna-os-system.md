@@ -83,6 +83,10 @@ Implements the OS design, section 1, OpenStack column.
   moruna: ready api=<address>:443 boot_ms=<n>
   ```
 
+- **`ready` means the node can run a job:** `api` answers, and `imagefs` has mounted the engine's
+  layer from `system`. `platform` prints `ready` (and on Azure sends the ready report) only after
+  both, so a node never reports ready and then fails on its own boot (1.6d's finding). The engine
+  layer's mount has the instance data's limit.
 - **`boot_ms`** counts from the core's first instruction to ready. Firmware and GRUB time is
   measured from outside, at bring-up, as create-to-ready.
 - **Limits:** services started within 5 s; an address within 30 s; instance data within 90 s.
