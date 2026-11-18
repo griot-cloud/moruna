@@ -17,7 +17,9 @@
 //!   connection.
 //! - Memory: a request's head is read and its token checked before any of its body, so a body
 //!   is read only for a call that takes one and is allowed; bodies share [`BODY_BUDGET`], and a
-//!   body that does not fit is answered `busy`.
+//!   body that does not fit is answered `busy`. An answer's body is written as TLS takes it,
+//!   32 KiB at a time, from where it is kept: a report, a page of events, or an MCP tool's
+//!   result holding either twice, is never copied whole.
 //! - Tokens (2C): every operation but `health` needs a JWT signed with Ed25519 under one of the
 //!   node's [`TokenKey`]s, for this node, expiring within [`MOST_AHEAD_SECONDS`], whose scope
 //!   covers the operation. Each call of an operation but `health` leaves an audit record; the
@@ -52,6 +54,7 @@ extern crate std;
 
 mod api;
 mod audit;
+mod body;
 mod der;
 mod engine;
 #[cfg(test)]

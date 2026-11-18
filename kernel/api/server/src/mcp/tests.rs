@@ -7,7 +7,7 @@ use crate::{
     signer::Signer,
     token::TokenKey,
 };
-use alloc::{format, string::ToString, vec};
+use alloc::{format, string::ToString, sync::Arc, vec, vec::Vec};
 use moruna_api::{Cloud, Executor, ExecutorKind, NodeHealth};
 
 const NOW: u64 = 1_794_931_200;
@@ -51,7 +51,7 @@ fn send(api: &mut Api, token: Option<&str>, body: &str) -> Answer {
 
 fn json_of(answer: &Answer) -> Value {
     assert_eq!(answer.status, 200);
-    serde_json::from_slice(&answer.body).unwrap()
+    serde_json::from_slice(&answer.body.bytes()).unwrap()
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn notifications_and_responses_are_accepted_without_a_body() {
     ] {
         let answer = send(&mut api, Some(&token), body);
         assert_eq!(answer.status, 202, "{body}");
-        assert!(answer.body.is_empty());
+        assert!(answer.body.bytes().is_empty());
     }
 }
 
@@ -292,7 +292,7 @@ fn only_post_is_served_on_mcp() {
     let answer = api.answer(&get, &[], NOW);
     assert_eq!(answer.status, 405);
     assert_eq!(answer.allow, Some("POST"));
-    assert!(answer.body.is_empty());
+    assert!(answer.body.bytes().is_empty());
     let mut delete = post(None);
     delete.method = "DELETE".to_string();
     assert_eq!(api.answer(&delete, &[], NOW).status, 400);
@@ -306,37 +306,52 @@ fn only_post_is_served_on_mcp() {
 #[test]
 fn the_tool_list_parses_and_a_bad_body_still_answers() {
     assert!(tools()["tools"].is_array());
-    let result = |answer: &Answer| -> Value {
-        serde_json::to_value(tool_result(answer)).expect("a tool result is JSON")
+    let result = |answer: Answer| -> Value {
+        let reply = json_of(&tool_answer(&json!("x"), answer));
+        assert_eq!(
+            (&reply["jsonrpc"], &reply["id"]),
+            (&json!("2.0"), &json!("x"))
+        );
+        reply["result"].clone()
     };
-    let failed = Answer::error(ErrorCode::Internal, "x");
-    let written = result(&failed);
+    let written = result(Answer::error(ErrorCode::Internal, "x"));
     assert_eq!(written["isError"], true);
     assert!(written.get("structuredContent").is_none());
-    let odd = Answer {
-        status: 200,
-        body: b"not json".to_vec(),
-        close: false,
-        allow: None,
-    };
-    let written = result(&odd);
+    let error: Value =
+        serde_json::from_str(written["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(error["error"]["code"], "internal");
+    let written = result(Answer::with(200, Body::of(Text::Static("not \"json\"\n"))));
     assert!(written.get("structuredContent").is_none());
     assert!(written.get("isError").is_none());
-    assert_eq!(written["content"][0]["text"], "not json");
-    // The answer's JSON is written as it came, its spacing and order kept.
-    let spaced = Answer {
-        status: 201,
-        body: br#"{ "b": 1,  "a": [2] }"#.to_vec(),
-        close: false,
-        allow: None,
-    };
-    let reply = tool_answer(&json!(9), &spaced);
-    let text = String::from_utf8(reply.body).unwrap();
+    assert_eq!(written["content"][0]["text"], "not \"json\"\n");
+    // The answer's JSON is written as it came, its spacing and order kept, and shared, not
+    // copied: the reply holds the one text, twice.
+    let spaced: Arc<str> = Arc::from(r#"{ "b": 1,  "a": [2] }"#);
+    let reply = tool_answer(
+        &json!(9),
+        Answer::with(201, Body::of(Text::Shared(spaced.clone()))),
+    );
+    assert_eq!(Arc::strong_count(&spaced), 2);
+    let text = String::from_utf8(reply.body.bytes()).unwrap();
     assert!(
         text.contains(r#""structuredContent":{ "b": 1,  "a": [2] }"#),
         "{text}"
     );
+    assert!(
+        text.contains(r#""text":"{ \"b\": 1,  \"a\": [2] }""#),
+        "{text}"
+    );
     assert_eq!(reply.status, 200);
+    // The tool list is the checked-in file, as it is.
+    let call = r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#;
+    let signer = Signer::new();
+    let token = signer.token("i-1", NOW + 60, &["observe"]);
+    let listed = send(&mut api(&signer), Some(&token), call).body.bytes();
+    let listed = String::from_utf8(listed).unwrap();
+    assert!(
+        listed.ends_with(&format!(r#""result":{TOOLS}}}"#)),
+        "{listed}"
+    );
 }
 
 /// A job whose engine has told `records` records, its first then log records, and has ended

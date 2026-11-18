@@ -243,6 +243,44 @@ fn a_second_submit_while_a_job_runs_is_busy() {
 }
 
 #[test]
+fn a_large_report_goes_in_pieces_whole_over_http_and_mcp_then_the_connection_closes() {
+    let mut harness = Harness::new();
+    submit(&mut harness);
+    // A report of 300 KiB with characters JSON escapes: many pieces of an answer.
+    let report = format!(r#"{{"pad":"{}"}}"#, r#"q\"\n"#.repeat(60 * 1024));
+    harness.engine.finish(&report, 0, None);
+    harness.settle();
+    let observer = harness.token(&["observe"]);
+    let client = harness.connect();
+    let request = format!(
+        "GET /v1/jobs/{RUN}/report HTTP/1.1\r\nHost: node\r\n{}Connection: close\r\n\r\n",
+        Harness::bearer(&observer)
+    );
+    let response = harness.exchange(client, request.as_bytes());
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, report.as_bytes());
+    assert_eq!(response.header("connection"), Some("close"));
+    assert!(harness.clients[client].server_closed());
+    // Over MCP: the same report as the text, escaped, and as the structured content.
+    let client = harness.connect();
+    let call = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                       "params": { "name": "moruna_jobs_report", "arguments": { "id": RUN } } });
+    let response = harness.exchange(client, &Harness::post("/mcp", &observer, &call.to_string()));
+    let result = result(&response);
+    let expected: Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(result["structuredContent"], expected);
+    assert_eq!(result["content"][0]["text"], report.as_str());
+    assert_eq!(
+        response.body.len(),
+        response
+            .header("content-length")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()
+    );
+}
+
+#[test]
 fn a_long_job_is_cancelled() {
     let mut harness = Harness::new();
     let client = submit(&mut harness);

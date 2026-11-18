@@ -8,12 +8,13 @@
 
 use crate::{
     api::{Admission, Answer, Api, Call, Inputs, Outcome},
+    body::{Body, Form, Text},
     http::Request,
     token::Grant,
 };
-use alloc::{borrow::Cow, string::String, vec::Vec};
-use moruna_api::{ErrorCode, OPERATIONS, Request as Body, Scope};
-use serde::{Deserialize, Serialize};
+use alloc::string::String;
+use moruna_api::{ErrorCode, OPERATIONS, Request as Takes, Scope};
+use serde::Deserialize;
 use serde_json::{Map, Value, json, value::RawValue};
 
 /// The path MCP is served on.
@@ -44,69 +45,57 @@ fn reply(id: &Value, outcome: Result<Value, (i64, &str)>) -> Answer {
 
 /// The answer to a notification or a response: accepted, with no body.
 fn accepted() -> Answer {
-    Answer {
-        status: 202,
-        body: Vec::new(),
-        close: false,
-        allow: None,
-    }
+    Answer::with(202, Body::default())
 }
 
 /// The tool list, parsed from the checked-in file.
+#[cfg(test)]
 pub(crate) fn tools() -> Value {
     serde_json::from_str(TOOLS).unwrap_or(Value::Null)
 }
 
-/// A JSON-RPC answer whose `result` is a tool's.
-#[derive(Serialize)]
-struct ToolReply<'a> {
-    jsonrpc: &'static str,
-    id: &'a Value,
-    result: ToolResult<'a>,
+/// The start of the JSON-RPC answer to the request `id`: `{"jsonrpc":"2.0","id":<id>`.
+fn envelope(id: &Value) -> Body {
+    let mut body = Body::of(Text::Static(r#"{"jsonrpc":"2.0","id":"#));
+    body.push(Text::Owned(
+        serde_json::to_string(id).unwrap_or_else(|_| String::from("null")),
+    ));
+    body
 }
 
-/// A tool result: one text content item, and the answer's JSON or that it is an error.
-#[derive(Serialize)]
-struct ToolResult<'a> {
-    content: [Content<'a>; 1],
-    #[serde(rename = "structuredContent", skip_serializing_if = "Option::is_none")]
-    structured: Option<&'a RawValue>,
-    #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
-    is_error: Option<bool>,
+/// The answer to `tools/list` for the request `id`: the checked-in list as it is.
+fn tool_list(id: &Value) -> Answer {
+    let mut body = envelope(id);
+    body.push(Text::Static(r#","result":"#));
+    body.push(Text::Static(TOOLS));
+    body.push(Text::Static("}"));
+    Answer::with(200, body)
 }
 
-/// A text content item.
-#[derive(Serialize)]
-struct Content<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    text: Cow<'a, str>,
-}
-
-/// A tool result holding an operation's answer: on success, its JSON as `structuredContent` and
-/// as one text content item; on an error, 2A's error body as the text and `isError`. The
-/// answer's JSON is written as the text it is: no tree is made of it, however long it is.
-fn tool_result(answer: &Answer) -> ToolResult<'_> {
+/// The answer to the tool call whose JSON-RPC ID is `id`, from the operation's `answer`: a tool
+/// result whose one text content item is the answer's body and, on success, whose structured
+/// content is the same JSON; on an error, the text is 2A's error body and the result says
+/// `isError`. The body is held once and written twice as it is sent, escaped and then as it
+/// is: no tree is made of it and no copy, however long it is.
+pub(crate) fn tool_answer(id: &Value, answer: Answer) -> Answer {
     let ok = (200..300).contains(&answer.status);
-    ToolResult {
-        content: [Content {
-            kind: "text",
-            text: String::from_utf8_lossy(&answer.body),
-        }],
-        structured: ok
-            .then(|| serde_json::from_slice(&answer.body).ok())
-            .flatten(),
-        is_error: (!ok).then_some(true),
+    let text = answer.body.into_text();
+    let json = ok && serde_json::from_str::<&RawValue>(text.as_str()).is_ok();
+    let mut body = envelope(id);
+    body.push(Text::Static(
+        r#","result":{"content":[{"type":"text","text":""#,
+    ));
+    let at = body.add(text);
+    body.write(at, Form::Escaped);
+    body.push(Text::Static(r#""}]"#));
+    if json {
+        body.push(Text::Static(r#","structuredContent":"#));
+        body.write(at, Form::Raw);
+    } else if !ok {
+        body.push(Text::Static(r#","isError":true"#));
     }
-}
-
-/// The answer to the tool call whose JSON-RPC ID is `id`, from the operation's `answer`.
-pub(crate) fn tool_answer(id: &Value, answer: &Answer) -> Answer {
-    Answer::ok(serde_json::to_vec(&ToolReply {
-        jsonrpc: "2.0",
-        id,
-        result: tool_result(answer),
-    }))
+    body.push(Text::Static("}}"));
+    Answer::with(200, body)
 }
 
 /// A `tools/call` message, read for its arguments as they were written.
@@ -131,10 +120,8 @@ impl Api {
             "POST" => {}
             "GET" => {
                 return answer(Answer {
-                    status: 405,
-                    body: Vec::new(),
-                    close: false,
                     allow: Some("POST"),
+                    ..Answer::with(405, Body::default())
                 });
             }
             _ => {
@@ -198,9 +185,9 @@ impl Api {
                 "serverInfo": { "name": "moruna", "version": self.facts.version }
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(tools()),
+            "tools/list" => return Outcome::Answer(tool_list(id)),
             "tools/call" => match self.tool(message.get("params"), body, grant, id, now) {
-                Ok(Outcome::Answer(answer)) => return Outcome::Answer(tool_answer(id, &answer)),
+                Ok(Outcome::Answer(answer)) => return Outcome::Answer(tool_answer(id, answer)),
                 Ok(later) => return later,
                 Err(refused) => Err(refused),
             },
@@ -248,7 +235,7 @@ impl Api {
                 now,
             )))
         };
-        if operation.request == Body::Job {
+        if operation.request == Takes::Job {
             let written = serde_json::from_slice::<RawCall<'_>>(body)
                 .ok()
                 .and_then(|call| call.params)

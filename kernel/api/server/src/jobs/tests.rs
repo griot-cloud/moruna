@@ -13,7 +13,7 @@ const V1: &str = r#"{"v1": {"moruna_spec": 1,
     "sink": {"kind": "count"}}}"#;
 
 fn body(answer: &Answer) -> Value {
-    serde_json::from_slice(&answer.body).unwrap()
+    serde_json::from_slice(&answer.body.bytes()).unwrap()
 }
 
 /// The one answer that has come, under `ticket`.
@@ -27,12 +27,14 @@ fn resolved(jobs: &mut Jobs, ticket: u64) -> Answer {
 
 /// Everything `stream` can be sent now, as text, and whether it has ended.
 fn sent(jobs: &Jobs, stream: &mut Stream) -> (String, bool) {
-    let mut out = Vec::new();
+    let mut all = Vec::new();
     loop {
-        let before = out.len();
+        // Each fill into an output TLS has emptied, as the session makes it.
+        let mut out = Vec::new();
         let ended = jobs.fill(stream, &mut out);
-        if ended || out.len() == before {
-            return (String::from_utf8(out).unwrap(), ended);
+        all.extend_from_slice(&out);
+        if ended || out.is_empty() {
+            return (String::from_utf8(all).unwrap(), ended);
         }
     }
 }
@@ -97,7 +99,10 @@ fn a_job_goes_from_spec_to_exit() {
     // The report is the engine's, as it wrote it.
     let report = jobs.report(RUN);
     assert_eq!(report.status, 200);
-    assert_eq!(report.body, br#"{"rows_out": 1000, "exit": {"code": 0}}"#);
+    assert_eq!(
+        report.body.bytes(),
+        br#"{"rows_out": 1000, "exit": {"code": 0}}"#
+    );
     assert_eq!(
         serde_json::to_value(jobs.list()).unwrap(),
         json!({ "jobs": [{ "id": RUN, "state": "completed", "submitted": NOW,
@@ -305,7 +310,7 @@ fn what_the_engine_says_before_the_run_id_is_kept_for_the_job() {
     assert_eq!(status.heartbeat.unwrap().rows_out, 7);
     engine.exit(0, None);
     jobs.pump(&mut engine, NOW + 2);
-    assert_eq!(jobs.report(RUN).body, br#"{"early":true}"#);
+    assert_eq!(jobs.report(RUN).body.bytes(), br#"{"early":true}"#);
 }
 
 #[test]
@@ -805,6 +810,41 @@ fn the_last_100_jobs_are_kept_and_their_reports_within_their_bytes() {
 }
 
 #[test]
+fn what_follows_the_records_goes_a_batch_at_a_time_and_the_stream_goes_on() {
+    let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
+    running(&mut jobs, &mut engine, V1);
+    let mut stream = jobs.stream(RUN, Some(1)).unwrap();
+    // A heartbeat larger than a batch: the stream sends it over two fills.
+    let bottleneck = "b".repeat(40 * 1024);
+    engine.say(&format!(
+        r#"{{"type":"heartbeat","t_ms":1,"rows_out":1,"bottleneck":"{bottleneck}"}}"#
+    ));
+    jobs.pump(&mut engine, NOW);
+    // Each fill as the session makes it: into an output TLS has emptied.
+    let (mut first, mut second) = (Vec::new(), Vec::new());
+    assert!(!jobs.fill(&mut stream, &mut first));
+    assert_eq!(first.len(), STREAM_BATCH);
+    assert!(!jobs.fill(&mut stream, &mut second));
+    first.extend_from_slice(&second);
+    let text = String::from_utf8(first).unwrap();
+    assert!(text.starts_with("event: heartbeat\ndata: {"));
+    assert!(text.ends_with(&format!("{bottleneck}\"}}\n\n")));
+    // It has not ended: the next record follows, and then the end, with a report that has no
+    // plan.
+    engine.log("source", "after");
+    engine.say(r#"{"type":"report","report":{"rows_out":1}}"#);
+    engine.exit(0, None);
+    jobs.pump(&mut engine, NOW);
+    let (text, ended) = sent(&jobs, &mut stream);
+    assert!(ended);
+    assert!(text.starts_with("id: 2\nevent: event\n"), "{text}");
+    assert!(text.contains(
+        "event: report\ndata: {\"type\":\"report\",\"report\":{\"rows_out\":1},\"plan\":null}\n\n"
+    ));
+    assert!(text.ends_with("\"diagnostic\":null}\n\n"));
+}
+
+#[test]
 fn a_line_skipped_before_the_run_id_is_counted_for_the_job() {
     let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
     let ticket = jobs.submit(&mut engine, V1.as_bytes(), NOW).unwrap();
@@ -858,7 +898,7 @@ fn a_secret_appears_in_nothing_the_node_keeps_or_answers() {
     let (events, ended) = sent(&jobs, &mut jobs.stream(RUN, None).unwrap());
     assert!(ended);
     all.push_str(&events);
-    all.push_str(&String::from_utf8(jobs.report(RUN).body).unwrap());
+    all.push_str(&String::from_utf8(jobs.report(RUN).body.bytes()).unwrap());
     all.push_str(&serde_json::to_string(&jobs.status(RUN).unwrap()).unwrap());
     all.push_str(&serde_json::to_string(&jobs.list()).unwrap());
     assert!(!all.contains(SECRET), "{all}");
@@ -880,7 +920,7 @@ fn a_secret_appears_in_nothing_the_node_keeps_or_answers() {
     let ticket = jobs.submit(&mut engine, job.as_bytes(), NOW).unwrap();
     engine.exit(2, Some(&format!("source.key: {SECRET} is not a key")));
     jobs.pump(&mut engine, NOW);
-    let refused = String::from_utf8(resolved(&mut jobs, ticket).body).unwrap();
+    let refused = String::from_utf8(resolved(&mut jobs, ticket).body.bytes()).unwrap();
     assert!(
         !refused.contains(SECRET) && refused.contains("[redacted] is not a key"),
         "{refused}"
@@ -895,7 +935,7 @@ fn a_secret_appears_in_nothing_the_node_keeps_or_answers() {
     // The check is told the secrets' names, and never their values.
     let names = engine.0.borrow().checked_names.last().unwrap().clone();
     assert_eq!(names, ["other", "s3.key"]);
-    let refused = String::from_utf8(resolved(&mut jobs, ticket).body).unwrap();
+    let refused = String::from_utf8(resolved(&mut jobs, ticket).body.bytes()).unwrap();
     assert!(
         !refused.contains(SECRET) && refused.contains("[redacted] is not a key"),
         "{refused}"
@@ -903,5 +943,9 @@ fn a_secret_appears_in_nothing_the_node_keeps_or_answers() {
     // The host's own refusal.
     engine.0.borrow_mut().refuse_start = Some(HostError::Refused(format!("no volume {SECRET}")));
     let refused = jobs.submit(&mut engine, job.as_bytes(), NOW).unwrap_err();
-    assert!(!String::from_utf8(refused.body).unwrap().contains(SECRET));
+    assert!(
+        !String::from_utf8(refused.body.bytes())
+            .unwrap()
+            .contains(SECRET)
+    );
 }
