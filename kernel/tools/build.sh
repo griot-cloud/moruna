@@ -106,6 +106,12 @@ set +x
 
 bin="${CARGO_TARGET_DIR:-$kernel/target}/$user_target_name/release"
 kernel_bin="${CARGO_TARGET_DIR:-$kernel/target}/$target/release"
+# Item 5.0: the program with std (examples/std-arrow), built against Rust's library/ with
+# Moruna's platform layer by build-std.sh, which owns its flags, and put beside the native
+# programs the image tool takes.
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$kernel/target}" \
+  "$kernel/tools/build-std.sh" "$kernel/examples/std-arrow/Cargo.toml"
+cp "${CARGO_TARGET_DIR:-$kernel/target}/x86_64-moruna/release/std-arrow" "$bin/std-arrow"
 rm -rf "$out"
 mkdir -p "$out"
 cp "$bin/deadline" "$out/deadline"

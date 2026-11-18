@@ -13,7 +13,7 @@ use moruna_abi::{
     fixed_name, limits, map, memory_flags, msi, nr, pin_flags, read_u32, resource_info,
     start_entry, valid_name, wait_item, write_u32, write_u64,
 };
-use ostd::{arch::cpu::context::UserContext, early_print, sync::Waiter};
+use ostd::{arch::cpu::context::UserContext, early_print, sync::Waiter, task::Task};
 
 use crate::{
     account::{Account, Charge},
@@ -148,6 +148,12 @@ pub fn dispatch(thread: &Arc<Thread>, ctx: &mut UserContext) -> Flow {
         nr::HYPERV_INTERRUPT => hyperv::hyperv_interrupt(p, a).map_err(Into::into),
         nr::HYPERV_SIGNAL_CREATE => hyperv::hyperv_signal_create(p, a).map_err(Into::into),
         nr::HYPERV_SIGNAL => hyperv::hyperv_signal(p, a).map_err(Into::into),
+        // ABI 2.8 (item 5.0): the wall clock, and a yield.
+        nr::CLOCK_SET_REALTIME => clock_set_realtime(p, a[0], a[1]),
+        nr::THREAD_YIELD => {
+            Task::yield_now();
+            one(0)
+        }
         nr::BATCH_GET => batch_get(thread, a[0]),
         nr::BATCH_PUT => batch_put(p, a[0], a[1], a[2]),
         nr::PORT_CALL => port_call(thread, a[0], a[1], a[2]),
@@ -236,6 +242,16 @@ pub(crate) fn typed<T>(
         return Err(Error::AccessDenied);
     }
     Ok(object)
+}
+
+/// `clock_set_realtime` (ABI 2.8): the wall clock reads `utc_ns` now; the holder of
+/// `root.clock` alone may say so.
+fn clock_set_realtime(p: &Process, clock: u64, utc_ns: u64) -> Ret {
+    typed(p, clock, Rights::WRITE, |h| {
+        as_resource(h, ResourceKind::Clock)
+    })?;
+    clock::set_realtime(utc_ns)?;
+    one(0)
 }
 
 fn handle_close(p: &Process, value: u64) -> Ret {
@@ -809,7 +825,9 @@ fn resource_narrow(p: &Process, value: u64, base: u64, len: u64) -> Ret {
         return Err(Error::AccessDenied.into());
     }
     let aligned = match source.kind {
-        ResourceKind::Process | ResourceKind::Hyperv => return Err(Error::InvalidArgs.into()),
+        ResourceKind::Process | ResourceKind::Hyperv | ResourceKind::Clock => {
+            return Err(Error::InvalidArgs.into());
+        }
         ResourceKind::DeviceMemory => {
             base.is_multiple_of(PAGE_SIZE) && len.is_multiple_of(PAGE_SIZE)
         }

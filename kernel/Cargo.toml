@@ -2,8 +2,9 @@
 resolver = "3"
 # `drivers/vmbus`, `drivers/storvsc` and `drivers/netvsc` hold crates one level down
 # (`drivers/vmbus/core`), so `drivers/*` must not take the directory itself for a crate: each
-# crate under it is a member by name.
-exclude = ["vendor/ring-0.17.14", "vendor/osdk-frame-allocator-0.19.0", "vendor/ostd-0.19.0", "drivers/vmbus", "drivers/storvsc", "drivers/netvsc"]
+# crate under it is a member by name. `examples/std-arrow` (item 5.0) is a program with std: its
+# own workspace, built by tools/build-std.sh for targets/x86_64-moruna.json.
+exclude = ["vendor/ring-0.17.14", "vendor/osdk-frame-allocator-0.19.0", "vendor/ostd-0.19.0", "drivers/vmbus", "drivers/storvsc", "drivers/netvsc", "examples/std-arrow"]
 members = ["abi", "loader", "handles", "quota", "datapath", "core", "boot", "sys", "svc", "programs", "tools/image", "examples/*", "drivers/*", "devices/*", "imagefs/*", "linux/core", "linux/protocol", "linux/server", "linux/test", "usage", "plane/check", "plane/core", "plane/test", "engine", "net/*", "storage", "node/core", "node/protocol", "node/supervisor", "node/admission", "node/image", "node/proof", "node/api", "node/config", "node/platform", "api/types", "vendor/openvmm/*", "ostd-adaptation", "drivers/vmbus/core", "drivers/vmbus/protocol", "drivers/vmbus/server", "drivers/storvsc/core", "drivers/storvsc/server", "drivers/storvsc/check", "drivers/netvsc/core", "api/server"]
 
 [workspace.package]
