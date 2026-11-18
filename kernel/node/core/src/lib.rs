@@ -469,6 +469,16 @@ pub mod line {
                     reason: format_args!("ended with code {code}"),
                 }
                 .fmt(f),
+                super::Gone::Faulted => Fatal {
+                    stage: self.0,
+                    reason: "faulted",
+                }
+                .fmt(f),
+                super::Gone::Killed => Fatal {
+                    stage: self.0,
+                    reason: "was killed",
+                }
+                .fmt(f),
                 super::Gone::LeftSupervision => Fatal {
                     stage: self.0,
                     reason: "closed its channel to the supervisor",
@@ -484,22 +494,33 @@ pub mod line {
 pub enum Gone {
     /// Its process ended, with its code when the supervisor knows it.
     Ended(Option<i64>),
+    /// A thread of it faulted, which ended it with no code.
+    Faulted,
+    /// It was killed through a handle to it.
+    Killed,
     /// It closed its channel to the supervisor (a bootstrap's, or admission's guardian)
     /// while its process still runs: the supervisor can no longer watch over it.
     LeftSupervision,
 }
 
 impl Gone {
+    /// How a service whose process has ended went, from the kernel's word on it
+    /// (`handle_info`, ABI 2.7).
+    pub fn ended(end: moruna_abi::process_end::End) -> Gone {
+        use moruna_abi::process_end::End;
+        match end {
+            End::Code(code) => Gone::Ended(Some(code)),
+            End::Faulted => Gone::Faulted,
+            End::Killed => Gone::Killed,
+        }
+    }
+
     /// What a service's closed channel to the supervisor means. A service that ends closes
     /// its channels a moment before its process is seen to have ended, so the supervisor
-    /// looks for its process's end first: `terminated` says whether it saw it. Either way
+    /// looks for its process's end first: `end` is how it ended, if it saw it end. Either way
     /// the line names the service, never the channel.
-    pub fn closed_channel(terminated: bool) -> Gone {
-        if terminated {
-            Gone::Ended(None)
-        } else {
-            Gone::LeftSupervision
-        }
+    pub fn closed_channel(end: Option<moruna_abi::process_end::End>) -> Gone {
+        end.map_or(Gone::LeftSupervision, Gone::ended)
     }
 }
 
@@ -661,6 +682,14 @@ mod start_tests {
             "moruna: fatal admission: closed its channel to the supervisor"
         );
         assert_eq!(
+            format!("{}", line::Gone("api", Gone::Faulted)),
+            "moruna: fatal api: faulted"
+        );
+        assert_eq!(
+            format!("{}", line::Gone("api", Gone::Killed)),
+            "moruna: fatal api: was killed"
+        );
+        assert_eq!(
             format!("{}", line::Late("netstack")),
             "moruna: fatal services: netstack did not start within 5 s"
         );
@@ -804,6 +833,7 @@ mod tests {
 
     #[test]
     fn a_closed_supervisor_channel_names_the_service_that_held_it() {
+        use moruna_abi::process_end::End;
         // Devices' bootstrap channel is a guardian, platform's is not, and a service with no
         // bootstrap has none. An admission service's guardian comes after every bootstrap's.
         let node = concat!(
@@ -824,9 +854,25 @@ mod tests {
         assert!(plain.guardians().is_empty());
         // Whether its process has been seen to end decides the line; it is never the
         // channel's error.
-        assert_eq!(Gone::closed_channel(true), Gone::Ended(None));
-        assert_eq!(Gone::closed_channel(false), Gone::LeftSupervision);
-        for gone in [Gone::closed_channel(true), Gone::closed_channel(false)] {
+        assert_eq!(
+            Gone::closed_channel(Some(End::Code(0))),
+            Gone::Ended(Some(0))
+        );
+        // The kernel's word on how the process ended gives the line its code (ABI 2.7).
+        assert_eq!(Gone::ended(End::Code(0)), Gone::Ended(Some(0)));
+        assert_eq!(Gone::ended(End::Code(-3)), Gone::Ended(Some(-3)));
+        assert_eq!(Gone::ended(End::Faulted), Gone::Faulted);
+        assert_eq!(Gone::ended(End::Killed), Gone::Killed);
+        assert_eq!(
+            format!("{}", line::Gone("devices", Gone::ended(End::Code(0)))),
+            "moruna: fatal devices: ended with code 0"
+        );
+        assert_eq!(Gone::closed_channel(None), Gone::LeftSupervision);
+        for gone in [
+            Gone::closed_channel(Some(End::Code(0))),
+            Gone::closed_channel(Some(End::Faulted)),
+            Gone::closed_channel(None),
+        ] {
             let text = format!("{}", line::Gone("devices", gone));
             assert!(text.starts_with("moruna: fatal devices: "), "{text}");
             assert!(!text.contains("guardian") && !text.contains("peer closed"));

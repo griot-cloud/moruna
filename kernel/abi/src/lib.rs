@@ -37,9 +37,11 @@ pub mod manifest;
 /// ABI 2.7 (`architecture/moruna-os-system.md`, section 1F; item 1.9c) adds Hyper-V's
 /// mechanism for VMBus: the boot capability `root.hyperv` (a resource of kind
 /// [`ResourceKind::Hyperv`]), the object [`ObjectType::HvSignal`], and the six calls of
-/// [`hyperv`], numbered `nr::HYPERV_POST` to `nr::HYPERV_SIGNAL`. ABI 2.8 (item 5.0, Rust's std
-/// on Moruna) adds the node's wall clock and a yield: the clock page's `REALTIME_BASE` and
-/// `REALTIME_SOURCE`, the boot capability `root.clock` (`ResourceKind::Clock`) and its
+/// [`hyperv`], numbered `nr::HYPERV_POST` to `nr::HYPERV_SIGNAL`. It also has
+/// `handle_info` give, in `rdx`, how a process that has ended ended ([`process_end`]), so
+/// that the supervisor names an ended service's exit code (1B). ABI 2.8 (item 5.0, Rust's
+/// std on Moruna) adds the node's wall clock and a yield: the clock page's `REALTIME_BASE`
+/// and `REALTIME_SOURCE`, the boot capability `root.clock` (`ResourceKind::Clock`) and its
 /// `clock_set_realtime`, and `thread_yield`, after 2.7's six calls.
 pub const ABI_MAJOR: u16 = 2;
 /// See [`ABI_MAJOR`].
@@ -57,6 +59,8 @@ pub mod nr {
     pub const ABI_VERSION: u64 = BASE;
     pub const HANDLE_CLOSE: u64 = BASE + 1;
     pub const HANDLE_DUPLICATE: u64 = BASE + 2;
+    /// `handle_info(handle) -> (type << 32) | rights`; for a process that has ended, how it
+    /// ended in `rdx` (ABI 2.7, `crate::process_end`), and 0 there for anything else.
     pub const HANDLE_INFO: u64 = BASE + 3;
     pub const CHANNEL_CREATE: u64 = BASE + 4;
     pub const CHANNEL_WRITE: u64 = BASE + 5;
@@ -655,6 +659,49 @@ pub mod resource_range {
         let start = base.checked_add(u64::from(bus_start) * ECAM_BUS_BYTES)?;
         let end = base.checked_add((u64::from(bus_end) + 1) * ECAM_BUS_BYTES)?;
         Some(start..end)
+    }
+}
+
+/// How a process ended, as `handle_info` gives it in `rdx` once the process is
+/// `TERMINATED` (ABI 2.7): its exit code, or one of two values no exit code is, for a process
+/// that faulted or was killed. Before the process ends, and for any other object, `rdx` is 0.
+pub mod process_end {
+    /// A thread of the process faulted, which ended it with no exit code.
+    pub const FAULTED: u64 = i64::MIN as u64;
+    /// It was killed through a handle to it (`process_kill`), with no exit code.
+    pub const KILLED: u64 = (i64::MIN + 1) as u64;
+
+    /// How a process ended.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum End {
+        /// It exited with this code (`process_exit`, or its last thread's last code).
+        Code(i64),
+        /// A thread of it faulted.
+        Faulted,
+        /// It was killed through a handle.
+        Killed,
+    }
+
+    impl End {
+        /// The value `handle_info` gives in `rdx`. An exit code of `i64::MIN` or
+        /// `i64::MIN + 1` reads back as [`End::Faulted`] or [`End::Killed`]: no program
+        /// exits with them.
+        pub const fn encode(self) -> u64 {
+            match self {
+                End::Code(code) => code as u64,
+                End::Faulted => FAULTED,
+                End::Killed => KILLED,
+            }
+        }
+
+        /// How a process ended, from `rdx`.
+        pub const fn decode(rdx: u64) -> End {
+            match rdx {
+                FAULTED => End::Faulted,
+                KILLED => End::Killed,
+                code => End::Code(code as i64),
+            }
+        }
     }
 }
 
@@ -1606,6 +1653,23 @@ mod tests {
         for right in [Rights::READ, Rights::MAP, Rights::WAIT] {
             assert!(!SIGNAL_RIGHTS.contains(right));
         }
+    }
+
+    #[test]
+    fn an_ended_processs_exit_code_round_trips_and_a_fault_or_a_kill_is_no_code() {
+        use process_end::{End, FAULTED, KILLED};
+        for code in [0, 1, 2, 7, 255, -1, -3, i64::MAX, i64::MIN + 2] {
+            assert_eq!(End::decode(End::Code(code).encode()), End::Code(code));
+        }
+        assert_eq!(End::Code(0).encode(), 0);
+        assert_eq!(End::Code(-1).encode(), u64::MAX);
+        assert_eq!(End::decode(FAULTED), End::Faulted);
+        assert_eq!(End::decode(KILLED), End::Killed);
+        assert_eq!(
+            (End::Faulted.encode(), End::Killed.encode()),
+            (FAULTED, KILLED)
+        );
+        assert_ne!(FAULTED, KILLED);
     }
 
     #[test]
