@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 const IMAGE: &[u8] = b"\x7fELF gate-score, a native function";
 const ADDRESS: &str = "https://images.example.com/gate-score";
-const JOB: &str = r#"{"v1":{"moruna_spec":1,"source":{"kind":"rows","rows":10},"kernels":[{"kind":"gate-score"}],"sink":{"kind":"count"}}}"#;
+const JOB: &str = r#"{"v1":{"moruna_spec":1,"source":{"kind":"rows","rows":10},"kernels":[{"kind":"function","function":"gate-score"}],"sink":{"kind":"count"}}}"#;
 
 #[test]
 fn a_signed_function_is_registered_and_listed() {

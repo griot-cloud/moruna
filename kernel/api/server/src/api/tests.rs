@@ -39,7 +39,7 @@ fn get(path: &str, token: Option<&str>) -> Request {
 }
 
 fn body(answer: &Answer) -> Value {
-    serde_json::from_slice(&answer.body).unwrap()
+    serde_json::from_slice(&answer.body.bytes()).unwrap()
 }
 
 /// An API whose one token key is `signer`'s.
@@ -59,7 +59,7 @@ fn each_operation_answers_a_token_whose_scope_covers_it() {
     let admin = signer.token("i-1", NOW + 60, &["admin"]);
     let health = api.answer(&get("/v1/health", None), &[], NOW);
     assert_eq!(health.status, 200);
-    assert_eq!(health.body, br#"{"status":"ok"}"#);
+    assert_eq!(health.body.bytes(), br#"{"status":"ok"}"#);
     let node = api.answer(&get("/v1/node", Some(&admin)), &[], NOW);
     assert_eq!(node.status, 200);
     assert_eq!(
@@ -71,7 +71,7 @@ fn each_operation_answers_a_token_whose_scope_covers_it() {
             "boot_ms": 2140, "time": NOW, "health": "degraded"
         })
     );
-    let node: Node = serde_json::from_slice(&node.body).unwrap();
+    let node: Node = serde_json::from_slice(&node.body.bytes()).unwrap();
     assert_eq!(node, facts().document(NOW));
     let audit = api.answer(&get("/v1/node/audit", Some(&admin)), &[], NOW);
     assert_eq!(audit.status, 200);
@@ -189,7 +189,7 @@ fn errors_carry_their_code_and_status() {
     ] {
         let answer = Answer::error(code, "why");
         assert_eq!(answer.status, code.status());
-        let parsed: ErrorBody = serde_json::from_slice(&answer.body).unwrap();
+        let parsed: ErrorBody = serde_json::from_slice(&answer.body.bytes()).unwrap();
         assert_eq!(parsed, ErrorBody::new(code, "why"));
     }
     let failed = Answer::ok(Err(serde_json::from_slice::<Value>(b"{").unwrap_err()));

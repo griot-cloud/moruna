@@ -1,10 +1,11 @@
 //! A node's function images (system design 3E, item 3.6): what a job's start does with the
 //! functions the job uses.
 //!
-//! - **Fetched** from the address each was registered with, through a [`Fetch`]: on a node, the
-//!   job's network (3D, item 3.4's `moruna-net` connector); in a test, anything that serves
-//!   bytes. A fetch is told the most bytes it may bring: the cache's whole size, since no image
-//!   larger than that is kept or run.
+//! - **Fetched** from the `https://` address each was registered with, through a [`Fetch`]: on a
+//!   node, by `node-admission` itself, over a channel it mints for the address's host on port
+//!   443, with the network server's `start_tls` (system design 3D, 3E); in a test, anything that
+//!   serves bytes. A fetch is told the most bytes it may bring: the cache's whole size, since no
+//!   image larger than that is kept or run.
 //! - **Verified:** the image's SHA-256 must be the one registered, whose signature `api` checked
 //!   at registration. An image changed since then is refused, naming the function
 //!   ([`Refused::Altered`]), and never kept.
@@ -13,8 +14,9 @@
 //!   SHA-256, whatever name or names it is registered under.
 //!
 //! What a job's start is handed ([`Cache::images`]) is each image's bytes, shared, in the order
-//! the job names them: an image evicted while a job still holds it lives until the job lets go.
-//! `no_std`, with `alloc`, for `node-admission`.
+//! the job names them, for `node-admission` to give the engine as a read-only memory object, the
+//! image stage's image with no copy: an image evicted while a job still holds it lives until the
+//! job lets go. `no_std`, with `alloc`, for `node-admission`.
 #![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -36,7 +38,7 @@ use moruna_imagefs::sha256;
 pub struct Registered {
     /// The name the job names it by.
     pub name: String,
-    /// Where its image is fetched from: an `https://` or object-store URL.
+    /// Where its image is fetched from: an `https://` URL.
     pub address: String,
     /// Its image's SHA-256.
     pub sha256: [u8; 32],

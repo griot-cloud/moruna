@@ -1,11 +1,13 @@
-//! The SCSI side: the five commands a block driver sends, the SCSI request each travels in,
-//! what a completion says of it, and the two answers the caller decodes from its own page.
+//! The SCSI side: the six commands a block driver sends, the SCSI request each travels in,
+//! what a completion says of it, and the three answers the caller decodes from its own page.
+
+use alloc::vec::Vec;
 
 use scsi_defs::{
-    AdditionalSenseCode, Cdb10, Cdb16, Cdb16Flags, CdbFlags, CdbInquiry, InquiryFlags,
-    ReadCapacity16Data, ReadCapacityDataEx, SERVICE_ACTION_READ_CAPACITY16, ScsiOp, ScsiStatus,
-    SenseDataErrorCode, SenseKey, ServiceActionIn16, VPD_SERIAL_NUMBER, VpdPageHeader,
-    srb::SrbStatus,
+    AdditionalSenseCode, Cdb10, Cdb16, Cdb16Flags, CdbFlags, CdbInquiry, InquiryFlags, LunList,
+    LunListEntry, ReadCapacity16Data, ReadCapacityDataEx, ReportLuns,
+    SERVICE_ACTION_READ_CAPACITY16, ScsiOp, ScsiStatus, SenseDataErrorCode, SenseKey,
+    ServiceActionIn16, VPD_SERIAL_NUMBER, VpdPageHeader, srb::SrbStatus,
 };
 use storvsp_protocol::{
     MAX_DATA_BUFFER_LENGTH_WITH_PADDING, NtStatus, Packet, SCSI_IOCTL_DATA_IN, SCSI_IOCTL_DATA_OUT,
@@ -98,6 +100,42 @@ pub fn serial(answer: &[u8]) -> Result<&[u8], Malformed> {
         .ok_or(Malformed("a serial longer than the bytes that arrived"))
 }
 
+/// Bytes [`Storvsc::report_luns`](crate::Storvsc::report_luns) asks the device for: one page,
+/// the list's header and 511 logical units, more than any Hyper-V controller has.
+pub const LUNS_BYTES: u32 = 4096;
+
+/// Decodes REPORT LUNS' answer (SPC-4, 6.33): the logical units of the target, as the
+/// bytes the device wrote into the caller's page, as many as the completion reports. Each
+/// unit a request can name, a single-level LUN below 256 in the peripheral or the flat
+/// addressing method, is in the list once, in the device's order; any other (a LUN of more
+/// levels, on another bus, or above 255) cannot be named in a storvsc request and is left
+/// out.
+pub fn luns(answer: &[u8]) -> Result<Vec<u8>, Malformed> {
+    let header: LunList = field(answer).ok_or(Malformed("a LUN list shorter than its header"))?;
+    let length = header.length.get() as usize;
+    if !length.is_multiple_of(size_of::<LunListEntry>()) {
+        return Err(Malformed("a LUN list whose length is not whole entries"));
+    }
+    let listed = &answer[size_of::<LunList>()..];
+    // A list longer than the bytes asked for arrives cut short: what arrived is used.
+    let (entries, _) = listed[..length.min(listed.len())].as_chunks::<8>();
+    let mut luns = Vec::new();
+    for entry in entries {
+        let lun = match (entry[0] >> 6, entry[2..].iter().all(|b| *b == 0)) {
+            // Peripheral device addressing on bus 0, and flat addressing.
+            (0, true) if entry[0] == 0 => Some(entry[1]),
+            (1, true) if entry[0] & 0x3f == 0 => Some(entry[1]),
+            _ => None,
+        };
+        if let Some(lun) = lun
+            && !luns.contains(&lun)
+        {
+            luns.push(lun);
+        }
+    }
+    Ok(luns)
+}
+
 /// The sense data of a failed command: SCSI's key, code and qualifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sense {
@@ -181,6 +219,18 @@ pub(crate) fn inquiry_serial() -> Command {
         flags: InquiryFlags::new().with_vpd(true),
         page_code: VPD_SERIAL_NUMBER,
         allocation_length: (SERIAL_BYTES as u16).into(),
+        control: 0,
+    };
+    Command::new(cdb.as_bytes(), true, false)
+}
+
+/// REPORT LUNS of every logical unit (select report 0), into one page.
+pub(crate) fn report_luns() -> Command {
+    let cdb = ReportLuns {
+        operation_code: ScsiOp::REPORT_LUNS,
+        reserved1: [0; 5],
+        allocation_length: LUNS_BYTES.into(),
+        reserved2: 0,
         control: 0,
     };
     Command::new(cdb.as_bytes(), true, false)

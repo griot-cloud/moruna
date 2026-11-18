@@ -161,6 +161,12 @@ impl Handle {
                 Ok(Handle(Object::Account(account.clone(), rights)))
             }
             Object::Account(_, _) => Err(Error::AccessDenied),
+            // A channel end's duplicate that may only be waited on: it shares the end,
+            // which closes once every handle to it has closed, as the kernel's does.
+            // The model keeps no rights on a channel's handles, so it makes no other.
+            Object::Endpoint(e) if rights == Rights::WAIT => {
+                Ok(Handle(Object::Endpoint(e.clone())))
+            }
             _ => Err(Error::WrongType),
         }
     }

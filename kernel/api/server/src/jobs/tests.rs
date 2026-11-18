@@ -13,7 +13,7 @@ const V1: &str = r#"{"v1": {"moruna_spec": 1,
     "sink": {"kind": "count"}}}"#;
 
 fn body(answer: &Answer) -> Value {
-    serde_json::from_slice(&answer.body).unwrap()
+    serde_json::from_slice(&answer.body.bytes()).unwrap()
 }
 
 /// The one answer that has come, under `ticket`.
@@ -27,12 +27,14 @@ fn resolved(jobs: &mut Jobs, ticket: u64) -> Answer {
 
 /// Everything `stream` can be sent now, as text, and whether it has ended.
 fn sent(jobs: &Jobs, stream: &mut Stream) -> (String, bool) {
-    let mut out = Vec::new();
+    let mut all = Vec::new();
     loop {
-        let before = out.len();
+        // Each fill into an output TLS has emptied, as the session makes it.
+        let mut out = Vec::new();
         let ended = jobs.fill(stream, &mut out);
-        if ended || out.len() == before {
-            return (String::from_utf8(out).unwrap(), ended);
+        all.extend_from_slice(&out);
+        if ended || out.is_empty() {
+            return (String::from_utf8(all).unwrap(), ended);
         }
     }
 }
@@ -97,7 +99,10 @@ fn a_job_goes_from_spec_to_exit() {
     // The report is the engine's, as it wrote it.
     let report = jobs.report(RUN);
     assert_eq!(report.status, 200);
-    assert_eq!(report.body, br#"{"rows_out": 1000, "exit": {"code": 0}}"#);
+    assert_eq!(
+        report.body.bytes(),
+        br#"{"rows_out": 1000, "exit": {"code": 0}}"#
+    );
     assert_eq!(
         serde_json::to_value(jobs.list()).unwrap(),
         json!({ "jobs": [{ "id": RUN, "state": "completed", "submitted": NOW,
@@ -305,7 +310,7 @@ fn what_the_engine_says_before_the_run_id_is_kept_for_the_job() {
     assert_eq!(status.heartbeat.unwrap().rows_out, 7);
     engine.exit(0, None);
     jobs.pump(&mut engine, &Registry::default(), NOW + 2);
-    assert_eq!(jobs.report(RUN).body, br#"{"early":true}"#);
+    assert_eq!(jobs.report(RUN).body.bytes(), br#"{"early":true}"#);
 }
 
 #[test]
@@ -446,8 +451,8 @@ fn a_stream_sends_records_heartbeats_then_the_report_and_the_exit() {
         "event: report\ndata: {\"type\":\"report\",\"report\":{\"rows_out\":20},\"plan\":{\"id\":\"plan-1\"}}\n\n\
          event: exit\ndata: {\"type\":\"exit\",\"code\":0,\"diagnostic\":null}\n\n"
     );
-    // A replay of the ended job, from its third record on.
-    let mut replay = jobs.stream(RUN, Some(3)).unwrap();
+    // A replay of the ended job after its second record: from its third on.
+    let mut replay = jobs.stream(RUN, Some(2)).unwrap();
     let (text, ended) = sent(&jobs, &mut replay);
     assert!(ended);
     assert!(text.starts_with("id: 3\nevent: event\n"), "{text}");
@@ -456,11 +461,244 @@ fn a_stream_sends_records_heartbeats_then_the_report_and_the_exit() {
         "heartbeats are not replayed"
     );
     assert!(text.ends_with("\"diagnostic\":null}\n\n") && text.contains("event: report\n"));
-    // From past its last record: only the end. From zero: all of it.
-    let (text, _) = sent(&jobs, &mut jobs.stream(RUN, Some(99)).unwrap());
-    assert!(text.starts_with("event: report\n"));
+    // After its last record, or past it: only the end. After zero: all of it.
+    for from in [3, 99] {
+        let (text, _) = sent(&jobs, &mut jobs.stream(RUN, Some(from)).unwrap());
+        assert!(text.starts_with("event: report\n"), "{from}: {text}");
+    }
     let (text, _) = sent(&jobs, &mut jobs.stream(RUN, Some(0)).unwrap());
     assert!(text.starts_with("id: 1\n"));
+}
+
+/// The page of the events' tool for [`RUN`] after its record `after`, parsed.
+fn page(jobs: &Jobs, after: u64) -> Value {
+    serde_json::from_str(&jobs.page(RUN, after).expect("the job is kept")).expect("a page is JSON")
+}
+
+/// Each event of `page`: its name, and its number when it has one.
+fn shape(page: &Value) -> Vec<(String, Option<u64>)> {
+    page["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| {
+            (
+                event["event"].as_str().unwrap().to_string(),
+                event["id"].as_u64(),
+            )
+        })
+        .collect()
+}
+
+/// `(name, id)` for a record numbered `id`.
+fn record(id: u64) -> (String, Option<u64>) {
+    ("event".to_string(), Some(id))
+}
+
+/// `(name, None)` for an event with no number.
+fn named(name: &str) -> (String, Option<u64>) {
+    (name.to_string(), None)
+}
+
+#[test]
+fn a_page_holds_the_records_after_from_then_the_end_and_where_to_go_on() {
+    let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
+    running(&mut jobs, &mut engine, V1);
+    // Running, with its first record: that record; after it, nothing yet.
+    let first = page(&jobs, 0);
+    assert_eq!(shape(&first), [record(1)]);
+    assert_eq!(first["records"][0]["data"]["kind"], "attempt_started");
+    assert_eq!(first["next"], 1);
+    assert_eq!(page(&jobs, 1), json!({ "records": [], "next": 1 }));
+    // A heartbeat and a record come. A page holds no heartbeat, as a fresh stream sends none
+    // until the next one comes: the job's latest is `jobs_get`'s.
+    engine.heartbeat(10);
+    engine.log("source", "two");
+    jobs.pump(&mut engine, &Registry::default(), NOW);
+    let second = page(&jobs, 1);
+    assert_eq!(shape(&second), [record(2)]);
+    assert_eq!(second["records"][0]["data"]["text"], "two");
+    assert_eq!(second["next"], 2);
+    // It ends: after the last record, the report and the exit, with no number; the page says
+    // to go on from where it was, and polled again it says the same.
+    engine.finish(r#"{"rows_out":20}"#, 0, None);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
+    let end = page(&jobs, 2);
+    assert_eq!(shape(&end), [named("report"), named("exit")]);
+    assert_eq!(
+        end["records"][0]["data"],
+        json!({ "type": "report", "report": { "rows_out": 20 }, "plan": { "id": "plan-1" } })
+    );
+    assert_eq!(
+        end["records"][1]["data"],
+        json!({ "type": "exit", "code": 0, "diagnostic": null })
+    );
+    assert_eq!(end["next"], 2);
+    assert_eq!(page(&jobs, 2), end);
+    // From the start, the page is what a fresh stream sends, event for event.
+    let whole = page(&jobs, 0);
+    let (text, ended) = sent(&jobs, &mut jobs.stream(RUN, None).unwrap());
+    assert!(ended);
+    let streamed: Vec<Value> = text
+        .split("\n\n")
+        .filter(|event| !event.is_empty())
+        .map(|event| {
+            let data = event.rsplit("data: ").next().unwrap();
+            serde_json::from_str(data).unwrap()
+        })
+        .collect();
+    let paged: Vec<Value> = whole["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["data"].clone())
+        .collect();
+    assert_eq!(paged, streamed);
+    assert_eq!(
+        shape(&whole),
+        [record(1), record(2), named("report"), named("exit")]
+    );
+    assert!(jobs.page("ffffffffffffffffffffffffffffffff", 0).is_none());
+}
+
+#[test]
+fn a_page_holds_at_most_1_000_events_and_its_end_whole() {
+    let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
+    running(&mut jobs, &mut engine, V1);
+    for n in 2..=1_500 {
+        engine.log("source", &format!("line {n}"));
+    }
+    // One line too long to read: the end will carry a note of it.
+    engine.say(&"x".repeat(ENGINE_LINE_LIMIT + 1));
+    jobs.pump(&mut engine, &Registry::default(), NOW);
+    let first = page(&jobs, 0);
+    let ids: Vec<u64> = shape(&first).iter().map(|event| event.1.unwrap()).collect();
+    assert_eq!(ids, (1..=1_000).collect::<Vec<u64>>());
+    assert_eq!(first["next"], 1_000);
+    // Caught up while the job runs: the rest, then the note, as a fresh stream sends it.
+    let rest = page(&jobs, 1_000);
+    let events = shape(&rest);
+    assert_eq!(events.len(), 501);
+    assert_eq!(events[499], record(1_500));
+    assert_eq!(events[500], named("note"));
+    assert_eq!(rest["records"][500]["data"]["skipped_lines"], 1);
+    assert_eq!(rest["next"], 1_500);
+    engine.finish("{}", 0, None);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
+    // The end is three events: with 997 records it fits, with 998 it waits for the next page.
+    let fits = shape(&page(&jobs, 503));
+    assert_eq!(fits.len(), 1_000);
+    assert_eq!(fits[996], record(1_500));
+    assert_eq!(fits[997..], [named("note"), named("report"), named("exit")]);
+    let waits = page(&jobs, 502);
+    assert_eq!(shape(&waits).len(), 998);
+    assert_eq!(waits["next"], 1_500);
+    assert_eq!(
+        shape(&page(&jobs, 1_500)),
+        [named("note"), named("report"), named("exit")]
+    );
+    // 1,000 records exactly leave no room for the end.
+    let full = page(&jobs, 500);
+    assert_eq!(shape(&full).len(), 1_000);
+    assert_eq!(full["next"], 1_500);
+}
+
+/// The bytes of the events' JSON in `page`.
+fn data_bytes(page: &Value) -> usize {
+    page["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["data"].to_string().len())
+        .sum()
+}
+
+#[test]
+fn a_page_holds_at_most_1_mib_of_events_but_always_one() {
+    let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
+    running(&mut jobs, &mut engine, V1);
+    // Records of a little over 100 KiB: after the first, small, record, ten fit in 1 MiB and
+    // the eleventh does not.
+    let line = "x".repeat(100 * 1024);
+    for _ in 0..20 {
+        engine.log("source", &line);
+    }
+    // A record whose JSON alone is over 1 MiB: each byte under 0x20 is written `\u00XX`.
+    engine.log("source", &"\u{1}".repeat(200 * 1024));
+    jobs.pump(&mut engine, &Registry::default(), NOW);
+    let ids = |page: &Value| -> Vec<u64> {
+        shape(page)
+            .iter()
+            .map(|event| event.1.expect("a record"))
+            .collect()
+    };
+    let first = page(&jobs, 0);
+    assert_eq!(ids(&first), (1..=11).collect::<Vec<u64>>());
+    assert!(data_bytes(&first) <= EVENTS_PAGE_BYTES);
+    assert_eq!(first["next"], 11);
+    let second = page(&jobs, 11);
+    assert_eq!(ids(&second), (12..=21).collect::<Vec<u64>>());
+    assert_eq!(second["next"], 21);
+    // The large record has a page of its own.
+    let large = page(&jobs, 21);
+    assert_eq!(ids(&large), [22]);
+    assert!(data_bytes(&large) > EVENTS_PAGE_BYTES);
+    assert_eq!(large["next"], 22);
+    // The end, with a report of 950 KiB, does not fit after it: it comes alone, next.
+    engine.finish(
+        &format!("{{\"pad\":\"{}\"}}", "r".repeat(950 * 1024)),
+        0,
+        None,
+    );
+    jobs.pump(&mut engine, &Registry::default(), NOW);
+    assert_eq!(ids(&page(&jobs, 21)), [22]);
+    let end = page(&jobs, 22);
+    assert_eq!(shape(&end), [named("report"), named("exit")]);
+    assert_eq!(end["next"], 22);
+    // After record 20: the record of 100 KiB, which the large one does not fit after.
+    assert_eq!(shape(&page(&jobs, 20)), [record(21)]);
+}
+
+#[test]
+fn a_page_passes_over_what_the_buffer_has_let_go() {
+    let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
+    running(&mut jobs, &mut engine, V1);
+    let line = "x".repeat(512 * 1024);
+    for _ in 0..40 {
+        engine.log("source", &line);
+        jobs.pump(&mut engine, &Registry::default(), NOW);
+    }
+    // Followed from the start, the pages begin at the oldest record kept, and their numbers show
+    // the gap. Records of 512 KiB come one to a page: two are over 1 MiB.
+    let records = jobs.buffered().1 as u64;
+    let (mut ids, mut next) = (Vec::new(), 0);
+    while next < 41 {
+        let kept = page(&jobs, next);
+        assert_eq!(shape(&kept).len(), 1);
+        ids.extend(shape(&kept).iter().map(|event| event.1.unwrap()));
+        next = kept["next"].as_u64().unwrap();
+    }
+    let first = 41 - records + 1;
+    assert_eq!(
+        ids,
+        (first..=41).collect::<Vec<u64>>(),
+        "the numbers show the gap"
+    );
+    // A job whose records have all gone gives the page its end alone.
+    engine.finish("{}", 0, None);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
+    engine.run_as("11111111111111111111111111111111");
+    running_as(&mut jobs, &mut engine, "11111111111111111111111111111111");
+    for _ in 0..40 {
+        engine.log("source", &line);
+        jobs.pump(&mut engine, &Registry::default(), NOW);
+    }
+    assert_eq!(
+        shape(&page(&jobs, 0)),
+        [named("report"), named("exit")],
+        "the first job's records are all gone"
+    );
+    assert_eq!(page(&jobs, 7)["next"], 7);
 }
 
 #[test]
@@ -572,6 +810,41 @@ fn the_last_100_jobs_are_kept_and_their_reports_within_their_bytes() {
 }
 
 #[test]
+fn what_follows_the_records_goes_a_batch_at_a_time_and_the_stream_goes_on() {
+    let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
+    running(&mut jobs, &mut engine, V1);
+    let mut stream = jobs.stream(RUN, Some(1)).unwrap();
+    // A heartbeat larger than a batch: the stream sends it over two fills.
+    let bottleneck = "b".repeat(40 * 1024);
+    engine.say(&format!(
+        r#"{{"type":"heartbeat","t_ms":1,"rows_out":1,"bottleneck":"{bottleneck}"}}"#
+    ));
+    jobs.pump(&mut engine, &Registry::default(), NOW);
+    // Each fill as the session makes it: into an output TLS has emptied.
+    let (mut first, mut second) = (Vec::new(), Vec::new());
+    assert!(!jobs.fill(&mut stream, &mut first));
+    assert_eq!(first.len(), STREAM_BATCH);
+    assert!(!jobs.fill(&mut stream, &mut second));
+    first.extend_from_slice(&second);
+    let text = String::from_utf8(first).unwrap();
+    assert!(text.starts_with("event: heartbeat\ndata: {"));
+    assert!(text.ends_with(&format!("{bottleneck}\"}}\n\n")));
+    // It has not ended: the next record follows, and then the end, with a report that has no
+    // plan.
+    engine.log("source", "after");
+    engine.say(r#"{"type":"report","report":{"rows_out":1}}"#);
+    engine.exit(0, None);
+    jobs.pump(&mut engine, &Registry::default(), NOW);
+    let (text, ended) = sent(&jobs, &mut stream);
+    assert!(ended);
+    assert!(text.starts_with("id: 2\nevent: event\n"), "{text}");
+    assert!(text.contains(
+        "event: report\ndata: {\"type\":\"report\",\"report\":{\"rows_out\":1},\"plan\":null}\n\n"
+    ));
+    assert!(text.ends_with("\"diagnostic\":null}\n\n"));
+}
+
+#[test]
 fn a_line_skipped_before_the_run_id_is_counted_for_the_job() {
     let (mut jobs, mut engine) = (Jobs::default(), Engine::new());
     let ticket = jobs.submit(&mut engine, V1.as_bytes(), NOW).unwrap();
@@ -625,11 +898,15 @@ fn a_secret_appears_in_nothing_the_node_keeps_or_answers() {
     let (events, ended) = sent(&jobs, &mut jobs.stream(RUN, None).unwrap());
     assert!(ended);
     all.push_str(&events);
-    all.push_str(&String::from_utf8(jobs.report(RUN).body).unwrap());
+    all.push_str(&String::from_utf8(jobs.report(RUN).body.bytes()).unwrap());
     all.push_str(&serde_json::to_string(&jobs.status(RUN).unwrap()).unwrap());
     all.push_str(&serde_json::to_string(&jobs.list()).unwrap());
     assert!(!all.contains(SECRET), "{all}");
     assert_eq!(all.matches("[redacted]").count(), 5, "{all}");
+    // A page of the events' tool: the log, the report and the exit, each redacted.
+    let page = jobs.page(RUN, 0).unwrap();
+    assert!(!page.contains(SECRET), "{page}");
+    assert_eq!(page.matches("[redacted]").count(), 3, "{page}");
     assert_eq!(
         jobs.status(RUN)
             .unwrap()
@@ -643,7 +920,7 @@ fn a_secret_appears_in_nothing_the_node_keeps_or_answers() {
     let ticket = jobs.submit(&mut engine, job.as_bytes(), NOW).unwrap();
     engine.exit(2, Some(&format!("source.key: {SECRET} is not a key")));
     jobs.pump(&mut engine, &Registry::default(), NOW);
-    let refused = String::from_utf8(resolved(&mut jobs, ticket).body).unwrap();
+    let refused = String::from_utf8(resolved(&mut jobs, ticket).body.bytes()).unwrap();
     assert!(
         !refused.contains(SECRET) && refused.contains("[redacted] is not a key"),
         "{refused}"
@@ -658,7 +935,7 @@ fn a_secret_appears_in_nothing_the_node_keeps_or_answers() {
     // The check is told the secrets' names, and never their values.
     let names = engine.0.borrow().checked_names.last().unwrap().clone();
     assert_eq!(names, ["other", "s3.key"]);
-    let refused = String::from_utf8(resolved(&mut jobs, ticket).body).unwrap();
+    let refused = String::from_utf8(resolved(&mut jobs, ticket).body.bytes()).unwrap();
     assert!(
         !refused.contains(SECRET) && refused.contains("[redacted] is not a key"),
         "{refused}"
@@ -666,5 +943,9 @@ fn a_secret_appears_in_nothing_the_node_keeps_or_answers() {
     // The host's own refusal.
     engine.0.borrow_mut().refuse_start = Some(HostError::Refused(format!("no volume {SECRET}")));
     let refused = jobs.submit(&mut engine, job.as_bytes(), NOW).unwrap_err();
-    assert!(!String::from_utf8(refused.body).unwrap().contains(SECRET));
+    assert!(
+        !String::from_utf8(refused.body.bytes())
+            .unwrap()
+            .contains(SECRET)
+    );
 }

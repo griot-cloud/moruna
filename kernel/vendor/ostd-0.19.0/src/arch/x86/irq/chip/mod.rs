@@ -280,7 +280,14 @@ fn init_and_disable_pic_if_present(madt_table: Pin<&Madt>) {
     // "A one indicates that the system also has a PC-AT-compatible dual-8259 setup. The 8259
     // vectors must be disabled (that is, masked) when enabling the ACPI APIC operation."
     const PCAT_COMPAT: u32 = 1;
-    if madt_table.flags & PCAT_COMPAT != 0 || pic::probe_legacy_pic() {
+    // moruna: the PIC is set up only where it answers its probe (Moruna's system design,
+    // section 1F: nothing from the old PC is assumed; work item 1.8). Upstream also set it
+    // up wherever the MADT sets PCAT_COMPAT, writing to ports that may have nothing behind
+    // them, as on a Hyper-V Generation 2 machine, which has no PIC. Where one answers it is
+    // masked as before, PCAT_COMPAT or not.
+    if pic::probe_legacy_pic() {
         pic::init_and_disable();
+    } else if madt_table.flags & PCAT_COMPAT != 0 {
+        crate::info!("The MADT sets PCAT_COMPAT, and no PIC answers its probe");
     }
 }

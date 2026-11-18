@@ -48,15 +48,15 @@ fn a_change_to_the_table_changes_both_files() {
     let step_2 = &OPERATIONS[..3];
     assert_eq!(openapi(step_2)["paths"].as_object().map(Map::len), Some(3));
     assert_eq!(mcp_tools(step_2)["tools"].as_array().map(Vec::len), Some(3));
-    // Step 3's seven job operations are on six paths, and 3E's two on one more; all but the
-    // stream of events are tools.
+    // Step 3's seven job operations are on six paths, and 3E's two on one more; each is a
+    // tool, the stream of events too.
     assert_eq!(
         openapi(OPERATIONS)["paths"].as_object().map(Map::len),
         Some(10)
     );
     assert_eq!(
         mcp_tools(OPERATIONS)["tools"].as_array().map(Vec::len),
-        Some(11)
+        Some(12)
     );
 }
 
@@ -169,7 +169,7 @@ fn openapi_has_every_operation_with_its_security_and_the_error_body() {
             "{path}"
         );
     }
-    // The stream of events is text, replayed from `from`; the report is any JSON object.
+    // The stream of events is text, replayed after `from`; the report is any JSON object.
     let events = &document["paths"]["/v1/jobs/{id}/events"]["get"];
     assert_eq!(events["operationId"], "jobs_events");
     assert_eq!(events["security"], observe);
@@ -179,8 +179,14 @@ fn openapi_has_every_operation_with_its_security_and_the_error_body() {
     );
     assert_eq!(
         events["parameters"][1],
-        json!({ "name": "from", "in": "query", "required": false,
+        json!({ "name": "from", "in": "query", "required": false, "description": FROM,
                 "schema": { "type": "integer", "minimum": 0 } })
+    );
+    assert!(
+        events["summary"]
+            .as_str()
+            .unwrap()
+            .contains("replayed after it")
     );
     let report = &document["paths"]["/v1/jobs/{id}/report"]["get"];
     assert_eq!(report["operationId"], "jobs_report");
@@ -373,12 +379,22 @@ fn openapi_schemas_carry_the_design_names_and_no_others() {
 fn mcp_has_one_tool_per_operation_with_its_input_and_output() {
     let list = mcp_tools(OPERATIONS);
     let tools = list["tools"].as_array().expect("a tool list");
-    let with_tools: Vec<&Operation> = OPERATIONS.iter().filter(|op| op.has_tool()).collect();
-    assert_eq!(tools.len(), with_tools.len());
+    assert_eq!(tools.len(), OPERATIONS.len());
     let nothing = json!({ "type": "object", "properties": {}, "additionalProperties": false });
     let id = json!({
         "type": "object",
         "properties": { "id": { "type": "string", "description": "The run's ID." } },
+        "required": ["id"],
+        "additionalProperties": false
+    });
+    // The events' tool: the run's ID, and the record its page comes after, which may be left
+    // out.
+    let events = json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string", "description": "The run's ID." },
+            "from": { "type": "integer", "minimum": 0, "description": FROM }
+        },
         "required": ["id"],
         "additionalProperties": false
     });
@@ -391,13 +407,14 @@ fn mcp_has_one_tool_per_operation_with_its_input_and_output() {
         ("moruna_jobs_list", Some("Jobs"), Some(&nothing)),
         ("moruna_jobs_get", Some("JobStatus"), Some(&id)),
         ("moruna_jobs_cancel", Some("JobStatus"), Some(&id)),
+        ("moruna_jobs_events", Some("JobEvents"), Some(&events)),
         ("moruna_jobs_report", None, Some(&id)),
         ("moruna_functions_register", Some("Function"), None),
         ("moruna_functions_list", Some("Functions"), Some(&nothing)),
     ];
-    for ((tool, operation), (name, title, input)) in tools.iter().zip(with_tools).zip(expected) {
+    for ((tool, operation), (name, title, input)) in tools.iter().zip(OPERATIONS).zip(expected) {
         assert_eq!(tool["name"], name);
-        assert_eq!(tool["description"], operation.summary);
+        assert_eq!(tool["description"], operation.tool_summary());
         match input {
             Some(input) => assert_eq!(&tool["inputSchema"], input, "{name}"),
             // A job: its document in one version, and nothing else; or a function's
@@ -428,5 +445,21 @@ fn mcp_has_one_tool_per_operation_with_its_input_and_output() {
     assert_eq!(
         allowed(&tools[1]["outputSchema"]["properties"]["cloud"]),
         ["azure", "none", "openstack"]
+    );
+    // A page of events: its records, each a stream's event with its JSON, and the next `from`.
+    let page = &tools[8]["outputSchema"];
+    assert_eq!(page["required"], json!(["records", "next"]));
+    let record = &page["properties"]["records"]["items"];
+    assert_eq!(record["required"], json!(["event", "data"]));
+    assert_eq!(
+        allowed(&record["properties"]["event"]),
+        ["event", "exit", "note", "report"]
+    );
+    assert_eq!(record["properties"]["data"]["type"], "object");
+    assert!(
+        tools[8]["description"]
+            .as_str()
+            .unwrap()
+            .contains("up to 1,000, and 1 MiB of them, after the record `from`")
     );
 }

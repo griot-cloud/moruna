@@ -17,23 +17,27 @@
 //!   connection.
 //! - Memory: a request's head is read and its token checked before any of its body, so a body
 //!   is read only for a call that takes one and is allowed; bodies share [`BODY_BUDGET`], and a
-//!   body that does not fit is answered `busy`.
+//!   body that does not fit is answered `busy`. An answer's body is written as TLS takes it,
+//!   32 KiB at a time, from where it is kept: a report, a page of events, or an MCP tool's
+//!   result holding either twice, is never copied whole.
 //! - Tokens (2C): every operation but `health` needs a JWT signed with Ed25519 under one of the
 //!   node's [`TokenKey`]s, for this node, expiring within [`MOST_AHEAD_SECONDS`], whose scope
 //!   covers the operation. Each call of an operation but `health` leaves an audit record; the
 //!   last [`AUDIT_LIMIT`] are kept in memory, and `node/audit` answers the newest
 //!   [`AUDIT_ANSWER_LIMIT`], newest first.
 //! - MCP (2D): `POST /mcp` on the same port with the same tokens, MCP's Streamable HTTP,
-//!   stateless, at [`PROTOCOL_VERSION`]: one tool per operation, `moruna_<id>`, but the stream
-//!   of events.
+//!   stateless, at [`PROTOCOL_VERSION`]: one tool per operation, `moruna_<id>`. The stream of
+//!   a job's events is `moruna_jobs_events`, which answers a page of them after a record, up to
+//!   1,000 and 1 MiB, and the record to ask after next: an agent polls.
 //! - Jobs (3A, 3B): the server is the engine's host. Through an [`EngineHost`] the node gives it
 //!   ([`Server::with_engine`]), it has the engine check a document, starts a fresh engine for
 //!   each job with the host protocol's `spec`, sends `cancel`, and reads `hello`, `heartbeat`,
 //!   the framed event records, `report` and `exit`. One job runs at a time; the last
 //!   [`JOBS_KEPT`] are kept with their state, heartbeat, exit and report; the last
 //!   [`EVENTS_KEPT`] event and log records, within [`EVENT_BUFFER_BYTES`], are kept for
-//!   `GET /v1/jobs/{id}/events`, which sends them as Server-Sent Events and replays from
-//!   `?from=`. What a job says is secret appears in no answer, event, log or report.
+//!   `GET /v1/jobs/{id}/events`, which sends them as Server-Sent Events and replays them after
+//!   `?from=`, the last record the reader has, as Server-Sent Events' `Last-Event-ID` is. What
+//!   a job says is secret appears in no answer, event, log or report.
 //! - Functions (3E): `POST /v1/functions` registers a function image by name when its Ed25519
 //!   signature over the image's SHA-256 verifies under one of node config's `functions.keys`
 //!   ([`FunctionKey`]); the entries, at most [`FUNCTIONS_LIMIT`], are kept in memory and listed by
@@ -55,6 +59,7 @@ extern crate std;
 
 mod api;
 mod audit;
+mod body;
 mod der;
 mod engine;
 #[cfg(test)]

@@ -10,7 +10,7 @@ use moruna_svc::{
 };
 use netstack_protocol::{Addr, Endpoint, Policy, Target, net};
 
-use crate::Stack;
+use crate::{Grant, Stack};
 
 /// The stack, shared by every connection's handler and the server's loop, and the
 /// connections that closed while the stack was in use.
@@ -50,13 +50,15 @@ pub fn after_turn(shared: &Rc<Shared>, d: &mut Dispatcher, now: u64) {
             core::mem::take(&mut st.grants),
         )
     };
-    for (pending, policy) in grants {
+    for (pending, policy, name) in grants {
         let outcome = match Channel::create() {
-            Ok((ours, theirs)) => match d.listen(ours, factory(shared.clone(), policy)) {
-                Ok(()) => Outcome::reply(theirs),
-                // As many handles as one wait takes: no room for another listener.
-                Err(_) => Outcome::Failure(net::Error::TooMany.code()),
-            },
+            Ok((ours, theirs)) => {
+                match d.listen(ours, granted(shared.clone(), Grant::new(name, policy))) {
+                    Ok(()) => Outcome::reply(theirs),
+                    // As many handles as one wait takes: no room for another listener.
+                    Err(_) => Outcome::Failure(net::Error::TooMany.code()),
+                }
+            }
             Err(_) => Outcome::Failure(net::Error::TooMany.code()),
         };
         // An answer whose connection has gone is dropped with it.
@@ -70,16 +72,24 @@ pub fn after_turn(shared: &Rc<Shared>, d: &mut Dispatcher, now: u64) {
 /// A connection's handler.
 pub struct Session {
     shared: Rc<Shared>,
-    policy: Policy,
+    grant: Rc<Grant>,
     id: Option<u64>,
 }
 
-/// A listener's factory: every connection through it holds `policy`.
+/// A listener's factory: every connection through it holds `policy`, under one grant
+/// of no slot's name.
 pub fn factory(shared: Rc<Shared>, policy: Policy) -> Factory {
+    granted(shared, Grant::new("(unnamed)", policy))
+}
+
+/// A listener's factory for `grant`: every connection through it holds its policy, and
+/// the sockets they hold between them count against its bound.
+pub fn granted(shared: Rc<Shared>, grant: Grant) -> Factory {
+    let grant = Rc::new(grant);
     Box::new(move || {
         Box::new(Session {
             shared: shared.clone(),
-            policy: policy.clone(),
+            grant: grant.clone(),
             id: None,
         }) as Box<dyn Handler>
     })
@@ -101,7 +111,7 @@ impl Handler for Session {
         let id = cx.connection();
         self.id = Some(id);
         let mut st = self.shared.stack.borrow_mut();
-        st.connection(id, &self.policy);
+        st.connection(id, &self.grant, || cx.peer_watch().ok());
         let bad = Outcome::Status(Status::BadMessage);
         let bound = st.account_bound(id);
         macro_rules! authorized {

@@ -10,7 +10,7 @@ const NOW: u64 = 1_794_931_200;
 const IMAGE: &[u8] = b"\x7fELF a native function";
 
 fn body(answer: &Answer) -> Value {
-    serde_json::from_slice(&answer.body).unwrap()
+    serde_json::from_slice(&answer.body.bytes()).unwrap()
 }
 
 fn message(answer: &Answer) -> String {
@@ -45,9 +45,19 @@ fn a_signed_image_is_registered_listed_and_replaced() {
     assert_eq!(registry.get("gate-score").unwrap().registered, NOW);
     // Registering the name again replaces its entry; another name is another entry.
     let other = b"\x7fELF the second build";
-    let again = registration("gate-score", "az://code/gate-score", other, &signer);
+    let again = registration(
+        "gate-score",
+        "https://x.blob.core.windows.net/code/gate-score?sv=1&sig=a",
+        other,
+        &signer,
+    );
     assert_eq!(registry.register(again.as_bytes(), NOW + 5).status, 201);
-    let enrich = registration("gate-enrich", "s3://code/gate-enrich", IMAGE, &signer);
+    let enrich = registration(
+        "gate-enrich",
+        "https://images.example.com/gate-enrich",
+        IMAGE,
+        &signer,
+    );
     assert_eq!(registry.register(enrich.as_bytes(), NOW + 6).status, 201);
     let list = registry.list();
     let names: Vec<&str> = list.functions.iter().map(|f| f.name.as_str()).collect();
@@ -149,8 +159,15 @@ fn each_malformed_field_is_refused_with_its_reason() {
         (&with("address", "http://x/gate"), "the address".into()),
         (&with("address", "file:///gate"), "the address".into()),
         (&with("address", "https://"), "the address".into()),
-        (&with("address", "s3://bucket"), "the address".into()),
-        (&with("address", "az://container/"), "the address".into()),
+        // Only https://: an object store's scheme would need its credentials where it is fetched.
+        (&with("address", "s3://bucket/gate"), "the address".into()),
+        (
+            &with("address", "az://container/gate"),
+            "the address".into(),
+        ),
+        (&with("address", "gs://bucket/gate"), "the address".into()),
+        (&with("address", "HTTPS://x/gate"), "the address".into()),
+        (&with("address", "https://?a=b"), "the address".into()),
         (&with("address", "gate-score"), "the address".into()),
         (&with("address", "https://x/a b"), "the address".into()),
         (
@@ -194,9 +211,8 @@ fn each_malformed_field_is_refused_with_its_reason() {
     for address in [
         "https://x",
         "https://x/a?b=c",
-        "s3://b/k",
-        "az://c/k/l",
-        "gs://b/k",
+        "https://acct.blob.core.windows.net/c/k?sv=2025-01-05&sig=abc%2Fdef",
+        "https://b.s3.amazonaws.com/k?X-Amz-Signature=0f",
     ] {
         assert!(is_address(address), "{address}");
     }
@@ -230,10 +246,12 @@ fn a_function_a_job_uses_that_is_not_registered_is_refused() {
     assert_eq!(registry.register(text.as_bytes(), NOW).status, 201);
     assert!(registry.refusals(&[]).is_empty());
     assert!(registry.refusals(&["gate-score".to_string()]).is_empty());
+    // The check names a job's registered functions only (its `kernels` entries of kind
+    // `function`), never the engine's own kinds.
     let refusals = registry.refusals(&[
         "gate-score".to_string(),
         "gate-audit".to_string(),
-        "std".to_string(),
+        "gate-enrich".to_string(),
     ]);
     assert_eq!(refusals.len(), 2);
     assert_eq!(refusals[0].field, "functions");
@@ -242,5 +260,5 @@ fn a_function_a_job_uses_that_is_not_registered_is_refused() {
             .message
             .contains("`gate-audit` is not registered")
     );
-    assert!(refusals[1].message.contains("`std`"));
+    assert!(refusals[1].message.contains("`gate-enrich`"));
 }

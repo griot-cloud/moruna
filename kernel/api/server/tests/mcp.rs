@@ -112,6 +112,7 @@ fn a_client_initializes_lists_and_calls_each_tool() {
             "moruna_jobs_list",
             "moruna_jobs_get",
             "moruna_jobs_cancel",
+            "moruna_jobs_events",
             "moruna_jobs_report",
             "moruna_functions_register",
             "moruna_functions_list"

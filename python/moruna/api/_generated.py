@@ -347,13 +347,14 @@ class FunctionRegistration:
     """
 
     name: str
-    """The name a job names the function by, as a task's kind: 1 to 64 characters, a lowercase
+    """The name a job names the function by (a version 1 `kernels` entry `{"kind": "function",
+    "function": "<name>"}`, a version 2 task of kind `function`): 1 to 64 characters, a lowercase
     letter first, then lowercase letters, digits, `_`, `-` and `.`.
     """
 
     address: str
-    """Where the image file is fetched from at job start: an `https://` URL, or an object-store URL
-    (`s3://`, `az://`, `gs://`).
+    """Where the image file is fetched from at job start: an `https://` URL. An object store's
+    private object is given as a pre-signed or SAS URL.
     """
 
     sha256: str
@@ -872,9 +873,9 @@ def functions_list(client: Caller) -> Functions:
 
 
 def functions_register(client: Caller, functionregistration: FunctionRegistration) -> Function:
-    """Register a function image by name: its address, its SHA-256, and an Ed25519 signature over
-    that SHA-256 by one of node config's functions.keys. Nothing is fetched until a job names it;
-    registering a name again replaces it.
+    """Register a function image by name: its https:// address, its SHA-256, and an Ed25519
+    signature over that SHA-256 by one of node config's functions.keys. Nothing is fetched until
+    a job names it; registering a name again replaces it.
 
     ``POST /v1/functions``, a token with scope ``admin``.
     """
@@ -944,7 +945,8 @@ def jobs_cancel(client: Caller, id: str) -> JobStatus:
 
 def jobs_events(client: Caller, id: str, *, from_: int | None = None) -> Iterator[ServerSentEvent]:
     """A job's events as Server-Sent Events: each event and log record as its JSON line, heartbeats,
-    then the report and the exit. `from` replays from that record of the node's buffer.
+    then the report and the exit. `from` is the last record already read, as Server-Sent Events'
+    Last-Event-ID: the node's buffer is replayed after it.
 
     ``GET /v1/jobs/{id}/events``, a token with scope ``observe``.
     """
@@ -996,9 +998,9 @@ class Operations(Caller):
         return functions_list(self)
 
     def functions_register(self, functionregistration: FunctionRegistration) -> Function:
-        """Register a function image by name: its address, its SHA-256, and an Ed25519 signature
-        over that SHA-256 by one of node config's functions.keys. Nothing is fetched until a job
-        names it; registering a name again replaces it.
+        """Register a function image by name: its https:// address, its SHA-256, and an Ed25519
+        signature over that SHA-256 by one of node config's functions.keys. Nothing is fetched
+        until a job names it; registering a name again replaces it.
 
         ``POST /v1/functions``, a token with scope ``admin``. The function
         ``functions_register(self, functionregistration)``.
@@ -1055,8 +1057,8 @@ class Operations(Caller):
 
     def jobs_events(self, id: str, *, from_: int | None = None) -> Iterator[ServerSentEvent]:
         """A job's events as Server-Sent Events: each event and log record as its JSON line,
-        heartbeats, then the report and the exit. `from` replays from that record of the node's
-        buffer.
+        heartbeats, then the report and the exit. `from` is the last record already read, as
+        Server-Sent Events' Last-Event-ID: the node's buffer is replayed after it.
 
         ``GET /v1/jobs/{id}/events``, a token with scope ``observe``. The function
         ``jobs_events(self, id, from_=from_)``.

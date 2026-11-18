@@ -79,7 +79,8 @@ pub struct Client {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Event {
     /// The record's number in the job's stream, from 1, for an `event`; `None` for the others.
-    /// A later call with `from` this number replays from this record.
+    /// A later call with `from` this number replays the records after this one, as Server-Sent
+    /// Events' `Last-Event-ID` does.
     pub id: Option<u64>,
     /// What it is: `event` (an event or log record), `heartbeat`, `report` or `exit`.
     pub name: String,
@@ -258,9 +259,10 @@ impl Client {
         self.send(operation("jobs_report")?, Some(id), None::<&()>)
     }
 
-    /// `GET /v1/jobs/{id}/events`: the job's events as they arrive, from its record `from`
-    /// (its first when `None`) as far back as the node's buffer holds them: each event and log
-    /// record, heartbeats, then the report and the exit. It needs an `observe` token.
+    /// `GET /v1/jobs/{id}/events`: the job's events as they arrive, after its record `from`, the
+    /// last one already read (from its first when `None` or 0), as far back as the node's
+    /// buffer holds them: each event and log record, heartbeats, then the report and the exit.
+    /// It needs an `observe` token.
     pub fn jobs_events(&self, id: &str, from: Option<u64>) -> Result<Events, Error> {
         let operation = operation("jobs_events")?;
         let mut url = self.url(operation, Some(id));

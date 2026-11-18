@@ -25,6 +25,10 @@ arrow = { version = "=59.3.0", default-features = false, features = ["ipc"] }
 bytemuck = { version = "=1.25.0" }
 moruna-ipc-check = { path = "../../../kernel/plane/check" }
 serde_json = { version = "=1.0.151" }
+# The engine's own record encoder (`moruna_kernel::ipc::encode_framing`), which lays out the
+# records the engine posts to a task, and an allocator for its framing.
+moruna-kernel = { path = "../../../crates/moruna-kernel" }
+moruna-testkit = { path = "../../../crates/moruna-testkit" }
 
 [profile.dev]
 panic = "abort"

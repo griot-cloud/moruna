@@ -9,9 +9,14 @@
 //! Reference: <https://wiki.osdev.org/Programmable_Interval_Timer>
 //!
 
+// moruna: whether a PIT answers at its ports, and the lines said when one is needed and
+// there is none (Moruna's system design, section 1F; work item 1.8).
+pub(in crate::arch) mod presence;
+
 use crate::{
     arch::{
-        device::io_port::WriteOnlyAccess,
+        // moruna: `ReadWriteAccess` added, for channel 0's latched count (`is_present`).
+        device::io_port::{ReadWriteAccess, WriteOnlyAccess},
         irq::{IRQ_CHIP, MappedIrqLine},
     },
     io::{IoPort, sensitive_io_port},
@@ -139,7 +144,10 @@ sensitive_io_port! {
     unsafe {
         /// The output from PIT channel 0 is connected to the PIC chip and generate "IRQ 0".
         /// If connected to PIC, the IRQ0 will generate by the **rising edge** of the output voltage.
-        static CHANNEL0_PORT: IoPort<u8, WriteOnlyAccess> = IoPort::new(0x40);
+        //
+        // moruna: read and write, where it was write only: `is_present` reads the latched
+        // count back through it.
+        static CHANNEL0_PORT: IoPort<u8, ReadWriteAccess> = IoPort::new(0x40);
 
         /// The output from PIT channel 1 was once used for refreshing the DRAM or RAM so that
         /// the capacitors don't forget their state.
@@ -181,6 +189,22 @@ pub(in crate::arch) fn init(operating_mode: OperatingMode) {
     const CYCLE: u32 = TIMER_RATE / TIMER_FREQ as u32;
     CHANNEL0_PORT.write((CYCLE & 0xFF) as _);
     CHANNEL0_PORT.write((CYCLE >> 8) as _);
+}
+
+/// moruna: whether a PIT answers at its ports (`presence.rs`). It sets channel 0 counting,
+/// as `init` does, and reads its latched count until two readings differ, at most
+/// `presence::READS` times. Nothing waits on an interrupt, so a machine with no PIT, as a
+/// Hyper-V Generation 2 machine, answers at once.
+pub(in crate::arch) fn is_present() -> bool {
+    init(OperatingMode::RateGenerator);
+    presence::counts((0..presence::READS).map(|_| {
+        MODE_COMMAND_PORT.write(
+            ((AccessMode::LatchCountValueCommand as u8) << 4) | ((Channel::Channel0 as u8) << 6),
+        );
+        let low = CHANNEL0_PORT.read();
+        let high = CHANNEL0_PORT.read();
+        u16::from_le_bytes([low, high])
+    }))
 }
 
 /// Enables the interrupt line that is connected to the PIT.

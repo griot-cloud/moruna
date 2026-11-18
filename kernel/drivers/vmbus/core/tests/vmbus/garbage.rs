@@ -137,7 +137,7 @@ fn a_message_type_the_protocol_does_not_have_is_refused() {
 #[test]
 fn before_contact_only_an_answer_to_it_is_a_message() {
     let mut host = FakeHost::new();
-    let mut client = Client::new();
+    let mut client = Client::new(0);
     // Disconnected.
     host.send(offer(1));
     assert_eq!(
@@ -249,7 +249,7 @@ fn a_version_accepted_with_no_connection_to_use_is_refused() {
     }
 
     let mut host = NoConnection(FakeHost::new());
-    let mut client = Client::new();
+    let mut client = Client::new(0);
     client.connect().unwrap();
     assert_eq!(client.poll(&mut host), Err(HostError::ConnectionId(0)));
     assert_eq!(client.state(), ClientState::Connecting);

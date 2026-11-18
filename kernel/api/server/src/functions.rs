@@ -1,15 +1,18 @@
 //! Functions (system design, section 3E): registration, the list, and the check a job's
 //! functions get at `validate`.
 //!
-//! - **Registration** (`POST /v1/functions`, admin) takes a name, the address the image file is
-//!   fetched from, the file's SHA-256 and an Ed25519 signature over the 32 bytes of that SHA-256.
-//!   The signature must verify under one of node config's `functions.keys` ([`FunctionKey`]);
-//!   then the entry is kept in `api`'s memory, at most [`FUNCTIONS_LIMIT`] of them. Nothing is
-//!   fetched. Registering a name again replaces its entry.
+//! - **Registration** (`POST /v1/functions`, admin) takes a name, the `https://` address the image
+//!   file is fetched from (an object store's private object as a pre-signed or SAS URL), the
+//!   file's SHA-256 and an Ed25519 signature over the 32 bytes of that SHA-256. The signature must
+//!   verify under one of node config's `functions.keys` ([`FunctionKey`]); then the entry is kept
+//!   in `api`'s memory, at most [`FUNCTIONS_LIMIT`] of them. Nothing is fetched. Registering a
+//!   name again replaces its entry.
 //! - **The list** (`GET /v1/functions`, observe): every entry, by name.
-//! - **A job names a function** by its registered name, as one of its tasks' kinds. The engine's
-//!   check answers the names a job uses (its `functions`), and each that is not registered is a
-//!   refusal of the job ([`Registry::refusals`]).
+//! - **A job names a function** by its registered name: in version 1 a `kernels` entry
+//!   `{"kind": "function", "function": "<name>"}`, in version 2 a task of kind `function` whose
+//!   settings name it. The engine's check answers those names only (its `functions`; the
+//!   engine's own kinds are never among them), and each that is not registered is a refusal of
+//!   the job ([`Registry::refusals`]).
 
 use crate::{api::Answer, identity::hex, token::base64};
 use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
@@ -22,10 +25,8 @@ use ring::{
 /// The most functions the node keeps registered: each takes a few hundred bytes of `api`'s
 /// memory, which is bounded (2B).
 pub const FUNCTIONS_LIMIT: usize = 256;
-/// The longest address taken, in bytes.
+/// The longest address taken, in bytes: a pre-signed or SAS URL's query included.
 pub const ADDRESS_LIMIT: usize = 2048;
-/// The schemes an address may have: HTTPS, and the object stores the engine reads.
-const SCHEMES: &[&str] = &["https", "s3", "az", "gs"];
 
 /// One of node config's `functions.keys`: an Ed25519 public key that may sign function images.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,9 +50,9 @@ impl FunctionKey {
     }
 }
 
-/// Whether `name` may name a function: the rule for a task's kind (`moruna_job::is_kind_name`),
-/// since a job names a function by its kind. 1 to 64 characters, a lowercase letter first, then
-/// lowercase letters, digits, `_`, `-` and `.`.
+/// Whether `name` may name a function: the rule for a kind's name (`moruna_job::is_kind_name`).
+/// 1 to 64 characters, a lowercase letter first, then lowercase letters, digits, `_`, `-` and
+/// `.`.
 pub(crate) fn is_function_name(name: &str) -> bool {
     let mut chars = name.chars();
     name.len() <= 64
@@ -60,17 +61,17 @@ pub(crate) fn is_function_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.'))
 }
 
-/// Whether `address` is one an image may be fetched from: `https://<host>/...`, or an object
-/// store's `<scheme>://<bucket or container>/<key>`, printable, with no space.
+/// Whether `address` is one an image may be fetched from: `https://<host>[/...]`, printable,
+/// with no space. Only HTTPS for now (the PM, 2026-11-18): an object store's scheme would need
+/// its credentials in `node-admission`, which fetches; a private object is given as a
+/// pre-signed or SAS URL instead.
 fn is_address(address: &str) -> bool {
-    let Some((scheme, rest)) = address.split_once("://") else {
+    let Some(rest) = address.strip_prefix("https://") else {
         return false;
     };
-    let (place, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
     address.len() <= ADDRESS_LIMIT
-        && SCHEMES.contains(&scheme)
-        && !place.is_empty()
-        && (scheme == "https" || !path.is_empty())
+        && !host.is_empty()
         && address.bytes().all(|b| b.is_ascii_graphic())
 }
 
@@ -138,8 +139,8 @@ impl Registry {
         }
         if !is_address(&given.address) {
             return Err(invalid(
-                "the address is where the image is fetched from: an https:// URL, or an object \
-                 store's s3://, az:// or gs:// URL with its key",
+                "the address is where the image is fetched from: an https:// URL (an object \
+                 store's private object as a pre-signed or SAS URL)",
             ));
         }
         let sha256 = sha256_of(&given.sha256).ok_or_else(|| {

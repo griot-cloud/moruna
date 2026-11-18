@@ -219,11 +219,11 @@
         "description": "A function image to register, the body of `POST /v1/functions` (system design 3E). Unknown\nfields are refused.",
         "properties": {
           "address": {
-            "description": "Where the image file is fetched from at job start: an `https://` URL, or an object-store\nURL (`s3://`, `az://`, `gs://`).",
+            "description": "Where the image file is fetched from at job start: an `https://` URL. An object store's\nprivate object is given as a pre-signed or SAS URL.",
             "type": "string"
           },
           "name": {
-            "description": "The name a job names the function by, as a task's kind: 1 to 64 characters, a lowercase\nletter first, then lowercase letters, digits, `_`, `-` and `.`.",
+            "description": "The name a job names the function by (a version 1 `kernels` entry\n`{\"kind\": \"function\", \"function\": \"<name>\"}`, a version 2 task of kind `function`): 1 to 64\ncharacters, a lowercase letter first, then lowercase letters, digits, `_`, `-` and `.`.",
             "type": "string"
           },
           "sha256": {
@@ -787,7 +787,7 @@
             ]
           }
         ],
-        "summary": "Register a function image by name: its address, its SHA-256, and an Ed25519 signature over that SHA-256 by one of node config's functions.keys. Nothing is fetched until a job names it; registering a name again replaces it."
+        "summary": "Register a function image by name: its https:// address, its SHA-256, and an Ed25519 signature over that SHA-256 by one of node config's functions.keys. Nothing is fetched until a job names it; registering a name again replaces it."
       }
     },
     "/v1/health": {
@@ -1048,6 +1048,7 @@
             }
           },
           {
+            "description": "The number of the last record already read, as Server-Sent Events' Last-Event-ID: the records after it are sent. 0, or absent, for the first.",
             "in": "query",
             "name": "from",
             "required": false,
@@ -1086,7 +1087,7 @@
             ]
           }
         ],
-        "summary": "A job's events as Server-Sent Events: each event and log record as its JSON line, heartbeats, then the report and the exit. `from` replays from that record of the node's buffer."
+        "summary": "A job's events as Server-Sent Events: each event and log record as its JSON line, heartbeats, then the report and the exit. `from` is the last record already read, as Server-Sent Events' Last-Event-ID: the node's buffer is replayed after it."
       }
     },
     "/v1/jobs/{id}/report": {
