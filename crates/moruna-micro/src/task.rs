@@ -1468,7 +1468,7 @@ impl TaskState {
                     Ok((id, _)) => break id,
                     // The region holds the task's unreleased batches: wait for a release.
                     Err(PlaneError::Budget { asked, free }) => {
-                        if !self.step(ports, names)? {
+                        if !self.step(ports, names)? && !self.wait_for_room(ports, names)? {
                             return Err(kernel_error(format!(
                                 "image `{}`: a record of {asked} bytes does not fit its input \
                                  region, which has {free} bytes free and nothing to release",
@@ -1483,7 +1483,7 @@ impl TaskState {
                 match self.plane.offer(self.task, 0, id) {
                     Ok(()) => break,
                     Err(PlaneError::Full) => {
-                        if !self.step(ports, names)? {
+                        if !self.step(ports, names)? && !self.wait_for_room(ports, names)? {
                             return Err(kernel_error(format!(
                                 "image `{}`: its input ring stays full",
                                 self.name
@@ -1516,6 +1516,75 @@ impl TaskState {
             .drop_batch(id)
             .map_err(|e| plane_error(&self.name, "the engine's hold", e))?;
         Ok((len, id))
+    }
+
+    /// After a look at the plane while the engine waits for room saw nothing come: whether to go
+    /// on waiting. The task releases each batch it holds once it has written its answer, so a
+    /// region or ring with a batch still in flight gets room; only one with nothing in flight
+    /// never will. A quiet look is the task at work, not a reason to give up: a record that did
+    /// not fit beside the batches in flight ended the run after one look of [`LOOK_NS`], while
+    /// the task was still working on them (6.2 run 4, Score at 4 instances on a 4-CPU node, 2 of
+    /// 5 runs; the booted check of 6.3r, both runs).
+    ///
+    /// While it waits, the engine takes the answers that have come. The task writes each answer
+    /// into a window, and a window goes back only when the engine takes the record in it: with
+    /// the records kept in place downstream and an answer not taken filling every window, the
+    /// task could not write its next answer, so it never released the batch whose room the
+    /// engine was waiting for (item 6.3r).
+    fn wait_for_room(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<bool> {
+        if self.in_flight.is_empty() && self.taking.is_none() {
+            return Ok(false);
+        }
+        // Every answer the task has finished, oldest first.
+        while let Some(oldest) = self.oldest()
+            && self
+                .early
+                .iter()
+                .any(|seen| matches!(seen, Seen::Released(b) if *b == oldest))
+        {
+            let answer = self.take_oldest(ports, names)?;
+            self.ready.push_back(answer);
+        }
+        // The parts of the answer the task is still writing, as far as they have come.
+        if matches!(self.early.front(), Some(Seen::Put(_)))
+            && (self.taking.is_some() || !self.in_flight.is_empty())
+        {
+            let mut taking = match self.taking.take() {
+                Some(taking) => taking,
+                None => Taking {
+                    offered: self.in_flight.pop_front().ok_or_else(|| {
+                        kernel_error(format!("image `{}`: no batch in flight", self.name))
+                    })?,
+                    parts: Vec::new(),
+                    refused: None,
+                    released: false,
+                },
+            };
+            while let Some(&Seen::Put(out)) = self.early.front() {
+                self.early.pop_front();
+                self.received += 1;
+                if let Err(e) = self.part(&mut taking, out) {
+                    self.taking = Some(taking);
+                    return Err(e);
+                }
+            }
+            self.taking = Some(taking);
+        }
+        Ok(true)
+    }
+
+    /// The batch whose answer is taken next: the one being taken, else the oldest in flight.
+    fn oldest(&self) -> Option<BatchId> {
+        match &self.taking {
+            Some(taking) => Some(taking.offered),
+            None => self.in_flight.front().copied(),
+        }
+    }
+
+    /// Batches posted to the task and not yet answered: those in flight, and the one whose
+    /// answer is being taken.
+    fn outstanding(&self) -> usize {
+        self.in_flight.len() + usize::from(self.taking.is_some())
     }
 
     /// One step of the plane while the engine waits for room: whether anything came.
@@ -1876,7 +1945,7 @@ impl TaskState {
             // the task has queued.
             self.gather(ports, names)?;
             let mut came = false;
-            while let Some(&oldest) = self.in_flight.front()
+            while let Some(oldest) = self.oldest()
                 && self
                     .early
                     .iter()
@@ -1890,7 +1959,7 @@ impl TaskState {
             // Nothing stays queued past this unit: a queued piece holds its morsel's memory,
             // and under memory pressure no unit may come to post it ([`layout::QUEUED_MAX`]).
             // And the stage's first unit leaves nothing in flight: it answers its whole morsel.
-            if layout::waits_for_answer(self.queued.len(), self.in_flight.len(), self.whole) {
+            if layout::waits_for_answer(self.queued.len(), self.outstanding(), self.whole) {
                 let answer = self.take_oldest(ports, names)?;
                 self.ready.push_back(answer);
                 self.feed(ports, names)?;
@@ -1942,7 +2011,7 @@ impl TaskState {
     /// ([`layout::to_post`]). A piece whose layout failed (the run's arena refused its
     /// framing) goes back to the front of the queue, for the unit applied again.
     fn feed(&mut self, ports: Option<&Arc<StagePorts>>, names: &[String]) -> Result<()> {
-        for _ in 0..layout::to_post(self.in_flight.len(), self.queued.len()) {
+        for _ in 0..layout::to_post(self.outstanding(), self.queued.len()) {
             let Some(part) = self.queued.pop_front() else {
                 break;
             };
