@@ -12,8 +12,8 @@ A Rust port of the dlmalloc allocator
 """
 edition.workspace = true
 
+# Moruna: the fuzzer is not vendored.
 [workspace]
-members = ['fuzz']
 
 [workspace.package]
 edition = '2021'

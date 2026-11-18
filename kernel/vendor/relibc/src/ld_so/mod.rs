@@ -128,7 +128,7 @@ fn static_init(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "redox"))]
+#[cfg(any(target_os = "linux", target_os = "moruna", target_os = "redox"))]
 pub unsafe fn init(
     sp: &'static Stack,
     #[cfg(target_os = "redox")] thr_fd: redox_rt::proc::FdGuardUpper,
@@ -141,6 +141,10 @@ pub unsafe fn init(
         let mut val = 0usize;
         syscall!(ARCH_PRCTL, ARCH_GET_FS, &raw mut val);
         tp = val;
+    }
+    #[cfg(all(target_os = "moruna", target_arch = "x86_64"))]
+    {
+        tp = relibc_moruna::thread::thread_pointer();
     }
     #[cfg(target_arch = "aarch64")]
     unsafe {

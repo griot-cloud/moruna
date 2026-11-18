@@ -1,0 +1,209 @@
+{
+  "upstreams": [
+    {
+      "name": "relibc",
+      "url": "https://gitlab.redox-os.org/redox-os/relibc.git",
+      "commit": "06a7b25d1874bdf0e4c6783fc5a84062d60aebad",
+      "license": "MIT",
+      "path": "."
+    },
+    {
+      "name": "openlibm",
+      "url": "https://gitlab.redox-os.org/redox-os/openlibm.git",
+      "commit": "f5ed774593458e116e69731a3ffa59e2a6408d4e",
+      "license": "MIT AND BSD-2-Clause AND ISC (LICENSE.md)",
+      "path": "openlibm/"
+    },
+    {
+      "name": "dlmalloc-rs",
+      "url": "https://gitlab.redox-os.org/redox-os/dlmalloc-rs.git",
+      "commit": "40c10f6182cb1d2a78b29f85492936dfbeded02e",
+      "license": "MIT OR Apache-2.0",
+      "path": "dlmalloc-rs/"
+    }
+  ],
+  "fetched": "2026-11-18, by git clone and a checkout of each commit; nothing was built or run",
+  "left_out": [
+    "redox-rt/",
+    "redox-ioctl/",
+    "ld_so/",
+    "src/crt0/",
+    "src/crti/",
+    "src/crtn/",
+    "Makefile",
+    "config.mk",
+    "renamesyms.sh",
+    "stripcore.sh",
+    "check.sh",
+    "fmt.sh",
+    "dynlst.txt",
+    "CONTRIBUTING.md",
+    "rust-toolchain.toml",
+    ".gitmodules",
+    ".gitlab-ci.yml",
+    ".gitignore",
+    "dlmalloc-rs/fuzz/",
+    "openlibm/{aarch64,arm,loongarch64,mips,powerpc,riscv64,s390,wasm32}/",
+    "openlibm/CMakeLists.txt",
+    "openlibm/openlibm.pc.in",
+    "openlibm/.github/",
+    "openlibm/.gitignore"
+  ],
+  "files": 1583,
+  "modified_upstream_files": {
+    "Cargo.lock": {
+      "upstream_sha256": "790d5cb8807db73793dbd43fc09b88beaa50e3c0886dc7c40d5adaf8fad82283",
+      "patched_sha256": "d0d414402f3bfbf9ac07596807279ef7e9555720e6348ddf8f3c5ce2ee165a2e"
+    },
+    "Cargo.toml": {
+      "upstream_sha256": "ff73ed1f29e24e4f145d5cf373154cc55dce89771c035725035a0fe7fcf0cca5",
+      "patched_sha256": "f8e417bd610a03e8f40b1ad2b7cdfe5512ebdb0412d16392e9589ba967dd4535"
+    },
+    "dlmalloc-rs/Cargo.toml": {
+      "upstream_sha256": "a677a6d15fe3552065fa0fd72fe4df6233c9d0ffa0e3c4b88cbaecc50eaeb40f",
+      "patched_sha256": "c83c242cf2d5911d27ed3287bb64e510f5bce7168d63fe4fe467e7d37552943e"
+    },
+    "generic-rt/Cargo.toml": {
+      "upstream_sha256": "3e80ffac172fc505ab198f583c990b6c92a9dae1b2991f116b4b8ae67a993e13",
+      "patched_sha256": "e1ed5a77812cb237a6fa39142e6d392dca9cd99f0d8887b3bb5a05d7444ad7c5"
+    },
+    "src/header/_paths/mod.rs": {
+      "upstream_sha256": "5a2980994c07e59e95fb2ba7fdb606f8b34677619b431955a5fb7794f80e2cf6",
+      "patched_sha256": "14ef90f347be381e01ffcb2dfc5895a3c11433ed17618b96df4669c3ffa80ce8"
+    },
+    "src/header/bits_mode-t/mod.rs": {
+      "upstream_sha256": "9fe0ed611ad518c6e9e44df8f447d57c475f28fec5c535b96216d7e52b5c4ddc",
+      "patched_sha256": "484b61018ce362f836ad6a3c9ac47634ef4ee59a742b7d35ae7fbfc8bb7164c3"
+    },
+    "src/header/bits_open-flags/mod.rs": {
+      "upstream_sha256": "a185fffae1b2e6ccc247733855685b83ede1e875e6696aace5a11e47b878a9d1",
+      "patched_sha256": "6c1139d246a5277bbd9f3741111c054469c9d195db4304cd266941ffdd6b6383"
+    },
+    "src/header/bits_suseconds-t/mod.rs": {
+      "upstream_sha256": "97e82b7757da246b25ca42c5d479eb6adef62a91ef9fd915b1cbbe35028cc563",
+      "patched_sha256": "708d9c72a8f04d29914c1b1dae16c4b2172b6fd78c7153415b63aab1f0668f20"
+    },
+    "src/header/fcntl/mod.rs": {
+      "upstream_sha256": "f4283b199cb5d73c138ab9924725dceffab3b7fbb51c4426a67cbb53a5796765",
+      "patched_sha256": "3ab41c320cb0f679d213d187524edeaaf1584958f289031fc676513e6487173a"
+    },
+    "src/header/grp/mod.rs": {
+      "upstream_sha256": "0aaf9aac79fdab537b06ba101d86ecbe94a96834da088b143272d58172e42ddb",
+      "patched_sha256": "aea1c654421527ef7915dad5631118e19b114634a58f90cce02d07a568cbd636"
+    },
+    "src/header/limits/mod.rs": {
+      "upstream_sha256": "8233b98da11fe2ccde05ce8145041094a59156276f658a57b1a61f2f84e99d2c",
+      "patched_sha256": "0c778aaab5cceb553ddd315ef4eee453fe73714eb8eb72475d12f7e17a6ed04c"
+    },
+    "src/header/netdb/mod.rs": {
+      "upstream_sha256": "9612f54a14935b19ccf6f7caee5162a4094467392282a2ef1f9f046f21fd1b6b",
+      "patched_sha256": "107257cf44e425d05a8f3aa57fd5ca372879808df7439330b82066ae2909abb5"
+    },
+    "src/header/pwd/mod.rs": {
+      "upstream_sha256": "1bc5aed8ec373d6f4d0ecead9dac6ce831cc6fbcd3efe4adab21cbf1d92e7db2",
+      "patched_sha256": "6030af97413c563e05ac2fd88f400485e99a1bae0ecb931869c36f162bd39c39"
+    },
+    "src/header/shadow/mod.rs": {
+      "upstream_sha256": "d9fcd83c7fe9bf18de66f5c4abede517f3b72cf9ea210bc933623bae7df182e3",
+      "patched_sha256": "7c7b74fa667c7d89601f98690037a8d94eabb7e7e3fa77ebfcd01830eedee8dc"
+    },
+    "src/header/signal/mod.rs": {
+      "upstream_sha256": "f302d67b27409cc0cac545feb7f1a186eb17a7ddc5512d303b957209b66bdf9c",
+      "patched_sha256": "df6cb350717a65ba68d648c05bd78a90bae57197fae5d60af75ac66eb9afc3ad"
+    },
+    "src/header/stdio/constants.rs": {
+      "upstream_sha256": "7c81d956581570ffa5c4c4bc0c30b7001f4e90a68d0a490efc5a2580c8fc22af",
+      "patched_sha256": "48521b32822bb21a88872013c9832fa5507b6fbc73e1c6ac32842a5f191df415"
+    },
+    "src/header/stdlib/mod.rs": {
+      "upstream_sha256": "e704ea6af0ec9328ef03d179a1f28b342d0dfe85640ba71dd520f0cdafc1a7f1",
+      "patched_sha256": "4f2f09be2f92c025a5040886e5dd70f8ca31a2161fb118baf3111ed1b1d2798f"
+    },
+    "src/header/sys_epoll/mod.rs": {
+      "upstream_sha256": "4ae5b12b937043bcaede196dd944183c6fa1c2c2136873c621e7f0b4f96988d9",
+      "patched_sha256": "5806a8c661c0f06d1dd891dbe5adc9e9c11fd8ab2a164b589a0ddd404de5c6c3"
+    },
+    "src/header/sys_ioctl/mod.rs": {
+      "upstream_sha256": "192583899fc57ca6d3cdbb7e6d253551d47f3b2cd75cd6fa9c64933169e737de",
+      "patched_sha256": "42fcecbb26df3548677b446e0f9da3877a6b3465d670d832a33b13bf28705186"
+    },
+    "src/header/sys_mman/mod.rs": {
+      "upstream_sha256": "1b7be4a16bcf30290e979d339edc675afb8ced7110d9f44a4dcbb4d5a611582c",
+      "patched_sha256": "70ac17b8dc332c65fc036e682091da3b7140bca16be00de8ace3aceee7f3ba57"
+    },
+    "src/header/sys_syslog/mod.rs": {
+      "upstream_sha256": "841f4acada8c85fae005a64cc129cc541adcf2f52e4a1a018ae83ccf5ad3ac52",
+      "patched_sha256": "52b04bc8eb1424000fa2e4c03579e0a36d11d18a052deeebf43748cdedb2ba96"
+    },
+    "src/header/termios/mod.rs": {
+      "upstream_sha256": "c885636f41b16afc71734ac1fbd96491f5fa6a5cbd9fa8360e5eead4e019c22c",
+      "patched_sha256": "a50323d736365e3264a357b4bbbe635f3547932690e56dcd23b3ee4c029cc457"
+    },
+    "src/header/time/constants.rs": {
+      "upstream_sha256": "4ae1ff2ccca0470a1b12076724d4dfdaf81c9a3293600395ebd52ffcb0cfdf55",
+      "patched_sha256": "e9462c55566a9c296c2de6500400675730658528d895ab208ce0697afe5ac85c"
+    },
+    "src/header/unistd/mod.rs": {
+      "upstream_sha256": "264a6f614e0bfb023f86fa59aad7fedb5efba92410b8240cad8b2212112f1bb8",
+      "patched_sha256": "2ba6ec42931af59987360cf94302989ba040f23b6925d84e87c500b3fec37fd8"
+    },
+    "src/header/unistd/sysconf.rs": {
+      "upstream_sha256": "2c8ef16f11fd2933d6bad8af638db5ac1bdd3740a8aaf2856d089e4c7848ebf8",
+      "patched_sha256": "281cd23b33f81191ee331009d10d12d4d6792fc14db0e05820e96a2d95b61f15"
+    },
+    "src/ld_so/dso.rs": {
+      "upstream_sha256": "88ae93bb28fbbdee444b4dd87718267ffef6fdd6b6c1099b5e93b50b40c6672c",
+      "patched_sha256": "b70957fc951481e22190c8e66715a981cb95fdcd70293709d31c636bf9eaf7c0"
+    },
+    "src/ld_so/mod.rs": {
+      "upstream_sha256": "b95199804a4b1550104163d2479073ef408181be7c1570c2131a9b317d25cc16",
+      "patched_sha256": "8436e50f1acf2d5179ff450c9da7e1e7851ceb074259600cef5a901ea5591e29"
+    },
+    "src/ld_so/tcb.rs": {
+      "upstream_sha256": "e7478c1ef9908aba0848cfc4bd9b49c3a0540874f2151049a64bc5e00ed94d07",
+      "patched_sha256": "07857231f39ae37b3916acc1acf00ac0d83febe4120970e68ccd98b5f9051479"
+    },
+    "src/lib.rs": {
+      "upstream_sha256": "ab4a48771ea8a0b3780bc9a7ec2d02cb4be62c5c342827977485cc3d4d944847",
+      "patched_sha256": "45c9b605f58700423734a0b18ce758ad4dc0f770a4d6a8643636a82664456468"
+    },
+    "src/platform/mod.rs": {
+      "upstream_sha256": "911cf4c8c4a86d824e4a38bf19a6a81d6f4bdb5534889fd8789653b2e2ffe66a",
+      "patched_sha256": "8c3d66ff80a868266c7362848f31dd221e73778c2e249bb8127e6e7e60e8f5e9"
+    },
+    "src/platform/types.rs": {
+      "upstream_sha256": "e8b0884ec57d3ac14fe5e840a3e612719736d90a132bbbe95aaa8764e887a635",
+      "patched_sha256": "aec9bdabef7ed91e9747436e77a087645437d93fe5ef435f9fb46d0a0600eb5a"
+    },
+    "src/pthread/mod.rs": {
+      "upstream_sha256": "e7f3e47a4dbd46cf3c9ffc442cd3dd006fff64c43cb1625f4b23774955eb6d31",
+      "patched_sha256": "a108f666b5cbd913c348af90247a164aae7354492605154b1609db381d0c5fba"
+    },
+    "src/sync/mod.rs": {
+      "upstream_sha256": "ab27e6ab289cf59cd8934a60618fee2d561e5b6faa8f5e004188e3d723b9c222",
+      "patched_sha256": "8e45916ced92f8e8efa50f395e230026a9e458b46b9e8c6059177eb0e179ff64"
+    }
+  },
+  "added_files": [
+    {
+      "path": "src/platform/moruna/epoll.rs",
+      "sha256": "470a69c8c8ce7f9c87b074cf62599fce789365a1a8a6764c1f60500aa50d4b73"
+    },
+    {
+      "path": "src/platform/moruna/mod.rs",
+      "sha256": "bfa7c9f1fcd2936a02deac36cd0f8c73f19cc1c54001587471a16c89ba15c990"
+    },
+    {
+      "path": "src/platform/moruna/ptrace.rs",
+      "sha256": "adc3209e84164193e8cedd1514f0f4c92b37e4085d2779efe2b6028229e4ce7d"
+    },
+    {
+      "path": "src/platform/moruna/signal.rs",
+      "sha256": "bd706d22d208c2a51267782714f44455280320f8098a28b32d2bfa9ac7708c2a"
+    },
+    {
+      "path": "src/platform/moruna/socket.rs",
+      "sha256": "5eb8468b83ec82e82e76660dd69439c81aed321803bc4915dcf9273ca107dbe9"
+    }
+  ]
+}

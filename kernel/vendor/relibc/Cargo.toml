@@ -3,20 +3,19 @@ name = "relibc"
 version = "0.2.5"
 authors = ["Jeremy Soller <jackpot51@gmail.com>"]
 edition = "2024"
+license = "MIT"
 
+# Moruna (item 5.2b): an rlib in one crate graph with std, moruna-function and its C library
+# (system design 5B); `cargo rustc --crate-type staticlib --features runtime` makes the archive
+# a program without std links.
 [lib]
 name = "relibc"
-crate-type = ["staticlib"]
+crate-type = ["rlib"]
 
+# Moruna: its own workspace under kernel/vendor, as upstream's is; Redox's own crates (redox-rt,
+# redox-ioctl), the dynamic linker (ld_so) and the crt objects are not vendored.
 [workspace]
-members = [
-    "src/crt0",
-    "src/crti",
-    "src/crtn",
-    "redox-rt",
-    "ld_so",
-    "generic-rt",
-]
+members = ["generic-rt"]
 exclude = ["tests", "dlmalloc-rs"]
 
 [workspace.lints.clippy]
@@ -68,11 +67,7 @@ workspace = true
 
 [workspace.dependencies]
 bitflags = "2"
-ioslice = { version = "0.6", default-features = false }
 plain = "0.2"
-redox-path = "0.4.1"
-redox_protocols = { package = "libredox", version = "0.1.25", default-features = false, features = ["protocol"] }
-redox_syscall = "0.9.5"
 
 [build-dependencies]
 cc = "1"
@@ -90,7 +85,6 @@ rand_jitter = "0.6"
 memchr = { version = "2.2.0", default-features = false }
 plain.workspace = true
 unicode-width = "0.1"
-__libc_only_for_layout_checks = { package = "libc", version = "0.2.149", optional = true }
 md5-crypto = { package = "md-5", version = "0.10.6", default-features = false }
 sha-crypt = { version = "0.5", default-features = false }
 base64ct = { version = "1.6", default-features = false, features = ["alloc"] }
@@ -100,46 +94,41 @@ bcrypt-pbkdf = { version = "0.10", default-features = false, features = [
 scrypt = { version = "0.11", default-features = false, features = ["simple"] }
 pbkdf2 = { version = "0.12", features = ["sha2"] }
 sha2 = { version = "0.10", default-features = false }
-generic-rt = { path = "generic-rt" }
+generic-rt = { path = "generic-rt", version = "=0.1.0" }
 chrono-tz = { version = "0.10", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 libm = "0.2"
 log = "0.4"
 spin = "0.9.8"
 argon2 = "0.5.3"
-redox-rings = { git = "https://gitlab.redox-os.org/redox-os/redox-rings.git", default-features = false, features = ["sync"] }
-redox-buffer-pool = { git = "https://gitlab.redox-os.org/redox-os/redox-buffer-pool.git", default-features = false, features = ["redox", "spinning"]}
 
 zerocopy = { version = "0.8.55", features = ["derive"] }
 
 [dependencies.dlmalloc]
 path = "dlmalloc-rs"
+version = "=0.2.8"
 default-features = false
 features = ["c_api"]
 
+# Moruna: crates.io's object, the release upstream's fork branches from, for the ELF reading
+# the static TLS setup and dl_iterate_phdr use.
 [dependencies.object]
 version = "0.36.7"
-git = "https://gitlab.redox-os.org/andypython/object"
-branch = "new"
 default-features = false
 features = ["elf", "read_core"]
 
-[target.'cfg(target_os = "linux")'.dependencies]
-sc = "0.2.7"
-
-[target.'cfg(target_os = "redox")'.dependencies]
-redox_syscall.workspace = true
-redox-rt = { path = "redox-rt" }
-redox-path.workspace = true
-redox_event = { version = "0.4.8", default-features = false, features = ["redox_syscall"] }
-ioslice.workspace = true
-redox-ioctl = { path = "redox-ioctl" }
-redox_protocols.workspace = true
+# Moruna: its platform, over moruna-sys (src/platform/moruna). Linux's and Redox's system call
+# crates are not vendored: neither platform is built here.
+[target.'cfg(target_os = "moruna")'.dependencies]
+relibc-moruna = { path = "../../relibc-moruna", version = "=0.1.0" }
 
 [features]
 # to enable trace level, take out this `no_trace`
-default = ["check_against_libc_crate", "no_trace"]
-check_against_libc_crate = ["__libc_only_for_layout_checks"]
+default = ["no_trace"]
+# Moruna: the libc crate the check compares layouts with knows no Moruna, and is not vendored.
+check_against_libc_crate = []
+# Moruna: the panic and allocation-error handlers, for a program without std; std has its own.
+runtime = []
 math_libm = []
 no_trace = ["log/release_max_level_debug"]
 # for very verbose activity beyond trace level
@@ -150,6 +139,3 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
-
-[patch.crates-io]
-redox_syscall = {git = "https://gitlab.redox-os.org/redox-os/kernel/"}

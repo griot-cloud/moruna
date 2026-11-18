@@ -6,7 +6,7 @@ use core::{mem, ptr};
 
 use cbitset::BitSet;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 use crate::platform::types::c_short;
 #[cfg(target_os = "redox")]
 use crate::platform::types::pthread_attr_t;
@@ -28,7 +28,7 @@ use super::{
     stdio::{fprintf, stderr},
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 #[path = "linux.rs"]
 pub mod sys;
 
@@ -110,7 +110,7 @@ pub struct sigaltstack {
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/signal.h.html>.
 #[repr(C)]
 #[derive(Clone)]
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "moruna")))]
 pub struct sigevent {
     /// Signal value.
     pub sigev_value: sigval,
@@ -131,7 +131,7 @@ pub struct sigevent {
 /// See <https://docs.rs/libc/0.2.186/src/libc/unix/linux_like/mod.rs.html#300-322>.
 #[repr(C)]
 #[derive(Clone)]
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 pub struct sigevent {
     /// Signal value.
     pub sigev_value: sigval,
@@ -150,7 +150,7 @@ pub struct sigevent {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "moruna")))]
 pub struct siginfo {
     /// Signal number.
     pub si_signo: c_int,
@@ -170,7 +170,7 @@ pub struct siginfo {
     pub si_value: sigval,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct siginfo {
@@ -188,7 +188,7 @@ pub struct siginfo {
     pub _sifields: siginfo_sifields,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union siginfo_sifields {
@@ -198,7 +198,7 @@ pub union siginfo_sifields {
     pub _pad: [c_char; 112],
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct siginfo_common {
@@ -207,7 +207,7 @@ pub struct siginfo_common {
     pub si_value: sigval,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct siginfo_sigfault {

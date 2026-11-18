@@ -40,6 +40,10 @@ impl Master {
 #[cfg(target_os = "linux")]
 pub type OsSpecific = ();
 
+// Moruna: the thread's id, given by its creator (no system call names a thread).
+#[cfg(target_os = "moruna")]
+pub type OsSpecific = crate::platform::sys::ThreadId;
+
 #[cfg(target_os = "redox")]
 pub type OsSpecific = redox_rt::signal::RtSigarea;
 
@@ -331,7 +335,7 @@ impl Tcb {
     ///
     /// For x86_64, the ABI page is not used.
     #[expect(clippy::type_complexity)]
-    #[cfg(any(target_os = "linux", target_os = "redox"))]
+    #[cfg(any(target_os = "linux", target_os = "moruna", target_os = "redox"))]
     unsafe fn os_new(
         size: usize,
     ) -> Result<(&'static mut [u8], &'static mut [u8], &'static mut [u8]), DlError> {
@@ -349,6 +353,14 @@ impl Tcb {
         unsafe {
             syscall!(ARCH_PRCTL, ARCH_SET_FS, tls_end);
         }
+    }
+
+    /// OS and architecture specific code to activate TLS - Moruna x86_64: the kernel keeps each
+    /// thread's FS base (`THREAD_SET_FS`), FS:0 the control block's self pointer.
+    #[cfg(all(target_os = "moruna", target_arch = "x86_64"))]
+    unsafe fn os_arch_activate(_os: &OsSpecific, tls_end: usize, _tls_len: usize) {
+        relibc_moruna::thread::set_thread_pointer(tls_end)
+            .expect("the kernel refused the thread's FS base");
     }
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]

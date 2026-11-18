@@ -1,6 +1,6 @@
 use crate::platform::types::{c_char, c_int, c_long, clockid_t};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 #[path = "linux.rs"]
 pub mod sys;
 

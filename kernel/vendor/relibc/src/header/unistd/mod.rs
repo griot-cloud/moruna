@@ -1347,9 +1347,15 @@ pub extern "C" fn ttyname_r(fildes: c_int, name: *mut c_char, namesize: size_t) 
 #[unsafe(no_mangle)]
 pub extern "C" fn ualarm(usecs: useconds_t, interval: useconds_t) -> useconds_t {
     // TODO setitimer is unimplemented on Redox and obsolete
-    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "moruna"),
+        target_pointer_width = "64"
+    ))]
     let (val_usec, int_usec) = (suseconds_t::from(usecs), suseconds_t::from(interval));
-    #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+    #[cfg(not(all(
+        any(target_os = "linux", target_os = "moruna"),
+        target_pointer_width = "64"
+    )))]
     let (val_usec, int_usec) = (
         suseconds_t::try_from(usecs).unwrap_or(suseconds_t::MAX),
         suseconds_t::try_from(interval).unwrap_or(suseconds_t::MAX),

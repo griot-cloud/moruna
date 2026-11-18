@@ -30,7 +30,7 @@ pub unsafe fn init() {
     //TODO: what is the best way to get these values?
     #[cfg(target_os = "redox")]
     let (stack_base, stack_size) = ((STACK_TOP - STACK_SIZE) as *mut c_void, STACK_SIZE);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "moruna"))]
     let (stack_base, stack_size) = (ptr::null_mut(), 0);
 
     let thread = Pthread {
@@ -93,7 +93,7 @@ pub struct Pthread {
 pub struct OsTid {
     #[cfg(target_os = "redox")]
     pub thread_fd: usize,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "moruna"))]
     pub thread_id: usize,
 }
 

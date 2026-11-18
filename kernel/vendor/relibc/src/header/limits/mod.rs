@@ -71,7 +71,7 @@ pub const MB_LEN_MAX: c_int = 4;
 
 // TODO: 4096 for most architectures as determined by a quick grep of musl's source; need a better
 // way to determine it for other archs or to hard code a value.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 pub const PAGE_SIZE: usize = 4096;
 
 // These POSIX symbols must have these values regardless of OS

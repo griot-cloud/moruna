@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Set the close-on-exec (`FD_CLOEXEC`) flag on the new file descriptor.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 pub const EPOLL_CLOEXEC: c_int = 0x8_0000;
 
 /// Set the close-on-exec (`FD_CLOEXEC`) flag on the new file descriptor.

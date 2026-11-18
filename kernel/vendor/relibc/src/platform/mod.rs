@@ -28,10 +28,15 @@ pub(crate) mod sys;
 #[path = "redox/mod.rs"]
 pub(crate) mod sys;
 
+// Moruna: its platform over moruna-sys (system design 5B, item 5.2b).
+#[cfg(target_os = "moruna")]
+#[path = "moruna/mod.rs"]
+pub(crate) mod sys;
+
 pub use self::rlb::{Line, RawLineBuffer};
 pub mod rlb;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 pub mod auxv_defs;
 
 #[cfg(target_os = "redox")]

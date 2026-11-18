@@ -73,7 +73,7 @@ impl FutexAtomicTy for AtomicU32 {
         #[cfg(target_os = "redox")]
         return AtomicU32::as_ptr(self);
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "moruna"))]
         return AtomicU32::as_mut_ptr(self);
 
         */
@@ -91,7 +91,7 @@ impl FutexAtomicTy for AtomicI32 {
         /*#[cfg(target_os = "redox")]
         return AtomicI32::as_ptr(self);
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "moruna"))]
         return AtomicI32::as_mut_ptr(self);*/
 
         ptr::from_ref::<AtomicI32>(self) as *mut i32

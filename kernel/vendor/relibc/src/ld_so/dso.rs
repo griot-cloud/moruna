@@ -3,12 +3,15 @@
 //! * <https://www.akkadia.org/drepper/dsohowto.pdf>
 
 use object::{
-    NativeEndian, Object, StringTable, SymbolIndex, U32, elf,
+    NativeEndian, Object, StringTable, SymbolIndex, elf,
     read::elf::{
         Dyn as _, GnuHashTable, HashTable as SysVHashTable, ProgramHeader as _, Rel as _,
         Rela as _, Sym as _, Version, VersionTable,
     },
 };
+// Moruna: only the hash table arms left out of its build use it.
+#[cfg(not(target_os = "moruna"))]
+use object::U32;
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::tcb::Tcb;
@@ -86,7 +89,24 @@ enum HashTable<'a> {
 }
 
 impl<'a> HashTable<'a> {
+    /// Moruna: a native function is one static program, and no object is loaded at run time
+    /// whose hash table a symbol is looked up in. crates.io's object, vendored for Moruna,
+    /// takes a parsed symbol table where upstream's fork takes the slices this file has.
+    #[cfg(target_os = "moruna")]
+    #[inline]
+    pub fn find(
+        &self,
+        _name: &str,
+        _version: Option<&Version<'_>>,
+        _symbols: &'a [Sym],
+        _strings: StringTable<'a>,
+        _versions: &VersionTable<'a, FileHeader>,
+    ) -> Option<(SymbolIndex, &'a Sym)> {
+        None
+    }
+
     /// Use the hash table to find the symbol table entry with the given name, hash, and version.
+    #[cfg(not(target_os = "moruna"))]
     #[inline]
     pub fn find(
         &self,
@@ -914,7 +934,9 @@ impl DSO {
         let mut needed = vec![];
         let mut jmprel = None;
         let mut soname = None;
-        let mut hash_table = None;
+        // Moruna: never set, its arms left out above.
+        #[cfg_attr(target_os = "moruna", allow(unused_mut))]
+        let mut hash_table: Option<HashTable<'_>> = None;
         let mut explicit_addend = None;
         let mut pltrelsz = None;
         let mut debug = None;
@@ -939,6 +961,9 @@ impl DSO {
             match tag {
                 elf::DT_DEBUG => debug = Some(i),
 
+                // Moruna: no object is loaded at run time (see `HashTable::find`), and the
+                // tables are made of crates.io object's private fields.
+                #[cfg(not(target_os = "moruna"))]
                 elf::DT_GNU_HASH => {
                     let header = unsafe { ptr.cast::<GnuHashHeader>().as_ref() }.unwrap();
                     let bloom_count = header.bloom_count.get(NativeEndian) as usize;
@@ -989,6 +1014,7 @@ impl DSO {
 
                 // XXX: Both GNU_HASH and HASH may be present, we give priority
                 // to GNU_HASH as it is significantly faster.
+                #[cfg(not(target_os = "moruna"))]
                 elf::DT_HASH if hash_table.is_none() => {
                     let header = unsafe { ptr.cast::<SysVHashHeader>().as_ref() }.unwrap();
                     let bucket_count = header.bucket_count.get(NativeEndian) as usize;

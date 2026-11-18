@@ -7,11 +7,11 @@
 //! Currently, Linux and Redox syscall backends are supported.
 
 #![no_std]
-#![feature(alloc_error_handler)]
+#![cfg_attr(feature = "runtime", feature(alloc_error_handler))]
 #![feature(c_variadic)]
 #![feature(core_intrinsics)]
 #![feature(macro_derive)]
-#![feature(lang_items)]
+#![cfg_attr(feature = "runtime", feature(lang_items))]
 #![feature(linkage)]
 #![feature(ptr_as_uninit)]
 #![feature(slice_ptr_get)]
@@ -64,19 +64,21 @@ use crate::platform::{Allocator, NEWALLOCATOR};
 #[global_allocator]
 static ALLOCATOR: Allocator = NEWALLOCATOR;
 
-#[cfg(not(test))]
+// Moruna: these four are the program's own only without std (feature `runtime`); in std's
+// crate graph std has them (system design 5B).
+#[cfg(all(not(test), feature = "runtime"))]
 #[panic_handler]
 #[linkage = "weak"]
 pub fn rust_begin_unwind(pi: &::core::panic::PanicInfo) -> ! {
     crate::panic::relibc_panic(pi)
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), feature = "runtime"))]
 #[lang = "eh_personality"]
 #[linkage = "weak"]
 pub extern "C" fn rust_eh_personality() {}
 
-#[cfg(not(test))]
+#[cfg(all(not(test), feature = "runtime"))]
 #[alloc_error_handler]
 #[linkage = "weak"]
 #[expect(improper_ctypes_definitions)]
@@ -89,7 +91,7 @@ pub extern "C" fn rust_oom(layout: ::core::alloc::Layout) -> ! {
     );
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), feature = "runtime"))]
 #[linkage = "weak"]
 #[unsafe(no_mangle)]
 pub extern "C" fn _Unwind_Resume() -> ! {

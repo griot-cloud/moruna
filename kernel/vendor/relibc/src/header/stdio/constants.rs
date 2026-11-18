@@ -27,9 +27,9 @@ pub const _IONBF: c_int = 2;
 /// Rename but don't replace the target if it exists.
 pub const RENAME_NOREPLACE: c_uint = 0x01;
 /// Atomically swap two files.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 pub const RENAME_EXCHANGE: c_uint = 0x02;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 pub const RENAME_WHITEOUT: c_uint = 0x04;
 
 // /dev/tty + nul

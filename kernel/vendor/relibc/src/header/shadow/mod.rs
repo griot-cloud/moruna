@@ -24,7 +24,7 @@ use crate::{
 use super::errno::{ENOENT, ERANGE};
 
 /// cbindgen:ignore
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 const SEPARATOR: char = ':';
 
 /// cbindgen:ignore

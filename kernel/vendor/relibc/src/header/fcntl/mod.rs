@@ -18,7 +18,7 @@ pub use crate::header::bits_open_flags::*;
 
 use super::errno::EINVAL;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 #[path = "linux.rs"]
 pub mod sys;
 

@@ -1,6 +1,6 @@
 //! Implementation specific, non-standard path aliases
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 #[path = "linux.rs"]
 mod sys;
 

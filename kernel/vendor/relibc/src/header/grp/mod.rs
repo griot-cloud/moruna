@@ -31,7 +31,7 @@ use super::{
 };
 
 /// cbindgen:ignore
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 const SEPARATOR: char = ':';
 
 /// cbindgen:ignore

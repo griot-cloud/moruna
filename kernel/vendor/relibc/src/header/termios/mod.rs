@@ -17,7 +17,7 @@ pub use self::sys::*;
 pub mod constants;
 pub use constants::*;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 #[path = "linux.rs"]
 pub mod sys;
 
@@ -56,7 +56,7 @@ pub const TCSADRAIN: c_int = 1;
 pub const TCSAFLUSH: c_int = 2;
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/termios.h.html>.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "moruna"))]
 #[repr(C)]
 #[derive(Default, Clone)]
 pub struct termios {
@@ -165,7 +165,7 @@ pub unsafe extern "C" fn tcgetsid(fildes: c_int) -> pid_t {
 /// Infallible. Always returns a value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cfgetispeed(termios_p: *const termios) -> speed_t {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "moruna"))]
     {
         unsafe { (*termios_p).__c_ispeed }
     }
@@ -189,7 +189,7 @@ pub unsafe extern "C" fn cfgetispeed(termios_p: *const termios) -> speed_t {
 /// Infallible. Always returns a value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cfgetospeed(termios_p: *const termios) -> speed_t {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "moruna"))]
     {
         unsafe { (*termios_p).__c_ospeed }
     }
@@ -213,7 +213,7 @@ pub unsafe extern "C" fn cfgetospeed(termios_p: *const termios) -> speed_t {
 pub unsafe extern "C" fn cfsetispeed(termios_p: *mut termios, speed: speed_t) -> c_int {
     match speed as usize {
         // TODO redox impl
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "moruna"))]
         B0..=B38400 | B57600..=B4000000 => {
             unsafe { (*termios_p).__c_ispeed = speed };
             0
@@ -238,7 +238,7 @@ pub unsafe extern "C" fn cfsetispeed(termios_p: *mut termios, speed: speed_t) ->
 pub unsafe extern "C" fn cfsetospeed(termios_p: *mut termios, speed: speed_t) -> c_int {
     match speed as usize {
         // TODO redox impl
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "moruna"))]
         B0..=B38400 | B57600..=B4000000 => {
             unsafe { (*termios_p).__c_ospeed = speed };
             0
