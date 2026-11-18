@@ -3,8 +3,8 @@
 
 use moruna_svc::{
     Channel, DEADLINE_INFINITE, Decoder, Encoder, Error, Handle, Hello, Kind, ObjectType,
-    ProtocolId, Refusal, Refused, Signals, Transport, WaitItem, Wire, WireError, frame, limits,
-    now, protocol, wait, wait_one,
+    ProtocolId, Refusal, Refused, Rights, Signals, Transport, WaitItem, Wire, WireError, frame,
+    limits, now, protocol, wait, wait_one,
 };
 
 fn round_trip<T: Wire + PartialEq + std::fmt::Debug + Clone>(value: T) {
@@ -293,4 +293,33 @@ fn sv_t8_wait_takes_many_items_and_honours_its_deadline() {
     let (a, c) = writer.join().expect("writer");
     drop((a, c));
     assert!(wait_one(&b.0, Signals::PEER_CLOSED, 0).is_ok());
+}
+
+#[test]
+fn sv_t8_a_wait_only_duplicate_shares_its_channel_end() {
+    let (a, b) = Channel::create().expect("channel");
+    let watch = a.0.duplicate(Rights::WAIT).expect("a wait-only duplicate");
+    assert_eq!(
+        a.0.duplicate(Rights::WAIT | Rights::READ).err(),
+        Some(Error::WrongType),
+        "no duplicate that may do more"
+    );
+    assert_eq!(
+        wait_one(&watch, Signals::PEER_CLOSED, 0),
+        Err(Error::TimedOut)
+    );
+    // The end stays open while any handle to it does, as the kernel's does.
+    drop(a);
+    assert_eq!(
+        wait_one(&b.0, Signals::PEER_CLOSED, 0),
+        Err(Error::TimedOut)
+    );
+    drop(watch);
+    assert!(wait_one(&b.0, Signals::PEER_CLOSED, 0).is_ok());
+    // A duplicate sees its end's peer go.
+    let (c, d) = Channel::create().expect("channel");
+    let watch = c.0.duplicate(Rights::WAIT).expect("a wait-only duplicate");
+    drop(d);
+    assert!(wait_one(&watch, Signals::PEER_CLOSED, 0).is_ok());
+    drop(c);
 }

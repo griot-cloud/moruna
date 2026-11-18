@@ -6,6 +6,10 @@
 //! resources. Any refusal powers the machine off with the reason on the console:
 //! a kernel that cannot start what it was told to start does not run half of it.
 //!
+//! The node's console (`architecture/moruna-os-system.md`, section 1B) has the core's line,
+//! `moruna: core <version> cpus=<n> memory=<bytes>`, once every CPU is online, and
+//! `moruna: fatal core: <reason>` for a refused boot or a panic, each before the power-off.
+//!
 //! Before anything is made the kernel sizes the machine's account (SDD 20 f.18): the
 //! free memory its frame allocator holds, less the kernel's own reserve. A manifest
 //! process with a `memory` line gets an account of its own carved out of it; every other
@@ -19,12 +23,17 @@ use alloc::{
     vec::Vec,
 };
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use moruna_abi::{
     ABI_MAJOR, ABI_MINOR, ResourceKind,
+    boot_line::{self, Core, Fatal, Panic},
     manifest::{Manifest, Source, source_rights},
+    resource_range,
 };
 use moruna_loader::cpio;
 use ostd::{
+    boot::memory_region::MemoryRegionType,
     early_println,
     power::{ExitCode, poweroff},
 };
@@ -32,6 +41,7 @@ use ostd::{
 use crate::{
     account::Account,
     channel::{self, Endpoint},
+    hyperv,
     memory::MemoryObject,
     object::{Console, Handle, Object, Resource},
     process::{self, Process},
@@ -51,9 +61,47 @@ pub fn boot() {
         }
         Err(reason) => {
             early_println!("kk: boot refused: {}", reason);
+            early_println!(
+                "{}",
+                Fatal {
+                    stage: boot_line::CORE,
+                    reason: &reason
+                }
+            );
             poweroff(ExitCode::Failure);
         }
     }
+}
+
+/// A panic in kernel mode is a fatal error of the core: its line, before OSTD's handler
+/// prints the panic whole and powers the machine off. It is said once, whichever CPU
+/// panics first and whatever panics after it, the writing of this line included.
+pub fn panicked(info: &core::panic::PanicInfo) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if SAID.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    early_println!(
+        "{}",
+        Fatal {
+            stage: boot_line::CORE,
+            reason: Panic {
+                location: info.location().map(|at| (at.file(), at.line())),
+                message: info.message(),
+            }
+        }
+    );
+}
+
+/// The usable RAM in the boot memory map: the bytes of every region OSTD's map of the
+/// bootloader's gives the type `Usable`.
+fn usable_memory() -> u64 {
+    ostd::boot::boot_info()
+        .memory_regions
+        .iter()
+        .filter(|region| region.typ() == MemoryRegionType::Usable)
+        .map(|region| region.len() as u64)
+        .sum()
 }
 
 fn start() -> Result<usize, String> {
@@ -77,6 +125,14 @@ fn start() -> Result<usize, String> {
     // once more. With no handler OSTD panics.
     ostd::mm::fault::inject_user_page_fault_handler(|_| Err(()));
     early_println!("kk: {} CPUs online", ostd::cpu::num_cpus());
+    early_println!(
+        "{}",
+        Core {
+            version: env!("CARGO_PKG_VERSION"),
+            cpus: ostd::cpu::num_cpus(),
+            memory: usable_memory(),
+        }
+    );
     #[cfg(feature = "probe")]
     osdk_frame_allocator::probe_shared_pool();
     let machine = machine_account()?;
@@ -103,18 +159,18 @@ fn machine_account() -> Result<Arc<Account>, String> {
 }
 
 /// The PCI configuration space the firmware describes (ACPI MCFG, its first segment),
-/// from its first bus to the end of its last: the range `root.ecam` covers.
+/// from its first bus to the end of its last: the range `root.ecam` covers. A machine
+/// whose firmware describes none, as a Hyper-V Generation 2 machine (the system design,
+/// section 1F), has no PCI bus: `root.ecam` covers nothing, and the boot goes on.
 fn ecam() -> Result<core::ops::Range<u64>, String> {
-    let region = ostd::arch::kernel::ACPI_INFO
+    let Some(region) = ostd::arch::kernel::ACPI_INFO
         .get()
         .and_then(|info| info.pci_ecam_region.as_ref())
-        .ok_or("root.ecam: the firmware describes no PCI configuration space (ACPI MCFG)")?;
-    let start = region.base_address + ((region.bus_start as u64) << 20);
-    let end = region.base_address + ((region.bus_end as u64 + 1) << 20);
-    if end <= start {
-        return Err(String::from("root.ecam: the MCFG's bus range is empty"));
-    }
-    Ok(start..end)
+    else {
+        return Ok(resource_range::NO_ECAM);
+    };
+    resource_range::ecam(region.base_address, region.bus_start, region.bus_end)
+        .ok_or_else(|| String::from("root.ecam: the MCFG's bus range is empty"))
 }
 
 fn start_manifest(machine: &Arc<Account>) -> Result<usize, String> {
@@ -177,6 +233,11 @@ fn start_manifest(machine: &Arc<Account>) -> Result<usize, String> {
                 Source::RootInterrupt => root(ResourceKind::Interrupt)?,
                 Source::RootMsi => root(ResourceKind::Msi)?,
                 Source::RootDma => root(ResourceKind::Dma)?,
+                // Made only where OSTD enabled CPU 0's SynIC; elsewhere the slot is left
+                // out, and the supervisor starts no service that needs it (ABI 2.7).
+                Source::RootHyperv if hyperv::available() => root(ResourceKind::Hyperv)?,
+                Source::RootHyperv => continue,
+                Source::RootClock => root(ResourceKind::Clock)?,
                 Source::RootEcam => Object::Resource(Arc::new(
                     Resource::new(
                         ResourceKind::DeviceMemory,

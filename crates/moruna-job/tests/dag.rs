@@ -3,8 +3,8 @@
 use moruna_job::{
     BudgetDoc, Catalogue, CheckpointDoc, Edge, ElasticDoc, ErrorPolicyDoc, GuaranteeDoc,
     HostProfileDoc, JOB_VERSION, Job, JobError, JobSpec, KindDoc, ObjectStoreDoc, Refusal,
-    RefusalCode, Reporting, S3Doc, SizerDoc, StagingDoc, Task, TaskIdsDoc, TaskRefDoc, check,
-    is_job_flatbuffer,
+    RefusalCode, Reporting, S3Doc, SecretRef, SizerDoc, StagingDoc, Task, TaskIdsDoc, TaskRefDoc,
+    check, is_job_flatbuffer,
 };
 use serde_json::{Value, json};
 
@@ -79,13 +79,18 @@ fn every_section() -> Job {
             endpoint: Some("unix:///s".into()),
             region: Some("r".into()),
             bucket: Some("b".into()),
+            access_key_id: Some(SecretRef::new("aws.id")),
+            secret_access_key: Some(SecretRef::new("aws.key")),
+            session_token: Some(SecretRef::new("aws:token")),
         }),
         gcs: Some(moruna_job::GcsDoc {
             bucket: Some("g".into()),
+            service_account_json: Some(SecretRef::new("gcs")),
         }),
         azure: Some(moruna_job::AzureDoc {
             account: Some("a".into()),
             container: Some("c".into()),
+            access_key: Some(SecretRef::new("azure-key_1")),
         }),
         local_root: Some("/root".into()),
         allow_http: true,

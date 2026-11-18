@@ -54,14 +54,17 @@ impl Grant {
     }
 }
 
-/// The value of one base64url digit, without padding (RFC 7515, section 2).
-fn digit(byte: u8) -> Option<u32> {
+/// The value of one base64 digit: of base64url (RFC 7515, section 2) when `url`, of standard
+/// base64 otherwise.
+fn digit(byte: u8, url: bool) -> Option<u32> {
     Some(u32::from(match byte {
         b'A'..=b'Z' => byte - b'A',
         b'a'..=b'z' => byte - b'a' + 26,
         b'0'..=b'9' => byte - b'0' + 52,
-        b'-' => 62,
-        b'_' => 63,
+        b'-' if url => 62,
+        b'_' if url => 63,
+        b'+' if !url => 62,
+        b'/' if !url => 63,
         _ => return None,
     }))
 }
@@ -69,6 +72,25 @@ fn digit(byte: u8) -> Option<u32> {
 /// `text` decoded from base64url without padding, refusing any other alphabet, padding, and a
 /// final digit whose unused bits are not zero.
 pub(crate) fn base64url(text: &[u8]) -> Option<Vec<u8>> {
+    decode(text, true)
+}
+
+/// `text` decoded from standard base64 with its padding, as the host protocol carries bytes.
+pub(crate) fn base64(text: &[u8]) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(4) {
+        return None;
+    }
+    let padding = text
+        .iter()
+        .rev()
+        .take(2)
+        .take_while(|b| **b == b'=')
+        .count();
+    decode(&text[..text.len() - padding], false)
+}
+
+/// `text` decoded from base64 digits without padding.
+fn decode(text: &[u8], url: bool) -> Option<Vec<u8>> {
     if text.len() % 4 == 1 {
         return None;
     }
@@ -76,7 +98,7 @@ pub(crate) fn base64url(text: &[u8]) -> Option<Vec<u8>> {
     for chunk in text.chunks(4) {
         let mut bits = 0u32;
         for (index, byte) in chunk.iter().enumerate() {
-            bits |= digit(*byte)? << (18 - 6 * index);
+            bits |= digit(*byte, url)? << (18 - 6 * index);
         }
         let bytes = bits.to_be_bytes();
         let whole = chunk.len() - 1;

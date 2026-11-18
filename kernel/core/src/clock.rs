@@ -1,10 +1,15 @@
 //! The clock, its page and the deadline queue (SDD 20, f.6; data-os §2, C8).
 //!
-//! The clock is the TSC scaled to nanoseconds since boot: `(tsc - origin) * MULTIPLIER >>
-//! SHIFT` (`moruna_datapath::clock`). The clock page publishes that same scale (`moruna_abi::clock_page`), written
-//! once at boot, so a process that maps it reads the time with no call and agrees with
-//! `clock_get` to the nanosecond. The TSC is the one counter and the scale never changes,
-//! so the page is never written again; its sequence lets a later kernel recalibrate.
+//! The clock is the TSC scaled to nanoseconds since the core's first instruction:
+//! `(tsc - origin) * MULTIPLIER >> SHIFT` (`moruna_datapath::clock`), where `origin` is the
+//! counter OSTD read as the boot processor ran its first Rust code (`ostd::boot::entry_tsc`, a
+//! `moruna:` patch), so the clock counts OSTD's start-up too (system design, section 1B:
+//! `boot_ms`). The clock page publishes that same scale and origin (`moruna_abi::clock_page`),
+//! written once at boot, so a process that maps it reads the time with no call and agrees with
+//! `clock_get` to the nanosecond. The TSC is the one counter and the scale never changes.
+//! The page is also the node's one wall clock (ABI 2.8): its realtime base and where the base
+//! came from, the CMOS clock's reading at boot, then each `clock_set_realtime`'s, both written
+//! under the page's sequence so a reader sees each change whole.
 //!
 //! Deadlines live in one queue ordered by time; OSTD's 1 kHz timer interrupt pops every
 //! entry that is due, firing a timer object or waking a waiting thread. Every mutation of
@@ -14,10 +19,11 @@
 use alloc::{collections::BTreeMap, sync::Arc, sync::Weak};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use moruna_abi::{DEADLINE_INFINITE, Error, PAGE_SIZE, Signals, charge};
+use moruna_abi::{DEADLINE_INFINITE, Error, PAGE_SIZE, Signals, charge, clock_page};
 use moruna_datapath::clock as scale;
 use ostd::{
     arch::{read_tsc, tsc_freq},
+    early_println,
     sync::{LocalIrqDisabled, SpinLock, Waker},
     timer,
 };
@@ -29,8 +35,13 @@ use crate::{
 };
 
 static MULTIPLIER: AtomicU64 = AtomicU64::new(0);
-/// The realtime clock at boot, in nanoseconds since 1970, read from the CMOS clock.
+/// The realtime base: the wall clock, in nanoseconds since 1970, at the monotonic clock's
+/// zero. The CMOS clock's reading at boot, then each `clock_set_realtime`'s; zero, unset, on a
+/// machine with no CMOS clock until `clock_set_realtime`.
 static REALTIME_AT_BOOT: AtomicU64 = AtomicU64::new(0);
+/// The clock page's sequence, kept here, where its one writer (`set_base`) reads it; its lock
+/// is what makes that writer one.
+static PAGE_SEQUENCE: SpinLock<u64> = SpinLock::new(scale::FIRST_SEQUENCE);
 static TSC_ORIGIN: AtomicU64 = AtomicU64::new(0);
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// The clock page, made at boot.
@@ -63,18 +74,65 @@ enum Entry {
 static QUEUE: SpinLock<BTreeMap<Key, Entry>, LocalIrqDisabled> = SpinLock::new(BTreeMap::new());
 
 /// Starts the clock and the deadline queue. Fails if OSTD could not measure the TSC.
+///
+/// The clock's zero is the core's first instruction: the counter OSTD recorded on entry. An entry
+/// that recorded none, or a counter ahead of this one, starts the clock here instead.
 pub fn init() -> Result<(), &'static str> {
     let hz = tsc_freq();
     if hz == 0 {
         return Err("the TSC frequency is unknown, so the clock cannot run");
     }
-    let origin = read_tsc();
+    let here = read_tsc();
+    let entry = ostd::boot::entry_tsc();
+    let origin = if entry != 0 && entry <= here {
+        entry
+    } else {
+        here
+    };
     let multiplier = scale::multiplier(hz).ok_or("the TSC frequency is unknown")?;
     TSC_ORIGIN.store(origin, Ordering::Release);
     MULTIPLIER.store(multiplier, Ordering::Release);
     make_page(origin, multiplier)?;
-    REALTIME_AT_BOOT.store(rtc::read()?, Ordering::Release);
+    // The CMOS clock is read now, after the clock's zero: the realtime at the zero is that
+    // reading less the time since, so `realtime` and a realtime deadline agree with it.
+    match rtc::read()? {
+        Some(cmos) => set_base(cmos.saturating_sub(now()), clock_page::realtime::MACHINE),
+        // No CMOS clock answered by its deadline: the realtime base stays unset, zero, its
+        // source `UNSET`, and the boot goes on. The node's wall clock comes from instance
+        // data, which `platform` reads and sets (`clock_set_realtime`, the system design,
+        // section 1D). Nothing in the core takes a zero base for an error: `realtime()` then
+        // counts from 1970, as the Linux layer's realtime clocks do (`foreign.rs`).
+        None => early_println!("{}", moruna_abi::boot_line::NO_CMOS_CLOCK),
+    }
+    early_println!(
+        "kk: clock: started {} ms after the core's first instruction",
+        scale::scale(here - origin, multiplier) / 1_000_000
+    );
     timer::register_callback_on_cpu(tick);
+    Ok(())
+}
+
+/// The realtime base becomes `base`, from `source` (`clock_page::realtime`), here and on the
+/// clock page, where readers see the base and the source change together under its sequence.
+fn set_base(base: u64, source: u64) {
+    let mut sequence = PAGE_SEQUENCE.lock();
+    if let Some(page) = page() {
+        for (at, bytes) in scale::realtime_writes(*sequence, base, source) {
+            // Each write lands before the next, as a reader of the sequence needs.
+            core::sync::atomic::fence(Ordering::SeqCst);
+            // The page is one page and every offset is inside it.
+            let _ = page.write(at as u64, &bytes);
+        }
+        *sequence += 2;
+    }
+    REALTIME_AT_BOOT.store(base, Ordering::Release);
+}
+
+/// `clock_set_realtime` (ABI 2.8): the wall clock reads `utc_ns` now. It may be called again
+/// at any time. `InvalidArgs` for a time at or before the monotonic clock's start.
+pub fn set_realtime(utc_ns: u64) -> Result<(), Error> {
+    let base = scale::realtime_base(utc_ns, now()).ok_or(Error::InvalidArgs)?;
+    set_base(base, clock_page::realtime::SET);
     Ok(())
 }
 
@@ -90,13 +148,14 @@ pub fn now() -> u64 {
     )
 }
 
-/// The realtime clock at boot, in nanoseconds since 1970.
+/// The realtime base: the wall clock, in nanoseconds since 1970, at the monotonic zero.
 pub fn realtime_at_boot() -> u64 {
     REALTIME_AT_BOOT.load(Ordering::Acquire)
 }
 
-/// The realtime clock now, in nanoseconds since 1970: the CMOS clock at boot, read once,
-/// advanced by the monotonic clock.
+/// The realtime clock now, in nanoseconds since 1970: the realtime base (the CMOS clock at
+/// boot, or the last `clock_set_realtime`) advanced by the monotonic clock. Unset, it counts
+/// from 1970.
 pub fn realtime() -> u64 {
     realtime_at_boot().saturating_add(now())
 }
@@ -104,6 +163,7 @@ pub fn realtime() -> u64 {
 /// The CMOS real-time clock, read once at boot (the node's time, as the machine's
 /// firmware keeps it, in UTC).
 mod rtc {
+    use moruna_datapath::clock as scale;
     use ostd::{arch::device::io_port::ReadWriteAccess, io::IoPort};
 
     const INDEX: u16 = 0x70;
@@ -136,11 +196,13 @@ mod rtc {
         century: u8,
     }
 
-    fn sample(cmos: &Cmos, century: Option<u8>) -> Reading {
-        while cmos.updating() {
-            core::hint::spin_loop();
+    /// One reading of the clock, once it is not updating; `None` if it is still updating
+    /// at `deadline`, as ports with no CMOS clock behind them read.
+    fn sample(cmos: &Cmos, century: Option<u8>, deadline: u64) -> Option<Reading> {
+        if !scale::wait_until(super::now, deadline, || !cmos.updating()) {
+            return None;
         }
-        Reading {
+        Some(Reading {
             second: cmos.get(0x00),
             minute: cmos.get(0x02),
             hour: cmos.get(0x04),
@@ -148,7 +210,7 @@ mod rtc {
             month: cmos.get(0x08),
             year: cmos.get(0x09),
             century: century.map(|r| cmos.get(r)).unwrap_or(0),
-        }
+        })
     }
 
     fn same(a: &Reading, b: &Reading) -> bool {
@@ -174,7 +236,10 @@ mod rtc {
         era * 146_097 + doe - 719_468
     }
 
-    pub fn read() -> Result<u64, &'static str> {
+    /// The clock, in nanoseconds since 1970; `None` when it has not answered and held
+    /// still within `CMOS_WAIT_NS`, as on a machine with no CMOS clock (the system design,
+    /// section 1B: no wait without a deadline in boot code).
+    pub fn read() -> Result<Option<u64>, &'static str> {
         let index = IoPort::acquire(INDEX).map_err(|_| "the CMOS clock's index port is taken")?;
         let data = IoPort::acquire(DATA).map_err(|_| "the CMOS clock's data port is taken")?;
         let cmos = Cmos { index, data };
@@ -182,10 +247,15 @@ mod rtc {
             .get()
             .and_then(|info| info.century_register)
             .map(|r| r.get());
+        let deadline = super::now().saturating_add(scale::CMOS_WAIT_NS);
         // Read until two readings agree, so an update between registers is not mixed in.
-        let mut last = sample(&cmos, century);
+        let Some(mut last) = sample(&cmos, century, deadline) else {
+            return Ok(None);
+        };
         let reading = loop {
-            let next = sample(&cmos, century);
+            let Some(next) = sample(&cmos, century, deadline) else {
+                return Ok(None);
+            };
             if same(&last, &next) {
                 break next;
             }
@@ -217,7 +287,7 @@ mod rtc {
             + decode(reading.minute) as i64 * 60
             + decode(reading.second) as i64;
         u64::try_from(seconds)
-            .map(|s| s * 1_000_000_000)
+            .map(|s| Some(s * 1_000_000_000))
             .map_err(|_| "the CMOS clock is before 1970")
     }
 }

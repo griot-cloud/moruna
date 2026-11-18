@@ -179,6 +179,86 @@
           }
         ]
       },
+      "Function": {
+        "description": "A registered function, as `GET /v1/functions` lists it.",
+        "properties": {
+          "address": {
+            "description": "Where its image is fetched from.",
+            "type": "string"
+          },
+          "key": {
+            "description": "The first 16 hex characters of the SHA-256 of the public bytes of the key whose signature\nverified, as the audit record names a token key.",
+            "type": "string"
+          },
+          "name": {
+            "description": "The name a job names it by.",
+            "type": "string"
+          },
+          "registered": {
+            "description": "When it was registered, in Unix seconds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sha256": {
+            "description": "The SHA-256 of its image, as 64 lowercase hexadecimal digits.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "address",
+          "sha256",
+          "key",
+          "registered"
+        ],
+        "type": "object"
+      },
+      "FunctionRegistration": {
+        "additionalProperties": false,
+        "description": "A function image to register, the body of `POST /v1/functions` (system design 3E). Unknown\nfields are refused.",
+        "properties": {
+          "address": {
+            "description": "Where the image file is fetched from at job start: an `https://` URL. An object store's\nprivate object is given as a pre-signed or SAS URL.",
+            "type": "string"
+          },
+          "name": {
+            "description": "The name a job names the function by (a version 1 `kernels` entry\n`{\"kind\": \"function\", \"function\": \"<name>\"}`, a version 2 task of kind `function`): 1 to 64\ncharacters, a lowercase letter first, then lowercase letters, digits, `_`, `-` and `.`.",
+            "type": "string"
+          },
+          "sha256": {
+            "description": "The SHA-256 of the image file, as 64 lowercase hexadecimal digits.",
+            "type": "string"
+          },
+          "signature": {
+            "description": "An Ed25519 signature over the 32 bytes of that SHA-256, by one of node config's\n`functions.keys`, in standard base64.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "address",
+          "sha256",
+          "signature"
+        ],
+        "type": "object"
+      },
+      "Functions": {
+        "description": "The answer to `GET /v1/functions`.",
+        "properties": {
+          "functions": {
+            "description": "Every registered function, by name.",
+            "items": {
+              "$ref": "#/components/schemas/Function"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "functions"
+        ],
+        "type": "object"
+      },
       "Health": {
         "description": "The answer to `GET /v1/health`.",
         "properties": {
@@ -201,6 +281,269 @@
             "type": "string"
           }
         ]
+      },
+      "Heartbeat": {
+        "description": "The fields of the engine's heartbeat (`moruna-hosted-engine.md`, section 4.3).",
+        "properties": {
+          "active_workers": {
+            "default": 0,
+            "description": "Workers allowed to take tasks.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "anon_bytes": {
+            "description": "The engine's anonymous memory, in bytes.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "bottleneck": {
+            "description": "What holds the run back, as the engine's controller last judged it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bytes_out": {
+            "default": 0,
+            "description": "Bytes the last stage has produced so far.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ceiling_bytes": {
+            "description": "The memory ceiling in force, in bytes.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "committed_seq": {
+            "description": "The sink's commit watermark.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rows_out": {
+            "default": 0,
+            "description": "Rows the last stage has produced so far.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "staging_bytes": {
+            "default": 0,
+            "description": "Bytes staged on disk.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "t_ms": {
+            "default": 0,
+            "description": "Milliseconds since the engine began the run.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "t_ms",
+          "rows_out",
+          "bytes_out",
+          "active_workers",
+          "staging_bytes"
+        ],
+        "type": "object"
+      },
+      "Job": {
+        "additionalProperties": false,
+        "description": "A job as a client hands it to the node: the job document, as version 1 JSON (`v1`) or as\nversion 2's FlatBuffers in base64 (`v2`), exactly one of the two, and the secrets its\nobject-store settings refer to by name (`{\"secret\": \"<name>\"}`).",
+        "properties": {
+          "secrets": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "The job's secrets (object-store credentials), by name: at most 32. They reach the engine\nbeside the document, never in it, and the node shows none of them in any answer, event,\nlog or report of this job.",
+            "type": "object"
+          },
+          "v1": {
+            "additionalProperties": true,
+            "description": "The job document, version 1, as JSON.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "v2": {
+            "description": "The job document, version 2: its `MJB2` FlatBuffer in standard base64.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "JobState": {
+        "description": "Where a job is in its life.",
+        "oneOf": [
+          {
+            "const": "starting",
+            "description": "The engine has taken the document and has not yet said how the run goes.",
+            "type": "string"
+          },
+          {
+            "const": "running",
+            "description": "The engine runs it.",
+            "type": "string"
+          },
+          {
+            "const": "completed",
+            "description": "It ended well: exit code 0.",
+            "type": "string"
+          },
+          {
+            "const": "failed",
+            "description": "It ended with an error.",
+            "type": "string"
+          },
+          {
+            "const": "cancelled",
+            "description": "It was cancelled: exit code 130.",
+            "type": "string"
+          }
+        ]
+      },
+      "JobStatus": {
+        "description": "The answer to `GET /v1/jobs/{id}` and to `POST /v1/jobs/{id}/cancel`.",
+        "properties": {
+          "ended": {
+            "description": "When it ended, in Unix seconds; absent until it has.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "exit_code": {
+            "description": "The engine's exit code; absent until the job has ended.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "heartbeat": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Heartbeat"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The engine's latest heartbeat; absent until it has sent one."
+          },
+          "id": {
+            "description": "The run's ID.",
+            "type": "string"
+          },
+          "started": {
+            "description": "When it began to run, in Unix seconds; absent until it has.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/JobState",
+            "description": "Where the job is in its life."
+          },
+          "submitted": {
+            "description": "When the node took the job, in Unix seconds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "state",
+          "submitted"
+        ],
+        "type": "object"
+      },
+      "JobSummary": {
+        "description": "One job in the list: its ID, its state and its times.",
+        "properties": {
+          "ended": {
+            "description": "When it ended, in Unix seconds; absent until it has.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "The run's ID.",
+            "type": "string"
+          },
+          "started": {
+            "description": "When it began to run, in Unix seconds; absent until it has.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/JobState",
+            "description": "Where the job is in its life."
+          },
+          "submitted": {
+            "description": "When the node took the job, in Unix seconds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "state",
+          "submitted"
+        ],
+        "type": "object"
+      },
+      "Jobs": {
+        "description": "The answer to `GET /v1/jobs`.",
+        "properties": {
+          "jobs": {
+            "description": "The last 100 jobs, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/JobSummary"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "jobs"
+        ],
+        "type": "object"
       },
       "Node": {
         "description": "The node document, the answer to `GET /v1/node`.",
@@ -281,6 +624,24 @@
           }
         ]
       },
+      "Refusal": {
+        "description": "One refusal of a job document, with the field it is about.",
+        "properties": {
+          "field": {
+            "description": "Where the problem is: `tasks[0].kind`, `budget.memory_bytes`, or `spec` for the document\nas a whole.",
+            "type": "string"
+          },
+          "message": {
+            "description": "One sentence that says what to change.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "field",
+          "message"
+        ],
+        "type": "object"
+      },
       "Scope": {
         "description": "What a token allows. `admin` covers `submit`, and `submit` covers `observe`.",
         "oneOf": [
@@ -300,6 +661,39 @@
             "type": "string"
           }
         ]
+      },
+      "Submitted": {
+        "description": "The answer to `POST /v1/jobs`: the job the node has taken.",
+        "properties": {
+          "id": {
+            "description": "The run's ID.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "Validation": {
+        "description": "The answer to `POST /v1/jobs/validate`: whether the engine takes the document.",
+        "properties": {
+          "ok": {
+            "description": "Whether the document is sound.",
+            "type": "boolean"
+          },
+          "refusals": {
+            "description": "Why not, when it is not: `moruna-job`'s refusals.",
+            "items": {
+              "$ref": "#/components/schemas/Refusal"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
       }
     },
     "securitySchemes": {
@@ -318,6 +712,84 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/v1/functions": {
+      "get": {
+        "operationId": "functions_list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Functions"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An error. Its code matches the HTTP status."
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "observe"
+            ]
+          }
+        ],
+        "summary": "Every registered function: its name, address, SHA-256, the key that signed it and when it was registered."
+      },
+      "post": {
+        "operationId": "functions_register",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FunctionRegistration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Function"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An error. Its code matches the HTTP status."
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "admin"
+            ]
+          }
+        ],
+        "summary": "Register a function image by name: its https:// address, its SHA-256, and an Ed25519 signature over that SHA-256 by one of node config's functions.keys. Nothing is fetched until a job names it; registering a name again replaces it."
+      }
+    },
     "/v1/health": {
       "get": {
         "operationId": "health",
@@ -345,6 +817,323 @@
         },
         "security": [],
         "summary": "Whether the node is up. The only call that needs no token."
+      }
+    },
+    "/v1/jobs": {
+      "get": {
+        "operationId": "jobs_list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Jobs"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An error. Its code matches the HTTP status."
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "observe"
+            ]
+          }
+        ],
+        "summary": "The last 100 jobs, newest first: each one's ID, state and times."
+      },
+      "post": {
+        "operationId": "jobs_submit",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Job"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Submitted"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An error. Its code matches the HTTP status."
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "submit"
+            ]
+          }
+        ],
+        "summary": "Run a job in a fresh engine and answer its run ID. Busy while a job runs; invalid with the engine's refusals."
+      }
+    },
+    "/v1/jobs/validate": {
+      "post": {
+        "operationId": "jobs_validate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Job"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Validation"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An error. Its code matches the HTTP status."
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "submit"
+            ]
+          }
+        ],
+        "summary": "Whether the engine takes a job document, and its refusals when it does not. Nothing runs."
+      }
+    },
+    "/v1/jobs/{id}": {
+      "get": {
+        "operationId": "jobs_get",
+        "parameters": [
+          {
+            "description": "The run's ID.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatus"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An error. Its code matches the HTTP status."
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "observe"
+            ]
+          }
+        ],
+        "summary": "One job: its state, its times, the engine's latest heartbeat and its exit code."
+      }
+    },
+    "/v1/jobs/{id}/cancel": {
+      "post": {
+        "operationId": "jobs_cancel",
+        "parameters": [
+          {
+            "description": "The run's ID.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatus"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An error. Its code matches the HTTP status."
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "submit"
+            ]
+          }
+        ],
+        "summary": "Tell the engine to cancel a job, and answer the job as it stands. Conflict if the job has ended."
+      }
+    },
+    "/v1/jobs/{id}/events": {
+      "get": {
+        "operationId": "jobs_events",
+        "parameters": [
+          {
+            "description": "The run's ID.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The number of the last record already read, as Server-Sent Events' Last-Event-ID: the records after it are sent. 0, or absent, for the first.",
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An error. Its code matches the HTTP status."
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "observe"
+            ]
+          }
+        ],
+        "summary": "A job's events as Server-Sent Events: each event and log record as its JSON line, heartbeats, then the report and the exit. `from` is the last record already read, as Server-Sent Events' Last-Event-ID: the node's buffer is replayed after it."
+      }
+    },
+    "/v1/jobs/{id}/report": {
+      "get": {
+        "operationId": "jobs_report",
+        "parameters": [
+          {
+            "description": "The run's ID.",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An error. Its code matches the HTTP status."
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "observe"
+            ]
+          }
+        ],
+        "summary": "A job's report, the engine's RunReport, once the job has ended."
       }
     },
     "/v1/node": {

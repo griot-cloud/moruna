@@ -94,7 +94,14 @@ fn audit_answers_its_list() {
 fn routes_come_from_the_operations_table_only() {
     let mut harness = Harness::new();
     let client = harness.connect();
-    for path in ["/", "/v1", "/v1/node/", "/v2/node", "/v1/jobs", "/V1/NODE"] {
+    for path in [
+        "/",
+        "/v1",
+        "/v1/node/",
+        "/v2/node",
+        "/v1/functions/gate-score",
+        "/V1/NODE",
+    ] {
         let response = harness.get(client, path, "");
         assert_eq!(response.status, 404, "{path}");
         assert_eq!(response.error_code(), "not_found");
@@ -257,7 +264,8 @@ fn a_body_is_never_read_for_a_call_its_token_does_not_allow() {
         (mcp_post(None, &ping_of(BODY_LIMIT)), 401),
         (mcp_post(Some("not.a.token"), &ping_of(BODY_LIMIT)), 401),
         (mcp_post(Some(&nothing), &ping_of(BODY_LIMIT)), 403),
-        (audit, 400),
+        // The scope is checked before the request is.
+        (audit, 403),
     ] {
         let client = harness.connect();
         let response = harness.exchange(client, &request);

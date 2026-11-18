@@ -487,6 +487,16 @@ fn ho_t8_checkpoint_then_cancel() {
     let on_disk = report_file(scratch.path());
     assert_eq!(on_disk["exit"]["code"], 130);
     assert_eq!(on_disk["exit"]["status"], "cancelled");
+    // stream P: the cancel's diagnosis is told as it came, before the run's end: where each
+    // worker's time went, as log events on the connection.
+    assert!(
+        everything.iter().any(|(_, m)| m["type"] == "event"
+            && m["kind"] == "log"
+            && m["text"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("at the cancel: engine worker "))),
+        "no diagnosis at the cancel"
+    );
     let _ = std::fs::remove_file(&socket);
 }
 

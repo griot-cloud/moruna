@@ -1,4 +1,4 @@
-//! `moruna.net` 3.0 (SDD 31, d.1): the network server's sockets, for the processes of a
+//! `moruna.net` 3.1 (SDD 31, d.1): the network server's sockets, for the processes of a
 //! node that speak to the network. A client connects, listens and accepts, sends and
 //! receives TCP bytes with backpressure and closes each half of a connection; binds
 //! UDP sockets and sends and receives datagrams; pings; and resolves names.
@@ -10,8 +10,10 @@
 //! server does anything, so a policy is the whole of what a client can reach: which
 //! remote addresses and ports it may connect and send to, which names it may resolve
 //! and connect to by name, which local addresses and ports it may listen and bind on,
-//! and how many sockets it may hold. A node's egress policy is a policy given to the
-//! listeners its tasks are linked to.
+//! how many sockets it may hold, and (since 3.1) how much memory they hold and for how
+//! long: each socket's buffers, the sockets one peer may hold, and how long a closed
+//! socket lingers. A node's egress policy is a policy given to the listeners its tasks
+//! are linked to.
 //!
 //! Sockets are numbered per connection and close with it. Requests that wait (open,
 //! accept, a receive with nothing queued, a send that finds no room, a resolve, a ping)
@@ -54,6 +56,16 @@ pub const NAME_MAX: usize = 253;
 pub const BACKLOG_MAX: u32 = 128;
 /// The most bytes a `ping` carries.
 pub const PING_MAX: u32 = 1024;
+/// The smallest and largest socket buffer, in bytes, a policy gives (`Policy::rx`,
+/// `Policy::tx`).
+pub const BUFFER_MIN: u32 = 1024;
+pub const BUFFER_MAX: u32 = 16 << 20;
+/// The live connections one remote address may hold through a grant's listeners when its
+/// policy says nothing (`Policy::per_peer`), and the most a policy may say.
+pub const PER_PEER_DEFAULT: u32 = 8;
+pub const PER_PEER_MAX: u32 = 65536;
+/// The longest linger a policy gives, in milliseconds (`Policy::linger_ms`).
+pub const LINGER_MAX_MS: u32 = 3_600_000;
 
 /// What a policy permits beyond its rules (`Policy::rights`).
 pub mod rights {
@@ -91,7 +103,9 @@ mod transport {
         pub protocol wire {
             name = "moruna.net";
             major = 3;
-            minor = 0;
+            // 3.1 (work item 1.3b): a policy bounds its sockets' buffers, the sockets
+            // one peer holds, and how long a closing socket lingers.
+            minor = 1;
             requests {
                 /// The interfaces, their addresses and links, the resolver's servers, and
                 /// this connection's policy.
@@ -170,8 +184,10 @@ mod transport {
                 8 => WrongKind;
                 /// A request of the same kind already waits on the socket.
                 9 => InUse;
-                /// The connection holds as many sockets as its policy allows, or the server
-                /// as many as its configuration allows.
+                /// The connection's grant holds as many sockets as its policy allows (every
+                /// connection through the grant's listener counted together, closing
+                /// sockets until they are freed), or the server as many as its
+                /// configuration allows.
                 10 => TooMany;
                 /// The socket is not connected, or its sending half has been shut down.
                 11 => NotConnected;

@@ -12,9 +12,10 @@ use std::path::Path;
 use std::process::Command;
 
 use moruna_api::{
-    Audit, ErrorCode, Health, HealthStatus, Method, Node, OPERATIONS, Operation, Response, Scope,
+    Audit, ErrorCode, Health, HealthStatus, Job, JobState, Method, Node, OPERATIONS, Operation,
+    Request, Response, Scope, Validation,
 };
-use moruna_api_client::{Client, Error, cli};
+use moruna_api_client::{Client, Error, Event, cli};
 use support::TestNode;
 
 fn client(node: &TestNode, scope: Scope) -> Client {
@@ -86,13 +87,145 @@ fn rust_client_health_needs_no_token() {
 fn rust_client_calls_every_operation_of_the_table() {
     let node = TestNode::start();
     let admin = client(&node, Scope::Admin);
-    for operation in OPERATIONS {
+    // Every operation that takes neither a run's ID nor a body.
+    let plain = OPERATIONS
+        .iter()
+        .filter(|op| !op.takes_id() && op.request == Request::None);
+    for operation in plain {
         let answer: serde_json::Value = admin.call(operation).unwrap();
         assert!(answer.is_object(), "{}: {answer}", operation.id);
     }
     let audit = admin.node_audit().unwrap();
     let called: Vec<_> = audit.records.iter().map(|r| r.operation.as_str()).collect();
-    assert_eq!(called, ["node_audit", "node", "health"]);
+    assert_eq!(
+        called,
+        [
+            "functions_list",
+            "jobs_list",
+            "node_audit",
+            "node",
+            "health"
+        ]
+    );
+}
+
+#[test]
+fn rust_client_registers_and_lists_functions() {
+    let node = TestNode::start();
+    let admin = client(&node, Scope::Admin);
+    let registration = moruna_api::FunctionRegistration {
+        name: "gate-score".to_string(),
+        address: "https://images.example.com/gate-score".to_string(),
+        sha256: "ab".repeat(32),
+        signature: "c2lnbmVk".to_string(),
+    };
+    let function = admin.functions_register(&registration).unwrap();
+    assert_eq!(
+        (function.name.as_str(), function.sha256.as_str()),
+        ("gate-score", registration.sha256.as_str())
+    );
+    let listed = client(&node, Scope::Observe).functions_list().unwrap();
+    assert_eq!(listed.functions, [function]);
+    let bad = moruna_api::FunctionRegistration {
+        signature: "bad".to_string(),
+        ..registration
+    };
+    let Err(Error::Api { status, error, .. }) = admin.functions_register(&bad) else {
+        panic!("a registration that does not verify is refused");
+    };
+    assert_eq!((status, error.code), (400, ErrorCode::Invalid));
+    assert!(error.message.contains("does not verify"));
+}
+
+#[test]
+fn rust_client_runs_a_job_through_to_its_report() {
+    let node = TestNode::start();
+    let submit = client(&node, Scope::Submit);
+    let job = Job::v1(serde_json::json!({ "moruna_spec": 1, "source": { "kind": "rows" } }));
+    assert_eq!(
+        submit.jobs_validate(&job).unwrap(),
+        Validation {
+            ok: true,
+            refusals: vec![]
+        }
+    );
+    let refused = Job::v1(serde_json::json!({ "refuse": "source.kind: no such kind" }));
+    let validation = submit.jobs_validate(&refused).unwrap();
+    assert!(!validation.ok);
+    assert_eq!(validation.refusals[0].message, "source.kind: no such kind");
+    match submit.jobs_submit(&refused) {
+        Err(Error::Api {
+            status: 400, error, ..
+        }) => {
+            assert_eq!(error.code, ErrorCode::Invalid);
+            assert_eq!(error.message, "source.kind: no such kind");
+        }
+        other => panic!("expected the refusal, got {other:?}"),
+    }
+    let id = submit.jobs_submit(&job).unwrap().id;
+    assert_eq!(id.len(), 32);
+    assert!(matches!(
+        submit.jobs_submit(&Job::<serde_json::Value>::v2("TUpCMg==")),
+        Err(Error::Api { status: 503, error, .. }) if error.code == ErrorCode::Busy
+    ));
+    // Reading needs only observe; cancelling needs submit.
+    let observe = client(&node, Scope::Observe);
+    let status = observe.jobs_get(&id).unwrap();
+    assert_eq!(status.state, JobState::Running);
+    assert_eq!(status.heartbeat.unwrap().rows_out, 3);
+    assert_eq!(observe.jobs_list().unwrap().jobs[0].id, id);
+    assert!(matches!(
+        observe.jobs_report(&id),
+        Err(Error::Api { status: 409, error, .. }) if error.code == ErrorCode::Conflict
+    ));
+    assert!(matches!(
+        observe.jobs_cancel(&id),
+        Err(Error::Api { status: 403, .. })
+    ));
+    let running: Vec<Event> = observe
+        .jobs_events(&id, None)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let names: Vec<&str> = running.iter().map(|event| event.name.as_str()).collect();
+    assert_eq!(names, ["event", "event", "heartbeat"]);
+    assert_eq!((running[0].id, running[2].id), (Some(1), None));
+    assert_eq!(running[1].data["kind"], "task_started");
+    assert_eq!(submit.jobs_cancel(&id).unwrap().state, JobState::Running);
+    let status = observe.jobs_get(&id).unwrap();
+    assert_eq!(
+        (status.state, status.exit_code),
+        (JobState::Cancelled, Some(130))
+    );
+    assert!(matches!(
+        submit.jobs_cancel(&id),
+        Err(Error::Api { status: 409, .. })
+    ));
+    // The ended job's events after its first record, to its exit; then its report.
+    let ended: Vec<Event> = observe
+        .jobs_events(&id, Some(1))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let names: Vec<&str> = ended.iter().map(|event| event.name.as_str()).collect();
+    assert_eq!(names, ["event", "heartbeat", "report", "exit"]);
+    assert_eq!(ended[0].id, Some(2));
+    assert_eq!(ended[3].data["code"], 130);
+    assert_eq!(
+        observe.jobs_report(&id).unwrap(),
+        serde_json::json!({ "rows_out": 3 })
+    );
+    // A job the node does not have.
+    for refused in [
+        observe.jobs_get("ffff").map(|_| ()),
+        observe.jobs_report("ffff").map(|_| ()),
+        observe.jobs_events("ffff", None).map(|_| ()),
+    ] {
+        assert!(
+            matches!(refused, Err(Error::Api { status: 404, .. })),
+            "{refused:?}"
+        );
+    }
 }
 
 #[test]
@@ -127,7 +260,10 @@ fn rust_client_refusals_carry_the_node_error() {
         method: Method::Get,
         path: "/v1/missing",
         scope: Some(Scope::Observe),
+        request: Request::None,
+        query: &[],
         response: Response::Node,
+        status: 200,
         summary: "",
     };
     let not_found = client(&node, Scope::Admin)

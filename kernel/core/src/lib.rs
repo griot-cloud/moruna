@@ -18,6 +18,7 @@ mod clock;
 mod datapath;
 mod foreign;
 mod futex;
+mod hyperv;
 mod interrupt;
 mod memory;
 mod object;
@@ -34,4 +35,11 @@ mod vm;
 /// It starts the manifest's processes and returns, which hands the CPU to them.
 pub fn main() {
     boot::boot();
+}
+
+/// Says the core's fatal line for a panic in kernel mode (`moruna: fatal core: <reason>`).
+/// The boot crate's panic handler calls it, then OSTD's handler, which powers the machine
+/// off.
+pub fn panicked(info: &core::panic::PanicInfo) {
+    boot::panicked(info);
 }

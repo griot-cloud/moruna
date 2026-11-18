@@ -202,6 +202,19 @@ impl Outbound {
     }
 }
 
+/// The job's secrets by name, as the `spec` message carries them beside the document (system
+/// design 3B). They never go into the document or its digest; what prints them prints only
+/// their names.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secrets(pub std::collections::BTreeMap<String, String>);
+
+impl std::fmt::Debug for Secrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0.keys()).finish()
+    }
+}
+
 /// A message from the peer to Moruna (MH 4.3).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -214,6 +227,10 @@ pub enum Inbound {
         /// document is planned by the default planner.
         #[serde(default)]
         plan: Option<String>,
+        /// The job's secrets, by name: what the references in its object-store settings
+        /// (`{"secret": "<name>"}`) resolve to.
+        #[serde(default, skip_serializing_if = "is_empty")]
+        secrets: Secrets,
     },
     /// Cancel the run: the manifest is written and the process exits 130.
     Cancel,
@@ -232,6 +249,73 @@ pub enum Inbound {
         #[serde(default)]
         error: Option<String>,
     },
+}
+
+fn is_empty(secrets: &Secrets) -> bool {
+    secrets.0.is_empty()
+}
+
+/// What a check on a channel reads (`moruna check-job --listen`, system design 3A): one line,
+/// the document as `spec` carries it, and the names of the secrets the job comes with, never
+/// their values.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CheckRequest {
+    /// The one message.
+    Check {
+        /// The document: version 1 as JSON, version 2's FlatBuffers as standard base64.
+        spec: serde_json::Value,
+        /// The names of the job's secrets.
+        #[serde(default)]
+        secrets: Vec<String>,
+    },
+}
+
+/// One refusal of a checked document: its field and a sentence that says what to change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckRefusal {
+    /// The field, as a path from the document's root.
+    pub field: String,
+    /// What is wrong with it.
+    pub message: String,
+}
+
+/// What a check on a channel answers, one line, before it exits.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CheckAnswer {
+    /// The one answer.
+    Checked {
+        /// Whether the document would run: no refusal.
+        ok: bool,
+        /// Every refusal, by field.
+        refusals: Vec<CheckRefusal>,
+        /// The budget the job runs with, in bytes: the document's, or on a node, when it names
+        /// none, the most the node allows. `None` when neither is known.
+        memory_bytes: Option<u64>,
+        /// The hosts the job reaches, from its object-store settings: what a node's egress
+        /// grants it (item 3.4). Empty when the document could not be read.
+        #[serde(default)]
+        hosts: Vec<String>,
+        /// The volumes the job names (`disk://<serial>`), each with its access: what a node
+        /// grants its engine (item 3.3).
+        #[serde(default)]
+        volumes: Vec<VolumeNeed>,
+        /// The functions the job uses, by name: what a node fetches for it (item 3.6).
+        #[serde(default)]
+        functions: Vec<String>,
+    },
+}
+
+/// A volume a job names, by the serial the cloud gives its disk, and whether the job writes it:
+/// `{"serial": "…", "write": bool}`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeNeed {
+    /// The serial, as `disk://<serial>/...` names it.
+    pub serial: String,
+    /// `true` for a sink's volume, which the job writes; `false` for one it only reads.
+    pub write: bool,
 }
 
 impl Inbound {
@@ -611,13 +695,44 @@ mod tests {
             Ok(Inbound::Spec {
                 spec: serde_json::json!({"a": 1}),
                 plan: None,
+                secrets: Default::default(),
             })
         );
+        // The job's secrets, by name, beside the document; what prints them prints their names.
+        let with = Inbound::parse(
+            r#"{"type":"spec","spec":{},"secrets":{"aws.key":"hunter2","gcs":"x"}}"#,
+        )
+        .expect("a spec with secrets");
+        let Inbound::Spec { secrets, .. } = &with else {
+            panic!("a spec")
+        };
+        assert_eq!(
+            secrets.0.get("aws.key").map(String::as_str),
+            Some("hunter2")
+        );
+        let printed = format!("{with:?}");
+        assert!(
+            printed.contains("aws.key") && !printed.contains("hunter2"),
+            "{printed}"
+        );
+        assert!(
+            Inbound::parse(r#"{"type":"spec","spec":{},"secrets":{"k":1}}"#).is_err(),
+            "a secret is a string"
+        );
+        // None is no member at all, as a peer before 3.2 writes it.
+        let none = serde_json::to_string(&Inbound::Spec {
+            spec: serde_json::json!({}),
+            plan: None,
+            secrets: Default::default(),
+        })
+        .unwrap();
+        assert!(!none.contains("secrets"), "{none}");
         assert_eq!(
             Inbound::parse("{\"type\":\"spec\",\"spec\":{},\"plan\":\"TVBMMQ==\"}"),
             Ok(Inbound::Spec {
                 spec: serde_json::json!({}),
                 plan: Some("TVBMMQ==".into()),
+                secrets: Default::default(),
             })
         );
         assert!(Inbound::parse("{\"type\":\"resize\",\"memory\":1}").is_err());

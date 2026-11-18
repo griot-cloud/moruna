@@ -217,6 +217,10 @@ pub fn run_all(f: &Fixtures) -> Results {
             several_records(f, protect),
         ));
     }
+    r.push((
+        "a_task_with_no_window_left_is_given_an_idle_one",
+        no_window_left(f),
+    ));
     r.push(("dp_i4_region_read_only", region_read_only(f)));
     r.push(("dp_i7_bounded", bounded(f)));
     r.push(("dp_i2_ports_and_waits", ports_and_waits(f)));
@@ -378,6 +382,60 @@ pub fn several_records(f: &Fixtures, protect: bool) -> Result<(), String> {
         "ended once",
     )?;
     same(p.exit_code(task), Some(0), "the exit code the task said")?;
+    empty(&p, "nothing left")
+}
+
+/// Item 3.1: a task with no window left to write in is given an idle one, whatever it waits
+/// on. Three answers fill a task's three windows; the engine keeps two of the records (a stage
+/// hands them on in place) and drops the third; the task, asleep on its bell for a window for
+/// its fourth answer, must be given that third one back. With only the half rule (one idle of
+/// three is under half) it never was, and the stage waited for the answer for good: the
+/// full-year hang. Protect mode, an image stage's: in unmap mode the records leave with the
+/// rings object the task hands back, and the next one's windows are all fresh.
+pub fn no_window_left(f: &Fixtures) -> Result<(), String> {
+    let mut p = plane(true);
+    let (task, mut t) = open(&mut p, shape(3), Behave::Echo)?;
+    let region = p.region_of(task).ok_or("no region")?;
+    drive(&mut p, &mut [&mut t])?;
+    let windows = |p: &Plane| p.window_states(task).unwrap_or_default();
+    same(
+        windows(&p),
+        vec!["given"; 3],
+        "every window given as it opens",
+    )?;
+    for i in 0..4 {
+        let b = load(&mut p, region, f)?;
+        p.offer(task, 0, b)
+            .map_err(|e| format!("offer {i}: {e:?}"))?;
+        p.drop_batch(b).map_err(|e| format!("drop {i}: {e:?}"))?;
+    }
+    let first = puts(&drive(&mut p, &mut [&mut t])?);
+    same(
+        first.len(),
+        3,
+        "a record in each window, the fourth waiting",
+    )?;
+    p.drop_batch(first[2].1)
+        .map_err(|e| format!("drop the third: {e:?}"))?;
+    same(
+        windows(&p),
+        vec!["held", "held", "idle"],
+        "two held, one idle",
+    )?;
+    let second = puts(&drive(&mut p, &mut [&mut t])?);
+    same(second.len(), 1, "the fourth answer, in the window dropped")
+        .map_err(|e| format!("{e}; windows {:?}", windows(&p)))?;
+    same(windows(&p), vec!["held"; 3], "the fourth answer held")?;
+    for (_, b, _) in first[..2].iter().chain(&second) {
+        p.drop_batch(*b).map_err(|e| format!("drop: {e:?}"))?;
+    }
+    p.finish(task, 0).map_err(|e| format!("finish: {e:?}"))?;
+    let events = drive(&mut p, &mut [&mut t])?;
+    same(
+        count(&events, |e| matches!(e, Event::Ended { .. })),
+        1,
+        "ended once",
+    )?;
     empty(&p, "nothing left")
 }
 

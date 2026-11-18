@@ -120,23 +120,52 @@ fn the_check_fails_when_the_document_changes_without_regenerating() {
 
 /// Python that runs a generated module (`sys.argv[1]`) and checks, for each operation ID in
 /// `sys.argv[2:]`, that its function and its `Operations` method make the same call and read
-/// the same answer.
-const SAME_CALLS: &str = "import sys, runpy
+/// the same answer. An operation is called with what it takes: a run's ID, a job, a function's
+/// registration, or nothing.
+const SAME_CALLS: &str = "import sys, runpy, inspect
 m = runpy.run_path(sys.argv[1])
+JOB = {'id': 'run-1', 'state': 'running', 'submitted': 1}
+FUNCTION = {'name': 'gate-score', 'address': 'https://x/gate-score', 'sha256': 'ab' * 32,
+            'key': '0123456789abcdef', 'registered': 1}
+ANSWERS = {
+    'node': {'version': '0.7.0', 'instance': 'i', 'cloud': 'none', 'cores': 1,
+             'memory_bytes': 1, 'executors': [], 'boot_ms': 1, 'time': 1, 'health': 'ok'},
+    'jobs_validate': {'ok': True}, 'jobs_submit': {'id': 'run-1'}, 'jobs_list': {'jobs': [JOB]},
+    'jobs_get': JOB, 'jobs_cancel': JOB, 'jobs_report': {'rows_out': 1},
+    'functions_register': FUNCTION, 'functions_list': {'functions': [FUNCTION]}}
 class Recorder(m['Operations']):
     def __init__(self):
         self.calls = []
-    def call(self, operation, method, path, *, token):
-        self.calls.append((operation, method, path, token))
-        return {'status': 'ok', 'records': []} if operation != 'node' else {
-            'version': '0.7.0', 'instance': 'i', 'cloud': 'none', 'cores': 1,
-            'memory_bytes': 1, 'executors': [], 'boot_ms': 1, 'time': 1, 'health': 'ok'}
+    def call(self, operation, method, path, *, token, body=None):
+        self.calls.append((operation, method, path, token, body))
+        return ANSWERS.get(operation, {'status': 'ok', 'records': []})
+    def stream(self, operation, path, *, token):
+        self.calls.append((operation, 'GET', path, token, None))
+        return iter([m['ServerSentEvent'](1, 'event', {'kind': 'attempt_started'})])
+def given(function):
+    parameters = list(inspect.signature(function).parameters.items())[1:]
+    made = {'job': lambda: m['Job'](v1={'moruna_spec': 1}),
+            'functionregistration': lambda: m['FunctionRegistration'](
+                name='gate-score', address='https://x/gate-score', sha256='ab' * 32,
+                signature='c2ln')}
+    return [made.get(name, lambda: 'run 1')()
+            for name, parameter in parameters if parameter.default is inspect.Parameter.empty]
 for name in sys.argv[2:]:
     by_function, by_method = Recorder(), Recorder()
-    answer = m[name](by_function)
-    assert getattr(by_method, name)() == answer, name
+    arguments = given(m[name])
+    answer, other = m[name](by_function, *arguments), getattr(by_method, name)(*arguments)
+    if not isinstance(answer, (dict, list)) and hasattr(answer, '__next__'):
+        answer, other = list(answer), list(other)
+        assert len(answer) == 1, name
+    assert other == answer, name
     assert by_function.calls == by_method.calls and len(by_method.calls) == 1, name
     assert by_method.calls[0][0] == name, by_method.calls
+    if 'run 1' in arguments:
+        assert '/run%201' in by_method.calls[0][2], by_method.calls
+    if name in ('jobs_validate', 'jobs_submit'):
+        assert by_method.calls[0][4] == {'v1': {'moruna_spec': 1}}, by_method.calls
+    if name == 'functions_register':
+        assert by_method.calls[0][4]['name'] == 'gate-score', by_method.calls
 ";
 
 /// The operation IDs of an OpenAPI document.
@@ -156,7 +185,23 @@ fn operation_ids(document: &Path) -> Vec<String> {
 #[test]
 fn the_committed_module_has_a_method_per_operation_that_calls_its_function() {
     let ids = operation_ids(&root().join("kernel/api/openapi.json"));
-    assert_eq!(ids, ["health", "node", "node_audit"]);
+    assert_eq!(
+        ids,
+        [
+            "functions_list",
+            "functions_register",
+            "health",
+            "jobs_cancel",
+            "jobs_events",
+            "jobs_get",
+            "jobs_list",
+            "jobs_report",
+            "jobs_submit",
+            "jobs_validate",
+            "node",
+            "node_audit"
+        ]
+    );
     let module = root().join("python/moruna/api/_generated.py");
     let output = python()
         .args(["-c", SAME_CALLS])
@@ -224,10 +269,10 @@ fn a_shape_the_generator_does_not_read_stops_it_by_name() {
         (
             |d| {
                 let node = &mut d["components"]["schemas"]["Node"];
-                node["properties"]["flag"] = json!({"type": "boolean"});
-                node["required"].as_array_mut().unwrap().push(json!("flag"));
+                node["properties"]["load"] = json!({"type": "number"});
+                node["required"].as_array_mut().unwrap().push(json!("load"));
             },
-            "Node.flag: a field schema of type 'boolean'",
+            "Node.load: a field schema of type 'number'",
         ),
         (
             |d| {
@@ -238,10 +283,10 @@ fn a_shape_the_generator_does_not_read_stops_it_by_name() {
         ),
         (
             |d| {
-                d["components"]["schemas"]["Node"]["properties"]["region"] =
-                    json!({"type": "string"});
+                d["paths"]["/v1/node"]["get"]["parameters"] =
+                    json!([{"name": "x-trace", "in": "header", "schema": {"type": "string"}}]);
             },
-            "Node: an optional field",
+            "node: the parameter 'x-trace'",
         ),
         (
             |d| d["components"]["schemas"]["Region"] = json!({"type": "string"}),
@@ -277,6 +322,63 @@ fn a_shape_the_generator_does_not_read_stops_it_by_name() {
         );
         assert!(!module.exists(), "{said}: a module was written");
     }
+}
+
+#[test]
+fn an_optional_field_and_a_query_are_generated_and_read() {
+    let scratch = Scratch::new();
+    let document = scratch.document(|d| {
+        let node = &mut d["components"]["schemas"]["Node"];
+        node["properties"]["region"] = json!({"type": ["string", "null"]});
+        node["properties"]["ready"] = json!({"type": "boolean"});
+        d["paths"]["/v1/node"]["get"]["parameters"] =
+            json!([{"name": "from", "in": "query", "schema": {"type": "integer", "minimum": 0}}]);
+    });
+    let module = scratch.0.join("_generated.py");
+    let output = generate(&[
+        Path::new("--openapi"),
+        &document,
+        Path::new("--output"),
+        &module,
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = std::fs::read_to_string(&module).unwrap();
+    for expected in [
+        "    region: str | None = None\n",
+        "    ready: bool | None = None\n",
+        "region=_maybe(data, \"region\", where, lambda at: _str(*at)),",
+        "ready=_maybe(data, \"ready\", where, lambda at: _bool(*at)),",
+        "        if self.region is not None:\n            data[\"region\"] = self.region\n",
+        "def node(client: Caller, *, from_: int | None = None) -> Node:\n",
+        "    answer = client.call(\"node\", \"GET\", \"/v1/node\" + _query(from_=from_), token=True)\n",
+        "        return node(self, from_=from_)\n",
+    ] {
+        assert!(text.contains(expected), "{expected:?} not in:\n{text}");
+    }
+    let check = "import sys, runpy\n\
+        m = runpy.run_path(sys.argv[1])\n\
+        d = {'version': '0.7.0', 'instance': 'i', 'cloud': 'none', 'cores': 1,\n\
+             'memory_bytes': 1, 'executors': [], 'boot_ms': 1, 'time': 1, 'health': 'ok'}\n\
+        n = m['Node'].from_json(d)\n\
+        assert n.region is None and n.ready is None and n.to_json() == d, n\n\
+        assert m['Node'].from_json({**d, 'region': None}).to_json() == d\n\
+        full = {**d, 'region': 'eu', 'ready': True}\n\
+        n = m['Node'].from_json(full)\n\
+        assert (n.region, n.ready) == ('eu', True) and n.to_json() == full, n\n\
+        for bad in ({**d, 'ready': 1}, {**d, 'region': 7}):\n\
+        \x20   try:\n\
+        \x20       m['Node'].from_json(bad)\n\
+        \x20   except ValueError:\n\
+        \x20       continue\n\
+        \x20   raise AssertionError(bad)\n\
+        assert m['_query'](from_=None) == '' and m['_query'](from_=7) == '?from=7'\n\
+        assert m['_segment']('a/b c') == 'a%2Fb%20c'\n";
+    let output = python()
+        .args(["-c", check])
+        .arg(&module)
+        .output()
+        .expect("python3 runs the module");
+    assert!(output.status.success(), "{}", stderr(&output));
 }
 
 #[test]

@@ -44,6 +44,8 @@ mod sc_t46_a_stuck_sink_is_flushed;
 mod sc_t4_one_record_per_morsel_stage;
 // stream P: a native stage's instances fed in turn.
 mod sc_p_dealt_instances;
+// Item 3.1: a native stage of eight ring tasks under a memory bound.
+mod sc_p_native_stage_memory;
 mod sc_t5_knobs_immediate;
 mod sc_t6_instance_affinity;
 mod sc_t7_error_policies;

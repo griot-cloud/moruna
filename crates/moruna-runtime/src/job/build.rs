@@ -764,6 +764,82 @@ fn object_store_of(doc: &ObjectStoreDoc) -> ObjectStoreConfig {
     }
 }
 
+/// Resolves the references to secrets in `doc`, the document's object-store settings, into
+/// `store`, the object stores built from it, with `secrets`, the job's secrets by name (system
+/// design 3B). A reference to a name not given is refused by its field, and a place the document
+/// leaves empty is left as it was.
+pub fn with_secrets(
+    store: &mut ObjectStoreConfig,
+    doc: &ObjectStoreDoc,
+    secrets: &std::collections::BTreeMap<String, String>,
+) -> std::result::Result<(), moruna_job::SpecError> {
+    let resolve =
+        |slot: &mut Option<String>, field: &str, reference: &Option<moruna_job::SecretRef>| {
+            let Some(reference) = reference else {
+                return Ok(());
+            };
+            let value = secrets.get(&reference.secret).ok_or_else(|| {
+                moruna_job::SpecError::new(
+                    field,
+                    format!(
+                        "the job comes with no secret named `{}`: give it in the job's secrets",
+                        reference.secret
+                    ),
+                )
+            })?;
+            *slot = Some(value.clone());
+            Ok(())
+        };
+    if let Some(doc) = &doc.s3 {
+        let s3 = store.s3.get_or_insert_with(S3Config::default);
+        resolve(
+            &mut s3.access_key_id,
+            "object_store.s3.access_key_id",
+            &doc.access_key_id,
+        )?;
+        resolve(
+            &mut s3.secret_access_key,
+            "object_store.s3.secret_access_key",
+            &doc.secret_access_key,
+        )?;
+        resolve(
+            &mut s3.session_token,
+            "object_store.s3.session_token",
+            &doc.session_token,
+        )?;
+    }
+    if let Some(doc) = &doc.gcs {
+        let gcs = store.gcs.get_or_insert_with(GcsConfig::default);
+        resolve(
+            &mut gcs.service_account_json,
+            "object_store.gcs.service_account_json",
+            &doc.service_account_json,
+        )?;
+    }
+    if let Some(doc) = &doc.azure {
+        let azure = store.azure.get_or_insert_with(AzureConfig::default);
+        resolve(
+            &mut azure.access_key,
+            "object_store.azure.access_key",
+            &doc.access_key,
+        )?;
+    }
+    Ok(())
+}
+
+/// For a run that is given no secrets (the Python surface's `moruna.run`): the first reference
+/// to a secret in `doc`, the document's object-store settings, refused by its field with
+/// `reason`.
+pub fn refuse_secret_refs(
+    doc: &ObjectStoreDoc,
+    reason: &str,
+) -> std::result::Result<(), moruna_job::SpecError> {
+    match doc.secret_refs().first() {
+        Some((field, _)) => Err(moruna_job::SpecError::new(*field, reason)),
+        None => Ok(()),
+    }
+}
+
 /// The shape of a resume argument, for a caller that must know it before building (the host
 /// session reads the manifest's run id to name the report file).
 pub fn resume_shape(job: &Job) -> Option<ResumeArg> {

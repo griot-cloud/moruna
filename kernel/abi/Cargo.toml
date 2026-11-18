@@ -8,5 +8,9 @@ publish.workspace = true
 
 [features]
 manifest = []
+# Item 5.0: built as a dependency of Rust's std for `target_os = "moruna"`
+# (kernel/vendor/rust-std), whose `core` is the one being built beside it.
+rustc-dep-of-std = ["dep:core"]
 
 [dependencies]
+core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core" }

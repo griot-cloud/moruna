@@ -87,8 +87,16 @@ table Staging {
   durable: bool = null;
 }
 
-// An object store's endpoints and names. A document holds no credential: the runner supplies
-// credentials when the job runs (the slots that held them are deprecated, never read).
+// A reference to one of the job's secrets, by name, where a credential belongs (system design
+// 3B): the runner gives the job's secrets beside the document (MH 4.3, `spec`'s `secrets`), and
+// the engine resolves each reference when it builds the job's object stores.
+table SecretRef {
+  // 1 to 64 of ASCII letters, digits, `_`, `-`, `.` and `:`.
+  secret: string (required);
+}
+
+// An object store's endpoints and names. A document holds no credential, only references to the
+// job's secrets (the slots that once held credentials are deprecated, never read).
 table S3 {
   endpoint: string;
   region: string;
@@ -96,18 +104,23 @@ table S3 {
   secret_access_key: string (deprecated);
   session_token: string (deprecated);
   bucket: string;
+  access_key_id_ref: SecretRef;
+  secret_access_key_ref: SecretRef;
+  session_token_ref: SecretRef;
 }
 
 table Gcs {
   service_account_path: string (deprecated);
   service_account_json: string (deprecated);
   bucket: string;
+  service_account_json_ref: SecretRef;
 }
 
 table Azure {
   account: string;
   access_key: string (deprecated);
   container: string;
+  access_key_ref: SecretRef;
 }
 
 table ObjectStore {

@@ -10,6 +10,24 @@ is both a function and a method of the client, generated alike::
     node = client.node()             # GET /v1/node, an observe token; api.node(client) too
     audit = client.node_audit()      # GET /v1/node/audit, an admin token
 
+A job (system design 3B) is its document, as version 1 JSON or version 2's FlatBuffers in
+base64; the node runs one at a time::
+
+    job = api.Job(v1={"moruna_spec": 1, ...})
+    if client.jobs_validate(job).ok:                 # a submit token
+        run = client.jobs_submit(job).id
+        for event in client.jobs_events(run):        # Server-Sent Events, as they arrive
+            print(event.event, event.data)
+        report = client.jobs_report(run)
+
+A function (system design 3E) is registered by name, with its image's address, the image's
+SHA-256 and an Ed25519 signature over that SHA-256 by one of node config's ``functions.keys``::
+
+    client.functions_register(api.FunctionRegistration(
+        name="gate-score", address="https://...", sha256="<64 hex digits>",
+        signature="<base64>"))                   # an admin token
+    client.functions_list()                       # an observe token
+
 **Pinning.** With ``pin``, the SHA-256 of the server's certificate in hex (what the node prints
 on its console as ``moruna: tls sha256=<hex>``), the client connects without verifying the
 certificate, then refuses the connection, before anything is sent, unless the certificate's
@@ -26,6 +44,7 @@ import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from typing import Any
 
 from moruna.api._generated import (
@@ -38,13 +57,35 @@ from moruna.api._generated import (
     ErrorDetail,
     Executor,
     ExecutorKind,
+    Function,
+    FunctionRegistration,
+    Functions,
     Health,
     HealthStatus,
+    Heartbeat,
+    Job,
+    Jobs,
+    JobState,
+    JobStatus,
+    JobSummary,
     Node,
     NodeHealth,
     Operations,
+    Refusal,
     Scope,
+    ServerSentEvent,
+    Submitted,
+    Validation,
+    functions_list,
+    functions_register,
     health,
+    jobs_cancel,
+    jobs_events,
+    jobs_get,
+    jobs_list,
+    jobs_report,
+    jobs_submit,
+    jobs_validate,
     node,
     node_audit,
 )
@@ -62,14 +103,36 @@ __all__ = [
     "ErrorDetail",
     "Executor",
     "ExecutorKind",
+    "Function",
+    "FunctionRegistration",
+    "Functions",
     "Health",
     "HealthStatus",
+    "Heartbeat",
+    "Job",
+    "JobState",
+    "JobStatus",
+    "JobSummary",
+    "Jobs",
     "Node",
     "NodeHealth",
     "Operations",
     "PinMismatch",
+    "Refusal",
     "Scope",
+    "ServerSentEvent",
+    "Submitted",
+    "Validation",
+    "functions_list",
+    "functions_register",
     "health",
+    "jobs_cancel",
+    "jobs_events",
+    "jobs_get",
+    "jobs_list",
+    "jobs_report",
+    "jobs_submit",
+    "jobs_validate",
     "node",
     "node_audit",
 ]
@@ -137,14 +200,13 @@ class Client(Operations):
     def __repr__(self) -> str:
         return f"Client({self.url!r})"
 
-    def call(self, operation: str, method: str, path: str, *, token: bool) -> Any:
-        """Call ``method path``, with the token when ``token``, and return its JSON answer.
+    def call(self, operation: str, method: str, path: str, *, token: bool, body: Any = None) -> Any:
+        """Call ``method path``, with the token when ``token`` and ``body`` as its JSON body when
+        it has one, and return its JSON answer.
 
         The generated operation functions (``node(client)`` and the others) call this.
         """
-        request = urllib.request.Request(self.url + path, method=method)
-        if token:
-            request.add_header("Authorization", f"Bearer {self._token}")
+        request = self._request(method, path, token=token, body=body)
         try:
             with self._opener.open(request, timeout=TIMEOUT) as response:
                 return _answer(operation, response.status, response.read())
@@ -155,6 +217,61 @@ class Client(Operations):
             raise Error(f"could not call {operation} at {self.url}: {error.reason}") from error
         except (OSError, http.client.HTTPException) as error:
             raise Error(f"could not call {operation} at {self.url}: {error}") from error
+
+    def stream(self, operation: str, path: str, *, token: bool) -> Iterator[ServerSentEvent]:
+        """Call ``GET path`` and return its answer's Server-Sent Events as they arrive, each
+        one's data read as JSON; the stream ends when the node closes it.
+
+        The call is made, and a refusal raised, here; the events are read as the iterator is.
+        The generated ``jobs_events(client, id)`` calls this.
+        """
+        request = self._request("GET", path, token=token, body=None)
+        request.add_header("Accept", "text/event-stream")
+        try:
+            response = self._opener.open(request, timeout=TIMEOUT)
+        except urllib.error.HTTPError as error:
+            with error:
+                _answer(operation, error.code, error.read())
+            raise Error(f"the node's answer to {operation} is not a stream") from error
+        except urllib.error.URLError as error:
+            raise Error(f"could not call {operation} at {self.url}: {error.reason}") from error
+        except (OSError, http.client.HTTPException) as error:
+            raise Error(f"could not call {operation} at {self.url}: {error}") from error
+        return _events(operation, response)
+
+    def _request(self, method: str, path: str, *, token: bool, body: Any) -> urllib.request.Request:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(self.url + path, data=data, method=method)
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        if token:
+            request.add_header("Authorization", f"Bearer {self._token}")
+        return request
+
+
+def _events(operation: str, response: http.client.HTTPResponse) -> Iterator[ServerSentEvent]:
+    """The Server-Sent Events of ``response``, one at a time, until the stream ends."""
+    with response:
+        identity: int | None = None
+        name = ""
+        data: Any = None
+        try:
+            for raw in response:
+                line = raw.decode().rstrip("\r\n")
+                if not line:
+                    if data is not None:
+                        yield ServerSentEvent(identity, name, data)
+                    identity, name, data = None, "", None
+                elif line.startswith("id: "):
+                    identity = int(line[4:])
+                elif line.startswith("event: "):
+                    name = line[7:]
+                elif line.startswith("data: "):
+                    data = json.loads(line[6:])
+        except ValueError as error:
+            raise Error(f"the node's stream of {operation} is not its events: {error}") from None
+        except (OSError, http.client.HTTPException) as error:
+            raise Error(f"the stream of {operation} failed: {error}") from error
 
 
 def _answer(operation: str, status: int, body: bytes) -> Any:

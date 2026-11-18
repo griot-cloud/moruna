@@ -23,17 +23,21 @@
 // attribute a program needs; the macro carries it so the program can forbid unsafe code.
 #![cfg_attr(target_os = "none", expect(internal_features))]
 
-#[cfg(feature = "heap")]
+#[cfg(any(feature = "heap", test))]
 extern crate alloc;
 
 pub mod datapath;
 #[cfg(feature = "heap")]
 mod heap;
+pub mod hyperv;
 pub mod personality;
 pub mod plane;
 mod private_memory;
 pub use private_memory::PrivateMemory;
 pub mod raw;
+// Item 5.0: the runtime of Rust's std on Moruna (feature `rt`), and its host tests.
+#[cfg(any(feature = "rt", test))]
+pub mod rt;
 pub mod start;
 
 #[cfg(target_os = "none")]
@@ -109,9 +113,22 @@ pub fn random(buf: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-/// Sets the calling thread's FS base (ABI 2.0); this crate keeps nothing there.
+/// Sets the calling thread's FS base (ABI 2.0); this crate keeps nothing there, but its
+/// `rt` (std's runtime) keeps each thread's table of thread-local keys there.
 pub fn set_fs(base: u64) -> Result<()> {
     check(raw::thread_set_fs(base)).map(|_| ())
+}
+
+/// Gives the calling thread's CPU to another ready thread, if there is one (ABI 2.8).
+pub fn thread_yield() {
+    raw::call0(nr::THREAD_YIELD);
+}
+
+/// The wall clock reads `utc_ns`, nanoseconds since 1970 (UTC), now (ABI 2.8). `clock` is
+/// `root.clock`, which the supervisor gives `platform` alone; the clock page carries the new
+/// realtime base. `InvalidArgs` for a time at or before the monotonic clock's start.
+pub fn clock_set_realtime(clock: &Handle, utc_ns: u64) -> Result<()> {
+    check(raw::call2(nr::CLOCK_SET_REALTIME, clock.raw() as u64, utc_ns).0).map(|_| ())
 }
 
 /// An owned handle. Dropping it closes it.
@@ -684,6 +701,19 @@ impl Mapping<'_> {
         // the mapping lives, which the borrow of `self` outlives. The caller's contract,
         // as this method's says, is that nothing writes them meanwhile.
         unsafe { core::slice::from_raw_parts(self.addr as *const u8, self.len as usize) }
+    }
+
+    /// The 32-bit word at `offset`, aligned to 4, as an atomic: a word shared with other
+    /// processes that every one of them reads and writes only atomically, such as a word
+    /// a futex waits on (ABI 2.0) or the wake word `vmbus` gives a driver (ABI 2.7). The
+    /// word of a read-only mapping is only ever loaded: a store to it faults the process.
+    pub fn atomic32(&self, offset: usize) -> Result<&core::sync::atomic::AtomicU32> {
+        let at = self.aligned(offset, 4)?;
+        // SAFETY: the kernel keeps the word mapped at `at`, inside the mapping and aligned
+        // to 4, for as long as the mapping lives, which the borrow of `self` outlives. Other
+        // processes may map it too; the caller's protocol accesses it only as an atomic, as
+        // this method's contract says.
+        Ok(unsafe { core::sync::atomic::AtomicU32::from_ptr(at as *mut u32) })
     }
 
     pub fn read_u32(&self, offset: usize) -> Result<u32> {

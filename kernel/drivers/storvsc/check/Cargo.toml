@@ -1,0 +1,23 @@
+[package]
+name = "storvsc-check"
+description = "Item 1.10b's Azure check, in the cloud profile's check variant only: the OS disk's GPT header, a data disk written, read back and restored, read_to at a byte offset, and the block protocol's conformance suite, through the disks storvsc registers with the device manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+bench = false
+
+# The program, for the kernel's user target only: on a host it is an empty program, and the
+# library, what it decides from the bytes it reads, is what the host tests run.
+[[bin]]
+name = "storvsc-check"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+moruna-svc.workspace = true
+block-protocol = { path = "../../block-protocol", version = "=0.1.0" }
+devices-protocol = { path = "../../../devices/protocol", version = "=0.1.0" }

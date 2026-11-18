@@ -3,11 +3,12 @@
 //! 2.5 will.
 #![allow(dead_code)]
 
+pub mod engine;
 pub mod signer;
 
 use moruna_api::{Cloud, Executor, ExecutorKind, NodeHealth};
 use moruna_api_server::{
-    Clock, Config, Identity, NodeFacts, Server, TokenKey, Transport, TransportError,
+    Clock, Config, FunctionKey, Identity, NodeFacts, Server, TokenKey, Transport, TransportError,
 };
 use ring::digest;
 use rustls::{
@@ -371,6 +372,8 @@ pub struct Harness {
     pub fingerprint: String,
     pub clients: Vec<Client>,
     pub signer: Signer,
+    /// The engine the server runs jobs through, as the test holds it.
+    pub engine: engine::Engine,
 }
 
 impl Harness {
@@ -388,13 +391,16 @@ impl Harness {
     pub fn with(identity: Identity, token_keys: Vec<TokenKey>, signer: Signer) -> Self {
         let clock = TestClock::new();
         let fingerprint = identity.fingerprint();
-        let server = Server::new(
+        let engine = engine::Engine::new();
+        let server = Server::with_engine(
             Config {
                 identity,
                 facts: facts(),
                 token_keys,
+                function_keys: vec![FunctionKey::new(signer.public())],
             },
             clock.clone(),
+            Box::new(engine.clone()),
         )
         .unwrap();
         Self {
@@ -403,7 +409,42 @@ impl Harness {
             fingerprint,
             clients: Vec::new(),
             signer,
+            engine,
         }
+    }
+
+    /// A server on a node that runs no jobs: built with `Server::new`, as a step 2 node is.
+    pub fn without_engine() -> Self {
+        let mut harness = Self::new();
+        let identity = Identity::generate(INSTANCE, WALL).unwrap();
+        harness.fingerprint = identity.fingerprint();
+        harness.server = Server::new(
+            Config {
+                identity,
+                facts: facts(),
+                token_keys: vec![TokenKey::new(harness.signer.public())],
+                function_keys: vec![FunctionKey::new(harness.signer.public())],
+            },
+            harness.clock.clone(),
+        )
+        .unwrap();
+        harness
+    }
+
+    /// Sends `request` on client `index`, and nothing more: its answer comes later.
+    pub fn send(&mut self, index: usize, request: &[u8]) {
+        self.clients[index].send(request);
+        self.settle();
+    }
+
+    /// A POST of `body` to `path` on client `index` with `token`: the request's bytes.
+    pub fn post(path: &str, token: &str, body: &str) -> Vec<u8> {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: node\r\n{}Content-Length: {}\r\n\r\n{body}",
+            Self::bearer(token),
+            body.len()
+        )
+        .into_bytes()
     }
 
     /// A valid token for this node with `scope`, expiring in ten minutes.
@@ -446,20 +487,20 @@ impl Harness {
         self.connect_with(config)
     }
 
-    /// Polls the server and pumps every client until nothing moves.
+    /// Polls the server and pumps every client until nothing moves. The engine moves between
+    /// polls too (a check started on one gives its verdict on the next), so a few polls in a
+    /// row must move nothing.
     pub fn settle(&mut self) {
+        let mut quiet = 0;
         for _ in 0..10_000 {
             self.server.poll();
             let mut moved = false;
             for client in &mut self.clients {
                 moved |= client.pump();
             }
-            if !moved {
-                // One more poll, for what the last pump delivered.
-                self.server.poll();
-                if !self.clients.iter_mut().any(Client::pump) {
-                    return;
-                }
+            quiet = if moved { 0 } else { quiet + 1 };
+            if quiet == 4 {
+                return;
             }
         }
         panic!("the exchange never settled");

@@ -1,0 +1,8 @@
+HTTP/1.1 400 Bad Request
+Content-Type: application/json; charset=utf-8
+Server: IMDS/150.870.65.1854
+x-ms-request-id: 9e6d3b1c-52f8-4a0e-8f0b-7c2a4d1e6a35
+Date: Tue, 17 Nov 2026 09:30:02 GMT
+Content-Length: 66
+
+{ "error": "Bad request. Required metadata header not specified" }

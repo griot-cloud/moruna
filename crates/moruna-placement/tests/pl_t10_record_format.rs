@@ -217,3 +217,97 @@ fn pl_t10_a_record_that_is_not_one_is_refused() {
         "a body that is not an MRB1 record is refused"
     );
 }
+
+/// Each table record of the run's segments, read back: its payload length.
+fn table_records(reactor: &FakeReactor, dir: &std::path::Path) -> Vec<u64> {
+    let page = common::PAGE as u64;
+    let mut out = Vec::new();
+    for n in 0..64u32 {
+        let path = dir.join(format!("seg-{n:06}.seg"));
+        let Some(file) = reactor.file(&path.display().to_string()) else {
+            continue;
+        };
+        let mut at = 0u64;
+        while (at + page) as usize <= file.len() && file[at as usize..at as usize + 8] != [0u8; 8] {
+            let header = parse(&file[at as usize..(at + page) as usize]);
+            if header.kind == 0 {
+                let body = &file[header.body_offset as usize
+                    ..(header.body_offset + header.payload_len) as usize];
+                let batch = ipc::decode(ArrowBuffer::from(body.to_vec()), common::PAGE)
+                    .expect("the IPC body decodes");
+                assert!(batch.num_rows() > 0);
+                out.push(header.payload_len);
+            }
+            at = at + page + header.payload_len.div_ceil(page) * page;
+        }
+    }
+    out
+}
+
+/// The body arrow-ipc's own stream of `batch` takes laid out as a record as it is, with the
+/// all-ones bitmap arrow gives a column with no nulls: what a spill took before the bitmaps
+/// were left out.
+fn as_written(batch: &moruna_kernel::arrow::record_batch::RecordBatch) -> u64 {
+    use moruna_ipc_check::frame::message_len;
+    let mut writer =
+        moruna_kernel::arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &batch.schema())
+            .expect("a writer");
+    writer.write(batch).expect("written");
+    let bytes = writer.into_inner().expect("the bytes");
+    let schema = message_len(&bytes).expect("a schema message") + 8;
+    let rb = message_len(&bytes[schema..]).expect("a batch message") + 8;
+    // A record's payload runs to the end of its last buffer (e.3), unpadded.
+    let laid = moruna_ipc_check::record::reframe(&bytes[..schema], &bytes[schema..schema + rb])
+        .expect("reframed");
+    laid.moves
+        .iter()
+        .map(|(_, to, len)| to + len)
+        .max()
+        .unwrap_or(0)
+}
+
+/// A spilled table carries no bitmap of all ones (`moruna_ipc_check::valid`): one row of an
+/// `Int32` column takes a page less than it did, and 64Ki rows two pages less, their bitmap's
+/// 8 KiB; and it reads back.
+#[test]
+fn pl_t10_a_spill_leaves_out_the_bitmap_of_all_ones() {
+    for rows in [1usize, 65_536] {
+        let scratch = common::Scratch::new(&format!("t10-valid-{rows}"));
+        let alloc = FakeAllocator::new();
+        let reactor = FakeReactor::new();
+        let mut cfg = common::config(
+            1,
+            Some(scratch.path().to_path_buf()),
+            common::budgets(1 << 30, 0, 1 << 30),
+        );
+        cfg.segment_bytes = 4 << 20;
+        let engine = common::engine(cfg, &alloc, &reactor);
+        engine.set_staging(0, true);
+        engine.set_promotion_window(0, 1);
+        let table = common::table_morsel(&alloc, 0, 0, rows);
+        let bytes = table.bytes;
+        drop(table);
+        engine.set_water(0, TierKind::Host, bytes, bytes);
+        for seq in 0..3u64 {
+            engine
+                .push(0, common::table_morsel(&alloc, seq, 0, rows))
+                .expect("push");
+            common::settle(&reactor);
+        }
+        let spilled = table_records(&reactor, &run_dir(&scratch));
+        assert!(!spilled.is_empty(), "{rows} rows: nothing spilled");
+        let before = as_written(&common::int_batch(&alloc, rows, alloc.host_tier()));
+        let bitmap_pages = (rows as u64).div_ceil(8).div_ceil(common::PAGE as u64);
+        for after in &spilled {
+            assert_eq!(
+                *after,
+                before - bitmap_pages * common::PAGE as u64,
+                "{rows} rows"
+            );
+        }
+        eprintln!(
+            "a spill of {rows} rows: {before} bytes of body before, {} after",
+            spilled[0]
+        );
+    }
+}

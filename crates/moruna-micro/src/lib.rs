@@ -13,6 +13,8 @@
 //! - [`start`]: whether this process is on the Moruna kernel, and its granted handles;
 //! - [`vsock`]: the host protocol's connection to the embedder, over the vsock driver
 //!   (`moruna.driver.vsock`), as the `Read` and `Write` halves the host protocol already speaks;
+//! - [`channel`]: the host protocol on a node, over the channel `node-admission` starts the
+//!   engine with, whose other end is the node's `api` (system design 3A);
 //! - [`image`]: the image the kernel attached: its record, granted as `image`, and the seals
 //!   of the layers the personality's programs start on, which an `image` entry's reference is
 //!   checked against before its task starts;
@@ -44,6 +46,8 @@ pub mod blk;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod rings;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod channel;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod image;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

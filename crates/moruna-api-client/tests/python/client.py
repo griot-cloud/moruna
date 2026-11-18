@@ -77,6 +77,57 @@ class AgainstTheNode(unittest.TestCase):
         self.assertEqual(len(after), before + 1)
         self.assertEqual(after[0].operation, "node_audit")
 
+    def test_runs_a_job_through_to_its_report(self) -> None:
+        admin = api.Client(URL, ADMIN, pin=PIN)
+        observe = api.Client(URL, OBSERVE, pin=PIN)
+        job = api.Job(v1={"moruna_spec": 1, "source": {"kind": "rows"}})
+        self.assertEqual(admin.jobs_validate(job), api.Validation(ok=True))
+        refused = admin.jobs_validate(api.Job(v1={"refuse": "source.kind: no such kind"}))
+        self.assertFalse(refused.ok)
+        self.assertEqual(refused.refusals, [api.Refusal("spec", "source.kind: no such kind")])
+        with self.assertRaises(api.ApiError) as caught:
+            admin.jobs_submit(api.Job(v1={"refuse": "source.kind: no such kind"}))
+        self.assertEqual(caught.exception.code, api.ErrorCode.INVALID)
+        self.assertEqual(caught.exception.message, "source.kind: no such kind")
+        with self.assertRaises(api.ApiError) as caught:
+            observe.jobs_submit(job)
+        self.assertEqual(caught.exception.code, api.ErrorCode.FORBIDDEN)
+        run = admin.jobs_submit(job).id
+        with self.assertRaises(api.ApiError) as caught:
+            api.jobs_submit(admin, api.Job(v2="TUpCMg=="))
+        self.assertEqual((caught.exception.status, caught.exception.code), (503, "busy"))
+        # Reading needs only observe.
+        status = observe.jobs_get(run)
+        self.assertIs(status.state, api.JobState.RUNNING)
+        self.assertIsNotNone(status.heartbeat)
+        assert status.heartbeat is not None
+        self.assertEqual((status.heartbeat.rows_out, status.heartbeat.bottleneck), (3, "sink"))
+        self.assertIsNone(status.exit_code)
+        self.assertEqual(api.JobStatus.from_json(status.to_json()), status)
+        self.assertEqual(api.jobs_list(observe).jobs[0].id, run)
+        with self.assertRaises(api.ApiError) as caught:
+            observe.jobs_report(run)
+        self.assertEqual(caught.exception.code, api.ErrorCode.CONFLICT)
+        running = list(observe.jobs_events(run))
+        self.assertEqual([e.event for e in running], ["event", "event", "heartbeat"])
+        self.assertEqual((running[0].id, running[2].id), (1, None))
+        self.assertEqual(running[1].data["kind"], "task_started")
+        # Cancel answers the job as it stood; then it has ended, with exit code 130.
+        self.assertIs(admin.jobs_cancel(run).state, api.JobState.RUNNING)
+        ended = observe.jobs_get(run)
+        self.assertEqual((ended.state, ended.exit_code), (api.JobState.CANCELLED, 130))
+        with self.assertRaises(api.ApiError) as caught:
+            api.jobs_cancel(admin, run)
+        self.assertEqual(caught.exception.code, api.ErrorCode.CONFLICT)
+        replay = list(api.jobs_events(observe, run, from_=1))
+        self.assertEqual([e.event for e in replay], ["event", "heartbeat", "report", "exit"])
+        self.assertEqual((replay[0].id, replay[3].data["code"]), (2, 130))
+        self.assertEqual(observe.jobs_report(run), {"rows_out": 3})
+        for call in (observe.jobs_get, observe.jobs_report, observe.jobs_events):
+            with self.assertRaises(api.ApiError) as caught:
+                call("no such run")
+            self.assertEqual(caught.exception.code, api.ErrorCode.NOT_FOUND)
+
     def test_health_needs_no_token(self) -> None:
         client = api.Client(URL, "not a token", pin=PIN)
         self.assertEqual(client.health(), api.Health(api.HealthStatus.OK))

@@ -1166,7 +1166,8 @@ fn run() -> i64 {
     let mut client = match moruna_svc::connect(&Channel(linux))
         .map_err(|err| format!("{err:?}"))
         .and_then(|c| {
-            linux::Client::connect(c, deadline_in(120 * SECONDS)).map_err(|err| format!("{err:?}"))
+            linux::Client::connect(c, deadline_in(moruna_svc::READY_TIMEOUT))
+                .map_err(|err| format!("{err:?}"))
         }) {
         Ok(c) => c,
         Err(why) => {

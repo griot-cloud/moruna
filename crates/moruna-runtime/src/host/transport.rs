@@ -1,10 +1,13 @@
 //! Addresses and sockets for the host protocol (MH 4.3): a Unix socket anywhere, a vsock socket
-//! on Linux, and on the Moruna kernel a stream of its vsock driver (SDD 30 f.2), which the
-//! engine reaches through the connection it was granted. One peer, one connection, so there is
-//! no multiplexing and no framing beyond the newline.
+//! on Linux, on the Moruna kernel a stream of its vsock driver (SDD 30 f.2), which the engine
+//! reaches through the connection it was granted, and on a Moruna node the channel
+//! `node-admission` started it with (system design 3A). One peer, one connection, so there is
+//! no multiplexing and no framing beyond the newline: over a channel, each message is the next
+//! piece of the stream ([`Messages`]).
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How long a write to the peer may block before the peer is treated as gone (MH 4.3). A peer
@@ -23,6 +26,19 @@ pub enum Address {
         /// The port.
         port: u32,
     },
+    /// `channel:SLOT`: a channel of the Moruna kernel the engine was started with, granted under
+    /// `SLOT` (system design 3A). Served on, it puts `moruna serve` in node mode
+    /// ([`super::node`]).
+    Channel(String),
+}
+
+/// Whether `slot` is a slot's name as the kernel takes one: 1 to 32 of lowercase letters,
+/// digits, `.`, `_` and `-`.
+fn is_slot(slot: &str) -> bool {
+    (1..=32).contains(&slot.len())
+        && slot
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
 }
 
 /// `VMADDR_CID_ANY`.
@@ -31,6 +47,14 @@ pub const VSOCK_CID_ANY: u32 = u32::MAX;
 impl Address {
     /// Parse an address (MH 4.3). The error says what was expected.
     pub fn parse(text: &str) -> Result<Address, String> {
+        if let Some(slot) = text.strip_prefix("channel:") {
+            if !is_slot(slot) {
+                return Err(format!(
+                    "`{text}`: a channel is channel:SLOT, its slot 1 to 32 of a-z, 0-9, . _ -"
+                ));
+            }
+            return Ok(Address::Channel(slot.to_string()));
+        }
         if let Some(rest) = text.strip_prefix("vsock://") {
             let (cid, port) = rest
                 .split_once(':')
@@ -52,7 +76,7 @@ impl Address {
             rest
         } else if text.contains("://") {
             return Err(format!(
-                "`{text}`: the protocol runs over unix:// or vsock:// sockets"
+                "`{text}`: the protocol runs over unix:// or vsock:// sockets, or a channel"
             ));
         } else {
             text
@@ -72,8 +96,103 @@ impl core::fmt::Display for Address {
             Address::Unix(path) => write!(f, "unix://{}", path.display()),
             Address::Vsock { cid, port } if *cid == VSOCK_CID_ANY => write!(f, "vsock://-1:{port}"),
             Address::Vsock { cid, port } => write!(f, "vsock://{cid}:{port}"),
+            Address::Channel(slot) => write!(f, "channel:{slot}"),
         }
     }
+}
+
+/// The largest message a channel of the Moruna kernel carries
+/// (`moruna_abi::limits::CHANNEL_MAX_BYTES`).
+pub const CHANNEL_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// One end of a channel, as the host protocol's byte stream rides it (system design 3A): each
+/// message is the next piece of the stream, at most [`CHANNEL_MESSAGE_BYTES`], with no handle,
+/// and the stream ends when the peer closes its end.
+pub trait Messages: Send + Sync {
+    /// Sends `bytes`, at most [`CHANNEL_MESSAGE_BYTES`] and never empty, as one message,
+    /// waiting while the peer's queue is full, at most [`WRITE_TIMEOUT`].
+    fn send(&self, bytes: &[u8]) -> io::Result<()>;
+    /// Receives the next message into `buf`, [`CHANNEL_MESSAGE_BYTES`] long, waiting for one;
+    /// `Ok(0)` once the stream has ended.
+    fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+    /// Closes this end: a `recv` waiting on it returns the end of the stream.
+    fn close(&self);
+}
+
+/// The byte stream over `messages`, as a [`Conn`].
+pub fn over_messages(messages: Arc<dyn Messages>) -> Conn {
+    let closer = messages.clone();
+    Conn {
+        reader: Box::new(MessageReader {
+            messages: messages.clone(),
+            buf: vec![0; CHANNEL_MESSAGE_BYTES],
+            at: 0,
+            len: 0,
+            ended: false,
+        }),
+        writer: Box::new(MessageWriter { messages }),
+        closer: Box::new(move || closer.close()),
+    }
+}
+
+/// The stream's inbound half: one message at a time, read out as asked.
+struct MessageReader {
+    messages: Arc<dyn Messages>,
+    buf: Vec<u8>,
+    at: usize,
+    len: usize,
+    ended: bool,
+}
+
+impl Read for MessageReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if self.at == self.len {
+            if self.ended {
+                return Ok(0);
+            }
+            self.len = self.messages.recv(&mut self.buf)?;
+            self.at = 0;
+            if self.len == 0 {
+                self.ended = true;
+                return Ok(0);
+            }
+        }
+        let count = out.len().min(self.len - self.at);
+        out[..count].copy_from_slice(&self.buf[self.at..self.at + count]);
+        self.at += count;
+        Ok(count)
+    }
+}
+
+/// The stream's outbound half: each write is one message, of as much as one carries.
+struct MessageWriter {
+    messages: Arc<dyn Messages>,
+}
+
+impl Write for MessageWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let count = bytes.len().min(CHANNEL_MESSAGE_BYTES);
+        self.messages.send(&bytes[..count])?;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A channel exists only on the Moruna kernel.
+fn no_channel(slot: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("channel:{slot} is a channel of the Moruna kernel, and this process is not on it"),
+    )
 }
 
 /// A connection's three parts: the inbound reader, the outbound writer, and what closes both.
@@ -126,6 +245,9 @@ pub fn connect(address: &Address) -> io::Result<Conn> {
             micro::conn(micro::driver()?.connect(*cid, *port)?)
         }
         Address::Vsock { cid, port } => vsock::connect(*cid, *port),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        Address::Channel(slot) if moruna_micro::on_kernel() => micro::channel(slot),
+        Address::Channel(slot) => Err(no_channel(slot)),
     }
 }
 
@@ -151,6 +273,30 @@ mod micro {
             .map_err(io::Error::other)
     }
 
+    /// The channel granted under `slot`, as the host protocol's stream.
+    pub(super) fn channel(slot: &str) -> io::Result<Conn> {
+        Ok(super::over_messages(Arc::new(Channel(
+            moruna_micro::channel::Endpoint::open(slot)?,
+        ))))
+    }
+
+    /// The kernel's channel endpoint as [`super::Messages`].
+    struct Channel(moruna_micro::channel::Endpoint);
+
+    impl super::Messages for Channel {
+        fn send(&self, bytes: &[u8]) -> io::Result<()> {
+            self.0.send(bytes)
+        }
+
+        fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.recv(buf)
+        }
+
+        fn close(&self) {
+            self.0.close();
+        }
+    }
+
     pub(super) fn conn(stream: Stream) -> io::Result<Conn> {
         let (reader, writer, closer) = stream.into_parts();
         Ok(Conn {
@@ -173,6 +319,8 @@ enum ListenerKind {
     /// A port of the Moruna kernel's vsock driver (SDD 30 f.2).
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     Kernel(moruna_micro::vsock::Listener),
+    /// A channel already connected to its one peer: accepting it hands it over, once.
+    Channel(std::sync::Mutex<Option<Conn>>),
 }
 
 impl Listener {
@@ -184,6 +332,23 @@ impl Listener {
             ListenerKind::Vsock(fd) => vsock::accept(fd),
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             ListenerKind::Kernel(listener) => micro::conn(listener.accept()?.0),
+            ListenerKind::Channel(conn) => conn
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "a channel has one peer, and it was accepted",
+                    )
+                }),
+        }
+    }
+
+    /// A listener whose one peer is already connected on `conn`: what a channel is.
+    pub fn connected(conn: Conn) -> Listener {
+        Listener {
+            inner: ListenerKind::Channel(std::sync::Mutex::new(Some(conn))),
         }
     }
 }
@@ -198,6 +363,7 @@ impl Drop for Listener {
             ListenerKind::Vsock(_) => {}
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             ListenerKind::Kernel(_) => {}
+            ListenerKind::Channel(_) => {}
         }
     }
 }
@@ -220,6 +386,7 @@ pub fn listen(address: &Address) -> io::Result<Listener> {
         }),
         #[cfg(not(target_os = "linux"))]
         Address::Vsock { .. } => Err(vsock::unsupported()),
+        Address::Channel(_) => connect(address).map(Listener::connected),
     }
 }
 
@@ -429,6 +596,109 @@ mod tests {
         server.close();
         drop(listener);
         assert!(!path.exists(), "the listener removes its socket file");
+    }
+
+    #[test]
+    fn a_channels_address_is_its_slot() {
+        assert_eq!(
+            Address::parse("channel:engine"),
+            Ok(Address::Channel("engine".into()))
+        );
+        assert_eq!(
+            Address::parse("channel:a.b_c-1").map(|a| a.to_string()),
+            Ok("channel:a.b_c-1".to_string())
+        );
+        let longest = format!("channel:{}", "s".repeat(32));
+        assert!(Address::parse(&longest).is_ok());
+        for text in [
+            "channel:",
+            "channel:Engine",
+            "channel:a b",
+            "channel:a/b",
+            &format!("channel:{}", "s".repeat(33)),
+        ] {
+            assert!(Address::parse(text).is_err(), "{text}");
+        }
+    }
+
+    /// Messages in memory: what one end sent, for the other to receive.
+    #[derive(Default)]
+    struct Memory {
+        queue: std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>,
+        closed: std::sync::atomic::AtomicBool,
+    }
+
+    impl Messages for Memory {
+        fn send(&self, bytes: &[u8]) -> io::Result<()> {
+            assert!(!bytes.is_empty() && bytes.len() <= CHANNEL_MESSAGE_BYTES);
+            self.queue.lock().unwrap().push_back(bytes.to_vec());
+            Ok(())
+        }
+
+        fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+            assert_eq!(buf.len(), CHANNEL_MESSAGE_BYTES, "room for any message");
+            match self.queue.lock().unwrap().pop_front() {
+                Some(message) => {
+                    buf[..message.len()].copy_from_slice(&message);
+                    Ok(message.len())
+                }
+                None => Ok(0),
+            }
+        }
+
+        fn close(&self) {
+            self.closed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The stream rides the messages: a write is one message of at most 64 KiB, a read takes
+    /// what it asks for across them, and the end of the messages is the end of the stream.
+    #[test]
+    fn a_stream_rides_a_channels_messages() {
+        let memory = Arc::new(Memory::default());
+        let conn = over_messages(memory.clone());
+        let (mut reader, mut writer, closer) = conn.into_parts();
+        let long: Vec<u8> = (0..150 * 1024).map(|i| (i % 251) as u8).collect();
+        writer.write_all(&long).expect("written");
+        writer.write_all(b"hello\n").expect("written");
+        assert_eq!(writer.write(b"").expect("nothing"), 0);
+        writer.flush().expect("flushed");
+        let sizes: Vec<usize> = memory.queue.lock().unwrap().iter().map(Vec::len).collect();
+        assert_eq!(
+            sizes,
+            [
+                CHANNEL_MESSAGE_BYTES,
+                CHANNEL_MESSAGE_BYTES,
+                150 * 1024 - 2 * CHANNEL_MESSAGE_BYTES,
+                6
+            ]
+        );
+        let mut back = vec![0u8; long.len() + 6];
+        let mut small = [0u8; 7];
+        // A small read takes part of a message, and the rest is read after it.
+        assert_eq!(reader.read(&mut small).expect("read"), 7);
+        back[..7].copy_from_slice(&small);
+        reader.read_exact(&mut back[7..]).expect("the rest");
+        assert_eq!(&back[..long.len()], &long[..]);
+        assert_eq!(&back[long.len()..], b"hello\n");
+        assert_eq!(reader.read(&mut []).expect("an empty read"), 0);
+        assert_eq!(reader.read(&mut small).expect("the end"), 0);
+        assert_eq!(reader.read(&mut small).expect("still the end"), 0);
+        closer();
+        assert!(memory.closed.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// A channel is connected to its one peer already: listening on it hands that peer over
+    /// once.
+    #[test]
+    fn a_channel_is_accepted_once() {
+        let listener = Listener::connected(over_messages(Arc::new(Memory::default())));
+        assert!(listener.accept().is_ok());
+        assert_eq!(
+            listener.accept().err().map(|e| e.kind()),
+            Some(io::ErrorKind::NotConnected)
+        );
     }
 
     #[cfg(not(target_os = "linux"))]

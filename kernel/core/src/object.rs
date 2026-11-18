@@ -14,6 +14,7 @@ use crate::{
     account::{Account, Charge},
     channel::Endpoint,
     clock::Timer,
+    hyperv::HvSignal,
     interrupt::Interrupt,
     memory::{DeviceMemory, MemoryObject, Pin, Pinned},
     plane::SlotEnd,
@@ -64,11 +65,13 @@ impl Resource {
     /// The root resource of `kind`, covering everything of that kind.
     pub fn root(kind: ResourceKind, account: &Arc<Account>) -> Result<Resource, Error> {
         let range = match kind {
-            ResourceKind::Process => 0..0,
+            ResourceKind::Process | ResourceKind::Clock => 0..0,
             ResourceKind::DeviceMemory => 0..resource_range::DEVICE_END,
             ResourceKind::Interrupt => 0..resource_range::INTERRUPT_END,
             ResourceKind::Msi => 0..resource_range::MSI_END,
             ResourceKind::Dma => 0..resource_range::DMA_END,
+            // Hyper-V's mechanism (ABI 2.7) has no range: there is one SynIC to reach.
+            ResourceKind::Hyperv => 0..0,
         };
         Resource::new(kind, range, account)
     }
@@ -98,6 +101,8 @@ pub enum Object {
     Slot(Arc<SlotEnd>),
     /// A memory account (ABI 2.3).
     Account(Arc<Account>),
+    /// The right to signal one Hyper-V connection ID (ABI 2.7).
+    HvSignal(Arc<HvSignal>),
 }
 
 impl Object {
@@ -115,6 +120,7 @@ impl Object {
             Object::Pin(_) => ObjectType::Pin,
             Object::Slot(_) => ObjectType::Slot,
             Object::Account(_) => ObjectType::Account,
+            Object::HvSignal(_) => ObjectType::HvSignal,
         }
     }
 
@@ -132,7 +138,8 @@ impl Object {
             | Object::Console(_)
             | Object::Resource(_)
             | Object::Pin(_)
-            | Object::Account(_) => None,
+            | Object::Account(_)
+            | Object::HvSignal(_) => None,
         }
     }
 
@@ -150,6 +157,8 @@ impl Object {
                 base | Rights::READ | Rights::WRITE | Rights::MAP
             }
             ObjectType::Console | ObjectType::Resource => base | Rights::WRITE,
+            // It only signals, and can be given to the channel's driver.
+            ObjectType::HvSignal => moruna_abi::hyperv::SIGNAL_RIGHTS,
             // Read its figures; carve from it, or charge a process or memory to it.
             ObjectType::Account => base | Rights::READ | Rights::WRITE,
             // A pin is only ever closed; closing needs no right.

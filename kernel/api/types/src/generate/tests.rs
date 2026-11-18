@@ -45,8 +45,19 @@ fn a_change_to_the_table_changes_both_files() {
     let fewer = &OPERATIONS[..OPERATIONS.len() - 1];
     assert_ne!(render(&openapi(fewer)), render(&openapi(OPERATIONS)));
     assert_ne!(render(&mcp_tools(fewer)), render(&mcp_tools(OPERATIONS)));
-    assert_eq!(openapi(fewer)["paths"].as_object().map(Map::len), Some(2));
-    assert_eq!(mcp_tools(fewer)["tools"].as_array().map(Vec::len), Some(2));
+    let step_2 = &OPERATIONS[..3];
+    assert_eq!(openapi(step_2)["paths"].as_object().map(Map::len), Some(3));
+    assert_eq!(mcp_tools(step_2)["tools"].as_array().map(Vec::len), Some(3));
+    // Step 3's seven job operations are on six paths, and 3E's two on one more; each is a
+    // tool, the stream of events too.
+    assert_eq!(
+        openapi(OPERATIONS)["paths"].as_object().map(Map::len),
+        Some(10)
+    );
+    assert_eq!(
+        mcp_tools(OPERATIONS)["tools"].as_array().map(Vec::len),
+        Some(12)
+    );
 }
 
 #[test]
@@ -71,32 +82,68 @@ fn openapi_has_every_operation_with_its_security_and_the_error_body() {
         (&scheme["type"], &scheme["scheme"], &scheme["bearerFormat"]),
         (&json!("http"), &json!("bearer"), &json!("JWT"))
     );
+    let observe = json!([{ "bearer": ["observe"] }]);
+    let submit = json!([{ "bearer": ["submit"] }]);
     let expected = [
-        ("/v1/health", "health", json!([]), "Health"),
+        ("get", "/v1/health", "health", json!([]), "200", "Health"),
+        ("get", "/v1/node", "node", observe.clone(), "200", "Node"),
         (
-            "/v1/node",
-            "node",
-            json!([{ "bearer": ["observe"] }]),
-            "Node",
-        ),
-        (
+            "get",
             "/v1/node/audit",
             "node_audit",
             json!([{ "bearer": ["admin"] }]),
+            "200",
             "Audit",
         ),
+        (
+            "post",
+            "/v1/jobs/validate",
+            "jobs_validate",
+            submit.clone(),
+            "200",
+            "Validation",
+        ),
+        (
+            "post",
+            "/v1/jobs",
+            "jobs_submit",
+            submit.clone(),
+            "201",
+            "Submitted",
+        ),
+        (
+            "get",
+            "/v1/jobs",
+            "jobs_list",
+            observe.clone(),
+            "200",
+            "Jobs",
+        ),
+        (
+            "get",
+            "/v1/jobs/{id}",
+            "jobs_get",
+            observe.clone(),
+            "200",
+            "JobStatus",
+        ),
+        (
+            "post",
+            "/v1/jobs/{id}/cancel",
+            "jobs_cancel",
+            submit,
+            "200",
+            "JobStatus",
+        ),
     ];
-    assert_eq!(
-        document["paths"].as_object().map(Map::len),
-        Some(expected.len())
-    );
-    for (path, id, security, response) in expected {
-        let operation = &document["paths"][path]["get"];
+    for (method, path, id, security, status, response) in expected {
+        let operation = &document["paths"][path][method];
         assert_eq!(operation["operationId"], id, "{path}");
         assert_eq!(operation["security"], security, "{path}");
         let responses = &operation["responses"];
+        assert_eq!(responses.as_object().map(Map::len), Some(2), "{path}");
         assert_eq!(
-            responses["200"]["content"]["application/json"]["schema"]["$ref"],
+            responses[status]["content"]["application/json"]["schema"]["$ref"],
             format!("#/components/schemas/{response}"),
             "{path}"
         );
@@ -105,7 +152,75 @@ fn openapi_has_every_operation_with_its_security_and_the_error_body() {
             "#/components/schemas/ErrorBody",
             "{path}"
         );
+        let takes_id = path.contains("{id}");
+        assert_eq!(
+            operation["parameters"]
+                == json!([{
+                    "name": "id", "in": "path", "required": true,
+                    "description": "The run's ID.", "schema": { "type": "string" }
+                }]),
+            takes_id,
+            "{path}"
+        );
+        assert_eq!(
+            operation["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+                == "#/components/schemas/Job",
+            id == "jobs_validate" || id == "jobs_submit",
+            "{path}"
+        );
     }
+    // The stream of events is text, replayed after `from`; the report is any JSON object.
+    let events = &document["paths"]["/v1/jobs/{id}/events"]["get"];
+    assert_eq!(events["operationId"], "jobs_events");
+    assert_eq!(events["security"], observe);
+    assert_eq!(
+        events["responses"]["200"]["content"]["text/event-stream"]["schema"],
+        json!({ "type": "string" })
+    );
+    assert_eq!(
+        events["parameters"][1],
+        json!({ "name": "from", "in": "query", "required": false, "description": FROM,
+                "schema": { "type": "integer", "minimum": 0 } })
+    );
+    assert!(
+        events["summary"]
+            .as_str()
+            .unwrap()
+            .contains("replayed after it")
+    );
+    let report = &document["paths"]["/v1/jobs/{id}/report"]["get"];
+    assert_eq!(report["operationId"], "jobs_report");
+    assert_eq!(
+        report["responses"]["200"]["content"]["application/json"]["schema"],
+        json!({ "type": "object" })
+    );
+    // 3E: registering takes a registration and answers 201 with the function; listing is open
+    // to observe.
+    let register = &document["paths"]["/v1/functions"]["post"];
+    assert_eq!(register["operationId"], "functions_register");
+    assert_eq!(register["security"], json!([{ "bearer": ["admin"] }]));
+    assert_eq!(
+        register["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/FunctionRegistration"
+    );
+    assert_eq!(
+        register["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/Function"
+    );
+    let list = &document["paths"]["/v1/functions"]["get"];
+    assert_eq!(list["security"], observe);
+    assert!(list.get("requestBody").is_none());
+    assert_eq!(
+        properties(&document, "FunctionRegistration"),
+        ["address", "name", "sha256", "signature"]
+    );
+    let total: usize = document["paths"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|methods| methods.as_object().unwrap().len())
+        .sum();
+    assert_eq!(total, OPERATIONS.len());
 }
 
 /// The property names of a component schema, sorted.
@@ -201,6 +316,63 @@ fn openapi_schemas_carry_the_design_names_and_no_others() {
             "internal"
         ])
     );
+    // 3B's names.
+    assert_eq!(
+        properties(&document, "Job"),
+        strings(&["v1", "v2", "secrets"])
+    );
+    assert_eq!(
+        document["components"]["schemas"]["Job"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        document["components"]["schemas"]["Job"]["properties"]["secrets"]["additionalProperties"],
+        json!({ "type": "string" })
+    );
+    assert_eq!(
+        properties(&document, "Validation"),
+        strings(&["ok", "refusals"])
+    );
+    assert_eq!(
+        properties(&document, "Refusal"),
+        strings(&["field", "message"])
+    );
+    assert_eq!(properties(&document, "Submitted"), strings(&["id"]));
+    assert_eq!(properties(&document, "Jobs"), strings(&["jobs"]));
+    assert_eq!(
+        properties(&document, "JobSummary"),
+        strings(&["id", "state", "submitted", "started", "ended"])
+    );
+    assert_eq!(
+        properties(&document, "JobStatus"),
+        strings(&[
+            "id",
+            "state",
+            "submitted",
+            "started",
+            "ended",
+            "heartbeat",
+            "exit_code"
+        ])
+    );
+    assert_eq!(
+        values(&document, "JobState"),
+        strings(&["starting", "running", "completed", "failed", "cancelled"])
+    );
+    assert_eq!(
+        properties(&document, "Heartbeat"),
+        strings(&[
+            "t_ms",
+            "committed_seq",
+            "rows_out",
+            "bytes_out",
+            "active_workers",
+            "ceiling_bytes",
+            "anon_bytes",
+            "bottleneck",
+            "staging_bytes"
+        ])
+    );
 }
 
 #[test]
@@ -208,20 +380,64 @@ fn mcp_has_one_tool_per_operation_with_its_input_and_output() {
     let list = mcp_tools(OPERATIONS);
     let tools = list["tools"].as_array().expect("a tool list");
     assert_eq!(tools.len(), OPERATIONS.len());
+    let nothing = json!({ "type": "object", "properties": {}, "additionalProperties": false });
+    let id = json!({
+        "type": "object",
+        "properties": { "id": { "type": "string", "description": "The run's ID." } },
+        "required": ["id"],
+        "additionalProperties": false
+    });
+    // The events' tool: the run's ID, and the record its page comes after, which may be left
+    // out.
+    let events = json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string", "description": "The run's ID." },
+            "from": { "type": "integer", "minimum": 0, "description": FROM }
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    });
     let expected = [
-        ("moruna_health", "Health"),
-        ("moruna_node", "Node"),
-        ("moruna_node_audit", "Audit"),
+        ("moruna_health", Some("Health"), Some(&nothing)),
+        ("moruna_node", Some("Node"), Some(&nothing)),
+        ("moruna_node_audit", Some("Audit"), Some(&nothing)),
+        ("moruna_jobs_validate", Some("Validation"), None),
+        ("moruna_jobs_submit", Some("Submitted"), None),
+        ("moruna_jobs_list", Some("Jobs"), Some(&nothing)),
+        ("moruna_jobs_get", Some("JobStatus"), Some(&id)),
+        ("moruna_jobs_cancel", Some("JobStatus"), Some(&id)),
+        ("moruna_jobs_events", Some("JobEvents"), Some(&events)),
+        ("moruna_jobs_report", None, Some(&id)),
+        ("moruna_functions_register", Some("Function"), None),
+        ("moruna_functions_list", Some("Functions"), Some(&nothing)),
     ];
-    for ((tool, operation), (name, title)) in tools.iter().zip(OPERATIONS).zip(expected) {
+    for ((tool, operation), (name, title, input)) in tools.iter().zip(OPERATIONS).zip(expected) {
         assert_eq!(tool["name"], name);
-        assert_eq!(tool["description"], operation.summary);
-        assert_eq!(
-            tool["inputSchema"],
-            json!({ "type": "object", "properties": {}, "additionalProperties": false })
-        );
+        assert_eq!(tool["description"], operation.tool_summary());
+        match input {
+            Some(input) => assert_eq!(&tool["inputSchema"], input, "{name}"),
+            // A job: its document in one version, and nothing else; or a function's
+            // registration, its four fields.
+            None => {
+                let input = &tool["inputSchema"];
+                let (title, fields) = match operation.request {
+                    Request::Function => ("FunctionRegistration", 4),
+                    _ => ("Job", 3),
+                };
+                assert_eq!(input["title"], title, "{name}");
+                assert_eq!(input["additionalProperties"], false, "{name}");
+                assert_eq!(
+                    input["properties"].as_object().map(Map::len),
+                    Some(fields),
+                    "{name}"
+                );
+            }
+        }
         assert_eq!(tool["outputSchema"]["type"], "object", "{name}");
-        assert_eq!(tool["outputSchema"]["title"], title, "{name}");
+        if let Some(title) = title {
+            assert_eq!(tool["outputSchema"]["title"], title, "{name}");
+        }
     }
     // Each output schema stands alone: every subschema is inlined, so no reference remains.
     let text = render(&list);
@@ -229,5 +445,21 @@ fn mcp_has_one_tool_per_operation_with_its_input_and_output() {
     assert_eq!(
         allowed(&tools[1]["outputSchema"]["properties"]["cloud"]),
         ["azure", "none", "openstack"]
+    );
+    // A page of events: its records, each a stream's event with its JSON, and the next `from`.
+    let page = &tools[8]["outputSchema"];
+    assert_eq!(page["required"], json!(["records", "next"]));
+    let record = &page["properties"]["records"]["items"];
+    assert_eq!(record["required"], json!(["event", "data"]));
+    assert_eq!(
+        allowed(&record["properties"]["event"]),
+        ["event", "exit", "note", "report"]
+    );
+    assert_eq!(record["properties"]["data"]["type"], "object");
+    assert!(
+        tools[8]["description"]
+            .as_str()
+            .unwrap()
+            .contains("up to 1,000, and 1 MiB of them, after the record `from`")
     );
 }

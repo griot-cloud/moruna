@@ -214,11 +214,15 @@ fn the_operations_table_is_the_design_table() {
                 op.method.as_str(),
                 op.path,
                 op.scope,
+                op.request,
                 op.response,
-                op.tool_name(),
+                op.status,
             )
         })
         .collect();
+    let observe = Some(Scope::Observe);
+    let submit = Some(Scope::Submit);
+    let (none, job) = (Request::None, Request::Job);
     assert_eq!(
         rows,
         vec![
@@ -227,26 +231,284 @@ fn the_operations_table_is_the_design_table() {
                 "GET",
                 "/v1/health",
                 None,
+                none,
                 Response::Health,
-                "moruna_health".to_string()
+                200
             ),
             (
                 "node",
                 "GET",
                 "/v1/node",
-                Some(Scope::Observe),
+                observe,
+                none,
                 Response::Node,
-                "moruna_node".to_string()
+                200
             ),
             (
                 "node_audit",
                 "GET",
                 "/v1/node/audit",
                 Some(Scope::Admin),
+                none,
                 Response::Audit,
-                "moruna_node_audit".to_string()
+                200
+            ),
+            // 3B's table, row for row.
+            (
+                "jobs_validate",
+                "POST",
+                "/v1/jobs/validate",
+                submit,
+                job,
+                Response::Validation,
+                200
+            ),
+            (
+                "jobs_submit",
+                "POST",
+                "/v1/jobs",
+                submit,
+                job,
+                Response::Submitted,
+                201
+            ),
+            (
+                "jobs_list",
+                "GET",
+                "/v1/jobs",
+                observe,
+                none,
+                Response::Jobs,
+                200
+            ),
+            (
+                "jobs_get",
+                "GET",
+                "/v1/jobs/{id}",
+                observe,
+                none,
+                Response::JobStatus,
+                200
+            ),
+            (
+                "jobs_cancel",
+                "POST",
+                "/v1/jobs/{id}/cancel",
+                submit,
+                none,
+                Response::JobStatus,
+                200
+            ),
+            (
+                "jobs_events",
+                "GET",
+                "/v1/jobs/{id}/events",
+                observe,
+                none,
+                Response::Events,
+                200
+            ),
+            (
+                "jobs_report",
+                "GET",
+                "/v1/jobs/{id}/report",
+                observe,
+                none,
+                Response::Report,
+                200
+            ),
+            // 3E's two.
+            (
+                "functions_register",
+                "POST",
+                "/v1/functions",
+                Some(Scope::Admin),
+                Request::Function,
+                Response::Function,
+                201
+            ),
+            (
+                "functions_list",
+                "GET",
+                "/v1/functions",
+                observe,
+                none,
+                Response::Functions,
+                200
             ),
         ]
     );
     assert!(OPERATIONS.iter().all(|op| !op.summary.is_empty()));
+    for op in OPERATIONS {
+        let events = op.id == "jobs_events";
+        // Every operation has a tool, the stream of events one that answers a page (item 3.7).
+        assert_eq!(op.tool_name(), format!("moruna_{}", op.id));
+        if events {
+            assert_eq!(op.tool_summary(), EVENTS_TOOL_SUMMARY);
+        } else {
+            assert_eq!(op.tool_summary(), op.summary);
+        }
+        assert_eq!(op.query.is_empty(), !events, "{}", op.id);
+    }
+    assert_eq!(OPERATIONS[8].query, ["from"]);
+}
+
+#[test]
+fn a_page_of_events_round_trips() {
+    let page: JobEvents<Value> = round_trip(
+        r#"{"records":[
+            {"id":4,"event":"event","data":{"type":"event","kind":"log","text":"one"}},
+            {"event":"note","data":{"type":"note","skipped_lines":1}},
+            {"event":"report","data":{"type":"report","report":{"rows_out":3},"plan":null}},
+            {"event":"exit","data":{"type":"exit","code":0,"diagnostic":null}}
+        ],"next":4}"#,
+    );
+    assert_eq!(page.next, 4);
+    let names: Vec<JobEventName> = page.records.iter().map(|record| record.event).collect();
+    assert_eq!(
+        names,
+        [
+            JobEventName::Event,
+            JobEventName::Note,
+            JobEventName::Report,
+            JobEventName::Exit
+        ]
+    );
+    assert_eq!(page.records[0].id, Some(4));
+    assert_eq!(page.records[1].id, None);
+    assert_eq!(page.records[3].data["code"], 0);
+    let empty: JobEvents<Value> = round_trip(r#"{"records":[],"next":0}"#);
+    assert!(empty.records.is_empty());
+    refused::<JobEventName>(r#""heartbeat""#);
+    assert_eq!((EVENTS_PAGE, EVENTS_PAGE_BYTES), (1_000, 1 << 20));
+    assert!(FROM.contains("Last-Event-ID") && FROM.contains("after it"));
+}
+
+#[test]
+fn a_path_matches_its_operation_and_gives_the_run_id() {
+    let by_id = |id: &str| OPERATIONS.iter().find(|op| op.id == id).unwrap();
+    let get = by_id("jobs_get");
+    assert!(get.takes_id() && !by_id("jobs_list").takes_id());
+    assert_eq!(get.matches("/v1/jobs/abc"), Some(Some("abc")));
+    assert_eq!(get.matches("/v1/jobs/"), None, "an empty ID is no ID");
+    assert_eq!(get.matches("/v1/jobs"), None);
+    assert_eq!(get.matches("/v1/jobs/abc/"), None);
+    assert_eq!(get.matches("/v1/jobs/abc/report"), None);
+    assert_eq!(get.matches("/v2/jobs/abc"), None);
+    assert_eq!(by_id("jobs_list").matches("/v1/jobs"), Some(None));
+    assert_eq!(by_id("jobs_list").matches("/v1/jobs/"), None);
+    let cancel = by_id("jobs_cancel");
+    assert_eq!(cancel.matches("/v1/jobs/abc/cancel"), Some(Some("abc")));
+    assert_eq!(cancel.matches("/v1/jobs/abc/events"), None);
+    assert_eq!(cancel.path_for("abc"), "/v1/jobs/abc/cancel");
+    assert_eq!(by_id("node").path_for("abc"), "/v1/node");
+    // The path of `validate` is also a job path whose ID would be `validate`: the method tells
+    // them apart.
+    assert_eq!(get.matches("/v1/jobs/validate"), Some(Some("validate")));
+    assert_eq!(
+        by_id("jobs_validate").matches("/v1/jobs/validate"),
+        Some(None)
+    );
+}
+
+#[test]
+fn a_job_is_its_document_in_one_version() {
+    let v1: Job<Value> = round_trip(r#"{"v1":{"moruna_spec":1,"source":{"kind":"rows"}}}"#);
+    assert_eq!(
+        v1,
+        Job::v1(serde_json::json!({"moruna_spec":1,"source":{"kind":"rows"}}))
+    );
+    let v2: Job<Value> = round_trip(r#"{"v2":"TUpCMg==","secrets":{"s3-key":"s3cr3t"}}"#);
+    assert_eq!(v2.v2.as_deref(), Some("TUpCMg=="));
+    assert_eq!(v2, Job::v2("TUpCMg==").with_secret("s3-key", "s3cr3t"));
+    assert!(Job::<Value>::v2("TUpCMg==").secrets.is_empty());
+    assert!(refused::<Job<Value>>(r#"{"v1":{},"v3":{}}"#).contains("v3"));
+    assert!(refused::<Job<Value>>(r#"{"v2":7}"#).contains("string"));
+    refused::<Job<Value>>(r#"{"v2":"TUpCMg==","secrets":["s3cr3t"]}"#);
+    refused::<Job<Value>>(r#"{"v2":"TUpCMg==","secrets":{"k":7}}"#);
+}
+
+#[test]
+fn the_job_answers_round_trip_3b() {
+    let ok: Validation = round_trip(r#"{"ok":true}"#);
+    assert!(ok.ok && ok.refusals.is_empty());
+    let not: Validation = round_trip(
+        r#"{"ok":false,"refusals":[{"field":"tasks[0].kind","message":"no such kind"}]}"#,
+    );
+    assert_eq!(not.refusals[0].field, "tasks[0].kind");
+    let submitted: Submitted = round_trip(r#"{"id":"0123456789abcdef0123456789abcdef"}"#);
+    assert_eq!(submitted.id.len(), 32);
+    let jobs: Jobs = round_trip(
+        r#"{"jobs":[
+            {"id":"b","state":"running","submitted":1794931260,"started":1794931261},
+            {"id":"a","state":"completed","submitted":1794931200,"started":1794931201,"ended":1794931230}
+        ]}"#,
+    );
+    assert_eq!(jobs.jobs[0].state, JobState::Running);
+    assert_eq!(jobs.jobs[0].ended, None);
+    let status: JobStatus = round_trip(
+        r#"{"id":"a","state":"cancelled","submitted":1,"started":2,"ended":3,
+            "heartbeat":{"t_ms":1500,"committed_seq":4,"rows_out":10,"bytes_out":80,
+                "active_workers":2,"ceiling_bytes":1024,"anon_bytes":512,"bottleneck":"sink",
+                "staging_bytes":0},
+            "exit_code":130}"#,
+    );
+    assert_eq!(status.exit_code, Some(130));
+    assert_eq!(
+        status.heartbeat.as_ref().unwrap().bottleneck.as_deref(),
+        Some("sink")
+    );
+    let starting: JobStatus = round_trip(r#"{"id":"a","state":"starting","submitted":1}"#);
+    assert!(starting.heartbeat.is_none() && starting.exit_code.is_none());
+    // The engine's heartbeat reads whatever fields it leaves out or nulls, and others it adds.
+    let heartbeat: Heartbeat = serde_json::from_str(
+        r#"{"type":"heartbeat","t_ms":7,"committed_seq":null,"rows_out":1,"later":true}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        (heartbeat.t_ms, heartbeat.committed_seq, heartbeat.rows_out),
+        (7, None, 1)
+    );
+    for (name, state, ended) in [
+        ("starting", JobState::Starting, false),
+        ("running", JobState::Running, false),
+        ("completed", JobState::Completed, true),
+        ("failed", JobState::Failed, true),
+        ("cancelled", JobState::Cancelled, true),
+    ] {
+        assert_eq!(
+            serde_json::to_value(state).unwrap(),
+            Value::String(name.into())
+        );
+        assert_eq!(state.ended(), ended);
+    }
+    refused::<JobState>(r#""paused""#);
+    assert_eq!(
+        (Method::Get.as_str(), Method::Post.as_str()),
+        ("GET", "POST")
+    );
+}
+
+#[test]
+fn a_function_and_its_registration_round_trip_3e() {
+    let registration: FunctionRegistration = round_trip(
+        r#"{"name":"gate-score","address":"https://example.com/gate-score","sha256":"ab","signature":"c2ln"}"#,
+    );
+    assert_eq!(registration.name, "gate-score");
+    assert!(
+        refused::<FunctionRegistration>(r#"{"name":"a","address":"b","sha256":"c"}"#)
+            .contains("signature")
+    );
+    assert!(
+        refused::<FunctionRegistration>(
+            r#"{"name":"a","address":"b","sha256":"c","signature":"d","key":"e"}"#
+        )
+        .contains("key")
+    );
+    let functions: Functions = round_trip(
+        r#"{"functions":[{"name":"gate-score","address":"https://images.example.com/gate-score","sha256":"ab","key":"0123456789abcdef","registered":1794931200}]}"#,
+    );
+    assert_eq!(functions.functions[0].registered, 1794931200);
+    let none: Functions = round_trip(r#"{"functions":[]}"#);
+    assert!(none.functions.is_empty());
 }

@@ -9,9 +9,12 @@ use moruna_vmbus::MessageType;
 use moruna_vmbus::RingPair;
 
 use crate::host::FakeHost;
+use crate::host::NIC;
+use crate::host::connect;
 use crate::host::connected;
 use crate::host::connection_of;
 use crate::host::drain;
+use crate::host::instance;
 
 const CHANNEL: ChannelId = ChannelId(1);
 const OTHER: ChannelId = ChannelId(2);
@@ -30,6 +33,41 @@ fn with_ring() -> (Client, FakeHost, RingPair) {
         outgoing_pages: 4,
     };
     (client, host, ring)
+}
+
+#[test]
+fn the_contact_and_every_channel_target_cpu_0s_vp_whatever_its_index() {
+    // Hyper-V numbers CPU 0's VP as it chooses; the strict host checks that the contact and
+    // each open name exactly the index the client was given.
+    for vp in [0, 3, 63] {
+        let mut host = FakeHost::new();
+        host.target_vp = vp;
+        host.devices = vec![(NIC, instance(1))];
+        let (mut client, events) = connect(&mut host);
+        assert!(matches!(events.last(), Some(Event::Connected { .. })));
+        assert_eq!(client.target_vp(), vp);
+        let memory = host.add_memory(1, 0x8000, 8);
+        let ring = RingPair {
+            memory,
+            outgoing_pages: 4,
+        };
+        client.open(&mut host, CHANNEL, ring).unwrap();
+        assert_eq!(
+            drain(&mut client, &mut host),
+            [Event::Opened { channel: CHANNEL }]
+        );
+        assert!(host.is_open(CHANNEL));
+    }
+}
+
+#[test]
+#[should_panic(expected = "messages target CPU 0's VP")]
+fn a_client_told_the_wrong_vp_is_caught() {
+    let mut host = FakeHost::new();
+    host.target_vp = 2;
+    let mut client = Client::new(0);
+    client.connect().unwrap();
+    drain(&mut client, &mut host);
 }
 
 #[test]

@@ -17,7 +17,7 @@ fn client(listener: &Channel) -> Result<net::Client, String> {
     let channel = moruna_svc::connect(listener).map_err(|e| format!("connect: {e:?}"))?;
     let account = moruna_svc::Account::carve(8 << 20, "net-proof")
         .map_err(|e| format!("network account: {e:?}"))?;
-    let mut client = net::Client::connect(channel, deadline_in(60 * SECOND), account)
+    let mut client = net::Client::connect(channel, deadline_in(moruna_svc::READY_TIMEOUT), account)
         .map_err(|e| format!("hello: {e:?}"))?;
     client.core().set_timeout(60 * SECOND);
     Ok(client)

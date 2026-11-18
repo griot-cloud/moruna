@@ -6,6 +6,16 @@ starts, with its engine, layers and launcher descriptor; or `cloud` (system desi
 one disk image for every cloud, which holds only what kernel/node/cloud.image lists and takes
 no agent port, CPU count, layers, writable homes, user network or guest CID.
 
+`cloud-test` is the cloud profile built for tests only, and never the release image (work item
+2.2c): the same description, assets and programs, with `api` built with its feature `test-exit`,
+so that it exits on a request to `/v1/test/exit` and says at each start that it is this build.
+That is the tests' one way to kill `api` from outside the node's design. `cloud` never builds
+it.
+
+`--formats` names the disk's formats (system design 1A, work item 1.5): `raw`, the disk every
+build writes, `qcow2` for OpenStack and `vhd` for Azure, each made from that one raw disk and
+written beside it.
+
 All inputs are explicit local files. This command does not fetch layers, install
 host tools, acquire credentials, upload an image or start a virtual machine.
 The caller must hold the programme's shared build reservation before invoking it.
@@ -18,20 +28,92 @@ from pathlib import Path
 import shutil
 import subprocess
 
-PROFILES = ("standalone", "cloud")
+PROFILES = ("standalone", "cloud", "cloud-test")
+# The profiles of the one cloud disk image: they take the same arguments and are checked alike.
+CLOUD_PROFILES = ("cloud", "cloud-test")
 # The user programs each profile's image starts; `--package` adds to them.
 PROGRAMS = {
     "standalone": ["moruna-node-supervisor", "node-admission", "moruna-storage-service", "devices", "imagefs", "linux", "netstack", "engine",
                    "virtio-blk", "virtio-vsock", "virtio-net", "nvme", "gve"],
-    "cloud": ["moruna-node-supervisor", "devices", "virtio-blk", "virtio-net", "nvme", "gve"],
+    "cloud": ["moruna-node-supervisor", "devices", "netstack", "moruna-node-api", "moruna-node-platform",
+              "virtio-blk", "virtio-net", "nvme", "gve", "moruna-vmbus-server", "moruna-storvsc-server"],
 }
+# For tests only, never the release image: the cloud's programs, `api` with its test route.
+PROGRAMS["cloud-test"] = PROGRAMS["cloud"]
+# The features each profile's user build turns on, beyond each program's defaults.
+FEATURES = {"standalone": [], "cloud": [], "cloud-test": ["moruna-node-api/test-exit"]}
 # The flags only a launcher's node takes, refused for a cloud image.
 LAUNCHER_FLAGS = (("agent_port", "--agent-port"), ("cpus", "--cpus"), ("layer", "--layer"),
                   ("writable_home", "--writable-home"), ("user_network", "--user-network"), ("cid", "--cid"))
+# The C of a user program (`ring`, which the network server brings in) is compiled as
+# kernel/tools/build.sh compiles it: by clang, freestanding, for the bare x86_64 ELF target.
+USER_CC = "CC_x86_64_moruna_user"
+USER_CFLAGS = "CFLAGS_x86_64_moruna_user"
+USER_C_FLAGS = "--target=x86_64-unknown-none -ffreestanding -mno-red-zone -fno-stack-protector"
+
+
+def user_c(environment):
+    """The two C compiler variables of the user build, as kernel/tools/build.sh sets them:
+    the caller's compiler, or clang; build.sh's flags, then the caller's. They name the user
+    target, so no host tool and no kernel build reads them."""
+    flags = " ".join(part for part in (USER_C_FLAGS, environment.get(USER_CFLAGS, "").strip()) if part)
+    return {USER_CC: environment.get(USER_CC) or "clang", USER_CFLAGS: flags}
+
+# The disk's formats. `raw` is the disk itself; each other one is a file beside it.
+FORMATS = ("raw", "qcow2", "vhd")
+MIB = 1024 * 1024
 
 
 def command(args, cwd, env=None):
     subprocess.run([str(a) for a in args], cwd=cwd, env=env, check=True)
+
+
+def whole_mib(size):
+    """`size` bytes rounded up to a whole MiB."""
+    return -(-size // MIB) * MIB
+
+
+def convert(disk, formats, run=command):
+    """Each of `formats` made from the raw disk, beside it: the files written, in that order.
+
+    `raw` is the disk itself, so it writes nothing. `qcow2` is for OpenStack. `vhd` is Azure's
+    fixed-size VHD: the raw disk rounded up to a whole MiB (zeros after its end), then the VHD's
+    512-byte footer. `force_size` keeps exactly that size, where QEMU would otherwise round it
+    to a disk geometry.
+    """
+    written = []
+    for name in dict.fromkeys(formats):
+        if name not in FORMATS:
+            raise ValueError(f"unknown disk format: {name}")
+        if name == "raw":
+            continue
+        target = disk.with_suffix(f".{name}")
+        if name == "qcow2":
+            run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2", disk, target], disk.parent)
+        else:
+            source, size = disk, disk.stat().st_size
+            if size != whole_mib(size):
+                source = disk.with_suffix(".vhd-source")
+                shutil.copyfile(disk, source)
+                os.truncate(source, whole_mib(size))
+            try:
+                run(["qemu-img", "convert", "-f", "raw", "-O", "vpc", "-o", "subformat=fixed,force_size",
+                     source, target], disk.parent)
+            finally:
+                if source != disk:
+                    source.unlink()
+        written.append(target)
+    return written
+
+
+def recorded(paths):
+    """Each file's size and SHA-256, as the package's evidence file holds them."""
+    evidence = {}
+    for path in paths:
+        with path.open("rb") as file:
+            digest = hashlib.file_digest(file, "sha256").hexdigest()
+        evidence[str(path)] = {"size": path.stat().st_size, "sha256": digest}
+    return evidence
 
 
 def arguments(argv=None):
@@ -49,11 +131,13 @@ def arguments(argv=None):
     parser.add_argument("--agent-port", type=int)
     parser.add_argument("--node-memory", type=int, required=True)
     parser.add_argument("--cpus", type=int)
+    parser.add_argument("--formats", nargs="+", choices=FORMATS, default=["raw"], metavar="FORMAT",
+                        help="the disk's formats, each written beside the raw disk: raw (the default), qcow2, vhd")
     args = parser.parse_args(argv)
-    if args.profile == "cloud":
+    if args.profile in CLOUD_PROFILES:
         given = [flag for name, flag in LAUNCHER_FLAGS if getattr(args, name) not in (None, False, [])]
         if given:
-            parser.error(f"the cloud profile takes no {', '.join(given)}")
+            parser.error(f"the {args.profile} profile takes no {', '.join(given)}")
         return parser, args
     missing = [flag for name, flag in (("agent_port", "--agent-port"), ("cpus", "--cpus")) if getattr(args, name) is None]
     if missing:
@@ -67,7 +151,7 @@ def arguments(argv=None):
 
 def main():
     parser, args = arguments()
-    cloud = args.profile == "cloud"
+    cloud = args.profile in CLOUD_PROFILES
     kernel = Path(__file__).resolve().parents[2]
     description = args.description.resolve(strict=True)
     assets = args.assets.resolve(strict=True)
@@ -77,6 +161,8 @@ def main():
     if out.exists():
         parser.error("output must be a new directory; existing artifacts are never removed")
     tools = ["cargo", "rustc", "grub-mkstandalone", "sgdisk", "mformat", "mmd", "mcopy"]
+    if any(name != "raw" for name in args.formats):
+        tools.append("qemu-img")
     for tool in tools:
         if shutil.which(tool) is None:
             parser.error(f"required tool unavailable: {tool}")
@@ -122,11 +208,13 @@ def main():
     env["RUSTFLAGS"] = flags
     command([*cargo, "build", *common, "-p", "moruna-microkernel-boot"], kernel, env)
     env["RUSTFLAGS"] = f"{flags} -Zunstable-options -C link-arg=-T{kernel / 'sys/user.ld'} -C link-arg=-static"
-    packages = list(dict.fromkeys([*PROGRAMS[args.profile], *args.package]))
+    env.update(user_c(os.environ))
+    packages =list(dict.fromkeys([*PROGRAMS[args.profile], *args.package]))
     package_args = [word for package in packages for word in ("-p", package)]
     user_common = ["--locked", "--offline", "--release", "--target", user_target, *std]
     # The storage service's feature names a package only the standalone node builds.
-    features = [] if "moruna-storage-service" not in packages else ["--features", "moruna-storage-service/service"]
+    named = [*FEATURES[args.profile], *(["moruna-storage-service/service"] if "moruna-storage-service" in packages else [])]
+    features = ["--features", ",".join(named)] if named else []
     # The JSON target's -Z flags follow `build`, as in kernel/tools/build.sh: this nightly
     # refuses them before the subcommand.
     command([*cargo, "build", "-Zunstable-options", "-Zjson-target-spec", *user_common, *package_args, *features], kernel, env)
@@ -161,7 +249,11 @@ def main():
         raise RuntimeError("kernel output is not ELF")
     shutil.copyfile(elf, payload / "moruna-kernel.elf")
     config = out / "grub.cfg"
-    config.write_text("set timeout=0\nset default=0\nmenuentry 'Moruna' {\n search --file --set=root /boot/moruna-kernel.elf\n multiboot2 /boot/moruna-kernel.elf\n module2 /boot/initramfs.cpio\n boot\n}\n")
+    # A node has no screen, and the core's multiboot2 header asks for no framebuffer. GRUB's EFI
+    # build has no text console to hand over instead, so at `boot` it still tries a video mode
+    # ("auto") and prints "error: no suitable video mode found" where the firmware offers none
+    # (QEMU with no display, Hyper-V Generation 2). `gfxpayload=text` has it try none.
+    config.write_text("set timeout=0\nset default=0\nmenuentry 'Moruna' {\n search --file --set=root /boot/moruna-kernel.elf\n multiboot2 /boot/moruna-kernel.elf\n module2 /boot/initramfs.cpio\n set gfxpayload=text\n boot\n}\n")
     boot = out / "BOOTX64.EFI"
     # GRUB reads the boot files from the GPT disk's FAT32 system partition: its partition and
     # filesystem modules are loaded with it, or `search` finds no device holding the kernel.
@@ -170,13 +262,12 @@ def main():
     boot_inputs = [boot, payload / "moruna-kernel.elf", payload / "initramfs.cpio"]
     if any(path.stat().st_size >= 0xffffffff for path in boot_inputs):
         parser.error("UEFI FAT32 boot files must each be smaller than 4GiB")
-    mib = 1024 * 1024
-    esp_mib = max(64, (sum(path.stat().st_size for path in boot_inputs) + 8 * mib + mib - 1) // mib)
+    esp_mib = max(64, (sum(path.stat().st_size for path in boot_inputs) + 8 * MIB + MIB - 1) // MIB)
     if esp_mib > 8192:
         parser.error("boot partition exceeds explicit 8GiB package limit")
     esp = out / "esp.img"
     with esp.open("xb") as file:
-        file.truncate(esp_mib * mib)
+        file.truncate(esp_mib * MIB)
     command(["mformat", "-i", esp, "-F", "::"], out)
     command(["mmd", "-i", esp, "::/EFI", "::/EFI/BOOT", "::/boot"], out)
     command(["mcopy", "-i", esp, boot, "::/EFI/BOOT/BOOTX64.EFI"], out)
@@ -184,17 +275,21 @@ def main():
         command(["mcopy", "-i", esp, payload / name, f"::/boot/{name}"], out)
     disk = out / "moruna-node.raw"
     with disk.open("xb") as file:
-        file.truncate((esp_mib + 4) * mib)
+        file.truncate((esp_mib + 4) * MIB)
     command(["sgdisk", "--clear", f"--new=1:2048:+{esp_mib}M", "--typecode=1:ef00", disk], out)
     with disk.open("r+b") as destination, esp.open("rb") as source:
         destination.seek(2048 * 512)
         shutil.copyfileobj(source, destination)
-    evidence = {}
-    for path in [description, *(payload / p.relative_to(assets) for p in files), payload / "manifest", payload / "initramfs.cpio", payload / "moruna-kernel.elf", boot, disk]:
-        evidence[str(path)] = {"size": path.stat().st_size, "sha256": hashlib.file_digest(path.open("rb"), "sha256").hexdigest()}
+    images = convert(disk, args.formats)
+    evidence = recorded([description, *(payload / p.relative_to(assets) for p in files), payload / "manifest",
+                         payload / "initramfs.cpio", payload / "moruna-kernel.elf", boot, disk, *images])
     if cloud:
         # No launcher descriptor, resources contract or writable inputs: a cloud boots the disk.
         (out / "inputs-and-artifacts.json").write_text(json.dumps(evidence, indent=2) + "\n")
+        if args.profile == "cloud-test":
+            print(f"Packaged {disk} (cloud-test profile: for tests only, never a release image; "
+                  "api exits on /v1/test/exit).")
+            return
         print(f"Packaged {disk} (cloud profile); boot and hardware validation remain required.")
         return
     def artifact(path):
