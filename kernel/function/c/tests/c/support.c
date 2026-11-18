@@ -187,8 +187,14 @@ size_t moruna_test_array_size(void) { return sizeof(struct ArrowArray); }
 
 size_t moruna_test_schema_size(void) { return sizeof(struct ArrowSchema); }
 
+void moruna_test_codes(int *codes) {
+  const int named[6] = {MORUNA_E_DONE,  MORUNA_E_NO_PLANE, MORUNA_E_NO_RINGS,
+                        MORUNA_E_RINGS, MORUNA_E_REFUSED,  MORUNA_E_WINDOW_SMALL};
+  memcpy(codes, named, sizeof named);
+}
+
 void check_failed(struct moruna_task *task, const char *what, int line) {
   char text[256];
   snprintf(text, sizeof text, "CHECK failed at scenarios.c:%d: %s", line, what);
-  moruna_log(task, 0, text);
+  moruna_log(task, text);
 }

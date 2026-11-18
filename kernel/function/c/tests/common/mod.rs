@@ -28,6 +28,8 @@ unsafe extern "C" {
     pub fn moruna_test_array_size() -> usize;
     pub fn moruna_test_schema_size() -> usize;
     pub fn moruna_test_cpp_sizes() -> usize;
+    pub fn moruna_test_codes(codes: *mut c_int);
+    pub fn moruna_test_sum() -> c_int;
 }
 
 /// What a C `main` returns, as the program's exit code.
@@ -54,7 +56,6 @@ pub fn without_a_task() {
         assert_eq!(moruna_emit(task, ptr::null_mut(), ptr::null_mut()), -2);
         moruna_log(
             task,
-            0,
             c"a line outside any run goes to standard error".as_ptr(),
         );
         moruna_error(task, ptr::null());

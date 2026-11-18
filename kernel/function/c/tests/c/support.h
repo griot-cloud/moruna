@@ -41,6 +41,8 @@ void schema_with_dictionary(struct ArrowSchema *out, const char *format, const c
 /* The sizes of the two structures as this compiler lays them out. */
 size_t moruna_test_array_size(void);
 size_t moruna_test_schema_size(void);
+/* The header's exit codes, from MORUNA_E_DONE to MORUNA_E_WINDOW_SMALL, into codes[6]. */
+void moruna_test_codes(int *codes);
 
 void check_failed(struct moruna_task *task, const char *what, int line);
 

@@ -101,8 +101,12 @@ fn every_path() {
             vec![ints(i64::MAX - 1, 1)],
             Box::new(|| unsafe { moruna_example_double() }),
         ),
+        (
+            vec![ints(0, 3), ints(3, 2)],
+            Box::new(|| unsafe { moruna_test_sum() }),
+        ),
     ];
-    for which in 0..12 {
+    for which in 0..11 {
         runs.push((
             vec![ints(0, 1)],
             Box::new(move || unsafe { moruna_test_emit_bad(which) }),

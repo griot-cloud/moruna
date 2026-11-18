@@ -9,7 +9,7 @@ extern "C" std::size_t moruna_test_cpp_sizes(void) {
   int (*open_call)(moruna_task **) = moruna_open;
   int (*next_call)(moruna_task *, ArrowArray *, ArrowSchema *) = moruna_next;
   int (*emit_call)(moruna_task *, ArrowArray *, ArrowSchema *) = moruna_emit;
-  void (*log_call)(moruna_task *, int, const char *) = moruna_log;
+  void (*log_call)(moruna_task *, const char *) = moruna_log;
   void (*error_call)(moruna_task *, const char *) = moruna_error;
   int (*finish_call)(moruna_task *) = moruna_finish;
   (void)open_call;

@@ -144,10 +144,10 @@ int moruna_test_refuse(void) {
   struct ArrowSchema schema, more_schema, so;
   CHECK(task, moruna_next(task, &in, &schema) == 1);
   moruna_error(task, "no column named x");
-  CHECK(task, moruna_next(task, &more, &more_schema) == -7);
+  CHECK(task, moruna_next(task, &more, &more_schema) == -MORUNA_E_REFUSED);
   CHECK(task, more.release == NULL && more_schema.release == NULL);
   plus(&in, 1, &out, &so);
-  CHECK(task, moruna_emit(task, &out, &so) == -7);
+  CHECK(task, moruna_emit(task, &out, &so) == -MORUNA_E_REFUSED);
   CHECK(task, out.release == NULL && so.release == NULL);
   moruna_error(task, NULL);
   in.release(&in);
@@ -167,35 +167,33 @@ int moruna_test_emit_bad(int which) {
   struct ArrowSchema schema, so, field;
   memset(&out, 0, sizeof out);
   memset(&so, 0, sizeof so);
-  if (which != 0)
-    CHECK(task, moruna_next(task, &in, &schema) == 1);
+  CHECK(task, moruna_next(task, &in, &schema) == 1);
   static const int64_t values[2] = {1, 2};
   static const int32_t offsets[3] = {0, 3, 1};
   static const int32_t keys[2] = {0, 1};
   static const int32_t words[3] = {0, 1, 2};
   switch (which) {
-  case 0: /* nothing held */
-  case 1: /* the batch NULL */
-  case 2: /* the schema NULL */
+  case 0: /* the batch NULL */
+  case 1: /* the schema NULL */
     ints(values, 2, &out, &so);
     break;
-  case 3: /* the batch released */
+  case 2: /* the batch released */
     ints(values, 2, &out, &so);
     out.release(&out);
     break;
-  case 4: /* not a struct */
+  case 3: /* not a struct */
     ints(values, 2, &out, &field);
     schema_of(&so, "l", "a", NULL, 0);
     field.release(&field);
     break;
-  case 5: /* two columns, one field */
+  case 4: /* two columns, one field */
     int64_column(&columns[0], values, NULL, 2);
     int64_column(&columns[1], values, NULL, 2);
     batch_of(&out, columns, 2, 2);
     schema_of(&field, "l", "a", NULL, 0);
     schema_of(&so, "+s", "", &field, 1);
     break;
-  case 6: { /* a dictionary column */
+  case 5: { /* a dictionary column */
     dictionary_column(&columns[0], keys, 2, words, "ab", 2);
     batch_of(&out, columns, 1, 2);
     struct ArrowSchema dictionary;
@@ -204,7 +202,7 @@ int moruna_test_emit_bad(int which) {
     schema_of(&so, "+s", "", &field, 1);
     break;
   }
-  case 7: { /* nulls in the struct array */
+  case 6: { /* nulls in the struct array */
     ints(values, 2, &out, &so);
     uint8_t *bits = counted_alloc(1);
     bits[0] = 1;
@@ -212,55 +210,83 @@ int moruna_test_emit_bad(int which) {
     out.null_count = 1;
     break;
   }
-  case 8: /* a column with a buffer missing */
+  case 7: /* a column with a buffer missing */
     ints(values, 2, &out, &so);
     out.children[0]->n_buffers = 1;
     break;
-  case 9: /* Utf8 offsets that go back */
+  case 8: /* Utf8 offsets that go back */
     utf8_column(&columns[0], offsets, "abc", 2);
     batch_of(&out, columns, 1, 2);
     schema_of(&field, "u", "s", NULL, 0);
     schema_of(&so, "+s", "", &field, 1);
     break;
-  case 10: /* a field with no format */
+  case 9: /* a field with no format */
     ints(values, 2, &out, &so);
     so.children[0]->format = NULL;
     break;
-  case 11: /* a schema's children NULL */
+  case 10: /* a schema's children NULL */
     ints(values, 2, &out, &so);
     so.children = NULL;
     break;
   default:
     return 98;
   }
-  r = moruna_emit(task, which == 1 ? NULL : &out, which == 2 ? NULL : &so);
-  CHECK(task, r == -7);
+  r = moruna_emit(task, which == 0 ? NULL : &out, which == 1 ? NULL : &so);
+  CHECK(task, r == -MORUNA_E_REFUSED);
   /* moruna_emit took what it was given and released it; what it was not given is released
      here, so every allocation of this side is freed once. */
-  if (which == 1)
+  if (which == 0)
     out.release(&out);
-  if (which == 2)
+  if (which == 1)
     so.release(&so);
   CHECK(task, out.release == NULL && so.release == NULL);
   CHECK(task, counts.allocs == counts.frees);
-  if (which != 0) {
-    in.release(&in);
-    schema.release(&schema);
-  }
+  in.release(&in);
+  schema.release(&schema);
   return moruna_finish(task);
 }
 
-/* Lines into the log, as given; level is not used yet. */
+/* An aggregate: a batch written before the first is taken, then column "a" summed over every
+   batch, each released as soon as it is read, and the sum written after the engine's end. Both
+   answer no input. */
+int moruna_test_sum(void) {
+  struct moruna_task *task;
+  int r = moruna_open(&task);
+  if (r < 0)
+    return -r;
+  struct ArrowArray in, out;
+  struct ArrowSchema schema, so;
+  static const int64_t before[1] = {-1};
+  ints(before, 1, &out, &so);
+  CHECK(task, moruna_emit(task, &out, &so) == 0);
+  int64_t sum = 0;
+  while ((r = moruna_next(task, &in, &schema)) == 1) {
+    const struct ArrowArray *a = in.children[0];
+    const int64_t *values = (const int64_t *)a->buffers[1] + a->offset + in.offset;
+    for (int64_t i = 0; i < in.length; i++)
+      sum += values[i];
+    in.release(&in);
+    schema.release(&schema);
+  }
+  CHECK(task, r == 0);
+  ints(&sum, 1, &out, &so);
+  CHECK(task, moruna_emit(task, &out, &so) == 0);
+  r = moruna_finish(task);
+  CHECK(NULL, counts.allocs == counts.frees);
+  return r;
+}
+
+/* Lines into the log, as given. */
 int moruna_test_log(void) {
   struct moruna_task *task;
   int r = moruna_open(&task);
   if (r < 0)
     return -r;
-  moruna_log(task, 0, "plain");
-  moruna_log(task, 3, "two\nlines");
-  moruna_log(task, 1, "");
-  moruna_log(task, 2, NULL);
-  moruna_log(NULL, 0, "a line with no task");
+  moruna_log(task, "plain");
+  moruna_log(task, "two\nlines");
+  moruna_log(task, "");
+  moruna_log(task, NULL);
+  moruna_log(NULL, "a line with no task");
   return echo(task);
 }
 
@@ -271,19 +297,19 @@ int moruna_test_null_task(void) {
   int r = moruna_open(&task);
   if (r < 0)
     return -r;
-  CHECK(task, moruna_open(&second) == -2 && second == NULL);
-  CHECK(task, moruna_open(NULL) == -7);
+  CHECK(task, moruna_open(&second) == -MORUNA_E_NO_PLANE && second == NULL);
+  CHECK(task, moruna_open(NULL) == -MORUNA_E_REFUSED);
   struct ArrowArray in, out;
   struct ArrowSchema schema, so;
-  CHECK(task, moruna_next(NULL, &in, &schema) == -2);
+  CHECK(task, moruna_next(NULL, &in, &schema) == -MORUNA_E_NO_PLANE);
   CHECK(task, in.release == NULL && schema.release == NULL);
   static const int64_t values[1] = {7};
   ints(values, 1, &out, &so);
-  CHECK(task, moruna_emit(NULL, &out, &so) == -2);
+  CHECK(task, moruna_emit(NULL, &out, &so) == -MORUNA_E_NO_PLANE);
   CHECK(task, out.release == NULL && so.release == NULL);
   CHECK(task, counts.allocs == counts.frees);
   moruna_error(NULL, "nobody to end");
-  CHECK(task, moruna_finish(NULL) == 2);
+  CHECK(task, moruna_finish(NULL) == MORUNA_E_NO_PLANE);
   return echo(task);
 }
 
@@ -294,7 +320,7 @@ int moruna_test_null_out(void) {
   if (r < 0)
     return -r;
   struct ArrowSchema schema;
-  CHECK(task, moruna_next(task, NULL, &schema) == -7);
+  CHECK(task, moruna_next(task, NULL, &schema) == -MORUNA_E_REFUSED);
   CHECK(task, schema.release == NULL);
   return moruna_finish(task);
 }

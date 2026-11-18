@@ -305,7 +305,8 @@ unsafe fn take_schema(p: *mut FFI_ArrowSchema) -> Option<FFI_ArrowSchema> {
     s.release.is_some().then_some(s)
 }
 
-/// Writes a batch as the answer to the oldest batch held, taking `*batch` and `*schema`.
+/// Writes a batch as the answer to the oldest batch held (or to none, with none held), taking
+/// `*batch` and `*schema`.
 ///
 /// # Safety
 ///
@@ -359,7 +360,7 @@ unsafe fn text(p: *const c_char) -> Option<String> {
 ///
 /// `task` is null or from `moruna_open`; `line` is null or a NUL-terminated string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moruna_log(task: *mut moruna_task, _level: c_int, line: *const c_char) {
+pub unsafe extern "C" fn moruna_log(task: *mut moruna_task, line: *const c_char) {
     // SAFETY: the caller's contract.
     let Some(line) = (unsafe { text(line) }) else {
         return;

@@ -26,15 +26,8 @@
  * examples/double.c is a whole function.
  *
  * A task ends with an exit code, which moruna_finish says on the task's rings and returns for
- * main to return; a call that fails returns it negated. They are moruna-function's codes:
- *
- *     0  every batch answered and given back, and the engine posts no more
- *     2  the program was not started on the data plane
- *     3  the task's plane holds no rings
- *     5  the rings broke
- *     7  the function refused a batch (moruna_error), a batch could not be read or written,
- *        or the function ended holding a batch or before the engine's end
- *     8  one row of an output batch takes more than a window
+ * main to return; a call that fails returns it negated (-MORUNA_E_REFUSED, say). They are
+ * moruna-function's codes (moruna_function::code), named below.
  *
  * The first failure ends the task: its line goes to the task's log, every later moruna_next and
  * moruna_emit returns its code, no batch is given back to the engine after it, and
@@ -42,6 +35,20 @@
  */
 #ifndef MORUNA_FUNCTION_H
 #define MORUNA_FUNCTION_H
+
+/* Every batch answered and given back, and the engine posts no more. */
+#define MORUNA_E_DONE 0
+/* The program was not started on the data plane. */
+#define MORUNA_E_NO_PLANE 2
+/* The task's plane holds no rings. */
+#define MORUNA_E_NO_RINGS 3
+/* The rings broke. */
+#define MORUNA_E_RINGS 5
+/* The function refused a batch (moruna_error), a batch could not be read or written, or the
+   function finished holding a batch or before the engine's end. */
+#define MORUNA_E_REFUSED 7
+/* One row of an output batch takes more than a window. */
+#define MORUNA_E_WINDOW_SMALL 8
 
 #include <stdint.h>
 
@@ -100,16 +107,16 @@ struct moruna_task;
 
 /*
  * Attaches the program to its task's rings, once: 0, with *task set; or the exit code negated,
- * with *task NULL and a line in the log saying why (-2 not started on the data plane, as in a
- * second call; -3 no rings).
+ * with *task NULL and a line in the log saying why (-MORUNA_E_NO_PLANE, as in a second call;
+ * -MORUNA_E_NO_RINGS).
  */
 int  moruna_open(struct moruna_task **task);
 
 /*
  * The next batch: 1, with *out and *schema filled, both the function's to release; 0 once the
- * engine posts no more; or the exit code negated once the task has failed (-5 the rings broke,
- * -7 the input record failed the engine's check, or an earlier failure). *out and *schema are
- * left released unless 1 is returned.
+ * engine posts no more; or the exit code negated once the task has failed (-MORUNA_E_RINGS,
+ * -MORUNA_E_REFUSED when the input record failed the engine's check, or an earlier failure's).
+ * *out and *schema are left released unless 1 is returned.
  *
  * The batch is read in place: its buffers are the engine's memory, read-only, and valid until
  * the batch's release is called (or, if a child array was moved out of it, until the last of
@@ -122,10 +129,12 @@ int  moruna_next(struct moruna_task *task, struct ArrowArray *out, struct ArrowS
 
 /*
  * Writes a batch as the answer to the oldest batch the task holds (taken by moruna_next and not
- * yet given back): copied once into a window, as one record, or as several in order when its
- * rows take more than a window. 0, or the exit code negated with the task failed: -7 the batch
- * cannot be carried (no batch held; not a struct array without nulls; a malformed array; a
- * dictionary column), -8 one row takes more than a window, -5 the rings broke.
+ * yet given back), or to none when it holds none (before its first batch, or after the engine's
+ * end, as an aggregate writes its total): copied once into a window, as one record, or as
+ * several in order when its rows take more than a window. 0, or the exit code negated with the
+ * task failed: -MORUNA_E_REFUSED the batch cannot be carried (not a struct array without
+ * nulls; a malformed array; a dictionary column), -MORUNA_E_WINDOW_SMALL one row takes more
+ * than a window, -MORUNA_E_RINGS the rings broke.
  *
  * It takes ownership of *batch and *schema whatever it returns: both are released by the time
  * it returns, and their release members are set to NULL.
@@ -133,21 +142,22 @@ int  moruna_next(struct moruna_task *task, struct ArrowArray *out, struct ArrowS
 int  moruna_emit(struct moruna_task *task, struct ArrowArray *batch, struct ArrowSchema *schema); /* takes ownership */
 
 /*
- * Writes line to the task's log, a record a line; a line with newlines is several. level is not
- * used yet: every line is written as given.
+ * Writes line to the task's log, as given, a record a line; a line with newlines is several.
  */
-void moruna_log(struct moruna_task *task, int level, const char *line);
+void moruna_log(struct moruna_task *task, const char *line);
 
 /*
  * Ends the task with message, the function's refusal of a batch: the line "<task>: <message>"
- * goes to the log, and the task ends with 7, or with the code of an earlier failure.
+ * goes to the log, and the task ends with MORUNA_E_REFUSED, or with the code of an earlier
+ * failure.
  */
 void moruna_error(struct moruna_task *task, const char *message);
 
 /*
  * Ends the task: says its exit code on the rings, where the engine reads it, frees the task and
- * returns the code, for main to return. 0 needs every batch given back and the engine's end
- * seen by moruna_next. A batch the function still holds stays valid until it is released.
+ * returns the code, for main to return. MORUNA_E_DONE needs every batch given back and the
+ * engine's end seen by moruna_next. A batch the function still holds stays valid until it is
+ * released.
  */
 int  moruna_finish(struct moruna_task *task);
 

@@ -203,7 +203,6 @@ fn moruna_error_ends_the_task_and_every_later_call_says_so() {
 #[test]
 fn what_moruna_emit_cannot_write_is_refused_and_released() {
     let cases = [
-        sdk::task::NONE_HELD,
         "moruna_emit: the batch or its schema is NULL or released",
         "moruna_emit: the batch or its schema is NULL or released",
         "moruna_emit: the batch or its schema is NULL or released",
@@ -409,4 +408,38 @@ fn the_structures_are_the_same_in_c_cplusplus_and_rust() {
         assert_eq!(moruna_test_schema_size(), schema);
         assert_eq!(moruna_test_cpp_sizes(), array * 1000 + schema);
     }
+}
+
+#[test]
+fn the_headers_codes_are_moruna_functions() {
+    let mut named = [-1 as c_int; 6];
+    unsafe { moruna_test_codes(named.as_mut_ptr()) };
+    let codes = [
+        code::DONE,
+        code::NO_PLANE,
+        code::NO_RINGS,
+        code::RINGS,
+        code::REFUSED,
+        code::WINDOW_SMALL,
+    ];
+    assert_eq!(named.map(i64::from), codes);
+}
+
+#[test]
+fn an_aggregate_writes_before_its_first_batch_and_after_the_end() {
+    let outcome = Plane::new()
+        .named("sum")
+        .run([ints(0, 3), ints(3, 4), ints(0, 0)], || {
+            exit(unsafe { moruna_test_sum() })
+        })
+        .unwrap();
+    ended(&outcome, code::DONE);
+    assert!(
+        outcome
+            .answers
+            .iter()
+            .all(|a| a.released && a.records.is_empty())
+    );
+    assert_eq!(outcome.unheld.batches, [ints(-1, 1), ints(21, 1)]);
+    assert_eq!(outcome.log, ["sum: answered 3 batches"]);
 }
