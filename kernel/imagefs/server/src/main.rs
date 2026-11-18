@@ -1510,9 +1510,11 @@ fn mount(out: &Console) -> Result<Shared<BlockDisk>, String> {
     Ok(Shared {
         cache,
         overlay,
+        // DUPLICATE too: each attached image writes to the console through its own handle,
+        // which `attach` duplicates from this one.
         out: Console(
             out.0
-                .duplicate(Rights::WRITE)
+                .duplicate(Rights::WRITE | Rights::DUPLICATE)
                 .map_err(|e| e.name().to_string())?,
         ),
         maps: Vec::new(),
