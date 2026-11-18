@@ -179,6 +179,86 @@
           }
         ]
       },
+      "Function": {
+        "description": "A registered function, as `GET /v1/functions` lists it.",
+        "properties": {
+          "address": {
+            "description": "Where its image is fetched from.",
+            "type": "string"
+          },
+          "key": {
+            "description": "The first 16 hex characters of the SHA-256 of the public bytes of the key whose signature\nverified, as the audit record names a token key.",
+            "type": "string"
+          },
+          "name": {
+            "description": "The name a job names it by.",
+            "type": "string"
+          },
+          "registered": {
+            "description": "When it was registered, in Unix seconds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sha256": {
+            "description": "The SHA-256 of its image, as 64 lowercase hexadecimal digits.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "address",
+          "sha256",
+          "key",
+          "registered"
+        ],
+        "type": "object"
+      },
+      "FunctionRegistration": {
+        "additionalProperties": false,
+        "description": "A function image to register, the body of `POST /v1/functions` (system design 3E). Unknown\nfields are refused.",
+        "properties": {
+          "address": {
+            "description": "Where the image file is fetched from at job start: an `https://` URL, or an object-store\nURL (`s3://`, `az://`, `gs://`).",
+            "type": "string"
+          },
+          "name": {
+            "description": "The name a job names the function by, as a task's kind: 1 to 64 characters, a lowercase\nletter first, then lowercase letters, digits, `_`, `-` and `.`.",
+            "type": "string"
+          },
+          "sha256": {
+            "description": "The SHA-256 of the image file, as 64 lowercase hexadecimal digits.",
+            "type": "string"
+          },
+          "signature": {
+            "description": "An Ed25519 signature over the 32 bytes of that SHA-256, by one of node config's\n`functions.keys`, in standard base64.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "address",
+          "sha256",
+          "signature"
+        ],
+        "type": "object"
+      },
+      "Functions": {
+        "description": "The answer to `GET /v1/functions`.",
+        "properties": {
+          "functions": {
+            "description": "Every registered function, by name.",
+            "items": {
+              "$ref": "#/components/schemas/Function"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "functions"
+        ],
+        "type": "object"
+      },
       "Health": {
         "description": "The answer to `GET /v1/health`.",
         "properties": {
@@ -632,6 +712,84 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/v1/functions": {
+      "get": {
+        "operationId": "functions_list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Functions"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An error. Its code matches the HTTP status."
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "observe"
+            ]
+          }
+        ],
+        "summary": "Every registered function: its name, address, SHA-256, the key that signed it and when it was registered."
+      },
+      "post": {
+        "operationId": "functions_register",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FunctionRegistration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Function"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An error. Its code matches the HTTP status."
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "admin"
+            ]
+          }
+        ],
+        "summary": "Register a function image by name: its address, its SHA-256, and an Ed25519 signature over that SHA-256 by one of node config's functions.keys. Nothing is fetched until a job names it; registering a name again replaces it."
+      }
+    },
     "/v1/health": {
       "get": {
         "operationId": "health",

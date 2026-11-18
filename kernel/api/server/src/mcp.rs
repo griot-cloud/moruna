@@ -217,7 +217,9 @@ impl Api {
                 now,
             )))
         };
-        if operation.request == Body::Job {
+        // An operation that takes a body (a job, a function's registration) takes the tool's
+        // arguments as that body, as they were written.
+        if operation.request != Body::None {
             let written = serde_json::from_slice::<RawCall<'_>>(body)
                 .ok()
                 .and_then(|call| call.params)

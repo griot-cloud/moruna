@@ -317,6 +317,25 @@ fn the_operations_table_is_the_design_table() {
                 Response::Report,
                 200
             ),
+            // 3E's two.
+            (
+                "functions_register",
+                "POST",
+                "/v1/functions",
+                Some(Scope::Admin),
+                Request::Function,
+                Response::Function,
+                201
+            ),
+            (
+                "functions_list",
+                "GET",
+                "/v1/functions",
+                observe,
+                none,
+                Response::Functions,
+                200
+            ),
         ]
     );
     assert!(OPERATIONS.iter().all(|op| !op.summary.is_empty()));
@@ -431,4 +450,28 @@ fn the_job_answers_round_trip_3b() {
         (Method::Get.as_str(), Method::Post.as_str()),
         ("GET", "POST")
     );
+}
+
+#[test]
+fn a_function_and_its_registration_round_trip_3e() {
+    let registration: FunctionRegistration = round_trip(
+        r#"{"name":"gate-score","address":"https://example.com/gate-score","sha256":"ab","signature":"c2ln"}"#,
+    );
+    assert_eq!(registration.name, "gate-score");
+    assert!(
+        refused::<FunctionRegistration>(r#"{"name":"a","address":"b","sha256":"c"}"#)
+            .contains("signature")
+    );
+    assert!(
+        refused::<FunctionRegistration>(
+            r#"{"name":"a","address":"b","sha256":"c","signature":"d","key":"e"}"#
+        )
+        .contains("key")
+    );
+    let functions: Functions = round_trip(
+        r#"{"functions":[{"name":"gate-score","address":"az://code/gate-score","sha256":"ab","key":"0123456789abcdef","registered":1794931200}]}"#,
+    );
+    assert_eq!(functions.functions[0].registered, 1794931200);
+    let none: Functions = round_trip(r#"{"functions":[]}"#);
+    assert!(none.functions.is_empty());
 }

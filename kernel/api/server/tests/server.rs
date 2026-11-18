@@ -99,7 +99,7 @@ fn routes_come_from_the_operations_table_only() {
         "/v1",
         "/v1/node/",
         "/v2/node",
-        "/v1/functions",
+        "/v1/functions/gate-score",
         "/V1/NODE",
     ] {
         let response = harness.get(client, path, "");

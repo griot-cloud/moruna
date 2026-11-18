@@ -34,6 +34,11 @@
 //!   [`EVENTS_KEPT`] event and log records, within [`EVENT_BUFFER_BYTES`], are kept for
 //!   `GET /v1/jobs/{id}/events`, which sends them as Server-Sent Events and replays from
 //!   `?from=`. What a job says is secret appears in no answer, event, log or report.
+//! - Functions (3E): `POST /v1/functions` registers a function image by name when its Ed25519
+//!   signature over the image's SHA-256 verifies under one of node config's `functions.keys`
+//!   ([`FunctionKey`]); the entries, at most [`FUNCTIONS_LIMIT`], are kept in memory and listed by
+//!   `GET /v1/functions`. A check's verdict refuses each function the job uses ([`Checked`]) that
+//!   is not registered. Nothing is fetched here: the node fetches a job's images at its start.
 //!
 //! The crate is `no_std` with `alloc`. On the kernel, ring's randomness comes from
 //! `moruna_svc::random`, as the network server's does.
@@ -55,6 +60,7 @@ mod engine;
 #[cfg(test)]
 #[path = "../tests/common/engine.rs"]
 mod fake;
+mod functions;
 mod http;
 mod identity;
 mod jobs;
@@ -72,7 +78,8 @@ mod transport;
 
 pub use api::NodeFacts;
 pub use audit::{AUDIT_ANSWER_LIMIT, AUDIT_LIMIT};
-pub use engine::{ENGINE_LINE_LIMIT, EngineHost, HostError, NoEngine};
+pub use engine::{Checked, ENGINE_LINE_LIMIT, EngineHost, HostError, NoEngine};
+pub use functions::{ADDRESS_LIMIT, FUNCTIONS_LIMIT, FunctionKey};
 pub use http::{BODY_BUDGET, BODY_LIMIT, HEADER_LIMIT};
 pub use identity::{Identity, IdentityError, VALID_AFTER_SECONDS, VALID_BEFORE_SECONDS};
 pub use jobs::{EVENT_BUFFER_BYTES, EVENTS_KEPT, JOBS_KEPT, REPORT_BYTES};

@@ -1235,6 +1235,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "node-functions"
+version = "0.1.0"
+dependencies = [
+ "moruna-imagefs",
+]
+
+[[package]]
 name = "node-protocol"
 version = "0.1.0"
 dependencies = [

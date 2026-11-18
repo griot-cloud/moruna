@@ -48,14 +48,15 @@ fn a_change_to_the_table_changes_both_files() {
     let step_2 = &OPERATIONS[..3];
     assert_eq!(openapi(step_2)["paths"].as_object().map(Map::len), Some(3));
     assert_eq!(mcp_tools(step_2)["tools"].as_array().map(Vec::len), Some(3));
-    // Step 3's seven operations are on six paths, and all but the stream of events are tools.
+    // Step 3's seven job operations are on six paths, and 3E's two on one more; all but the
+    // stream of events are tools.
     assert_eq!(
         openapi(OPERATIONS)["paths"].as_object().map(Map::len),
-        Some(9)
+        Some(10)
     );
     assert_eq!(
         mcp_tools(OPERATIONS)["tools"].as_array().map(Vec::len),
-        Some(9)
+        Some(11)
     );
 }
 
@@ -186,6 +187,26 @@ fn openapi_has_every_operation_with_its_security_and_the_error_body() {
     assert_eq!(
         report["responses"]["200"]["content"]["application/json"]["schema"],
         json!({ "type": "object" })
+    );
+    // 3E: registering takes a registration and answers 201 with the function; listing is open
+    // to observe.
+    let register = &document["paths"]["/v1/functions"]["post"];
+    assert_eq!(register["operationId"], "functions_register");
+    assert_eq!(register["security"], json!([{ "bearer": ["admin"] }]));
+    assert_eq!(
+        register["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/FunctionRegistration"
+    );
+    assert_eq!(
+        register["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/Function"
+    );
+    let list = &document["paths"]["/v1/functions"]["get"];
+    assert_eq!(list["security"], observe);
+    assert!(list.get("requestBody").is_none());
+    assert_eq!(
+        properties(&document, "FunctionRegistration"),
+        ["address", "name", "sha256", "signature"]
     );
     let total: usize = document["paths"]
         .as_object()
@@ -371,20 +392,27 @@ fn mcp_has_one_tool_per_operation_with_its_input_and_output() {
         ("moruna_jobs_get", Some("JobStatus"), Some(&id)),
         ("moruna_jobs_cancel", Some("JobStatus"), Some(&id)),
         ("moruna_jobs_report", None, Some(&id)),
+        ("moruna_functions_register", Some("Function"), None),
+        ("moruna_functions_list", Some("Functions"), Some(&nothing)),
     ];
     for ((tool, operation), (name, title, input)) in tools.iter().zip(with_tools).zip(expected) {
         assert_eq!(tool["name"], name);
         assert_eq!(tool["description"], operation.summary);
         match input {
             Some(input) => assert_eq!(&tool["inputSchema"], input, "{name}"),
-            // A job: its document in one version, and nothing else.
+            // A job: its document in one version, and nothing else; or a function's
+            // registration, its four fields.
             None => {
                 let input = &tool["inputSchema"];
-                assert_eq!(input["title"], "Job", "{name}");
+                let (title, fields) = match operation.request {
+                    Request::Function => ("FunctionRegistration", 4),
+                    _ => ("Job", 3),
+                };
+                assert_eq!(input["title"], title, "{name}");
                 assert_eq!(input["additionalProperties"], false, "{name}");
                 assert_eq!(
                     input["properties"].as_object().map(Map::len),
-                    Some(3),
+                    Some(fields),
                     "{name}"
                 );
             }

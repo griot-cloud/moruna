@@ -385,6 +385,21 @@ fn the_wall_clock_is_carried_forward_from_the_hand_over() {
     assert!((ms..ms + 1_000).contains(&(now() / 1_000_000)));
 }
 
+/// The function keys come from node config's `functions.keys` (item 3.6).
+#[test]
+fn the_function_keys_come_from_node_config() {
+    let key = base64::encode(&[5; 32]);
+    let user_data = format!(
+        r#"{{"moruna":1,"api":{{"token_keys":["{}"]}},"functions":{{"keys":["{key}"]}}}}"#,
+        base64::encode(&[7; 32])
+    );
+    let config = node::config(&handover_of(&user_data), 1, now()).expect("a config");
+    assert_eq!(
+        config.function_keys,
+        [moruna_api_server::FunctionKey::new([5; 32])]
+    );
+}
+
 /// The node document's facts and the token keys come from the hand-over (work item 2.2b).
 #[test]
 fn the_server_s_config_comes_from_the_hand_over() {
@@ -408,6 +423,8 @@ fn the_server_s_config_comes_from_the_hand_over() {
     assert_eq!(facts.boot_ms, 0);
     assert_eq!(facts.health, NodeHealth::Ok);
     assert_eq!(config.token_keys, keys.map(TokenKey::new));
+    // No `functions`: no key may sign a function image.
+    assert!(config.function_keys.is_empty());
     // No `tls`: the node's own identity, a fresh one each time.
     let fingerprint = config.identity.fingerprint();
     assert_eq!(fingerprint.len(), 64);

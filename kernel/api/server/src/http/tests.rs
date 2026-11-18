@@ -215,6 +215,7 @@ fn api(signer: &Signer) -> (Api, Budget) {
         Api::new(
             facts(),
             vec![TokenKey::new(signer.public())],
+            Vec::new(),
             alloc::boxed::Box::new(crate::NoEngine),
         ),
         Budget::new(BODY_BUDGET),

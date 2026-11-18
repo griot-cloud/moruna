@@ -8,7 +8,8 @@
 
 use crate::{
     api::Answer,
-    engine::{ENGINE_LINE_LIMIT, EngineHost, HostError, Message, Wire},
+    engine::{Checked, ENGINE_LINE_LIMIT, EngineHost, HostError, Message, Wire},
+    functions::Registry,
     json::{Secrets, compact, is_object},
     token::base64,
 };
@@ -474,9 +475,10 @@ impl Jobs {
         true
     }
 
-    /// Moves the checks and the engine in flight as far as they go now.
-    pub(crate) fn pump(&mut self, host: &mut dyn EngineHost, now: u64) {
-        self.pump_checks(host);
+    /// Moves the checks and the engine in flight as far as they go now. A check's verdict also
+    /// refuses each function the job uses that is not in `functions` (3E).
+    pub(crate) fn pump(&mut self, host: &mut dyn EngineHost, functions: &Registry, now: u64) {
+        self.pump_checks(host, functions);
         if self.flight.is_none() {
             return;
         }
@@ -506,8 +508,9 @@ impl Jobs {
         self.wire.settle();
     }
 
-    /// Hands the engine the next document to check, and takes the verdict of the one it has.
-    fn pump_checks(&mut self, host: &mut dyn EngineHost) {
+    /// Hands the engine the next document to check, and takes the verdict of the one it has: the
+    /// engine's refusals, and one for each function the job uses that is not registered.
+    fn pump_checks(&mut self, host: &mut dyn EngineHost, functions: &Registry) {
         if self.checking
             && let Some(verdict) = host.checked()
         {
@@ -516,7 +519,13 @@ impl Jobs {
                 && !core::mem::take(&mut self.unwanted)
             {
                 let answer = match verdict {
-                    Ok(refusals) => validation(refusals, &check.secrets),
+                    Ok(Checked {
+                        mut refusals,
+                        functions: used,
+                    }) => {
+                        refusals.extend(functions.refusals(&used));
+                        validation(refusals, &check.secrets)
+                    }
                     Err(error) => failed(error, &check.secrets),
                 };
                 self.resolved.push((check.ticket, answer));

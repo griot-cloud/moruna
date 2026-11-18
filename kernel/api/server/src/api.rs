@@ -5,6 +5,7 @@
 use crate::{
     audit::{AUDIT_ANSWER_LIMIT, AuditLog},
     engine::EngineHost,
+    functions::{FunctionKey, Registry},
     http::{Authorization, Request},
     jobs::{Jobs, Stream},
     mcp::{self, MCP_PATH},
@@ -155,12 +156,13 @@ struct Pending {
 }
 
 /// The operations' state: what the node says about itself, the keys its tokens are checked
-/// against, the audit record, the jobs, and the engine's host.
+/// against, the audit record, the jobs, the registered functions, and the engine's host.
 pub(crate) struct Api {
     pub facts: NodeFacts,
     verifier: Verifier,
     audit: AuditLog,
     jobs: Jobs,
+    functions: Registry,
     host: Box<dyn EngineHost>,
     /// The calls whose answers come later, by ticket, and the answers that have come.
     pending: BTreeMap<u64, Pending>,
@@ -182,12 +184,18 @@ fn from_of(query: &str) -> Option<u64> {
 }
 
 impl Api {
-    pub(crate) fn new(facts: NodeFacts, keys: Vec<TokenKey>, host: Box<dyn EngineHost>) -> Self {
+    pub(crate) fn new(
+        facts: NodeFacts,
+        keys: Vec<TokenKey>,
+        function_keys: Vec<FunctionKey>,
+        host: Box<dyn EngineHost>,
+    ) -> Self {
         Self {
             facts,
             verifier: Verifier::new(keys),
             audit: AuditLog::default(),
             jobs: Jobs::default(),
+            functions: Registry::new(function_keys),
             host,
             pending: BTreeMap::new(),
             ready: BTreeMap::new(),
@@ -269,7 +277,7 @@ impl Api {
             Body::Job if operation.response == Response::Submitted && self.jobs.busy() => {
                 refuse(self, grant.as_ref(), ErrorCode::Busy, "a job is running")
             }
-            Body::Job => Admission::Body(Call::Operation(operation, grant)),
+            Body::Job | Body::Function => Admission::Body(Call::Operation(operation, grant)),
         }
     }
 
@@ -344,6 +352,8 @@ impl Api {
                 Answer::ok(serde_json::to_vec(&self.audit.audit(AUDIT_ANSWER_LIMIT)))
             }
             Response::Jobs => Answer::ok(serde_json::to_vec(&self.jobs.list())),
+            Response::Function => self.functions.register(inputs.body, now),
+            Response::Functions => Answer::ok(serde_json::to_vec(&self.functions.list())),
             Response::JobStatus if operation.method == Method::Post => {
                 self.jobs.cancel(self.host.as_mut(), id)
             }
@@ -388,7 +398,7 @@ impl Api {
     /// Moves the jobs as far as they go now: the engine's messages and the checks. An answer
     /// that has come is recorded, and kept for the call that waits for it.
     pub(crate) fn pump(&mut self, now: u64) {
-        self.jobs.pump(self.host.as_mut(), now);
+        self.jobs.pump(self.host.as_mut(), &self.functions, now);
         for (ticket, answer) in self.jobs.resolved() {
             let Some(pending) = self.pending.remove(&ticket) else {
                 continue;

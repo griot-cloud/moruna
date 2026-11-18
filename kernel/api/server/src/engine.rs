@@ -24,6 +24,18 @@ pub enum HostError {
     Unavailable,
 }
 
+/// The engine's check of a document: its refusals, none when the document is sound, and what the
+/// job needs of the node that `api` judges itself. The check answers these in its `checked` line
+/// (`moruna-hosted-engine.md`, `check-job`); the node's host passes them on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Checked {
+    /// The engine's refusals.
+    pub refusals: Vec<Refusal>,
+    /// The functions the job uses, by the names they are registered under (system design 3E):
+    /// its `needs.functions`. Each that is not registered is refused at `validate`.
+    pub functions: Vec<String>,
+}
+
 /// What the server asks of the node to run jobs: the engine's check of a document, a fresh
 /// engine for a job, and the host protocol's bytes to and from it. `api` does not link
 /// `moruna-job`: a document is checked by the engine itself.
@@ -38,8 +50,8 @@ pub trait EngineHost {
     fn check(&mut self, document: &[u8], secrets: &[String]) -> Result<(), HostError>;
 
     /// The verdict of the check under way, once it has one: the engine's refusals, none when
-    /// the document is sound.
-    fn checked(&mut self) -> Option<Result<Vec<Refusal>, HostError>>;
+    /// the document is sound, and the functions the job uses.
+    fn checked(&mut self) -> Option<Result<Checked, HostError>>;
 
     /// Starts a fresh engine for one job and sends it `spec`, the host protocol's `spec`
     /// message: one line, its line break included, with the job's secrets in its `secrets`
@@ -63,7 +75,7 @@ impl EngineHost for NoEngine {
         Err(HostError::Unavailable)
     }
 
-    fn checked(&mut self) -> Option<Result<Vec<Refusal>, HostError>> {
+    fn checked(&mut self) -> Option<Result<Checked, HostError>> {
         None
     }
 

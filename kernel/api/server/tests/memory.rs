@@ -13,7 +13,9 @@ use common::{
     facts, pinned,
     signer::Signer,
 };
-use moruna_api_server::{BODY_BUDGET, BODY_LIMIT, Config, Identity, OPEN_LIMIT, Server, TokenKey};
+use moruna_api_server::{
+    BODY_BUDGET, BODY_LIMIT, Config, FunctionKey, Identity, OPEN_LIMIT, Server, TokenKey,
+};
 use rustls::{ClientConnection, pki_types::ServerName};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -157,6 +159,7 @@ fn eighty_connections_with_1_mib_bodies_and_no_token_stay_under_32_mib() {
                 identity,
                 facts: facts(),
                 token_keys: vec![TokenKey::new(signer.public())],
+                function_keys: vec![FunctionKey::new(signer.public())],
             },
             clock.clone(),
             Box::new(engine.clone()),

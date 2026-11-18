@@ -5,8 +5,8 @@
 //! order a JSON map keeps, and each file ends in one newline.
 
 use crate::{
-    Audit, ErrorBody, Health, Job, JobStatus, Jobs, Node, OPERATIONS, Operation, Request, Response,
-    Submitted, Validation,
+    Audit, ErrorBody, Function, FunctionRegistration, Functions, Health, Job, JobStatus, Jobs,
+    Node, OPERATIONS, Operation, Request, Response, Submitted, Validation,
 };
 use alloc::{string::String, vec::Vec};
 use schemars::{JsonSchema, Schema, SchemaGenerator, generate::SchemaSettings};
@@ -29,9 +29,14 @@ pub fn files() -> [(&'static str, String); 2] {
     ]
 }
 
-/// The schema of a job as a client writes it: its version 1 document any JSON object.
-fn job(generator: &mut SchemaGenerator) -> Schema {
-    generator.subschema_for::<Job<Map<String, Value>>>()
+/// The schema of the body `request` takes, when it takes one: a job as a client writes it (its
+/// version 1 document any JSON object), or a function's registration.
+fn body(generator: &mut SchemaGenerator, request: Request) -> Option<Schema> {
+    match request {
+        Request::None => None,
+        Request::Job => Some(generator.subschema_for::<Job<Map<String, Value>>>()),
+        Request::Function => Some(generator.subschema_for::<FunctionRegistration>()),
+    }
 }
 
 /// The schema of what `response` answers with; a report is any JSON object, and a stream of
@@ -50,6 +55,8 @@ fn answer(generator: &mut SchemaGenerator, response: Response) -> Value {
         Response::JobStatus => of::<JobStatus>(generator),
         Response::Events => json!({ "type": "string" }),
         Response::Report => json!({ "type": "object" }),
+        Response::Function => of::<Function>(generator),
+        Response::Functions => of::<Functions>(generator),
     }
 }
 
@@ -122,10 +129,10 @@ pub fn openapi(operations: &[Operation]) -> Value {
         if !parameters.is_empty() {
             item[method.as_str()]["parameters"] = Value::Array(parameters);
         }
-        if operation.request == Request::Job {
+        if let Some(schema) = body(&mut generator, operation.request) {
             item[method.as_str()]["requestBody"] = json!({
                 "required": true,
-                "content": { "application/json": { "schema": job(&mut generator) } }
+                "content": { "application/json": { "schema": schema } }
             });
         }
     }
@@ -178,10 +185,15 @@ pub fn mcp_tools(operations: &[Operation]) -> Value {
                 Response::Jobs => generator.root_schema_for::<Jobs>().to_value(),
                 Response::JobStatus => generator.root_schema_for::<JobStatus>().to_value(),
                 Response::Events | Response::Report => json!({ "type": "object" }),
+                Response::Function => generator.root_schema_for::<Function>().to_value(),
+                Response::Functions => generator.root_schema_for::<Functions>().to_value(),
             };
             let mut input = match operation.request {
                 Request::Job => generator
                     .root_schema_for::<Job<Map<String, Value>>>()
+                    .to_value(),
+                Request::Function => generator
+                    .root_schema_for::<FunctionRegistration>()
                     .to_value(),
                 Request::None => json!({
                     "type": "object",

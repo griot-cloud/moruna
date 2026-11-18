@@ -46,8 +46,8 @@
 use std::io::{BufRead, BufReader};
 
 use moruna_api::{
-    Audit, ErrorBody, ErrorCode, ErrorDetail, Health, Job, JobStatus, Jobs, Method, Node,
-    Operation, Submitted, Validation,
+    Audit, ErrorBody, ErrorCode, ErrorDetail, Function, FunctionRegistration, Functions, Health,
+    Job, JobStatus, Jobs, Method, Node, Operation, Submitted, Validation,
 };
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde::Serialize;
@@ -217,6 +217,22 @@ impl Client {
     /// `submit` token.
     pub fn jobs_submit<D: Serialize>(&self, job: &Job<D>) -> Result<Submitted, Error> {
         self.send(operation("jobs_submit")?, None, Some(job))
+    }
+
+    /// `POST /v1/functions`: register a function image by name, with its address, its SHA-256
+    /// and an Ed25519 signature over that SHA-256 by one of node config's `functions.keys`
+    /// (system design 3E). Nothing is fetched until a job names it; registering a name again
+    /// replaces it. It needs an `admin` token.
+    pub fn functions_register(
+        &self,
+        registration: &FunctionRegistration,
+    ) -> Result<Function, Error> {
+        self.send(operation("functions_register")?, None, Some(registration))
+    }
+
+    /// `GET /v1/functions`: every registered function. It needs an `observe` token.
+    pub fn functions_list(&self) -> Result<Functions, Error> {
+        self.call(operation("functions_list")?)
     }
 
     /// `GET /v1/jobs`: the last 100 jobs, newest first. It needs an `observe` token.

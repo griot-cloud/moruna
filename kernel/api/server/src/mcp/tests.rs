@@ -28,6 +28,7 @@ fn api(signer: &Signer) -> Api {
             health: NodeHealth::Ok,
         },
         vec![TokenKey::new(signer.public())],
+        vec![crate::FunctionKey::new(signer.public())],
         alloc::boxed::Box::new(crate::NoEngine),
     )
 }
