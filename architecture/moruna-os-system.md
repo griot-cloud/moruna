@@ -573,10 +573,13 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
   heap is measured by the counting allocator, and each lane flushes its row group by it. The
   writers' claim is their floor, not their ceiling: they are granted, up to their room, what their
   row groups need to reach the sink's own row-group target, so an ample budget writes the groups
-  the sink asks for. That extra comes only from what the arena's working size (the arena sized
-  with the claims) leaves above it, never from the arena, so on a tight or free chain there may be
-  none: the arena's least is a floor, not a working size (6.3d: an arena cut to its least by the
-  writers' extra failed to allocate). The decoders' least batches, one of the least morsel per
+  the sink asks for. The order: the claims stand in front of the arena; the arena takes its share
+  of the rest by the chain's factor and the extra never takes from it; the extra comes only from
+  the decoders' share of the rest beyond their least batches, so on a tight or free chain there may
+  be none. The arena's least is a floor, not a working size (6.3d: an arena cut to its least by the
+  writers' extra failed to allocate), and a cap on the arena at one morsel in flight per worker,
+  twice, was measured and dropped: it halved the arena at 672 MiB and 1 GiB and doubled the reads
+  and the row groups. The decoders' least batches, one of the least morsel per
   worker, are claimed with their fixed need, so a decode always has a batch. The
   fixed claims compose as one sum held outside the arena before its share is taken: the stateful
   kernels' declared state, the functions' measured fixed bytes (below), the decoders' fixed need
