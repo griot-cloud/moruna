@@ -47,6 +47,7 @@ use crate::{
     device::Port,
     dhcp::Client,
     grant::Grant,
+    meter::Meter,
 };
 
 /// The first port a connect or a port-0 listener may be given (RFC 6335).
@@ -410,6 +411,8 @@ pub struct Stack {
     /// Lines for the console exactly as they are, for operators: a grant at its bound,
     /// at most once a minute a grant (work item 1.3b).
     pub bounds: Vec<String>,
+    /// Where the server's bytes and time go (work item 6.3ab).
+    pub meter: Meter,
     /// Whether an interface has taken a DHCP lease since the stack was made.
     leased: bool,
     /// When the stack was made, in nanoseconds: a lease's line says how long after it came.
@@ -557,6 +560,7 @@ impl Stack {
             notes: Vec::new(),
             boot: Vec::new(),
             bounds: Vec::new(),
+            meter: Meter::new(moruna_svc::now),
             leased: false,
             made: now,
             now,
@@ -758,7 +762,9 @@ impl Stack {
         self.now = now;
         self.expire_server_identities();
         let t = instant(now);
+        self.meter.counts.polls += 1;
         for _ in 0..LOOPBACK_ROUNDS {
+            let ingress = self.meter.now();
             for i in 0..self.ifaces.len() {
                 if !self.ifaces[i].up {
                     continue;
@@ -778,13 +784,18 @@ impl Stack {
                 }
                 self.dhcp(i);
             }
+            let service = self.meter.now();
+            self.meter.counts.ingress_ns += service.saturating_sub(ingress);
             self.service();
+            let egress = self.meter.now();
+            self.meter.counts.service_ns += egress.saturating_sub(service);
             for x in self.ifaces.iter_mut() {
                 if !x.up {
                     continue;
                 }
                 x.egress(t);
             }
+            self.meter.counts.egress_ns += self.meter.since(egress);
             for o in self.orphans.iter_mut() {
                 o.sent = true;
             }
@@ -2038,7 +2049,12 @@ impl Stack {
         if source.mapping(false).is_err() {
             return fail(net::Error::BadArgument);
         }
-        let Stack { conns, ifaces, .. } = self;
+        let Stack {
+            conns,
+            ifaces,
+            meter,
+            ..
+        } = self;
         let t = match conns
             .get_mut(&conn)
             .and_then(|c| c.sockets.get_mut(&socket))
@@ -2051,7 +2067,7 @@ impl Stack {
             return fail(net::Error::InUse);
         }
         let socket = ifaces[t.iface].set.get_mut::<tcp::Socket>(t.handle);
-        match try_send_from(t, socket, &source) {
+        match try_send_from(t, socket, &source, meter) {
             Some(Ok(n)) => Outcome::reply(n),
             Some(Err(error)) => fail(error),
             None => {
@@ -2073,7 +2089,12 @@ impl Stack {
         if !self.memory_matches(conn, &memory) {
             return fail(net::Error::BadArgument);
         }
-        let Stack { conns, ifaces, .. } = self;
+        let Stack {
+            conns,
+            ifaces,
+            meter,
+            ..
+        } = self;
         let t = match conns
             .get_mut(&conn)
             .and_then(|c| c.sockets.get_mut(&socket))
@@ -2097,7 +2118,7 @@ impl Stack {
             return fail(net::Error::InUse);
         }
         let s = ifaces[t.iface].set.get_mut::<tcp::Socket>(t.handle);
-        match try_receive_into(t, s, &destination) {
+        match try_receive_into(t, s, &destination, meter) {
             Some(Ok(b)) => Outcome::reply(b),
             Some(Err(e)) => fail(e),
             None => {
@@ -2120,6 +2141,7 @@ impl Stack {
             conns,
             ifaces,
             ready,
+            meter,
             ..
         } = self;
         let t = match conns
@@ -2147,7 +2169,11 @@ impl Stack {
         t.shut = true;
         if let Some(tls) = &mut t.tls {
             tls.shutdown(close_deadline);
-            tls.poll(ifaces[t.iface].set.get_mut::<tcp::Socket>(t.handle), now);
+            tls.poll(
+                ifaces[t.iface].set.get_mut::<tcp::Socket>(t.handle),
+                now,
+                meter,
+            );
             if let Some(e) = tls.error() {
                 return fail(tls_error(e));
             }
@@ -2667,15 +2693,18 @@ impl Stack {
                 conns,
                 ifaces,
                 ready,
+                meter,
                 ..
             } = self;
+            let mut tls_sockets = 0;
             for (cid, c) in conns.iter_mut() {
                 for (sid, sock) in c.sockets.iter_mut() {
                     match sock {
                         Sock::Tcp(t) => {
                             let s = ifaces[t.iface].set.get_mut::<tcp::Socket>(t.handle);
                             if let Some(tls) = &mut t.tls {
-                                tls.poll(s, now);
+                                tls_sockets += 1;
+                                tls.poll(s, now, meter);
                                 if let Some(p) = t.shutdown_pending.take() {
                                     if let Some(e) = tls.error() {
                                         ready.push((p, fail(tls_error(e))));
@@ -2737,14 +2766,14 @@ impl Stack {
                                 continue;
                             }
                             if let Some((p, destination)) = t.receive.take() {
-                                match try_receive_into(t, s, &destination) {
+                                match try_receive_into(t, s, &destination, meter) {
                                     Some(Ok(b)) => ready.push((p, Outcome::reply(b))),
                                     Some(Err(e)) => ready.push((p, fail(e))),
                                     None => t.receive = Some((p, destination)),
                                 }
                             }
                             if let Some((p, bytes)) = t.send.take() {
-                                match try_send_from(t, s, &bytes) {
+                                match try_send_from(t, s, &bytes, meter) {
                                     Some(Ok(n)) => ready.push((p, Outcome::reply(n))),
                                     Some(Err(e)) => ready.push((p, fail(e))),
                                     None => t.send = Some((p, bytes)),
@@ -2775,6 +2804,7 @@ impl Stack {
                     }
                 }
             }
+            meter.tls_sockets(tls_sockets);
         }
         for (cid, sid) in failed_opens {
             if let Some((Sock::Tcp(t), grant)) = self
@@ -3039,7 +3069,27 @@ fn state_of(s: tcp::State) -> SocketState {
 
 /// What a send can be answered with now: how many bytes were taken, or why none can
 /// be; `None` while it must wait for room.
+/// [`send_from_loan`], timed and counted (work item 6.3ab): the copy out of the client's loan,
+/// its mapping included.
 fn try_send_from(
+    t: &mut Tcp,
+    s: &mut tcp::Socket<'static>,
+    source: &StreamLoan,
+    meter: &mut Meter,
+) -> Option<Result<u32, net::Error>> {
+    let start = meter.now();
+    let result = send_from_loan(t, s, source);
+    meter.counts.from_clients_ns += meter.since(start);
+    if let Some(Ok(n)) = result {
+        meter.counts.sends += 1;
+        meter.counts.from_clients_bytes += u64::from(n);
+    }
+    result
+}
+
+/// What a send can be answered with now: the bytes taken from the client's loan, or a
+/// failure; `None` while it must wait.
+fn send_from_loan(
     t: &mut Tcp,
     s: &mut tcp::Socket<'static>,
     source: &StreamLoan,
@@ -3084,9 +3134,31 @@ fn try_send_from(
     )
 }
 
+/// [`receive_into_loan`], timed and counted (work item 6.3ab): every try, a pending receive's
+/// at each poll among them, with its mapping of the client's loan, and the bytes copied into
+/// it.
+fn try_receive_into(
+    t: &mut Tcp,
+    s: &mut tcp::Socket<'static>,
+    destination: &StreamLoan,
+    meter: &mut Meter,
+) -> Option<Result<u32, net::Error>> {
+    let start = meter.now();
+    let result = receive_into_loan(t, s, destination);
+    meter.counts.receive_tries += 1;
+    meter.counts.to_clients_ns += meter.since(start);
+    if let Some(Ok(n)) = result
+        && n > 0
+    {
+        meter.counts.receives += 1;
+        meter.counts.to_clients_bytes += u64::from(n);
+    }
+    result
+}
+
 /// What a receive can be answered with now: bytes, the end of the stream (none), or
 /// a reset; `None` while it must wait.
-fn try_receive_into(
+fn receive_into_loan(
     t: &mut Tcp,
     s: &mut tcp::Socket<'static>,
     destination: &StreamLoan,

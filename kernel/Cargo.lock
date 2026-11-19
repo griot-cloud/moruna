@@ -1300,6 +1300,7 @@ dependencies = [
  "devices-protocol",
  "moruna-netstack",
  "moruna-svc",
+ "moruna-sys",
  "net-protocol",
  "netstack-protocol",
 ]

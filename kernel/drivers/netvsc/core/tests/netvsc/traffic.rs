@@ -26,6 +26,7 @@ fn length(i: usize) -> usize {
 #[test]
 fn a_thousand_frames_each_way_arrive_with_their_bytes_intact() {
     let (mut card, host) = started(ROOMY);
+    let at_start = card.counts();
     let mut random = Random(0x111a);
     assert_eq!((length(0), length(999)), (60, 1514));
     assert_eq!(card.mtu() as usize + 14, length(999));
@@ -73,6 +74,20 @@ fn a_thousand_frames_each_way_arrive_with_their_bytes_intact() {
     assert_eq!(host.free_sections(), 129);
     assert!(host.received.iter().all(|s| *s == Status::SUCCESS));
     assert!(host.received.len() > 4 + 1000 / 8);
+    // The card counted every frame each way and every receive (work item 6.3ab).
+    let counts = card.counts();
+    let bytes: u64 = (0..1000).map(|i| length(i) as u64).sum();
+    assert_eq!(counts.frames_out - at_start.frames_out, 1000);
+    assert_eq!(counts.bytes_out - at_start.bytes_out, bytes);
+    assert_eq!(counts.frames_in - at_start.frames_in, 1000);
+    assert_eq!(counts.bytes_in - at_start.bytes_in, bytes);
+    assert_eq!(
+        counts.receives - at_start.receives,
+        (host.received.len() - 4) as u64
+    );
+    assert!(counts.packets_in - at_start.packets_in >= counts.receives - at_start.receives);
+    assert!(counts.commits > at_start.commits);
+    assert_eq!(counts.signals as usize, card.signals());
 }
 
 #[test]
@@ -88,10 +103,12 @@ fn the_send_buffer_runs_out_and_recovers() {
         host.borrow_mut().hold = true;
         assert!(card.send(&frames[next]).unwrap(), "cycle {cycle}");
         assert!(card.send(&frames[next + 1]).unwrap(), "cycle {cycle}");
+        let full = card.counts().sections_full;
         for _ in 0..3 {
             assert!(!card.send(&frames[next + 2]).unwrap(), "cycle {cycle}");
             assert_eq!(drain(&mut card), []);
         }
+        assert_eq!(card.counts().sections_full, full + 3, "counted (6.3ab)");
         assert_eq!(host.borrow().frames.len(), next + 2);
         // The completions come, and with them the sections.
         host.borrow_mut().release();
@@ -130,7 +147,9 @@ fn the_ring_to_the_host_fills_and_recovers() {
     }
     // Each frame's packet takes 64 bytes of the ring's 4,088.
     assert_eq!(sent, 63);
+    let full = card.counts().ring_full;
     assert!(!card.send(&frames[sent]).unwrap());
+    assert_eq!(card.counts().ring_full, full + 1, "counted (6.3ab)");
     assert!(host.borrow().frames.is_empty());
     assert_eq!(card.wait(), Ok(Wait::TimedOut));
     // The host reads again. It was asked to signal once the ring has room, and does.
@@ -222,12 +241,24 @@ fn arm_says_when_there_is_work_and_leaves_the_hosts_signal_on() {
     assert_eq!(drain(&mut card), []);
     let _ = card.wait();
     // Nothing to read and nothing refused: nothing to do.
+    let before = card.counts();
     assert!(!card.arm().unwrap());
+    let after = card.counts();
+    assert_eq!(
+        (after.arms, after.idle),
+        (before.arms + 1, before.idle + 1),
+        "an arm that finds nothing is a wait (6.3ab)"
+    );
     // A frame comes: there is work, and the host signalled as it delivered.
     let mut random = Random(0xa4);
     let frame = random.frame(200);
     host.borrow_mut().deliver(&[&frame]);
     assert!(card.arm().unwrap(), "the frame is in the ring");
+    assert_eq!(
+        card.counts().idle,
+        after.idle,
+        "an arm that finds work is no wait"
+    );
     assert_eq!(drain(&mut card), [Got::Frame(frame)]);
     assert!(!card.arm().unwrap());
     assert_eq!(card.wait(), Ok(Wait::Signalled), "the host's signal, kept");

@@ -87,6 +87,34 @@ pub fn not_started(instance: impl core::fmt::Display, e: NetvscError) -> String 
 /// The most refusals said on the console; the rest are only counted.
 const REFUSAL_LINES: u64 = 16;
 
+/// The least time between two meter lines while frames move (work item 6.3ab): a line on the
+/// serial console holds its CPU for a few milliseconds.
+pub const METER_PERIOD_NS: u64 = 10_000_000_000;
+
+/// The process's own counts (work item 6.3ab), beside the card's
+/// ([`moruna_netvsc::Counts`]) and the protocol's (the hub's).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Process {
+    /// The loop's turns, and the time of its own work between waits.
+    pub turns: u64,
+    pub busy_ns: u64,
+    /// Wakes by the host's signal (through `vmbus`), and the time the card's service took in
+    /// them.
+    pub wakes: u64,
+    pub wake_ns: u64,
+    /// The clients' requests, and the time their handlers took, the card's service with them.
+    pub requests: u64,
+    pub requests_ns: u64,
+}
+
+/// What the meter's line says beside the counts: the process's CPU and its heap's large
+/// blocks, when the node says them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Beside {
+    pub cpu_ns: Option<u64>,
+    pub heap_maps: Option<u64>,
+}
+
 /// What `info` answers for `card`: its address and MTU, no offload, one queue.
 pub fn info<C: Channel, S: Shared>(card: &Netvsc<C, S>) -> Info {
     Info {
@@ -147,6 +175,11 @@ pub struct Driver<C: Channel, S: Shared> {
     lines: Vec<String>,
     /// What the host sent that was refused.
     refused: u64,
+    /// The process's counts, the clock they are timed with, and when the meter's last line
+    /// was said with the frames moved by then (work item 6.3ab).
+    pub process: Process,
+    clock: fn() -> u64,
+    said: Option<(u64, u64)>,
 }
 
 impl<C: Channel, S: Shared> Driver<C, S> {
@@ -158,7 +191,87 @@ impl<C: Channel, S: Shared> Driver<C, S> {
             server,
             lines: Vec::new(),
             refused: 0,
+            process: Process::default(),
+            clock: moruna_svc::now,
+            said: None,
         }
+    }
+
+    /// Times the meter with `clock` from now on: on a node, the clock page's.
+    pub fn set_clock(&mut self, clock: fn() -> u64) {
+        self.clock = clock;
+    }
+
+    /// The meter's clock now.
+    pub fn now(&self) -> u64 {
+        (self.clock)()
+    }
+
+    /// The host's signal woke the process: the card is serviced, and timed.
+    pub fn woken(&mut self) {
+        let start = self.now();
+        self.service();
+        self.process.wakes += 1;
+        self.process.wake_ns += self.now().saturating_sub(start);
+    }
+
+    /// The loop's own work in a turn, from `woke` (its return from the dispatcher), ends now.
+    pub fn turned(&mut self, woke: u64) {
+        self.process.turns += 1;
+        self.process.busy_ns += self.now().saturating_sub(woke);
+    }
+
+    /// The meter's line at `now`, if one is due: frames moved and [`METER_PERIOD_NS`] has
+    /// passed since the last (work item 6.3ab). Every count is from the process's start.
+    /// `beside` is read only for a line that is due: reading it is a call.
+    pub fn meter(&mut self, now: u64, beside: impl FnOnce() -> Beside) -> Option<String> {
+        let card = self.card.counts();
+        let moved = card.frames_in + card.frames_out;
+        if let Some((at, frames)) = self.said
+            && (frames == moved || now.saturating_sub(at) < METER_PERIOD_NS)
+        {
+            return None;
+        }
+        if self.said.is_none() && moved == 0 {
+            return None;
+        }
+        self.said = Some((now, moved));
+        let beside = beside();
+        let known = |v: Option<u64>| v.map_or_else(|| String::from("unknown"), |v| format!("{v}"));
+        let (p, hub) = (&self.process, &self.server.hub);
+        Some(format!(
+            "netvsc: meter at_ms={} cpu_us={} heap_maps={} busy_us={} turns={} wakes={} \
+             wake_us={} requests={} requests_us={} arms={} idle={} packets_in={} receives={} \
+             in={}f/{}B out={}f/{}B commits={} signals={} ring_full={} sections_full={} \
+             answered={} answered_frames={} backlog={} dropped={} rx_errors={} tx_errors={}",
+            now / 1_000_000,
+            known(beside.cpu_ns.map(|ns| ns / 1_000)),
+            known(beside.heap_maps),
+            p.busy_ns / 1_000,
+            p.turns,
+            p.wakes,
+            p.wake_ns / 1_000,
+            p.requests,
+            p.requests_ns / 1_000,
+            card.arms,
+            card.idle,
+            card.packets_in,
+            card.receives,
+            card.frames_in,
+            card.bytes_in,
+            card.frames_out,
+            card.bytes_out,
+            card.commits,
+            card.signals,
+            card.ring_full,
+            card.sections_full,
+            hub.answered,
+            hub.answered_frames,
+            hub.backlog,
+            hub.rx_dropped,
+            hub.rx_errors,
+            hub.tx_errors,
+        ))
     }
 
     /// The card.
@@ -256,6 +369,7 @@ impl<C: Channel, S: Shared> Driver<C, S> {
                 server,
                 lines,
                 refused,
+                ..
             } = self;
             match card.poll() {
                 Ok(None) => return,
@@ -304,12 +418,15 @@ impl<C: Channel, S: Shared> Handler for Connection<C, S> {
         self.id = Some(cx.connection());
         let driver = self.driver.clone();
         let mut driver = driver.borrow_mut();
+        let start = driver.now();
         let outcome = driver.handle(cx, ordinal, d);
         // What this request's turn finished, its own answer among them maybe.
         driver.service();
         for (pending, answer) in driver.take_ready() {
             cx.complete(pending, answer);
         }
+        driver.process.requests += 1;
+        driver.process.requests_ns += driver.now().saturating_sub(start);
         outcome
     }
 

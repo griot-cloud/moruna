@@ -31,6 +31,9 @@ pub mod datapath;
 pub mod env;
 #[cfg(feature = "heap")]
 mod heap;
+/// The large blocks the heap has mapped (work item 6.3ab).
+#[cfg(feature = "heap")]
+pub use heap::large_blocks as heap_large_blocks;
 pub mod hyperv;
 pub mod personality;
 pub mod plane;

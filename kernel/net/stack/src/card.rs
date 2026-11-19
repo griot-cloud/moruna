@@ -19,6 +19,8 @@ use alloc::{format, string::String, vec::Vec};
 use moruna_svc::{CallError, ClientCore, Encoder, Wire, frame::Frame as Message};
 use net_protocol::{Frame, Link, SEND_FRAMES_MAX};
 
+use crate::meter::CardCounts;
+
 /// What one send to a card carries besides its frames: the frame header, the count,
 /// each frame's length.
 const SEND_OVERHEAD: usize = 64;
@@ -66,6 +68,8 @@ pub struct CardLink<C = ClientCore> {
     batch: u32,
     /// Why the card can no longer be used.
     pub failed: Option<String>,
+    /// What has moved on the link (work item 6.3ab, `crate::meter`).
+    pub counts: CardCounts,
 }
 
 impl<C: Answers> CardLink<C> {
@@ -80,6 +84,7 @@ impl<C: Answers> CardLink<C> {
             sends: Vec::new(),
             batch,
             failed: None,
+            counts: CardCounts::default(),
         }
     }
 
@@ -106,6 +111,9 @@ impl<C: Answers> CardLink<C> {
             d.finish()
                 .map_err(|e| format!("a receive's frames: {e:?}"))?;
             taken.frames = frames.into_iter().map(|f| f.0).collect();
+            self.counts.answers += 1;
+            self.counts.frames_in += taken.frames.len() as u64;
+            self.counts.bytes_in += taken.frames.iter().map(|f| f.len() as u64).sum::<u64>();
             self.receive = None;
         }
         if let Some(t) = self.link
@@ -190,6 +198,9 @@ impl<C: Answers> CardLink<C> {
             let mut e = Encoder::new();
             batch.encode(&mut e).map_err(|e| format!("{e:?}"))?;
             let id = self.core.send(4, e).map_err(|e| format!("send: {e:?}"))?;
+            self.counts.sends += 1;
+            self.counts.frames_out += u64::from(frames);
+            self.counts.bytes_out += (bytes - SEND_OVERHEAD - 4 * n) as u64;
             self.sends.push((id, frames));
         }
     }

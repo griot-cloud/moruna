@@ -1035,3 +1035,183 @@ fn an_answer_cut_by_a_fin_without_close_notify_is_delivered_then_the_truncation_
     drop(slots);
     server.join().unwrap();
 }
+
+/// A TLS peer that answers the client's request `get` with `total` bytes, then ends as an
+/// HTTPS server may: close_notify, then its TCP end.
+fn sender(
+    mut c: net::Client,
+    listener: u32,
+    config: Arc<ServerConfig>,
+    total: usize,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let opened = c.accept(listener).unwrap();
+        let mut tls = ServerConnection::new(config).unwrap();
+        let mut asked = false;
+        while !asked {
+            let bytes =
+                common::receive(&mut c, opened.socket, netstack_protocol::RECEIVE_MAX as u32)
+                    .unwrap();
+            assert!(!bytes.is_empty(), "the client ended before its request");
+            tls.read_tls(&mut Cursor::new(bytes)).unwrap();
+            tls.process_new_packets().unwrap();
+            let mut request = [0u8; 16];
+            if let Ok(n) = tls.reader().read(&mut request)
+                && n > 0
+            {
+                assert_eq!(&request[..n], b"get");
+                asked = true;
+            }
+            let mut output = Vec::new();
+            tls.write_tls(&mut output).unwrap();
+            assert!(send(&mut c, opened.socket, &output));
+        }
+        let chunk = vec![0x5a; 16 * 1024];
+        let mut sent = 0;
+        while sent < total {
+            sent += tls
+                .writer()
+                .write(&chunk[..(total - sent).min(chunk.len())])
+                .unwrap();
+            let mut output = Vec::new();
+            while tls.wants_write() {
+                tls.write_tls(&mut output).unwrap();
+            }
+            assert!(send(&mut c, opened.socket, &output));
+        }
+        tls.send_close_notify();
+        let mut output = Vec::new();
+        while tls.wants_write() {
+            tls.write_tls(&mut output).unwrap();
+        }
+        assert!(send(&mut c, opened.socket, &output));
+        c.shutdown(opened.socket).unwrap();
+    })
+}
+
+/// `total` bytes read over TLS from a peer on loopback through a server configured by
+/// `config`: the server's meter at its end, and how long the read took, in nanoseconds.
+fn download(config: &str, total: usize) -> (moruna_netstack::Meter, u64) {
+    let (ca, peer_config) = credentials();
+    let (mut slots, server) = common::serve_metered(
+        config,
+        &[],
+        no_external_cards(),
+        Some(trust(&ca)),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    let listener = slots.remove("listen").unwrap();
+    let mut a = client(moruna_svc::connect(&listener).unwrap());
+    let mut b = client(moruna_svc::connect(&listener).unwrap());
+    let (listening, address) = b
+        .listen(Endpoint::new(Addr::v4(127, 0, 0, 1), 0), 1)
+        .unwrap();
+    let opened = a.open(Target::Endpoint(address), None).unwrap();
+    let peer = sender(b, listening, peer_config, total);
+    a.start_tls(opened.socket, "peer.ke2.test".into()).unwrap();
+    let began = moruna_svc::now();
+    assert!(send(&mut a, opened.socket, b"get"));
+    let mut read = 0;
+    loop {
+        let bytes =
+            common::receive(&mut a, opened.socket, netstack_protocol::RECEIVE_MAX as u32).unwrap();
+        if bytes.is_empty() {
+            break;
+        }
+        assert!(bytes.iter().all(|b| *b == 0x5a));
+        read += bytes.len();
+    }
+    let took = moruna_svc::now() - began;
+    assert_eq!(read, total);
+    a.shutdown(opened.socket).unwrap();
+    drop(a);
+    peer.join().unwrap();
+    drop(listener);
+    drop(slots);
+    (server.join().unwrap(), took)
+}
+
+/// The network server's meter (work item 6.3ab) counts a TLS download where it happens: the
+/// ciphertext TLS took from TCP, the plaintext it opened, the bytes copied to the clients, and
+/// the time of each part.
+#[test]
+fn the_meter_counts_a_tls_download() {
+    let total = 1 << 20;
+    let (meter, _) = download(CONFIG, total);
+    let c = meter.counts;
+    // The client's TLS opened exactly the peer's answer, from more ciphertext than that.
+    assert_eq!(c.opened_bytes, total as u64);
+    assert!(c.tls_in_bytes > total as u64, "{c:?}");
+    assert!(c.open_ns > 0, "{c:?}");
+    // It sealed the request, and gave TCP its record and the handshake's.
+    assert_eq!(c.sealed_bytes, 3);
+    assert!(c.seal_ns > 0 && c.tls_out_bytes > 3, "{c:?}");
+    // Copied to the clients: the client's plaintext, and the client's handshake and request to
+    // the peer; out of them, the peer's ciphertext and the client's request.
+    assert!(c.to_clients_bytes > total as u64, "{c:?}");
+    assert!(c.from_clients_bytes > total as u64, "{c:?}");
+    assert!(
+        c.receives >= (total / netstack_protocol::RECEIVE_MAX) as u64,
+        "{c:?}"
+    );
+    assert!(c.receive_tries >= c.receives && c.sends > 0, "{c:?}");
+    assert!(c.to_clients_ns > 0 && c.from_clients_ns > 0, "{c:?}");
+    // The polls and the loop, timed.
+    assert!(
+        c.polls > 0 && c.ingress_ns > 0 && c.service_ns > 0 && c.egress_ns > 0,
+        "{c:?}"
+    );
+    assert!(c.turns > 0 && c.busy_ns > 0, "{c:?}");
+    assert!(c.requests > 0 && c.requests_ns > 0, "{c:?}");
+    // The TLS socket went with its client.
+    assert_eq!(c.tls_sockets, 0);
+}
+
+/// What the network server's own work costs a TLS download on this host, by its meter (work
+/// item 6.3ab): 64 MiB over loopback at Ethernet's MTU, so TCP takes the node's segments. It
+/// asserts only what it read: run it in a release build with `--ignored --nocapture` for the
+/// figures.
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn the_network_servers_own_cost_of_a_tls_download() {
+    let total = 64 << 20;
+    let config = "moruna-netstack 1
+setting tls-handshake-timeout-ms 2000
+setting loopback-mtu 1500
+grant listen rights=connect,listen,resolve remote=127.0.0.0/8 local=127.0.0.0/8 sockets=8
+";
+    let (meter, took) = download(config, total);
+    let c = meter.counts;
+    assert_eq!(c.opened_bytes, total as u64);
+    let rate = |bytes: u64, ns: u64| bytes as f64 * 1e3 / ns.max(1) as f64;
+    let mb = total as f64 / 1e6;
+    std::eprintln!(
+        "6.3ab host: {mb:.0} MB over TLS at MTU 1500 in {:.3} s ({:.0} MB/s end to end); \
+         server busy {:.3} s ({:.0} MB/s): its loop {:.3} s in {} turns, {} polls, \
+         {} requests {:.3} s; \
+         ingress {:.3} s, service {:.3} s, egress {:.3} s; \
+         TLS open {:.3} s ({:.0} MB/s of plaintext); copies to clients {:.3} s over {} tries \
+         ({:.0} MB/s of {} MB), from clients {:.3} s ({:.0} MB/s of {} MB)",
+        took as f64 / 1e9,
+        rate(total as u64, took),
+        (c.busy_ns + c.requests_ns) as f64 / 1e9,
+        rate(total as u64, c.busy_ns + c.requests_ns),
+        c.busy_ns as f64 / 1e9,
+        c.turns,
+        c.polls,
+        c.requests,
+        c.requests_ns as f64 / 1e9,
+        c.ingress_ns as f64 / 1e9,
+        c.service_ns as f64 / 1e9,
+        c.egress_ns as f64 / 1e9,
+        c.open_ns as f64 / 1e9,
+        rate(c.opened_bytes, c.open_ns),
+        c.to_clients_ns as f64 / 1e9,
+        c.receive_tries,
+        rate(c.to_clients_bytes, c.to_clients_ns),
+        c.to_clients_bytes / 1_000_000,
+        c.from_clients_ns as f64 / 1e9,
+        rate(c.from_clients_bytes, c.from_clients_ns),
+        c.from_clients_bytes / 1_000_000,
+    );
+}

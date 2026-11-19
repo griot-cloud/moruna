@@ -12,3 +12,6 @@ moruna-netstack = { path = "../stack", version = "=0.1.0" }
 netstack-protocol = { path = "../protocol", version = "=0.1.0" }
 net-protocol = { path = "../../drivers/net-protocol", version = "=0.1.0" }
 devices-protocol = { path = "../../devices/protocol", version = "=0.1.0" }
+# The meter's clock (the clock page, read with no call), the server's CPU and its heap's large
+# blocks (work item 6.3ab).
+moruna-sys.workspace = true
