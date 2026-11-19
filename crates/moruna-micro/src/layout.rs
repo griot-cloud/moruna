@@ -698,6 +698,51 @@ fn windows_said(windows: Option<&[&str]>) -> String {
     windows.map_or_else(|| String::from("not a ring task's"), |w| w.join(", "))
 }
 
+/// Why a stage fails on its task, which decides whether it waits for the task's end
+/// ([`failing`], item 6.3x).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// The task ended, or said it did: how it ended is read, within the bound of a task's end.
+    Ended,
+    /// The task broke the protocol and may still be running: it is ended at once, as a cancel
+    /// ends it, and its end is not waited for.
+    Violation,
+}
+
+/// A task a stage fails on ([`failing`]).
+pub trait Failing {
+    /// How the task ended, as the stage reads it.
+    type How;
+    /// Takes what the task has written by now, without waiting for more.
+    fn drain(&mut self);
+    /// Ends the task now, without waiting for its end.
+    fn end_now(&mut self);
+    /// How the task ended, waiting up to `wait_ns` nanoseconds for its answer.
+    fn how(&mut self, wait_ns: u64) -> Self::How;
+}
+
+/// What a stage does with its task as it fails on it, and how the task ended, if it waited.
+///
+/// - [`Failure::Ended`]: the task's answer, read within `end_ns`; an ended task's comes at once.
+/// - [`Failure::Violation`]: the task ended at once and no answer waited for, so the failure's
+///   time is the violation's own. The stage used to wait `end_ns` (60 s) for the end of a task
+///   whose input was still open, which never came: every failure of item 6.3x came 60 s after
+///   its violation, and read as a stall.
+///
+/// Either way it takes what the task wrote, before and after, waiting for nothing more.
+pub fn failing<T: Failing>(task: &mut T, failure: Failure, end_ns: u64) -> Option<T::How> {
+    task.drain();
+    let how = match failure {
+        Failure::Ended => Some(task.how(end_ns)),
+        Failure::Violation => {
+            task.end_now();
+            None
+        }
+    };
+    task.drain();
+    how
+}
+
 /// What a ring stage saw of its task, kept for a failure to say ([`Recent`], item 6.3x). Each
 /// names the engine's batch: an input posted, or a record put.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1669,6 +1714,73 @@ mod tests {
             "batch 8 released with no record; in flight behind it: none; taking: none; early: \
              none; its windows: not a ring task's; the last it saw: none"
         );
+    }
+
+    /// A task as a stage fails on it: one still running answers nothing, so a wait for its
+    /// answer lasts to the deadline; one that ended answers at once.
+    struct Task {
+        running: bool,
+        drains: u32,
+        ended_now: bool,
+        waited: Option<u64>,
+    }
+
+    impl Task {
+        fn new(running: bool) -> Task {
+            Task {
+                running,
+                drains: 0,
+                ended_now: false,
+                waited: None,
+            }
+        }
+    }
+
+    impl Failing for Task {
+        type How = Option<&'static str>;
+        fn drain(&mut self) {
+            self.drains += 1;
+        }
+        fn end_now(&mut self) {
+            self.ended_now = true;
+            self.running = false;
+        }
+        fn how(&mut self, wait_ns: u64) -> Option<&'static str> {
+            self.waited = Some(wait_ns);
+            if self.running {
+                std::thread::sleep(std::time::Duration::from_nanos(wait_ns));
+                return None;
+            }
+            Some("exited 0")
+        }
+    }
+
+    #[test]
+    fn x63_a_violation_fails_the_stage_well_within_a_second() {
+        const END_NS: u64 = 60 * 1_000_000_000;
+        let started = std::time::Instant::now();
+        let mut live = Task::new(true);
+        assert_eq!(failing(&mut live, Failure::Violation, END_NS), None);
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(100),
+            "a violation waited {took:?}"
+        );
+        assert!(live.ended_now, "the task is ended at once");
+        assert_eq!(live.waited, None, "and its end is not waited for");
+        assert_eq!(live.drains, 2, "what it wrote is taken, before and after");
+    }
+
+    #[test]
+    fn x63_a_task_s_end_is_read_within_the_end_s_bound() {
+        let mut ended = Task::new(false);
+        assert_eq!(
+            failing(&mut ended, Failure::Ended, 7),
+            Some(Some("exited 0"))
+        );
+        assert_eq!(ended.waited, Some(7));
+        assert!(!ended.ended_now, "an ended task is not ended again");
+        assert_eq!(ended.drains, 2);
     }
 
     #[test]

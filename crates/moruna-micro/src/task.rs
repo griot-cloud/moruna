@@ -75,7 +75,9 @@ const HELLO_SECONDS: u64 = 120;
 /// How often a stage waiting on its task looks at the run's cancel and at the personality's
 /// answer: an answer of the task's own arrives at once, whatever this is.
 const LOOK_NS: u64 = 250_000_000;
-/// How long the personality may take to answer for a task the plane has seen end.
+/// How long the personality may take to answer for a task the plane has seen end, and a task's
+/// process to end once ended. Never a wait for a task that broke the protocol: the stage ends
+/// that one at once ([`TaskState::violated`], item 6.3x).
 const END_SECONDS: u64 = 60;
 /// A task's log ring.
 const RING_BYTES: u64 = 64 * 1024;
@@ -1900,14 +1902,28 @@ impl TaskState {
         }
     }
 
-    /// The stage's failure, with how the task ended and its last lines.
+    /// The stage's failure on a task that ended, or said it did: with how it ended, its answer
+    /// read within [`END_SECONDS`], and its last lines.
     fn failed(&mut self, cause: &str) -> MorunaError {
-        self.drain_log();
+        self.fail(cause, layout::Failure::Ended)
+    }
+
+    /// The stage's failure on a protocol violation by a task that may still be running (item
+    /// 6.3x): the task ended at once, as a cancel ends it, and its last lines as it wrote them
+    /// by then; its end is not waited for, so the failure's time is the violation's own.
+    fn violated(&mut self, cause: &str) -> MorunaError {
+        self.fail(cause, layout::Failure::Violation)
+    }
+
+    /// [`Self::failed`] and [`Self::violated`]: [`layout::failing`], then the failure's line.
+    fn fail(&mut self, cause: &str, failure: layout::Failure) -> MorunaError {
         let name = self.name.clone();
         let footprint = self.footprint();
         let native = self.process.is_some();
-        let head = match self.answer(END_SECONDS * SECONDS) {
-            Some(Ok(e)) => match e.how {
+        let head = match layout::failing(self, failure, END_SECONDS * SECONDS) {
+            None => format!("image `{name}`: {cause}; the engine ended it at once ({footprint})"),
+            Some(None) => format!("image `{name}`: {cause}"),
+            Some(Some(Ok(e))) => match e.how {
                 how::EXITED => format!("image `{name}`: {cause}; exited with status {}", e.code),
                 how::SIGNALED => format!("image `{name}`: {cause}; was ended by signal {}", e.code),
                 _ if native => format!(
@@ -1920,14 +1936,45 @@ impl TaskState {
                      console line says why)"
                 ),
             },
-            Some(Err(why)) => format!("image `{name}`: {cause}; {why}"),
-            None => format!("image `{name}`: {cause}"),
+            Some(Some(Err(why))) => format!("image `{name}`: {cause}; {why}"),
         };
-        self.drain_log();
         let lines: Vec<String> = self.tail.iter().cloned().collect();
         kernel_error(with_stderr(head, &lines))
     }
 
+    /// Ends the task now, as a cancel's retire does ([`Self::teardown`]), without waiting for
+    /// its end: a native task's process is killed; a Linux task's connection to the
+    /// personality, which ends it, is closed once its answer, if it has come, is read. The
+    /// teardown that follows the failure waits for the end, off the failure's path.
+    fn end_now(&mut self) {
+        let _ = self.answer(0);
+        match self.process.as_ref() {
+            Some(process) if !self.terminal_confirmed => {
+                let _ = process.kill();
+            }
+            Some(_) => {}
+            None => drop(self.client.take()),
+        }
+    }
+}
+
+impl layout::Failing for TaskState {
+    type How = Option<std::result::Result<Ended, String>>;
+
+    fn drain(&mut self) {
+        self.drain_log();
+    }
+
+    fn end_now(&mut self) {
+        TaskState::end_now(self);
+    }
+
+    fn how(&mut self, wait_ns: u64) -> Self::How {
+        self.answer(wait_ns).cloned()
+    }
+}
+
+impl TaskState {
     /// Grants the window for the task's next record, once none is held.
     fn grant(&mut self, input: u64) -> Result<()> {
         if self.window.is_some() {
@@ -2155,7 +2202,7 @@ impl TaskState {
                 self.call(ports, names, call, port, request)?;
                 Ok(true)
             }
-            Some(Event::Refused { reason, .. }) => Err(self.failed(&format!(
+            Some(Event::Refused { reason, .. }) => Err(self.violated(&format!(
                 "its record on its output was refused by the engine's check: {reason}"
             ))),
             Some(Event::Ended { .. }) => {
@@ -2175,7 +2222,7 @@ impl TaskState {
             }
             Some(Event::Put { batch, .. }) => {
                 let _ = self.plane.drop_batch(batch);
-                Err(self.failed("it put a record before it was offered a batch"))
+                Err(self.violated("it put a record before it was offered a batch"))
             }
             Some(Event::Released {
                 batch, piece_ns, ..
@@ -2408,7 +2455,7 @@ impl TaskState {
         let answer = match t.parts.len() {
             0 => {
                 let held = self.no_record(t.offered);
-                return Err(self.failed(&format!(
+                return Err(self.violated(&format!(
                     "it said a batch was done without a record for it: a task answers every \
                      batch, with a record of no rows when it keeps none ({held})"
                 )));
@@ -2775,7 +2822,7 @@ impl TaskState {
                     request,
                 }) => self.call(ports, names, call, port, request)?,
                 Some(Event::Refused { reason, .. }) => {
-                    return Err(self.failed(&format!(
+                    return Err(self.violated(&format!(
                         "its record on its output was refused by the engine's check: {reason}"
                     )));
                 }
@@ -2849,7 +2896,7 @@ impl TaskState {
                     return Ok(Seen::Put(batch));
                 }
                 Some(Event::Refused { reason, .. }) => {
-                    return Err(self.failed(&format!(
+                    return Err(self.violated(&format!(
                         "its record on its output was refused by the engine's check: {reason}"
                     )));
                 }
@@ -3123,11 +3170,11 @@ impl Kernel for ImageTask {
                             st.sent
                         )
                     };
-                    Err(st.failed(&cause))
+                    Err(st.violated(&cause))
                 }
                 Seen::Released(b, _) => {
                     let held = st.no_record(b);
-                    Err(st.failed(&format!("it released a batch it was not sent ({held})")))
+                    Err(st.violated(&format!("it released a batch it was not sent ({held})")))
                 }
                 Seen::Ended => match st.answer(END_SECONDS * SECONDS) {
                     Some(Ok(e)) if e.how == how::EXITED && e.code == 0 => {
