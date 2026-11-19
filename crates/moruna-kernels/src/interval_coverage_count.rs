@@ -647,6 +647,7 @@ impl Kernel for IntervalCoverageCount {
             preferred_rows: None,
             resume: ResumePolicy::Reinit,
             state_bytes: None,
+            measured_line: None,
         }
     }
 

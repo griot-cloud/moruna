@@ -261,6 +261,7 @@ impl Kernel for FakeKernel {
             preferred_rows: None,
             resume: self.inner.resume,
             state_bytes: Some(self.inner.state_bytes),
+            measured_line: None,
         }
     }
 

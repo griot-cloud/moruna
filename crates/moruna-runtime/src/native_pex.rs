@@ -81,6 +81,7 @@ impl NativePex {
                 _ => ResumePolicy::Reinit,
             },
             state_bytes: h.state_bytes,
+            measured_line: None,
         };
         let declared = package.manifest.declared().map_err(MorunaError::from)?;
         Ok(Self {

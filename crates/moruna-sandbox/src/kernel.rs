@@ -188,6 +188,7 @@ impl SandboxKernel {
             preferred_rows: h.preferred_rows,
             resume,
             state_bytes: h.state_bytes,
+            measured_line: None,
         };
         let declared = manifest.declared().map_err(MorunaError::from)?;
         let notes = tree.notes.clone();

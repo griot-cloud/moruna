@@ -294,6 +294,7 @@ impl Kernel for MlpKernel {
             preferred_rows: None,
             resume: ResumePolicy::Reinit,
             state_bytes: Some(self.forward.state_bytes()),
+            measured_line: None,
         }
     }
 

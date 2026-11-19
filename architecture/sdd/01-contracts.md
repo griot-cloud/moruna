@@ -555,6 +555,17 @@ pub struct KernelHints {
     /// Bytes one instance's state is expected to hold (a model's weights); seeds the
     /// controller's state term before the first `footprint` is observed (RC f.3).
     pub state_bytes: Option<u64>,
+    /// The stage's measured line where the run has one (system design 3A, 6.3w): set by the
+    /// run from what the job, the registry or its store measured, never by a kernel. The anon
+    /// fit takes its slope where its window cannot resolve one (RC f.3).
+    pub measured_line: Option<MeasuredLine>,
+}
+
+/// A function's memory as a line over its batch, in the units the run sizes its instances with.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MeasuredLine {
+    pub fixed_bytes: f64,
+    pub per_input_byte: f64,
 }
 
 /// Per-instance state a stateful kernel keeps between `apply` calls.
