@@ -288,3 +288,28 @@ that Occupancy and Audit were bound by the drive's one-at-a-time fetch (6.3t), n
 - **The Linux engines installed this time** (uv's timeout fix). Ray failed every job on a missing
   aiohttp; fixed in the harness (a5c212c5). Dask's Enrich r0 lost its workers. The full table
   follows when run 5 ends.
+
+### Run 202611182200, the full table (PM, 2026-11-19)
+
+Every Moruna output is bit for bit with 0.6.6.
+
+Medians, in seconds. These rows are the table's own (5 measured runs), so the node's figures differ
+slightly from the 6-run medians above.
+
+| Job | Moruna node | 0.6.6 Python | 0.6.6 Rust | Plain Rust pool | DuckDB | Polars | Spark | Dask |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Score | 55.3 | 59.9 | 30.5 | 27.7 | 139.1 | 142.3 | 120.9 | 78.0 |
+| Occupancy | 16.5 | 17.8 | 11.4 | 2.8 | 40.1 (SQL 19.0) | 41.3 | 78.4 | 33.9 |
+| Enrich | 71.0 | 17.7 | 18.1 | 13.3 | 28.7 | 29.8 (expressions 16.7) | 123.2 | failed |
+| Audit | 17.7 (3 of 5) | 33.8 | 12.7 | 4.0 | 54.8 | 56.0 | 92.8 | 37.2 |
+
+Ray failed every job on a missing aiohttp (fixed in a5c212c5). Dask's Enrich lost its workers in every
+run.
+
+- **Against the Python engines,** Moruna is faster on every job, Enrich excepted.
+- **Against 0.6.6's Rust function:**
+  - Score 0.55×, Occupancy 0.69×, Audit 0.72×, Enrich 0.25×.
+  - The plain Rust pool, which reads from Blob into one process, reads the year in about 2.8 s, so
+    reading from Blob on Linux runs at about 300 MB/s. The node reads at about 52 MB/s, with one row
+    group fetched at a time.
+  - The asynchronous fetch (a906df5d) is in run 6. Enrich is bound by its uploads (6.3u).
