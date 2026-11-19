@@ -628,8 +628,10 @@ fn mapping<'a>(handle: &Handle, offset: u64, len: u64, flags: u64) -> Result<Map
 }
 
 /// Pages mapped into this process; unmapped on drop. The bytes are shared with every
-/// other mapping of the same object, so they are read and written one at a time as
-/// volatile accesses, never through a Rust reference.
+/// other mapping of the same object. [`Mapping::read`] and [`Mapping::write`] copy a range
+/// whole, which the protocol over the object hands to the caller for the copy (work item
+/// 6.3ad); a device's register, or a word other processes change at any time, is accessed
+/// at its own width ([`Mapping::read32`], [`Mapping::atomic32`]), never through them.
 #[derive(Debug)]
 pub struct Mapping<'a> {
     addr: u64,
@@ -693,21 +695,49 @@ impl Mapping<'_> {
         Ok(self.addr + offset as u64)
     }
 
+    /// Copies `buf.len()` bytes from `offset` into `buf`, in one bulk copy (work item 6.3ad).
+    ///
+    /// The range is the caller's for the copy: no other party writes it meanwhile. The
+    /// protocol over the memory is what promises it: a loan's lender does not touch it between
+    /// handing it over and its answer (SDD 31, caller-owned loans; the data plane's DP-I4,
+    /// SDD 29), a device has completed the buffer it wrote, a boot's data is never written.
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
         let at = self.range(offset, buf.len())?;
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = raw::peek(at + i as u64);
+        // SAFETY: `range` keeps the `buf.len()` bytes at `at` inside the mapping, which the
+        // kernel keeps mapped readable while `self` lives. `buf` is a Rust borrow of memory
+        // of the process's own, exclusive while it lives, so it is no part of this mapping,
+        // whose bytes no `&mut` reaches but `shared_region`'s, which borrows `self`
+        // exclusively. No other party writes the range during the copy: the caller's
+        // promise, as this method's contract says.
+        unsafe {
+            core::ptr::copy_nonoverlapping(at as *const u8, buf.as_mut_ptr(), buf.len());
         }
         Ok(())
     }
 
+    /// Copies `data` to `offset`, in one bulk copy (work item 6.3ad).
+    ///
+    /// The range is the caller's for the copy: no other party writes it meanwhile, and the
+    /// bytes are another party's only once the caller hands the range over (the contract of
+    /// [`Mapping::read`]).
     pub fn write(&self, offset: usize, data: &[u8]) -> Result<()> {
         if !self.writable {
             return Err(Error::AccessDenied);
         }
         let at = self.range(offset, data.len())?;
-        for (i, b) in data.iter().enumerate() {
-            raw::poke(at + i as u64, *b);
+        let source = data.as_ptr() as u64;
+        // SAFETY: `range` keeps the `data.len()` bytes at `at` inside the mapping, which the
+        // kernel keeps mapped writable while `self` lives (`writable`, checked above). No
+        // other party writes the range during the copy, the caller's promise as this
+        // method's contract says. `data` overlaps the range only when it was borrowed from
+        // this mapping's own bytes (`bytes`), a contract `bytes` forbids: such a copy is
+        // still made as overlapping ranges are, by `copy`.
+        unsafe {
+            if source < at + data.len() as u64 && at < source + data.len() as u64 {
+                core::ptr::copy(data.as_ptr(), at as *mut u8, data.len());
+            } else {
+                core::ptr::copy_nonoverlapping(data.as_ptr(), at as *mut u8, data.len());
+            }
         }
         Ok(())
     }
@@ -1221,4 +1251,143 @@ macro_rules! main {
             $crate::exit($run())
         }
     };
+}
+
+/// Copies through a mapping (work item 6.3ad), on a host: a [`Mapping`] over a buffer of the
+/// test's, which the kernel would have mapped, and which is never dropped, so nothing is
+/// unmapped.
+#[cfg(test)]
+mod mapping_tests {
+    extern crate std;
+
+    use core::mem::ManuallyDrop;
+    use std::{time::Instant, vec, vec::Vec};
+
+    use super::*;
+
+    /// A mapping of `bytes`, writable or not.
+    fn over(bytes: &mut [u8], writable: bool) -> ManuallyDrop<Mapping<'static>> {
+        ManuallyDrop::new(Mapping {
+            addr: bytes.as_mut_ptr() as u64,
+            len: bytes.len() as u64,
+            writable,
+            made_writable: writable,
+            _object: PhantomData,
+        })
+    }
+
+    /// The bytes of a stream that is not one byte repeated.
+    fn stream(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 7 + i / 4093) as u8).collect()
+    }
+
+    /// The network server copies what a client receives into the client's loan, and the client
+    /// copies it out again (SDD 31). Run 10 moved 5.06 GB to clients in 87.3 s, one volatile
+    /// byte at a time each way. A 64 MiB receive through a loan, in and out, costs at most a
+    /// fifth of that byte-wise copy.
+    #[test]
+    fn a_64_mib_receive_through_a_loan_costs_at_most_a_fifth_of_a_byte_wise_copy() {
+        const LEN: usize = 64 << 20;
+        let wire = stream(LEN);
+        // Every page touched before either copy is timed.
+        let mut loan = vec![1u8; LEN];
+        let mut client = vec![1u8; LEN];
+        let mapping = over(&mut loan, true);
+        let at = mapping.addr();
+        let began = Instant::now();
+        for (i, b) in wire.iter().enumerate() {
+            raw::poke(at + i as u64, *b);
+        }
+        for (i, b) in client.iter_mut().enumerate() {
+            *b = raw::peek(at + i as u64);
+        }
+        let byte_wise = began.elapsed();
+        assert!(client == wire);
+        client.fill(0);
+        mapping.write(0, &vec![0u8; LEN]).unwrap();
+        let began = Instant::now();
+        mapping.write(0, &wire).unwrap();
+        mapping.read(0, &mut client).unwrap();
+        let through = began.elapsed();
+        assert!(client == wire);
+        std::eprintln!(
+            "6.3ad host: 64 MiB into a loan and out: byte-wise {:.3} s ({:.0} MB/s), \
+             through the mapping {:.3} s ({:.0} MB/s), {:.1} times less",
+            byte_wise.as_secs_f64(),
+            2.0 * LEN as f64 / 1e6 / byte_wise.as_secs_f64(),
+            through.as_secs_f64(),
+            2.0 * LEN as f64 / 1e6 / through.as_secs_f64(),
+            byte_wise.as_secs_f64() / through.as_secs_f64(),
+        );
+        assert!(
+            through * 5 <= byte_wise,
+            "through the mapping {through:?}, byte-wise {byte_wise:?}"
+        );
+        drop(loan);
+    }
+
+    /// A copy moves exactly its bytes, at any offset and length within the mapping, and
+    /// nothing outside it; a writable mapping alone is written.
+    #[test]
+    fn a_copy_moves_its_bytes_alone_within_the_mapping_and_its_rights() {
+        let mut bytes = vec![0u8; 3 * 4096];
+        let mapping = over(&mut bytes, true);
+        let source = stream(5000);
+        for (offset, len) in [
+            (0, 0),
+            (0, 1),
+            (1, 7),
+            (3, 4096),
+            (4093, 5000),
+            (8191, 4097),
+        ] {
+            let len = len.min(source.len());
+            mapping.write(0, &vec![0xee; 3 * 4096]).unwrap();
+            mapping.write(offset, &source[..len]).unwrap();
+            let mut all = vec![0u8; 3 * 4096];
+            mapping.read(0, &mut all).unwrap();
+            assert!(all[..offset].iter().all(|b| *b == 0xee), "{offset} {len}");
+            assert_eq!(&all[offset..offset + len], &source[..len], "{offset} {len}");
+            assert!(
+                all[offset + len..].iter().all(|b| *b == 0xee),
+                "{offset} {len}"
+            );
+            let mut back = vec![0u8; len];
+            mapping.read(offset, &mut back).unwrap();
+            assert_eq!(back, &source[..len]);
+        }
+        // Past the end, or wrapping, refused before a byte moves.
+        let mut out = [0u8; 2];
+        assert_eq!(mapping.read(3 * 4096 - 1, &mut out), Err(Error::OutOfRange));
+        assert_eq!(mapping.read(usize::MAX, &mut out), Err(Error::OutOfRange));
+        assert_eq!(mapping.write(3 * 4096 - 1, &[1, 2]), Err(Error::OutOfRange));
+        assert_eq!(mapping.read_u32(0).unwrap(), 0xeeee_eeee);
+        // A read-only mapping is read, never written.
+        let mut fixed = stream(4096);
+        let read_only = over(&mut fixed, false);
+        assert_eq!(read_only.write(0, &[0]), Err(Error::AccessDenied));
+        let mut out = vec![0u8; 4096];
+        read_only.read(0, &mut out).unwrap();
+        assert_eq!(out, stream(4096));
+        drop((bytes, fixed));
+    }
+
+    /// The mapping's own bytes written back into it, shifted: a contract `bytes` already
+    /// forbids (nothing writes the mapping while they are borrowed), copied as overlapping
+    /// ranges are rather than left to `copy_nonoverlapping`.
+    #[test]
+    fn a_write_of_the_mapping_s_own_bytes_is_a_copy_of_overlapping_ranges() {
+        let mut bytes = stream(4096);
+        let mapping = over(&mut bytes, true);
+        mapping.write(1, &mapping.bytes()[..100]).unwrap();
+        mapping.write(200, &mapping.bytes()[201..301]).unwrap();
+        let mut out = vec![0u8; 4096];
+        mapping.read(0, &mut out).unwrap();
+        let s = stream(4096);
+        assert_eq!(out[0], s[0]);
+        assert_eq!(&out[1..101], &s[..100]);
+        assert_eq!(&out[200..300], &s[201..301]);
+        assert_eq!(&out[300..], &s[300..]);
+        drop(bytes);
+    }
 }

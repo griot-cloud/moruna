@@ -1154,7 +1154,10 @@ fn the_meter_counts_a_tls_download() {
         c.receives >= (total / netstack_protocol::RECEIVE_MAX) as u64,
         "{c:?}"
     );
-    assert!(c.receive_tries >= c.receives && c.sends > 0, "{c:?}");
+    // Each receive tried once, when its socket had bytes or its end (work item 6.3ad): every
+    // try answered, the last with the end of the stream.
+    assert_eq!(c.receive_tries, c.receives + 1, "{c:?}");
+    assert!(c.sends > 0, "{c:?}");
     assert!(c.to_clients_ns > 0 && c.from_clients_ns > 0, "{c:?}");
     // The polls and the loop, timed.
     assert!(
@@ -1165,6 +1168,54 @@ fn the_meter_counts_a_tls_download() {
     assert!(c.requests > 0 && c.requests_ns > 0, "{c:?}");
     // The TLS socket went with its client.
     assert_eq!(c.tls_sockets, 0);
+}
+
+/// A receive waiting on a socket with no data is not tried at the server's polls (work item
+/// 6.3ad: run 10 tried each answered receive about 35 times, mapping its loan at each try). It
+/// is tried once its socket has data, and answered then.
+#[test]
+fn a_pending_receive_is_tried_only_once_its_socket_has_data() {
+    let (mut slots, server) = common::serve_metered(
+        CONFIG,
+        &[],
+        no_external_cards(),
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    let listener = slots.remove("listen").unwrap();
+    let mut a = client(moruna_svc::connect(&listener).unwrap());
+    let mut b = client(moruna_svc::connect(&listener).unwrap());
+    let mut c = client(moruna_svc::connect(&listener).unwrap());
+    let (listening, address) = b
+        .listen(Endpoint::new(Addr::v4(127, 0, 0, 1), 0), 1)
+        .unwrap();
+    let opened = a.open(Target::Endpoint(address), None).unwrap();
+    let accepted = b.accept(listening).unwrap();
+    // `a` waits, on a thread of its own, for bytes its peer has not sent.
+    let waiting = thread::spawn(move || {
+        let bytes = common::receive(&mut a, opened.socket, 64).unwrap();
+        (a, bytes)
+    });
+    // Meanwhile the server polls, at another client's requests and at its own timers.
+    thread::sleep(std::time::Duration::from_millis(100));
+    for _ in 0..200 {
+        c.info().unwrap();
+    }
+    thread::sleep(std::time::Duration::from_millis(100));
+    assert!(send(&mut b, accepted.socket, b"x"));
+    let (mut a, bytes) = waiting.join().unwrap();
+    assert_eq!(bytes, b"x");
+    a.close(opened.socket).unwrap();
+    b.close(accepted.socket).unwrap();
+    drop((a, b, c, listener, slots));
+    let counts = server.join().unwrap().counts;
+    assert!(counts.polls > 200, "{counts:?}");
+    // One try, once the byte had come, and it answered.
+    assert_eq!(
+        (counts.receive_tries, counts.receives),
+        (1, 1),
+        "{counts:?}"
+    );
 }
 
 /// What the network server's own work costs a TLS download on this host, by its meter (work

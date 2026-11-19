@@ -234,6 +234,8 @@ impl Network {
                             Ok(count) => {
                                 let count = count.min(RECEIVE_BYTES) as usize;
                                 let mut bytes = vec![0; count];
+                                // Answered, the network server holds the loan no more (SDD
+                                // 31): the copy is a bulk one (`Mapping::read`, 6.3ad).
                                 stream
                                     .receive_memory
                                     .map(0, u64::from(RECEIVE_BYTES), map::READ)
@@ -371,6 +373,8 @@ impl Network {
                 let stream = self.streams.get_mut(&socket).expect("a socket's stream");
                 let count = stream.staged.len().min(SEND_BYTES as usize);
                 let bytes: Vec<u8> = stream.staged.iter().take(count).copied().collect();
+                // Lent only after the copy, and read-only: no other party writes it meanwhile,
+                // so the copy is a bulk one (`Mapping::write`, 6.3ad).
                 stream
                     .send_memory
                     .map(0, u64::from(SEND_BYTES), map::WRITE)

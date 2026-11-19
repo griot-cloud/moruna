@@ -58,7 +58,8 @@ pub struct Counts {
     pub sealed_bytes: u64,
     pub seal_ns: u64,
     /// Bytes copied into the clients' loans, the receives answered with them, the receives
-    /// tried (a pending one is tried at each poll), and the time of the tries.
+    /// tried (each once it can be answered, work item 6.3ad), and the time of the tries and of
+    /// each receive's one mapping of its loan, made as it comes.
     pub to_clients_bytes: u64,
     pub receives: u64,
     pub receive_tries: u64,

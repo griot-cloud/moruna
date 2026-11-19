@@ -221,7 +221,9 @@ struct StreamLoan {
     max: u32,
 }
 impl StreamLoan {
-    fn mapping(&self, writable: bool) -> Result<(moruna_svc::Mapping<'_>, usize), net::Error> {
+    /// The whole pages covering the loan's range: the first's offset in the memory, their
+    /// length, and where the range starts within them.
+    fn pages(&self) -> Result<(u64, u64, usize), net::Error> {
         let base = self.offset / 4096 * 4096;
         let within = (self.offset - base) as usize;
         let length = (within as u64)
@@ -230,19 +232,42 @@ impl StreamLoan {
             .ok_or(net::Error::BadArgument)?
             / 4096
             * 4096;
+        Ok((base, length, within))
+    }
+
+    /// A send's loan mapped readable, for one try.
+    fn mapping(&self) -> Result<(moruna_svc::Mapping<'_>, usize), net::Error> {
+        let (base, length, within) = self.pages()?;
         self.memory
-            .map(
-                base,
-                length,
-                if writable {
-                    moruna_svc::map::WRITE
-                } else {
-                    moruna_svc::map::READ
-                },
-            )
+            .map(base, length, moruna_svc::map::READ)
             .map(|mapping| (mapping, within))
             .map_err(|_| net::Error::BadArgument)
     }
+
+    /// A receive's loan mapped writable, once, before any byte is taken for it.
+    fn destination(self) -> Result<Destination, net::Error> {
+        let (base, length, within) = self.pages()?;
+        let mapping = self
+            .memory
+            .map_detached(base, length, moruna_svc::map::WRITE)
+            .map_err(|_| net::Error::BadArgument)?;
+        Ok(Destination {
+            mapping,
+            within,
+            max: self.max,
+            _loan: self.memory,
+        })
+    }
+}
+
+/// A receive's loan, mapped writable from the receive's arrival to its answer, close or
+/// cancel (work item 6.3ad): each try copies into the mapping, and none maps or unmaps it.
+/// The mapping goes before the loan's handle.
+struct Destination {
+    mapping: moruna_svc::Mapping<'static>,
+    within: usize,
+    max: u32,
+    _loan: moruna_svc::Memory,
 }
 
 struct Tcp {
@@ -259,7 +284,7 @@ struct Tcp {
     remote: Endpoint,
     /// A connect waiting to be established, and when it gives up.
     opening: Option<(Pending, u64)>,
-    receive: Option<(Pending, StreamLoan)>,
+    receive: Option<(Pending, Destination)>,
     send: Option<(Pending, StreamLoan)>,
     shut: bool,
     established: bool,
@@ -2046,7 +2071,7 @@ impl Stack {
             offset,
             max: length,
         };
-        if source.mapping(false).is_err() {
+        if source.mapping().is_err() {
             return fail(net::Error::BadArgument);
         }
         let Stack {
@@ -2106,19 +2131,24 @@ impl Stack {
         if max == 0 || max as usize > RECEIVE_MAX {
             return fail(net::Error::BadArgument);
         }
-        let destination = StreamLoan {
+        // The loan's one mapping is part of the copies' time, as each try's was (6.3ab).
+        let start = meter.now();
+        let destination = (StreamLoan {
             memory,
             offset,
             max,
+        })
+        .destination();
+        meter.counts.to_clients_ns += meter.since(start);
+        let destination = match destination {
+            Ok(destination) => destination,
+            Err(error) => return fail(error),
         };
-        if destination.mapping(true).is_err() {
-            return fail(net::Error::BadArgument);
-        }
         if t.receive.is_some() {
             return fail(net::Error::InUse);
         }
         let s = ifaces[t.iface].set.get_mut::<tcp::Socket>(t.handle);
-        match try_receive_into(t, s, &destination, meter) {
+        match receive_when_ready(t, s, &destination, meter) {
             Some(Ok(b)) => Outcome::reply(b),
             Some(Err(e)) => fail(e),
             None => {
@@ -2766,7 +2796,7 @@ impl Stack {
                                 continue;
                             }
                             if let Some((p, destination)) = t.receive.take() {
-                                match try_receive_into(t, s, &destination, meter) {
+                                match receive_when_ready(t, s, &destination, meter) {
                                     Some(Ok(b)) => ready.push((p, Outcome::reply(b))),
                                     Some(Err(e)) => ready.push((p, fail(e))),
                                     None => t.receive = Some((p, destination)),
@@ -3097,7 +3127,10 @@ fn send_from_loan(
     if t.shut {
         return Some(Err(net::Error::NotConnected));
     }
-    let (mapping, within) = match source.mapping(false) {
+    // The loan is the server's while it holds the send: the client does not touch it between
+    // handing it over and its answer (SDD 31, caller-owned loans), so each copy out of it is a
+    // bulk one (`Mapping::read`, work item 6.3ad).
+    let (mapping, within) = match source.mapping() {
         Ok(mapping) => mapping,
         Err(error) => return Some(Err(error)),
     };
@@ -3134,13 +3167,35 @@ fn send_from_loan(
     )
 }
 
-/// [`receive_into_loan`], timed and counted (work item 6.3ab): every try, a pending receive's
-/// at each poll among them, with its mapping of the client's loan, and the bytes copied into
-/// it.
+/// A receive tried only when it can be answered now (work item 6.3ad): [`try_receive_into`]
+/// once its socket has bytes or its end; `None`, untried, while it must wait.
+fn receive_when_ready(
+    t: &mut Tcp,
+    s: &mut tcp::Socket<'static>,
+    destination: &Destination,
+    meter: &mut Meter,
+) -> Option<Result<u32, net::Error>> {
+    if !receive_ready(t, s) {
+        return None;
+    }
+    try_receive_into(t, s, destination, meter)
+}
+
+/// Whether [`receive_into_loan`] answers a receive now: TLS has plaintext, its end or a
+/// failure; a socket that must be TLS is not; TCP has bytes, or will have no more.
+fn receive_ready(t: &Tcp, s: &tcp::Socket<'static>) -> bool {
+    match &t.tls {
+        Some(tls) => tls.receivable(),
+        None => t.tls_required || s.can_recv() || !s.may_recv(),
+    }
+}
+
+/// [`receive_into_loan`], timed and counted (work item 6.3ab): every try, and the bytes copied
+/// into the client's loan.
 fn try_receive_into(
     t: &mut Tcp,
     s: &mut tcp::Socket<'static>,
-    destination: &StreamLoan,
+    destination: &Destination,
     meter: &mut Meter,
 ) -> Option<Result<u32, net::Error>> {
     let start = meter.now();
@@ -3161,13 +3216,13 @@ fn try_receive_into(
 fn receive_into_loan(
     t: &mut Tcp,
     s: &mut tcp::Socket<'static>,
-    destination: &StreamLoan,
+    destination: &Destination,
 ) -> Option<Result<u32, net::Error>> {
-    // Map the owned capability before consuming any TCP or TLS plaintext.
-    let (mapping, within) = match destination.mapping(true) {
-        Ok(m) => m,
-        Err(e) => return Some(Err(e)),
-    };
+    // The loan was mapped as the receive came, before any TCP or TLS plaintext was taken for
+    // it. It is the server's until the answer: the client does not touch it between handing it
+    // over and the answer (SDD 31, caller-owned loans), so each copy into it is a bulk one
+    // (`Mapping::write`, work item 6.3ad).
+    let (mapping, within) = (&destination.mapping, destination.within);
     if let Some(tls) = &mut t.tls {
         // rustls' bounded server-charged plaintext staging is not a wire reply.
         return tls
