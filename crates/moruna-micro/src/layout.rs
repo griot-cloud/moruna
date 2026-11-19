@@ -90,17 +90,6 @@ pub fn plane_for(piece: u64) -> (u64, u64) {
     (budget, s.region + 2 * s.windows * s.window)
 }
 
-/// The account a measured task is carved at (system design 3A): `account` bytes, what the
-/// node's readings of the function say one of its processes holds at its piece, in whole pages,
-/// and never more than half of what is left in the engine's account (`room`), as
-/// [`task_limit`] keeps it. The least [`TASK_MIN`] is not applied: it is where a function with
-/// no measurement starts, and a measured function gets its measured need (PM, 2026-11-18).
-/// `None` when not a page is left.
-pub fn measured_task_limit(account: u64, room: u64) -> Option<u64> {
-    let limit = account.next_multiple_of(PAGE).min(room / 2) & !(PAGE - 1);
-    (limit >= PAGE).then_some(limit)
-}
-
 /// A function's measured line as the run carried it (system design 3A): what a stage's warm-up
 /// keeps the slope of when a registration measured it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -127,17 +116,6 @@ pub struct Line {
 /// records (PM, 2026-11-18).
 pub fn room_for_next(outstanding: u64, sizes: &RingSizes) -> bool {
     outstanding.saturating_add(1).saturating_mul(sizes.piece) <= sizes.region
-}
-
-/// The account a task that passed its room is started again with (system design 3A; PM,
-/// 2026-11-18): the larger of twice the one it had and what its refusal says it needed, its
-/// account's peak and the largest charge refused, widened by the measurement's `margin`, so one
-/// restart reaches the need the refusal named; as far as the engine's `room` allows a task's
-/// account beside the engine's own half ([`measured_task_limit`]). `None` when that is no
-/// larger, and the stage then fails as it did.
-pub fn restarted_limit(limit: u64, needed: u64, margin: f64, room: u64) -> Option<u64> {
-    let needed = ((needed as f64) * (1.0 + margin.max(0.0))).ceil() as u64;
-    measured_task_limit(limit.saturating_mul(2).max(needed), room).filter(|&grown| grown > limit)
 }
 
 /// The pieces a stage's first task warms up on, the smallest first (system design 3A; PM,
@@ -1276,39 +1254,6 @@ mod tests {
     }
 
     #[test]
-    fn a_task_that_passed_its_room_is_started_again_with_twice_it_or_its_need() {
-        const MIB: u64 = 1 << 20;
-        // A refusal that names less than twice the account: twice it.
-        assert_eq!(
-            restarted_limit(16 * MIB, 20 * MIB, 0.0, 1024 * MIB),
-            Some(32 * MIB)
-        );
-        // gate-grows on the booted check (6.3g turn 2): an account of 9347072 bytes, its peak
-        // 2561184 and a charge of 42107136 refused. Doubling took three restarts, to 74776576
-        // bytes; the need the refusal names takes one, to enough for it.
-        let (limit, peak, refused) = (9_347_072, 2_561_184, 42_107_136);
-        let grown = restarted_limit(limit, peak + refused, 0.02, 1024 * MIB).expect("grown");
-        assert!(grown >= peak + refused && grown > 2 * limit, "{grown}");
-        assert_eq!(grown % PAGE, 0, "in whole pages");
-        assert!(
-            grown < 2 * (peak + refused),
-            "not past what the margin asks"
-        );
-        // As far as half the engine's room.
-        assert_eq!(
-            restarted_limit(300 * MIB, 0, 0.0, 1024 * MIB),
-            Some(512 * MIB)
-        );
-        assert_eq!(
-            restarted_limit(limit, peak + refused, 0.0, 64 * MIB),
-            Some(32 * MIB)
-        );
-        // No larger: none, and the stage fails as it did.
-        assert_eq!(restarted_limit(512 * MIB, 600 * MIB, 0.0, 1024 * MIB), None);
-        assert_eq!(restarted_limit(16 * MIB, 0, 0.0, 0), None);
-    }
-
-    #[test]
     fn a_line_s_account_is_its_need_at_a_piece_in_whole_pages() {
         const MIB: u64 = 1 << 20;
         assert!(
@@ -1392,11 +1337,6 @@ mod tests {
         assert_eq!(plane_for(u64::MAX), plane_for(PIECE_MAX));
         // Pieces of 16 MiB: 208 MiB of plane, as a share of 832 MiB makes.
         assert_eq!(plane_for(PIECE_MAX).1, NATIVE_CHILD_MAX / 4);
-        // The account in whole pages, under half the room, and no least.
-        assert_eq!(measured_task_limit(4_758_480, 1 << 30), Some(4_759_552));
-        assert_eq!(measured_task_limit(64 << 20, 64 << 20), Some(32 << 20));
-        assert_eq!(measured_task_limit(1, 1 << 30), Some(PAGE));
-        assert_eq!(measured_task_limit(1 << 20, PAGE), None);
     }
 
     #[test]

@@ -11,6 +11,9 @@
 //! - `--garbage` writes bytes that are no Arrow stream;
 //! - `--exit 3` does its work and then exits with status 3 where it should have ended the stream;
 //! - `--sleep-ms 50` takes 50 milliseconds over each batch, as a function that computes does;
+//! - `--first-batch-mib 32` holds 32 MiB more over the first batch it reads than over the others,
+//!   as a function whose working set its first batch sets does (a model it loads, a cache it
+//!   fills): a process started again holds it again over the first batch it is given;
 //! - `--report` says on standard error who and where it is (its user, its process id, its
 //!   environment, the entries of `/` and of `/proc`) and exits with status 9.
 
@@ -102,6 +105,16 @@ fn main() {
         }
     });
 
+    let first_batch = args
+        .iter()
+        .position(|a| a == "--first-batch-mib")
+        .map(
+            |at| match args.get(at + 1).and_then(|mib| mib.parse::<usize>().ok()) {
+                Some(mib) => mib << 20,
+                None => die("--first-batch-mib", "it takes mebibytes"),
+            },
+        );
+
     let mut stdin = std::io::BufReader::new(std::io::stdin().lock());
     match stdin.fill_buf() {
         // No byte at all: no batch, nothing to write.
@@ -118,8 +131,15 @@ fn main() {
     let mut output = StreamWriter::try_new(std::io::stdout().lock(), &out_schema)
         .unwrap_or_else(|e| die("writing the output schema", e));
     let _ = output.get_mut().flush();
+    let mut first = true;
     for batch in input.by_ref() {
         let batch = batch.unwrap_or_else(|e| die("reading a batch", e));
+        // Every page written, so the cgroup counts them all, and held while the batch is.
+        let held: Vec<u8> = match first_batch {
+            Some(bytes) if first => std::hint::black_box(vec![1u8; bytes]),
+            _ => Vec::new(),
+        };
+        first = false;
         let rows = batch.num_rows() as i64;
         let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
         columns.push(Arc::new(Int64Array::from_iter_values(0..rows)));
@@ -135,6 +155,7 @@ fn main() {
             .get_mut()
             .flush()
             .unwrap_or_else(|e| die("flushing a batch", e));
+        drop(std::hint::black_box(held));
     }
     // Standard input ended: that is the end of the stream (SDD 19 f.6).
     drop(input);

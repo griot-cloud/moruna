@@ -9,13 +9,18 @@
 //!   worker. Each instance is funded with an equal share of the stage's ceiling, at least
 //!   [`LEAST`], and the stage starts as many as that funds ([`funded`]).
 //! - **One cgroup for the stage** carries the stage's ceiling (`memory.max`) and the run's CPU
-//!   quota (`cpu.max`), with one cgroup for each instance under it, whose `memory.max` is the
-//!   instance's share ([`Stage`]).
+//!   quota (`cpu.max`), with one cgroup for each instance under it ([`Stage`]). An instance is
+//!   carved as the node carves its task (item 6.3v, [`Carve`]): a measured stage's at its
+//!   line's account at the stage's measured piece, under half of what the other instances'
+//!   limits leave of the ceiling; an unmeasured stage's at the equal share; one its cgroup
+//!   killed, at the account it grew to. Their limits never sum past the ceiling as they are
+//!   carved.
 //! - **What the stage holds** outside the engine's process is the sum over its instances
 //!   ([`Stage::memory_current`]), and limits that moved are written to the stage and to every
-//!   instance ([`Stage::write_limits`]).
-//! - **What one instance takes** is what its share holds (system design 3A): by its function's
-//!   measured line, or for an unmeasured one its share over its factor. The controller holds
+//!   instance carved by the share ([`Stage::write_limits`]); an account of an instance's own
+//!   stays.
+//! - **What one instance takes** (system design 3A): a measured stage's measured piece, or for
+//!   an unmeasured one what its share holds, its share over its factor. The controller holds
 //!   the stage's morsels to it, and a larger batch is cut into slices of its rows ([`cut`]),
 //!   whose answers are joined in order.
 //! - **What the instances did** is the run report's ([`Busy`]): how many held a batch at once,
@@ -113,11 +118,38 @@ struct Limits {
     share: u64,
 }
 
+/// How an instance's `memory.max` is carved as it enters its stage (system design 3A, 3E; PM,
+/// 2026-11-19, 6.3v: a Linux instance is carved as the node carves its task).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Carve {
+    /// A stage with no measurement: 6.3f's equal share of the stage's ceiling, which follows
+    /// the ceiling and the count as they are written; never more than the other instances'
+    /// limits leave of the ceiling.
+    Share,
+    /// A measured stage's instance, at the line's account at the stage's measured piece:
+    /// `instances::measured_task_limit(account, room)`, the room the stage's ceiling less the
+    /// other instances' limits. Its own from then on.
+    Measured(u64),
+    /// An instance its cgroup killed, started again at the account it grew to
+    /// (`instances::restarted_limit`, from what the others leave). Its own from then on.
+    Grown(u64),
+}
+
+/// A live instance of the stage: its cgroup, and its `memory.max` as last written.
+struct Held {
+    id: u64,
+    cgroup: Arc<StageCgroup>,
+    limit: u64,
+    /// Carved at an account of its own (measured, or grown by a restart), which the stage's
+    /// share does not move.
+    own: bool,
+}
+
 /// One stage's cgroups: the stage's own, which carries its ceiling, and each live instance's
 /// under it. The stage's is removed when the last of them is.
 pub(super) struct Stage {
     /// Declared before `cgroup`, so an instance's cgroup still listed goes before the stage's.
-    instances: Mutex<Vec<(u64, Arc<StageCgroup>)>>,
+    instances: Mutex<Vec<Held>>,
     cgroup: StageCgroup,
     /// The instances the ceiling is shared among.
     count: AtomicUsize,
@@ -167,20 +199,65 @@ impl Stage {
         lock(&self.limits).ceiling
     }
 
-    /// The place of instance `instance`: its cgroup, made under the stage's with the share as
-    /// its `memory.max`.
-    pub(super) fn enter(self: &Arc<Self>, instance: usize) -> io::Result<Place> {
+    /// The place of instance `instance`: its cgroup, made under the stage's with the
+    /// `memory.max` its `carve` gives it out of what the other instances' limits leave of the
+    /// ceiling, so their limits never sum past it. Refused, in words, when that leaves not a
+    /// page.
+    pub(super) fn enter(self: &Arc<Self>, instance: usize, carve: Carve) -> io::Result<Place> {
         // The limits are held, so a share written meanwhile reaches this instance too.
         let limits = lock(&self.limits);
+        let room = self.room_beside(&limits, None);
+        let (limit, own) = match carve {
+            Carve::Share => (Some(limits.share.min(room)), false),
+            Carve::Measured(account) => (instances::measured_task_limit(account, room), true),
+            Carve::Grown(account) => (Some(account), true),
+        };
+        let limit = limit.filter(|&limit| limit >= PAGE).ok_or_else(|| {
+            io::Error::other(format!(
+                "the stage's ceiling of {} bytes leaves {room} beside its other instances' \
+                 limits, too few for instance {instance}",
+                limits.ceiling
+            ))
+        })?;
         let id = self.started.fetch_add(1, Ordering::Relaxed);
         let name = format!("instance-{instance}-{id}");
-        let cgroup = Arc::new(self.cgroup.child(&name, limits.share)?);
-        lock(&self.instances).push((id, Arc::clone(&cgroup)));
+        let cgroup = Arc::new(self.cgroup.child(&name, limit)?);
+        lock(&self.instances).push(Held {
+            id,
+            cgroup: Arc::clone(&cgroup),
+            limit,
+            own,
+        });
         Ok(Place {
             id,
             cgroup,
             stage: Arc::clone(self),
         })
+    }
+
+    /// What the stage's ceiling as last written leaves beside the limits of its live
+    /// instances other than the one numbered `except` (system design 3A: the room an instance
+    /// is carved from, or that a restart grows it in, with its own limit returned).
+    fn room_beside(&self, limits: &Limits, except: Option<u64>) -> u64 {
+        let others = lock(&self.instances)
+            .iter()
+            .filter(|held| Some(held.id) != except)
+            .fold(0u64, |sum, held| sum.saturating_add(held.limit));
+        limits.ceiling.saturating_sub(others)
+    }
+
+    /// What the stage's ceiling leaves an instance numbered `id` beside the others' limits,
+    /// its own returned.
+    fn room_for(&self, id: u64) -> u64 {
+        self.room_beside(&lock(&self.limits), Some(id))
+    }
+
+    /// The `memory.max` of the instance numbered `id` as last written; `None` when it is gone.
+    fn limit_of(&self, id: u64) -> Option<u64> {
+        lock(&self.instances)
+            .iter()
+            .find(|held| held.id == id)
+            .map(|held| held.limit)
     }
 
     /// The instance numbered `id` is gone: its cgroup is no longer the stage's to read or
@@ -189,7 +266,7 @@ impl Stage {
         let mut held = lock(&self.instances);
         let gone = held
             .iter()
-            .position(|(i, _)| *i == id)
+            .position(|held| held.id == id)
             .map(|at| held.swap_remove(at));
         drop(held);
         // Outside the lock: removing a cgroup waits for its processes to be gone.
@@ -199,29 +276,39 @@ impl Stage {
     /// What the stage's instances hold now, summed (SDD 19 IM-I7); zero with none.
     pub(super) fn memory_current(&self) -> io::Result<u64> {
         let mut sum = 0u64;
-        for (_, cgroup) in lock(&self.instances).iter() {
-            sum = sum.saturating_add(cgroup.memory_current()?);
+        for held in lock(&self.instances).iter() {
+            sum = sum.saturating_add(held.cgroup.memory_current()?);
         }
         Ok(sum)
     }
 
+    /// Every live instance carved by the share has `share` as its `memory.max`; one carved at an
+    /// account of its own keeps it, as a task's account on the Moruna kernel does.
+    fn write_shares(&self, share: u64) -> io::Result<()> {
+        for held in lock(&self.instances).iter_mut().filter(|held| !held.own) {
+            held.cgroup.set_memory_max(share)?;
+            held.limit = share;
+        }
+        Ok(())
+    }
+
     /// The stage's ceiling is shared among `count` instances from now on (system design 3A: the
-    /// count a warm-up's measurement funds), at least one: every live instance's `memory.max`
-    /// is its new share, and an instance started later is given it. The share.
+    /// count a warm-up's measurement funds), at least one: every live instance carved by the
+    /// share has its new share as its `memory.max`, and an instance started later by the share
+    /// is given it. The share.
     pub(super) fn recount(&self, count: usize) -> io::Result<u64> {
         let mut limits = lock(&self.limits);
         let count = count.max(1);
         let share = share(limits.ceiling, count);
-        for (_, cgroup) in lock(&self.instances).iter() {
-            cgroup.set_memory_max(share)?;
-        }
+        self.write_shares(share)?;
         self.count.store(count, Ordering::Relaxed);
         limits.share = share;
         Ok(share)
     }
 
-    /// The stage's `memory.max` and `cpu.max`, and every instance's share of the ceiling as
-    /// its `memory.max`, written when either moved since they were last written. The share.
+    /// The stage's `memory.max` and `cpu.max`, and the share of the ceiling as the `memory.max`
+    /// of every instance carved by it, written when either moved since they were last written.
+    /// The share.
     pub(super) fn write_limits(&self, ceiling: u64, cores: f64) -> io::Result<u64> {
         let mut limits = lock(&self.limits);
         if limits.ceiling == ceiling && limits.cores == cores.to_bits() {
@@ -230,9 +317,7 @@ impl Stage {
         let share = share(ceiling, self.count.load(Ordering::Relaxed));
         self.cgroup.set_memory_max(ceiling)?;
         self.cgroup.set_cpu_max(cores)?;
-        for (_, cgroup) in lock(&self.instances).iter() {
-            cgroup.set_memory_max(share)?;
-        }
+        self.write_shares(share)?;
         *limits = Limits {
             ceiling,
             cores: cores.to_bits(),
@@ -256,6 +341,19 @@ impl Place {
     /// The instance's cgroup, which its process joins.
     pub(super) fn cgroup(&self) -> &Arc<StageCgroup> {
         &self.cgroup
+    }
+
+    /// The instance's `memory.max`, as last written.
+    pub(super) fn limit(&self) -> u64 {
+        self.stage
+            .limit_of(self.id)
+            .unwrap_or_else(|| self.stage.share())
+    }
+
+    /// What the stage's ceiling leaves this instance beside the others' limits, its own
+    /// returned.
+    pub(super) fn room(&self) -> u64 {
+        self.stage.room_for(self.id)
     }
 
     /// The stage.
@@ -395,7 +493,7 @@ mod tests {
         let dir = parent("recount");
         let stage = Arc::new(Stage::create(&dir, "stage", 1 << 30, 4.0, 4).unwrap());
         enabled(&stage);
-        let first = stage.enter(0).unwrap();
+        let first = stage.enter(0, Carve::Share).unwrap();
         assert_eq!(
             read(first.cgroup().dir(), "memory.max"),
             (256 * MIB).to_string()
@@ -406,7 +504,7 @@ mod tests {
             read(first.cgroup().dir(), "memory.max"),
             (512 * MIB).to_string()
         );
-        let second = stage.enter(1).unwrap();
+        let second = stage.enter(1, Carve::Share).unwrap();
         assert_eq!(
             read(second.cgroup().dir(), "memory.max"),
             (512 * MIB).to_string()
@@ -507,7 +605,7 @@ mod tests {
 
         let mut places = Vec::new();
         for instance in 0..4 {
-            let place = stage.enter(instance).unwrap();
+            let place = stage.enter(instance, Carve::Share).unwrap();
             assert_eq!(place.id, instance as u64);
             let at = place.cgroup().dir();
             assert_eq!(
@@ -554,7 +652,7 @@ mod tests {
         gone(places.remove(2));
         assert!(!third.exists());
         assert_eq!(stage.memory_current().unwrap(), 7 * MIB);
-        let again = stage.enter(2).unwrap();
+        let again = stage.enter(2, Carve::Share).unwrap();
         assert_eq!(again.id, 4);
         assert_eq!(again.cgroup().dir(), stage.dir().join("instance-2-4"));
         assert_eq!(
@@ -578,6 +676,76 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Item 6.3v (PM, 2026-11-19): an instance is carved as the node carves its task. A measured
+    /// one at its account, in whole pages, under half of what the others' limits leave of the
+    /// ceiling; one started again at the account it grew to; one by the share at the share, never
+    /// past what the others leave. The share's writes pass over the accounts, which are the
+    /// instances' own, and a carve that leaves not a page is refused in words.
+    #[test]
+    fn an_instance_is_carved_as_the_node_carves_its_task() {
+        let dir = parent("carve");
+        let stage = Arc::new(Stage::create(&dir, "stage", 1 << 30, 4.0, 4).unwrap());
+        enabled(&stage);
+        let first = stage.enter(0, Carve::Share).unwrap();
+        assert_eq!(first.limit(), 256 * MIB);
+        // Measured: its account in whole pages.
+        let second = stage.enter(1, Carve::Measured(100 * MIB + 1)).unwrap();
+        assert_eq!(second.limit(), 100 * MIB + PAGE);
+        assert_eq!(
+            read(second.cgroup().dir(), "memory.max"),
+            (100 * MIB + PAGE).to_string()
+        );
+        // Under half of what the others leave: 1024 - 256 - 100 MiB and a page, halved.
+        let third = stage.enter(2, Carve::Measured(600 * MIB)).unwrap();
+        assert_eq!(third.limit(), 334 * MIB - PAGE);
+        // An instance's room is the ceiling less the others' limits, its own returned.
+        assert_eq!(second.room(), 1024 * MIB - 256 * MIB - (334 * MIB - PAGE));
+        assert_eq!(first.room(), 1024 * MIB - 434 * MIB);
+        // Started again: at the account it grew to, as given.
+        let fourth = stage.enter(3, Carve::Grown(64 * MIB)).unwrap();
+        assert_eq!(fourth.limit(), 64 * MIB);
+        assert_eq!(
+            read(fourth.cgroup().dir(), "memory.max"),
+            (64 * MIB).to_string()
+        );
+        // The ceiling moved, and the count: only the share's instance follows.
+        assert_eq!(stage.write_limits(1 << 29, 4.0).unwrap(), 128 * MIB);
+        assert_eq!(first.limit(), 128 * MIB);
+        assert_eq!(stage.recount(2).unwrap(), 256 * MIB);
+        assert_eq!(
+            read(first.cgroup().dir(), "memory.max"),
+            (256 * MIB).to_string()
+        );
+        for (place, limit) in [
+            (&second, 100 * MIB + PAGE),
+            (&third, 334 * MIB - PAGE),
+            (&fourth, 64 * MIB),
+        ] {
+            assert_eq!(place.limit(), limit);
+            assert_eq!(read(place.cgroup().dir(), "memory.max"), limit.to_string());
+        }
+        // The instances hold more than the ceiling now leaves: nothing more is carved, by any
+        // rule, and the share's instance has what the others leave it.
+        assert_eq!(first.room(), 512 * MIB - 498 * MIB);
+        for carve in [Carve::Measured(MIB), Carve::Share] {
+            let refused = stage.enter(4, carve).err().expect("refused").to_string();
+            assert!(
+                refused.contains(
+                    "leaves 0 beside its other instances' limits, too few for \
+                                  instance 4"
+                ),
+                "{refused}"
+            );
+        }
+        // An instance gone returns its limit to the room.
+        gone(fourth);
+        gone(third);
+        assert_eq!(first.room(), 512 * MIB - (100 * MIB + PAGE));
+        gone(second);
+        gone(first);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_stage_of_one_gives_it_the_whole_ceiling() {
         let dir = parent("one");
@@ -585,7 +753,7 @@ mod tests {
         enabled(&stage);
         assert_eq!(count(&stage), 1);
         let stage = Arc::new(stage);
-        let place = stage.enter(0).unwrap();
+        let place = stage.enter(0, Carve::Share).unwrap();
         let at = place.cgroup().dir();
         assert_eq!(read(at, "memory.max"), (100 * MIB + 5).to_string());
         assert_eq!(read(stage.dir(), "cpu.max"), "max 100000");
@@ -606,7 +774,11 @@ mod tests {
         // fixture's file still says `+memory +cpu`, which names none) is refused.
         let dir = parent("unenabled");
         let stage = Arc::new(Stage::create(&dir, "stage", 1 << 30, 1.0, 2).unwrap());
-        let refused = stage.enter(0).err().expect("refused").to_string();
+        let refused = stage
+            .enter(0, Carve::Share)
+            .err()
+            .expect("refused")
+            .to_string();
         assert!(refused.contains("`memory` controller"), "{refused}");
         assert_eq!(stage.memory_current().unwrap(), 0, "nothing was listed");
         let _ = fs::remove_dir_all(&dir);

@@ -977,7 +977,7 @@ fn im_t34_a_stage_s_cgroup_holds_one_for_each_instance() {
     k.bind_run(sampler(GIB / 4, GIB / 2, 1.0), GIB / 2);
     assert_eq!(echo(&k, states[2].as_mut(), 7), 7);
     let left: u64 = cgroup_file(&stage, "memory.max").parse().unwrap();
-    assert!(left >= GIB / 4 && left < GIB / 2, "{left}");
+    assert!((GIB / 4..GIB / 2).contains(&left), "{left}");
     for dir in &dirs {
         // An equal share, in whole pages of this machine's.
         let share: u64 = cgroup_file(dir, "memory.max").parse().unwrap();
@@ -1082,23 +1082,23 @@ fn im_t35_memory_bounds_an_image_s_instances() {
     assert_eq!(instances_said(&k.note()), (1, 1, vec![1]));
 }
 
-/// IM-T36 a_batch_past_an_instance_s_cap_goes_in_slices (system design 3A, item 6.3f): an
-/// instance takes at most what its cgroup's share holds by its function's measured line, which
-/// the kernel says to the controller; a batch past that is cut into slices of its rows, each
-/// given to the process and answered in turn, and the answers are joined in order into one
-/// batch: every row once. A batch that fits goes whole.
+/// IM-T36 a_batch_past_an_instance_s_cap_goes_in_slices (system design 3A, items 6.3f and
+/// 6.3v): an instance of a measured stage takes at most the stage's measured piece, at which its
+/// cgroup was carved by its function's line, which the kernel says to the controller; a batch
+/// past that is cut into slices of its rows, each given to the process and answered in turn,
+/// and the answers are joined in order into one batch: every row once. A batch that fits goes
+/// whole.
 #[test]
 #[ignore = "Linux, sandbox host: root, and MORUNA_SANDBOX_CGROUP"]
 fn im_t36_a_batch_past_an_instance_s_cap_goes_in_slices() {
     use moruna_kernel::Kernel;
-    const MIB: u64 = 1 << 20;
     const ROWS_IN: i64 = 100_000;
     let scratch = Scratch::new("im_t36");
     let layout = layout(&scratch);
     let image = unpacked(&scratch, &layout);
     let k = echo_kernel(&image, 4);
-    // A function measured to hold a KiB beside each byte of its batch: an instance's quarter of
-    // a gibibyte holds 256 KiB of input.
+    // A function measured to hold a KiB beside each byte of its batch, in a run whose largest
+    // morsel is 256 KiB: an account of a quarter of a gibibyte at that piece.
     let line = moruna_cost::Memory {
         fixed_bytes: 0.0,
         per_input_byte: 1024.0,
@@ -1108,12 +1108,12 @@ fn im_t36_a_batch_past_an_instance_s_cap_goes_in_slices() {
         input_bytes_min: 4096,
         input_bytes_max: 65536,
     };
-    k.bind_room(1 << 44, 512 * MIB, 4 * MIB, 4.0, Some(line));
+    k.bind_room(1 << 44, 256 << 10, 4 << 10, 4.0, Some(line));
     k.bind_run(sampler(0, GIB, 4.0), GIB);
     assert_eq!(
         k.instances(),
         4,
-        "the line at the least morsel funds all four"
+        "the line at the largest piece funds all four"
     );
     assert_eq!(k.morsel_bytes_max(), Some(256 << 10));
     let mut state = k.init(&init_ctx(0)).unwrap_or_else(|e| panic!("{e}"));
@@ -1166,9 +1166,303 @@ fn im_t36_a_batch_past_an_instance_s_cap_goes_in_slices() {
     );
     assert!(
         note.contains(
-            "measured: batches of at most 262144 bytes, what an instance's share of 268435456 \
-             bytes holds"
+            "measured: batches of at most 262144 bytes, the stage's measured piece; each \
+             instance's cgroup carved at its function's line there, an account of 268435456 bytes"
         ),
         "{note}"
+    );
+}
+
+/// The kernel of the fixture's `arrow_echo` holding `mib` MiB more over its first batch
+/// (`--first-batch-mib`), in a job of `cpus` CPUs.
+fn holding_kernel(
+    image: &moruna_image::Image,
+    cpus: usize,
+    mib: u64,
+) -> moruna_sandbox::ImageKernel {
+    moruna_sandbox::ImageKernel::new(
+        "echo",
+        image,
+        Some(vec![
+            "/bin/arrow_echo".into(),
+            "--first-batch-mib".into(),
+            mib.to_string(),
+        ]),
+        &Default::default(),
+        cgroup(),
+        false,
+        cpus,
+    )
+    .expect("the kernel")
+}
+
+/// A function measured to hold `fixed` bytes whatever its batch and `per_byte` a byte of it,
+/// with no spread, over 32 units of 1 to 16 MiB: enough that a stage does not warm up on it.
+fn measured_line(fixed: u64, per_byte: f64) -> moruna_cost::Memory {
+    moruna_cost::Memory {
+        fixed_bytes: fixed as f64,
+        per_input_byte: per_byte,
+        output_per_input_byte: None,
+        spread: 0.0,
+        units: 32,
+        input_bytes_min: 1 << 20,
+        input_bytes_max: 16 << 20,
+    }
+}
+
+/// The restarts a stage's note says, each `(task, the account it passed, the account it was
+/// started again with)`.
+fn restarts_said(note: &str) -> Vec<(usize, u64, u64)> {
+    note.split("; ")
+        .filter_map(|part| {
+            let rest = part.strip_prefix("task ")?;
+            let (task, rest) = rest.split_once(" passed its account of ")?;
+            let (passed, rest) =
+                rest.split_once(" bytes (killed by its memory limit, its peak ")?;
+            let (_, rest) = rest.split_once(" bytes): started again with an account of ")?;
+            let (grown, rest) = rest.split_once(" bytes, its ")?;
+            assert_eq!(rest, "1 unanswered pieces posted again", "{part}");
+            Some((
+                task.parse().ok()?,
+                passed.parse().ok()?,
+                grown.parse().ok()?,
+            ))
+        })
+        .collect()
+}
+
+/// IM-T37 an_instance_its_cgroup_kills_starts_again_at_a_larger_account (system design 3A, item
+/// 6.3v): a measured stage's instances are carved at its line's account at its measured piece,
+/// as the node carves its tasks. An instance whose first batch holds more than that is killed
+/// by its cgroup and started again by the node's rule, at the larger of twice its account and
+/// its cgroup's peak, under half of what the other instances leave of the stage's ceiling; it is
+/// given the batch again and every row comes back. The grown account is the instance's from then
+/// on, the others keep theirs, and a second kill follows the same rule from the grown one. An
+/// instance whose stage leaves it no room to grow fails, as before, in the cgroup's words.
+#[test]
+#[ignore = "Linux, sandbox host: root, and MORUNA_SANDBOX_CGROUP"]
+fn im_t37_an_instance_its_cgroup_kills_starts_again_at_a_larger_account() {
+    use moruna_kernel::Kernel;
+    const MIB: u64 = 1 << 20;
+    let scratch = Scratch::new("im_t37");
+    let layout = layout(&scratch);
+    let image = unpacked(&scratch, &layout);
+    // Measured to hold 8 MiB and a byte a byte: at pieces of 16 MiB, accounts of 24 MiB, and
+    // the run's 96 MiB for the stage funds all four there, in a stage's ceiling of 256 MiB.
+    let line = measured_line(8 * MIB, 1.0);
+    let measured = |hold: u64| {
+        let k = holding_kernel(&image, 4, hold);
+        k.bind_room(4 * 24 * MIB, 16 * MIB, 4 * MIB, 4.0, Some(line.clone()));
+        k.bind_run(sampler(0, 256 * MIB, 4.0), 256 * MIB);
+        assert_eq!(k.instances(), 4);
+        k
+    };
+
+    // Its first batch holds 80 MiB more, past its account and past twice it: its cgroup kills
+    // it, and it is started again at 48 MiB, and killed again, and started again at 96 MiB.
+    // It was the unit's error: killed for using more memory than its stage's limit.
+    let k = measured(80);
+    let mut state = k.init(&init_ctx(0)).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(echo(&k, state.as_mut(), 1000), 1000, "every row");
+    let note = k.note();
+    assert_eq!(
+        restarts_said(&note),
+        vec![(0, 24 * MIB, 48 * MIB), (0, 48 * MIB, 96 * MIB)],
+        "{note}"
+    );
+    assert_eq!(
+        cgroup_file(&state_of(&mut state).cgroup(), "memory.max"),
+        (96 * MIB).to_string()
+    );
+    assert_eq!(k.morsel_bytes_max(), Some(16 * MIB), "the measured piece");
+    assert!(k.finish(state.as_mut()).unwrap().is_none());
+    drop(state);
+
+    // 32 MiB more: past its account alone, so one restart, beside another instance.
+    let k = measured(32);
+    let mut states: Vec<_> = (0..2)
+        .map(|i| k.init(&init_ctx(i)).unwrap_or_else(|e| panic!("{e}")))
+        .collect();
+    for state in &mut states {
+        let dir = state_of(state).cgroup();
+        assert_eq!(cgroup_file(&dir, "memory.max"), (24 * MIB).to_string());
+    }
+    let (first, pid) = {
+        let st = state_of(&mut states[0]);
+        (st.cgroup(), st.pid())
+    };
+    assert_eq!(echo(&k, states[0].as_mut(), 1000), 1000, "every row");
+    // Started again at twice its account, in a fresh cgroup and process; the other keeps its.
+    let st = state_of(&mut states[0]);
+    assert_ne!((st.cgroup(), st.pid()), (first.clone(), pid));
+    assert!(!first.exists(), "the killed instance's cgroup is gone");
+    assert_eq!(
+        cgroup_file(&st.cgroup(), "memory.max"),
+        (48 * MIB).to_string()
+    );
+    let other = state_of(&mut states[1]).cgroup();
+    assert_eq!(cgroup_file(&other, "memory.max"), (24 * MIB).to_string());
+    let note = k.note();
+    assert_eq!(
+        restarts_said(&note),
+        vec![(0, 24 * MIB, 48 * MIB)],
+        "{note}"
+    );
+    // Its next batch holds no more: answered at the grown account, with no restart.
+    assert_eq!(echo(&k, states[0].as_mut(), 1000), 1000);
+    assert_eq!(restarts_said(&k.note()).len(), 1);
+    for state in &mut states {
+        assert!(k.finish(state.as_mut()).unwrap().is_none());
+    }
+    drop(states);
+
+    // An unmeasured stage's four instances share its ceiling equally: the one killed has no
+    // room to grow beside the others, and the batch fails as it did, in the cgroup's words.
+    let k = holding_kernel(&image, 4, 96);
+    k.bind_run(sampler(0, 256 * MIB, 4.0), 256 * MIB);
+    let mut states: Vec<_> = (0..4)
+        .map(|i| k.init(&init_ctx(i)).unwrap_or_else(|e| panic!("{e}")))
+        .collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from_iter_values(0..10)) as ArrayRef],
+    )
+    .expect("a batch");
+    let input = moruna_kernel::Payload::Table(batch, moruna_kernel::Tier::Host);
+    let Err(failed) = k.apply(states[0].as_mut(), input) else {
+        panic!("killed, with no room to grow, it answered");
+    };
+    let failed = failed.to_string();
+    assert!(
+        failed.contains("was killed for using more memory than its stage's limit"),
+        "{failed}"
+    );
+    assert!(restarts_said(&k.note()).is_empty());
+    drop(states);
+}
+
+/// What the Parquet files under `out` hold, `(id, value)` a row, sorted.
+fn rows_of(out: &Path) -> Vec<(i64, i64)> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(out)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("parquet"))
+        .collect();
+    files.sort();
+    let mut rows = Vec::new();
+    for file in files {
+        let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&file).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let col = |name: &str| {
+                batch
+                    .column_by_name(name)
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>().cloned())
+                    .unwrap_or_else(|| panic!("{}: no column `{name}`", file.display()))
+            };
+            let (id, value) = (col("id"), col("value"));
+            rows.extend((0..id.len()).map(|i| (id.value(i), value.value(i))));
+        }
+    }
+    rows.sort_unstable();
+    rows
+}
+
+/// `job` run with `line` as what it came with of its function's memory (`RunSpec::measured`).
+fn run_measured(
+    job: &JobSpec,
+    line: moruna_cost::Memory,
+) -> Result<moruna_runtime::RunReport, String> {
+    let _serial = RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    let job = moruna_job::Job::from_v1(job);
+    let plan = moruna_runtime::job::plan::default_plan(&job).map_err(|e| e.to_string())?;
+    let mut built = build(
+        &job,
+        &plan,
+        &Registry::standard(),
+        BuildOptions {
+            strict: true,
+            env: &no_env,
+            notes: Vec::new(),
+            packages: PackageHost {
+                sandbox_python: None,
+                sandbox_cgroup: Some(cgroup()),
+            },
+            host_ports: None,
+            pulled_images: None,
+            args: Default::default(),
+            held: Vec::new(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    built.spec.measured = vec![Some(line)];
+    Runtime::run(built.spec, CancelToken::new()).map_err(|e| e.to_string())
+}
+
+/// IM-T38 a_job_completes_when_an_instance_passes_its_measured_account (system design 3A, item
+/// 6.3v): an image function in a job of 4 CPUs, measured to hold less than its first batch does,
+/// is killed by its cgroup and started again at a larger account, as the node's task is; the
+/// job completes with every row equal to a run with room to spare, and the stage's note says
+/// which instance started again and at what account. It failed the job: on Linux an instance
+/// killed by its memory limit was the unit's error.
+#[test]
+#[ignore = "Linux, sandbox host: root, and MORUNA_SANDBOX_CGROUP"]
+fn im_t38_a_job_completes_when_an_instance_passes_its_measured_account() {
+    const MIB: u64 = 1 << 20;
+    const ROWS: i64 = ROWS_WIDE;
+    let run = |name: &str, line: moruna_cost::Memory| {
+        let scratch = Scratch::new(name);
+        let layout = layout(&scratch);
+        write_parquet_in(&scratch.path().join("in.parquet"), ROWS, 16);
+        // Its first batch holds 48 MiB more than the others.
+        let job = job_of(
+            scratch.path(),
+            &layout,
+            json!({"command": ["/bin/arrow_echo", "--first-batch-mib", "48"]}),
+            Some(4.0),
+        );
+        let report = run_measured(&job, line).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let note = report
+            .notes
+            .iter()
+            .find(|n| n.starts_with("image `kernels[0]`: "))
+            .expect("the stage's note")
+            .clone();
+        let json: Value = serde_json::from_str(&report.to_json()).unwrap();
+        let stage = json["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["stage"] == 1)
+            .expect("the image's stage")
+            .clone();
+        assert_eq!(
+            (stage["rows_in"].as_i64(), stage["rows_out"].as_i64()),
+            (Some(ROWS), Some(ROWS)),
+            "{note}"
+        );
+        (rows_of(&scratch.path().join("out")), note)
+    };
+    // Measured at 8 MiB and two bytes a byte: an account of 40 MiB at pieces of 16 MiB, less
+    // than its first batch holds.
+    let (rows, note) = run("im_t38_tight", measured_line(8 * MIB, 2.0));
+    println!("{note}");
+    let restarts = restarts_said(&note);
+    assert!(!restarts.is_empty(), "an instance started again: {note}");
+    for (_, passed, grown) in &restarts {
+        assert!(*grown >= 2 * passed, "{note}");
+    }
+    assert!(note.contains("measured: batches of at most "), "{note}");
+    // With room to spare: an account that holds its first batch, and no restart.
+    let (spare, roomy) = run("im_t38_spare", measured_line(96 * MIB, 2.0));
+    assert!(restarts_said(&roomy).is_empty(), "{roomy}");
+    assert_eq!(rows.len(), ROWS as usize);
+    assert_eq!(rows, spare, "every row equal to a run with room to spare");
+    assert_eq!(
+        rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        (0..ROWS).collect::<Vec<_>>()
     );
 }

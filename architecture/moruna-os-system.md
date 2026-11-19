@@ -646,7 +646,11 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
     smaller morsel is only slower), and the kernel cuts a larger batch at it, since a target
     bounds only what the source reads for its first consumer. On the node it is the smaller of
     the piece an instance's account holds and its plane's piece, so no batch is past its input
-    region either.
+    region either. On a Linux host an instance is carved as the node carves its task (PM,
+    2026-11-19, 6.3v): a measured stage's instance's cgroup at its line's account at the stage's
+    measured piece (`instances::measured_task_limit`, under half of what the other instances'
+    limits leave of the stage's ceiling), and its batches cut at that piece; an unmeasured
+    stage's at its equal share of the ceiling (6.3f), its batches at what the share holds.
   - **A profile remembered at one instance count is not applied unscaled at another:** the profile
     keeps the count it was written at; read at another count, its fixed term is scaled by now over
     then and its settled target is not used, and it is still trusted; a file that does not say its
@@ -660,7 +664,14 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
     account's count of refused charges (`account_info`, ABI 2.10), never guessed from how it
     ended; the larger room comes from the job's, doubling up to the whole of it, and the report
     says so. One that keeps state restarts from its last checkpoint; with none the job fails,
-    naming the function, with the measurement recorded so the next run is sized right.
+    naming the function, with the measurement recorded so the next run is sized right. On a
+    Linux host (6.3v) passing it is read from the instance's cgroup, its process ended with an
+    `oom_kill` in its `memory.events`; the need is the cgroup's `memory.peak` at the kill, the
+    room what the stage's ceiling leaves beside the other instances' limits, and the account the
+    node's rule gives (`moruna_adapters::instances::restarted_limit`: the larger of twice the
+    account and the need widened by the margin, under half the room, only when it grows). The
+    instance's unanswered batch is given again to a fresh process at that account, which is the
+    instance's from then on; the others keep theirs.
   - **Off the node** (the library, `moruna run`) the run finds what `moruna check` measured in its
     observation store, by the function and its declared input, and sizes its arena from that before
     any source is built. A measurement stands over what the function declares; a function measured
@@ -810,7 +821,10 @@ Added to `moruna-api` (2A), so the OpenAPI document, the MCP tools and the clien
   a job that ran before:** each instance is funded with an equal share of what the run has past its
   arena, at least a function's least, so the run starts as many as that funds, at least one a
   stage, and is refused only when one does not fit; the report says `N of M instances: the share
-  funds N` (PM, 2026-11-18). One rule for every engine, `moruna_adapters::instances`. **Each
+  funds N` (PM, 2026-11-18). One rule for every engine, `moruna_adapters::instances`. On a
+  Linux host each instance is a cgroup under its stage's, which carries the stage's ceiling: a
+  measured stage's carved at its measured account, an unmeasured one's at an equal share of the
+  ceiling, and their limits never sum past it as they are carved (3A, 6.3v). **Each
   instance is told its share of the job's CPUs,** the whole CPUs it has to itself and at least one
   (`MORUNA_CPUS`), and the common thread pools (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
   `MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS`, `RAYON_NUM_THREADS`) are set to it unless the image's
