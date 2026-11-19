@@ -10,6 +10,7 @@
 
 mod append;
 pub(crate) mod decode_copy;
+mod decoders;
 mod hint;
 mod pages;
 mod parts;
@@ -24,6 +25,11 @@ use moruna_kernel::{
     SourceSchema, Split, SplitId, Tier,
 };
 use parquet::file::metadata::ParquetMetaData;
+
+pub use decoders::{
+    ARENA_LEAST_BUFFER_BYTES, BYTE_ARRAY_COLUMN_DECODE_BYTES, FIXED_COLUMN_DECODE_BYTES,
+    decode_fixed_bytes, read_least_arena_bytes,
+};
 
 use crate::stats::{Counters, SourceStats};
 
@@ -95,6 +101,8 @@ pub struct ParquetSource {
     /// The most decoded bytes one decode builds outside the arena at once (3A); `None` decodes
     /// each range in one batch.
     decode_batch_bytes: Option<u64>,
+    /// The run's decode batch, read at each read in place of `decode_batch_bytes` (6.3d).
+    decode_batch: Option<DecodeBatch>,
 }
 
 /// A row group's fetch, as the source keeps it for the group's ranges (6.3t).
@@ -116,6 +124,31 @@ pub(crate) enum Claim {
 
 /// How many row groups' page locations a source keeps: more than the reads a run has in flight.
 const PAGED_KEPT: usize = 64;
+
+/// A decode batch the run sets once it has sized its arena (3A, items 6.3a and 6.3d): it knows
+/// the room its decoders have above the arena only after the sinks' writers have claimed
+/// theirs, which needs the schema the source gives. The source reads it at each read. Clones
+/// share it.
+#[derive(Clone, Debug, Default)]
+pub struct DecodeBatch(Arc<std::sync::atomic::AtomicU64>);
+
+impl DecodeBatch {
+    /// A batch not set yet: each range decodes in one batch until it is.
+    pub fn new() -> DecodeBatch {
+        DecodeBatch::default()
+    }
+
+    /// Decode in batches of at most `bytes` decoded bytes; `None` keeps one batch a range.
+    pub fn set(&self, bytes: Option<u64>) {
+        self.0
+            .store(bytes.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The batch set, `None` for one batch a range.
+    pub fn get(&self) -> Option<u64> {
+        Some(self.0.load(std::sync::atomic::Ordering::SeqCst)).filter(|&bytes| bytes > 0)
+    }
+}
 
 impl ParquetSource {
     /// Read every footer now (the plan cache), so `plan` is a clone and is complete before the
@@ -186,6 +219,7 @@ impl ParquetSource {
             paged: std::sync::Mutex::new(std::collections::VecDeque::new()),
             fetches: std::sync::Mutex::new(std::collections::HashMap::new()),
             decode_batch_bytes: None,
+            decode_batch: None,
         })
     }
 
@@ -199,8 +233,18 @@ impl ParquetSource {
         self
     }
 
+    /// Decode each read in batches of what `batch` holds when the read starts (6.3d): the run
+    /// sets it once it has sized its arena, after the source is built.
+    pub fn decode_batches_from(mut self, batch: DecodeBatch) -> ParquetSource {
+        self.decode_batch = Some(batch);
+        self
+    }
+
     pub(crate) fn decode_batch_bytes(&self) -> Option<u64> {
-        self.decode_batch_bytes
+        match &self.decode_batch {
+            Some(batch) => batch.get(),
+            None => self.decode_batch_bytes,
+        }
     }
 
     /// `split`'s row group alone, with its pages located, for a ranged read (`pages`); `None`

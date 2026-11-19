@@ -554,6 +554,54 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
   row group by its pages), not refused while workers idle. The no-kernel read target lets
   `read_ahead` reads fit at their charge. Found by 6.3a: at 3A's split of 1 GiB, one of two workers
   idled half the run, because each whole row group was charged twice its size.
+  **The room is claimed in order, each claim from a measurement.** First the arena's least, one
+  read in flight per worker at its charge, so no worker idles: a read at the least morsel, or a wide
+  read's buffers when they are more (two or three a column, each at least the arena's smallest
+  class of 64 KiB; what the arena gets above its least is efficiency, not need); and a Parquet source's decoders' fixed need: each
+  projected column's reader holds its codec's decompression context, its page and its dictionary
+  whatever the batch (158 KB a fixed-width column, 217 KB a byte array, measured), one decode per
+  worker. Then a Parquet sink's writers: one lane per worker, each
+  lane needing its columns' codec contexts at its page twice over (Zstandard keeps two a column, in
+  the C library's memory, counted by their measured sizes), at the page measured to lose nothing in
+  bytes or time against the best (233 KB, the largest in the 256 KiB step of the context). If the
+  two do not both fit, the page shrinks to the largest that fits before lanes are cut, and a schema
+  whose one lane does not fit is refused before the run starts, naming the least budget that holds
+  it. The rest is divided between the arena and the decoders' room above it by the chain's own
+  factor (a copy's one byte outside the arena per byte in flight, or its kernels'). A sink adds no
+  factor: its writers' need is a fixed amount per lane, not per byte in flight, so a chain whose
+  kernels declare nothing outside the arena gets exactly the writers' claim above it. The writers'
+  heap is measured by the counting allocator, and each lane flushes its row group by it; a morsel
+  is written in slices only as far as the lane's room under its flush point requires (by the
+  heap a write was measured to hold per value and per byte of its strings), so a morsel that fits
+  the room is written whole (a fixed eighth of a page a slice cost the NYC year 6% of its encode
+  CPU for no memory). The
+  writers' claim is their floor, not their ceiling: they are granted, up to their room, what their
+  row groups need to reach the sink's own row-group target, so an ample budget writes the groups
+  the sink asks for. The order: the claims stand in front of the arena; the claims are memory
+  outside the arena, so they count inside the share the chain's factor keeps outside it, and the
+  share kept above the arena beside them is max(0, that share of the rest − the claims): the arena
+  is its least and min(rest, its share of the rest + the claims), never more than the arena sized
+  before the claims, so memory is not provided for twice (at 1 GiB on 4 workers the NYC year's
+  claims of 268 MB fit inside the share, and its arena is the 641 MB it had before them). The
+  extra never takes from the arena; it comes only from the decoders' share of the rest beyond
+  their least batches, so on a tight or free chain there may
+  be none. The arena's least is a floor, not a working size (6.3d: an arena cut to its least by the
+  writers' extra failed to allocate), and a cap on the arena at one morsel in flight per worker,
+  twice, was measured and dropped: it halved the arena at 672 MiB and 1 GiB and doubled the reads
+  and the row groups. The decoders' least batches, one of the least morsel per
+  worker, are claimed with their fixed need, so a decode always has a batch. The
+  fixed claims compose as one sum held outside the arena before its share is taken: the stateful
+  kernels' declared state, the functions' measured fixed bytes (below), the decoders' fixed need
+  and the writers' need.
+  **In a run,** the arena is made at its largest from the claims known before the schemas are,
+  its pages untouched; once the graph is validated and before anything reads, the decoders' and
+  the writers' needs are computed from the schemas and the arena capped as the order above sizes
+  it. The sinks'
+  file buffers are the capped arena's, granted at the sink's open, and a decode's batch is the
+  decoders' room over the workers; the object stores' room stays sized from the larger arena,
+  since it only bounds requests. Found by 6.3d: the writers' heap came from Parquet's defaults, the
+  columns and the lanes, never the budget; a table of 384 one-byte columns held 261 MB against a
+  79 MB room.
 - **A function's memory is measured, never assumed.** A job's budget has two parts: the arena,
   which holds the Arrow batches in flight, and the room above it, where each function instance keeps
   its own working memory. The room each instance needs comes from measurement: the warm-up's memory

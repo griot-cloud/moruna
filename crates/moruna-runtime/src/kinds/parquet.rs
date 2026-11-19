@@ -121,6 +121,9 @@ impl SourceKind for Parquet {
         Ok(BuiltSource {
             spec: SourceSpec::Build(Box::new(move |ctx| {
                 let meta = ctx.object_metadata()?;
+                // 3A (6.3d): its decoders' columns hold room outside the arena whatever the
+                // batch, which the run claims once it knows the source's schema.
+                ctx.claim_decoders();
                 // With the arena, so an object URL's footer can be read (MH 4.6); decoding in
                 // batches the headroom above the arena holds (3A, 6.3a).
                 Ok(Arc::new(
@@ -130,7 +133,8 @@ impl SourceKind for Parquet {
                         meta,
                         ctx.alloc.clone(),
                     )?
-                    .decode_batches_of(ctx.decode_batch_bytes()),
+                    // 3A (6.3a, 6.3d): the run sets the batch once its arena is sized.
+                    .decode_batches_from(ctx.decode_batch()),
                 ) as Arc<dyn Source>)
             })),
             targets: settings.url.0,
@@ -231,18 +235,21 @@ impl SinkKind for Parquet {
         Ok(BuiltSink {
             spec: SinkSpec::Build(Box::new(move |ctx| {
                 // The sink encodes each file in the arena, in one of two buffers: together they
-                // are the share the facade sets aside for it.
+                // are the share the facade grants it once its arena is sized (3A, 6.3d).
                 let cfg = ParquetSinkConfig {
                     url,
                     row_group_bytes,
-                    file_bytes: file_bytes.min(ctx.claim_file_buffer() / 2),
+                    file_bytes,
                     compression,
                     writer_props: None,
                 };
                 // The run id goes into every file's footer (08 e.2).
                 let sink = ParquetSink::new(cfg, ctx.reactor.clone(), ctx.alloc.clone())?
                     .with_run_id(ctx.run_id)
-                    .with_lanes(usize::from(ctx.workers.max(1)));
+                    .with_lanes(usize::from(ctx.workers.max(1)))
+                    // 3A (6.3d): the writers claim their need above the arena, granted once
+                    // the run knows the sink's schema, with the file buffers' bytes.
+                    .with_grant(ctx.claim_writer_heap(compression, row_group_bytes, file_bytes));
                 Ok(Box::new(sink) as Box<dyn moruna_kernel::Sink>)
             })),
             target,

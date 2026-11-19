@@ -28,6 +28,11 @@ pyo3-arrow = { workspace = true, optional = true }
 moruna-testkit = { workspace = true }
 safetensors = { workspace = true }
 bytes = { workspace = true }
+# 6.3d: the writer-heap measurements read a Zstandard context's size (`tests/lane_heap_measure.rs`),
+# and the lane tests give the sink a real arena, whose buffers are not the heap they count
+# (`tests/si_lane_heap.rs`).
+zstd = { workspace = true }
+moruna-arena = { workspace = true }
 
 [features]
 default = []

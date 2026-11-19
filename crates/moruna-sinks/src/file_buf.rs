@@ -301,6 +301,17 @@ impl FileBuffers {
     }
 }
 
+/// The file a lane of a sink of `file_bytes` files encoding into `lanes` at once grows to, the
+/// arena aside ([`FileBuffers::lane_cap`] with all the arena it asks free): a share of the
+/// pair's bytes, a whole class, at most [`LANE_MAX_BYTES`]. The run reads it to know how large a
+/// row group a lane can reach before it rolls (system design 3A, 6.3d).
+pub fn lane_file_bytes(file_bytes: u64, lanes: usize) -> u64 {
+    let share = file_bytes.saturating_mul(2) / lanes.max(2) as u64;
+    class_ceil(share)
+        .min(LANE_MAX_BYTES)
+        .max(class_ceil(GRANULE))
+}
+
 /// A run id as the lowercase hex a footer carries (e.2).
 pub(crate) fn hex(run_id: &RunId) -> String {
     use std::fmt::Write as _;

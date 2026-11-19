@@ -37,7 +37,11 @@ mod util;
 
 pub use crate::ipc::{ArrowIpcSource, ArrowIpcSourceConfig};
 pub use crate::parquet::decode_copy::copy_batch;
-pub use crate::parquet::{ParquetSource, ParquetSourceConfig, RowFilter, ScalarValue};
+pub use crate::parquet::{
+    ARENA_LEAST_BUFFER_BYTES, BYTE_ARRAY_COLUMN_DECODE_BYTES, DecodeBatch,
+    FIXED_COLUMN_DECODE_BYTES, ParquetSource, ParquetSourceConfig, RowFilter, ScalarValue,
+    decode_fixed_bytes, read_least_arena_bytes,
+};
 pub use crate::tensor::{TensorSource, TensorSourceConfig};
 pub use stats::SourceStats;
 pub use stream::{ArrowStreamSource, StreamEnd};
