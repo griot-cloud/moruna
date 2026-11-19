@@ -649,6 +649,8 @@ pub(crate) fn run_task(
 
     let unit_ns = t1.saturating_sub(t0);
     let unit_cpu_ns = c1.saturating_sub(c0);
+    // Item 6.3ac: every unit's CPU is the stage's, one that gives no morsel included.
+    entry.worker_cpu_ns.fetch_add(unit_cpu_ns, Ordering::SeqCst);
     // What the unit gave, for the probe: every morsel's output.
     let mut bytes_out = 0;
     let mut gave = Vec::new();
@@ -691,7 +693,11 @@ pub(crate) fn run_task(
                 // than a wrong observation; its record and growth stand.
                 let timed = match morsel.time {
                     MorselTime::Unit => Some((unit_ns, unit_cpu_ns)),
-                    MorselTime::Given { wall_ns, cpu_ns } => Some((wall_ns, cpu_ns)),
+                    MorselTime::Given { wall_ns, cpu_ns } => {
+                        // Item 6.3ac: what its ring task spent on it is the stage's too.
+                        entry.task_cpu_ns.fetch_add(cpu_ns, Ordering::SeqCst);
+                        Some((wall_ns, cpu_ns))
+                    }
                     MorselTime::Untimed => None,
                 };
                 if let Some((wall_ns, cpu_ns)) = timed {
@@ -739,6 +745,7 @@ pub(crate) fn run_task(
                      rows_out: u64,
                      bytes_out: u64,
                      tier_out: u8,
+                     cpu_ns: u64,
                      outcome: Outcome,
                      error: Option<String>| {
         build_record(
@@ -759,7 +766,7 @@ pub(crate) fn run_task(
                 features: &taken.features,
                 s0,
                 s1,
-                cpu_ns: unit_cpu_ns,
+                cpu_ns,
                 q_before: q_before.clone(),
                 q_after: q_after.clone(),
                 miss_wait_us: wait_us,
@@ -771,11 +778,22 @@ pub(crate) fn run_task(
         )
     };
     // SC-I4: one record per morsel and stage, when the stage gives the morsel (6.3m): its rows and
-    // bytes in as it was taken, its rows and bytes out as it was given.
+    // bytes in as it was taken, its rows and bytes out as it was given. The unit's CPU is split
+    // evenly among them, so they sum to it (6.3ac).
     let mut records: Vec<TraceRecord> = gave
         .iter()
-        .map(|(seq, taken, rows, bytes, tier_out)| {
-            record_of(*seq, taken, *rows, *bytes, *tier_out, Outcome::Ok, None)
+        .zip(cpu_shares(unit_cpu_ns, gave.len()))
+        .map(|((seq, taken, rows, bytes, tier_out), cpu_ns)| {
+            record_of(
+                *seq,
+                taken,
+                *rows,
+                *bytes,
+                *tier_out,
+                cpu_ns,
+                Outcome::Ok,
+                None,
+            )
         })
         .collect();
 
@@ -795,7 +813,7 @@ pub(crate) fn run_task(
             origin,
             learn: None,
         };
-        let mut record = record_of(seq, &own, 0, 0, tier_in, Outcome::Error, error);
+        let mut record = record_of(seq, &own, 0, 0, tier_in, unit_cpu_ns, Outcome::Error, error);
         // f.8: a device out of memory is the one error that does not reach the policy first.
         // Its record goes to the hook alone, so the trace still sees exactly one record per
         // morsel and stage (SC-I4, TR-I2), and the controller shrinks the stage's device
@@ -841,6 +859,14 @@ pub(crate) fn run_task(
         }));
     }
     Ok(None)
+}
+
+/// A unit's CPU split among the `n` morsels it gave (item 6.3ac): evenly, the odd nanoseconds to
+/// the first, so the shares sum to the unit's CPU.
+pub(crate) fn cpu_shares(cpu_ns: u64, n: usize) -> impl Iterator<Item = u64> {
+    let n64 = u64::try_from(n).unwrap_or(u64::MAX).max(1);
+    let (share, odd) = (cpu_ns / n64, cpu_ns % n64);
+    (0..n).map(move |i| if i == 0 { share + odd } else { share })
 }
 
 /// Each morsel a unit gave, with what it brought in (item 6.3m): the unit's own, morsel `seq`,

@@ -66,8 +66,8 @@ pub use kernel::{
     set_kernel_alloc, take_kernel_alloc,
 };
 pub use knobs::{
-    CancelToken, ErrorPolicy, Knob, KnobSnapshot, Knobs, ProbeResult, Prober, RecordHook,
-    SchedulerStats, SizerKind, StageStats, StatsSource,
+    CancelToken, CodecStats, ErrorPolicy, Knob, KnobSnapshot, Knobs, ProbeResult, Prober,
+    RecordHook, SchedulerStats, SizerKind, StageStats, StatsSource,
 };
 pub use limits::{
     Device, Guarantee, HostProfile, LimitSource, Limits, MemoryBasis, OutsideMemory, ProcessPeak,

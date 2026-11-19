@@ -121,6 +121,12 @@ pub(crate) struct StageEntry {
     pub(crate) pool: Option<InstancePool>,
     pub(crate) tasks: AtomicU64,
     pub(crate) busy_ns: AtomicU64,
+    /// The workers' thread CPU over all its units, those that gave no morsel included (item
+    /// 6.3ac).
+    pub(crate) worker_cpu_ns: AtomicU64,
+    /// The CPU its ring task gave for the morsels it completed (`MorselTime::Given`'s `cpu_ns`,
+    /// item 6.3ac).
+    pub(crate) task_cpu_ns: AtomicU64,
     pub(crate) errors: AtomicU32,
     pub(crate) skipped: AtomicU32,
     pub(crate) running: AtomicU32,
@@ -635,6 +641,8 @@ impl Shared {
                     pool,
                     tasks: AtomicU64::new(0),
                     busy_ns: AtomicU64::new(0),
+                    worker_cpu_ns: AtomicU64::new(0),
+                    task_cpu_ns: AtomicU64::new(0),
                     errors: AtomicU32::new(0),
                     skipped: AtomicU32::new(0),
                     running: AtomicU32::new(0),

@@ -40,6 +40,9 @@ pub(crate) struct Times {
     operations: AtomicU64,
     io_ns: AtomicU64,
     codec_ns: AtomicU64,
+    /// Thread CPU decoding or encoding on workers, as a worker's unit is measured: what the
+    /// controller charges the stages beside the end (item 6.3ac).
+    codec_cpu_ns: AtomicU64,
     /// Some decode or encode was timed apart from its I/O.
     apart: AtomicBool,
 }
@@ -58,6 +61,16 @@ impl Times {
     pub(crate) fn codec(&self, start: Instant) {
         self.codec_ns.fetch_add(since(start), Ordering::Relaxed);
         self.apart.store(true, Ordering::Relaxed);
+    }
+
+    /// A decode or an encode used `ns` of its thread's CPU.
+    pub(crate) fn codec_cpu(&self, ns: u64) {
+        self.codec_cpu_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    /// The thread CPU of its decodes or encodes so far.
+    pub(crate) fn codec_cpu_ns(&self) -> u64 {
+        self.codec_cpu_ns.load(Ordering::Relaxed)
     }
 
     /// A read or a write is over.

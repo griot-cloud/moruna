@@ -2,7 +2,7 @@
 
 use std::sync::atomic::Ordering;
 
-use moruna_kernel::{SchedulerStats, StageStats};
+use moruna_kernel::{CodecStats, SchedulerStats, StageStats};
 
 use crate::instances;
 use crate::shared::Shared;
@@ -42,11 +42,44 @@ pub(crate) fn scheduler_stats(shared: &Shared) -> SchedulerStats {
             instances_live: instances::live(shared, index),
             morsel_bytes_max: entry.kernel.morsel_bytes_max(),
             measured_line: entry.kernel.measured_line(),
+            worker_cpu_ns: entry.worker_cpu_ns.load(Ordering::SeqCst),
+            task_cpu_ns: entry.task_cpu_ns.load(Ordering::SeqCst),
+            bytes_in: entry.bytes_in.load(Ordering::SeqCst),
+        })
+        .collect();
+    // Item 6.3ac: a source's decode is charged to the stages it feeds directly, a sink's encode
+    // to the stages that feed it directly.
+    let decodes = shared
+        .sources
+        .iter()
+        .map(|end| CodecStats {
+            cpu_ns: end.out.times.codec_cpu_ns(),
+            stages: shared
+                .stages
+                .iter()
+                .filter(|stage| stage.inputs.iter().any(|q| end.outputs.contains(q)))
+                .map(|stage| stage.stage)
+                .collect(),
+        })
+        .collect();
+    let encodes = shared
+        .sinks
+        .iter()
+        .map(|end| CodecStats {
+            cpu_ns: end.input.times.codec_cpu_ns(),
+            stages: shared
+                .stages
+                .iter()
+                .filter(|stage| stage.outputs.contains(&end.queue))
+                .map(|stage| stage.stage)
+                .collect(),
         })
         .collect();
     let (stages_waiting, calls_waiting) = shared.waiting();
     SchedulerStats {
         policy: policy_stats(shared),
+        decodes,
+        encodes,
         per_stage,
         workers_waiting: u16::try_from(calls_waiting).unwrap_or(u16::MAX),
         stages_waiting,

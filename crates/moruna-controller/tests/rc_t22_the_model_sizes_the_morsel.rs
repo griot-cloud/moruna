@@ -68,6 +68,7 @@ fn observation(target: u64, ready: bool) -> Observation {
         completions_since_adjust: if ready { 8 } else { 0 },
         damping: 8,
         recent: Vec::new(),
+        cpu: Default::default(),
     }
 }
 

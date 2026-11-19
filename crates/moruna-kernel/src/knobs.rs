@@ -109,6 +109,27 @@ pub struct StageStats {
     /// The function's line as the run's warm-up measured it, once it has
     /// (`Kernel::measured_line`, item 6.3w); `None` before that.
     pub measured_line: Option<crate::MeasuredLine>,
+    /// Nanoseconds of the workers' thread CPU over all the stage's units, those that gave no
+    /// morsel included, since the run began (item 6.3ac).
+    pub worker_cpu_ns: u64,
+    /// Nanoseconds of CPU its ring task gave for the morsels the stage completed
+    /// (`MorselTime::Given`'s `cpu_ns`, summed), since the run began; 0 for a stage with no
+    /// ring task (item 6.3ac).
+    pub task_cpu_ns: u64,
+    /// Input bytes the stage has taken since the run began (item 6.3ac).
+    pub bytes_in: u64,
+}
+
+/// One source's decode CPU or one sink's encode CPU, and the stages it is charged to (item
+/// 6.3ac).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodecStats {
+    /// Nanoseconds of thread CPU decoding (a source) or encoding (a sink) on workers since the
+    /// run began; 0 for an end that does both halves in one call.
+    pub cpu_ns: u64,
+    /// The stages it is charged to: those a source feeds directly, or those that feed a sink
+    /// directly, ascending.
+    pub stages: Vec<StageId>,
 }
 
 /// The scheduler's counters as the controller reads them.
@@ -148,6 +169,10 @@ pub struct SchedulerStats {
     pub knob_clamps: u64,
     /// The scheduling policy's decisions and what they left unused (d.18).
     pub policy: crate::policy::PolicyStats,
+    /// Each source's decode CPU, source 0 first (item 6.3ac).
+    pub decodes: Vec<CodecStats>,
+    /// Each sink's encode CPU, sink 0 first (item 6.3ac).
+    pub encodes: Vec<CodecStats>,
 }
 
 /// The probe protocol (RC f.2) as the controller sees it. Implemented by the scheduler.

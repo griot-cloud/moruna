@@ -1,6 +1,6 @@
 //! `RuleSizer`, the additive-increase multiplicative-decrease sizer that ships in v1 (f.4).
 
-use super::{Envelope, Observation, Proposal, Sizer, SizerOutcome};
+use super::{CpuPerByte, Envelope, Observation, Proposal, Sizer, SizerOutcome, StageCpu};
 
 /// The exponential weight of one observation on the peak ratio (f.4).
 const ALPHA: f64 = 0.2;
@@ -20,9 +20,14 @@ enum Search {
     /// Growing under the memory rule; nothing compared yet.
     Growing,
     /// `at` is being measured against `base`, whose CPU per byte was `base_cost`.
-    Trying { base: u64, base_cost: f64, at: u64 },
-    /// Settled at `best`: the memory rule grows no further than it.
-    Settled { best: u64 },
+    Trying {
+        base: u64,
+        base_cost: CpuPerByte,
+        at: u64,
+    },
+    /// Settled at `best`: the memory rule grows no further than it. `cost` is what the stage
+    /// spent per byte there, when the search measured it there.
+    Settled { best: u64, cost: Option<CpuPerByte> },
 }
 
 /// The rule sizer: additive increase while the stage is using less of its allowance than
@@ -42,6 +47,9 @@ pub struct RuleSizer {
     changed_at_ns: u64,
     /// The target at the previous proposal: when the one observed differs, the target moved.
     last_target: u64,
+    /// The stage's counters when the target last changed: the window the current target ran
+    /// starts there (item 6.3ac).
+    window_from: StageCpu,
 }
 
 impl RuleSizer {
@@ -55,28 +63,35 @@ impl RuleSizer {
             search: Search::Growing,
             changed_at_ns: 0,
             last_target: 0,
+            window_from: StageCpu::default(),
         }
     }
 
-    /// CPU per input byte of the records sized at `target` since the target last changed, when
-    /// there are enough of them to judge (f.4b). A morsel within a factor of two of the target
-    /// counts: a split smaller than the target arrives as it is.
-    fn cost_at(&self, obs: &Observation, target: u64) -> Option<f64> {
-        let (mut cpu_us, mut bytes, mut n) = (0u64, 0u64, 0usize);
-        for record in &obs.recent {
-            if record.outcome != moruna_kernel::Outcome::Ok
-                || record.t_start_ns <= self.changed_at_ns
-                || record.bytes_in == 0
-                || record.bytes_in.saturating_mul(2) < target
-                || record.bytes_in > target.saturating_mul(2)
-            {
-                continue;
-            }
-            cpu_us += record.cpu_time_us;
-            bytes += record.bytes_in;
-            n += 1;
+    /// The whole stage's CPU per input byte at `target`, once enough records sized at it have
+    /// come since the target last changed to judge (f.4b). A morsel within a factor of two of
+    /// the target counts: a split smaller than the target arrives as it is.
+    ///
+    /// The cost is the scheduler's counters over the window the target ran (item 6.3ac): the
+    /// workers' CPU over all the stage's units, its ring task's, and the decode and encode
+    /// charged to it, per input byte. A record carries only its unit's share of the worker's
+    /// CPU, so a smaller morsel's extra reads, decodes and encodes, and its task's time, are in
+    /// none of them.
+    fn cost_at(&self, obs: &Observation, target: u64) -> Option<CpuPerByte> {
+        let sized = obs
+            .recent
+            .iter()
+            .filter(|record| {
+                record.outcome == moruna_kernel::Outcome::Ok
+                    && record.t_start_ns > self.changed_at_ns
+                    && record.bytes_in > 0
+                    && record.bytes_in.saturating_mul(2) >= target
+                    && record.bytes_in <= target.saturating_mul(2)
+            })
+            .count();
+        if sized < SEARCH_RECORDS {
+            return None;
         }
-        (n >= SEARCH_RECORDS && bytes > 0).then(|| cpu_us as f64 / bytes as f64)
+        obs.cpu.since(&self.window_from)
     }
 
     /// The proposal.
@@ -125,15 +140,22 @@ impl Sizer for RuleSizer {
         let ratio = using / allowance;
         if let (Search::Growing, Some(learned)) = (self.search, obs.learned_target) {
             // An earlier run of this kernel searched and settled: start where it did.
-            self.search = Search::Settled { best: learned };
+            self.search = Search::Settled {
+                best: learned,
+                cost: None,
+            };
         }
         // Memory first: over the allowance halves, whatever the search was doing, and the
         // halved target is the most the search may come back to.
         if ratio > DECREASE_ABOVE {
             let halved = obs.target / 2;
             self.search = match self.search {
-                Search::Settled { best } => Search::Settled {
-                    best: best.min(halved),
+                // Nothing was measured at the half: what the search measured stands only where
+                // it settled.
+                Search::Settled { best, cost } if best <= halved => Search::Settled { best, cost },
+                Search::Settled { .. } => Search::Settled {
+                    best: halved,
+                    cost: None,
                 },
                 _ => Search::Growing,
             };
@@ -149,6 +171,7 @@ impl Sizer for RuleSizer {
                 .map(|r| r.t_start_ns)
                 .max()
                 .unwrap_or(self.changed_at_ns);
+            self.window_from = obs.cpu;
         }
         self.last_target = obs.target;
         let can_grow = ratio < INCREASE_BELOW && grown <= envelope.max;
@@ -170,8 +193,11 @@ impl Sizer for RuleSizer {
                     };
                     self.propose_target(obs, at)
                 }
-                Some(_) => {
-                    self.search = Search::Settled { best: obs.target };
+                Some(cost) => {
+                    self.search = Search::Settled {
+                        best: obs.target,
+                        cost: Some(cost),
+                    };
                     self.propose_target(obs, obs.target)
                 }
                 None => self.propose_target(obs, obs.target),
@@ -188,7 +214,7 @@ impl Sizer for RuleSizer {
                 }
                 match self.cost_at(obs, at) {
                     None => self.propose_target(obs, at),
-                    Some(cost) if cost < base_cost * (1.0 - SEARCH_GAIN) => {
+                    Some(cost) if cost.total() < base_cost.total() * (1.0 - SEARCH_GAIN) => {
                         if at / 2 >= envelope.min {
                             self.search = Search::Trying {
                                 base: at,
@@ -197,17 +223,23 @@ impl Sizer for RuleSizer {
                             };
                             self.propose_target(obs, at / 2)
                         } else {
-                            self.search = Search::Settled { best: at };
+                            self.search = Search::Settled {
+                                best: at,
+                                cost: Some(cost),
+                            };
                             self.propose_target(obs, at)
                         }
                     }
                     Some(_) => {
-                        self.search = Search::Settled { best: base };
+                        self.search = Search::Settled {
+                            best: base,
+                            cost: Some(base_cost),
+                        };
                         self.propose_target(obs, base)
                     }
                 }
             }
-            Search::Settled { best } if can_grow && obs.target < best => {
+            Search::Settled { best, .. } if can_grow && obs.target < best => {
                 self.propose_target(obs, grown.min(best))
             }
             Search::Settled { .. } => self.propose_target(obs, obs.target),
@@ -241,7 +273,14 @@ impl Sizer for RuleSizer {
 
     fn settled_target(&self) -> Option<u64> {
         match self.search {
-            Search::Settled { best } => Some(best),
+            Search::Settled { best, .. } => Some(best),
+            _ => None,
+        }
+    }
+
+    fn settled_cost(&self) -> Option<CpuPerByte> {
+        match self.search {
+            Search::Settled { cost, .. } => cost,
             _ => None,
         }
     }
@@ -269,6 +308,7 @@ mod tests {
             completions_since_adjust: 8,
             damping: 8,
             recent: Vec::new(),
+            cpu: StageCpu::default(),
         }
     }
 
@@ -351,6 +391,14 @@ mod tests {
             .collect()
     }
 
+    /// `n` morsels of `bytes` more on the counters of a stage with no ring task, costing
+    /// `ns_per_byte` of the workers' CPU each (6.3ac): what `records` gives them.
+    fn ran(cpu: &mut StageCpu, n: u64, bytes: u64, ns_per_byte: f64) -> StageCpu {
+        cpu.worker_ns += n * (bytes as f64 * ns_per_byte / 1000.0) as u64 * 1000;
+        cpu.bytes_in += n * bytes;
+        *cpu
+    }
+
     /// A sizer that has seen growth well inside its allowance, at the envelope's top.
     fn at_the_top() -> (RuleSizer, Envelope) {
         let mut sizer = RuleSizer::new(0.85, 0.25);
@@ -377,14 +425,18 @@ mod tests {
     #[test]
     fn rc_t24_a_smaller_target_that_costs_less_is_kept() {
         let (mut sizer, envelope) = at_the_top();
+        let mut cpu = StageCpu::default();
         let mut obs = observation(64 * MIB, 3.5, 0);
         obs.recent = records(12, 64 * MIB, 4.0, 0);
+        obs.cpu = ran(&mut cpu, 12, 64 * MIB, 4.0);
         assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 32 * MIB);
         // The sizer sees each new target first beside the records that ran before it.
         let mut obs = observation(32 * MIB, 3.5, 0);
         obs.recent = records(12, 64 * MIB, 4.0, 0);
+        obs.cpu = cpu;
         assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 32 * MIB);
         obs.recent = records(12, 32 * MIB, 3.0, 100);
+        obs.cpu = ran(&mut cpu, 12, 32 * MIB, 3.0);
         assert_eq!(
             sizer.propose(&obs, &envelope).morsel_target,
             16 * MIB,
@@ -392,8 +444,10 @@ mod tests {
         );
         let mut obs = observation(16 * MIB, 3.5, 0);
         obs.recent = records(12, 32 * MIB, 3.0, 100);
+        obs.cpu = cpu;
         assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 16 * MIB);
         obs.recent = records(12, 16 * MIB, 2.95, 200);
+        obs.cpu = ran(&mut cpu, 12, 16 * MIB, 2.95);
         assert_eq!(
             sizer.propose(&obs, &envelope).morsel_target,
             32 * MIB,
@@ -411,13 +465,17 @@ mod tests {
     #[test]
     fn rc_t24_a_smaller_target_that_costs_more_is_not_kept() {
         let (mut sizer, envelope) = at_the_top();
+        let mut cpu = StageCpu::default();
         let mut obs = observation(64 * MIB, 3.5, 0);
         obs.recent = records(12, 64 * MIB, 2.0, 0);
+        obs.cpu = ran(&mut cpu, 12, 64 * MIB, 2.0);
         assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 32 * MIB);
         let mut obs = observation(32 * MIB, 3.5, 0);
         obs.recent = records(12, 64 * MIB, 2.0, 0);
+        obs.cpu = cpu;
         assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 32 * MIB);
         obs.recent = records(12, 32 * MIB, 2.6, 100);
+        obs.cpu = ran(&mut cpu, 12, 32 * MIB, 2.6);
         assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 64 * MIB);
         assert_eq!(sizer.settled_target(), Some(64 * MIB));
     }
@@ -428,6 +486,7 @@ mod tests {
         let (mut sizer, envelope) = at_the_top();
         let mut obs = observation(64 * MIB, 3.5, 0);
         obs.recent = records(5, 64 * MIB, 2.0, 0);
+        obs.cpu = ran(&mut StageCpu::default(), 5, 64 * MIB, 2.0);
         assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 64 * MIB);
         assert_eq!(sizer.settled_target(), None);
     }
@@ -441,6 +500,187 @@ mod tests {
         obs.learned_target = Some(16 * MIB);
         assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 16 * MIB);
         assert_eq!(sizer.settled_target(), Some(16 * MIB));
+    }
+
+    /// One size's CPU per byte in the ring stage of RC-T28, in nanoseconds: its function's
+    /// (the task's), and the engine's three parts.
+    #[derive(Clone, Copy)]
+    struct Spent {
+        task: f64,
+        worker: f64,
+        decode: f64,
+        encode: f64,
+    }
+
+    /// The ring stage of RC-T28 at `bytes` a morsel. Its function, which runs in the task, is
+    /// cheaper per byte on smaller morsels (they stay in the cache); the engine pays a fixed cost
+    /// a morsel, posting and taking its pieces on the worker and decoding its read, so it costs
+    /// more per byte on smaller ones. The sink's encode is the same per byte at every size.
+    fn ring_stage(bytes: u64) -> Spent {
+        let at_64 = (64 * MIB) as f64 / bytes as f64;
+        let task = match bytes / MIB {
+            64.. => 3.0,
+            32.. => 2.4,
+            16.. => 2.2,
+            _ => 2.1,
+        };
+        Spent {
+            task,
+            worker: 0.3 + 0.05 * at_64,
+            decode: 0.4 + 0.15 * at_64,
+            encode: 0.1,
+        }
+    }
+
+    /// RC-T28 (f.4b, item 6.3ac): the search's cost at a size is the whole stage's CPU per byte,
+    /// from the scheduler's counters over the window the size ran: the function's and the
+    /// engine's. The stage above spends, per byte, 4.0 ns at 64 MiB (the function's 3.0), 3.6 at
+    /// 32 (2.4) and 3.8 at 16 (2.2): the least at 32 MiB, though the function alone is cheaper
+    /// at 16 and the worker's unit CPU alone, which the records carry, at 64.
+    #[test]
+    fn rc_t28_the_search_settles_where_the_whole_stage_costs_least() {
+        let (mut sizer, envelope) = at_the_top();
+        let mut cpu = StageCpu::default();
+        let mut target = 64 * MIB;
+        let mut t = 0;
+        let mut tried = Vec::new();
+        for _ in 0..16 {
+            // Twelve morsels at the target, as the counters and the records see them.
+            let spent = ring_stage(target);
+            let ns = |per_byte: f64| (per_byte * target as f64) as u64 * 12;
+            cpu.worker_ns += ns(spent.worker);
+            cpu.task_ns += ns(spent.task);
+            cpu.decode_ns += ns(spent.decode);
+            cpu.encode_ns += ns(spent.encode);
+            cpu.bytes_in += 12 * target;
+            let recent = records(12, target, spent.worker, t);
+            t += 100;
+            tried.push(target);
+            let mut obs = observation(target, 3.5, 0);
+            obs.recent = recent.clone();
+            obs.cpu = cpu;
+            let next = sizer.propose(&obs, &envelope).morsel_target;
+            if next != target {
+                // The sizer sees each new target first beside what ran before it.
+                let mut obs = observation(next, 3.5, 0);
+                obs.recent = recent;
+                obs.cpu = cpu;
+                assert_eq!(sizer.propose(&obs, &envelope).morsel_target, next);
+                target = next;
+            }
+            if sizer.settled_target().is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            sizer.settled_target(),
+            Some(32 * MIB),
+            "tried {:?} MiB",
+            tried.iter().map(|b| b / MIB).collect::<Vec<_>>()
+        );
+        let cost = sizer.settled_cost().expect("measured where it settled");
+        assert!(
+            (cost.function - 2.4).abs() < 1e-6 && (cost.engine - 1.2).abs() < 1e-6,
+            "{cost:?}"
+        );
+    }
+
+    /// RC-T28: a stage with no ring task runs its function on the worker, so the function's
+    /// part is the workers' unit CPU and the engine's the decode and the encode beside it.
+    #[test]
+    fn rc_t28_a_stage_with_no_ring_task_is_its_units_and_its_ends() {
+        let from = StageCpu {
+            worker_ns: 100,
+            task_ns: 0,
+            decode_ns: 10,
+            encode_ns: 5,
+            bytes_in: 1_000,
+        };
+        let now = StageCpu {
+            worker_ns: 2_100,
+            task_ns: 0,
+            decode_ns: 510,
+            encode_ns: 505,
+            bytes_in: 2_000,
+        };
+        let cost = now.since(&from).expect("bytes came in");
+        assert_eq!((cost.function, cost.engine), (2.0, 1.0));
+        assert_eq!(cost.total(), 3.0);
+        assert_eq!(now.since(&now), None, "no bytes, no verdict");
+    }
+
+    /// RC-T28: a memory cut below the settled target keeps it settled there, with nothing
+    /// measured at the new one to say.
+    #[test]
+    fn rc_t28_a_memory_cut_below_the_settled_target_has_no_cost() {
+        let (mut sizer, envelope) = at_the_top();
+        let mut obs = observation(16 * MIB, 3.5, 0);
+        obs.learned_target = Some(16 * MIB);
+        assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 16 * MIB);
+        assert_eq!(sizer.settled_cost(), None, "learned, not measured");
+        // Growth far past the allowance halves the target and the settled one with it.
+        sizer.observe(
+            &obs,
+            &SizerOutcome {
+                peak_delta: 64 * 16 * MIB,
+                bytes_in: 16 * MIB,
+                wall_ns: 1,
+            },
+        );
+        assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 8 * MIB);
+        assert_eq!(sizer.settled_target(), Some(8 * MIB));
+        assert_eq!(sizer.settled_cost(), None);
+    }
+
+    /// RC-T28: the search stops at the envelope's floor, settled with what it measured there:
+    /// a half that would pass the floor is not tried, whether the search is starting or keeping
+    /// a cheaper half. A sizer with no search has no settled cost.
+    #[test]
+    fn rc_t28_the_search_stops_at_the_floor_with_what_it_measured() {
+        // Starting at the floor's double: the half is the floor, tried and kept, and its half
+        // passes the floor, so it settles there.
+        let (mut sizer, _) = at_the_top();
+        let envelope = Envelope {
+            min: 32 * MIB,
+            max: 64 * MIB,
+        };
+        let mut cpu = StageCpu::default();
+        let mut obs = observation(64 * MIB, 3.5, 0);
+        obs.recent = records(12, 64 * MIB, 4.0, 0);
+        obs.cpu = ran(&mut cpu, 12, 64 * MIB, 4.0);
+        assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 32 * MIB);
+        let mut obs = observation(32 * MIB, 3.5, 0);
+        obs.recent = records(12, 64 * MIB, 4.0, 0);
+        obs.cpu = cpu;
+        assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 32 * MIB);
+        obs.recent = records(12, 32 * MIB, 3.0, 100);
+        obs.cpu = ran(&mut cpu, 12, 32 * MIB, 3.0);
+        assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 32 * MIB);
+        assert_eq!(sizer.settled_target(), Some(32 * MIB));
+        let cost = sizer.settled_cost().expect("measured there");
+        assert!((cost.total() - 3.0).abs() < 1e-4, "{cost:?}");
+
+        // Starting at the floor itself: no half to try, settled where it is.
+        let (mut sizer, _) = at_the_top();
+        let envelope = Envelope {
+            min: 64 * MIB,
+            max: 64 * MIB,
+        };
+        let mut obs = observation(64 * MIB, 3.5, 0);
+        obs.recent = records(12, 64 * MIB, 2.0, 0);
+        obs.cpu = ran(&mut StageCpu::default(), 12, 64 * MIB, 2.0);
+        assert_eq!(sizer.propose(&obs, &envelope).morsel_target, 64 * MIB);
+        assert_eq!(sizer.settled_target(), Some(64 * MIB));
+        let cost = sizer.settled_cost().expect("measured there");
+        assert!(
+            (cost.function - 2.0).abs() < 1e-4 && cost.engine == 0.0,
+            "{cost:?}"
+        );
+
+        assert_eq!(
+            super::super::LearnedSizer::new(0.85, 0.25).settled_cost(),
+            None
+        );
     }
 
     /// RC-T23: growth past the allowance still halves.

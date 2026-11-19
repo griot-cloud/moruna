@@ -183,6 +183,9 @@ fn finish_stage(shared: &Shared, worker: u16, stage_ix: usize) -> Result<()> {
         }));
         let c1 = crate::cputime::thread_cpu_ns();
         let t1 = crate::cputime::now_ns();
+        // Item 6.3ac: the end's call is one of the stage's units, whatever it gave.
+        let unit_cpu_ns = c1.saturating_sub(c0);
+        entry.worker_cpu_ns.fetch_add(unit_cpu_ns, Ordering::SeqCst);
         let alloc = moruna_kernel::take_kernel_alloc();
         let retire = !matches!(outcome, Ok(Ok(_)));
         {
@@ -267,10 +270,11 @@ fn finish_stage(shared: &Shared, worker: u16, stage_ix: usize) -> Result<()> {
             if let Some(taken) = &taken {
                 // 6.3m, decision 4: a morsel with no time gives the cost model nothing.
                 let timed = match morsel.time {
-                    moruna_kernel::MorselTime::Unit => {
-                        Some((t1.saturating_sub(t0), c1.saturating_sub(c0)))
+                    moruna_kernel::MorselTime::Unit => Some((t1.saturating_sub(t0), unit_cpu_ns)),
+                    moruna_kernel::MorselTime::Given { wall_ns, cpu_ns } => {
+                        entry.task_cpu_ns.fetch_add(cpu_ns, Ordering::SeqCst);
+                        Some((wall_ns, cpu_ns))
                     }
-                    moruna_kernel::MorselTime::Given { wall_ns, cpu_ns } => Some((wall_ns, cpu_ns)),
                     moruna_kernel::MorselTime::Untimed => None,
                 };
                 if let Some((wall_ns, cpu_ns)) = timed {
@@ -298,7 +302,8 @@ fn finish_stage(shared: &Shared, worker: u16, stage_ix: usize) -> Result<()> {
         let s1 = shared.sampler.sample()?;
         let q_after = crate::worker::tier_totals(&shared.placement_stats());
         let none = moruna_kernel::MorselFeatures::default();
-        for (seq, taken, rows, bytes, tier) in gave {
+        let shares = crate::worker::cpu_shares(unit_cpu_ns, gave.len());
+        for ((seq, taken, rows, bytes, tier), cpu_ns) in gave.into_iter().zip(shares) {
             // SC-I4: the batch is a morsel of this stage, and leaves one record like every other:
             // a morsel the stage was given with its rows and bytes in as it was taken.
             let (rows_in, bytes_in, tier_in, features) = match &taken {
@@ -328,7 +333,7 @@ fn finish_stage(shared: &Shared, worker: u16, stage_ix: usize) -> Result<()> {
                     features,
                     s0,
                     s1,
-                    cpu_ns: c1.saturating_sub(c0),
+                    cpu_ns,
                     q_before: q_before.clone(),
                     q_after: q_after.clone(),
                     miss_wait_us: 0,

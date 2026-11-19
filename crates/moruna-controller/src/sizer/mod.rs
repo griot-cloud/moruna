@@ -65,6 +65,66 @@ pub struct Observation {
     /// holds is bounded by `trace.memory_limit`. A sizer must read a short window as less
     /// evidence and never as evidence that the stage was idle (11 f).
     pub recent: Vec<TraceRecord>,
+    /// The stage's CPU and input bytes since the run began, as of this tick (item 6.3ac).
+    pub cpu: StageCpu,
+}
+
+/// A stage's CPU and input bytes since the run began, from the scheduler's counters (item
+/// 6.3ac, f.4b). A sizer takes the difference over a window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageCpu {
+    /// The workers' thread CPU over all the stage's units, those that gave no morsel included.
+    pub worker_ns: u64,
+    /// What its ring task gave for the morsels it completed; 0 for a stage with no ring task.
+    pub task_ns: u64,
+    /// The decode CPU of the sources that feed it directly.
+    pub decode_ns: u64,
+    /// The encode CPU of the sinks it feeds directly.
+    pub encode_ns: u64,
+    /// The input bytes it has taken.
+    pub bytes_in: u64,
+}
+
+impl StageCpu {
+    /// The stage's CPU per input byte between `from` and these counters, in its two parts;
+    /// `None` when it took no bytes in between. The function's is the task's CPU, or for a
+    /// stage with no ring task (none given in between) the workers' unit CPU, in which the
+    /// function runs; the engine's is the rest.
+    pub fn since(&self, from: &StageCpu) -> Option<CpuPerByte> {
+        let bytes = self
+            .bytes_in
+            .checked_sub(from.bytes_in)
+            .filter(|b| *b > 0)? as f64;
+        let worker = self.worker_ns.saturating_sub(from.worker_ns);
+        let task = self.task_ns.saturating_sub(from.task_ns);
+        let codec = self.decode_ns.saturating_sub(from.decode_ns)
+            + self.encode_ns.saturating_sub(from.encode_ns);
+        let (function, engine) = if task > 0 {
+            (task, worker + codec)
+        } else {
+            (worker, codec)
+        };
+        Some(CpuPerByte {
+            function: function as f64 / bytes,
+            engine: engine as f64 / bytes,
+        })
+    }
+}
+
+/// A stage's CPU per input byte at one morsel size, in nanoseconds (item 6.3ac, f.4b).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CpuPerByte {
+    /// Its function's.
+    pub function: f64,
+    /// The engine's: what the stage cost beside its function.
+    pub engine: f64,
+}
+
+impl CpuPerByte {
+    /// The whole stage's.
+    pub fn total(&self) -> f64 {
+        self.function + self.engine
+    }
 }
 
 /// One sizer's answer.
@@ -105,6 +165,11 @@ pub trait Sizer: Send {
     /// The target a throughput search settled on, if the sizer ran one to the end: what the
     /// profile keeps for the next run of the kernel (e.3, f.4b). `None` by default.
     fn settled_target(&self) -> Option<u64> {
+        None
+    }
+    /// What the stage spent per byte at the settled target, when the search measured it there
+    /// (item 6.3ac). `None` by default.
+    fn settled_cost(&self) -> Option<CpuPerByte> {
         None
     }
 }
