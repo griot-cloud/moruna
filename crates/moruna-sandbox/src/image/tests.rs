@@ -676,11 +676,19 @@ fn an_unmeasured_function_warms_up_on_its_first_instance_and_the_fit_funds_the_o
     assert!(k.warming());
     assert_eq!((k.instances(), k.instances_ready()), (4, 1));
     assert_eq!(k.morsel_bytes_max(), Some(160 * MIB));
+    assert_eq!(k.measured_line(), None, "nothing fitted yet");
     let (dir, stage) = plain_stage("fit", 2560 * MIB, 4);
     lock(&k.warm).readings = score_readings();
     lock(&k.warm).started = Some(Instant::now());
     k.warmed(&stage);
     assert!(!k.warming());
+    // The fitted line is said to the controller at once (6.3w).
+    let said = k.measured_line().expect("the warm-up's line");
+    assert!(
+        (said.per_input_byte - 20.0).abs() < 1e-6
+            && (said.fixed_bytes - (150 * MIB) as f64).abs() < 64.0,
+        "{said:?}"
+    );
     // The fit: 150 MiB of its own and 20 bytes a byte (to the least squares' rounding). Four at
     // pieces of 16 MiB need 470 MiB each, of the 2560 the run has for them: all four, and
     // 680 MiB back to the arena.

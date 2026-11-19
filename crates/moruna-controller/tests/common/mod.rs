@@ -195,6 +195,7 @@ pub fn stats(active: u16, busy: u16) -> SchedulerStats {
             skipped: 0,
             instances_live: 1,
             morsel_bytes_max: None,
+            measured_line: None,
         }],
         workers_active: active,
         workers_busy: busy,
@@ -264,6 +265,9 @@ pub struct RecordingProber {
     calls: Mutex<Vec<(StageId, u64)>>,
     /// When set, every probe fails with this `Plan` message instead of answering.
     fails_with: Option<String>,
+    /// When set, what the scheduler's counters say from the first probe on: what a warm-up
+    /// the probe's morsel completed has measured (6.3w).
+    then_stats: Option<SchedulerStats>,
 }
 
 impl RecordingProber {
@@ -272,6 +276,18 @@ impl RecordingProber {
             inner,
             calls: Mutex::new(Vec::new()),
             fails_with: None,
+            then_stats: None,
+        })
+    }
+
+    /// A prober whose probe leaves the scheduler's counters at `stats`, as a stage whose
+    /// warm-up the probe's morsel completed says its line from then on (6.3w).
+    pub fn then_stats(inner: FakeKnobs, stats: SchedulerStats) -> Arc<RecordingProber> {
+        Arc::new(RecordingProber {
+            inner,
+            calls: Mutex::new(Vec::new()),
+            fails_with: None,
+            then_stats: Some(stats),
         })
     }
 
@@ -282,6 +298,7 @@ impl RecordingProber {
             inner,
             calls: Mutex::new(Vec::new()),
             fails_with: Some(msg.to_string()),
+            then_stats: None,
         })
     }
 
@@ -299,6 +316,9 @@ impl Prober for RecordingProber {
             .push((stage, bytes));
         if let Some(msg) = &self.fails_with {
             return Err(moruna_kernel::MorunaError::Plan(msg.clone()));
+        }
+        if let Some(stats) = &self.then_stats {
+            self.inner.set_stats(stats.clone());
         }
         self.inner.probe(stage, bytes)
     }

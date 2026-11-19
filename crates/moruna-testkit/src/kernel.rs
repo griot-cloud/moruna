@@ -6,8 +6,8 @@ use std::thread::ThreadId;
 use std::time::Duration;
 
 use moruna_kernel::{
-    Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, MorunaError, Payload,
-    PayloadKind, PayloadSpec, Result, ResumePolicy, SourceSchema, TierPref,
+    Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState, MeasuredLine, MorunaError,
+    Payload, PayloadKind, PayloadSpec, Result, ResumePolicy, SourceSchema, TierPref,
 };
 
 /// One `apply`: its index, the instance that ran it and the thread it ran on (d.15).
@@ -63,6 +63,7 @@ struct Inner {
     refuse_on: Vec<usize>,
     panic_on: Vec<usize>,
     grow_state_by: u64,
+    measured_line: Option<MeasuredLine>,
     init_calls: AtomicU64,
     restore_calls: AtomicU64,
     checkpoint_calls: Arc<AtomicU64>,
@@ -73,7 +74,7 @@ struct Inner {
 ///
 /// Knobs: `amplification(f64)`, `latency(Duration)`, `stateful(instances, state_bytes)`,
 /// `resume(ResumePolicy)`, `fail_on(applies)`, `refuse_on(applies)`, `panic_on(applies)`,
-/// `grow_state_by(bytes)`.
+/// `grow_state_by(bytes)`, `measured_line(line)`.
 /// Observables: `applies()`, `init_calls()`, `restore_calls()`, `checkpoint_calls()`.
 #[derive(Clone)]
 pub struct FakeKernel {
@@ -101,6 +102,7 @@ impl FakeKernel {
                 refuse_on: Vec::new(),
                 panic_on: Vec::new(),
                 grow_state_by: 0,
+                measured_line: None,
                 init_calls: AtomicU64::new(0),
                 restore_calls: AtomicU64::new(0),
                 checkpoint_calls: Arc::new(AtomicU64::new(0)),
@@ -158,6 +160,12 @@ impl FakeKernel {
         self.rebuild(|b| b.grow_state_by = bytes)
     }
 
+    /// Knob: the line `Kernel::measured_line` says, as a warm-up that has measured the function
+    /// would (item 6.3w).
+    pub fn measured_line(self, line: MeasuredLine) -> FakeKernel {
+        self.rebuild(|b| b.measured_line = Some(line))
+    }
+
     /// Observable: one record per apply, in call order.
     pub fn applies(&self) -> Vec<ApplyRecord> {
         self.lock().applies.clone()
@@ -193,6 +201,7 @@ impl FakeKernel {
             refuse_on: self.inner.refuse_on.clone(),
             panic_on: self.inner.panic_on.clone(),
             grow_state_by: self.inner.grow_state_by,
+            measured_line: self.inner.measured_line,
         };
         f(&mut builder);
         let state = std::mem::take(&mut *self.lock());
@@ -208,6 +217,7 @@ impl FakeKernel {
                 refuse_on: builder.refuse_on,
                 panic_on: builder.panic_on,
                 grow_state_by: builder.grow_state_by,
+                measured_line: builder.measured_line,
                 init_calls: AtomicU64::new(self.init_calls()),
                 restore_calls: AtomicU64::new(self.restore_calls()),
                 checkpoint_calls: Arc::clone(&self.inner.checkpoint_calls),
@@ -236,6 +246,7 @@ struct Builder {
     refuse_on: Vec<usize>,
     panic_on: Vec<usize>,
     grow_state_by: u64,
+    measured_line: Option<MeasuredLine>,
 }
 
 impl Kernel for FakeKernel {
@@ -261,7 +272,12 @@ impl Kernel for FakeKernel {
             preferred_rows: None,
             resume: self.inner.resume,
             state_bytes: Some(self.inner.state_bytes),
+            measured_line: None,
         }
+    }
+
+    fn measured_line(&self) -> Option<MeasuredLine> {
+        self.inner.measured_line
     }
 
     fn accepts(&self) -> PayloadSpec {

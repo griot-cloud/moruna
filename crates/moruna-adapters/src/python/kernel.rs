@@ -236,6 +236,7 @@ impl PyKernel {
                     preferred_rows: spec.preferred_rows,
                     resume: spec.resume,
                     state_bytes: spec.state_bytes,
+                    measured_line: None,
                 },
                 resume: spec.resume,
                 declared: spec.declared.clone(),

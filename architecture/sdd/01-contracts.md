@@ -555,6 +555,17 @@ pub struct KernelHints {
     /// Bytes one instance's state is expected to hold (a model's weights); seeds the
     /// controller's state term before the first `footprint` is observed (RC f.3).
     pub state_bytes: Option<u64>,
+    /// The stage's measured line where the run has one (system design 3A, 6.3w): set by the
+    /// run from what the job, the registry or its store measured, never by a kernel. The anon
+    /// fit takes its slope where its window cannot resolve one (RC f.3).
+    pub measured_line: Option<MeasuredLine>,
+}
+
+/// A function's memory as a line over its batch, in the units the run sizes its instances with.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MeasuredLine {
+    pub fixed_bytes: f64,
+    pub per_input_byte: f64,
 }
 
 /// Per-instance state a stateful kernel keeps between `apply` calls.
@@ -650,6 +661,10 @@ pub trait Kernel: Send + Sync + 'static {
     /// The output schema for the input schemas, port 0 first (d.16). The default is
     /// `output_schema` for one input and a `Plan` refusal for several.
     fn output_schema_of(&self, inputs: &[SourceSchema]) -> Result<SourceSchema> { .. }
+    /// The function's line as this run's warm-up measured it, once it has (system design 3A,
+    /// 6.3w): read with the stage's counters every tick (`StageStats::measured_line`), as
+    /// `morsel_bytes_max` is; the controller's anon fit takes its slope (RC f.3). Default `None`.
+    fn measured_line(&self) -> Option<MeasuredLine> { None }
 }
 ```
 
@@ -1004,7 +1019,8 @@ pub struct KnobSnapshot {
 pub trait StatsSource: Send + Sync { fn scheduler_stats(&self) -> SchedulerStats; }
 
 #[derive(Clone, Debug, Default)]
-pub struct StageStats { pub stage: StageId, pub tasks: u64, pub busy_ns: u64, pub errors: u32, pub skipped: u32, pub instances_live: u16 }
+pub struct StageStats { pub stage: StageId, pub tasks: u64, pub busy_ns: u64, pub errors: u32, pub skipped: u32, pub instances_live: u16,
+    pub morsel_bytes_max: Option<u64> /* RC-I11 */, pub measured_line: Option<MeasuredLine> /* the warm-up's, 6.3w */ }
 
 #[derive(Clone, Debug, Default)]
 pub struct SchedulerStats {

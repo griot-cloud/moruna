@@ -135,8 +135,13 @@ pub(crate) fn fit_notes(state: &crate::ControllerState) -> Vec<String> {
         .stages
         .iter()
         .map(|ctl| {
+            // Which slope stands (item 6.3w), once a record has been fitted.
+            let from = ctl
+                .anon_slope
+                .map(|from| format!(" {}", from.said()))
+                .unwrap_or_default();
             format!(
-                "controller stage {}: amplification {:.2}, anon fit {} bytes fixed plus {:.3} bytes a morsel byte, safety {:.2}, morsel target {} bytes, {} breaches at the floor",
+                "controller stage {}: amplification {:.2}, anon fit {} bytes fixed plus {:.3} bytes a morsel byte{from}, safety {:.2}, morsel target {} bytes, {} breaches at the floor",
                 ctl.stage, ctl.a_k, ctl.c_anon, ctl.a_anon, ctl.safety, ctl.target, ctl.floor_breaches
             )
         })

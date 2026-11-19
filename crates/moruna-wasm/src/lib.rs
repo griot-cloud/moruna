@@ -397,6 +397,7 @@ impl WasmKernel {
                 ResumePolicy::Reinit
             },
             state_bytes: h.state_bytes,
+            measured_line: None,
         };
         Ok(WasmKernel {
             package,

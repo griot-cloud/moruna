@@ -389,6 +389,25 @@ fn sc_j_stats_before_a_run() {
         bytes: 64,
     });
     assert_eq!(rig.scheduler.snapshot().morsel_target.len(), 3);
+    assert!(
+        stats.per_stage.iter().all(|s| s.measured_line.is_none()),
+        "no warm-up has measured anything"
+    );
+}
+
+/// j (6.3w): a stage's counters carry the line its kernel's warm-up measured, read each time
+/// the controller reads them, as the largest morsel its instances take is.
+#[test]
+fn sc_j_the_counters_carry_the_warm_up_s_line() {
+    let line = moruna_kernel::MeasuredLine {
+        fixed_bytes: 4.0e6,
+        per_input_byte: 2.0,
+    };
+    let rig = RigBuilder::new()
+        .kernel(Arc::new(FakeKernel::new().measured_line(line)))
+        .go();
+    let stats = rig.scheduler.scheduler_stats();
+    assert_eq!(stats.per_stage[0].measured_line, Some(line));
 }
 
 /// d.1: `Scheduler::new` refuses a chain whose sink cannot take the last stage's output, and

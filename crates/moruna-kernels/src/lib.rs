@@ -762,6 +762,7 @@ impl Kernel for StdKernel {
                 _ => ResumePolicy::Reinit,
             },
             state_bytes: None,
+            measured_line: None,
         }
     }
 

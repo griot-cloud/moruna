@@ -1001,7 +1001,10 @@ fn drive(
                 stage,
                 fingerprint: kernel.fingerprint(),
                 schema_hash: schemas[usize::from(input)].hash(),
-                hints: kernel.hints(),
+                hints: with_measured_line(
+                    kernel.hints(),
+                    measured.get(at).and_then(Option::as_ref),
+                ),
                 kind: kernel.kind(),
             }
         })
@@ -2622,6 +2625,24 @@ fn amplification_of(kernel: &dyn moruna_kernel::Kernel) -> f64 {
         .unwrap_or(DEFAULT_OUT_OF_ARENA_AMPLIFICATION)
 }
 
+/// A stage's hints as the controller is given them (item 6.3w): with the stage's measured line
+/// where the run has one (`measured`, what the job, the registry or the run's store measured of
+/// its function), its fixed bytes and its bytes per input byte, the units the run sizes the
+/// function's instances with. The controller's anon fit takes its slope where its window cannot
+/// resolve one (11 f.3). Where the run has none, the kernel's own hints, unchanged.
+fn with_measured_line(
+    mut hints: moruna_kernel::KernelHints,
+    measured: Option<&moruna_cost::Memory>,
+) -> moruna_kernel::KernelHints {
+    if let Some(memory) = measured {
+        hints.measured_line = Some(moruna_kernel::MeasuredLine {
+            fixed_bytes: memory.fixed_bytes,
+            per_input_byte: memory.per_input_byte,
+        });
+    }
+    hints
+}
+
 /// The smallest region granularity 02 e.1 rounds the arena down to.
 const GRANULE_BYTES: u64 = 64 << 10;
 
@@ -2721,6 +2742,35 @@ mod tests {
                 "{nothing}"
             );
         }
+    }
+
+    /// 6.3w: the controller is given a stage's measured line where the run has one, its fixed
+    /// bytes and its bytes per input byte; where it has none, the kernel's hints as they are.
+    #[test]
+    fn the_controller_is_given_the_stage_s_measured_line() {
+        let declared = moruna_kernel::KernelHints {
+            expected_amplification: Some(3.0),
+            ..moruna_kernel::KernelHints::default()
+        };
+        let memory = moruna_cost::Memory {
+            fixed_bytes: 4.0e6,
+            per_input_byte: 2.0,
+            output_per_input_byte: None,
+            spread: 0.1,
+            units: 5,
+            input_bytes_min: 1 << 20,
+            input_bytes_max: 16 << 20,
+        };
+        let given = with_measured_line(declared.clone(), Some(&memory));
+        assert_eq!(
+            given.measured_line,
+            Some(moruna_kernel::MeasuredLine {
+                fixed_bytes: 4.0e6,
+                per_input_byte: 2.0
+            })
+        );
+        assert_eq!(given.expected_amplification, Some(3.0), "the rest stands");
+        assert_eq!(with_measured_line(declared, None).measured_line, None);
     }
 
     /// 6.3f: a Linux image stage warms up when it has other instances to size, as the most a

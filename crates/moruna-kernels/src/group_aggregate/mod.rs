@@ -1078,6 +1078,7 @@ impl Kernel for GroupAggregate {
                 Path::Dense => self.dense_bytes(),
                 Path::Hash => None,
             },
+            measured_line: None,
         }
     }
 

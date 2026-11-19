@@ -62,8 +62,8 @@ pub use held::Held;
 pub use ids::{ALIGNMENT, DeviceId, LOCAL_NODE, NodeId, RunId, Seq, SplitId, StageId};
 pub use kernel::{
     AllocCounts, Completed, GilState, InitCtx, Kernel, KernelAlloc, KernelHints, KernelKind,
-    KernelState, LogicalRows, LogicalTaskRows, MorselTime, NoState, ResumePolicy, set_kernel_alloc,
-    take_kernel_alloc,
+    KernelState, LogicalRows, LogicalTaskRows, MeasuredLine, MorselTime, NoState, ResumePolicy,
+    set_kernel_alloc, take_kernel_alloc,
 };
 pub use knobs::{
     CancelToken, ErrorPolicy, Knob, KnobSnapshot, Knobs, ProbeResult, Prober, RecordHook,

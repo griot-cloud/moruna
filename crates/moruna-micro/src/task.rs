@@ -463,6 +463,8 @@ struct Warm {
     started: u64,
     /// What it found and did, for the stage's note.
     said: Option<String>,
+    /// The line it fitted, which the stage's kernel says to the controller (item 6.3w).
+    line: Option<moruna_kernel::MeasuredLine>,
 }
 
 impl Busy {
@@ -1084,6 +1086,13 @@ impl ImageTask {
             laid.join(", ")
         );
         let fit = moruna_api::Measured::from_readings(&readings, client.as_ref());
+        // Said to the controller as soon as it is fitted (item 6.3w).
+        if let Some(fit) = &fit {
+            lock(&self.busy.warm).line = Some(moruna_kernel::MeasuredLine {
+                fixed_bytes: fit.fixed_bytes,
+                per_input_byte: fit.per_input_byte,
+            });
+        }
         let share = *lock(&self.ceiling);
         let others = self.instances().saturating_sub(1);
         if let (Some(fit), Some(share)) = (fit, share) {
@@ -2962,6 +2971,12 @@ impl Kernel for ImageTask {
         let ceiling = (*lock(&self.ceiling))?;
         let plane = layout::ring_sizes(self.plane_budget(ceiling)).piece;
         Some(layout::piece_cap(plane, measured))
+    }
+
+    /// The line the stage's warm-up fitted, once it has (item 6.3w): the controller's anon fit
+    /// takes its slope.
+    fn measured_line(&self) -> Option<moruna_kernel::MeasuredLine> {
+        lock(&self.busy.warm).line
     }
 
     fn accepts(&self) -> PayloadSpec {

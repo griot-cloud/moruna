@@ -44,6 +44,8 @@ pub(super) struct Warm {
     pub(super) started: Option<Instant>,
     /// What it found and did, for the stage's note.
     pub(super) said: Option<String>,
+    /// The line it fitted, which the stage's kernel says to the controller (item 6.3w).
+    pub(super) line: Option<moruna_kernel::MeasuredLine>,
 }
 
 /// The node's form of a measurement, which its fit keeps the slope of.
@@ -198,6 +200,11 @@ impl ImageKernel {
             laid.join(", ")
         );
         if let Some(fit) = moruna_api::Measured::from_readings(&readings, client.as_ref()) {
+            // Said to the controller as soon as it is fitted (item 6.3w).
+            lock(&self.warm).line = Some(moruna_kernel::MeasuredLine {
+                fixed_bytes: fit.fixed_bytes,
+                per_input_byte: fit.per_input_byte,
+            });
             let line = as_memory(&fit);
             said.push_str(&format!(
                 ": {:.0} bytes of its own and {:.3} bytes a byte, margin {:.2}{}",
