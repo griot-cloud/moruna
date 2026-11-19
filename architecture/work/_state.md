@@ -15,11 +15,12 @@ Boot evidence is kept in `~/moruna-data/boots/` (chain logs, scripts, run report
 
 | Item | Branch | State |
 |---|---|---|
-| 6.3g a function's memory measured | MERGED 13bb3750 (phases 1–3, with 6.3i's two commits) | Done, booted: Score and Enrich complete with the warm-up (4.9 s of 96 s); gate-grows restarts past its room with every row once; 6.3i's KB5 lines pass. Left for 6.3f: the Linux ImageKernel's slicing at the cap, a real Python image function at 4 instances |
+| 6.3p + 1.11e ring wakeups (since 04:45) | `work/6.3p-plane-batching` on `work/1.11e-wake-waits-a-slice` | The fair lockstep measurement of rules b, d and e; both merge together once DS-P steady passes and lockstep does not regress |
+| (free since 04:35Z) | | Next: 6.3v the Linux restart |
 
 ## The PM's, in order
 
-Run 6 next: the node alone at feature's tip (the asynchronous fetch, 6.3g, 6.3r's gap fix), its table merged with run 5's Linux engines.
+Run 6 running (launched 04:18Z, image cc3086ad: the asynchronous fetch, 6.3d, 6.3g, 6.3f, 6.3r's gap fix, 6.3u's timing, the kernels): the node alone, its table merged with run 5's Linux engines when it ends.
 
 Benchmark run 5 so far (results 202611182200, image b11c1342): node Score 55–57 s 6/6, Occupancy 15.8–17.6 s, Enrich 63–74 s 6/6, Audit 17.4–17.9 s 4/6 (2 failed on 6.3r's gap). The Linux engines are installing and running this time (0.6.6's Rust Score 30.3 s, 0.6.6 Python 60.1 s, Dask 78.8 s). Harness faults to fix before the next full run: Ray fails every job with `ImportError: cannot import name 'HTTPFileSystem' from 'fsspec.implementations.http'` (fsspec too new for ray 2.60; pin it in install.py); Dask's Enrich r0 ended KilledWorker.
 
@@ -53,5 +54,5 @@ Benchmark run 5 is ready (`~/moruna-data/chain-bench5.sh <commit>`): the node im
 | 17 | 6.3v the Linux restart | after 6.3f | none | A Linux image instance killed by its cgroup (memory.events oom_kill) restarts once at the need (peak and what the kill shows, widened by the margin, capped at half the room), its failed slice sent again, as the node's restart does (6.3g) |
 | 18 | 6.3w the controller's anon fit on small morsels | to write | none | Found by 6.3f: on 5 KB test batches the anon fit read 115–215 bytes a morsel byte (the process's own few MiB put on tiny morsels, fixed term 0), so the controller ran 1 worker of 4. Boots show "anon fit 0 bytes fixed plus ~4 bytes a morsel byte" too. Figures (IM-T32/33, 1 GiB, arrow_echo): 5 KB batches fit 215.8 and 114.4 bytes a byte, anon for kernels 66 MB, 1–2 of 4 workers; 1 MiB batches fit 12.9 (true about 2, the process's ~3.9 MB fixed put on the morsels), workers dropped to 1 at the warm-up's end and came back one every 0.27 s. The fit needs its fixed term |
 | 19 | 1.11g the device manager's drain clock | to write | none | Found by 1.11e: the device manager gives its drivers WAIT_NS = 120 s to end once its own listeners close (kernel/devices/server/src/node.rs:880), but block3–7 (the Linux stack's disks) end only when their last client does; a boot whose tests finish sooner drains for longer (83–97 s, once ~120 s). Start the clock only for drivers whose own clients have gone |
-| 16 | S.1 dependency advisories (helper since 06:55) | `work/S.1-dependency-advisories` on cc3086ad | none | Upgraded: rustls 0.23.46 and rustls-webpki 0.103.17 (both workspaces), tokio 1.53.3, wasmtime 48.0.9 with wat 1.254.2, zip 9.0.5, zstd 0.13.5 (and -safe, -sys), yoke-derive 0.8.4 (yanked 0.8.3); chrono, chrono-tz, humantime, paste ignored by ID with reasons; cargo deny advisories (yanked = deny) in --fast offline, --rust, full and CI. Kernel tests 1,090 and TLS suites pass; root tests running. The booted HTTPS and Blob check waits for the next image |
+| 16 | S.1 dependency advisories | MERGED (`work/S.1-dependency-advisories` 54f8ca02, 830a6a0b) | none | Done: rustls 0.23.46 and rustls-webpki 0.103.17 (both workspaces), tokio 1.53.3, wasmtime 48.0.9 with wat 1.254.2, zip 9.0.5, zstd 0.13.5 (and -safe, -sys), yoke-derive 0.8.4 (yanked 0.8.3); chrono, chrono-tz, humantime (root) and paste (kernel) ignored by ID with reasons, no vulnerability ignored; `cargo deny` advisories (yanked = deny) in --fast offline, --rust, full and CI, both workspaces. Root tests 2,332 pass, kernel 1,090, TLS suites pass. Left: the booted HTTPS and Blob-over-TLS check on the next image |
 

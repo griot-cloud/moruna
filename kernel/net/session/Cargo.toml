@@ -15,4 +15,4 @@ netstack-protocol = { path = "../protocol", version = "=0.1.0" }
 moruna-netstack = { path = "../stack", version = "=0.1.0" }
 moruna-node-http = { path = "../../node/http", version = "=0.1.0" }
 rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "crypto"] }
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }

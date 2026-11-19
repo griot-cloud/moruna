@@ -6,7 +6,8 @@
 # or a page in no toctree under docs/ (tools/docs/check_docs.py; CI also builds
 # the site with Sphinx, warnings as errors); a commit-message rule the DCO self-test
 # rejects (tools/quality/check_dco.sh, F6.5); a supply-chain rule of deny.toml
-# when cargo-deny is installed (F6.5); a failing test; a failing
+# when cargo-deny is installed (F6.5), a known RustSec advisory in either workspace
+# among them (S.1); a failing test; a failing
 # examples/append_column.rs, which is the first program a user writes; line
 # coverage below MORUNA_COVERAGE_MIN (default 80) in any workspace crate that has
 # instrumented lines (a stub crate with no code is not measured); a failing
@@ -16,8 +17,10 @@
 #   (none)    the whole gate, everything below.
 #   --fast    the hooks' half: every check that takes seconds on an incremental build (em
 #             dashes, stubs, the docs, formatting, clippy over every target, which compiles
-#             the tests too, the tier lint and the supply-chain bans).
-#   --rust    CI's Rust job: everything except python/tests.
+#             the tests too, the tier lint, the supply-chain bans and the advisories checked
+#             offline against the RustSec database as last fetched).
+#   --rust    CI's Rust job: everything except python/tests, cargo-deny required and the
+#             advisories checked against the database fetched now.
 #   --python  CI's Python job: python/tests against a freshly built wheel, and nothing else.
 #             The two jobs run side by side, so neither waits for the other and a failure in
 #             one does not hide the other's result.
@@ -61,6 +64,29 @@ lean() {
   fi
   find target/debug/deps -maxdepth 1 -type f -perm -u+x ! -name '*.so' -delete 2>/dev/null || true
   step "lean: $(df -h . | awk 'NR==2 {print $4}') free"
+}
+
+# The RustSec advisories, in the root workspace and in the kernel's (kernel/deny.toml, which
+# cargo-deny reads beside the manifest it is given). The hooks' half (--fast) runs offline,
+# against the database as cargo-deny last fetched it, in about a second per workspace. Where
+# no database has ever been fetched it says so and passes: that is the one case in which it
+# passes without checking. Every other mode fetches the database first, so it judges against
+# the advisories published today.
+advisories() {
+  local db_root="${CARGO_HOME:-$HOME/.cargo}/advisory-dbs"
+  if [ "$MODE" = fast ]; then
+    if ! compgen -G "$db_root/advisory-db-*/.git" >/dev/null; then
+      step "cargo deny check advisories: not run, no RustSec database has been fetched into $db_root yet (run cargo deny fetch once, online); CI runs it"
+      return 0
+    fi
+    step "cargo deny --offline check advisories (root, kernel/), against the database as last fetched"
+    quiet advisories cargo deny --offline check advisories
+    quiet advisories_kernel cargo deny --offline --manifest-path kernel/Cargo.toml check advisories
+  else
+    step "cargo deny check advisories (root, kernel/)"
+    quiet advisories cargo deny check advisories
+    quiet advisories_kernel cargo deny --manifest-path kernel/Cargo.toml check advisories
+  fi
 }
 
 MODE=all
@@ -294,13 +320,19 @@ if [ -f Cargo.toml ]; then
   step "tools/lint/same_bounds.sh"
   quiet lint tools/lint/same_bounds.sh
   # Supply-chain policy (deny.toml, board F6.5). cargo-deny is a CI tool, not a
-  # workspace dependency, so a machine without it still passes this gate.
-  # Locally only the offline, deterministic halves are fatal: `bans` (one arrow,
-  # parquet, object_store and tokio) and `sources` (crates.io only). `advisories`
-  # needs to fetch the RustSec database, which a pre-commit hook must not do, and
-  # `licenses` is reported rather than enforced here because it currently carries
-  # an open decision for the PM (see the CC0-1.0 note in deny.toml). The
-  # supply-chain workflow runs all four and fails on any of them.
+  # workspace dependency, so a machine without it still passes the hooks' half and the
+  # local full gate; CI's Rust job (--rust) installs it and fails without it.
+  # `bans` (one arrow, parquet, object_store and tokio) and `sources` (crates.io only)
+  # are offline and deterministic, so they are fatal everywhere. `licenses` is reported
+  # rather than enforced here because it currently carries an open decision for the PM
+  # (see the CC0-1.0 note in deny.toml); the weekly supply-chain job fails on it.
+  # `advisories` (the RustSec database, and a yanked crate in the lock file), in both
+  # workspaces (root and kernel/, each with its own deny.toml), is fatal everywhere (work
+  # item S.1, 2026-11-19: five rustls and webpki vulnerabilities and a yanked crate went unseen
+  # because nothing on a commit or a pull request ran it). The hooks run it offline,
+  # against the RustSec database as last fetched, so a commit that brings in a known
+  # vulnerable crate stops at the commit; the --rust and full gates fetch the database,
+  # and CI's online run is the authority.
   if command -v cargo-deny >/dev/null 2>&1; then
     step "cargo deny check bans sources"
     quiet deny cargo deny check bans sources
@@ -309,8 +341,11 @@ if [ -f Cargo.toml ]; then
     else
       step "cargo deny check licenses: open finding, see deny.toml; the supply-chain workflow fails on it"
     fi
+    advisories
+  elif [ "$MODE" = rust ]; then
+    fail "cargo-deny is not installed: CI's Rust job runs cargo deny check advisories (cargo install --locked cargo-deny)"
   else
-    step "cargo-deny is not installed (cargo install --locked cargo-deny); deny.toml not checked here, the supply-chain workflow checks it"
+    step "cargo-deny is not installed (cargo install --locked cargo-deny); deny.toml and the advisories not checked here, CI checks them"
   fi
   if [ "$MODE" = fast ]; then
     step "OK (fast checks passed. The full release gate runs in required Linux CI)"

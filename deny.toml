@@ -49,10 +49,15 @@ targets = [
 
 [advisories]
 # cargo-deny config version 2: a vulnerability is always an error, so there is
-# no knob here that could soften it. `yanked` stays at its default (a warning)
-# because `cargo audit` in the same workflow reads the lock file's yanked status
-# and fails on it; the two tools split that job between them on purpose.
+# no knob here that could soften it. A yanked crate in the lock file is an error
+# too. Nothing else checks for one: this comment used to say `cargo audit` in the
+# same workflow failed on it, but no workflow runs `cargo audit`, and a yanked
+# yoke-derive 0.8.3 sat in the lock file unseen until work item S.1 (PM,
+# 2026-11-19). cargo-deny reads the yanked state from the crates.io index: the
+# gate's online run from the index as it is now, the hooks' offline run from
+# cargo's local copy of it, as last updated.
 db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
 # An advisory is ignored only by the PM, with the reason, the date and the event
 # that removes it written on the entry. cargo-deny 0.20.2 accepts only `id` and
 # `reason` on an ignore entry (there is no `expiration` key in this version), so
@@ -69,6 +74,18 @@ ignore = [
   # reactor first enables an object-store backend. See issue #9.
   { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39.4 via the pinned object_store 0.13.2; dormant until an object-store backend is enabled; no upgrade keeps one arrow in the workspace; removed or re-decided before the wave 2 gate (PM, 2026-09-22, issue #9)" },
   { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39.4 via the pinned object_store 0.13.2; dormant until an object-store backend is enabled; no upgrade keeps one arrow in the workspace; removed or re-decided before the wave 2 gate (PM, 2026-09-22, issue #9)" },
+  # Unmaintained, not vulnerable: chronotope announced that chrono and chrono-tz are no
+  # longer maintained, and humantime is unmaintained because it wraps chrono
+  # (chronotope/chrono#1768, RustSec 2026-0543, 0555 and 0542). No Moruna crate names any of the three. They come in
+  # only with the pinned arrow and parquet 59.3.0, object_store 0.13.2, pyo3 0.29.2 and
+  # pyo3-arrow 0.19.0 (and chrono-tz also through the `chrono-tz` feature the root
+  # Cargo.toml turns on for arrow, so that a timestamp column can name its zone). No
+  # release of any of them drops chrono, so there is nothing to replace them with until
+  # arrow moves off it. Each entry is re-decided when the arrow, parquet and
+  # object_store pin moves (preamble 6.2). Decided by the PM on 2026-11-19 (work item S.1).
+  { id = "RUSTSEC-2026-0543", reason = "chrono 0.4.45 is unmaintained, not vulnerable; no Moruna crate uses it; it comes in only through the pinned arrow/parquet 59.3.0, object_store 0.13.2, pyo3 0.29.2 and pyo3-arrow 0.19.0, none of which has a release without it; re-decided when the arrow/parquet/object_store pin moves (PM, 2026-11-19, S.1)" },
+  { id = "RUSTSEC-2026-0555", reason = "chrono-tz 0.10.4 is unmaintained, not vulnerable; no Moruna crate uses it directly; it comes in through the pinned arrow 59.3.0 (its `chrono-tz` feature, for zone-named timestamp columns), pyo3 0.29.2 and pyo3-arrow 0.19.0; re-decided when the arrow/parquet/object_store pin moves (PM, 2026-11-19, S.1)" },
+  { id = "RUSTSEC-2026-0542", reason = "humantime 2.4.0 is unmaintained (it wraps chrono), not vulnerable; no Moruna crate uses it; it comes in only through the pinned object_store 0.13.2; re-decided when the arrow/parquet/object_store pin moves (PM, 2026-11-19, S.1)" },
 ]
 
 [licenses]

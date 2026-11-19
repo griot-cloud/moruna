@@ -4,7 +4,7 @@
 **Status:** DRAFT, 2026-10-30. Implementation and proof are tracked separately below.
 **Parent:** `BOARD.md` EK, KE2; SDD 20 (process boundary), SDD 23 (service SDK), SDD 29 (card protocol).
 **Component:** `kernel/net/{protocol,stack,server}`. The server is a user process, not kernel code.
-**Consumes:** `moruna.driver.net`, the device directory, smoltcp 0.12.0, rustls 0.23.45 and ring 0.17.14.
+**Consumes:** `moruna.driver.net`, the device directory, smoltcp 0.12.0, rustls 0.23.46 and ring 0.17.14.
 
 ## a. Responsibility
 

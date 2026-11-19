@@ -16,7 +16,7 @@ serde = { version = "=1.0.229", default-features = false, features = ["alloc", "
 # `raw_value`: a job's document and its report pass through as the text they arrived as.
 serde_json = { version = "=1.0.154", default-features = false, features = ["alloc", "raw_value"] }
 # The network server's versions (kernel/net/stack).
-rustls = { version = "=0.23.45", default-features = false, features = ["ring"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring"] }
 ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }
 
 # On the kernel, ring's randomness comes from moruna_svc::random, as the network server's does.
@@ -34,4 +34,4 @@ test-exit = []
 [dev-dependencies]
 # A real rustls client for the tests, as the network server's tests use; `tls12` so that a test
 # can show the server refuses a TLS 1.2 client.
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }

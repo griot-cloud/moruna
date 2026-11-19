@@ -67,7 +67,7 @@ arrow = { version = "=59.3.0", default-features = false, features = ["ffi", "ipc
 # Arrow IPC LZ4_FRAME and ZSTD buffers (07 e.9, 08 e.3, contracts e.8): `moruna-kernel` inflates them
 # itself, after checking every declared size; the sink writes them through arrow-ipc.
 lz4_flex = { version = "=0.14.0", default-features = false, features = ["std", "frame", "safe-encode", "safe-decode"] }
-zstd = { version = "=0.13.3", default-features = false }
+zstd = { version = "=0.13.5", default-features = false }
 # The message arrow-ipc reads after a compressed batch has been inflated: built with the generated
 # builders, which need the flatbuffers crate arrow-ipc itself uses. The job document (SDD 22 e.4,
 # KA5) is read through the code flatc generates at this version (`tools/flatc/generate.sh`).
@@ -76,7 +76,7 @@ parquet = { version = "=59.3.0", features = ["arrow", "async", "object_store"] }
 object_store = { version = "=0.13.2" }
 dlpark = { version = "=0.8.0" }
 safetensors = { version = "=0.8.0" }
-tokio = { version = "=1.53.1", features = ["rt-multi-thread", "fs", "sync"] }
+tokio = { version = "=1.53.3", features = ["rt-multi-thread", "fs", "sync"] }
 io-uring = { version = "=0.7.15" }
 crossbeam = { version = "=0.8.5" }
 cudarc = { version = "=0.19.9", features = ["cuda-12060"] }
@@ -127,7 +127,7 @@ socket2 = { version = "=0.6.5" }
 # signatures. All three are already in the graph through `object_store` at these versions; they
 # are named here so the client can use them directly (a preamble 6.2 table addition, E2).
 reqwest = { version = "=0.12.28", default-features = false }
-rustls = { version = "=0.23.45", default-features = false }
+rustls = { version = "=0.23.46", default-features = false }
 ring = { version = "=0.17.14", default-features = false }
 # The job document's content address (MH 4.1, 13 d.2): `sha256` of the canonical JSON.
 sha2 = { version = "=0.11.0" }
@@ -147,9 +147,9 @@ schemars = { version = "=1.2.2" }
 # else; wat
 # writes the test components in the text format, at the wasmparser that wasmtime uses; zip is the `.pex`
 # archive; landlock and seccompiler confine a `.pex` stage's child on Linux.
-wasmtime = { version = "=47.0.4", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
-wat = { version = "=1.252.0" }
-zip = { version = "=9.0.3", default-features = false, features = ["deflate"] }
+wasmtime = { version = "=48.0.9", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
+wat = { version = "=1.254.2" }
+zip = { version = "=9.0.5", default-features = false, features = ["deflate"] }
 landlock = { version = "=0.4.7" }
 seccompiler = { version = "=0.5.0" }
 
