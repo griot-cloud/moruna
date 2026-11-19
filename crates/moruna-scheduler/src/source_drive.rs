@@ -785,7 +785,9 @@ fn submit<'a>(
                 || shared.offload_inline(),
                 move || {
                     let started = std::time::Instant::now();
+                    let cpu = crate::cputime::thread_cpu_ns();
                     let decoded = decoder.decode(&owned, fetched, alloc.as_ref(), tier);
+                    decoding.codec_cpu(crate::cputime::thread_cpu_ns().saturating_sub(cpu));
                     worker_times
                         .here()
                         .decode

@@ -127,6 +127,7 @@ pub(crate) fn observation(
         completions_since_adjust: ctl.completions_since_adjust,
         damping: model::damping(state),
         recent,
+        cpu: ctl.cpu,
     }
 }
 

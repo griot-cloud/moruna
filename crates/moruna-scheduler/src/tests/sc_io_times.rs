@@ -19,6 +19,17 @@ const FETCH: Duration = Duration::from_millis(2);
 const DECODE: Duration = Duration::from_millis(3);
 const ENCODE: Duration = Duration::from_millis(3);
 const PUT: Duration = Duration::from_millis(1);
+/// The CPU each decode and each encode spends besides its sleep (item 6.3ac).
+const BURN_NS: u64 = 1_000_000;
+
+/// Spend `ns` of this thread's CPU.
+fn burn(ns: u64) {
+    let start = crate::cputime::thread_cpu_ns();
+    let mut x = 0u64;
+    while crate::cputime::thread_cpu_ns().saturating_sub(start) < ns {
+        x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(7));
+    }
+}
 
 /// A fake source that fetches on the drive and decodes on workers.
 struct Split2(FakeSource);
@@ -66,6 +77,7 @@ impl Source for Split2 {
         _tier: Tier,
     ) -> Result<Payload> {
         std::thread::sleep(DECODE);
+        burn(BURN_NS);
         fetched
             .0
             .downcast::<Payload>()
@@ -95,6 +107,7 @@ impl Sink for Encode2 {
     }
     fn encode(&self, seq: Seq, payload: Payload) -> Result<Encoded> {
         std::thread::sleep(ENCODE);
+        burn(BURN_NS);
         Ok(Encoded(Box::new((seq, payload))))
     }
     fn put(&self, encoded: Encoded) -> BoxFuture<'_, Result<()>> {
@@ -110,6 +123,11 @@ impl Sink for Encode2 {
 }
 
 fn run(source: Arc<dyn Source>, sink: Box<dyn Sink>) -> Scheduler {
+    run_chain(source, 1, sink)
+}
+
+/// The run of `stages` stages of the fake kernel between the source and the sink.
+fn run_chain(source: Arc<dyn Source>, stages: usize, sink: Box<dyn Sink>) -> Scheduler {
     let scheduler = Scheduler::new(
         SchedulerConfig {
             initial_morsel_target: 8,
@@ -119,7 +137,9 @@ fn run(source: Arc<dyn Source>, sink: Box<dyn Sink>) -> Scheduler {
         },
         Pipeline::chain(
             source,
-            vec![Arc::new(FakeKernel::new())],
+            (0..stages)
+                .map(|_| Arc::new(FakeKernel::new()) as Arc<dyn moruna_kernel::Kernel>)
+                .collect(),
             SinkHandle::wrap(sink, false, 1 << 20),
         ),
         Arc::new(FakePlacement::new()),
@@ -161,6 +181,44 @@ fn reads_are_timed_apart_from_decodes_and_encodes_apart_from_writes() {
         "{sink:?}"
     );
     assert!(sink.io_ns >= 8 * ns(PUT), "{sink:?}");
+}
+
+/// Item 6.3ac: a decode's and an encode's CPU is counted as the thread's, as a worker's unit is,
+/// not as the wall time they took, and charged to the stages beside them: the source's to the
+/// stage it feeds, the sink's to the stage that feeds it. Each stage counts the bytes it took.
+#[test]
+fn decode_and_encode_cpu_are_charged_to_the_stages_beside_them() {
+    use moruna_kernel::StatsSource;
+    let sink = FakeSink::new();
+    let scheduler = run_chain(
+        Arc::new(Split2(FakeSource::new().splits(1, 8, 64))),
+        2,
+        Box::new(Encode2(sink.clone())),
+    );
+    assert_eq!(sink.written().len(), 8);
+    let stats = scheduler.scheduler_stats();
+    let times = scheduler.io_times();
+    let (decode, encode) = (&stats.decodes[0], &stats.encodes[0]);
+    assert_eq!((stats.decodes.len(), stats.encodes.len()), (1, 1));
+    assert_eq!(decode.stages, vec![1], "the source feeds stage 1");
+    assert_eq!(encode.stages, vec![2], "stage 2 feeds the sink");
+    for (cpu, wall) in [
+        (
+            decode.cpu_ns,
+            times.sources[0].codec_ns.expect("timed apart"),
+        ),
+        (encode.cpu_ns, times.sinks[0].codec_ns.expect("timed apart")),
+    ] {
+        assert!(cpu >= 8 * BURN_NS, "{cpu} ns of CPU");
+        assert!(
+            cpu + 8 * ns(DECODE) / 2 <= wall,
+            "{cpu} ns of CPU in {wall} ns"
+        );
+    }
+    for stage in &stats.per_stage {
+        assert!(stage.bytes_in > 0, "{stage:?}");
+        assert_eq!(stage.task_cpu_ns, 0, "no ring task");
+    }
 }
 
 #[test]

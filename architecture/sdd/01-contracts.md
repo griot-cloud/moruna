@@ -1020,7 +1020,14 @@ pub trait StatsSource: Send + Sync { fn scheduler_stats(&self) -> SchedulerStats
 
 #[derive(Clone, Debug, Default)]
 pub struct StageStats { pub stage: StageId, pub tasks: u64, pub busy_ns: u64, pub errors: u32, pub skipped: u32, pub instances_live: u16,
-    pub morsel_bytes_max: Option<u64> /* RC-I11 */, pub measured_line: Option<MeasuredLine> /* the warm-up's, 6.3w */ }
+    pub morsel_bytes_max: Option<u64> /* RC-I11 */, pub measured_line: Option<MeasuredLine> /* the warm-up's, 6.3w */,
+    /* since the run began, 6.3ac: the workers' CPU over all its units, its ring task's (`Given`), the bytes it took */
+    pub worker_cpu_ns: u64, pub task_cpu_ns: u64, pub bytes_in: u64 }
+
+/// One source's decode or one sink's encode, as thread CPU since the run began, and the stages
+/// it is charged to: those a source feeds directly, those that feed a sink directly (6.3ac).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodecStats { pub cpu_ns: u64, pub stages: Vec<StageId> }
 
 #[derive(Clone, Debug, Default)]
 pub struct SchedulerStats {
@@ -1030,6 +1037,7 @@ pub struct SchedulerStats {
     pub source_exhausted: bool, pub seq_issued: Seq,
     pub committed_seq: Option<Seq>, pub checkpoints: u64, pub last_checkpoint_us: u64, pub resumed: bool, pub recomputed: u64,
     pub knob_clamps: u64,
+    pub decodes: Vec<CodecStats> /* each source's, 6.3ac */, pub encodes: Vec<CodecStats> /* each sink's */,
 }
 
 /// The probe protocol (RC f.2) as the controller sees it. Implemented by the scheduler.

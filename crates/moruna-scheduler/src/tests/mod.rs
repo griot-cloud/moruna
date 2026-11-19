@@ -61,6 +61,8 @@ mod sc_p_native_stage_memory;
 mod sc_p_a_unit_is_a_morsel;
 // Item 6.3m, decided: a morsel given later is pushed, recorded and learned under its own number.
 mod sc_p_a_morsel_given_later;
+// Item 6.3ac: a unit's CPU is split among the morsels it gives and counted once.
+mod sc_p_a_unit_s_cpu_is_counted_once;
 mod sc_t5_knobs_immediate;
 mod sc_t6_instance_affinity;
 mod sc_t7_error_policies;

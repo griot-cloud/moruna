@@ -211,7 +211,11 @@ fn write_loop(
                                         MorunaError::Sink(format!("no sink {index}"))
                                     })?;
                                     let guard = end.sink.read().unwrap_or_else(|e| e.into_inner());
+                                    let cpu = crate::cputime::thread_cpu_ns();
                                     let encoded = guard.encode(seq, payload);
+                                    encoding.codec_cpu(
+                                        crate::cputime::thread_cpu_ns().saturating_sub(cpu),
+                                    );
                                     owner.times.here().encode.fetch_add(
                                         crate::times::since(started),
                                         std::sync::atomic::Ordering::Relaxed,

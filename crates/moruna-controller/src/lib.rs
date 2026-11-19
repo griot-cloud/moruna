@@ -50,7 +50,8 @@ pub use admission::{FixedCommitmentInput, fixed_commitment_budget};
 /// least by it, system design 3A, 6.3d).
 pub use model::READ_CHARGE;
 pub use sizer::{
-    Envelope, LearnedSizer, ModelSizer, Observation, Proposal, RuleSizer, Sizer, SizerOutcome,
+    CpuPerByte, Envelope, LearnedSizer, ModelSizer, Observation, Proposal, RuleSizer, Sizer,
+    SizerOutcome, StageCpu,
 };
 pub use summary::{Bottleneck, ControllerSummary};
 
@@ -555,6 +556,9 @@ pub(crate) struct StageCtl {
     /// A call of this stage waits on a port (MH 4.10): its target is not taken down, and its
     /// state is not what a memory row ends the run for, while it waits.
     pub waiting: bool,
+    /// The stage's CPU and input bytes since the run began, as the last tick read them (item
+    /// 6.3ac).
+    pub cpu: StageCpu,
 }
 
 const INITIAL_ANON_AMPLIFICATION: f64 = 4.0;
@@ -666,6 +670,7 @@ impl StageCtl {
             var_mean: 0.0,
             var_m2: 0.0,
             waiting: false,
+            cpu: StageCpu::default(),
         }
     }
 

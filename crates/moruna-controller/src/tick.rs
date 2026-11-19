@@ -123,7 +123,23 @@ pub(crate) fn tick(ctl: &Inner) {
         }
         let mut line_moved = false;
         for stage_stats in &stats.per_stage {
+            // Item 6.3ac: a source's decode is charged to the stages it feeds, a sink's encode to
+            // the stages that feed it.
+            let charged = |ends: &[moruna_kernel::CodecStats]| -> u64 {
+                ends.iter()
+                    .filter(|end| end.stages.contains(&stage_stats.stage))
+                    .map(|end| end.cpu_ns)
+                    .sum()
+            };
+            let cpu = crate::StageCpu {
+                worker_ns: stage_stats.worker_cpu_ns,
+                task_ns: stage_stats.task_cpu_ns,
+                decode_ns: charged(&stats.decodes),
+                encode_ns: charged(&stats.encodes),
+                bytes_in: stage_stats.bytes_in,
+            };
             if let Some(ctl_stage) = state.stage_mut(stage_stats.stage) {
+                ctl_stage.cpu = cpu;
                 ctl_stage.instances_live = stage_stats.instances_live;
                 ctl_stage.morsel_cap = stage_stats.morsel_bytes_max;
                 // A warm-up that has measured the stage's function says its line here, and the
@@ -219,9 +235,20 @@ pub(crate) fn tick(ctl: &Inner) {
                 {
                     state.stages[at].settled_noted = Some(best);
                     if observation.learned_target != Some(best) {
+                        // Item 6.3ac: what the stage spent there, in its two parts.
+                        let parts = state.stages[at]
+                            .sizer
+                            .settled_cost()
+                            .map(|cost| {
+                                format!(
+                                    " (its function's {:.2} ns, the engine's {:.2} ns a byte)",
+                                    cost.function, cost.engine
+                                )
+                            })
+                            .unwrap_or_default();
                         state.note(format!(
-                            "stage {stage} settled at {best} bytes a morsel, where its function \
-                             spent the least CPU per byte"
+                            "stage {stage} settled at {best} bytes a morsel, where the stage \
+                             spent the least CPU per byte{parts}"
                         ));
                     }
                 }
