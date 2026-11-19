@@ -24,7 +24,10 @@
 # coverage. Local hooks run the portable fast checks.
 # Checks on their own cadence:
 #   cargo-deny    licences and advisories change with the world, not with a
-#                 commit, so they run weekly and on demand, below.
+#                 commit, so all four checks run weekly and on demand, below, in
+#                 both workspaces. The advisories, bans and sources also run on
+#                 every pull request, in the Rust job's quality gate (S.1), so a
+#                 known vulnerability cannot wait a week to be seen.
 #   the container the cgroup ceiling and MinIO matter at a wave gate, not on
 #                 every push: a full rebuild inside a container is the most
 #                 expensive thing here. Run it from the Actions tab, or let
@@ -111,6 +114,12 @@ jobs:
           rustup component add llvm-tools-preview
           cargo install cargo-llvm-cov --locked --version 0.8.5
           "$FREETHREADED" -m pip install --quiet --only-binary=:all: numpy pytest pyarrow maturin pyyaml uv cryptography
+      # The gate below runs cargo deny check advisories in both workspaces (and bans and
+      # sources), and fails in --rust mode without cargo-deny (work item S.1).
+      - name: cargo-deny for the gate's advisories, bans and sources
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        with:
+          tool: cargo-deny@0.20.2
       - name: The vmm jail may make user namespaces, and reach the programs it binds in
         # The jail's child binds moruna-vhost-vsock into its root from inside a user namespace
         # that does not map the runner's user, so it walks the path as "other". An installed
@@ -501,7 +510,9 @@ jobs:
         uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
         with:
           tool: cargo-deny@0.20.2
-      - run: cargo deny check advisories licenses bans sources
+      - run: |
+          cargo deny check advisories licenses bans sources
+          cargo deny --manifest-path kernel/Cargo.toml check advisories licenses bans sources
       - name: MinIO for the object-store paths
         run: |
           docker run -d --name minio --network host \

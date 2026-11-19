@@ -3,7 +3,7 @@
 # differences are MPL-2.0 for OSTD (DECISIONS.md MK1), and scoped 0BSD
 # exceptions for the native network stack's smoltcp and managed dependencies.
 #
-#   cargo deny --manifest-path kernel/Cargo.toml check licenses bans sources
+#   cargo deny --manifest-path kernel/Cargo.toml check advisories licenses bans sources
 #
 # (cargo-deny reads the deny.toml beside the manifest it is given.)
 
@@ -14,6 +14,23 @@ targets = [
   "x86_64-unknown-none",
   "x86_64-unknown-linux-gnu",
   "aarch64-apple-darwin",
+]
+
+[advisories]
+# As in the root deny.toml: config version 2, so a vulnerability is always an error, a yanked
+# crate in the lock file is an error too, and an advisory is ignored only by the PM, with the
+# reason, the date and the event that removes it written on the entry (cargo-deny 0.20.2 takes
+# only `id` and `reason`).
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = [
+  # paste 1.0.15 is unmaintained, not vulnerable: its author archived it. It is a
+  # compile-time proc-macro, and the kernel graph reaches it once, through the vendored
+  # osdk-frame-allocator 0.19.0 (kernel/vendor), whose `fast_smp_counter!` macro uses
+  # `paste!` to name a per-CPU static. Nothing of it is left in the kernel at run time. The
+  # vendored crate is not edited to swap in a fork. Decided by the PM on 2026-11-19 (work
+  # item S.1).
+  { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 is unmaintained, not vulnerable; a compile-time proc-macro used once, by `fast_smp_counter!` in the vendored osdk-frame-allocator 0.19.0, with nothing left at run time; re-decided when the vendored OSTD copy is updated (PM, 2026-11-19, S.1)" },
 ]
 
 [licenses]
