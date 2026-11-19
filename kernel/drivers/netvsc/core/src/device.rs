@@ -332,6 +332,11 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         &mut self.wire.channel
     }
 
+    /// What has moved through the card since it started (work item 6.3ab).
+    pub fn counts(&self) -> crate::Counts {
+        self.wire.counts
+    }
+
     /// Sends one frame: an RNDIS packet message in a free section of the send buffer,
     /// named to the host by an NVSP message that asks for a completion. The host's
     /// completion, read by [`Netvsc::poll`], frees the section.
@@ -366,13 +371,17 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         // What the host is owed goes first: it is waiting on it, and it is older.
         self.settle()?;
         let Some(section) = self.send.take() else {
+            self.wire.counts.sections_full += 1;
             return Ok(false);
         };
         let at = section as usize * self.send.size;
         self.send.memory.write(at, &rndis::data(frame.len()));
         self.send.memory.write(at + rndis::DATA, frame);
         let sent = self.name(section, protocol::DATA_CHANNEL_TYPE, message)?;
-        if !sent {
+        if sent {
+            self.wire.counts.frames_out += 1;
+            self.wire.counts.bytes_out += frame.len() as u64;
+        } else {
             self.send.give(nvsp::transaction(section));
         }
         #[cfg(feature = "trace-first-frames")]
@@ -611,6 +620,7 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
             next: 0,
             status: Status::SUCCESS,
         });
+        self.wire.counts.receives += 1;
         Ok(())
     }
 
@@ -670,6 +680,8 @@ impl<C: Channel, S: Shared> Netvsc<C, S> {
         self.receive
             .memory
             .read(at + start as usize, &mut self.frame);
+        self.wire.counts.frames_in += 1;
+        self.wire.counts.bytes_in += length;
         #[cfg(feature = "trace-first-frames")]
         if let Some(trace) = self.wire.trace.as_mut() {
             trace.received(&self.frame);

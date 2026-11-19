@@ -79,6 +79,8 @@ pub(crate) struct Wire<C: Channel> {
     /// commit as it is made.
     #[cfg(feature = "trace-first-frames")]
     pub trace: Option<crate::trace::Trace>,
+    /// What the wire has counted: packets in, commits, signals, a full ring (work item 6.3ab).
+    pub counts: crate::Counts,
 }
 
 /// The NVSP packet size of `version`, in the ring's whole eight-byte words. netvsp
@@ -111,6 +113,7 @@ impl<C: Channel> Wire<C> {
             deadline,
             #[cfg(feature = "trace-first-frames")]
             trace: None,
+            counts: crate::Counts::default(),
         }
     }
 
@@ -161,6 +164,14 @@ impl<C: Channel> Wire<C> {
     /// after the caller has read everything, so that a packet that came meanwhile is not
     /// left waiting for a signal already given.
     pub fn arm(&mut self) -> Result<bool, NetvscError> {
+        self.counts.arms += 1;
+        let ready = self.ready()?;
+        self.counts.idle += u64::from(!ready);
+        Ok(ready)
+    }
+
+    /// [`Wire::arm`]'s answer.
+    fn ready(&mut self) -> Result<bool, NetvscError> {
         self.flush()?;
         let incoming = self.channel.incoming();
         incoming.set_interrupt_mask(false);
@@ -244,7 +255,9 @@ impl<C: Channel> Wire<C> {
         };
         // The read is committed before the caller looks for another packet.
         let signal = incoming.commit_read(&mut at);
+        self.counts.packets_in += 1;
         if signal {
+            self.counts.signals += 1;
             self.channel.signal_host()?;
         }
         Ok(Some(Packet {
@@ -289,6 +302,7 @@ impl<C: Channel> Wire<C> {
                 Err(WriteError::Full(bytes)) => {
                     // The host signals once that much is free. It may have made the room
                     // between the write and this request, so the write is tried once more.
+                    self.counts.ring_full += 1;
                     outgoing.set_pending_send_size(bytes)?;
                     self.crowded = true;
                     self.wanted = bytes;
@@ -316,7 +330,9 @@ impl<C: Channel> Wire<C> {
             return Ok(());
         };
         let signal = self.channel.outgoing().commit_write(&mut at);
+        self.counts.commits += 1;
         if signal {
+            self.counts.signals += 1;
             self.channel.signal_host()?;
         }
         #[cfg(feature = "trace-first-frames")]

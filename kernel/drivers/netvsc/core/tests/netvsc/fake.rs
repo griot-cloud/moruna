@@ -319,6 +319,11 @@ impl Card {
         self.driver.channel().host_signals()
     }
 
+    /// What the card counted (work item 6.3ab).
+    pub fn counts(&self) -> moruna_netvsc::Counts {
+        self.driver.counts()
+    }
+
     /// The lines the card's trace noted since they were last taken (work item 1.11c).
     #[cfg(feature = "trace-first-frames")]
     pub fn take_trace(&mut self) -> Vec<String> {

@@ -13,7 +13,7 @@ use core::{
     alloc::{GlobalAlloc, Layout},
     cell::UnsafeCell,
     ptr::null_mut,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use moruna_abi::{Error, PAGE_SIZE, RawHandle, map, nr};
@@ -55,6 +55,16 @@ pub(crate) static HEAP: Heap = Heap {
         end: 0,
     }),
 };
+
+/// The large blocks mapped since the process started (work item 6.3ab): each a memory object
+/// made and mapped, and unmapped when it is freed, three calls and its pages' faults.
+static LARGE_BLOCKS: AtomicU64 = AtomicU64::new(0);
+
+/// The large blocks the process's heap has mapped since it started: every allocation over the
+/// largest small class, a `Vec` grown past it included, is one (work item 6.3ab).
+pub fn large_blocks() -> u64 {
+    LARGE_BLOCKS.load(Ordering::Relaxed)
+}
 
 fn class_of(layout: Layout) -> Option<usize> {
     let need = layout.size().max(layout.align());
@@ -129,6 +139,7 @@ unsafe impl GlobalAlloc for Heap {
         match class_of(layout) {
             Some(class) => self.with(|state| take_small(state, class)),
             None if layout.align() <= PAGE => {
+                LARGE_BLOCKS.fetch_add(1, Ordering::Relaxed);
                 map_pages(layout.size().next_multiple_of(PAGE)).map_or(null_mut(), |a| a as *mut u8)
             }
             None => null_mut(),

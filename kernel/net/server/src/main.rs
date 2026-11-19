@@ -36,9 +36,10 @@ use core::cell::RefCell;
 
 use devices_protocol::directory;
 use moruna_netstack::{
-    Card, Config, Grant, Shared, Stack, after_turn,
+    Beside, Card, CardCounts, Charged, Config, Grant, Shared, Stack, after_turn,
     boot::{NO_LEASE, fatal},
     card::CardLink,
+    cpu::Cpuid,
     granted, parse,
 };
 use moruna_svc::{
@@ -74,6 +75,17 @@ impl Watch for CardWatch {
         Signals::READABLE | Signals::PEER_CLOSED
     }
     fn signaled(&mut self, _: Signals, _: &mut Completions) -> bool {
+        // Timed on the meter (work item 6.3ab): the answers read, decoded and queued.
+        let start = clock();
+        let kept = self.take();
+        self.shared.stack.borrow_mut().meter.counts.card_ns += clock().saturating_sub(start);
+        kept
+    }
+}
+
+impl CardWatch {
+    /// Takes what the card answered; `false` once the card has failed.
+    fn take(&mut self) -> bool {
         let mut cards = self.cards.borrow_mut();
         let c = &mut cards[self.index];
         // Everything the card has answered: the channel read to its end, then each reply
@@ -113,6 +125,53 @@ impl Watch for Clock {
     fn signaled(&mut self, _: Signals, _: &mut Completions) -> bool {
         // The loop polls after every turn and sets the timer again.
         true
+    }
+}
+
+/// The meter's clock (work item 6.3ab): the clock page, read with no call; the core's clock
+/// where the kernel gives no page.
+fn clock() -> u64 {
+    moruna_sys::datapath::clock_now().unwrap_or_else(now)
+}
+
+/// The CPUID words ring's AES-GCM is chosen by (work item 6.3ab).
+fn cpuid() -> Cpuid {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    let top = __cpuid(0).eax;
+    let (leaf7_ebx, leaf7_ecx) = if top >= 7 {
+        let leaf7 = __cpuid_count(7, 0);
+        (leaf7.ebx, leaf7.ecx)
+    } else {
+        (0, 0)
+    };
+    Cpuid {
+        leaf1_ecx: __cpuid(1).ecx,
+        leaf7_ebx,
+        leaf7_ecx,
+        xsave_bytes: if top >= 0xd {
+            __cpuid_count(0xd, 0).ebx
+        } else {
+            0
+        },
+    }
+}
+
+/// What the meter's line says beside the stack's own counts: the cards'.
+fn beside(cards: &Cards, stack: &Stack) -> Beside {
+    Beside {
+        cards: cards
+            .borrow()
+            .iter()
+            .fold(CardCounts::default(), |all, l| all.plus(&l.counts)),
+        dropped: stack.ifaces.iter().map(|x| x.port.dropped).sum(),
+    }
+}
+
+/// The CPU charged to the server's account and its heap's large blocks, read for a line.
+fn charged() -> Charged {
+    Charged {
+        cpu_ns: moruna_sys::own_cpu().ok(),
+        heap_maps: Some(moruna_sys::heap_large_blocks()),
     }
 }
 
@@ -300,6 +359,7 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
         )?
     };
     let mut stack = Stack::new(&config, &cards, u64::from_le_bytes(seed), now())?;
+    stack.meter.set_clock(clock);
     // TLS's time is the node's one wall clock, the core's clock page (system design 3D): set at
     // boot from the machine's clock, and by `platform` from its cloud's `Date`. While it is
     // unset, `start_tls` is refused `TlsUnavailable`. With no roots there is no TLS at all.
@@ -339,6 +399,8 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
         ));
     }
     println!(out, "{}", up);
+    // Which AES-GCM ring takes on this CPU (work item 6.3ab).
+    println!(out, "{}", cpuid().line());
     // The listeners are taken only now, once the server has started: one that cannot start
     // ends holding none, so its clients see it go when its process ends, after its fatal
     // line, and the console names the cause first (system design 1B).
@@ -380,6 +442,8 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
     .map_err(|e| format!("watching the timer: {}", e.name()))?;
     let mut reported = alloc::vec![false; cards.borrow().len()];
     let mut linger: Option<u64> = None;
+    // When the turn woke, on the meter's clock (work item 6.3ab).
+    let mut woke = clock();
     loop {
         after_turn(&shared, &mut d, now());
         for note in core::mem::take(&mut shared.stack.borrow_mut().notes) {
@@ -432,8 +496,19 @@ fn serve(out: &Console, started: u64) -> Result<i64, String> {
         timer
             .set(if deadline == 0 { 0 } else { deadline.max(1) })
             .map_err(|e| format!("timer_set: {}", e.name()))?;
+        // The turn's work is done: it is timed before its line, whose console time it is not.
+        let line = {
+            let mut st = shared.stack.borrow_mut();
+            st.meter.turned(woke);
+            let beside = beside(&cards, &st);
+            st.meter.line(clock(), &beside, charged)
+        };
+        if let Some(line) = line {
+            println!(out, "{}", line);
+        }
         d.turn(DEADLINE_INFINITE)
             .map_err(|e| format!("wait: {}", e.name()))?;
+        woke = clock();
     }
     let st = shared.stack.borrow();
     let mut line = String::from("KE2 netstack: served until every client left");

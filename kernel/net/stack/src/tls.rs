@@ -13,6 +13,8 @@ use rustls::{
 use smoltcp::socket::tcp;
 use zeroize::Zeroize;
 
+use crate::meter::Meter;
+
 /// The largest application record accepted per send. Larger calls make progress
 /// through partial sends, as the unencrypted socket protocol already permits.
 const RECORD: usize = 16_384;
@@ -374,8 +376,9 @@ impl Tls {
     ) -> Option<Result<Result<u32, E>, Error>> {
         state_mut!(self,s=>s.receive_to(max,write))
     }
-    pub fn poll(&mut self, socket: &mut tcp::Socket<'static>, now: u64) {
-        state_mut!(self,s=>s.poll(socket,now))
+    /// Moves the socket's records, timed and counted on `meter` (work item 6.3ab).
+    pub fn poll(&mut self, socket: &mut tcp::Socket<'static>, now: u64, meter: &mut Meter) {
+        state_mut!(self,s=>s.poll(socket,now,meter))
     }
 }
 impl<C: Connection> State<C> {
@@ -484,7 +487,7 @@ impl<C: Connection> State<C> {
         }
         self.peer_closed.then(|| Ok(Ok(0)))
     }
-    pub fn poll(&mut self, socket: &mut tcp::Socket<'static>, now: u64) {
+    pub fn poll(&mut self, socket: &mut tcp::Socket<'static>, now: u64, meter: &mut Meter) {
         if self.failure.is_some() {
             return;
         }
@@ -492,14 +495,19 @@ impl<C: Connection> State<C> {
         let result = if !self.ready && self.time.current_time().is_none() {
             Err(Error::Unavailable)
         } else {
-            self.advance(socket, now)
+            self.advance(socket, now, meter)
         };
         if let Err(e) = result {
             self.failure = Some(e);
             socket.abort();
         }
     }
-    fn advance(&mut self, socket: &mut tcp::Socket<'static>, now: u64) -> Result<(), Error> {
+    fn advance(
+        &mut self,
+        socket: &mut tcp::Socket<'static>,
+        now: u64,
+        meter: &mut Meter,
+    ) -> Result<(), Error> {
         if !self.ready && now >= self.deadline {
             return Err(Error::TimedOut);
         }
@@ -514,6 +522,7 @@ impl<C: Connection> State<C> {
                 let sent = socket
                     .send_slice(&self.outgoing[self.offset..])
                     .map_err(|_| Error::Protocol)?;
+                meter.counts.tls_out_bytes += sent as u64;
                 self.offset += sent;
                 if self.offset < self.outgoing.len() {
                     return Ok(());
@@ -529,6 +538,7 @@ impl<C: Connection> State<C> {
                     .recv_slice(&mut self.incoming[at..])
                     .map_err(|_| Error::Protocol)?;
                 self.incoming.truncate(at + n);
+                meter.counts.tls_in_bytes += n as u64;
                 if !self.ready {
                     self.handshake_bytes =
                         self.handshake_bytes.checked_add(n).ok_or(Error::Limit)?;
@@ -537,6 +547,9 @@ impl<C: Connection> State<C> {
                     }
                 }
             }
+            // rustls opens every whole record it holds as it processes them: timed from here
+            // to their plaintext taken, when there is input to open.
+            let opening = (!self.incoming.is_empty()).then(|| meter.now());
             let status = self.conn.records(&mut self.incoming);
             let mut discard = status.discard;
             let mut wait = false;
@@ -565,15 +578,22 @@ impl<C: Connection> State<C> {
                             .map_err(|_| Error::Protocol)?;
                         discard += record.discard;
                         self.plain_in.extend_from_slice(record.payload)?;
+                        meter.counts.opened_bytes += record.payload.len() as u64;
+                    }
+                    if let Some(start) = opening {
+                        meter.counts.open_ns += meter.since(start);
                     }
                 }
                 ConnectionState::WriteTraffic(mut write) => {
                     self.ready = true;
                     if !self.plain_out.is_empty() {
                         self.outgoing.resize(self.plain_out.len() + OVERHEAD)?;
+                        let sealing = meter.now();
                         let n = write
                             .encrypt(&self.plain_out, &mut self.outgoing)
                             .map_err(|_| Error::Protocol)?;
+                        meter.counts.seal_ns += meter.since(sealing);
+                        meter.counts.sealed_bytes += self.plain_out.len() as u64;
                         self.outgoing.truncate(n);
                         self.plain_out.clear();
                     } else if self.closing && !self.close_queued {

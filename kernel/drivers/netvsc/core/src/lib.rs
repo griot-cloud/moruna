@@ -80,6 +80,37 @@ impl fmt::Display for Nvsp {
     }
 }
 
+/// What has moved through the card since it started (work item 6.3ab): counted always, an
+/// addition each, for the netvsc process's meter line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// Packets read off the ring from the host, of every kind.
+    pub packets_in: u64,
+    /// Receives among them: transfer-page packets, each naming one or more frames.
+    pub receives: u64,
+    /// Frames handed to the caller, and their bytes.
+    pub frames_in: u64,
+    /// Bytes of the frames handed to the caller.
+    pub bytes_in: u64,
+    /// Frames sent, and their bytes.
+    pub frames_out: u64,
+    /// Bytes of the frames sent.
+    pub bytes_out: u64,
+    /// Frames not sent at once because no send section was free.
+    pub sections_full: u64,
+    /// Writes the ring to the host had no room for, after which the host was asked to signal.
+    pub ring_full: u64,
+    /// Commits of the ring to the host.
+    pub commits: u64,
+    /// Signals to the host, by VMBus's rule: on a commit to an empty ring, or a read that made
+    /// room the host waits for.
+    pub signals: u64,
+    /// Arms: the driver asked the host to signal before it waits.
+    pub arms: u64,
+    /// Arms that found nothing to do: the driver then waits for the host's signal.
+    pub idle: u64,
+}
+
 /// Bytes of an Ethernet header: destination, source, EtherType.
 pub const ETHERNET_HEADER: usize = 14;
 /// Bytes of a page, the unit memory is shared with the host in.

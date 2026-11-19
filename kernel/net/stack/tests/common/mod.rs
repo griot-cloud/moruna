@@ -18,7 +18,7 @@ use std::{
     vec::Vec,
 };
 
-use moruna_netstack::{Card, Grant, Shared, Stack, after_turn, granted, parse};
+use moruna_netstack::{Card, Grant, Meter, Shared, Stack, after_turn, granted, parse};
 use moruna_svc::{Channel, Dispatcher, Turn, now};
 use smoltcp::wire::{
     DhcpMessageType, DhcpPacket, DhcpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
@@ -140,6 +140,24 @@ pub fn serve_until(
     trust: Option<moruna_netstack::tls::Trust>,
     stop: Arc<AtomicBool>,
 ) -> (BTreeMap<String, Channel>, thread::JoinHandle<()>) {
+    let (slots, join) = serve_metered(config, macs, wire, trust, stop);
+    // The server's panic, if it had one, is this thread's.
+    let server = thread::spawn(move || {
+        if let Err(panic) = join.join() {
+            std::panic::resume_unwind(panic);
+        }
+    });
+    (slots, server)
+}
+
+/// The same server, whose thread ends with its stack's meter (work item 6.3ab).
+pub fn serve_metered(
+    config: &str,
+    macs: &[u64],
+    wire: Wire,
+    trust: Option<moruna_netstack::tls::Trust>,
+    stop: Arc<AtomicBool>,
+) -> (BTreeMap<String, Channel>, thread::JoinHandle<Meter>) {
     let config = parse(config).expect("the configuration");
     let mut ours = BTreeMap::new();
     let mut theirs = Vec::new();
@@ -170,10 +188,12 @@ pub fn serve_until(
                 .expect("listen");
         }
         loop {
+            let woke = shared.stack.borrow().meter.now();
             after_turn(&shared, &mut d, now());
             let deadline = {
                 let mut st = shared.stack.borrow_mut();
                 wire(&mut st, &mut rng);
+                st.meter.turned(woke);
                 let t = now();
                 st.poll_at()
                     .unwrap_or(t + 50_000_000)
@@ -186,6 +206,10 @@ pub fn serve_until(
                 break;
             }
         }
+        // The stack's meter, its borrow ended before the stack goes.
+        let meter = shared.stack.borrow().meter.clone();
+        drop(shared);
+        meter
     });
     (ours, join)
 }

@@ -254,7 +254,8 @@ impl Watch for Woken {
             trace.woken();
         }
         let closed = drain(&self.wake);
-        driver.service();
+        // The card serviced, and the wake counted and timed (work item 6.3ab).
+        driver.woken();
         for (pending, outcome) in driver.take_ready() {
             done.complete(pending, outcome);
         }
@@ -263,6 +264,12 @@ impl Watch for Woken {
         }
         !closed
     }
+}
+
+/// The meter's clock (work item 6.3ab): the clock page, read with no call; the core's clock
+/// where the kernel gives no page.
+fn clock() -> u64 {
+    moruna_sys::datapath::clock_now().unwrap_or_else(now)
 }
 
 fn take(name: &str) -> Result<Handle, String> {
@@ -413,6 +420,7 @@ fn serve(console: &Console, started: u64) -> Result<(), String> {
         .take_wake()
         .ok_or("the card's wake channel")?;
     let driver: Served = Rc::new(RefCell::new(Driver::new(card)));
+    driver.borrow_mut().set_clock(clock);
     let mut dispatcher = Dispatcher::new();
     let gone = Rc::new(Cell::new(false));
     dispatcher
@@ -438,6 +446,8 @@ fn serve(console: &Console, started: u64) -> Result<(), String> {
         ),
     }
     drop(directory);
+    // When the turn woke, on the meter's clock (work item 6.3ab).
+    let mut woke = clock();
     loop {
         {
             let mut driver = driver.borrow_mut();
@@ -452,6 +462,16 @@ fn serve(console: &Console, started: u64) -> Result<(), String> {
             if let Some(why) = driver.failed() {
                 return Err(String::from(why));
             }
+            // The turn's work is done: timed before the meter's line, whose console time it
+            // is not (work item 6.3ab).
+            driver.turned(woke);
+            let beside = || moruna_netvsc_server::Beside {
+                cpu_ns: moruna_sys::own_cpu().ok(),
+                heap_maps: Some(moruna_sys::heap_large_blocks()),
+            };
+            if let Some(line) = driver.meter(clock(), beside) {
+                println!(console, "{}", line);
+            }
             // A diagnosis build notes when the wait begins, after the console's lines (work
             // item 1.11d).
             #[cfg(feature = "trace-first-frames")]
@@ -465,6 +485,7 @@ fn serve(console: &Console, started: u64) -> Result<(), String> {
         dispatcher
             .turn(DEADLINE_INFINITE)
             .map_err(|e| format!("wait: {}", e.name()))?;
+        woke = clock();
     }
 }
 

@@ -111,6 +111,8 @@ impl Handler for Session {
         let id = cx.connection();
         self.id = Some(id);
         let mut st = self.shared.stack.borrow_mut();
+        // Every request's handler is timed on the meter (work item 6.3ab).
+        let start = st.meter.now();
         st.connection(id, &self.grant, || cx.peer_watch().ok());
         let bad = Outcome::Status(Status::BadMessage);
         let bound = st.account_bound(id);
@@ -123,7 +125,7 @@ impl Handler for Session {
                 }
             };
         }
-        match ordinal {
+        let outcome = match ordinal {
             1 => match args::<()>(d) {
                 Some(()) => authorized!(st.info(id)),
                 None => bad,
@@ -221,7 +223,10 @@ impl Handler for Session {
                 None => bad,
             },
             _ => Outcome::Status(Status::UnknownMethod),
-        }
+        };
+        st.meter.counts.requests += 1;
+        st.meter.counts.requests_ns += st.meter.since(start);
+        outcome
     }
 
     fn closed(&mut self) {

@@ -437,7 +437,10 @@ version 5.
   - Score: 16.8 → 8.4 → 4.2 MB, against 15.9 → 8.0 → 5.7.
   - Audit: 8.4 MB, against 16.8.
   - Score read in 863 pieces against 465, and decoded for 34.9 s against 25.7 s, summed.
-- **Why:** with 6.3m and 6.3z, a ring morsel's record carries the function's own time, which falls
-  on smaller morsels. The search counts only that, not the extra reads, decodes and encodes a
-  smaller morsel costs the engine. Item 6.3ac makes the search's cost the whole stage's CPU per
-  byte.
+- **Why (corrected the same day):**
+  - The search reads the records' CPU, which is still the engine worker's for each unit.
+  - Since 6.3m a unit that completes no morsel leaves no record, so its CPU is lost, and one that
+    completes several puts its whole CPU on each. That bookkeeping, not the function's time,
+    moved the search.
+  - The search also counts none of the decode and encode a smaller morsel costs.
+  - Item 6.3ac makes its cost the stage's whole CPU per byte, from counters that miss no unit.

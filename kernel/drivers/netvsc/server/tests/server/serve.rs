@@ -376,3 +376,81 @@ fn a_channel_the_host_takes_back_fails_the_driver_and_sends_are_refused() {
         Some("sending frames: the channel is closed")
     );
 }
+
+/// The process's meter (work item 6.3ab): its line says what moved each way, the card's and
+/// the protocol's counts and the process's own, once frames have moved, and then at most every
+/// period while they move.
+#[test]
+fn the_meter_says_what_moved_at_most_every_period() {
+    use moruna_netvsc_server::{Beside, METER_PERIOD_NS};
+    let (mut world, commands) = World::new(ROOMY, |_| ());
+    // Nothing has moved: no line.
+    assert_eq!(world.driver(0).borrow_mut().meter(0, Beside::default), None);
+    let listener = world.listener(0);
+    let out = frames(0x6a, (0..10).map(|i| 60 + i * 100));
+    let back = frames(0x6b, (0..20).map(|i| 1514 - i * 50));
+    let (batch, delivered) = (wire(&out), back.clone());
+    let got = world.serve(thread::spawn(move || {
+        let mut c = client(&listener);
+        c.subscribe().unwrap();
+        assert_eq!(c.send(batch).unwrap(), 10);
+        commands.to(0, move |host, _| {
+            for frame in &delivered {
+                host.inject(frame);
+            }
+        });
+        collect(&mut c, 20)
+    }));
+    assert_eq!(got, back);
+    let mut driver = world.driver(0).borrow_mut();
+    // A wake and a turn of the loop, as the node's process makes them.
+    let woke = driver.now();
+    driver.woken();
+    driver.turned(woke);
+    let p = driver.process;
+    assert_eq!((p.wakes, p.turns), (1, 1));
+    assert!(
+        p.requests >= 3,
+        "the subscribe, the send, the receives: {p:?}"
+    );
+    let bytes = |f: &[Vec<u8>]| f.iter().map(|f| f.len()).sum::<usize>();
+    let beside = Beside {
+        cpu_ns: Some(7_000),
+        heap_maps: Some(8),
+    };
+    let line = driver.meter(5_000_000, || beside).expect("frames moved");
+    assert!(
+        line.starts_with("netvsc: meter at_ms=5 cpu_us=7 heap_maps=8 busy_us="),
+        "{line}"
+    );
+    for part in [
+        format!(" in={}f/{}B ", back.len(), bytes(&back)),
+        format!(" out={}f/{}B ", out.len(), bytes(&out)),
+        String::from(" turns=1 wakes=1 "),
+        String::from(" dropped=0 rx_errors=0 tx_errors=0"),
+    ] {
+        assert!(line.contains(&part), "{part:?} in {line}");
+    }
+    let card = driver.card().counts();
+    assert!(
+        card.receives > 0 && card.commits > 0 && card.arms > 0,
+        "{card:?}"
+    );
+    let hub = &driver.server().hub;
+    assert!(hub.answered > 0 && hub.answered_frames == 20, "{line}");
+    // Within the period: nothing; past it, with nothing more moved: nothing.
+    assert_eq!(
+        driver.meter(6_000_000, || panic!("read only for a line")),
+        None
+    );
+    assert_eq!(driver.meter(5_000_000 + METER_PERIOD_NS, || beside), None);
+    // Past it, with a frame more: the next line.
+    assert!(driver.card().send(&out[0]).unwrap());
+    let next = driver
+        .meter(5_000_000 + METER_PERIOD_NS, Beside::default)
+        .expect("a frame moved");
+    assert!(
+        next.contains(" out=11f/") && next.contains("cpu_us=unknown heap_maps=unknown"),
+        "{next}"
+    );
+}

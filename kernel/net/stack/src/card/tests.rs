@@ -174,6 +174,18 @@ fn every_answer_there_is_taken_in_one_pump_whatever_their_order() {
     );
     assert_eq!(link.sends(), 0);
     assert!(!readable(&link));
+    // What moved, counted (work item 6.3ab): one answer of two frames in, two sends out.
+    assert_eq!(
+        link.counts,
+        crate::meter::CardCounts {
+            answers: 1,
+            frames_in: 2,
+            bytes_in: 120,
+            sends: 2,
+            frames_out: SEND_FRAMES_MAX as u64 + 1,
+            bytes_out: 60 * (SEND_FRAMES_MAX as u64 + 1),
+        }
+    );
     // The receive and the link's next generation, asked again.
     let (ordinal, _, _) = card.request();
     assert_eq!(ordinal, 6);

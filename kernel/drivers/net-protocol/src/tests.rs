@@ -172,12 +172,17 @@ fn nt_t4_the_hub_fans_frames_out_and_bounds_every_queue() {
     );
     assert_eq!(hub.stats(2).rx_frames, 2);
     assert_eq!(hub.stats(2).rx_bytes, 130);
+    // Three receives answered with four frames; the first of connection 2's left one queued
+    // behind it (work item 6.3ab).
+    assert_eq!((hub.answered, hub.answered_frames, hub.backlog), (3, 4, 1));
     // A full queue drops and counts; the other connection's does not.
     for _ in 0..QUEUE_FRAMES + 5 {
         hub.deliver(&[3; 60]);
     }
     assert_eq!(hub.stats(1).rx_dropped, 5);
     assert_eq!(hub.stats(9).rx_dropped, 0);
+    // Both connections' queues were full: ten drops in all.
+    assert_eq!(hub.rx_dropped, 10);
     // One answer never exceeds a message, however many frames are queued.
     let mut hub: Hub<u32> = Hub::new(true, 0);
     hub.subscribe(1);

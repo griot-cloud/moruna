@@ -36,6 +36,14 @@ pub struct Hub<P> {
     pub rx_bytes: u64,
     pub rx_errors: u64,
     pub tx_errors: u64,
+    /// Frames dropped for a connection whose queue was full, every connection's.
+    pub rx_dropped: u64,
+    /// Receives answered with frames, and the frames they carried (work item 6.3ab).
+    pub answered: u64,
+    pub answered_frames: u64,
+    /// Receives answered that left frames queued behind them: their connection takes the
+    /// frames slower than the card has them.
+    pub backlog: u64,
 }
 
 impl<P> Hub<P> {
@@ -55,6 +63,10 @@ impl<P> Hub<P> {
             rx_bytes: 0,
             rx_errors: 0,
             tx_errors: 0,
+            rx_dropped: 0,
+            answered: 0,
+            answered_frames: 0,
+            backlog: 0,
         }
     }
 
@@ -97,7 +109,11 @@ impl<P> Hub<P> {
             inbox.waiting = Some((defer(), max));
             return Ok(Answer::Later);
         }
-        Ok(Answer::Now(take(inbox, max)))
+        let frames = take(inbox, max);
+        self.answered += 1;
+        self.answered_frames += frames.len() as u64;
+        self.backlog += u64::from(!inbox.frames.is_empty());
+        Ok(Answer::Now(frames))
     }
 
     /// Queues a copy of `frame` for every subscribed connection.
@@ -107,6 +123,7 @@ impl<P> Hub<P> {
         for inbox in self.inboxes.values_mut() {
             if inbox.frames.len() >= QUEUE_FRAMES || inbox.bytes + frame.len() > QUEUE_BYTES {
                 inbox.dropped += 1;
+                self.rx_dropped += 1;
                 continue;
             }
             inbox.bytes += frame.len();
@@ -116,14 +133,22 @@ impl<P> Hub<P> {
 
     /// Answers every waiting receive whose connection has frames.
     pub fn answers(&mut self, out: &mut Vec<(P, Vec<Frame>)>) {
+        let (mut answered, mut frames, mut backlog) = (0, 0, 0);
         for inbox in self.inboxes.values_mut() {
             if inbox.frames.is_empty() {
                 continue;
             }
             if let Some((pending, max)) = inbox.waiting.take() {
-                out.push((pending, take(inbox, max)));
+                let taken = take(inbox, max);
+                answered += 1;
+                frames += taken.len() as u64;
+                backlog += u64::from(!inbox.frames.is_empty());
+                out.push((pending, taken));
             }
         }
+        self.answered += answered;
+        self.answered_frames += frames;
+        self.backlog += backlog;
     }
 
     /// The link now, or later (taking `defer()`) if its generation is `generation`.
