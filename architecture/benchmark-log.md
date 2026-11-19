@@ -313,3 +313,50 @@ run.
     reading from Blob on Linux runs at about 300 MB/s. The node reads at about 52 MB/s, with one row
     group fetched at a time.
   - The asynchronous fetch (a906df5d) is in run 6. Enrich is bound by its uploads (6.3u).
+
+### Run 202611190418, the node alone at cc3086ad (PM, 2026-11-19)
+
+Image cc3086ad carries:
+- 6.3t's asynchronous fetch;
+- 6.3d's writers' claims;
+- 6.3g's measured memory;
+- 6.3f;
+- 6.3r's gap fix;
+- 6.3u's object timing;
+- the kernels.
+
+It does not carry 1.11e (a wake preempts a busy CPU after 500 µs) or 6.3p, both merged after it.
+Gate tasks are built at 1fceede8. The outputs' bit-for-bit check was still running when this was
+written.
+
+| Job | Runs | Run 6 (s) | Run 5 median (s) |
+|---|---|---|---:|
+| Score | 6 of 6 | 57.0, 60.4, 63.2, 65.1, 65.1, 67.3: slower every run | 55.3 |
+| Occupancy | 4 of 6 | 16.8, 17.8, 18.1, 19.2 | 16.5 |
+| Enrich | 6 of 6 | 71.5, 81.5, 78.6, 73.7, 77.2, 73.2 | 71.0 |
+| Audit | 4 of 6 | 19.3, 19.8, 19.7, 19.3 | 17.7 |
+
+- **The failures, 2 of Occupancy's and 2 of Audit's, are one defect (6.3x).** At the drain a task
+  stalls for about 44 s, then a batch is released with no record.
+- **The object stores' figures (6.3u's note) name the disease.** Every job reads the same 843 MB
+  in 139 requests.
+
+| Job | A read | A write | Requests in flight on average |
+|---|---:|---:|---:|
+| Occupancy | 15–22 MB/s | ≈10 MB/s | reads ≈2.4 |
+| Audit | 23–30 MB/s | ≈10 MB/s | |
+| Enrich | 11–17 MB/s | 5.5–6.3 MB/s | writes ≈2.9 |
+| Score, all 4 CPUs computing | 4.6, falling to 3.1 MB/s | 3.2–3.7 MB/s | |
+
+- **One stream is bound by the node's round trip.** A 256 KiB TCP window (the netstack's
+  default) over the 11–13 ms that 1.11d measured on the node gives about 21 MB/s. That round trip
+  is the scheduler's 10 ms slice: a woken network or driver thread waits behind a computing one,
+  which is why Score's streams fall to 3–5 MB/s. 1.11e is the fix, and run 7 measures it.
+- **Too few requests are in flight.** The controller starts the read-ahead at the worker count (4)
+  and raises it only when the workers idle (`moruna-controller` `read_ahead`, `classify.rs`).
+  Q0 peaked at 87 MB of a 3.16 GB tier, and the job's input would fit in its 7.4 GB arena many
+  times over. Each Enrich upload has 2 parts in flight.
+- **What follows run 7:**
+  - reads in flight sized by the store's rate and the arena's room, not by the worker count;
+  - more parts in flight per upload;
+  - TCP buffers at the bandwidth-delay product, if the round trip stays long.
