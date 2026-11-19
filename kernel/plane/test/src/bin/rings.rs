@@ -574,12 +574,13 @@ fn lockstep(r: &mut Run) -> Result<(), String> {
     r.start("ring-lockstep", 4 * MIB, 4)?;
     let calls0 = calls(&mut r.plane);
     let c0 = r.plane.counters();
-    // Each batch's time from its post to its record: what a lone batch, one post and then its
-    // answer awaited, costs (6.3p: lingering must cost it nothing).
+    // Each batch's time from the start of its post to its record: what a lone batch, one post
+    // and then its answer awaited, costs (6.3p: lingering must cost it nothing). Timed from the
+    // post's start, so a wake at the post and one as the engine blocks are timed alike.
     let mut took = Vec::with_capacity(LOCKSTEP as usize);
     for n in 0..LOCKSTEP {
-        r.post(n)?;
         let posted = moruna_svc::now();
+        r.post(n)?;
         let out = r.record()?;
         took.push(moruna_svc::now().saturating_sub(posted));
         r.judge(out, n)?;
@@ -612,7 +613,7 @@ fn lockstep(r: &mut Run) -> Result<(), String> {
     }
     println!(
         r.out,
-        "DS-P lockstep: ok: {} batches of {} rows, one at a time, each made in the task's region and read in place, y = 3x + 7 judged on every row, and the task said exit code 0 on its rings and its one log line on its log ring: engine {} calls a batch ({} revokes, {} regrants, {} sleeps on its bell, {} wakes of the task, {} of them as it blocked); task {} calls a batch ({} waits, {} wakes); the kernel copied {} bytes for the task, its bells' words; a batch's post to its record {} us at the median, {} us at least, {} us at most",
+        "DS-P lockstep: ok: {} batches of {} rows, one at a time, each made in the task's region and read in place, y = 3x + 7 judged on every row, and the task said exit code 0 on its rings and its one log line on its log ring: engine {} calls a batch ({} revokes, {} regrants, {} sleeps on its bell, {} wakes of the task, {} of them as it blocked); task {} calls a batch ({} waits, {} wakes); the kernel copied {} bytes for the task, its bells' words; a batch's post, from its start, to its record {} us at the median, {} us at least, {} us at most",
         LOCKSTEP,
         ROWS,
         ratio(spent, LOCKSTEP),
