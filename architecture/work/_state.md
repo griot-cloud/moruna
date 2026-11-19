@@ -16,13 +16,13 @@ Boot evidence is kept in `~/moruna-data/boots/` (chain logs, scripts, run report
 | Item | Branch | State |
 |---|---|---|
 | (free since 08:55Z) | | Next: the PM's choice after run 11 |
-| 6.3af the card link (since 09:40Z) | `work/6.3af-card-link` from feature | Building the work item: receives kept outstanding on net0 so one is always armed; the drops named first |
+| 6.3af the card link (since 09:40Z) | `work/6.3af-card-link` from 87301996 | Drops named (the hub's queue, 1024 frames); building the PM's answer (09:50Z): queued receives under moruna.driver.net 1.1, 24 at MTU 1500 |
 
 ## The PM's, in order
 
 Run 6 done (202611190418, image cc3086ad; benchmark log): Score 57–67 s (slower every run), Occupancy 16.8–19.2 s 4/6, Enrich 71–82 s, Audit 19.3–19.8 s 4/6. The failures are 6.3x. Its object figures name the disease: one stream reads at ~20 MB/s and writes at ~10 MB/s (a 256 KiB window over the node's ~12 ms round trip, the 10 ms slice that 1.11e removes), and only ~2.4 reads are in flight (read-ahead follows the worker count). Run 7 (image at dc026acc+, with 1.11e and 6.3p) is building, 04:50Z. Every completed output is bit for bit.
 
-Run 7 done (202611190506, image 15a67df7, benchmark log): 24 of 24 completed. Score 54.3–55.1 s steady, Occupancy 16.2–16.4, Enrich 60–75, Audit 17.6–18.4; 6.3x not seen in 12 runs. 1.11e lifted Score's reads under load to 12–18 MB/s a request; one request still tops near 25 MB/s, so 6.3y's in-flight count is next. Run 11 done (202611190853, image 7c973a96: 6.3ac and 6.3ad; benchmark log): 24 of 24, the best on every job (Score 46.8–49.6 s, Occupancy 14.4–15.2, Enrich 43.8–50.6, Audit 14.8–16.1); bit-for-bit check running. The network server at ~1 GB/s to its clients; the card link next (6.3af: 65% of answers backlogged, 0.43% of frames dropped). Run 12 next: 6.3x at feature's tip (its booted check).
+Run 7 done (202611190506, image 15a67df7, benchmark log): 24 of 24 completed. Score 54.3–55.1 s steady, Occupancy 16.2–16.4, Enrich 60–75, Audit 17.6–18.4; 6.3x not seen in 12 runs. 1.11e lifted Score's reads under load to 12–18 MB/s a request; one request still tops near 25 MB/s, so 6.3y's in-flight count is next. Run 11 done (202611190853, image 7c973a96: 6.3ac and 6.3ad; benchmark log): 24 of 24, the best on every job (Score 46.8–49.6 s, Occupancy 14.4–15.2, Enrich 43.8–50.6, Audit 14.8–16.1); every output bit for bit. The network server at ~1 GB/s to its clients; the card link next (6.3af: 65% of answers backlogged, 0.43% of frames dropped). Run 12 launched 09:38Z at feature's tip: 6.3x's booted check.
 
 Run 10 done (202611190756, image 80ce24c6; benchmark log): 23 of 24, bit for bit; Audit r5 failed with 6.3x (not closed). Score 52.9–54.5 s, Occupancy 17.4–18.8, Enrich 62.8–65.5, Audit 17.8–18.6. Its meters name the network ceiling (6.3ad). Run 11 next: 6.3ac (and 6.3ad if ready).
 
