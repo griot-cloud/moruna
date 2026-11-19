@@ -20,20 +20,32 @@ fn failures(summary: &Summary, checks: &[(String, Result<(), String>)]) -> Vec<S
 }
 
 #[test]
-fn the_suite_for_one_card_passes_against_the_driver() {
+fn the_suite_for_one_card_passes_against_the_driver_for_a_client_of_1_1_and_of_1_0() {
     let (mut world, _) = World::new(ROOMY, |_| ());
-    let listener = world.listener(0);
-    let (summary, checks) = world.serve(thread::spawn(move || {
+    let (listener, old) = (world.listener(0), world.listener(0));
+    let (summary, checks, summary_1_0, checks_1_0) = world.serve(thread::spawn(move || {
         let mut checks = Vec::new();
         let summary = conformance::run(
             &net_protocol::suite(),
             &mut conformance::Listener(listener),
             &mut |c| checks.push((c.name.to_string(), c.result.clone())),
         );
-        (summary, checks)
+        // A client of 1.0 (work item 6.3af): one receive waits, as in 1.0.
+        let mut checks_1_0 = Vec::new();
+        let summary_1_0 = conformance::run(
+            &net_protocol::suite_1_0(),
+            &mut conformance::Listener(old),
+            &mut |c| checks_1_0.push((c.name.to_string(), c.result.clone())),
+        );
+        (summary, checks, summary_1_0, checks_1_0)
     }));
     assert!(summary.ok(), "{:?}", failures(&summary, &checks));
     assert!(summary.passed >= 16, "{summary:?}");
+    assert!(
+        summary_1_0.ok(),
+        "{:?}",
+        failures(&summary_1_0, &checks_1_0)
+    );
     assert!(world.driver(0).borrow().failed().is_none());
 }
 
