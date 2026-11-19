@@ -1,7 +1,8 @@
 //! The protocol's conformance suites (SDD 29, k): one card alone ([`suite`]: its
 //! information, its link, frames sent, every refusal, receiving and its refusals, the
-//! counters), and two cards on one link ([`pair_suite`]: frames of every size out of
-//! one arrive at the other intact, a batch arrives in order, and both ways).
+//! counters), one card's receives as a client of 1.0 sees them ([`suite_1_0`]), and two
+//! cards on one link ([`pair_suite`]: frames of every size out of one arrive at the
+//! other intact, a batch arrives in order, and both ways).
 //!
 //! The frames a suite sends go from the card to its own address with EtherType
 //! 0x88b5, which IEEE 802 sets aside for local experiments, so a suite run on a live
@@ -10,14 +11,14 @@
 use alloc::{format, string::String, vec, vec::Vec};
 
 use moruna_svc::{
-    Encoder, Error, Kind, ProtocolError, Signals, Wire,
+    Encoder, Error, Kind, ProtocolError, ProtocolId, Signals, Wire,
     conformance::{Case, Fail, PairCase, PairSuite, Probe, Suite},
     deadline_in, now, wait_one,
 };
 
 use crate::{
-    FRAME_MAX, FRAME_MIN, Frame, HEADER, Info, Link, SEND_FRAMES_MAX, Stats, is_group, net, octets,
-    offload,
+    FRAME_MAX, FRAME_MIN, Frame, HEADER, Info, Link, QUEUE_FRAMES, SEND_FRAMES_MAX, Stats,
+    is_group, net, octets, offload, receives,
 };
 
 /// The EtherType of every frame a suite sends.
@@ -182,7 +183,8 @@ fn refusals(p: &mut Probe) -> Result<(), Fail> {
     )
 }
 
-fn receiving(p: &mut Probe) -> Result<(), Fail> {
+/// A client of 1.0: one receive waits, and a second is `InUse`.
+fn receiving_1_0(p: &mut Probe) -> Result<(), Fail> {
     p.request(6, u32_body(8)?)?
         .failure(net::Error::NotSubscribed.code())?;
     decoded::<()>(p, 5, Encoder::new())?;
@@ -190,6 +192,40 @@ fn receiving(p: &mut Probe) -> Result<(), Fail> {
     unanswered(p, 6, 1000, u32_body(8)?)?;
     p.request(6, u32_body(8)?)?
         .failure(net::Error::InUse.code())
+}
+
+/// A client of 1.1: receives wait until together they take a full queue of the card's
+/// largest frames (`receives`, work item 6.3af), and the next is `InUse`.
+fn receiving(p: &mut Probe) -> Result<(), Fail> {
+    let i = info_of(p)?;
+    p.request(6, u32_body(8)?)?
+        .failure(net::Error::NotSubscribed.code())?;
+    decoded::<()>(p, 5, Encoder::new())?;
+    decoded::<()>(p, 5, Encoder::new())?;
+    let max = QUEUE_FRAMES as u32;
+    let waiting = receives(max, i.max_frame);
+    for k in 0..waiting {
+        // More receives than a channel holds wait for the card to read the first.
+        wait_one(
+            &p.channel().0,
+            Signals::WRITABLE,
+            deadline_in(5_000_000_000),
+        )
+        .map_err(|e| format!("receive {k} waited for room: {}", e.name()))?;
+        p.send_raw(Kind::Request, 6, 1000 + k, u32_body(max)?)
+            .map_err(wire)?;
+    }
+    match wait_one(&p.channel().0, Signals::READABLE, deadline_in(200_000_000)) {
+        Err(Error::TimedOut) => {}
+        other => {
+            return Err(format!(
+                "a receive of {waiting} was answered at once: {other:?}"
+            ));
+        }
+    }
+    p.request(6, u32_body(max)?)?
+        .failure(net::Error::InUse.code())
+        .map_err(|e| format!("receive {} of a full queue's worth: {e}", waiting + 1))
 }
 
 fn counters(p: &mut Probe) -> Result<(), Fail> {
@@ -229,7 +265,7 @@ const CASES: &[Case] = &[
         check: refusals,
     },
     Case {
-        name: "receive: refused before subscribe; waits for a frame; a second waiting receive is InUse",
+        name: "receive: refused before subscribe; receives wait until together they take a full queue, and the next is InUse",
         check: receiving,
     },
     Case {
@@ -245,6 +281,22 @@ pub fn suite() -> Suite {
         id: net::ID,
         requests: net::REQUESTS,
         cases: CASES,
+        timeout: 30_000_000_000,
+    }
+}
+
+const CASES_1_0: &[Case] = &[Case {
+    name: "receive, a client of 1.0: refused before subscribe; waits for a frame; a second waiting receive is InUse",
+    check: receiving_1_0,
+}];
+
+/// The suite for one card as a client of 1.0 sees it (work item 6.3af): its receives as
+/// in 1.0, one waiting at a time. On a link where no frame arrives for it while it runs.
+pub fn suite_1_0() -> Suite {
+    Suite {
+        id: ProtocolId::new(net::ID.name, net::ID.major, 0),
+        requests: net::REQUESTS,
+        cases: CASES_1_0,
         timeout: 30_000_000_000,
     }
 }

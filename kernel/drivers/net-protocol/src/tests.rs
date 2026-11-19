@@ -7,7 +7,8 @@ use moruna_svc::{Channel, Decoder, Encoder, Handle, Kind, Wire, frame};
 
 use crate::{
     Answer, FRAME_MAX, FRAME_MIN, Frame, Hub, Info, Link, QUEUE_FRAMES, RECEIVE_BYTES,
-    SEND_FRAMES_MAX, Stats, check, flow_hash, is_group, mac, net, octets,
+    SEND_FRAMES_MAX, Stats, answer_frames, check, flow_hash, is_group, mac, net, octets,
+    queue_frames, receives,
 };
 
 fn round_trip<T: Wire + Clone + PartialEq + core::fmt::Debug>(v: T) {
@@ -58,6 +59,7 @@ fn nt_t1_the_types_travel() {
     assert!(is_group(0x0100_5e00_0001));
     assert!(!is_group(0x5254_0012_3456));
     assert_eq!(net::ID.name, "moruna.driver.net");
+    assert_eq!((net::ID.major, net::ID.minor), (1, 1));
     assert_eq!(net::REQUESTS, &[1, 2, 3, 4, 5, 6, 7]);
 }
 
@@ -147,11 +149,12 @@ fn nt_t3_a_flow_hashes_alike_and_other_frames_to_zero() {
 
 #[test]
 fn nt_t4_the_hub_fans_frames_out_and_bounds_every_queue() {
-    let mut hub: Hub<u32> = Hub::new(true, 0);
+    // Clients of 1.0: one receive waits at a time, as in 1.0.
+    let mut hub: Hub<u32> = Hub::new(true, 0, 1514);
     assert_eq!(hub.receive(1, 8, || 100), Err(net::Error::NotSubscribed));
-    hub.subscribe(1);
-    hub.subscribe(1);
-    hub.subscribe(2);
+    hub.subscribe(1, 0);
+    hub.subscribe(1, 0);
+    hub.subscribe(2, 0);
     assert_eq!(hub.subscribers(), 2);
     // No frame: the receive waits; a second waits are refused.
     assert_eq!(hub.receive(1, 8, || 100), Ok(Answer::Later));
@@ -184,8 +187,8 @@ fn nt_t4_the_hub_fans_frames_out_and_bounds_every_queue() {
     // Both connections' queues were full: ten drops in all.
     assert_eq!(hub.rx_dropped, 10);
     // One answer never exceeds a message, however many frames are queued.
-    let mut hub: Hub<u32> = Hub::new(true, 0);
-    hub.subscribe(1);
+    let mut hub: Hub<u32> = Hub::new(true, 0, 1514);
+    hub.subscribe(1, 0);
     for _ in 0..100 {
         hub.deliver(&[4; 1514]);
     }
@@ -195,8 +198,8 @@ fn nt_t4_the_hub_fans_frames_out_and_bounds_every_queue() {
     let bytes: usize = first.iter().map(|f| 4 + f.0.len()).sum();
     assert!(bytes <= RECEIVE_BYTES && bytes + 4 + 1514 > RECEIVE_BYTES);
     // The largest frame the protocol carries goes, alone, in one reply.
-    let mut hub: Hub<u32> = Hub::new(true, 0);
-    hub.subscribe(1);
+    let mut hub: Hub<u32> = Hub::new(true, 0, FRAME_MAX as u32);
+    hub.subscribe(1, 0);
     hub.deliver(&vec![5; FRAME_MAX]);
     hub.deliver(&vec![5; FRAME_MAX]);
     let Ok(Answer::Now(alone)) = hub.receive(1, 8, || 0) else {
@@ -204,9 +207,10 @@ fn nt_t4_the_hub_fans_frames_out_and_bounds_every_queue() {
     };
     assert_eq!(alone.len(), 2);
     // A closed connection's queue, waiting receive and link waits go.
-    let mut hub: Hub<u32> = Hub::new(false, 0);
-    hub.subscribe(1);
+    let mut hub: Hub<u32> = Hub::new(false, 0, 1514);
+    hub.subscribe(1, 1);
     assert_eq!(hub.receive(1, 8, || 7), Ok(Answer::Later));
+    assert_eq!(hub.receive(1, 8, || 11), Ok(Answer::Later));
     assert_eq!(hub.link_changed(1, 1, || 8), Answer::Later);
     assert_eq!(hub.link_changed(2, 1, || 9), Answer::Later);
     hub.closed(1);
@@ -233,6 +237,130 @@ fn nt_t4_the_hub_fans_frames_out_and_bounds_every_queue() {
     hub.rx_errors = 2;
     let s = hub.stats(2);
     assert_eq!((s.tx_frames, s.tx_errors, s.rx_errors), (4, 1, 2));
+}
+
+/// `n` frames of `len` bytes, each numbered in its first four bytes from `first`.
+fn numbered(first: u32, n: u32, len: usize) -> Vec<Vec<u8>> {
+    (first..first + n)
+        .map(|k| {
+            let mut f = vec![0u8; len];
+            f[..4].copy_from_slice(&k.to_be_bytes());
+            f
+        })
+        .collect()
+}
+
+#[test]
+fn nt_t4_the_count_of_receives_is_a_full_queue_over_an_answer() {
+    // MTU 1500: 1024 frames a queue, 43 of the largest an answer, 24 receives.
+    assert_eq!(queue_frames(1514), QUEUE_FRAMES as u32);
+    assert_eq!(answer_frames(256, 1514), 43);
+    assert_eq!(answer_frames(1024, 1514), 43);
+    assert_eq!(receives(256, 1514), 24);
+    // A smaller batch takes more receives; a batch is clamped to 1 to QUEUE_FRAMES.
+    assert_eq!(answer_frames(8, 1514), 8);
+    assert_eq!(receives(8, 1514), 128);
+    assert_eq!(answer_frames(0, 1514), 1);
+    assert_eq!(receives(0, 1514), QUEUE_FRAMES as u32);
+    // The largest frames: the queue's bytes bound it first (256), and an answer holds 3.
+    assert_eq!(queue_frames(FRAME_MAX as u32), 256);
+    assert_eq!(answer_frames(256, FRAME_MAX as u32), 3);
+    assert_eq!(receives(256, FRAME_MAX as u32), 86);
+    // Small frames: an answer takes the whole batch.
+    assert_eq!(answer_frames(256, 60), 256);
+    assert_eq!(receives(256, 60), 4);
+    // No frame size divides by zero or answers with nothing.
+    assert_eq!(queue_frames(0), QUEUE_FRAMES as u32);
+    assert_eq!(queue_frames(u32::MAX), 1);
+    assert_eq!(answer_frames(5, u32::MAX), 1);
+}
+
+#[test]
+fn nt_t4_a_client_of_1_1_keeps_receives_waiting_until_they_take_a_full_queue() {
+    let mut hub: Hub<u32> = Hub::new(true, 0, 1514);
+    hub.subscribe(1, 1);
+    hub.subscribe(2, 0);
+    // A client of 1.1: 24 receives of 43 frames wait, the 25th is refused.
+    for k in 0..24 {
+        assert_eq!(hub.receive(1, 256, || k), Ok(Answer::Later), "receive {k}");
+    }
+    assert_eq!(hub.receive(1, 256, || 99), Err(net::Error::InUse));
+    // A client of 1.0 beside it: one.
+    assert_eq!(hub.receive(2, 256, || 200), Ok(Answer::Later));
+    assert_eq!(hub.receive(2, 256, || 201), Err(net::Error::InUse));
+    // A full queue of the largest frames: every frame goes out to the 1.1 client in the
+    // order it came, in its receives in the order they came, and none stays queued; the
+    // 1.0 client's one receive takes 43 and leaves the rest queued.
+    let burst = numbered(0, QUEUE_FRAMES as u32, 1514);
+    for f in &burst {
+        hub.deliver(f);
+    }
+    let mut out = Vec::new();
+    hub.answers(&mut out);
+    let (ones, twos): (Vec<_>, Vec<_>) = out.into_iter().partition(|(p, _)| *p < 200);
+    assert_eq!(
+        ones.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+        (0..24).collect::<Vec<_>>()
+    );
+    let got: Vec<Vec<u8>> = ones.into_iter().flat_map(|(_, f)| f).map(|f| f.0).collect();
+    assert!(got == burst, "the frames in order");
+    assert_eq!(twos.len(), 1);
+    assert_eq!(twos[0].1.len(), 43);
+    assert_eq!(hub.rx_dropped, 0);
+    // 25 answers; only the 1.0 client's left frames queued.
+    assert_eq!((hub.answered, hub.answered_frames), (25, 1024 + 43));
+    assert_eq!(hub.backlog, 1);
+
+    // More frames than the receives waiting take: answered in order, and backlog once,
+    // for frames still queued when every receive waiting has been answered.
+    let mut hub: Hub<u32> = Hub::new(true, 0, 1514);
+    hub.subscribe(1, 1);
+    assert_eq!(hub.receive(1, 256, || 1), Ok(Answer::Later));
+    assert_eq!(hub.receive(1, 256, || 2), Ok(Answer::Later));
+    for f in numbered(0, 100, 1514) {
+        hub.deliver(&f);
+    }
+    let mut out = Vec::new();
+    hub.answers(&mut out);
+    let sizes: Vec<(u32, usize)> = out.iter().map(|(p, f)| (*p, f.len())).collect();
+    assert_eq!(sizes, [(1, 43), (2, 43)]);
+    assert_eq!((hub.answered, hub.backlog), (2, 1));
+    // The queue holds frames and nothing waits: a receive is answered at once, and is
+    // backlog if it leaves frames queued.
+    let Ok(Answer::Now(now)) = hub.receive(1, 10, || 3) else {
+        panic!("frames were queued");
+    };
+    assert_eq!(now.len(), 10);
+    assert_eq!((hub.answered, hub.backlog), (3, 2));
+    let Ok(Answer::Now(rest)) = hub.receive(1, 256, || 4) else {
+        panic!("frames were queued");
+    };
+    assert_eq!(rest.len(), 4);
+    assert_eq!((hub.answered, hub.backlog), (4, 2));
+
+    // A receive that comes while frames are queued for one waiting before it waits behind
+    // it, and the frames go to the first.
+    let mut hub: Hub<u32> = Hub::new(true, 0, 1514);
+    hub.subscribe(1, 1);
+    assert_eq!(hub.receive(1, 256, || 1), Ok(Answer::Later));
+    hub.deliver(&[7; 60]);
+    assert_eq!(hub.receive(1, 256, || 2), Ok(Answer::Later));
+    let mut out = Vec::new();
+    hub.answers(&mut out);
+    assert_eq!(out, [(1, vec![Frame(vec![7; 60])])]);
+    hub.deliver(&[8; 60]);
+    let mut out = Vec::new();
+    hub.answers(&mut out);
+    assert_eq!(out, [(2, vec![Frame(vec![8; 60])])]);
+    assert_eq!(hub.backlog, 0);
+
+    // Smaller receives: more of them wait, until together they take a full queue.
+    let mut hub: Hub<u32> = Hub::new(true, 0, 1514);
+    hub.subscribe(1, 1);
+    for k in 0..128 {
+        assert_eq!(hub.receive(1, 8, || k), Ok(Answer::Later), "receive {k}");
+    }
+    assert_eq!(hub.receive(1, 8, || 999), Err(net::Error::InUse));
 }
 
 // Exercise the exact fixture batching arithmetic through the real codec/transport.

@@ -1,5 +1,8 @@
 //! The card link against a card's end of the channel driven by hand (work item 1.3c): an
-//! answer that comes while a pump runs is never left filed with the channel empty.
+//! answer that comes while a pump runs is never left filed with the channel empty. And
+//! against the protocol's own hub (work item 6.3af): receives enough to take a full queue
+//! stay outstanding on a card of 1.1, so a burst leaves nothing queued and drops nothing;
+//! one on a card of 1.0, as before.
 
 extern crate std;
 
@@ -9,7 +12,7 @@ use std::cell::RefCell;
 use moruna_svc::{
     CallError, Channel, ClientCore, Encoder, Kind, ProtocolError, Wire, deadline_in, frame,
 };
-use net_protocol::{Frame, Link, SEND_FRAMES_MAX, net};
+use net_protocol::{Answer as Answered, Frame, Hub, Link, QUEUE_FRAMES, SEND_FRAMES_MAX, net};
 
 use super::{Answers, CardLink, Taken};
 
@@ -39,6 +42,9 @@ impl Answers for Late {
     }
     fn take(&mut self, txid: u32) -> Option<Result<frame::Frame, CallError<u32>>> {
         self.core.take_reply(txid)
+    }
+    fn minor(&self) -> u16 {
+        self.core.server_minor()
     }
 }
 
@@ -74,13 +80,22 @@ fn frames(n: usize) -> Vec<Frame> {
     (0..n).map(|k| Frame(vec![k as u8; 60])).collect()
 }
 
-/// A link over a connection whose card's end the test holds, its receive (id `r`) and
-/// link wait (id `l`) asked.
+/// A link over a connection whose card's end the test holds, the card of 1.0, its one
+/// receive (id `r`) and link wait (id `l`) asked.
 fn open() -> (CardLink<Late>, Card, u32, u32) {
+    let (link, card, mut asked) = open_at(0);
+    assert_eq!(asked.len(), 1, "a card of 1.0 has one receive asked");
+    let l = asked_link(&card);
+    (link, card, asked.remove(0), l)
+}
+
+/// A link over a connection whose card's end the test holds, the card welcoming it at
+/// minor `minor`: the receives it asked (their ids), its link wait not yet read.
+fn open_at(minor: u16) -> (CardLink<Late>, Card, Vec<u32>) {
     let (mine, theirs) = Channel::create().expect("channel");
     let mut welcome = Encoder::new();
     net::ID.major.encode(&mut welcome).expect("major");
-    0u16.encode(&mut welcome).expect("minor");
+    minor.encode(&mut welcome).expect("minor");
     frame::send(&theirs, Kind::Welcome, 0, 0, welcome).expect("welcome");
     let core = ClientCore::connect(mine, net::ID, deadline_in(5 * SECOND)).expect("connect");
     let card = Card {
@@ -94,15 +109,58 @@ fn open() -> (CardLink<Late>, Card, u32, u32) {
         card: card.end.clone(),
         late: card.late.clone(),
     };
-    let mut link = CardLink::new(String::from("net0"), late, 1, 64);
+    let mut link = CardLink::new(String::from("net0"), late, 1, 64, MAX_FRAME);
     link.ask().expect("ask");
-    let (ordinal, r, mut f) = card.request();
-    assert_eq!(ordinal, 6);
-    assert_eq!(u32::decode(&mut f.decoder()).expect("max"), 64);
+    let mut asked = Vec::new();
+    for _ in 0..link.receives() {
+        let (ordinal, r, mut f) = card.request();
+        assert_eq!(ordinal, 6);
+        assert_eq!(u32::decode(&mut f.decoder()).expect("max"), 64);
+        asked.push(r);
+    }
+    (link, card, asked)
+}
+
+/// The link's wait for the link, which it asks after its receives: its id.
+fn asked_link(card: &Card) -> u32 {
     let (ordinal, l, mut f) = card.request();
     assert_eq!(ordinal, 3);
     assert_eq!(u32::decode(&mut f.decoder()).expect("generation"), 1);
-    (link, card, r, l)
+    l
+}
+
+#[test]
+fn a_card_of_1_1_has_a_full_queue_of_receives_asked_and_a_card_of_1_0_one() {
+    // MTU 1500, 64 frames a receive: 43 of the largest an answer, 1024 a queue, 24.
+    let (link, card, asked) = open_at(1);
+    assert_eq!(asked.len(), 24);
+    assert_eq!(link.receives(), 24);
+    asked_link(&card);
+    assert!(card.nothing_asked());
+    let (link, card, asked) = open_at(0);
+    assert_eq!((asked.len(), link.receives()), (1, 1));
+    asked_link(&card);
+    assert!(card.nothing_asked());
+}
+
+#[test]
+fn receives_answered_out_of_order_are_taken_and_each_asked_again() {
+    let (mut link, card, asked) = open_at(1);
+    asked_link(&card);
+    // The second answered before the first: both taken, each asked again.
+    card.answer(Kind::Reply, asked[1], body(frames(1)));
+    let taken = link.pump().expect("pump");
+    assert_eq!(taken.frames.len(), 1);
+    let (ordinal, _, _) = card.request();
+    assert_eq!(ordinal, 6);
+    assert!(card.nothing_asked());
+    card.answer(Kind::Reply, asked[0], body(frames(2)));
+    assert_eq!(link.pump().expect("pump").frames.len(), 2);
+    let (ordinal, _, _) = card.request();
+    assert_eq!(ordinal, 6);
+    assert!(card.nothing_asked());
+    assert_eq!(link.receives(), 24);
+    assert_eq!((link.counts.answers, link.counts.frames_in), (2, 3));
 }
 
 /// Whether the link's connection has something to read: the server waits on it, so it
@@ -214,6 +272,130 @@ fn sends_wait_for_room_and_a_frame_too_large_for_a_message_stays() {
     let mut big = vec![vec![0u8; moruna_svc::limits::CHANNEL_MAX_BYTES]];
     link.flush(&mut big, 8).expect("flush");
     assert_eq!(big.len(), 1, "a frame no message holds is not sent");
+}
+
+/// A card whose receive side is the protocol's own hub, serving the link's requests over a
+/// channel the test drives (work item 6.3af): every receive the link asks goes to the hub,
+/// and the hub's answers go back on the channel.
+struct HubCard {
+    end: Channel,
+    hub: Hub<u32>,
+}
+
+impl HubCard {
+    /// Answers every request the link has sent: a receive goes to the hub (answered now,
+    /// left waiting or refused), a wait for the link is left waiting.
+    fn serve(&mut self) {
+        while let Some(mut f) = frame::recv(&self.end).expect("read") {
+            if f.ordinal != 6 {
+                continue;
+            }
+            let max = u32::decode(&mut f.decoder()).expect("max");
+            match self.hub.receive(1, max, || f.txid) {
+                Ok(Answered::Now(frames)) => self.reply(f.txid, frames),
+                Ok(Answered::Later) => {}
+                Err(e) => frame::send(&self.end, Kind::Failure, 0, f.txid, body(e.code()))
+                    .expect("refusal"),
+            }
+        }
+    }
+
+    /// `frames` arrive at the card in one turn of its driver: each is queued, then the
+    /// receives waiting are answered.
+    fn arrive(&mut self, frames: &[Vec<u8>]) {
+        for f in frames {
+            self.hub.deliver(f);
+        }
+        let mut answers = Vec::new();
+        self.hub.answers(&mut answers);
+        for (txid, frames) in answers {
+            self.reply(txid, frames);
+        }
+    }
+
+    fn reply(&self, txid: u32, frames: Vec<Frame>) {
+        frame::send(&self.end, Kind::Reply, 0, txid, body(frames)).expect("reply");
+    }
+}
+
+/// A link of the network server's default batch to a card of MTU 1500 whose receive side
+/// is a hub, its card welcoming the link at protocol minor `minor`.
+fn hub_link(minor: u16) -> (CardLink<ClientCore>, HubCard) {
+    let (mine, theirs) = Channel::create().expect("channel");
+    let mut welcome = Encoder::new();
+    net::ID.major.encode(&mut welcome).expect("major");
+    minor.encode(&mut welcome).expect("minor");
+    frame::send(&theirs, Kind::Welcome, 0, 0, welcome).expect("welcome");
+    let core = ClientCore::connect(mine, net::ID, deadline_in(5 * SECOND)).expect("connect");
+    let hello = frame::recv(&theirs).expect("read").expect("hello");
+    assert_eq!(hello.kind, Kind::Hello);
+    // The card's hub: a card of 1.0 serves a client as 1.0 whatever the client says.
+    let mut hub = Hub::new(true, 0, MAX_FRAME);
+    hub.subscribe(1, minor);
+    let batch = crate::config::Settings::default().card_receive_frames as u32;
+    let mut link = CardLink::new(String::from("net0"), core, 1, batch, MAX_FRAME);
+    link.ask().expect("ask");
+    let mut card = HubCard { end: theirs, hub };
+    card.serve();
+    (link, card)
+}
+
+/// `n` frames of the largest size a card of MTU 1500 delivers, numbered from `first`.
+fn full_frames(first: u32, n: usize) -> Vec<Vec<u8>> {
+    (0..n as u32)
+        .map(|k| {
+            let mut f = vec![0u8; MAX_FRAME as usize];
+            f[..4].copy_from_slice(&(first + k).to_be_bytes());
+            f
+        })
+        .collect()
+}
+
+/// The largest frame of a card of MTU 1500.
+const MAX_FRAME: u32 = 1514;
+
+/// Two bursts of a full queue of the largest frames, far more than one answer carries
+/// (43), at a card of minor `minor`, the network server taking what the card answered
+/// after each: answers that left frames queued, frames dropped, and the frames taken.
+fn two_bursts(minor: u16) -> (u64, u64, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let (mut link, mut card) = hub_link(minor);
+    let first = full_frames(0, QUEUE_FRAMES);
+    let second = full_frames(QUEUE_FRAMES as u32, QUEUE_FRAMES);
+    let mut got = Vec::new();
+    card.arrive(&first);
+    got.extend(link.pump().expect("pump").frames);
+    card.serve();
+    card.arrive(&second);
+    got.extend(link.pump().expect("pump").frames);
+    card.serve();
+    let want: Vec<Vec<u8>> = first.into_iter().chain(second).collect();
+    (card.hub.backlog, card.hub.rx_dropped, got, want)
+}
+
+#[test]
+fn a_burst_larger_than_one_answer_leaves_nothing_queued_and_drops_nothing() {
+    // Work item 6.3af. With one receive outstanding the hub answered 43 frames and queued
+    // the rest behind them, and the second burst found the queue nearly full and was
+    // dropped: (3, 938, 86). With a full queue's worth outstanding, nothing waits.
+    let (backlog, dropped, got, want) = two_bursts(1);
+    assert_eq!(
+        (backlog, dropped, got.len()),
+        (0, 0, want.len()),
+        "answers that left frames queued, frames dropped, frames taken"
+    );
+    assert!(
+        got == want,
+        "the frames taken are the frames sent, in order"
+    );
+}
+
+#[test]
+fn on_a_card_of_1_0_one_receive_is_outstanding_as_before() {
+    // A client of 1.1 and a card of 1.0: one receive, and the burst backlogs and drops
+    // exactly as it did before 1.1.
+    let (backlog, dropped, got, want) = two_bursts(0);
+    assert_eq!((backlog, dropped, got.len()), (3, 938, 86));
+    assert!(got[..43] == want[..43], "the frames taken come in order");
 }
 
 #[test]

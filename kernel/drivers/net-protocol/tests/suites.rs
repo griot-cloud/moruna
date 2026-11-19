@@ -1,7 +1,8 @@
 //! NT-T5 (SDD 29, k): the protocol's suites pass against a model of two cards on one
 //! link served by `net_protocol::Server`, the server every driver runs, by one
-//! dispatcher on the host's model of the channel ABI; and fail against cards that
-//! break the protocol: one that sends what it should refuse, one that loses frames.
+//! dispatcher on the host's model of the channel ABI, for a client of 1.1 and of 1.0;
+//! and fail against cards that break the protocol: one that sends what it should
+//! refuse, one that loses frames.
 
 use std::{cell::RefCell, rc::Rc, thread};
 
@@ -152,7 +153,7 @@ fn failures(summary: &conformance::Summary, names: &[(String, Result<(), String>
 
 #[test]
 fn nt_t5_the_suites_pass_against_two_joined_cards() {
-    let (mut a, mut b, join) = cards(Flaw::None, 2);
+    let (mut a, mut b, join) = cards(Flaw::None, 3);
     for listener in [a.remove(0), b.remove(0)] {
         let mut checks = Vec::new();
         let summary = conformance::run(
@@ -162,6 +163,22 @@ fn nt_t5_the_suites_pass_against_two_joined_cards() {
         );
         assert!(summary.ok(), "{:?}", failures(&summary, &checks));
         assert!(summary.passed >= 16, "{summary:?}");
+    }
+    // A client of 1.0 (work item 6.3af): one receive waits, as in 1.0.
+    for listener in [a.remove(0), b.remove(0)] {
+        let mut checks = Vec::new();
+        let summary = conformance::run(
+            &net_protocol::suite_1_0(),
+            &mut conformance::Listener(listener),
+            &mut |c| checks.push((c.name.to_string(), c.result.clone())),
+        );
+        assert!(summary.ok(), "{:?}", failures(&summary, &checks));
+        assert!(
+            checks
+                .iter()
+                .any(|(n, _)| n.starts_with("receive, a client of 1.0")),
+            "{checks:?}"
+        );
     }
     let mut checks = Vec::new();
     let summary = conformance::run_pair(

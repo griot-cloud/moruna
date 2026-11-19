@@ -40,7 +40,7 @@ impl Server {
     pub fn new(info: Info, link_up: bool, speed_mbps: u32) -> Server {
         Server {
             info,
-            hub: Hub::new(link_up, speed_mbps),
+            hub: Hub::new(link_up, speed_mbps, info.max_frame),
             sends: VecDeque::new(),
             ready: Vec::new(),
             failed: None,
@@ -151,7 +151,8 @@ impl Server {
                 Outcome::Deferred
             }
             5 => {
-                self.hub.subscribe(conn);
+                // A client of 1.1 may keep several receives waiting (work item 6.3af).
+                self.hub.subscribe(conn, cx.client_minor());
                 Outcome::reply(())
             }
             6 => {

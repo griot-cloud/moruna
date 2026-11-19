@@ -65,6 +65,22 @@ Caller-owned TX/RX/credential loans require exact caller Account origin. Private
 
 The per-process kernel ceiling is KB5's responsibility. These protocol/settings bounds are not a substitute for KB5, and this branch does not invent an independent kernel allocator or bypass a process grant.
 
+## e. The card link: receives outstanding (work item 6.3af)
+
+The server keeps receives outstanding on each card (`moruna_netstack::card::CardLink`) so that one is always waiting at the card while it takes another's frames; each answer carries what the card's queue holds, up to the answer's limit. With one receive outstanding, the frames that came while its answer was on the way waited in the card's queue behind it (run 11: 65% of answers left frames queued) and, once the queue was full, were dropped (0.43% of frames, each a TCP retransmit).
+
+The count is the card's, never a constant: the least that leaves nothing queued and drops nothing at the card's queue limit, the queue's frames over an answer's (`net_protocol::receives`):
+
+```
+receives = ceil(queue_frames / answer_frames)
+queue_frames  = min(QUEUE_FRAMES, QUEUE_BYTES / max_frame)
+answer_frames = min(card-receive-frames, RECEIVE_BYTES / (4 + max_frame))
+```
+
+`max_frame` is the card's `info`; `QUEUE_FRAMES` (1024), `QUEUE_BYTES` (4 MiB) and `RECEIVE_BYTES` (65,472) are `moruna.driver.net`'s (SDD 29); `card-receive-frames` is each receive's `max` (setting, default 256), clamped to 1 to 1024. At MTU 1500 that is 1024 frames a queue over 43 of 1514 bytes an answer (4 bytes of length each): 24 receives. Fewer leave a full queue's last frames queued behind the last answer (23 take 989); more take nothing more. However many frames the queue holds when the card answers, then, every one goes out in an answer and the queue is empty after it, so no frame finds it full until more than a queue's worth come between two of the card's answers (a driver's turn that delivers more than 1024 frames still drops past the limit; the node run judges it).
+
+A card of `moruna.driver.net` 1.1 takes exactly that many receives of one `max` from a client of 1.1, answers them in the order they came, and refuses the next `InUse` (SDD 29 d.1). On a card whose welcome says 1.0 the server keeps one, as before. The receives' answers are taken in the order they were asked, every one the card has answered at each pump, and each is asked again at once.
+
 ## k. Checks and proof status
 
 Host checks cover the existing wire/policy/config/single-server/pair-server suites, lossy-link TCP, DHCP lease installation and removal, DNS failure/slot accounting, TLS CA/name/time failures, partial records, abrupt EOF, handshake bounds, post-plaintext upgrade refusal and persistence of the failure marker. The protocol suite must account for every major-3 dispatch row, preserve unchanged ordinal encodings, and refuse old majors.

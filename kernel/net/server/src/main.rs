@@ -280,11 +280,14 @@ fn open_cards(
             mtu: info.mtu,
             up: link.up,
         });
+        // Receives enough to take the card's full queue stay outstanding (work item 6.3af):
+        // their count is the card's, from its largest frame.
         let mut core_link = CardLink::new(
             iface.card.clone(),
             client.into_core(),
             link.generation,
             batch,
+            info.max_frame,
         );
         core_link.ask()?;
         links.push(core_link);

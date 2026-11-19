@@ -1,6 +1,11 @@
-//! `moruna.driver.net` 1.0 (SDD 29, d.1): a network card. A client sends Ethernet
+//! `moruna.driver.net` 1.1 (SDD 29, d.1): a network card. A client sends Ethernet
 //! frames and receives the frames the card receives; it reads the card's address,
 //! MTU and link state, waits for the link to change, and reads the counters.
+//!
+//! 1.1 (work item 6.3af) lets a client of 1.1 keep several receives waiting, answered in
+//! order, until together they take a full queue ([`receives`]), so one is always waiting
+//! while the client takes another's frames. A client of 1.0 keeps one, as in 1.0; a
+//! client of 1.1 keeps more than one only on a card of 1.1.
 //!
 //! Frames travel in messages, a batch of them each way: a card's buffers are its
 //! device's (virtio-net's descriptors, gVNIC's registered page lists), the network
@@ -33,7 +38,7 @@ use moruna_svc::{Decoder, Encoder, Wire, WireError, limits};
 
 pub use hub::{Answer, Hub};
 pub use server::{Ring, Server};
-pub use suites::{ETHERTYPE, frame, pair_suite, suite};
+pub use suites::{ETHERTYPE, frame, pair_suite, suite, suite_1_0};
 
 /// Bytes of an Ethernet header: destination, source, EtherType.
 pub const HEADER: usize = 14;
@@ -52,6 +57,32 @@ pub const QUEUE_BYTES: usize = 4 << 20;
 /// The bytes of frames one `receive` answers with, encoding included: a message's
 /// body less the reply's count.
 pub const RECEIVE_BYTES: usize = limits::CHANNEL_MAX_BYTES - 64;
+
+/// The frames a connection's queue holds of a card whose largest frame is `max_frame`:
+/// [`QUEUE_FRAMES`], or as many of the largest frames as [`QUEUE_BYTES`] holds if fewer.
+pub fn queue_frames(max_frame: u32) -> u32 {
+    let bytes = QUEUE_BYTES as u32 / max_frame.max(1);
+    (QUEUE_FRAMES as u32).min(bytes).max(1)
+}
+
+/// The frames one `receive` of at most `max` carries from a card whose largest frame is
+/// `max_frame`, every frame of the largest size: `max` (clamped to 1 to [`QUEUE_FRAMES`]),
+/// or as many as [`RECEIVE_BYTES`] holds if fewer, and always at least one.
+pub fn answer_frames(max: u32, max_frame: u32) -> u32 {
+    let fit = RECEIVE_BYTES as u32 / 4u32.saturating_add(max_frame);
+    max.clamp(1, QUEUE_FRAMES as u32).min(fit).max(1)
+}
+
+/// The receives of at most `max` a client of 1.1 keeps waiting on a card whose largest
+/// frame is `max_frame` (work item 6.3af): the least that together take a full queue,
+/// `ceil(queue_frames / answer_frames)`. However many frames the queue holds when the
+/// card answers, then, every one goes out with an answer and none stays queued; and with
+/// the queue emptied at each answer, no frame finds it full. 24 at MTU 1500 (1024 frames
+/// over 43 an answer). A card of 1.1 takes exactly this many such receives from a
+/// client of 1.1 and refuses the next `InUse`.
+pub fn receives(max: u32, max_frame: u32) -> u32 {
+    queue_frames(max_frame).div_ceil(answer_frames(max, max_frame))
+}
 
 // A receive always carries at least one frame of the largest size.
 const _: () = assert!(4 + FRAME_MAX <= RECEIVE_BYTES);
@@ -188,7 +219,7 @@ moruna_svc::protocol! {
     pub protocol net {
         name = "moruna.driver.net";
         major = 1;
-        minor = 0;
+        minor = 1;
         requests {
             /// The card's address, MTU, largest frame, offloads and queues.
             1 => fn info() -> Info;
@@ -204,7 +235,9 @@ moruna_svc::protocol! {
             /// connection, as for every other subscribed one.
             5 => fn subscribe() -> ();
             /// At most `max` of the frames queued for this connection, answered once
-            /// there is one.
+            /// there is one. A client of 1.1 may keep several waiting, answered in the
+            /// order they came, until together they take a full queue (`receives`); a
+            /// client of 1.0 keeps one.
             6 => fn receive(max: u32) -> Vec<Frame>;
             /// The card's counters and this connection's drops.
             7 => fn stats() -> Stats;
@@ -223,7 +256,8 @@ moruna_svc::protocol! {
             5 => TooMany;
             /// A receive on a connection that has not subscribed.
             6 => NotSubscribed;
-            /// A receive while another of this connection's waits.
+            /// A receive while this connection's waiting receives already take a full
+            /// queue; for a client of 1.0, while another of its receives waits.
             7 => InUse;
             /// The device failed.
             8 => Io;
