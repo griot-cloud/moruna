@@ -22,7 +22,7 @@ Boot evidence is kept in `~/moruna-data/boots/` (chain logs, scripts, run report
 
 Run 6 next: the node alone at feature's tip (the asynchronous fetch, 6.3g, 6.3r's gap fix), its table merged with run 5's Linux engines.
 
-Benchmark run 5 so far (results 202611182200, image b11c1342): node Score 55–57 s 6/6, Occupancy 15.8–17.6 s, Enrich 63–74 s 6/6, Audit 17.4–17.9 s 4/6 (2 failed on 6.3r's gap). The Linux engines are installing and running this time (0.6.6's Rust Score 30.3 s, 0.6.6 Python 60.1 s, Dask 78.8 s).
+Benchmark run 5 so far (results 202611182200, image b11c1342): node Score 55–57 s 6/6, Occupancy 15.8–17.6 s, Enrich 63–74 s 6/6, Audit 17.4–17.9 s 4/6 (2 failed on 6.3r's gap). The Linux engines are installing and running this time (0.6.6's Rust Score 30.3 s, 0.6.6 Python 60.1 s, Dask 78.8 s). Harness faults to fix before the next full run: Ray fails every job with `ImportError: cannot import name 'HTTPFileSystem' from 'fsspec.implementations.http'` (fsspec too new for ray 2.60; pin it in install.py); Dask's Enrich r0 ended KilledWorker.
 
 
 All six first kernels are merged (4.1–4.6): expr, filter, take, group_aggregate, interval_coverage_count, mlp_forward. What is left of them is measurement (4G.1–4G.4) and their use by the gate functions (functions built on kernels).
