@@ -3,11 +3,14 @@
 //!
 //! A stage runs one process for each CPU of the job unless its image declares fewer (system
 //! design 3E, the `stage` module): each is an instance of the stage, in a cgroup of its own
-//! under the stage's, with an equal share of the stage's ceiling. A function's memory is
-//! measured, never assumed (3A): a stage the run has no measurement of warms up on its first
-//! instance before its others start (the `warm` module), and an instance is given at most what
-//! its share holds by the measured line, a larger batch cut into slices of its rows whose
-//! answers are joined in order.
+//! under the stage's. A function's memory is measured, never assumed (3A): a stage the run has
+//! no measurement of warms up on its first instance before its others start (the `warm`
+//! module). A measured stage's instances are carved as the node carves its tasks, each cgroup at
+//! the line's account at the stage's measured piece, and given batches of at most that piece;
+//! an unmeasured stage's have an equal share of its ceiling and at most what that holds. A
+//! larger batch is cut into slices of its rows whose answers are joined in order. An instance
+//! its cgroup kills is started again at a larger account, as the node's task is (the `restart`
+//! module).
 //!
 //! Each instance is a task of a plane of its own (`moruna_plane_linux::LinuxPlane`), one input
 //! slot and one output slot. Each `apply` writes the batch once, as a record, into a memfd that
@@ -30,6 +33,7 @@
 //! ends the stage with the check's reason.
 
 mod process;
+mod restart;
 mod spawn;
 mod stage;
 mod stdio;
@@ -60,7 +64,7 @@ use crate::STOP_GRACE;
 use crate::cgroup::StageCgroup;
 use crate::output::{TAIL_LINES, Tail, follow_stderr};
 use spawn::{Plan, Streams, spawn};
-use stage::{Busy, Place, Stage};
+use stage::{Busy, Carve, Place, Stage};
 use stdio::Bridge;
 
 /// The size of an image's `/tmp` (SDD 19 f.5 step 4): the stage has no scratch setting yet.
@@ -202,6 +206,22 @@ impl Room {
         }
     }
 
+    /// The note's words for a measured stage's instances, sized at pieces of `piece` bytes and
+    /// accounts of `account` (item 6.3v); [`Room::bounded`]'s for a stage with no line.
+    fn sized(&self, piece: u64, account: u64, share: u64) -> String {
+        match &self.line {
+            Some(line) => format!(
+                "measured: batches of at most {piece} bytes, the stage's measured piece; each \
+                 instance's cgroup carved at its function's line there, an account of {account} \
+                 bytes ({:.0} bytes plus {:.2} a byte, margin {:.2})",
+                line.fixed_bytes,
+                line.per_input_byte,
+                line.margin(),
+            ),
+            None => self.bounded(share),
+        }
+    }
+
     /// The note's words for what bounds an instance's batch at `share`.
     fn bounded(&self, share: u64) -> String {
         let piece = self.piece_within(share);
@@ -275,6 +295,15 @@ pub struct ImageKernel {
     starting: Mutex<()>,
     /// What the instances did, for the run's report.
     busy: Arc<Busy>,
+    /// The piece and the account a measured stage's instances are sized at (system design 3A,
+    /// item 6.3v, as the node's `size_measured`): each instance's cgroup is carved at the
+    /// account, and its batches are cut at the piece. `None` for a stage on the share's rule.
+    measured: Mutex<Option<(u64, u64)>>,
+    /// The account each instance its cgroup killed is started with since (system design 3A),
+    /// by instance, as on the node.
+    restarted: Mutex<BTreeMap<usize, u64>>,
+    /// Each time an instance its cgroup killed was started again, as the stage's note says it.
+    restarts: Mutex<Vec<String>>,
 }
 
 impl std::fmt::Debug for ImageKernel {
@@ -344,6 +373,9 @@ impl ImageKernel {
             on_sized: OnceLock::new(),
             starting: Mutex::new(()),
             busy: Arc::new(Busy::default()),
+            measured: Mutex::new(None),
+            restarted: Mutex::new(BTreeMap::new()),
+            restarts: Mutex::new(Vec::new()),
         })
     }
 
@@ -366,14 +398,22 @@ impl ImageKernel {
         if let Some(said) = self.warm_said() {
             note.push_str(&format!("; {said}"));
         }
+        let measured = *lock(&self.measured);
         if let Some(room) = lock(&self.room).as_ref() {
+            let share = self.share.load(Ordering::Relaxed);
             note.push_str(&format!(
                 "; {}, of {} bytes past the arena; each told {} of the job's {} CPUs",
-                room.bounded(self.share.load(Ordering::Relaxed)),
+                match measured {
+                    Some((piece, account)) => room.sized(piece, account, share),
+                    None => room.bounded(share),
+                },
                 room.bytes,
                 self.cpu_share(),
                 self.job_cpus.load(Ordering::Relaxed),
             ));
+        }
+        for said in lock(&self.restarts).iter() {
+            note.push_str(&format!("; {said}"));
         }
         note
     }
@@ -397,13 +437,17 @@ impl ImageKernel {
     /// ([`ImageKernel::bind_run`], which funds them).
     ///
     /// - A function whose memory is measured (`line`, what the job came with or the run's store
-    ///   holds) has each instance funded at its line at the `least` morsel, so every CPU of the
-    ///   job runs one where that fits, and its batches are cut to what an instance's share
-    ///   holds by the line.
+    ///   holds) is sized as the node sizes its tasks (item 6.3v): at the largest of the run's
+    ///   pieces at which every instance fits in `room` by the line, else the least with as many
+    ///   as fit there; each instance's cgroup is carved at the line's account at that piece, and
+    ///   its batches are cut at the piece. A line by which one does not fit at the least piece
+    ///   funds as many as its account at the `least` morsel does, on the share's rule.
     /// - An unmeasured one has each instance funded at the largest batch the run may give it,
     ///   `morsel` bytes, times `factor` (what it declares it holds a byte, or the run's
-    ///   default), and its batches are bounded by the share over that factor: with no warm-up
-    ///   and no restart here, a batch past its cgroup would end the instance.
+    ///   default), and its batches are bounded by the share over that factor.
+    ///
+    /// An instance its cgroup kills is started again at a larger account when the stage's
+    /// ceiling leaves room for one (`ImageKernel::restart`).
     ///
     /// A job that ran in one process runs in as many as that funds, and never fails for the
     /// count.
@@ -424,10 +468,15 @@ impl ImageKernel {
         });
     }
 
-    /// The largest batch one instance takes at `share` bytes, by what the run said of its
-    /// function ([`ImageKernel::bind_room`]); `None` when it said nothing, no share is known
+    /// The largest batch one instance takes: a measured stage's measured piece (item 6.3v, as
+    /// the node's are cut); otherwise what `share` bytes hold by what the run said of its
+    /// function ([`ImageKernel::bind_room`]), `None` when it said nothing, no share is known
     /// yet, or the function's line does not grow.
     fn piece_cap(&self, share: u64) -> Option<u64> {
+        let measured = *lock(&self.measured);
+        if let Some((piece, _)) = measured {
+            return Some(piece.max(1));
+        }
         if share == 0 {
             return None;
         }
@@ -451,11 +500,13 @@ impl ImageKernel {
     /// - the job's CPUs are the run's CPU quota, rounded up, which is the figure the engine
     ///   starts its workers from, so the stage has an instance for each of them (a sampler
     ///   that says no quota leaves the CPUs the stage's build had);
-    /// - memory bounds them: as many of those the rule asks for as the room funds, each at
-    ///   its need, when the run said them ([`ImageKernel::bind_room`]); otherwise, and while
-    ///   the stage warms up on its first instance ([`ImageKernel::warm_up`], whose measurement
-    ///   then funds them), as many as the stage's ceiling funds at the least an instance needs
-    ///   (`stage::funded`). A stage of one instance has nothing to warm up for.
+    /// - memory bounds them: as many of those the rule asks for as the room funds, when the run
+    ///   said it ([`ImageKernel::bind_room`]): a measured function's sized as the node sizes its
+    ///   tasks, at a piece and an account (`warm::measured_sizing`), else each at its need;
+    ///   otherwise, and while the stage warms up on its first instance
+    ///   ([`ImageKernel::warm_up`], whose measurement then funds them), as many as the stage's
+    ///   ceiling funds at the least an instance needs (`stage::funded`). A stage of one
+    ///   instance has nothing to warm up for.
     ///
     /// A stage whose instances are already running keeps the instances it has.
     pub fn bind_run(&self, sampler: Arc<dyn Sampler>, ceiling: u64) {
@@ -470,11 +521,20 @@ impl ImageKernel {
             if asked <= 1 {
                 self.warming.store(false, Ordering::Relaxed);
             }
-            let (room, need) = match lock(&self.room).as_ref() {
-                Some(room) if !self.warming() => (room.bytes, room.need()),
-                _ => (ceiling, stage::LEAST),
+            let (funded, measured) = match lock(&self.room).as_ref() {
+                Some(room) if !self.warming() => {
+                    match room
+                        .line
+                        .as_ref()
+                        .map(|line| warm::measured_sizing(room, line, asked))
+                    {
+                        Some(Ok((piece, account, count))) => (count, Some((piece, account))),
+                        _ => (stage::funded(room.bytes, asked, room.need()), None),
+                    }
+                }
+                _ => (stage::funded(ceiling, asked, stage::LEAST), None),
             };
-            let funded = stage::funded(room, asked, need);
+            *lock(&self.measured) = measured;
             self.job_cpus.store(cpus, Ordering::Relaxed);
             self.asked.store(asked, Ordering::Relaxed);
             self.funded.store(funded, Ordering::Relaxed);
@@ -490,7 +550,7 @@ impl ImageKernel {
     }
 
     /// The limits moved (MH 4.4): the stage ceiling is recomputed and written now, to the
-    /// stage and to every instance.
+    /// stage and to every instance carved by the share.
     pub fn limits_changed(&self) {
         if let Some(stage) = self.memory.stage()
             && let Err(e) = self.write_limits(&stage)
@@ -517,8 +577,8 @@ impl ImageKernel {
         Ok((ceiling.saturating_sub(rest), sample.cpu_limit))
     }
 
-    /// The stage's `memory.max` and `cpu.max` from a fresh sample, and every instance's share
-    /// of the ceiling, written when they moved; the share.
+    /// The stage's `memory.max` and `cpu.max` from a fresh sample, and the share of the ceiling
+    /// of every instance carved by it, written when they moved; the share.
     fn write_limits(&self, stage: &Stage) -> Result<u64> {
         // What the stage's instances hold is the stage's own: the rest of the run is what the
         // sample holds beside it.
@@ -560,14 +620,23 @@ impl ImageKernel {
     }
 
     /// SDD 19 f.5: the cgroup, then the process. The cgroup is the instance's own, under the
-    /// stage's, with its share of the stage's ceiling.
+    /// stage's, carved as the node carves its task (item 6.3v): an instance started again
+    /// after its cgroup killed it at the account it grew to; else a measured stage's at its
+    /// measured account; else at its share of the stage's ceiling.
     fn start(&self, ctx: &InitCtx) -> Result<ImageState> {
+        let grown = lock(&self.restarted).get(&ctx.instance).copied();
+        let measured = *lock(&self.measured);
+        let carve = match (grown, measured) {
+            (Some(grown), _) => Carve::Grown(grown),
+            (None, Some((_, account))) => Carve::Measured(account),
+            (None, None) => Carve::Share,
+        };
         // The instance's cgroup goes with its place, whichever way this ends.
         let place = self
             .stage()?
-            .enter(ctx.instance)
+            .enter(ctx.instance, carve)
             .map_err(|e| config(format!("{}: the instance's cgroup: {e}", self.name)))?;
-        let ceiling = place.stage().share();
+        let ceiling = place.limit();
         let ports = lock(&self.ports).clone().filter(|p| !p.is_empty());
         let socket = port_socket(&self.name, ports.is_some(), self.plane)?;
         let plan = plan_of(
@@ -898,7 +967,8 @@ pub struct ImageState {
     sent: u64,
     received: u64,
     alloc: Arc<dyn Allocator>,
-    /// The instance's share of the stage's ceiling: the most its record and its window are.
+    /// The instance's `memory.max` (its share of the stage's ceiling, or its account): the most
+    /// its window is.
     ceiling: u64,
     /// The stage's ceiling when the instance started, half its plane's budget: the most a
     /// window is, whatever its share grows to.
@@ -1222,20 +1292,22 @@ impl Kernel for ImageKernel {
         if self.warming() { 1 } else { self.instances() }
     }
 
-    /// The largest morsel, in input bytes, one instance takes inside its cgroup's share (system
-    /// design 3A, item 6.3f): by its function's measured line, piece <= (share - fixed) /
-    /// per-byte; for an unmeasured function, the share over its factor. The share is the one
-    /// last written, so a ceiling that moved moves it. `None` until the run says what bounds it
-    /// ([`ImageKernel::bind_room`]).
+    /// The largest morsel, in input bytes, one instance takes (system design 3A): a measured
+    /// stage's measured piece, which its instances' accounts were carved at (item 6.3v);
+    /// otherwise what the instance's share of its cgroup holds (item 6.3f), by its function's
+    /// line, piece <= (share - fixed) / per-byte, or for an unmeasured function the share over
+    /// its factor. The share is the one last written, so a ceiling that moved moves it. `None`
+    /// until the run says what bounds it ([`ImageKernel::bind_room`]).
     fn morsel_bytes_max(&self) -> Option<u64> {
         self.piece_cap(self.share.load(Ordering::Relaxed))
     }
 
     /// SDD 19 f.6: one batch to the process and one back, in lockstep, across the plane. A
-    /// batch past what an instance takes ([`Kernel::morsel_bytes_max`], at the share just
-    /// written) is cut into slices of its rows, each given and answered in turn, and the
-    /// answers joined in order: the stage's target bounds only what the source reads for its
-    /// first consumer, and a batch past an instance's cgroup would end it.
+    /// batch past what an instance takes ([`Kernel::morsel_bytes_max`]) is cut into slices of
+    /// its rows, each given and answered in turn, and the answers joined in order: the stage's
+    /// target bounds only what the source reads for its first consumer. An instance its cgroup
+    /// kills while it answers is started again at a larger account where the stage's ceiling
+    /// leaves one, and given the slice again (`ImageKernel::restart`).
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
         let st = state
             .as_any_mut()
@@ -1246,7 +1318,8 @@ impl Kernel for ImageKernel {
                 "an image takes a table; its batches cross the data plane as records".into(),
             ));
         };
-        st.ceiling = self.write_limits(st.place.stage())?;
+        self.write_limits(st.place.stage())?;
+        st.ceiling = st.place.limit();
         // The instance holds the batch from here until its answers are taken, or it fails.
         let _holding = st.busy.hold();
         // The stage's first instance measures its function on its first pieces while the stage
@@ -1261,7 +1334,7 @@ impl Kernel for ImageKernel {
         }
         let mut answers = Vec::with_capacity(slices.len());
         for slice in slices {
-            answers.push(st.exchange(slice)?);
+            answers.push(self.exchange(st, slice)?);
         }
         match answers.len() {
             1 => answers

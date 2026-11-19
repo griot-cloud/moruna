@@ -447,17 +447,18 @@ fn an_unmeasured_function_is_funded_at_the_largest_batch_times_the_factor() {
     assert_eq!(k.morsel_bytes_max(), Some(GIB));
 }
 
-/// System design 3A (PM, 2026-11-19, 6.3f): a measured function's stage is funded at its line
-/// at the least morsel, so every CPU of the job runs an instance, and its batches are held to
-/// what an instance's share holds by the line: the piece shrinks first, and only then do fewer
-/// instances run. The share is the one last written, so a ceiling that moved moves the cap.
+/// System design 3A (PM, 2026-11-19, 6.3f and 6.3v): a measured function's stage is sized as
+/// the node sizes its tasks: at the largest of the run's pieces at which every CPU of the job
+/// runs an instance by its line, each instance's cgroup carved at the line's account there and
+/// its batches cut at that piece, whatever the share; the piece shrinks first, and only then do
+/// fewer instances run.
 #[test]
 fn a_measured_function_runs_every_cpu_and_its_line_sets_the_piece() {
     // Score's line, about: 150 MiB of interpreter and libraries, and 20 bytes a byte of input.
     let score = line(150 * MIB, 20.0);
     let k = kernel_of(&[], 4).unwrap();
-    // 2.5 GiB past the arena funds four at 150 + 80 MiB each, although a 512 MiB batch at four
-    // instances would not fit: the line at the least morsel funds them.
+    // 2.5 GiB past the arena funds four at 16 MiB pieces, 150 + 320 MiB each, although a
+    // 512 MiB batch at four instances would not fit.
     k.bind_room(
         2560 * MIB,
         512 * MIB,
@@ -467,43 +468,56 @@ fn a_measured_function_runs_every_cpu_and_its_line_sets_the_piece() {
     );
     k.bind_run(sampler(0, 2560 * MIB), 4 * GIB);
     assert_eq!(k.instances(), 4);
-    // Each instance's share is 640 MiB: (640 - 150) / 20 = 24.5 MiB a batch.
-    assert_eq!(k.morsel_bytes_max(), Some(25_690_112));
+    // Batches of the measured piece, 16 MiB, at accounts of 150 + 20 x 16 MiB.
+    assert_eq!(k.morsel_bytes_max(), Some(16 * MIB));
+    assert_eq!(*lock(&k.measured), Some((16 * MIB, 470 * MIB)));
     let note = k.note();
     assert!(
         note.contains(
-            "measured: batches of at most 25690112 bytes, what an instance's share of 671088640 \
-             bytes holds by its function's line (157286400 bytes plus 20.00 a byte, margin \
-             0.00); each instance funded for 241172480 bytes, the line at the least morsel of \
-             4194304 bytes, of 2684354560 bytes past the arena"
+            "measured: batches of at most 16777216 bytes, the stage's measured piece; each \
+             instance's cgroup carved at its function's line there, an account of 492830720 \
+             bytes (157286400 bytes plus 20.00 a byte, margin 0.00), of 2684354560 bytes past \
+             the arena"
         ),
         "{note}"
     );
     assert!(!note.contains(" of 4 instances"), "all four: {note}");
-    // The ceiling moved: the cap moves with the share that is written.
+    // The ceiling moved: a measured stage's batches stay at its piece, as the node's do.
     k.share.store(320 * MIB, Ordering::Relaxed);
-    assert_eq!(k.morsel_bytes_max(), Some(8_912_896));
-    // A share that does not hold the fixed part alone: one byte, never zero.
-    k.share.store(100 * MIB, Ordering::Relaxed);
-    assert_eq!(k.morsel_bytes_max(), Some(1));
-    // Room for two at the least morsel: two, not one.
-    k.bind_room(500 * MIB, 512 * MIB, LEAST_MORSEL, 4.0, Some(score));
+    assert_eq!(k.morsel_bytes_max(), Some(16 * MIB));
+    // Room for two at the least morsel: two, not one, at the least piece.
+    k.bind_room(500 * MIB, 512 * MIB, LEAST_MORSEL, 4.0, Some(score.clone()));
     k.bind_run(sampler(0, 2560 * MIB), 4 * GIB);
     assert_eq!(k.instances(), 2);
+    assert_eq!(*lock(&k.measured), Some((LEAST_MORSEL, 230 * MIB)));
     assert!(
         k.note()
             .contains("score: 2 of 4 instances: the share funds 2"),
         "{}",
         k.note()
     );
-    // A line that does not grow bounds nothing past what it says.
+    // A line that holds nothing whatever its batch: the run's largest morsel, nothing smaller.
     let flat = moruna_cost::Memory {
         input_bytes_max: 0,
         ..line(0, 0.0)
     };
     k.bind_room(2560 * MIB, 512 * MIB, LEAST_MORSEL, 4.0, Some(flat));
     k.bind_run(sampler(0, 2560 * MIB), 4 * GIB);
-    assert_eq!(k.morsel_bytes_max(), None);
+    assert_eq!(k.morsel_bytes_max(), Some(512 * MIB));
+    // A stage the run says no line of is on the share's rule: what an instance's share holds.
+    k.bind_room(2560 * MIB, 512 * MIB, LEAST_MORSEL, 4.0, None);
+    k.bind_run(sampler(0, 2560 * MIB), 4 * GIB);
+    assert_eq!(*lock(&k.measured), None);
+    // Measured, but not one instance at the least piece by it: the share's rule, by its line.
+    k.bind_room(200 * MIB, 512 * MIB, LEAST_MORSEL, 4.0, Some(score));
+    k.bind_run(sampler(0, 2560 * MIB), 4 * GIB);
+    assert_eq!((k.instances(), *lock(&k.measured)), (1, None));
+    let note = k.note();
+    assert!(
+        note.contains("measured: batches of at most ")
+            && note.contains("what an instance's share of 2684354560 bytes holds"),
+        "{note}"
+    );
     // A line whose need at the least morsel is past what a number holds funds one instance.
     let past = line(0, f64::MAX);
     k.bind_room(2560 * MIB, 512 * MIB, LEAST_MORSEL, 4.0, Some(past));
@@ -675,8 +689,9 @@ fn an_unmeasured_function_warms_up_on_its_first_instance_and_the_fit_funds_the_o
     let back = freed.load(Ordering::Relaxed);
     assert!(near(back, 680 * MIB), "{back}");
     assert_eq!(stage.share(), 640 * MIB);
+    // Batches of the piece the fit sized the instances at (6.3v), as the node's are cut.
     let cap = k.morsel_bytes_max().expect("a cap");
-    assert!(near(cap, 25_690_112), "(640 - 150) / 20 MiB: {cap}");
+    assert_eq!(cap, 16 * MIB);
     let note = k.note();
     assert!(
         note.contains("; warmed up on its first instance over 5 pieces in ")

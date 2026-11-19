@@ -12,9 +12,11 @@
 //!   with the slope of what the run had of the function kept where it had one.
 //! - The stage's instances are then funded from the fit over the run's room for them
 //!   (`instances::fund_measured`, at pieces from the largest morsel down to the least: the piece
-//!   shrinks first, and only then do fewer instances run). The stage's ceiling is shared among
-//!   that many, each instance's batches are held to what its share holds by the fit, the room
-//!   they do not need goes back to the run's arena, and the others start.
+//!   shrinks first, and only then do fewer instances run). The others are carved at the fit's
+//!   account at that piece and every instance's batches are cut at the piece, as the node's
+//!   are (item 6.3v); the room they do not need goes back to the run's arena, and the others
+//!   start. An instance its cgroup kills while it warms up is started again by the restart's
+//!   rule (the `restart` module) and the warm-up goes on.
 
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -114,7 +116,7 @@ impl ImageKernel {
     pub(super) fn warm(&self, st: &mut ImageState, batch: RecordBatch) -> Result<Payload> {
         let rows = batch.num_rows();
         if rows == 0 {
-            return st.exchange(batch);
+            return self.exchange(st, batch);
         }
         let per_row = (laid_bytes(&batch, &*st.alloc)? / rows as u64).max(1);
         let mut answers = Vec::new();
@@ -123,7 +125,7 @@ impl ImageKernel {
             if !self.warming() {
                 let rest = batch.slice(at, rows - at);
                 for slice in pieces(&rest, self.piece_cap(st.ceiling), &*st.alloc)? {
-                    answers.push(st.exchange(slice)?);
+                    answers.push(self.exchange(st, slice)?);
                 }
                 break;
             }
@@ -139,7 +141,7 @@ impl ImageKernel {
             at += take;
             let laid = laid_bytes(&piece, &*st.alloc)?;
             lock(&self.warm).started.get_or_insert_with(Instant::now);
-            answers.push(st.exchange(piece)?);
+            answers.push(self.exchange(st, piece)?);
             self.reading(st, laid);
         }
         if answers.len() > 1 {
@@ -171,7 +173,7 @@ impl ImageKernel {
         };
         if done {
             self.warmed(st.place.stage());
-            st.ceiling = st.place.stage().share();
+            st.ceiling = st.place.limit();
         }
     }
 
@@ -215,9 +217,9 @@ impl ImageKernel {
         self.warming.store(false, Ordering::Relaxed);
     }
 
-    /// The stage's instances funded from `line` over the run's room for them, the stage's
-    /// ceiling shared among them, and the room they do not need handed back; the note's words
-    /// for it.
+    /// The stage's instances funded from `line` over the run's room for them, sized at the
+    /// piece and the account it gives ([`measured_sizing`]), the share of the stage's ceiling
+    /// counted among them, and the room they do not need handed back; the note's words for it.
     pub(super) fn size_from(&self, stage: &Stage, line: moruna_cost::Memory) -> String {
         let asked = self.asked.load(Ordering::Relaxed);
         let mut room = lock(&self.room);
@@ -225,18 +227,8 @@ impl ImageKernel {
             return String::from("; the run said no room for the stage, which stays as it was");
         };
         room.line = Some(line.clone());
-        // Down to the least morsel, or to the largest piece the warm-up gave where the job's
-        // batches were smaller than that (`instances::measured_pieces`, as the node decides
-        // it): a line of one size is scaled up in proportion past it (`Memory::account`),
-        // which would cost an instance at a piece the job has not given as far more than it
-        // measured, while a larger batch is cut at what its share holds.
-        let ladder = instances::measured_pieces(
-            &stage::ladder(room.morsel, room.least),
-            line.input_bytes_max,
-        );
-        let costs: Vec<u64> = ladder.iter().map(|&piece| need_at(&line, piece)).collect();
-        let (at, counts) = match instances::fund_measured(room.bytes, &[(asked, costs.clone())]) {
-            Ok(funded) => funded,
+        let (piece, account, count) = match measured_sizing(room, &line, asked) {
+            Ok(sized) => sized,
             Err(why) => {
                 // Not one instance at the least piece: one, in the whole ceiling, as before.
                 let share = stage.recount(1).unwrap_or_else(|_| stage.share());
@@ -245,7 +237,9 @@ impl ImageKernel {
                 return format!("; one instance, in the whole of the stage's ceiling ({why})");
             }
         };
-        let count = counts.first().copied().unwrap_or(1).max(1);
+        // Its other instances are carved at the account, and its batches cut at the piece, as
+        // the node's are (item 6.3v); the first keeps its cgroup, on the share's rule.
+        *lock(&self.measured) = Some((piece, account));
         self.funded.store(count, Ordering::Relaxed);
         let share = match stage.recount(count) {
             Ok(share) => share,
@@ -257,14 +251,42 @@ impl ImageKernel {
         self.share.store(share, Ordering::Relaxed);
         let freed = room
             .bytes
-            .saturating_sub(costs[at].saturating_mul(count as u64));
+            .saturating_sub(account.saturating_mul(count as u64));
         if let Some(f) = self.on_sized.get() {
             f(freed);
         }
         format!(
-            "; its {count} instances funded at pieces of {} bytes, {} bytes each, of the {} \
-             bytes the run has for them, {freed} bytes of it handed back to the arena",
-            ladder[at], costs[at], room.bytes
+            "; its {count} instances funded at pieces of {piece} bytes, {account} bytes each, of \
+             the {} bytes the run has for them, {freed} bytes of it handed back to the arena",
+            room.bytes
         )
     }
+}
+
+/// The piece and the account a stage measured by `line` sizes its instances at, and how many of
+/// the `asked` it runs (system design 3A; the node sizes its tasks so, item 6.3v): at the largest
+/// of the run's pieces, from its largest morsel down to its least (`stage::ladder`), at which
+/// every instance fits in the run's room for them by the line's account there, else the least
+/// with as many as fit there (`instances::fund_measured`: the piece shrinks first, then the
+/// count). The pieces go down to the largest the line was measured at where that is under the
+/// least morsel (`instances::measured_pieces`, as the node decides it): a line of one size is
+/// scaled up in proportion past it (`Memory::account`), which would cost an instance at a
+/// piece the job has not given as far more than it measured. Refused, in words, when one
+/// instance does not fit at the least.
+pub(super) fn measured_sizing(
+    room: &super::Room,
+    line: &moruna_cost::Memory,
+    asked: usize,
+) -> std::result::Result<(u64, u64, usize), String> {
+    let ladder = instances::measured_pieces(
+        &stage::ladder(room.morsel, room.least),
+        line.input_bytes_max,
+    );
+    let costs: Vec<u64> = ladder.iter().map(|&piece| need_at(line, piece)).collect();
+    let (at, counts) = instances::fund_measured(room.bytes, &[(asked, costs.clone())])?;
+    Ok((
+        ladder[at],
+        costs[at],
+        counts.first().copied().unwrap_or(1).max(1),
+    ))
 }
