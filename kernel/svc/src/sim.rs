@@ -509,11 +509,15 @@ impl Usage {
 /// rights, not kernel quota charging or DMA; kernel acceptance proves those.
 #[derive(Debug)]
 pub struct Memory(pub Handle);
+/// A mapping keeps its object's bytes, as the kernel keeps a mapping's pages, whatever
+/// becomes of the handle it was made from; `'a` is the borrow of that handle, which
+/// [`Memory::map_detached`] does not take.
 pub struct Mapping<'a> {
-    memory: &'a Memory,
+    bytes: Arc<MemoryState>,
     offset: usize,
     len: usize,
     writable: bool,
+    _memory: core::marker::PhantomData<&'a Memory>,
 }
 impl Memory {
     pub fn create(size: u64) -> Result<Self> {
@@ -552,6 +556,14 @@ impl Memory {
         ))))
     }
     pub fn map(&self, offset: u64, len: u64, flags: u64) -> Result<Mapping<'_>> {
+        self.mapping(offset, len, flags)
+    }
+    /// Maps as [`Memory::map`] does, with a mapping that does not borrow the handle (the
+    /// native `Memory::map_detached`).
+    pub fn map_detached(&self, offset: u64, len: u64, flags: u64) -> Result<Mapping<'static>> {
+        self.mapping(offset, len, flags)
+    }
+    fn mapping<'a>(&self, offset: u64, len: u64, flags: u64) -> Result<Mapping<'a>> {
         let Object::Memory(bytes, rights) = &self.0.0 else {
             return Err(Error::WrongType);
         };
@@ -578,10 +590,11 @@ impl Memory {
             return Err(Error::OutOfRange);
         }
         Ok(Mapping {
-            memory: self,
+            bytes: Arc::clone(bytes),
             offset,
             len,
             writable: flags & moruna_abi::map::WRITE != 0,
+            _memory: core::marker::PhantomData,
         })
     }
 }
@@ -591,10 +604,7 @@ impl Mapping<'_> {
             .checked_add(out.len())
             .filter(|end| *end <= self.len)
             .ok_or(Error::InvalidArgs)?;
-        let Object::Memory(bytes, _) = &self.memory.0.0 else {
-            return Err(Error::WrongType);
-        };
-        out.copy_from_slice(&lock(&bytes.bytes)[self.offset + offset..self.offset + end]);
+        out.copy_from_slice(&lock(&self.bytes.bytes)[self.offset + offset..self.offset + end]);
         Ok(())
     }
     pub fn write(&self, offset: usize, data: &[u8]) -> Result<()> {
@@ -605,10 +615,7 @@ impl Mapping<'_> {
             .checked_add(data.len())
             .filter(|end| *end <= self.len)
             .ok_or(Error::InvalidArgs)?;
-        let Object::Memory(bytes, _) = &self.memory.0.0 else {
-            return Err(Error::WrongType);
-        };
-        lock(&bytes.bytes)[self.offset + offset..self.offset + end].copy_from_slice(data);
+        lock(&self.bytes.bytes)[self.offset + offset..self.offset + end].copy_from_slice(data);
         Ok(())
     }
 }

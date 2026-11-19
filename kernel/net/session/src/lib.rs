@@ -302,6 +302,8 @@ impl Socket {
             .send_loan
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        // The loan is this socket's, under its lock, and lent only after the copy: no other
+        // party writes it meanwhile, so the copy is a bulk one (`Mapping::write`, 6.3ad).
         loan.map(0, LOAN_BYTES as u64, map::WRITE)
             .and_then(|mapping| mapping.write(0, &bytes[..count]))
             .map_err(kernel)?;
@@ -341,6 +343,9 @@ impl Socket {
         if count > most {
             return Err(malformed());
         }
+        // Answered, the network server holds the loan no more, and no other receive is lent it
+        // while its lock is held: no other party writes it during the copy, so the copy is a
+        // bulk one (`Mapping::read`, 6.3ad).
         loan.map(0, LOAN_BYTES as u64, map::READ)
             .and_then(|mapping| mapping.read(0, &mut buffer[..count]))
             .map_err(kernel)?;

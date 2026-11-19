@@ -106,6 +106,8 @@ impl Stream for NetStream<'_> {
     fn write(&mut self, bytes: &[u8], deadline: u64) -> Result<usize, StreamError> {
         let count = bytes.len().min(LOAN_BYTES);
         arm(self.client, deadline)?;
+        // The loan is lent only after the copy, and to one call at a time: no other party
+        // writes it meanwhile, so the copy is a bulk one (`Mapping::write`, work item 6.3ad).
         self.loan
             .map(0, LOAN_BYTES as u64, map::WRITE)
             .and_then(|mapping| mapping.write(0, &bytes[..count]))
@@ -132,6 +134,8 @@ impl Stream for NetStream<'_> {
                 "the network server gave more bytes than were asked for",
             )));
         }
+        // Answered, the network server holds the loan no more (SDD 31): no other party writes
+        // it during the copy, a bulk one (`Mapping::read`, work item 6.3ad).
         self.loan
             .map(0, LOAN_BYTES as u64, map::READ)
             .and_then(|mapping| mapping.read(0, &mut buffer[..count]))

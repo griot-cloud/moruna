@@ -34,6 +34,35 @@ fn memory_loans_share_backing_and_enforce_mapping_rights_and_bounds() {
     assert!(read_only.map(0, 4096, map::WRITE).is_err());
     assert!(read_only.0.duplicate(Rights::ALL).is_err());
 }
+/// A detached mapping keeps its object's bytes after the handle it was made from has gone,
+/// shared with every other mapping, under the same rights and bounds (work item 6.3ad: the
+/// network server keeps a receive's loan mapped from its arrival to its answer).
+#[test]
+fn a_detached_mapping_outlives_its_handle_and_shares_the_object_s_bytes() {
+    let original = Memory::create(8192).unwrap();
+    let loan = Memory(
+        original
+            .0
+            .duplicate(Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER)
+            .unwrap(),
+    );
+    let kept = loan.map_detached(4096, 4096, map::WRITE).unwrap();
+    drop(loan);
+    kept.write(1, b"kept").unwrap();
+    let mut seen = [0; 4];
+    original
+        .map(4096, 4096, map::READ)
+        .unwrap()
+        .read(1, &mut seen)
+        .unwrap();
+    assert_eq!(&seen, b"kept");
+    assert_eq!(kept.write(4093, b"kept"), Err(Error::InvalidArgs));
+    let read_only = original.map_detached(0, 8192, map::READ).unwrap();
+    assert_eq!(read_only.write(0, b"x"), Err(Error::AccessDenied));
+    read_only.read(4097, &mut seen).unwrap();
+    assert_eq!(&seen, b"kept");
+    assert!(original.map_detached(0, 12288, map::READ).is_err());
+}
 #[test]
 fn channel_transfer_cannot_upgrade_nontransferable_memory() {
     let memory = Memory::create(4096).unwrap();

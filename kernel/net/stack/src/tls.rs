@@ -376,6 +376,11 @@ impl Tls {
     ) -> Option<Result<Result<u32, E>, Error>> {
         state_mut!(self,s=>s.receive_to(max,write))
     }
+    /// Whether [`Tls::receive_to`] answers now (work item 6.3ad): plaintext waits, or the
+    /// stream's end, or a failure.
+    pub fn receivable(&self) -> bool {
+        state!(self,s=>s.receivable())
+    }
     /// Moves the socket's records, timed and counted on `meter` (work item 6.3ab).
     pub fn poll(&mut self, socket: &mut tcp::Socket<'static>, now: u64, meter: &mut Meter) {
         state_mut!(self,s=>s.poll(socket,now,meter))
@@ -486,6 +491,9 @@ impl<C: Connection> State<C> {
             return Some(Err(error));
         }
         self.peer_closed.then(|| Ok(Ok(0)))
+    }
+    pub fn receivable(&self) -> bool {
+        !self.plain_in.is_empty() || self.failure.is_some() || self.peer_closed
     }
     pub fn poll(&mut self, socket: &mut tcp::Socket<'static>, now: u64, meter: &mut Meter) {
         if self.failure.is_some() {

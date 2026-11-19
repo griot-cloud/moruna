@@ -86,11 +86,26 @@ adds map::READ, even for a requested writable mapping. The stack validates and m
 only pages covering the bounded offset/range before consuming any bytes; overflow,
 missing rights, wrong object, out-of-range mapping and max beyond RECEIVE_MAX are
 refused. A deferred receive owns that loan until completion, close, disconnect or
-cancel; it does not allocate a second destination or retain a lifetime-free raw
-mapping. Completion is a u32 count and zero retains authenticated EOF semantics.
+cancel; it does not allocate a second destination. It keeps the loan mapped writable
+from the receive's arrival to its end: one mapping, owned with the loan and dropped
+with it, so a try neither maps nor unmaps (work item 6.3ad). A receive is tried only
+when it can be answered: its socket has bytes (smoltcp's `can_recv`, or TLS
+plaintext), its end, or a failure; never at every poll while it waits.
+Completion is a u32 count and zero retains authenticated EOF semantics.
 Plain TCP copies from smoltcp's bounded receive ring directly into the mapped caller
 destination. TLS uses rustls' existing bounded server-charged plaintext staging;
 this is not a zero-copy or DMA-to-application claim and never a bulk wire reply.
+
+**The loan contract, which the copies rely on (work item 6.3ad).** A client does not
+read or write a loan between handing it over and its answer, as the data plane's
+DP-I4 (SDD 29) says of a batch: nothing writes a buffer while another party holds it.
+So the server copies into a receive's loan and out of a send's loan with one bulk copy
+(`Mapping::write` and `Mapping::read`, `core::ptr::copy_nonoverlapping` over the
+mapped range), and a client copies out of its receive loan once the receive is
+answered and into its send loan before it lends it, the same way. The call sites say
+so: the server's
+`send_from_loan` and `receive_into_loan`, and its clients' (`moruna-net-session`,
+`moruna-node-http`'s `NetStream`, `platform`'s `Socket`, the API server's network).
 
 The SDK host Memory model tests shared backing, subset rights, transferable handles,
 page bounds and map/write permissions. It does not prove kernel account charging or
