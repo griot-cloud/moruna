@@ -12,12 +12,17 @@
 //! takes the line's slope; the growth that does not scale goes into the fixed term, once; every
 //! reading in the window is still bounded (RC-I1); and the workers stay at what the arena and
 //! the CPU allow.
+//!
+//! The line is the one the run was given at the start (the job's, the registry's or its store's,
+//! in the stage's hints), or the one its warm-up measured, the moment the stage's counters say it
+//! (PM, 2026-11-19): mid-run, or by the end of the probe when the probe's morsel completed the
+//! warm-up. The probe's slope is the line's too: one reading has no spread either.
 
 mod common;
 
 use common::{GIB, MIB, active_workers, config, record, stats};
 use moruna_controller::Controller;
-use moruna_kernel::{KernelHints, MeasuredLine, ProbeResult, TraceRecord};
+use moruna_kernel::{KernelHints, MeasuredLine, ProbeResult, SchedulerStats, TraceRecord};
 use moruna_testkit::{FakeKnobs, FakeSampler};
 
 /// The stage's measured line: about 4 MB whatever the batch, 2 bytes a byte of input.
@@ -31,6 +36,9 @@ const HELD: u64 = 4_000_000;
 const WORKERS: u16 = 4;
 /// The room the instances did not need, handed back to the arena at the warm-up's end.
 const HANDED_BACK: u64 = 4 * MIB;
+/// IM-T32's small batches, and the allocator's chunk one of them carries.
+const SMALL: u64 = 5_000;
+const CHUNK: u64 = 1_070_000;
 
 /// One reading as the test feeds it: the morsel, and what the process grew by across `apply`.
 #[derive(Clone, Copy, Debug)]
@@ -55,6 +63,72 @@ fn readings(bytes_in: u64, count: usize, chunks: &[(usize, u64)]) -> Vec<Reading
         .collect()
 }
 
+/// IM-T32's 5 KB morsels: two carry an allocator's chunk of about a megabyte and half of one.
+fn small_morsels() -> Vec<Reading> {
+    readings(SMALL, 12, &[(2, CHUNK), (7, 570_000)])
+}
+
+/// The scheduler's counters for the one stage on four busy workers, its kernel saying `line`.
+fn counters(line: Option<MeasuredLine>) -> SchedulerStats {
+    let mut stats = stats(WORKERS, WORKERS);
+    stats.per_stage[0].measured_line = line;
+    stats
+}
+
+/// A probe of one morsel of `bytes_in` bytes that grew the process by `growth`.
+fn probe(bytes_in: u64, growth: u64) -> ProbeResult {
+    ProbeResult {
+        bytes_in,
+        rows_in: bytes_in / 16,
+        bytes_out: bytes_in,
+        peak_delta: growth,
+        dev_peak_delta: 0,
+        wall_ns: 1_000_000,
+        cpu_ns: 1_000_000,
+    }
+}
+
+/// A run at 1 GiB on 4 workers whose stage was given `line` at the start and whose probe is
+/// `probed`; when `warmed` is given, the probe's morsel completes the stage's warm-up and the
+/// counters say that line from then on. Run up: prepared, probed and started.
+fn started(
+    line: Option<MeasuredLine>,
+    probed: ProbeResult,
+    warmed: Option<MeasuredLine>,
+) -> common::Rig {
+    let cfg = config(GIB, WORKERS);
+    let resting = cfg.arena_bytes;
+    let hints = KernelHints {
+        measured_line: line,
+        ..KernelHints::default()
+    };
+    let knobs = FakeKnobs::new()
+        .probe_result(1, probed)
+        .stats(counters(None));
+    let prober = match warmed {
+        Some(line) => common::RecordingProber::then_stats(knobs.clone(), counters(Some(line))),
+        None => common::RecordingProber::new(knobs.clone()),
+    };
+    let rig = common::Rig::with_prober(
+        cfg,
+        vec![common::kernel(1, hints)],
+        knobs,
+        FakeSampler::new().scripted(common::steady(resting + HELD, 4096)),
+        prober,
+    );
+    rig.run_up();
+    rig
+}
+
+/// Feed `readings` a tick at a time.
+fn feed(rig: &common::Rig, readings: &[Reading]) {
+    let resting = config(GIB, WORKERS).arena_bytes;
+    for (at, r) in readings.iter().enumerate() {
+        rig.feed(&reading(at as u64 + 1, resting, r));
+        rig.controller.tick_once();
+    }
+}
+
 /// What a run ended on: the worker count it last wrote, and its fit as the report says it.
 struct Ended {
     workers: u16,
@@ -63,51 +137,37 @@ struct Ended {
     note: String,
 }
 
-/// A run at 1 GiB on 4 workers whose stage carries `line`, probed on a morsel of the run's own
-/// size at two bytes a byte, fed `readings` a tick at a time; then the warm-up's end hands room
-/// back to the arena and the plan is solved again (`set_arena`).
-fn run(line: Option<MeasuredLine>, readings: &[Reading]) -> Ended {
-    let cfg = config(GIB, WORKERS);
-    let resting = cfg.arena_bytes;
-    let first = readings[0].bytes_in;
-    let probe = ProbeResult {
-        bytes_in: first,
-        rows_in: first / 16,
-        bytes_out: first,
-        peak_delta: 2 * first,
-        dev_peak_delta: 0,
-        wall_ns: 1_000_000,
-        cpu_ns: 1_000_000,
-    };
-    let hints = KernelHints {
-        measured_line: line,
-        ..KernelHints::default()
-    };
-    let rig = common::Rig::new(
-        cfg,
-        vec![common::kernel(1, hints)],
-        FakeKnobs::new()
-            .probe_result(1, probe)
-            .stats(stats(WORKERS, WORKERS)),
-        FakeSampler::new().scripted(common::steady(resting + HELD, 4096)),
-    );
-    rig.run_up();
-    for (at, r) in readings.iter().enumerate() {
-        rig.feed(&reading(at as u64 + 1, resting, r));
-        rig.controller.tick_once();
-    }
+/// The warm-up's end hands room back to the arena and the plan is solved again (`set_arena`);
+/// then what the run ended on.
+fn hand_back(rig: common::Rig) -> Ended {
+    let resting = config(GIB, WORKERS).arena_bytes;
     rig.controller.set_arena(resting + HANDED_BACK, 0);
+    let ended = now(&rig);
+    rig.controller.stop();
+    ended
+}
+
+/// The worker count the run last wrote, and its fit as the report says it now.
+fn now(rig: &common::Rig) -> Ended {
     let workers = *active_workers(&rig.writes())
         .last()
         .expect("a worker count");
     let (c, a, note) = fit(&rig.controller);
-    rig.controller.stop();
     Ended {
         workers,
         c,
         a,
         note,
     }
+}
+
+/// A run whose stage was given `line` at the start, probed on a morsel of the run's own size at
+/// two bytes a byte, fed `readings` a tick at a time; then the warm-up's hand-back.
+fn run(line: Option<MeasuredLine>, readings: &[Reading]) -> Ended {
+    let first = readings[0].bytes_in;
+    let rig = started(line, probe(first, 2 * first), None);
+    feed(&rig, readings);
+    hand_back(rig)
 }
 
 /// The trace record of one reading: the process at `resting` plus what the instances hold
@@ -174,16 +234,17 @@ fn assert_took_the_line(ended: &Ended) {
     );
 }
 
+/// The fixed term 5 KB morsels leave on four workers by the line: the chunk and the morsel's own
+/// growth, less what the line charges the four in flight.
+const SMALL_C: u64 = HELD + CHUNK + 2 * SMALL - 2 * 4 * SMALL;
+
 #[test]
 fn rc_t27_five_kilobyte_morsels_take_the_measured_slope() {
-    // 5 KB morsels; two of them carry an allocator's chunk of about a megabyte and half of one.
-    let fed = readings(5_000, 12, &[(2, 1_070_000), (7, 570_000)]);
+    let fed = small_morsels();
     let ended = run(Some(LINE), &fed);
     assert_took_the_line(&ended);
-    // The chunk, and the morsel's own growth, less what the line charges the four in flight.
     assert_eq!(
-        ended.c,
-        HELD + 1_070_000 + 2 * 5_000 - 2 * 4 * 5_000,
+        ended.c, SMALL_C,
         "the growth that does not scale is in the fixed term, once: {}",
         ended.note
     );
@@ -203,9 +264,9 @@ fn rc_t27_one_mebibyte_morsels_take_the_measured_slope() {
 #[test]
 fn rc_t27_without_a_line_the_steepest_reading_stands() {
     // Where no line exists, nothing changes: the steepest growth over a morsel, said so.
-    let fed = readings(5_000, 12, &[(2, 1_070_000), (7, 570_000)]);
+    let fed = small_morsels();
     let ended = run(None, &fed);
-    let steepest = (1_070_000.0 + 10_000.0) / 5_000.0;
+    let steepest = (CHUNK + 2 * SMALL) as f64 / SMALL as f64;
     assert!((ended.a - steepest).abs() < 1e-6, "{}", ended.note);
     assert_eq!(ended.workers, 1, "{}", ended.note);
     assert!(
@@ -235,4 +296,70 @@ fn rc_t27_a_window_with_spread_fits_its_own_line() {
         ended.note
     );
     assert_bounded(&ended, &fed);
+}
+
+#[test]
+fn rc_t27_the_warm_up_s_line_arriving_mid_run_is_taken_at_once() {
+    // IM-T32 as it runs: nothing measured the function, so its stage warms up on the job's first
+    // batches and the controller has no line until the warm-up has fitted one.
+    let fed = small_morsels();
+    let rig = started(None, probe(SMALL, 2 * SMALL), None);
+    feed(&rig, &fed);
+    let before = now(&rig);
+    assert!(
+        before.a > 200.0 && before.note.contains("(steepest reading)"),
+        "{}",
+        before.note
+    );
+    // The warm-up has fitted its line: the stage's counters say it, and the next tick refits.
+    rig.knobs.set_stats(counters(Some(LINE)));
+    rig.controller.tick_once();
+    let ended = hand_back(rig);
+    assert_took_the_line(&ended);
+    assert_eq!(ended.c, SMALL_C, "{}", ended.note);
+    assert_bounded(&ended, &fed);
+}
+
+#[test]
+fn rc_t27_the_probe_takes_the_line() {
+    // A 5 KB probe that caught the allocator's chunk: alone, its reading is 216 bytes a byte,
+    // and the solve at `start` runs one worker of four.
+    let steep = probe(SMALL, CHUNK + 2 * SMALL);
+    let alone = started(None, steep.clone(), None);
+    let without = now(&alone);
+    assert_eq!(without.workers, 1, "{}", without.note);
+    assert!((without.a - 216.0).abs() < 1e-9, "{}", without.note);
+    alone.controller.stop();
+
+    // With a line given at the start, the probe's slope is the line's: one reading has no
+    // spread either. Its growth is still the fixed term, until a record separates the two.
+    let given = started(Some(LINE), steep.clone(), None);
+    let with = now(&given);
+    assert_eq!(
+        (with.workers, with.a, with.c),
+        (WORKERS, LINE.per_input_byte, CHUNK + 2 * SMALL),
+        "{}",
+        with.note
+    );
+    given.controller.stop();
+
+    // And a warm-up the probe's morsel completed says its line by the probe's end.
+    let warmed = started(None, steep.clone(), Some(LINE));
+    let with = now(&warmed);
+    assert_eq!(
+        (with.workers, with.a),
+        (WORKERS, LINE.per_input_byte),
+        "{}",
+        with.note
+    );
+    warmed.controller.stop();
+
+    // A line that arrives before any record of the run is the slope at once, the probe's fixed
+    // term kept.
+    let later = started(None, steep, None);
+    later.knobs.set_stats(counters(Some(LINE)));
+    later.controller.tick_once();
+    let (c, a, note) = fit(&later.controller);
+    assert_eq!((a, c), (LINE.per_input_byte, CHUNK + 2 * SMALL), "{note}");
+    later.controller.stop();
 }

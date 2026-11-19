@@ -475,4 +475,13 @@ pub trait Kernel: Send + Sync + 'static {
     fn morsel_bytes_max(&self) -> Option<u64> {
         None
     }
+    /// The function's line as this run's warm-up measured it (system design 3A; item 6.3w): its
+    /// fixed bytes and its bytes per input byte, once the stage's warm-up on its first instance
+    /// has fitted them, and `None` before that and for every kernel that does not warm up. Read
+    /// with the stage's counters on every tick (`StageStats::measured_line`), as
+    /// [`Kernel::morsel_bytes_max`] is: the controller's anon fit takes its slope where its
+    /// window cannot resolve one (RC f.3).
+    fn measured_line(&self) -> Option<MeasuredLine> {
+        None
+    }
 }

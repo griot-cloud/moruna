@@ -1302,6 +1302,12 @@ impl Kernel for ImageKernel {
         self.piece_cap(self.share.load(Ordering::Relaxed))
     }
 
+    /// The line the stage's warm-up fitted, once it has (item 6.3w): the controller's anon fit
+    /// takes its slope.
+    fn measured_line(&self) -> Option<moruna_kernel::MeasuredLine> {
+        lock(&self.warm).line
+    }
+
     /// SDD 19 f.6: one batch to the process and one back, in lockstep, across the plane. A
     /// batch past what an instance takes ([`Kernel::morsel_bytes_max`]) is cut into slices of
     /// its rows, each given and answered in turn, and the answers joined in order: the stage's

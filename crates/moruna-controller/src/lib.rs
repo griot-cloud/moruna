@@ -26,9 +26,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use moruna_kernel::{
-    Fingerprint, KernelHints, KernelKind, KnobSnapshot, Knobs, Limits, MorunaError, Placement,
-    Prober, Sampler, Seq, SizerKind, StageId, StatsSource, TierBudgets, Topology, TraceRecord,
-    TraceTail,
+    Fingerprint, KernelHints, KernelKind, KnobSnapshot, Knobs, Limits, MeasuredLine, MorunaError,
+    Placement, Prober, Sampler, Seq, SizerKind, StageId, StatsSource, TierBudgets, Topology,
+    TraceRecord, TraceTail,
 };
 
 mod admission;
@@ -581,10 +581,40 @@ impl StageCtl {
         while self.anon_points.len() > WINDOW {
             self.anon_points.pop_front();
         }
+        self.refit_anon();
+    }
+
+    /// Refit both terms of f.3 from the window as it stands.
+    fn refit_anon(&mut self) {
         let fit = fit_anon(&self.anon_points, self.a_anon_seed, self.line_slope);
         self.a_anon = fit.a;
         self.c_anon = fit.c;
         self.anon_slope = Some(fit.from);
+    }
+
+    /// Take the stage's measured line (item 6.3w; PM, 2026-11-19): the one the run was given at
+    /// the start (the job's, the registry's or its store's), or the one its warm-up measured, the
+    /// moment it arrives in the stage's counters. The fit takes it at once: a window that
+    /// cannot resolve a slope takes the line's and its constant the rest; one with the spread
+    /// keeps its own. With no reading yet, the slope is the line's, since the probe's one reading
+    /// has no spread either, and the probe's fixed term stands. True when the line moved.
+    pub(crate) fn take_line(&mut self, line: Option<MeasuredLine>) -> bool {
+        let Some(slope) = line
+            .map(|line| line.per_input_byte)
+            .filter(|slope| slope.is_finite() && *slope >= 0.0)
+        else {
+            return false;
+        };
+        if self.line_slope == Some(slope) {
+            return false;
+        }
+        self.line_slope = Some(slope);
+        if self.anon_points.is_empty() {
+            self.a_anon = slope.max(MIN_AMPLIFICATION);
+        } else {
+            self.refit_anon();
+        }
+        true
     }
 
     fn new(stage: StageId, cfg: &ControllerConfig, sizer: Box<dyn Sizer>) -> StageCtl {

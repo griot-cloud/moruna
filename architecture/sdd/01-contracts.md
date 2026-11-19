@@ -661,6 +661,10 @@ pub trait Kernel: Send + Sync + 'static {
     /// The output schema for the input schemas, port 0 first (d.16). The default is
     /// `output_schema` for one input and a `Plan` refusal for several.
     fn output_schema_of(&self, inputs: &[SourceSchema]) -> Result<SourceSchema> { .. }
+    /// The function's line as this run's warm-up measured it, once it has (system design 3A,
+    /// 6.3w): read with the stage's counters every tick (`StageStats::measured_line`), as
+    /// `morsel_bytes_max` is; the controller's anon fit takes its slope (RC f.3). Default `None`.
+    fn measured_line(&self) -> Option<MeasuredLine> { None }
 }
 ```
 
@@ -1015,7 +1019,8 @@ pub struct KnobSnapshot {
 pub trait StatsSource: Send + Sync { fn scheduler_stats(&self) -> SchedulerStats; }
 
 #[derive(Clone, Debug, Default)]
-pub struct StageStats { pub stage: StageId, pub tasks: u64, pub busy_ns: u64, pub errors: u32, pub skipped: u32, pub instances_live: u16 }
+pub struct StageStats { pub stage: StageId, pub tasks: u64, pub busy_ns: u64, pub errors: u32, pub skipped: u32, pub instances_live: u16,
+    pub morsel_bytes_max: Option<u64> /* RC-I11 */, pub measured_line: Option<MeasuredLine> /* the warm-up's, 6.3w */ }
 
 #[derive(Clone, Debug, Default)]
 pub struct SchedulerStats {

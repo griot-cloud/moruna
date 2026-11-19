@@ -121,11 +121,18 @@ pub(crate) fn tick(ctl: &Inner) {
         for ctl_stage in state.stages.iter_mut() {
             ctl_stage.waiting = stats.stages_waiting.contains(&ctl_stage.stage);
         }
+        let mut line_moved = false;
         for stage_stats in &stats.per_stage {
             if let Some(ctl_stage) = state.stage_mut(stage_stats.stage) {
                 ctl_stage.instances_live = stage_stats.instances_live;
                 ctl_stage.morsel_cap = stage_stats.morsel_bytes_max;
+                // A warm-up that has measured the stage's function says its line here, and the
+                // fit takes it at once (item 6.3w, f.3).
+                line_moved |= ctl_stage.take_line(stage_stats.measured_line);
             }
+        }
+        if line_moved {
+            model::refresh_envelopes(&mut state);
         }
         // A stage whose instances can now take less than its target (a warm-up measured its
         // function, system design 3A) is brought down to it at once, whatever else this tick

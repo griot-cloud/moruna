@@ -111,18 +111,19 @@ pub(crate) fn prepare(ctl: &Inner) -> Result<Budgets> {
         for stage in stages {
             let mut sizer_ctl = crate::StageCtl::new(stage, &cfg, factory(stage));
             sizer_ctl.instances_live = state.max_instances(stage);
-            sizer_ctl.morsel_cap = stats
+            let counters = stats
                 .per_stage
                 .iter()
-                .find(|counters| counters.stage == stage)
-                .and_then(|counters| counters.morsel_bytes_max);
-            // The stage's measured line, where the run has one (item 6.3w): its slope is what
-            // the anon fit takes where its window cannot resolve one (f.3).
-            sizer_ctl.line_slope = state
-                .hints(stage)
-                .measured_line
-                .map(|line| line.per_input_byte)
-                .filter(|slope| slope.is_finite() && *slope >= 0.0);
+                .find(|counters| counters.stage == stage);
+            sizer_ctl.morsel_cap = counters.and_then(|counters| counters.morsel_bytes_max);
+            // The stage's measured line, where the run has one (item 6.3w): its warm-up's if it
+            // has measured one already, else the one the run was given. Its slope is what the
+            // anon fit takes where its window cannot resolve one (f.3).
+            sizer_ctl.take_line(
+                counters
+                    .and_then(|counters| counters.measured_line)
+                    .or(state.hints(stage).measured_line),
+            );
             state.stages.push(sizer_ctl);
         }
         (budgets, tier_budgets)

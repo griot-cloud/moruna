@@ -32,6 +32,7 @@ fn scheduler_stats(active: u16, busy: u16) -> SchedulerStats {
             skipped: 0,
             instances_live: 1,
             morsel_bytes_max: None,
+            measured_line: None,
         }],
         workers_active: active,
         workers_busy: busy,

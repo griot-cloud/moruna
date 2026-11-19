@@ -106,6 +106,9 @@ pub struct StageStats {
     /// The largest morsel one of the stage's instances can take, as its kernel says it
     /// (`Kernel::morsel_bytes_max`); `None` when nothing bounds it but the run's memory.
     pub morsel_bytes_max: Option<u64>,
+    /// The function's line as the run's warm-up measured it, once it has
+    /// (`Kernel::measured_line`, item 6.3w); `None` before that.
+    pub measured_line: Option<crate::MeasuredLine>,
 }
 
 /// The scheduler's counters as the controller reads them.

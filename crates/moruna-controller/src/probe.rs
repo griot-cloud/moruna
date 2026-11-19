@@ -113,8 +113,19 @@ pub(crate) fn probe_all(ctl: &Inner, resuming: bool) -> Result<()> {
             Err(e) => return Err(e),
         };
         probed += 1;
+        // A warm-up the probe's morsel completed has measured the function's line by now
+        // (item 6.3w): read with the lock released (RC-I10), it seeds the probe's slope.
+        let line = ctl
+            .peers()
+            .stats
+            .scheduler_stats()
+            .per_stage
+            .iter()
+            .find(|counters| counters.stage == stage)
+            .and_then(|counters| counters.measured_line);
         {
             let mut state = ctl.held();
+            state.stages[at].take_line(line);
             record_probe(&mut state, at, &result);
             let ctl_stage = &state.stages[at];
             tracing::info!(
@@ -327,8 +338,16 @@ fn record_probe(state: &mut crate::ControllerState, at: usize, result: &ProbeRes
             // The probe runs one morsel on one worker (SC f.9), so a process-wide delta over it
             // is already the per-in-flight-morsel figure f.3's anon inequality wants, with none
             // of the concurrency the steady-state fit in 10 f.3 has to divide back out.
-            ctl.a_anon = measured.max(MIN_AMPLIFICATION);
-            ctl.a_anon_seed = ctl.a_anon;
+            //
+            // Where the stage has a measured line, the slope is the line's (item 6.3w; PM,
+            // 2026-11-19): one reading has no spread either, and on a small morsel the growth
+            // across one `apply` holds what does not scale with it (115 to 216 bytes a byte on
+            // 5 KB batches, IM-T32). The probe's own figure is kept as `a_anon_seed`, what the
+            // profile records as the probe's and compares for drift.
+            ctl.a_anon_seed = measured.max(MIN_AMPLIFICATION);
+            ctl.a_anon = ctl
+                .line_slope
+                .map_or(ctl.a_anon_seed, |slope| slope.max(MIN_AMPLIFICATION));
             // And the whole of the probe's growth is seeded as the fixed term, until a real
             // record lets `fit_anon` separate the two (11 f.3). One observation cannot tell a
             // kernel that costs 160 MB whatever the morsel from one that costs ten bytes per
@@ -352,7 +371,7 @@ fn record_probe(state: &mut crate::ControllerState, at: usize, result: &ProbeRes
             // (every morsel of the run at its own size, fixed cost and all), so an identical
             // second run could read as drift and lose the margin its evidence had bought
             // (2026-11-14). A file without the probe's figure is not compared.
-            let distance = (ctl.a_anon - found.probe_a_anon).abs() / found.probe_a_anon;
+            let distance = (ctl.a_anon_seed - found.probe_a_anon).abs() / found.probe_a_anon;
             if distance > DRIFT {
                 // The probe is what is true now; the profile is what was true before. Trust
                 // the probe and put the margin back where an unseen kernel starts.
