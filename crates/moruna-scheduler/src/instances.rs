@@ -172,11 +172,14 @@ fn finish_stage(shared: &Shared, worker: u16, stage_ix: usize) -> Result<()> {
         };
         let s0 = shared.sampler.sample()?;
         let q_before = crate::worker::tier_totals(&shared.placement_stats());
+        // d.16: what the instance gives of its own is numbered after every number the stage's
+        // input could carry, and after what the instances before it gave.
+        let after = base.saturating_add(given);
         let t0 = crate::cputime::now_ns();
         let c0 = crate::cputime::thread_cpu_ns();
         let kernel = entry.kernel.clone();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            kernel.finish(state.as_mut())
+            kernel.finish_morsels(state.as_mut(), after)
         }));
         let c1 = crate::cputime::thread_cpu_ns();
         let t1 = crate::cputime::now_ns();
@@ -190,10 +193,9 @@ fn finish_stage(shared: &Shared, worker: u16, stage_ix: usize) -> Result<()> {
                 slot.state = if retire { None } else { Some(state) };
             }
         }
-        let seq = base.saturating_add(given);
-        let payload = match outcome {
-            Ok(Ok(Some(payload))) => payload,
-            Ok(Ok(None)) => continue,
+        let seq = after;
+        let completed = match outcome {
+            Ok(Ok(completed)) => completed,
             Ok(Err(MorunaError::Kernel { msg, features, .. })) => {
                 return Err(MorunaError::Kernel {
                     stage,
@@ -215,56 +217,129 @@ fn finish_stage(shared: &Shared, worker: u16, stage_ix: usize) -> Result<()> {
                 });
             }
         };
-        // f.12: from here on no manifest is written; this batch has no origin to read it again
-        // from.
+        if completed.is_empty() {
+            continue;
+        }
+        // f.12: from here on no manifest is written; a batch given here has no origin to read it
+        // again from, or its morsel's rows are not where the manifest would put them.
         shared.finish_gave.store(true, Ordering::SeqCst);
-        let rows = payload.rows();
-        let bytes = payload.bytes();
-        let tier = payload.tier().index() as u8;
-        let morsel = moruna_kernel::Morsel::new(seq, stage, payload, FINISHED);
-        crate::decide::admit_push(shared, &entry.outputs, morsel, None)?;
-        given += 1;
-        entry.rows_out.fetch_add(rows, Ordering::SeqCst);
-        entry.bytes_out.fetch_add(bytes, Ordering::SeqCst);
+        let mut gave = Vec::with_capacity(completed.len());
+        for morsel in completed {
+            let rows = morsel.output.rows();
+            let bytes = morsel.output.bytes();
+            let tier = morsel.output.tier().index() as u8;
+            // 6.3m: a morsel the stage was given and gives at its end, under its own number, or
+            // the stage's own output, numbered past every input number.
+            let taken = entry
+                .open
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&morsel.seq);
+            let origin = match &taken {
+                Some(taken) => {
+                    entry.learn_growth(taken.bytes_in, bytes);
+                    taken.origin.clone()
+                }
+                None if morsel.seq >= base => {
+                    given = given.max(morsel.seq - base + 1);
+                    FINISHED
+                }
+                None => {
+                    return Err(MorunaError::Kernel {
+                        stage,
+                        seq: morsel.seq,
+                        msg: format!(
+                            "its finish gave morsel {}, which the stage was not given or has \
+                             given already",
+                            morsel.seq
+                        ),
+                        features: None,
+                    });
+                }
+            };
+            let out = moruna_kernel::Morsel::new(morsel.seq, stage, morsel.output, origin);
+            crate::decide::admit_push(shared, &entry.outputs, out, None)?;
+            entry.rows_out.fetch_add(rows, Ordering::SeqCst);
+            entry.bytes_out.fetch_add(bytes, Ordering::SeqCst);
+            for &q in &entry.outputs {
+                shared.fed(q);
+            }
+            if let Some(taken) = &taken {
+                // 6.3m, decision 4: a morsel with no time gives the cost model nothing.
+                let timed = match morsel.time {
+                    moruna_kernel::MorselTime::Unit => {
+                        Some((t1.saturating_sub(t0), c1.saturating_sub(c0)))
+                    }
+                    moruna_kernel::MorselTime::Given { wall_ns, cpu_ns } => Some((wall_ns, cpu_ns)),
+                    moruna_kernel::MorselTime::Untimed => None,
+                };
+                if let Some((wall_ns, cpu_ns)) = timed {
+                    crate::learning::settle(
+                        shared,
+                        stage_ix,
+                        taken.learn.as_ref(),
+                        crate::learning::Measured {
+                            rows_in: taken.rows_in,
+                            bytes_in: taken.bytes_in,
+                            wall_ns,
+                            cpu_ns,
+                            rows_out: rows,
+                            bytes_out: bytes,
+                        },
+                    );
+                }
+            }
+            gave.push((morsel.seq, taken, rows, bytes, tier));
+        }
         entry.tasks.fetch_add(1, Ordering::SeqCst);
         entry
             .busy_ns
             .fetch_add(t1.saturating_sub(t0), Ordering::SeqCst);
-        for &q in &entry.outputs {
-            shared.fed(q);
-        }
         let s1 = shared.sampler.sample()?;
         let q_after = crate::worker::tier_totals(&shared.placement_stats());
-        // SC-I4: the batch is a morsel of this stage, and leaves one record like every other.
-        let record = crate::worker::build_record(
-            shared,
-            crate::worker::RecordInput {
-                seq,
-                stage,
-                worker,
-                instance,
-                t0,
-                t1,
-                rows_in: 0,
-                bytes_in: 0,
-                rows_out: rows,
-                bytes_out: bytes,
-                tier_in: tier,
-                tier_out: tier,
-                features: &moruna_kernel::MorselFeatures::default(),
-                s0,
-                s1,
-                cpu_ns: c1.saturating_sub(c0),
-                q_before,
-                q_after,
-                miss_wait_us: 0,
-                state_bytes: 0,
-                outcome: moruna_kernel::Outcome::Ok,
-                error: None,
-                alloc,
-            },
-        );
-        crate::worker::emit(shared, record);
+        let none = moruna_kernel::MorselFeatures::default();
+        for (seq, taken, rows, bytes, tier) in gave {
+            // SC-I4: the batch is a morsel of this stage, and leaves one record like every other:
+            // a morsel the stage was given with its rows and bytes in as it was taken.
+            let (rows_in, bytes_in, tier_in, features) = match &taken {
+                Some(taken) => (
+                    taken.rows_in,
+                    taken.bytes_in,
+                    taken.tier_in,
+                    &taken.features,
+                ),
+                None => (0, 0, tier, &none),
+            };
+            let record = crate::worker::build_record(
+                shared,
+                crate::worker::RecordInput {
+                    seq,
+                    stage,
+                    worker,
+                    instance,
+                    t0,
+                    t1,
+                    rows_in,
+                    bytes_in,
+                    rows_out: rows,
+                    bytes_out: bytes,
+                    tier_in,
+                    tier_out: tier,
+                    features,
+                    s0,
+                    s1,
+                    cpu_ns: c1.saturating_sub(c0),
+                    q_before: q_before.clone(),
+                    q_after: q_after.clone(),
+                    miss_wait_us: 0,
+                    state_bytes: 0,
+                    outcome: moruna_kernel::Outcome::Ok,
+                    error: None,
+                    alloc,
+                },
+            );
+            crate::worker::emit(shared, record);
+        }
     }
     // Before the outputs close: a sink that sees them closed knows every number they carried.
     let _ = entry.finished.set(given);

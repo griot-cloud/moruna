@@ -7,8 +7,53 @@ use crate::buffer::Allocator;
 use crate::declare::Declared;
 use crate::error::MorunaError;
 use crate::fingerprint::Fingerprint;
-use crate::ids::DeviceId;
+use crate::ids::{DeviceId, Seq};
 use crate::payload::{Payload, PayloadSpec, SourceSchema};
+
+/// How long a morsel a kernel gave took, as the cost model is told it (item 6.3m, decision 4).
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum MorselTime {
+    /// The call that gave it, as the scheduler measures it around the call: its wall time and its
+    /// worker's CPU time. What a kernel that gives each morsel in the call that brought it says
+    /// ([`Kernel::apply_morsels`]'s default), exactly as before.
+    Unit,
+    /// The wall and CPU nanoseconds the kernel measured for the morsel itself: a pipelined
+    /// stage's, its pieces' function times summed as its task reported them.
+    Given {
+        /// Wall nanoseconds.
+        wall_ns: u64,
+        /// CPU nanoseconds.
+        cpu_ns: u64,
+    },
+    /// No time: the kernel has none for it (a ring task that stamps no time on its pieces). The
+    /// cost model is given no observation of the morsel rather than a wrong one; its trace record
+    /// and the stage's learned growth stand.
+    Untimed,
+}
+
+/// A morsel a call of a kernel completed (item 6.3m): its number, the output that answers it,
+/// and how long it took. A stage gives a morsel's output once, under that morsel's number,
+/// when the morsel's last answer has come.
+#[derive(Debug)]
+pub struct Completed {
+    /// The morsel's number: the one the stage was given it under.
+    pub seq: Seq,
+    /// Its whole output.
+    pub output: Payload,
+    /// How long it took, for the cost model.
+    pub time: MorselTime,
+}
+
+impl Completed {
+    /// Morsel `seq`'s `output`, given in the call that brought it and timed as that call.
+    pub fn unit(seq: Seq, output: Payload) -> Completed {
+        Completed {
+            seq,
+            output,
+            time: MorselTime::Unit,
+        }
+    }
+}
 
 /// Whether a kernel keeps per-instance state between `apply` calls.
 pub enum KernelKind {
@@ -256,8 +301,37 @@ pub trait Kernel: Send + Sync + 'static {
         ))
     }
     /// Synchronous; may take seconds; must not spawn threads that outlive the call;
-    /// safe to call concurrently on different `state`s. Returns a resident payload.
+    /// safe to call concurrently on different `state`s. Returns a resident payload: the output
+    /// of `input`'s own morsel. The scheduler reaches it through [`Kernel::apply_morsels`], whose
+    /// default calls it, on a stage of one input.
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> crate::Result<Payload>;
+    /// One unit of a stage of one input (contracts d.7, amended 2026-11-19 by item 6.3m): `input`
+    /// is morsel `seq`'s, and the call returns the morsels it completed, each under its own
+    /// number with its whole output: none, one or several. A morsel is given once, when its last
+    /// answer has come, and never under another morsel's number. A pipelined kernel, which keeps
+    /// a morsel's pieces in flight past the call that brought them (a ring stage's task,
+    /// `moruna_micro::task`), overrides it: a unit then gives the morsels whose last pieces were
+    /// answered while it ran, and the ones still open come with later units or from
+    /// [`Kernel::finish_morsels`]. The scheduler pushes each morsel downstream under its number
+    /// and records it then: its trace record (its rows and bytes in, kept from when it was taken,
+    /// and its rows and bytes out), the stage's learned growth, and the cost model's observation
+    /// by its [`MorselTime`]. A unit that completes nothing pushes and records nothing; its
+    /// worker's time still counts as the stage's busy time. A number the stage was not given, or
+    /// one given twice, fails the unit as a kernel error under the unit's own number.
+    ///
+    /// The default calls [`Kernel::apply`] and gives the unit's own morsel, timed as the call
+    /// ([`MorselTime::Unit`]): a kernel that is not pipelined behaves exactly as before. A stage
+    /// of several inputs, or one that joins its inputs by morsel, is not called here
+    /// ([`Kernel::apply_port`], [`Kernel::apply_aligned`]): each of its units gives its own
+    /// morsel.
+    fn apply_morsels(
+        &self,
+        state: &mut dyn KernelState,
+        input: Payload,
+        seq: Seq,
+    ) -> crate::Result<Vec<Completed>> {
+        Ok(vec![Completed::unit(seq, self.apply(state, input)?)])
+    }
     /// The end of the input (contracts d.7, amended 2026-10-28 and 2026-11-04): called once per
     /// live instance of a stateful stage, in instance order, once every input of the stage has
     /// ended and its last `apply` has returned, and before the stage's output queues close. A
@@ -266,10 +340,32 @@ pub trait Kernel: Send + Sync + 'static {
     /// collects every batch) gives it here. A payload it returns goes downstream like the output
     /// of an `apply`, numbered after every number the stage's input could carry (d.16); `None`
     /// gives nothing. An `Err` ends the run. The default gives nothing, which is every kernel that
-    /// holds nothing apart.
+    /// holds nothing apart. The scheduler reaches it through [`Kernel::finish_morsels`], whose
+    /// default calls it.
     fn finish(&self, state: &mut dyn KernelState) -> crate::Result<Option<Payload>> {
         let _ = state;
         Ok(None)
+    }
+    /// The end of the input, as [`Kernel::finish`], for a kernel that gives morsels (item 6.3m):
+    /// the morsels still open in this instance at the stage's end, each under its own number with
+    /// its whole output, and anything the kernel gives of its own under `after`, the number after
+    /// every one the stage's input could carry (d.16; the next instance's `after` is one more for
+    /// each such number used). The scheduler records a morsel the stage was given as
+    /// [`Kernel::apply_morsels`] does. Any other number at or past the stage's first `after` is
+    /// the stage's own output, as a `finish`'s payload is; one below it that the stage was not
+    /// given, or gave already, ends the run as a kernel error.
+    ///
+    /// The default calls [`Kernel::finish`] and gives its payload under `after`, as before.
+    fn finish_morsels(
+        &self,
+        state: &mut dyn KernelState,
+        after: Seq,
+    ) -> crate::Result<Vec<Completed>> {
+        Ok(self
+            .finish(state)?
+            .map(|output| Completed::unit(after, output))
+            .into_iter()
+            .collect())
     }
     /// How many input ports the kernel takes at most (d.16): a stage that takes several inputs
     /// numbers them from 0 and is refused at build when it has more than this. One for a

@@ -392,6 +392,120 @@ pub fn waits_for_answer(queued: usize, in_flight: usize, whole: bool) -> bool {
     holds_worker(queued) || (whole && in_flight > 0)
 }
 
+/// The morsels a ring task has been given and not yet answered in full (item 6.3m: an answer
+/// belongs to its morsel), oldest first: each its number, how many of its pieces are still to be
+/// answered, its answers so far in piece order, and their function times as the task reported
+/// them. A task is posted pieces oldest first and answers them in turn, so every answer is the
+/// oldest open morsel's; the stage takes a piece's answer here, and when it was its morsel's
+/// last, the morsel is answered whole and the stage gives it under its own number. What it holds
+/// is bounded by what is in flight: at a unit's return no piece is queued
+/// ([`QUEUED_MAX`]), so only morsels with a piece in flight ([`IN_FLIGHT`]) are open, and an
+/// answer is held no longer than its morsel's last piece takes.
+#[derive(Debug)]
+pub struct Morsels<A> {
+    open: std::collections::VecDeque<Open<A>>,
+}
+
+#[derive(Debug)]
+struct Open<A> {
+    seq: moruna_kernel::Seq,
+    left: usize,
+    answers: Vec<A>,
+    /// The pieces' wall and CPU nanoseconds summed; `None` once a piece came with no time.
+    time: Option<(u64, u64)>,
+}
+
+/// A morsel all of whose pieces are answered ([`Morsels::answer`]): its number, its answers in
+/// piece order, and its time: the pieces' times summed when every piece came with one, else
+/// [`moruna_kernel::MorselTime::Untimed`].
+#[derive(Debug)]
+pub struct Answered<A> {
+    /// The morsel's number.
+    pub seq: moruna_kernel::Seq,
+    /// Its pieces' answers, in piece order.
+    pub answers: Vec<A>,
+    /// Its time, for the cost model.
+    pub time: moruna_kernel::MorselTime,
+}
+
+impl<A> Default for Morsels<A> {
+    fn default() -> Self {
+        Morsels {
+            open: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl<A> Morsels<A> {
+    /// No morsel open.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Morsel `seq` is given to the task in `pieces` pieces, after every morsel open. A morsel of
+    /// no pieces opens nothing: no answer comes for it (a cut never makes one,
+    /// [`cut`]).
+    pub fn open(&mut self, seq: moruna_kernel::Seq, pieces: usize) {
+        if pieces == 0 {
+            return;
+        }
+        self.open.push_back(Open {
+            seq,
+            left: pieces,
+            answers: Vec::with_capacity(pieces),
+            time: Some((0, 0)),
+        });
+    }
+
+    /// The task's answer to its oldest piece not yet answered, with the piece's function time
+    /// (wall and CPU nanoseconds) when the task reported one: the oldest open morsel's. Its
+    /// morsel, answered whole, when this was its last piece. An answer with no morsel open is
+    /// refused: it answers nothing the task was given.
+    pub fn answer(
+        &mut self,
+        answer: A,
+        time: Option<(u64, u64)>,
+    ) -> Result<Option<Answered<A>>, &'static str> {
+        let Some(oldest) = self.open.front_mut() else {
+            return Err("an answer to no morsel the task was given");
+        };
+        oldest.answers.push(answer);
+        oldest.time = match (oldest.time, time) {
+            (Some((wall, cpu)), Some((w, c))) => {
+                Some((wall.saturating_add(w), cpu.saturating_add(c)))
+            }
+            _ => None,
+        };
+        oldest.left -= 1;
+        if oldest.left > 0 {
+            return Ok(None);
+        }
+        Ok(self.open.pop_front().map(|done| Answered {
+            seq: done.seq,
+            answers: done.answers,
+            time: match done.time {
+                Some((wall_ns, cpu_ns)) => moruna_kernel::MorselTime::Given { wall_ns, cpu_ns },
+                None => moruna_kernel::MorselTime::Untimed,
+            },
+        }))
+    }
+
+    /// Morsels open: given and not answered in full.
+    pub fn len(&self) -> usize {
+        self.open.len()
+    }
+
+    /// Whether no morsel is open.
+    pub fn is_empty(&self) -> bool {
+        self.open.is_empty()
+    }
+
+    /// Answers held: those of the morsels open.
+    pub fn held(&self) -> usize {
+        self.open.iter().map(|m| m.answers.len()).sum()
+    }
+}
+
 /// The largest piece: the region and windows it makes are what a task holds in flight, never a
 /// share of the budget. Budget shares made each task's plane up to 512 MiB, all of it zeroed
 /// when it was made and charged to the engine (the NYC gate, 2026-11-17).
@@ -1510,5 +1624,58 @@ mod tests {
         assert_eq!(port_name(&names, 0), None);
         assert_eq!(port_name(&names, 3), None);
         assert_eq!(line(b"x"), b"x\n");
+    }
+
+    #[test]
+    fn m63_t1_an_answer_belongs_to_the_oldest_open_morsel_and_a_morsel_is_given_whole() {
+        let mut m: Morsels<&str> = Morsels::new();
+        assert!(m.is_empty());
+        m.open(4, 2);
+        m.open(5, 1);
+        m.open(6, 3);
+        assert_eq!((m.len(), m.held()), (3, 0));
+        // Morsel 4's first piece: nothing whole yet.
+        assert!(m.answer("4a", Some((10, 5))).expect("open").is_none());
+        assert_eq!(m.held(), 1);
+        // Its last: morsel 4, its answers in piece order, its pieces' times summed.
+        let four = m.answer("4b", Some((20, 7))).expect("open").expect("whole");
+        assert_eq!(four.seq, 4);
+        assert_eq!(four.answers, vec!["4a", "4b"]);
+        assert_eq!(
+            four.time,
+            moruna_kernel::MorselTime::Given {
+                wall_ns: 30,
+                cpu_ns: 12
+            }
+        );
+        // A morsel of one piece is given at its one answer.
+        let five = m.answer("5", Some((1, 1))).expect("open").expect("whole");
+        assert_eq!((five.seq, five.answers), (5, vec!["5"]));
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn m63_t2_a_morsel_one_of_whose_pieces_came_with_no_time_is_untimed() {
+        let mut m = Morsels::new();
+        m.open(1, 3);
+        assert!(m.answer(1u8, Some((5, 5))).expect("open").is_none());
+        assert!(m.answer(2, None).expect("open").is_none());
+        let one = m.answer(3, Some((5, 5))).expect("open").expect("whole");
+        assert_eq!(one.time, moruna_kernel::MorselTime::Untimed);
+        assert_eq!(one.answers, vec![1, 2, 3]);
+        // A task that reports no time at all: every morsel untimed (6.3m, decision 4).
+        m.open(2, 1);
+        let two = m.answer(4, None).expect("open").expect("whole");
+        assert_eq!((two.seq, two.time), (2, moruna_kernel::MorselTime::Untimed));
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn m63_t3_an_answer_to_no_open_morsel_is_refused_and_a_morsel_of_no_pieces_opens_nothing() {
+        let mut m: Morsels<u8> = Morsels::default();
+        m.open(9, 0);
+        assert!(m.is_empty(), "no piece, no answer to wait for");
+        assert!(m.answer(1, None).is_err());
+        assert!(format!("{m:?}").contains("open"));
     }
 }

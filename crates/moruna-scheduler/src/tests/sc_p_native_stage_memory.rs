@@ -3,9 +3,10 @@
 //!
 //! `moruna_micro::task::TaskState` runs only on the Moruna kernel, so the stage here is a model
 //! of its ring mode, step for step: `pipelined`, `feed`, `take_oldest`, `answers`, `part`,
-//! `output`, `land`, `join`, `join_ready`, `gather`, `step`, `wait_any` and `finish`, on the
-//! stage's own layout (`moruna_micro::layout`: `IN_FLIGHT`, `WINDOWS`, `QUEUED_MAX`, `cut`,
-//! `to_post`, `answers_whole`, `waits_for_answer`, `keep_in_place`).
+//! `output`, `land`, `join`, `took`, `give`, `gather`, `step`, `wait_any` and `finish_morsels`,
+//! on the stage's own layout (`moruna_micro::layout`: `IN_FLIGHT`, `WINDOWS`, `QUEUED_MAX`,
+//! `cut`, `to_post`, `answers_whole`, `waits_for_answer`, `keep_in_place`, and item 6.3m's
+//! `Morsels`, by which a unit gives each morsel whole under its own number).
 //!
 //! Its tasks are threads, as `images/gate/tasks` runs on `moruna_sys::plane::Rings`: a region of
 //! `IN_FLIGHT + 1` pieces and `WINDOWS` windows; each batch answered in turn with its records,
@@ -30,9 +31,9 @@ use moruna_kernel::arrow::buffer::{Buffer as ArrowBuffer, ScalarBuffer};
 use moruna_kernel::arrow::datatypes::SchemaRef;
 use moruna_kernel::arrow::record_batch::RecordBatch;
 use moruna_kernel::{
-    Allocator, BoxFuture, CancelToken, Fingerprint, InitCtx, Kernel, KernelKind, KernelState,
-    MorunaError, Payload, PayloadKind, PayloadSpec, Result, Seq, Sink, SinkSummary, SourceSchema,
-    Tier, TierPref,
+    Allocator, BoxFuture, CancelToken, Completed, Fingerprint, InitCtx, Kernel, KernelKind,
+    KernelState, MorunaError, Payload, PayloadKind, PayloadSpec, Result, Seq, Sink, SinkSummary,
+    SourceSchema, Tier, TierPref,
 };
 use moruna_micro::layout;
 use moruna_testkit::{FakeAllocator, FakeSink, FakeSource};
@@ -344,7 +345,8 @@ struct EngineLook {
     /// Batches posted and not answered, and pieces queued (`in_flight`, `queued`).
     in_flight: usize,
     queued: usize,
-    /// Answers the unit under way had taken (`TaskState::ready`).
+    /// Answers taken and not yet given: of morsels open, and of morsels answered whole
+    /// (`TaskState::morsels`, `TaskState::done`).
     ready: usize,
 }
 
@@ -371,7 +373,11 @@ struct Ring {
     applying: bool,
     /// The unit under way answers its whole morsel: the stage's first (6.3j).
     whole: bool,
-    ready: VecDeque<Payload>,
+    /// The morsels given and not answered in full, and those answered whole and not given (6.3m).
+    morsels: layout::Morsels<Payload>,
+    done: VecDeque<layout::Answered<Payload>>,
+    /// What the function takes a piece, which the model's task reports as its time.
+    work: Duration,
     taking: Option<Taking>,
     early: VecDeque<Seen>,
     schema: Option<SchemaRef>,
@@ -504,7 +510,7 @@ impl Ring {
             held: self.held,
             in_flight: self.in_flight.len(),
             queued: self.queued.len(),
-            ready: self.ready.len(),
+            ready: self.morsels.held() + self.done.iter().map(|d| d.answers.len()).sum::<usize>(),
         });
         loop {
             self.reap();
@@ -563,24 +569,25 @@ impl Ring {
         }
     }
 
-    fn pipelined(&mut self, batch: &RecordBatch) -> Result<Payload> {
+    fn pipelined(&mut self, batch: &RecordBatch, seq: Seq) -> Result<Vec<Completed>> {
         if self.schema.is_none() {
             self.schema = lock(&self.stage_schema).clone();
         }
         if !self.applying {
             let pieces = self.pieces(batch)?;
+            self.morsels.open(seq, pieces.len());
             self.queued.extend(pieces);
             self.applying = true;
             self.whole = layout::answers_whole(self.schema.is_some());
         }
         if self.taking.is_some() {
             let answer = self.take_oldest()?;
-            self.ready.push_back(answer);
+            self.took(answer)?;
         }
         self.feed()?;
-        if self.schema.is_none() && self.ready.is_empty() {
+        if self.schema.is_none() {
             let answer = self.take_oldest()?;
-            self.ready.push_back(answer);
+            self.took(answer)?;
             self.feed()?;
         }
         loop {
@@ -593,50 +600,70 @@ impl Ring {
                     .any(|seen| matches!(seen, Seen::Released(b) if *b == oldest))
             {
                 let answer = self.take_oldest()?;
-                self.ready.push_back(answer);
+                self.took(answer)?;
                 came = true;
             }
             self.feed()?;
             if layout::waits_for_answer(self.queued.len(), self.in_flight.len(), self.whole) {
                 let answer = self.take_oldest()?;
-                self.ready.push_back(answer);
+                self.took(answer)?;
                 self.feed()?;
             } else if !came {
                 break;
             }
         }
-        let answer = match self.ready.len() {
-            0 => {
-                let schema = self
-                    .schema
-                    .clone()
-                    .ok_or_else(|| kernel_error("no answer's schema yet"))?;
-                Payload::Table(RecordBatch::new_empty(schema), Tier::Host)
-            }
-            1 => self
-                .ready
-                .pop_front()
-                .ok_or_else(|| kernel_error("no answer"))?,
-            _ => self.join_ready()?,
-        };
+        let given = self.give()?;
         self.applying = false;
         self.whole = false;
-        Ok(answer)
+        Ok(given)
     }
 
-    fn join_ready(&mut self) -> Result<Payload> {
-        let ready: Vec<Payload> = std::mem::take(&mut self.ready).into();
-        match self.join(&ready) {
-            Ok(joined) => {
-                drop(ready);
-                self.reap();
-                Ok(joined)
+    /// `TaskState::took`: an answer to its morsel. The model's task reports each piece's
+    /// function time, its `work`, as a task that stamps it on its release would (item 6.3z).
+    fn took(&mut self, answer: Payload) -> Result<()> {
+        let ns = self.work.as_nanos() as u64;
+        if let Some(whole) = self
+            .morsels
+            .answer(answer, Some((ns, ns)))
+            .map_err(kernel_error)?
+        {
+            self.done.push_back(whole);
+        }
+        Ok(())
+    }
+
+    /// `TaskState::give`: each morsel answered whole, its answers joined.
+    fn give(&mut self) -> Result<Vec<Completed>> {
+        for at in 0..self.done.len() {
+            if self.done[at].answers.len() < 2 {
+                continue;
             }
-            Err(e) => {
-                self.ready = ready.into();
-                Err(e)
+            let parts = std::mem::take(&mut self.done[at].answers);
+            match self.join(&parts) {
+                Ok(joined) => {
+                    drop(parts);
+                    self.reap();
+                    self.done[at].answers = vec![joined];
+                }
+                Err(e) => {
+                    self.done[at].answers = parts;
+                    return Err(e);
+                }
             }
         }
+        self.done
+            .drain(..)
+            .map(|mut whole| {
+                Ok(Completed {
+                    seq: whole.seq,
+                    output: whole
+                        .answers
+                        .pop()
+                        .ok_or_else(|| kernel_error("a morsel with no answer"))?,
+                    time: whole.time,
+                })
+            })
+            .collect()
     }
 
     fn feed(&mut self) -> Result<()> {
@@ -834,7 +861,9 @@ impl Kernel for NativeStage {
             queued: VecDeque::new(),
             applying: false,
             whole: false,
-            ready: VecDeque::new(),
+            morsels: layout::Morsels::new(),
+            done: VecDeque::new(),
+            work: self.work,
             taking: None,
             early: VecDeque::new(),
             schema: None,
@@ -845,7 +874,18 @@ impl Kernel for NativeStage {
         }))
     }
 
-    fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
+    /// The scheduler gives a stage of one input its morsels (`apply_morsels`); the model has no
+    /// answer of one batch to give.
+    fn apply(&self, _state: &mut dyn KernelState, _input: Payload) -> Result<Payload> {
+        Err(kernel_error("a ring stage gives morsels (apply_morsels)"))
+    }
+
+    fn apply_morsels(
+        &self,
+        state: &mut dyn KernelState,
+        input: Payload,
+        seq: Seq,
+    ) -> Result<Vec<Completed>> {
         self.applies.fetch_add(1, Ordering::Relaxed);
         let st = state
             .as_any_mut()
@@ -855,12 +895,12 @@ impl Kernel for NativeStage {
             return Err(kernel_error("not a table"));
         };
         st.in_apply = true;
-        let answer = st.pipelined(&batch);
+        let given = st.pipelined(&batch, seq);
         st.in_apply = false;
-        answer
+        given
     }
 
-    fn finish(&self, state: &mut dyn KernelState) -> Result<Option<Payload>> {
+    fn finish_morsels(&self, state: &mut dyn KernelState, _after: Seq) -> Result<Vec<Completed>> {
         let st = state
             .as_any_mut()
             .downcast_mut::<Ring>()
@@ -871,13 +911,9 @@ impl Kernel for NativeStage {
                 break;
             }
             let answer = st.take_oldest()?;
-            st.ready.push_back(answer);
+            st.took(answer)?;
         }
-        let rest = match st.ready.len() {
-            0 => None,
-            1 => st.ready.pop_front(),
-            _ => Some(st.join_ready()?),
-        };
+        let rest = st.give()?;
         st.plane.finish();
         loop {
             match st.wait_any()? {
