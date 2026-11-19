@@ -127,15 +127,51 @@ pub(crate) struct AnonFit {
     pub(crate) c: u64,
     /// Anonymous bytes per byte in flight, charged per morsel.
     pub(crate) a: f64,
+    /// Which slope stands.
+    pub(crate) from: AnonSlope,
+}
+
+/// Where the slope of f.3's anon fit came from, which the run's report says (item 6.3w).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnonSlope {
+    /// The least-squares slope of a window with the spread to resolve one.
+    Fitted,
+    /// The stage's measured line's, where the window cannot resolve one.
+    Line,
+    /// The steepest growth over a morsel, where the window cannot resolve a slope and the stage
+    /// has no measured line.
+    Steepest,
+}
+
+impl AnonSlope {
+    /// The report's words for it.
+    pub(crate) fn said(self) -> &'static str {
+        match self {
+            AnonSlope::Fitted => "(fitted)",
+            AnonSlope::Line => "(slope from the stage's measured line)",
+            AnonSlope::Steepest => "(steepest reading)",
+        }
+    }
 }
 
 /// Fit `fixed + growth <= c_anon + a_anon x x` over a window of readings (f.3).
 ///
 /// The slope is fitted to the **growth** alone, because that is the part of the reading a morsel
 /// caused: least squares over the window when it holds `MIN_ANON_POINTS` readings and a spread of
-/// `ANON_SPREAD` in `x`, and otherwise the largest `growth / x` in it, which is the conservative
-/// reading of a window that cannot resolve a line. The floor is `MIN_AMPLIFICATION`, so a morsel
-/// is never free.
+/// `ANON_SPREAD` in `x`; otherwise the slope of the stage's measured line (`line`) where it has
+/// one, and else the largest `growth / x` in the window, which is the conservative reading of a
+/// window that cannot resolve a line. The floor is `MIN_AMPLIFICATION`, so a morsel is never
+/// free.
+///
+/// The measured line (item 6.3w, PM 2026-11-19). A run's records all come at one target, so its
+/// window rarely has the spread, and the growth across one `apply` also holds what does not scale
+/// with the morsel: an allocator's chunk, first touches, a new instance's own memory. On a small
+/// morsel that growth over `x` read 50 to 100 times the true slope (IM-T32 and IM-T33: 115 to 216
+/// bytes a byte on 5 KB batches, 12.9 on 1 MiB where the truth is about 2), `anon_footprint`
+/// charged it once per morsel in flight, and the only remedy left was fewer workers. The stage's
+/// measured line was fitted over pieces of 1 to 16 MiB and has the spread the window lacks: where
+/// the window cannot resolve a slope its slope stands, and the growth that does not scale goes
+/// into the constant below, once. A window with the spread still fits its own.
 ///
 /// The constant is then the larger of two things at every reading: the residency measured before
 /// `apply` less what the other morsels in flight beside it are modelled to hold, which no morsel
@@ -171,25 +207,32 @@ pub(crate) struct AnonFit {
 /// of 16 cases; and predicting each record from the ones before it inside a single run, which is
 /// what the controller actually does, it bounds the next morsel's peak in 117 of 144 cases
 /// against the one-term form's 45.
-pub(crate) fn fit_anon(points: &VecDeque<AnonReading>, seed: f64) -> AnonFit {
+pub(crate) fn fit_anon(points: &VecDeque<AnonReading>, seed: f64, line: Option<f64>) -> AnonFit {
     if points.is_empty() {
+        let (a, from) = match line {
+            Some(slope) => (slope, AnonSlope::Line),
+            None => (seed, AnonSlope::Steepest),
+        };
         return AnonFit {
             c: 0,
-            a: seed.max(MIN_AMPLIFICATION),
+            a: a.max(MIN_AMPLIFICATION),
+            from,
         };
     }
-    let a = match fitted_slope(points) {
-        Some(slope) => slope,
-        None => {
+    let (a, from) = match (fitted_slope(points), line) {
+        (Some(slope), _) => (slope, AnonSlope::Fitted),
+        (None, Some(slope)) => (slope, AnonSlope::Line),
+        (None, None) => {
             let steepest = points.iter().fold(0.0f64, |acc, r| acc.max(r.growth / r.x));
-            if points.len() < MIN_ANON_POINTS {
+            let steepest = if points.len() < MIN_ANON_POINTS {
                 steepest.max(seed)
             } else {
                 steepest
-            }
+            };
+            (steepest, AnonSlope::Steepest)
         }
-    }
-    .max(MIN_AMPLIFICATION);
+    };
+    let a = a.max(MIN_AMPLIFICATION);
     let c = points.iter().fold(0.0f64, |acc, r| {
         acc.max(r.fixed - a * r.others)
             .max(r.fixed + r.growth - a * (r.x + r.others))
@@ -198,6 +241,7 @@ pub(crate) fn fit_anon(points: &VecDeque<AnonReading>, seed: f64) -> AnonFit {
         // Rounded up, not truncated: a fit one byte short of the window is not a bound.
         c: if c >= 0.0 { c.ceil() as u64 } else { 0 },
         a,
+        from,
     }
 }
 
@@ -445,6 +489,12 @@ pub(crate) struct StageCtl {
     /// One `AnonReading` per record, newest last, bounded by `WINDOW`. Both terms of f.3 come
     /// from it.
     pub anon_points: VecDeque<AnonReading>,
+    /// The bytes per input byte of the stage's measured line, where the run has one
+    /// (`KernelHints::measured_line`, item 6.3w): the slope `fit_anon` takes where its window
+    /// cannot resolve one.
+    pub line_slope: Option<f64>,
+    /// Which slope the last fit took, for the run's report; `None` before the first.
+    pub anon_slope: Option<AnonSlope>,
     pub a_k_dev: f64,
     pub safety: f32,
     pub target: u64,
@@ -531,9 +581,10 @@ impl StageCtl {
         while self.anon_points.len() > WINDOW {
             self.anon_points.pop_front();
         }
-        let fit = fit_anon(&self.anon_points, self.a_anon_seed);
+        let fit = fit_anon(&self.anon_points, self.a_anon_seed, self.line_slope);
         self.a_anon = fit.a;
         self.c_anon = fit.c;
+        self.anon_slope = Some(fit.from);
     }
 
     fn new(stage: StageId, cfg: &ControllerConfig, sizer: Box<dyn Sizer>) -> StageCtl {
@@ -544,6 +595,8 @@ impl StageCtl {
             a_anon_seed: INITIAL_ANON_AMPLIFICATION,
             c_anon: 0,
             anon_points: VecDeque::new(),
+            line_slope: None,
+            anon_slope: None,
             a_k_dev: 0.0,
             safety: cfg.safety_initial,
             target: cfg.probe_bytes,
@@ -1428,7 +1481,7 @@ impl Drop for Controller {
 
 #[cfg(test)]
 mod anon_fit_tests {
-    use super::{AnonFit, AnonReading, MIN_AMPLIFICATION, WINDOW, fit_anon};
+    use super::{AnonFit, AnonReading, AnonSlope, MIN_AMPLIFICATION, WINDOW, fit_anon};
     use std::collections::VecDeque;
 
     const MIB: f64 = (1024 * 1024) as f64;
@@ -1462,7 +1515,7 @@ mod anon_fit_tests {
     #[test]
     fn the_fit_separates_the_fixed_cost_from_the_scaling_one() {
         let points = window(&[4.0 * MIB, 8.0 * MIB, 16.0 * MIB, 64.0 * MIB].repeat(2));
-        let fit = fit_anon(&points, 4.0);
+        let fit = fit_anon(&points, 4.0, None);
         assert!(
             (fit.a - SLOPE).abs() < 0.01,
             "the slope is fitted to the growth alone: {} against {SLOPE}",
@@ -1492,7 +1545,7 @@ mod anon_fit_tests {
     fn the_fixed_term_survives_a_window_with_no_spread() {
         let floor = 4.0 * MIB;
         let flat = window(&[floor; WINDOW]);
-        let fit = fit_anon(&flat, 4.0);
+        let fit = fit_anon(&flat, 4.0, None);
         assert!(
             (fit.c as f64 - FIXED).abs() < MIB,
             "the fixed term is measured, not inferred: {} against {FIXED}",
@@ -1518,7 +1571,11 @@ mod anon_fit_tests {
             let a = window(xs)
                 .iter()
                 .fold(0.0f64, |acc, r| acc.max((r.fixed + r.growth) / r.x));
-            AnonFit { c: 0, a }
+            AnonFit {
+                c: 0,
+                a,
+                from: AnonSlope::Steepest,
+            }
         };
         let small_1 = one_term(&[floor; WINDOW]);
         let big_1 = one_term(&[large; WINDOW]);
@@ -1538,8 +1595,8 @@ mod anon_fit_tests {
 
         // Two terms, from windows at the same two sizes. The floor is priced from the residency
         // it actually costs, whichever window the fit came from.
-        let small_2 = fit_anon(&window(&[floor; WINDOW]), 4.0);
-        let big_2 = fit_anon(&window(&[large; WINDOW]), 4.0);
+        let small_2 = fit_anon(&window(&[floor; WINDOW]), 4.0, None);
+        let big_2 = fit_anon(&window(&[large; WINDOW]), 4.0, None);
         for fit in [small_2, big_2] {
             assert!(
                 (fit.c as f64 - FIXED).abs() < MIB,
@@ -1560,7 +1617,7 @@ mod anon_fit_tests {
         // at any morsel size.
         let mut mixed = window(&[large; WINDOW / 2]);
         mixed.extend(window(&[floor; WINDOW / 2]));
-        let fit = fit_anon(&mixed, 4.0);
+        let fit = fit_anon(&mixed, 4.0, None);
         assert!(
             (fit.a - SLOPE).abs() < 0.01,
             "the slope is fitted: {}",
@@ -1583,7 +1640,7 @@ mod anon_fit_tests {
         // Fewer readings than the slope needs: the probe's seed governs the slope, and the
         // constant is still the measured residency.
         let short = window(&[4.0 * MIB, 64.0 * MIB]);
-        let fit = fit_anon(&short, 7.0);
+        let fit = fit_anon(&short, 7.0, None);
         assert_eq!(
             fit.a, 7.0,
             "the seed governs the slope until there is evidence"
@@ -1601,7 +1658,7 @@ mod anon_fit_tests {
                 growth: 0.0,
             })
             .collect();
-        let fit = fit_anon(&flat, 4.0);
+        let fit = fit_anon(&flat, 4.0, None);
         assert_eq!(fit.a, MIN_AMPLIFICATION, "a morsel is never free");
         for r in &flat {
             assert!(says(fit, r.x) >= r.fixed + r.growth, "bounds at {}", r.x);
@@ -1609,13 +1666,88 @@ mod anon_fit_tests {
 
         // An empty window is the state before the first record, and the seed answers for it.
         let empty: VecDeque<AnonReading> = VecDeque::new();
-        assert_eq!(fit_anon(&empty, 6.0), AnonFit { c: 0, a: 6.0 });
         assert_eq!(
-            fit_anon(&empty, 0.0),
+            fit_anon(&empty, 6.0, None),
             AnonFit {
                 c: 0,
-                a: MIN_AMPLIFICATION
+                a: 6.0,
+                from: AnonSlope::Steepest
             }
+        );
+        assert_eq!(
+            fit_anon(&empty, 0.0, None),
+            AnonFit {
+                c: 0,
+                a: MIN_AMPLIFICATION,
+                from: AnonSlope::Steepest
+            }
+        );
+    }
+
+    /// RC-T27 (6.3w). With the stage's measured line, a window that cannot resolve a slope takes
+    /// the line's: one with no spread, one too short and an empty one alike, the probe's seed
+    /// included. The growth that does not scale goes into the constant, once, and every reading
+    /// is still bounded. A window with the spread fits its own slope whatever the line says, and
+    /// a line below the floor is held at it.
+    #[test]
+    fn a_window_without_a_slope_takes_the_measured_line() {
+        // 5 KB morsels, each two bytes a byte, one of them with an allocator's chunk of a MB.
+        let small = 5_000.0;
+        let flat: VecDeque<AnonReading> = (0..WINDOW)
+            .map(|i| AnonReading {
+                x: small,
+                others: 3.0 * small,
+                fixed: 4.0e6,
+                growth: 2.0 * small + if i == 3 { 1.07e6 } else { 0.0 },
+            })
+            .collect();
+        let steepest = fit_anon(&flat, 4.0, None);
+        assert_eq!(steepest.from, AnonSlope::Steepest);
+        assert!(steepest.a > 200.0, "the defect: {}", steepest.a);
+        let fit = fit_anon(&flat, 4.0, Some(2.0));
+        assert_eq!((fit.a, fit.from), (2.0, AnonSlope::Line));
+        // The chunk less what the line already charges the morsels in flight beside it.
+        assert_eq!(
+            fit.c as f64,
+            4.0e6 + 1.07e6 + 2.0 * small - 2.0 * 4.0 * small,
+            "the chunk is in the constant: {}",
+            fit.c
+        );
+        for r in &flat {
+            assert!(
+                fit.c as f64 + fit.a * (r.x + r.others) >= r.fixed + r.growth,
+                "RC-I1 at {r:?}"
+            );
+        }
+
+        // Too short for a slope: the line, not the probe's seed.
+        let short: VecDeque<AnonReading> = flat.iter().take(2).copied().collect();
+        let fit = fit_anon(&short, 7.0, Some(2.0));
+        assert_eq!((fit.a, fit.from), (2.0, AnonSlope::Line));
+
+        // Empty: the line as well, and its slope never below the floor.
+        let empty: VecDeque<AnonReading> = VecDeque::new();
+        assert_eq!(
+            fit_anon(&empty, 7.0, Some(0.0)),
+            AnonFit {
+                c: 0,
+                a: MIN_AMPLIFICATION,
+                from: AnonSlope::Line
+            }
+        );
+
+        // The spread: the window's own line, which the measured one does not override.
+        let spread = window(&[4.0 * MIB, 8.0 * MIB, 16.0 * MIB, 64.0 * MIB].repeat(2));
+        let fit = fit_anon(&spread, 4.0, Some(2.0));
+        assert_eq!(fit.from, AnonSlope::Fitted);
+        assert!((fit.a - SLOPE).abs() < 0.01, "{}", fit.a);
+        assert_eq!(
+            [AnonSlope::Fitted, AnonSlope::Line, AnonSlope::Steepest].map(AnonSlope::said),
+            [
+                "(fitted)",
+                "(slope from the stage's measured line)",
+                "(steepest reading)"
+            ]
         );
     }
 
@@ -1641,7 +1773,7 @@ mod anon_fit_tests {
                 }
             })
             .collect();
-        let fit = fit_anon(&readings, 4.0);
+        let fit = fit_anon(&readings, 4.0, None);
         assert!((fit.a - PER_BYTE).abs() < 1e-9, "per morsel: {}", fit.a);
         for r in &readings {
             assert!(
@@ -1669,7 +1801,7 @@ mod anon_fit_tests {
                 growth: r.growth,
             })
             .collect();
-        let old = fit_anon(&before_rb3, 4.0);
+        let old = fit_anon(&before_rb3, 4.0, None);
         assert!(old.c as f64 >= FIXED + others_held, "{}", old.c);
         assert!(old.a < PER_BYTE / 4.0, "{}", old.a);
 
@@ -1682,7 +1814,7 @@ mod anon_fit_tests {
                 growth: PER_BYTE * small,
             })
             .collect();
-        let fit = fit_anon(&alone, 4.0);
+        let fit = fit_anon(&alone, 4.0, None);
         assert!((fit.c as f64 - FIXED).abs() < 1.0, "{}", fit.c);
     }
 }

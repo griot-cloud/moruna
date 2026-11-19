@@ -116,6 +116,13 @@ pub(crate) fn prepare(ctl: &Inner) -> Result<Budgets> {
                 .iter()
                 .find(|counters| counters.stage == stage)
                 .and_then(|counters| counters.morsel_bytes_max);
+            // The stage's measured line, where the run has one (item 6.3w): its slope is what
+            // the anon fit takes where its window cannot resolve one (f.3).
+            sizer_ctl.line_slope = state
+                .hints(stage)
+                .measured_line
+                .map(|line| line.per_input_byte)
+                .filter(|slope| slope.is_finite() && *slope >= 0.0);
             state.stages.push(sizer_ctl);
         }
         (budgets, tier_budgets)
