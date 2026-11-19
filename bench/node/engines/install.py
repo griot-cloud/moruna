@@ -9,7 +9,7 @@ in installed.json with why it failed. 0.6.6 has one interpreter, its wheel's.
 | Engine | Interpreter | Packages |
 | --- | --- | --- |
 | `moruna066`, `moruna066-rust` | CPython 3.14t, free-threaded | 0.6.6's wheel, pyarrow, numpy; and `moruna_gate` (images/gate/py066) |
-| `ray` | the newest of CPython 3.14, 3.13, 3.12, 3.11, 3.10 it installs on, with the GIL | ray[data], typing-extensions, pyarrow, pandas, numpy |
+| `ray` | the newest of CPython 3.14, 3.13, 3.12, 3.11, 3.10 it installs on, with the GIL | ray[data], typing-extensions, aiohttp, pyarrow, pandas, numpy |
 | `spark` | the same | pyspark, pyarrow, pandas, numpy; a JVM (setup-linux.sh installs openjdk-17-jre-headless) |
 | `dask` | the same | dask[distributed,dataframe], adlfs, pyarrow, pandas, numpy |
 | `duckdb` | the same | duckdb, pyarrow, numpy |
@@ -62,7 +62,9 @@ GIL = tuple(f"{v}+gil" for v in PYTHONS)
 PIP = {
     "moruna066": (("3.14t",), ["{wheel}", "pyarrow", "numpy"]),
     # typing-extensions: `ray.data` imports it and Ray does not declare it (see the module's note).
-    "ray": (GIL, ["ray[data]", "typing-extensions", "pyarrow", "pandas", "numpy"]),
+    # aiohttp: `ray.data` resolves a path through fsspec's HTTPFileSystem, which needs aiohttp, and
+    # neither declares it; without it every Ray job failed on its import (6.2 run 5).
+    "ray": (GIL, ["ray[data]", "typing-extensions", "aiohttp", "pyarrow", "pandas", "numpy"]),
     "spark": (GIL, ["pyspark", "pyarrow", "pandas", "numpy"]),
     "dask": (GIL, ["dask[distributed,dataframe]", "adlfs", "pyarrow", "pandas", "numpy"]),
     "duckdb": (GIL, ["duckdb", "pyarrow", "numpy"]),
