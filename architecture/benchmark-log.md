@@ -253,3 +253,38 @@ interleaved run by run, medians of 3. Every run completed. The raw table is
 
 The gain is largest where the arena cuts the most parts. On the node, 6.3l's own analysis found
 that Occupancy and Audit were bound by the drive's one-at-a-time fetch (6.3t), not by decode.
+
+
+## Run 202611182200 (6.2 run 5, PM, 2026-11-19): the node's rows
+
+- **Image:** b11c1342. It has 6.3e, 6.3r (wait for room), 6.3s, 6.3n, 6.3t (requests in flight
+  together), 6.3l, the 6.3h stack and 6.3g phases 1–2. It does not have the asynchronous fetch,
+  6.3g phase 3 or 6.3r's gap fix: those are in run 6.
+- **The machine:** an Azure D4s_v4 node in griot-dev, 4 CPUs, 12.98 GiB, Blob.
+- **The node, medians of the passing runs:**
+
+  | Job | Run 3 | Run 4 | Run 5 | Runs ok | 0.6.6, Rust (run 3) |
+  |---|---:|---:|---:|---|---:|
+  | Score | 93.2 s | 53.0 s | 55.8 s | 6 of 6 | 33.9 s |
+  | Occupancy | 19.2 s | 18.6 s | 16.3 s | 6 of 6 | 11.0 s |
+  | Enrich | 62.3 s | none | 69.5 s | 6 of 6 | 18.5 s |
+  | Audit | 20.2 s | 20.1 s | 17.6 s | 4 of 6 | 11.8 s |
+
+- **What changed:**
+  - Score and Enrich complete in every run at 4 instances (6.3r).
+  - Occupancy and Audit read faster (6.3t, 6.3l).
+  - Audit failed twice with "it said a batch was done without a record". The cause was a gap in
+    6.3r's wait: the batch being taken was not counted as outstanding. It is fixed and booted
+    (75347b85) and in run 6.
+- **What bounds each job now:**
+  - **Score:** the engine workers are idle about 27 s each of 57 s, and the bottleneck is Idle
+    for 33 s. The four task processes and the four workers share 4 CPUs, waiting on the ring's
+    wakeups (1.11e and 6.3p, in progress).
+  - **Enrich:** waits on memory for 46 of 63 s. The sink awaits each ~42 MB file's upload at
+    ~8 MB/s an upload with 2 parts in flight (6.3u). The node's report now times uploads, from
+    run 6 on.
+  - **Occupancy and Audit:** the drive fetched one row group at a time. The asynchronous fetch
+    (a906df5d) is in run 6.
+- **The Linux engines installed this time** (uv's timeout fix). Ray failed every job on a missing
+  aiohttp; fixed in the harness (a5c212c5). Dask's Enrich r0 lost its workers. The full table
+  follows when run 5 ends.
