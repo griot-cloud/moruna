@@ -41,7 +41,13 @@ fn scheduler_stats(active: u16, busy: u16) -> SchedulerStats {
 }
 
 fn row_rig(stats: SchedulerStats, samples: Vec<Sample>) -> common::Rig {
-    let cfg = config(CEILING, 8);
+    row_rig_at(CEILING, stats, samples)
+}
+
+/// The same rig under another ceiling: the read-ahead the initial solution sets is the room's
+/// (6.3y), so a smaller ceiling starts it below its ceiling of 64.
+fn row_rig_at(ceiling: u64, stats: SchedulerStats, samples: Vec<Sample>) -> common::Rig {
+    let cfg = config(ceiling, 8);
     let probe_bytes = cfg.probe_bytes;
     common::Rig::new(
         cfg,
@@ -54,10 +60,18 @@ fn row_rig(stats: SchedulerStats, samples: Vec<Sample>) -> common::Rig {
 }
 
 /// The read-ahead the initial solution sets on this rig: row 4 is "every read the read-ahead
-/// allows is in flight", and that depth follows the pool (RB1), so the rows read it rather than
+/// allows is in flight", and that depth is the room's (6.3y), so the rows read it rather than
 /// assume a figure.
 fn initial_read_ahead() -> u16 {
-    let rig = row_rig(scheduler_stats(8, 1), vec![sample(BASELINE, 1_000)]);
+    initial_read_ahead_at(CEILING)
+}
+
+fn initial_read_ahead_at(ceiling: u64) -> u16 {
+    let rig = row_rig_at(
+        ceiling,
+        scheduler_stats(8, 1),
+        vec![sample(BASELINE, 1_000)],
+    );
     rig.run_up();
     let depth = read_aheads(&rig.writes())
         .last()
@@ -186,9 +200,17 @@ fn rc_t9_row3_cpu_quota() {
 
 #[test]
 fn rc_t9_row4_io_read() {
+    // Under 512 MiB the room starts the read-ahead below its ceiling (28 reads), so the row has
+    // a deeper one to take or to fund.
+    let ceiling = CEILING / 16;
     let mut stats = scheduler_stats(8, 1);
-    stats.reads_in_flight = initial_read_ahead();
-    let rig = row_rig(
+    stats.reads_in_flight = initial_read_ahead_at(ceiling);
+    assert!(
+        stats.reads_in_flight < 64,
+        "the room starts it below the ceiling"
+    );
+    let rig = row_rig_at(
+        ceiling,
         stats,
         vec![
             sample(BASELINE, 1_000),
@@ -214,6 +236,38 @@ fn rc_t9_row4_io_read() {
         active_workers(fresh).is_empty(),
         "RC-I8: the worker count does not move in the same tick as the read-ahead"
     );
+    rig.controller.stop();
+}
+
+/// 6.3y: under 8 GiB the room gives the read-ahead its ceiling of 64 at the start. Row 4 still
+/// names the bottleneck, and moves nothing: there is no deeper read-ahead to take, so there is
+/// none to fund either.
+#[test]
+fn rc_t9_row4_io_read_at_the_read_aheads_ceiling() {
+    assert_eq!(initial_read_ahead(), 64, "the room gives the ceiling");
+    let mut stats = scheduler_stats(8, 1);
+    stats.reads_in_flight = 64;
+    let rig = row_rig(
+        stats,
+        vec![
+            sample(BASELINE, 1_000),
+            sample(BASELINE, 2_000),
+            sample(BASELINE, 3_000),
+        ],
+    );
+    rig.run_up();
+    rig.feed(&queued(1, 0, 0));
+    let mark = rig.writes().len();
+    rig.controller.tick_once();
+
+    assert_eq!(last_class(&rig), Bottleneck::IoRead, "f.6 row 4");
+    let fresh = &rig.writes()[mark..];
+    assert!(
+        read_aheads(fresh).is_empty(),
+        "no read-ahead past its ceiling"
+    );
+    assert!(high_waters(fresh).is_empty(), "nothing to fund");
+    assert!(active_workers(fresh).is_empty(), "RC-I8");
     rig.controller.stop();
 }
 
