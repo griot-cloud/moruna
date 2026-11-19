@@ -672,6 +672,17 @@ fn dp_ring_conformance_passes_on_the_kernel_model() {
     }
 }
 
+/// Item 6.3x, the defect as a test: a release the engine reads after the group it took gives a
+/// batch done before that batch's record (`RingPlane::release_ahead_of`'s second read, given
+/// by `emit_released`). Fails until the PM decides the fix.
+#[test]
+fn p_6_3x_a_record_comes_before_its_release_when_the_task_answers_during_a_revoke() {
+    let f = fixtures();
+    if let Err(e) = crate::ring_conformance::answers_in_order_across_a_revoke(&f) {
+        panic!("{e}");
+    }
+}
+
 #[test]
 fn a_task_is_never_left_without_a_window_while_one_is_idle() {
     use crate::ringed::gives_idle;

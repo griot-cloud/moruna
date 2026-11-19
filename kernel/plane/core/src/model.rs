@@ -90,6 +90,20 @@ pub struct Model {
     /// The clock the engine reads with no call (`RingCalls::clock`), as a test sets it; none by
     /// default, as an engine without a clock page.
     pub clock: Option<u64>,
+    /// What a task does on its own CPU while the engine is in `windows_protect`, as a test sets
+    /// it; nothing by default. The model runs one call at a time, so a test that needs the task
+    /// to move between two of the engine's reads in one look puts its step here (item 6.3x).
+    pub during_protect: Option<Beside>,
+}
+
+/// A test's step of a task, run beside one of the engine's calls ([`Model::during_protect`]).
+#[derive(Clone)]
+pub struct Beside(pub Rc<dyn Fn()>);
+
+impl core::fmt::Debug for Beside {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Beside")
+    }
 }
 
 impl Default for Model {
@@ -105,6 +119,7 @@ impl Default for Model {
             calls: 0,
             futex: Rc::new(core::cell::Cell::new(0)),
             clock: None,
+            during_protect: None,
         }
     }
 }

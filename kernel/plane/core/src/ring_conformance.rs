@@ -519,6 +519,83 @@ pub fn answers_in_order(f: &Fixtures, protect: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Item 6.3x: each batch's records come before its release when the task answers its next
+/// batch while the engine revokes the group it read (protect mode). The engine reads the
+/// releases, then the records, revokes the records' windows, and reads the releases again
+/// before each record of the group (`RingPlane::release_ahead_of`). A task that takes, answers
+/// and releases its next batch during the revoke has that release read by the second read,
+/// while its record was posted after the group: the look gives the release, and the record only
+/// at the next look. The ring stage takes a batch's records up to its release, so it saw that
+/// batch done with no record ("it said a batch was done without a record for it": runs 6 and 10,
+/// Occupancy and Audit on a 4-CPU node under the emulator, whose revoke is a TLB shootdown).
+pub fn answers_in_order_across_a_revoke(f: &Fixtures) -> Result<(), String> {
+    use alloc::rc::Rc;
+    use core::cell::RefCell;
+    let mut p = plane(true);
+    let (task, t) = open(&mut p, shape(8), Behave::Echo)?;
+    let t = Rc::new(RefCell::new(t));
+    let region = p.region_of(task).ok_or("no region")?;
+    drive(&mut p, &mut [&mut *t.borrow_mut()])?;
+    let mut offered = Vec::new();
+    let mut offer = |p: &mut Plane, i: usize| -> Result<(), String> {
+        let b = load(p, region, f)?;
+        p.offer(task, 0, b)
+            .map_err(|e| format!("offer {i}: {e:?}"))?;
+        p.drop_batch(b).map_err(|e| format!("drop {i}: {e:?}"))?;
+        offered.push(b);
+        Ok(())
+    };
+    // Batch 0, answered and released before the engine looks.
+    offer(&mut p, 0)?;
+    t.borrow_mut().step();
+    // Batch 1, posted; the task takes, answers and releases it while the engine revokes batch
+    // 0's record.
+    offer(&mut p, 1)?;
+    let beside = Rc::clone(&t);
+    p.plane.calls.during_protect = Some(crate::model::Beside(Rc::new(move || {
+        beside.borrow_mut().step();
+    })));
+    // The engine looks with the task not borrowed: the revoke steps it.
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        while let Some(e) = p.next(0).map_err(|e| format!("next: {e:?}"))? {
+            if let Event::Put { batch, .. } = &e {
+                p.drop_batch(*batch)
+                    .map_err(|e| format!("drop out: {e:?}"))?;
+            }
+            seen.push(e);
+        }
+        if count(&seen, |e| matches!(e, Event::Put { .. })) == 2
+            && count(&seen, |e| matches!(e, Event::Released { .. })) == 2
+        {
+            break;
+        }
+        t.borrow_mut().step();
+    }
+    p.plane.calls.during_protect = None;
+    let order: Vec<String> = seen
+        .iter()
+        .filter_map(|e| match e {
+            Event::Put { .. } => Some(String::from("put")),
+            Event::Released { batch, .. } => Some(format!(
+                "released {}",
+                offered.iter().position(|b| b == batch).unwrap_or(9)
+            )),
+            _ => None,
+        })
+        .collect();
+    same(
+        order,
+        vec![
+            String::from("put"),
+            String::from("released 0"),
+            String::from("put"),
+            String::from("released 1"),
+        ],
+        "each batch's record before its release, the next batch answered during the revoke",
+    )
+}
+
 /// Stream P with a record answering no input: an aggregate releases its batches with no record,
 /// then, holding none, posts its total (moruna-function's cookie `u64::MAX`). Whatever one look
 /// finds, the engine gives the record after every release the task made before it. It used to

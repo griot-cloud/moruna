@@ -141,6 +141,12 @@ impl RingCalls for Model {
                 }
             }
         }
+        drop(s);
+        // The task on its own CPU while the call is under way: on the kernel a revoke is a page
+        // table change and a TLB shootdown, long enough under the emulator for a whole piece.
+        if let Some(beside) = self.during_protect.clone() {
+            (beside.0)();
+        }
         Ok(())
     }
 }

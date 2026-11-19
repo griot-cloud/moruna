@@ -1206,6 +1206,13 @@ impl<C: RingCalls> RingPlane<C> {
     }
 
     /// Gives the releases read so far as `Released` events, oldest first.
+    ///
+    /// Item 6.3x, the defect, not yet fixed: after a group, "so far" includes what
+    /// [`Self::release_ahead_of`] read after the group was read (its [`Self::count_released`]),
+    /// so a batch the task answered and released after the engine read its records, while the
+    /// engine revoked them, is given released here and its record only at the next look. Only
+    /// the releases read before the group, and those ahead of a record in it, are known to follow
+    /// their records. The test is `ring_conformance::answers_in_order_across_a_revoke`.
     fn emit_released(&mut self, id: u32) -> Result<(), PlaneError> {
         let n = self
             .tasks
