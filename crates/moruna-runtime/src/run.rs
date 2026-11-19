@@ -471,6 +471,7 @@ fn drive(
     // arena's room for bytes in flight, shared by requests of at least S3's least part.
     let object_io = object_io_for(arena_bytes, &mut notes);
     let mut object_io_built = None;
+    let mut own_reactor: Option<Arc<moruna_reactor::Reactor>> = None;
     let (reactor, object_metadata): (Arc<dyn Reactor>, Option<Arc<dyn ObjectMetadata>>) =
         match components.reactor {
             Some(reactor) => (reactor, components.object_metadata),
@@ -492,6 +493,7 @@ fn drive(
                     },
                     alloc.clone(),
                 )?;
+                own_reactor = Some(built.clone());
                 data_os::reactor(granted.as_ref(), built.clone(), Some(built), alloc.clone())?
             }
         };
@@ -1309,6 +1311,12 @@ fn drive(
         #[cfg(feature = "python")]
         &py_kernels,
     );
+    if let Some(note) = own_reactor
+        .as_ref()
+        .and_then(|r| object_measured_note(&r.stats()))
+    {
+        notes.push(note);
+    }
     let meta = report::meta(MetaInput {
         run_id,
         exit,
@@ -1719,6 +1727,36 @@ fn object_io_for(arena_bytes: u64, notes: &mut Vec<String>) -> moruna_reactor::O
         moruna_storage::net::SOCKETS,
     ));
     io
+}
+
+/// What the object stores delivered, as one request saw it (item 6.3u): the reads' and the
+/// writes' bytes over the time each took, summed over them. A write's time runs from its first
+/// part to its completion, so with its parts in flight it is the write's own rate. `None` when
+/// the run made no object request.
+fn object_measured_note(s: &moruna_reactor::ReactorStats) -> Option<String> {
+    if s.object_reads == 0 && s.object_writes == 0 {
+        return None;
+    }
+    let rate = |bytes: u64, ns: u64| {
+        if ns == 0 {
+            0.0
+        } else {
+            bytes as f64 / 1e6 / (ns as f64 / 1e9)
+        }
+    };
+    Some(format!(
+        "object stores, measured: {} reads of {} bytes, {:.1} MB/s a read ({:.1} s of reads); \
+         {} writes of {} bytes in {} parts, {:.1} MB/s a write ({:.1} s of writes)",
+        s.object_reads,
+        s.object_bytes,
+        rate(s.object_bytes, s.object_read_ns),
+        s.object_read_ns as f64 / 1e9,
+        s.object_writes,
+        s.object_write_bytes,
+        s.object_write_parts,
+        rate(s.object_write_bytes, s.object_write_ns),
+        s.object_write_ns as f64 / 1e9,
+    ))
 }
 
 /// The out-of-arena amplification assumed for a kernel that declares none: the same figure the
@@ -2822,6 +2860,29 @@ mod tests {
     /// bound of 14,360 MiB (`kernel/node/core`'s `the_cloud_profile_fits_on_2_8_and_16_gib_nodes`).
     /// At the small one N is the room over S3's least part and each part a little over it; at
     /// the large one N reaches the job's socket budget and the parts grow with the room.
+    #[test]
+    fn the_object_stores_measured_rates_are_noted() {
+        let none = moruna_reactor::ReactorStats::default();
+        assert_eq!(object_measured_note(&none), None);
+        let s = moruna_reactor::ReactorStats {
+            object_reads: 4,
+            object_bytes: 400_000_000,
+            object_read_ns: 8_000_000_000,
+            object_writes: 2,
+            object_write_bytes: 84_000_000,
+            object_write_parts: 4,
+            object_write_ns: 10_000_000_000,
+            ..moruna_reactor::ReactorStats::default()
+        };
+        assert_eq!(
+            object_measured_note(&s).as_deref(),
+            Some(
+                "object stores, measured: 4 reads of 400000000 bytes, 50.0 MB/s a read (8.0 s of \
+                 reads); 2 writes of 84000000 bytes in 4 parts, 8.4 MB/s a write (10.0 s of writes)"
+            )
+        );
+    }
+
     #[test]
     fn a_jobs_budget_sets_the_object_stores_requests_and_parts() {
         const MIB: u64 = 1 << 20;

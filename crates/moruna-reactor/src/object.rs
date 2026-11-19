@@ -82,6 +82,15 @@ impl ObjectIo {
         len <= self.part_for(len)
     }
 
+    /// The parts an object of `len` bytes is written in: one when it is a single put.
+    pub fn parts_of(&self, len: u64) -> u64 {
+        if self.single_put(len) {
+            1
+        } else {
+            len.div_ceil(self.part_for(len))
+        }
+    }
+
     /// The parts of an object of `len` bytes in flight at once: all of them, up to N.
     pub fn parts_in_flight(&self, len: u64) -> usize {
         let parts = usize::try_from(len.div_ceil(self.part_for(len))).unwrap_or(usize::MAX);
@@ -350,7 +359,7 @@ pub(crate) struct ObjectLayer {
     /// counts requests in flight and can fail a named part.
     override_backend: Option<Arc<dyn ObjectBackend>>,
     /// What the run's budget lets the stores have in flight (3A, 3.5b).
-    budget: ObjectIo,
+    pub(crate) budget: ObjectIo,
 }
 
 impl ObjectLayer {

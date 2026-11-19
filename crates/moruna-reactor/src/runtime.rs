@@ -718,6 +718,7 @@ async fn read_object_body(
     }
     let (backend, path) = inner.objects.resolve(url)?;
     let range = offset..offset + len as u64;
+    let started = std::time::Instant::now();
     let (mut dst, mut outcome) = backend.read_range(&path, range.clone(), dst).await;
     // f.3: one reactor-level retry on a connection reset, above the object_store crate's own
     // backoff. The retry reads the whole range into the same buffer again.
@@ -742,7 +743,9 @@ async fn read_object_body(
     })?;
     // The ingress copy (b): out of the network library's pieces into the arena. It is the one
     // copy on this path and it is counted apart from payload copies (G-I2).
-    inner.counters.note_object_read(len as u64);
+    inner
+        .counters
+        .note_object_read(len as u64, elapsed_ns(started));
     inner.counters.note_ingress(len as u64);
     Ok(dst)
 }
@@ -753,9 +756,22 @@ async fn run_write_object(inner: Arc<Inner>, op: WriteObjectOp, _permit: OwnedSe
         inner.resolve(tx, Err(MorunaError::Cancelled));
         return;
     }
+    let started = std::time::Instant::now();
+    let len = src.len() as u64;
     let result = crate::object::write(&inner.objects, &url, &src).await;
     drop(src);
+    if result.is_ok() {
+        let parts = inner.objects.budget.parts_of(len);
+        inner
+            .counters
+            .note_object_write(len, parts, elapsed_ns(started));
+    }
     inner.resolve(tx, result);
+}
+
+/// Nanoseconds since `started`, saturating.
+fn elapsed_ns(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// The two removal calls d.9 added for a sink's resume. They take an object permit like every

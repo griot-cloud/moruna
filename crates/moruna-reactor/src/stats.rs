@@ -56,6 +56,18 @@ pub struct ReactorStats {
     pub object_reads: u64,
     /// Object bytes requested.
     pub object_bytes: u64,
+    /// Nanoseconds the object reads took, summed over the reads (each from its request to its
+    /// last byte in the arena): with `object_bytes`, what one read's request delivers.
+    pub object_read_ns: u64,
+    /// Object writes completed.
+    pub object_writes: u64,
+    /// Bytes the completed object writes wrote.
+    pub object_write_bytes: u64,
+    /// Parts the completed object writes went in: one for a single put.
+    pub object_write_parts: u64,
+    /// Nanoseconds the completed object writes took, summed over the writes (each from its
+    /// first part to its completion): with `object_write_bytes`, what one write delivers.
+    pub object_write_ns: u64,
     /// Bytes copied out of a network library's buffer into an arena buffer (06 b).
     pub ingress_bytes: u64,
     /// Host to device copies.
@@ -91,6 +103,11 @@ pub(crate) struct Counters {
     uring_ops: AtomicU64,
     object_reads: AtomicU64,
     object_bytes: AtomicU64,
+    object_read_ns: AtomicU64,
+    object_writes: AtomicU64,
+    object_write_bytes: AtomicU64,
+    object_write_parts: AtomicU64,
+    object_write_ns: AtomicU64,
     ingress_bytes: AtomicU64,
     copies_h2d: AtomicU64,
     copies_d2h: AtomicU64,
@@ -123,6 +140,11 @@ impl Counters {
             uring_ops: get(&self.uring_ops),
             object_reads: get(&self.object_reads),
             object_bytes: get(&self.object_bytes),
+            object_read_ns: get(&self.object_read_ns),
+            object_writes: get(&self.object_writes),
+            object_write_bytes: get(&self.object_write_bytes),
+            object_write_parts: get(&self.object_write_parts),
+            object_write_ns: get(&self.object_write_ns),
             ingress_bytes: get(&self.ingress_bytes),
             copies_h2d: get(&self.copies_h2d),
             copies_d2h: get(&self.copies_d2h),
@@ -151,9 +173,17 @@ impl Counters {
         self.uring_ops.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn note_object_read(&self, bytes: u64) {
+    pub(crate) fn note_object_read(&self, bytes: u64, ns: u64) {
         self.object_reads.fetch_add(1, Ordering::Relaxed);
         self.object_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.object_read_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_object_write(&self, bytes: u64, parts: u64, ns: u64) {
+        self.object_writes.fetch_add(1, Ordering::Relaxed);
+        self.object_write_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.object_write_parts.fetch_add(parts, Ordering::Relaxed);
+        self.object_write_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
     pub(crate) fn note_ingress(&self, bytes: u64) {
@@ -330,7 +360,7 @@ mod tests {
         c.note_direct(true);
         c.note_direct(false);
         c.note_uring();
-        c.note_object_read(3);
+        c.note_object_read(3, 0);
         c.note_ingress(3);
         c.note_bounce(1);
         c.note_error();
