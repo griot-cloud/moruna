@@ -2339,7 +2339,7 @@ def test_each_engine_lands_on_the_newest_cpython_it_installs_and_imports_on(tmp_
     monkeypatch.setattr(install, "versions", versions)
     root = tmp_path / "root"
     assert install.main(["--root", str(root), "--gate-src", str(tmp_path), "--engines", "ray"]) == 0
-    assert install.PIP["ray"][1] == ["ray[data]", "typing-extensions", "pyarrow", "pandas", "numpy"]
+    assert install.PIP["ray"][1] == ["ray[data]", "typing-extensions", "aiohttp", "pyarrow", "pandas", "numpy"]
     assert all(c[-5:] == install.PIP["ray"][1] for c in seen if c[:3] == ["uv", "pip", "install"])
     ray = json.load(open(root / "installed.json"))["ray"]
     assert (ray["ok"], ray["interpreter"], ray["python"], ray["gil"]) == (True, "3.12+gil", "3.12.3", True)
