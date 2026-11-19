@@ -116,13 +116,9 @@ pub fn start_process(
     );
     let ports = ports.filter(|p| !p.is_empty());
     let socket = port_socket(name, ports.is_some(), false)?;
-    let plan = plan_of(
-        launch,
-        &rootfs,
-        &filters,
-        cgroup.dir(),
-        socket.as_ref().map(|(_, _, env)| env.as_str()),
-    )?;
+    let mut env = launch.env_entries();
+    env.extend(socket.as_ref().map(|(_, _, env)| env.clone()));
+    let plan = plan_of(launch, &rootfs, &filters, cgroup.dir(), env)?;
     let (task_end, runner_end) = match socket {
         Some((task, runner, _)) => (Some(task), Some(runner)),
         None => (None, None),

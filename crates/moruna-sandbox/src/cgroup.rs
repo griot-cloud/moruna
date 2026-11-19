@@ -87,6 +87,21 @@ impl StageCgroup {
         &self.dir
     }
 
+    /// Let this cgroup hold cgroups of its own (system design 3E: one for each instance of an
+    /// image function's stage): `memory` and `cpu` enabled for its children. It holds no process
+    /// itself, so the kernel allows it; its own `memory.max` and `cpu.max` stay the ceiling of
+    /// everything under it.
+    pub fn enable_children(&self) -> io::Result<()> {
+        self.write("cgroup.subtree_control", "+memory +cpu")
+    }
+
+    /// A cgroup under this one, `<dir>/<name>`, for one instance: `memory.max` its `share`, swap
+    /// off, and no CPU quota of its own, since this cgroup's holds every instance. Needs
+    /// [`StageCgroup::enable_children`] first. It is removed before this one is.
+    pub fn child(&self, name: &str, share: u64) -> io::Result<StageCgroup> {
+        StageCgroup::create(&self.dir, name, share, 0.0)
+    }
+
     fn write(&self, file: &str, value: &str) -> io::Result<()> {
         let path = self.dir.join(file);
         fs::write(&path, value).map_err(|e| write_refused(&path, e))
@@ -158,6 +173,16 @@ impl StageCgroup {
         text.trim()
             .parse()
             .map_err(|e| io::Error::other(format!("{}: {e}", path.display())))
+    }
+
+    /// The most the cgroup has held since it was made (`memory.peak`, Linux 5.19), read as a
+    /// file of its own: no mark is started or read. A stage's warm-up reads an instance's need
+    /// from it after each of its growing pieces (system design 3A).
+    pub fn memory_peak_ever(&self) -> io::Result<u64> {
+        self.read("memory.peak")?
+            .trim()
+            .parse()
+            .map_err(|e| io::Error::other(format!("memory.peak: {e}")))
     }
 
     /// `memory.max`, as written.
@@ -273,6 +298,10 @@ mod tests {
         );
         fs::write(cg.dir().join("memory.peak"), "x\n").unwrap();
         assert!(cg.memory_peak().is_err());
+        assert!(cg.memory_peak_ever().is_err());
+        // The peak since the cgroup was made, read as a file of its own.
+        fs::write(cg.dir().join("memory.peak"), "4096\n").unwrap();
+        assert_eq!(cg.memory_peak_ever().unwrap(), 4096);
         assert!(cg.memory_current().is_err(), "no memory.current yet");
         fs::write(cg.dir().join("memory.current"), "123\n").unwrap();
         assert_eq!(cg.memory_current().unwrap(), 123);

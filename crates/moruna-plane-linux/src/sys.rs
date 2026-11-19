@@ -195,7 +195,16 @@ impl Map {
             return Err(io::Error::last_os_error());
         }
         let at = NonNull::new(at.cast::<u8>()).ok_or_else(|| io::Error::other("mmap gave 0"))?;
-        Ok(Map { at, len })
+        let map = Map { at, len };
+        // A writable mapping is never a forked child's (item 6.3f): a process that writes
+        // records and starts processes, as an engine starting a stage's instances one at a time
+        // does, would otherwise give each child its writable windows from fork to exec, and a
+        // window a child holds mapped writable cannot be sealed when it is put (`EBUSY`).
+        if access == Access::Write {
+            // SAFETY: advice on the mapping just made, which this value owns.
+            check(unsafe { libc::madvise(at.as_ptr().cast(), len, libc::MADV_DONTFORK) })?;
+        }
+        Ok(map)
     }
 
     /// Where the mapping starts.
@@ -496,4 +505,45 @@ pub fn claim(fd: RawFd) -> io::Result<OwnedFd> {
     // SAFETY: the descriptor is open, and by the plane's contract with the process that started
     // this one it is the plane's alone: nothing else of this process owns it.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::AsFd;
+
+    use super::*;
+
+    /// Item 6.3f: a process that writes a window and starts a process meanwhile (an engine
+    /// starting a stage's next instance while another's bridge writes its answer) can still
+    /// seal the window: a forked child is never given the writable mapping, so it holds none
+    /// from fork to exec.
+    #[test]
+    fn a_window_mapped_writable_is_never_a_forked_child_s() {
+        let page = PAGE as usize;
+        let fd = memfd(PAGE).unwrap();
+        let mut window = Map::new(fd.as_fd(), 0, page, Access::Write).unwrap();
+        window.bytes_mut()[0] = 7;
+        // SAFETY: the child only sleeps and exits; it touches nothing the parent holds.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", io::Error::last_os_error());
+        if child == 0 {
+            // SAFETY: async-signal-safe calls in the forked child, then its end.
+            unsafe {
+                libc::usleep(300_000);
+                libc::_exit(0);
+            }
+        }
+        // The child lives, and holds no mapping of the window: once the parent's own is gone,
+        // nothing has it mapped writable.
+        drop(window);
+        let sealed = seal(fd.as_fd());
+        let mut status = 0;
+        // SAFETY: waiting for the child this test made, into a local.
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        assert!(sealed.is_ok(), "{sealed:?}");
+        let read = Map::new(fd.as_fd(), 0, page, Access::Read).unwrap();
+        assert_eq!(read.bytes()[0], 7);
+        // A mapping of no bytes is refused.
+        assert!(Map::new(fd.as_fd(), 0, 0, Access::Read).is_err());
+    }
 }

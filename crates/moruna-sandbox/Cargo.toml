@@ -31,6 +31,11 @@ moruna-abi = { workspace = true }
 libc = { workspace = true }
 landlock = { workspace = true }
 seccompiler = { workspace = true }
+# A function's measured memory (system design 3A): the line an image stage's instances are
+# funded and their batches cut by, and the node's fit of a warm-up's readings, which a Linux
+# image stage's warm-up shares with the Moruna kernel's (item 6.3f).
+moruna-cost = { workspace = true }
+moruna-api = { workspace = true }
 
 [dev-dependencies]
 moruna-testkit = { workspace = true }

@@ -601,6 +601,14 @@ fn unpacked(
     Ok((image, cgroup))
 }
 
+/// The CPUs of the machine as a stage's build finds them, which stand in for a job that names
+/// no `budget.cpu` until its run is bound and says its own (system design 3E): those this
+/// process may run on, by its affinity and its cgroups' CPU quota, at least one.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn node_cpus() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
 #[cfg(target_os = "linux")]
 fn sandboxed(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<Stage> {
     use std::sync::Arc;
@@ -609,6 +617,10 @@ fn sandboxed(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
     let routes = routes(entry, &settings, cx)?;
     let names: Vec<String> = routes.keys().cloned().collect();
     let env = task_env(entry, &settings, Role::Kernel, &names, cx)?;
+    // System design 3E: one instance for each CPU of the job, as on the Moruna kernel. Here
+    // they are its `budget.cpu`, or the CPUs this process may use; the run says its own when
+    // it is bound, the quota the engine starts its workers from.
+    let cpus = cx.cpus(node_cpus());
     let kernel = Arc::new(moruna_sandbox::ImageKernel::new(
         entry.field(),
         &image,
@@ -616,6 +628,7 @@ fn sandboxed(entry: &Entry<'_>, settings: Settings, cx: &mut Context) -> Result<
         &env,
         cgroup,
         settings.plane,
+        cpus,
     )?);
     let mut stage = Stage::of(kernel.clone());
     let bound = kernel.clone();
@@ -736,5 +749,14 @@ mod tests {
             Some(PathBuf::from("/home/u/.cache/moruna/unpacked"))
         );
         assert_eq!(unpack_dir(None, None), None);
+    }
+
+    /// Until its run is bound, a job that names no `budget.cpu` has the CPUs this process may
+    /// use (system design 3E): at least one, and never more than the machine has.
+    #[test]
+    fn a_node_s_cpus_are_those_the_process_may_use() {
+        let cpus = super::node_cpus();
+        assert!(cpus >= 1);
+        assert!(cpus as f64 <= moruna_discovery::machine_cores());
     }
 }
