@@ -688,14 +688,28 @@ impl ParquetSink {
         // size: `row_group_bytes` is a target, and `roll_bytes` is what the arena agreed to.
         let target = self.cfg.row_group_bytes.min(roll_bytes);
         // 6.3d: with a heap allowance the morsel is written in slices (zero copy) of no more
-        // rows than bring an eighth of a page, so what a write converts stays within its share,
-        // and the row group is flushed once the heap the writer's calls hold, and twice the most
-        // one slice grew it by, reach the allowance less its codecs and a slice.
+        // rows than the lane's room under its flush point holds, or than the transients kept
+        // above it hold where that is more, so a morsel that fits the room is written whole;
+        // the row group is flushed once the heap the writer's calls hold, and twice the most
+        // one slice grew it by, reach the flush point.
         let all = batch.num_rows();
-        let slice = bounds.map_or(all, |b| b.slice(all, bytes)).max(1);
         let mut at = 0;
+        let mut slices = 0;
         while at < all {
-            let take = slice.min(all - at);
+            let take = bounds
+                .map_or(all, |b| {
+                    let room = b.room(
+                        measured.then(|| (heap.held(), *jump)),
+                        if measured {
+                            0
+                        } else {
+                            current.writer.memory_size() as u64
+                        },
+                    );
+                    b.slice(all, bytes, room)
+                })
+                .clamp(1, all - at);
+            slices += 1;
             let first = current.writer.in_progress_rows() == 0;
             let before = heap.held();
             {
@@ -736,6 +750,7 @@ impl ParquetSink {
         {
             let mut inner = self.lock();
             inner.stats.writes += 1;
+            inner.stats.slices += slices;
             inner.stats.encode_bytes += bytes;
         }
         tracing::trace!(target: "sink.encode", seq, bytes, "encoded a morsel");

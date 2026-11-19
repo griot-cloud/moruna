@@ -216,7 +216,7 @@ const PAGE: u64 = 1 << 20;
 
 /// What a run wrote: its files' row groups, the most values a data page held, the rows, the sum
 /// of every numeric column's values, whether any column chunk is dictionary encoded, and the
-/// most the sink held on the heap.
+/// most the sink held on the heap, and the writes and the slices they were written in.
 struct Written {
     files: usize,
     row_groups: usize,
@@ -226,6 +226,8 @@ struct Written {
     dictionary: bool,
     held_peak: i64,
     measured: bool,
+    writes: u64,
+    slices: u64,
 }
 
 fn schema_of(types: &[DataType]) -> SchemaRef {
@@ -336,6 +338,8 @@ fn write(tag: &str, schema: &SchemaRef, compression: Compression, share: Option<
         dictionary: false,
         held_peak: HELD_PEAK.load(Ordering::SeqCst),
         measured: sink.stats().writer_heap_measured,
+        writes: sink.stats().writes,
+        slices: sink.stats().slices,
     };
     for name in &summary.files {
         let url = format!("{}/{}", scratch.url(), name);
@@ -493,7 +497,25 @@ fn the_model_holds_a_wide_string_column() {
     ]));
     let leaves = leaves_of(&schema).expect("leaves");
     let lane = 2 * least_lane_bytes(&leaves, zstd());
-    holds("lane-heap-strings", &schema, lane.max(4 << 20));
+    let written = holds("lane-heap-strings", &schema, lane.max(4 << 20));
+    assert!(
+        written.slices > written.writes,
+        "a morsel of 10 MiB of strings does not fit the room: {} slices",
+        written.slices
+    );
+}
+
+/// A morsel that fits the lane's room under its flush point is written whole, in one slice
+/// (PM, 2026-11-19): NYC's columns, a 12-byte flag among them, at a lane of 128 MB.
+#[test]
+fn a_morsel_that_fits_the_lanes_room_is_written_whole() {
+    let written = holds("lane-heap-whole", &taxi(), 128_000_000);
+    assert_eq!(written.writes, MORSELS as u64);
+    assert_eq!(
+        written.slices, written.writes,
+        "one slice a morsel: {} in {} writes",
+        written.slices, written.writes
+    );
 }
 
 /// 192 small integer columns, one and two bytes, at a lane that holds their codecs at a small

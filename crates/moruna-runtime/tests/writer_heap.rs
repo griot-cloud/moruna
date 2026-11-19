@@ -517,7 +517,10 @@ fn a_chain_declaring_nothing_outside_the_arena_leaves_its_writers_their_claim() 
         .iter()
         .find(|n| n.starts_with("arena sized at"))
         .expect("the arena's note");
-    assert!(sized.contains("then 1.00 of the"), "{sized}");
+    assert!(
+        sized.contains("less the 0 kept above the arena beside them: 0.00 of those bytes"),
+        "{sized}"
+    );
     assert!(
         sized.contains("by the 0.00 bytes the chain is expected to allocate"),
         "{sized}"

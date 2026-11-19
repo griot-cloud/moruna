@@ -9,6 +9,9 @@
 pub struct SinkStats {
     /// Calls to `write` that reached the encoder.
     pub writes: u64,
+    /// The slices a Parquet sink's writers wrote those calls' morsels in: one a morsel unless
+    /// the lane's room under its flush point cut it (6.3d, `lane_heap::Bounds::slice`).
+    pub slices: u64,
     /// Payload bytes the CPU encoded into arena memory (the one copy G-I2 allows a sink).
     pub encode_bytes: u64,
     /// Files whose bytes are visible to a reader and safe against process loss.

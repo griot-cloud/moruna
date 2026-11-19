@@ -570,12 +570,21 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
   factor (a copy's one byte outside the arena per byte in flight, or its kernels'). A sink adds no
   factor: its writers' need is a fixed amount per lane, not per byte in flight, so a chain whose
   kernels declare nothing outside the arena gets exactly the writers' claim above it. The writers'
-  heap is measured by the counting allocator, and each lane flushes its row group by it. The
+  heap is measured by the counting allocator, and each lane flushes its row group by it; a morsel
+  is written in slices only as far as the lane's room under its flush point requires (by the
+  heap a write was measured to hold per value and per byte of its strings), so a morsel that fits
+  the room is written whole (a fixed eighth of a page a slice cost the NYC year 6% of its encode
+  CPU for no memory). The
   writers' claim is their floor, not their ceiling: they are granted, up to their room, what their
   row groups need to reach the sink's own row-group target, so an ample budget writes the groups
-  the sink asks for. The order: the claims stand in front of the arena; the arena takes its share
-  of the rest by the chain's factor and the extra never takes from it; the extra comes only from
-  the decoders' share of the rest beyond their least batches, so on a tight or free chain there may
+  the sink asks for. The order: the claims stand in front of the arena; the claims are memory
+  outside the arena, so they count inside the share the chain's factor keeps outside it, and the
+  share kept above the arena beside them is max(0, that share of the rest − the claims): the arena
+  is its least and min(rest, its share of the rest + the claims), never more than the arena sized
+  before the claims, so memory is not provided for twice (at 1 GiB on 4 workers the NYC year's
+  claims of 268 MB fit inside the share, and its arena is the 641 MB it had before them). The
+  extra never takes from the arena; it comes only from the decoders' share of the rest beyond
+  their least batches, so on a tight or free chain there may
   be none. The arena's least is a floor, not a working size (6.3d: an arena cut to its least by the
   writers' extra failed to allocate), and a cap on the arena at one morsel in flight per worker,
   twice, was measured and dropped: it halved the arena at 672 MiB and 1 GiB and doubled the reads
@@ -586,7 +595,7 @@ client ─HTTPS─► api ──(job, cancel)──► node-admission ──star
   and the writers' need.
   **In a run,** the arena is made at its largest from the claims known before the schemas are,
   its pages untouched; once the graph is validated and before anything reads, the decoders' and
-  the writers' needs are computed from the schemas and the arena capped at what the claims leave
+  the writers' needs are computed from the schemas and the arena capped as the order above sizes
   it. The sinks'
   file buffers are the capped arena's, granted at the sink's open, and a decode's batch is the
   decoders' room over the workers; the object stores' room stays sized from the larger arena,

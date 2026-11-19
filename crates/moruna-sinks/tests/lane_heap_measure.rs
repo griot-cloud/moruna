@@ -488,3 +488,84 @@ fn m8_heap_over_memory_size_when_flushed_by_it() {
     flushed_by_estimate(Kind::Str(32), 8, true, 1 << 20, 1024, 4_000_000, zstd);
     flushed_by_estimate(Kind::Int16, 192, true, 1820, 512, 40_000_000, zstd);
 }
+
+/// M9: the heap one write holds, over what the writer held before it, per byte of a slice's
+/// byte-array values: a warm writer of one string column of `width`-byte values (at least their
+/// digits) and `distinct` distinct values beside three Int64 columns, at the claim's page
+/// (233,016 bytes, its dictionary page the same, Zstandard), written in slices of about
+/// `slice_bytes` bytes of string values. Reports the most a write held, and what it kept, per
+/// string byte, over 12 slices after a first.
+fn slice_held(width: usize, distinct: i64, dictionary: bool, slice_bytes: usize) {
+    let rows = (slice_bytes / width).max(1);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("s", DataType::Utf8, true),
+        Field::new("a", DataType::Int64, true),
+        Field::new("b", DataType::Int64, true),
+        Field::new("c", DataType::Int64, true),
+    ]));
+    let slices: Vec<RecordBatch> = (0..13)
+        .map(|b| {
+            let from = (b * rows) as i64;
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    column(Kind::Str(width), from, rows, distinct),
+                    column(Kind::Int64, from, rows, 1 << 40),
+                    column(Kind::Int64, from + 3, rows, 1 << 40),
+                    column(Kind::Int64, from + 7, rows, 1 << 40),
+                ],
+            )
+            .expect("a batch")
+        })
+        .collect();
+    let page = 233_016;
+    let props = WriterProperties::builder()
+        .set_dictionary_enabled(dictionary)
+        .set_data_page_size_limit(page)
+        .set_dictionary_page_size_limit(page)
+        .set_write_batch_size(1024)
+        .set_max_row_group_row_count(None)
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+    let mut writer = ArrowWriter::try_new(Vec::<u8>::with_capacity(512 << 20), schema, Some(props))
+        .expect("a writer");
+    writer.write(&slices[0]).expect("written");
+    let (mut most, mut kept) = (0f64, 0f64);
+    let mut value_bytes = 0;
+    for s in &slices[1..] {
+        let strings = s
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("strings");
+        let bytes = strings.value_data().len() as f64;
+        value_bytes = strings.value_data().len();
+        let before = reset_peak();
+        writer.write(s).expect("written");
+        most = most.max((peak() - before) as f64 / bytes);
+        kept = kept.max((live() - before) as f64 / bytes);
+    }
+    println!(
+        "M9 width={width} distinct={distinct} dictionary={dictionary} rows={rows} \
+         string_bytes={value_bytes} most_per_byte={most:.3} kept_per_byte={kept:.3}"
+    );
+}
+
+#[test]
+#[ignore = "a measurement: run with --ignored --nocapture"]
+fn m9_heap_per_slice_byte() {
+    for (width, distinct) in [
+        (1usize, 2i64),
+        (16, 1 << 40),
+        (64, 1 << 40),
+        (256, 1 << 40),
+        (2048, 1 << 40),
+        (64, 100),
+    ] {
+        for dictionary in [true, false] {
+            for slice_bytes in [64usize << 10, 1 << 20, 8 << 20] {
+                slice_held(width, distinct, dictionary, slice_bytes);
+            }
+        }
+    }
+}

@@ -114,17 +114,34 @@ const MIN_PAGE_ROWS: u64 = 128;
 /// The smallest page a lane is cut to: below it a page is mostly its header (M4: 1,276 bytes).
 const LEAST_PAGE_BYTES: u64 = 1 << 10;
 
-/// The part of the writer's share a slice's transients may take: an eighth, so a lane flushes
-/// its row group by what it holds and not by what one write converts.
+/// The part of the writer's share the least slice's transients may take, kept above the flush
+/// point: an eighth, so a lane flushes its row group by what it holds and not by what one write
+/// converts. A slice above the least takes the room under the flush point ([`Bounds::slice`]).
 const SLICE_SHARE: u64 = 8;
 
-/// The part of a page one slice may bring of its byte arrays' values: an eighth of its byte
-/// limit, so a byte array's page closes within an eighth of its limit whatever its values'
-/// width (M8: a slice of 1,024 two-KiB strings held 5.8 MB beside a 0.8 MB estimate; of 32,
-/// 1.1 MB). A fixed-width column's page is held there by the write batch ([`bounds`]), so its
-/// values do not narrow the slice: bounding them too cut the NYC year's slices to 15 rows at
-/// 14.5 KB pages and tripled its wall (6.3d host table, 2026-11-18).
+/// The part of a page a slice the transients kept above the flush point hold may bring of its
+/// byte arrays' values: an eighth of its byte limit (M8: a slice of 1,024 two-KiB strings held
+/// 5.8 MB beside a 0.8 MB estimate; of 32, 1.1 MB). It is the least slice, which the lane's
+/// room under its flush point raises ([`Bounds::slice`]); a byte array's page is closed within
+/// its limit by parquet itself, which cuts a mini-batch of large values to fit one page
+/// (parquet 59.3.0's `ByteBudgetChunker`). A fixed-width column's values do not narrow it:
+/// bounding them too cut the NYC year's slices to 15 rows at 14.5 KB pages and tripled its
+/// wall (6.3d host table, 2026-11-18).
 const SLICE_PAGE_SHARE: u64 = 8;
+
+/// What a write holds on the heap per byte of its byte arrays' values, beside
+/// [`WRITE_BYTES_PER_VALUE`] a value. M9, a warm writer at the claim's page, a string column
+/// beside three Int64 columns: at slices of 8 MiB of strings, 1 to 2,048 bytes wide, a write
+/// held 15 to 401 heap bytes a row, everything counted, against the 101 to 1,124 these two
+/// figures give its four values; at 64 KiB and 1 MiB slices a write's buffers growing by
+/// doubling add a fixed MiB or so, which the room leaves by twice the most one slice grew the
+/// heap by ([`Bounds::room`]).
+const HEAP_PER_SLICE_ARRAY_BYTE: f64 = 0.5;
+
+/// The pages a write holds of each byte-array column while it writes, beyond what it keeps,
+/// whatever its slice's size: M9, a write of 1 MiB or more of 2 KiB strings held 1.33 MB over
+/// what it kept at 233 KB pages, 5.7 pages, and of 64 KiB, 2.8 pages.
+const ARRAY_WRITE_PAGES: u64 = 6;
 
 /// What a flush holds besides what the writer held before it: the open page it finishes, copied
 /// and compressed, one column at a time (see `bounds`).
@@ -472,10 +489,14 @@ pub(crate) struct Bounds {
     /// The fixed-width columns to write without a dictionary: all of them when their empty hash
     /// indexes would not fit beside the writer's least, else none.
     pub plain: Vec<ColumnPath>,
-    /// The most rows of a batch written at once, by their conversions' transients.
+    /// The rows of the least slice, by their conversions' transients kept above the flush
+    /// point; the room under it raises a slice above this ([`Bounds::slice`]).
     pub slice_rows: usize,
-    /// Whether a slice is bounded by its bytes too: the schema has byte arrays.
+    /// Whether a slice counts its bytes too: the schema has byte arrays.
     pub arrays: bool,
+    /// What a write holds of the byte-array columns' pages whatever its slice
+    /// ([`ARRAY_WRITE_PAGES`] a column).
+    pub array_pages: u64,
     /// The decoded bytes a row's fixed-width fields take ([`Leaves::fixed_row`]).
     pub fixed_row: u64,
     /// Roll the file before a morsel would take its page index and row group metadata past
@@ -503,8 +524,9 @@ pub(crate) fn bounds(
     let codec = lane_codecs(leaves, compression, page);
     let writer = allowance.saturating_sub(codec);
     let slice_rows = (writer / SLICE_SHARE / (count * WRITE_BYTES_PER_VALUE)).max(1);
-    // A slice's transients: its values' conversions (M5), and the bytes it brings, an eighth of
-    // a page at the most ([`Bounds::slice`]). A flush's: it finishes one column's open page at a
+    // The least slice's transients, kept above the flush point: its values' conversions (M5),
+    // and the bytes it brings, an eighth of a page at the most; a larger slice takes the room
+    // under the flush point instead ([`Bounds::slice`]). A flush's: it finishes one column's open page at a
     // time, copying it whole and compressing the copy (parquet 59.3.0,
     // `GenericColumnWriter::add_data_page`), two pages at the most (M8: a flush peaked 0.1 MB
     // over the write before it for 1 MiB pages; si_lane_heap.rs's 2 KiB strings, 0.18 MB at
@@ -531,6 +553,7 @@ pub(crate) fn bounds(
         plain,
         slice_rows: to_usize(slice_rows),
         arrays: leaves.arrays > 0,
+        array_pages: (leaves.arrays as u64).saturating_mul(ARRAY_WRITE_PAGES * page as u64),
         fixed_row: leaves.fixed_row,
         index_share: flush_at / INDEX_SHARE,
         leaves: leaves.count.max(1),
@@ -563,20 +586,48 @@ impl Bounds {
             )
     }
 
-    /// The rows of a morsel of `rows` rows and `bytes` decoded bytes to write at once: at most
+    /// The rows of a morsel of `rows` rows and `bytes` decoded bytes to write at once, with
+    /// `room` bytes left under the flush point ([`Bounds::room`]): as many as the room holds, at
+    /// [`WRITE_BYTES_PER_VALUE`] a value and [`HEAP_PER_SLICE_ARRAY_BYTE`] a byte of byte
+    /// arrays' values beside [`Bounds::array_pages`] (M5, M9), so a morsel that fits the room is
+    /// written whole (PM,
+    /// 2026-11-19: a fixed eighth of a page cost the NYC year 6% of its encode CPU for no
+    /// memory); and never fewer than the transients kept above the flush point hold:
     /// [`Bounds::slice_rows`], and where the schema has byte arrays, no more than bring an
-    /// eighth of a page of their values, taken to be all of a row's bytes beyond its fixed-width
-    /// fields and all in one column.
-    pub(crate) fn slice(&self, rows: usize, bytes: u64) -> usize {
-        if !self.arrays {
-            return self.slice_rows.max(1);
-        }
+    /// eighth of a page of their values. A row's bytes beyond its fixed-width fields are taken
+    /// to be its byte arrays'.
+    pub(crate) fn slice(&self, rows: usize, bytes: u64, room: u64) -> usize {
         let per_row = bytes.div_ceil(rows.max(1) as u64);
-        let variable = per_row.saturating_sub(self.fixed_row).max(1);
-        let by_bytes = (self.page_bytes as u64 / SLICE_PAGE_SHARE / variable).max(1);
-        self.slice_rows
-            .min(usize::try_from(by_bytes).unwrap_or(usize::MAX))
-            .max(1)
+        let variable = if self.arrays {
+            per_row.saturating_sub(self.fixed_row).max(1)
+        } else {
+            0
+        };
+        let least = if self.arrays {
+            let by_bytes = (self.page_bytes as u64 / SLICE_PAGE_SHARE / variable).max(1);
+            self.slice_rows
+                .min(usize::try_from(by_bytes).unwrap_or(usize::MAX))
+        } else {
+            self.slice_rows
+        };
+        let row_heap = (self.leaves as u64)
+            .saturating_mul(WRITE_BYTES_PER_VALUE)
+            .saturating_add((variable as f64 * HEAP_PER_SLICE_ARRAY_BYTE).ceil() as u64)
+            .max(1);
+        let by_room =
+            usize::try_from(room.saturating_sub(self.array_pages) / row_heap).unwrap_or(usize::MAX);
+        least.max(by_room).max(1)
+    }
+
+    /// The room left under the flush point, as [`Bounds::flush`] reads the heap: measured, the
+    /// flush point less what the writer's calls hold and twice the most one slice grew it by;
+    /// unmeasured, less parquet's estimate times [`FALLBACK_FACTOR`].
+    pub(crate) fn room(&self, measured: Option<(u64, u64)>, memory: u64) -> u64 {
+        let held = match measured {
+            Some((held, jump)) => held.saturating_add(jump.saturating_mul(2)),
+            None => (memory as f64 * FALLBACK_FACTOR) as u64,
+        };
+        self.flush_at.saturating_sub(held)
     }
 
     /// Whether the row group is flushed now. Measured (`held`, the heap the writer's calls
@@ -852,30 +903,73 @@ mod tests {
         assert!(!b.flush(None, fallback - 2));
     }
 
-    /// A slice brings no more than an eighth of a page of byte arrays' values, taking a row's
-    /// bytes beyond its fixed-width fields to be one column's; a schema without byte arrays is
-    /// sliced by its conversions alone, its pages held by the write batch.
+    /// With no room under the flush point a slice is what the transients kept above it hold:
+    /// no more than an eighth of a page of byte arrays' values, taking a row's bytes beyond its
+    /// fixed-width fields to be one column's; a schema without byte arrays is sliced by its
+    /// conversions alone, its pages held by the write batch.
     #[test]
-    fn a_slice_brings_no_more_than_an_eighth_of_a_page_of_byte_arrays() {
+    fn without_room_a_slice_brings_no_more_than_an_eighth_of_a_page_of_byte_arrays() {
         let b = bounds(10 << 30, &taxi(), zstd(), ROWS, MIB, MIB, 1024);
         assert_eq!(taxi().fixed_row, 128);
         assert_eq!(
-            b.slice(5_000, 5_000 * 152),
+            b.slice(5_000, 5_000 * 152, 0),
             MIB / 8 / (152 - 128),
             "narrow rows: an eighth of a MiB page of the string's 24 bytes a row"
         );
         assert_eq!(
-            b.slice(5_000, 5_000 * 4096),
+            b.slice(5_000, 5_000 * 4096, 0),
             MIB / 8 / (4096 - 128),
             "a wide string"
         );
-        assert_eq!(b.slice(10, 10 << 30), 1, "at least a row");
-        assert_eq!(b.slice(0, 0), MIB / 8);
+        assert_eq!(b.slice(10, 10 << 30, 0), 1, "at least a row");
+        assert_eq!(b.slice(0, 0, 0), MIB / 8);
         let numbers = leaves(&vec![DataType::Int64; 4]);
         let n = bounds(26_000_000, &numbers, zstd(), ROWS, MIB, MIB, 1024);
-        assert_eq!(n.slice(100_000, 100_000 * 32), n.slice_rows);
-        assert_eq!(n.slice(100_000, 100_000 << 20), n.slice_rows);
+        assert_eq!(n.slice(100_000, 100_000 * 32, 0), n.slice_rows);
+        assert_eq!(n.slice(100_000, 100_000 << 20, 0), n.slice_rows);
         assert!(n.slice_rows > 1024, "no fixed cap on rows: {n:?}");
+    }
+
+    /// A slice takes as many rows as the lane's room under its flush point holds, at 25 heap
+    /// bytes a value and half a byte a byte of byte arrays (M5, M9), so a morsel that fits the
+    /// room is written whole (PM, 2026-11-19); the room is the flush point less what the heap
+    /// holds and twice the most one slice grew it by, or parquet's estimate where unmeasured.
+    #[test]
+    fn a_morsel_that_fits_the_lanes_room_is_written_whole() {
+        let taxi = taxi();
+        let b = bounds(97_542_398, &taxi, zstd(), ROWS, 233_016, 233_016, 1024);
+        // The NYC year's morsel at 1 GiB on 2 workers: about 28,000 rows of 152 decoded bytes.
+        let (rows, bytes) = (28_000usize, 28_000 * 152);
+        let room = b.room(Some((17 << 20, 1 << 20)), 0);
+        assert_eq!(room, b.flush_at - (17 << 20) - (2 << 20));
+        let row_heap = 19 * WRITE_BYTES_PER_VALUE + 12;
+        assert_eq!(
+            b.array_pages,
+            ARRAY_WRITE_PAGES * 233_016,
+            "one string column's pages"
+        );
+        assert!(rows as u64 * row_heap + b.array_pages <= room, "{room}");
+        assert!(b.slice(rows, bytes, room) >= rows, "written whole");
+        // Less room: the rows it holds beside the strings' pages, never below the slice kept
+        // above the flush point.
+        let less = 10_000 * row_heap + b.array_pages;
+        assert_eq!(b.slice(rows, bytes, less), 10_000);
+        let least = b.slice(rows, bytes, 0);
+        assert_eq!(least, (233_016 / 8 / 24) as usize);
+        assert_eq!(b.slice(rows, bytes, row_heap), least);
+        // A schema without byte arrays counts its values alone.
+        let numbers = leaves(&vec![DataType::Int64; 4]);
+        let n = bounds(26_000_000, &numbers, zstd(), ROWS, MIB, MIB, 1024);
+        assert_eq!(
+            n.slice(1 << 20, 32 << 20, 400 << 20),
+            (400u64 << 20) as usize / (4 * WRITE_BYTES_PER_VALUE) as usize
+        );
+        // The room is what the flush reads: nothing at the flush point, measured or estimated.
+        assert_eq!(b.room(Some((b.flush_at, 0)), 0), 0);
+        assert_eq!(b.room(Some((b.flush_at / 2, b.flush_at)), 0), 0);
+        let estimate = (b.flush_at as f64 / FALLBACK_FACTOR) as u64;
+        assert!(b.room(None, estimate) <= 2, "{}", b.room(None, estimate));
+        assert_eq!(b.room(None, 0), b.flush_at);
     }
     /// The run fits the writers in order (6.3d): one lane per worker at the claim's page when
     /// the room holds it; else the largest page that holds one lane per worker (P1); else fewer

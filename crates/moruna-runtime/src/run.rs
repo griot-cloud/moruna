@@ -661,7 +661,8 @@ fn drive(
     // each projected column; then the sinks' writers, one lane per worker at the claim's page,
     // or (memory bounding the page before the lanes) at the largest page that fits, or on fewer
     // lanes at the least page; then the rest, divided between the arena and the decoders'
-    // batches by the chain's own factor. A run whose first claims leave no lane is refused
+    // batches by the chain's own factor, the claims counting inside the share it keeps outside
+    // the arena (PM, 2026-11-19). A run whose first claims leave no lane is refused
     // here, with the least budget that holds it. The arena was made at its largest and none of
     // its pages is touched yet, so it is capped here at what the claims leave it. An injected
     // allocator is the caller's arena, and its budget is not the facade's to name.
@@ -853,8 +854,8 @@ fn drive(
     }
     let mut capped = None;
     if sizing.claimed() {
-        // The arena takes what the claims leave it: the same arithmetic with the writers held
-        // outside it, and its note in place of the one made before they were known.
+        // The arena takes what the claims leave it less the share kept above it beside them
+        // (`Sizing::divide`), and its note goes in place of the one made before they were known.
         let mut sized = Vec::new();
         arena_bytes = sizing.divide(limits.memory_ceiling, &mut sized);
         notes.retain(|note| !note.starts_with("arena sized at "));
@@ -1822,10 +1823,25 @@ impl Sizing {
             .saturating_sub(self.writers_extra)
     }
 
+    /// What [`Sizing::divide`] keeps above the arena at `ceiling` beside the claims (3A, 6.3d,
+    /// PM 2026-11-19): the claims are memory outside the arena, so they count inside the share
+    /// the chain's factor keeps outside it, `(1 - share) x rest`, and only what that share holds
+    /// beyond them is kept, never less than nothing.
+    fn kept_beside_claims(&self, ceiling: u64) -> u64 {
+        let claims = self
+            .decoders
+            .saturating_add(self.decode_least)
+            .saturating_add(self.writers);
+        let outside = (self.rest(ceiling) as f64 * (1.0 - arena_share(self.out_of_arena))) as u64;
+        outside.saturating_sub(claims)
+    }
+
     /// The arena's host bytes for `ceiling`. Before the claims are known: sized over the
     /// allowance, `ceiling - baseline - reserve - expected kernel state`, by the chain's factor.
-    /// After (3A, 6.3d): the arena's least, and its share by the chain's factor of what the
-    /// claims leave.
+    /// After (3A, 6.3d): the arena's least, and what the claims leave less what the chain's
+    /// factor keeps above the arena beside them ([`Sizing::kept_beside_claims`]), so
+    /// `least + min(rest, share x rest + claims)`; never more than the arena sized before the
+    /// claims.
     fn divide(&self, ceiling: u64, notes: &mut Vec<String>) -> u64 {
         if !self.claimed() {
             return arena_host_bytes(
@@ -1850,14 +1866,17 @@ impl Sizing {
             ..*self
         }
         .divide(ceiling, &mut Vec::new());
-        let arena = ((least + (rest as f64 * share) as u64) / granule * granule).min(largest);
+        let kept = self.kept_beside_claims(ceiling);
+        let arena = ((least + rest.saturating_sub(kept)) / granule * granule).min(largest);
         notes.push(format!(
             "arena sized at {arena} bytes, of the {allowance} byte allowance: its least, {least} \
-             bytes (one read in flight per worker at its charge), then {share:.2} of the {rest} \
-             bytes the claims leave, by the {:.2} bytes the chain is expected to allocate \
-             outside the arena per byte in flight; above it the sources' decoders claim {} \
-             bytes whatever their batch and {} for their least batches, and the sinks' writers \
-             {}",
+             bytes (one read in flight per worker at its charge), then the {rest} bytes the \
+             claims leave, less the {kept} kept above the arena beside them: {:.2} of those \
+             bytes, by the {:.2} bytes the chain is expected to allocate outside the arena per \
+             byte in flight, less the claims, which count inside that share; above it the \
+             sources' decoders claim {} bytes whatever their batch and {} for their least \
+             batches, and the sinks' writers {}",
+            1.0 - share,
             out_of_arena_factor(self.out_of_arena),
             self.decoders,
             self.decode_least,
@@ -2932,10 +2951,18 @@ mod tests {
                 ..sized
             }
             .divide(ceiling, &mut Vec::new());
-            let expected = (least + (rest as f64 * arena_share(factor)) as u64).min(largest);
+            // The claims count inside the share kept above the arena (PM, 2026-11-19).
+            let claims = sized.decoders + sized.decode_least + sized.writers;
+            let expected = (least + rest.min((rest as f64 * arena_share(factor)) as u64 + claims))
+                .min(largest);
             assert!(
                 arena.abs_diff(expected) < GRANULE_BYTES,
                 "{factor}: {arena} of {rest}"
+            );
+            let kept = sized.kept_beside_claims(ceiling);
+            assert_eq!(
+                kept,
+                ((rest as f64 * (1.0 - arena_share(factor))) as u64).saturating_sub(claims)
             );
             assert!(
                 notes[0].starts_with(&format!("arena sized at {arena} bytes")),
@@ -2967,6 +2994,75 @@ mod tests {
                 sized.writers_room(ceiling)
             );
         }
+    }
+
+    /// 3A (6.3d, PM 2026-11-19): the claims count inside the share the chain keeps above the
+    /// arena, so they are not provided for twice. The NYC year's copy at 1 GiB on 4 workers
+    /// (factor 1, claims of 268 MB) keeps nothing above the arena beside them, and its arena is
+    /// the one sized before the claims; small claims leave the share's remainder above it.
+    #[test]
+    fn the_claims_count_inside_the_share_kept_above_the_arena() {
+        let ceiling = 1u64 << 30;
+        let year = Sizing {
+            baseline: 4_538_752,
+            workers: 4,
+            out_of_arena: 1.0,
+            decoders: 12_244_000,
+            decode_least: 4 * 4 * config::MORSEL_MIN_BYTES,
+            writers: 188_713_168,
+            file_buffers: true,
+            ..sizing()
+        };
+        let before = Sizing {
+            decoders: 0,
+            decode_least: 0,
+            writers: 0,
+            ..year
+        }
+        .divide(ceiling, &mut Vec::new());
+        let rest = year.rest(ceiling);
+        let claims = year.decoders + year.decode_least + year.writers;
+        assert!(
+            (rest as f64 / 3.0) < claims as f64,
+            "the claims pass the share"
+        );
+        assert_eq!(year.kept_beside_claims(ceiling), 0);
+        let arena = year.divide(ceiling, &mut Vec::new());
+        assert_eq!(
+            arena,
+            ((year.arena_least() + rest) / GRANULE_BYTES * GRANULE_BYTES).min(before)
+        );
+        assert_eq!(arena, before, "back to the arena sized before the claims");
+
+        // Claims of 20 MB: the share keeps a third of the rest above the arena, less them, and
+        // the arena is the one sized before the claims, which already left them their room.
+        let small = Sizing {
+            decoders: 4 << 20,
+            decode_least: 8 << 20,
+            writers: 8 << 20,
+            ..year
+        };
+        let rest = small.rest(ceiling);
+        let kept = small.kept_beside_claims(ceiling);
+        assert_eq!(kept, ((rest as f64 / 3.0) as u64) - (20 << 20));
+        assert!(small.arena_least() + rest - kept >= before);
+        let arena = small.divide(ceiling, &mut Vec::new());
+        assert_eq!(arena, before);
+        assert_eq!(
+            small.decoders_room(ceiling, arena) - small.decoders - small.decode_least,
+            small.allowance(ceiling) - before - (20 << 20),
+            "what is above the arena beside the claims is the decoders' share"
+        );
+        // Claims past the share the arena sized before them left: the arena is what they leave.
+        let large = Sizing {
+            writers: 400 << 20,
+            ..year
+        };
+        let arena = large.divide(ceiling, &mut Vec::new());
+        let leave = large.allowance(ceiling) - large.decoders - large.decode_least - (400 << 20);
+        assert_eq!(large.kept_beside_claims(ceiling), 0);
+        assert_eq!(arena, leave / GRANULE_BYTES * GRANULE_BYTES);
+        assert!(arena < before);
     }
 
     /// 3A (6.3d): the arena's share by the chain's factor, a nonsense factor counting as the
