@@ -43,7 +43,7 @@ smoltcp = { version = "=0.13.1", default-features = false, features = ["alloc", 
 heapless = { version = "=0.9.3", default-features = false }
 # An HTTPS client, a token issuer and the answers' JSON, as the API server's own tests have
 # them, at the workspace's versions.
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
 ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }
 httparse = { version = "=1.10.1", default-features = false }
 serde_json = { version = "=1.0.154", default-features = false, features = ["alloc"] }

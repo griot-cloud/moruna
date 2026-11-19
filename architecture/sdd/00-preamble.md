@@ -481,7 +481,7 @@ Pinned in `[workspace.dependencies]`; the agent building component 1 pins the la
 | `hyper`, `hyper-util`, `http`, `http-body-util`, `socket2` | 6, runtime (dev) | object storage through a Unix or vsock socket: HTTP/1.1 over a stream for `object_store`'s S3 client (MH 4.6) | already in the graph through `object_store`; `default-features = false` on `hyper` and `hyper-util` |
 | `kvm-ioctls`, `kvm-bindings`, `vmm-sys-util` | `moruna-vmm` | KVM: the VM, memory slots, irqchip, vCPUs (MH 4.8) | Linux only; `kvm-bindings` with `fam-wrappers` |
 | `vm-memory`, `virtio-queue`, `virtio-bindings`, `vm-superio`, `linux-loader` | `moruna-vmm` | guest memory, split virtqueues, the virtio constants, the serial console, loading the guest kernel (MH 4.8) | the rust-vmm crates; `vm-memory` with `backend-mmap`, `linux-loader` with `bzimage`, `elf`, `pe` |
-| `wasmtime` | 17 (`moruna-wasm`) | a `.wasm` package's runtime: the component model, cranelift, fuel, the resource limiter (FP 4) | 47.0.4, the version `parcel-runtime` already brings, so the graph has one; `default-features = false`, features `cranelift`, `component-model`, `runtime`, `std`; added 2026-10-15 |
+| `wasmtime` | 17 (`moruna-wasm`) | a `.wasm` package's runtime: the component model, cranelift, fuel, the resource limiter (FP 4) | 48.0.9 (S.1, 2026-11-19: 47 has no release that fixes its advisories; it was 47.0.4, the version `parcel-runtime` brought); `default-features = false`, features `cranelift`, `component-model`, `runtime`, `std`; added 2026-10-15 |
 | `wat` | 17 (dev) | the test components, written in the text format | dev-dependency only |
 | `zip` | 16 | the `.pex` archive | `default-features = false`, feature `deflate`; added 2026-10-15 |
 | `landlock`, `seccompiler` | 17 (`moruna-sandbox`, Linux) | the child's filesystem rules and system-call allow-list (FP 4) | added 2026-10-15 |
@@ -514,7 +514,7 @@ Pinned versions (filled by the component 1 agent in wave 0, F0.1, on 2026-09-22;
 | `object_store` | 0.13.2 | | |
 | `dlpark` | 0.8.0 | `blake3` | 1.8.7 |
 | `safetensors` | 0.8.0 | `serde` | 1.0.229 |
-| `tokio` | 1.53.1 | `serde_json` | 1.0.151 |
+| `tokio` | 1.53.3 (S.1, 2026-11-19: RUSTSEC-2026-0386) | `serde_json` | 1.0.151 |
 | `io-uring` | 0.7.15 | `base64` | 0.23.1 |
 | `crossbeam` | 0.8.5 | `libc` | 0.2.189 |
 | `cudarc` | 0.19.9 | `bytes` | 1.12.1 |
@@ -532,10 +532,10 @@ Pinned versions (filled by the component 1 agent in wave 0, F0.1, on 2026-09-22;
 | `virtio-bindings` | 0.2.7 | `vm-superio` | 0.8.2 |
 | `linux-loader` | 0.14.0 | `vm-fdt` | 0.3.0 |
 | `acpi_tables` | 0.2.1 | `vortex` | 0.86.1 (E2, 2026-09-29: the newest release; it builds on 1.98.1 and declares `rust-version = 1.95`) |
-| `wasmtime` | 47.0.4 (2026-10-15: the version `parcel-runtime` brings, so the graph has one; 49.0.3 was the newest) | `wat` (dev) | 1.252.0 (the `wasmparser` wasmtime 47 uses) |
-| `zip` | 9.0.3 | `landlock` | 0.4.7 |
+| `wasmtime` | 48.0.9 (S.1, 2026-11-19: the smallest jump from 47.0.4 that fixes RUSTSEC-2026-0315 to 0424; 50.0.2 was the newest) | `wat` (dev) | 1.254.2 (the `wasmparser` wasmtime 48 uses) |
+| `zip` | 9.0.5 (S.1, 2026-11-19: RUSTSEC-2026-0548) | `landlock` | 0.4.7 |
 | `seccompiler` | 0.5.0 | `schemars` | 1.2.2 (2026-10-28: the version `parcel-core` brings, so the graph has one) |
-| `lz4_flex` | 0.14.0 (the version arrow-ipc uses) | `zstd` | 0.13.3 (the version arrow-ipc uses) |
+| `lz4_flex` | 0.14.0 (the version arrow-ipc uses) | `zstd` | 0.13.5 (the line arrow-ipc uses; S.1, 2026-11-19: RUSTSEC-2026-0391, with `zstd-safe` 7.4.1 and `zstd-sys` 2.1.3 for 0398, 0403 and 0410) |
 | `flatbuffers` | 25.12.19 (the version arrow-ipc uses) | | |
 
 arrow and parquet are pinned to the 59 line because datafusion 55.1.0 and pyo3-arrow 0.19.0 require it; a single arrow version in the workspace is what S7 and S13 rely on (one RecordBatch type across moruna-kernel, the bridges and the Python surface); decided by the PM 2026-09-22 (E2). object_store is pinned to the 0.13 line for the same reason.
