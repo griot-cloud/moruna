@@ -4,7 +4,9 @@
 //! `Completion` and never allocates payload memory: the only calls it makes into another
 //! component are `Placement::pop`, `Placement::push`, `Kernel::apply` and `TraceSink::record`
 //! (SC-I1). It holds no scheduler lock across any of them, and it does not block outside
-//! `Kernel::apply`: see the note on the claim in `run_task`.
+//! `Kernel::apply`: see the note on the claim in `run_task`. On a stage of one input the apply is
+//! `Kernel::apply_morsels`, and what the worker pushes and records is each morsel the unit gave,
+//! under that morsel's own number, with what it brought in when it was taken (item 6.3m).
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -14,14 +16,14 @@ use std::time::Duration;
 use crossbeam::channel::Receiver;
 use crossbeam::sync::Parker;
 use moruna_kernel::{
-    KernelState, Locality, Morsel, MorselFeatures, MorunaError, NoState, Outcome, Payload,
-    PayloadSpec, PlacementStats, ProbeResult, Result, Sample, Seq, StageId, TIER_COUNT, Tier,
-    TraceRecord,
+    Completed, KernelState, Locality, Morsel, MorselFeatures, MorselTime, MorunaError, NoState,
+    Outcome, PayloadSpec, PlacementStats, ProbeResult, Result, Sample, Seq, StageId, TIER_COUNT,
+    Tier, TraceRecord,
 };
 
 use crate::cputime::{now_ns, thread_cpu_ns};
 use crate::instances;
-use crate::shared::{JobOutput, JobRequest, Shared, WorkerJob};
+use crate::shared::{JobOutput, JobRequest, Shared, Taken, WorkerJob};
 use crate::slots::BusySlot;
 
 /// Between two attempts of a unit the arena refused: run the offloaded jobs that are queued, on
@@ -304,9 +306,10 @@ fn claim_and_pop(
     }
 }
 
-/// What `apply` did, before the policy sees it.
+/// What `apply` did, before the policy sees it: the morsels it gave, each with what it brought
+/// in (6.3m), or its failure.
 enum Applied {
-    Produced(Payload),
+    Produced(Vec<(Completed, Taken)>),
     Failed(MorunaError),
 }
 
@@ -494,6 +497,10 @@ pub(crate) fn run_task(
     };
     let t0 = now_ns();
     let c0 = thread_cpu_ns();
+    // Item 6.3m: a unit of a stage of one input gives the morsels it completed, each under its
+    // own number (`Kernel::apply_morsels`). A stage of several inputs, or one that joins them by
+    // morsel, gives its unit's own morsel.
+    let gives_morsels = !joined && entry.inputs.len() == 1;
     let raw = {
         let state: &mut dyn KernelState = match state_box.as_mut() {
             Some(state) => state.as_mut(),
@@ -505,7 +512,9 @@ pub(crate) fn run_task(
                 let mut inputs = Vec::with_capacity(others.len() + 1);
                 inputs.push(payload);
                 inputs.extend(others);
-                kernel.apply_aligned(state, inputs)
+                kernel
+                    .apply_aligned(state, inputs)
+                    .map(|out| vec![Completed::unit(seq, out)])
             }))
         } else {
             // RB5: an arena that cannot take the unit's output is a wall, not an error. The
@@ -521,7 +530,13 @@ pub(crate) fn run_task(
                 let st: &mut dyn KernelState = &mut *state;
                 let kernel = kernel.clone();
                 let result = std::panic::catch_unwind(AssertUnwindSafe(move || {
-                    kernel.apply_port(st, port, payload)
+                    if gives_morsels {
+                        kernel.apply_morsels(st, payload, seq)
+                    } else {
+                        kernel
+                            .apply_port(st, port, payload)
+                            .map(|out| vec![Completed::unit(seq, out)])
+                    }
                 }));
                 if let Ok(Err(MorunaError::Alloc { bytes, .. })) = &result
                     && shared.run_state().is_live()
@@ -595,8 +610,20 @@ pub(crate) fn run_task(
         }
     };
 
+    // 6.3m: what each morsel the unit gave brought in, settled while the instance is still held,
+    // so no later unit of it can give this unit's morsel before it is kept.
     let applied = match raw {
-        Ok(Ok(out)) => Applied::Produced(out),
+        Ok(Ok(completed)) => match resolve(entry, completed, seq, || Taken {
+            rows_in,
+            bytes_in,
+            tier_in,
+            features: features.clone(),
+            origin: origin.clone(),
+            learn: learn.cloned(),
+        }) {
+            Ok(given) => Applied::Produced(given),
+            Err(e) => Applied::Failed(e),
+        },
         Ok(Err(e)) => Applied::Failed(e),
         // l: a panicking kernel's state is retired, and the panic becomes a `Kernel` error
         // whose message starts with `panic:` (f.8).
@@ -620,51 +647,74 @@ pub(crate) fn run_task(
         );
     }
 
-    let mut rows_out = 0;
+    let unit_ns = t1.saturating_sub(t0);
+    let unit_cpu_ns = c1.saturating_sub(c0);
+    // What the unit gave, for the probe: every morsel's output.
     let mut bytes_out = 0;
-    let mut tier_out = tier_in;
+    let mut gave = Vec::new();
     let mut error = None;
     let mut failure = None;
     let mut push_error = released.err();
     match applied {
-        Applied::Produced(out) => {
-            rows_out = out.rows();
-            bytes_out = out.bytes();
-            tier_out = out.tier().index() as u8;
-            // 6.3b: learned before the push, so the reads after it are sized by it.
-            entry.learn_growth(bytes_in, bytes_out);
-            let out_morsel = Morsel::new(seq, stage, out, origin);
-            // One push into every queue the stage gives to: the batch is shared, never copied
-            // (contracts d.16).
-            if push_error.is_some() {
-                // The release failed: the run ends on that error, and nothing is pushed.
-            } else if let Err(e) =
-                crate::decide::admit_push_on_worker(shared, &entry.outputs, out_morsel, claim)
-            {
-                push_error = Some(e);
-            } else {
-                entry.rows_out.fetch_add(rows_out, Ordering::SeqCst);
-                entry.bytes_out.fetch_add(bytes_out, Ordering::SeqCst);
+        Applied::Produced(given) => {
+            let mut claim = claim;
+            for (morsel, taken) in given {
+                let (rows, bytes) = (morsel.output.rows(), morsel.output.bytes());
+                let tier_out = morsel.output.tier().index() as u8;
+                // 6.3b: learned before the push, so the reads after it are sized by it.
+                entry.learn_growth(taken.bytes_in, bytes);
+                if push_error.is_some() {
+                    // The release failed: the run ends on that error, and nothing is pushed.
+                    break;
+                }
+                let out_morsel =
+                    Morsel::new(morsel.seq, stage, morsel.output, taken.origin.clone());
+                // One push into every queue the stage gives to: the batch is shared, never copied
+                // (contracts d.16). The unit's claim on what it is predicted to make goes with its
+                // first.
+                if let Err(e) = crate::decide::admit_push_on_worker(
+                    shared,
+                    &entry.outputs,
+                    out_morsel,
+                    claim.take(),
+                ) {
+                    push_error = Some(e);
+                    break;
+                }
+                entry.rows_out.fetch_add(rows, Ordering::SeqCst);
+                entry.bytes_out.fetch_add(bytes, Ordering::SeqCst);
                 for &q in &entry.outputs {
                     shared.fed(q);
                 }
+                bytes_out += bytes;
+                // 6.3m, decision 4: a morsel with no time gives the cost model nothing rather
+                // than a wrong observation; its record and growth stand.
+                let timed = match morsel.time {
+                    MorselTime::Unit => Some((unit_ns, unit_cpu_ns)),
+                    MorselTime::Given { wall_ns, cpu_ns } => Some((wall_ns, cpu_ns)),
+                    MorselTime::Untimed => None,
+                };
+                if let Some((wall_ns, cpu_ns)) = timed {
+                    crate::learning::settle(
+                        shared,
+                        stage_ix,
+                        taken.learn.as_ref(),
+                        crate::learning::Measured {
+                            rows_in: taken.rows_in,
+                            bytes_in: taken.bytes_in,
+                            wall_ns,
+                            cpu_ns,
+                            rows_out: rows,
+                            bytes_out: bytes,
+                        },
+                    );
+                }
+                gave.push((morsel.seq, taken, rows, bytes, tier_out));
+            }
+            if push_error.is_none() {
+                // A unit that completed no morsel still kept its worker busy.
                 entry.tasks.fetch_add(1, Ordering::SeqCst);
-                entry
-                    .busy_ns
-                    .fetch_add(t1.saturating_sub(t0), Ordering::SeqCst);
-                crate::learning::settle(
-                    shared,
-                    stage_ix,
-                    learn,
-                    crate::learning::Measured {
-                        rows_in,
-                        bytes_in,
-                        wall_ns: t1.saturating_sub(t0),
-                        cpu_ns: c1.saturating_sub(c0),
-                        rows_out,
-                        bytes_out,
-                    },
-                );
+                entry.busy_ns.fetch_add(unit_ns, Ordering::SeqCst);
             }
         }
         Applied::Failed(e) => {
@@ -684,52 +734,50 @@ pub(crate) fn run_task(
     }
 
     let q_after = tier_totals(&shared.placement_stats());
-    let mut record = build_record(
-        shared,
-        RecordInput {
-            seq,
-            stage,
-            worker,
-            instance: instance_index,
-            t0,
-            t1,
-            rows_in,
-            bytes_in,
-            rows_out,
-            bytes_out,
-            tier_in,
-            tier_out,
-            features: &features,
-            s0,
-            s1,
-            cpu_ns: c1.saturating_sub(c0),
-            q_before,
-            q_after,
-            miss_wait_us: wait_us,
-            state_bytes,
-            outcome: if failure.is_some() {
-                Outcome::Error
-            } else {
-                Outcome::Ok
+    let record_of = |seq: Seq,
+                     taken: &Taken,
+                     rows_out: u64,
+                     bytes_out: u64,
+                     tier_out: u8,
+                     outcome: Outcome,
+                     error: Option<String>| {
+        build_record(
+            shared,
+            RecordInput {
+                seq,
+                stage,
+                worker,
+                instance: instance_index,
+                t0,
+                t1,
+                rows_in: taken.rows_in,
+                bytes_in: taken.bytes_in,
+                rows_out,
+                bytes_out,
+                tier_in: taken.tier_in,
+                tier_out,
+                features: &taken.features,
+                s0,
+                s1,
+                cpu_ns: unit_cpu_ns,
+                q_before: q_before.clone(),
+                q_after: q_after.clone(),
+                miss_wait_us: wait_us,
+                state_bytes,
+                outcome,
+                error,
+                alloc,
             },
-            error,
-            alloc,
-        },
-    );
-
-    // f.8: a device out of memory is the one error that does not reach the policy first. Its
-    // record goes to the hook alone, so the trace still sees exactly one record per morsel and
-    // stage (SC-I4, TR-I2), and the controller shrinks the stage's device footprint inside it.
-    let device_oom = matches!(
-        failure,
-        Some(MorunaError::Alloc {
-            tier: Tier::Device(_),
-            ..
+        )
+    };
+    // SC-I4: one record per morsel and stage, when the stage gives the morsel (6.3m): its rows and
+    // bytes in as it was taken, its rows and bytes out as it was given.
+    let mut records: Vec<TraceRecord> = gave
+        .iter()
+        .map(|(seq, taken, rows, bytes, tier_out)| {
+            record_of(*seq, taken, *rows, *bytes, *tier_out, Outcome::Ok, None)
         })
-    );
-    if device_oom && let Some(hook) = shared.record_hook() {
-        hook(&record);
-    }
+        .collect();
 
     // A probe's record says it was the probe only when its apply succeeded. A probe that failed
     // keeps the outcome the error policy gave it (`Error`, `Skip`), so the run report counts the
@@ -738,16 +786,45 @@ pub(crate) fn run_task(
     // microkernel, 2026-11-15).
     let probed = probing && failure.is_none();
     if let Some(e) = failure {
+        // A failed unit's record is its own morsel's, under its own number.
+        let own = Taken {
+            rows_in,
+            bytes_in,
+            tier_in,
+            features,
+            origin,
+            learn: None,
+        };
+        let mut record = record_of(seq, &own, 0, 0, tier_in, Outcome::Error, error);
+        // f.8: a device out of memory is the one error that does not reach the policy first.
+        // Its record goes to the hook alone, so the trace still sees exactly one record per
+        // morsel and stage (SC-I4, TR-I2), and the controller shrinks the stage's device
+        // footprint inside it.
+        let device_oom = matches!(
+            e,
+            MorunaError::Alloc {
+                tier: Tier::Device(_),
+                ..
+            }
+        );
+        if device_oom && let Some(hook) = shared.record_hook() {
+            hook(&record);
+        }
         entry.errors.fetch_add(1, Ordering::SeqCst);
         record.outcome = crate::policy::apply_policy(shared, stage_ix, input, seq_in, e);
+        records.push(record);
     }
     if probed {
-        record.outcome = Outcome::Probe;
+        for record in &mut records {
+            record.outcome = Outcome::Probe;
+        }
     }
 
     entry.running.fetch_sub(1, Ordering::SeqCst);
     drop(slot);
-    emit(shared, record);
+    for record in records {
+        emit(shared, record);
+    }
 
     if let Some(e) = push_error {
         return Err(e);
@@ -759,11 +836,49 @@ pub(crate) fn run_task(
             bytes_out,
             peak_delta: s1.peak_anon_bytes.saturating_sub(s0.anon_bytes),
             dev_peak_delta: s1.device_used[0].saturating_sub(s0.device_used[0]),
-            wall_ns: t1.saturating_sub(t0),
-            cpu_ns: c1.saturating_sub(c0),
+            wall_ns: unit_ns,
+            cpu_ns: unit_cpu_ns,
         }));
     }
     Ok(None)
+}
+
+/// Each morsel a unit gave, with what it brought in (item 6.3m): the unit's own, morsel `seq`,
+/// as `own` says it was taken; another as the unit that took it kept it in the stage's open
+/// morsels. The unit's own, when the unit did not give it, is kept there for the unit that
+/// does. A number the stage was not given, or gave already, fails the unit as a kernel error.
+fn resolve(
+    entry: &crate::shared::StageEntry,
+    completed: Vec<Completed>,
+    seq: Seq,
+    own: impl FnOnce() -> Taken,
+) -> Result<Vec<(Completed, Taken)>> {
+    let mut own = Some(own);
+    let mut open = None;
+    let mut given = Vec::with_capacity(completed.len());
+    for morsel in completed {
+        let taken = match own.take_if(|_| morsel.seq == seq) {
+            Some(own) => own(),
+            None => open
+                .get_or_insert_with(|| entry.open.lock().unwrap_or_else(|e| e.into_inner()))
+                .remove(&morsel.seq)
+                .ok_or_else(|| MorunaError::Kernel {
+                    stage: entry.stage,
+                    seq,
+                    msg: format!(
+                        "it gave morsel {}, which the stage was not given or has given already",
+                        morsel.seq
+                    ),
+                    features: None,
+                })?,
+        };
+        given.push((morsel, taken));
+    }
+    if let Some(own) = own {
+        open.get_or_insert_with(|| entry.open.lock().unwrap_or_else(|e| e.into_inner()))
+            .insert(seq, own());
+    }
+    Ok(given)
 }
 
 /// CT-I10: the diagnostic names the morsel, its stage and its features.

@@ -61,8 +61,9 @@ pub use graph::{Affine, Consumer, Link, MAX_PATHS, Produced, Producer, Topology}
 pub use held::Held;
 pub use ids::{ALIGNMENT, DeviceId, LOCAL_NODE, NodeId, RunId, Seq, SplitId, StageId};
 pub use kernel::{
-    AllocCounts, GilState, InitCtx, Kernel, KernelAlloc, KernelHints, KernelKind, KernelState,
-    LogicalRows, LogicalTaskRows, NoState, ResumePolicy, set_kernel_alloc, take_kernel_alloc,
+    AllocCounts, Completed, GilState, InitCtx, Kernel, KernelAlloc, KernelHints, KernelKind,
+    KernelState, LogicalRows, LogicalTaskRows, MorselTime, NoState, ResumePolicy, set_kernel_alloc,
+    take_kernel_alloc,
 };
 pub use knobs::{
     CancelToken, ErrorPolicy, Knob, KnobSnapshot, Knobs, ProbeResult, Prober, RecordHook,

@@ -57,6 +57,10 @@ mod sc_p_dealt_instances;
 mod sc_p_instances_wait_for_a_warm_up;
 // Item 3.1: a native stage of eight ring tasks under a memory bound.
 mod sc_p_native_stage_memory;
+// Item 6.3m: what the engine learns of a function from one unit is that unit's own morsel.
+mod sc_p_a_unit_is_a_morsel;
+// Item 6.3m, decided: a morsel given later is pushed, recorded and learned under its own number.
+mod sc_p_a_morsel_given_later;
 mod sc_t5_knobs_immediate;
 mod sc_t6_instance_affinity;
 mod sc_t7_error_policies;

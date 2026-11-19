@@ -15,9 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use moruna_job::{ArrowField, ArrowSchema};
 use moruna_kernel::arrow::datatypes::Schema;
 use moruna_kernel::{
-    Allocator, BoxFuture, Declared, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind,
-    KernelState, LogicalRows, LogicalTaskRows, MorunaError, Payload, PayloadSpec, Result, RowRange,
-    Source, SourceSchema, Split, Tier,
+    Allocator, BoxFuture, Completed, Declared, Fingerprint, InitCtx, Kernel, KernelHints,
+    KernelKind, KernelState, LogicalRows, LogicalTaskRows, MorunaError, Payload, PayloadSpec,
+    Result, RowRange, Seq, Source, SourceSchema, Split, Tier,
 };
 
 /// Which of a task's outputs is being checked.
@@ -171,6 +171,25 @@ impl GuardedKernel {
     pub fn wrap(inner: Arc<dyn Kernel>, guard: Arc<GivesGuard>) -> Arc<dyn Kernel> {
         Arc::new(GuardedKernel { inner, guard })
     }
+
+    /// Every morsel's output checked, in the order given, as `produced` says of its number.
+    fn checked(
+        &self,
+        given: Vec<Completed>,
+        produced: impl Fn(Seq) -> Produced,
+    ) -> Result<Vec<Completed>> {
+        given
+            .into_iter()
+            .map(|morsel| {
+                Ok(Completed {
+                    output: self
+                        .guard
+                        .check_payload(produced(morsel.seq), morsel.output)?,
+                    ..morsel
+                })
+            })
+            .collect()
+    }
 }
 
 impl Kernel for GuardedKernel {
@@ -218,6 +237,28 @@ impl Kernel for GuardedKernel {
             Some(out) => self.guard.check_payload(Produced::Final, out).map(Some),
             None => Ok(None),
         }
+    }
+    // 6.3m: a pipelined kernel's morsels, each checked as a batch it produced.
+    fn apply_morsels(
+        &self,
+        state: &mut dyn KernelState,
+        input: Payload,
+        seq: Seq,
+    ) -> Result<Vec<Completed>> {
+        let given = self.inner.apply_morsels(state, input, seq)?;
+        self.checked(given, |_| Produced::Batch)
+    }
+    /// A morsel the stage was given is a batch it produced; what it gives of its own, at or past
+    /// `after`, is its completion output.
+    fn finish_morsels(&self, state: &mut dyn KernelState, after: Seq) -> Result<Vec<Completed>> {
+        let given = self.inner.finish_morsels(state, after)?;
+        self.checked(given, |seq| {
+            if seq >= after {
+                Produced::Final
+            } else {
+                Produced::Batch
+            }
+        })
     }
     fn max_inputs(&self) -> u16 {
         self.inner.max_inputs()
@@ -541,6 +582,66 @@ mod tests {
         };
         assert!(k.init(&ctx).is_ok());
         assert!(k.restore(&ctx, b"").is_err());
+    }
+
+    /// A pipelined kernel that gives at its end a morsel it was given and one of its own.
+    struct Ending;
+    impl Kernel for Ending {
+        fn fingerprint(&self) -> Fingerprint {
+            Fingerprint::compute("ending", b"")
+        }
+        fn kind(&self) -> KernelKind {
+            KernelKind::Stateless
+        }
+        fn accepts(&self) -> PayloadSpec {
+            PayloadSpec {
+                kind: moruna_kernel::PayloadKind::Table,
+                tier: moruna_kernel::TierPref::Host,
+            }
+        }
+        fn output_schema(&self, input: &SourceSchema) -> Result<SourceSchema> {
+            Ok(input.clone())
+        }
+        fn init(&self, _: &InitCtx) -> Result<Box<dyn KernelState>> {
+            Ok(Box::new(moruna_kernel::NoState))
+        }
+        fn apply(&self, _: &mut dyn KernelState, input: Payload) -> Result<Payload> {
+            Ok(input)
+        }
+        fn finish_morsels(&self, _: &mut dyn KernelState, after: Seq) -> Result<Vec<Completed>> {
+            Ok(vec![
+                Completed::unit(after - 1, good_batch()),
+                Completed::unit(after, bad_batch()),
+            ])
+        }
+    }
+
+    #[test]
+    fn a_guarded_kernel_checks_each_morsel_a_kernel_gives() {
+        // 6.3m: each morsel's output is checked as the batch it is.
+        let g = guard();
+        let k = GuardedKernel::wrap(
+            Scripted::scripted(vec![good_batch(), bad_batch()], Some(bad_batch())),
+            g.clone(),
+        );
+        let mut state = moruna_kernel::NoState;
+        let given = k.apply_morsels(&mut state, good_batch(), 5).unwrap();
+        assert_eq!((given.len(), given[0].seq), (1, 5));
+        let e = k
+            .apply_morsels(&mut state, good_batch(), 6)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("its batch 2"), "{e}");
+        let e = k.finish_morsels(&mut state, 9).unwrap_err().to_string();
+        assert!(e.contains("its final output"), "{e}");
+        assert!(k.finish_morsels(&mut state, 9).unwrap().is_empty());
+        // A morsel the stage was given and gives at its end is a batch; one past every input
+        // number is the final output.
+        let g = guard();
+        let k = GuardedKernel::wrap(Arc::new(Ending), g.clone());
+        let e = k.finish_morsels(&mut state, 9).unwrap_err().to_string();
+        assert!(e.contains("its final output"), "{e}");
+        assert_eq!(g.checked(), 1, "morsel 8 passed as a batch");
     }
 
     #[test]

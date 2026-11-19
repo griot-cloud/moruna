@@ -25,13 +25,15 @@
 //! The stage here is a model of the kernel's, which compiles for the kernel alone: it follows
 //! `pipelined` step by step with the rules `layout` gives both ([`layout::cut`],
 //! [`layout::to_post`], [`layout::answers_whole`], [`layout::waits_for_answer`],
-//! [`layout::ring_sizes`]), over a task that answers a piece when it is waited for and not
-//! before, as a function slower than the engine does. Everything else is real: the Parquet
-//! source, the arena, the scheduler and its probe, the controller and its report.
+//! [`layout::ring_sizes`], [`layout::Morsels`]), over a task that answers a piece when it is
+//! waited for and not before, as a function slower than the engine does. Everything else is
+//! real: the Parquet source, the arena, the scheduler and its probe, the controller and its
+//! report, the trace and the cost model's store.
 //!
-//! A unit of such a stage is still not self-contained after its first: what a later unit gives
-//! is other morsels' answers. The test prints what each reader of single units gets on this
-//! run, against the function's own figure (see `per_unit_readers`).
+//! A later unit of such a stage gives what has come, which is other morsels' answers. 6.3m: an
+//! answer belongs to its morsel. The stage gives a morsel whole, under its own number, once
+//! its last answer has come, and every reader takes the morsels given, not the units. The test
+//! reads what each reader got on this run against the function's own figure (see `readers`).
 
 #![allow(clippy::result_large_err)]
 
@@ -44,12 +46,16 @@ use std::sync::{Arc, Mutex};
 use arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use moruna_cost::{ObservationSource, Target};
 use moruna_kernel::{
-    Allocator, CancelToken, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState,
-    MorunaError, Payload, PayloadKind, PayloadSpec, SourceSchema, Tier, TierPref,
+    Allocator, CancelToken, Completed, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind,
+    KernelState, MorunaError, Payload, PayloadKind, PayloadSpec, SourceSchema, Tier, TierPref,
+    TraceRecord, TraceSink, TraceTail,
 };
 use moruna_micro::layout;
-use moruna_runtime::{RunSpec, Runtime, SinkSpec, SourceSpec};
+use moruna_runtime::cost::{CostSettings, RunLearning, StageCost};
+use moruna_runtime::{Components, RunSpec, Runtime, SinkSpec, SourceSpec};
+use moruna_testkit::FakeTrace;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -103,17 +109,16 @@ fn write_input(path: &Path, rows: usize) {
     writer.close().expect("the footer is written");
 }
 
-/// What one unit of the stage took and gave, as the engine's worker counts it.
+/// What one unit of the stage took and gave.
 #[derive(Clone, Copy, Debug)]
 struct Unit {
     /// The pieces its morsel was cut into.
     pieces: usize,
     rows_in: usize,
+    /// The rows of the morsels it gave, whole, each under its own number.
     rows_out: usize,
-    /// Of the rows it gave, those that answer its own morsel.
+    /// Of those, its own morsel's.
     own_rows: usize,
-    bytes_in: u64,
-    bytes_out: u64,
 }
 
 /// A ring stage as the kernel's image task makes one, of one task, whose function gives its
@@ -124,20 +129,17 @@ struct RingStage {
     units: Arc<Mutex<Vec<Unit>>>,
 }
 
-/// A piece, or its answer, and the unit whose morsel it is of.
-type Of = (usize, RecordBatch);
-
-/// The stage's task state: `TaskState`'s `queued`, `in_flight`, `ready`, `schema` and `whole`.
+/// The stage's task state: `TaskState`'s `queued`, `in_flight`, `morsels`, `done`, `schema` and
+/// `whole`.
 struct Ring {
     alloc: Arc<dyn Allocator>,
-    /// Units applied so far.
-    units: usize,
     /// Pieces given to the stage and not yet posted to the task.
-    queued: VecDeque<Of>,
+    queued: VecDeque<RecordBatch>,
     /// Pieces posted and not answered, oldest first: the task's region holds a copy of each.
-    in_flight: VecDeque<Of>,
-    /// Answers taken and not yet given.
-    ready: VecDeque<Of>,
+    in_flight: VecDeque<RecordBatch>,
+    /// The morsels given and not answered in full (6.3m), and those answered whole, not given.
+    morsels: layout::Morsels<RecordBatch>,
+    done: VecDeque<layout::Answered<RecordBatch>>,
     /// The task's answers' schema, once its first has come.
     schema: Option<SchemaRef>,
     /// The unit under way answers its whole morsel.
@@ -205,7 +207,7 @@ impl Ring {
     /// nothing of its morsel past the unit.
     fn feed(&mut self) -> moruna_kernel::Result<()> {
         for _ in 0..layout::to_post(self.in_flight.len(), self.queued.len()) {
-            let Some((unit, part)) = self.queued.pop_front() else {
+            let Some(part) = self.queued.pop_front() else {
                 break;
             };
             let columns = (0..part.num_columns())
@@ -216,18 +218,21 @@ impl Ring {
                 .collect::<moruna_kernel::Result<Vec<ArrayRef>>>()?;
             let posted = RecordBatch::try_new(part.schema(), columns)
                 .map_err(|e| kernel_error(format!("posting a piece: {e}")))?;
-            self.in_flight.push_back((unit, posted));
+            self.in_flight.push_back(posted);
         }
         Ok(())
     }
 
-    /// `TaskState::take_oldest`: the answer to the oldest piece in flight, waited for, onto
-    /// `ready`. The function runs here: its piece's columns, and their first two added.
+    /// `TaskState::take_oldest` and `TaskState::took`: the answer to the oldest piece in flight,
+    /// waited for, to its morsel. The function runs here: its piece's columns, and their first
+    /// two added. Its task stamps the piece's function time on its answer, as a ring task will
+    /// (item 6.3z); the kernel's own reports none yet, so its morsels give the cost model nothing.
     fn take_oldest(&mut self) -> moruna_kernel::Result<()> {
-        let (unit, piece) = self
+        let piece = self
             .in_flight
             .pop_front()
             .ok_or_else(|| kernel_error("no piece in flight".to_string()))?;
+        let started = std::time::Instant::now();
         let total: Vec<i64> = int64(&piece, 0)?
             .values()
             .iter()
@@ -239,28 +244,32 @@ impl Ring {
         let schema = Arc::new(Schema::new(output_fields(&piece.schema())));
         let answer = RecordBatch::try_new(schema, columns)
             .map_err(|e| kernel_error(format!("the function's answer: {e}")))?;
+        let ns = started.elapsed().as_nanos() as u64;
         self.schema.get_or_insert_with(|| answer.schema());
-        self.ready.push_back((unit, answer));
+        if let Some(whole) = self
+            .morsels
+            .answer(answer, Some((ns, ns)))
+            .map_err(|why| kernel_error(why.to_string()))?
+        {
+            self.done.push_back(whole);
+        }
         Ok(())
     }
 
-    /// The answers taken and not given, as one batch (`TaskState::join_ready`), and how many
-    /// of its rows answer unit `unit`'s morsel.
-    fn give(&mut self, unit: usize) -> moruna_kernel::Result<Option<(RecordBatch, usize)>> {
-        let ready: Vec<Of> = std::mem::take(&mut self.ready).into();
-        let own = ready
-            .iter()
-            .filter(|(of, _)| *of == unit)
-            .map(|(_, answer)| answer.num_rows())
-            .sum();
-        let mut answers: Vec<RecordBatch> = ready.into_iter().map(|(_, answer)| answer).collect();
-        match answers.len() {
-            0 => Ok(None),
-            1 => Ok(answers.pop().map(|answer| (answer, own))),
-            _ => concat_batches(&answers[0].schema(), &answers)
-                .map(|joined| Some((joined, own)))
-                .map_err(|e| kernel_error(format!("joining answers: {e}"))),
-        }
+    /// `TaskState::give`: each morsel answered whole, its answers joined, under its number.
+    fn give(&mut self) -> moruna_kernel::Result<Vec<Completed>> {
+        self.done
+            .drain(..)
+            .map(|whole| {
+                let joined = concat_batches(&whole.answers[0].schema(), &whole.answers)
+                    .map_err(|e| kernel_error(format!("joining a morsel's answers: {e}")))?;
+                Ok(Completed {
+                    seq: whole.seq,
+                    output: Payload::Table(joined, Tier::Host),
+                    time: whole.time,
+                })
+            })
+            .collect()
     }
 }
 
@@ -304,18 +313,28 @@ impl Kernel for RingStage {
     fn init(&self, ctx: &InitCtx) -> moruna_kernel::Result<Box<dyn KernelState>> {
         Ok(Box::new(Ring {
             alloc: ctx.alloc.clone(),
-            units: 0,
             queued: VecDeque::new(),
             in_flight: VecDeque::new(),
-            ready: VecDeque::new(),
+            morsels: layout::Morsels::new(),
+            done: VecDeque::new(),
             schema: None,
             whole: false,
         }))
     }
 
+    /// The scheduler gives a stage of one input its morsels (`apply_morsels`).
+    fn apply(&self, _: &mut dyn KernelState, _: Payload) -> moruna_kernel::Result<Payload> {
+        Err(kernel_error("a ring stage gives morsels".to_string()))
+    }
+
     /// `TaskState::pipelined`, with a task that has answered nothing it was not waited for:
     /// what `gather` finds is nothing, so no answer `came` between two looks.
-    fn apply(&self, state: &mut dyn KernelState, input: Payload) -> moruna_kernel::Result<Payload> {
+    fn apply_morsels(
+        &self,
+        state: &mut dyn KernelState,
+        input: Payload,
+        seq: moruna_kernel::Seq,
+    ) -> moruna_kernel::Result<Vec<Completed>> {
         let st = state
             .as_any_mut()
             .downcast_mut::<Ring>()
@@ -323,15 +342,13 @@ impl Kernel for RingStage {
         let Payload::Table(batch, _) = &input else {
             return Err(kernel_error("the stage takes tables".to_string()));
         };
-        let unit = st.units;
-        st.units += 1;
         let pieces = st.pieces(batch, self.piece)?;
         let cut = pieces.len();
-        st.queued
-            .extend(pieces.into_iter().map(|piece| (unit, piece)));
+        st.morsels.open(seq, cut);
+        st.queued.extend(pieces);
         st.whole = layout::answers_whole(st.schema.is_some());
         st.feed()?;
-        if st.schema.is_none() && st.ready.is_empty() {
+        if st.schema.is_none() {
             st.take_oldest()?;
             st.feed()?;
         }
@@ -347,36 +364,26 @@ impl Kernel for RingStage {
             }
         }
         st.whole = false;
-        let (answer, own_rows) = match st.give(unit)? {
-            Some(given) => given,
-            // No answer has come: a batch of no rows, and the answers come with a later one.
-            None => (
-                RecordBatch::new_empty(
-                    st.schema
-                        .clone()
-                        .ok_or_else(|| kernel_error("no answer's schema yet".to_string()))?,
-                ),
-                0,
-            ),
-        };
-        let (rows_in, rows_out, bytes_in) = (batch.num_rows(), answer.num_rows(), input.bytes());
-        let answer = Payload::Table(answer, Tier::Host);
+        let given = st.give()?;
+        let rows = |c: &Completed| c.output.rows() as usize;
         self.units
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(Unit {
                 pieces: cut,
-                rows_in,
-                rows_out,
-                own_rows,
-                bytes_in,
-                bytes_out: answer.bytes(),
+                rows_in: batch.num_rows(),
+                rows_out: given.iter().map(rows).sum(),
+                own_rows: given.iter().filter(|c| c.seq == seq).map(rows).sum(),
             });
-        Ok(answer)
+        Ok(given)
     }
 
-    /// `ImageTask::finish`: every answer still in flight, joined.
-    fn finish(&self, state: &mut dyn KernelState) -> moruna_kernel::Result<Option<Payload>> {
+    /// `ImageTask::finish_morsels`: every morsel still open, answered whole.
+    fn finish_morsels(
+        &self,
+        state: &mut dyn KernelState,
+        _after: moruna_kernel::Seq,
+    ) -> moruna_kernel::Result<Vec<Completed>> {
         let st = state
             .as_any_mut()
             .downcast_mut::<Ring>()
@@ -388,9 +395,7 @@ impl Kernel for RingStage {
             }
             st.take_oldest()?;
         }
-        Ok(st
-            .give(usize::MAX)?
-            .map(|(rest, _)| Payload::Table(rest, Tier::Host)))
+        st.give()
     }
 }
 
@@ -407,76 +412,76 @@ fn amplification(notes: &[String]) -> f64 {
         .unwrap_or_else(|| panic!("a figure in `{note}`"))
 }
 
-/// What each reader of single units gets on this run, printed against the function's own
-/// figure `real` (its bytes out over its bytes in, over the run). After its first, a unit of a
-/// ring stage gives other morsels' answers, so these are not the function's: they are what
-/// the engine's worker hands, unit by unit, to
-/// - the stage's learned growth (`moruna-scheduler`, `StageEntry::learn_growth`: the largest
-///   bytes out over bytes in of any one unit, by which reads are cut),
-/// - the trace's record of each morsel (its rows and bytes out beside its rows and bytes in),
-/// - the cost model's observation of each unit (`learning::settle`: bytes out and rows out for
-///   a unit's bytes in and rows in).
-fn per_unit_readers(units: &[Unit], real: f64) {
-    let ratio = |u: &Unit| u.bytes_out as f64 / u.bytes_in as f64;
+/// What each reader of the stage's morsels got on this run, against the function's own figure
+/// `real` (its bytes out over its bytes in, over the run), each as the engine handed it:
+/// - the trace's record of each morsel (its rows and bytes out beside its rows and bytes in);
+/// - the stage's learned growth (`moruna-scheduler`, `StageEntry::learn_growth`, by which reads
+///   are cut): the most bytes out over bytes in of any morsel given, which the scheduler learns
+///   from the same pair it records, so it is the most of the records';
+/// - the cost model's observation of each morsel (`learning::settle`), as its store kept it.
+///
+/// Each must be the function's (item 6.3m). The trace's records are printed with the units
+/// that gave them.
+fn readers(units: &[Unit], records: &[TraceRecord], observed: &[(f64, f64)], real: f64) {
     for (n, u) in units.iter().enumerate() {
         eprintln!(
-            "  unit {n}: {} pieces, {} rows in, {} rows out ({} of them its own), {:.2} bytes \
-             out a byte in",
-            u.pieces,
-            u.rows_in,
-            u.rows_out,
-            u.own_rows,
-            ratio(u)
+            "  unit {n}: {} pieces, {} rows in, gave {} rows of whole morsels ({} of them its own)",
+            u.pieces, u.rows_in, u.rows_out, u.own_rows
         );
     }
-    let growth = units.iter().map(ratio).fold(0.0, f64::max);
-    eprintln!(
-        "learned growth (the most any one unit gave over what it took): {growth:.2}, where the \
-         function's is {real:.2}: {:.1} times it",
-        growth / real
-    );
-    let own = units
-        .iter()
-        .filter(|u| u.own_rows == u.rows_out && u.rows_out > 0)
-        .count();
-    let none = units.iter().filter(|u| u.rows_out == 0).count();
-    let mut ratios: Vec<f64> = units.iter().map(ratio).collect();
+    let ratio = |r: &TraceRecord| r.bytes_out as f64 / r.bytes_in as f64;
+    let mut ratios: Vec<f64> = records.iter().map(ratio).collect();
     ratios.sort_by(f64::total_cmp);
+    let growth = ratios[ratios.len() - 1];
     eprintln!(
-        "the trace's record of a morsel: {own} of {} units gave their own morsel's answer and \
-         nothing else, {none} gave no rows, {} gave another morsel's; a record's bytes out over \
-         its bytes in runs from {:.2} to {:.2}, median {:.2}, where the function's is {real:.2}",
-        units.len(),
-        units.len() - own - none,
+        "the trace's records of {} morsels: bytes out over bytes in from {:.3} to {:.3}, where \
+         the function's is {real:.3}; learned growth {growth:.3}",
+        records.len(),
         ratios[0],
-        ratios[ratios.len() - 1],
-        ratios[ratios.len() / 2]
+        growth
     );
-    // The line through the origin that fits the units' (bytes in, bytes out) best, which is
-    // what a model of one unit learns of the function, and how far each unit lies from the
-    // function's own line.
-    let (xy, xx) = units.iter().fold((0.0, 0.0), |(xy, xx), u| {
-        let (x, y) = (u.bytes_in as f64, u.bytes_out as f64);
-        (xy + x * y, xx + x * x)
-    });
-    let mut off: Vec<f64> = units
+    let wrong: Vec<String> = records
         .iter()
-        .map(|u| (u.bytes_out as f64 - real * u.bytes_in as f64).abs() / (real * u.bytes_in as f64))
+        .filter(|r| (ratio(r) - real).abs() > 0.01 || r.rows_out != r.rows_in)
+        .map(|r| {
+            format!(
+                "morsel {}: {} rows in, {} out, {:.3}",
+                r.seq,
+                r.rows_in,
+                r.rows_out,
+                ratio(r)
+            )
+        })
         .collect();
-    off.sort_by(f64::total_cmp);
+    assert!(
+        wrong.is_empty(),
+        "every morsel's record is the function's: {wrong:?}"
+    );
+    assert!(
+        (growth - real).abs() < 0.01,
+        "the stage's learned growth is {growth:.3}, where the function's is {real:.3}"
+    );
+    // The line through the origin that fits the cost model's (bytes in, bytes out) best, and
+    // how far each lies from the function's own.
+    let (xy, xx) = observed
+        .iter()
+        .fold((0.0, 0.0), |(xy, xx), (x, y)| (xy + x * y, xx + x * x));
+    let fitted = xy / xx;
+    let off = observed
+        .iter()
+        .map(|(x, y)| (y / x - real).abs())
+        .fold(0.0, f64::max);
     eprintln!(
-        "the cost model's units: fitted through them, bytes out are {:.2} times bytes in, where \
-         the function's are {real:.2}; a unit's bytes out are off its own morsel's by {:.0}% at \
-         the median and {:.0}% at the most; their sum is {:.2} of the stage's bytes out, the \
-         rest given at the stage's end",
-        xy / xx,
-        100.0 * off[off.len() / 2],
-        100.0 * off[off.len() - 1],
-        units.iter().map(|u| u.bytes_out).sum::<u64>() as f64
-            / (real * units.iter().map(|u| u.bytes_in).sum::<u64>() as f64)
+        "the cost model's {} morsels: fitted, bytes out are {fitted:.3} times bytes in, each \
+         within {off:.3} of the function's {real:.3}",
+        observed.len()
+    );
+    assert!(
+        (fitted - real).abs() < 0.01 && off < 0.01,
+        "the cost model learns the function's out/in: fitted {fitted:.3}, the farthest off by \
+         {off:.3}, where it is {real:.3}"
     );
 }
-
 #[test]
 fn a_ring_stage_s_amplification_is_its_function_s_output_over_its_input() {
     let _serial = one_run_at_a_time();
@@ -533,7 +538,28 @@ fn a_ring_stage_s_amplification_is_its_function_s_output_over_its_input() {
     spec.profiles_dir = Some(scratch.path().join("profiles"));
     std::fs::create_dir_all(scratch.path().join("staging")).expect("the staging directory");
 
-    let report = match Runtime::run(spec, CancelToken::new()) {
+    // The run's trace, and a store for what its cost model learns.
+    let trace = Arc::new(FakeTrace::new().capacity(1 << 16));
+    let observations = scratch.path().join("observations");
+    let learning = RunLearning {
+        online: CostSettings::directory(&observations)
+            .open_online()
+            .expect("the store opens for the run"),
+        stages: vec![StageCost {
+            kind: "ring".into(),
+            settings: moruna_cost::Digest([0; 32]),
+            fingerprint: None,
+        }],
+    };
+    let components = Components {
+        trace: Some((
+            trace.clone() as Arc<dyn TraceSink>,
+            trace.clone() as Arc<dyn TraceTail>,
+        )),
+        learning: Some(learning),
+        ..Components::default()
+    };
+    let report = match Runtime::run_with(spec, CancelToken::new(), components) {
         Ok(report) => report,
         Err(error) => panic!(
             "the run did not complete: {error}; notes: {:?}",
@@ -547,18 +573,20 @@ fn a_ring_stage_s_amplification_is_its_function_s_output_over_its_input() {
         rows as u64,
         "every row is written"
     );
-    let totals = report
-        .stages
+    // The stage's totals over the run, from its records (the run's own trace is the test's).
+    let all: Vec<TraceRecord> = trace
+        .records()
+        .into_iter()
+        .filter(|r| r.stage == 1)
+        .collect();
+    let (bytes_in, bytes_out) = all
         .iter()
-        .find(|s| s.stage == 1)
-        .expect("the stage's totals");
-    let real = totals.bytes_out as f64 / totals.bytes_in as f64;
+        .fold((0, 0), |(i, o), r| (i + r.bytes_in, o + r.bytes_out));
+    let real = bytes_out as f64 / bytes_in as f64;
     assert!(
         (real - 1.17).abs() < 0.01,
-        "the function's output is 1.17 times its input over the run: {} bytes out for {} in, \
-         {real:.2}",
-        totals.bytes_out,
-        totals.bytes_in
+        "the function's output is 1.17 times its input over the run: {bytes_out} bytes out for \
+         {bytes_in} in, {real:.2}"
     );
 
     // The probe is the stage's first unit: two pieces, as on run 3's node.
@@ -569,7 +597,40 @@ fn a_ring_stage_s_amplification_is_its_function_s_output_over_its_input() {
         "the probe's morsel of {} rows is two pieces of at most {piece} bytes",
         probe.rows_in
     );
-    per_unit_readers(&units, real);
+    // The stage's morsels, each once, as their records say: every one taken has one.
+    let mut records: Vec<TraceRecord> = all.into_iter().filter(|r| r.rows_in > 0).collect();
+    records.sort_by_key(|r| r.seq);
+    let mut seqs: Vec<u64> = records.iter().map(|r| r.seq).collect();
+    seqs.dedup();
+    assert_eq!(seqs.len(), records.len(), "a record a morsel");
+    assert_eq!(
+        (
+            records.iter().map(|r| r.rows_in).sum::<u64>(),
+            records.iter().map(|r| r.rows_out).sum::<u64>()
+        ),
+        (rows as u64, rows as u64),
+        "every row in a morsel's record, in and out"
+    );
+    let store = moruna_cost::LocalStore::open(&observations).expect("the store opens");
+    let mut observed = Vec::new();
+    store
+        .scan_all(&mut |history| {
+            observed.extend(history.observations.iter().filter_map(|o| {
+                Some((
+                    o.inputs.data.bytes? as f64,
+                    o.outcome.get(Target::BytesOut)?,
+                ))
+            }));
+            Ok(())
+        })
+        .expect("the store scans");
+    assert!(
+        observed.len() + 1 >= records.len(),
+        "a cost-model observation for every morsel but the probe's: {} of {}",
+        observed.len(),
+        records.len()
+    );
+    readers(&units, &records, &observed, real);
 
     let measured = amplification(&report.notes);
     assert!(
@@ -584,6 +645,6 @@ fn a_ring_stage_s_amplification_is_its_function_s_output_over_its_input() {
     assert_eq!(
         (probe.rows_out, probe.own_rows),
         (probe.rows_in, probe.rows_in),
-        "the stage's first unit answers its whole morsel"
+        "the stage's first unit answers its whole morsel, and gives nothing else"
     );
 }

@@ -53,9 +53,9 @@ use moruna_adapters::{UNKNOWN_SEQ, UNKNOWN_STAGE};
 use moruna_kernel::arrow::buffer::Buffer as ArrowBuffer;
 use moruna_kernel::ports::Answer as PortAnswer;
 use moruna_kernel::{
-    Allocator, CancelToken, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind, KernelState,
-    MorunaError, OutputSink, Payload, PayloadKind, PayloadSpec, Result, RunPorts, SourceSchema,
-    StageId, StagePorts, Stream as OutStream, TierPref,
+    Allocator, CancelToken, Completed, Fingerprint, InitCtx, Kernel, KernelHints, KernelKind,
+    KernelState, MorunaError, OutputSink, Payload, PayloadKind, PayloadSpec, Result, RunPorts, Seq,
+    SourceSchema, StageId, StagePorts, Stream as OutStream, TierPref,
 };
 use moruna_plane::kernel::Kernel as Calls;
 use moruna_plane::ringed::{Region, RingShape};
@@ -655,18 +655,23 @@ impl ImageTask {
     }
 
     /// Exchange one real checked record with an explicitly bounded reply window.
-    /// Caller must use managed_windows before exchanging nonzero reply capacities.
+    /// Caller must use managed_windows before exchanging nonzero reply capacities. In ring mode
+    /// the answer is every morsel the unit gave, joined, as before item 6.3m
+    /// ([`TaskState::one`]); the scheduler takes the morsels themselves
+    /// ([`Kernel::apply_morsels`]).
     pub fn exchange(
         &self,
         state: &mut dyn KernelState,
         input: Payload,
         reply_bytes: u64,
     ) -> Result<Payload> {
-        if reply_bytes != 0 && !self.managed_windows {
-            return Err(kernel_error(
-                "explicit replies require managed task windows".into(),
-            ));
-        }
+        let st = self.task_state(state)?;
+        let given = self.exchange_morsels(st, input, 0, reply_bytes)?;
+        st.one(given)
+    }
+
+    /// `state` as this stage's task state: one it made, of one of its tasks.
+    fn task_state<'a>(&self, state: &'a mut dyn KernelState) -> Result<&'a mut TaskState> {
         let st = state
             .as_any_mut()
             .downcast_mut::<TaskState>()
@@ -674,6 +679,25 @@ impl ImageTask {
         if !self.memory.iter().any(|m| Arc::ptr_eq(&st.memory, m)) {
             return Err(kernel_error(
                 "image: state belongs to another actual task owner".into(),
+            ));
+        }
+        Ok(st)
+    }
+
+    /// One unit, `input` being morsel `seq`'s: the morsels it completed (item 6.3m). In lockstep
+    /// the task answers the record before the unit returns, so the unit gives its own morsel,
+    /// timed as the unit; in ring mode the morsels whose last pieces were answered meanwhile
+    /// ([`TaskState::pipelined`]).
+    fn exchange_morsels(
+        &self,
+        st: &mut TaskState,
+        input: Payload,
+        seq: Seq,
+        reply_bytes: u64,
+    ) -> Result<Vec<Completed>> {
+        if reply_bytes != 0 && !self.managed_windows {
+            return Err(kernel_error(
+                "explicit replies require managed task windows".into(),
             ));
         }
         let Payload::Table(batch, _) = input else {
@@ -709,9 +733,9 @@ impl ImageTask {
         if st.rings {
             loop {
                 let answered = if st.instance == 0 && self.warming() {
-                    self.warm(st, &batch)
+                    self.warm(st, &batch, seq)
                 } else {
-                    st.pipelined(&batch, self.ports.get(), &self.port_names)
+                    st.pipelined(&batch, seq, self.ports.get(), &self.port_names)
                 };
                 match answered {
                     // A refusal of the run's arena is applied again as it is (RB5); a task that
@@ -741,7 +765,7 @@ impl ImageTask {
                 if !self.managed_windows && !st.rings {
                     st.grant(len)?;
                 }
-                Ok(out)
+                Ok(vec![Completed::unit(seq, out)])
             }
             Seen::Ended => {
                 let cause = format!(
@@ -895,7 +919,9 @@ impl ImageTask {
         let unanswered = st.unanswered()?;
         let posted = unanswered.len();
         let queued: Vec<_> = st.queued.drain(..).collect();
-        let ready = std::mem::take(&mut st.ready);
+        // Each morsel keeps its number: its pieces posted again are the same pieces, in order.
+        let morsels = std::mem::take(&mut st.morsels);
+        let done = std::mem::take(&mut st.done);
         let (applying, schema, instance) = (st.applying, st.schema.clone(), st.instance);
         let ctx = InitCtx {
             instance,
@@ -912,7 +938,8 @@ impl ImageTask {
             ))
         })?;
         fresh.queued = unanswered.into_iter().chain(queued).collect();
-        fresh.ready = ready;
+        fresh.morsels = morsels;
+        fresh.done = done;
         fresh.applying = applying;
         if fresh.schema.is_none() {
             fresh.schema = schema;
@@ -946,11 +973,13 @@ impl ImageTask {
     /// smallest first ([`layout::WARM_PIECES`], none past its plane's piece), each laid out and
     /// its answer taken before the next, so the account's peak after each answer is that
     /// piece's. A unit the run's arena refused goes on where it stopped, as a ring unit does.
+    /// Its pieces are morsel `seq`'s, which it gives whole under that number (6.3m).
     fn warm(
         &self,
         st: &mut TaskState,
         batch: &moruna_kernel::arrow::record_batch::RecordBatch,
-    ) -> Result<Payload> {
+        seq: Seq,
+    ) -> Result<Vec<Completed>> {
         let (ports, names) = (self.ports.get(), &self.port_names);
         let plane = layout::ring_sizes(st.plane.residency().budget).piece;
         if st.schema.is_none() {
@@ -960,7 +989,7 @@ impl ImageTask {
             let rows = batch.num_rows();
             let per_row = (st.record_len(batch)? / rows.max(1) as u64).max(1);
             let mut next = lock(&self.busy.warm).readings.len();
-            let mut at = 0;
+            let (mut at, mut cut) = (0, 0);
             while at < rows {
                 let size = layout::WARM_PIECES
                     .get(next)
@@ -971,15 +1000,17 @@ impl ImageTask {
                     .unwrap_or(usize::MAX)
                     .clamp(1, rows - at);
                 let pieces = st.pieces(&batch.slice(at, take), plane)?;
+                cut += pieces.len();
                 st.queued.extend(pieces);
                 at += take;
                 next += 1;
             }
+            st.morsels.open(seq, cut);
             st.applying = true;
         }
         if st.taking.is_some() {
             let answer = st.take_oldest(ports, names)?;
-            st.ready.push_back(answer);
+            st.took(answer)?;
             let laid = lock(&self.busy.warm).laid.take();
             if let Some(laid) = laid {
                 self.reading(st, laid);
@@ -1005,27 +1036,13 @@ impl ImageTask {
                 warm.laid = Some(laid);
             }
             let answer = st.take_oldest(ports, names)?;
-            st.ready.push_back(answer);
+            st.took(answer)?;
             lock(&self.busy.warm).laid = None;
             self.reading(st, laid);
         }
+        let given = st.give()?;
         st.applying = false;
-        match st.ready.len() {
-            0 => {
-                let schema = st.schema.clone().ok_or_else(|| {
-                    kernel_error(format!("image `{}`: no answer's schema yet", self.name))
-                })?;
-                Ok(Payload::Table(
-                    moruna_kernel::arrow::record_batch::RecordBatch::new_empty(schema),
-                    moruna_kernel::Tier::Host,
-                ))
-            }
-            1 => st
-                .ready
-                .pop_front()
-                .ok_or_else(|| kernel_error(format!("image `{}`: no answer", self.name))),
-            _ => st.join_ready(),
-        }
+        Ok(given)
     }
 
     /// One warm-up reading: the first task's account's peak after the answer to a piece of
@@ -1438,7 +1455,8 @@ impl ImageTask {
             queued: VecDeque::new(),
             applying: false,
             whole: false,
-            ready: VecDeque::new(),
+            morsels: layout::Morsels::new(),
+            done: VecDeque::new(),
             taking: None,
             counted: false,
             early: VecDeque::new(),
@@ -1512,9 +1530,13 @@ pub struct TaskState {
     /// first, which a probe is ([`layout::answers_whole`]). Kept across a refused unit, as
     /// `applying` is.
     whole: bool,
-    /// Ring mode: answers the unit under way has taken and not yet given, oldest first: kept
-    /// across a refused unit, given with the unit that completes.
-    ready: VecDeque<Payload>,
+    /// Ring mode: the morsels given to the task and not answered in full, each with its answers
+    /// so far (item 6.3m: an answer belongs to its morsel). Kept across a refused unit and a
+    /// restart: the pieces posted again are the same pieces, in the same order.
+    morsels: layout::Morsels<Payload>,
+    /// Ring mode: morsels answered whole and not yet given, oldest first: kept across a refused
+    /// unit, given with the unit that completes, each under its own number.
+    done: VecDeque<layout::Answered<Payload>>,
     /// Ring mode: the answer being taken when the run's arena refused one of its records.
     taking: Option<Taking>,
     /// Whether this task counts in the stage's busy tasks now.
@@ -1526,7 +1548,7 @@ pub struct TaskState {
     schema: Option<moruna_kernel::arrow::datatypes::SchemaRef>,
     /// The stage's gauge of busy tasks.
     busy: Arc<Busy>,
-    /// Answers the stage gave as batches of no rows, the answers coming later.
+    /// Units that completed no morsel, their morsels' answers coming later.
     deferred: u64,
     /// Which of the stage's tasks it is, and the CPU it was placed on.
     instance: usize,
@@ -2026,7 +2048,7 @@ impl TaskState {
                 .any(|seen| matches!(seen, Seen::Released(b) if *b == oldest))
         {
             let answer = self.take_oldest(ports, names)?;
-            self.ready.push_back(answer);
+            self.took(answer)?;
         }
         // The parts of the answer the task is still writing, as far as they have come.
         if matches!(self.early.front(), Some(Seen::Put(_)))
@@ -2383,14 +2405,17 @@ impl TaskState {
         }
     }
 
-    /// Ring mode: `batch` goes to the task in pieces of at most its plane's piece, queued and
-    /// posted as the task has room ([`layout::IN_FLIGHT`] in flight), and the stage answers
-    /// with every answer it has taken meanwhile, joined, the oldest first. It waits for an
-    /// answer only for the task's first (whose schema stands for the rest) and to make room for
-    /// pieces still queued, since it returns with none queued ([`layout::QUEUED_MAX`]); with
-    /// no answer come it answers with a batch of no rows, and the answers come with a later
-    /// batch, or at the stage's end. A morsel of [`layout::IN_FLIGHT`] pieces is posted at
-    /// once, so one engine worker keeps every task of the stage busy.
+    /// Ring mode: `batch`, morsel `seq`, goes to the task in pieces of at most its plane's piece,
+    /// queued and posted as the task has room ([`layout::IN_FLIGHT`] in flight), and the stage
+    /// gives every morsel whose last piece was answered meanwhile, each whole under its own
+    /// number, the oldest first (item 6.3m: an answer belongs to its morsel; [`layout::Morsels`]).
+    /// It waits for an answer only for the task's first (whose schema stands for the rest) and
+    /// to make room for pieces still queued, since it returns with none queued
+    /// ([`layout::QUEUED_MAX`]); a unit that completed no morsel gives none, and its morsel
+    /// comes with a later unit, or at the stage's end. A morsel of [`layout::IN_FLIGHT`] pieces
+    /// is posted at once, so one engine worker keeps every task of the stage busy. The task
+    /// stamps no time on its pieces yet (item 6.3z), so a morsel is given untimed: the cost model
+    /// learns nothing of it rather than a wrong figure (6.3m, decision 4).
     ///
     /// The stage's first unit is the exception: it answers its whole morsel
     /// ([`layout::answers_whole`]). The controller's probe is that unit, and what it took and
@@ -2398,14 +2423,16 @@ impl TaskState {
     /// pieces was read as the function's whole output).
     ///
     /// A unit the run's arena refused is applied again with the same batch (RB5): it goes on
-    /// from where it stopped ([`TaskState::applying`]), with the answers it had taken
-    /// ([`TaskState::ready`]) and the one it was taking ([`TaskState::taking`]).
+    /// from where it stopped ([`TaskState::applying`]), with the morsels' answers it had taken
+    /// ([`TaskState::morsels`], [`TaskState::done`]) and the one it was taking
+    /// ([`TaskState::taking`]).
     fn pipelined(
         &mut self,
         batch: &moruna_kernel::arrow::record_batch::RecordBatch,
+        seq: Seq,
         ports: Option<&Arc<StagePorts>>,
         names: &[String],
-    ) -> Result<Payload> {
+    ) -> Result<Vec<Completed>> {
         // At most its plane's piece, and no more than its account holds by the function's
         // measured line (system design 3A).
         let piece = layout::piece_cap(
@@ -2421,18 +2448,20 @@ impl TaskState {
             let started = moruna_svc::now();
             let pieces = self.pieces(batch, piece)?;
             self.timed[CUT] += moruna_svc::now().saturating_sub(started);
+            self.morsels.open(seq, pieces.len());
             self.queued.extend(pieces);
             self.applying = true;
             self.whole = layout::answers_whole(self.schema.is_some());
         }
         if self.taking.is_some() {
             let answer = self.take_oldest(ports, names)?;
-            self.ready.push_back(answer);
+            self.took(answer)?;
         }
         self.feed(ports, names)?;
-        if self.schema.is_none() && self.ready.is_empty() {
+        // No answer has come yet: every answer taken gives its schema.
+        if self.schema.is_none() {
             let answer = self.take_oldest(ports, names)?;
-            self.ready.push_back(answer);
+            self.took(answer)?;
             self.feed(ports, names)?;
         }
         loop {
@@ -2447,7 +2476,7 @@ impl TaskState {
                     .any(|seen| matches!(seen, Seen::Released(b) if *b == oldest))
             {
                 let answer = self.take_oldest(ports, names)?;
-                self.ready.push_back(answer);
+                self.took(answer)?;
                 came = true;
             }
             self.feed(ports, names)?;
@@ -2456,7 +2485,7 @@ impl TaskState {
             // And the stage's first unit leaves nothing in flight: it answers its whole morsel.
             if layout::waits_for_answer(self.queued.len(), self.outstanding(), self.whole) {
                 let answer = self.take_oldest(ports, names)?;
-                self.ready.push_back(answer);
+                self.took(answer)?;
                 self.feed(ports, names)?;
             } else if !came {
                 break;
@@ -2467,41 +2496,90 @@ impl TaskState {
         // (it wakes a sleeping task a group of posts at a time, item 6.3p) is woken now, so it
         // answers them while the engine does other work.
         self.plane.leave();
-        let answer = match self.ready.len() {
+        if self.done.is_empty() {
+            self.deferred += 1;
+        }
+        let given = self.give()?;
+        self.applying = false;
+        self.whole = false;
+        Ok(given)
+    }
+
+    /// An answer taken, to its morsel ([`layout::Morsels::answer`]); the morsel to those to give
+    /// when it was its last piece. The task stamps no time on a piece (item 6.3z).
+    fn took(&mut self, answer: Payload) -> Result<()> {
+        let whole = self
+            .morsels
+            .answer(answer, None)
+            .map_err(|why| kernel_error(format!("image `{}`: {why}", self.name)))?;
+        if let Some(whole) = whole {
+            self.done.push_back(whole);
+        }
+        Ok(())
+    }
+
+    /// The morsels answered whole, each its answers joined into one batch, the oldest first.
+    /// A join the run's arena refuses keeps them all, those joined already as their one batch,
+    /// for the unit applied again (RB5).
+    fn give(&mut self) -> Result<Vec<Completed>> {
+        for at in 0..self.done.len() {
+            if self.done[at].answers.len() < 2 {
+                continue;
+            }
+            let parts = std::mem::take(&mut self.done[at].answers);
+            match self.join(&parts) {
+                Ok(joined) => {
+                    // Their windows go back once the joined batch has landed.
+                    drop(parts);
+                    self.reap();
+                    self.done[at].answers = vec![joined];
+                }
+                Err(e) => {
+                    self.done[at].answers = parts;
+                    return Err(e);
+                }
+            }
+        }
+        let name = &self.name;
+        self.done
+            .drain(..)
+            .map(|mut whole| {
+                let output = whole.answers.pop().ok_or_else(|| {
+                    kernel_error(format!("image `{name}`: a morsel with no answer"))
+                })?;
+                Ok(Completed {
+                    seq: whole.seq,
+                    output,
+                    time: whole.time,
+                })
+            })
+            .collect()
+    }
+
+    /// What `apply` and `finish`, which give one batch, give of the morsels a unit gave: their
+    /// outputs joined, the oldest first, or a batch of no rows when there are none, as before
+    /// item 6.3m. For a caller of the old contract: the scheduler takes the morsels themselves
+    /// ([`Kernel::apply_morsels`]).
+    fn one(&mut self, given: Vec<Completed>) -> Result<Payload> {
+        let mut outputs: Vec<Payload> = given.into_iter().map(|c| c.output).collect();
+        match outputs.len() {
             0 => {
                 let schema = self.schema.clone().ok_or_else(|| {
                     kernel_error(format!("image `{}`: no answer's schema yet", self.name))
                 })?;
-                self.deferred += 1;
-                Payload::Table(
+                Ok(Payload::Table(
                     moruna_kernel::arrow::record_batch::RecordBatch::new_empty(schema),
                     moruna_kernel::Tier::Host,
-                )
+                ))
             }
-            1 => self
-                .ready
-                .pop_front()
-                .ok_or_else(|| kernel_error(format!("image `{}`: no answer", self.name)))?,
-            _ => self.join_ready()?,
-        };
-        self.applying = false;
-        self.whole = false;
-        Ok(answer)
-    }
-
-    /// The answers taken and not given, joined; kept when the run's arena refuses the join.
-    fn join_ready(&mut self) -> Result<Payload> {
-        let ready: Vec<Payload> = std::mem::take(&mut self.ready).into();
-        match self.join(&ready) {
-            Ok(joined) => {
-                // Their windows go back once the joined batch has landed.
-                drop(ready);
+            1 => outputs
+                .pop()
+                .ok_or_else(|| kernel_error(format!("image `{}`: no answer", self.name))),
+            _ => {
+                let joined = self.join(&outputs)?;
+                drop(outputs);
                 self.reap();
                 Ok(joined)
-            }
-            Err(e) => {
-                self.ready = ready.into();
-                Err(e)
             }
         }
     }
@@ -2883,27 +2961,44 @@ impl Kernel for ImageTask {
         Ok(Box::new(self.start(ctx)?))
     }
 
-    /// SDD 19 f.6 on the kernel: one record to the task and one back, in lockstep; in ring
-    /// mode in pieces, with at most [`layout::IN_FLIGHT`] in flight, the answers coming with later
-    /// batches ([`TaskState::pipelined`]).
+    /// SDD 19 f.6 on the kernel, as one batch: [`Kernel::apply_morsels`]'s morsels joined
+    /// ([`ImageTask::exchange`]), for a caller of the old contract.
     fn apply(&self, state: &mut dyn KernelState, input: Payload) -> Result<Payload> {
         self.exchange(state, input, 0)
     }
 
-    /// SDD 19 f.6, f.7 on the kernel: the input ends; the task puts nothing more, ends its
-    /// stream and exits 0. It gives the answers still in flight (ring mode), joined into one
-    /// batch, and nothing else: every batch an image writes answers one it was sent.
+    /// SDD 19 f.6 on the kernel: one record to the task and one back, in lockstep, which gives
+    /// the unit's own morsel; in ring mode in pieces, with at most [`layout::IN_FLIGHT`] in
+    /// flight, giving the morsels whose last pieces were answered meanwhile, each under its own
+    /// number, untimed ([`TaskState::pipelined`]; item 6.3m).
+    fn apply_morsels(
+        &self,
+        state: &mut dyn KernelState,
+        input: Payload,
+        seq: Seq,
+    ) -> Result<Vec<Completed>> {
+        let st = self.task_state(state)?;
+        self.exchange_morsels(st, input, seq, 0)
+    }
+
+    /// [`Kernel::finish_morsels`]' morsels as one batch, for a caller of the old contract.
     fn finish(&self, state: &mut dyn KernelState) -> Result<Option<Payload>> {
-        (|| -> Result<Option<Payload>> {
-            let st = state
-                .as_any_mut()
-                .downcast_mut::<TaskState>()
-                .ok_or_else(|| kernel_error("image: a state this kernel did not make".into()))?;
-            if !self.memory.iter().any(|m| Arc::ptr_eq(&st.memory, m)) {
-                return Err(kernel_error(
-                    "image: state belongs to another actual task owner".into(),
-                ));
-            }
+        let given = self.finish_morsels(state, 0)?;
+        if given.is_empty() {
+            return Ok(None);
+        }
+        let st = self.task_state(state)?;
+        st.one(given).map(Some)
+    }
+
+    /// SDD 19 f.6, f.7 on the kernel: the input ends; the task puts nothing more, ends its
+    /// stream and exits 0. It gives the morsels still open (ring mode), each under its own
+    /// number once its last answer is back (item 6.3m), and nothing else: every batch an image
+    /// writes answers one it was sent, so nothing is given under `after`.
+    fn finish_morsels(&self, state: &mut dyn KernelState, after: Seq) -> Result<Vec<Completed>> {
+        let _ = after;
+        (|| -> Result<Vec<Completed>> {
+            let st = self.task_state(state)?;
             // The answers a unit took and did not give first, then every piece the task has
             // queued, as it has room, and every answer back.
             loop {
@@ -2912,13 +3007,9 @@ impl Kernel for ImageTask {
                     break;
                 }
                 let answer = st.take_oldest(self.ports.get(), &self.port_names)?;
-                st.ready.push_back(answer);
+                st.took(answer)?;
             }
-            let rest = match st.ready.len() {
-                0 => None,
-                1 => st.ready.pop_front(),
-                _ => Some(st.join_ready()?),
-            };
+            let rest = st.give()?;
             st.plane
                 .finish(st.task, 0)
                 .map_err(|e| plane_error(&st.name, "ending the task's input", e))?;

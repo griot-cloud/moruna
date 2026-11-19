@@ -317,6 +317,21 @@ impl FinalRows {
         }
         Ok(output)
     }
+    /// Every morsel's output captured, in the order given (6.3m).
+    fn captured(
+        &self,
+        given: Vec<moruna_kernel::Completed>,
+    ) -> moruna_kernel::Result<Vec<moruna_kernel::Completed>> {
+        given
+            .into_iter()
+            .map(|morsel| {
+                Ok(moruna_kernel::Completed {
+                    output: self.capture(morsel.output)?,
+                    ..morsel
+                })
+            })
+            .collect()
+    }
 }
 impl Kernel for FinalRows {
     fn fingerprint(&self) -> moruna_kernel::Fingerprint {
@@ -379,6 +394,22 @@ impl Kernel for FinalRows {
             .finish(state)?
             .map(|output| self.capture(output))
             .transpose()
+    }
+    // 6.3m: a pipelined kernel's morsels, each captured as it is given.
+    fn apply_morsels(
+        &self,
+        state: &mut dyn moruna_kernel::KernelState,
+        input: moruna_kernel::Payload,
+        seq: moruna_kernel::Seq,
+    ) -> moruna_kernel::Result<Vec<moruna_kernel::Completed>> {
+        self.captured(self.kernel.apply_morsels(state, input, seq)?)
+    }
+    fn finish_morsels(
+        &self,
+        state: &mut dyn moruna_kernel::KernelState,
+        after: moruna_kernel::Seq,
+    ) -> moruna_kernel::Result<Vec<moruna_kernel::Completed>> {
+        self.captured(self.kernel.finish_morsels(state, after)?)
     }
     fn aligns_inputs(&self) -> bool {
         self.kernel.aligns_inputs()
@@ -1484,6 +1515,21 @@ mod tests {
             1,
             "the final output is captured"
         );
+        // 6.3m: the morsels a kernel gives are captured as they are given, under their numbers.
+        let given = bound
+            .apply_morsels(
+                &mut state,
+                moruna_kernel::Payload::Table(batch(), Tier::Host),
+                4,
+            )
+            .unwrap();
+        assert_eq!(
+            (given.len(), given[0].seq, given[0].time),
+            (1, 4, moruna_kernel::MorselTime::Unit)
+        );
+        let ended = bound.finish_morsels(&mut state, 9).unwrap();
+        assert_eq!((ended.len(), ended[0].seq), (1, 9));
+        assert_eq!(rows.0.lock().unwrap().len(), 3, "each morsel is captured");
         let table = SourceSchema::Table(batch().schema());
         assert!(bound.output_schema(&table).is_ok());
         assert!(bound.output_schema_of(std::slice::from_ref(&table)).is_ok());

@@ -97,6 +97,18 @@ pub(crate) struct InstancePool {
     pub(crate) dealt: std::sync::atomic::AtomicUsize,
 }
 
+/// What a morsel brought into its stage, kept from when it was taken until the stage gives it
+/// (item 6.3m: an answer belongs to its morsel): its record's input side, its rows' origin, and
+/// the cost model's prediction it was taken on.
+pub(crate) struct Taken {
+    pub(crate) rows_in: u64,
+    pub(crate) bytes_in: u64,
+    pub(crate) tier_in: u8,
+    pub(crate) features: moruna_kernel::MorselFeatures,
+    pub(crate) origin: moruna_kernel::Origin,
+    pub(crate) learn: Option<Arc<moruna_cost::Prediction>>,
+}
+
 /// One kernel stage: the kernel, its instance pool and its counters (e.3).
 pub(crate) struct StageEntry {
     pub(crate) stage: StageId,
@@ -132,6 +144,11 @@ pub(crate) struct StageEntry {
     pub(crate) growth: AtomicU64,
     /// The growth before its first morsel: the kernel's declared amplification, or 1.
     pub(crate) declared_growth: f64,
+    /// The morsels its kernel was given and has not given back, by number (item 6.3m): a
+    /// pipelined kernel's, whose unit returns before its morsel is answered. Each is recorded,
+    /// learned from and pushed when the kernel gives it. Bounded by what the kernel holds in
+    /// flight; empty for a kernel that gives each morsel in the unit that brought it.
+    pub(crate) open: Mutex<std::collections::HashMap<Seq, Taken>>,
 }
 
 impl StageEntry {
@@ -640,6 +657,7 @@ impl Shared {
                         .expected_amplification
                         .filter(|a| a.is_finite() && *a > 0.0)
                         .unwrap_or(1.0),
+                    open: Mutex::new(std::collections::HashMap::new()),
                 }
             })
             .collect();
